@@ -87,7 +87,6 @@ func TestCloseRacingWithEnqueueRejectsPostCloseEvent(t *testing.T) {
 	defer server.Close()
 
 	client := newTestClient(t, server.URL)
-	client.lifecycleMu.Lock()
 
 	closeStarted := make(chan struct{})
 	closeDone := make(chan error, 1)
@@ -102,8 +101,6 @@ func TestCloseRacingWithEnqueueRejectsPostCloseEvent(t *testing.T) {
 	go func() {
 		enqueueDone <- client.Enqueue(Event{Name: "racing_event"})
 	}()
-
-	client.lifecycleMu.Unlock()
 
 	if err := <-enqueueDone; err != ErrClosed {
 		t.Fatalf("expected racing enqueue after close start to return ErrClosed, got %v", err)
@@ -127,7 +124,6 @@ func TestCloseRacingWithTrackRejectsPostCloseEvent(t *testing.T) {
 	defer server.Close()
 
 	client := newTestClient(t, server.URL)
-	client.lifecycleMu.Lock()
 
 	closeStarted := make(chan struct{})
 	closeDone := make(chan error, 1)
@@ -143,8 +139,6 @@ func TestCloseRacingWithTrackRejectsPostCloseEvent(t *testing.T) {
 		trackDone <- client.Track(context.Background(), Event{Name: "racing_track"})
 	}()
 
-	client.lifecycleMu.Unlock()
-
 	if err := <-trackDone; err != ErrClosed {
 		t.Fatalf("expected racing Track after close start to return ErrClosed, got %v", err)
 	}
@@ -153,6 +147,50 @@ func TestCloseRacingWithTrackRejectsPostCloseEvent(t *testing.T) {
 	}
 	if got := requests.Load(); got != 0 {
 		t.Fatalf("expected no Track publish after close start, got %d requests", got)
+	}
+}
+
+func TestEnqueueIsNotBlockedBySlowTrackPublish(t *testing.T) {
+	requestStarted := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	var started atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if started.CompareAndSwap(false, true) {
+			close(requestStarted)
+			<-releaseRequest
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"accepted":1,"rejected":0,"duplicates":0}`))
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL)
+	defer client.Close(context.Background())
+
+	trackDone := make(chan error, 1)
+	go func() {
+		trackDone <- client.Track(context.Background(), Event{Name: "slow_track"})
+	}()
+	<-requestStarted
+
+	enqueueDone := make(chan error, 1)
+	go func() {
+		enqueueDone <- client.Enqueue(Event{Name: "queued_while_track_publishes"})
+	}()
+
+	select {
+	case err := <-enqueueDone:
+		if err != nil {
+			t.Fatalf("Enqueue returned error: %v", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("Enqueue blocked behind slow Track network publish")
+	}
+
+	close(releaseRequest)
+	if err := <-trackDone; err != nil {
+		t.Fatalf("Track returned error: %v", err)
 	}
 }
 
@@ -256,7 +294,7 @@ func TestEnqueueSnapshotsMutableEventMaps(t *testing.T) {
 	}
 }
 
-func TestFlushAvailableAttemptsAllQueuedBatchesAfterFirstError(t *testing.T) {
+func TestFlushAvailableRetainsFailedBatchAndRetries(t *testing.T) {
 	firstErr := errors.New("first batch failed")
 	transport := &sequenceTransport{firstErr: firstErr}
 	client := &Client{
@@ -280,15 +318,67 @@ func TestFlushAvailableAttemptsAllQueuedBatchesAfterFirstError(t *testing.T) {
 		t.Fatal("expected second enqueue to succeed")
 	}
 
-	_, err := client.flushAvailable(context.Background(), nil)
+	batch, err := client.flushAvailable(context.Background(), nil)
 	if !errors.Is(err, firstErr) {
 		t.Fatalf("expected first error, got %v", err)
 	}
-	if transport.calls != 2 {
-		t.Fatalf("expected 2 publish attempts, got %d", transport.calls)
+	if transport.calls != 1 {
+		t.Fatalf("expected one publish attempt before retaining failed batch, got %d", transport.calls)
 	}
-	if stats := client.Snapshot(); stats.FailedBatches != 1 || stats.Published != 1 || stats.Accepted != 1 {
-		t.Fatalf("unexpected stats after partial flush: %+v", stats)
+	if len(batch) != 1 || batch[0].ID != "evt-1" {
+		t.Fatalf("expected failed batch to be retained, got %+v", batch)
+	}
+	if len(client.queue.ch) != 1 {
+		t.Fatalf("expected later queued event to remain queued, got queue size %d", len(client.queue.ch))
+	}
+	if stats := client.Snapshot(); stats.FailedBatches != 1 || stats.Published != 0 || stats.Accepted != 0 {
+		t.Fatalf("unexpected stats after failed flush: %+v", stats)
+	}
+
+	batch, err = client.flushAvailable(context.Background(), batch)
+	if err != nil {
+		t.Fatalf("retry flush returned error: %v", err)
+	}
+	if len(batch) != 0 {
+		t.Fatalf("expected retained batch to be cleared after retry, got %+v", batch)
+	}
+	if transport.calls != 3 {
+		t.Fatalf("expected retained and queued batches to publish after retry, got %d calls", transport.calls)
+	}
+	if got := transport.requestEventNames(); strings.Join(got, ",") != "first,first,second" {
+		t.Fatalf("unexpected publish order %v", got)
+	}
+	if stats := client.Snapshot(); stats.FailedBatches != 1 || stats.Published != 2 || stats.Accepted != 2 {
+		t.Fatalf("unexpected stats after retry flush: %+v", stats)
+	}
+}
+
+func TestPublishWorkerBatchRetainsFailedBatch(t *testing.T) {
+	firstErr := errors.New("first batch failed")
+	transport := &sequenceTransport{firstErr: firstErr}
+	client := &Client{
+		cfg: Config{
+			WorkspaceID:   "workspace-test",
+			AppID:         "app-test",
+			EnvironmentID: "develop",
+			Source:        SourceBackend,
+			BatchSize:     2,
+			HTTPTimeout:   time.Second,
+		},
+		clock:     realClock{},
+		queue:     newBoundedQueue(2),
+		transport: transport,
+	}
+
+	batch := []Event{{ID: "evt-1", Name: "first"}}
+	retained := client.publishWorkerBatch(batch)
+	if len(retained) != 1 || retained[0].ID != "evt-1" {
+		t.Fatalf("expected worker to retain failed batch, got %+v", retained)
+	}
+
+	retained = client.publishWorkerBatch(retained)
+	if len(retained) != 0 {
+		t.Fatalf("expected successful retry to clear batch, got %+v", retained)
 	}
 }
 
@@ -333,12 +423,24 @@ func waitForClientClosed(t *testing.T, client *Client) {
 type sequenceTransport struct {
 	firstErr error
 	calls    int
+	requests []batchRequest
 }
 
 func (t *sequenceTransport) Publish(ctx context.Context, request batchRequest) (batchResult, error) {
 	t.calls++
+	t.requests = append(t.requests, request)
 	if t.calls == 1 {
 		return batchResult{}, t.firstErr
 	}
 	return batchResult{Accepted: len(request.Events)}, nil
+}
+
+func (t *sequenceTransport) requestEventNames() []string {
+	names := make([]string, 0)
+	for _, request := range t.requests {
+		for _, event := range request.Events {
+			names = append(names, event.EventName)
+		}
+	}
+	return names
 }

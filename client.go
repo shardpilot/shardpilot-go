@@ -18,6 +18,7 @@ type Client struct {
 	stop          chan struct{}
 	workerDone    chan struct{}
 	lifecycleMu   sync.Mutex
+	trackWG       sync.WaitGroup
 	closeOnce     sync.Once
 	closed        atomic.Bool
 }
@@ -49,11 +50,14 @@ func NewClient(cfg Config) (*Client, error) {
 
 func (c *Client) Track(ctx context.Context, event Event) error {
 	c.lifecycleMu.Lock()
-	defer c.lifecycleMu.Unlock()
-
 	if c.closed.Load() {
+		c.lifecycleMu.Unlock()
 		return ErrClosed
 	}
+	c.trackWG.Add(1)
+	c.lifecycleMu.Unlock()
+	defer c.trackWG.Done()
+
 	return c.publish(ctx, []Event{cloneEvent(event)})
 }
 
@@ -95,13 +99,13 @@ func (c *Client) Flush(ctx context.Context) error {
 }
 
 func (c *Client) Close(ctx context.Context) error {
-	c.closed.Store(true)
-
 	var flushErr error
 	c.closeOnce.Do(func() {
 		c.lifecycleMu.Lock()
+		c.closed.Store(true)
 		c.lifecycleMu.Unlock()
 
+		c.trackWG.Wait()
 		flushErr = c.Flush(ctx)
 		close(c.stop)
 	})
@@ -126,8 +130,12 @@ func (c *Client) run() {
 
 	batch := make([]Event, 0, c.cfg.BatchSize)
 	for {
+		queueEvents := c.queue.ch
+		if len(batch) >= c.cfg.BatchSize {
+			queueEvents = nil
+		}
 		select {
-		case event := <-c.queue.ch:
+		case event := <-queueEvents:
 			batch = append(batch, event)
 			if len(batch) >= c.cfg.BatchSize {
 				batch = c.publishWorkerBatch(batch)
@@ -146,17 +154,19 @@ func (c *Client) run() {
 }
 
 func (c *Client) flushAvailable(ctx context.Context, batch []Event) ([]Event, error) {
-	var firstErr error
 	for {
-		batch = c.queue.drainInto(batch, c.cfg.BatchSize)
 		if len(batch) > 0 {
-			if err := c.publishBatchWithContext(ctx, batch); err != nil && firstErr == nil {
-				firstErr = err
+			if err := c.publishBatchWithContext(ctx, batch); err != nil {
+				return batch, err
 			}
 			batch = batch[:0]
 		}
+		batch = c.queue.drainInto(batch, c.cfg.BatchSize)
 		if len(c.queue.ch) == 0 {
-			return batch, firstErr
+			if len(batch) == 0 {
+				return batch, nil
+			}
+			continue
 		}
 	}
 }
@@ -167,7 +177,9 @@ func (c *Client) publishWorkerBatch(batch []Event) []Event {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.HTTPTimeout)
 	defer cancel()
-	_ = c.publishBatchWithContext(ctx, batch)
+	if err := c.publishBatchWithContext(ctx, batch); err != nil {
+		return batch
+	}
 	return batch[:0]
 }
 
