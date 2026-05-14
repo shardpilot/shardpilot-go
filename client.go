@@ -2,6 +2,9 @@ package shardpilot
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -20,6 +23,7 @@ type Client struct {
 	lifecycleMu   sync.Mutex
 	trackWG       sync.WaitGroup
 	closeOnce     sync.Once
+	closeErr      error
 	closed        atomic.Bool
 }
 
@@ -54,11 +58,17 @@ func (c *Client) Track(ctx context.Context, event Event) error {
 		c.lifecycleMu.Unlock()
 		return ErrClosed
 	}
+	event, err := c.prepareEvent(event)
+	if err != nil {
+		c.stats.recordFailure(err)
+		c.lifecycleMu.Unlock()
+		return err
+	}
 	c.trackWG.Add(1)
 	c.lifecycleMu.Unlock()
 	defer c.trackWG.Done()
 
-	return c.publish(ctx, []Event{cloneEvent(event)})
+	return c.publish(ctx, []Event{event})
 }
 
 func (c *Client) Enqueue(event Event) error {
@@ -68,7 +78,11 @@ func (c *Client) Enqueue(event Event) error {
 	if c.closed.Load() {
 		return ErrClosed
 	}
-	if !c.queue.enqueue(cloneEvent(event)) {
+	event, err := c.prepareEvent(event)
+	if err != nil {
+		return err
+	}
+	if !c.queue.enqueue(event) {
 		c.stats.dropped.Add(1)
 		return ErrQueueFull
 	}
@@ -99,14 +113,13 @@ func (c *Client) Flush(ctx context.Context) error {
 }
 
 func (c *Client) Close(ctx context.Context) error {
-	var flushErr error
 	c.closeOnce.Do(func() {
 		c.lifecycleMu.Lock()
 		c.closed.Store(true)
 		c.lifecycleMu.Unlock()
 
 		c.trackWG.Wait()
-		flushErr = c.Flush(ctx)
+		c.closeErr = c.Flush(ctx)
 		close(c.stop)
 	})
 
@@ -115,7 +128,7 @@ func (c *Client) Close(ctx context.Context) error {
 	case <-contextDone(ctx):
 		return contextCause(ctx)
 	}
-	return flushErr
+	return c.closeErr
 }
 
 func (c *Client) Snapshot() Stats {
@@ -147,24 +160,31 @@ func (c *Client) run() {
 			batch, err = c.flushAvailable(request.ctx, batch)
 			request.reply <- err
 		case <-c.stop:
-			_, _ = c.flushAvailable(context.Background(), batch)
 			return
 		}
 	}
 }
 
 func (c *Client) flushAvailable(ctx context.Context, batch []Event) ([]Event, error) {
+	var firstErr error
 	for {
 		if len(batch) > 0 {
 			if err := c.publishBatchWithContext(ctx, batch); err != nil {
-				return batch, err
+				if !isPermanentEventError(err) {
+					return batch, err
+				}
+				if firstErr == nil {
+					firstErr = err
+				}
+				batch = batch[:0]
+			} else {
+				batch = batch[:0]
 			}
-			batch = batch[:0]
 		}
 		batch = c.queue.drainInto(batch, c.cfg.BatchSize)
 		if len(c.queue.ch) == 0 {
 			if len(batch) == 0 {
-				return batch, nil
+				return batch, firstErr
 			}
 			continue
 		}
@@ -178,6 +198,9 @@ func (c *Client) publishWorkerBatch(batch []Event) []Event {
 	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.HTTPTimeout)
 	defer cancel()
 	if err := c.publishBatchWithContext(ctx, batch); err != nil {
+		if isPermanentEventError(err) {
+			return batch[:0]
+		}
 		return batch
 	}
 	return batch[:0]
@@ -232,4 +255,16 @@ func cloneEvent(event Event) Event {
 	event.Props = cloneMap(event.Props)
 	event.Context = cloneMap(event.Context)
 	return event
+}
+
+func (c *Client) prepareEvent(event Event) (Event, error) {
+	event = cloneEvent(event)
+	if strings.TrimSpace(event.Name) == "" {
+		return Event{}, fmt.Errorf("%w: event name is required", ErrInvalidEvent)
+	}
+	return event, nil
+}
+
+func isPermanentEventError(err error) bool {
+	return errors.Is(err, ErrInvalidEvent)
 }

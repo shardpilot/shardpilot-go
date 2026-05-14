@@ -79,6 +79,25 @@ func TestCloseRejectsNewEvents(t *testing.T) {
 	}
 }
 
+func TestEnqueueRejectsInvalidEvent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"accepted":0,"rejected":0,"duplicates":0}`))
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL)
+	defer client.Close(context.Background())
+
+	if err := client.Enqueue(Event{Name: "   "}); !errors.Is(err, ErrInvalidEvent) {
+		t.Fatalf("expected ErrInvalidEvent, got %v", err)
+	}
+	if stats := client.Snapshot(); stats.Enqueued != 0 {
+		t.Fatalf("expected invalid enqueue not to increment Enqueued, got %d", stats.Enqueued)
+	}
+}
+
 func TestCloseRacingWithEnqueueRejectsPostCloseEvent(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -237,6 +256,56 @@ func TestCloseWaitsForInFlightTrack(t *testing.T) {
 	}
 }
 
+func TestCloseWithCanceledContextDoesNotPublishAfterDeadline(t *testing.T) {
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"accepted":1,"rejected":0,"duplicates":0}`))
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL)
+	if err := client.Enqueue(Event{Name: "queued_before_expired_close"}); err != nil {
+		t.Fatalf("Enqueue returned error: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := client.Close(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected canceled Close error, got %v", err)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("expected no publish after Close context cancellation, got %d requests", got)
+	}
+}
+
+func TestRepeatedCloseReturnsFirstFlushFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`temporary failure body that must not leak`))
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL)
+	if err := client.Enqueue(Event{Name: "queued_before_failed_close"}); err != nil {
+		t.Fatalf("Enqueue returned error: %v", err)
+	}
+
+	firstErr := client.Close(context.Background())
+	if firstErr == nil {
+		t.Fatal("expected first Close to return flush failure")
+	}
+	secondErr := client.Close(context.Background())
+	if secondErr == nil {
+		t.Fatal("expected repeated Close to return first failure")
+	}
+	if secondErr.Error() != firstErr.Error() {
+		t.Fatalf("expected repeated Close error %q, got %q", firstErr.Error(), secondErr.Error())
+	}
+}
+
 func TestEnqueueSnapshotsMutableEventMaps(t *testing.T) {
 	requests := make(chan batchRequest, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -292,6 +361,47 @@ func TestEnqueueSnapshotsMutableEventMaps(t *testing.T) {
 	}
 	if _, exists := event.Context["new"]; exists {
 		t.Fatalf("context includes post-enqueue mutation: %+v", event.Context)
+	}
+}
+
+func TestInvalidQueuedBuildErrorDoesNotBlockLaterValidEvents(t *testing.T) {
+	transport := &sequenceTransport{}
+	client := &Client{
+		cfg: Config{
+			WorkspaceID:   "workspace-test",
+			AppID:         "app-test",
+			EnvironmentID: "develop",
+			Source:        SourceBackend,
+			BatchSize:     1,
+			HTTPTimeout:   time.Second,
+		},
+		clock:     realClock{},
+		queue:     newBoundedQueue(2),
+		transport: transport,
+	}
+
+	if !client.queue.enqueue(Event{ID: "evt-invalid", Name: " "}) {
+		t.Fatal("expected invalid internal enqueue to succeed")
+	}
+	if !client.queue.enqueue(Event{ID: "evt-valid", Name: "valid"}) {
+		t.Fatal("expected valid internal enqueue to succeed")
+	}
+
+	batch, err := client.flushAvailable(context.Background(), nil)
+	if !errors.Is(err, ErrInvalidEvent) {
+		t.Fatalf("expected ErrInvalidEvent, got %v", err)
+	}
+	if len(batch) != 0 {
+		t.Fatalf("expected invalid batch to be discarded, got %+v", batch)
+	}
+	if transport.calls != 1 {
+		t.Fatalf("expected later valid event to publish, got %d publish calls", transport.calls)
+	}
+	if got := transport.requestEventNames(); strings.Join(got, ",") != "valid" {
+		t.Fatalf("unexpected published events %v", got)
+	}
+	if stats := client.Snapshot(); stats.FailedBatches != 1 || stats.Published != 1 || stats.Accepted != 1 {
+		t.Fatalf("unexpected stats after invalid and valid flush: %+v", stats)
 	}
 }
 
@@ -430,7 +540,7 @@ type sequenceTransport struct {
 func (t *sequenceTransport) Publish(ctx context.Context, request batchRequest) (batchResult, error) {
 	t.calls++
 	t.requests = append(t.requests, request)
-	if t.calls == 1 {
+	if t.calls == 1 && t.firstErr != nil {
 		return batchResult{}, t.firstErr
 	}
 	return batchResult{Accepted: len(request.Events)}, nil
