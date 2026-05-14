@@ -405,6 +405,52 @@ func TestInvalidQueuedBuildErrorDoesNotBlockLaterValidEvents(t *testing.T) {
 	}
 }
 
+func TestPermanentHTTPStatusDoesNotBlockLaterValidEvents(t *testing.T) {
+	for _, statusCode := range []int{http.StatusBadRequest, http.StatusForbidden} {
+		t.Run(fmt.Sprintf("status_%d", statusCode), func(t *testing.T) {
+			transport := &sequenceTransport{firstErr: &HTTPStatusError{StatusCode: statusCode}}
+			client := &Client{
+				cfg: Config{
+					WorkspaceID:   "workspace-test",
+					AppID:         "app-test",
+					EnvironmentID: "develop",
+					Source:        SourceBackend,
+					BatchSize:     1,
+					HTTPTimeout:   time.Second,
+				},
+				clock:     realClock{},
+				queue:     newBoundedQueue(2),
+				transport: transport,
+			}
+
+			if !client.queue.enqueue(Event{ID: "evt-permanent", Name: "permanent_status"}) {
+				t.Fatal("expected permanent-status enqueue to succeed")
+			}
+			if !client.queue.enqueue(Event{ID: "evt-valid", Name: "valid_after_permanent_status"}) {
+				t.Fatal("expected valid enqueue to succeed")
+			}
+
+			batch, err := client.flushAvailable(context.Background(), nil)
+			var statusErr *HTTPStatusError
+			if !errors.As(err, &statusErr) || statusErr.StatusCode != statusCode {
+				t.Fatalf("expected HTTPStatusError %d, got %v", statusCode, err)
+			}
+			if len(batch) != 0 {
+				t.Fatalf("expected permanent status batch to be discarded, got %+v", batch)
+			}
+			if transport.calls != 2 {
+				t.Fatalf("expected later valid event to publish after permanent status, got %d calls", transport.calls)
+			}
+			if got := transport.requestEventNames(); strings.Join(got, ",") != "permanent_status,valid_after_permanent_status" {
+				t.Fatalf("unexpected published events %v", got)
+			}
+			if stats := client.Snapshot(); stats.FailedBatches != 1 || stats.Published != 1 || stats.Accepted != 1 || stats.Dropped != 1 {
+				t.Fatalf("unexpected stats after permanent status and valid flush: %+v", stats)
+			}
+		})
+	}
+}
+
 func TestFlushAvailableRetainsFailedBatchAndRetries(t *testing.T) {
 	firstErr := errors.New("first batch failed")
 	transport := &sequenceTransport{firstErr: firstErr}
@@ -461,6 +507,50 @@ func TestFlushAvailableRetainsFailedBatchAndRetries(t *testing.T) {
 	}
 	if stats := client.Snapshot(); stats.FailedBatches != 1 || stats.Published != 2 || stats.Accepted != 2 {
 		t.Fatalf("unexpected stats after retry flush: %+v", stats)
+	}
+}
+
+func TestRetryableHTTPStatusRetainsFailedBatch(t *testing.T) {
+	for _, statusCode := range []int{http.StatusInternalServerError, http.StatusTooManyRequests} {
+		t.Run(fmt.Sprintf("status_%d", statusCode), func(t *testing.T) {
+			transport := &sequenceTransport{firstErr: &HTTPStatusError{StatusCode: statusCode}}
+			client := &Client{
+				cfg: Config{
+					WorkspaceID:   "workspace-test",
+					AppID:         "app-test",
+					EnvironmentID: "develop",
+					Source:        SourceBackend,
+					BatchSize:     1,
+					HTTPTimeout:   time.Second,
+				},
+				clock:     realClock{},
+				queue:     newBoundedQueue(1),
+				transport: transport,
+			}
+
+			if !client.queue.enqueue(Event{ID: "evt-retryable", Name: "retryable_status"}) {
+				t.Fatal("expected retryable-status enqueue to succeed")
+			}
+			batch, err := client.flushAvailable(context.Background(), nil)
+			var statusErr *HTTPStatusError
+			if !errors.As(err, &statusErr) || statusErr.StatusCode != statusCode {
+				t.Fatalf("expected HTTPStatusError %d, got %v", statusCode, err)
+			}
+			if len(batch) != 1 || batch[0].ID != "evt-retryable" {
+				t.Fatalf("expected retryable status batch retained, got %+v", batch)
+			}
+
+			batch, err = client.flushAvailable(context.Background(), batch)
+			if err != nil {
+				t.Fatalf("retry flush returned error: %v", err)
+			}
+			if len(batch) != 0 {
+				t.Fatalf("expected retryable status batch to clear after success, got %+v", batch)
+			}
+			if stats := client.Snapshot(); stats.FailedBatches != 1 || stats.Published != 1 || stats.Accepted != 1 {
+				t.Fatalf("unexpected stats after retryable status retry: %+v", stats)
+			}
+		})
 	}
 }
 

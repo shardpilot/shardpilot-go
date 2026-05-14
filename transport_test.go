@@ -2,6 +2,7 @@ package shardpilot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -40,6 +41,10 @@ func TestTransportDoesNotRetryClientErrors(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected Track error")
+	}
+	var statusErr *HTTPStatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected typed HTTP status error, got %v", err)
 	}
 	if requests.Load() != 1 {
 		t.Fatalf("expected one request, got %d", requests.Load())

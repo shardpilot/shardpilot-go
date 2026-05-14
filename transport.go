@@ -21,6 +21,18 @@ type batchResult struct {
 	Duplicates int `json:"duplicates"`
 }
 
+type HTTPStatusError struct {
+	StatusCode int
+}
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("shardpilot ingest returned status %d", e.StatusCode)
+}
+
+func (e *HTTPStatusError) Retryable() bool {
+	return e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
+}
+
 type httpTransport struct {
 	endpoint string
 	token    string
@@ -58,7 +70,7 @@ func (t *httpTransport) Publish(ctx context.Context, request batchRequest) (batc
 
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
-		return batchResult{}, fmt.Errorf("shardpilot ingest returned status %d", response.StatusCode)
+		return batchResult{}, &HTTPStatusError{StatusCode: response.StatusCode}
 	}
 
 	var result batchResult

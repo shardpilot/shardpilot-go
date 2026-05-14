@@ -170,12 +170,13 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event) ([]Event, er
 	for {
 		if len(batch) > 0 {
 			if err := c.publishBatchWithContext(ctx, batch); err != nil {
-				if !isPermanentEventError(err) {
+				if !isPermanentPublishError(err) {
 					return batch, err
 				}
 				if firstErr == nil {
 					firstErr = err
 				}
+				c.stats.dropped.Add(uint64(len(batch)))
 				batch = batch[:0]
 			} else {
 				batch = batch[:0]
@@ -198,7 +199,8 @@ func (c *Client) publishWorkerBatch(batch []Event) []Event {
 	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.HTTPTimeout)
 	defer cancel()
 	if err := c.publishBatchWithContext(ctx, batch); err != nil {
-		if isPermanentEventError(err) {
+		if isPermanentPublishError(err) {
+			c.stats.dropped.Add(uint64(len(batch)))
 			return batch[:0]
 		}
 		return batch
@@ -265,6 +267,13 @@ func (c *Client) prepareEvent(event Event) (Event, error) {
 	return event, nil
 }
 
-func isPermanentEventError(err error) bool {
-	return errors.Is(err, ErrInvalidEvent)
+func isPermanentPublishError(err error) bool {
+	if errors.Is(err, ErrInvalidEvent) {
+		return true
+	}
+	var statusErr *HTTPStatusError
+	if errors.As(err, &statusErr) {
+		return !statusErr.Retryable()
+	}
+	return false
 }

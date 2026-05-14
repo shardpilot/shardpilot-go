@@ -47,7 +47,7 @@ const (
 )
 
 func normalizeConfig(cfg Config) (Config, error) {
-	cfg.IngestURL = strings.TrimRight(strings.TrimSpace(cfg.IngestURL), "/")
+	cfg.IngestURL = strings.TrimSpace(cfg.IngestURL)
 	cfg.Token = strings.TrimSpace(cfg.Token)
 	cfg.WorkspaceID = strings.TrimSpace(cfg.WorkspaceID)
 	cfg.AppID = strings.TrimSpace(cfg.AppID)
@@ -79,6 +79,22 @@ func normalizeConfig(cfg Config) (Config, error) {
 	if parsed.Scheme != "https" && !allowInsecureURL(parsed, cfg.AllowInsecurePrivateNetwork) {
 		return Config{}, fmt.Errorf("%w: ingest URL must use https outside localhost, loopback, or explicitly allowed private networks", ErrInvalidConfig)
 	}
+	if parsed.User != nil {
+		return Config{}, fmt.Errorf("%w: ingest URL must not include user info", ErrInvalidConfig)
+	}
+	if parsed.RawQuery != "" {
+		return Config{}, fmt.Errorf("%w: ingest URL must not include query parameters", ErrInvalidConfig)
+	}
+	if parsed.Fragment != "" {
+		return Config{}, fmt.Errorf("%w: ingest URL must not include a fragment", ErrInvalidConfig)
+	}
+	if parsed.Path != "" && parsed.Path != "/" {
+		return Config{}, fmt.Errorf("%w: ingest URL must not include a path", ErrInvalidConfig)
+	}
+	parsed.Path = ""
+	parsed.RawPath = ""
+	parsed.ForceQuery = false
+	cfg.IngestURL = strings.TrimRight(parsed.String(), "/")
 
 	if cfg.BatchSize <= 0 {
 		cfg.BatchSize = defaultBatchSize

@@ -145,6 +145,27 @@ func TestConfigValidationAndDefaults(t *testing.T) {
 	}
 	defer privateClient.Close(context.Background())
 
+	for name, ingestURL := range map[string]string{
+		"user info":     "https://token@example.com",
+		"query":         "https://example.com?token=value",
+		"fragment":      "https://example.com#fragment",
+		"non-root path": "https://example.com/ingest",
+	} {
+		t.Run("rejects "+name, func(t *testing.T) {
+			_, err := NewClient(Config{
+				IngestURL:     ingestURL,
+				Token:         "token",
+				WorkspaceID:   "workspace",
+				AppID:         "app",
+				EnvironmentID: "develop",
+				Source:        SourceBackend,
+			})
+			if err == nil {
+				t.Fatalf("expected ingest URL %q to be rejected", ingestURL)
+			}
+		})
+	}
+
 	if client.cfg.IngestURL != "http://localhost:8080" {
 		t.Fatalf("unexpected normalized URL %q", client.cfg.IngestURL)
 	}
