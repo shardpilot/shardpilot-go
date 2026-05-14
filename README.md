@@ -78,6 +78,13 @@ It is not a top-level ShardPilot ingest envelope field.
 - Batches default to 25 events and are capped at 100.
 - The async queue is bounded and memory-only; there is no durable local queue
   in v0.
+- The worker retains at most one failed in-memory batch for a later retry.
+  There is no disk persistence and no unbounded local replay.
+- Retry attempts happen through the normal worker cadence: no more frequently
+  than `FlushInterval`, plus explicit `Flush` or `Close` calls.
+- The SDK does not start concurrent retry storms. While one worker batch is
+  retained, sustained failures can apply backpressure and new queued events may
+  be dropped according to `BufferSize`.
 - If the queue is full, `Enqueue` drops the event, increments `Dropped`, and
   returns `ErrQueueFull`.
 - `Track` sends one event synchronously for tests and utilities.
@@ -86,10 +93,9 @@ It is not a top-level ShardPilot ingest envelope field.
   context deadline.
 - Event IDs are generated with crypto/rand UUIDv4-like identifiers when absent.
 - Event timestamps default to `time.Now().UTC()` when absent.
-- Non-local HTTP ingest URLs are rejected; use HTTPS outside localhost or
-  loopback development.
-- v0 does not retry failed batches. Applications may call `Flush`/`Track`
-  again when appropriate.
+- HTTP ingest URLs are allowed for localhost and loopback development. Use
+  HTTPS elsewhere unless explicitly opting into private-network HTTP with
+  `AllowInsecurePrivateNetwork`.
 
 ## Security And Privacy
 

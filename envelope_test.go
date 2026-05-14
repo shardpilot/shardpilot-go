@@ -119,6 +119,32 @@ func TestConfigValidationAndDefaults(t *testing.T) {
 	}
 	defer client.Close(context.Background())
 
+	_, err = NewClient(Config{
+		IngestURL:     "http://10.0.0.10:8080",
+		Token:         "token",
+		WorkspaceID:   "workspace",
+		AppID:         "app",
+		EnvironmentID: "develop",
+		Source:        SourceBackend,
+	})
+	if err == nil {
+		t.Fatal("expected private network http URL to require explicit opt-in")
+	}
+
+	privateClient, err := NewClient(Config{
+		IngestURL:                   "http://10.0.0.10:8080",
+		Token:                       "token",
+		WorkspaceID:                 "workspace",
+		AppID:                       "app",
+		EnvironmentID:               "develop",
+		Source:                      SourceBackend,
+		AllowInsecurePrivateNetwork: true,
+	})
+	if err != nil {
+		t.Fatalf("expected private network http URL to be allowed with explicit opt-in: %v", err)
+	}
+	defer privateClient.Close(context.Background())
+
 	if client.cfg.IngestURL != "http://localhost:8080" {
 		t.Fatalf("unexpected normalized URL %q", client.cfg.IngestURL)
 	}

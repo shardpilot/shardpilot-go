@@ -21,21 +21,21 @@ type Logger interface {
 }
 
 type Config struct {
-	IngestURL          string
-	Token              string
-	WorkspaceID        string
-	AppID              string
-	EnvironmentID      string
-	Source             Source
-	AppVersion         string
-	AppBuild           string
-	Platform           string
-	BatchSize          int
-	BufferSize         int
-	FlushInterval      time.Duration
-	HTTPTimeout        time.Duration
-	Logger             Logger
-	AllowInsecureLocal bool
+	IngestURL                   string
+	Token                       string
+	WorkspaceID                 string
+	AppID                       string
+	EnvironmentID               string
+	Source                      Source
+	AppVersion                  string
+	AppBuild                    string
+	Platform                    string
+	BatchSize                   int
+	BufferSize                  int
+	FlushInterval               time.Duration
+	HTTPTimeout                 time.Duration
+	Logger                      Logger
+	AllowInsecurePrivateNetwork bool
 }
 
 const (
@@ -76,8 +76,8 @@ func normalizeConfig(cfg Config) (Config, error) {
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return Config{}, fmt.Errorf("%w: ingest URL must be absolute", ErrInvalidConfig)
 	}
-	if parsed.Scheme != "https" && !allowInsecureURL(parsed, cfg.AllowInsecureLocal) {
-		return Config{}, fmt.Errorf("%w: ingest URL must use https outside localhost or loopback", ErrInvalidConfig)
+	if parsed.Scheme != "https" && !allowInsecureURL(parsed, cfg.AllowInsecurePrivateNetwork) {
+		return Config{}, fmt.Errorf("%w: ingest URL must use https outside localhost, loopback, or explicitly allowed private networks", ErrInvalidConfig)
 	}
 
 	if cfg.BatchSize <= 0 {

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -56,6 +57,7 @@ func (t *httpTransport) Publish(ctx context.Context, request batchRequest) (batc
 	defer response.Body.Close()
 
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
 		return batchResult{}, fmt.Errorf("shardpilot ingest returned status %d", response.StatusCode)
 	}
 
