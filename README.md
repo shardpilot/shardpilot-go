@@ -13,6 +13,11 @@ go get github.com/shardpilot/shardpilot-go@latest
 Until an explicit release wave publishes tags, use source checkouts or module
 replacements during evaluation.
 
+The module `go` directive is kept at Go 1.23 as the source-compatibility
+baseline for SDK consumers. Current supported Go toolchains are still
+recommended for production builds, and CI verifies both Go 1.23.x compatibility
+and the current Go toolchain target.
+
 ## Basic Usage
 
 ```go

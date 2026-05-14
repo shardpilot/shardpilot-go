@@ -17,6 +17,7 @@ type Client struct {
 	flushRequests chan flushRequest
 	stop          chan struct{}
 	workerDone    chan struct{}
+	lifecycleMu   sync.Mutex
 	closeOnce     sync.Once
 	closed        atomic.Bool
 }
@@ -54,6 +55,9 @@ func (c *Client) Track(ctx context.Context, event Event) error {
 }
 
 func (c *Client) Enqueue(event Event) error {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+
 	if c.closed.Load() {
 		return ErrClosed
 	}
@@ -88,9 +92,13 @@ func (c *Client) Flush(ctx context.Context) error {
 }
 
 func (c *Client) Close(ctx context.Context) error {
+	c.closed.Store(true)
+
 	var flushErr error
 	c.closeOnce.Do(func() {
-		c.closed.Store(true)
+		c.lifecycleMu.Lock()
+		c.lifecycleMu.Unlock()
+
 		flushErr = c.Flush(ctx)
 		close(c.stop)
 	})
@@ -144,7 +152,7 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event) ([]Event, er
 			}
 			batch = batch[:0]
 		}
-		if len(c.queue.ch) == 0 || firstErr != nil {
+		if len(c.queue.ch) == 0 {
 			return batch, firstErr
 		}
 	}
