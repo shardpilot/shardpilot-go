@@ -48,10 +48,13 @@ func NewClient(cfg Config) (*Client, error) {
 }
 
 func (c *Client) Track(ctx context.Context, event Event) error {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+
 	if c.closed.Load() {
 		return ErrClosed
 	}
-	return c.publish(ctx, []Event{event})
+	return c.publish(ctx, []Event{cloneEvent(event)})
 }
 
 func (c *Client) Enqueue(event Event) error {
@@ -61,7 +64,7 @@ func (c *Client) Enqueue(event Event) error {
 	if c.closed.Load() {
 		return ErrClosed
 	}
-	if !c.queue.enqueue(event) {
+	if !c.queue.enqueue(cloneEvent(event)) {
 		c.stats.dropped.Add(1)
 		return ErrQueueFull
 	}
@@ -211,4 +214,10 @@ func contextCause(ctx context.Context) error {
 		return context.Canceled
 	}
 	return ctx.Err()
+}
+
+func cloneEvent(event Event) Event {
+	event.Props = cloneMap(event.Props)
+	event.Context = cloneMap(event.Context)
+	return event
 }

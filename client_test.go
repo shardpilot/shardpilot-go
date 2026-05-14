@@ -73,6 +73,9 @@ func TestCloseRejectsNewEvents(t *testing.T) {
 	if stats := client.Snapshot(); stats.Enqueued != 0 {
 		t.Fatalf("expected closed enqueue not to increment Enqueued, got %d", stats.Enqueued)
 	}
+	if err := client.Track(context.Background(), Event{Name: "track_after_close"}); err != ErrClosed {
+		t.Fatalf("expected ErrClosed from Track after Close, got %v", err)
+	}
 }
 
 func TestCloseRacingWithEnqueueRejectsPostCloseEvent(t *testing.T) {
@@ -93,6 +96,7 @@ func TestCloseRacingWithEnqueueRejectsPostCloseEvent(t *testing.T) {
 		closeDone <- client.Close(context.Background())
 	}()
 	<-closeStarted
+	waitForClientClosed(t, client)
 
 	enqueueDone := make(chan error, 1)
 	go func() {
@@ -109,6 +113,146 @@ func TestCloseRacingWithEnqueueRejectsPostCloseEvent(t *testing.T) {
 	}
 	if stats := client.Snapshot(); stats.Enqueued != 0 {
 		t.Fatalf("expected racing closed enqueue not to increment Enqueued, got %d", stats.Enqueued)
+	}
+}
+
+func TestCloseRacingWithTrackRejectsPostCloseEvent(t *testing.T) {
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"accepted":1,"rejected":0,"duplicates":0}`))
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL)
+	client.lifecycleMu.Lock()
+
+	closeStarted := make(chan struct{})
+	closeDone := make(chan error, 1)
+	go func() {
+		close(closeStarted)
+		closeDone <- client.Close(context.Background())
+	}()
+	<-closeStarted
+	waitForClientClosed(t, client)
+
+	trackDone := make(chan error, 1)
+	go func() {
+		trackDone <- client.Track(context.Background(), Event{Name: "racing_track"})
+	}()
+
+	client.lifecycleMu.Unlock()
+
+	if err := <-trackDone; err != ErrClosed {
+		t.Fatalf("expected racing Track after close start to return ErrClosed, got %v", err)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("expected no Track publish after close start, got %d requests", got)
+	}
+}
+
+func TestCloseWaitsForInFlightTrack(t *testing.T) {
+	requestStarted := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(requestStarted)
+		<-releaseRequest
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"accepted":1,"rejected":0,"duplicates":0}`))
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL)
+
+	trackDone := make(chan error, 1)
+	go func() {
+		trackDone <- client.Track(context.Background(), Event{Name: "in_flight_track"})
+	}()
+	<-requestStarted
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- client.Close(context.Background())
+	}()
+	waitForClientClosed(t, client)
+
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close completed before in-flight Track finished: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(releaseRequest)
+
+	if err := <-trackDone; err != nil {
+		t.Fatalf("Track returned error: %v", err)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatalf("Close returned error: %v", err)
+	}
+}
+
+func TestEnqueueSnapshotsMutableEventMaps(t *testing.T) {
+	requests := make(chan batchRequest, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request batchRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		requests <- request
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"accepted":1,"rejected":0,"duplicates":0}`))
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL)
+	defer client.Close(context.Background())
+
+	props := map[string]any{"level": "before", "score": 10}
+	eventContext := map[string]any{"surface": "menu", "online": true}
+	if err := client.Enqueue(Event{
+		ID:      "evt-mutable",
+		Name:    "mutable_event",
+		Props:   props,
+		Context: eventContext,
+	}); err != nil {
+		t.Fatalf("Enqueue returned error: %v", err)
+	}
+
+	props["level"] = "after"
+	props["score"] = 99
+	props["new"] = "post-enqueue"
+	eventContext["surface"] = "gameplay"
+	eventContext["online"] = false
+	eventContext["new"] = "post-enqueue"
+
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush returned error: %v", err)
+	}
+
+	request := <-requests
+	if len(request.Events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(request.Events))
+	}
+	event := request.Events[0]
+	if event.Props["level"] != "before" || event.Props["score"] != float64(10) {
+		t.Fatalf("props were not snapshotted before caller mutation: %+v", event.Props)
+	}
+	if _, exists := event.Props["new"]; exists {
+		t.Fatalf("props include post-enqueue mutation: %+v", event.Props)
+	}
+	if event.Context["surface"] != "menu" || event.Context["online"] != true {
+		t.Fatalf("context was not snapshotted before caller mutation: %+v", event.Context)
+	}
+	if _, exists := event.Context["new"]; exists {
+		t.Fatalf("context includes post-enqueue mutation: %+v", event.Context)
 	}
 }
 
@@ -164,6 +308,24 @@ func TestSourceCompatibilityBaselineAndCIMatrix(t *testing.T) {
 	for _, version := range []string{"'1.23.x'", "'1.26.3'"} {
 		if !strings.Contains(string(workflow), version) {
 			t.Fatalf("CI workflow missing Go matrix version %s", version)
+		}
+	}
+}
+
+func waitForClientClosed(t *testing.T, client *Client) {
+	t.Helper()
+	deadline := time.After(time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if client.closed.Load() {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for client Close to start")
+		case <-ticker.C:
 		}
 	}
 }
