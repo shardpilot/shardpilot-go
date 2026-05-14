@@ -33,6 +33,18 @@ func (e *HTTPStatusError) Retryable() bool {
 	return e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
 }
 
+type EncodeError struct {
+	Err error
+}
+
+func (e *EncodeError) Error() string {
+	return fmt.Sprintf("encode shardpilot batch: %v", e.Err)
+}
+
+func (e *EncodeError) Unwrap() error {
+	return e.Err
+}
+
 type httpTransport struct {
 	endpoint string
 	token    string
@@ -52,7 +64,7 @@ func newHTTPTransport(cfg Config) *httpTransport {
 func (t *httpTransport) Publish(ctx context.Context, request batchRequest) (batchResult, error) {
 	payload, err := json.Marshal(request)
 	if err != nil {
-		return batchResult{}, fmt.Errorf("encode shardpilot batch: %w", err)
+		return batchResult{}, &EncodeError{Err: err}
 	}
 
 	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, t.endpoint, bytes.NewReader(payload))

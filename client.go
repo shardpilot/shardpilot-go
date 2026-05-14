@@ -22,7 +22,11 @@ type Client struct {
 	workerDone    chan struct{}
 	lifecycleMu   sync.Mutex
 	trackWG       sync.WaitGroup
-	closeOnce     sync.Once
+	closeMu       sync.Mutex
+	closeInFlight bool
+	closeComplete bool
+	closeDone     chan struct{}
+	stopOnce      sync.Once
 	closeErr      error
 	closed        atomic.Bool
 }
@@ -113,22 +117,76 @@ func (c *Client) Flush(ctx context.Context) error {
 }
 
 func (c *Client) Close(ctx context.Context) error {
-	c.closeOnce.Do(func() {
-		c.lifecycleMu.Lock()
-		c.closed.Store(true)
-		c.lifecycleMu.Unlock()
+	c.lifecycleMu.Lock()
+	c.closed.Store(true)
+	c.lifecycleMu.Unlock()
 
+	if err := c.waitForTracks(ctx); err != nil {
+		return err
+	}
+	return c.finishClose(ctx)
+}
+
+func (c *Client) waitForTracks(ctx context.Context) error {
+	waitDone := make(chan struct{})
+	go func() {
 		c.trackWG.Wait()
-		c.closeErr = c.Flush(ctx)
-		close(c.stop)
-	})
+		close(waitDone)
+	}()
 
 	select {
-	case <-c.workerDone:
+	case <-waitDone:
+		return nil
 	case <-contextDone(ctx):
 		return contextCause(ctx)
 	}
-	return c.closeErr
+}
+
+func (c *Client) finishClose(ctx context.Context) error {
+	c.closeMu.Lock()
+	if c.closeComplete {
+		err := c.closeErr
+		c.closeMu.Unlock()
+		return err
+	}
+	if c.closeInFlight {
+		done := c.closeDone
+		c.closeMu.Unlock()
+		select {
+		case <-done:
+			c.closeMu.Lock()
+			err := c.closeErr
+			c.closeMu.Unlock()
+			return err
+		case <-contextDone(ctx):
+			return contextCause(ctx)
+		}
+	}
+	c.closeInFlight = true
+	done := make(chan struct{})
+	c.closeDone = done
+	c.closeMu.Unlock()
+
+	err := c.Flush(ctx)
+	c.stopOnce.Do(func() {
+		close(c.stop)
+	})
+	select {
+	case <-c.workerDone:
+	case <-contextDone(ctx):
+		if err == nil {
+			err = contextCause(ctx)
+		}
+	}
+
+	c.closeMu.Lock()
+	c.closeErr = err
+	c.closeComplete = true
+	c.closeInFlight = false
+	close(done)
+	c.closeMu.Unlock()
+
+	return err
 }
 
 func (c *Client) Snapshot() Stats {
@@ -274,6 +332,10 @@ func isPermanentPublishError(err error) bool {
 	var statusErr *HTTPStatusError
 	if errors.As(err, &statusErr) {
 		return !statusErr.Retryable()
+	}
+	var encodeErr *EncodeError
+	if errors.As(err, &encodeErr) {
+		return true
 	}
 	return false
 }

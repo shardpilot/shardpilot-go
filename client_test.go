@@ -256,6 +256,49 @@ func TestCloseWaitsForInFlightTrack(t *testing.T) {
 	}
 }
 
+func TestCloseWithCanceledContextReturnsWhileTrackInFlight(t *testing.T) {
+	requestStarted := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(requestStarted)
+		<-releaseRequest
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"accepted":1,"rejected":0,"duplicates":0}`))
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL)
+
+	trackDone := make(chan error, 1)
+	go func() {
+		trackDone <- client.Track(context.Background(), Event{Name: "in_flight_track"})
+	}()
+	<-requestStarted
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := client.Close(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected deadline error while Track is in-flight, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("Close waited too long for in-flight Track after context deadline: %s", elapsed)
+	}
+	if err := client.Enqueue(Event{Name: "after_close_start"}); err != ErrClosed {
+		t.Fatalf("expected Enqueue after Close start to return ErrClosed, got %v", err)
+	}
+
+	close(releaseRequest)
+	if err := <-trackDone; err != nil {
+		t.Fatalf("Track returned error: %v", err)
+	}
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("second Close with valid context returned error: %v", err)
+	}
+}
+
 func TestCloseWithCanceledContextDoesNotPublishAfterDeadline(t *testing.T) {
 	var requests atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -345,7 +388,12 @@ func TestEnqueueSnapshotsMutableEventMaps(t *testing.T) {
 		t.Fatalf("Flush returned error: %v", err)
 	}
 
-	request := <-requests
+	var request batchRequest
+	select {
+	case request = <-requests:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for later valid event publish")
+	}
 	if len(request.Events) != 1 {
 		t.Fatalf("expected 1 event, got %d", len(request.Events))
 	}
@@ -451,6 +499,76 @@ func TestPermanentHTTPStatusDoesNotBlockLaterValidEvents(t *testing.T) {
 	}
 }
 
+func TestPermanentEncodeErrorDoesNotBlockLaterValidEvents(t *testing.T) {
+	requests := make(chan batchRequest, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request batchRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		requests <- request
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"accepted":%d,"rejected":0,"duplicates":0}`, len(request.Events))))
+	}))
+	defer server.Close()
+
+	cfg := Config{
+		IngestURL:     server.URL,
+		Token:         "test-token",
+		WorkspaceID:   "workspace-test",
+		AppID:         "app-test",
+		EnvironmentID: "develop",
+		Source:        SourceBackend,
+		AppVersion:    "0.1.0",
+		AppBuild:      "100",
+		Platform:      "linux",
+		BatchSize:     1,
+		BufferSize:    4,
+		FlushInterval: time.Hour,
+		HTTPTimeout:   time.Second,
+	}
+	client := &Client{
+		cfg:       cfg,
+		clock:     realClock{},
+		queue:     newBoundedQueue(4),
+		transport: newHTTPTransport(cfg),
+	}
+
+	if err := client.Enqueue(Event{
+		ID:    "evt-encode-failure",
+		Name:  "encode_failure",
+		Props: map[string]any{"bad": func() {}},
+	}); err != nil {
+		t.Fatalf("Enqueue invalid JSON event returned error: %v", err)
+	}
+	if err := client.Enqueue(Event{ID: "evt-valid", Name: "valid_after_encode_failure"}); err != nil {
+		t.Fatalf("Enqueue valid event returned error: %v", err)
+	}
+
+	batch, err := client.flushAvailable(context.Background(), nil)
+	var encodeErr *EncodeError
+	if !errors.As(err, &encodeErr) {
+		t.Fatalf("expected EncodeError, got %v", err)
+	}
+	if len(batch) != 0 {
+		t.Fatalf("expected permanent encode failure not to retain a batch, got %+v", batch)
+	}
+
+	var request batchRequest
+	select {
+	case request = <-requests:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for later valid event publish")
+	}
+	if len(request.Events) != 1 || request.Events[0].EventName != "valid_after_encode_failure" {
+		t.Fatalf("expected later valid event to publish, got %+v", request.Events)
+	}
+	if stats := client.Snapshot(); stats.FailedBatches != 1 || stats.Dropped != 1 || stats.Published != 1 || stats.Accepted != 1 {
+		t.Fatalf("unexpected stats after encode failure and valid flush: %+v", stats)
+	}
+}
+
 func TestFlushAvailableRetainsFailedBatchAndRetries(t *testing.T) {
 	firstErr := errors.New("first batch failed")
 	transport := &sequenceTransport{firstErr: firstErr}
@@ -551,6 +669,48 @@ func TestRetryableHTTPStatusRetainsFailedBatch(t *testing.T) {
 				t.Fatalf("unexpected stats after retryable status retry: %+v", stats)
 			}
 		})
+	}
+}
+
+func TestPublishWorkerBatchDropsPermanentEncodeFailure(t *testing.T) {
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"accepted":1,"rejected":0,"duplicates":0}`))
+	}))
+	defer server.Close()
+
+	cfg := Config{
+		IngestURL:     server.URL,
+		Token:         "test-token",
+		WorkspaceID:   "workspace-test",
+		AppID:         "app-test",
+		EnvironmentID: "develop",
+		Source:        SourceBackend,
+		BatchSize:     2,
+		HTTPTimeout:   time.Second,
+	}
+	client := &Client{
+		cfg:       cfg,
+		clock:     realClock{},
+		queue:     newBoundedQueue(1),
+		transport: newHTTPTransport(cfg),
+	}
+
+	retained := client.publishWorkerBatch([]Event{{
+		ID:      "evt-encode-failure",
+		Name:    "encode_failure",
+		Context: map[string]any{"bad": func() {}},
+	}})
+	if len(retained) != 0 {
+		t.Fatalf("expected worker to drop permanent encode failure, got %+v", retained)
+	}
+	if stats := client.Snapshot(); stats.FailedBatches != 1 || stats.Dropped != 1 {
+		t.Fatalf("unexpected stats after worker encode failure: %+v", stats)
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("expected no HTTP request for encode failure, got %d", got)
 	}
 }
 
