@@ -11,7 +11,7 @@ Pin that Phase 1 alpha milestone explicitly after tag creation:
 go get github.com/shardpilot/shardpilot-go@v0.1.0
 ```
 
-v0.1.0 is a Phase 1 alpha milestone tied to ADR-0176; it is not a GA or 1.0 release.
+v0.1.0 is an early alpha pre-release; the API is unstable and may change before v1.
 
 Floating release-style install shape:
 
