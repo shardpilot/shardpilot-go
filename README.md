@@ -1,17 +1,18 @@
 # ShardPilot Go SDK
 
 ShardPilot Go SDK is a v0 public-preview source SDK for sending app-first
-telemetry to ShardPilot ingest. The API is pre-1.0 and may change before v1.
-After this PR merges and maintainers create the tag, the first alpha module tag
-for Phase 1 will be `v0.1.0`.
+telemetry to ShardPilot ingest. The API is pre-v1 and may change before v1.
+After this PR merges and maintainers create the tag, the current alpha module
+tag for Phase 1 will be `v0.1.1`.
 
-Pin that Phase 1 alpha milestone explicitly after tag creation:
+Pin the current Phase 1 alpha milestone explicitly after tag creation:
 
 ```bash
-go get github.com/shardpilot/shardpilot-go@v0.1.0
+go get github.com/shardpilot/shardpilot-go@v0.1.1
 ```
 
-v0.1.0 is an early alpha pre-release; the API is unstable and may change before v1.
+v0.1.1 is an early alpha pre-release; the API is unstable and may change before v1.
+v0.1.0 is retracted in v0.1.1+ go.mod; prefer v0.1.1 or later.
 
 Floating release-style install shape:
 
