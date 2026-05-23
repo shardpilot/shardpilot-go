@@ -14,7 +14,3 @@
 - This is a Phase 1 alpha milestone tied to ADR-0176. It is not a GA or 1.0 release.
 
 ## Unreleased
-
-- Add v0 public-preview Go SDK source for app-first ShardPilot ingest.
-- Add bounded async queue, batch transport, lifecycle, stats, tests, example,
-  and CI.
