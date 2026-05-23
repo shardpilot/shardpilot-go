@@ -11,6 +11,6 @@
   retryable HTTP responses.
 - Includes a basic backend example and Go CI coverage for the compatibility
   baseline and current toolchain.
-- This is a Phase 1 alpha milestone tied to ADR-0176. It is not a GA or 1.0 release.
+- This is an early alpha pre-release. The API is unstable and may change before v1.
 
 ## Unreleased
