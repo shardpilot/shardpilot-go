@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -181,8 +182,8 @@ func normalizeIngestURL(raw string) (string, error) {
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 		return "", fmt.Errorf("%w: ingest url must be absolute", ErrInvalidConfig)
 	}
-	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return "", fmt.Errorf("%w: ingest url must use http or https", ErrInvalidConfig)
+	if parsed.Scheme != "https" && !allowInsecureURL(parsed) {
+		return "", fmt.Errorf("%w: ingest url must use https outside localhost or loopback", ErrInvalidConfig)
 	}
 	if parsed.User != nil {
 		return "", fmt.Errorf("%w: ingest url must not include user info", ErrInvalidConfig)
@@ -194,6 +195,21 @@ func normalizeIngestURL(raw string) (string, error) {
 		return "", fmt.Errorf("%w: ingest url must not include a fragment", ErrInvalidConfig)
 	}
 	return strings.TrimRight(parsed.String(), "/"), nil
+}
+
+func allowInsecureURL(parsed *url.URL) bool {
+	if parsed.Scheme != "http" {
+		return false
+	}
+	return isLoopbackHost(parsed.Hostname())
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 type rateSampler struct {

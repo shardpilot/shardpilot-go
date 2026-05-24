@@ -195,6 +195,25 @@ func TestNewClientDefaultHTTPTimeout(t *testing.T) {
 	}
 }
 
+func TestNewClientRejectsNonLocalHTTP(t *testing.T) {
+	_, err := NewClient(ClientOptions{IngestURL: "http://ingest.example.invalid/crashes", APIKey: "workspace-api-key-test"})
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("expected ErrInvalidConfig for non-local http ingest URL, got %v", err)
+	}
+}
+
+func TestNewClientAllowsLoopbackHTTP(t *testing.T) {
+	for _, ingestURL := range []string{
+		"http://localhost:8080/crashes",
+		"http://127.0.0.1:8080/crashes",
+		"http://[::1]:8080/crashes",
+	} {
+		if _, err := NewClient(ClientOptions{IngestURL: ingestURL, APIKey: "workspace-api-key-test"}); err != nil {
+			t.Fatalf("expected loopback http ingest URL %q to be accepted: %v", ingestURL, err)
+		}
+	}
+}
+
 func BenchmarkClientEmit(b *testing.B) {
 	client, err := NewClient(ClientOptions{
 		IngestURL: "https://ingest.example.invalid/crashes",
