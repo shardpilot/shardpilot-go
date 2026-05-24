@@ -748,15 +748,15 @@ func TestSourceCompatibilityBaselineAndCIMatrix(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read go.mod: %v", err)
 	}
-	if !strings.Contains(string(goMod), "\ngo 1.23\n") {
-		t.Fatalf("go.mod must keep Go 1.23 source-compatibility baseline:\n%s", string(goMod))
+	if !strings.Contains(string(goMod), "\ngo 1.24\n") {
+		t.Fatalf("go.mod must keep Go 1.24 source-compatibility baseline:\n%s", string(goMod))
 	}
 
 	workflow, err := os.ReadFile(".github/workflows/ci.yml")
 	if err != nil {
 		t.Fatalf("read CI workflow: %v", err)
 	}
-	for _, version := range []string{"'1.23.x'", "'1.26.3'"} {
+	for _, version := range []string{"'1.24.x'", "'1.26.3'"} {
 		if !strings.Contains(string(workflow), version) {
 			t.Fatalf("CI workflow missing Go matrix version %s", version)
 		}
