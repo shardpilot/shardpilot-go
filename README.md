@@ -3,17 +3,18 @@
 ShardPilot Go SDK is a v0 public-preview source SDK for sending app-first
 telemetry to ShardPilot ingest. The API is pre-v1 and may change before v1.
 After this PR merges and maintainers create the tag, the current alpha module
-tag candidate will be `v0.1.2`.
+tag candidate will be `v0.2.0-alpha`.
 
 Pin the current alpha milestone explicitly after tag creation:
 
 ```bash
-go get github.com/shardpilot/shardpilot-go@v0.1.2
+go get github.com/shardpilot/shardpilot-go@v0.2.0-alpha
 ```
 
-v0.1.2 is an early alpha pre-release; the API is unstable and may change before v1.
-v0.1.2 and later require Go 1.24 or newer.
-v0.1.0 is retracted in v0.1.1+ go.mod; prefer v0.1.2 or later.
+v0.2.0-alpha is an early alpha pre-release; the API is unstable and may change
+before v1. v0.2.0-alpha and later require Go 1.24 or newer. v0.1.0 is
+retracted in v0.1.1+ go.mod; prefer v0.2.0-alpha or later for crash reporting
+or v0.1.2 for analytics-only integrations.
 
 Floating release-style install shape:
 
@@ -57,6 +58,80 @@ err = client.Track(context.Background(), shardpilot.Event{
 
 See [`examples/basic`](examples/basic) for a runnable backend/server example
 using environment variables.
+
+## Crash Reporting
+
+The crash SDK lives in `pkg/crash` and sends sanitized ADR-0191 crash events to
+the configured ShardPilot ingest endpoint. It generates UUIDv7 crash IDs when
+needed, records a fixed ring of analytics-event-name breadcrumbs, strips PII and
+raw identifier material, and intentionally has no API surface for minidumps,
+screenshots, network payloads, or attachments. This is an alpha release; the API
+may change before v1.0.
+
+```go
+package main
+
+import (
+    "context"
+    "log"
+    "os"
+    "time"
+
+    "github.com/shardpilot/shardpilot-go/pkg/crash"
+)
+
+func main() {
+    /*
+        Production crash capture requires hooking the runtime panic handler.
+        This example only demonstrates the client API surface with a synthetic
+        stub event; it does not install a panic handler or capture a real crash.
+    */
+    ingestURL := os.Getenv("SHARDPILOT_INGEST_URL")
+    apiKey := os.Getenv("SHARDPILOT_API_KEY")
+    if ingestURL == "" || apiKey == "" {
+        log.Fatal("SHARDPILOT_INGEST_URL and SHARDPILOT_API_KEY are required")
+    }
+
+    client, err := crash.NewClient(crash.ClientOptions{
+        IngestURL: ingestURL,
+        APIKey:    apiKey,
+    })
+    if err != nil {
+        log.Fatalf("create crash client: %v", err)
+    }
+
+    client.RecordBreadcrumb("session_start")
+    client.RecordBreadcrumb("level_loaded")
+    client.RecordBreadcrumb("boss_intro_seen")
+
+    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+    defer cancel()
+
+    err = client.EmitFatal(ctx, crash.Event{
+        AppVersion:  "0.2.0-alpha",
+        BuildID:     "synthetic-build",
+        OS:          crash.OSInfo{Name: "linux", Version: "synthetic"},
+        DeviceClass: crash.DeviceClassDesktop,
+        StackFrames: []crash.Frame{
+            {Function: "main.syntheticCrash", File: "examples/crash/main.go", Line: 42, Module: "examples-crash"},
+            {Function: "main.main", File: "examples/crash/main.go", Line: 36, Module: "examples-crash"},
+        },
+        ThreadState: crash.ThreadStateMain,
+        SessionID:   "sha256-session-hash-example",
+        OccurredAt:  time.Now().UTC(),
+    })
+    if err != nil {
+        log.Fatalf("emit crash event: %v", err)
+    }
+}
+```
+
+See [`examples/crash`](examples/crash) for the runnable version.
+
+## Versioning
+
+- `v0.1.x` is the analytics SDK only.
+- `v0.2.x` adds the crash SDK under `pkg/crash`; the analytics API is unchanged.
 
 ## Wire Contract
 

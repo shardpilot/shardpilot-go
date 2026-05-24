@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.2.0-alpha — 2026-05-24 — crash SDK alpha
+
+- Adds `pkg/crash` with ADR-0191 event types, UUIDv7 crash IDs, sanitized
+  breadcrumbs, no-PII scrubbing, fatal/non-fatal emit APIs, default non-fatal
+  sampling, and a crash reporting example.
+- Keeps the existing v0.1.x analytics API unchanged.
+- This is an early alpha pre-release. The API is unstable and may change
+  before v1.
+
 ## v0.1.2 — Go 1.24 modernization
 
 - Bumped the `go` directive to 1.24 for Swiss Tables hash map performance and
