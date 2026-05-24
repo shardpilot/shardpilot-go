@@ -97,6 +97,9 @@ func (c *Client) emit(ctx context.Context, event Event, fatal bool) error {
 	if c == nil {
 		return fmt.Errorf("%w: client is nil", ErrInvalidConfig)
 	}
+	if err := c.validateReady(); err != nil {
+		return err
+	}
 	prepared, err := c.prepareEvent(event)
 	if err != nil {
 		return err
@@ -136,6 +139,9 @@ func (c *Client) prepareEvent(event Event) (Event, error) {
 }
 
 func (c *Client) post(ctx context.Context, event Event) error {
+	if err := c.validateReady(); err != nil {
+		return err
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -163,6 +169,22 @@ func (c *Client) post(ctx context.Context, event Event) error {
 		err := &HTTPStatusError{StatusCode: response.StatusCode}
 		c.logf("shardpilot crash ingest failed: %v", err)
 		return err
+	}
+	return nil
+}
+
+func (c *Client) validateReady() error {
+	if c == nil {
+		return fmt.Errorf("%w: client is nil", ErrInvalidConfig)
+	}
+	if strings.TrimSpace(c.ingestURL) == "" {
+		return fmt.Errorf("%w: ingest url is required", ErrInvalidConfig)
+	}
+	if strings.TrimSpace(c.apiKey) == "" {
+		return fmt.Errorf("%w: api key is required", ErrInvalidConfig)
+	}
+	if c.httpClient == nil {
+		return fmt.Errorf("%w: http client is required", ErrInvalidConfig)
 	}
 	return nil
 }

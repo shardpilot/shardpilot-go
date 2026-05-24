@@ -172,6 +172,28 @@ func TestClientEmitFatalBypassesSampler(t *testing.T) {
 	}
 }
 
+func TestClientEmitRejectsZeroValueClient(t *testing.T) {
+	var client Client
+
+	if err := client.Emit(context.Background(), validEvent(t)); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("expected zero-value Emit to return ErrInvalidConfig, got %v", err)
+	}
+	if err := client.EmitFatal(context.Background(), validEvent(t)); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("expected zero-value EmitFatal to return ErrInvalidConfig, got %v", err)
+	}
+}
+
+func TestClientEmitRejectsPartiallyInitializedClient(t *testing.T) {
+	client := &Client{
+		ingestURL: "https://ingest.example.invalid/crashes",
+		apiKey:    "workspace-api-key-test",
+	}
+
+	if err := client.Emit(context.Background(), validEvent(t)); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("expected partially initialized Emit to return ErrInvalidConfig, got %v", err)
+	}
+}
+
 func TestDefaultSamplerEmitsTenPercent(t *testing.T) {
 	sampler := newDefaultSampler()
 	var emitted int
