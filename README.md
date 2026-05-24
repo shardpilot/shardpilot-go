@@ -3,16 +3,17 @@
 ShardPilot Go SDK is a v0 public-preview source SDK for sending app-first
 telemetry to ShardPilot ingest. The API is pre-v1 and may change before v1.
 After this PR merges and maintainers create the tag, the current alpha module
-tag for Phase 1 will be `v0.1.1`.
+tag candidate will be `v0.1.2`.
 
-Pin the current Phase 1 alpha milestone explicitly after tag creation:
+Pin the current alpha milestone explicitly after tag creation:
 
 ```bash
-go get github.com/shardpilot/shardpilot-go@v0.1.1
+go get github.com/shardpilot/shardpilot-go@v0.1.2
 ```
 
-v0.1.1 is an early alpha pre-release; the API is unstable and may change before v1.
-v0.1.0 is retracted in v0.1.1+ go.mod; prefer v0.1.1 or later.
+v0.1.2 is an early alpha pre-release; the API is unstable and may change before v1.
+v0.1.2 and later require Go 1.24 or newer.
+v0.1.0 is retracted in v0.1.1+ go.mod; prefer v0.1.2 or later.
 
 Floating release-style install shape:
 
@@ -23,9 +24,9 @@ go get github.com/shardpilot/shardpilot-go@latest
 For development beyond the tagged alpha milestone, source checkouts or module
 replacements can still be used during evaluation.
 
-The module `go` directive is kept at Go 1.23 as the source-compatibility
+The module `go` directive is kept at Go 1.24 as the source-compatibility
 baseline for SDK consumers. Current supported Go toolchains are still
-recommended for production builds, and CI verifies both Go 1.23.x compatibility
+recommended for production builds, and CI verifies both Go 1.24.x compatibility
 and the current Go toolchain target.
 
 ## Basic Usage
@@ -118,8 +119,8 @@ It is not a top-level ShardPilot ingest envelope field.
   unsanitized stack/backtrace payloads.
 - The SDK does not perform provider, model, GitHub, billing, control-plane
   write, or automatic action calls.
-- Project Tower can use this SDK through normal app-first telemetry, but no
-  Project Tower-specific event names or domain logic live in SDK core.
+- Product integrations can use this SDK through normal app-first telemetry,
+  but no product-specific event names or domain logic live in SDK core.
 
 Developer docs are planned for `docs.shardpilot.com`, but that domain is not
 provisioned or live in this wave.
