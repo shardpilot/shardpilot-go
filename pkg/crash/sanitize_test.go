@@ -9,16 +9,16 @@ import (
 
 func TestSanitizeEventStripsDisallowedOptionalFields(t *testing.T) {
 	event := validEvent(t)
-	event.AppVersion = "sample@example.invalid"
-	event.BuildID = "header.eyJzdWIiOiJ0ZXN0In0.signature"
+	event.App.Version = "sample@example.invalid"
+	event.App.BuildID = "header.eyJzdWIiOiJ0ZXN0In0.signature"
 	event.OS.Name = "desktop 198.51.100.23"
 	event.OS.Version = "2001:db8::1"
-	event.StackFrames = []Frame{{
-		Function: "player_raw_identifier",
-		File:     "safe/file.go",
-		Line:     -12,
-		Module:   "synthetic-module",
-	}}
+	event.Threads[0].Frames[0].Function = "player_raw_identifier"
+	event.Threads[0].Frames[0].File = "safe/file.go"
+	event.Threads[0].Frames[0].Line = -12
+	event.Threads[0].Frames[0].ModuleName = "synthetic-module"
+	event.Device["model"] = "device_raw_identifier"
+	event.Metadata = map[string]string{"safe_key": "safe_value", "unsafe": "sample@example.invalid"}
 	event.Breadcrumbs = []Breadcrumb{
 		{Name: "screen_open", Timestamp: time.Unix(1700000003, 0)},
 		{Name: "sample@example.invalid", Timestamp: time.Unix(1700000004, 0).UTC()},
@@ -31,11 +31,11 @@ func TestSanitizeEventStripsDisallowedOptionalFields(t *testing.T) {
 		t.Fatalf("SanitizeEvent returned error: %v", err)
 	}
 
-	if sanitized.AppVersion != "" {
-		t.Fatalf("expected email-like app version to be stripped, got %q", sanitized.AppVersion)
+	if sanitized.App.Version != "" {
+		t.Fatalf("expected email-like app version to be stripped, got %q", sanitized.App.Version)
 	}
-	if sanitized.BuildID != "" {
-		t.Fatalf("expected JWT-like build id to be stripped, got %q", sanitized.BuildID)
+	if sanitized.App.BuildID != "" {
+		t.Fatalf("expected JWT-like build id to be stripped, got %q", sanitized.App.BuildID)
 	}
 	if sanitized.OS.Name != "" {
 		t.Fatalf("expected IPv4-bearing OS name to be stripped, got %q", sanitized.OS.Name)
@@ -43,14 +43,24 @@ func TestSanitizeEventStripsDisallowedOptionalFields(t *testing.T) {
 	if sanitized.OS.Version != "" {
 		t.Fatalf("expected IPv6-bearing OS version to be stripped, got %q", sanitized.OS.Version)
 	}
-	if sanitized.StackFrames[0].Function != "" {
-		t.Fatalf("expected raw identifier prefix to be stripped, got %q", sanitized.StackFrames[0].Function)
+	frame := sanitized.Threads[0].Frames[0]
+	if frame.Function != "" {
+		t.Fatalf("expected raw identifier prefix to be stripped, got %q", frame.Function)
 	}
-	if sanitized.StackFrames[0].File != "safe/file.go" {
-		t.Fatalf("expected safe frame file to remain, got %q", sanitized.StackFrames[0].File)
+	if frame.File != "safe/file.go" {
+		t.Fatalf("expected safe frame file to remain, got %q", frame.File)
 	}
-	if sanitized.StackFrames[0].Line != 0 {
-		t.Fatalf("expected negative frame line to be clamped to 0, got %d", sanitized.StackFrames[0].Line)
+	if frame.Line != 0 {
+		t.Fatalf("expected negative frame line to be clamped to 0, got %d", frame.Line)
+	}
+	if _, ok := sanitized.Device["model"]; ok {
+		t.Fatalf("expected unsafe device model to be dropped, got %#v", sanitized.Device)
+	}
+	if got := sanitized.Metadata["safe_key"]; got != "safe_value" {
+		t.Fatalf("expected safe metadata to remain, got %#v", sanitized.Metadata)
+	}
+	if _, ok := sanitized.Metadata["unsafe"]; ok {
+		t.Fatalf("expected unsafe metadata to be dropped, got %#v", sanitized.Metadata)
 	}
 	if len(sanitized.Breadcrumbs) != 1 || sanitized.Breadcrumbs[0].Name != "screen_open" {
 		t.Fatalf("expected only safe breadcrumb to remain, got %#v", sanitized.Breadcrumbs)
@@ -73,7 +83,7 @@ func TestSanitizeEventRejectsUnsafeSessionID(t *testing.T) {
 		"header.eyJzdWIiOiJ0ZXN0In0.signature",
 	} {
 		event := validEvent(t)
-		event.SessionID = sessionID
+		event.Context["session_id"] = sessionID
 		if _, err := SanitizeEvent(event); !errors.Is(err, ErrInvalidEvent) {
 			t.Fatalf("expected ErrInvalidEvent for session %q, got %v", sessionID, err)
 		}
@@ -130,19 +140,37 @@ func TestSanitizeEventCapsBreadcrumbs(t *testing.T) {
 func assertEventHasNoDisallowedStrings(t *testing.T, event Event) {
 	t.Helper()
 	values := []string{
-		event.AppVersion,
-		event.BuildID,
+		event.App.ID,
+		event.App.Version,
+		event.App.BuildID,
+		event.Platform,
 		event.OS.Name,
 		event.OS.Version,
-		event.DeviceClass,
-		event.ThreadState,
-		event.SessionID,
+		event.Exception.Type,
+		event.Exception.Reason,
+		event.Exception.CrashedThreadID,
+		event.RawText,
 	}
-	for _, frame := range event.StackFrames {
-		values = append(values, frame.Function, frame.File, frame.Module)
+	for _, module := range event.Modules {
+		values = append(values, module.ID, module.Name, module.Platform, module.DebugID, module.BuildID, module.LoadAddress, module.BaseAddress, module.EndAddress, module.Size)
+	}
+	for _, thread := range event.Threads {
+		values = append(values, thread.ID, thread.Name)
+		for _, frame := range thread.Frames {
+			values = append(values, frame.ModuleID, frame.Module, frame.ModuleName, frame.InstructionAddress, frame.Address, frame.RelativeAddress, frame.Function, frame.File)
+		}
 	}
 	for _, breadcrumb := range event.Breadcrumbs {
-		values = append(values, breadcrumb.Name)
+		values = append(values, breadcrumb.Name, breadcrumb.Type, breadcrumb.Category, breadcrumb.Level, breadcrumb.Message)
+	}
+	for _, value := range event.Device {
+		values = append(values, value)
+	}
+	for _, value := range event.Context {
+		values = append(values, value)
+	}
+	for _, value := range event.Metadata {
+		values = append(values, value)
 	}
 	for _, value := range values {
 		if containsDisallowedContent(value) {

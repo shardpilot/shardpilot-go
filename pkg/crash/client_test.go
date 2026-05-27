@@ -18,6 +18,9 @@ var benchmarkEmitSink Event
 func TestClientEmitRoundTrip(t *testing.T) {
 	var received Event
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/crashes/ingest" {
+			t.Fatalf("unexpected request path: %s", r.URL.Path)
+		}
 		if got := r.Header.Get("Authorization"); got != "Bearer workspace-api-key-test" {
 			t.Fatalf("unexpected Authorization header: %q", got)
 		}
@@ -52,20 +55,13 @@ func TestClientEmitRoundTrip(t *testing.T) {
 	client.RecordBreadcrumb("match.round-start")
 	client.RecordBreadcrumb("screen_open")
 
-	event := Event{
-		AppVersion:  "sample@example.invalid",
-		BuildID:     "header.eyJzdWIiOiJ0ZXN0In0.signature",
-		OS:          OSInfo{Name: "linux", Version: "198.51.100.40"},
-		DeviceClass: DeviceClassDesktop,
-		StackFrames: []Frame{{
-			Function: "main.run",
-			File:     "2001:db8::40",
-			Line:     42,
-			Module:   "device_raw_identifier",
-		}},
-		ThreadState: ThreadStateMain,
-		SessionID:   "sha256-session-hash-test",
-	}
+	event := validEvent(t)
+	event.App.Version = "sample@example.invalid"
+	event.App.BuildID = "header.eyJzdWIiOiJ0ZXN0In0.signature"
+	event.OS.Version = "198.51.100.40"
+	event.Threads[0].Frames[0].File = "2001:db8::40"
+	event.Threads[0].Frames[0].ModuleName = "device_raw_identifier"
+	event.Breadcrumbs = nil
 
 	if err := client.Emit(context.Background(), event); err != nil {
 		t.Fatalf("Emit returned error: %v", err)
@@ -80,14 +76,14 @@ func TestClientEmitRoundTrip(t *testing.T) {
 	if len(received.Breadcrumbs) != 3 {
 		t.Fatalf("expected ring breadcrumbs in payload, got %#v", received.Breadcrumbs)
 	}
-	if received.AppVersion != "" || received.BuildID != "" || received.OS.Version != "" {
+	if received.App.Version != "" || received.App.BuildID != "" || received.OS.Version != "" {
 		t.Fatalf("expected unsafe optional strings to be stripped: %#v", received)
 	}
-	if got := received.StackFrames[0].File; got != "" {
+	if got := received.Threads[0].Frames[0].File; got != "" {
 		t.Fatalf("expected unsafe frame file stripped, got %q", got)
 	}
-	if got := received.StackFrames[0].Module; got != "" {
-		t.Fatalf("expected unsafe frame module stripped, got %q", got)
+	if got := received.Threads[0].Frames[0].ModuleName; got != "" {
+		t.Fatalf("expected unsafe frame module name stripped, got %q", got)
 	}
 	assertEventHasNoDisallowedStrings(t, received)
 }
@@ -135,13 +131,41 @@ func TestClientEmitRejectsInvalidEventBeforePost(t *testing.T) {
 		t.Fatalf("NewClient: %v", err)
 	}
 	event := validEvent(t)
-	event.SessionID = "player_session_hash"
+	event.Context["session_id"] = "player_session_hash"
 
 	if err := client.Emit(context.Background(), event); !errors.Is(err, ErrInvalidEvent) {
 		t.Fatalf("expected ErrInvalidEvent, got %v", err)
 	}
 	if got := requests.Load(); got != 0 {
 		t.Fatalf("expected invalid event not to post, got %d requests", got)
+	}
+}
+
+func TestClientRetriesRetryableStatus(t *testing.T) {
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	client, err := NewClient(ClientOptions{
+		IngestURL:    server.URL,
+		APIKey:       "workspace-api-key-test",
+		Sampler:      alwaysSampler{},
+		RetryBackoff: time.Nanosecond,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if err := client.Emit(context.Background(), validEvent(t)); err != nil {
+		t.Fatalf("Emit returned error: %v", err)
+	}
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("expected one retry, got %d requests", got)
 	}
 }
 
@@ -185,8 +209,10 @@ func TestClientEmitRejectsZeroValueClient(t *testing.T) {
 
 func TestClientEmitRejectsPartiallyInitializedClient(t *testing.T) {
 	client := &Client{
-		ingestURL: "https://ingest.example.invalid/crashes",
-		apiKey:    "workspace-api-key-test",
+		ingestURL:    "https://ingest.example.invalid/api/v1/crashes/ingest",
+		apiKey:       "workspace-api-key-test",
+		maxAttempts:  1,
+		retryBackoff: time.Millisecond,
 	}
 
 	if err := client.Emit(context.Background(), validEvent(t)); !errors.Is(err, ErrInvalidConfig) {
@@ -208,7 +234,7 @@ func TestDefaultSamplerEmitsTenPercent(t *testing.T) {
 }
 
 func TestNewClientDefaultHTTPTimeout(t *testing.T) {
-	client, err := NewClient(ClientOptions{IngestURL: "https://ingest.example.invalid/crashes", APIKey: "workspace-api-key-test"})
+	client, err := NewClient(ClientOptions{IngestURL: "https://ingest.example.invalid", APIKey: "workspace-api-key-test"})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -218,7 +244,7 @@ func TestNewClientDefaultHTTPTimeout(t *testing.T) {
 }
 
 func TestNewClientRejectsNonLocalHTTP(t *testing.T) {
-	_, err := NewClient(ClientOptions{IngestURL: "http://ingest.example.invalid/crashes", APIKey: "workspace-api-key-test"})
+	_, err := NewClient(ClientOptions{IngestURL: "http://ingest.example.invalid", APIKey: "workspace-api-key-test"})
 	if !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("expected ErrInvalidConfig for non-local http ingest URL, got %v", err)
 	}
@@ -226,9 +252,9 @@ func TestNewClientRejectsNonLocalHTTP(t *testing.T) {
 
 func TestNewClientAllowsLoopbackHTTP(t *testing.T) {
 	for _, ingestURL := range []string{
-		"http://localhost:8080/crashes",
-		"http://127.0.0.1:8080/crashes",
-		"http://[::1]:8080/crashes",
+		"http://localhost:8086",
+		"http://127.0.0.1:8086",
+		"http://[::1]:8086",
 	} {
 		if _, err := NewClient(ClientOptions{IngestURL: ingestURL, APIKey: "workspace-api-key-test"}); err != nil {
 			t.Fatalf("expected loopback http ingest URL %q to be accepted: %v", ingestURL, err)
@@ -238,7 +264,7 @@ func TestNewClientAllowsLoopbackHTTP(t *testing.T) {
 
 func BenchmarkClientEmit(b *testing.B) {
 	client, err := NewClient(ClientOptions{
-		IngestURL: "https://ingest.example.invalid/crashes",
+		IngestURL: "https://ingest.example.invalid",
 		APIKey:    "workspace-api-key-test",
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			_, _ = io.Copy(io.Discard, req.Body)
@@ -282,15 +308,31 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 
 func validEventForBenchmark() Event {
 	return Event{
-		CrashID:     "018bcfe5-5680-7cc8-a7b8-7f6b0a5969de",
-		AppVersion:  "0.2.0-alpha-bench",
-		BuildID:     "build-bench",
-		OS:          OSInfo{Name: "linux", Version: "bench"},
-		DeviceClass: DeviceClassDesktop,
-		StackFrames: []Frame{{Function: "main.run", File: "main.go", Line: 42, Module: "bench-module"}},
+		CrashID:    "018bcfe5-5680-7cc8-a7b8-7f6b0a5969de",
+		OccurredAt: time.Unix(1700000002, 0).UTC(),
+		App:        AppInfo{ID: "app_bench", Version: "0.2.0-alpha-bench", BuildID: "build-bench"},
+		Platform:   "linux",
+		OS:         OSInfo{Name: "linux", Version: "bench"},
+		Device:     map[string]string{"class": DeviceClassDesktop, "arch": "x86_64"},
+		Context:    map[string]string{"session_id": "sha256-session-hash-bench"},
+		Exception:  ExceptionInfo{Type: "SIGSEGV", CrashedThreadID: "main"},
+		Modules: []Module{{
+			ID:          "bench",
+			Name:        "bench-module",
+			DebugID:     "AABBCCDDEEFF00112233445566778899",
+			LoadAddress: "0x400000",
+		}},
+		Threads: []Thread{{
+			ID:      "main",
+			Crashed: true,
+			Frames: []Frame{{
+				ModuleID:           "bench",
+				InstructionAddress: "0x401015",
+				Function:           "main.run",
+				File:               "main.go",
+				Line:               42,
+			}},
+		}},
 		Breadcrumbs: []Breadcrumb{{Name: "screen_open", Timestamp: time.Unix(1700000001, 0).UTC()}},
-		ThreadState: ThreadStateMain,
-		SessionID:   "sha256-session-hash-bench",
-		OccurredAt:  time.Unix(1700000002, 0).UTC(),
 	}
 }

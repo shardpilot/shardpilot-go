@@ -32,7 +32,10 @@ func TestUUIDv7Validation(t *testing.T) {
 
 func TestValidateEventCapsStackFrames(t *testing.T) {
 	event := validEvent(t)
-	event.StackFrames = make([]Frame, maxStackFrames+1)
+	event.Threads[0].Frames = make([]Frame, maxStackFrames+1)
+	for i := range event.Threads[0].Frames {
+		event.Threads[0].Frames[i] = Frame{ModuleID: "synthetic", InstructionAddress: "0x401015"}
+	}
 
 	if err := validateEvent(event); !errors.Is(err, ErrInvalidEvent) {
 		t.Fatalf("expected ErrInvalidEvent for too many stack frames, got %v", err)
@@ -40,18 +43,10 @@ func TestValidateEventCapsStackFrames(t *testing.T) {
 }
 
 func TestNormalizeEventTimesUsesUTC(t *testing.T) {
-	id, err := newCrashIDAt(time.Unix(1700000000, 0).UTC())
-	if err != nil {
-		t.Fatalf("newCrashIDAt: %v", err)
-	}
 	local := time.FixedZone("synthetic-zone", 3*60*60)
-	event := Event{
-		CrashID:     id,
-		DeviceClass: DeviceClassDesktop,
-		ThreadState: ThreadStateMain,
-		OccurredAt:  time.Date(2026, 5, 24, 12, 0, 0, 0, local),
-		Breadcrumbs: []Breadcrumb{{Name: "screen_open", Timestamp: time.Date(2026, 5, 24, 12, 0, 1, 0, local)}},
-	}
+	event := validEvent(t)
+	event.OccurredAt = time.Date(2026, 5, 24, 12, 0, 0, 0, local)
+	event.Breadcrumbs = []Breadcrumb{{Name: "screen_open", Timestamp: time.Date(2026, 5, 24, 12, 0, 1, 0, local)}}
 
 	normalized := normalizeEventTimes(event, time.Unix(1700000000, 0).UTC())
 	if normalized.OccurredAt.Location() != time.UTC {
@@ -65,17 +60,21 @@ func TestNormalizeEventTimesUsesUTC(t *testing.T) {
 	}
 }
 
+func TestNormalizeEventShapeDefaultsCrashedThread(t *testing.T) {
+	event := validEvent(t)
+	event.Exception.CrashedThreadID = ""
+	event.Threads[0].Crashed = false
+	normalized := normalizeEventShape(event)
+	if normalized.Exception.CrashedThreadID != "main" || !normalized.Threads[0].Crashed {
+		t.Fatalf("crashed thread not defaulted: %+v", normalized)
+	}
+}
+
 func TestValidateEventEnums(t *testing.T) {
 	event := validEvent(t)
-	event.DeviceClass = "watch"
+	event.Device["class"] = "watch"
 	if err := validateEvent(event); !errors.Is(err, ErrInvalidEvent) {
 		t.Fatalf("expected invalid device class error, got %v", err)
-	}
-
-	event = validEvent(t)
-	event.ThreadState = "worker"
-	if err := validateEvent(event); !errors.Is(err, ErrInvalidEvent) {
-		t.Fatalf("expected invalid thread state error, got %v", err)
 	}
 }
 
@@ -86,15 +85,31 @@ func validEvent(t *testing.T) Event {
 		t.Fatalf("newCrashIDAt: %v", err)
 	}
 	return Event{
-		CrashID:     id,
-		AppVersion:  "0.2.0-alpha-test",
-		BuildID:     "build-test",
-		OS:          OSInfo{Name: "linux", Version: "test"},
-		DeviceClass: DeviceClassDesktop,
-		StackFrames: []Frame{{Function: "main.run", File: "main.go", Line: 42, Module: "synthetic-module"}},
+		CrashID:    id,
+		OccurredAt: time.Unix(1700000002, 0).UTC(),
+		App:        AppInfo{ID: "app_test_001", Version: "0.2.0-alpha-test", BuildID: "build-test"},
+		Platform:   "linux",
+		OS:         OSInfo{Name: "linux", Version: "test"},
+		Device:     map[string]string{"class": DeviceClassDesktop, "arch": "x86_64"},
+		Context:    map[string]string{"session_id": "sha256-session-hash-test"},
+		Exception:  ExceptionInfo{Type: "SIGSEGV", Reason: "synthetic fault", CrashedThreadID: "main"},
+		Modules: []Module{{
+			ID:          "synthetic",
+			Name:        "synthetic-module",
+			DebugID:     "AABBCCDDEEFF00112233445566778899",
+			LoadAddress: "0x400000",
+		}},
+		Threads: []Thread{{
+			ID:      "main",
+			Crashed: true,
+			Frames: []Frame{{
+				ModuleID:           "synthetic",
+				InstructionAddress: "0x401015",
+				Function:           "main.run",
+				File:               "main.go",
+				Line:               42,
+			}},
+		}},
 		Breadcrumbs: []Breadcrumb{{Name: "screen_open", Timestamp: time.Unix(1700000001, 0).UTC()}},
-		ThreadState: ThreadStateMain,
-		SessionID:   "sha256-session-hash-test",
-		OccurredAt:  time.Unix(1700000002, 0).UTC(),
 	}
 }

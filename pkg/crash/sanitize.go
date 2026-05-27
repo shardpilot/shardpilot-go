@@ -9,6 +9,7 @@ import (
 
 var (
 	analyticsEventNamePattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_.:-]{0,127}$`)
+	mapKeyPattern             = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_.:-]{0,63}$`)
 	ipv4Pattern               = regexp.MustCompile(`(?:^|[^0-9])((?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9]))(?:$|[^0-9])`)
 	ipv6CandidatePattern      = regexp.MustCompile(`[0-9A-Fa-f:.]{3,}`)
 	jwtPattern                = regexp.MustCompile(`(?:^|[^A-Za-z0-9_-])([A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,})(?:$|[^A-Za-z0-9_-])`)
@@ -32,26 +33,51 @@ func (sanitizer) Event(event Event) (Event, error) {
 func SanitizeEvent(event Event) (Event, error) {
 	event = cloneEvent(event)
 	event.CrashID = strings.TrimSpace(event.CrashID)
-
-	sessionID := strings.TrimSpace(event.SessionID)
-	if containsDisallowedContent(sessionID) {
-		return Event{}, fmt.Errorf("%w: session_id contains disallowed identifier material", ErrInvalidEvent)
-	}
-	event.SessionID = sessionID
-
-	event.AppVersion = sanitizeString(event.AppVersion)
-	event.BuildID = sanitizeString(event.BuildID)
+	event.App.ID = sanitizeString(event.App.ID)
+	event.App.Version = sanitizeString(event.App.Version)
+	event.App.BuildID = sanitizeString(event.App.BuildID)
+	event.Platform = sanitizeString(event.Platform)
 	event.OS.Name = sanitizeString(event.OS.Name)
 	event.OS.Version = sanitizeString(event.OS.Version)
-	event.DeviceClass = sanitizeString(event.DeviceClass)
-	event.ThreadState = sanitizeString(event.ThreadState)
+	event.Exception.Type = sanitizeString(event.Exception.Type)
+	event.Exception.Reason = sanitizeString(event.Exception.Reason)
+	event.Exception.CrashedThreadID = sanitizeString(event.Exception.CrashedThreadID)
+	event.RawText = sanitizeString(event.RawText)
+	if sessionID := event.Context["session_id"]; containsDisallowedContent(sessionID) {
+		return Event{}, fmt.Errorf("%w: context.session_id contains disallowed identifier material", ErrInvalidEvent)
+	}
+	event.Device = sanitizeStringMap(event.Device)
+	event.Context = sanitizeStringMap(event.Context)
+	event.Metadata = sanitizeStringMap(event.Metadata)
 
-	for i := range event.StackFrames {
-		event.StackFrames[i].Function = sanitizeString(event.StackFrames[i].Function)
-		event.StackFrames[i].File = sanitizeString(event.StackFrames[i].File)
-		event.StackFrames[i].Module = sanitizeString(event.StackFrames[i].Module)
-		if event.StackFrames[i].Line < 0 {
-			event.StackFrames[i].Line = 0
+	for i := range event.Modules {
+		event.Modules[i].ID = sanitizeString(event.Modules[i].ID)
+		event.Modules[i].Name = sanitizeString(event.Modules[i].Name)
+		event.Modules[i].Platform = sanitizeString(event.Modules[i].Platform)
+		event.Modules[i].DebugID = sanitizeString(event.Modules[i].DebugID)
+		event.Modules[i].BuildID = sanitizeString(event.Modules[i].BuildID)
+		event.Modules[i].LoadAddress = sanitizeString(event.Modules[i].LoadAddress)
+		event.Modules[i].BaseAddress = sanitizeString(event.Modules[i].BaseAddress)
+		event.Modules[i].EndAddress = sanitizeString(event.Modules[i].EndAddress)
+		event.Modules[i].Size = sanitizeString(event.Modules[i].Size)
+	}
+
+	for i := range event.Threads {
+		event.Threads[i].ID = sanitizeString(event.Threads[i].ID)
+		event.Threads[i].Name = sanitizeString(event.Threads[i].Name)
+		for j := range event.Threads[i].Frames {
+			frame := &event.Threads[i].Frames[j]
+			frame.ModuleID = sanitizeString(frame.ModuleID)
+			frame.Module = sanitizeString(frame.Module)
+			frame.ModuleName = sanitizeString(frame.ModuleName)
+			frame.InstructionAddress = sanitizeString(frame.InstructionAddress)
+			frame.Address = sanitizeString(frame.Address)
+			frame.RelativeAddress = sanitizeString(frame.RelativeAddress)
+			frame.Function = sanitizeString(frame.Function)
+			frame.File = sanitizeString(frame.File)
+			if frame.Line < 0 {
+				frame.Line = 0
+			}
 		}
 	}
 
@@ -63,11 +89,17 @@ func SanitizeEvent(event Event) (Event, error) {
 			continue
 		}
 		breadcrumb.Name = name
+		breadcrumb.Type = sanitizeString(breadcrumb.Type)
+		breadcrumb.Category = sanitizeString(breadcrumb.Category)
+		breadcrumb.Level = sanitizeString(breadcrumb.Level)
+		breadcrumb.Message = sanitizeString(breadcrumb.Message)
 		breadcrumb.Timestamp = breadcrumb.Timestamp.UTC()
 		breadcrumbs = append(breadcrumbs, breadcrumb)
 	}
 	event.Breadcrumbs = breadcrumbs
+	event.FingerprintComponents = sanitizeStringSlice(event.FingerprintComponents)
 	event.OccurredAt = event.OccurredAt.UTC()
+
 	return event, nil
 }
 
@@ -77,6 +109,39 @@ func sanitizeString(value string) string {
 		return ""
 	}
 	return value
+}
+
+func sanitizeStringMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := map[string]string{}
+	for key, value := range in {
+		key = strings.TrimSpace(key)
+		if !mapKeyPattern.MatchString(key) || containsDisallowedContent(key) {
+			continue
+		}
+		value = sanitizeString(value)
+		if value == "" {
+			continue
+		}
+		out[key] = value
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func sanitizeStringSlice(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, value := range in {
+		value = sanitizeString(value)
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 func sanitizeBreadcrumbName(name string) (string, bool) {
