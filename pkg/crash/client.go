@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -15,22 +16,28 @@ import (
 )
 
 const defaultHTTPTimeout = 30 * time.Second
+const defaultMaxAttempts = 2
+const defaultRetryBackoff = 50 * time.Millisecond
 
 type Client struct {
-	ingestURL   string
-	apiKey      string
-	httpClient  *http.Client
-	logger      Logger
-	sampler     Sampler
-	breadcrumbs *breadcrumbRing
+	ingestURL    string
+	apiKey       string
+	httpClient   *http.Client
+	logger       Logger
+	sampler      Sampler
+	breadcrumbs  *breadcrumbRing
+	maxAttempts  int
+	retryBackoff time.Duration
 }
 
 type ClientOptions struct {
-	IngestURL  string
-	APIKey     string
-	HTTPClient *http.Client
-	Logger     Logger
-	Sampler    Sampler
+	IngestURL    string
+	APIKey       string
+	HTTPClient   *http.Client
+	Logger       Logger
+	Sampler      Sampler
+	MaxAttempts  int
+	RetryBackoff time.Duration
 }
 
 type Logger interface {
@@ -47,6 +54,10 @@ type HTTPStatusError struct {
 
 func (e *HTTPStatusError) Error() string {
 	return fmt.Sprintf("shardpilot crash ingest returned status %d", e.StatusCode)
+}
+
+func (e *HTTPStatusError) Retryable() bool {
+	return e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
 }
 
 func NewClient(opts ClientOptions) (*Client, error) {
@@ -67,14 +78,24 @@ func NewClient(opts ClientOptions) (*Client, error) {
 	if sampler == nil {
 		sampler = newDefaultSampler()
 	}
+	maxAttempts := opts.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = defaultMaxAttempts
+	}
+	retryBackoff := opts.RetryBackoff
+	if retryBackoff <= 0 {
+		retryBackoff = defaultRetryBackoff
+	}
 
 	return &Client{
-		ingestURL:   ingestURL,
-		apiKey:      apiKey,
-		httpClient:  httpClient,
-		logger:      opts.Logger,
-		sampler:     sampler,
-		breadcrumbs: newBreadcrumbRing(),
+		ingestURL:    ingestURL,
+		apiKey:       apiKey,
+		httpClient:   httpClient,
+		logger:       opts.Logger,
+		sampler:      sampler,
+		breadcrumbs:  newBreadcrumbRing(),
+		maxAttempts:  maxAttempts,
+		retryBackoff: retryBackoff,
 	}, nil
 }
 
@@ -127,6 +148,7 @@ func (c *Client) prepareEvent(event Event) (Event, error) {
 		event.Breadcrumbs = capBreadcrumbs(event.Breadcrumbs)
 	}
 	event = normalizeEventTimes(event, time.Now().UTC())
+	event = normalizeEventShape(event)
 
 	sanitized, err := sanitize.Event(event)
 	if err != nil {
@@ -139,6 +161,24 @@ func (c *Client) prepareEvent(event Event) (Event, error) {
 }
 
 func (c *Client) post(ctx context.Context, event Event) error {
+	var lastErr error
+	for attempt := 1; attempt <= c.maxAttempts; attempt++ {
+		err := c.postOnce(ctx, event)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if attempt >= c.maxAttempts || !retryableError(err) {
+			return err
+		}
+		if waitErr := sleepContext(ctx, c.retryBackoff*time.Duration(attempt)); waitErr != nil {
+			return waitErr
+		}
+	}
+	return lastErr
+}
+
+func (c *Client) postOnce(ctx context.Context, event Event) error {
 	if err := c.validateReady(); err != nil {
 		return err
 	}
@@ -186,6 +226,12 @@ func (c *Client) validateReady() error {
 	if c.httpClient == nil {
 		return fmt.Errorf("%w: http client is required", ErrInvalidConfig)
 	}
+	if c.maxAttempts <= 0 {
+		return fmt.Errorf("%w: max attempts must be positive", ErrInvalidConfig)
+	}
+	if c.retryBackoff <= 0 {
+		return fmt.Errorf("%w: retry backoff must be positive", ErrInvalidConfig)
+	}
 	return nil
 }
 
@@ -216,7 +262,13 @@ func normalizeIngestURL(raw string) (string, error) {
 	if parsed.Fragment != "" {
 		return "", fmt.Errorf("%w: ingest url must not include a fragment", ErrInvalidConfig)
 	}
-	return strings.TrimRight(parsed.String(), "/"), nil
+	if parsed.Path != "" && parsed.Path != "/" {
+		return "", fmt.Errorf("%w: ingest url must be the crash-symbolicator base URL", ErrInvalidConfig)
+	}
+	parsed.Path = ""
+	parsed.RawPath = ""
+	parsed.ForceQuery = false
+	return strings.TrimRight(parsed.String(), "/") + "/api/v1/crashes/ingest", nil
 }
 
 func allowInsecureURL(parsed *url.URL) bool {
@@ -248,4 +300,38 @@ func (s *rateSampler) ShouldEmit(Event) bool {
 		return true
 	}
 	return s.counter.Add(1)%s.every == 0
+}
+
+func retryableError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	type retryable interface {
+		Retryable() bool
+	}
+	var statusErr retryable
+	if errors.As(err, &statusErr) {
+		return statusErr.Retryable()
+	}
+	return true
+}
+
+func sleepContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }

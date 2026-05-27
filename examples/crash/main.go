@@ -15,10 +15,10 @@ func main() {
 		This example only demonstrates the client API surface with a synthetic
 		stub event; it does not install a panic handler or capture a real crash.
 	*/
-	ingestURL := os.Getenv("SHARDPILOT_INGEST_URL")
+	ingestURL := os.Getenv("SHARDPILOT_CRASH_SYMBOLICATOR_URL")
 	apiKey := os.Getenv("SHARDPILOT_API_KEY")
 	if ingestURL == "" || apiKey == "" {
-		log.Fatal("SHARDPILOT_INGEST_URL and SHARDPILOT_API_KEY are required")
+		log.Fatal("SHARDPILOT_CRASH_SYMBOLICATOR_URL and SHARDPILOT_API_KEY are required")
 	}
 
 	client, err := crash.NewClient(crash.ClientOptions{
@@ -37,17 +37,28 @@ func main() {
 	defer cancel()
 
 	err = client.EmitFatal(ctx, crash.Event{
-		AppVersion:  "0.2.0-alpha",
-		BuildID:     "synthetic-build",
-		OS:          crash.OSInfo{Name: "linux", Version: "synthetic"},
-		DeviceClass: crash.DeviceClassDesktop,
-		StackFrames: []crash.Frame{
-			{Function: "main.syntheticCrash", File: "examples/crash/main.go", Line: 42, Module: "examples-crash"},
-			{Function: "main.main", File: "examples/crash/main.go", Line: 36, Module: "examples-crash"},
-		},
-		ThreadState: crash.ThreadStateMain,
-		SessionID:   "sha256-session-hash-example",
-		OccurredAt:  time.Now().UTC(),
+		OccurredAt: time.Now().UTC(),
+		App:        crash.AppInfo{ID: "app_example", Version: "0.2.0-alpha", BuildID: "synthetic-build"},
+		Platform:   "linux",
+		OS:         crash.OSInfo{Name: "linux", Version: "synthetic"},
+		Device:     map[string]string{"class": crash.DeviceClassDesktop, "arch": "x86_64"},
+		Context:    map[string]string{"session_id": "sha256-session-hash-example"},
+		Exception:  crash.ExceptionInfo{Type: "SIGSEGV", Reason: "synthetic fault", CrashedThreadID: "main"},
+		Modules: []crash.Module{{
+			ID:          "examples-crash",
+			Name:        "examples-crash",
+			DebugID:     "AABBCCDDEEFF00112233445566778899",
+			LoadAddress: "0x400000",
+		}},
+		Threads: []crash.Thread{{
+			ID:      "main",
+			Name:    "main",
+			Crashed: true,
+			Frames: []crash.Frame{
+				{ModuleID: "examples-crash", InstructionAddress: "0x401015", Function: "main.syntheticCrash", File: "examples/crash/main.go", Line: 42},
+				{ModuleID: "examples-crash", InstructionAddress: "0x401000", Function: "main.main", File: "examples/crash/main.go", Line: 36},
+			},
+		}},
 	})
 	if err != nil {
 		log.Fatalf("emit crash event: %v", err)
