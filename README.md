@@ -169,8 +169,10 @@ The SDK does not expose or send legacy public SDK fields such as `project_id`,
 `build_version`. Use `app_version` or `app_build` for application version
 metadata.
 
-`MatchID` is a convenience metadata field and is placed under `props.match_id`.
-It is not a top-level ShardPilot ingest envelope field.
+The `Event` envelope is universal and does not carry domain-specific fields.
+Game- or vertical-specific context (for example `match_id`) goes in `Props`,
+which is sent as `props` (e.g. `Props["match_id"]` is serialized to
+`props.match_id`). It is not a top-level ShardPilot ingest envelope field.
 
 The crash SDK sends:
 

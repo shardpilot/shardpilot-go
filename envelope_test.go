@@ -43,9 +43,9 @@ func TestTrackSendsAppFirstEnvelope(t *testing.T) {
 		AnonymousID:     "anonymous-example",
 		SessionID:       "session-example",
 		SessionSequence: 1,
-		MatchID:         "match-example",
 		Props: map[string]any{
-			"surface": "test",
+			"surface":  "test",
+			"match_id": "match-example",
 		},
 	})
 	if err != nil {

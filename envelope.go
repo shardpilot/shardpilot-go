@@ -51,14 +51,6 @@ func (c *Client) buildEnvelope(event Event) (eventEnvelope, error) {
 	}
 
 	props := cloneMap(event.Props)
-	if event.MatchID != "" {
-		if props == nil {
-			props = make(map[string]any, 1)
-		}
-		if _, exists := props["match_id"]; !exists {
-			props["match_id"] = event.MatchID
-		}
-	}
 
 	platform := firstNonEmpty(event.Platform, c.cfg.Platform)
 	appVersion := firstNonEmpty(event.AppVersion, c.cfg.AppVersion)
