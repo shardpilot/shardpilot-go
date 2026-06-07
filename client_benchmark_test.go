@@ -80,11 +80,11 @@ func benchmarkEvent() Event {
 		AnonymousID:     "anon-bench",
 		SessionID:       "session-bench",
 		SessionSequence: 42,
-		MatchID:         "match-bench",
 		Platform:        "server",
 		AppVersion:      "0.1.2-bench",
 		AppBuild:        "bench-build",
 		Props: map[string]any{
+			"match_id":     "match-bench",
 			"level":        12,
 			"mode":         "arena",
 			"score":        98233,

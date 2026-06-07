@@ -10,7 +10,6 @@ type Event struct {
 	AnonymousID     string
 	SessionID       string
 	SessionSequence int64
-	MatchID         string
 	Platform        string
 	AppVersion      string
 	AppBuild        string

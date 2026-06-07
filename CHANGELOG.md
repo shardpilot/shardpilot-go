@@ -1,5 +1,27 @@
 # Changelog
 
+## v0.3.0-alpha — 2026-06-07 — universal envelope (proposed)
+
+- BREAKING: Removed the game-flavored `MatchID` field from the universal
+  `Event` envelope. ShardPilot is a universal multi-tenant analytics platform;
+  domain-specific context does not belong on the universal envelope.
+- Migration: move any `Event.MatchID` usage into the existing `Props` map as
+  `Props["match_id"]` (it is serialized to `props.match_id`, exactly as before).
+  No other behavior changes — the wire payload is unchanged when you set
+  `Props["match_id"]`.
+
+  ```go
+  // before
+  client.Track(ctx, shardpilot.Event{Name: "match_end", MatchID: "m-123"})
+
+  // after
+  client.Track(ctx, shardpilot.Event{Name: "match_end", Props: map[string]any{"match_id": "m-123"}})
+  ```
+
+- This is an early alpha pre-release. The API is unstable and may change
+  before v1. Version bump is proposed (`v0.3.0-alpha`); the git tag is not yet
+  created.
+
 ## v0.2.0-alpha — 2026-05-24 — crash SDK alpha
 
 - Adds `pkg/crash` with ADR-0191 event types, UUIDv7 crash IDs, sanitized
