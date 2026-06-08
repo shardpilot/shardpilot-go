@@ -756,7 +756,7 @@ func TestSourceCompatibilityBaselineAndCIMatrix(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read CI workflow: %v", err)
 	}
-	for _, version := range []string{"'1.24.x'", "'1.26.3'"} {
+	for _, version := range []string{"'1.24.x'", "'1.26.4'"} {
 		if !strings.Contains(string(workflow), version) {
 			t.Fatalf("CI workflow missing Go matrix version %s", version)
 		}
