@@ -107,8 +107,9 @@ consent decision, with tri-state semantics:
   open.
 - **granted**: the pipeline is open.
 - **denied**: events are dropped at enqueue — `Track` and `Enqueue` return
-  `ErrConsentDenied` — and the pending queue is cleared (cleared events count
-  as `Dropped` in `Snapshot`).
+  `ErrConsentDenied` — the pending queue is cleared, and any event batch
+  publish already in flight on the network is aborted (cleared and aborted
+  events count as `Dropped` in `Snapshot`, never as `Published`).
 
 The state is held in client memory only; the SDK does not persist it. If
 consent must survive process restarts, read `Client.Consent()` after a
@@ -120,10 +121,12 @@ same bearer-token transport as event batches, using `Config.UserID`
 (preferred) or `Config.AnonymousID` as `actor_identifier`. The post is
 fire-and-forget for the caller — `SetConsent` never blocks on the network —
 but decisions are transmitted by a single per-client sender in call order, so
-a deny-then-grant cannot arrive at the server reversed. Failures are logged
-quietly via `Config.Logger` and never affect the local state. If neither
-identity field is configured, the decision applies locally only and no
-request is sent. Consent never rides the event envelope.
+a deny-then-grant cannot arrive at the server reversed. `Close` waits
+(bounded by its context) for decisions recorded before it was called to
+finish transmitting. Failures are logged quietly via `Config.Logger` and
+never affect the local state. If neither identity field is configured, the
+decision applies locally only and no request is sent. Consent never rides
+the event envelope.
 
 ## Crash Reporting
 
@@ -283,9 +286,9 @@ pre-symbolicated frame fields, optional `raw_text`, and breadcrumbs.
   returns `ErrQueueFull`.
 - While consent is denied, `Track` and `Enqueue` drop the event, increment
   `Dropped`, and return `ErrConsentDenied`; events pending at the moment of
-  denial — both queued and already pulled into the worker's in-flight batch —
-  are cleared and counted as `Dropped`, and never publish even if consent is
-  granted again later.
+  denial — queued, already pulled into the worker's batch, or mid-publish on
+  the network (the HTTP request is aborted) — are cleared and counted as
+  `Dropped`, and never publish even if consent is granted again later.
 - `Track` sends one event synchronously for tests and utilities.
 - `Flush` drains queued events.
 - `Close` marks the client closed and flushes remaining queued events until the

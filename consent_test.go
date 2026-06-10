@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -350,6 +351,162 @@ func TestConsentDenyThenGrantDropsWorkerHeldBatch(t *testing.T) {
 	}
 	if got := eventCount.Load(); got != 1 {
 		t.Fatalf("expected exactly the post-grant event to publish, got %d", got)
+	}
+}
+
+func TestCloseWaitsForPendingConsentPublish(t *testing.T) {
+	consentStarted := make(chan struct{})
+	releaseConsent := make(chan struct{})
+	var consentStartedOnce, releaseOnce sync.Once
+	var consentPosts atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/consent":
+			consentStartedOnce.Do(func() { close(consentStarted) })
+			<-releaseConsent
+			consentPosts.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"recorded":true,"replayed":false}`))
+		case "/v1/events:batch":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"accepted":0,"rejected":0,"duplicates":0}`))
+		default:
+			t.Errorf("unexpected request path %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	// Unblock the handler before server.Close (defers run LIFO) so a test
+	// failure cannot deadlock the server shutdown.
+	defer releaseOnce.Do(func() { close(releaseConsent) })
+
+	client := newConsentTestClient(t, server.URL, "user-actor", "")
+
+	client.SetConsent(true)
+	select {
+	case <-consentStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for the consent POST to start")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- client.Close(context.Background()) }()
+
+	// While the consent POST is held open, Close must keep waiting on the
+	// sender instead of returning with the decision untransmitted.
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned (err=%v) while the recorded consent decision was still untransmitted", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	releaseOnce.Do(func() { close(releaseConsent) })
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close returned error: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for Close after releasing the consent POST")
+	}
+	if got := consentPosts.Load(); got != 1 {
+		t.Fatalf("expected the consent POST to complete before Close returned, got %d", got)
+	}
+}
+
+func TestConsentDenialCancelsInFlightPublish(t *testing.T) {
+	const batchSize = 3
+
+	publishStarted := make(chan struct{})
+	publishResolved := make(chan error, 1)
+	var publishStartedOnce sync.Once
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/events:batch":
+			// Drain the body first: the server only watches for a client
+			// disconnect (cancelling r.Context()) once the request body is
+			// consumed and its background read is active.
+			_, _ = io.Copy(io.Discard, r.Body)
+			publishStartedOnce.Do(func() { close(publishStarted) })
+			// Hold the publish open until the SDK aborts the request (the
+			// denial cancellation, surfacing as r.Context().Done()) or the
+			// failure-mode timeout proves no abort happened. Both arms stay
+			// well under the client's HTTPTimeout so a timeout cannot
+			// masquerade as the denial abort.
+			select {
+			case <-r.Context().Done():
+				publishResolved <- r.Context().Err()
+			case <-time.After(3 * time.Second):
+				publishResolved <- nil
+			}
+		case "/v1/consent":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"recorded":true,"replayed":false}`))
+		default:
+			t.Errorf("unexpected request path %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(Config{
+		IngestURL:     server.URL,
+		Token:         "test-token",
+		WorkspaceID:   "workspace-test",
+		AppID:         "app-test",
+		EnvironmentID: "develop",
+		Source:        SourceBackend,
+		AnonymousID:   "anon-actor",
+		BatchSize:     batchSize,
+		BufferSize:    8,
+		FlushInterval: time.Hour,
+		HTTPTimeout:   10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	// Filling a whole batch makes the worker start a publish immediately;
+	// the server then holds that publish in flight.
+	for _, name := range []string{"purchase", "economy_tx", "match_end"} {
+		if err := client.Enqueue(Event{Name: name}); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+	}
+	select {
+	case <-publishStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for the worker publish to reach the server")
+	}
+
+	client.SetConsent(false)
+
+	select {
+	case cause := <-publishResolved:
+		if cause == nil {
+			t.Fatal("consent denial did not abort the in-flight publish")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the in-flight publish to resolve")
+	}
+
+	// The aborted batch must be counted as Dropped (the worker reconciles
+	// the denial epoch right after the failed publish), never as Published.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		stats := client.Snapshot()
+		if stats.Dropped == batchSize {
+			if stats.Published != 0 {
+				t.Fatalf("expected no events published after mid-flight denial, got %d", stats.Published)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected %d dropped events after mid-flight denial, got %+v", batchSize, stats)
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 

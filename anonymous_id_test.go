@@ -1,6 +1,8 @@
 package shardpilot
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -94,5 +96,37 @@ func TestCreateAnonymousIDLostRaceReturnsWinner(t *testing.T) {
 	data, err = os.ReadFile(corrupt)
 	if err != nil || string(data) != "not-a-uuid\n" {
 		t.Fatalf("expected the corrupt file to be left untouched, got %q (err %v)", data, err)
+	}
+}
+
+func TestCreateAnonymousIDRemovesPartialFileOnWriteFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "anonymous_id")
+	injected := errors.New("injected write failure: no space left on device")
+
+	_, err := createAnonymousIDWith(path, func(file *os.File, s string) (int, error) {
+		// Simulate the ENOSPC shape: part of the ID lands on disk before
+		// the write fails, leaving truncated junk behind.
+		if _, writeErr := file.WriteString(s[:4]); writeErr != nil {
+			t.Fatalf("seed partial content: %v", writeErr)
+		}
+		return 0, injected
+	})
+	if !errors.Is(err, injected) {
+		t.Fatalf("expected the injected write failure, got %v", err)
+	}
+
+	// The partial file must be removed: an orphan would make every future
+	// LoadOrCreateAnonymousID fail as corrupt.
+	if _, statErr := os.Stat(path); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Fatalf("expected the partial anonymous ID file to be removed, stat returned %v", statErr)
+	}
+
+	// And with the orphan gone, a later call recovers with a fresh ID.
+	id, err := LoadOrCreateAnonymousID(path)
+	if err != nil {
+		t.Fatalf("LoadOrCreateAnonymousID after failed create: %v", err)
+	}
+	if !uuidv7.IsValid(id) {
+		t.Fatalf("expected a valid UUIDv7 after recovery, got %q", id)
 	}
 }

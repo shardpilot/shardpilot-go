@@ -59,6 +59,13 @@ func readAnonymousID(path string) (string, error) {
 // fs.ErrExist), the winner's file is read back and its ID returned instead,
 // so concurrent first runs converge on a single identifier.
 func createAnonymousID(path string) (string, error) {
+	return createAnonymousIDWith(path, (*os.File).WriteString)
+}
+
+// createAnonymousIDWith is createAnonymousID with an injectable write step,
+// so write failures (ENOSPC and friends) can be exercised deterministically
+// in tests.
+func createAnonymousIDWith(path string, write func(*os.File, string) (int, error)) (string, error) {
 	id, err := uuidv7.New()
 	if err != nil {
 		return "", fmt.Errorf("generate anonymous ID: %w", err)
@@ -75,11 +82,17 @@ func createAnonymousID(path string) (string, error) {
 		}
 		return "", fmt.Errorf("create anonymous ID file: %w", err)
 	}
-	if _, err := file.WriteString(id + "\n"); err != nil {
+	if _, err := write(file, id+"\n"); err != nil {
 		_ = file.Close()
+		// Best-effort cleanup: a partially written file would make every
+		// future LoadOrCreateAnonymousID fail as corrupt, so remove what
+		// this call just created (O_EXCL guarantees ownership) instead of
+		// leaving the orphan behind.
+		_ = os.Remove(path)
 		return "", fmt.Errorf("write anonymous ID file: %w", err)
 	}
 	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
 		return "", fmt.Errorf("write anonymous ID file: %w", err)
 	}
 	return id, nil

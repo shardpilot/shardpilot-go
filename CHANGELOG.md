@@ -16,22 +16,27 @@
   (0600 permissions, parent directories created as needed). The file is
   created atomically (`O_CREATE|O_EXCL`): concurrent first runs racing on
   the same path converge on a single winner's ID instead of overwriting
-  each other. The SDK never calls it implicitly and never writes files on
-  its own.
+  each other, and a file left partially written by a failed create (disk
+  full and friends) is removed best-effort so later calls recover instead
+  of failing on the orphan forever. The SDK never calls it implicitly and
+  never writes files on its own.
 - Added a minimal consent API: `Client.SetConsent(analyticsGranted bool)`
   and `Client.Consent()` with tri-state semantics {unknown, granted,
   denied}. Unknown leaves the pipeline fully open. Denied drops events at
   enqueue (`Track`/`Enqueue` return the new `ErrConsentDenied`) and clears
-  every pending event — the queued backlog and any batch the worker has
-  already pulled in-flight — so events from before a denial never publish,
-  even across a later re-grant (cleared events count as `Dropped`). An
-  explicit decision is posted to `POST {IngestURL}/v1/consent` with the
-  batch transport credentials; the post is fire-and-forget for the caller
-  but transmitted by a single per-client sender in call order, so
-  deny-then-grant cannot arrive at the server reversed. Failures are logged
-  quietly and never affect the local state. Consent state is in-memory only
-  — integrators persist and re-apply it across restarts. Consent never
-  rides the event envelope.
+  every pending event — the queued backlog, any batch the worker has
+  already pulled in-flight, and any batch publish already on the network
+  (the HTTP request is aborted) — so events from before a denial never
+  publish, even across a later re-grant (cleared events count as `Dropped`,
+  never as `Published`). An explicit decision is posted to
+  `POST {IngestURL}/v1/consent` with the batch transport credentials; the
+  post is fire-and-forget for the caller but transmitted by a single
+  per-client sender in call order, so deny-then-grant cannot arrive at the
+  server reversed, and `Close` waits (bounded by its context) for decisions
+  recorded before it to finish transmitting. Failures are logged quietly
+  and never affect the local state. Consent state is in-memory only —
+  integrators persist and re-apply it across restarts. Consent never rides
+  the event envelope.
 - Added optional `Config.UserID` / `Config.AnonymousID` default actor
   identity fields: used as envelope defaults for events that do not set
   their own identity, and as the consent `actor_identifier` (user ID

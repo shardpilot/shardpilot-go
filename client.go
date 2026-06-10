@@ -39,11 +39,24 @@ type Client struct {
 	// period.
 	consentEpoch atomic.Uint64
 
+	// consentGate carries a context cancelled on consent denial so event
+	// publishes already in flight abort instead of completing against a
+	// freshly denied actor. SetConsent stores the denied state before
+	// swapping in a fresh gate, and publishers load the gate before
+	// re-checking denial, so every denial either cancels the gate an
+	// in-flight publisher holds or is visible to that publisher's
+	// re-check.
+	consentGate atomic.Pointer[consentGateState]
+
 	// consentSends feeds the single consent sender goroutine (started
 	// lazily by consentSenderOnce) so consent decisions are transmitted
-	// in SetConsent call order.
+	// in SetConsent call order. consentSenderDone is closed when the
+	// sender exits; Close waits on it (bounded by the Close context, like
+	// workerDone) so decisions recorded before Close are transmitted
+	// before Close returns.
 	consentSends      chan consentRequest
 	consentSenderOnce sync.Once
+	consentSenderDone chan struct{}
 }
 
 type flushRequest struct {
@@ -58,15 +71,17 @@ func NewClient(cfg Config) (*Client, error) {
 	}
 
 	client := &Client{
-		cfg:           normalized,
-		clock:         realClock{},
-		queue:         newBoundedQueue(normalized.BufferSize),
-		transport:     newHTTPTransport(normalized),
-		flushRequests: make(chan flushRequest),
-		stop:          make(chan struct{}),
-		workerDone:    make(chan struct{}),
-		consentSends:  make(chan consentRequest, consentSendBuffer),
+		cfg:               normalized,
+		clock:             realClock{},
+		queue:             newBoundedQueue(normalized.BufferSize),
+		transport:         newHTTPTransport(normalized),
+		flushRequests:     make(chan flushRequest),
+		stop:              make(chan struct{}),
+		workerDone:        make(chan struct{}),
+		consentSends:      make(chan consentRequest, consentSendBuffer),
+		consentSenderDone: make(chan struct{}),
 	}
+	client.consentGate.Store(newConsentGateState())
 
 	go client.run()
 	return client, nil
@@ -93,7 +108,14 @@ func (c *Client) Track(ctx context.Context, event Event) error {
 	c.lifecycleMu.Unlock()
 	defer c.trackWG.Done()
 
-	return c.publish(ctx, []Event{event})
+	err = c.publish(ctx, []Event{event})
+	if errors.Is(err, ErrConsentDenied) {
+		// A denial landed between Track's consent check above and the
+		// publish; count the event as dropped, matching the check-time
+		// denial path.
+		c.stats.dropped.Add(1)
+	}
+	return err
 }
 
 func (c *Client) Enqueue(event Event) error {
@@ -203,6 +225,19 @@ func (c *Client) finishClose(ctx context.Context) error {
 			err = contextCause(ctx)
 		}
 	}
+	// The consent sender drains decisions still pending when c.stop closes.
+	// Start it if it never ran — against a closed stop it drains and exits
+	// immediately, so consentSenderDone closes either way — then wait for it
+	// exactly like workerDone, so a decision recorded before Close is
+	// transmitted before Close returns.
+	c.startConsentSender()
+	select {
+	case <-c.consentSenderDone:
+	case <-contextDone(ctx):
+		if err == nil {
+			err = contextCause(ctx)
+		}
+	}
 
 	c.closeMu.Lock()
 	c.closeErr = err
@@ -280,6 +315,14 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 		}
 		if len(batch) > 0 {
 			if err := c.publishBatchWithContext(ctx, batch); err != nil {
+				if errors.Is(err, ErrConsentDenied) {
+					// A denial landed between this iteration's consent check
+					// and the publish: drop and drain exactly like the
+					// denied path above, keeping Flush's nil result.
+					dropped := len(batch) + c.queue.drainAll()
+					c.stats.dropped.Add(uint64(dropped))
+					return batch[:0], firstErr
+				}
 				if !isPermanentPublishError(err) {
 					return batch, err
 				}
@@ -337,6 +380,24 @@ func (c *Client) publishBatchWithContext(ctx context.Context, events []Event) er
 	ctx, cancel := contextWithDefaultTimeout(ctx, c.cfg.HTTPTimeout)
 	defer cancel()
 
+	// Load the denial gate BEFORE re-checking consent: a denial completed
+	// after the load cancels the loaded gate (aborting the in-flight HTTP
+	// request mid-transfer), while a denial completed before it stored the
+	// denied state first and is caught by the re-check below. Either way no
+	// event publish can run to completion past a completed denial.
+	if gate := c.consentGate.Load(); gate != nil {
+		var cancelOnDenial context.CancelFunc
+		ctx, cancelOnDenial = context.WithCancel(ctx)
+		defer cancelOnDenial()
+		stop := context.AfterFunc(gate.ctx, cancelOnDenial)
+		defer stop()
+	}
+	if c.consentDenied() {
+		// Not a transport failure: callers count the batch as Dropped,
+		// matching their own pre-publish denial paths.
+		return ErrConsentDenied
+	}
+
 	request, err := c.buildBatch(events)
 	if err != nil {
 		c.stats.recordFailure(err)
@@ -384,6 +445,11 @@ func (c *Client) prepareEvent(event Event) (Event, error) {
 
 func isPermanentPublishError(err error) bool {
 	if errors.Is(err, ErrInvalidEvent) {
+		return true
+	}
+	// A consent denial that raced the publish start: retrying would only
+	// re-reject, and the events must be dropped (never published).
+	if errors.Is(err, ErrConsentDenied) {
 		return true
 	}
 	var statusErr *HTTPStatusError

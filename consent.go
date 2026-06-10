@@ -37,6 +37,20 @@ const (
 // last-writer-wins semantics, and SetConsent never blocks on the network.
 const consentSendBuffer = 16
 
+// consentGateState is one denial generation of the in-flight publish gate:
+// ctx is cancelled when consent is denied, aborting event publishes started
+// under an earlier granted/unknown state. Each denial installs a fresh gate
+// so publishes after a later re-grant are not affected by past denials.
+type consentGateState struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+func newConsentGateState() *consentGateState {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &consentGateState{ctx: ctx, cancel: cancel}
+}
+
 type consentRequest struct {
 	WorkspaceID     string          `json:"workspace_id"`
 	AppID           string          `json:"app_id"`
@@ -55,8 +69,10 @@ type consentResult struct {
 // SetConsent records an explicit analytics consent decision.
 //
 // Locally it is synchronous: denied consent immediately starts rejecting
-// Track/Enqueue with ErrConsentDenied and clears the pending queue (cleared
-// events count as Dropped). Granting re-opens the pipeline.
+// Track/Enqueue with ErrConsentDenied, clears the pending queue (cleared
+// events count as Dropped), and aborts any event batch publish already in
+// flight on the network (the aborted events count as Dropped, never as
+// Published). Granting re-opens the pipeline.
 //
 // Remotely it is fire-and-forget for the caller: the decision is handed to
 // a single per-client sender goroutine that posts to
@@ -66,8 +82,10 @@ type consentResult struct {
 // call order (a deny-then-grant cannot arrive at the server reversed).
 // Failures are logged quietly through Config.Logger and never affect the
 // local state. If neither identity field is configured, the decision is
-// applied locally only. Decisions recorded after Close are applied locally
-// but are no longer transmitted. Consent never rides the event envelope.
+// applied locally only. Close waits (bounded by its context) for decisions
+// recorded before it was called to finish transmitting; decisions recorded
+// after Close are applied locally but are no longer transmitted. Consent
+// never rides the event envelope.
 //
 // The state is held in memory only; see ConsentState for persistence notes.
 func (c *Client) SetConsent(analyticsGranted bool) {
@@ -87,6 +105,14 @@ func (c *Client) SetConsent(analyticsGranted bool) {
 		// when it next observes the moved epoch. Events enqueued before this
 		// denial therefore never survive into a later granted period.
 		c.consentEpoch.Add(1)
+		// Abort any event publish already in flight: cancel the current gate
+		// and install a fresh one for publishes after a later re-grant. The
+		// denied state was stored above, so a publisher that misses this
+		// cancellation (it loaded the fresh gate) instead sees the denial on
+		// its post-load re-check.
+		if gate := c.consentGate.Swap(newConsentGateState()); gate != nil {
+			gate.cancel()
+		}
 		if dropped := c.queue.drainAll(); dropped > 0 {
 			c.stats.dropped.Add(uint64(dropped))
 		}
@@ -121,14 +147,21 @@ func (c *Client) SetConsent(analyticsGranted bool) {
 	c.lifecycleMu.Unlock()
 }
 
+// startConsentSender starts the single consent sender goroutine exactly
+// once. Close also calls it (after closing c.stop) so consentSenderDone is
+// guaranteed to close even when no decision was ever recorded.
+func (c *Client) startConsentSender() {
+	c.consentSenderOnce.Do(func() {
+		go c.consentSender()
+	})
+}
+
 // enqueueConsentPublish hands a decision to the single ordered consent
 // sender, starting it lazily on first use. Must be called with lifecycleMu
 // held (it is the only producer on consentSends, which keeps the
 // drop-oldest overflow handling race-free on the producer side).
 func (c *Client) enqueueConsentPublish(request consentRequest) {
-	c.consentSenderOnce.Do(func() {
-		go c.consentSender()
-	})
+	c.startConsentSender()
 	for {
 		select {
 		case c.consentSends <- request:
@@ -148,8 +181,10 @@ func (c *Client) enqueueConsentPublish(request consentRequest) {
 
 // consentSender is the single goroutine that transmits consent decisions in
 // the order they were recorded. It exits once the client stops, after
-// flushing any decisions still pending at that point.
+// flushing any decisions still pending at that point; consentSenderDone is
+// closed on exit so Close can wait for that flush.
 func (c *Client) consentSender() {
+	defer close(c.consentSenderDone)
 	for {
 		select {
 		case request := <-c.consentSends:
