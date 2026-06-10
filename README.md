@@ -74,11 +74,13 @@ using environment variables.
 
 `LoadOrCreateAnonymousID(path)` loads a persisted anonymous identifier from a
 file, or generates a fresh UUIDv7 and persists it there with 0600 permissions
-(creating parent directories as needed). The file is created atomically with
-an exclusive create, so concurrent first runs racing on the same path
-converge on a single identifier. It is strictly opt-in: the SDK never calls
-it implicitly and never writes files on its own, so server integrations that
-do not want on-disk state simply never call it.
+(creating parent directories as needed). The ID is fully written to a private
+temp file and then published to the final path atomically without
+overwriting, so the file only ever appears complete: concurrent first runs
+racing on the same path converge on a single identifier and never observe a
+partial file. It is strictly opt-in: the SDK never calls it implicitly and
+never writes files on its own, so server integrations that do not want
+on-disk state simply never call it.
 
 ```go
 anonymousID, err := shardpilot.LoadOrCreateAnonymousID(
@@ -288,7 +290,9 @@ pre-symbolicated frame fields, optional `raw_text`, and breadcrumbs.
   `Dropped`, and return `ErrConsentDenied`; events pending at the moment of
   denial — queued, already pulled into the worker's batch, or mid-publish on
   the network (the HTTP request is aborted) — are cleared and counted as
-  `Dropped`, and never publish even if consent is granted again later.
+  `Dropped`, never as `FailedBatches`, and never publish even if consent is
+  granted again later — including when a re-grant lands before the aborted
+  request returns.
 - `Track` sends one event synchronously for tests and utilities.
 - `Flush` drains queued events.
 - `Close` marks the client closed and flushes remaining queued events until the

@@ -13,13 +13,16 @@
   updated to canonical names.
 - Added `LoadOrCreateAnonymousID(path)`: an opt-in helper that loads or
   creates a UUIDv7 anonymous identifier persisted at the given file path
-  (0600 permissions, parent directories created as needed). The file is
-  created atomically (`O_CREATE|O_EXCL`): concurrent first runs racing on
-  the same path converge on a single winner's ID instead of overwriting
-  each other, and a file left partially written by a failed create (disk
-  full and friends) is removed best-effort so later calls recover instead
-  of failing on the orphan forever. The SDK never calls it implicitly and
-  never writes files on its own.
+  (0600 permissions, parent directories created as needed). The ID is fully
+  written to a private temp file and then published to the final path
+  atomically without overwriting (a hard link, which fails on EEXIST instead
+  of replacing the winner like a rename would), so the final path only ever
+  appears complete: concurrent first runs racing on the same path converge
+  on a single winner's ID, never overwrite each other, and never observe an
+  empty or partially written file. A write failure (disk full and friends)
+  only ever touches the temp file, which is cleaned up so later calls
+  recover. The SDK never calls it implicitly and never writes files on its
+  own.
 - Added a minimal consent API: `Client.SetConsent(analyticsGranted bool)`
   and `Client.Consent()` with tri-state semantics {unknown, granted,
   denied}. Unknown leaves the pipeline fully open. Denied drops events at
@@ -27,8 +30,10 @@
   every pending event — the queued backlog, any batch the worker has
   already pulled in-flight, and any batch publish already on the network
   (the HTTP request is aborted) — so events from before a denial never
-  publish, even across a later re-grant (cleared events count as `Dropped`,
-  never as `Published`). An explicit decision is posted to
+  publish, even across a later re-grant (cleared and aborted events count as
+  `Dropped`, never as `Published` or as failed batches, even when the
+  re-grant lands before the aborted request returns). An explicit decision
+  is posted to
   `POST {IngestURL}/v1/consent` with the batch transport credentials; the
   post is fire-and-forget for the caller but transmitted by a single
   per-client sender in call order, so deny-then-grant cannot arrive at the

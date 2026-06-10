@@ -15,11 +15,14 @@ import (
 // given file path, or generates a fresh UUIDv7 and persists it there.
 //
 // On first use it creates the parent directory (0700) and writes the ID with
-// 0600 permissions. The file is created atomically (O_CREATE|O_EXCL): when
-// two processes race to create it, exactly one generated ID wins and both
-// callers return it. Subsequent calls with the same path return the same ID.
-// If the file exists but does not contain a valid UUIDv7, an error is
-// returned and the file is left untouched.
+// 0600 permissions. The ID is written to a private temp file first and then
+// published to the final path atomically without overwriting (a hard link),
+// so the final path only ever appears fully written: when two processes race
+// to create it, exactly one generated ID wins and both callers return it,
+// and a concurrent reader can never observe an empty or partial file.
+// Subsequent calls with the same path return the same ID. If the file exists
+// but does not contain a valid UUIDv7, an error is returned and the file is
+// left untouched.
 //
 // This helper is strictly opt-in: the SDK never calls it implicitly and
 // never writes files on its own, so server integrations that do not want
@@ -54,10 +57,11 @@ func readAnonymousID(path string) (string, error) {
 	return id, nil
 }
 
-// createAnonymousID generates a fresh ID and persists it with an exclusive
-// create. If another process won the creation race (O_EXCL fails with
-// fs.ErrExist), the winner's file is read back and its ID returned instead,
-// so concurrent first runs converge on a single identifier.
+// createAnonymousID generates a fresh ID, writes it fully to a private temp
+// file, and publishes it to the final path atomically without overwriting.
+// If another process won the publish race (os.Link fails with fs.ErrExist),
+// the winner's file is read back and its ID returned instead, so concurrent
+// first runs converge on a single identifier.
 func createAnonymousID(path string) (string, error) {
 	return createAnonymousIDWith(path, (*os.File).WriteString)
 }
@@ -70,30 +74,56 @@ func createAnonymousIDWith(path string, write func(*os.File, string) (int, error
 	if err != nil {
 		return "", fmt.Errorf("generate anonymous ID: %w", err)
 	}
-	if dir := filepath.Dir(path); dir != "." {
+	dir := filepath.Dir(path)
+	if dir != "." {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return "", fmt.Errorf("create anonymous ID directory: %w", err)
 		}
 	}
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+
+	// Write the full ID to a private temp file (same directory, unique name,
+	// 0600 from os.CreateTemp) before the final path exists at all, so a
+	// concurrent reader can never observe the final path empty or partially
+	// written and error out as corrupt instead of converging on the winner.
+	temp, err := os.CreateTemp(dir, ".anonymous_id-*.tmp")
 	if err != nil {
+		return "", fmt.Errorf("create anonymous ID temp file: %w", err)
+	}
+	tempPath := temp.Name()
+	// The temp file is removed on every path out of this function: on
+	// failure no orphan is left behind, and on success the published final
+	// path keeps the data alive through its own directory entry.
+	defer func() { _ = os.Remove(tempPath) }()
+
+	if _, err := write(temp, id+"\n"); err != nil {
+		_ = temp.Close()
+		return "", fmt.Errorf("write anonymous ID file: %w", err)
+	}
+	if err := temp.Sync(); err != nil {
+		_ = temp.Close()
+		return "", fmt.Errorf("write anonymous ID file: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return "", fmt.Errorf("write anonymous ID file: %w", err)
+	}
+
+	// Publish atomically WITHOUT overwriting: os.Link creates the final path
+	// as a second name for the fully written, flushed, and closed temp file,
+	// and fails with EEXIST when another process already published — unlike
+	// os.Rename it can never replace a winner's file. Because the link is
+	// the final path's first appearance, the file is complete from the very
+	// first moment it is observable. Hard links are supported on every
+	// platform this SDK is tested on (Linux and macOS CI); no Windows
+	// fallback is provided.
+	if err := os.Link(tempPath, path); err != nil {
 		if errors.Is(err, fs.ErrExist) {
+			// Lost the publish race: converge on the winner's ID. With
+			// link-based publish the winner's file is necessarily complete,
+			// so a corrupt-content error here means the file was produced
+			// outside this helper and is still surfaced, never overwritten.
 			return readAnonymousID(path)
 		}
-		return "", fmt.Errorf("create anonymous ID file: %w", err)
-	}
-	if _, err := write(file, id+"\n"); err != nil {
-		_ = file.Close()
-		// Best-effort cleanup: a partially written file would make every
-		// future LoadOrCreateAnonymousID fail as corrupt, so remove what
-		// this call just created (O_EXCL guarantees ownership) instead of
-		// leaving the orphan behind.
-		_ = os.Remove(path)
-		return "", fmt.Errorf("write anonymous ID file: %w", err)
-	}
-	if err := file.Close(); err != nil {
-		_ = os.Remove(path)
-		return "", fmt.Errorf("write anonymous ID file: %w", err)
+		return "", fmt.Errorf("publish anonymous ID file: %w", err)
 	}
 	return id, nil
 }

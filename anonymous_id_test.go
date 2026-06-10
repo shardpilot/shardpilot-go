@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 
 	"github.com/shardpilot/shardpilot-go/internal/uuidv7"
@@ -115,18 +116,86 @@ func TestCreateAnonymousIDRemovesPartialFileOnWriteFailure(t *testing.T) {
 		t.Fatalf("expected the injected write failure, got %v", err)
 	}
 
-	// The partial file must be removed: an orphan would make every future
-	// LoadOrCreateAnonymousID fail as corrupt.
+	// The final path must never have appeared (the partial content only ever
+	// lived in the temp file), and the temp file must be cleaned up: an
+	// orphan would make every future LoadOrCreateAnonymousID fail as corrupt
+	// or leak junk into the directory.
 	if _, statErr := os.Stat(path); !errors.Is(statErr, fs.ErrNotExist) {
-		t.Fatalf("expected the partial anonymous ID file to be removed, stat returned %v", statErr)
+		t.Fatalf("expected no anonymous ID file after the failed write, stat returned %v", statErr)
+	}
+	entries, readErr := os.ReadDir(filepath.Dir(path))
+	if readErr != nil {
+		t.Fatalf("read anonymous ID directory: %v", readErr)
+	}
+	if len(entries) != 0 {
+		names := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			names = append(names, entry.Name())
+		}
+		t.Fatalf("expected the temp file to be removed after the failed write, found %v", names)
 	}
 
-	// And with the orphan gone, a later call recovers with a fresh ID.
+	// And with nothing left behind, a later call recovers with a fresh ID.
 	id, err := LoadOrCreateAnonymousID(path)
 	if err != nil {
 		t.Fatalf("LoadOrCreateAnonymousID after failed create: %v", err)
 	}
 	if !uuidv7.IsValid(id) {
 		t.Fatalf("expected a valid UUIDv7 after recovery, got %q", id)
+	}
+}
+
+func TestLoadOrCreateAnonymousIDConcurrentCreatorsConverge(t *testing.T) {
+	// N processes-worth of concurrent first runs race on the same path. With
+	// link-based publish the final path only ever appears fully written, so
+	// every creator must converge on the single winner's ID with zero
+	// corrupt-file errors (the O_EXCL-on-the-final-path scheme this replaced
+	// let a reader observe an empty or partial file mid-create).
+	const creators = 32
+	path := filepath.Join(t.TempDir(), "shardpilot", "anonymous_id")
+
+	ids := make([]string, creators)
+	errs := make([]error, creators)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < creators; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			ids[i], errs[i] = LoadOrCreateAnonymousID(path)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i := 0; i < creators; i++ {
+		if errs[i] != nil {
+			t.Fatalf("creator %d errored (no concurrent creator may ever see a partial file): %v", i, errs[i])
+		}
+		if ids[i] != ids[0] {
+			t.Fatalf("creators diverged: creator %d got %q, creator 0 got %q", i, ids[i], ids[0])
+		}
+	}
+	if !uuidv7.IsValid(ids[0]) {
+		t.Fatalf("expected a valid UUIDv7 winner, got %q", ids[0])
+	}
+
+	// The published file holds exactly the winner's ID and every losing
+	// creator's temp file has been cleaned up.
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != ids[0]+"\n" {
+		t.Fatalf("expected the published file to hold the winner's ID %q, got %q (err %v)", ids[0], data, err)
+	}
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		t.Fatalf("read anonymous ID directory: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != filepath.Base(path) {
+		names := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			names = append(names, entry.Name())
+		}
+		t.Fatalf("expected only the published anonymous ID file to remain, found %v", names)
 	}
 }

@@ -385,7 +385,8 @@ func (c *Client) publishBatchWithContext(ctx context.Context, events []Event) er
 	// request mid-transfer), while a denial completed before it stored the
 	// denied state first and is caught by the re-check below. Either way no
 	// event publish can run to completion past a completed denial.
-	if gate := c.consentGate.Load(); gate != nil {
+	gate := c.consentGate.Load()
+	if gate != nil {
 		var cancelOnDenial context.CancelFunc
 		ctx, cancelOnDenial = context.WithCancel(ctx)
 		defer cancelOnDenial()
@@ -405,6 +406,19 @@ func (c *Client) publishBatchWithContext(ctx context.Context, events []Event) er
 	}
 	result, err := c.transport.Publish(ctx, request)
 	if err != nil {
+		if gate != nil && gate.ctx.Err() != nil && errors.Is(err, context.Canceled) {
+			// THIS publish's gate was cancelled, so a consent denial aborted
+			// the request mid-flight. Map the cancellation to ErrConsentDenied
+			// regardless of the CURRENT consent state: a quick re-grant can
+			// land before the transport returns, leaving consentDenied()
+			// false, but the aborted batch must still count as Dropped and
+			// never as a failed batch (callers treat ErrConsentDenied exactly
+			// like their pre-publish denial paths). A CALLER-context
+			// cancellation is never reclassified — it leaves this gate's
+			// context intact, so gate.ctx.Err() stays nil unless a denial
+			// actually happened during this publish.
+			return ErrConsentDenied
+		}
 		c.stats.recordFailure(err)
 		if c.cfg.Logger != nil {
 			c.cfg.Logger.Printf("shardpilot batch publish failed: %v", err)

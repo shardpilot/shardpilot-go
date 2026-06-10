@@ -510,6 +510,212 @@ func TestConsentDenialCancelsInFlightPublish(t *testing.T) {
 	}
 }
 
+// blockingCancelTransport blocks Publish until its publish context is
+// cancelled AND the test releases it, then returns the wrapped cancellation
+// error the real HTTP transport surfaces when a request is aborted. The
+// two-phase block lets a test deterministically interleave consent flips
+// between the cancellation and the transport's return.
+type blockingCancelTransport struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newBlockingCancelTransport() *blockingCancelTransport {
+	return &blockingCancelTransport{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (t *blockingCancelTransport) Publish(ctx context.Context, request batchRequest) (batchResult, error) {
+	t.once.Do(func() { close(t.started) })
+	<-ctx.Done()
+	<-t.release
+	return batchResult{}, fmt.Errorf("send shardpilot ingest request: %w", ctx.Err())
+}
+
+func (t *blockingCancelTransport) PublishConsent(ctx context.Context, request consentRequest) (consentResult, error) {
+	return consentResult{Recorded: true}, nil
+}
+
+// newBlockingPublishClient builds a workerless client around a
+// blockingCancelTransport, suitable for driving Track directly. No identity
+// is configured, so SetConsent applies locally only and never spawns the
+// consent sender.
+func newBlockingPublishClient(transport *blockingCancelTransport) *Client {
+	client := &Client{
+		cfg: Config{
+			WorkspaceID:   "workspace-test",
+			AppID:         "app-test",
+			EnvironmentID: "develop",
+			Source:        SourceBackend,
+			BatchSize:     1,
+			HTTPTimeout:   10 * time.Second,
+		},
+		clock:     realClock{},
+		queue:     newBoundedQueue(8),
+		transport: transport,
+	}
+	client.consentGate.Store(newConsentGateState())
+	return client
+}
+
+func TestConsentGateCancellationMapsToDeniedAfterQuickRegrant(t *testing.T) {
+	transport := newBlockingCancelTransport()
+	client := newBlockingPublishClient(transport)
+
+	trackErr := make(chan error, 1)
+	go func() {
+		trackErr <- client.Track(context.Background(), Event{Name: "purchase"})
+	}()
+	select {
+	case <-transport.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for the publish to enter the transport")
+	}
+
+	// Deny while the publish is inside the transport (cancelling its gate),
+	// then re-grant BEFORE the transport returns: consentDenied() is false by
+	// the time the cancellation error surfaces, so only the held gate can
+	// identify the abort as a denial.
+	client.SetConsent(false)
+	client.SetConsent(true)
+	if state := client.Consent(); state != ConsentGranted {
+		t.Fatalf("expected consent re-granted before the transport returned, got %q", state)
+	}
+	close(transport.release)
+
+	select {
+	case err := <-trackErr:
+		if !errors.Is(err, ErrConsentDenied) {
+			t.Fatalf("expected the gate-cancelled publish to surface ErrConsentDenied despite the re-grant, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for Track to return")
+	}
+
+	// The aborted batch counts as Dropped — never as a failed batch and
+	// never as Published (README: in-flight denial aborts count as Dropped).
+	stats := client.Snapshot()
+	if stats.Dropped != 1 {
+		t.Fatalf("expected the aborted event to count as dropped, got %+v", stats)
+	}
+	if stats.FailedBatches != 0 {
+		t.Fatalf("expected no failed batches for a denial abort, got %+v", stats)
+	}
+	if stats.Published != 0 {
+		t.Fatalf("expected no published events after a mid-flight denial, got %+v", stats)
+	}
+}
+
+func TestCallerContextCancellationIsNotMappedToConsentDenied(t *testing.T) {
+	transport := newBlockingCancelTransport()
+	client := newBlockingPublishClient(transport)
+
+	callerCtx, cancelCaller := context.WithCancel(context.Background())
+	defer cancelCaller()
+	trackErr := make(chan error, 1)
+	go func() {
+		trackErr <- client.Track(callerCtx, Event{Name: "purchase"})
+	}()
+	select {
+	case <-transport.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for the publish to enter the transport")
+	}
+
+	// The CALLER aborts the publish; the consent gate stays intact, so the
+	// cancellation must surface as-is, not be reclassified as a denial.
+	cancelCaller()
+	close(transport.release)
+
+	select {
+	case err := <-trackErr:
+		if errors.Is(err, ErrConsentDenied) {
+			t.Fatalf("caller-context cancellation was misclassified as ErrConsentDenied: %v", err)
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected the caller cancellation to surface, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for Track to return")
+	}
+
+	stats := client.Snapshot()
+	if stats.Dropped != 0 {
+		t.Fatalf("expected no dropped events for a caller cancellation, got %+v", stats)
+	}
+	if stats.FailedBatches != 1 {
+		t.Fatalf("expected the caller cancellation to count as a failed batch, got %+v", stats)
+	}
+}
+
+func TestWorkerMidFlightDenialQuickRegrantCountsDroppedNotFailed(t *testing.T) {
+	const batchSize = 3
+
+	client, err := NewClient(Config{
+		IngestURL:     "http://127.0.0.1:9", // never dialed: the transport is replaced below
+		Token:         "test-token",
+		WorkspaceID:   "workspace-test",
+		AppID:         "app-test",
+		EnvironmentID: "develop",
+		Source:        SourceBackend,
+		BatchSize:     batchSize,
+		BufferSize:    8,
+		FlushInterval: time.Hour,
+		HTTPTimeout:   10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	// Swap in the blocking transport before any event flows; the enqueue
+	// channel hand-off orders this write before the worker's first publish.
+	transport := newBlockingCancelTransport()
+	client.transport = transport
+
+	// Filling a whole batch makes the worker start a publish immediately;
+	// the transport then holds that publish in flight.
+	for _, name := range []string{"purchase", "economy_tx", "match_end"} {
+		if err := client.Enqueue(Event{Name: name}); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+	}
+	select {
+	case <-transport.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for the worker publish to enter the transport")
+	}
+
+	// Deny (aborting the in-flight publish) and re-grant before the
+	// transport returns the cancellation error.
+	client.SetConsent(false)
+	client.SetConsent(true)
+	close(transport.release)
+
+	// The aborted batch must be counted as Dropped immediately by the worker
+	// (ErrConsentDenied is permanent), never as a failed batch.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		stats := client.Snapshot()
+		if stats.Dropped == batchSize {
+			if stats.FailedBatches != 0 {
+				t.Fatalf("expected no failed batches for a denial abort under quick re-grant, got %+v", stats)
+			}
+			if stats.Published != 0 {
+				t.Fatalf("expected no events published after a mid-flight denial, got %+v", stats)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("expected %d dropped events after the mid-flight denial, got %+v", batchSize, stats)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestSetConsentDecisionsArriveInCallOrder(t *testing.T) {
 	const flips = 12
 
