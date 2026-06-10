@@ -7,4 +7,5 @@ var (
 	ErrInvalidConfig = errors.New("invalid shardpilot config")
 	ErrInvalidEvent  = errors.New("invalid shardpilot event")
 	ErrQueueFull     = errors.New("shardpilot queue is full")
+	ErrConsentDenied = errors.New("shardpilot analytics consent is denied")
 )

@@ -1,11 +1,12 @@
 package crash
 
 import (
-	"crypto/rand"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/shardpilot/shardpilot-go/internal/uuidv7"
 )
 
 const (
@@ -106,28 +107,7 @@ func newCrashID() (string, error) {
 }
 
 func newCrashIDAt(now time.Time) (string, error) {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", err
-	}
-
-	millis := uint64(now.UTC().UnixMilli())
-	b[0] = byte(millis >> 40)
-	b[1] = byte(millis >> 32)
-	b[2] = byte(millis >> 24)
-	b[3] = byte(millis >> 16)
-	b[4] = byte(millis >> 8)
-	b[5] = byte(millis)
-	b[6] = (b[6] & 0x0f) | 0x70
-	b[8] = (b[8] & 0x3f) | 0x80
-
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
-		b[0:4],
-		b[4:6],
-		b[6:8],
-		b[8:10],
-		b[10:16],
-	), nil
+	return uuidv7.NewAt(now)
 }
 
 func validateEvent(event Event) error {
@@ -316,34 +296,7 @@ func validTokenish(value string) bool {
 }
 
 func isUUIDv7(value string) bool {
-	if len(value) != 36 {
-		return false
-	}
-	for i := 0; i < len(value); i++ {
-		switch i {
-		case 8, 13, 18, 23:
-			if value[i] != '-' {
-				return false
-			}
-		default:
-			if !isHex(value[i]) {
-				return false
-			}
-		}
-	}
-	if value[14] != '7' {
-		return false
-	}
-	switch value[19] {
-	case '8', '9', 'a', 'A', 'b', 'B':
-		return true
-	default:
-		return false
-	}
-}
-
-func isHex(ch byte) bool {
-	return ch >= '0' && ch <= '9' || ch >= 'a' && ch <= 'f' || ch >= 'A' && ch <= 'F'
+	return uuidv7.IsValid(value)
 }
 
 func firstNonEmptyString(values ...string) string {

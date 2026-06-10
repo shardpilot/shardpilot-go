@@ -13,6 +13,7 @@ import (
 
 type transport interface {
 	Publish(ctx context.Context, request batchRequest) (batchResult, error)
+	PublishConsent(ctx context.Context, request consentRequest) (consentResult, error)
 }
 
 type batchResult struct {
@@ -46,15 +47,18 @@ func (e *EncodeError) Unwrap() error {
 }
 
 type httpTransport struct {
-	endpoint string
-	token    string
-	client   *http.Client
+	endpoint        string
+	consentEndpoint string
+	token           string
+	client          *http.Client
 }
 
 func newHTTPTransport(cfg Config) *httpTransport {
+	base := strings.TrimRight(cfg.IngestURL, "/")
 	return &httpTransport{
-		endpoint: strings.TrimRight(cfg.IngestURL, "/") + "/v1/events:batch",
-		token:    cfg.Token,
+		endpoint:        base + "/v1/events:batch",
+		consentEndpoint: base + "/v1/consent",
+		token:           cfg.Token,
 		client: &http.Client{
 			Timeout: cfg.HTTPTimeout,
 		},
@@ -62,34 +66,49 @@ func newHTTPTransport(cfg Config) *httpTransport {
 }
 
 func (t *httpTransport) Publish(ctx context.Context, request batchRequest) (batchResult, error) {
+	var result batchResult
+	if err := t.postJSON(ctx, t.endpoint, request, &result); err != nil {
+		return batchResult{}, err
+	}
+	return result, nil
+}
+
+func (t *httpTransport) PublishConsent(ctx context.Context, request consentRequest) (consentResult, error) {
+	var result consentResult
+	if err := t.postJSON(ctx, t.consentEndpoint, request, &result); err != nil {
+		return consentResult{}, err
+	}
+	return result, nil
+}
+
+func (t *httpTransport) postJSON(ctx context.Context, endpoint string, request any, result any) error {
 	payload, err := json.Marshal(request)
 	if err != nil {
-		return batchResult{}, &EncodeError{Err: err}
+		return &EncodeError{Err: err}
 	}
 
-	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, t.endpoint, bytes.NewReader(payload))
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
 	if err != nil {
-		return batchResult{}, fmt.Errorf("create shardpilot ingest request: %w", err)
+		return fmt.Errorf("create shardpilot ingest request: %w", err)
 	}
 	httpRequest.Header.Set("Content-Type", "application/json")
 	httpRequest.Header.Set("Authorization", "Bearer "+t.token)
 
 	response, err := t.client.Do(httpRequest)
 	if err != nil {
-		return batchResult{}, fmt.Errorf("send shardpilot ingest request: %w", err)
+		return fmt.Errorf("send shardpilot ingest request: %w", err)
 	}
 	defer response.Body.Close()
 
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
-		return batchResult{}, &HTTPStatusError{StatusCode: response.StatusCode}
+		return &HTTPStatusError{StatusCode: response.StatusCode}
 	}
 
-	var result batchResult
-	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
-		return batchResult{}, fmt.Errorf("decode shardpilot ingest response: %w", err)
+	if err := json.NewDecoder(response.Body).Decode(result); err != nil {
+		return fmt.Errorf("decode shardpilot ingest response: %w", err)
 	}
-	return result, nil
+	return nil
 }
 
 func contextWithDefaultTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {

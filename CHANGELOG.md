@@ -1,5 +1,55 @@
 # Changelog
 
+## Unreleased
+
+- Fixed the quickstart (README and `examples/basic`) to demonstrate a
+  backend-legal canonical event. The previous example tracked
+  `session_start` with `Source: SourceBackend`, which is doubly wrong: the
+  canonical session event is named `app.session_started` AND is
+  client-source-only, so a backend SDK cannot legally send it. The
+  quickstart now tracks `purchase` (source const `backend`) with the
+  schema-required props `amount`, `currency`, and `product`. Remaining
+  stale `session_start` literals in tests, the crash example, and docs were
+  updated to canonical names.
+- Added `LoadOrCreateAnonymousID(path)`: an opt-in helper that loads or
+  creates a UUIDv7 anonymous identifier persisted at the given file path
+  (0600 permissions, parent directories created as needed). The ID is fully
+  written to a private temp file and then published to the final path
+  atomically without overwriting (a hard link, which fails on EEXIST instead
+  of replacing the winner like a rename would), so the final path only ever
+  appears complete: concurrent first runs racing on the same path converge
+  on a single winner's ID, never overwrite each other, and never observe an
+  empty or partially written file. A write failure (disk full and friends)
+  only ever touches the temp file, which is cleaned up so later calls
+  recover. The SDK never calls it implicitly and never writes files on its
+  own.
+- Added a minimal consent API: `Client.SetConsent(analyticsGranted bool)`
+  and `Client.Consent()` with tri-state semantics {unknown, granted,
+  denied}. Unknown leaves the pipeline fully open. Denied drops events at
+  enqueue (`Track`/`Enqueue` return the new `ErrConsentDenied`) and clears
+  every pending event — the queued backlog, any batch the worker has
+  already pulled in-flight, and any batch publish already on the network
+  (the HTTP request is aborted) — so events from before a denial never
+  publish, even across a later re-grant (cleared and aborted events count as
+  `Dropped`, never as `Published` or as failed batches, even when the
+  re-grant lands before the aborted request returns). An explicit decision
+  is posted to
+  `POST {IngestURL}/v1/consent` with the batch transport credentials; the
+  post is fire-and-forget for the caller but transmitted by a single
+  per-client sender in call order, so deny-then-grant cannot arrive at the
+  server reversed, and `Close` waits (bounded by its context) for decisions
+  recorded before it to finish transmitting. Failures are logged quietly
+  and never affect the local state. Consent state is in-memory only —
+  integrators persist and re-apply it across restarts. Consent never rides
+  the event envelope.
+- Added optional `Config.UserID` / `Config.AnonymousID` default actor
+  identity fields: used as envelope defaults for events that do not set
+  their own identity, and as the consent `actor_identifier` (user ID
+  preferred, else anonymous ID).
+- Internal: extracted the UUIDv7 generator shared by crash IDs, anonymous
+  IDs, and consent idempotency keys into `internal/uuidv7` (behavior
+  unchanged).
+
 ## v0.3.0-alpha — 2026-06-07 — universal envelope (proposed)
 
 - BREAKING: Removed the game-flavored `MatchID` field from the universal
@@ -57,5 +107,3 @@
 - Includes a basic backend example and Go CI coverage for the compatibility
   baseline and current toolchain.
 - This is an early alpha pre-release. The API is unstable and may change before v1.
-
-## Unreleased
