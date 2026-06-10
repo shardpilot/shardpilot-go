@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+- Fixed the quickstart (README and `examples/basic`) to demonstrate a
+  backend-legal canonical event. The previous example tracked
+  `session_start` with `Source: SourceBackend`, which is doubly wrong: the
+  canonical session event is named `app.session_started` AND is
+  client-source-only, so a backend SDK cannot legally send it. The
+  quickstart now tracks `purchase` (source const `backend`) with the
+  schema-required props `amount`, `currency`, and `product`. Remaining
+  stale `session_start` literals in tests, the crash example, and docs were
+  updated to canonical names.
+- Added `LoadOrCreateAnonymousID(path)`: an opt-in helper that loads or
+  creates a UUIDv7 anonymous identifier persisted at the given file path
+  (0600 permissions, parent directories created as needed). The SDK never
+  calls it implicitly and never writes files on its own.
+- Added a minimal consent API: `Client.SetConsent(analyticsGranted bool)`
+  and `Client.Consent()` with tri-state semantics {unknown, granted,
+  denied}. Unknown leaves the pipeline fully open. Denied drops events at
+  enqueue (`Track`/`Enqueue` return the new `ErrConsentDenied`) and clears
+  the pending queue. An explicit decision is posted fire-and-forget to
+  `POST {IngestURL}/v1/consent` with the batch transport credentials;
+  failures are logged quietly and never affect the local state. Consent
+  state is in-memory only — integrators persist and re-apply it across
+  restarts. Consent never rides the event envelope.
+- Added optional `Config.UserID` / `Config.AnonymousID` default actor
+  identity fields: used as envelope defaults for events that do not set
+  their own identity, and as the consent `actor_identifier` (user ID
+  preferred, else anonymous ID).
+- Internal: extracted the UUIDv7 generator shared by crash IDs, anonymous
+  IDs, and consent idempotency keys into `internal/uuidv7` (behavior
+  unchanged).
+
 ## v0.3.0-alpha — 2026-06-07 — universal envelope (proposed)
 
 - BREAKING: Removed the game-flavored `MatchID` field from the universal
@@ -57,5 +89,3 @@
 - Includes a basic backend example and Go CI coverage for the compatibility
   baseline and current toolchain.
 - This is an early alpha pre-release. The API is unstable and may change before v1.
-
-## Unreleased

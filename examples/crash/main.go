@@ -29,7 +29,7 @@ func main() {
 		log.Fatalf("create crash client: %v", err)
 	}
 
-	client.RecordBreadcrumb("session_start")
+	client.RecordBreadcrumb("app.session_started")
 	client.RecordBreadcrumb("level_loaded")
 	client.RecordBreadcrumb("boss_intro_seen")
 

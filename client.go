@@ -29,6 +29,7 @@ type Client struct {
 	stopOnce      sync.Once
 	closeErr      error
 	closed        atomic.Bool
+	consent       atomic.Int32
 }
 
 type flushRequest struct {
@@ -62,6 +63,11 @@ func (c *Client) Track(ctx context.Context, event Event) error {
 		c.lifecycleMu.Unlock()
 		return ErrClosed
 	}
+	if c.consentDenied() {
+		c.lifecycleMu.Unlock()
+		c.stats.dropped.Add(1)
+		return ErrConsentDenied
+	}
 	event, err := c.prepareEvent(event)
 	if err != nil {
 		c.stats.recordFailure(err)
@@ -81,6 +87,10 @@ func (c *Client) Enqueue(event Event) error {
 
 	if c.closed.Load() {
 		return ErrClosed
+	}
+	if c.consentDenied() {
+		c.stats.dropped.Add(1)
+		return ErrConsentDenied
 	}
 	event, err := c.prepareEvent(event)
 	if err != nil {
@@ -224,6 +234,14 @@ func (c *Client) run() {
 }
 
 func (c *Client) flushAvailable(ctx context.Context, batch []Event) ([]Event, error) {
+	if c.consentDenied() {
+		dropped := len(batch) + c.queue.drainAll()
+		if dropped > 0 {
+			c.stats.dropped.Add(uint64(dropped))
+		}
+		return batch[:0], nil
+	}
+
 	var firstErr error
 	for {
 		if len(batch) > 0 {
@@ -253,6 +271,10 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event) ([]Event, er
 func (c *Client) publishWorkerBatch(batch []Event) []Event {
 	if len(batch) == 0 {
 		return batch
+	}
+	if c.consentDenied() {
+		c.stats.dropped.Add(uint64(len(batch)))
+		return batch[:0]
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.HTTPTimeout)
 	defer cancel()

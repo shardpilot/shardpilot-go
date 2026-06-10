@@ -17,6 +17,18 @@ func (q *boundedQueue) enqueue(event Event) bool {
 	}
 }
 
+func (q *boundedQueue) drainAll() int {
+	count := 0
+	for {
+		select {
+		case <-q.ch:
+			count++
+		default:
+			return count
+		}
+	}
+}
+
 func (q *boundedQueue) drainInto(events []Event, limit int) []Event {
 	for len(events) < limit {
 		select {

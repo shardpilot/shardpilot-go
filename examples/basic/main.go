@@ -30,11 +30,17 @@ func main() {
 	}
 	defer client.Close(context.Background())
 
+	// purchase is a backend-source canonical event: the server-validated
+	// real-money purchase reported after receipt/store validation. The
+	// schema requires props.amount, props.currency, and props.product.
 	if err := client.Track(ctx, shardpilot.Event{
-		Name:      "session_start",
-		SessionID: "session-example",
+		Name:   "purchase",
+		UserID: "user-1042",
 		Props: map[string]any{
-			"surface": "backend",
+			"amount":   9.99,
+			"currency": "USD",
+			"product":  "starter_pack",
+			"quantity": 1,
 		},
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "track event: %v\n", err)

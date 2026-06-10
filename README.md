@@ -47,17 +47,79 @@ if err != nil {
 }
 defer client.Close(context.Background())
 
+// purchase is a backend-source canonical event: the authoritative
+// real-money purchase your backend reports AFTER receipt/store validation.
+// Required props per the canonical schema: amount, currency, product.
 err = client.Track(context.Background(), shardpilot.Event{
-    Name:      "session_start",
-    SessionID: "session-example",
+    Name:   "purchase",
+    UserID: "user-1042",
     Props: map[string]any{
-        "surface": "backend",
+        "amount":   9.99,
+        "currency": "USD",
+        "product":  "starter_pack",
+        "quantity": 1,
     },
 })
 ```
 
+Pick events whose canonical schema allows your configured `Source`. Session
+and screen events (for example `app.session_started`, `app.screen_view`) are
+client-source-only, so a backend client cannot legally send them; backend
+clients send backend-source events such as `purchase` or `economy_tx`.
+
 See [`examples/basic`](examples/basic) for a runnable backend/server example
 using environment variables.
+
+## Anonymous IDs (opt-in helper)
+
+`LoadOrCreateAnonymousID(path)` loads a persisted anonymous identifier from a
+file, or generates a fresh UUIDv7 and persists it there with 0600 permissions
+(creating parent directories as needed). It is strictly opt-in: the SDK never
+calls it implicitly and never writes files on its own, so server integrations
+that do not want on-disk state simply never call it.
+
+```go
+anonymousID, err := shardpilot.LoadOrCreateAnonymousID(
+    filepath.Join(configDir, "shardpilot", "anonymous_id"))
+if err != nil {
+    return err
+}
+
+client, err := shardpilot.NewClient(shardpilot.Config{
+    // ... required fields ...
+    AnonymousID: anonymousID,
+})
+```
+
+`Config.UserID` and `Config.AnonymousID` are optional default actor identity
+values: events that do not set their own `UserID`/`AnonymousID` inherit them,
+and `SetConsent` uses them as the consent actor identifier (user ID
+preferred, else anonymous ID).
+
+## Consent
+
+`Client.SetConsent(analyticsGranted bool)` records an explicit analytics
+consent decision, with tri-state semantics:
+
+- **unknown** (initial): no decision recorded, the event pipeline is fully
+  open.
+- **granted**: the pipeline is open.
+- **denied**: events are dropped at enqueue — `Track` and `Enqueue` return
+  `ErrConsentDenied` — and the pending queue is cleared (cleared events count
+  as `Dropped` in `Snapshot`).
+
+The state is held in client memory only; the SDK does not persist it. If
+consent must survive process restarts, read `Client.Consent()` after a
+decision, store it yourself (for example next to the anonymous-ID file), and
+re-apply it with `SetConsent` on startup.
+
+An explicit decision is also posted fire-and-forget to
+`POST {IngestURL}/v1/consent` with the same bearer-token transport as event
+batches, using `Config.UserID` (preferred) or `Config.AnonymousID` as
+`actor_identifier`. Failures are logged quietly via `Config.Logger` and never
+affect the local state. If neither identity field is configured, the decision
+applies locally only and no request is sent. Consent never rides the event
+envelope.
 
 ## Crash Reporting
 
@@ -103,7 +165,7 @@ func main() {
         log.Fatalf("create crash client: %v", err)
     }
 
-    client.RecordBreadcrumb("session_start")
+    client.RecordBreadcrumb("app.session_started")
     client.RecordBreadcrumb("level_loaded")
     client.RecordBreadcrumb("boss_intro_seen")
 
@@ -174,6 +236,20 @@ Game- or vertical-specific context (for example `match_id`) goes in `Props`,
 which is sent as `props` (e.g. `Props["match_id"]` is serialized to
 `props.match_id`). It is not a top-level ShardPilot ingest envelope field.
 
+Explicit consent decisions are sent on their own endpoint (never on the
+event envelope):
+
+```text
+POST {IngestURL}/v1/consent
+Content-Type: application/json
+Authorization: Bearer <token>
+```
+
+with body fields `workspace_id`, `app_id`, `environment_id`,
+`actor_identifier`, `categories` (`{"analytics": <bool>}`), `decided_at`
+(RFC3339), and a fresh UUIDv7 `idempotency_key`. The service responds
+`200 {"recorded": true, "replayed": <bool>}`.
+
 The crash SDK sends:
 
 ```text
@@ -201,6 +277,9 @@ pre-symbolicated frame fields, optional `raw_text`, and breadcrumbs.
   be dropped according to `BufferSize`.
 - If the queue is full, `Enqueue` drops the event, increments `Dropped`, and
   returns `ErrQueueFull`.
+- While consent is denied, `Track` and `Enqueue` drop the event, increment
+  `Dropped`, and return `ErrConsentDenied`; queued events pending at the
+  moment of denial are cleared and counted as `Dropped`.
 - `Track` sends one event synchronously for tests and utilities.
 - `Flush` drains queued events.
 - `Close` marks the client closed and flushes remaining queued events until the

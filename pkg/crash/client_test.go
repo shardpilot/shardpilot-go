@@ -51,7 +51,7 @@ func TestClientEmitRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
-	client.RecordBreadcrumb("session_start")
+	client.RecordBreadcrumb("app.session_started")
 	client.RecordBreadcrumb("match.round-start")
 	client.RecordBreadcrumb("screen_open")
 

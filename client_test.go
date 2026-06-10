@@ -796,6 +796,10 @@ func (t *sequenceTransport) Publish(ctx context.Context, request batchRequest) (
 	return batchResult{Accepted: len(request.Events)}, nil
 }
 
+func (t *sequenceTransport) PublishConsent(ctx context.Context, request consentRequest) (consentResult, error) {
+	return consentResult{Recorded: true}, nil
+}
+
 func (t *sequenceTransport) requestEventNames() []string {
 	names := make([]string, 0)
 	for _, request := range t.requests {

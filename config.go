@@ -21,15 +21,24 @@ type Logger interface {
 }
 
 type Config struct {
-	IngestURL                   string
-	Token                       string
-	WorkspaceID                 string
-	AppID                       string
-	EnvironmentID               string
-	Source                      Source
-	AppVersion                  string
-	AppBuild                    string
-	Platform                    string
+	IngestURL     string
+	Token         string
+	WorkspaceID   string
+	AppID         string
+	EnvironmentID string
+	Source        Source
+	AppVersion    string
+	AppBuild      string
+	Platform      string
+
+	// UserID and AnonymousID are optional default actor identity values.
+	// When set, they are used as envelope defaults for events that do not
+	// set their own UserID/AnonymousID, and as the consent actor identifier
+	// for SetConsent (UserID preferred, else AnonymousID). AnonymousID can
+	// be sourced from the opt-in LoadOrCreateAnonymousID helper.
+	UserID      string
+	AnonymousID string
+
 	BatchSize                   int
 	BufferSize                  int
 	FlushInterval               time.Duration
@@ -52,6 +61,8 @@ func normalizeConfig(cfg Config) (Config, error) {
 	cfg.WorkspaceID = strings.TrimSpace(cfg.WorkspaceID)
 	cfg.AppID = strings.TrimSpace(cfg.AppID)
 	cfg.EnvironmentID = strings.TrimSpace(cfg.EnvironmentID)
+	cfg.UserID = strings.TrimSpace(cfg.UserID)
+	cfg.AnonymousID = strings.TrimSpace(cfg.AnonymousID)
 
 	if cfg.IngestURL == "" {
 		return Config{}, fmt.Errorf("%w: ingest URL is required", ErrInvalidConfig)

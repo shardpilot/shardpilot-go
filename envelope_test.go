@@ -38,7 +38,7 @@ func TestTrackSendsAppFirstEnvelope(t *testing.T) {
 
 	err := client.Track(context.Background(), Event{
 		ID:              "evt-test-1",
-		Name:            "session_start",
+		Name:            "match_end",
 		Timestamp:       time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC),
 		AnonymousID:     "anonymous-example",
 		SessionID:       "session-example",

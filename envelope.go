@@ -55,6 +55,8 @@ func (c *Client) buildEnvelope(event Event) (eventEnvelope, error) {
 	platform := firstNonEmpty(event.Platform, c.cfg.Platform)
 	appVersion := firstNonEmpty(event.AppVersion, c.cfg.AppVersion)
 	appBuild := firstNonEmpty(event.AppBuild, c.cfg.AppBuild)
+	userID := firstNonEmpty(event.UserID, c.cfg.UserID)
+	anonymousID := firstNonEmpty(event.AnonymousID, c.cfg.AnonymousID)
 
 	return eventEnvelope{
 		EventID:         id,
@@ -65,8 +67,8 @@ func (c *Client) buildEnvelope(event Event) (eventEnvelope, error) {
 		WorkspaceID:     c.cfg.WorkspaceID,
 		AppID:           c.cfg.AppID,
 		EnvironmentID:   c.cfg.EnvironmentID,
-		UserID:          event.UserID,
-		AnonymousID:     event.AnonymousID,
+		UserID:          userID,
+		AnonymousID:     anonymousID,
 		SessionID:       event.SessionID,
 		SessionSequence: event.SessionSequence,
 		Platform:        platform,
