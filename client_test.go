@@ -435,7 +435,8 @@ func TestInvalidQueuedBuildErrorDoesNotBlockLaterValidEvents(t *testing.T) {
 		t.Fatal("expected valid internal enqueue to succeed")
 	}
 
-	batch, err := client.flushAvailable(context.Background(), nil)
+	var consentEpoch uint64
+	batch, err := client.flushAvailable(context.Background(), nil, &consentEpoch)
 	if !errors.Is(err, ErrInvalidEvent) {
 		t.Fatalf("expected ErrInvalidEvent, got %v", err)
 	}
@@ -478,7 +479,8 @@ func TestPermanentHTTPStatusDoesNotBlockLaterValidEvents(t *testing.T) {
 				t.Fatal("expected valid enqueue to succeed")
 			}
 
-			batch, err := client.flushAvailable(context.Background(), nil)
+			var consentEpoch uint64
+			batch, err := client.flushAvailable(context.Background(), nil, &consentEpoch)
 			var statusErr *HTTPStatusError
 			if !errors.As(err, &statusErr) || statusErr.StatusCode != statusCode {
 				t.Fatalf("expected HTTPStatusError %d, got %v", statusCode, err)
@@ -546,7 +548,8 @@ func TestPermanentEncodeErrorDoesNotBlockLaterValidEvents(t *testing.T) {
 		t.Fatalf("Enqueue valid event returned error: %v", err)
 	}
 
-	batch, err := client.flushAvailable(context.Background(), nil)
+	var consentEpoch uint64
+	batch, err := client.flushAvailable(context.Background(), nil, &consentEpoch)
 	var encodeErr *EncodeError
 	if !errors.As(err, &encodeErr) {
 		t.Fatalf("expected EncodeError, got %v", err)
@@ -593,7 +596,8 @@ func TestFlushAvailableRetainsFailedBatchAndRetries(t *testing.T) {
 		t.Fatal("expected second enqueue to succeed")
 	}
 
-	batch, err := client.flushAvailable(context.Background(), nil)
+	var consentEpoch uint64
+	batch, err := client.flushAvailable(context.Background(), nil, &consentEpoch)
 	if !errors.Is(err, firstErr) {
 		t.Fatalf("expected first error, got %v", err)
 	}
@@ -610,7 +614,7 @@ func TestFlushAvailableRetainsFailedBatchAndRetries(t *testing.T) {
 		t.Fatalf("unexpected stats after failed flush: %+v", stats)
 	}
 
-	batch, err = client.flushAvailable(context.Background(), batch)
+	batch, err = client.flushAvailable(context.Background(), batch, &consentEpoch)
 	if err != nil {
 		t.Fatalf("retry flush returned error: %v", err)
 	}
@@ -649,7 +653,8 @@ func TestRetryableHTTPStatusRetainsFailedBatch(t *testing.T) {
 			if !client.queue.enqueue(Event{ID: "evt-retryable", Name: "retryable_status"}) {
 				t.Fatal("expected retryable-status enqueue to succeed")
 			}
-			batch, err := client.flushAvailable(context.Background(), nil)
+			var consentEpoch uint64
+			batch, err := client.flushAvailable(context.Background(), nil, &consentEpoch)
 			var statusErr *HTTPStatusError
 			if !errors.As(err, &statusErr) || statusErr.StatusCode != statusCode {
 				t.Fatalf("expected HTTPStatusError %d, got %v", statusCode, err)
@@ -658,7 +663,7 @@ func TestRetryableHTTPStatusRetainsFailedBatch(t *testing.T) {
 				t.Fatalf("expected retryable status batch retained, got %+v", batch)
 			}
 
-			batch, err = client.flushAvailable(context.Background(), batch)
+			batch, err = client.flushAvailable(context.Background(), batch, &consentEpoch)
 			if err != nil {
 				t.Fatalf("retry flush returned error: %v", err)
 			}
@@ -698,11 +703,12 @@ func TestPublishWorkerBatchDropsPermanentEncodeFailure(t *testing.T) {
 		transport: newHTTPTransport(cfg),
 	}
 
+	var consentEpoch uint64
 	retained := client.publishWorkerBatch([]Event{{
 		ID:      "evt-encode-failure",
 		Name:    "encode_failure",
 		Context: map[string]any{"bad": func() {}},
-	}})
+	}}, &consentEpoch)
 	if len(retained) != 0 {
 		t.Fatalf("expected worker to drop permanent encode failure, got %+v", retained)
 	}
@@ -732,12 +738,13 @@ func TestPublishWorkerBatchRetainsFailedBatch(t *testing.T) {
 	}
 
 	batch := []Event{{ID: "evt-1", Name: "first"}}
-	retained := client.publishWorkerBatch(batch)
+	var consentEpoch uint64
+	retained := client.publishWorkerBatch(batch, &consentEpoch)
 	if len(retained) != 1 || retained[0].ID != "evt-1" {
 		t.Fatalf("expected worker to retain failed batch, got %+v", retained)
 	}
 
-	retained = client.publishWorkerBatch(retained)
+	retained = client.publishWorkerBatch(retained, &consentEpoch)
 	if len(retained) != 0 {
 		t.Fatalf("expected successful retry to clear batch, got %+v", retained)
 	}

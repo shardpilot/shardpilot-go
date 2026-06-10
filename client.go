@@ -30,6 +30,20 @@ type Client struct {
 	closeErr      error
 	closed        atomic.Bool
 	consent       atomic.Int32
+
+	// consentEpoch is the denial generation counter: SetConsent(false)
+	// increments it so the worker discards events it has already pulled
+	// into its local batch. The worker tracks the last epoch it observed
+	// and drops its held batch whenever the epoch moved, which guarantees
+	// events enqueued before a denial never survive into a later granted
+	// period.
+	consentEpoch atomic.Uint64
+
+	// consentSends feeds the single consent sender goroutine (started
+	// lazily by consentSenderOnce) so consent decisions are transmitted
+	// in SetConsent call order.
+	consentSends      chan consentRequest
+	consentSenderOnce sync.Once
 }
 
 type flushRequest struct {
@@ -51,6 +65,7 @@ func NewClient(cfg Config) (*Client, error) {
 		flushRequests: make(chan flushRequest),
 		stop:          make(chan struct{}),
 		workerDone:    make(chan struct{}),
+		consentSends:  make(chan consentRequest, consentSendBuffer),
 	}
 
 	go client.run()
@@ -210,7 +225,9 @@ func (c *Client) run() {
 	defer ticker.Stop()
 
 	batch := make([]Event, 0, c.cfg.BatchSize)
+	seenConsentEpoch := c.consentEpoch.Load()
 	for {
+		batch = c.dropBatchOnConsentEpoch(batch, &seenConsentEpoch)
 		queueEvents := c.queue.ch
 		if len(batch) >= c.cfg.BatchSize {
 			queueEvents = nil
@@ -219,13 +236,13 @@ func (c *Client) run() {
 		case event := <-queueEvents:
 			batch = append(batch, event)
 			if len(batch) >= c.cfg.BatchSize {
-				batch = c.publishWorkerBatch(batch)
+				batch = c.publishWorkerBatch(batch, &seenConsentEpoch)
 			}
 		case <-ticker.C:
-			batch = c.publishWorkerBatch(batch)
+			batch = c.publishWorkerBatch(batch, &seenConsentEpoch)
 		case request := <-c.flushRequests:
 			var err error
-			batch, err = c.flushAvailable(request.ctx, batch)
+			batch, err = c.flushAvailable(request.ctx, batch, &seenConsentEpoch)
 			request.reply <- err
 		case <-c.stop:
 			return
@@ -233,17 +250,34 @@ func (c *Client) run() {
 	}
 }
 
-func (c *Client) flushAvailable(ctx context.Context, batch []Event) ([]Event, error) {
-	if c.consentDenied() {
-		dropped := len(batch) + c.queue.drainAll()
-		if dropped > 0 {
-			c.stats.dropped.Add(uint64(dropped))
-		}
-		return batch[:0], nil
+// dropBatchOnConsentEpoch discards the worker-held batch when a consent
+// denial happened since the worker last looked. Events cleared here count
+// as Dropped; events drained from the shared queue are counted by
+// SetConsent itself, so each event is counted exactly once.
+func (c *Client) dropBatchOnConsentEpoch(batch []Event, seenEpoch *uint64) []Event {
+	epoch := c.consentEpoch.Load()
+	if epoch == *seenEpoch {
+		return batch
 	}
+	*seenEpoch = epoch
+	if len(batch) > 0 {
+		c.stats.dropped.Add(uint64(len(batch)))
+		batch = batch[:0]
+	}
+	return batch
+}
 
+func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentEpoch *uint64) ([]Event, error) {
 	var firstErr error
 	for {
+		batch = c.dropBatchOnConsentEpoch(batch, seenConsentEpoch)
+		if c.consentDenied() {
+			dropped := len(batch) + c.queue.drainAll()
+			if dropped > 0 {
+				c.stats.dropped.Add(uint64(dropped))
+			}
+			return batch[:0], firstErr
+		}
 		if len(batch) > 0 {
 			if err := c.publishBatchWithContext(ctx, batch); err != nil {
 				if !isPermanentPublishError(err) {
@@ -268,7 +302,8 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event) ([]Event, er
 	}
 }
 
-func (c *Client) publishWorkerBatch(batch []Event) []Event {
+func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64) []Event {
+	batch = c.dropBatchOnConsentEpoch(batch, seenConsentEpoch)
 	if len(batch) == 0 {
 		return batch
 	}

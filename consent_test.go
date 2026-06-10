@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -294,5 +295,120 @@ func (l chanLogger) Printf(format string, args ...any) {
 	select {
 	case l.logs <- fmt.Sprintf(format, args...):
 	default:
+	}
+}
+
+func TestConsentDenyThenGrantDropsWorkerHeldBatch(t *testing.T) {
+	var eventCount atomic.Int64
+	consents := make(chan capturedConsent, 4)
+	server := newConsentTestServer(t, &eventCount, consents)
+	defer server.Close()
+
+	// BatchSize 10 + 1h FlushInterval: the worker pulls enqueued events
+	// into its local batch and then holds them without publishing.
+	client := newConsentTestClient(t, server.URL, "", "anon-actor")
+	defer client.Close(context.Background())
+
+	for _, name := range []string{"purchase", "economy_tx", "match_end"} {
+		if err := client.Enqueue(Event{Name: name}); err != nil {
+			t.Fatalf("Enqueue: %v", err)
+		}
+	}
+
+	// Wait until the worker has moved every event out of the shared queue
+	// into its worker-local batch, so the denial below cannot reach them
+	// via the queue drain.
+	deadline := time.Now().Add(3 * time.Second)
+	for len(client.queue.ch) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the worker to pull events into its local batch")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	client.SetConsent(false)
+	waitForConsent(t, consents)
+	client.SetConsent(true)
+	waitForConsent(t, consents)
+
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if got := eventCount.Load(); got != 0 {
+		t.Fatalf("worker-held events from the denied period must not publish after re-grant, got %d published", got)
+	}
+	if got := client.Snapshot().Dropped; got != 3 {
+		t.Fatalf("expected 3 dropped worker-held events, got %d", got)
+	}
+
+	// The pipeline is open again: post-grant events publish normally.
+	if err := client.Enqueue(Event{Name: "purchase"}); err != nil {
+		t.Fatalf("Enqueue after grant: %v", err)
+	}
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush after grant: %v", err)
+	}
+	if got := eventCount.Load(); got != 1 {
+		t.Fatalf("expected exactly the post-grant event to publish, got %d", got)
+	}
+}
+
+func TestSetConsentDecisionsArriveInCallOrder(t *testing.T) {
+	const flips = 12
+
+	var mu sync.Mutex
+	var arrived []bool
+	done := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/consent" {
+			t.Errorf("unexpected request path %q", r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		var body consentRequest
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode consent request: %v", err)
+		}
+		// Hold every request briefly: concurrent unordered senders would
+		// interleave here, while the single serialized sender stays in
+		// strict call order.
+		time.Sleep(5 * time.Millisecond)
+		mu.Lock()
+		arrived = append(arrived, body.Categories["analytics"])
+		full := len(arrived) == flips
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"recorded":true,"replayed":false}`))
+		if full {
+			close(done)
+		}
+	}))
+	defer server.Close()
+
+	client := newConsentTestClient(t, server.URL, "user-actor", "")
+	defer client.Close(context.Background())
+
+	want := make([]bool, 0, flips)
+	for i := 0; i < flips; i++ {
+		granted := i%2 != 0 // deny, grant, deny, grant, ...
+		client.SetConsent(granted)
+		want = append(want, granted)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		mu.Lock()
+		got := len(arrived)
+		mu.Unlock()
+		t.Fatalf("timed out waiting for %d consent POSTs, got %d", flips, got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for i, granted := range want {
+		if arrived[i] != granted {
+			t.Fatalf("consent decisions arrived out of call order: position %d got analytics=%v, want %v (full order %v, want %v)", i, arrived[i], granted, arrived, want)
+		}
 	}
 }

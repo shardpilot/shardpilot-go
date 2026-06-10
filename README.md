@@ -74,9 +74,11 @@ using environment variables.
 
 `LoadOrCreateAnonymousID(path)` loads a persisted anonymous identifier from a
 file, or generates a fresh UUIDv7 and persists it there with 0600 permissions
-(creating parent directories as needed). It is strictly opt-in: the SDK never
-calls it implicitly and never writes files on its own, so server integrations
-that do not want on-disk state simply never call it.
+(creating parent directories as needed). The file is created atomically with
+an exclusive create, so concurrent first runs racing on the same path
+converge on a single identifier. It is strictly opt-in: the SDK never calls
+it implicitly and never writes files on its own, so server integrations that
+do not want on-disk state simply never call it.
 
 ```go
 anonymousID, err := shardpilot.LoadOrCreateAnonymousID(
@@ -113,13 +115,15 @@ consent must survive process restarts, read `Client.Consent()` after a
 decision, store it yourself (for example next to the anonymous-ID file), and
 re-apply it with `SetConsent` on startup.
 
-An explicit decision is also posted fire-and-forget to
-`POST {IngestURL}/v1/consent` with the same bearer-token transport as event
-batches, using `Config.UserID` (preferred) or `Config.AnonymousID` as
-`actor_identifier`. Failures are logged quietly via `Config.Logger` and never
-affect the local state. If neither identity field is configured, the decision
-applies locally only and no request is sent. Consent never rides the event
-envelope.
+An explicit decision is also posted to `POST {IngestURL}/v1/consent` with the
+same bearer-token transport as event batches, using `Config.UserID`
+(preferred) or `Config.AnonymousID` as `actor_identifier`. The post is
+fire-and-forget for the caller — `SetConsent` never blocks on the network —
+but decisions are transmitted by a single per-client sender in call order, so
+a deny-then-grant cannot arrive at the server reversed. Failures are logged
+quietly via `Config.Logger` and never affect the local state. If neither
+identity field is configured, the decision applies locally only and no
+request is sent. Consent never rides the event envelope.
 
 ## Crash Reporting
 
@@ -278,8 +282,10 @@ pre-symbolicated frame fields, optional `raw_text`, and breadcrumbs.
 - If the queue is full, `Enqueue` drops the event, increments `Dropped`, and
   returns `ErrQueueFull`.
 - While consent is denied, `Track` and `Enqueue` drop the event, increment
-  `Dropped`, and return `ErrConsentDenied`; queued events pending at the
-  moment of denial are cleared and counted as `Dropped`.
+  `Dropped`, and return `ErrConsentDenied`; events pending at the moment of
+  denial — both queued and already pulled into the worker's in-flight batch —
+  are cleared and counted as `Dropped`, and never publish even if consent is
+  granted again later.
 - `Track` sends one event synchronously for tests and utilities.
 - `Flush` drains queued events.
 - `Close` marks the client closed and flushes remaining queued events until the
