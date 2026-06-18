@@ -1,36 +1,37 @@
-# ShardPilot Go SDK
+# shardpilot-go
 
-ShardPilot Go SDK is a v0 public-preview source SDK for sending app-first
-telemetry to ShardPilot ingest. The API is pre-v1 and may change before v1.
-After this PR merges and maintainers create the tag, the current alpha module
-tag candidate will be `v0.2.0-alpha`.
+> Go client SDK for ShardPilot — sends app-first analytics events (and, optionally, crash reports) to the ShardPilot ingest plane. Zero third-party dependencies, stdlib only.
 
-Pin the current alpha milestone explicitly after tag creation:
+Platform context: [`../AGENTS.md`](../AGENTS.md). Governing ADRs: app-first analytics [ADR-0139](../docs/architecture/adr/0139-universal-app-analytics-core-refactor.md), crash SDK design [ADR-0191](../docs/architecture/adr/0191-crash-sdk-design.md), dual-mode ingest auth [ADR-0222](../docs/architecture/adr/0222-dual-mode-client-ingest-auth-publishable-key-and-per-tenant-jwt.md).
+
+## Status
+
+Real, tested, working code — **early alpha**. The API is pre-v1 and may change before v1.
+
+- Two import paths: the root `shardpilot` package (analytics) and `pkg/crash` (crash reporting).
+- Module `go` directive is **1.24** (the source-compatibility baseline for SDK consumers). CI verifies both Go 1.24.x and the current toolchain (1.26.4).
+- Pre-launch: ingest endpoints are reached via the local Compose stack or a deployed environment you provide; there is no public production endpoint.
+
+## What it does
+
+- Builds and sends app-first event envelopes to `POST {IngestURL}/v1/events:batch` with bearer-token auth.
+- Synchronous `Track`, bounded async `Enqueue`, `Flush`, and `Close`; in-memory delivery stats via `Snapshot`.
+- Bounded batching (default 25 events, capped at 100) with retry of retryable HTTP responses; memory-only queue (no durable on-disk queue).
+- Optional explicit analytics consent (`SetConsent` / `Consent`) with a separate `POST {IngestURL}/v1/consent` endpoint.
+- Opt-in `LoadOrCreateAnonymousID(path)` helper for a persisted UUIDv7 anonymous identifier.
+- Crash reporting (`pkg/crash`): sends the canonical crash-symbolicator wire schema to `POST {base}/api/v1/crashes/ingest`, with sanitized breadcrumbs, PII scrubbing, and fatal/non-fatal emit APIs.
+
+## Installation
 
 ```bash
-go get github.com/shardpilot/shardpilot-go@v0.2.0-alpha
+go get github.com/shardpilot/shardpilot-go@v0.3.0-alpha
 ```
 
-v0.2.0-alpha is an early alpha pre-release; the API is unstable and may change
-before v1. v0.2.0-alpha and later require Go 1.24 or newer. v0.1.0 is
-retracted in v0.1.1+ go.mod; prefer v0.2.0-alpha or later for crash reporting
-or v0.1.2 for analytics-only integrations.
+`v0.3.0-alpha` is the latest tag (de-games the universal `Event` envelope). `pkg/crash` landed in `v0.2.0-alpha`. For analytics only, `v0.1.2` is available. **`v0.1.0` is retracted** in the module's `go.mod` (use `v0.1.2` or `v0.2.0-alpha` or later). `v0.1.2` and later require **Go 1.24+**.
 
-Floating release-style install shape:
+## Quick start (analytics)
 
-```bash
-go get github.com/shardpilot/shardpilot-go@latest
-```
-
-For development beyond the tagged alpha milestone, source checkouts or module
-replacements can still be used during evaluation.
-
-The module `go` directive is kept at Go 1.24 as the source-compatibility
-baseline for SDK consumers. Current supported Go toolchains are still
-recommended for production builds, and CI verifies both Go 1.24.x compatibility
-and the current Go toolchain target.
-
-## Basic Usage
+A runnable backend example lives in [`examples/basic`](examples/basic). The minimal flow:
 
 ```go
 client, err := shardpilot.NewClient(shardpilot.Config{
@@ -47,9 +48,9 @@ if err != nil {
 }
 defer client.Close(context.Background())
 
-// purchase is a backend-source canonical event: the authoritative
-// real-money purchase your backend reports AFTER receipt/store validation.
-// Required props per the canonical schema: amount, currency, product.
+// purchase is a backend-source canonical event: the server-validated,
+// real-money purchase reported after receipt/store validation. The
+// canonical schema requires props.amount, props.currency, and props.product.
 err = client.Track(context.Background(), shardpilot.Event{
     Name:   "purchase",
     UserID: "user-1042",
@@ -62,260 +63,141 @@ err = client.Track(context.Background(), shardpilot.Event{
 })
 ```
 
-Pick events whose canonical schema allows your configured `Source`. Session
-and screen events (for example `app.session_started`, `app.screen_view`) are
-client-source-only, so a backend client cannot legally send them; backend
-clients send backend-source events such as `purchase` or `economy_tx`.
+Pick events whose canonical schema allows your configured `Source`. Session/screen events (e.g. `app.session_started`, `app.screen_view`) are client-source-only — a backend client cannot legally send them; backend clients send backend-source events such as `purchase` or `economy_tx`.
 
-See [`examples/basic`](examples/basic) for a runnable backend/server example
-using environment variables.
+## Quick start (crash reporting)
 
-## Anonymous IDs (opt-in helper)
-
-`LoadOrCreateAnonymousID(path)` loads a persisted anonymous identifier from a
-file, or generates a fresh UUIDv7 and persists it there with 0600 permissions
-(creating parent directories as needed). The ID is fully written to a private
-temp file and then published to the final path atomically without
-overwriting, so the file only ever appears complete: concurrent first runs
-racing on the same path converge on a single identifier and never observe a
-partial file. It is strictly opt-in: the SDK never calls it implicitly and
-never writes files on its own, so server integrations that do not want
-on-disk state simply never call it.
+A runnable example lives in [`examples/crash`](examples/crash). It demonstrates the client API surface with a synthetic stub event; it does not install a panic handler or capture a real crash.
 
 ```go
-anonymousID, err := shardpilot.LoadOrCreateAnonymousID(
-    filepath.Join(configDir, "shardpilot", "anonymous_id"))
+import "github.com/shardpilot/shardpilot-go/pkg/crash"
+
+client, err := crash.NewClient(crash.ClientOptions{
+    IngestURL: os.Getenv("SHARDPILOT_CRASH_SYMBOLICATOR_URL"),
+    APIKey:    os.Getenv("SHARDPILOT_API_KEY"),
+})
 if err != nil {
     return err
 }
 
-client, err := shardpilot.NewClient(shardpilot.Config{
-    // ... required fields ...
-    AnonymousID: anonymousID,
+client.RecordBreadcrumb("app.session_started")
+client.RecordBreadcrumb("level_loaded")
+
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+
+err = client.EmitFatal(ctx, crash.Event{
+    OccurredAt: time.Now().UTC(),
+    App:        crash.AppInfo{ID: "app_example", Version: "0.2.0-alpha", BuildID: "synthetic-build"},
+    Platform:   "linux",
+    OS:         crash.OSInfo{Name: "linux", Version: "synthetic"},
+    Device:     map[string]string{"class": crash.DeviceClassDesktop, "arch": "x86_64"},
+    Exception:  crash.ExceptionInfo{Type: "SIGSEGV", Reason: "synthetic fault", CrashedThreadID: "main"},
+    Modules: []crash.Module{{
+        ID: "examples-crash", Name: "examples-crash",
+        DebugID: "AABBCCDDEEFF00112233445566778899", LoadAddress: "0x400000",
+    }},
+    Threads: []crash.Thread{{
+        ID: "main", Name: "main", Crashed: true,
+        Frames: []crash.Frame{
+            {ModuleID: "examples-crash", InstructionAddress: "0x401015", Function: "main.syntheticCrash", File: "examples/crash/main.go", Line: 42},
+            {ModuleID: "examples-crash", InstructionAddress: "0x401000", Function: "main.main", File: "examples/crash/main.go", Line: 36},
+        },
+    }},
 })
 ```
 
-`Config.UserID` and `Config.AnonymousID` are optional default actor identity
-values: events that do not set their own `UserID`/`AnonymousID` inherit them,
-and `SetConsent` uses them as the consent actor identifier (user ID
-preferred, else anonymous ID).
+`EmitFatal` always sends; `Emit` (non-fatal) is subject to the client sampler (default: 1 in 10).
 
-## Consent
+## Configuration
 
-`Client.SetConsent(analyticsGranted bool)` records an explicit analytics
-consent decision, with tri-state semantics:
+`shardpilot.Config` fields:
 
-- **unknown** (initial): no decision recorded, the event pipeline is fully
-  open.
-- **granted**: the pipeline is open.
-- **denied**: events are dropped at enqueue — `Track` and `Enqueue` return
-  `ErrConsentDenied` — the pending queue is cleared, and any event batch
-  publish already in flight on the network is aborted (cleared and aborted
-  events count as `Dropped` in `Snapshot`, never as `Published`).
+| Field | Required | Notes |
+|---|---|---|
+| `IngestURL` | yes | Absolute base URL, no path/query/fragment. HTTPS required outside localhost/loopback (or private nets with `AllowInsecurePrivateNetwork`). |
+| `Token` | yes | Bearer token (Mode A `sp_ingest_` publishable key or Mode B per-tenant JWT, ADR-0222). Held in memory; never logged. |
+| `WorkspaceID` / `AppID` / `EnvironmentID` | yes | App-first identity (`workspace → app → environment`). |
+| `Source` | yes | `SourceClient`, `SourceServer`, or `SourceBackend`. |
+| `AppVersion` / `AppBuild` / `Platform` | no | Default envelope metadata. |
+| `UserID` / `AnonymousID` | no | Default actor identity; also the consent `actor_identifier` (UserID preferred). |
+| `BatchSize` | no | Default 25, capped at 100. |
+| `BufferSize` | no | Async queue capacity, default 1000. |
+| `FlushInterval` | no | Default 1s. |
+| `HTTPTimeout` | no | Default 2s. |
+| `Logger` | no | `Printf`-style logger; never receives tokens or full payloads. |
+| `AllowInsecurePrivateNetwork` | no | Allow plain HTTP to RFC1918 private addresses. |
 
-The state is held in client memory only; the SDK does not persist it. If
-consent must survive process restarts, read `Client.Consent()` after a
-decision, store it yourself (for example next to the anonymous-ID file), and
-re-apply it with `SetConsent` on startup.
+The example programs read these from `SHARDPILOT_*` environment variables; the SDK itself reads no environment variables.
 
-An explicit decision is also posted to `POST {IngestURL}/v1/consent` with the
-same bearer-token transport as event batches, using `Config.UserID`
-(preferred) or `Config.AnonymousID` as `actor_identifier`. The post is
-fire-and-forget for the caller — `SetConsent` never blocks on the network —
-but decisions are transmitted by a single per-client sender in call order, so
-a deny-then-grant cannot arrive at the server reversed. `Close` waits
-(bounded by its context) for decisions recorded before it was called to
-finish transmitting. Failures are logged quietly via `Config.Logger` and
-never affect the local state. If neither identity field is configured, the
-decision applies locally only and no request is sent. Consent never rides
-the event envelope.
+Crash client (`crash.ClientOptions`): `IngestURL` (crash-symbolicator base URL), `APIKey` (needs `crash:write`), plus optional `HTTPClient`, `Logger`, `Sampler`, `MaxAttempts` (default 2), `RetryBackoff` (default 50ms). Default HTTP timeout is 30s.
 
-## Crash Reporting
+## Wire contract
 
-The crash SDK lives in `pkg/crash` and sends the canonical crash-symbolicator
-wire schema to `POST /api/v1/crashes/ingest` on the configured
-crash-symbolicator base URL. The canonical schema is owned by
-`shardpilot/crash-symbolicator` in `api/openapi.yaml`; the SDK mirrors that
-schema with typed Go structs. It generates UUIDv7 crash IDs when needed,
-records a fixed ring of analytics-event-name breadcrumbs, strips PII and raw
-identifier material, and intentionally has no API surface for screenshots,
-network payloads, or attachments. This is an alpha release; the API may change
-before v1.0.
+App-first event envelope (`POST {IngestURL}/v1/events:batch`, `Authorization: Bearer <token>`). Each envelope carries `event_id`, `schema_version`, `event_name`, `source`, `event_ts`, `workspace_id`, `app_id`, `environment_id`, and optional `user_id`, `anonymous_id`, `session_id`, `session_sequence`, `platform`, `app_version`, `app_build`, `context`, `props`.
 
-```go
-package main
+The envelope is **universal** — no domain-specific fields. Vertical context (e.g. `match_id`) goes in `Props` and serializes under `props`. **Banned legacy fields** never appear in SDK source or on the wire: `project_id`, `game_id`, `env`, `event_ts_server`, `event_seq_session`, top-level `build_version`. Use `app_version` / `app_build` for version metadata.
 
-import (
-    "context"
-    "log"
-    "os"
-    "time"
+Consent decisions ride their own endpoint (`POST {IngestURL}/v1/consent`), never the event envelope, with body `workspace_id`, `app_id`, `environment_id`, `actor_identifier`, `categories` (`{"analytics": <bool>}`), `decided_at` (RFC3339), and a fresh UUIDv7 `idempotency_key`.
 
-    "github.com/shardpilot/shardpilot-go/pkg/crash"
-)
+Crash reports go to `POST {base}/api/v1/crashes/ingest` (`Authorization: Bearer <api-key-with-crash:write>`) with a stable `crash_id`, `occurred_at`, app/platform/os, device & context maps, exception metadata, binary modules with `debug_id`/`load_address`, per-thread raw instruction addresses, optional pre-symbolicated frames, optional `raw_text`, and breadcrumbs. The crash structs are a **hand-maintained mirror** of crash-symbolicator's `api/openapi.yaml`.
 
-func main() {
-    /*
-        Production crash capture requires hooking the runtime panic handler.
-        This example only demonstrates the client API surface with a synthetic
-        stub event; it does not install a panic handler or capture a real crash.
-    */
-    ingestURL := os.Getenv("SHARDPILOT_CRASH_SYMBOLICATOR_URL")
-    apiKey := os.Getenv("SHARDPILOT_API_KEY")
-    if ingestURL == "" || apiKey == "" {
-        log.Fatal("SHARDPILOT_CRASH_SYMBOLICATOR_URL and SHARDPILOT_API_KEY are required")
-    }
+## Privacy & consent
 
-    client, err := crash.NewClient(crash.ClientOptions{
-        IngestURL: ingestURL,
-        APIKey:    apiKey,
-    })
-    if err != nil {
-        log.Fatalf("create crash client: %v", err)
-    }
+- `SetConsent(analyticsGranted bool)` is tri-state: **unknown** (initial, pipeline open), **granted** (open), **denied** (events dropped at enqueue with `ErrConsentDenied`; pending queue cleared and in-flight batch aborted — cleared events count as `Dropped`, never `Published`).
+- Consent state is **in-memory only**; the SDK does not persist it. Read `Consent()` and re-apply with `SetConsent` to survive restarts.
+- An explicit decision posts fire-and-forget to `/v1/consent`; decisions are transmitted by a single per-client sender in call order, so deny-then-grant cannot arrive reversed. `Close` waits (bounded by its context) for prior decisions to finish sending.
+- Crash reports strip PII and raw identifier material; there is no API surface for screenshots, network payloads, or attachments.
+- Do not commit tokens or real customer/player data. Tokens and full event payloads are never logged by default.
 
-    client.RecordBreadcrumb("app.session_started")
-    client.RecordBreadcrumb("level_loaded")
-    client.RecordBreadcrumb("boss_intro_seen")
+## Project layout
 
-    ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-    defer cancel()
+| Path | What it is |
+|---|---|
+| `client.go`, `queue.go`, `transport.go`, `envelope.go` | Analytics client: lifecycle, bounded queue, HTTP transport, envelope builder. |
+| `config.go`, `event.go`, `consent.go`, `metrics.go`, `errors.go` | Config validation, public `Event`, consent state machine, `Stats`, sentinel errors. |
+| `anonymous_id.go`, `ids.go`, `clock.go` | Opt-in anonymous-ID helper, event-ID generation, injectable clock. |
+| `internal/uuidv7/` | Shared UUIDv7 generator (crash IDs, anonymous IDs, consent idempotency keys). |
+| `pkg/crash/` | Crash SDK: `client.go`, `event.go` (typed wire schema), `breadcrumbs.go`, `sanitize.go`. |
+| `examples/basic/`, `examples/crash/` | Runnable analytics and crash examples (env-var driven). |
+| `*_test.go`, `quickstart_test.go`, `client_benchmark_test.go` | Unit, quickstart, and benchmark tests. |
 
-    err = client.EmitFatal(ctx, crash.Event{
-        OccurredAt: time.Now().UTC(),
-        App:        crash.AppInfo{ID: "app_example", Version: "0.2.0-alpha", BuildID: "synthetic-build"},
-        Platform:   "linux",
-        OS:         crash.OSInfo{Name: "linux", Version: "synthetic"},
-        Device:     map[string]string{"class": crash.DeviceClassDesktop, "arch": "x86_64"},
-        Context:    map[string]string{"session_id": "sha256-session-hash-example"},
-        Exception:  crash.ExceptionInfo{Type: "SIGSEGV", Reason: "synthetic fault", CrashedThreadID: "main"},
-        Modules: []crash.Module{{
-            ID:          "examples-crash",
-            Name:        "examples-crash",
-            DebugID:     "AABBCCDDEEFF00112233445566778899",
-            LoadAddress: "0x400000",
-        }},
-        Threads: []crash.Thread{{
-            ID:      "main",
-            Crashed: true,
-            Frames: []crash.Frame{
-                {ModuleID: "examples-crash", InstructionAddress: "0x401015", Function: "main.syntheticCrash", File: "examples/crash/main.go", Line: 42},
-                {ModuleID: "examples-crash", InstructionAddress: "0x401000", Function: "main.main", File: "examples/crash/main.go", Line: 36},
-            },
-        }},
-    })
-    if err != nil {
-        log.Fatalf("emit crash event: %v", err)
-    }
-}
+## Build & test
+
+No Makefile — standard Go tooling. CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `gofmt` check, `go test ./...`, and `go vet ./...` on Go 1.24.x and 1.26.4.
+
+```bash
+go build ./...
+go test ./...
+go vet ./...
+gofmt -l .
 ```
 
-See [`examples/crash`](examples/crash) for the runnable version.
+## Conventions & boundaries
 
-## Versioning
+- **Zero third-party dependencies** — stdlib only. Keep it that way.
+- **No domain logic in core.** No product-specific event names or game/vertical fields in the universal envelope.
+- **The SDK only sends telemetry.** It performs no provider, model, GitHub, billing, control-plane write, or automatic action calls.
+- **Fail-safe HTTP.** HTTPS required outside localhost/loopback (private-network HTTP only via explicit opt-in). No durable local queue; no retry storms; the worker retains at most one failed in-memory batch.
+- The `go` directive stays at **1.24** for consumer compatibility even though CI also exercises the current toolchain.
 
-- `v0.1.x` is the analytics SDK only.
-- `v0.2.x` adds the crash SDK under `pkg/crash`; the analytics API is unchanged.
+## Roadmap
 
-## Wire Contract
+Pre-v1; the API is explicitly unstable. From the changelog `[Unreleased]`:
 
-The analytics SDK sends:
+- Consent API, `LoadOrCreateAnonymousID`, and optional default actor identity fields are landed in `[Unreleased]` (not yet tagged).
+- Public developer docs are planned for `docs.shardpilot.com`; that domain is not yet provisioned.
 
-```text
-POST {IngestURL}/v1/events:batch
-Content-Type: application/json
-Authorization: Bearer <token>
-```
+`v0.3.0-alpha` (tagged) removed the game-flavored `MatchID` field from the universal `Event` envelope; carry that context in `Props["match_id"]` instead (wire payload unchanged).
 
-Event envelopes are app-first and use:
+## Related repositories
 
-- `workspace_id`
-- `app_id`
-- `environment_id`
-- `event_ts`
-- `session_sequence`
+- [`../analytics-service`](../analytics-service) — ingest plane that receives the event batches and consent decisions.
+- [`../crash-symbolicator`](../crash-symbolicator) — owns the canonical crash wire schema (`api/openapi.yaml`) this SDK mirrors.
+- [`../control-plane`](../control-plane) — mints/introspects the ingest tokens and API keys used here.
+- [`../developers`](../developers) — public docs for the ingest API and SDKs.
+- Sibling SDKs: [`../shardpilot-unity`](../shardpilot-unity), [`../shardpilot-unreal`](../shardpilot-unreal), [`../shardpilot-defold`](../shardpilot-defold).
 
-The SDK does not expose or send legacy public SDK fields such as `project_id`,
-`game_id`, `env`, `event_ts_server`, `event_seq_session`, or top-level
-`build_version`. Use `app_version` or `app_build` for application version
-metadata.
+## License
 
-The `Event` envelope is universal and does not carry domain-specific fields.
-Game- or vertical-specific context (for example `match_id`) goes in `Props`,
-which is sent as `props` (e.g. `Props["match_id"]` is serialized to
-`props.match_id`). It is not a top-level ShardPilot ingest envelope field.
-
-Explicit consent decisions are sent on their own endpoint (never on the
-event envelope):
-
-```text
-POST {IngestURL}/v1/consent
-Content-Type: application/json
-Authorization: Bearer <token>
-```
-
-with body fields `workspace_id`, `app_id`, `environment_id`,
-`actor_identifier`, `categories` (`{"analytics": <bool>}`), `decided_at`
-(RFC3339), and a fresh UUIDv7 `idempotency_key`. The service responds
-`200 {"recorded": true, "replayed": <bool>}`.
-
-The crash SDK sends:
-
-```text
-POST {SHARDPILOT_CRASH_SYMBOLICATOR_URL}/api/v1/crashes/ingest
-Content-Type: application/json
-Authorization: Bearer <api-key-with-crash:write>
-```
-
-Crash reports include a stable `crash_id`, `occurred_at`, `app`,
-`platform`/`os`, device/context maps, exception metadata, binary images with
-`debug_id` and `load_address`, per-thread raw instruction addresses, optional
-pre-symbolicated frame fields, optional `raw_text`, and breadcrumbs.
-
-## Behavior
-
-- Batches default to 25 events and are capped at 100.
-- The async queue is bounded and memory-only; there is no durable local queue
-  in v0.
-- The worker retains at most one failed in-memory batch for a later retry.
-  There is no disk persistence and no unbounded local replay.
-- Retry attempts happen through the normal worker cadence: no more frequently
-  than `FlushInterval`, plus explicit `Flush` or `Close` calls.
-- The SDK does not start concurrent retry storms. While one worker batch is
-  retained, sustained failures can apply backpressure and new queued events may
-  be dropped according to `BufferSize`.
-- If the queue is full, `Enqueue` drops the event, increments `Dropped`, and
-  returns `ErrQueueFull`.
-- While consent is denied, `Track` and `Enqueue` drop the event, increment
-  `Dropped`, and return `ErrConsentDenied`; events pending at the moment of
-  denial — queued, already pulled into the worker's batch, or mid-publish on
-  the network (the HTTP request is aborted) — are cleared and counted as
-  `Dropped`, never as `FailedBatches`, and never publish even if consent is
-  granted again later — including when a re-grant lands before the aborted
-  request returns.
-- `Track` sends one event synchronously for tests and utilities.
-- `Flush` drains queued events.
-- `Close` marks the client closed and flushes remaining queued events until the
-  context deadline.
-- Event IDs are generated with crypto/rand UUIDv4-like identifiers when absent.
-- Event timestamps default to `time.Now().UTC()` when absent.
-- HTTP ingest URLs are allowed for localhost and loopback development. Use
-  HTTPS elsewhere unless explicitly opting into private-network HTTP with
-  `AllowInsecurePrivateNetwork`.
-
-## Security And Privacy
-
-- Do not commit tokens or real customer/player data.
-- Tokens are held in memory only.
-- Tokens are never logged by the SDK.
-- Full event payloads are never logged by the SDK by default.
-- Do not send raw provider payloads, raw player/customer payloads, diffs,
-  patches, code/file/archive content, prompts, completions, secrets, or
-  unsanitized stack/backtrace payloads.
-- The SDK does not perform provider, model, GitHub, billing, control-plane
-  write, or automatic action calls.
-- Product integrations can use this SDK through normal app-first telemetry,
-  but no product-specific event names or domain logic live in SDK core.
-
-Developer docs are planned for `docs.shardpilot.com`, but that domain is not
-provisioned or live in this wave.
+See [LICENSE](LICENSE) and [NOTICE](NOTICE). Security policy: [SECURITY.md](SECURITY.md).
