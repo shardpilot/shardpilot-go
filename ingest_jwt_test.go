@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -488,6 +489,29 @@ func TestSignIngestJWT_WipedKeyCannotMint(t *testing.T) {
 	}
 	if _, err := SignIngestJWT(copyOfKey, claims); !errors.Is(err, ErrInvalidSigningKey) {
 		t.Fatalf("a copy of a wiped key (all-zero backing) must not mint, err=%v", err)
+	}
+}
+
+// A SigningKey must redact its secret when formatted, so a stray %v/%s/%#v log
+// line cannot leak the per-tenant HMAC secret.
+func TestSigningKeyRedactsSecretWhenFormatted(t *testing.T) {
+	secret := []byte("super-secret-tenant-hmac-value-abcdef")
+	key := SigningKey{KID: "kid-redact", Secret: secret}
+	for _, verb := range []string{"%v", "%+v", "%s", "%#v"} {
+		out := fmt.Sprintf(verb, key)
+		if strings.Contains(out, string(secret)) {
+			t.Errorf("%s leaked the secret: %q", verb, out)
+		}
+		if !strings.Contains(out, "kid-redact") {
+			t.Errorf("%s should still show the kid: %q", verb, out)
+		}
+		if !strings.Contains(out, "REDACTED") {
+			t.Errorf("%s should mark the secret redacted: %q", verb, out)
+		}
+	}
+	// A pointer to the key formats the same way (value receiver is in *T's set).
+	if strings.Contains(fmt.Sprintf("%v", &key), string(secret)) {
+		t.Error("formatting a *SigningKey leaked the secret")
 	}
 }
 

@@ -167,9 +167,12 @@ if err != nil {
 ```
 
 Defaults: issuer `project-tower-main-server`, audience `analytics-service`,
-lifetime 10m (well under the server's 15m max-lifetime and 5m iat-age caps).
-Override per deployment with `WithIngestIssuer`, `WithIngestAudience`, and
-`WithIngestLifetime` (capped at 15m); `WithIngestNow` / `WithIngestClock` exist
+lifetime 5m. The default equals the server's 5m iat-age window — the verifier
+rejects a token more than 5m past its `iat` regardless of `exp`, so a longer
+lifetime would advertise validity the server will not honour. Override per
+deployment with `WithIngestIssuer`, `WithIngestAudience`, and
+`WithIngestLifetime` (capped at the server's 15m max-lifetime, but note the 5m
+iat-age window still applies); `WithIngestNow` / `WithIngestClock` exist
 for tests. The scope is fixed to `analytics:ingest`. Every input is validated at
 mint time — an empty/over-long subject or `bind_anon`, an empty tenant field, an
 invalid `kid`, an empty secret, or an over-long lifetime all return an error and

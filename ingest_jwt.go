@@ -123,12 +123,27 @@ var ErrInvalidMintOption = errors.New("invalid shardpilot mint option")
 // bytes (already base64url-decoded if the caller received it base64url-encoded
 // on the wire) and is HELD ONLY in a trusted server-side process.
 //
-// Secret is []byte — never a string — so it is not accidentally captured by a
-// %s/%v in a log line. It MUST NOT be logged. Use ZeroSecret to wipe a copy
-// once a key is no longer needed.
+// SigningKey implements a redacting String/GoString, so logging a key (or a
+// struct that embeds one) with %v/%+v/%s/%#v never emits the secret — only the
+// kid and the secret's byte length. The Secret field itself MUST still never be
+// logged directly (e.g. fmt.Sprintf("%s", key.Secret) prints the raw bytes). Use
+// ZeroSecret to wipe a copy once a key is no longer needed.
 type SigningKey struct {
 	KID    string
 	Secret []byte
+}
+
+// String redacts the secret so a SigningKey formatted with %v/%+v/%s never emits
+// the raw HMAC bytes; only the kid and the secret's length are shown. A value
+// receiver puts String in the method set of both SigningKey and *SigningKey, so
+// fmt uses it whether a value or a pointer is logged.
+func (k SigningKey) String() string {
+	return fmt.Sprintf("SigningKey{KID:%q, Secret:[REDACTED %d bytes]}", k.KID, len(k.Secret))
+}
+
+// GoString redacts the secret for the %#v verb as well.
+func (k SigningKey) GoString() string {
+	return k.String()
 }
 
 // ZeroSecret overwrites the key's secret bytes in place with zeros, so a

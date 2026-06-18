@@ -11,8 +11,10 @@
   from control-plane (`SigningKey{KID, Secret}`, secret as raw `[]byte`), and
   signs a conformant token: header `alg=HS256` + `kid`; claims `iss`/`aud`/`sub`/
   `iat`/`exp`/`scope=analytics:ingest`/`workspace_id`/`app_id`/`environment_id`
-  and optional `bind_anon`. Lifetime defaults to 10m (capped at the server's 15m
-  max), `iat` is stamped to now (fresh against the 5m max-iat-age window), and
+  and optional `bind_anon`. Lifetime defaults to 5m — equal to the server's 5m
+  iat-age window, which the verifier enforces regardless of `exp` (capped at the
+  server's 15m max-lifetime). `iat` is stamped to now (fresh against that 5m
+  window), and
   every input is validated at mint time so a token it returns is never rejected
   downstream for a malformed claim, an over-long subject/anon, or an over-long
   lifetime. Options: `WithIngestIssuer`/`WithIngestAudience`/`WithIngestLifetime`
