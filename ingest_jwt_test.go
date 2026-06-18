@@ -214,7 +214,7 @@ func TestSignIngestJWT_RoundTrip(t *testing.T) {
 		t.Errorf("bind_anon=%v, want %q", pt.payload["bind_anon"], claims.BindAnon)
 	}
 
-	// exp - iat is the default 10m, within MaxLifetime.
+	// exp - iat is the default 5m (= the server MaxIatAge window), within MaxLifetime.
 	iat := int64(pt.payload["iat"].(float64))
 	exp := int64(pt.payload["exp"].(float64))
 	if iat != now.Unix() {
@@ -307,6 +307,12 @@ func TestSignIngestJWT_Negatives(t *testing.T) {
 		{
 			name:    "empty secret",
 			key:     SigningKey{KID: "kid1", Secret: nil},
+			claims:  goodClaims,
+			wantErr: ErrInvalidSigningKey,
+		},
+		{
+			name:    "all-zero secret",
+			key:     SigningKey{KID: "kid1", Secret: make([]byte, 32)},
 			claims:  goodClaims,
 			wantErr: ErrInvalidSigningKey,
 		},
@@ -425,6 +431,71 @@ func TestSignIngestJWT_Negatives(t *testing.T) {
 				t.Errorf("token must be empty on error, got %q", token)
 			}
 		})
+	}
+}
+
+// Subject and bind_anon must be signed RAW (byte-for-byte) so they match the
+// raw user_id/anonymous_id the event path sends; tenant-scope ids are trimmed.
+func TestSignIngestJWT_SubjectAndBindAnonSignedRaw(t *testing.T) {
+	secret := []byte("raw-preserve-secret-value-0987654321ab")
+	key := SigningKey{KID: "kid", Secret: secret}
+	now := time.Date(2026, 6, 18, 12, 0, 0, 0, time.UTC)
+	claims := IngestJWTClaims{
+		Subject:       " user-with-spaces ",
+		WorkspaceID:   "  ws  ",
+		AppID:         "app",
+		EnvironmentID: "env",
+		BindAnon:      " anon-padded ",
+	}
+	token, err := SignIngestJWT(key, claims, WithIngestNow(func() time.Time { return now }))
+	if err != nil {
+		t.Fatalf("SignIngestJWT: %v", err)
+	}
+	pt := hs256Verify(t, token, secret)
+	if pt.payload["sub"] != " user-with-spaces " {
+		t.Errorf("sub=%q, want raw %q (trimming would authorize a different identity)", pt.payload["sub"], " user-with-spaces ")
+	}
+	if pt.payload["bind_anon"] != " anon-padded " {
+		t.Errorf("bind_anon=%q, want raw %q (trimming would stitch a different anon)", pt.payload["bind_anon"], " anon-padded ")
+	}
+	// Tenant-scope identifiers ARE canonicalized (trimmed) — they match the
+	// resolved whitespace-free scope, not a per-event byte value.
+	if pt.payload["workspace_id"] != "ws" {
+		t.Errorf("workspace_id=%q, want trimmed %q", pt.payload["workspace_id"], "ws")
+	}
+}
+
+// ZeroSecret must leave the key unable to mint: the original (detached) fails
+// the empty-secret guard, and a by-value copy taken before wiping (whose backing
+// array is now all-zero) fails the all-zero guard.
+func TestSignIngestJWT_WipedKeyCannotMint(t *testing.T) {
+	claims := IngestJWTClaims{Subject: "u", WorkspaceID: "ws", AppID: "app", EnvironmentID: "env"}
+	key := SigningKey{KID: "kid", Secret: []byte("a-real-tenant-secret-value-1234567890")}
+	copyOfKey := key // shares the same backing array
+
+	key.ZeroSecret()
+
+	if key.Secret != nil {
+		t.Errorf("ZeroSecret must detach the slice, got len=%d", len(key.Secret))
+	}
+	if _, err := SignIngestJWT(key, claims); !errors.Is(err, ErrInvalidSigningKey) {
+		t.Fatalf("wiped key must not mint, err=%v", err)
+	}
+	for i, b := range copyOfKey.Secret {
+		if b != 0 {
+			t.Fatalf("ZeroSecret must scrub the shared backing array, byte %d = %d", i, b)
+		}
+	}
+	if _, err := SignIngestJWT(copyOfKey, claims); !errors.Is(err, ErrInvalidSigningKey) {
+		t.Fatalf("a copy of a wiped key (all-zero backing) must not mint, err=%v", err)
+	}
+}
+
+// The default lifetime must stay within the server's iat-age window, or cached
+// tokens would fail ingest before their advertised exp (independent of exp).
+func TestDefaultIngestLifetimeWithinIatAgeWindow(t *testing.T) {
+	if DefaultIngestLifetime > verifierMaxIatAge {
+		t.Fatalf("DefaultIngestLifetime=%s exceeds the verifier MaxIatAge=%s; cached tokens would fail ingest before exp", DefaultIngestLifetime, verifierMaxIatAge)
 	}
 }
 

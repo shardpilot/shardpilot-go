@@ -65,10 +65,14 @@ const (
 	DefaultIngestAudience = "analytics-service"
 
 	// DefaultIngestLifetime is the default token validity window (exp - iat). It
-	// is intentionally well under the server's 15m MaxLifetime cap and its 5m
-	// MaxIatAge window, leaving comfortable headroom for clock skew and for the
-	// client to fetch and use the token before it expires.
-	DefaultIngestLifetime = 10 * time.Minute
+	// equals the server's 5m MaxIatAge window so the advertised exp is actually
+	// reachable. The verifier enforces iat-age independently of exp: it rejects
+	// any token more than MaxIatAge past its iat REGARDLESS of exp, so a longer
+	// default (e.g. 10m) would advertise validity the server will not honour —
+	// cached/retried tokens would start failing ingest at ~5m even though they
+	// are not yet "expired". 5m sits well under the 15m MaxLifetime cap, leaving
+	// the iat-age window as the binding bound and exp honest about it.
+	DefaultIngestLifetime = 5 * time.Minute
 
 	// maxIngestLifetime is the hard cap on a minted token's lifetime. It mirrors
 	// the analytics-service DefaultIngestClientJWTMaxLifetime (15m): a token whose
@@ -129,12 +133,29 @@ type SigningKey struct {
 
 // ZeroSecret overwrites the key's secret bytes in place with zeros, so a
 // long-lived process can wipe a secret it no longer needs rather than wait for
-// the garbage collector. After calling it the key can no longer mint tokens.
-// It is safe to call on a zero-value key.
+// the garbage collector. After calling it the key can no longer mint tokens:
+// the backing bytes are scrubbed AND the slice is detached (length 0), so a
+// later SignIngestJWT on this key fails the non-empty-secret guard rather than
+// silently signing with all-zero bytes. It is safe to call on a zero-value key.
 func (k *SigningKey) ZeroSecret() {
 	for i := range k.Secret {
 		k.Secret[i] = 0
 	}
+	k.Secret = nil
+}
+
+// allZeroBytes reports whether b is non-empty and every byte is zero — the state
+// the backing array of a SigningKey is left in by ZeroSecret (and the state a
+// by-value copy of a wiped key is in, since only the original's slice header is
+// detached). Such a key cannot mint a token the verifier will accept, so
+// SignIngestJWT rejects it.
+func allZeroBytes(b []byte) bool {
+	for _, c := range b {
+		if c != 0 {
+			return false
+		}
+	}
+	return len(b) > 0
 }
 
 // IngestJWTClaims are the per-mint claims that bind a token to a verified user
@@ -196,9 +217,14 @@ func WithIngestAudience(audience string) MintOption {
 }
 
 // WithIngestLifetime overrides the token validity window (exp - iat). The
-// default is DefaultIngestLifetime (10m). It must be greater than zero and at
+// default is DefaultIngestLifetime (5m). It must be greater than zero and at
 // most the server's 15m MaxLifetime cap; an over-long lifetime is rejected here
 // at the mint source so the token is never rejected for lifetime at verify.
+//
+// NOTE: the server ALSO enforces a 5m iat-age window independent of exp, so a
+// lifetime longer than ~5m advertises validity the server will not honour — the
+// token becomes unusable ~5m after iat regardless of its exp. Prefer the default
+// unless the deployment's MaxIatAge is configured higher.
 func WithIngestLifetime(d time.Duration) MintOption {
 	return func(o *mintOptions) error {
 		if d <= 0 {
@@ -305,13 +331,29 @@ func SignIngestJWT(key SigningKey, claims IngestJWTClaims, opts ...MintOption) (
 	if len(key.Secret) == 0 {
 		return "", fmt.Errorf("%w: secret must be non-empty", ErrInvalidSigningKey)
 	}
+	if allZeroBytes(key.Secret) {
+		// A wiped (ZeroSecret) or misconfigured all-zero secret has non-zero
+		// length but cannot produce a token the verifier — which signs with the
+		// real tenant secret — will accept. Reject it at the mint source.
+		return "", fmt.Errorf("%w: secret is wiped or all-zero", ErrInvalidSigningKey)
+	}
 
 	// --- Validate the claims ---
-	subject := strings.TrimSpace(claims.Subject)
-	if subject == "" {
+	// Subject (sub) and BindAnon are SIGNED RAW (untrimmed). The server compares
+	// the verified sub/bind_anon byte-for-byte against each event's user_id /
+	// anonymous_id, which the event path (buildEnvelope) preserves verbatim;
+	// trimming here would sign "user" for a caller's " user" and the token would
+	// authorize/stitch a different identity than the events carry. Validate
+	// against a trimmed copy (subject must be non-blank) and against the RAW
+	// length the server will guard, but never alter the signed bytes.
+	//
+	// WorkspaceID/AppID/EnvironmentID, by contrast, are tenant-scope identifiers
+	// the server matches against the resolved canonical scope (which is
+	// whitespace-free), so they ARE trimmed to the canonical form.
+	if strings.TrimSpace(claims.Subject) == "" {
 		return "", fmt.Errorf("%w: subject (user_id) is required", ErrInvalidIngestClaims)
 	}
-	if len(subject) > IngestSubjectMaxLength {
+	if len(claims.Subject) > IngestSubjectMaxLength {
 		return "", fmt.Errorf("%w: subject exceeds the maximum of %d bytes", ErrInvalidIngestClaims, IngestSubjectMaxLength)
 	}
 
@@ -328,8 +370,7 @@ func SignIngestJWT(key SigningKey, claims IngestJWTClaims, opts ...MintOption) (
 		return "", fmt.Errorf("%w: environment_id is required", ErrInvalidIngestClaims)
 	}
 
-	bindAnon := strings.TrimSpace(claims.BindAnon)
-	if len(bindAnon) > IngestSubjectMaxLength {
+	if len(claims.BindAnon) > IngestSubjectMaxLength {
 		return "", fmt.Errorf("%w: bind_anon exceeds the maximum of %d bytes", ErrInvalidIngestClaims, IngestSubjectMaxLength)
 	}
 
@@ -345,14 +386,14 @@ func SignIngestJWT(key SigningKey, claims IngestJWTClaims, opts ...MintOption) (
 	payload := ingestJWTPayload{
 		Issuer:        o.issuer,
 		Audience:      o.audience,
-		Subject:       subject,
+		Subject:       claims.Subject,
 		IssuedAt:      iat,
 		ExpiresAt:     exp,
 		Scope:         ingestScope,
 		WorkspaceID:   workspaceID,
 		AppID:         appID,
 		EnvironmentID: environmentID,
-		BindAnon:      bindAnon,
+		BindAnon:      claims.BindAnon,
 	}
 
 	return signHS256(header, payload, key.Secret)
