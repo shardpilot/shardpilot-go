@@ -23,11 +23,19 @@ Real, tested, working code — **early alpha**. The API is pre-v1 and may change
 
 ## Installation
 
+For the newest documented helpers, install from `main` (no tag ships them yet — see below):
+
+```bash
+go get github.com/shardpilot/shardpilot-go@main
+```
+
+`v0.3.0-alpha` is the latest tag, but it only de-games the universal `Event` envelope (plus `pkg/crash`, which landed in `v0.2.0-alpha`). The consent API (`SetConsent` / `Consent`), `LoadOrCreateAnonymousID`, the backend-only `SignIngestJWT` Mode-B mint helper, and the default actor identity fields documented in this README are **not in any tag** — they live in the changelog's `[Unreleased]` section and are reachable only from `main` until the next tag (`v0.3.0`) is cut. To pin a tagged release that ships only the de-gamed envelope and crash SDK, use:
+
 ```bash
 go get github.com/shardpilot/shardpilot-go@v0.3.0-alpha
 ```
 
-`v0.3.0-alpha` is the latest tag (de-games the universal `Event` envelope). `pkg/crash` landed in `v0.2.0-alpha`. For analytics only, `v0.1.2` is available. **`v0.1.0` is retracted** in the module's `go.mod` (use `v0.1.2` or `v0.2.0-alpha` or later). `v0.1.2` and later require **Go 1.24+**.
+For analytics only, `v0.1.2` is available. **`v0.1.0` is retracted** in the module's `go.mod` (use `v0.1.2` or `v0.2.0-alpha` or later). `v0.1.2` and later require **Go 1.24+**.
 
 ## Quick start (analytics)
 
