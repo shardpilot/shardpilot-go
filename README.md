@@ -150,6 +150,29 @@ Crash reports go to `POST {base}/api/v1/crashes/ingest` (`Authorization: Bearer 
 - Crash reports strip PII and raw identifier material; there is no API surface for screenshots, network payloads, or attachments.
 - Do not commit tokens or real customer/player data. Tokens and full event payloads are never logged by default.
 
+## Minting client ingest JWTs (backend-only, ADR-0222 Mode B)
+
+> **Backend-only — this helper holds the per-tenant signing secret.** It belongs in a trusted server-side game backend and must **never** be compiled into a shipped client binary. Client SDKs (Unity, Unreal, Defold) consume a minted token through a `token_provider` callback and never see the secret. This Go SDK is a backend/service-tier SDK, so its dual-mode role is the inverse: it **mints** the short-lived per-user JWTs that client SDKs then fetch over your own authenticated channel.
+
+`SignIngestJWT` mints a short-lived HS256 JWT that the analytics-service Mode-B verifier accepts. The per-tenant signing secret (and its key id `kid`) is minted/rotated/served by control-plane; your backend obtains it out-of-band and passes it in. The helper does not fetch, store, or rotate the secret — it only signs. It is **additive** and does not change the service-tier `Config.Token` / `Authorization: Bearer` transport.
+
+```go
+// Per-tenant secret + kid, obtained out-of-band from control-plane.
+// Secret is RAW bytes (base64url-decode first if you received it encoded).
+key := shardpilot.SigningKey{KID: kid, Secret: secret}
+
+token, err := shardpilot.SignIngestJWT(key, shardpilot.IngestJWTClaims{
+    Subject:       verifiedUserID,    // JWT `sub`; your authenticated user_id
+    WorkspaceID:   workspaceID,
+    AppID:         appID,
+    EnvironmentID: environmentID,
+    BindAnon:      deviceAnonymousID, // optional: the persistent anonymous_id
+})
+// Hand `token` to exactly one client over an authenticated channel. NEVER log it.
+```
+
+Defaults: issuer `project-tower-main-server`, audience `analytics-service`, lifetime 5m (equal to the server's 5m `iat`-age window, which the verifier enforces regardless of `exp`; capped at the server's 15m max). Override with `WithIngestIssuer` / `WithIngestAudience` / `WithIngestLifetime` (plus `WithIngestNow` / `WithIngestClock` for tests). Scope is fixed to `analytics:ingest`. Every input is validated at mint time, so a returned token is never rejected downstream for a malformed claim. The secret is `[]byte` (never logged); `SigningKey.ZeroSecret()` wipes a copy.
+
 ## Project layout
 
 | Path | What it is |
@@ -157,6 +180,7 @@ Crash reports go to `POST {base}/api/v1/crashes/ingest` (`Authorization: Bearer 
 | `client.go`, `queue.go`, `transport.go`, `envelope.go` | Analytics client: lifecycle, bounded queue, HTTP transport, envelope builder. |
 | `config.go`, `event.go`, `consent.go`, `metrics.go`, `errors.go` | Config validation, public `Event`, consent state machine, `Stats`, sentinel errors. |
 | `anonymous_id.go`, `ids.go`, `clock.go` | Opt-in anonymous-ID helper, event-ID generation, injectable clock. |
+| `ingest_jwt.go` | Backend-only `SignIngestJWT` Mode-B ingest-JWT mint helper (ADR-0222). |
 | `internal/uuidv7/` | Shared UUIDv7 generator (crash IDs, anonymous IDs, consent idempotency keys). |
 | `pkg/crash/` | Crash SDK: `client.go`, `event.go` (typed wire schema), `breadcrumbs.go`, `sanitize.go`. |
 | `examples/basic/`, `examples/crash/` | Runnable analytics and crash examples (env-var driven). |
@@ -185,7 +209,7 @@ gofmt -l .
 
 Pre-v1; the API is explicitly unstable. From the changelog `[Unreleased]`:
 
-- Consent API, `LoadOrCreateAnonymousID`, and optional default actor identity fields are landed in `[Unreleased]` (not yet tagged).
+- Consent API, `LoadOrCreateAnonymousID`, the backend-only `SignIngestJWT` Mode-B mint helper (ADR-0222), and optional default actor identity fields are landed in `[Unreleased]` (not yet tagged; `SignIngestJWT` is additive and intended for the `v0.3.0` release).
 - Public developer docs are planned for `docs.shardpilot.com`; that domain is not yet provisioned.
 
 `v0.3.0-alpha` (tagged) removed the game-flavored `MatchID` field from the universal `Event` envelope; carry that context in `Props["match_id"]` instead (wire payload unchanged).
