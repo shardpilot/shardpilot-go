@@ -2,7 +2,7 @@
 
 > Go client SDK for ShardPilot — sends app-first analytics events (and, optionally, crash reports) to the ShardPilot ingest plane. Zero third-party dependencies, stdlib only.
 
-Platform context: [`../AGENTS.md`](../AGENTS.md). Governing ADRs: app-first analytics [ADR-0139](../docs/architecture/adr/0139-universal-app-analytics-core-refactor.md), crash SDK design [ADR-0191](../docs/architecture/adr/0191-crash-sdk-design.md), dual-mode ingest auth [ADR-0222](../docs/architecture/adr/0222-dual-mode-client-ingest-auth-publishable-key-and-per-tenant-jwt.md).
+Governing ADRs (internal): app-first analytics ADR-0139, crash SDK design ADR-0191, dual-mode ingest auth ADR-0222.
 
 ## Status
 
@@ -146,7 +146,7 @@ Crash reports go to `POST {base}/api/v1/crashes/ingest` (`Authorization: Bearer 
 
 - `SetConsent(analyticsGranted bool)` is tri-state: **unknown** (initial, pipeline open), **granted** (open), **denied** (events dropped at enqueue with `ErrConsentDenied`; pending queue cleared and in-flight batch aborted — cleared events count as `Dropped`, never `Published`).
 - Consent state is **in-memory only**; the SDK does not persist it. Read `Consent()` and re-apply with `SetConsent` to survive restarts.
-- An explicit decision posts fire-and-forget to `/v1/consent`; decisions are transmitted by a single per-client sender in call order, so deny-then-grant cannot arrive reversed. `Close` waits (bounded by its context) for prior decisions to finish sending.
+- An explicit decision posts fire-and-forget to `/v1/consent` **only when an actor identity is configured** (`Config.UserID`, else `Config.AnonymousID`); with neither set the decision is applied locally only and nothing is posted server-side. When posted, decisions are transmitted by a single per-client sender in call order, so deny-then-grant cannot arrive reversed. `Close` waits (bounded by its context) for prior decisions to finish sending.
 - Crash reports strip PII and raw identifier material; there is no API surface for screenshots, network payloads, or attachments.
 - Do not commit tokens or real customer/player data. Tokens and full event payloads are never logged by default.
 
@@ -168,6 +168,11 @@ token, err := shardpilot.SignIngestJWT(key, shardpilot.IngestJWTClaims{
     EnvironmentID: environmentID,
     BindAnon:      deviceAnonymousID, // optional: the persistent anonymous_id
 })
+if err != nil {
+    // An empty/invalid key, malformed kid, or invalid claims fail fast here:
+    // SignIngestJWT returns no token. Never hand out an empty/invalid token.
+    return err
+}
 // Hand `token` to exactly one client over an authenticated channel. NEVER log it.
 ```
 
@@ -216,11 +221,11 @@ Pre-v1; the API is explicitly unstable. From the changelog `[Unreleased]`:
 
 ## Related repositories
 
-- [`../analytics-service`](../analytics-service) — ingest plane that receives the event batches and consent decisions.
-- [`../crash-symbolicator`](../crash-symbolicator) — owns the canonical crash wire schema (`api/openapi.yaml`) this SDK mirrors.
-- [`../control-plane`](../control-plane) — mints/introspects the ingest tokens and API keys used here.
-- [`../developers`](../developers) — public docs for the ingest API and SDKs.
-- Sibling SDKs: [`../shardpilot-unity`](../shardpilot-unity), [`../shardpilot-unreal`](../shardpilot-unreal), [`../shardpilot-defold`](../shardpilot-defold).
+- `analytics-service` (internal) — ingest plane that receives the event batches and consent decisions.
+- `crash-symbolicator` (internal) — owns the canonical crash wire schema (`api/openapi.yaml`) this SDK mirrors.
+- `control-plane` (internal) — mints/introspects the ingest tokens and API keys used here.
+- `developers` (internal) — public docs for the ingest API and SDKs.
+- Sibling SDKs: `shardpilot-unity` (internal), `shardpilot-unreal` (internal), and [`shardpilot-defold`](https://github.com/shardpilot/shardpilot-defold).
 
 ## License
 
