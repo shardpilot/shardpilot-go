@@ -130,6 +130,53 @@ never affect the local state. If neither identity field is configured, the
 decision applies locally only and no request is sent. Consent never rides
 the event envelope.
 
+## Minting client ingest JWTs (backend-only, ADR-0222 Mode B)
+
+> **Security: backend-only. This helper holds the per-tenant signing secret.**
+> It belongs in a trusted server-side game-backend and **must never** be
+> compiled into a shipped client binary. A client SDK (Unity, Unreal, Defold)
+> consumes a minted token through a `token_provider` callback and never sees
+> the secret. This Go SDK is a backend/service-tier SDK, so its dual-mode role
+> is the inverse: it **mints** the short-lived per-user JWTs the client SDKs
+> then fetch over your own authenticated channel.
+
+`SignIngestJWT` mints a short-lived HS256 JWT that the analytics-service Mode-B
+verifier accepts. The per-tenant signing secret (and its key id, `kid`) is
+minted, rotated, and served by control-plane; your backend obtains it
+out-of-band (e.g. over control-plane's machine-to-machine serve channel) and
+passes it here. This helper does not fetch, store, or rotate the secret — it
+only signs a conformant token with it. It is **additive**: it does not change
+the service-tier `Config.Token` / `Authorization: Bearer` transport.
+
+```go
+// The per-tenant secret + kid, obtained out-of-band from control-plane.
+// Secret is RAW bytes (base64url-decode it first if you received it encoded).
+key := shardpilot.SigningKey{KID: kid, Secret: secret}
+
+token, err := shardpilot.SignIngestJWT(key, shardpilot.IngestJWTClaims{
+    Subject:       verifiedUserID, // the JWT `sub`; your authenticated user_id
+    WorkspaceID:   workspaceID,
+    AppID:         appID,
+    EnvironmentID: environmentID,
+    BindAnon:      deviceAnonymousID, // optional: the persistent anonymous_id
+})
+if err != nil {
+    return err
+}
+// Hand `token` to exactly one client over an authenticated channel. NEVER log it.
+```
+
+Defaults: issuer `project-tower-main-server`, audience `analytics-service`,
+lifetime 10m (well under the server's 15m max-lifetime and 5m iat-age caps).
+Override per deployment with `WithIngestIssuer`, `WithIngestAudience`, and
+`WithIngestLifetime` (capped at 15m); `WithIngestNow` / `WithIngestClock` exist
+for tests. The scope is fixed to `analytics:ingest`. Every input is validated at
+mint time — an empty/over-long subject or `bind_anon`, an empty tenant field, an
+invalid `kid`, an empty secret, or an over-long lifetime all return an error and
+no token — so a minted token is never rejected downstream for a malformed claim.
+The secret is `[]byte` (never a logged string); call `SigningKey.ZeroSecret()` to
+wipe a copy you no longer need.
+
 ## Crash Reporting
 
 The crash SDK lives in `pkg/crash` and sends the canonical crash-symbolicator
@@ -216,6 +263,9 @@ See [`examples/crash`](examples/crash) for the runnable version.
 
 - `v0.1.x` is the analytics SDK only.
 - `v0.2.x` adds the crash SDK under `pkg/crash`; the analytics API is unchanged.
+- `SignIngestJWT` (the backend-only ADR-0222 Mode-B mint helper) is a purely
+  additive, backward-compatible addition, so it ships as a minor bump (intended
+  `v0.3.0` at release). The git tag is applied at release time.
 
 ## Wire Contract
 

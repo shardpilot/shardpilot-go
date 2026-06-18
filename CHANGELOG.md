@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+- Added `SignIngestJWT`: an optional, backend-only helper that mints a
+  short-lived ADR-0222 Mode-B per-tenant ingest JWT (HS256) that the
+  analytics-service Mode-B verifier accepts. A trusted Go game-backend can use
+  it to mint the per-user tokens that client SDKs (Unity/Unreal/Defold) then
+  fetch over the studio's own authenticated channel via their `token_provider`
+  callback. The helper holds the per-tenant signing secret obtained out-of-band
+  from control-plane (`SigningKey{KID, Secret}`, secret as raw `[]byte`), and
+  signs a conformant token: header `alg=HS256` + `kid`; claims `iss`/`aud`/`sub`/
+  `iat`/`exp`/`scope=analytics:ingest`/`workspace_id`/`app_id`/`environment_id`
+  and optional `bind_anon`. Lifetime defaults to 10m (capped at the server's 15m
+  max), `iat` is stamped to now (fresh against the 5m max-iat-age window), and
+  every input is validated at mint time so a token it returns is never rejected
+  downstream for a malformed claim, an over-long subject/anon, or an over-long
+  lifetime. Options: `WithIngestIssuer`/`WithIngestAudience`/`WithIngestLifetime`
+  and `WithIngestNow`/`WithIngestClock` (tests). The HS256 signing is hand-rolled
+  (no new dependency; the SDK stays dependency-free) and can only ever emit
+  HS256, so algorithm confusion is impossible by construction. The secret is
+  never logged and `SigningKey.ZeroSecret()` wipes a copy in place. This is
+  additive and does not change the existing service-tier `Config.Token`
+  transport. **Backend-only: the secret must never ship in a client binary.**
 - Fixed the quickstart (README and `examples/basic`) to demonstrate a
   backend-legal canonical event. The previous example tracked
   `session_start` with `Source: SourceBackend`, which is doubly wrong: the
