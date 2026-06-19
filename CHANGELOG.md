@@ -72,7 +72,7 @@
   IDs, and consent idempotency keys into `internal/uuidv7` (behavior
   unchanged).
 
-## v0.3.0-alpha — 2026-06-07 — universal envelope (proposed)
+## v0.3.0-alpha — 2026-06-07 — universal envelope
 
 - BREAKING: Removed the game-flavored `MatchID` field from the universal
   `Event` envelope. ShardPilot is a universal multi-tenant analytics platform;
@@ -91,8 +91,7 @@
   ```
 
 - This is an early alpha pre-release. The API is unstable and may change
-  before v1. Version bump is proposed (`v0.3.0-alpha`); the git tag is not yet
-  created.
+  before v1. Released as the `v0.3.0-alpha` git tag.
 
 ## v0.2.0-alpha — 2026-05-24 — crash SDK alpha
 
