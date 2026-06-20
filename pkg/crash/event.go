@@ -28,9 +28,13 @@ var (
 )
 
 type Event struct {
-	CrashID               string            `json:"crash_id"`
-	OccurredAt            time.Time         `json:"occurred_at"`
-	App                   AppInfo           `json:"app"`
+	CrashID    string    `json:"crash_id"`
+	OccurredAt time.Time `json:"occurred_at"`
+	App        AppInfo   `json:"app"`
+	// Source is the component slug within the app (ADR-0223): which repo/service this
+	// crash came from (e.g. main-server, game-server). Usually set once via
+	// ClientOptions.Source and stamped on every event; a per-event value wins.
+	Source                string            `json:"source,omitempty"`
 	Platform              string            `json:"platform"`
 	OS                    OSInfo            `json:"os"`
 	Device                map[string]string `json:"device,omitempty"`
@@ -132,9 +136,8 @@ func validateEvent(event Event) error {
 	if strings.TrimSpace(event.Exception.Type) == "" {
 		return fmt.Errorf("%w: exception.type is required", ErrInvalidEvent)
 	}
-	if len(event.Modules) == 0 {
-		return fmt.Errorf("%w: at least one module is required", ErrInvalidEvent)
-	}
+	// 0 modules is allowed for a PRE-SYMBOLICATED crash (ADR-0223): a Go/server crash
+	// captured from the runtime carries function/file/line frames and no native modules.
 	if len(event.Modules) > maxModules {
 		return fmt.Errorf("%w: modules cannot exceed %d", ErrInvalidEvent, maxModules)
 	}
@@ -165,11 +168,16 @@ func validateEvent(event Event) error {
 			if frame.Line < 0 {
 				return fmt.Errorf("%w: threads[%d].frames[%d].line cannot be negative", ErrInvalidEvent, i, j)
 			}
-			if strings.TrimSpace(firstNonEmptyString(frame.InstructionAddress, frame.Address)) == "" {
-				return fmt.Errorf("%w: threads[%d].frames[%d].instruction_addr is required", ErrInvalidEvent, i, j)
-			}
-			if len(event.Modules) != 1 && strings.TrimSpace(firstNonEmptyString(frame.ModuleID, frame.Module, frame.ModuleName)) == "" {
-				return fmt.Errorf("%w: threads[%d].frames[%d].module_id is required", ErrInvalidEvent, i, j)
+			// A PRE-SYMBOLICATED frame (function resolved client-side, ADR-0223) needs
+			// neither an instruction address nor a module; a native frame still does, and
+			// module_id is only required to disambiguate among MULTIPLE modules.
+			if strings.TrimSpace(frame.Function) == "" {
+				if strings.TrimSpace(firstNonEmptyString(frame.InstructionAddress, frame.Address)) == "" {
+					return fmt.Errorf("%w: threads[%d].frames[%d] requires instruction_addr or a function", ErrInvalidEvent, i, j)
+				}
+				if len(event.Modules) > 1 && strings.TrimSpace(firstNonEmptyString(frame.ModuleID, frame.Module, frame.ModuleName)) == "" {
+					return fmt.Errorf("%w: threads[%d].frames[%d].module_id is required", ErrInvalidEvent, i, j)
+				}
 			}
 		}
 	}

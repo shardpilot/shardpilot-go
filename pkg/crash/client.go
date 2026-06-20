@@ -22,6 +22,8 @@ const defaultRetryBackoff = 50 * time.Millisecond
 type Client struct {
 	ingestURL    string
 	apiKey       string
+	app          AppInfo
+	source       string
 	httpClient   *http.Client
 	logger       Logger
 	sampler      Sampler
@@ -31,8 +33,18 @@ type Client struct {
 }
 
 type ClientOptions struct {
-	IngestURL    string
-	APIKey       string
+	IngestURL string
+	APIKey    string
+	// App identifies the project this client reports for. Its fields default onto every
+	// event that leaves them empty (per-event values win). REQUIRED for auto-capture
+	// (Recover/CapturePanic), which builds events with no App of their own; the producer
+	// rejects an empty app.id and one that mismatches the API key's app scope. App.ID
+	// must equal the API key's app.
+	App AppInfo
+	// Source is the component slug (ADR-0223) stamped on every event that doesn't set
+	// its own: which repo/service in a multi-component product this crash came from
+	// (e.g. main-server, game-server). Optional.
+	Source       string
 	HTTPClient   *http.Client
 	Logger       Logger
 	Sampler      Sampler
@@ -88,8 +100,14 @@ func NewClient(opts ClientOptions) (*Client, error) {
 	}
 
 	return &Client{
-		ingestURL:    ingestURL,
-		apiKey:       apiKey,
+		ingestURL: ingestURL,
+		apiKey:    apiKey,
+		app: AppInfo{
+			ID:      strings.TrimSpace(opts.App.ID),
+			Version: strings.TrimSpace(opts.App.Version),
+			BuildID: strings.TrimSpace(opts.App.BuildID),
+		},
+		source:       strings.TrimSpace(opts.Source),
 		httpClient:   httpClient,
 		logger:       opts.Logger,
 		sampler:      sampler,
@@ -134,6 +152,19 @@ func (c *Client) emit(ctx context.Context, event Event, fatal bool) error {
 func (c *Client) prepareEvent(event Event) (Event, error) {
 	event = cloneEvent(event)
 	event.CrashID = strings.TrimSpace(event.CrashID)
+	// Default app identity and source from client config; a per-event value always wins.
+	if strings.TrimSpace(event.App.ID) == "" {
+		event.App.ID = c.app.ID
+	}
+	if strings.TrimSpace(event.App.Version) == "" {
+		event.App.Version = c.app.Version
+	}
+	if strings.TrimSpace(event.App.BuildID) == "" {
+		event.App.BuildID = c.app.BuildID
+	}
+	if strings.TrimSpace(event.Source) == "" {
+		event.Source = c.source
+	}
 	if event.CrashID == "" {
 		id, err := newCrashID()
 		if err != nil {
@@ -239,6 +270,14 @@ func (c *Client) logf(format string, args ...any) {
 	if c.logger != nil {
 		c.logger.Printf(format, args...)
 	}
+}
+
+// safeLogf logs without ever letting a misbehaving Logger's panic escape. It is used on
+// the crash-capture path, where an escaping panic would replace (mask) the original
+// crash value that Recover is about to re-panic.
+func (c *Client) safeLogf(format string, args ...any) {
+	defer func() { _ = recover() }()
+	c.logf(format, args...)
 }
 
 func normalizeIngestURL(raw string) (string, error) {

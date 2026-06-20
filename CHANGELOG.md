@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Added automatic panic capture to `pkg/crash`: `Client.Recover(ctx)` (defer at a
+  goroutine / request-handler boundary — reports the panic as a fatal crash, then
+  re-panics so normal crash behaviour is preserved) and `Client.CapturePanic(ctx,
+  recovered)` (report an already-recovered value without re-panicking). Captured
+  frames are pre-symbolicated from the Go runtime (package-qualified function, file,
+  line — no native modules or addresses, accepted by the producer per ADR-0223). New
+  `ClientOptions.App` (defaulted onto every event; required for auto-capture, and
+  `App.ID` must match the API key's app scope) and `ClientOptions.Source` (component
+  slug, ADR-0223) are stamped on events that don't set their own. The report send
+  detaches from the caller's context cancellation/deadline (keeping its values) so a
+  panic during graceful shutdown or after a client disconnect is still delivered; a
+  nil client is a safe no-op and still re-panics. The runtime panic machinery
+  (`runtime.gopanic`/`sigpanic`/`panicmem`/`panicdivide`/`panicBounds*`/`goPanic*`) and
+  the SDK's own frames are trimmed so the application origin is the top frame across
+  panic kinds. Frame function names are scrubbed as code symbols (email/IP only), not
+  free text, so legitimate package-qualified symbols (incl. `player_*`/`user_*` package
+  names) survive; the crash-symbolicator re-scrubs server-side as defense in depth.
 - Added `SignIngestJWT`: an optional, backend-only helper that mints a
   short-lived ADR-0222 Mode-B per-tenant ingest JWT (HS256) that the
   analytics-service Mode-B verifier accepts. A trusted Go game-backend can use

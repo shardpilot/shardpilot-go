@@ -13,7 +13,7 @@ func TestSanitizeEventStripsDisallowedOptionalFields(t *testing.T) {
 	event.App.BuildID = "header.eyJzdWIiOiJ0ZXN0In0.signature"
 	event.OS.Name = "desktop 198.51.100.23"
 	event.OS.Version = "2001:db8::1"
-	event.Threads[0].Frames[0].Function = "player_raw_identifier"
+	event.Threads[0].Frames[0].Function = "handler.report@example.invalid"
 	event.Threads[0].Frames[0].File = "safe/file.go"
 	event.Threads[0].Frames[0].Line = -12
 	event.Threads[0].Frames[0].ModuleName = "synthetic-module"
@@ -45,7 +45,7 @@ func TestSanitizeEventStripsDisallowedOptionalFields(t *testing.T) {
 	}
 	frame := sanitized.Threads[0].Frames[0]
 	if frame.Function != "" {
-		t.Fatalf("expected raw identifier prefix to be stripped, got %q", frame.Function)
+		t.Fatalf("expected email-bearing frame function to be stripped, got %q", frame.Function)
 	}
 	if frame.File != "safe/file.go" {
 		t.Fatalf("expected safe frame file to remain, got %q", frame.File)
@@ -178,6 +178,57 @@ func assertEventHasNoDisallowedStrings(t *testing.T, event Event) {
 		}
 		if strings.Contains(value, "{") || strings.Contains(value, "}") {
 			t.Fatalf("found payload-shaped string in sanitized event: %q", value)
+		}
+	}
+}
+
+func TestSanitizeSymbolKeepsGoSymbolsButStripsPII(t *testing.T) {
+	// Package-qualified Go symbols (value-receiver methods, closures) are dotted
+	// 3-segment strings that the JWT heuristic would falsely blank; sanitizeSymbol must
+	// keep them, or the frame loses its function and the whole crash is dropped.
+	keep := []string{
+		"crash_test.boomForCaptureTest",
+		"main.Server.Handle",
+		"pkg.(*Type).Method",
+		"pkg.worker.process.func1",
+		"crash_test.TestRecoverCapturesPanicOriginAndRepanics.func2",
+		// Packages legitimately named with a raw-identifier prefix must survive — blanking
+		// them would drop the whole crash (the symbol is the address-less frame's identity).
+		"player_state.Tick",
+		"user_session.(*Manager).Close",
+		"device_registry.lookup.func1",
+		"customer_billing.Charge",
+	}
+	for _, s := range keep {
+		if got := sanitizeSymbol(s); got != s {
+			t.Errorf("sanitizeSymbol(%q) = %q, want it preserved", s, got)
+		}
+	}
+	// Only an embedded email or IP blanks a symbol — content that never appears in a
+	// legitimate Go symbol.
+	strip := []string{
+		"pkg.handler@example.invalid",
+		"node.198.51.100.23.handler",
+		"handler_2001:db8::1",
+	}
+	for _, s := range strip {
+		if got := sanitizeSymbol(s); got != "" {
+			t.Errorf("sanitizeSymbol(%q) = %q, want blanked", s, got)
+		}
+	}
+}
+
+func TestShortFuncNameTrimsImportPath(t *testing.T) {
+	cases := map[string]string{
+		"github.com/org/repo/pkg.(*Type).Method": "pkg.(*Type).Method",
+		"github.com/org/repo/internal/foo.Bar":   "foo.Bar",
+		"main.main":                              "main.main",
+		"runtime.gopanic":                        "runtime.gopanic",
+		"":                                       "",
+	}
+	for in, want := range cases {
+		if got := shortFuncName(in); got != want {
+			t.Errorf("shortFuncName(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

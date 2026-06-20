@@ -73,7 +73,7 @@ func SanitizeEvent(event Event) (Event, error) {
 			frame.InstructionAddress = sanitizeString(frame.InstructionAddress)
 			frame.Address = sanitizeString(frame.Address)
 			frame.RelativeAddress = sanitizeString(frame.RelativeAddress)
-			frame.Function = sanitizeString(frame.Function)
+			frame.Function = sanitizeSymbol(frame.Function)
 			frame.File = sanitizeString(frame.File)
 			if frame.Line < 0 {
 				frame.Line = 0
@@ -163,6 +163,20 @@ func containsDisallowedContent(value string) bool {
 	if value == "" {
 		return false
 	}
+	if containsDisallowedIdentity(value) {
+		return true
+	}
+	return jwtPattern.MatchString(value)
+}
+
+// containsDisallowedIdentity reports the non-token PII signals: emails, the
+// player_/user_/customer_/device_ raw-identifier prefixes, and IP addresses. It is
+// the part of the disallowed-content check that applies even to code symbols.
+func containsDisallowedIdentity(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
 	if strings.Contains(value, "@") {
 		return true
 	}
@@ -172,10 +186,35 @@ func containsDisallowedContent(value string) bool {
 	if ipv4Pattern.MatchString(value) {
 		return true
 	}
-	if containsIPv6(value) {
+	return containsIPv6(value)
+}
+
+// sanitizeSymbol scrubs a code symbol (a stack-frame function name). It applies ONLY the
+// signals that never legitimately appear in a Go symbol — an embedded email or IP — and
+// deliberately omits both the JWT/dotted-token heuristic (a package-qualified symbol like
+// pkg.Type.Method is three dotted segments) AND the raw-identifier PREFIX heuristic (a
+// package may legitimately be named player_*, user_*, customer_*, device_*, e.g.
+// player_state.Tick). Blanking a valid symbol would strip the frame's only identity and,
+// for a pre-symbolicated frame with no address, drop the WHOLE crash; the crash-symbolicator
+// re-scrubs Function server-side (full pattern set) as defense in depth.
+func sanitizeSymbol(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || symbolHasDisallowedContent(value) {
+		return ""
+	}
+	return value
+}
+
+// symbolHasDisallowedContent flags an embedded email or IP address — the only PII signals
+// that cannot appear in a legitimate Go code symbol.
+func symbolHasDisallowedContent(value string) bool {
+	if strings.Contains(value, "@") {
 		return true
 	}
-	return jwtPattern.MatchString(value)
+	if ipv4Pattern.MatchString(value) {
+		return true
+	}
+	return containsIPv6(value)
 }
 
 func startsWithDisallowedPrefix(value string) bool {
