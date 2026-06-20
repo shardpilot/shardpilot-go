@@ -96,10 +96,10 @@ func (c *Client) panicEvent(recovered any) Event {
 }
 
 // captureGoFrames walks the CURRENT goroutine's stack into pre-symbolicated frames.
-// Called from a deferred recover the panicking stack is still live beneath it, so
-// the panic origin is present; the SDK's own frames and the runtime panic machinery
-// (runtime.gopanic/sigpanic/...) are trimmed from the top so frame[0] is the
-// application function that panicked.
+// Called from a deferred recover the panicking stack is still live beneath it, so the
+// panic origin is present; everything above the origin — the SDK's own frames, any
+// caller-owned recover wrapper, and the runtime panic machinery — is trimmed so frame[0]
+// is the application function that panicked.
 func captureGoFrames() []Frame {
 	var pcs [maxCaptureFrames]uintptr
 	// skip runtime.Callers + captureGoFrames themselves.
@@ -117,17 +117,7 @@ func captureGoFrames() []Frame {
 		}
 	}
 
-	// Trim leading SDK + runtime-panic-machinery frames so the application origin is
-	// on top. Stop at the first frame that is neither, then keep the rest verbatim.
-	start := 0
-	for start < len(raw) && isCapturePlumbingFrame(raw[start].Function) {
-		start++
-	}
-	if start == len(raw) {
-		// Defensive: everything looked like plumbing (shouldn't happen). Keep all so a
-		// crash is never reported with zero frames.
-		start = 0
-	}
+	start := originFrameStart(raw)
 
 	frames := make([]Frame, 0, len(raw)-start)
 	for i := start; i < len(raw); i++ {
@@ -150,6 +140,42 @@ func captureGoFrames() []Frame {
 	return frames
 }
 
+// originFrameStart returns the index of the panicking application frame within a captured
+// stack. Every Go panic dispatches its deferred funcs through runtime.gopanic, so the
+// origin is the first NON-runtime frame beneath gopanic. Anchoring there trims, in one
+// step and without enumerating every helper, three things at once: the SDK's own capture
+// frames above gopanic, the caller's recover wrapper above gopanic (the CapturePanic
+// case, where user code — not the SDK — invoked us), and the runtime panic helpers below
+// gopanic (sigpanic / panicmem / panicdivide / panicBounds* / panicshift / goPanic* / …).
+// If no panic is in flight (e.g. CapturePanic called after the panic already settled),
+// it falls back to trimming only the SDK's leading frames.
+func originFrameStart(raw []runtime.Frame) int {
+	for i := range raw {
+		if raw[i].Function != "runtime.gopanic" {
+			continue
+		}
+		origin := i + 1
+		for origin < len(raw) && strings.HasPrefix(raw[origin].Function, "runtime.") {
+			origin++
+		}
+		if origin < len(raw) {
+			return origin
+		}
+		// Pathological: nothing but runtime frames beneath gopanic. Keep the first frame
+		// after gopanic rather than reporting an empty stack.
+		return i + 1
+	}
+	// No panic dispatch on the stack: trim only our own leading frames.
+	start := 0
+	for start < len(raw) && strings.HasPrefix(raw[start].Function, crashPackagePrefix) {
+		start++
+	}
+	if start >= len(raw) {
+		return 0
+	}
+	return start
+}
+
 // shortFuncName trims the import-path prefix from a Go runtime function name, keeping
 // the package-qualified symbol (github.com/org/repo/pkg.(*T).M → pkg.(*T).M). The full
 // import path resembles a URL path and is redacted by the ingest PII scrubber; the short
@@ -159,26 +185,6 @@ func shortFuncName(fn string) string {
 		return fn[i+1:]
 	}
 	return fn
-}
-
-// isCapturePlumbingFrame reports whether a frame is the SDK's own capture path or the
-// runtime panic machinery that sits between Recover and the real panic origin.
-func isCapturePlumbingFrame(fn string) bool {
-	if strings.HasPrefix(fn, crashPackagePrefix) {
-		return true
-	}
-	// Bounds-check panics route through asm panicBounds -> runtime.panicBounds /
-	// panicBounds64 / panicBounds32 / panicBounds32X (Go 1.24+); older toolchains and
-	// some build configs use the runtime.goPanicIndex / goPanicSlice* family. Prefix-match
-	// both so index/slice-out-of-range crashes still surface the application origin on top.
-	if strings.HasPrefix(fn, "runtime.panicBounds") || strings.HasPrefix(fn, "runtime.goPanic") {
-		return true
-	}
-	switch fn {
-	case "runtime.gopanic", "runtime.sigpanic", "runtime.panicmem", "runtime.panicdivide":
-		return true
-	}
-	return false
 }
 
 // panicType derives the crash exception type from a recovered value: the concrete

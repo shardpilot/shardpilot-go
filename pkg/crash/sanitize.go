@@ -36,10 +36,16 @@ func SanitizeEvent(event Event) (Event, error) {
 	event.App.ID = sanitizeString(event.App.ID)
 	event.App.Version = sanitizeString(event.App.Version)
 	event.App.BuildID = sanitizeString(event.App.BuildID)
+	// Source is an operator-set component slug (ADR-0223) on the wire; scrub it like the
+	// other identifiers so a misconfigured value carrying PII never leaves the process.
+	event.Source = sanitizeString(event.Source)
 	event.Platform = sanitizeString(event.Platform)
 	event.OS.Name = sanitizeString(event.OS.Name)
 	event.OS.Version = sanitizeString(event.OS.Version)
-	event.Exception.Type = sanitizeString(event.Exception.Type)
+	// exception.type is a CODE SYMBOL (a Go panic value's type, e.g. user_session.Fault, or
+	// a native signal name) — scrub it as a symbol so a legit package-prefixed type name is
+	// not blanked as a raw identifier (which would drop the crash for an empty exception.type).
+	event.Exception.Type = sanitizeSymbol(event.Exception.Type)
 	event.Exception.Reason = sanitizeString(event.Exception.Reason)
 	event.Exception.CrashedThreadID = sanitizeString(event.Exception.CrashedThreadID)
 	event.RawText = sanitizeString(event.RawText)
@@ -99,6 +105,13 @@ func SanitizeEvent(event Event) (Event, error) {
 	event.Breadcrumbs = breadcrumbs
 	event.FingerprintComponents = sanitizeStringSlice(event.FingerprintComponents)
 	event.OccurredAt = event.OccurredAt.UTC()
+
+	// The required `modules` field must marshal as [] (an empty list), not null, for a
+	// pre-symbolicated crash with zero native modules — a strict producer schema validating
+	// `type: array` would reject null and drop every auto-captured Go panic.
+	if event.Modules == nil {
+		event.Modules = []Module{}
+	}
 
 	return event, nil
 }

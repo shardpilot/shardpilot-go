@@ -232,3 +232,48 @@ func TestShortFuncNameTrimsImportPath(t *testing.T) {
 		}
 	}
 }
+
+func TestSanitizeEventScrubsSource(t *testing.T) {
+	e := validEvent(t)
+	e.Source = "report@example.invalid" // F1: PII in the source slug
+	s, err := SanitizeEvent(e)
+	if err != nil {
+		t.Fatalf("SanitizeEvent: %v", err)
+	}
+	if s.Source != "" {
+		t.Fatalf("PII-bearing source must be blanked, got %q", s.Source)
+	}
+	e.Source = "main-server" // a valid component slug survives
+	s, err = SanitizeEvent(e)
+	if err != nil {
+		t.Fatalf("SanitizeEvent: %v", err)
+	}
+	if s.Source != "main-server" {
+		t.Fatalf("valid source slug must survive, got %q", s.Source)
+	}
+}
+
+func TestSanitizeEventKeepsPackagePrefixedExceptionType(t *testing.T) {
+	e := validEvent(t)
+	e.Exception.Type = "user_session.Fault" // F6: typed panic from a user_-prefixed package
+	s, err := SanitizeEvent(e)
+	if err != nil {
+		t.Fatalf("SanitizeEvent: %v", err)
+	}
+	if s.Exception.Type != "user_session.Fault" {
+		t.Fatalf("package-prefixed exception type must survive as a symbol, got %q", s.Exception.Type)
+	}
+}
+
+func TestSanitizeEventModulesNeverNull(t *testing.T) {
+	e := validEvent(t)
+	e.Modules = nil // F2: zero-module pre-symbolicated crash
+	e.Threads[0].Frames = []Frame{{Function: "main.run", File: "main.go", Line: 1}}
+	s, err := SanitizeEvent(e)
+	if err != nil {
+		t.Fatalf("SanitizeEvent: %v", err)
+	}
+	if s.Modules == nil {
+		t.Fatalf("Modules must be a non-nil empty slice so it marshals as [] not null")
+	}
+}

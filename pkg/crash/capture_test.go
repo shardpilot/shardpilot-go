@@ -8,6 +8,7 @@ package crash_test
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -163,16 +164,12 @@ func TestCapturePanicReportsWithoutRepanicking(t *testing.T) {
 	if len(received.Threads) != 1 || len(received.Threads[0].Frames) == 0 {
 		t.Fatalf("expected captured frames, got %#v", received.Threads)
 	}
-	// CapturePanic is called from the caller's OWN recover, so the panic origin is still
-	// beneath it on the stack and must appear among the frames.
-	foundOrigin := false
-	for _, f := range received.Threads[0].Frames {
-		if strings.Contains(f.Function, "boomForCaptureTest") {
-			foundOrigin = true
-		}
-	}
-	if !foundOrigin {
-		t.Fatalf("panic origin missing from captured frames: %#v", received.Threads[0].Frames)
+	// CapturePanic is called from the caller's OWN deferred recover, which sits between the
+	// SDK frames and runtime.gopanic. Anchoring the trim on gopanic skips that wrapper, so
+	// the panic ORIGIN must be frame[0] — otherwise grouping collapses on the recover wrapper.
+	top := received.Threads[0].Frames[0].Function
+	if !strings.Contains(top, "boomForCaptureTest") {
+		t.Fatalf("top frame = %q, want the panic origin (boomForCaptureTest); recover wrapper not trimmed", top)
 	}
 }
 
@@ -289,5 +286,30 @@ func TestRecoverDeliversWithCancelledContext(t *testing.T) {
 
 	if received.Exception.Reason != "captured-boom" {
 		t.Fatalf("crash was dropped on a cancelled context: reason=%q", received.Exception.Reason)
+	}
+}
+
+// The required `modules` field must be sent as an empty JSON array, never null, for a
+// zero-module pre-symbolicated Go crash (F2) — a strict producer schema rejects null.
+func TestRecoverMarshalsZeroModulesAsEmptyArray(t *testing.T) {
+	var body []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	client := newCaptureClient(t, server.URL, "main-server")
+
+	func() {
+		defer func() { _ = recover() }()
+		defer client.Recover(context.Background())
+		boomForCaptureTest()
+	}()
+
+	if strings.Contains(string(body), `"modules":null`) {
+		t.Fatalf("modules must not marshal as null: %s", body)
+	}
+	if !strings.Contains(string(body), `"modules":[]`) {
+		t.Fatalf("expected modules:[] in the posted payload, got: %s", body)
 	}
 }

@@ -168,12 +168,19 @@ func validateEvent(event Event) error {
 			if frame.Line < 0 {
 				return fmt.Errorf("%w: threads[%d].frames[%d].line cannot be negative", ErrInvalidEvent, i, j)
 			}
-			// A PRE-SYMBOLICATED frame (function resolved client-side, ADR-0223) needs
-			// neither an instruction address nor a module; a native frame still does, and
-			// module_id is only required to disambiguate among MULTIPLE modules.
-			if strings.TrimSpace(frame.Function) == "" {
-				if strings.TrimSpace(firstNonEmptyString(frame.InstructionAddress, frame.Address)) == "" {
-					return fmt.Errorf("%w: threads[%d].frames[%d] requires instruction_addr or a function", ErrInvalidEvent, i, j)
+			hasFunction := strings.TrimSpace(frame.Function) != ""
+			hasAddress := strings.TrimSpace(firstNonEmptyString(frame.InstructionAddress, frame.Address)) != ""
+			// Every frame must be identifiable — a PRE-SYMBOLICATED frame by its function
+			// (ADR-0223, no modules/address needed) or a native frame by its address.
+			if !hasFunction && !hasAddress {
+				return fmt.Errorf("%w: threads[%d].frames[%d] requires instruction_addr or a function", ErrInvalidEvent, i, j)
+			}
+			// An instruction address is only resolvable against a module map: it requires at
+			// least one module, and a module_id to disambiguate among multiple. (A frame with
+			// a function and no address is fully resolved and needs neither.)
+			if hasAddress {
+				if len(event.Modules) == 0 {
+					return fmt.Errorf("%w: threads[%d].frames[%d] has an instruction address but no module to resolve it", ErrInvalidEvent, i, j)
 				}
 				if len(event.Modules) > 1 && strings.TrimSpace(firstNonEmptyString(frame.ModuleID, frame.Module, frame.ModuleName)) == "" {
 					return fmt.Errorf("%w: threads[%d].frames[%d].module_id is required", ErrInvalidEvent, i, j)
