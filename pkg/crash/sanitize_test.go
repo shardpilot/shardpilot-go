@@ -317,3 +317,37 @@ func TestTrimBuildPath(t *testing.T) {
 		}
 	}
 }
+
+func TestSanitizeFunctionNameTrustedVsUntrusted(t *testing.T) {
+	jwtShaped := "crash_test.TestFoo.func2"         // legit Go symbol, but JWT-shaped
+	prefixed := "player_state.Tick"                 // legit symbol in a raw-id-prefixed pkg
+	token := "header.eyJzdWIiOiJ0ZXN0In0.signature" // a real token in a function field
+	// Trusted (SDK-captured): legit symbols survive.
+	for _, s := range []string{jwtShaped, prefixed, "main.run"} {
+		if got := sanitizeFunctionName(s, true); got != s {
+			t.Errorf("trusted sanitizeFunctionName(%q) = %q, want preserved", s, got)
+		}
+	}
+	// Untrusted (manual caller): the full scrubber blanks token/raw-id-prefixed values.
+	for _, s := range []string{jwtShaped, prefixed, token} {
+		if got := sanitizeFunctionName(s, false); got != "" {
+			t.Errorf("untrusted sanitizeFunctionName(%q) = %q, want blanked", s, got)
+		}
+	}
+	// A plain symbol survives even untrusted.
+	if got := sanitizeFunctionName("main.run", false); got != "main.run" {
+		t.Errorf("untrusted plain symbol must survive, got %q", got)
+	}
+}
+
+func TestSanitizeEventBlanksTokenInManualFrameFunction(t *testing.T) {
+	e := validEvent(t) // frame already carries an instruction_addr + module, so it stays valid
+	e.Threads[0].Frames[0].Function = "header.eyJzdWIiOiJ0ZXN0In0.signature"
+	s, err := SanitizeEvent(e) // manual path → full scrub
+	if err != nil {
+		t.Fatalf("SanitizeEvent: %v", err)
+	}
+	if got := s.Threads[0].Frames[0].Function; got != "" {
+		t.Fatalf("token-like manual frame function must be blanked on the wire, got %q", got)
+	}
+}

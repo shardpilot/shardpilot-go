@@ -22,15 +22,15 @@ var disallowedPrefixes = [...]string{
 	"device_",
 }
 
-type sanitizer struct{}
-
-var sanitize sanitizer
-
-func (sanitizer) Event(event Event) (Event, error) {
-	return SanitizeEvent(event)
+// SanitizeEvent scrubs an event for the wire with the FULL content rules on every
+// caller-populated string, including frame functions. The auto-capture path uses the
+// internal sanitizeEvent(event, true) instead, which treats runtime-derived frame
+// functions as trusted code symbols.
+func SanitizeEvent(event Event) (Event, error) {
+	return sanitizeEvent(event, false)
 }
 
-func SanitizeEvent(event Event) (Event, error) {
+func sanitizeEvent(event Event, trustedFrameFunctions bool) (Event, error) {
 	event = cloneEvent(event)
 	event.CrashID = strings.TrimSpace(event.CrashID)
 	event.App.ID = sanitizeString(event.App.ID)
@@ -80,7 +80,7 @@ func SanitizeEvent(event Event) (Event, error) {
 			frame.InstructionAddress = sanitizeString(frame.InstructionAddress)
 			frame.Address = sanitizeString(frame.Address)
 			frame.RelativeAddress = sanitizeString(frame.RelativeAddress)
-			frame.Function = sanitizeSymbol(frame.Function)
+			frame.Function = sanitizeFunctionName(frame.Function, trustedFrameFunctions)
 			frame.File = sanitizeString(frame.File)
 			if frame.Line < 0 {
 				frame.Line = 0
@@ -217,6 +217,18 @@ func sanitizeSymbol(value string) string {
 		return ""
 	}
 	return value
+}
+
+// sanitizeFunctionName scrubs a stack-frame function. A TRUSTED function comes from the
+// Go runtime symbol table (the auto-capture path) and is scrubbed as a code symbol so a
+// legitimate package-qualified name (which is JWT-shaped / raw-id-prefixed) survives; an
+// UNTRUSTED function is caller-populated (manual Emit/EmitFatal) and gets the full content
+// scrubber, preserving the SDK's no-tokens-on-the-wire guarantee for that public field.
+func sanitizeFunctionName(value string, trusted bool) string {
+	if trusted {
+		return sanitizeSymbol(value)
+	}
+	return sanitizeString(value)
 }
 
 // symbolHasDisallowedContent flags an embedded email or IP address — the only PII signals

@@ -68,9 +68,10 @@ func (c *Client) reportPanic(ctx context.Context, recovered any) {
 	}
 	emitCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultHTTPTimeout)
 	defer cancel()
-	// EmitFatal is synchronous and bypasses sampling (a crash is always sent). Errors
-	// are logged, never returned: capture must not block or alter the re-panic.
-	if err := c.EmitFatal(emitCtx, c.panicEvent(recovered)); err != nil {
+	// emitCapturedFatal is synchronous and bypasses sampling (a crash is always sent), and
+	// marks the runtime-derived frames as trusted symbols. Errors are logged, never
+	// returned: capture must not block or alter the re-panic.
+	if err := c.emitCapturedFatal(emitCtx, c.panicEvent(recovered)); err != nil {
 		c.logf("crash capture: emit fatal panic: %v", err)
 	}
 }
