@@ -84,7 +84,7 @@ type Frame struct {
 	ModuleID           string `json:"module_id,omitempty"`
 	Module             string `json:"module,omitempty"`
 	ModuleName         string `json:"module_name,omitempty"`
-	InstructionAddress string `json:"instruction_addr"`
+	InstructionAddress string `json:"instruction_addr,omitempty"`
 	Address            string `json:"address,omitempty"`
 	RelativeAddress    string `json:"relative_addr,omitempty"`
 	Function           string `json:"function,omitempty"`

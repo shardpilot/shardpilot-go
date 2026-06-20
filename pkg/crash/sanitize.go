@@ -42,10 +42,11 @@ func SanitizeEvent(event Event) (Event, error) {
 	event.Platform = sanitizeString(event.Platform)
 	event.OS.Name = sanitizeString(event.OS.Name)
 	event.OS.Version = sanitizeString(event.OS.Version)
-	// exception.type is a CODE SYMBOL (a Go panic value's type, e.g. user_session.Fault, or
-	// a native signal name) — scrub it as a symbol so a legit package-prefixed type name is
-	// not blanked as a raw identifier (which would drop the crash for an empty exception.type).
-	event.Exception.Type = sanitizeSymbol(event.Exception.Type)
+	// exception.type stays under the FULL scrubber: it is caller-populated free text for
+	// manual Emit/EmitFatal, so a token-like or raw-identifier value must still be stripped.
+	// The auto-capture path keeps its Go type safe at the source via panicType/safeTypeName
+	// so a legit package-prefixed type is not blanked here.
+	event.Exception.Type = sanitizeString(event.Exception.Type)
 	event.Exception.Reason = sanitizeString(event.Exception.Reason)
 	event.Exception.CrashedThreadID = sanitizeString(event.Exception.CrashedThreadID)
 	event.RawText = sanitizeString(event.RawText)

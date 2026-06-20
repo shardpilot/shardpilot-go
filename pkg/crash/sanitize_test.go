@@ -253,15 +253,40 @@ func TestSanitizeEventScrubsSource(t *testing.T) {
 	}
 }
 
-func TestSanitizeEventKeepsPackagePrefixedExceptionType(t *testing.T) {
+func TestSafeTypeNameSurvivesScrubber(t *testing.T) {
+	// safeTypeName keeps the auto-capture Go type from being blanked by the FULL exception
+	// type scrubber while never producing an empty (crash-dropping) value.
+	cases := map[string]string{
+		"string":               "string",
+		"*errors.errorString":  "*errors.errorString",
+		"runtime.Error":        "runtime.Error",
+		"*user_session.Fault":  "*user_session.Fault", // pointer: prefix rule does not fire
+		"user_session.Fault":   "Fault",               // value type in a user_ pkg → bare type
+		"player_state.ErrTick": "ErrTick",
+	}
+	for in, want := range cases {
+		got := safeTypeName(in)
+		if got != want {
+			t.Errorf("safeTypeName(%q) = %q, want %q", in, got, want)
+		}
+		if sanitizeString(got) == "" {
+			t.Errorf("safeTypeName(%q) = %q must survive the wire scrubber, got blanked", in, got)
+		}
+	}
+}
+
+func TestSanitizeEventScrubsManualExceptionType(t *testing.T) {
+	// A MANUAL caller's exception.type stays under the full scrubber (defense for misuse):
+	// a token-like value is blanked (and the event then fails validation, dropping the
+	// misuse rather than leaking it).
 	e := validEvent(t)
-	e.Exception.Type = "user_session.Fault" // F6: typed panic from a user_-prefixed package
+	e.Exception.Type = "header.eyJzdWIiOiJ0ZXN0In0.signature"
 	s, err := SanitizeEvent(e)
 	if err != nil {
 		t.Fatalf("SanitizeEvent: %v", err)
 	}
-	if s.Exception.Type != "user_session.Fault" {
-		t.Fatalf("package-prefixed exception type must survive as a symbol, got %q", s.Exception.Type)
+	if s.Exception.Type != "" {
+		t.Fatalf("token-like manual exception type must be blanked, got %q", s.Exception.Type)
 	}
 }
 

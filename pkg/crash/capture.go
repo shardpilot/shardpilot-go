@@ -194,7 +194,28 @@ func panicType(recovered any) string {
 	if recovered == nil {
 		return "panic"
 	}
-	return fmt.Sprintf("%T", recovered)
+	return safeTypeName(fmt.Sprintf("%T", recovered))
+}
+
+// safeTypeName returns a wire-sanitizer-safe exception type. exception.type is scrubbed
+// as free text by SanitizeEvent (the FULL PII rules — so a MANUAL caller's value is fully
+// protected). A Go type from a player_/user_/customer_/device_-prefixed PACKAGE would be
+// blanked by that raw-identifier-prefix rule and drop the crash, so fall back to the bare
+// type name, and finally to "panic", to keep a non-empty type that survives the scrubber.
+func safeTypeName(t string) string {
+	t = strings.TrimSpace(t)
+	if t == "" {
+		return "panic"
+	}
+	if !containsDisallowedContent(t) {
+		return t
+	}
+	if i := strings.LastIndexAny(t, "./"); i >= 0 && i+1 < len(t) {
+		if bare := t[i+1:]; !containsDisallowedContent(bare) {
+			return bare
+		}
+	}
+	return "panic"
 }
 
 // goPlatform maps the Go runtime GOOS to the crash ingest platform enum.
