@@ -133,7 +133,7 @@ func captureGoFrames() []Frame {
 		frames = append(frames, Frame{
 			Index:    len(frames),
 			Function: fn,
-			File:     f.File,
+			File:     trimBuildPath(f.File),
 			Line:     f.Line,
 		})
 	}
@@ -185,6 +185,21 @@ func shortFuncName(fn string) string {
 		return fn[i+1:]
 	}
 	return fn
+}
+
+// trimBuildPath reduces a runtime.Frame.File absolute build-host path to its
+// package-relative tail (<dir>/<file>), dropping the leading machine prefix. Without
+// -trimpath the runtime records absolute paths (e.g. /home/alice/work/... or
+// /Users/alice/...), which would leak a developer username or CI workspace name on the
+// wire; the trailing two segments keep useful context (package dir + file) without it.
+func trimBuildPath(file string) string {
+	file = strings.TrimSpace(file)
+	if i := strings.LastIndexByte(file, '/'); i > 0 {
+		if j := strings.LastIndexByte(file[:i], '/'); j >= 0 {
+			return file[j+1:]
+		}
+	}
+	return file
 }
 
 // panicType derives the crash exception type from a recovered value: the concrete

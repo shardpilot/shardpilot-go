@@ -132,6 +132,14 @@ func TestRecoverCapturesPanicOriginAndRepanics(t *testing.T) {
 	if top.File == "" || top.Line == 0 {
 		t.Fatalf("top frame should be symbolicated with file:line, got %#v", top)
 	}
+	// The build-host absolute path (and any developer username / CI workspace in it) must
+	// be trimmed to the package-relative tail before it leaves the process.
+	if strings.HasPrefix(top.File, "/") || strings.Contains(top.File, "/Users/") || strings.Contains(top.File, "/home/") {
+		t.Fatalf("captured File must be trimmed of the absolute build path, got %q", top.File)
+	}
+	if !strings.HasSuffix(top.File, "capture_test.go") {
+		t.Fatalf("captured File should keep the package-relative tail, got %q", top.File)
+	}
 }
 
 func TestCapturePanicReportsWithoutRepanicking(t *testing.T) {

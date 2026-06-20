@@ -302,3 +302,18 @@ func TestSanitizeEventModulesNeverNull(t *testing.T) {
 		t.Fatalf("Modules must be a non-nil empty slice so it marshals as [] not null")
 	}
 }
+
+func TestTrimBuildPath(t *testing.T) {
+	cases := map[string]string{
+		"/home/alice/work/proj/internal/foo/bar.go":           "foo/bar.go",
+		"/Users/oleg/shardpilot/shardpilot-go/pkg/crash/c.go": "crash/c.go",
+		"foo/bar.go": "foo/bar.go",
+		"bar.go":     "bar.go",
+		"":           "",
+	}
+	for in, want := range cases {
+		if got := trimBuildPath(in); got != want {
+			t.Errorf("trimBuildPath(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
