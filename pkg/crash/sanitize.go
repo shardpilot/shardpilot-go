@@ -22,23 +22,30 @@ var disallowedPrefixes = [...]string{
 	"device_",
 }
 
-type sanitizer struct{}
-
-var sanitize sanitizer
-
-func (sanitizer) Event(event Event) (Event, error) {
-	return SanitizeEvent(event)
+// SanitizeEvent scrubs an event for the wire with the FULL content rules on every
+// caller-populated string, including frame functions. The auto-capture path uses the
+// internal sanitizeEvent(event, true) instead, which treats runtime-derived frame
+// functions as trusted code symbols.
+func SanitizeEvent(event Event) (Event, error) {
+	return sanitizeEvent(event, false)
 }
 
-func SanitizeEvent(event Event) (Event, error) {
+func sanitizeEvent(event Event, trustedFrameFunctions bool) (Event, error) {
 	event = cloneEvent(event)
 	event.CrashID = strings.TrimSpace(event.CrashID)
 	event.App.ID = sanitizeString(event.App.ID)
 	event.App.Version = sanitizeString(event.App.Version)
 	event.App.BuildID = sanitizeString(event.App.BuildID)
+	// Source is an operator-set component slug (ADR-0223) on the wire; scrub it like the
+	// other identifiers so a misconfigured value carrying PII never leaves the process.
+	event.Source = sanitizeString(event.Source)
 	event.Platform = sanitizeString(event.Platform)
 	event.OS.Name = sanitizeString(event.OS.Name)
 	event.OS.Version = sanitizeString(event.OS.Version)
+	// exception.type stays under the FULL scrubber: it is caller-populated free text for
+	// manual Emit/EmitFatal, so a token-like or raw-identifier value must still be stripped.
+	// The auto-capture path keeps its Go type safe at the source via panicType/safeTypeName
+	// so a legit package-prefixed type is not blanked here.
 	event.Exception.Type = sanitizeString(event.Exception.Type)
 	event.Exception.Reason = sanitizeString(event.Exception.Reason)
 	event.Exception.CrashedThreadID = sanitizeString(event.Exception.CrashedThreadID)
@@ -73,7 +80,7 @@ func SanitizeEvent(event Event) (Event, error) {
 			frame.InstructionAddress = sanitizeString(frame.InstructionAddress)
 			frame.Address = sanitizeString(frame.Address)
 			frame.RelativeAddress = sanitizeString(frame.RelativeAddress)
-			frame.Function = sanitizeString(frame.Function)
+			frame.Function = sanitizeFunctionName(frame.Function, trustedFrameFunctions)
 			frame.File = sanitizeString(frame.File)
 			if frame.Line < 0 {
 				frame.Line = 0
@@ -99,6 +106,13 @@ func SanitizeEvent(event Event) (Event, error) {
 	event.Breadcrumbs = breadcrumbs
 	event.FingerprintComponents = sanitizeStringSlice(event.FingerprintComponents)
 	event.OccurredAt = event.OccurredAt.UTC()
+
+	// The required `modules` field must marshal as [] (an empty list), not null, for a
+	// pre-symbolicated crash with zero native modules — a strict producer schema validating
+	// `type: array` would reject null and drop every auto-captured Go panic.
+	if event.Modules == nil {
+		event.Modules = []Module{}
+	}
 
 	return event, nil
 }
@@ -163,6 +177,20 @@ func containsDisallowedContent(value string) bool {
 	if value == "" {
 		return false
 	}
+	if containsDisallowedIdentity(value) {
+		return true
+	}
+	return jwtPattern.MatchString(value)
+}
+
+// containsDisallowedIdentity reports the non-token PII signals: emails, the
+// player_/user_/customer_/device_ raw-identifier prefixes, and IP addresses. It is
+// the part of the disallowed-content check that applies even to code symbols.
+func containsDisallowedIdentity(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
 	if strings.Contains(value, "@") {
 		return true
 	}
@@ -172,10 +200,47 @@ func containsDisallowedContent(value string) bool {
 	if ipv4Pattern.MatchString(value) {
 		return true
 	}
-	if containsIPv6(value) {
+	return containsIPv6(value)
+}
+
+// sanitizeSymbol scrubs a code symbol (a stack-frame function name). It applies ONLY the
+// signals that never legitimately appear in a Go symbol — an embedded email or IP — and
+// deliberately omits both the JWT/dotted-token heuristic (a package-qualified symbol like
+// pkg.Type.Method is three dotted segments) AND the raw-identifier PREFIX heuristic (a
+// package may legitimately be named player_*, user_*, customer_*, device_*, e.g.
+// player_state.Tick). Blanking a valid symbol would strip the frame's only identity and,
+// for a pre-symbolicated frame with no address, drop the WHOLE crash; the crash-symbolicator
+// re-scrubs Function server-side (full pattern set) as defense in depth.
+func sanitizeSymbol(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || symbolHasDisallowedContent(value) {
+		return ""
+	}
+	return value
+}
+
+// sanitizeFunctionName scrubs a stack-frame function. A TRUSTED function comes from the
+// Go runtime symbol table (the auto-capture path) and is scrubbed as a code symbol so a
+// legitimate package-qualified name (which is JWT-shaped / raw-id-prefixed) survives; an
+// UNTRUSTED function is caller-populated (manual Emit/EmitFatal) and gets the full content
+// scrubber, preserving the SDK's no-tokens-on-the-wire guarantee for that public field.
+func sanitizeFunctionName(value string, trusted bool) string {
+	if trusted {
+		return sanitizeSymbol(value)
+	}
+	return sanitizeString(value)
+}
+
+// symbolHasDisallowedContent flags an embedded email or IP address — the only PII signals
+// that cannot appear in a legitimate Go code symbol.
+func symbolHasDisallowedContent(value string) bool {
+	if strings.Contains(value, "@") {
 		return true
 	}
-	return jwtPattern.MatchString(value)
+	if ipv4Pattern.MatchString(value) {
+		return true
+	}
+	return containsIPv6(value)
 }
 
 func startsWithDisallowedPrefix(value string) bool {

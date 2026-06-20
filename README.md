@@ -117,6 +117,28 @@ err = client.EmitFatal(ctx, crash.Event{
 
 `EmitFatal` always sends; `Emit` (non-fatal) is subject to the client sampler (default: 1 in 10).
 
+### Automatic panic capture
+
+For Go services you can capture panics automatically instead of building `Event`s by hand. Configure the client with the app identity (and, for a multi-component product, a `Source` slug per ADR-0223), then defer `Recover` at each goroutine / request-handler boundary:
+
+```go
+client, err := crash.NewClient(crash.ClientOptions{
+    IngestURL: os.Getenv("SHARDPILOT_CRASH_SYMBOLICATOR_URL"),
+    APIKey:    os.Getenv("SHARDPILOT_API_KEY"),
+    App:       crash.AppInfo{ID: "fortress-fury", Version: "1.4.0"},
+    Source:    "main-server", // which component/repo this crash came from
+})
+
+func handleRequest(ctx context.Context) {
+    defer client.Recover(ctx) // reports the panic as fatal, then RE-PANICS
+    // ... work that may panic ...
+}
+```
+
+`Recover` recovers a panic, reports it synchronously (so the report is sent before the process exits), and then **re-panics** so the program's normal crash behaviour is preserved. Use it once per goroutine — a panic in a bare `go func(){…}()` with no deferred `Recover` is not captured. `CapturePanic(ctx, recovered)` reports an already-recovered value **without** re-panicking, for callers that intentionally recover and keep running. A nil/unconfigured client is a safe no-op (and `Recover` still re-panics).
+
+Captured frames are **pre-symbolicated** from the Go runtime (package-qualified function, file, line — no native modules or addresses, accepted by the producer per ADR-0223). `App` fields and `Source` are stamped onto every event that doesn't set its own; a per-event value always wins.
+
 ## Configuration
 
 `shardpilot.Config` fields:
@@ -138,7 +160,7 @@ err = client.EmitFatal(ctx, crash.Event{
 
 The example programs read these from `SHARDPILOT_*` environment variables; the SDK itself reads no environment variables.
 
-Crash client (`crash.ClientOptions`): `IngestURL` (crash-symbolicator base URL), `APIKey` (needs `crash:write`), plus optional `HTTPClient`, `Logger`, `Sampler`, `MaxAttempts` (default 2), `RetryBackoff` (default 50ms). Default HTTP timeout is 30s.
+Crash client (`crash.ClientOptions`): `IngestURL` (crash-symbolicator base URL), `APIKey` (needs `crash:write`), plus optional `App` (`AppInfo{ID,Version,BuildID}` — defaulted onto every event; **required for automatic panic capture**, and `App.ID` must equal the API key's app scope), `Source` (component slug, ADR-0223), `HTTPClient`, `Logger`, `Sampler`, `MaxAttempts` (default 2), `RetryBackoff` (default 50ms). Default HTTP timeout is 30s.
 
 ## Wire contract
 
@@ -195,7 +217,7 @@ Defaults: issuer `project-tower-main-server`, audience `analytics-service`, life
 | `anonymous_id.go`, `ids.go`, `clock.go` | Opt-in anonymous-ID helper, event-ID generation, injectable clock. |
 | `ingest_jwt.go` | Backend-only `SignIngestJWT` Mode-B ingest-JWT mint helper (ADR-0222). |
 | `internal/uuidv7/` | Shared UUIDv7 generator (crash IDs, anonymous IDs, consent idempotency keys). |
-| `pkg/crash/` | Crash SDK: `client.go`, `event.go` (typed wire schema), `breadcrumbs.go`, `sanitize.go`. |
+| `pkg/crash/` | Crash SDK: `client.go`, `event.go` (typed wire schema), `capture.go` (automatic panic capture), `breadcrumbs.go`, `sanitize.go`. |
 | `examples/basic/`, `examples/crash/` | Runnable analytics and crash examples (env-var driven). |
 | `*_test.go`, `quickstart_test.go`, `client_benchmark_test.go` | Unit, quickstart, and benchmark tests. |
 

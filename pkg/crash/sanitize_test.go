@@ -13,7 +13,7 @@ func TestSanitizeEventStripsDisallowedOptionalFields(t *testing.T) {
 	event.App.BuildID = "header.eyJzdWIiOiJ0ZXN0In0.signature"
 	event.OS.Name = "desktop 198.51.100.23"
 	event.OS.Version = "2001:db8::1"
-	event.Threads[0].Frames[0].Function = "player_raw_identifier"
+	event.Threads[0].Frames[0].Function = "handler.report@example.invalid"
 	event.Threads[0].Frames[0].File = "safe/file.go"
 	event.Threads[0].Frames[0].Line = -12
 	event.Threads[0].Frames[0].ModuleName = "synthetic-module"
@@ -45,7 +45,7 @@ func TestSanitizeEventStripsDisallowedOptionalFields(t *testing.T) {
 	}
 	frame := sanitized.Threads[0].Frames[0]
 	if frame.Function != "" {
-		t.Fatalf("expected raw identifier prefix to be stripped, got %q", frame.Function)
+		t.Fatalf("expected email-bearing frame function to be stripped, got %q", frame.Function)
 	}
 	if frame.File != "safe/file.go" {
 		t.Fatalf("expected safe frame file to remain, got %q", frame.File)
@@ -179,5 +179,175 @@ func assertEventHasNoDisallowedStrings(t *testing.T, event Event) {
 		if strings.Contains(value, "{") || strings.Contains(value, "}") {
 			t.Fatalf("found payload-shaped string in sanitized event: %q", value)
 		}
+	}
+}
+
+func TestSanitizeSymbolKeepsGoSymbolsButStripsPII(t *testing.T) {
+	// Package-qualified Go symbols (value-receiver methods, closures) are dotted
+	// 3-segment strings that the JWT heuristic would falsely blank; sanitizeSymbol must
+	// keep them, or the frame loses its function and the whole crash is dropped.
+	keep := []string{
+		"crash_test.boomForCaptureTest",
+		"main.Server.Handle",
+		"pkg.(*Type).Method",
+		"pkg.worker.process.func1",
+		"crash_test.TestRecoverCapturesPanicOriginAndRepanics.func2",
+		// Packages legitimately named with a raw-identifier prefix must survive — blanking
+		// them would drop the whole crash (the symbol is the address-less frame's identity).
+		"player_state.Tick",
+		"user_session.(*Manager).Close",
+		"device_registry.lookup.func1",
+		"customer_billing.Charge",
+	}
+	for _, s := range keep {
+		if got := sanitizeSymbol(s); got != s {
+			t.Errorf("sanitizeSymbol(%q) = %q, want it preserved", s, got)
+		}
+	}
+	// Only an embedded email or IP blanks a symbol — content that never appears in a
+	// legitimate Go symbol.
+	strip := []string{
+		"pkg.handler@example.invalid",
+		"node.198.51.100.23.handler",
+		"handler_2001:db8::1",
+	}
+	for _, s := range strip {
+		if got := sanitizeSymbol(s); got != "" {
+			t.Errorf("sanitizeSymbol(%q) = %q, want blanked", s, got)
+		}
+	}
+}
+
+func TestShortFuncNameTrimsImportPath(t *testing.T) {
+	cases := map[string]string{
+		"github.com/org/repo/pkg.(*Type).Method": "pkg.(*Type).Method",
+		"github.com/org/repo/internal/foo.Bar":   "foo.Bar",
+		"main.main":                              "main.main",
+		"runtime.gopanic":                        "runtime.gopanic",
+		"":                                       "",
+	}
+	for in, want := range cases {
+		if got := shortFuncName(in); got != want {
+			t.Errorf("shortFuncName(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestSanitizeEventScrubsSource(t *testing.T) {
+	e := validEvent(t)
+	e.Source = "report@example.invalid" // F1: PII in the source slug
+	s, err := SanitizeEvent(e)
+	if err != nil {
+		t.Fatalf("SanitizeEvent: %v", err)
+	}
+	if s.Source != "" {
+		t.Fatalf("PII-bearing source must be blanked, got %q", s.Source)
+	}
+	e.Source = "main-server" // a valid component slug survives
+	s, err = SanitizeEvent(e)
+	if err != nil {
+		t.Fatalf("SanitizeEvent: %v", err)
+	}
+	if s.Source != "main-server" {
+		t.Fatalf("valid source slug must survive, got %q", s.Source)
+	}
+}
+
+func TestSafeTypeNameSurvivesScrubber(t *testing.T) {
+	// safeTypeName keeps the auto-capture Go type from being blanked by the FULL exception
+	// type scrubber while never producing an empty (crash-dropping) value.
+	cases := map[string]string{
+		"string":               "string",
+		"*errors.errorString":  "*errors.errorString",
+		"runtime.Error":        "runtime.Error",
+		"*user_session.Fault":  "*user_session.Fault", // pointer: prefix rule does not fire
+		"user_session.Fault":   "Fault",               // value type in a user_ pkg → bare type
+		"player_state.ErrTick": "ErrTick",
+	}
+	for in, want := range cases {
+		got := safeTypeName(in)
+		if got != want {
+			t.Errorf("safeTypeName(%q) = %q, want %q", in, got, want)
+		}
+		if sanitizeString(got) == "" {
+			t.Errorf("safeTypeName(%q) = %q must survive the wire scrubber, got blanked", in, got)
+		}
+	}
+}
+
+func TestSanitizeEventScrubsManualExceptionType(t *testing.T) {
+	// A MANUAL caller's exception.type stays under the full scrubber (defense for misuse):
+	// a token-like value is blanked (and the event then fails validation, dropping the
+	// misuse rather than leaking it).
+	e := validEvent(t)
+	e.Exception.Type = "header.eyJzdWIiOiJ0ZXN0In0.signature"
+	s, err := SanitizeEvent(e)
+	if err != nil {
+		t.Fatalf("SanitizeEvent: %v", err)
+	}
+	if s.Exception.Type != "" {
+		t.Fatalf("token-like manual exception type must be blanked, got %q", s.Exception.Type)
+	}
+}
+
+func TestSanitizeEventModulesNeverNull(t *testing.T) {
+	e := validEvent(t)
+	e.Modules = nil // F2: zero-module pre-symbolicated crash
+	e.Threads[0].Frames = []Frame{{Function: "main.run", File: "main.go", Line: 1}}
+	s, err := SanitizeEvent(e)
+	if err != nil {
+		t.Fatalf("SanitizeEvent: %v", err)
+	}
+	if s.Modules == nil {
+		t.Fatalf("Modules must be a non-nil empty slice so it marshals as [] not null")
+	}
+}
+
+func TestTrimBuildPath(t *testing.T) {
+	cases := map[string]string{
+		"/home/alice/work/proj/internal/foo/bar.go":           "foo/bar.go",
+		"/Users/oleg/shardpilot/shardpilot-go/pkg/crash/c.go": "crash/c.go",
+		"foo/bar.go": "foo/bar.go",
+		"bar.go":     "bar.go",
+		"":           "",
+	}
+	for in, want := range cases {
+		if got := trimBuildPath(in); got != want {
+			t.Errorf("trimBuildPath(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestSanitizeFunctionNameTrustedVsUntrusted(t *testing.T) {
+	jwtShaped := "crash_test.TestFoo.func2"         // legit Go symbol, but JWT-shaped
+	prefixed := "player_state.Tick"                 // legit symbol in a raw-id-prefixed pkg
+	token := "header.eyJzdWIiOiJ0ZXN0In0.signature" // a real token in a function field
+	// Trusted (SDK-captured): legit symbols survive.
+	for _, s := range []string{jwtShaped, prefixed, "main.run"} {
+		if got := sanitizeFunctionName(s, true); got != s {
+			t.Errorf("trusted sanitizeFunctionName(%q) = %q, want preserved", s, got)
+		}
+	}
+	// Untrusted (manual caller): the full scrubber blanks token/raw-id-prefixed values.
+	for _, s := range []string{jwtShaped, prefixed, token} {
+		if got := sanitizeFunctionName(s, false); got != "" {
+			t.Errorf("untrusted sanitizeFunctionName(%q) = %q, want blanked", s, got)
+		}
+	}
+	// A plain symbol survives even untrusted.
+	if got := sanitizeFunctionName("main.run", false); got != "main.run" {
+		t.Errorf("untrusted plain symbol must survive, got %q", got)
+	}
+}
+
+func TestSanitizeEventBlanksTokenInManualFrameFunction(t *testing.T) {
+	e := validEvent(t) // frame already carries an instruction_addr + module, so it stays valid
+	e.Threads[0].Frames[0].Function = "header.eyJzdWIiOiJ0ZXN0In0.signature"
+	s, err := SanitizeEvent(e) // manual path → full scrub
+	if err != nil {
+		t.Fatalf("SanitizeEvent: %v", err)
+	}
+	if got := s.Threads[0].Frames[0].Function; got != "" {
+		t.Fatalf("token-like manual frame function must be blanked on the wire, got %q", got)
 	}
 }

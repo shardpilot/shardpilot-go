@@ -113,3 +113,40 @@ func validEvent(t *testing.T) Event {
 		Breadcrumbs: []Breadcrumb{{Name: "screen_open", Timestamp: time.Unix(1700000001, 0).UTC()}},
 	}
 }
+
+func TestValidateEventPreSymbolicatedFrameNeedsNoModule(t *testing.T) {
+	e := validEvent(t)
+	e.Modules = nil // pre-symbolicated Go crash: zero native modules
+	e.Threads[0].Frames = []Frame{{Function: "main.run", File: "main.go", Line: 10}}
+	if err := validateEvent(e); err != nil {
+		t.Fatalf("pre-symbolicated function-only frame with 0 modules must validate, got %v", err)
+	}
+}
+
+func TestValidateEventNativeAddressFrameRequiresModule(t *testing.T) {
+	e := validEvent(t)
+	e.Modules = nil // F4: an address with no module map is unresolvable
+	e.Threads[0].Frames = []Frame{{InstructionAddress: "0x401015"}}
+	if err := validateEvent(e); !errors.Is(err, ErrInvalidEvent) {
+		t.Fatalf("addressed frame with 0 modules must be rejected, got %v", err)
+	}
+}
+
+func TestValidateEventAddressedFrameMultiModuleRequiresModuleID(t *testing.T) {
+	e := validEvent(t)
+	e.Modules = []Module{
+		{Name: "a", DebugID: "AABBCCDDEEFF00112233445566778899", LoadAddress: "0x1000"},
+		{Name: "b", DebugID: "99887766554433221100FFEEDDCCBBAA", LoadAddress: "0x2000"},
+	}
+	// F7: a frame with a function AND an address, multi-module, no module_id => reject
+	// (the address still needs a module to disambiguate, despite the function).
+	e.Threads[0].Frames = []Frame{{Function: "main.run", InstructionAddress: "0x1010"}}
+	if err := validateEvent(e); !errors.Is(err, ErrInvalidEvent) {
+		t.Fatalf("addressed multi-module frame without module_id must be rejected, got %v", err)
+	}
+	// With a module_id it validates.
+	e.Threads[0].Frames[0].ModuleID = "a"
+	if err := validateEvent(e); err != nil {
+		t.Fatalf("addressed frame with module_id must validate, got %v", err)
+	}
+}
