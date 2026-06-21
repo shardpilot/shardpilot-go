@@ -13,7 +13,7 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// A self-contained mirror of the analytics-service Mode-B verifier's
+// A self-contained mirror of the ShardPilot Mode-B verifier's
 // hard-reject contract. It exists ONLY in the test so the round-trip proves a
 // minted token would actually pass the server's 16-check contract, without the
 // SDK taking a dependency on the server or a JWT library. Keep these defaults

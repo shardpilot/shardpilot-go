@@ -15,7 +15,7 @@ project channel.
 - Do not commit tokens, secrets, or real customer/player data.
 - The SDK must not log tokens or full event payloads.
 - The SDK must not store a durable local queue in v0.
-- The SDK must not make provider, model, GitHub, billing, or control-plane
+- The SDK must not make provider, model, GitHub, billing, or account-management
   write calls.
 - Do not send raw provider payloads, raw player/customer payloads, diffs,
   patches, code/file/archive content, prompts, completions, or unsanitized

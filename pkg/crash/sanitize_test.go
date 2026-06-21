@@ -235,7 +235,7 @@ func TestShortFuncNameTrimsImportPath(t *testing.T) {
 
 func TestSanitizeEventScrubsSource(t *testing.T) {
 	e := validEvent(t)
-	e.Source = "report@example.invalid" // F1: PII in the source slug
+	e.Source = "report@example.invalid" // PII in the source slug
 	s, err := SanitizeEvent(e)
 	if err != nil {
 		t.Fatalf("SanitizeEvent: %v", err)
@@ -292,7 +292,7 @@ func TestSanitizeEventScrubsManualExceptionType(t *testing.T) {
 
 func TestSanitizeEventModulesNeverNull(t *testing.T) {
 	e := validEvent(t)
-	e.Modules = nil // F2: zero-module pre-symbolicated crash
+	e.Modules = nil // zero-module pre-symbolicated crash
 	e.Threads[0].Frames = []Frame{{Function: "main.run", File: "main.go", Line: 1}}
 	s, err := SanitizeEvent(e)
 	if err != nil {

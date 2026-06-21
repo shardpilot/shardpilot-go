@@ -36,7 +36,7 @@ func sanitizeEvent(event Event, trustedFrameFunctions bool) (Event, error) {
 	event.App.ID = sanitizeString(event.App.ID)
 	event.App.Version = sanitizeString(event.App.Version)
 	event.App.BuildID = sanitizeString(event.App.BuildID)
-	// Source is an operator-set component slug (ADR-0223) on the wire; scrub it like the
+	// Source is an operator-set component slug on the wire; scrub it like the
 	// other identifiers so a misconfigured value carrying PII never leaves the process.
 	event.Source = sanitizeString(event.Source)
 	event.Platform = sanitizeString(event.Platform)
@@ -209,7 +209,7 @@ func containsDisallowedIdentity(value string) bool {
 // pkg.Type.Method is three dotted segments) AND the raw-identifier PREFIX heuristic (a
 // package may legitimately be named player_*, user_*, customer_*, device_*, e.g.
 // player_state.Tick). Blanking a valid symbol would strip the frame's only identity and,
-// for a pre-symbolicated frame with no address, drop the WHOLE crash; the crash-symbolicator
+// for a pre-symbolicated frame with no address, drop the WHOLE crash; ShardPilot
 // re-scrubs Function server-side (full pattern set) as defense in depth.
 func sanitizeSymbol(value string) string {
 	value = strings.TrimSpace(value)

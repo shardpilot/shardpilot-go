@@ -1,8 +1,6 @@
 # shardpilot-go
 
-> Go client SDK for ShardPilot — sends app-first analytics events (and, optionally, crash reports) to the ShardPilot ingest plane. Zero third-party dependencies, stdlib only.
-
-Governing ADRs (internal): app-first analytics ADR-0139, crash SDK design ADR-0191, dual-mode ingest auth ADR-0222.
+> Go client SDK for ShardPilot — sends app-first analytics events (and, optionally, crash reports) to the ShardPilot ingest API. Zero third-party dependencies, stdlib only.
 
 ## Status
 
@@ -19,7 +17,7 @@ Real, tested, working code — **early alpha**. The API is pre-v1 and may change
 - Bounded batching (default 25 events, capped at 100) with retry of retryable HTTP responses; memory-only queue (no durable on-disk queue).
 - Optional explicit analytics consent (`SetConsent` / `Consent`) with a separate `POST {IngestURL}/v1/consent` endpoint.
 - Opt-in `LoadOrCreateAnonymousID(path)` helper for a persisted UUIDv7 anonymous identifier.
-- Crash reporting (`pkg/crash`): sends the canonical crash-symbolicator wire schema to `POST {base}/api/v1/crashes/ingest`, with sanitized breadcrumbs, PII scrubbing, and fatal/non-fatal emit APIs.
+- Crash reporting (`pkg/crash`): sends the canonical crash wire schema to `POST {base}/api/v1/crashes/ingest`, with sanitized breadcrumbs, PII scrubbing, and fatal/non-fatal emit APIs.
 
 ## Installation
 
@@ -119,7 +117,7 @@ err = client.EmitFatal(ctx, crash.Event{
 
 ### Automatic panic capture
 
-For Go services you can capture panics automatically instead of building `Event`s by hand. Configure the client with the app identity (and, for a multi-component product, a `Source` slug per ADR-0223), then defer `Recover` at each goroutine / request-handler boundary:
+For Go services you can capture panics automatically instead of building `Event`s by hand. Configure the client with the app identity (and, for a multi-component product, a `Source` slug), then defer `Recover` at each goroutine / request-handler boundary:
 
 ```go
 client, err := crash.NewClient(crash.ClientOptions{
@@ -137,7 +135,7 @@ func handleRequest(ctx context.Context) {
 
 `Recover` recovers a panic, reports it synchronously (so the report is sent before the process exits), and then **re-panics** so the program's normal crash behaviour is preserved. Use it once per goroutine — a panic in a bare `go func(){…}()` with no deferred `Recover` is not captured. `CapturePanic(ctx, recovered)` reports an already-recovered value **without** re-panicking, for callers that intentionally recover and keep running. A nil/unconfigured client is a safe no-op (and `Recover` still re-panics).
 
-Captured frames are **pre-symbolicated** from the Go runtime (package-qualified function, file, line — no native modules or addresses, accepted by the producer per ADR-0223). `App` fields and `Source` are stamped onto every event that doesn't set its own; a per-event value always wins.
+Captured frames are **pre-symbolicated** from the Go runtime (package-qualified function, file, line — no native modules or addresses, accepted by the crash ingest API). `App` fields and `Source` are stamped onto every event that doesn't set its own; a per-event value always wins.
 
 ## Configuration
 
@@ -146,7 +144,7 @@ Captured frames are **pre-symbolicated** from the Go runtime (package-qualified 
 | Field | Required | Notes |
 |---|---|---|
 | `IngestURL` | yes | Absolute base URL, no path/query/fragment. HTTPS required outside localhost/loopback (or private nets with `AllowInsecurePrivateNetwork`). |
-| `Token` | yes | Bearer token (Mode A `sp_ingest_` publishable key or Mode B per-tenant JWT, ADR-0222). Held in memory; never logged. |
+| `Token` | yes | Bearer token (Mode A `sp_ingest_` publishable key or Mode B per-tenant JWT). Held in memory; never logged. |
 | `WorkspaceID` / `AppID` / `EnvironmentID` | yes | App-first identity (`workspace → app → environment`). |
 | `Source` | yes | `SourceClient`, `SourceServer`, or `SourceBackend`. |
 | `AppVersion` / `AppBuild` / `Platform` | no | Default envelope metadata. |
@@ -160,7 +158,7 @@ Captured frames are **pre-symbolicated** from the Go runtime (package-qualified 
 
 The example programs read these from `SHARDPILOT_*` environment variables; the SDK itself reads no environment variables.
 
-Crash client (`crash.ClientOptions`): `IngestURL` (crash-symbolicator base URL), `APIKey` (needs `crash:write`), plus optional `App` (`AppInfo{ID,Version,BuildID}` — defaulted onto every event; **required for automatic panic capture**, and `App.ID` must equal the API key's app scope), `Source` (component slug, ADR-0223), `HTTPClient`, `Logger`, `Sampler`, `MaxAttempts` (default 2), `RetryBackoff` (default 50ms). Default HTTP timeout is 30s.
+Crash client (`crash.ClientOptions`): `IngestURL` (crash ingest base URL), `APIKey` (needs `crash:write`), plus optional `App` (`AppInfo{ID,Version,BuildID}` — defaulted onto every event; **required for automatic panic capture**, and `App.ID` must equal the API key's app scope), `Source` (component slug), `HTTPClient`, `Logger`, `Sampler`, `MaxAttempts` (default 2), `RetryBackoff` (default 50ms). Default HTTP timeout is 30s.
 
 ## Wire contract
 
@@ -170,7 +168,7 @@ The envelope is **universal** — no domain-specific fields. Vertical context (e
 
 Consent decisions ride their own endpoint (`POST {IngestURL}/v1/consent`), never the event envelope, with body `workspace_id`, `app_id`, `environment_id`, `actor_identifier`, `categories` (`{"analytics": <bool>}`), `decided_at` (RFC3339), and a fresh UUIDv7 `idempotency_key`.
 
-Crash reports go to `POST {base}/api/v1/crashes/ingest` (`Authorization: Bearer <api-key-with-crash:write>`) with a stable `crash_id`, `occurred_at`, app/platform/os, device & context maps, exception metadata, binary modules with `debug_id`/`load_address`, per-thread raw instruction addresses, optional pre-symbolicated frames, optional `raw_text`, and breadcrumbs. The crash structs are a **hand-maintained mirror** of crash-symbolicator's `api/openapi.yaml`.
+Crash reports go to `POST {base}/api/v1/crashes/ingest` (`Authorization: Bearer <api-key-with-crash:write>`) with a stable `crash_id`, `occurred_at`, app/platform/os, device & context maps, exception metadata, binary modules with `debug_id`/`load_address`, per-thread raw instruction addresses, optional pre-symbolicated frames, optional `raw_text`, and breadcrumbs. The crash structs are a **hand-maintained mirror** of the ShardPilot crash ingest API's OpenAPI schema.
 
 ## Privacy & consent
 
@@ -180,14 +178,14 @@ Crash reports go to `POST {base}/api/v1/crashes/ingest` (`Authorization: Bearer 
 - Crash reports strip PII and raw identifier material; there is no API surface for screenshots, network payloads, or attachments.
 - Do not commit tokens or real customer/player data. Tokens and full event payloads are never logged by default.
 
-## Minting client ingest JWTs (backend-only, ADR-0222 Mode B)
+## Minting client ingest JWTs (backend-only, Mode B)
 
 > **Backend-only — this helper holds the per-tenant signing secret.** It belongs in a trusted server-side game backend and must **never** be compiled into a shipped client binary. Client SDKs (Unity, Unreal, Defold) consume a minted token through a `token_provider` callback and never see the secret. This Go SDK is a backend/service-tier SDK, so its dual-mode role is the inverse: it **mints** the short-lived per-user JWTs that client SDKs then fetch over your own authenticated channel.
 
-`SignIngestJWT` mints a short-lived HS256 JWT that the analytics-service Mode-B verifier accepts. The per-tenant signing secret (and its key id `kid`) is minted/rotated/served by control-plane; your backend obtains it out-of-band and passes it in. The helper does not fetch, store, or rotate the secret — it only signs. It is **additive** and does not change the service-tier `Config.Token` / `Authorization: Bearer` transport.
+`SignIngestJWT` mints a short-lived HS256 JWT that the ShardPilot ingest API's Mode-B verifier accepts. The per-tenant signing secret (and its key id `kid`) is minted, rotated, and served by ShardPilot; your backend obtains it out-of-band and passes it in. The helper does not fetch, store, or rotate the secret — it only signs. It is **additive** and does not change the service-tier `Config.Token` / `Authorization: Bearer` transport.
 
 ```go
-// Per-tenant secret + kid, obtained out-of-band from control-plane.
+// Per-tenant secret + kid, obtained out-of-band from ShardPilot.
 // Secret is RAW bytes (base64url-decode first if you received it encoded).
 key := shardpilot.SigningKey{KID: kid, Secret: secret}
 
@@ -215,7 +213,7 @@ Defaults: issuer `project-tower-main-server`, audience `analytics-service`, life
 | `client.go`, `queue.go`, `transport.go`, `envelope.go` | Analytics client: lifecycle, bounded queue, HTTP transport, envelope builder. |
 | `config.go`, `event.go`, `consent.go`, `metrics.go`, `errors.go` | Config validation, public `Event`, consent state machine, `Stats`, sentinel errors. |
 | `anonymous_id.go`, `ids.go`, `clock.go` | Opt-in anonymous-ID helper, event-ID generation, injectable clock. |
-| `ingest_jwt.go` | Backend-only `SignIngestJWT` Mode-B ingest-JWT mint helper (ADR-0222). |
+| `ingest_jwt.go` | Backend-only `SignIngestJWT` Mode-B ingest-JWT mint helper. |
 | `internal/uuidv7/` | Shared UUIDv7 generator (crash IDs, anonymous IDs, consent idempotency keys). |
 | `pkg/crash/` | Crash SDK: `client.go`, `event.go` (typed wire schema), `capture.go` (automatic panic capture), `breadcrumbs.go`, `sanitize.go`. |
 | `examples/basic/`, `examples/crash/` | Runnable analytics and crash examples (env-var driven). |
@@ -236,7 +234,7 @@ gofmt -l .
 
 - **Zero third-party dependencies** — stdlib only. Keep it that way.
 - **No domain logic in core.** No product-specific event names or game/vertical fields in the universal envelope.
-- **The SDK only sends telemetry.** It performs no provider, model, GitHub, billing, control-plane write, or automatic action calls.
+- **The SDK only sends telemetry.** It performs no provider, model, GitHub, billing, or account-management write calls, and triggers no automatic actions.
 - **Fail-safe HTTP.** HTTPS required outside localhost/loopback (private-network HTTP only via explicit opt-in). No durable local queue; no retry storms; the worker retains at most one failed in-memory batch.
 - The `go` directive stays at **1.24** for consumer compatibility even though CI also exercises the current toolchain.
 
@@ -244,18 +242,16 @@ gofmt -l .
 
 Pre-v1; the API is explicitly unstable. From the changelog `[Unreleased]`:
 
-- Consent API, `LoadOrCreateAnonymousID`, the backend-only `SignIngestJWT` Mode-B mint helper (ADR-0222), and optional default actor identity fields are landed in `[Unreleased]` (not yet tagged; `SignIngestJWT` is additive and intended for the `v0.3.0` release).
+- Consent API, `LoadOrCreateAnonymousID`, the backend-only `SignIngestJWT` Mode-B mint helper, and optional default actor identity fields are landed in `[Unreleased]` (not yet tagged; `SignIngestJWT` is additive and intended for the `v0.3.0` release).
 - Public developer docs are planned for `docs.shardpilot.com`; that domain is not yet provisioned.
 
 `v0.3.0-alpha` (tagged) removed the game-flavored `MatchID` field from the universal `Event` envelope; carry that context in `Props["match_id"]` instead (wire payload unchanged).
 
-## Related repositories
+## Related
 
-- `analytics-service` (internal) — ingest plane that receives the event batches and consent decisions.
-- `crash-symbolicator` (internal) — owns the canonical crash wire schema (`api/openapi.yaml`) this SDK mirrors.
-- `control-plane` (internal) — mints/introspects the ingest tokens and API keys used here.
-- `developers` (internal) — public docs for the ingest API and SDKs.
-- Sibling SDKs: `shardpilot-unity` (internal), `shardpilot-unreal` (internal), and [`shardpilot-defold`](https://github.com/shardpilot/shardpilot-defold).
+- The **ShardPilot platform** receives the event batches, consent decisions, and crash reports this SDK sends, and mints and introspects the ingest tokens and API keys it uses.
+- Sibling client SDKs for game engines: Unity, Unreal, and [`shardpilot-defold`](https://github.com/shardpilot/shardpilot-defold).
+- Developer documentation for the ingest API and SDKs is planned for `docs.shardpilot.com`.
 
 ## License
 

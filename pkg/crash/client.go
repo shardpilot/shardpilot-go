@@ -41,7 +41,7 @@ type ClientOptions struct {
 	// rejects an empty app.id and one that mismatches the API key's app scope. App.ID
 	// must equal the API key's app.
 	App AppInfo
-	// Source is the component slug (ADR-0223) stamped on every event that doesn't set
+	// Source is the component slug stamped on every event that doesn't set
 	// its own: which repo/service in a multi-component product this crash came from
 	// (e.g. main-server, game-server). Optional.
 	Source       string

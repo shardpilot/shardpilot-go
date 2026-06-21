@@ -78,7 +78,7 @@ func (c *Client) reportPanic(ctx context.Context, recovered any) {
 
 // panicEvent builds the crash Event for a recovered panic value. Frames are
 // PRE-SYMBOLICATED from the Go runtime (function/file/line, no native modules or
-// addresses — accepted by the producer per ADR-0223). Exposed unexported for tests.
+// addresses — accepted by the crash ingest API). Exposed unexported for tests.
 func (c *Client) panicEvent(recovered any) Event {
 	return Event{
 		Platform: goPlatform(),

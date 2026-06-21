@@ -298,7 +298,7 @@ func TestRecoverDeliversWithCancelledContext(t *testing.T) {
 }
 
 // The required `modules` field must be sent as an empty JSON array, never null, for a
-// zero-module pre-symbolicated Go crash (F2) — a strict producer schema rejects null.
+// zero-module pre-symbolicated Go crash — a strict producer schema rejects null.
 func TestRecoverMarshalsZeroModulesAsEmptyArray(t *testing.T) {
 	var body []byte
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

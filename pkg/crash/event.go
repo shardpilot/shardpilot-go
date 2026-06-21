@@ -31,7 +31,7 @@ type Event struct {
 	CrashID    string    `json:"crash_id"`
 	OccurredAt time.Time `json:"occurred_at"`
 	App        AppInfo   `json:"app"`
-	// Source is the component slug within the app (ADR-0223): which repo/service this
+	// Source is the component slug within the app: which repo/service this
 	// crash came from (e.g. main-server, game-server). Usually set once via
 	// ClientOptions.Source and stamped on every event; a per-event value wins.
 	Source                string            `json:"source,omitempty"`
@@ -136,7 +136,7 @@ func validateEvent(event Event) error {
 	if strings.TrimSpace(event.Exception.Type) == "" {
 		return fmt.Errorf("%w: exception.type is required", ErrInvalidEvent)
 	}
-	// 0 modules is allowed for a PRE-SYMBOLICATED crash (ADR-0223): a Go/server crash
+	// 0 modules is allowed for a PRE-SYMBOLICATED crash: a Go/server crash
 	// captured from the runtime carries function/file/line frames and no native modules.
 	if len(event.Modules) > maxModules {
 		return fmt.Errorf("%w: modules cannot exceed %d", ErrInvalidEvent, maxModules)
@@ -171,7 +171,7 @@ func validateEvent(event Event) error {
 			hasFunction := strings.TrimSpace(frame.Function) != ""
 			hasAddress := strings.TrimSpace(firstNonEmptyString(frame.InstructionAddress, frame.Address)) != ""
 			// Every frame must be identifiable — a PRE-SYMBOLICATED frame by its function
-			// (ADR-0223, no modules/address needed) or a native frame by its address.
+			// (no modules/address needed) or a native frame by its address.
 			if !hasFunction && !hasAddress {
 				return fmt.Errorf("%w: threads[%d].frames[%d] requires instruction_addr or a function", ErrInvalidEvent, i, j)
 			}
