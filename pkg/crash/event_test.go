@@ -125,7 +125,7 @@ func TestValidateEventPreSymbolicatedFrameNeedsNoModule(t *testing.T) {
 
 func TestValidateEventNativeAddressFrameRequiresModule(t *testing.T) {
 	e := validEvent(t)
-	e.Modules = nil // F4: an address with no module map is unresolvable
+	e.Modules = nil // an address with no module map is unresolvable
 	e.Threads[0].Frames = []Frame{{InstructionAddress: "0x401015"}}
 	if err := validateEvent(e); !errors.Is(err, ErrInvalidEvent) {
 		t.Fatalf("addressed frame with 0 modules must be rejected, got %v", err)
@@ -138,7 +138,7 @@ func TestValidateEventAddressedFrameMultiModuleRequiresModuleID(t *testing.T) {
 		{Name: "a", DebugID: "AABBCCDDEEFF00112233445566778899", LoadAddress: "0x1000"},
 		{Name: "b", DebugID: "99887766554433221100FFEEDDCCBBAA", LoadAddress: "0x2000"},
 	}
-	// F7: a frame with a function AND an address, multi-module, no module_id => reject
+	// a frame with a function AND an address, multi-module, no module_id => reject
 	// (the address still needs a module to disambiguate, despite the function).
 	e.Threads[0].Frames = []Frame{{Function: "main.run", InstructionAddress: "0x1010"}}
 	if err := validateEvent(e); !errors.Is(err, ErrInvalidEvent) {

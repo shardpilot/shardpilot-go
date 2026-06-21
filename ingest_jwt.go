@@ -12,7 +12,7 @@ import (
 )
 
 // ===========================================================================
-// ADR-0222 Mode-B per-tenant ingest JWT mint helper.
+// Mode-B per-tenant ingest JWT mint helper.
 //
 // SECURITY — BACKEND-ONLY. THIS HELPER HOLDS THE PER-TENANT SIGNING SECRET.
 //
@@ -23,9 +23,9 @@ import (
 // sees the secret; this helper is the inverse — it MINTS the token the client
 // then fetches over the studio's own authenticated channel.
 //
-// The per-tenant HS256 secret is minted, rotated, and served by control-plane.
-// The backend obtains it out-of-band (e.g. over CP's machine-to-machine serve
-// channel) together with its key id (kid). This helper does not fetch, store,
+// The per-tenant HS256 secret is minted, rotated, and served by ShardPilot.
+// The backend obtains it out-of-band (e.g. over ShardPilot's machine-to-machine
+// serve channel) together with its key id (kid). This helper does not fetch, store,
 // or rotate the secret — it only signs a conformant short-lived JWT with it.
 //
 // NEVER ship the secret in a client. NEVER log the secret or a minted token.
@@ -33,7 +33,7 @@ import (
 
 // IngestSubjectMaxLength is the maximum byte length of the JWT subject (the
 // verified user_id) and of the optional bound anonymous_id. It mirrors the
-// analytics-service actorhash.MaxIdentifierLength canonical upper bound (512
+// ShardPilot ingest API's canonical identifier upper bound (512
 // bytes): the server back-fills the verified subject onto events that omit a
 // user_id, and stamps a verified alias edge from bind_anon, both AFTER its own
 // per-event length guard runs, so a subject/bind_anon longer than this is
@@ -42,7 +42,7 @@ import (
 // over-long subject or anon downstream.
 const IngestSubjectMaxLength = 512
 
-// ingestKidMaxLength mirrors the analytics-service signingkeys.maxKidLength
+// ingestKidMaxLength mirrors the ShardPilot ingest API's max kid length
 // (256): a kid is a short opaque id. A kid longer than this — or one carrying a
 // character outside the resolver charset [A-Za-z0-9_.-] — is rejected by the
 // Mode-B verifier before it ever resolves the secret, so reject it here too.
@@ -54,13 +54,13 @@ const ingestKidMaxLength = 256
 const ingestScope = "analytics:ingest"
 
 const (
-	// DefaultIngestIssuer is the issuer the analytics-service Mode-B verifier
-	// expects by default (config DefaultIngestClientJWTIssuer). Override per
+	// DefaultIngestIssuer is the issuer the ShardPilot Mode-B verifier
+	// expects by default. Override per
 	// deployment with WithIngestIssuer when the server is configured otherwise.
 	DefaultIngestIssuer = "project-tower-main-server"
 
-	// DefaultIngestAudience is the audience the analytics-service Mode-B verifier
-	// expects by default (config DefaultIngestClientJWTAudience). Override with
+	// DefaultIngestAudience is the audience the ShardPilot Mode-B verifier
+	// expects by default. Override with
 	// WithIngestAudience when the server is configured otherwise.
 	DefaultIngestAudience = "analytics-service"
 
@@ -75,7 +75,7 @@ const (
 	DefaultIngestLifetime = 5 * time.Minute
 
 	// maxIngestLifetime is the hard cap on a minted token's lifetime. It mirrors
-	// the analytics-service DefaultIngestClientJWTMaxLifetime (15m): a token whose
+	// the ShardPilot server's max client-JWT lifetime (15m): a token whose
 	// exp - iat exceeds this is rejected at verify even though it is not yet
 	// expired. The helper rejects an over-long WithIngestLifetime at the mint
 	// source so a token it emits is never rejected downstream for lifetime.
@@ -83,7 +83,7 @@ const (
 )
 
 // kidCharset reports whether the kid uses only the resolver-permitted charset
-// [A-Za-z0-9_.-]. It mirrors the analytics-service signingkeys.kidPattern. A
+// [A-Za-z0-9_.-]. It mirrors the ShardPilot ingest API's kid pattern. A
 // hand-written charset check keeps this file dependency-free.
 func validIngestKid(kid string) bool {
 	if kid == "" || len(kid) > ingestKidMaxLength {
@@ -118,7 +118,7 @@ var ErrInvalidIngestClaims = errors.New("invalid shardpilot ingest claims")
 var ErrInvalidMintOption = errors.New("invalid shardpilot mint option")
 
 // SigningKey is a per-tenant HS256 ingest signing key obtained out-of-band from
-// control-plane. KID is the key's stable opaque id, stamped into the JWT header
+// ShardPilot. KID is the key's stable opaque id, stamped into the JWT header
 // so the verifier can resolve the matching secret. Secret holds the RAW secret
 // bytes (already base64url-decoded if the caller received it base64url-encoded
 // on the wire) and is HELD ONLY in a trusted server-side process.
@@ -184,7 +184,7 @@ func allZeroBytes(b []byte) bool {
 //     three must be non-empty.
 //   - BindAnon is OPTIONAL: the device's persistent anonymous_id. When set, the
 //     server admits a stitched anon equal to it alongside the verified subject
-//     (ADR-0222 §5-alias). Empty means the token vouches for no anon. When set
+//     (a verified anonymous alias). Empty means the token vouches for no anon. When set
 //     it must be at most IngestSubjectMaxLength bytes.
 type IngestJWTClaims struct {
 	Subject       string
@@ -206,7 +206,7 @@ type mintOptions struct {
 type MintOption func(*mintOptions) error
 
 // WithIngestIssuer overrides the `iss` claim (default DefaultIngestIssuer). It
-// must match the issuer the target analytics-service is configured with.
+// must match the issuer the target ShardPilot ingest API is configured with.
 func WithIngestIssuer(issuer string) MintOption {
 	return func(o *mintOptions) error {
 		issuer = strings.TrimSpace(issuer)
@@ -219,7 +219,7 @@ func WithIngestIssuer(issuer string) MintOption {
 }
 
 // WithIngestAudience overrides the `aud` claim (default DefaultIngestAudience).
-// It must match the audience the target analytics-service is configured with.
+// It must match the audience the target ShardPilot ingest API is configured with.
 func WithIngestAudience(audience string) MintOption {
 	return func(o *mintOptions) error {
 		audience = strings.TrimSpace(audience)
@@ -304,8 +304,8 @@ type ingestJWTPayload struct {
 	BindAnon      string `json:"bind_anon,omitempty"`
 }
 
-// SignIngestJWT mints a short-lived ADR-0222 Mode-B per-tenant ingest JWT,
-// signed HS256 with the supplied per-tenant secret, that the analytics-service
+// SignIngestJWT mints a short-lived Mode-B per-tenant ingest JWT,
+// signed HS256 with the supplied per-tenant secret, that the ShardPilot
 // Mode-B verifier accepts. The returned string is a compact JWS
 // (header.payload.signature, all base64url, no padding).
 //

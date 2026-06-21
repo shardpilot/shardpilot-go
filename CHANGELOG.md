@@ -7,10 +7,10 @@
   re-panics so normal crash behaviour is preserved) and `Client.CapturePanic(ctx,
   recovered)` (report an already-recovered value without re-panicking). Captured
   frames are pre-symbolicated from the Go runtime (package-qualified function, file,
-  line — no native modules or addresses, accepted by the producer per ADR-0223). New
+  line — no native modules or addresses, accepted by the crash ingest API). New
   `ClientOptions.App` (defaulted onto every event; required for auto-capture, and
   `App.ID` must match the API key's app scope) and `ClientOptions.Source` (component
-  slug, ADR-0223) are stamped on events that don't set their own. The report send
+  slug) are stamped on events that don't set their own. The report send
   detaches from the caller's context cancellation/deadline (keeping its values) so a
   panic during graceful shutdown or after a client disconnect is still delivered; a
   nil client is a safe no-op and still re-panics. The runtime panic machinery
@@ -18,14 +18,14 @@
   the SDK's own frames are trimmed so the application origin is the top frame across
   panic kinds. Frame function names are scrubbed as code symbols (email/IP only), not
   free text, so legitimate package-qualified symbols (incl. `player_*`/`user_*` package
-  names) survive; the crash-symbolicator re-scrubs server-side as defense in depth.
+  names) survive; ShardPilot re-scrubs server-side as defense in depth.
 - Added `SignIngestJWT`: an optional, backend-only helper that mints a
-  short-lived ADR-0222 Mode-B per-tenant ingest JWT (HS256) that the
-  analytics-service Mode-B verifier accepts. A trusted Go game-backend can use
+  short-lived Mode-B per-tenant ingest JWT (HS256) that the
+  ShardPilot ingest API's Mode-B verifier accepts. A trusted Go game-backend can use
   it to mint the per-user tokens that client SDKs (Unity/Unreal/Defold) then
   fetch over the studio's own authenticated channel via their `token_provider`
   callback. The helper holds the per-tenant signing secret obtained out-of-band
-  from control-plane (`SigningKey{KID, Secret}`, secret as raw `[]byte`), and
+  from ShardPilot (`SigningKey{KID, Secret}`, secret as raw `[]byte`), and
   signs a conformant token: header `alg=HS256` + `kid`; claims `iss`/`aud`/`sub`/
   `iat`/`exp`/`scope=analytics:ingest`/`workspace_id`/`app_id`/`environment_id`
   and optional `bind_anon`. Lifetime defaults to 5m — equal to the server's 5m
@@ -112,7 +112,7 @@
 
 ## v0.2.0-alpha — 2026-05-24 — crash SDK alpha
 
-- Adds `pkg/crash` with ADR-0191 event types, UUIDv7 crash IDs, sanitized
+- Adds `pkg/crash` with typed crash event types, UUIDv7 crash IDs, sanitized
   breadcrumbs, no-PII scrubbing, fatal/non-fatal emit APIs, default non-fatal
   sampling, and a crash reporting example.
 - Keeps the existing v0.1.x analytics API unchanged.
