@@ -79,7 +79,7 @@ A runnable example lives in [`examples/crash`](examples/crash). It demonstrates 
 import "github.com/shardpilot/shardpilot-go/pkg/crash"
 
 client, err := crash.NewClient(crash.ClientOptions{
-    IngestURL: os.Getenv("SHARDPILOT_CRASH_SYMBOLICATOR_URL"),
+    IngestURL: os.Getenv("SHARDPILOT_CRASH_INGEST_URL"),
     APIKey:    os.Getenv("SHARDPILOT_API_KEY"),
 })
 if err != nil {
@@ -121,7 +121,7 @@ For Go services you can capture panics automatically instead of building `Event`
 
 ```go
 client, err := crash.NewClient(crash.ClientOptions{
-    IngestURL: os.Getenv("SHARDPILOT_CRASH_SYMBOLICATOR_URL"),
+    IngestURL: os.Getenv("SHARDPILOT_CRASH_INGEST_URL"),
     APIKey:    os.Getenv("SHARDPILOT_API_KEY"),
     App:       crash.AppInfo{ID: "fortress-fury", Version: "1.4.0"},
     Source:    "main-server", // which component/repo this crash came from
