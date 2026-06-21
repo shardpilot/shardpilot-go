@@ -249,8 +249,8 @@ Pre-v1; the API is explicitly unstable. From the changelog `[Unreleased]`:
 
 ## Related
 
-- The **ShardPilot platform** receives the event batches, consent decisions, and crash reports this SDK sends, and mints and introspects the ingest tokens and API keys it uses.
-- Sibling client SDKs for game engines: Unity, Unreal, and [`shardpilot-defold`](https://github.com/shardpilot/shardpilot-defold).
+- The **ShardPilot platform** receives the event batches, consent decisions, and crash reports this SDK sends, and issues and introspects the ingest API keys and per-tenant signing secrets it uses (this backend SDK mints the short-lived per-tenant JWT itself via `SignIngestJWT`).
+- Sibling client SDK: [`shardpilot-defold`](https://github.com/shardpilot/shardpilot-defold) — the public Defold engine SDK.
 - Developer documentation for the ingest API and SDKs is planned for `docs.shardpilot.com`.
 
 ## License
