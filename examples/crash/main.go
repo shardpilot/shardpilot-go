@@ -15,10 +15,10 @@ func main() {
 		This example only demonstrates the client API surface with a synthetic
 		stub event; it does not install a panic handler or capture a real crash.
 	*/
-	ingestURL := os.Getenv("SHARDPILOT_CRASH_SYMBOLICATOR_URL")
+	ingestURL := os.Getenv("SHARDPILOT_CRASH_INGEST_URL")
 	apiKey := os.Getenv("SHARDPILOT_API_KEY")
 	if ingestURL == "" || apiKey == "" {
-		log.Fatal("SHARDPILOT_CRASH_SYMBOLICATOR_URL and SHARDPILOT_API_KEY are required")
+		log.Fatal("SHARDPILOT_CRASH_INGEST_URL and SHARDPILOT_API_KEY are required")
 	}
 
 	client, err := crash.NewClient(crash.ClientOptions{

@@ -310,7 +310,7 @@ func normalizeIngestURL(raw string) (string, error) {
 		return "", fmt.Errorf("%w: ingest url must not include a fragment", ErrInvalidConfig)
 	}
 	if parsed.Path != "" && parsed.Path != "/" {
-		return "", fmt.Errorf("%w: ingest url must be the crash-symbolicator base URL", ErrInvalidConfig)
+		return "", fmt.Errorf("%w: ingest url must be the crash ingest base URL", ErrInvalidConfig)
 	}
 	parsed.Path = ""
 	parsed.RawPath = ""
