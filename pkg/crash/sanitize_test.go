@@ -204,16 +204,17 @@ func TestSanitizeSymbolKeepsGoSymbolsButStripsPII(t *testing.T) {
 			t.Errorf("sanitizeSymbol(%q) = %q, want it preserved", s, got)
 		}
 	}
-	// Only an embedded email or IP blanks a symbol — content that never appears in a
-	// legitimate Go symbol.
-	strip := []string{
-		"pkg.handler@example.invalid",
-		"node.198.51.100.23.handler",
-		"handler_2001:db8::1",
+	// An embedded email or IP — content that never appears in a legitimate Go symbol — is
+	// redacted IN PLACE, not blanked whole: blanking would make a pre-symbolicated frame
+	// identity-less and drop the crash. Assert the PII run is gone from the output.
+	stripped := map[string]string{
+		"node.198.51.100.23.handler":  "198.51.100.23",
+		"handler_2001:db8::1":         "2001:db8::1",
+		"pkg.handler@example.invalid": "@",
 	}
-	for _, s := range strip {
-		if got := sanitizeSymbol(s); got != "" {
-			t.Errorf("sanitizeSymbol(%q) = %q, want blanked", s, got)
+	for s, pii := range stripped {
+		if got := sanitizeSymbol(s); strings.Contains(got, pii) {
+			t.Errorf("sanitizeSymbol(%q) = %q, still carries PII %q", s, got, pii)
 		}
 	}
 }
