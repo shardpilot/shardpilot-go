@@ -170,6 +170,8 @@ Consent decisions ride their own endpoint (`POST {IngestURL}/v1/consent`), never
 
 Crash reports go to `POST {base}/api/v1/crashes/ingest` (`Authorization: Bearer <api-key-with-crash:write>`) with a stable `crash_id`, `occurred_at`, app/platform/os, device & context maps, exception metadata, binary modules with `debug_id`/`load_address`, per-thread raw instruction addresses, optional pre-symbolicated frames, optional `raw_text`, and breadcrumbs. The crash structs are a **hand-maintained mirror** of the ShardPilot crash ingest API's OpenAPI schema.
 
+The ingest response is surfaced through the optional `ClientOptions.OnResult func(Result)` callback (fired on both manual `Emit`/`EmitFatal` and the auto-capture path, on the calling goroutine): `Result` carries the server-assigned `CrashID`/`Fingerprint`, a `Suppressed` flag (the crash was accepted but **not stored** because the actor withheld consent — the HTTP status is still `2xx`), and any `Warnings`. Suppression and warnings are also logged. When a `429`/`5xx` carries a `Retry-After` header (delta-seconds or HTTP-date), the retry loop waits that long (clamped to a safe maximum) instead of the fixed backoff.
+
 ## Privacy & consent
 
 - `SetConsent(analyticsGranted bool)` is tri-state: **unknown** (initial, pipeline open), **granted** (open), **denied** (events dropped at enqueue with `ErrConsentDenied`; pending queue cleared and in-flight batch aborted — cleared events count as `Dropped`, never `Published`).

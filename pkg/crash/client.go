@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -30,6 +31,7 @@ type Client struct {
 	breadcrumbs  *breadcrumbRing
 	maxAttempts  int
 	retryBackoff time.Duration
+	onResult     func(Result)
 }
 
 type ClientOptions struct {
@@ -50,6 +52,25 @@ type ClientOptions struct {
 	Sampler      Sampler
 	MaxAttempts  int
 	RetryBackoff time.Duration
+	// OnResult, when set, is called after each successful ingest with the server's
+	// Result (whether the crash was suppressed, plus any warnings). It runs on the
+	// calling goroutine — including the auto-capture path during a panic — so keep it
+	// fast and non-blocking; a panic inside it is recovered and ignored.
+	OnResult func(Result)
+}
+
+// Result is the outcome of a crash ingest, parsed from the server's response.
+type Result struct {
+	// CrashID echoes the id of the accepted crash.
+	CrashID string
+	// Fingerprint is the server-assigned grouping fingerprint (empty when suppressed).
+	Fingerprint string
+	// Suppressed is true when the server accepted the request (2xx) but did NOT store the
+	// crash because the actor withheld consent. Callers that need delivery confirmation
+	// must check this — the HTTP status alone is 2xx in this case.
+	Suppressed bool
+	// Warnings are non-fatal processing notices the server attached to the response.
+	Warnings []string
 }
 
 type Logger interface {
@@ -62,6 +83,14 @@ type Sampler interface {
 
 type HTTPStatusError struct {
 	StatusCode int
+	// RetryAfter is the delay the server asked the client to wait before retrying,
+	// parsed from the Retry-After response header. Zero when absent, unparseable, or an
+	// explicit "retry now" (0); use a present value via the retry loop, which distinguishes
+	// the two internally.
+	RetryAfter time.Duration
+	// retryAfterPresent reports whether the server actually sent a Retry-After (even "0").
+	// The retry loop honors a present value over the fixed backoff; an absent one falls back.
+	retryAfterPresent bool
 }
 
 func (e *HTTPStatusError) Error() string {
@@ -114,6 +143,7 @@ func NewClient(opts ClientOptions) (*Client, error) {
 		breadcrumbs:  newBreadcrumbRing(),
 		maxAttempts:  maxAttempts,
 		retryBackoff: retryBackoff,
+		onResult:     opts.OnResult,
 	}, nil
 }
 
@@ -154,7 +184,12 @@ func (c *Client) emit(ctx context.Context, event Event, fatal, trustedFrameFunct
 	if !fatal && c.sampler != nil && !c.sampler.ShouldEmit(prepared) {
 		return nil
 	}
-	return c.post(ctx, prepared)
+	result, err := c.post(ctx, prepared)
+	if err != nil {
+		return err
+	}
+	c.notifyResult(result)
+	return nil
 }
 
 func (c *Client) prepareEvent(event Event, trustedFrameFunctions bool) (Event, error) {
@@ -199,39 +234,46 @@ func (c *Client) prepareEvent(event Event, trustedFrameFunctions bool) (Event, e
 	return sanitized, nil
 }
 
-func (c *Client) post(ctx context.Context, event Event) error {
+func (c *Client) post(ctx context.Context, event Event) (Result, error) {
 	var lastErr error
 	for attempt := 1; attempt <= c.maxAttempts; attempt++ {
-		err := c.postOnce(ctx, event)
+		result, err := c.postOnce(ctx, event)
 		if err == nil {
-			return nil
+			return result, nil
 		}
 		lastErr = err
 		if attempt >= c.maxAttempts || !retryableError(err) {
-			return err
+			return Result{}, err
 		}
-		if waitErr := sleepContext(ctx, c.retryBackoff*time.Duration(attempt)); waitErr != nil {
-			return waitErr
+		backoff := c.retryBackoff * time.Duration(attempt)
+		// Honor a server-supplied Retry-After (e.g. a gateway 429) over the fixed backoff,
+		// including an explicit "retry now" (0); fall back to the fixed backoff only when
+		// the server sent no Retry-After.
+		if retryAfter, ok := retryAfterFromError(err); ok {
+			backoff = retryAfter
+		}
+		if waitErr := sleepContext(ctx, backoff); waitErr != nil {
+			return Result{}, waitErr
 		}
 	}
-	return lastErr
+	return Result{}, lastErr
 }
 
-func (c *Client) postOnce(ctx context.Context, event Event) error {
+func (c *Client) postOnce(ctx context.Context, event Event) (Result, error) {
 	if err := c.validateReady(); err != nil {
-		return err
+		return Result{}, err
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	payload, err := json.Marshal(event)
 	if err != nil {
-		return fmt.Errorf("encode shardpilot crash event: %w", err)
+		return Result{}, fmt.Errorf("encode shardpilot crash event: %w", err)
 	}
 
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.ingestURL, bytes.NewReader(payload))
 	if err != nil {
-		return fmt.Errorf("create shardpilot crash ingest request: %w", err)
+		return Result{}, fmt.Errorf("create shardpilot crash ingest request: %w", err)
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer "+c.apiKey)
@@ -239,17 +281,131 @@ func (c *Client) postOnce(ctx context.Context, event Event) error {
 	response, err := c.httpClient.Do(request)
 	if err != nil {
 		c.logf("shardpilot crash ingest request failed: %v", err)
-		return fmt.Errorf("send shardpilot crash ingest request: %w", err)
+		return Result{}, fmt.Errorf("send shardpilot crash ingest request: %w", err)
 	}
 	defer response.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 4096))
 
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		err := &HTTPStatusError{StatusCode: response.StatusCode}
-		c.logf("shardpilot crash ingest failed: %v", err)
-		return err
+		// Drain a bounded amount for connection reuse without buffering the unused
+		// error body into a retained slice.
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseBodyBytes))
+		retryAfter, present := parseRetryAfter(response.Header.Get("Retry-After"))
+		statusErr := &HTTPStatusError{
+			StatusCode:        response.StatusCode,
+			RetryAfter:        retryAfter,
+			retryAfterPresent: present,
+		}
+		c.logf("shardpilot crash ingest failed: %v", statusErr)
+		return Result{}, statusErr
 	}
-	return nil
+
+	body, _ := io.ReadAll(io.LimitReader(response.Body, maxResponseBodyBytes))
+	result := parseResult(body)
+	if result.Suppressed {
+		c.logf("shardpilot crash ingest suppressed: actor consent withheld, crash not stored")
+	}
+	for _, warning := range result.Warnings {
+		c.logf("shardpilot crash ingest warning: %s", warning)
+	}
+	return result, nil
+}
+
+const (
+	// maxResponseBodyBytes caps how much of the ingest response is read for parsing.
+	maxResponseBodyBytes = 1 << 20
+	// maxRetryAfter caps a server-supplied Retry-After so a hostile or buggy value cannot
+	// stall a reporting goroutine — which, on the auto-capture path, runs during crash
+	// handling — for an unbounded time.
+	maxRetryAfter = 2 * time.Minute
+	// maxRetryAfterSeconds is maxRetryAfter in whole seconds; the seconds form is clamped
+	// against it BEFORE multiplying so a huge value cannot overflow time.Duration.
+	maxRetryAfterSeconds = int(maxRetryAfter / time.Second)
+)
+
+// parseResult best-effort decodes the crash ingest response. A malformed or empty body
+// yields the zero Result and never turns a 2xx into a failure.
+func parseResult(body []byte) Result {
+	var payload struct {
+		CrashID     string   `json:"crash_id"`
+		Fingerprint string   `json:"fingerprint"`
+		Suppressed  bool     `json:"suppressed"`
+		Warnings    []string `json:"warnings"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return Result{}
+	}
+	return Result{
+		CrashID:     payload.CrashID,
+		Fingerprint: payload.Fingerprint,
+		Suppressed:  payload.Suppressed,
+		Warnings:    payload.Warnings,
+	}
+}
+
+// parseRetryAfter parses a Retry-After header (delta-seconds or an HTTP-date). The bool
+// reports whether a valid value was present: an explicit "0" (or an already-elapsed date)
+// returns (0, true) — retry now — distinct from an absent or malformed header (0, false),
+// which leaves the caller on its fixed backoff. The duration is clamped to [0, maxRetryAfter].
+func parseRetryAfter(value string) (time.Duration, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0, false
+	}
+	if seconds, err := strconv.Atoi(value); err == nil {
+		switch {
+		case seconds < 0:
+			return 0, false
+		case seconds == 0:
+			return 0, true
+		case seconds > maxRetryAfterSeconds:
+			// Clamp before multiplying so a huge value cannot overflow time.Duration.
+			return maxRetryAfter, true
+		default:
+			return time.Duration(seconds) * time.Second, true
+		}
+	} else if errors.Is(err, strconv.ErrRange) {
+		// A value too large to fit an int (e.g. a 20-digit header) still means "wait a
+		// long time" → clamp to the cap; a hugely negative one is malformed.
+		if strings.HasPrefix(value, "-") {
+			return 0, false
+		}
+		return maxRetryAfter, true
+	}
+	if when, err := http.ParseTime(value); err == nil {
+		return clampRetryAfter(time.Until(when)), true
+	}
+	return 0, false
+}
+
+func clampRetryAfter(d time.Duration) time.Duration {
+	switch {
+	case d <= 0:
+		return 0
+	case d > maxRetryAfter:
+		return maxRetryAfter
+	default:
+		return d
+	}
+}
+
+// retryAfterFromError returns the server-requested retry delay carried by an
+// *HTTPStatusError and whether one was present (an explicit "0" is present, retry now).
+func retryAfterFromError(err error) (time.Duration, bool) {
+	var statusErr *HTTPStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.RetryAfter, statusErr.retryAfterPresent
+	}
+	return 0, false
+}
+
+// notifyResult invokes the optional OnResult callback, guarding against a panic in user
+// code — which, on the auto-capture path, would re-enter crash handling.
+func (c *Client) notifyResult(result Result) {
+	if c == nil || c.onResult == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	c.onResult(result)
 }
 
 func (c *Client) validateReady() error {

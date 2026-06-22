@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- `pkg/crash` now surfaces the ingest response and honors server backpressure. A new
+  optional `ClientOptions.OnResult func(Result)` callback reports the server's per-crash
+  `Result` — the assigned `CrashID`/`Fingerprint`, a `Suppressed` flag (the crash was
+  accepted but **not stored** because the actor withheld consent, so the `2xx` alone is not
+  delivery confirmation), and any `Warnings` — on both manual `Emit`/`EmitFatal` and the
+  auto-capture path; suppression and warnings are also logged. The retry loop now honors a
+  `Retry-After` response header (delta-seconds or HTTP-date, clamped to a safe maximum) on a
+  `429`/`5xx`, falling back to the fixed backoff when absent. `Emit`/`EmitFatal` signatures
+  are unchanged; the previously discarded response body is now read (best-effort — a 2xx with
+  an unparseable body is still treated as accepted).
+
 - Added automatic panic capture to `pkg/crash`: `Client.Recover(ctx)` (defer at a
   goroutine / request-handler boundary — reports the panic as a fatal crash, then
   re-panics so normal crash behaviour is preserved) and `Client.CapturePanic(ctx,
