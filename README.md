@@ -71,6 +71,8 @@ err = client.Track(context.Background(), shardpilot.Event{
 
 Pick events whose canonical schema allows your configured `Source`. Session/screen events (e.g. `app.session_started`, `app.screen_view`) are client-source-only — a backend client cannot legally send them; backend clients send backend-source events such as `purchase` or `economy_tx`.
 
+> **`session_id` is required for non-`backend` sources.** The ingest API requires a `session_id` on every event whose `source` is not `backend` (i.e. `SourceClient` / `SourceServer`). This is a backend/service-tier SDK and does **not** manage a session lifecycle — it passes `Event.SessionID` and `Event.SessionSequence` through verbatim. So if you configure a non-`backend` `Source`, you must set `SessionID` (and a monotonic `SessionSequence`) on each event yourself; an event with no `session_id` is rejected (`400`) and, because per-event statuses are not surfaced, the **whole batch is dropped silently**. `SourceBackend` events do not require a session. (The client SDKs — Unity, Unreal, Defold — open and number sessions automatically; this SDK is deliberately pass-through, since a backend rarely has a single per-process session.)
+
 ## Quick start (crash reporting)
 
 A runnable example lives in [`examples/crash`](examples/crash). It demonstrates the client API surface with a synthetic stub event; it does not install a panic handler or capture a real crash.
