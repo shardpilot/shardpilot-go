@@ -211,7 +211,7 @@ if err != nil {
 // Hand `token` to exactly one client over an authenticated channel. NEVER log it.
 ```
 
-Defaults: issuer `project-tower-main-server`, audience `analytics-service`, lifetime 5m (equal to the server's 5m `iat`-age window, which the verifier enforces regardless of `exp`; capped at the server's 15m max). Override with `WithIngestIssuer` / `WithIngestAudience` / `WithIngestLifetime` (plus `WithIngestNow` / `WithIngestClock` for tests). Scope is fixed to `analytics:ingest`. Every input is validated at mint time, so a returned token is never rejected downstream for a malformed claim. The secret is `[]byte` (never logged); `SigningKey.ZeroSecret()` wipes a copy.
+Defaults: issuer `shardpilot`, audience `shardpilot-ingest`, lifetime 5m (equal to the server's 5m `iat`-age window, which the verifier enforces regardless of `exp`; capped at the server's 15m max). Override with `WithIngestIssuer` / `WithIngestAudience` / `WithIngestLifetime` (plus `WithIngestNow` / `WithIngestClock` for tests). Scope is fixed to `analytics:ingest`. Every input is validated at mint time, so a returned token is never rejected downstream for a malformed claim. The secret is `[]byte` (never logged); `SigningKey.ZeroSecret()` wipes a copy.
 
 ## Project layout
 

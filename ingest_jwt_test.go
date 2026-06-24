@@ -264,7 +264,7 @@ func TestSignIngestJWT_CustomIssuerAudienceLifetime(t *testing.T) {
 		EnvironmentID: "env2",
 	},
 		WithIngestIssuer("my-game-backend"),
-		WithIngestAudience("analytics-service"),
+		WithIngestAudience("my-analytics"),
 		WithIngestLifetime(5*time.Minute),
 		WithIngestNow(func() time.Time { return now }),
 	)
@@ -281,7 +281,7 @@ func TestSignIngestJWT_CustomIssuerAudienceLifetime(t *testing.T) {
 	if got := time.Duration(exp-iat) * time.Second; got != 5*time.Minute {
 		t.Errorf("lifetime=%s, want 5m", got)
 	}
-	assertVerifierContract(t, pt, now, "my-game-backend", "analytics-service", "u2")
+	assertVerifierContract(t, pt, now, "my-game-backend", "my-analytics", "u2")
 }
 
 // ---------------------------------------------------------------------------
