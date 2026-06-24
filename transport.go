@@ -16,10 +16,23 @@ type transport interface {
 	PublishConsent(ctx context.Context, request consentRequest) (consentResult, error)
 }
 
+// batchResult is the wire decode of the events:batch response (HTTP 202).
+// It is mapped to the public BatchResult before it leaves the SDK; see
+// batch_result.go.
 type batchResult struct {
-	Accepted   int `json:"accepted"`
-	Rejected   int `json:"rejected"`
-	Duplicates int `json:"duplicates"`
+	Accepted   int                    `json:"accepted"`
+	Rejected   int                    `json:"rejected"`
+	Duplicates int                    `json:"duplicates"`
+	Events     []batchEventStatusWire `json:"events"`
+}
+
+// batchEventStatusWire is the wire decode of one per-event outcome in the
+// batch response.
+type batchEventStatusWire struct {
+	EventID string `json:"event_id"`
+	Status  string `json:"status"`
+	Code    string `json:"code,omitempty"`
+	Message string `json:"message,omitempty"`
 }
 
 type HTTPStatusError struct {
