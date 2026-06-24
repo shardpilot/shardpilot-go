@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- The analytics client now surfaces the ingest endpoint's per-event outcomes instead of
+  discarding them. The `202` batch response carries an `events[]` list (one `event_id` +
+  `status` + optional `code`/`message` per event), and a new optional
+  `Config.OnBatchResult func(BatchResult)` callback reports it after each successful batch
+  publish — the only way to learn which individual events the server **rejected**,
+  **suppressed** for withheld consent (`suppressed_no_consent` /
+  `suppressed_ad_revenue_consent` — the `2xx` alone is not delivery confirmation),
+  **observed** (event name not registered), or folded as **duplicates**. The callback runs
+  on the publish path (the background flush worker and synchronous `Track` publishes share
+  it, so it may be called concurrently); keep it fast and non-blocking, and a panic inside it
+  is recovered so a buggy callback cannot stop delivery. `Snapshot()` gains a
+  `Stats.ByStatus map[EventStatus]uint64` per-status breakdown folded from the same list (the
+  existing `Accepted`/`Rejected`/`Duplicates` aggregate counters are unchanged). The public
+  `Track`/`Enqueue`/`Flush`/`Snapshot` signatures are unchanged; this is purely additive.
+  (Partial-batch acceptance on a permanent `4xx` and a bounded disk-spool remain follow-ups,
+  marked with TODOs in the source.)
+
 - `pkg/crash` now surfaces the ingest response and honors server backpressure. A new
   optional `ClientOptions.OnResult func(Result)` callback reports the server's per-crash
   `Result` — the assigned `CrashID`/`Fingerprint`, a `Suppressed` flag (the crash was

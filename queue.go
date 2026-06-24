@@ -1,5 +1,11 @@
 package shardpilot
 
+// boundedQueue is an in-memory, bounded event buffer. It is intentionally
+// memory-only: events still buffered when the process exits are lost.
+//
+// TODO: optional bounded disk-spool for at-least-once delivery across
+// restarts, with a retry-age cap and a dead-letter callback for events that
+// cannot be delivered before they age out.
 type boundedQueue struct {
 	ch chan Event
 }

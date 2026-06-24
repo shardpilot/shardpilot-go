@@ -426,7 +426,19 @@ func (c *Client) publishBatchWithContext(ctx context.Context, events []Event) er
 		return err
 	}
 	c.stats.recordBatch(result, len(events))
+	c.notifyBatchResult(result.toPublic())
 	return nil
+}
+
+// notifyBatchResult invokes the optional OnBatchResult callback with the
+// publish outcome, guarding against a panic in user code so a buggy callback
+// cannot take down the background flush worker.
+func (c *Client) notifyBatchResult(result BatchResult) {
+	if c.cfg.OnBatchResult == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	c.cfg.OnBatchResult(result)
 }
 
 func contextDone(ctx context.Context) <-chan struct{} {
@@ -457,6 +469,11 @@ func (c *Client) prepareEvent(event Event) (Event, error) {
 	return event, nil
 }
 
+// TODO: partial-batch acceptance. A permanent 4xx (e.g. one invalid event)
+// currently drops the whole batch, discarding the events the server would
+// still accept. Once the ingest envelope reports which events failed on a
+// 4xx (the same per-event statuses BatchResult already exposes on a 202),
+// retain and re-publish the still-valid events instead of dropping them all.
 func isPermanentPublishError(err error) bool {
 	if errors.Is(err, ErrInvalidEvent) {
 		return true

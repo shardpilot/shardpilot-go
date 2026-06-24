@@ -13,7 +13,7 @@ Real, tested, working code — **early alpha**. The API is pre-v1 and may change
 ## What it does
 
 - Builds and sends app-first event envelopes to `POST {IngestURL}/v1/events:batch` with bearer-token auth.
-- Synchronous `Track`, bounded async `Enqueue`, `Flush`, and `Close`; in-memory delivery stats via `Snapshot`.
+- Synchronous `Track`, bounded async `Enqueue`, `Flush`, and `Close`; in-memory delivery stats via `Snapshot` (including a per-status breakdown in `Stats.ByStatus`), plus an optional `OnBatchResult` callback that surfaces the server's per-event outcomes (which events were rejected, suppressed, observed, or folded as duplicates).
 - Bounded batching (default 25 events, capped at 100) with retry of retryable HTTP responses; memory-only queue (no durable on-disk queue).
 - Optional explicit analytics consent (`SetConsent` / `Consent`) with a separate `POST {IngestURL}/v1/consent` endpoint.
 - Opt-in `LoadOrCreateAnonymousID(path)` helper for a persisted UUIDv7 anonymous identifier.
@@ -157,6 +157,7 @@ Captured frames are **pre-symbolicated** from the Go runtime (package-qualified 
 | `HTTPTimeout` | no | Default 2s. |
 | `Logger` | no | `Printf`-style logger; never receives tokens or full payloads. |
 | `AllowInsecurePrivateNetwork` | no | Allow plain HTTP to RFC1918 private addresses. |
+| `OnBatchResult` | no | `func(BatchResult)` called after each successful batch publish with the server's per-event outcomes. Runs on the publish path (may be called concurrently); keep it fast and non-blocking. A panic inside it is recovered. |
 
 The example programs read these from `SHARDPILOT_*` environment variables; the SDK itself reads no environment variables.
 
@@ -167,6 +168,8 @@ Crash client (`crash.ClientOptions`): `IngestURL` (crash ingest base URL), `APIK
 App-first event envelope (`POST {IngestURL}/v1/events:batch`, `Authorization: Bearer <token>`). Each envelope carries `event_id`, `schema_version`, `event_name`, `source`, `event_ts`, `workspace_id`, `app_id`, `environment_id`, and optional `user_id`, `anonymous_id`, `session_id`, `session_sequence`, `platform`, `app_version`, `app_build`, `context`, `props`.
 
 The envelope is **universal** — no domain-specific fields. Vertical context (e.g. `match_id`) goes in `Props` and serializes under `props`. **Banned legacy fields** never appear in SDK source or on the wire: `project_id`, `game_id`, `env`, `event_ts_server`, `event_seq_session`, top-level `build_version`. Use `app_version` / `app_build` for version metadata.
+
+The `202` batch response carries the aggregate `accepted` / `rejected` / `duplicates` counts plus an `events[]` list with one entry per event (`event_id`, `status`, optional `code` / `message`). `status` is one of `accepted`, `observed` (`event_name` not registered), `duplicate`, `suppressed_no_consent`, `suppressed_ad_revenue_consent`, or `rejected` — for suppressed events the `202` is **not** delivery confirmation. The aggregate counts fold into `Snapshot()` (with the full per-status breakdown in `Stats.ByStatus`), and the per-event list is surfaced through the optional `Config.OnBatchResult func(BatchResult)` callback — the only way to learn which individual events the server rejected, suppressed, observed, or folded as duplicates. The callback runs on the publish path (the background flush worker and synchronous `Track` publishes share it, so it may be called concurrently); keep it fast and non-blocking, and a panic inside it is recovered so a buggy callback cannot stop delivery.
 
 Consent decisions ride their own endpoint (`POST {IngestURL}/v1/consent`), never the event envelope, with body `workspace_id`, `app_id`, `environment_id`, `actor_identifier`, `categories` (`{"analytics": <bool>}`), `decided_at` (RFC3339), and a fresh UUIDv7 `idempotency_key`.
 
@@ -214,7 +217,7 @@ Defaults: issuer `project-tower-main-server`, audience `analytics-service`, life
 
 | Path | What it is |
 |---|---|
-| `client.go`, `queue.go`, `transport.go`, `envelope.go` | Analytics client: lifecycle, bounded queue, HTTP transport, envelope builder. |
+| `client.go`, `queue.go`, `transport.go`, `envelope.go`, `batch_result.go` | Analytics client: lifecycle, bounded queue, HTTP transport, envelope builder, public batch-response types. |
 | `config.go`, `event.go`, `consent.go`, `metrics.go`, `errors.go` | Config validation, public `Event`, consent state machine, `Stats`, sentinel errors. |
 | `anonymous_id.go`, `ids.go`, `clock.go` | Opt-in anonymous-ID helper, event-ID generation, injectable clock. |
 | `ingest_jwt.go` | Backend-only `SignIngestJWT` Mode-B ingest-JWT mint helper. |

@@ -45,6 +45,22 @@ type Config struct {
 	HTTPTimeout                 time.Duration
 	Logger                      Logger
 	AllowInsecurePrivateNetwork bool
+
+	// OnBatchResult, when set, is called after each successful batch publish
+	// (HTTP 202) with the ingest outcome: the accepted/rejected/duplicate
+	// aggregate plus the per-event status list the endpoint reports. It is the
+	// only way to learn which individual events the server rejected, folded as
+	// duplicates, observed (event_name not registered), or suppressed for
+	// withheld consent — for suppressed events the 202 is not delivery
+	// confirmation. The same per-event statuses are also folded into the
+	// Snapshot().ByStatus aggregate.
+	//
+	// It runs synchronously on the SDK's publish path and may be called
+	// concurrently: the background flush worker and synchronous Track publishes
+	// share it. Keep it fast, non-blocking, and safe for concurrent use. It is
+	// never called when the publish fails at the transport, and a panic inside
+	// it is recovered and ignored so a buggy callback cannot stop delivery.
+	OnBatchResult func(BatchResult)
 }
 
 const (
