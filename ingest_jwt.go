@@ -57,12 +57,12 @@ const (
 	// DefaultIngestIssuer is the issuer the ShardPilot Mode-B verifier
 	// expects by default. Override per
 	// deployment with WithIngestIssuer when the server is configured otherwise.
-	DefaultIngestIssuer = "project-tower-main-server"
+	DefaultIngestIssuer = "shardpilot"
 
 	// DefaultIngestAudience is the audience the ShardPilot Mode-B verifier
 	// expects by default. Override with
 	// WithIngestAudience when the server is configured otherwise.
-	DefaultIngestAudience = "analytics-service"
+	DefaultIngestAudience = "shardpilot-ingest"
 
 	// DefaultIngestLifetime is the default token validity window (exp - iat). It
 	// equals the server's 5m MaxIatAge window so the advertised exp is actually

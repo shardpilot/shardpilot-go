@@ -62,7 +62,9 @@
   window), and
   every input is validated at mint time so a token it returns is never rejected
   downstream for a malformed claim, an over-long subject/anon, or an over-long
-  lifetime. Options: `WithIngestIssuer`/`WithIngestAudience`/`WithIngestLifetime`
+  lifetime. The `iss`/`aud` defaults are the neutral public values `shardpilot` /
+  `shardpilot-ingest` (matching the ingest verifier's defaults); override either per
+  deployment with `WithIngestIssuer`/`WithIngestAudience`/`WithIngestLifetime`
   and `WithIngestNow`/`WithIngestClock` (tests). The HS256 signing is hand-rolled
   (no new dependency; the SDK stays dependency-free) and can only ever emit
   HS256, so algorithm confusion is impossible by construction. The secret is
