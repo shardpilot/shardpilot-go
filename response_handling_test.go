@@ -576,6 +576,50 @@ func TestDeadlineRetryFailureWithoutHintFallsBackToTickCadence(t *testing.T) {
 	}
 }
 
+func TestConsentDenialClearsStaleDeferral(t *testing.T) {
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", "3600")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"code":"rate_limited","message":"ingest rate limit exceeded"}}`))
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"accepted":1,"rejected":0,"duplicates":0}`))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(Config{
+		IngestURL:     server.URL,
+		Token:         "token-value",
+		WorkspaceID:   "workspace-test",
+		AppID:         "app-test",
+		EnvironmentID: "develop",
+		Source:        SourceBackend,
+		BatchSize:     1,
+		FlushInterval: 200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	if err := client.Enqueue(Event{Name: "deferred_then_denied"}); err != nil {
+		t.Fatalf("enqueue first: %v", err)
+	}
+	waitFor(t, 2*time.Second, "the rate-limited attempt", func() bool { return calls.Load() >= 1 })
+
+	// The denial discards the retained batch; the re-grant admits new
+	// events. The stale 1h deadline must not hold them.
+	client.SetConsent(false)
+	client.SetConsent(true)
+	if err := client.Enqueue(Event{Name: "after_regrant"}); err != nil {
+		t.Fatalf("enqueue second: %v", err)
+	}
+	waitFor(t, 3*time.Second, "the post-regrant publish", func() bool { return calls.Load() >= 2 })
+}
+
 func TestExplicitFlushBypassesRetryAfterDeferral(t *testing.T) {
 	var calls atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

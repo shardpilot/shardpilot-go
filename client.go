@@ -280,7 +280,15 @@ func (c *Client) run() {
 		}
 	}()
 	for {
+		hadBatch := len(batch) > 0
 		batch = c.dropBatchOnConsentEpoch(batch, &seenConsentEpoch)
+		if hadBatch && len(batch) == 0 {
+			// A consent denial discarded the batch the deferral was
+			// protecting: clear the deadline too, or a deny→re-grant round
+			// trip would hold FRESH post-grant events behind a stale
+			// Retry-After (up to the 24h clamp) with nothing left to retry.
+			deferUntil = time.Time{}
+		}
 		queueEvents := c.queue.ch
 		if len(batch) >= c.cfg.BatchSize {
 			queueEvents = nil
