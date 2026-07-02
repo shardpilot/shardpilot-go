@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -65,11 +66,11 @@ type HTTPStatusError struct {
 	// Details are the envelope's per-field reasons; nil when absent.
 	Details []ErrorDetail
 
-	// RetryAfter is the server's Retry-After response header (whole seconds,
-	// clamped to 24h), or zero when the header was absent or unparseable. The
-	// background flush worker defers its next automatic publish attempt by at
-	// least this long; synchronous Track callers receive it here and decide
-	// for themselves.
+	// RetryAfter is the server's Retry-After response header — delta-seconds
+	// or HTTP-date form, clamped to 24h — or zero when the header was absent
+	// or unparseable. The background flush worker defers its next automatic
+	// publish attempt by at least this long; synchronous Track callers
+	// receive it here and decide for themselves.
 	RetryAfter time.Duration
 }
 
@@ -235,26 +236,41 @@ func newHTTPStatusError(response *http.Response) *HTTPStatusError {
 	return statusErr
 }
 
-// parseRetryAfter reads a whole-seconds Retry-After header value. Only the
-// delta-seconds form is honored — the HTTP-date form returns zero so the
-// client falls back to its own cadence — and the result is clamped to
-// maxRetryAfter. Absent, negative, or malformed values yield zero. The clamp
-// compares raw seconds, BEFORE the duration conversion: a huge-but-parseable
-// value (above ~9.2e9 seconds) would overflow the nanosecond multiplication
-// and slip past a duration-level clamp as garbage.
+// parseRetryAfter reads a Retry-After header in either standard form —
+// delta-seconds or HTTP-date — mirroring the crash client's handling, and
+// clamps the result to maxRetryAfter. Absent, negative/past, or malformed
+// values yield zero. The delta-seconds clamp compares raw seconds BEFORE the
+// duration conversion: a huge-but-parseable value (above ~9.2e9 seconds)
+// would overflow the nanosecond multiplication and slip past a
+// duration-level clamp as garbage; a value too large even for int64 still
+// means "wait a long time" and clamps rather than being ignored.
 func parseRetryAfter(header string) time.Duration {
 	header = strings.TrimSpace(header)
 	if header == "" {
 		return 0
 	}
-	seconds, err := strconv.ParseInt(header, 10, 64)
-	if err != nil || seconds <= 0 {
-		return 0
-	}
-	if seconds > int64(maxRetryAfter/time.Second) {
+	if seconds, err := strconv.ParseInt(header, 10, 64); err == nil {
+		if seconds <= 0 {
+			return 0
+		}
+		if seconds > int64(maxRetryAfter/time.Second) {
+			return maxRetryAfter
+		}
+		return time.Duration(seconds) * time.Second
+	} else if errors.Is(err, strconv.ErrRange) && !strings.HasPrefix(header, "-") {
 		return maxRetryAfter
 	}
-	return time.Duration(seconds) * time.Second
+	if when, err := http.ParseTime(header); err == nil {
+		retryAfter := time.Until(when)
+		if retryAfter <= 0 {
+			return 0
+		}
+		if retryAfter > maxRetryAfter {
+			return maxRetryAfter
+		}
+		return retryAfter
+	}
+	return 0
 }
 
 func contextWithDefaultTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {

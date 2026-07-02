@@ -5,12 +5,15 @@
 - The analytics client now parses the error envelope on non-2xx ingest responses and honors
   `Retry-After`. `HTTPStatusError` carries the server's machine-readable `ErrorCode`
   (e.g. `rate_limited`, `validation_error`), `ErrorMessage`, the per-field `Details` list,
-  and the whole-seconds `Retry-After` header as a `RetryAfter` duration (delta-seconds form
-  only, clamped to 24h) — `Error()` folds the code and up to five `field:code` detail pairs
+  and the `Retry-After` header as a `RetryAfter` duration (both standard forms —
+  delta-seconds and HTTP-date — clamped to 24h, consistent with the crash client) —
+  `Error()` folds the code and up to five `field:code` detail pairs
   into the message, so logs show `status 429 (rate_limited) [events:events_rate_limited]`
   instead of a bare status. After a rate-limited automatic publish the background flush
   worker now defers its next automatic attempt until the `Retry-After` deadline passes
-  (events keep buffering in the bounded queue meanwhile); explicit `Flush` and `Close`
+  (events keep buffering in the bounded queue meanwhile) and retries AT that deadline via a
+  dedicated wake — not at the next flush tick, which could be much later when
+  `FlushInterval` exceeds the hint; explicit `Flush` and `Close`
   attempts are not gated — they carry caller intent — and a renewed failure re-arms the
   deferral.
 

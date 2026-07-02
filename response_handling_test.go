@@ -105,17 +105,92 @@ func TestParseRetryAfter(t *testing.T) {
 		{"0", 0},
 		{"-3", 0},
 		{"abc", 0},
-		{"Wed, 21 Oct 2026 07:28:00 GMT", 0},
+		// A past HTTP-date means "retry now": no deferral.
+		{"Wed, 21 Oct 2015 07:28:00 GMT", 0},
 		{"999999", maxRetryAfter},
 		// Parseable but beyond the int64 nanosecond range: the clamp must
 		// compare raw seconds, or the duration conversion would overflow.
 		{"99999999999", maxRetryAfter},
 		{"9223372036854775807", maxRetryAfter},
+		// Too large even for int64 still means "wait a long time": clamp,
+		// don't ignore. A hugely negative value stays malformed.
+		{"999999999999999999999", maxRetryAfter},
+		{"-999999999999999999999", 0},
 	}
 	for _, c := range cases {
 		if got := parseRetryAfter(c.header); got != c.want {
 			t.Fatalf("parseRetryAfter(%q) = %v, want %v", c.header, got, c.want)
 		}
+	}
+}
+
+func TestParseRetryAfterHTTPDateForm(t *testing.T) {
+	// A future HTTP-date defers by the distance from now (both standard
+	// header forms are honored, consistent with the crash client).
+	when := time.Now().Add(10 * time.Minute).UTC().Format(http.TimeFormat)
+	got := parseRetryAfter(when)
+	if got < 9*time.Minute || got > 10*time.Minute+time.Second {
+		t.Fatalf("parseRetryAfter(%q) = %v, want ~10m", when, got)
+	}
+
+	// A far-future date clamps to the 24h maximum.
+	farFuture := time.Now().Add(90 * 24 * time.Hour).UTC().Format(http.TimeFormat)
+	if got := parseRetryAfter(farFuture); got != maxRetryAfter {
+		t.Fatalf("parseRetryAfter(far future) = %v, want %v", got, maxRetryAfter)
+	}
+}
+
+func TestDeferralWakeRetriesAtDeadlineNotNextTick(t *testing.T) {
+	var calls atomic.Int64
+	var firstAttempt, secondAttempt atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := calls.Add(1)
+		if call == 1 {
+			firstAttempt.Store(time.Now().UnixMilli())
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"code":"rate_limited","message":"ingest rate limit exceeded"}}`))
+			return
+		}
+		if call == 2 {
+			secondAttempt.Store(time.Now().UnixMilli())
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"accepted":1,"rejected":0,"duplicates":0}`))
+	}))
+	defer server.Close()
+
+	// The flush interval is far LONGER than the 1s Retry-After: the retry
+	// must fire at the backpressure deadline (the dedicated wake), not at
+	// the next flush tick minutes later.
+	client, err := NewClient(Config{
+		IngestURL:     server.URL,
+		Token:         "token-value",
+		WorkspaceID:   "workspace-test",
+		AppID:         "app-test",
+		EnvironmentID: "develop",
+		Source:        SourceBackend,
+		BatchSize:     1,
+		FlushInterval: 10 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	// BatchSize 1: the enqueue itself triggers the first automatic publish.
+	if err := client.Enqueue(Event{Name: "deadline_wake"}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	waitFor(t, 2*time.Second, "first publish attempt", func() bool { return calls.Load() >= 1 })
+	waitFor(t, 5*time.Second, "the deadline-wake retry", func() bool { return calls.Load() >= 2 })
+	gap := secondAttempt.Load() - firstAttempt.Load()
+	if gap < 800 {
+		t.Fatalf("expected the retry to wait out the Retry-After hint, got %dms", gap)
+	}
+	if gap > 4000 {
+		t.Fatalf("expected the retry at the deadline, not the next flush tick, got %dms", gap)
 	}
 }
 

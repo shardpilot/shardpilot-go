@@ -269,11 +269,33 @@ func (c *Client) run() {
 	// are NOT gated: they carry caller intent, and a renewed failure simply
 	// re-arms the deadline.
 	var deferUntil time.Time
+	// deferTimer wakes the worker AT the backpressure deadline, so the held
+	// batch retries when the server said it may — not at the next flush tick,
+	// which can be much later when FlushInterval exceeds the Retry-After. It
+	// is re-armed at the top of every iteration to match the current deadline.
+	var deferTimer *time.Timer
+	defer func() {
+		if deferTimer != nil {
+			deferTimer.Stop()
+		}
+	}()
 	for {
 		batch = c.dropBatchOnConsentEpoch(batch, &seenConsentEpoch)
 		queueEvents := c.queue.ch
 		if len(batch) >= c.cfg.BatchSize {
 			queueEvents = nil
+		}
+		var deferWake <-chan time.Time
+		if remaining := c.deferRemaining(deferUntil); remaining > 0 {
+			if deferTimer == nil {
+				deferTimer = time.NewTimer(remaining)
+			} else {
+				stopAndDrainTimer(deferTimer)
+				deferTimer.Reset(remaining)
+			}
+			deferWake = deferTimer.C
+		} else if deferTimer != nil {
+			stopAndDrainTimer(deferTimer)
 		}
 		select {
 		case event := <-queueEvents:
@@ -286,6 +308,13 @@ func (c *Client) run() {
 				continue
 			}
 			batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil)
+		case <-deferWake:
+			// The backpressure deadline passed: retry the held batch now
+			// rather than waiting out the remainder of the flush interval.
+			if c.publishDeferred(deferUntil) {
+				continue
+			}
+			batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil)
 		case request := <-c.flushRequests:
 			var err error
 			batch, err = c.flushAvailable(request.ctx, batch, &seenConsentEpoch)
@@ -293,6 +322,30 @@ func (c *Client) run() {
 			request.reply <- err
 		case <-c.stop:
 			return
+		}
+	}
+}
+
+// deferRemaining is the time left until the backpressure deadline, or zero
+// when no deferral is active.
+func (c *Client) deferRemaining(deferUntil time.Time) time.Duration {
+	if deferUntil.IsZero() {
+		return 0
+	}
+	remaining := deferUntil.Sub(c.clock.Now())
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+// stopAndDrainTimer stops a timer and drains an already-delivered tick so a
+// later Reset never wakes on a stale expiry.
+func stopAndDrainTimer(timer *time.Timer) {
+	if !timer.Stop() {
+		select {
+		case <-timer.C:
+		default:
 		}
 	}
 }
