@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+- The analytics client now parses the error envelope on non-2xx ingest responses and honors
+  `Retry-After`. `HTTPStatusError` carries the server's machine-readable `ErrorCode`
+  (e.g. `rate_limited`, `validation_error`), `ErrorMessage`, the per-field `Details` list,
+  and the `Retry-After` header as a `RetryAfter` duration (both standard forms —
+  delta-seconds and HTTP-date — parsed like the crash client; the analytics deferral
+  clamps at 24h, while the crash client's short in-process retry loop keeps its own
+  smaller bound) —
+  `Error()` folds the code and up to five `field:code` detail pairs
+  into the message, so logs show `status 429 (rate_limited) [events:events_rate_limited]`
+  instead of a bare status. After a rate-limited automatic publish the background flush
+  worker now defers its next automatic attempt until the `Retry-After` deadline passes
+  (events keep buffering in the bounded queue meanwhile) and retries AT that deadline via a
+  dedicated wake — not at the next flush tick, which could be much later when
+  `FlushInterval` exceeds the hint. The server's latest hint wins (a fresh shorter value
+  replaces an earlier longer deadline), and an explicit `Retry-After: 0` — "retry now" — is
+  honored as an immediate retry (with a tiny anti-hot-loop spacing floor). Explicit `Flush`
+  and `Close` attempts are not gated — they carry caller intent — a renewed failure re-arms
+  the deferral, and a flush that leaves nothing retained (delivered or permanently dropped)
+  clears any stale deadline so later events are never held behind it.
+
+- Event ids and timestamps are now stamped once when an event is accepted (`Track`/`Enqueue`)
+  rather than on each publish attempt, so every retry of a batch re-sends byte-identical
+  event identities and the ingest service folds re-sends as duplicates instead of storing
+  them twice. Caller-supplied `Event.ID`/`Event.Timestamp` values are used unchanged, as
+  before.
+
 - The analytics client now surfaces the ingest endpoint's per-event outcomes instead of
   discarding them. The `202` batch response carries an `events[]` list (one `event_id` +
   `status` + optional `code`/`message` per event), and a new optional
