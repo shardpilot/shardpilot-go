@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- The analytics client now parses the error envelope on non-2xx ingest responses and honors
+  `Retry-After`. `HTTPStatusError` carries the server's machine-readable `ErrorCode`
+  (e.g. `rate_limited`, `validation_error`), `ErrorMessage`, the per-field `Details` list,
+  and the whole-seconds `Retry-After` header as a `RetryAfter` duration (delta-seconds form
+  only, clamped to 24h) — `Error()` folds the code and up to five `field:code` detail pairs
+  into the message, so logs show `status 429 (rate_limited) [events:events_rate_limited]`
+  instead of a bare status. After a rate-limited automatic publish the background flush
+  worker now defers its next automatic attempt until the `Retry-After` deadline passes
+  (events keep buffering in the bounded queue meanwhile); explicit `Flush` and `Close`
+  attempts are not gated — they carry caller intent — and a renewed failure re-arms the
+  deferral.
+
+- Event ids and timestamps are now stamped once when an event is accepted (`Track`/`Enqueue`)
+  rather than on each publish attempt, so every retry of a batch re-sends byte-identical
+  event identities and the ingest service folds re-sends as duplicates instead of storing
+  them twice. Caller-supplied `Event.ID`/`Event.Timestamp` values are used unchanged, as
+  before.
+
 - The analytics client now surfaces the ingest endpoint's per-event outcomes instead of
   discarding them. The `202` batch response carries an `events[]` list (one `event_id` +
   `status` + optional `code`/`message` per event), and a new optional

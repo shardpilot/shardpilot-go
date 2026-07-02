@@ -261,6 +261,14 @@ func (c *Client) run() {
 
 	batch := make([]Event, 0, c.cfg.BatchSize)
 	seenConsentEpoch := c.consentEpoch.Load()
+	// deferUntil is the server-backpressure deadline: after a retryable
+	// failure that carried a Retry-After hint, automatic publishes (batch-full
+	// and flush-interval ticks) hold off until it passes. Events keep
+	// accumulating in the batch and the queue meanwhile — the bounded queue is
+	// the backpressure surface. Explicit Flush (and therefore Close) attempts
+	// are NOT gated: they carry caller intent, and a renewed failure simply
+	// re-arms the deadline.
+	var deferUntil time.Time
 	for {
 		batch = c.dropBatchOnConsentEpoch(batch, &seenConsentEpoch)
 		queueEvents := c.queue.ch
@@ -270,17 +278,45 @@ func (c *Client) run() {
 		select {
 		case event := <-queueEvents:
 			batch = append(batch, event)
-			if len(batch) >= c.cfg.BatchSize {
-				batch = c.publishWorkerBatch(batch, &seenConsentEpoch)
+			if len(batch) >= c.cfg.BatchSize && !c.publishDeferred(deferUntil) {
+				batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil)
 			}
 		case <-ticker.C:
-			batch = c.publishWorkerBatch(batch, &seenConsentEpoch)
+			if c.publishDeferred(deferUntil) {
+				continue
+			}
+			batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil)
 		case request := <-c.flushRequests:
 			var err error
 			batch, err = c.flushAvailable(request.ctx, batch, &seenConsentEpoch)
+			c.applyRetryAfter(err, &deferUntil)
 			request.reply <- err
 		case <-c.stop:
 			return
+		}
+	}
+}
+
+// publishDeferred reports whether the server-backpressure deadline is still
+// in the future, i.e. automatic publishes should hold off.
+func (c *Client) publishDeferred(deferUntil time.Time) bool {
+	return !deferUntil.IsZero() && c.clock.Now().Before(deferUntil)
+}
+
+// applyRetryAfter re-arms or clears the worker's backpressure deadline from a
+// publish outcome: a retryable failure that carried a Retry-After hint defers
+// the next automatic attempt at least that long (never shortening an already
+// later deadline); a fully successful outcome clears it.
+func (c *Client) applyRetryAfter(err error, deferUntil *time.Time) {
+	if err == nil {
+		*deferUntil = time.Time{}
+		return
+	}
+	var statusErr *HTTPStatusError
+	if errors.As(err, &statusErr) && statusErr.Retryable() && statusErr.RetryAfter > 0 {
+		deadline := c.clock.Now().Add(statusErr.RetryAfter)
+		if deadline.After(*deferUntil) {
+			*deferUntil = deadline
 		}
 	}
 }
@@ -345,7 +381,7 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 	}
 }
 
-func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64) []Event {
+func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, deferUntil *time.Time) []Event {
 	batch = c.dropBatchOnConsentEpoch(batch, seenConsentEpoch)
 	if len(batch) == 0 {
 		return batch
@@ -357,12 +393,14 @@ func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64) []E
 	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.HTTPTimeout)
 	defer cancel()
 	if err := c.publishBatchWithContext(ctx, batch); err != nil {
+		c.applyRetryAfter(err, deferUntil)
 		if isPermanentPublishError(err) {
 			c.stats.dropped.Add(uint64(len(batch)))
 			return batch[:0]
 		}
 		return batch
 	}
+	*deferUntil = time.Time{}
 	return batch[:0]
 }
 
@@ -461,10 +499,26 @@ func cloneEvent(event Event) Event {
 	return event
 }
 
+// prepareEvent validates and normalizes an event at intake. The event id and
+// timestamp are stamped HERE, exactly once, so every later publish attempt of
+// the same event ships the identical envelope: the ingest service
+// de-duplicates re-sends by event_id, which only works when a retry reuses
+// the id of the attempt it repeats (a per-attempt id would turn a
+// delivered-but-timed-out batch into permanent duplicates).
 func (c *Client) prepareEvent(event Event) (Event, error) {
 	event = cloneEvent(event)
 	if strings.TrimSpace(event.Name) == "" {
 		return Event{}, fmt.Errorf("%w: event name is required", ErrInvalidEvent)
+	}
+	if strings.TrimSpace(event.ID) == "" {
+		id, err := newEventID()
+		if err != nil {
+			return Event{}, fmt.Errorf("%w: generate event id: %v", ErrInvalidEvent, err)
+		}
+		event.ID = id
+	}
+	if event.Timestamp.IsZero() {
+		event.Timestamp = c.clock.Now()
 	}
 	return event, nil
 }
