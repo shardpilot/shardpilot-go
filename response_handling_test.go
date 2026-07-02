@@ -107,6 +107,10 @@ func TestParseRetryAfter(t *testing.T) {
 		{"abc", 0},
 		{"Wed, 21 Oct 2026 07:28:00 GMT", 0},
 		{"999999", maxRetryAfter},
+		// Parseable but beyond the int64 nanosecond range: the clamp must
+		// compare raw seconds, or the duration conversion would overflow.
+		{"99999999999", maxRetryAfter},
+		{"9223372036854775807", maxRetryAfter},
 	}
 	for _, c := range cases {
 		if got := parseRetryAfter(c.header); got != c.want {

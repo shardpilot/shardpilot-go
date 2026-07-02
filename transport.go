@@ -238,7 +238,10 @@ func newHTTPStatusError(response *http.Response) *HTTPStatusError {
 // parseRetryAfter reads a whole-seconds Retry-After header value. Only the
 // delta-seconds form is honored — the HTTP-date form returns zero so the
 // client falls back to its own cadence — and the result is clamped to
-// maxRetryAfter. Absent, negative, or malformed values yield zero.
+// maxRetryAfter. Absent, negative, or malformed values yield zero. The clamp
+// compares raw seconds, BEFORE the duration conversion: a huge-but-parseable
+// value (above ~9.2e9 seconds) would overflow the nanosecond multiplication
+// and slip past a duration-level clamp as garbage.
 func parseRetryAfter(header string) time.Duration {
 	header = strings.TrimSpace(header)
 	if header == "" {
@@ -248,11 +251,10 @@ func parseRetryAfter(header string) time.Duration {
 	if err != nil || seconds <= 0 {
 		return 0
 	}
-	retryAfter := time.Duration(seconds) * time.Second
-	if retryAfter > maxRetryAfter {
+	if seconds > int64(maxRetryAfter/time.Second) {
 		return maxRetryAfter
 	}
-	return retryAfter
+	return time.Duration(seconds) * time.Second
 }
 
 func contextWithDefaultTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
