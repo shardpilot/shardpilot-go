@@ -286,14 +286,28 @@ func (c *Client) run() {
 			queueEvents = nil
 		}
 		var deferWake <-chan time.Time
-		if remaining := c.deferRemaining(deferUntil); remaining > 0 {
-			if deferTimer == nil {
-				deferTimer = time.NewTimer(remaining)
+		if !deferUntil.IsZero() {
+			if remaining := c.deferRemaining(deferUntil); remaining > 0 {
+				if deferTimer == nil {
+					deferTimer = time.NewTimer(remaining)
+				} else {
+					stopAndDrainTimer(deferTimer)
+					deferTimer.Reset(remaining)
+				}
+				deferWake = deferTimer.C
 			} else {
-				stopAndDrainTimer(deferTimer)
-				deferTimer.Reset(remaining)
+				// The backpressure deadline elapsed while the worker was busy
+				// with another case — e.g. the queue case won the select in
+				// the same instant the timer fired, drained its tick, and the
+				// held batch stayed below BatchSize. Retry NOW instead of
+				// silently disarming and waiting for the next flush tick.
+				deferUntil = time.Time{}
+				if deferTimer != nil {
+					stopAndDrainTimer(deferTimer)
+				}
+				batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil)
+				continue
 			}
-			deferWake = deferTimer.C
 		} else if deferTimer != nil {
 			stopAndDrainTimer(deferTimer)
 		}

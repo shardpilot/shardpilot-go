@@ -2,6 +2,7 @@ package shardpilot
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -333,6 +334,77 @@ func TestWorkerHoldsAutomaticPublishesUntilRetryAfter(t *testing.T) {
 	waitFor(t, 3*time.Second, "post-deferral retry", func() bool { return calls.Load() >= 2 })
 	if gap := secondAttempt.Load() - firstAttempt.Load(); gap < 800 {
 		t.Fatalf("expected the retry to wait out the Retry-After hint, got %dms", gap)
+	}
+}
+
+func TestEventArrivingDuringDeferralKeepsTheDeadlineRetry(t *testing.T) {
+	var calls atomic.Int64
+	var firstAttempt, secondAttempt atomic.Int64
+	var secondAttemptEvents atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := calls.Add(1)
+		if call == 1 {
+			firstAttempt.Store(time.Now().UnixMilli())
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"code":"rate_limited","message":"ingest rate limit exceeded"}}`))
+			return
+		}
+		var request batchRequest
+		_ = json.NewDecoder(r.Body).Decode(&request)
+		if call == 2 {
+			secondAttempt.Store(time.Now().UnixMilli())
+			secondAttemptEvents.Store(int64(len(request.Events)))
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(fmt.Sprintf(`{"accepted":%d,"rejected":0,"duplicates":0}`, len(request.Events))))
+	}))
+	defer server.Close()
+
+	// A long flush interval: if the deadline wake were lost (e.g. to a queue
+	// event racing the timer), the retry would not happen for 10 minutes.
+	client, err := NewClient(Config{
+		IngestURL:     server.URL,
+		Token:         "token-value",
+		WorkspaceID:   "workspace-test",
+		AppID:         "app-test",
+		EnvironmentID: "develop",
+		Source:        SourceBackend,
+		BatchSize:     2,
+		FlushInterval: 10 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	if err := client.Enqueue(Event{Name: "deferred_first"}); err != nil {
+		t.Fatalf("enqueue first: %v", err)
+	}
+	// The explicit flush publishes the under-sized batch and hits the 429;
+	// the worker retains it on a 1s server hint.
+	flushCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := client.Flush(flushCtx); err == nil {
+		t.Fatal("expected the first flush to surface the rate-limited failure")
+	}
+
+	// A fresh event arrives mid-deferral and fills the batch; the retry must
+	// still fire at the backpressure deadline, carrying both events.
+	if err := client.Enqueue(Event{Name: "deferred_second"}); err != nil {
+		t.Fatalf("enqueue second: %v", err)
+	}
+
+	waitFor(t, 5*time.Second, "the deadline retry", func() bool { return calls.Load() >= 2 })
+	gap := secondAttempt.Load() - firstAttempt.Load()
+	if gap < 800 {
+		t.Fatalf("expected the retry to wait out the Retry-After hint, got %dms", gap)
+	}
+	if gap > 4000 {
+		t.Fatalf("expected the retry at the deadline, not the next flush tick, got %dms", gap)
+	}
+	if got := secondAttemptEvents.Load(); got != 2 {
+		t.Fatalf("expected the deadline retry to carry both events, got %d", got)
 	}
 }
 
