@@ -301,7 +301,7 @@ func (c *Client) run() {
 				// the same instant the timer fired, drained its tick, and the
 				// held batch stayed below BatchSize. Retry NOW instead of
 				// silently disarming and waiting for the next flush tick.
-				deferUntil = time.Time{}
+				// (publishWorkerBatch consumes the elapsed deadline.)
 				if deferTimer != nil {
 					stopAndDrainTimer(deferTimer)
 				}
@@ -449,6 +449,12 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 }
 
 func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, deferUntil *time.Time) []Event {
+	// Every automatic caller gates on the deadline having passed, so consume
+	// it here: a follow-up failure WITHOUT a fresh Retry-After then falls
+	// back to the normal tick cadence instead of re-firing immediately off
+	// the stale, already-elapsed deadline (applyRetryAfter re-arms it when
+	// the new failure carries its own hint).
+	*deferUntil = time.Time{}
 	batch = c.dropBatchOnConsentEpoch(batch, seenConsentEpoch)
 	if len(batch) == 0 {
 		return batch
@@ -467,7 +473,6 @@ func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, def
 		}
 		return batch
 	}
-	*deferUntil = time.Time{}
 	return batch[:0]
 }
 

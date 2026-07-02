@@ -6,7 +6,9 @@
   `Retry-After`. `HTTPStatusError` carries the server's machine-readable `ErrorCode`
   (e.g. `rate_limited`, `validation_error`), `ErrorMessage`, the per-field `Details` list,
   and the `Retry-After` header as a `RetryAfter` duration (both standard forms —
-  delta-seconds and HTTP-date — clamped to 24h, consistent with the crash client) —
+  delta-seconds and HTTP-date — parsed like the crash client; the analytics deferral
+  clamps at 24h, while the crash client's short in-process retry loop keeps its own
+  smaller bound) —
   `Error()` folds the code and up to five `field:code` detail pairs
   into the message, so logs show `status 429 (rate_limited) [events:events_rate_limited]`
   instead of a bare status. After a rate-limited automatic publish the background flush

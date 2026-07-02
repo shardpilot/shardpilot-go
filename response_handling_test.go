@@ -408,6 +408,64 @@ func TestEventArrivingDuringDeferralKeepsTheDeadlineRetry(t *testing.T) {
 	}
 }
 
+func TestDeadlineRetryFailureWithoutHintFallsBackToTickCadence(t *testing.T) {
+	var calls atomic.Int64
+	var attempts [3]atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := calls.Add(1)
+		if call <= 3 {
+			attempts[call-1].Store(time.Now().UnixMilli())
+		}
+		switch call {
+		case 1:
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"code":"rate_limited","message":"ingest rate limit exceeded"}}`))
+		case 2:
+			// Retryable, but NO fresh hint: the stale, already-elapsed
+			// deadline must not trigger an immediate back-to-back retry.
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":{"code":"internal_error","message":"internal server error"}}`))
+		default:
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"accepted":1,"rejected":0,"duplicates":0}`))
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(Config{
+		IngestURL:     server.URL,
+		Token:         "token-value",
+		WorkspaceID:   "workspace-test",
+		AppID:         "app-test",
+		EnvironmentID: "develop",
+		Source:        SourceBackend,
+		BatchSize:     1,
+		FlushInterval: 300 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	if err := client.Enqueue(Event{Name: "cadence_after_deadline"}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	waitFor(t, 10*time.Second, "the third attempt", func() bool { return calls.Load() >= 3 })
+	gap12 := attempts[1].Load() - attempts[0].Load()
+	gap23 := attempts[2].Load() - attempts[1].Load()
+	if gap12 < 800 {
+		t.Fatalf("expected the second attempt at the Retry-After deadline, got %dms", gap12)
+	}
+	if gap23 < 150 {
+		t.Fatalf("expected the post-deadline failure to fall back to the tick cadence, got a %dms back-to-back retry", gap23)
+	}
+	if gap23 > 3000 {
+		t.Fatalf("expected the tick-cadence retry within a flush interval or two, got %dms", gap23)
+	}
+}
+
 func TestExplicitFlushBypassesRetryAfterDeferral(t *testing.T) {
 	var calls atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
