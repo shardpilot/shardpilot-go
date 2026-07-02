@@ -15,9 +15,12 @@
   worker now defers its next automatic attempt until the `Retry-After` deadline passes
   (events keep buffering in the bounded queue meanwhile) and retries AT that deadline via a
   dedicated wake — not at the next flush tick, which could be much later when
-  `FlushInterval` exceeds the hint; explicit `Flush` and `Close`
-  attempts are not gated — they carry caller intent — and a renewed failure re-arms the
-  deferral.
+  `FlushInterval` exceeds the hint. The server's latest hint wins (a fresh shorter value
+  replaces an earlier longer deadline), and an explicit `Retry-After: 0` — "retry now" — is
+  honored as an immediate retry (with a tiny anti-hot-loop spacing floor). Explicit `Flush`
+  and `Close` attempts are not gated — they carry caller intent — a renewed failure re-arms
+  the deferral, and a flush that leaves nothing retained (delivered or permanently dropped)
+  clears any stale deadline so later events are never held behind it.
 
 - Event ids and timestamps are now stamped once when an event is accepted (`Track`/`Enqueue`)
   rather than on each publish attempt, so every retry of a batch re-sends byte-identical

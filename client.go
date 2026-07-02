@@ -332,6 +332,14 @@ func (c *Client) run() {
 		case request := <-c.flushRequests:
 			var err error
 			batch, err = c.flushAvailable(request.ctx, batch, &seenConsentEpoch)
+			if len(batch) == 0 {
+				// The batch the deferral was protecting is gone — delivered,
+				// dropped as permanent, or discarded by a consent denial. A
+				// stale deadline must not gate later queued events (it could
+				// hold them up to the 24h clamp); a fresh failure below
+				// re-arms it when it carries its own hint.
+				deferUntil = time.Time{}
+			}
 			c.applyRetryAfter(err, &deferUntil)
 			request.reply <- err
 		case <-c.stop:
@@ -371,22 +379,33 @@ func (c *Client) publishDeferred(deferUntil time.Time) bool {
 }
 
 // applyRetryAfter re-arms or clears the worker's backpressure deadline from a
-// publish outcome: a retryable failure that carried a Retry-After hint defers
-// the next automatic attempt at least that long (never shortening an already
-// later deadline); a fully successful outcome clears it.
+// publish outcome: a retryable failure that carried a Retry-After hint sets
+// the deadline to now + hint — the server's LATEST word wins, so an explicit
+// "Retry-After: 0" ("retry now") replaces an earlier longer deadline and the
+// worker retries immediately via the elapsed-deadline path. A fully
+// successful outcome clears the deadline; a failure without a usable hint
+// leaves it untouched.
 func (c *Client) applyRetryAfter(err error, deferUntil *time.Time) {
 	if err == nil {
 		*deferUntil = time.Time{}
 		return
 	}
 	var statusErr *HTTPStatusError
-	if errors.As(err, &statusErr) && statusErr.Retryable() && statusErr.RetryAfter > 0 {
-		deadline := c.clock.Now().Add(statusErr.RetryAfter)
-		if deadline.After(*deferUntil) {
-			*deferUntil = deadline
+	if errors.As(err, &statusErr) && statusErr.Retryable() && statusErr.retryAfterPresent {
+		retryAfter := statusErr.RetryAfter
+		if retryAfter < minRetryNowSpacing {
+			// "Retry now" still gets a tiny spacing floor so a server that
+			// keeps answering an explicit zero cannot induce a hot retry
+			// loop; 100ms is immediate in product terms.
+			retryAfter = minRetryNowSpacing
 		}
+		*deferUntil = c.clock.Now().Add(retryAfter)
 	}
 }
+
+// minRetryNowSpacing floors an explicit "Retry-After: 0" so honoring the
+// server's retry-now hint can never degenerate into a hot loop.
+const minRetryNowSpacing = 100 * time.Millisecond
 
 // dropBatchOnConsentEpoch discards the worker-held batch when a consent
 // denial happened since the worker last looked. Events cleared here count

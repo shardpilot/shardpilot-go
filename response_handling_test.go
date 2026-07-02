@@ -97,47 +97,50 @@ func TestErrorMessageCapsDetailCodes(t *testing.T) {
 
 func TestParseRetryAfter(t *testing.T) {
 	cases := []struct {
-		header string
-		want   time.Duration
+		header      string
+		want        time.Duration
+		wantPresent bool
 	}{
-		{"", 0},
-		{"7", 7 * time.Second},
-		{" 10 ", 10 * time.Second},
-		{"0", 0},
-		{"-3", 0},
-		{"abc", 0},
-		// A past HTTP-date means "retry now": no deferral.
-		{"Wed, 21 Oct 2015 07:28:00 GMT", 0},
-		{"999999", maxRetryAfter},
+		{"", 0, false},
+		{"7", 7 * time.Second, true},
+		{" 10 ", 10 * time.Second, true},
+		// An explicit zero is a REAL hint ("retry now"), distinct from a
+		// missing header; same for an already-elapsed HTTP-date.
+		{"0", 0, true},
+		{"Wed, 21 Oct 2015 07:28:00 GMT", 0, true},
+		{"-3", 0, false},
+		{"abc", 0, false},
+		{"999999", maxRetryAfter, true},
 		// Parseable but beyond the int64 nanosecond range: the clamp must
 		// compare raw seconds, or the duration conversion would overflow.
-		{"99999999999", maxRetryAfter},
-		{"9223372036854775807", maxRetryAfter},
+		{"99999999999", maxRetryAfter, true},
+		{"9223372036854775807", maxRetryAfter, true},
 		// Too large even for int64 still means "wait a long time": clamp,
 		// don't ignore. A hugely negative value stays malformed.
-		{"999999999999999999999", maxRetryAfter},
-		{"-999999999999999999999", 0},
+		{"999999999999999999999", maxRetryAfter, true},
+		{"-999999999999999999999", 0, false},
 	}
 	for _, c := range cases {
-		if got := parseRetryAfter(c.header); got != c.want {
-			t.Fatalf("parseRetryAfter(%q) = %v, want %v", c.header, got, c.want)
+		got, present := parseRetryAfter(c.header)
+		if got != c.want || present != c.wantPresent {
+			t.Fatalf("parseRetryAfter(%q) = (%v, %v), want (%v, %v)", c.header, got, present, c.want, c.wantPresent)
 		}
 	}
 }
 
 func TestParseRetryAfterHTTPDateForm(t *testing.T) {
 	// A future HTTP-date defers by the distance from now (both standard
-	// header forms are honored, consistent with the crash client).
+	// header forms are honored, like the crash client).
 	when := time.Now().Add(10 * time.Minute).UTC().Format(http.TimeFormat)
-	got := parseRetryAfter(when)
-	if got < 9*time.Minute || got > 10*time.Minute+time.Second {
-		t.Fatalf("parseRetryAfter(%q) = %v, want ~10m", when, got)
+	got, present := parseRetryAfter(when)
+	if !present || got < 9*time.Minute || got > 10*time.Minute+time.Second {
+		t.Fatalf("parseRetryAfter(%q) = (%v, %v), want ~10m present", when, got, present)
 	}
 
 	// A far-future date clamps to the 24h maximum.
 	farFuture := time.Now().Add(90 * 24 * time.Hour).UTC().Format(http.TimeFormat)
-	if got := parseRetryAfter(farFuture); got != maxRetryAfter {
-		t.Fatalf("parseRetryAfter(far future) = %v, want %v", got, maxRetryAfter)
+	if got, present := parseRetryAfter(farFuture); !present || got != maxRetryAfter {
+		t.Fatalf("parseRetryAfter(far future) = (%v, %v), want (%v, true)", got, present, maxRetryAfter)
 	}
 }
 
@@ -200,7 +203,7 @@ func TestApplyRetryAfterArmsAndClearsDeadline(t *testing.T) {
 	client := &Client{clock: clock}
 
 	var deferUntil time.Time
-	client.applyRetryAfter(&HTTPStatusError{StatusCode: 429, RetryAfter: 7 * time.Second}, &deferUntil)
+	client.applyRetryAfter(&HTTPStatusError{StatusCode: 429, RetryAfter: 7 * time.Second, retryAfterPresent: true}, &deferUntil)
 	if want := clock.now.Add(7 * time.Second); !deferUntil.Equal(want) {
 		t.Fatalf("expected deadline %v, got %v", want, deferUntil)
 	}
@@ -208,15 +211,29 @@ func TestApplyRetryAfterArmsAndClearsDeadline(t *testing.T) {
 		t.Fatal("expected publishes to be deferred before the deadline")
 	}
 
-	// A shorter hint never shortens an already later deadline.
-	client.applyRetryAfter(&HTTPStatusError{StatusCode: 429, RetryAfter: time.Second}, &deferUntil)
-	if want := clock.now.Add(7 * time.Second); !deferUntil.Equal(want) {
-		t.Fatalf("expected deadline to stay %v, got %v", want, deferUntil)
+	// The server's LATEST word wins: a fresh shorter hint replaces an
+	// earlier longer deadline.
+	client.applyRetryAfter(&HTTPStatusError{StatusCode: 429, RetryAfter: time.Second, retryAfterPresent: true}, &deferUntil)
+	if want := clock.now.Add(time.Second); !deferUntil.Equal(want) {
+		t.Fatalf("expected the fresh hint to replace the deadline with %v, got %v", want, deferUntil)
+	}
+
+	// An explicit zero ("retry now") arms only the tiny anti-hot-loop floor.
+	client.applyRetryAfter(&HTTPStatusError{StatusCode: 429, RetryAfter: 0, retryAfterPresent: true}, &deferUntil)
+	if want := clock.now.Add(minRetryNowSpacing); !deferUntil.Equal(want) {
+		t.Fatalf("expected a retry-now hint to arm the %v floor, got %v", minRetryNowSpacing, deferUntil)
+	}
+
+	// A retryable failure WITHOUT a usable header leaves the deadline alone.
+	before := deferUntil
+	client.applyRetryAfter(&HTTPStatusError{StatusCode: 500}, &deferUntil)
+	if !deferUntil.Equal(before) {
+		t.Fatalf("expected a hintless failure to leave the deadline at %v, got %v", before, deferUntil)
 	}
 
 	// A non-retryable status never arms the deferral.
 	var fresh time.Time
-	client.applyRetryAfter(&HTTPStatusError{StatusCode: 400, RetryAfter: 7 * time.Second}, &fresh)
+	client.applyRetryAfter(&HTTPStatusError{StatusCode: 400, RetryAfter: 7 * time.Second, retryAfterPresent: true}, &fresh)
 	if !fresh.IsZero() {
 		t.Fatalf("expected 400 to leave the deadline unset, got %v", fresh)
 	}
@@ -231,6 +248,99 @@ func TestApplyRetryAfterArmsAndClearsDeadline(t *testing.T) {
 	if client.publishDeferred(deferUntil) {
 		t.Fatal("expected a cleared deadline to never defer")
 	}
+}
+
+func TestRetryAfterZeroRetriesPromptly(t *testing.T) {
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.Header().Set("Retry-After", "0")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"code":"rate_limited","message":"ingest rate limit exceeded"}}`))
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"accepted":1,"rejected":0,"duplicates":0}`))
+	}))
+	defer server.Close()
+
+	// With a 10-minute flush interval, only an honored retry-now hint can
+	// produce a prompt second attempt.
+	client, err := NewClient(Config{
+		IngestURL:     server.URL,
+		Token:         "token-value",
+		WorkspaceID:   "workspace-test",
+		AppID:         "app-test",
+		EnvironmentID: "develop",
+		Source:        SourceBackend,
+		BatchSize:     1,
+		FlushInterval: 10 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	if err := client.Enqueue(Event{Name: "retry_now"}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	waitFor(t, 3*time.Second, "the retry-now attempt", func() bool { return calls.Load() >= 2 })
+}
+
+func TestFlushDroppingTheBatchClearsStaleDeferral(t *testing.T) {
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch calls.Add(1) {
+		case 1:
+			// Arm a long server deferral.
+			w.Header().Set("Retry-After", "3600")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"error":{"code":"rate_limited","message":"ingest rate limit exceeded"}}`))
+		case 2:
+			// The explicit flush turns the batch into a permanent drop.
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"code":"validation_error","message":"request validation failed"}}`))
+		default:
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = w.Write([]byte(`{"accepted":1,"rejected":0,"duplicates":0}`))
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(Config{
+		IngestURL:     server.URL,
+		Token:         "token-value",
+		WorkspaceID:   "workspace-test",
+		AppID:         "app-test",
+		EnvironmentID: "develop",
+		Source:        SourceBackend,
+		BatchSize:     1,
+		FlushInterval: 300 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	if err := client.Enqueue(Event{Name: "deferred_then_dropped"}); err != nil {
+		t.Fatalf("enqueue first: %v", err)
+	}
+	waitFor(t, 2*time.Second, "the first (rate-limited) attempt", func() bool { return calls.Load() >= 1 })
+
+	// The explicit flush bypasses the 1h deferral; the server now rejects
+	// the batch permanently, so the flush drops it.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := client.Flush(ctx); err == nil {
+		t.Fatal("expected the flush to surface the permanent rejection")
+	}
+
+	// The batch the deferral protected is gone: a fresh event must publish
+	// on the normal cadence, not be held behind the stale 1h deadline.
+	if err := client.Enqueue(Event{Name: "after_drop"}); err != nil {
+		t.Fatalf("enqueue second: %v", err)
+	}
+	waitFor(t, 3*time.Second, "the post-drop publish", func() bool { return calls.Load() >= 3 })
 }
 
 func TestRetriesReuseEventIDAndTimestamp(t *testing.T) {
