@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.4.0-alpha — 2026-07-06 — consent, result callbacks, JWT mint
+
 - The analytics client now parses the error envelope on non-2xx ingest responses and honors
   `Retry-After`. `HTTPStatusError` carries the server's machine-readable `ErrorCode`
   (e.g. `rate_limited`, `validation_error`), `ErrorMessage`, the per-field `Details` list,
@@ -144,6 +146,8 @@
 - Internal: extracted the UUIDv7 generator shared by crash IDs, anonymous
   IDs, and consent idempotency keys into `internal/uuidv7` (behavior
   unchanged).
+- This is an early alpha pre-release. The API is unstable and may change
+  before v1. Released as the `v0.4.0-alpha` git tag.
 
 ## v0.3.0-alpha — 2026-06-07 — universal envelope
 

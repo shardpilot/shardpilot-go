@@ -22,13 +22,13 @@ Real, tested, working code — **early alpha**. The API is pre-v1 and may change
 
 ## Installation
 
-For the newest documented helpers, install from `main` (no tag ships them yet — see below):
+Install the latest tagged release:
 
 ```bash
-go get github.com/shardpilot/shardpilot-go@main
+go get github.com/shardpilot/shardpilot-go@v0.4.0-alpha
 ```
 
-`v0.3.0-alpha` is the latest tag, but it only de-games the universal `Event` envelope (plus `pkg/crash`, which landed in `v0.2.0-alpha`). The consent API (`SetConsent` / `Consent`), `LoadOrCreateAnonymousID`, the backend-only `SignIngestJWT` Mode-B mint helper, and the default actor identity fields documented in this README are **not in any tag** — they live in the changelog's `[Unreleased]` section and are reachable only from `main` until the next tag (`v0.3.0`) is cut. To pin a tagged release that ships only the de-gamed envelope and crash SDK, use:
+`v0.4.0-alpha` is the latest tag. It ships the consent API (`SetConsent` / `Consent`), `LoadOrCreateAnonymousID`, the backend-only `SignIngestJWT` Mode-B mint helper, and the default actor identity fields documented in this README, on top of the de-gamed universal `Event` envelope and `pkg/crash`. To pin the earlier tag that ships only the de-gamed envelope (`v0.3.0-alpha`) and crash SDK (`v0.2.0-alpha`), use:
 
 ```bash
 go get github.com/shardpilot/shardpilot-go@v0.3.0-alpha
@@ -250,9 +250,9 @@ gofmt -l .
 
 ## Roadmap
 
-Pre-v1; the API is explicitly unstable. From the changelog `[Unreleased]`:
+Pre-v1; the API is explicitly unstable.
 
-- Consent API, `LoadOrCreateAnonymousID`, the backend-only `SignIngestJWT` Mode-B mint helper, and optional default actor identity fields are landed in `[Unreleased]` (not yet tagged; `SignIngestJWT` is additive and intended for the `v0.3.0` release).
+- The consent API, `LoadOrCreateAnonymousID`, the backend-only `SignIngestJWT` Mode-B mint helper, and optional default actor identity fields shipped in `v0.4.0-alpha`; the changelog's `Unreleased` section is currently empty.
 - Public developer docs are planned for `docs.shardpilot.com`; that domain is not yet provisioned.
 
 `v0.3.0-alpha` (tagged) removed the game-flavored `MatchID` field from the universal `Event` envelope; carry that context in `Props["match_id"]` instead (wire payload unchanged).
