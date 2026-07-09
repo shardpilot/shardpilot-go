@@ -20,8 +20,8 @@
 # Usage:
 #   codex-review.sh request <owner/repo> <pr>       # post @codex review, wait for 👀 (retry ≤5×). RUN IN BACKGROUND.
 #   codex-review.sh await   <owner/repo> <pr> [after-comment-id]  # poll for the verdict on HEAD (≤20 min). RUN IN BACKGROUND.
-#                                                   # pass the request-comment id printed by `request` so only a verdict
-#                                                   # posted AFTER the trigger counts (stale same-sha verdicts ignored).
+#                                                   # pass the floor comment id printed by `request` so only a verdict
+#                                                   # posted AFTER that comment counts (stale same-sha verdicts ignored).
 #   codex-review.sh status  <owner/repo> <pr> [after-comment-id]  # one-shot snapshot — the re-check tool. foreground
 #                                                   # same floor semantics as await: with the id set, an older clean
 #                                                   # comment cannot make the snapshot read CLEAN after a re-trigger.
@@ -29,13 +29,18 @@
 #   codex-review.sh resolve <owner/repo> <pr> <threadId...> # mark addressed threads on that PR resolved. foreground
 #   codex-review.sh checks  <owner/repo> <pr>       # GitHub Actions check-runs on HEAD.             foreground
 #
-# Exit codes:
-#   0  ok / clean verdict on HEAD / checks green
-#   1  checks: non-passing, pending, missing, or unreadable check-runs (NOT green)
-#   2  findings present (unresolved review threads)
-#   3  Codex never acknowledged after 5 attempts (it may be down — stop, tell the user)
-#   4  timed out (>20 min) — review likely never started or the read is wrong; check manually
-#  64  usage error / could not post the review request
+# Exit codes (per command — the exit status IS the gate signal):
+#   request: 0 = acknowledged (👀 or fresh Codex output) · 3 = never acked after 5 attempts
+#            (Codex may be down — stop, tell the user) · 64 = preflight/post failed
+#   await:   0 = CLEAN on HEAD · 2 = findings (unresolved threads) · 4 = timed out (>20 min —
+#            review likely never started or the read is wrong; check manually)
+#   status:  0 = settled CLEAN on HEAD with verifiably green checks · 1 = anything else
+#            (findings, no verdict on HEAD, unknown/unreadable surfaces, settle window,
+#            or CI not verifiably green)
+#   threads: 0 = listed · 1 = thread read failed (state unknown — fail closed)
+#   checks:  0 = all green · 1 = non-passing, pending, missing, or unreadable (NOT green)
+#   resolve: 0 = every requested thread resolved · 1 = any refused or failed
+#   64 = usage error (any command)
 
 set -uo pipefail
 
@@ -77,6 +82,27 @@ latest_bot_comment_id() {
 # signal — more reliable than a review object's commit_id, which can stay pinned
 # to an older findings review.
 reviewed_sha_from() { grep -oiE 'reviewed commit[^0-9a-f]*[0-9a-f]{7,40}' | grep -oiE '[0-9a-f]{7,40}' | head -1; }
+
+# Reviewed-commit gate: Codex verdicts normally carry an ABBREVIATED (~10-hex)
+# commit id, not a full 40-char sha — requiring 40 chars made `await`/`status`
+# TIMEOUT on genuinely clean reviews. Accept a full 40-char equality match, or
+# an abbreviated id of ≥10 hex chars that is a case-insensitive PREFIX of the
+# full observed head sha; anything shorter than 10 chars, non-hex, or without
+# a full 40-char head to compare against fails CLOSED. On the earlier
+# collision objection (a short prefix could collide or be forced): a ≥10-hex
+# prefix compared against ONE pinned head sha leaves ~16^-10 per candidate —
+# an attacker cannot grind the head sha of a PR they want merged into a chosen
+# prefix without pushing commits, which resets the gate — and the merge-time
+# `--match-head-commit <gate-sha>` guard (SKILL.md step 6) backstops it: even
+# a colliding "clean" read cannot merge a head other than the one gated.
+reviewed_matches_head() {  # $1 = reviewed sha (lowercased), $2 = full head sha (lowercased)
+  local r="$1" h="$2"
+  [ -n "$r" ] && [ ${#h} -eq 40 ] || return 1
+  [[ "$r" =~ ^[0-9a-f]+$ ]] || return 1
+  if [ ${#r} -eq 40 ]; then [ "$r" = "$h" ]; return $?; fi
+  [ ${#r} -ge 10 ] || return 1
+  case "$h" in "$r"*) return 0 ;; *) return 1 ;; esac
+}
 
 # All check-runs on a sha, across pages (per_page caps at 100; a failure or a
 # still-pending run on page 2+ must not slip past the green gate). Same
@@ -129,6 +155,17 @@ graphql_threads() {
   printf '%s\n' "$all"
 }
 
+# Non-passing run count for an already-fetched check-runs array (stdin) —
+# shared by `checks` and `status` so both exit-code gates apply the SAME
+# strictness rules (see cmd_checks for the ALLOW_SKIPPED rationale).
+nonpassing_count() {
+  if [ "${ALLOW_SKIPPED:-0}" = "1" ]; then
+    jq '[.[]|select(.conclusion==null or (.conclusion!="success" and .conclusion!="neutral" and .conclusion!="skipped"))]|length' 2>/dev/null
+  else
+    jq '[.[]|select(.conclusion != "success")]|length' 2>/dev/null
+  fi
+}
+
 unresolved_count() {
   # Fail CLOSED: on any thread-read failure echo "unknown" and return 1 — the
   # gate must never treat an unreadable findings surface as "0 findings".
@@ -144,8 +181,27 @@ unresolved_count() {
   echo "$n"
 }
 
+# Unresolved non-outdated threads AUTHORED BY CODEX (GraphQL surfaces the bare
+# login). Used ONLY by `request`'s fresh-output acknowledgment shortcut, so a
+# human (or other-bot) thread posted after the request cannot read as "Codex
+# picked it up". The merge gate itself still counts ALL authors via
+# unresolved_count. Same fail-CLOSED contract: "unknown" + rc 1 on read failure.
+unresolved_codex_count() {
+  local resp n
+  resp=$(graphql_threads) || { echo "unknown"; return 1; }
+  n=$(printf '%s' "$resp" | jq '[.[] | select(.isResolved==false and .isOutdated==false
+        and ((.comments.nodes[0].author.login // "") == "chatgpt-codex-connector"))] | length' 2>/dev/null)
+  [[ "${n:-}" =~ ^[0-9]+$ ]] || { echo "unknown"; return 1; }
+  echo "$n"
+}
+
 list_threads() {
-  graphql_threads | jq -r 'map(select(.isResolved==false))
+  # Print an EXPLICIT error on read failure — silence here would let "listing
+  # failed" read as "(no threads)" to a human skimming the output. Returns 1 so
+  # `threads` (which is just this) is nonzero when the state is unknown.
+  local resp
+  resp=$(graphql_threads) || { echo "  ERROR: reviewThreads read FAILED — thread state UNKNOWN (fail closed; do not treat as none)."; return 1; }
+  printf '%s\n' "$resp" | jq -r 'map(select(.isResolved==false))
     | if length==0 then "  (none)"
       else .[] | "  • \(.id)  [\(.comments.nodes[0].author.login // "?")]  \(.comments.nodes[0].path // "—"):\(.comments.nodes[0].line // "?")\(if .isOutdated then " (outdated)" else "" end)\n    \((.comments.nodes[0].body // "")|gsub("[\n\r]+";" ")|.[0:240])"
       end' 2>/dev/null
@@ -154,13 +210,24 @@ list_threads() {
 # ---- subcommands ------------------------------------------------------------
 
 cmd_request() {
-  local attempt cid first_cid="" i eyes_c eyes_p base_cid base_unres new_cid new_unres
+  local attempt cid first_cid="" i eyes_c eyes_p base_cid base_unres new_cid new_unres floor
+  # Preflight the OBSERVATION tooling before posting anything: if jq is missing
+  # or the comment surface is unreadable (bad auth, wrong repo/PR), posting
+  # would fire a review whose acknowledgment we can never observe — and the
+  # loop would then misreport a Codex outage. Fail with usage instead.
+  command -v jq >/dev/null 2>&1 || { echo "[$(ts)] ERROR: jq not found — cannot observe Codex responses; not posting a request."; return 64; }
+  if [ -z "$(latest_bot_comment_json)" ]; then
+    echo "[$(ts)] ERROR: cannot read the PR comment surface (gh auth? repo/PR correct?) — not posting a request."
+    return 64
+  fi
   # Baselines for the fresh-output shortcut. Fail CLOSED when unreadable: an
-  # unknown baseline stays EMPTY and the shortcut is skipped (👀-only path),
-  # so historical Codex comments/threads can never read as "fresh output since
-  # this request" just because a baseline read errored down to zero.
-  base_cid=$(latest_bot_comment_id); [[ "$base_cid"   =~ ^[0-9]+$ ]] || base_cid=""
-  base_unres=$(unresolved_count);    [[ "$base_unres" =~ ^[0-9]+$ ]] || base_unres=""
+  # unknown baseline stays EMPTY and that signal is skipped, so historical
+  # Codex comments/threads can never read as "fresh output since this request"
+  # just because a baseline read errored down to zero. The thread baseline
+  # counts CODEX-authored threads only — a human commenting mid-request must
+  # not read as Codex acknowledgment.
+  base_cid=$(latest_bot_comment_id);   [[ "$base_cid"   =~ ^[0-9]+$ ]] || base_cid=""
+  base_unres=$(unresolved_codex_count); [[ "$base_unres" =~ ^[0-9]+$ ]] || base_unres=""
   for attempt in 1 2 3 4 5; do
     cid=$(gh api -X POST "repos/$SLUG/issues/$PR/comments" -f body='@codex review' --jq '.id' 2>/dev/null)
     # Fail IMMEDIATELY if the request comment could not be posted (missing
@@ -171,11 +238,17 @@ cmd_request() {
       echo "[$(ts)] ERROR: could not post '@codex review' (no comment id returned — check token permissions, PR number, rate limits)."
       return 64
     fi
-    # The verdict floor handed to `await` is the FIRST request comment of this
-    # invocation, not the latest retry's: a verdict landing between retry
-    # attempts is fresh output for THIS request cycle, and a later attempt's
-    # higher comment id must not make `await` discard it into a false timeout.
     [ -n "$first_cid" ] || first_cid="$cid"
+    # The verdict floor handed to `await` is the PRE-REQUEST Codex-comment
+    # baseline when it was readable, else the FIRST request comment of this
+    # invocation (never a later retry's higher id). Rationale: any Codex
+    # verdict newer than the last pre-request bot comment is fresh output of
+    # THIS cycle — including one that lands in the instant between the baseline
+    # read and our comment posting, or between retry attempts. Flooring at the
+    # request comment's own id would discard such a verdict into a false
+    # timeout; flooring at the baseline still excludes every stale pre-request
+    # comment.
+    floor="${base_cid:-$first_cid}"
     echo "[$(ts)] attempt $attempt/5 — posted '@codex review' (comment $cid)"
     for i in $(seq 1 10); do          # 10 × 30s = 5 min per attempt
       sleep 30
@@ -187,17 +260,22 @@ cmd_request() {
         | jq '[(add // [])[]|select('"$IS_CODEX"')|.content]|index("eyes")' 2>/dev/null)
       eyes_p=$(gh api "repos/$SLUG/issues/$PR/reactions?per_page=100" --paginate --slurp 2>/dev/null \
         | jq '[(add // [])[]|select('"$IS_CODEX"')|.content]|index("eyes")' 2>/dev/null)
-      new_cid=$(latest_bot_comment_id); [[ "$new_cid" =~ ^[0-9]+$ ]] || new_cid=0
-      new_unres=$(unresolved_count);    [[ "$new_unres" =~ ^[0-9]+$ ]] || new_unres=0
+      new_cid=$(latest_bot_comment_id);    [[ "$new_cid"   =~ ^[0-9]+$ ]] || new_cid=0
+      new_unres=$(unresolved_codex_count); [[ "$new_unres" =~ ^[0-9]+$ ]] || new_unres=0
       # Acknowledged if Codex reacted (👀) OR has already produced fresh output
       # since the request — a new bot comment (clean verdict) or new unresolved
-      # threads (findings). The 👀 can be transient or skipped, so never rely on
-      # it alone, or a working review gets needlessly re-asked up to 5×.
+      # Codex threads (findings). The 👀 can be transient or skipped, so never
+      # rely on it alone, or a working review gets needlessly re-asked up to 5×.
       if { [ -n "${eyes_c:-}" ] && [ "$eyes_c" != "null" ]; } || { [ -n "${eyes_p:-}" ] && [ "$eyes_p" != "null" ]; }; then
-        echo "[$(ts)] 👀 Codex acknowledged — review running. Next: codex-review.sh await $SLUG $PR $first_cid"; return 0
+        echo "[$(ts)] 👀 Codex acknowledged — review running. Next: codex-review.sh await $SLUG $PR $floor"; return 0
       fi
-      if [ -n "$base_cid" ] && [ -n "$base_unres" ] && { [ "$new_cid" -gt "$base_cid" ] || [ "$new_unres" -gt "$base_unres" ]; }; then
-        echo "[$(ts)] Codex already responded (fresh output since request) — go to: codex-review.sh await $SLUG $PR $first_cid"; return 0
+      # The two fresh-output signals are evaluated INDEPENDENTLY, each gated on
+      # its own readable baseline: an unreadable thread baseline must not
+      # disable the comment-id signal (or vice versa) — each side fails closed
+      # on its own, not jointly.
+      if { [ -n "$base_cid" ] && [ "$new_cid" -gt "$base_cid" ]; } || \
+         { [ -n "$base_unres" ] && [ "$new_unres" -gt "$base_unres" ]; }; then
+        echo "[$(ts)] Codex already responded (fresh output since request) — go to: codex-review.sh await $SLUG $PR $floor"; return 0
       fi
     done
     echo "[$(ts)] no 👀 / no Codex output after 5 min — re-asking."
@@ -207,11 +285,12 @@ cmd_request() {
 }
 
 cmd_await() {
-  # Optional 3rd arg (after the pr): a comment id — usually the request
-  # comment id printed by `request`. When given, only a bot verdict POSTED
-  # AFTER that id counts: an older clean comment on the same sha must not
-  # satisfy a re-requested pass (e.g. after resolving threads with no push),
-  # or await can report CLEAN while the fresh pass is still running.
+  # Optional 3rd arg (after the pr): a comment id — the floor printed by
+  # `request` (the pre-request Codex-comment baseline, or the request comment
+  # id when that baseline was unreadable). When given, only a bot verdict
+  # POSTED AFTER that id counts: an older clean comment on the same sha must
+  # not satisfy a re-requested pass (e.g. after resolving threads with no
+  # push), or await can report CLEAN while the fresh pass is still running.
   local after_id="${1:-0}"; [[ "$after_id" =~ ^[0-9]+$ ]] || after_id=0
   local start now elapsed sha sha7 sha_full bc bcid body rsha rsha7 clean unresolved settle_sha=""
   start=$(date +%s)
@@ -236,11 +315,12 @@ cmd_await() {
       echo "[$(ts)] FINDINGS — $unresolved unresolved review thread(s):"
       list_threads
       return 2
-    # Clean = verdict text + Reviewed-commit == HEAD + 0 unresolved. Settle once
-    # (~3.5 min) before declaring it, because inline comments can lag the verdict.
-    # The Reviewed-commit comparison uses the FULL 40-char sha — a 7-hex prefix
-    # can collide (or be forced adversarially) and must never clear a merge gate.
-    elif [ "$clean" = yes ] && [ ${#rsha} -eq 40 ] && [ "$rsha" = "$sha_full" ]; then
+    # Clean = verdict text + Reviewed-commit matches HEAD + 0 unresolved. Settle
+    # once (~3.5 min) before declaring it, because inline comments can lag the
+    # verdict. The Reviewed-commit match accepts a full 40-char sha or a ≥10-hex
+    # abbreviated prefix of HEAD (Codex posts ~10-hex ids); <10 chars fails
+    # closed — see reviewed_matches_head for the collision analysis.
+    elif [ "$clean" = yes ] && reviewed_matches_head "$rsha" "$sha_full"; then
       # The settle is PER-SHA: if HEAD advanced since the last settle (e.g. a
       # push landed mid-settle and Codex re-reviewed), the new sha gets its own
       # settle window instead of inheriting the old one and skipping the wait.
@@ -272,7 +352,7 @@ cmd_status() {
   # was just re-triggered on the SAME sha, an older clean comment must not
   # make the snapshot read CLEAN — pass the request-comment id as the floor.
   local after_id="${1:-0}"; [[ "$after_id" =~ ^[0-9]+$ ]] || after_id=0
-  local sha sha7 sha_full bc bcid body rsha rsha7 clean unresolved runs
+  local sha sha7 sha_full bc bcid body rsha rsha7 clean unresolved runs nonpass checks_green=no
   sha=$(head_sha); sha7=${sha:0:7}
   sha_full=$(printf '%s' "$sha" | tr '[:upper:]' '[:lower:]')
   bc=$(latest_bot_comment_json)
@@ -285,24 +365,61 @@ cmd_status() {
 
   echo "PR $SLUG#$PR"
   echo "  HEAD                 $sha7"
-  echo "  Codex reviewed       ${rsha7:-none}  $([ ${#rsha} -eq 40 ] && [ "$rsha" = "$sha_full" ] && echo '== HEAD ✓ (full-sha match)' || echo '(not HEAD — re-review pending, none, or short sha)')"
+  echo "  Codex reviewed       ${rsha7:-none}  $(reviewed_matches_head "$rsha" "$sha_full" && echo '== HEAD ✓ (full sha or ≥10-hex prefix)' || echo '(not HEAD — re-review pending, none, or unusable sha)')"
   echo "  clean-verdict text   $clean"
   echo "  unresolved threads   ${unresolved:-unknown}"
   echo "  mergeable            $(gh api graphql -f query='query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){mergeStateStatus mergeable}}}' -f o="$OWNER" -f r="$NAME" -F n="$PR" --jq '.data.repository.pullRequest|"\(.mergeable) / mergeStateStatus=\(.mergeStateStatus)"' 2>/dev/null)"
   echo "  --- GitHub Actions ---"
+  # Track the CI result for the exit gate below: checks_green=yes only when
+  # the run list was readable, non-empty, and every run passes (same rules as
+  # `checks` via nonpassing_count). Unreadable/missing stays "no" — fail closed.
   if runs=$(check_runs_json "$sha"); then
     printf '%s' "$runs" | jq -r '.[]|"    \(.conclusion // .status)\t\(.name)"' 2>/dev/null | sort
+    nonpass=$(printf '%s' "$runs" | nonpassing_count)
+    [[ "${nonpass:-}" =~ ^[0-9]+$ ]] && [ "$nonpass" -eq 0 ] && checks_green=yes
   else
     echo "    (check-run read FAILED or no runs exist on this sha — treat as NOT green, fail closed)"
   fi
   echo "  --- unresolved review threads ---"
   list_threads
   echo ""
-  echo "  Verdict line:        $(
-    if [ "${unresolved:-unknown}" = "unknown" ]; then echo 'UNKNOWN — thread read failed (fail closed, not clean)'
-    elif [ "$unresolved" -gt 0 ]; then echo 'FINDINGS'
-    elif [ "$clean" = yes ] && [ ${#rsha} -eq 40 ] && [ "$rsha" = "$sha_full" ]; then echo 'CLEAN on HEAD'
-    else echo 'no verdict on HEAD yet'; fi)"
+  # Verdict + exit code. status shares await's settle discipline: inline
+  # comments can lag the verdict comment by 3-5 min, so a snapshot taken
+  # inside the settle window (<210s since the verdict posted, matching await's
+  # sleep) reports SETTLING — not an instant CLEAN a wrapper could merge on.
+  # Exit code IS the signal: 0 only for a settled CLEAN on HEAD with
+  # verifiably green checks; findings, no-verdict, unknown, settling, and
+  # not-green/unverified-CI snapshots all exit 1 — the snapshot covers the CI
+  # surface too, so its 0 must not vouch for less than everything it displays.
+  local verdict rc=1 created cepoch age
+  if [ "${unresolved:-unknown}" = "unknown" ]; then
+    verdict='UNKNOWN — thread read failed (fail closed, not clean)'
+  elif [ "$unresolved" -gt 0 ]; then
+    verdict='FINDINGS'
+  elif [ "$clean" = yes ] && reviewed_matches_head "$rsha" "$sha_full"; then
+    created=$(printf '%s' "$bc" | jq -r '.created_at // ""' 2>/dev/null)
+    cepoch=""
+    if [ -n "$created" ]; then   # GNU date parses "" as *today 00:00* — never feed it an empty string
+      cepoch=$(date -u -d "$created" +%s 2>/dev/null) \
+        || cepoch=$(date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$created" +%s 2>/dev/null) \
+        || cepoch=""
+    fi
+    [[ "$cepoch" =~ ^[0-9]+$ ]] || cepoch=""
+    age=$(( $(date +%s) - ${cepoch:-0} ))
+    if [ -z "$cepoch" ]; then
+      verdict='SETTLING? — clean verdict on HEAD but its timestamp is unreadable; use await for the settled verdict (fail closed)'
+    elif [ "$age" -lt 210 ]; then
+      verdict="SETTLING — clean verdict on HEAD posted ${age}s ago (<210s); inline comments may still be landing. Re-run status after the window, or use await."
+    elif [ "$checks_green" != yes ]; then
+      verdict='CLEAN on HEAD, but checks NOT verifiably green (failing, pending, missing, or unreadable) — exit stays nonzero (fail closed)'
+    else
+      verdict='CLEAN on HEAD, checks green'; rc=0
+    fi
+  else
+    verdict='no verdict on HEAD yet'
+  fi
+  echo "  Verdict line:        $verdict"
+  return $rc
 }
 
 cmd_threads() { list_threads; }
@@ -324,11 +441,7 @@ cmd_checks() {
   # deploys), set ALLOW_SKIPPED=1 to accept neutral/skipped; they are still
   # listed above so the operator sees exactly what did not run.
   local nonpass
-  if [ "${ALLOW_SKIPPED:-0}" = "1" ]; then
-    nonpass=$(printf '%s' "$runs" | jq '[.[]|select(.conclusion==null or (.conclusion!="success" and .conclusion!="neutral" and .conclusion!="skipped"))]|length' 2>/dev/null)
-  else
-    nonpass=$(printf '%s' "$runs" | jq '[.[]|select(.conclusion != "success")]|length' 2>/dev/null)
-  fi
+  nonpass=$(printf '%s' "$runs" | nonpassing_count)
   echo "non-passing check-runs: ${nonpass:-unknown (read failed — treat as NOT green)}"
   # Exit code IS the gate signal: nonzero whenever the surface is not
   # verifiably green (failures, pending runs, or an unreadable count), so a

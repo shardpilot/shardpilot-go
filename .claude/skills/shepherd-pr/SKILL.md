@@ -10,8 +10,13 @@ description: >-
   shepherd/babysit/drive a PR, request or kick off a Codex review, get a PR
   reviewed, take a PR to merge, or check whether Codex has finished — even if
   they only give a PR number or say things like "погнать на ревью", "закажи
-  ревью у codex", "доведи PR до merge", "проверь, отревьюил ли codex". Merge is
-  autonomous once the clean-verdict, thread, and CI gates pass (step 6).
+  ревью у codex", "доведи PR до merge", "проверь, отревьюил ли codex". Scope
+  follows the ask: a status-only or review-only request ("check whether Codex
+  finished", "request a review") ends after reporting the state. The
+  autonomous-merge step (6) applies only when the user asked to shepherd the
+  PR to merge — explicitly, or via the standing policy for a PR this session
+  itself opened; then merge is autonomous once the clean-verdict, thread, and
+  CI gates pass.
 ---
 
 # Shepherd a PR through Codex review
@@ -22,11 +27,18 @@ constantly, and the failure mode is always the same: a poll concludes "clean" or
 API quirks was forgotten. **The quirks are encoded in the helper script — lean on
 it instead of hand-rolling `gh api` calls each time.**
 
-The goal is to take the PR all the way to merged and report the evidence. **Merge
-is autonomous once the gates pass** — clean verdict on HEAD, 0 unresolved Codex
-threads, green checks, and `mergeStateStatus == CLEAN` (see step 6). No per-PR
-human go-ahead is required; this is the standing ShardPilot merge policy
-(authorized 2026-07-07).
+**Match the scope to the ask.** A status-only or review-only request ("check
+whether Codex finished", "request a review", "закажи ревью") ends after
+reporting the resulting state — do not continue to merge. Step 6 applies only
+when the user asked to shepherd the PR to merge, explicitly or via the
+standing policy for a PR this session itself opened.
+
+When shepherding to merge, the goal is to take the PR all the way to merged and
+report the evidence. **Merge is autonomous once the gates pass** — clean verdict
+on HEAD, 0 unresolved non-outdated threads from **any** author (human threads
+hold the gate too), green checks, and `mergeStateStatus == CLEAN` (see step 6).
+No per-PR human go-ahead is required; this is the standing ShardPilot merge
+policy (authorized 2026-07-07).
 
 ## The helper script
 
@@ -37,11 +49,26 @@ you have installed the skill as a personal skill it also works from
 Requires `gh` (authenticated) + `jq`. The second argument is always `owner/repo`
 (e.g. `shardpilot/integrations`).
 
+**Run the helper from a trusted ref, never from the PR's checkout.** A PR can
+modify this very script (and this file), so executing the copy in the PR
+worktree means running code the PR author controls — with your `gh`
+credentials. Before reviewing/merging a third-party PR, materialize the helper
+from the default branch and run that copy:
+
+```
+git fetch origin
+git show origin/<default-branch>:.claude/skills/shepherd-pr/scripts/codex-review.sh \
+  > /tmp/codex-review-trusted.sh && chmod +x /tmp/codex-review-trusted.sh
+```
+
+The PR-head copy is trustworthy only when the shepherd session itself authored
+every commit on the branch.
+
 | command | does | run how |
 |---|---|---|
 | `request <owner/repo> <pr>` | posts `@codex review`, waits for 👀, re-asks up to 5× (5 min apart) | **background** |
-| `await <owner/repo> <pr> [after-comment-id]` | polls for the verdict on HEAD, ≤20 min, with the inline-lag settle; pass the request-comment id printed by `request` so a stale same-sha verdict from before the trigger is ignored | **background** |
-| `status <owner/repo> <pr> [after-comment-id]` | one-shot snapshot (HEAD, reviewed-commit, verdict, threads, checks, mergeable); same verdict floor as `await` after a re-trigger | foreground |
+| `await <owner/repo> <pr> [after-comment-id]` | polls for the verdict on HEAD, ≤20 min, with the inline-lag settle; pass the floor comment id printed by `request` so a stale same-sha verdict from before the trigger is ignored | **background** |
+| `status <owner/repo> <pr> [after-comment-id]` | one-shot snapshot (HEAD, reviewed-commit, verdict, threads, checks, mergeable); same verdict floor as `await` after a re-trigger, and same settle window — a verdict younger than ~3.5 min reads SETTLING, not CLEAN | foreground |
 | `threads <owner/repo> <pr>` | lists unresolved review threads (id / author / path / body) for triage | foreground |
 | `resolve <owner/repo> <pr> <threadId...>` | marks addressed threads resolved (refuses IDs not belonging to that PR) | foreground |
 | `checks <owner/repo> <pr>` | GitHub Actions check-runs on HEAD | foreground |
@@ -49,10 +76,17 @@ Requires `gh` (authenticated) + `jq`. The second argument is always `owner/repo`
 **`request` and `await` sleep for minutes — always launch them with the Bash
 tool's `run_in_background: true`.** A foreground multi-minute `sleep` is blocked by
 the harness and would freeze the turn; in the background the script runs detached
-and you're notified when it exits. The exit code tells you what happened:
+and you're notified when it exits. The exit code tells you what happened,
+per command:
 
-`0` clean on HEAD · `2` findings · `3` Codex never acked (it may be down — stop) ·
-`4` timed out >20 min (review likely never started — check manually) · `64` usage.
+`request` 0 = acknowledged (👀 or fresh Codex output), 3 = never acked after 5
+attempts (Codex may be down — stop) · `await` 0 = clean on HEAD, 2 = findings,
+4 = timed out >20 min (review likely never started — check manually) ·
+`status` 0 = settled CLEAN on HEAD **with verifiably green checks**, 1 =
+anything else (findings / no verdict / unknown / settling / CI not verifiably
+green) · `checks` 0 = all green, 1 = not verifiably green ·
+`threads` 1 = thread read failed · `resolve` 1 = any thread not actually
+resolved · `64` usage/preflight error.
 
 ## The cycle
 
@@ -82,8 +116,12 @@ rather than spinning.
 
 **2. Wait for the verdict.** Run `await` in the background. It resolves to one of:
 - **CLEAN** (exit 0) — a "Didn't find any major issues" verdict whose
-  `Reviewed commit` matches HEAD (full 40-char sha), with 0 unresolved review
-  threads from **any** author — a human thread holds the gate too. Go to step 5.
+  `Reviewed commit` matches HEAD — either the full 40-char sha or, as Codex
+  normally posts, an abbreviated ~10-hex id that is a case-insensitive prefix
+  of HEAD (ids shorter than 10 hex chars fail closed; the merge-time
+  `--match-head-commit` pin in step 6 backstops the residual prefix-collision
+  risk) — with 0 unresolved review threads from **any** author — a human
+  thread holds the gate too. Go to step 5.
 - **FINDINGS** (exit 2) — one or more unresolved inline threads. Go to step 3.
 - **TIMEOUT** (exit 4) — >20 min with no verdict. A real review almost never
   takes that long, so the review probably never started (was there a 👀?). Run
@@ -121,17 +159,32 @@ repo's `AGENTS.md`.
 **5. Confirm GitHub Actions.** `checks` lists the check-runs on HEAD. All must
 pass; fix any failures (which loops back through 3–4).
 
-6. **Merge — autonomous when clean.** When the verdict is clean on HEAD, all check-runs are green, and mergeStateStatus is CLEAN, squash-merge and delete the branch. No human go-ahead is needed.
+6. **Merge — autonomous when clean AND in scope.** This step applies only when
+   the task is to shepherd the PR to merge (see the scope check at the top); on
+   a status-only or review-only request, report the gate state and stop. When
+   the verdict is clean on HEAD, all check-runs are green, and mergeStateStatus
+   is CLEAN, squash-merge with the head pinned to the exact sha the gate
+   evidence was observed on:
 
-   Two merge-time guards: (a) re-read the PR head SHA immediately before issuing
-   the merge and proceed only if it still equals the sha the clean verdict and
-   green checks were observed on — if it advanced, restart at step 1; (b) delete
-   only the temporary automation branches AGENTS.md pre-authorizes for cleanup —
-   `claude/…`, `wave/…`, `policy/…` (the `/` matters: a `wavefront-x` or
-   `wave-foo` branch is NOT covered) — or a work branch this shepherd session
-   itself created for the PR. Generic prefixes like `chore/…`, `feat/…`,
-   `fix/…` can be human-owned: unless the branch is the session's own, merge
-   without deleting and report that deletion is left to a human.
+   ```
+   gh pr merge <n> --repo <owner/repo> --squash --match-head-commit <gate-sha>
+   ```
+
+   `--match-head-commit` makes the gate→merge step atomic: if any commit lands
+   after the gates were read, GitHub refuses the merge instead of merging
+   unreviewed code. A mismatch rejection means the head moved — restart the
+   cycle at step 1 on the new head. Keep the advisory pre-merge re-read too:
+   re-read the PR head sha immediately before merging and only issue the merge
+   if it still equals `<gate-sha>` (a cheap early catch; the `--match-head-commit`
+   pin is what actually closes the race). No human go-ahead is needed.
+
+   **Branch deletion:** add `--delete-branch` only for a work branch this
+   shepherd session itself created and pushed for this PR. Any other branch —
+   including `claude/…`, `wave/…`, `policy/…` automation prefixes — may be
+   deleted only when the repo's own instructions (its AGENTS.md or
+   contributing docs) actually authorize deleting that class of branch; do not
+   assume such authorization exists. Otherwise merge without deleting and
+   report that the branch was left for its owner.
 
 ## Detection traps (why naive polling lies)
 
@@ -158,7 +211,11 @@ The script handles them; this is so you recognize them if you read raw API outpu
   Didn't find any major issues. …" lands in `issues/<n>/comments` with a
   `**Reviewed commit:** \`<sha>\`` line, while the review *object* may stay
   `COMMENTED` on an *older* commit. The authoritative "reviewed THIS commit" signal
-  is that `Reviewed commit` line == HEAD. The trailing sign-off is **random**
+  is that `Reviewed commit` line matching HEAD — and Codex writes it as an
+  **abbreviated ~10-hex id**, so the script prefix-matches it against the full
+  head sha (≥10 hex chars required; shorter fails closed). Demanding a full
+  40-char equality here false-times-out genuinely clean reviews. The trailing
+  sign-off is **random**
   (*Chef's kiss*, *Bravo*, *Swish!*, *Keep it up!*, …) — match the stable
   "Didn't find any major issues", never the sign-off.
 - **Inline-lag settle.** A review object can appear 3–5 min *before* its inline
