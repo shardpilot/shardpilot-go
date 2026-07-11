@@ -186,6 +186,36 @@ pass; fix any failures (which loops back through 3–4).
    assume such authorization exists. Otherwise merge without deleting and
    report that the branch was left for its owner.
 
+## Turn discipline: webhooks are hints, never the wake mechanism
+
+Webhook events are best-effort hints at most — never rely on one to wake you.
+CI success, new pushes, and merge-conflict transitions are **NEVER delivered as
+webhooks**, and the Codex verdict summary has been observed to skip webhook
+delivery entirely. The PR itself is the only source of truth.
+
+- **Before ending ANY turn while the PR this skill is driving is open, re-read
+  the PR state directly** (MCP `pull_request_read`: latest Codex review vs the
+  current head SHA, unresolved review threads, `mergeable_state`, and CI
+  check-runs on the head SHA). Never end a turn on the assumption that an
+  event will arrive to prompt the next step.
+- **While a Codex verdict is pending on the current head, do not end the
+  turn.** Poll in-turn on a ~5-minute cadence until the verdict lands or a
+  genuine user-blocking question arises. Standalone `sleep` is blocked by the
+  harness and foreground Bash calls cap at 10 minutes — pace each polling
+  interval with a bounded busy-wait instead:
+
+  ```
+  target=$(( $(date +%s) + 300 )); until [ $(date +%s) -ge $target ]; do :; done
+  ```
+
+- **On every wake, reconcile the full PR state before acting on the event that
+  woke you.** Assume events were missed while you were away — given the
+  delivery gaps above, the waking event is never the whole story.
+- **Never end a turn relying on a background monitor, timer, or scheduled
+  self-check-in to resume PR work** — they do not survive container idle.
+  Background helper runs (`request`/`await`) are fine *within* a turn, but the
+  turn stays open and keeps polling until the pending state is resolved.
+
 ## Detection traps (why naive polling lies)
 
 These are the specific bugs that have caused false "clean"/"no verdict" calls.
