@@ -106,6 +106,37 @@ Run each repo's full gate (`make ci`, or the repo's aggregate check) locally
 from the worktree **after committing** and treat that output as the artifact —
 a green remote check can pass vacuously on an empty diff.
 
+### Per-repo gates (SDK, docs, and ops repos)
+
+**The authoritative gate for any repo is its own `.github/workflows/ci.yml` —
+not this table.** Before reporting "gate passed", open that workflow,
+enumerate its jobs, and account for every one with one of the four statuses:
+`Pass` or `Fail` with its output as the artifact, `Blocked` (cannot run here
+— say why), or `Not tested` (with the reason). The rows below are pointers,
+not the contract.
+
+The table above covers Go/Angular/data surfaces, but this skill also ships to
+repos with entirely different gates. Run the gate commands locally from the
+worktree after committing and treat their output as the evidence. Jobs that
+are license- or infra-gated and did not run are reported `Blocked` with the
+gating reason — never assumed `Pass`; a probe/preflight job that exists only
+to gate an optional job is accounted for together with the job it gates.
+shardpilot-unity, shardpilot-unreal, and marketing-site each also run a
+gitleaks secret-scan job — run the same scan locally (the
+`ghcr.io/gitleaks/gitleaks` Docker image works) or report it
+`Blocked (gitleaks not installable here)`.
+
+| Repo | Gate (evidence = its output) |
+|---|---|
+| shardpilot-unity | JSON-parse `package.json` + every `*.asmdef`; `./tools~/headless-tests/run.sh`; gitleaks secret scan (see above). The dotnet-format job self-skips while the package ships no `.csproj`/`.editorconfig` outside `tools~/` — report it `Not tested (no format inputs; CI job self-skips)`, and if inputs appear, run the variant CI selects. The GameCI editmode/playmode jobs require `UNITY_LICENSE`/`UNITY_EMAIL`/`UNITY_PASSWORD` secrets and normally skip — report them `Blocked (no Unity license secrets)`, not Pass |
+| shardpilot-unreal | `make test` (portable C++ core); gitleaks secret scan (`gitleaks detect --source . --redact --verbose`) — report it `Blocked` if gitleaks isn't installable locally. The in-engine "Unreal Engine smoke" job (`Automation RunTests ShardPilot`) requires `EPIC_GHCR_TOKEN` plus a configured engine image/runner and normally skips — report it `Blocked (no Unreal engine container/runner)`, not Pass |
+| shardpilot-defold | `bash -n scripts/*.sh`; `./scripts/check_library.sh`; `lua5.4 test/test_sdk.lua`, `lua5.4 test/test_crash.lua`, `lua5.4 test/test_remote_config.lua` |
+| docs | `make check && make lint` |
+| developers | `git diff --check origin/main...HEAD` (whitespace, three-dot against the PR base ref exactly as its CI runs it — a bare `git diff --check` sees only unstaged changes and passes vacuously after committing); `bash -n scripts/*.sh && ./scripts/check_docs.sh` |
+| infra | `make ci`, plus `make k8s-lint` (needs kubeconform/helm/kustomize/yq/shellcheck installed) |
+| qa | `npm ci`, then `make check && make ci` |
+| marketing-site | `npm ci`; `npm audit --audit-level=high`; `npm run lint && npm run check && npm run build && npm run check:links`; `npm run build:live` (live-mode build); gitleaks secret scan (see above). The Cloudflare Workers preview/production deploy jobs run only in CI — account for them as `Blocked (CI-only deploy)` |
+
 ## References — read the relevant file in full before planning the run
 
 | File | When |
