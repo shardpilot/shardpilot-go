@@ -705,11 +705,12 @@ func TestPublishWorkerBatchDropsPermanentEncodeFailure(t *testing.T) {
 
 	var consentEpoch uint64
 	var deferUntil time.Time
+	backoffAttempt := 0
 	retained := client.publishWorkerBatch([]Event{{
 		ID:      "evt-encode-failure",
 		Name:    "encode_failure",
 		Context: map[string]any{"bad": func() {}},
-	}}, &consentEpoch, &deferUntil)
+	}}, &consentEpoch, &deferUntil, &backoffAttempt)
 	if len(retained) != 0 {
 		t.Fatalf("expected worker to drop permanent encode failure, got %+v", retained)
 	}
@@ -741,14 +742,21 @@ func TestPublishWorkerBatchRetainsFailedBatch(t *testing.T) {
 	batch := []Event{{ID: "evt-1", Name: "first"}}
 	var consentEpoch uint64
 	var deferUntil time.Time
-	retained := client.publishWorkerBatch(batch, &consentEpoch, &deferUntil)
+	backoffAttempt := 0
+	retained := client.publishWorkerBatch(batch, &consentEpoch, &deferUntil, &backoffAttempt)
 	if len(retained) != 1 || retained[0].ID != "evt-1" {
 		t.Fatalf("expected worker to retain failed batch, got %+v", retained)
 	}
+	if backoffAttempt != 1 {
+		t.Fatalf("expected the retained failure to advance the backoff attempt, got %d", backoffAttempt)
+	}
 
-	retained = client.publishWorkerBatch(retained, &consentEpoch, &deferUntil)
+	retained = client.publishWorkerBatch(retained, &consentEpoch, &deferUntil, &backoffAttempt)
 	if len(retained) != 0 {
 		t.Fatalf("expected successful retry to clear batch, got %+v", retained)
+	}
+	if backoffAttempt != 0 {
+		t.Fatalf("expected the successful retry to reset the backoff attempt, got %d", backoffAttempt)
 	}
 }
 
