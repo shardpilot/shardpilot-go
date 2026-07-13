@@ -354,7 +354,7 @@ func (c *Client) run() {
 			batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
 		case request := <-c.flushRequests:
 			var err error
-			batch, err = c.flushAvailable(request.ctx, batch, &seenConsentEpoch)
+			batch, err = c.flushAvailable(request.ctx, batch, &seenConsentEpoch, &backoffAttempt)
 			if len(batch) == 0 {
 				// The batch the deferral was protecting is gone — delivered,
 				// dropped as permanent, or discarded by a consent denial. A
@@ -363,7 +363,9 @@ func (c *Client) run() {
 				// re-arms it when it carries its own hint.
 				deferUntil = time.Time{}
 			}
-			c.applyRetryPacing(err, &deferUntil, &backoffAttempt)
+			if !callerAbandonedFlush(request.ctx, err) {
+				c.applyRetryPacing(err, &deferUntil, &backoffAttempt)
+			}
 			request.reply <- err
 		case <-c.stop:
 			return
@@ -407,12 +409,17 @@ func (c *Client) publishDeferred(deferUntil time.Time) bool {
 // "Retry-After: 0" ("retry now") replaces an earlier longer deadline and the
 // worker retries immediately via the elapsed-deadline path. A retryable
 // failure WITHOUT a usable hint falls back to the client-side backoff
-// schedule: it advances the consecutive-failure count and defers by
-// backoffDelay, so a sustained outage is retried with exponentially growing,
+// schedule: it advances the consecutive-failure count and re-arms the
+// deadline from backoffDelay — clearing it on the first failure, whose
+// schedule slot is "retry at the flush cadence" (the latest failure's word
+// wins here too, so a stale longer hint from a previous attempt cannot park
+// the batch) — so a sustained outage is retried with exponentially growing,
 // jittered spacing instead of at a fixed cadence in lockstep across the
 // fleet. A fully successful outcome clears the deadline and resets the
-// backoff; a permanent failure leaves both untouched (the batch is dropped,
-// never retried).
+// backoff. A permanent failure never arms a deferral; when it is an HTTP
+// response (the endpoint answered — the outage, if any, is over) it also
+// resets the backoff streak, while client-side permanent errors (encode,
+// consent) say nothing about the endpoint and leave pacing untouched.
 func (c *Client) applyRetryPacing(err error, deferUntil *time.Time, backoffAttempt *int) {
 	if err == nil {
 		*deferUntil = time.Time{}
@@ -432,12 +439,26 @@ func (c *Client) applyRetryPacing(err error, deferUntil *time.Time, backoffAttem
 		return
 	}
 	if isPermanentPublishError(err) {
+		if statusErr != nil {
+			*backoffAttempt = 0
+		}
 		return
 	}
 	*backoffAttempt++
 	if delay := c.backoffDelay(*backoffAttempt); delay > 0 {
 		*deferUntil = c.clock.Now().Add(delay)
+	} else {
+		*deferUntil = time.Time{}
 	}
+}
+
+// callerAbandonedFlush reports whether a failed explicit Flush was cut short
+// by its own caller's context (cancellation or deadline) rather than by the
+// ingest endpoint. Caller abandonment is not a backpressure signal, so it
+// must neither advance nor re-arm retry pacing — and it must not reset it
+// either, since nothing was learned about the endpoint.
+func callerAbandonedFlush(ctx context.Context, err error) bool {
+	return err != nil && ctx != nil && ctx.Err() != nil
 }
 
 // minRetryNowSpacing floors an explicit "Retry-After: 0" so honoring the
@@ -516,7 +537,7 @@ func (c *Client) dropBatchOnConsentEpoch(batch []Event, seenEpoch *uint64) []Eve
 	return batch
 }
 
-func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentEpoch *uint64) ([]Event, error) {
+func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentEpoch *uint64, backoffAttempt *int) ([]Event, error) {
 	var firstErr error
 	for {
 		batch = c.dropBatchOnConsentEpoch(batch, seenConsentEpoch)
@@ -546,6 +567,12 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 				c.stats.dropped.Add(uint64(len(batch)))
 				batch = batch[:0]
 			} else {
+				// EVERY successful publish ends the failure streak — a flush
+				// can deliver several batches and still return a later
+				// batch's error, and that error must be paced as a FIRST
+				// failure, not as a continuation of a streak a mid-flush
+				// success already broke.
+				*backoffAttempt = 0
 				batch = batch[:0]
 			}
 		}

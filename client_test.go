@@ -436,7 +436,8 @@ func TestInvalidQueuedBuildErrorDoesNotBlockLaterValidEvents(t *testing.T) {
 	}
 
 	var consentEpoch uint64
-	batch, err := client.flushAvailable(context.Background(), nil, &consentEpoch)
+	backoffAttempt := 0
+	batch, err := client.flushAvailable(context.Background(), nil, &consentEpoch, &backoffAttempt)
 	if !errors.Is(err, ErrInvalidEvent) {
 		t.Fatalf("expected ErrInvalidEvent, got %v", err)
 	}
@@ -480,7 +481,8 @@ func TestPermanentHTTPStatusDoesNotBlockLaterValidEvents(t *testing.T) {
 			}
 
 			var consentEpoch uint64
-			batch, err := client.flushAvailable(context.Background(), nil, &consentEpoch)
+			backoffAttempt := 0
+			batch, err := client.flushAvailable(context.Background(), nil, &consentEpoch, &backoffAttempt)
 			var statusErr *HTTPStatusError
 			if !errors.As(err, &statusErr) || statusErr.StatusCode != statusCode {
 				t.Fatalf("expected HTTPStatusError %d, got %v", statusCode, err)
@@ -549,7 +551,8 @@ func TestPermanentEncodeErrorDoesNotBlockLaterValidEvents(t *testing.T) {
 	}
 
 	var consentEpoch uint64
-	batch, err := client.flushAvailable(context.Background(), nil, &consentEpoch)
+	backoffAttempt := 0
+	batch, err := client.flushAvailable(context.Background(), nil, &consentEpoch, &backoffAttempt)
 	var encodeErr *EncodeError
 	if !errors.As(err, &encodeErr) {
 		t.Fatalf("expected EncodeError, got %v", err)
@@ -597,7 +600,8 @@ func TestFlushAvailableRetainsFailedBatchAndRetries(t *testing.T) {
 	}
 
 	var consentEpoch uint64
-	batch, err := client.flushAvailable(context.Background(), nil, &consentEpoch)
+	backoffAttempt := 0
+	batch, err := client.flushAvailable(context.Background(), nil, &consentEpoch, &backoffAttempt)
 	if !errors.Is(err, firstErr) {
 		t.Fatalf("expected first error, got %v", err)
 	}
@@ -614,7 +618,7 @@ func TestFlushAvailableRetainsFailedBatchAndRetries(t *testing.T) {
 		t.Fatalf("unexpected stats after failed flush: %+v", stats)
 	}
 
-	batch, err = client.flushAvailable(context.Background(), batch, &consentEpoch)
+	batch, err = client.flushAvailable(context.Background(), batch, &consentEpoch, &backoffAttempt)
 	if err != nil {
 		t.Fatalf("retry flush returned error: %v", err)
 	}
@@ -654,7 +658,8 @@ func TestRetryableHTTPStatusRetainsFailedBatch(t *testing.T) {
 				t.Fatal("expected retryable-status enqueue to succeed")
 			}
 			var consentEpoch uint64
-			batch, err := client.flushAvailable(context.Background(), nil, &consentEpoch)
+			backoffAttempt := 0
+			batch, err := client.flushAvailable(context.Background(), nil, &consentEpoch, &backoffAttempt)
 			var statusErr *HTTPStatusError
 			if !errors.As(err, &statusErr) || statusErr.StatusCode != statusCode {
 				t.Fatalf("expected HTTPStatusError %d, got %v", statusCode, err)
@@ -663,7 +668,7 @@ func TestRetryableHTTPStatusRetainsFailedBatch(t *testing.T) {
 				t.Fatalf("expected retryable status batch retained, got %+v", batch)
 			}
 
-			batch, err = client.flushAvailable(context.Background(), batch, &consentEpoch)
+			batch, err = client.flushAvailable(context.Background(), batch, &consentEpoch, &backoffAttempt)
 			if err != nil {
 				t.Fatalf("retry flush returned error: %v", err)
 			}
