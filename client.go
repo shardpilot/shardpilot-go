@@ -39,6 +39,12 @@ type Client struct {
 	// recovery).
 	workerSeenSuccesses uint64
 
+	// pacingWake nudges a parked worker when publishSuccesses moves, so a
+	// recovery proven by a synchronous Track retries the held batch NOW
+	// instead of at the next flush tick (which can be minutes away).
+	// Capacity 1 with non-blocking sends: one pending nudge is enough.
+	pacingWake chan struct{}
+
 	flushRequests chan flushRequest
 	stop          chan struct{}
 	workerDone    chan struct{}
@@ -98,6 +104,7 @@ func NewClient(cfg Config) (*Client, error) {
 		jitter:            rand.Float64,
 		queue:             newBoundedQueue(normalized.BufferSize),
 		transport:         newHTTPTransport(normalized),
+		pacingWake:        make(chan struct{}, 1),
 		flushRequests:     make(chan flushRequest),
 		stop:              make(chan struct{}),
 		workerDone:        make(chan struct{}),
@@ -322,10 +329,16 @@ func (c *Client) run() {
 			// A publish succeeded since the worker's pacing state last
 			// settled — typically a synchronous Track on a caller goroutine
 			// while the worker waited out a deadline. The endpoint is
-			// healthy again: stop waiting and restart the schedule.
+			// healthy again: stop waiting, restart the schedule, and retry
+			// a held batch NOW rather than at the next flush tick (which
+			// can be minutes away on a long FlushInterval).
 			c.workerSeenSuccesses = successes
 			deferUntil = time.Time{}
 			backoffAttempt = 0
+			if len(batch) > 0 {
+				batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
+				continue
+			}
 		}
 		queueEvents := c.queue.ch
 		if len(batch) >= c.cfg.BatchSize {
@@ -375,6 +388,11 @@ func (c *Client) run() {
 				continue
 			}
 			batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
+		case <-c.pacingWake:
+			// A publish succeeded elsewhere (typically a synchronous Track)
+			// while the worker was parked: loop back so the pacing check at
+			// the top clears any stale deferral and retries the held batch.
+			continue
 		case request := <-c.flushRequests:
 			var err error
 			batch, err = c.flushAvailable(request.ctx, batch, &seenConsentEpoch, &backoffAttempt)
@@ -490,17 +508,19 @@ func (c *Client) applyRetryPacing(err error, deferUntil *time.Time, backoffAttem
 
 // callerAbandonedFlush reports whether a failed explicit Flush was cut short
 // by its own caller's context (cancellation or deadline) rather than by the
-// ingest endpoint. Only a failure that IS the context's error counts: a real
-// endpoint outcome (an HTTP status error, a connection refusal) racing the
-// caller's deadline is still endpoint feedback and must pace. Caller
-// abandonment is not a backpressure signal, so it must neither advance nor
-// re-arm retry pacing — and it must not reset it either, since nothing was
-// learned about the endpoint.
+// ingest endpoint. Only a failure that IS the caller context's OWN error
+// state counts (errors.Is against ctx.Err()): a real endpoint outcome — an
+// HTTP status error, a connection refusal, or even a transport timeout
+// (DeadlineExceeded) under a merely CANCELED caller context — is still
+// endpoint feedback and must pace. Caller abandonment is not a backpressure
+// signal, so it must neither advance nor re-arm retry pacing — and it must
+// not reset it either, since nothing was learned about the endpoint.
 func callerAbandonedFlush(ctx context.Context, err error) bool {
-	if err == nil || ctx == nil || ctx.Err() == nil {
+	if err == nil || ctx == nil {
 		return false
 	}
-	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+	ctxErr := ctx.Err()
+	return ctxErr != nil && errors.Is(err, ctxErr)
 }
 
 // minRetryNowSpacing floors an explicit "Retry-After: 0" so honoring the
@@ -613,6 +633,16 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 				}
 				if firstErr == nil {
 					firstErr = err
+				}
+				var statusErr *HTTPStatusError
+				if errors.As(err, &statusErr) {
+					// A swallowed permanent HTTP response is still a
+					// RESPONSE: the endpoint answered, so the hint-less
+					// streak ends here even though the flush keeps
+					// draining — applyRetryPacing never sees this error
+					// unless it is the flush's final word (same rationale
+					// as its own permanent-HTTP reset).
+					*backoffAttempt = 0
 				}
 				c.stats.dropped.Add(uint64(len(batch)))
 				batch = batch[:0]
@@ -729,8 +759,14 @@ func (c *Client) publishBatchWithContext(ctx context.Context, events []Event) er
 	c.notifyBatchResult(result.toPublic())
 	// Signal the success to the worker's pacing state: a synchronous Track
 	// (or any other path) proving the endpoint healthy must clear a stale
-	// retry deadline instead of letting it hold automatic publishes.
+	// retry deadline instead of letting it hold automatic publishes. The
+	// non-blocking nudge wakes a parked worker so the held batch retries
+	// promptly instead of at the next flush tick.
 	c.publishSuccesses.Add(1)
+	select {
+	case c.pacingWake <- struct{}{}:
+	default:
+	}
 	return nil
 }
 

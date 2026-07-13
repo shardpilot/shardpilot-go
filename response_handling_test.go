@@ -438,6 +438,13 @@ func TestCallerAbandonedFlushDoesNotPace(t *testing.T) {
 		t.Fatal("expected a transport failure to pace even under a canceled caller context")
 	}
 
+	// The error must match the caller context's OWN state: a transport
+	// timeout (DeadlineExceeded) under a merely CANCELED caller context is
+	// the endpoint's doing, not the caller's, and must pace.
+	if callerAbandonedFlush(canceled, fmt.Errorf("publish: %w", context.DeadlineExceeded)) {
+		t.Fatal("expected a transport deadline under a canceled caller context to pace")
+	}
+
 	// A cancellation-shaped failure with the caller context still live is
 	// the transport's own doing (HTTP timeout) and must pace.
 	if callerAbandonedFlush(context.Background(), context.DeadlineExceeded) {
@@ -493,15 +500,15 @@ func TestConsentDenialDiscardResetsBackoffStreak(t *testing.T) {
 
 func TestTrackSuccessClearsWorkerBackoff(t *testing.T) {
 	var calls atomic.Int64
-	var stamps [4]atomic.Int64
+	var stamps [3]atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		call := calls.Add(1)
-		if call <= 4 {
+		if call <= 3 {
 			stamps[call-1].Store(time.Now().UnixMilli())
 		}
-		if call <= 2 {
-			// Two hint-less 5xx: the worker arms the 1s backoff floor after
-			// the second failure.
+		if call == 1 {
+			// A hint-less 5xx: the batch is retained; with a 10-minute
+			// flush interval the next automatic attempt is far away.
 			w.WriteHeader(http.StatusInternalServerError)
 			_, _ = w.Write([]byte(`{"error":{"code":"internal_error","message":"broker unavailable"}}`))
 			return
@@ -511,6 +518,8 @@ func TestTrackSuccessClearsWorkerBackoff(t *testing.T) {
 	}))
 	defer server.Close()
 
+	// The flush interval is deliberately enormous: only the success-signal
+	// nudge can produce a prompt retry of the retained batch.
 	client, err := NewClient(Config{
 		IngestURL:     server.URL,
 		Token:         "token-value",
@@ -519,7 +528,7 @@ func TestTrackSuccessClearsWorkerBackoff(t *testing.T) {
 		EnvironmentID: "develop",
 		Source:        SourceBackend,
 		BatchSize:     1,
-		FlushInterval: 50 * time.Millisecond,
+		FlushInterval: 10 * time.Minute,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -529,19 +538,63 @@ func TestTrackSuccessClearsWorkerBackoff(t *testing.T) {
 	if err := client.Enqueue(Event{Name: "outage_victim"}); err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
-	// Failure 1 at the cadence, failure 2 arms the 1s backoff floor.
-	waitFor(t, 5*time.Second, "two failing attempts", func() bool { return calls.Load() >= 2 })
+	waitFor(t, 5*time.Second, "the failing attempt", func() bool { return calls.Load() >= 1 })
 
-	// A synchronous Track succeeds mid-deferral (call 3): the endpoint is
-	// healthy, so the retained batch must retry promptly (call 4) instead
-	// of waiting out the rest of the armed deadline.
+	// A synchronous Track succeeds (call 2): the endpoint is healthy, so
+	// the nudge must wake the parked worker and retry the retained batch
+	// (call 3) promptly — NOT at the flush tick minutes away.
 	if err := client.Track(context.Background(), Event{Name: "recovery_probe"}); err != nil {
 		t.Fatalf("track: %v", err)
 	}
-	waitFor(t, 3*time.Second, "the retained batch retry after recovery", func() bool { return calls.Load() >= 4 })
-	gap := stamps[3].Load() - stamps[2].Load()
-	if gap >= 800 {
-		t.Fatalf("expected the Track success to clear the stale deadline and retry at the cadence, got %dms", gap)
+	waitFor(t, 3*time.Second, "the retained batch retry after recovery", func() bool { return calls.Load() >= 3 })
+	gap := stamps[2].Load() - stamps[1].Load()
+	if gap >= 2000 {
+		t.Fatalf("expected the Track success to nudge a prompt retry, got %dms", gap)
+	}
+}
+
+func TestFlushSwallowedPermanentHTTPResetsStreak(t *testing.T) {
+	// The flush loop swallows a permanent HTTP rejection (drops the batch,
+	// keeps draining) and then returns a LATER batch's retryable failure.
+	// The swallowed 4xx proved the endpoint answered, so the pre-flush
+	// streak must end there and the returned 5xx paces as a first failure.
+	transport := &scriptedTransport{errs: []error{&HTTPStatusError{StatusCode: 400}, &HTTPStatusError{StatusCode: 503}}}
+	client := &Client{
+		cfg: Config{
+			WorkspaceID:   "workspace-test",
+			AppID:         "app-test",
+			EnvironmentID: "develop",
+			Source:        SourceBackend,
+			BatchSize:     1,
+			HTTPTimeout:   time.Second,
+		},
+		clock:     realClock{},
+		queue:     newBoundedQueue(2),
+		transport: transport,
+	}
+	if !client.queue.enqueue(Event{ID: "evt-2", Name: "second"}) {
+		t.Fatal("enqueue evt-2")
+	}
+
+	batch := []Event{{ID: "evt-1", Name: "first"}}
+	var consentEpoch uint64
+	backoffAttempt := 5 // a pre-flush failure streak
+	retained, err := client.flushAvailable(context.Background(), batch, &consentEpoch, &backoffAttempt)
+	var statusErr *HTTPStatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("expected the later 503 to be returned, got %v", err)
+	}
+	if len(retained) != 1 || retained[0].ID != "evt-2" {
+		t.Fatalf("expected the second batch retained, got %+v", retained)
+	}
+	if backoffAttempt != 0 {
+		t.Fatalf("expected the swallowed permanent HTTP response to reset the streak, got %d", backoffAttempt)
+	}
+
+	var deferUntil time.Time
+	client.applyRetryPacing(err, &deferUntil, &backoffAttempt)
+	if backoffAttempt != 1 || !deferUntil.IsZero() {
+		t.Fatalf("expected the post-flush failure to pace as attempt 1 at the cadence, got attempt=%d deferUntil=%v", backoffAttempt, deferUntil)
 	}
 }
 
