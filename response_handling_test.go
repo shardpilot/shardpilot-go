@@ -414,18 +414,34 @@ func TestApplyRetryPacingBacksOffWithoutHint(t *testing.T) {
 func TestCallerAbandonedFlushDoesNotPace(t *testing.T) {
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
-	failure := errors.New("publish aborted")
 
-	// A failure under the caller's own cancellation is not a backpressure
-	// signal: pacing is skipped entirely.
-	if !callerAbandonedFlush(canceled, failure) {
-		t.Fatal("expected a failed flush under a canceled caller context to be abandoned")
+	// A failure that IS the caller's cancellation (possibly wrapped) is not
+	// a backpressure signal: pacing is skipped entirely.
+	if !callerAbandonedFlush(canceled, context.Canceled) {
+		t.Fatal("expected a context.Canceled failure under a canceled caller context to be abandoned")
+	}
+	if !callerAbandonedFlush(canceled, fmt.Errorf("publish: %w", context.Canceled)) {
+		t.Fatal("expected a wrapped cancellation to be abandoned")
+	}
+	expired, expire := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer expire()
+	if !callerAbandonedFlush(expired, fmt.Errorf("publish: %w", context.DeadlineExceeded)) {
+		t.Fatal("expected a caller-deadline failure to be abandoned")
 	}
 
-	// The same failure with the caller context still live IS endpoint
-	// feedback and must pace.
-	if callerAbandonedFlush(context.Background(), failure) {
-		t.Fatal("expected a failed flush under a live context to apply pacing")
+	// A REAL endpoint outcome racing the caller's deadline is still
+	// endpoint feedback and must pace, even though ctx.Err() is non-nil.
+	if callerAbandonedFlush(canceled, &HTTPStatusError{StatusCode: 503}) {
+		t.Fatal("expected an HTTP status failure to pace even under a canceled caller context")
+	}
+	if callerAbandonedFlush(canceled, errors.New("dial tcp: connection refused")) {
+		t.Fatal("expected a transport failure to pace even under a canceled caller context")
+	}
+
+	// A cancellation-shaped failure with the caller context still live is
+	// the transport's own doing (HTTP timeout) and must pace.
+	if callerAbandonedFlush(context.Background(), context.DeadlineExceeded) {
+		t.Fatal("expected a failure under a live context to apply pacing")
 	}
 
 	// A flush that finished successfully paces (resets) even if the caller
@@ -435,8 +451,97 @@ func TestCallerAbandonedFlushDoesNotPace(t *testing.T) {
 	}
 
 	// A nil context can never be the cause of the failure.
-	if callerAbandonedFlush(nil, failure) {
+	if callerAbandonedFlush(nil, context.Canceled) {
 		t.Fatal("expected a nil caller context to never mark the flush abandoned")
+	}
+}
+
+func TestConsentDenialDiscardResetsBackoffStreak(t *testing.T) {
+	clock := &stubClock{now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	client := &Client{clock: clock}
+	client.jitter = func() float64 { return 0 }
+
+	// A denial surfacing as ErrConsentDenied from the publish itself: the
+	// discarded batch takes the streak with it, and no deferral is armed.
+	var deferUntil time.Time
+	attempt := 3
+	client.applyRetryPacing(ErrConsentDenied, &deferUntil, &attempt)
+	if attempt != 0 || !deferUntil.IsZero() {
+		t.Fatalf("after mid-publish denial: attempt=%d deferUntil=%v, want 0 and zero", attempt, deferUntil)
+	}
+
+	// The epoch-based discard of a held batch resets the streak too.
+	client.consentEpoch.Add(1)
+	seen := uint64(0)
+	attempt = 4
+	batch := client.dropBatchOnConsentEpoch([]Event{{ID: "evt-1", Name: "denied"}}, &seen, &attempt)
+	if len(batch) != 0 {
+		t.Fatalf("expected the epoch discard to clear the batch, got %+v", batch)
+	}
+	if attempt != 0 {
+		t.Fatalf("expected the epoch discard to reset the streak, got %d", attempt)
+	}
+
+	// An epoch move with NOTHING held resets nothing — there was no batch
+	// for the streak to belong to.
+	client.consentEpoch.Add(1)
+	attempt = 2
+	if got := client.dropBatchOnConsentEpoch(nil, &seen, &attempt); len(got) != 0 || attempt != 2 {
+		t.Fatalf("expected an empty-batch epoch move to leave the streak, got batch=%v attempt=%d", got, attempt)
+	}
+}
+
+func TestTrackSuccessClearsWorkerBackoff(t *testing.T) {
+	var calls atomic.Int64
+	var stamps [4]atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := calls.Add(1)
+		if call <= 4 {
+			stamps[call-1].Store(time.Now().UnixMilli())
+		}
+		if call <= 2 {
+			// Two hint-less 5xx: the worker arms the 1s backoff floor after
+			// the second failure.
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":{"code":"internal_error","message":"broker unavailable"}}`))
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"accepted":1,"rejected":0,"duplicates":0}`))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(Config{
+		IngestURL:     server.URL,
+		Token:         "token-value",
+		WorkspaceID:   "workspace-test",
+		AppID:         "app-test",
+		EnvironmentID: "develop",
+		Source:        SourceBackend,
+		BatchSize:     1,
+		FlushInterval: 50 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	if err := client.Enqueue(Event{Name: "outage_victim"}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	// Failure 1 at the cadence, failure 2 arms the 1s backoff floor.
+	waitFor(t, 5*time.Second, "two failing attempts", func() bool { return calls.Load() >= 2 })
+
+	// A synchronous Track succeeds mid-deferral (call 3): the endpoint is
+	// healthy, so the retained batch must retry promptly (call 4) instead
+	// of waiting out the rest of the armed deadline.
+	if err := client.Track(context.Background(), Event{Name: "recovery_probe"}); err != nil {
+		t.Fatalf("track: %v", err)
+	}
+	waitFor(t, 3*time.Second, "the retained batch retry after recovery", func() bool { return calls.Load() >= 4 })
+	gap := stamps[3].Load() - stamps[2].Load()
+	if gap >= 800 {
+		t.Fatalf("expected the Track success to clear the stale deadline and retry at the cadence, got %dms", gap)
 	}
 }
 
