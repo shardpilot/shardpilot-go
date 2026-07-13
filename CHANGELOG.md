@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Retryable batch publish failures **without** a `Retry-After` hint (server unreachable,
+  `5xx` without the header) now fall back to client-side exponential backoff with full
+  jitter instead of retrying at the fixed flush cadence indefinitely: the first failure
+  still retries at the flush cadence, each further consecutive failure defers the next
+  automatic attempt by a random wait in [1s, ceiling] with the ceiling doubling per
+  failure up to 60s, and a successful publish resets the schedule. A server `Retry-After`
+  hint still takes precedence exactly as before, explicit `Flush`/`Close` attempts remain
+  ungated, and a consent denial that discards the held batch clears the backoff along
+  with the deferral. This mirrors the shardpilot-defold reference semantics and removes
+  the fixed ~1s fleet-wide retry storm during ingest outages.
+
 ## v0.4.0-alpha — 2026-07-06 — consent, result callbacks, JWT mint
 
 - The analytics client now parses the error envelope on non-2xx ingest responses and honors

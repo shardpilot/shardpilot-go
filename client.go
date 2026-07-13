@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,33 @@ type Client struct {
 	queue     *boundedQueue
 	transport transport
 	stats     statsCollector
+
+	// jitter is the uniform [0, 1) source for the publish backoff's full
+	// jitter; tests pin it for deterministic schedules. Only the flush
+	// worker goroutine reads it. Nil falls back to the shared math/rand
+	// source (bare Clients constructed in tests).
+	jitter func() float64
+
+	// publishSuccesses counts every successful batch publish on ANY path —
+	// including synchronous Track publishes on caller goroutines. The worker
+	// samples it (against workerSeenSuccesses) to learn that the endpoint
+	// recovered while it was waiting out a retry deadline: a success that
+	// happened after the deadline was armed clears the deferral and resets
+	// the backoff, exactly like a success on the worker's own path.
+	publishSuccesses atomic.Uint64
+
+	// workerSeenSuccesses is the worker's last-consumed publishSuccesses
+	// value. Owned by the flush worker goroutine exclusively (resynced by
+	// applyRetryPacing when a publish outcome settles, so a success
+	// concurrent with a failing publish is never mistaken for a later
+	// recovery).
+	workerSeenSuccesses uint64
+
+	// pacingWake nudges a parked worker when publishSuccesses moves, so a
+	// recovery proven by a synchronous Track retries the held batch NOW
+	// instead of at the next flush tick (which can be minutes away).
+	// Capacity 1 with non-blocking sends: one pending nudge is enough.
+	pacingWake chan struct{}
 
 	flushRequests chan flushRequest
 	stop          chan struct{}
@@ -73,8 +101,10 @@ func NewClient(cfg Config) (*Client, error) {
 	client := &Client{
 		cfg:               normalized,
 		clock:             realClock{},
+		jitter:            rand.Float64,
 		queue:             newBoundedQueue(normalized.BufferSize),
 		transport:         newHTTPTransport(normalized),
+		pacingWake:        make(chan struct{}, 1),
 		flushRequests:     make(chan flushRequest),
 		stop:              make(chan struct{}),
 		workerDone:        make(chan struct{}),
@@ -261,14 +291,19 @@ func (c *Client) run() {
 
 	batch := make([]Event, 0, c.cfg.BatchSize)
 	seenConsentEpoch := c.consentEpoch.Load()
-	// deferUntil is the server-backpressure deadline: after a retryable
-	// failure that carried a Retry-After hint, automatic publishes (batch-full
-	// and flush-interval ticks) hold off until it passes. Events keep
-	// accumulating in the batch and the queue meanwhile — the bounded queue is
-	// the backpressure surface. Explicit Flush (and therefore Close) attempts
-	// are NOT gated: they carry caller intent, and a renewed failure simply
-	// re-arms the deadline.
+	// deferUntil is the retry-pacing deadline: after a retryable failure,
+	// automatic publishes (batch-full and flush-interval ticks) hold off
+	// until it passes. It is armed from the server's Retry-After hint when
+	// the failure carried one, else from the client-side exponential-backoff
+	// schedule (backoffDelay). Events keep accumulating in the batch and the
+	// queue meanwhile — the bounded queue is the backpressure surface.
+	// Explicit Flush (and therefore Close) attempts are NOT gated: they
+	// carry caller intent, and a renewed failure simply re-arms the deadline.
 	var deferUntil time.Time
+	// backoffAttempt counts consecutive retryable publish failures so the
+	// hint-less fallback schedule (backoffDelay) grows per failure; a
+	// successful publish resets it.
+	backoffAttempt := 0
 	// deferTimer wakes the worker AT the backpressure deadline, so the held
 	// batch retries when the server said it may — not at the next flush tick,
 	// which can be much later when FlushInterval exceeds the Retry-After. It
@@ -281,13 +316,37 @@ func (c *Client) run() {
 	}()
 	for {
 		hadBatch := len(batch) > 0
-		batch = c.dropBatchOnConsentEpoch(batch, &seenConsentEpoch)
+		batch = c.dropBatchOnConsentEpoch(batch, &seenConsentEpoch, &backoffAttempt)
 		if hadBatch && len(batch) == 0 {
 			// A consent denial discarded the batch the deferral was
-			// protecting: clear the deadline too, or a deny→re-grant round
-			// trip would hold FRESH post-grant events behind a stale
-			// Retry-After (up to the 24h clamp) with nothing left to retry.
+			// protecting: clear the deadline too (the drop itself reset the
+			// backoff progression), or a deny→re-grant round trip would hold
+			// FRESH post-grant events behind a stale Retry-After (up to the
+			// 24h clamp) with nothing left to retry.
 			deferUntil = time.Time{}
+		}
+		if successes := c.publishSuccesses.Load(); successes != c.workerSeenSuccesses {
+			// A publish succeeded since the worker's pacing state last
+			// settled — typically a synchronous Track on a caller goroutine
+			// while the worker waited out a deadline. The endpoint is
+			// healthy again: stop waiting and restart the schedule. The
+			// immediate retry below fires ONLY when the success cleared an
+			// actual recovery state (an armed deadline or a failure streak
+			// holding a retained batch) — during normal operation a Track
+			// success must not flush healthy partial batches early and
+			// defeat BatchSize/FlushInterval batching. Every retained-for-
+			// retry batch has such state: a hint-less failure advances the
+			// streak and a hinted one arms the deadline.
+			c.workerSeenSuccesses = successes
+			recovered := !deferUntil.IsZero() || backoffAttempt > 0
+			deferUntil = time.Time{}
+			backoffAttempt = 0
+			if recovered && len(batch) > 0 {
+				// Retry the held batch NOW rather than at the next flush
+				// tick, which can be minutes away on a long FlushInterval.
+				batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
+				continue
+			}
 		}
 		queueEvents := c.queue.ch
 		if len(batch) >= c.cfg.BatchSize {
@@ -313,7 +372,7 @@ func (c *Client) run() {
 				if deferTimer != nil {
 					stopAndDrainTimer(deferTimer)
 				}
-				batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil)
+				batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
 				continue
 			}
 		} else if deferTimer != nil {
@@ -323,23 +382,28 @@ func (c *Client) run() {
 		case event := <-queueEvents:
 			batch = append(batch, event)
 			if len(batch) >= c.cfg.BatchSize && !c.publishDeferred(deferUntil) {
-				batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil)
+				batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
 			}
 		case <-ticker.C:
 			if c.publishDeferred(deferUntil) {
 				continue
 			}
-			batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil)
+			batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
 		case <-deferWake:
 			// The backpressure deadline passed: retry the held batch now
 			// rather than waiting out the remainder of the flush interval.
 			if c.publishDeferred(deferUntil) {
 				continue
 			}
-			batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil)
+			batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
+		case <-c.pacingWake:
+			// A publish succeeded elsewhere (typically a synchronous Track)
+			// while the worker was parked: loop back so the pacing check at
+			// the top clears any stale deferral and retries the held batch.
+			continue
 		case request := <-c.flushRequests:
 			var err error
-			batch, err = c.flushAvailable(request.ctx, batch, &seenConsentEpoch)
+			batch, err = c.flushAvailable(request.ctx, batch, &seenConsentEpoch, &backoffAttempt)
 			if len(batch) == 0 {
 				// The batch the deferral was protecting is gone — delivered,
 				// dropped as permanent, or discarded by a consent denial. A
@@ -348,7 +412,9 @@ func (c *Client) run() {
 				// re-arms it when it carries its own hint.
 				deferUntil = time.Time{}
 			}
-			c.applyRetryAfter(err, &deferUntil)
+			if !callerAbandonedFlush(request.ctx, err) {
+				c.applyRetryPacing(err, &deferUntil, &backoffAttempt)
+			}
 			request.reply <- err
 		case <-c.stop:
 			return
@@ -386,16 +452,32 @@ func (c *Client) publishDeferred(deferUntil time.Time) bool {
 	return !deferUntil.IsZero() && c.clock.Now().Before(deferUntil)
 }
 
-// applyRetryAfter re-arms or clears the worker's backpressure deadline from a
-// publish outcome: a retryable failure that carried a Retry-After hint sets
+// applyRetryPacing re-arms or clears the worker's retry-pacing deadline from
+// a publish outcome. A retryable failure that carried a Retry-After hint sets
 // the deadline to now + hint — the server's LATEST word wins, so an explicit
 // "Retry-After: 0" ("retry now") replaces an earlier longer deadline and the
-// worker retries immediately via the elapsed-deadline path. A fully
-// successful outcome clears the deadline; a failure without a usable hint
-// leaves it untouched.
-func (c *Client) applyRetryAfter(err error, deferUntil *time.Time) {
+// worker retries immediately via the elapsed-deadline path. A retryable
+// failure WITHOUT a usable hint falls back to the client-side backoff
+// schedule: it advances the consecutive-failure count and re-arms the
+// deadline from backoffDelay — clearing it on the first failure, whose
+// schedule slot is "retry at the flush cadence" (the latest failure's word
+// wins here too, so a stale longer hint from a previous attempt cannot park
+// the batch) — so a sustained outage is retried with exponentially growing,
+// jittered spacing instead of at a fixed cadence in lockstep across the
+// fleet. A fully successful outcome clears the deadline and resets the
+// backoff. A permanent failure never arms a deferral; when it is an HTTP
+// response (the endpoint answered — the outage, if any, is over) it also
+// resets the backoff streak, while client-side permanent errors (encode,
+// consent) say nothing about the endpoint and leave pacing untouched.
+func (c *Client) applyRetryPacing(err error, deferUntil *time.Time, backoffAttempt *int) {
+	// This outcome is the worker's newest knowledge: consume every success
+	// recorded up to now, so only a success that lands strictly AFTER this
+	// settles can later clear the pacing armed below (see the run() loop's
+	// publishSuccesses check).
+	c.workerSeenSuccesses = c.publishSuccesses.Load()
 	if err == nil {
 		*deferUntil = time.Time{}
+		*backoffAttempt = 0
 		return
 	}
 	var statusErr *HTTPStatusError
@@ -408,18 +490,113 @@ func (c *Client) applyRetryAfter(err error, deferUntil *time.Time) {
 			retryAfter = minRetryNowSpacing
 		}
 		*deferUntil = c.clock.Now().Add(retryAfter)
+		return
 	}
+	if errors.Is(err, ErrConsentDenied) {
+		// A denial discarded the batch mid-publish: the failure streak
+		// belonged to that batch and goes with it, so fresh post-re-grant
+		// events never start deep in the backoff schedule (mirrors every
+		// other denial-discard site).
+		*backoffAttempt = 0
+		return
+	}
+	if isPermanentPublishError(err) {
+		if statusErr != nil {
+			*backoffAttempt = 0
+		}
+		return
+	}
+	*backoffAttempt++
+	if delay := c.backoffDelay(*backoffAttempt); delay > 0 {
+		*deferUntil = c.clock.Now().Add(delay)
+	} else {
+		*deferUntil = time.Time{}
+	}
+}
+
+// callerAbandonedFlush reports whether a failed explicit Flush was cut short
+// by its own caller's context (cancellation or deadline) rather than by the
+// ingest endpoint. Only a failure that IS the caller context's OWN error
+// state counts (errors.Is against ctx.Err()): a real endpoint outcome — an
+// HTTP status error, a connection refusal, or even a transport timeout
+// (DeadlineExceeded) under a merely CANCELED caller context — is still
+// endpoint feedback and must pace. Caller abandonment is not a backpressure
+// signal, so it must neither advance nor re-arm retry pacing — and it must
+// not reset it either, since nothing was learned about the endpoint.
+func callerAbandonedFlush(ctx context.Context, err error) bool {
+	if err == nil || ctx == nil {
+		return false
+	}
+	ctxErr := ctx.Err()
+	return ctxErr != nil && errors.Is(err, ctxErr)
 }
 
 // minRetryNowSpacing floors an explicit "Retry-After: 0" so honoring the
 // server's retry-now hint can never degenerate into a hot loop.
 const minRetryNowSpacing = 100 * time.Millisecond
 
+// Client-side fallback pacing for retryable publish failures that carry no
+// Retry-After hint (server unreachable, or a 5xx without the header):
+// exponential backoff with full jitter, mirroring the shardpilot-defold
+// reference semantics. The first failure retries at the normal flush cadence
+// with no extra wait; sustained failures then defer by a random duration in
+// [base, ceiling], with the ceiling doubling per consecutive failure up to
+// the cap and the jitter de-synchronizing clients so a recovering server
+// does not face the whole fleet at once.
+const (
+	publishBackoffBase = time.Second
+	publishBackoffCap  = 60 * time.Second
+)
+
+// backoffCeiling is the deterministic upper bound of the jitter window for
+// the given consecutive-failure attempt: base·2^(attempt−2), clamped to the
+// cap (the exponent is clamped too, so an arbitrarily long outage cannot
+// overflow the shift). Attempts before the second have no window — the first
+// failure does not defer.
+func backoffCeiling(attempt int) time.Duration {
+	if attempt < 2 {
+		return 0
+	}
+	exp := attempt - 2
+	if exp > 16 {
+		exp = 16
+	}
+	ceiling := publishBackoffBase << exp
+	if ceiling > publishBackoffCap {
+		ceiling = publishBackoffCap
+	}
+	return ceiling
+}
+
+// backoffDelay is the deferral for the given consecutive-failure attempt:
+// zero for the first failure (retry at the next flush cadence without an
+// extra wait), then full jitter in [base, ceiling] — never below the base,
+// so a dead endpoint is always given breathing room before the next probe.
+func (c *Client) backoffDelay(attempt int) time.Duration {
+	ceiling := backoffCeiling(attempt)
+	if ceiling <= 0 {
+		return 0
+	}
+	return publishBackoffBase + time.Duration(c.jitterValue()*float64(ceiling-publishBackoffBase))
+}
+
+// jitterValue returns a uniform value in [0, 1) from the client's jitter
+// source, falling back to the shared math/rand source when none was injected
+// (bare Clients constructed by tests).
+func (c *Client) jitterValue() float64 {
+	if c.jitter != nil {
+		return c.jitter()
+	}
+	return rand.Float64()
+}
+
 // dropBatchOnConsentEpoch discards the worker-held batch when a consent
 // denial happened since the worker last looked. Events cleared here count
 // as Dropped; events drained from the shared queue are counted by
-// SetConsent itself, so each event is counted exactly once.
-func (c *Client) dropBatchOnConsentEpoch(batch []Event, seenEpoch *uint64) []Event {
+// SetConsent itself, so each event is counted exactly once. The discarded
+// batch takes its backoff streak with it — fresh post-re-grant events must
+// never start deep in a schedule that belonged to condemned data.
+func (c *Client) dropBatchOnConsentEpoch(batch []Event, seenEpoch *uint64, backoffAttempt *int) []Event {
 	epoch := c.consentEpoch.Load()
 	if epoch == *seenEpoch {
 		return batch
@@ -428,19 +605,23 @@ func (c *Client) dropBatchOnConsentEpoch(batch []Event, seenEpoch *uint64) []Eve
 	if len(batch) > 0 {
 		c.stats.dropped.Add(uint64(len(batch)))
 		batch = batch[:0]
+		*backoffAttempt = 0
 	}
 	return batch
 }
 
-func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentEpoch *uint64) ([]Event, error) {
+func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentEpoch *uint64, backoffAttempt *int) ([]Event, error) {
 	var firstErr error
 	for {
-		batch = c.dropBatchOnConsentEpoch(batch, seenConsentEpoch)
+		batch = c.dropBatchOnConsentEpoch(batch, seenConsentEpoch, backoffAttempt)
 		if c.consentDenied() {
 			dropped := len(batch) + c.queue.drainAll()
 			if dropped > 0 {
 				c.stats.dropped.Add(uint64(dropped))
 			}
+			// A denial-drained flush discards the pipeline the streak was
+			// tracking along with it.
+			*backoffAttempt = 0
 			return batch[:0], firstErr
 		}
 		if len(batch) > 0 {
@@ -448,9 +629,11 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 				if errors.Is(err, ErrConsentDenied) {
 					// A denial landed between this iteration's consent check
 					// and the publish: drop and drain exactly like the
-					// denied path above, keeping Flush's nil result.
+					// denied path above, keeping Flush's nil result. The
+					// streak goes with the discarded batch.
 					dropped := len(batch) + c.queue.drainAll()
 					c.stats.dropped.Add(uint64(dropped))
+					*backoffAttempt = 0
 					return batch[:0], firstErr
 				}
 				if !isPermanentPublishError(err) {
@@ -459,9 +642,25 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 				if firstErr == nil {
 					firstErr = err
 				}
+				var statusErr *HTTPStatusError
+				if errors.As(err, &statusErr) {
+					// A swallowed permanent HTTP response is still a
+					// RESPONSE: the endpoint answered, so the hint-less
+					// streak ends here even though the flush keeps
+					// draining — applyRetryPacing never sees this error
+					// unless it is the flush's final word (same rationale
+					// as its own permanent-HTTP reset).
+					*backoffAttempt = 0
+				}
 				c.stats.dropped.Add(uint64(len(batch)))
 				batch = batch[:0]
 			} else {
+				// EVERY successful publish ends the failure streak — a flush
+				// can deliver several batches and still return a later
+				// batch's error, and that error must be paced as a FIRST
+				// failure, not as a continuation of a streak a mid-flush
+				// success already broke.
+				*backoffAttempt = 0
 				batch = batch[:0]
 			}
 		}
@@ -475,25 +674,27 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 	}
 }
 
-func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, deferUntil *time.Time) []Event {
+func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, deferUntil *time.Time, backoffAttempt *int) []Event {
 	// Every automatic caller gates on the deadline having passed, so consume
-	// it here: a follow-up failure WITHOUT a fresh Retry-After then falls
-	// back to the normal tick cadence instead of re-firing immediately off
-	// the stale, already-elapsed deadline (applyRetryAfter re-arms it when
-	// the new failure carries its own hint).
+	// it here: a follow-up failure re-arms it through applyRetryPacing (from
+	// its own Retry-After hint, or the backoff schedule) instead of
+	// re-firing immediately off the stale, already-elapsed deadline.
 	*deferUntil = time.Time{}
-	batch = c.dropBatchOnConsentEpoch(batch, seenConsentEpoch)
+	batch = c.dropBatchOnConsentEpoch(batch, seenConsentEpoch, backoffAttempt)
 	if len(batch) == 0 {
 		return batch
 	}
 	if c.consentDenied() {
 		c.stats.dropped.Add(uint64(len(batch)))
+		// Denial-discard: the streak belonged to the dropped batch.
+		*backoffAttempt = 0
 		return batch[:0]
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.HTTPTimeout)
 	defer cancel()
-	if err := c.publishBatchWithContext(ctx, batch); err != nil {
-		c.applyRetryAfter(err, deferUntil)
+	err := c.publishBatchWithContext(ctx, batch)
+	c.applyRetryPacing(err, deferUntil, backoffAttempt)
+	if err != nil {
 		if isPermanentPublishError(err) {
 			c.stats.dropped.Add(uint64(len(batch)))
 			return batch[:0]
@@ -564,6 +765,16 @@ func (c *Client) publishBatchWithContext(ctx context.Context, events []Event) er
 	}
 	c.stats.recordBatch(result, len(events))
 	c.notifyBatchResult(result.toPublic())
+	// Signal the success to the worker's pacing state: a synchronous Track
+	// (or any other path) proving the endpoint healthy must clear a stale
+	// retry deadline instead of letting it hold automatic publishes. The
+	// non-blocking nudge wakes a parked worker so the held batch retries
+	// promptly instead of at the next flush tick.
+	c.publishSuccesses.Add(1)
+	select {
+	case c.pacingWake <- struct{}{}:
+	default:
+	}
 	return nil
 }
 
