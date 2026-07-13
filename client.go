@@ -329,13 +329,21 @@ func (c *Client) run() {
 			// A publish succeeded since the worker's pacing state last
 			// settled — typically a synchronous Track on a caller goroutine
 			// while the worker waited out a deadline. The endpoint is
-			// healthy again: stop waiting, restart the schedule, and retry
-			// a held batch NOW rather than at the next flush tick (which
-			// can be minutes away on a long FlushInterval).
+			// healthy again: stop waiting and restart the schedule. The
+			// immediate retry below fires ONLY when the success cleared an
+			// actual recovery state (an armed deadline or a failure streak
+			// holding a retained batch) — during normal operation a Track
+			// success must not flush healthy partial batches early and
+			// defeat BatchSize/FlushInterval batching. Every retained-for-
+			// retry batch has such state: a hint-less failure advances the
+			// streak and a hinted one arms the deadline.
 			c.workerSeenSuccesses = successes
+			recovered := !deferUntil.IsZero() || backoffAttempt > 0
 			deferUntil = time.Time{}
 			backoffAttempt = 0
-			if len(batch) > 0 {
+			if recovered && len(batch) > 0 {
+				// Retry the held batch NOW rather than at the next flush
+				// tick, which can be minutes away on a long FlushInterval.
 				batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
 				continue
 			}

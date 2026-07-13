@@ -553,6 +553,55 @@ func TestTrackSuccessClearsWorkerBackoff(t *testing.T) {
 	}
 }
 
+func TestTrackSuccessDoesNotFlushHealthyPartialBatches(t *testing.T) {
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"accepted":1,"rejected":0,"duplicates":0}`))
+	}))
+	defer server.Close()
+
+	// Healthy pipeline: no failures, no armed deadline, no streak — a Track
+	// success must NOT flush the partial async batch ahead of its
+	// BatchSize/FlushInterval schedule.
+	client, err := NewClient(Config{
+		IngestURL:     server.URL,
+		Token:         "token-value",
+		WorkspaceID:   "workspace-test",
+		AppID:         "app-test",
+		EnvironmentID: "develop",
+		Source:        SourceBackend,
+		BatchSize:     10,
+		FlushInterval: 10 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	if err := client.Enqueue(Event{Name: "partial_batch_event"}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if err := client.Track(context.Background(), Event{Name: "healthy_track"}); err != nil {
+		t.Fatalf("track: %v", err)
+	}
+
+	// Only the synchronous Track single may have reached the server; give a
+	// wrongly-nudged worker ample time to misbehave before asserting.
+	time.Sleep(1200 * time.Millisecond)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("expected only the Track publish on a healthy pipeline, got %d calls", got)
+	}
+
+	// The partial batch is still intact and delivers on close.
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("expected the partial batch to deliver on close, got %d calls", got)
+	}
+}
+
 func TestFlushSwallowedPermanentHTTPResetsStreak(t *testing.T) {
 	// The flush loop swallows a permanent HTTP rejection (drops the batch,
 	// keeps draining) and then returns a LATER batch's retryable failure.
