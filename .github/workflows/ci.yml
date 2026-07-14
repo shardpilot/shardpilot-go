@@ -43,3 +43,14 @@ jobs:
 
       - name: Vet
         run: go vet ./...
+
+  release-consistency:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Version consistency (README latest tag == CHANGELOG head)
+        run: ./scripts/check_release_consistency.sh

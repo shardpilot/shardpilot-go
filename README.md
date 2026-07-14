@@ -231,7 +231,7 @@ Defaults: issuer `shardpilot`, audience `shardpilot-ingest`, lifetime 5m (equal 
 
 ## Build & test
 
-No Makefile — standard Go tooling. CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `gofmt` check, `go test ./...`, and `go vet ./...` on Go 1.24.x and 1.26.4.
+No Makefile — standard Go tooling. CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `gofmt` check, `go test ./...`, and `go vet ./...` on Go 1.24.x and 1.26.4, plus a release version-consistency check (`scripts/check_release_consistency.sh`; see [`docs/release.md`](docs/release.md)).
 
 ```bash
 go build ./...
