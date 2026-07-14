@@ -252,7 +252,7 @@ gofmt -l .
 
 Pre-v1; the API is explicitly unstable.
 
-- The consent API, `LoadOrCreateAnonymousID`, the backend-only `SignIngestJWT` Mode-B mint helper, and optional default actor identity fields shipped in `v0.4.0-alpha`; the changelog's `Unreleased` section is currently empty.
+- The consent API, `LoadOrCreateAnonymousID`, the backend-only `SignIngestJWT` Mode-B mint helper, and optional default actor identity fields shipped in `v0.4.0-alpha`; for changes merged since that tag, see the `Unreleased` section of [CHANGELOG.md](CHANGELOG.md).
 - Public developer docs are planned for `docs.shardpilot.com`; that domain is not yet provisioned.
 
 `v0.3.0-alpha` (tagged) removed the game-flavored `MatchID` field from the universal `Event` envelope; carry that context in `Props["match_id"]` instead (wire payload unchanged).
