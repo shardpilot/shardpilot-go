@@ -19,14 +19,14 @@ jobs:
       matrix:
         go-version:
           - '1.24.x'
-          - '1.26.4'
+          - '1.26.5'
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version: ${{ matrix.go-version }}
 
@@ -50,7 +50,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Version consistency (README latest tag == CHANGELOG head)
         run: ./scripts/check_release_consistency.sh
