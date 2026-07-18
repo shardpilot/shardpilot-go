@@ -22,7 +22,12 @@ const (
 	// as a duplicate (Code is typically "duplicate_event_id").
 	EventStatusDuplicate EventStatus = "duplicate"
 	// EventStatusSuppressedNoConsent means the event was dropped because the
-	// actor withheld analytics consent. The 202 is not delivery confirmation.
+	// actor withheld analytics consent — or, on a workspace whose strict
+	// consent mode is enforced, because the actor has no explicit analytics
+	// consent recorded server-side at all (missing or undecided state fails
+	// closed there; this SDK's ConsentUnknown default keeps publishing, so
+	// such events are suppressed terminally, and silently unless
+	// Config.OnBatchResult is wired). The 202 is not delivery confirmation.
 	EventStatusSuppressedNoConsent EventStatus = "suppressed_no_consent"
 	// EventStatusSuppressedAdRevenueConsent means an ad-revenue event was
 	// dropped because the actor withheld the required ad-revenue consent.

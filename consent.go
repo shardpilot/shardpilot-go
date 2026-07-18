@@ -17,6 +17,18 @@ type ConsentState string
 const (
 	// ConsentUnknown is the initial state: no decision has been recorded,
 	// and the event pipeline is fully open.
+	//
+	// This is the opposite default posture from the consent-first client
+	// SDKs (Defold/Unity/Unreal), which transmit nothing while consent is
+	// unknown. Caveat for strict-consent workspaces: on a workspace whose
+	// effective strict consent mode is enforce, the server fails closed and
+	// terminally suppresses every event whose actor has no explicit
+	// analytics consent recorded server-side — per event, as
+	// suppressed_no_consent inside the 202 envelope, never as an error — so
+	// publishing under ConsentUnknown "succeeds" while delivering nothing,
+	// and silently unless Config.OnBatchResult is wired to observe the
+	// suppressions. Call SetConsent(true) for actors who have consented
+	// before publishing their events.
 	ConsentUnknown ConsentState = "unknown"
 	// ConsentGranted means analytics consent was explicitly granted.
 	ConsentGranted ConsentState = "granted"
@@ -86,6 +98,15 @@ type consentResult struct {
 // recorded before it was called to finish transmitting; decisions recorded
 // after Close are applied locally but are no longer transmitted. Consent
 // never rides the event envelope.
+//
+// On a strict-consent (enforce) workspace an explicit grant is what admits
+// the actor's events: without a consent decision recorded server-side the
+// ingest endpoint terminally suppresses each event as suppressed_no_consent
+// inside the 202 — see ConsentUnknown. Call SetConsent(true) for consented
+// actors before publishing, and wire Config.OnBatchResult to observe any
+// suppressions. Grants are recorded server-side only through a
+// consent-write-capable service credential; a publishable Mode A client key
+// may record denials only.
 //
 // The state is held in memory only; see ConsentState for persistence notes.
 func (c *Client) SetConsent(analyticsGranted bool) {
