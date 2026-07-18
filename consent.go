@@ -25,10 +25,11 @@ const (
 	// terminally suppresses every event whose actor has no explicit
 	// analytics consent recorded server-side — per event, as
 	// suppressed_no_consent inside the 202 envelope, never as an error — so
-	// publishing under ConsentUnknown "succeeds" while delivering nothing,
-	// and silently unless Config.OnBatchResult is wired to observe the
-	// suppressions. Call SetConsent(true) for actors who have consented
-	// before publishing their events.
+	// publishing under ConsentUnknown "succeeds" while delivering nothing;
+	// the suppressions surface only through Config.OnBatchResult or the
+	// Snapshot().ByStatus breakdown. Make sure consent is recorded
+	// server-side for actors who have consented before publishing their
+	// events — see SetConsent for what that requires.
 	ConsentUnknown ConsentState = "unknown"
 	// ConsentGranted means analytics consent was explicitly granted.
 	ConsentGranted ConsentState = "granted"
@@ -102,9 +103,18 @@ type consentResult struct {
 // On a strict-consent (enforce) workspace an explicit grant is what admits
 // the actor's events: without a consent decision recorded server-side the
 // ingest endpoint terminally suppresses each event as suppressed_no_consent
-// inside the 202 — see ConsentUnknown. Call SetConsent(true) for consented
-// actors before publishing, and wire Config.OnBatchResult to observe any
-// suppressions. Grants are recorded server-side only through a
+// inside the 202 — see ConsentUnknown. Because the receipt posts
+// fire-and-forget in the background, calling SetConsent(true) immediately
+// before publishing does NOT synchronize the grant: events flushed before
+// the /v1/consent write lands are still suppressed. Ensure the grant is
+// recorded server-side before the actor's first events are published — for
+// example out-of-band through a service credential, or after observing the
+// consent write succeed — and watch Config.OnBatchResult or the
+// Snapshot().ByStatus breakdown for suppressed_no_consent to detect the
+// race. The receipt also covers only the configured actor (Config.UserID,
+// else Config.AnonymousID); events that override the actor per event
+// (Event.UserID) need consent recorded for each such actor through a
+// service path. Grants are recorded server-side only through a
 // consent-write-capable service credential; a publishable Mode A client key
 // may record denials only.
 //
