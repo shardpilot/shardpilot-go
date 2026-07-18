@@ -158,6 +158,8 @@ Captured frames are **pre-symbolicated** from the Go runtime (package-qualified 
 | `HTTPTimeout` | no | Default 2s. |
 | `Logger` | no | `Printf`-style logger; never receives tokens or full payloads. |
 | `AllowInsecurePrivateNetwork` | no | Allow plain HTTP to RFC1918 private addresses. |
+| `SchemaRevision` | no | Overrides the ingest envelope schema-set revision declared on `events:batch` publishes via the `X-ShardPilot-Schema-Revision` request header. Default: `DefaultSchemaRevision`, the revision this SDK release was coordinated against. |
+| `DisableSchemaRevision` | no | Stops declaring a schema-set revision entirely (no header; undeclared always passes the server's handshake in every mode) — the no-rebuild escape hatch if an armed enforce-mode handshake rejects this build's revision as stale. |
 | `OnBatchResult` | no | `func(BatchResult)` called after each successful batch publish with the server's per-event outcomes. Runs on the publish path (may be called concurrently); keep it fast and non-blocking. A panic inside it is recovered. |
 
 The example programs read these from `SHARDPILOT_*` environment variables; the SDK itself reads no environment variables.

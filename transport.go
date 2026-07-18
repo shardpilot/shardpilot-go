@@ -131,7 +131,11 @@ type httpTransport struct {
 	endpoint        string
 	consentEndpoint string
 	token           string
-	client          *http.Client
+	// schemaRevision is declared via the X-ShardPilot-Schema-Revision request
+	// header on events:batch publishes ONLY — the header is not defined for
+	// the consent route. Empty means declare nothing (header omitted).
+	schemaRevision string
+	client         *http.Client
 }
 
 func newHTTPTransport(cfg Config) *httpTransport {
@@ -140,6 +144,7 @@ func newHTTPTransport(cfg Config) *httpTransport {
 		endpoint:        base + "/v1/events:batch",
 		consentEndpoint: base + "/v1/consent",
 		token:           cfg.Token,
+		schemaRevision:  effectiveSchemaRevision(cfg),
 		client: &http.Client{
 			Timeout: cfg.HTTPTimeout,
 		},
@@ -148,7 +153,7 @@ func newHTTPTransport(cfg Config) *httpTransport {
 
 func (t *httpTransport) Publish(ctx context.Context, request batchRequest) (batchResult, error) {
 	var result batchResult
-	if err := t.postJSON(ctx, t.endpoint, request, &result); err != nil {
+	if err := t.postJSON(ctx, t.endpoint, request, &result, t.schemaRevision); err != nil {
 		return batchResult{}, err
 	}
 	return result, nil
@@ -156,13 +161,19 @@ func (t *httpTransport) Publish(ctx context.Context, request batchRequest) (batc
 
 func (t *httpTransport) PublishConsent(ctx context.Context, request consentRequest) (consentResult, error) {
 	var result consentResult
-	if err := t.postJSON(ctx, t.consentEndpoint, request, &result); err != nil {
+	// The schema-revision header is a batch-endpoint contract; the consent
+	// route must never carry it.
+	if err := t.postJSON(ctx, t.consentEndpoint, request, &result, ""); err != nil {
 		return consentResult{}, err
 	}
 	return result, nil
 }
 
-func (t *httpTransport) postJSON(ctx context.Context, endpoint string, request any, result any) error {
+// postJSON posts one JSON request to an ingest endpoint. schemaRevision, when
+// non-empty, is declared via the X-ShardPilot-Schema-Revision request header;
+// it is passed per call because this helper is shared across routes and only
+// the events:batch route defines the header.
+func (t *httpTransport) postJSON(ctx context.Context, endpoint string, request any, result any, schemaRevision string) error {
 	payload, err := json.Marshal(request)
 	if err != nil {
 		return &EncodeError{Err: err}
@@ -174,6 +185,9 @@ func (t *httpTransport) postJSON(ctx context.Context, endpoint string, request a
 	}
 	httpRequest.Header.Set("Content-Type", "application/json")
 	httpRequest.Header.Set("Authorization", "Bearer "+t.token)
+	if schemaRevision != "" {
+		httpRequest.Header.Set(schemaRevisionHeader, schemaRevision)
+	}
 
 	response, err := t.client.Do(httpRequest)
 	if err != nil {
