@@ -106,17 +106,17 @@ type consentResult struct {
 // inside the 202 — see ConsentUnknown. Because the receipt posts
 // fire-and-forget in the background, calling SetConsent(true) immediately
 // before publishing does NOT synchronize the grant: events flushed before
-// the /v1/consent write lands are still suppressed. Ensure the grant is
-// recorded server-side before the actor's first events are published — for
-// example out-of-band through a service credential, or after observing the
-// consent write succeed — and watch Config.OnBatchResult or the
-// Snapshot().ByStatus breakdown for suppressed_no_consent to detect the
-// race. The receipt also covers only the configured actor (Config.UserID,
-// else Config.AnonymousID); events that override the actor per event
-// (Event.UserID) need consent recorded for each such actor through a
-// service path. Grants are recorded server-side only through a
-// consent-write-capable service credential; a publishable Mode A client key
-// may record denials only.
+// the /v1/consent write lands are still suppressed, and the SDK exposes no
+// per-receipt success signal (failures are only logged). When admission
+// must be guaranteed from the first event, record the grant out-of-band
+// through a consent-write-capable service credential before publishing, and
+// watch Config.OnBatchResult or the Snapshot().ByStatus breakdown for
+// suppressed_no_consent to detect the race. The receipt also covers only
+// the configured actor (Config.UserID, else Config.AnonymousID); events
+// that override the actor per event (Event.UserID or Event.AnonymousID)
+// need consent recorded for each such actor through a service path. Grants
+// are recorded server-side only through a consent-write-capable service
+// credential; a publishable Mode A client key may record denials only.
 //
 // The state is held in memory only; see ConsentState for persistence notes.
 func (c *Client) SetConsent(analyticsGranted bool) {
