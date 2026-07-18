@@ -60,6 +60,15 @@ type Config struct {
 	// share it. Keep it fast, non-blocking, and safe for concurrent use. It is
 	// never called when the publish fails at the transport, and a panic inside
 	// it is recovered and ignored so a buggy callback cannot stop delivery.
+	//
+	// Wiring it is the per-event way to notice strict-consent suppression:
+	// on a workspace whose strict consent mode is enforced, events published
+	// for an actor with no explicit consent recorded server-side (this SDK's
+	// ConsentUnknown default keeps the pipeline open) come back
+	// suppressed_no_consent in the 202 — a successful publish that delivered
+	// nothing. Integrations without the callback can poll the
+	// Snapshot().ByStatus breakdown for the same statuses. See
+	// ConsentUnknown and SetConsent.
 	OnBatchResult func(BatchResult)
 }
 

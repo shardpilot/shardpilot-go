@@ -17,6 +17,19 @@ type ConsentState string
 const (
 	// ConsentUnknown is the initial state: no decision has been recorded,
 	// and the event pipeline is fully open.
+	//
+	// This is the opposite default posture from the consent-first client
+	// SDKs (Defold/Unity/Unreal), which transmit nothing while consent is
+	// unknown. Caveat for strict-consent workspaces: on a workspace whose
+	// effective strict consent mode is enforce, the server fails closed and
+	// terminally suppresses every event whose actor has no explicit
+	// analytics consent recorded server-side — per event, as
+	// suppressed_no_consent inside the 202 envelope, never as an error — so
+	// publishing under ConsentUnknown "succeeds" while delivering nothing;
+	// the suppressions surface only through Config.OnBatchResult or the
+	// Snapshot().ByStatus breakdown. Make sure consent is recorded
+	// server-side for actors who have consented before publishing their
+	// events — see SetConsent for what that requires.
 	ConsentUnknown ConsentState = "unknown"
 	// ConsentGranted means analytics consent was explicitly granted.
 	ConsentGranted ConsentState = "granted"
@@ -86,6 +99,24 @@ type consentResult struct {
 // recorded before it was called to finish transmitting; decisions recorded
 // after Close are applied locally but are no longer transmitted. Consent
 // never rides the event envelope.
+//
+// On a strict-consent (enforce) workspace an explicit grant is what admits
+// the actor's events: without a consent decision recorded server-side the
+// ingest endpoint terminally suppresses each event as suppressed_no_consent
+// inside the 202 — see ConsentUnknown. Because the receipt posts
+// fire-and-forget in the background, calling SetConsent(true) immediately
+// before publishing does NOT synchronize the grant: events flushed before
+// the /v1/consent write lands are still suppressed, and the SDK exposes no
+// per-receipt success signal (failures are only logged). When admission
+// must be guaranteed from the first event, record the grant out-of-band
+// through a consent-write-capable service credential before publishing, and
+// watch Config.OnBatchResult or the Snapshot().ByStatus breakdown for
+// suppressed_no_consent to detect the race. The receipt also covers only
+// the configured actor (Config.UserID, else Config.AnonymousID); events
+// that override the actor per event (Event.UserID or Event.AnonymousID)
+// need consent recorded for each such actor through a service path. Grants
+// are recorded server-side only through a consent-write-capable service
+// credential; a publishable Mode A client key may record denials only.
 //
 // The state is held in memory only; see ConsentState for persistence notes.
 func (c *Client) SetConsent(analyticsGranted bool) {

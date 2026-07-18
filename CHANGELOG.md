@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- Docs only: documented the strict-consent caveat for this SDK's open-by-default
+  `ConsentUnknown` posture (README "Privacy & consent", plus the godoc on
+  `ConsentUnknown`, `SetConsent`, `EventStatusSuppressedNoConsent`, and
+  `Config.OnBatchResult`). On a workspace whose effective strict consent mode is
+  `enforce`, events published for actors without an explicit consent decision
+  recorded server-side are terminally suppressed per event (`suppressed_no_consent`
+  inside the `202`), observable only via `OnBatchResult` or `Snapshot().ByStatus`.
+  The docs now spell out that the grant must be recorded server-side before
+  publishing (`SetConsent` posts fire-and-forget and covers only the configured
+  actor — per-event `Event.UserID` actors need a service-path consent write) and
+  recommend watching `OnBatchResult`/`Snapshot().ByStatus` for suppressions. No
+  behavior change.
+
 - Retryable batch publish failures **without** a `Retry-After` hint (server unreachable,
   `5xx` without the header) now fall back to client-side exponential backoff with full
   jitter instead of retrying at the fixed flush cadence indefinitely: the first failure
