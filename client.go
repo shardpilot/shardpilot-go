@@ -758,8 +758,14 @@ func (c *Client) publishBatchWithContext(ctx context.Context, events []Event) er
 			return ErrConsentDenied
 		}
 		c.stats.recordFailure(err)
-		if c.cfg.Logger != nil {
-			c.cfg.Logger.Printf("shardpilot batch publish failed: %v", err)
+		if isSchemaRevisionMismatch(err) {
+			// Terminal for the batch (isPermanentPublishError routes it to
+			// the drop path, never a retry): this build's declared schema
+			// revision no longer matches what the ingest service serves.
+			c.logf("shardpilot batch publish rejected: schema revision mismatch (this build declares %q); batch dropped as terminal — rebuild against the server's current schema set, override Config.SchemaRevision, or set Config.DisableSchemaRevision to stop declaring: %v",
+				effectiveSchemaRevision(c.cfg), err)
+		} else {
+			c.logf("shardpilot batch publish failed: %v", err)
 		}
 		return err
 	}
@@ -845,6 +851,18 @@ func isPermanentPublishError(err error) bool {
 	// A consent denial that raced the publish start: retrying would only
 	// re-reject, and the events must be dropped (never published).
 	if errors.Is(err, ErrConsentDenied) {
+		return true
+	}
+	// An enforce-mode schema-revision-mismatch 409 is terminal by contract:
+	// the server sends no Retry-After because re-sending the same batch from
+	// the same build can never succeed — only a rebuild against the current
+	// schema set (or stop declaring via Config.DisableSchemaRevision) clears
+	// it. The generic non-retryable branch below already drops it today; this
+	// explicit branch pins that routing so no future 409 handling — e.g. the
+	// partial-batch/split work in the TODO above, which the two
+	// workspace-conflict 409 codes could legitimately feed — ever retries or
+	// splits a schema-revision mismatch.
+	if isSchemaRevisionMismatch(err) {
 		return true
 	}
 	var statusErr *HTTPStatusError

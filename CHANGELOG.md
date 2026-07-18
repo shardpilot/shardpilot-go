@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Every `events:batch` publish now declares the ingest envelope schema-set revision this
+  SDK build was coordinated against via the `X-ShardPilot-Schema-Revision` request header
+  (`DefaultSchemaRevision` — the digest of the ingest service's embedded schema set,
+  currently pinned to analytics-service `main` @ `7d118c5`). The header rides on the batch
+  route ONLY — the consent route never carries it — and is provably inert while the ingest
+  service's schema-revision handshake runs in its default `off` mode (the header is neither
+  read nor echoed there); it arms the server-side staleness alarm for the future `log` /
+  `enforce` rollout. `Config.SchemaRevision` overrides the declared value and
+  `Config.DisableSchemaRevision` stops declaring entirely (an undeclared revision always
+  passes the handshake in every mode). An enforce-mode rejection — HTTP `409` with error
+  code `schema_revision_mismatch`, discriminated by code since `409` is shared with the
+  workspace-conflict codes — is terminal for the batch: it is dropped through the permanent-
+  failure path with a dedicated log line, never retried (the server sends no `Retry-After`
+  for it; re-sending the same batch from the same build can never succeed).
+
 - Docs only: documented the strict-consent caveat for this SDK's open-by-default
   `ConsentUnknown` posture (README "Privacy & consent", plus the godoc on
   `ConsentUnknown`, `SetConsent`, `EventStatusSuppressedNoConsent`, and
