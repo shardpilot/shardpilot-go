@@ -52,5 +52,5 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Version consistency (README latest tag == CHANGELOG head)
+      - name: Version consistency (README latest tag == CHANGELOG head == skill pin)
         run: ./scripts/check_release_consistency.sh
