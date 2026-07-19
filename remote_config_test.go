@@ -1139,6 +1139,78 @@ func TestRemoteConfigInternalTimeoutStaysTransient(t *testing.T) {
 	}
 }
 
+func TestRemoteConfigStalledBodyPreservesStatus(t *testing.T) {
+	var stall atomic.Bool
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if stall.Load() {
+			// An authoritative 401 whose BODY stalls past the SDK-internal
+			// timeout: status and headers flush immediately, the body never
+			// completes.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":{"code":"unauthorized"`))
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			<-release
+			return
+		}
+		_, _ = w.Write([]byte(`{"values":{"k":"v"}}`))
+	}))
+	defer server.Close()
+	defer close(release)
+
+	cachePath := filepath.Join(t.TempDir(), "rc-cache.json")
+	client, err := NewClient(Config{
+		IngestURL:             server.URL,
+		Token:                 "test-token",
+		WorkspaceID:           "workspace-test",
+		AppID:                 "app-test",
+		EnvironmentID:         "develop",
+		Source:                SourceBackend,
+		AnonymousID:           "anon-rc-1",
+		APIKey:                "test-rc-key",
+		RemoteConfigURL:       server.URL,
+		RemoteConfigCachePath: cachePath,
+		FlushInterval:         time.Hour,
+		HTTPTimeout:           100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("priming fetch: %v", err)
+	}
+	cacheBefore, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("read primed cache: %v", err)
+	}
+
+	// The key is revoked: the 401 status arrives, then the body stalls until
+	// the SDK-internal deadline ends the read. The received status must
+	// classify — unauthorized fails closed — never degrade into a
+	// cache-served http_0 that keeps a revoked key supplied with
+	// configuration.
+	stall.Store(true)
+	result, err := client.FetchRemoteConfig(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "unauthorized") {
+		t.Fatalf("expected the stalled 401 to fail closed as unauthorized, got result=%+v err=%v", result, err)
+	}
+	if result.FromCache {
+		t.Fatalf("an unauthorized outcome must never serve the cache, got %+v", result)
+	}
+	cacheAfter, _ := os.ReadFile(cachePath)
+	if string(cacheBefore) != string(cacheAfter) {
+		t.Fatalf("an unauthorized outcome must leave the cache file untouched")
+	}
+	if got := client.RemoteConfigString("k", "fallback"); got != "v" {
+		t.Fatalf("an unauthorized outcome must leave the getter snapshot intact, got %q", got)
+	}
+}
+
 func TestRemoteConfigInFlight200DoesNotRollBackFresherDurable(t *testing.T) {
 	var requests atomic.Int64
 	arrived := make(chan struct{}, 1)

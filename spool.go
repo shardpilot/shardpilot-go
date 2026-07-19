@@ -772,7 +772,18 @@ func (s *diskSpool) append(batch []spoolEntry, deadlineMS int64, now time.Time, 
 		appended[entry.id] = struct{}{}
 	}
 	if len(appended) == 0 && deadlineMS <= 0 {
-		return false, nil, expired, nil, false
+		// Nothing new to write — but a PREVIOUS append may have accepted
+		// entries into the mirror under a failed record write (dirty). This
+		// path is exactly how that batch comes back (a retained batch's
+		// in-process retry, and Close's remnant settle, re-append as
+		// duplicates), so it must retry the recovered write rather than skip
+		// it: a transient disk error at the original append followed only by
+		// duplicate re-appends would otherwise hold the events in memory all
+		// the way through shutdown and lose them on exit.
+		if s.dirty {
+			persistFailed = s.saveLocked() != nil
+		}
+		return false, nil, expired, nil, persistFailed
 	}
 	evicted = s.evictOverCapsLocked()
 	for _, entry := range batch {

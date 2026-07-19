@@ -213,9 +213,13 @@ func (t *httpTransport) PublishConsent(ctx context.Context, request consentReque
 }
 
 // FetchRemoteConfig GETs the remote-config resource. It reports transport-
-// level failures (no connection, timeout) as an error — classified as the
-// transient `http_0` outcome upstream — and every HTTP response, whatever
-// its status, as a remoteConfigResponse for applyRemoteConfig to classify.
+// level failures before a status arrives (no connection, header-phase
+// timeout) as a bare error — classified as the transient `http_0` outcome
+// upstream — and every HTTP response, whatever its status, as a
+// remoteConfigResponse for applyRemoteConfig to classify; a response whose
+// body read was ended by the request context is returned WITH the read error
+// so the caller can discriminate a caller abort from an SDK-internal
+// deadline (see the body-read comment below).
 // Redirects are NOT followed (see rcClient): a 3xx is returned as-is so the
 // decision core can classify it as the contract's permanent http_3xx. The
 // request authenticates with the publishable API key only, and never carries
@@ -239,25 +243,29 @@ func (t *httpTransport) FetchRemoteConfig(ctx context.Context, request remoteCon
 	// Read one byte past the contract's 1MB cap: an over-cap body arrives
 	// truncated to rcMaxBodyBytes+1 bytes, which applyRemoteConfig classifies
 	// as malformed without this ever reading an unbounded response. A body
-	// read the SERVER cut short is not a transport failure: the status line
-	// and headers already arrived, so the response is passed through with
-	// bodyIncomplete set — a truncated 401/403 must fail closed by status,
-	// not degrade into a cache-served http_0. A read ended by the request
-	// CONTEXT (cancellation or timeout) stays a transport-level error, so
-	// caller-abort discrimination upstream keeps working.
+	// read cut short — by the server, or by the request context expiring
+	// mid-body — is not a transport failure: the status line and headers
+	// already arrived and are real information, so the response is passed
+	// through with bodyIncomplete set (a stalled or truncated 401/403 must
+	// fail closed by status, not degrade into a cache-served http_0). When
+	// the CONTEXT ended the read, the error is returned alongside the
+	// response: the caller discriminates a caller-context abort (the caller's
+	// own error wins, response discarded) from an SDK-internal deadline (the
+	// response classifies by status).
 	body, readErr := io.ReadAll(io.LimitReader(response.Body, rcMaxBodyBytes+1))
-	if readErr != nil && ctx.Err() != nil {
-		return remoteConfigResponse{}, fmt.Errorf("read shardpilot remote config response: %w", readErr)
-	}
 	seconds, present := parseRemoteConfigRetryAfter(response.Header.Get("Retry-After"))
-	return remoteConfigResponse{
+	result := remoteConfigResponse{
 		status:            response.StatusCode,
 		body:              body,
 		bodyIncomplete:    readErr != nil,
 		etag:              response.Header.Get("Etag"),
 		retryAfterSeconds: seconds,
 		retryAfterPresent: present,
-	}, nil
+	}
+	if readErr != nil && ctx.Err() != nil {
+		return result, fmt.Errorf("read shardpilot remote config response: %w", readErr)
+	}
+	return result, nil
 }
 
 // parseRemoteConfigRetryAfter reads a remote-config 429's Retry-After header

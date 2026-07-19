@@ -2103,15 +2103,29 @@ func TestSpoolCapacityDeadLetterDeferredUntilEvictionDurable(t *testing.T) {
 	// The next append evicts it over the 1-event cap — but the removing
 	// rewrite FAILS, so the old record (still carrying evt-defer-1) stays on
 	// disk. A crash here would reload and resend it: the capacity
-	// dead-letter must therefore NOT fire yet.
+	// dead-letter must therefore NOT fire yet. The over-cap append drives the
+	// diskSpool directly (the same call spoolFailedBatch makes) instead of
+	// racing an Enqueue+Flush against the worker's queue consumption: whether
+	// the worker had absorbed the second event before a flush request decided
+	// what to retry is a scheduler coin flip, and losing it retried only the
+	// retained first event with no eviction attempted at all.
 	injectedErr := errors.New("injected rename failure")
 	client.spool.renameFn = func(string, string) error { return injectedErr }
-	if err := client.Enqueue(Event{ID: "evt-defer-2", Name: "e2"}); err != nil {
-		t.Fatalf("Enqueue: %v", err)
+	now := time.Now()
+	_, added, _, evicted, persistFailed := client.spool.append([]spoolEntry{{
+		id:  "evt-defer-2",
+		ts:  now.UTC().Format(time.RFC3339Nano),
+		raw: spoolTestEnvelope(t, "evt-defer-2", now),
+	}}, 0, now, func() bool { return true })
+	if len(added) != 1 || !persistFailed {
+		t.Fatalf("expected the over-cap append accepted with a failed rewrite, got added=%d persistFailed=%v", len(added), persistFailed)
 	}
-	if err := client.Flush(context.Background()); err == nil {
-		t.Fatalf("expected the retriable failure surfaced")
+	if len(evicted) != 0 {
+		t.Fatalf("a capacity eviction whose rewrite failed must be deferred, not returned, got %d", len(evicted))
 	}
+	// A full client-layer drain pass (the flush-cadence upkeep) while the
+	// rewrite still fails must not release the deferred letter either.
+	client.spoolMaintain()
 	if letters := recorder.byReason(SpoolDropCapacity); len(letters) != 0 {
 		t.Fatalf("a capacity drop whose rewrite failed must not dead-letter yet, got %+v", letters)
 	}
@@ -2144,6 +2158,193 @@ func TestSpoolCapacityDeadLetterDeferredUntilEvictionDurable(t *testing.T) {
 	}
 	state.setOutcome(http.StatusAccepted, "", "")
 	_ = client.Close(context.Background())
+}
+
+func TestSpoolRebuildFailureSettlesSpooledMembers(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+	state.setOutcome(http.StatusInternalServerError, "internal_error", "")
+
+	dir := t.TempDir()
+	recorder := &spoolDeadLetterRecorder{}
+	client := newSpoolTestClient(t, server.URL, dir, recorder, nil)
+	client.SetConsent(true)
+
+	// evt-rebuild-1 fails retriably: spooled durably, retained by the worker.
+	if err := client.Enqueue(Event{ID: "evt-rebuild-1", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Flush(context.Background()); err == nil {
+		t.Fatalf("expected the retriable failure surfaced")
+	}
+	if got := len(readSpoolRecordFile(t, dir).Events); got != 1 {
+		t.Fatalf("expected the failed batch spooled, got %d", got)
+	}
+
+	// A later batchmate whose Props cannot serialize joins the retained
+	// batch; wait for the worker to absorb it so the flush retry rebuilds ONE
+	// batch of both events and fails on the poison member.
+	if err := client.Enqueue(Event{ID: "evt-rebuild-2", Name: "e2", Props: map[string]any{"bad": func() {}}}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for len(client.queue.ch) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the worker to pull the poison event into its batch")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	err := client.Flush(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "encode shardpilot batch") {
+		t.Fatalf("expected the rebuild's encode failure surfaced, got %v", err)
+	}
+	// The permanent drop settles the previously spooled member too: counted
+	// dropped == gone from disk, dead-lettered through the terminal class.
+	if record := readSpoolRecordFile(t, dir); len(record.Events) != 0 {
+		t.Fatalf("expected the spooled member settled out of the record, got %s", mustJSON(t, record.Events))
+	}
+	terminal := recorder.byReason(SpoolDropTerminal)
+	if len(terminal) != 1 || len(terminal[0].Envelopes) != 1 || !containsEventID(t, terminal[0].Envelopes, "evt-rebuild-1") {
+		t.Fatalf("expected exactly the spooled member dead-lettered terminal, got %+v", terminal)
+	}
+	if stats := client.Snapshot(); stats.Dropped != 2 {
+		t.Fatalf("expected both batch members counted dropped, got %+v", stats)
+	}
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// A restart delivers NOTHING: the drop settled the spool record as well.
+	state.setOutcome(http.StatusAccepted, "", "")
+	sent := state.batchCount()
+	restarted := newSpoolTestClient(t, server.URL, dir, nil, nil)
+	if err := restarted.Flush(context.Background()); err != nil {
+		t.Fatalf("restart Flush: %v", err)
+	}
+	if got := state.batchCount(); got != sent {
+		t.Fatalf("expected no redelivery after restart, got %d batches (was %d)", got, sent)
+	}
+	_ = restarted.Close(context.Background())
+}
+
+func TestSpoolWorkerRebuildFailureSettlesSpooledMembers(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+	state.setOutcome(http.StatusInternalServerError, "internal_error", "")
+
+	dir := t.TempDir()
+	recorder := &spoolDeadLetterRecorder{}
+	client := newSpoolTestClient(t, server.URL, dir, recorder, func(cfg *Config) {
+		cfg.BatchSize = 2
+	})
+	client.SetConsent(true)
+
+	if err := client.Enqueue(Event{ID: "evt-wrebuild-1", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Flush(context.Background()); err == nil {
+		t.Fatalf("expected the retriable failure surfaced")
+	}
+	if got := len(readSpoolRecordFile(t, dir).Events); got != 1 {
+		t.Fatalf("expected the failed batch spooled, got %d", got)
+	}
+
+	// The poison batchmate fills the batch to BatchSize, so the WORKER path
+	// (publishWorkerBatch) rebuilds on its own and hits the encode failure;
+	// its permanent drop must settle the spooled member exactly like the
+	// flush path's.
+	if err := client.Enqueue(Event{ID: "evt-wrebuild-2", Name: "e2", Props: map[string]any{"bad": func() {}}}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	waitFor(t, 3*time.Second, "the worker drop to settle the spooled member", func() bool {
+		return len(recorder.byReason(SpoolDropTerminal)) == 1
+	})
+	terminal := recorder.byReason(SpoolDropTerminal)
+	if len(terminal[0].Envelopes) != 1 || !containsEventID(t, terminal[0].Envelopes, "evt-wrebuild-1") {
+		t.Fatalf("expected exactly the spooled member dead-lettered terminal, got %+v", terminal)
+	}
+	if record := readSpoolRecordFile(t, dir); len(record.Events) != 0 {
+		t.Fatalf("expected the spooled member settled out of the record, got %s", mustJSON(t, record.Events))
+	}
+	if stats := client.Snapshot(); stats.Dropped != 2 {
+		t.Fatalf("expected both batch members counted dropped, got %+v", stats)
+	}
+	_ = client.Close(context.Background())
+}
+
+func TestSpoolDuplicateAppendRetriesDirtyWrite(t *testing.T) {
+	dir := t.TempDir()
+	s := newDiskSpool(Config{SpoolDir: dir, SpoolMaxEvents: 8, SpoolMaxBytes: 1 << 20})
+	now := time.Now()
+	entry := spoolEntry{id: "evt-dup-1", ts: now.UTC().Format(time.RFC3339Nano), raw: spoolTestEnvelope(t, "evt-dup-1", now)}
+
+	injectedErr := errors.New("injected rename failure")
+	s.renameFn = func(string, string) error { return injectedErr }
+	refused, added, _, _, persistFailed := s.append([]spoolEntry{entry}, 0, now, func() bool { return true })
+	if refused || len(added) != 1 || !persistFailed {
+		t.Fatalf("expected the first append accepted with a failed write, got refused=%v added=%d persistFailed=%v", refused, len(added), persistFailed)
+	}
+	if spoolFileExists(dir) {
+		t.Fatalf("expected no record on disk while the write fails")
+	}
+
+	// The disk error clears, and the SAME batch re-appends — exactly what the
+	// retained batch's next in-process retry does. Every entry is a duplicate
+	// and no deadline rides along: before the fix this early-returned without
+	// ever retrying the dirty write.
+	s.renameFn = os.Rename
+	refused, added, _, _, persistFailed = s.append([]spoolEntry{entry}, 0, now, func() bool { return true })
+	if refused || len(added) != 0 || persistFailed {
+		t.Fatalf("expected the duplicate append to retry and land the write, got refused=%v added=%d persistFailed=%v", refused, len(added), persistFailed)
+	}
+	record := readSpoolRecordFile(t, dir)
+	if len(record.Events) != 1 || !containsEventID(t, record.Events, "evt-dup-1") {
+		t.Fatalf("expected the recovered write durable, got %s", mustJSON(t, record.Events))
+	}
+	if s.dirty {
+		t.Fatalf("expected the dirty flag cleared by the retried write")
+	}
+	if got := s.takeBecameDurable(); got != 1 {
+		t.Fatalf("expected the entry counted durable exactly once the retried write landed, got %d", got)
+	}
+}
+
+func TestSpoolCloseRetriesDirtyWrite(t *testing.T) {
+	_, server := newSpoolTestServer(t)
+	defer server.Close()
+
+	dir := t.TempDir()
+	client := newSpoolTestClient(t, server.URL, dir, nil, nil)
+
+	// An append accepts the entry into the mirror but the record write fails.
+	injectedErr := errors.New("injected rename failure")
+	client.spool.renameFn = func(string, string) error { return injectedErr }
+	now := time.Now()
+	_, added, _, _, persistFailed := client.spool.append([]spoolEntry{{
+		id:  "evt-close-1",
+		ts:  now.UTC().Format(time.RFC3339Nano),
+		raw: spoolTestEnvelope(t, "evt-close-1", now),
+	}}, 0, now, func() bool { return true })
+	if len(added) != 1 || !persistFailed {
+		t.Fatalf("expected the append accepted with a failed write, got added=%d persistFailed=%v", len(added), persistFailed)
+	}
+	if spoolFileExists(dir) {
+		t.Fatalf("expected no record on disk while the write fails")
+	}
+
+	// The disk error clears before shutdown. Close's final settle must retry
+	// the dirty write even though nothing else touches the spool (empty
+	// remnant, no flush-cadence tick left) — exiting without it would lose
+	// the event despite the disk having recovered.
+	client.spool.renameFn = os.Rename
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	record := readSpoolRecordFile(t, dir)
+	if len(record.Events) != 1 || !containsEventID(t, record.Events, "evt-close-1") {
+		t.Fatalf("expected Close to land the recovered write durably, got %s", mustJSON(t, record.Events))
+	}
 }
 
 func TestSpoolLoadClampsPersistedRetryDeadline(t *testing.T) {

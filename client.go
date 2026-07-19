@@ -476,6 +476,13 @@ func (c *Client) run() {
 			// behind — is the spool's remnant (grant-gated; no-op without a
 			// spool).
 			c.spoolCloseRemnant(batch)
+			// Final settle: a record write that failed earlier (dirty mirror)
+			// gets one last retry before the worker exits, whatever shape the
+			// remnant took — empty, refused, or unserializable, the remnant
+			// append alone cannot be relied on to reach the disk retry, and
+			// exiting with a recovered-but-unwritten spool would lose events
+			// that a flush-cadence tick tomorrow would have saved.
+			c.spoolMaintain()
 			return
 		}
 	}
@@ -719,6 +726,17 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 			var result batchResult
 			if err != nil {
 				c.recordBuildFailure(err)
+				// The rebuild failed permanently (always the EncodeError /
+				// ErrInvalidEvent class) before producing a request, so the
+				// zero value above names no event IDs — the permanent drop
+				// below could then never settle the batch's previously
+				// SPOOLED members: stats would say dropped while the events
+				// stayed in spool.json and redelivered after a restart. The
+				// retained request still names exactly those members (it is
+				// the built form of the batch prefix an earlier retriable
+				// failure retained and spooled), so the drop settles through
+				// it: counted-dropped == gone-from-disk.
+				request = c.retainedRequest
 			} else {
 				result, err = c.publishRequestResult(ctx, request, len(batch))
 			}
@@ -811,6 +829,12 @@ func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, def
 	var result batchResult
 	if err != nil {
 		c.recordBuildFailure(err)
+		// Same substitution as flushAvailable: a failed rebuild returns the
+		// zero-valued request, and the permanent drop below must still settle
+		// the previously spooled members named by the retained request —
+		// otherwise they stay in spool.json (counted dropped, redelivered
+		// after restart).
+		request = c.retainedRequest
 	} else {
 		result, err = c.publishRequestResult(ctx, request, len(batch))
 	}

@@ -693,8 +693,11 @@ func rcFetchError(code string) error {
 // "client_id_unavailable" and "remote_config_not_configured" fail before any
 // network use). A fetch ended by the CALLER's context — cancellation or the
 // caller's own deadline — returns that context error with no cache fallback
-// and no side effects; only SDK-internal timeouts classify as the transient
-// http_0. A successful result also updates the getter snapshot; a failed one
+// and no side effects; an SDK-internal timeout classifies as the transient
+// http_0 only when it fired before a status arrived, while one that merely
+// stalled the response BODY preserves the received status and classifies by
+// it (a stalled 401 fails closed; only a stalled 200 stays transient). A
+// successful result also updates the getter snapshot; a failed one
 // leaves it untouched. Fetching is not consent-gated. Concurrent fetches are
 // legal; an older response never overwrites a newer settled outcome. Fetches
 // are fenced by the client lifecycle exactly like synchronous Track
@@ -776,15 +779,25 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 				// its deadline): that is an abort, not an endpoint outcome —
 				// no cache fallback masquerading as success, no cooldown or
 				// fence side effects, just the caller's error back (same
-				// discrimination as callerAbandonedFlush). An SDK-internal
-				// timeout leaves the caller context error-free and stays the
-				// transient class below.
+				// discrimination as callerAbandonedFlush). Any partial
+				// response riding the error is discarded with it.
 				return RemoteConfigResult{}, err
 			}
 		}
-		// Transport-level failure (no connection, timeout): status 0, the
-		// transient class.
-		resp = remoteConfigResponse{}
+		if resp.status == 0 {
+			// Transport-level failure before any status arrived (no
+			// connection, or the SDK-internal timeout fired in the header
+			// phase): the transient http_0 class.
+			resp = remoteConfigResponse{}
+		}
+		// A non-zero status rode the error through: the SDK-internal deadline
+		// ended the BODY read after an authoritative status had already
+		// arrived. The response classifies BY STATUS below with its
+		// incomplete-body marker — a stalled 401/403 fails closed, a stalled
+		// 3xx stays permanent, a stalled 429 stays transient and arms the
+		// cooldown; only a stalled 200 remains the transient malformed class —
+		// instead of every stall degrading into a cache-served http_0 (which
+		// would keep serving a snapshot for a revoked key).
 	}
 
 	now := c.clock.Now()
