@@ -181,6 +181,24 @@ type diskSpool struct {
 	// writes exactly as it does for loads.
 	grantPersisted bool
 
+	// actorDigest is the canonical digest of the actor/scope tuple this
+	// client's consent decisions cover; the persisted consent record carries
+	// and is verified against it (see consentActorDigest).
+	actorDigest string
+
+	// settledIDs remembers (bounded, FIFO) the event ids THIS process removed
+	// from the spool — acked, expired, evicted, or purged — so the
+	// reload-and-merge save can never resurrect them from a stale on-disk
+	// copy written by another client sharing the directory.
+	settledIDs  map[string]struct{}
+	settledFIFO []string
+
+	// countForeign, when set, is called (under mu; must not call back into
+	// the spool or run user code) with the number of on-disk records a
+	// merging save found that this process neither holds nor settled — i.e.
+	// another writer's mutations detected on the shared directory.
+	countForeign func(n int)
+
 	// removeFn/renameFn are the file primitives, injectable so tests can
 	// exercise purge and persist failures deterministically (the same seam
 	// discipline as createAnonymousIDWith).
@@ -188,14 +206,22 @@ type diskSpool struct {
 	renameFn func(oldpath, newpath string) error
 }
 
+// spoolSettledMemory bounds the settled-id memory used to suppress
+// merge-resurrection. Past it the oldest suppression is forgotten: a very
+// old id could then be resurrected by a stale sibling write, which degrades
+// to at-least-once delivery (the server de-dupes by event_id).
+const spoolSettledMemory = 4096
+
 func newDiskSpool(cfg Config) *diskSpool {
 	s := &diskSpool{
-		dir:       cfg.SpoolDir,
-		maxEvents: cfg.SpoolMaxEvents,
-		maxBytes:  cfg.SpoolMaxBytes,
-		ids:       make(map[string]struct{}),
-		removeFn:  os.Remove,
-		renameFn:  os.Rename,
+		dir:         cfg.SpoolDir,
+		maxEvents:   cfg.SpoolMaxEvents,
+		maxBytes:    cfg.SpoolMaxBytes,
+		ids:         make(map[string]struct{}),
+		settledIDs:  make(map[string]struct{}),
+		actorDigest: consentActorDigest(cfg),
+		removeFn:    os.Remove,
+		renameFn:    os.Rename,
 	}
 	s.owed = wipeOwedMarkerExists(s.dir)
 	return s
@@ -205,15 +231,86 @@ func (s *diskSpool) filePath() string {
 	return filepath.Join(s.dir, spoolFileName)
 }
 
-// saveLocked rewrites spool.json from the mirror (atomic temp+rename, 0600).
-// On failure the mirror stays authoritative and dirty marks the retry.
+// recordSettledLocked remembers an id this process removed from the spool so
+// a merging save does not resurrect it (bounded FIFO).
+func (s *diskSpool) recordSettledLocked(id string) {
+	if id == "" {
+		return
+	}
+	if _, exists := s.settledIDs[id]; exists {
+		return
+	}
+	s.settledIDs[id] = struct{}{}
+	s.settledFIFO = append(s.settledFIFO, id)
+	if len(s.settledFIFO) > spoolSettledMemory {
+		delete(s.settledIDs, s.settledFIFO[0])
+		s.settledFIFO = s.settledFIFO[1:]
+	}
+}
+
+// saveLocked rewrites spool.json with RELOAD-AND-MERGE semantics (atomic
+// temp+rename, 0600): the current on-disk record is re-read and unioned with
+// the in-memory mirror by event_id — minus the ids this process settled —
+// disk records first (they are the older, already-persisted view), then the
+// caps re-applied oldest-drop on the merged list, deterministically. One
+// client per SpoolDir is the supported topology; the merge is the safety net
+// that keeps a concurrent writer's still-undelivered records from being
+// silently dropped by a mirror-only rewrite. Cross-process races thereby
+// shrink to last-writer-wins over a merged view: a record a sibling acked
+// concurrently can be resurrected and resent — at-least-once, and the server
+// de-duplicates by event_id. Foreign records ride the file only: they are
+// never adopted into this process's mirror or resend queue (a restart loads
+// them normally). On failure the mirror stays authoritative and dirty marks
+// the flush-cadence retry.
 func (s *diskSpool) saveLocked() error {
-	record := spoolRecordWire{
-		Version:           spoolRecordVersion,
-		Events:            make([]json.RawMessage, 0, len(s.entries)),
-		RetryAfterUntilMS: s.retryAfterUntilMS,
+	merged := make([]spoolEntry, 0, len(s.entries))
+	seen := make(map[string]struct{}, len(s.entries))
+	foreign := 0
+	for _, entry := range s.readRecordEntriesLocked() {
+		if entry.id == "" {
+			continue
+		}
+		if _, settled := s.settledIDs[entry.id]; settled {
+			continue
+		}
+		if _, dup := seen[entry.id]; dup {
+			continue
+		}
+		seen[entry.id] = struct{}{}
+		if _, ours := s.ids[entry.id]; !ours {
+			foreign++
+		}
+		merged = append(merged, entry)
 	}
 	for _, entry := range s.entries {
+		if _, dup := seen[entry.id]; dup {
+			continue
+		}
+		seen[entry.id] = struct{}{}
+		merged = append(merged, entry)
+	}
+	if foreign > 0 && s.countForeign != nil {
+		s.countForeign(foreign)
+	}
+	mergedBytes := 0
+	for _, entry := range merged {
+		mergedBytes += len(entry.raw)
+	}
+	for len(merged) > 0 && (len(merged) > s.maxEvents || mergedBytes > s.maxBytes) {
+		mergedBytes -= len(merged[0].raw)
+		merged = merged[1:]
+	}
+	if len(merged) == 0 {
+		// An empty record must never park a future start behind a stale
+		// Retry-After deadline.
+		s.retryAfterUntilMS = 0
+	}
+	record := spoolRecordWire{
+		Version:           spoolRecordVersion,
+		Events:            make([]json.RawMessage, 0, len(merged)),
+		RetryAfterUntilMS: s.retryAfterUntilMS,
+	}
+	for _, entry := range merged {
 		record.Events = append(record.Events, entry.raw)
 	}
 	payload, err := json.Marshal(record)
@@ -222,6 +319,36 @@ func (s *diskSpool) saveLocked() error {
 	}
 	s.dirty = err != nil
 	return err
+}
+
+// clearRetryDeadline drops the persisted Retry-After deadline after a
+// successful batch publish: a success proves the backpressure window over,
+// and a stale persisted deadline must not defer the next start's publishes.
+// Returns whether a rewrite was needed and failed.
+func (s *diskSpool) clearRetryDeadline() (persistFailed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.retryAfterUntilMS == 0 {
+		return false
+	}
+	s.retryAfterUntilMS = 0
+	if s.owed {
+		return false
+	}
+	return s.saveLocked() != nil
+}
+
+// storeRetryDeadline writes through a refreshed server Retry-After deadline
+// (e.g. a 429 on a spooled resend) so a process exit before the in-memory
+// retry still honors the remaining window at the next start.
+func (s *diskSpool) storeRetryDeadline(deadlineMS int64) (persistFailed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if deadlineMS <= 0 || s.owed {
+		return false
+	}
+	s.retryAfterUntilMS = deadlineMS
+	return s.saveLocked() != nil
 }
 
 // removeRecordFile deletes spool.json; an already-absent file is success.
@@ -272,6 +399,10 @@ func (s *diskSpool) purge() (dropped []spoolEntry, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	dropped = s.entries
+	for _, entry := range dropped {
+		// Condemned data must not be resurrected by a later merging save.
+		s.recordSettledLocked(entry.id)
+	}
 	s.entries = nil
 	s.ids = make(map[string]struct{})
 	s.totalBytes = 0
@@ -292,10 +423,14 @@ func (s *diskSpool) purge() (dropped []spoolEntry, err error) {
 
 // readRecordEntries best-effort parses the on-disk record WITHOUT loading it
 // into the mirror — used at init to report what a non-grant purge is about
-// to drop.
+// to drop, and by the merging save to see a sibling writer's view.
 func (s *diskSpool) readRecordEntries() []spoolEntry {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.readRecordEntriesLocked()
+}
+
+func (s *diskSpool) readRecordEntriesLocked() []spoolEntry {
 	data, err := os.ReadFile(s.filePath())
 	if err != nil {
 		return nil
@@ -348,6 +483,7 @@ func (s *diskSpool) load(now time.Time) spoolLoadOutcome {
 		_ = json.Unmarshal(raw, &envelope)
 		entry := spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: raw}
 		if spoolEntryExpired(entry, now) {
+			s.recordSettledLocked(entry.id)
 			outcome.expired = append(outcome.expired, entry)
 			continue
 		}
@@ -373,13 +509,15 @@ func (s *diskSpool) load(now time.Time) spoolLoadOutcome {
 }
 
 // evictOverCapsLocked applies the count cap then the byte cap, evicting
-// OLDEST first, and returns the evicted entries.
+// OLDEST first, and returns the evicted entries (settled — an evicted event
+// was dead-lettered and must not be resurrected by a merging save).
 func (s *diskSpool) evictOverCapsLocked() []spoolEntry {
 	var evicted []spoolEntry
 	for len(s.entries) > 0 && (len(s.entries) > s.maxEvents || s.totalBytes > s.maxBytes) {
 		oldest := s.entries[0]
 		s.entries = s.entries[1:]
 		delete(s.ids, oldest.id)
+		s.recordSettledLocked(oldest.id)
 		s.totalBytes -= len(oldest.raw)
 		evicted = append(evicted, oldest)
 	}
@@ -448,6 +586,7 @@ func (s *diskSpool) ack(ids []string) (removed []spoolEntry, persistFailed bool)
 		if _, isAcked := acked[entry.id]; isAcked {
 			removed = append(removed, entry)
 			delete(s.ids, entry.id)
+			s.recordSettledLocked(entry.id)
 			s.totalBytes -= len(entry.raw)
 			continue
 		}
@@ -488,6 +627,7 @@ func (s *diskSpool) pullResendChunk(limit int, now time.Time) (chunk, expired []
 		}
 		if spoolEntryExpired(entry, now) {
 			delete(s.ids, entry.id)
+			s.recordSettledLocked(entry.id)
 			s.totalBytes -= len(entry.raw)
 			kept := s.entries[:0]
 			for _, held := range s.entries {
@@ -750,8 +890,22 @@ func (c *Client) resendSpooledChunks(deferUntil *time.Time, backoffAttempt *int)
 			}
 			continue
 		}
+		c.spoolStoreResendDeadline(err)
 		s.requeueResend(chunk)
 		return false
+	}
+}
+
+// spoolStoreResendDeadline writes through the server Retry-After deadline a
+// retriable spool-resend failure carried, so a process exit before the
+// in-memory retry still honors the remaining window at the next start.
+func (c *Client) spoolStoreResendDeadline(err error) {
+	deadlineMS := c.spoolDeadlineFromError(err)
+	if deadlineMS <= 0 {
+		return
+	}
+	if c.spool.storeRetryDeadline(deadlineMS) {
+		c.recordSpoolPersistFailure()
 	}
 }
 
@@ -786,6 +940,7 @@ func (c *Client) flushSpooledChunks(ctx context.Context, backoffAttempt *int) er
 			return err
 		}
 		if !isPermanentPublishError(err) {
+			c.spoolStoreResendDeadline(err)
 			s.requeueResend(chunk)
 			return err
 		}
@@ -864,7 +1019,7 @@ func (c *Client) initSpool() []SpoolDeadLetter {
 		c.logf("shardpilot spool: a spool wipe is still owed from a previous run; disk spool disabled until it succeeds")
 		return nil
 	}
-	if state, ok := loadConsentRecord(s.dir); ok && state == ConsentGranted {
+	if state, ok := loadConsentRecord(s.dir, s.actorDigest); ok && state == ConsentGranted {
 		outcome := s.load(c.clock.Now())
 		var letters []SpoolDeadLetter
 		if len(outcome.expired) > 0 {
@@ -921,7 +1076,7 @@ func (c *Client) applySpoolConsentLocked(analyticsGranted bool) []SpoolDeadLette
 			c.stats.setLastError("spool_purge_failed")
 			c.logf("shardpilot spool: consent purge failed; a wipe is owed and the disk spool is disabled until it succeeds: %v", err)
 		}
-		if recordErr := saveConsentRecord(s.dir, false, s.renameFn); recordErr != nil {
+		if recordErr := saveConsentRecord(s.dir, false, s.actorDigest, s.renameFn); recordErr != nil {
 			c.stats.setLastError("consent_record_persist_failed")
 			c.logf("shardpilot spool: persisting the denied consent record failed (the decision still applies in memory): %v", recordErr)
 		}
@@ -935,7 +1090,7 @@ func (c *Client) applySpoolConsentLocked(analyticsGranted bool) []SpoolDeadLette
 		c.logf("shardpilot spool: a spool wipe is still owed; the persisted consent decision stays denied and the disk spool stays disabled until the wipe succeeds")
 		return nil
 	}
-	if err := saveConsentRecord(s.dir, true, s.renameFn); err != nil {
+	if err := saveConsentRecord(s.dir, true, s.actorDigest, s.renameFn); err != nil {
 		s.mu.Lock()
 		s.grantPersisted = false
 		s.mu.Unlock()

@@ -997,6 +997,208 @@ func TestRemoteConfigRetryAfterParseDigitsOnly(t *testing.T) {
 	}
 }
 
+func TestRemoteConfigRedirectClassifiedPermanent(t *testing.T) {
+	var script atomic.Value
+	script.Store(rcScriptStep{status: 200, body: `{"values":{"k":"v"}}`})
+	server := newRCScriptServer(t, nil, &script)
+	defer server.Close()
+
+	cachePath := filepath.Join(t.TempDir(), "rc-cache.json")
+	client := newRemoteConfigClient(t, server.URL, cachePath, "anon-rc-1")
+	defer client.Close(context.Background())
+
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("priming fetch: %v", err)
+	}
+	cacheBefore, _ := os.ReadFile(cachePath)
+
+	// The redirect is NOT followed: the 3xx itself is the outcome, and the
+	// contract classifies it as an authoritative permanent failure — never a
+	// transient malformed_response built from the redirect target's HTML.
+	script.Store(rcScriptStep{status: 302, headers: map[string]string{"Location": server.URL + "/elsewhere"}})
+	_, err := client.FetchRemoteConfig(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "http_302") {
+		t.Fatalf("expected the redirect classified as permanent http_302, got %v", err)
+	}
+	cacheAfter, _ := os.ReadFile(cachePath)
+	if string(cacheBefore) != string(cacheAfter) {
+		t.Fatalf("a redirect must not disturb the cache file")
+	}
+	if got := client.RemoteConfigString("k", "fallback"); got != "v" {
+		t.Fatalf("a redirect must leave the getter snapshot intact, got %q", got)
+	}
+}
+
+func TestRemoteConfigCallerCancellationReturnsContextError(t *testing.T) {
+	var requests atomic.Int64
+	arrived := make(chan struct{}, 4)
+	release := make(chan struct{})
+	var blocking atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if blocking.Load() {
+			arrived <- struct{}{}
+			<-release
+		}
+		_, _ = w.Write([]byte(`{"values":{"k":"v"}}`))
+	}))
+	defer server.Close()
+	defer close(release)
+
+	cachePath := filepath.Join(t.TempDir(), "rc-cache.json")
+	client := newRemoteConfigClient(t, server.URL, cachePath, "anon-rc-1")
+	defer client.Close(context.Background())
+
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("priming fetch: %v", err)
+	}
+	cacheBefore, _ := os.ReadFile(cachePath)
+
+	// The CALLER cancels mid-request: the fetch returns the caller's context
+	// error — never a cache-served "success" the caller cannot distinguish
+	// from a healthy outcome.
+	blocking.Store(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	fetchDone := make(chan error, 1)
+	go func() {
+		_, fetchErr := client.FetchRemoteConfig(ctx)
+		fetchDone <- fetchErr
+	}()
+	<-arrived
+	cancel()
+	err := <-fetchDone
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected the caller's context.Canceled, got %v", err)
+	}
+	if strings.Contains(err.Error(), "http_0") {
+		t.Fatalf("caller cancellation must not classify as a transport outcome, got %v", err)
+	}
+	cacheAfter, _ := os.ReadFile(cachePath)
+	if string(cacheBefore) != string(cacheAfter) {
+		t.Fatalf("caller cancellation must not disturb the cache file")
+	}
+	if got := client.RemoteConfigString("k", "fallback"); got != "v" {
+		t.Fatalf("caller cancellation must leave the getter snapshot intact, got %q", got)
+	}
+
+	// No cooldown or fence side effects: the very next fetch reaches the
+	// network normally.
+	blocking.Store(false)
+	sent := requests.Load()
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("post-cancel fetch: %v", err)
+	}
+	if requests.Load() != sent+1 {
+		t.Fatalf("expected the post-cancel fetch on the network")
+	}
+}
+
+func TestRemoteConfigInternalTimeoutStaysTransient(t *testing.T) {
+	var slow atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if slow.Load() {
+			time.Sleep(500 * time.Millisecond)
+		}
+		_, _ = w.Write([]byte(`{"values":{"k":"v"}}`))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(Config{
+		IngestURL:       server.URL,
+		Token:           "test-token",
+		WorkspaceID:     "workspace-test",
+		AppID:           "app-test",
+		EnvironmentID:   "develop",
+		Source:          SourceBackend,
+		AnonymousID:     "anon-rc-1",
+		APIKey:          "test-rc-key",
+		RemoteConfigURL: server.URL,
+		FlushInterval:   time.Hour,
+		HTTPTimeout:     100 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("priming fetch: %v", err)
+	}
+
+	// The SDK-internal HTTPTimeout fires while the CALLER's context (with no
+	// deadline of its own) is still live: this is an endpoint outcome, and
+	// the transient class serves the cache.
+	slow.Store(true)
+	result, err := client.FetchRemoteConfig(context.Background())
+	if err != nil {
+		t.Fatalf("expected the internal timeout served from cache, got %v", err)
+	}
+	if !result.FromCache || result.Reason != "http_0" || result.Values["k"] != "v" {
+		t.Fatalf("expected the cache-served http_0 outcome, got %+v", result)
+	}
+}
+
+func TestRemoteConfigInFlight200DoesNotRollBackFresherDurable(t *testing.T) {
+	var requests atomic.Int64
+	arrived := make(chan struct{}, 1)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) == 2 {
+			arrived <- struct{}{}
+			<-release
+			_, _ = w.Write([]byte(`{"values":{"k":"B"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"values":{"k":"A"}}`))
+	}))
+	defer server.Close()
+
+	cachePath := filepath.Join(t.TempDir(), "rc-cache.json")
+	client := newRemoteConfigClient(t, server.URL, cachePath, "anon-rc-1")
+	defer client.Close(context.Background())
+
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("priming fetch: %v", err)
+	}
+	primed := readRemoteConfigCacheFile(t, cachePath)
+
+	fetchDone := make(chan RemoteConfigResult, 1)
+	go func() {
+		result, fetchErr := client.FetchRemoteConfig(context.Background())
+		if fetchErr != nil {
+			t.Errorf("in-flight fetch: %v", fetchErr)
+		}
+		fetchDone <- result
+	}()
+	<-arrived
+	// Another same-app process refreshes the durable record while this
+	// fetch's response is still in flight.
+	foreign := rcCache{
+		Scope:       primed.Scope,
+		ETag:        `"foreign"`,
+		Body:        `{"values":{"k":"C"}}`,
+		FetchedAtMS: primed.FetchedAtMS + 10_000,
+	}
+	writeRemoteConfigCacheFile(t, cachePath, foreign)
+	close(release)
+
+	result := <-fetchDone
+	// The fetch's caller still receives ITS response...
+	if result.FromCache || result.Values["k"] != "B" {
+		t.Fatalf("expected the in-flight fetch to serve its own response, got %+v", result)
+	}
+	// ...but the fresher durable record is not rolled back...
+	record := readRemoteConfigCacheFile(t, cachePath)
+	if record.Body != foreign.Body || record.FetchedAtMS != foreign.FetchedAtMS {
+		t.Fatalf("expected the fresher durable record kept, got %+v", record)
+	}
+	// ...and the getters never regress (they keep the last installed
+	// snapshot; the next load converges on the freshest record).
+	if got := client.RemoteConfigString("k", "fallback"); got != "A" {
+		t.Fatalf("expected the getter snapshot unchanged, got %q", got)
+	}
+}
+
 func TestRemoteConfigFetchAfterCloseReturnsErrClosed(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"values":{}}`))

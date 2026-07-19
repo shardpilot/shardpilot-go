@@ -35,12 +35,17 @@ type Stats struct {
 	// SpoolPersistFailed counts failed spool record writes (the in-memory
 	// mirror stays authoritative and the write is retried on the flush
 	// cadence). Every SpoolEvicted/SpoolExpired drop is also reported through
-	// Config.OnSpoolDeadLetter.
+	// Config.OnSpoolDeadLetter. SpoolForeignMerged counts on-disk records a
+	// merging spool save found that this client neither holds nor settled —
+	// i.e. another writer's mutations detected on a shared SpoolDir (one
+	// client per SpoolDir is the supported topology; the reload-and-merge
+	// save is the safety net, and this counter is how sharing shows up).
 	Spooled            uint64
 	SpoolResent        uint64
 	SpoolEvicted       uint64
 	SpoolExpired       uint64
 	SpoolPersistFailed uint64
+	SpoolForeignMerged uint64
 }
 
 type statsCollector struct {
@@ -57,6 +62,7 @@ type statsCollector struct {
 	spoolEvicted       atomic.Uint64
 	spoolExpired       atomic.Uint64
 	spoolPersistFailed atomic.Uint64
+	spoolForeignMerged atomic.Uint64
 
 	mu        sync.Mutex
 	lastError string
@@ -90,6 +96,7 @@ func (s *statsCollector) snapshot() Stats {
 		SpoolEvicted:       s.spoolEvicted.Load(),
 		SpoolExpired:       s.spoolExpired.Load(),
 		SpoolPersistFailed: s.spoolPersistFailed.Load(),
+		SpoolForeignMerged: s.spoolForeignMerged.Load(),
 	}
 }
 

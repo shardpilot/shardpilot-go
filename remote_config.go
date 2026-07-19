@@ -3,6 +3,7 @@ package shardpilot
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -481,11 +482,15 @@ func (rc *remoteConfigState) raiseStampAboveSuperseded(record *rcCache, served, 
 // installs it: the in-process record, the durable copy (best-effort), and
 // the getter snapshot. The gates, in order: the per-scope sequence fence
 // (an outcome older than the newest settled one installs nothing); only
-// authoritative outcomes settle it; a fresh 200 always installs, a 304
-// revalidation installs its renewed stamp unless a FRESHER durable record
-// with a DIFFERENT body appeared mid-flight (a 304 validates at server
-// handling time and cannot be ordered against it — the values are still
-// served to the caller, the restamp is skipped); a cache-served outcome
+// authoritative outcomes settle it; a fresh 200 or a 304 revalidation
+// installs UNLESS a FRESHER durable record with a DIFFERENT body appeared
+// mid-flight — both validate at server handling time, and responses arrive
+// in no particular order, so neither can be ordered against a record another
+// process persisted while this fetch was in flight; overwriting it could
+// roll the durable configuration (and, for restarts and siblings, the
+// getters) back. On that guard the values are still served to this fetch's
+// caller, the install is skipped, and the freshest durable record stays —
+// this process converges on it at the next load. A cache-served outcome
 // installs only by ADOPTION, when the served record is strictly fresher
 // than the held one. Returns whether the durable write failed (the caller
 // surfaces it).
@@ -508,14 +513,17 @@ func (rc *remoteConfigState) installLocked(seq uint64, result RemoteConfigResult
 	if record != nil {
 		durable = rc.durableRecord(scope)
 	}
-	if revalidated != nil && durable != nil && served != nil &&
-		durable.Body != revalidated.Body &&
-		durable.FetchedAtMS > served.FetchedAtMS {
-		// A DIFFERENT body, persisted by another same-app process after this
-		// fetch captured its record, may reflect a newer server state than
-		// this revalidation. Renewing the stamp over it could roll the
-		// durable configuration back, so the renewal is skipped (the
-		// revalidated values are still served to this fetch's caller).
+	if record != nil && durable != nil &&
+		durable.Body != record.Body &&
+		(served == nil || durable.FetchedAtMS > served.FetchedAtMS) {
+		// The durable record advanced past what this fetch dispatched
+		// against: a DIFFERENT body, persisted by another same-app process
+		// while this response was in flight, may reflect a newer server
+		// state than this response — the two cannot be ordered from here.
+		// Raising this record's stamp above it and saving would roll the
+		// durable configuration back, so the install is skipped (the fetched
+		// values are still served to this fetch's caller; getters never
+		// regress, and the next load converges on the freshest record).
 		record = nil
 	}
 	switch {
@@ -592,10 +600,12 @@ func rcFetchError(code string) error {
 // snapshot; "http_<status>" is permanent; "transient_..."/"http_0"/
 // "malformed_response" are transient with no usable cache;
 // "client_id_unavailable" and "remote_config_not_configured" fail before any
-// network use). A successful result also updates the getter snapshot; a
-// failed one leaves it untouched. Fetching is not consent-gated. Concurrent
-// fetches are legal; an older response never overwrites a newer settled
-// outcome.
+// network use). A fetch ended by the CALLER's context — cancellation or the
+// caller's own deadline — returns that context error with no cache fallback
+// and no side effects; only SDK-internal timeouts classify as the transient
+// http_0. A successful result also updates the getter snapshot; a failed one
+// leaves it untouched. Fetching is not consent-gated. Concurrent fetches are
+// legal; an older response never overwrites a newer settled outcome.
 func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, error) {
 	if c.closed.Load() {
 		return RemoteConfigResult{}, ErrClosed
@@ -635,6 +645,7 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 	apiKey := rc.apiKey
 	rc.mu.Unlock()
 
+	callerCtx := ctx
 	ctx, cancel := contextWithDefaultTimeout(ctx, c.cfg.HTTPTimeout)
 	defer cancel()
 	resp, err := c.transport.FetchRemoteConfig(ctx, remoteConfigRequest{
@@ -643,6 +654,18 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 		ifNoneMatch: etag,
 	})
 	if err != nil {
+		if callerCtx != nil {
+			if ctxErr := callerCtx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
+				// The CALLER's own context ended the fetch (cancellation or
+				// its deadline): that is an abort, not an endpoint outcome —
+				// no cache fallback masquerading as success, no cooldown or
+				// fence side effects, just the caller's error back (same
+				// discrimination as callerAbandonedFlush). An SDK-internal
+				// timeout leaves the caller context error-free and stays the
+				// transient class below.
+				return RemoteConfigResult{}, err
+			}
+		}
 		// Transport-level failure (no connection, timeout): status 0, the
 		// transient class.
 		resp = remoteConfigResponse{}

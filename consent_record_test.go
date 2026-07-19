@@ -6,27 +6,41 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
 
 func TestConsentRecordRoundTrip(t *testing.T) {
 	dir := t.TempDir()
+	digest := spoolTestActorDigest()
 
-	if _, ok := loadConsentRecord(dir); ok {
+	if _, ok := loadConsentRecord(dir, digest); ok {
 		t.Fatalf("expected no decision from an absent record")
 	}
-	if err := saveConsentRecord(dir, true, os.Rename); err != nil {
+	if err := saveConsentRecord(dir, true, digest, os.Rename); err != nil {
 		t.Fatalf("save granted: %v", err)
 	}
-	if state, ok := loadConsentRecord(dir); !ok || state != ConsentGranted {
+	if state, ok := loadConsentRecord(dir, digest); !ok || state != ConsentGranted {
 		t.Fatalf("expected a granted record, got %v %v", state, ok)
 	}
-	if err := saveConsentRecord(dir, false, os.Rename); err != nil {
+	if err := saveConsentRecord(dir, false, digest, os.Rename); err != nil {
 		t.Fatalf("save denied: %v", err)
 	}
-	if state, ok := loadConsentRecord(dir); !ok || state != ConsentDenied {
+	if state, ok := loadConsentRecord(dir, digest); !ok || state != ConsentDenied {
 		t.Fatalf("expected a denied record, got %v %v", state, ok)
+	}
+
+	// A record written for a DIFFERENT actor/scope tuple is no decision for
+	// this one: a reused state dir never lets one actor's decision authorize
+	// another's disk participation.
+	otherDigest := consentActorDigest(Config{
+		WorkspaceID:   "workspace-test",
+		EnvironmentID: "develop",
+		AnonymousID:   "anon-other",
+	})
+	if _, ok := loadConsentRecord(dir, otherDigest); ok {
+		t.Fatalf("expected no decision for a different actor digest")
 	}
 
 	// Unreadable and unknown-valued records are no decision at all — the
@@ -34,14 +48,39 @@ func TestConsentRecordRoundTrip(t *testing.T) {
 	if err := os.WriteFile(consentRecordPath(dir), []byte("not json"), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if _, ok := loadConsentRecord(dir); ok {
+	if _, ok := loadConsentRecord(dir, digest); ok {
 		t.Fatalf("expected no decision from an unreadable record")
 	}
-	if err := os.WriteFile(consentRecordPath(dir), []byte(`{"consent_analytics":"maybe"}`), 0o600); err != nil {
+	if err := os.WriteFile(consentRecordPath(dir), []byte(`{"consent_analytics":"maybe","actor_digest":"`+digest+`"}`), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if _, ok := loadConsentRecord(dir); ok {
+	if _, ok := loadConsentRecord(dir, digest); ok {
 		t.Fatalf("expected no decision from an unknown value")
+	}
+}
+
+func TestConsentActorDigestInjective(t *testing.T) {
+	base := Config{WorkspaceID: "ws", EnvironmentID: "env", UserID: "u", AnonymousID: "a"}
+	digest := consentActorDigest(base)
+	if len(digest) != 64 {
+		t.Fatalf("expected a sha256 hex digest, got %q", digest)
+	}
+	// Every tuple field participates, and shifting bytes across field
+	// boundaries changes the digest (length-prefixed hashing).
+	variants := []Config{
+		{WorkspaceID: "wsX", EnvironmentID: "env", UserID: "u", AnonymousID: "a"},
+		{WorkspaceID: "ws", EnvironmentID: "envX", UserID: "u", AnonymousID: "a"},
+		{WorkspaceID: "ws", EnvironmentID: "env", UserID: "uX", AnonymousID: "a"},
+		{WorkspaceID: "ws", EnvironmentID: "env", UserID: "u", AnonymousID: "aX"},
+		{WorkspaceID: "wse", EnvironmentID: "nv", UserID: "u", AnonymousID: "a"},
+	}
+	for _, variant := range variants {
+		if consentActorDigest(variant) == digest {
+			t.Fatalf("expected a distinct digest for %+v", variant)
+		}
+	}
+	if consentActorDigest(base) != digest {
+		t.Fatalf("expected a deterministic digest")
 	}
 }
 
@@ -67,8 +106,13 @@ func TestConsentRecordWrittenAtomicallyWithPrivateModes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if string(data) != `{"consent_analytics":"granted"}` {
-		t.Fatalf("unexpected record content %q", data)
+	want := `{"consent_analytics":"granted","actor_digest":"` + spoolTestActorDigest() + `"}`
+	if string(data) != want {
+		t.Fatalf("unexpected record content %q (want %q)", data, want)
+	}
+	// The record carries a fixed-size digest, never the verbatim identity.
+	if strings.Contains(string(data), "anon-spool-1") {
+		t.Fatalf("the consent record must not contain plaintext identifiers: %q", data)
 	}
 	// No stray temp files linger from the atomic write.
 	entries, err := os.ReadDir(dir)

@@ -134,6 +134,9 @@ func NewClient(cfg Config) (*Client, error) {
 	var initDeadLetters []SpoolDeadLetter
 	if normalized.SpoolDir != "" {
 		client.spool = newDiskSpool(normalized)
+		client.spool.countForeign = func(n int) {
+			client.stats.spoolForeignMerged.Add(uint64(n))
+		}
 		initDeadLetters = client.initSpool()
 	}
 	if normalized.RemoteConfigURL != "" {
@@ -882,6 +885,14 @@ func (c *Client) publishRequest(ctx context.Context, request batchRequest, size 
 	}
 	c.stats.recordBatch(result, size)
 	c.notifyBatchResult(result.toPublic())
+	if c.spool != nil {
+		// ANY successful publish proves the server's backpressure window
+		// over: a persisted Retry-After deadline surviving it would defer the
+		// next start's publishes for a window that already ended.
+		if c.spool.clearRetryDeadline() {
+			c.recordSpoolPersistFailure()
+		}
+	}
 	// Signal the success to the worker's pacing state: a synchronous Track
 	// (or any other path) proving the endpoint healthy must clear a stale
 	// retry deadline instead of letting it hold automatic publishes. The

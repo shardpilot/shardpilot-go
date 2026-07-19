@@ -161,6 +161,13 @@ type httpTransport struct {
 	// the consent route. Empty means declare nothing (header omitted).
 	schemaRevision string
 	client         *http.Client
+	// rcClient serves remote-config fetches only. Unlike the ingest client it
+	// does NOT follow redirects: the remote-config contract classifies a 3xx
+	// as a permanent http_3xx failure, and silently following it would
+	// instead surface the redirect target's body (typically HTML) as a
+	// transient malformed_response — the wrong class, and one that serves the
+	// cache for an endpoint that authoritatively is not here.
+	rcClient *http.Client
 }
 
 func newHTTPTransport(cfg Config) *httpTransport {
@@ -172,6 +179,12 @@ func newHTTPTransport(cfg Config) *httpTransport {
 		schemaRevision:  effectiveSchemaRevision(cfg),
 		client: &http.Client{
 			Timeout: cfg.HTTPTimeout,
+		},
+		rcClient: &http.Client{
+			Timeout: cfg.HTTPTimeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
 	}
 }
@@ -198,8 +211,10 @@ func (t *httpTransport) PublishConsent(ctx context.Context, request consentReque
 // level failures (no connection, timeout) as an error — classified as the
 // transient `http_0` outcome upstream — and every HTTP response, whatever
 // its status, as a remoteConfigResponse for applyRemoteConfig to classify.
-// The request authenticates with the publishable API key only, and never
-// carries the schema-revision header (a batch-route contract).
+// Redirects are NOT followed (see rcClient): a 3xx is returned as-is so the
+// decision core can classify it as the contract's permanent http_3xx. The
+// request authenticates with the publishable API key only, and never carries
+// the schema-revision header (a batch-route contract).
 func (t *httpTransport) FetchRemoteConfig(ctx context.Context, request remoteConfigRequest) (remoteConfigResponse, error) {
 	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, request.url, nil)
 	if err != nil {
@@ -210,7 +225,7 @@ func (t *httpTransport) FetchRemoteConfig(ctx context.Context, request remoteCon
 		httpRequest.Header.Set("If-None-Match", request.ifNoneMatch)
 	}
 
-	response, err := t.client.Do(httpRequest)
+	response, err := t.rcClient.Do(httpRequest)
 	if err != nil {
 		return remoteConfigResponse{}, fmt.Errorf("send shardpilot remote config request: %w", err)
 	}
