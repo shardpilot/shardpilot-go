@@ -1,6 +1,7 @@
 package shardpilot
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -379,14 +380,31 @@ func applyRemoteConfig(cache *rcCache, resp remoteConfigResponse, nowMS int64) (
 
 // rcCacheReadLimit bounds how much of the durable cache file is ever read
 // back: twice the response-body cap plus a fixed framing overhead. The body
-// rides the record as a JSON string, and escaping a valid JSON text at worst
-// doubles it (each `"`, `\`, and inter-token whitespace control byte escapes
-// to two bytes; valid JSON text carries no raw control characters inside
-// strings), so a record this client could have written fits with room to
-// spare — a larger file is not such a record and is treated as corrupt
-// without ever being loaded whole, mirroring the spool's bounded record
-// read.
+// rides the record as a JSON string written WITHOUT HTML escaping (see
+// marshalRCCache), so escaping a valid JSON text at worst doubles it (each
+// `"`, `\`, and inter-token whitespace control byte escapes to two bytes;
+// valid JSON text carries no raw control characters inside strings, and
+// `<`/`>`/`&` pass through verbatim). A record this client could have
+// written therefore fits with room to spare — a larger file is not such a
+// record and is treated as corrupt without ever being loaded whole,
+// mirroring the spool's bounded record read.
 const rcCacheReadLimit = 2*rcMaxBodyBytes + 64<<10
+
+// marshalRCCache encodes the cache record without JSON HTML escaping: the
+// record is a private file read back only by this SDK, never embedded in
+// HTML, and the default escaping would expand every `<`, `>`, and `&` in the
+// body SIXFOLD (`<`) — enough to push a legitimately sub-cap body past
+// rcCacheReadLimit and lose the last-known-good record to the corrupt-cache
+// path on its next load.
+func marshalRCCache(record *rcCache) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(record); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
 
 // durableRecord loads the usable durable record for the given scope, or nil.
 // A record written for any other (workspace, environment, client, url) tuple
@@ -443,7 +461,7 @@ func (rc *remoteConfigState) loadCacheLocked() *rcCache {
 // parent's permissions are never changed; tightening is reserved for the
 // dedicated SpoolDir state directory the SDK owns.
 func (rc *remoteConfigState) saveDurable(record *rcCache) error {
-	payload, err := json.Marshal(record)
+	payload, err := marshalRCCache(record)
 	if err != nil {
 		return err
 	}

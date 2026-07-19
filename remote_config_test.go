@@ -1601,3 +1601,35 @@ func TestRemoteConfigOversizedCacheFileIgnoredWithoutFullUse(t *testing.T) {
 		t.Fatalf("expected the oversized file overwritten by the fresh record, got %d body bytes", len(record.Body))
 	}
 }
+
+func TestRemoteConfigCacheRoundTripsHTMLDenseBody(t *testing.T) {
+	// A valid sub-cap body dense in `<`: default JSON marshaling would
+	// HTML-escape each to 6 bytes and push the self-written record past the
+	// bounded read limit, losing it to the corrupt-cache path on reload.
+	body := `{"values":{"k":"` + strings.Repeat("<", 700_000) + `"}}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	defer server.Close()
+
+	cachePath := filepath.Join(t.TempDir(), "rc-cache.json")
+	first := newRemoteConfigClient(t, server.URL, cachePath, "anon-rc-1")
+	if _, err := first.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("FetchRemoteConfig: %v", err)
+	}
+	_ = first.Close(context.Background())
+	info, err := os.Stat(cachePath)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Size() > rcCacheReadLimit {
+		t.Fatalf("self-written record exceeds the bounded read limit: %d > %d", info.Size(), rcCacheReadLimit)
+	}
+
+	// A restart preloads and serves it — the record must not read as corrupt.
+	second := newRemoteConfigClient(t, server.URL, cachePath, "anon-rc-1")
+	defer second.Close(context.Background())
+	if got := second.RemoteConfigString("k", "fallback"); got != strings.Repeat("<", 700_000) {
+		t.Fatalf("expected the HTML-dense record preloaded, got %d-byte value (fallback? %v)", len(got), got == "fallback")
+	}
+}

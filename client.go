@@ -681,8 +681,12 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 				c.stats.dropped.Add(uint64(dropped))
 			}
 			// A denial-drained flush discards the pipeline the streak was
-			// tracking along with it.
+			// tracking along with it — including the retained wire bytes,
+			// which described the discarded batch: kept, they could resend a
+			// dropped event's stale encoding under a reused event_id after a
+			// later grant.
 			*backoffAttempt = 0
+			c.retainedRequest = batchRequest{}
 			return batch[:0], firstErr
 		}
 		// Spooled chunks flush before the fresh batch (they are the oldest
@@ -696,6 +700,8 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 					c.stats.dropped.Add(uint64(dropped))
 				}
 				*backoffAttempt = 0
+				// The retained wire bytes described the discarded batch.
+				c.retainedRequest = batchRequest{}
 				return batch[:0], firstErr
 			}
 			if !isPermanentPublishError(err) {
@@ -710,10 +716,11 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 			// already marshaled resends its retained bytes verbatim, so the
 			// in-process retry matches what that failure spooled.
 			request, err := c.buildBatchReusing(batch, c.retainedRequest)
+			var result batchResult
 			if err != nil {
 				c.recordBuildFailure(err)
 			} else {
-				err = c.publishRequest(ctx, request, len(batch))
+				result, err = c.publishRequestResult(ctx, request, len(batch))
 			}
 			if err != nil {
 				if errors.Is(err, ErrConsentDenied) {
@@ -757,7 +764,7 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 				// batch's error, and that error must be paced as a FIRST
 				// failure, not as a continuation of a streak a mid-flush
 				// success already broke.
-				c.spoolAck(request)
+				c.spoolAckWithVerdicts(request, result)
 				*backoffAttempt = 0
 				batch = batch[:0]
 				c.retainedRequest = batchRequest{}
@@ -801,10 +808,11 @@ func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, def
 	// Build THROUGH the retained request (see buildBatchReusing): the prefix
 	// a previous failed attempt already marshaled resends its exact bytes.
 	request, err := c.buildBatchReusing(batch, c.retainedRequest)
+	var result batchResult
 	if err != nil {
 		c.recordBuildFailure(err)
 	} else {
-		err = c.publishRequest(ctx, request, len(batch))
+		result, err = c.publishRequestResult(ctx, request, len(batch))
 	}
 	c.applyRetryPacing(err, deferUntil, backoffAttempt)
 	if err != nil {
@@ -825,7 +833,7 @@ func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, def
 		c.spoolFailedBatch(request, err)
 		return batch
 	}
-	c.spoolAck(request)
+	c.spoolAckWithVerdicts(request, result)
 	c.retainedRequest = batchRequest{}
 	return batch[:0]
 }

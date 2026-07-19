@@ -514,13 +514,29 @@ func (s *diskSpool) settleOwedWipeLocked() bool {
 	if s.removeRecordFile() != nil {
 		return false
 	}
-	s.owed = false
 	// The record file is gone: any deferred capacity evictions are final.
 	s.releaseDeferredCapacityDropsLocked()
-	// Best-effort: a marker that cannot be removed re-enters owed on the
-	// next start and re-runs this (idempotent) wipe.
-	_ = removeWipeOwedMarker(s.dir)
+	// The durable marker must come off BEFORE the spool reopens: with the
+	// marker still on disk, a restart would re-run the wipe and destroy
+	// events spooled after this settle — so a failed marker removal keeps
+	// the spool fail-closed (the record file is already gone; the next
+	// settle attempt retries just the marker).
+	if s.removeMarkerFile() != nil {
+		return false
+	}
+	s.owed = false
 	return true
+}
+
+// removeMarkerFile removes the wipe-owed marker through the injectable
+// remove primitive (so tests can exercise a refused marker removal); an
+// already-absent marker is success.
+func (s *diskSpool) removeMarkerFile() error {
+	err := s.removeFn(spoolWipeOwedPath(s.dir))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 // purge condemns the whole spool: the mirror and resend queue are cleared
@@ -549,12 +565,17 @@ func (s *diskSpool) purge() (dropped []spoolEntry, err error) {
 		_ = createWipeOwedMarker(s.dir)
 		return dropped, err
 	}
-	if s.owed {
-		s.owed = false
-		_ = removeWipeOwedMarker(s.dir)
-	}
 	// The record file is gone: any deferred capacity evictions are final.
 	s.releaseDeferredCapacityDropsLocked()
+	if s.owed {
+		// The purge itself succeeded, but the spool reopens only once the
+		// durable marker is off disk too — a stale marker would re-condemn
+		// (wipe at the next start) anything spooled after this purge.
+		if s.removeMarkerFile() != nil {
+			return dropped, nil
+		}
+		s.owed = false
+	}
 	return dropped, nil
 }
 
@@ -579,7 +600,12 @@ func (s *diskSpool) readRecordBytesLocked() ([]byte, error) {
 		return nil, err
 	}
 	defer file.Close()
-	limit := int64(s.maxBytes) + spoolRecordReadOverhead
+	// The framing allowance scales with the EVENT cap as well: past ~64k
+	// retained envelopes the array separators alone outgrow the fixed
+	// overhead, and a self-written cap-full record must never read back as
+	// oversized. Four bytes per allowed event covers the separator with
+	// room to spare.
+	limit := int64(s.maxBytes) + spoolRecordReadOverhead + 4*int64(s.maxEvents)
 	data, err := io.ReadAll(io.LimitReader(file, limit+1))
 	if err != nil {
 		return nil, err
@@ -673,7 +699,13 @@ func (s *diskSpool) load(now time.Time) spoolLoadOutcome {
 			remaining = spoolMaxDeferralSeed
 		}
 		outcome.deferUntil = now.Add(remaining)
-		s.retryAfterUntilMS = record.RetryAfterUntilMS
+		// The STORED deadline is clamped too, not just the seeded deferral:
+		// re-persisting a far-future raw value (a far-forward clock at write
+		// time, or a tampered file) would hand every subsequent restart a
+		// fresh full-clamp deferral — the rewrite below persists the bounded
+		// absolute instant instead, so a restart chain can never be parked
+		// longer than one clamp window from this load.
+		s.retryAfterUntilMS = outcome.deferUntil.UnixMilli()
 	}
 	s.resend = append([]spoolEntry(nil), s.entries...)
 	outcome.persistFailed = s.saveLocked() != nil
@@ -1071,9 +1103,15 @@ func (c *Client) spoolFailedBatch(request batchRequest, cause error) {
 	c.drainSpoolCapacityDrops()
 }
 
-// spoolAck settles a delivered batch: its events, if spooled, are removed
-// (no dead-letter — they were delivered).
-func (c *Client) spoolAck(request batchRequest) {
+// spoolAckWithVerdicts settles a delivered live batch's spooled copies from
+// the response's per-event verdicts, exactly like settleResentChunk does for
+// restart-loaded chunks: every event in the accepted batch is settled
+// server-side and comes off the spool, but one the response marked rejected
+// or consent-suppressed was DROPPED, not delivered — its previously spooled
+// copy dead-letters with the matching class instead of vanishing as if
+// delivered. (No SpoolResent counting here: that counter is for a previous
+// process's records.)
+func (c *Client) spoolAckWithVerdicts(request batchRequest, result batchResult) {
 	s := c.spool
 	if s == nil {
 		return
@@ -1082,7 +1120,26 @@ func (c *Client) spoolAck(request batchRequest) {
 	if len(entries) == 0 {
 		return
 	}
-	if _, persistFailed := s.ack(spoolEntryIDs(entries)); persistFailed {
+	verdicts := make(map[string]EventStatus, len(result.Events))
+	for _, event := range result.Events {
+		verdicts[event.EventID] = EventStatus(event.Status)
+	}
+	removed, persistFailed := s.ack(spoolEntryIDs(entries))
+	var terminal, consentDropped []spoolEntry
+	for _, entry := range removed {
+		reason, dropped := spoolVerdictDropReason(verdicts[entry.id])
+		if !dropped {
+			continue
+		}
+		if reason == SpoolDropConsent {
+			consentDropped = append(consentDropped, entry)
+		} else {
+			terminal = append(terminal, entry)
+		}
+	}
+	c.notifySpoolDeadLetter(SpoolDropTerminal, terminal)
+	c.notifySpoolDeadLetter(SpoolDropConsent, consentDropped)
+	if persistFailed {
 		c.recordSpoolPersistFailure()
 	}
 	c.drainSpoolCapacityDrops()
