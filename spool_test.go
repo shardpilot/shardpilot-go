@@ -1974,6 +1974,96 @@ func TestSpoolRecoveryWakeResendsSpoolOnlyWork(t *testing.T) {
 	_ = client.Close(context.Background())
 }
 
+// A canceled explicit Flush whose only pending work is a startup-loaded
+// spool chunk is caller abandonment, not endpoint feedback: it must leave
+// the armed retry deadline untouched. The requeued chunk is exactly the
+// work that deadline still protects, so the worker's empty-batch deadline
+// clear must not run for an abandoned flush — or the chunk would retry at
+// the next tick inside the server's window.
+func TestSpoolCanceledFlushPreservesArmedDeadline(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+	// Any leaked retry keeps failing retriably; the discriminator is whether
+	// a request arrives at all while the deadline is armed.
+	state.setOutcome(http.StatusInternalServerError, "internal_error", "3600")
+
+	dir := t.TempDir()
+	now := time.Now()
+	writeConsentRecordFile(t, dir, "granted")
+	writeSpoolRecordFile(t, dir, now.Add(time.Hour).UnixMilli(), spoolTestEnvelope(t, "evt-cancel-armed-1", now))
+
+	// The short cadence makes a leaked deadline clear observable: the next
+	// tick would retry the requeued chunk immediately.
+	client := newSpoolTestClient(t, server.URL, dir, nil, func(cfg *Config) {
+		cfg.FlushInterval = 40 * time.Millisecond
+	})
+	defer client.Close(context.Background())
+
+	if client.initialDeferUntil.IsZero() {
+		t.Fatalf("expected the persisted deadline to seed the deferral")
+	}
+	// Baseline: inside the restored window automatic resends hold off.
+	time.Sleep(150 * time.Millisecond)
+	if got := state.batchCount(); got != 0 {
+		t.Fatalf("expected no resend inside the armed window before the flush, got %d requests", got)
+	}
+
+	// The canceled flush is handed straight to the worker so it cannot
+	// short-circuit in Flush's own pre-send context check. The publish
+	// attempt fails with the caller's context error before reaching the
+	// server; the chunk is requeued and the held batch stays empty.
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	reply := make(chan error, 1)
+	select {
+	case client.flushRequests <- flushRequest{ctx: canceledCtx, reply: reply}:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out handing the canceled flush to the worker")
+	}
+	select {
+	case err := <-reply:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected the canceled flush to surface the caller's context error, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the canceled flush reply")
+	}
+
+	// Zero pacing side-effects: the deadline stays armed, so the requeued
+	// chunk must NOT retry at the following ticks.
+	time.Sleep(400 * time.Millisecond)
+	if got := state.batchCount(); got != 0 {
+		t.Fatalf("expected the armed deadline to keep gating the requeued chunk after the canceled flush, got %d requests", got)
+	}
+
+	// Control: a live-context flush behaves as before — explicit intent
+	// bypasses the deferral, delivers the chunk, and the successful outcome
+	// clears pacing so a fresh event publishes on the normal cadence.
+	state.setOutcome(http.StatusAccepted, "", "")
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("live-context flush: %v", err)
+	}
+	if got := state.batchCount(); got != 1 {
+		t.Fatalf("expected the live flush to deliver the requeued chunk, got %d requests", got)
+	}
+	if record := readSpoolRecordFile(t, dir); len(record.Events) != 0 {
+		t.Fatalf("expected the delivered chunk acked out of the record, got %s", mustJSON(t, record.Events))
+	}
+	if err := client.Enqueue(Event{ID: "evt-cancel-armed-fresh-1", Name: "fresh"}); err != nil {
+		t.Fatalf("enqueue fresh event: %v", err)
+	}
+	waitFor(t, 5*time.Second, "the fresh event published on the flush cadence", func() bool {
+		for _, arrival := range state.allArrivals() {
+			for _, id := range arrival {
+				if id == "evt-cancel-armed-fresh-1" {
+					return true
+				}
+			}
+		}
+		return false
+	})
+}
+
 func TestSpoolInProcessRetryReusesRetainedBytes(t *testing.T) {
 	state, server := newSpoolTestServer(t)
 	defer server.Close()

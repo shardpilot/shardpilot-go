@@ -458,15 +458,22 @@ func (c *Client) run() {
 		case request := <-c.flushRequests:
 			var err error
 			batch, err = c.flushAvailable(request.ctx, batch, &seenConsentEpoch, &backoffAttempt)
-			if len(batch) == 0 {
-				// The batch the deferral was protecting is gone — delivered,
-				// dropped as permanent, or discarded by a consent denial. A
-				// stale deadline must not gate later queued events (it could
-				// hold them up to the 24h clamp); a fresh failure below
-				// re-arms it when it carries its own hint.
-				deferUntil = time.Time{}
-			}
+			// Caller abandonment produces ZERO pacing side-effects — the
+			// empty-batch clear included: a canceled spool-only flush comes
+			// back with an empty batch while the requeued chunk is exactly
+			// the work the armed deadline still protects, and clearing it
+			// would retry that chunk at the next tick inside the server's
+			// window.
 			if !callerAbandonedFlush(request.ctx, err) {
+				if len(batch) == 0 {
+					// The batch the deferral was protecting is gone —
+					// delivered, dropped as permanent, or discarded by a
+					// consent denial. A stale deadline must not gate later
+					// queued events (it could hold them up to the 24h clamp);
+					// a fresh failure below re-arms it when it carries its
+					// own hint.
+					deferUntil = time.Time{}
+				}
 				c.applyRetryPacing(err, &deferUntil, &backoffAttempt)
 			}
 			request.reply <- err
