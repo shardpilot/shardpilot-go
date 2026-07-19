@@ -16,6 +16,36 @@ import (
 type transport interface {
 	Publish(ctx context.Context, request batchRequest) (batchResult, error)
 	PublishConsent(ctx context.Context, request consentRequest) (consentResult, error)
+	FetchRemoteConfig(ctx context.Context, request remoteConfigRequest) (remoteConfigResponse, error)
+}
+
+// remoteConfigRequest is one remote-config GET: the fully built fetch URL,
+// the publishable API key for the Bearer header (never the ingest token),
+// and the cached ETag for If-None-Match revalidation (empty sends none).
+type remoteConfigRequest struct {
+	url         string
+	bearer      string
+	ifNoneMatch string
+}
+
+// remoteConfigResponse is the raw remote-config outcome the decision core
+// (applyRemoteConfig) classifies. body is capped at rcMaxBodyBytes+1 so an
+// over-cap payload is detectable without unbounded reads; bodyIncomplete
+// marks a body whose read failed mid-stream (a truncated response) — the
+// status and headers already arrived and are real information, so a
+// truncated response still classifies BY STATUS (a truncated 401 fails
+// closed exactly like a whole one; only a 200 needs its body at all).
+// retryAfterSeconds carries a 429's Retry-After parsed digits-only
+// (HTTP-date is NOT accepted on this route — the server contract sends
+// integer seconds >= 1); retryAfterPresent distinguishes a parsed header
+// from an absent or malformed one.
+type remoteConfigResponse struct {
+	status            int
+	body              []byte
+	bodyIncomplete    bool
+	etag              string
+	retryAfterSeconds int
+	retryAfterPresent bool
 }
 
 // batchResult is the wire decode of the events:batch response (HTTP 202).
@@ -136,6 +166,13 @@ type httpTransport struct {
 	// the consent route. Empty means declare nothing (header omitted).
 	schemaRevision string
 	client         *http.Client
+	// rcClient serves remote-config fetches only. Unlike the ingest client it
+	// does NOT follow redirects: the remote-config contract classifies a 3xx
+	// as a permanent http_3xx failure, and silently following it would
+	// instead surface the redirect target's body (typically HTML) as a
+	// transient malformed_response — the wrong class, and one that serves the
+	// cache for an endpoint that authoritatively is not here.
+	rcClient *http.Client
 }
 
 func newHTTPTransport(cfg Config) *httpTransport {
@@ -147,6 +184,12 @@ func newHTTPTransport(cfg Config) *httpTransport {
 		schemaRevision:  effectiveSchemaRevision(cfg),
 		client: &http.Client{
 			Timeout: cfg.HTTPTimeout,
+		},
+		rcClient: &http.Client{
+			Timeout: cfg.HTTPTimeout,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		},
 	}
 }
@@ -167,6 +210,87 @@ func (t *httpTransport) PublishConsent(ctx context.Context, request consentReque
 		return consentResult{}, err
 	}
 	return result, nil
+}
+
+// FetchRemoteConfig GETs the remote-config resource. It reports transport-
+// level failures before a status arrives (no connection, header-phase
+// timeout) as a bare error — classified as the transient `http_0` outcome
+// upstream — and every HTTP response, whatever its status, as a
+// remoteConfigResponse for applyRemoteConfig to classify; a response whose
+// body read was ended by the request context is returned WITH the read error
+// so the caller can discriminate a caller abort from an SDK-internal
+// deadline (see the body-read comment below).
+// Redirects are NOT followed (see rcClient): a 3xx is returned as-is so the
+// decision core can classify it as the contract's permanent http_3xx. The
+// request authenticates with the publishable API key only, and never carries
+// the schema-revision header (a batch-route contract).
+func (t *httpTransport) FetchRemoteConfig(ctx context.Context, request remoteConfigRequest) (remoteConfigResponse, error) {
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, request.url, nil)
+	if err != nil {
+		return remoteConfigResponse{}, fmt.Errorf("create shardpilot remote config request: %w", err)
+	}
+	httpRequest.Header.Set("Authorization", "Bearer "+request.bearer)
+	if request.ifNoneMatch != "" {
+		httpRequest.Header.Set("If-None-Match", request.ifNoneMatch)
+	}
+
+	response, err := t.rcClient.Do(httpRequest)
+	if err != nil {
+		return remoteConfigResponse{}, fmt.Errorf("send shardpilot remote config request: %w", err)
+	}
+	defer response.Body.Close()
+
+	// Read one byte past the contract's 1MB cap: an over-cap body arrives
+	// truncated to rcMaxBodyBytes+1 bytes, which applyRemoteConfig classifies
+	// as malformed without this ever reading an unbounded response. A body
+	// read cut short — by the server, or by the request context expiring
+	// mid-body — is not a transport failure: the status line and headers
+	// already arrived and are real information, so the response is passed
+	// through with bodyIncomplete set (a stalled or truncated 401/403 must
+	// fail closed by status, not degrade into a cache-served http_0). When
+	// the CONTEXT ended the read, the error is returned alongside the
+	// response: the caller discriminates a caller-context abort (the caller's
+	// own error wins, response discarded) from an SDK-internal deadline (the
+	// response classifies by status).
+	body, readErr := io.ReadAll(io.LimitReader(response.Body, rcMaxBodyBytes+1))
+	seconds, present := parseRemoteConfigRetryAfter(response.Header.Get("Retry-After"))
+	result := remoteConfigResponse{
+		status:            response.StatusCode,
+		body:              body,
+		bodyIncomplete:    readErr != nil,
+		etag:              response.Header.Get("Etag"),
+		retryAfterSeconds: seconds,
+		retryAfterPresent: present,
+	}
+	if readErr != nil && ctx.Err() != nil {
+		return result, fmt.Errorf("read shardpilot remote config response: %w", readErr)
+	}
+	return result, nil
+}
+
+// parseRemoteConfigRetryAfter reads a remote-config 429's Retry-After header
+// in digits-only delta-seconds form. Unlike the batch route's parseRetryAfter
+// it deliberately does NOT accept the HTTP-date form: the remote-config
+// server contract sends integer seconds >= 1, and the SDK-wide parse rule
+// for this route is digits-only. Anything else — absent, negative, a date, a
+// fraction — reports (0, false), which the cooldown treats as the 1s floor.
+// A digits-only value too large for int64 still means "wait a long time" and
+// saturates at the cooldown clamp instead of being ignored.
+func parseRemoteConfigRetryAfter(header string) (int, bool) {
+	header = strings.TrimSpace(header)
+	if header == "" {
+		return 0, false
+	}
+	for i := 0; i < len(header); i++ {
+		if header[i] < '0' || header[i] > '9' {
+			return 0, false
+		}
+	}
+	seconds, err := strconv.ParseInt(header, 10, 64)
+	if err != nil || seconds > rcCooldownClampSeconds {
+		return rcCooldownClampSeconds, true
+	}
+	return int(seconds), true
 }
 
 // postJSON posts one JSON request to an ingest endpoint. schemaRevision, when

@@ -650,6 +650,7 @@ func TestFlushSwallowedPermanentHTTPResetsStreak(t *testing.T) {
 // scriptedTransport fails call i with errs[i] (nil = success) and accepts
 // every call past the script's end.
 type scriptedTransport struct {
+	unusedRemoteConfigTransport
 	errs  []error
 	calls int
 }

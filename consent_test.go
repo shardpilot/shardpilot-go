@@ -516,6 +516,7 @@ func TestConsentDenialCancelsInFlightPublish(t *testing.T) {
 // two-phase block lets a test deterministically interleave consent flips
 // between the cancellation and the transport's return.
 type blockingCancelTransport struct {
+	unusedRemoteConfigTransport
 	started chan struct{}
 	release chan struct{}
 	once    sync.Once

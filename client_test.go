@@ -804,6 +804,7 @@ func waitForClientClosed(t *testing.T, client *Client) {
 }
 
 type sequenceTransport struct {
+	unusedRemoteConfigTransport
 	firstErr error
 	calls    int
 	requests []batchRequest

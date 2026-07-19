@@ -118,7 +118,13 @@ type consentResult struct {
 // are recorded server-side only through a consent-write-capable service
 // credential; a publishable Mode A client key may record denials only.
 //
-// The state is held in memory only; see ConsentState for persistence notes.
+// The live state is held in memory only; see ConsentState for persistence
+// notes. When Config.SpoolDir is set, the DECISION is additionally persisted
+// (consent.json) and the disk spool follows it: denial purges the spool (a
+// failed purge owes a wipe and fails the spool closed until it succeeds),
+// and spool writes open only under a granted live state whose record was
+// successfully persisted — a strictly grant-only disk posture that leaves
+// the live pipeline's documented behavior untouched.
 func (c *Client) SetConsent(analyticsGranted bool) {
 	state := consentStateGranted
 	if !analyticsGranted {
@@ -148,9 +154,14 @@ func (c *Client) SetConsent(analyticsGranted bool) {
 			c.stats.dropped.Add(uint64(dropped))
 		}
 	}
+	// Disk side of the decision (no-op without SpoolDir). Dead-letters are
+	// collected here and emitted only after lifecycleMu is released — the
+	// callback is integrator code and may call back into the client.
+	deadLetters := c.applySpoolConsentLocked(analyticsGranted)
 
 	if actor == "" {
 		c.lifecycleMu.Unlock()
+		c.emitSpoolDeadLetters(deadLetters)
 		c.logf("shardpilot consent: no actor identity configured (Config.UserID or Config.AnonymousID); decision applied locally only")
 		return
 	}
@@ -158,6 +169,7 @@ func (c *Client) SetConsent(analyticsGranted bool) {
 	idempotencyKey, err := uuidv7.New()
 	if err != nil {
 		c.lifecycleMu.Unlock()
+		c.emitSpoolDeadLetters(deadLetters)
 		c.logf("shardpilot consent: generate idempotency key failed: %v", err)
 		return
 	}
@@ -176,6 +188,7 @@ func (c *Client) SetConsent(analyticsGranted bool) {
 	// matches the local state order across concurrent SetConsent calls.
 	c.enqueueConsentPublish(request)
 	c.lifecycleMu.Unlock()
+	c.emitSpoolDeadLetters(deadLetters)
 }
 
 // startConsentSender starts the single consent sender goroutine exactly
