@@ -1213,3 +1213,60 @@ func TestRemoteConfigFetchAfterCloseReturnsErrClosed(t *testing.T) {
 		t.Fatalf("expected ErrClosed, got %v", err)
 	}
 }
+
+func TestRemoteConfigTruncatedResponsesClassifyByStatus(t *testing.T) {
+	// The handler advertises a longer body than it writes, so the client's
+	// body read fails mid-stream while the status and headers already
+	// arrived.
+	var status atomic.Int64
+	status.Store(200)
+	var truncate atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		code := int(status.Load())
+		if truncate.Load() {
+			w.Header().Set("Content-Length", "4096")
+			w.WriteHeader(code)
+			_, _ = w.Write([]byte(`{"values":{"k":`))
+			return
+		}
+		w.WriteHeader(code)
+		_, _ = w.Write([]byte(`{"values":{"k":"v"}}`))
+	}))
+	defer server.Close()
+
+	cachePath := filepath.Join(t.TempDir(), "rc-cache.json")
+	client := newRemoteConfigClient(t, server.URL, cachePath, "anon-rc-1")
+	defer client.Close(context.Background())
+
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("priming fetch: %v", err)
+	}
+	cacheBefore, _ := os.ReadFile(cachePath)
+
+	// A truncated 401 keeps its authority: fail closed, refuse to serve the
+	// cache — never the cache-served http_0 a discarded status produced.
+	truncate.Store(true)
+	status.Store(401)
+	_, err := client.FetchRemoteConfig(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "unauthorized") {
+		t.Fatalf("expected a truncated 401 to fail closed as unauthorized, got %v", err)
+	}
+	cacheAfter, _ := os.ReadFile(cachePath)
+	if string(cacheBefore) != string(cacheAfter) {
+		t.Fatalf("a truncated 401 must not disturb the cache file")
+	}
+	if got := client.RemoteConfigString("k", "fallback"); got != "v" {
+		t.Fatalf("a truncated 401 must leave the getter snapshot intact, got %q", got)
+	}
+
+	// A truncated 200 is the one outcome that NEEDED its body: transient,
+	// cache-served.
+	status.Store(200)
+	result, err := client.FetchRemoteConfig(context.Background())
+	if err != nil {
+		t.Fatalf("expected the truncated 200 served from cache, got %v", err)
+	}
+	if !result.FromCache || result.Reason != "malformed_response" || result.Values["k"] != "v" {
+		t.Fatalf("expected the cache-served malformed_response outcome, got %+v", result)
+	}
+}

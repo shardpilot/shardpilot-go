@@ -30,14 +30,19 @@ type remoteConfigRequest struct {
 
 // remoteConfigResponse is the raw remote-config outcome the decision core
 // (applyRemoteConfig) classifies. body is capped at rcMaxBodyBytes+1 so an
-// over-cap payload is detectable without unbounded reads. retryAfterSeconds
-// carries a 429's Retry-After parsed digits-only (HTTP-date is NOT accepted
-// on this route — the server contract sends integer seconds >= 1);
-// retryAfterPresent distinguishes a parsed header from an absent or
-// malformed one.
+// over-cap payload is detectable without unbounded reads; bodyIncomplete
+// marks a body whose read failed mid-stream (a truncated response) — the
+// status and headers already arrived and are real information, so a
+// truncated response still classifies BY STATUS (a truncated 401 fails
+// closed exactly like a whole one; only a 200 needs its body at all).
+// retryAfterSeconds carries a 429's Retry-After parsed digits-only
+// (HTTP-date is NOT accepted on this route — the server contract sends
+// integer seconds >= 1); retryAfterPresent distinguishes a parsed header
+// from an absent or malformed one.
 type remoteConfigResponse struct {
 	status            int
 	body              []byte
+	bodyIncomplete    bool
 	etag              string
 	retryAfterSeconds int
 	retryAfterPresent bool
@@ -233,15 +238,22 @@ func (t *httpTransport) FetchRemoteConfig(ctx context.Context, request remoteCon
 
 	// Read one byte past the contract's 1MB cap: an over-cap body arrives
 	// truncated to rcMaxBodyBytes+1 bytes, which applyRemoteConfig classifies
-	// as malformed without this ever reading an unbounded response.
-	body, err := io.ReadAll(io.LimitReader(response.Body, rcMaxBodyBytes+1))
-	if err != nil {
-		return remoteConfigResponse{}, fmt.Errorf("read shardpilot remote config response: %w", err)
+	// as malformed without this ever reading an unbounded response. A body
+	// read the SERVER cut short is not a transport failure: the status line
+	// and headers already arrived, so the response is passed through with
+	// bodyIncomplete set — a truncated 401/403 must fail closed by status,
+	// not degrade into a cache-served http_0. A read ended by the request
+	// CONTEXT (cancellation or timeout) stays a transport-level error, so
+	// caller-abort discrimination upstream keeps working.
+	body, readErr := io.ReadAll(io.LimitReader(response.Body, rcMaxBodyBytes+1))
+	if readErr != nil && ctx.Err() != nil {
+		return remoteConfigResponse{}, fmt.Errorf("read shardpilot remote config response: %w", readErr)
 	}
 	seconds, present := parseRemoteConfigRetryAfter(response.Header.Get("Retry-After"))
 	return remoteConfigResponse{
 		status:            response.StatusCode,
 		body:              body,
+		bodyIncomplete:    readErr != nil,
 		etag:              response.Header.Get("Etag"),
 		retryAfterSeconds: seconds,
 		retryAfterPresent: present,

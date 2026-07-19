@@ -193,6 +193,12 @@ type diskSpool struct {
 	settledIDs  map[string]struct{}
 	settledFIFO []string
 
+	// pendingCapacityDrops holds locally-owned entries a merging save
+	// cap-evicted (foreign records pushed the merged view over the caps).
+	// The client layer drains them (takeCapacityDrops) after each spool
+	// operation to dead-letter and count outside the lock.
+	pendingCapacityDrops []spoolEntry
+
 	// countForeign, when set, is called (under mu; must not call back into
 	// the spool or run user code) with the number of on-disk records a
 	// merging save found that this process neither holds nor settled — i.e.
@@ -260,8 +266,13 @@ func (s *diskSpool) recordSettledLocked(id string) {
 // concurrently can be resurrected and resent — at-least-once, and the server
 // de-duplicates by event_id. Foreign records ride the file only: they are
 // never adopted into this process's mirror or resend queue (a restart loads
-// them normally). On failure the mirror stays authoritative and dirty marks
-// the flush-cadence retry.
+// them normally). A cap eviction at merge time settles LOCAL state too: an
+// evicted entry this process still mirrored is removed from the mirror,
+// settled, and queued in pendingCapacityDrops for the client layer to
+// dead-letter and count (the file and the mirror must never disagree about
+// an event's fate); an evicted foreign entry is only settled, so it does not
+// resurrect through a later save. On failure the mirror stays authoritative
+// and dirty marks the flush-cadence retry.
 func (s *diskSpool) saveLocked() error {
 	merged := make([]spoolEntry, 0, len(s.entries))
 	seen := make(map[string]struct{}, len(s.entries))
@@ -296,9 +307,34 @@ func (s *diskSpool) saveLocked() error {
 	for _, entry := range merged {
 		mergedBytes += len(entry.raw)
 	}
+	var capDropped map[string]struct{}
 	for len(merged) > 0 && (len(merged) > s.maxEvents || mergedBytes > s.maxBytes) {
-		mergedBytes -= len(merged[0].raw)
+		dropped := merged[0]
+		mergedBytes -= len(dropped.raw)
 		merged = merged[1:]
+		s.recordSettledLocked(dropped.id)
+		if _, ours := s.ids[dropped.id]; ours {
+			// This process still claimed the entry: the mirror follows the
+			// written record, and the drop surfaces through the standard
+			// capacity dead-letter (drained by the client layer after the
+			// current operation).
+			if capDropped == nil {
+				capDropped = make(map[string]struct{})
+			}
+			capDropped[dropped.id] = struct{}{}
+			delete(s.ids, dropped.id)
+			s.totalBytes -= len(dropped.raw)
+			s.pendingCapacityDrops = append(s.pendingCapacityDrops, dropped)
+		}
+	}
+	if capDropped != nil {
+		kept := s.entries[:0]
+		for _, entry := range s.entries {
+			if _, wasDropped := capDropped[entry.id]; !wasDropped {
+				kept = append(kept, entry)
+			}
+		}
+		s.entries = kept
 	}
 	if len(merged) == 0 {
 		// An empty record must never park a future start behind a stale
@@ -319,6 +355,17 @@ func (s *diskSpool) saveLocked() error {
 	}
 	s.dirty = err != nil
 	return err
+}
+
+// takeCapacityDrops drains the locally-owned entries a merging save evicted
+// for capacity, for the client layer to dead-letter and count outside the
+// lock.
+func (s *diskSpool) takeCapacityDrops() []spoolEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	drops := s.pendingCapacityDrops
+	s.pendingCapacityDrops = nil
+	return drops
 }
 
 // clearRetryDeadline drops the persisted Retry-After deadline after a
@@ -495,7 +542,14 @@ func (s *diskSpool) load(now time.Time) spoolLoadOutcome {
 		s.totalBytes += len(entry.raw)
 	}
 	outcome.evicted = s.evictOverCapsLocked()
-	if record.RetryAfterUntilMS > now.UnixMilli() {
+	// The persisted deadline re-seeds the deferral only while loaded events
+	// remain to protect: a load that discarded EVERY saved event (expired,
+	// undatable, evicted by smaller caps) has nothing left behind the
+	// backpressure window, and gating brand-new events on it — up to the 24h
+	// clamp — would defer fresh work for a record that no longer exists. The
+	// stale deadline is dropped along with the empty record (retryAfterUntilMS
+	// stays zero, and the rewrite below persists that).
+	if len(s.entries) > 0 && record.RetryAfterUntilMS > now.UnixMilli() {
 		remaining := time.Duration(record.RetryAfterUntilMS-now.UnixMilli()) * time.Millisecond
 		if remaining > spoolMaxDeferralSeed {
 			remaining = spoolMaxDeferralSeed
@@ -769,29 +823,76 @@ func (c *Client) spoolDeadlineFromError(err error) int64 {
 	return c.clock.Now().Add(statusErr.RetryAfter).UnixMilli()
 }
 
+// drainSpoolCapacityDrops emits the locally-owned entries a merging save
+// cap-evicted. Called after every client-level spool operation that can
+// rewrite the record, outside the spool lock.
+func (c *Client) drainSpoolCapacityDrops() {
+	if c.spool == nil {
+		return
+	}
+	drops := c.spool.takeCapacityDrops()
+	if len(drops) == 0 {
+		return
+	}
+	c.stats.spoolEvicted.Add(uint64(len(drops)))
+	c.notifySpoolDeadLetter(SpoolDropCapacity, drops)
+}
+
+// partitionSpoolEligible splits a failed batch's envelopes by whether the
+// persisted grant's actor scope covers them. The consent record (and its
+// actor_digest) is scoped to the CONFIGURED actor tuple, but events may
+// carry per-event UserID/AnonymousID overrides: an envelope whose EFFECTIVE
+// actor differs from the configured tuple must never ride the configured
+// actor's grant onto disk. Refuse-per-envelope rather than batch splitting:
+// the in-memory batch stays whole for the live retry (the live pipeline is
+// not consent-scoped per envelope), and only the DISK side filters.
+func (c *Client) partitionSpoolEligible(request batchRequest) (eligible, refused []spoolEntry) {
+	if len(request.Events) == 0 || len(request.Events) != len(request.rawEvents) {
+		return nil, nil
+	}
+	for i, envelope := range request.Events {
+		entry := spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: request.rawEvents[i]}
+		// buildEnvelope resolved the effective actor (per-event override,
+		// else the configured default), so equality against the configured
+		// tuple is exactly "the persisted grant covers this envelope".
+		if envelope.UserID == c.cfg.UserID && envelope.AnonymousID == c.cfg.AnonymousID {
+			eligible = append(eligible, entry)
+		} else {
+			refused = append(refused, entry)
+		}
+	}
+	return eligible, refused
+}
+
 // spoolFailedBatch appends a retriably failed worker batch to the spool.
 // Under a non-grant live state, an unpersisted grant record, or an owed
 // wipe, nothing touches disk and the would-have-spooled batch goes to the
-// dead-letter callback instead.
+// dead-letter callback instead. Eligibility is per-envelope: only envelopes
+// whose effective actor the persisted grant covers may spool; the rest
+// dead-letter as consent drops.
 func (c *Client) spoolFailedBatch(request batchRequest, cause error) {
 	s := c.spool
 	if s == nil {
 		return
 	}
-	entries := spoolEntriesFromRequest(request)
-	if len(entries) == 0 {
+	eligible, refusedActors := c.partitionSpoolEligible(request)
+	c.notifySpoolDeadLetter(SpoolDropConsent, refusedActors)
+	if len(eligible) == 0 {
 		return
 	}
 	// An owed wipe is retried before any append; still owed refuses disk.
 	s.settleOwedWipe()
-	refused, added, evicted, persistFailed := s.append(entries, c.spoolDeadlineFromError(cause), func() bool {
+	refused, added, evicted, persistFailed := s.append(eligible, c.spoolDeadlineFromError(cause), func() bool {
 		return c.consent.Load() == consentStateGranted && s.grantPersisted
 	})
 	if refused {
-		c.notifySpoolDeadLetter(SpoolDropConsent, entries)
+		c.notifySpoolDeadLetter(SpoolDropConsent, eligible)
 		return
 	}
-	if len(added) > 0 {
+	// Spooled counts DURABLY spooled events only: a failed record rewrite
+	// keeps the additions in the mirror (retried on the flush cadence) but
+	// must not report them as safely on disk.
+	if len(added) > 0 && !persistFailed {
 		c.stats.spooled.Add(uint64(len(added)))
 	}
 	if len(evicted) > 0 {
@@ -801,6 +902,7 @@ func (c *Client) spoolFailedBatch(request batchRequest, cause error) {
 	if persistFailed {
 		c.recordSpoolPersistFailure()
 	}
+	c.drainSpoolCapacityDrops()
 }
 
 // spoolAck settles a delivered batch: its events, if spooled, are removed
@@ -817,6 +919,7 @@ func (c *Client) spoolAck(request batchRequest) {
 	if _, persistFailed := s.ack(spoolEntryIDs(entries)); persistFailed {
 		c.recordSpoolPersistFailure()
 	}
+	c.drainSpoolCapacityDrops()
 }
 
 // spoolSettleTerminal settles a terminally failed batch: previously spooled
@@ -838,6 +941,7 @@ func (c *Client) spoolSettleTerminal(request batchRequest) {
 	if persistFailed {
 		c.recordSpoolPersistFailure()
 	}
+	c.drainSpoolCapacityDrops()
 }
 
 // settleResentChunk settles a successfully re-published spool chunk.
@@ -846,6 +950,7 @@ func (c *Client) settleResentChunk(chunk []spoolEntry) {
 	if _, persistFailed := c.spool.ack(spoolEntryIDs(chunk)); persistFailed {
 		c.recordSpoolPersistFailure()
 	}
+	c.drainSpoolCapacityDrops()
 }
 
 // resendSpooledChunks re-publishes startup-loaded spool chunks on the
@@ -864,6 +969,7 @@ func (c *Client) resendSpooledChunks(deferUntil *time.Time, backoffAttempt *int)
 		if persistFailed {
 			c.recordSpoolPersistFailure()
 		}
+		c.drainSpoolCapacityDrops()
 		if len(chunk) == 0 {
 			return true
 		}
@@ -907,6 +1013,7 @@ func (c *Client) spoolStoreResendDeadline(err error) {
 	if c.spool.storeRetryDeadline(deadlineMS) {
 		c.recordSpoolPersistFailure()
 	}
+	c.drainSpoolCapacityDrops()
 }
 
 // flushSpooledChunks is resendSpooledChunks for the explicit Flush path: it
@@ -927,6 +1034,7 @@ func (c *Client) flushSpooledChunks(ctx context.Context, backoffAttempt *int) er
 		if persistFailed {
 			c.recordSpoolPersistFailure()
 		}
+		c.drainSpoolCapacityDrops()
 		if len(chunk) == 0 {
 			return firstErr
 		}
@@ -975,6 +1083,7 @@ func (c *Client) spoolMaintain() {
 	if attempted, failed := s.retryPersist(); attempted && failed {
 		c.recordSpoolPersistFailure()
 	}
+	c.drainSpoolCapacityDrops()
 }
 
 // spoolCloseRemnant spools the undelivered remnant when the worker stops:
@@ -1029,6 +1138,13 @@ func (c *Client) initSpool() []SpoolDeadLetter {
 		if len(outcome.evicted) > 0 {
 			c.stats.spoolEvicted.Add(uint64(len(outcome.evicted)))
 			letters = append(letters, spoolDeadLetterFrom(SpoolDropCapacity, outcome.evicted))
+		}
+		// The init rewrite is a merging save too; drops it produced are
+		// folded into the deferred init letters (the callback must not run
+		// mid-construction).
+		if drops := s.takeCapacityDrops(); len(drops) > 0 {
+			c.stats.spoolEvicted.Add(uint64(len(drops)))
+			letters = append(letters, spoolDeadLetterFrom(SpoolDropCapacity, drops))
 		}
 		if outcome.persistFailed {
 			c.recordSpoolPersistFailure()

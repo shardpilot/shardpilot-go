@@ -294,7 +294,12 @@ func serveRemoteConfigCache(cache *rcCache, reason string) (RemoteConfigResult, 
 // A transport-level error arrives here as status 0.
 func applyRemoteConfig(cache *rcCache, resp remoteConfigResponse, nowMS int64) (result RemoteConfigResult, newCache *rcCache, authoritative bool, revalidated *rcCache, failure string) {
 	if resp.status == 200 {
-		if len(resp.body) <= rcMaxBodyBytes {
+		// A 200 is the only outcome that needs its body: a mid-stream read
+		// failure (bodyIncomplete) makes it unusable — the transient
+		// malformed class — while every non-200 below classifies by STATUS
+		// alone, so a truncated 401 still fails closed and a truncated
+		// 3xx/4xx is still permanent.
+		if !resp.bodyIncomplete && len(resp.body) <= rcMaxBodyBytes {
 			if values, version, hasVersion, ok := parseRemoteConfigBody(string(resp.body)); ok {
 				return RemoteConfigResult{
 						Values:     values,

@@ -892,6 +892,7 @@ func (c *Client) publishRequest(ctx context.Context, request batchRequest, size 
 		if c.spool.clearRetryDeadline() {
 			c.recordSpoolPersistFailure()
 		}
+		c.drainSpoolCapacityDrops()
 	}
 	// Signal the success to the worker's pacing state: a synchronous Track
 	// (or any other path) proving the endpoint healthy must clear a stale

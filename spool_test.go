@@ -1154,8 +1154,14 @@ func TestSpoolPersistFailureCountsAndMirrorStaysAuthoritative(t *testing.T) {
 	if err := client.Flush(context.Background()); err == nil {
 		t.Fatalf("expected the retriable failure surfaced")
 	}
-	if stats := client.Snapshot(); stats.SpoolPersistFailed == 0 {
+	stats := client.Snapshot()
+	if stats.SpoolPersistFailed == 0 {
 		t.Fatalf("expected SpoolPersistFailed counted, got %+v", stats)
+	}
+	// Spooled counts DURABLY spooled events only: nothing landed on disk,
+	// so nothing may be reported as spooled.
+	if stats.Spooled != 0 {
+		t.Fatalf("expected Spooled=0 while the record write fails, got %+v", stats)
 	}
 	if spoolFileExists(dir) {
 		t.Fatalf("expected no record file while the write fails")
@@ -1173,6 +1179,10 @@ func TestSpoolPersistFailureCountsAndMirrorStaysAuthoritative(t *testing.T) {
 	record := readSpoolRecordFile(t, dir)
 	if len(record.Events) != 2 || !containsEventID(t, record.Events, "evt-persist-1") || !containsEventID(t, record.Events, "evt-persist-2") {
 		t.Fatalf("expected the recovered write to persist the whole mirror, got %s", mustJSON(t, record.Events))
+	}
+	// The recovered append durably landed, so its additions count.
+	if stats := client.Snapshot(); stats.Spooled == 0 {
+		t.Fatalf("expected Spooled counted once the write landed, got %+v", stats)
 	}
 	state.setOutcome(http.StatusAccepted, "", "")
 	_ = client.Close(context.Background())
@@ -1501,4 +1511,174 @@ func TestSpoolConsentRecordActorScoped(t *testing.T) {
 		t.Fatalf("expected actor A's grant record still usable, got %v %v", state2, ok)
 	}
 	_ = clientA2.Close(context.Background())
+}
+
+func TestSpoolEmptyLoadDropsStaleDeadline(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+	state.setOutcome(http.StatusAccepted, "", "")
+
+	// The record carries a still-future deadline but ONLY expired events:
+	// nothing survives the load, so nothing is left for the window to
+	// protect — fresh events must not be gated on it.
+	dir := t.TempDir()
+	now := time.Now()
+	writeConsentRecordFile(t, dir, "granted")
+	writeSpoolRecordFile(t, dir, now.Add(time.Hour).UnixMilli(),
+		spoolTestEnvelope(t, "evt-stale-1", now.Add(-8*24*time.Hour)),
+		spoolTestEnvelope(t, "evt-stale-2", now.Add(-9*24*time.Hour)))
+
+	recorder := &spoolDeadLetterRecorder{}
+	client := newSpoolTestClient(t, server.URL, dir, recorder, nil)
+	defer client.Close(context.Background())
+
+	if !client.initialDeferUntil.IsZero() {
+		t.Fatalf("an all-discarded load must not seed the deferral, got %v", client.initialDeferUntil)
+	}
+	record := readSpoolRecordFile(t, dir)
+	if len(record.Events) != 0 || record.RetryAfterUntilMS != 0 {
+		t.Fatalf("expected an empty record without the stale deadline, got %d events, deadline %d", len(record.Events), record.RetryAfterUntilMS)
+	}
+	if letters := recorder.byReason(SpoolDropExpired); len(letters) != 1 || len(letters[0].Envelopes) != 2 {
+		t.Fatalf("expected the discarded events dead-lettered as expired, got %+v", letters)
+	}
+	// Brand-new events publish immediately.
+	if err := client.Enqueue(Event{ID: "evt-fresh-after-stale", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if got := state.batchCount(); got != 1 {
+		t.Fatalf("expected the fresh event published immediately, got %d requests", got)
+	}
+}
+
+func TestSpoolActorScopedPerEnvelope(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+	state.setOutcome(http.StatusAccepted, "", "")
+
+	// A grant persisted for the CONFIGURED actor covers only envelopes whose
+	// effective actor IS that tuple: a per-event override rides the batch
+	// live, but never that grant onto disk.
+	dir := t.TempDir()
+	recorder := &spoolDeadLetterRecorder{}
+	client := newSpoolTestClient(t, server.URL, dir, recorder, nil)
+	client.SetConsent(true)
+
+	request, err := client.buildBatch([]Event{
+		{ID: "evt-own-actor", Name: "e1"},
+		{ID: "evt-other-actor", Name: "e2", AnonymousID: "anon-somebody-else"},
+	})
+	if err != nil {
+		t.Fatalf("buildBatch: %v", err)
+	}
+	client.spoolFailedBatch(request, nil)
+
+	record := readSpoolRecordFile(t, dir)
+	if len(record.Events) != 1 || !containsEventID(t, record.Events, "evt-own-actor") {
+		t.Fatalf("expected only the configured actor's envelope spooled, got %s", mustJSON(t, record.Events))
+	}
+	letters := recorder.byReason(SpoolDropConsent)
+	if len(letters) != 1 || len(letters[0].Envelopes) != 1 || !containsEventID(t, letters[0].Envelopes, "evt-other-actor") {
+		t.Fatalf("expected the override envelope dead-lettered as consent, got %+v", letters)
+	}
+	if stats := client.Snapshot(); stats.Spooled != 1 {
+		t.Fatalf("expected Spooled=1 (the covered envelope only), got %+v", stats)
+	}
+	_ = client.Close(context.Background())
+
+	// With NO configured actor, the grant covers the empty tuple only:
+	// events carrying explicit identities never spool under it.
+	bareDir := t.TempDir()
+	bareRecorder := &spoolDeadLetterRecorder{}
+	bare := newSpoolTestClient(t, server.URL, bareDir, bareRecorder, func(cfg *Config) {
+		cfg.AnonymousID = ""
+	})
+	bare.SetConsent(true)
+	request, err = bare.buildBatch([]Event{{ID: "evt-explicit-id", Name: "e1", UserID: "user-explicit"}})
+	if err != nil {
+		t.Fatalf("buildBatch: %v", err)
+	}
+	bare.spoolFailedBatch(request, nil)
+	if spoolFileExists(bareDir) {
+		t.Fatalf("an explicit-identity envelope must not spool under a no-actor grant")
+	}
+	if letters := bareRecorder.byReason(SpoolDropConsent); len(letters) != 1 || !containsEventID(t, letters[0].Envelopes, "evt-explicit-id") {
+		t.Fatalf("expected the explicit-identity envelope dead-lettered as consent, got %+v", letters)
+	}
+	_ = bare.Close(context.Background())
+}
+
+func TestSpoolMergeCapEvictionSettlesMirror(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{
+		SpoolDir:       dir,
+		SpoolMaxEvents: 3,
+		SpoolMaxBytes:  1 << 20,
+		WorkspaceID:    "workspace-test",
+		EnvironmentID:  "develop",
+		AnonymousID:    "anon-spool-1",
+	}
+	spoolA := newDiskSpool(cfg)
+	spoolB := newDiskSpool(cfg)
+	allowed := func() bool { return true }
+	now := time.Now()
+	entry := func(id string) spoolEntry {
+		return spoolEntry{id: id, ts: now.UTC().Format(time.RFC3339Nano), raw: spoolTestEnvelope(t, id, now)}
+	}
+
+	// A persists two, B adds a third (the shared cap is 3), then A appends a
+	// fourth: A's merged view is [a1 a2 b1] + [a3] — over the cap — and the
+	// oldest entry dropped is A's OWN a1, which A still mirrors.
+	if refused, _, _, persistFailed := spoolA.append([]spoolEntry{entry("evt-mc-a1"), entry("evt-mc-a2")}, 0, allowed); refused || persistFailed {
+		t.Fatalf("append A: refused=%v persistFailed=%v", refused, persistFailed)
+	}
+	if refused, _, _, persistFailed := spoolB.append([]spoolEntry{entry("evt-mc-b1")}, 0, allowed); refused || persistFailed {
+		t.Fatalf("append B: refused=%v persistFailed=%v", refused, persistFailed)
+	}
+	refused, added, evicted, persistFailed := spoolA.append([]spoolEntry{entry("evt-mc-a3")}, 0, allowed)
+	if refused || persistFailed || len(evicted) != 0 {
+		t.Fatalf("append A2: refused=%v persistFailed=%v evicted=%d", refused, persistFailed, len(evicted))
+	}
+	if len(added) != 1 {
+		t.Fatalf("expected a3 accepted, got %d", len(added))
+	}
+
+	// The merge-stage cap drop settled LOCAL state: a1 left the mirror, is
+	// reported for the capacity dead-letter, and cannot resurrect.
+	drops := spoolA.takeCapacityDrops()
+	if len(drops) != 1 || drops[0].id != "evt-mc-a1" {
+		t.Fatalf("expected a1 reported as a local capacity drop, got %+v", drops)
+	}
+	record := readSpoolRecordFile(t, dir)
+	if len(record.Events) != 3 || containsEventID(t, record.Events, "evt-mc-a1") {
+		t.Fatalf("expected the record to hold [a2 b1 a3], got %s", mustJSON(t, record.Events))
+	}
+	spoolA.mu.Lock()
+	mirrorIDs := make([]string, 0, len(spoolA.entries))
+	for _, held := range spoolA.entries {
+		mirrorIDs = append(mirrorIDs, held.id)
+	}
+	total := spoolA.totalBytes
+	spoolA.mu.Unlock()
+	if len(mirrorIDs) != 2 || mirrorIDs[0] != "evt-mc-a2" || mirrorIDs[1] != "evt-mc-a3" {
+		t.Fatalf("expected A's mirror to match the written record's local subset, got %v", mirrorIDs)
+	}
+	wantBytes := 0
+	for _, held := range []string{"evt-mc-a2", "evt-mc-a3"} {
+		wantBytes += len(spoolTestEnvelope(t, held, now))
+	}
+	if total != wantBytes {
+		t.Fatalf("expected the byte counter to follow the mirror, got %d want %d", total, wantBytes)
+	}
+	// A later save (an ack of a2) must not resurrect a1.
+	if removed, persistFailed := spoolA.ack([]string{"evt-mc-a2"}); len(removed) != 1 || persistFailed {
+		t.Fatalf("ack: removed=%d persistFailed=%v", len(removed), persistFailed)
+	}
+	record = readSpoolRecordFile(t, dir)
+	if containsEventID(t, record.Events, "evt-mc-a1") {
+		t.Fatalf("a merge-cap-dropped entry must never resurrect, got %s", mustJSON(t, record.Events))
+	}
 }
