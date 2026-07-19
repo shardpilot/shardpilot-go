@@ -287,8 +287,8 @@ Run against your dev/staging deployment credentials, then check each item:
    event with `Status` `shardpilot.EventStatusAccepted` (`"accepted"`) — or
    `shardpilot.EventStatusObserved` (`"observed"`) if you used an
    unregistered test name; both prove auth + connectivity + envelope shape.
-   Cross-check `client.Snapshot()`: `Published` and `Accepted` incremented,
-   and `Snapshot().ByStatus` counts your status.
+   Cross-check `client.Snapshot()`: `Published` incremented and
+   `Snapshot().ByStatus` counting your event's status.
 3. **Consent suppression check.** If `OnBatchResult` shows
    `shardpilot.EventStatusSuppressedNoConsent` (`"suppressed_no_consent"`),
    the workspace enforces strict consent and no grant is recorded
