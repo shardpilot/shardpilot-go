@@ -1167,9 +1167,24 @@ func TestSpoolPersistFailureCountsAndMirrorStaysAuthoritative(t *testing.T) {
 		t.Fatalf("expected no record file while the write fails")
 	}
 
-	// The mirror stayed authoritative: once writes work again, the next
-	// append persists the earlier event too.
+	// The write path recovers and the flush-cadence retryPersist lands the
+	// mirror: the entries that just became durable count into Spooled now —
+	// exactly once.
 	client.spool.renameFn = os.Rename
+	client.spoolMaintain()
+	if got := len(readSpoolRecordFile(t, dir).Events); got != 1 {
+		t.Fatalf("expected the retried write to land the mirror, got %d events", got)
+	}
+	if stats := client.Snapshot(); stats.Spooled != 1 {
+		t.Fatalf("expected Spooled=1 at the successful retry, got %+v", stats)
+	}
+	client.spoolMaintain()
+	if stats := client.Snapshot(); stats.Spooled != 1 {
+		t.Fatalf("expected the retry count to move exactly once, got %+v", stats)
+	}
+
+	// The mirror stayed authoritative throughout: a later append persists
+	// alongside the earlier event and counts only itself.
 	if err := client.Enqueue(Event{ID: "evt-persist-2", Name: "e2"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
@@ -1178,11 +1193,10 @@ func TestSpoolPersistFailureCountsAndMirrorStaysAuthoritative(t *testing.T) {
 	}
 	record := readSpoolRecordFile(t, dir)
 	if len(record.Events) != 2 || !containsEventID(t, record.Events, "evt-persist-1") || !containsEventID(t, record.Events, "evt-persist-2") {
-		t.Fatalf("expected the recovered write to persist the whole mirror, got %s", mustJSON(t, record.Events))
+		t.Fatalf("expected both events persisted, got %s", mustJSON(t, record.Events))
 	}
-	// The recovered append durably landed, so its additions count.
-	if stats := client.Snapshot(); stats.Spooled == 0 {
-		t.Fatalf("expected Spooled counted once the write landed, got %+v", stats)
+	if stats := client.Snapshot(); stats.Spooled != 2 {
+		t.Fatalf("expected Spooled=2 after the second durable append, got %+v", stats)
 	}
 	state.setOutcome(http.StatusAccepted, "", "")
 	_ = client.Close(context.Background())
@@ -1430,10 +1444,10 @@ func TestSpoolSharedDirMergePreservesSiblingRecords(t *testing.T) {
 	// Interleaved appends from two instances: each save reloads and merges,
 	// so neither writer's records are silently dropped by the other's
 	// mirror-only view.
-	if refused, _, _, persistFailed := spoolA.append([]spoolEntry{e1}, 0, allowed); refused || persistFailed {
+	if refused, _, _, _, persistFailed := spoolA.append([]spoolEntry{e1}, 0, now, allowed); refused || persistFailed {
 		t.Fatalf("append A: refused=%v persistFailed=%v", refused, persistFailed)
 	}
-	if refused, _, _, persistFailed := spoolB.append([]spoolEntry{e2}, 0, allowed); refused || persistFailed {
+	if refused, _, _, _, persistFailed := spoolB.append([]spoolEntry{e2}, 0, now, allowed); refused || persistFailed {
 		t.Fatalf("append B: refused=%v persistFailed=%v", refused, persistFailed)
 	}
 	record := readSpoolRecordFile(t, dir)
@@ -1632,13 +1646,13 @@ func TestSpoolMergeCapEvictionSettlesMirror(t *testing.T) {
 	// A persists two, B adds a third (the shared cap is 3), then A appends a
 	// fourth: A's merged view is [a1 a2 b1] + [a3] — over the cap — and the
 	// oldest entry dropped is A's OWN a1, which A still mirrors.
-	if refused, _, _, persistFailed := spoolA.append([]spoolEntry{entry("evt-mc-a1"), entry("evt-mc-a2")}, 0, allowed); refused || persistFailed {
+	if refused, _, _, _, persistFailed := spoolA.append([]spoolEntry{entry("evt-mc-a1"), entry("evt-mc-a2")}, 0, now, allowed); refused || persistFailed {
 		t.Fatalf("append A: refused=%v persistFailed=%v", refused, persistFailed)
 	}
-	if refused, _, _, persistFailed := spoolB.append([]spoolEntry{entry("evt-mc-b1")}, 0, allowed); refused || persistFailed {
+	if refused, _, _, _, persistFailed := spoolB.append([]spoolEntry{entry("evt-mc-b1")}, 0, now, allowed); refused || persistFailed {
 		t.Fatalf("append B: refused=%v persistFailed=%v", refused, persistFailed)
 	}
-	refused, added, evicted, persistFailed := spoolA.append([]spoolEntry{entry("evt-mc-a3")}, 0, allowed)
+	refused, added, _, evicted, persistFailed := spoolA.append([]spoolEntry{entry("evt-mc-a3")}, 0, now, allowed)
 	if refused || persistFailed || len(evicted) != 0 {
 		t.Fatalf("append A2: refused=%v persistFailed=%v evicted=%d", refused, persistFailed, len(evicted))
 	}
@@ -1681,4 +1695,57 @@ func TestSpoolMergeCapEvictionSettlesMirror(t *testing.T) {
 	if containsEventID(t, record.Events, "evt-mc-a1") {
 		t.Fatalf("a merge-cap-dropped entry must never resurrect, got %s", mustJSON(t, record.Events))
 	}
+}
+
+func TestSpoolAppendExpiresPreAgedEnvelopes(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+	state.setOutcome(http.StatusAccepted, "", "")
+
+	dir := t.TempDir()
+	recorder := &spoolDeadLetterRecorder{}
+	client := newSpoolTestClient(t, server.URL, dir, recorder, nil)
+	client.SetConsent(true)
+
+	// The event's caller-supplied timestamp is already older than the 7-day
+	// retry cap when the batch fails: the retention bound is enforced at
+	// APPEND — the envelope dead-letters as expired and never lands on disk.
+	request, err := client.buildBatch([]Event{
+		{ID: "evt-preaged-1", Name: "e1", Timestamp: time.Now().Add(-8 * 24 * time.Hour)},
+	})
+	if err != nil {
+		t.Fatalf("buildBatch: %v", err)
+	}
+	client.spoolFailedBatch(request, nil)
+
+	if spoolFileExists(dir) {
+		t.Fatalf("a pre-expired envelope must never land in spool.json")
+	}
+	letters := recorder.byReason(SpoolDropExpired)
+	if len(letters) != 1 || !containsEventID(t, letters[0].Envelopes, "evt-preaged-1") {
+		t.Fatalf("expected the pre-expired envelope dead-lettered as expired, got %+v", letters)
+	}
+	stats := client.Snapshot()
+	if stats.SpoolExpired != 1 || stats.Spooled != 0 {
+		t.Fatalf("expected SpoolExpired=1 and Spooled=0, got %+v", stats)
+	}
+
+	// A future-dated envelope beyond the skew tolerance fails the same way,
+	// while a fresh one in the same batch still spools.
+	request, err = client.buildBatch([]Event{
+		{ID: "evt-future-1", Name: "e2", Timestamp: time.Now().Add(2 * time.Hour)},
+		{ID: "evt-fresh-1", Name: "e3"},
+	})
+	if err != nil {
+		t.Fatalf("buildBatch: %v", err)
+	}
+	client.spoolFailedBatch(request, nil)
+	record := readSpoolRecordFile(t, dir)
+	if len(record.Events) != 1 || !containsEventID(t, record.Events, "evt-fresh-1") {
+		t.Fatalf("expected only the fresh envelope spooled, got %s", mustJSON(t, record.Events))
+	}
+	if stats := client.Snapshot(); stats.SpoolExpired != 2 || stats.Spooled != 1 {
+		t.Fatalf("expected SpoolExpired=2 and Spooled=1, got %+v", stats)
+	}
+	_ = client.Close(context.Background())
 }

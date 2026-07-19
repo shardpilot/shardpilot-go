@@ -199,6 +199,14 @@ type diskSpool struct {
 	// operation to dead-letter and count outside the lock.
 	pendingCapacityDrops []spoolEntry
 
+	// uncountedIDs tracks entries accepted into the mirror under a FAILED
+	// record write: they were deliberately not counted as Spooled (nothing
+	// was durable). When a later save lands, the ones still mirrored have
+	// just become durable — becameDurable accumulates them for the client
+	// layer to fold into Stats.Spooled exactly once (takeBecameDurable).
+	uncountedIDs  map[string]struct{}
+	becameDurable int
+
 	// countForeign, when set, is called (under mu; must not call back into
 	// the spool or run user code) with the number of on-disk records a
 	// merging save found that this process neither holds nor settled — i.e.
@@ -220,14 +228,15 @@ const spoolSettledMemory = 4096
 
 func newDiskSpool(cfg Config) *diskSpool {
 	s := &diskSpool{
-		dir:         cfg.SpoolDir,
-		maxEvents:   cfg.SpoolMaxEvents,
-		maxBytes:    cfg.SpoolMaxBytes,
-		ids:         make(map[string]struct{}),
-		settledIDs:  make(map[string]struct{}),
-		actorDigest: consentActorDigest(cfg),
-		removeFn:    os.Remove,
-		renameFn:    os.Rename,
+		dir:          cfg.SpoolDir,
+		maxEvents:    cfg.SpoolMaxEvents,
+		maxBytes:     cfg.SpoolMaxBytes,
+		ids:          make(map[string]struct{}),
+		settledIDs:   make(map[string]struct{}),
+		uncountedIDs: make(map[string]struct{}),
+		actorDigest:  consentActorDigest(cfg),
+		removeFn:     os.Remove,
+		renameFn:     os.Rename,
 	}
 	s.owed = wipeOwedMarkerExists(s.dir)
 	return s
@@ -354,6 +363,17 @@ func (s *diskSpool) saveLocked() error {
 		err = writePrivateFileAtomic(s.filePath(), payload, s.renameFn)
 	}
 	s.dirty = err != nil
+	if err == nil && len(s.uncountedIDs) > 0 {
+		// Entries accepted under an earlier FAILED write just became
+		// durable, IF they are still mirrored (one removed before any
+		// successful write was never durably spooled and stays uncounted).
+		for id := range s.uncountedIDs {
+			if _, present := s.ids[id]; present {
+				s.becameDurable++
+			}
+		}
+		s.uncountedIDs = make(map[string]struct{})
+	}
 	return err
 }
 
@@ -366,6 +386,16 @@ func (s *diskSpool) takeCapacityDrops() []spoolEntry {
 	drops := s.pendingCapacityDrops
 	s.pendingCapacityDrops = nil
 	return drops
+}
+
+// takeBecameDurable drains the count of previously-uncounted mirror entries
+// a successful save just made durable, for Stats.Spooled.
+func (s *diskSpool) takeBecameDurable() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	count := s.becameDurable
+	s.becameDurable = 0
+	return count
 }
 
 // clearRetryDeadline drops the persisted Retry-After deadline after a
@@ -452,6 +482,7 @@ func (s *diskSpool) purge() (dropped []spoolEntry, err error) {
 	}
 	s.entries = nil
 	s.ids = make(map[string]struct{})
+	s.uncountedIDs = make(map[string]struct{})
 	s.totalBytes = 0
 	s.resend = nil
 	s.retryAfterUntilMS = 0
@@ -581,20 +612,29 @@ func (s *diskSpool) evictOverCapsLocked() []spoolEntry {
 // append records a failed batch's envelopes. allowed is evaluated UNDER the
 // spool lock so an append can never race a consent purge into re-creating a
 // condemned record (SetConsent stores the denied state before its purge
-// takes this lock). De-duplicated by event_id; oldest-first eviction may
-// reach into the batch being appended, in which case only the survivors
-// count as durably spooled. deadlineMS, when non-zero, records the live
-// server Retry-After deadline this batch was spooled under (the server's
-// latest word replaces an earlier stored one).
-func (s *diskSpool) append(batch []spoolEntry, deadlineMS int64, allowed func() bool) (refused bool, added, evicted []spoolEntry, persistFailed bool) {
+// takes this lock). The retry-age cap is enforced AT APPEND, not just at
+// load: an envelope already expired (or future-dated beyond the skew
+// tolerance) when it fails is returned as expired and never lands on disk —
+// the documented retention bound holds without waiting for a restart.
+// De-duplicated by event_id; oldest-first eviction may reach into the batch
+// being appended, in which case only the survivors count as durably spooled.
+// deadlineMS, when non-zero, records the live server Retry-After deadline
+// this batch was spooled under (the server's latest word replaces an earlier
+// stored one). An append that changes nothing (everything expired or
+// duplicate, no deadline) skips the rewrite entirely.
+func (s *diskSpool) append(batch []spoolEntry, deadlineMS int64, now time.Time, allowed func() bool) (refused bool, added, expired, evicted []spoolEntry, persistFailed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.owed || !allowed() {
-		return true, nil, nil, false
+		return true, nil, nil, nil, false
 	}
 	appended := make(map[string]struct{}, len(batch))
 	for _, entry := range batch {
 		if entry.id == "" {
+			continue
+		}
+		if spoolEntryExpired(entry, now) {
+			expired = append(expired, entry)
 			continue
 		}
 		if _, exists := s.ids[entry.id]; exists {
@@ -604,6 +644,9 @@ func (s *diskSpool) append(batch []spoolEntry, deadlineMS int64, allowed func() 
 		s.ids[entry.id] = struct{}{}
 		s.totalBytes += len(entry.raw)
 		appended[entry.id] = struct{}{}
+	}
+	if len(appended) == 0 && deadlineMS <= 0 {
+		return false, nil, expired, nil, false
 	}
 	evicted = s.evictOverCapsLocked()
 	for _, entry := range batch {
@@ -618,7 +661,14 @@ func (s *diskSpool) append(batch []spoolEntry, deadlineMS int64, allowed func() 
 		s.retryAfterUntilMS = deadlineMS
 	}
 	persistFailed = s.saveLocked() != nil
-	return false, added, evicted, persistFailed
+	if persistFailed {
+		// Accepted into the mirror but not durable: deliberately uncounted
+		// until a later save lands (see uncountedIDs).
+		for _, entry := range added {
+			s.uncountedIDs[entry.id] = struct{}{}
+		}
+	}
+	return false, added, expired, evicted, persistFailed
 }
 
 // ack removes settled events by id — a 2xx delivery or a terminal ingest
@@ -830,6 +880,11 @@ func (c *Client) drainSpoolCapacityDrops() {
 	if c.spool == nil {
 		return
 	}
+	// Fold in entries a successful save just made durable after an earlier
+	// failed write left them uncounted.
+	if durable := c.spool.takeBecameDurable(); durable > 0 {
+		c.stats.spooled.Add(uint64(durable))
+	}
 	drops := c.spool.takeCapacityDrops()
 	if len(drops) == 0 {
 		return
@@ -882,13 +937,16 @@ func (c *Client) spoolFailedBatch(request batchRequest, cause error) {
 	}
 	// An owed wipe is retried before any append; still owed refuses disk.
 	s.settleOwedWipe()
-	refused, added, evicted, persistFailed := s.append(eligible, c.spoolDeadlineFromError(cause), func() bool {
+	refused, added, expired, evicted, persistFailed := s.append(eligible, c.spoolDeadlineFromError(cause), c.clock.Now(), func() bool {
 		return c.consent.Load() == consentStateGranted && s.grantPersisted
 	})
 	if refused {
 		c.notifySpoolDeadLetter(SpoolDropConsent, eligible)
 		return
 	}
+	// An envelope already past the retry-age cap when it fails never lands
+	// on disk: the retention bound is enforced at append, not just at load.
+	c.recordSpoolExpired(expired)
 	// Spooled counts DURABLY spooled events only: a failed record rewrite
 	// keeps the additions in the mirror (retried on the flush cadence) but
 	// must not report them as safely on disk.

@@ -1270,3 +1270,48 @@ func TestRemoteConfigTruncatedResponsesClassifyByStatus(t *testing.T) {
 		t.Fatalf("expected the cache-served malformed_response outcome, got %+v", result)
 	}
 }
+
+func TestRemoteConfigCooldownHonorsCanceledContext(t *testing.T) {
+	var requests atomic.Int64
+	var script atomic.Value
+	script.Store(rcScriptStep{status: 200, body: `{"values":{"k":"v"}}`})
+	server := newRCScriptServer(t, &requests, &script)
+	defer server.Close()
+
+	client := newRemoteConfigClient(t, server.URL, "", "anon-rc-1")
+	defer client.Close(context.Background())
+	clock := &stubClock{now: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)}
+	client.clock = clock
+
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("priming fetch: %v", err)
+	}
+	script.Store(rcScriptStep{status: 429, headers: map[string]string{"Retry-After": "60"}})
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("cooldown-arming fetch: %v", err)
+	}
+	sent := requests.Load()
+	snapshotBefore := client.RemoteConfigString("k", "fallback")
+
+	// Inside the cooldown window an already-canceled caller gets ITS context
+	// error — never a cache "success" — and nothing installs.
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	clock.now = clock.now.Add(10 * time.Second)
+	_, err := client.FetchRemoteConfig(canceled)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected the caller's context.Canceled inside the cooldown, got %v", err)
+	}
+	if requests.Load() != sent {
+		t.Fatalf("an in-window fetch must not touch the network")
+	}
+	if got := client.RemoteConfigString("k", "fallback"); got != snapshotBefore {
+		t.Fatalf("a canceled in-window fetch must not touch the snapshot, got %q", got)
+	}
+	// A live caller inside the same window still gets the cache-served
+	// transient_429.
+	result, err := client.FetchRemoteConfig(context.Background())
+	if err != nil || !result.FromCache || result.Reason != "transient_429" {
+		t.Fatalf("expected the live in-window fetch cache-served, got %+v %v", result, err)
+	}
+}

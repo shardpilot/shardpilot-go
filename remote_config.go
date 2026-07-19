@@ -43,6 +43,11 @@ import (
 //     PERMANENT failure: the fetch fails rather than serving stale values as
 //     healthy; cache and snapshot stay untouched.
 //
+// Permanent and fail-closed outcomes are authoritative for THE FETCH THAT
+// RECEIVED THEM — they do not latch: every fetch classifies independently,
+// so a later transient failure still serves the last-known-good cache. This
+// matches the canonical Defold/Unity behavior (ports, not redesigns).
+//
 // A 429 additionally arms an in-memory cooldown from its Retry-After header
 // (digits-only, floored at 1s, clamped at 24h; absent or malformed reads as
 // the floor). An explicit fetch inside the window does not touch the network:
@@ -631,6 +636,17 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 	seq := rc.fetchSeq
 	cache := rc.loadCacheLocked()
 	if c.clock.Now().Before(rc.cooldownUntil) {
+		// The cooldown fast path honors the caller's context FIRST, exactly
+		// like a dispatched fetch would through the transport: a caller that
+		// already canceled (or whose deadline already passed) gets its
+		// context error — never a cache "success" it cannot distinguish from
+		// a healthy outcome — and nothing installs or adopts.
+		if ctx != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				rc.mu.Unlock()
+				return RemoteConfigResult{}, ctxErr
+			}
+		}
 		// Inside the 429 cooldown an explicit fetch does not touch the
 		// network: the outcome is the cache-served transient_429, by design
 		// indistinguishable from a live 429.
