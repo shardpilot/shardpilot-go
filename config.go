@@ -125,6 +125,11 @@ type Config struct {
 	// share it. Keep it fast, non-blocking, and safe for concurrent use. It is
 	// never called when the publish fails at the transport, and a panic inside
 	// it is recovered and ignored so a buggy callback cannot stop delivery.
+	// With a disk spool configured, the callback fires only AFTER the spool
+	// has settled the delivered batch (previously spooled copies acked off
+	// disk), so state changes made inside it — e.g. SetConsent(false) —
+	// apply to the remaining record only, never to events this 202 already
+	// delivered.
 	//
 	// Wiring it is the per-event way to notice strict-consent suppression:
 	// on a workspace whose strict consent mode is enforced, events published

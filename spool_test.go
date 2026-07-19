@@ -629,7 +629,7 @@ func TestSpoolOldestDropAtCountAndByteCaps(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildBatch: %v", err)
 	}
-	client.spoolFailedBatch(request, nil)
+	client.spoolFailedBatch(request, nil, false)
 
 	record := readSpoolRecordFile(t, dir)
 	if len(record.Events) != 3 {
@@ -1590,7 +1590,7 @@ func TestSpoolActorScopedPerEnvelope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildBatch: %v", err)
 	}
-	client.spoolFailedBatch(request, nil)
+	client.spoolFailedBatch(request, nil, false)
 
 	record := readSpoolRecordFile(t, dir)
 	if len(record.Events) != 1 || !containsEventID(t, record.Events, "evt-own-actor") {
@@ -1617,7 +1617,7 @@ func TestSpoolActorScopedPerEnvelope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildBatch: %v", err)
 	}
-	bare.spoolFailedBatch(request, nil)
+	bare.spoolFailedBatch(request, nil, false)
 	if spoolFileExists(bareDir) {
 		t.Fatalf("an explicit-identity envelope must not spool under a no-actor grant")
 	}
@@ -1718,7 +1718,7 @@ func TestSpoolAppendExpiresPreAgedEnvelopes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildBatch: %v", err)
 	}
-	client.spoolFailedBatch(request, nil)
+	client.spoolFailedBatch(request, nil, false)
 
 	if spoolFileExists(dir) {
 		t.Fatalf("a pre-expired envelope must never land in spool.json")
@@ -1741,7 +1741,7 @@ func TestSpoolAppendExpiresPreAgedEnvelopes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildBatch: %v", err)
 	}
-	client.spoolFailedBatch(request, nil)
+	client.spoolFailedBatch(request, nil, false)
 	record := readSpoolRecordFile(t, dir)
 	if len(record.Events) != 1 || !containsEventID(t, record.Events, "evt-fresh-1") {
 		t.Fatalf("expected only the fresh envelope spooled, got %s", mustJSON(t, record.Events))
@@ -2062,6 +2062,206 @@ func TestSpoolCanceledFlushPreservesArmedDeadline(t *testing.T) {
 		}
 		return false
 	})
+}
+
+// The abandonment rule extends to PERSISTED pacing state: a canceled flush
+// whose spool-resend attempt fails with the caller's own context error must
+// not run the hintless deadline withdrawal — nothing was learned from the
+// endpoint, so retry_after_until_ms survives and a restart still defers
+// inside the server's window.
+func TestSpoolCanceledFlushKeepsPersistedDeadline(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+	// A real retriable outcome (WITH a hint) for the eventual Close attempt;
+	// the canceled flush itself must never reach the server.
+	state.setOutcome(http.StatusInternalServerError, "internal_error", "3600")
+
+	dir := t.TempDir()
+	now := time.Now()
+	deadlineMS := now.Add(time.Hour).UnixMilli()
+	writeConsentRecordFile(t, dir, "granted")
+	writeSpoolRecordFile(t, dir, deadlineMS, spoolTestEnvelope(t, "evt-keep-deadline-1", now))
+
+	client := newSpoolTestClient(t, server.URL, dir, nil, nil)
+	if client.initialDeferUntil.IsZero() {
+		t.Fatalf("expected the persisted deadline to seed the deferral")
+	}
+
+	// Canceled flush straight to the worker: the resend attempt fails with
+	// the caller's context error before reaching the server.
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	reply := make(chan error, 1)
+	select {
+	case client.flushRequests <- flushRequest{ctx: canceledCtx, reply: reply}:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out handing the canceled flush to the worker")
+	}
+	select {
+	case err := <-reply:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected the canceled flush to surface the caller's context error, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the canceled flush reply")
+	}
+
+	// Zero persisted-pacing mutations: the record still carries the seeded
+	// deadline and the requeued chunk stays spooled.
+	record := readSpoolRecordFile(t, dir)
+	if record.RetryAfterUntilMS != deadlineMS {
+		t.Fatalf("expected the persisted deadline %d preserved after the canceled flush, got %d", deadlineMS, record.RetryAfterUntilMS)
+	}
+	if len(record.Events) != 1 {
+		t.Fatalf("expected the requeued chunk still spooled, got %d events", len(record.Events))
+	}
+	if got := state.batchCount(); got != 0 {
+		t.Fatalf("expected the canceled flush to never reach the server, got %d requests", got)
+	}
+	// Close's own flush is live-context work: its retriable failure carries
+	// the server's fresh Retry-After hint, refreshing the persisted window.
+	_ = client.Close(context.Background())
+
+	// A restart seeds its deferral from the preserved window and does not
+	// resend inside it despite a hot flush cadence.
+	restarted := newSpoolTestClient(t, server.URL, dir, nil, func(cfg *Config) {
+		cfg.FlushInterval = 30 * time.Millisecond
+	})
+	if restarted.initialDeferUntil.IsZero() {
+		t.Fatalf("expected the restart to seed the deferral from the preserved deadline")
+	}
+	before := state.batchCount()
+	time.Sleep(250 * time.Millisecond)
+	if got := state.batchCount(); got != before {
+		t.Fatalf("expected no resend inside the preserved window after restart, got %d requests after %d", got, before)
+	}
+	state.setOutcome(http.StatusAccepted, "", "")
+	_ = restarted.Close(context.Background())
+}
+
+// The same persisted-state abandonment rule on the batch APPEND path: a
+// retained batch retried under a canceled caller context re-appends (crash
+// insurance), but the hintless context error must not withdraw the window a
+// real 429 persisted alongside the spooled copy.
+func TestSpoolCanceledFlushBatchAppendKeepsPersistedDeadline(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+	// The live flush fails 429 WITH Retry-After: the batch spools and the
+	// server window persists alongside it.
+	state.setOutcome(http.StatusTooManyRequests, "rate_limited", "3600")
+
+	dir := t.TempDir()
+	client := newSpoolTestClient(t, server.URL, dir, nil, nil)
+	client.SetConsent(true)
+
+	if err := client.Enqueue(Event{ID: "evt-append-keep-1", Name: "append_keep"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Flush(context.Background()); err == nil {
+		t.Fatalf("expected the 429 surfaced")
+	}
+	armed := readSpoolRecordFile(t, dir)
+	if armed.RetryAfterUntilMS == 0 {
+		t.Fatalf("expected the 429 hint persisted alongside the spooled batch, got %+v", armed)
+	}
+	if len(armed.Events) != 1 {
+		t.Fatalf("expected the failed batch spooled, got %d events", len(armed.Events))
+	}
+
+	// The retained batch retried under a canceled caller context: the
+	// context error is hintless, but abandonment must not withdraw the
+	// persisted window.
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	reply := make(chan error, 1)
+	select {
+	case client.flushRequests <- flushRequest{ctx: canceledCtx, reply: reply}:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out handing the canceled flush to the worker")
+	}
+	select {
+	case err := <-reply:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("expected the canceled flush to surface the caller's context error, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the canceled flush reply")
+	}
+
+	after := readSpoolRecordFile(t, dir)
+	if after.RetryAfterUntilMS != armed.RetryAfterUntilMS {
+		t.Fatalf("expected the persisted deadline %d preserved after the canceled retry, got %d", armed.RetryAfterUntilMS, after.RetryAfterUntilMS)
+	}
+	if len(after.Events) != 1 {
+		t.Fatalf("expected the spooled batch intact, got %d events", len(after.Events))
+	}
+	if got := state.batchCount(); got != 1 {
+		t.Fatalf("expected only the live 429 attempt to reach the server, got %d requests", got)
+	}
+	state.setOutcome(http.StatusAccepted, "", "")
+	_ = client.Close(context.Background())
+}
+
+// An OnBatchResult callback observing a resend 202 runs only AFTER the spool
+// settled the delivered chunk: a consent flip inside the callback purges the
+// remainder only — the delivered entries are already acked off disk and must
+// never be dead-lettered as consent drops.
+func TestSpoolResendConsentFlipInCallbackSettlesDeliveredFirst(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+	state.setOutcome(http.StatusAccepted, "", "")
+
+	dir := t.TempDir()
+	now := time.Now()
+	writeConsentRecordFile(t, dir, "granted")
+	writeSpoolRecordFile(t, dir, 0,
+		spoolTestEnvelope(t, "evt-flip-1", now),
+		spoolTestEnvelope(t, "evt-flip-2", now))
+
+	recorder := &spoolDeadLetterRecorder{}
+	// The callback closes over the client variable assigned below; the first
+	// publish (and therefore the first callback) cannot fire before the
+	// explicit Flush, so the assignment is ordered before every read.
+	var client *Client
+	var flipped atomic.Bool
+	client = newSpoolTestClient(t, server.URL, dir, recorder, func(cfg *Config) {
+		cfg.BatchSize = 1 // one spooled envelope per resend chunk
+		cfg.OnBatchResult = func(BatchResult) {
+			if flipped.CompareAndSwap(false, true) {
+				client.SetConsent(false)
+			}
+		}
+	})
+
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	// The purge applies to the undelivered remainder only.
+	consentLetters := recorder.byReason(SpoolDropConsent)
+	if len(consentLetters) != 1 || len(consentLetters[0].Envelopes) != 1 || !containsEventID(t, consentLetters[0].Envelopes, "evt-flip-2") {
+		t.Fatalf("expected exactly the undelivered remainder dead-lettered as consent, got %+v", consentLetters)
+	}
+	for _, reason := range []SpoolDropReason{SpoolDropConsent, SpoolDropTerminal, SpoolDropCapacity, SpoolDropExpired} {
+		for _, letter := range recorder.byReason(reason) {
+			if containsEventID(t, letter.Envelopes, "evt-flip-1") {
+				t.Fatalf("delivered event evt-flip-1 must never dead-letter, found in a %q letter", reason)
+			}
+		}
+	}
+	stats := client.Snapshot()
+	if stats.SpoolResent != 1 {
+		t.Fatalf("expected SpoolResent=1 for the delivered chunk, got %+v", stats)
+	}
+	// Exactly one batch reached the server: the second chunk was purged by
+	// the denial, never attempted.
+	if got := state.batchCount(); got != 1 {
+		t.Fatalf("expected exactly the delivered chunk on the wire, got %d requests", got)
+	}
+	if spoolFileExists(dir) {
+		t.Fatalf("expected the denial purge to remove spool.json")
+	}
+	_ = client.Close(context.Background())
 }
 
 func TestSpoolInProcessRetryReusesRetainedBytes(t *testing.T) {

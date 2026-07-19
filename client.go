@@ -761,9 +761,11 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 				}
 				if !isPermanentPublishError(err) {
 					// Retained for the in-process retry AND spooled
-					// (grant-only) so a restart resends identical bytes.
+					// (grant-only) so a restart resends identical bytes. A
+					// caller-abandoned attempt still spools (crash
+					// insurance) but leaves the persisted deadline alone.
 					c.retainedRequest = request
-					c.spoolFailedBatch(request, err)
+					c.spoolFailedBatch(request, err, callerAbandonedFlush(ctx, err))
 					return batch, err
 				}
 				if firstErr == nil {
@@ -788,8 +790,12 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 				// can deliver several batches and still return a later
 				// batch's error, and that error must be paced as a FIRST
 				// failure, not as a continuation of a streak a mid-flush
-				// success already broke.
+				// success already broke. Spool settled first, callback
+				// second: an OnBatchResult callback may flip consent, and
+				// the resulting purge must find the delivered events already
+				// acked off disk — never dead-letter them as consent drops.
 				c.spoolAckWithVerdicts(request, result)
+				c.notifyBatchResult(result.toPublic())
 				*backoffAttempt = 0
 				batch = batch[:0]
 				c.retainedRequest = batchRequest{}
@@ -859,12 +865,16 @@ func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, def
 		// Retriable: the batch is retained in memory for the in-process
 		// retry — together with its built wire bytes — and spooled
 		// (grant-only) as crash insurance so a restart resends the identical
-		// bytes.
+		// bytes. The worker publishes under its own internal context, so
+		// caller abandonment never applies here.
 		c.retainedRequest = request
-		c.spoolFailedBatch(request, err)
+		c.spoolFailedBatch(request, err, false)
 		return batch
 	}
+	// Spool settled first, callback second (see flushAvailable's success
+	// path for the rationale).
 	c.spoolAckWithVerdicts(request, result)
+	c.notifyBatchResult(result.toPublic())
 	c.retainedRequest = batchRequest{}
 	return batch[:0]
 }
@@ -902,16 +912,26 @@ func (c *Client) recordBuildFailure(err error) {
 
 // publishRequest publishes one already-built batch request — fresh events
 // (typed envelopes plus their retained wire bytes) or a spooled resend
-// chunk (raw bytes only) — through the consent gate, transport, stats, and
-// callback plumbing shared by every publish path.
+// chunk (raw bytes only) — through the consent gate, transport, and stats
+// plumbing shared by every publish path. Synchronous single-shot batches
+// (Track) have no spooled copies to settle, so the success callback fires
+// immediately here.
 func (c *Client) publishRequest(ctx context.Context, request batchRequest, size int) error {
-	_, err := c.publishRequestResult(ctx, request, size)
+	result, err := c.publishRequestResult(ctx, request, size)
+	if err == nil {
+		c.notifyBatchResult(result.toPublic())
+	}
 	return err
 }
 
 // publishRequestResult is publishRequest returning the decoded batch response
 // as well: the spool's resend settle needs the per-event verdicts to tell
-// confirmed-delivered events from per-event terminal outcomes.
+// confirmed-delivered events from per-event terminal outcomes. It does NOT
+// invoke OnBatchResult — each successful caller notifies AFTER settling the
+// spool for the outcome, so user code observing a delivery never runs while
+// the delivered events still sit in the record, where a callback-driven
+// consent flip would purge (and dead-letter) entries the 202 already
+// settled.
 func (c *Client) publishRequestResult(ctx context.Context, request batchRequest, size int) (batchResult, error) {
 	ctx, cancel := contextWithDefaultTimeout(ctx, c.cfg.HTTPTimeout)
 	defer cancel()
@@ -963,7 +983,6 @@ func (c *Client) publishRequestResult(ctx context.Context, request batchRequest,
 		return batchResult{}, err
 	}
 	c.stats.recordBatch(result, size)
-	c.notifyBatchResult(result.toPublic())
 	if c.spool != nil {
 		// ANY successful publish proves the server's backpressure window
 		// over: a persisted Retry-After deadline surviving it would defer the

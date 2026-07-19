@@ -1103,8 +1103,11 @@ func (c *Client) partitionSpoolEligible(request batchRequest) (eligible, refused
 // wipe, nothing touches disk and the would-have-spooled batch goes to the
 // dead-letter callback instead. Eligibility is per-envelope: only envelopes
 // whose effective actor the persisted grant covers may spool; the rest
-// dead-letter as consent drops.
-func (c *Client) spoolFailedBatch(request batchRequest, cause error) {
+// dead-letter as consent drops. abandoned marks a failure that was the
+// flush caller's OWN context error (callerAbandonedFlush): the append still
+// happens — the batch is undelivered work and spooling it is crash
+// insurance, not pacing — but the persisted deadline stays untouched.
+func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned bool) {
 	s := c.spool
 	if s == nil {
 		return
@@ -1120,8 +1123,11 @@ func (c *Client) spoolFailedBatch(request batchRequest, cause error) {
 	// A retriable failure that carried NO usable Retry-After withdraws a
 	// previously persisted deadline (the server's latest word governs). The
 	// Close remnant append (cause == nil) is not a failure outcome: a live
-	// persisted window must survive it into the next start.
-	clearStale := cause != nil && deadlineMS <= 0
+	// persisted window must survive it into the next start. A caller-abandoned
+	// flush is no failure OUTCOME either — nothing was learned from the
+	// endpoint — so the abandonment rule extends to persisted pacing state
+	// and the window survives untouched.
+	clearStale := cause != nil && deadlineMS <= 0 && !abandoned
 	refused, added, expired, evicted, persistFailed := s.append(eligible, deadlineMS, clearStale, c.clock.Now(), func() bool {
 		return c.consent.Load() == consentStateGranted && s.grantPersisted
 	})
@@ -1309,7 +1315,10 @@ func (c *Client) resendSpooledChunks(deferUntil *time.Time, backoffAttempt *int)
 		cancel()
 		c.applyRetryPacing(err, deferUntil, backoffAttempt)
 		if err == nil {
+			// Settle the delivered chunk off the spool BEFORE the callback:
+			// a callback-driven consent flip must purge the remainder only.
 			c.settleResentChunk(chunk, result)
+			c.notifyBatchResult(result.toPublic())
 			continue
 		}
 		if errors.Is(err, ErrConsentDenied) {
@@ -1379,7 +1388,10 @@ func (c *Client) flushSpooledChunks(ctx context.Context, backoffAttempt *int) er
 		}
 		result, err := c.publishRequestResult(ctx, spoolChunkRequest(chunk), len(chunk))
 		if err == nil {
+			// Settle the delivered chunk off the spool BEFORE the callback:
+			// a callback-driven consent flip must purge the remainder only.
 			c.settleResentChunk(chunk, result)
+			c.notifyBatchResult(result.toPublic())
 			*backoffAttempt = 0
 			continue
 		}
@@ -1387,7 +1399,14 @@ func (c *Client) flushSpooledChunks(ctx context.Context, backoffAttempt *int) er
 			return err
 		}
 		if !isPermanentPublishError(err) {
-			c.spoolStoreResendDeadline(err)
+			// A caller-abandoned flush learned nothing from the endpoint, so
+			// it makes no persisted-pacing mutations either: the hintless
+			// withdrawal below would wipe retry_after_until_ms and let the
+			// next start resend inside the server's still-live window. The
+			// requeued chunk keeps the previously persisted deadline.
+			if !callerAbandonedFlush(ctx, err) {
+				c.spoolStoreResendDeadline(err)
+			}
 			s.requeueResend(chunk)
 			return err
 		}
@@ -1456,7 +1475,7 @@ func (c *Client) spoolCloseRemnant(batch []Event) {
 		c.logf("shardpilot spool: close remnant could not be serialized and was dropped: %v", err)
 		return
 	}
-	c.spoolFailedBatch(request, nil)
+	c.spoolFailedBatch(request, nil, false)
 }
 
 // initSpool runs the construction-time spool lifecycle: settle an owed wipe
