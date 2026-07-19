@@ -213,3 +213,53 @@ func TestInjectedHTTPClientRemoteConfigStillRefusesRedirects(t *testing.T) {
 		t.Fatalf("expected the redirect target never requested, got %d requests", followed.Load())
 	}
 }
+
+func TestInjectedClientAttemptsBoundedByHTTPTimeout(t *testing.T) {
+	hang := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		<-hang
+	}))
+	defer server.Close()
+	// Runs before server.Close (LIFO), releasing the hung handler so Close
+	// does not wait forever on it.
+	defer close(hang)
+
+	// The injected client carries NO Timeout of its own, and the caller's
+	// deadline is far longer than HTTPTimeout: the per-request context cap
+	// must still bound the attempt at HTTPTimeout — the internal clients'
+	// Timeout used to be the only cap, and injection must not lose it.
+	client, err := NewClient(Config{
+		IngestURL:     server.URL,
+		Token:         "test-token",
+		WorkspaceID:   "workspace-test",
+		AppID:         "app-test",
+		EnvironmentID: "develop",
+		Source:        SourceBackend,
+		AnonymousID:   "anon-inject-3",
+		HTTPClient:    &http.Client{},
+		FlushInterval: time.Hour,
+		HTTPTimeout:   200 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	start := time.Now()
+	trackErr := client.Track(ctx, Event{Name: "hang"})
+	elapsed := time.Since(start)
+	if trackErr == nil {
+		t.Fatal("expected the hung attempt to fail")
+	}
+	if !errors.Is(trackErr, context.DeadlineExceeded) {
+		t.Fatalf("expected the SDK cap's deadline, got %v", trackErr)
+	}
+	if ctx.Err() != nil {
+		t.Fatal("the CALLER's context must not have expired — the SDK cap must fire first")
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("attempt ran %v; the HTTPTimeout cap did not bound the injected client", elapsed)
+	}
+	_ = client.Close(context.Background())
+}

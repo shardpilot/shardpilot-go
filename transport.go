@@ -436,12 +436,20 @@ func parseRetryAfter(header string) (time.Duration, bool) {
 	return 0, false
 }
 
+// contextWithDefaultTimeout bounds one attempt by the SDK timeout,
+// UNCONDITIONALLY: context.WithTimeout never extends a parent's earlier
+// deadline, so the derived context carries min(caller deadline, now+timeout).
+// It used to leave a parent that already had a deadline untouched, relying on
+// the internal http.Client's Timeout as the cap — which an injected
+// Config.HTTPClient with a zero Timeout does not have, letting a caller
+// deadline LONGER than HTTPTimeout stretch an attempt to the caller's
+// deadline against the documented injection contract. Caller-abort
+// discrimination is unaffected: the callers that need it (FetchRemoteConfig,
+// callerAbandonedFlush) test the CALLER's original context, which an SDK-cap
+// expiry never marks.
 func contextWithDefaultTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	if parent == nil {
 		parent = context.Background()
-	}
-	if _, ok := parent.Deadline(); ok {
-		return parent, func() {}
 	}
 	return context.WithTimeout(parent, timeout)
 }

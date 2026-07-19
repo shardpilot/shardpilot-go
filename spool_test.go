@@ -2760,6 +2760,201 @@ func TestSetConsentDiskStallDoesNotBlockIntake(t *testing.T) {
 	}
 }
 
+func TestDenialAppliesToIntakeWhileEarlierDecisionDiskStalls(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+	state.setOutcome(http.StatusAccepted, "", "")
+
+	dir := t.TempDir()
+	client := newSpoolTestClient(t, server.URL, dir, nil, nil)
+
+	// Stall the FIRST consent-record rename (the grant's). The denial issued
+	// while it is stuck must take effect on intake IMMEDIATELY — the
+	// in-memory flip must never queue behind an earlier decision's disk
+	// write — while its own record write waits its turn, so the persisted
+	// record still lands in decision order (denied last).
+	stalled := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	client.spool.renameFn = func(oldpath, newpath string) error {
+		once.Do(func() {
+			close(stalled)
+			<-release
+		})
+		return os.Rename(oldpath, newpath)
+	}
+
+	grantDone := make(chan struct{})
+	go func() {
+		defer close(grantDone)
+		client.SetConsent(true)
+	}()
+	<-stalled
+
+	denyDone := make(chan struct{})
+	go func() {
+		defer close(denyDone)
+		client.SetConsent(false)
+	}()
+	waitFor(t, 3*time.Second, "the denial visible to intake while the grant's write is stalled", func() bool {
+		return client.Consent() == ConsentDenied
+	})
+	if err := client.Enqueue(Event{ID: "evt-under-denial-1", Name: "e1"}); !errors.Is(err, ErrConsentDenied) {
+		t.Fatalf("expected intake rejecting under the denial, got %v", err)
+	}
+	select {
+	case <-grantDone:
+		t.Fatal("the grant decision finished while its rename was supposed to be stalled")
+	default:
+	}
+
+	close(release)
+	<-grantDone
+	<-denyDone
+
+	// Disk order equals decision order: the denial's record is the one on
+	// disk, even though it was ISSUED mid-stall.
+	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentDenied {
+		t.Fatalf("expected the denied record persisted last, got (%v, %v)", recorded, ok)
+	}
+	// Transmission order equals decision order too.
+	waitFor(t, 5*time.Second, "both decisions transmitted", func() bool {
+		return state.consentCount() == 2
+	})
+	first, second := state.consentAt(0), state.consentAt(1)
+	if got := consentBodyAnalytics(t, first.body); got != true {
+		t.Fatalf("expected the grant transmitted first, got %v", first.body)
+	}
+	if got := consentBodyAnalytics(t, second.body); got != false {
+		t.Fatalf("expected the denial transmitted second, got %v", second.body)
+	}
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// consentBodyAnalytics extracts categories.analytics from a captured consent
+// request body.
+func consentBodyAnalytics(t *testing.T, body map[string]any) bool {
+	t.Helper()
+	categories, ok := body["categories"].(map[string]any)
+	if !ok {
+		t.Fatalf("consent body carries no categories: %v", body)
+	}
+	analytics, ok := categories["analytics"].(bool)
+	if !ok {
+		t.Fatalf("consent body carries no boolean analytics category: %v", body)
+	}
+	return analytics
+}
+
+func TestCloseWaitsForStalledGrantDecision(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+	state.setOutcome(http.StatusAccepted, "", "")
+
+	dir := t.TempDir()
+	client := newSpoolTestClient(t, server.URL, dir, nil, nil)
+
+	stalled := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	client.spool.renameFn = func(oldpath, newpath string) error {
+		once.Do(func() {
+			close(stalled)
+			<-release
+		})
+		return os.Rename(oldpath, newpath)
+	}
+
+	decisionDone := make(chan struct{})
+	go func() {
+		defer close(decisionDone)
+		client.SetConsent(true)
+	}()
+	<-stalled
+
+	// Close must fence behind the in-flight decision: without the fence it
+	// would stop and drain the consent sender BEFORE the stalled decision's
+	// handoff, and the grant would silently never transmit.
+	closeErr := make(chan error, 1)
+	go func() { closeErr <- client.Close(context.Background()) }()
+	select {
+	case err := <-closeErr:
+		t.Fatalf("Close returned (%v) while a pre-Close decision was still persisting", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	<-decisionDone
+	if err := <-closeErr; err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// The fenced Close drained the sender AFTER the handoff: the decision
+	// reached the server, and its record reached disk.
+	if got := state.consentCount(); got != 1 {
+		t.Fatalf("expected the pre-Close grant transmitted before Close returned, got %d consent posts", got)
+	}
+	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentGranted {
+		t.Fatalf("expected the granted record persisted, got (%v, %v)", recorded, ok)
+	}
+}
+
+func TestCloseWaitsForStalledDenialDecision(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+	state.setOutcome(http.StatusAccepted, "", "")
+
+	dir := t.TempDir()
+	client := newSpoolTestClient(t, server.URL, dir, nil, nil)
+	// A completed grant first, so an abandoned denial would leave a STALE
+	// GRANTED record on disk — the exact hazard the Close fence prevents.
+	client.SetConsent(true)
+
+	stalled := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	client.spool.removeFn = func(path string) error {
+		once.Do(func() {
+			close(stalled)
+			<-release
+		})
+		return os.Remove(path)
+	}
+
+	decisionDone := make(chan struct{})
+	go func() {
+		defer close(decisionDone)
+		client.SetConsent(false)
+	}()
+	<-stalled
+
+	closeErr := make(chan error, 1)
+	go func() { closeErr <- client.Close(context.Background()) }()
+	select {
+	case err := <-closeErr:
+		t.Fatalf("Close returned (%v) while the denial's purge was still in flight", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	<-decisionDone
+	if err := <-closeErr; err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// The denial completed before teardown: denied record on disk (never a
+	// stale grant), and both decisions transmitted in order.
+	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentDenied {
+		t.Fatalf("expected the denied record persisted before Close returned, got (%v, %v)", recorded, ok)
+	}
+	if got := state.consentCount(); got != 2 {
+		t.Fatalf("expected both decisions transmitted before Close returned, got %d consent posts", got)
+	}
+	if got := consentBodyAnalytics(t, state.consentAt(1).body); got != false {
+		t.Fatalf("expected the denial transmitted last, got %v", state.consentAt(1).body)
+	}
+}
+
 func TestSpoolDuplicateAppendRetriesDirtyWrite(t *testing.T) {
 	dir := t.TempDir()
 	s := newDiskSpool(Config{SpoolDir: dir, SpoolMaxEvents: 8, SpoolMaxBytes: 1 << 20})

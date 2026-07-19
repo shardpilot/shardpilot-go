@@ -52,9 +52,11 @@ type Config struct {
 	// fetches — so an integrator can supply a pooled transport, a proxy, mTLS,
 	// or instrumentation. Nil — the default — keeps the SDK's internal
 	// clients, exactly as before the field existed. Two SDK contracts survive
-	// injection unchanged: every attempt is still bounded by HTTPTimeout (or
-	// the caller's own context deadline) through per-request contexts, whether
-	// or not the injected client carries a Timeout of its own; and
+	// injection unchanged: every attempt is still bounded by the SOONER of
+	// HTTPTimeout and the caller's own context deadline through per-request
+	// contexts, whether or not the injected client carries a Timeout of its
+	// own (a caller deadline longer than HTTPTimeout never stretches an
+	// attempt past HTTPTimeout); and
 	// remote-config fetches still refuse to follow redirects — the SDK derives
 	// its remote-config client from HTTPClient with CheckRedirect pinned
 	// (sharing the Transport and Jar), because silently following a 3xx would

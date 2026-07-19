@@ -1553,16 +1553,17 @@ func (c *Client) initSpool() []SpoolDeadLetter {
 }
 
 // applySpoolConsent applies a SetConsent decision to the disk side: persist
-// the decision record and purge or open the spool. Called with consentMu
-// held — NEVER lifecycleMu, which every Track/Enqueue takes: this function
-// fsyncs files, and event intake must not wait out a disk stall. consentMu
-// keeps the disk order equal to the decision order across concurrent
-// SetConsent calls; the in-memory state was already stored before this runs,
-// so the spool's own gates (append's allowed re-check, owed-wipe) see the
-// decided state under their own lock. Returns the dead-letters for the
-// caller to emit after unlocking. Denial: the spool is purged (a failed
-// purge owes a wipe and fails closed) and the denied record is written
-// regardless. Grant: an owed wipe is retried FIRST — while it still fails,
+// the decision record and purge or open the spool. Called while holding the
+// consent ticket turn — NEVER lifecycleMu, which every Track/Enqueue takes:
+// this function fsyncs files, and event intake must not wait out a disk
+// stall. The ticket order keeps the disk order equal to the decision order
+// across concurrent SetConsent calls; the in-memory state was already stored
+// before this runs, so the spool's own gates (append's allowed re-check,
+// owed-wipe) see the decided state under their own lock. Returns the
+// dead-letters for the caller to emit after releasing the turn. Denial: the
+// spool is purged (a failed purge owes a wipe and fails closed) and the
+// denied record is written regardless. Grant: an owed wipe is retried FIRST
+// — while it still fails,
 // the persisted decision stays denied and the live in-memory grant applies
 // per the open posture — then the granted record is persisted, and only a
 // SUCCESSFUL persist opens spool writes (grantPersisted): a grant whose

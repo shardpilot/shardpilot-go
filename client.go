@@ -50,15 +50,34 @@ type Client struct {
 	workerDone    chan struct{}
 	lifecycleMu   sync.Mutex
 
-	// consentMu serializes whole SetConsent decisions — the in-memory flip,
-	// the disk side (consent record + spool purge), and the sender handoff —
-	// so concurrent decisions settle in one order everywhere. It exists so
-	// the DISK work can run outside lifecycleMu: lifecycleMu is on every
-	// Track/Enqueue call, and holding it across fsync'd file writes would
-	// stall event intake behind a slow SpoolDir for the duration of a
-	// consent decision. Ordering: consentMu is acquired before lifecycleMu
-	// and never the other way around.
-	consentMu     sync.Mutex
+	// The consent ticket line serializes the SLOW half of SetConsent — disk
+	// persistence and the sender handoff — in the exact order the fast
+	// halves took effect, WITHOUT making intake or a later decision's
+	// in-memory flip wait behind an earlier decision's fsync. Tickets are
+	// assigned under lifecycleMu together with the in-memory flip (so the
+	// ticket order IS the decision order), and each decision waits for its
+	// ticket before touching disk: the persisted record and the transmitted
+	// sequence always agree with the in-memory order — the last decision's
+	// write lands last — while a denial issued during an earlier decision's
+	// stalled write still rejects Track/Enqueue from the moment it was
+	// issued. consentTicketNext is guarded by lifecycleMu;
+	// consentTicketServing by consentTurnMu.
+	consentTurnMu        sync.Mutex
+	consentTurnCond      *sync.Cond
+	consentTicketNext    uint64
+	consentTicketServing uint64
+
+	// consentDecisionsWG counts SetConsent calls admitted BEFORE Close
+	// stored the closed flag (both happen under lifecycleMu, so the set is
+	// exact). Close waits for them — bounded by its context — before
+	// stopping and draining the consent sender: a pre-Close decision's
+	// record write, spool purge, and transmission handoff must not be
+	// abandoned by teardown (a stranded enqueue would silently never
+	// transmit; an interrupted denial could leave a stale granted record on
+	// disk). Decisions arriving after Close keep today's documented
+	// applied-locally-only behavior and are not fenced.
+	consentDecisionsWG sync.WaitGroup
+
 	trackWG       sync.WaitGroup
 	closeMu       sync.Mutex
 	closeInFlight bool
@@ -147,6 +166,7 @@ func NewClient(cfg Config) (*Client, error) {
 		consentSends:      make(chan consentRequest, consentSendBuffer),
 		consentSenderDone: make(chan struct{}),
 	}
+	client.consentTurnCond = sync.NewCond(&client.consentTurnMu)
 	client.consentGate.Store(newConsentGateState())
 
 	// Spool init runs before the worker starts: it seeds initialDeferUntil
@@ -254,6 +274,9 @@ func (c *Client) Close(ctx context.Context) error {
 	if err := c.waitForTracks(ctx); err != nil {
 		return err
 	}
+	if err := c.waitForConsentDecisions(ctx); err != nil {
+		return err
+	}
 	return c.finishClose(ctx)
 }
 
@@ -261,6 +284,29 @@ func (c *Client) waitForTracks(ctx context.Context) error {
 	waitDone := make(chan struct{})
 	go func() {
 		c.trackWG.Wait()
+		close(waitDone)
+	}()
+
+	select {
+	case <-waitDone:
+		return nil
+	case <-contextDone(ctx):
+		return contextCause(ctx)
+	}
+}
+
+// waitForConsentDecisions waits — bounded by the Close context — for every
+// SetConsent call admitted before Close stored the closed flag to finish its
+// disk work and hand its transmission to the consent sender. Without this
+// fence, Close could stop and drain the sender inside a decision's window
+// between the in-memory flip and the handoff: the decision would enqueue
+// into a channel nobody reads again (silently never transmitted), and a
+// denial's spool purge or record write could be abandoned mid-flight,
+// leaving a stale granted record for the next start to trust.
+func (c *Client) waitForConsentDecisions(ctx context.Context) error {
+	waitDone := make(chan struct{})
+	go func() {
+		c.consentDecisionsWG.Wait()
 		close(waitDone)
 	}()
 
