@@ -62,6 +62,55 @@ type Config struct {
 	// handshake starts rejecting this build's declared revision as stale.
 	DisableSchemaRevision bool
 
+	// APIKey is the publishable client ingest key (`sp_ingest_...`) that
+	// authenticates remote-config fetches: the GET carries
+	// `Authorization: Bearer <APIKey>`, never Token (a Mode B ingest JWT
+	// cannot authenticate the remote-config endpoint). Required when
+	// RemoteConfigURL is set; unused otherwise. Held in memory; never logged.
+	APIKey string
+
+	// RemoteConfigURL is the remote-config base URL (a dedicated config
+	// origin — never the ingest URL). Empty — the default — disables the
+	// remote-config client entirely. Validated like IngestURL: absolute,
+	// HTTPS outside loopback (or private nets with
+	// AllowInsecurePrivateNetwork), no path/query/fragment/user info.
+	RemoteConfigURL string
+
+	// RemoteConfigCachePath, when set, is the file the remote-config client
+	// persists its durable last-known-good cache record to, so a restart or
+	// an offline start still serves the previously fetched configuration.
+	// Empty keeps the cache in memory only (getters still serve the last
+	// served snapshot within the process). Independent of SpoolDir — setting
+	// it never enables consent persistence or the disk spool.
+	RemoteConfigCachePath string
+
+	// SpoolDir, when set, is the opt-in state directory for the bounded disk
+	// spool and the persisted consent decision (`spool.json`, `consent.json`,
+	// and the `spool-wipe-owed` marker; directory 0700, files 0600). Empty —
+	// the default — keeps today's memory-only queue behavior: nothing is
+	// ever written to disk. Disk participation is strictly grant-only; see
+	// SetConsent.
+	SpoolDir string
+
+	// SpoolMaxEvents caps how many undelivered events the disk spool retains;
+	// past it the OLDEST events are dropped (through OnSpoolDeadLetter).
+	// Zero defaults to 2000 when SpoolDir is set.
+	SpoolMaxEvents int
+
+	// SpoolMaxBytes caps the total serialized envelope bytes the disk spool
+	// retains, with the same oldest-first eviction. Zero defaults to 1 MiB
+	// (1,048,576 bytes) when SpoolDir is set.
+	SpoolMaxBytes int
+
+	// OnSpoolDeadLetter, when set, is called with every event the disk spool
+	// drops undelivered: capacity eviction, retry-age expiry, a terminal
+	// ingest outcome on previously spooled events, a consent purge, and
+	// batches refused disk under a non-grant (or owed-wipe) state. It runs on
+	// the SDK's worker/consent paths; keep it fast and non-blocking. A panic
+	// inside it is recovered, like OnBatchResult. Never called when SpoolDir
+	// is empty.
+	OnSpoolDeadLetter func(SpoolDeadLetter)
+
 	// OnBatchResult, when set, is called after each successful batch publish
 	// (HTTP 202) with the ingest outcome: the accepted/rejected/duplicate
 	// aggregate plus the per-event status list the endpoint reports. It is the
@@ -94,6 +143,12 @@ const (
 	defaultBufferSize    = 1000
 	defaultFlushInterval = time.Second
 	defaultHTTPTimeout   = 2 * time.Second
+
+	// Disk-spool caps: the cross-SDK canonical bound of 2000 events / 1 MiB
+	// of serialized envelopes (the Defold reference's smaller 500/256KiB is a
+	// documented save-file adaptation, not the contract).
+	defaultSpoolMaxEvents = 2000
+	defaultSpoolMaxBytes  = 1 << 20
 )
 
 func normalizeConfig(cfg Config) (Config, error) {
@@ -109,6 +164,10 @@ func normalizeConfig(cfg Config) (Config, error) {
 	// whitespace-only override falls back to the default — use
 	// DisableSchemaRevision to stop declaring).
 	cfg.SchemaRevision = strings.TrimSpace(cfg.SchemaRevision)
+	cfg.APIKey = strings.TrimSpace(cfg.APIKey)
+	cfg.RemoteConfigURL = strings.TrimSpace(cfg.RemoteConfigURL)
+	cfg.RemoteConfigCachePath = strings.TrimSpace(cfg.RemoteConfigCachePath)
+	cfg.SpoolDir = strings.TrimSpace(cfg.SpoolDir)
 
 	if cfg.IngestURL == "" {
 		return Config{}, fmt.Errorf("%w: ingest URL is required", ErrInvalidConfig)
@@ -129,29 +188,34 @@ func normalizeConfig(cfg Config) (Config, error) {
 		return Config{}, fmt.Errorf("%w: source must be client, server, or backend", ErrInvalidConfig)
 	}
 
-	parsed, err := url.Parse(cfg.IngestURL)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return Config{}, fmt.Errorf("%w: ingest URL must be absolute", ErrInvalidConfig)
+	normalizedIngest, err := normalizeBaseURL(cfg.IngestURL, "ingest URL", cfg.AllowInsecurePrivateNetwork)
+	if err != nil {
+		return Config{}, err
 	}
-	if parsed.Scheme != "https" && !allowInsecureURL(parsed, cfg.AllowInsecurePrivateNetwork) {
-		return Config{}, fmt.Errorf("%w: ingest URL must use https outside localhost, loopback, or explicitly allowed private networks", ErrInvalidConfig)
+	cfg.IngestURL = normalizedIngest
+
+	if cfg.RemoteConfigURL != "" {
+		// The remote-config route authenticates with the publishable API key
+		// only — a Mode B ingest JWT never does — so configuring the URL
+		// without the key could never produce a working fetch.
+		if cfg.APIKey == "" {
+			return Config{}, fmt.Errorf("%w: remote config requires APIKey", ErrInvalidConfig)
+		}
+		normalizedRC, err := normalizeBaseURL(cfg.RemoteConfigURL, "remote config URL", cfg.AllowInsecurePrivateNetwork)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.RemoteConfigURL = normalizedRC
 	}
-	if parsed.User != nil {
-		return Config{}, fmt.Errorf("%w: ingest URL must not include user info", ErrInvalidConfig)
+
+	if cfg.SpoolDir != "" {
+		if cfg.SpoolMaxEvents <= 0 {
+			cfg.SpoolMaxEvents = defaultSpoolMaxEvents
+		}
+		if cfg.SpoolMaxBytes <= 0 {
+			cfg.SpoolMaxBytes = defaultSpoolMaxBytes
+		}
 	}
-	if parsed.RawQuery != "" {
-		return Config{}, fmt.Errorf("%w: ingest URL must not include query parameters", ErrInvalidConfig)
-	}
-	if parsed.Fragment != "" {
-		return Config{}, fmt.Errorf("%w: ingest URL must not include a fragment", ErrInvalidConfig)
-	}
-	if parsed.Path != "" && parsed.Path != "/" {
-		return Config{}, fmt.Errorf("%w: ingest URL must not include a path", ErrInvalidConfig)
-	}
-	parsed.Path = ""
-	parsed.RawPath = ""
-	parsed.ForceQuery = false
-	cfg.IngestURL = strings.TrimRight(parsed.String(), "/")
 
 	if cfg.BatchSize <= 0 {
 		cfg.BatchSize = defaultBatchSize
@@ -170,6 +234,37 @@ func normalizeConfig(cfg Config) (Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// normalizeBaseURL validates and normalizes a base endpoint URL (ingest or
+// remote-config): absolute, HTTPS outside loopback (or private networks when
+// explicitly allowed), and bare — no user info, query, fragment, or path —
+// with any trailing slash trimmed so equivalent spellings normalize
+// identically. label names the field in the returned error.
+func normalizeBaseURL(raw, label string, allowPrivate bool) (string, error) {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("%w: %s must be absolute", ErrInvalidConfig, label)
+	}
+	if parsed.Scheme != "https" && !allowInsecureURL(parsed, allowPrivate) {
+		return "", fmt.Errorf("%w: %s must use https outside localhost, loopback, or explicitly allowed private networks", ErrInvalidConfig, label)
+	}
+	if parsed.User != nil {
+		return "", fmt.Errorf("%w: %s must not include user info", ErrInvalidConfig, label)
+	}
+	if parsed.RawQuery != "" {
+		return "", fmt.Errorf("%w: %s must not include query parameters", ErrInvalidConfig, label)
+	}
+	if parsed.Fragment != "" {
+		return "", fmt.Errorf("%w: %s must not include a fragment", ErrInvalidConfig, label)
+	}
+	if parsed.Path != "" && parsed.Path != "/" {
+		return "", fmt.Errorf("%w: %s must not include a path", ErrInvalidConfig, label)
+	}
+	parsed.Path = ""
+	parsed.RawPath = ""
+	parsed.ForceQuery = false
+	return strings.TrimRight(parsed.String(), "/"), nil
 }
 
 func validSource(source Source) bool {

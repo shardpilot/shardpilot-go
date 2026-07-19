@@ -1,0 +1,1013 @@
+package shardpilot
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
+// unusedRemoteConfigTransport satisfies the transport interface's remote-
+// config method for fakes that never fetch configuration.
+type unusedRemoteConfigTransport struct{}
+
+func (unusedRemoteConfigTransport) FetchRemoteConfig(context.Context, remoteConfigRequest) (remoteConfigResponse, error) {
+	return remoteConfigResponse{}, errors.New("remote config fetch not faked")
+}
+
+func newRemoteConfigClient(t *testing.T, serverURL, cachePath, anonymousID string) *Client {
+	t.Helper()
+	client, err := NewClient(Config{
+		IngestURL:             serverURL,
+		Token:                 "test-token",
+		WorkspaceID:           "workspace-test",
+		AppID:                 "app-test",
+		EnvironmentID:         "develop",
+		Source:                SourceBackend,
+		AnonymousID:           anonymousID,
+		APIKey:                "test-rc-key",
+		RemoteConfigURL:       serverURL,
+		RemoteConfigCachePath: cachePath,
+		BatchSize:             2,
+		BufferSize:            4,
+		FlushInterval:         time.Hour,
+		HTTPTimeout:           time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	return client
+}
+
+func testRemoteConfigScope(serverURL string) string {
+	return buildRemoteConfigScope("workspace-test", "develop", "anon-rc-1", serverURL)
+}
+
+func writeRemoteConfigCacheFile(t *testing.T, path string, record rcCache) {
+	t.Helper()
+	payload, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("marshal cache record: %v", err)
+	}
+	if err := os.WriteFile(path, payload, 0o600); err != nil {
+		t.Fatalf("write cache record: %v", err)
+	}
+}
+
+func readRemoteConfigCacheFile(t *testing.T, path string) rcCache {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read cache record: %v", err)
+	}
+	var record rcCache
+	if err := json.Unmarshal(data, &record); err != nil {
+		t.Fatalf("unmarshal cache record: %v", err)
+	}
+	return record
+}
+
+func TestRemoteConfigRequestShape(t *testing.T) {
+	type seenRequest struct {
+		method      string
+		escapedPath string
+		auth        string
+		ifNoneMatch string
+		revision    string
+	}
+	seen := make(chan seenRequest, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- seenRequest{
+			method:      r.Method,
+			escapedPath: r.URL.EscapedPath(),
+			auth:        r.Header.Get("Authorization"),
+			ifNoneMatch: r.Header.Get("If-None-Match"),
+			revision:    r.Header.Get("X-ShardPilot-Schema-Revision"),
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"version":1,"values":{"k":"v"}}`))
+	}))
+	defer server.Close()
+
+	// The identifier carries a space, a slash, and a percent sign: each must
+	// arrive as exactly one escaped path segment byte sequence.
+	client := newRemoteConfigClient(t, server.URL, "", "anon id/1%x")
+	defer client.Close(context.Background())
+
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("FetchRemoteConfig: %v", err)
+	}
+	request := <-seen
+	if request.method != http.MethodGet {
+		t.Fatalf("expected GET, got %s", request.method)
+	}
+	if want := "/config/v1/workspace-test/develop/anon%20id%2F1%25x"; request.escapedPath != want {
+		t.Fatalf("expected path %q, got %q", want, request.escapedPath)
+	}
+	if request.auth != "Bearer test-rc-key" {
+		t.Fatalf("expected the publishable APIKey bearer, got %q", request.auth)
+	}
+	if request.ifNoneMatch != "" {
+		t.Fatalf("expected no If-None-Match without a cache, got %q", request.ifNoneMatch)
+	}
+	if request.revision != "" {
+		t.Fatalf("remote config request must never carry the schema-revision header, got %q", request.revision)
+	}
+}
+
+func TestRemoteConfigConfigValidation(t *testing.T) {
+	base := Config{
+		IngestURL:     "http://localhost:8080",
+		Token:         "test-token",
+		WorkspaceID:   "workspace-test",
+		AppID:         "app-test",
+		EnvironmentID: "develop",
+		Source:        SourceBackend,
+	}
+
+	missingKey := base
+	missingKey.RemoteConfigURL = "https://config.example.test"
+	if _, err := NewClient(missingKey); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("expected ErrInvalidConfig for RemoteConfigURL without APIKey, got %v", err)
+	}
+
+	for _, badURL := range []string{
+		"config.example.test",              // not absolute
+		"http://config.example.test",       // http outside loopback
+		"https://config.example.test/path", // path
+		"https://config.example.test?x=1",  // query
+		"https://config.example.test#frag", // fragment
+		"https://user@config.example.test", // user info
+		"http://192.168.1.10",              // private without opt-in
+	} {
+		cfg := base
+		cfg.APIKey = "test-rc-key"
+		cfg.RemoteConfigURL = badURL
+		if _, err := NewClient(cfg); !errors.Is(err, ErrInvalidConfig) {
+			t.Fatalf("expected remote config URL %q to be rejected, got %v", badURL, err)
+		}
+	}
+
+	private := base
+	private.APIKey = "test-rc-key"
+	private.RemoteConfigURL = "http://192.168.1.10"
+	private.AllowInsecurePrivateNetwork = true
+	client, err := NewClient(private)
+	if err != nil {
+		t.Fatalf("expected private remote config URL to be allowed with the opt-in, got %v", err)
+	}
+	_ = client.Close(context.Background())
+
+	// APIKey alone (no RemoteConfigURL) is valid — there is no both-set
+	// credential conflict in this SDK.
+	keyOnly := base
+	keyOnly.APIKey = "test-rc-key"
+	client, err = NewClient(keyOnly)
+	if err != nil {
+		t.Fatalf("expected APIKey without RemoteConfigURL to be valid, got %v", err)
+	}
+	if _, err := client.FetchRemoteConfig(context.Background()); err == nil || !strings.Contains(err.Error(), "remote_config_not_configured") {
+		t.Fatalf("expected remote_config_not_configured, got %v", err)
+	}
+	_ = client.Close(context.Background())
+}
+
+func TestRemoteConfigClientIDUnavailable(t *testing.T) {
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+
+	client := newRemoteConfigClient(t, server.URL, "", "")
+	defer client.Close(context.Background())
+
+	if _, err := client.FetchRemoteConfig(context.Background()); err == nil || !strings.Contains(err.Error(), "client_id_unavailable") {
+		t.Fatalf("expected client_id_unavailable, got %v", err)
+	}
+	if requests.Load() != 0 {
+		t.Fatalf("expected the failure before any network use, got %d requests", requests.Load())
+	}
+}
+
+func TestRemoteConfigFresh200ServesAndPersists(t *testing.T) {
+	body := `{"version":3,"values":{"speed":2.5,"title":"go","dark":false}}`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"v3"`)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer server.Close()
+
+	cachePath := filepath.Join(t.TempDir(), "rc-cache.json")
+	client := newRemoteConfigClient(t, server.URL, cachePath, "anon-rc-1")
+	defer client.Close(context.Background())
+	clock := &stubClock{now: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)}
+	client.clock = clock
+
+	result, err := client.FetchRemoteConfig(context.Background())
+	if err != nil {
+		t.Fatalf("FetchRemoteConfig: %v", err)
+	}
+	if result.FromCache || result.Reason != "" {
+		t.Fatalf("expected a fresh result, got %+v", result)
+	}
+	if !result.HasVersion || result.Version != 3 {
+		t.Fatalf("expected wrapper version 3, got %+v", result)
+	}
+	if result.Values["speed"] != 2.5 || result.Values["title"] != "go" || result.Values["dark"] != false {
+		t.Fatalf("unexpected values %+v", result.Values)
+	}
+	if _, present := result.Values["version"]; present {
+		t.Fatalf("wrapper version must never appear as a configuration value")
+	}
+
+	record := readRemoteConfigCacheFile(t, cachePath)
+	if record.Scope != testRemoteConfigScope(server.URL) {
+		t.Fatalf("unexpected persisted scope %q", record.Scope)
+	}
+	if record.ETag != `"v3"` {
+		t.Fatalf("expected the response ETag persisted, got %q", record.ETag)
+	}
+	if record.Body != body {
+		t.Fatalf("expected the raw response text persisted, got %q", record.Body)
+	}
+	if record.FetchedAtMS != clock.now.UnixMilli() {
+		t.Fatalf("expected fetched_at_ms %d, got %d", clock.now.UnixMilli(), record.FetchedAtMS)
+	}
+	if info, err := os.Stat(cachePath); err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("expected a 0600 cache file, got %v %v", info.Mode(), err)
+	}
+}
+
+func TestRemoteConfig304RenewsStampAndServesCache(t *testing.T) {
+	var ifNoneMatch atomic.Value
+	var mode atomic.Int64 // 0 = 200, 1 = 304
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if mode.Load() == 1 {
+			ifNoneMatch.Store(r.Header.Get("If-None-Match"))
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		w.Header().Set("ETag", `"v1"`)
+		_, _ = w.Write([]byte(`{"version":1,"values":{"k":"v"}}`))
+	}))
+	defer server.Close()
+
+	cachePath := filepath.Join(t.TempDir(), "rc-cache.json")
+	client := newRemoteConfigClient(t, server.URL, cachePath, "anon-rc-1")
+	defer client.Close(context.Background())
+	clock := &stubClock{now: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)}
+	client.clock = clock
+
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("fresh fetch: %v", err)
+	}
+	firstStamp := readRemoteConfigCacheFile(t, cachePath).FetchedAtMS
+
+	mode.Store(1)
+	clock.now = clock.now.Add(10 * time.Second)
+	result, err := client.FetchRemoteConfig(context.Background())
+	if err != nil {
+		t.Fatalf("revalidation fetch: %v", err)
+	}
+	if !result.FromCache || result.Reason != "" {
+		t.Fatalf("expected a clean cache-served revalidation, got %+v", result)
+	}
+	if result.Values["k"] != "v" || !result.HasVersion || result.Version != 1 {
+		t.Fatalf("unexpected revalidated result %+v", result)
+	}
+	if got := ifNoneMatch.Load(); got != `"v1"` {
+		t.Fatalf("expected If-None-Match %q, got %q", `"v1"`, got)
+	}
+	record := readRemoteConfigCacheFile(t, cachePath)
+	if record.FetchedAtMS != firstStamp+10_000 {
+		t.Fatalf("expected the freshness stamp renewed to %d, got %d", firstStamp+10_000, record.FetchedAtMS)
+	}
+	if record.ETag != `"v1"` {
+		t.Fatalf("expected the ETag kept, got %q", record.ETag)
+	}
+}
+
+// remoteConfigScriptServer answers each request from the front of script;
+// the last entry repeats.
+type rcScriptStep struct {
+	status  int
+	body    string
+	headers map[string]string
+	drop    bool // close the connection without responding (transport error)
+}
+
+func newRCScriptServer(t *testing.T, requests *atomic.Int64, script *atomic.Value) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests != nil {
+			requests.Add(1)
+		}
+		step := script.Load().(rcScriptStep)
+		if step.drop {
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err == nil {
+				_ = conn.Close()
+			}
+			return
+		}
+		for key, value := range step.headers {
+			w.Header().Set(key, value)
+		}
+		if step.status != http.StatusOK {
+			w.WriteHeader(step.status)
+		}
+		_, _ = w.Write([]byte(step.body))
+	}))
+}
+
+func TestRemoteConfigTransientOutcomesServeCacheThenFail(t *testing.T) {
+	var script atomic.Value
+	script.Store(rcScriptStep{status: 200, body: `{"version":1,"values":{"k":"v"}}`, headers: map[string]string{"ETag": `"v1"`}})
+	server := newRCScriptServer(t, nil, &script)
+	defer server.Close()
+
+	cachePath := filepath.Join(t.TempDir(), "rc-cache.json")
+	client := newRemoteConfigClient(t, server.URL, cachePath, "anon-rc-1")
+	defer client.Close(context.Background())
+
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("priming fetch: %v", err)
+	}
+	cacheBefore, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("read cache: %v", err)
+	}
+
+	transients := []struct {
+		step   rcScriptStep
+		reason string
+	}{
+		{rcScriptStep{status: 408, body: `{}`}, "transient_408"},
+		{rcScriptStep{status: 500, body: `oops`}, "transient_500"},
+		{rcScriptStep{status: 503, body: ``}, "transient_503"},
+		{rcScriptStep{drop: true}, "http_0"},
+		{rcScriptStep{status: 200, body: `not json`}, "malformed_response"},
+		{rcScriptStep{status: 200, body: `[]`}, "malformed_response"},
+		{rcScriptStep{status: 200, body: `{"pad":"` + strings.Repeat("a", rcMaxBodyBytes) + `"}`}, "malformed_response"},
+	}
+	for _, tc := range transients {
+		script.Store(tc.step)
+		result, err := client.FetchRemoteConfig(context.Background())
+		if err != nil {
+			t.Fatalf("%s: expected the cache served, got error %v", tc.reason, err)
+		}
+		if !result.FromCache || result.Reason != tc.reason {
+			t.Fatalf("expected cache-served %s, got %+v", tc.reason, result)
+		}
+		if result.Values["k"] != "v" {
+			t.Fatalf("%s: unexpected values %+v", tc.reason, result.Values)
+		}
+	}
+
+	cacheAfter, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("read cache: %v", err)
+	}
+	if string(cacheBefore) != string(cacheAfter) {
+		t.Fatalf("transient outcomes must never disturb the cache record")
+	}
+
+	// With no usable cache the same outcomes hard-fail with the same codes.
+	bare := newRemoteConfigClient(t, server.URL, "", "anon-rc-2")
+	defer bare.Close(context.Background())
+	script.Store(rcScriptStep{status: 503, body: ``})
+	if _, err := bare.FetchRemoteConfig(context.Background()); err == nil || !strings.Contains(err.Error(), "transient_503") {
+		t.Fatalf("expected transient_503 failure without a cache, got %v", err)
+	}
+}
+
+func TestRemoteConfigUnauthorizedFailsClosed(t *testing.T) {
+	var script atomic.Value
+	script.Store(rcScriptStep{status: 200, body: `{"values":{"k":"v"}}`, headers: map[string]string{"ETag": `"v1"`}})
+	server := newRCScriptServer(t, nil, &script)
+	defer server.Close()
+
+	cachePath := filepath.Join(t.TempDir(), "rc-cache.json")
+	client := newRemoteConfigClient(t, server.URL, cachePath, "anon-rc-1")
+	defer client.Close(context.Background())
+
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("priming fetch: %v", err)
+	}
+	cacheBefore, _ := os.ReadFile(cachePath)
+
+	for _, status := range []int{401, 403} {
+		script.Store(rcScriptStep{status: status, body: `{"error":{"code":"unauthorized"}}`})
+		_, err := client.FetchRemoteConfig(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "unauthorized") {
+			t.Fatalf("expected unauthorized for %d, got %v", status, err)
+		}
+		// Fail closed means refuse to serve — not delete: the cache file is
+		// byte-identical and the getter snapshot still serves.
+		cacheAfter, _ := os.ReadFile(cachePath)
+		if string(cacheBefore) != string(cacheAfter) {
+			t.Fatalf("%d must not disturb the cache file", status)
+		}
+		if got := client.RemoteConfigString("k", "fallback"); got != "v" {
+			t.Fatalf("%d must leave the getter snapshot intact, got %q", status, got)
+		}
+	}
+
+	// A later 200 with a valid credential resumes over the same cache file.
+	script.Store(rcScriptStep{status: 200, body: `{"values":{"k":"v2"}}`})
+	result, err := client.FetchRemoteConfig(context.Background())
+	if err != nil || result.Values["k"] != "v2" {
+		t.Fatalf("expected recovery after unauthorized, got %+v %v", result, err)
+	}
+}
+
+func TestRemoteConfigPermanentFailuresNeverServeCache(t *testing.T) {
+	var script atomic.Value
+	script.Store(rcScriptStep{status: 200, body: `{"values":{"k":"v"}}`})
+	server := newRCScriptServer(t, nil, &script)
+	defer server.Close()
+
+	cachePath := filepath.Join(t.TempDir(), "rc-cache.json")
+	client := newRemoteConfigClient(t, server.URL, cachePath, "anon-rc-1")
+	defer client.Close(context.Background())
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("priming fetch: %v", err)
+	}
+	cacheBefore, _ := os.ReadFile(cachePath)
+
+	for _, status := range []int{404, 413} {
+		script.Store(rcScriptStep{status: status, body: ``})
+		_, err := client.FetchRemoteConfig(context.Background())
+		want := "http_" + map[int]string{404: "404", 413: "413"}[status]
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("expected %s, got %v", want, err)
+		}
+		cacheAfter, _ := os.ReadFile(cachePath)
+		if string(cacheBefore) != string(cacheAfter) {
+			t.Fatalf("%d must not disturb the cache file", status)
+		}
+		if got := client.RemoteConfigString("k", "fallback"); got != "v" {
+			t.Fatalf("%d must leave the getter snapshot intact, got %q", status, got)
+		}
+	}
+}
+
+func TestRemoteConfigMalformedValuesMemberNeverFallsBack(t *testing.T) {
+	var script atomic.Value
+	server := newRCScriptServer(t, nil, &script)
+	defer server.Close()
+
+	client := newRemoteConfigClient(t, server.URL, "", "anon-rc-1")
+	defer client.Close(context.Background())
+
+	// A wrapper whose values member is not an object must be malformed —
+	// never served as an unwrapped payload (that would expose wrapper fields
+	// as configuration).
+	for _, body := range []string{
+		`{"version":1,"values":null}`,
+		`{"version":1,"values":[]}`,
+		`{"version":1,"values":"nope"}`,
+		`{"version":1,"values":5}`,
+	} {
+		script.Store(rcScriptStep{status: 200, body: body})
+		if _, err := client.FetchRemoteConfig(context.Background()); err == nil || !strings.Contains(err.Error(), "malformed_response") {
+			t.Fatalf("expected malformed_response for %s, got %v", body, err)
+		}
+	}
+}
+
+func TestRemoteConfigUnwrappedPayload(t *testing.T) {
+	var script atomic.Value
+	script.Store(rcScriptStep{status: 200, body: `{"version":7,"speed":1.5}`})
+	server := newRCScriptServer(t, nil, &script)
+	defer server.Close()
+
+	client := newRemoteConfigClient(t, server.URL, "", "anon-rc-1")
+	defer client.Close(context.Background())
+
+	result, err := client.FetchRemoteConfig(context.Background())
+	if err != nil {
+		t.Fatalf("FetchRemoteConfig: %v", err)
+	}
+	if result.HasVersion {
+		t.Fatalf("an unwrapped payload carries no wrapper version, got %+v", result)
+	}
+	// In an unwrapped payload a "version" KEY is configuration.
+	if result.Values["version"] != float64(7) || result.Values["speed"] != 1.5 {
+		t.Fatalf("unexpected unwrapped values %+v", result.Values)
+	}
+	if got := client.RemoteConfigNumber("version", 0); got != 7 {
+		t.Fatalf("expected the unwrapped version key served as configuration, got %v", got)
+	}
+	if _, has := client.RemoteConfigVersion(); has {
+		t.Fatalf("RemoteConfigVersion must report absent for an unwrapped payload")
+	}
+}
+
+func TestRemoteConfigTypedGetters(t *testing.T) {
+	var script atomic.Value
+	script.Store(rcScriptStep{status: 200, body: `{"values":{"s":"text","n":4,"flag":false,"nested":{"a":1},"list":[1,2]}}`})
+	server := newRCScriptServer(t, nil, &script)
+	defer server.Close()
+
+	client := newRemoteConfigClient(t, server.URL, "", "anon-rc-1")
+	defer client.Close(context.Background())
+
+	// Before any served snapshot: defaults and nil Values.
+	if got := client.RemoteConfigString("s", "default"); got != "default" {
+		t.Fatalf("expected the default pre-fetch, got %q", got)
+	}
+	if client.RemoteConfigValues() != nil {
+		t.Fatalf("expected nil Values before a served snapshot")
+	}
+
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("FetchRemoteConfig: %v", err)
+	}
+
+	if got := client.RemoteConfigString("s", "default"); got != "text" {
+		t.Fatalf("string getter: got %q", got)
+	}
+	if got := client.RemoteConfigNumber("n", 0); got != 4 {
+		t.Fatalf("number getter: got %v", got)
+	}
+	// A stored false must be servable — not collapsed into the default.
+	if got := client.RemoteConfigBool("flag", true); got != false {
+		t.Fatalf("bool getter must serve a stored false")
+	}
+	// Missing key AND type mismatch both serve the default.
+	if got := client.RemoteConfigString("missing", "default"); got != "default" {
+		t.Fatalf("missing key: got %q", got)
+	}
+	if got := client.RemoteConfigString("n", "default"); got != "default" {
+		t.Fatalf("type mismatch: got %q", got)
+	}
+	if got := client.RemoteConfigNumber("s", 9); got != 9 {
+		t.Fatalf("type mismatch: got %v", got)
+	}
+	if got := client.RemoteConfigBool("s", true); got != true {
+		t.Fatalf("type mismatch: got %v", got)
+	}
+
+	// Values and nested values are defensive copies: mutating them must not
+	// corrupt what later getters read.
+	values := client.RemoteConfigValues()
+	values["s"] = "mutated"
+	nested, _ := client.RemoteConfigValue("nested")
+	nested.(map[string]any)["a"] = 99.0
+	if got := client.RemoteConfigString("s", ""); got != "text" {
+		t.Fatalf("snapshot corrupted through Values copy: %q", got)
+	}
+	fresh, _ := client.RemoteConfigValue("nested")
+	if fresh.(map[string]any)["a"] != float64(1) {
+		t.Fatalf("snapshot corrupted through nested value copy: %+v", fresh)
+	}
+}
+
+func TestRemoteConfigGettersServeFromDiskPreFetch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("no fetch should happen in this test")
+	}))
+	defer server.Close()
+
+	cachePath := filepath.Join(t.TempDir(), "rc-cache.json")
+	writeRemoteConfigCacheFile(t, cachePath, rcCache{
+		Scope:       testRemoteConfigScope(server.URL),
+		ETag:        `"v1"`,
+		Body:        `{"version":2,"values":{"k":"from-disk"}}`,
+		FetchedAtMS: 1000,
+	})
+
+	client := newRemoteConfigClient(t, server.URL, cachePath, "anon-rc-1")
+	defer client.Close(context.Background())
+
+	if got := client.RemoteConfigString("k", "default"); got != "from-disk" {
+		t.Fatalf("expected the persisted snapshot served pre-fetch, got %q", got)
+	}
+	if version, has := client.RemoteConfigVersion(); !has || version != 2 {
+		t.Fatalf("expected the persisted wrapper version, got %v %v", version, has)
+	}
+}
+
+func TestRemoteConfigOtherScopeCacheIsMissAndOverwritten(t *testing.T) {
+	var sawIfNoneMatch atomic.Value
+	sawIfNoneMatch.Store("")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawIfNoneMatch.Store(r.Header.Get("If-None-Match"))
+		_, _ = w.Write([]byte(`{"values":{"k":"fresh"}}`))
+	}))
+	defer server.Close()
+
+	cachePath := filepath.Join(t.TempDir(), "rc-cache.json")
+	writeRemoteConfigCacheFile(t, cachePath, rcCache{
+		Scope:       buildRemoteConfigScope("other-workspace", "develop", "anon-rc-1", server.URL),
+		ETag:        `"stale"`,
+		Body:        `{"values":{"k":"other-scope"}}`,
+		FetchedAtMS: 1000,
+	})
+
+	client := newRemoteConfigClient(t, server.URL, cachePath, "anon-rc-1")
+	defer client.Close(context.Background())
+
+	// The other-scope record is a miss: never served, its ETag never sent.
+	if got := client.RemoteConfigString("k", "default"); got != "default" {
+		t.Fatalf("another scope's values must never be served, got %q", got)
+	}
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("FetchRemoteConfig: %v", err)
+	}
+	if got := sawIfNoneMatch.Load(); got != "" {
+		t.Fatalf("another scope's ETag must never be sent, got %q", got)
+	}
+	record := readRemoteConfigCacheFile(t, cachePath)
+	if record.Scope != testRemoteConfigScope(server.URL) {
+		t.Fatalf("expected the next successful fetch to overwrite the record, got scope %q", record.Scope)
+	}
+}
+
+func TestRemoteConfigCorruptCacheFileIsCleanStart(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"values":{"k":"recovered"}}`))
+	}))
+	defer server.Close()
+
+	cachePath := filepath.Join(t.TempDir(), "rc-cache.json")
+	if err := os.WriteFile(cachePath, []byte("not json at all"), 0o600); err != nil {
+		t.Fatalf("write corrupt cache: %v", err)
+	}
+
+	client := newRemoteConfigClient(t, server.URL, cachePath, "anon-rc-1")
+	defer client.Close(context.Background())
+
+	if got := client.RemoteConfigString("k", "default"); got != "default" {
+		t.Fatalf("a corrupt cache must be a miss, got %q", got)
+	}
+	result, err := client.FetchRemoteConfig(context.Background())
+	if err != nil || result.Values["k"] != "recovered" {
+		t.Fatalf("expected a clean recovery fetch, got %+v %v", result, err)
+	}
+	record := readRemoteConfigCacheFile(t, cachePath)
+	if record.Body != `{"values":{"k":"recovered"}}` {
+		t.Fatalf("expected the corrupt record overwritten, got %q", record.Body)
+	}
+}
+
+func TestRemoteConfigConcurrentFetchFenceRefusesLateOverwrite(t *testing.T) {
+	firstArrived := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) == 1 {
+			close(firstArrived)
+			<-releaseFirst
+			_, _ = w.Write([]byte(`{"values":{"k":"old"}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"values":{"k":"new"}}`))
+	}))
+	defer server.Close()
+
+	client := newRemoteConfigClient(t, server.URL, "", "anon-rc-1")
+	defer client.Close(context.Background())
+
+	firstResult := make(chan RemoteConfigResult, 1)
+	go func() {
+		result, err := client.FetchRemoteConfig(context.Background())
+		if err != nil {
+			t.Errorf("first fetch: %v", err)
+		}
+		firstResult <- result
+	}()
+	// The first fetch holds a lower sequence number: its request reached the
+	// server (so its seq was assigned) before the second fetch dispatches.
+	<-firstArrived
+
+	second, err := client.FetchRemoteConfig(context.Background())
+	if err != nil || second.Values["k"] != "new" {
+		t.Fatalf("second fetch: %+v %v", second, err)
+	}
+
+	close(releaseFirst)
+	first := <-firstResult
+	// The late first response still answers ITS caller...
+	if first.FromCache || first.Values["k"] != "old" {
+		t.Fatalf("the late fetch must still receive its own response, got %+v", first)
+	}
+	// ...but must not roll the snapshot back over the newer settled outcome.
+	if got := client.RemoteConfigString("k", "default"); got != "new" {
+		t.Fatalf("a late older response must not overwrite a newer settled one, got %q", got)
+	}
+}
+
+func TestRemoteConfigBackwardClockStampMonotonic(t *testing.T) {
+	var script atomic.Value
+	script.Store(rcScriptStep{status: 200, body: `{"values":{"k":"first"}}`})
+	server := newRCScriptServer(t, nil, &script)
+	defer server.Close()
+
+	cachePath := filepath.Join(t.TempDir(), "rc-cache.json")
+	client := newRemoteConfigClient(t, server.URL, cachePath, "anon-rc-1")
+	defer client.Close(context.Background())
+	clock := &stubClock{now: time.Date(2026, 7, 1, 12, 0, 0, 0, time.UTC)}
+	client.clock = clock
+
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("first fetch: %v", err)
+	}
+	firstStamp := readRemoteConfigCacheFile(t, cachePath).FetchedAtMS
+
+	// The wall clock jumps BACK an hour; the record installed now must still
+	// rank above the record it supersedes: superseded stamp + 1ms.
+	clock.now = clock.now.Add(-time.Hour)
+	script.Store(rcScriptStep{status: 200, body: `{"values":{"k":"second"}}`})
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("second fetch: %v", err)
+	}
+	record := readRemoteConfigCacheFile(t, cachePath)
+	if record.FetchedAtMS != firstStamp+1 {
+		t.Fatalf("expected the stamp raised to superseded+1 (%d), got %d", firstStamp+1, record.FetchedAtMS)
+	}
+	if record.Body != `{"values":{"k":"second"}}` {
+		t.Fatalf("expected the newer body persisted, got %q", record.Body)
+	}
+}
+
+func TestRemoteConfigFailedCacheWriteKeepsHeldSnapshot(t *testing.T) {
+	var script atomic.Value
+	script.Store(rcScriptStep{status: 200, body: `{"values":{"k":"served"}}`})
+	server := newRCScriptServer(t, nil, &script)
+	defer server.Close()
+
+	dir := t.TempDir()
+	cachePath := filepath.Join(dir, "rc-cache.json")
+	client := newRemoteConfigClient(t, server.URL, cachePath, "anon-rc-1")
+	defer client.Close(context.Background())
+
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	defer func() { _ = os.Chmod(dir, 0o700) }()
+	if probe, err := os.CreateTemp(dir, "probe-*"); err == nil {
+		// Running with privileges that ignore file modes (root): the failed
+		// write cannot be provoked this way.
+		_ = probe.Close()
+		_ = os.Remove(probe.Name())
+		t.Skip("directory permissions are not enforced in this environment")
+	}
+
+	result, err := client.FetchRemoteConfig(context.Background())
+	if err != nil {
+		t.Fatalf("the fetch itself must succeed despite the failed persist: %v", err)
+	}
+	if result.Values["k"] != "served" {
+		t.Fatalf("unexpected result %+v", result)
+	}
+	// The held in-memory record backs the getters and later offline fetches.
+	if got := client.RemoteConfigString("k", "default"); got != "served" {
+		t.Fatalf("expected the held snapshot to serve, got %q", got)
+	}
+	if stats := client.Snapshot(); stats.LastError != "remote_config_cache_persist_failed" {
+		t.Fatalf("expected remote_config_cache_persist_failed surfaced, got %q", stats.LastError)
+	}
+	script.Store(rcScriptStep{status: 503})
+	offline, err := client.FetchRemoteConfig(context.Background())
+	if err != nil || !offline.FromCache || offline.Values["k"] != "served" {
+		t.Fatalf("expected the held record served offline, got %+v %v", offline, err)
+	}
+}
+
+func TestRemoteConfigNotConsentGated(t *testing.T) {
+	var requests atomic.Int64
+	var script atomic.Value
+	script.Store(rcScriptStep{status: 200, body: `{"values":{"k":"v"}}`})
+	server := newRCScriptServer(t, &requests, &script)
+	defer server.Close()
+
+	cachePath := filepath.Join(t.TempDir(), "rc-cache.json")
+	client := newRemoteConfigClient(t, server.URL, cachePath, "anon-rc-1")
+	defer client.Close(context.Background())
+
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("priming fetch: %v", err)
+	}
+	cacheBefore, _ := os.ReadFile(cachePath)
+
+	client.SetConsent(false)
+	// The denial itself must not clear the cache record.
+	cacheAfterDenial, _ := os.ReadFile(cachePath)
+	if string(cacheBefore) != string(cacheAfterDenial) {
+		t.Fatalf("denied consent must not clear the remote-config cache")
+	}
+	// And the fetch is not consent-gated: it still reaches the network and
+	// serves (and refreshes) as usual.
+	result, err := client.FetchRemoteConfig(context.Background())
+	if err != nil || result.Values["k"] != "v" {
+		t.Fatalf("expected the fetch to work under denied consent, got %+v %v", result, err)
+	}
+	if requests.Load() < 2 {
+		t.Fatalf("expected the denied-consent fetch to reach the network, got %d requests", requests.Load())
+	}
+	if record := readRemoteConfigCacheFile(t, cachePath); record.Body != `{"values":{"k":"v"}}` {
+		t.Fatalf("expected the cache still healthy after the denied-consent fetch, got %q", record.Body)
+	}
+}
+
+func TestRemoteConfigCooldownShortCircuitsInsideWindow(t *testing.T) {
+	var requests atomic.Int64
+	var script atomic.Value
+	script.Store(rcScriptStep{status: 200, body: `{"values":{"k":"v"}}`})
+	server := newRCScriptServer(t, &requests, &script)
+	defer server.Close()
+
+	client := newRemoteConfigClient(t, server.URL, "", "anon-rc-1")
+	defer client.Close(context.Background())
+	clock := &stubClock{now: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)}
+	client.clock = clock
+
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("priming fetch: %v", err)
+	}
+
+	script.Store(rcScriptStep{status: 429, headers: map[string]string{"Retry-After": "7"}})
+	result, err := client.FetchRemoteConfig(context.Background())
+	if err != nil || !result.FromCache || result.Reason != "transient_429" {
+		t.Fatalf("expected the live 429 cache-served, got %+v %v", result, err)
+	}
+	sent := requests.Load()
+
+	// Inside the 7s window: zero HTTP requests, same cache-served outcome —
+	// indistinguishable from a live 429 to the caller.
+	clock.now = clock.now.Add(6 * time.Second)
+	result, err = client.FetchRemoteConfig(context.Background())
+	if err != nil || !result.FromCache || result.Reason != "transient_429" {
+		t.Fatalf("expected the in-window fetch cache-served as transient_429, got %+v %v", result, err)
+	}
+	if requests.Load() != sent {
+		t.Fatalf("an in-window fetch must not touch the network: %d -> %d requests", sent, requests.Load())
+	}
+
+	// Past the deadline the next fetch is real again.
+	script.Store(rcScriptStep{status: 200, body: `{"values":{"k":"after"}}`})
+	clock.now = clock.now.Add(2 * time.Second)
+	result, err = client.FetchRemoteConfig(context.Background())
+	if err != nil || result.FromCache || result.Values["k"] != "after" {
+		t.Fatalf("expected a real fetch after expiry, got %+v %v", result, err)
+	}
+	if requests.Load() != sent+1 {
+		t.Fatalf("expected exactly one more request after expiry, got %d", requests.Load()-sent)
+	}
+}
+
+func TestRemoteConfigCooldownWithoutCacheFails(t *testing.T) {
+	var requests atomic.Int64
+	var script atomic.Value
+	script.Store(rcScriptStep{status: 429, headers: map[string]string{"Retry-After": "30"}})
+	server := newRCScriptServer(t, &requests, &script)
+	defer server.Close()
+
+	client := newRemoteConfigClient(t, server.URL, "", "anon-rc-1")
+	defer client.Close(context.Background())
+	clock := &stubClock{now: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)}
+	client.clock = clock
+
+	if _, err := client.FetchRemoteConfig(context.Background()); err == nil || !strings.Contains(err.Error(), "transient_429") {
+		t.Fatalf("expected transient_429 without a cache, got %v", err)
+	}
+	sent := requests.Load()
+	clock.now = clock.now.Add(10 * time.Second)
+	if _, err := client.FetchRemoteConfig(context.Background()); err == nil || !strings.Contains(err.Error(), "transient_429") {
+		t.Fatalf("expected the in-window fetch to fail transient_429, got %v", err)
+	}
+	if requests.Load() != sent {
+		t.Fatalf("an in-window fetch must not touch the network")
+	}
+}
+
+func TestRemoteConfigCooldownFloorAndExpiry(t *testing.T) {
+	for _, header := range []string{"", "0", "soon", "-5", "1.5"} {
+		var requests atomic.Int64
+		var script atomic.Value
+		headers := map[string]string{}
+		if header != "" {
+			headers["Retry-After"] = header
+		}
+		script.Store(rcScriptStep{status: 429, headers: headers})
+		server := newRCScriptServer(t, &requests, &script)
+
+		client := newRemoteConfigClient(t, server.URL, "", "anon-rc-1")
+		clock := &stubClock{now: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)}
+		client.clock = clock
+
+		_, _ = client.FetchRemoteConfig(context.Background())
+		sent := requests.Load()
+
+		// An absent or malformed header floors at 1s: still in-window at
+		// +0.5s, expired at +1s.
+		clock.now = clock.now.Add(500 * time.Millisecond)
+		_, _ = client.FetchRemoteConfig(context.Background())
+		if requests.Load() != sent {
+			t.Fatalf("header %q: expected the +0.5s fetch inside the 1s floor window", header)
+		}
+		clock.now = clock.now.Add(500 * time.Millisecond)
+		_, _ = client.FetchRemoteConfig(context.Background())
+		if requests.Load() != sent+1 {
+			t.Fatalf("header %q: expected the +1s fetch to go out", header)
+		}
+
+		_ = client.Close(context.Background())
+		server.Close()
+	}
+}
+
+func TestRemoteConfigCooldownClamp(t *testing.T) {
+	var requests atomic.Int64
+	var script atomic.Value
+	script.Store(rcScriptStep{status: 429, headers: map[string]string{"Retry-After": "999999999"}})
+	server := newRCScriptServer(t, &requests, &script)
+	defer server.Close()
+
+	client := newRemoteConfigClient(t, server.URL, "", "anon-rc-1")
+	defer client.Close(context.Background())
+	clock := &stubClock{now: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)}
+	client.clock = clock
+
+	_, _ = client.FetchRemoteConfig(context.Background())
+	sent := requests.Load()
+
+	clock.now = clock.now.Add(24*time.Hour - time.Second)
+	_, _ = client.FetchRemoteConfig(context.Background())
+	if requests.Load() != sent {
+		t.Fatalf("expected the fetch just under 24h still inside the clamped window")
+	}
+	clock.now = clock.now.Add(2 * time.Second)
+	_, _ = client.FetchRemoteConfig(context.Background())
+	if requests.Load() != sent+1 {
+		t.Fatalf("expected the fetch past the 24h clamp to go out")
+	}
+}
+
+func TestRemoteConfigCooldownMonotonicMax(t *testing.T) {
+	rc := &remoteConfigState{}
+	now := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
+	rc.armCooldownLocked(now, remoteConfigResponse{retryAfterSeconds: 100, retryAfterPresent: true})
+	// A later, shorter Retry-After from a straggling concurrent response
+	// must never LOWER the armed deadline.
+	rc.armCooldownLocked(now, remoteConfigResponse{retryAfterSeconds: 5, retryAfterPresent: true})
+	if want := now.Add(100 * time.Second); !rc.cooldownUntil.Equal(want) {
+		t.Fatalf("expected the deadline kept at %v, got %v", want, rc.cooldownUntil)
+	}
+	rc.armCooldownLocked(now, remoteConfigResponse{retryAfterSeconds: 200, retryAfterPresent: true})
+	if want := now.Add(200 * time.Second); !rc.cooldownUntil.Equal(want) {
+		t.Fatalf("expected the deadline extended to %v, got %v", want, rc.cooldownUntil)
+	}
+}
+
+func TestRemoteConfigRetryAfterParseDigitsOnly(t *testing.T) {
+	cases := []struct {
+		header  string
+		seconds int
+		present bool
+	}{
+		{"", 0, false},
+		{"7", 7, true},
+		{" 7 ", 7, true},
+		{"0", 0, true},
+		{"-1", 0, false},
+		{"1.5", 0, false},
+		{"soon", 0, false},
+		// HTTP-date is deliberately NOT accepted on this route.
+		{"Wed, 01 Jul 2026 00:00:07 GMT", 0, false},
+		{"99999999999999999999", rcCooldownClampSeconds, true},
+		{"999999999", rcCooldownClampSeconds, true},
+	}
+	for _, tc := range cases {
+		seconds, present := parseRemoteConfigRetryAfter(tc.header)
+		if seconds != tc.seconds || present != tc.present {
+			t.Fatalf("header %q: got (%d, %v), want (%d, %v)", tc.header, seconds, present, tc.seconds, tc.present)
+		}
+	}
+}
+
+func TestRemoteConfigFetchAfterCloseReturnsErrClosed(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"values":{}}`))
+	}))
+	defer server.Close()
+
+	client := newRemoteConfigClient(t, server.URL, "", "anon-rc-1")
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if _, err := client.FetchRemoteConfig(context.Background()); !errors.Is(err, ErrClosed) {
+		t.Fatalf("expected ErrClosed, got %v", err)
+	}
+}

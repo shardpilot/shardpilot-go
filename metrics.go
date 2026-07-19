@@ -24,6 +24,23 @@ type Stats struct {
 	// is nil until a batch response carrying a per-event list is recorded.
 	ByStatus  map[EventStatus]uint64
 	LastError string
+
+	// Disk-spool counters (always zero when Config.SpoolDir is unset).
+	// Spooled counts events durably appended to the spool (survivors only —
+	// an append the caps immediately evicted from is not counted);
+	// SpoolResent counts spooled events successfully re-published from a
+	// previous process's record; SpoolEvicted counts oldest-first cap
+	// evictions; SpoolExpired counts retry-age-cap drops (older than 7 days,
+	// future-dated beyond the skew tolerance, or undatable); and
+	// SpoolPersistFailed counts failed spool record writes (the in-memory
+	// mirror stays authoritative and the write is retried on the flush
+	// cadence). Every SpoolEvicted/SpoolExpired drop is also reported through
+	// Config.OnSpoolDeadLetter.
+	Spooled            uint64
+	SpoolResent        uint64
+	SpoolEvicted       uint64
+	SpoolExpired       uint64
+	SpoolPersistFailed uint64
 }
 
 type statsCollector struct {
@@ -34,6 +51,12 @@ type statsCollector struct {
 	accepted      atomic.Uint64
 	rejected      atomic.Uint64
 	duplicates    atomic.Uint64
+
+	spooled            atomic.Uint64
+	spoolResent        atomic.Uint64
+	spoolEvicted       atomic.Uint64
+	spoolExpired       atomic.Uint64
+	spoolPersistFailed atomic.Uint64
 
 	mu        sync.Mutex
 	lastError string
@@ -53,15 +76,20 @@ func (s *statsCollector) snapshot() Stats {
 	s.mu.Unlock()
 
 	return Stats{
-		Enqueued:      s.enqueued.Load(),
-		Dropped:       s.dropped.Load(),
-		Published:     s.published.Load(),
-		FailedBatches: s.failedBatches.Load(),
-		Accepted:      s.accepted.Load(),
-		Rejected:      s.rejected.Load(),
-		Duplicates:    s.duplicates.Load(),
-		ByStatus:      byStatus,
-		LastError:     lastError,
+		Enqueued:           s.enqueued.Load(),
+		Dropped:            s.dropped.Load(),
+		Published:          s.published.Load(),
+		FailedBatches:      s.failedBatches.Load(),
+		Accepted:           s.accepted.Load(),
+		Rejected:           s.rejected.Load(),
+		Duplicates:         s.duplicates.Load(),
+		ByStatus:           byStatus,
+		LastError:          lastError,
+		Spooled:            s.spooled.Load(),
+		SpoolResent:        s.spoolResent.Load(),
+		SpoolEvicted:       s.spoolEvicted.Load(),
+		SpoolExpired:       s.spoolExpired.Load(),
+		SpoolPersistFailed: s.spoolPersistFailed.Load(),
 	}
 }
 
@@ -88,5 +116,14 @@ func (s *statsCollector) recordFailure(err error) {
 	s.failedBatches.Add(1)
 	s.mu.Lock()
 	s.lastError = err.Error()
+	s.mu.Unlock()
+}
+
+// setLastError surfaces a non-batch operational failure (a failed remote-
+// config cache or spool/consent record write) in Stats.LastError without
+// counting a failed batch — no batch failed.
+func (s *statsCollector) setLastError(message string) {
+	s.mu.Lock()
+	s.lastError = message
 	s.mu.Unlock()
 }

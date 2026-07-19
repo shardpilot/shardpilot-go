@@ -1,6 +1,8 @@
 package shardpilot
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -8,6 +10,37 @@ import (
 
 type batchRequest struct {
 	Events []eventEnvelope `json:"events"`
+
+	// rawEvents, when non-nil, is the exact wire serialization of the batch's
+	// envelopes, one JSON object per event. The request body is then built by
+	// joining THESE bytes verbatim (see MarshalJSON), so the bytes a failed
+	// batch spools to disk and the bytes a later resend puts on the wire are
+	// identical — the ingest service de-duplicates re-sends by event_id, and
+	// byte-identity is what makes a spooled re-send fold as a duplicate
+	// instead of risking drift. Spool-origin resends carry ONLY rawEvents
+	// (the typed Events are not reconstructed: a JSON round trip through Go
+	// values is not byte-stable).
+	rawEvents []json.RawMessage
+}
+
+// MarshalJSON emits {"events":[...]} by joining rawEvents verbatim when they
+// are present, bypassing any re-encoding of the envelope bytes; a request
+// without rawEvents (none is built by the SDK today) marshals normally.
+func (r batchRequest) MarshalJSON() ([]byte, error) {
+	if r.rawEvents == nil {
+		type plainBatchRequest batchRequest
+		return json.Marshal(plainBatchRequest(r))
+	}
+	var b bytes.Buffer
+	b.WriteString(`{"events":[`)
+	for i, raw := range r.rawEvents {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.Write(raw)
+	}
+	b.WriteString(`]}`)
+	return b.Bytes(), nil
 }
 
 type eventEnvelope struct {
@@ -79,16 +112,29 @@ func (c *Client) buildEnvelope(event Event) (eventEnvelope, error) {
 	}, nil
 }
 
+// buildBatch builds the wire request for a batch: each envelope is marshaled
+// exactly once here and the resulting bytes are what the request body joins
+// (and what the disk spool records on a retriable failure), so every publish
+// attempt, spool record, and spooled resend of an event carries identical
+// bytes. An envelope that cannot marshal (an unserializable Props value)
+// surfaces as an EncodeError — the same permanent class the transport-level
+// encode produced before.
 func (c *Client) buildBatch(events []Event) (batchRequest, error) {
 	envelopes := make([]eventEnvelope, 0, len(events))
+	raws := make([]json.RawMessage, 0, len(events))
 	for _, event := range events {
 		envelope, err := c.buildEnvelope(event)
 		if err != nil {
 			return batchRequest{}, err
 		}
+		raw, err := json.Marshal(envelope)
+		if err != nil {
+			return batchRequest{}, &EncodeError{Err: err}
+		}
 		envelopes = append(envelopes, envelope)
+		raws = append(raws, raw)
 	}
-	return batchRequest{Events: envelopes}, nil
+	return batchRequest{Events: envelopes, rawEvents: raws}, nil
 }
 
 func cloneMap(in map[string]any) map[string]any {
