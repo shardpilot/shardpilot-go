@@ -478,6 +478,33 @@ func (c *Client) initConsentFloor(chmod func(name string, mode os.FileMode) erro
 			c.consent.Store(consentStateDeniedForcedMinor)
 		}
 	}
+	if c.consentOutbox.pending() {
+		// Construction is a dispatch point: reloaded receipts must re-send
+		// promptly, not idle until the first flush tick (potentially
+		// FlushInterval away) or a caller-driven operation. The buffered
+		// nudge is consumed by the worker's select as soon as it starts.
+		c.wakeConsentDispatch()
+	}
+}
+
+// validateConsentFloorIdentity gates a consent decision on IN-CONTRACT
+// configured identifiers when the floor is enabled: any non-empty
+// Config.UserID/AnonymousID over the 512-byte clamp REJECTS the decision —
+// reject, never truncate, and never silently mint the receipt for a
+// DIFFERENT actor than events carry. Go's EVENT path deliberately has no
+// identifier clamp (the envelope stamps configured identifiers verbatim),
+// so a receipt minted for a fallback actor would authorize an actor the
+// events do not attribute to — on a strict-consent workspace the events
+// would be suppressed while the receipt reads as covered. Both identifiers
+// empty stays the documented local-only decision path.
+func (c *Client) validateConsentFloorIdentity() error {
+	if c.cfg.UserID != "" && !validConsentIdentifier(c.cfg.UserID) {
+		return ErrInvalidConsentIdentity
+	}
+	if c.cfg.AnonymousID != "" && !validConsentIdentifier(c.cfg.AnonymousID) {
+		return ErrInvalidConsentIdentity
+	}
+	return nil
 }
 
 // wakeConsentDispatch nudges the worker to run a consent dispatch pass
@@ -655,18 +682,14 @@ func (c *Client) drainConsentOutboxEvictions() {
 }
 
 // mintConsentReceipt builds a receipt at decision time under the floor. The
-// actor snapshot is the first VALID configured identifier (UserID
-// preferred; validity = non-empty and within the 512-byte clamp — rejected,
-// never truncated); no valid actor means no receipt (the decision still
-// applies locally). The anonymous-id retention snapshot rides only when
-// valid, and never on the wire.
+// actor snapshot is the configured actor exactly as events carry it (UserID
+// preferred, else AnonymousID) — validateConsentFloorIdentity already
+// rejected out-of-contract identifiers before the decision applied, so the
+// receipt's actor can never silently diverge from the events' actor. No
+// configured actor at all means no receipt (the decision still applies
+// locally). The anonymous-id retention snapshot never rides the wire.
 func (c *Client) mintConsentReceipt(analyticsGranted bool, reason string) (consentReceipt, bool) {
-	actor := ""
-	if validConsentIdentifier(c.cfg.UserID) {
-		actor = c.cfg.UserID
-	} else if validConsentIdentifier(c.cfg.AnonymousID) {
-		actor = c.cfg.AnonymousID
-	}
+	actor := firstNonEmpty(c.cfg.UserID, c.cfg.AnonymousID)
 	if actor == "" {
 		return consentReceipt{}, false
 	}

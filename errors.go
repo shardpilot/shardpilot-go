@@ -37,4 +37,14 @@ var (
 	// decision value that is not ConsentDecisionGranted,
 	// ConsentDecisionDenied, or ConsentDecisionDeniedForcedMinor.
 	ErrInvalidConsentDecision = errors.New("invalid shardpilot consent decision")
+
+	// ErrInvalidConsentIdentity rejects a consent decision under the opt-in
+	// consent floor when a configured identifier (Config.UserID or
+	// Config.AnonymousID) is non-empty but over the 512-byte receipt
+	// clamp: the floor requires in-contract identifiers, because events
+	// stamp the configured identifiers verbatim and a receipt minted for a
+	// substitute actor would authorize a DIFFERENT actor than the events
+	// carry. The decision is rejected whole — reject, never truncate —
+	// and NOTHING is applied. Never returned when the floor is off.
+	ErrInvalidConsentIdentity = errors.New("shardpilot consent identity exceeds the identifier clamp")
 )

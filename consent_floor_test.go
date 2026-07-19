@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -27,6 +29,7 @@ type floorTestServer struct {
 	batches           [][]string
 	consentStatus     int
 	consentRetryAfter string
+	batchStatus       int
 }
 
 func newFloorTestServer(t *testing.T) (*floorTestServer, *httptest.Server) {
@@ -50,8 +53,14 @@ func newFloorTestServer(t *testing.T) (*floorTestServer, *httptest.Server) {
 			state.mu.Lock()
 			state.order = append(state.order, "batch")
 			state.batches = append(state.batches, ids)
+			batchStatus := state.batchStatus
 			state.mu.Unlock()
 			w.Header().Set("Content-Type", "application/json")
+			if batchStatus != 0 && batchStatus != http.StatusAccepted {
+				w.WriteHeader(batchStatus)
+				fmt.Fprint(w, `{"error":{"code":"test","message":"test"}}`)
+				return
+			}
 			w.WriteHeader(http.StatusAccepted)
 			fmt.Fprintf(w, `{"accepted":%d,"rejected":0,"duplicates":0}`, len(ids))
 		case "/v1/consent":
@@ -93,6 +102,12 @@ func (s *floorTestServer) setConsentOutcome(status int, retryAfter string) {
 	defer s.mu.Unlock()
 	s.consentStatus = status
 	s.consentRetryAfter = retryAfter
+}
+
+func (s *floorTestServer) setBatchOutcome(status int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.batchStatus = status
 }
 
 func (s *floorTestServer) snapshotOrder() []string {
@@ -723,34 +738,66 @@ func TestConsentOutboxGarbledRecordLoadsEmpty(t *testing.T) {
 	}
 }
 
-func TestConsentFloorIdentifierClampOnReceiptPath(t *testing.T) {
+func TestConsentFloorRejectsOutOfContractIdentity(t *testing.T) {
 	state, server := newFloorTestServer(t)
 	defer server.Close()
 
-	// An oversized UserID is REJECTED (never truncated) and the receipt
-	// actor falls back to the valid AnonymousID.
+	// Go's EVENT path stamps configured identifiers verbatim (deliberately
+	// unclamped), so a receipt minted for a substitute actor would
+	// authorize a DIFFERENT actor than events carry. The floor therefore
+	// REJECTS a decision whole when a configured identifier is out of
+	// contract — reject, never truncate, never silently mint for a
+	// fallback actor.
 	oversized := strings.Repeat("u", maxConsentIdentifierBytes+1)
 	client := newFloorTestClient(t, server.URL, t.TempDir(), func(cfg *Config) {
 		cfg.UserID = oversized
 	})
+	if err := client.SetConsentDecision(ConsentDecisionGranted); !errors.Is(err, ErrInvalidConsentIdentity) {
+		t.Fatalf("expected ErrInvalidConsentIdentity, got %v", err)
+	}
+	// NOTHING was applied — not the state, not a receipt, not a wire post —
+	// and the void SetConsent surface rejects identically.
 	client.SetConsent(true)
+	if got := client.Consent(); got != ConsentUnknown {
+		t.Fatalf("expected the rejected decision to apply nothing, got %v", got)
+	}
+	if client.consentOutbox.pending() {
+		t.Fatalf("expected no receipt minted for a rejected decision")
+	}
 	if err := client.Close(context.Background()); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	if got := state.consentCount(); got != 1 {
-		t.Fatalf("expected the receipt delivered, got %d", got)
-	}
-	if actor := state.consentAt(0)["actor_identifier"]; actor != "anon-spool-1" {
-		t.Fatalf("expected the actor to fall back to the valid anonymous id, got %v", actor)
+	if got := state.consentCount(); got != 0 {
+		t.Fatalf("expected nothing transmitted for rejected decisions, got %d", got)
 	}
 
-	// With NO valid identifier the decision applies locally only: no
-	// receipt is minted, nothing reaches the wire, teardown completes.
-	dark := newFloorTestClient(t, server.URL, t.TempDir(), func(cfg *Config) {
-		cfg.UserID = oversized
-		cfg.AnonymousID = strings.Repeat("v", maxConsentIdentifierBytes+1)
+	// The 512-byte boundary is IN contract: accepted verbatim as the
+	// receipt actor — exactly what events carry.
+	boundary := strings.Repeat("b", maxConsentIdentifierBytes)
+	boundaryClient := newFloorTestClient(t, server.URL, t.TempDir(), func(cfg *Config) {
+		cfg.UserID = boundary
 	})
-	dark.SetConsent(false)
+	if err := boundaryClient.SetConsentDecision(ConsentDecisionGranted); err != nil {
+		t.Fatalf("SetConsentDecision at the boundary: %v", err)
+	}
+	if err := boundaryClient.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := state.consentCount(); got != 1 {
+		t.Fatalf("expected the boundary receipt delivered, got %d", got)
+	}
+	if actor := state.consentAt(0)["actor_identifier"]; actor != boundary {
+		t.Fatalf("expected the boundary identifier as the receipt actor, verbatim")
+	}
+
+	// With NO configured identifier at all the decision applies locally
+	// only (no receipt) — the documented no-actor path, not a rejection.
+	dark := newFloorTestClient(t, server.URL, t.TempDir(), func(cfg *Config) {
+		cfg.AnonymousID = ""
+	})
+	if err := dark.SetConsentDecision(ConsentDecisionDenied); err != nil {
+		t.Fatalf("SetConsentDecision with no identity: %v", err)
+	}
 	if got := dark.Consent(); got != ConsentDenied {
 		t.Fatalf("expected the decision applied locally, got %v", got)
 	}
@@ -758,7 +805,24 @@ func TestConsentFloorIdentifierClampOnReceiptPath(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 	if got := state.consentCount(); got != 1 {
-		t.Fatalf("expected no receipt for an invalid-identity decision, got %d", got)
+		t.Fatalf("expected no receipt for a no-identity decision, got %d", got)
+	}
+
+	// Floor OFF: no identity gate — the legacy fire-and-forget posture is
+	// unchanged (the clamp is floor-scoped; go's general event/identity
+	// path deliberately keeps today's behavior).
+	legacy := newFloorTestClient(t, server.URL, t.TempDir(), func(cfg *Config) {
+		cfg.ConsentFloor = nil
+		cfg.UserID = oversized
+	})
+	if err := legacy.SetConsentDecision(ConsentDecisionGranted); err != nil {
+		t.Fatalf("expected no identity gate with the floor off, got %v", err)
+	}
+	if err := legacy.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := state.consentCount(); got != 2 {
+		t.Fatalf("expected the legacy post despite the oversized identity, got %d", got)
 	}
 }
 
@@ -1140,4 +1204,262 @@ func TestConsentFloorEmptyBody2xxAcknowledges(t *testing.T) {
 	if err := client.Close(context.Background()); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
+}
+
+func TestConsentFloorCloseRunsDrainDespiteEventError(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the first grant acknowledged", func() bool {
+		return client.Snapshot().ConsentRecorded == 1
+	})
+
+	// Manufacture PENDING consent work that does NOT arm the gate: the
+	// second grant delivers and prunes, but the prune's rewrite fails —
+	// dirty with an EMPTY mirror, so the outbox is pending (the on-disk
+	// record is stale) while no retained grant holds the event legs. The
+	// flag is atomic: the worker's dispatch pass reads it concurrently.
+	writeErr := errors.New("disk full")
+	var failing atomic.Bool
+	failing.Store(true)
+	// Assigned under the outbox mutex: the worker's dispatch pass reads the
+	// seam under the same lock while it settles the first decision.
+	client.consentOutbox.mu.Lock()
+	client.consentOutbox.renameFn = func(oldpath, newpath string) error {
+		if failing.Load() {
+			return writeErr
+		}
+		return os.Rename(oldpath, newpath)
+	}
+	client.consentOutbox.mu.Unlock()
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the second grant acknowledged with its prune owed", func() bool {
+		return client.Snapshot().ConsentRecorded == 2 && client.consentOutbox.pending()
+	})
+
+	// A REAL, non-gate event-plane error at Close: the batch endpoint
+	// answers a terminal 400 for the queued event.
+	state.setBatchOutcome(http.StatusBadRequest)
+	if err := client.Enqueue(Event{ID: "evt-terminal-1", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	err := client.Close(context.Background())
+	// The consent drain ran DESPITE the event error, and its retryable
+	// verdict rides the fold — the cached terminal event error must not
+	// mask the pending state, or repeated Close calls could never retry
+	// the drain and the owed rewrite would be lost with the process.
+	var statusErr *HTTPStatusError
+	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected the terminal event outcome surfaced, got %v", err)
+	}
+	if !errors.Is(err, ErrConsentPending) {
+		t.Fatalf("expected the retryable consent verdict folded in, got %v", err)
+	}
+
+	// The retry path stays alive: heal the disk and a repeated Close lands
+	// the owed rewrite and completes.
+	failing.Store(false)
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("expected the retried Close to settle the owed write and complete, got %v", err)
+	}
+	_ = state
+}
+
+// eofOnConsentTransport fails consent POSTs at the SEND (a connection
+// closed before any status arrives — a bare io.EOF in the chain), while
+// delegating everything else to the real transport.
+type eofOnConsentTransport struct {
+	mu      sync.Mutex
+	failing bool
+}
+
+func (t *eofOnConsentTransport) setFailing(failing bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.failing = failing
+}
+
+func (t *eofOnConsentTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	t.mu.Lock()
+	failing := t.failing
+	t.mu.Unlock()
+	if failing && strings.HasSuffix(request.URL.Path, "/v1/consent") {
+		return nil, io.EOF
+	}
+	return http.DefaultTransport.RoundTrip(request)
+}
+
+func TestConsentFloorSendPathEOFStaysRetryable(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	transport := &eofOnConsentTransport{failing: true}
+	client := newFloorTestClient(t, server.URL, t.TempDir(), func(cfg *Config) {
+		cfg.HTTPClient = &http.Client{Transport: transport}
+	})
+	client.SetConsent(true)
+	// A send-path EOF observed NO status: it must classify retryable —
+	// never as an empty-body acknowledgement — so the receipt stays
+	// retained and nothing counts recorded.
+	waitFor(t, 3*time.Second, "the send failure counted", func() bool {
+		return client.Snapshot().ConsentFailed >= 1
+	})
+	if got := client.Snapshot().ConsentRecorded; got != 0 {
+		t.Fatalf("a send-path EOF must never acknowledge, got %d recorded", got)
+	}
+	if head, ok := client.consentOutbox.head(); !ok || !head.analyticsGranted() {
+		t.Fatalf("expected the grant receipt retained at the head, got (%v, %v)", head, ok)
+	}
+
+	// The endpoint heals: the retained receipt delivers.
+	transport.setFailing(false)
+	clearConsentDeferral(client)
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := state.consentCount(); got != 1 {
+		t.Fatalf("expected the retained receipt delivered after the heal, got %d", got)
+	}
+}
+
+func TestConsentFloorFlushDispatchesReceiptsUnderDenial(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+	state.setConsentOutcome(http.StatusServiceUnavailable, "3600")
+
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	client.SetConsent(true)
+	client.SetConsent(false)
+	if got := client.Consent(); got != ConsentDenied {
+		t.Fatalf("expected the denied state, got %v", got)
+	}
+
+	// Heal, drain any pending worker nudge so the EXPLICIT Flush is the
+	// dispatch point under test, and release the parked window.
+	state.setConsentOutcome(http.StatusOK, "")
+	select {
+	case <-client.consentWake:
+	default:
+	}
+	clearConsentDeferral(client)
+
+	// Receipt delivery is permitted — required — while consent is denied:
+	// the flush dispatches the retained trail even though the event legs
+	// refuse, synchronously in this call.
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	granted, denied := 0, 0
+	for i := 0; i < state.consentCount(); i++ {
+		if consentBoolCategory(t, state.consentAt(i)) {
+			granted++
+		} else {
+			denied++
+		}
+	}
+	if granted < 1 || denied < 1 {
+		t.Fatalf("expected the full trail delivered through the denied flush, got %d grants %d denials", granted, denied)
+	}
+	if err := client.Track(context.Background(), Event{Name: "e1"}); !errors.Is(err, ErrConsentDenied) {
+		t.Fatalf("expected the event legs still refused under the denial, got %v", err)
+	}
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestConsentFloorReloadedReceiptDispatchesWithoutCallerOps(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+	state.setConsentOutcome(http.StatusServiceUnavailable, "3600")
+
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the parked decision-time dispatch", func() bool {
+		return state.consentCount() >= 1
+	})
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close over the durable outbox: %v", err)
+	}
+
+	// Relaunch with the endpoint healed and NO caller operations at all:
+	// construction is a dispatch point — the reloaded receipt must re-send
+	// via the construction wake, not idle until a flush tick (an hour
+	// away) or a caller op.
+	state.setConsentOutcome(http.StatusOK, "")
+	relaunched := newFloorTestClient(t, server.URL, dir, nil)
+	waitFor(t, 3*time.Second, "the reloaded receipt re-sent by construction alone", func() bool {
+		return state.consentCount() >= 2
+	})
+	if err := relaunched.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestConsentFloorPostCloseDecisionLeavesNoDurableState(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the grant acknowledged", func() bool {
+		return client.Snapshot().ConsentRecorded == 1
+	})
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// A post-Close decision under the floor is memory-only IN FULL: no
+	// receipt AND no persisted decision — the next launch must not
+	// resurrect a decision whose receipt was never sent.
+	if err := client.SetConsentDecision(ConsentDecisionDenied); err != nil {
+		t.Fatalf("SetConsentDecision: %v", err)
+	}
+	if got := client.Consent(); got != ConsentDenied {
+		t.Fatalf("expected the post-Close decision applied in memory, got %v", got)
+	}
+	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentGranted {
+		t.Fatalf("expected the pre-Close granted record untouched, got (%v, %v)", recorded, ok)
+	}
+
+	// The next launch runs on the pre-Close state and transmits nothing
+	// new.
+	posts := state.consentCount()
+	relaunched := newFloorTestClient(t, server.URL, dir, nil)
+	if got := relaunched.Consent(); got != ConsentGranted {
+		t.Fatalf("expected the pre-Close persisted state as the live state, got %v", got)
+	}
+	if err := relaunched.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := state.consentCount(); got != posts {
+		t.Fatalf("expected no phantom transmissions at the next launch, got %d (was %d)", got, posts)
+	}
+}
+
+func TestPostCloseDecisionStillPersistsRecordWithoutFloor(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, func(cfg *Config) {
+		cfg.ConsentFloor = nil
+	})
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// Floor OFF keeps today's behavior byte-for-byte: a post-Close
+	// decision still writes the local record (it only ever gates the next
+	// launch's spool there, never the live state).
+	client.SetConsent(false)
+	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentDenied {
+		t.Fatalf("expected the post-Close record written with the floor off, got (%v, %v)", recorded, ok)
+	}
+	_ = state
 }

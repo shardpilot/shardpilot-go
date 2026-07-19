@@ -139,10 +139,16 @@ type Config struct {
 	//     the grant on the wire on a strict-consent workspace. Released the
 	//     moment the receipt is handed to the transport — never gated on its
 	//     acknowledgement — and an empty pipeline is never gated.
-	//   - Receipt identifiers are bounded: a UserID/AnonymousID over 512
-	//     BYTES is rejected for the receipt's actor snapshot (never
-	//     truncated — truncation could collide distinct identities), and
-	//     oversized entries are dropped fail-safe by the outbox sanitizer.
+	//   - The floor requires IN-CONTRACT identifiers: a non-empty
+	//     UserID/AnonymousID over 512 BYTES rejects a consent decision
+	//     whole (ErrInvalidConsentIdentity — reject, never truncate).
+	//     Events stamp configured identifiers verbatim, so a receipt minted
+	//     for a substitute actor would authorize a different actor than the
+	//     events carry; the floor refuses to create that divergence.
+	//     Oversized entries in a persisted outbox are dropped fail-safe by
+	//     the sanitizer.
+	//   - Decisions recorded after Close are memory-only in full (no
+	//     receipt, no persisted record): record decisions before Close.
 	ConsentFloor *ConsentFloorConfig
 
 	// SpoolMaxEvents caps how many undelivered events the disk spool retains;

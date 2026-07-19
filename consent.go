@@ -159,7 +159,12 @@ func (c *Client) SetConsent(analyticsGranted bool) {
 	if !analyticsGranted {
 		decision = ConsentDecisionDenied
 	}
-	c.applyConsentDecision(decision)
+	if err := c.applyConsentDecision(decision); err != nil {
+		// Only the floor's identity gate can reject here (the decision
+		// value is always valid), and this void legacy surface has nowhere
+		// to return it: surface loudly instead of applying half a decision.
+		c.logf("shardpilot consent: decision rejected, nothing applied: %v", err)
+	}
 }
 
 // SetConsentDecision records an explicit consent decision in its typed
@@ -183,11 +188,21 @@ func (c *Client) SetConsentDecision(decision ConsentDecision) error {
 	default:
 		return ErrInvalidConsentDecision
 	}
-	c.applyConsentDecision(decision)
-	return nil
+	return c.applyConsentDecision(decision)
 }
 
-func (c *Client) applyConsentDecision(decision ConsentDecision) {
+func (c *Client) applyConsentDecision(decision ConsentDecision) error {
+	if c.consentFloorEnabled() {
+		// The floor requires in-contract identifiers BEFORE anything
+		// applies: a configured identifier over the receipt clamp would
+		// force the receipt onto a different actor than events carry (go's
+		// event path stamps identifiers verbatim, deliberately unclamped),
+		// so the decision is rejected whole — reject, never truncate,
+		// never silently mint for a substitute actor.
+		if err := c.validateConsentFloorIdentity(); err != nil {
+			return err
+		}
+	}
 	analyticsGranted := decision == ConsentDecisionGranted
 	state := consentStateGranted
 	switch decision {
@@ -253,8 +268,17 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) {
 	// outside lifecycleMu: it fsyncs files, and event intake must not wait
 	// out a disk stall. The spool's own append gate re-checks the already
 	// stored live state under its lock, so a batch racing this section can
-	// never re-create a record the purge below condemns.
-	deadLetters := c.applySpoolConsent(decision)
+	// never re-create a record the purge below condemns. Under the FLOOR a
+	// post-Close decision is memory-only in full: with the persisted
+	// decision feeding the next launch's LIVE state, writing it here would
+	// resurrect a decision whose receipt was never sent (and never will
+	// be) — the floor's applied-locally-only means exactly the in-memory
+	// state, nothing durable. Floor-off keeps writing, unchanged: there the
+	// record only ever gates the next launch's spool, never the live state.
+	var deadLetters []SpoolDeadLetter
+	if admitted || !c.consentFloorEnabled() {
+		deadLetters = c.applySpoolConsent(decision)
+	}
 
 	var keyErr error
 	if c.consentFloorEnabled() {
@@ -337,6 +361,7 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) {
 	} else if keyErr != nil {
 		c.logf("shardpilot consent: generate idempotency key failed: %v", keyErr)
 	}
+	return nil
 }
 
 // consentTurnCondLocked returns the turn condition variable, materializing

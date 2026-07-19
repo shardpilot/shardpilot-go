@@ -431,21 +431,27 @@ func (c *Client) finishClose(ctx context.Context) error {
 			err = contextCause(ctx)
 		}
 	}
-	if err == nil || errors.Is(err, ErrConsentReceiptPending) {
-		// Consent-floor drain (no-op with the floor off): deliver retained
-		// receipts, retry an owed outbox write, and decline completion with
-		// ErrConsentPending when undelivered receipts could not be made
-		// durable — teardown must not silently lose a consent decision's
-		// receipt. Declined completion stays retryable (see the
-		// closeComplete branch above). A GATED final flush
-		// (ErrConsentReceiptPending — a parked grant held the event legs)
-		// must reach this drain too, and its verdict replaces the gate
-		// error: the gate error is transient and NOT what repeated Close
-		// calls should freeze on — the durability verdict is. The held
-		// events themselves are the spool close-remnant's business
-		// (grant-gated crash insurance), exactly as for any other
-		// undelivered remainder at teardown.
-		err = c.finalizeConsentOutbox(ctx)
+	// Consent-floor drain (no-op with the floor off): ALWAYS runs, whatever
+	// the event-plane outcome — deliver retained receipts, retry an owed
+	// outbox write, and decline completion with ErrConsentPending when
+	// undelivered receipts could not be made durable. Teardown must not
+	// silently lose a consent decision's receipt, and an event-plane
+	// failure (a terminal batch outcome, a context expiry, a gated flush)
+	// must never mask the RETRYABLE pending state: the event outcome is
+	// already settled — dropped, spooled as the close remnant, or reported —
+	// while pending receipts still have a path to safety through repeated
+	// Close, so the drain's verdict must stay observable. The verdicts are
+	// FOLDED with errors.Join: callers see both, and errors.Is(err,
+	// ErrConsentPending) keeps driving the retry branch above. The one
+	// substitution: a GATED final flush's ErrConsentReceiptPending is
+	// dropped in favor of the drain's verdict alone — the gate error is
+	// transient bookkeeping about the same receipts the drain just settled,
+	// not an event-plane outcome worth freezing.
+	consentErr := c.finalizeConsentOutbox(ctx)
+	if errors.Is(err, ErrConsentReceiptPending) {
+		err = consentErr
+	} else {
+		err = errors.Join(err, consentErr)
 	}
 
 	c.closeMu.Lock()
@@ -849,6 +855,12 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 	var firstErr error
 	for {
 		batch = c.dropBatchOnConsentEpoch(batch, seenConsentEpoch, backoffAttempt)
+		// Consent-floor receipts dispatch first (a dispatch point of the
+		// flush) — BEFORE the denied early-return below, because receipt
+		// delivery is permitted (required) while consent is denied: a
+		// parked grant-then-deny trail must still drain through an explicit
+		// Flush in a denied session, even though the EVENT legs refuse.
+		handedReceipts := c.dispatchConsentReceipts(ctx)
 		if c.consentDenied() {
 			dropped := len(batch) + c.queue.drainAll()
 			if dropped > 0 {
@@ -863,12 +875,10 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 			c.retainedRequest = batchRequest{}
 			return batch[:0], firstErr
 		}
-		// Consent-floor receipts dispatch first (a dispatch point of the
-		// flush), and a still-undispatched analytics-grant receipt holds the
-		// event legs: the flush reports ErrConsentReceiptPending instead of
+		// A still-undispatched analytics-grant receipt holds the event
+		// legs: the flush reports ErrConsentReceiptPending instead of
 		// letting queued events overtake the grant on the wire. An empty
 		// pipeline is never gated.
-		handedReceipts := c.dispatchConsentReceipts(ctx)
 		if c.grantReceiptGateArmed(handedReceipts) && (len(batch) > 0 || c.spoolHasResendWork() || len(c.queue.ch) > 0) {
 			return batch, ErrConsentReceiptPending
 		}
