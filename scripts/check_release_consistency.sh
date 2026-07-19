@@ -61,10 +61,22 @@ skill_gogets="$(grep -oE "go get github\.com/shardpilot/shardpilot-go@${semver_r
   fail "$skill_md: multiple install commands found (keep exactly one):"$'\n'"$skill_gogets"
 skill_goget_version="${skill_gogets##*@}"
 
-printf '%-29s %s\n' "README latest-tag claim:" "$readme_latest"
-printf '%-29s %s\n' "README install command tag:" "$readme_goget_version"
-printf '%-29s %s\n' "CHANGELOG topmost release:" "$changelog_latest"
-printf '%-29s %s\n' "SKILL.md install command tag:" "$skill_goget_version"
+# 5. The skill's user-facing prose claim ("pinned release tag `vX.Y.Z`") must
+#    name that same tag — the install command alone is not what readers (or
+#    AI tools) treat as the described-version statement. Exactly one such
+#    claim must exist so a stale duplicate cannot linger, and it must sit on
+#    a single line (like the README's latest-tag sentence) to stay greppable.
+skill_claims="$(grep -oE "pinned release tag \`${semver_re}\`" "$skill_md" || true)"
+[ -n "$skill_claims" ] || fail "$skill_md: no 'pinned release tag \`vX.Y.Z\`' claim found (the claim must appear on a single line)"
+[ "$(printf '%s\n' "$skill_claims" | wc -l)" -eq 1 ] || \
+  fail "$skill_md: multiple 'pinned release tag' claims found (keep exactly one):"$'\n'"$skill_claims"
+skill_claim_version="$(printf '%s\n' "$skill_claims" | grep -oE "$semver_re" | head -n 1)"
+
+printf '%-30s %s\n' "README latest-tag claim:" "$readme_latest"
+printf '%-30s %s\n' "README install command tag:" "$readme_goget_version"
+printf '%-30s %s\n' "CHANGELOG topmost release:" "$changelog_latest"
+printf '%-30s %s\n' "SKILL.md install command tag:" "$skill_goget_version"
+printf '%-30s %s\n' "SKILL.md pinned-release claim:" "$skill_claim_version"
 
 [ "$readme_latest" = "$changelog_latest" ] || \
   fail "README claims latest tag $readme_latest but CHANGELOG's topmost released section is $changelog_latest"
@@ -72,10 +84,12 @@ printf '%-29s %s\n' "SKILL.md install command tag:" "$skill_goget_version"
   fail "README's first install command targets $readme_goget_version but the latest-tag claim is $readme_latest"
 [ "$skill_goget_version" = "$readme_latest" ] || \
   fail "$skill_md pins $skill_goget_version but the README's latest-tag claim is $readme_latest (update the skill's Install section in the release PR)"
+[ "$skill_claim_version" = "$readme_latest" ] || \
+  fail "$skill_md's pinned-release claim names $skill_claim_version but the README's latest-tag claim is $readme_latest (update the skill's intro claim in the release PR)"
 
 if $release_mode; then
   if git rev-parse -q --verify "refs/tags/${readme_latest}" >/dev/null; then
-    printf '%-29s %s\n' "git tag exists:" "$readme_latest"
+    printf '%-30s %s\n' "git tag exists:" "$readme_latest"
   else
     fail "--release: git tag $readme_latest does not exist (create it at the release commit before publishing)"
   fi

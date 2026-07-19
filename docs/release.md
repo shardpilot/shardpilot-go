@@ -19,10 +19,10 @@ v1.
    - updates the README Installation section's latest-tag claims to match:
      the `go get github.com/shardpilot/shardpilot-go@vX.Y.Z` install command
      and the "`vX.Y.Z` is the latest tag." sentence, and
-   - updates the single install command in the Install section of
-     `.claude/skills/shardpilot-go-integration/SKILL.md` to the same tag
-     (and re-verifies the skill's behavioral claims against any surface
-     changes shipping in the release).
+   - updates `.claude/skills/shardpilot-go-integration/SKILL.md` to the same
+     tag in both its single install command and its single "pinned release
+     tag" intro claim (and re-verifies the skill's behavioral claims against
+     any surface changes shipping in the release).
 2. CI enforces the consistency: `scripts/check_release_consistency.sh` (the
    `release-consistency` job in `.github/workflows/ci.yml`) fails any PR
    where the README's latest-tag claim, the README's install command, the

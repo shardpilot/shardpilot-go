@@ -5,10 +5,11 @@ description: Use when integrating the ShardPilot Go SDK (shardpilot-go) into a G
 
 # Integrating the ShardPilot Go SDK
 
-This skill describes the SDK exactly as shipped in the pinned release tag
-`v0.4.0-alpha`. Every behavioral claim below was verified against that tag's
-source. Where the SDK does not have a capability, this skill says so — do not
-invent config fields, endpoints, or behaviors beyond what is documented here.
+This skill describes the SDK exactly as shipped in the
+pinned release tag `v0.4.0-alpha`. Every behavioral claim below was verified
+against that tag's source. Where the SDK does not have a capability, this
+skill says so — do not invent config fields, endpoints, or behaviors beyond
+what is documented here.
 
 ## What the SDK does today
 
@@ -47,8 +48,10 @@ go get github.com/shardpilot/shardpilot-go@v0.4.0-alpha
   prefer the pin above.
 - Pre-launch: there is no public production ingest endpoint yet. `IngestURL`
   is the base URL of the ShardPilot deployment you were given (or a local
-  stack). HTTPS is required outside localhost/loopback unless
-  `AllowInsecurePrivateNetwork` explicitly allows private-network HTTP.
+  stack). HTTPS is required outside localhost/loopback. The **analytics
+  client only** can opt into private-network HTTP via
+  `Config.AllowInsecurePrivateNetwork`; the crash client has no such option
+  and rejects any plain-HTTP URL outside localhost/loopback.
 
 ## Credentials
 
@@ -103,7 +106,14 @@ client, err := shardpilot.NewClient(shardpilot.Config{
 if err != nil {
     return err
 }
-defer client.Close(context.Background()) // flushes pending events, bounded by ctx
+defer func() {
+    // Close flushes pending events and consent receipts, bounded by its
+    // context — always give it a deadline so a degraded ingest cannot
+    // stall shutdown.
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    _ = client.Close(ctx)
+}()
 ```
 
 Required: `IngestURL`, `Token`, `WorkspaceID`, `AppID`, `EnvironmentID`, and a
@@ -207,8 +217,8 @@ Facts that keep integrations correct:
 
 ## Remote config
 
-**Not available in this SDK.** `v0.4.0-alpha` has no remote-config API — no
-fetch call, no getters, no cache. Do not generate remote-config code against
+**Not available in this SDK.** The pinned release has no remote-config API —
+no fetch call, no getters, no cache. Do not generate remote-config code against
 this SDK; if the integration needs server-driven tuning values, source them
 elsewhere.
 
@@ -242,6 +252,8 @@ crashClient, err := crash.NewClient(crash.ClientOptions{
 - `RecordBreadcrumb(name)` — ring buffer attached to subsequent events.
 - Events are PII-scrubbed and sanitized before send; retries default to 2
   attempts with backoff, honoring `Retry-After`.
+- The crash `IngestURL` must be HTTPS outside localhost/loopback — unlike
+  the analytics client, there is **no** private-network HTTP option here.
 
 **There is no client-side consent gating in `pkg/crash`** — no opt-out
 switch, no consent check before send (crash reporting operates as a
@@ -291,10 +303,15 @@ Run against your dev/staging deployment credentials, then check each item:
    `Snapshot().ByStatus` counting your event's status.
 3. **Consent suppression check.** If `OnBatchResult` shows
    `shardpilot.EventStatusSuppressedNoConsent` (`"suppressed_no_consent"`),
-   the workspace enforces strict consent and no grant is recorded
-   server-side for that actor — the 202 you got was NOT delivery. Record the
-   grant server-side (see the consent section) and re-test until the status
-   is `accepted`.
+   the actor's consent is withheld server-side and the 202 was NOT
+   delivery. That has two distinct causes — determine which before acting:
+   either **no decision is recorded** and the workspace enforces strict
+   consent, or the actor has an **explicitly recorded denial** (which
+   suppresses regardless of workspace mode). If the actor genuinely
+   consented, record the grant server-side (see the consent section) and
+   re-test until the status is `accepted`. If the denial is real, the
+   suppression is correct behavior — leave it in place; never overwrite an
+   opt-out just to make a verification pass.
 4. **Failure visibility.** Point `Token` at an invalid value once and
    confirm `Track` returns a `*shardpilot.HTTPStatusError` whose `ErrorCode`
    is `unauthorized`/`forbidden` — proves your error handling surfaces real
