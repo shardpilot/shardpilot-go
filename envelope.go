@@ -154,7 +154,12 @@ func (c *Client) buildBatchReusing(events []Event, retained batchRequest) (batch
 		reuse = 0
 	}
 	for i := 0; i < reuse; i++ {
-		if retained.Events[i].EventID != events[i].ID {
+		// Compare in the envelope's canonical form: buildEnvelope TRIMS a
+		// caller-supplied id before stamping it into the wire envelope, so a
+		// padded Event.ID must still match the retained (trimmed) event_id —
+		// a raw comparison would miss, rebuild, and drift from the bytes the
+		// failure already spooled under that same event_id.
+		if retained.Events[i].EventID != strings.TrimSpace(events[i].ID) {
 			reuse = i
 			break
 		}

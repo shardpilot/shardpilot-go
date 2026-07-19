@@ -23,8 +23,10 @@
   `Close` fails `ErrClosed`, and `Close` waits (bounded by its context) for in-flight
   fetches, so no fetch I/O or durable cache write outlives it. Deliberate delta vs
   Defold/Unity: a `429`'s `Retry-After` (digits-only, floor 1s, clamp 24h) arms an in-memory
-  cooldown, and an explicit fetch inside it serves the cache without touching the network —
-  the client half of the server-side remote-config fetch rate limit.
+  cooldown (sequence-fenced like installs: a stale `429` landing after a newer fetch already
+  settled an authoritative outcome does not arm it), and an explicit fetch inside it serves
+  the cache without touching the network — the client half of the server-side remote-config
+  fetch rate limit.
 
 - Bounded disk spool (GAP-075; closes the long-standing follow-up in `queue.go`): opt-in via
   `Config.SpoolDir`; 2000 events / 1 MiB caps with oldest-first eviction, and the record is
@@ -45,8 +47,9 @@
   instead of gating fresh work on it. Retriable failures (`429`/`5xx`/network) spool,
   terminal outcomes never do; a 7-day retry-age cap expires records whose age is
   unprovable, too old, or future-dated; and `Config.OnSpoolDeadLetter` fires on every drop
-  (capacity, expiry, terminal, consent). `Stats.Spooled` counts only durably written
-  events. One client per `SpoolDir` is the supported topology; as a safety net every save
+  (capacity, expiry, terminal, consent) — a capacity eviction reports only once the rewrite
+  that removed it from disk durably lands, never for an eviction a failed rewrite left
+  reloadable. `Stats.Spooled` counts only durably written events. One client per `SpoolDir` is the supported topology; as a safety net every save
   reloads and merges the on-disk record by `event_id` (union minus this process's settled
   ids, caps re-applied oldest-drop — a cap drop at merge time settles the local mirror and
   dead-letters locally-owned entries), so a sibling writer's undelivered records are never

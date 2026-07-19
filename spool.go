@@ -217,6 +217,16 @@ type diskSpool struct {
 	// operation to dead-letter and count outside the lock.
 	pendingCapacityDrops []spoolEntry
 
+	// deferredCapacityDrops holds cap-evicted entries whose REMOVING rewrite
+	// failed: the old record still carries them on disk, so the eviction is
+	// not final yet — a crash before a successful rewrite reloads and
+	// resends them. Their capacity dead-letters are deferred until the
+	// eviction durably lands (a later successful save, whose merge excludes
+	// them via settledIDs, or the record file's removal), at which point
+	// they move to pendingCapacityDrops; the callback thereby reports only
+	// FINAL undelivered outcomes, never an eviction the disk later undoes.
+	deferredCapacityDrops []spoolEntry
+
 	// uncountedIDs tracks entries accepted into the mirror under a FAILED
 	// record write: they were deliberately not counted as Spooled (nothing
 	// was durable). When a later save lands, the ones still mirrored have
@@ -337,6 +347,7 @@ func (s *diskSpool) saveLocked() error {
 		mergedBytes += len(entry.raw)
 	}
 	var capDropped map[string]struct{}
+	var capDrops []spoolEntry
 	for len(merged) > 0 && (len(merged) > s.maxEvents || mergedBytes > s.maxBytes) {
 		dropped := merged[0]
 		mergedBytes -= len(dropped.raw)
@@ -346,14 +357,15 @@ func (s *diskSpool) saveLocked() error {
 			// This process still claimed the entry: the mirror follows the
 			// written record, and the drop surfaces through the standard
 			// capacity dead-letter (drained by the client layer after the
-			// current operation).
+			// current operation) — once the write below lands; a failed
+			// write defers it (see deferredCapacityDrops).
 			if capDropped == nil {
 				capDropped = make(map[string]struct{})
 			}
 			capDropped[dropped.id] = struct{}{}
 			delete(s.ids, dropped.id)
 			s.totalBytes -= len(dropped.raw)
-			s.pendingCapacityDrops = append(s.pendingCapacityDrops, dropped)
+			capDrops = append(capDrops, dropped)
 		}
 	}
 	if capDropped != nil {
@@ -383,7 +395,18 @@ func (s *diskSpool) saveLocked() error {
 		err = writePrivateFileAtomic(s.filePath(), payload, s.renameFn, s.chmodFn)
 	}
 	s.dirty = err != nil
-	if err == nil && len(s.uncountedIDs) > 0 {
+	if err != nil {
+		// The rewrite that would have removed these merge evictions from
+		// disk did not land: their dead-letters wait for the save that does.
+		s.deferredCapacityDrops = append(s.deferredCapacityDrops, capDrops...)
+		return err
+	}
+	s.pendingCapacityDrops = append(s.pendingCapacityDrops, capDrops...)
+	// This record just landed WITHOUT every previously deferred eviction
+	// (settledIDs excluded them from the merge): those evictions are now
+	// final, so their capacity dead-letters release.
+	s.releaseDeferredCapacityDropsLocked()
+	if len(s.uncountedIDs) > 0 {
 		// Entries accepted under an earlier FAILED write just became
 		// durable, IF they are still mirrored (one removed before any
 		// successful write was never durably spooled and stays uncounted).
@@ -394,7 +417,19 @@ func (s *diskSpool) saveLocked() error {
 		}
 		s.uncountedIDs = make(map[string]struct{})
 	}
-	return err
+	return nil
+}
+
+// releaseDeferredCapacityDropsLocked moves evictions whose removal from disk
+// has now durably happened — a successful rewrite that excluded them, or the
+// record file's removal — into pendingCapacityDrops for the client layer to
+// dead-letter and count.
+func (s *diskSpool) releaseDeferredCapacityDropsLocked() {
+	if len(s.deferredCapacityDrops) == 0 {
+		return
+	}
+	s.pendingCapacityDrops = append(s.pendingCapacityDrops, s.deferredCapacityDrops...)
+	s.deferredCapacityDrops = nil
 }
 
 // takeCapacityDrops drains the locally-owned entries a merging save evicted
@@ -480,6 +515,8 @@ func (s *diskSpool) settleOwedWipeLocked() bool {
 		return false
 	}
 	s.owed = false
+	// The record file is gone: any deferred capacity evictions are final.
+	s.releaseDeferredCapacityDropsLocked()
 	// Best-effort: a marker that cannot be removed re-enters owed on the
 	// next start and re-runs this (idempotent) wipe.
 	_ = removeWipeOwedMarker(s.dir)
@@ -516,6 +553,8 @@ func (s *diskSpool) purge() (dropped []spoolEntry, err error) {
 		s.owed = false
 		_ = removeWipeOwedMarker(s.dir)
 	}
+	// The record file is gone: any deferred capacity evictions are final.
+	s.releaseDeferredCapacityDropsLocked()
 	return dropped, nil
 }
 
@@ -638,6 +677,13 @@ func (s *diskSpool) load(now time.Time) spoolLoadOutcome {
 	}
 	s.resend = append([]spoolEntry(nil), s.entries...)
 	outcome.persistFailed = s.saveLocked() != nil
+	if outcome.persistFailed && len(outcome.evicted) > 0 {
+		// Same deferral as append: the rewrite that would have removed the
+		// load-time evictions from disk failed, so their dead-letters wait
+		// for the save that durably lands.
+		s.deferredCapacityDrops = append(s.deferredCapacityDrops, outcome.evicted...)
+		outcome.evicted = nil
+	}
 	return outcome
 }
 
@@ -715,6 +761,12 @@ func (s *diskSpool) append(batch []spoolEntry, deadlineMS int64, now time.Time, 
 		for _, entry := range added {
 			s.uncountedIDs[entry.id] = struct{}{}
 		}
+		// The failed rewrite left the evicted entries in the on-disk record:
+		// a crash now would reload and resend them, so their capacity
+		// dead-letters defer until the eviction durably lands rather than
+		// reporting a drop the disk could still undo.
+		s.deferredCapacityDrops = append(s.deferredCapacityDrops, evicted...)
+		evicted = nil
 	}
 	return false, added, expired, evicted, persistFailed
 }

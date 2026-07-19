@@ -2028,3 +2028,120 @@ func TestSpoolInProcessRetryReusesRetainedBytes(t *testing.T) {
 	}
 	_ = client.Close(context.Background())
 }
+
+func TestSpoolRetryReusesRetainedBytesForPaddedID(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+	state.setOutcome(http.StatusInternalServerError, "internal_error", "")
+
+	dir := t.TempDir()
+	client := newSpoolTestClient(t, server.URL, dir, nil, nil)
+	client.SetConsent(true)
+
+	// The caller pads the id with whitespace; buildEnvelope trims it into
+	// the wire event_id, so the retained-request comparison must match in
+	// that same canonical form — a raw comparison would rebuild and drift.
+	nested := map[string]any{"k": "v1"}
+	if err := client.Enqueue(Event{ID: "  evt-pad-1  ", Name: "e1", Props: map[string]any{"nested": nested}}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Flush(context.Background()); err == nil {
+		t.Fatalf("expected the retriable failure surfaced")
+	}
+	spooled := readSpoolRecordFile(t, dir)
+	if len(spooled.Events) != 1 || !containsEventID(t, spooled.Events, "evt-pad-1") {
+		t.Fatalf("expected the failed batch spooled under the trimmed id, got %s", mustJSON(t, spooled.Events))
+	}
+
+	nested["k"] = "v2"
+	state.setOutcome(http.StatusAccepted, "", "")
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("retry Flush: %v", err)
+	}
+
+	bodies := state.allBodies()
+	if len(bodies) != 2 {
+		t.Fatalf("expected the failed attempt and its retry, got %d bodies", len(bodies))
+	}
+	firstWire := wireEventBytes(t, bodies[0])
+	retryWire := wireEventBytes(t, bodies[1])
+	if len(firstWire) != 1 || len(retryWire) != 1 {
+		t.Fatalf("expected single-event bodies, got %d/%d", len(firstWire), len(retryWire))
+	}
+	if retryWire[0] != firstWire[0] || retryWire[0] != string(spooled.Events[0]) {
+		t.Fatalf("padded-id retry drifted from the retained/spooled encoding:\n first: %s\n retry: %s\n spool: %s", firstWire[0], retryWire[0], spooled.Events[0])
+	}
+	if !strings.Contains(retryWire[0], `"v1"`) || strings.Contains(retryWire[0], `"v2"`) {
+		t.Fatalf("expected the retry to carry the retained pre-mutation encoding, got %s", retryWire[0])
+	}
+	_ = client.Close(context.Background())
+}
+
+func TestSpoolCapacityDeadLetterDeferredUntilEvictionDurable(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+	state.setOutcome(http.StatusInternalServerError, "internal_error", "")
+
+	dir := t.TempDir()
+	recorder := &spoolDeadLetterRecorder{}
+	client := newSpoolTestClient(t, server.URL, dir, recorder, func(cfg *Config) {
+		cfg.SpoolMaxEvents = 1
+	})
+	client.SetConsent(true)
+
+	// evt-defer-1 spools durably first.
+	if err := client.Enqueue(Event{ID: "evt-defer-1", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Flush(context.Background()); err == nil {
+		t.Fatalf("expected the retriable failure surfaced")
+	}
+	if got := len(readSpoolRecordFile(t, dir).Events); got != 1 {
+		t.Fatalf("expected the first event durably spooled, got %d", got)
+	}
+
+	// The next append evicts it over the 1-event cap — but the removing
+	// rewrite FAILS, so the old record (still carrying evt-defer-1) stays on
+	// disk. A crash here would reload and resend it: the capacity
+	// dead-letter must therefore NOT fire yet.
+	injectedErr := errors.New("injected rename failure")
+	client.spool.renameFn = func(string, string) error { return injectedErr }
+	if err := client.Enqueue(Event{ID: "evt-defer-2", Name: "e2"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Flush(context.Background()); err == nil {
+		t.Fatalf("expected the retriable failure surfaced")
+	}
+	if letters := recorder.byReason(SpoolDropCapacity); len(letters) != 0 {
+		t.Fatalf("a capacity drop whose rewrite failed must not dead-letter yet, got %+v", letters)
+	}
+	if stats := client.Snapshot(); stats.SpoolEvicted != 0 {
+		t.Fatalf("expected SpoolEvicted deferred with the letter, got %+v", stats)
+	}
+	if record := readSpoolRecordFile(t, dir); !containsEventID(t, record.Events, "evt-defer-1") {
+		t.Fatalf("expected the old record still on disk while the rewrite fails, got %s", mustJSON(t, record.Events))
+	}
+
+	// The write path recovers: the flush-cadence retry lands the record
+	// WITHOUT the evicted entry — the eviction is now final, so the deferred
+	// capacity dead-letter fires exactly once.
+	client.spool.renameFn = os.Rename
+	client.spoolMaintain()
+	record := readSpoolRecordFile(t, dir)
+	if len(record.Events) != 1 || !containsEventID(t, record.Events, "evt-defer-2") {
+		t.Fatalf("expected the landed record to carry only the survivor, got %s", mustJSON(t, record.Events))
+	}
+	letters := recorder.byReason(SpoolDropCapacity)
+	if len(letters) != 1 || len(letters[0].Envelopes) != 1 || !containsEventID(t, letters[0].Envelopes, "evt-defer-1") {
+		t.Fatalf("expected exactly the evicted event dead-lettered once the eviction landed, got %+v", letters)
+	}
+	if stats := client.Snapshot(); stats.SpoolEvicted != 1 {
+		t.Fatalf("expected SpoolEvicted counted at the durable eviction, got %+v", stats)
+	}
+	client.spoolMaintain()
+	if got := recorder.byReason(SpoolDropCapacity); len(got) != 1 {
+		t.Fatalf("expected the deferred letter released exactly once, got %+v", got)
+	}
+	state.setOutcome(http.StatusAccepted, "", "")
+	_ = client.Close(context.Background())
+}

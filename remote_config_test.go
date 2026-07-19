@@ -1414,3 +1414,190 @@ func TestRemoteConfigCloseFencesInFlightFetch(t *testing.T) {
 		t.Fatalf("expected ErrClosed for a post-close fetch, got %v", err)
 	}
 }
+
+func TestRemoteConfigCacheWriteDoesNotChmodSharedParent(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"values":{"k":"v"}}`))
+	}))
+	defer server.Close()
+
+	// RemoteConfigCachePath names a FILE in a directory the caller chose —
+	// here a shared 0755 one (think /tmp or an XDG cache dir). A cache write
+	// must not re-mode it: the tighten-to-0700 side effect is reserved for
+	// the dedicated SpoolDir state directory the SDK owns.
+	shared := filepath.Join(t.TempDir(), "shared")
+	if err := os.Mkdir(shared, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Chmod(shared, 0o755); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	cachePath := filepath.Join(shared, "rc-cache.json")
+
+	client := newRemoteConfigClient(t, server.URL, cachePath, "anon-rc-1")
+	defer client.Close(context.Background())
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("FetchRemoteConfig: %v", err)
+	}
+
+	info, err := os.Stat(shared)
+	if err != nil {
+		t.Fatalf("stat shared dir: %v", err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Fatalf("expected the pre-existing shared parent left at 0755, got %v", info.Mode().Perm())
+	}
+	fileInfo, err := os.Stat(cachePath)
+	if err != nil {
+		t.Fatalf("stat cache file: %v", err)
+	}
+	if fileInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("expected the cache file itself private 0600, got %v", fileInfo.Mode().Perm())
+	}
+	if record := readRemoteConfigCacheFile(t, cachePath); record.Body != `{"values":{"k":"v"}}` {
+		t.Fatalf("expected the record written through the untouched parent, got %+v", record)
+	}
+}
+
+func TestRemoteConfigSkippedInstallDoesNotAdoptOrMoveGetters(t *testing.T) {
+	arrived := make(chan struct{}, 1)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		arrived <- struct{}{}
+		<-release
+		_, _ = w.Write([]byte(`{"values":{"k":"C"}}`))
+	}))
+	defer server.Close()
+
+	cachePath := filepath.Join(t.TempDir(), "rc-cache.json")
+	// Constructed with NO cache file: rc.held stays nil (nothing preloads),
+	// which is exactly the corner where the adoption branch used to run for
+	// a guard-skipped fresh 200.
+	client := newRemoteConfigClient(t, server.URL, cachePath, "anon-rc-1")
+	defer client.Close(context.Background())
+	scope := testRemoteConfigScope(server.URL)
+
+	// Another process writes record A after construction; this fetch
+	// dispatches against it...
+	base := time.Now().UnixMilli()
+	writeRemoteConfigCacheFile(t, cachePath, rcCache{
+		Scope: scope, ETag: `"a"`, Body: `{"values":{"k":"A"}}`, FetchedAtMS: base,
+	})
+	fetchDone := make(chan RemoteConfigResult, 1)
+	go func() {
+		result, fetchErr := client.FetchRemoteConfig(context.Background())
+		if fetchErr != nil {
+			t.Errorf("in-flight fetch: %v", fetchErr)
+		}
+		fetchDone <- result
+	}()
+	<-arrived
+	// ...and refreshes it to a FRESHER record B (different body) while the
+	// 200 response is still in flight, so the install guard skips.
+	fresher := rcCache{
+		Scope: scope, ETag: `"b"`, Body: `{"values":{"k":"B"}}`, FetchedAtMS: base + 10_000,
+	}
+	writeRemoteConfigCacheFile(t, cachePath, fresher)
+	close(release)
+
+	result := <-fetchDone
+	// The fetch's caller still receives ITS response...
+	if result.FromCache || result.Values["k"] != "C" {
+		t.Fatalf("expected the in-flight fetch to serve its own response, got %+v", result)
+	}
+	// ...the fresher durable record stays...
+	if record := readRemoteConfigCacheFile(t, cachePath); record.Body != fresher.Body || record.FetchedAtMS != fresher.FetchedAtMS {
+		t.Fatalf("expected the fresher durable record kept, got %+v", record)
+	}
+	// ...and the skip installs NOTHING: no adoption of the at-dispatch
+	// record, no skipped-200 values in the getters — the snapshot a skipped
+	// install would have mismatched stays exactly where it was (empty here).
+	if got := client.RemoteConfigString("k", "fallback"); got != "fallback" {
+		t.Fatalf("expected the getter snapshot untouched by the skipped install, got %q", got)
+	}
+}
+
+func TestRemoteConfigStaleLate429DoesNotArmCooldown(t *testing.T) {
+	var requests atomic.Int64
+	firstArrived := make(chan struct{}, 1)
+	releaseFirst := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) == 1 {
+			firstArrived <- struct{}{}
+			<-releaseFirst
+			w.Header().Set("Retry-After", "3600")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write([]byte(`{"values":{"k":"fresh"}}`))
+	}))
+	defer server.Close()
+
+	client := newRemoteConfigClient(t, server.URL, filepath.Join(t.TempDir(), "rc-cache.json"), "anon-rc-1")
+	defer client.Close(context.Background())
+
+	// Fetch 1 dispatches and stalls inside the server...
+	firstDone := make(chan error, 1)
+	go func() {
+		_, fetchErr := client.FetchRemoteConfig(context.Background())
+		firstDone <- fetchErr
+	}()
+	<-firstArrived
+	// ...fetch 2 dispatches later and settles a fresh 200 FIRST...
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("newer fetch: %v", err)
+	}
+	// ...then the stalled 429 lands: an outdated backpressure instruction
+	// from before the endpoint provably served fresh configuration.
+	close(releaseFirst)
+	if err := <-firstDone; err == nil || !strings.Contains(err.Error(), "transient_429") {
+		t.Fatalf("expected the stale fetch's own transient_429 outcome (it dispatched with no cache), got %v", err)
+	}
+
+	// The stale 429 must NOT have armed the cooldown: a third fetch hits the
+	// network instead of being cache-served inside a phantom window.
+	result, err := client.FetchRemoteConfig(context.Background())
+	if err != nil {
+		t.Fatalf("post-stale fetch: %v", err)
+	}
+	if result.FromCache || result.Values["k"] != "fresh" {
+		t.Fatalf("expected a live network fetch, not a cooldown cache serve, got %+v", result)
+	}
+	if got := requests.Load(); got != 3 {
+		t.Fatalf("expected the third fetch on the wire (3 requests), got %d", got)
+	}
+}
+
+func TestRemoteConfigOversizedCacheFileIgnoredWithoutFullUse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"values":{"k":"fresh"}}`))
+	}))
+	defer server.Close()
+
+	// A cache file over the bounded read limit — a previous buggy version,
+	// tampering, or simply not this SDK's record. It must be treated as
+	// corrupt (clean start) without being loaded whole.
+	cachePath := filepath.Join(t.TempDir(), "rc-cache.json")
+	huge := make([]byte, rcCacheReadLimit+1)
+	for i := range huge {
+		huge[i] = 'x'
+	}
+	if err := os.WriteFile(cachePath, huge, 0o600); err != nil {
+		t.Fatalf("write oversized cache: %v", err)
+	}
+
+	client := newRemoteConfigClient(t, server.URL, cachePath, "anon-rc-1")
+	defer client.Close(context.Background())
+	if got := client.RemoteConfigString("k", "fallback"); got != "fallback" {
+		t.Fatalf("expected no preload from an over-limit cache file, got %q", got)
+	}
+
+	// A fresh fetch works over it and overwrites it with a bounded record.
+	result, err := client.FetchRemoteConfig(context.Background())
+	if err != nil || result.FromCache || result.Values["k"] != "fresh" {
+		t.Fatalf("expected a clean live fetch over the discarded cache, got %+v %v", result, err)
+	}
+	if record := readRemoteConfigCacheFile(t, cachePath); record.Body != `{"values":{"k":"fresh"}}` {
+		t.Fatalf("expected the oversized file overwritten by the fresh record, got %d body bytes", len(record.Body))
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -376,17 +377,34 @@ func applyRemoteConfig(cache *rcCache, resp remoteConfigResponse, nowMS int64) (
 	return result, nil, false, nil, failure
 }
 
+// rcCacheReadLimit bounds how much of the durable cache file is ever read
+// back: twice the response-body cap plus a fixed framing overhead. The body
+// rides the record as a JSON string, and escaping a valid JSON text at worst
+// doubles it (each `"`, `\`, and inter-token whitespace control byte escapes
+// to two bytes; valid JSON text carries no raw control characters inside
+// strings), so a record this client could have written fits with room to
+// spare — a larger file is not such a record and is treated as corrupt
+// without ever being loaded whole, mirroring the spool's bounded record
+// read.
+const rcCacheReadLimit = 2*rcMaxBodyBytes + 64<<10
+
 // durableRecord loads the usable durable record for the given scope, or nil.
 // A record written for any other (workspace, environment, client, url) tuple
 // is a miss: its values are never served and its ETag is never sent. So is a
-// record whose body no longer parses — corrupt cache is a clean start. The
-// next successful fetch overwrites it.
+// record whose body no longer parses, or a file over the bounded read limit
+// — corrupt cache is a clean start, decided before unbounded memory is spent
+// reading it. The next successful fetch overwrites it.
 func (rc *remoteConfigState) durableRecord(scope string) *rcCache {
 	if rc.cachePath == "" {
 		return nil
 	}
-	data, err := os.ReadFile(rc.cachePath)
+	file, err := os.Open(rc.cachePath)
 	if err != nil {
+		return nil
+	}
+	data, err := io.ReadAll(io.LimitReader(file, rcCacheReadLimit+1))
+	_ = file.Close()
+	if err != nil || int64(len(data)) > rcCacheReadLimit {
 		return nil
 	}
 	var record rcCache
@@ -419,20 +437,25 @@ func (rc *remoteConfigState) loadCacheLocked() *rcCache {
 // saveDurable persists the cache record atomically: full write to a private
 // temp file in the same directory (0600), then rename over the final path —
 // rename rather than the anonymous-ID helper's no-overwrite link, because
-// this record must be overwritable by design.
+// this record must be overwritable by design. The write is create-only for
+// parents (nil chmod): RemoteConfigCachePath names a FILE in a directory the
+// caller chose — often shared (/tmp, an XDG cache dir) — so a pre-existing
+// parent's permissions are never changed; tightening is reserved for the
+// dedicated SpoolDir state directory the SDK owns.
 func (rc *remoteConfigState) saveDurable(record *rcCache) error {
 	payload, err := json.Marshal(record)
 	if err != nil {
 		return err
 	}
-	return writePrivateFileAtomic(rc.cachePath, payload, os.Rename, os.Chmod)
+	return writePrivateFileAtomic(rc.cachePath, payload, os.Rename, nil)
 }
 
 // tombstoneDurable clears the durable record (best-effort) by overwriting it
 // with an empty object, which no scope matches — a restart then starts from
-// the caller's defaults rather than from rolled-back values.
+// the caller's defaults rather than from rolled-back values. Create-only for
+// parents, like saveDurable.
 func (rc *remoteConfigState) tombstoneDurable() {
-	_ = writePrivateFileAtomic(rc.cachePath, []byte("{}"), os.Rename, os.Chmod)
+	_ = writePrivateFileAtomic(rc.cachePath, []byte("{}"), os.Rename, nil)
 }
 
 // ensurePrivateDir creates dir with the SDK's private mode and TIGHTENS an
@@ -460,14 +483,23 @@ func ensurePrivateDir(dir string, chmod func(name string, mode os.FileMode) erro
 }
 
 // writePrivateFileAtomic writes payload to path with the SDK's private-file
-// discipline: parent directories ensured private 0700 (pre-existing looser
-// modes are tightened, see ensurePrivateDir), a fully written and synced 0600
-// temp file in the same directory, then an atomic publish via the given
-// rename.
+// discipline: parent directories ensured private 0700, a fully written and
+// synced 0600 temp file in the same directory, then an atomic publish via
+// the given rename. A non-nil chmod additionally TIGHTENS a pre-existing
+// looser parent to 0700 (see ensurePrivateDir) — for paths inside the
+// dedicated SpoolDir state directory the SDK owns. A nil chmod is
+// create-only: directories the write creates are 0700, but a pre-existing
+// parent's permissions are never changed — for RemoteConfigCachePath, whose
+// parent is an arbitrary caller-chosen (possibly shared) directory that a
+// cache write must not lock other users out of.
 func writePrivateFileAtomic(path string, payload []byte, rename func(oldpath, newpath string) error, chmod func(name string, mode os.FileMode) error) error {
 	dir := filepath.Dir(path)
 	if dir != "." {
-		if err := ensurePrivateDir(dir, chmod); err != nil {
+		if chmod == nil {
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				return err
+			}
+		} else if err := ensurePrivateDir(dir, chmod); err != nil {
 			return err
 		}
 	}
@@ -557,10 +589,15 @@ func (rc *remoteConfigState) installLocked(seq uint64, result RemoteConfigResult
 		// while this response was in flight, may reflect a newer server
 		// state than this response — the two cannot be ordered from here.
 		// Raising this record's stamp above it and saving would roll the
-		// durable configuration back, so the install is skipped (the fetched
-		// values are still served to this fetch's caller; getters never
-		// regress, and the next load converges on the freshest record).
-		record = nil
+		// durable configuration back, so the install is skipped ENTIRELY:
+		// returning here (never falling through to the adoption branch)
+		// keeps the getter snapshot untouched too — falling through would
+		// adopt the at-dispatch record as held while installing the SKIPPED
+		// response's values into the getters, a mismatched pair that rolls
+		// getters back over the newer durable configuration. The fetched
+		// values are still served to this fetch's caller; the next load
+		// converges on the freshest record.
+		return persistFailed
 	}
 	switch {
 	case record != nil:
@@ -736,7 +773,13 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 	result, newCache, authoritative, revalidated, failure := applyRemoteConfig(cache, resp, now.UnixMilli())
 
 	rc.mu.Lock()
-	if resp.status == 429 {
+	if resp.status == 429 && seq > rc.settled[rc.scope] {
+		// The cooldown is fenced by the same per-scope sequence as installs:
+		// a stale 429 that arrives AFTER a newer fetch already settled an
+		// authoritative outcome (a fresh 200, say) is an outdated
+		// backpressure instruction — arming it would suppress later fetches
+		// for a window the server has already moved past, even though the
+		// stale response's result is otherwise ignored.
 		rc.armCooldownLocked(now, resp)
 	}
 	persistFailed := rc.installLocked(seq, result, failure == "", newCache, authoritative, cache, revalidated)
