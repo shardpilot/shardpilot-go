@@ -78,7 +78,13 @@ func validConsentIdentifier(identifier string) bool {
 // consentReceipt is one stored outbox entry — the canonical receipt fields,
 // minted ONCE at decision time and re-sent verbatim (same idempotency key,
 // same decided_at, never re-stamped). AnonymousID is retention-only
-// metadata and NEVER rides the wire body.
+// metadata and NEVER rides the wire body. Categories.Analytics is a
+// POINTER deliberately: a malformed or legacy entry with the category
+// absent must be distinguishable from an explicit denial — JSON's zero
+// value for a plain bool would silently turn "field missing" into
+// "analytics: false", and a resend of that fabricated denial could
+// overwrite a previously granted actor server-side. The sanitizer drops
+// absent-category entries as malformed instead.
 type consentReceipt struct {
 	IdempotencyKey  string `json:"idempotency_key"`
 	WorkspaceID     string `json:"workspace_id"`
@@ -86,11 +92,18 @@ type consentReceipt struct {
 	EnvironmentID   string `json:"environment_id"`
 	ActorIdentifier string `json:"actor_identifier"`
 	Categories      struct {
-		Analytics bool `json:"analytics"`
+		Analytics *bool `json:"analytics"`
 	} `json:"categories"`
 	DecidedAt   string `json:"decided_at"`
 	Reason      string `json:"reason,omitempty"`
 	AnonymousID string `json:"anonymous_id,omitempty"`
+}
+
+// analyticsGranted reads the receipt's analytics category, false when the
+// category is absent (only sanitized receipts — where it is always present
+// — are ever dispatched or gated on).
+func (r consentReceipt) analyticsGranted() bool {
+	return r.Categories.Analytics != nil && *r.Categories.Analytics
 }
 
 // consentOutboxWire is the consent-outbox.json payload.
@@ -101,13 +114,18 @@ type consentOutboxWire struct {
 
 // sanitizeConsentReceipt validates one stored entry and copies it down to
 // exactly the known fields. An entry survives only with every required
-// field a non-empty string, the actor identifier within the byte clamp, and
-// the optional fields absent or valid; anything else — a truncated entry, a
-// garbled field, an oversized legacy identifier — is dropped fail-safe:
-// never sent, never a crash, never blocking the deliverable rest.
+// field a non-empty string, the actor identifier within the byte clamp,
+// the analytics category PRESENT (an absent category is a malformed entry,
+// never an implicit denial — see the type comment), and the optional
+// fields absent or valid; anything else — a truncated entry, a garbled
+// field, an oversized legacy identifier — is dropped fail-safe: never
+// sent, never a crash, never blocking the deliverable rest.
 func sanitizeConsentReceipt(entry consentReceipt) (consentReceipt, bool) {
 	if entry.IdempotencyKey == "" || entry.WorkspaceID == "" || entry.AppID == "" ||
 		entry.EnvironmentID == "" || entry.DecidedAt == "" {
+		return consentReceipt{}, false
+	}
+	if entry.Categories.Analytics == nil {
 		return consentReceipt{}, false
 	}
 	if !validConsentIdentifier(entry.ActorIdentifier) {
@@ -126,7 +144,10 @@ func sanitizeConsentReceipt(entry consentReceipt) (consentReceipt, bool) {
 		Reason:          entry.Reason,
 		AnonymousID:     entry.AnonymousID,
 	}
-	sanitized.Categories.Analytics = entry.Categories.Analytics
+	// A fresh pointer, never an alias into the loaded entry: the copy-down
+	// must own every byte it keeps.
+	analytics := *entry.Categories.Analytics
+	sanitized.Categories.Analytics = &analytics
 	return sanitized, true
 }
 
@@ -219,12 +240,19 @@ func (o *consentOutbox) load() {
 			continue
 		}
 		loaded = append(loaded, sanitized)
-		if len(loaded) == maxConsentOutboxEntries {
-			break
-		}
+	}
+	evicted := 0
+	for len(loaded) > maxConsentOutboxEntries {
+		// The cap trims OLDEST first at load exactly as it does on save: an
+		// over-cap legacy record keeps its NEWEST receipts — the newest
+		// decisions are the operative ones, and dropping them instead would
+		// resend only stale history.
+		loaded = loaded[1:]
+		evicted++
 	}
 	o.mu.Lock()
 	o.receipts = loaded
+	o.evictedSinceSave += evicted
 	o.mu.Unlock()
 }
 
@@ -367,7 +395,7 @@ func (o *consentOutbox) grantPendingDispatch(handed map[string]struct{}) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	for _, entry := range o.receipts {
-		if !entry.Categories.Analytics {
+		if !entry.analyticsGranted() {
 			continue
 		}
 		if _, wasHanded := handed[entry.IdempotencyKey]; !wasHanded {
@@ -411,6 +439,47 @@ func (c *Client) consentFloorEnabled() bool {
 	return c.cfg.ConsentFloor != nil
 }
 
+// initConsentFloor runs the construction-time consent-floor lifecycle,
+// before the worker starts. Persisted floor state — the receipt outbox AND
+// the decision that becomes the LIVE state — may be trusted only through a
+// state directory whose privacy is established, the same
+// ensurePrivateDir-first gate initSpool applies before trusting spool.json:
+// in a directory that cannot be tightened to 0700, a stale or planted
+// grant/outbox entry could otherwise start the client live-granted or
+// transmit fabricated receipts. A refused tighten starts the floor
+// FAIL-CLOSED instead: undecided state, empty outbox, surfaced through
+// Stats.LastError — and every later durable outbox write keeps failing
+// through this same gate inside writePrivateFileAtomic, so the owed-write
+// machinery and Close's ErrConsentPending backstop apply (the on-disk files
+// are left in place for a later run with the permissions fixed). The
+// worker's first dispatch pass re-sends reloaded receipts BEFORE any event
+// batch — the retained grant itself is the dispatch gate; no deferral state
+// persists across launches, and none is needed. chmod is injectable so
+// tests can exercise the refused-tighten gate deterministically.
+func (c *Client) initConsentFloor(chmod func(name string, mode os.FileMode) error) {
+	c.consentOutbox = newConsentOutbox(c.cfg.SpoolDir)
+	if c.cfg.SpoolDir == "" {
+		return
+	}
+	if err := ensurePrivateDir(c.cfg.SpoolDir, chmod); err != nil {
+		c.stats.setLastError("spool_dir_private_failed")
+		c.logf("shardpilot consent floor: the state directory could not be made private (0700); persisted floor state is not loaded and the floor starts undecided with an empty outbox: %v", err)
+		return
+	}
+	c.consentOutbox.load()
+	c.drainConsentOutboxEvictions()
+	if state, ok := loadConsentRecord(c.cfg.SpoolDir, consentActorDigest(c.cfg)); ok {
+		switch state {
+		case ConsentGranted:
+			c.consent.Store(consentStateGranted)
+		case ConsentDenied:
+			c.consent.Store(consentStateDenied)
+		case ConsentDeniedForcedMinor:
+			c.consent.Store(consentStateDeniedForcedMinor)
+		}
+	}
+}
+
 // wakeConsentDispatch nudges the worker to run a consent dispatch pass
 // promptly (non-blocking; one pending nudge is enough). No-op with the
 // floor off.
@@ -433,7 +502,7 @@ func consentReceiptWire(receipt consentReceipt) consentRequest {
 		AppID:           receipt.AppID,
 		EnvironmentID:   receipt.EnvironmentID,
 		ActorIdentifier: receipt.ActorIdentifier,
-		Categories:      map[string]bool{"analytics": receipt.Categories.Analytics},
+		Categories:      map[string]bool{"analytics": receipt.analyticsGranted()},
 		DecidedAt:       receipt.DecidedAt,
 		IdempotencyKey:  receipt.IdempotencyKey,
 		Reason:          receipt.Reason,
@@ -463,12 +532,17 @@ func consentDeliveryRetryable(err error) bool {
 // transport; an acknowledgement prunes and chains the next, a retryable
 // failure parks the plane (server Retry-After on 429 AND 5xx, else jittered
 // backoff) and stops, a terminal outcome drops the receipt (diagnosed) and
-// chains. Returns the idempotency keys handed to the transport during THIS
-// pass — the dispatch gate releases exactly those (release-on-dispatch,
-// never on acknowledgement). Never dispatches after teardown began: Close's
-// own final drain is the last dispatch point. An owed durable write is
+// chains. Each attempt is bounded by the SOONER of the caller's context and
+// HTTPTimeout — caller-driven dispatch points (Track, Flush, Close) pass
+// their own context so a caller deadline or cancellation bounds the consent
+// POST too; the worker's automatic points pass background. An attempt ended
+// by the CALLER's own context is no outcome: the receipt stays at the head,
+// nothing is counted, no deferral is armed (the same no-outcome discipline
+// as callerAbandonedFlush). Returns the idempotency keys handed to the
+// transport during THIS pass — the dispatch gate releases exactly those
+// (release-on-dispatch, never on acknowledgement). An owed durable write is
 // retried first — every dispatch point is also a persistence retry point.
-func (c *Client) dispatchConsentReceipts() map[string]struct{} {
+func (c *Client) dispatchConsentReceipts(ctx context.Context) map[string]struct{} {
 	if !c.consentFloorEnabled() {
 		return nil
 	}
@@ -493,8 +567,8 @@ func (c *Client) dispatchConsentReceipts() map[string]struct{} {
 			return handed
 		}
 		handed[receipt.IdempotencyKey] = struct{}{}
-		ctx, cancel := context.WithTimeout(context.Background(), c.cfg.HTTPTimeout)
-		_, err := c.transport.PublishConsent(ctx, consentReceiptWire(receipt))
+		attemptCtx, cancel := contextWithDefaultTimeout(ctx, c.cfg.HTTPTimeout)
+		_, err := c.transport.PublishConsent(attemptCtx, consentReceiptWire(receipt))
 		cancel()
 		if err == nil {
 			c.stats.consentRecorded.Add(1)
@@ -507,6 +581,13 @@ func (c *Client) dispatchConsentReceipts() map[string]struct{} {
 			}
 			c.drainConsentOutboxEvictions()
 			continue
+		}
+		if ctx != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
+				// The CALLER's own context ended the attempt (cancellation
+				// or its deadline): an abort, not an endpoint outcome.
+				return handed
+			}
 		}
 		c.stats.consentFailed.Add(1)
 		c.stats.setLastConsentError(err.Error())
@@ -603,7 +684,7 @@ func (c *Client) mintConsentReceipt(analyticsGranted bool, reason string) (conse
 		DecidedAt:       c.clock.Now().UTC().Format(time.RFC3339),
 		Reason:          reason,
 	}
-	receipt.Categories.Analytics = analyticsGranted
+	receipt.Categories.Analytics = &analyticsGranted
 	if validConsentIdentifier(c.cfg.AnonymousID) {
 		receipt.AnonymousID = c.cfg.AnonymousID
 	}
@@ -611,17 +692,17 @@ func (c *Client) mintConsentReceipt(analyticsGranted bool, reason string) (conse
 }
 
 // finalizeConsentOutbox is Close's consent-floor drain: one last dispatch
-// pass (delivering what the endpoint will take), then the durability
-// verdict — teardown completes only when nothing undelivered remains OR
-// every retained receipt is safely on disk (durable backend, no owed
-// write), where it re-sends at the next launch. Otherwise ErrConsentPending:
-// the process exiting now would lose the receipts; a repeated Close retries
-// both the delivery and the owed write.
-func (c *Client) finalizeConsentOutbox() error {
+// pass (delivering what the endpoint will take, bounded by the Close
+// context), then the durability verdict — teardown completes only when
+// nothing undelivered remains OR every retained receipt is safely on disk
+// (durable backend, no owed write), where it re-sends at the next launch.
+// Otherwise ErrConsentPending: the process exiting now would lose the
+// receipts; a repeated Close retries both the delivery and the owed write.
+func (c *Client) finalizeConsentOutbox(ctx context.Context) error {
 	if !c.consentFloorEnabled() {
 		return nil
 	}
-	c.dispatchConsentReceipts()
+	c.dispatchConsentReceipts(ctx)
 	if attempted, failed := c.consentOutbox.retryPersist(); attempted {
 		if failed {
 			c.recordConsentOutboxPersistFailure()

@@ -221,6 +221,19 @@ func (t *httpTransport) PublishConsent(ctx context.Context, request consentReque
 	// The schema-revision header is a batch-endpoint contract; the consent
 	// route must never carry it.
 	if err := t.postJSON(ctx, t.consentEndpoint, request, &result, ""); err != nil {
+		if errors.Is(err, io.EOF) {
+			// A 2xx with an EMPTY body (a 204, or an empty 200): the decode
+			// hit clean EOF, but the consent contract is that ANY 2xx
+			// acknowledges the write — the status is the acknowledgement,
+			// the body is optional. Treating it as retryable would retain
+			// an already-accepted receipt forever: a grant would keep
+			// gating events and Close would keep reporting pending work.
+			// (postJSON decodes only after the 2xx check, so a decode EOF
+			// implies the status already passed; a TRUNCATED body —
+			// ErrUnexpectedEOF — stays retryable, and the server
+			// de-duplicates the re-send by idempotency key.)
+			return consentResult{}, nil
+		}
 		return consentResult{}, err
 	}
 	return result, nil

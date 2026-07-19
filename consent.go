@@ -264,17 +264,23 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) {
 		// nudged to dispatch promptly. Receipts are an append-only decision
 		// trail: a later decision never withdraws an earlier receipt (a
 		// grant-then-deny delivers BOTH, in order), so after a denial no
-		// stale grant is ever the server's last word.
-		reason := ""
-		if decision == ConsentDecisionDeniedForcedMinor {
-			reason = consentDecisionReason
-		}
-		if receipt, ok := c.mintConsentReceipt(analyticsGranted, reason); ok {
-			if c.consentOutbox.append(receipt) {
-				c.recordConsentOutboxPersistFailure()
+		// stale grant is ever the server's last word. A decision recorded
+		// AFTER Close keeps the documented applied-locally-only posture:
+		// no receipt is minted, retained, or persisted — a durable
+		// post-Close receipt would transmit at the NEXT launch, which
+		// "no longer transmitted" promises not to do.
+		if admitted {
+			reason := ""
+			if decision == ConsentDecisionDeniedForcedMinor {
+				reason = consentDecisionReason
 			}
-			c.drainConsentOutboxEvictions()
-			c.wakeConsentDispatch()
+			if receipt, ok := c.mintConsentReceipt(analyticsGranted, reason); ok {
+				if c.consentOutbox.append(receipt) {
+					c.recordConsentOutboxPersistFailure()
+				}
+				c.drainConsentOutboxEvictions()
+				c.wakeConsentDispatch()
+			}
 		}
 	} else if actor != "" {
 		idempotencyKey, err := uuidv7.New()

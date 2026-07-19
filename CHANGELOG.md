@@ -11,7 +11,12 @@
   - Consent-first gating: `Track`/`Enqueue` refuse the new `ErrConsentUnknown` until an
     explicit decision is recorded (distinct from `ErrConsentDenied`); with `SpoolDir` the
     persisted decision reloads as the LIVE state at startup, and an undecided session
-    transmits nothing at all.
+    transmits nothing at all. Persisted floor state is trusted only through a state
+    directory whose privacy is established (the spool's ensurePrivateDir-first gate): a
+    refused tighten starts the floor fail-closed — undecided, empty outbox, surfaced via
+    `Stats.LastError` — with the on-disk files left for a run with fixed permissions.
+    Decisions recorded after `Close` keep the documented applied-locally-only posture: no
+    receipt is minted, retained, or persisted.
   - Durable consent-receipt outbox (`consent-outbox.json` under `SpoolDir`; in-memory
     without it): exactly one receipt per explicit decision — an append-only trail, a later
     decision never withdraws an earlier receipt — 32-cap FIFO evicting oldest on save, no
@@ -23,7 +28,13 @@
     plane behind the server's `Retry-After` — parsed on `429` AND `5xx` — or jittered
     backoff, independent of the events plane's pacing; every other outcome is terminal and
     chains the next receipt (including `401`: this SDK's bearer is static for the client's
-    lifetime, the engine SDKs' static-credential rule).
+    lifetime, the engine SDKs' static-credential rule). Dispatches on caller-driven
+    operations (`Track`, `Flush`, `Close`) are bounded by the sooner of the caller's
+    context and `HTTPTimeout`, and a caller-aborted attempt is no outcome (nothing
+    counted, no deferral armed, receipt retained). Consent gating never feeds the EVENTS
+    plane's retry pacing. A `2xx` with an empty body (`204`, empty `200`) acknowledges a
+    consent write — the status is the acknowledgement — on the floor path and the legacy
+    fire-and-forget path alike.
   - Grant-receipt dispatch gate: while an analytics-grant receipt is retained undispatched
     (parked, queued, or reloaded after a relaunch), event legs hold — `Track`/`Flush`
     return the new `ErrConsentReceiptPending`, intake stays open — so post-grant events

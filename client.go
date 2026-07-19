@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -192,28 +193,8 @@ func NewClient(cfg Config) (*Client, error) {
 		initDeadLetters = client.initSpool()
 	}
 	if normalized.ConsentFloor != nil {
-		// Consent floor init, before the worker starts: the durable outbox
-		// reloads retained receipts (the worker's first pass re-sends them
-		// BEFORE any event batch — the retained grant itself is the dispatch
-		// gate, no deferral state persists across launches), and the
-		// persisted decision becomes the LIVE state, so a decision survives
-		// restarts. No decision (or no SpoolDir) starts unknown, which the
-		// floor keeps fully dark at intake.
 		client.consentWake = make(chan struct{}, 1)
-		client.consentOutbox = newConsentOutbox(normalized.SpoolDir)
-		client.consentOutbox.load()
-		if normalized.SpoolDir != "" {
-			if state, ok := loadConsentRecord(normalized.SpoolDir, consentActorDigest(normalized)); ok {
-				switch state {
-				case ConsentGranted:
-					client.consent.Store(consentStateGranted)
-				case ConsentDenied:
-					client.consent.Store(consentStateDenied)
-				case ConsentDeniedForcedMinor:
-					client.consent.Store(consentStateDeniedForcedMinor)
-				}
-			}
-		}
+		client.initConsentFloor(os.Chmod)
 	}
 	if normalized.RemoteConfigURL != "" {
 		client.rc = newRemoteConfigState(normalized)
@@ -262,7 +243,7 @@ func (c *Client) Track(ctx context.Context, event Event) error {
 		// rather than overtake the grant on the wire. Transient: the
 		// receipt dispatches on the worker cadence and the pipeline
 		// reopens.
-		handed := c.dispatchConsentReceipts()
+		handed := c.dispatchConsentReceipts(ctx)
 		if c.grantReceiptGateArmed(handed) {
 			return ErrConsentReceiptPending
 		}
@@ -413,7 +394,7 @@ func (c *Client) finishClose(ctx context.Context) error {
 		done := make(chan struct{})
 		c.closeDone = done
 		c.closeMu.Unlock()
-		err := c.finalizeConsentOutbox()
+		err := c.finalizeConsentOutbox(ctx)
 		c.closeMu.Lock()
 		c.closeErr = err
 		c.closeInFlight = false
@@ -450,14 +431,21 @@ func (c *Client) finishClose(ctx context.Context) error {
 			err = contextCause(ctx)
 		}
 	}
-	if err == nil {
+	if err == nil || errors.Is(err, ErrConsentReceiptPending) {
 		// Consent-floor drain (no-op with the floor off): deliver retained
 		// receipts, retry an owed outbox write, and decline completion with
 		// ErrConsentPending when undelivered receipts could not be made
 		// durable — teardown must not silently lose a consent decision's
 		// receipt. Declined completion stays retryable (see the
-		// closeComplete branch above).
-		err = c.finalizeConsentOutbox()
+		// closeComplete branch above). A GATED final flush
+		// (ErrConsentReceiptPending — a parked grant held the event legs)
+		// must reach this drain too, and its verdict replaces the gate
+		// error: the gate error is transient and NOT what repeated Close
+		// calls should freeze on — the durability verdict is. The held
+		// events themselves are the spool close-remnant's business
+		// (grant-gated crash insurance), exactly as for any other
+		// undelivered remainder at teardown.
+		err = c.finalizeConsentOutbox(ctx)
 	}
 
 	c.closeMu.Lock()
@@ -591,7 +579,7 @@ func (c *Client) run() {
 				// The CONSENT plane is independent of the events plane's
 				// pacing: retained receipts still dispatch while event
 				// publishes wait out their deferral.
-				c.dispatchConsentReceipts()
+				c.dispatchConsentReceipts(context.Background())
 				continue
 			}
 			batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
@@ -614,7 +602,7 @@ func (c *Client) run() {
 			// tick. An armed events-plane deferral is respected: only the
 			// consent plane dispatches then.
 			if c.publishDeferred(deferUntil) {
-				c.dispatchConsentReceipts()
+				c.dispatchConsentReceipts(context.Background())
 				continue
 			}
 			batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
@@ -714,6 +702,15 @@ func (c *Client) applyRetryPacing(err error, deferUntil *time.Time, backoffAttem
 	if err == nil {
 		*deferUntil = time.Time{}
 		*backoffAttempt = 0
+		return
+	}
+	if errors.Is(err, ErrConsentReceiptPending) {
+		// Consent gating is not an event-publish outcome: the batch leg was
+		// HELD, never attempted, so nothing was learned about the ingest
+		// endpoint. Event pacing stays untouched — the consent plane has
+		// its own deferral, and feeding the gate into the event backoff
+		// would keep queued events waiting behind an unrelated deferral
+		// after the receipt delivers.
 		return
 	}
 	var statusErr *HTTPStatusError
@@ -871,7 +868,7 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 		// event legs: the flush reports ErrConsentReceiptPending instead of
 		// letting queued events overtake the grant on the wire. An empty
 		// pipeline is never gated.
-		handedReceipts := c.dispatchConsentReceipts()
+		handedReceipts := c.dispatchConsentReceipts(ctx)
 		if c.grantReceiptGateArmed(handedReceipts) && (len(batch) > 0 || c.spoolHasResendWork() || len(c.queue.ch) > 0) {
 			return batch, ErrConsentReceiptPending
 		}
@@ -992,7 +989,7 @@ func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, def
 	// resends included: receipts deliver under denied/unknown too, and the
 	// pass's handoffs are what release the dispatch gate for this cycle
 	// (no-op with the floor off).
-	handedReceipts := c.dispatchConsentReceipts()
+	handedReceipts := c.dispatchConsentReceipts(context.Background())
 	if c.grantReceiptGateArmed(handedReceipts) && (len(batch) > 0 || c.spoolHasResendWork() || len(c.queue.ch) > 0) {
 		// An analytics-grant receipt is retained undispatched (parked in a
 		// backoff/Retry-After window, or queued behind another receipt):
