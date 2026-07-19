@@ -50,8 +50,10 @@ go get github.com/shardpilot/shardpilot-go@v0.4.0-alpha
   is the base URL of the ShardPilot deployment you were given (or a local
   stack). HTTPS is required outside localhost/loopback. The **analytics
   client only** can opt into private-network HTTP via
-  `Config.AllowInsecurePrivateNetwork`; the crash client has no such option
-  and rejects any plain-HTTP URL outside localhost/loopback.
+  `Config.AllowInsecurePrivateNetwork`, and only for private (RFC1918) **IP
+  literals** — the SDK never resolves DNS names, so an internal hostname
+  (e.g. a `.internal` alias) still requires HTTPS. The crash client has no
+  such option and rejects any plain-HTTP URL outside localhost/loopback.
 
 ## Credentials
 
@@ -74,7 +76,12 @@ one of:
   `shardpilot-ingest`, lifetime 5m (server cap 15m; the server also enforces
   a 5m issued-at freshness window regardless of `exp`). Scope is fixed to
   `analytics:ingest`. Call `SigningKey.ZeroSecret()` to wipe a secret you no
-  longer need.
+  longer need. A minted JWT is **per-actor, not tenant-wide**: it binds the
+  verified `Subject` (plus optional `BindAnon`) and authorizes ingest only
+  for that user within the tenant scope, so a client running on a Mode-B
+  token must publish only that actor's events. A long-lived backend client
+  that publishes for many users belongs on a Mode A key; mint Mode-B JWTs
+  primarily for individual client SDK instances to consume.
 
 The crash client (`pkg/crash`) takes its own `ClientOptions.APIKey` — an API
 key with the `crash:write` scope.
@@ -119,8 +126,9 @@ defer func() {
 Required: `IngestURL`, `Token`, `WorkspaceID`, `AppID`, `EnvironmentID`, and a
 valid `Source` (`SourceClient` / `SourceServer` / `SourceBackend`).
 `NewClient` rejects an `IngestURL` with a path, query, fragment, or userinfo,
-and non-HTTPS URLs outside localhost/loopback (private RFC1918 HTTP only via
-`AllowInsecurePrivateNetwork`). Optional tuning: `BatchSize` (default 25, max
+and non-HTTPS URLs outside localhost/loopback (plain HTTP to a private
+RFC1918 **IP literal** only, via `AllowInsecurePrivateNetwork` — hostnames
+are never resolved). Optional tuning: `BatchSize` (default 25, max
 100), `BufferSize` (async queue capacity, default 1000), `FlushInterval`
 (default 1s), `HTTPTimeout` (default 2s), `Logger`, `UserID`/`AnonymousID`
 (default actor identity), `OnBatchResult` (see verification). The SDK itself
@@ -209,8 +217,13 @@ Facts that keep integrations correct:
   auto-generated when empty), so a retried batch is de-duplicated by the
   server instead of double-counted.
 - **A permanent (non-retryable 4xx) failure drops the whole batch** — e.g.
-  one invalid event takes down its batch. Retryable failures (429/5xx) are
-  retried, honoring the server's `Retry-After` hint for automatic publishes.
+  one invalid event takes down its batch.
+- **Only queued publishes are retried.** The background flush worker retains
+  a batch that failed retryably (429/5xx or transport error) and retries it,
+  honoring the server's `Retry-After` hint. Synchronous `Track` does **not**
+  retry: it publishes once and returns the error, so `Track` callers own
+  their own retry/error policy (`HTTPStatusError.RetryAfter` carries the
+  server's hint to honor).
 - Non-2xx responses surface as `*shardpilot.HTTPStatusError` with the
   server's machine-readable `ErrorCode` (e.g. `unauthorized`,
   `validation_error`, `rate_limited`), per-field `Details`, and `RetryAfter`.
