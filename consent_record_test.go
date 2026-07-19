@@ -18,17 +18,23 @@ func TestConsentRecordRoundTrip(t *testing.T) {
 	if _, ok := loadConsentRecord(dir, digest); ok {
 		t.Fatalf("expected no decision from an absent record")
 	}
-	if err := saveConsentRecord(dir, true, digest, os.Rename, os.Chmod); err != nil {
+	if err := saveConsentRecord(dir, ConsentDecisionGranted, digest, os.Rename, os.Chmod); err != nil {
 		t.Fatalf("save granted: %v", err)
 	}
 	if state, ok := loadConsentRecord(dir, digest); !ok || state != ConsentGranted {
 		t.Fatalf("expected a granted record, got %v %v", state, ok)
 	}
-	if err := saveConsentRecord(dir, false, digest, os.Rename, os.Chmod); err != nil {
+	if err := saveConsentRecord(dir, ConsentDecisionDenied, digest, os.Rename, os.Chmod); err != nil {
 		t.Fatalf("save denied: %v", err)
 	}
 	if state, ok := loadConsentRecord(dir, digest); !ok || state != ConsentDenied {
 		t.Fatalf("expected a denied record, got %v %v", state, ok)
+	}
+	if err := saveConsentRecord(dir, ConsentDecisionDeniedForcedMinor, digest, os.Rename, os.Chmod); err != nil {
+		t.Fatalf("save forced-minor: %v", err)
+	}
+	if state, ok := loadConsentRecord(dir, digest); !ok || state != ConsentDeniedForcedMinor {
+		t.Fatalf("expected a forced-minor record, got %v %v", state, ok)
 	}
 
 	// A record written for a DIFFERENT actor/scope tuple is no decision for

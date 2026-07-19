@@ -42,11 +42,14 @@ const (
 )
 
 // consentRecordWire is the consent.json payload:
-// {"consent_analytics":"granted"|"denied","actor_digest":"<sha256 hex>"}.
-// An absent file means no decision. actor_digest scopes the decision to the
-// actor tuple it covered (see consentActorDigest) — a digest, never the
-// verbatim identifiers, so the record stays fixed-size and holds no
-// plaintext identity material.
+// {"consent_analytics":"granted"|"denied"|"denied_forced_minor",
+// "actor_digest":"<sha256 hex>"}. An absent file means no decision.
+// actor_digest scopes the decision to the actor tuple it covered (see
+// consentActorDigest) — a digest, never the verbatim identifiers, so the
+// record stays fixed-size and holds no plaintext identity material. The
+// forced-minor value is written only through SetConsentDecision; an SDK
+// build that predates it reads the value as "no usable decision", which
+// fails toward purging — the safe direction.
 type consentRecordWire struct {
 	ConsentAnalytics string `json:"consent_analytics"`
 	ActorDigest      string `json:"actor_digest"`
@@ -102,6 +105,8 @@ func loadConsentRecord(dir, actorDigest string) (ConsentState, bool) {
 		return ConsentGranted, true
 	case "denied":
 		return ConsentDenied, true
+	case "denied_forced_minor":
+		return ConsentDeniedForcedMinor, true
 	default:
 		return ConsentUnknown, false
 	}
@@ -112,12 +117,8 @@ func loadConsentRecord(dir, actorDigest string) (ConsentState, bool) {
 // tightened when it pre-exists looser — 0600 file, full temp write + atomic
 // rename). rename and chmod are injectable so tests can exercise persist and
 // refused-tighten failures deterministically.
-func saveConsentRecord(dir string, granted bool, actorDigest string, rename func(oldpath, newpath string) error, chmod func(name string, mode os.FileMode) error) error {
-	decision := "denied"
-	if granted {
-		decision = "granted"
-	}
-	payload, err := json.Marshal(consentRecordWire{ConsentAnalytics: decision, ActorDigest: actorDigest})
+func saveConsentRecord(dir string, decision ConsentDecision, actorDigest string, rename func(oldpath, newpath string) error, chmod func(name string, mode os.FileMode) error) error {
+	payload, err := json.Marshal(consentRecordWire{ConsentAnalytics: string(decision), ActorDigest: actorDigest})
 	if err != nil {
 		return err
 	}

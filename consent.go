@@ -37,12 +37,37 @@ const (
 	// ConsentDenied means analytics consent was explicitly denied: events
 	// are dropped at enqueue and the pending queue has been cleared.
 	ConsentDenied ConsentState = "denied"
+	// ConsentDeniedForcedMinor is the forced-minor denial recorded through
+	// SetConsentDecision(ConsentDecisionDeniedForcedMinor): analytics-wise
+	// IDENTICAL to ConsentDenied everywhere — every gate treats both as the
+	// same denied state and Track/Enqueue refuse with the same
+	// ErrConsentDenied — but the receipt carries reason
+	// "denied_forced_minor" so the backend can tell a band-forced denial
+	// from a chosen one. Under the consent floor with SpoolDir it persists
+	// as its own state and reloads as the same state.
+	ConsentDeniedForcedMinor ConsentState = "denied_forced_minor"
 )
+
+// ConsentDecision is an explicit consent decision for SetConsentDecision.
+// Exactly three values are accepted; anything else is
+// ErrInvalidConsentDecision.
+type ConsentDecision string
+
+const (
+	ConsentDecisionGranted           ConsentDecision = "granted"
+	ConsentDecisionDenied            ConsentDecision = "denied"
+	ConsentDecisionDeniedForcedMinor ConsentDecision = "denied_forced_minor"
+)
+
+// consentDecisionReason is the only reason value a receipt ever carries,
+// riding forced-minor decisions on the stored entry and the wire body.
+const consentDecisionReason = "denied_forced_minor"
 
 const (
 	consentStateUnknown int32 = iota
 	consentStateGranted
 	consentStateDenied
+	consentStateDeniedForcedMinor
 )
 
 // consentSendBuffer bounds the pending consent decisions awaiting the
@@ -73,6 +98,9 @@ type consentRequest struct {
 	Categories      map[string]bool `json:"categories"`
 	DecidedAt       string          `json:"decided_at"`
 	IdempotencyKey  string          `json:"idempotency_key"`
+	// Reason rides forced-minor denials only ("denied_forced_minor");
+	// absent on every other decision.
+	Reason string `json:"reason,omitempty"`
 }
 
 type consentResult struct {
@@ -127,9 +155,46 @@ type consentResult struct {
 // successfully persisted — a strictly grant-only disk posture that leaves
 // the live pipeline's documented behavior untouched.
 func (c *Client) SetConsent(analyticsGranted bool) {
-	state := consentStateGranted
+	decision := ConsentDecisionGranted
 	if !analyticsGranted {
+		decision = ConsentDecisionDenied
+	}
+	c.applyConsentDecision(decision)
+}
+
+// SetConsentDecision records an explicit consent decision in its typed
+// form. ConsentDecisionGranted and ConsentDecisionDenied behave exactly
+// like SetConsent(true)/SetConsent(false). ConsentDecisionDeniedForcedMinor
+// is the forced-minor denial: analytics-wise identical to a denial — the
+// full denial path runs and every gate treats the state as denied — with
+// the receipt carrying reason "denied_forced_minor" so the backend can tell
+// a band-forced denial from a chosen one. Any other value is rejected with
+// ErrInvalidConsentDecision and NOTHING is applied.
+//
+// Delivery of the decision follows the client's mode: under the opt-in
+// consent floor (Config.ConsentFloor) the receipt rides the durable outbox
+// — retained, retried until acknowledged, delivered in decision order, with
+// durability failures surfaced through Stats (ConsentOutboxPersistFailed,
+// LastConsentError) and Close's ErrConsentPending backstop; without the
+// floor it posts fire-and-forget exactly like SetConsent.
+func (c *Client) SetConsentDecision(decision ConsentDecision) error {
+	switch decision {
+	case ConsentDecisionGranted, ConsentDecisionDenied, ConsentDecisionDeniedForcedMinor:
+	default:
+		return ErrInvalidConsentDecision
+	}
+	c.applyConsentDecision(decision)
+	return nil
+}
+
+func (c *Client) applyConsentDecision(decision ConsentDecision) {
+	analyticsGranted := decision == ConsentDecisionGranted
+	state := consentStateGranted
+	switch decision {
+	case ConsentDecisionDenied:
 		state = consentStateDenied
+	case ConsentDecisionDeniedForcedMinor:
+		state = consentStateDeniedForcedMinor
 	}
 
 	actor := firstNonEmpty(c.cfg.UserID, c.cfg.AnonymousID)
@@ -189,10 +254,29 @@ func (c *Client) SetConsent(analyticsGranted bool) {
 	// out a disk stall. The spool's own append gate re-checks the already
 	// stored live state under its lock, so a batch racing this section can
 	// never re-create a record the purge below condemns.
-	deadLetters := c.applySpoolConsent(analyticsGranted)
+	deadLetters := c.applySpoolConsent(decision)
 
 	var keyErr error
-	if actor != "" {
+	if c.consentFloorEnabled() {
+		// Consent-floor delivery: exactly one receipt per explicit decision
+		// rides the durable outbox — appended while still holding the turn so
+		// the outbox order matches the decision order — and the worker is
+		// nudged to dispatch promptly. Receipts are an append-only decision
+		// trail: a later decision never withdraws an earlier receipt (a
+		// grant-then-deny delivers BOTH, in order), so after a denial no
+		// stale grant is ever the server's last word.
+		reason := ""
+		if decision == ConsentDecisionDeniedForcedMinor {
+			reason = consentDecisionReason
+		}
+		if receipt, ok := c.mintConsentReceipt(analyticsGranted, reason); ok {
+			if c.consentOutbox.append(receipt) {
+				c.recordConsentOutboxPersistFailure()
+			}
+			c.drainConsentOutboxEvictions()
+			c.wakeConsentDispatch()
+		}
+	} else if actor != "" {
 		idempotencyKey, err := uuidv7.New()
 		if err != nil {
 			keyErr = err
@@ -200,7 +284,7 @@ func (c *Client) SetConsent(analyticsGranted bool) {
 			// Hand off while still holding the turn so the transmission
 			// order matches the decision order across concurrent SetConsent
 			// calls (the turn is the single producer on consentSends).
-			c.enqueueConsentPublish(consentRequest{
+			request := consentRequest{
 				WorkspaceID:     c.cfg.WorkspaceID,
 				AppID:           c.cfg.AppID,
 				EnvironmentID:   c.cfg.EnvironmentID,
@@ -208,7 +292,15 @@ func (c *Client) SetConsent(analyticsGranted bool) {
 				Categories:      map[string]bool{"analytics": analyticsGranted},
 				DecidedAt:       c.clock.Now().UTC().Format(time.RFC3339),
 				IdempotencyKey:  idempotencyKey,
-			})
+			}
+			if decision == ConsentDecisionDeniedForcedMinor {
+				// Without the floor the forced-minor decision still applies
+				// its full denial semantics; the reason rides the
+				// fire-and-forget receipt (best-effort, like every legacy
+				// consent post).
+				request.Reason = consentDecisionReason
+			}
+			c.enqueueConsentPublish(request)
 		}
 	}
 
@@ -234,7 +326,7 @@ func (c *Client) SetConsent(analyticsGranted bool) {
 	}
 
 	c.emitSpoolDeadLetters(deadLetters)
-	if actor == "" {
+	if !c.consentFloorEnabled() && actor == "" {
 		c.logf("shardpilot consent: no actor identity configured (Config.UserID or Config.AnonymousID); decision applied locally only")
 	} else if keyErr != nil {
 		c.logf("shardpilot consent: generate idempotency key failed: %v", keyErr)
@@ -323,13 +415,28 @@ func (c *Client) Consent() ConsentState {
 		return ConsentGranted
 	case consentStateDenied:
 		return ConsentDenied
+	case consentStateDeniedForcedMinor:
+		return ConsentDeniedForcedMinor
 	default:
 		return ConsentUnknown
 	}
 }
 
+// consentDenied treats both denial flavors identically: the forced-minor
+// state gates analytics exactly like an ordinary denial.
 func (c *Client) consentDenied() bool {
-	return c.consent.Load() == consentStateDenied
+	switch c.consent.Load() {
+	case consentStateDenied, consentStateDeniedForcedMinor:
+		return true
+	default:
+		return false
+	}
+}
+
+// consentUndecided reports the unknown state, which the opt-in consent
+// floor treats as closed (ErrConsentUnknown at intake).
+func (c *Client) consentUndecided() bool {
+	return c.consent.Load() == consentStateUnknown
 }
 
 func (c *Client) logf(format string, args ...any) {

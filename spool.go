@@ -1569,12 +1569,16 @@ func (c *Client) initSpool() []SpoolDeadLetter {
 // SUCCESSFUL persist opens spool writes (grantPersisted): a grant whose
 // record could not be written keeps disk closed, so a load on the next start
 // can always trust the record it finds.
-func (c *Client) applySpoolConsent(analyticsGranted bool) []SpoolDeadLetter {
+func (c *Client) applySpoolConsent(decision ConsentDecision) []SpoolDeadLetter {
 	s := c.spool
 	if s == nil {
 		return nil
 	}
-	if !analyticsGranted {
+	if decision != ConsentDecisionGranted {
+		// Both denial flavors run the full denial path; the persisted record
+		// keeps the exact decision value (a forced-minor denial reloads as
+		// its own state under the consent floor, and reads as "no usable
+		// decision" — fail toward purging — on builds that predate it).
 		s.mu.Lock()
 		s.grantPersisted = false
 		s.mu.Unlock()
@@ -1583,7 +1587,7 @@ func (c *Client) applySpoolConsent(analyticsGranted bool) []SpoolDeadLetter {
 			c.stats.setLastError("spool_purge_failed")
 			c.logf("shardpilot spool: consent purge failed; a wipe is owed and the disk spool is disabled until it succeeds: %v", err)
 		}
-		if recordErr := saveConsentRecord(s.dir, false, s.actorDigest, s.renameFn, s.chmodFn); recordErr != nil {
+		if recordErr := saveConsentRecord(s.dir, decision, s.actorDigest, s.renameFn, s.chmodFn); recordErr != nil {
 			c.stats.setLastError("consent_record_persist_failed")
 			c.logf("shardpilot spool: persisting the denied consent record failed (the decision still applies in memory): %v", recordErr)
 		}
@@ -1597,7 +1601,7 @@ func (c *Client) applySpoolConsent(analyticsGranted bool) []SpoolDeadLetter {
 		c.logf("shardpilot spool: a spool wipe is still owed; the persisted consent decision stays denied and the disk spool stays disabled until the wipe succeeds")
 		return nil
 	}
-	if err := saveConsentRecord(s.dir, true, s.actorDigest, s.renameFn, s.chmodFn); err != nil {
+	if err := saveConsentRecord(s.dir, ConsentDecisionGranted, s.actorDigest, s.renameFn, s.chmodFn); err != nil {
 		s.mu.Lock()
 		s.grantPersisted = false
 		s.mu.Unlock()

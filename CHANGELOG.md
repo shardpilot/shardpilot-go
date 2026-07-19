@@ -2,6 +2,56 @@
 
 ## Unreleased
 
+- Opt-in client-side consent floor (`Config.ConsentFloor`), adopting the engine SDKs'
+  consent-first contract for integrations that need client-side enforcement (per the
+  sdk-stability-1.0 disposition: user-facing adopters bound by the DPIA condition opt in;
+  the DEFAULT — `ConsentFloor` nil — keeps this SDK's documented server-side posture
+  byte-for-byte, proven by an explicit equivalence test plus the whole existing suite
+  running floor-off). With the floor enabled:
+  - Consent-first gating: `Track`/`Enqueue` refuse the new `ErrConsentUnknown` until an
+    explicit decision is recorded (distinct from `ErrConsentDenied`); with `SpoolDir` the
+    persisted decision reloads as the LIVE state at startup, and an undecided session
+    transmits nothing at all.
+  - Durable consent-receipt outbox (`consent-outbox.json` under `SpoolDir`; in-memory
+    without it): exactly one receipt per explicit decision — an append-only trail, a later
+    decision never withdraws an earlier receipt — 32-cap FIFO evicting oldest on save, no
+    TTL, sanitize-on-load-and-save with a bounded record read, failed-write-never-evicts
+    (the write is owed and retried at every dispatch point and at `Close`), strictly serial
+    decision-order delivery retried until acknowledged, re-sent VERBATIM across restarts
+    (same `idempotency_key`/`decided_at`; the server de-duplicates). Retryable outcomes
+    (transport failure, `429`, any `5xx`) keep the receipt at the head and park the consent
+    plane behind the server's `Retry-After` — parsed on `429` AND `5xx` — or jittered
+    backoff, independent of the events plane's pacing; every other outcome is terminal and
+    chains the next receipt (including `401`: this SDK's bearer is static for the client's
+    lifetime, the engine SDKs' static-credential rule).
+  - Grant-receipt dispatch gate: while an analytics-grant receipt is retained undispatched
+    (parked, queued, or reloaded after a relaunch), event legs hold — `Track`/`Flush`
+    return the new `ErrConsentReceiptPending`, intake stays open — so post-grant events
+    can never overtake the grant on the wire and be terminally `suppressed_no_consent` on
+    a strict-consent workspace. Released the moment the receipt is HANDED to the transport
+    (never gated on its acknowledgement; a receipt dispatched in a cycle does not hold that
+    cycle's batch even when its outcome fails retryably), and an empty pipeline is never
+    gated, so a retained receipt alone cannot wedge teardown.
+  - `SetConsentDecision(ConsentDecision)` with the forced-minor denial
+    (`ConsentDecisionDeniedForcedMinor`): analytics-wise identical to denied everywhere —
+    same gates, same `ErrConsentDenied`, full denial path — with the receipt carrying
+    `reason: "denied_forced_minor"`; persisted as its own state and reloading as itself
+    under the floor; superseded normally by a later decision (whose receipt carries no
+    reason). Available without the floor too, where the reason rides the legacy
+    fire-and-forget post. Invalid values reject `ErrInvalidConsentDecision` and apply
+    nothing. An AC-8 whole-session test pins the forced-minor session shape: exactly one
+    analytics-plane request (the receipt), zero event batches.
+  - Teardown durability: `Close` completes only when every retained receipt is delivered
+    or durably on disk; otherwise the new `ErrConsentPending` is returned and `Close`
+    stays RETRYABLE (a repeated call re-runs the delivery/persist drain), so a consent
+    decision's receipt is never silently lost by process exit.
+  - Receipt-path identifier clamp: `UserID`/`AnonymousID` over 512 BYTES are rejected for
+    the receipt's actor snapshot (never truncated), with fallback to the next valid
+    configured identifier; the outbox sanitizer drops oversized or malformed entries
+    fail-safe. The anonymous-id retention snapshot never rides the wire.
+  - Consent-plane observability on `Snapshot()`: `ConsentRecorded`, `ConsentFailed`,
+    `ConsentOutboxEvicted`, `ConsentOutboxPersistFailed`, `LastConsentError`.
+
 - Fleet-audit follow-ups on the GAP-075 spool and transport machinery:
   - Poison-member isolation on the worker publish paths: a batch member whose nested
     `Props`/`Context` values no longer serialize (mutated after `Enqueue`) is now dropped

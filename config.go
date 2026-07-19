@@ -107,8 +107,43 @@ type Config struct {
 	// and the `spool-wipe-owed` marker; directory 0700, files 0600). Empty —
 	// the default — keeps today's memory-only queue behavior: nothing is
 	// ever written to disk. Disk participation is strictly grant-only; see
-	// SetConsent.
+	// SetConsent. With ConsentFloor set it additionally holds the durable
+	// consent-receipt outbox (`consent-outbox.json`).
 	SpoolDir string
+
+	// ConsentFloor opts this client into the CLIENT-SIDE consent floor: the
+	// consent-first posture the ShardPilot engine SDKs (Defold/Unity/Unreal)
+	// ship, adapted to this SDK's server posture. Nil — the default — keeps
+	// the documented server-side-responsibility posture byte-for-byte:
+	// unknown consent leaves the pipeline open, SetConsent posts its receipt
+	// fire-and-forget, and nothing below applies.
+	//
+	// With the floor enabled:
+	//   - Tri-state gating: Track/Enqueue refuse ErrConsentUnknown until an
+	//     explicit decision is recorded, and ErrConsentDenied under a denial
+	//     (including the forced-minor denial; see SetConsentDecision). With
+	//     SpoolDir set, the persisted decision reloads as the LIVE state at
+	//     construction, so a decision survives restarts.
+	//   - Consent receipts ride a durable outbox (32 receipts, FIFO,
+	//     oldest-evicted, retried until acknowledged, delivered strictly in
+	//     decision order — grant-then-deny can never settle reversed; server
+	//     Retry-After honored on 429 and 5xx, jittered backoff otherwise).
+	//     A receipt documents the decision itself, so delivery is permitted
+	//     — required — while consent is denied or unknown. With SpoolDir the
+	//     outbox survives process death; without it receipts are retained in
+	//     memory only and Close reports ErrConsentPending while any remain
+	//     undelivered.
+	//   - The grant-receipt dispatch gate: event batches hold (Track/Flush
+	//     return ErrConsentReceiptPending) while an analytics-grant receipt
+	//     is retained undispatched, so post-grant events can never overtake
+	//     the grant on the wire on a strict-consent workspace. Released the
+	//     moment the receipt is handed to the transport — never gated on its
+	//     acknowledgement — and an empty pipeline is never gated.
+	//   - Receipt identifiers are bounded: a UserID/AnonymousID over 512
+	//     BYTES is rejected for the receipt's actor snapshot (never
+	//     truncated — truncation could collide distinct identities), and
+	//     oversized entries are dropped fail-safe by the outbox sanitizer.
+	ConsentFloor *ConsentFloorConfig
 
 	// SpoolMaxEvents caps how many undelivered events the disk spool retains;
 	// past it the OLDEST events are dropped (through OnSpoolDeadLetter).
@@ -159,6 +194,12 @@ type Config struct {
 	// ConsentUnknown and SetConsent.
 	OnBatchResult func(BatchResult)
 }
+
+// ConsentFloorConfig configures the opt-in client-side consent floor. The
+// zero value enables the full documented contract; the struct exists so
+// future floor tuning has a home without another Config field. See
+// Config.ConsentFloor.
+type ConsentFloorConfig struct{}
 
 const (
 	defaultBatchSize     = 25
