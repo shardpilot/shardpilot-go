@@ -2,6 +2,7 @@ package shardpilot
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/shardpilot/shardpilot-go/internal/uuidv7"
@@ -133,7 +134,22 @@ func (c *Client) SetConsent(analyticsGranted bool) {
 
 	actor := firstNonEmpty(c.cfg.UserID, c.cfg.AnonymousID)
 
+	// FAST HALF, under lifecycleMu: the decision takes effect on intake
+	// IMMEDIATELY — before any disk work, this call's or an earlier
+	// decision's. A denial issued while a predecessor's record write stalls
+	// on a slow SpoolDir must reject Track/Enqueue from this moment, so the
+	// in-memory flip never queues behind disk. The ticket taken here fixes
+	// this decision's place in the total decision order; the slow half below
+	// runs strictly in ticket order. Admission for the Close fence is
+	// decided here too: closed is stored under this same mutex, so "admitted
+	// before Close" is exact (see consentDecisionsWG).
 	c.lifecycleMu.Lock()
+	ticket := c.consentTicketNext
+	c.consentTicketNext++
+	admitted := !c.closed.Load()
+	if admitted {
+		c.consentDecisionsWG.Add(1)
+	}
 	c.consent.Store(state)
 	if !analyticsGranted {
 		// Bump the denial epoch BEFORE draining the shared queue: events the
@@ -154,41 +170,86 @@ func (c *Client) SetConsent(analyticsGranted bool) {
 			c.stats.dropped.Add(uint64(dropped))
 		}
 	}
-	// Disk side of the decision (no-op without SpoolDir). Dead-letters are
-	// collected here and emitted only after lifecycleMu is released — the
-	// callback is integrator code and may call back into the client.
-	deadLetters := c.applySpoolConsentLocked(analyticsGranted)
-
-	if actor == "" {
-		c.lifecycleMu.Unlock()
-		c.emitSpoolDeadLetters(deadLetters)
-		c.logf("shardpilot consent: no actor identity configured (Config.UserID or Config.AnonymousID); decision applied locally only")
-		return
-	}
-
-	idempotencyKey, err := uuidv7.New()
-	if err != nil {
-		c.lifecycleMu.Unlock()
-		c.emitSpoolDeadLetters(deadLetters)
-		c.logf("shardpilot consent: generate idempotency key failed: %v", err)
-		return
-	}
-
-	request := consentRequest{
-		WorkspaceID:     c.cfg.WorkspaceID,
-		AppID:           c.cfg.AppID,
-		EnvironmentID:   c.cfg.EnvironmentID,
-		ActorIdentifier: actor,
-		Categories:      map[string]bool{"analytics": analyticsGranted},
-		DecidedAt:       c.clock.Now().UTC().Format(time.RFC3339),
-		IdempotencyKey:  idempotencyKey,
-	}
-
-	// Enqueue while still holding lifecycleMu so the transmission order
-	// matches the local state order across concurrent SetConsent calls.
-	c.enqueueConsentPublish(request)
 	c.lifecycleMu.Unlock()
+
+	// SLOW HALF, in ticket order: disk persistence, then the sender handoff.
+	// The wait keeps overlapping decisions' disk writes and transmissions in
+	// the decision order (the LAST decision's record lands last, and the
+	// server receives decisions in call order), while intake above never
+	// waits — only later DECISIONS queue behind a stalled write, exactly as
+	// they did when one mutex covered everything.
+	c.consentTurnMu.Lock()
+	for c.consentTicketServing != ticket {
+		c.consentTurnCondLocked().Wait()
+	}
+	c.consentTurnMu.Unlock()
+
+	// Disk side of the decision (no-op without SpoolDir), deliberately
+	// outside lifecycleMu: it fsyncs files, and event intake must not wait
+	// out a disk stall. The spool's own append gate re-checks the already
+	// stored live state under its lock, so a batch racing this section can
+	// never re-create a record the purge below condemns.
+	deadLetters := c.applySpoolConsent(analyticsGranted)
+
+	var keyErr error
+	if actor != "" {
+		idempotencyKey, err := uuidv7.New()
+		if err != nil {
+			keyErr = err
+		} else {
+			// Hand off while still holding the turn so the transmission
+			// order matches the decision order across concurrent SetConsent
+			// calls (the turn is the single producer on consentSends).
+			c.enqueueConsentPublish(consentRequest{
+				WorkspaceID:     c.cfg.WorkspaceID,
+				AppID:           c.cfg.AppID,
+				EnvironmentID:   c.cfg.EnvironmentID,
+				ActorIdentifier: actor,
+				Categories:      map[string]bool{"analytics": analyticsGranted},
+				DecidedAt:       c.clock.Now().UTC().Format(time.RFC3339),
+				IdempotencyKey:  idempotencyKey,
+			})
+		}
+	}
+
+	// Release the turn BEFORE the dead-letter callback runs: the callback is
+	// integrator code and may call back into the client — including
+	// SetConsent itself, which must be able to take the next ticket. The
+	// cond is read under the same mutex as the serving counter, so a waiter
+	// that materializes it concurrently is either already released by the
+	// increment (its loop re-check) or found here and woken.
+	c.consentTurnMu.Lock()
+	c.consentTicketServing++
+	turnCond := c.consentTurnCond
+	c.consentTurnMu.Unlock()
+	if turnCond != nil {
+		turnCond.Broadcast()
+	}
+	if admitted {
+		// The decision is fully settled — record written (or its failure
+		// logged), spool side applied, transmission handed off — so the
+		// Close fence may pass. The dead-letter callback below is not
+		// fenced, matching its existing after-the-locks posture.
+		c.consentDecisionsWG.Done()
+	}
+
 	c.emitSpoolDeadLetters(deadLetters)
+	if actor == "" {
+		c.logf("shardpilot consent: no actor identity configured (Config.UserID or Config.AnonymousID); decision applied locally only")
+	} else if keyErr != nil {
+		c.logf("shardpilot consent: generate idempotency key failed: %v", keyErr)
+	}
+}
+
+// consentTurnCondLocked returns the turn condition variable, materializing
+// it on first need. Must be called with consentTurnMu held. NewClient
+// initializes the cond eagerly; the lazy path exists for bare Clients
+// constructed by tests, which never run NewClient.
+func (c *Client) consentTurnCondLocked() *sync.Cond {
+	if c.consentTurnCond == nil {
+		c.consentTurnCond = sync.NewCond(&c.consentTurnMu)
+	}
+	return c.consentTurnCond
 }
 
 // startConsentSender starts the single consent sender goroutine exactly
@@ -201,9 +262,10 @@ func (c *Client) startConsentSender() {
 }
 
 // enqueueConsentPublish hands a decision to the single ordered consent
-// sender, starting it lazily on first use. Must be called with lifecycleMu
-// held (it is the only producer on consentSends, which keeps the
-// drop-oldest overflow handling race-free on the producer side).
+// sender, starting it lazily on first use. Must be called while holding the
+// consent ticket turn (SetConsent's slow half) — the turn is the only
+// producer on consentSends, which keeps the drop-oldest overflow handling
+// race-free on the producer side.
 func (c *Client) enqueueConsentPublish(request consentRequest) {
 	c.startConsentSender()
 	for {

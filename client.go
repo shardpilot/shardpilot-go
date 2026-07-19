@@ -49,6 +49,35 @@ type Client struct {
 	stop          chan struct{}
 	workerDone    chan struct{}
 	lifecycleMu   sync.Mutex
+
+	// The consent ticket line serializes the SLOW half of SetConsent — disk
+	// persistence and the sender handoff — in the exact order the fast
+	// halves took effect, WITHOUT making intake or a later decision's
+	// in-memory flip wait behind an earlier decision's fsync. Tickets are
+	// assigned under lifecycleMu together with the in-memory flip (so the
+	// ticket order IS the decision order), and each decision waits for its
+	// ticket before touching disk: the persisted record and the transmitted
+	// sequence always agree with the in-memory order — the last decision's
+	// write lands last — while a denial issued during an earlier decision's
+	// stalled write still rejects Track/Enqueue from the moment it was
+	// issued. consentTicketNext is guarded by lifecycleMu;
+	// consentTicketServing by consentTurnMu.
+	consentTurnMu        sync.Mutex
+	consentTurnCond      *sync.Cond
+	consentTicketNext    uint64
+	consentTicketServing uint64
+
+	// consentDecisionsWG counts SetConsent calls admitted BEFORE Close
+	// stored the closed flag (both happen under lifecycleMu, so the set is
+	// exact). Close waits for them — bounded by its context — before
+	// stopping and draining the consent sender: a pre-Close decision's
+	// record write, spool purge, and transmission handoff must not be
+	// abandoned by teardown (a stranded enqueue would silently never
+	// transmit; an interrupted denial could leave a stale granted record on
+	// disk). Decisions arriving after Close keep today's documented
+	// applied-locally-only behavior and are not fenced.
+	consentDecisionsWG sync.WaitGroup
+
 	trackWG       sync.WaitGroup
 	closeMu       sync.Mutex
 	closeInFlight bool
@@ -105,10 +134,10 @@ type Client struct {
 	// publish retained alongside its in-memory batch. Owned by the flush
 	// worker goroutine exclusively (every path that reads or writes it —
 	// publishWorkerBatch, flushAvailable, the close remnant — runs there).
-	// In-process retries rebuild THROUGH it (buildBatchReusing) so the bytes
-	// a retry puts on the wire are the bytes the failure spooled, even when
-	// the caller mutates nested Props/Context values after Enqueue; it is
-	// cleared whenever the batch it described is delivered, dropped, or
+	// In-process retries rebuild THROUGH it (buildBatchIsolating) so the
+	// bytes a retry puts on the wire are the bytes the failure spooled, even
+	// when the caller mutates nested Props/Context values after Enqueue; it
+	// is cleared whenever the batch it described is delivered, dropped, or
 	// discarded.
 	retainedRequest batchRequest
 }
@@ -137,6 +166,7 @@ func NewClient(cfg Config) (*Client, error) {
 		consentSends:      make(chan consentRequest, consentSendBuffer),
 		consentSenderDone: make(chan struct{}),
 	}
+	client.consentTurnCond = sync.NewCond(&client.consentTurnMu)
 	client.consentGate.Store(newConsentGateState())
 
 	// Spool init runs before the worker starts: it seeds initialDeferUntil
@@ -244,6 +274,9 @@ func (c *Client) Close(ctx context.Context) error {
 	if err := c.waitForTracks(ctx); err != nil {
 		return err
 	}
+	if err := c.waitForConsentDecisions(ctx); err != nil {
+		return err
+	}
 	return c.finishClose(ctx)
 }
 
@@ -251,6 +284,29 @@ func (c *Client) waitForTracks(ctx context.Context) error {
 	waitDone := make(chan struct{})
 	go func() {
 		c.trackWG.Wait()
+		close(waitDone)
+	}()
+
+	select {
+	case <-waitDone:
+		return nil
+	case <-contextDone(ctx):
+		return contextCause(ctx)
+	}
+}
+
+// waitForConsentDecisions waits — bounded by the Close context — for every
+// SetConsent call admitted before Close stored the closed flag to finish its
+// disk work and hand its transmission to the consent sender. Without this
+// fence, Close could stop and drain the sender inside a decision's window
+// between the in-memory flip and the handoff: the decision would enqueue
+// into a channel nobody reads again (silently never transmitted), and a
+// denial's spool purge or record write could be abandoned mid-flight,
+// leaving a stale granted record for the next start to trust.
+func (c *Client) waitForConsentDecisions(ctx context.Context) error {
+	waitDone := make(chan struct{})
+	go func() {
+		c.consentDecisionsWG.Wait()
 		close(waitDone)
 	}()
 
@@ -728,26 +784,24 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 		if len(batch) > 0 {
 			// Build THROUGH the retained request: a batch a previous attempt
 			// already marshaled resends its retained bytes verbatim, so the
-			// in-process retry matches what that failure spooled.
-			request, err := c.buildBatchReusing(batch, c.retainedRequest)
-			var result batchResult
-			if err != nil {
-				c.recordBuildFailure(err)
-				// The rebuild failed permanently (always the EncodeError /
-				// ErrInvalidEvent class) before producing a request, so the
-				// zero value above names no event IDs — the permanent drop
-				// below could then never settle the batch's previously
-				// SPOOLED members: stats would say dropped while the events
-				// stayed in spool.json and redelivered after a restart. The
-				// retained request still names exactly those members (it is
-				// the built form of the batch prefix an earlier retriable
-				// failure retained and spooled), so the drop settles through
-				// it: counted-dropped == gone-from-disk.
-				request = c.retainedRequest
-			} else {
-				result, err = c.publishRequestResult(ctx, request, len(batch))
+			// in-process retry matches what that failure spooled. A member
+			// that no longer serializes is dropped ALONE — settled, counted,
+			// and folded into the flush's first-error the way a terminal
+			// chunk failure is — and its batchmates publish on.
+			request, kept, poisoned := c.buildBatchIsolating(batch, c.retainedRequest)
+			if len(poisoned) > 0 {
+				c.settlePoisonedEvents(poisoned)
+				if firstErr == nil {
+					firstErr = poisoned[0].err
+				}
+				batch = kept
 			}
-			if err != nil {
+			if len(batch) == 0 {
+				// Every member poisoned: nothing is left to publish or
+				// retain. The queue drain below still runs — later enqueued
+				// events are unaffected by the condemned batch.
+				c.retainedRequest = batchRequest{}
+			} else if result, err := c.publishRequestResult(ctx, request, len(batch)); err != nil {
 				if errors.Is(err, ErrConsentDenied) {
 					// A denial landed between this iteration's consent check
 					// and the publish: drop and drain exactly like the
@@ -836,21 +890,24 @@ func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, def
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.HTTPTimeout)
 	defer cancel()
-	// Build THROUGH the retained request (see buildBatchReusing): the prefix
-	// a previous failed attempt already marshaled resends its exact bytes.
-	request, err := c.buildBatchReusing(batch, c.retainedRequest)
-	var result batchResult
-	if err != nil {
-		c.recordBuildFailure(err)
-		// Same substitution as flushAvailable: a failed rebuild returns the
-		// zero-valued request, and the permanent drop below must still settle
-		// the previously spooled members named by the retained request —
-		// otherwise they stay in spool.json (counted dropped, redelivered
-		// after restart).
-		request = c.retainedRequest
-	} else {
-		result, err = c.publishRequestResult(ctx, request, len(batch))
+	// Build THROUGH the retained request (see buildBatchIsolating): the prefix
+	// a previous failed attempt already marshaled resends its exact bytes. A
+	// member that no longer serializes is dropped alone — settled and counted
+	// — and its batchmates publish on.
+	request, kept, poisoned := c.buildBatchIsolating(batch, c.retainedRequest)
+	if len(poisoned) > 0 {
+		c.settlePoisonedEvents(poisoned)
+		batch = kept
+		if len(batch) == 0 {
+			// Every member poisoned: nothing is left to publish or retain,
+			// and nothing was learned about the endpoint, so retry pacing
+			// stays untouched (the same posture applyRetryPacing takes for
+			// client-side permanent errors).
+			c.retainedRequest = batchRequest{}
+			return batch[:0]
+		}
 	}
+	result, err := c.publishRequestResult(ctx, request, len(batch))
 	c.applyRetryPacing(err, deferUntil, backoffAttempt)
 	if err != nil {
 		if isPermanentPublishError(err) {
@@ -908,6 +965,29 @@ func (c *Client) recordBuildFailure(err error) {
 	if errors.As(err, &encodeErr) {
 		c.logf("shardpilot batch publish failed: %v", err)
 	}
+}
+
+// settlePoisonedEvents drops the members a worker-path batch build could not
+// serialize, attributed per event: each is counted Dropped and logged with
+// its id, and the attempt records ONE build failure — the first error — on
+// the same FailedBatches/LastError surface the whole-batch drop used to
+// feed. Any previously spooled copy settles off the record as terminal;
+// under today's invariants a poisoned member can never HAVE one (its bytes
+// never marshaled, and a member whose bytes were retained rides the reuse
+// prefix), so that settle is insurance: if the invariant ever drifts,
+// counted-dropped must still equal gone-from-disk.
+func (c *Client) settlePoisonedEvents(poisoned []poisonedEvent) {
+	if len(poisoned) == 0 {
+		return
+	}
+	c.stats.dropped.Add(uint64(len(poisoned)))
+	c.stats.recordFailure(poisoned[0].err)
+	ids := make([]string, 0, len(poisoned))
+	for _, poison := range poisoned {
+		ids = append(ids, poison.id)
+		c.logf("shardpilot batch build: event %q could not be serialized and was dropped (its batchmates were not): %v", poison.id, poison.err)
+	}
+	c.spoolSettleTerminalIDs(ids)
 }
 
 // publishRequest publishes one already-built batch request — fresh events

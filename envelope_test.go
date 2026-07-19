@@ -3,6 +3,7 @@ package shardpilot
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -198,4 +199,70 @@ func newTestClient(t *testing.T, ingestURL string) *Client {
 		t.Fatalf("NewClient: %v", err)
 	}
 	return client
+}
+
+func TestBuildBatchIsolatingAttributesPoisonMembers(t *testing.T) {
+	client := &Client{
+		cfg: Config{
+			WorkspaceID:   "workspace-test",
+			AppID:         "app-test",
+			EnvironmentID: "develop",
+			Source:        SourceBackend,
+		},
+		clock: realClock{},
+	}
+	now := time.Now()
+	ok1 := Event{ID: "evt-iso-1", Name: "e1", Timestamp: now}
+	poison := Event{ID: "evt-iso-poison", Name: "e2", Timestamp: now, Props: map[string]any{"bad": func() {}}}
+	ok2 := Event{ID: "evt-iso-3", Name: "e3", Timestamp: now}
+
+	// Mixed batch, nothing retained: the poison member is attributed by id
+	// with the EncodeError class, and the request/kept pair carries exactly
+	// its batchmates, aligned.
+	request, kept, poisoned := client.buildBatchIsolating([]Event{ok1, poison, ok2}, batchRequest{})
+	if len(request.Events) != 2 || request.Events[0].EventID != "evt-iso-1" || request.Events[1].EventID != "evt-iso-3" {
+		t.Fatalf("expected the two serializable members built, got %+v", request.Events)
+	}
+	if len(request.rawEvents) != 2 {
+		t.Fatalf("expected raw bytes aligned with the built envelopes, got %d", len(request.rawEvents))
+	}
+	if len(kept) != 2 || kept[0].ID != "evt-iso-1" || kept[1].ID != "evt-iso-3" {
+		t.Fatalf("expected kept aligned with the request, got %+v", kept)
+	}
+	if len(poisoned) != 1 || poisoned[0].id != "evt-iso-poison" {
+		t.Fatalf("expected the poison member attributed by id, got %+v", poisoned)
+	}
+	var encodeErr *EncodeError
+	if !errors.As(poisoned[0].err, &encodeErr) {
+		t.Fatalf("expected the EncodeError class attributed, got %v", poisoned[0].err)
+	}
+
+	// A retained prefix rides verbatim: the reused member's bytes are the
+	// retained bytes, never a re-marshal, even with a poison member behind it.
+	retained, err := client.buildBatch([]Event{ok1})
+	if err != nil {
+		t.Fatalf("buildBatch: %v", err)
+	}
+	request, kept, poisoned = client.buildBatchIsolating([]Event{ok1, poison, ok2}, retained)
+	if len(request.rawEvents) != 2 || string(request.rawEvents[0]) != string(retained.rawEvents[0]) {
+		t.Fatalf("expected the retained member's bytes reused verbatim")
+	}
+	if len(kept) != 2 || len(poisoned) != 1 {
+		t.Fatalf("expected the poison member isolated behind the reused prefix, got kept=%d poisoned=%d", len(kept), len(poisoned))
+	}
+
+	// Every member poisoned: an empty request, an empty kept, all attributed.
+	request, kept, poisoned = client.buildBatchIsolating([]Event{poison}, batchRequest{})
+	if len(request.Events) != 0 || len(kept) != 0 || len(poisoned) != 1 {
+		t.Fatalf("expected the all-poison batch fully attributed, got request=%d kept=%d poisoned=%d",
+			len(request.Events), len(kept), len(poisoned))
+	}
+
+	// Nothing poisoned: kept is the input, untouched, and no attribution.
+	events := []Event{ok1, ok2}
+	request, kept, poisoned = client.buildBatchIsolating(events, batchRequest{})
+	if len(request.Events) != 2 || len(kept) != 2 || poisoned != nil {
+		t.Fatalf("expected the clean batch built whole, got request=%d kept=%d poisoned=%v",
+			len(request.Events), len(kept), poisoned)
+	}
 }

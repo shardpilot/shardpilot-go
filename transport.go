@@ -177,20 +177,34 @@ type httpTransport struct {
 
 func newHTTPTransport(cfg Config) *httpTransport {
 	base := strings.TrimRight(cfg.IngestURL, "/")
+	refuseRedirects := func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	client := cfg.HTTPClient
+	rcClient := &http.Client{
+		Timeout:       cfg.HTTPTimeout,
+		CheckRedirect: refuseRedirects,
+	}
+	if client == nil {
+		client = &http.Client{
+			Timeout: cfg.HTTPTimeout,
+		}
+	} else {
+		// The remote-config client derives from the injected one — same
+		// Transport, Jar, and Timeout — with only CheckRedirect pinned: the
+		// no-redirect classification is an SDK contract (a 3xx is the
+		// permanent http_3xx outcome), not an integrator knob.
+		derived := *client
+		derived.CheckRedirect = refuseRedirects
+		rcClient = &derived
+	}
 	return &httpTransport{
 		endpoint:        base + "/v1/events:batch",
 		consentEndpoint: base + "/v1/consent",
 		token:           cfg.Token,
 		schemaRevision:  effectiveSchemaRevision(cfg),
-		client: &http.Client{
-			Timeout: cfg.HTTPTimeout,
-		},
-		rcClient: &http.Client{
-			Timeout: cfg.HTTPTimeout,
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		},
+		client:          client,
+		rcClient:        rcClient,
 	}
 }
 
@@ -422,12 +436,20 @@ func parseRetryAfter(header string) (time.Duration, bool) {
 	return 0, false
 }
 
+// contextWithDefaultTimeout bounds one attempt by the SDK timeout,
+// UNCONDITIONALLY: context.WithTimeout never extends a parent's earlier
+// deadline, so the derived context carries min(caller deadline, now+timeout).
+// It used to leave a parent that already had a deadline untouched, relying on
+// the internal http.Client's Timeout as the cap — which an injected
+// Config.HTTPClient with a zero Timeout does not have, letting a caller
+// deadline LONGER than HTTPTimeout stretch an attempt to the caller's
+// deadline against the documented injection contract. Caller-abort
+// discrimination is unaffected: the callers that need it (FetchRemoteConfig,
+// callerAbandonedFlush) test the CALLER's original context, which an SDK-cap
+// expiry never marks.
 func contextWithDefaultTimeout(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	if parent == nil {
 		parent = context.Background()
-	}
-	if _, ok := parent.Deadline(); ok {
-		return parent, func() {}
 	}
 	return context.WithTimeout(parent, timeout)
 }

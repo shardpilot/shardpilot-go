@@ -3,6 +3,7 @@ package shardpilot
 import (
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -45,6 +46,23 @@ type Config struct {
 	HTTPTimeout                 time.Duration
 	Logger                      Logger
 	AllowInsecurePrivateNetwork bool
+
+	// HTTPClient, when set, is the *http.Client every request this SDK makes
+	// goes through — event-batch publishes, consent posts, and remote-config
+	// fetches — so an integrator can supply a pooled transport, a proxy, mTLS,
+	// or instrumentation. Nil — the default — keeps the SDK's internal
+	// clients, exactly as before the field existed. Two SDK contracts survive
+	// injection unchanged: every attempt is still bounded by the SOONER of
+	// HTTPTimeout and the caller's own context deadline through per-request
+	// contexts, whether or not the injected client carries a Timeout of its
+	// own (a caller deadline longer than HTTPTimeout never stretches an
+	// attempt past HTTPTimeout); and
+	// remote-config fetches still refuse to follow redirects — the SDK derives
+	// its remote-config client from HTTPClient with CheckRedirect pinned
+	// (sharing the Transport and Jar), because silently following a 3xx would
+	// surface the redirect target's body for an endpoint that authoritatively
+	// is not here (see the rcClient rationale in transport.go).
+	HTTPClient *http.Client
 
 	// SchemaRevision overrides the ingest envelope schema-set revision this
 	// client declares on events:batch publishes (the
