@@ -230,6 +230,15 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) error {
 	if admitted {
 		c.consentDecisionsWG.Add(1)
 	}
+	grantArming := c.consentFloorEnabled() && admitted && analyticsGranted
+	if grantArming {
+		// Arm the dispatch gate BEFORE the granted state becomes visible:
+		// the receipt appends in the ticket-ordered slow half, and a
+		// concurrent event leg must not slip a batch out in the window
+		// between the observable grant and the receipt's existence (see
+		// consentGrantArming).
+		c.consentGrantArming.Add(1)
+	}
 	c.consent.Store(state)
 	if !analyticsGranted {
 		// Bump the denial epoch BEFORE draining the shared queue: events the
@@ -305,6 +314,14 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) error {
 				c.drainConsentOutboxEvictions()
 				c.wakeConsentDispatch()
 			}
+		}
+		if grantArming {
+			// The receipt now exists in the outbox (or provably never will
+			// — no configured actor, or a failed idempotency-key mint): the
+			// outbox predicate takes over from the arming window either
+			// way, and the gate must not stay stuck for a receipt that
+			// cannot come.
+			c.consentGrantArming.Add(-1)
 		}
 	} else if actor != "" {
 		idempotencyKey, err := uuidv7.New()

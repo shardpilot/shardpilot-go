@@ -217,28 +217,18 @@ func (t *httpTransport) Publish(ctx context.Context, request batchRequest) (batc
 }
 
 func (t *httpTransport) PublishConsent(ctx context.Context, request consentRequest) (consentResult, error) {
-	var result consentResult
 	// The schema-revision header is a batch-endpoint contract; the consent
-	// route must never carry it.
-	if err := t.postJSON(ctx, t.consentEndpoint, request, &result, ""); err != nil {
-		if errors.Is(err, errEmptyResponseBody) {
-			// A 2xx with an EMPTY body (a 204, or an empty 200): the
-			// consent contract is that ANY 2xx acknowledges the write — the
-			// status is the acknowledgement, the body is optional. Treating
-			// it as retryable would retain an already-accepted receipt
-			// forever: a grant would keep gating events and Close would
-			// keep reporting pending work. The sentinel is STATUS-GATED —
-			// postJSON attaches it only to a clean decode EOF after the 2xx
-			// check passed — so a send-path EOF (a connection closed before
-			// any status arrived) never masquerades as an acknowledgement;
-			// it stays retryable like every transport failure, and a
-			// TRUNCATED body (ErrUnexpectedEOF) stays retryable too, with
-			// the server de-duplicating the re-send by idempotency key.
-			return consentResult{}, nil
-		}
+	// route must never carry it. The RESPONSE body is not decoded at all:
+	// the consent contract is that ANY 2xx acknowledges the write — the
+	// status is the acknowledgement, the body (empty 200, 204, or even a
+	// non-JSON payload from an intermediary) is irrelevant, and requiring a
+	// decode here would turn an already-accepted receipt into retained
+	// retry work forever. Send-path and no-status errors still surface as
+	// errors — nothing without an observed success status is acknowledged.
+	if err := t.postJSON(ctx, t.consentEndpoint, request, nil, ""); err != nil {
 		return consentResult{}, err
 	}
-	return result, nil
+	return consentResult{}, nil
 }
 
 // FetchRemoteConfig GETs the remote-config resource. It reports transport-
@@ -352,29 +342,18 @@ func (t *httpTransport) postJSON(ctx context.Context, endpoint string, request a
 		return newHTTPStatusError(response)
 	}
 
+	if result == nil {
+		// The caller ignores the response body entirely (the consent route:
+		// any 2xx IS the acknowledgement): nothing to decode, and a body of
+		// any shape — empty, non-JSON, truncated — must not turn a received
+		// success status into an error.
+		return nil
+	}
 	if err := json.NewDecoder(response.Body).Decode(result); err != nil {
-		if errors.Is(err, io.EOF) {
-			// A clean EOF HERE — and only here, after the 2xx check above —
-			// means the server answered success with an EMPTY body (a 204,
-			// or an empty 200). The sentinel lets status-aware callers
-			// (PublishConsent, whose contract is that any 2xx acknowledges)
-			// tell this apart from a SEND-path EOF, where no status was
-			// ever observed and nothing may be treated as acknowledged. The
-			// original chain is preserved alongside it.
-			return fmt.Errorf("decode shardpilot ingest response: %w: %w", errEmptyResponseBody, err)
-		}
 		return fmt.Errorf("decode shardpilot ingest response: %w", err)
 	}
 	return nil
 }
-
-// errEmptyResponseBody marks a 2xx response whose body was empty where a
-// JSON payload was expected. Attached ONLY by postJSON's decode step, which
-// runs strictly after the status check — so its presence in an error chain
-// proves a success status was actually received (unlike a bare io.EOF,
-// which a closed connection can produce on the SEND path before any status
-// arrives).
-var errEmptyResponseBody = errors.New("empty response body")
 
 // maxErrorBodyBytes bounds how much of a non-2xx response body is read while
 // looking for the error envelope; a real envelope is tiny.

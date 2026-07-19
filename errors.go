@@ -47,4 +47,15 @@ var (
 	// carry. The decision is rejected whole — reject, never truncate —
 	// and NOTHING is applied. Never returned when the floor is off.
 	ErrInvalidConsentIdentity = errors.New("shardpilot consent identity exceeds the identifier clamp")
+
+	// ErrEventsDiscarded reports — folded into Close's returned error under
+	// the opt-in consent floor — that undelivered events were DISCARDED at
+	// teardown because the client has no durable spool to retain them
+	// (Config.SpoolDir empty); typically events the grant-receipt dispatch
+	// gate held through the final flush. The discard is permanent history:
+	// every Close call keeps reporting it, so silent event loss can never
+	// read as a clean teardown (the discarded events are also counted in
+	// Stats.Dropped). Configure SpoolDir to retain undelivered events
+	// across restarts instead. Never returned when the floor is off.
+	ErrEventsDiscarded = errors.New("shardpilot events were discarded at close (no durable spool)")
 )

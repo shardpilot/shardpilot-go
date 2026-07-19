@@ -29,6 +29,7 @@ type floorTestServer struct {
 	batches           [][]string
 	consentStatus     int
 	consentRetryAfter string
+	consentRawBody    string
 	batchStatus       int
 }
 
@@ -73,7 +74,15 @@ func newFloorTestServer(t *testing.T) (*floorTestServer, *httptest.Server) {
 			state.consents = append(state.consents, body)
 			status := state.consentStatus
 			retryAfter := state.consentRetryAfter
+			rawBody := state.consentRawBody
 			state.mu.Unlock()
+			if rawBody != "" {
+				// A 2xx with a NON-JSON body (an intermediary's plain-text
+				// answer): the status is still the acknowledgement.
+				w.Header().Set("Content-Type", "text/plain")
+				fmt.Fprint(w, rawBody)
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
 			if retryAfter != "" {
 				w.Header().Set("Retry-After", retryAfter)
@@ -108,6 +117,12 @@ func (s *floorTestServer) setBatchOutcome(status int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.batchStatus = status
+}
+
+func (s *floorTestServer) setConsentRawBody(body string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.consentRawBody = body
 }
 
 func (s *floorTestServer) snapshotOrder() []string {
@@ -939,11 +954,26 @@ func TestConsentFloorCloseAfterGatedFlushIsRetryablePending(t *testing.T) {
 	if errors.Is(err, ErrConsentReceiptPending) {
 		t.Fatalf("the transient gate error must not be Close's frozen verdict, got %v", err)
 	}
+	// The gated event had no spool to survive in: its discard is part of
+	// the verdict, and Stats counts it.
+	if !errors.Is(err, ErrEventsDiscarded) {
+		t.Fatalf("expected the discarded gated event reported, got %v", err)
+	}
+	if got := client.Snapshot().Dropped; got == 0 {
+		t.Fatalf("expected the discarded event counted dropped, got %+v", client.Snapshot())
+	}
 
 	state.setConsentOutcome(http.StatusOK, "")
 	clearConsentDeferral(client)
-	if err := client.Close(context.Background()); err != nil {
-		t.Fatalf("expected the retried Close to deliver and complete, got %v", err)
+	retried := client.Close(context.Background())
+	// The retried Close delivers the receipt — the PENDING state clears —
+	// but the event loss is permanent history and keeps being reported:
+	// never a clean teardown over silently discarded events.
+	if errors.Is(retried, ErrConsentPending) {
+		t.Fatalf("expected the receipt delivered on the retried Close, got %v", retried)
+	}
+	if !errors.Is(retried, ErrEventsDiscarded) {
+		t.Fatalf("expected the discard still reported on the retried Close, got %v", retried)
 	}
 	last := state.consentAt(state.consentCount() - 1)
 	if !consentBoolCategory(t, last) {
@@ -1072,12 +1102,12 @@ func TestConsentFloorDispatchBoundedByCallerDeadline(t *testing.T) {
 	err := client.Track(ctx, Event{Name: "e1"})
 	elapsed := time.Since(start)
 	// The caller's deadline bounded the consent POST — not HTTPTimeout
-	// (5s). The receipt WAS handed to the transport, so the gate released
-	// for this cycle (release-on-dispatch) and Track proceeded to the event
-	// leg, which failed on the same expired caller context — the caller's
-	// own error, exactly like any deadline-bounded Track.
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("expected the caller's deadline surfaced, got %v", err)
+	// (5s) — and because the abort observed NO HTTP outcome, the receipt
+	// counts as UNHANDED: the gate stays armed and the event leg refuses
+	// rather than risk being the server's first-seen request ahead of the
+	// grant.
+	if !errors.Is(err, ErrConsentReceiptPending) {
+		t.Fatalf("expected the gate armed after the no-response abort, got %v", err)
 	}
 	if elapsed > 3*time.Second {
 		t.Fatalf("the caller deadline did not bound the consent dispatch: %v", elapsed)
@@ -1462,4 +1492,243 @@ func TestPostCloseDecisionStillPersistsRecordWithoutFloor(t *testing.T) {
 		t.Fatalf("expected the post-Close record written with the floor off, got (%v, %v)", recorded, ok)
 	}
 	_ = state
+}
+
+func TestConsentFloorTrailTailOverridesStaleRecord(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the grant acknowledged", func() bool {
+		return client.Snapshot().ConsentRecorded == 1
+	})
+
+	// The DENIAL: its receipt appends durably, but the decision-record
+	// write fails transiently — consent.json keeps saying GRANTED while
+	// the durable trail's tail says denied.
+	state.setConsentOutcome(http.StatusServiceUnavailable, "3600")
+	client.spool.renameFn = func(oldpath, newpath string) error {
+		return errors.New("disk full")
+	}
+	client.SetConsent(false)
+	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentGranted {
+		t.Fatalf("test setup: expected the record write to have failed (stale grant), got (%v, %v)", recorded, ok)
+	}
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close over the durable outbox: %v", err)
+	}
+
+	// Reload: trusting the stale record would reopen the pipeline for an
+	// actor whose LAST decision was a denial (and a pending DENY receipt
+	// arms no gate). The trail tail is the newer truth: the floor starts
+	// DENIED, and the stale record heals to denied on disk.
+	relaunched := newFloorTestClient(t, server.URL, dir, nil)
+	if got := relaunched.Consent(); got != ConsentDenied {
+		t.Fatalf("expected the trail tail to override the stale granted record, got %v", got)
+	}
+	if err := relaunched.Track(context.Background(), Event{Name: "e1"}); !errors.Is(err, ErrConsentDenied) {
+		t.Fatalf("expected the pipeline closed under the trail-derived denial, got %v", err)
+	}
+	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentDenied {
+		t.Fatalf("expected the stale record healed from the trail, got (%v, %v)", recorded, ok)
+	}
+	// The retained deny receipt still delivers once the endpoint heals.
+	state.setConsentOutcome(http.StatusOK, "")
+	clearConsentDeferral(relaunched)
+	if err := relaunched.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	last := state.consentAt(state.consentCount() - 1)
+	if consentBoolCategory(t, last) {
+		t.Fatalf("expected the retained deny receipt delivered, got %v", last)
+	}
+	if err := relaunched.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestConsentFloorGrantNotObservableBeforeReceiptArmed(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, nil)
+
+	// Stall an EARLIER decision's slow half (the deny's record write), so
+	// the following grant's fast half applies — live state granted — while
+	// its receipt append queues behind the stalled ticket turn.
+	stalled := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	client.spool.renameFn = func(oldpath, newpath string) error {
+		once.Do(func() {
+			close(stalled)
+			<-release
+		})
+		return os.Rename(oldpath, newpath)
+	}
+	denyDone := make(chan struct{})
+	go func() {
+		defer close(denyDone)
+		client.SetConsent(false)
+	}()
+	<-stalled
+	grantDone := make(chan struct{})
+	go func() {
+		defer close(grantDone)
+		client.SetConsent(true)
+	}()
+	waitFor(t, 3*time.Second, "the grant observable in the live state", func() bool {
+		return client.Consent() == ConsentGranted
+	})
+
+	// The grant is OBSERVABLE but its receipt does not exist yet: the
+	// arming window must hold the event legs — a batch shipped now would
+	// precede the grant receipt on the wire.
+	if err := client.Track(context.Background(), Event{Name: "e1"}); !errors.Is(err, ErrConsentReceiptPending) {
+		t.Fatalf("expected the event leg held while the grant receipt is mid-append, got %v", err)
+	}
+	if got := state.batchCount(); got != 0 {
+		t.Fatalf("expected no batch before the grant receipt exists, got %d", got)
+	}
+
+	close(release)
+	<-denyDone
+	<-grantDone
+	// Both receipts now exist; the trail drains and events follow.
+	if err := client.Enqueue(Event{ID: "evt-armed-1", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	order := state.snapshotOrder()
+	if state.batchCount() != 1 || order[len(order)-1] != "batch" {
+		t.Fatalf("expected the receipts on the wire before the batch, got %v", order)
+	}
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestConsentFloorNonJSON2xxAcknowledges(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+	// A 2xx whose body is not JSON at all (an intermediary's plain-text
+	// answer): the status IS the acknowledgement — the consent route never
+	// requires a decodable body.
+	state.setConsentRawBody("OK\n")
+
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the non-JSON 2xx acknowledged", func() bool {
+		return client.Snapshot().ConsentRecorded == 1
+	})
+	if client.consentOutbox.pending() {
+		t.Fatalf("expected the acknowledged receipt pruned")
+	}
+	if err := client.Enqueue(Event{ID: "evt-raw-1", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if got := state.batchCount(); got != 1 {
+		t.Fatalf("expected the batch delivered after the raw-body ack, got %d", got)
+	}
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestConsentFloorReloadRefusesOutOfContractIdentity(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	dir := t.TempDir()
+	oversized := strings.Repeat("u", maxConsentIdentifierBytes+1)
+	cfgTuple := Config{
+		WorkspaceID:   "workspace-test",
+		EnvironmentID: "develop",
+		UserID:        oversized,
+		AnonymousID:   "anon-spool-1",
+	}
+	// A persisted grant for the out-of-contract tuple (legacy, seeded, or
+	// written by a floor-off build, which has no identity gate).
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	payload := []byte(fmt.Sprintf(`{"consent_analytics":"granted","actor_digest":%q}`, consentActorDigest(cfgTuple)))
+	if err := os.WriteFile(consentRecordPath(dir), payload, 0o600); err != nil {
+		t.Fatalf("write consent record: %v", err)
+	}
+
+	client := newFloorTestClient(t, server.URL, dir, func(cfg *Config) {
+		cfg.UserID = oversized
+	})
+	// The identity contract holds at reload exactly as at decision time:
+	// the persisted grant is NOT loaded — the floor starts undecided,
+	// distinctly diagnosed — so out-of-contract identifiers never publish
+	// past the decision-time gate via a persisted state.
+	if got := client.Consent(); got != ConsentUnknown {
+		t.Fatalf("expected the out-of-contract reload refused, got %v", got)
+	}
+	if got := client.Snapshot().LastError; got != "consent_identity_invalid" {
+		t.Fatalf("expected the distinct identity diagnostic, got %q", got)
+	}
+	if err := client.Track(context.Background(), Event{Name: "e1"}); !errors.Is(err, ErrConsentUnknown) {
+		t.Fatalf("expected the pipeline closed under the refused reload, got %v", err)
+	}
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := state.snapshotOrder(); len(got) != 0 {
+		t.Fatalf("expected a fully dark session under the refused reload, got %v", got)
+	}
+}
+
+func TestConsentFloorNoResponseFailureKeepsGateArmed(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	transport := &eofOnConsentTransport{failing: true}
+	client := newFloorTestClient(t, server.URL, t.TempDir(), func(cfg *Config) {
+		cfg.HTTPClient = &http.Client{Transport: transport}
+	})
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the no-response failure counted", func() bool {
+		return client.Snapshot().ConsentFailed >= 1
+	})
+
+	// NO HTTP outcome was observed for the grant: the server may never
+	// have seen it, so the receipt counts as UNHANDED and the gate keeps
+	// holding the event legs — a batch shipped now could be the server's
+	// first-seen request, overtaking the grant.
+	if err := client.Enqueue(Event{ID: "evt-noresp-1", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Flush(context.Background()); !errors.Is(err, ErrConsentReceiptPending) {
+		t.Fatalf("expected the gate armed after a no-response dispatch failure, got %v", err)
+	}
+	if got := state.batchCount(); got != 0 {
+		t.Fatalf("expected no batch while the grant is unobserved, got %d", got)
+	}
+
+	// The endpoint heals: the receipt delivers with an OBSERVED outcome and
+	// the held events follow.
+	transport.setFailing(false)
+	clearConsentDeferral(client)
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush after the heal: %v", err)
+	}
+	order := state.snapshotOrder()
+	if state.batchCount() != 1 || order[len(order)-1] != "batch" {
+		t.Fatalf("expected the receipt observed before the batch, got %v", order)
+	}
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 }

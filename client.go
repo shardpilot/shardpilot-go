@@ -136,6 +136,27 @@ type Client struct {
 	// off (a nil channel never fires in the worker's select).
 	consentWake chan struct{}
 
+	// consentGrantArming counts floor GRANT decisions whose receipt is not
+	// yet appended to the outbox: the fast half flips the live state to
+	// granted BEFORE the ticket-ordered slow half appends the receipt, and
+	// in that window a concurrent Track/worker flush would see granted with
+	// an empty outbox — an unarmed gate — and ship a batch BEFORE the grant
+	// receipt exists. The counter arms the dispatch gate across the window
+	// (incremented with the state flip under lifecycleMu, decremented once
+	// the slow half has appended the receipt — or established that none
+	// will exist), so the event path reopens only once the receipt is the
+	// gate's own source of truth: receipt-armed-before-observable-grant,
+	// adapted to the fast/slow lock split.
+	consentGrantArming atomic.Int64
+
+	// closeDiscardedEvents counts undelivered events a MEMORY-ONLY floor
+	// client discarded when the worker stopped (no spool to retain them —
+	// typically a gated final flush's remnant). Written by the worker's
+	// stop path before workerDone closes; folded into Close's verdict as
+	// ErrEventsDiscarded on every Close call, so the loss can never read
+	// as a clean teardown.
+	closeDiscardedEvents atomic.Uint64
+
 	// initialDeferUntil seeds the flush worker's retry-pacing deadline from
 	// the spool's persisted retry_after_until_ms, so server backpressure
 	// captured before a restart still holds automatic publishes for the
@@ -389,12 +410,15 @@ func (c *Client) finishClose(ctx context.Context) error {
 		// would not silently lose them, and Close stays RETRYABLE — this
 		// call re-runs the consent drain alone (the worker and sender are
 		// already stopped; the drain dispatches directly on this goroutine)
-		// and the verdict replaces the stored one.
+		// and the verdict replaces the stored one. A discarded gated-flush
+		// remnant stays folded into the fresh verdict too: a successful
+		// receipt drain must not retroactively report a clean teardown over
+		// events that were already lost.
 		c.closeInFlight = true
 		done := make(chan struct{})
 		c.closeDone = done
 		c.closeMu.Unlock()
-		err := c.finalizeConsentOutbox(ctx)
+		err := c.closeDiscardVerdict(c.finalizeConsentOutbox(ctx))
 		c.closeMu.Lock()
 		c.closeErr = err
 		c.closeInFlight = false
@@ -453,6 +477,9 @@ func (c *Client) finishClose(ctx context.Context) error {
 	} else {
 		err = errors.Join(err, consentErr)
 	}
+	// A memory-only floor client that discarded a gated remnant reports the
+	// loss on every Close — see closeDiscardVerdict.
+	err = c.closeDiscardVerdict(err)
 
 	c.closeMu.Lock()
 	c.closeErr = err
@@ -638,8 +665,10 @@ func (c *Client) run() {
 			// Close already flushed; whatever is still undelivered — the
 			// retained batch and any queue remainder a failing endpoint left
 			// behind — is the spool's remnant (grant-gated; no-op without a
-			// spool).
+			// spool). A memory-only FLOOR client instead accounts the
+			// discarded remnant so Close can report the loss.
 			c.spoolCloseRemnant(batch)
+			c.recordDiscardedCloseRemnant(batch)
 			// Final settle: a record write that failed earlier (dirty mirror)
 			// gets one last retry before the worker exits, whatever shape the
 			// remnant took — empty, refused, or unserializable, the remnant

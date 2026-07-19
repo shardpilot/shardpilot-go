@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -324,6 +325,18 @@ func (o *consentOutbox) head() (consentReceipt, bool) {
 	return o.receipts[0], true
 }
 
+// tail returns the newest retained receipt — the LATEST explicit decision
+// still awaiting delivery — when one exists. The reload uses it as the
+// newer truth over a stale persisted decision record (see initConsentFloor).
+func (o *consentOutbox) tail() (consentReceipt, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if len(o.receipts) == 0 {
+		return consentReceipt{}, false
+	}
+	return o.receipts[len(o.receipts)-1], true
+}
+
 // prune removes the head receipt by idempotency key after an
 // acknowledgement or a terminal drop, and rewrites the record. A failed
 // rewrite never blocks the rest of the trail: the mirror is already pruned,
@@ -468,14 +481,53 @@ func (c *Client) initConsentFloor(chmod func(name string, mode os.FileMode) erro
 	}
 	c.consentOutbox.load()
 	c.drainConsentOutboxEvictions()
-	if state, ok := loadConsentRecord(c.cfg.SpoolDir, consentActorDigest(c.cfg)); ok {
-		switch state {
-		case ConsentGranted:
-			c.consent.Store(consentStateGranted)
-		case ConsentDenied:
-			c.consent.Store(consentStateDenied)
-		case ConsentDeniedForcedMinor:
-			c.consent.Store(consentStateDeniedForcedMinor)
+	if err := c.validateConsentFloorIdentity(); err != nil {
+		// The identity contract holds at RELOAD exactly as at decision
+		// time: a persisted decision (legacy, seeded, or written under a
+		// different build) must not start the floor granted for a
+		// configuration whose identifiers are out of contract — events
+		// would publish out-of-contract identifiers past the decision-time
+		// gate. Fail closed: undecided, distinctly diagnosed. Retained
+		// receipts still deliver (the sanitizer guarantees their actors are
+		// in contract).
+		c.stats.setLastError("consent_identity_invalid")
+		c.logf("shardpilot consent floor: a configured identifier exceeds the %d-byte clamp; the persisted decision is not loaded and the floor starts undecided: %v", maxConsentIdentifierBytes, err)
+	} else {
+		state, recordOK := loadConsentRecord(c.cfg.SpoolDir, consentActorDigest(c.cfg))
+		// The TRAIL TAIL is the newer truth: the newest retained receipt is
+		// the latest explicit decision, and when the decision record
+		// disagrees — the record write for that decision was still owed
+		// when the previous process ended — trusting the record would
+		// resurrect the SUPERSEDED decision (a stale grant reopening the
+		// pipeline for an actor whose last decision was a denial). The
+		// tail overrides fail-closed, and the owed record write is retried
+		// here so the disagreement heals.
+		if tail, ok := c.consentOutbox.tail(); ok && tail.ActorIdentifier == firstNonEmpty(c.cfg.UserID, c.cfg.AnonymousID) {
+			tailDecision := ConsentDecisionDenied
+			tailState := ConsentDenied
+			switch {
+			case tail.analyticsGranted():
+				tailDecision, tailState = ConsentDecisionGranted, ConsentGranted
+			case tail.Reason == consentDecisionReason:
+				tailDecision, tailState = ConsentDecisionDeniedForcedMinor, ConsentDeniedForcedMinor
+			}
+			if !recordOK || state != tailState {
+				state, recordOK = tailState, true
+				if err := saveConsentRecord(c.cfg.SpoolDir, tailDecision, consentActorDigest(c.cfg), os.Rename, chmod); err != nil {
+					c.stats.setLastError("consent_record_persist_failed")
+					c.logf("shardpilot consent floor: healing the stale decision record from the receipt trail failed (the trail-derived state still applies in memory): %v", err)
+				}
+			}
+		}
+		if recordOK {
+			switch state {
+			case ConsentGranted:
+				c.consent.Store(consentStateGranted)
+			case ConsentDenied:
+				c.consent.Store(consentStateDenied)
+			case ConsentDeniedForcedMinor:
+				c.consent.Store(consentStateDeniedForcedMinor)
+			}
 		}
 	}
 	if c.consentOutbox.pending() {
@@ -593,10 +645,21 @@ func (c *Client) dispatchConsentReceipts(ctx context.Context) map[string]struct{
 		if !ok {
 			return handed
 		}
-		handed[receipt.IdempotencyKey] = struct{}{}
 		attemptCtx, cancel := contextWithDefaultTimeout(ctx, c.cfg.HTTPTimeout)
 		_, err := c.transport.PublishConsent(attemptCtx, consentReceiptWire(receipt))
 		cancel()
+		// The dispatch gate releases only on an OBSERVED HTTP outcome: a
+		// success, or a status error — proof the request reached the server
+		// and was answered, so an event batch following in this cycle
+		// cannot be the server's first-seen request. A failure with NO
+		// response observed (connection refused, send-path EOF, a timeout
+		// before any status, a caller abort) leaves the receipt UNHANDED:
+		// the server may never have seen the grant, and the gate must keep
+		// holding the batch legs.
+		var statusErr *HTTPStatusError
+		if err == nil || errors.As(err, &statusErr) {
+			handed[receipt.IdempotencyKey] = struct{}{}
+		}
 		if err == nil {
 			c.stats.consentRecorded.Add(1)
 			o.mu.Lock()
@@ -660,10 +723,16 @@ func (c *Client) armConsentDeferral(err error) {
 }
 
 // grantReceiptGateArmed evaluates the dispatch gate after a pass: handed is
-// what THIS cycle put on the wire.
+// what THIS cycle put on the wire. A grant decision mid-append (its receipt
+// not yet in the outbox — see consentGrantArming) arms the gate exactly
+// like a retained undispatched grant: the batch legs must not reopen before
+// the receipt exists to be dispatched ahead of them.
 func (c *Client) grantReceiptGateArmed(handed map[string]struct{}) bool {
 	if !c.consentFloorEnabled() {
 		return false
+	}
+	if c.consentGrantArming.Load() > 0 {
+		return true
 	}
 	return c.consentOutbox.grantPendingDispatch(handed)
 }
@@ -712,6 +781,47 @@ func (c *Client) mintConsentReceipt(analyticsGranted bool, reason string) (conse
 		receipt.AnonymousID = c.cfg.AnonymousID
 	}
 	return receipt, true
+}
+
+// recordDiscardedCloseRemnant accounts for the undelivered events a
+// MEMORY-ONLY floor client discards when the worker stops: with no spool
+// there is nothing to retain them in — typically the remnant a gated final
+// flush left held — so they are gone. Counted into Stats.Dropped and
+// remembered for Close's verdict (ErrEventsDiscarded): the documented
+// memory-only contract is that undelivered events do not survive teardown,
+// and the floor's addition is that the loss is REPORTED rather than read
+// as a clean close. No-op with a spool configured (the remnant spooled) or
+// with the floor off (there Close's own flush error is the caller's
+// signal, unchanged).
+func (c *Client) recordDiscardedCloseRemnant(batch []Event) {
+	if c.spool != nil || !c.consentFloorEnabled() {
+		return
+	}
+	discarded := len(batch)
+	for {
+		select {
+		case <-c.queue.ch:
+			discarded++
+			continue
+		default:
+		}
+		break
+	}
+	if discarded == 0 {
+		return
+	}
+	c.stats.dropped.Add(uint64(discarded))
+	c.closeDiscardedEvents.Add(uint64(discarded))
+}
+
+// closeDiscardVerdict folds the permanent discarded-events record into a
+// Close verdict; nil-in nil-out when nothing was discarded.
+func (c *Client) closeDiscardVerdict(err error) error {
+	discarded := c.closeDiscardedEvents.Load()
+	if discarded == 0 {
+		return err
+	}
+	return errors.Join(err, fmt.Errorf("%w: %d event(s)", ErrEventsDiscarded, discarded))
 }
 
 // finalizeConsentOutbox is Close's consent-floor drain: one last dispatch

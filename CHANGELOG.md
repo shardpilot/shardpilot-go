@@ -22,7 +22,14 @@
     the 512-byte clamp rejects the decision whole with the new
     `ErrInvalidConsentIdentity` (reject, never truncate, never silently mint the receipt
     for a different actor than events carry — go's event path stamps configured
-    identifiers verbatim, deliberately unclamped).
+    identifiers verbatim, deliberately unclamped), and the same contract holds at
+    RELOAD: a persisted decision for an out-of-contract configuration is refused
+    fail-closed (undecided, diagnosed `consent_identity_invalid`). At reload the
+    receipt trail's TAIL is the newer truth: when the decision record disagrees with
+    the newest retained receipt (the record write was still owed when the previous
+    process ended), the tail's decision governs fail-closed and the stale record is
+    healed — a stale grant can never reopen the pipeline for an actor whose last
+    decision was a denial.
   - Durable consent-receipt outbox (`consent-outbox.json` under `SpoolDir`; in-memory
     without it): exactly one receipt per explicit decision — an append-only trail, a later
     decision never withdraws an earlier receipt — 32-cap FIFO evicting oldest on save, no
@@ -38,15 +45,23 @@
     operations (`Track`, `Flush`, `Close`) are bounded by the sooner of the caller's
     context and `HTTPTimeout`, and a caller-aborted attempt is no outcome (nothing
     counted, no deferral armed, receipt retained). Consent gating never feeds the EVENTS
-    plane's retry pacing. A `2xx` with an empty body (`204`, empty `200`) acknowledges a
-    consent write — the status is the acknowledgement, and the classification is
-    status-gated: a send-path EOF where no status arrived stays retryable — on the floor
-    path and the legacy fire-and-forget path alike. Receipt delivery is permitted while
-    consent is denied, on every dispatch point including an explicit `Flush` in a denied
-    session; construction is a dispatch point too (reloaded receipts re-send promptly,
-    not at the first flush tick). `Close` runs the consent drain whatever the
-    event-plane outcome, folding both verdicts (`errors.Join`) so a terminal event error
-    never masks the retryable `ErrConsentPending` state.
+    plane's retry pacing. The consent route never decodes the response body: ANY `2xx`
+    status is the acknowledgement (empty `200`, `204`, even a non-JSON body), while
+    send-path and no-status errors stay retryable — on the floor path and the legacy
+    fire-and-forget path alike. The dispatch gate releases only on an OBSERVED HTTP
+    outcome: a grant whose POST failed with no response observed (connection refused,
+    send-path EOF, a timeout before any status, a caller abort) stays unhanded and keeps
+    holding the event legs — a batch must never be the server's first-seen request ahead
+    of the grant; and a grant decision holds the event legs from the moment it is
+    OBSERVABLE, before its receipt finishes appending (the arming window). Receipt
+    delivery is permitted while consent is denied, on every dispatch point including an
+    explicit `Flush` in a denied session; construction is a dispatch point too (reloaded
+    receipts re-send promptly, not at the first flush tick). `Close` runs the consent
+    drain whatever the event-plane outcome, folding both verdicts (`errors.Join`) so a
+    terminal event error never masks the retryable `ErrConsentPending` state — and a
+    memory-only floor client that discarded a gated final flush's undelivered events
+    reports the loss on every `Close` (`ErrEventsDiscarded`, counted in `Stats.Dropped`)
+    instead of ever reading as a clean teardown.
   - Grant-receipt dispatch gate: while an analytics-grant receipt is retained undispatched
     (parked, queued, or reloaded after a relaunch), event legs hold — `Track`/`Flush`
     return the new `ErrConsentReceiptPending`, intake stays open — so post-grant events
