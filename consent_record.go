@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -27,6 +28,17 @@ import (
 const (
 	consentRecordFileName = "consent.json"
 	spoolWipeOwedFileName = "spool-wipe-owed"
+
+	// consentRecordReadLimit bounds how much of consent.json is ever read
+	// back. The record is tiny and fixed-shape (two short fields, one a
+	// 64-hex digest — well under 1 KiB); 8 KiB is generous by an order of
+	// magnitude, and a larger file is not a record this SDK could have
+	// written. The limit keeps NewClient from allocating unboundedly for a
+	// stale/corrupt/planted file in an existing SpoolDir, mirroring the
+	// bounded spool and remote-config cache reads; an over-limit file is
+	// simply no usable decision (the corrupt-record path: fail toward
+	// purging, never toward loading).
+	consentRecordReadLimit = 8 << 10
 )
 
 // consentRecordWire is the consent.json payload:
@@ -62,13 +74,20 @@ func spoolWipeOwedPath(dir string) string {
 }
 
 // loadConsentRecord reads the persisted consent decision for the given actor
-// digest. ok is false when no usable decision exists FOR THAT ACTOR — the
-// file is absent, unreadable, carries an unknown value, or was written for a
+// digest, through a hard size limit (consentRecordReadLimit) so an oversized
+// file can never make client construction read it whole. ok is false when no
+// usable decision exists FOR THAT ACTOR — the file is absent, unreadable,
+// over the read limit, carries an unknown value, or was written for a
 // different actor/scope tuple — which the spool treats exactly like an
 // explicit denial (fail toward purging, never toward loading).
 func loadConsentRecord(dir, actorDigest string) (ConsentState, bool) {
-	data, err := os.ReadFile(consentRecordPath(dir))
+	file, err := os.Open(consentRecordPath(dir))
 	if err != nil {
+		return ConsentUnknown, false
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, consentRecordReadLimit+1))
+	if err != nil || len(data) > consentRecordReadLimit {
 		return ConsentUnknown, false
 	}
 	var record consentRecordWire

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -1445,10 +1446,10 @@ func TestSpoolSharedDirMergePreservesSiblingRecords(t *testing.T) {
 	// Interleaved appends from two instances: each save reloads and merges,
 	// so neither writer's records are silently dropped by the other's
 	// mirror-only view.
-	if refused, _, _, _, persistFailed := spoolA.append([]spoolEntry{e1}, 0, now, allowed); refused || persistFailed {
+	if refused, _, _, _, persistFailed := spoolA.append([]spoolEntry{e1}, 0, false, now, allowed); refused || persistFailed {
 		t.Fatalf("append A: refused=%v persistFailed=%v", refused, persistFailed)
 	}
-	if refused, _, _, _, persistFailed := spoolB.append([]spoolEntry{e2}, 0, now, allowed); refused || persistFailed {
+	if refused, _, _, _, persistFailed := spoolB.append([]spoolEntry{e2}, 0, false, now, allowed); refused || persistFailed {
 		t.Fatalf("append B: refused=%v persistFailed=%v", refused, persistFailed)
 	}
 	record := readSpoolRecordFile(t, dir)
@@ -1647,13 +1648,13 @@ func TestSpoolMergeCapEvictionSettlesMirror(t *testing.T) {
 	// A persists two, B adds a third (the shared cap is 3), then A appends a
 	// fourth: A's merged view is [a1 a2 b1] + [a3] — over the cap — and the
 	// oldest entry dropped is A's OWN a1, which A still mirrors.
-	if refused, _, _, _, persistFailed := spoolA.append([]spoolEntry{entry("evt-mc-a1"), entry("evt-mc-a2")}, 0, now, allowed); refused || persistFailed {
+	if refused, _, _, _, persistFailed := spoolA.append([]spoolEntry{entry("evt-mc-a1"), entry("evt-mc-a2")}, 0, false, now, allowed); refused || persistFailed {
 		t.Fatalf("append A: refused=%v persistFailed=%v", refused, persistFailed)
 	}
-	if refused, _, _, _, persistFailed := spoolB.append([]spoolEntry{entry("evt-mc-b1")}, 0, now, allowed); refused || persistFailed {
+	if refused, _, _, _, persistFailed := spoolB.append([]spoolEntry{entry("evt-mc-b1")}, 0, false, now, allowed); refused || persistFailed {
 		t.Fatalf("append B: refused=%v persistFailed=%v", refused, persistFailed)
 	}
-	refused, added, _, evicted, persistFailed := spoolA.append([]spoolEntry{entry("evt-mc-a3")}, 0, now, allowed)
+	refused, added, _, evicted, persistFailed := spoolA.append([]spoolEntry{entry("evt-mc-a3")}, 0, false, now, allowed)
 	if refused || persistFailed || len(evicted) != 0 {
 		t.Fatalf("append A2: refused=%v persistFailed=%v evicted=%d", refused, persistFailed, len(evicted))
 	}
@@ -2116,7 +2117,7 @@ func TestSpoolCapacityDeadLetterDeferredUntilEvictionDurable(t *testing.T) {
 		id:  "evt-defer-2",
 		ts:  now.UTC().Format(time.RFC3339Nano),
 		raw: spoolTestEnvelope(t, "evt-defer-2", now),
-	}}, 0, now, func() bool { return true })
+	}}, 0, false, now, func() bool { return true })
 	if len(added) != 1 || !persistFailed {
 		t.Fatalf("expected the over-cap append accepted with a failed rewrite, got added=%d persistFailed=%v", len(added), persistFailed)
 	}
@@ -2281,7 +2282,7 @@ func TestSpoolDuplicateAppendRetriesDirtyWrite(t *testing.T) {
 
 	injectedErr := errors.New("injected rename failure")
 	s.renameFn = func(string, string) error { return injectedErr }
-	refused, added, _, _, persistFailed := s.append([]spoolEntry{entry}, 0, now, func() bool { return true })
+	refused, added, _, _, persistFailed := s.append([]spoolEntry{entry}, 0, false, now, func() bool { return true })
 	if refused || len(added) != 1 || !persistFailed {
 		t.Fatalf("expected the first append accepted with a failed write, got refused=%v added=%d persistFailed=%v", refused, len(added), persistFailed)
 	}
@@ -2294,7 +2295,7 @@ func TestSpoolDuplicateAppendRetriesDirtyWrite(t *testing.T) {
 	// and no deadline rides along: before the fix this early-returned without
 	// ever retrying the dirty write.
 	s.renameFn = os.Rename
-	refused, added, _, _, persistFailed = s.append([]spoolEntry{entry}, 0, now, func() bool { return true })
+	refused, added, _, _, persistFailed = s.append([]spoolEntry{entry}, 0, false, now, func() bool { return true })
 	if refused || len(added) != 0 || persistFailed {
 		t.Fatalf("expected the duplicate append to retry and land the write, got refused=%v added=%d persistFailed=%v", refused, len(added), persistFailed)
 	}
@@ -2325,7 +2326,7 @@ func TestSpoolCloseRetriesDirtyWrite(t *testing.T) {
 		id:  "evt-close-1",
 		ts:  now.UTC().Format(time.RFC3339Nano),
 		raw: spoolTestEnvelope(t, "evt-close-1", now),
-	}}, 0, now, func() bool { return true })
+	}}, 0, false, now, func() bool { return true })
 	if len(added) != 1 || !persistFailed {
 		t.Fatalf("expected the append accepted with a failed write, got added=%d persistFailed=%v", len(added), persistFailed)
 	}
@@ -2345,6 +2346,296 @@ func TestSpoolCloseRetriesDirtyWrite(t *testing.T) {
 	if len(record.Events) != 1 || !containsEventID(t, record.Events, "evt-close-1") {
 		t.Fatalf("expected Close to land the recovered write durably, got %s", mustJSON(t, record.Events))
 	}
+}
+
+func TestSpoolLoadRefusedWhenDirCannotBePrivate(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	writeConsentRecordFile(t, dir, "granted")
+	now := time.Now()
+	writeSpoolRecordFile(t, dir, 0, spoolTestEnvelope(t, "evt-dirref-1", now))
+
+	cfg := Config{
+		WorkspaceID:    "workspace-test",
+		EnvironmentID:  "develop",
+		AnonymousID:    "anon-spool-1",
+		SpoolDir:       dir,
+		SpoolMaxEvents: 8,
+		SpoolMaxBytes:  1 << 20,
+	}
+	client := &Client{cfg: cfg, clock: realClock{}, spool: newDiskSpool(cfg)}
+	// The dir pre-exists looser than 0700 and the tighten is refused: the
+	// persisted grant and record must NOT be trusted — no load, no resend
+	// seeding — the same fail-closed posture as the refused-tighten write
+	// path.
+	client.spool.chmodFn = func(string, os.FileMode) error {
+		return errors.New("chmod refused")
+	}
+	if letters := client.initSpool(); len(letters) != 0 {
+		t.Fatalf("a refused dir tighten must not produce init dead-letters, got %+v", letters)
+	}
+	if client.spool.hasResendWork() {
+		t.Fatalf("a record from an untightenable dir must not seed resend work")
+	}
+	if got := client.Snapshot().LastError; got != "spool_dir_private_failed" {
+		t.Fatalf("expected spool_dir_private_failed surfaced, got %q", got)
+	}
+	if !spoolFileExists(dir) {
+		t.Fatalf("the untrusted record must be left in place for a later run with fixed permissions")
+	}
+}
+
+func TestSpoolDeadLetterEnvelopesAreCopies(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+	state.setOutcome(http.StatusInternalServerError, "internal_error", "")
+
+	dir := t.TempDir()
+	var mutated atomic.Bool
+	client := newSpoolTestClient(t, server.URL, dir, nil, func(cfg *Config) {
+		cfg.SpoolMaxEvents = 1
+		cfg.OnSpoolDeadLetter = func(letter SpoolDeadLetter) {
+			// A worst-case integrator: shred every envelope byte slice the
+			// callback hands over. The retained/mirror bytes must be
+			// unaffected — the payload is the integrator's copy.
+			for _, envelope := range letter.Envelopes {
+				for i := range envelope {
+					envelope[i] = 'X'
+				}
+			}
+			mutated.Store(true)
+		}
+	})
+	client.SetConsent(true)
+
+	if err := client.Enqueue(Event{ID: "evt-mut-1", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Flush(context.Background()); err == nil {
+		t.Fatalf("expected the retriable failure surfaced")
+	}
+	// evt-mut-2 evicts evt-mut-1 over the 1-event cap: the capacity
+	// dead-letter fires with evt-mut-1's envelope — whose spooled bytes came
+	// from the same marshal as the worker's retained request — and the
+	// callback shreds it.
+	if err := client.Enqueue(Event{ID: "evt-mut-2", Name: "e2"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for len(client.queue.ch) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the worker to pull the second event into its batch")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := client.Flush(context.Background()); err == nil {
+		t.Fatalf("expected the retriable failure surfaced")
+	}
+	if !mutated.Load() {
+		t.Fatalf("expected the capacity dead-letter callback to have run")
+	}
+
+	// The retained batch redelivers on recovery: its wire bytes must be the
+	// ORIGINAL encoding, not the callback-mutated one.
+	state.setOutcome(http.StatusAccepted, "", "")
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("recovery Flush: %v", err)
+	}
+	bodies := state.allBodies()
+	firstWire := wireEventBytes(t, bodies[0])
+	lastWire := wireEventBytes(t, bodies[len(bodies)-1])
+	if len(firstWire) != 1 || len(lastWire) != 2 {
+		t.Fatalf("expected 1-event first body and 2-event final body, got %d/%d", len(firstWire), len(lastWire))
+	}
+	if lastWire[0] != firstWire[0] || strings.Contains(lastWire[0], "XX") {
+		t.Fatalf("callback mutation leaked into the retry bytes:\n first: %s\n retry: %s", firstWire[0], lastWire[0])
+	}
+	_ = client.Close(context.Background())
+}
+
+func TestSpoolPrivateDirTightensCwdSpoolDir(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Chdir(dir)
+
+	// SpoolDir "." resolves record paths to bare filenames (filepath.Dir
+	// "."): the 0700 state-directory guarantee must hold for the actual
+	// directory all the same.
+	s := newDiskSpool(Config{SpoolDir: ".", SpoolMaxEvents: 8, SpoolMaxBytes: 1 << 20})
+	now := time.Now()
+	refused, added, _, _, persistFailed := s.append([]spoolEntry{spoolEntryFromEnvelope(t, spoolTestEnvelope(t, "evt-cwd-1", now))}, 0, false, now, func() bool { return true })
+	if refused || len(added) != 1 || persistFailed {
+		t.Fatalf("append: refused=%v added=%d persistFailed=%v", refused, len(added), persistFailed)
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("a cwd spool dir must be tightened to 0700 like any explicit path, got %v", info.Mode().Perm())
+	}
+	record := readSpoolRecordFile(t, ".")
+	if len(record.Events) != 1 || !containsEventID(t, record.Events, "evt-cwd-1") {
+		t.Fatalf("expected the record written through the tightened cwd, got %s", mustJSON(t, record.Events))
+	}
+}
+
+func TestSpoolOversizedConsentRecordTreatedAsNoDecision(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+	state.setOutcome(http.StatusAccepted, "", "")
+
+	dir := t.TempDir()
+	// An oversized consent.json — stale, corrupt, or locally planted — must
+	// be read only through the bound and treated as no usable decision:
+	// never loaded whole, never trusted as a grant. The fixture PARSES as a
+	// granted record for this actor (a padded-but-valid JSON object), so
+	// only the size bound stands between it and being trusted.
+	oversized := fmt.Sprintf(`{"consent_analytics":"granted","actor_digest":%q,"pad":%q}`,
+		spoolTestActorDigest(), strings.Repeat("j", consentRecordReadLimit+4096))
+	if err := os.WriteFile(consentRecordPath(dir), []byte(oversized), 0o600); err != nil {
+		t.Fatalf("write oversized consent record: %v", err)
+	}
+	if _, ok := loadConsentRecord(dir, spoolTestActorDigest()); ok {
+		t.Fatalf("an over-limit consent record must be no usable decision")
+	}
+	now := time.Now()
+	writeSpoolRecordFile(t, dir, 0, spoolTestEnvelope(t, "evt-bigconsent-1", now))
+
+	recorder := &spoolDeadLetterRecorder{}
+	client := newSpoolTestClient(t, server.URL, dir, recorder, nil)
+	// No usable decision: the record purges at init (consent drop) and the
+	// client starts normally.
+	letters := recorder.byReason(SpoolDropConsent)
+	if len(letters) != 1 || !containsEventID(t, letters[0].Envelopes, "evt-bigconsent-1") {
+		t.Fatalf("expected the record purged as a consent drop, got %+v", letters)
+	}
+	if spoolFileExists(dir) {
+		t.Fatalf("expected the spool record purged from disk")
+	}
+	_ = client.Close(context.Background())
+}
+
+func TestSpoolHintlessRetryClearsPersistedDeadline(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+	state.setOutcome(http.StatusTooManyRequests, "rate_limited", "120")
+
+	dir := t.TempDir()
+	client := newSpoolTestClient(t, server.URL, dir, nil, nil)
+	client.SetConsent(true)
+
+	if err := client.Enqueue(Event{ID: "evt-hintless-1", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Flush(context.Background()); err == nil {
+		t.Fatalf("expected the 429 surfaced")
+	}
+	if got := readSpoolRecordFile(t, dir).RetryAfterUntilMS; got <= time.Now().UnixMilli() {
+		t.Fatalf("expected a live persisted deadline from the 429, got %d", got)
+	}
+
+	// The next retriable failure carries NO Retry-After: the persisted
+	// window is withdrawn — the server's latest word governs the disk
+	// exactly as it governs live pacing.
+	state.setOutcome(http.StatusInternalServerError, "internal_error", "")
+	if err := client.Flush(context.Background()); err == nil {
+		t.Fatalf("expected the 500 surfaced")
+	}
+	record := readSpoolRecordFile(t, dir)
+	if record.RetryAfterUntilMS != 0 {
+		t.Fatalf("expected the hintless failure to clear the persisted deadline, got %d", record.RetryAfterUntilMS)
+	}
+	if len(record.Events) != 1 {
+		t.Fatalf("expected the event still spooled, got %d", len(record.Events))
+	}
+	state.setOutcome(http.StatusAccepted, "", "")
+	_ = client.Close(context.Background())
+
+	// A restart must not defer: no window is being asserted anymore.
+	restarted := newSpoolTestClient(t, server.URL, dir, nil, nil)
+	if !restarted.initialDeferUntil.IsZero() {
+		t.Fatalf("expected no re-seeded deferral after the hintless clear, got %v", restarted.initialDeferUntil)
+	}
+	_ = restarted.Close(context.Background())
+}
+
+func TestSpoolResendHintlessFailureClearsPersistedDeadline(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+	state.setOutcome(http.StatusInternalServerError, "internal_error", "")
+
+	dir := t.TempDir()
+	writeConsentRecordFile(t, dir, "granted")
+	now := time.Now()
+	// A record persisted under a live Retry-After window by a previous
+	// process.
+	writeSpoolRecordFile(t, dir, now.Add(time.Hour).UnixMilli(), spoolTestEnvelope(t, "evt-resend-clear-1", now))
+
+	client := newSpoolTestClient(t, server.URL, dir, nil, nil)
+	if client.initialDeferUntil.IsZero() {
+		t.Fatalf("expected the persisted deadline to seed the deferral")
+	}
+	// The explicit-Flush resend fails WITHOUT a Retry-After: the persisted
+	// window is withdrawn while the event stays spooled for retry.
+	if err := client.Flush(context.Background()); err == nil {
+		t.Fatalf("expected the resend failure surfaced")
+	}
+	record := readSpoolRecordFile(t, dir)
+	if record.RetryAfterUntilMS != 0 {
+		t.Fatalf("expected the hintless resend failure to clear the persisted deadline, got %d", record.RetryAfterUntilMS)
+	}
+	if len(record.Events) != 1 || !containsEventID(t, record.Events, "evt-resend-clear-1") {
+		t.Fatalf("expected the event still spooled for retry, got %s", mustJSON(t, record.Events))
+	}
+	state.setOutcome(http.StatusAccepted, "", "")
+	_ = client.Close(context.Background())
+}
+
+func TestSpoolDuplicateIDBatchCountsSpooledOnce(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+	state.setOutcome(http.StatusInternalServerError, "internal_error", "")
+
+	dir := t.TempDir()
+	client := newSpoolTestClient(t, server.URL, dir, nil, nil)
+	client.SetConsent(true)
+
+	// The caller supplies the same Event.ID twice in one batch (legal — the
+	// server de-duplicates by event_id): the spool stores ONE envelope for
+	// that id and must count one.
+	if err := client.Enqueue(Event{ID: "evt-dupid-1", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Enqueue(Event{ID: "evt-dupid-1", Name: "e1b"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Enqueue(Event{ID: "evt-dupid-2", Name: "e2"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for len(client.queue.ch) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for the worker to pull the batch")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err := client.Flush(context.Background()); err == nil {
+		t.Fatalf("expected the retriable failure surfaced")
+	}
+
+	if got := len(readSpoolRecordFile(t, dir).Events); got != 2 {
+		t.Fatalf("expected two unique envelopes spooled, got %d", got)
+	}
+	if stats := client.Snapshot(); stats.Spooled != 2 {
+		t.Fatalf("expected Spooled to count unique ids (2), got Spooled=%d", stats.Spooled)
+	}
+	state.setOutcome(http.StatusAccepted, "", "")
+	_ = client.Close(context.Background())
 }
 
 func TestSpoolLoadClampsPersistedRetryDeadline(t *testing.T) {
@@ -2480,7 +2771,7 @@ func TestSpoolOwedWipeStaysClosedUntilMarkerRemoved(t *testing.T) {
 	if spoolFileExists(dir) {
 		t.Fatalf("expected the record itself wiped")
 	}
-	refused, _, _, _, _ := s.append([]spoolEntry{{id: "evt-owed-new-1", ts: time.Now().UTC().Format(time.RFC3339Nano), raw: json.RawMessage(`{}`)}}, 0, time.Now(), func() bool { return true })
+	refused, _, _, _, _ := s.append([]spoolEntry{{id: "evt-owed-new-1", ts: time.Now().UTC().Format(time.RFC3339Nano), raw: json.RawMessage(`{}`)}}, 0, false, time.Now(), func() bool { return true })
 	if !refused {
 		t.Fatalf("an append must stay refused while the stale marker persists")
 	}
@@ -2496,7 +2787,7 @@ func TestSpoolOwedWipeStaysClosedUntilMarkerRemoved(t *testing.T) {
 	if wipeOwedMarkerExists(dir) {
 		t.Fatalf("expected the marker gone")
 	}
-	refused, added, _, _, _ := s.append([]spoolEntry{spoolEntryFromEnvelope(t, spoolTestEnvelope(t, "evt-owed-new-2", time.Now()))}, 0, time.Now(), func() bool { return true })
+	refused, added, _, _, _ := s.append([]spoolEntry{spoolEntryFromEnvelope(t, spoolTestEnvelope(t, "evt-owed-new-2", time.Now()))}, 0, false, time.Now(), func() bool { return true })
 	if refused || len(added) != 1 {
 		t.Fatalf("expected the reopened spool to accept appends, got refused=%v added=%d", refused, len(added))
 	}

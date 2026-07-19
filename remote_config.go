@@ -512,12 +512,19 @@ func ensurePrivateDir(dir string, chmod func(name string, mode os.FileMode) erro
 // cache write must not lock other users out of.
 func writePrivateFileAtomic(path string, payload []byte, rename func(oldpath, newpath string) error, chmod func(name string, mode os.FileMode) error) error {
 	dir := filepath.Dir(path)
-	if dir != "." {
-		if chmod == nil {
-			if err := os.MkdirAll(dir, 0o700); err != nil {
-				return err
-			}
-		} else if err := ensurePrivateDir(dir, chmod); err != nil {
+	// filepath.Dir yields "." for a bare filename — a caller-chosen state
+	// dir of "." (or ""). The privacy guarantee applies to the ACTUAL
+	// directory all the same: the tighten path must ensure/chmod "." like
+	// any explicit path, or a cwd spool dir would silently keep whatever
+	// permissions it already had. Only the create-only (nil chmod) posture
+	// skips it — "." always exists, so there is nothing to create and, by
+	// that posture's contract, nothing may be chmodded.
+	if chmod != nil {
+		if err := ensurePrivateDir(dir, chmod); err != nil {
+			return err
+		}
+	} else if dir != "." {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return err
 		}
 	}

@@ -745,10 +745,16 @@ func (s *diskSpool) evictOverCapsLocked() []spoolEntry {
 // De-duplicated by event_id; oldest-first eviction may reach into the batch
 // being appended, in which case only the survivors count as durably spooled.
 // deadlineMS, when non-zero, records the live server Retry-After deadline
-// this batch was spooled under (the server's latest word replaces an earlier
-// stored one). An append that changes nothing (everything expired or
-// duplicate, no deadline) skips the rewrite entirely.
-func (s *diskSpool) append(batch []spoolEntry, deadlineMS int64, now time.Time, allowed func() bool) (refused bool, added, expired, evicted []spoolEntry, persistFailed bool) {
+// this batch was spooled under; clearStaleDeadline marks a retriable FAILURE
+// that carried no deadline — the server's latest word governs either way, so
+// a live hint replaces the stored deadline and a hintless failure WITHDRAWS
+// it (a restart must not park behind a window the server stopped asserting;
+// mirrors applyRetryPacing, whose client-side backoff is never persisted).
+// The Close remnant append is not a failure outcome and passes
+// clearStaleDeadline=false, so a live window survives it into the next
+// start. An append that changes nothing (everything expired or duplicate, no
+// deadline change) skips the rewrite entirely.
+func (s *diskSpool) append(batch []spoolEntry, deadlineMS int64, clearStaleDeadline bool, now time.Time, allowed func() bool) (refused bool, added, expired, evicted []spoolEntry, persistFailed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.owed || !allowed() {
@@ -771,7 +777,18 @@ func (s *diskSpool) append(batch []spoolEntry, deadlineMS int64, now time.Time, 
 		s.totalBytes += len(entry.raw)
 		appended[entry.id] = struct{}{}
 	}
-	if len(appended) == 0 && deadlineMS <= 0 {
+	deadlineChanged := false
+	if deadlineMS > 0 {
+		s.retryAfterUntilMS = deadlineMS
+		deadlineChanged = true
+	} else if clearStaleDeadline && s.retryAfterUntilMS != 0 {
+		// The latest retriable failure carried no Retry-After: the stored
+		// deadline is no longer the server's word, and keeping it would park
+		// a restart's publishes behind backpressure nobody is asserting.
+		s.retryAfterUntilMS = 0
+		deadlineChanged = true
+	}
+	if len(appended) == 0 && !deadlineChanged {
 		// Nothing new to write — but a PREVIOUS append may have accepted
 		// entries into the mirror under a failed record write (dirty). This
 		// path is exactly how that batch comes back (a retained batch's
@@ -786,16 +803,22 @@ func (s *diskSpool) append(batch []spoolEntry, deadlineMS int64, now time.Time, 
 		return false, nil, expired, nil, persistFailed
 	}
 	evicted = s.evictOverCapsLocked()
+	countedAdded := make(map[string]struct{}, len(appended))
 	for _, entry := range batch {
 		if _, wasAppended := appended[entry.id]; !wasAppended {
 			continue
 		}
+		if _, counted := countedAdded[entry.id]; counted {
+			// A duplicate id within THIS batch stored only its first
+			// envelope (the insert loop's s.ids check skipped the rest):
+			// counting later occurrences would report more durably spooled
+			// events than the record holds.
+			continue
+		}
 		if _, survived := s.ids[entry.id]; survived {
+			countedAdded[entry.id] = struct{}{}
 			added = append(added, entry)
 		}
-	}
-	if deadlineMS > 0 {
-		s.retryAfterUntilMS = deadlineMS
 	}
 	persistFailed = s.saveLocked() != nil
 	if persistFailed {
@@ -964,7 +987,12 @@ func spoolEntryIDs(chunk []spoolEntry) []string {
 func spoolDeadLetterFrom(reason SpoolDropReason, entries []spoolEntry) SpoolDeadLetter {
 	envelopes := make([]json.RawMessage, len(entries))
 	for i, entry := range entries {
-		envelopes[i] = entry.raw
+		// The callback payload is the integrator's to keep or mutate: it must
+		// never alias the live bytes backing the retained request or the
+		// spool mirror, or a callback that redacts/annotates an envelope
+		// would silently corrupt the byte-identical retry/resend contract
+		// under that same event_id.
+		envelopes[i] = append(json.RawMessage(nil), entry.raw...)
 	}
 	return SpoolDeadLetter{Reason: reason, Envelopes: envelopes}
 }
@@ -1088,7 +1116,13 @@ func (c *Client) spoolFailedBatch(request batchRequest, cause error) {
 	}
 	// An owed wipe is retried before any append; still owed refuses disk.
 	s.settleOwedWipe()
-	refused, added, expired, evicted, persistFailed := s.append(eligible, c.spoolDeadlineFromError(cause), c.clock.Now(), func() bool {
+	deadlineMS := c.spoolDeadlineFromError(cause)
+	// A retriable failure that carried NO usable Retry-After withdraws a
+	// previously persisted deadline (the server's latest word governs). The
+	// Close remnant append (cause == nil) is not a failure outcome: a live
+	// persisted window must survive it into the next start.
+	clearStale := cause != nil && deadlineMS <= 0
+	refused, added, expired, evicted, persistFailed := s.append(eligible, deadlineMS, clearStale, c.clock.Now(), func() bool {
 		return c.consent.Load() == consentStateGranted && s.grantPersisted
 	})
 	if refused {
@@ -1301,10 +1335,18 @@ func (c *Client) resendSpooledChunks(deferUntil *time.Time, backoffAttempt *int)
 
 // spoolStoreResendDeadline writes through the server Retry-After deadline a
 // retriable spool-resend failure carried, so a process exit before the
-// in-memory retry still honors the remaining window at the next start.
+// in-memory retry still honors the remaining window at the next start. A
+// hintless retriable resend failure WITHDRAWS a previously persisted
+// deadline instead — the same latest-word rule as the append path: the
+// server stopped asserting a window, so a restart must not park behind the
+// stale one.
 func (c *Client) spoolStoreResendDeadline(err error) {
 	deadlineMS := c.spoolDeadlineFromError(err)
 	if deadlineMS <= 0 {
+		if c.spool.clearRetryDeadline() {
+			c.recordSpoolPersistFailure()
+		}
+		c.drainSpoolCapacityDrops()
 		return
 	}
 	if c.spool.storeRetryDeadline(deadlineMS) {
@@ -1430,6 +1472,20 @@ func (c *Client) initSpool() []SpoolDeadLetter {
 		return nil
 	}
 	if state, ok := loadConsentRecord(s.dir, s.actorDigest); ok && state == ConsentGranted {
+		// The persisted record may be trusted — loaded, resend-seeded,
+		// rewritten — only through a directory whose privacy is established.
+		// An existing SpoolDir that cannot be tightened to 0700 fails the
+		// spool CLOSED instead: no load, no resend, matching the
+		// refused-tighten write path's posture (would-spool batches keep
+		// dead-lettering through the closed write gate, which requires a
+		// successful record persist through this same tighten). The on-disk
+		// records are left in place for a later run with the permissions
+		// fixed.
+		if err := ensurePrivateDir(s.dir, s.chmodFn); err != nil {
+			c.stats.setLastError("spool_dir_private_failed")
+			c.logf("shardpilot spool: the spool directory could not be made private (0700); the persisted record is not loaded and the disk spool is disabled: %v", err)
+			return nil
+		}
 		outcome := s.load(c.clock.Now())
 		var letters []SpoolDeadLetter
 		if len(outcome.expired) > 0 {

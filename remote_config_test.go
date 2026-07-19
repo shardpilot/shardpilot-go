@@ -1685,7 +1685,29 @@ func TestRemoteConfigCacheRoundTripsHTMLDenseBody(t *testing.T) {
 	defer server.Close()
 
 	cachePath := filepath.Join(t.TempDir(), "rc-cache.json")
-	first := newRemoteConfigClient(t, server.URL, cachePath, "anon-rc-1")
+	// The priming fetch moves a ~700KB body; the shared helper's 1s
+	// HTTPTimeout flaked under loaded -race soaks (deadline mid-body), so
+	// this fixture gives the fetch comfortable headroom — the test is about
+	// the cache round trip, not timeout behavior.
+	first, err := NewClient(Config{
+		IngestURL:             server.URL,
+		Token:                 "test-token",
+		WorkspaceID:           "workspace-test",
+		AppID:                 "app-test",
+		EnvironmentID:         "develop",
+		Source:                SourceBackend,
+		AnonymousID:           "anon-rc-1",
+		APIKey:                "test-rc-key",
+		RemoteConfigURL:       server.URL,
+		RemoteConfigCachePath: cachePath,
+		BatchSize:             2,
+		BufferSize:            4,
+		FlushInterval:         time.Hour,
+		HTTPTimeout:           10 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
 	if _, err := first.FetchRemoteConfig(context.Background()); err != nil {
 		t.Fatalf("FetchRemoteConfig: %v", err)
 	}
