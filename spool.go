@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -64,11 +65,13 @@ const (
 	// days, future-dated beyond the skew tolerance, or undatable).
 	SpoolDropExpired SpoolDropReason = "expired"
 	// SpoolDropTerminal: a permanent ingest outcome settled previously
-	// spooled events.
+	// spooled events — a batch-level permanent failure, or a per-event
+	// `rejected` verdict inside a resent chunk's 2xx.
 	SpoolDropTerminal SpoolDropReason = "terminal"
-	// SpoolDropConsent: a consent purge dropped the record, or a
+	// SpoolDropConsent: a consent purge dropped the record, a
 	// would-have-spooled batch was refused disk under a non-grant or
-	// owed-wipe state.
+	// owed-wipe state, or a resent event came back consent-suppressed in the
+	// response's per-event verdicts.
 	SpoolDropConsent SpoolDropReason = "consent"
 )
 
@@ -98,7 +101,22 @@ const (
 	// retry_after_until_ms, matching the ingest plane's Retry-After clamp so
 	// wall-clock skew in the stored deadline cannot park the client longer.
 	spoolMaxDeferralSeed = 24 * time.Hour
+
+	// spoolRecordReadOverhead is the fixed allowance over SpoolMaxBytes for
+	// the record's own JSON framing when reading spool.json back. Every save
+	// re-applies the byte cap to the EVENT bytes before writing, so a
+	// legitimate record can exceed the cap only by its framing (field names,
+	// separators, the deadline) — a few KB at the 2000-event cap; 64 KiB is
+	// generous by orders of magnitude, and a file larger than the cap plus
+	// this is not a record this spool could have written.
+	spoolRecordReadOverhead = 64 << 10
 )
+
+// errSpoolRecordOversized marks a spool.json exceeding the bounded read
+// limit: it is handled by the corrupt-record path (discarded, clean start)
+// without ever being read whole — the bounded-spool guarantee must hold at
+// load time too, not just for what this process writes.
+var errSpoolRecordOversized = errors.New("spool record exceeds the bounded read limit")
 
 // spoolRecordWire is the spool.json payload. Events hold the exact
 // wire-serialized envelope bytes; retry_after_until_ms carries a live server
@@ -213,11 +231,12 @@ type diskSpool struct {
 	// another writer's mutations detected on the shared directory.
 	countForeign func(n int)
 
-	// removeFn/renameFn are the file primitives, injectable so tests can
-	// exercise purge and persist failures deterministically (the same seam
-	// discipline as createAnonymousIDWith).
+	// removeFn/renameFn/chmodFn are the file primitives, injectable so tests
+	// can exercise purge, persist, and refused-dir-tighten failures
+	// deterministically (the same seam discipline as createAnonymousIDWith).
 	removeFn func(path string) error
 	renameFn func(oldpath, newpath string) error
+	chmodFn  func(name string, mode os.FileMode) error
 }
 
 // spoolSettledMemory bounds the settled-id memory used to suppress
@@ -237,6 +256,7 @@ func newDiskSpool(cfg Config) *diskSpool {
 		actorDigest:  consentActorDigest(cfg),
 		removeFn:     os.Remove,
 		renameFn:     os.Rename,
+		chmodFn:      os.Chmod,
 	}
 	s.owed = wipeOwedMarkerExists(s.dir)
 	return s
@@ -360,7 +380,7 @@ func (s *diskSpool) saveLocked() error {
 	}
 	payload, err := json.Marshal(record)
 	if err == nil {
-		err = writePrivateFileAtomic(s.filePath(), payload, s.renameFn)
+		err = writePrivateFileAtomic(s.filePath(), payload, s.renameFn, s.chmodFn)
 	}
 	s.dirty = err != nil
 	if err == nil && len(s.uncountedIDs) > 0 {
@@ -508,8 +528,31 @@ func (s *diskSpool) readRecordEntries() []spoolEntry {
 	return s.readRecordEntriesLocked()
 }
 
+// readRecordBytesLocked reads spool.json through a hard size limit derived
+// from the byte cap (SpoolMaxBytes plus a fixed framing overhead), so an
+// unexpectedly large record — a previous buggy version, different caps, or
+// local tampering — can never make startup or a merging save allocate
+// unbounded memory before the caps get a chance to apply. An over-limit file
+// returns errSpoolRecordOversized for the caller's corrupt-record handling.
+func (s *diskSpool) readRecordBytesLocked() ([]byte, error) {
+	file, err := os.Open(s.filePath())
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	limit := int64(s.maxBytes) + spoolRecordReadOverhead
+	data, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, errSpoolRecordOversized
+	}
+	return data, nil
+}
+
 func (s *diskSpool) readRecordEntriesLocked() []spoolEntry {
-	data, err := os.ReadFile(s.filePath())
+	data, err := s.readRecordBytesLocked()
 	if err != nil {
 		return nil
 	}
@@ -547,8 +590,13 @@ func (s *diskSpool) load(now time.Time) spoolLoadOutcome {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var outcome spoolLoadOutcome
-	data, err := os.ReadFile(s.filePath())
+	data, err := s.readRecordBytesLocked()
 	if err != nil {
+		if errors.Is(err, errSpoolRecordOversized) {
+			// Over the bounded read limit: not a record this spool could have
+			// written, treated exactly like a record that does not parse.
+			_ = s.removeRecordFile()
+		}
 		return outcome
 	}
 	var record spoolRecordWire
@@ -764,6 +812,14 @@ func (s *diskSpool) requeueResend(chunk []spoolEntry) {
 		}
 	}
 	s.resend = append(kept, s.resend...)
+}
+
+// hasResendWork reports whether startup-loaded entries still await
+// re-publish (never under an owed wipe: the spool is fail-closed then).
+func (s *diskSpool) hasResendWork() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return !s.owed && len(s.resend) > 0
 }
 
 // retryPersist re-attempts a failed record rewrite (flush-cadence retry).
@@ -1002,13 +1058,76 @@ func (c *Client) spoolSettleTerminal(request batchRequest) {
 	c.drainSpoolCapacityDrops()
 }
 
-// settleResentChunk settles a successfully re-published spool chunk.
-func (c *Client) settleResentChunk(chunk []spoolEntry) {
-	c.stats.spoolResent.Add(uint64(len(chunk)))
-	if _, persistFailed := c.spool.ack(spoolEntryIDs(chunk)); persistFailed {
+// spoolVerdictDropReason maps a per-event ingest verdict to the dead-letter
+// class a spooled event settled by it drops with: a rejection is a terminal
+// server outcome, and a consent suppression is a consent outcome. Everything
+// else — accepted, observed, duplicate, an event absent from the verdict
+// list, or a status this build does not recognize — reports no drop.
+func spoolVerdictDropReason(status EventStatus) (SpoolDropReason, bool) {
+	switch status {
+	case EventStatusRejected:
+		return SpoolDropTerminal, true
+	case EventStatusSuppressedNoConsent, EventStatusSuppressedAdRevenueConsent:
+		return SpoolDropConsent, true
+	default:
+		return "", false
+	}
+}
+
+// settleResentChunk settles a re-published spool chunk from the response's
+// per-event verdicts. Every event in an accepted batch is SETTLED on the
+// server — removal from the spool is right for all of them, and retrying any
+// would only re-produce the same verdict — but a 2xx is not delivery
+// confirmation per event: a per-event terminal verdict (rejected, or a
+// consent suppression, which the batch contract explicitly says is not
+// delivery) means the spooled event was dropped, so it dead-letters with the
+// matching class instead of counting as resent. An event the verdict list
+// does not mention, or whose status this build cannot classify, settles as
+// delivered — inventing a drop for an unrecognized status would false-alarm
+// the dead-letter contract (mirroring Stats.ByStatus's carry-through
+// posture).
+func (c *Client) settleResentChunk(chunk []spoolEntry, result batchResult) {
+	verdicts := make(map[string]EventStatus, len(result.Events))
+	for _, event := range result.Events {
+		verdicts[event.EventID] = EventStatus(event.Status)
+	}
+	resent := 0
+	for _, entry := range chunk {
+		if _, dropped := spoolVerdictDropReason(verdicts[entry.id]); !dropped {
+			resent++
+		}
+	}
+	if resent > 0 {
+		c.stats.spoolResent.Add(uint64(resent))
+	}
+	removed, persistFailed := c.spool.ack(spoolEntryIDs(chunk))
+	var terminal, consentDropped []spoolEntry
+	for _, entry := range removed {
+		reason, dropped := spoolVerdictDropReason(verdicts[entry.id])
+		if !dropped {
+			continue
+		}
+		if reason == SpoolDropConsent {
+			consentDropped = append(consentDropped, entry)
+		} else {
+			terminal = append(terminal, entry)
+		}
+	}
+	c.notifySpoolDeadLetter(SpoolDropTerminal, terminal)
+	c.notifySpoolDeadLetter(SpoolDropConsent, consentDropped)
+	if persistFailed {
 		c.recordSpoolPersistFailure()
 	}
 	c.drainSpoolCapacityDrops()
+}
+
+// spoolHasResendWork reports pending spool resend work for the worker's
+// recovery wake: a success that proves the endpoint healthy again must kick
+// requeued spooled chunks too, or spool-only work would idle until the next
+// flush tick (potentially hours away) even though the batch that proved
+// recovery already delivered.
+func (c *Client) spoolHasResendWork() bool {
+	return c.spool != nil && c.spool.hasResendWork()
 }
 
 // resendSpooledChunks re-publishes startup-loaded spool chunks on the
@@ -1032,11 +1151,11 @@ func (c *Client) resendSpooledChunks(deferUntil *time.Time, backoffAttempt *int)
 			return true
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), c.cfg.HTTPTimeout)
-		err := c.publishRequest(ctx, spoolChunkRequest(chunk), len(chunk))
+		result, err := c.publishRequestResult(ctx, spoolChunkRequest(chunk), len(chunk))
 		cancel()
 		c.applyRetryPacing(err, deferUntil, backoffAttempt)
 		if err == nil {
-			c.settleResentChunk(chunk)
+			c.settleResentChunk(chunk, result)
 			continue
 		}
 		if errors.Is(err, ErrConsentDenied) {
@@ -1096,9 +1215,9 @@ func (c *Client) flushSpooledChunks(ctx context.Context, backoffAttempt *int) er
 		if len(chunk) == 0 {
 			return firstErr
 		}
-		err := c.publishRequest(ctx, spoolChunkRequest(chunk), len(chunk))
+		result, err := c.publishRequestResult(ctx, spoolChunkRequest(chunk), len(chunk))
 		if err == nil {
-			c.settleResentChunk(chunk)
+			c.settleResentChunk(chunk, result)
 			*backoffAttempt = 0
 			continue
 		}
@@ -1166,7 +1285,11 @@ func (c *Client) spoolCloseRemnant(batch []Event) {
 	if len(remnant) == 0 {
 		return
 	}
-	request, err := c.buildBatch(remnant)
+	// The retained batch's prefix reuses its retained wire bytes (the append
+	// de-duplicates by event_id against bytes already spooled at the failure,
+	// so a re-encode drifting under a mutated Props value must not happen
+	// here either); the queue remainder builds fresh.
+	request, err := c.buildBatchReusing(remnant, c.retainedRequest)
 	if err != nil {
 		c.logf("shardpilot spool: close remnant could not be serialized and was dropped: %v", err)
 		return
@@ -1250,7 +1373,7 @@ func (c *Client) applySpoolConsentLocked(analyticsGranted bool) []SpoolDeadLette
 			c.stats.setLastError("spool_purge_failed")
 			c.logf("shardpilot spool: consent purge failed; a wipe is owed and the disk spool is disabled until it succeeds: %v", err)
 		}
-		if recordErr := saveConsentRecord(s.dir, false, s.actorDigest, s.renameFn); recordErr != nil {
+		if recordErr := saveConsentRecord(s.dir, false, s.actorDigest, s.renameFn, s.chmodFn); recordErr != nil {
 			c.stats.setLastError("consent_record_persist_failed")
 			c.logf("shardpilot spool: persisting the denied consent record failed (the decision still applies in memory): %v", recordErr)
 		}
@@ -1264,7 +1387,7 @@ func (c *Client) applySpoolConsentLocked(analyticsGranted bool) []SpoolDeadLette
 		c.logf("shardpilot spool: a spool wipe is still owed; the persisted consent decision stays denied and the disk spool stays disabled until the wipe succeeds")
 		return nil
 	}
-	if err := saveConsentRecord(s.dir, true, s.actorDigest, s.renameFn); err != nil {
+	if err := saveConsentRecord(s.dir, true, s.actorDigest, s.renameFn, s.chmodFn); err != nil {
 		s.mu.Lock()
 		s.grantPersisted = false
 		s.mu.Unlock()

@@ -137,6 +137,47 @@ func (c *Client) buildBatch(events []Event) (batchRequest, error) {
 	return batchRequest{Events: envelopes, rawEvents: raws}, nil
 }
 
+// buildBatchReusing is buildBatch for the worker's retry paths: it reuses the
+// already-marshaled envelopes a previous (retriably failed) attempt retained,
+// for the longest leading prefix whose event ids still line up position by
+// position, and builds only the events beyond it. Reuse is what keeps an
+// in-process retry byte-identical to the bytes that failure spooled:
+// rebuilding from the Event batch would re-marshal Props/Context, whose
+// NESTED values the caller can mutate after Enqueue (intake clones one level
+// deep), and drift bytes under the same event_id — one encoding per event_id
+// everywhere: wire, disk, retry. A retained request that no longer
+// corresponds (the batch was cleared, replaced, or reordered) contributes
+// nothing and everything rebuilds.
+func (c *Client) buildBatchReusing(events []Event, retained batchRequest) (batchRequest, error) {
+	reuse := len(retained.Events)
+	if reuse > len(events) || len(retained.Events) != len(retained.rawEvents) {
+		reuse = 0
+	}
+	for i := 0; i < reuse; i++ {
+		if retained.Events[i].EventID != events[i].ID {
+			reuse = i
+			break
+		}
+	}
+	envelopes := make([]eventEnvelope, 0, len(events))
+	raws := make([]json.RawMessage, 0, len(events))
+	envelopes = append(envelopes, retained.Events[:reuse]...)
+	raws = append(raws, retained.rawEvents[:reuse]...)
+	for _, event := range events[reuse:] {
+		envelope, err := c.buildEnvelope(event)
+		if err != nil {
+			return batchRequest{}, err
+		}
+		raw, err := json.Marshal(envelope)
+		if err != nil {
+			return batchRequest{}, &EncodeError{Err: err}
+		}
+		envelopes = append(envelopes, envelope)
+		raws = append(raws, raw)
+	}
+	return batchRequest{Events: envelopes, rawEvents: raws}, nil
+}
+
 func cloneMap(in map[string]any) map[string]any {
 	if len(in) == 0 {
 		return nil

@@ -18,13 +18,13 @@ func TestConsentRecordRoundTrip(t *testing.T) {
 	if _, ok := loadConsentRecord(dir, digest); ok {
 		t.Fatalf("expected no decision from an absent record")
 	}
-	if err := saveConsentRecord(dir, true, digest, os.Rename); err != nil {
+	if err := saveConsentRecord(dir, true, digest, os.Rename, os.Chmod); err != nil {
 		t.Fatalf("save granted: %v", err)
 	}
 	if state, ok := loadConsentRecord(dir, digest); !ok || state != ConsentGranted {
 		t.Fatalf("expected a granted record, got %v %v", state, ok)
 	}
-	if err := saveConsentRecord(dir, false, digest, os.Rename); err != nil {
+	if err := saveConsentRecord(dir, false, digest, os.Rename, os.Chmod); err != nil {
 		t.Fatalf("save denied: %v", err)
 	}
 	if state, ok := loadConsentRecord(dir, digest); !ok || state != ConsentDenied {

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1313,5 +1314,103 @@ func TestRemoteConfigCooldownHonorsCanceledContext(t *testing.T) {
 	result, err := client.FetchRemoteConfig(context.Background())
 	if err != nil || !result.FromCache || result.Reason != "transient_429" {
 		t.Fatalf("expected the live in-window fetch cache-served, got %+v %v", result, err)
+	}
+}
+
+// blockingFetchTransport holds a remote-config fetch inside the transport
+// until the test releases it, then answers a fresh 200 — for proving Close
+// fences in-flight fetches.
+type blockingFetchTransport struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (t *blockingFetchTransport) Publish(context.Context, batchRequest) (batchResult, error) {
+	return batchResult{}, nil
+}
+
+func (t *blockingFetchTransport) PublishConsent(context.Context, consentRequest) (consentResult, error) {
+	return consentResult{Recorded: true}, nil
+}
+
+func (t *blockingFetchTransport) FetchRemoteConfig(context.Context, remoteConfigRequest) (remoteConfigResponse, error) {
+	t.once.Do(func() { close(t.started) })
+	<-t.release
+	return remoteConfigResponse{status: 200, body: []byte(`{"values":{"fence":"held"}}`), etag: `"rc-fence-1"`}, nil
+}
+
+func TestRemoteConfigCloseFencesInFlightFetch(t *testing.T) {
+	cachePath := filepath.Join(t.TempDir(), "rc-cache.json")
+	client, err := NewClient(Config{
+		IngestURL:             "http://127.0.0.1:9", // never dialed: the transport is replaced below
+		Token:                 "test-token",
+		WorkspaceID:           "workspace-test",
+		AppID:                 "app-test",
+		EnvironmentID:         "develop",
+		Source:                SourceBackend,
+		AnonymousID:           "anon-rc-1",
+		APIKey:                "test-rc-key",
+		RemoteConfigURL:       "http://127.0.0.1:9",
+		RemoteConfigCachePath: cachePath,
+		BatchSize:             2,
+		BufferSize:            4,
+		FlushInterval:         time.Hour,
+		HTTPTimeout:           time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	transport := &blockingFetchTransport{started: make(chan struct{}), release: make(chan struct{})}
+	client.transport = transport
+
+	fetchDone := make(chan error, 1)
+	go func() {
+		_, fetchErr := client.FetchRemoteConfig(context.Background())
+		fetchDone <- fetchErr
+	}()
+	select {
+	case <-transport.started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for the fetch to enter the transport")
+	}
+
+	closeDone := make(chan struct{})
+	go func() {
+		_ = client.Close(context.Background())
+		close(closeDone)
+	}()
+	// Close must WAIT for the in-flight fetch — the same lifecycle fence as a
+	// synchronous Track publish — never return around live fetch I/O.
+	select {
+	case <-closeDone:
+		t.Fatal("Close returned while a remote-config fetch was still in flight")
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	close(transport.release)
+	select {
+	case fetchErr := <-fetchDone:
+		if fetchErr != nil {
+			t.Fatalf("FetchRemoteConfig: %v", fetchErr)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for the released fetch to return")
+	}
+	select {
+	case <-closeDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for Close to return after the fetch settled")
+	}
+
+	// The fetch settled — including its durable cache write — BEFORE Close
+	// returned; nothing runs after it.
+	record := readRemoteConfigCacheFile(t, cachePath)
+	if record.Body != `{"values":{"fence":"held"}}` {
+		t.Fatalf("expected the in-flight fetch's cache write completed before Close returned, got %q", record.Body)
+	}
+	// A fetch that begins after Close is rejected outright.
+	if _, err := client.FetchRemoteConfig(context.Background()); !errors.Is(err, ErrClosed) {
+		t.Fatalf("expected ErrClosed for a post-close fetch, got %v", err)
 	}
 }

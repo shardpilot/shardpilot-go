@@ -89,10 +89,11 @@ func loadConsentRecord(dir, actorDigest string) (ConsentState, bool) {
 }
 
 // saveConsentRecord persists a consent decision, stamped with the actor
-// digest it covers, with the SDK's private-file discipline (0700 dir, 0600
-// file, full temp write + atomic rename). rename is injectable so tests can
-// exercise persist failures deterministically.
-func saveConsentRecord(dir string, granted bool, actorDigest string, rename func(oldpath, newpath string) error) error {
+// digest it covers, with the SDK's private-file discipline (0700 dir —
+// tightened when it pre-exists looser — 0600 file, full temp write + atomic
+// rename). rename and chmod are injectable so tests can exercise persist and
+// refused-tighten failures deterministically.
+func saveConsentRecord(dir string, granted bool, actorDigest string, rename func(oldpath, newpath string) error, chmod func(name string, mode os.FileMode) error) error {
 	decision := "denied"
 	if granted {
 		decision = "granted"
@@ -101,14 +102,14 @@ func saveConsentRecord(dir string, granted bool, actorDigest string, rename func
 	if err != nil {
 		return err
 	}
-	return writePrivateFileAtomic(consentRecordPath(dir), payload, rename)
+	return writePrivateFileAtomic(consentRecordPath(dir), payload, rename, chmod)
 }
 
 // createWipeOwedMarker records that a spool purge failed and a wipe is still
 // owed, so the fail-closed state survives a restart. Presence is the flag;
 // the file carries no content.
 func createWipeOwedMarker(dir string) error {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := ensurePrivateDir(dir, os.Chmod); err != nil {
 		return err
 	}
 	file, err := os.OpenFile(spoolWipeOwedPath(dir), os.O_CREATE|os.O_WRONLY, 0o600)

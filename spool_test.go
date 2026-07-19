@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1746,6 +1747,284 @@ func TestSpoolAppendExpiresPreAgedEnvelopes(t *testing.T) {
 	}
 	if stats := client.Snapshot(); stats.SpoolExpired != 2 || stats.Spooled != 1 {
 		t.Fatalf("expected SpoolExpired=2 and Spooled=1, got %+v", stats)
+	}
+	_ = client.Close(context.Background())
+}
+
+func TestSpoolPreExistingStateDirTightenedToPrivate(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+	state.setOutcome(http.StatusAccepted, "", "")
+
+	// The app pre-created the state dir with loose permissions: os.MkdirAll
+	// alone would keep them (its mode applies only to dirs it creates), so
+	// the first private write must TIGHTEN the dir to the documented 0700.
+	dir := filepath.Join(t.TempDir(), "state")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	client := newSpoolTestClient(t, server.URL, dir, nil, nil)
+	defer client.Close(context.Background())
+	client.SetConsent(true)
+
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("expected the pre-existing state dir tightened to 0700, got %v", info.Mode().Perm())
+	}
+	if _, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok {
+		t.Fatalf("expected the grant record persisted alongside the tighten")
+	}
+}
+
+func TestSpoolChmodRefusedFailsClosedAndDeadLetters(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+	state.setOutcome(http.StatusInternalServerError, "internal_error", "")
+
+	dir := filepath.Join(t.TempDir(), "state")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	recorder := &spoolDeadLetterRecorder{}
+	client := newSpoolTestClient(t, server.URL, dir, recorder, nil)
+
+	// The dir's privacy cannot be established (chmod refused): the write is a
+	// persist failure — never a silent proceed — so the grant record fails,
+	// the spool stays closed, and would-have-spooled batches dead-letter.
+	client.spool.chmodFn = func(string, os.FileMode) error {
+		return errors.New("chmod refused")
+	}
+	client.SetConsent(true)
+	if got := client.Snapshot().LastError; got != "consent_record_persist_failed" {
+		t.Fatalf("expected the refused tighten surfaced as a record persist failure, got %q", got)
+	}
+
+	if err := client.Enqueue(Event{ID: "evt-chmod-1", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Flush(context.Background()); err == nil {
+		t.Fatalf("expected the retriable failure surfaced")
+	}
+	if spoolFileExists(dir) {
+		t.Fatalf("nothing may be written through a dir whose privacy could not be established")
+	}
+	letters := recorder.byReason(SpoolDropConsent)
+	if len(letters) == 0 || !containsEventID(t, letters[0].Envelopes, "evt-chmod-1") {
+		t.Fatalf("expected the refused batch dead-lettered, got %+v", letters)
+	}
+	state.setOutcome(http.StatusAccepted, "", "")
+	_ = client.Close(context.Background())
+}
+
+func TestSpoolOversizedRecordDiscardedWithoutFullLoad(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+	state.setOutcome(http.StatusAccepted, "", "")
+
+	dir := t.TempDir()
+	writeConsentRecordFile(t, dir, "granted")
+	// A VALID record far beyond SpoolMaxBytes plus the framing allowance —
+	// e.g. left by a version with different caps, or tampered. Loading it
+	// whole and then evicting would defeat the bounded-spool guarantee, so
+	// the bounded read treats it as corrupt: discarded as a clean start, with
+	// NO eviction cascade (which would dead-letter every entry).
+	now := time.Now()
+	pad := strings.Repeat("x", 4096)
+	envelopes := make([]json.RawMessage, 0, 20)
+	for i := 0; i < 20; i++ {
+		envelopes = append(envelopes, json.RawMessage(fmt.Sprintf(
+			`{"event_id":"evt-oversized-%d","event_ts":%q,"pad":%q}`, i, now.UTC().Format(time.RFC3339Nano), pad)))
+	}
+	writeSpoolRecordFile(t, dir, 0, envelopes...)
+
+	recorder := &spoolDeadLetterRecorder{}
+	client := newSpoolTestClient(t, server.URL, dir, recorder, func(cfg *Config) {
+		cfg.SpoolMaxBytes = 4096
+	})
+	if spoolFileExists(dir) {
+		t.Fatalf("expected the over-limit record discarded at load")
+	}
+	if recorder.count() != 0 {
+		t.Fatalf("an over-limit record is a clean start, not an eviction cascade; got %d letters", recorder.count())
+	}
+	if stats := client.Snapshot(); stats.SpoolEvicted != 0 || stats.SpoolExpired != 0 {
+		t.Fatalf("expected no drop counters from the discarded record, got %+v", stats)
+	}
+	if !client.initialDeferUntil.IsZero() {
+		t.Fatalf("expected no deferral seeded from a discarded record")
+	}
+
+	// The client starts clean and functions normally.
+	if err := client.Enqueue(Event{ID: "evt-after-oversize-1", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	arrivals := state.allArrivals()
+	if len(arrivals) != 1 || len(arrivals[0]) != 1 || arrivals[0][0] != "evt-after-oversize-1" {
+		t.Fatalf("expected only the fresh event published (no resends from the discarded record), got %v", arrivals)
+	}
+	_ = client.Close(context.Background())
+}
+
+func TestSpoolResendPerEventTerminalVerdictsDeadLetter(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+
+	dir := t.TempDir()
+	now := time.Now()
+	writeConsentRecordFile(t, dir, "granted")
+	writeSpoolRecordFile(t, dir, 0,
+		spoolTestEnvelope(t, "evt-verdict-ok-1", now),
+		spoolTestEnvelope(t, "evt-verdict-rej-1", now),
+		spoolTestEnvelope(t, "evt-verdict-sup-1", now),
+	)
+	// The 2xx carries per-event verdicts: one delivered, one rejected, one
+	// consent-suppressed — and the batch contract says suppressed is NOT
+	// delivery confirmation.
+	state.setAcceptedBody(`{"accepted":1,"rejected":1,"duplicates":0,"events":[` +
+		`{"event_id":"evt-verdict-ok-1","status":"accepted"},` +
+		`{"event_id":"evt-verdict-rej-1","status":"rejected","code":"invalid_event"},` +
+		`{"event_id":"evt-verdict-sup-1","status":"suppressed_no_consent"}]}`)
+
+	recorder := &spoolDeadLetterRecorder{}
+	client := newSpoolTestClient(t, server.URL, dir, recorder, nil)
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	// Every event is settled on the server (all removed from the record)...
+	record := readSpoolRecordFile(t, dir)
+	if len(record.Events) != 0 {
+		t.Fatalf("expected every verdicted event settled out of the record, got %s", mustJSON(t, record.Events))
+	}
+	// ...but only the confirmed delivery counts as resent; the per-event
+	// terminal verdicts dead-letter with their matching classes.
+	terminal := recorder.byReason(SpoolDropTerminal)
+	if len(terminal) != 1 || len(terminal[0].Envelopes) != 1 || !containsEventID(t, terminal[0].Envelopes, "evt-verdict-rej-1") {
+		t.Fatalf("expected exactly the rejected event dead-lettered terminal, got %+v", terminal)
+	}
+	consentLetters := recorder.byReason(SpoolDropConsent)
+	if len(consentLetters) != 1 || len(consentLetters[0].Envelopes) != 1 || !containsEventID(t, consentLetters[0].Envelopes, "evt-verdict-sup-1") {
+		t.Fatalf("expected exactly the suppressed event dead-lettered as consent, got %+v", consentLetters)
+	}
+	if recorder.count() != 2 {
+		t.Fatalf("the delivered event must not dead-letter, got %d letters", recorder.count())
+	}
+	if stats := client.Snapshot(); stats.SpoolResent != 1 {
+		t.Fatalf("expected SpoolResent to count only the confirmed delivery, got %+v", stats)
+	}
+	_ = client.Close(context.Background())
+}
+
+func TestSpoolRecoveryWakeResendsSpoolOnlyWork(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+
+	dir := t.TempDir()
+	writeConsentRecordFile(t, dir, "granted")
+	writeSpoolRecordFile(t, dir, 0, spoolTestEnvelope(t, "evt-wake-1", time.Now()))
+
+	// The startup-loaded chunk fails retriably WITH a Retry-After hint: the
+	// chunk is requeued and the worker parks behind the deadline, with an
+	// empty held batch — the only pending work is spool-only.
+	state.setOutcome(http.StatusInternalServerError, "internal_error", "60")
+	client := newSpoolTestClient(t, server.URL, dir, nil, nil)
+	if err := client.Flush(context.Background()); err == nil {
+		t.Fatalf("expected the retriable resend failure surfaced")
+	}
+
+	// A synchronous Track success proves the endpoint healthy again: the
+	// recovery wake must kick the requeued spool chunk NOW — FlushInterval is
+	// an hour, so idling until the next tick would strand it.
+	state.setOutcome(http.StatusAccepted, "", "")
+	if err := client.Track(context.Background(), Event{ID: "evt-wake-live-1", Name: "live"}); err != nil {
+		t.Fatalf("Track: %v", err)
+	}
+	waitFor(t, 5*time.Second, "the spooled chunk resent on the recovery wake", func() bool {
+		return client.Snapshot().SpoolResent == 1
+	})
+	record := readSpoolRecordFile(t, dir)
+	if len(record.Events) != 0 {
+		t.Fatalf("expected the resent chunk acked out of the record, got %s", mustJSON(t, record.Events))
+	}
+	// The chunk arrived exactly twice: the failed startup attempt and the one
+	// recovery-wake resend — no extra retries.
+	chunkArrivals := 0
+	for _, arrival := range state.allArrivals() {
+		if len(arrival) == 1 && arrival[0] == "evt-wake-1" {
+			chunkArrivals++
+		}
+	}
+	if chunkArrivals != 2 {
+		t.Fatalf("expected the failed attempt plus exactly one recovery-wake resend, got %d chunk arrivals (%v)", chunkArrivals, state.allArrivals())
+	}
+	_ = client.Close(context.Background())
+}
+
+func TestSpoolInProcessRetryReusesRetainedBytes(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+	state.setOutcome(http.StatusInternalServerError, "internal_error", "")
+
+	dir := t.TempDir()
+	client := newSpoolTestClient(t, server.URL, dir, nil, nil)
+	client.SetConsent(true)
+
+	// Intake clones Props one level deep: the NESTED map stays shared with
+	// the caller, so mutating it after Enqueue would change a re-marshal.
+	nested := map[string]any{"k": "v1"}
+	if err := client.Enqueue(Event{ID: "evt-bytes-1", Name: "e1", Props: map[string]any{"nested": nested}}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Flush(context.Background()); err == nil {
+		t.Fatalf("expected the retriable failure surfaced")
+	}
+	spooled := readSpoolRecordFile(t, dir)
+	if len(spooled.Events) != 1 {
+		t.Fatalf("expected the failed batch spooled, got %d events", len(spooled.Events))
+	}
+
+	// The caller mutates the nested value AFTER the failure. The in-process
+	// retry must resend the RETAINED bytes — the ones just spooled — not a
+	// fresh marshal that would drift under the same event_id.
+	nested["k"] = "v2"
+	state.setOutcome(http.StatusAccepted, "", "")
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("retry Flush: %v", err)
+	}
+
+	bodies := state.allBodies()
+	if len(bodies) != 2 {
+		t.Fatalf("expected the failed attempt and its retry, got %d bodies", len(bodies))
+	}
+	firstWire := wireEventBytes(t, bodies[0])
+	retryWire := wireEventBytes(t, bodies[1])
+	if len(firstWire) != 1 || len(retryWire) != 1 {
+		t.Fatalf("expected single-event bodies, got %d/%d", len(firstWire), len(retryWire))
+	}
+	if retryWire[0] != firstWire[0] {
+		t.Fatalf("retry bytes drifted from the first attempt:\n first: %s\n retry: %s", firstWire[0], retryWire[0])
+	}
+	if retryWire[0] != string(spooled.Events[0]) {
+		t.Fatalf("retry bytes drifted from the spooled record:\n spool: %s\n retry: %s", spooled.Events[0], retryWire[0])
+	}
+	if !strings.Contains(retryWire[0], `"v1"`) || strings.Contains(retryWire[0], `"v2"`) {
+		t.Fatalf("expected the retry to carry the retained pre-mutation encoding, got %s", retryWire[0])
+	}
+	if record := readSpoolRecordFile(t, dir); len(record.Events) != 0 {
+		t.Fatalf("expected the delivered batch acked out of the spool, got %s", mustJSON(t, record.Events))
 	}
 	_ = client.Close(context.Background())
 }

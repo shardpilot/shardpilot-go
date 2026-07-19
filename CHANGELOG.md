@@ -18,39 +18,50 @@
   (cancellation or the caller's deadline) returns that context error with no cache fallback;
   only SDK-internal timeouts classify as the transient `http_0`. A fresh `200`, like a `304`,
   never overwrites a durable cache record another process refreshed with different content
-  while the response was in flight. Fetching is not consent-gated. Deliberate delta vs
+  while the response was in flight. Fetching is not consent-gated, and fetches are fenced
+  by the client lifecycle like synchronous `Track` publishes: a fetch that begins after
+  `Close` fails `ErrClosed`, and `Close` waits (bounded by its context) for in-flight
+  fetches, so no fetch I/O or durable cache write outlives it. Deliberate delta vs
   Defold/Unity: a `429`'s `Retry-After` (digits-only, floor 1s, clamp 24h) arms an in-memory
   cooldown, and an explicit fetch inside it serves the cache without touching the network —
   the client half of the server-side remote-config fetch rate limit.
 
 - Bounded disk spool (GAP-075; closes the long-standing follow-up in `queue.go`): opt-in via
-  `Config.SpoolDir`; 2000 events / 1 MiB caps with oldest-first eviction; verbatim
-  single-stamp envelope records so every resend is byte-identical and the server de-dupes by
-  `event_id`; ack-removal on delivery and on terminal outcomes; spooled chunks resend before
-  fresh events through the same pacing gates. A live server `Retry-After` deadline is
-  persisted with the record and re-seeds the deferral across restarts (24h clamp): a `429`
-  on a spooled resend writes the refreshed deadline through, ANY successful publish clears
-  it, an empty record never carries a stale deadline, and a load that discards every saved
-  event drops the deadline instead of gating fresh work on it. Retriable failures
-  (`429`/`5xx`/network) spool, terminal outcomes never do; a 7-day retry-age cap expires
-  records whose age is unprovable, too old, or future-dated; and `Config.OnSpoolDeadLetter`
-  fires on every drop (capacity, expiry, terminal, consent). `Stats.Spooled` counts only
-  durably written events. One client per `SpoolDir` is the supported topology; as a safety
-  net every save reloads and merges the on-disk record by `event_id` (union minus this
-  process's settled ids, caps re-applied oldest-drop — a cap drop at merge time settles the
-  local mirror and dead-letters locally-owned entries), so a sibling writer's undelivered
-  records are never silently dropped — last-writer-wins over a merged view, at-least-once
-  on concurrent acks, surfaced via `Stats.SpoolForeignMerged`. Disk participation is
-  strictly grant-only and requires a PERSISTED grant for writes and loads alike: enabling
-  the spool persists each `SetConsent` decision — scoped to the actor by a SHA-256 digest
-  of the configured (workspace, environment, `UserID`, `AnonymousID`) tuple, never verbatim
-  identifiers, so one actor's grant never authorizes another's disk participation over a
-  reused directory, and enforced per envelope: an event whose effective actor differs from
-  that tuple (a per-event identity override) dead-letters instead of spooling — spool
-  writes open only after the granted record is durably written (stricter than the Defold
-  reference on this seam, deliberately), loads happen only from a persisted matching grant,
-  any other state purges the record, and a failed purge owes a wipe that fails the spool
-  closed (`spool_purge_failed`) until it succeeds. The live pipeline's open-by-default
+  `Config.SpoolDir`; 2000 events / 1 MiB caps with oldest-first eviction, and the record is
+  read back through a hard limit derived from the byte cap (an over-limit `spool.json` is
+  discarded as corrupt, never loaded whole); verbatim single-stamp envelope records — the
+  failed batch also retains its built wire bytes, so an in-process retry resends exactly
+  what the failure spooled even when the caller mutates nested `Props`/`Context` values
+  after handoff — so every resend is byte-identical and the server de-dupes by `event_id`;
+  ack-removal on delivery and on terminal outcomes, with a resent chunk settling by the
+  response's per-event verdicts: only confirmed deliveries count as resent, and a per-event
+  `rejected` or consent-suppressed outcome dead-letters with the matching class; spooled
+  chunks resend before fresh events through the same pacing gates, and the recovery wake
+  after a success that ends a failure streak kicks requeued spooled chunks too, not only
+  the held batch. A live server `Retry-After` deadline is persisted with the record and
+  re-seeds the deferral across restarts (24h clamp): a `429` on a spooled resend writes the
+  refreshed deadline through, ANY successful publish clears it, an empty record never
+  carries a stale deadline, and a load that discards every saved event drops the deadline
+  instead of gating fresh work on it. Retriable failures (`429`/`5xx`/network) spool,
+  terminal outcomes never do; a 7-day retry-age cap expires records whose age is
+  unprovable, too old, or future-dated; and `Config.OnSpoolDeadLetter` fires on every drop
+  (capacity, expiry, terminal, consent). `Stats.Spooled` counts only durably written
+  events. One client per `SpoolDir` is the supported topology; as a safety net every save
+  reloads and merges the on-disk record by `event_id` (union minus this process's settled
+  ids, caps re-applied oldest-drop — a cap drop at merge time settles the local mirror and
+  dead-letters locally-owned entries), so a sibling writer's undelivered records are never
+  silently dropped — last-writer-wins over a merged view, at-least-once on concurrent
+  acks, surfaced via `Stats.SpoolForeignMerged`. Disk participation is strictly grant-only
+  and requires a PERSISTED grant for writes and loads alike: enabling the spool persists
+  each `SetConsent` decision — scoped to the actor by a SHA-256 digest of the configured
+  (workspace, environment, `UserID`, `AnonymousID`) tuple, never verbatim identifiers, so
+  one actor's grant never authorizes another's disk participation over a reused directory,
+  and enforced per envelope: an event whose effective actor differs from that tuple (a
+  per-event identity override) dead-letters instead of spooling — spool writes open only
+  after the granted record is durably written (stricter than the Defold reference on this
+  seam, deliberately), loads happen only from a persisted matching grant, any other state
+  purges the record, and a failed purge owes a wipe that fails the spool closed
+  (`spool_purge_failed`) until it succeeds. The live pipeline's open-by-default
   `ConsentUnknown` posture is unchanged.
 
 - Every `events:batch` publish now declares the ingest envelope schema-set revision this

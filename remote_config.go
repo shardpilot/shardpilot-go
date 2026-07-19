@@ -425,23 +425,49 @@ func (rc *remoteConfigState) saveDurable(record *rcCache) error {
 	if err != nil {
 		return err
 	}
-	return writePrivateFileAtomic(rc.cachePath, payload, os.Rename)
+	return writePrivateFileAtomic(rc.cachePath, payload, os.Rename, os.Chmod)
 }
 
 // tombstoneDurable clears the durable record (best-effort) by overwriting it
 // with an empty object, which no scope matches — a restart then starts from
 // the caller's defaults rather than from rolled-back values.
 func (rc *remoteConfigState) tombstoneDurable() {
-	_ = writePrivateFileAtomic(rc.cachePath, []byte("{}"), os.Rename)
+	_ = writePrivateFileAtomic(rc.cachePath, []byte("{}"), os.Rename, os.Chmod)
+}
+
+// ensurePrivateDir creates dir with the SDK's private mode and TIGHTENS an
+// already-existing directory to it: os.MkdirAll is a mode no-op for a
+// directory the app pre-created (say 0755), which would leave the documented
+// "private 0700 state directory" promise silently unkept — other local users
+// could enumerate it, and in a writable directory delete or replace the
+// records regardless of their own 0600 modes. A stat or chmod failure is
+// returned as the write's error, so the caller's persist-failure (fail-safe)
+// path applies; the write never proceeds against a directory whose privacy
+// could not be established. chmod is injectable so tests can exercise the
+// refused-tighten path deterministically.
+func ensurePrivateDir(dir string, chmod func(name string, mode os.FileMode) error) error {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return err
+	}
+	if info.Mode().Perm() == 0o700 {
+		return nil
+	}
+	return chmod(dir, 0o700)
 }
 
 // writePrivateFileAtomic writes payload to path with the SDK's private-file
-// discipline: parent directories 0700, a fully written and synced 0600 temp
-// file in the same directory, then an atomic publish via the given rename.
-func writePrivateFileAtomic(path string, payload []byte, rename func(oldpath, newpath string) error) error {
+// discipline: parent directories ensured private 0700 (pre-existing looser
+// modes are tightened, see ensurePrivateDir), a fully written and synced 0600
+// temp file in the same directory, then an atomic publish via the given
+// rename.
+func writePrivateFileAtomic(path string, payload []byte, rename func(oldpath, newpath string) error, chmod func(name string, mode os.FileMode) error) error {
 	dir := filepath.Dir(path)
 	if dir != "." {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
+		if err := ensurePrivateDir(dir, chmod); err != nil {
 			return err
 		}
 	}
@@ -615,11 +641,25 @@ func rcFetchError(code string) error {
 // and no side effects; only SDK-internal timeouts classify as the transient
 // http_0. A successful result also updates the getter snapshot; a failed one
 // leaves it untouched. Fetching is not consent-gated. Concurrent fetches are
-// legal; an older response never overwrites a newer settled outcome.
+// legal; an older response never overwrites a newer settled outcome. Fetches
+// are fenced by the client lifecycle exactly like synchronous Track
+// publishes: a fetch that begins after Close is rejected with ErrClosed, and
+// Close waits (bounded by its own context) for in-flight fetches to settle,
+// so no fetch I/O or durable cache write is still running when Close returns.
 func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, error) {
+	// The same lifecycle fence as Track: registering in trackWG under
+	// lifecycleMu means Close either sees this fetch (and waits for it) or
+	// completed its closed store first (and this fetch is rejected) — an
+	// in-flight fetch can never keep doing network I/O or write the durable
+	// cache after Close has returned.
+	c.lifecycleMu.Lock()
 	if c.closed.Load() {
+		c.lifecycleMu.Unlock()
 		return RemoteConfigResult{}, ErrClosed
 	}
+	c.trackWG.Add(1)
+	c.lifecycleMu.Unlock()
+	defer c.trackWG.Done()
 	rc := c.rc
 	if rc == nil {
 		return RemoteConfigResult{}, rcFetchError("remote_config_not_configured")

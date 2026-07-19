@@ -100,6 +100,17 @@ type Client struct {
 	// captured before a restart still holds automatic publishes for the
 	// remaining window. Set before the worker starts; zero when none.
 	initialDeferUntil time.Time
+
+	// retainedRequest is the built wire request a retriably failed worker
+	// publish retained alongside its in-memory batch. Owned by the flush
+	// worker goroutine exclusively (every path that reads or writes it —
+	// publishWorkerBatch, flushAvailable, the close remnant — runs there).
+	// In-process retries rebuild THROUGH it (buildBatchReusing) so the bytes
+	// a retry puts on the wire are the bytes the failure spooled, even when
+	// the caller mutates nested Props/Context values after Enqueue; it is
+	// cleared whenever the batch it described is delivered, dropped, or
+	// discarded.
+	retainedRequest batchRequest
 }
 
 type flushRequest struct {
@@ -375,9 +386,14 @@ func (c *Client) run() {
 			recovered := !deferUntil.IsZero() || backoffAttempt > 0
 			deferUntil = time.Time{}
 			backoffAttempt = 0
-			if recovered && len(batch) > 0 {
+			if recovered && (len(batch) > 0 || c.spoolHasResendWork()) {
 				// Retry the held batch NOW rather than at the next flush
 				// tick, which can be minutes away on a long FlushInterval.
+				// Requeued spooled chunks are pending retryable work too:
+				// when they are ALL the recovery left behind (the held batch
+				// is empty), the wake must still kick publishWorkerBatch —
+				// its resend-first path — or spool-only work would idle until
+				// the next tick or an explicit Flush.
 				batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
 				continue
 			}
@@ -649,6 +665,8 @@ func (c *Client) dropBatchOnConsentEpoch(batch []Event, seenEpoch *uint64, backo
 		c.stats.dropped.Add(uint64(len(batch)))
 		batch = batch[:0]
 		*backoffAttempt = 0
+		// The retained wire bytes described the discarded batch.
+		c.retainedRequest = batchRequest{}
 	}
 	return batch
 }
@@ -688,7 +706,10 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 			}
 		}
 		if len(batch) > 0 {
-			request, err := c.buildBatch(batch)
+			// Build THROUGH the retained request: a batch a previous attempt
+			// already marshaled resends its retained bytes verbatim, so the
+			// in-process retry matches what that failure spooled.
+			request, err := c.buildBatchReusing(batch, c.retainedRequest)
 			if err != nil {
 				c.recordBuildFailure(err)
 			} else {
@@ -703,11 +724,13 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 					dropped := len(batch) + c.queue.drainAll()
 					c.stats.dropped.Add(uint64(dropped))
 					*backoffAttempt = 0
+					c.retainedRequest = batchRequest{}
 					return batch[:0], firstErr
 				}
 				if !isPermanentPublishError(err) {
 					// Retained for the in-process retry AND spooled
 					// (grant-only) so a restart resends identical bytes.
+					c.retainedRequest = request
 					c.spoolFailedBatch(request, err)
 					return batch, err
 				}
@@ -727,6 +750,7 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 				c.spoolSettleTerminal(request)
 				c.stats.dropped.Add(uint64(len(batch)))
 				batch = batch[:0]
+				c.retainedRequest = batchRequest{}
 			} else {
 				// EVERY successful publish ends the failure streak — a flush
 				// can deliver several batches and still return a later
@@ -736,6 +760,7 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 				c.spoolAck(request)
 				*backoffAttempt = 0
 				batch = batch[:0]
+				c.retainedRequest = batchRequest{}
 			}
 		}
 		batch = c.queue.drainInto(batch, c.cfg.BatchSize)
@@ -768,11 +793,14 @@ func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, def
 		c.stats.dropped.Add(uint64(len(batch)))
 		// Denial-discard: the streak belonged to the dropped batch.
 		*backoffAttempt = 0
+		c.retainedRequest = batchRequest{}
 		return batch[:0]
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.HTTPTimeout)
 	defer cancel()
-	request, err := c.buildBatch(batch)
+	// Build THROUGH the retained request (see buildBatchReusing): the prefix
+	// a previous failed attempt already marshaled resends its exact bytes.
+	request, err := c.buildBatchReusing(batch, c.retainedRequest)
 	if err != nil {
 		c.recordBuildFailure(err)
 	} else {
@@ -786,15 +814,19 @@ func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, def
 			// launch.
 			c.spoolSettleTerminal(request)
 			c.stats.dropped.Add(uint64(len(batch)))
+			c.retainedRequest = batchRequest{}
 			return batch[:0]
 		}
 		// Retriable: the batch is retained in memory for the in-process
-		// retry, and spooled (grant-only) as crash insurance so a restart
-		// resends the identical bytes.
+		// retry — together with its built wire bytes — and spooled
+		// (grant-only) as crash insurance so a restart resends the identical
+		// bytes.
+		c.retainedRequest = request
 		c.spoolFailedBatch(request, err)
 		return batch
 	}
 	c.spoolAck(request)
+	c.retainedRequest = batchRequest{}
 	return batch[:0]
 }
 
@@ -834,6 +866,14 @@ func (c *Client) recordBuildFailure(err error) {
 // chunk (raw bytes only) — through the consent gate, transport, stats, and
 // callback plumbing shared by every publish path.
 func (c *Client) publishRequest(ctx context.Context, request batchRequest, size int) error {
+	_, err := c.publishRequestResult(ctx, request, size)
+	return err
+}
+
+// publishRequestResult is publishRequest returning the decoded batch response
+// as well: the spool's resend settle needs the per-event verdicts to tell
+// confirmed-delivered events from per-event terminal outcomes.
+func (c *Client) publishRequestResult(ctx context.Context, request batchRequest, size int) (batchResult, error) {
 	ctx, cancel := contextWithDefaultTimeout(ctx, c.cfg.HTTPTimeout)
 	defer cancel()
 
@@ -853,7 +893,7 @@ func (c *Client) publishRequest(ctx context.Context, request batchRequest, size 
 	if c.consentDenied() {
 		// Not a transport failure: callers count the batch as Dropped,
 		// matching their own pre-publish denial paths.
-		return ErrConsentDenied
+		return batchResult{}, ErrConsentDenied
 	}
 
 	result, err := c.transport.Publish(ctx, request)
@@ -869,7 +909,7 @@ func (c *Client) publishRequest(ctx context.Context, request batchRequest, size 
 			// cancellation is never reclassified — it leaves this gate's
 			// context intact, so gate.ctx.Err() stays nil unless a denial
 			// actually happened during this publish.
-			return ErrConsentDenied
+			return batchResult{}, ErrConsentDenied
 		}
 		c.stats.recordFailure(err)
 		if isSchemaRevisionMismatch(err) {
@@ -881,7 +921,7 @@ func (c *Client) publishRequest(ctx context.Context, request batchRequest, size 
 		} else {
 			c.logf("shardpilot batch publish failed: %v", err)
 		}
-		return err
+		return batchResult{}, err
 	}
 	c.stats.recordBatch(result, size)
 	c.notifyBatchResult(result.toPublic())
@@ -904,7 +944,7 @@ func (c *Client) publishRequest(ctx context.Context, request batchRequest, size 
 	case c.pacingWake <- struct{}{}:
 	default:
 	}
-	return nil
+	return result, nil
 }
 
 // notifyBatchResult invokes the optional OnBatchResult callback with the
