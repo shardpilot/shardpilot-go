@@ -49,7 +49,8 @@
   unprovable, too old, or future-dated; and `Config.OnSpoolDeadLetter` fires on every drop
   (capacity, expiry, terminal, consent) — a capacity eviction reports only once the rewrite
   that removed it from disk durably lands, never for an eviction a failed rewrite left
-  reloadable. `Stats.Spooled` counts only durably written events. One client per `SpoolDir` is the supported topology; as a safety net every save
+  reloadable. `Stats.Spooled` counts only durably written events. One client per `SpoolDir`
+  is the supported topology; as a safety net every save
   reloads and merges the on-disk record by `event_id` (union minus this process's settled
   ids, caps re-applied oldest-drop — a cap drop at merge time settles the local mirror and
   dead-letters locally-owned entries), so a sibling writer's undelivered records are never
@@ -66,6 +67,16 @@
   purges the record, and a failed purge owes a wipe that fails the spool closed
   (`spool_purge_failed`) until it succeeds. The live pipeline's open-by-default
   `ConsentUnknown` posture is unchanged.
+
+- Added a customer-facing AI integration skill
+  (`.claude/skills/shardpilot-go-integration/SKILL.md`): a source-verified brief of the
+  pinned install tag, credential handling, this SDK's server-side consent posture
+  (open-by-default under `unknown`, inverted vs the consent-first client SDKs), crash
+  reporting, offline limitations, and a verify-your-integration checklist, so AI coding
+  tools integrate the SDK contract-correctly. The README points to it from a new
+  "AI-assisted integration" section, and `scripts/check_release_consistency.sh` now also
+  fails when the skill's single pinned install command drifts from the README's
+  latest-tag claims (release runbook updated accordingly).
 
 - Every `events:batch` publish now declares the ingest envelope schema-set revision this
   SDK build was coordinated against via the `X-ShardPilot-Schema-Revision` request header

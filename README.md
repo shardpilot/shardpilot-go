@@ -284,6 +284,10 @@ Pre-v1; the API is explicitly unstable.
 
 `v0.3.0-alpha` (tagged) removed the game-flavored `MatchID` field from the universal `Event` envelope; carry that context in `Props["match_id"]` instead (wire payload unchanged).
 
+## AI-assisted integration
+
+Integrating with an AI coding tool (Claude Code, Cursor, etc.)? This repo ships a machine-readable integration skill at [`.claude/skills/shardpilot-go-integration/SKILL.md`](.claude/skills/shardpilot-go-integration/SKILL.md) — a source-verified brief of the pinned install tag, credential handling, this SDK's server-side consent posture, crash reporting, and a verification checklist, written so AI-generated integrations stay contract-correct. Claude Code discovers it automatically; point other tools at that file. The planned developer docs site (`docs.shardpilot.com`, not yet live) will additionally publish an `llms.txt` family of machine-readable documentation indexes once it launches.
+
 ## Related
 
 - The **ShardPilot platform** receives the event batches, consent decisions, and crash reports this SDK sends, and issues and introspects the ingest API keys and per-tenant signing secrets it uses (this backend SDK mints the short-lived per-tenant JWT itself via `SignIngestJWT`).
