@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -546,7 +547,38 @@ func writePrivateFileAtomic(path string, payload []byte, rename func(oldpath, ne
 	if err := temp.Close(); err != nil {
 		return err
 	}
-	return rename(tempPath, path)
+	if err := rename(tempPath, path); err != nil {
+		return err
+	}
+	// The rename is durable only once the parent directory's metadata is on
+	// stable storage: fsyncing the temp file made the BYTES durable, but a
+	// crash before the directory entry lands can forget the publish (or leave
+	// the old name). A failed directory sync reports as a failed write — the
+	// caller's mirror-authoritative retry then rewrites and re-syncs, so
+	// durability is never silently assumed.
+	return syncDir(filepath.Dir(path))
+}
+
+// syncDir fsyncs a directory so a just-published entry (a rename over the
+// final path, or a created marker) survives a crash. Scope: the publish
+// transitions are what this guards — a lost UNLINK, by contrast, degrades to
+// a state an existing recovery path re-handles idempotently (a resurrected
+// spool.json re-purges at the next non-grant init; a resurrected record
+// resends and the server de-duplicates by event_id). On Windows directories
+// cannot be opened for syncing and NTFS journals metadata on its own, so the
+// sync is skipped there rather than failing every write.
+func syncDir(dir string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	handle, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	// The handle is read-only: Close after a successful Sync cannot lose data,
+	// so only the Sync outcome decides the write's fate.
+	defer handle.Close()
+	return handle.Sync()
 }
 
 // raiseStampAboveSuperseded orders the record being installed above every

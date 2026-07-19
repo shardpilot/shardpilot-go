@@ -133,6 +133,11 @@ func (c *Client) SetConsent(analyticsGranted bool) {
 
 	actor := firstNonEmpty(c.cfg.UserID, c.cfg.AnonymousID)
 
+	// consentMu serializes the whole decision; lifecycleMu guards only the
+	// in-memory flip below and is released BEFORE the disk side runs, so a
+	// slow SpoolDir write never stalls Track/Enqueue intake behind a consent
+	// decision (see the field comment for the lock order).
+	c.consentMu.Lock()
 	c.lifecycleMu.Lock()
 	c.consent.Store(state)
 	if !analyticsGranted {
@@ -154,13 +159,19 @@ func (c *Client) SetConsent(analyticsGranted bool) {
 			c.stats.dropped.Add(uint64(dropped))
 		}
 	}
-	// Disk side of the decision (no-op without SpoolDir). Dead-letters are
-	// collected here and emitted only after lifecycleMu is released — the
-	// callback is integrator code and may call back into the client.
-	deadLetters := c.applySpoolConsentLocked(analyticsGranted)
+	c.lifecycleMu.Unlock()
+	// Disk side of the decision (no-op without SpoolDir), deliberately
+	// outside lifecycleMu: it fsyncs files, and event intake must not wait
+	// out a disk stall. The spool's own append gate re-checks the already
+	// stored live state under its lock, so a batch racing this section can
+	// never re-create a record the purge below condemns. Dead-letters are
+	// collected here and emitted only after consentMu is released — the
+	// callback is integrator code and may call back into the client
+	// (including SetConsent itself).
+	deadLetters := c.applySpoolConsent(analyticsGranted)
 
 	if actor == "" {
-		c.lifecycleMu.Unlock()
+		c.consentMu.Unlock()
 		c.emitSpoolDeadLetters(deadLetters)
 		c.logf("shardpilot consent: no actor identity configured (Config.UserID or Config.AnonymousID); decision applied locally only")
 		return
@@ -168,7 +179,7 @@ func (c *Client) SetConsent(analyticsGranted bool) {
 
 	idempotencyKey, err := uuidv7.New()
 	if err != nil {
-		c.lifecycleMu.Unlock()
+		c.consentMu.Unlock()
 		c.emitSpoolDeadLetters(deadLetters)
 		c.logf("shardpilot consent: generate idempotency key failed: %v", err)
 		return
@@ -184,10 +195,10 @@ func (c *Client) SetConsent(analyticsGranted bool) {
 		IdempotencyKey:  idempotencyKey,
 	}
 
-	// Enqueue while still holding lifecycleMu so the transmission order
+	// Enqueue while still holding consentMu so the transmission order
 	// matches the local state order across concurrent SetConsent calls.
 	c.enqueueConsentPublish(request)
-	c.lifecycleMu.Unlock()
+	c.consentMu.Unlock()
 	c.emitSpoolDeadLetters(deadLetters)
 }
 
@@ -201,7 +212,7 @@ func (c *Client) startConsentSender() {
 }
 
 // enqueueConsentPublish hands a decision to the single ordered consent
-// sender, starting it lazily on first use. Must be called with lifecycleMu
+// sender, starting it lazily on first use. Must be called with consentMu
 // held (it is the only producer on consentSends, which keeps the
 // drop-oldest overflow handling race-free on the producer side).
 func (c *Client) enqueueConsentPublish(request consentRequest) {

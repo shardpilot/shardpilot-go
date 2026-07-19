@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1725,5 +1726,32 @@ func TestRemoteConfigCacheRoundTripsHTMLDenseBody(t *testing.T) {
 	defer second.Close(context.Background())
 	if got := second.RemoteConfigString("k", "fallback"); got != strings.Repeat("<", 700_000) {
 		t.Fatalf("expected the HTML-dense record preloaded, got %d-byte value (fallback? %v)", len(got), got == "fallback")
+	}
+}
+
+func TestWritePrivateFileAtomicReportsDirSyncFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the post-rename directory sync is skipped on windows")
+	}
+	base := t.TempDir()
+	dir := filepath.Join(base, "state")
+	outside := filepath.Join(base, "outside")
+	if err := os.MkdirAll(outside, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	// The injected rename publishes the record OUTSIDE the state directory
+	// and removes the state directory, so the post-rename directory sync
+	// cannot succeed: the failure must surface as a failed write (the
+	// caller's mirror-authoritative retry then rewrites and re-syncs), never
+	// as a silently-assumed durable publish.
+	rename := func(oldpath, newpath string) error {
+		if err := os.Rename(oldpath, filepath.Join(outside, filepath.Base(newpath))); err != nil {
+			return err
+		}
+		return os.RemoveAll(dir)
+	}
+	err := writePrivateFileAtomic(filepath.Join(dir, spoolFileName), []byte(`{}`), rename, os.Chmod)
+	if err == nil {
+		t.Fatalf("expected the unsyncable parent directory surfaced as a failed write")
 	}
 }

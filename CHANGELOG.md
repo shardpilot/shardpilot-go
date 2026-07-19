@@ -2,6 +2,37 @@
 
 ## Unreleased
 
+- Fleet-audit follow-ups on the GAP-075 spool and transport machinery:
+  - Poison-member isolation on the worker publish paths: a batch member whose nested
+    `Props`/`Context` values no longer serialize (mutated after `Enqueue`) is now dropped
+    ALONE — attributed by event id in the log, counted `Dropped`, and folded into an explicit
+    `Flush`'s first-error the way a terminal spool-chunk failure already is — and its
+    batchmates publish on, where the whole batch (previously spooled copies included) used to
+    be condemned for one member's mutation. The Close remnant spools its serializable members
+    under the same rule instead of dying whole. The synchronous `Track` path is unchanged:
+    single-event, the caller owns the error.
+  - `Config.HTTPClient`: optional injection of the `*http.Client` behind every request the
+    SDK makes (event batches, consent posts, remote-config fetches) for pooled transports,
+    proxies, mTLS, or instrumentation. Nil — the default — keeps the SDK's internal clients
+    exactly as before. Injection preserves two SDK contracts: per-attempt deadlines still
+    come from `HTTPTimeout`/caller contexts, and remote-config fetches still refuse
+    redirects (the SDK derives its remote-config client from the injected one with
+    `CheckRedirect` pinned, sharing the transport).
+  - Crash-durability of state publishes: the atomic record write (spool record, consent
+    record, remote-config cache) now fsyncs the parent directory after the rename, and the
+    owed-wipe marker create does the same — a crash right after a write can no longer forget
+    the publish. A failed directory sync reports as a failed write, so the
+    mirror-authoritative retry rewrites and re-syncs. Skipped on Windows, where directories
+    cannot be opened for syncing and NTFS journals metadata on its own.
+  - `SetConsent`'s disk side (consent-record persist + spool purge) moved off the lock every
+    `Track`/`Enqueue` takes: a slow `SpoolDir` write no longer stalls event intake for the
+    duration of a consent decision. Decision semantics are unchanged — a dedicated mutex
+    serializes whole decisions, so the in-memory order, the disk order, and the consent-send
+    order still agree across concurrent `SetConsent` calls.
+  - Tests for the spool-load discard branches that had none: an unparseable `spool.json` and
+    a wrong-version record each load as a clean start — file removed, no dead-letters, no
+    counters, and no deferral seeded from an incompatible record's persisted deadline.
+
 - Remote config client (GAP-075): explicit `FetchRemoteConfig` plus never-fail typed getters
   (`RemoteConfigValue/String/Number/Bool/Values/Version`) over a durable last-known-good cache
   (`Config.RemoteConfigURL`, `Config.APIKey`, `Config.RemoteConfigCachePath`), scoped by

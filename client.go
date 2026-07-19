@@ -49,6 +49,16 @@ type Client struct {
 	stop          chan struct{}
 	workerDone    chan struct{}
 	lifecycleMu   sync.Mutex
+
+	// consentMu serializes whole SetConsent decisions — the in-memory flip,
+	// the disk side (consent record + spool purge), and the sender handoff —
+	// so concurrent decisions settle in one order everywhere. It exists so
+	// the DISK work can run outside lifecycleMu: lifecycleMu is on every
+	// Track/Enqueue call, and holding it across fsync'd file writes would
+	// stall event intake behind a slow SpoolDir for the duration of a
+	// consent decision. Ordering: consentMu is acquired before lifecycleMu
+	// and never the other way around.
+	consentMu     sync.Mutex
 	trackWG       sync.WaitGroup
 	closeMu       sync.Mutex
 	closeInFlight bool
@@ -105,10 +115,10 @@ type Client struct {
 	// publish retained alongside its in-memory batch. Owned by the flush
 	// worker goroutine exclusively (every path that reads or writes it —
 	// publishWorkerBatch, flushAvailable, the close remnant — runs there).
-	// In-process retries rebuild THROUGH it (buildBatchReusing) so the bytes
-	// a retry puts on the wire are the bytes the failure spooled, even when
-	// the caller mutates nested Props/Context values after Enqueue; it is
-	// cleared whenever the batch it described is delivered, dropped, or
+	// In-process retries rebuild THROUGH it (buildBatchIsolating) so the
+	// bytes a retry puts on the wire are the bytes the failure spooled, even
+	// when the caller mutates nested Props/Context values after Enqueue; it
+	// is cleared whenever the batch it described is delivered, dropped, or
 	// discarded.
 	retainedRequest batchRequest
 }
@@ -728,26 +738,24 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 		if len(batch) > 0 {
 			// Build THROUGH the retained request: a batch a previous attempt
 			// already marshaled resends its retained bytes verbatim, so the
-			// in-process retry matches what that failure spooled.
-			request, err := c.buildBatchReusing(batch, c.retainedRequest)
-			var result batchResult
-			if err != nil {
-				c.recordBuildFailure(err)
-				// The rebuild failed permanently (always the EncodeError /
-				// ErrInvalidEvent class) before producing a request, so the
-				// zero value above names no event IDs — the permanent drop
-				// below could then never settle the batch's previously
-				// SPOOLED members: stats would say dropped while the events
-				// stayed in spool.json and redelivered after a restart. The
-				// retained request still names exactly those members (it is
-				// the built form of the batch prefix an earlier retriable
-				// failure retained and spooled), so the drop settles through
-				// it: counted-dropped == gone-from-disk.
-				request = c.retainedRequest
-			} else {
-				result, err = c.publishRequestResult(ctx, request, len(batch))
+			// in-process retry matches what that failure spooled. A member
+			// that no longer serializes is dropped ALONE — settled, counted,
+			// and folded into the flush's first-error the way a terminal
+			// chunk failure is — and its batchmates publish on.
+			request, kept, poisoned := c.buildBatchIsolating(batch, c.retainedRequest)
+			if len(poisoned) > 0 {
+				c.settlePoisonedEvents(poisoned)
+				if firstErr == nil {
+					firstErr = poisoned[0].err
+				}
+				batch = kept
 			}
-			if err != nil {
+			if len(batch) == 0 {
+				// Every member poisoned: nothing is left to publish or
+				// retain. The queue drain below still runs — later enqueued
+				// events are unaffected by the condemned batch.
+				c.retainedRequest = batchRequest{}
+			} else if result, err := c.publishRequestResult(ctx, request, len(batch)); err != nil {
 				if errors.Is(err, ErrConsentDenied) {
 					// A denial landed between this iteration's consent check
 					// and the publish: drop and drain exactly like the
@@ -836,21 +844,24 @@ func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, def
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.HTTPTimeout)
 	defer cancel()
-	// Build THROUGH the retained request (see buildBatchReusing): the prefix
-	// a previous failed attempt already marshaled resends its exact bytes.
-	request, err := c.buildBatchReusing(batch, c.retainedRequest)
-	var result batchResult
-	if err != nil {
-		c.recordBuildFailure(err)
-		// Same substitution as flushAvailable: a failed rebuild returns the
-		// zero-valued request, and the permanent drop below must still settle
-		// the previously spooled members named by the retained request —
-		// otherwise they stay in spool.json (counted dropped, redelivered
-		// after restart).
-		request = c.retainedRequest
-	} else {
-		result, err = c.publishRequestResult(ctx, request, len(batch))
+	// Build THROUGH the retained request (see buildBatchIsolating): the prefix
+	// a previous failed attempt already marshaled resends its exact bytes. A
+	// member that no longer serializes is dropped alone — settled and counted
+	// — and its batchmates publish on.
+	request, kept, poisoned := c.buildBatchIsolating(batch, c.retainedRequest)
+	if len(poisoned) > 0 {
+		c.settlePoisonedEvents(poisoned)
+		batch = kept
+		if len(batch) == 0 {
+			// Every member poisoned: nothing is left to publish or retain,
+			// and nothing was learned about the endpoint, so retry pacing
+			// stays untouched (the same posture applyRetryPacing takes for
+			// client-side permanent errors).
+			c.retainedRequest = batchRequest{}
+			return batch[:0]
+		}
 	}
+	result, err := c.publishRequestResult(ctx, request, len(batch))
 	c.applyRetryPacing(err, deferUntil, backoffAttempt)
 	if err != nil {
 		if isPermanentPublishError(err) {
@@ -908,6 +919,29 @@ func (c *Client) recordBuildFailure(err error) {
 	if errors.As(err, &encodeErr) {
 		c.logf("shardpilot batch publish failed: %v", err)
 	}
+}
+
+// settlePoisonedEvents drops the members a worker-path batch build could not
+// serialize, attributed per event: each is counted Dropped and logged with
+// its id, and the attempt records ONE build failure — the first error — on
+// the same FailedBatches/LastError surface the whole-batch drop used to
+// feed. Any previously spooled copy settles off the record as terminal;
+// under today's invariants a poisoned member can never HAVE one (its bytes
+// never marshaled, and a member whose bytes were retained rides the reuse
+// prefix), so that settle is insurance: if the invariant ever drifts,
+// counted-dropped must still equal gone-from-disk.
+func (c *Client) settlePoisonedEvents(poisoned []poisonedEvent) {
+	if len(poisoned) == 0 {
+		return
+	}
+	c.stats.dropped.Add(uint64(len(poisoned)))
+	c.stats.recordFailure(poisoned[0].err)
+	ids := make([]string, 0, len(poisoned))
+	for _, poison := range poisoned {
+		ids = append(ids, poison.id)
+		c.logf("shardpilot batch build: event %q could not be serialized and was dropped (its batchmates were not): %v", poison.id, poison.err)
+	}
+	c.spoolSettleTerminalIDs(ids)
 }
 
 // publishRequest publishes one already-built batch request — fresh events

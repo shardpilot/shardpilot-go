@@ -137,18 +137,37 @@ func (c *Client) buildBatch(events []Event) (batchRequest, error) {
 	return batchRequest{Events: envelopes, rawEvents: raws}, nil
 }
 
-// buildBatchReusing is buildBatch for the worker's retry paths: it reuses the
-// already-marshaled envelopes a previous (retriably failed) attempt retained,
-// for the longest leading prefix whose event ids still line up position by
-// position, and builds only the events beyond it. Reuse is what keeps an
-// in-process retry byte-identical to the bytes that failure spooled:
-// rebuilding from the Event batch would re-marshal Props/Context, whose
-// NESTED values the caller can mutate after Enqueue (intake clones one level
-// deep), and drift bytes under the same event_id — one encoding per event_id
-// everywhere: wire, disk, retry. A retained request that no longer
+// poisonedEvent is one batch member a worker-path build could not serialize:
+// the event's stamped id and its build error, attributed so the drop can
+// name the event instead of condemning the whole batch.
+type poisonedEvent struct {
+	id  string
+	err error
+}
+
+// buildBatchIsolating is buildBatch for the worker's retry paths: it reuses
+// the already-marshaled envelopes a previous (retriably failed) attempt
+// retained, for the longest leading prefix whose event ids still line up
+// position by position, and builds only the events beyond it. Reuse is what
+// keeps an in-process retry byte-identical to the bytes that failure
+// spooled: rebuilding from the Event batch would re-marshal Props/Context,
+// whose NESTED values the caller can mutate after Enqueue (intake clones one
+// level deep), and drift bytes under the same event_id — one encoding per
+// event_id everywhere: wire, disk, retry. A retained request that no longer
 // corresponds (the batch was cleared, replaced, or reordered) contributes
 // nothing and everything rebuilds.
-func (c *Client) buildBatchReusing(events []Event, retained batchRequest) (batchRequest, error) {
+//
+// A member that cannot build — an unserializable Props/Context value the
+// caller mutated in after Enqueue — is POISON: it is returned attributed in
+// poisoned rather than failing the batch, so one bad event can never strand
+// its batchmates (the previous whole-batch EncodeError settled every member,
+// spooled copies included, for one event's mutation). kept is events minus
+// the poisoned members, aligned with the returned request; when nothing
+// poisons it is the input slice unchanged, and when something does the input
+// slice's backing array is reused for the compaction — callers own the batch
+// slice and must adopt kept in its place. Reused-prefix members carry bytes
+// already marshaled once and can never poison.
+func (c *Client) buildBatchIsolating(events []Event, retained batchRequest) (request batchRequest, kept []Event, poisoned []poisonedEvent) {
 	reuse := len(retained.Events)
 	if reuse > len(events) || len(retained.Events) != len(retained.rawEvents) {
 		reuse = 0
@@ -168,19 +187,32 @@ func (c *Client) buildBatchReusing(events []Event, retained batchRequest) (batch
 	raws := make([]json.RawMessage, 0, len(events))
 	envelopes = append(envelopes, retained.Events[:reuse]...)
 	raws = append(raws, retained.rawEvents[:reuse]...)
-	for _, event := range events[reuse:] {
+	kept = events
+	for i, event := range events[reuse:] {
 		envelope, err := c.buildEnvelope(event)
-		if err != nil {
-			return batchRequest{}, err
+		var raw json.RawMessage
+		if err == nil {
+			raw, err = json.Marshal(envelope)
+			if err != nil {
+				err = &EncodeError{Err: err}
+			}
 		}
-		raw, err := json.Marshal(envelope)
 		if err != nil {
-			return batchRequest{}, &EncodeError{Err: err}
+			if poisoned == nil {
+				// First poison member: everything before it survives; the
+				// compaction reuses the input's backing array from here on.
+				kept = events[:reuse+i]
+			}
+			poisoned = append(poisoned, poisonedEvent{id: strings.TrimSpace(event.ID), err: err})
+			continue
+		}
+		if poisoned != nil {
+			kept = append(kept, event)
 		}
 		envelopes = append(envelopes, envelope)
 		raws = append(raws, raw)
 	}
-	return batchRequest{Events: envelopes, rawEvents: raws}, nil
+	return batchRequest{Events: envelopes, rawEvents: raws}, kept, poisoned
 }
 
 func cloneMap(in map[string]any) map[string]any {

@@ -2451,7 +2451,7 @@ func TestSpoolCapacityDeadLetterDeferredUntilEvictionDurable(t *testing.T) {
 	_ = client.Close(context.Background())
 }
 
-func TestSpoolRebuildFailureSettlesSpooledMembers(t *testing.T) {
+func TestSpoolFlushPoisonMemberIsolatedSurvivorsDeliver(t *testing.T) {
 	state, server := newSpoolTestServer(t)
 	defer server.Close()
 	state.setOutcome(http.StatusInternalServerError, "internal_error", "")
@@ -2474,7 +2474,8 @@ func TestSpoolRebuildFailureSettlesSpooledMembers(t *testing.T) {
 
 	// A later batchmate whose Props cannot serialize joins the retained
 	// batch; wait for the worker to absorb it so the flush retry rebuilds ONE
-	// batch of both events and fails on the poison member.
+	// batch of both events and attributes the build failure to the poison
+	// member alone.
 	if err := client.Enqueue(Event{ID: "evt-rebuild-2", Name: "e2", Props: map[string]any{"bad": func() {}}}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
@@ -2486,28 +2487,36 @@ func TestSpoolRebuildFailureSettlesSpooledMembers(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 
+	state.setOutcome(http.StatusAccepted, "", "")
 	err := client.Flush(context.Background())
+	// The poison member's build error folds into the flush's first-error
+	// (like a terminal chunk failure) — but its batchmate DELIVERS in the
+	// same flush instead of dying with it.
 	if err == nil || !strings.Contains(err.Error(), "encode shardpilot batch") {
-		t.Fatalf("expected the rebuild's encode failure surfaced, got %v", err)
+		t.Fatalf("expected the poison member's encode failure surfaced, got %v", err)
 	}
-	// The permanent drop settles the previously spooled member too: counted
-	// dropped == gone from disk, dead-lettered through the terminal class.
+	arrivals := state.allArrivals()
+	last := arrivals[len(arrivals)-1]
+	if len(last) != 1 || last[0] != "evt-rebuild-1" {
+		t.Fatalf("expected the surviving batchmate delivered, got %v", last)
+	}
+	// Delivery settled the survivor's spooled copy; the poison member was
+	// never on disk (its bytes never marshaled), so nothing dead-letters.
 	if record := readSpoolRecordFile(t, dir); len(record.Events) != 0 {
-		t.Fatalf("expected the spooled member settled out of the record, got %s", mustJSON(t, record.Events))
+		t.Fatalf("expected the delivered survivor settled out of the record, got %s", mustJSON(t, record.Events))
 	}
-	terminal := recorder.byReason(SpoolDropTerminal)
-	if len(terminal) != 1 || len(terminal[0].Envelopes) != 1 || !containsEventID(t, terminal[0].Envelopes, "evt-rebuild-1") {
-		t.Fatalf("expected exactly the spooled member dead-lettered terminal, got %+v", terminal)
+	if got := recorder.byReason(SpoolDropTerminal); len(got) != 0 {
+		t.Fatalf("expected no terminal dead-letters (the survivor delivered, the poison member never spooled), got %+v", got)
 	}
-	if stats := client.Snapshot(); stats.Dropped != 2 {
-		t.Fatalf("expected both batch members counted dropped, got %+v", stats)
+	if stats := client.Snapshot(); stats.Dropped != 1 {
+		t.Fatalf("expected only the poison member counted dropped, got %+v", stats)
 	}
 	if err := client.Close(context.Background()); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// A restart delivers NOTHING: the drop settled the spool record as well.
-	state.setOutcome(http.StatusAccepted, "", "")
+	// A restart delivers NOTHING: the survivor was acked off the record and
+	// the poison member never reached it.
 	sent := state.batchCount()
 	restarted := newSpoolTestClient(t, server.URL, dir, nil, nil)
 	if err := restarted.Flush(context.Background()); err != nil {
@@ -2519,7 +2528,7 @@ func TestSpoolRebuildFailureSettlesSpooledMembers(t *testing.T) {
 	_ = restarted.Close(context.Background())
 }
 
-func TestSpoolWorkerRebuildFailureSettlesSpooledMembers(t *testing.T) {
+func TestSpoolWorkerPoisonMemberIsolatedSurvivorsDeliver(t *testing.T) {
 	state, server := newSpoolTestServer(t)
 	defer server.Close()
 	state.setOutcome(http.StatusInternalServerError, "internal_error", "")
@@ -2542,26 +2551,213 @@ func TestSpoolWorkerRebuildFailureSettlesSpooledMembers(t *testing.T) {
 	}
 
 	// The poison batchmate fills the batch to BatchSize, so the WORKER path
-	// (publishWorkerBatch) rebuilds on its own and hits the encode failure;
-	// its permanent drop must settle the spooled member exactly like the
-	// flush path's.
+	// (publishWorkerBatch) rebuilds on its own: the poison member is dropped
+	// attributed, and the retained batchmate delivers in the same attempt
+	// instead of being condemned with it.
+	state.setOutcome(http.StatusAccepted, "", "")
 	if err := client.Enqueue(Event{ID: "evt-wrebuild-2", Name: "e2", Props: map[string]any{"bad": func() {}}}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
-	waitFor(t, 3*time.Second, "the worker drop to settle the spooled member", func() bool {
-		return len(recorder.byReason(SpoolDropTerminal)) == 1
+	waitFor(t, 3*time.Second, "the worker to deliver the surviving batchmate", func() bool {
+		arrivals := state.allArrivals()
+		if len(arrivals) == 0 {
+			return false
+		}
+		last := arrivals[len(arrivals)-1]
+		return len(last) == 1 && last[0] == "evt-wrebuild-1"
 	})
-	terminal := recorder.byReason(SpoolDropTerminal)
-	if len(terminal[0].Envelopes) != 1 || !containsEventID(t, terminal[0].Envelopes, "evt-wrebuild-1") {
-		t.Fatalf("expected exactly the spooled member dead-lettered terminal, got %+v", terminal)
+	waitFor(t, 3*time.Second, "the delivered survivor settled off the record", func() bool {
+		return len(readSpoolRecordFile(t, dir).Events) == 0
+	})
+	if got := recorder.byReason(SpoolDropTerminal); len(got) != 0 {
+		t.Fatalf("expected no terminal dead-letters (the survivor delivered, the poison member never spooled), got %+v", got)
 	}
-	if record := readSpoolRecordFile(t, dir); len(record.Events) != 0 {
-		t.Fatalf("expected the spooled member settled out of the record, got %s", mustJSON(t, record.Events))
-	}
-	if stats := client.Snapshot(); stats.Dropped != 2 {
-		t.Fatalf("expected both batch members counted dropped, got %+v", stats)
+	if stats := client.Snapshot(); stats.Dropped != 1 {
+		t.Fatalf("expected only the poison member counted dropped, got %+v", stats)
 	}
 	_ = client.Close(context.Background())
+}
+
+func TestSpoolCloseRemnantPoisonMemberIsolated(t *testing.T) {
+	dir := t.TempDir()
+	cfg := Config{
+		WorkspaceID:    "workspace-test",
+		AppID:          "app-test",
+		EnvironmentID:  "develop",
+		Source:         SourceBackend,
+		AnonymousID:    "anon-spool-1",
+		SpoolDir:       dir,
+		SpoolMaxEvents: defaultSpoolMaxEvents,
+		SpoolMaxBytes:  defaultSpoolMaxBytes,
+	}
+	client := &Client{cfg: cfg, clock: realClock{}, queue: newBoundedQueue(4), spool: newDiskSpool(cfg)}
+	client.consent.Store(consentStateGranted)
+	client.spool.grantPersisted = true
+
+	now := time.Now()
+	batch := []Event{
+		{ID: "evt-remnant-ok", Name: "e1", Timestamp: now},
+		{ID: "evt-remnant-poison", Name: "e2", Timestamp: now, Props: map[string]any{"bad": func() {}}},
+	}
+	client.spoolCloseRemnant(batch)
+
+	// The poison member is dropped attributed; the rest of the remnant still
+	// spools instead of dying with it (the old whole-remnant drop).
+	record := readSpoolRecordFile(t, dir)
+	if len(record.Events) != 1 || !containsEventID(t, record.Events, "evt-remnant-ok") {
+		t.Fatalf("expected exactly the serializable remnant member spooled, got %s", mustJSON(t, record.Events))
+	}
+	if stats := client.Snapshot(); stats.Dropped != 1 {
+		t.Fatalf("expected the poison member counted dropped, got %+v", stats)
+	}
+}
+
+func TestSpoolCorruptRecordDiscardedAtLoad(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+	state.setOutcome(http.StatusAccepted, "", "")
+
+	dir := t.TempDir()
+	writeConsentRecordFile(t, dir, "granted")
+	// An unparseable spool.json — truncated by a crash mid-tamper, or plain
+	// garbage — proves nothing about what was retained: the load must be a
+	// clean start (file removed, no dead-letters, no counters), never a
+	// crash or an eviction cascade.
+	if err := os.WriteFile(filepath.Join(dir, spoolFileName), []byte(`{"version":1,"events":[{`), 0o600); err != nil {
+		t.Fatalf("write corrupt record: %v", err)
+	}
+
+	recorder := &spoolDeadLetterRecorder{}
+	client := newSpoolTestClient(t, server.URL, dir, recorder, nil)
+	if spoolFileExists(dir) {
+		t.Fatalf("expected the unparseable record discarded at load")
+	}
+	if recorder.count() != 0 {
+		t.Fatalf("an unparseable record is a clean start, not a drop report; got %d letters", recorder.count())
+	}
+	if stats := client.Snapshot(); stats.SpoolEvicted != 0 || stats.SpoolExpired != 0 {
+		t.Fatalf("expected no drop counters from the discarded record, got %+v", stats)
+	}
+	if !client.initialDeferUntil.IsZero() {
+		t.Fatalf("expected no deferral seeded from a discarded record")
+	}
+
+	// The client starts clean and functions normally.
+	if err := client.Enqueue(Event{ID: "evt-after-corrupt-1", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	arrivals := state.allArrivals()
+	if len(arrivals) != 1 || len(arrivals[0]) != 1 || arrivals[0][0] != "evt-after-corrupt-1" {
+		t.Fatalf("expected only the fresh event published, got %v", arrivals)
+	}
+	_ = client.Close(context.Background())
+}
+
+func TestSpoolWrongVersionRecordDiscardedAtLoad(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+	state.setOutcome(http.StatusAccepted, "", "")
+
+	dir := t.TempDir()
+	writeConsentRecordFile(t, dir, "granted")
+	// A well-formed record whose version this build does not write: its
+	// event bytes and its persisted deadline belong to an incompatible
+	// layout and must not be trusted — not resent, not seeding the deferral.
+	// Discarded as a clean start exactly like an unparseable record.
+	record := spoolRecordWire{
+		Version:           spoolRecordVersion + 1,
+		Events:            []json.RawMessage{spoolTestEnvelope(t, "evt-wrong-version-1", time.Now())},
+		RetryAfterUntilMS: time.Now().Add(time.Hour).UnixMilli(),
+	}
+	payload, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("marshal wrong-version record: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, spoolFileName), payload, 0o600); err != nil {
+		t.Fatalf("write wrong-version record: %v", err)
+	}
+
+	recorder := &spoolDeadLetterRecorder{}
+	client := newSpoolTestClient(t, server.URL, dir, recorder, nil)
+	if spoolFileExists(dir) {
+		t.Fatalf("expected the wrong-version record discarded at load")
+	}
+	if recorder.count() != 0 {
+		t.Fatalf("a wrong-version record is a clean start, not a drop report; got %d letters", recorder.count())
+	}
+	if !client.initialDeferUntil.IsZero() {
+		t.Fatalf("expected no deferral seeded from an incompatible record's deadline")
+	}
+
+	// The client starts clean: only fresh events publish, never the
+	// incompatible record's.
+	if err := client.Enqueue(Event{ID: "evt-after-wrong-version-1", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	arrivals := state.allArrivals()
+	if len(arrivals) != 1 || len(arrivals[0]) != 1 || arrivals[0][0] != "evt-after-wrong-version-1" {
+		t.Fatalf("expected only the fresh event published (no resends from the discarded record), got %v", arrivals)
+	}
+	_ = client.Close(context.Background())
+}
+
+func TestSetConsentDiskStallDoesNotBlockIntake(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+	state.setOutcome(http.StatusAccepted, "", "")
+
+	dir := t.TempDir()
+	client := newSpoolTestClient(t, server.URL, dir, nil, nil)
+
+	// Stall the consent-record rename mid-decision: SetConsent's disk side
+	// must not hold the lock Track/Enqueue take, so intake proceeds while
+	// the write is stuck (a slow SpoolDir must never stall the pipeline).
+	stalled := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	client.spool.renameFn = func(oldpath, newpath string) error {
+		once.Do(func() {
+			close(stalled)
+			<-release
+		})
+		return os.Rename(oldpath, newpath)
+	}
+
+	decisionDone := make(chan struct{})
+	go func() {
+		defer close(decisionDone)
+		client.SetConsent(true)
+	}()
+	<-stalled
+
+	enqueued := make(chan error, 1)
+	go func() { enqueued <- client.Enqueue(Event{ID: "evt-during-stall-1", Name: "e1"}) }()
+	select {
+	case err := <-enqueued:
+		if err != nil {
+			t.Fatalf("Enqueue during the stalled consent write: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Enqueue blocked behind the consent decision's disk write")
+	}
+	if got := client.Consent(); got != ConsentGranted {
+		t.Fatalf("expected the in-memory decision already applied, got %v", got)
+	}
+
+	close(release)
+	<-decisionDone
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 }
 
 func TestSpoolDuplicateAppendRetriesDirtyWrite(t *testing.T) {

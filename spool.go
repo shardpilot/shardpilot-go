@@ -1200,15 +1200,22 @@ func (c *Client) spoolAckWithVerdicts(request batchRequest, result batchResult) 
 // events are removed so a poison batch cannot re-fail every launch, and
 // exactly those removed are dead-lettered as terminal.
 func (c *Client) spoolSettleTerminal(request batchRequest) {
-	s := c.spool
-	if s == nil {
-		return
-	}
 	entries := spoolEntriesFromRequest(request)
 	if len(entries) == 0 {
 		return
 	}
-	removed, persistFailed := s.ack(spoolEntryIDs(entries))
+	c.spoolSettleTerminalIDs(spoolEntryIDs(entries))
+}
+
+// spoolSettleTerminalIDs is spoolSettleTerminal for callers that hold event
+// ids rather than a built request (the per-event poison drops, whose events
+// never produced wire bytes).
+func (c *Client) spoolSettleTerminalIDs(ids []string) {
+	s := c.spool
+	if s == nil || len(ids) == 0 {
+		return
+	}
+	removed, persistFailed := s.ack(ids)
 	if len(removed) > 0 {
 		c.notifySpoolDeadLetter(SpoolDropTerminal, removed)
 	}
@@ -1469,10 +1476,12 @@ func (c *Client) spoolCloseRemnant(batch []Event) {
 	// The retained batch's prefix reuses its retained wire bytes (the append
 	// de-duplicates by event_id against bytes already spooled at the failure,
 	// so a re-encode drifting under a mutated Props value must not happen
-	// here either); the queue remainder builds fresh.
-	request, err := c.buildBatchReusing(remnant, c.retainedRequest)
-	if err != nil {
-		c.logf("shardpilot spool: close remnant could not be serialized and was dropped: %v", err)
+	// here either); the queue remainder builds fresh, and a member that no
+	// longer serializes is dropped alone — the rest of the remnant still
+	// spools instead of dying with it.
+	request, _, poisoned := c.buildBatchIsolating(remnant, c.retainedRequest)
+	c.settlePoisonedEvents(poisoned)
+	if len(request.Events) == 0 {
 		return
 	}
 	c.spoolFailedBatch(request, nil, false)
@@ -1543,18 +1552,23 @@ func (c *Client) initSpool() []SpoolDeadLetter {
 	return []SpoolDeadLetter{spoolDeadLetterFrom(SpoolDropConsent, dropped)}
 }
 
-// applySpoolConsentLocked applies a SetConsent decision to the disk side:
-// persist the decision record and purge or open the spool. Called with
-// lifecycleMu held; returns the dead-letters for the caller to emit after
-// unlocking. Denial: the spool is purged (a failed purge owes a wipe and
-// fails closed) and the denied record is written regardless. Grant: an owed
-// wipe is retried FIRST — while it still fails, the persisted decision
-// stays denied and the live in-memory grant applies per the open posture —
-// then the granted record is persisted, and only a SUCCESSFUL persist opens
-// spool writes (grantPersisted): a grant whose record could not be written
-// keeps disk closed, so a load on the next start can always trust the
-// record it finds.
-func (c *Client) applySpoolConsentLocked(analyticsGranted bool) []SpoolDeadLetter {
+// applySpoolConsent applies a SetConsent decision to the disk side: persist
+// the decision record and purge or open the spool. Called with consentMu
+// held — NEVER lifecycleMu, which every Track/Enqueue takes: this function
+// fsyncs files, and event intake must not wait out a disk stall. consentMu
+// keeps the disk order equal to the decision order across concurrent
+// SetConsent calls; the in-memory state was already stored before this runs,
+// so the spool's own gates (append's allowed re-check, owed-wipe) see the
+// decided state under their own lock. Returns the dead-letters for the
+// caller to emit after unlocking. Denial: the spool is purged (a failed
+// purge owes a wipe and fails closed) and the denied record is written
+// regardless. Grant: an owed wipe is retried FIRST — while it still fails,
+// the persisted decision stays denied and the live in-memory grant applies
+// per the open posture — then the granted record is persisted, and only a
+// SUCCESSFUL persist opens spool writes (grantPersisted): a grant whose
+// record could not be written keeps disk closed, so a load on the next start
+// can always trust the record it finds.
+func (c *Client) applySpoolConsent(analyticsGranted bool) []SpoolDeadLetter {
 	s := c.spool
 	if s == nil {
 		return nil

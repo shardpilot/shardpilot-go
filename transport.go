@@ -177,20 +177,34 @@ type httpTransport struct {
 
 func newHTTPTransport(cfg Config) *httpTransport {
 	base := strings.TrimRight(cfg.IngestURL, "/")
+	refuseRedirects := func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	client := cfg.HTTPClient
+	rcClient := &http.Client{
+		Timeout:       cfg.HTTPTimeout,
+		CheckRedirect: refuseRedirects,
+	}
+	if client == nil {
+		client = &http.Client{
+			Timeout: cfg.HTTPTimeout,
+		}
+	} else {
+		// The remote-config client derives from the injected one — same
+		// Transport, Jar, and Timeout — with only CheckRedirect pinned: the
+		// no-redirect classification is an SDK contract (a 3xx is the
+		// permanent http_3xx outcome), not an integrator knob.
+		derived := *client
+		derived.CheckRedirect = refuseRedirects
+		rcClient = &derived
+	}
 	return &httpTransport{
 		endpoint:        base + "/v1/events:batch",
 		consentEndpoint: base + "/v1/consent",
 		token:           cfg.Token,
 		schemaRevision:  effectiveSchemaRevision(cfg),
-		client: &http.Client{
-			Timeout: cfg.HTTPTimeout,
-		},
-		rcClient: &http.Client{
-			Timeout: cfg.HTTPTimeout,
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		},
+		client:          client,
+		rcClient:        rcClient,
 	}
 }
 

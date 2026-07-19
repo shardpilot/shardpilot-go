@@ -126,7 +126,10 @@ func saveConsentRecord(dir string, granted bool, actorDigest string, rename func
 
 // createWipeOwedMarker records that a spool purge failed and a wipe is still
 // owed, so the fail-closed state survives a restart. Presence is the flag;
-// the file carries no content.
+// the file carries no content. The directory is synced after the create for
+// the same reason writePrivateFileAtomic syncs it after a rename: the marker
+// IS the persisted fail-closed state, and a crash that forgets the entry
+// would reopen the spool with the condemned record still owed.
 func createWipeOwedMarker(dir string) error {
 	if err := ensurePrivateDir(dir, os.Chmod); err != nil {
 		return err
@@ -135,7 +138,10 @@ func createWipeOwedMarker(dir string) error {
 	if err != nil {
 		return err
 	}
-	return file.Close()
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return syncDir(dir)
 }
 
 func removeWipeOwedMarker(dir string) error {
