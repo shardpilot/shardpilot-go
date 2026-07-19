@@ -14,10 +14,12 @@
   - `Config.HTTPClient`: optional injection of the `*http.Client` behind every request the
     SDK makes (event batches, consent posts, remote-config fetches) for pooled transports,
     proxies, mTLS, or instrumentation. Nil — the default — keeps the SDK's internal clients
-    exactly as before. Injection preserves two SDK contracts: per-attempt deadlines still
-    come from `HTTPTimeout`/caller contexts, and remote-config fetches still refuse
-    redirects (the SDK derives its remote-config client from the injected one with
-    `CheckRedirect` pinned, sharing the transport).
+    exactly as before. Injection preserves two SDK contracts: every attempt is bounded by
+    the SOONER of `HTTPTimeout` and the caller's context deadline through per-request
+    contexts — an injected client without a `Timeout` of its own can no longer stretch an
+    attempt to a longer caller deadline — and remote-config fetches still refuse redirects
+    (the SDK derives its remote-config client from the injected one with `CheckRedirect`
+    pinned, sharing the transport).
   - Crash-durability of state publishes: the atomic record write (spool record, consent
     record, remote-config cache) now fsyncs the parent directory after the rename, and the
     owed-wipe marker create does the same — a crash right after a write can no longer forget
@@ -26,12 +28,18 @@
     cannot be opened for syncing and NTFS journals metadata on its own.
   - `SetConsent`'s disk side (consent-record persist + spool purge) moved off the lock every
     `Track`/`Enqueue` takes: a slow `SpoolDir` write no longer stalls event intake for the
-    duration of a consent decision. Decision semantics are unchanged — a dedicated mutex
-    serializes whole decisions, so the in-memory order, the disk order, and the consent-send
-    order still agree across concurrent `SetConsent` calls.
+    duration of a consent decision, and a decision issued while an earlier decision's write
+    is stalled takes effect on intake IMMEDIATELY (a denial rejects events from the moment
+    it is issued, never from when the disk frees up). Overlapping decisions' disk writes and
+    transmissions still settle strictly in decision order (the last decision's record lands
+    last), and `Close` now waits — bounded by its context — for decisions admitted before it,
+    so teardown can no longer strand an in-flight decision's transmission or abandon a
+    denial's purge half-way.
   - Tests for the spool-load discard branches that had none: an unparseable `spool.json` and
     a wrong-version record each load as a clean start — file removed, no dead-letters, no
     counters, and no deferral seeded from an incompatible record's persisted deadline.
+
+## v0.5.0-alpha — 2026-07-19 — remote config, disk spool, schema revision
 
 - Remote config client (GAP-075): explicit `FetchRemoteConfig` plus never-fail typed getters
   (`RemoteConfigValue/String/Number/Bool/Values/Version`) over a durable last-known-good cache
@@ -147,6 +155,9 @@
   ungated, and a consent denial that discards the held batch clears the backoff along
   with the deferral. This mirrors the shardpilot-defold reference semantics and removes
   the fixed ~1s fleet-wide retry storm during ingest outages.
+
+- This is an early alpha pre-release. The API is unstable and may change
+  before v1. Released as the `v0.5.0-alpha` git tag.
 
 ## v0.4.0-alpha — 2026-07-06 — consent, result callbacks, JWT mint
 

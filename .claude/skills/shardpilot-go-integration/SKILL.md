@@ -1,12 +1,12 @@
 ---
 name: shardpilot-go-integration
-description: Use when integrating the ShardPilot Go SDK (shardpilot-go) into a Go server or backend service — pinned install, credentials, the server-side consent posture, analytics events, crash reporting, and how to verify the integration end to end.
+description: Use when integrating the ShardPilot Go SDK (shardpilot-go) into a Go server or backend service — pinned install, credentials, the server-side consent posture, analytics events, remote config, the opt-in disk spool, crash reporting, and how to verify the integration end to end.
 ---
 
 # Integrating the ShardPilot Go SDK
 
 This skill describes the SDK exactly as shipped in the
-pinned release tag `v0.4.0-alpha`. Every behavioral claim below was verified
+pinned release tag `v0.5.0-alpha`. Every behavioral claim below was verified
 against that tag's source. Where the SDK does not have a capability, this
 skill says so — do not invent config fields, endpoints, or behaviors beyond
 what is documented here.
@@ -24,18 +24,27 @@ stdlib-only with zero third-party dependencies. It:
   transmits them to ShardPilot in the background;
 - mints short-lived Mode-B per-user ingest JWTs (`SignIngestJWT`) for client
   SDKs to consume — a backend-only helper;
-- offers an opt-in persisted anonymous ID helper (`LoadOrCreateAnonymousID`).
+- offers an opt-in persisted anonymous ID helper (`LoadOrCreateAnonymousID`);
+- fetches remote configuration on explicit call (`FetchRemoteConfig`) with
+  never-fail typed getters over a durable last-known-good cache (see
+  "Remote config");
+- optionally spools retriably failed queued batches to disk and resends them
+  across restarts (`Config.SpoolDir` — opt-in and strictly
+  consent-grant-gated; see "Offline behavior / spool").
 
 It deliberately does **not**: manage session lifecycles (`Event.SessionID` /
-`Event.SessionSequence` are passed through verbatim), fetch remote config
-(see below), persist events or consent state to disk, or auto-instrument
-anything. It sends telemetry only — no other write calls, no automatic
-actions.
+`Event.SessionSequence` are passed through verbatim), refresh remote config
+on its own (no polling, no experiment assignment — every fetch is an
+explicit call), write anything to disk unless explicitly opted in
+(`SpoolDir` / `RemoteConfigCachePath` / `LoadOrCreateAnonymousID`; the live
+consent state is never restored from disk), or auto-instrument anything. On
+the network it sends telemetry and fetches remote config when asked — no
+other calls, no automatic actions.
 
 ## Install
 
 ```bash
-go get github.com/shardpilot/shardpilot-go@v0.4.0-alpha
+go get github.com/shardpilot/shardpilot-go@v0.5.0-alpha
 ```
 
 - Requires **Go 1.24+**.
@@ -44,8 +53,8 @@ go get github.com/shardpilot/shardpilot-go@v0.4.0-alpha
   - `github.com/shardpilot/shardpilot-go/pkg/crash` — crash reporting
     (package `crash`).
 - **`v0.1.0` is retracted** in `go.mod`; never pin it. Older usable pins
-  (`v0.3.0-alpha`, `v0.2.0-alpha`, `v0.1.2`) ship progressively less surface —
-  prefer the pin above.
+  (`v0.4.0-alpha`, `v0.3.0-alpha`, `v0.2.0-alpha`, `v0.1.2`) ship
+  progressively less surface — prefer the pin above.
 - Pre-launch: there is no public production ingest endpoint yet. `IngestURL`
   is the base URL of the ShardPilot deployment you were given (or a local
   stack). HTTPS is required outside localhost/loopback. The **analytics
@@ -131,8 +140,13 @@ RFC1918 **IP literal** only, via `AllowInsecurePrivateNetwork` — hostnames
 are never resolved). Optional tuning: `BatchSize` (default 25, max
 100), `BufferSize` (async queue capacity, default 1000), `FlushInterval`
 (default 1s), `HTTPTimeout` (default 2s), `Logger`, `UserID`/`AnonymousID`
-(default actor identity), `OnBatchResult` (see verification). The SDK itself
-reads no environment variables.
+(default actor identity), `OnBatchResult` (see verification), the
+remote-config fields (`RemoteConfigURL` + `APIKey` +
+`RemoteConfigCachePath`; see "Remote config"), the disk-spool fields
+(`SpoolDir`, `SpoolMaxEvents`, `SpoolMaxBytes`, `OnSpoolDeadLetter`; see
+"Offline behavior / spool"), and `SchemaRevision` /
+`DisableSchemaRevision` (see the facts list below). The SDK itself reads no
+environment variables.
 
 ## Consent model — READ THIS FIRST, IT IS INVERTED
 
@@ -151,9 +165,12 @@ nothing while consent is unknown. This server-side SDK does the inverse:
   `Enqueue` return `ErrConsentDenied`, clears the pending queue (cleared
   events count as `Dropped`), and aborts any batch publish already in flight
   on the network. `SetConsent(true)` re-opens the pipeline.
-- **Consent state is in-memory only.** It is NOT persisted across process
-  restarts. If consent must survive restarts, store the decision yourself
-  and re-apply it with `SetConsent` on startup, before publishing.
+- **The live consent state is in-memory only.** It is NOT restored across
+  process restarts — even with `Config.SpoolDir` set, which persists each
+  decision to disk solely to gate the spool's disk participation (see
+  "Offline behavior / spool"), never to re-apply it. If consent must survive
+  restarts, store the decision yourself and re-apply it with `SetConsent` on
+  startup, before publishing.
 - **Consent receipts are fire-and-forget.** A `SetConsent` call also
   transmits the decision to ShardPilot in the background — but only when an
   actor identity is configured (`Config.UserID`, else `Config.AnonymousID`);
@@ -220,20 +237,67 @@ Facts that keep integrations correct:
   one invalid event takes down its batch.
 - **Only queued publishes are retried.** The background flush worker retains
   a batch that failed retryably (429/5xx or transport error) and retries it,
-  honoring the server's `Retry-After` hint. Synchronous `Track` does **not**
-  retry: it publishes once and returns the error, so `Track` callers own
-  their own retry/error policy (`HTTPStatusError.RetryAfter` carries the
+  honoring the server's `Retry-After` hint; a retryable failure **without** a
+  hint paces itself with full-jitter exponential backoff (first failure at
+  the flush cadence, then a random wait in [1s, ceiling] with the ceiling
+  doubling per consecutive failure up to 60s, reset on success). With
+  `SpoolDir` set such batches also spool to disk as crash insurance (see
+  "Offline behavior / spool"). Synchronous `Track` does **not** retry and
+  never spools: it publishes once and returns the error, so `Track` callers
+  own their own retry/error policy (`HTTPStatusError.RetryAfter` carries the
   server's hint to honor).
+- **Every batch publish declares a schema-set revision** via the
+  `X-ShardPilot-Schema-Revision` request header (`DefaultSchemaRevision`,
+  the revision this build was coordinated against; override with
+  `Config.SchemaRevision`, or stop declaring with
+  `Config.DisableSchemaRevision` — an undeclared revision always passes).
+  The header rides the batch route only and is inert while the server's
+  handshake mode is `off`; under a future `enforce` mode a stale revision is
+  rejected as HTTP `409` with error code `schema_revision_mismatch`, which
+  is **terminal** for the batch — dropped, never retried.
 - Non-2xx responses surface as `*shardpilot.HTTPStatusError` with the
   server's machine-readable `ErrorCode` (e.g. `unauthorized`,
   `validation_error`, `rate_limited`), per-field `Details`, and `RetryAfter`.
 
 ## Remote config
 
-**Not available in this SDK.** The pinned release has no remote-config API —
-no fetch call, no getters, no cache. Do not generate remote-config code against
-this SDK; if the integration needs server-driven tuning values, source them
-elsewhere.
+Available from this release — **explicit fetch only**. Configure
+`RemoteConfigURL` (a dedicated config origin, never the ingest URL) plus
+`APIKey` (a publishable `sp_ingest_` client key — remote config is **never**
+authenticated with `Config.Token`; a Mode-B JWT cannot fetch config), and
+usually `RemoteConfigCachePath` (durable last-known-good cache file) plus a
+persisted `Config.AnonymousID` — the anonymous ID is the fetch's
+`client_id`, and without one every fetch fails `client_id_unavailable`.
+
+```go
+res, err := client.FetchRemoteConfig(ctx) // one GET, ETag-revalidated
+speed := client.RemoteConfigNumber("scroll_speed", 1.0)
+```
+
+- **The SDK never refreshes on its own** — no polling, no experiment
+  assignment, no client-side rule evaluation. Call `FetchRemoteConfig(ctx)`
+  when the service wants fresh values.
+- **Typed getters never fail**: `RemoteConfigString` / `RemoteConfigNumber`
+  / `RemoteConfigBool` return the caller's default on a missing key AND on a
+  type mismatch; `RemoteConfigValue` / `RemoteConfigVersion` are comma-ok;
+  `RemoteConfigValues` snapshots the whole map. All read the in-memory
+  snapshot only — never the network, never an error — and serve cached
+  values before (and without) any fetch.
+- **Transient failures serve the cache**: offline, `408`, `429`, `5xx`, or a
+  malformed/oversized body returns the cached snapshot as a success with
+  `FromCache=true` and a `Reason` code (or fails with that code when no
+  usable cache exists). **`401`/`403` fail closed** — the cache is never
+  served for that fetch (a revoked key must not keep supplying
+  configuration), though the cached record survives for later fetches under
+  a valid credential. Any other status (`404`, `3xx`, other `4xx`) is a
+  permanent error; redirects are not followed on this route.
+- **A `429`'s `Retry-After` arms an in-memory cooldown** (floor 1s, clamp
+  24h): an explicit fetch inside the window serves the cache without
+  touching the network.
+- **Not consent-gated**: denied analytics consent neither blocks fetches nor
+  clears the config cache — configuration is client-public tuning, not
+  telemetry. `RemoteConfigCachePath` works without `SpoolDir` and never
+  enables consent persistence.
 
 ## Crash reporting (`pkg/crash`)
 
@@ -278,17 +342,46 @@ and that surfaces as `Result.Suppressed == true` in the `OnResult` callback
 
 ## Offline behavior / spool
 
-**None.** The analytics queue is in-memory only (bounded by `BufferSize`);
-a disk spool is an acknowledged TODO in the source, not a feature. Concretely:
+**Default: none.** With `SpoolDir` unset the analytics queue is in-memory
+only (bounded by `BufferSize`): events still buffered when the process dies
+are lost, events dropped on queue overflow (`ErrQueueFull`) are lost, and
+nothing replays across restarts.
 
-- Events still buffered when the process dies are **lost**.
-- Events dropped on queue overflow (`ErrQueueFull`) are **lost**.
-- There is no offline replay across restarts, for analytics or crash reports
-  (a crash report that cannot be sent at capture time is lost).
+**Opt-in bounded disk spool** (`Config.SpoolDir`): queued batches that fail
+retryably (`429`/`5xx`/network) are persisted and resend before fresh events
+on later flushes — including after a restart — as byte-identical envelopes
+the server de-duplicates by `event_id`. Terminal outcomes never spool, and
+synchronous `Track` failures never spool. Facts:
+
+- **Caps and drops**: 2000 events / 1 MiB by default (oldest evicted first),
+  plus a 7-day retry-age expiry; every event the spool drops undelivered
+  (capacity, expiry, terminal outcome, consent) fires
+  `Config.OnSpoolDeadLetter`. `Stats.Spooled` counts only durably written
+  events.
+- **Resends settle by the response's per-event verdicts**: only confirmed
+  deliveries count as resent — a per-event `rejected` or consent-suppressed
+  outcome dead-letters with the matching class (a `202` alone is not
+  delivery confirmation).
+- **Disk participation is strictly consent-grant-gated — the
+  open-under-`unknown` live posture does NOT extend to disk.** Spool writes
+  and startup loads require a **persisted** `SetConsent(true)` grant scoped
+  (via digest) to the configured (workspace, environment, `UserID`,
+  `AnonymousID`) actor. Under any other state — including the initial
+  `unknown` — nothing touches disk: would-have-spooled batches surface via
+  `OnSpoolDeadLetter` with the consent class while the normal in-memory
+  retry continues, and a persisted record in any non-granted or other-actor
+  state is purged. An event whose per-event `Event.UserID` /
+  `Event.AnonymousID` override differs from the configured actor never
+  spools — it dead-letters instead.
+- **One client per `SpoolDir`** is the supported topology (concurrent
+  sibling writers are merge-tolerated as a safety net, surfaced via
+  `Stats.SpoolForeignMerged`, not a feature).
+- **Crash reports still have no offline replay** — a crash report that
+  cannot be sent at capture time is lost.
 
 Call `Flush(ctx)` at checkpoints and `Close(ctx)` on shutdown to bound the
-loss window. If at-least-once delivery matters, keep your own durable record
-upstream of the SDK.
+loss window. If at-least-once delivery matters end to end, keep your own
+durable record upstream of the SDK.
 
 ## Verify your integration
 
@@ -347,10 +440,13 @@ Run against your dev/staging deployment credentials, then check each item:
 Stated plainly so integrations are designed around them, not surprised by
 them:
 
-- **No durable delivery.** In-memory queue only; process death or queue
-  overflow loses events. No offline spool for analytics or crash reports.
-- **Consent state does not survive restarts** (in-memory only; re-apply on
-  startup yourself).
+- **Durable delivery is opt-in and partial.** The queue is in-memory by
+  default; the `SpoolDir` spool covers only retryably failed queued batches
+  and only under a persisted consent grant. Process death still loses the
+  live queue and buffer, and crash reports have no offline replay.
+- **The live consent state does not survive restarts** (never restored at
+  startup, even though `SpoolDir` persists the decision record to gate disk
+  participation; re-apply on startup yourself).
 - **Consent receipts have no delivery guarantee**: fire-and-forget, 16-entry
   pending buffer with oldest-dropped overflow, failures only logged, no
   per-receipt success signal, and no ordering guarantee relative to event
@@ -359,7 +455,9 @@ them:
   need a separate consent-write-capable service credential.
 - **No `denied_forced_minor` / forced-minor flow** (exists in ShardPilot's
   client SDKs, not here).
-- **No remote config** in this SDK.
+- **Remote config is explicit-fetch-only** — no background refresh, no
+  experiment assignment or rule evaluation, and every fetch requires
+  `Config.AnonymousID` (the `client_id`).
 - **Whole-batch loss on a permanent 4xx** — one invalid event drops its
   entire batch (partial-batch recovery is a known TODO).
 - **Non-fatal crash sampling defaults to 1-in-10 per client**, and a
