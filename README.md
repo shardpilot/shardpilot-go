@@ -27,13 +27,13 @@ Real, tested, working code — **early alpha**. The API is pre-v1 and may change
 Install the latest tagged release:
 
 ```bash
-go get github.com/shardpilot/shardpilot-go@v0.4.0-alpha
+go get github.com/shardpilot/shardpilot-go@v0.5.0-alpha
 ```
 
-`v0.4.0-alpha` is the latest tag. It ships the consent API (`SetConsent` / `Consent`), `LoadOrCreateAnonymousID`, the backend-only `SignIngestJWT` Mode-B mint helper, and the default actor identity fields documented in this README, on top of the de-gamed universal `Event` envelope and `pkg/crash`. To pin the earlier tag that ships only the de-gamed envelope (`v0.3.0-alpha`) and crash SDK (`v0.2.0-alpha`), use:
+`v0.5.0-alpha` is the latest tag. It ships the explicit-fetch remote config client (`FetchRemoteConfig` + never-fail typed getters over a durable last-known-good cache), the opt-in consent-gated bounded disk spool (`Config.SpoolDir`), the `X-ShardPilot-Schema-Revision` batch declaration, and full-jitter retry backoff documented in this README, on top of the v0.4.0-alpha consent API, `SignIngestJWT` Mode-B mint helper, and `pkg/crash`. To pin the previous tag that ships the consent API, result callbacks, and JWT mint but none of the above, use:
 
 ```bash
-go get github.com/shardpilot/shardpilot-go@v0.3.0-alpha
+go get github.com/shardpilot/shardpilot-go@v0.4.0-alpha
 ```
 
 For analytics only, `v0.1.2` is available. **`v0.1.0` is retracted** in the module's `go.mod` (use `v0.1.2` or `v0.2.0-alpha` or later). `v0.1.2` and later require **Go 1.24+**.
@@ -279,7 +279,7 @@ gofmt -l .
 
 Pre-v1; the API is explicitly unstable.
 
-- The consent API, `LoadOrCreateAnonymousID`, the backend-only `SignIngestJWT` Mode-B mint helper, and optional default actor identity fields shipped in `v0.4.0-alpha`; for changes merged since that tag, see the `Unreleased` section of [CHANGELOG.md](CHANGELOG.md).
+- The remote config client (`FetchRemoteConfig` + typed getters), the opt-in bounded disk spool (`Config.SpoolDir`), the schema-revision declaration on `events:batch`, and the full-jitter retry backoff shipped in `v0.5.0-alpha`; the changelog's `Unreleased` section is currently empty.
 - Public developer docs are planned for `docs.shardpilot.com`; that domain is not yet provisioned.
 
 `v0.3.0-alpha` (tagged) removed the game-flavored `MatchID` field from the universal `Event` envelope; carry that context in `Props["match_id"]` instead (wire payload unchanged).

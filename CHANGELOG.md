@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.5.0-alpha — 2026-07-19 — remote config, disk spool, schema revision
+
 - Remote config client (GAP-075): explicit `FetchRemoteConfig` plus never-fail typed getters
   (`RemoteConfigValue/String/Number/Bool/Values/Version`) over a durable last-known-good cache
   (`Config.RemoteConfigURL`, `Config.APIKey`, `Config.RemoteConfigCachePath`), scoped by
@@ -116,6 +118,9 @@
   ungated, and a consent denial that discards the held batch clears the backoff along
   with the deferral. This mirrors the shardpilot-defold reference semantics and removes
   the fixed ~1s fleet-wide retry storm during ingest outages.
+
+- This is an early alpha pre-release. The API is unstable and may change
+  before v1. Released as the `v0.5.0-alpha` git tag.
 
 ## v0.4.0-alpha — 2026-07-06 — consent, result callbacks, JWT mint
 
