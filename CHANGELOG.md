@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Added a customer-facing AI integration skill
+  (`.claude/skills/shardpilot-go-integration/SKILL.md`): a source-verified brief of the
+  pinned install tag, credential handling, this SDK's server-side consent posture
+  (open-by-default under `unknown`, inverted vs the consent-first client SDKs), crash
+  reporting, offline limitations, and a verify-your-integration checklist, so AI coding
+  tools integrate the SDK contract-correctly. The README points to it from a new
+  "AI-assisted integration" section, and `scripts/check_release_consistency.sh` now also
+  fails when the skill's single pinned install command drifts from the README's
+  latest-tag claims (release runbook updated accordingly).
+
 - Every `events:batch` publish now declares the ingest envelope schema-set revision this
   SDK build was coordinated against via the `X-ShardPilot-Schema-Revision` request header
   (`DefaultSchemaRevision` — the digest of the ingest service's embedded schema set,

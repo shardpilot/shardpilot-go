@@ -4,7 +4,9 @@ The ShardPilot Go SDK is published as semver git tags plus a GitHub Release
 per tag (currently `v0.4.0-alpha`). There is no packaging step: Go modules
 resolve `go get github.com/shardpilot/shardpilot-go@vX.Y.Z` directly off the
 git tag. The SDK carries no in-code version constant, so the version surfaces
-that must agree are the README's Installation section and `CHANGELOG.md`.
+that must agree are the README's Installation section, `CHANGELOG.md`, and
+the integration skill's install pin
+(`.claude/skills/shardpilot-go-integration/SKILL.md`).
 This is an early alpha pre-release: the API is unstable and may change before
 v1.
 
@@ -13,14 +15,19 @@ v1.
 1. Open a single release PR that:
    - rolls the `## Unreleased` section of `CHANGELOG.md` into a new
      `## vX.Y.Z(-alpha) — YYYY-MM-DD — short summary` section (leave
-     `## Unreleased` in place, empty or freshly restarted), and
+     `## Unreleased` in place, empty or freshly restarted),
    - updates the README Installation section's latest-tag claims to match:
      the `go get github.com/shardpilot/shardpilot-go@vX.Y.Z` install command
-     and the "`vX.Y.Z` is the latest tag." sentence.
+     and the "`vX.Y.Z` is the latest tag." sentence, and
+   - updates `.claude/skills/shardpilot-go-integration/SKILL.md` to the same
+     tag in both its single install command and its single "pinned release
+     tag" intro claim (and re-verifies the skill's behavioral claims against
+     any surface changes shipping in the release).
 2. CI enforces the consistency: `scripts/check_release_consistency.sh` (the
    `release-consistency` job in `.github/workflows/ci.yml`) fails any PR
-   where the README's latest-tag claim, the README's install command, and
-   the topmost released CHANGELOG section disagree.
+   where the README's latest-tag claim, the README's install command, the
+   topmost released CHANGELOG section, or the integration skill's install
+   pin disagree.
 3. After the release PR merges, tag `vX.Y.Z(-alpha)` at the merge commit and
    publish a GitHub Release for the tag, marked **pre-release** for `-alpha`
    versions, with the release notes copied from that CHANGELOG section.
