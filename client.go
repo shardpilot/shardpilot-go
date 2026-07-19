@@ -202,6 +202,18 @@ func NewClient(cfg Config) (*Client, error) {
 	client.consentTurnCond = sync.NewCond(&client.consentTurnMu)
 	client.consentGate.Store(newConsentGateState())
 
+	// Consent-floor init runs FIRST when the floor is opted in: it resolves
+	// the LIVE consent truth — the outbox reload, the identity contract, the
+	// receipt trail's tail overriding (and healing) a stale decision record
+	// — before ANY spool data is loaded, so initSpool below trusts the
+	// RESOLVED state. The worker re-publishes loaded chunks, so seeding
+	// resend work under a stale grant whose operative decision was a durable
+	// denial would transmit pre-denial events (see initSpool's grant-only
+	// rule under the floor).
+	if normalized.ConsentFloor != nil {
+		client.consentWake = make(chan struct{}, 1)
+		client.initConsentFloor(os.Chmod)
+	}
 	// Spool init runs before the worker starts: it seeds initialDeferUntil
 	// and the resend queue the worker consumes. Dead-letters it produced are
 	// emitted only after the client is fully wired.
@@ -212,10 +224,6 @@ func NewClient(cfg Config) (*Client, error) {
 			client.stats.spoolForeignMerged.Add(uint64(n))
 		}
 		initDeadLetters = client.initSpool()
-	}
-	if normalized.ConsentFloor != nil {
-		client.consentWake = make(chan struct{}, 1)
-		client.initConsentFloor(os.Chmod)
 	}
 	if normalized.RemoteConfigURL != "" {
 		client.rc = newRemoteConfigState(normalized)
@@ -245,6 +253,16 @@ func (c *Client) Track(ctx context.Context, event Event) error {
 		c.lifecycleMu.Unlock()
 		c.stats.dropped.Add(1)
 		return ErrConsentUnknown
+	}
+	if c.consentFloorEnabled() && c.consentFloorActorMismatch(event) {
+		// The floor's decision covers the CONFIGURED identity only: an event
+		// overriding UserID/AnonymousID to a different effective actor would
+		// transmit an actor with no local decision and no receipt. Distinct
+		// refusal; per-actor decisions beyond the configured one use the
+		// server-side consent path.
+		c.lifecycleMu.Unlock()
+		c.stats.dropped.Add(1)
+		return ErrConsentActorMismatch
 	}
 	event, err := c.prepareEvent(event)
 	if err != nil {
@@ -297,6 +315,13 @@ func (c *Client) Enqueue(event Event) error {
 		// parked grant receipt holds the worker's BATCH leg, not Enqueue.
 		c.stats.dropped.Add(1)
 		return ErrConsentUnknown
+	}
+	if c.consentFloorEnabled() && c.consentFloorActorMismatch(event) {
+		// Same actor contract as Track: the floor's decision covers the
+		// configured identity only, so an override to a different effective
+		// actor is refused at intake rather than queued for transmission.
+		c.stats.dropped.Add(1)
+		return ErrConsentActorMismatch
 	}
 	event, err := c.prepareEvent(event)
 	if err != nil {
@@ -477,8 +502,12 @@ func (c *Client) finishClose(ctx context.Context) error {
 	} else {
 		err = errors.Join(err, consentErr)
 	}
-	// A memory-only floor client that discarded a gated remnant reports the
-	// loss on every Close — see closeDiscardVerdict.
+	// A floor client whose close remnant was neither delivered nor made
+	// durable — discarded outright (memory-only), refused by the spool's
+	// write gate, or left in a mirror whose persist still failed — reports
+	// the loss on every Close: see closeDiscardVerdict. In particular a
+	// successful consent drain above must not turn a lost gated remnant
+	// into a nil verdict.
 	err = c.closeDiscardVerdict(err)
 
 	c.closeMu.Lock()
@@ -667,7 +696,7 @@ func (c *Client) run() {
 			// behind — is the spool's remnant (grant-gated; no-op without a
 			// spool). A memory-only FLOOR client instead accounts the
 			// discarded remnant so Close can report the loss.
-			c.spoolCloseRemnant(batch)
+			remnantAdded, remnantRefused := c.spoolCloseRemnant(batch)
 			c.recordDiscardedCloseRemnant(batch)
 			// Final settle: a record write that failed earlier (dirty mirror)
 			// gets one last retry before the worker exits, whatever shape the
@@ -676,6 +705,11 @@ func (c *Client) run() {
 			// exiting with a recovered-but-unwritten spool would lose events
 			// that a flush-cadence tick tomorrow would have saved.
 			c.spoolMaintain()
+			// AFTER the final settle (a recovered write reads as safe): a
+			// FLOOR client's remnant that is still neither delivered nor
+			// durable is a reportable discard, exactly like the memory-only
+			// case above — Close must not read as clean over it.
+			c.recordUnspooledCloseRemnant(remnantAdded, remnantRefused)
 			return
 		}
 	}

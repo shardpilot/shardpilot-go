@@ -285,10 +285,6 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) error {
 	// state, nothing durable. Floor-off keeps writing, unchanged: there the
 	// record only ever gates the next launch's spool, never the live state.
 	var deadLetters []SpoolDeadLetter
-	if admitted || !c.consentFloorEnabled() {
-		deadLetters = c.applySpoolConsent(decision)
-	}
-
 	var keyErr error
 	if c.consentFloorEnabled() {
 		// Consent-floor delivery: exactly one receipt per explicit decision
@@ -302,17 +298,54 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) error {
 		// no receipt is minted, retained, or persisted — a durable
 		// post-Close receipt would transmit at the NEXT launch, which
 		// "no longer transmitted" promises not to do.
+		//
+		// DURABLE ORDERING per decision flavor (the engine SDKs' shared
+		// rule: grants receipt-first, denials record-first). A crash can
+		// land between the receipt append and the record write, and the
+		// next launch restores whatever the disk says — so the pair must
+		// be ordered so that every reachable intermediate state fails
+		// CLOSED. GRANT: the receipt rides the durable outbox FIRST, and
+		// the granted record is written only once the receipt trail is
+		// safely down (or provably never coming — no configured actor, a
+		// failed key mint: the documented local-only path). Record-first
+		// would leave "granted record, empty outbox" reachable — a
+		// relaunch flowing events with no receipt ever sent. When the
+		// receipt write itself fails, the record write is WITHHELD: the
+		// live grant applies in memory, the receipt write stays owed, and
+		// the next launch restores the old persisted state — or, once the
+		// owed receipt landed, the grant from the trail tail (healing the
+		// record at reload). DENIAL: the record — and the spool purge it
+		// condemns — stays FIRST (a crash after it restores denied,
+		// fail-closed); the deny receipt appends after it.
 		if admitted {
 			reason := ""
 			if decision == ConsentDecisionDeniedForcedMinor {
 				reason = consentDecisionReason
 			}
-			if receipt, ok := c.mintConsentReceipt(analyticsGranted, reason); ok {
-				if c.consentOutbox.append(receipt) {
-					c.recordConsentOutboxPersistFailure()
+			if analyticsGranted {
+				receiptTrailSafe := true
+				if receipt, ok := c.mintConsentReceipt(true, reason); ok {
+					if c.consentOutbox.append(receipt) {
+						c.recordConsentOutboxPersistFailure()
+						receiptTrailSafe = false
+					}
+					c.drainConsentOutboxEvictions()
+					c.wakeConsentDispatch()
 				}
-				c.drainConsentOutboxEvictions()
-				c.wakeConsentDispatch()
+				if receiptTrailSafe {
+					deadLetters = c.applySpoolConsent(decision)
+				} else {
+					c.logf("shardpilot consent floor: the grant receipt could not be written durably; the granted record is withheld (a restart restores the prior state, or the grant from the trail tail once the owed receipt write lands)")
+				}
+			} else {
+				deadLetters = c.applySpoolConsent(decision)
+				if receipt, ok := c.mintConsentReceipt(false, reason); ok {
+					if c.consentOutbox.append(receipt) {
+						c.recordConsentOutboxPersistFailure()
+					}
+					c.drainConsentOutboxEvictions()
+					c.wakeConsentDispatch()
+				}
 			}
 		}
 		if grantArming {
@@ -323,31 +356,39 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) error {
 			// cannot come.
 			c.consentGrantArming.Add(-1)
 		}
-	} else if actor != "" {
-		idempotencyKey, err := uuidv7.New()
-		if err != nil {
-			keyErr = err
-		} else {
-			// Hand off while still holding the turn so the transmission
-			// order matches the decision order across concurrent SetConsent
-			// calls (the turn is the single producer on consentSends).
-			request := consentRequest{
-				WorkspaceID:     c.cfg.WorkspaceID,
-				AppID:           c.cfg.AppID,
-				EnvironmentID:   c.cfg.EnvironmentID,
-				ActorIdentifier: actor,
-				Categories:      map[string]bool{"analytics": analyticsGranted},
-				DecidedAt:       c.clock.Now().UTC().Format(time.RFC3339),
-				IdempotencyKey:  idempotencyKey,
+	} else {
+		// Floor-off: the record/spool side applies unconditionally — even
+		// post-Close, where the record only ever gates the NEXT launch's
+		// spool, never any live state — and the legacy fire-and-forget
+		// post follows.
+		deadLetters = c.applySpoolConsent(decision)
+		if actor != "" {
+			idempotencyKey, err := uuidv7.New()
+			if err != nil {
+				keyErr = err
+			} else {
+				// Hand off while still holding the turn so the transmission
+				// order matches the decision order across concurrent
+				// SetConsent calls (the turn is the single producer on
+				// consentSends).
+				request := consentRequest{
+					WorkspaceID:     c.cfg.WorkspaceID,
+					AppID:           c.cfg.AppID,
+					EnvironmentID:   c.cfg.EnvironmentID,
+					ActorIdentifier: actor,
+					Categories:      map[string]bool{"analytics": analyticsGranted},
+					DecidedAt:       c.clock.Now().UTC().Format(time.RFC3339),
+					IdempotencyKey:  idempotencyKey,
+				}
+				if decision == ConsentDecisionDeniedForcedMinor {
+					// Without the floor the forced-minor decision still
+					// applies its full denial semantics; the reason rides
+					// the fire-and-forget receipt (best-effort, like every
+					// legacy consent post).
+					request.Reason = consentDecisionReason
+				}
+				c.enqueueConsentPublish(request)
 			}
-			if decision == ConsentDecisionDeniedForcedMinor {
-				// Without the floor the forced-minor decision still applies
-				// its full denial semantics; the reason rides the
-				// fire-and-forget receipt (best-effort, like every legacy
-				// consent post).
-				request.Reason = consentDecisionReason
-			}
-			c.enqueueConsentPublish(request)
 		}
 	}
 

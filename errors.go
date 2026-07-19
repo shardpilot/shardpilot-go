@@ -48,14 +48,28 @@ var (
 	// and NOTHING is applied. Never returned when the floor is off.
 	ErrInvalidConsentIdentity = errors.New("shardpilot consent identity exceeds the identifier clamp")
 
+	// ErrConsentActorMismatch is returned by Track/Enqueue under the opt-in
+	// consent floor for an event whose per-event UserID/AnonymousID override
+	// resolves to a DIFFERENT effective actor than the configured identity
+	// the floor's decision covers. The floor holds one client-side decision
+	// for one actor: transmitting an override actor would publish events no
+	// local decision (and no dispatched receipt) covers. Overrides that
+	// resolve to the SAME effective actor pass through; per-actor decisions
+	// beyond the configured identity belong to the server-side consent path
+	// (the default posture). Never returned when the floor is off.
+	ErrConsentActorMismatch = errors.New("shardpilot event actor differs from the consent-floor actor")
+
 	// ErrEventsDiscarded reports — folded into Close's returned error under
 	// the opt-in consent floor — that undelivered events were DISCARDED at
-	// teardown because the client has no durable spool to retain them
-	// (Config.SpoolDir empty); typically events the grant-receipt dispatch
-	// gate held through the final flush. The discard is permanent history:
-	// every Close call keeps reporting it, so silent event loss can never
-	// read as a clean teardown (the discarded events are also counted in
-	// Stats.Dropped). Configure SpoolDir to retain undelivered events
-	// across restarts instead. Never returned when the floor is off.
+	// teardown: neither delivered nor durably retained. Without
+	// Config.SpoolDir there is nothing to retain the close remnant in; with
+	// one, the remnant's spool write can itself fail closed (an unpersisted
+	// grant record refusing the write gate, or a persist failure — e.g.
+	// disk full — the final retry could not recover). Typically these are
+	// events the grant-receipt dispatch gate held through the final flush.
+	// The discard is permanent history: every Close call keeps reporting
+	// it, so silent event loss can never read as a clean teardown (the
+	// discarded events are also counted in Stats.Dropped). Never returned
+	// when the floor is off.
 	ErrEventsDiscarded = errors.New("shardpilot events were discarded at close (no durable spool)")
 )

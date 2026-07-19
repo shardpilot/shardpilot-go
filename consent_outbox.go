@@ -502,7 +502,7 @@ func (c *Client) initConsentFloor(chmod func(name string, mode os.FileMode) erro
 		// pipeline for an actor whose last decision was a denial). The
 		// tail overrides fail-closed, and the owed record write is retried
 		// here so the disagreement heals.
-		if tail, ok := c.consentOutbox.tail(); ok && tail.ActorIdentifier == firstNonEmpty(c.cfg.UserID, c.cfg.AnonymousID) {
+		if tail, ok := c.consentOutbox.tail(); ok && c.consentReceiptInScope(tail) {
 			tailDecision := ConsentDecisionDenied
 			tailState := ConsentDenied
 			switch {
@@ -537,6 +537,45 @@ func (c *Client) initConsentFloor(chmod func(name string, mode os.FileMode) erro
 		// nudge is consumed by the worker's select as soon as it starts.
 		c.wakeConsentDispatch()
 	}
+}
+
+// consentReceiptInScope reports whether a retained receipt describes THIS
+// client's decision scope: the configured workspace/app/environment tuple
+// and the configured actor. The reload's trail-tail override may trust only
+// an in-scope receipt as the operative decision — a SpoolDir reused across
+// workspaces, apps, or environments retains foreign receipts (they re-send
+// verbatim for their own historic scope, correctly), and a foreign grant or
+// denial must not flip this client's live state or heal consent.json for a
+// digest the receipt's decision never covered. Deliberately STRICTER than
+// the record digest (which spans apps within a workspace/environment):
+// skipping an out-of-scope override keeps the correctly-scoped record,
+// while adopting a cross-scope tail would apply another scope's decision.
+func (c *Client) consentReceiptInScope(receipt consentReceipt) bool {
+	return receipt.WorkspaceID == c.cfg.WorkspaceID &&
+		receipt.AppID == c.cfg.AppID &&
+		receipt.EnvironmentID == c.cfg.EnvironmentID &&
+		receipt.ActorIdentifier == firstNonEmpty(c.cfg.UserID, c.cfg.AnonymousID)
+}
+
+// consentFloorActorMismatch reports whether an event's EFFECTIVE actor —
+// per-event overrides applied over the configured identifiers exactly as
+// buildEnvelope stamps them — differs from the configured actor the floor's
+// decision covers. The floor holds ONE client-side decision for ONE actor:
+// an event overriding to a different effective actor would transmit an
+// actor with no local decision and no dispatched receipt, so Track/Enqueue
+// refuse it (ErrConsentActorMismatch). Per-actor decisions beyond the
+// configured identity belong to the server-side consent path — the default
+// posture, which per-event overrides were designed for; with the floor off
+// they pass through unchanged.
+func (c *Client) consentFloorActorMismatch(event Event) bool {
+	if event.UserID == "" && event.AnonymousID == "" {
+		return false
+	}
+	effective := firstNonEmpty(
+		firstNonEmpty(event.UserID, c.cfg.UserID),
+		firstNonEmpty(event.AnonymousID, c.cfg.AnonymousID),
+	)
+	return effective != firstNonEmpty(c.cfg.UserID, c.cfg.AnonymousID)
 }
 
 // validateConsentFloorIdentity gates a consent decision on IN-CONTRACT
@@ -812,6 +851,33 @@ func (c *Client) recordDiscardedCloseRemnant(batch []Event) {
 	}
 	c.stats.dropped.Add(uint64(discarded))
 	c.closeDiscardedEvents.Add(uint64(discarded))
+}
+
+// recordUnspooledCloseRemnant accounts for close-remnant events a FLOOR
+// client's spool could not make safe when the worker stopped: the write
+// gate refused them (an unpersisted grant record or an owed wipe — e.g. a
+// refused directory tighten), or their append landed only in the mirror
+// and the final persist retry still failed (e.g. disk full). Either way
+// the process exiting now loses them — neither delivered nor durable — so,
+// exactly like the memory-only discard above, they are counted Dropped and
+// folded permanently into every Close verdict (ErrEventsDiscarded): a
+// successful consent drain must not read as a clean teardown over lost
+// events. The dead-letter callback (gate refusals) still received its
+// courtesy copy. Floor-off keeps today's posture unchanged: stats and
+// dead-letters, no Close-verdict fold.
+func (c *Client) recordUnspooledCloseRemnant(mirrorAdded, gateRefused int) {
+	if c.spool == nil || !c.consentFloorEnabled() {
+		return
+	}
+	lost := gateRefused
+	if mirrorAdded > 0 && c.spool.persistOwed() {
+		lost += mirrorAdded
+	}
+	if lost == 0 {
+		return
+	}
+	c.stats.dropped.Add(uint64(lost))
+	c.closeDiscardedEvents.Add(uint64(lost))
 }
 
 // closeDiscardVerdict folds the permanent discarded-events record into a

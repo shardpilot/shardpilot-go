@@ -29,14 +29,32 @@
     the newest retained receipt (the record write was still owed when the previous
     process ended), the tail's decision governs fail-closed and the stale record is
     healed — a stale grant can never reopen the pipeline for an actor whose last
-    decision was a denial.
+    decision was a denial. The tail override trusts only a receipt IN SCOPE — the
+    configured workspace/app/environment tuple and the configured actor — so a foreign
+    receipt retained in a reused `SpoolDir` can neither flip this client's state nor
+    heal the record for a digest its decision never covered. The floor resolves BEFORE
+    any spooled events load (construction ordering), and spooled events reload only
+    under a grant the RESOLVED state confirms: a stale granted record whose operative
+    decision is the trail tail's denial purges the spool instead of seeding resend
+    work that would transmit pre-denial events. The floor covers the CONFIGURED
+    identity: an event whose per-event `UserID`/`AnonymousID` override resolves to a
+    different effective actor is refused at intake with the new
+    `ErrConsentActorMismatch` (that actor has no local decision and no receipt;
+    per-actor decisions beyond the configured identity stay on the server-side path —
+    floor-off, overrides pass through unchanged).
   - Durable consent-receipt outbox (`consent-outbox.json` under `SpoolDir`; in-memory
     without it): exactly one receipt per explicit decision — an append-only trail, a later
     decision never withdraws an earlier receipt — 32-cap FIFO evicting oldest on save, no
     TTL, sanitize-on-load-and-save with a bounded record read, failed-write-never-evicts
     (the write is owed and retried at every dispatch point and at `Close`), strictly serial
     decision-order delivery retried until acknowledged, re-sent VERBATIM across restarts
-    (same `idempotency_key`/`decided_at`; the server de-duplicates). Retryable outcomes
+    (same `idempotency_key`/`decided_at`; the server de-duplicates). Durable ordering
+    per decision flavor (the engine SDKs' shared rule): a GRANT appends its receipt
+    FIRST and writes the granted decision record only once the receipt trail is safely
+    down — a crash can never leave a restored grant with an empty outbox flowing
+    events receipt-less, and a failed receipt write WITHHOLDS the record (fail-closed
+    across restart, healed from the trail tail once the owed write lands) — while a
+    DENIAL keeps its record (and the spool purge it condemns) first. Retryable outcomes
     (transport failure, `429`, any `5xx`) keep the receipt at the head and park the consent
     plane behind the server's `Retry-After` — parsed on `429` AND `5xx` — or jittered
     backoff, independent of the events plane's pacing; every other outcome is terminal and
@@ -59,16 +77,19 @@
     receipts re-send promptly, not at the first flush tick). `Close` runs the consent
     drain whatever the event-plane outcome, folding both verdicts (`errors.Join`) so a
     terminal event error never masks the retryable `ErrConsentPending` state — and a
-    memory-only floor client that discarded a gated final flush's undelivered events
-    reports the loss on every `Close` (`ErrEventsDiscarded`, counted in `Stats.Dropped`)
-    instead of ever reading as a clean teardown.
+    floor client whose close remnant was neither delivered nor made durable reports the
+    loss on every `Close` (`ErrEventsDiscarded`, counted in `Stats.Dropped`) instead of
+    ever reading as a clean teardown: the memory-only discard, a remnant the spool's
+    write gate refused, and a remnant whose spool persist still failed after the final
+    settle retry all fold the same way.
   - Grant-receipt dispatch gate: while an analytics-grant receipt is retained undispatched
     (parked, queued, or reloaded after a relaunch), event legs hold — `Track`/`Flush`
     return the new `ErrConsentReceiptPending`, intake stays open — so post-grant events
     can never overtake the grant on the wire and be terminally `suppressed_no_consent` on
-    a strict-consent workspace. Released the moment the receipt is HANDED to the transport
-    (never gated on its acknowledgement; a receipt dispatched in a cycle does not hold that
-    cycle's batch even when its outcome fails retryably), and an empty pipeline is never
+    a strict-consent workspace. Released on an OBSERVED HTTP outcome for the receipt —
+    success or a status error, never gated on its acknowledgement (a receipt the server
+    answered does not hold that cycle's batch even when the answer is a retryable
+    failure), while a no-response failure keeps holding — and an empty pipeline is never
     gated, so a retained receipt alone cannot wedge teardown.
   - `SetConsentDecision(ConsentDecision)` with the forced-minor denial
     (`ConsentDecisionDeniedForcedMinor`): analytics-wise identical to denied everywhere —
@@ -83,10 +104,11 @@
     or durably on disk; otherwise the new `ErrConsentPending` is returned and `Close`
     stays RETRYABLE (a repeated call re-runs the delivery/persist drain), so a consent
     decision's receipt is never silently lost by process exit.
-  - Receipt-path identifier clamp: `UserID`/`AnonymousID` over 512 BYTES are rejected for
-    the receipt's actor snapshot (never truncated), with fallback to the next valid
-    configured identifier; the outbox sanitizer drops oversized or malformed entries
-    fail-safe. The anonymous-id retention snapshot never rides the wire.
+  - Receipt-path identifier clamp: `UserID`/`AnonymousID` over 512 BYTES reject the
+    decision whole (`ErrInvalidConsentIdentity` — never truncated, never a substitute
+    actor) at decision time AND at reload; the outbox sanitizer drops oversized or
+    malformed entries fail-safe. The anonymous-id retention snapshot never rides the
+    wire.
   - Consent-plane observability on `Snapshot()`: `ConsentRecorded`, `ConsentFailed`,
     `ConsentOutboxEvicted`, `ConsentOutboxPersistFailed`, `LastConsentError`.
 

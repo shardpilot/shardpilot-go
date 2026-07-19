@@ -123,7 +123,10 @@ type Config struct {
 	//     explicit decision is recorded, and ErrConsentDenied under a denial
 	//     (including the forced-minor denial; see SetConsentDecision). With
 	//     SpoolDir set, the persisted decision reloads as the LIVE state at
-	//     construction, so a decision survives restarts.
+	//     construction, so a decision survives restarts — with the durable
+	//     receipt trail's TAIL overriding (and healing) a stale record, and
+	//     spooled events reloading only under a grant the resolved state
+	//     confirms.
 	//   - Consent receipts ride a durable outbox (32 receipts, FIFO,
 	//     oldest-evicted, retried until acknowledged, delivered strictly in
 	//     decision order — grant-then-deny can never settle reversed; server
@@ -136,12 +139,19 @@ type Config struct {
 	//   - The grant-receipt dispatch gate: event batches hold (Track/Flush
 	//     return ErrConsentReceiptPending) while an analytics-grant receipt
 	//     is retained undispatched, so post-grant events can never overtake
-	//     the grant on the wire on a strict-consent workspace. Released the
-	//     moment the receipt is handed to the transport — never gated on its
-	//     acknowledgement — and an empty pipeline is never gated.
+	//     the grant on the wire on a strict-consent workspace. Released on
+	//     an OBSERVED HTTP outcome for the receipt (success or a status
+	//     error) — never gated on its acknowledgement, while a no-response
+	//     failure keeps holding — and an empty pipeline is never gated.
+	//   - The floor covers the CONFIGURED identity: an event whose per-event
+	//     UserID/AnonymousID override resolves to a DIFFERENT effective
+	//     actor is refused (ErrConsentActorMismatch) — its actor has no
+	//     local decision and no receipt. Per-actor decisions beyond the
+	//     configured identity belong to the server-side consent path.
 	//   - The floor requires IN-CONTRACT identifiers: a non-empty
 	//     UserID/AnonymousID over 512 BYTES rejects a consent decision
-	//     whole (ErrInvalidConsentIdentity — reject, never truncate).
+	//     whole (ErrInvalidConsentIdentity — reject, never truncate), and
+	//     refuses a persisted decision at reload the same way.
 	//     Events stamp configured identifiers verbatim, so a receipt minted
 	//     for a substitute actor would authorize a different actor than the
 	//     events carry; the floor refuses to create that divergence.

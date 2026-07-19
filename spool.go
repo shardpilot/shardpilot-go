@@ -940,6 +940,16 @@ func (s *diskSpool) hasResendWork() bool {
 	return !s.owed && len(s.resend) > 0
 }
 
+// persistOwed reports whether mirror-only state is NOT safely on disk: a
+// failed record rewrite still owes its durable write (dirty), or an owed
+// wipe keeps the spool fail-closed. The close-remnant accounting asks this
+// AFTER the final settle retry, so a recovered write reads as safe.
+func (s *diskSpool) persistOwed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.dirty || s.owed
+}
+
 // retryPersist re-attempts a failed record rewrite (flush-cadence retry).
 // The first return reports whether a write was attempted at all.
 func (s *diskSpool) retryPersist() (attempted, failed bool) {
@@ -1107,15 +1117,18 @@ func (c *Client) partitionSpoolEligible(request batchRequest) (eligible, refused
 // flush caller's OWN context error (callerAbandonedFlush): the append still
 // happens — the batch is undelivered work and spooling it is crash
 // insurance, not pacing — but the persisted deadline stays untouched.
-func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned bool) {
+// Returns how many events the append newly landed in the mirror and how
+// many the closed write gate refused, so the close-remnant path can tell
+// whether the remnant is actually safe (see recordUnspooledCloseRemnant).
+func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned bool) (mirrorAdded, gateRefused int) {
 	s := c.spool
 	if s == nil {
-		return
+		return 0, 0
 	}
 	eligible, refusedActors := c.partitionSpoolEligible(request)
 	c.notifySpoolDeadLetter(SpoolDropConsent, refusedActors)
 	if len(eligible) == 0 {
-		return
+		return 0, 0
 	}
 	// An owed wipe is retried before any append; still owed refuses disk.
 	s.settleOwedWipe()
@@ -1133,7 +1146,7 @@ func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned b
 	})
 	if refused {
 		c.notifySpoolDeadLetter(SpoolDropConsent, eligible)
-		return
+		return 0, len(eligible)
 	}
 	// An envelope already past the retry-age cap when it fails never lands
 	// on disk: the retention bound is enforced at append, not just at load.
@@ -1152,6 +1165,7 @@ func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned b
 		c.recordSpoolPersistFailure()
 	}
 	c.drainSpoolCapacityDrops()
+	return len(added), 0
 }
 
 // spoolAckWithVerdicts settles a delivered live batch's spooled copies from
@@ -1455,10 +1469,12 @@ func (c *Client) spoolMaintain() {
 // the retained batch (usually already spooled at its failure — the append
 // de-duplicates) plus whatever Close's flush left in the queue. Under a
 // non-grant or owed-wipe state the remnant goes to the dead-letter callback
-// instead (spoolFailedBatch's gate).
-func (c *Client) spoolCloseRemnant(batch []Event) {
+// instead (spoolFailedBatch's gate). Returns the append's mirror-added and
+// gate-refused counts so the floor's close accounting can tell whether the
+// remnant is actually safe (see recordUnspooledCloseRemnant).
+func (c *Client) spoolCloseRemnant(batch []Event) (mirrorAdded, gateRefused int) {
 	if c.spool == nil {
-		return
+		return 0, 0
 	}
 	remnant := batch
 	for {
@@ -1471,7 +1487,7 @@ func (c *Client) spoolCloseRemnant(batch []Event) {
 		break
 	}
 	if len(remnant) == 0 {
-		return
+		return 0, 0
 	}
 	// The retained batch's prefix reuses its retained wire bytes (the append
 	// de-duplicates by event_id against bytes already spooled at the failure,
@@ -1482,9 +1498,9 @@ func (c *Client) spoolCloseRemnant(batch []Event) {
 	request, _, poisoned := c.buildBatchIsolating(remnant, c.retainedRequest)
 	c.settlePoisonedEvents(poisoned)
 	if len(request.Events) == 0 {
-		return
+		return 0, 0
 	}
-	c.spoolFailedBatch(request, nil, false)
+	return c.spoolFailedBatch(request, nil, false)
 }
 
 // initSpool runs the construction-time spool lifecycle: settle an owed wipe
@@ -1514,33 +1530,48 @@ func (c *Client) initSpool() []SpoolDeadLetter {
 			c.logf("shardpilot spool: the spool directory could not be made private (0700); the persisted record is not loaded and the disk spool is disabled: %v", err)
 			return nil
 		}
-		outcome := s.load(c.clock.Now())
-		var letters []SpoolDeadLetter
-		if len(outcome.expired) > 0 {
-			c.stats.spoolExpired.Add(uint64(len(outcome.expired)))
-			letters = append(letters, spoolDeadLetterFrom(SpoolDropExpired, outcome.expired))
+		// GRANT-ONLY under the RESOLVED floor: with the consent floor opted
+		// in, initConsentFloor already resolved the live truth before this
+		// runs — the receipt trail's tail can override a stale record (a
+		// deny receipt durable while the record write was still owed), and
+		// the identity contract can refuse the reload outright. A persisted
+		// grant the resolved state does NOT confirm must not seed resend
+		// work: the worker re-publishes loaded chunks, so trusting the
+		// stale record here would transmit pre-denial events under an
+		// operative denial (or transmit at all in a session that must stay
+		// dark). The unconfirmed spool falls through to the purge below,
+		// condemned exactly like a persisted denial.
+		if !c.consentFloorEnabled() || c.consent.Load() == consentStateGranted {
+			outcome := s.load(c.clock.Now())
+			var letters []SpoolDeadLetter
+			if len(outcome.expired) > 0 {
+				c.stats.spoolExpired.Add(uint64(len(outcome.expired)))
+				letters = append(letters, spoolDeadLetterFrom(SpoolDropExpired, outcome.expired))
+			}
+			if len(outcome.evicted) > 0 {
+				c.stats.spoolEvicted.Add(uint64(len(outcome.evicted)))
+				letters = append(letters, spoolDeadLetterFrom(SpoolDropCapacity, outcome.evicted))
+			}
+			// The init rewrite is a merging save too; drops it produced are
+			// folded into the deferred init letters (the callback must not
+			// run mid-construction).
+			if drops := s.takeCapacityDrops(); len(drops) > 0 {
+				c.stats.spoolEvicted.Add(uint64(len(drops)))
+				letters = append(letters, spoolDeadLetterFrom(SpoolDropCapacity, drops))
+			}
+			if outcome.persistFailed {
+				c.recordSpoolPersistFailure()
+			}
+			c.initialDeferUntil = outcome.deferUntil
+			return letters
 		}
-		if len(outcome.evicted) > 0 {
-			c.stats.spoolEvicted.Add(uint64(len(outcome.evicted)))
-			letters = append(letters, spoolDeadLetterFrom(SpoolDropCapacity, outcome.evicted))
-		}
-		// The init rewrite is a merging save too; drops it produced are
-		// folded into the deferred init letters (the callback must not run
-		// mid-construction).
-		if drops := s.takeCapacityDrops(); len(drops) > 0 {
-			c.stats.spoolEvicted.Add(uint64(len(drops)))
-			letters = append(letters, spoolDeadLetterFrom(SpoolDropCapacity, drops))
-		}
-		if outcome.persistFailed {
-			c.recordSpoolPersistFailure()
-		}
-		c.initialDeferUntil = outcome.deferUntil
-		return letters
 	}
-	// No persisted grant (absent, denied, or unreadable record): the spool
-	// record is purged, unconditionally and idempotently. What it held is
-	// reported as a consent drop — condemned whether or not the file removal
-	// itself succeeds (a failure owes a wipe and fails closed).
+	// No persisted grant (absent, denied, or unreadable record) — or, under
+	// the consent floor, a persisted grant the RESOLVED live state does not
+	// confirm: the spool record is purged, unconditionally and idempotently.
+	// What it held is reported as a consent drop — condemned whether or not
+	// the file removal itself succeeds (a failure owes a wipe and fails
+	// closed).
 	dropped := s.readRecordEntries()
 	if _, err := s.purge(); err != nil {
 		c.stats.setLastError("spool_purge_failed")
