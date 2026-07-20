@@ -554,7 +554,13 @@ func (c *Client) purgeWithdrawnExperimentFacts() {
 		// current epoch. emitMu → spool mutex is the established order
 		// (the spool's mutex is a leaf); dead-letters still dispatch with
 		// no lock held below.
-		removedSpooled, persistFailed = c.spool.removeMatching(withdrawnExperimentFactRaw)
+		// The post-bump epoch guards the sweep on top of the emitMu window:
+		// the drop-time capture path appends from under e.mu ALONE (no
+		// emitMu — lock order forbids it there), so a capture born after
+		// this purge's bump can land mid-sweep; its entries carry the
+		// current epoch stamp and are spared, while everything older is
+		// withdrawn as before.
+		removedSpooled, persistFailed = c.spool.removeMatching(withdrawnExperimentFactRaw, c.expFactPurgeEpoch.Load())
 	}
 	e.emitMu.Unlock()
 	if removedQueued > 0 {
@@ -604,12 +610,17 @@ func (c *Client) dropWithdrawnExperimentFacts(batch []Event, backoffAttempt *int
 		// sides with one predicate keeps the pair positionally aligned for
 		// the prefix-reuse builder; any residual mismatch falls back to
 		// the rebuild path by clearing.
+		// The filtered retained request stays even when the batch is LONGER
+		// than the retained prefix (queued members appended after the
+		// failure that retained the bytes): both filters preserve order, so
+		// the surviving prefix stays aligned, and the prefix-reuse builder
+		// verifies id equality per position anyway (truncating reuse at the
+		// first mismatch). A wholesale clear on the length mismatch
+		// re-marshaled the surviving prefix members and broke the
+		// byte-identical retry/spool contract exactly when a withdrawn fact
+		// shared their batch.
 		filtered, _ := filterWithdrawnFromBatchRequest(c.retainedRequest)
-		if len(filtered.Events) == len(kept) {
-			c.retainedRequest = filtered
-		} else {
-			c.retainedRequest = batchRequest{}
-		}
+		c.retainedRequest = filtered
 		if len(kept) == 0 {
 			// The whole held batch was withdrawn: the discarded batch takes
 			// its backoff streak with it (the consent-drop discipline) —

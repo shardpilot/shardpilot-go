@@ -53,7 +53,7 @@ func TestWithdrawnSpoolRemovalSurvivesFailedSave(t *testing.T) {
 		}
 		return os.Rename(oldpath, newpath)
 	}
-	removed, persistFailed := s.removeMatching(withdrawnExperimentFactRaw)
+	removed, persistFailed := s.removeMatching(withdrawnExperimentFactRaw, 1)
 	if len(removed) != 1 || removed[0].id != "fact-1" {
 		t.Fatalf("expected the fact withdrawn, got %v", removed)
 	}
@@ -172,7 +172,7 @@ func TestWithdrawnChunkRequeueIsSkipped(t *testing.T) {
 	if refused, added, _, _, _ := s.append([]spoolEntry{entry}, 0, false, now, func() bool { return true }); refused || len(added) != 1 {
 		t.Fatalf("test setup: append failed")
 	}
-	if removed, _ := s.removeMatching(withdrawnExperimentFactRaw); len(removed) != 1 {
+	if removed, _ := s.removeMatching(withdrawnExperimentFactRaw, 1); len(removed) != 1 {
 		t.Fatalf("test setup: withdrawal did not remove the fact")
 	}
 	// The chunk was in transport during the withdrawal and now requeues.

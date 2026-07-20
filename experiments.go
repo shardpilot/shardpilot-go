@@ -1481,6 +1481,14 @@ func (e *experimentsState) syncDurableEntryLocked(scope, experimentKey string, a
 		asOf = entry.FetchedAtMS
 	} else {
 		if !hasStored {
+			if existing, ok := e.durablePending[intentKey]; ok && existing.captureFirst {
+				// Nothing stored to delete, but the pending pair's FROZEN
+				// capture payload has not landed: the capture debt is a
+				// distinct obligation (the owed exposure's only durable
+				// replay source) and survives until captureRetryFn lands
+				// it — its delete half then self-settles via the fences.
+				return true
+			}
 			delete(e.durablePending, intentKey)
 			return true
 		}
@@ -1507,7 +1515,18 @@ func (e *experimentsState) syncDurableEntryLocked(scope, experimentKey string, a
 	// record instead of leaving siblings for the cycle.
 	folded := e.foldOwedIntentsLocked(record, scope, experimentKey)
 	if e.saveDurableRecordLocked(record) {
-		delete(e.durablePending, intentKey)
+		if existing, ok := e.durablePending[intentKey]; ok && existing.captureFirst && !isRetry {
+			// The landed save supersedes the pending pair's RECORD half
+			// only (typically a fresh same-experiment install replacing a
+			// capture-gated drop): the FROZEN capture payload is the old
+			// owed exposure's only durable replay source and must not be
+			// cleared by the shared (scope, experiment) key. The pair stays
+			// armed — captureRetryFn re-attempts the payload, and once it
+			// lands the pair's delete half self-settles as outranked
+			// against the fresher record (the owed-drop fence).
+		} else {
+			delete(e.durablePending, intentKey)
+		}
 		for _, foldedKey := range folded {
 			delete(e.durablePending, foldedKey)
 		}
@@ -1522,7 +1541,15 @@ func (e *experimentsState) syncDurableEntryLocked(scope, experimentKey string, a
 		delete(record.Entries, experimentKey)
 		e.saveDurableRecordLocked(record)
 	}
-	e.durablePending[intentKey] = expOwedSync{asOf: asOf, drop: entry == nil, scope: scope, experimentKey: experimentKey}
+	next := expOwedSync{asOf: asOf, drop: entry == nil, scope: scope, experimentKey: experimentKey}
+	if existing, ok := e.durablePending[intentKey]; ok && existing.captureFirst && !isRetry {
+		// The failed save's replacement intent CARRIES the unlanded capture
+		// debt: overwriting the pair with a plain intent would silently
+		// drop the frozen payload — the old owed exposure's only durable
+		// replay source.
+		next.captureFirst, next.captureEntries = true, existing.captureEntries
+	}
+	e.durablePending[intentKey] = next
 	return false
 }
 
@@ -2074,6 +2101,15 @@ func (e *experimentsState) paceTransientLocked(nowMS int64, retryAfterSeconds in
 			e.deferRevalidationLocked(nowMS, retryAfterSeconds)
 		} else {
 			e.retryAfterMS = 0
+			// Present-zero says retry NOW for the cadence too: the due
+			// cycle pre-armed the next interval before dispatching, and
+			// leaving that deadline standing would defer the server's
+			// explicit immediate-retry answer by the full interval. The
+			// pull-down twin of the parked case (an unarmed cadence stays
+			// unarmed: 0 is never greater than nowMS).
+			if e.revalidateAtMS > nowMS {
+				e.revalidateAtMS = nowMS
+			}
 		}
 		return
 	}
@@ -2177,6 +2213,16 @@ func (c *Client) fetchExperimentAssignment(ctx context.Context, experimentKey st
 	}
 	subject := e.currentSubjectIDLocked()
 	if subject == "" {
+		// Re-checked immediately before minting: a revocation landing
+		// between the preflight refusal check above and this lazy mint must
+		// not adopt — let alone persist — a NEW spcid_ for a session the
+		// plane already refuses (forced-minor sessions especially create
+		// ZERO experiment state). An existing subject takes no new state
+		// and rides the pre-wire re-check instead.
+		if err := c.experimentConsentRefusal(); err != nil {
+			e.mu.Unlock()
+			return ExperimentAssignmentResult{}, err
+		}
 		var persisted bool
 		subject, persisted = e.adoptMintedSubjectIDLocked()
 		if subject == "" {
