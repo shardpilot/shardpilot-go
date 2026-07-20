@@ -98,9 +98,13 @@
     slot: the MEMORY half runs immediately regardless (the condemned entries
     dead-letter at denial time, cleared from the mirror and resend queue and
     tombstoned against merging saves — condemnation is never disk-dependent),
-    and the deferred record-FILE removal rides the durable wipe-owed marker,
-    which a SUPERSEDING grant settles BEFORE its own record can reopen the
-    spool and which a crash re-derives at the next start — a later grant whose
+    and the deferred record-FILE removal rides the durable wipe-owed marker
+    — created under the SAME spool-mutex hold that sets the owed flag, so a
+    concurrent settle (maintain, the append gate, a superseding grant) can
+    never consume the flag inside the window and leave a late-created
+    marker orphaned on disk to wipe a later grant's events at the next
+    start — which a SUPERSEDING grant settles BEFORE its own record can
+    reopen the spool and which a crash re-derives at the next start — a later grant whose
     successful record write clears the owed slot can no longer silently forget
     that a denial condemned the spooled events, and events a denial condemned
     never resend, whatever decision follows. The debt's DURABILITY is itself
@@ -110,10 +114,14 @@
     denied record, which restores record-first and completes the purge; else
     remove the condemned spool file itself, durable by destruction — and
     destruction counts as durable only once the DIRECTORY entry change is
-    fsynced (settleOwedWipe syncs the spool directory after its unlinks and
-    keeps the wipe owed on a failed sync: POSIX permits a crash to lose an
-    un-synced unlink, and a resurrected spool.json under the stale granted
-    record with no marker would reload the condemned events); else
+    fsynced (settleOwedWipe keeps the wipe owed on a failed sync: POSIX
+    permits a crash to lose an un-synced unlink, and a resurrected
+    spool.json under the stale granted record with no marker would reload
+    the condemned events), with the unlinks strictly ORDERED — the record
+    file first, a dir-sync, only then the marker, then a second sync — so
+    the marker OUTLIVES the record it condemns (both-before-one-sync would
+    let a crash persist the marker's unlink but not the record's: no
+    marker, condemned file back, stale grant); else
     surface the failure with the in-memory condemnation holding and the
     owed-record retry re-deriving the debt at every dispatch point), because
     a crash with none of them would leave stale granted state plus the
