@@ -1079,9 +1079,16 @@ func (c *Client) spoolDeadlineFromError(err error) int64 {
 // drainSpoolCapacityDrops emits the locally-owned entries a merging save
 // cap-evicted. Called after every client-level spool operation that can
 // rewrite the record, outside the spool lock.
-func (c *Client) drainSpoolCapacityDrops() {
+// drainSpoolCapacityDrops surfaces settled capacity evictions (dead-letter
+// + SpoolEvicted) and returns how many it drained: the worker's stop path
+// counts close-phase evictions into the discard fold — an eviction that
+// lands at exit is a permanent loss with no later resend (still-DEFERRED
+// evictions are excluded by takeCapacityDrops itself: their removing
+// rewrite never landed, the old record still carries them, and the next
+// launch reloads and resends them — the #34 deferral rule).
+func (c *Client) drainSpoolCapacityDrops() int {
 	if c.spool == nil {
-		return
+		return 0
 	}
 	// Fold in entries a successful save just made durable after an earlier
 	// failed write left them uncounted.
@@ -1090,10 +1097,11 @@ func (c *Client) drainSpoolCapacityDrops() {
 	}
 	drops := c.spool.takeCapacityDrops()
 	if len(drops) == 0 {
-		return
+		return 0
 	}
 	c.stats.spoolEvicted.Add(uint64(len(drops)))
 	c.notifySpoolDeadLetter(SpoolDropCapacity, drops)
+	return len(drops)
 }
 
 // partitionSpoolEligible splits a failed batch's envelopes by whether the
@@ -1153,15 +1161,15 @@ func (c *Client) spoolActorEligible(envelope eventEnvelope) bool {
 // exactly as unpersisted as a fresh add — so the close-remnant path can
 // tell whether the remnant is actually safe (see
 // recordUnspooledCloseRemnant and diskSpool.unpersistedOf).
-func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned bool) (gateRefused int, mirrored []string) {
+func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned bool) (gateRefused int, mirrored []string, capacityDropped int) {
 	s := c.spool
 	if s == nil {
-		return 0, nil
+		return 0, nil, 0
 	}
 	eligible, refusedActors := c.partitionSpoolEligible(request)
 	c.notifySpoolDeadLetter(SpoolDropConsent, refusedActors)
 	if len(eligible) == 0 {
-		return 0, nil
+		return 0, nil, 0
 	}
 	// An owed wipe is retried before any append; still owed refuses disk.
 	s.settleOwedWipe()
@@ -1179,7 +1187,7 @@ func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned b
 	})
 	if refused {
 		c.notifySpoolDeadLetter(SpoolDropConsent, eligible)
-		return len(eligible), nil
+		return len(eligible), nil, 0
 	}
 	// An envelope already past the retry-age cap when it fails never lands
 	// on disk: the retention bound is enforced at append, not just at load.
@@ -1197,7 +1205,7 @@ func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned b
 	if persistFailed {
 		c.recordSpoolPersistFailure()
 	}
-	c.drainSpoolCapacityDrops()
+	capacityDropped = len(evicted) + c.drainSpoolCapacityDrops()
 	// Everything eligible that was not dropped for retry age is in the
 	// mirror now — freshly added, or a duplicate of an entry a previous
 	// append already accepted (possibly under a failed write).
@@ -1210,7 +1218,7 @@ func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned b
 			mirrored = append(mirrored, entry.id)
 		}
 	}
-	return 0, mirrored
+	return 0, mirrored, capacityDropped
 }
 
 // spoolAckWithVerdicts settles a delivered live batch's spooled copies from
@@ -1498,16 +1506,16 @@ func (c *Client) flushSpooledChunks(ctx context.Context, backoffAttempt *int) er
 
 // spoolMaintain runs the flush-cadence spool upkeep: retry an owed wipe and
 // a failed record rewrite.
-func (c *Client) spoolMaintain() {
+func (c *Client) spoolMaintain() (capacityDropped int) {
 	s := c.spool
 	if s == nil {
-		return
+		return 0
 	}
 	s.settleOwedWipe()
 	if attempted, failed := s.retryPersist(); attempted && failed {
 		c.recordSpoolPersistFailure()
 	}
-	c.drainSpoolCapacityDrops()
+	return c.drainSpoolCapacityDrops()
 }
 
 // spoolCloseRemnant spools the undelivered remnant when the worker stops:
@@ -1517,9 +1525,9 @@ func (c *Client) spoolMaintain() {
 // instead (spoolFailedBatch's gate). Returns the gate-refused count and the
 // remnant ids left in the mirror so the floor's close accounting can tell
 // whether the remnant is actually safe (see recordUnspooledCloseRemnant).
-func (c *Client) spoolCloseRemnant(batch []Event) (gateRefused int, mirrored []string) {
+func (c *Client) spoolCloseRemnant(batch []Event) (gateRefused int, mirrored []string, capacityDropped int) {
 	if c.spool == nil {
-		return 0, nil
+		return 0, nil, 0
 	}
 	remnant := batch
 	for {
@@ -1532,7 +1540,7 @@ func (c *Client) spoolCloseRemnant(batch []Event) (gateRefused int, mirrored []s
 		break
 	}
 	if len(remnant) == 0 {
-		return 0, nil
+		return 0, nil, 0
 	}
 	// The retained batch's prefix reuses its retained wire bytes (the append
 	// de-duplicates by event_id against bytes already spooled at the failure,
@@ -1543,7 +1551,7 @@ func (c *Client) spoolCloseRemnant(batch []Event) (gateRefused int, mirrored []s
 	request, _, poisoned := c.buildBatchIsolating(remnant, c.retainedRequest)
 	c.settlePoisonedEvents(poisoned)
 	if len(request.Events) == 0 {
-		return 0, nil
+		return 0, nil, 0
 	}
 	return c.spoolFailedBatch(request, nil, false)
 }

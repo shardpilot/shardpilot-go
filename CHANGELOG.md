@@ -143,7 +143,13 @@
     lifetime, the engine SDKs' static-credential rule). Dispatches on caller-driven
     operations (`Track`, `Flush`, `Close`) are bounded by the sooner of the caller's
     context and `HTTPTimeout`, and a caller-aborted attempt is no outcome (nothing
-    counted, no deferral armed, receipt retained). Consent gating never feeds the EVENTS
+    counted, no deferral armed, receipt retained). Caller-driven DRAINS (`Flush`,
+    `Close`) JOIN behind a concurrent dispatch pass — bounded by the caller's
+    context — instead of silently skipping when the serial claim is held: losing
+    the claim to a concurrent pass can no longer make a denied-path `Flush`
+    report success over an undrained trail, and a join the caller's context cut
+    short surfaces the caller's own error while receipts remain pending
+    (automatic passes keep skipping — the work is being served). Consent gating never feeds the EVENTS
     plane's retry pacing. The consent route never decodes the response body: ANY `2xx`
     status is the acknowledgement (empty `200`, `204`, even a non-JSON body), while
     send-path and no-status errors stay retryable — on the floor path and the legacy
@@ -161,9 +167,14 @@
     floor client whose close remnant was neither delivered nor made durable reports the
     loss on every `Close` (`ErrEventsDiscarded`, counted in `Stats.Dropped`) instead of
     ever reading as a clean teardown: the memory-only discard, a remnant the spool's
-    write gate refused, and a remnant still unpersisted after the final settle retry
-    all fold the same way — counted PER EVENT through the mirror's unpersisted-entry
-    tracking, so a remnant that merely de-duplicated against an earlier append whose
+    write gate refused, a remnant still unpersisted after the final settle retry,
+    and the close phase's settled CAPACITY evictions (a remnant overflowing
+    `SpoolMaxEvents`/`SpoolMaxBytes` at exit is a permanent loss with no later
+    resend — unlike a mid-session eviction — while a still-DEFERRED eviction
+    stays on disk and reloads, the durable-eviction-deferral rule, so it is
+    deliberately not counted) all fold the same way — counted PER EVENT through
+    the mirror's unpersisted-entry tracking, so a remnant that merely
+    de-duplicated against an earlier append whose
     save had failed counts exactly like a fresh dirty add. The discard fold is
     re-applied (idempotently) on every cached-`Close` return: a `Close` whose context
     expired before the worker's stop path finished counting cannot hide a loss

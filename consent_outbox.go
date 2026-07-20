@@ -184,8 +184,12 @@ type consentOutbox struct {
 
 	// dispatching is the serial-dispatch claim: at most one dispatch pass
 	// runs at a time, so at most one receipt is ever in flight and decision
-	// order is preserved on the wire.
-	dispatching bool
+	// order is preserved on the wire. dispatchWaiters are caller-driven
+	// drains JOINING behind an in-flight pass (see claimDispatchWait):
+	// released (closed) when the claim frees, so a Flush/Close drain waits
+	// its turn instead of silently skipping receipt work.
+	dispatching     bool
+	dispatchWaiters []chan struct{}
 
 	// deferUntil parks the consent plane after a retryable delivery failure
 	// (server Retry-After, or jittered backoff); backoffAttempt counts the
@@ -704,10 +708,43 @@ func (o *consentOutbox) claimDispatch() bool {
 	return true
 }
 
+// claimDispatchWait takes the serial-dispatch claim, JOINING behind an
+// in-flight pass instead of skipping: a caller-driven drain (Flush, Close)
+// promises its caller that the receipt work ran, so losing the claim to a
+// concurrent pass must wait for that pass to release — bounded by the
+// caller's context — and then run its own. Returns false only when the
+// context ended first (the drain did not run; the caller must not report
+// success over it). A pass is always finite — each attempt is bounded by
+// HTTPTimeout and the trail is capped — so the wait terminates.
+func (o *consentOutbox) claimDispatchWait(ctx context.Context) bool {
+	for {
+		o.mu.Lock()
+		if !o.dispatching {
+			o.dispatching = true
+			o.mu.Unlock()
+			return true
+		}
+		wait := make(chan struct{})
+		o.dispatchWaiters = append(o.dispatchWaiters, wait)
+		o.mu.Unlock()
+		select {
+		case <-wait:
+			// The claim released; loop to contend for it again.
+		case <-contextDone(ctx):
+			return false
+		}
+	}
+}
+
 func (o *consentOutbox) releaseDispatch() {
 	o.mu.Lock()
 	o.dispatching = false
+	waiters := o.dispatchWaiters
+	o.dispatchWaiters = nil
 	o.mu.Unlock()
+	for _, wait := range waiters {
+		close(wait)
+	}
 }
 
 // deferralActive reports whether the consent plane is parked (a retryable
@@ -1191,9 +1228,20 @@ func consentDeliveryRetryable(err error) bool {
 // transport during THIS pass — the dispatch gate releases exactly those
 // (release-on-dispatch, never on acknowledgement). An owed durable write is
 // retried first — every dispatch point is also a persistence retry point.
-func (c *Client) dispatchConsentReceipts(ctx context.Context) map[string]struct{} {
+//
+// join selects the claim discipline: automatic passes (worker ticks/wakes,
+// Track's opportunistic dispatch) SKIP when another pass already holds the
+// serial claim — the work is being served — while CALLER-DRIVEN drains
+// (Flush, Close) JOIN behind the in-flight pass, bounded by the caller's
+// context, and then run their own: their caller was promised the receipt
+// work ran, and skipping would let a flush report success over an undrained
+// trail. The second return reports whether the drain RAN TO ITS OWN STOP:
+// false when the caller's context ended first — either waiting out the join
+// or mid-attempt — so the caller must not report success over receipts it
+// never drained.
+func (c *Client) dispatchConsentReceipts(ctx context.Context, join bool) (map[string]struct{}, bool) {
 	if !c.consentFloorEnabled() {
-		return nil
+		return nil, true
 	}
 	o := c.consentOutbox
 	// The mint retry runs FIRST: a recovered mint appends its receipt, and
@@ -1211,18 +1259,22 @@ func (c *Client) dispatchConsentReceipts(ctx context.Context) map[string]struct{
 	// outbox write recovers — before the receipt below can dispatch, be
 	// acknowledged, and prune away the trail's only durable evidence.
 	c.retryOwedConsentRecord()
-	if !o.claimDispatch() {
-		return nil
+	if join {
+		if !o.claimDispatchWait(ctx) {
+			return nil, false
+		}
+	} else if !o.claimDispatch() {
+		return nil, false
 	}
 	defer o.releaseDispatch()
 	handed := make(map[string]struct{})
 	for {
 		if o.deferralActive(c.clock.Now()) {
-			return handed
+			return handed, true
 		}
 		receipt, ok := o.nextDispatchable(c.consentReceiptInScope)
 		if !ok {
-			return handed
+			return handed, true
 		}
 		if o.recordOwedFor(receipt.IdempotencyKey) {
 			// THIS receipt's own decision-record write is still owed — its
@@ -1235,7 +1287,7 @@ func (c *Client) dispatchConsentReceipts(ctx context.Context) map[string]struct{
 			// stops (serial order); a successful record write — always for
 			// the newest decision — clears every mark and releases the trail
 			// in order.
-			return handed
+			return handed, true
 		}
 		if owedMint := c.consentMintOwedSnapshot(); owedMint != nil &&
 			owedMint.decision != ConsentDecisionGranted && receipt.analyticsGranted() {
@@ -1245,7 +1297,7 @@ func (c *Client) dispatchConsentReceipts(ctx context.Context) map[string]struct{
 			// even exist to follow it). Earlier GRANTS park until the owed
 			// denial mints; earlier denials may still deliver — same state as
 			// the operative decision, the fail-safe direction.
-			return handed
+			return handed, true
 		}
 		if c.consentDenyProofHeld(receipt) {
 			// The next dispatchable is the trail's proof of a denial whose
@@ -1255,7 +1307,7 @@ func (c *Client) dispatchConsentReceipts(ctx context.Context) map[string]struct{
 			// decision. The pass stops here (serial order forbids skipping
 			// within the scope); the owed-record retry above releases it
 			// once the record heals.
-			return handed
+			return handed, true
 		}
 		if receipt.analyticsGranted() && c.consentGrantPairIncomplete() {
 			// A GRANT dispatches only when its PAIR — the durable receipt
@@ -1270,7 +1322,7 @@ func (c *Client) dispatchConsentReceipts(ctx context.Context) map[string]struct{
 			// retries above heal both halves at the next dispatch point and
 			// release it. Memory-only outboxes never owe writes and are
 			// unaffected.
-			return handed
+			return handed, true
 		}
 		attemptCtx, cancel := contextWithDefaultTimeout(ctx, c.cfg.HTTPTimeout)
 		_, err := c.transport.PublishConsent(attemptCtx, consentReceiptWire(receipt))
@@ -1302,8 +1354,9 @@ func (c *Client) dispatchConsentReceipts(ctx context.Context) map[string]struct{
 		if ctx != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
 				// The CALLER's own context ended the attempt (cancellation
-				// or its deadline): an abort, not an endpoint outcome.
-				return handed
+				// or its deadline): an abort, not an endpoint outcome — and
+				// for a caller-driven drain, an incomplete drain.
+				return handed, false
 			}
 		}
 		c.stats.consentFailed.Add(1)
@@ -1317,7 +1370,7 @@ func (c *Client) dispatchConsentReceipts(ctx context.Context) map[string]struct{
 			continue
 		}
 		c.armConsentDeferral(err)
-		return handed
+		return handed, true
 	}
 }
 
@@ -1551,22 +1604,29 @@ func (c *Client) recordDiscardedCloseRemnant(batch []Event) {
 // recordUnspooledCloseRemnant accounts for close-remnant events a FLOOR
 // client's spool could not make safe when the worker stopped: the write
 // gate refused them (an unpersisted grant record or an owed wipe — e.g. a
-// refused directory tighten), or they sit in the mirror with their durable
+// refused directory tighten), they sit in the mirror with their durable
 // write STILL owed after the final persist retry (e.g. disk full) —
 // counted per event through uncountedIDs, so a remnant that merely
 // de-duplicated against an earlier dirty append is counted exactly like a
-// fresh dirty add. Either way the process exiting now loses them — neither
-// delivered nor durable — so, exactly like the memory-only discard above,
-// they are counted Dropped and folded permanently into every Close verdict
-// (ErrEventsDiscarded): a successful consent drain must not read as a
-// clean teardown over lost events. The dead-letter callback (gate
-// refusals) still received its courtesy copy. Floor-off keeps today's
-// posture unchanged: stats and dead-letters, no Close-verdict fold.
-func (c *Client) recordUnspooledCloseRemnant(gateRefused int, mirrored []string) {
+// fresh dirty add — or the close phase CAPACITY-EVICTED them
+// (capacityDropped: the remnant overflowed SpoolMaxEvents/SpoolMaxBytes
+// and the settled evictions — the remnant's own members or the older
+// entries they displaced — landed durably gone; an eviction at exit has no
+// later resend, unlike a mid-session one whose loss the caps always
+// implied, while a still-DEFERRED eviction stays on disk and reloads, so
+// it is deliberately NOT counted). Either way the process exiting now
+// loses them — neither delivered nor durable — so, exactly like the
+// memory-only discard above, they are counted Dropped and folded
+// permanently into every Close verdict (ErrEventsDiscarded): a successful
+// consent drain must not read as a clean teardown over lost events. The
+// dead-letter callback (gate refusals, capacity drops) still received its
+// courtesy copy. Floor-off keeps today's posture unchanged: stats and
+// dead-letters, no Close-verdict fold.
+func (c *Client) recordUnspooledCloseRemnant(gateRefused int, mirrored []string, capacityDropped int) {
 	if c.spool == nil || !c.consentFloorEnabled() {
 		return
 	}
-	lost := gateRefused + c.spool.unpersistedOf(mirrored)
+	lost := gateRefused + capacityDropped + c.spool.unpersistedOf(mirrored)
 	if lost == 0 {
 		return
 	}
@@ -1600,7 +1660,10 @@ func (c *Client) finalizeConsentOutbox(ctx context.Context) error {
 	if !c.consentFloorEnabled() {
 		return nil
 	}
-	c.dispatchConsentReceipts(ctx)
+	// Close's drain JOINS behind any in-flight pass (bounded by the Close
+	// context) so the final delivery attempt actually runs instead of
+	// skipping; the durability verdict below stays safe either way.
+	c.dispatchConsentReceipts(ctx, true)
 	if attempted, failed := c.consentOutbox.retryPersist(); attempted {
 		if failed {
 			c.recordConsentOutboxPersistFailure()

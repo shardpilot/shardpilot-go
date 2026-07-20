@@ -3409,3 +3409,115 @@ func TestConsentFloorCorruptStampFloorRecordReadsAbsent(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 }
+
+func TestConsentFloorFlushJoinsInFlightDispatchPass(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// A caller-driven drain must never silently skip when a concurrent pass
+	// holds the serial-dispatch claim: pre-fix, a Flush losing the claim on
+	// the denied path returned SUCCESS with the denial receipt undrained.
+	// The test holds the claim itself — a deterministic in-flight pass — so
+	// the decision's worker wake cannot deliver either.
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	if !client.consentOutbox.claimDispatch() {
+		t.Fatalf("test shape: claiming the dispatch lock failed")
+	}
+	client.SetConsent(false) // the deny receipt is retained; every pass loses the claim
+
+	// A bounded caller joins up to its own deadline, then reports THAT
+	// bound — never nil success over the undrained trail.
+	shortCtx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	err := client.Flush(shortCtx)
+	cancel()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected the cut join to surface the caller's bound over the undrained trail, got %v", err)
+	}
+	if got := state.consentCount(); got != 0 {
+		t.Fatalf("test shape: nothing may deliver while the claim is held, got %d", got)
+	}
+
+	// An unbounded caller JOINS: the flush parks as a dispatch waiter, the
+	// in-flight pass releases, and the flush then drains the trail ITSELF
+	// before returning success.
+	flushErr := make(chan error, 1)
+	go func() {
+		flushErr <- client.Flush(context.Background())
+	}()
+	waitFor(t, 3*time.Second, "the flush parked as a dispatch waiter", func() bool {
+		client.consentOutbox.mu.Lock()
+		defer client.consentOutbox.mu.Unlock()
+		return len(client.consentOutbox.dispatchWaiters) > 0
+	})
+	client.consentOutbox.releaseDispatch()
+	if err := <-flushErr; err != nil {
+		t.Fatalf("expected the joined flush to drain and succeed, got %v", err)
+	}
+	if got := state.consentCount(); got != 1 {
+		t.Fatalf("expected the deny receipt drained BY the joined flush before it returned, got %d", got)
+	}
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestConsentFloorCloseRemnantCapacityEvictionFoldsDiscarded(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// A close remnant larger than the spool cap evicts at the STOP-path
+	// append. That eviction lands durably gone at exit — there is no later
+	// resend, unlike a mid-session eviction — so it must fold into the
+	// Close verdict like every other close-remnant loss. Pre-fix: the fold
+	// counted only gate refusals and still-unpersisted mirror entries, the
+	// evicted event was silently lost, and Close read nil.
+	dir := t.TempDir()
+	transport := &eofOnConsentTransport{}
+	client := newFloorTestClient(t, server.URL, dir, func(cfg *Config) {
+		cfg.SpoolMaxEvents = 1
+		cfg.HTTPClient = &http.Client{Transport: transport}
+	})
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the grant acknowledged", func() bool {
+		return client.Snapshot().ConsentRecorded == 1
+	})
+
+	// Park a superseding grant receipt with NO observed outcome (send-path
+	// EOF): unhanded, it keeps the gate armed through Close's final flush,
+	// so the queued events reach the spool only through the stop path's
+	// close-remnant append — where the cap evicts the older one.
+	transport.setFailing(true)
+	client.SetConsent(true)
+	if err := client.Enqueue(Event{ID: "evt-cap-1", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Enqueue(Event{ID: "evt-cap-2", Name: "e2"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	closeErr := client.Close(context.Background())
+	if !errors.Is(closeErr, ErrEventsDiscarded) {
+		t.Fatalf("expected the capacity-evicted remnant folded into the Close verdict, got %v", closeErr)
+	}
+	if errors.Is(closeErr, ErrConsentPending) {
+		t.Fatalf("the parked receipt is durably on disk; only the discard may report: %v", closeErr)
+	}
+	stats := client.Snapshot()
+	if stats.SpoolEvicted != 1 {
+		t.Fatalf("expected exactly the one cap eviction, got %d", stats.SpoolEvicted)
+	}
+	if stats.Dropped == 0 {
+		t.Fatalf("expected the exit-time eviction counted Dropped")
+	}
+	if stats.Spooled != 1 {
+		t.Fatalf("expected the surviving remnant event durably spooled, got %d", stats.Spooled)
+	}
+	if got := state.batchCount(); got != 0 {
+		t.Fatalf("expected the gated close to publish nothing, got %d batches", got)
+	}
+	// The fold is permanent: a repeated Close still reports the loss.
+	if err := client.Close(context.Background()); !errors.Is(err, ErrEventsDiscarded) {
+		t.Fatalf("expected the discard permanent on repeated Close, got %v", err)
+	}
+}

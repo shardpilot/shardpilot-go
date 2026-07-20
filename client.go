@@ -332,7 +332,7 @@ func (c *Client) Track(ctx context.Context, event Event) error {
 		// rather than overtake the grant on the wire. Transient: the
 		// receipt dispatches on the worker cadence and the pipeline
 		// reopens.
-		handed := c.dispatchConsentReceipts(ctx)
+		handed, _ := c.dispatchConsentReceipts(ctx, false)
 		if c.grantReceiptGateArmed(handed) {
 			return ErrConsentReceiptPending
 		}
@@ -697,7 +697,7 @@ func (c *Client) run() {
 				// The CONSENT plane is independent of the events plane's
 				// pacing: retained receipts still dispatch while event
 				// publishes wait out their deferral.
-				c.dispatchConsentReceipts(context.Background())
+				c.dispatchConsentReceipts(context.Background(), false)
 				continue
 			}
 			batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
@@ -720,7 +720,7 @@ func (c *Client) run() {
 			// tick. An armed events-plane deferral is respected: only the
 			// consent plane dispatches then.
 			if c.publishDeferred(deferUntil) {
-				c.dispatchConsentReceipts(context.Background())
+				c.dispatchConsentReceipts(context.Background(), false)
 				continue
 			}
 			batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
@@ -752,7 +752,7 @@ func (c *Client) run() {
 			// behind — is the spool's remnant (grant-gated; no-op without a
 			// spool). A memory-only FLOOR client instead accounts the
 			// discarded remnant so Close can report the loss.
-			remnantRefused, remnantMirrored := c.spoolCloseRemnant(batch)
+			remnantRefused, remnantMirrored, remnantCapacityDropped := c.spoolCloseRemnant(batch)
 			c.recordDiscardedCloseRemnant(batch)
 			// Final settle: a record write that failed earlier (dirty mirror)
 			// gets one last retry before the worker exits, whatever shape the
@@ -760,12 +760,15 @@ func (c *Client) run() {
 			// append alone cannot be relied on to reach the disk retry, and
 			// exiting with a recovered-but-unwritten spool would lose events
 			// that a flush-cadence tick tomorrow would have saved.
-			c.spoolMaintain()
+			closeCapacityDropped := remnantCapacityDropped + c.spoolMaintain()
 			// AFTER the final settle (a recovered write reads as safe): a
 			// FLOOR client's remnant that is still neither delivered nor
 			// durable is a reportable discard, exactly like the memory-only
-			// case above — Close must not read as clean over it.
-			c.recordUnspooledCloseRemnant(remnantRefused, remnantMirrored)
+			// case above — Close must not read as clean over it. Capacity
+			// evictions the CLOSE phase settled count in too: an eviction
+			// landing at exit is a permanent loss with no later resend
+			// (still-deferred evictions stayed on disk and reload).
+			c.recordUnspooledCloseRemnant(remnantRefused, remnantMirrored, closeCapacityDropped)
 			return
 		}
 	}
@@ -978,8 +981,20 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 		// flush) — BEFORE the denied early-return below, because receipt
 		// delivery is permitted (required) while consent is denied: a
 		// parked grant-then-deny trail must still drain through an explicit
-		// Flush in a denied session, even though the EVENT legs refuse.
-		handedReceipts := c.dispatchConsentReceipts(ctx)
+		// Flush in a denied session, even though the EVENT legs refuse. The
+		// drain JOINS behind a concurrent pass (Track's synchronous
+		// dispatch, Close's drain) instead of skipping: Flush promised its
+		// caller the receipt work ran.
+		handedReceipts, receiptsDrained := c.dispatchConsentReceipts(ctx, true)
+		if !receiptsDrained && c.consentOutbox.pending() {
+			// The caller's context ended before the drain could run (or
+			// finish): receipts remain that this flush never drained, and a
+			// nil return — the denied path below returns success — would
+			// silently misreport them as handled. The caller's own bound is
+			// the honest verdict; the retained trail re-dispatches at every
+			// later dispatch point and Close's backstop still applies.
+			return batch, contextCause(ctx)
+		}
 		if c.consentDenied() {
 			dropped := len(batch) + c.queue.drainAll()
 			if dropped > 0 {
@@ -1118,7 +1133,7 @@ func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, def
 	// resends included: receipts deliver under denied/unknown too, and the
 	// pass's handoffs are what release the dispatch gate for this cycle
 	// (no-op with the floor off).
-	handedReceipts := c.dispatchConsentReceipts(context.Background())
+	handedReceipts, _ := c.dispatchConsentReceipts(context.Background(), false)
 	if c.grantReceiptGateArmed(handedReceipts) && (len(batch) > 0 || c.spoolHasResendWork() || len(c.queue.ch) > 0) {
 		// An analytics-grant receipt is retained undispatched (parked in a
 		// backoff/Retry-After window, or queued behind another receipt):
