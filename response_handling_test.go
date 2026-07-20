@@ -1023,7 +1023,10 @@ func TestEventArrivingDuringDeferralKeepsTheDeadlineRetry(t *testing.T) {
 		t.Fatalf("enqueue second: %v", err)
 	}
 
-	waitFor(t, 5*time.Second, "the deadline retry", func() bool { return calls.Load() >= 2 })
+	// Poll the recorded attempt time itself, not the call counter: the
+	// handler bumps calls BEFORE storing secondAttempt, so a counter-based
+	// wait can read the timestamp mid-handler as zero.
+	waitFor(t, 5*time.Second, "the deadline retry", func() bool { return secondAttempt.Load() != 0 })
 	gap := secondAttempt.Load() - firstAttempt.Load()
 	if gap < 800 {
 		t.Fatalf("expected the retry to wait out the Retry-After hint, got %dms", gap)

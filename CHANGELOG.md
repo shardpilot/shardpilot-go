@@ -86,13 +86,22 @@
     in-scope proof receipt is HELD from dispatch entirely, so it can never be
     acknowledged and pruned while the stale pre-denial record would rule a restart
     (Close still completes over the durable held proof; the relaunch restores the
-    denial from it and heals the record). A GRANT receipt dispatches only from a
-    DURABLY-RETAINED outbox: while the outbox write is owed (the grant's own failed
-    append included), the dispatch pass holds — an acknowledgement followed by a crash
-    before the write recovered would leave neither a durable receipt nor a granted
-    record, losing the grant across restart though the server recorded it; the pass
-    that recovers the write completes the withheld record pair before the receipt can
-    be acknowledged. Retryable outcomes
+    denial from it and heals the record). A GRANT receipt dispatches only when its
+    PAIR is fully durable: while the outbox write is owed (the grant's own failed
+    append included), while the granted RECORD write is owed, or while a grant
+    decision is still mid-persist, the dispatch pass holds — an acknowledgement
+    followed by a crash would otherwise prune the only durable half and leave neither
+    a receipt nor a granted record, losing the grant across restart though the server
+    recorded it; the pass that recovers the writes completes the pair before the
+    receipt can be acknowledged, and an owed GRANT record also pends `Close`
+    (`ErrConsentPending`, retryable) so teardown never reads clean over an incomplete
+    pair. Decision stamps are MONOTONIC per client: same-tick (or backward-stepping
+    clock) decisions mint strictly increasing `decided_at` values, so the reload's
+    strictly-newer rule always sees the newest decision. Foreign receipts retained in
+    a reused `SpoolDir` are never dispatched with this client's scoped bearer — a
+    terminal 401/403 would prune ANOTHER scope's consent receipt — they stay retained
+    for a correctly scoped client while this client's own trail dispatches around
+    them in order. Retryable outcomes
     (transport failure, `429`, any `5xx`) keep the receipt at the head and park the consent
     plane behind the server's `Retry-After` — parsed on `429` AND `5xx` — or jittered
     backoff, independent of the events plane's pacing; every other outcome is terminal and
@@ -121,7 +130,10 @@
     write gate refused, and a remnant still unpersisted after the final settle retry
     all fold the same way — counted PER EVENT through the mirror's unpersisted-entry
     tracking, so a remnant that merely de-duplicated against an earlier append whose
-    save had failed counts exactly like a fresh dirty add.
+    save had failed counts exactly like a fresh dirty add. The discard fold is
+    re-applied (idempotently) on every cached-`Close` return: a `Close` whose context
+    expired before the worker's stop path finished counting cannot hide a loss
+    counted after its verdict was cached.
   - Grant-receipt dispatch gate: while an analytics-grant receipt is retained undispatched
     (parked, queued, or reloaded after a relaunch), event legs hold — `Track`/`Flush`
     return the new `ErrConsentReceiptPending`, intake stays open — so post-grant events

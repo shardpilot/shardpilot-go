@@ -354,19 +354,49 @@ func (o *consentOutbox) latestMatching(match func(consentReceipt) bool) (consent
 	return consentReceipt{}, false
 }
 
-// prune removes the head receipt by idempotency key after an
-// acknowledgement or a terminal drop, and rewrites the record. A failed
-// rewrite never blocks the rest of the trail: the mirror is already pruned,
-// dirty marks the owed write, and if the process dies first the next launch
-// re-sends the stale entry and the server de-duplicates.
+// prune removes a settled receipt by idempotency key after an
+// acknowledgement or a terminal drop, and rewrites the record. The settled
+// receipt is the dispatch pass's in-flight one — the oldest IN-SCOPE entry
+// — which need not be the absolute head in a reused SpoolDir: foreign
+// entries retained before it are never dispatched (and so never pruned) by
+// this client, and removing a mid-array entry preserves the relative order
+// of everything else. A failed rewrite never blocks the rest of the trail:
+// the mirror is already pruned, dirty marks the owed write, and if the
+// process dies first the next launch re-sends the stale entry and the
+// server de-duplicates.
 func (o *consentOutbox) prune(idempotencyKey string) (persistFailed bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if len(o.receipts) == 0 || o.receipts[0].IdempotencyKey != idempotencyKey {
-		return false
+	for i, entry := range o.receipts {
+		if entry.IdempotencyKey != idempotencyKey {
+			continue
+		}
+		pruned := make([]consentReceipt, 0, len(o.receipts)-1)
+		pruned = append(pruned, o.receipts[:i]...)
+		pruned = append(pruned, o.receipts[i+1:]...)
+		o.receipts = pruned
+		return o.saveLocked() != nil
 	}
-	o.receipts = append([]consentReceipt(nil), o.receipts[1:]...)
-	return o.saveLocked() != nil
+	return false
+}
+
+// nextDispatchable returns the oldest retained receipt IN SCOPE — the one
+// this client's dispatch may put on the wire. Foreign receipts (a reused
+// SpoolDir interleaves scopes) are SKIPPED, never dispatched: this client's
+// bearer is scoped, so a foreign receipt could take a terminal 401/403 here
+// and be pruned — losing ANOTHER scope's consent receipt before a correctly
+// scoped client resends it. Foreign entries stay retained (per-directory
+// retention; the cap still bounds them), and skipping them cannot reorder
+// this client's own trail — in-scope receipts keep their relative order.
+func (o *consentOutbox) nextDispatchable(inScope func(consentReceipt) bool) (consentReceipt, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for _, entry := range o.receipts {
+		if inScope(entry) {
+			return entry, true
+		}
+	}
+	return consentReceipt{}, false
 }
 
 // writeOwed reports an owed durable outbox write (a failed save not yet
@@ -852,30 +882,33 @@ func (c *Client) dispatchConsentReceipts(ctx context.Context) map[string]struct{
 		if o.deferralActive(c.clock.Now()) {
 			return handed
 		}
-		receipt, ok := o.head()
+		receipt, ok := o.nextDispatchable(c.consentReceiptInScope)
 		if !ok {
 			return handed
 		}
 		if c.consentDenyProofHeld(receipt) {
-			// The head is the trail's proof of a denial whose record write
-			// is still owed: it must not deliver (and prune) while the
-			// stale pre-denial record is the only other durable state — a
-			// crash after the prune would restore the superseded decision.
-			// The pass stops here (serial order forbids skipping); the
-			// owed-record retry above releases it once the record heals.
+			// The next dispatchable is the trail's proof of a denial whose
+			// record write is still owed: it must not deliver (and prune)
+			// while the stale pre-denial record is the only other durable
+			// state — a crash after the prune would restore the superseded
+			// decision. The pass stops here (serial order forbids skipping
+			// within the scope); the owed-record retry above releases it
+			// once the record heals.
 			return handed
 		}
-		if receipt.analyticsGranted() && o.writeOwed() {
-			// A GRANT dispatches only from a DURABLY-RETAINED outbox: with
-			// the outbox write owed (this receipt's own failed append may
-			// BE that write), an acknowledgement now could be followed by a
-			// crash before the write recovers — leaving neither a durable
-			// receipt nor a granted record, losing the user's grant across
-			// restart even though the server recorded it. The pass stops
-			// (serial order); retryPersist at the next dispatch point heals
-			// the outbox and the SAME pass completes the withheld record
-			// pair before this receipt can be acknowledged. Memory-only
-			// outboxes never owe a write and are unaffected.
+		if receipt.analyticsGranted() && c.consentGrantPairIncomplete() {
+			// A GRANT dispatches only when its PAIR — the durable receipt
+			// AND the granted record — is fully down: with the outbox write
+			// owed (this receipt's own failed append may BE that write),
+			// with the granted record write owed, or while a grant decision
+			// is still mid-persist (the arming window), an acknowledgement
+			// now could be followed by a crash before the remaining half
+			// recovers — leaving neither a durable receipt nor a granted
+			// record, losing the user's grant across restart even though
+			// the server recorded it. The pass stops (serial order); the
+			// retries above heal both halves at the next dispatch point and
+			// release it. Memory-only outboxes never owe writes and are
+			// unaffected.
 			return handed
 		}
 		attemptCtx, cancel := contextWithDefaultTimeout(ctx, c.cfg.HTTPTimeout)
@@ -1020,12 +1053,48 @@ func (c *Client) mintConsentReceipt(analyticsGranted bool, reason, decidedAt str
 }
 
 // consentDecisionStamp mints a decision's decided-at instant: RFC3339 with
-// nanoseconds, so two rapid decisions order strictly (plain second
-// precision would tie a grant and a denial recorded in the same second and
-// defeat the reload's strictly-newer rule). Still valid RFC3339 on the
-// wire.
+// nanoseconds, STRICTLY MONOTONIC per client. Two decisions recorded in the
+// same clock tick (a coarse or duplicated reading) would otherwise mint
+// identical stamps and defeat the reload's strictly-newer override — after
+// a crash the stale record would tie with, and beat, the newest retained
+// receipt. When the clock has not advanced past the previously issued
+// stamp, the new stamp is the previous one plus one nanosecond: a
+// deterministic total order for rapid decisions that the parse/compare
+// honors, and still valid RFC3339 on the wire. Mints are serialized by the
+// consent ticket turn; the mutex keeps the seam safe for bare test clients
+// too.
 func (c *Client) consentDecisionStamp() string {
-	return c.clock.Now().UTC().Format(time.RFC3339Nano)
+	c.consentStampMu.Lock()
+	defer c.consentStampMu.Unlock()
+	now := c.clock.Now().UTC()
+	if c.lastConsentStamp != "" {
+		if last, err := time.Parse(time.RFC3339Nano, c.lastConsentStamp); err == nil && !now.After(last) {
+			now = last.Add(time.Nanosecond)
+		}
+	}
+	stamp := now.Format(time.RFC3339Nano)
+	c.lastConsentStamp = stamp
+	return stamp
+}
+
+// consentGrantPairIncomplete reports whether the current GRANT pair — the
+// durable receipt trail and the granted decision record — is not yet fully
+// on disk: the outbox write is owed, the granted record write is owed, or a
+// grant decision is still mid-persist (the arming window between its
+// receipt append and its owed-slot settlement). While incomplete, in-scope
+// grant receipts are held from dispatch: an acknowledgement would prune the
+// only durable half (or race the missing one), and a crash right after
+// would lose the user's grant across restart even though the server
+// recorded it.
+func (c *Client) consentGrantPairIncomplete() bool {
+	if c.consentOutbox.writeOwed() {
+		return true
+	}
+	if c.consentGrantArming.Load() > 0 {
+		return true
+	}
+	owed := c.consentRecordOwedSnapshot()
+	return owed != nil && owed.decision == ConsentDecisionGranted
 }
 
 // consentReceiptNewerThanRecord reports whether a retained receipt's
@@ -1109,10 +1178,15 @@ func (c *Client) recordUnspooledCloseRemnant(gateRefused int, mirrored []string)
 }
 
 // closeDiscardVerdict folds the permanent discarded-events record into a
-// Close verdict; nil-in nil-out when nothing was discarded.
+// Close verdict; nil-in nil-out when nothing was discarded. IDEMPOTENT: a
+// verdict already carrying ErrEventsDiscarded passes through unchanged, so
+// the fold is re-applied safely on every cached-close return — a Close
+// whose context expired before the worker's stop path finished counting can
+// cache its verdict BEFORE the discard lands, and later Close calls must
+// still report the loss.
 func (c *Client) closeDiscardVerdict(err error) error {
 	discarded := c.closeDiscardedEvents.Load()
-	if discarded == 0 {
+	if discarded == 0 || errors.Is(err, ErrEventsDiscarded) {
 		return err
 	}
 	return errors.Join(err, fmt.Errorf("%w: %d event(s)", ErrEventsDiscarded, discarded))
@@ -1135,6 +1209,18 @@ func (c *Client) finalizeConsentOutbox(ctx context.Context) error {
 			c.recordConsentOutboxPersistFailure()
 		}
 		c.drainConsentOutboxEvictions()
+	}
+	if owed := c.consentRecordOwedSnapshot(); owed != nil && owed.decision == ConsentDecisionGranted {
+		// The GRANT pair is incomplete: the granted record write is still
+		// owed (the dispatch pass above retried it), so teardown must not
+		// read as clean — outbox durability alone does not cover the pair,
+		// and a receipt that had already delivered would leave NEITHER half
+		// on disk. Retryable: a repeated Close re-runs the record retry. An
+		// owed DENIAL record, by contrast, completes teardown: its held
+		// proof receipt is durably retained (or the durability check below
+		// pends), and the next launch restores the denial from the trail
+		// and heals the record.
+		return ErrConsentPending
 	}
 	pending, safelyOnDisk := c.consentOutbox.pendingDurability()
 	if !pending || safelyOnDisk {

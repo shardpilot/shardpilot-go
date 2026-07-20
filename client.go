@@ -171,6 +171,13 @@ type Client struct {
 	// dispatch hold); mutations happen under consentRecordApplyMu too.
 	consentOwedMu sync.Mutex
 
+	// consentStampMu guards lastConsentStamp: the per-client MONOTONIC
+	// decision-stamp seam (consentDecisionStamp). Same-tick decisions must
+	// mint strictly increasing decided_at values or the reload's
+	// strictly-newer override would miss the newest decision after a crash.
+	consentStampMu   sync.Mutex
+	lastConsentStamp string
+
 	// consentRecordOwed is the floor decision whose durable record write is
 	// still OWED (failed, deliberately withheld while the grant's receipt
 	// trail write is itself owed — receipt-first — or a failed reload
@@ -445,7 +452,11 @@ func (c *Client) finishClose(ctx context.Context) error {
 			c.closeMu.Lock()
 			err := c.closeErr
 			c.closeMu.Unlock()
-			return err
+			// Re-fold LATE discards (idempotent): the close that cached this
+			// verdict may have abandoned the worker on its own context
+			// expiry, and the stop path can count discarded remnant events
+			// AFTER the verdict was cached.
+			return c.closeDiscardVerdict(err)
 		case <-contextDone(ctx):
 			return contextCause(ctx)
 		}
@@ -454,7 +465,9 @@ func (c *Client) finishClose(ctx context.Context) error {
 		if !errors.Is(c.closeErr, ErrConsentPending) {
 			err := c.closeErr
 			c.closeMu.Unlock()
-			return err
+			// Same late-discard re-fold as the waiter path above: a cached
+			// verdict must never hide a loss counted after it was stored.
+			return c.closeDiscardVerdict(err)
 		}
 		// The previous Close left consent receipts pending (undeliverable
 		// AND not durably on disk): completion was declined so the process

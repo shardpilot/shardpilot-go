@@ -435,12 +435,14 @@ func TestConsentFloorDecisionTrailDeliversInOrder(t *testing.T) {
 		t.Fatalf("expected Track refused under the denial, got %v", err)
 	}
 
+	// Heal and drain. A parked 503 attempt can still be IN FLIGHT here and
+	// re-arm the deferral after a one-shot clear, so the poll clears and
+	// flushes each round until the trail drains — the assertion is about
+	// ORDER, not about which cycle delivers.
 	state.setConsentOutcome(http.StatusOK, "")
-	clearConsentDeferral(client)
-	if err := client.Flush(context.Background()); err != nil {
-		t.Fatalf("Flush: %v", err)
-	}
-	waitFor(t, 3*time.Second, "both receipts delivered", func() bool {
+	waitFor(t, 5*time.Second, "both receipts delivered", func() bool {
+		clearConsentDeferral(client)
+		_ = client.Flush(context.Background())
 		granted, denied := 0, 0
 		for i := 0; i < state.consentCount(); i++ {
 			if consentBoolCategory(t, state.consentAt(i)) {
@@ -2009,12 +2011,20 @@ func TestConsentFloorCrossScopeTailNeverFlipsState(t *testing.T) {
 			if err := client.Track(context.Background(), Event{Name: "e1"}); !errors.Is(err, ErrConsentDenied) {
 				t.Fatalf("expected the pipeline closed under the scoped denial, got %v", err)
 			}
-			// The foreign receipt still delivers verbatim for its own
-			// historic scope — retention is per-directory, state is
-			// per-scope.
-			waitFor(t, 3*time.Second, "the foreign receipt delivered", func() bool {
-				return state.consentCount() >= 1
-			})
+			// The foreign receipt is never dispatched with this client's
+			// scoped bearer — a terminal 401/403 here would prune another
+			// scope's consent receipt — so it stays retained on disk for a
+			// correctly scoped client (retention is per-directory, delivery
+			// is per-scope).
+			if err := client.Flush(context.Background()); err != nil {
+				t.Fatalf("Flush: %v", err)
+			}
+			if got := state.consentCount(); got != 0 {
+				t.Fatalf("expected the foreign receipt never posted with this bearer, got %d posts", got)
+			}
+			if !client.consentOutbox.pending() {
+				t.Fatalf("expected the foreign receipt still retained")
+			}
 			if err := client.Close(context.Background()); err != nil {
 				t.Fatalf("Close: %v", err)
 			}
@@ -2166,13 +2176,20 @@ func TestConsentFloorForeignTailDoesNotHideInScopeProof(t *testing.T) {
 	if err := client.Track(context.Background(), Event{Name: "e1"}); !errors.Is(err, ErrConsentDenied) {
 		t.Fatalf("expected the pipeline closed under the in-scope denial, got %v", err)
 	}
-	// Both receipts still deliver, in retention order (deny first), each
-	// verbatim for its own scope; no batch ever.
-	waitFor(t, 3*time.Second, "both receipts delivered", func() bool {
-		return state.consentCount() >= 2
+	// Only the IN-SCOPE deny delivers — the foreign receipt is never
+	// dispatched with this client's scoped bearer (it stays retained for a
+	// correctly scoped client); no batch ever.
+	waitFor(t, 3*time.Second, "the in-scope deny delivered", func() bool {
+		return state.consentCount() >= 1
 	})
 	if consentBoolCategory(t, state.consentAt(0)) {
-		t.Fatalf("expected the in-scope deny delivered first, got %v", state.consentAt(0))
+		t.Fatalf("expected the in-scope deny delivered, got %v", state.consentAt(0))
+	}
+	if got := state.consentCount(); got != 1 {
+		t.Fatalf("expected ONLY the in-scope receipt on the wire, got %d posts", got)
+	}
+	if !client.consentOutbox.pending() {
+		t.Fatalf("expected the foreign receipt still retained")
 	}
 	if got := state.batchCount(); got != 0 {
 		t.Fatalf("expected a dark denied session, got %d batches", got)
@@ -2419,34 +2436,34 @@ func TestConsentFloorForeignParkedGrantDoesNotGateEvents(t *testing.T) {
 		return client.Snapshot().ConsentRecorded == 1
 	})
 
-	// A FOREIGN grant receipt (another scope sharing the dir) parks behind
-	// a retryable failure. It is unrelated to this client's actor: it must
-	// keep re-sending for its own scope, but never hold this pipeline.
+	// A FOREIGN grant receipt (another scope sharing the dir) sits retained.
+	// It is unrelated to this client's actor: it is never dispatched with
+	// this client's bearer and must never hold this pipeline.
 	state.setConsentOutcome(http.StatusServiceUnavailable, "3600")
 	foreign := testConsentReceipt("key-foreign-parked-1", true)
 	foreign.WorkspaceID = "workspace-other"
 	if client.consentOutbox.append(foreign) {
 		t.Fatalf("seeding the foreign receipt failed")
 	}
-	// First event leg: the pass attempts the foreign receipt (503 — an
-	// observed outcome) and parks the plane; the batch must still flow.
+	// Event legs: the dispatch pass SKIPS the foreign receipt (nothing
+	// in-scope to send, nothing handed), and the retained foreign grant
+	// alone must not arm the gate — both batches flow.
 	if err := client.Track(context.Background(), Event{ID: "evt-foreign-gate-1", Name: "e1"}); err != nil {
-		t.Fatalf("expected the batch to flow despite the parked foreign grant, got %v", err)
+		t.Fatalf("expected the batch to flow despite the retained foreign grant, got %v", err)
 	}
-	// Second event leg: the plane is parked, nothing is handed this cycle —
-	// the retained foreign grant alone must not arm the gate.
 	if err := client.Track(context.Background(), Event{ID: "evt-foreign-gate-2", Name: "e1"}); err != nil {
-		t.Fatalf("expected the batch to flow while the foreign grant stays parked, got %v", err)
+		t.Fatalf("expected the batch to flow while the foreign grant stays retained, got %v", err)
 	}
 	if got := state.batchCount(); got != 2 {
 		t.Fatalf("expected both batches on the wire, got %d", got)
 	}
-	// The foreign receipt still delivers for its own scope once the
-	// endpoint heals.
-	state.setConsentOutcome(http.StatusOK, "")
-	clearConsentDeferral(client)
-	if err := client.Flush(context.Background()); err != nil {
-		t.Fatalf("Flush: %v", err)
+	// Only this client's own grant ever rode the consent route; the foreign
+	// receipt stays retained on disk for a correctly scoped client.
+	if got := state.consentCount(); got != 1 {
+		t.Fatalf("expected only the own grant on the consent route, got %d posts", got)
+	}
+	if !client.consentOutbox.pending() {
+		t.Fatalf("expected the foreign receipt still retained")
 	}
 	if err := client.Close(context.Background()); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -2736,4 +2753,173 @@ func TestConsentFloorSecondaryOverrideSpoolsUnderFloor(t *testing.T) {
 		return client.Snapshot().Spooled == 1
 	})
 	_ = client.Close(context.Background()) // the 503 event error is expected
+}
+
+func TestConsentFloorGrantReceiptHeldWhileRecordOwed(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// The grant's receipt appends durably, but the granted RECORD write
+	// fails: the pair is incomplete, and the receipt must be held from
+	// dispatch — an acknowledgement would prune the only durable half, and
+	// a crash would leave NEITHER on disk.
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	writeErr := errors.New("disk full")
+	var failing atomic.Bool
+	failing.Store(true)
+	client.spool.mu.Lock()
+	client.spool.renameFn = func(oldpath, newpath string) error {
+		if failing.Load() {
+			return writeErr
+		}
+		return os.Rename(oldpath, newpath)
+	}
+	client.spool.mu.Unlock()
+	client.SetConsent(true)
+	_ = client.Flush(context.Background()) // a dispatch point; the grant must hold
+	if got := state.consentCount(); got != 0 {
+		t.Fatalf("expected the grant receipt HELD while its record is owed, got %d consent posts", got)
+	}
+	if err := client.Track(context.Background(), Event{Name: "e1"}); !errors.Is(err, ErrConsentReceiptPending) {
+		t.Fatalf("expected the event legs gated behind the held pair, got %v", err)
+	}
+
+	// Close must not read as clean over the incomplete pair: the owed
+	// granted record pends the verdict, retryably.
+	if err := client.Close(context.Background()); !errors.Is(err, ErrConsentPending) {
+		t.Fatalf("expected ErrConsentPending while the granted record is owed, got %v", err)
+	}
+
+	// The disk heals: the retried Close completes the record, releases the
+	// receipt, delivers it, and finishes clean.
+	failing.Store(false)
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("expected the retried Close to complete the pair, got %v", err)
+	}
+	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentGranted {
+		t.Fatalf("expected the granted record completed before delivery, got (%v, %v)", recorded, ok)
+	}
+	if got := state.consentCount(); got != 1 {
+		t.Fatalf("expected the receipt delivered once the pair completed, got %d posts", got)
+	}
+}
+
+func TestConsentDecisionStampsMonotonicSameTick(t *testing.T) {
+	// A frozen clock mints the SAME instant twice: the stamps must still
+	// order strictly, or the reload's strictly-newer override would miss
+	// the newest decision after a crash.
+	frozen := &stubClock{now: time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)}
+	client := &Client{cfg: Config{}, clock: frozen}
+	first := client.consentDecisionStamp()
+	second := client.consentDecisionStamp()
+	third := client.consentDecisionStamp()
+	if first == second || second == third {
+		t.Fatalf("expected distinct stamps from a frozen clock, got %q %q %q", first, second, third)
+	}
+	if !consentReceiptNewerThanRecord(second, first) || !consentReceiptNewerThanRecord(third, second) {
+		t.Fatalf("expected strictly increasing stamps, got %q %q %q", first, second, third)
+	}
+	// A clock that moved BACKWARD still cannot regress the order.
+	frozen.now = frozen.now.Add(-time.Hour)
+	fourth := client.consentDecisionStamp()
+	if !consentReceiptNewerThanRecord(fourth, third) {
+		t.Fatalf("expected monotonicity across a backward clock step, got %q then %q", third, fourth)
+	}
+}
+
+func TestConsentFloorForeignReceiptNeverDispatched(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// A foreign receipt retained in a reused SpoolDir must never ride this
+	// client's scoped bearer — a terminal 401/403 answer would prune
+	// ANOTHER scope's consent receipt. It stays retained; only in-scope
+	// receipts dispatch.
+	dir := t.TempDir()
+	foreign := testConsentReceipt("key-foreign-keep-1", true)
+	foreign.WorkspaceID = "workspace-other"
+	planted := newConsentOutbox(dir)
+	if planted.append(foreign) {
+		t.Fatalf("seeding the foreign receipt failed")
+	}
+
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the own grant acknowledged", func() bool {
+		return client.Snapshot().ConsentRecorded == 1
+	})
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if got := state.consentCount(); got != 1 {
+		t.Fatalf("expected only the in-scope receipt on the wire, got %d posts", got)
+	}
+	if got := state.consentAt(0)["workspace_id"]; got != "workspace-test" {
+		t.Fatalf("expected the posted receipt to carry this client's scope, got %v", got)
+	}
+	if !client.consentOutbox.pending() {
+		t.Fatalf("expected the foreign receipt still retained")
+	}
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close over the durably retained foreign receipt: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, consentOutboxFileName))
+	if err != nil || !strings.Contains(string(data), "key-foreign-keep-1") {
+		t.Fatalf("expected the foreign receipt durably retained for a correctly scoped client, got %q (%v)", data, err)
+	}
+}
+
+func TestConsentFloorLateDiscardFoldsIntoCachedClose(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the grant acknowledged", func() bool {
+		return client.Snapshot().ConsentRecorded == 1
+	})
+	if err := client.Enqueue(Event{ID: "evt-latediscard-1", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	// The worker STALLS in a spool write (the failed flush's crash-insurance
+	// append, then the stop path's remnant) while Close's context expires:
+	// Close caches its verdict BEFORE the stop path counts the discarded
+	// remnant.
+	state.setBatchOutcome(http.StatusServiceUnavailable)
+	stalled := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	writeErr := errors.New("disk full")
+	client.spool.mu.Lock()
+	client.spool.renameFn = func(oldpath, newpath string) error {
+		once.Do(func() { close(stalled) })
+		<-release
+		return writeErr
+	}
+	client.spool.mu.Unlock()
+
+	expiring, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	err := client.Close(expiring)
+	if err == nil || errors.Is(err, ErrEventsDiscarded) {
+		t.Fatalf("test shape: expected the cached verdict WITHOUT the not-yet-counted discard, got %v", err)
+	}
+
+	// The worker finishes discarding AFTER the verdict was cached: the
+	// remnant write keeps failing, so the events are neither delivered nor
+	// durable at exit.
+	<-stalled
+	close(release)
+	waitFor(t, 3*time.Second, "the late discard counted", func() bool {
+		return client.closeDiscardedEvents.Load() > 0
+	})
+
+	// Every later Close must fold the late discard into the cached verdict.
+	if err := client.Close(context.Background()); !errors.Is(err, ErrEventsDiscarded) {
+		t.Fatalf("expected the late discard reported on the cached close, got %v", err)
+	}
+	_ = state
 }

@@ -376,8 +376,12 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) error {
 			// — no configured actor, or a failed idempotency-key mint): the
 			// outbox predicate takes over from the arming window either
 			// way, and the gate must not stay stuck for a receipt that
-			// cannot come.
+			// cannot come. Re-wake the dispatcher: a pass that ran during
+			// the window HELD the grant (consentGrantPairIncomplete) and
+			// returned without arming any deferral, so without this nudge
+			// the receipt would idle until the next tick or caller op.
 			c.consentGrantArming.Add(-1)
+			c.wakeConsentDispatch()
 		}
 	} else {
 		// Floor-off: the record/spool side applies unconditionally — even

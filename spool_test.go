@@ -1957,13 +1957,11 @@ func TestSpoolRecoveryWakeResendsSpoolOnlyWork(t *testing.T) {
 	if err := client.Track(context.Background(), Event{ID: "evt-wake-live-1", Name: "live"}); err != nil {
 		t.Fatalf("Track: %v", err)
 	}
-	waitFor(t, 5*time.Second, "the spooled chunk resent on the recovery wake", func() bool {
-		return client.Snapshot().SpoolResent == 1
+	// Poll the durable artifact alongside the counter: the resent count is
+	// delivery truth and can precede the ack's record rewrite by a moment.
+	waitFor(t, 5*time.Second, "the spooled chunk resent and acked out of the record", func() bool {
+		return client.Snapshot().SpoolResent == 1 && len(readSpoolRecordFile(t, dir).Events) == 0
 	})
-	record := readSpoolRecordFile(t, dir)
-	if len(record.Events) != 0 {
-		t.Fatalf("expected the resent chunk acked out of the record, got %s", mustJSON(t, record.Events))
-	}
 	// The chunk arrived exactly twice: the failed startup attempt and the one
 	// recovery-wake resend — no extra retries.
 	chunkArrivals := 0
