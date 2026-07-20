@@ -305,6 +305,10 @@ func NewClient(cfg Config) (*Client, error) {
 		// persisted last-known-good assignments immediately and re-arms
 		// their exposure facts for this instance.
 		client.exp = newExperimentsState(normalized)
+		// The cadence jitter rides the client's seeded jitter seam — the
+		// FIRST revalidation arm included, so fresh installs spread across
+		// the ±10% window instead of herding at exactly 300s.
+		client.exp.jitterFn = client.jitterValue
 		client.exp.preload()
 		client.expLaneDone = make(chan struct{})
 	}
@@ -565,19 +569,15 @@ func (c *Client) finishClose(ctx context.Context) error {
 	// fact the room the flush frees — see the second sweep below).
 	c.closeExperimentPreFlush()
 	err := c.Flush(ctx)
-	// The flush freed queue room: owed exposure facts that could not
-	// enqueue above get their last chance, then everything newly queued is
-	// delivered by one more flush pass (or spooled/counted by the worker's
-	// stop-path drain when that pass fails too). Best-effort by design — a
-	// still-failing enqueue is not a teardown blocker; the durable record
-	// re-arms live assignments at the next launch — and never silent:
-	// whatever enters the queue is counted by the close path's delivery
-	// accounting (spool/discard).
-	if c.closeExperimentPostFlush() {
-		if flushErr := c.Flush(ctx); flushErr != nil {
-			c.logf("shardpilot experiments: delivering owed exposure facts at close failed (they spool or are counted with the close remnant): %v", flushErr)
-		}
-	}
+	// The flush freed queue room: owed exposure facts drain in a
+	// sweep-then-flush LOOP until nothing is owed or a pass makes no
+	// progress (see closeExperimentPostFlush) — a bounded queue can admit
+	// as little as one fact per pass, and a single pass would silently
+	// lose the rest. Best-effort by design and never silent: whatever
+	// enters the queue is delivered or counted by the close path's
+	// accounting, and the durable record re-arms live assignments at the
+	// next launch.
+	c.closeExperimentPostFlush(ctx)
 	c.stopOnce.Do(func() {
 		close(c.stop)
 	})

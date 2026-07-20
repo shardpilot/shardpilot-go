@@ -1,6 +1,7 @@
 package shardpilot
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"sort"
@@ -431,18 +432,44 @@ func (c *Client) closeExperimentPreFlush() {
 // design and never silent: whatever cannot be delivered is counted by the
 // close path's accounting, and the durable record re-arms live assignments
 // at the next launch.
-func (c *Client) closeExperimentPostFlush() (enqueuedAny bool) {
+// closeExperimentPostFlush drains close-time owed exposures in a LOOP —
+// sweep, then flush what entered the queue, until nothing is owed or a full
+// pass makes no progress (a bounded-capacity queue can admit as little as
+// one fact per pass, and one sweep+flush would silently lose the rest).
+// Whatever a stuck pass leaves is surfaced (logged and counted by the close
+// path's delivery accounting; live assignments re-arm from the durable
+// record at the next launch), then the consumer tears down.
+func (c *Client) closeExperimentPostFlush(ctx context.Context) {
 	e := c.exp
 	if e == nil {
-		return false
+		return
 	}
 	if c.experimentConsentRefusal() == nil {
-		before := c.owedExperimentExposureCount()
-		c.sweepAllExperimentExposuresMode(true)
-		enqueuedAny = c.owedExperimentExposureCount() < before
+		for {
+			before := c.owedExperimentExposureCount()
+			if before == 0 {
+				break
+			}
+			c.sweepAllExperimentExposuresMode(true)
+			after := c.owedExperimentExposureCount()
+			if after < before {
+				// Deliver what the sweep enqueued so the next pass has
+				// room; a failed flush leaves the facts for the worker's
+				// stop-path drain (spooled or counted, never silent).
+				if flushErr := c.Flush(ctx); flushErr != nil {
+					c.logf("shardpilot experiments: delivering owed exposure facts at close failed (they spool or are counted with the close remnant): %v", flushErr)
+					break
+				}
+			}
+			if after == 0 || after >= before {
+				if after > 0 {
+					c.logf("shardpilot experiments: %d owed exposure fact(s) could not be enqueued at close; live assignments re-arm from the durable record at the next launch", after)
+				}
+				break
+			}
+		}
 	}
 	e.teardown()
-	return enqueuedAny
 }
 
 func (c *Client) owedExperimentExposureCount() int {

@@ -191,6 +191,8 @@ const (
 	expMaxRecordBytes          = 393216 // canon parity with the defold store clamp
 	expSubjectFileName         = "experiment_subject_key"
 	expSubjectReadLimit        = 1024
+	expTombstoneFileName       = "experiments.condemned"
+	expTombstoneReadLimit      = 8192
 	expCacheFileName           = "experiments.json"
 	experimentExposureName     = "experiment_exposure"
 	experimentOutcomeName      = "experiment_outcome"
@@ -772,6 +774,24 @@ func experimentExposureEventID(sessionMarker, subjectKey, experimentKey string, 
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
 }
 
+// experimentAttributesEqual reports whether two normalized attribute sets
+// are identical (both are sorted by the normalizer, so pairwise equality is
+// set equality). A cached verdict was computed FOR its attribute set: a
+// transient failure may serve it only to a request with the SAME set — a
+// geo=US cache must not answer a geo=CA request during an outage (the
+// server could have targeted them differently).
+func experimentAttributesEqual(a, b []expAttribute) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // exposureTupleKey is the ratified de-dupe tuple: (experiment, version,
 // subject) — nothing more. The assignment key is deliberately NOT part of
 // it: it is normally deterministic for this tuple anyway, and a regenerated
@@ -947,6 +967,11 @@ type experimentsState struct {
 	memorySubjectID string
 	memoryRecord    *expDurableRecord
 
+	// jitterFn is the uniform [0, 1) source for cadence jitter, wired from
+	// the owning client at construction (the Client.jitter seam). nil
+	// degrades to the midpoint (no jitter) — construction always sets it.
+	jitterFn func() float64
+
 	// laneParkedForTests suspends the background lane's automatic ticks so
 	// tests can drive tick() deterministically. Never set in production.
 	laneParkedForTests bool
@@ -963,14 +988,25 @@ type expOwedExposure struct {
 	session string
 }
 
-// expOwedSync is one owed durable intent, carrying the SCOPE it was decided
-// against: a subject rotation retires a scope, and an owed drop must land
-// against the RETIRED record (never be re-aimed at the new subject's), while
-// an owed write's in-memory source is gone with the rotation and cancels.
+// expOwedSync is one owed durable intent, KEYED BY (scope, experiment) —
+// see scopedIntentKey — and carrying both halves: a subject rotation
+// retires a scope, and an owed drop must land against the RETIRED record
+// (never be re-aimed at, or overwritten by, the new subject's intents for
+// the same experiment key), while an owed write's in-memory source is gone
+// with the rotation and cancels. Keying by experiment alone would let a
+// post-rotation failed WRITE overwrite the retired scope's owed DROP,
+// leaving stale assignment and fact-key data on disk forever.
 type expOwedSync struct {
-	asOf  int64
-	drop  bool
-	scope string
+	asOf          int64
+	drop          bool
+	scope         string
+	experimentKey string
+}
+
+// scopedIntentKey is the durablePending map key: the (scope, experiment)
+// composite, joined with the separator no escaped component contains.
+func scopedIntentKey(scope, experimentKey string) string {
+	return scope + rcScopeSeparator + experimentKey
 }
 
 type expExposed struct {
@@ -1009,12 +1045,26 @@ func newExperimentsState(cfg Config) *experimentsState {
 func (e *experimentsState) preload() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if condemned := e.condemnedScopeLocked(); condemned != "" {
+		// A previous process's real-subjects sentinel clear never landed:
+		// the tombstone condemns that scope's record. Refuse to serve it
+		// and re-arm the owed clear so this process retries it (the
+		// write-time demotion rule still applies if fresh authorized state
+		// installs first).
+		e.durableClearPending = true
+		e.durableClearAsOf = 0
+		e.durableClearScope = condemned
+	}
 	subject := e.currentSubjectIDLocked()
 	if subject == "" {
 		return
 	}
 	record := e.loadDurableRecordLocked()
 	if record == nil || record.Scope != e.scopeForLocked(subject) {
+		return
+	}
+	if e.durableClearPending && e.durableClearScope == record.Scope {
+		// The record is condemned: nothing serves from it.
 		return
 	}
 	for key, stored := range record.Entries {
@@ -1039,6 +1089,23 @@ func (e *experimentsState) subjectFilePath() string {
 	return filepath.Join(e.spoolDir, expSubjectFileName)
 }
 
+// readSubjectFileLocked reads the persisted subject id through a hard cap:
+// a valid file holds at most a 70-char id plus a newline, so anything past
+// the cap is not a file this SDK wrote — corrupt, read as a miss ("")
+// without allocating it.
+func (e *experimentsState) readSubjectFileLocked() string {
+	file, err := os.Open(e.subjectFilePath())
+	if err != nil {
+		return ""
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, expSubjectReadLimit+1))
+	_ = file.Close()
+	if readErr != nil || len(data) > expSubjectReadLimit {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
 // currentSubjectIDLocked returns the stored subject id when it is
 // wire-valid, else "". Never mints. The persisted value is read at most
 // once per process; adoption updates the cached copy.
@@ -1046,19 +1113,8 @@ func (e *experimentsState) currentSubjectIDLocked() string {
 	if !e.subjectChecked {
 		e.subjectChecked = true
 		raw := e.memorySubjectID
-		if path := e.subjectFilePath(); path != "" {
-			// Bounded read: a valid file holds at most a 70-char id plus a
-			// newline, so anything past the hard cap is not a file this SDK
-			// wrote — corrupt, read as a miss without allocating it.
-			if file, err := os.Open(path); err == nil {
-				data, readErr := io.ReadAll(io.LimitReader(file, expSubjectReadLimit+1))
-				_ = file.Close()
-				if readErr == nil && len(data) <= expSubjectReadLimit {
-					raw = strings.TrimSpace(string(data))
-				} else {
-					raw = ""
-				}
-			}
+		if e.subjectFilePath() != "" {
+			raw = e.readSubjectFileLocked()
 		}
 		if validExperimentSubjectID(raw) {
 			e.subjectID = raw
@@ -1079,11 +1135,18 @@ func (e *experimentsState) currentSubjectIDLocked() string {
 // subject included — stays distinct from anything the new subject arms. A
 // failed persist is diagnosed and the minted id still rules this process,
 // so one session stays self-consistent.
+// adoptMintedSubjectIDLocked mints and adopts a subject id. The INITIAL
+// mint (no id ruled this state yet) publishes create-only — temp file plus
+// a hard link that fails when another process already published — and
+// CONVERGES on the winner's id, so two clients racing a shared state dir
+// end on one subject instead of two. A RE-MINT (grammar sentinel, corrupt
+// load) replaces the stored value outright: rotation is the point.
 func (e *experimentsState) adoptMintedSubjectIDLocked() (string, bool) {
 	minted, err := mintExperimentSubjectID()
 	if err != nil {
 		return "", false
 	}
+	initialMint := e.subjectID == ""
 	e.entries = make(map[string]*expEntry)
 	e.exposed = make(map[string]expExposed)
 	// The rotation retires the previous scope: owed WRITES lose their
@@ -1102,8 +1165,28 @@ func (e *experimentsState) adoptMintedSubjectIDLocked() (string, bool) {
 		// The chmod hook tightens a pre-existing loose state dir/file (the
 		// spool's ensurePrivateDir discipline) — the subject id is private
 		// state whatever permissions the directory arrived with.
-		if err := writePrivateFileAtomic(path, []byte(minted+"\n"), os.Rename, os.Chmod); err != nil {
-			persisted = false
+		rename := os.Rename
+		if initialMint {
+			// Create-only publish: os.Link fails with EEXIST when another
+			// process won the initial-mint race — converge on its id.
+			rename = func(oldpath, newpath string) error { return os.Link(oldpath, newpath) }
+		}
+		if err := writePrivateFileAtomic(path, []byte(minted+"\n"), rename, os.Chmod); err != nil {
+			converged := false
+			if initialMint && errors.Is(err, os.ErrExist) {
+				if winner := e.readSubjectFileLocked(); validExperimentSubjectID(winner) {
+					// Lost the initial publish race to a VALID winner:
+					// converge on its id — one subject rules the shared
+					// state dir.
+					e.subjectID = winner
+					return winner, true
+				}
+				// The existing file is CORRUPT (this is why the mint ran):
+				// replace it outright — fresh-install semantics must not be
+				// blocked by the garbage they exist to heal.
+				converged = writePrivateFileAtomic(path, []byte(minted+"\n"), os.Rename, os.Chmod) == nil
+			}
+			persisted = converged
 		}
 	} else {
 		e.memorySubjectID = minted
@@ -1118,6 +1201,65 @@ func (e *experimentsState) cacheFilePath() string {
 		return ""
 	}
 	return filepath.Join(e.spoolDir, expCacheFileName)
+}
+
+func (e *experimentsState) tombstoneFilePath() string {
+	if e.spoolDir == "" {
+		return ""
+	}
+	return filepath.Join(e.spoolDir, expTombstoneFileName)
+}
+
+// writeCondemnationTombstoneLocked durably condemns the named scope's
+// record after a FAILED sentinel clear: the owed-clear intent is otherwise
+// memory-only, and a crash before the retry would let the next process
+// preload and serve assignments the real-subjects sentinel withdrew. The
+// tombstone is tiny, so it often lands where the record rewrite could not
+// (the defold-canon tombstone rationale); when even it cannot be written
+// the in-memory owed clear still rules this process and the residual
+// crash-window is surfaced to the caller for a diagnostic. Deliberately
+// NOT gated by the test write-failure seam: the tombstone is the recovery
+// mechanism for exactly that failure.
+func (e *experimentsState) writeCondemnationTombstoneLocked(scope string) bool {
+	path := e.tombstoneFilePath()
+	if path == "" {
+		return true // memory-only mode: the in-memory owed clear IS the state
+	}
+	return writePrivateFileAtomic(path, []byte(scope+"\n"), os.Rename, os.Chmod) == nil
+}
+
+// condemnedScopeLocked returns the scope a durable tombstone condemns, or
+// "". Bounded read; unreadable or over-cap reads as no tombstone (the owed
+// machinery still rules in-process).
+func (e *experimentsState) condemnedScopeLocked() string {
+	path := e.tombstoneFilePath()
+	if path == "" {
+		return ""
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return ""
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, expTombstoneReadLimit+1))
+	_ = file.Close()
+	if readErr != nil || len(data) > expTombstoneReadLimit {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
+}
+
+// clearCondemnationTombstoneLocked removes a tombstone naming scope (or any
+// tombstone when scope is ""). Best-effort: a failed removal leaves a
+// tombstone that the next load re-honors — fail closed, never fail open.
+func (e *experimentsState) clearCondemnationTombstoneLocked(scope string) {
+	path := e.tombstoneFilePath()
+	if path == "" {
+		return
+	}
+	if scope != "" && e.condemnedScopeLocked() != scope {
+		return
+	}
+	_ = os.Remove(path)
 }
 
 // loadDurableRecordLocked loads the stored record, or nil when absent or
@@ -1181,7 +1323,14 @@ func (e *experimentsState) saveDurableRecordLocked(record *expDurableRecord) boo
 	}
 	// The chmod hook tightens a pre-existing loose state dir/file (the
 	// spool's ensurePrivateDir discipline).
-	return writePrivateFileAtomic(path, buf.Bytes(), os.Rename, os.Chmod) == nil
+	if writePrivateFileAtomic(path, buf.Bytes(), os.Rename, os.Chmod) != nil {
+		return false
+	}
+	// Fresh durable state for this scope supersedes a condemnation naming
+	// it (the write-time demotion rule): the tombstone must not condemn
+	// the record that replaced the withdrawn one.
+	e.clearCondemnationTombstoneLocked(stored.Scope)
+	return true
 }
 
 // clearDurableRecordLocked drops the stored record outright (loads as "no
@@ -1210,6 +1359,8 @@ func (e *experimentsState) clearDurableRecordLocked() bool {
 			return false
 		}
 	}
+	// The withdrawn record is gone: any condemnation tombstone is spent.
+	e.clearCondemnationTombstoneLocked("")
 	return true
 }
 
@@ -1218,6 +1369,13 @@ func (e *experimentsState) clearDurableRecordLocked() bool {
 // overwritten by the next write).
 func (e *experimentsState) durableRecordForLocked(scope string) *expDurableRecord {
 	if record := e.loadDurableRecordLocked(); record != nil && record.Scope == scope {
+		if condemned := e.condemnedScopeLocked(); condemned == record.Scope {
+			// A condemned record is not a merge base: folding its entries
+			// back into a fresh save would resurrect withdrawn
+			// assignments. Start fresh; the successful save then
+			// supersedes the tombstone.
+			return &expDurableRecord{Scope: scope, Entries: make(map[string]expEntry)}
+		}
 		return record
 	}
 	return &expDurableRecord{Scope: scope, Entries: make(map[string]expEntry)}
@@ -1243,6 +1401,7 @@ func (e *experimentsState) durableRecordForLocked(scope string) *expDurableRecor
 // cancels owed WRITES but must let owed authoritative DROPS land; a subject
 // rotation cancels owed writes and keeps drops aimed at the retired scope).
 func (e *experimentsState) syncDurableEntryLocked(scope, experimentKey string, asOf int64, isRetry bool) bool {
+	intentKey := scopedIntentKey(scope, experimentKey)
 	entry := e.entries[experimentKey]
 	record := e.durableRecordForLocked(scope)
 	stored, hasStored := record.Entries[experimentKey]
@@ -1251,7 +1410,7 @@ func (e *experimentsState) syncDurableEntryLocked(scope, experimentKey string, a
 			if isRetry {
 				// A same-namespace sibling persisted a FRESHER entry after
 				// this write was decided: never roll the shared record back.
-				delete(e.durablePending, experimentKey)
+				delete(e.durablePending, intentKey)
 				return true
 			}
 			entry.FetchedAtMS = stored.FetchedAtMS + 1
@@ -1260,7 +1419,7 @@ func (e *experimentsState) syncDurableEntryLocked(scope, experimentKey string, a
 		asOf = entry.FetchedAtMS
 	} else {
 		if !hasStored {
-			delete(e.durablePending, experimentKey)
+			delete(e.durablePending, intentKey)
 			return true
 		}
 		if isRetry && stored.FetchedAtMS > asOf {
@@ -1268,7 +1427,7 @@ func (e *experimentsState) syncDurableEntryLocked(scope, experimentKey string, a
 			// drop was decided: a sibling client persisted a newer
 			// assignment this drop never resolved. Deleting it would lose
 			// newer valid state, so the outranked drop settles instead.
-			delete(e.durablePending, experimentKey)
+			delete(e.durablePending, intentKey)
 			return true
 		}
 		if !isRetry && stored.FetchedAtMS >= asOf {
@@ -1286,7 +1445,7 @@ func (e *experimentsState) syncDurableEntryLocked(scope, experimentKey string, a
 	// record instead of leaving siblings for the cycle.
 	folded := e.foldOwedIntentsLocked(record, scope, experimentKey)
 	if e.saveDurableRecordLocked(record) {
-		delete(e.durablePending, experimentKey)
+		delete(e.durablePending, intentKey)
 		for _, foldedKey := range folded {
 			delete(e.durablePending, foldedKey)
 		}
@@ -1301,7 +1460,7 @@ func (e *experimentsState) syncDurableEntryLocked(scope, experimentKey string, a
 		delete(record.Entries, experimentKey)
 		e.saveDurableRecordLocked(record)
 	}
-	e.durablePending[experimentKey] = expOwedSync{asOf: asOf, drop: entry == nil, scope: scope}
+	e.durablePending[intentKey] = expOwedSync{asOf: asOf, drop: entry == nil, scope: scope, experimentKey: experimentKey}
 	return false
 }
 
@@ -1312,39 +1471,39 @@ func (e *experimentsState) syncDurableEntryLocked(scope, experimentKey string, a
 // for OTHER scopes are foreign and are left for the retry cycle's
 // foreign-scope pass; memory is consulted for writes only (drops resolve
 // against the record alone).
-func (e *experimentsState) foldOwedIntentsLocked(record *expDurableRecord, scope, skipKey string) []string {
+func (e *experimentsState) foldOwedIntentsLocked(record *expDurableRecord, scope, skipExperimentKey string) []string {
 	var folded []string
-	for key, pending := range e.durablePending {
-		if key == skipKey || pending.scope != scope {
+	for intentKey, pending := range e.durablePending {
+		if pending.scope != scope || pending.experimentKey == skipExperimentKey {
 			continue
 		}
-		stored, hasStored := record.Entries[key]
+		stored, hasStored := record.Entries[pending.experimentKey]
 		if pending.drop {
 			if hasStored && stored.FetchedAtMS > pending.asOf {
 				// Outranked owed drop: a fresher sibling write landed after
 				// the drop was decided — the drop settles without applying.
-				folded = append(folded, key)
+				folded = append(folded, intentKey)
 				continue
 			}
-			delete(record.Entries, key)
-			folded = append(folded, key)
+			delete(record.Entries, pending.experimentKey)
+			folded = append(folded, intentKey)
 			continue
 		}
-		entry := e.entries[key]
+		entry := e.entries[pending.experimentKey]
 		if entry == nil {
 			// An owed write whose in-memory source is gone (latch or
 			// rotation should have cancelled it): nothing to fold — settle
 			// it rather than let it decay into a delete.
-			folded = append(folded, key)
+			folded = append(folded, intentKey)
 			continue
 		}
 		if hasStored && stored.FetchedAtMS > entry.FetchedAtMS {
 			// Retry semantics: yield to the strictly-fresher stored entry.
-			folded = append(folded, key)
+			folded = append(folded, intentKey)
 			continue
 		}
-		record.Entries[key] = *entry
-		folded = append(folded, key)
+		record.Entries[pending.experimentKey] = *entry
+		folded = append(folded, intentKey)
 	}
 	return folded
 }
@@ -1381,7 +1540,7 @@ func (e *experimentsState) demoteOwedClearLocked() {
 		if stored.FetchedAtMS >= asOf {
 			asOf = stored.FetchedAtMS + 1
 		}
-		e.durablePending[key] = expOwedSync{asOf: asOf, drop: true, scope: record.Scope}
+		e.durablePending[scopedIntentKey(record.Scope, key)] = expOwedSync{asOf: asOf, drop: true, scope: record.Scope, experimentKey: key}
 	}
 }
 
@@ -1450,49 +1609,47 @@ func (e *experimentsState) retryDurableSync() {
 			}
 		}
 	}
-	// Foreign-scope drops: land against the retired scope's record, or
-	// settle when another scope's write already replaced it. (Foreign
-	// WRITES cannot exist: a rotation cancels owed writes.)
+	// Foreign-scope drops: land against the retired scope's record —
+	// memory never consulted — or settle when another scope's write
+	// already replaced it. (Foreign WRITES cannot exist: a rotation
+	// cancels owed writes; any straggler cancels here the same way.)
 	foreignScopes := make(map[string][]string)
-	for key, pending := range e.durablePending {
+	for intentKey, pending := range e.durablePending {
 		if subject := e.currentSubjectIDLocked(); subject != "" && pending.scope == e.scopeForLocked(subject) {
 			continue
 		}
 		if !pending.drop {
-			// A foreign owed write's source rotated away: cancel rather
-			// than let it decay into a delete against a record it never
-			// described.
-			delete(e.durablePending, key)
+			delete(e.durablePending, intentKey)
 			continue
 		}
-		foreignScopes[pending.scope] = append(foreignScopes[pending.scope], key)
+		foreignScopes[pending.scope] = append(foreignScopes[pending.scope], intentKey)
 	}
-	for scope, keys := range foreignScopes {
+	for scope, intentKeys := range foreignScopes {
 		record := e.loadDurableRecordLocked()
 		if record == nil || record.Scope != scope {
 			// The retired record is gone or replaced: the withdrawn state
 			// cannot serve (scope-miss), the drops settle.
-			for _, key := range keys {
-				delete(e.durablePending, key)
+			for _, intentKey := range intentKeys {
+				delete(e.durablePending, intentKey)
 			}
 			continue
 		}
-		sort.Strings(keys)
-		applied := keys[:0]
-		for _, key := range keys {
-			pending := e.durablePending[key]
-			if stored, hasStored := record.Entries[key]; hasStored && stored.FetchedAtMS > pending.asOf {
+		sort.Strings(intentKeys)
+		applied := intentKeys[:0]
+		for _, intentKey := range intentKeys {
+			pending := e.durablePending[intentKey]
+			if stored, hasStored := record.Entries[pending.experimentKey]; hasStored && stored.FetchedAtMS > pending.asOf {
 				// Outranked by a fresher foreign write: settle without
 				// applying.
-				delete(e.durablePending, key)
+				delete(e.durablePending, intentKey)
 				continue
 			}
-			delete(record.Entries, key)
-			applied = append(applied, key)
+			delete(record.Entries, pending.experimentKey)
+			applied = append(applied, intentKey)
 		}
 		if len(applied) > 0 && e.saveDurableRecordLocked(record) {
-			for _, key := range applied {
-				delete(e.durablePending, key)
+			for _, intentKey := range applied {
+				delete(e.durablePending, intentKey)
 			}
 		}
 	}
@@ -1547,10 +1704,15 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 			} else {
 				// The withdrawn assignments are still on disk: mark the
 				// clear OWED — stamped by this resolution — and retry it
-				// every cycle until it lands.
+				// every cycle until it lands. The owed intent alone is
+				// memory-only, so a durable condemnation tombstone is
+				// written fail-closed too: a crash before the retry must
+				// not let the next process preload and serve the withdrawn
+				// record.
 				e.durableClearPending = true
 				e.durableClearAsOf = resolvedAtMS
 				e.durableClearScope = scope
+				e.writeCondemnationTombstoneLocked(scope)
 				return false, true, true
 			}
 			return false, false, true
@@ -1622,7 +1784,7 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 		// canon must never let that clear delete state written after it.
 		e.demoteOwedClearLocked()
 		persisted := e.syncDurableEntryLocked(scope, experimentKey, entry.FetchedAtMS, false)
-		e.armRevalidationLocked(resolvedAtMS, nil)
+		e.armRevalidationLocked(resolvedAtMS)
 		// The variant takes effect at this resolution (a variant change on
 		// republish applies here too): the application point. The snapshot
 		// is ARMED behind any still-owed earlier applications (the queue
@@ -1731,10 +1893,10 @@ func (e *experimentsState) teardown() {
 // armRevalidationLocked schedules the next revalidation cycle:
 // 300s ± 10% uniform jitter from now. jitter is the caller's [0, 1) source
 // (the client's seeded jitter seam); nil uses the midpoint.
-func (e *experimentsState) armRevalidationLocked(nowMS int64, jitter func() float64) {
+func (e *experimentsState) armRevalidationLocked(nowMS int64) {
 	unit := 0.5
-	if jitter != nil {
-		unit = jitter()
+	if e.jitterFn != nil {
+		unit = e.jitterFn()
 	}
 	factor := 1 + (unit*2-1)*expRevalidateJitter
 	e.revalidateAtMS = nowMS + int64(math.Floor(expRevalidateIntervalSeconds*factor*1000))
@@ -1761,7 +1923,7 @@ func (e *experimentsState) deferRevalidationLocked(nowMS int64, seconds int) {
 // failure: a server Retry-After wins; otherwise exponential backoff with
 // full jitter (transport parity — the first failure is free, then the
 // ceiling doubles per consecutive failure up to the cap).
-func (e *experimentsState) paceTransientLocked(nowMS int64, retryAfterSeconds int, retryAfterPresent bool, jitter func() float64) {
+func (e *experimentsState) paceTransientLocked(nowMS int64, retryAfterSeconds int, retryAfterPresent bool) {
 	if retryAfterPresent && retryAfterSeconds > 0 {
 		e.deferRevalidationLocked(nowMS, retryAfterSeconds)
 		return
@@ -1779,8 +1941,8 @@ func (e *experimentsState) paceTransientLocked(nowMS int64, retryAfterSeconds in
 		ceiling = expBackoffCapSeconds
 	}
 	unit := 0.5
-	if jitter != nil {
-		unit = jitter()
+	if e.jitterFn != nil {
+		unit = e.jitterFn()
 	}
 	wait := float64(expBackoffBaseSeconds) + unit*(ceiling-float64(expBackoffBaseSeconds))
 	e.deferRevalidationLocked(nowMS, int(math.Ceil(wait)))
@@ -1981,7 +2143,17 @@ func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string
 			entryNow = e.entries[experimentKey]
 		}
 	}
-	result, outcome, failure := applyExperimentAssignment(entryNow, resp, expRequestScope{
+	// Attribute-match gate on stale serving: the cached verdict was
+	// computed for ITS normalized attribute set — a transient outcome may
+	// serve it only to a request carrying the SAME set. A mismatched
+	// request gets the closed transient failure instead of another
+	// cohort's variant. (Revalidation re-sends the entry's own set, so the
+	// lane always matches.)
+	serveEntry := entryNow
+	if serveEntry != nil && !experimentAttributesEqual(serveEntry.Attributes, normalizedAttributes) {
+		serveEntry = nil
+	}
+	result, outcome, failure := applyExperimentAssignment(serveEntry, resp, expRequestScope{
 		appKey:        e.appKey,
 		envKey:        e.envKey,
 		experimentKey: experimentKey,
@@ -2042,7 +2214,7 @@ func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string
 		// discarded with it: a stale 429/5xx must not park the CURRENT
 		// plane's revalidation (and kill checks) for up to the day clamp.
 		if subjectNow := e.currentSubjectIDLocked(); subjectNow != "" && e.scopeForLocked(subjectNow) == scope {
-			e.paceTransientLocked(nowMS, outcome.retryAfterSeconds, outcome.retryAfterPresent, c.experimentJitter())
+			e.paceTransientLocked(nowMS, outcome.retryAfterSeconds, outcome.retryAfterPresent)
 		}
 	}
 	sweepOwedNow, persistFailed, dropAllLanded := e.installLocked(seq, scope, experimentKey, outcome, authEpoch, nowMS)
@@ -2067,7 +2239,11 @@ func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string
 	var supersededResult ExperimentAssignmentResult
 	supersededFailure := ""
 	if !epochStale && !scopeStale && fencedOut && outcome.authoritative {
-		supersededResult, supersededFailure = serveExperimentEntryOrFail(e.entries[experimentKey], "superseded")
+		supersededServe := e.entries[experimentKey]
+		if supersededServe != nil && !experimentAttributesEqual(supersededServe.Attributes, normalizedAttributes) {
+			supersededServe = nil
+		}
+		supersededResult, supersededFailure = serveExperimentEntryOrFail(supersededServe, "superseded")
 	}
 	overflowed := e.drainOwedExposureOverflowLocked()
 	e.mu.Unlock()
@@ -2155,9 +2331,9 @@ func (c *Client) experimentCycle(ctx context.Context) {
 			e.retryAfterMS = 0
 		}
 		if e.revalidateAtMS == 0 {
-			e.armRevalidationLocked(nowMS, c.experimentJitter())
+			e.armRevalidationLocked(nowMS)
 		} else if nowMS >= e.revalidateAtMS {
-			e.armRevalidationLocked(nowMS, c.experimentJitter())
+			e.armRevalidationLocked(nowMS)
 			keys = make([]string, 0, len(e.entries))
 			for key := range e.entries {
 				keys = append(keys, key)
@@ -2180,9 +2356,21 @@ func (c *Client) experimentCycle(ctx context.Context) {
 		}
 		e.mu.Lock()
 		blocked := e.authBlocked || e.tornDown
+		// The key must STILL be cached (and under the current subject's
+		// scope) at dispatch: the batch runs from a snapshot, and a
+		// concurrent host fetch can have dropped the entry (a
+		// not-assigned verdict, a permanent 400, a subject re-mint
+		// clearing the cache) since it was taken. A revalidation for a
+		// vanished key is a no-op — dispatching it anyway could REINSTALL
+		// the just-dropped experiment (with no remembered attributes),
+		// resurrecting state the plane deliberately removed.
+		stillCached := e.entries[key] != nil
 		e.mu.Unlock()
 		if blocked {
 			return
+		}
+		if !stillCached {
+			continue
 		}
 		_, _ = c.fetchExperimentAssignment(ctx, key, nil, true, nil)
 	}
@@ -2230,7 +2418,8 @@ func (c *Client) runExperimentsLane() {
 // ship one code path with the control experience as its default.
 func (c *Client) ExperimentVariant(experimentKey string) string {
 	e := c.exp
-	if e == nil || strings.TrimSpace(experimentKey) == "" {
+	experimentKey = strings.TrimSpace(experimentKey)
+	if e == nil || experimentKey == "" {
 		return ""
 	}
 	if c.experimentConsentRefusal() != nil {
@@ -2252,7 +2441,8 @@ func (c *Client) ExperimentVariant(experimentKey string) string {
 // serving rules.
 func (c *Client) ExperimentVariantPayload(experimentKey string) map[string]any {
 	e := c.exp
-	if e == nil || strings.TrimSpace(experimentKey) == "" {
+	experimentKey = strings.TrimSpace(experimentKey)
+	if e == nil || experimentKey == "" {
 		return nil
 	}
 	if c.experimentConsentRefusal() != nil {

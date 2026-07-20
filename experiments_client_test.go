@@ -930,7 +930,13 @@ func TestOwedDurableDropRetriesUntilStorageRecovers(t *testing.T) {
 		t.Fatalf("expected the kill miss, got %+v / %v", result, err)
 	}
 	client.exp.mu.Lock()
-	pending, owed := client.exp.durablePending[expTestScopeKey]
+	var pending expOwedSync
+	owed := false
+	for _, candidate := range client.exp.durablePending {
+		if candidate.experimentKey == expTestScopeKey {
+			pending, owed = candidate, true
+		}
+	}
 	client.exp.mu.Unlock()
 	if !owed || !pending.drop {
 		t.Fatalf("the failed durable drop must be owed, got %+v (owed=%v)", pending, owed)

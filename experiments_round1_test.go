@@ -566,9 +566,9 @@ func TestFoldedDropYieldsToFresherStoredSibling(t *testing.T) {
 	record := &expDurableRecord{Scope: scope, Entries: map[string]expEntry{
 		"exp-x": {AssignmentKey: "a", VariantKey: "v", Version: 1, AssignmentUnit: "client_id", FetchedAtMS: 100},
 	}}
-	e.durablePending["exp-x"] = expOwedSync{asOf: 50, drop: true, scope: scope}
+	e.durablePending[scopedIntentKey(scope, "exp-x")] = expOwedSync{asOf: 50, drop: true, scope: scope, experimentKey: "exp-x"}
 	folded := e.foldOwedIntentsLocked(record, scope, "")
-	if len(folded) != 1 || folded[0] != "exp-x" {
+	if len(folded) != 1 || folded[0] != scopedIntentKey(scope, "exp-x") {
 		t.Fatalf("the outranked drop must settle via the fold, got %v", folded)
 	}
 	if _, still := record.Entries["exp-x"]; !still {
