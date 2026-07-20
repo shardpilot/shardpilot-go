@@ -4616,3 +4616,320 @@ func TestConsentFloorFastHalfDenialParksGrantHandoff(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 }
+
+func TestConsentFloorPurgeDebtMarkerFailureRecordRetryRules(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// Escalation ladder, first rung: when the denial's record write fails
+	// AND the wipe-owed marker cannot be created, the branch must not
+	// return with NOTHING durable — it retries the denied record, and a
+	// successful retry restores record-first (the reload sees denied and
+	// purges; the spool purge completes in the same pass).
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the grant acknowledged", func() bool {
+		return client.Snapshot().ConsentRecorded == 1
+	})
+	state.setBatchOutcome(http.StatusServiceUnavailable)
+	if err := client.Enqueue(Event{ID: "evt-ladder-a-1", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Flush(context.Background()); err == nil {
+		t.Fatalf("expected the retryable batch failure that spools the event")
+	}
+	waitFor(t, 3*time.Second, "the event spooled durably", func() bool {
+		return client.Snapshot().Spooled == 1
+	})
+
+	// Seams: the FIRST consent.json write fails (the decision-time one);
+	// the ladder's retry — the very next write — succeeds. The marker can
+	// never be created.
+	var recordFailsLeft atomic.Int32
+	recordFailsLeft.Store(1)
+	client.spool.mu.Lock()
+	client.spool.renameFn = func(oldpath, newpath string) error {
+		if strings.HasSuffix(newpath, consentRecordFileName) && recordFailsLeft.Add(-1) >= 0 {
+			return errors.New("disk full")
+		}
+		return os.Rename(oldpath, newpath)
+	}
+	client.spool.markerFn = func(string) error {
+		return errors.New("marker refused")
+	}
+	client.spool.mu.Unlock()
+
+	client.SetConsent(false)
+	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentDenied {
+		t.Fatalf("expected the RETRIED denied record durable when the marker cannot be created, got (%v, %v)", recorded, ok)
+	}
+	if _, err := os.Stat(filepath.Join(dir, spoolFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected the purge completed under the durable denied record, got %v", err)
+	}
+	if wipeOwedMarkerExists(dir) {
+		t.Fatalf("test shape: the marker must never have been created")
+	}
+
+	// Crash pin: a relaunch restores the denial and resends nothing.
+	state.setBatchOutcome(0)
+	batchesBefore := state.batchCount()
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	relaunched := newFloorTestClient(t, server.URL, dir, nil)
+	if got := relaunched.Consent(); got != ConsentDenied {
+		t.Fatalf("expected the relaunch to restore the durable denial, got %v", got)
+	}
+	if err := relaunched.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if err := relaunched.Close(context.Background()); err != nil {
+		t.Fatalf("relaunch Close: %v", err)
+	}
+	for _, id := range state.batchIDsSince(batchesBefore) {
+		if id == "evt-ladder-a-1" {
+			t.Fatalf("the condemned event resent after the relaunch: %v", state.batchIDsSince(batchesBefore))
+		}
+	}
+}
+
+func TestConsentFloorPurgeDebtMarkerFailureWipesSpoolFile(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// Escalation ladder, second rung — pinned on the ACTORLESS local-only
+	// path, where no deny receipt will ever exist to override a stale
+	// granted record at reload (the finding's sharpest exposure): with the
+	// denied record unwritable AND the marker uncreatable, the branch
+	// removes the condemned spool file ITSELF — durable by destruction —
+	// so a crash cannot reload the condemned events under the old grant.
+	actorless := func(cfg *Config) {
+		cfg.AnonymousID = ""
+	}
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, actorless)
+	client.SetConsent(true) // actorless: record persists immediately, receipt-less
+	state.setBatchOutcome(http.StatusServiceUnavailable)
+	if err := client.Enqueue(Event{ID: "evt-ladder-b-1", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Flush(context.Background()); err == nil {
+		t.Fatalf("expected the retryable batch failure that spools the event")
+	}
+	waitFor(t, 3*time.Second, "the event spooled durably", func() bool {
+		return client.Snapshot().Spooled == 1
+	})
+	if got := state.consentCount(); got != 0 {
+		t.Fatalf("test shape: an actorless client must never post a receipt, got %d", got)
+	}
+
+	// Seams: consent.json writes ALWAYS fail; the marker can never be
+	// created; file removal is untouched.
+	client.spool.mu.Lock()
+	client.spool.renameFn = func(oldpath, newpath string) error {
+		if strings.HasSuffix(newpath, consentRecordFileName) {
+			return errors.New("disk full")
+		}
+		return os.Rename(oldpath, newpath)
+	}
+	client.spool.markerFn = func(string) error {
+		return errors.New("marker refused")
+	}
+	client.spool.mu.Unlock()
+
+	client.SetConsent(false)
+	if _, err := os.Stat(filepath.Join(dir, spoolFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected the condemned spool file removed when neither the record nor the marker could be made durable, got %v", err)
+	}
+	if wipeOwedMarkerExists(dir) {
+		t.Fatalf("test shape: the marker must never have been created")
+	}
+	if recorded, ok := loadConsentRecord(dir, client.spool.actorDigest); !ok || recorded != ConsentGranted {
+		t.Fatalf("test shape: expected the stale granted record still on disk, got (%v, %v)", recorded, ok)
+	}
+
+	// CRASH (no Close): the relaunch promotes the stale grant — no receipt
+	// exists to override it — but nothing condemned can reload: the spool
+	// file is gone. Pre-fix the file survives with no marker, and the
+	// condemned event resends under the old grant.
+	state.setBatchOutcome(0)
+	batchesBefore := state.batchCount()
+	relaunched := newFloorTestClient(t, server.URL, dir, actorless)
+	if got := relaunched.Consent(); got != ConsentGranted {
+		t.Fatalf("test shape: expected the stale grant promoted on the actorless relaunch (nothing overrides it), got %v", got)
+	}
+	if err := relaunched.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if err := relaunched.Close(context.Background()); err != nil {
+		t.Fatalf("relaunch Close: %v", err)
+	}
+	for _, id := range state.batchIDsSince(batchesBefore) {
+		if id == "evt-ladder-b-1" {
+			t.Fatalf("the condemned event reloaded and resent under the stale grant: %v", state.batchIDsSince(batchesBefore))
+		}
+	}
+}
+
+func TestConsentFloorPurgeDebtNothingDurableSurfacesAndRetries(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// Escalation ladder, last rung: record retry, marker, AND spool removal
+	// all fail — the branch surfaces the failure (LastError), keeps the
+	// live denial's in-memory condemnation (mirror cleared, disk
+	// fail-closed), and the owed-record retry re-derives the debt at the
+	// next dispatch point until one durable outcome lands.
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the grant acknowledged", func() bool {
+		return client.Snapshot().ConsentRecorded == 1
+	})
+	state.setBatchOutcome(http.StatusServiceUnavailable)
+	if err := client.Enqueue(Event{ID: "evt-ladder-c-1", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Flush(context.Background()); err == nil {
+		t.Fatalf("expected the retryable batch failure that spools the event")
+	}
+	waitFor(t, 3*time.Second, "the event spooled durably", func() bool {
+		return client.Snapshot().Spooled == 1
+	})
+
+	var failing atomic.Bool
+	failing.Store(true)
+	client.spool.mu.Lock()
+	client.spool.renameFn = func(oldpath, newpath string) error {
+		if failing.Load() && strings.HasSuffix(newpath, consentRecordFileName) {
+			return errors.New("disk full")
+		}
+		return os.Rename(oldpath, newpath)
+	}
+	client.spool.markerFn = func(string) error {
+		if failing.Load() {
+			return errors.New("marker refused")
+		}
+		return createWipeOwedMarker(dir)
+	}
+	client.spool.removeFn = func(path string) error {
+		if failing.Load() && strings.HasSuffix(path, spoolFileName) {
+			return errors.New("remove refused")
+		}
+		return os.Remove(path)
+	}
+	client.spool.mu.Unlock()
+
+	client.SetConsent(false)
+	if got := client.Snapshot().LastError; got != "spool_purge_failed" {
+		t.Fatalf("expected the nothing-durable outcome surfaced as spool_purge_failed, got %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, spoolFileName)); err != nil {
+		t.Fatalf("test shape: the spool file could not be removed and must still exist, got %v", err)
+	}
+	if wipeOwedMarkerExists(dir) {
+		t.Fatalf("test shape: the marker must not exist")
+	}
+	client.spool.mu.Lock()
+	heldEntries, heldResend := len(client.spool.entries), len(client.spool.resend)
+	owed := client.spool.owed
+	client.spool.mu.Unlock()
+	if heldEntries != 0 || heldResend != 0 {
+		t.Fatalf("expected the in-memory condemnation regardless (mirror and resend queue cleared), got %d entries, %d resend chunks", heldEntries, heldResend)
+	}
+	if !owed {
+		t.Fatalf("expected the spool fail-closed (in-memory owed) while nothing durable exists")
+	}
+
+	// The debt re-derives: everything heals, and the next dispatch point's
+	// owed-record retry re-runs the branch — the denied record lands and
+	// the purge completes.
+	failing.Store(false)
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush after the heal: %v", err)
+	}
+	waitFor(t, 3*time.Second, "the denied record healed and the spool purged", func() bool {
+		recorded, ok := loadConsentRecord(dir, spoolTestActorDigest())
+		if !ok || recorded != ConsentDenied {
+			return false
+		}
+		_, statErr := os.Stat(filepath.Join(dir, spoolFileName))
+		return errors.Is(statErr, os.ErrNotExist)
+	})
+	state.setBatchOutcome(0)
+	batchesBefore := state.batchCount()
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	for _, id := range state.batchIDsSince(batchesBefore) {
+		if id == "evt-ladder-c-1" {
+			t.Fatalf("the condemned event resent after the heal: %v", state.batchIDsSince(batchesBefore))
+		}
+	}
+}
+
+func TestConsentFloorFailedSaveEvictionFoldsIntoCloseVerdict(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// A close-remnant member evicted by the caps BEFORE a FAILED save has
+	// no durable copy anywhere — it was only ever accepted into the mirror
+	// under failed writes — so its eviction is a SETTLED loss, not a
+	// deferrable one: it must be returned, counted (SpoolEvicted, Dropped)
+	// and folded into the Close verdict. Pre-fix the failed-save path
+	// deferred ALL evictions, and a disk-full Close lost the member with
+	// no ErrEventsDiscarded accounting for it.
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, func(cfg *Config) {
+		cfg.SpoolMaxEvents = 1
+	})
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the grant acknowledged", func() bool {
+		return client.Snapshot().ConsentRecorded == 1
+	})
+
+	// spool.json saves fail from the START: E1 is accepted into the mirror
+	// under a failed write — uncounted, and never on disk.
+	client.spool.mu.Lock()
+	client.spool.renameFn = func(oldpath, newpath string) error {
+		if strings.HasSuffix(newpath, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return os.Rename(oldpath, newpath)
+	}
+	client.spool.mu.Unlock()
+	state.setBatchOutcome(http.StatusServiceUnavailable)
+	if err := client.Enqueue(Event{ID: "evt-cap-lost-1", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Flush(context.Background()); err == nil {
+		t.Fatalf("expected the retryable batch failure")
+	}
+
+	// The close remnant appends E2 over the cap: the eviction takes E1 —
+	// never durably saved — and the remnant save fails again.
+	if err := client.Enqueue(Event{ID: "evt-cap-lost-2", Name: "e2"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	err := client.Close(context.Background())
+	if !errors.Is(err, ErrEventsDiscarded) {
+		t.Fatalf("expected the close verdict to report the discarded remnant, got %v", err)
+	}
+	// Close appends the retained batch twice (the failing final flush, then
+	// the stop-path remnant), and the cap churns on each: stage one evicts
+	// E1 (never saved — settled loss, counted), stage two re-admits E1 and
+	// evicts E2 (accepted under the stage-one failed save — settled loss,
+	// counted), leaving E1 mirrored-but-unpersisted for the remnant fold.
+	// Every member is lost exactly once in the verdict: E2 through its
+	// settled eviction, E1 through unpersistedOf. Pre-fix both evictions
+	// deferred (SpoolEvicted 0) and only the mirrored member counted
+	// (Dropped 1) — E2 vanished with no accounting at all.
+	snap := client.Snapshot()
+	if got := snap.SpoolEvicted; got != 2 {
+		t.Fatalf("expected the never-persisted evictions COUNTED despite the failed saves, got SpoolEvicted=%d", got)
+	}
+	if got := snap.Dropped; got != 2 {
+		t.Fatalf("expected BOTH remnant members in the loss accounting (the settled eviction and the unpersisted mirror member), got Dropped=%d", got)
+	}
+}

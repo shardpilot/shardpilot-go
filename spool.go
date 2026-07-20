@@ -244,9 +244,12 @@ type diskSpool struct {
 	// removeFn/renameFn/chmodFn are the file primitives, injectable so tests
 	// can exercise purge, persist, and refused-dir-tighten failures
 	// deterministically (the same seam discipline as createAnonymousIDWith).
+	// markerFn creates the wipe-owed marker (createWipeOwedMarker),
+	// injectable so tests can exercise a failed debt-marker creation.
 	removeFn func(path string) error
 	renameFn func(oldpath, newpath string) error
 	chmodFn  func(name string, mode os.FileMode) error
+	markerFn func(dir string) error
 }
 
 // spoolSettledMemory bounds the settled-id memory used to suppress
@@ -267,6 +270,7 @@ func newDiskSpool(cfg Config) *diskSpool {
 		removeFn:     os.Remove,
 		renameFn:     os.Rename,
 		chmodFn:      os.Chmod,
+		markerFn:     createWipeOwedMarker,
 	}
 	s.owed = wipeOwedMarkerExists(s.dir)
 	return s
@@ -837,12 +841,30 @@ func (s *diskSpool) append(batch []spoolEntry, deadlineMS int64, clearStaleDeadl
 		for _, entry := range added {
 			s.uncountedIDs[entry.id] = struct{}{}
 		}
-		// The failed rewrite left the evicted entries in the on-disk record:
-		// a crash now would reload and resend them, so their capacity
-		// dead-letters defer until the eviction durably lands rather than
-		// reporting a drop the disk could still undo.
-		s.deferredCapacityDrops = append(s.deferredCapacityDrops, evicted...)
-		evicted = nil
+		// The failed rewrite left PREVIOUSLY SAVED evictions in the on-disk
+		// record: a crash now would reload and resend those, so their
+		// capacity dead-letters defer until the eviction durably lands
+		// rather than reporting a drop the disk could still undo. An
+		// eviction with NO durable copy — a member of THIS batch, or one
+		// accepted under an earlier failed write with no successful save
+		// since (still in uncountedIDs) — has nothing the disk could undo:
+		// it is a SETTLED loss the moment it leaves the mirror and must be
+		// returned and counted NOW. Deferring it too would let a disk-full
+		// Close exit with the member neither mirrored nor counted — lost
+		// without ever surfacing in the discard verdict.
+		var deferred, settled []spoolEntry
+		for _, entry := range evicted {
+			_, fromThisBatch := appended[entry.id]
+			_, unsaved := s.uncountedIDs[entry.id]
+			if fromThisBatch || unsaved {
+				delete(s.uncountedIDs, entry.id)
+				settled = append(settled, entry)
+				continue
+			}
+			deferred = append(deferred, entry)
+		}
+		s.deferredCapacityDrops = append(s.deferredCapacityDrops, deferred...)
+		evicted = settled
 	}
 	return false, added, expired, evicted, persistFailed
 }
@@ -1729,6 +1751,7 @@ func (c *Client) applySpoolConsent(decision ConsentDecision, decidedAt string) (
 		// so nothing flows meanwhile, and the owed-record retry re-runs this
 		// branch — the purge completes in the same pass the record lands.
 		recordPersisted := true
+		var condemned []spoolEntry
 		if recordErr := saveConsentRecord(s.dir, decision, s.actorDigest, decidedAt, floorAuthored, s.renameFn, s.chmodFn); recordErr != nil {
 			recordPersisted = false
 			c.stats.setLastError("consent_record_persist_failed")
@@ -1750,24 +1773,72 @@ func (c *Client) applySpoolConsent(decision ConsentDecision, decidedAt string) (
 			// marker before anything loads). Events a denial condemned must
 			// never resend, whatever decision follows.
 			s.mu.Lock()
-			condemned := s.condemnEntriesLocked()
+			condemned = s.condemnEntriesLocked()
 			s.owed = true
 			s.mu.Unlock()
-			_ = createWipeOwedMarker(s.dir)
-			if len(condemned) == 0 {
-				return nil, false
+			if markerErr := s.markerFn(s.dir); markerErr != nil {
+				// The debt marker could not be made durable either. The
+				// INVARIANT this branch upholds: it returns only after
+				// EITHER the denied record, the wipe-owed marker, or the
+				// spool file's removal is durable — with none of them, a
+				// crash leaves stale granted consent.json + spool.json and
+				// NO owed marker, and the next launch reloads the condemned
+				// events under the old grant (in the actorless local-only
+				// path no deny receipt would ever exist to override it).
+				// Escalate through the remaining durable outcomes in order.
+				if retryErr := saveConsentRecord(s.dir, decision, s.actorDigest, decidedAt, floorAuthored, s.renameFn, s.chmodFn); retryErr == nil {
+					// The denied RECORD is durable after all: record-first
+					// is restored, and every crash interleaving from here
+					// fails closed (a relaunch restores denied and purges at
+					// init). Fall through to the normal purge below — its
+					// own failure modes are covered by the durable record.
+					recordPersisted = true
+					c.logf("shardpilot spool: the wipe-owed marker could not be created (%v); the retried denied record write succeeded and rules any reload", markerErr)
+				} else if s.settleOwedWipe() {
+					// The condemned spool FILE itself is gone (the settle
+					// consumed the in-memory debt with it): nothing
+					// condemned can reload, whatever the stale granted
+					// record says — the debt is settled by destruction. The
+					// denied record stays owed and retries at every
+					// dispatch point.
+					c.logf("shardpilot spool: the wipe-owed marker could not be created (%v); the condemned spool file was removed instead — nothing condemned can reload", markerErr)
+					if len(condemned) == 0 {
+						return nil, false
+					}
+					return []SpoolDeadLetter{spoolDeadLetterFrom(SpoolDropConsent, condemned)}, false
+				} else {
+					// NOTHING durable could be made — surface it. The live
+					// denial's in-memory condemnation holds for this
+					// process (intake refused, mirror and resend queue
+					// cleared, disk work refused via the in-memory owed
+					// flag), and the owed-record retry re-runs this whole
+					// branch at every dispatch point — re-deriving the debt
+					// until one of the three outcomes lands. A crash
+					// meanwhile is the surfaced, diagnosed residual.
+					c.stats.setLastError("spool_purge_failed")
+					c.logf("shardpilot spool: neither the denied record, the wipe-owed marker, nor the spool removal could be made durable (marker: %v; record retry: %v); the denial holds in memory and the debt re-derives at every dispatch point", markerErr, retryErr)
+					if len(condemned) == 0 {
+						return nil, false
+					}
+					return []SpoolDeadLetter{spoolDeadLetterFrom(SpoolDropConsent, condemned)}, false
+				}
+			} else {
+				if len(condemned) == 0 {
+					return nil, false
+				}
+				return []SpoolDeadLetter{spoolDeadLetterFrom(SpoolDropConsent, condemned)}, false
 			}
-			return []SpoolDeadLetter{spoolDeadLetterFrom(SpoolDropConsent, condemned)}, false
 		}
 		dropped, err := s.purge()
 		if err != nil {
 			c.stats.setLastError("spool_purge_failed")
 			c.logf("shardpilot spool: consent purge failed; a wipe is owed and the disk spool is disabled until it succeeds: %v", err)
 		}
-		if len(dropped) == 0 {
+		condemned = append(condemned, dropped...)
+		if len(condemned) == 0 {
 			return nil, recordPersisted
 		}
-		return []SpoolDeadLetter{spoolDeadLetterFrom(SpoolDropConsent, dropped)}, recordPersisted
+		return []SpoolDeadLetter{spoolDeadLetterFrom(SpoolDropConsent, condemned)}, recordPersisted
 	}
 	if !s.settleOwedWipe() {
 		c.stats.setLastError("spool_purge_failed")

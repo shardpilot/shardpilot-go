@@ -103,7 +103,18 @@
     spool and which a crash re-derives at the next start — a later grant whose
     successful record write clears the owed slot can no longer silently forget
     that a denial condemned the spooled events, and events a denial condemned
-    never resend, whatever decision follows. A decision-record
+    never resend, whatever decision follows. The debt's DURABILITY is itself
+    an invariant: the deferring branch returns only after EITHER the denied
+    record, the wipe-owed marker, or the spool file's removal is durable —
+    when the marker creation fails too it escalates in order (retry the
+    denied record, which restores record-first and completes the purge; else
+    remove the condemned spool file itself, durable by destruction; else
+    surface the failure with the in-memory condemnation holding and the
+    owed-record retry re-deriving the debt at every dispatch point), because
+    a crash with none of them would leave stale granted state plus the
+    condemned file and NO marker — reloading the condemned events under the
+    old grant, with no deny receipt ever coming on the actorless local-only
+    path. A decision-record
     write that fails (or is withheld) is OWED and retried at every dispatch point: the
     withheld grant record completes its receipt-first PAIR in the same pass the outbox
     write recovers — before the receipt can deliver and prune away the trail's only
@@ -242,7 +253,13 @@
     `SpoolMaxEvents`/`SpoolMaxBytes` at exit is a permanent loss with no later
     resend — unlike a mid-session eviction — while a still-DEFERRED eviction
     stays on disk and reloads, the durable-eviction-deferral rule, so it is
-    deliberately not counted), remnant members past the RETRY-AGE cap (refused at
+    deliberately not counted; the deferral applies only to evictions with a
+    durable stale copy — an eviction under a FAILED save of an entry that was
+    never durably saved, a member of the failing batch itself or one accepted
+    under an earlier failed write, has nothing the disk could undo and is a
+    SETTLED loss returned and counted immediately, so a disk-full Close can
+    no longer exit with such a member neither mirrored nor counted), remnant
+    members past the RETRY-AGE cap (refused at
     the close append as too old to ever resend), and remnant members that could
     not SERIALIZE (poisoned — already counted `Dropped` at their settle, joining
     the verdict fold only) all fold the same way — counted PER EVENT through
