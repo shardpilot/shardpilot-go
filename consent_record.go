@@ -57,12 +57,18 @@ type consentRecordWire struct {
 
 // consentActorDigest canonically digests the actor/scope tuple a persisted
 // consent decision covers: the same identity fields SetConsent's decision is
-// about — the configured workspace/environment scope and the configured
-// UserID/AnonymousID actor identity. Fields are length-prefixed before
-// hashing, so distinct tuples can never collide by concatenation.
+// about — the configured workspace/APP/environment scope and the configured
+// UserID/AnonymousID actor identity. AppID is part of the tuple because the
+// record can become LIVE floor state at reload: a SpoolDir reused across
+// apps in one workspace/environment must not let another app's record rule
+// this app's floor (its receipt was delivered for the other app's scope).
+// A record written by an earlier build (digest without AppID) reads as "no
+// usable decision" — fail-closed: the floor starts undecided and the spool
+// purges once, exactly like any digest mismatch. Fields are length-prefixed
+// before hashing, so distinct tuples can never collide by concatenation.
 func consentActorDigest(cfg Config) string {
 	h := sha256.New()
-	for _, field := range []string{cfg.WorkspaceID, cfg.EnvironmentID, cfg.UserID, cfg.AnonymousID} {
+	for _, field := range []string{cfg.WorkspaceID, cfg.AppID, cfg.EnvironmentID, cfg.UserID, cfg.AnonymousID} {
 		fmt.Fprintf(h, "%d:%s\n", len(field), field)
 	}
 	return hex.EncodeToString(h.Sum(nil))

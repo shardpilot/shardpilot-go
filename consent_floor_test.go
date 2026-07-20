@@ -1000,6 +1000,7 @@ func TestConsentFloorRefusedTightenStartsFailClosed(t *testing.T) {
 
 	cfg := Config{
 		WorkspaceID:   "workspace-test",
+		AppID:         "app-test",
 		EnvironmentID: "develop",
 		AnonymousID:   "anon-spool-1",
 		SpoolDir:      dir,
@@ -1652,6 +1653,7 @@ func TestConsentFloorReloadRefusesOutOfContractIdentity(t *testing.T) {
 	oversized := strings.Repeat("u", maxConsentIdentifierBytes+1)
 	cfgTuple := Config{
 		WorkspaceID:   "workspace-test",
+		AppID:         "app-test",
 		EnvironmentID: "develop",
 		UserID:        oversized,
 		AnonymousID:   "anon-spool-1",
@@ -1834,6 +1836,7 @@ func TestConsentFloorUnconfirmedGrantPurgesSpoolAtInit(t *testing.T) {
 	oversized := strings.Repeat("u", maxConsentIdentifierBytes+1)
 	invalidTuple := Config{
 		WorkspaceID:   "workspace-test",
+		AppID:         "app-test",
 		EnvironmentID: "develop",
 		UserID:        oversized,
 		AnonymousID:   "anon-spool-1",
@@ -2114,5 +2117,322 @@ func TestConsentFloorGatedCloseReportsUnspooledRemnant(t *testing.T) {
 	}
 	if got := state.batchCount(); got != 0 {
 		t.Fatalf("expected the held event never published, got %d batches", got)
+	}
+}
+
+func TestConsentFloorForeignTailDoesNotHideInScopeProof(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// A stale GRANTED record, this client's durable DENY receipt, and a
+	// FOREIGN receipt retained after it (another scope sharing the dir).
+	// The absolute tail is foreign — the override must still find the
+	// latest IN-SCOPE receipt and resolve the denial.
+	dir := t.TempDir()
+	writeConsentRecordFile(t, dir, "granted")
+	planted := newConsentOutbox(dir)
+	if planted.append(testConsentReceipt("key-inscope-deny-1", false)) {
+		t.Fatalf("seeding the in-scope deny receipt failed")
+	}
+	foreign := testConsentReceipt("key-foreign-tail-1", true)
+	foreign.WorkspaceID = "workspace-other"
+	if planted.append(foreign) {
+		t.Fatalf("seeding the foreign tail receipt failed")
+	}
+
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	if got := client.Consent(); got != ConsentDenied {
+		t.Fatalf("expected the latest IN-SCOPE receipt to override the stale grant, got %v", got)
+	}
+	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentDenied {
+		t.Fatalf("expected the stale record healed from the in-scope proof, got (%v, %v)", recorded, ok)
+	}
+	if err := client.Track(context.Background(), Event{Name: "e1"}); !errors.Is(err, ErrConsentDenied) {
+		t.Fatalf("expected the pipeline closed under the in-scope denial, got %v", err)
+	}
+	// Both receipts still deliver, in retention order (deny first), each
+	// verbatim for its own scope; no batch ever.
+	waitFor(t, 3*time.Second, "both receipts delivered", func() bool {
+		return state.consentCount() >= 2
+	})
+	if consentBoolCategory(t, state.consentAt(0)) {
+		t.Fatalf("expected the in-scope deny delivered first, got %v", state.consentAt(0))
+	}
+	if got := state.batchCount(); got != 0 {
+		t.Fatalf("expected a dark denied session, got %d batches", got)
+	}
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestConsentFloorDenyProofHeldUntilRecordDurable(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the grant acknowledged", func() bool {
+		return client.Snapshot().ConsentRecorded == 1
+	})
+
+	// The denial's record write fails (the granted record stays on disk),
+	// while the deny receipt appends durably. Delivering that receipt now
+	// would prune the trail's ONLY durable evidence of the denial: it must
+	// stay HELD until the denied record lands.
+	client.spool.mu.Lock()
+	client.spool.renameFn = func(oldpath, newpath string) error {
+		return errors.New("disk full")
+	}
+	client.spool.mu.Unlock()
+	client.SetConsent(false)
+	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentGranted {
+		t.Fatalf("test setup: expected the denied record write to have failed, got (%v, %v)", recorded, ok)
+	}
+	_ = client.Flush(context.Background()) // a dispatch point; the proof must hold
+	if got := state.consentCount(); got != 1 {
+		t.Fatalf("expected the deny proof HELD while its record write is owed, got %d consent posts", got)
+	}
+
+	// The disk heals: the owed record retry lands the denied record at the
+	// next dispatch point, which releases the proof for delivery.
+	client.spool.mu.Lock()
+	client.spool.renameFn = os.Rename
+	client.spool.mu.Unlock()
+	if err := client.Flush(context.Background()); err != nil && !errors.Is(err, ErrConsentDenied) {
+		t.Fatalf("Flush after the heal: %v", err)
+	}
+	waitFor(t, 3*time.Second, "the deny receipt delivered after the record healed", func() bool {
+		return state.consentCount() == 2
+	})
+	if consentBoolCategory(t, state.consentAt(1)) {
+		t.Fatalf("expected the deny receipt delivered, got %v", state.consentAt(1))
+	}
+	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentDenied {
+		t.Fatalf("expected the denied record durable before the proof delivered, got (%v, %v)", recorded, ok)
+	}
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestConsentFloorHeldDenyProofRestoresDenialAcrossRestart(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// The crash half of the held proof: the record write NEVER heals in
+	// session one — Close completes over the durable retained proof — and
+	// the relaunch must restore the denial from it, not the stale grant.
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the grant acknowledged", func() bool {
+		return client.Snapshot().ConsentRecorded == 1
+	})
+	client.spool.mu.Lock()
+	client.spool.renameFn = func(oldpath, newpath string) error {
+		return errors.New("disk full")
+	}
+	client.spool.mu.Unlock()
+	client.SetConsent(false)
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close over the durable held proof: %v", err)
+	}
+	if got := state.consentCount(); got != 1 {
+		t.Fatalf("expected the held proof undelivered at exit, got %d consent posts", got)
+	}
+
+	relaunched := newFloorTestClient(t, server.URL, dir, nil)
+	if got := relaunched.Consent(); got != ConsentDenied {
+		t.Fatalf("expected the held proof to restore the denial, got %v", got)
+	}
+	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentDenied {
+		t.Fatalf("expected the stale record healed at reload, got (%v, %v)", recorded, ok)
+	}
+	// With the record healed the proof is releasable and delivers.
+	waitFor(t, 3*time.Second, "the deny receipt delivered after the relaunch heal", func() bool {
+		return state.consentCount() == 2
+	})
+	if err := relaunched.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestConsentFloorWithheldGrantRecordCompletesOnRetry(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// The grant's receipt write fails, so its record is WITHHELD
+	// (receipt-first); the endpoint is down too, so nothing delivers yet.
+	state.setConsentOutcome(http.StatusServiceUnavailable, "3600")
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	client.consentOutbox.mu.Lock()
+	client.consentOutbox.renameFn = func(oldpath, newpath string) error {
+		return errors.New("disk full")
+	}
+	client.consentOutbox.mu.Unlock()
+	client.SetConsent(true)
+	if _, ok := loadConsentRecord(dir, spoolTestActorDigest()); ok {
+		t.Fatalf("test setup: expected the granted record withheld")
+	}
+
+	// The disk heals: the SAME dispatch pass that recovers the outbox write
+	// completes the receipt-first pair — the granted record lands BEFORE
+	// the receipt can dispatch, be acknowledged, and prune away.
+	client.consentOutbox.mu.Lock()
+	client.consentOutbox.renameFn = os.Rename
+	client.consentOutbox.mu.Unlock()
+	state.setConsentOutcome(http.StatusOK, "")
+	clearConsentDeferral(client)
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentGranted {
+		t.Fatalf("expected the withheld record completed on the outbox retry, got (%v, %v)", recorded, ok)
+	}
+	waitFor(t, 3*time.Second, "the grant receipt delivered", func() bool {
+		return client.Snapshot().ConsentRecorded == 1
+	})
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// The relaunch restores the grant from the RECORD — the receipt is long
+	// pruned, and without the completed pair this would start unknown.
+	relaunched := newFloorTestClient(t, server.URL, dir, nil)
+	if got := relaunched.Consent(); got != ConsentGranted {
+		t.Fatalf("expected the completed record to restore the grant, got %v", got)
+	}
+	if err := relaunched.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestConsentFloorDirtyDuplicateRemnantCountsDiscarded(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the grant acknowledged", func() bool {
+		return client.Snapshot().ConsentRecorded == 1
+	})
+
+	// The batch fails retryably and its spool append lands in the MIRROR
+	// only (the save fails): the event is already tracked as unpersisted
+	// when Close's remnant re-appends it as a DUPLICATE.
+	state.setBatchOutcome(http.StatusServiceUnavailable)
+	client.spool.mu.Lock()
+	client.spool.renameFn = func(oldpath, newpath string) error {
+		return errors.New("disk full")
+	}
+	client.spool.mu.Unlock()
+	if err := client.Enqueue(Event{ID: "evt-dupremnant-1", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Flush(context.Background()); err == nil {
+		t.Fatalf("expected the retryable batch failure")
+	}
+
+	// Close: the remnant append de-duplicates (nothing newly added), the
+	// final settle retry still fails — the event is neither delivered nor
+	// durable, and the loss must fold into the verdict.
+	err := client.Close(context.Background())
+	if !errors.Is(err, ErrEventsDiscarded) {
+		t.Fatalf("expected the dirty duplicate remnant reported on Close, got %v", err)
+	}
+	if got := client.Snapshot().Dropped; got == 0 {
+		t.Fatalf("expected the lost remnant counted dropped")
+	}
+	if got := state.batchCount(); got == 0 {
+		t.Fatalf("test shape: expected the failing batch attempts on the wire")
+	}
+}
+
+func TestConsentFloorRecordScopedToApp(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// A granted record persisted by ANOTHER APP in the same
+	// workspace/environment/actor (its receipt long delivered and pruned).
+	// This app's floor must not adopt it as live state.
+	dir := t.TempDir()
+	otherApp := Config{
+		WorkspaceID:   "workspace-test",
+		AppID:         "app-other",
+		EnvironmentID: "develop",
+		AnonymousID:   "anon-spool-1",
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	payload := []byte(fmt.Sprintf(`{"consent_analytics":"granted","actor_digest":%q}`, consentActorDigest(otherApp)))
+	if err := os.WriteFile(consentRecordPath(dir), payload, 0o600); err != nil {
+		t.Fatalf("write consent record: %v", err)
+	}
+
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	if got := client.Consent(); got != ConsentUnknown {
+		t.Fatalf("expected the app-foreign record refused (undecided), got %v", got)
+	}
+	if err := client.Track(context.Background(), Event{Name: "e1"}); !errors.Is(err, ErrConsentUnknown) {
+		t.Fatalf("expected the pipeline dark under the refused record, got %v", err)
+	}
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if got := state.snapshotOrder(); len(got) != 0 {
+		t.Fatalf("expected a fully dark session, got %v", got)
+	}
+	// The foreign record is left in place for its own app.
+	if _, err := os.Stat(consentRecordPath(dir)); err != nil {
+		t.Fatalf("expected the app-foreign record left in place, got %v", err)
+	}
+}
+
+func TestConsentFloorForeignParkedGrantDoesNotGateEvents(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	client := newFloorTestClient(t, server.URL, t.TempDir(), nil)
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the grant acknowledged", func() bool {
+		return client.Snapshot().ConsentRecorded == 1
+	})
+
+	// A FOREIGN grant receipt (another scope sharing the dir) parks behind
+	// a retryable failure. It is unrelated to this client's actor: it must
+	// keep re-sending for its own scope, but never hold this pipeline.
+	state.setConsentOutcome(http.StatusServiceUnavailable, "3600")
+	foreign := testConsentReceipt("key-foreign-parked-1", true)
+	foreign.WorkspaceID = "workspace-other"
+	if client.consentOutbox.append(foreign) {
+		t.Fatalf("seeding the foreign receipt failed")
+	}
+	// First event leg: the pass attempts the foreign receipt (503 — an
+	// observed outcome) and parks the plane; the batch must still flow.
+	if err := client.Track(context.Background(), Event{ID: "evt-foreign-gate-1", Name: "e1"}); err != nil {
+		t.Fatalf("expected the batch to flow despite the parked foreign grant, got %v", err)
+	}
+	// Second event leg: the plane is parked, nothing is handed this cycle —
+	// the retained foreign grant alone must not arm the gate.
+	if err := client.Track(context.Background(), Event{ID: "evt-foreign-gate-2", Name: "e1"}); err != nil {
+		t.Fatalf("expected the batch to flow while the foreign grant stays parked, got %v", err)
+	}
+	if got := state.batchCount(); got != 2 {
+		t.Fatalf("expected both batches on the wire, got %d", got)
+	}
+	// The foreign receipt still delivers for its own scope once the
+	// endpoint heals.
+	state.setConsentOutcome(http.StatusOK, "")
+	clearConsentDeferral(client)
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 }

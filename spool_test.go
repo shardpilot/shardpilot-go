@@ -236,6 +236,7 @@ func spoolFileExists(dir string) bool {
 func spoolTestActorDigest() string {
 	return consentActorDigest(Config{
 		WorkspaceID:   "workspace-test",
+		AppID:         "app-test",
 		EnvironmentID: "develop",
 		AnonymousID:   "anon-spool-1",
 	})
@@ -3040,6 +3041,7 @@ func TestSpoolLoadRefusedWhenDirCannotBePrivate(t *testing.T) {
 
 	cfg := Config{
 		WorkspaceID:    "workspace-test",
+		AppID:          "app-test",
 		EnvironmentID:  "develop",
 		AnonymousID:    "anon-spool-1",
 		SpoolDir:       dir,

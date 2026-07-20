@@ -337,6 +337,23 @@ func (o *consentOutbox) tail() (consentReceipt, bool) {
 	return o.receipts[len(o.receipts)-1], true
 }
 
+// latestMatching returns the newest retained receipt satisfying match — the
+// trail tail AS SEEN BY one scope. A reused SpoolDir interleaves scopes: a
+// foreign receipt newer than this client's latest in-scope receipt must not
+// HIDE it (requiring the absolute tail to be in scope would skip the
+// override and let a stale record rule), so the reload scans newest→oldest
+// for the latest decision that actually belongs to this scope.
+func (o *consentOutbox) latestMatching(match func(consentReceipt) bool) (consentReceipt, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for i := len(o.receipts) - 1; i >= 0; i-- {
+		if match(o.receipts[i]) {
+			return o.receipts[i], true
+		}
+	}
+	return consentReceipt{}, false
+}
+
 // prune removes the head receipt by idempotency key after an
 // acknowledgement or a terminal drop, and rewrites the record. A failed
 // rewrite never blocks the rest of the trail: the mirror is already pruned,
@@ -350,6 +367,16 @@ func (o *consentOutbox) prune(idempotencyKey string) (persistFailed bool) {
 	}
 	o.receipts = append([]consentReceipt(nil), o.receipts[1:]...)
 	return o.saveLocked() != nil
+}
+
+// writeOwed reports an owed durable outbox write (a failed save not yet
+// recovered). The owed-record retry checks it before writing a GRANT
+// record: receipt-first means the granted record may not land while the
+// receipt trail's own write is still owed.
+func (o *consentOutbox) writeOwed() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.dirty
 }
 
 // retryPersist re-attempts an owed durable write. The first return reports
@@ -403,12 +430,17 @@ func (o *consentOutbox) pendingDurability() (pending, safelyOnDisk bool) {
 // releases the gate for itself the moment of handoff — dispatch, never
 // acknowledgement — even when its outcome was a retryable failure: its
 // request preceded any batch dispatched after it in this cycle, and the
-// retained copy re-arms the gate for LATER cycles instead.
-func (o *consentOutbox) grantPendingDispatch(handed map[string]struct{}) bool {
+// retained copy re-arms the gate for LATER cycles instead. Only IN-SCOPE
+// grants arm the gate (inScope — the same workspace/app/environment/actor
+// tuple as the reload's trail matching): a FOREIGN grant retained in a
+// reused SpoolDir is unrelated to whether this client's events are
+// admissible, and a parked foreign grant must not hold this pipeline — it
+// still re-sends verbatim for its own historic scope, it just doesn't gate.
+func (o *consentOutbox) grantPendingDispatch(handed map[string]struct{}, inScope func(consentReceipt) bool) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	for _, entry := range o.receipts {
-		if !entry.analyticsGranted() {
+		if !entry.analyticsGranted() || !inScope(entry) {
 			continue
 		}
 		if _, wasHanded := handed[entry.IdempotencyKey]; !wasHanded {
@@ -502,7 +534,10 @@ func (c *Client) initConsentFloor(chmod func(name string, mode os.FileMode) erro
 		// pipeline for an actor whose last decision was a denial). The
 		// tail overrides fail-closed, and the owed record write is retried
 		// here so the disagreement heals.
-		if tail, ok := c.consentOutbox.tail(); ok && c.consentReceiptInScope(tail) {
+		// The latest IN-SCOPE receipt is the proof — scanned newest→oldest,
+		// so a foreign receipt retained after it (another scope sharing the
+		// SpoolDir) can never hide this client's own latest decision.
+		if tail, ok := c.consentOutbox.latestMatching(c.consentReceiptInScope); ok {
 			tailDecision := ConsentDecisionDenied
 			tailState := ConsentDenied
 			switch {
@@ -598,6 +633,93 @@ func (c *Client) validateConsentFloorIdentity() error {
 	return nil
 }
 
+// setConsentRecordOwed records the outcome of a consent decision's durable
+// record write: persisted clears the owed slot, a failure (or a withheld
+// grant record) owes the exact decision for retry. Must be called under
+// consentRecordApplyMu, right after the write (or withhold) it describes —
+// the slot and the disk state move together. Owed state only ever exists
+// with a spool (memory-only floors have no record at all).
+func (c *Client) setConsentRecordOwed(decision ConsentDecision, persisted bool) {
+	c.consentOwedMu.Lock()
+	defer c.consentOwedMu.Unlock()
+	if persisted || c.spool == nil {
+		c.consentRecordOwed = nil
+		return
+	}
+	owed := decision
+	c.consentRecordOwed = &owed
+}
+
+// consentRecordOwedSnapshot reads the owed slot (nil when nothing is owed).
+func (c *Client) consentRecordOwedSnapshot() *ConsentDecision {
+	c.consentOwedMu.Lock()
+	defer c.consentOwedMu.Unlock()
+	return c.consentRecordOwed
+}
+
+// retryOwedConsentRecord re-applies an OWED consent-record write at a
+// dispatch point — every dispatch point is a persistence retry point for
+// the record exactly as it is for the outbox. Completion rules: a DENIAL
+// re-applies immediately (re-purge is idempotent); a GRANT completes the
+// receipt-first PAIR — it may write the granted record only once the
+// receipt trail's own durable write is no longer owed (a withheld grant
+// record landing right after the outbox retry succeeds, so an acknowledged
+// receipt can never prune away leaving no durable grant behind). The
+// record-apply lock is TRY-locked: an opportunistic retry never makes the
+// dispatch path wait out a stalled decision write — the holder settles the
+// slot itself, and the next dispatch point retries.
+func (c *Client) retryOwedConsentRecord() {
+	if !c.consentFloorEnabled() || c.spool == nil {
+		return
+	}
+	if c.consentRecordOwedSnapshot() == nil {
+		return
+	}
+	if !c.consentRecordApplyMu.TryLock() {
+		return
+	}
+	var deadLetters []SpoolDeadLetter
+	func() {
+		defer c.consentRecordApplyMu.Unlock()
+		owedPtr := c.consentRecordOwedSnapshot()
+		if owedPtr == nil {
+			return
+		}
+		owed := *owedPtr
+		if owed == ConsentDecisionGranted && c.consentOutbox.writeOwed() {
+			// Receipt-first: the grant's record stays withheld while the
+			// receipt trail itself is not durably down.
+			return
+		}
+		var persisted bool
+		deadLetters, persisted = c.applySpoolConsent(owed)
+		c.setConsentRecordOwed(owed, persisted)
+	}()
+	// Emit outside the lock: the callback is integrator code and may call
+	// back into the client (a retried denial purge is normally empty — the
+	// original purge already condemned and reported the entries).
+	c.emitSpoolDeadLetters(deadLetters)
+}
+
+// consentDenyProofHeld reports whether this receipt must stay retained
+// instead of dispatching: it is the trail's PROOF — the latest in-scope
+// receipt — of a DENIAL whose decision-record write is still owed. If it
+// delivered and pruned now, the only durable state left would be the stale
+// pre-denial record, and a crash would restore the superseded decision
+// (a stale grant reopening the pipeline for a denied actor). The pass stops
+// at the proof (serial order forbids skipping); the owed-record retry at
+// each dispatch point releases it the moment the denied record lands.
+// Grants are never held: their crash direction is fail-CLOSED, and the
+// withheld-record pair completes at the retry site instead.
+func (c *Client) consentDenyProofHeld(receipt consentReceipt) bool {
+	owedPtr := c.consentRecordOwedSnapshot()
+	if owedPtr == nil || *owedPtr == ConsentDecisionGranted {
+		return false
+	}
+	proof, ok := c.consentOutbox.latestMatching(c.consentReceiptInScope)
+	return ok && proof.IdempotencyKey == receipt.IdempotencyKey
+}
+
 // wakeConsentDispatch nudges the worker to run a consent dispatch pass
 // promptly (non-blocking; one pending nudge is enough). No-op with the
 // floor off.
@@ -671,6 +793,11 @@ func (c *Client) dispatchConsentReceipts(ctx context.Context) map[string]struct{
 		}
 		c.drainConsentOutboxEvictions()
 	}
+	// The record retry runs AFTER the outbox retry on purpose: a withheld
+	// grant record completes its receipt-first pair in the same pass the
+	// outbox write recovers — before the receipt below can dispatch, be
+	// acknowledged, and prune away the trail's only durable evidence.
+	c.retryOwedConsentRecord()
 	if !o.claimDispatch() {
 		return nil
 	}
@@ -682,6 +809,15 @@ func (c *Client) dispatchConsentReceipts(ctx context.Context) map[string]struct{
 		}
 		receipt, ok := o.head()
 		if !ok {
+			return handed
+		}
+		if c.consentDenyProofHeld(receipt) {
+			// The head is the trail's proof of a denial whose record write
+			// is still owed: it must not deliver (and prune) while the
+			// stale pre-denial record is the only other durable state — a
+			// crash after the prune would restore the superseded decision.
+			// The pass stops here (serial order forbids skipping); the
+			// owed-record retry above releases it once the record heals.
 			return handed
 		}
 		attemptCtx, cancel := contextWithDefaultTimeout(ctx, c.cfg.HTTPTimeout)
@@ -773,7 +909,7 @@ func (c *Client) grantReceiptGateArmed(handed map[string]struct{}) bool {
 	if c.consentGrantArming.Load() > 0 {
 		return true
 	}
-	return c.consentOutbox.grantPendingDispatch(handed)
+	return c.consentOutbox.grantPendingDispatch(handed, c.consentReceiptInScope)
 }
 
 func (c *Client) recordConsentOutboxPersistFailure() {
@@ -856,23 +992,22 @@ func (c *Client) recordDiscardedCloseRemnant(batch []Event) {
 // recordUnspooledCloseRemnant accounts for close-remnant events a FLOOR
 // client's spool could not make safe when the worker stopped: the write
 // gate refused them (an unpersisted grant record or an owed wipe — e.g. a
-// refused directory tighten), or their append landed only in the mirror
-// and the final persist retry still failed (e.g. disk full). Either way
-// the process exiting now loses them — neither delivered nor durable — so,
-// exactly like the memory-only discard above, they are counted Dropped and
-// folded permanently into every Close verdict (ErrEventsDiscarded): a
-// successful consent drain must not read as a clean teardown over lost
-// events. The dead-letter callback (gate refusals) still received its
-// courtesy copy. Floor-off keeps today's posture unchanged: stats and
-// dead-letters, no Close-verdict fold.
-func (c *Client) recordUnspooledCloseRemnant(mirrorAdded, gateRefused int) {
+// refused directory tighten), or they sit in the mirror with their durable
+// write STILL owed after the final persist retry (e.g. disk full) —
+// counted per event through uncountedIDs, so a remnant that merely
+// de-duplicated against an earlier dirty append is counted exactly like a
+// fresh dirty add. Either way the process exiting now loses them — neither
+// delivered nor durable — so, exactly like the memory-only discard above,
+// they are counted Dropped and folded permanently into every Close verdict
+// (ErrEventsDiscarded): a successful consent drain must not read as a
+// clean teardown over lost events. The dead-letter callback (gate
+// refusals) still received its courtesy copy. Floor-off keeps today's
+// posture unchanged: stats and dead-letters, no Close-verdict fold.
+func (c *Client) recordUnspooledCloseRemnant(gateRefused int, mirrored []string) {
 	if c.spool == nil || !c.consentFloorEnabled() {
 		return
 	}
-	lost := gateRefused
-	if mirrorAdded > 0 && c.spool.persistOwed() {
-		lost += mirrorAdded
-	}
+	lost := gateRefused + c.spool.unpersistedOf(mirrored)
 	if lost == 0 {
 		return
 	}

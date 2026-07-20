@@ -940,14 +940,28 @@ func (s *diskSpool) hasResendWork() bool {
 	return !s.owed && len(s.resend) > 0
 }
 
-// persistOwed reports whether mirror-only state is NOT safely on disk: a
-// failed record rewrite still owes its durable write (dirty), or an owed
-// wipe keeps the spool fail-closed. The close-remnant accounting asks this
-// AFTER the final settle retry, so a recovered write reads as safe.
-func (s *diskSpool) persistOwed() bool {
+// unpersistedOf counts which of the given ids are accepted into the mirror
+// but NOT safely on disk: still tracked by uncountedIDs (accepted under a
+// FAILED record write and not yet covered by a later successful one) and
+// still mirrored (an entry evicted before any successful write was already
+// reported through its capacity dead-letter). The close-remnant accounting
+// asks this AFTER the final settle retry, so a recovered write — which
+// clears uncountedIDs — reads as safe, and a remnant that merely
+// DE-DUPLICATED against an earlier dirty append counts exactly like a
+// fresh dirty add.
+func (s *diskSpool) unpersistedOf(ids []string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.dirty || s.owed
+	count := 0
+	for _, id := range ids {
+		if _, uncounted := s.uncountedIDs[id]; !uncounted {
+			continue
+		}
+		if _, mirrored := s.ids[id]; mirrored {
+			count++
+		}
+	}
+	return count
 }
 
 // retryPersist re-attempts a failed record rewrite (flush-cadence retry).
@@ -1117,18 +1131,21 @@ func (c *Client) partitionSpoolEligible(request batchRequest) (eligible, refused
 // flush caller's OWN context error (callerAbandonedFlush): the append still
 // happens — the batch is undelivered work and spooling it is crash
 // insurance, not pacing — but the persisted deadline stays untouched.
-// Returns how many events the append newly landed in the mirror and how
-// many the closed write gate refused, so the close-remnant path can tell
-// whether the remnant is actually safe (see recordUnspooledCloseRemnant).
-func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned bool) (mirrorAdded, gateRefused int) {
+// Returns how many events the closed write gate refused and the ids the
+// append left IN THE MIRROR — newly added or de-duplicated against an
+// earlier append: a duplicate of an entry accepted under a FAILED write is
+// exactly as unpersisted as a fresh add — so the close-remnant path can
+// tell whether the remnant is actually safe (see
+// recordUnspooledCloseRemnant and diskSpool.unpersistedOf).
+func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned bool) (gateRefused int, mirrored []string) {
 	s := c.spool
 	if s == nil {
-		return 0, 0
+		return 0, nil
 	}
 	eligible, refusedActors := c.partitionSpoolEligible(request)
 	c.notifySpoolDeadLetter(SpoolDropConsent, refusedActors)
 	if len(eligible) == 0 {
-		return 0, 0
+		return 0, nil
 	}
 	// An owed wipe is retried before any append; still owed refuses disk.
 	s.settleOwedWipe()
@@ -1146,7 +1163,7 @@ func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned b
 	})
 	if refused {
 		c.notifySpoolDeadLetter(SpoolDropConsent, eligible)
-		return 0, len(eligible)
+		return len(eligible), nil
 	}
 	// An envelope already past the retry-age cap when it fails never lands
 	// on disk: the retention bound is enforced at append, not just at load.
@@ -1165,7 +1182,19 @@ func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned b
 		c.recordSpoolPersistFailure()
 	}
 	c.drainSpoolCapacityDrops()
-	return len(added), 0
+	// Everything eligible that was not dropped for retry age is in the
+	// mirror now — freshly added, or a duplicate of an entry a previous
+	// append already accepted (possibly under a failed write).
+	expiredIDs := make(map[string]struct{}, len(expired))
+	for _, entry := range expired {
+		expiredIDs[entry.id] = struct{}{}
+	}
+	for _, entry := range eligible {
+		if _, dropped := expiredIDs[entry.id]; !dropped {
+			mirrored = append(mirrored, entry.id)
+		}
+	}
+	return 0, mirrored
 }
 
 // spoolAckWithVerdicts settles a delivered live batch's spooled copies from
@@ -1469,12 +1498,12 @@ func (c *Client) spoolMaintain() {
 // the retained batch (usually already spooled at its failure — the append
 // de-duplicates) plus whatever Close's flush left in the queue. Under a
 // non-grant or owed-wipe state the remnant goes to the dead-letter callback
-// instead (spoolFailedBatch's gate). Returns the append's mirror-added and
-// gate-refused counts so the floor's close accounting can tell whether the
-// remnant is actually safe (see recordUnspooledCloseRemnant).
-func (c *Client) spoolCloseRemnant(batch []Event) (mirrorAdded, gateRefused int) {
+// instead (spoolFailedBatch's gate). Returns the gate-refused count and the
+// remnant ids left in the mirror so the floor's close accounting can tell
+// whether the remnant is actually safe (see recordUnspooledCloseRemnant).
+func (c *Client) spoolCloseRemnant(batch []Event) (gateRefused int, mirrored []string) {
 	if c.spool == nil {
-		return 0, 0
+		return 0, nil
 	}
 	remnant := batch
 	for {
@@ -1487,7 +1516,7 @@ func (c *Client) spoolCloseRemnant(batch []Event) (mirrorAdded, gateRefused int)
 		break
 	}
 	if len(remnant) == 0 {
-		return 0, 0
+		return 0, nil
 	}
 	// The retained batch's prefix reuses its retained wire bytes (the append
 	// de-duplicates by event_id against bytes already spooled at the failure,
@@ -1498,7 +1527,7 @@ func (c *Client) spoolCloseRemnant(batch []Event) (mirrorAdded, gateRefused int)
 	request, _, poisoned := c.buildBatchIsolating(remnant, c.retainedRequest)
 	c.settlePoisonedEvents(poisoned)
 	if len(request.Events) == 0 {
-		return 0, 0
+		return 0, nil
 	}
 	return c.spoolFailedBatch(request, nil, false)
 }
@@ -1585,25 +1614,28 @@ func (c *Client) initSpool() []SpoolDeadLetter {
 
 // applySpoolConsent applies a SetConsent decision to the disk side: persist
 // the decision record and purge or open the spool. Called while holding the
-// consent ticket turn — NEVER lifecycleMu, which every Track/Enqueue takes:
-// this function fsyncs files, and event intake must not wait out a disk
-// stall. The ticket order keeps the disk order equal to the decision order
-// across concurrent SetConsent calls; the in-memory state was already stored
-// before this runs, so the spool's own gates (append's allowed re-check,
-// owed-wipe) see the decided state under their own lock. Returns the
-// dead-letters for the caller to emit after releasing the turn. Denial: the
-// spool is purged (a failed purge owes a wipe and fails closed) and the
+// consent ticket turn (or, for an owed-record retry, the record-apply lock
+// — see retryOwedConsentRecord) — NEVER lifecycleMu, which every
+// Track/Enqueue takes: this function fsyncs files, and event intake must
+// not wait out a disk stall. The ticket order keeps the disk order equal to
+// the decision order across concurrent SetConsent calls; the in-memory
+// state was already stored before this runs, so the spool's own gates
+// (append's allowed re-check, owed-wipe) see the decided state under their
+// own lock. Returns the dead-letters for the caller to emit after releasing
+// the turn, and whether the decision RECORD is durably persisted (true with
+// no spool at all — nothing to persist; under the consent floor a false
+// return owes the record write, retried at every dispatch point). Denial:
+// the spool is purged (a failed purge owes a wipe and fails closed) and the
 // denied record is written regardless. Grant: an owed wipe is retried FIRST
-// — while it still fails,
-// the persisted decision stays denied and the live in-memory grant applies
-// per the open posture — then the granted record is persisted, and only a
-// SUCCESSFUL persist opens spool writes (grantPersisted): a grant whose
-// record could not be written keeps disk closed, so a load on the next start
-// can always trust the record it finds.
-func (c *Client) applySpoolConsent(decision ConsentDecision) []SpoolDeadLetter {
+// — while it still fails, the persisted decision stays denied and the live
+// in-memory grant applies per the open posture — then the granted record is
+// persisted, and only a SUCCESSFUL persist opens spool writes
+// (grantPersisted): a grant whose record could not be written keeps disk
+// closed, so a load on the next start can always trust the record it finds.
+func (c *Client) applySpoolConsent(decision ConsentDecision) ([]SpoolDeadLetter, bool) {
 	s := c.spool
 	if s == nil {
-		return nil
+		return nil, true
 	}
 	if decision != ConsentDecisionGranted {
 		// Both denial flavors run the full denial path; the persisted record
@@ -1618,19 +1650,21 @@ func (c *Client) applySpoolConsent(decision ConsentDecision) []SpoolDeadLetter {
 			c.stats.setLastError("spool_purge_failed")
 			c.logf("shardpilot spool: consent purge failed; a wipe is owed and the disk spool is disabled until it succeeds: %v", err)
 		}
+		recordPersisted := true
 		if recordErr := saveConsentRecord(s.dir, decision, s.actorDigest, s.renameFn, s.chmodFn); recordErr != nil {
+			recordPersisted = false
 			c.stats.setLastError("consent_record_persist_failed")
 			c.logf("shardpilot spool: persisting the denied consent record failed (the decision still applies in memory): %v", recordErr)
 		}
 		if len(dropped) == 0 {
-			return nil
+			return nil, recordPersisted
 		}
-		return []SpoolDeadLetter{spoolDeadLetterFrom(SpoolDropConsent, dropped)}
+		return []SpoolDeadLetter{spoolDeadLetterFrom(SpoolDropConsent, dropped)}, recordPersisted
 	}
 	if !s.settleOwedWipe() {
 		c.stats.setLastError("spool_purge_failed")
 		c.logf("shardpilot spool: a spool wipe is still owed; the persisted consent decision stays denied and the disk spool stays disabled until the wipe succeeds")
-		return nil
+		return nil, false
 	}
 	if err := saveConsentRecord(s.dir, ConsentDecisionGranted, s.actorDigest, s.renameFn, s.chmodFn); err != nil {
 		s.mu.Lock()
@@ -1638,10 +1672,10 @@ func (c *Client) applySpoolConsent(decision ConsentDecision) []SpoolDeadLetter {
 		s.mu.Unlock()
 		c.stats.setLastError("consent_record_persist_failed")
 		c.logf("shardpilot spool: persisting the granted consent record failed; the live grant applies but the disk spool stays closed until a persist succeeds: %v", err)
-		return nil
+		return nil, false
 	}
 	s.mu.Lock()
 	s.grantPersisted = true
 	s.mu.Unlock()
-	return nil
+	return nil, true
 }

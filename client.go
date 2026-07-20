@@ -157,6 +157,29 @@ type Client struct {
 	// as a clean teardown.
 	closeDiscardedEvents atomic.Uint64
 
+	// consentRecordApplyMu serializes every consent-record disk write under
+	// the floor: a decision's own disk section (already serial through the
+	// ticket turn) BLOCK-locks it, while an owed-record retry at a dispatch
+	// point TRY-locks — an opportunistic retry must never make Track or the
+	// worker wait out a stalled decision write. Because the owed slot below
+	// is only mutated under this lock together with the write it describes,
+	// a retry that wins the lock always re-applies the CURRENT owed decision
+	// (never a superseded one over a newer record).
+	consentRecordApplyMu sync.Mutex
+
+	// consentOwedMu guards consentRecordOwed for cheap reads (the deny-proof
+	// dispatch hold); mutations happen under consentRecordApplyMu too.
+	consentOwedMu sync.Mutex
+
+	// consentRecordOwed is the floor decision whose durable record write is
+	// still OWED (failed, or deliberately withheld while the grant's receipt
+	// trail write is itself owed — receipt-first). Retried at every dispatch
+	// point (retryOwedConsentRecord); while a DENIAL is owed, the trail's
+	// in-scope proof receipt is held from dispatch so the only durable
+	// evidence of the denial cannot prune away before the record heals. Nil
+	// when nothing is owed; each new decision's slow half overwrites it.
+	consentRecordOwed *ConsentDecision
+
 	// initialDeferUntil seeds the flush worker's retry-pacing deadline from
 	// the spool's persisted retry_after_until_ms, so server backpressure
 	// captured before a restart still holds automatic publishes for the
@@ -696,7 +719,7 @@ func (c *Client) run() {
 			// behind — is the spool's remnant (grant-gated; no-op without a
 			// spool). A memory-only FLOOR client instead accounts the
 			// discarded remnant so Close can report the loss.
-			remnantAdded, remnantRefused := c.spoolCloseRemnant(batch)
+			remnantRefused, remnantMirrored := c.spoolCloseRemnant(batch)
 			c.recordDiscardedCloseRemnant(batch)
 			// Final settle: a record write that failed earlier (dirty mirror)
 			// gets one last retry before the worker exits, whatever shape the
@@ -709,7 +732,7 @@ func (c *Client) run() {
 			// FLOOR client's remnant that is still neither delivered nor
 			// durable is a reportable discard, exactly like the memory-only
 			// case above — Close must not read as clean over it.
-			c.recordUnspooledCloseRemnant(remnantAdded, remnantRefused)
+			c.recordUnspooledCloseRemnant(remnantRefused, remnantMirrored)
 			return
 		}
 	}

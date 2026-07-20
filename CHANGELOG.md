@@ -29,10 +29,17 @@
     the newest retained receipt (the record write was still owed when the previous
     process ended), the tail's decision governs fail-closed and the stale record is
     healed — a stale grant can never reopen the pipeline for an actor whose last
-    decision was a denial. The tail override trusts only a receipt IN SCOPE — the
-    configured workspace/app/environment tuple and the configured actor — so a foreign
-    receipt retained in a reused `SpoolDir` can neither flip this client's state nor
-    heal the record for a digest its decision never covered. The floor resolves BEFORE
+    decision was a denial. The override reads the latest IN-SCOPE receipt — scanned
+    newest→oldest for the configured workspace/app/environment tuple and the configured
+    actor — so a foreign receipt retained in a reused `SpoolDir` can neither flip this
+    client's state, nor heal the record for a digest its decision never covered, nor
+    HIDE this client's own latest decision by merely being newer. The scope digest that
+    keys `consent.json` now includes `AppID` (a reused directory across apps in one
+    workspace/environment must not let another app's record — whose receipt was
+    delivered for the other app's scope — become this app's live floor state); a record
+    written by an earlier build reads as "no usable decision" and fails closed, the
+    same treatment as any digest mismatch (this applies with the floor off too, where
+    the record gates only the next launch's spool). The floor resolves BEFORE
     any spooled events load (construction ordering), and spooled events reload only
     under a grant the RESOLVED state confirms: a stale granted record whose operative
     decision is the trail tail's denial purges the spool instead of seeding resend
@@ -54,7 +61,15 @@
     down — a crash can never leave a restored grant with an empty outbox flowing
     events receipt-less, and a failed receipt write WITHHOLDS the record (fail-closed
     across restart, healed from the trail tail once the owed write lands) — while a
-    DENIAL keeps its record (and the spool purge it condemns) first. Retryable outcomes
+    DENIAL keeps its record (and the spool purge it condemns) first. A decision-record
+    write that fails (or is withheld) is OWED and retried at every dispatch point: the
+    withheld grant record completes its receipt-first PAIR in the same pass the outbox
+    write recovers — before the receipt can deliver and prune away the trail's only
+    durable grant evidence — and while a DENIED record write is owed, the denial's
+    in-scope proof receipt is HELD from dispatch entirely, so it can never be
+    acknowledged and pruned while the stale pre-denial record would rule a restart
+    (Close still completes over the durable held proof; the relaunch restores the
+    denial from it and heals the record). Retryable outcomes
     (transport failure, `429`, any `5xx`) keep the receipt at the head and park the consent
     plane behind the server's `Retry-After` — parsed on `429` AND `5xx` — or jittered
     backoff, independent of the events plane's pacing; every other outcome is terminal and
@@ -80,8 +95,10 @@
     floor client whose close remnant was neither delivered nor made durable reports the
     loss on every `Close` (`ErrEventsDiscarded`, counted in `Stats.Dropped`) instead of
     ever reading as a clean teardown: the memory-only discard, a remnant the spool's
-    write gate refused, and a remnant whose spool persist still failed after the final
-    settle retry all fold the same way.
+    write gate refused, and a remnant still unpersisted after the final settle retry
+    all fold the same way — counted PER EVENT through the mirror's unpersisted-entry
+    tracking, so a remnant that merely de-duplicated against an earlier append whose
+    save had failed counts exactly like a fresh dirty add.
   - Grant-receipt dispatch gate: while an analytics-grant receipt is retained undispatched
     (parked, queued, or reloaded after a relaunch), event legs hold — `Track`/`Flush`
     return the new `ErrConsentReceiptPending`, intake stays open — so post-grant events
@@ -90,7 +107,9 @@
     success or a status error, never gated on its acknowledgement (a receipt the server
     answered does not hold that cycle's batch even when the answer is a retryable
     failure), while a no-response failure keeps holding — and an empty pipeline is never
-    gated, so a retained receipt alone cannot wedge teardown.
+    gated, so a retained receipt alone cannot wedge teardown. Only IN-SCOPE grants arm
+    the gate: a foreign grant parked in a reused `SpoolDir` keeps re-sending for its own
+    historic scope but never holds this client's pipeline.
   - `SetConsentDecision(ConsentDecision)` with the forced-minor denial
     (`ConsentDecisionDeniedForcedMinor`): analytics-wise identical to denied everywhere —
     same gates, same `ErrConsentDenied`, full denial path — with the receipt carrying

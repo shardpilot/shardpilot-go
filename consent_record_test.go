@@ -66,7 +66,7 @@ func TestConsentRecordRoundTrip(t *testing.T) {
 }
 
 func TestConsentActorDigestInjective(t *testing.T) {
-	base := Config{WorkspaceID: "ws", EnvironmentID: "env", UserID: "u", AnonymousID: "a"}
+	base := Config{WorkspaceID: "ws", AppID: "app", EnvironmentID: "env", UserID: "u", AnonymousID: "a"}
 	digest := consentActorDigest(base)
 	if len(digest) != 64 {
 		t.Fatalf("expected a sha256 hex digest, got %q", digest)
@@ -74,11 +74,13 @@ func TestConsentActorDigestInjective(t *testing.T) {
 	// Every tuple field participates, and shifting bytes across field
 	// boundaries changes the digest (length-prefixed hashing).
 	variants := []Config{
-		{WorkspaceID: "wsX", EnvironmentID: "env", UserID: "u", AnonymousID: "a"},
-		{WorkspaceID: "ws", EnvironmentID: "envX", UserID: "u", AnonymousID: "a"},
-		{WorkspaceID: "ws", EnvironmentID: "env", UserID: "uX", AnonymousID: "a"},
-		{WorkspaceID: "ws", EnvironmentID: "env", UserID: "u", AnonymousID: "aX"},
-		{WorkspaceID: "wse", EnvironmentID: "nv", UserID: "u", AnonymousID: "a"},
+		{WorkspaceID: "wsX", AppID: "app", EnvironmentID: "env", UserID: "u", AnonymousID: "a"},
+		{WorkspaceID: "ws", AppID: "appX", EnvironmentID: "env", UserID: "u", AnonymousID: "a"},
+		{WorkspaceID: "ws", AppID: "app", EnvironmentID: "envX", UserID: "u", AnonymousID: "a"},
+		{WorkspaceID: "ws", AppID: "app", EnvironmentID: "env", UserID: "uX", AnonymousID: "a"},
+		{WorkspaceID: "ws", AppID: "app", EnvironmentID: "env", UserID: "u", AnonymousID: "aX"},
+		{WorkspaceID: "wse", AppID: "app", EnvironmentID: "nv", UserID: "u", AnonymousID: "a"},
+		{WorkspaceID: "wsa", AppID: "pp", EnvironmentID: "env", UserID: "u", AnonymousID: "a"},
 	}
 	for _, variant := range variants {
 		if consentActorDigest(variant) == digest {
