@@ -135,6 +135,14 @@ func sanitizeConsentReceipt(entry consentReceipt) (consentReceipt, bool) {
 	if entry.AnonymousID != "" && !validConsentIdentifier(entry.AnonymousID) {
 		return consentReceipt{}, false
 	}
+	if _, err := time.Parse(time.RFC3339Nano, entry.DecidedAt); err != nil {
+		// Every SDK-minted receipt carries a parseable stamp: a malformed
+		// decided_at is corrupt data, dropped fail-safe — persisted, it
+		// could otherwise become reload truth (the tail-pick accepts an
+		// in-scope receipt unconditionally when no usable record exists,
+		// and only parses the stamp when comparing against one).
+		return consentReceipt{}, false
+	}
 	sanitized := consentReceipt{
 		IdempotencyKey:  entry.IdempotencyKey,
 		WorkspaceID:     entry.WorkspaceID,
@@ -335,6 +343,27 @@ func (o *consentOutbox) tail() (consentReceipt, bool) {
 		return consentReceipt{}, false
 	}
 	return o.receipts[len(o.receipts)-1], true
+}
+
+// maxDecidedAt returns the latest parseable decided_at among ALL retained
+// receipts ("" when none). The reload seeds the monotonic stamp floor from
+// it: new decisions must out-order every persisted stamp, and including
+// foreign receipts is harmlessly conservative (stamps merely start later).
+func (o *consentOutbox) maxDecidedAt() string {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	best := ""
+	var bestAt time.Time
+	for _, entry := range o.receipts {
+		at, err := time.Parse(time.RFC3339Nano, entry.DecidedAt)
+		if err != nil {
+			continue
+		}
+		if best == "" || at.After(bestAt) {
+			best, bestAt = entry.DecidedAt, at
+		}
+	}
+	return best
 }
 
 // latestMatching returns the newest retained receipt satisfying match — the
@@ -559,6 +588,13 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 		digest := consentActorDigest(c.cfg)
 		record, recordOK := loadConsentRecordInfo(c.cfg.SpoolDir, digest)
 		state := record.state
+		// Seed the monotonic stamp floor from PERSISTED state before any
+		// new decision can mint: a restart on a system clock running behind
+		// the persisted stamps would otherwise mint a decision OLDER than
+		// the record or a retained receipt — the strictly-newer rule would
+		// then ignore the new decision's receipt at the next reload, or let
+		// a stale unpruned grant receipt out-order a durable denial.
+		c.seedConsentStamp(record.decidedAt, c.consentOutbox.maxDecidedAt())
 		// The trail can be newer truth than the record: when the record
 		// write for the LATEST decision was still owed when the previous
 		// process ended, trusting the record would resurrect the SUPERSEDED
@@ -583,27 +619,32 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 			case tail.Reason == consentDecisionReason:
 				tailDecision, tailState = ConsentDecisionDeniedForcedMinor, ConsentDeniedForcedMinor
 			}
-			if !recordOK || state != tailState {
-				state, recordOK = tailState, true
-				// The trail-derived state is floor-proven by construction:
-				// its receipt exists. The heal carries the RECEIPT's stamp,
-				// so a later reload sees record and receipt as the same
-				// decision (no re-override churn).
-				record = consentRecordInfo{state: tailState, decidedAt: tail.DecidedAt, floor: true}
-				if err := saveConsentRecord(c.cfg.SpoolDir, tailDecision, digest, tail.DecidedAt, true, rename, chmod); err != nil {
-					c.stats.setLastError("consent_record_persist_failed")
-					c.logf("shardpilot consent floor: healing the stale decision record from the receipt trail failed (the trail-derived state still applies in memory and the write stays owed): %v", err)
-					// The failed heal is an OWED record write, registered
-					// BEFORE the worker starts: without it the proof receipt
-					// would not be held (consentDenyProofHeld) and could
-					// deliver and prune the only durable evidence of the
-					// denial — a crash after that would restore the stale
-					// pre-denial record. The retry at every dispatch point
-					// heals it exactly like a live decision's failed write.
-					c.consentRecordApplyMu.Lock()
-					c.setConsentRecordOwed(tailDecision, tail.DecidedAt, false)
-					c.consentRecordApplyMu.Unlock()
-				}
+			// Heal UNCONDITIONALLY inside this branch: the outer condition
+			// already established the record is absent or strictly OLDER
+			// than the proof, so the on-disk record is outdated even when
+			// the state string matches — a same-state rewrite is what turns
+			// an UNPROVEN (floor-off era) granted record into the proven,
+			// receipt-stamped one, or the provenance gate below would
+			// discard a grant whose durable proof is right there. The heal
+			// carries the RECEIPT's stamp, so a later reload sees record
+			// and receipt as the same decision (no re-override churn); the
+			// trail-derived state is floor-proven by construction — its
+			// receipt exists.
+			state, recordOK = tailState, true
+			record = consentRecordInfo{state: tailState, decidedAt: tail.DecidedAt, floor: true}
+			if err := saveConsentRecord(c.cfg.SpoolDir, tailDecision, digest, tail.DecidedAt, true, rename, chmod); err != nil {
+				c.stats.setLastError("consent_record_persist_failed")
+				c.logf("shardpilot consent floor: healing the stale decision record from the receipt trail failed (the trail-derived state still applies in memory and the write stays owed): %v", err)
+				// The failed heal is an OWED record write, registered
+				// BEFORE the worker starts: without it the proof receipt
+				// would not be held (consentDenyProofHeld) and could
+				// deliver and prune the only durable evidence of the
+				// denial — a crash after that would restore the stale
+				// pre-denial record. The retry at every dispatch point
+				// heals it exactly like a live decision's failed write.
+				c.consentRecordApplyMu.Lock()
+				c.setConsentRecordOwed(tailDecision, tail.DecidedAt, false)
+				c.consentRecordApplyMu.Unlock()
 			}
 		}
 		if recordOK {
@@ -1077,6 +1118,30 @@ func (c *Client) consentDecisionStamp() string {
 	return stamp
 }
 
+// seedConsentStamp advances the monotonic decision-stamp floor to at least
+// the given persisted stamps (unparseable or empty ones are ignored): after
+// a reload, consentDecisionStamp must mint strictly AFTER everything
+// already on disk, whatever the system clock says.
+func (c *Client) seedConsentStamp(stamps ...string) {
+	c.consentStampMu.Lock()
+	defer c.consentStampMu.Unlock()
+	for _, stamp := range stamps {
+		if stamp == "" {
+			continue
+		}
+		at, err := time.Parse(time.RFC3339Nano, stamp)
+		if err != nil {
+			continue
+		}
+		if c.lastConsentStamp != "" {
+			if last, lerr := time.Parse(time.RFC3339Nano, c.lastConsentStamp); lerr == nil && !at.After(last) {
+				continue
+			}
+		}
+		c.lastConsentStamp = stamp
+	}
+}
+
 // consentGrantPairIncomplete reports whether the current GRANT pair — the
 // durable receipt trail and the granted decision record — is not yet fully
 // on disk: the outbox write is owed, the granted record write is owed, or a
@@ -1210,17 +1275,29 @@ func (c *Client) finalizeConsentOutbox(ctx context.Context) error {
 		}
 		c.drainConsentOutboxEvictions()
 	}
-	if owed := c.consentRecordOwedSnapshot(); owed != nil && owed.decision == ConsentDecisionGranted {
-		// The GRANT pair is incomplete: the granted record write is still
-		// owed (the dispatch pass above retried it), so teardown must not
-		// read as clean — outbox durability alone does not cover the pair,
-		// and a receipt that had already delivered would leave NEITHER half
-		// on disk. Retryable: a repeated Close re-runs the record retry. An
-		// owed DENIAL record, by contrast, completes teardown: its held
-		// proof receipt is durably retained (or the durability check below
-		// pends), and the next launch restores the denial from the trail
-		// and heals the record.
-		return ErrConsentPending
+	if owed := c.consentRecordOwedSnapshot(); owed != nil {
+		if owed.decision == ConsentDecisionGranted {
+			// The GRANT pair is incomplete: the granted record write is
+			// still owed (the dispatch pass above retried it), so teardown
+			// must not read as clean — outbox durability alone does not
+			// cover the pair, and a receipt that had already delivered
+			// would leave NEITHER half on disk. Retryable: a repeated
+			// Close re-runs the record retry.
+			return ErrConsentPending
+		}
+		// An owed DENIAL record may complete teardown ONLY over a DURABLE
+		// proof: a held deny receipt safely on disk lets the next launch
+		// restore the denial from the trail and heal the record. Without
+		// one — the documented local-only path (no configured actor, a
+		// failed key mint) minted no receipt, or the outbox write is
+		// itself owed — nothing durable contradicts the stale pre-denial
+		// record, and a clean Close would let a restart promote it.
+		// Retryable exactly like the grant pair.
+		proof, ok := c.consentOutbox.latestMatching(c.consentReceiptInScope)
+		_, safelyOnDisk := c.consentOutbox.pendingDurability()
+		if !ok || proof.analyticsGranted() || !safelyOnDisk {
+			return ErrConsentPending
+		}
 	}
 	pending, safelyOnDisk := c.consentOutbox.pendingDurability()
 	if !pending || safelyOnDisk {

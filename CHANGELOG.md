@@ -95,9 +95,18 @@
     recorded it; the pass that recovers the writes completes the pair before the
     receipt can be acknowledged, and an owed GRANT record also pends `Close`
     (`ErrConsentPending`, retryable) so teardown never reads clean over an incomplete
-    pair. Decision stamps are MONOTONIC per client: same-tick (or backward-stepping
-    clock) decisions mint strictly increasing `decided_at` values, so the reload's
-    strictly-newer rule always sees the newest decision. Foreign receipts retained in
+    pair — and an owed DENIAL record pends `Close` too unless a durable in-scope
+    proof receipt exists (the local-only path mints none: nothing durable would
+    contradict the stale pre-denial record). Decision stamps are MONOTONIC per
+    client AND seeded at reload from the maximum persisted stamp (record and
+    retained receipts), so same-tick decisions, backward-stepping clocks, and
+    behind-clock restarts all mint strictly increasing `decided_at` values — the
+    reload's strictly-newer rule always sees the newest decision. The reload heals
+    from the proof even when the state string matches: a strictly newer in-scope
+    receipt promotes an UNPROVEN same-state grant record to the floor-marked,
+    receipt-stamped one instead of discarding a grant whose durable proof exists.
+    The sanitizer also drops receipts whose `decided_at` does not parse (corrupt
+    data must never become reload truth). Foreign receipts retained in
     a reused `SpoolDir` are never dispatched with this client's scoped bearer — a
     terminal 401/403 would prune ANOTHER scope's consent receipt — they stay retained
     for a correctly scoped client while this client's own trail dispatches around
