@@ -68,7 +68,10 @@
     disk retention later; floor-off keeps the released strict both-identifiers rule.
   - Durable consent-receipt outbox (`consent-outbox.json` under `SpoolDir`; in-memory
     without it): exactly one receipt per explicit decision — an append-only trail, a later
-    decision never withdraws an earlier receipt — 32-cap FIFO evicting oldest on save, no
+    decision never withdraws an earlier receipt — 32-cap FIFO evicting oldest on save AND
+    at load (an over-cap legacy record keeps its newest receipts, and the load-time trim
+    OWES the durable rewrite so the trimmed record lands at the first dispatch point
+    instead of re-evicting and re-counting on every restart), no
     TTL, sanitize-on-load-and-save with a bounded record read, failed-write-never-evicts
     (the write is owed and retried at every dispatch point and at `Close`), strictly serial
     decision-order delivery retried until acknowledged, re-sent VERBATIM across restarts
@@ -163,16 +166,25 @@
     explicit `Flush` in a denied session; construction is a dispatch point too (reloaded
     receipts re-send promptly, not at the first flush tick). `Close` runs the consent
     drain whatever the event-plane outcome, folding both verdicts (`errors.Join`) so a
-    terminal event error never masks the retryable `ErrConsentPending` state — and a
+    terminal event error never masks the retryable `ErrConsentPending` state; a drain
+    the CALLER's own context stopped — the join cut short, or an attempt aborted
+    mid-flight — with receipt work remaining folds the caller's context error into
+    the verdict too (on the first Close and on every retried one), so a
+    deadline-bounded Close never reports bare `ErrConsentPending` — or a clean nil
+    over durably-retained receipts — as if its delivery attempt had actually run to
+    completion — and a
     floor client whose close remnant was neither delivered nor made durable reports the
     loss on every `Close` (`ErrEventsDiscarded`, counted in `Stats.Dropped`) instead of
     ever reading as a clean teardown: the memory-only discard, a remnant the spool's
     write gate refused, a remnant still unpersisted after the final settle retry,
-    and the close phase's settled CAPACITY evictions (a remnant overflowing
+    the close phase's settled CAPACITY evictions (a remnant overflowing
     `SpoolMaxEvents`/`SpoolMaxBytes` at exit is a permanent loss with no later
     resend — unlike a mid-session eviction — while a still-DEFERRED eviction
     stays on disk and reloads, the durable-eviction-deferral rule, so it is
-    deliberately not counted) all fold the same way — counted PER EVENT through
+    deliberately not counted), remnant members past the RETRY-AGE cap (refused at
+    the close append as too old to ever resend), and remnant members that could
+    not SERIALIZE (poisoned — already counted `Dropped` at their settle, joining
+    the verdict fold only) all fold the same way — counted PER EVENT through
     the mirror's unpersisted-entry tracking, so a remnant that merely
     de-duplicated against an earlier append whose
     save had failed counts exactly like a fresh dirty add. The discard fold is

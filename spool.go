@@ -1155,21 +1155,24 @@ func (c *Client) spoolActorEligible(envelope eventEnvelope) bool {
 // flush caller's OWN context error (callerAbandonedFlush): the append still
 // happens — the batch is undelivered work and spooling it is crash
 // insurance, not pacing — but the persisted deadline stays untouched.
-// Returns how many events the closed write gate refused and the ids the
+// Returns how many events the closed write gate refused, the ids the
 // append left IN THE MIRROR — newly added or de-duplicated against an
 // earlier append: a duplicate of an entry accepted under a FAILED write is
-// exactly as unpersisted as a fresh add — so the close-remnant path can
-// tell whether the remnant is actually safe (see
-// recordUnspooledCloseRemnant and diskSpool.unpersistedOf).
-func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned bool) (gateRefused int, mirrored []string, capacityDropped int) {
+// exactly as unpersisted as a fresh add — the settled capacity evictions,
+// and the retry-age expiries the append dropped, so the close-remnant path
+// can tell whether the remnant is actually safe (see
+// recordUnspooledCloseRemnant and diskSpool.unpersistedOf; the worker's
+// mid-session calls ignore the counts — expiry and eviction are normal
+// retention outcomes there, reported through their own stats).
+func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned bool) (gateRefused int, mirrored []string, capacityDropped, expiredDropped int) {
 	s := c.spool
 	if s == nil {
-		return 0, nil, 0
+		return 0, nil, 0, 0
 	}
 	eligible, refusedActors := c.partitionSpoolEligible(request)
 	c.notifySpoolDeadLetter(SpoolDropConsent, refusedActors)
 	if len(eligible) == 0 {
-		return 0, nil, 0
+		return 0, nil, 0, 0
 	}
 	// An owed wipe is retried before any append; still owed refuses disk.
 	s.settleOwedWipe()
@@ -1187,7 +1190,7 @@ func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned b
 	})
 	if refused {
 		c.notifySpoolDeadLetter(SpoolDropConsent, eligible)
-		return len(eligible), nil, 0
+		return len(eligible), nil, 0, 0
 	}
 	// An envelope already past the retry-age cap when it fails never lands
 	// on disk: the retention bound is enforced at append, not just at load.
@@ -1218,7 +1221,7 @@ func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned b
 			mirrored = append(mirrored, entry.id)
 		}
 	}
-	return 0, mirrored, capacityDropped
+	return 0, mirrored, capacityDropped, len(expired)
 }
 
 // spoolAckWithVerdicts settles a delivered live batch's spooled copies from
@@ -1522,12 +1525,15 @@ func (c *Client) spoolMaintain() (capacityDropped int) {
 // the retained batch (usually already spooled at its failure — the append
 // de-duplicates) plus whatever Close's flush left in the queue. Under a
 // non-grant or owed-wipe state the remnant goes to the dead-letter callback
-// instead (spoolFailedBatch's gate). Returns the gate-refused count and the
-// remnant ids left in the mirror so the floor's close accounting can tell
-// whether the remnant is actually safe (see recordUnspooledCloseRemnant).
-func (c *Client) spoolCloseRemnant(batch []Event) (gateRefused int, mirrored []string, capacityDropped int) {
+// instead (spoolFailedBatch's gate). Returns the gate-refused count, the
+// remnant ids left in the mirror, the settled capacity evictions, the
+// retry-age expiries, and the members that could not serialize (poisoned —
+// already counted Dropped by settlePoisonedEvents) so the floor's close
+// accounting can fold every teardown loss (see
+// recordUnspooledCloseRemnant).
+func (c *Client) spoolCloseRemnant(batch []Event) (gateRefused int, mirrored []string, capacityDropped, expiredDropped, poisonedDropped int) {
 	if c.spool == nil {
-		return 0, nil, 0
+		return 0, nil, 0, 0, 0
 	}
 	remnant := batch
 	for {
@@ -1540,7 +1546,7 @@ func (c *Client) spoolCloseRemnant(batch []Event) (gateRefused int, mirrored []s
 		break
 	}
 	if len(remnant) == 0 {
-		return 0, nil, 0
+		return 0, nil, 0, 0, 0
 	}
 	// The retained batch's prefix reuses its retained wire bytes (the append
 	// de-duplicates by event_id against bytes already spooled at the failure,
@@ -1551,9 +1557,10 @@ func (c *Client) spoolCloseRemnant(batch []Event) (gateRefused int, mirrored []s
 	request, _, poisoned := c.buildBatchIsolating(remnant, c.retainedRequest)
 	c.settlePoisonedEvents(poisoned)
 	if len(request.Events) == 0 {
-		return 0, nil, 0
+		return 0, nil, 0, 0, len(poisoned)
 	}
-	return c.spoolFailedBatch(request, nil, false)
+	gateRefused, mirrored, capacityDropped, expiredDropped = c.spoolFailedBatch(request, nil, false)
+	return gateRefused, mirrored, capacityDropped, expiredDropped, len(poisoned)
 }
 
 // initSpool runs the construction-time spool lifecycle: settle an owed wipe

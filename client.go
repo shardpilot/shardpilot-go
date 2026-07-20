@@ -752,7 +752,7 @@ func (c *Client) run() {
 			// behind — is the spool's remnant (grant-gated; no-op without a
 			// spool). A memory-only FLOOR client instead accounts the
 			// discarded remnant so Close can report the loss.
-			remnantRefused, remnantMirrored, remnantCapacityDropped := c.spoolCloseRemnant(batch)
+			remnantRefused, remnantMirrored, remnantCapacityDropped, remnantExpired, remnantPoisoned := c.spoolCloseRemnant(batch)
 			c.recordDiscardedCloseRemnant(batch)
 			// Final settle: a record write that failed earlier (dirty mirror)
 			// gets one last retry before the worker exits, whatever shape the
@@ -765,10 +765,12 @@ func (c *Client) run() {
 			// FLOOR client's remnant that is still neither delivered nor
 			// durable is a reportable discard, exactly like the memory-only
 			// case above — Close must not read as clean over it. Capacity
-			// evictions the CLOSE phase settled count in too: an eviction
-			// landing at exit is a permanent loss with no later resend
-			// (still-deferred evictions stayed on disk and reload).
-			c.recordUnspooledCloseRemnant(remnantRefused, remnantMirrored, closeCapacityDropped)
+			// evictions the CLOSE phase settled count in too (an eviction
+			// landing at exit is a permanent loss with no later resend;
+			// still-deferred evictions stayed on disk and reload), as do the
+			// remnant's retry-age expiries and its poisoned (unserializable)
+			// members — every one an event the teardown lost.
+			c.recordUnspooledCloseRemnant(remnantRefused, remnantMirrored, closeCapacityDropped, remnantExpired, remnantPoisoned)
 			return
 		}
 	}

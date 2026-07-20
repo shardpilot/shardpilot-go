@@ -1376,29 +1376,42 @@ func TestConsentFloorSendPathEOFStaysRetryable(t *testing.T) {
 func TestConsentFloorFlushDispatchesReceiptsUnderDenial(t *testing.T) {
 	state, server := newFloorTestServer(t)
 	defer server.Close()
-	state.setConsentOutcome(http.StatusServiceUnavailable, "3600")
 
+	// Hold the serial-dispatch claim BEFORE the decisions — a deterministic
+	// in-flight pass. The worker's decision wakes lose the claim and skip,
+	// so the trail stays parked with NO attempt ever started: unlike the
+	// earlier 503-parked shape, no late-settling in-flight failure can
+	// re-arm a deferral under the flush.
 	dir := t.TempDir()
 	client := newFloorTestClient(t, server.URL, dir, nil)
+	if !client.consentOutbox.claimDispatch() {
+		t.Fatalf("test shape: claiming the dispatch lock failed")
+	}
 	client.SetConsent(true)
 	client.SetConsent(false)
 	if got := client.Consent(); got != ConsentDenied {
 		t.Fatalf("expected the denied state, got %v", got)
 	}
-
-	// Heal, drain any pending worker nudge so the EXPLICIT Flush is the
-	// dispatch point under test, and release the parked window.
-	state.setConsentOutcome(http.StatusOK, "")
-	select {
-	case <-client.consentWake:
-	default:
+	if got := state.consentCount(); got != 0 {
+		t.Fatalf("test shape: the trail must be parked before the flush, got %d posts", got)
 	}
-	clearConsentDeferral(client)
 
 	// Receipt delivery is permitted — required — while consent is denied:
 	// the flush dispatches the retained trail even though the event legs
-	// refuse, synchronously in this call.
-	if err := client.Flush(context.Background()); err != nil {
+	// refuse. It JOINS behind the held claim (observable as a dispatch
+	// waiter) and, once released, the trail is fully drained BY THE TIME
+	// the flush returns — the join guarantee.
+	flushErr := make(chan error, 1)
+	go func() {
+		flushErr <- client.Flush(context.Background())
+	}()
+	waitFor(t, 3*time.Second, "the flush parked as a dispatch waiter", func() bool {
+		client.consentOutbox.mu.Lock()
+		defer client.consentOutbox.mu.Unlock()
+		return len(client.consentOutbox.dispatchWaiters) > 0
+	})
+	client.consentOutbox.releaseDispatch()
+	if err := <-flushErr; err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
 	granted, denied := 0, 0
@@ -1409,7 +1422,7 @@ func TestConsentFloorFlushDispatchesReceiptsUnderDenial(t *testing.T) {
 			denied++
 		}
 	}
-	if granted < 1 || denied < 1 {
+	if granted != 1 || denied != 1 {
 		t.Fatalf("expected the full trail delivered through the denied flush, got %d grants %d denials", granted, denied)
 	}
 	if err := client.Track(context.Background(), Event{Name: "e1"}); !errors.Is(err, ErrConsentDenied) {
@@ -3519,5 +3532,185 @@ func TestConsentFloorCloseRemnantCapacityEvictionFoldsDiscarded(t *testing.T) {
 	// The fold is permanent: a repeated Close still reports the loss.
 	if err := client.Close(context.Background()); !errors.Is(err, ErrEventsDiscarded) {
 		t.Fatalf("expected the discard permanent on repeated Close, got %v", err)
+	}
+}
+
+func TestConsentFloorRetryableCloseSurfacesCallerBound(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+	state.setConsentOutcome(http.StatusServiceUnavailable, "3600")
+
+	// MEMORY-ONLY floor with a parked receipt: the first Close correctly
+	// declines with the retryable ErrConsentPending. A RETRIED Close whose
+	// own deadline expires mid-drain (here: waiting out a held dispatch
+	// claim) must fold the caller's context error into the verdict — bare
+	// ErrConsentPending would hide that this Close never ran its delivery
+	// attempt to completion within the caller's bound.
+	client := newFloorTestClient(t, server.URL, "", nil)
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the parked receipt counted", func() bool {
+		return client.Snapshot().ConsentFailed >= 1
+	})
+	if err := client.Close(context.Background()); !errors.Is(err, ErrConsentPending) {
+		t.Fatalf("expected the memory-only parked receipt to pend Close, got %v", err)
+	}
+
+	if !client.consentOutbox.claimDispatch() {
+		t.Fatalf("test shape: claiming the dispatch lock failed")
+	}
+	shortCtx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	err := client.Close(shortCtx)
+	cancel()
+	if !errors.Is(err, ErrConsentPending) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("expected the retried Close to carry BOTH the pending state and the caller's bound, got %v", err)
+	}
+	client.consentOutbox.releaseDispatch()
+
+	// Released, healed, deferral cleared: the next retried Close drains and
+	// completes clean.
+	state.setConsentOutcome(http.StatusOK, "")
+	clearConsentDeferral(client)
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("expected the healed retried Close to complete, got %v", err)
+	}
+	// Exactly two arrivals: the decision-time attempt the server answered
+	// 503 (an observed outcome — it reached the server), then the final
+	// Close's successful delivery of the retained receipt.
+	if got := state.consentCount(); got != 2 {
+		t.Fatalf("expected the 503-answered attempt plus the final delivery, got %d", got)
+	}
+}
+
+func TestConsentFloorPoisonedCloseRemnantFoldsDiscarded(t *testing.T) {
+	_, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// A close-remnant member that cannot serialize (poisoned Props) settles
+	// at the stop path — a teardown loss: it must fold into the Close
+	// verdict (its Dropped count already happened at the settle) instead of
+	// letting Close read nil over it.
+	dir := t.TempDir()
+	transport := &eofOnConsentTransport{}
+	client := newFloorTestClient(t, server.URL, dir, func(cfg *Config) {
+		cfg.HTTPClient = &http.Client{Transport: transport}
+	})
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the grant acknowledged", func() bool {
+		return client.Snapshot().ConsentRecorded == 1
+	})
+	transport.setFailing(true)
+	client.SetConsent(true) // parked with no observed outcome: gates the final flush
+	if err := client.Enqueue(Event{ID: "evt-poison-1", Name: "e1", Props: map[string]any{"bad": func() {}}}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Enqueue(Event{ID: "evt-poison-2", Name: "e2"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	closeErr := client.Close(context.Background())
+	if !errors.Is(closeErr, ErrEventsDiscarded) {
+		t.Fatalf("expected the poisoned remnant member folded into the Close verdict, got %v", closeErr)
+	}
+	if errors.Is(closeErr, ErrConsentPending) {
+		t.Fatalf("the parked receipt is durably on disk; only the discard may report: %v", closeErr)
+	}
+	stats := client.Snapshot()
+	if stats.Dropped == 0 {
+		t.Fatalf("expected the poisoned member counted Dropped by its settle")
+	}
+	if stats.Spooled != 1 {
+		t.Fatalf("expected the healthy remnant member durably spooled, got %d", stats.Spooled)
+	}
+}
+
+func TestConsentFloorExpiredCloseRemnantFoldsDiscarded(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// A close-remnant member already past the retry-age cap never lands on
+	// disk (the append refuses it as too old to ever resend) — at teardown
+	// that is a permanent loss, folded into the Close verdict exactly like
+	// gate refusals and capacity evictions.
+	dir := t.TempDir()
+	transport := &eofOnConsentTransport{}
+	client := newFloorTestClient(t, server.URL, dir, func(cfg *Config) {
+		cfg.HTTPClient = &http.Client{Transport: transport}
+	})
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the grant acknowledged", func() bool {
+		return client.Snapshot().ConsentRecorded == 1
+	})
+	transport.setFailing(true)
+	client.SetConsent(true) // parked with no observed outcome: gates the final flush
+	if err := client.Enqueue(Event{ID: "evt-expired-1", Name: "e1", Timestamp: time.Now().Add(-8 * 24 * time.Hour)}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Enqueue(Event{ID: "evt-fresh-1", Name: "e2"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	closeErr := client.Close(context.Background())
+	if !errors.Is(closeErr, ErrEventsDiscarded) {
+		t.Fatalf("expected the expired remnant member folded into the Close verdict, got %v", closeErr)
+	}
+	stats := client.Snapshot()
+	if stats.SpoolExpired != 1 {
+		t.Fatalf("expected exactly the one retry-age expiry, got %d", stats.SpoolExpired)
+	}
+	if stats.Dropped == 0 {
+		t.Fatalf("expected the exit-time expiry counted Dropped")
+	}
+	if stats.Spooled != 1 {
+		t.Fatalf("expected the fresh remnant member durably spooled, got %d", stats.Spooled)
+	}
+	if got := state.batchCount(); got != 0 {
+		t.Fatalf("expected the gated close to publish nothing, got %d batches", got)
+	}
+}
+
+func TestConsentOutboxOverCapLoadTrimLandsDurably(t *testing.T) {
+	// The load-time cap trim is a MEMORY change: without marking the write
+	// owed, a process that never saves before exiting leaves the over-cap
+	// file behind, and every restart re-evicts and re-counts the same
+	// entries. The trim must owe the rewrite; the owed-write machinery
+	// lands it at the first retry.
+	dir := t.TempDir()
+	over := maxConsentOutboxEntries + 8
+	record := consentOutboxWire{Version: consentOutboxRecordVersion}
+	for i := 0; i < over; i++ {
+		record.Receipts = append(record.Receipts, testConsentReceipt(fmt.Sprintf("key-trim-%02d", i), false))
+	}
+	payload, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("marshal seed record: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName), payload, 0o600); err != nil {
+		t.Fatalf("write seed record: %v", err)
+	}
+
+	outbox := newConsentOutbox(dir)
+	outbox.load(nil)
+	if got := outbox.takeEvicted(); got != 8 {
+		t.Fatalf("expected the 8 load-time evictions counted, got %d", got)
+	}
+	if !outbox.writeOwed() {
+		t.Fatalf("expected the load-time trim to OWE the durable rewrite")
+	}
+	if attempted, failed := outbox.retryPersist(); !attempted || failed {
+		t.Fatalf("expected the owed rewrite attempted and landed, got (%v, %v)", attempted, failed)
+	}
+	if got := len(outbox.readRecordReceipts()); got != maxConsentOutboxEntries {
+		t.Fatalf("expected the trimmed record durable on disk, got %d entries", got)
+	}
+
+	// A restart sees a within-cap record: no re-eviction, no re-count, no
+	// owed write.
+	reloaded := newConsentOutbox(dir)
+	reloaded.load(nil)
+	if got := reloaded.takeEvicted(); got != 0 {
+		t.Fatalf("expected no re-eviction after the durable trim, got %d", got)
+	}
+	if reloaded.writeOwed() {
+		t.Fatalf("expected no owed write on a within-cap record")
 	}
 }

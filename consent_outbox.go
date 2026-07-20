@@ -351,6 +351,18 @@ func (o *consentOutbox) load(own func(consentReceipt) bool) {
 	}
 	o.receipts = loaded
 	o.evictedSinceSave += evicted
+	if evicted > 0 {
+		// The trim only happened in MEMORY: left there, a process that never
+		// saves before exiting leaves the over-cap file behind, and every
+		// restart re-evicts and re-counts the same entries. Marking the
+		// write OWED is enough — the owed-write machinery (retryPersist at
+		// every dispatch point, the construction wake below, Close's retry)
+		// lands the trimmed record durably, and the failed-write posture is
+		// preserved: nothing more is evicted if the rewrite fails, the
+		// mirror stays authoritative, and the settled trim keys keep the
+		// merge from re-adopting the evicted entries meanwhile.
+		o.dirty = true
+	}
 	o.mu.Unlock()
 }
 
@@ -1614,24 +1626,35 @@ func (c *Client) recordDiscardedCloseRemnant(batch []Event) {
 // entries they displaced — landed durably gone; an eviction at exit has no
 // later resend, unlike a mid-session one whose loss the caps always
 // implied, while a still-DEFERRED eviction stays on disk and reloads, so
-// it is deliberately NOT counted). Either way the process exiting now
-// loses them — neither delivered nor durable — so, exactly like the
+// it is deliberately NOT counted). Remnant members past the RETRY-AGE cap
+// (expiredDropped — the append refused them as too old to ever resend) and
+// members that could not SERIALIZE (poisonedDropped — settled and already
+// counted Dropped by settlePoisonedEvents, so they join the verdict fold
+// only) are teardown losses the same way. Either way the process exiting
+// now loses them — neither delivered nor durable — so, exactly like the
 // memory-only discard above, they are counted Dropped and folded
 // permanently into every Close verdict (ErrEventsDiscarded): a successful
 // consent drain must not read as a clean teardown over lost events. The
-// dead-letter callback (gate refusals, capacity drops) still received its
-// courtesy copy. Floor-off keeps today's posture unchanged: stats and
-// dead-letters, no Close-verdict fold.
-func (c *Client) recordUnspooledCloseRemnant(gateRefused int, mirrored []string, capacityDropped int) {
+// dead-letter callback (gate refusals, capacity drops, expiries, poisoned
+// members) still received its courtesy copy. Floor-off keeps today's
+// posture unchanged: stats and dead-letters, no Close-verdict fold.
+func (c *Client) recordUnspooledCloseRemnant(gateRefused int, mirrored []string, capacityDropped, expiredDropped, poisonedDropped int) {
 	if c.spool == nil || !c.consentFloorEnabled() {
 		return
 	}
-	lost := gateRefused + capacityDropped + c.spool.unpersistedOf(mirrored)
-	if lost == 0 {
+	// Gate refusals, close-phase capacity evictions, retry-age expiries, and
+	// still-unpersisted mirror entries count Dropped here; the remnant's
+	// POISONED members were already counted Dropped by settlePoisonedEvents
+	// and only join the close-verdict fold — a teardown loss either way.
+	lost := gateRefused + capacityDropped + expiredDropped + c.spool.unpersistedOf(mirrored)
+	discarded := lost + poisonedDropped
+	if discarded == 0 {
 		return
 	}
-	c.stats.dropped.Add(uint64(lost))
-	c.closeDiscardedEvents.Add(uint64(lost))
+	if lost > 0 {
+		c.stats.dropped.Add(uint64(lost))
+	}
+	c.closeDiscardedEvents.Add(uint64(discarded))
 }
 
 // closeDiscardVerdict folds the permanent discarded-events record into a
@@ -1663,13 +1686,33 @@ func (c *Client) finalizeConsentOutbox(ctx context.Context) error {
 	// Close's drain JOINS behind any in-flight pass (bounded by the Close
 	// context) so the final delivery attempt actually runs instead of
 	// skipping; the durability verdict below stays safe either way.
-	c.dispatchConsentReceipts(ctx, true)
+	_, drained := c.dispatchConsentReceipts(ctx, true)
 	if attempted, failed := c.consentOutbox.retryPersist(); attempted {
 		if failed {
 			c.recordConsentOutboxPersistFailure()
 		}
 		c.drainConsentOutboxEvictions()
 	}
+	verdict := c.consentOutboxCloseVerdict()
+	if !drained && (verdict != nil || c.consentOutbox.pending()) {
+		// The caller's OWN context stopped the drain — the join was cut
+		// short, or an attempt aborted mid-flight — while receipt work
+		// remains. The verdict alone (ErrConsentPending, or even nil over
+		// durably-retained receipts) would hide that this Close never ran
+		// its delivery attempt to completion within the caller's bound, so
+		// the caller's error folds in; errors.Is(·, ErrConsentPending)
+		// still drives the retryable-close branch when the pending state
+		// holds. A cut drain with NOTHING left (the joined pass delivered
+		// everything) folds nothing — no work was skipped.
+		verdict = errors.Join(verdict, contextCause(ctx))
+	}
+	return verdict
+}
+
+// consentOutboxCloseVerdict computes Close's consent durability verdict —
+// teardown completes only when nothing undelivered remains OR every retained
+// receipt is safely on disk with no owed mint or record write.
+func (c *Client) consentOutboxCloseVerdict() error {
 	if c.consentMintOwedSnapshot() != nil {
 		// A decision's receipt is still OWED to a failed mint (the dispatch
 		// pass above retried it): the receipt is neither delivered nor
