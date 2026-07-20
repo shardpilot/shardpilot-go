@@ -57,7 +57,10 @@
     any spooled events load (construction ordering), and spooled events reload only
     under a grant the RESOLVED state confirms: a stale granted record whose operative
     decision is the trail tail's denial purges the spool instead of seeding resend
-    work that would transmit pre-denial events. The floor covers the CONFIGURED
+    work that would transmit pre-denial events — while a grant the trail proof
+    RESOLVED whose record heal FAILED preserves and loads the spool (never purged
+    and dead-lettered on the stale record read alone), with the write gate closed
+    until the owed record write lands. The floor covers the CONFIGURED
     identity: an event whose per-event `UserID`/`AnonymousID` override resolves to a
     different effective actor is refused at intake with the new
     `ErrConsentActorMismatch` (that actor has no local decision and no receipt;
@@ -106,7 +109,12 @@
     landed — the retained grant stays held instead of delivering and pruning
     while the deny proof is held (a grant must never become the server's last
     word against a local denial), and a successful record write (always the
-    newest decision's) releases the whole trail in order. A failed
+    newest decision's) releases the whole trail in order. The rule GENERALIZES
+    across the stale-grant family: an in-scope grant never dispatches past a
+    PARKED newer in-scope denial, whatever parked it — the per-receipt owed
+    mark, the owed mint (the receipt not yet in the trail), or the held deny
+    proof — while a newer denial with no holds needs no park: the same serial
+    pass delivers grant then denial in decision order. A failed
     idempotency-key MINT for a CONFIGURED actor is never the local-only path:
     the receipt is OWED — re-minted at every dispatch point with the original
     decision's stamp — a mint-failed GRANT withholds its record and holds the
@@ -203,7 +211,11 @@
     save had failed counts exactly like a fresh dirty add. The discard fold is
     re-applied (idempotently) on every cached-`Close` return: a `Close` whose context
     expired before the worker's stop path finished counting cannot hide a loss
-    counted after its verdict was cached.
+    counted after its verdict was cached — and a RETRIED `Close` (after an
+    earlier one timed out pre-workerDone with consent pending) waits for the
+    worker's stop path, bounded by its own context, before it can return nil:
+    the caller never exits on a clean retried verdict while the close remnant
+    is still being spooled or counted.
   - Grant-receipt dispatch gate: while an analytics-grant receipt is retained undispatched
     (parked, queued, or reloaded after a relaunch), event legs hold — `Track`/`Flush`
     return the new `ErrConsentReceiptPending`, intake stays open — so post-grant events

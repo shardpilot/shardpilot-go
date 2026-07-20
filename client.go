@@ -489,17 +489,32 @@ func (c *Client) finishClose(ctx context.Context) error {
 		// The previous Close left consent receipts pending (undeliverable
 		// AND not durably on disk): completion was declined so the process
 		// would not silently lose them, and Close stays RETRYABLE — this
-		// call re-runs the consent drain alone (the worker and sender are
-		// already stopped; the drain dispatches directly on this goroutine)
-		// and the verdict replaces the stored one. A discarded gated-flush
-		// remnant stays folded into the fresh verdict too: a successful
-		// receipt drain must not retroactively report a clean teardown over
-		// events that were already lost.
+		// call re-runs the consent drain (dispatching directly on this
+		// goroutine) and the verdict replaces the stored one. A discarded
+		// gated-flush remnant stays folded into the fresh verdict too: a
+		// successful receipt drain must not retroactively report a clean
+		// teardown over events that were already lost.
 		c.closeInFlight = true
 		done := make(chan struct{})
 		c.closeDone = done
 		c.closeMu.Unlock()
-		err := c.closeDiscardVerdict(c.finalizeConsentOutbox(ctx))
+		err := c.finalizeConsentOutbox(ctx)
+		// The WORKER may still be running: the earlier Close can have timed
+		// out before workerDone, with the stop path — the one that spools
+		// and counts the close remnant — not yet finished (or not even
+		// started, the worker stuck mid-operation). A nil from this retry
+		// without waiting would let the caller exit over a remnant that is
+		// neither delivered nor durable, uncounted. Wait it out bounded by
+		// THIS caller's context, folding the bound in when it cuts the wait;
+		// the discard verdict below then sees everything the finished stop
+		// path counted (and the idempotent re-fold on cached returns catches
+		// any straggler, the round-established posture).
+		select {
+		case <-c.workerDone:
+		case <-contextDone(ctx):
+			err = errors.Join(err, contextCause(ctx))
+		}
+		err = c.closeDiscardVerdict(err)
 		c.closeMu.Lock()
 		c.closeErr = err
 		c.closeInFlight = false

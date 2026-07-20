@@ -3904,3 +3904,209 @@ func TestConsentOutboxSanitizerRejectsInvalidReason(t *testing.T) {
 		t.Fatalf("expected the reasonless denial kept")
 	}
 }
+
+func TestConsentFloorGrantHeldBehindParkedNewerDenial(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// Third variant of the stale-grant family: the retained grant's OWN
+	// pair is complete (receipt durable, record persisted), and the newer
+	// denial is minted and durably appended but HELD — its record write
+	// owed, the deny proof parked pending the heal. The grant must not
+	// dispatch and prune past it: the server's last word would be granted
+	// against the local denial for as long as the heal keeps failing.
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	if !client.consentOutbox.claimDispatch() {
+		t.Fatalf("test shape: claiming the dispatch lock failed")
+	}
+	client.SetConsent(true) // pair completes cleanly; receipt retained (claim held)
+	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentGranted {
+		t.Fatalf("test shape: expected the granted record persisted, got (%v, %v)", recorded, ok)
+	}
+	recordErr := errors.New("disk full")
+	var failing atomic.Bool
+	failing.Store(true)
+	client.spool.renameFn = func(oldpath, newpath string) error {
+		if failing.Load() && strings.Contains(newpath, consentRecordFileName) {
+			return recordErr
+		}
+		return os.Rename(oldpath, newpath)
+	}
+	client.SetConsent(false) // denied record write fails: deny receipt durable but HELD
+	client.consentOutbox.releaseDispatch()
+
+	_ = client.Flush(context.Background()) // a full dispatch pass; NOTHING may deliver
+	if got := state.consentCount(); got != 0 {
+		t.Fatalf("expected the grant HELD behind the parked newer denial, got %d consent posts", got)
+	}
+
+	// The record heals: the same pass lands the denied record, releases the
+	// trail, and delivers grant-then-denial in decision order.
+	failing.Store(false)
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush after the heal: %v", err)
+	}
+	waitFor(t, 3*time.Second, "the trail delivered in order", func() bool {
+		return state.consentCount() == 2
+	})
+	if !consentBoolCategory(t, state.consentAt(0)) || consentBoolCategory(t, state.consentAt(1)) {
+		t.Fatalf("expected grant-then-denial in decision order, got %v then %v", state.consentAt(0), state.consentAt(1))
+	}
+	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentDenied {
+		t.Fatalf("expected the healed denied record, got (%v, %v)", recorded, ok)
+	}
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestConsentFloorFailedHealPreservesResolvedGrantSpool(t *testing.T) {
+	// A grant-tail reload whose consent.json heal FAILED: the live state
+	// resolves GRANTED from the durable proof while the on-disk record
+	// still reads absent (here: a corrupt-stamped grant). The spool
+	// decision must consult the RESOLVED truth — keep and load spool.json,
+	// gated (grantPersisted stays false until the owed heal lands) — never
+	// purge and dead-letter events the resolved grant plainly covers.
+	dir := t.TempDir()
+	payload := []byte(fmt.Sprintf(`{"consent_analytics":"granted","actor_digest":%q,"decided_at":"not-a-time","floor":true}`, spoolTestActorDigest()))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(consentRecordPath(dir), payload, 0o600); err != nil {
+		t.Fatalf("write corrupt record: %v", err)
+	}
+	planted := newConsentOutbox(dir)
+	if planted.append(testConsentReceipt("key-heal-grant-1", true)) {
+		t.Fatalf("seeding the grant proof failed")
+	}
+	writeSpoolRecordFile(t, dir, 0, spoolTestEnvelope(t, "evt-preserve-1", time.Now()))
+
+	cfg := Config{
+		WorkspaceID:    "workspace-test",
+		AppID:          "app-test",
+		EnvironmentID:  "develop",
+		AnonymousID:    "anon-spool-1",
+		SpoolDir:       dir,
+		SpoolMaxEvents: 100,
+		SpoolMaxBytes:  1 << 20,
+		ConsentFloor:   &ConsentFloorConfig{},
+	}
+	client := &Client{cfg: cfg, clock: realClock{}}
+	client.initConsentFloor(func(oldpath, newpath string) error {
+		if strings.Contains(newpath, consentRecordFileName) {
+			return errors.New("disk full")
+		}
+		return os.Rename(oldpath, newpath)
+	}, os.Chmod)
+	if got := client.Consent(); got != ConsentGranted {
+		t.Fatalf("test shape: expected the proof-resolved grant, got %v", got)
+	}
+	if owed := client.consentRecordOwedSnapshot(); owed == nil || owed.decision != ConsentDecisionGranted {
+		t.Fatalf("test shape: expected the failed heal owed, got %+v", owed)
+	}
+
+	client.spool = newDiskSpool(cfg)
+	letters := client.initSpool()
+	if len(letters) != 0 {
+		t.Fatalf("expected NO dead-letters for a spool the resolved grant covers, got %v", letters)
+	}
+	if _, err := os.Stat(filepath.Join(dir, spoolFileName)); err != nil {
+		t.Fatalf("expected spool.json preserved under the resolved grant, got %v", err)
+	}
+	client.spool.mu.Lock()
+	loaded := len(client.spool.entries)
+	gateOpen := client.spool.grantPersisted
+	client.spool.mu.Unlock()
+	if loaded != 1 {
+		t.Fatalf("expected the spooled event loaded for resend, got %d entries", loaded)
+	}
+	if gateOpen {
+		t.Fatalf("expected the write gate CLOSED while the heal is owed (grantPersisted false)")
+	}
+}
+
+func TestConsentFloorRetriedCloseWaitsForWorkerStop(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// An earlier Close that timed out BEFORE workerDone leaves the worker's
+	// stop path unfinished; the retried Close (taken because consent was
+	// pending) must not return nil without waiting for it — the caller
+	// would exit before the close remnant is spooled or counted.
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	if !client.consentOutbox.claimDispatch() {
+		t.Fatalf("test shape: claiming the dispatch lock failed")
+	}
+	client.SetConsent(true) // pair completes; receipt retained under the held claim
+	outboxErr := errors.New("disk full")
+	var outboxFailing atomic.Bool
+	client.consentOutbox.mu.Lock()
+	client.consentOutbox.renameFn = func(oldpath, newpath string) error {
+		if outboxFailing.Load() {
+			return outboxErr
+		}
+		return os.Rename(oldpath, newpath)
+	}
+	client.consentOutbox.mu.Unlock()
+	outboxFailing.Store(true)
+	client.consentOutbox.releaseDispatch()
+	// The delivery acks but the prune REWRITE fails: consent stays pending
+	// (dirty outbox, nothing retained) while the spool write gate is OPEN
+	// (the granted record persisted cleanly).
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if got := client.Snapshot().ConsentRecorded; got != 1 {
+		t.Fatalf("test shape: expected the grant delivered, got %d", got)
+	}
+	if !client.consentOutbox.writeOwed() {
+		t.Fatalf("test shape: expected the prune rewrite owed")
+	}
+
+	// Stall the worker's NEXT spool.json write (the 503-failed batch's
+	// crash-insurance append) so Close #1 times out with the worker stuck.
+	stallRelease := make(chan struct{})
+	var stallOnce sync.Once
+	client.spool.renameFn = func(oldpath, newpath string) error {
+		if strings.Contains(newpath, spoolFileName) {
+			stallOnce.Do(func() { <-stallRelease })
+		}
+		return os.Rename(oldpath, newpath)
+	}
+	state.setBatchOutcome(http.StatusServiceUnavailable)
+	if err := client.Enqueue(Event{ID: "evt-retry-close-1", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	shortCtx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	err := client.Close(shortCtx)
+	cancel()
+	if !errors.Is(err, ErrConsentPending) {
+		t.Fatalf("test shape: expected the first Close pending on the owed outbox write, got %v", err)
+	}
+
+	// The outbox heals, but the WORKER is still stalled mid-write: the
+	// retried Close settles the consent plane yet must NOT return nil —
+	// bounded by its own context, it reports the bound instead of letting
+	// the caller exit over an unspooled remnant.
+	outboxFailing.Store(false)
+	retryCtx, cancelRetry := context.WithTimeout(context.Background(), 2*time.Second)
+	retryErr := client.Close(retryCtx)
+	cancelRetry()
+	if retryErr == nil {
+		t.Fatalf("expected the retried Close to wait for the worker stop path, got nil with the remnant unspooled")
+	}
+
+	// Release the stall: the worker finishes, and the remnant lands
+	// durably.
+	close(stallRelease)
+	waitFor(t, 3*time.Second, "the remnant spooled durably", func() bool {
+		return client.Snapshot().Spooled == 1
+	})
+	data, err := os.ReadFile(filepath.Join(dir, spoolFileName))
+	if err != nil || !strings.Contains(string(data), "evt-retry-close-1") {
+		t.Fatalf("expected the remnant event durable in spool.json, got (%v, %q)", err, string(data))
+	}
+}

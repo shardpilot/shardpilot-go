@@ -1575,7 +1575,20 @@ func (c *Client) initSpool() []SpoolDeadLetter {
 		c.logf("shardpilot spool: a spool wipe is still owed from a previous run; disk spool disabled until it succeeds")
 		return nil
 	}
-	if state, ok := loadConsentRecord(s.dir, s.actorDigest); ok && state == ConsentGranted {
+	// The RESOLVED floor truth governs the spool decision, never
+	// consent.json alone: a grant-tail reload whose record HEAL failed
+	// leaves the live state granted — durable in-scope proof retained, the
+	// heal registered as an owed record write — while the on-disk record is
+	// still stale or absent. Purging on the record read alone would
+	// dead-letter a spool the resolved grant plainly covers. So the load
+	// path admits a durably-recorded grant OR a floor-RESOLVED grant;
+	// grantPersisted (the write gate) opens only when the RECORD itself is
+	// durably the grant — under an owed heal it stays closed until the
+	// retried write lands (applySpoolConsent's success path reopens it).
+	recordState, recordOK := loadConsentRecord(s.dir, s.actorDigest)
+	recordIsGrant := recordOK && recordState == ConsentGranted
+	floorResolvedGrant := c.consentFloorEnabled() && c.consent.Load() == consentStateGranted
+	if recordIsGrant || floorResolvedGrant {
 		// The persisted record may be trusted — loaded, resend-seeded,
 		// rewritten — only through a directory whose privacy is established.
 		// An existing SpoolDir that cannot be tightened to 0700 fails the
@@ -1601,17 +1614,19 @@ func (c *Client) initSpool() []SpoolDeadLetter {
 		// operative denial (or transmit at all in a session that must stay
 		// dark). The unconfirmed spool falls through to the purge below,
 		// condemned exactly like a persisted denial.
-		if !c.consentFloorEnabled() || c.consent.Load() == consentStateGranted {
-			if c.consentFloorEnabled() {
+		if !c.consentFloorEnabled() || floorResolvedGrant {
+			if c.consentFloorEnabled() && recordIsGrant {
 				// The floor confirmed the persisted grant as the LIVE state,
 				// and the record on disk IS that persisted grant: the spool
 				// write gate reopens now. Without this, every restart would
 				// refuse retriable-failure appends and close remnants
 				// (grantPersisted false) until a fresh SetConsent(true) —
 				// dead-lettering events the reloaded grant plainly covers.
-				// Floor-off keeps the documented posture: live state is
-				// memory-only, the host re-applies SetConsent at startup and
-				// the gate opens there.
+				// Under a FAILED heal (resolved grant, record still stale or
+				// absent) the gate stays closed instead: writes reopen the
+				// moment the owed record write lands. Floor-off keeps the
+				// documented posture: live state is memory-only, the host
+				// re-applies SetConsent at startup and the gate opens there.
 				s.mu.Lock()
 				s.grantPersisted = true
 				s.mu.Unlock()

@@ -636,6 +636,14 @@ func (o *consentOutbox) recordOwedFor(idempotencyKey string) bool {
 	return owed
 }
 
+// snapshot copies the retained trail in order (for read-only walks that
+// combine per-receipt state with client-level holds without holding mu).
+func (o *consentOutbox) snapshot() []consentReceipt {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return append([]consentReceipt(nil), o.receipts...)
+}
+
 // nextDispatchable returns the oldest retained receipt IN SCOPE — the one
 // this client's dispatch may put on the wire. Foreign receipts (a reused
 // SpoolDir interleaves scopes) are SKIPPED, never dispatched: this client's
@@ -1192,6 +1200,37 @@ func (c *Client) retryOwedConsentMint() {
 	c.wakeConsentDispatch()
 }
 
+// newerInScopeDenialHeld reports whether an in-scope DENIAL receipt NEWER
+// than the given grant (later in the trail — trail order is decision order
+// per scope) is retained AND itself held from dispatch: its own
+// decision-record write is owed (the per-receipt mark), or it is the held
+// deny proof (consentDenyProofHeld). Delivering the earlier grant and
+// pruning it while such a denial is parked would make the grant the
+// server's LAST word for as long as the denial's record write keeps
+// failing — and a crash meanwhile leaves it that way against the local
+// denial. The generalized rule across the stale-grant family: an in-scope
+// grant never dispatches past a parked newer in-scope denial, whatever
+// parked it — the slot-overwrite mark, the owed mint (checked separately:
+// that receipt is not in the trail yet), or the held proof. A newer denial
+// with NO holds needs no park: the same serial pass delivers the grant and
+// then the denial, in order.
+func (c *Client) newerInScopeDenialHeld(grant consentReceipt) bool {
+	seenGrant := false
+	for _, entry := range c.consentOutbox.snapshot() {
+		if entry.IdempotencyKey == grant.IdempotencyKey {
+			seenGrant = true
+			continue
+		}
+		if !seenGrant || entry.analyticsGranted() || !c.consentReceiptInScope(entry) {
+			continue
+		}
+		if c.consentOutbox.recordOwedFor(entry.IdempotencyKey) || c.consentDenyProofHeld(entry) {
+			return true
+		}
+	}
+	return false
+}
+
 // consentDenyProofHeld reports whether this receipt must stay retained
 // instead of dispatching: it is the trail's PROOF — the latest in-scope
 // receipt — of a DENIAL whose decision-record write is still owed. If it
@@ -1342,6 +1381,16 @@ func (c *Client) dispatchConsentReceipts(ctx context.Context, join bool) (map[st
 			// even exist to follow it). Earlier GRANTS park until the owed
 			// denial mints; earlier denials may still deliver — same state as
 			// the operative decision, the fail-safe direction.
+			return handed, true
+		}
+		if receipt.analyticsGranted() && c.newerInScopeDenialHeld(receipt) {
+			// The same rule for a denial that IS in the trail, minted and
+			// durably appended, but itself HELD (its record write owed, or
+			// the held deny proof): the earlier grant must not deliver and
+			// prune while the newer denial is parked — the server's last
+			// word would be granted against the local denial until (unless)
+			// the denial's record heals. The pass stops; the heal that
+			// releases the denial releases the whole trail in order.
 			return handed, true
 		}
 		if c.consentDenyProofHeld(receipt) {
