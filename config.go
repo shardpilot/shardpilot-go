@@ -102,6 +102,34 @@ type Config struct {
 	// it never enables consent persistence or the disk spool.
 	RemoteConfigCachePath string
 
+	// ExperimentsEnabled opts this client into the experiment-assignment
+	// consumer (ADR-0259): the assignment fetch, the cached-variant
+	// getters, periodic revalidation, and the exposure/outcome fact
+	// producers. Default false — DARK: while off, zero experiment code
+	// paths execute (no subject-id mint, no fetch, no revalidation
+	// goroutine, no fact emission, no new persistence keys and no reads of
+	// previously persisted ones), and the public experiment surface
+	// refuses ErrExperimentsNotConfigured.
+	//
+	// The assignment endpoint lives on the same control-plane host as the
+	// remote-config fetch and authenticates with the same publishable
+	// APIKey, so the flag requires RemoteConfigURL (which in turn requires
+	// APIKey). With SpoolDir set, the consumer persists its subject id and
+	// its assignment cache there (files 0600); without it both are
+	// in-memory only — a restart re-buckets the subject, documented
+	// ephemeral.
+	//
+	// Dark-phase note: the platform's experimentation flags are OFF in
+	// every environment today, so an enabled consumer receives 403 on
+	// every fetch until platform enablement — the expected fail-closed
+	// posture. Until the control-plane auth leg grants publishable keys
+	// the experiment-assignment read scope, only an explicitly scoped
+	// runtime token authenticates (401 otherwise). The exposure/outcome
+	// lane is additionally dark END-TO-END: the analytics service rejects
+	// these event names from publishable client keys until the platform's
+	// producer-lane decision lands.
+	ExperimentsEnabled bool
+
 	// SpoolDir, when set, is the opt-in state directory for the bounded disk
 	// spool and the persisted consent decision (`spool.json`, `consent.json`,
 	// and the `spool-wipe-owed` marker; directory 0700, files 0600). Empty —
@@ -292,6 +320,16 @@ func normalizeConfig(cfg Config) (Config, error) {
 			return Config{}, err
 		}
 		cfg.RemoteConfigURL = normalizedRC
+	}
+
+	if cfg.ExperimentsEnabled && cfg.RemoteConfigURL == "" {
+		// The assignment endpoint is the control-plane host the
+		// remote-config fetch already points at (path-swapped), and it
+		// authenticates with the same publishable APIKey the
+		// RemoteConfigURL branch above already required: enabling
+		// experiments without that base could never produce a working
+		// fetch.
+		return Config{}, fmt.Errorf("%w: experiments require RemoteConfigURL (the assignment endpoint shares the control-plane host)", ErrInvalidConfig)
 	}
 
 	if cfg.SpoolDir != "" {

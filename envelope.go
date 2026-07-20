@@ -61,6 +61,15 @@ type eventEnvelope struct {
 	AppBuild        string         `json:"app_build,omitempty"`
 	Context         map[string]any `json:"context,omitempty"`
 	Props           map[string]any `json:"props,omitempty"`
+
+	// internalIdentityFact marks an envelope the SDK built for one of its
+	// OWN experiment facts: user_id omitted BY WIRE CONTRACT (never an
+	// actor override) with the CONFIGURED client identity as anonymous_id.
+	// Unexported and never serialized — the wire bytes and spool records
+	// are unchanged; it exists so the disk spool's actor-eligibility check
+	// reaches the same verdict intake did for these envelopes (see
+	// spoolActorEligible).
+	internalIdentityFact bool
 }
 
 func (c *Client) buildEnvelope(event Event) (eventEnvelope, error) {
@@ -89,13 +98,25 @@ func (c *Client) buildEnvelope(event Event) (eventEnvelope, error) {
 	appVersion := firstNonEmpty(event.AppVersion, c.cfg.AppVersion)
 	appBuild := firstNonEmpty(event.AppBuild, c.cfg.AppBuild)
 	userID := firstNonEmpty(event.UserID, c.cfg.UserID)
+	if event.omitUserID {
+		// SDK-internal experiment facts: the ingest contract rejects these
+		// event names when user_id carries ANY value, so the configured
+		// default must not be stamped in.
+		userID = ""
+	}
 	anonymousID := firstNonEmpty(event.AnonymousID, c.cfg.AnonymousID)
+	source := c.cfg.Source
+	if event.sourceOverride != "" {
+		// SDK-internal experiment facts: admitted with source "client"
+		// only.
+		source = event.sourceOverride
+	}
 
 	return eventEnvelope{
 		EventID:         id,
 		SchemaVersion:   1,
 		EventName:       name,
-		Source:          c.cfg.Source,
+		Source:          source,
 		EventTS:         timestamp.UTC().Format(time.RFC3339Nano),
 		WorkspaceID:     c.cfg.WorkspaceID,
 		AppID:           c.cfg.AppID,
@@ -109,6 +130,8 @@ func (c *Client) buildEnvelope(event Event) (eventEnvelope, error) {
 		AppBuild:        appBuild,
 		Context:         cloneMap(event.Context),
 		Props:           props,
+
+		internalIdentityFact: event.omitUserID,
 	}, nil
 }
 

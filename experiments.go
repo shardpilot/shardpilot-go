@@ -1,0 +1,1982 @@
+package shardpilot
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/shardpilot/shardpilot-go/internal/uuidv7"
+)
+
+// Experiment-assignment consumer (ADR-0259 SDK leg): GETs the server-evaluated
+// assignment for one (app, environment, experiment, subject) tuple from the
+// control-plane assignment endpoint and serves the assigned variant to the
+// host, with a durable last-known-good cache, periodic revalidation (the
+// SDK-side kill-switch reach), and an exposure-fact lane riding the normal
+// analytics pipeline. Deliberately separate from remote_config.go (a
+// different endpoint with different fail-closed rules) but mirroring its
+// transport discipline: publishable-key bearer auth, injective escaping,
+// scope-stamped cache with corrupt = miss, per-key sequence fencing for
+// out-of-order responses, and the shared redirect-refusing bounded-read GET.
+//
+// DARK BY DEFAULT. This machinery is constructed only when the config sets
+// `ExperimentsEnabled = true`; the flag defaults to false and while it is off
+// ZERO experiment code paths execute — no subject-id mint, no assignment
+// fetch, no revalidation goroutine, no exposure emit, no new persistence
+// keys, no reads of previously persisted ones. The server side is equally
+// dark: while the platform flags are off the endpoint answers 403, which
+// this client treats fail-closed exactly like bad auth. Flipping the SDK
+// flag on for real traffic is governed by the platform flag-flip registry
+// preconditions, not by this module.
+//
+// Wire contract (assignment fetch):
+//
+//	GET {RemoteConfigURL}/api/v1/runtime/experiments/assignment
+//	  ?app_key=&environment_key=&experiment_key=&subject_key=&<attributes>
+//	Authorization: Bearer <publishable APIKey>
+//
+// The base URL is the configured RemoteConfigURL — the control-plane host —
+// with the path swapped; no new endpoint configuration exists. The endpoint
+// requires the experiment-assignment read scope on the key, granted
+// server-side.
+//
+// Outcomes (decided by applyExperimentAssignment, pure):
+//   - 200 assigned — the variant is served and cached (memory + durable).
+//     Assignment stickiness is entirely the server's deterministic hash; the
+//     cache is a latency/offline device, never an assignment authority, and
+//     this client never re-buckets locally.
+//   - 200 not-assigned — three shapes distinguished only by `reason`: absent
+//     (deterministic traffic-gate miss), "targeting_unmatched" (may change
+//     when attributes change), "kill_switch" (operator kill). Any OTHER
+//     reason is not a verdict this SDK can represent and classifies as
+//     malformed. All three shapes drop the cached assignment; a kill in
+//     particular must stop applying at the next safe point and emits no
+//     exposure.
+//   - 401/403 — fail CLOSED: the result never serves a cached assignment,
+//     in-memory serving stops (getters return nothing) and revalidation
+//     halts until re-init or a later successful, authorized fetch. The
+//     durable cache record itself is left untouched (remote-config parity)
+//     EXCEPT for the server's real-subjects kill sentinel ("experiment
+//     real-subject assignment is disabled"), which additionally drops the
+//     durable record — the platform flipped the real-subjects flag back
+//     off, and the cached assignments plus their subject-fact keys must not
+//     outlive that.
+//   - 404 — permanent for the experiment: treated as not-assigned, the
+//     cached assignment is dropped and never served stale, and revalidation
+//     stops asking for that key (the drop removes it from the cache).
+//   - 400 — permanent for this input set. One special case: the subject-id
+//     grammar sentinel with an SDK-minted subject id re-mints the id ONCE
+//     per process and retries with the EXACT normalized attribute set of the
+//     rejected request (a conforming mint that still 400s is a bug, surfaced
+//     through diagnostics, never a retry loop). Every other 400 drops the
+//     cached entry: a permanently rejected input set must not serve stale
+//     forever while revalidation re-sends it.
+//   - 503 / 429 / 5xx / offline / timeout / malformed — transient: the
+//     cached assignment is served (FromCache=true with Code carrying the
+//     reason) and the revalidation cadence backs off; Retry-After is honored
+//     on 429 AND 5xx exactly like the batch transport. An offline client
+//     keeps its last-known-good variant indefinitely — the documented
+//     kill-latency caveat.
+//
+// Subject id (`spcid_`): SDK-minted and SDK-managed — "spcid_" plus the 32
+// lowercase hex chars of a UUIDv7 with the dashes removed. There is NO host
+// override path: no public setter and no config field is read for it. It is
+// persisted in the SpoolDir state directory (in memory only, per process,
+// when SpoolDir is unset — documented ephemeral re-bucketing), minted lazily
+// the first time a fetch needs it, validated against the wire grammar on
+// load (the FULL grammar, so an id from another SDK build stays sticky), and
+// re-minted only on storage loss/corruption or the server's grammar
+// sentinel. It is NOT the anonymous id, and it egresses ONLY as the
+// assignment fetch's subject_key — never in analytics events, in any props,
+// or as an envelope identity.
+//
+// Consent posture (assignment plane): the plane consumes the SAME effective
+// consent state the analytics path uses — nothing separate is computed.
+// While that state refuses analytics (denied, either flavor — the forced
+// minor state included — or unknown under the opt-in ConsentFloor) no
+// assignment request leaves the process, no subject id is minted, nothing
+// is served (getters return nothing) and the revalidation lane does not
+// run: a forced-minor session produces ZERO experiment traffic on both
+// planes. Without the floor this SDK's documented open-under-unknown
+// posture applies to this plane too: consent unknown ADMITS, denial
+// refuses. This is deliberately stricter than the remote-config fetch
+// (which is not consent-gated). A consent downgrade mid-session stops
+// fetching and serving; the durable cache record is retained but not
+// served, and a later re-grant serves it again.
+//
+// Exposure lane (analytics plane): `experiment_exposure` facts ride the
+// normal event pipeline (queue → batch → spool → consent gates) with the
+// strict server-side props allowlist. Emission timing is the ratified SDK
+// convention: at most once per (experiment_key, experiment_version, subject)
+// per session — this SDK has no session lifecycle, so its session is the
+// client instance — emitted when the assigned variant is first applied (a
+// fresh fetch resolution, or the first sweep serving a cache-restored
+// assignment), with a DETERMINISTIC event id so at-least-once retries and
+// same-session re-emissions collapse server-side as duplicates.
+// TrackExperimentExposure is the explicit re-arm escape hatch (a re-arm
+// mints a distinct deterministic id). The assignment_key prop carries the
+// server-minted subject-fact key VERBATIM (the raw subject id is
+// structurally rejected there); an assignment without one emits NO fact.
+// NOTE: the analytics service currently rejects these event names from
+// publishable client keys by design; until the platform's producer-lane
+// decision lands, an emitted exposure is expected to come back as a
+// per-event reject. That server-side block is load-bearing and this SDK
+// deliberately relies on it staying authoritative — the lane is dark
+// end-to-end.
+
+const expAssignmentRoute = "/api/v1/runtime/experiments/assignment"
+
+// Revalidation cadence (the SDK's contribution to the kill-switch reach):
+// re-issue the assignment GET for every cached entry, batched per cycle,
+// every 300 seconds with ±10% uniform jitter. The endpoint has no
+// conditional requests (no ETag), so revalidation is a plain re-fetch.
+const (
+	expRevalidateIntervalSeconds = 300
+	expRevalidateJitter          = 0.1
+)
+
+// Transient-failure backoff for the revalidation cadence (transport parity
+// with the batch path): full jitter in [base, ceiling], ceiling doubling per
+// consecutive failure up to the cap; a server Retry-After (clamped to one
+// day) overrides the computed wait.
+const (
+	expBackoffBaseSeconds = 1
+	expBackoffCapSeconds  = 60
+	expMaxDeferSeconds    = 86400
+)
+
+// Server error sentinels this client reacts to by exact body text (the error
+// contract distinguishes same-status outcomes only by the body's `error`
+// string). String equality on a fully read body only; an unparseable,
+// truncated, or near-miss body is the generic outcome for its status.
+const (
+	expSentinelRealSubjectsDisabled = "experiment real-subject assignment is disabled"
+	expSentinelSubjectGrammar       = "experiment metadata must use synthetic local-safe identifiers only"
+)
+
+// The server-evaluated targeting attribute vocabulary: the fixed allowlist
+// plus the custom_attribute_<name> family (suffix 1-64 chars). Names outside
+// it are never sent; values are trimmed and bounded to 512 bytes, and at
+// most 64 attributes ride one fetch (sorted-name order, matching the
+// server's own consideration order).
+var expAllowedAttributes = map[string]bool{
+	"geo":          true,
+	"app_version":  true,
+	"device_type":  true,
+	"install_date": true,
+	"user_segment": true,
+}
+
+const (
+	expCustomAttributePrefix   = "custom_attribute_"
+	expMaxAttributeValueBytes  = 512
+	expMaxAttributes           = 64
+	expMaxCustomAttributeName  = 64
+	expMaxOwedExposures        = 8
+	expMaxBodyBytes            = rcMaxBodyBytes
+	expMaxRecordBytes          = 393216 // canon parity with the defold store clamp
+	expSubjectFileName         = "experiment_subject_key"
+	expCacheFileName           = "experiments.json"
+	experimentExposureName     = "experiment_exposure"
+	experimentOutcomeName      = "experiment_outcome"
+	experimentReasonKillSwitch = "kill_switch"
+	experimentReasonTargeting  = "targeting_unmatched"
+)
+
+// expSubjectKeyPattern is the FULL wire grammar for a client subject id.
+// Accepting the full grammar on load (not just this SDK's own 32-hex body)
+// keeps a stored id sticky across SDK builds: re-minting re-buckets, so an
+// id that is still wire-valid is never discarded.
+var expSubjectKeyPattern = regexp.MustCompile(`^spcid_[A-Za-z0-9_-]{20,64}$`)
+
+func validExperimentSubjectID(value string) bool {
+	return expSubjectKeyPattern.MatchString(value)
+}
+
+// mintExperimentSubjectID mints a fresh subject id: "spcid_" + the SDK's
+// UUIDv7 with dashes removed (32 lowercase hex chars, 38 chars total —
+// inside the wire grammar's 20-64 body bound and charset).
+func mintExperimentSubjectID() (string, error) {
+	value, err := uuidv7.New()
+	if err != nil {
+		return "", err
+	}
+	return "spcid_" + strings.ReplaceAll(value, "-", ""), nil
+}
+
+// ── URL, scope, attributes ──────────────────────────────────────────────────
+
+type expAttribute struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+// buildExperimentAssignmentURL builds the assignment GET URL: the four
+// required routing params in fixed order, then the normalized attributes in
+// their sorted order. Names and values are percent-escaped so a value
+// containing "&", "=", or "#" cannot restructure the query string.
+func buildExperimentAssignmentURL(baseURL, appKey, environmentKey, experimentKey, subjectKey string, attributes []expAttribute) string {
+	var b strings.Builder
+	b.WriteString(strings.TrimRight(baseURL, "/"))
+	b.WriteString(expAssignmentRoute)
+	b.WriteByte('?')
+	writePair := func(name, value string, first bool) {
+		if !first {
+			b.WriteByte('&')
+		}
+		b.WriteString(escapeExperimentQueryComponent(name))
+		b.WriteByte('=')
+		b.WriteString(escapeExperimentQueryComponent(value))
+	}
+	writePair("app_key", appKey, true)
+	writePair("environment_key", environmentKey, false)
+	writePair("experiment_key", experimentKey, false)
+	writePair("subject_key", subjectKey, false)
+	for _, attribute := range attributes {
+		writePair(attribute.Name, attribute.Value, false)
+	}
+	return b.String()
+}
+
+// escapeExperimentQueryComponent percent-escapes everything outside the RFC
+// 3986 unreserved set (injective; the shared escaping discipline with the
+// remote-config URL builder — url.QueryEscape's space-as-plus would not
+// round-trip through a strict decoder unambiguously).
+func escapeExperimentQueryComponent(value string) string {
+	return escapeRemoteConfigSegment(value)
+}
+
+// buildExperimentScope stamps a cache record with the (workspace, app,
+// environment, subject, url, credential) tuple its assignments were fetched
+// for. Components are escaped and joined with a separator no escaped
+// component can contain, so two distinct tuples can never collide into one
+// scope string. The credential rides as a non-secret fingerprint: an
+// in-place API-key swap (a tenant change with everything else equal) must
+// scope-miss, never serve the previous tenant's assignment. The experiment
+// key is deliberately NOT part of the base scope — entries are keyed by it
+// inside the record, so the full cache identity is the (scope,
+// experiment_key) pair.
+func buildExperimentScope(workspaceID, appID, environmentID, subjectID, baseURL, apiKeyFingerprint string) string {
+	return escapeRemoteConfigSegment(workspaceID) + rcScopeSeparator +
+		escapeRemoteConfigSegment(appID) + rcScopeSeparator +
+		escapeRemoteConfigSegment(environmentID) + rcScopeSeparator +
+		escapeRemoteConfigSegment(subjectID) + rcScopeSeparator +
+		strings.TrimRight(baseURL, "/") + rcScopeSeparator +
+		apiKeyFingerprint
+}
+
+// experimentAPIKeyFingerprint is a short non-secret digest of the
+// publishable key for cache scoping: it identifies the credential without
+// storing anything that authenticates.
+func experimentAPIKeyFingerprint(apiKey string) string {
+	digest := sha256.Sum256([]byte("shardpilot-exp-key|" + apiKey))
+	return hex.EncodeToString(digest[:8])
+}
+
+// normalizeExperimentAttributes turns host-supplied targeting attributes
+// into the ordered pairs a fetch sends: names outside the vocabulary and
+// unusable values are DROPPED (counted for diagnostics), never sent — an
+// invented name would be ignored server-side at best, and an oversized
+// value would fail the whole fetch whenever the experiment carries a
+// targeting condition. Dropping fails toward targeting_unmatched, the safe
+// direction. Values are trimmed; the surviving pairs are sorted by name and
+// capped at 64 (drop beyond the cap, in that same order — mirroring the
+// server's sorted-key consideration).
+func normalizeExperimentAttributes(attributes map[string]string) (pairs []expAttribute, dropped int) {
+	if len(attributes) == 0 {
+		return nil, 0
+	}
+	names := make([]string, 0, len(attributes))
+	for name := range attributes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		value := strings.TrimSpace(attributes[name])
+		switch {
+		case !validExperimentAttributeName(name), value == "", len(value) > expMaxAttributeValueBytes:
+			dropped++
+		case len(pairs) >= expMaxAttributes:
+			dropped++
+		default:
+			pairs = append(pairs, expAttribute{Name: name, Value: value})
+		}
+	}
+	return pairs, dropped
+}
+
+func validExperimentAttributeName(name string) bool {
+	if expAllowedAttributes[name] {
+		return true
+	}
+	if strings.HasPrefix(name, expCustomAttributePrefix) {
+		suffix := len(name) - len(expCustomAttributePrefix)
+		return suffix >= 1 && suffix <= expMaxCustomAttributeName
+	}
+	return false
+}
+
+// ── verdict parsing and classification ──────────────────────────────────────
+
+// ExperimentAssignmentResult is one fetch's usable outcome. A cache-served
+// transient IS a usable outcome: the host has the last known assignment
+// (FromCache=true) with Code carrying why the network could not refresh it.
+type ExperimentAssignmentResult struct {
+	// Assigned is the verdict. False for a traffic-gate miss (Reason
+	// empty), an operator kill (Reason "kill_switch"), a targeting miss
+	// (Reason "targeting_unmatched"), or an unknown experiment (Code
+	// "not_found").
+	Assigned bool
+	// VariantKey and VariantPayload are present only when Assigned.
+	VariantKey     string
+	VariantPayload map[string]any
+	// Version is the published experiment version the verdict was computed
+	// against (0 when the server omitted it on a not-assigned shape).
+	Version int64
+	// Reason distinguishes the three not-assigned shapes; empty for the
+	// legacy traffic-gate miss and for an assigned verdict.
+	Reason string
+	// Boundary is the server's machine-readable boundary block, served
+	// verbatim on fresh verdicts for observability. Do not assert its
+	// literal values; they change as the platform's rollout posture does.
+	Boundary map[string]any
+	// FromCache reports that the assignment was served from the
+	// last-known-good cache over a transient failure.
+	FromCache bool
+	// Code is the taxonomy code when the outcome is not a fresh verdict:
+	// "not_found" (unknown experiment), "superseded" (a newer outcome
+	// settled while this fetch was in flight), or the transient reason of a
+	// cache serve ("transient_503", "http_0", "malformed_response", ...).
+	Code string
+}
+
+// expEntry is one cached assignment. Only ASSIGNED verdicts are cached;
+// every not-assigned outcome drops its key.
+type expEntry struct {
+	AssignmentKey  string         `json:"assignment_key"`
+	VariantKey     string         `json:"variant_key"`
+	VariantPayload map[string]any `json:"variant_payload,omitempty"`
+	Version        int64          `json:"version"`
+	AssignmentUnit string         `json:"assignment_unit"`
+	SubjectFactKey string         `json:"subject_fact_key,omitempty"`
+	SubjectKey     string         `json:"subject_key,omitempty"`
+	Attributes     []expAttribute `json:"attributes,omitempty"`
+	FetchedAtMS    int64          `json:"fetched_at_ms"`
+}
+
+// expOutcome directs the stateful install after the pure classification.
+type expOutcome struct {
+	// authoritative settles the per-key sequence fence (a fresh 200 in any
+	// shape, 401/403, 404, 400, and other permanent errors);
+	// transient/cache outcomes do not, so they cannot fence off a fresh
+	// response in flight.
+	authoritative bool
+	// newEntry — cache this assignment (exists exactly for 200 assigned).
+	newEntry *expEntry
+	// dropEntry / dropAll — drop the experiment's cached assignment (every
+	// not-assigned shape, 404, and non-grammar 400s) / the whole durable
+	// record (the real-subjects kill sentinel).
+	dropEntry bool
+	dropAll   bool
+	// authBlocked — 401/403: stop serving, halt revalidation, fail closed.
+	authBlocked bool
+	// remint — the subject-grammar 400 sentinel: the caller may re-mint the
+	// subject id once per process and retry.
+	remint bool
+	// transient — pace the revalidation backoff; retryAfterSeconds honors a
+	// server Retry-After (429 and 5xx alike).
+	transient         bool
+	retryAfterSeconds int
+	retryAfterPresent bool
+	// attributes is stamped by the fetch path: the normalized set this
+	// request sent, remembered on the installed entry for revalidation.
+	attributes []expAttribute
+}
+
+// expAssignmentWire is the presence-aware decode shape for a 200 body.
+// Wrong types anywhere in the tree — a string version, an array payload, a
+// non-object boundary — fail the typed decode and classify malformed.
+type expAssignmentWire struct {
+	AppKey         *string        `json:"app_key"`
+	EnvironmentKey *string        `json:"environment_key"`
+	ExperimentKey  *string        `json:"experiment_key"`
+	Version        *int64         `json:"version"`
+	Assigned       *bool          `json:"assigned"`
+	AssignmentKey  string         `json:"assignment_key"`
+	VariantKey     string         `json:"variant_key"`
+	VariantPayload map[string]any `json:"variant_payload"`
+	Reason         *string        `json:"reason"`
+	SubjectFactKey string         `json:"subject_fact_key"`
+	Boundary       map[string]any `json:"boundary"`
+}
+
+// expRequestScope is the request identity a 200 body must echo consistently:
+// a body whose echoed app_key, environment_key, or experiment_key disagrees
+// with the fetch that was just built is not this request's verdict and
+// classifies malformed BEFORE install (absent echo fields are tolerated).
+type expRequestScope struct {
+	appKey        string
+	envKey        string
+	experimentKey string
+}
+
+// serveExperimentEntryOrFail serves the cached entry for a transient
+// failure, or fails when none exists. A served entry is still a usable
+// outcome — the host has an assignment — with FromCache=true and Code
+// carrying why the network could not refresh it. Only assigned entries are
+// ever cached, so a cache serve always carries a variant.
+func serveExperimentEntryOrFail(entry *expEntry, code string) (ExperimentAssignmentResult, string) {
+	if entry != nil {
+		return ExperimentAssignmentResult{
+			Assigned:       true,
+			VariantKey:     entry.VariantKey,
+			VariantPayload: deepCopyJSONMap(entry.VariantPayload, 0),
+			Version:        entry.Version,
+			FromCache:      true,
+			Code:           code,
+		}, ""
+	}
+	return ExperimentAssignmentResult{}, code
+}
+
+// experimentBodyErrorText extracts the body `error` string of a non-2xx
+// answer, or "". A truncated body never yields a sentinel — the equality
+// cannot be trusted — and reads as generic for its status.
+func experimentBodyErrorText(body []byte, bodyIncomplete bool) string {
+	if bodyIncomplete {
+		return ""
+	}
+	var wire struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(body, &wire) != nil {
+		return ""
+	}
+	return wire.Error
+}
+
+// applyExperimentAssignment decides one fetch outcome from the transport
+// response and the CURRENT cached entry for the key. Pure (no IO, no state)
+// so tests can drive every branch. Returns the served result, the install
+// directives, and a failure code; a non-empty failure code means the fetch
+// produced no usable verdict (the result is zero). A transport-level error
+// arrives here as status 0; a stalled body after an authoritative status
+// arrives with the status and bodyIncomplete set, and every non-200
+// classifies by STATUS alone (a truncated 401 still fails closed, a
+// truncated 404 is still permanent; the sentinels are the one
+// body-sensitive refinement and a truncated body is never a sentinel).
+func applyExperimentAssignment(entry *expEntry, resp remoteConfigResponse, scope expRequestScope, nowMS int64) (ExperimentAssignmentResult, expOutcome, string) {
+	status := resp.status
+
+	if status == 200 {
+		verdict, outcome, ok := parseExperimentVerdict(resp, scope, nowMS)
+		if !ok {
+			result, failure := serveExperimentEntryOrFail(entry, "malformed_response")
+			return result, expOutcome{transient: true}, failureOrEmpty(result, failure)
+		}
+		return verdict, outcome, ""
+	}
+
+	// Unauthorized / forbidden fail CLOSED (a dark server, a revoked or
+	// unscoped key, a suspended tenant — indistinguishable here, all must
+	// stop serving): the cached record is never served for this outcome and
+	// revalidation halts. The durable record is kept EXCEPT under the
+	// real-subjects kill sentinel, which drops it — the assignments and
+	// their subject-fact keys must not outlive the platform flipping that
+	// flag off.
+	if status == 401 || status == 403 {
+		outcome := expOutcome{authoritative: true, authBlocked: true}
+		if status == 403 && experimentBodyErrorText(resp.body, resp.bodyIncomplete) == expSentinelRealSubjectsDisabled {
+			outcome.dropAll = true
+		}
+		return ExperimentAssignmentResult{}, outcome, "unauthorized"
+	}
+
+	// Unknown experiment key or nothing published in scope: permanent for
+	// this key. Treated as a first-class not-assigned answer (the host's
+	// actionable outcome is identical: no variant), with Code carrying the
+	// diagnosis; the cached assignment is dropped, never served stale, and
+	// the drop stops revalidation from re-asking.
+	if status == 404 {
+		return ExperimentAssignmentResult{Code: "not_found"},
+			expOutcome{authoritative: true, dropEntry: true}, ""
+	}
+
+	// Bad inputs are permanent for this input set — retrying unchanged
+	// cannot help. The one self-healing case: the subject-grammar sentinel
+	// with an SDK-minted id means the persisted id went bad; the caller
+	// re-mints once (fresh-install semantics) and retries — deliberately
+	// NOT a drop: the assignment itself was never rejected, the subject id
+	// was. Every OTHER 400 drops the cached entry: a cached assignment
+	// whose revalidation is permanently rejected must not keep serving
+	// stale forever while the cadence re-sends the same invalid input set.
+	if status == 400 {
+		if experimentBodyErrorText(resp.body, resp.bodyIncomplete) == expSentinelSubjectGrammar {
+			return ExperimentAssignmentResult{},
+				expOutcome{authoritative: true, remint: true}, "bad_request"
+		}
+		return ExperimentAssignmentResult{},
+			expOutcome{authoritative: true, dropEntry: true}, "bad_request"
+	}
+
+	// Transient bucket: no connection, timeout, backpressure, or any server
+	// error — including the 503 the endpoint answers when its kill-state
+	// read fails (an explicit serve-stale-and-retry case). Retry-After is
+	// honored on 429 and 5xx alike.
+	transientCode := ""
+	switch {
+	case status == 0:
+		transientCode = "http_0"
+	case status == 408:
+		transientCode = "transient_408"
+	case status == 429 || status >= 500:
+		transientCode = "transient_" + strconv.Itoa(status)
+	}
+	if transientCode != "" {
+		outcome := expOutcome{transient: true}
+		if status == 429 || status >= 500 {
+			outcome.retryAfterSeconds = resp.retryAfterSeconds
+			outcome.retryAfterPresent = resp.retryAfterPresent
+		}
+		result, failure := serveExperimentEntryOrFail(entry, transientCode)
+		return result, outcome, failureOrEmpty(result, failure)
+	}
+
+	// Anything else (an unexpected redirect, another 4xx) is an
+	// authoritative "no assignment is served here": fail without serving
+	// stale values; the cached record stays untouched.
+	return ExperimentAssignmentResult{},
+		expOutcome{authoritative: true}, "http_" + strconv.Itoa(status)
+}
+
+func failureOrEmpty(result ExperimentAssignmentResult, failure string) string {
+	if result.FromCache {
+		return ""
+	}
+	return failure
+}
+
+// parseExperimentVerdict parses a 200 body end-to-end: complete for its
+// verdict shape, echo-consistent with the request, or not a verdict at all
+// (ok=false → malformed_response). Required per shape (the server contract
+// always sends these):
+//   - assigned: a PRESENT, POSITIVE version (published versions start at
+//     1), non-empty assignment_key and variant_key, and a non-empty
+//     boundary.assignment_unit;
+//   - not assigned: a KNOWN reason — absent (traffic gate), kill_switch, or
+//     targeting_unmatched. An unknown reason is not a shape this SDK knows.
+func parseExperimentVerdict(resp remoteConfigResponse, scope expRequestScope, nowMS int64) (ExperimentAssignmentResult, expOutcome, bool) {
+	if resp.bodyIncomplete || len(resp.body) > expMaxBodyBytes {
+		return ExperimentAssignmentResult{}, expOutcome{}, false
+	}
+	var wire expAssignmentWire
+	if err := json.Unmarshal(resp.body, &wire); err != nil {
+		return ExperimentAssignmentResult{}, expOutcome{}, false
+	}
+	if wire.Assigned == nil {
+		return ExperimentAssignmentResult{}, expOutcome{}, false
+	}
+	// Echo validation: a present-but-different echoed identity is another
+	// request's verdict and must not install under this one's scope.
+	if wire.AppKey != nil && *wire.AppKey != scope.appKey {
+		return ExperimentAssignmentResult{}, expOutcome{}, false
+	}
+	if wire.EnvironmentKey != nil && *wire.EnvironmentKey != scope.envKey {
+		return ExperimentAssignmentResult{}, expOutcome{}, false
+	}
+	if wire.ExperimentKey != nil && *wire.ExperimentKey != scope.experimentKey {
+		return ExperimentAssignmentResult{}, expOutcome{}, false
+	}
+
+	if *wire.Assigned {
+		if wire.Version == nil || *wire.Version < 1 {
+			return ExperimentAssignmentResult{}, expOutcome{}, false
+		}
+		assignmentKey := strings.TrimSpace(wire.AssignmentKey)
+		variantKey := strings.TrimSpace(wire.VariantKey)
+		assignmentUnit, _ := wire.Boundary["assignment_unit"].(string)
+		if assignmentKey == "" || variantKey == "" || assignmentUnit == "" {
+			return ExperimentAssignmentResult{}, expOutcome{}, false
+		}
+		subjectFactKey := strings.TrimSpace(wire.SubjectFactKey)
+		entry := &expEntry{
+			AssignmentKey:  assignmentKey,
+			VariantKey:     variantKey,
+			VariantPayload: deepCopyJSONMap(wire.VariantPayload, 0),
+			Version:        *wire.Version,
+			AssignmentUnit: assignmentUnit,
+			SubjectFactKey: subjectFactKey,
+			FetchedAtMS:    nowMS,
+		}
+		return ExperimentAssignmentResult{
+			Assigned:       true,
+			VariantKey:     variantKey,
+			VariantPayload: deepCopyJSONMap(wire.VariantPayload, 0),
+			Version:        *wire.Version,
+			Boundary:       deepCopyJSONMap(wire.Boundary, 0),
+		}, expOutcome{authoritative: true, newEntry: entry}, true
+	}
+
+	reason := ""
+	if wire.Reason != nil {
+		reason = *wire.Reason
+	}
+	switch reason {
+	case "", experimentReasonKillSwitch, experimentReasonTargeting:
+	default:
+		// Not a verdict this SDK can represent: the allowlist is {absent,
+		// kill_switch, targeting_unmatched}.
+		return ExperimentAssignmentResult{}, expOutcome{}, false
+	}
+	version := int64(0)
+	if wire.Version != nil {
+		version = *wire.Version
+	}
+	// Every not-assigned shape drops the cached assignment: the server just
+	// said this subject has no variant NOW, and a kill in particular must
+	// stop applying at the next safe point and emit no exposure.
+	return ExperimentAssignmentResult{
+		Assigned: false,
+		Reason:   reason,
+		Version:  version,
+		Boundary: deepCopyJSONMap(wire.Boundary, 0),
+	}, expOutcome{authoritative: true, dropEntry: true}, true
+}
+
+// deepCopyJSONMap deep-copies a decoded JSON object so a map handed to host
+// code can be mutated freely without corrupting the cached entry later
+// reads use. Depth-bounded (decoded JSON is acyclic; the cap only bounds
+// the walk — deeper subtrees are dropped, canon parity).
+func deepCopyJSONMap(value map[string]any, depth int) map[string]any {
+	if value == nil {
+		return nil
+	}
+	if depth >= 16 {
+		return nil
+	}
+	out := make(map[string]any, len(value))
+	for key, child := range value {
+		out[key] = deepCopyJSONValue(child, depth+1)
+	}
+	return out
+}
+
+func deepCopyJSONValue(value any, depth int) any {
+	switch typed := value.(type) {
+	case map[string]any:
+		return deepCopyJSONMap(typed, depth)
+	case []any:
+		if depth >= 16 {
+			return nil
+		}
+		out := make([]any, len(typed))
+		for i, child := range typed {
+			out[i] = deepCopyJSONValue(child, depth+1)
+		}
+		return out
+	default:
+		return typed
+	}
+}
+
+// ── deterministic exposure event id ─────────────────────────────────────────
+
+// experimentExposureEventID derives the deterministic exposure event id: a
+// stable digest of (session marker, subject, experiment, version, arm) —
+// exactly the de-dupe tuple plus the session marker and the re-arm counter,
+// so the id-uniqueness domain and the de-dupe domain coincide. The same
+// tuple always derives the same id, so an accidental double emission inside
+// one session collapses server-side as a duplicate; an explicit re-arm
+// bumps the counter, and a rotated subject or another client instance
+// derives a distinct id. UUID-shaped so it rides the envelope like any
+// other event id.
+func experimentExposureEventID(sessionMarker, subjectKey, experimentKey string, version, arm int64) string {
+	digest := sha256.Sum256([]byte(strings.Join([]string{
+		"exposure",
+		sessionMarker,
+		subjectKey,
+		experimentKey,
+		strconv.FormatInt(version, 10),
+		strconv.FormatInt(arm, 10),
+	}, "\x1f")))
+	b := digest[:16]
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// exposureTupleKey is the ratified de-dupe tuple: (experiment, version,
+// subject) — nothing more. The assignment key is deliberately NOT part of
+// it: it is normally deterministic for this tuple anyway, and a regenerated
+// key for the same tuple must not over-count exposures. The emitted fact
+// still carries the current subject-fact key as a prop.
+func exposureTupleKey(experimentKey string, entry *expEntry) string {
+	return escapeRemoteConfigSegment(experimentKey) + rcScopeSeparator +
+		strconv.FormatInt(entry.Version, 10) + rcScopeSeparator +
+		escapeRemoteConfigSegment(entry.SubjectKey)
+}
+
+// ── durable store ───────────────────────────────────────────────────────────
+
+// expDurableRecord is the durable cache file's shape: ONE scope's entry set.
+// A record stamped for any other scope is dead weight and is overwritten by
+// the next write; a record without a scope stamp cannot be attributed to
+// any tuple and reads as no cache.
+type expDurableRecord struct {
+	Scope   string              `json:"scope"`
+	Entries map[string]expEntry `json:"entries"`
+}
+
+// sanitizeExperimentEntries keeps only entries that are complete,
+// well-formed assignment records, copied down to the known fields. Anything
+// else — a corrupt file, a truncated entry, a garbled field — is dropped
+// rather than served or crashed on (corrupt = miss, clean start).
+func sanitizeExperimentEntries(entries map[string]expEntry) map[string]expEntry {
+	out := make(map[string]expEntry, len(entries))
+	for key, entry := range entries {
+		if key == "" ||
+			strings.TrimSpace(entry.AssignmentKey) == "" ||
+			strings.TrimSpace(entry.VariantKey) == "" ||
+			entry.Version < 1 ||
+			strings.TrimSpace(entry.AssignmentUnit) == "" {
+			continue
+		}
+		attributes := entry.Attributes
+		entry.Attributes = nil
+		for _, attribute := range attributes {
+			if attribute.Name != "" {
+				entry.Attributes = append(entry.Attributes, attribute)
+			}
+		}
+		entry.VariantPayload = deepCopyJSONMap(entry.VariantPayload, 0)
+		out[key] = entry
+	}
+	return out
+}
+
+// ── the consumer state ──────────────────────────────────────────────────────
+
+// experimentsState is the per-client experiment machinery. mu guards every
+// field; emitMu serializes exposure emission and sweeps and is always taken
+// OUTSIDE mu (lock order: emitMu → lifecycleMu → mu; nothing takes mu and
+// then a client lock).
+type experimentsState struct {
+	mu     sync.Mutex
+	emitMu sync.Mutex
+
+	workspaceID string
+	appKey      string
+	envKey      string
+	baseURL     string
+	keyPrint    string
+	spoolDir    string
+
+	// entries is the in-memory serving cache: experiment key → entry. Only
+	// assigned entries exist here; every not-assigned outcome drops its
+	// key.
+	entries map[string]*expEntry
+
+	// pendingExposure holds applications whose exposure fact is still OWED:
+	// experiment key → a bounded FIFO of {entry, session} snapshots, each
+	// carrying THE SESSION THE APPLICATION BELONGS TO. Swept while consent
+	// admits. The snapshot — not the serving cache — is the emission
+	// source, so an owed fact for a variant that really ran survives a
+	// later drop of the live entry, an ordinary auth latch, and a subject
+	// re-mint (exposure facts are facts about the PAST; only the
+	// real-subjects sentinel — whose fact keys must not outlive it —
+	// discards them).
+	pendingExposure map[string][]*expOwedExposure
+
+	// durablePending is the durable-write convergence intent: experiment
+	// key → {asOf, drop} for an OWED sync (memory changed, disk did not),
+	// retried every cycle; durableClearPending is an owed whole-record
+	// clear stamped by its resolution. The recorded intent lets an
+	// ordinary fail-closed latch cancel owed WRITES (the 401/403 canon
+	// retains the durable record) while authoritative drops still land.
+	durablePending      map[string]expOwedSync
+	durableClearPending bool
+	durableClearAsOf    int64
+
+	// tornDown is set at teardown: an in-flight response landing afterwards
+	// must not install, persist, pace, or surface anything.
+	tornDown bool
+
+	// exposed is the session-scoped exposure dedup: tuple key → {arm,
+	// auto}. arm is the highest arm handed out for the tuple; auto records
+	// whether the AUTOMATIC arm-0 fact has emitted — an explicit re-arm may
+	// run while that emission is still owed in the queue, and must not
+	// consume its slot.
+	exposed map[string]expExposed
+
+	// sessionMarker is one marker per constructed consumer (= per SDK
+	// session; this SDK has no session lifecycle, so its session is the
+	// client instance): part of the deterministic exposure id, so each
+	// instance's first application emits its own fact while duplicates
+	// within the instance collapse.
+	sessionMarker string
+
+	// Per-(scope, experiment) sequence fence for out-of-order responses,
+	// remote-config discipline: only an outcome newer than every settled
+	// one for its key may install.
+	fetchSeq uint64
+	settled  map[string]uint64
+
+	// authBlocked is the fail-closed latch: set by 401/403, cleared by
+	// re-init or a later authoritative, authorized outcome of a fetch
+	// STARTED AFTER the latch was set. While set, nothing is served and
+	// revalidation halts; an explicit host fetch stays allowed (the
+	// user-triggered path) and its success unlatches. authEpoch counts
+	// latch events: every fetch captures it at dispatch and an outcome
+	// whose captured epoch is stale is discarded outright — with a batch
+	// of revalidations in flight, one 401 must not be undone (and revoked
+	// assignments must not be reinstalled) by a sibling response that was
+	// already in flight when the latch landed.
+	authBlocked bool
+	authEpoch   uint64
+
+	// Revalidation cadence state (unix ms; 0 = unarmed).
+	revalidateAtMS int64
+	retryAfterMS   int64
+	backoffAttempt int
+
+	// reminted is the one-shot grammar re-mint guard (per process).
+	reminted bool
+
+	// purgeEpoch counts consent purges: an emission whose enqueue raced a
+	// purge must not mark its tuple exposed over the purge's re-arm (the
+	// queued fact may have been wiped) — the sweep re-emits it with the
+	// SAME deterministic id, so a survivor collapses server-side.
+	purgeEpoch uint64
+
+	// owedExposureOverflow counts owed-exposure snapshots dropped by the
+	// bounded FIFO, drained to a diagnostic by the next client-side pass.
+	owedExposureOverflow int
+
+	// subjectID is the lazily loaded/minted subject id ("" = none yet);
+	// subjectChecked marks that the persisted value was read once.
+	subjectID      string
+	subjectChecked bool
+
+	// memorySubjectID / memoryRecord are the SpoolDir-less fallbacks: the
+	// subject id and the record last only for the process lifetime,
+	// documented ephemeral.
+	memorySubjectID string
+	memoryRecord    *expDurableRecord
+
+	// laneParkedForTests suspends the background lane's automatic ticks so
+	// tests can drive tick() deterministically. Never set in production.
+	laneParkedForTests bool
+
+	// failDurableWritesForTests makes every durable save/clear report
+	// failure, so the owed-sync machinery can be exercised
+	// deterministically (the createAnonymousIDWith seam shape). Never set
+	// in production.
+	failDurableWritesForTests bool
+}
+
+type expOwedExposure struct {
+	entry   *expEntry
+	session string
+}
+
+type expOwedSync struct {
+	asOf int64
+	drop bool
+}
+
+type expExposed struct {
+	arm  int64
+	auto bool
+}
+
+func newExperimentsState(cfg Config) *experimentsState {
+	marker, err := uuidv7.New()
+	if err != nil {
+		// The marker only needs uniqueness per instance; a randomness
+		// failure this early degrades to a time-derived marker rather than
+		// failing construction.
+		marker = "session-" + strconv.FormatInt(int64(os.Getpid()), 10)
+	}
+	return &experimentsState{
+		workspaceID:     cfg.WorkspaceID,
+		appKey:          cfg.AppID,
+		envKey:          cfg.EnvironmentID,
+		baseURL:         strings.TrimRight(cfg.RemoteConfigURL, "/"),
+		keyPrint:        experimentAPIKeyFingerprint(cfg.APIKey),
+		spoolDir:        cfg.SpoolDir,
+		entries:         make(map[string]*expEntry),
+		pendingExposure: make(map[string][]*expOwedExposure),
+		durablePending:  make(map[string]expOwedSync),
+		exposed:         make(map[string]expExposed),
+		sessionMarker:   marker,
+		settled:         make(map[string]uint64),
+	}
+}
+
+// preload serves the persisted last-known-good assignments immediately
+// after a restart when a stored subject id exists and the record matches
+// this exact scope; their exposures re-arm for this instance and are
+// emitted by the first admitted sweep. No subject id is minted here.
+func (e *experimentsState) preload() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	subject := e.currentSubjectIDLocked()
+	if subject == "" {
+		return
+	}
+	record := e.loadDurableRecordLocked()
+	if record == nil || record.Scope != e.scopeForLocked(subject) {
+		return
+	}
+	for key, stored := range record.Entries {
+		entry := stored
+		e.entries[key] = &entry
+		e.pendingExposure[key] = []*expOwedExposure{
+			{entry: &entry, session: e.sessionMarker},
+		}
+	}
+}
+
+func (e *experimentsState) scopeForLocked(subjectID string) string {
+	return buildExperimentScope(e.workspaceID, e.appKey, e.envKey, subjectID, e.baseURL, e.keyPrint)
+}
+
+// ── subject id persistence ──────────────────────────────────────────────────
+
+func (e *experimentsState) subjectFilePath() string {
+	if e.spoolDir == "" {
+		return ""
+	}
+	return filepath.Join(e.spoolDir, expSubjectFileName)
+}
+
+// currentSubjectIDLocked returns the stored subject id when it is
+// wire-valid, else "". Never mints. The persisted value is read at most
+// once per process; adoption updates the cached copy.
+func (e *experimentsState) currentSubjectIDLocked() string {
+	if !e.subjectChecked {
+		e.subjectChecked = true
+		raw := e.memorySubjectID
+		if path := e.subjectFilePath(); path != "" {
+			if data, err := os.ReadFile(path); err == nil {
+				raw = strings.TrimSpace(string(data))
+			}
+		}
+		if validExperimentSubjectID(raw) {
+			e.subjectID = raw
+		}
+	}
+	return e.subjectID
+}
+
+// adoptMintedSubjectIDLocked mints and adopts a fresh subject id. A new
+// subject is a new cache scope AND a new exposure subject: assignments
+// fetched for the old subject must neither serve nor expose GOING FORWARD,
+// and the session's exposure de-dupe resets — the de-dupe tuple is per
+// (experiment, version, SUBJECT), so the new subject's first application
+// must emit even where the old subject's already did. Owed exposure
+// snapshots are deliberately RETAINED: a treatment that already ran under
+// the old subject is a fact about the past, its fact carries the
+// server-minted fact key (never the subject id), and its tuple — old
+// subject included — stays distinct from anything the new subject arms. A
+// failed persist is diagnosed and the minted id still rules this process,
+// so one session stays self-consistent.
+func (e *experimentsState) adoptMintedSubjectIDLocked() (string, bool) {
+	minted, err := mintExperimentSubjectID()
+	if err != nil {
+		return "", false
+	}
+	e.entries = make(map[string]*expEntry)
+	e.exposed = make(map[string]expExposed)
+	e.subjectID = minted
+	e.subjectChecked = true
+	persisted := true
+	if path := e.subjectFilePath(); path != "" {
+		if err := writePrivateFileAtomic(path, []byte(minted+"\n"), os.Rename, nil); err != nil {
+			persisted = false
+		}
+	} else {
+		e.memorySubjectID = minted
+	}
+	return minted, persisted
+}
+
+// ── durable record IO (all under mu) ────────────────────────────────────────
+
+func (e *experimentsState) cacheFilePath() string {
+	if e.spoolDir == "" {
+		return ""
+	}
+	return filepath.Join(e.spoolDir, expCacheFileName)
+}
+
+// loadDurableRecordLocked loads the stored record, or nil when absent or
+// unusable: a missing, over-limit, or unparseable file — or one without a
+// scope stamp — is a clean start, decided before unbounded memory is spent
+// reading it. Entries are sanitized field-by-field (corrupt = miss).
+func (e *experimentsState) loadDurableRecordLocked() *expDurableRecord {
+	path := e.cacheFilePath()
+	if path == "" {
+		if e.memoryRecord == nil {
+			return nil
+		}
+		copied := expDurableRecord{Scope: e.memoryRecord.Scope, Entries: sanitizeExperimentEntries(e.memoryRecord.Entries)}
+		return &copied
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	data, err := io.ReadAll(io.LimitReader(file, expMaxRecordBytes+1))
+	_ = file.Close()
+	if err != nil || len(data) > expMaxRecordBytes {
+		return nil
+	}
+	var record expDurableRecord
+	if json.Unmarshal(data, &record) != nil {
+		return nil
+	}
+	if record.Scope == "" {
+		return nil
+	}
+	record.Entries = sanitizeExperimentEntries(record.Entries)
+	return &record
+}
+
+// saveDurableRecordLocked persists the record atomically (private file, no
+// JSON HTML escaping; the record clamp refuses a write that could not be
+// read back whole). Returns false when the write did not land — the
+// previously stored record stays untouched.
+func (e *experimentsState) saveDurableRecordLocked(record *expDurableRecord) bool {
+	if e.failDurableWritesForTests {
+		return false
+	}
+	if record == nil || record.Scope == "" {
+		return false
+	}
+	stored := expDurableRecord{Scope: record.Scope, Entries: sanitizeExperimentEntries(record.Entries)}
+	path := e.cacheFilePath()
+	if path == "" {
+		e.memoryRecord = &stored
+		return true
+	}
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(stored); err != nil {
+		return false
+	}
+	if buf.Len() > expMaxRecordBytes {
+		return false
+	}
+	return writePrivateFileAtomic(path, buf.Bytes(), os.Rename, nil) == nil
+}
+
+// clearDurableRecordLocked drops the stored record outright (loads as "no
+// cache" afterwards). Returns true when the clear landed.
+func (e *experimentsState) clearDurableRecordLocked() bool {
+	if e.failDurableWritesForTests {
+		return false
+	}
+	path := e.cacheFilePath()
+	if path == "" {
+		e.memoryRecord = nil
+		return true
+	}
+	err := os.Remove(path)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	return true
+}
+
+// durableRecordForLocked returns the stored record for scope, or a fresh
+// empty one (a record stamped for any other scope is dead weight and is
+// overwritten by the next write).
+func (e *experimentsState) durableRecordForLocked(scope string) *expDurableRecord {
+	if record := e.loadDurableRecordLocked(); record != nil && record.Scope == scope {
+		return record
+	}
+	return &expDurableRecord{Scope: scope, Entries: make(map[string]expEntry)}
+}
+
+// syncDurableEntryLocked converges one experiment's durable entry to the
+// in-memory truth: an entry present in memory is written, an absent one is
+// dropped. asOf stamps the state change (the entry's own fetch time for a
+// write, the resolution time for a drop) and drives the sibling freshness
+// fence. isRetry marks an owed-sync retry: only there does the fence apply
+// to DROPS — at decision time a drop resolves whatever the shared record
+// holds, clock rollbacks included, and its stamp is raised ABOVE that
+// record; a retry may instead run after a sibling client persisted a
+// genuinely newer assignment the drop never saw, and yields to it. The
+// same asymmetry holds for WRITES: at decision time a fresh authoritative
+// write supersedes the stored record (raising its own stamp above it, so a
+// wall-clock rollback can never leave the superseded variant as reload
+// truth), while an owed retry yields to a strictly-fresher sibling write.
+// Returns true when the disk agrees with memory; false marks the key owed
+// with the raised stamp and the intent (a later ordinary fail-closed latch
+// cancels owed WRITES but must let owed authoritative DROPS land).
+func (e *experimentsState) syncDurableEntryLocked(scope, experimentKey string, asOf int64, isRetry bool) bool {
+	entry := e.entries[experimentKey]
+	record := e.durableRecordForLocked(scope)
+	stored, hasStored := record.Entries[experimentKey]
+	if entry != nil {
+		if hasStored && stored.FetchedAtMS > entry.FetchedAtMS {
+			if isRetry {
+				// A same-namespace sibling persisted a FRESHER entry after
+				// this write was decided: never roll the shared record back.
+				delete(e.durablePending, experimentKey)
+				return true
+			}
+			entry.FetchedAtMS = stored.FetchedAtMS + 1
+		}
+		record.Entries[experimentKey] = *entry
+		asOf = entry.FetchedAtMS
+	} else {
+		if !hasStored {
+			delete(e.durablePending, experimentKey)
+			return true
+		}
+		if isRetry && stored.FetchedAtMS > asOf {
+			// The RETRY of an owed drop found an entry stamped after the
+			// drop was decided: a sibling client persisted a newer
+			// assignment this drop never resolved. Deleting it would lose
+			// newer valid state, so the outranked drop settles instead.
+			delete(e.durablePending, experimentKey)
+			return true
+		}
+		if !isRetry && stored.FetchedAtMS >= asOf {
+			// At DECISION time a drop always wins over the stored record it
+			// resolves: the wall clock can move backward, and fencing the
+			// delete on raw stamps would let a rollback revive a killed
+			// variant at the next launch. Raise the drop's effective stamp
+			// above the record instead.
+			asOf = stored.FetchedAtMS + 1
+		}
+		delete(record.Entries, experimentKey)
+	}
+	if e.saveDurableRecordLocked(record) {
+		delete(e.durablePending, experimentKey)
+		return true
+	}
+	if entry != nil && hasStored {
+		// The refresh write failed with a superseded entry still stored:
+		// tombstone it best-effort (the smaller record often fits where the
+		// refreshed one did not), so a relaunch starts clean rather than
+		// serving the variant memory already replaced. The owed retry below
+		// still converges the disk to the full entry when storage recovers.
+		delete(record.Entries, experimentKey)
+		e.saveDurableRecordLocked(record)
+	}
+	e.durablePending[experimentKey] = expOwedSync{asOf: asOf, drop: entry == nil}
+	return false
+}
+
+// demoteOwedClearLocked demotes an owed whole-record clear into per-key
+// drops for exactly the keys the clear still covers — everything on disk
+// that memory does not hold — each stamped by the clear decision, raised
+// above the covered record (the sentinel is decisive over the state it
+// withdrew). Runs from the retry cycle AND at fresh-install time: a fresh
+// authorized assignment landing after the failed clear supersedes the
+// whole-record form immediately, so a later ordinary auth latch — which
+// empties memory while RETAINING the durable record — can never leave the
+// stale clear armed to wipe state written after it.
+func (e *experimentsState) demoteOwedClearLocked() {
+	if !e.durableClearPending {
+		return
+	}
+	clearAsOf := e.durableClearAsOf
+	e.durableClearPending = false
+	e.durableClearAsOf = 0
+	record := e.loadDurableRecordLocked()
+	if record == nil {
+		return
+	}
+	for key, stored := range record.Entries {
+		if e.entries[key] != nil {
+			continue
+		}
+		asOf := clearAsOf
+		if stored.FetchedAtMS >= asOf {
+			asOf = stored.FetchedAtMS + 1
+		}
+		e.durablePending[key] = expOwedSync{asOf: asOf, drop: true}
+	}
+}
+
+// retryDurableSync retries every owed durable write (and an owed
+// whole-record clear) so the disk converges as soon as storage recovers,
+// instead of waiting for an unrelated write or a relaunch. Local disk
+// housekeeping only: no network, no serving decisions, so it runs
+// regardless of the consent state — a kill drop decided under grant must
+// land durably even if consent flips.
+func (e *experimentsState) retryDurableSync() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.durableClearPending {
+		if len(e.entries) > 0 {
+			// Newer authorized state was installed after the failed clear:
+			// the clear must not wipe it — demote it to the per-key drops
+			// it still covers.
+			e.demoteOwedClearLocked()
+		} else if e.clearDurableRecordLocked() {
+			e.durableClearPending = false
+			e.durableClearAsOf = 0
+			e.durablePending = make(map[string]expOwedSync)
+		}
+	}
+	if len(e.durablePending) == 0 {
+		return
+	}
+	subject := e.currentSubjectIDLocked()
+	if subject == "" {
+		return
+	}
+	scope := e.scopeForLocked(subject)
+	keys := make([]string, 0, len(e.durablePending))
+	for key := range e.durablePending {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		pending := e.durablePending[key]
+		e.syncDurableEntryLocked(scope, key, pending.asOf, true)
+	}
+}
+
+// ── install ─────────────────────────────────────────────────────────────────
+
+// installLocked settles an authoritative fetch outcome and, when it may,
+// installs it. Gates, in remote-config order: the auth epoch must still be
+// current (an outcome whose fetch was already in flight when a fail-closed
+// latch landed is discarded outright — it must neither unlatch nor
+// reinstall revoked assignments), the scope must still be current (a
+// subject re-minted while the response was in flight makes it another
+// subject's assignment), then the per-key sequence fence, then the
+// outcome's own directives. Returns install directives for the caller's
+// off-lock work: whether an exposure sweep is owed, whether a durable
+// persist failure must be surfaced, and whether the real-subjects sentinel
+// drop actually landed (vs being discarded by a gate).
+func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string, outcome expOutcome, authEpoch uint64, resolvedAtMS int64) (sweepOwed, persistFailed, dropAllLanded bool) {
+	if authEpoch != e.authEpoch {
+		return false, false, false
+	}
+	subject := e.currentSubjectIDLocked()
+	if subject == "" || e.scopeForLocked(subject) != scope {
+		return false, false, false
+	}
+	fenceKey := scope + rcScopeSeparator + experimentKey
+	if seq <= e.settled[fenceKey] {
+		return false, false, false
+	}
+	if outcome.authoritative {
+		e.settled[fenceKey] = seq
+	}
+	if outcome.authBlocked {
+		// Fail closed: stop serving every cached assignment (the getters
+		// return nothing), halt revalidation, and open a new auth epoch so
+		// every response still in flight is discarded — only a fetch
+		// started AFTER this moment may unlatch. The durable record is
+		// retained (a re-init may serve it and re-probe) unless the
+		// real-subjects sentinel says the platform withdrew the
+		// assignments outright.
+		e.authBlocked = true
+		e.authEpoch++
+		e.entries = make(map[string]*expEntry)
+		if outcome.dropAll {
+			// The sentinel withdraws the assignments AND their subject-fact
+			// keys outright: owed exposure snapshots carry those keys and
+			// go with them.
+			e.pendingExposure = make(map[string][]*expOwedExposure)
+			if e.clearDurableRecordLocked() {
+				e.durablePending = make(map[string]expOwedSync)
+			} else {
+				// The withdrawn assignments are still on disk: mark the
+				// clear OWED — stamped by this resolution — and retry it
+				// every cycle until it lands.
+				e.durableClearPending = true
+				e.durableClearAsOf = resolvedAtMS
+				return false, true, true
+			}
+			return false, false, true
+		} else {
+			// An ORDINARY 401/403 retains the durable record — and the owed
+			// EXPOSURE snapshots: a treatment that already ran is a fact
+			// about the past, and the latch stops future serving, not the
+			// reporting of what happened (the sweep keeps draining them
+			// while consent admits). An owed cache WRITE whose entry this
+			// latch just cleared from memory must not decay into a delete
+			// at the next retry — absence in memory here is fail-closed
+			// serving, not a drop decision — so owed writes are cancelled
+			// (their source data is gone; the disk keeps its last-known
+			// record). Owed DROPS were authoritative server decisions and
+			// still land.
+			for key, pending := range e.durablePending {
+				if !pending.drop {
+					delete(e.durablePending, key)
+				}
+			}
+		}
+		return false, false, false
+	}
+	if outcome.authoritative {
+		// An authoritative, authorized outcome of a post-latch fetch (the
+		// epoch gate above guarantees that) proves the credential works
+		// again: unlatch and let revalidation resume.
+		e.authBlocked = false
+	}
+	if outcome.transient {
+		return false, false, false
+	}
+	// A settled authoritative answer resets the consecutive-failure
+	// counter. A server-set Retry-After deadline is deliberately NOT
+	// cleared here: the pacing is shared by every cached entry, and one
+	// admitted request for an unrelated entry does not rescind the server's
+	// wait for the plane — the deadline simply expires on its own (clamped
+	// to a day; the deferral setter already keeps only the LATEST
+	// deadline).
+	e.backoffAttempt = 0
+	if outcome.dropEntry {
+		dropped := e.entries[experimentKey]
+		delete(e.entries, experimentKey)
+		// The OWED exposures deliberately survive the drop: an application
+		// that already happened is a fact — the drop stops future serving,
+		// not the record of real treatment. The durable drop converges
+		// keyed on the DISK state (a latch may have cleared serving while
+		// the record retains the entry) and is retried until it lands — the
+		// kill rule demands the drop reach the disk. The drop's effective
+		// stamp is raised above the entry it resolves: the wall clock can
+		// move backward, and a drop for X must always outrank X's own
+		// stamp.
+		asOf := resolvedAtMS
+		if dropped != nil && dropped.FetchedAtMS >= asOf {
+			asOf = dropped.FetchedAtMS + 1
+		}
+		persisted := e.syncDurableEntryLocked(scope, experimentKey, asOf, false)
+		return false, !persisted, false
+	}
+	if outcome.newEntry != nil {
+		entry := outcome.newEntry
+		entry.SubjectKey = subject
+		entry.Attributes = outcome.attributes
+		e.entries[experimentKey] = entry
+		// A fresh authorized assignment supersedes any owed whole-record
+		// clear RIGHT NOW, not at the next cycle: waiting would leave the
+		// stale clear armed across an ordinary auth latch (which empties
+		// memory while retaining the durable record), and the retention
+		// canon must never let that clear delete state written after it.
+		e.demoteOwedClearLocked()
+		persisted := e.syncDurableEntryLocked(scope, experimentKey, entry.FetchedAtMS, false)
+		e.armRevalidationLocked(resolvedAtMS, nil)
+		// The variant takes effect at this resolution (a variant change on
+		// republish applies here too): the application point. The snapshot
+		// is ARMED behind any still-owed earlier applications (the queue
+		// preserves them — a full analytics queue must not cost the
+		// previous treatment its fact) and the caller's off-lock sweep
+		// drains in order; a locally failed emit is retried by the cycle
+		// sweep instead of being lost.
+		e.armExposureLocked(experimentKey, entry)
+		return true, !persisted, false
+	}
+	return false, false, false
+}
+
+// ── exposure arming (state side; emission lives in experiment_facts.go) ─────
+
+// armExposureLocked arms one application snapshot for emission. A
+// same-(session, tuple) snapshot already armed at the tail is refreshed in
+// place (purges re-arm the same application; the de-dupe collapses
+// same-tuple emissions anyway), so the queue only grows across genuinely
+// distinct applications. The FIFO is bounded; overflowing drops the OLDEST
+// with a diagnostic, so a new application displacing the slot cannot
+// silently lose the previous application's still-unemitted fact.
+func (e *experimentsState) armExposureLocked(experimentKey string, entry *expEntry) (overflowed bool) {
+	list := e.pendingExposure[experimentKey]
+	if tail := lastOwedExposure(list); tail != nil && tail.session == e.sessionMarker &&
+		exposureTupleKey(experimentKey, tail.entry) == exposureTupleKey(experimentKey, entry) {
+		tail.entry = entry
+		return false
+	}
+	list = append(list, &expOwedExposure{entry: entry, session: e.sessionMarker})
+	if len(list) > expMaxOwedExposures {
+		list = list[1:]
+		e.owedExposureOverflow++
+		overflowed = true
+	}
+	e.pendingExposure[experimentKey] = list
+	return overflowed
+}
+
+// drainOwedExposureOverflowLocked reports and resets the FIFO-overflow
+// count for the caller's diagnostic.
+func (e *experimentsState) drainOwedExposureOverflowLocked() int {
+	count := e.owedExposureOverflow
+	e.owedExposureOverflow = 0
+	return count
+}
+
+func lastOwedExposure(list []*expOwedExposure) *expOwedExposure {
+	if len(list) == 0 {
+		return nil
+	}
+	return list[len(list)-1]
+}
+
+// owedTupleArmedLocked reports whether the queue still holds an armed
+// CURRENT-SESSION snapshot for the tuple: this session's automatic arm-0
+// emission is owed, not yet emitted. Prior sessions' owed snapshots are
+// another session's facts and do not count against this session's arm
+// accounting.
+func (e *experimentsState) owedTupleArmedLocked(experimentKey, tuple string) bool {
+	for _, owed := range e.pendingExposure[experimentKey] {
+		if owed.session == e.sessionMarker && exposureTupleKey(experimentKey, owed.entry) == tuple {
+			return true
+		}
+	}
+	return false
+}
+
+// onAnalyticsPurge re-arms this session's emissions after a consent denial
+// purged queued-but-unpublished analytics facts — exposure facts included.
+// Those facts never reached the server, so a later re-grant of the retained
+// assignment emits the exposure again instead of silently under-counting
+// real treatment. Facts that HAD already published — or were mid-flight,
+// wire-ambiguous, when the denial landed — simply collapse server-side as
+// duplicates of their deterministic event ids (the re-emission derives the
+// SAME id for the same session, tuple, and arm), so the blanket re-arm is
+// safe on both sides of the ambiguity.
+func (e *experimentsState) onAnalyticsPurge() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.purgeEpoch++
+	e.exposed = make(map[string]expExposed)
+	for key, entry := range e.entries {
+		e.armExposureLocked(key, entry)
+	}
+}
+
+// teardown stops the consumer: an in-flight response landing afterwards is
+// discarded outright — nothing installs, persists, paces, or surfaces.
+func (e *experimentsState) teardown() {
+	e.mu.Lock()
+	e.tornDown = true
+	e.mu.Unlock()
+}
+
+// ── revalidation cadence state ──────────────────────────────────────────────
+
+// armRevalidationLocked schedules the next revalidation cycle:
+// 300s ± 10% uniform jitter from now. jitter is the caller's [0, 1) source
+// (the client's seeded jitter seam); nil uses the midpoint.
+func (e *experimentsState) armRevalidationLocked(nowMS int64, jitter func() float64) {
+	unit := 0.5
+	if jitter != nil {
+		unit = jitter()
+	}
+	factor := 1 + (unit*2-1)*expRevalidateJitter
+	e.revalidateAtMS = nowMS + int64(math.Floor(expRevalidateIntervalSeconds*factor*1000))
+}
+
+// deferRevalidationLocked parks the cadence until a deadline. Monotone: only
+// the LATEST deadline is kept, and a deferral never shortens an armed one.
+// Clamped to one day so a hostile or bugged header cannot park the plane
+// (and its kill checks) indefinitely.
+func (e *experimentsState) deferRevalidationLocked(nowMS int64, seconds int) {
+	if seconds <= 0 {
+		return
+	}
+	if seconds > expMaxDeferSeconds {
+		seconds = expMaxDeferSeconds
+	}
+	deadline := nowMS + int64(seconds)*1000
+	if deadline > e.retryAfterMS {
+		e.retryAfterMS = deadline
+	}
+}
+
+// paceTransientLocked paces the revalidation cadence after a transient
+// failure: a server Retry-After wins; otherwise exponential backoff with
+// full jitter (transport parity — the first failure is free, then the
+// ceiling doubles per consecutive failure up to the cap).
+func (e *experimentsState) paceTransientLocked(nowMS int64, retryAfterSeconds int, retryAfterPresent bool, jitter func() float64) {
+	if retryAfterPresent && retryAfterSeconds > 0 {
+		e.deferRevalidationLocked(nowMS, retryAfterSeconds)
+		return
+	}
+	e.backoffAttempt++
+	if e.backoffAttempt < 2 {
+		return
+	}
+	exp := e.backoffAttempt - 2
+	if exp > 16 {
+		exp = 16
+	}
+	ceiling := float64(expBackoffBaseSeconds) * math.Pow(2, float64(exp))
+	if ceiling > expBackoffCapSeconds {
+		ceiling = expBackoffCapSeconds
+	}
+	unit := 0.5
+	if jitter != nil {
+		unit = jitter()
+	}
+	wait := float64(expBackoffBaseSeconds) + unit*(ceiling-float64(expBackoffBaseSeconds))
+	e.deferRevalidationLocked(nowMS, int(math.Ceil(wait)))
+}
+
+// ── the fetch (on *Client: transport, clock, lifecycle) ─────────────────────
+
+// expFetchError formats a fetch outcome with no usable verdict; the
+// taxonomy code is the machine-readable part of the message (the
+// remote-config error convention).
+func expFetchError(code string) error {
+	return fmt.Errorf("shardpilot experiment assignment fetch failed: %s", code)
+}
+
+// FetchExperimentAssignment performs one explicit (host-triggered)
+// assignment fetch for experimentKey and blocks for its outcome.
+// attributes is the optional server-evaluated targeting attribute set
+// (allowlisted names plus the custom_attribute_* family; out-of-vocabulary
+// names and unusable values are dropped, never sent). A nil error means the
+// host has a usable verdict — fresh, or served from the last-known-good
+// cache over a transient failure (FromCache=true with Code set), or a
+// first-class not-assigned answer (Assigned=false; Code "not_found" for an
+// unknown experiment). A non-nil error means no usable verdict:
+// ErrConsentDenied/ErrConsentUnknown when the plane's consent gate refuses
+// (granted-only, forced-minor fully off), ErrClosed after Close, and
+// otherwise the taxonomy code in the error text ("unauthorized" fails
+// closed without serving the cache; "bad_request"/"http_<status>" are
+// permanent; "transient_..."/"http_0"/"malformed_response" are transient
+// with no usable cache; "superseded"/"stale_subject" mean a newer outcome
+// settled while this fetch was in flight and no cached assignment exists;
+// "experiment_key_required" and "subject_unavailable" fail before any
+// network use).
+//
+// Concurrent fetches are legal; an older response never overwrites (or,
+// for the sentinel, drops past) a newer settled outcome — a fenced-out
+// authoritative response serves the SETTLED current state to its caller,
+// never the discarded variant. Every fetch classifies independently: a
+// 401/403 halts the automatic revalidation lane and in-memory serving, and
+// a later authorized fetch started after the latch resumes both.
+func (c *Client) FetchExperimentAssignment(ctx context.Context, experimentKey string, attributes map[string]string) (ExperimentAssignmentResult, error) {
+	return c.fetchExperimentAssignment(ctx, experimentKey, attributes, false, nil)
+}
+
+func (c *Client) fetchExperimentAssignment(ctx context.Context, experimentKey string, attributes map[string]string, isRevalidation bool, presetAttributes []expAttribute) (ExperimentAssignmentResult, error) {
+	// The same lifecycle fence as Track and FetchRemoteConfig: Close either
+	// sees this fetch (and waits for it) or completed its closed store
+	// first (and this fetch is rejected).
+	c.lifecycleMu.Lock()
+	if c.closed.Load() {
+		c.lifecycleMu.Unlock()
+		return ExperimentAssignmentResult{}, ErrClosed
+	}
+	c.trackWG.Add(1)
+	c.lifecycleMu.Unlock()
+	defer c.trackWG.Done()
+
+	e := c.exp
+	if e == nil {
+		return ExperimentAssignmentResult{}, ErrExperimentsNotConfigured
+	}
+	experimentKey = strings.TrimSpace(experimentKey)
+	if experimentKey == "" {
+		return ExperimentAssignmentResult{}, expFetchError("experiment_key_required")
+	}
+	// GRANTED-ONLY plane (see the module header): while the effective
+	// consent state refuses analytics — the forced-minor state included —
+	// no request leaves the process, nothing is minted, nothing is served.
+	if err := c.experimentConsentRefusal(); err != nil {
+		return ExperimentAssignmentResult{}, err
+	}
+
+	e.mu.Lock()
+	if e.tornDown {
+		e.mu.Unlock()
+		return ExperimentAssignmentResult{}, ErrClosed
+	}
+	subject := e.currentSubjectIDLocked()
+	if subject == "" {
+		var persisted bool
+		subject, persisted = e.adoptMintedSubjectIDLocked()
+		if subject == "" {
+			e.mu.Unlock()
+			return ExperimentAssignmentResult{}, expFetchError("subject_unavailable")
+		}
+		if !persisted {
+			c.stats.setLastError("experiment_subject_persist_failed")
+			c.logf("shardpilot experiments: persisting the minted subject id failed; the id rules this process only (a restart re-buckets)")
+		}
+	}
+	e.fetchSeq++
+	seq := e.fetchSeq
+	// Capture the scope and the auth epoch ONCE per fetch: the URL, the
+	// served cache, and the installed entry all describe the same subject
+	// even if the id re-mints while the request is in flight, and an
+	// outcome that raced a fail-closed latch is discarded by the epoch
+	// gate at install time.
+	scope := e.scopeForLocked(subject)
+	authEpoch := e.authEpoch
+	var normalizedAttributes []expAttribute
+	dropped := 0
+	switch {
+	case presetAttributes != nil:
+		// Internal grammar-remint retry only: the EXACT normalized set of
+		// the rejected request rides the retry verbatim — the subject
+		// rotation cleared the cached entry the cadence would have re-read
+		// them from, and a targeted assignment must be retried with the
+		// same input set, not un-targeted.
+		normalizedAttributes = presetAttributes
+	case attributes != nil:
+		normalizedAttributes, dropped = normalizeExperimentAttributes(attributes)
+	case isRevalidation:
+		// A revalidation re-sends the attributes of the last host-supplied
+		// fetch for this experiment (one targeting vocabulary, one value
+		// set), so a server-evaluated condition keeps seeing the same
+		// subject it matched before. Only the CADENCE reuses them: a
+		// host-triggered fetch that omits attributes means what it says —
+		// it sends none, and none become the entry's remembered set.
+		if entry := e.entries[experimentKey]; entry != nil {
+			normalizedAttributes = entry.Attributes
+		}
+	}
+	fetchURL := buildExperimentAssignmentURL(e.baseURL, e.appKey, e.envKey, experimentKey, subject, normalizedAttributes)
+	e.mu.Unlock()
+	if dropped > 0 {
+		c.logf("shardpilot experiments: dropped %d targeting attribute(s) outside the vocabulary or value bounds for experiment %q", dropped, experimentKey)
+	}
+
+	callerCtx := ctx
+	fetchCtx, cancel := contextWithDefaultTimeout(ctx, c.cfg.HTTPTimeout)
+	defer cancel()
+	// The transport's remote-config GET is exactly this route's shape too —
+	// bare authenticated GET, redirects refused, bounded body read — with
+	// no If-None-Match: the assignment endpoint has no ETag/304 contract.
+	resp, err := c.transport.FetchRemoteConfig(fetchCtx, remoteConfigRequest{
+		url:    fetchURL,
+		bearer: c.cfg.APIKey,
+	})
+	if err != nil {
+		if callerCtx != nil {
+			if ctxErr := callerCtx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
+				// The CALLER's own context ended the fetch: an abort, not an
+				// endpoint outcome — no cache fallback, no fence side
+				// effects, just the caller's error back.
+				return ExperimentAssignmentResult{}, err
+			}
+		}
+		if resp.status == 0 {
+			// Transport-level failure before any status arrived: the
+			// transient http_0 class.
+			resp = remoteConfigResponse{}
+		}
+		// A non-zero status rode the error through: the SDK-internal
+		// deadline ended the BODY read after an authoritative status
+		// arrived. Classify BY STATUS with the incomplete-body marker — a
+		// stalled 401/403 fails closed (and can never be a sentinel), a
+		// stalled 404 stays permanent, only a stalled 200 is transient.
+	}
+	return c.settleExperimentFetch(experimentKey, attributes, isRevalidation, seq, scope, authEpoch, normalizedAttributes, resp)
+}
+
+// settleExperimentFetch is the response half of a fetch: the consent
+// re-check, the pure classification against the CURRENT fenced entry, the
+// grammar-remint path, pacing, the install, and the caller-result guards.
+func (c *Client) settleExperimentFetch(experimentKey string, attributes map[string]string, isRevalidation bool, seq uint64, scope string, authEpoch uint64, normalizedAttributes []expAttribute, resp remoteConfigResponse) (ExperimentAssignmentResult, error) {
+	e := c.exp
+	// A revocation while the request was in flight closes the plane.
+	// Nothing installs, nothing paces, nothing re-mints, and the caller
+	// receives the refusal — never a healthy assignment fetched under a
+	// consent that no longer holds.
+	if err := c.experimentConsentRefusal(); err != nil {
+		return ExperimentAssignmentResult{}, err
+	}
+
+	nowMS := c.clock.Now().UnixMilli()
+	e.mu.Lock()
+	if e.tornDown {
+		// A torn-down consumer discards in-flight responses outright:
+		// nothing installs, persists, or paces (the documented teardown
+		// contract).
+		e.mu.Unlock()
+		return ExperimentAssignmentResult{}, ErrClosed
+	}
+	// Classification reads the CURRENT fenced entry, not the one captured
+	// at dispatch: a kill or supersede that resolved while this request was
+	// in flight must not be undone in the RESULT either — a caller must
+	// never be handed a variant the fenced state no longer serves. A stale
+	// epoch or scope reads as no entry.
+	var entryNow *expEntry
+	if authEpoch == e.authEpoch {
+		if subjectNow := e.currentSubjectIDLocked(); subjectNow != "" && e.scopeForLocked(subjectNow) == scope {
+			entryNow = e.entries[experimentKey]
+		}
+	}
+	result, outcome, failure := applyExperimentAssignment(entryNow, resp, expRequestScope{
+		appKey:        e.appKey,
+		envKey:        e.envKey,
+		experimentKey: experimentKey,
+	}, nowMS)
+	outcome.attributes = normalizedAttributes
+	// Captured BEFORE install (which may settle this very seq): true when a
+	// NEWER outcome for this key already settled while this response was in
+	// flight, i.e. the install below discards it.
+	fenceKey := scope + rcScopeSeparator + experimentKey
+	fencedOut := seq <= e.settled[fenceKey]
+
+	if outcome.remint && !e.reminted && !fencedOut && authEpoch == e.authEpoch {
+		// The persisted subject id failed the wire grammar (storage
+		// corruption this client could not detect locally): re-mint once
+		// per process and retry as a fresh subject — from the revalidation
+		// path too, or a rejected cached subject would never heal until an
+		// explicit host fetch happens to run. A second grammar reject with
+		// a freshly minted id is a bug, never a loop. (Never reached under
+		// a mid-flight revocation: the consent gate above returns first, so
+		// no id is minted post-revocation.) The re-mint honors the SAME
+		// fences as any other outcome — a grammar reject that is fenced
+		// out, stale by epoch, or stale by scope must not rotate the
+		// persisted subject, wipe entries, or consume the one-shot budget:
+		// it falls through and is discarded like the stale outcome it is.
+		if subjectNow := e.currentSubjectIDLocked(); subjectNow != "" && e.scopeForLocked(subjectNow) == scope {
+			e.reminted = true
+			_, persisted := e.adoptMintedSubjectIDLocked()
+			e.mu.Unlock()
+			c.logf("shardpilot experiments: the server rejected the persisted subject id's grammar; re-minted once and retrying (the subject re-buckets, fresh-install semantics)")
+			if !persisted {
+				c.stats.setLastError("experiment_subject_persist_failed")
+			}
+			// The retry carries the SAME normalized attribute set the
+			// rejected request sent: the adopt above cleared the cached
+			// entry, so the cadence path could no longer recover its saved
+			// attributes on its own.
+			preset := normalizedAttributes
+			if preset == nil {
+				preset = []expAttribute{}
+			}
+			return c.fetchExperimentAssignment(context.Background(), experimentKey, attributes, isRevalidation, preset)
+		}
+	}
+	if outcome.transient && authEpoch == e.authEpoch {
+		// Pacing is gated on scope currency exactly like the install: a
+		// transient answer for a RE-MINTED-AWAY subject is discarded from
+		// state, and its Retry-After must be discarded with it — a stale
+		// 429/5xx must not park the CURRENT subject's revalidation (and
+		// kill checks) for up to the day clamp.
+		if subjectNow := e.currentSubjectIDLocked(); subjectNow != "" && e.scopeForLocked(subjectNow) == scope {
+			e.paceTransientLocked(nowMS, outcome.retryAfterSeconds, outcome.retryAfterPresent, c.experimentJitter())
+		}
+	}
+	sweepOwedNow, persistFailed, dropAllLanded := e.installLocked(seq, scope, experimentKey, outcome, authEpoch, nowMS)
+	// The epoch re-check guards the PUBLIC result like the install: a
+	// response that raced a fail-closed latch was discarded from state
+	// above, and its caller must not receive a healthy assignment either —
+	// it gets the closed result. (The latch-setting response itself
+	// re-derives its own identical closed result here.)
+	epochStale := authEpoch != e.authEpoch && !outcome.authBlocked
+	// The subject-scope re-check guards the result the same way: a subject
+	// re-minted while this response was in flight makes it ANOTHER
+	// subject's assignment — the install discarded it, and the caller must
+	// receive the miss, never the discarded variant.
+	subjectNow := e.currentSubjectIDLocked()
+	scopeStale := subjectNow == "" || e.scopeForLocked(subjectNow) != scope
+	// And the per-key sequence fence guards it last: an older AUTHORITATIVE
+	// response that a newer settled outcome already fenced out was
+	// discarded by the install, and its caller must receive the SETTLED
+	// current state — the cached assignment the getters serve, or the miss
+	// — never the fenced-out variant. Transient results already derive
+	// from the current fenced entry and pass through untouched.
+	var supersededResult ExperimentAssignmentResult
+	supersededFailure := ""
+	if !epochStale && !scopeStale && fencedOut && outcome.authoritative {
+		supersededResult, supersededFailure = serveExperimentEntryOrFail(e.entries[experimentKey], "superseded")
+	}
+	overflowed := e.drainOwedExposureOverflowLocked()
+	e.mu.Unlock()
+	if overflowed > 0 {
+		c.logf("shardpilot experiments: %d owed exposure snapshot(s) dropped (bounded queue overflow) — oldest first", overflowed)
+	}
+
+	if dropAllLanded {
+		c.logf("shardpilot experiments: the platform disabled real-subject assignment; dropped the cached assignments and their subject fact keys")
+	}
+	if persistFailed {
+		c.stats.setLastError("experiment_cache_persist_failed")
+		c.logf("shardpilot experiments: persisting the assignment cache failed; the write is owed and retried until it lands")
+	}
+	if sweepOwedNow {
+		// The freshly applied assignment's exposure fact (and any earlier
+		// owed ones for the key) drain now, off-lock, in FIFO order.
+		c.sweepExperimentExposures(experimentKey)
+	}
+
+	switch {
+	case epochStale:
+		return ExperimentAssignmentResult{}, expFetchError("unauthorized")
+	case scopeStale:
+		return ExperimentAssignmentResult{}, expFetchError("stale_subject")
+	case fencedOut && outcome.authoritative:
+		if supersededFailure != "" {
+			return ExperimentAssignmentResult{}, expFetchError(supersededFailure)
+		}
+		return supersededResult, nil
+	case failure != "":
+		return ExperimentAssignmentResult{}, expFetchError(failure)
+	default:
+		return result, nil
+	}
+}
+
+// experimentJitter adapts the client's uniform [0, 1) jitter seam for the
+// cadence math.
+func (c *Client) experimentJitter() func() float64 {
+	return c.jitterValue
+}
+
+// ── the cycle (background lane) ─────────────────────────────────────────────
+
+// experimentCycle is one lane cycle, driven every second by the background
+// goroutine (and directly by tests): owed durable writes retry FIRST and
+// regardless of consent (local disk housekeeping — a kill drop decided
+// under grant must land durably even if consent flipped meanwhile); then,
+// while consent admits, the owed-exposure sweep (cache-restored
+// applications, locally failed emissions, and applications whose facts a
+// consent purge re-armed all drain here); then the revalidation cadence —
+// while not auth latched, at least one assignment is cached, and no
+// Retry-After deadline parks it, every cached key re-fetches once per
+// armed interval. A parked revalidation never blocks anything: there is no
+// pending state to drain at shutdown.
+func (c *Client) experimentCycle() {
+	e := c.exp
+	if e == nil {
+		return
+	}
+	e.mu.Lock()
+	if e.tornDown {
+		e.mu.Unlock()
+		return
+	}
+	overflowed := e.drainOwedExposureOverflowLocked()
+	e.mu.Unlock()
+	if overflowed > 0 {
+		c.logf("shardpilot experiments: %d owed exposure snapshot(s) dropped (bounded queue overflow) — oldest first", overflowed)
+	}
+	e.retryDurableSync()
+	if c.experimentConsentRefusal() != nil {
+		return
+	}
+	c.sweepAllExperimentExposures()
+	nowMS := c.clock.Now().UnixMilli()
+	var keys []string
+	e.mu.Lock()
+	switch {
+	case e.authBlocked || len(e.entries) == 0:
+	case e.retryAfterMS != 0 && nowMS < e.retryAfterMS:
+	default:
+		if e.retryAfterMS != 0 {
+			e.retryAfterMS = 0
+		}
+		if e.revalidateAtMS == 0 {
+			e.armRevalidationLocked(nowMS, c.experimentJitter())
+		} else if nowMS >= e.revalidateAtMS {
+			e.armRevalidationLocked(nowMS, c.experimentJitter())
+			keys = make([]string, 0, len(e.entries))
+			for key := range e.entries {
+				keys = append(keys, key)
+			}
+			sort.Strings(keys)
+		}
+	}
+	e.mu.Unlock()
+	for _, key := range keys {
+		// Batched per cycle: one GET per cached entry, each re-sending its
+		// last host-supplied attributes. Outcomes apply at resolution; the
+		// fetch handles its own state (a latch mid-batch discards the
+		// siblings' responses through the epoch fence).
+		_, _ = c.fetchExperimentAssignment(context.Background(), key, nil, true, nil)
+	}
+}
+
+// runExperimentsLane is the background lane goroutine, started only when
+// the consumer is enabled: a one-second heartbeat driving experimentCycle
+// until the client stops. The cadence state (not the heartbeat) decides
+// when network work happens.
+func (c *Client) runExperimentsLane() {
+	defer close(c.expLaneDone)
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.stop:
+			return
+		case <-ticker.C:
+			c.exp.mu.Lock()
+			parked := c.exp.laneParkedForTests
+			c.exp.mu.Unlock()
+			if !parked {
+				c.experimentCycle()
+			}
+		}
+	}
+}
+
+// ── getters ─────────────────────────────────────────────────────────────────
+
+// ExperimentVariant returns the cached assigned variant key for an
+// experiment, or "". It never touches the network and serves "" while no
+// assignment is cached — or while the plane's consent gate refuses: the
+// plane is granted-only, so a non-admitted session sees no variants at all
+// (the cache record is retained, unserved, until a re-grant). Host code can
+// ship one code path with the control experience as its default.
+func (c *Client) ExperimentVariant(experimentKey string) string {
+	e := c.exp
+	if e == nil || strings.TrimSpace(experimentKey) == "" {
+		return ""
+	}
+	if c.experimentConsentRefusal() != nil {
+		return ""
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.tornDown {
+		return ""
+	}
+	if entry := e.entries[experimentKey]; entry != nil {
+		return entry.VariantKey
+	}
+	return ""
+}
+
+// ExperimentVariantPayload returns a copy of the cached assigned variant's
+// payload for an experiment, or nil — under exactly ExperimentVariant's
+// serving rules.
+func (c *Client) ExperimentVariantPayload(experimentKey string) map[string]any {
+	e := c.exp
+	if e == nil || strings.TrimSpace(experimentKey) == "" {
+		return nil
+	}
+	if c.experimentConsentRefusal() != nil {
+		return nil
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.tornDown {
+		return nil
+	}
+	if entry := e.entries[experimentKey]; entry != nil {
+		return deepCopyJSONMap(entry.VariantPayload, 0)
+	}
+	return nil
+}

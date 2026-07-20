@@ -121,6 +121,17 @@ type Client struct {
 	// defaults).
 	rc *remoteConfigState
 
+	// exp is the experiment-assignment consumer; nil when
+	// Config.ExperimentsEnabled is false — the default, with no experiment
+	// code paths at all (the public experiment surface refuses
+	// ErrExperimentsNotConfigured).
+	exp *experimentsState
+
+	// expLaneDone is closed when the experiments background lane goroutine
+	// exits; nil when the consumer is not enabled. Close waits on it
+	// (bounded by its context) like workerDone.
+	expLaneDone chan struct{}
+
 	// spool is the opt-in bounded disk spool; nil when Config.SpoolDir is
 	// unset (today's memory-only behavior, unchanged).
 	spool *diskSpool
@@ -287,8 +298,21 @@ func NewClient(cfg Config) (*Client, error) {
 		client.rc = newRemoteConfigState(normalized)
 		client.rc.preload()
 	}
+	if normalized.ExperimentsEnabled {
+		// The experiment-assignment consumer (dark unless opted in — while
+		// off there is no subject-id mint, no fetch, no lane goroutine, no
+		// fact emission, and no new persistence keys). The preload serves
+		// persisted last-known-good assignments immediately and re-arms
+		// their exposure facts for this instance.
+		client.exp = newExperimentsState(normalized)
+		client.exp.preload()
+		client.expLaneDone = make(chan struct{})
+	}
 
 	go client.run()
+	if client.exp != nil {
+		go client.runExperimentsLane()
+	}
 	client.emitSpoolDeadLetters(initDeadLetters)
 	return client, nil
 }
@@ -535,7 +559,25 @@ func (c *Client) finishClose(ctx context.Context) error {
 	c.closeDone = done
 	c.closeMu.Unlock()
 
+	// Experiments last-chance housekeeping runs BEFORE the final flush so
+	// owed durable syncs land and owed exposure facts enter the queue in
+	// time to ride it (a treatment applied under a FULL queue gets its
+	// fact the room the flush frees — see the second sweep below).
+	c.closeExperimentPreFlush()
 	err := c.Flush(ctx)
+	// The flush freed queue room: owed exposure facts that could not
+	// enqueue above get their last chance, then everything newly queued is
+	// delivered by one more flush pass (or spooled/counted by the worker's
+	// stop-path drain when that pass fails too). Best-effort by design — a
+	// still-failing enqueue is not a teardown blocker; the durable record
+	// re-arms live assignments at the next launch — and never silent:
+	// whatever enters the queue is counted by the close path's delivery
+	// accounting (spool/discard).
+	if c.closeExperimentPostFlush() {
+		if flushErr := c.Flush(ctx); flushErr != nil {
+			c.logf("shardpilot experiments: delivering owed exposure facts at close failed (they spool or are counted with the close remnant): %v", flushErr)
+		}
+	}
 	c.stopOnce.Do(func() {
 		close(c.stop)
 	})
@@ -544,6 +586,20 @@ func (c *Client) finishClose(ctx context.Context) error {
 	case <-contextDone(ctx):
 		if err == nil {
 			err = contextCause(ctx)
+		}
+	}
+	// The experiments background lane exits on the same stop signal; wait
+	// for it like workerDone so no lane-scheduled fetch or cache write
+	// outlives Close. (Its in-flight fetches are additionally fenced by
+	// trackWG, already waited out before finishClose, and the consumer is
+	// torn down above — a straggling response discards itself.)
+	if c.expLaneDone != nil {
+		select {
+		case <-c.expLaneDone:
+		case <-contextDone(ctx):
+			if err == nil {
+				err = contextCause(ctx)
+			}
 		}
 	}
 	// The consent sender drains decisions still pending when c.stop closes.
