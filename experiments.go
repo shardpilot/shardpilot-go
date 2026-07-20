@@ -1477,6 +1477,18 @@ func (e *experimentsState) syncDurableEntryLocked(scope, experimentKey string, a
 			}
 			entry.FetchedAtMS = stored.FetchedAtMS + 1
 		}
+		if existing, ok := e.durablePending[intentKey]; ok && !isRetry && existing.asOf >= entry.FetchedAtMS {
+			// A pending intent for this key (typically a capture-gated drop
+			// whose record half is blocked behind its frozen payload) is the
+			// key's LATEST decided outcome, and this fresh install strictly
+			// supersedes it in program order — but the stored record the
+			// stamp-raise above consulted predates the intent, so a
+			// same-millisecond resolution would leave the install's stamp
+			// EQUAL to the intent's asOf and the pair's later drop retry
+			// would outrank the newer assignment (deleting it) instead of
+			// settling. Rank the install above the intent it supersedes.
+			entry.FetchedAtMS = existing.asOf + 1
+		}
 		record.Entries[experimentKey] = *entry
 		asOf = entry.FetchedAtMS
 	} else {

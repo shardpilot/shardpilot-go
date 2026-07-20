@@ -297,6 +297,11 @@ func TestReinstallPreservesUnlandedCaptureDebt(t *testing.T) {
 		cfg.BatchSize = 1
 		cfg.BufferSize = 1
 	})
+	// A FROZEN clock forces the kill's asOf and the reinstall's stamp into
+	// the same millisecond — the collision a fast runner hits with the
+	// real clock — so the pending-intent stamp raise is exercised
+	// deterministically on every runtime.
+	client.clock = &expFakeClock{now: time.Now()}
 	defer func() {
 		capture.setStatus(http.StatusAccepted)
 		_ = client.Close(context.Background())
