@@ -5075,3 +5075,174 @@ func TestConsentFloorDuplicateIDExpiredRemnantStillCounted(t *testing.T) {
 		t.Fatalf("test shape: expected the stale copy refused for retry age")
 	}
 }
+
+func TestConsentFloorSettleUnlinkOrderMarkerOutlivesRecord(t *testing.T) {
+	// The settle's unlink ORDER: record file, dir-sync, THEN the marker
+	// (then a second sync) — the marker must OUTLIVE the record it
+	// condemns. Unlinking both before one sync lets a crash persist the
+	// MARKER's unlink but not the record's: no marker + the condemned
+	// spool.json back on disk + a stale granted record = the condemned
+	// events reload at the next launch.
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, spoolFileName), []byte(`{"v":1,"events":[]}`), 0o600); err != nil {
+		t.Fatalf("seed spool file: %v", err)
+	}
+	if err := createWipeOwedMarker(dir); err != nil {
+		t.Fatalf("seed marker: %v", err)
+	}
+	s := newDiskSpool(Config{
+		SpoolDir:      dir,
+		WorkspaceID:   "workspace-test",
+		AppID:         "app-test",
+		EnvironmentID: "develop",
+		AnonymousID:   "anon-spool-1",
+	})
+	if !s.owedWipe() {
+		t.Fatalf("test setup: expected the marker to derive an owed wipe")
+	}
+
+	var opsMu sync.Mutex
+	var ops []string
+	var syncFails atomic.Bool
+	syncFails.Store(true)
+	s.removeFn = func(path string) error {
+		opsMu.Lock()
+		ops = append(ops, "rm:"+filepath.Base(path))
+		opsMu.Unlock()
+		return os.Remove(path)
+	}
+	s.syncFn = func(string) error {
+		opsMu.Lock()
+		ops = append(ops, "sync")
+		opsMu.Unlock()
+		if syncFails.Load() {
+			return errors.New("dir sync refused")
+		}
+		return syncDir(dir)
+	}
+
+	// First settle: the record's unlink runs but its sync FAILS — the
+	// marker must still be on disk (not yet unlinked), so a crash here
+	// either keeps the marker (debt re-derived) or resurrects the record
+	// under the marker; never "no marker, record resurrected".
+	if s.settleOwedWipe() {
+		t.Fatalf("expected the settle refused while the record unlink cannot be synced")
+	}
+	if _, err := os.Stat(filepath.Join(dir, spoolFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("test shape: expected the record file unlinked in-process, got %v", err)
+	}
+	if !wipeOwedMarkerExists(dir) {
+		t.Fatalf("expected the marker to OUTLIVE the record: it must not be unlinked before the record's destruction is durably synced")
+	}
+	if !s.owedWipe() {
+		t.Fatalf("expected the wipe still owed after the refused sync")
+	}
+
+	// Healed: the settle completes in order — record unlink, sync, marker
+	// unlink, sync — and only then reopens.
+	syncFails.Store(false)
+	if !s.settleOwedWipe() {
+		t.Fatalf("expected the healed settle to complete")
+	}
+	if wipeOwedMarkerExists(dir) {
+		t.Fatalf("expected the marker consumed by the completed settle")
+	}
+	if s.owedWipe() {
+		t.Fatalf("expected the wipe settled")
+	}
+	opsMu.Lock()
+	got := strings.Join(ops, ",")
+	opsMu.Unlock()
+	want := "rm:" + spoolFileName + ",sync," +
+		"rm:" + spoolFileName + ",sync,rm:" + spoolWipeOwedFileName + ",sync"
+	if got != want {
+		t.Fatalf("unlink/sync order mismatch:\n got %s\nwant %s", got, want)
+	}
+}
+
+func TestConsentFloorMarkerCreateSerializedWithOwedFlag(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// The deferred-purge marker must be created under the SAME s.mu hold
+	// that sets the owed flag: released first, a concurrent settle
+	// (spoolMaintain, the append gate, a superseding grant) can consume
+	// the flag and complete a full wipe inside the window, after which
+	// the late marker create lands while memory says nothing is owed — a
+	// stale marker that wipes a later grant's events at the next start.
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the grant acknowledged", func() bool {
+		return client.Snapshot().ConsentRecorded == 1
+	})
+	state.setBatchOutcome(http.StatusServiceUnavailable)
+	if err := client.Enqueue(Event{ID: "evt-race-1", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Flush(context.Background()); err == nil {
+		t.Fatalf("expected the retryable batch failure that spools the event")
+	}
+	waitFor(t, 3*time.Second, "the event spooled durably", func() bool {
+		return client.Snapshot().Spooled == 1
+	})
+
+	var failing atomic.Bool
+	failing.Store(true)
+	var lockViolation atomic.Bool
+	settleResult := make(chan bool, 1)
+	var settleOnce sync.Once
+	client.spool.mu.Lock()
+	client.spool.renameFn = func(oldpath, newpath string) error {
+		if failing.Load() && strings.HasSuffix(newpath, consentRecordFileName) {
+			return errors.New("disk full")
+		}
+		return os.Rename(oldpath, newpath)
+	}
+	client.spool.markerFn = func(string) error {
+		// The serialization probe: if the owed-flag mutex can be taken
+		// HERE, the marker is being created outside the transition it must
+		// be atomic with.
+		if client.spool.mu.TryLock() {
+			client.spool.mu.Unlock()
+			lockViolation.Store(true)
+		}
+		// The worst-case maintain interleave: a settle launched at the
+		// exact creation point. Serialized, it can only run AFTER the
+		// marker is down — observing flag AND marker together, a
+		// legitimate full wipe.
+		settleOnce.Do(func() {
+			go func() { settleResult <- client.spool.settleOwedWipe() }()
+		})
+		return createWipeOwedMarker(dir)
+	}
+	client.spool.mu.Unlock()
+
+	client.SetConsent(false)
+	if lockViolation.Load() {
+		t.Fatalf("the wipe-owed marker was created OUTSIDE the s.mu hold that sets the owed flag — a concurrent settle can orphan it")
+	}
+	if !<-settleResult {
+		t.Fatalf("expected the interleaved settle to complete a legitimate full wipe once the flag+marker transition finished")
+	}
+
+	// No orphaned marker anywhere: heal, let the owed-record retry finish
+	// the denial durably, and end clean.
+	failing.Store(false)
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush after the heal: %v", err)
+	}
+	waitFor(t, 3*time.Second, "the denial durably settled with no stale marker", func() bool {
+		recorded, ok := loadConsentRecord(dir, spoolTestActorDigest())
+		if !ok || recorded != ConsentDenied {
+			return false
+		}
+		client.spool.mu.Lock()
+		owed := client.spool.owed
+		client.spool.mu.Unlock()
+		return !owed && !wipeOwedMarkerExists(dir)
+	})
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}

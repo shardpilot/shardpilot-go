@@ -519,25 +519,36 @@ func (s *diskSpool) settleOwedWipeLocked() bool {
 	if !s.owed {
 		return true
 	}
+	// Unlink ORDER: the record file first, then a DIRECTORY fsync, and
+	// only then the marker (then a second sync) — the marker must OUTLIVE
+	// the record it condemns. Unlinking both before one sync would let a
+	// crash persist the MARKER's unlink but not the record's: no marker,
+	// the condemned spool.json back on disk, a stale granted record — the
+	// next launch would reload exactly what the denial condemned. With the
+	// record's unlink durably synced FIRST, every crash interleaving fails
+	// closed: the marker still on disk re-derives the debt and the settle
+	// re-runs; the marker durably gone implies the record already was.
+	// POSIX permits a crash to lose any un-synced unlink — and on the
+	// purge-debt destruction rung this settle IS the only durable outcome
+	// (record, marker, and record-retry all failed) — so a failed sync
+	// keeps the wipe owed (fail-closed, retried) and that rung falls to
+	// the surfaced posture.
 	if s.removeRecordFile() != nil {
 		return false
 	}
-	// The durable marker must come off BEFORE the spool reopens: with the
-	// marker still on disk, a restart would re-run the wipe and destroy
-	// events spooled after this settle — so a failed marker removal keeps
-	// the spool fail-closed (the record file is already gone; the next
-	// settle attempt retries just the marker).
+	if s.syncFn(s.dir) != nil {
+		return false
+	}
+	// The durable marker comes off only now — after the record's durable
+	// destruction — and BEFORE the spool reopens: a stale marker would
+	// re-condemn (wipe at the next start) anything spooled after this
+	// settle, so its removal must be durable too before the wipe settles.
+	// A failed removal or sync keeps the spool fail-closed (the record
+	// file is already durably gone; the next settle retries just the
+	// marker half).
 	if s.removeMarkerFile() != nil {
 		return false
 	}
-	// The unlinks are DURABLE only once the directory entry changes are
-	// fsynced: POSIX permits a crash to lose an un-synced unlink, which
-	// would resurrect the condemned record file — and on the purge-debt
-	// destruction rung this settle IS the only durable outcome (record,
-	// marker, and record-retry all failed), so a resurrected spool.json
-	// under the stale granted record would reload the condemned events. A
-	// failed sync keeps the wipe owed (fail-closed, retried), and the
-	// destruction rung falls to the surfaced posture.
 	if s.syncFn(s.dir) != nil {
 		return false
 	}
@@ -1796,11 +1807,22 @@ func (c *Client) applySpoolConsent(decision ConsentDecision, decidedAt string) (
 			// re-derives the debt at the next start (initSpool settles the
 			// marker before anything loads). Events a denial condemned must
 			// never resend, whatever decision follows.
+			// The marker lands under the SAME s.mu hold that sets the owed
+			// flag: releasing the lock first would let a concurrent settle
+			// (spoolMaintain, the append gate, a superseding grant) consume
+			// the flag and complete a FULL wipe inside the window — record
+			// and marker unlinked, owed cleared — after which the late
+			// marker create would land on disk while memory says nothing
+			// is owed: a stale marker that would wipe the events a later
+			// grant spools, at the next start. Serialized, a concurrent
+			// settle observes either no debt yet (a no-op) or the flag AND
+			// the marker together (a legitimate full wipe).
 			s.mu.Lock()
 			condemned = s.condemnEntriesLocked()
 			s.owed = true
+			markerErr := s.markerFn(s.dir)
 			s.mu.Unlock()
-			if markerErr := s.markerFn(s.dir); markerErr != nil {
+			if markerErr != nil {
 				// The debt marker could not be made durable either. The
 				// INVARIANT this branch upholds: it returns only after
 				// EITHER the denied record, the wipe-owed marker, or the
