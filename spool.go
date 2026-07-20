@@ -102,6 +102,19 @@ const (
 	// wall-clock skew in the stored deadline cannot park the client longer.
 	spoolMaxDeferralSeed = 24 * time.Hour
 
+	// spoolWithdrawnFileName is the durable withdrawal marker: event ids the
+	// real-subjects sentinel purge removed from the spool whose record
+	// rewrite has not landed yet. Terminal withdrawal is not an ordinary
+	// at-least-once ack — a crash between the purge and a successful
+	// rewrite must NOT resurrect withdrawn facts into the next process's
+	// resend queue — so the ids persist first and the marker spends only
+	// once a rewrite without those entries lands. Honored at load.
+	spoolWithdrawnFileName = "spool.withdrawn.json"
+
+	// spoolWithdrawnReadLimit bounds the marker read (ids are ~40 bytes
+	// each; the bound is generous past any legitimate marker).
+	spoolWithdrawnReadLimit = 256 << 10
+
 	// spoolRecordReadOverhead is the fixed allowance over SpoolMaxBytes for
 	// the record's own JSON framing when reading spool.json back. Every save
 	// re-applies the byte cap to the EVENT bytes before writing, so a
@@ -170,6 +183,11 @@ type diskSpool struct {
 	dir       string
 	maxEvents int
 	maxBytes  int
+
+	// withdrawnMarkerOwed reports a live withdrawal marker on disk: it
+	// spends (removes) after the next successful record rewrite, which by
+	// then excludes the withdrawn entries.
+	withdrawnMarkerOwed bool
 
 	entries    []spoolEntry
 	ids        map[string]struct{}
@@ -424,6 +442,11 @@ func (s *diskSpool) saveLocked() error {
 			}
 		}
 		s.uncountedIDs = make(map[string]struct{})
+	}
+	if s.withdrawnMarkerOwed && s.removeWithdrawnMarkerLocked() {
+		// The record that just landed excludes the withdrawn entries
+		// (settledIDs kept them out of the merge): the marker is spent.
+		s.withdrawnMarkerOwed = false
 	}
 	return nil
 }
@@ -710,10 +733,27 @@ func (s *diskSpool) load(now time.Time) spoolLoadOutcome {
 		_ = s.removeRecordFile()
 		return outcome
 	}
+	withdrawn := readWithdrawnMarker(s.dir)
+	withdrawnIDs := make(map[string]struct{}, len(withdrawn))
+	for _, id := range withdrawn {
+		withdrawnIDs[id] = struct{}{}
+	}
+	if len(withdrawnIDs) > 0 {
+		s.withdrawnMarkerOwed = true
+	}
 	for _, raw := range record.Events {
 		var envelope spoolEnvelopeWire
 		_ = json.Unmarshal(raw, &envelope)
 		entry := spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: raw}
+		if _, isWithdrawn := withdrawnIDs[entry.id]; isWithdrawn {
+			// A previous process withdrew this envelope (the real-subjects
+			// sentinel) but exited before the clean rewrite landed: honor
+			// the durable withdrawal — never resend. Settled, so the
+			// merging save cannot resurrect it; the marker spends when the
+			// rewrite below (or any later one) lands.
+			s.recordSettledLocked(entry.id)
+			continue
+		}
 		if spoolEntryExpired(entry, now) {
 			s.recordSettledLocked(entry.id)
 			outcome.expired = append(outcome.expired, entry)
@@ -940,8 +980,13 @@ func (s *diskSpool) ack(ids []string) (removed []spoolEntry, persistFailed bool)
 // predicate reads the entry's exact wire bytes), with ack's mechanics: the
 // mirror, id set, byte total, and resend queue all forget the removed
 // entries, the removal is persisted, and the removed entries are returned
-// for the caller to dead-letter. A failed persist is reported the same way
-// ack reports one — the mirror is authoritative and the next save retries.
+// for the caller to dead-letter. Unlike an ack, this removal is a TERMINAL
+// WITHDRAWAL: before the mirror forgets anything, the removed ids persist
+// in the withdrawal marker, so a crash before a successful record rewrite
+// cannot resurrect withdrawn facts into the next process's resend queue —
+// the marker is honored at load and spends once a rewrite without those
+// entries lands. A failed persist is reported the same way ack reports one
+// — the mirror is authoritative and the next save retries.
 func (s *diskSpool) removeMatching(matches func(raw json.RawMessage) bool) (removed []spoolEntry, persistFailed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -949,11 +994,29 @@ func (s *diskSpool) removeMatching(matches func(raw json.RawMessage) bool) (remo
 		return nil, false
 	}
 	removedIDs := make(map[string]struct{})
-	kept := s.entries[:0]
 	for _, entry := range s.entries {
 		if matches(entry.raw) {
 			removed = append(removed, entry)
 			removedIDs[entry.id] = struct{}{}
+		}
+	}
+	if len(removed) == 0 {
+		return nil, false
+	}
+	// Durability first: persist the withdrawal intent BEFORE the mirror
+	// forgets the entries. A failed marker write proceeds regardless — the
+	// save below may still land the clean record; both failing is the
+	// storage-dead residual the persist flag surfaces.
+	ids := make([]string, 0, len(removed))
+	for _, entry := range removed {
+		ids = append(ids, entry.id)
+	}
+	if s.writeWithdrawnMarkerLocked(ids) == nil {
+		s.withdrawnMarkerOwed = true
+	}
+	kept := s.entries[:0]
+	for _, entry := range s.entries {
+		if _, isRemoved := removedIDs[entry.id]; isRemoved {
 			delete(s.ids, entry.id)
 			s.recordSettledLocked(entry.id)
 			s.totalBytes -= len(entry.raw)
@@ -962,9 +1025,6 @@ func (s *diskSpool) removeMatching(matches func(raw json.RawMessage) bool) (remo
 		kept = append(kept, entry)
 	}
 	s.entries = kept
-	if len(removed) == 0 {
-		return nil, false
-	}
 	keptResend := s.resend[:0]
 	for _, entry := range s.resend {
 		if _, isRemoved := removedIDs[entry.id]; !isRemoved {
@@ -974,6 +1034,58 @@ func (s *diskSpool) removeMatching(matches func(raw json.RawMessage) bool) (remo
 	s.resend = keptResend
 	persistFailed = s.saveLocked() != nil
 	return removed, persistFailed
+}
+
+// writeWithdrawnMarkerLocked persists the withdrawn-id set, merging any
+// still-unspent marker (a second purge before the first rewrite lands).
+func (s *diskSpool) writeWithdrawnMarkerLocked(ids []string) error {
+	seen := make(map[string]struct{})
+	all := make([]string, 0, len(ids))
+	for _, id := range append(readWithdrawnMarker(s.dir), ids...) {
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		all = append(all, id)
+	}
+	payload, err := json.Marshal(all)
+	if err != nil {
+		return err
+	}
+	return writePrivateFileAtomic(spoolWithdrawnPath(s.dir), payload, s.renameFn, s.chmodFn)
+}
+
+// removeWithdrawnMarkerLocked spends the marker; a missing file counts as
+// spent.
+func (s *diskSpool) removeWithdrawnMarkerLocked() bool {
+	err := s.removeFn(spoolWithdrawnPath(s.dir))
+	return err == nil || errors.Is(err, fs.ErrNotExist)
+}
+
+func spoolWithdrawnPath(dir string) string {
+	return filepath.Join(dir, spoolWithdrawnFileName)
+}
+
+// readWithdrawnMarker reads the withdrawn-id set (bounded; corrupt or
+// oversized reads as absent).
+func readWithdrawnMarker(dir string) []string {
+	file, err := os.Open(spoolWithdrawnPath(dir))
+	if err != nil {
+		return nil
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, spoolWithdrawnReadLimit+1))
+	if err != nil || len(data) > spoolWithdrawnReadLimit {
+		return nil
+	}
+	var ids []string
+	if json.Unmarshal(data, &ids) != nil {
+		return nil
+	}
+	return ids
 }
 
 // pullResendChunk takes up to limit startup-loaded entries for re-publish,
@@ -1279,6 +1391,19 @@ func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned b
 	s := c.spool
 	if s == nil {
 		return 0, nil, 0, 0
+	}
+	if c.exp != nil && request.expPurgeEpoch != c.expFactPurgeEpoch.Load() {
+		// A real-subjects sentinel purge landed AFTER this batch was built
+		// (it was in transport when the sentinel arrived): its withdrawn
+		// experiment facts must not be written back into the pipeline the
+		// purge just cleaned. Re-filter at respool time; the surviving
+		// members keep their exact bytes.
+		filtered, removed := filterWithdrawnFromBatchRequest(request)
+		if removed > 0 {
+			request = filtered
+			c.stats.dropped.Add(uint64(removed))
+			c.logf("shardpilot experiments: withheld %d withdrawn experiment fact(s) from a post-sentinel respool", removed)
+		}
 	}
 	eligible, refusedActors := c.partitionSpoolEligible(request)
 	c.notifySpoolDeadLetter(SpoolDropConsent, refusedActors)

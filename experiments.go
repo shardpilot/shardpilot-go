@@ -987,6 +987,16 @@ type experimentsState struct {
 	// degrades to the midpoint (no jitter) — construction always sets it.
 	jitterFn func() float64
 
+	// captureOwedDropFn, when set, durably captures an entry's still-owed
+	// exposure facts BEFORE the entry's durable delete lands (the fleet
+	// contract: a kill/not-assigned drop must not lose the fact of real
+	// treatment to a process death before the next sweep — the spool
+	// replays it at the next launch, and the deterministic event id
+	// collapses a double delivery server-side). Called under e.mu; the
+	// implementation must take no client lock and defer any integrator
+	// callbacks.
+	captureOwedDropFn func(experimentKey string, owed []*expOwedExposure)
+
 	// laneParkedForTests suspends the background lane's automatic ticks so
 	// tests can drive tick() deterministically. Never set in production.
 	laneParkedForTests bool
@@ -1712,7 +1722,17 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 		if outcome.dropAll {
 			// The sentinel withdraws the assignments AND their subject-fact
 			// keys outright: owed exposure snapshots carry those keys and
-			// go with them.
+			// go with them. The dedupe slate resets with them — a purged
+			// queued-undelivered automatic exposure must not leave its tuple
+			// marked emitted, or a later authorized re-fetch in this session
+			// would arm a replacement and suppress it as already-sent
+			// (under-counting real treatment). The blanket clear is safe on
+			// both sides of the delivery ambiguity: a fact that HAD
+			// delivered re-derives the SAME deterministic id and collapses
+			// server-side. The purge epoch bump fences emissions already in
+			// flight past their gates, exactly like the consent purge.
+			e.exposed = make(map[string]expExposed)
+			e.purgeEpoch++
 			e.pendingExposure = make(map[string][]*expOwedExposure)
 			if e.clearDurableRecordLocked() {
 				e.durablePending = make(map[string]expOwedSync)
@@ -1783,6 +1803,17 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 		asOf := resolvedAtMS
 		if dropped != nil && dropped.FetchedAtMS >= asOf {
 			asOf = dropped.FetchedAtMS + 1
+		}
+		// The narrow drop-time capture (fleet contract): the entry's durable
+		// delete is about to land while its exposure may still be owed only
+		// in memory — durably capture those owed facts FIRST, so a process
+		// death before the next sweep replays them from the spool instead of
+		// losing real treatment. Queue-full-without-drop stays memory-only
+		// by design; only the delete triggers capture.
+		if e.captureOwedDropFn != nil {
+			if owed := e.pendingExposure[experimentKey]; len(owed) > 0 {
+				e.captureOwedDropFn(experimentKey, owed)
+			}
 		}
 		persisted := e.syncDurableEntryLocked(scope, experimentKey, asOf, false)
 		return false, !persisted, false
@@ -1942,11 +1973,16 @@ func (e *experimentsState) paceTransientLocked(nowMS int64, retryAfterSeconds in
 	if retryAfterPresent {
 		// A PRESENT hint is the server's explicit pacing answer either way:
 		// positive parks the cadence; ZERO (a literal 0, or an HTTP-date
-		// already past) says "retry immediately" — no deferral, and no
-		// backoff arming either: the exponential streak is the guess for a
-		// server that said nothing, never an override of one that spoke.
+		// already past) says "retry immediately" — no deferral, no backoff
+		// arming (the exponential streak is the guess for a server that
+		// said nothing, never an override of one that spoke), AND any
+		// previously armed deferral clears: this is the LATEST fence-gated
+		// server word on pacing, and staying parked to an older deadline
+		// would defy it.
 		if retryAfterSeconds > 0 {
 			e.deferRevalidationLocked(nowMS, retryAfterSeconds)
+		} else {
+			e.retryAfterMS = 0
 		}
 		return
 	}
@@ -2284,6 +2320,9 @@ func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string
 	}
 	overflowed := e.drainOwedExposureOverflowLocked()
 	e.mu.Unlock()
+	// Dead-letters the locked install deferred (the drop-time owed capture
+	// runs under e.mu) dispatch here, with no lock held.
+	c.drainDeferredSpoolLetters()
 	if overflowed > 0 {
 		c.logf("shardpilot experiments: %d owed exposure snapshot(s) dropped (bounded queue overflow) — oldest first", overflowed)
 	}

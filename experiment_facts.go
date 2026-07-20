@@ -377,6 +377,14 @@ func (c *Client) TrackExperimentOutcome(experimentKey, outcomeKey string, outcom
 	if err := c.experimentConsentRefusal(); err != nil {
 		return err
 	}
+	// The emit lock serializes the outcome with a real-subjects sentinel
+	// purge exactly like exposures: without it this path could read a live
+	// entry, lose the race to purgeWithdrawnExperimentFacts, and enqueue a
+	// withdrawn subject-fact key AFTER the queue filter ran. Under the
+	// lock the outcome either enqueues before the filter (and is caught)
+	// or reads the already-cleared cache after it (and refuses).
+	e.emitMu.Lock()
+	defer e.emitMu.Unlock()
 	e.mu.Lock()
 	if e.tornDown {
 		e.mu.Unlock()
@@ -501,7 +509,7 @@ func (c *Client) purgeWithdrawnExperimentFacts() {
 // queue before the purge's filter ran are invisible to that filter, exactly
 // like the consent drain. Runs only on the worker goroutine; the seen-epoch
 // field is worker-owned state (the retainedRequest discipline).
-func (c *Client) dropWithdrawnExperimentFacts(batch []Event) []Event {
+func (c *Client) dropWithdrawnExperimentFacts(batch []Event, backoffAttempt *int) []Event {
 	epoch := c.expFactPurgeEpoch.Load()
 	if epoch == c.workerSeenExpFactPurge {
 		return batch
@@ -518,10 +526,143 @@ func (c *Client) dropWithdrawnExperimentFacts(batch []Event) []Event {
 	}
 	if removed > 0 {
 		c.stats.dropped.Add(uint64(removed))
-		// The retained wire bytes described the pre-filter batch.
-		c.retainedRequest = batchRequest{}
+		// The retained wire bytes described the pre-filter batch: filter
+		// them by the SAME predicate so surviving members keep their exact
+		// bytes — the byte-identical retry/spool contract must hold for
+		// host events that merely shared a batch with withdrawn facts (a
+		// wholesale clear would remarshal them, drifting if the caller
+		// mutated nested Props/Context after Enqueue). Filtering both
+		// sides with one predicate keeps the pair positionally aligned for
+		// the prefix-reuse builder; any residual mismatch falls back to
+		// the rebuild path by clearing.
+		filtered, _ := filterWithdrawnFromBatchRequest(c.retainedRequest)
+		if len(filtered.Events) == len(kept) {
+			c.retainedRequest = filtered
+		} else {
+			c.retainedRequest = batchRequest{}
+		}
+		if len(kept) == 0 {
+			// The whole held batch was withdrawn: the discarded batch takes
+			// its backoff streak with it (the consent-drop discipline) —
+			// post-sentinel events must never start deep in a schedule that
+			// belonged to condemned data.
+			*backoffAttempt = 0
+		}
 	}
 	return kept
+}
+
+// filterWithdrawnFromBatchRequest drops withdrawn experiment facts from a
+// built batch request, preserving the surviving members' exact wire bytes
+// and their envelope/raw pairing.
+func filterWithdrawnFromBatchRequest(request batchRequest) (batchRequest, int) {
+	if len(request.Events) == 0 || len(request.Events) != len(request.rawEvents) {
+		return request, 0
+	}
+	removed := 0
+	envelopes := make([]eventEnvelope, 0, len(request.Events))
+	raws := make([]json.RawMessage, 0, len(request.rawEvents))
+	for i, raw := range request.rawEvents {
+		if withdrawnExperimentFactRaw(raw) {
+			removed++
+			continue
+		}
+		envelopes = append(envelopes, request.Events[i])
+		raws = append(raws, raw)
+	}
+	if removed == 0 {
+		return request, 0
+	}
+	request.Events = envelopes
+	request.rawEvents = raws
+	return request, removed
+}
+
+// captureOwedExposuresForDrop durably captures an entry's still-owed
+// exposure facts into the disk spool — invoked by the install's drop branch
+// UNDER e.mu, BEFORE the entry's durable delete lands (the fleet contract:
+// a kill/not-assigned drop must not lose the fact of real treatment to a
+// process death before the next sweep). The next launch replays the spooled
+// envelope; a fact the live session ALSO delivers settles its spooled copy
+// by event id, and a double delivery collapses server-side on the
+// deterministic id. Queue-full-without-drop stays memory-only by design.
+//
+// Lock discipline: runs under e.mu, so it takes NO client lock (the fact
+// and envelope builders are lock-free; the spool's mutex is a leaf) and
+// DEFERS integrator dead-letter callbacks to the next off-lock drain.
+func (c *Client) captureOwedExposuresForDrop(experimentKey string, owed []*expOwedExposure) {
+	if c.spool == nil {
+		return
+	}
+	events := make([]Event, 0, len(owed))
+	for _, snapshot := range owed {
+		// The automatic owed emission is arm 0 by definition, and the id is
+		// exactly the one the live sweep would mint for it.
+		eventID := experimentExposureEventID(snapshot.session, snapshot.entry.SubjectKey, experimentKey, snapshot.entry.Version, 0)
+		event, skipCode := c.buildExperimentFactEvent(experimentExposureName, experimentKey, snapshot.entry, eventID)
+		if skipCode != "" {
+			continue // no server-safe fact exists for this snapshot
+		}
+		events = append(events, event)
+	}
+	if len(events) == 0 {
+		return
+	}
+	request, err := c.buildBatch(events)
+	if err != nil {
+		return
+	}
+	eligible, refusedActors := c.partitionSpoolEligible(request)
+	if len(refusedActors) > 0 {
+		c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropConsent, refusedActors))
+	}
+	if len(eligible) == 0 {
+		return
+	}
+	s := c.spool
+	refused, added, expired, evicted, persistFailed := s.append(eligible, 0, false, c.clock.Now(), func() bool {
+		return c.consent.Load() == consentStateGranted && s.grantPersisted
+	})
+	if refused {
+		c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropConsent, eligible))
+		return
+	}
+	if len(expired) > 0 {
+		c.stats.spoolExpired.Add(uint64(len(expired)))
+		c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropExpired, expired))
+	}
+	if len(added) > 0 && !persistFailed {
+		c.stats.spooled.Add(uint64(len(added)))
+	}
+	if len(evicted) > 0 {
+		c.stats.spoolEvicted.Add(uint64(len(evicted)))
+		c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropCapacity, evicted))
+	}
+	if persistFailed {
+		c.recordSpoolPersistFailure()
+	}
+}
+
+// deferSpoolLetter queues a dead-letter for the next off-lock drain point —
+// for spool work performed under a state lock, where invoking the
+// integrator callback directly could deadlock or re-enter.
+func (c *Client) deferSpoolLetter(letter SpoolDeadLetter) {
+	if len(letter.Envelopes) == 0 {
+		return
+	}
+	c.deferredLettersMu.Lock()
+	c.deferredSpoolLetters = append(c.deferredSpoolLetters, letter)
+	c.deferredLettersMu.Unlock()
+}
+
+// drainDeferredSpoolLetters dispatches deferred dead-letters with no lock
+// held.
+func (c *Client) drainDeferredSpoolLetters() {
+	c.deferredLettersMu.Lock()
+	letters := c.deferredSpoolLetters
+	c.deferredSpoolLetters = nil
+	c.deferredLettersMu.Unlock()
+	c.emitSpoolDeadLetters(letters)
 }
 
 // closeExperimentPreFlush is the first half of Close's last-chance pass,
@@ -549,6 +690,8 @@ func (c *Client) closeExperimentPreFlush() {
 	if c.experimentConsentRefusal() == nil {
 		c.sweepAllExperimentExposuresMode(true)
 	}
+	// Any dead-letters a locked capture deferred must not be lost at close.
+	c.drainDeferredSpoolLetters()
 }
 
 // closeExperimentPostFlush is the second half: the flush freed queue room,

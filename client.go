@@ -107,6 +107,13 @@ type Client struct {
 	expFactPurgeEpoch      atomic.Uint64
 	workerSeenExpFactPurge uint64
 
+	// deferredSpoolLetters holds dead-letters produced by spool work done
+	// under a state lock (the drop-time owed-exposure capture runs under
+	// e.mu); they dispatch at the next off-lock drain point — the
+	// integrator callback must never run with a lock held.
+	deferredLettersMu    sync.Mutex
+	deferredSpoolLetters []SpoolDeadLetter
+
 	// consentGate carries a context cancelled on consent denial so event
 	// publishes already in flight abort instead of completing against a
 	// freshly denied actor. SetConsent stores the denied state before
@@ -319,6 +326,7 @@ func NewClient(cfg Config) (*Client, error) {
 		// FIRST revalidation arm included, so fresh installs spread across
 		// the ±10% window instead of herding at exactly 300s.
 		client.exp.jitterFn = client.jitterValue
+		client.exp.captureOwedDropFn = client.captureOwedExposuresForDrop
 		client.exp.preload()
 		client.expLaneDone = make(chan struct{})
 	}
@@ -1051,7 +1059,7 @@ func (c *Client) jitterValue() float64 {
 func (c *Client) dropBatchOnConsentEpoch(batch []Event, seenEpoch *uint64, backoffAttempt *int) []Event {
 	// The sentinel-purge filter shares this gate: it runs at exactly the
 	// dispatch points the consent drop does, before any send.
-	batch = c.dropWithdrawnExperimentFacts(batch)
+	batch = c.dropWithdrawnExperimentFacts(batch, backoffAttempt)
 	epoch := c.consentEpoch.Load()
 	if epoch == *seenEpoch {
 		return batch

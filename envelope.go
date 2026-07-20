@@ -21,6 +21,13 @@ type batchRequest struct {
 	// (the typed Events are not reconstructed: a JSON round trip through Go
 	// values is not byte-stable).
 	rawEvents []json.RawMessage
+
+	// expPurgeEpoch is the real-subjects sentinel purge generation the batch
+	// was built under. A retriable failure that respools this request
+	// AFTER a newer purge (the batch was in transport when the sentinel
+	// landed) re-filters the withdrawn facts at respool time instead of
+	// writing them back into the pipeline the purge just cleaned.
+	expPurgeEpoch uint64
 }
 
 // MarshalJSON emits {"events":[...]} by joining rawEvents verbatim when they
@@ -157,7 +164,7 @@ func (c *Client) buildBatch(events []Event) (batchRequest, error) {
 		envelopes = append(envelopes, envelope)
 		raws = append(raws, raw)
 	}
-	return batchRequest{Events: envelopes, rawEvents: raws}, nil
+	return batchRequest{Events: envelopes, rawEvents: raws, expPurgeEpoch: c.expFactPurgeEpoch.Load()}, nil
 }
 
 // poisonedEvent is one batch member a worker-path build could not serialize:
@@ -235,7 +242,7 @@ func (c *Client) buildBatchIsolating(events []Event, retained batchRequest) (req
 		envelopes = append(envelopes, envelope)
 		raws = append(raws, raw)
 	}
-	return batchRequest{Events: envelopes, rawEvents: raws}, kept, poisoned
+	return batchRequest{Events: envelopes, rawEvents: raws, expPurgeEpoch: c.expFactPurgeEpoch.Load()}, kept, poisoned
 }
 
 func cloneMap(in map[string]any) map[string]any {
