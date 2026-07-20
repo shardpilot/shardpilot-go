@@ -488,10 +488,13 @@ func serveExperimentEntryOrFail(entry *expEntry, code string) (ExperimentAssignm
 }
 
 // experimentBodyErrorText extracts the body `error` string of a non-2xx
-// answer, or "". A truncated body never yields a sentinel — the equality
-// cannot be trusted — and reads as generic for its status.
+// answer, or "". A truncated OR over-limit body never yields a sentinel —
+// the equality cannot be trusted (an over-limit read is a truncated VIEW
+// even when the prefix happens to unmarshal, e.g. sentinel JSON followed by
+// padding whitespace) — and reads as generic for its status, exactly the
+// bound parseExperimentVerdict applies to 200 bodies.
 func experimentBodyErrorText(body []byte, bodyIncomplete bool) string {
-	if bodyIncomplete {
+	if bodyIncomplete || len(body) > expMaxBodyBytes {
 		return ""
 	}
 	var wire struct {
@@ -596,11 +599,17 @@ func applyExperimentAssignment(entry *expEntry, resp remoteConfigResponse, scope
 		return result, outcome, failureOrEmpty(result, failure)
 	}
 
-	// Anything else (an unexpected redirect, another 4xx) is an
-	// authoritative "no assignment is served here": fail without serving
-	// stale values; the cached record stays untouched.
-	return ExperimentAssignmentResult{},
-		expOutcome{authoritative: true}, "http_" + strconv.Itoa(status)
+	// Anything else (an unexpected redirect, another 4xx — statuses this
+	// contract never sends) lands in the TRANSIENT bucket: serve the
+	// last-known-good and let the cadence retry. Only contract statuses may
+	// make authoritative decisions — an out-of-contract answer (a proxy
+	// redirect, a gateway mangling the route) proves nothing about the
+	// assignment, so it must neither drop the cached entry nor claim an
+	// authoritative no-serve while the getters keep serving that same entry
+	// (the forbidden half-state: the fetch caller and the getters would
+	// disagree about the plane).
+	result, failure := serveExperimentEntryOrFail(entry, "http_"+strconv.Itoa(status))
+	return result, expOutcome{transient: true}, failureOrEmpty(result, failure)
 }
 
 func failureOrEmpty(result ExperimentAssignmentResult, failure string) string {
@@ -1930,8 +1939,15 @@ func (e *experimentsState) deferRevalidationLocked(nowMS int64, seconds int) {
 // full jitter (transport parity — the first failure is free, then the
 // ceiling doubles per consecutive failure up to the cap).
 func (e *experimentsState) paceTransientLocked(nowMS int64, retryAfterSeconds int, retryAfterPresent bool) {
-	if retryAfterPresent && retryAfterSeconds > 0 {
-		e.deferRevalidationLocked(nowMS, retryAfterSeconds)
+	if retryAfterPresent {
+		// A PRESENT hint is the server's explicit pacing answer either way:
+		// positive parks the cadence; ZERO (a literal 0, or an HTTP-date
+		// already past) says "retry immediately" — no deferral, and no
+		// backoff arming either: the exponential streak is the guess for a
+		// server that said nothing, never an override of one that spoke.
+		if retryAfterSeconds > 0 {
+			e.deferRevalidationLocked(nowMS, retryAfterSeconds)
+		}
 		return
 	}
 	e.backoffAttempt++
@@ -2045,13 +2061,18 @@ func (c *Client) fetchExperimentAssignment(ctx context.Context, experimentKey st
 			c.logf("shardpilot experiments: persisting the minted subject id failed; the id rules this process only (a restart re-buckets)")
 		}
 	}
-	if isRevalidation && e.entries[experimentKey] == nil {
+	if isRevalidation && presetAttributes == nil && e.entries[experimentKey] == nil {
 		// The pre-dispatch existence check and this section run under
 		// separate lock acquisitions: the entry can vanish in the gap (a
 		// concurrent host fetch's drop, a re-mint clearing the cache).
 		// Re-check WHILE HOLDING the lock — a revalidation for a vanished
 		// key must not dispatch at all, or its 200 would reinstall (with
 		// no remembered attributes) an experiment the plane just removed.
+		// The one legitimate entry-less revalidation dispatch is the
+		// grammar-remint RETRY (presetAttributes non-nil): the rotation it
+		// rides just cleared the whole cache BY DESIGN, and the retry
+		// carries the rejected request's exact attribute set — aborting it
+		// here would kill the lane path's one-shot self-heal.
 		e.mu.Unlock()
 		return ExperimentAssignmentResult{}, expFetchError("revalidation_entry_vanished")
 	}
@@ -2268,6 +2289,10 @@ func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string
 	}
 
 	if dropAllLanded {
+		// The install (under e.mu) discarded the cache and the owed
+		// snapshots; the PIPELINE-resident facts — queue, worker batch,
+		// spool — are withdrawn here, off e.mu.
+		c.purgeWithdrawnExperimentFacts()
 		c.logf("shardpilot experiments: the platform disabled real-subject assignment; dropped the cached assignments and their subject fact keys")
 	}
 	if persistFailed {

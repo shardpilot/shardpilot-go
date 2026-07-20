@@ -936,6 +936,46 @@ func (s *diskSpool) ack(ids []string) (removed []spoolEntry, persistFailed bool)
 	return removed, persistFailed
 }
 
+// removeMatching removes every spooled envelope the predicate matches (the
+// predicate reads the entry's exact wire bytes), with ack's mechanics: the
+// mirror, id set, byte total, and resend queue all forget the removed
+// entries, the removal is persisted, and the removed entries are returned
+// for the caller to dead-letter. A failed persist is reported the same way
+// ack reports one — the mirror is authoritative and the next save retries.
+func (s *diskSpool) removeMatching(matches func(raw json.RawMessage) bool) (removed []spoolEntry, persistFailed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.entries) == 0 {
+		return nil, false
+	}
+	removedIDs := make(map[string]struct{})
+	kept := s.entries[:0]
+	for _, entry := range s.entries {
+		if matches(entry.raw) {
+			removed = append(removed, entry)
+			removedIDs[entry.id] = struct{}{}
+			delete(s.ids, entry.id)
+			s.recordSettledLocked(entry.id)
+			s.totalBytes -= len(entry.raw)
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	s.entries = kept
+	if len(removed) == 0 {
+		return nil, false
+	}
+	keptResend := s.resend[:0]
+	for _, entry := range s.resend {
+		if _, isRemoved := removedIDs[entry.id]; !isRemoved {
+			keptResend = append(keptResend, entry)
+		}
+	}
+	s.resend = keptResend
+	persistFailed = s.saveLocked() != nil
+	return removed, persistFailed
+}
+
 // pullResendChunk takes up to limit startup-loaded entries for re-publish,
 // applying the retry-age cap at selection time (entries that expired while
 // waiting are dropped from the mirror and returned as expired). Entries no

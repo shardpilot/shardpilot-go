@@ -2,6 +2,7 @@ package shardpilot
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -255,8 +256,16 @@ func (c *Client) sweepExperimentExposuresMode(experimentKey string, atClose bool
 			return
 		}
 		head := list[0]
+		// Copy the snapshot's fields UNDER the lock: armExposureLocked
+		// refreshes a same-(session, tuple) tail snapshot in place, so
+		// reading head.entry/head.session after the unlock races that
+		// write. The copies stay a consistent pair; a refresh that lands
+		// mid-emission is tuple-identical by construction (the refresh
+		// gate), so emitting the older copy derives the same deterministic
+		// id and the identity-based removal below is untouched.
+		headEntry, headSession := head.entry, head.session
 		e.mu.Unlock()
-		ok, _, terminal := c.emitEntryExposure(experimentKey, head.entry, false, head.session, atClose)
+		ok, _, terminal := c.emitEntryExposure(experimentKey, headEntry, false, headSession, atClose)
 		if !ok && !terminal {
 			return
 		}
@@ -406,6 +415,113 @@ func experimentFactError(code string, terminal bool) error {
 		return ErrClosed
 	}
 	return fmt.Errorf("%w: %s", ErrInvalidExperimentFact, code)
+}
+
+// isWithdrawnExperimentFactEvent recognizes one of this SDK's own
+// experiment facts carrying a server-minted subject fact key — the exact
+// class the real-subjects sentinel withdraws from delivery. Host events
+// merely sharing a name are not matched (they cannot carry a grammar-valid
+// sfk1_ assignment key they never had).
+func isWithdrawnExperimentFactEvent(event Event) bool {
+	if event.Name != experimentExposureName && event.Name != experimentOutcomeName {
+		return false
+	}
+	key, _ := event.Props["assignment_key"].(string)
+	return expSubjectFactKeyPattern.MatchString(key)
+}
+
+// withdrawnExperimentFactRaw is the same recognition over a spooled
+// envelope's exact wire bytes.
+func withdrawnExperimentFactRaw(raw json.RawMessage) bool {
+	var wire struct {
+		EventName string `json:"event_name"`
+		Props     struct {
+			AssignmentKey string `json:"assignment_key"`
+		} `json:"props"`
+	}
+	if json.Unmarshal(raw, &wire) != nil {
+		return false
+	}
+	if wire.EventName != experimentExposureName && wire.EventName != experimentOutcomeName {
+		return false
+	}
+	return expSubjectFactKeyPattern.MatchString(wire.Props.AssignmentKey)
+}
+
+// purgeWithdrawnExperimentFacts runs when the real-subjects sentinel LANDS:
+// the platform withdrew the assignments AND their subject fact keys, so
+// experiment facts already ACCEPTED into the pipeline — the shared queue,
+// the worker's held batch, the disk spool — must not ship on the next
+// flush. Owed snapshots were discarded by the install under e.mu; this is
+// the rest of the pipeline:
+//   - the queue filters under the intake lock, with emitMu held so an emit
+//     in flight either enqueued before the filter (and is caught) or reads
+//     the already-cleared state after it (and emits nothing);
+//   - the worker's held batch filters at its next dispatch point via the
+//     purge epoch (see dropWithdrawnExperimentFacts) — before any send;
+//   - the spool removes matching envelopes and dead-letters them
+//     (SpoolDropTerminal: the server outcome settled them undeliverable).
+//
+// The residual is a fact already handed to the transport when the sentinel
+// landed: indistinguishable from one already delivered — and if that same
+// in-flight send fails and spools, the spool's retry-age cap bounds it.
+func (c *Client) purgeWithdrawnExperimentFacts() {
+	e := c.exp
+	e.emitMu.Lock()
+	c.lifecycleMu.Lock()
+	c.expFactPurgeEpoch.Add(1)
+	removedQueued := c.queue.filter(func(event Event) bool {
+		return !isWithdrawnExperimentFactEvent(event)
+	})
+	c.lifecycleMu.Unlock()
+	e.emitMu.Unlock()
+	var removedSpooled []spoolEntry
+	persistFailed := false
+	if c.spool != nil {
+		removedSpooled, persistFailed = c.spool.removeMatching(withdrawnExperimentFactRaw)
+	}
+	if removedQueued > 0 {
+		c.stats.dropped.Add(uint64(removedQueued))
+	}
+	if persistFailed {
+		c.recordSpoolPersistFailure()
+	}
+	if removedQueued > 0 || len(removedSpooled) > 0 {
+		c.logf("shardpilot experiments: withdrew %d queued and %d spooled experiment fact(s) with the real-subjects sentinel (their subject fact keys must not ship)", removedQueued, len(removedSpooled))
+	}
+	// Dead-letters dispatch with no lock held: the callback is integrator
+	// code.
+	c.notifySpoolDeadLetter(SpoolDropTerminal, removedSpooled)
+}
+
+// dropWithdrawnExperimentFacts is the worker-batch leg of the sentinel
+// purge: at every dispatch point (the same spot the consent-epoch drop
+// runs, before any send) the worker checks whether a purge happened since
+// it last looked and filters ITS held batch — events it pulled from the
+// queue before the purge's filter ran are invisible to that filter, exactly
+// like the consent drain. Runs only on the worker goroutine; the seen-epoch
+// field is worker-owned state (the retainedRequest discipline).
+func (c *Client) dropWithdrawnExperimentFacts(batch []Event) []Event {
+	epoch := c.expFactPurgeEpoch.Load()
+	if epoch == c.workerSeenExpFactPurge {
+		return batch
+	}
+	c.workerSeenExpFactPurge = epoch
+	kept := batch[:0]
+	removed := 0
+	for _, event := range batch {
+		if isWithdrawnExperimentFactEvent(event) {
+			removed++
+			continue
+		}
+		kept = append(kept, event)
+	}
+	if removed > 0 {
+		c.stats.dropped.Add(uint64(removed))
+		// The retained wire bytes described the pre-filter batch.
+		c.retainedRequest = batchRequest{}
+	}
+	return kept
 }
 
 // closeExperimentPreFlush is the first half of Close's last-chance pass,

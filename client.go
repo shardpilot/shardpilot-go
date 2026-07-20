@@ -97,6 +97,16 @@ type Client struct {
 	// period.
 	consentEpoch atomic.Uint64
 
+	// expFactPurgeEpoch is the real-subjects sentinel purge counter: the
+	// sentinel withdraws experiment facts already accepted into the
+	// pipeline, and the worker — which may hold some in its local batch —
+	// filters that batch when it next observes a moved epoch (see
+	// dropWithdrawnExperimentFacts). workerSeenExpFactPurge is the
+	// worker-goroutine-owned seen mark (the retainedRequest discipline: no
+	// lock, single goroutine).
+	expFactPurgeEpoch      atomic.Uint64
+	workerSeenExpFactPurge uint64
+
 	// consentGate carries a context cancelled on consent denial so event
 	// publishes already in flight abort instead of completing against a
 	// freshly denied actor. SetConsent stores the denied state before
@@ -1039,6 +1049,9 @@ func (c *Client) jitterValue() float64 {
 // batch takes its backoff streak with it — fresh post-re-grant events must
 // never start deep in a schedule that belonged to condemned data.
 func (c *Client) dropBatchOnConsentEpoch(batch []Event, seenEpoch *uint64, backoffAttempt *int) []Event {
+	// The sentinel-purge filter shares this gate: it runs at exactly the
+	// dispatch points the consent drop does, before any send.
+	batch = c.dropWithdrawnExperimentFacts(batch)
 	epoch := c.consentEpoch.Load()
 	if epoch == *seenEpoch {
 		return batch

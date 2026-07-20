@@ -406,14 +406,25 @@ func TestApplyExperimentAssignmentClassification(t *testing.T) {
 		}
 	})
 
-	t.Run("other statuses are permanent without drops", func(t *testing.T) {
-		for _, status := range []int{301, 302, 413, 418} {
+	t.Run("out-of-contract statuses are transient serve-stale", func(t *testing.T) {
+		// The full status table: every status this contract never sends
+		// lands in the EXPLICIT transient bucket — serve the last-known-good
+		// and let the cadence retry. None may claim an authoritative
+		// no-serve while the getters keep serving the cached entry (the
+		// forbidden half-state), and none may drop or latch anything.
+		for _, status := range []int{301, 302, 303, 304, 307, 402, 405, 409, 410, 413, 418, 422, 451} {
 			result, outcome, failure := applyExperimentAssignment(cached, expTestResponse(status, ``), scope, 42)
-			if failure != "http_"+itoa(status) || result.FromCache {
-				t.Fatalf("status %d: expected permanent http failure, got %+v failure=%q", status, result, failure)
+			if failure != "" || !result.FromCache || result.Code != "http_"+itoa(status) {
+				t.Fatalf("status %d: expected transient serve-stale, got %+v failure=%q", status, result, failure)
 			}
-			if !outcome.authoritative || outcome.dropEntry || outcome.dropAll || outcome.authBlocked {
-				t.Fatalf("status %d: cache stays untouched, got %+v", status, outcome)
+			if !outcome.transient || outcome.authoritative || outcome.dropEntry || outcome.dropAll || outcome.authBlocked {
+				t.Fatalf("status %d: expected the transient bucket with cache untouched, got %+v", status, outcome)
+			}
+			// With NO cached entry the same status is the closed transient
+			// failure — code intact, still nothing dropped or latched.
+			bare, bareOutcome, bareFailure := applyExperimentAssignment(nil, expTestResponse(status, ``), scope, 42)
+			if bareFailure != "http_"+itoa(status) || bare.Assigned || !bareOutcome.transient || bareOutcome.authoritative {
+				t.Fatalf("status %d without cache: expected closed transient failure, got %+v failure=%q", status, bare, bareFailure)
 			}
 		}
 	})
