@@ -135,7 +135,7 @@ func TestPostPurgeRespoolFiltersWithdrawnFacts(t *testing.T) {
 	client.exp.mu.Lock()
 	entry := client.exp.entries[expTestScopeKey]
 	client.exp.mu.Unlock()
-	factEvent, skip := client.buildExperimentFactEvent(experimentExposureName, expTestScopeKey, entry, "")
+	factEvent, skip := client.buildExperimentFactEvent(experimentExposureName, expTestScopeKey, entry, "", client.exp.sessionMarker)
 	if skip != "" {
 		t.Fatalf("test setup: fact build refused (%s)", skip)
 	}
@@ -207,7 +207,7 @@ func TestSentinelBatchFilterBackoffAndRetainedBytes(t *testing.T) {
 		SubjectFactKey: "sfk1_" + strings.Repeat("a", 64),
 		SubjectKey:     "spcid_" + strings.Repeat("b", 32),
 	}
-	factEvent, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-unit", entry, "")
+	factEvent, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-unit", entry, "", client.exp.sessionMarker)
 	if skip != "" {
 		t.Fatalf("test setup: fact build refused (%s)", skip)
 	}

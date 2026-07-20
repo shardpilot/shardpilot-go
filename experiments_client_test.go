@@ -1181,15 +1181,11 @@ func TestConsentPurgeReArmsExposureWithSameID(t *testing.T) {
 	// published collapses server-side as a duplicate.
 	client.SetConsent(false)
 	client.SetConsent(true)
-	// Let the worker observe the denial epoch with an empty batch before
-	// the sweep re-emits: an event received by a PARKED worker as the
-	// first wake after a deny lands in its batch ahead of the loop-top
-	// epoch check and is dropped as pre-denial — a pre-existing epoch-
-	// observation race in the worker, not an experiments behavior (see
-	// the PR notes; it hits ordinary Enqueue the same way).
-	if err := client.Flush(context.Background()); err != nil {
-		t.Fatalf("sync flush: %v", err)
-	}
+	// No epoch-sync flush here — deliberately. The worker's receive-time
+	// admission boundary settles the denial epoch BEFORE the re-armed
+	// fact joins its held batch, so the re-emission below is deterministic
+	// however the worker's select interleaves with the sweep's enqueue
+	// (this staging was flaky when the boundary only ran at the loop top).
 	client.experimentCycle(context.Background())
 	if err := client.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)

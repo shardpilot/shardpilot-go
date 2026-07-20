@@ -432,6 +432,12 @@ func (c *Client) Enqueue(event Event) error {
 	if err != nil {
 		return err
 	}
+	// The intake stamp: the denial generation this admission happened
+	// under. Enqueue holds lifecycleMu — the same lock a denial's fast
+	// half takes to bump the epoch and drain the queue — so the stamp is
+	// exact: an event admitted here is fully enqueued before any later
+	// denial starts, and its stamp provably predates that denial's bump.
+	event.intakeConsentEpoch = c.consentEpoch.Load()
 	if !c.queue.enqueue(event) {
 		c.stats.dropped.Add(1)
 		return ErrQueueFull
@@ -782,7 +788,7 @@ func (c *Client) run() {
 		}
 		select {
 		case event := <-queueEvents:
-			batch = append(batch, event)
+			batch = c.admitReceivedEvent(batch, event, &seenConsentEpoch, &backoffAttempt)
 			if len(batch) >= c.cfg.BatchSize && !c.publishDeferred(deferUntil) {
 				batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
 			}
@@ -1076,6 +1082,50 @@ func (c *Client) dropBatchOnConsentEpoch(batch []Event, seenEpoch *uint64, backo
 	return batch
 }
 
+// admitReceivedEvent joins one queue-received event to the worker-held
+// batch. The consent-epoch boundary settles FIRST: a denial that landed
+// while the worker was parked in its select condemned the HELD events
+// only, and after a deny → quick-re-grant round trip the re-grant's fresh
+// events arrive while the worker still holds that stale batch — appended
+// blindly they would be discarded WITH it at the next epoch observation,
+// silently losing events accepted after consent was granted again. The
+// epoch partitions batches: a batch never spans consent epochs, so the
+// epoch drop only ever discards pre-denial events. The received event then
+// joins only when its intake stamp belongs to the settled epoch — a
+// pre-denial event this receive stole from the denial's concurrent queue
+// drain (both consume the same channel) is dropped here, counted exactly
+// once (it escaped the drain's own count), never revived into a later
+// granted period.
+func (c *Client) admitReceivedEvent(batch []Event, event Event, seenEpoch *uint64, backoffAttempt *int) []Event {
+	batch = c.dropBatchOnConsentEpoch(batch, seenEpoch, backoffAttempt)
+	if event.intakeConsentEpoch < *seenEpoch {
+		c.stats.dropped.Add(1)
+		return batch
+	}
+	return append(batch, event)
+}
+
+// drainQueueAdmitted is admitReceivedEvent's bulk form for the flush path:
+// the epoch boundary settles once, then queued events join the batch only
+// under a matching intake stamp (stale-stamped strays drop, counted), up
+// to the batch-size limit drainInto honored.
+func (c *Client) drainQueueAdmitted(batch []Event, seenEpoch *uint64, backoffAttempt *int) []Event {
+	batch = c.dropBatchOnConsentEpoch(batch, seenEpoch, backoffAttempt)
+	for len(batch) < c.cfg.BatchSize {
+		select {
+		case event := <-c.queue.ch:
+			if event.intakeConsentEpoch < *seenEpoch {
+				c.stats.dropped.Add(1)
+				continue
+			}
+			batch = append(batch, event)
+		default:
+			return batch
+		}
+	}
+	return batch
+}
+
 func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentEpoch *uint64, backoffAttempt *int) ([]Event, error) {
 	var firstErr error
 	for {
@@ -1222,7 +1272,7 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 				c.retainedRequest = batchRequest{}
 			}
 		}
-		batch = c.queue.drainInto(batch, c.cfg.BatchSize)
+		batch = c.drainQueueAdmitted(batch, seenConsentEpoch, backoffAttempt)
 		if len(c.queue.ch) == 0 {
 			if len(batch) == 0 {
 				return batch, firstErr

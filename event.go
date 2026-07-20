@@ -38,4 +38,13 @@ type Event struct {
 	// fact (a new authorized assignment after re-enable) must never be
 	// dropped for a worker's epoch lag.
 	expFactEpoch uint64
+
+	// intakeConsentEpoch is the consent denial generation this event was
+	// ADMITTED under, stamped at the queue boundary. The worker joins a
+	// received event to its held batch only when this stamp matches the
+	// epoch it just settled: a denial's queue drain and the worker's
+	// receive consume the same channel, so a pre-denial event the worker
+	// steals from the drain is recognized (stale stamp) and dropped at
+	// admission instead of riding — or condemning — a later epoch's batch.
+	intakeConsentEpoch uint64
 }

@@ -72,6 +72,11 @@ func (c *Client) experimentConsentRefusal() error {
 func (c *Client) enqueueExperimentFact(event Event, atClose bool) error {
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
+	// The intake stamp, read under lifecycleMu — the same lock a denial's
+	// fast half takes — so it is exact, exactly like Enqueue's: a fact
+	// admitted here is fully enqueued before any later denial's bump and
+	// drain start, and the stamp provably predates that denial.
+	intakeEpoch := c.consentEpoch.Load()
 	if !atClose && c.closed.Load() {
 		return ErrClosed
 	}
@@ -102,6 +107,7 @@ func (c *Client) enqueueExperimentFact(event Event, atClose bool) error {
 	if err != nil {
 		return err
 	}
+	event.intakeConsentEpoch = intakeEpoch
 	if !c.queue.enqueue(event) {
 		return ErrQueueFull
 	}
@@ -114,7 +120,7 @@ func (c *Client) enqueueExperimentFact(event Event, atClose bool) error {
 // enforced here so the raw spcid subject id can never leave the SDK in
 // experiment props. eventID, when non-empty, presets the deterministic
 // exposure id; empty lets the pipeline mint a fresh one (outcomes).
-func (c *Client) buildExperimentFactEvent(name, experimentKey string, entry *expEntry, eventID string) (Event, string) {
+func (c *Client) buildExperimentFactEvent(name, experimentKey string, entry *expEntry, eventID, sessionID string) (Event, string) {
 	factKey := strings.TrimSpace(entry.SubjectFactKey)
 	if !expSubjectFactKeyPattern.MatchString(factKey) {
 		// The privacy boundary of the fact lane: ONLY a grammar-valid
@@ -140,7 +146,18 @@ func (c *Client) buildExperimentFactEvent(name, experimentKey string, entry *exp
 		ID:          eventID,
 		Name:        name,
 		AnonymousID: c.cfg.AnonymousID,
-		Props:       props,
+		// The arm-time session identity. The source override below makes
+		// these facts publish as "client" whatever tier the configuration
+		// is, and the ingest contract requires session_id on every
+		// non-backend event — an unstamped fact would be REJECTED once the
+		// producer lane accepts these names. This SDK's session is the
+		// client instance (one marker per construction); an owed snapshot
+		// passes the marker of the session its application belonged to.
+		// Host events under a backend-source configuration are untouched:
+		// they keep publishing as "backend" with the contract's session_id
+		// carve-out.
+		SessionID: sessionID,
+		Props:     props,
 		// Envelope contract for experiment facts: source "client" and no
 		// user_id, whatever the client configuration would default.
 		omitUserID:     true,
@@ -220,7 +237,7 @@ func (c *Client) emitEntryExposure(experimentKey string, entry *expEntry, rearm 
 	e.mu.Unlock()
 
 	eventID := experimentExposureEventID(marker, entry.SubjectKey, experimentKey, entry.Version, arm)
-	event, skipCode := c.buildExperimentFactEvent(experimentExposureName, experimentKey, entry, eventID)
+	event, skipCode := c.buildExperimentFactEvent(experimentExposureName, experimentKey, entry, eventID, marker)
 	if skipCode != "" {
 		c.logf("shardpilot experiments: exposure for experiment %q skipped (%s)", experimentKey, skipCode)
 		return false, skipCode, true
@@ -406,11 +423,14 @@ func (c *Client) TrackExperimentOutcome(experimentKey, outcomeKey string, outcom
 		return ErrClosed
 	}
 	entry := e.entries[experimentKey]
+	// An outcome is measured in THIS session by definition (it has no owed
+	// cross-session machinery): the current marker is its session identity.
+	marker := e.sessionMarker
 	e.mu.Unlock()
 	if entry == nil {
 		return ErrExperimentNoAssignment
 	}
-	event, skipCode := c.buildExperimentFactEvent(experimentOutcomeName, experimentKey, entry, "")
+	event, skipCode := c.buildExperimentFactEvent(experimentOutcomeName, experimentKey, entry, "", marker)
 	if skipCode != "" {
 		return ErrExperimentFactUnavailable
 	}
@@ -519,12 +539,24 @@ func (c *Client) purgeWithdrawnExperimentFacts() {
 	// any send.
 	c.expFactPurgeEpoch.Add(1)
 	c.lifecycleMu.Unlock()
-	e.emitMu.Unlock()
 	var removedSpooled []spoolEntry
 	persistFailed := false
 	if c.spool != nil {
+		// STILL under emitMu: every fact producer holds it, so no fresh
+		// post-purge fact can be BORN — let alone spooled by a worker's
+		// failed publish — until this sweep completes, which makes the
+		// epoch-blind raw predicate exact (everything it can reach
+		// predates the purge). Pre-purge facts a concurrent respool races
+		// in are re-filtered by the respool's own epoch check instead.
+		// With emitMu released first (the old shape), a fresh authorized
+		// fact enqueued after the bump could reach the spool ahead of this
+		// sweep and be withdrawn — dead-lettered — despite carrying the
+		// current epoch. emitMu → spool mutex is the established order
+		// (the spool's mutex is a leaf); dead-letters still dispatch with
+		// no lock held below.
 		removedSpooled, persistFailed = c.spool.removeMatching(withdrawnExperimentFactRaw)
 	}
+	e.emitMu.Unlock()
 	if removedQueued > 0 {
 		c.stats.dropped.Add(uint64(removedQueued))
 	}
@@ -638,7 +670,7 @@ func (c *Client) captureOwedExposuresForDrop(experimentKey string, owed []*expOw
 		// The automatic owed emission is arm 0 by definition, and the id is
 		// exactly the one the live sweep would mint for it.
 		eventID := experimentExposureEventID(snapshot.session, snapshot.entry.SubjectKey, experimentKey, snapshot.entry.Version, 0)
-		event, skipCode := c.buildExperimentFactEvent(experimentExposureName, experimentKey, snapshot.entry, eventID)
+		event, skipCode := c.buildExperimentFactEvent(experimentExposureName, experimentKey, snapshot.entry, eventID, snapshot.session)
 		if skipCode != "" {
 			continue // no server-safe fact exists for this snapshot
 		}

@@ -2044,6 +2044,16 @@ func (e *experimentsState) deferRevalidationLocked(nowMS int64, seconds int) {
 	if deadline > e.retryAfterMS {
 		e.retryAfterMS = deadline
 	}
+	// Pacing pulls the armed cadence deadline DOWN, never out (the defold
+	// canon's rule). The cycle arms the next interval BEFORE its batch
+	// runs, so a transient park landing mid-batch would otherwise strand
+	// the failed and the skipped keys until the FULL interval — the
+	// documented Retry-After/backoff recovery, not the 300s cadence, must
+	// decide when the plane probes again after a parked failure. An
+	// unarmed cadence stays unarmed (nothing cached is waiting to probe).
+	if e.revalidateAtMS > 0 && e.revalidateAtMS > e.retryAfterMS {
+		e.revalidateAtMS = e.retryAfterMS
+	}
 }
 
 // paceTransientLocked paces the revalidation cadence after a transient
@@ -2234,6 +2244,29 @@ func (c *Client) fetchExperimentAssignment(ctx context.Context, experimentKey st
 	callerCtx := ctx
 	fetchCtx, cancel := contextWithDefaultTimeout(ctx, c.cfg.HTTPTimeout)
 	defer cancel()
+	// Load the denial gate BEFORE the pre-wire consent re-check — the
+	// events plane's publish discipline (publishRequestResult), applied to
+	// the granted-only experiment plane: a denial completed AFTER the load
+	// cancels the loaded gate and aborts the GET mid-flight; one completed
+	// BEFORE it stored the refused state first and the re-check below
+	// refuses pre-wire. Either way no assignment GET runs to completion
+	// past a completed revocation — the settle-time check alone only
+	// discarded the RESPONSE, after the wire traffic already happened,
+	// which broke the forced-minor zero-experiment-traffic promise under
+	// concurrent revocation.
+	gate := c.consentGate.Load()
+	if gate != nil {
+		var cancelOnDenial context.CancelFunc
+		fetchCtx, cancelOnDenial = context.WithCancel(fetchCtx)
+		defer cancelOnDenial()
+		stop := context.AfterFunc(gate.ctx, cancelOnDenial)
+		defer stop()
+	}
+	if err := c.experimentConsentRefusal(); err != nil {
+		// Refused PRE-WIRE: the claimed fence sequence settles nothing and
+		// a later fetch simply outranks it.
+		return ExperimentAssignmentResult{}, err
+	}
 	// The transport's remote-config GET is exactly this route's shape too —
 	// bare authenticated GET, redirects refused, bounded body read — with
 	// no If-None-Match: the assignment endpoint has no ETag/304 contract.
@@ -2242,6 +2275,20 @@ func (c *Client) fetchExperimentAssignment(ctx context.Context, experimentKey st
 		bearer: c.cfg.APIKey,
 	})
 	if err != nil {
+		if gate != nil && gate.ctx.Err() != nil && errors.Is(err, context.Canceled) {
+			// THIS fetch's gate was cancelled: a consent denial aborted the
+			// GET mid-flight. The refusal is returned regardless of the
+			// CURRENT consent state (a quick re-grant can land before the
+			// transport returns) and BEFORE any classification: an aborted
+			// wire exchange must not install, pace, serve stale, or count
+			// as a transient endpoint outcome. A caller-context
+			// cancellation is never reclassified — it leaves this gate's
+			// context intact.
+			if refusal := c.experimentConsentRefusal(); refusal != nil {
+				return ExperimentAssignmentResult{}, refusal
+			}
+			return ExperimentAssignmentResult{}, ErrConsentDenied
+		}
 		if callerCtx != nil {
 			if ctxErr := callerCtx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
 				// The CALLER's own context ended the fetch: an abort, not an

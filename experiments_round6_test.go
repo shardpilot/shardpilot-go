@@ -38,7 +38,7 @@ func TestPurgeEpochBumpsAfterQueueDrain(t *testing.T) {
 		SubjectFactKey: "sfk1_" + strings.Repeat("a", 64),
 		SubjectKey:     "spcid_" + strings.Repeat("b", 32),
 	}
-	factEvent, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-toctou", entry, "")
+	factEvent, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-toctou", entry, "", client.exp.sessionMarker)
 	if skip != "" {
 		t.Fatalf("test setup: fact build refused (%s)", skip)
 	}
@@ -261,7 +261,7 @@ func TestRespoolDropsCountOnce(t *testing.T) {
 		SubjectFactKey: "sfk1_" + strings.Repeat("a", 64),
 		SubjectKey:     "spcid_" + strings.Repeat("b", 32),
 	}
-	factEvent, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-count", entry, "")
+	factEvent, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-count", entry, "", client.exp.sessionMarker)
 	if skip != "" {
 		t.Fatalf("test setup: fact build refused (%s)", skip)
 	}
