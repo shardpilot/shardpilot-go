@@ -190,11 +190,15 @@ const (
 	expMaxBodyBytes            = rcMaxBodyBytes
 	expMaxRecordBytes          = 393216 // canon parity with the defold store clamp
 	expSubjectFileName         = "experiment_subject_key"
+	expSubjectReadLimit        = 1024
 	expCacheFileName           = "experiments.json"
 	experimentExposureName     = "experiment_exposure"
 	experimentOutcomeName      = "experiment_outcome"
 	experimentReasonKillSwitch = "kill_switch"
 	experimentReasonTargeting  = "targeting_unmatched"
+
+	experimentAssignmentUnitSynthetic = "synthetic_subject_key"
+	experimentAssignmentUnitClientID  = "client_id"
 )
 
 // expSubjectKeyPattern is the FULL wire grammar for a client subject id.
@@ -202,6 +206,13 @@ const (
 // keeps a stored id sticky across SDK builds: re-minting re-buckets, so an
 // id that is still wire-valid is never discarded.
 var expSubjectKeyPattern = regexp.MustCompile(`^spcid_[A-Za-z0-9_-]{20,64}$`)
+
+// expSubjectFactKeyPattern is the server grammar for the derived analytics
+// fact subject (`sfk1_` + 64 lowercase hex). It is THE privacy boundary of
+// the fact lane: only a grammar-valid subject-fact key may ever ride an
+// analytics fact's assignment_key — a malformed or echoed-raw value (the
+// spcid_ subject id included) is never sent.
+var expSubjectFactKeyPattern = regexp.MustCompile(`^sfk1_[0-9a-f]{64}$`)
 
 func validExperimentSubjectID(value string) bool {
 	return expSubjectKeyPattern.MatchString(value)
@@ -411,17 +422,38 @@ type expOutcome struct {
 // Wrong types anywhere in the tree — a string version, an array payload, a
 // non-object boundary — fail the typed decode and classify malformed.
 type expAssignmentWire struct {
-	AppKey         *string        `json:"app_key"`
-	EnvironmentKey *string        `json:"environment_key"`
-	ExperimentKey  *string        `json:"experiment_key"`
-	Version        *int64         `json:"version"`
-	Assigned       *bool          `json:"assigned"`
-	AssignmentKey  string         `json:"assignment_key"`
-	VariantKey     string         `json:"variant_key"`
-	VariantPayload map[string]any `json:"variant_payload"`
-	Reason         *string        `json:"reason"`
-	SubjectFactKey string         `json:"subject_fact_key"`
-	Boundary       map[string]any `json:"boundary"`
+	// The echoed request identity and the reason decode PRESENCE-AWARE as
+	// raw JSON: an absent member is tolerated (nil), while a present member
+	// of any non-string type — an explicit null included — is not this
+	// contract's shape and classifies malformed (presence vs type split).
+	AppKey         json.RawMessage `json:"app_key"`
+	EnvironmentKey json.RawMessage `json:"environment_key"`
+	ExperimentKey  json.RawMessage `json:"experiment_key"`
+	Version        *int64          `json:"version"`
+	Assigned       *bool           `json:"assigned"`
+	AssignmentKey  string          `json:"assignment_key"`
+	VariantKey     string          `json:"variant_key"`
+	VariantPayload map[string]any  `json:"variant_payload"`
+	Reason         json.RawMessage `json:"reason"`
+	SubjectFactKey string          `json:"subject_fact_key"`
+	Boundary       map[string]any  `json:"boundary"`
+}
+
+// expEchoMatches validates one presence-aware echoed member: absent is
+// tolerated; present must be a JSON string equal to the request's value —
+// a different value OR a non-string type (null included) is malformed.
+func expEchoMatches(raw json.RawMessage, want string) bool {
+	if raw == nil {
+		return true
+	}
+	// Decode through a pointer: `json.Unmarshal` of a JSON null into a bare
+	// string is a silent no-op, and null is PRESENT-non-string — malformed,
+	// never coerced to the absent shape.
+	var value *string
+	if json.Unmarshal(raw, &value) != nil || value == nil {
+		return false
+	}
+	return *value == want
 }
 
 // expRequestScope is the request identity a 200 body must echo consistently:
@@ -590,15 +622,12 @@ func parseExperimentVerdict(resp remoteConfigResponse, scope expRequestScope, no
 	if wire.Assigned == nil {
 		return ExperimentAssignmentResult{}, expOutcome{}, false
 	}
-	// Echo validation: a present-but-different echoed identity is another
-	// request's verdict and must not install under this one's scope.
-	if wire.AppKey != nil && *wire.AppKey != scope.appKey {
-		return ExperimentAssignmentResult{}, expOutcome{}, false
-	}
-	if wire.EnvironmentKey != nil && *wire.EnvironmentKey != scope.envKey {
-		return ExperimentAssignmentResult{}, expOutcome{}, false
-	}
-	if wire.ExperimentKey != nil && *wire.ExperimentKey != scope.experimentKey {
+	// Echo validation: a present-but-different — or present-but-non-string
+	// — echoed identity is not this request's verdict and must not install
+	// under its scope.
+	if !expEchoMatches(wire.AppKey, scope.appKey) ||
+		!expEchoMatches(wire.EnvironmentKey, scope.envKey) ||
+		!expEchoMatches(wire.ExperimentKey, scope.experimentKey) {
 		return ExperimentAssignmentResult{}, expOutcome{}, false
 	}
 
@@ -609,10 +638,25 @@ func parseExperimentVerdict(resp remoteConfigResponse, scope expRequestScope, no
 		assignmentKey := strings.TrimSpace(wire.AssignmentKey)
 		variantKey := strings.TrimSpace(wire.VariantKey)
 		assignmentUnit, _ := wire.Boundary["assignment_unit"].(string)
-		if assignmentKey == "" || variantKey == "" || assignmentUnit == "" {
+		if assignmentKey == "" || variantKey == "" {
+			return ExperimentAssignmentResult{}, expOutcome{}, false
+		}
+		switch assignmentUnit {
+		case experimentAssignmentUnitSynthetic, experimentAssignmentUnitClientID:
+		default:
+			// An unknown assignment unit is not a verdict this SDK can
+			// represent (it would be cached and forwarded verbatim into
+			// analytics facts).
 			return ExperimentAssignmentResult{}, expOutcome{}, false
 		}
 		subjectFactKey := strings.TrimSpace(wire.SubjectFactKey)
+		if subjectFactKey != "" && !expSubjectFactKeyPattern.MatchString(subjectFactKey) {
+			// A present subject-fact key MUST satisfy the sfk1_ grammar: a
+			// malformed echo — the raw spcid_ subject id included — must
+			// never be cached as the value the fact lane would forward
+			// verbatim into analytics assignment_key props.
+			return ExperimentAssignmentResult{}, expOutcome{}, false
+		}
 		entry := &expEntry{
 			AssignmentKey:  assignmentKey,
 			VariantKey:     variantKey,
@@ -633,7 +677,16 @@ func parseExperimentVerdict(resp remoteConfigResponse, scope expRequestScope, no
 
 	reason := ""
 	if wire.Reason != nil {
-		reason = *wire.Reason
+		// Present must be a JSON string (presence vs type split: an
+		// explicit null or any other type is malformed, never coerced to
+		// the absent traffic-gate shape — and null needs the pointer
+		// decode, since unmarshalling null into a bare string is a silent
+		// no-op).
+		var decoded *string
+		if json.Unmarshal(wire.Reason, &decoded) != nil || decoded == nil {
+			return ExperimentAssignmentResult{}, expOutcome{}, false
+		}
+		reason = *decoded
 	}
 	switch reason {
 	case "", experimentReasonKillSwitch, experimentReasonTargeting:
@@ -751,16 +804,32 @@ func sanitizeExperimentEntries(entries map[string]expEntry) map[string]expEntry 
 		if key == "" ||
 			strings.TrimSpace(entry.AssignmentKey) == "" ||
 			strings.TrimSpace(entry.VariantKey) == "" ||
-			entry.Version < 1 ||
-			strings.TrimSpace(entry.AssignmentUnit) == "" {
+			entry.Version < 1 {
 			continue
 		}
-		attributes := entry.Attributes
-		entry.Attributes = nil
-		for _, attribute := range attributes {
-			if attribute.Name != "" {
-				entry.Attributes = append(entry.Attributes, attribute)
+		switch entry.AssignmentUnit {
+		case experimentAssignmentUnitSynthetic, experimentAssignmentUnitClientID:
+		default:
+			// An unknown unit could not have been installed by this build's
+			// parser: corrupt or foreign — miss.
+			continue
+		}
+		if entry.SubjectFactKey != "" && !expSubjectFactKeyPattern.MatchString(entry.SubjectFactKey) {
+			// A stored fact key outside the sfk1_ grammar (older builds,
+			// corruption) must never reach the fact lane: the assignment
+			// still serves, degraded to fact-less.
+			entry.SubjectFactKey = ""
+		}
+		// Stored attributes re-validate against the LIVE fetch-time
+		// vocabulary and bounds: a corrupt or older-build record must not
+		// feed out-of-vocabulary names, oversized values, or an over-cap
+		// set into revalidation fetches.
+		if len(entry.Attributes) > 0 {
+			restored := make(map[string]string, len(entry.Attributes))
+			for _, attribute := range entry.Attributes {
+				restored[attribute.Name] = attribute.Value
 			}
+			entry.Attributes, _ = normalizeExperimentAttributes(restored)
 		}
 		entry.VariantPayload = deepCopyJSONMap(entry.VariantPayload, 0)
 		out[key] = entry
@@ -810,6 +879,7 @@ type experimentsState struct {
 	durablePending      map[string]expOwedSync
 	durableClearPending bool
 	durableClearAsOf    int64
+	durableClearScope   string
 
 	// tornDown is set at teardown: an in-flight response landing afterwards
 	// must not install, persist, pace, or surface anything.
@@ -893,9 +963,14 @@ type expOwedExposure struct {
 	session string
 }
 
+// expOwedSync is one owed durable intent, carrying the SCOPE it was decided
+// against: a subject rotation retires a scope, and an owed drop must land
+// against the RETIRED record (never be re-aimed at the new subject's), while
+// an owed write's in-memory source is gone with the rotation and cancels.
 type expOwedSync struct {
-	asOf int64
-	drop bool
+	asOf  int64
+	drop  bool
+	scope string
 }
 
 type expExposed struct {
@@ -972,8 +1047,17 @@ func (e *experimentsState) currentSubjectIDLocked() string {
 		e.subjectChecked = true
 		raw := e.memorySubjectID
 		if path := e.subjectFilePath(); path != "" {
-			if data, err := os.ReadFile(path); err == nil {
-				raw = strings.TrimSpace(string(data))
+			// Bounded read: a valid file holds at most a 70-char id plus a
+			// newline, so anything past the hard cap is not a file this SDK
+			// wrote — corrupt, read as a miss without allocating it.
+			if file, err := os.Open(path); err == nil {
+				data, readErr := io.ReadAll(io.LimitReader(file, expSubjectReadLimit+1))
+				_ = file.Close()
+				if readErr == nil && len(data) <= expSubjectReadLimit {
+					raw = strings.TrimSpace(string(data))
+				} else {
+					raw = ""
+				}
 			}
 		}
 		if validExperimentSubjectID(raw) {
@@ -1002,11 +1086,23 @@ func (e *experimentsState) adoptMintedSubjectIDLocked() (string, bool) {
 	}
 	e.entries = make(map[string]*expEntry)
 	e.exposed = make(map[string]expExposed)
+	// The rotation retires the previous scope: owed WRITES lose their
+	// in-memory source and cancel; owed DROPS were authoritative server
+	// decisions against the retired record and stay aimed at it (the
+	// retry cycle's foreign-scope pass lands or settles them).
+	for key, pending := range e.durablePending {
+		if !pending.drop {
+			delete(e.durablePending, key)
+		}
+	}
 	e.subjectID = minted
 	e.subjectChecked = true
 	persisted := true
 	if path := e.subjectFilePath(); path != "" {
-		if err := writePrivateFileAtomic(path, []byte(minted+"\n"), os.Rename, nil); err != nil {
+		// The chmod hook tightens a pre-existing loose state dir/file (the
+		// spool's ensurePrivateDir discipline) — the subject id is private
+		// state whatever permissions the directory arrived with.
+		if err := writePrivateFileAtomic(path, []byte(minted+"\n"), os.Rename, os.Chmod); err != nil {
 			persisted = false
 		}
 	} else {
@@ -1083,7 +1179,9 @@ func (e *experimentsState) saveDurableRecordLocked(record *expDurableRecord) boo
 	if buf.Len() > expMaxRecordBytes {
 		return false
 	}
-	return writePrivateFileAtomic(path, buf.Bytes(), os.Rename, nil) == nil
+	// The chmod hook tightens a pre-existing loose state dir/file (the
+	// spool's ensurePrivateDir discipline).
+	return writePrivateFileAtomic(path, buf.Bytes(), os.Rename, os.Chmod) == nil
 }
 
 // clearDurableRecordLocked drops the stored record outright (loads as "no
@@ -1101,6 +1199,17 @@ func (e *experimentsState) clearDurableRecordLocked() bool {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return false
 	}
+	if err == nil {
+		// The unlink is durable only once the parent directory's metadata
+		// is on stable storage: a crash right after a synced-nothing Remove
+		// can resurrect the withdrawn record, serving assignments the
+		// real-subjects sentinel just condemned. A failed sync keeps the
+		// clear OWED (the caller retries), matching the write path's
+		// syncDir discipline.
+		if syncDir(filepath.Dir(path)) != nil {
+			return false
+		}
+	}
 	return true
 }
 
@@ -1115,21 +1224,24 @@ func (e *experimentsState) durableRecordForLocked(scope string) *expDurableRecor
 }
 
 // syncDurableEntryLocked converges one experiment's durable entry to the
-// in-memory truth: an entry present in memory is written, an absent one is
-// dropped. asOf stamps the state change (the entry's own fetch time for a
-// write, the resolution time for a drop) and drives the sibling freshness
-// fence. isRetry marks an owed-sync retry: only there does the fence apply
-// to DROPS — at decision time a drop resolves whatever the shared record
-// holds, clock rollbacks included, and its stamp is raised ABOVE that
-// record; a retry may instead run after a sibling client persisted a
-// genuinely newer assignment the drop never saw, and yields to it. The
-// same asymmetry holds for WRITES: at decision time a fresh authoritative
-// write supersedes the stored record (raising its own stamp above it, so a
-// wall-clock rollback can never leave the superseded variant as reload
-// truth), while an owed retry yields to a strictly-fresher sibling write.
-// Returns true when the disk agrees with memory; false marks the key owed
-// with the raised stamp and the intent (a later ordinary fail-closed latch
-// cancels owed WRITES but must let owed authoritative DROPS land).
+// in-memory truth — and, in the SAME save, folds every other owed intent
+// decided against the same scope (combined-save folding: a working save
+// must not leave sibling intents waiting for the retry cycle). An entry
+// present in memory is written, an absent one is dropped. asOf stamps the
+// state change (the entry's own fetch time for a write, the resolution time
+// for a drop) and drives the sibling freshness fence. isRetry marks an
+// owed-sync retry: only there does the fence apply to DROPS — at decision
+// time a drop resolves whatever the shared record holds, clock rollbacks
+// included, and its stamp is raised ABOVE that record; a retry may instead
+// run after a sibling client persisted a genuinely newer assignment the
+// drop never saw, and yields to it. The same asymmetry holds for WRITES: at
+// decision time a fresh authoritative write supersedes the stored record
+// (raising its own stamp above it), while an owed retry yields to a
+// strictly-fresher sibling write. Returns true when the disk agrees with
+// memory for the primary key; false marks it owed with the raised stamp,
+// the intent, and the decision scope (a later ordinary fail-closed latch
+// cancels owed WRITES but must let owed authoritative DROPS land; a subject
+// rotation cancels owed writes and keeps drops aimed at the retired scope).
 func (e *experimentsState) syncDurableEntryLocked(scope, experimentKey string, asOf int64, isRetry bool) bool {
 	entry := e.entries[experimentKey]
 	record := e.durableRecordForLocked(scope)
@@ -1169,8 +1281,15 @@ func (e *experimentsState) syncDurableEntryLocked(scope, experimentKey string, a
 		}
 		delete(record.Entries, experimentKey)
 	}
+	// Fold every owed same-scope sibling intent into this save (their own
+	// retry fences honored), so one working write converges the whole
+	// record instead of leaving siblings for the cycle.
+	folded := e.foldOwedIntentsLocked(record, scope, experimentKey)
 	if e.saveDurableRecordLocked(record) {
 		delete(e.durablePending, experimentKey)
+		for _, foldedKey := range folded {
+			delete(e.durablePending, foldedKey)
+		}
 		return true
 	}
 	if entry != nil && hasStored {
@@ -1182,15 +1301,61 @@ func (e *experimentsState) syncDurableEntryLocked(scope, experimentKey string, a
 		delete(record.Entries, experimentKey)
 		e.saveDurableRecordLocked(record)
 	}
-	e.durablePending[experimentKey] = expOwedSync{asOf: asOf, drop: entry == nil}
+	e.durablePending[experimentKey] = expOwedSync{asOf: asOf, drop: entry == nil, scope: scope}
 	return false
 }
 
+// foldOwedIntentsLocked applies every owed intent decided against scope —
+// except skipKey, the caller's primary — onto record, with owed-retry fence
+// semantics. Returns the keys whose intents were applied (or settled by
+// their fences): the caller settles them only if its save lands. Intents
+// for OTHER scopes are foreign and are left for the retry cycle's
+// foreign-scope pass; memory is consulted for writes only (drops resolve
+// against the record alone).
+func (e *experimentsState) foldOwedIntentsLocked(record *expDurableRecord, scope, skipKey string) []string {
+	var folded []string
+	for key, pending := range e.durablePending {
+		if key == skipKey || pending.scope != scope {
+			continue
+		}
+		stored, hasStored := record.Entries[key]
+		if pending.drop {
+			if hasStored && stored.FetchedAtMS > pending.asOf {
+				// Outranked owed drop: a fresher sibling write landed after
+				// the drop was decided — the drop settles without applying.
+				folded = append(folded, key)
+				continue
+			}
+			delete(record.Entries, key)
+			folded = append(folded, key)
+			continue
+		}
+		entry := e.entries[key]
+		if entry == nil {
+			// An owed write whose in-memory source is gone (latch or
+			// rotation should have cancelled it): nothing to fold — settle
+			// it rather than let it decay into a delete.
+			folded = append(folded, key)
+			continue
+		}
+		if hasStored && stored.FetchedAtMS > entry.FetchedAtMS {
+			// Retry semantics: yield to the strictly-fresher stored entry.
+			folded = append(folded, key)
+			continue
+		}
+		record.Entries[key] = *entry
+		folded = append(folded, key)
+	}
+	return folded
+}
+
 // demoteOwedClearLocked demotes an owed whole-record clear into per-key
-// drops for exactly the keys the clear still covers — everything on disk
-// that memory does not hold — each stamped by the clear decision, raised
-// above the covered record (the sentinel is decisive over the state it
-// withdrew). Runs from the retry cycle AND at fresh-install time: a fresh
+// drops for exactly the keys the clear still covers — everything on the
+// clear's OWN scope's record that memory does not hold — each stamped by
+// the clear decision, raised above the covered record (the sentinel is
+// decisive over the state it withdrew). A record already replaced by
+// another scope's write settles the clear outright: the withdrawn record is
+// gone. Runs from the retry cycle AND at fresh-install time: a fresh
 // authorized assignment landing after the failed clear supersedes the
 // whole-record form immediately, so a later ordinary auth latch — which
 // empties memory while RETAINING the durable record — can never leave the
@@ -1200,10 +1365,12 @@ func (e *experimentsState) demoteOwedClearLocked() {
 		return
 	}
 	clearAsOf := e.durableClearAsOf
+	clearScope := e.durableClearScope
 	e.durableClearPending = false
 	e.durableClearAsOf = 0
+	e.durableClearScope = ""
 	record := e.loadDurableRecordLocked()
-	if record == nil {
+	if record == nil || (clearScope != "" && record.Scope != clearScope) {
 		return
 	}
 	for key, stored := range record.Entries {
@@ -1214,16 +1381,20 @@ func (e *experimentsState) demoteOwedClearLocked() {
 		if stored.FetchedAtMS >= asOf {
 			asOf = stored.FetchedAtMS + 1
 		}
-		e.durablePending[key] = expOwedSync{asOf: asOf, drop: true}
+		e.durablePending[key] = expOwedSync{asOf: asOf, drop: true, scope: record.Scope}
 	}
 }
 
-// retryDurableSync retries every owed durable write (and an owed
-// whole-record clear) so the disk converges as soon as storage recovers,
-// instead of waiting for an unrelated write or a relaunch. Local disk
-// housekeeping only: no network, no serving decisions, so it runs
-// regardless of the consent state — a kill drop decided under grant must
-// land durably even if consent flips.
+// retryDurableSync retries every owed durable intent so the disk converges
+// as soon as storage recovers, instead of waiting for an unrelated write or
+// a relaunch: the owed whole-record clear first (scope-gated — a record
+// already replaced by a newer scope settles it), then ONE folded save for
+// the current scope's intents, then the foreign-scope drops — intents
+// decided against a RETIRED scope land against that record alone, memory
+// never consulted, and settle the moment another scope's write replaced the
+// file. Local disk housekeeping only: no network, no serving decisions, so
+// it runs regardless of the consent state — a kill drop decided under grant
+// must land durably even if consent flips.
 func (e *experimentsState) retryDurableSync() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -1233,28 +1404,97 @@ func (e *experimentsState) retryDurableSync() {
 			// the clear must not wipe it — demote it to the per-key drops
 			// it still covers.
 			e.demoteOwedClearLocked()
-		} else if e.clearDurableRecordLocked() {
-			e.durableClearPending = false
-			e.durableClearAsOf = 0
-			e.durablePending = make(map[string]expOwedSync)
+		} else {
+			record := e.loadDurableRecordLocked()
+			switch {
+			case record == nil:
+				// Nothing stored (or unreadable = miss): the withdrawn
+				// record is gone either way.
+				e.durableClearPending = false
+				e.durableClearAsOf = 0
+				e.durableClearScope = ""
+			case e.durableClearScope != "" && record.Scope != e.durableClearScope:
+				// Another scope's write replaced the withdrawn record: the
+				// clear's target no longer exists.
+				e.durableClearPending = false
+				e.durableClearAsOf = 0
+				e.durableClearScope = ""
+			case e.clearDurableRecordLocked():
+				e.durableClearPending = false
+				e.durableClearAsOf = 0
+				e.durableClearScope = ""
+				e.durablePending = make(map[string]expOwedSync)
+			}
 		}
 	}
 	if len(e.durablePending) == 0 {
 		return
 	}
-	subject := e.currentSubjectIDLocked()
-	if subject == "" {
-		return
+	// Current-scope intents: one folded save.
+	if subject := e.currentSubjectIDLocked(); subject != "" {
+		scope := e.scopeForLocked(subject)
+		hasCurrent := false
+		for _, pending := range e.durablePending {
+			if pending.scope == scope {
+				hasCurrent = true
+				break
+			}
+		}
+		if hasCurrent {
+			record := e.durableRecordForLocked(scope)
+			folded := e.foldOwedIntentsLocked(record, scope, "")
+			if len(folded) > 0 && e.saveDurableRecordLocked(record) {
+				for _, key := range folded {
+					delete(e.durablePending, key)
+				}
+			}
+		}
 	}
-	scope := e.scopeForLocked(subject)
-	keys := make([]string, 0, len(e.durablePending))
-	for key := range e.durablePending {
-		keys = append(keys, key)
+	// Foreign-scope drops: land against the retired scope's record, or
+	// settle when another scope's write already replaced it. (Foreign
+	// WRITES cannot exist: a rotation cancels owed writes.)
+	foreignScopes := make(map[string][]string)
+	for key, pending := range e.durablePending {
+		if subject := e.currentSubjectIDLocked(); subject != "" && pending.scope == e.scopeForLocked(subject) {
+			continue
+		}
+		if !pending.drop {
+			// A foreign owed write's source rotated away: cancel rather
+			// than let it decay into a delete against a record it never
+			// described.
+			delete(e.durablePending, key)
+			continue
+		}
+		foreignScopes[pending.scope] = append(foreignScopes[pending.scope], key)
 	}
-	sort.Strings(keys)
-	for _, key := range keys {
-		pending := e.durablePending[key]
-		e.syncDurableEntryLocked(scope, key, pending.asOf, true)
+	for scope, keys := range foreignScopes {
+		record := e.loadDurableRecordLocked()
+		if record == nil || record.Scope != scope {
+			// The retired record is gone or replaced: the withdrawn state
+			// cannot serve (scope-miss), the drops settle.
+			for _, key := range keys {
+				delete(e.durablePending, key)
+			}
+			continue
+		}
+		sort.Strings(keys)
+		applied := keys[:0]
+		for _, key := range keys {
+			pending := e.durablePending[key]
+			if stored, hasStored := record.Entries[key]; hasStored && stored.FetchedAtMS > pending.asOf {
+				// Outranked by a fresher foreign write: settle without
+				// applying.
+				delete(e.durablePending, key)
+				continue
+			}
+			delete(record.Entries, key)
+			applied = append(applied, key)
+		}
+		if len(applied) > 0 && e.saveDurableRecordLocked(record) {
+			for _, key := range applied {
+				delete(e.durablePending, key)
+			}
+		}
 	}
 }
 
@@ -1310,6 +1550,7 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 				// every cycle until it lands.
 				e.durableClearPending = true
 				e.durableClearAsOf = resolvedAtMS
+				e.durableClearScope = scope
 				return false, true, true
 			}
 			return false, false, true
@@ -1463,6 +1704,14 @@ func (e *experimentsState) onAnalyticsPurge() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.purgeEpoch++
+	// Owed snapshots are DISCARDED first, then every live entry re-arms:
+	// after a purge the session's emission slate is exactly its still-live
+	// treatments — a snapshot for a since-dropped entry must not re-emit
+	// into the re-granted session (the ratified reconciliation of the
+	// blanket-re-arm rule). The deterministic id domain is unchanged: a
+	// re-armed live tuple derives the same id its purged fact carried, so
+	// a wire-ambiguous survivor still collapses server-side.
+	e.pendingExposure = make(map[string][]*expOwedExposure)
 	e.exposed = make(map[string]expExposed)
 	for key, entry := range e.entries {
 		e.armExposureLocked(key, entry)
@@ -1576,17 +1825,24 @@ func (c *Client) FetchExperimentAssignment(ctx context.Context, experimentKey st
 }
 
 func (c *Client) fetchExperimentAssignment(ctx context.Context, experimentKey string, attributes map[string]string, isRevalidation bool, presetAttributes []expAttribute) (ExperimentAssignmentResult, error) {
-	// The same lifecycle fence as Track and FetchRemoteConfig: Close either
-	// sees this fetch (and waits for it) or completed its closed store
-	// first (and this fetch is rejected).
+	// The same lifecycle fence as Track and FetchRemoteConfig for HOST
+	// fetches: Close either sees this fetch (and waits for it) or completed
+	// its closed store first (and this fetch is rejected). The automatic
+	// lane's fetches deliberately do NOT join the host-operation wait
+	// group: a hung revalidation GET must not hold Close for a timeout —
+	// the lane's stop-cancelled context aborts it instead, and Close's
+	// lane-done wait (plus the teardown gate on the settle path) covers
+	// the rest.
 	c.lifecycleMu.Lock()
 	if c.closed.Load() {
 		c.lifecycleMu.Unlock()
 		return ExperimentAssignmentResult{}, ErrClosed
 	}
-	c.trackWG.Add(1)
+	if !isRevalidation {
+		c.trackWG.Add(1)
+		defer c.trackWG.Done()
+	}
 	c.lifecycleMu.Unlock()
-	defer c.trackWG.Done()
 
 	e := c.exp
 	if e == nil {
@@ -1689,13 +1945,13 @@ func (c *Client) fetchExperimentAssignment(ctx context.Context, experimentKey st
 		// stalled 401/403 fails closed (and can never be a sentinel), a
 		// stalled 404 stays permanent, only a stalled 200 is transient.
 	}
-	return c.settleExperimentFetch(experimentKey, attributes, isRevalidation, seq, scope, authEpoch, normalizedAttributes, resp)
+	return c.settleExperimentFetch(ctx, experimentKey, attributes, isRevalidation, seq, scope, authEpoch, normalizedAttributes, resp)
 }
 
 // settleExperimentFetch is the response half of a fetch: the consent
 // re-check, the pure classification against the CURRENT fenced entry, the
 // grammar-remint path, pacing, the install, and the caller-result guards.
-func (c *Client) settleExperimentFetch(experimentKey string, attributes map[string]string, isRevalidation bool, seq uint64, scope string, authEpoch uint64, normalizedAttributes []expAttribute, resp remoteConfigResponse) (ExperimentAssignmentResult, error) {
+func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string, attributes map[string]string, isRevalidation bool, seq uint64, scope string, authEpoch uint64, normalizedAttributes []expAttribute, resp remoteConfigResponse) (ExperimentAssignmentResult, error) {
 	e := c.exp
 	// A revocation while the request was in flight closes the plane.
 	// Nothing installs, nothing paces, nothing re-mints, and the caller
@@ -1737,7 +1993,7 @@ func (c *Client) settleExperimentFetch(experimentKey string, attributes map[stri
 	fenceKey := scope + rcScopeSeparator + experimentKey
 	fencedOut := seq <= e.settled[fenceKey]
 
-	if outcome.remint && !e.reminted && !fencedOut && authEpoch == e.authEpoch {
+	if outcome.remint && !fencedOut && authEpoch == e.authEpoch {
 		// The persisted subject id failed the wire grammar (storage
 		// corruption this client could not detect locally): re-mint once
 		// per process and retry as a fresh subject — from the revalidation
@@ -1751,30 +2007,40 @@ func (c *Client) settleExperimentFetch(experimentKey string, attributes map[stri
 		// persisted subject, wipe entries, or consume the one-shot budget:
 		// it falls through and is discarded like the stale outcome it is.
 		if subjectNow := e.currentSubjectIDLocked(); subjectNow != "" && e.scopeForLocked(subjectNow) == scope {
-			e.reminted = true
-			_, persisted := e.adoptMintedSubjectIDLocked()
-			e.mu.Unlock()
-			c.logf("shardpilot experiments: the server rejected the persisted subject id's grammar; re-minted once and retrying (the subject re-buckets, fresh-install semantics)")
-			if !persisted {
-				c.stats.setLastError("experiment_subject_persist_failed")
+			if !e.reminted {
+				e.reminted = true
+				_, persisted := e.adoptMintedSubjectIDLocked()
+				e.mu.Unlock()
+				c.logf("shardpilot experiments: the server rejected the persisted subject id's grammar; re-minted once and retrying (the subject re-buckets, fresh-install semantics)")
+				if !persisted {
+					c.stats.setLastError("experiment_subject_persist_failed")
+				}
+				// The retry carries the SAME normalized attribute set the
+				// rejected request sent — under the CALLER's own context:
+				// an expired or cancelled caller bounds the whole blocking
+				// call, the internal retry included.
+				preset := normalizedAttributes
+				if preset == nil {
+					preset = []expAttribute{}
+				}
+				return c.fetchExperimentAssignment(ctx, experimentKey, attributes, isRevalidation, preset)
 			}
-			// The retry carries the SAME normalized attribute set the
-			// rejected request sent: the adopt above cleared the cached
-			// entry, so the cadence path could no longer recover its saved
-			// attributes on its own.
-			preset := normalizedAttributes
-			if preset == nil {
-				preset = []expAttribute{}
-			}
-			return c.fetchExperimentAssignment(context.Background(), experimentKey, attributes, isRevalidation, preset)
+			// The one-shot budget is SPENT and this grammar reject is
+			// CURRENT (it passed the epoch/scope/sequence gates): a
+			// permanently rejected input set must not keep serving stale —
+			// it converts to the permanent-400 durable drop. Stale rejects
+			// above are discarded whole (no drop, no budget effect).
+			outcome.remint = false
+			outcome.dropEntry = true
 		}
 	}
-	if outcome.transient && authEpoch == e.authEpoch {
-		// Pacing is gated on scope currency exactly like the install: a
-		// transient answer for a RE-MINTED-AWAY subject is discarded from
-		// state, and its Retry-After must be discarded with it — a stale
-		// 429/5xx must not park the CURRENT subject's revalidation (and
-		// kill checks) for up to the day clamp.
+	if outcome.transient && authEpoch == e.authEpoch && !fencedOut {
+		// Pacing is gated on scope currency AND the per-key sequence fence
+		// exactly like the install and the re-mint: a transient answer for
+		// a RE-MINTED-AWAY subject — or one a newer settled fetch already
+		// fenced out — is discarded from state, and its Retry-After must be
+		// discarded with it: a stale 429/5xx must not park the CURRENT
+		// plane's revalidation (and kill checks) for up to the day clamp.
 		if subjectNow := e.currentSubjectIDLocked(); subjectNow != "" && e.scopeForLocked(subjectNow) == scope {
 			e.paceTransientLocked(nowMS, outcome.retryAfterSeconds, outcome.retryAfterPresent, c.experimentJitter())
 		}
@@ -1858,7 +2124,7 @@ func (c *Client) experimentJitter() func() float64 {
 // Retry-After deadline parks it, every cached key re-fetches once per
 // armed interval. A parked revalidation never blocks anything: there is no
 // pending state to drain at shutdown.
-func (c *Client) experimentCycle() {
+func (c *Client) experimentCycle(ctx context.Context) {
 	e := c.exp
 	if e == nil {
 		return
@@ -1902,10 +2168,23 @@ func (c *Client) experimentCycle() {
 	e.mu.Unlock()
 	for _, key := range keys {
 		// Batched per cycle: one GET per cached entry, each re-sending its
-		// last host-supplied attributes. Outcomes apply at resolution; the
-		// fetch handles its own state (a latch mid-batch discards the
-		// siblings' responses through the epoch fence).
-		_, _ = c.fetchExperimentAssignment(context.Background(), key, nil, true, nil)
+		// last host-supplied attributes. The plane's gates re-check BEFORE
+		// every automatic fetch: an auth latch set by an earlier key's
+		// refusal stops the batch outright (an unattended lane must not
+		// keep asking a plane that just closed, and a later 200 in the same
+		// batch must not clear the latch — only a host fetch or re-init
+		// reopens), and a teardown, consent flip, or lane-context cancel
+		// (Close) stops it the same way.
+		if ctx.Err() != nil || c.experimentConsentRefusal() != nil {
+			return
+		}
+		e.mu.Lock()
+		blocked := e.authBlocked || e.tornDown
+		e.mu.Unlock()
+		if blocked {
+			return
+		}
+		_, _ = c.fetchExperimentAssignment(ctx, key, nil, true, nil)
 	}
 }
 
@@ -1915,6 +2194,15 @@ func (c *Client) experimentCycle() {
 // when network work happens.
 func (c *Client) runExperimentsLane() {
 	defer close(c.expLaneDone)
+	// The lane's fetches run under a stop-cancelled context: Close cancels
+	// any in-flight revalidation GET instead of waiting it out (the lane
+	// never blocks Close).
+	laneCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-c.stop
+		cancel()
+	}()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
@@ -1926,7 +2214,7 @@ func (c *Client) runExperimentsLane() {
 			parked := c.exp.laneParkedForTests
 			c.exp.mu.Unlock()
 			if !parked {
-				c.experimentCycle()
+				c.experimentCycle(laneCtx)
 			}
 		}
 	}

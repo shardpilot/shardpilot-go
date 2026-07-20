@@ -88,6 +88,7 @@ func (c *Client) enqueueExperimentFact(event Event, atClose bool) error {
 	if !c.queue.enqueue(event) {
 		return ErrQueueFull
 	}
+	c.stats.enqueued.Add(1)
 	return nil
 }
 
@@ -98,7 +99,11 @@ func (c *Client) enqueueExperimentFact(event Event, atClose bool) error {
 // exposure id; empty lets the pipeline mint a fresh one (outcomes).
 func (c *Client) buildExperimentFactEvent(name, experimentKey string, entry *expEntry, eventID string) (Event, string) {
 	factKey := strings.TrimSpace(entry.SubjectFactKey)
-	if factKey == "" {
+	if !expSubjectFactKeyPattern.MatchString(factKey) {
+		// The privacy boundary of the fact lane: ONLY a grammar-valid
+		// server-minted sfk1_ key may ride assignment_key. Absent AND
+		// malformed values (a raw spcid_ echo included) alike mean this
+		// assignment produces no fact.
 		return Event{}, "exposure_no_subject_fact_key"
 	}
 	if c.cfg.AnonymousID == "" {

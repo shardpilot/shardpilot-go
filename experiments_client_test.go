@@ -499,7 +499,7 @@ func TestGrantedOnlyGatesWithConsentFloor(t *testing.T) {
 	if err := client.TrackExperimentOutcome(expTestScopeKey, "score", 1); !errors.Is(err, ErrConsentDenied) {
 		t.Fatalf("expected ErrConsentDenied from the producer, got %v", err)
 	}
-	client.experimentCycle()
+	client.experimentCycle(context.Background())
 	if script.requestCount() != 0 {
 		t.Fatalf("forced-minor must produce zero experiment traffic, saw %d", script.requestCount())
 	}
@@ -576,7 +576,7 @@ func TestUnauthorizedLatchesAndHostFetchUnlatches(t *testing.T) {
 	client.exp.mu.Lock()
 	client.exp.revalidateAtMS = 1 // long expired
 	client.exp.mu.Unlock()
-	client.experimentCycle()
+	client.experimentCycle(context.Background())
 	if script.requestCount() != before {
 		t.Fatalf("a latched lane must not revalidate")
 	}
@@ -816,7 +816,7 @@ func TestRevalidationCycleReusesAttributesAndDropsOnKill(t *testing.T) {
 
 	// The install armed the cadence; before the deadline a cycle is a
 	// no-op.
-	client.experimentCycle()
+	client.experimentCycle(context.Background())
 	if script.requestCount() != 1 {
 		t.Fatalf("no revalidation before the deadline")
 	}
@@ -824,7 +824,7 @@ func TestRevalidationCycleReusesAttributesAndDropsOnKill(t *testing.T) {
 	// with the remembered attributes; the kill answer drops the entry and
 	// emits no exposure.
 	clock.advance(331 * time.Second)
-	client.experimentCycle()
+	client.experimentCycle(context.Background())
 	if script.requestCount() != 2 {
 		t.Fatalf("expected the revalidation fetch, got %d requests", script.requestCount())
 	}
@@ -842,7 +842,7 @@ func TestRevalidationCycleReusesAttributesAndDropsOnKill(t *testing.T) {
 	}
 	// With nothing cached the cycle stops asking.
 	clock.advance(400 * time.Second)
-	client.experimentCycle()
+	client.experimentCycle(context.Background())
 	if script.requestCount() != 2 {
 		t.Fatalf("an empty cache must not revalidate")
 	}
@@ -873,7 +873,7 @@ func TestRetryAfterPacesTheCadenceOnly(t *testing.T) {
 	client.exp.revalidateAtMS = clock.Now().UnixMilli() - 1
 	client.exp.mu.Unlock()
 	requestsBefore := script.requestCount()
-	client.experimentCycle()
+	client.experimentCycle(context.Background())
 	if script.requestCount() != requestsBefore {
 		t.Fatalf("the Retry-After window must park the cadence")
 	}
@@ -888,7 +888,7 @@ func TestRetryAfterPacesTheCadenceOnly(t *testing.T) {
 	client.exp.mu.Lock()
 	client.exp.revalidateAtMS = clock.Now().UnixMilli() - 1
 	client.exp.mu.Unlock()
-	client.experimentCycle()
+	client.experimentCycle(context.Background())
 	if script.requestCount() != requestsBefore+2 {
 		t.Fatalf("an expired Retry-After window must release the cadence")
 	}
@@ -942,7 +942,7 @@ func TestOwedDurableDropRetriesUntilStorageRecovers(t *testing.T) {
 	}
 	// Storage recovers; the next cycle converges the disk.
 	restoreExperimentStorage(t, client)
-	client.experimentCycle()
+	client.experimentCycle(context.Background())
 	client.exp.mu.Lock()
 	owedCount := len(client.exp.durablePending)
 	client.exp.mu.Unlock()
@@ -1050,7 +1050,7 @@ func TestOwedWholeRecordClearDemotesOnFreshInstall(t *testing.T) {
 	}
 	// The demoted per-key drops (for keys the clear still covered) and the
 	// fresh install converge the disk to exactly the new state.
-	client.experimentCycle()
+	client.experimentCycle(context.Background())
 	record := readExperimentRecord(t, spoolDir)
 	if record == nil || len(record.Entries) != 1 || record.Entries[expTestScopeKey].Version != 2 {
 		t.Fatalf("the disk must converge to the fresh install, got %+v", record)
@@ -1184,7 +1184,7 @@ func TestConsentPurgeReArmsExposureWithSameID(t *testing.T) {
 	if err := client.Flush(context.Background()); err != nil {
 		t.Fatalf("sync flush: %v", err)
 	}
-	client.experimentCycle()
+	client.experimentCycle(context.Background())
 	if err := client.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
@@ -1235,7 +1235,7 @@ func TestExplicitReArmWhileAutoOwedEmitsBothDistinctIDs(t *testing.T) {
 			facts = append(facts, event)
 		}
 	}
-	client.experimentCycle() // sweeps the owed arm 0
+	client.experimentCycle(context.Background()) // sweeps the owed arm 0
 	for _, event := range client.queue.drainInto(nil, 16) {
 		if event.Name == experimentExposureName {
 			facts = append(facts, event)
@@ -1350,7 +1350,7 @@ func TestRestoreFromDiskServesAndReArmsExposure(t *testing.T) {
 	// ...and its exposure re-arms for the NEW session (a fresh instance is
 	// a fresh session): the sweep emits one fact with the new session's
 	// deterministic id.
-	client2.experimentCycle()
+	client2.experimentCycle(context.Background())
 	if err := client2.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
