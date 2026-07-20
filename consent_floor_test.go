@@ -5138,8 +5138,9 @@ func TestConsentFloorSettleUnlinkOrderMarkerOutlivesRecord(t *testing.T) {
 		t.Fatalf("expected the wipe still owed after the refused sync")
 	}
 
-	// Healed: the settle completes in order — record unlink, sync, marker
-	// unlink, sync — and only then reopens.
+	// Healed: the settle completes in order — record unlink, sync, then the
+	// marker leg (the wipe marker and any withdrawal marker, whose debt the
+	// total destruction subsumes), sync — and only then reopens.
 	syncFails.Store(false)
 	if !s.settleOwedWipe() {
 		t.Fatalf("expected the healed settle to complete")
@@ -5154,7 +5155,8 @@ func TestConsentFloorSettleUnlinkOrderMarkerOutlivesRecord(t *testing.T) {
 	got := strings.Join(ops, ",")
 	opsMu.Unlock()
 	want := "rm:" + spoolFileName + ",sync," +
-		"rm:" + spoolFileName + ",sync,rm:" + spoolWipeOwedFileName + ",sync"
+		"rm:" + spoolFileName + ",sync,rm:" + spoolWipeOwedFileName + "," +
+		"rm:" + spoolWithdrawnFileName + ",sync"
 	if got != want {
 		t.Fatalf("unlink/sync order mismatch:\n got %s\nwant %s", got, want)
 	}

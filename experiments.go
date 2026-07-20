@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
@@ -717,6 +718,18 @@ func parseExperimentVerdict(resp remoteConfigResponse, scope expRequestScope, no
 	}
 	version := int64(0)
 	if wire.Version != nil {
+		if *wire.Version < 1 {
+			// The SAME positivity rule the assigned branch enforces
+			// (published versions start at 1): a PRESENT non-positive
+			// version is not a verdict this contract sends — treating
+			// {"assigned":false,"reason":"kill_switch","version":-1} as an
+			// authoritative not-assigned would drop the cached assignment
+			// on a malformed body, instead of the malformed_response
+			// transient path that retains and serve-stales the
+			// last-known-good record. Absent stays tolerated (the
+			// traffic-gate shape carries no version).
+			return ExperimentAssignmentResult{}, expOutcome{}, false
+		}
 		version = *wire.Version
 	}
 	// Every not-assigned shape drops the cached assignment: the server just
@@ -1014,6 +1027,15 @@ type experimentsState struct {
 	// tests can drive tick() deterministically. Never set in production.
 	laneParkedForTests bool
 
+	// consentRaceSeam, when set, fires at the two consent commit points —
+	// "mint_adopted" (between the lazy mint's adoption and its commit
+	// re-check) and "settle_locked" (a response settle entering the locked
+	// section, before the under-lock consent read) — so tests can land a
+	// consent flip deterministically inside the race window the commit
+	// checks close. Never set in production (the consentSlowHalfGate
+	// discipline).
+	consentRaceSeam func(stage string)
+
 	// failDurableWritesForTests makes every durable save/clear report
 	// failure, so the owed-sync machinery can be exercised
 	// deterministically (the createAnonymousIDWith seam shape). Never set
@@ -1188,10 +1210,14 @@ func (e *experimentsState) currentSubjectIDLocked() string {
 // CONVERGES on the winner's id, so two clients racing a shared state dir
 // end on one subject instead of two. A RE-MINT (grammar sentinel, corrupt
 // load) replaces the stored value outright: rotation is the point.
-func (e *experimentsState) adoptMintedSubjectIDLocked() (string, bool) {
+// ownFile reports whether THIS call published the persisted file — false
+// when the id converged on another process's winner (that file is the
+// winner's property and an undo must never remove it), when the persist
+// failed, or when the client is memory-only.
+func (e *experimentsState) adoptMintedSubjectIDLocked() (subject string, persisted, ownFile bool) {
 	minted, err := mintExperimentSubjectID()
 	if err != nil {
-		return "", false
+		return "", false, false
 	}
 	initialMint := e.subjectID == ""
 	e.entries = make(map[string]*expEntry)
@@ -1207,7 +1233,7 @@ func (e *experimentsState) adoptMintedSubjectIDLocked() (string, bool) {
 	}
 	e.subjectID = minted
 	e.subjectChecked = true
-	persisted := true
+	persisted = true
 	if path := e.subjectFilePath(); path != "" {
 		// The chmod hook tightens a pre-existing loose state dir/file (the
 		// spool's ensurePrivateDir discipline) — the subject id is private
@@ -1226,7 +1252,7 @@ func (e *experimentsState) adoptMintedSubjectIDLocked() (string, bool) {
 					// converge on its id — one subject rules the shared
 					// state dir.
 					e.subjectID = winner
-					return winner, true
+					return winner, true, false
 				}
 				// The existing file is CORRUPT (this is why the mint ran):
 				// replace it outright — fresh-install semantics must not be
@@ -1235,10 +1261,35 @@ func (e *experimentsState) adoptMintedSubjectIDLocked() (string, bool) {
 			}
 			persisted = converged
 		}
+		ownFile = persisted
 	} else {
 		e.memorySubjectID = minted
 	}
-	return minted, persisted
+	return minted, persisted, ownFile
+}
+
+// unadoptFreshMintLocked reverses a lazy mint whose commit-point consent
+// re-check found the plane refused: the adopted id leaves memory, and the
+// persisted file — when THIS call published it — is removed so nothing of
+// the refused-session mint outlives the abort. A converged-on-winner file
+// is another process's pre-existing subject state, not this mint's, and is
+// left in place (the invariant holds vacuously: this process created no
+// durable state). Returns whether a file THIS mint owned could not be
+// removed — the caller surfaces that residual (the file then reads as a
+// pre-existing id a later granted session converges on, exactly like any
+// other process's publish).
+func (e *experimentsState) unadoptFreshMintLocked(ownFile bool) bool {
+	e.subjectID = ""
+	e.memorySubjectID = ""
+	removeFailed := false
+	if ownFile {
+		if path := e.subjectFilePath(); path != "" {
+			if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				removeFailed = true
+			}
+		}
+	}
+	return removeFailed
 }
 
 // ── durable record IO (all under mu) ────────────────────────────────────────
@@ -1797,16 +1848,123 @@ func (e *experimentsState) retryDurableSync() {
 // off-lock work: whether an exposure sweep is owed, whether a durable
 // persist failure must be surfaced, and whether the real-subjects sentinel
 // drop actually landed (vs being discarded by a gate).
-func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string, outcome expOutcome, authEpoch uint64, resolvedAtMS int64) (sweepOwed, persistFailed, dropAllLanded bool) {
-	if authEpoch != e.authEpoch {
-		return false, false, false
+// applyEntryDropLocked is the authoritative single-entry drop package: the
+// entry leaves memory and its durable delete converges — with the narrow
+// drop-time capture first. Shared by the current-epoch install and the
+// epoch-stale destructive carve-out (the fleet partition).
+func (e *experimentsState) applyEntryDropLocked(scope, experimentKey string, resolvedAtMS int64) (persistFailed bool) {
+	dropped := e.entries[experimentKey]
+	delete(e.entries, experimentKey)
+	// The OWED exposures deliberately survive the drop: an application
+	// that already happened is a fact — the drop stops future serving,
+	// not the record of real treatment. The durable drop converges
+	// keyed on the DISK state (a latch may have cleared serving while
+	// the record retains the entry) and is retried until it lands — the
+	// kill rule demands the drop reach the disk. The drop's effective
+	// stamp is raised above the entry it resolves: the wall clock can
+	// move backward, and a drop for X must always outrank X's own
+	// stamp.
+	asOf := resolvedAtMS
+	if dropped != nil && dropped.FetchedAtMS >= asOf {
+		asOf = dropped.FetchedAtMS + 1
 	}
+	// The narrow drop-time capture (fleet contract): the entry's durable
+	// delete is about to land while its exposure may still be owed only
+	// in memory — durably capture those owed facts FIRST, so a process
+	// death before the next sweep replays them from the spool instead of
+	// losing real treatment. Queue-full-without-drop stays memory-only
+	// by design; only the delete triggers capture. A capture that could
+	// NOT be made durable (spool persist failure) must not let the
+	// record delete outrun the replay source: the drop becomes an owed
+	// capture+delete PAIR — serving already stopped (the entry left
+	// memory above), the durable record stays intact, and the retry
+	// cycle re-attempts the capture before converging the record.
+	if e.captureOwedDropFn != nil {
+		if owed := e.pendingExposure[experimentKey]; len(owed) > 0 {
+			if ok, frozen := e.captureOwedDropFn(experimentKey, owed); !ok {
+				e.durablePending[scopedIntentKey(scope, experimentKey)] = expOwedSync{
+					asOf: asOf, drop: true, scope: scope,
+					experimentKey: experimentKey,
+					captureFirst:  true, captureEntries: frozen,
+				}
+				return true
+			}
+		}
+	}
+	return !e.syncDurableEntryLocked(scope, experimentKey, asOf, false)
+}
+
+// applySentinelWithdrawalLocked is the real-subjects sentinel package: the
+// fail-closed latch, a fresh auth epoch, and the outright withdrawal of the
+// cached assignments, their subject-fact keys, and the owed exposure
+// snapshots that carry them — durably (a failed whole-record clear is owed,
+// tombstoned, and retried). Shared by the current-epoch install and the
+// epoch-stale destructive carve-out (the fleet partition).
+func (e *experimentsState) applySentinelWithdrawalLocked(scope string, resolvedAtMS int64) (persistFailed, landed bool) {
+	e.authBlocked = true
+	e.authEpoch++
+	e.entries = make(map[string]*expEntry)
+	// The sentinel withdraws the assignments AND their subject-fact
+	// keys outright: owed exposure snapshots carry those keys and
+	// go with them. The dedupe slate resets with them — a purged
+	// queued-undelivered automatic exposure must not leave its tuple
+	// marked emitted, or a later authorized re-fetch in this session
+	// would arm a replacement and suppress it as already-sent
+	// (under-counting real treatment). The blanket clear is safe on
+	// both sides of the delivery ambiguity: a fact that HAD
+	// delivered re-derives the SAME deterministic id and collapses
+	// server-side. The purge epoch bump fences emissions already in
+	// flight past their gates, exactly like the consent purge.
+	e.exposed = make(map[string]expExposed)
+	e.purgeEpoch++
+	e.pendingExposure = make(map[string][]*expOwedExposure)
+	if e.clearDurableRecordLocked() {
+		e.durablePending = make(map[string]expOwedSync)
+	} else {
+		// The withdrawn assignments are still on disk: mark the
+		// clear OWED — stamped by this resolution — and retry it
+		// every cycle until it lands. The owed intent alone is
+		// memory-only, so a durable condemnation tombstone is
+		// written fail-closed too: a crash before the retry must
+		// not let the next process preload and serve the withdrawn
+		// record.
+		e.durableClearPending = true
+		e.durableClearAsOf = resolvedAtMS
+		e.durableClearScope = scope
+		e.writeCondemnationTombstoneLocked(scope)
+		return true, true
+	}
+	return false, true
+}
+
+func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string, outcome expOutcome, authEpoch uint64, resolvedAtMS int64) (sweepOwed, persistFailed, dropAllLanded bool) {
 	subject := e.currentSubjectIDLocked()
 	if subject == "" || e.scopeForLocked(subject) != scope {
 		return false, false, false
 	}
 	fenceKey := scope + rcScopeSeparator + experimentKey
 	if seq <= e.settled[fenceKey] {
+		return false, false, false
+	}
+	if authEpoch != e.authEpoch {
+		// The fleet partition (defold R22) applied to the auth-epoch gate:
+		// a response that raced a fail-closed latch installs nothing,
+		// unlatches nothing, settles no fence, resets no backoff — but its
+		// DESTRUCTIVE half still lands. The latch retains the durable
+		// record, so discarding a server-directed withdrawal here would let
+		// a later unlatch or re-init serve an assignment the server already
+		// killed or withdrew. The scope and sequence gates above still
+		// apply: another subject's verdict, or one a newer settled outcome
+		// superseded, stays discarded whole.
+		if outcome.authoritative && !outcome.transient {
+			if outcome.dropAll {
+				pf, landed := e.applySentinelWithdrawalLocked(scope, resolvedAtMS)
+				return false, pf, landed
+			}
+			if outcome.dropEntry {
+				return false, e.applyEntryDropLocked(scope, experimentKey, resolvedAtMS), false
+			}
+		}
 		return false, false, false
 	}
 	if outcome.authoritative {
@@ -1820,57 +1978,27 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 		// retained (a re-init may serve it and re-probe) unless the
 		// real-subjects sentinel says the platform withdrew the
 		// assignments outright.
+		if outcome.dropAll {
+			pf, landed := e.applySentinelWithdrawalLocked(scope, resolvedAtMS)
+			return false, pf, landed
+		}
 		e.authBlocked = true
 		e.authEpoch++
 		e.entries = make(map[string]*expEntry)
-		if outcome.dropAll {
-			// The sentinel withdraws the assignments AND their subject-fact
-			// keys outright: owed exposure snapshots carry those keys and
-			// go with them. The dedupe slate resets with them — a purged
-			// queued-undelivered automatic exposure must not leave its tuple
-			// marked emitted, or a later authorized re-fetch in this session
-			// would arm a replacement and suppress it as already-sent
-			// (under-counting real treatment). The blanket clear is safe on
-			// both sides of the delivery ambiguity: a fact that HAD
-			// delivered re-derives the SAME deterministic id and collapses
-			// server-side. The purge epoch bump fences emissions already in
-			// flight past their gates, exactly like the consent purge.
-			e.exposed = make(map[string]expExposed)
-			e.purgeEpoch++
-			e.pendingExposure = make(map[string][]*expOwedExposure)
-			if e.clearDurableRecordLocked() {
-				e.durablePending = make(map[string]expOwedSync)
-			} else {
-				// The withdrawn assignments are still on disk: mark the
-				// clear OWED — stamped by this resolution — and retry it
-				// every cycle until it lands. The owed intent alone is
-				// memory-only, so a durable condemnation tombstone is
-				// written fail-closed too: a crash before the retry must
-				// not let the next process preload and serve the withdrawn
-				// record.
-				e.durableClearPending = true
-				e.durableClearAsOf = resolvedAtMS
-				e.durableClearScope = scope
-				e.writeCondemnationTombstoneLocked(scope)
-				return false, true, true
-			}
-			return false, false, true
-		} else {
-			// An ORDINARY 401/403 retains the durable record — and the owed
-			// EXPOSURE snapshots: a treatment that already ran is a fact
-			// about the past, and the latch stops future serving, not the
-			// reporting of what happened (the sweep keeps draining them
-			// while consent admits). An owed cache WRITE whose entry this
-			// latch just cleared from memory must not decay into a delete
-			// at the next retry — absence in memory here is fail-closed
-			// serving, not a drop decision — so owed writes are cancelled
-			// (their source data is gone; the disk keeps its last-known
-			// record). Owed DROPS were authoritative server decisions and
-			// still land.
-			for key, pending := range e.durablePending {
-				if !pending.drop {
-					delete(e.durablePending, key)
-				}
+		// An ORDINARY 401/403 retains the durable record — and the owed
+		// EXPOSURE snapshots: a treatment that already ran is a fact
+		// about the past, and the latch stops future serving, not the
+		// reporting of what happened (the sweep keeps draining them
+		// while consent admits). An owed cache WRITE whose entry this
+		// latch just cleared from memory must not decay into a delete
+		// at the next retry — absence in memory here is fail-closed
+		// serving, not a drop decision — so owed writes are cancelled
+		// (their source data is gone; the disk keeps its last-known
+		// record). Owed DROPS were authoritative server decisions and
+		// still land.
+		for key, pending := range e.durablePending {
+			if !pending.drop {
+				delete(e.durablePending, key)
 			}
 		}
 		return false, false, false
@@ -1897,46 +2025,7 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 	// deadline).
 	e.backoffAttempt = 0
 	if outcome.dropEntry {
-		dropped := e.entries[experimentKey]
-		delete(e.entries, experimentKey)
-		// The OWED exposures deliberately survive the drop: an application
-		// that already happened is a fact — the drop stops future serving,
-		// not the record of real treatment. The durable drop converges
-		// keyed on the DISK state (a latch may have cleared serving while
-		// the record retains the entry) and is retried until it lands — the
-		// kill rule demands the drop reach the disk. The drop's effective
-		// stamp is raised above the entry it resolves: the wall clock can
-		// move backward, and a drop for X must always outrank X's own
-		// stamp.
-		asOf := resolvedAtMS
-		if dropped != nil && dropped.FetchedAtMS >= asOf {
-			asOf = dropped.FetchedAtMS + 1
-		}
-		// The narrow drop-time capture (fleet contract): the entry's durable
-		// delete is about to land while its exposure may still be owed only
-		// in memory — durably capture those owed facts FIRST, so a process
-		// death before the next sweep replays them from the spool instead of
-		// losing real treatment. Queue-full-without-drop stays memory-only
-		// by design; only the delete triggers capture. A capture that could
-		// NOT be made durable (spool persist failure) must not let the
-		// record delete outrun the replay source: the drop becomes an owed
-		// capture+delete PAIR — serving already stopped (the entry left
-		// memory above), the durable record stays intact, and the retry
-		// cycle re-attempts the capture before converging the record.
-		if e.captureOwedDropFn != nil {
-			if owed := e.pendingExposure[experimentKey]; len(owed) > 0 {
-				if ok, frozen := e.captureOwedDropFn(experimentKey, owed); !ok {
-					e.durablePending[scopedIntentKey(scope, experimentKey)] = expOwedSync{
-						asOf: asOf, drop: true, scope: scope,
-						experimentKey: experimentKey,
-						captureFirst:  true, captureEntries: frozen,
-					}
-					return false, true, false
-				}
-			}
-		}
-		persisted := e.syncDurableEntryLocked(scope, experimentKey, asOf, false)
-		return false, !persisted, false
+		return false, e.applyEntryDropLocked(scope, experimentKey, resolvedAtMS), false
 	}
 	if outcome.newEntry != nil {
 		entry := outcome.newEntry
@@ -2235,11 +2324,34 @@ func (c *Client) fetchExperimentAssignment(ctx context.Context, experimentKey st
 			e.mu.Unlock()
 			return ExperimentAssignmentResult{}, err
 		}
-		var persisted bool
-		subject, persisted = e.adoptMintedSubjectIDLocked()
+		var persisted, ownFile bool
+		subject, persisted, ownFile = e.adoptMintedSubjectIDLocked()
 		if subject == "" {
 			e.mu.Unlock()
 			return ExperimentAssignmentResult{}, expFetchError("subject_unavailable")
+		}
+		if e.consentRaceSeam != nil {
+			e.consentRaceSeam("mint_adopted")
+		}
+		// COMMIT-POINT double check, after the adopt/persist: a denial's
+		// fast half flips the consent atomic OUTSIDE e.mu (its e.mu
+		// rendezvous — onAnalyticsPurge — only queues BEHIND this section),
+		// so the flip can land between the pre-mint check above and the
+		// persist. Consent moved → the mint aborts and the undo leaves
+		// nothing persisted: a refused session — the forced-minor state
+		// above all — ends with ZERO subject state, not a freshly minted
+		// spcid_ that would survive the denial indefinitely. A flip landing
+		// after THIS read linearizes the mint before the denial (the
+		// denial's own e.mu purge completes strictly later), which is the
+		// pre-denial-mint case whose subject the denial retains by design.
+		if refusal := c.experimentConsentRefusal(); refusal != nil {
+			removeFailed := e.unadoptFreshMintLocked(ownFile)
+			e.mu.Unlock()
+			if removeFailed {
+				c.stats.setLastError("experiment_subject_unmint_failed")
+				c.logf("shardpilot experiments: removing the subject id minted across a consent revocation failed; the orphaned file reads as a pre-existing id at the next granted session")
+			}
+			return ExperimentAssignmentResult{}, refusal
 		}
 		if !persisted {
 			c.stats.setLastError("experiment_subject_persist_failed")
@@ -2391,6 +2503,27 @@ func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string
 		e.mu.Unlock()
 		return ExperimentAssignmentResult{}, ErrClosed
 	}
+	if e.consentRaceSeam != nil {
+		e.consentRaceSeam("settle_locked")
+	}
+	// The consent re-check UNDER e.mu, at the commit point: the entry check
+	// above runs before this lock, and a denial completing in the gap —
+	// SetConsentDecision's fast half flips the atomic without e.mu — must
+	// not let a 200 install memory/disk state or arm exposure debt while
+	// the plane is refused; after a re-grant the client would serve an
+	// assignment fetched across the revoked interval. The fleet partition
+	// (defold R22) splits the refused settle instead of discarding it
+	// whole: CONSTRUCTIVE halves — the install, exposure arming, the
+	// grammar re-mint's subject adoption, pacing, a healthy caller result —
+	// are discarded, while DESTRUCTIVE server verdicts from a request
+	// dispatched under grant (an authoritative not-assigned, a permanent
+	// drop, the real-subjects sentinel) still apply to durable state: the
+	// cache is retained across denial by design, so a discarded withdrawal
+	// would re-serve a server-killed assignment at the next re-grant.
+	// A flip landing after this read linearizes the settle before the
+	// denial (its e.mu purge queues behind this section) — the response
+	// then predates the revocation.
+	consentRefusal := c.experimentConsentRefusal()
 	// Classification reads the CURRENT fenced entry, not the one captured
 	// at dispatch: a kill or supersede that resolved while this request was
 	// in flight must not be undone in the RESULT either — a caller must
@@ -2424,15 +2557,17 @@ func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string
 	fenceKey := scope + rcScopeSeparator + experimentKey
 	fencedOut := seq <= e.settled[fenceKey]
 
-	if outcome.remint && !fencedOut && authEpoch == e.authEpoch {
+	if outcome.remint && consentRefusal == nil && !fencedOut && authEpoch == e.authEpoch {
 		// The persisted subject id failed the wire grammar (storage
 		// corruption this client could not detect locally): re-mint once
 		// per process and retry as a fresh subject — from the revalidation
 		// path too, or a rejected cached subject would never heal until an
 		// explicit host fetch happens to run. A second grammar reject with
 		// a freshly minted id is a bug, never a loop. (Never reached under
-		// a mid-flight revocation: the consent gate above returns first, so
-		// no id is minted post-revocation.) The re-mint honors the SAME
+		// a mid-flight revocation: the consent gate above returns first,
+		// and the under-lock re-check gates the constructive re-mint — a
+		// subject adoption — race-free, so no id is minted
+		// post-revocation.) The re-mint honors the SAME
 		// fences as any other outcome — a grammar reject that is fenced
 		// out, stale by epoch, or stale by scope must not rotate the
 		// persisted subject, wipe entries, or consume the one-shot budget:
@@ -2440,7 +2575,7 @@ func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string
 		if subjectNow := e.currentSubjectIDLocked(); subjectNow != "" && e.scopeForLocked(subjectNow) == scope {
 			if !e.reminted {
 				e.reminted = true
-				_, persisted := e.adoptMintedSubjectIDLocked()
+				_, persisted, _ := e.adoptMintedSubjectIDLocked()
 				if !persisted {
 					// The OLD subject file may outlive this process (the
 					// replace failed): durably condemn the OLD scope's
@@ -2475,18 +2610,34 @@ func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string
 			outcome.dropEntry = true
 		}
 	}
-	if outcome.transient && authEpoch == e.authEpoch && !fencedOut {
+	if outcome.transient && consentRefusal == nil && authEpoch == e.authEpoch && !fencedOut {
 		// Pacing is gated on scope currency AND the per-key sequence fence
 		// exactly like the install and the re-mint: a transient answer for
 		// a RE-MINTED-AWAY subject — or one a newer settled fetch already
 		// fenced out — is discarded from state, and its Retry-After must be
 		// discarded with it: a stale 429/5xx must not park the CURRENT
 		// plane's revalidation (and kill checks) for up to the day clamp.
+		// (A refused plane paces nothing either — the 2381 contract.)
 		if subjectNow := e.currentSubjectIDLocked(); subjectNow != "" && e.scopeForLocked(subjectNow) == scope {
 			e.paceTransientLocked(nowMS, outcome.retryAfterSeconds, outcome.retryAfterPresent)
 		}
 	}
-	sweepOwedNow, persistFailed, dropAllLanded := e.installLocked(seq, scope, experimentKey, outcome, authEpoch, nowMS)
+	skipInstall := false
+	if consentRefusal != nil {
+		// The partition's constructive strip: nothing installs and no
+		// exposure debt arms on a refused plane. Destructive halves —
+		// dropEntry and the dropAll sentinel package — flow through to the
+		// install below and land durably. An ORDINARY latch (authBlocked
+		// without the sentinel) is protective serving state, not a
+		// server-directed withdrawal: a refused settle leaves it unmoved,
+		// exactly as the pre-lock refusal return always has.
+		outcome.newEntry = nil
+		skipInstall = outcome.authBlocked && !outcome.dropAll
+	}
+	var sweepOwedNow, persistFailed, dropAllLanded bool
+	if !skipInstall {
+		sweepOwedNow, persistFailed, dropAllLanded = e.installLocked(seq, scope, experimentKey, outcome, authEpoch, nowMS)
+	}
 	// The epoch re-check guards the PUBLIC result like the install: a
 	// response that raced a fail-closed latch was discarded from state
 	// above, and its caller must not receive a healthy assignment either —
@@ -2538,6 +2689,13 @@ func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string
 		// The freshly applied assignment's exposure fact (and any earlier
 		// owed ones for the key) drain now, off-lock, in FIFO order.
 		c.sweepExperimentExposures(experimentKey)
+	}
+
+	if consentRefusal != nil {
+		// The destructive halves (if any) applied above; the caller
+		// receives the refusal — never a healthy assignment fetched across
+		// a consent that closed while the response settled.
+		return ExperimentAssignmentResult{}, consentRefusal
 	}
 
 	switch {

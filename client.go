@@ -243,6 +243,13 @@ type Client struct {
 	// only before the decision under test starts (no concurrent mutation).
 	consentSlowHalfGate func()
 
+	// drainReceiveSeam, when non-nil, is invoked for each event the bulk
+	// flush drain receives BEFORE its admission — the mid-drain window
+	// where a consent flip can land between the drain's boundary settle
+	// and an event's append. Test seam (the consentSlowHalfGate
+	// discipline); nil in production.
+	drainReceiveSeam func(Event)
+
 	// initialDeferUntil seeds the flush worker's retry-pacing deadline from
 	// the spool's persisted retry_after_until_ms, so server backpressure
 	// captured before a restart still holds automatic publishes for the
@@ -1105,20 +1112,24 @@ func (c *Client) admitReceivedEvent(batch []Event, event Event, seenEpoch *uint6
 	return append(batch, event)
 }
 
-// drainQueueAdmitted is admitReceivedEvent's bulk form for the flush path:
-// the epoch boundary settles once, then queued events join the batch only
-// under a matching intake stamp (stale-stamped strays drop, counted), up
-// to the batch-size limit drainInto honored.
+// drainQueueAdmitted is admitReceivedEvent's bulk form for the flush path.
+// Each drained event re-settles the epoch boundary exactly like the
+// per-event receive path: a deny → re-grant landing MID-drain enqueues
+// post-grant events whose intake stamp is NEWER than the settled epoch —
+// appended blindly they would join the pre-denial held batch and be
+// discarded WITH it at the next epoch observation, silently losing events
+// accepted after consent was granted again. The per-event re-settle drops
+// the stale held batch FIRST, so a newer-stamped event never joins an
+// older-epoch batch, and stale-stamped strays still drop, counted.
 func (c *Client) drainQueueAdmitted(batch []Event, seenEpoch *uint64, backoffAttempt *int) []Event {
 	batch = c.dropBatchOnConsentEpoch(batch, seenEpoch, backoffAttempt)
 	for len(batch) < c.cfg.BatchSize {
 		select {
 		case event := <-c.queue.ch:
-			if event.intakeConsentEpoch < *seenEpoch {
-				c.stats.dropped.Add(1)
-				continue
+			if c.drainReceiveSeam != nil {
+				c.drainReceiveSeam(event)
 			}
-			batch = append(batch, event)
+			batch = c.admitReceivedEvent(batch, event, seenEpoch, backoffAttempt)
 		default:
 			return batch
 		}

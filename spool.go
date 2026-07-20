@@ -111,9 +111,24 @@ const (
 	// once a rewrite without those entries lands. Honored at load.
 	spoolWithdrawnFileName = "spool.withdrawn.json"
 
-	// spoolWithdrawnReadLimit bounds the marker read (ids are ~40 bytes
-	// each; the bound is generous past any legitimate marker).
+	// spoolWithdrawnReadLimit is the FLOOR of the marker read bound: small
+	// configurations keep this generous legacy bound, while larger
+	// configured spools derive a capacity-proportional bound instead (see
+	// withdrawnMarkerReadLimit) — a fixed cap would read a legitimately
+	// large marker as absent after a crash and reload withdrawn facts for
+	// resend.
 	spoolWithdrawnReadLimit = 256 << 10
+
+	// spoolWithdrawnPerIDBytes is the per-id allowance behind the derived
+	// marker read bound: a UUID-shaped event id's JSON envelope (36 chars,
+	// quotes, separator) is ~40 bytes; 128 leaves headroom for longer
+	// deterministic ids and a second unspent generation's merge.
+	spoolWithdrawnPerIDBytes = 128
+
+	// spoolWithdrawnReadCeiling clamps the derived marker bound (overflow
+	// safety for absurd SpoolMaxEvents values): past this the marker is not
+	// a file this spool could legitimately have written.
+	spoolWithdrawnReadCeiling = 1 << 30
 
 	// spoolRecordReadOverhead is the fixed allowance over SpoolMaxBytes for
 	// the record's own JSON framing when reading spool.json back. Every save
@@ -194,19 +209,22 @@ type diskSpool struct {
 	maxEvents int
 	maxBytes  int
 
-	// withdrawnMarkerOwed reports a live withdrawal marker on disk: it
-	// spends (removes) after the next successful record rewrite, which by
-	// then excludes the withdrawn entries.
+	// withdrawnMarkerOwed reports an unspent withdrawal DEBT: a marker may
+	// be live on disk (the crash protection), or its write may have failed
+	// — the debt arms either way and spends (removing any marker file,
+	// durably) after the next successful record rewrite, which by then
+	// excludes the withdrawn entries.
 	withdrawnMarkerOwed bool
 
-	// withdrawnOwedIDs mirrors the UNSPENT withdrawal marker's full id set
-	// (populated when the marker writes or is honored at load, cleared when
-	// it spends). The reload-and-merge save excludes these ids DIRECTLY: a
-	// withdrawal larger than spoolSettledMemory would evict its oldest ids
-	// from the bounded settled cache before the save runs, and the merge
-	// would read them back from the stale on-disk record — writing a
-	// "clean" file that resurrects withdrawn facts, then spending the
-	// marker that condemned them.
+	// withdrawnOwedIDs holds the UNSPENT withdrawal debt's full id set —
+	// populated when a withdrawal happens (marker write SUCCESSFUL OR NOT)
+	// or when a marker is honored at load, retained across merged
+	// generations, cleared only when the debt spends. The reload-and-merge
+	// save excludes these ids DIRECTLY: a withdrawal larger than
+	// spoolSettledMemory would evict its oldest ids from the bounded
+	// settled cache before the save runs, and the merge would read them
+	// back from the stale on-disk record — writing a "clean" file that
+	// resurrects facts the mirror already dead-lettered.
 	withdrawnOwedIDs map[string]struct{}
 
 	entries    []spoolEntry
@@ -611,13 +629,21 @@ func (s *diskSpool) settleOwedWipeLocked() bool {
 	// settle, so its removal must be durable too before the wipe settles.
 	// A failed removal or sync keeps the spool fail-closed (the record
 	// file is already durably gone; the next settle retries just the
-	// marker half).
+	// marker half). The WITHDRAWAL marker goes with it: the record's total
+	// destruction subsumes any partial-withdrawal debt (a damaged marker's
+	// unknowable id set included), and left behind it would condemn — or,
+	// damaged, re-wipe — facts spooled fresh after this settle.
 	if s.removeMarkerFile() != nil {
+		return false
+	}
+	if err := s.removeFn(spoolWithdrawnPath(s.dir)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return false
 	}
 	if s.syncFn(s.dir) != nil {
 		return false
 	}
+	s.withdrawnMarkerOwed = false
+	s.withdrawnOwedIDs = nil
 	// The record file is durably gone: any deferred capacity evictions are
 	// final.
 	s.releaseDeferredCapacityDropsLocked()
@@ -776,7 +802,22 @@ func (s *diskSpool) load(now time.Time) spoolLoadOutcome {
 		_ = s.removeRecordFile()
 		return outcome
 	}
-	withdrawn := readWithdrawnMarker(s.dir)
+	withdrawn, markerDamaged := readWithdrawnMarker(s.dir, s.withdrawnMarkerReadLimit())
+	if markerDamaged {
+		// A PRESENT-but-unusable withdrawal marker (unreadable, over the
+		// bound, corrupt) is a withdrawal whose id set is UNKNOWABLE — it
+		// must never collapse to "absent" and reload withdrawn facts for
+		// resend (the terminal-withdrawal contract is privacy-side).
+		// Fail closed by escalating to the wipe rung: total durable
+		// destruction of the record subsumes the unknowable partial
+		// withdrawal, the owed wipe blocks all disk work until it settles
+		// durably (record first, then both markers, each sync-fenced), and
+		// facts spooled after the settle are FRESH — never condemned by
+		// the stale marker, which the settle removed.
+		s.owed = true
+		_ = s.markerFn(s.dir)
+		return outcome
+	}
 	withdrawnIDs := make(map[string]struct{}, len(withdrawn))
 	for _, id := range withdrawn {
 		withdrawnIDs[id] = struct{}{}
@@ -1060,14 +1101,20 @@ func (s *diskSpool) removeMatching(matches func(raw json.RawMessage) bool, curre
 	// Durability first: persist the withdrawal intent BEFORE the mirror
 	// forgets the entries. A failed marker write proceeds regardless — the
 	// save below may still land the clean record; both failing is the
-	// storage-dead residual the persist flag surfaces.
+	// storage-dead residual the persist flag surfaces. The debt arms and
+	// the in-memory FULL id set backs the merge exclusion EITHER WAY
+	// (writeWithdrawnMarkerLocked populates it before attempting the
+	// write): a failed marker write must not degrade the exclusion to the
+	// bounded settled cache, which a large withdrawal overflows — the save
+	// would merge the oldest withdrawn ids back from the stale record and
+	// report clean, resurrecting dead-lettered facts. The spend tolerates
+	// a marker that never reached disk.
 	ids := make([]string, 0, len(removed))
 	for _, entry := range removed {
 		ids = append(ids, entry.id)
 	}
-	if s.writeWithdrawnMarkerLocked(ids) == nil {
-		s.withdrawnMarkerOwed = true
-	}
+	_ = s.writeWithdrawnMarkerLocked(ids)
+	s.withdrawnMarkerOwed = true
 	kept := s.entries[:0]
 	for _, entry := range s.entries {
 		if _, isRemoved := removedIDs[entry.id]; isRemoved {
@@ -1090,12 +1137,24 @@ func (s *diskSpool) removeMatching(matches func(raw json.RawMessage) bool, curre
 	return removed, persistFailed
 }
 
-// writeWithdrawnMarkerLocked persists the withdrawn-id set, merging any
-// still-unspent marker (a second purge before the first rewrite lands).
+// writeWithdrawnMarkerLocked arms the withdrawal debt and persists the
+// withdrawn-id set, merging the still-unspent prior generation (a second
+// purge before the first rewrite lands) from BOTH sources — the readable
+// disk marker and the in-memory owed set. The in-memory FULL set backs the
+// merge exclusion BEFORE the file write is attempted: even a FAILED marker
+// write must keep withdrawn ids out of every following reload-and-merge
+// save (the bounded settled cache alone lets the oldest ids of a large
+// withdrawal merge back from the stale on-disk record and report a clean
+// save), and the union means a damaged or unwritable disk generation never
+// drops ids this process still remembers.
 func (s *diskSpool) writeWithdrawnMarkerLocked(ids []string) error {
+	prior, _ := readWithdrawnMarker(s.dir, s.withdrawnMarkerReadLimit())
 	seen := make(map[string]struct{})
 	all := make([]string, 0, len(ids))
-	for _, id := range append(readWithdrawnMarker(s.dir), ids...) {
+	for priorOwed := range s.withdrawnOwedIDs {
+		prior = append(prior, priorOwed)
+	}
+	for _, id := range append(prior, ids...) {
 		if id == "" {
 			continue
 		}
@@ -1105,6 +1164,7 @@ func (s *diskSpool) writeWithdrawnMarkerLocked(ids []string) error {
 		seen[id] = struct{}{}
 		all = append(all, id)
 	}
+	s.withdrawnOwedIDs = seen
 	payload, err := json.Marshal(all)
 	if err != nil {
 		return err
@@ -1112,45 +1172,77 @@ func (s *diskSpool) writeWithdrawnMarkerLocked(ids []string) error {
 	if err := writePrivateFileAtomic(spoolWithdrawnPath(s.dir), payload, s.renameFn, s.chmodFn); err != nil {
 		return err
 	}
-	// Mirror the durable marker's FULL id set for the merge exclusion (the
-	// bounded settled cache can evict older ids of a large withdrawal
-	// before the save runs — see withdrawnOwedIDs).
-	owed := make(map[string]struct{}, len(all))
-	for _, id := range all {
-		owed[id] = struct{}{}
-	}
-	s.withdrawnOwedIDs = owed
-	return nil
+	// The recovery-marker durability idiom (createWipeOwedMarker): the
+	// marker's directory entry is fsynced before the withdrawal intent is
+	// considered durably persisted — an un-synced marker could vanish in a
+	// crash while the stale record survives, resurrecting withdrawn facts
+	// at the next load.
+	return s.syncFn(s.dir)
 }
 
 // removeWithdrawnMarkerLocked spends the marker; a missing file counts as
-// spent.
+// removed, but the spend completes only once the directory entry's removal
+// is durably synced — POSIX may lose an un-synced unlink in a crash, and a
+// resurrected marker honored after the owed state cleared would condemn
+// same-id FRESH facts spooled after re-enable (the settleOwedWipeLocked
+// unlink discipline). The sync runs on the missing-file path too: a prior
+// attempt may have unlinked and then failed exactly this sync.
 func (s *diskSpool) removeWithdrawnMarkerLocked() bool {
-	err := s.removeFn(spoolWithdrawnPath(s.dir))
-	return err == nil || errors.Is(err, fs.ErrNotExist)
+	if err := s.removeFn(spoolWithdrawnPath(s.dir)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return false
+	}
+	return s.syncFn(s.dir) == nil
 }
 
 func spoolWithdrawnPath(dir string) string {
 	return filepath.Join(dir, spoolWithdrawnFileName)
 }
 
-// readWithdrawnMarker reads the withdrawn-id set (bounded; corrupt or
-// oversized reads as absent).
-func readWithdrawnMarker(dir string) []string {
+// withdrawnMarkerReadLimit derives the marker read bound from the
+// CONFIGURED spool capacity — never a fixed constant: a marker for a
+// legitimately large configured withdrawal must read back after a crash.
+// Floored at the legacy generous bound, ceiling-clamped for overflow
+// safety.
+func (s *diskSpool) withdrawnMarkerReadLimit() int64 {
+	limit := int64(spoolWithdrawnReadLimit)
+	if s.maxEvents > 0 {
+		if s.maxEvents > spoolWithdrawnReadCeiling/spoolWithdrawnPerIDBytes {
+			return spoolWithdrawnReadCeiling
+		}
+		derived := int64(s.maxEvents)*spoolWithdrawnPerIDBytes + int64(spoolRecordReadOverhead)
+		if derived > limit {
+			limit = derived
+		}
+	}
+	if limit > spoolWithdrawnReadCeiling {
+		limit = spoolWithdrawnReadCeiling
+	}
+	return limit
+}
+
+// readWithdrawnMarker reads the withdrawn-id set. damaged distinguishes a
+// PRESENT-but-unusable marker — unreadable, over the bound, or corrupt —
+// from a genuinely absent one: a damaged marker still testifies that a
+// withdrawal happened whose id set is now unknowable, and callers must
+// fail CLOSED on it (the load escalates to the wipe rung) instead of
+// collapsing it to "no marker" and reloading withdrawn facts for resend.
+func readWithdrawnMarker(dir string, limit int64) (ids []string, damaged bool) {
 	file, err := os.Open(spoolWithdrawnPath(dir))
 	if err != nil {
-		return nil
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, false
+		}
+		return nil, true
 	}
 	defer file.Close()
-	data, err := io.ReadAll(io.LimitReader(file, spoolWithdrawnReadLimit+1))
-	if err != nil || len(data) > spoolWithdrawnReadLimit {
-		return nil
+	data, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil || int64(len(data)) > limit {
+		return nil, true
 	}
-	var ids []string
 	if json.Unmarshal(data, &ids) != nil {
-		return nil
+		return nil, true
 	}
-	return ids
+	return ids, false
 }
 
 // pullResendChunk takes up to limit startup-loaded entries for re-publish,
