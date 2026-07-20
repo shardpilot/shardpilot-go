@@ -2,6 +2,327 @@
 
 ## Unreleased
 
+- Opt-in client-side consent floor (`Config.ConsentFloor`), adopting the engine SDKs'
+  consent-first contract for integrations that need client-side enforcement (per the
+  sdk-stability-1.0 disposition: user-facing adopters bound by the DPIA condition opt in;
+  the DEFAULT — `ConsentFloor` nil — keeps this SDK's documented server-side posture
+  byte-for-byte, proven by an explicit equivalence test plus the whole existing suite
+  running floor-off). With the floor enabled:
+  - Consent-first gating: `Track`/`Enqueue` refuse the new `ErrConsentUnknown` until an
+    explicit decision is recorded (distinct from `ErrConsentDenied`); with `SpoolDir` the
+    persisted decision reloads as the LIVE state at startup, and an undecided session
+    transmits nothing at all. Persisted floor state is trusted only through a state
+    directory whose privacy is established (the spool's ensurePrivateDir-first gate): a
+    refused tighten starts the floor fail-closed — undecided, empty outbox, surfaced via
+    `Stats.LastError` — with the on-disk files left for a run with fixed permissions.
+    Decisions recorded after `Close` are memory-only IN FULL under the floor: no receipt
+    is minted, retained, or persisted, and the local decision record is not rewritten
+    (the next launch runs on the pre-`Close` state; record decisions before `Close`).
+    The floor requires IN-CONTRACT identifiers: a non-empty `UserID`/`AnonymousID` over
+    the 512-byte clamp rejects the decision whole with the new
+    `ErrInvalidConsentIdentity` (reject, never truncate, never silently mint the receipt
+    for a different actor than events carry — go's event path stamps configured
+    identifiers verbatim, deliberately unclamped), and the same contract holds at
+    RELOAD: a persisted decision for an out-of-contract configuration is refused
+    fail-closed (undecided, diagnosed `consent_identity_invalid`). At reload the
+    receipt trail's TAIL is the newer truth: when the decision record disagrees with
+    the newest retained receipt (the record write was still owed when the previous
+    process ended), the tail's decision governs fail-closed and the stale record is
+    healed — a stale grant can never reopen the pipeline for an actor whose last
+    decision was a denial. The override reads the latest IN-SCOPE receipt — scanned
+    newest→oldest for the configured workspace/app/environment tuple and the configured
+    actor, matching BOTH actor components (the wire identifier AND the retained
+    AnonymousID metadata, mirroring the record digest's actor scope), so a reused
+    `SpoolDir` with the same UserID but a different configured AnonymousID treats
+    the old identity's receipts as foreign — so a foreign receipt retained in a reused `SpoolDir` can neither flip this
+    client's state, nor heal the record for a digest its decision never covered, nor
+    HIDE this client's own latest decision by merely being newer — and it may override
+    only when its decision is STRICTLY NEWER than the record's decision moment
+    (`consent.json` now carries the decision's `decided_at`, the same instant its
+    receipt carries): a STALE receipt left on disk by a failed prune rewrite — already
+    acknowledged long ago — can never flip the state back over a record persisted for
+    a newer decision. A failed HEAL registers as an owed record write exactly like a
+    live decision's failure, holding the denial's proof receipt until the record
+    lands. `consent.json` also carries FLOOR PROVENANCE: a granted record written
+    without `Config.ConsentFloor` (the fire-and-forget era — its POST may have failed;
+    no receipt exists) is never promoted to live floor state — the floor starts
+    undecided, diagnosed `consent_record_unproven` — while denials are honored
+    regardless of provenance (the fail-closed direction). A floor-confirmed granted
+    record also reopens the spool's write gate at reload, so post-restart retriable
+    failures and close remnants spool durably instead of dead-lettering until a fresh
+    `SetConsent(true)`. The scope digest that
+    keys `consent.json` now includes `AppID` (a reused directory across apps in one
+    workspace/environment must not let another app's record — whose receipt was
+    delivered for the other app's scope — become this app's live floor state); a record
+    written by an earlier build reads as "no usable decision" and fails closed, the
+    same treatment as any digest mismatch (this applies with the floor off too, where
+    the record gates only the next launch's spool). The floor resolves BEFORE
+    any spooled events load (construction ordering), and spooled events reload only
+    under a grant the RESOLVED state confirms: a stale granted record whose operative
+    decision is the trail tail's denial purges the spool instead of seeding resend
+    work that would transmit pre-denial events — while a grant the trail proof
+    RESOLVED whose record heal FAILED preserves and loads the spool (never purged
+    and dead-lettered on the stale record read alone), with the write gate closed
+    until the owed record write lands. The floor covers the CONFIGURED
+    identity: an event whose per-event `UserID`/`AnonymousID` override resolves to a
+    different effective actor is refused at intake with the new
+    `ErrConsentActorMismatch` (that actor has no local decision and no receipt;
+    per-actor decisions beyond the configured identity stay on the server-side path —
+    floor-off, overrides pass through unchanged). The disk spool's actor eligibility
+    mirrors the same effective-actor rule under the floor: an event the floor ADMITTED
+    (say a secondary AnonymousID override under a configured UserID) is never refused
+    disk retention later; floor-off keeps the released strict both-identifiers rule.
+  - Durable consent-receipt outbox (`consent-outbox.json` under `SpoolDir`; in-memory
+    without it): exactly one receipt per explicit decision — an append-only trail, a later
+    decision never withdraws an earlier receipt — 32-cap FIFO evicting oldest on save AND
+    at load (an over-cap legacy record keeps its newest receipts, and the load-time trim
+    OWES the durable rewrite so the trimmed record lands at the first dispatch point
+    instead of re-evicting and re-counting on every restart), no
+    TTL, sanitize-on-load-and-save with a bounded record read, failed-write-never-evicts
+    (the write is owed and retried at every dispatch point and at `Close`), strictly serial
+    decision-order delivery retried until acknowledged, re-sent VERBATIM across restarts
+    (same `idempotency_key`/`decided_at`; the server de-duplicates). Durable ordering
+    per decision flavor (the engine SDKs' shared rule): a GRANT appends its receipt
+    FIRST and writes the granted decision record only once the receipt trail is safely
+    down — a crash can never leave a restored grant with an empty outbox flowing
+    events receipt-less, and a failed receipt write WITHHOLDS the record (fail-closed
+    across restart, healed from the trail tail once the owed write lands) — while a
+    DENIAL keeps its record (and the spool purge it condemns) first — and WITHIN
+    the denial the RECORD lands before the purge destroys anything: purge-first
+    would open a crash window where the spool is gone with no durable evidence
+    of the denial yet, and a relaunch would promote the stale granted record
+    over a destroyed spool; a failed denied-record write DEFERS the purge with
+    it (the write gate is already closed and the live denial refuses intake),
+    completing both in the owed-record retry pass the record lands. The
+    deferred purge is a DEBT carried independently of the single owed-record
+    slot: the MEMORY half runs immediately regardless (the condemned entries
+    dead-letter at denial time, cleared from the mirror and resend queue and
+    tombstoned against merging saves — condemnation is never disk-dependent),
+    and the deferred record-FILE removal rides the durable wipe-owed marker
+    — created under the SAME spool-mutex hold that sets the owed flag, so a
+    concurrent settle (maintain, the append gate, a superseding grant) can
+    never consume the flag inside the window and leave a late-created
+    marker orphaned on disk to wipe a later grant's events at the next
+    start — which a SUPERSEDING grant settles BEFORE its own record can
+    reopen the spool and which a crash re-derives at the next start — a later grant whose
+    successful record write clears the owed slot can no longer silently forget
+    that a denial condemned the spooled events, and events a denial condemned
+    never resend, whatever decision follows. The debt's DURABILITY is itself
+    an invariant: the deferring branch returns only after EITHER the denied
+    record, the wipe-owed marker, or the spool file's removal is durable —
+    when the marker creation fails too it escalates in order (retry the
+    denied record, which restores record-first and completes the purge; else
+    remove the condemned spool file itself, durable by destruction — and
+    destruction counts as durable only once the DIRECTORY entry change is
+    fsynced (settleOwedWipe keeps the wipe owed on a failed sync: POSIX
+    permits a crash to lose an un-synced unlink, and a resurrected
+    spool.json under the stale granted record with no marker would reload
+    the condemned events), with the unlinks strictly ORDERED — the record
+    file first, a dir-sync, only then the marker, then a second sync — so
+    the marker OUTLIVES the record it condemns (both-before-one-sync would
+    let a crash persist the marker's unlink but not the record's: no
+    marker, condemned file back, stale grant); else
+    surface the failure with the in-memory condemnation holding and the
+    owed-record retry re-deriving the debt at every dispatch point), because
+    a crash with none of them would leave stale granted state plus the
+    condemned file and NO marker — reloading the condemned events under the
+    old grant, with no deny receipt ever coming on the actorless local-only
+    path. A decision-record
+    write that fails (or is withheld) is OWED and retried at every dispatch point: the
+    withheld grant record completes its receipt-first PAIR in the same pass the outbox
+    write recovers — before the receipt can deliver and prune away the trail's only
+    durable grant evidence — and while a DENIED record write is owed, the denial's
+    in-scope proof receipt is HELD from dispatch entirely, so it can never be
+    acknowledged and pruned while the stale pre-denial record would rule a restart
+    (Close still completes over the durable held proof; the relaunch restores the
+    denial from it and heals the record). A GRANT receipt dispatches only when its
+    PAIR is fully durable: while the outbox write is owed (the grant's own failed
+    append included), while the granted RECORD write is owed, or while a grant
+    decision is still mid-persist, the dispatch pass holds — an acknowledgement
+    followed by a crash would otherwise prune the only durable half and leave neither
+    a receipt nor a granted record, losing the grant across restart though the server
+    recorded it; the pass that recovers the writes completes the pair before the
+    receipt can be acknowledged, and an owed GRANT record also pends `Close`
+    (`ErrConsentPending`, retryable) so teardown never reads clean over an incomplete
+    pair — and an owed DENIAL record pends `Close` too unless a durable in-scope
+    proof receipt exists (the local-only path mints none: nothing durable would
+    contradict the stale pre-denial record). The pair-incomplete hold is tracked
+    PER RECEIPT, not only in the newest-decision owed slot: a newer denial whose
+    record write also fails cannot release an earlier grant whose record never
+    landed — the retained grant stays held instead of delivering and pruning
+    while the deny proof is held (a grant must never become the server's last
+    word against a local denial), and a successful record write (always the
+    newest decision's) releases the whole trail in order. The rule GENERALIZES
+    across the stale-grant family: an in-scope grant never dispatches past a
+    PARKED newer in-scope denial, whatever parked it — the per-receipt owed
+    mark, the owed mint (the receipt not yet in the trail), or the held deny
+    proof — while a newer denial with no holds needs no park: the same serial
+    pass delivers grant then denial in decision order. The handoff RE-CHECKS
+    under the decision serialization point: immediately before the transport
+    call a grant re-takes the record-apply lock opportunistically — a failed
+    try means a decision is mid-flight (possibly appending that held denial)
+    and the grant parks for the next pass, while a successful try re-runs the
+    held-denial predicates against the settled trail, closing the window
+    between the pass's hold checks and the post. A successful try ALSO
+    consults the LIVE consent state: a denial's fast half flips the live
+    state before any disk work, so in the window before its slow half
+    appends the receipt the apply lock is free and no hold is visible in the
+    trail — a grant with no newer in-scope denial behind it in the trail
+    parks while the live state says denied, until the denial's evidence
+    exists. An appended unheld denial then delivers in order BEHIND the
+    grant (the normal grant-then-deny trail), while a stale grant receipt
+    reloaded under a durably DENIED state simply stays retained — durable,
+    never the server's last word past the denial, and a key-de-duplicated
+    replay if it ever posts. A failed
+    idempotency-key MINT for a CONFIGURED actor is never the local-only path:
+    the receipt is OWED — re-minted at every dispatch point with the original
+    decision's stamp — a mint-failed GRANT withholds its record and holds the
+    batch legs exactly like a failed append, earlier in-scope grants park
+    behind a mint-owed denial, and `Close` pends (`ErrConsentPending`) until
+    the owed receipt exists; only a client with NO configured identifiers
+    persists a decision receipt-less. The owed-record retry WAITS on the owed
+    mint too: a mint-owed grant has no receipt anywhere, so the outbox owing
+    no write proves nothing — writing the granted record at a dispatch point
+    would make "granted record, no receipt ever minted" durable and a crash
+    would promote the grant receipt-less — the record lands only after the
+    retried mint appends the receipt, completing the pair receipt-first. Decision stamps are MONOTONIC per
+    client AND seeded at reload from the maximum persisted stamp (record and
+    retained receipts), so same-tick decisions, backward-stepping clocks, and
+    behind-clock restarts all mint strictly increasing `decided_at` values — the
+    reload's strictly-newer rule always sees the newest decision. The reload heals
+    from the proof even when the state string matches: a strictly newer in-scope
+    receipt promotes an UNPROVEN same-state grant record to the floor-marked,
+    receipt-stamped one instead of discarding a grant whose durable proof exists.
+    The sanitizer also drops receipts whose `decided_at` does not parse, whose
+    `reason` is not the one value this SDK mints (`denied_forced_minor`, and
+    only on DENIALS — a grant claiming it is a self-contradiction), or whose
+    idempotency key duplicates an earlier entry (keep-FIRST: the ingest
+    service de-duplicates by key and honors the first body it saw, so a later
+    conflicting body could never take effect server-side) — corrupt data must
+    never become reload truth. A FLOOR-MARKED `consent.json` whose
+    `decided_at` is missing or unparsable fails closed PER FLAVOR: a corrupt
+    GRANT reads as ABSENT (an unorderable grant must not beat a durable newer
+    deny receipt), while a corrupt DENIAL is PRESERVED as
+    denied-with-unknown-stamp — read as absent, a stale retained grant
+    receipt would apply unconditionally and reopen the floor against a
+    durable denial — and is never superseded by comparison. LEGACY unmarked
+    records keep loading stampless, with the ordering rule they predate made
+    explicit: a validly-stamped in-scope proof receipt supersedes a legacy
+    record in BOTH directions (a denial proof heals denied over a legacy
+    grant that provenance would otherwise strand as undecided — losing the
+    denial — and a grant proof heals a floor-marked grant over a legacy
+    denial); with no stamped proof retained, provenance vets legacy grants
+    and legacy denials stay honored. Foreign receipts retained in
+    a reused `SpoolDir` are never dispatched with this client's scoped bearer — a
+    terminal 401/403 would prune ANOTHER scope's consent receipt — they stay retained
+    for a correctly scoped client while this client's own trail dispatches around
+    them in order, and outbox rewrites RELOAD-AND-MERGE the on-disk record
+    exactly like the disk spool's saves (the fresh disk view first, minus the
+    keys this process settled, plus its own unsaved appends; de-duplicated by
+    idempotency key, cap re-applied on the merged view): a sibling floor
+    client's receipts appended to the shared directory after this process
+    loaded are never clobbered by a mirror-only rewrite, and a receipt its
+    owner pruned concurrently never resurrects from this process's stale
+    mirror copy. Retryable outcomes
+    (transport failure, `429`, any `5xx`) keep the receipt at the head and park the consent
+    plane behind the server's `Retry-After` — parsed on `429` AND `5xx` — or jittered
+    backoff, independent of the events plane's pacing; every other outcome is terminal and
+    chains the next receipt (including `401`: this SDK's bearer is static for the client's
+    lifetime, the engine SDKs' static-credential rule). Dispatches on caller-driven
+    operations (`Track`, `Flush`, `Close`) are bounded by the sooner of the caller's
+    context and `HTTPTimeout`, and a caller-aborted attempt is no outcome (nothing
+    counted, no deferral armed, receipt retained). Caller-driven DRAINS (`Flush`,
+    `Close`) JOIN behind a concurrent dispatch pass — bounded by the caller's
+    context — instead of silently skipping when the serial claim is held: losing
+    the claim to a concurrent pass can no longer make a denied-path `Flush`
+    report success over an undrained trail, and a join the caller's context cut
+    short surfaces the caller's own error while receipts remain pending
+    (automatic passes keep skipping — the work is being served). Consent gating never feeds the EVENTS
+    plane's retry pacing. The consent route never decodes the response body: ANY `2xx`
+    status is the acknowledgement (empty `200`, `204`, even a non-JSON body), while
+    send-path and no-status errors stay retryable — on the floor path and the legacy
+    fire-and-forget path alike. The dispatch gate releases only on an OBSERVED HTTP
+    outcome: a grant whose POST failed with no response observed (connection refused,
+    send-path EOF, a timeout before any status, a caller abort) stays unhanded and keeps
+    holding the event legs — a batch must never be the server's first-seen request ahead
+    of the grant; and a grant decision holds the event legs from the moment it is
+    OBSERVABLE, before its receipt finishes appending (the arming window). Receipt
+    delivery is permitted while consent is denied, on every dispatch point including an
+    explicit `Flush` in a denied session; construction is a dispatch point too (reloaded
+    receipts re-send promptly, not at the first flush tick). `Close` runs the consent
+    drain whatever the event-plane outcome, folding both verdicts (`errors.Join`) so a
+    terminal event error never masks the retryable `ErrConsentPending` state; a drain
+    the CALLER's own context stopped — the join cut short, or an attempt aborted
+    mid-flight — with receipt work remaining folds the caller's context error into
+    the verdict too (on the first Close and on every retried one), so a
+    deadline-bounded Close never reports bare `ErrConsentPending` — or a clean nil
+    over durably-retained receipts — as if its delivery attempt had actually run to
+    completion — and a
+    floor client whose close remnant was neither delivered nor made durable reports the
+    loss on every `Close` (`ErrEventsDiscarded`, counted in `Stats.Dropped`) instead of
+    ever reading as a clean teardown: the memory-only discard, a remnant the spool's
+    write gate refused, a remnant still unpersisted after the final settle retry,
+    the close phase's settled CAPACITY evictions (a remnant overflowing
+    `SpoolMaxEvents`/`SpoolMaxBytes` at exit is a permanent loss with no later
+    resend — unlike a mid-session eviction — while a still-DEFERRED eviction
+    stays on disk and reloads, the durable-eviction-deferral rule, so it is
+    deliberately not counted; the deferral applies only to evictions with a
+    durable stale copy — an eviction under a FAILED save of an entry that was
+    never durably saved, a member of the failing batch itself or one accepted
+    under an earlier failed write, has nothing the disk could undo and is a
+    SETTLED loss returned and counted immediately, so a disk-full Close can
+    no longer exit with such a member neither mirrored nor counted), remnant
+    members past the RETRY-AGE cap (refused at
+    the close append as too old to ever resend), and remnant members that could
+    not SERIALIZE (poisoned — already counted `Dropped` at their settle, joining
+    the verdict fold only) all fold the same way — counted PER EVENT through
+    the mirror's unpersisted-entry tracking, so a remnant that merely
+    de-duplicated against an earlier append whose
+    save had failed counts exactly like a fresh dirty add; the retry-age
+    discount removes exactly the EXPIRED COPIES (a per-entry multiset,
+    never every entry sharing an id), so a fresh duplicate retained under
+    the same event id as an expired stale copy still reaches the
+    unpersisted-mirror fold instead of silently vanishing from a
+    failed-save close. The discard fold is
+    re-applied (idempotently) on every cached-`Close` return: a `Close` whose context
+    expired before the worker's stop path finished counting cannot hide a loss
+    counted after its verdict was cached — and a RETRIED `Close` (after an
+    earlier one timed out pre-workerDone with consent pending) waits for the
+    worker's stop path, bounded by its own context, before it can return nil:
+    the caller never exits on a clean retried verdict while the close remnant
+    is still being spooled or counted.
+  - Grant-receipt dispatch gate: while an analytics-grant receipt is retained undispatched
+    (parked, queued, or reloaded after a relaunch), event legs hold — `Track`/`Flush`
+    return the new `ErrConsentReceiptPending`, intake stays open — so post-grant events
+    can never overtake the grant on the wire and be terminally `suppressed_no_consent` on
+    a strict-consent workspace. Released on an OBSERVED HTTP outcome for the receipt —
+    success or a status error, never gated on its acknowledgement (a receipt the server
+    answered does not hold that cycle's batch even when the answer is a retryable
+    failure), while a no-response failure keeps holding — and an empty pipeline is never
+    gated, so a retained receipt alone cannot wedge teardown. Only IN-SCOPE grants arm
+    the gate: a foreign grant parked in a reused `SpoolDir` keeps re-sending for its own
+    historic scope but never holds this client's pipeline.
+  - `SetConsentDecision(ConsentDecision)` with the forced-minor denial
+    (`ConsentDecisionDeniedForcedMinor`): analytics-wise identical to denied everywhere —
+    same gates, same `ErrConsentDenied`, full denial path — with the receipt carrying
+    `reason: "denied_forced_minor"`; persisted as its own state and reloading as itself
+    under the floor; superseded normally by a later decision (whose receipt carries no
+    reason). Available without the floor too, where the reason rides the legacy
+    fire-and-forget post. Invalid values reject `ErrInvalidConsentDecision` and apply
+    nothing. An AC-8 whole-session test pins the forced-minor session shape: exactly one
+    analytics-plane request (the receipt), zero event batches.
+  - Teardown durability: `Close` completes only when every retained receipt is delivered
+    or durably on disk; otherwise the new `ErrConsentPending` is returned and `Close`
+    stays RETRYABLE (a repeated call re-runs the delivery/persist drain), so a consent
+    decision's receipt is never silently lost by process exit.
+  - Receipt-path identifier clamp: `UserID`/`AnonymousID` over 512 BYTES reject the
+    decision whole (`ErrInvalidConsentIdentity` — never truncated, never a substitute
+    actor) at decision time AND at reload; the outbox sanitizer drops oversized or
+    malformed entries fail-safe. The anonymous-id retention snapshot never rides the
+    wire.
+  - Consent-plane observability on `Snapshot()`: `ConsentRecorded`, `ConsentFailed`,
+    `ConsentOutboxEvicted`, `ConsentOutboxPersistFailed`, `LastConsentError`.
+
 - Fleet-audit follow-ups on the GAP-075 spool and transport machinery:
   - Poison-member isolation on the worker publish paths: a batch member whose nested
     `Props`/`Context` values no longer serialize (mutated after `Enqueue`) is now dropped

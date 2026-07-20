@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -124,6 +125,96 @@ type Client struct {
 	// unset (today's memory-only behavior, unchanged).
 	spool *diskSpool
 
+	// consentOutbox is the consent floor's receipt outbox; nil unless
+	// Config.ConsentFloor is set (see consent_outbox.go). Durable when
+	// SpoolDir is also set, in-memory otherwise.
+	consentOutbox *consentOutbox
+
+	// consentWake nudges the worker to run a consent dispatch pass promptly
+	// after a decision under the consent floor, instead of waiting for the
+	// flush tick. Capacity 1 with non-blocking sends; nil when the floor is
+	// off (a nil channel never fires in the worker's select).
+	consentWake chan struct{}
+
+	// consentGrantArming counts floor GRANT decisions whose receipt is not
+	// yet appended to the outbox: the fast half flips the live state to
+	// granted BEFORE the ticket-ordered slow half appends the receipt, and
+	// in that window a concurrent Track/worker flush would see granted with
+	// an empty outbox — an unarmed gate — and ship a batch BEFORE the grant
+	// receipt exists. The counter arms the dispatch gate across the window
+	// (incremented with the state flip under lifecycleMu, decremented once
+	// the slow half has appended the receipt — or established that none
+	// will exist), so the event path reopens only once the receipt is the
+	// gate's own source of truth: receipt-armed-before-observable-grant,
+	// adapted to the fast/slow lock split.
+	consentGrantArming atomic.Int64
+
+	// closeDiscardedEvents counts undelivered events a MEMORY-ONLY floor
+	// client discarded when the worker stopped (no spool to retain them —
+	// typically a gated final flush's remnant). Written by the worker's
+	// stop path before workerDone closes; folded into Close's verdict as
+	// ErrEventsDiscarded on every Close call, so the loss can never read
+	// as a clean teardown.
+	closeDiscardedEvents atomic.Uint64
+
+	// consentRecordApplyMu serializes every consent-record disk write under
+	// the floor: a decision's own disk section (already serial through the
+	// ticket turn) BLOCK-locks it, while an owed-record retry at a dispatch
+	// point TRY-locks — an opportunistic retry must never make Track or the
+	// worker wait out a stalled decision write. Because the owed slot below
+	// is only mutated under this lock together with the write it describes,
+	// a retry that wins the lock always re-applies the CURRENT owed decision
+	// (never a superseded one over a newer record).
+	consentRecordApplyMu sync.Mutex
+
+	// consentOwedMu guards consentRecordOwed for cheap reads (the deny-proof
+	// dispatch hold); mutations happen under consentRecordApplyMu too.
+	consentOwedMu sync.Mutex
+
+	// consentStampMu guards lastConsentStamp: the per-client MONOTONIC
+	// decision-stamp seam (consentDecisionStamp). Same-tick decisions must
+	// mint strictly increasing decided_at values or the reload's
+	// strictly-newer override would miss the newest decision after a crash.
+	consentStampMu   sync.Mutex
+	lastConsentStamp string
+
+	// consentRecordOwed is the floor decision whose durable record write is
+	// still OWED (failed, deliberately withheld while the grant's receipt
+	// trail write is itself owed — receipt-first — or a failed reload
+	// heal). Carries the decision's decided-at stamp so the retried record
+	// keeps the ordering instant of the decision it describes. Retried at
+	// every dispatch point (retryOwedConsentRecord); while a DENIAL is
+	// owed, the trail's in-scope proof receipt is held from dispatch so the
+	// only durable evidence of the denial cannot prune away before the
+	// record heals. Nil when nothing is owed; each new decision's slow half
+	// overwrites it — which is why the outbox ALSO marks incomplete pairs
+	// per receipt (consentOutbox.recordOwedKeys): the slot alone would
+	// forget an older receipt's owed record when a newer decision's write
+	// fails too.
+	consentRecordOwed *consentOwedRecord
+
+	// consentMintOwed is the floor decision whose RECEIPT could not be
+	// minted (idempotency-key generation failed): the decision applied
+	// locally, its receipt is owed — retried at every dispatch point
+	// (retryOwedConsentMint), pending Close until it lands. Guarded by
+	// consentOwedMu; mutations happen under consentRecordApplyMu too. Nil
+	// when nothing is owed; the newest decision owns the slot (a successful
+	// newer mint supersedes an owed older one — see consentOwedMint).
+	consentMintOwed *consentOwedMint
+
+	// consentMintIDFn is the receipt idempotency-key mint seam, injectable
+	// so tests can exercise mint failure deterministically (nil = uuidv7).
+	// Guarded by consentOwedMu.
+	consentMintIDFn func() (string, error)
+
+	// consentSlowHalfGate, when non-nil, is invoked between a decision's
+	// FAST half (the live-state flip published under lifecycleMu) and its
+	// slow half (ticket turn, disk persistence, receipt append) — the exact
+	// window the grant handoff's fast-half check covers. Test seam so the
+	// window can be held open deterministically; nil in production, and set
+	// only before the decision under test starts (no concurrent mutation).
+	consentSlowHalfGate func()
+
 	// initialDeferUntil seeds the flush worker's retry-pacing deadline from
 	// the spool's persisted retry_after_until_ms, so server backpressure
 	// captured before a restart still holds automatic publishes for the
@@ -169,6 +260,18 @@ func NewClient(cfg Config) (*Client, error) {
 	client.consentTurnCond = sync.NewCond(&client.consentTurnMu)
 	client.consentGate.Store(newConsentGateState())
 
+	// Consent-floor init runs FIRST when the floor is opted in: it resolves
+	// the LIVE consent truth — the outbox reload, the identity contract, the
+	// receipt trail's tail overriding (and healing) a stale decision record
+	// — before ANY spool data is loaded, so initSpool below trusts the
+	// RESOLVED state. The worker re-publishes loaded chunks, so seeding
+	// resend work under a stale grant whose operative decision was a durable
+	// denial would transmit pre-denial events (see initSpool's grant-only
+	// rule under the floor).
+	if normalized.ConsentFloor != nil {
+		client.consentWake = make(chan struct{}, 1)
+		client.initConsentFloor(os.Rename, os.Chmod)
+	}
 	// Spool init runs before the worker starts: it seeds initialDeferUntil
 	// and the resend queue the worker consumes. Dead-letters it produced are
 	// emitted only after the client is fully wired.
@@ -201,6 +304,24 @@ func (c *Client) Track(ctx context.Context, event Event) error {
 		c.stats.dropped.Add(1)
 		return ErrConsentDenied
 	}
+	if c.consentFloorEnabled() && c.consentUndecided() {
+		// The consent floor's consent-first posture: an undecided actor
+		// transmits nothing (distinct refusal from a denial, so the host can
+		// tell "ask the user" from "the user said no").
+		c.lifecycleMu.Unlock()
+		c.stats.dropped.Add(1)
+		return ErrConsentUnknown
+	}
+	if c.consentFloorEnabled() && c.consentFloorActorMismatch(event) {
+		// The floor's decision covers the CONFIGURED identity only: an event
+		// overriding UserID/AnonymousID to a different effective actor would
+		// transmit an actor with no local decision and no receipt. Distinct
+		// refusal; per-actor decisions beyond the configured one use the
+		// server-side consent path.
+		c.lifecycleMu.Unlock()
+		c.stats.dropped.Add(1)
+		return ErrConsentActorMismatch
+	}
 	event, err := c.prepareEvent(event)
 	if err != nil {
 		c.stats.recordFailure(err)
@@ -210,6 +331,20 @@ func (c *Client) Track(ctx context.Context, event Event) error {
 	c.trackWG.Add(1)
 	c.lifecycleMu.Unlock()
 	defer c.trackWG.Done()
+
+	if c.consentFloorEnabled() {
+		// Track is a consent dispatch point: retained receipts go to the
+		// transport BEFORE the event leg — and while an analytics-grant
+		// receipt remains undispatched (parked in a backoff/Retry-After
+		// window, or claimed by a concurrent pass), the event leg refuses
+		// rather than overtake the grant on the wire. Transient: the
+		// receipt dispatches on the worker cadence and the pipeline
+		// reopens.
+		handed, _ := c.dispatchConsentReceipts(ctx, false)
+		if c.grantReceiptGateArmed(handed) {
+			return ErrConsentReceiptPending
+		}
+	}
 
 	err = c.publish(ctx, []Event{event})
 	if errors.Is(err, ErrConsentDenied) {
@@ -231,6 +366,20 @@ func (c *Client) Enqueue(event Event) error {
 	if c.consentDenied() {
 		c.stats.dropped.Add(1)
 		return ErrConsentDenied
+	}
+	if c.consentFloorEnabled() && c.consentUndecided() {
+		// Consent-first floor: nothing is even queued for an undecided
+		// actor. The dispatch gate, by contrast, never blocks intake — a
+		// parked grant receipt holds the worker's BATCH leg, not Enqueue.
+		c.stats.dropped.Add(1)
+		return ErrConsentUnknown
+	}
+	if c.consentFloorEnabled() && c.consentFloorActorMismatch(event) {
+		// Same actor contract as Track: the floor's decision covers the
+		// configured identity only, so an override to a different effective
+		// actor is refused at intake rather than queued for transmission.
+		c.stats.dropped.Add(1)
+		return ErrConsentActorMismatch
 	}
 	event, err := c.prepareEvent(event)
 	if err != nil {
@@ -320,11 +469,6 @@ func (c *Client) waitForConsentDecisions(ctx context.Context) error {
 
 func (c *Client) finishClose(ctx context.Context) error {
 	c.closeMu.Lock()
-	if c.closeComplete {
-		err := c.closeErr
-		c.closeMu.Unlock()
-		return err
-	}
 	if c.closeInFlight {
 		done := c.closeDone
 		c.closeMu.Unlock()
@@ -333,10 +477,58 @@ func (c *Client) finishClose(ctx context.Context) error {
 			c.closeMu.Lock()
 			err := c.closeErr
 			c.closeMu.Unlock()
-			return err
+			// Re-fold LATE discards (idempotent): the close that cached this
+			// verdict may have abandoned the worker on its own context
+			// expiry, and the stop path can count discarded remnant events
+			// AFTER the verdict was cached.
+			return c.closeDiscardVerdict(err)
 		case <-contextDone(ctx):
 			return contextCause(ctx)
 		}
+	}
+	if c.closeComplete {
+		if !errors.Is(c.closeErr, ErrConsentPending) {
+			err := c.closeErr
+			c.closeMu.Unlock()
+			// Same late-discard re-fold as the waiter path above: a cached
+			// verdict must never hide a loss counted after it was stored.
+			return c.closeDiscardVerdict(err)
+		}
+		// The previous Close left consent receipts pending (undeliverable
+		// AND not durably on disk): completion was declined so the process
+		// would not silently lose them, and Close stays RETRYABLE — this
+		// call re-runs the consent drain (dispatching directly on this
+		// goroutine) and the verdict replaces the stored one. A discarded
+		// gated-flush remnant stays folded into the fresh verdict too: a
+		// successful receipt drain must not retroactively report a clean
+		// teardown over events that were already lost.
+		c.closeInFlight = true
+		done := make(chan struct{})
+		c.closeDone = done
+		c.closeMu.Unlock()
+		err := c.finalizeConsentOutbox(ctx)
+		// The WORKER may still be running: the earlier Close can have timed
+		// out before workerDone, with the stop path — the one that spools
+		// and counts the close remnant — not yet finished (or not even
+		// started, the worker stuck mid-operation). A nil from this retry
+		// without waiting would let the caller exit over a remnant that is
+		// neither delivered nor durable, uncounted. Wait it out bounded by
+		// THIS caller's context, folding the bound in when it cuts the wait;
+		// the discard verdict below then sees everything the finished stop
+		// path counted (and the idempotent re-fold on cached returns catches
+		// any straggler, the round-established posture).
+		select {
+		case <-c.workerDone:
+		case <-contextDone(ctx):
+			err = errors.Join(err, contextCause(ctx))
+		}
+		err = c.closeDiscardVerdict(err)
+		c.closeMu.Lock()
+		c.closeErr = err
+		c.closeInFlight = false
+		close(done)
+		c.closeMu.Unlock()
+		return err
 	}
 	c.closeInFlight = true
 	done := make(chan struct{})
@@ -367,6 +559,35 @@ func (c *Client) finishClose(ctx context.Context) error {
 			err = contextCause(ctx)
 		}
 	}
+	// Consent-floor drain (no-op with the floor off): ALWAYS runs, whatever
+	// the event-plane outcome — deliver retained receipts, retry an owed
+	// outbox write, and decline completion with ErrConsentPending when
+	// undelivered receipts could not be made durable. Teardown must not
+	// silently lose a consent decision's receipt, and an event-plane
+	// failure (a terminal batch outcome, a context expiry, a gated flush)
+	// must never mask the RETRYABLE pending state: the event outcome is
+	// already settled — dropped, spooled as the close remnant, or reported —
+	// while pending receipts still have a path to safety through repeated
+	// Close, so the drain's verdict must stay observable. The verdicts are
+	// FOLDED with errors.Join: callers see both, and errors.Is(err,
+	// ErrConsentPending) keeps driving the retry branch above. The one
+	// substitution: a GATED final flush's ErrConsentReceiptPending is
+	// dropped in favor of the drain's verdict alone — the gate error is
+	// transient bookkeeping about the same receipts the drain just settled,
+	// not an event-plane outcome worth freezing.
+	consentErr := c.finalizeConsentOutbox(ctx)
+	if errors.Is(err, ErrConsentReceiptPending) {
+		err = consentErr
+	} else {
+		err = errors.Join(err, consentErr)
+	}
+	// A floor client whose close remnant was neither delivered nor made
+	// durable — discarded outright (memory-only), refused by the spool's
+	// write gate, or left in a mirror whose persist still failed — reports
+	// the loss on every Close: see closeDiscardVerdict. In particular a
+	// successful consent drain above must not turn a lost gated remnant
+	// into a nil verdict.
+	err = c.closeDiscardVerdict(err)
 
 	c.closeMu.Lock()
 	c.closeErr = err
@@ -496,6 +717,10 @@ func (c *Client) run() {
 			// work, not endpoint traffic.
 			c.spoolMaintain()
 			if c.publishDeferred(deferUntil) {
+				// The CONSENT plane is independent of the events plane's
+				// pacing: retained receipts still dispatch while event
+				// publishes wait out their deferral.
+				c.dispatchConsentReceipts(context.Background(), false)
 				continue
 			}
 			batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
@@ -511,6 +736,17 @@ func (c *Client) run() {
 			// while the worker was parked: loop back so the pacing check at
 			// the top clears any stale deferral and retries the held batch.
 			continue
+		case <-c.consentWake:
+			// A consent decision was recorded under the floor: dispatch its
+			// receipt promptly — and, with the gate possibly released, give
+			// the batch leg its chance — instead of waiting for the flush
+			// tick. An armed events-plane deferral is respected: only the
+			// consent plane dispatches then.
+			if c.publishDeferred(deferUntil) {
+				c.dispatchConsentReceipts(context.Background(), false)
+				continue
+			}
+			batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
 		case request := <-c.flushRequests:
 			var err error
 			batch, err = c.flushAvailable(request.ctx, batch, &seenConsentEpoch, &backoffAttempt)
@@ -537,15 +773,27 @@ func (c *Client) run() {
 			// Close already flushed; whatever is still undelivered — the
 			// retained batch and any queue remainder a failing endpoint left
 			// behind — is the spool's remnant (grant-gated; no-op without a
-			// spool).
-			c.spoolCloseRemnant(batch)
+			// spool). A memory-only FLOOR client instead accounts the
+			// discarded remnant so Close can report the loss.
+			remnantRefused, remnantMirrored, remnantCapacityDropped, remnantExpired, remnantPoisoned := c.spoolCloseRemnant(batch)
+			c.recordDiscardedCloseRemnant(batch)
 			// Final settle: a record write that failed earlier (dirty mirror)
 			// gets one last retry before the worker exits, whatever shape the
 			// remnant took — empty, refused, or unserializable, the remnant
 			// append alone cannot be relied on to reach the disk retry, and
 			// exiting with a recovered-but-unwritten spool would lose events
 			// that a flush-cadence tick tomorrow would have saved.
-			c.spoolMaintain()
+			closeCapacityDropped := remnantCapacityDropped + c.spoolMaintain()
+			// AFTER the final settle (a recovered write reads as safe): a
+			// FLOOR client's remnant that is still neither delivered nor
+			// durable is a reportable discard, exactly like the memory-only
+			// case above — Close must not read as clean over it. Capacity
+			// evictions the CLOSE phase settled count in too (an eviction
+			// landing at exit is a permanent loss with no later resend;
+			// still-deferred evictions stayed on disk and reload), as do the
+			// remnant's retry-age expiries and its poisoned (unserializable)
+			// members — every one an event the teardown lost.
+			c.recordUnspooledCloseRemnant(remnantRefused, remnantMirrored, closeCapacityDropped, remnantExpired, remnantPoisoned)
 			return
 		}
 	}
@@ -607,6 +855,15 @@ func (c *Client) applyRetryPacing(err error, deferUntil *time.Time, backoffAttem
 	if err == nil {
 		*deferUntil = time.Time{}
 		*backoffAttempt = 0
+		return
+	}
+	if errors.Is(err, ErrConsentReceiptPending) {
+		// Consent gating is not an event-publish outcome: the batch leg was
+		// HELD, never attempted, so nothing was learned about the ingest
+		// endpoint. Event pacing stays untouched — the consent plane has
+		// its own deferral, and feeding the gate into the event backoff
+		// would keep queued events waiting behind an unrelated deferral
+		// after the receipt delivers.
 		return
 	}
 	var statusErr *HTTPStatusError
@@ -745,6 +1002,24 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 	var firstErr error
 	for {
 		batch = c.dropBatchOnConsentEpoch(batch, seenConsentEpoch, backoffAttempt)
+		// Consent-floor receipts dispatch first (a dispatch point of the
+		// flush) — BEFORE the denied early-return below, because receipt
+		// delivery is permitted (required) while consent is denied: a
+		// parked grant-then-deny trail must still drain through an explicit
+		// Flush in a denied session, even though the EVENT legs refuse. The
+		// drain JOINS behind a concurrent pass (Track's synchronous
+		// dispatch, Close's drain) instead of skipping: Flush promised its
+		// caller the receipt work ran.
+		handedReceipts, receiptsDrained := c.dispatchConsentReceipts(ctx, true)
+		if !receiptsDrained && c.consentOutbox.pending() {
+			// The caller's context ended before the drain could run (or
+			// finish): receipts remain that this flush never drained, and a
+			// nil return — the denied path below returns success — would
+			// silently misreport them as handled. The caller's own bound is
+			// the honest verdict; the retained trail re-dispatches at every
+			// later dispatch point and Close's backstop still applies.
+			return batch, contextCause(ctx)
+		}
 		if c.consentDenied() {
 			dropped := len(batch) + c.queue.drainAll()
 			if dropped > 0 {
@@ -758,6 +1033,13 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 			*backoffAttempt = 0
 			c.retainedRequest = batchRequest{}
 			return batch[:0], firstErr
+		}
+		// A still-undispatched analytics-grant receipt holds the event
+		// legs: the flush reports ErrConsentReceiptPending instead of
+		// letting queued events overtake the grant on the wire. An empty
+		// pipeline is never gated.
+		if c.grantReceiptGateArmed(handedReceipts) && (len(batch) > 0 || c.spoolHasResendWork() || len(c.queue.ch) > 0) {
+			return batch, ErrConsentReceiptPending
 		}
 		// Spooled chunks flush before the fresh batch (they are the oldest
 		// undelivered work), through the same error semantics: a denial or a
@@ -872,6 +1154,20 @@ func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, def
 	// re-firing immediately off the stale, already-elapsed deadline.
 	*deferUntil = time.Time{}
 	batch = c.dropBatchOnConsentEpoch(batch, seenConsentEpoch, backoffAttempt)
+	// Consent-floor receipts dispatch FIRST — before every event leg, spool
+	// resends included: receipts deliver under denied/unknown too, and the
+	// pass's handoffs are what release the dispatch gate for this cycle
+	// (no-op with the floor off).
+	handedReceipts, _ := c.dispatchConsentReceipts(context.Background(), false)
+	if c.grantReceiptGateArmed(handedReceipts) && (len(batch) > 0 || c.spoolHasResendWork() || len(c.queue.ch) > 0) {
+		// An analytics-grant receipt is retained undispatched (parked in a
+		// backoff/Retry-After window, or queued behind another receipt):
+		// events sent now would overtake it on the wire and be terminally
+		// suppressed on a strict-consent workspace. Hold the event legs;
+		// an empty pipeline is never gated, so a retained receipt alone can
+		// never wedge teardown.
+		return batch
+	}
 	// Spooled chunks (a previous process's undelivered events) resend before
 	// the fresh batch; a retriable chunk failure arms the pacing deadline
 	// and the fresh batch waits behind the same gate.

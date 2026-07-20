@@ -236,6 +236,7 @@ func spoolFileExists(dir string) bool {
 func spoolTestActorDigest() string {
 	return consentActorDigest(Config{
 		WorkspaceID:   "workspace-test",
+		AppID:         "app-test",
 		EnvironmentID: "develop",
 		AnonymousID:   "anon-spool-1",
 	})
@@ -246,7 +247,10 @@ func writeConsentRecordFile(t *testing.T, dir, decision string) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	payload := []byte(fmt.Sprintf(`{"consent_analytics":%q,"actor_digest":%q}`, decision, spoolTestActorDigest()))
+	// Floor-marked, with a stamp OLDER than testConsentReceipt's
+	// (2026-07-19T00:00:00Z): floor tests seeding a stale record plus a
+	// newer receipt exercise the strictly-newer override rule.
+	payload := []byte(fmt.Sprintf(`{"consent_analytics":%q,"actor_digest":%q,"decided_at":"2026-07-18T00:00:00Z","floor":true}`, decision, spoolTestActorDigest()))
 	if err := os.WriteFile(consentRecordPath(dir), payload, 0o600); err != nil {
 		t.Fatalf("write consent record: %v", err)
 	}
@@ -1953,13 +1957,11 @@ func TestSpoolRecoveryWakeResendsSpoolOnlyWork(t *testing.T) {
 	if err := client.Track(context.Background(), Event{ID: "evt-wake-live-1", Name: "live"}); err != nil {
 		t.Fatalf("Track: %v", err)
 	}
-	waitFor(t, 5*time.Second, "the spooled chunk resent on the recovery wake", func() bool {
-		return client.Snapshot().SpoolResent == 1
+	// Poll the durable artifact alongside the counter: the resent count is
+	// delivery truth and can precede the ack's record rewrite by a moment.
+	waitFor(t, 5*time.Second, "the spooled chunk resent and acked out of the record", func() bool {
+		return client.Snapshot().SpoolResent == 1 && len(readSpoolRecordFile(t, dir).Events) == 0
 	})
-	record := readSpoolRecordFile(t, dir)
-	if len(record.Events) != 0 {
-		t.Fatalf("expected the resent chunk acked out of the record, got %s", mustJSON(t, record.Events))
-	}
 	// The chunk arrived exactly twice: the failed startup attempt and the one
 	// recovery-wake resend — no extra retries.
 	chunkArrivals := 0
@@ -3040,6 +3042,7 @@ func TestSpoolLoadRefusedWhenDirCannotBePrivate(t *testing.T) {
 
 	cfg := Config{
 		WorkspaceID:    "workspace-test",
+		AppID:          "app-test",
 		EnvironmentID:  "develop",
 		AnonymousID:    "anon-spool-1",
 		SpoolDir:       dir,

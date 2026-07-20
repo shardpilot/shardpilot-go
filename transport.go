@@ -217,13 +217,18 @@ func (t *httpTransport) Publish(ctx context.Context, request batchRequest) (batc
 }
 
 func (t *httpTransport) PublishConsent(ctx context.Context, request consentRequest) (consentResult, error) {
-	var result consentResult
 	// The schema-revision header is a batch-endpoint contract; the consent
-	// route must never carry it.
-	if err := t.postJSON(ctx, t.consentEndpoint, request, &result, ""); err != nil {
+	// route must never carry it. The RESPONSE body is not decoded at all:
+	// the consent contract is that ANY 2xx acknowledges the write — the
+	// status is the acknowledgement, the body (empty 200, 204, or even a
+	// non-JSON payload from an intermediary) is irrelevant, and requiring a
+	// decode here would turn an already-accepted receipt into retained
+	// retry work forever. Send-path and no-status errors still surface as
+	// errors — nothing without an observed success status is acknowledged.
+	if err := t.postJSON(ctx, t.consentEndpoint, request, nil, ""); err != nil {
 		return consentResult{}, err
 	}
-	return result, nil
+	return consentResult{}, nil
 }
 
 // FetchRemoteConfig GETs the remote-config resource. It reports transport-
@@ -337,6 +342,13 @@ func (t *httpTransport) postJSON(ctx context.Context, endpoint string, request a
 		return newHTTPStatusError(response)
 	}
 
+	if result == nil {
+		// The caller ignores the response body entirely (the consent route:
+		// any 2xx IS the acknowledgement): nothing to decode, and a body of
+		// any shape — empty, non-JSON, truncated — must not turn a received
+		// success status into an error.
+		return nil
+	}
 	if err := json.NewDecoder(response.Body).Decode(result); err != nil {
 		return fmt.Errorf("decode shardpilot ingest response: %w", err)
 	}

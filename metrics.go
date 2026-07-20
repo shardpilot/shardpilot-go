@@ -48,6 +48,22 @@ type Stats struct {
 	SpoolExpired       uint64
 	SpoolPersistFailed uint64
 	SpoolForeignMerged uint64
+
+	// Consent-floor counters (always zero when Config.ConsentFloor is
+	// unset). ConsentRecorded counts receipts the ingest service
+	// acknowledged; ConsentFailed counts delivery failures (retryable AND
+	// terminal — a terminal one also drops the receipt);
+	// ConsentOutboxEvicted counts oldest-first cap evictions from the
+	// 32-receipt outbox; ConsentOutboxPersistFailed counts failed outbox
+	// writes (the in-memory receipts stay authoritative and the write is
+	// retried at every dispatch point); LastConsentError is the most recent
+	// consent-plane error, machine-readable where the failure had a
+	// taxonomy code.
+	ConsentRecorded            uint64
+	ConsentFailed              uint64
+	ConsentOutboxEvicted       uint64
+	ConsentOutboxPersistFailed uint64
+	LastConsentError           string
 }
 
 type statsCollector struct {
@@ -66,14 +82,21 @@ type statsCollector struct {
 	spoolPersistFailed atomic.Uint64
 	spoolForeignMerged atomic.Uint64
 
-	mu        sync.Mutex
-	lastError string
-	byStatus  map[EventStatus]uint64
+	consentRecorded            atomic.Uint64
+	consentFailed              atomic.Uint64
+	consentOutboxEvicted       atomic.Uint64
+	consentOutboxPersistFailed atomic.Uint64
+
+	mu               sync.Mutex
+	lastError        string
+	lastConsentError string
+	byStatus         map[EventStatus]uint64
 }
 
 func (s *statsCollector) snapshot() Stats {
 	s.mu.Lock()
 	lastError := s.lastError
+	lastConsentError := s.lastConsentError
 	var byStatus map[EventStatus]uint64
 	if len(s.byStatus) > 0 {
 		byStatus = make(map[EventStatus]uint64, len(s.byStatus))
@@ -84,21 +107,26 @@ func (s *statsCollector) snapshot() Stats {
 	s.mu.Unlock()
 
 	return Stats{
-		Enqueued:           s.enqueued.Load(),
-		Dropped:            s.dropped.Load(),
-		Published:          s.published.Load(),
-		FailedBatches:      s.failedBatches.Load(),
-		Accepted:           s.accepted.Load(),
-		Rejected:           s.rejected.Load(),
-		Duplicates:         s.duplicates.Load(),
-		ByStatus:           byStatus,
-		LastError:          lastError,
-		Spooled:            s.spooled.Load(),
-		SpoolResent:        s.spoolResent.Load(),
-		SpoolEvicted:       s.spoolEvicted.Load(),
-		SpoolExpired:       s.spoolExpired.Load(),
-		SpoolPersistFailed: s.spoolPersistFailed.Load(),
-		SpoolForeignMerged: s.spoolForeignMerged.Load(),
+		Enqueued:                   s.enqueued.Load(),
+		Dropped:                    s.dropped.Load(),
+		Published:                  s.published.Load(),
+		FailedBatches:              s.failedBatches.Load(),
+		Accepted:                   s.accepted.Load(),
+		Rejected:                   s.rejected.Load(),
+		Duplicates:                 s.duplicates.Load(),
+		ByStatus:                   byStatus,
+		LastError:                  lastError,
+		Spooled:                    s.spooled.Load(),
+		SpoolResent:                s.spoolResent.Load(),
+		SpoolEvicted:               s.spoolEvicted.Load(),
+		SpoolExpired:               s.spoolExpired.Load(),
+		SpoolPersistFailed:         s.spoolPersistFailed.Load(),
+		SpoolForeignMerged:         s.spoolForeignMerged.Load(),
+		ConsentRecorded:            s.consentRecorded.Load(),
+		ConsentFailed:              s.consentFailed.Load(),
+		ConsentOutboxEvicted:       s.consentOutboxEvicted.Load(),
+		ConsentOutboxPersistFailed: s.consentOutboxPersistFailed.Load(),
+		LastConsentError:           lastConsentError,
 	}
 }
 
@@ -134,5 +162,13 @@ func (s *statsCollector) recordFailure(err error) {
 func (s *statsCollector) setLastError(message string) {
 	s.mu.Lock()
 	s.lastError = message
+	s.mu.Unlock()
+}
+
+// setLastConsentError surfaces the most recent consent-plane failure
+// (receipt delivery or outbox persistence) in Stats.LastConsentError.
+func (s *statsCollector) setLastConsentError(message string) {
+	s.mu.Lock()
+	s.lastConsentError = message
 	s.mu.Unlock()
 }
