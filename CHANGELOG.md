@@ -93,7 +93,17 @@
     of the denial yet, and a relaunch would promote the stale granted record
     over a destroyed spool; a failed denied-record write DEFERS the purge with
     it (the write gate is already closed and the live denial refuses intake),
-    completing both in the owed-record retry pass the record lands. A decision-record
+    completing both in the owed-record retry pass the record lands. The
+    deferred purge is a DEBT carried independently of the single owed-record
+    slot: the MEMORY half runs immediately regardless (the condemned entries
+    dead-letter at denial time, cleared from the mirror and resend queue and
+    tombstoned against merging saves — condemnation is never disk-dependent),
+    and the deferred record-FILE removal rides the durable wipe-owed marker,
+    which a SUPERSEDING grant settles BEFORE its own record can reopen the
+    spool and which a crash re-derives at the next start — a later grant whose
+    successful record write clears the owed slot can no longer silently forget
+    that a denial condemned the spooled events, and events a denial condemned
+    never resend, whatever decision follows. A decision-record
     write that fails (or is withheld) is OWED and retried at every dispatch point: the
     withheld grant record completes its receipt-first PAIR in the same pass the outbox
     write recovers — before the receipt can deliver and prune away the trail's only
@@ -129,14 +139,29 @@
     try means a decision is mid-flight (possibly appending that held denial)
     and the grant parks for the next pass, while a successful try re-runs the
     held-denial predicates against the settled trail, closing the window
-    between the pass's hold checks and the post. A failed
+    between the pass's hold checks and the post. A successful try ALSO
+    consults the LIVE consent state: a denial's fast half flips the live
+    state before any disk work, so in the window before its slow half
+    appends the receipt the apply lock is free and no hold is visible in the
+    trail — a grant with no newer in-scope denial behind it in the trail
+    parks while the live state says denied, until the denial's evidence
+    exists. An appended unheld denial then delivers in order BEHIND the
+    grant (the normal grant-then-deny trail), while a stale grant receipt
+    reloaded under a durably DENIED state simply stays retained — durable,
+    never the server's last word past the denial, and a key-de-duplicated
+    replay if it ever posts. A failed
     idempotency-key MINT for a CONFIGURED actor is never the local-only path:
     the receipt is OWED — re-minted at every dispatch point with the original
     decision's stamp — a mint-failed GRANT withholds its record and holds the
     batch legs exactly like a failed append, earlier in-scope grants park
     behind a mint-owed denial, and `Close` pends (`ErrConsentPending`) until
     the owed receipt exists; only a client with NO configured identifiers
-    persists a decision receipt-less. Decision stamps are MONOTONIC per
+    persists a decision receipt-less. The owed-record retry WAITS on the owed
+    mint too: a mint-owed grant has no receipt anywhere, so the outbox owing
+    no write proves nothing — writing the granted record at a dispatch point
+    would make "granted record, no receipt ever minted" durable and a crash
+    would promote the grant receipt-less — the record lands only after the
+    retried mint appends the receipt, completing the pair receipt-first. Decision stamps are MONOTONIC per
     client AND seeded at reload from the maximum persisted stamp (record and
     retained receipts), so same-tick decisions, backward-stepping clocks, and
     behind-clock restarts all mint strictly increasing `decided_at` values — the

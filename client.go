@@ -207,6 +207,14 @@ type Client struct {
 	// Guarded by consentOwedMu.
 	consentMintIDFn func() (string, error)
 
+	// consentSlowHalfGate, when non-nil, is invoked between a decision's
+	// FAST half (the live-state flip published under lifecycleMu) and its
+	// slow half (ticket turn, disk persistence, receipt append) — the exact
+	// window the grant handoff's fast-half check covers. Test seam so the
+	// window can be held open deterministically; nil in production, and set
+	// only before the decision under test starts (no concurrent mutation).
+	consentSlowHalfGate func()
+
 	// initialDeferUntil seeds the flush worker's retry-pacing deadline from
 	// the spool's persisted retry_after_until_ms, so server backpressure
 	// captured before a restart still holds automatic publishes for the

@@ -539,18 +539,15 @@ func (s *diskSpool) removeMarkerFile() error {
 	return nil
 }
 
-// purge condemns the whole spool: the mirror and resend queue are cleared
-// unconditionally (the entries are returned for dead-lettering — they are
-// dropped from delivery either way), and the record file is removed. A
-// failed file removal owes a wipe: the durable marker is created
-// (best-effort; an in-memory owed flag fails closed regardless) and the
-// spool refuses all disk work until a later wipe succeeds.
-func (s *diskSpool) purge() (dropped []spoolEntry, err error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	dropped = s.entries
+// condemnEntriesLocked clears the in-memory mirror and resend queue and
+// tombstones every held entry (condemned data must not be resurrected by a
+// later merging save), returning the entries for dead-lettering. This is
+// the MEMORY half of a purge: condemning what the spool holds is never
+// disk-dependent — only the record-file removal can fail, and only that
+// removal is ever owed.
+func (s *diskSpool) condemnEntriesLocked() []spoolEntry {
+	dropped := s.entries
 	for _, entry := range dropped {
-		// Condemned data must not be resurrected by a later merging save.
 		s.recordSettledLocked(entry.id)
 	}
 	s.entries = nil
@@ -560,6 +557,19 @@ func (s *diskSpool) purge() (dropped []spoolEntry, err error) {
 	s.resend = nil
 	s.retryAfterUntilMS = 0
 	s.dirty = false
+	return dropped
+}
+
+// purge condemns the whole spool: the mirror and resend queue are cleared
+// unconditionally (the entries are returned for dead-lettering — they are
+// dropped from delivery either way), and the record file is removed. A
+// failed file removal owes a wipe: the durable marker is created
+// (best-effort; an in-memory owed flag fails closed regardless) and the
+// spool refuses all disk work until a later wipe succeeds.
+func (s *diskSpool) purge() (dropped []spoolEntry, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	dropped = s.condemnEntriesLocked()
 	if err = s.removeRecordFile(); err != nil {
 		s.owed = true
 		_ = createWipeOwedMarker(s.dir)
@@ -1722,8 +1732,32 @@ func (c *Client) applySpoolConsent(decision ConsentDecision, decidedAt string) (
 		if recordErr := saveConsentRecord(s.dir, decision, s.actorDigest, decidedAt, floorAuthored, s.renameFn, s.chmodFn); recordErr != nil {
 			recordPersisted = false
 			c.stats.setLastError("consent_record_persist_failed")
-			c.logf("shardpilot spool: persisting the denied consent record failed (the decision still applies in memory; the spool purge is deferred to the record retry): %v", recordErr)
-			return nil, false
+			c.logf("shardpilot spool: persisting the denied consent record failed (the decision still applies in memory; the spool purge is deferred to the record retry and owed durably): %v", recordErr)
+			// The deferred purge is a DEBT carried independently of the
+			// owed-record slot: the slot holds only the NEWEST owed decision,
+			// so a SUPERSEDING grant whose record write succeeds would clear
+			// it — and with it, silently forget that this denial condemned
+			// the spooled events, letting them resend under the new grant.
+			// The MEMORY half of the purge runs NOW regardless: condemning
+			// the held entries (mirror, resend queue, tombstones against a
+			// merging save) is not disk-dependent, so the entries
+			// dead-letter immediately and can never resend from memory.
+			// Only the record-FILE removal is deferred, and the wipe-owed
+			// marker carries that debt: the grant path settles an owed wipe
+			// BEFORE its record can reopen the spool, the retried denial's
+			// own purge clears the marker when it runs, and a crash
+			// re-derives the debt at the next start (initSpool settles the
+			// marker before anything loads). Events a denial condemned must
+			// never resend, whatever decision follows.
+			s.mu.Lock()
+			condemned := s.condemnEntriesLocked()
+			s.owed = true
+			s.mu.Unlock()
+			_ = createWipeOwedMarker(s.dir)
+			if len(condemned) == 0 {
+				return nil, false
+			}
+			return []SpoolDeadLetter{spoolDeadLetterFrom(SpoolDropConsent, condemned)}, false
 		}
 		dropped, err := s.purge()
 		if err != nil {

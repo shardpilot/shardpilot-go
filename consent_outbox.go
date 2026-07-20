@@ -1107,10 +1107,25 @@ func (c *Client) retryOwedConsentRecord() {
 		if owed == nil {
 			return
 		}
-		if owed.decision == ConsentDecisionGranted && c.consentOutbox.writeOwed() {
-			// Receipt-first: the grant's record stays withheld while the
-			// receipt trail itself is not durably down.
-			return
+		if owed.decision == ConsentDecisionGranted {
+			if c.consentOutbox.writeOwed() {
+				// Receipt-first: the grant's record stays withheld while the
+				// receipt trail itself is not durably down.
+				return
+			}
+			if mo := c.consentMintOwedSnapshot(); mo != nil && mo.decidedAt == owed.decidedAt {
+				// The grant's receipt has not even been MINTED yet: the
+				// outbox is clean only because there is nothing in it to
+				// write, so writeOwed alone cannot guard this pair. Writing
+				// the granted record now would make "granted record, no
+				// receipt anywhere" durable — a crash would promote the
+				// grant receipt-less at the next launch, exactly what
+				// receipt-first forbids. The record lands only after the
+				// mint retry appends the receipt (retryOwedConsentMint runs
+				// earlier in the same dispatch sequence), completing the
+				// pair in order.
+				return
+			}
 		}
 		var persisted bool
 		deadLetters, persisted = c.applySpoolConsent(owed.decision, owed.decidedAt)
@@ -1237,6 +1252,27 @@ func (c *Client) newerInScopeDenialHeld(grant consentReceipt) bool {
 		if c.consentOutbox.recordOwedFor(entry.IdempotencyKey) || c.consentDenyProofHeld(entry) {
 			return true
 		}
+	}
+	return false
+}
+
+// newerInScopeDenialInTrail reports whether ANY in-scope denial receipt —
+// held or freely dispatchable — sits after the grant in the trail. The
+// fast-half window check uses it: a live DENIED state with no denial
+// receipt behind the grant means the denial's slow half has not appended
+// yet (or its evidence is otherwise absent), so the grant must not post on
+// the strength of the trail alone.
+func (c *Client) newerInScopeDenialInTrail(grant consentReceipt) bool {
+	seenGrant := false
+	for _, entry := range c.consentOutbox.snapshot() {
+		if entry.IdempotencyKey == grant.IdempotencyKey {
+			seenGrant = true
+			continue
+		}
+		if !seenGrant || entry.analyticsGranted() || !c.consentReceiptInScope(entry) {
+			continue
+		}
+		return true
 	}
 	return false
 }
@@ -1447,6 +1483,21 @@ func (c *Client) dispatchConsentReceipts(ctx context.Context, join bool) (map[st
 			mo := c.consentMintOwedSnapshot()
 			heldBehindDenial := (mo != nil && mo.decision != ConsentDecisionGranted) ||
 				c.newerInScopeDenialHeld(receipt)
+			if !heldBehindDenial && c.consentDenied() && !c.newerInScopeDenialInTrail(receipt) {
+				// The FAST-HALF window: a denial has already flipped the
+				// LIVE state (stored under lifecycleMu, before any disk
+				// work) but its slow half has not appended the receipt —
+				// the apply lock was free to take and NO hold is visible in
+				// the trail, yet posting the grant now could make it the
+				// server's last word with the denial's receipt landing right
+				// behind. Park until the denial's evidence exists: an
+				// appended unheld denial then delivers in order BEHIND the
+				// grant (the normal grant-then-deny trail), while a stale
+				// grant reloaded under a durably denied state simply stays
+				// retained — durable, and a replay the server de-duplicates
+				// by key if it ever posts.
+				heldBehindDenial = true
+			}
 			c.consentRecordApplyMu.Unlock()
 			if heldBehindDenial {
 				return handed, true

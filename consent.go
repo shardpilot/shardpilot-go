@@ -261,6 +261,14 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) error {
 	}
 	c.lifecycleMu.Unlock()
 
+	if gate := c.consentSlowHalfGate; gate != nil {
+		// Test seam: the fast half is published (live state flipped, epoch
+		// bumped, gate swapped) but the slow half has not started — no
+		// receipt exists yet and the record-apply lock is free. This is the
+		// window the grant handoff's fast-half check parks against.
+		gate()
+	}
+
 	// SLOW HALF, in ticket order: disk persistence, then the sender handoff.
 	// The wait keeps overlapping decisions' disk writes and transmissions in
 	// the decision order (the LAST decision's record lands last, and the
