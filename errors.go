@@ -97,4 +97,13 @@ var (
 	// outcome value that is not a finite number or a boolean. The fact is
 	// refused whole; nothing is queued.
 	ErrInvalidExperimentFact = errors.New("invalid shardpilot experiment fact")
+
+	// ErrExperimentScopeMismatch is returned by the experiment exposure/
+	// outcome producers for an assignment whose echoed app_key/
+	// environment_key does not match THIS client's configured AppID/
+	// EnvironmentID: a verdict fetched by another client, app, or
+	// environment must never build facts under this client's envelope
+	// scope — the fact would attribute another scope's experiment keys to
+	// this app's identity. Nothing is queued.
+	ErrExperimentScopeMismatch = errors.New("shardpilot experiment assignment is for a different app/environment scope")
 )

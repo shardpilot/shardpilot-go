@@ -61,6 +61,15 @@ type eventEnvelope struct {
 	AppBuild        string         `json:"app_build,omitempty"`
 	Context         map[string]any `json:"context,omitempty"`
 	Props           map[string]any `json:"props,omitempty"`
+
+	// internalIdentityFact marks an envelope the SDK built for one of its
+	// OWN experiment facts: user_id omitted BY WIRE CONTRACT (never an
+	// actor override) with the CONFIGURED client identity as anonymous_id.
+	// Unexported and never serialized — the wire bytes and spool records
+	// are unchanged; it exists so the disk spool's actor-eligibility check
+	// reaches the same verdict intake did for these envelopes (see
+	// spoolActorEligible).
+	internalIdentityFact bool
 }
 
 func (c *Client) buildEnvelope(event Event) (eventEnvelope, error) {
@@ -120,6 +129,8 @@ func (c *Client) buildEnvelope(event Event) (eventEnvelope, error) {
 		AppBuild:        appBuild,
 		Context:         cloneMap(event.Context),
 		Props:           props,
+
+		internalIdentityFact: event.omitUserID,
 	}, nil
 }
 

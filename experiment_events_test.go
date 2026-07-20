@@ -10,7 +10,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // envelopeCapture records the full decoded wire envelopes of every batch
@@ -74,12 +76,14 @@ func clientIDAssignment() ExperimentAssignment {
 // syntheticAssignment is an assigned synthetic_subject_key-unit verdict.
 func syntheticAssignment() ExperimentAssignment {
 	return ExperimentAssignment{
-		ExperimentKey: "exp-onboarding",
-		Version:       7,
-		Assigned:      true,
-		AssignmentKey: "asgn_feedfacefeedfacefeedfacefeedface",
-		VariantKey:    "control",
-		Boundary:      ExperimentAssignmentBoundary{AssignmentUnit: "synthetic_subject_key"},
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		ExperimentKey:  "exp-onboarding",
+		Version:        7,
+		Assigned:       true,
+		AssignmentKey:  "asgn_feedfacefeedfacefeedfacefeedface",
+		VariantKey:     "control",
+		Boundary:       ExperimentAssignmentBoundary{AssignmentUnit: "synthetic_subject_key"},
 	}
 }
 
@@ -237,17 +241,224 @@ func TestExperimentExposureDedupePerAssignmentKey(t *testing.T) {
 		t.Fatalf("duplicate Track exposure must be a nil no-op, got %v", err)
 	}
 
-	// A different assignment key is a different exposure.
-	other := clientIDAssignment()
-	other.AssignmentKey = "asgn_feedfacefeedfacefeedfacefeedface"
-	if err := client.EnqueueExperimentExposure(other); err != nil {
-		t.Fatalf("other exposure: %v", err)
+	// The dedupe identity is the FULL assignment identity: a different
+	// assignment key, a different VERSION of the same experiment, or a
+	// different EXPERIMENT sharing an assignment key each get their own
+	// exposure.
+	otherKey := clientIDAssignment()
+	otherKey.AssignmentKey = "asgn_feedfacefeedfacefeedfacefeedface"
+	otherVersion := clientIDAssignment()
+	otherVersion.Version = 4
+	otherExperiment := clientIDAssignment()
+	otherExperiment.ExperimentKey = "exp-onboarding"
+	for _, variant := range []ExperimentAssignment{otherKey, otherVersion, otherExperiment} {
+		if err := client.EnqueueExperimentExposure(variant); err != nil {
+			t.Fatalf("distinct-identity exposure: %v", err)
+		}
+	}
+	// And each of those identities dedupes on its own repeat.
+	if err := client.EnqueueExperimentExposure(otherVersion); err != nil {
+		t.Fatalf("duplicate of the other version must be a nil no-op, got %v", err)
 	}
 	if err := client.Flush(context.Background()); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
-	if got := len(capture.all()); got != 2 {
-		t.Fatalf("expected exactly one exposure per assignment key, got %d envelopes", got)
+	if got := len(capture.all()); got != 4 {
+		t.Fatalf("expected exactly one exposure per assignment identity, got %d envelopes", got)
+	}
+}
+
+func TestExperimentProducersRejectCrossScopeAssignments(t *testing.T) {
+	capture, server := newIngestCaptureServer(t)
+	defer server.Close()
+	client := newExperimentsClient(t, server.URL, "", nil)
+	defer client.Close(context.Background())
+
+	// A verdict fetched for another app/environment scope must never build
+	// facts under this client's envelope scope.
+	otherApp := clientIDAssignment()
+	otherApp.AppKey = "app-other"
+	otherEnv := clientIDAssignment()
+	otherEnv.EnvironmentKey = "production"
+	unscoped := clientIDAssignment()
+	unscoped.AppKey, unscoped.EnvironmentKey = "", ""
+	for _, assignment := range []ExperimentAssignment{otherApp, otherEnv, unscoped} {
+		if err := client.TrackExperimentExposure(context.Background(), assignment); !errors.Is(err, ErrExperimentScopeMismatch) {
+			t.Fatalf("expected ErrExperimentScopeMismatch from Track exposure, got %v", err)
+		}
+		if err := client.EnqueueExperimentExposure(assignment); !errors.Is(err, ErrExperimentScopeMismatch) {
+			t.Fatalf("expected ErrExperimentScopeMismatch from Enqueue exposure, got %v", err)
+		}
+		if err := client.TrackExperimentOutcome(context.Background(), assignment, "k", 1); !errors.Is(err, ErrExperimentScopeMismatch) {
+			t.Fatalf("expected ErrExperimentScopeMismatch from Track outcome, got %v", err)
+		}
+		if err := client.EnqueueExperimentOutcome(assignment, "k", 1); !errors.Is(err, ErrExperimentScopeMismatch) {
+			t.Fatalf("expected ErrExperimentScopeMismatch from Enqueue outcome, got %v", err)
+		}
+		// Distinct from the generic fact-contract refusal.
+		if err := client.EnqueueExperimentExposure(assignment); errors.Is(err, ErrInvalidExperimentFact) {
+			t.Fatalf("scope mismatch must not read as ErrInvalidExperimentFact, got %v", err)
+		}
+	}
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if got := len(capture.all()); got != 0 {
+		t.Fatalf("cross-scope refusals must queue nothing, got %d envelopes", got)
+	}
+
+	// The refusals claimed nothing: the correctly scoped exposure for the
+	// same assignment key still emits.
+	if err := client.EnqueueExperimentExposure(clientIDAssignment()); err != nil {
+		t.Fatalf("in-scope exposure after refusals: %v", err)
+	}
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if got := len(capture.all()); got != 1 {
+		t.Fatalf("expected the in-scope exposure delivered, got %d envelopes", got)
+	}
+}
+
+func TestExperimentFactSpoolRetentionUnderFloorWithUserID(t *testing.T) {
+	// The floor's spool actor-eligibility must reach the SAME verdict
+	// intake did for the SDK's own experiment facts: their envelopes omit
+	// user_id BY WIRE CONTRACT while carrying the configured client
+	// identity as anonymous_id — under a configured UserID that is not an
+	// actor override, and a retryably failed batch must RETAIN the fact on
+	// disk, never dead-letter it as a consent drop.
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	var deadMu sync.Mutex
+	var dead []SpoolDeadLetter
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, func(cfg *Config) {
+		cfg.UserID = "user-42"
+		cfg.APIKey = "test-exp-key"
+		cfg.ExperimentsURL = server.URL + "/api/cp/v1"
+		cfg.ExperimentSubjectKey = testExperimentSubjectKey
+		cfg.OnSpoolDeadLetter = func(letter SpoolDeadLetter) {
+			deadMu.Lock()
+			dead = append(dead, letter)
+			deadMu.Unlock()
+		}
+	})
+	defer client.Close(context.Background())
+
+	client.SetConsent(true)
+	if err := client.EnqueueExperimentExposure(clientIDAssignment()); err != nil {
+		t.Fatalf("EnqueueExperimentExposure under a grant: %v", err)
+	}
+
+	// A retryable batch failure spools the fact under the persisted grant.
+	state.setBatchOutcome(http.StatusInternalServerError)
+	if err := client.Flush(context.Background()); err == nil {
+		t.Fatal("expected the failed flush to report the retryable error")
+	}
+	deadMu.Lock()
+	for _, letter := range dead {
+		if letter.Reason == SpoolDropConsent {
+			deadMu.Unlock()
+			t.Fatalf("the SDK's own experiment fact must not dead-letter as a consent drop: %+v", letter)
+		}
+	}
+	deadMu.Unlock()
+	if stats := client.Snapshot(); stats.Spooled != 1 {
+		t.Fatalf("expected the fact retained in the spool, got %+v", stats)
+	}
+	firstBatch := state.batchIDsSince(0)
+	if len(firstBatch) != 1 {
+		t.Fatalf("expected the one failed batch attempt, got %v", firstBatch)
+	}
+
+	// And the retained fact delivers on the retry, byte-identical id.
+	state.setBatchOutcome(0)
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("recovery flush: %v", err)
+	}
+	all := state.batchIDsSince(0)
+	if len(all) < 2 || all[len(all)-1] != firstBatch[0] {
+		t.Fatalf("expected the retained fact re-delivered under its original id %q, got %v", firstBatch[0], all)
+	}
+}
+
+func TestExperimentExposureConcurrentDuplicateWaitsForConversion(t *testing.T) {
+	// Two goroutines race the same assignment key: the duplicate must not
+	// report "emitted" off a pending attempt — if the first attempt fails
+	// and re-arms, the waiting duplicate takes over and performs its own
+	// emission, so exactly one exposure lands.
+	capture := &envelopeCapture{}
+	var batchCalls atomic.Int64
+	firstArrived := make(chan struct{}, 1)
+	releaseFirst := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/events:batch" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"recorded":true}`)
+			return
+		}
+		if batchCalls.Add(1) == 1 {
+			firstArrived <- struct{}{}
+			<-releaseFirst
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprint(w, `{"error":{"code":"internal_error","message":"boom"}}`)
+			return
+		}
+		var request struct {
+			Events []map[string]any `json:"events"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode batch request: %v", err)
+		}
+		capture.mu.Lock()
+		capture.envelopes = append(capture.envelopes, request.Events...)
+		count := len(request.Events)
+		capture.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		fmt.Fprintf(w, `{"accepted":%d,"rejected":0,"duplicates":0}`, count)
+	}))
+	defer server.Close()
+
+	client := newExperimentsClient(t, server.URL, "", func(cfg *Config) {
+		cfg.HTTPTimeout = 5 * time.Second
+	})
+	defer client.Close(context.Background())
+
+	first := make(chan error, 1)
+	go func() {
+		first <- client.TrackExperimentExposure(context.Background(), clientIDAssignment())
+	}()
+	<-firstArrived // the first attempt owns the reservation and is on the wire
+
+	second := make(chan error, 1)
+	go func() {
+		second <- client.TrackExperimentExposure(context.Background(), clientIDAssignment())
+	}()
+
+	// Release the first attempt into its 500: it fails and re-arms; the
+	// waiting duplicate takes over and emits for real.
+	close(releaseFirst)
+	if err := <-first; err == nil {
+		t.Fatal("expected the first attempt's retryable failure surfaced")
+	}
+	if err := <-second; err != nil {
+		t.Fatalf("expected the waiting duplicate to take over and emit, got %v", err)
+	}
+	if got := len(capture.all()); got != 1 {
+		t.Fatalf("expected exactly one exposure on the wire, got %d", got)
+	}
+	if got := batchCalls.Load(); got != 2 {
+		t.Fatalf("expected exactly two batch attempts (failed + converted), got %d", got)
+	}
+
+	// And after conversion, further duplicates are immediate no-ops.
+	if err := client.TrackExperimentExposure(context.Background(), clientIDAssignment()); err != nil {
+		t.Fatalf("post-conversion duplicate must be a nil no-op, got %v", err)
+	}
+	if got := len(capture.all()); got != 1 {
+		t.Fatalf("post-conversion duplicate must emit nothing, got %d envelopes", got)
 	}
 }
 

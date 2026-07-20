@@ -16,8 +16,14 @@
     `ExperimentAssignmentResult` (all three not-assigned shapes distinguished by the
     assignment's `reason` — absent = traffic gate, `kill_switch`,
     `targeting_unmatched` — and the client_id-unit `subject_fact_key` retained: it is
-    the only permitted analytics fact subject). The ratified remote-config failure
-    canon applies per fetch — transients serve the per-experiment last-known-good
+    the only permitted analytics fact subject). Bodies are validated per verdict
+    shape: a syntactically valid but INCOMPLETE verdict (an assigned verdict missing
+    its assignment/variant keys or a known assignment unit — or, for the client_id
+    unit, a grammar-valid subject fact key — a not-assigned verdict with an unknown
+    reason) and wrongly TYPED members (an array/string `variant_payload`, a
+    non-object `boundary`) classify as the transient `malformed_response` and keep
+    serving the last-known-good record, never install as a fresh verdict. The
+    ratified remote-config failure canon applies per fetch — transients serve the per-experiment last-known-good
     cached assignment (`FromCache=true`), `401`/`403` fail closed with NO cross-fetch
     latch, `404`/unexpected statuses are permanent — plus the two assignment-only
     extras of ADR-0259 Amendment 2: a `403` whose JSON `error` member EQUALS
@@ -47,11 +53,20 @@
     they inherit the configured consent posture exactly: with `Config.ConsentFloor`,
     unknown consent ⇒ dropped (`ErrConsentUnknown`) and denied ⇒ dropped
     (`ErrConsentDenied`); with the floor nil, the documented server-side posture is
-    unchanged. Exposures deduplicate client-side (one per assignment key per client
-    instance; refused attempts re-arm), outcomes do not; a not-assigned verdict is
-    refused (`ErrExperimentNotAssigned`). New errors:
-    `ErrExperimentsNotConfigured`, `ErrExperimentNotAssigned`,
-    `ErrInvalidExperimentFact`. NOTE: the server-side client-tier admission for
+    unchanged. The facts also stay SPOOL-eligible under the floor's persisted grant:
+    the wire-contract `user_id` omission is envelope minimization, not an actor
+    override, so a retryably failed fact is retained on disk for the configured
+    actor instead of dead-lettering as a consent drop. Exposures deduplicate
+    client-side (one per assignment IDENTITY — experiment key + version +
+    assignment key — per client instance; a concurrent duplicate waits for the
+    in-flight attempt and reports success only once an exposure actually emitted;
+    refused attempts re-arm), outcomes do not; a not-assigned
+    verdict is refused (`ErrExperimentNotAssigned`) and an assignment echoing
+    another app/environment scope is refused (`ErrExperimentScopeMismatch`) —
+    facts are built only from verdicts fetched for THIS client's configured
+    `AppID`/`EnvironmentID`. New errors: `ErrExperimentsNotConfigured`,
+    `ErrExperimentNotAssigned`, `ErrInvalidExperimentFact`,
+    `ErrExperimentScopeMismatch`. NOTE: the server-side client-tier admission for
     these two event names is decision-gated and CLOSED today (publishable keys are
     rejected for them at the ingest edge, and the analytics client_id-unit flag
     defaults off) — the producer lane is dark end to end.
@@ -61,7 +76,11 @@
   (`If-None-Match` with the cached ETag) so a running client converges on a
   server-side change — a kill switch flip included — within one interval. Each cycle
   waits max(configured interval, the server's `Cache-Control` max-age — 300s before
-  one is seen — floored at 60s); a tick inside an armed `429` `Retry-After` cooldown
+  one is seen — floored at 60s), and a fetch that observes a CHANGED cadence
+  re-arms a pending timer to pull the next tick in when the new anchor is shorter
+  (never pushing it out; a stale overlapping response cannot overwrite the cadence
+  — the max-age store sits behind the same per-scope sequence fence as installs
+  and the `429` cooldown); a tick inside an armed `429` `Retry-After` cooldown
   performs no network call and does not reschedule tighter; and after the TIMER
   receives an authoritative `401`/`403` it halts until re-initialization, while
   explicit fetches keep classifying per fetch. The schedule anchor and the

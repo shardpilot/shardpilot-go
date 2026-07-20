@@ -1197,7 +1197,20 @@ func (c *Client) partitionSpoolEligible(request batchRequest) (eligible, refused
 // dead-lettered would contradict the round-4 override semantics). Floor
 // OFF keeps the released strict rule — both envelope identifiers equal to
 // the configured tuple — unchanged.
+//
+// The SDK's OWN experiment facts are the one envelope shape whose wire
+// identifiers deliberately DIFFER from the configured tuple without an
+// actor change: user_id is omitted by the ingest contract for those event
+// names while anonymous_id carries the configured client identity, so
+// reading the envelope's identifiers as an actor decision would refuse —
+// under a configured UserID — the very facts intake admitted AS the
+// configured actor. They carry a non-serialized marker instead, and
+// eligibility for them is the same decision intake made: the configured
+// identity, matched on the anonymous_id the fact actually carries.
 func (c *Client) spoolActorEligible(envelope eventEnvelope) bool {
+	if envelope.internalIdentityFact {
+		return c.cfg.AnonymousID != "" && envelope.AnonymousID == c.cfg.AnonymousID
+	}
 	if c.consentFloorEnabled() {
 		effective := firstNonEmpty(envelope.UserID, envelope.AnonymousID)
 		return effective == firstNonEmpty(c.cfg.UserID, c.cfg.AnonymousID)

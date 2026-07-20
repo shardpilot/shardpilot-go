@@ -275,6 +275,72 @@ func TestExperimentAssignmentFreshVerdictShapes(t *testing.T) {
 	}
 }
 
+func TestExperimentAssignmentIncompleteVerdictsAreMalformed(t *testing.T) {
+	// Syntactically valid JSON that is INCOMPLETE for its verdict shape —
+	// or carries the wrong TYPE for a member the SDK relies on — must
+	// classify as the transient malformed_response and keep serving the
+	// last-known-good record, never install as a fresh verdict.
+	var script atomic.Value
+	script.Store(rcScriptStep{status: 200, body: testAssignedBody})
+	server := newRCScriptServer(t, nil, &script)
+	defer server.Close()
+
+	cachePath := filepath.Join(t.TempDir(), "exp-cache.json")
+	client := newExperimentsClient(t, server.URL, cachePath, nil)
+	defer client.Close(context.Background())
+	if _, err := client.FetchExperimentAssignment(context.Background(), "exp-checkout"); err != nil {
+		t.Fatalf("priming fetch: %v", err)
+	}
+	cacheBefore, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("read cache: %v", err)
+	}
+
+	incomplete := []struct {
+		name string
+		body string
+	}{
+		{"bare experiment_key only", `{"experiment_key":"exp-checkout"}`},
+		{"assigned without assignment_key", `{"experiment_key":"exp-checkout","assigned":true,"variant_key":"v","boundary":{"assignment_unit":"synthetic_subject_key"}}`},
+		{"assigned without variant_key", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","assigned":true,"boundary":{"assignment_unit":"synthetic_subject_key"}}`},
+		{"assigned without boundary", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","assigned":true,"variant_key":"v"}`},
+		{"assigned with unknown unit", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","assigned":true,"variant_key":"v","boundary":{"assignment_unit":"device_id"}}`},
+		{"assigned client_id without subject_fact_key", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","assigned":true,"variant_key":"v","boundary":{"assignment_unit":"client_id"}}`},
+		{"assigned client_id with a raw spcid subject", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","assigned":true,"variant_key":"v","subject_fact_key":"` + testExperimentSubjectKey + `","boundary":{"assignment_unit":"client_id"}}`},
+		{"not-assigned with unknown reason", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","assigned":false,"reason":"paused"}`},
+		{"fractional version", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","version":3.5}`},
+		{"fractional-form integer version", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","version":3.0}`},
+		{"negative version", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","version":-1}`},
+		{"overflowing version", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","version":9223372036854775808}`},
+		{"string version", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","version":"3"}`},
+		{"array variant_payload", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","assigned":true,"variant_key":"v","variant_payload":[1,2],"boundary":{"assignment_unit":"synthetic_subject_key"}}`},
+		{"string variant_payload", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","assigned":true,"variant_key":"v","variant_payload":"fast","boundary":{"assignment_unit":"synthetic_subject_key"}}`},
+		{"number variant_payload", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","assigned":true,"variant_key":"v","variant_payload":7,"boundary":{"assignment_unit":"synthetic_subject_key"}}`},
+		{"non-object boundary", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","assigned":true,"variant_key":"v","boundary":"client_id"}`},
+	}
+	for _, tc := range incomplete {
+		script.Store(rcScriptStep{status: 200, body: tc.body})
+		result, err := client.FetchExperimentAssignment(context.Background(), "exp-checkout")
+		if err != nil {
+			t.Fatalf("%s: expected the LKG cache served over the malformed body, got error %v", tc.name, err)
+		}
+		if !result.FromCache || result.Reason != "malformed_response" {
+			t.Fatalf("%s: expected cache-served malformed_response, got %+v", tc.name, result)
+		}
+		if !result.Assignment.Assigned || result.Assignment.SubjectFactKey != testSubjectFactKey {
+			t.Fatalf("%s: expected the intact LKG verdict served, got %+v", tc.name, result.Assignment)
+		}
+	}
+
+	cacheAfter, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("read cache: %v", err)
+	}
+	if string(cacheBefore) != string(cacheAfter) {
+		t.Fatalf("incomplete verdict bodies must never disturb the cache record")
+	}
+}
+
 func TestExperimentAssignmentTransientsServeCacheThenFail(t *testing.T) {
 	var script atomic.Value
 	script.Store(rcScriptStep{status: 200, body: testAssignedBody})

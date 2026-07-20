@@ -278,6 +278,127 @@ func TestRemoteConfigRevalidationLoopRunsThenHalts(t *testing.T) {
 	}
 }
 
+func TestRemoteConfigRevalidationReArmsOnShorterCadence(t *testing.T) {
+	// A pending long timer must not wait out its old schedule after a
+	// fetch observes a SHORTER server cadence: the observed change nudges
+	// the loop and the next tick is re-armed to the new, sooner deadline.
+	var requests atomic.Int64
+	var script atomic.Value
+	script.Store(rcScriptStep{status: 200, body: `{"values":{"k":"v"}}`, headers: map[string]string{"ETag": `"v1"`, "Cache-Control": "private, max-age=60"}})
+	server := newRCScriptServer(t, &requests, &script)
+	defer server.Close()
+
+	client := newRemoteConfigClient(t, server.URL, "", "anon-rc-1")
+	defer client.Close(context.Background())
+
+	// The seam models the anchor change: the initial arm reads a LONG
+	// cycle, every re-evaluation after the nudge a short one.
+	var delayCalls atomic.Int64
+	client.rc.revalidateDelayFn = func() time.Duration {
+		if delayCalls.Add(1) == 1 {
+			return time.Hour
+		}
+		return 5 * time.Millisecond
+	}
+	client.rcRevalidateDone = make(chan struct{})
+	go client.runRemoteConfigRevalidation()
+
+	// The explicit fetch observes the server cadence (a CHANGE from
+	// nothing-yet-seen) and nudges the pending hour-long timer…
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("explicit fetch: %v", err)
+	}
+	// …which must re-arm to the shorter deadline and tick well before the
+	// old schedule.
+	waitFor(t, 5*time.Second, "re-armed revalidation tick", func() bool {
+		return requests.Load() >= 2
+	})
+}
+
+func TestRemoteConfigCadenceChangeNudgesRecalc(t *testing.T) {
+	var script atomic.Value
+	script.Store(rcScriptStep{status: 200, body: `{"values":{"k":"v"}}`, headers: map[string]string{"Cache-Control": "private, max-age=120"}})
+	server := newRCScriptServer(t, nil, &script)
+	defer server.Close()
+
+	client := newRemoteConfigClient(t, server.URL, "", "anon-rc-1")
+	defer client.Close(context.Background())
+
+	// A fetch that observes a CHANGED max-age parks one recalc nudge.
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("first fetch: %v", err)
+	}
+	select {
+	case <-client.rc.revalidateRecalc:
+	default:
+		t.Fatal("expected the observed cadence change to park a recalc nudge")
+	}
+
+	// An UNCHANGED max-age nudges nothing (no recalc churn per tick).
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("second fetch: %v", err)
+	}
+	select {
+	case <-client.rc.revalidateRecalc:
+		t.Fatal("an unchanged cadence must not nudge the recalc channel")
+	default:
+	}
+}
+
+func TestRemoteConfigStaleLateResponseDoesNotOverwriteCadence(t *testing.T) {
+	// Overlapping fetches: an older response landing AFTER a newer fetch
+	// settled must not overwrite the revalidation cadence — the max-age
+	// store sits behind the same per-scope sequence fence as installs and
+	// the 429 cooldown.
+	var requests atomic.Int64
+	firstArrived := make(chan struct{}, 1)
+	releaseFirst := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) == 1 {
+			firstArrived <- struct{}{}
+			<-releaseFirst
+			// The STALE cadence: an outdated 24h max-age.
+			w.Header().Set("Cache-Control", "private, max-age=86400")
+			_, _ = w.Write([]byte(`{"values":{"k":"stale"}}`))
+			return
+		}
+		w.Header().Set("Cache-Control", "private, max-age=60")
+		_, _ = w.Write([]byte(`{"values":{"k":"fresh"}}`))
+	}))
+	defer server.Close()
+
+	client := newRemoteConfigClient(t, server.URL, "", "anon-rc-1")
+	defer client.Close(context.Background())
+
+	// Fetch 1 dispatches and stalls inside the server...
+	firstDone := make(chan error, 1)
+	go func() {
+		_, fetchErr := client.FetchRemoteConfig(context.Background())
+		firstDone <- fetchErr
+	}()
+	<-firstArrived
+	// ...fetch 2 dispatches later and settles a fresh 200 FIRST, with the
+	// server's CURRENT 60s cadence...
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("newer fetch: %v", err)
+	}
+	// ...then the stalled response lands with its outdated 24h max-age.
+	close(releaseFirst)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("stale fetch: %v", err)
+	}
+
+	client.rc.mu.Lock()
+	seconds, present := client.rc.maxAgeSeconds, client.rc.maxAgePresent
+	client.rc.mu.Unlock()
+	if !present || seconds != 60 {
+		t.Fatalf("expected the settled fetch's 60s cadence kept over the stale 24h one, got (%d, %v)", seconds, present)
+	}
+	if got := client.rc.revalidateDelay(0); got != 60*time.Second {
+		t.Fatalf("expected the revalidation schedule anchored at 60s, got %v", got)
+	}
+}
+
 func TestRemoteConfigRevalidationDefaultOffAndCloseStops(t *testing.T) {
 	var requests atomic.Int64
 	var script atomic.Value

@@ -176,15 +176,25 @@ type remoteConfigState struct {
 	// test seam (like Client.jitter), nil in production. Set only before
 	// the timer goroutine starts.
 	revalidateDelayFn func() time.Duration
+
+	// revalidateRecalc nudges the periodic revalidation timer to
+	// re-evaluate its PENDING deadline after a fetch observed a changed
+	// server cadence: a shorter max-age must pull the next tick in instead
+	// of waiting out the old longer schedule (the timer only ever pulls
+	// in, never pushes out — a lengthened cadence takes effect from the
+	// next cycle). Capacity 1 with non-blocking sends; consumed only by
+	// the timer loop, and a parked nudge with no loop running is inert.
+	revalidateRecalc chan struct{}
 }
 
 func newRemoteConfigState(cfg Config) *remoteConfigState {
 	rc := &remoteConfigState{
-		fetchURL:  buildRemoteConfigURL(cfg.RemoteConfigURL, cfg.WorkspaceID, cfg.EnvironmentID, cfg.AnonymousID),
-		apiKey:    cfg.APIKey,
-		cachePath: cfg.RemoteConfigCachePath,
-		clientID:  cfg.AnonymousID,
-		settled:   make(map[string]uint64),
+		fetchURL:         buildRemoteConfigURL(cfg.RemoteConfigURL, cfg.WorkspaceID, cfg.EnvironmentID, cfg.AnonymousID),
+		apiKey:           cfg.APIKey,
+		cachePath:        cfg.RemoteConfigCachePath,
+		clientID:         cfg.AnonymousID,
+		settled:          make(map[string]uint64),
+		revalidateRecalc: make(chan struct{}, 1),
 	}
 	if rc.clientID != "" {
 		rc.scope = buildRemoteConfigScope(cfg.WorkspaceID, cfg.EnvironmentID, rc.clientID, cfg.RemoteConfigURL)
@@ -882,12 +892,25 @@ func (c *Client) fetchRemoteConfigOutcome(ctx context.Context) (RemoteConfigResu
 	result, newCache, authoritative, revalidated, failure := applyRemoteConfig(cache, resp, now.UnixMilli())
 
 	rc.mu.Lock()
-	if resp.maxAgePresent {
+	if resp.maxAgePresent && seq > rc.settled[rc.scope] {
 		// The server's advertised revalidation cadence, remembered for the
-		// opt-in periodic revalidation timer's schedule anchor. Last write
-		// wins — a cadence hint, never a classification input.
+		// opt-in periodic revalidation timer's schedule anchor. Fenced by
+		// the same per-scope sequence as installs and the 429 cooldown: an
+		// older response landing AFTER a newer fetch settled an
+		// authoritative outcome is outdated cadence too — letting it win
+		// would park (or hurry) the timer on a max-age the server has
+		// already moved past. Never a classification input.
+		changed := !rc.maxAgePresent || rc.maxAgeSeconds != resp.maxAgeSeconds
 		rc.maxAgeSeconds = resp.maxAgeSeconds
 		rc.maxAgePresent = true
+		if changed {
+			// Nudge a pending revalidation timer to re-evaluate its
+			// deadline: a SHORTER cadence pulls the next tick in.
+			select {
+			case rc.revalidateRecalc <- struct{}{}:
+			default:
+			}
+		}
 	}
 	if resp.status == 429 && seq > rc.settled[rc.scope] {
 		// The cooldown is fenced by the same per-scope sequence as installs:
@@ -975,12 +998,32 @@ func (rc *remoteConfigState) autoLaneHalted() bool {
 func (c *Client) runRemoteConfigRevalidation() {
 	defer close(c.rcRevalidateDone)
 	for {
-		timer := time.NewTimer(c.rc.revalidateDelay(c.cfg.RemoteConfigRevalidateInterval))
-		select {
-		case <-c.stop:
-			timer.Stop()
-			return
-		case <-timer.C:
+		delay := c.rc.revalidateDelay(c.cfg.RemoteConfigRevalidateInterval)
+		deadline := time.Now().Add(delay)
+		timer := time.NewTimer(delay)
+		for waiting := true; waiting; {
+			select {
+			case <-c.stop:
+				timer.Stop()
+				return
+			case <-timer.C:
+				waiting = false
+			case <-c.rc.revalidateRecalc:
+				// A fetch observed a CHANGED server cadence while this
+				// timer was pending: re-arm only to PULL THE NEXT TICK IN
+				// — a shorter max-age must not wait out the old longer
+				// schedule — and never to push it out (a lengthened
+				// cadence takes effect from the next cycle; the sooner
+				// pending tick stays honest). A pulled-in tick landing
+				// inside an armed 429 cooldown still performs no network
+				// call, by the cooldown's own guarantee.
+				newDelay := c.rc.revalidateDelay(c.cfg.RemoteConfigRevalidateInterval)
+				if newDeadline := time.Now().Add(newDelay); newDeadline.Before(deadline) {
+					stopAndDrainTimer(timer)
+					timer.Reset(newDelay)
+					deadline = newDeadline
+				}
+			}
 		}
 		if c.revalidateRemoteConfigOnce() {
 			return

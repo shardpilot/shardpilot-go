@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -61,6 +62,14 @@ func (c *Client) buildExperimentFactEvent(name string, assignment ExperimentAssi
 		// verdict (traffic gate, kill switch, targeting miss) must never
 		// produce one.
 		return Event{}, ErrExperimentNotAssigned
+	}
+	if assignment.AppKey != c.cfg.AppID || assignment.EnvironmentKey != c.cfg.EnvironmentID {
+		// The assignment response echoes the app/environment keys it was
+		// computed for; a verdict from ANOTHER scope (another client, app,
+		// or environment — or a hand-built value that names none) must not
+		// build facts under this client's envelope scope.
+		return Event{}, fmt.Errorf("%w: assignment is for app_key %q / environment_key %q, this client is configured for %q / %q",
+			ErrExperimentScopeMismatch, assignment.AppKey, assignment.EnvironmentKey, c.cfg.AppID, c.cfg.EnvironmentID)
 	}
 	experimentKey := strings.TrimSpace(assignment.ExperimentKey)
 	assignmentKey := strings.TrimSpace(assignment.AssignmentKey)
@@ -146,59 +155,87 @@ func normalizeExperimentOutcomeValue(value any) (any, error) {
 	}
 }
 
+// experimentExposureDedupeKey is the exposure reservation identity: the
+// FULL assignment identity — experiment key, version, and assignment key —
+// escaped and joined injectively (the scope-join discipline), so two
+// distinct assignments can never collide into one reservation. Keying on
+// the assignment key alone would rely on its (server-side) derivation
+// covering experiment and version; the SDK also accepts caller-held
+// ExperimentAssignment values, so the identity is made explicit here.
+func experimentExposureDedupeKey(assignment ExperimentAssignment) string {
+	return escapeRemoteConfigSegment(strings.TrimSpace(assignment.ExperimentKey)) + rcScopeSeparator +
+		strconv.FormatInt(assignment.Version, 10) + rcScopeSeparator +
+		escapeRemoteConfigSegment(strings.TrimSpace(assignment.AssignmentKey))
+}
+
+// emitExperimentExposure is the shared exposure path: build the fact, then
+// run the one-per-launch reservation protocol for its assignment identity
+// (experiment key + version + assignment key). The FIRST caller for an
+// identity owns the emitting attempt; a concurrent duplicate WAITS for that
+// attempt to settle instead of reporting success for an emission that may
+// still fail — nil is returned off another caller's work only once the
+// reservation actually CONVERTED (the fact was admitted). If the in-flight
+// attempt fails and re-arms, a waiting duplicate contends again and
+// performs its own attempt.
+func (c *Client) emitExperimentExposure(assignment ExperimentAssignment, send func(Event) error) error {
+	exp := c.exp
+	if exp == nil {
+		return ErrExperimentsNotConfigured
+	}
+	event, err := c.buildExperimentFactEvent(experimentExposureEventName, assignment, "", nil)
+	if err != nil {
+		return err
+	}
+	dedupeKey := experimentExposureDedupeKey(assignment)
+	for {
+		claim, owner := exp.beginExposureClaim(dedupeKey)
+		if !owner {
+			// A converted reservation's done is already closed: the
+			// duplicate returns nil immediately. A pending one blocks
+			// until the in-flight attempt settles (bounded by that
+			// attempt's own send semantics).
+			<-claim.done
+			if claim.converted {
+				return nil
+			}
+			continue
+		}
+		err := send(event)
+		exp.settleExposureClaim(dedupeKey, claim, err == nil)
+		return err
+	}
+}
+
 // TrackExperimentExposure publishes ONE experiment_exposure fact for an
 // assignment the app just acted on, synchronously through Track — inheriting
 // Track's full posture: lifecycle (ErrClosed), the configured consent
 // posture (with Config.ConsentFloor: ErrConsentUnknown/ErrConsentDenied
 // refusals — consent unknown transmits nothing), and delivery feedback.
 //
-// Exposures are deduplicated client-side per assignment key per client
-// instance (the server never deduplicates): the first admitted call emits,
-// and later calls for the same assignment key return nil without emitting.
-// A refused call (consent, queue, transport) releases the slot so a later
-// attempt can emit. Requires the experiment opt-in (ErrExperimentsNotConfigured
-// otherwise) and refuses not-assigned verdicts (ErrExperimentNotAssigned)
-// and out-of-contract facts (ErrInvalidExperimentFact).
+// Exposures are deduplicated client-side per assignment identity —
+// experiment key + version + assignment key — per client instance (the
+// server never deduplicates): the first admitted call emits, and later
+// calls for the same identity return nil without emitting — a concurrent
+// duplicate waits for the in-flight attempt and returns nil only if that
+// attempt actually admitted the fact. A refused call (consent, queue,
+// transport) releases the slot so a later (or waiting) attempt can emit.
+// Requires the experiment opt-in (ErrExperimentsNotConfigured
+// otherwise) and refuses not-assigned verdicts (ErrExperimentNotAssigned),
+// assignments from another app/environment scope
+// (ErrExperimentScopeMismatch), and out-of-contract facts
+// (ErrInvalidExperimentFact).
 func (c *Client) TrackExperimentExposure(ctx context.Context, assignment ExperimentAssignment) error {
-	exp := c.exp
-	if exp == nil {
-		return ErrExperimentsNotConfigured
-	}
-	event, err := c.buildExperimentFactEvent(experimentExposureEventName, assignment, "", nil)
-	if err != nil {
-		return err
-	}
-	if !exp.claimExposure(strings.TrimSpace(assignment.AssignmentKey)) {
-		return nil
-	}
-	if err := c.Track(ctx, event); err != nil {
-		exp.unclaimExposure(strings.TrimSpace(assignment.AssignmentKey))
-		return err
-	}
-	return nil
+	return c.emitExperimentExposure(assignment, func(event Event) error {
+		return c.Track(ctx, event)
+	})
 }
 
 // EnqueueExperimentExposure is TrackExperimentExposure through the
 // asynchronous queue (Enqueue): same validation, same consent inheritance,
-// same one-per-assignment-key dedupe; delivery rides the background flush
-// worker.
+// same one-per-assignment-identity reservation; delivery rides the
+// background flush worker.
 func (c *Client) EnqueueExperimentExposure(assignment ExperimentAssignment) error {
-	exp := c.exp
-	if exp == nil {
-		return ErrExperimentsNotConfigured
-	}
-	event, err := c.buildExperimentFactEvent(experimentExposureEventName, assignment, "", nil)
-	if err != nil {
-		return err
-	}
-	if !exp.claimExposure(strings.TrimSpace(assignment.AssignmentKey)) {
-		return nil
-	}
-	if err := c.Enqueue(event); err != nil {
-		exp.unclaimExposure(strings.TrimSpace(assignment.AssignmentKey))
-		return err
-	}
-	return nil
+	return c.emitExperimentExposure(assignment, c.Enqueue)
 }
 
 // TrackExperimentOutcome publishes one experiment_outcome fact — the

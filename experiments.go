@@ -201,7 +201,13 @@ type experimentsState struct {
 	// scopePrefix stamps every record with the (app, environment, subject,
 	// url) tuple it was fetched for; the full scope appends the escaped
 	// experiment key. Same escaped-join construction as the remote-config
-	// scope, so two distinct tuples can never collide.
+	// scope, so two distinct tuples can never collide. INVARIANT: the
+	// scope covers every input that varies the fetch URL —
+	// buildExperimentAssignmentURL builds from exactly (base URL incl.
+	// prefix, app_key, environment_key, experiment_key, subject_key) and
+	// this SDK sends NO targeting attributes; if attribute params are ever
+	// added, they must join the scope or records would be served across
+	// attribute sets.
 	scopePrefix string
 
 	// held is the freshest served record per scope for this process,
@@ -224,10 +230,15 @@ type experimentsState struct {
 	// automatic revalidation. Host-triggered fetches ignore it entirely.
 	autoHalted bool
 
-	// exposures is the client-side exposure dedupe set: assignment keys an
-	// exposure fact has been admitted for in this client instance
-	// (per-launch, matching the producer contract's per-session dedupe).
-	exposures map[string]struct{}
+	// exposures is the client-side exposure dedupe state: one reservation
+	// per assignment IDENTITY — experiment key + version + assignment key
+	// (experimentExposureDedupeKey) — in this client instance (per-launch,
+	// matching the producer contract's per-session dedupe). A reservation
+	// is PENDING while its emitting attempt is in flight, CONVERTED once
+	// an exposure was actually admitted, and removed when the attempt
+	// failed — concurrent duplicates wait on the pending attempt rather
+	// than reporting success for an emission that may still re-arm.
+	exposures map[string]*expExposureClaim
 
 	// revalidateDelayFn overrides the automatic lane's cycle delay; test
 	// seam (like Client.jitter), nil in production. Set only before the
@@ -245,7 +256,7 @@ func newExperimentsState(cfg Config) *experimentsState {
 		subjectKey: cfg.ExperimentSubjectKey,
 		held:       make(map[string]*expCache),
 		settled:    make(map[string]uint64),
-		exposures:  make(map[string]struct{}),
+		exposures:  make(map[string]*expExposureClaim),
 	}
 	exp.scopePrefix = escapeRemoteConfigSegment(exp.appKey) + rcScopeSeparator +
 		escapeRemoteConfigSegment(exp.envKey) + rcScopeSeparator +
@@ -272,20 +283,70 @@ func buildExperimentAssignmentURL(baseURL, appKey, environmentKey, experimentKey
 	return strings.TrimRight(baseURL, "/") + "/runtime/experiments/assignment?" + query.Encode()
 }
 
-// parseExperimentAssignmentBody parses an assignment body: a JSON object
-// decoding into the assignment shape with a non-empty experiment_key.
-// Returns ok=false for anything unusable (which classifies as the transient
-// malformed_response, exactly like a remote-config body that fails to
-// parse).
+// The two machine-readable not-assigned reasons (absent = the legacy
+// traffic-gate miss). Any OTHER reason value is not a shape this SDK knows
+// and classifies as malformed rather than being served as a verdict.
+const (
+	experimentReasonKillSwitch         = "kill_switch"
+	experimentReasonTargetingUnmatched = "targeting_unmatched"
+)
+
+// parseExperimentAssignmentBody parses an assignment body end-to-end: a JSON
+// object decoding into the assignment shape AND complete for its verdict
+// shape — a syntactically valid but incomplete body must classify as the
+// transient malformed_response (serving the last-known-good cache), never be
+// installed as a fresh verdict the producers and cache would then trust.
+// Required per shape (the server contract always sends these):
+//   - both shapes: non-empty experiment_key and assignment_key (the
+//     deterministic assignment identifier is computed before any verdict and
+//     is always present; it is also part of the exposure dedupe identity)
+//     and a non-negative version — the typed decode already rejects
+//     fractional, exponent-form, overflowing, and non-numeric version
+//     values (any of them errors json.Unmarshal into the int64 field, never
+//     silently truncates), so the explicit check covers the one
+//     representable-but-invalid form;
+//   - assigned: non-empty variant_key and a KNOWN boundary.assignment_unit —
+//     and for the client_id unit a grammar-valid subject_fact_key, the one
+//     value the analytics facts rely on;
+//   - not assigned: a known reason (absent = traffic gate, kill_switch,
+//     targeting_unmatched); an unknown reason is not a verdict this SDK can
+//     represent.
+//
+// Wrong TYPES anywhere in the tree — an array/string variant_payload, a
+// non-object boundary — also fail the typed decode and classify malformed.
+// Returns ok=false for anything unusable.
 func parseExperimentAssignmentBody(body string) (ExperimentAssignment, bool) {
 	var assignment ExperimentAssignment
 	if err := json.Unmarshal([]byte(body), &assignment); err != nil {
 		return ExperimentAssignment{}, false
 	}
-	if strings.TrimSpace(assignment.ExperimentKey) == "" {
+	if strings.TrimSpace(assignment.ExperimentKey) == "" || strings.TrimSpace(assignment.AssignmentKey) == "" {
 		return ExperimentAssignment{}, false
 	}
-	return assignment, true
+	if assignment.Version < 0 {
+		return ExperimentAssignment{}, false
+	}
+	if assignment.Assigned {
+		if strings.TrimSpace(assignment.VariantKey) == "" {
+			return ExperimentAssignment{}, false
+		}
+		switch assignment.Boundary.AssignmentUnit {
+		case experimentAssignmentUnitSynthetic:
+		case experimentAssignmentUnitClientID:
+			if !experimentSubjectFactKeyPattern.MatchString(assignment.SubjectFactKey) {
+				return ExperimentAssignment{}, false
+			}
+		default:
+			return ExperimentAssignment{}, false
+		}
+		return assignment, true
+	}
+	switch assignment.Reason {
+	case "", experimentReasonKillSwitch, experimentReasonTargetingUnmatched:
+		return assignment, true
+	default:
+		return ExperimentAssignment{}, false
+	}
 }
 
 // serveExperimentAssignmentCache serves the cached assignment for a
@@ -543,23 +604,43 @@ func (e *experimentsState) cachedExperimentKeys() []string {
 	return keys
 }
 
-// claimExposure claims the one-per-launch exposure slot for an assignment
-// key; the caller un-claims if the fact is refused, so a later attempt can
-// emit.
-func (e *experimentsState) claimExposure(assignmentKey string) bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if _, emitted := e.exposures[assignmentKey]; emitted {
-		return false
-	}
-	e.exposures[assignmentKey] = struct{}{}
-	return true
+// expExposureClaim is one assignment key's exposure reservation. done is
+// closed when the emitting attempt settles; converted (written before the
+// close, so any waiter released by done observes it) records whether the
+// exposure was actually admitted.
+type expExposureClaim struct {
+	done      chan struct{}
+	converted bool
 }
 
-func (e *experimentsState) unclaimExposure(assignmentKey string) {
+// beginExposureClaim reserves the one-per-launch exposure slot for an
+// assignment identity (experimentExposureDedupeKey). The second result
+// reports whether THIS caller owns the emitting attempt; false hands back
+// the existing reservation (pending or converted) for the caller to wait
+// on. A duplicate must never report success off a reservation that has not
+// CONVERTED — a pending attempt can still fail and re-arm.
+func (e *experimentsState) beginExposureClaim(dedupeKey string) (*expExposureClaim, bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	delete(e.exposures, assignmentKey)
+	if existing := e.exposures[dedupeKey]; existing != nil {
+		return existing, false
+	}
+	claim := &expExposureClaim{done: make(chan struct{})}
+	e.exposures[dedupeKey] = claim
+	return claim, true
+}
+
+// settleExposureClaim settles the reservation the caller owns: converted
+// keeps it forever (the per-launch dedupe mark); a failed attempt removes it
+// so a later — or a concurrently waiting — call can emit.
+func (e *experimentsState) settleExposureClaim(dedupeKey string, claim *expExposureClaim, converted bool) {
+	e.mu.Lock()
+	claim.converted = converted
+	if !converted {
+		delete(e.exposures, dedupeKey)
+	}
+	e.mu.Unlock()
+	close(claim.done)
 }
 
 func (e *experimentsState) haltAutoLane() {
