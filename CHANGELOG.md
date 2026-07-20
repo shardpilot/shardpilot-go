@@ -2,6 +2,71 @@
 
 ## Unreleased
 
+- Dark, opt-in experimentation surface (GAP-017 / ADR-0259). Nothing changes unless
+  explicitly configured — and the platform's experimentation flags are OFF in every
+  environment today, so even an opted-in consumer receives `403` and fails closed
+  until enablement (the expected dark posture; until the control-plane auth leg
+  grants publishable keys the `experiment_assignment_read` scope, only an explicitly
+  scoped runtime token authenticates the fetch at all):
+  - Experiment assignment consumer: `Config.ExperimentsURL` (the control-plane base
+    INCLUDING the deployment's API prefix, e.g. `/api/cp/v1`; requires `APIKey` —
+    the publishable key, never `Token`) + `FetchExperimentAssignment(ctx,
+    experimentKey)` — one `GET /runtime/experiments/assignment` with
+    `app_key`/`environment_key`/`experiment_key`/`subject_key`, parsed into
+    `ExperimentAssignmentResult` (all three not-assigned shapes distinguished by the
+    assignment's `reason` — absent = traffic gate, `kill_switch`,
+    `targeting_unmatched` — and the client_id-unit `subject_fact_key` retained: it is
+    the only permitted analytics fact subject). The ratified remote-config failure
+    canon applies per fetch — transients serve the per-experiment last-known-good
+    cached assignment (`FromCache=true`), `401`/`403` fail closed with NO cross-fetch
+    latch, `404`/unexpected statuses are permanent — plus the two assignment-only
+    extras of ADR-0259 Amendment 2: a `403` whose JSON `error` member EQUALS
+    `experiment real-subject assignment is disabled` (exact string; nothing looser)
+    additionally drops the cached record and its subject fact key, and the AUTOMATIC
+    revalidation lane (opt-in `Config.ExperimentAssignmentRevalidateInterval`,
+    default OFF, 60s floor) halts after an authoritative `401`/`403` until
+    re-initialization — host-triggered fetches keep classifying per fetch and never
+    resume the lane. Optional durable records via
+    `Config.ExperimentAssignmentCachePath` (one client per cache path, like the
+    remote-config cache). No cooldown is armed on this plane (it has no `429`
+    `Retry-After` contract today).
+  - `spcid` experiment subject key: `Config.ExperimentSubjectKey` + the opt-in
+    `LoadOrCreateExperimentSubjectKey(path)` helper — mints `spcid_` + UUIDv7 and
+    persists it with the anonymous-ID helper's no-overwrite link-publish discipline.
+    A DEDICATED installation identifier (grammar `^spcid_[A-Za-z0-9_-]{20,64}$`,
+    enforced at construction): never derived from, and never replacing,
+    `Config.AnonymousID` — analytics identity continuity is untouched, and the
+    remote-config `client_id` is unchanged.
+  - Exposure/outcome producers: `TrackExperimentExposure`/`EnqueueExperimentExposure`
+    and `TrackExperimentOutcome`/`EnqueueExperimentOutcome` build the
+    strict-allowlist `experiment_exposure`/`experiment_outcome` facts — client_id
+    unit: `assignment_key` carries the `sfk1_` subject fact key (the raw `spcid_`
+    subject never rides props); `anonymous_id` always carries the SDK client
+    identity (erasure reachability); `user_id` is always omitted and the envelope
+    source is always `client` — THROUGH the existing `Track`/`Enqueue` pipeline, so
+    they inherit the configured consent posture exactly: with `Config.ConsentFloor`,
+    unknown consent ⇒ dropped (`ErrConsentUnknown`) and denied ⇒ dropped
+    (`ErrConsentDenied`); with the floor nil, the documented server-side posture is
+    unchanged. Exposures deduplicate client-side (one per assignment key per client
+    instance; refused attempts re-arm), outcomes do not; a not-assigned verdict is
+    refused (`ErrExperimentNotAssigned`). New errors:
+    `ErrExperimentsNotConfigured`, `ErrExperimentNotAssigned`,
+    `ErrInvalidExperimentFact`. NOTE: the server-side client-tier admission for
+    these two event names is decision-gated and CLOSED today (publishable keys are
+    rejected for them at the ingest edge, and the analytics client_id-unit flag
+    defaults off) — the producer lane is dark end to end.
+- Opt-in periodic remote-config revalidation (`Config.RemoteConfigRevalidateInterval`,
+  default OFF — the documented explicit-fetch-only behavior is unchanged
+  byte-for-byte when unset): a background timer re-runs the standard conditional GET
+  (`If-None-Match` with the cached ETag) so a running client converges on a
+  server-side change — a kill switch flip included — within one interval. Each cycle
+  waits max(configured interval, the server's `Cache-Control` max-age — 300s before
+  one is seen — floored at 60s); a tick inside an armed `429` `Retry-After` cooldown
+  performs no network call and does not reschedule tighter; and after the TIMER
+  receives an authoritative `401`/`403` it halts until re-initialization, while
+  explicit fetches keep classifying per fetch. The schedule anchor and the
+  timer-halt rule follow the coordinator-recommended defaults and are pending
+  ratification (documented as such in the feature PR).
 - Opt-in client-side consent floor (`Config.ConsentFloor`), adopting the engine SDKs'
   consent-first contract for integrations that need client-side enforcement (per the
   sdk-stability-1.0 disposition: user-facing adopters bound by the DPIA condition opt in;

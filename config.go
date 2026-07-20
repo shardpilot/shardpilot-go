@@ -102,6 +102,99 @@ type Config struct {
 	// it never enables consent persistence or the disk spool.
 	RemoteConfigCachePath string
 
+	// RemoteConfigRevalidateInterval opts this client into PERIODIC
+	// remote-config revalidation: a background timer that re-runs the same
+	// conditional GET FetchRemoteConfig performs (If-None-Match with the
+	// cached ETag), so an already-running client converges on a
+	// server-side change — a kill switch flip included — within one
+	// interval instead of at its next explicit fetch. Zero — the default —
+	// keeps the documented explicit-fetch-only behavior byte-for-byte: no
+	// timer, no background fetch, nothing new on the wire. Ignored unless
+	// RemoteConfigURL is set.
+	//
+	// The schedule anchors to the SERVER's cadence: each cycle waits
+	// max(this interval, the last seen Cache-Control max-age — 300s before
+	// one is seen — floored at 60s), so a positive value here can slow the
+	// timer down but never drive it faster than the server's advertised
+	// cadence or the 60s floor. A tick inside an armed 429 Retry-After
+	// cooldown performs no network call (the cooldown's cache-served
+	// transient_429 outcome, exactly like an explicit fetch) and does not
+	// reschedule tighter. Timer fetches classify exactly like explicit
+	// fetches with ONE addition: after the TIMER receives an authoritative
+	// 401/403 it halts until the client is re-initialized — an unattended
+	// loop must not keep re-asking an endpoint that authoritatively
+	// refused it. Explicit FetchRemoteConfig calls keep classifying
+	// per-fetch and never resume the halted timer.
+	RemoteConfigRevalidateInterval time.Duration
+
+	// ExperimentsURL opts this client into the experiment assignment
+	// consumer: the control-plane experiments base URL INCLUDING the API
+	// prefix the deployment routes (production/public
+	// `https://<control-plane>/api/cp/v1`; in-cluster deployments may use
+	// `/api/v1`). The SDK appends `/runtime/experiments/assignment`.
+	// Unlike IngestURL/RemoteConfigURL a path prefix is expected here;
+	// query, fragment, and user info are still rejected, and HTTPS is
+	// required outside loopback (or private nets with
+	// AllowInsecurePrivateNetwork). Empty — the default — disables the
+	// experiment consumer entirely (fetches fail
+	// experiments_not_configured, producers refuse
+	// ErrExperimentsNotConfigured; nothing new on the wire). Requires
+	// APIKey: the assignment fetch authenticates with the publishable
+	// client key, never Token.
+	//
+	// Dark-phase note: the platform's experimentation flags are OFF in
+	// every environment today, so a configured consumer receives 403
+	// (`experimentation runtime is disabled` / `experiment assignment
+	// fetch is disabled`) on every call until enablement — the expected
+	// fail-closed posture. Until the control-plane auth leg grants
+	// publishable keys the `experiment_assignment_read` scope, only an
+	// explicitly scoped runtime token authenticates (401 otherwise);
+	// integration tests need such a token during the dark phase.
+	ExperimentsURL string
+
+	// ExperimentSubjectKey is this installation's persisted experiment
+	// subject key — the `subject_key` every assignment fetch sends —
+	// conforming to `^spcid_[A-Za-z0-9_-]{20,64}$`. Source it from the
+	// opt-in LoadOrCreateExperimentSubjectKey helper. It is a DEDICATED
+	// identifier: never derive it from, and never replace, AnonymousID
+	// (analytics identity continuity) — the raw value authenticates
+	// nothing, and it never rides experiment analytics facts (the server
+	// returns a derived subject_fact_key for that). A non-empty value that
+	// does not match the grammar is rejected at construction; empty makes
+	// assignment fetches fail subject_key_unavailable before any network
+	// use.
+	ExperimentSubjectKey string
+
+	// ExperimentAssignmentCachePath, when set, is the file the experiment
+	// consumer persists its cached assignment records to (one record per
+	// experiment scope), so a restart serves last-known-good assignments
+	// over transient failures. File 0600; directories the SDK creates are
+	// 0700; a pre-existing parent's permissions are never changed. The
+	// file is read back through a hard size limit (an over-limit file is
+	// discarded as corrupt, never loaded whole) and holds ONE client's
+	// scope set: records for another (app, environment, subject, URL)
+	// tuple are misses and are dropped by this client's next persisted
+	// change — one client per cache path is the supported topology, like
+	// RemoteConfigCachePath. Empty keeps assignment records in memory
+	// only. Independent of SpoolDir; never enables consent persistence.
+	ExperimentAssignmentCachePath string
+
+	// ExperimentAssignmentRevalidateInterval opts this client into the
+	// AUTOMATIC assignment revalidation lane: a background timer that
+	// re-fetches every cached assignment (the experiment keys this client
+	// has fetched) so a running client converges on an operator kill or a
+	// variant change without a host call. Zero — the default — means NO
+	// automatic lane: assignments refresh only by explicit
+	// FetchExperimentAssignment calls. Ignored unless ExperimentsURL is
+	// set. Each cycle waits max(this interval, 60s).
+	//
+	// Halt contract (ADR-0259 Amendment 2): after the automatic lane
+	// receives ANY authoritative 401/403 — the real-subjects sentinel
+	// included — it stops scheduling assignment fetches until the client
+	// is re-initialized. Host-triggered fetches keep classifying
+	// per-fetch, and a later host-fetch success does NOT resume the lane.
+	ExperimentAssignmentRevalidateInterval time.Duration
+
 	// SpoolDir, when set, is the opt-in state directory for the bounded disk
 	// spool and the persisted consent decision (`spool.json`, `consent.json`,
 	// and the `spool-wipe-owed` marker; directory 0700, files 0600). Empty —
@@ -253,6 +346,9 @@ func normalizeConfig(cfg Config) (Config, error) {
 	cfg.APIKey = strings.TrimSpace(cfg.APIKey)
 	cfg.RemoteConfigURL = strings.TrimSpace(cfg.RemoteConfigURL)
 	cfg.RemoteConfigCachePath = strings.TrimSpace(cfg.RemoteConfigCachePath)
+	cfg.ExperimentsURL = strings.TrimSpace(cfg.ExperimentsURL)
+	cfg.ExperimentSubjectKey = strings.TrimSpace(cfg.ExperimentSubjectKey)
+	cfg.ExperimentAssignmentCachePath = strings.TrimSpace(cfg.ExperimentAssignmentCachePath)
 	cfg.SpoolDir = strings.TrimSpace(cfg.SpoolDir)
 
 	if cfg.IngestURL == "" {
@@ -292,6 +388,26 @@ func normalizeConfig(cfg Config) (Config, error) {
 			return Config{}, err
 		}
 		cfg.RemoteConfigURL = normalizedRC
+	}
+
+	if cfg.ExperimentsURL != "" {
+		// Same credential contract as remote config: the assignment fetch
+		// authenticates with the publishable API key only, never Token.
+		if cfg.APIKey == "" {
+			return Config{}, fmt.Errorf("%w: experiments requires APIKey", ErrInvalidConfig)
+		}
+		normalizedExp, err := normalizePrefixedBaseURL(cfg.ExperimentsURL, "experiments URL", cfg.AllowInsecurePrivateNetwork)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.ExperimentsURL = normalizedExp
+	}
+	if cfg.ExperimentSubjectKey != "" && !validExperimentSubjectKey(cfg.ExperimentSubjectKey) {
+		// The server enforces the spcid grammar with a permanent 400; a
+		// value that can never fetch is a caller bug caught at
+		// construction. (Notably a UUID AnonymousID wired here by mistake
+		// fails this check — the subject key is a dedicated identifier.)
+		return Config{}, fmt.Errorf("%w: ExperimentSubjectKey must match %s (see LoadOrCreateExperimentSubjectKey)", ErrInvalidConfig, experimentSubjectKeyGrammar)
 	}
 
 	if cfg.SpoolDir != "" {
@@ -350,6 +466,33 @@ func normalizeBaseURL(raw, label string, allowPrivate bool) (string, error) {
 	parsed.Path = ""
 	parsed.RawPath = ""
 	parsed.ForceQuery = false
+	return strings.TrimRight(parsed.String(), "/"), nil
+}
+
+// normalizePrefixedBaseURL validates and normalizes a base endpoint URL that
+// MAY carry a path prefix (the experiments base URL: control-plane routes
+// mount under a deployment-chosen prefix such as /api/cp/v1, so the prefix is
+// configuration, not something the SDK can hardcode). Same rules as
+// normalizeBaseURL otherwise: absolute, HTTPS outside loopback (or private
+// networks when explicitly allowed), no user info, query, or fragment; any
+// trailing slash is trimmed so equivalent spellings normalize identically.
+func normalizePrefixedBaseURL(raw, label string, allowPrivate bool) (string, error) {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("%w: %s must be absolute", ErrInvalidConfig, label)
+	}
+	if parsed.Scheme != "https" && !allowInsecureURL(parsed, allowPrivate) {
+		return "", fmt.Errorf("%w: %s must use https outside localhost, loopback, or explicitly allowed private networks", ErrInvalidConfig, label)
+	}
+	if parsed.User != nil {
+		return "", fmt.Errorf("%w: %s must not include user info", ErrInvalidConfig, label)
+	}
+	if parsed.RawQuery != "" || parsed.ForceQuery {
+		return "", fmt.Errorf("%w: %s must not include query parameters", ErrInvalidConfig, label)
+	}
+	if parsed.Fragment != "" {
+		return "", fmt.Errorf("%w: %s must not include a fragment", ErrInvalidConfig, label)
+	}
 	return strings.TrimRight(parsed.String(), "/"), nil
 }
 

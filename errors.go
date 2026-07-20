@@ -72,4 +72,29 @@ var (
 	// discarded events are also counted in Stats.Dropped). Never returned
 	// when the floor is off.
 	ErrEventsDiscarded = errors.New("shardpilot events were discarded at close (no durable spool)")
+
+	// ErrExperimentsNotConfigured is returned by the experiment exposure/
+	// outcome producers when the experiment consumer is not opted in
+	// (Config.ExperimentsURL unset): with no assignment plane configured
+	// there is no assignment these facts could describe. The default
+	// posture — no experiments configured — emits nothing.
+	ErrExperimentsNotConfigured = errors.New("shardpilot experiments are not configured")
+
+	// ErrExperimentNotAssigned is returned by the experiment exposure/
+	// outcome producers for an assignment whose Assigned is false (a
+	// traffic-gate miss, a kill switch, or a targeting mismatch): the
+	// producer contract emits facts only for assignments the app can act
+	// on — never for a not-assigned verdict.
+	ErrExperimentNotAssigned = errors.New("shardpilot experiment assignment is not assigned")
+
+	// ErrInvalidExperimentFact is returned by the experiment exposure/
+	// outcome producers when a fact cannot be built within the ingest
+	// contract: a malformed assignment (missing keys, an unknown
+	// assignment unit, a client_id-unit assignment without a valid
+	// sfk1_ subject_fact_key — the raw spcid_ subject never rides
+	// experiment props), a missing Config.AnonymousID (experiment facts
+	// must carry the SDK client identity for erasure reachability), or an
+	// outcome value that is not a finite number or a boolean. The fact is
+	// refused whole; nothing is queued.
+	ErrInvalidExperimentFact = errors.New("invalid shardpilot experiment fact")
 )

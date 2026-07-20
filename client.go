@@ -121,6 +121,25 @@ type Client struct {
 	// defaults).
 	rc *remoteConfigState
 
+	// rcRevalidateDone is closed when the opt-in periodic remote-config
+	// revalidation timer goroutine exits; nil when the timer is not opted
+	// in (Config.RemoteConfigRevalidateInterval unset) — the default, with
+	// no goroutine and no background fetches. Close waits on it (bounded
+	// by its context) like workerDone.
+	rcRevalidateDone chan struct{}
+
+	// exp is the experiment assignment machinery; nil when
+	// Config.ExperimentsURL is unset (fetches fail
+	// experiments_not_configured, producers refuse
+	// ErrExperimentsNotConfigured).
+	exp *experimentsState
+
+	// expRevalidateDone is closed when the opt-in automatic assignment
+	// revalidation lane goroutine exits; nil when the lane is not opted in
+	// (Config.ExperimentAssignmentRevalidateInterval unset) — the default.
+	// Close waits on it like rcRevalidateDone.
+	expRevalidateDone chan struct{}
+
 	// spool is the opt-in bounded disk spool; nil when Config.SpoolDir is
 	// unset (today's memory-only behavior, unchanged).
 	spool *diskSpool
@@ -287,8 +306,23 @@ func NewClient(cfg Config) (*Client, error) {
 		client.rc = newRemoteConfigState(normalized)
 		client.rc.preload()
 	}
+	if normalized.ExperimentsURL != "" {
+		client.exp = newExperimentsState(normalized)
+		client.exp.preload()
+	}
 
 	go client.run()
+	// The opt-in revalidation goroutines: none starts unless its interval
+	// is set, so the default wire behavior — explicit fetches only — is
+	// unchanged byte-for-byte.
+	if client.rc != nil && normalized.RemoteConfigRevalidateInterval > 0 {
+		client.rcRevalidateDone = make(chan struct{})
+		go client.runRemoteConfigRevalidation()
+	}
+	if client.exp != nil && normalized.ExperimentAssignmentRevalidateInterval > 0 {
+		client.expRevalidateDone = make(chan struct{})
+		go client.runExperimentAssignmentRevalidation()
+	}
 	client.emitSpoolDeadLetters(initDeadLetters)
 	return client, nil
 }
@@ -544,6 +578,23 @@ func (c *Client) finishClose(ctx context.Context) error {
 	case <-contextDone(ctx):
 		if err == nil {
 			err = contextCause(ctx)
+		}
+	}
+	// The opt-in revalidation goroutines (remote config, experiment
+	// assignment) exit on the same stop signal; wait for them like
+	// workerDone so no timer-scheduled fetch or cache write outlives
+	// Close. (Their in-flight fetches are additionally fenced by trackWG,
+	// already waited out before finishClose.)
+	for _, revalidateDone := range []chan struct{}{c.rcRevalidateDone, c.expRevalidateDone} {
+		if revalidateDone == nil {
+			continue
+		}
+		select {
+		case <-revalidateDone:
+		case <-contextDone(ctx):
+			if err == nil {
+				err = contextCause(ctx)
+			}
 		}
 	}
 	// The consent sender drains decisions still pending when c.stop closes.

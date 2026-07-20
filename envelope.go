@@ -89,13 +89,24 @@ func (c *Client) buildEnvelope(event Event) (eventEnvelope, error) {
 	appVersion := firstNonEmpty(event.AppVersion, c.cfg.AppVersion)
 	appBuild := firstNonEmpty(event.AppBuild, c.cfg.AppBuild)
 	userID := firstNonEmpty(event.UserID, c.cfg.UserID)
+	if event.omitUserID {
+		// SDK-internal experiment facts: the ingest contract rejects these
+		// event names when user_id carries ANY value, so the configured
+		// default must not be stamped in.
+		userID = ""
+	}
 	anonymousID := firstNonEmpty(event.AnonymousID, c.cfg.AnonymousID)
+	source := c.cfg.Source
+	if event.sourceOverride != "" {
+		// SDK-internal experiment facts: admitted with source "client" only.
+		source = event.sourceOverride
+	}
 
 	return eventEnvelope{
 		EventID:         id,
 		SchemaVersion:   1,
 		EventName:       name,
-		Source:          c.cfg.Source,
+		Source:          source,
 		EventTS:         timestamp.UTC().Format(time.RFC3339Nano),
 		WorkspaceID:     c.cfg.WorkspaceID,
 		AppID:           c.cfg.AppID,

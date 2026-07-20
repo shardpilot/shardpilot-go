@@ -155,6 +155,27 @@ type remoteConfigState struct {
 	// (a client's scope is fixed by its config). Monotone: a new 429 can
 	// only extend it, and it is never persisted; it expires only by time.
 	cooldownUntil time.Time
+
+	// maxAgeSeconds/maxAgePresent hold the last seen Cache-Control max-age
+	// — the server's advertised revalidation cadence. Consumed ONLY by the
+	// opt-in periodic revalidation timer's schedule anchor; fetch
+	// classification never reads it (the explicit-fetch contract still
+	// interprets no Cache-Control).
+	maxAgeSeconds int
+	maxAgePresent bool
+
+	// autoHalted marks the opt-in periodic revalidation TIMER halted after
+	// an authoritative 401/403 one of ITS fetches received: an unattended
+	// loop must not keep re-asking an endpoint that authoritatively refused
+	// it. The timer goroutine exits on it; only re-initialization (a new
+	// client) resumes automatic revalidation. Explicit fetches ignore it
+	// entirely — per-fetch classification is unchanged.
+	autoHalted bool
+
+	// revalidateDelayFn overrides the revalidation timer's cycle delay;
+	// test seam (like Client.jitter), nil in production. Set only before
+	// the timer goroutine starts.
+	revalidateDelayFn func() time.Duration
 }
 
 func newRemoteConfigState(cfg Config) *remoteConfigState {
@@ -744,6 +765,24 @@ func rcFetchError(code string) error {
 // Close waits (bounded by its own context) for in-flight fetches to settle,
 // so no fetch I/O or durable cache write is still running when Close returns.
 func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, error) {
+	result, code, err := c.fetchRemoteConfigOutcome(ctx)
+	if err != nil {
+		return RemoteConfigResult{}, err
+	}
+	if code != "" {
+		return RemoteConfigResult{}, rcFetchError(code)
+	}
+	return result, nil
+}
+
+// fetchRemoteConfigOutcome is the shared fetch core behind FetchRemoteConfig
+// (which formats the failure code into an error) and the opt-in periodic
+// revalidation timer (which reads the code directly — its halt trigger is
+// the "unauthorized" class). A non-nil error is a lifecycle or
+// caller-context outcome (ErrClosed, the caller's own context error),
+// mutually exclusive with a failure code; every path's behavior is the
+// public method's documented contract, unchanged.
+func (c *Client) fetchRemoteConfigOutcome(ctx context.Context) (RemoteConfigResult, string, error) {
 	// The same lifecycle fence as Track: registering in trackWG under
 	// lifecycleMu means Close either sees this fetch (and waits for it) or
 	// completed its closed store first (and this fetch is rejected) — an
@@ -752,20 +791,20 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 	c.lifecycleMu.Lock()
 	if c.closed.Load() {
 		c.lifecycleMu.Unlock()
-		return RemoteConfigResult{}, ErrClosed
+		return RemoteConfigResult{}, "", ErrClosed
 	}
 	c.trackWG.Add(1)
 	c.lifecycleMu.Unlock()
 	defer c.trackWG.Done()
 	rc := c.rc
 	if rc == nil {
-		return RemoteConfigResult{}, rcFetchError("remote_config_not_configured")
+		return RemoteConfigResult{}, "remote_config_not_configured", nil
 	}
 	if rc.clientID == "" {
 		// The cache scope and the fetch route both need the client id; with
 		// none configured there is nothing coherent to fetch. Decided before
 		// any network use.
-		return RemoteConfigResult{}, rcFetchError("client_id_unavailable")
+		return RemoteConfigResult{}, "client_id_unavailable", nil
 	}
 
 	rc.mu.Lock()
@@ -781,7 +820,7 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 		if ctx != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				rc.mu.Unlock()
-				return RemoteConfigResult{}, ctxErr
+				return RemoteConfigResult{}, "", ctxErr
 			}
 		}
 		// Inside the 429 cooldown an explicit fetch does not touch the
@@ -791,9 +830,9 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 		rc.installLocked(seq, result, failure == "", nil, false, cache, nil)
 		rc.mu.Unlock()
 		if failure != "" {
-			return RemoteConfigResult{}, rcFetchError(failure)
+			return RemoteConfigResult{}, failure, nil
 		}
-		return result, nil
+		return result, "", nil
 	}
 	etag := ""
 	if cache != nil {
@@ -820,7 +859,7 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 				// fence side effects, just the caller's error back (same
 				// discrimination as callerAbandonedFlush). Any partial
 				// response riding the error is discarded with it.
-				return RemoteConfigResult{}, err
+				return RemoteConfigResult{}, "", err
 			}
 		}
 		if resp.status == 0 {
@@ -843,6 +882,13 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 	result, newCache, authoritative, revalidated, failure := applyRemoteConfig(cache, resp, now.UnixMilli())
 
 	rc.mu.Lock()
+	if resp.maxAgePresent {
+		// The server's advertised revalidation cadence, remembered for the
+		// opt-in periodic revalidation timer's schedule anchor. Last write
+		// wins — a cadence hint, never a classification input.
+		rc.maxAgeSeconds = resp.maxAgeSeconds
+		rc.maxAgePresent = true
+	}
 	if resp.status == 429 && seq > rc.settled[rc.scope] {
 		// The cooldown is fenced by the same per-scope sequence as installs:
 		// a stale 429 that arrives AFTER a newer fetch already settled an
@@ -860,9 +906,108 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 		c.logf("shardpilot remote config: persisting the cache record failed; the fetched configuration stays the in-memory fallback for this process")
 	}
 	if failure != "" {
-		return RemoteConfigResult{}, rcFetchError(failure)
+		return RemoteConfigResult{}, failure, nil
 	}
-	return result, nil
+	return result, "", nil
+}
+
+// ── periodic revalidation (opt-in) ─────────────────────────────────────────
+
+// rcRevalidateFloor is the minimum revalidation cycle spacing, respecting
+// the platform's per-(workspace, environment, client) fetch rate limiter: a
+// timer never polls more often than once a minute, however small the server
+// cadence or the configured interval.
+const rcRevalidateFloor = 60 * time.Second
+
+// rcRevalidateFallback is the schedule anchor before any Cache-Control
+// max-age has been seen (the server's default max-age).
+const rcRevalidateFallback = 300 * time.Second
+
+// revalidateDelay is the revalidation timer's next cycle delay:
+// max(configured interval, server anchor), where the anchor is the last
+// seen Cache-Control max-age — 300s before one is seen — floored at 60s. A
+// configured interval can slow the timer down but never drive it faster
+// than the server's advertised cadence.
+func (rc *remoteConfigState) revalidateDelay(configured time.Duration) time.Duration {
+	if rc.revalidateDelayFn != nil {
+		return rc.revalidateDelayFn()
+	}
+	rc.mu.Lock()
+	seconds, present := rc.maxAgeSeconds, rc.maxAgePresent
+	rc.mu.Unlock()
+	anchor := rcRevalidateFallback
+	if present {
+		anchor = time.Duration(seconds) * time.Second
+	}
+	if anchor < rcRevalidateFloor {
+		anchor = rcRevalidateFloor
+	}
+	if configured > anchor {
+		return configured
+	}
+	return anchor
+}
+
+func (rc *remoteConfigState) haltAutoLane() {
+	rc.mu.Lock()
+	rc.autoHalted = true
+	rc.mu.Unlock()
+}
+
+func (rc *remoteConfigState) autoLaneHalted() bool {
+	rc.mu.Lock()
+	defer rc.mu.Unlock()
+	return rc.autoHalted
+}
+
+// runRemoteConfigRevalidation is the opt-in periodic revalidation timer
+// (started only when Config.RemoteConfigRevalidateInterval > 0): each cycle
+// re-runs the same conditional GET an explicit FetchRemoteConfig performs —
+// If-None-Match with the cached ETag, the full failure taxonomy, the 429
+// cooldown (a tick inside an armed cooldown performs no network call and
+// does not reschedule tighter) — so a running client converges on a
+// server-side change within one interval. The timer exits when the client
+// stops, or when it halts: after one of ITS OWN fetches receives an
+// authoritative 401/403 it stops scheduling until re-initialization — an
+// unattended loop must not keep re-asking an endpoint that authoritatively
+// refused it. Explicit fetches keep classifying per-fetch throughout and
+// never resume the halted timer.
+func (c *Client) runRemoteConfigRevalidation() {
+	defer close(c.rcRevalidateDone)
+	for {
+		timer := time.NewTimer(c.rc.revalidateDelay(c.cfg.RemoteConfigRevalidateInterval))
+		select {
+		case <-c.stop:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		if c.revalidateRemoteConfigOnce() {
+			return
+		}
+	}
+}
+
+// revalidateRemoteConfigOnce runs one timer cycle and reports whether the
+// timer must exit (halted, or the client closed). Transient and permanent
+// non-auth outcomes keep the schedule: the durable cache serves, and the
+// next cycle re-asks.
+func (c *Client) revalidateRemoteConfigOnce() (exit bool) {
+	if c.rc.autoLaneHalted() {
+		return true
+	}
+	_, code, err := c.fetchRemoteConfigOutcome(context.Background())
+	if err != nil {
+		// Only lifecycle outcomes surface as errors on a background
+		// context; the timer winds down with the client.
+		return errors.Is(err, ErrClosed)
+	}
+	if code == "unauthorized" {
+		c.rc.haltAutoLane()
+		c.logf("shardpilot remote config revalidation: halted after an authoritative 401/403; explicit fetches remain available, and the timer resumes only on re-initialization")
+		return true
+	}
+	return false
 }
 
 // ── typed value getters ─────────────────────────────────────────────────────

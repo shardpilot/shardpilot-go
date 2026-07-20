@@ -15,4 +15,18 @@ type Event struct {
 	AppBuild        string
 	Props           map[string]any
 	Context         map[string]any
+
+	// omitUserID, when set, forces the wire envelope's user_id to be
+	// OMITTED even when Config.UserID would default it. Unexported: only
+	// the SDK's own experiment fact producers set it — the ingest contract
+	// rejects experiment events that carry any user_id (the fact subject is
+	// the assignment_key; identity rides anonymous_id for erasure
+	// reachability).
+	omitUserID bool
+
+	// sourceOverride, when non-empty, replaces Config.Source on the wire
+	// envelope for this event. Unexported: only the SDK's own experiment
+	// fact producers set it — the ingest contract admits experiment events
+	// with source "client" only, whatever tier the publishing credential is.
+	sourceOverride Source
 }

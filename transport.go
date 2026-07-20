@@ -38,7 +38,12 @@ type remoteConfigRequest struct {
 // retryAfterSeconds carries a 429's Retry-After parsed digits-only
 // (HTTP-date is NOT accepted on this route — the server contract sends
 // integer seconds >= 1); retryAfterPresent distinguishes a parsed header
-// from an absent or malformed one.
+// from an absent or malformed one. maxAgeSeconds carries the response's
+// Cache-Control max-age directive (the server's advertised revalidation
+// cadence; sent on this route as "private, max-age=N"), with
+// maxAgePresent distinguishing a parsed directive from an absent or
+// malformed one — consumed only by the opt-in periodic revalidation
+// timer's schedule anchor, never by fetch classification.
 type remoteConfigResponse struct {
 	status            int
 	body              []byte
@@ -46,6 +51,8 @@ type remoteConfigResponse struct {
 	etag              string
 	retryAfterSeconds int
 	retryAfterPresent bool
+	maxAgeSeconds     int
+	maxAgePresent     bool
 }
 
 // batchResult is the wire decode of the events:batch response (HTTP 202).
@@ -273,6 +280,7 @@ func (t *httpTransport) FetchRemoteConfig(ctx context.Context, request remoteCon
 	// response classifies by status).
 	body, readErr := io.ReadAll(io.LimitReader(response.Body, rcMaxBodyBytes+1))
 	seconds, present := parseRemoteConfigRetryAfter(response.Header.Get("Retry-After"))
+	maxAge, maxAgePresent := parseCacheControlMaxAge(response.Header.Get("Cache-Control"))
 	result := remoteConfigResponse{
 		status:            response.StatusCode,
 		body:              body,
@@ -280,6 +288,8 @@ func (t *httpTransport) FetchRemoteConfig(ctx context.Context, request remoteCon
 		etag:              response.Header.Get("Etag"),
 		retryAfterSeconds: seconds,
 		retryAfterPresent: present,
+		maxAgeSeconds:     maxAge,
+		maxAgePresent:     maxAgePresent,
 	}
 	if readErr != nil && ctx.Err() != nil {
 		return result, fmt.Errorf("read shardpilot remote config response: %w", readErr)
@@ -310,6 +320,37 @@ func parseRemoteConfigRetryAfter(header string) (int, bool) {
 		return rcCooldownClampSeconds, true
 	}
 	return int(seconds), true
+}
+
+// parseCacheControlMaxAge reads a Cache-Control header's max-age directive in
+// digits-only whole seconds (the remote-config server contract: "private,
+// max-age=N"). Directive matching is case-insensitive per RFC 9111; a quoted,
+// negative, fractional, or otherwise malformed value — or an absent directive
+// — reports (0, false). A digits-only value too large for int64 still means
+// "a very long cadence" and saturates at the cooldown clamp (the largest
+// bound this route uses for time values) instead of being ignored.
+func parseCacheControlMaxAge(header string) (int, bool) {
+	for _, directive := range strings.Split(header, ",") {
+		name, value, found := strings.Cut(strings.TrimSpace(directive), "=")
+		if !found || !strings.EqualFold(strings.TrimSpace(name), "max-age") {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return 0, false
+		}
+		for i := 0; i < len(value); i++ {
+			if value[i] < '0' || value[i] > '9' {
+				return 0, false
+			}
+		}
+		seconds, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || seconds > rcCooldownClampSeconds {
+			return rcCooldownClampSeconds, true
+		}
+		return int(seconds), true
+	}
+	return 0, false
 }
 
 // postJSON posts one JSON request to an ingest endpoint. schemaRevision, when
