@@ -359,3 +359,58 @@ func TestDroppedEntryOwedExposureSurvivesProcessDeath(t *testing.T) {
 		t.Fatalf("the replayed fact must carry the server-minted fact key, got %q", key)
 	}
 }
+
+// Fleet-contract status-table refinements: an unexpected status SETTLES the
+// per-key fence (the server answered — an older in-flight response must not
+// overwrite the newer observation) while the auth latch stays invariant in
+// BOTH directions.
+func TestUnexpectedStatusSettlesFenceAndKeepsLatch(t *testing.T) {
+	script := &expScript{}
+	capture := &expWireCapture{}
+	server := newExperimentServer(t, script, capture)
+	defer server.Close()
+	client := newExperimentClient(t, server.URL, nil)
+	defer client.Close(context.Background())
+	fetchAssignment(t, client, expTestScopeKey)
+
+	e := client.exp
+	e.mu.Lock()
+	subject := e.currentSubjectIDLocked()
+	scope := e.scopeForLocked(subject)
+	fenceKey := scope + rcScopeSeparator + expTestScopeKey
+	seqBefore := e.settled[fenceKey]
+	epoch := e.authEpoch
+	// A 409-class outcome at a fresh sequence: the fence must settle.
+	e.fetchSeq++
+	seq409 := e.fetchSeq
+	e.installLocked(seq409, scope, expTestScopeKey, expOutcome{transient: true, authoritative: true}, epoch, 1000)
+	settled := e.settled[fenceKey]
+	latchedAfter := e.authBlocked
+	e.mu.Unlock()
+	if settled != seq409 || settled <= seqBefore {
+		t.Fatalf("an unexpected status must settle the per-key fence, got %d (before %d)", settled, seqBefore)
+	}
+	if latchedAfter {
+		t.Fatalf("an unexpected status must never latch")
+	}
+
+	// Latch invariance the other way: a latched plane stays latched.
+	e.mu.Lock()
+	e.authBlocked = true
+	epoch = e.authEpoch
+	e.fetchSeq++
+	e.installLocked(e.fetchSeq, scope, expTestScopeKey, expOutcome{transient: true, authoritative: true}, epoch, 2000)
+	stillLatched := e.authBlocked
+	// And an older AUTHORITATIVE response behind the settled fence is
+	// discarded: the cache stays exactly as the fence left it.
+	entriesBefore := len(e.entries)
+	e.installLocked(seq409-1, scope, expTestScopeKey, expOutcome{authoritative: true, dropEntry: true}, epoch, 3000)
+	entriesAfter := len(e.entries)
+	e.mu.Unlock()
+	if !stillLatched {
+		t.Fatalf("an unexpected status must never unlatch a latched plane")
+	}
+	if entriesAfter != entriesBefore {
+		t.Fatalf("a fence-losing older response must be discarded, entries %d -> %d", entriesBefore, entriesAfter)
+	}
+}

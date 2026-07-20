@@ -600,16 +600,19 @@ func applyExperimentAssignment(entry *expEntry, resp remoteConfigResponse, scope
 	}
 
 	// Anything else (an unexpected redirect, another 4xx — statuses this
-	// contract never sends) lands in the TRANSIENT bucket: serve the
-	// last-known-good and let the cadence retry. Only contract statuses may
-	// make authoritative decisions — an out-of-contract answer (a proxy
-	// redirect, a gateway mangling the route) proves nothing about the
-	// assignment, so it must neither drop the cached entry nor claim an
-	// authoritative no-serve while the getters keep serving that same entry
-	// (the forbidden half-state: the fetch caller and the getters would
-	// disagree about the plane).
+	// contract never sends) is the fleet-contract TRANSIENT class: a closed
+	// transient result to the caller (serve-stale under the attribute-match
+	// rule), the cache RETAINED, and the revalidation cadence kept probing —
+	// a stray proxy 409 must never kill a valid cached treatment; the
+	// platform speaks authoritatively only through 200 verdicts, 400s, the
+	// auth statuses, and the sentinel. Two refinements distinguish the class
+	// from ordinary transients: the SERVER answered, so the per-key sequence
+	// fence SETTLES (authoritative for ordering — an older in-flight
+	// response must not overwrite the newer observation), while the auth
+	// latch never changes in EITHER direction (the install's unlatch is
+	// gated on authoritative NON-transient outcomes).
 	result, failure := serveExperimentEntryOrFail(entry, "http_"+strconv.Itoa(status))
-	return result, expOutcome{transient: true}, failureOrEmpty(result, failure)
+	return result, expOutcome{transient: true, authoritative: true}, failureOrEmpty(result, failure)
 }
 
 func failureOrEmpty(result ExperimentAssignmentResult, failure string) string {
@@ -992,10 +995,13 @@ type experimentsState struct {
 	// contract: a kill/not-assigned drop must not lose the fact of real
 	// treatment to a process death before the next sweep — the spool
 	// replays it at the next launch, and the deterministic event id
-	// collapses a double delivery server-side). Called under e.mu; the
-	// implementation must take no client lock and defer any integrator
-	// callbacks.
-	captureOwedDropFn func(experimentKey string, owed []*expOwedExposure)
+	// collapses a double delivery server-side). Returns whether the capture
+	// is DURABLE (or moot: nothing capturable, no spool, policy-refused);
+	// false marks a mechanical persist failure — the caller must then keep
+	// the durable record intact and retry the capture+delete PAIR together.
+	// Called under e.mu; the implementation must take no client lock and
+	// defer any integrator callbacks.
+	captureOwedDropFn func(experimentKey string, owed []*expOwedExposure) bool
 
 	// laneParkedForTests suspends the background lane's automatic ticks so
 	// tests can drive tick() deterministically. Never set in production.
@@ -1026,6 +1032,12 @@ type expOwedSync struct {
 	drop          bool
 	scope         string
 	experimentKey string
+	// captureFirst marks a drop whose owed-exposure durable capture has not
+	// landed yet: the record delete must not outrun the replay source, so
+	// the pair retries TOGETHER — the capture attempt first, the record
+	// converge only once it lands (or nothing remains to capture). Such an
+	// intent never folds into sibling saves.
+	captureFirst bool
 }
 
 // scopedIntentKey is the durablePending map key: the (scope, experiment)
@@ -1274,17 +1286,26 @@ func (e *experimentsState) condemnedScopeLocked() string {
 }
 
 // clearCondemnationTombstoneLocked removes a tombstone naming scope (or any
-// tombstone when scope is ""). Best-effort: a failed removal leaves a
-// tombstone that the next load re-honors — fail closed, never fail open.
-func (e *experimentsState) clearCondemnationTombstoneLocked(scope string) {
+// tombstone when scope is ""), reporting whether the spend DURABLY landed
+// (a missing tombstone counts as spent). The unlink is durable only once
+// the parent directory's metadata is synced: a crash after the record save
+// but before a durable unlink would resurrect the tombstone and condemn the
+// FRESH record at the next launch (the tombstone is scope-stamped, and the
+// replacement record usually carries the same scope). A failed spend fails
+// CLOSED — the caller keeps the save owed and retries the pair.
+func (e *experimentsState) clearCondemnationTombstoneLocked(scope string) bool {
 	path := e.tombstoneFilePath()
 	if path == "" {
-		return
+		return true
 	}
 	if scope != "" && e.condemnedScopeLocked() != scope {
-		return
+		return true
 	}
-	_ = os.Remove(path)
+	err := os.Remove(path)
+	if err != nil {
+		return errors.Is(err, os.ErrNotExist)
+	}
+	return syncDir(filepath.Dir(path)) == nil
 }
 
 // loadDurableRecordLocked loads the stored record, or nil when absent or
@@ -1351,11 +1372,16 @@ func (e *experimentsState) saveDurableRecordLocked(record *expDurableRecord) boo
 	if writePrivateFileAtomic(path, buf.Bytes(), os.Rename, os.Chmod) != nil {
 		return false
 	}
-	// Fresh durable state for this scope supersedes a condemnation naming
-	// it (the write-time demotion rule): the tombstone must not condemn
-	// the record that replaced the withdrawn one.
-	e.clearCondemnationTombstoneLocked(stored.Scope)
-	return true
+	// Fresh durable state supersedes ANY condemnation (the write-time
+	// demotion rule): whatever record a tombstone condemned was just
+	// REPLACED by this save, so the spend covers every scope — a stale
+	// old-scope tombstone left by a failed re-mint persist included. The
+	// spend is part of the durable save: a save whose tombstone unlink
+	// could not be made durable is NOT reported landed — the owed-write
+	// machinery retries the idempotent pair until both are on disk,
+	// because a resurrected tombstone would condemn the fresh record at
+	// the next launch.
+	return e.clearCondemnationTombstoneLocked("")
 }
 
 // clearDurableRecordLocked drops the stored record outright (loads as "no
@@ -1384,9 +1410,10 @@ func (e *experimentsState) clearDurableRecordLocked() bool {
 			return false
 		}
 	}
-	// The withdrawn record is gone: any condemnation tombstone is spent.
-	e.clearCondemnationTombstoneLocked("")
-	return true
+	// The withdrawn record is gone: any condemnation tombstone is spent —
+	// durably, or the clear stays owed (a resurrected tombstone would
+	// needlessly condemn the NEXT record written for its scope).
+	return e.clearCondemnationTombstoneLocked("")
 }
 
 // durableRecordForLocked returns the stored record for scope, or a fresh
@@ -1502,6 +1529,12 @@ func (e *experimentsState) foldOwedIntentsLocked(record *expDurableRecord, scope
 		if pending.scope != scope || pending.experimentKey == skipExperimentKey {
 			continue
 		}
+		if pending.captureFirst {
+			// A drop whose owed-exposure capture has not landed: folding it
+			// would delete the record entry before the replay source exists.
+			// It waits for the retry cycle's capture attempt.
+			continue
+		}
 		stored, hasStored := record.Entries[pending.experimentKey]
 		if pending.drop {
 			if hasStored && stored.FetchedAtMS > pending.asOf {
@@ -1614,6 +1647,21 @@ func (e *experimentsState) retryDurableSync() {
 	if len(e.durablePending) == 0 {
 		return
 	}
+	// Capture-gated drops first: re-attempt the durable owed-exposure
+	// capture for every pair whose capture has not landed. Success — or
+	// nothing left to capture (the live sweep delivered the facts, or the
+	// snapshots were discarded) — releases the gate so the drop converges
+	// below; failure keeps the pair owed and the record intact.
+	for intentKey, pending := range e.durablePending {
+		if !pending.captureFirst {
+			continue
+		}
+		owed := e.pendingExposure[pending.experimentKey]
+		if len(owed) == 0 || e.captureOwedDropFn == nil || e.captureOwedDropFn(pending.experimentKey, owed) {
+			pending.captureFirst = false
+			e.durablePending[intentKey] = pending
+		}
+	}
 	// Current-scope intents: one folded save.
 	if subject := e.currentSubjectIDLocked(); subject != "" {
 		scope := e.scopeForLocked(subject)
@@ -1645,6 +1693,11 @@ func (e *experimentsState) retryDurableSync() {
 		}
 		if !pending.drop {
 			delete(e.durablePending, intentKey)
+			continue
+		}
+		if pending.captureFirst {
+			// The capture gate above could not release this pair yet: the
+			// retired record keeps its entry until the replay source lands.
 			continue
 		}
 		foreignScopes[pending.scope] = append(foreignScopes[pending.scope], intentKey)
@@ -1771,10 +1824,14 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 		}
 		return false, false, false
 	}
-	if outcome.authoritative {
-		// An authoritative, authorized outcome of a post-latch fetch (the
+	if outcome.authoritative && !outcome.transient {
+		// An authoritative, authorized VERDICT of a post-latch fetch (the
 		// epoch gate above guarantees that) proves the credential works
-		// again: unlatch and let revalidation resume.
+		// again: unlatch and let revalidation resume. The unexpected-status
+		// class (authoritative for FENCE ordering, transient for
+		// everything else) is excluded: the fleet contract pins the latch
+		// invariant in both directions — a stray 409 neither latches nor
+		// unlatches.
 		e.authBlocked = false
 	}
 	if outcome.transient {
@@ -1809,10 +1866,21 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 		// in memory — durably capture those owed facts FIRST, so a process
 		// death before the next sweep replays them from the spool instead of
 		// losing real treatment. Queue-full-without-drop stays memory-only
-		// by design; only the delete triggers capture.
+		// by design; only the delete triggers capture. A capture that could
+		// NOT be made durable (spool persist failure) must not let the
+		// record delete outrun the replay source: the drop becomes an owed
+		// capture+delete PAIR — serving already stopped (the entry left
+		// memory above), the durable record stays intact, and the retry
+		// cycle re-attempts the capture before converging the record.
 		if e.captureOwedDropFn != nil {
 			if owed := e.pendingExposure[experimentKey]; len(owed) > 0 {
-				e.captureOwedDropFn(experimentKey, owed)
+				if !e.captureOwedDropFn(experimentKey, owed) {
+					e.durablePending[scopedIntentKey(scope, experimentKey)] = expOwedSync{
+						asOf: asOf, drop: true, scope: scope,
+						experimentKey: experimentKey, captureFirst: true,
+					}
+					return false, true, false
+				}
 			}
 		}
 		persisted := e.syncDurableEntryLocked(scope, experimentKey, asOf, false)
@@ -2255,6 +2323,16 @@ func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string
 			if !e.reminted {
 				e.reminted = true
 				_, persisted := e.adoptMintedSubjectIDLocked()
+				if !persisted {
+					// The OLD subject file may outlive this process (the
+					// replace failed): durably condemn the OLD scope's
+					// record, or a crash would let the next launch preload
+					// and SERVE the server-rejected subject's assignments
+					// (its wire self-heal only fixes fetches, not the
+					// stale serving in between). The tombstone spends when
+					// any fresh save replaces the record.
+					e.writeCondemnationTombstoneLocked(scope)
+				}
 				e.mu.Unlock()
 				c.logf("shardpilot experiments: the server rejected the persisted subject id's grammar; re-minted once and retrying (the subject re-buckets, fresh-install semantics)")
 				if !persisted {

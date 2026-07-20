@@ -477,10 +477,18 @@ func (c *Client) purgeWithdrawnExperimentFacts() {
 	e := c.exp
 	e.emitMu.Lock()
 	c.lifecycleMu.Lock()
-	c.expFactPurgeEpoch.Add(1)
 	removedQueued := c.queue.filter(func(event Event) bool {
 		return !isWithdrawnExperimentFactEvent(event)
 	})
+	// The epoch bumps AFTER the queue drain: bumping first opens a TOCTOU
+	// window where a worker dispatch point observes the new epoch against
+	// an empty batch (advancing its seen mark), then receives a withdrawn
+	// fact the filter had not drained yet — the fact would ride under a
+	// matching seen epoch, unfiltered. Bumped after, any fact a worker
+	// stole from the queue mid-drain was pulled under the OLD epoch: its
+	// next dispatch point observes the move and filters the batch before
+	// any send.
+	c.expFactPurgeEpoch.Add(1)
 	c.lifecycleMu.Unlock()
 	e.emitMu.Unlock()
 	var removedSpooled []spoolEntry
@@ -590,9 +598,11 @@ func filterWithdrawnFromBatchRequest(request batchRequest) (batchRequest, int) {
 // Lock discipline: runs under e.mu, so it takes NO client lock (the fact
 // and envelope builders are lock-free; the spool's mutex is a leaf) and
 // DEFERS integrator dead-letter callbacks to the next off-lock drain.
-func (c *Client) captureOwedExposuresForDrop(experimentKey string, owed []*expOwedExposure) {
+func (c *Client) captureOwedExposuresForDrop(experimentKey string, owed []*expOwedExposure) bool {
 	if c.spool == nil {
-		return
+		// Memory-only client: no durable capture exists to gate on — the
+		// documented ephemeral posture.
+		return true
 	}
 	events := make([]Event, 0, len(owed))
 	for _, snapshot := range owed {
@@ -606,26 +616,30 @@ func (c *Client) captureOwedExposuresForDrop(experimentKey string, owed []*expOw
 		events = append(events, event)
 	}
 	if len(events) == 0 {
-		return
+		return true
 	}
 	request, err := c.buildBatch(events)
 	if err != nil {
-		return
+		return true // unbuildable facts have no capturable form
 	}
 	eligible, refusedActors := c.partitionSpoolEligible(request)
 	if len(refusedActors) > 0 {
 		c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropConsent, refusedActors))
 	}
 	if len(eligible) == 0 {
-		return
+		return true
 	}
 	s := c.spool
 	refused, added, expired, evicted, persistFailed := s.append(eligible, 0, false, c.clock.Now(), func() bool {
 		return c.consent.Load() == consentStateGranted && s.grantPersisted
 	})
 	if refused {
+		// A POLICY refusal (non-grant / owed-wipe write gate): the spool's
+		// documented posture is dead-letter-instead-of-disk, and gating the
+		// record delete on a state only a consent change can open would
+		// hold the kill's durable side hostage indefinitely.
 		c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropConsent, eligible))
-		return
+		return true
 	}
 	if len(expired) > 0 {
 		c.stats.spoolExpired.Add(uint64(len(expired)))
@@ -639,8 +653,13 @@ func (c *Client) captureOwedExposuresForDrop(experimentKey string, owed []*expOw
 		c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropCapacity, evicted))
 	}
 	if persistFailed {
+		// MECHANICAL failure: the facts sit in the spool mirror but not
+		// durably on disk — the caller keeps the record intact and retries
+		// the capture+delete pair.
 		c.recordSpoolPersistFailure()
+		return false
 	}
+	return true
 }
 
 // deferSpoolLetter queues a dead-letter for the next off-lock drain point —

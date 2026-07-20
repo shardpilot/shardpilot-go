@@ -1397,11 +1397,13 @@ func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned b
 		// (it was in transport when the sentinel arrived): its withdrawn
 		// experiment facts must not be written back into the pipeline the
 		// purge just cleaned. Re-filter at respool time; the surviving
-		// members keep their exact bytes.
+		// members keep their exact bytes. Deliberately NOT counted in
+		// Stats.Dropped here: the same events still sit in the worker's
+		// retained batch on the retriable path, and the worker-batch filter
+		// counts them exactly once at its next dispatch point.
 		filtered, removed := filterWithdrawnFromBatchRequest(request)
 		if removed > 0 {
 			request = filtered
-			c.stats.dropped.Add(uint64(removed))
 			c.logf("shardpilot experiments: withheld %d withdrawn experiment fact(s) from a post-sentinel respool", removed)
 		}
 	}
