@@ -121,13 +121,26 @@
     from the proof even when the state string matches: a strictly newer in-scope
     receipt promotes an UNPROVEN same-state grant record to the floor-marked,
     receipt-stamped one instead of discarding a grant whose durable proof exists.
-    The sanitizer also drops receipts whose `decided_at` does not parse (corrupt
-    data must never become reload truth), and a FLOOR-MARKED `consent.json`
-    whose `decided_at` is missing or unparsable reads as ABSENT, fail-closed:
-    floor-authored records always carry the stamp the ordering rule runs on, so
-    an unorderable one must not let a stale grant beat a durable newer deny
-    receipt (legacy unmarked records keep loading stampless — their grants are
-    already vetted by provenance, their denials honored). Foreign receipts retained in
+    The sanitizer also drops receipts whose `decided_at` does not parse, whose
+    `reason` is not the one value this SDK mints (`denied_forced_minor`, and
+    only on DENIALS — a grant claiming it is a self-contradiction), or whose
+    idempotency key duplicates an earlier entry (keep-FIRST: the ingest
+    service de-duplicates by key and honors the first body it saw, so a later
+    conflicting body could never take effect server-side) — corrupt data must
+    never become reload truth. A FLOOR-MARKED `consent.json` whose
+    `decided_at` is missing or unparsable fails closed PER FLAVOR: a corrupt
+    GRANT reads as ABSENT (an unorderable grant must not beat a durable newer
+    deny receipt), while a corrupt DENIAL is PRESERVED as
+    denied-with-unknown-stamp — read as absent, a stale retained grant
+    receipt would apply unconditionally and reopen the floor against a
+    durable denial — and is never superseded by comparison. LEGACY unmarked
+    records keep loading stampless, with the ordering rule they predate made
+    explicit: a validly-stamped in-scope proof receipt supersedes a legacy
+    record in BOTH directions (a denial proof heals denied over a legacy
+    grant that provenance would otherwise strand as undecided — losing the
+    denial — and a grant proof heals a floor-marked grant over a legacy
+    denial); with no stamped proof retained, provenance vets legacy grants
+    and legacy denials stay honored. Foreign receipts retained in
     a reused `SpoolDir` are never dispatched with this client's scoped bearer — a
     terminal 401/403 would prune ANOTHER scope's consent receipt — they stay retained
     for a correctly scoped client while this client's own trail dispatches around

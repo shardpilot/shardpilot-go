@@ -144,22 +144,6 @@ func loadConsentRecordInfo(dir, actorDigest string) (consentRecordInfo, bool) {
 	if record.ActorDigest != actorDigest {
 		return none, false
 	}
-	if record.Floor {
-		// A floor-authored record ALWAYS carries its decision's stamp (the
-		// save writes both fields together), and the stamp is what orders the
-		// record against retained receipts at reload. A floor-marked record
-		// whose decided_at is empty or unparsable is corrupt — the
-		// strictly-newer compare can never run against it, so a stale grant
-		// would beat a durable newer deny receipt purely because the file was
-		// damaged. Unusable is ABSENT, fail-closed: the reload falls through
-		// to the receipt trail (whose proof then applies unconditionally) or
-		// starts undecided. Legacy records (no floor mark) keep loading with
-		// their empty stamp: the provenance rule already vets their grants,
-		// and their denials are honored — the fail-closed direction.
-		if _, err := time.Parse(time.RFC3339Nano, record.DecidedAt); err != nil {
-			return none, false
-		}
-	}
 	info := consentRecordInfo{decidedAt: record.DecidedAt, floor: record.Floor}
 	switch record.ConsentAnalytics {
 	case "granted":
@@ -170,6 +154,35 @@ func loadConsentRecordInfo(dir, actorDigest string) (consentRecordInfo, bool) {
 		info.state = ConsentDeniedForcedMinor
 	default:
 		return none, false
+	}
+	if record.Floor {
+		// A floor-authored record ALWAYS carries its decision's stamp (the
+		// save writes both fields together), and the stamp is what orders
+		// the record against retained receipts at reload. A floor-marked
+		// record whose decided_at is empty or unparsable is corrupt — the
+		// strictly-newer compare can never run against it — and the two
+		// decision flavors fail in OPPOSITE directions:
+		//   - a corrupt-stamped GRANT reads as ABSENT: kept, an unorderable
+		//     grant would beat a durable newer deny receipt purely because
+		//     the file was damaged (fail-closed = no grant);
+		//   - a corrupt-stamped DENIAL is PRESERVED as denied with the
+		//     garbled stamp cleared (denied-with-unknown-stamp): read as
+		//     absent, a stale retained grant receipt would apply
+		//     unconditionally and reopen the floor against a durable denial
+		//     (fail-closed = keep the denial). The cleared stamp keeps the
+		//     record un-overridable by comparison — floor-marked stampless
+		//     is never superseded, unlike the legacy stampless shape — and
+		//     the next decision or trail heal rewrites it whole.
+		// Legacy records (no floor mark) keep loading with their empty
+		// stamp: the provenance rule vets their grants, their denials are
+		// honored, and a validly-stamped in-scope proof supersedes them in
+		// both directions (they predate the stamping build).
+		if _, err := time.Parse(time.RFC3339Nano, record.DecidedAt); err != nil {
+			if info.state == ConsentGranted {
+				return none, false
+			}
+			info.decidedAt = ""
+		}
 	}
 	return info, true
 }

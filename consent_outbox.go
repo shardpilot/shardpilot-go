@@ -135,6 +135,22 @@ func sanitizeConsentReceipt(entry consentReceipt) (consentReceipt, bool) {
 	if entry.AnonymousID != "" && !validConsentIdentifier(entry.AnonymousID) {
 		return consentReceipt{}, false
 	}
+	switch entry.Reason {
+	case "":
+	case consentDecisionReason:
+		// The only reason this SDK ever mints, and only on DENIALS: a
+		// "granted" receipt claiming a forced-minor denial reason is a
+		// contradiction no decision path can produce — corrupt data,
+		// dropped fail-safe rather than re-sent as a self-contradictory
+		// consent statement.
+		if *entry.Categories.Analytics {
+			return consentReceipt{}, false
+		}
+	default:
+		// An unknown reason value is not a receipt this SDK could have
+		// written; dropped fail-safe like every unknown field shape.
+		return consentReceipt{}, false
+	}
 	if _, err := time.Parse(time.RFC3339Nano, entry.DecidedAt); err != nil {
 		// Every SDK-minted receipt carries a parseable stamp: a malformed
 		// decided_at is corrupt data, dropped fail-safe — persisted, it
@@ -309,11 +325,24 @@ func (o *consentOutbox) readRecordReceipts() []consentReceipt {
 		return nil
 	}
 	loaded := make([]consentReceipt, 0, len(record.Receipts))
+	seen := make(map[string]struct{}, len(record.Receipts))
 	for _, entry := range record.Receipts {
 		sanitized, ok := sanitizeConsentReceipt(entry)
 		if !ok {
 			continue
 		}
+		if _, dup := seen[sanitized.IdempotencyKey]; dup {
+			// Duplicate idempotency keys never come from this SDK (keys are
+			// minted once and the merging save de-duplicates); a corrupt or
+			// hand-edited record can carry them, possibly with DIFFERENT
+			// decision bodies. Keep the FIRST occurrence — the
+			// server-consistent choice: the ingest service de-duplicates by
+			// idempotency key and honors the first body it saw, answering
+			// replays with `replayed`, so a later conflicting body under the
+			// same key could never take effect server-side anyway.
+			continue
+		}
+		seen[sanitized.IdempotencyKey] = struct{}{}
 		loaded = append(loaded, sanitized)
 	}
 	return loaded
@@ -836,15 +865,19 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 		// last decision was a denial). The proof is the latest IN-SCOPE
 		// receipt — scanned newest→oldest, so a foreign receipt retained
 		// after it (another scope sharing the SpoolDir) can never hide it —
-		// and it may override ONLY when its decision is STRICTLY newer than
-		// the record's decision moment: the outbox can also hold a STALE
-		// receipt (acknowledged long ago, left on disk by a failed prune
-		// rewrite), and re-reading that must never flip the state back over
-		// a record persisted for a NEWER decision (deny record durable,
-		// deny receipt append failed, crash). With no record at all the
-		// proof restores its decision unconditionally.
+		// and it may override ONLY when it SUPERSEDES the record
+		// (consentReceiptSupersedesRecord): strictly newer than a stamped
+		// record — the outbox can also hold a STALE receipt (acknowledged
+		// long ago, left on disk by a failed prune rewrite), and re-reading
+		// that must never flip the state back over a record persisted for a
+		// NEWER decision (deny record durable, deny receipt append failed,
+		// crash) — while a LEGACY stampless record is provably older than
+		// any validly-stamped proof and yields in both directions, and a
+		// floor-marked stampless record (the preserved corrupt denial)
+		// never yields by comparison. With no record at all the proof
+		// restores its decision unconditionally.
 		if tail, ok := c.consentOutbox.latestMatching(c.consentReceiptInScope); ok &&
-			(!recordOK || consentReceiptNewerThanRecord(tail.DecidedAt, record.decidedAt)) {
+			(!recordOK || consentReceiptSupersedesRecord(tail.DecidedAt, record)) {
 			tailDecision := ConsentDecisionDenied
 			tailState := ConsentDenied
 			switch {
@@ -864,7 +897,7 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 			// and receipt as the same decision (no re-override churn); the
 			// trail-derived state is floor-proven by construction — its
 			// receipt exists.
-			staleStamp, staleOK := record.decidedAt, recordOK
+			staleRecord, staleOK := record, recordOK
 			state, recordOK = tailState, true
 			record = consentRecordInfo{state: tailState, decidedAt: tail.DecidedAt, floor: true}
 			if err := saveConsentRecord(c.cfg.SpoolDir, tailDecision, digest, tail.DecidedAt, true, rename, chmod); err != nil {
@@ -887,7 +920,7 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 					if !c.consentReceiptInScope(entry) {
 						return false
 					}
-					return !staleOK || consentReceiptNewerThanRecord(entry.DecidedAt, staleStamp)
+					return !staleOK || consentReceiptSupersedesRecord(entry.DecidedAt, staleRecord)
 				})
 				c.consentRecordApplyMu.Unlock()
 			}
@@ -1564,9 +1597,7 @@ func (c *Client) consentGrantPairIncomplete() bool {
 // Only then may the trail override the record at reload: a STALE receipt —
 // acknowledged long ago but re-read from an outbox rewrite that failed to
 // prune it — must never flip the state back over a record persisted for a
-// NEWER decision. A record without a stamp (legacy shape) or an unparsable
-// stamp is never overridden-by-comparison: fail toward the record, which
-// the provenance rule below already vets.
+// NEWER decision.
 func consentReceiptNewerThanRecord(receiptDecidedAt, recordDecidedAt string) bool {
 	if receiptDecidedAt == "" || recordDecidedAt == "" {
 		return false
@@ -1580,6 +1611,35 @@ func consentReceiptNewerThanRecord(receiptDecidedAt, recordDecidedAt string) boo
 		return false
 	}
 	return receiptAt.After(recordAt)
+}
+
+// consentReceiptSupersedesRecord decides whether an in-scope proof receipt
+// may override (and heal) the persisted record at reload. Three record
+// shapes, three rules:
+//   - STAMPED record: the proof must be STRICTLY newer
+//     (consentReceiptNewerThanRecord) — a stale acked-but-unpruned receipt
+//     never flips back a newer decision.
+//   - LEGACY stampless record (no floor mark): it predates the stamping
+//     build, so it is OLDER than any validly-stamped receipt BY DEFINITION —
+//     the proof supersedes it in BOTH directions (a grant proof heals a
+//     floor-marked grant over a legacy denial; a denial proof heals denied
+//     over a legacy grant that provenance would otherwise strand as
+//     undecided, losing the denial). With no validly-stamped in-scope proof
+//     retained, today's posture holds: provenance vets legacy grants,
+//     legacy denials are honored.
+//   - FLOOR-MARKED stampless record (the corrupt-stamped DENIAL shape
+//     loadConsentRecordInfo preserves): never superseded by comparison —
+//     the record is not provably old, and failing toward the denial is the
+//     fail-closed direction.
+func consentReceiptSupersedesRecord(receiptDecidedAt string, record consentRecordInfo) bool {
+	if record.decidedAt == "" {
+		if record.floor {
+			return false
+		}
+		_, err := time.Parse(time.RFC3339Nano, receiptDecidedAt)
+		return err == nil
+	}
+	return consentReceiptNewerThanRecord(receiptDecidedAt, record.decidedAt)
 }
 
 // recordDiscardedCloseRemnant accounts for the undelivered events a

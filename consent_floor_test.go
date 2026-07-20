@@ -3714,3 +3714,193 @@ func TestConsentOutboxOverCapLoadTrimLandsDurably(t *testing.T) {
 		t.Fatalf("expected no owed write on a within-cap record")
 	}
 }
+
+func TestConsentFloorCorruptStampFloorDenialStaysDenied(t *testing.T) {
+	// A floor-marked DENIED record with a garbled stamp must PRESERVE the
+	// denial (denied-with-unknown-stamp) — read as absent, a stale retained
+	// grant receipt would apply unconditionally and reopen the floor
+	// against a durable denial. Only corrupt-stamped GRANTS read as absent:
+	// the two flavors fail closed in opposite directions.
+	writeRecord := func(t *testing.T, dir, state, stamp string) {
+		t.Helper()
+		payload := []byte(fmt.Sprintf(`{"consent_analytics":%q,"actor_digest":%q,"decided_at":%q,"floor":true}`, state, spoolTestActorDigest(), stamp))
+		if err := os.WriteFile(consentRecordPath(dir), payload, 0o600); err != nil {
+			t.Fatalf("write consent record: %v", err)
+		}
+	}
+
+	// Unit shape: corrupt-stamped denials load as denied with the stamp
+	// cleared (both flavors); the corrupt-stamped grant stays absent.
+	unitDir := t.TempDir()
+	writeRecord(t, unitDir, "denied", "not-a-time")
+	if info, ok := loadConsentRecordInfo(unitDir, spoolTestActorDigest()); !ok || info.state != ConsentDenied || info.decidedAt != "" || !info.floor {
+		t.Fatalf("expected the corrupt-stamped denial preserved stampless, got (%+v, %v)", info, ok)
+	}
+	writeRecord(t, unitDir, "denied_forced_minor", "")
+	if info, ok := loadConsentRecordInfo(unitDir, spoolTestActorDigest()); !ok || info.state != ConsentDeniedForcedMinor || info.decidedAt != "" {
+		t.Fatalf("expected the corrupt-stamped forced-minor denial preserved, got (%+v, %v)", info, ok)
+	}
+	writeRecord(t, unitDir, "granted", "not-a-time")
+	if _, ok := loadConsentRecordInfo(unitDir, spoolTestActorDigest()); ok {
+		t.Fatalf("expected the corrupt-stamped grant absent (fail-closed)")
+	}
+
+	// Reload shape: corrupt-stamped denial PLUS a stale retained in-scope
+	// GRANT receipt — the floor-marked stampless record is never superseded
+	// by comparison, so the session stays denied while the receipt still
+	// delivers for the trail.
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+	dir := t.TempDir()
+	writeRecord(t, dir, "denied", "not-a-time")
+	planted := newConsentOutbox(dir)
+	if planted.append(testConsentReceipt("key-stale-grant-1", true)) {
+		t.Fatalf("seeding the stale grant receipt failed")
+	}
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	if got := client.Consent(); got != ConsentDenied {
+		t.Fatalf("expected the corrupt-stamped denial to rule the reload, got %v", got)
+	}
+	if err := client.Track(context.Background(), Event{Name: "e1"}); !errors.Is(err, ErrConsentDenied) {
+		t.Fatalf("expected the denial live, got %v", err)
+	}
+	waitFor(t, 3*time.Second, "the stale receipt still delivered for the trail", func() bool {
+		return state.consentCount() == 1
+	})
+	if got := client.Consent(); got != ConsentDenied {
+		t.Fatalf("expected the denial to survive the receipt delivery, got %v", got)
+	}
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestConsentFloorLegacyRecordSupersededByStampedProof(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// A LEGACY stampless record predates the stamping build: any
+	// validly-stamped in-scope proof supersedes it in BOTH directions.
+	writeLegacyRecord := func(t *testing.T, dir, decision string) {
+		t.Helper()
+		payload := []byte(fmt.Sprintf(`{"consent_analytics":%q,"actor_digest":%q}`, decision, spoolTestActorDigest()))
+		if err := os.WriteFile(consentRecordPath(dir), payload, 0o600); err != nil {
+			t.Fatalf("write consent record: %v", err)
+		}
+	}
+
+	// Legacy GRANT + durable denial proof: pre-fix the compare blocked the
+	// override and provenance stranded the floor UNDECIDED — losing the
+	// denial. The proof must heal denied.
+	deniedDir := t.TempDir()
+	writeLegacyRecord(t, deniedDir, "granted")
+	planted := newConsentOutbox(deniedDir)
+	if planted.append(testConsentReceipt("key-legacy-deny-1", false)) {
+		t.Fatalf("seeding the deny receipt failed")
+	}
+	deniedClient := newFloorTestClient(t, server.URL, deniedDir, nil)
+	if got := deniedClient.Consent(); got != ConsentDenied {
+		t.Fatalf("expected the stamped denial proof to supersede the legacy grant, got %v", got)
+	}
+	info, ok := loadConsentRecordInfo(deniedDir, spoolTestActorDigest())
+	if !ok || info.state != ConsentDenied || !info.floor || info.decidedAt != "2026-07-19T00:00:00Z" {
+		t.Fatalf("expected the record healed denied from the proof, got (%+v, %v)", info, ok)
+	}
+	if err := deniedClient.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Legacy DENIAL + durable later grant proof: the user's newest decision
+	// is the grant — the proof supersedes the legacy denial and heals a
+	// floor-marked grant.
+	grantedDir := t.TempDir()
+	writeLegacyRecord(t, grantedDir, "denied")
+	planted = newConsentOutbox(grantedDir)
+	if planted.append(testConsentReceipt("key-legacy-grant-1", true)) {
+		t.Fatalf("seeding the grant receipt failed")
+	}
+	grantedClient := newFloorTestClient(t, server.URL, grantedDir, nil)
+	if got := grantedClient.Consent(); got != ConsentGranted {
+		t.Fatalf("expected the stamped grant proof to supersede the legacy denial, got %v", got)
+	}
+	info, ok = loadConsentRecordInfo(grantedDir, spoolTestActorDigest())
+	if !ok || info.state != ConsentGranted || !info.floor {
+		t.Fatalf("expected the record healed to a floor-marked grant, got (%+v, %v)", info, ok)
+	}
+	waitFor(t, 3*time.Second, "the retained proofs delivered", func() bool {
+		return state.consentCount() == 2
+	})
+	if err := grantedClient.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestConsentOutboxDuplicateKeysKeepFirstAtLoad(t *testing.T) {
+	// Duplicate idempotency keys never come from this SDK; a corrupt or
+	// hand-edited record can carry them with DIFFERENT decision bodies. The
+	// load keeps the FIRST occurrence — the server-consistent choice: the
+	// ingest service de-duplicates by key and honors the first body it saw,
+	// so a later conflicting body could never take effect server-side.
+	dir := t.TempDir()
+	first := testConsentReceipt("key-dup-1", true)
+	conflicting := testConsentReceipt("key-dup-1", false)
+	conflicting.DecidedAt = "2026-07-19T01:00:00Z"
+	other := testConsentReceipt("key-uniq-1", false)
+	record := consentOutboxWire{Version: consentOutboxRecordVersion, Receipts: []consentReceipt{first, conflicting, other}}
+	payload, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("marshal seed record: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName), payload, 0o600); err != nil {
+		t.Fatalf("write seed record: %v", err)
+	}
+
+	outbox := newConsentOutbox(dir)
+	outbox.load(nil)
+	outbox.mu.Lock()
+	keys := make([]string, 0, len(outbox.receipts))
+	var firstKept *bool
+	for _, entry := range outbox.receipts {
+		keys = append(keys, entry.IdempotencyKey)
+		if entry.IdempotencyKey == "key-dup-1" {
+			firstKept = entry.Categories.Analytics
+		}
+	}
+	outbox.mu.Unlock()
+	if len(keys) != 2 || keys[0] != "key-dup-1" || keys[1] != "key-uniq-1" {
+		t.Fatalf("expected the duplicate dropped keep-first, got %v", keys)
+	}
+	if firstKept == nil || !*firstKept {
+		t.Fatalf("expected the FIRST body (the grant) kept for the duplicated key")
+	}
+}
+
+func TestConsentOutboxSanitizerRejectsInvalidReason(t *testing.T) {
+	// The only reason this SDK mints is denied_forced_minor, and only on
+	// denials: a grant carrying it is a self-contradictory statement, and
+	// an unknown reason is not a receipt this SDK could have written — both
+	// drop fail-safe rather than re-send.
+	grantWithReason := testConsentReceipt("key-reason-1", true)
+	grantWithReason.Reason = consentDecisionReason
+	if _, ok := sanitizeConsentReceipt(grantWithReason); ok {
+		t.Fatalf("expected a GRANT with the forced-minor reason dropped")
+	}
+	unknownReason := testConsentReceipt("key-reason-2", false)
+	unknownReason.Reason = "because"
+	if _, ok := sanitizeConsentReceipt(unknownReason); ok {
+		t.Fatalf("expected an unknown reason dropped")
+	}
+	forcedMinor := testConsentReceipt("key-reason-3", false)
+	forcedMinor.Reason = consentDecisionReason
+	if sanitized, ok := sanitizeConsentReceipt(forcedMinor); !ok || sanitized.Reason != consentDecisionReason {
+		t.Fatalf("expected the reasoned denial kept, got (%+v, %v)", sanitized, ok)
+	}
+	plainGrant := testConsentReceipt("key-reason-4", true)
+	if _, ok := sanitizeConsentReceipt(plainGrant); !ok {
+		t.Fatalf("expected the reasonless grant kept")
+	}
+	plainDenial := testConsentReceipt("key-reason-5", false)
+	if _, ok := sanitizeConsentReceipt(plainDenial); !ok {
+		t.Fatalf("expected the reasonless denial kept")
+	}
+}
