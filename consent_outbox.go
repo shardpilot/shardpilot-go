@@ -194,6 +194,37 @@ type consentOutbox struct {
 	deferUntil     time.Time
 	backoffAttempt int
 
+	// settledKeys remembers (bounded, FIFO) the idempotency keys THIS process
+	// removed from the outbox — acknowledged, terminally dropped, or
+	// cap-evicted — so the reload-and-merge save can never resurrect them
+	// from a stale on-disk copy written by another client sharing the
+	// directory (the same suppression discipline as diskSpool.settledIDs).
+	settledKeys map[string]struct{}
+	settledFIFO []string
+
+	// ownKeys marks the receipts THIS process appended (its own minted
+	// decisions). The merging save writes exactly: the fresh DISK view minus
+	// settled keys, plus own unsaved appends — a stale foreign copy in this
+	// mirror never flows back to the file, so a receipt its owner pruned
+	// concurrently stays pruned (the same no-foreign-writeback rule as the
+	// disk spool's mirror). Loaded entries are deliberately NOT own: the
+	// disk view refreshes them every save.
+	ownKeys map[string]struct{}
+
+	// recordOwedKeys marks retained receipts whose DECISION-RECORD write is
+	// still owed — the receipt's durable PAIR is incomplete. Tracked PER
+	// RECEIPT, not only in the client's single owed slot: the slot always
+	// holds the NEWEST owed decision, so a newer denial's failed record write
+	// would otherwise erase the fact that an earlier grant's record never
+	// landed — and the unmarked grant would dispatch and prune while the deny
+	// proof is held, making a grant the server's last word against a local
+	// denial. A marked receipt never dispatches; a SUCCESSFUL record write
+	// (always for the newest decision) clears every mark — the on-disk record
+	// is then at least as new as every marked receipt's decision, which
+	// settles each pair's crash story. In-memory only: after a crash the
+	// reload re-derives the owed state from record-vs-trail and re-marks.
+	recordOwedKeys map[string]struct{}
+
 	// renameFn/chmodFn are the file primitives, injectable so tests can
 	// exercise failed-write-never-evicts deterministically (the same seam
 	// discipline as diskSpool).
@@ -203,9 +234,37 @@ type consentOutbox struct {
 
 func newConsentOutbox(dir string) *consentOutbox {
 	return &consentOutbox{
-		dir:      dir,
-		renameFn: os.Rename,
-		chmodFn:  os.Chmod,
+		dir:            dir,
+		settledKeys:    make(map[string]struct{}),
+		ownKeys:        make(map[string]struct{}),
+		recordOwedKeys: make(map[string]struct{}),
+		renameFn:       os.Rename,
+		chmodFn:        os.Chmod,
+	}
+}
+
+// consentSettledMemory bounds the settled-key memory used to suppress
+// merge-resurrection (see settledKeys). Decisions are rare — the bound is
+// generous — and past it the oldest suppression is forgotten: a very old key
+// could then be resurrected by a stale sibling write, which degrades to
+// at-least-once delivery (the server de-duplicates by idempotency key).
+const consentSettledMemory = 256
+
+// recordSettledLocked remembers a key this process removed from the outbox
+// so a merging save does not resurrect it (bounded FIFO). Must be called
+// with mu held.
+func (o *consentOutbox) recordSettledLocked(key string) {
+	if key == "" {
+		return
+	}
+	if _, exists := o.settledKeys[key]; exists {
+		return
+	}
+	o.settledKeys[key] = struct{}{}
+	o.settledFIFO = append(o.settledFIFO, key)
+	if len(o.settledFIFO) > consentSettledMemory {
+		delete(o.settledKeys, o.settledFIFO[0])
+		o.settledFIFO = o.settledFIFO[1:]
 	}
 }
 
@@ -220,27 +279,30 @@ func (o *consentOutbox) filePath() string {
 	return filepath.Join(o.dir, consentOutboxFileName)
 }
 
-// load reads the durable record into the mirror at construction: sanitized,
-// capped, oldest first. A file that is missing, over the bounded read
-// limit, unparseable, or of an unknown version loads as EMPTY — corrupt
-// state is a clean start, never a crash into the host — and a wholly
-// garbled record is simply overwritten by the next save.
-func (o *consentOutbox) load() {
+// readRecordReceipts best-effort parses the current on-disk record WITHOUT
+// adopting it: bounded read, sanitized entries in file order. Used by load
+// at construction and by the merging save to see a sibling writer's view
+// (it touches no guarded state, so it is safe with or without mu held). A
+// file that is missing, unreadable, over the read limit, unparseable, or of
+// an unknown version reads as EMPTY — corrupt state is a clean start, never
+// a crash into the host — and a wholly garbled record is simply overwritten
+// by the next save.
+func (o *consentOutbox) readRecordReceipts() []consentReceipt {
 	if !o.durable() {
-		return
+		return nil
 	}
 	file, err := os.Open(o.filePath())
 	if err != nil {
-		return
+		return nil
 	}
 	data, err := io.ReadAll(io.LimitReader(file, consentOutboxReadLimit+1))
 	_ = file.Close()
 	if err != nil || len(data) > consentOutboxReadLimit {
-		return
+		return nil
 	}
 	var record consentOutboxWire
 	if json.Unmarshal(data, &record) != nil || record.Version != consentOutboxRecordVersion {
-		return
+		return nil
 	}
 	loaded := make([]consentReceipt, 0, len(record.Receipts))
 	for _, entry := range record.Receipts {
@@ -250,65 +312,129 @@ func (o *consentOutbox) load() {
 		}
 		loaded = append(loaded, sanitized)
 	}
+	return loaded
+}
+
+// load reads the durable record into the mirror at construction: sanitized,
+// capped, oldest first. Entries matching own (nil: every entry) are adopted
+// as THIS process's — its trail from a previous run, which its merging
+// saves keep writing back even when a disk re-read transiently fails —
+// while the rest stay foreign: refreshed from the fresh disk view on every
+// save, never written back from this mirror, so their owner's concurrent
+// prune is honored.
+func (o *consentOutbox) load(own func(consentReceipt) bool) {
+	if !o.durable() {
+		return
+	}
+	loaded := o.readRecordReceipts()
+	o.mu.Lock()
 	evicted := 0
 	for len(loaded) > maxConsentOutboxEntries {
 		// The cap trims OLDEST first at load exactly as it does on save: an
 		// over-cap legacy record keeps its NEWEST receipts — the newest
 		// decisions are the operative ones, and dropping them instead would
-		// resend only stale history.
+		// resend only stale history. The trim is settled so the next merging
+		// save does not re-adopt (and re-count) the same entries from the
+		// still-over-cap file.
+		o.recordSettledLocked(loaded[0].IdempotencyKey)
 		loaded = loaded[1:]
 		evicted++
 	}
-	o.mu.Lock()
+	for _, entry := range loaded {
+		if own == nil || own(entry) {
+			o.ownKeys[entry.IdempotencyKey] = struct{}{}
+		}
+	}
 	o.receipts = loaded
 	o.evictedSinceSave += evicted
 	o.mu.Unlock()
 }
 
-// saveLocked rewrites consent-outbox.json from the mirror: sanitize, evict
-// oldest past the cap (the mirror ADOPTS the trimmed list — the newest
-// decisions are the operative ones), atomic private write. On failure
-// nothing is evicted and nothing partially succeeds: the mirror stays
-// authoritative, dirty marks the owed write, and the caller counts the
-// failure. Must be called with mu held.
+// saveLocked rewrites consent-outbox.json with RELOAD-AND-MERGE semantics
+// (the diskSpool.saveLocked discipline): the current on-disk record is
+// re-read and unioned with the mirror by idempotency key — disk entries
+// first (the older, already-persisted view), minus the keys this process
+// settled — then the cap re-applied oldest-drop on the merged list, atomic
+// private write. One floor client per SpoolDir is the supported topology;
+// the merge is the safety net that keeps a sibling writer's undelivered
+// receipts (appended after this process loaded) from being clobbered by a
+// mirror-only rewrite, honoring the preserve-foreign model at the FILE
+// level too. Cross-process races thereby shrink to last-writer-wins over a
+// merged view: a receipt a sibling settled concurrently can resurrect and
+// re-send, which the server de-duplicates by idempotency key. On SUCCESS
+// the mirror adopts the merged view (foreign entries ride exactly as a
+// load would have adopted them: retained, never dispatched out of scope)
+// and cap evictions settle so a stale sibling write cannot resurrect them.
+// On failure nothing is evicted, settled, or adopted — the mirror stays
+// authoritative past the cap, dirty marks the owed write, and the caller
+// counts the failure; evict-and-retry on failure is forbidden: it could
+// turn a transient failure into a "successfully written" smaller record,
+// silently dropping a receipt while reporting success. Must be called with
+// mu held.
 func (o *consentOutbox) saveLocked() error {
-	kept := make([]consentReceipt, 0, len(o.receipts))
+	seen := make(map[string]struct{}, len(o.receipts))
+	merged := make([]consentReceipt, 0, len(o.receipts))
+	for _, entry := range o.readRecordReceipts() {
+		if _, settled := o.settledKeys[entry.IdempotencyKey]; settled {
+			continue
+		}
+		if _, dup := seen[entry.IdempotencyKey]; dup {
+			continue
+		}
+		seen[entry.IdempotencyKey] = struct{}{}
+		merged = append(merged, entry)
+	}
 	for _, entry := range o.receipts {
 		sanitized, ok := sanitizeConsentReceipt(entry)
 		if !ok {
 			continue
 		}
-		kept = append(kept, sanitized)
+		if _, own := o.ownKeys[sanitized.IdempotencyKey]; !own {
+			// Only entries THIS process appended flow from the mirror to the
+			// file; a foreign entry rides the fresh disk view above or not at
+			// all — a stale mirror copy must not resurrect a receipt its
+			// owner pruned since this process loaded it.
+			continue
+		}
+		if _, dup := seen[sanitized.IdempotencyKey]; dup {
+			continue
+		}
+		seen[sanitized.IdempotencyKey] = struct{}{}
+		merged = append(merged, sanitized)
 	}
-	evicted := 0
-	for len(kept) > maxConsentOutboxEntries {
-		kept = kept[1:]
-		evicted++
+	var evictKeys []string
+	for len(merged) > maxConsentOutboxEntries {
+		evictKeys = append(evictKeys, merged[0].IdempotencyKey)
+		merged = merged[1:]
+	}
+	settleEvictions := func() {
+		for _, key := range evictKeys {
+			o.recordSettledLocked(key)
+			delete(o.recordOwedKeys, key)
+			delete(o.ownKeys, key)
+		}
+		o.evictedSinceSave += len(evictKeys)
 	}
 	if !o.durable() {
-		// No durable backend: the trimmed mirror is all there is. The cap
-		// still applies (the outbox is bounded in every mode), and dirty
-		// stays false — there is no write to owe.
-		o.receipts = kept
-		o.evictedSinceSave += evicted
+		// No durable backend: the trimmed mirror is all there is (and the
+		// disk view above was empty). The cap still applies — the outbox is
+		// bounded in every mode — and dirty stays false: there is no write
+		// to owe.
+		o.receipts = merged
+		settleEvictions()
 		return nil
 	}
-	record := consentOutboxWire{Version: consentOutboxRecordVersion, Receipts: kept}
+	record := consentOutboxWire{Version: consentOutboxRecordVersion, Receipts: merged}
 	payload, err := json.Marshal(record)
 	if err == nil {
 		err = writePrivateFileAtomic(o.filePath(), payload, o.renameFn, o.chmodFn)
 	}
 	if err != nil {
-		// Failed write: NEVER evict, never partially succeed. The mirror —
-		// including entries past the cap — keeps ruling the process and the
-		// write is owed. Evict-and-retry on failure is forbidden: it could
-		// turn a transient failure into a "successfully written" smaller
-		// record, silently dropping a receipt while reporting success.
 		o.dirty = true
 		return err
 	}
-	o.receipts = kept
-	o.evictedSinceSave += evicted
+	o.receipts = merged
+	settleEvictions()
 	o.dirty = false
 	return nil
 }
@@ -319,6 +445,10 @@ func (o *consentOutbox) saveLocked() error {
 func (o *consentOutbox) append(receipt consentReceipt) (persistFailed bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	// Own BEFORE saving: the merging save writes exactly the disk view plus
+	// this process's own unsaved appends, and the fresh entry is not on disk
+	// yet.
+	o.ownKeys[receipt.IdempotencyKey] = struct{}{}
 	o.receipts = append(o.receipts, receipt)
 	return o.saveLocked() != nil
 }
@@ -400,6 +530,14 @@ func (o *consentOutbox) prune(idempotencyKey string) (persistFailed bool) {
 		if entry.IdempotencyKey != idempotencyKey {
 			continue
 		}
+		// Settle the key FIRST: the merging save re-reads the on-disk record,
+		// which still carries this receipt until the rewrite lands, and an
+		// unsettled key would simply resurrect through the merge. Settling
+		// also survives a failed rewrite — the next successful save excludes
+		// it — and clears any stale record-owed/own mark with the entry.
+		o.recordSettledLocked(idempotencyKey)
+		delete(o.recordOwedKeys, idempotencyKey)
+		delete(o.ownKeys, idempotencyKey)
 		pruned := make([]consentReceipt, 0, len(o.receipts)-1)
 		pruned = append(pruned, o.receipts[:i]...)
 		pruned = append(pruned, o.receipts[i+1:]...)
@@ -407,6 +545,50 @@ func (o *consentOutbox) prune(idempotencyKey string) (persistFailed bool) {
 		return o.saveLocked() != nil
 	}
 	return false
+}
+
+// markRecordOwed marks one retained receipt's decision-record write as owed
+// (see recordOwedKeys): the receipt holds from dispatch until a successful
+// record write settles every pair.
+func (o *consentOutbox) markRecordOwed(idempotencyKey string) {
+	if idempotencyKey == "" {
+		return
+	}
+	o.mu.Lock()
+	o.recordOwedKeys[idempotencyKey] = struct{}{}
+	o.mu.Unlock()
+}
+
+// markRecordOwedWhere marks every retained receipt matching the predicate
+// (the reload uses it after a failed heal: every in-scope receipt newer than
+// the stale on-disk record describes a decision that record does not cover).
+func (o *consentOutbox) markRecordOwedWhere(match func(consentReceipt) bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for _, entry := range o.receipts {
+		if match(entry) {
+			o.recordOwedKeys[entry.IdempotencyKey] = struct{}{}
+		}
+	}
+}
+
+// clearRecordOwedMarks drops every record-owed mark: a decision-record write
+// just SUCCEEDED, and the record always describes the newest decision — at
+// least as new as every marked receipt's — so no retained receipt's pair is
+// incomplete anymore.
+func (o *consentOutbox) clearRecordOwedMarks() {
+	o.mu.Lock()
+	o.recordOwedKeys = make(map[string]struct{})
+	o.mu.Unlock()
+}
+
+// recordOwedFor reports whether a receipt's decision-record write is still
+// owed (per-receipt; see recordOwedKeys).
+func (o *consentOutbox) recordOwedFor(idempotencyKey string) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	_, owed := o.recordOwedKeys[idempotencyKey]
+	return owed
 }
 
 // nextDispatchable returns the oldest retained receipt IN SCOPE — the one
@@ -571,7 +753,10 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 		c.logf("shardpilot consent floor: the state directory could not be made private (0700); persisted floor state is not loaded and the floor starts undecided with an empty outbox: %v", err)
 		return
 	}
-	c.consentOutbox.load()
+	// In-scope entries load as this client's OWN trail (its previous run's
+	// receipts, kept written back by every merging save); foreign entries
+	// stay disk-refreshed so a sibling scope's own prunes are honored.
+	c.consentOutbox.load(c.consentReceiptInScope)
 	c.drainConsentOutboxEvictions()
 	if err := c.validateConsentFloorIdentity(); err != nil {
 		// The identity contract holds at RELOAD exactly as at decision
@@ -630,6 +815,7 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 			// and receipt as the same decision (no re-override churn); the
 			// trail-derived state is floor-proven by construction — its
 			// receipt exists.
+			staleStamp, staleOK := record.decidedAt, recordOK
 			state, recordOK = tailState, true
 			record = consentRecordInfo{state: tailState, decidedAt: tail.DecidedAt, floor: true}
 			if err := saveConsentRecord(c.cfg.SpoolDir, tailDecision, digest, tail.DecidedAt, true, rename, chmod); err != nil {
@@ -642,8 +828,18 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 				// denial — a crash after that would restore the stale
 				// pre-denial record. The retry at every dispatch point
 				// heals it exactly like a live decision's failed write.
+				// Marked PER RECEIPT too: every in-scope receipt the stale
+				// on-disk record does not cover holds from dispatch until
+				// the heal lands, so a later live decision's failed write
+				// overwriting the single owed slot cannot release them.
 				c.consentRecordApplyMu.Lock()
 				c.setConsentRecordOwed(tailDecision, tail.DecidedAt, false)
+				c.consentOutbox.markRecordOwedWhere(func(entry consentReceipt) bool {
+					if !c.consentReceiptInScope(entry) {
+						return false
+					}
+					return !staleOK || consentReceiptNewerThanRecord(entry.DecidedAt, staleStamp)
+				})
 				c.consentRecordApplyMu.Unlock()
 			}
 		}
@@ -757,14 +953,23 @@ type consentOwedRecord struct {
 // with a spool (memory-only floors have no record at all).
 func (c *Client) setConsentRecordOwed(decision ConsentDecision, decidedAt string, persisted bool) {
 	c.consentOwedMu.Lock()
-	defer c.consentOwedMu.Unlock()
 	// SpoolDir (not c.spool) is the durability truth: the reload registers
 	// a failed HEAL as owed before the spool object exists.
 	if persisted || c.cfg.SpoolDir == "" {
 		c.consentRecordOwed = nil
+		c.consentOwedMu.Unlock()
+		if persisted && c.consentOutbox != nil {
+			// The record write SUCCEEDED, and the record always describes the
+			// newest decision: every retained receipt's pair is settled, so
+			// the per-receipt holds release (see recordOwedKeys — the slot
+			// alone cannot carry them: a newer decision's failure overwrites
+			// it, which must not erase an older receipt's incomplete pair).
+			c.consentOutbox.clearRecordOwedMarks()
+		}
 		return
 	}
 	c.consentRecordOwed = &consentOwedRecord{decision: decision, decidedAt: decidedAt}
+	c.consentOwedMu.Unlock()
 }
 
 // consentRecordOwedSnapshot reads the owed slot (nil when nothing is owed).
@@ -815,6 +1020,94 @@ func (c *Client) retryOwedConsentRecord() {
 	// back into the client (a retried denial purge is normally empty — the
 	// original purge already condemned and reported the entries).
 	c.emitSpoolDeadLetters(deadLetters)
+}
+
+// consentOwedMint is a decision whose receipt could not even be MINTED (the
+// idempotency-key mint failed — crypto randomness unavailable): the decision
+// applied locally, but its receipt is OWED, never "provably never coming".
+// Only the truly actorless local-only path (no configured UserID or
+// AnonymousID) is sanctioned to persist a decision without a receipt; a
+// mint failure for a CONFIGURED actor behaves like a failed append instead
+// — the grant record is withheld, Close pends (ErrConsentPending), and the
+// mint retries at every dispatch point. The slot holds the NEWEST decision
+// only: a newer decision that mints successfully supersedes it — appending
+// the older receipt after the newer one would break the trail's
+// append-order = decision-order invariant, and the superseded decision was
+// never durable anywhere, exactly like a failed append lost to a crash.
+type consentOwedMint struct {
+	decision         ConsentDecision
+	analyticsGranted bool
+	reason           string
+	decidedAt        string
+}
+
+// setConsentMintOwed stores (or, with nil, clears) the owed-mint slot.
+func (c *Client) setConsentMintOwed(owed *consentOwedMint) {
+	c.consentOwedMu.Lock()
+	c.consentMintOwed = owed
+	c.consentOwedMu.Unlock()
+}
+
+// consentMintOwedSnapshot reads the owed-mint slot (nil when nothing is
+// owed).
+func (c *Client) consentMintOwedSnapshot() *consentOwedMint {
+	c.consentOwedMu.Lock()
+	defer c.consentOwedMu.Unlock()
+	return c.consentMintOwed
+}
+
+// consentMintID mints a receipt idempotency key through the injectable seam
+// (tests exercise mint failure deterministically); nil means uuidv7.
+func (c *Client) consentMintID() (string, error) {
+	c.consentOwedMu.Lock()
+	mint := c.consentMintIDFn
+	c.consentOwedMu.Unlock()
+	if mint == nil {
+		return uuidv7.New()
+	}
+	return mint()
+}
+
+// retryOwedConsentMint re-attempts an OWED receipt mint at a dispatch point
+// — every dispatch point is a mint retry point exactly as it is a
+// persistence retry point. On success the receipt appends (its stamp, flavor
+// and reason are the ORIGINAL decision's; only the idempotency key is fresh
+// — no receipt with the old key can exist anywhere, the mint never produced
+// one) and, when the decision's record write is still owed (a mint-failed
+// GRANT withholds its record), the fresh receipt is marked pair-incomplete
+// so it holds from dispatch until the record lands. The record-apply lock is
+// TRY-locked like the owed-record retry: an opportunistic retry never makes
+// the dispatch path wait out a live decision.
+func (c *Client) retryOwedConsentMint() {
+	if !c.consentFloorEnabled() {
+		return
+	}
+	if c.consentMintOwedSnapshot() == nil {
+		return
+	}
+	if !c.consentRecordApplyMu.TryLock() {
+		return
+	}
+	defer c.consentRecordApplyMu.Unlock()
+	owed := c.consentMintOwedSnapshot()
+	if owed == nil {
+		return
+	}
+	receipt, minted, err := c.mintConsentReceipt(owed.analyticsGranted, owed.reason, owed.decidedAt)
+	if err != nil || !minted {
+		// Still failing (the configured actor cannot vanish — cfg is
+		// static); the slot stays owed for the next dispatch point.
+		return
+	}
+	c.setConsentMintOwed(nil)
+	if c.consentOutbox.append(receipt) {
+		c.recordConsentOutboxPersistFailure()
+	}
+	c.drainConsentOutboxEvictions()
+	if owedRecord := c.consentRecordOwedSnapshot(); owedRecord != nil && owedRecord.decidedAt == owed.decidedAt {
+		c.consentOutbox.markRecordOwed(receipt.IdempotencyKey)
+	}
+	c.wakeConsentDispatch()
 }
 
 // consentDenyProofHeld reports whether this receipt must stay retained
@@ -903,6 +1196,10 @@ func (c *Client) dispatchConsentReceipts(ctx context.Context) map[string]struct{
 		return nil
 	}
 	o := c.consentOutbox
+	// The mint retry runs FIRST: a recovered mint appends its receipt, and
+	// the outbox/record retries just below then settle that append's write
+	// and its withheld record in the same pass.
+	c.retryOwedConsentMint()
 	if attempted, failed := o.retryPersist(); attempted {
 		if failed {
 			c.recordConsentOutboxPersistFailure()
@@ -925,6 +1222,29 @@ func (c *Client) dispatchConsentReceipts(ctx context.Context) map[string]struct{
 		}
 		receipt, ok := o.nextDispatchable(c.consentReceiptInScope)
 		if !ok {
+			return handed
+		}
+		if o.recordOwedFor(receipt.IdempotencyKey) {
+			// THIS receipt's own decision-record write is still owed — its
+			// durable pair is incomplete, PER RECEIPT: the client's single
+			// owed slot tracks only the newest decision, so a retained older
+			// grant whose record never landed must not lose its hold when a
+			// newer denial's failed record write overwrites the slot — it
+			// would dispatch and prune while the deny proof is held, making
+			// a grant the server's last word against a local denial. The pass
+			// stops (serial order); a successful record write — always for
+			// the newest decision — clears every mark and releases the trail
+			// in order.
+			return handed
+		}
+		if owedMint := c.consentMintOwedSnapshot(); owedMint != nil &&
+			owedMint.decision != ConsentDecisionGranted && receipt.analyticsGranted() {
+			// A NEWER denial's receipt is still owed to the mint: delivering
+			// an earlier in-scope grant now could leave the grant as the
+			// server's last word indefinitely (the denial's receipt does not
+			// even exist to follow it). Earlier GRANTS park until the owed
+			// denial mints; earlier denials may still deliver — same state as
+			// the operative decision, the fail-safe direction.
 			return handed
 		}
 		if c.consentDenyProofHeld(receipt) {
@@ -1041,6 +1361,15 @@ func (c *Client) grantReceiptGateArmed(handed map[string]struct{}) bool {
 	if c.consentGrantArming.Load() > 0 {
 		return true
 	}
+	if owedMint := c.consentMintOwedSnapshot(); owedMint != nil && owedMint.analyticsGranted {
+		// The operative grant's receipt is OWED to a failed mint: no retained
+		// receipt exists to arm the gate, but the batch legs must hold all
+		// the same — events dispatched now would reach a strict-consent
+		// workspace before any receipt could (the mint retries at every
+		// dispatch point and the appended receipt then takes over the gate).
+		// Always this client's own decision, so no foreign-scope concern.
+		return true
+	}
 	return c.consentOutbox.grantPendingDispatch(handed, c.consentReceiptInScope)
 }
 
@@ -1061,18 +1390,21 @@ func (c *Client) drainConsentOutboxEvictions() {
 // actor snapshot is the configured actor exactly as events carry it (UserID
 // preferred, else AnonymousID) — validateConsentFloorIdentity already
 // rejected out-of-contract identifiers before the decision applied, so the
-// receipt's actor can never silently diverge from the events' actor. No
-// configured actor at all means no receipt (the decision still applies
-// locally). The anonymous-id retention snapshot never rides the wire.
-func (c *Client) mintConsentReceipt(analyticsGranted bool, reason, decidedAt string) (consentReceipt, bool) {
+// receipt's actor can never silently diverge from the events' actor. The
+// two no-receipt outcomes are DISTINCT: no configured actor at all means no
+// receipt with a nil error — the sanctioned local-only path, where a
+// receipt is provably never coming — while a failed idempotency-key mint
+// returns the error: the receipt IS owed (the caller registers it for
+// retry; the decision must not persist as if the trail were safe). The
+// anonymous-id retention snapshot never rides the wire.
+func (c *Client) mintConsentReceipt(analyticsGranted bool, reason, decidedAt string) (consentReceipt, bool, error) {
 	actor := firstNonEmpty(c.cfg.UserID, c.cfg.AnonymousID)
 	if actor == "" {
-		return consentReceipt{}, false
+		return consentReceipt{}, false, nil
 	}
-	idempotencyKey, err := uuidv7.New()
+	idempotencyKey, err := c.consentMintID()
 	if err != nil {
-		c.logf("shardpilot consent floor: generate idempotency key failed; the decision applies locally without a receipt: %v", err)
-		return consentReceipt{}, false
+		return consentReceipt{}, false, err
 	}
 	receipt := consentReceipt{
 		IdempotencyKey:  idempotencyKey,
@@ -1090,7 +1422,7 @@ func (c *Client) mintConsentReceipt(analyticsGranted bool, reason, decidedAt str
 	if validConsentIdentifier(c.cfg.AnonymousID) {
 		receipt.AnonymousID = c.cfg.AnonymousID
 	}
-	return receipt, true
+	return receipt, true, nil
 }
 
 // consentDecisionStamp mints a decision's decided-at instant: RFC3339 with
@@ -1275,6 +1607,14 @@ func (c *Client) finalizeConsentOutbox(ctx context.Context) error {
 		}
 		c.drainConsentOutboxEvictions()
 	}
+	if c.consentMintOwedSnapshot() != nil {
+		// A decision's receipt is still OWED to a failed mint (the dispatch
+		// pass above retried it): the receipt is neither delivered nor
+		// durable ANYWHERE — unlike the actorless local-only path, it is
+		// coming — so teardown must not read as clean. Retryable: a repeated
+		// Close re-runs the mint retry.
+		return ErrConsentPending
+	}
 	if owed := c.consentRecordOwedSnapshot(); owed != nil {
 		if owed.decision == ConsentDecisionGranted {
 			// The GRANT pair is incomplete: the granted record write is
@@ -1288,11 +1628,12 @@ func (c *Client) finalizeConsentOutbox(ctx context.Context) error {
 		// An owed DENIAL record may complete teardown ONLY over a DURABLE
 		// proof: a held deny receipt safely on disk lets the next launch
 		// restore the denial from the trail and heal the record. Without
-		// one — the documented local-only path (no configured actor, a
-		// failed key mint) minted no receipt, or the outbox write is
-		// itself owed — nothing durable contradicts the stale pre-denial
-		// record, and a clean Close would let a restart promote it.
-		// Retryable exactly like the grant pair.
+		// one — the documented local-only path (no configured actor)
+		// minted no receipt, or the outbox write is itself owed — nothing
+		// durable contradicts the stale pre-denial record, and a clean
+		// Close would let a restart promote it. (A receipt owed to a
+		// failed MINT already pended above.) Retryable exactly like the
+		// grant pair.
 		proof, ok := c.consentOutbox.latestMatching(c.consentReceiptInScope)
 		_, safelyOnDisk := c.consentOutbox.pendingDurability()
 		if !ok || proof.analyticsGranted() || !safelyOnDisk {

@@ -306,8 +306,11 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) error {
 		// be ordered so that every reachable intermediate state fails
 		// CLOSED. GRANT: the receipt rides the durable outbox FIRST, and
 		// the granted record is written only once the receipt trail is
-		// safely down (or provably never coming — no configured actor, a
-		// failed key mint: the documented local-only path). Record-first
+		// safely down (or provably never coming — no configured actor,
+		// the documented local-only path; a failed idempotency-key MINT
+		// is NOT that path: the receipt is OWED and retried at every
+		// dispatch point, the record withheld exactly like a failed
+		// append). Record-first
 		// would leave "granted record, empty outbox" reachable — a
 		// relaunch flowing events with no receipt ever sent. When the
 		// receipt write itself fails, the record write is WITHHELD: the
@@ -328,55 +331,113 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) error {
 			// artifacts of one decision must carry the same moment.
 			decidedAt := c.consentDecisionStamp()
 			if analyticsGranted {
+				// The whole grant side runs under the record-apply lock so
+				// the owed-mint slot, the owed-record slot, and the
+				// per-receipt pair marks move together — an opportunistic
+				// retry (TryLock) can never interleave between them.
+				c.consentRecordApplyMu.Lock()
 				receiptTrailSafe := true
-				if receipt, ok := c.mintConsentReceipt(true, reason, decidedAt); ok {
+				receipt, minted, mintErr := c.mintConsentReceipt(true, reason, decidedAt)
+				switch {
+				case mintErr != nil:
+					// The receipt could not even be minted for a CONFIGURED
+					// actor: it is OWED — retried at every dispatch point —
+					// and the trail is unsafe exactly like a failed append,
+					// so the granted record is withheld below. Only the
+					// actorless local-only path may persist receipt-less.
+					receiptTrailSafe = false
+					c.setConsentMintOwed(&consentOwedMint{decision: decision, analyticsGranted: true, reason: reason, decidedAt: decidedAt})
+					c.stats.setLastConsentError("consent_receipt_mint_failed")
+					c.logf("shardpilot consent floor: minting the grant receipt's idempotency key failed; the receipt is owed (retried at every dispatch point) and the granted record is withheld until it lands: %v", mintErr)
+				case minted:
+					// A successful mint supersedes any older owed mint (the
+					// slot holds the newest decision only; appending the
+					// older receipt later would break trail order).
+					c.setConsentMintOwed(nil)
 					if c.consentOutbox.append(receipt) {
 						c.recordConsentOutboxPersistFailure()
 						receiptTrailSafe = false
 					}
 					c.drainConsentOutboxEvictions()
 					c.wakeConsentDispatch()
+				default:
+					// No configured actor: the documented local-only path —
+					// a receipt is provably never coming, and the record may
+					// persist without one. Supersedes any older owed mint.
+					c.setConsentMintOwed(nil)
 				}
-				c.consentRecordApplyMu.Lock()
 				if receiptTrailSafe {
 					var recordPersisted bool
 					deadLetters, recordPersisted = c.applySpoolConsent(decision, decidedAt)
 					c.setConsentRecordOwed(decision, decidedAt, recordPersisted)
+					if minted && !recordPersisted {
+						// The pair-incomplete hold is PER RECEIPT (the single
+						// owed slot tracks only the newest decision — a later
+						// decision's failure must not release this one).
+						c.consentOutbox.markRecordOwed(receipt.IdempotencyKey)
+					}
 				} else {
 					// The record write is WITHHELD (receipt-first) and OWED:
 					// the retry at every dispatch point completes the pair
-					// the moment the outbox write lands — an acknowledged
-					// receipt must never prune away leaving no durable grant.
+					// the moment the outbox write (or the owed mint) lands —
+					// an acknowledged receipt must never prune away leaving
+					// no durable grant.
 					c.setConsentRecordOwed(decision, decidedAt, false)
+					if minted {
+						c.consentOutbox.markRecordOwed(receipt.IdempotencyKey)
+					}
 					c.logf("shardpilot consent floor: the grant receipt could not be written durably; the granted record is withheld (owed — completed when the receipt write lands; a restart meanwhile restores the prior state, or the grant from the trail tail once the owed receipt landed)")
 				}
 				c.consentRecordApplyMu.Unlock()
 			} else {
+				// The denial side holds the record-apply lock across the
+				// record write AND the receipt mint/append for the same
+				// reason as the grant side: the owed slots and the
+				// per-receipt marks must move together.
 				c.consentRecordApplyMu.Lock()
 				var recordPersisted bool
 				deadLetters, recordPersisted = c.applySpoolConsent(decision, decidedAt)
 				// A failed denied-record write is OWED: retried at every
 				// dispatch point, and until it lands the denial's in-scope
-				// proof receipt is HELD from dispatch (consentDenyProofHeld)
-				// so the trail's only durable evidence cannot prune away
-				// while the stale pre-denial record would rule a restart.
+				// proof receipt is HELD from dispatch (consentDenyProofHeld
+				// plus the per-receipt mark) so the trail's only durable
+				// evidence cannot prune away while the stale pre-denial
+				// record would rule a restart.
 				c.setConsentRecordOwed(decision, decidedAt, recordPersisted)
-				c.consentRecordApplyMu.Unlock()
-				if receipt, ok := c.mintConsentReceipt(false, reason, decidedAt); ok {
+				receipt, minted, mintErr := c.mintConsentReceipt(false, reason, decidedAt)
+				switch {
+				case mintErr != nil:
+					// The deny receipt is OWED to the failed mint (retried at
+					// every dispatch point; Close pends until it lands). The
+					// record was already written FIRST — fail-closed exactly
+					// as a failed append would leave it.
+					c.setConsentMintOwed(&consentOwedMint{decision: decision, analyticsGranted: false, reason: reason, decidedAt: decidedAt})
+					c.stats.setLastConsentError("consent_receipt_mint_failed")
+					c.logf("shardpilot consent floor: minting the denial receipt's idempotency key failed; the receipt is owed and retried at every dispatch point (the denied record was written first): %v", mintErr)
+				case minted:
+					c.setConsentMintOwed(nil)
 					if c.consentOutbox.append(receipt) {
 						c.recordConsentOutboxPersistFailure()
 					}
 					c.drainConsentOutboxEvictions()
+					if !recordPersisted {
+						c.consentOutbox.markRecordOwed(receipt.IdempotencyKey)
+					}
 					c.wakeConsentDispatch()
+				default:
+					c.setConsentMintOwed(nil)
 				}
+				c.consentRecordApplyMu.Unlock()
 			}
 		}
 		if grantArming {
-			// The receipt now exists in the outbox (or provably never will
-			// — no configured actor, or a failed idempotency-key mint): the
-			// outbox predicate takes over from the arming window either
-			// way, and the gate must not stay stuck for a receipt that
-			// cannot come. Re-wake the dispatcher: a pass that ran during
+			// The receipt now exists in the outbox, is owed to a failed
+			// mint (the owed-mint gate holds the batch legs until the
+			// retried mint appends it), or provably never will exist (no
+			// configured actor): the outbox/owed-mint predicates take over
+			// from the arming window either way, and the gate must not
+			// stay stuck for a receipt that cannot come. Re-wake the
+			// dispatcher: a pass that ran during
 			// the window HELD the grant (consentGrantPairIncomplete) and
 			// returned without arming any deferral, so without this nudge
 			// the receipt would idle until the next tick or caller op.

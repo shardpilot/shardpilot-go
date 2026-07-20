@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // Persisted consent decision and owed-wipe marker for the opt-in disk spool
@@ -56,7 +57,12 @@ const (
 // record was authored under Config.ConsentFloor, where a grant is written
 // only with its receipt trail durably down. A granted record WITHOUT the
 // mark (the floor-off fire-and-forget era — its POST may have failed, no
-// receipt exists) is unproven and never becomes live floor state. The
+// receipt exists) is unproven and never becomes live floor state. A
+// floor-marked record additionally REQUIRES a parseable RFC3339Nano
+// decided_at — the two fields are always written together, and without the
+// stamp the receipt-ordering rule cannot run — so a floor-marked record
+// with a missing or garbled stamp reads as ABSENT (fail-closed), never as
+// an unorderable decision. The
 // forced-minor value is written only through SetConsentDecision; an SDK
 // build that predates it reads the value as "no usable decision", which
 // fails toward purging — the safe direction, as with every unknown field
@@ -137,6 +143,22 @@ func loadConsentRecordInfo(dir, actorDigest string) (consentRecordInfo, bool) {
 	}
 	if record.ActorDigest != actorDigest {
 		return none, false
+	}
+	if record.Floor {
+		// A floor-authored record ALWAYS carries its decision's stamp (the
+		// save writes both fields together), and the stamp is what orders the
+		// record against retained receipts at reload. A floor-marked record
+		// whose decided_at is empty or unparsable is corrupt — the
+		// strictly-newer compare can never run against it, so a stale grant
+		// would beat a durable newer deny receipt purely because the file was
+		// damaged. Unusable is ABSENT, fail-closed: the reload falls through
+		// to the receipt trail (whose proof then applies unconditionally) or
+		// starts undecided. Legacy records (no floor mark) keep loading with
+		// their empty stamp: the provenance rule already vets their grants,
+		// and their denials are honored — the fail-closed direction.
+		if _, err := time.Parse(time.RFC3339Nano, record.DecidedAt); err != nil {
+			return none, false
+		}
 	}
 	info := consentRecordInfo{decidedAt: record.DecidedAt, floor: record.Floor}
 	switch record.ConsentAnalytics {

@@ -187,8 +187,25 @@ type Client struct {
 	// owed, the trail's in-scope proof receipt is held from dispatch so the
 	// only durable evidence of the denial cannot prune away before the
 	// record heals. Nil when nothing is owed; each new decision's slow half
-	// overwrites it.
+	// overwrites it — which is why the outbox ALSO marks incomplete pairs
+	// per receipt (consentOutbox.recordOwedKeys): the slot alone would
+	// forget an older receipt's owed record when a newer decision's write
+	// fails too.
 	consentRecordOwed *consentOwedRecord
+
+	// consentMintOwed is the floor decision whose RECEIPT could not be
+	// minted (idempotency-key generation failed): the decision applied
+	// locally, its receipt is owed — retried at every dispatch point
+	// (retryOwedConsentMint), pending Close until it lands. Guarded by
+	// consentOwedMu; mutations happen under consentRecordApplyMu too. Nil
+	// when nothing is owed; the newest decision owns the slot (a successful
+	// newer mint supersedes an owed older one — see consentOwedMint).
+	consentMintOwed *consentOwedMint
+
+	// consentMintIDFn is the receipt idempotency-key mint seam, injectable
+	// so tests can exercise mint failure deterministically (nil = uuidv7).
+	// Guarded by consentOwedMu.
+	consentMintIDFn func() (string, error)
 
 	// initialDeferUntil seeds the flush worker's retry-pacing deadline from
 	// the spool's persisted retry_after_until_ms, so server backpressure

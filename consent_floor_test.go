@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/shardpilot/shardpilot-go/internal/uuidv7"
 )
 
 // floorTestServer records EVERY analytics-plane arrival in one global order
@@ -701,7 +703,7 @@ func TestConsentOutboxFailedWriteNeverEvicts(t *testing.T) {
 		t.Fatalf("expected the owed write retried and landed, got (%v, %v)", attempted, failed)
 	}
 	reloaded := newConsentOutbox(dir)
-	reloaded.load()
+	reloaded.load(nil)
 	if head, ok := reloaded.head(); !ok || head.IdempotencyKey != "key-durable-1" {
 		t.Fatalf("expected the healed record readable, got (%v, %v)", head, ok)
 	}
@@ -721,7 +723,7 @@ func TestConsentOutboxSanitizerDropsMalformedAndOversized(t *testing.T) {
 		t.Fatalf("write outbox record: %v", err)
 	}
 	outbox := newConsentOutbox(dir)
-	outbox.load()
+	outbox.load(nil)
 	outbox.mu.Lock()
 	defer outbox.mu.Unlock()
 	if len(outbox.receipts) != 1 {
@@ -1149,7 +1151,7 @@ func TestConsentOutboxSanitizerRejectsAbsentCategory(t *testing.T) {
 		t.Fatalf("write outbox record: %v", err)
 	}
 	outbox := newConsentOutbox(dir)
-	outbox.load()
+	outbox.load(nil)
 	outbox.mu.Lock()
 	defer outbox.mu.Unlock()
 	// An entry with the analytics category ABSENT is malformed, never an
@@ -1189,7 +1191,7 @@ func TestConsentOutboxOverCapLoadKeepsNewest(t *testing.T) {
 		t.Fatalf("write outbox record: %v", err)
 	}
 	outbox := newConsentOutbox(dir)
-	outbox.load()
+	outbox.load(nil)
 	outbox.mu.Lock()
 	kept := len(outbox.receipts)
 	oldest := outbox.receipts[0].IdempotencyKey
@@ -3110,5 +3112,300 @@ func TestConsentOutboxMalformedStampDroppedAndNeverReloadTruth(t *testing.T) {
 	}
 	if got := state.batchCount(); got != 0 {
 		t.Fatalf("expected a dark session, got %d batches", got)
+	}
+}
+
+func TestConsentFloorOwedGrantHoldSurvivesNewerOwedDenialOverwrite(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// A grant whose record write fails leaves its receipt durable with the
+	// record OWED; a NEWER denial whose record write ALSO fails overwrites
+	// the single owed slot. The retained grant's pair-incomplete hold must
+	// survive that overwrite (it is tracked PER RECEIPT): the grant
+	// delivering and pruning now — while the deny proof is held — would
+	// make a grant the server's last word against a local denial.
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	recordErr := errors.New("disk full")
+	var failing atomic.Bool
+	failing.Store(true)
+	client.spool.renameFn = func(oldpath, newpath string) error {
+		if failing.Load() && strings.Contains(newpath, consentRecordFileName) {
+			return recordErr
+		}
+		return os.Rename(oldpath, newpath)
+	}
+
+	client.SetConsent(true)  // receipt durable; the granted record write fails (owed)
+	client.SetConsent(false) // deny receipt durable; the denied record write fails — the slot OVERWRITES
+	if owed := client.consentRecordOwedSnapshot(); owed == nil || owed.decision != ConsentDecisionDenied {
+		t.Fatalf("test shape: expected the owed slot overwritten by the denial, got %+v", owed)
+	}
+	_ = client.Flush(context.Background()) // a dispatch point; NOTHING may deliver
+	if got := state.consentCount(); got != 0 {
+		t.Fatalf("expected the retained grant HELD despite the slot overwrite, got %d consent posts", got)
+	}
+
+	// Crash half: teardown completes over the durable proof (both receipts
+	// safely on disk, the denial last), and the relaunch — the record never
+	// landed — restores the denial from the trail, heals the record, and
+	// re-sends the WHOLE trail in decision order, denial as the last word.
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close over the durable held trail: %v", err)
+	}
+	if got := state.consentCount(); got != 0 {
+		t.Fatalf("expected the trail still held through Close, got %d consent posts", got)
+	}
+	relaunched := newFloorTestClient(t, server.URL, dir, nil)
+	if got := relaunched.Consent(); got != ConsentDenied {
+		t.Fatalf("expected the trail-derived denial live after relaunch, got %v", got)
+	}
+	waitFor(t, 3*time.Second, "the retained trail re-sent in order", func() bool {
+		return state.consentCount() == 2
+	})
+	if !consentBoolCategory(t, state.consentAt(0)) || consentBoolCategory(t, state.consentAt(1)) {
+		t.Fatalf("expected grant-then-denial in decision order, got %v then %v", state.consentAt(0), state.consentAt(1))
+	}
+	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentDenied {
+		t.Fatalf("expected the healed denied record after relaunch, got (%v, %v)", recorded, ok)
+	}
+	if err := relaunched.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestConsentOutboxMergingSavePreservesSiblingReceipts(t *testing.T) {
+	// Two floor clients share a SpoolDir (different scopes). Outbox rewrites
+	// must reload-and-merge like the disk spool's saves, never blindly
+	// serialize this process's mirror: a sibling's receipt appended after
+	// this process loaded would otherwise be clobbered by the next rewrite —
+	// and, symmetrically, a receipt the sibling pruned must not resurrect
+	// from this process's stale mirror copy.
+	dir := t.TempDir()
+	fileKeys := func() string {
+		t.Helper()
+		probe := newConsentOutbox(dir)
+		keys := make([]string, 0, 4)
+		for _, entry := range probe.readRecordReceipts() {
+			keys = append(keys, entry.IdempotencyKey)
+		}
+		return strings.Join(keys, ",")
+	}
+
+	clientA := newConsentOutbox(dir)
+	clientA.load(nil)
+	if clientA.append(testConsentReceipt("key-a-1", true)) {
+		t.Fatalf("append a1: unexpected persist failure")
+	}
+
+	clientB := newConsentOutbox(dir)
+	clientB.load(func(entry consentReceipt) bool {
+		return strings.HasPrefix(entry.IdempotencyKey, "key-b-")
+	})
+	siblingReceipt := testConsentReceipt("key-b-1", false)
+	siblingReceipt.ActorIdentifier = "anon-sibling-2" // another scope's decision
+	if clientB.append(siblingReceipt) {
+		t.Fatalf("append b1: unexpected persist failure")
+	}
+
+	// A's next rewrite runs with a mirror that predates B's append: the
+	// merge (fresh disk view first) must preserve b1 while adding A's new
+	// receipt after it.
+	if clientA.append(testConsentReceipt("key-a-2", true)) {
+		t.Fatalf("append a2: unexpected persist failure")
+	}
+	if got := fileKeys(); got != "key-a-1,key-b-1,key-a-2" {
+		t.Fatalf("expected the sibling receipt preserved through the merge, got %q", got)
+	}
+
+	// Each client prunes its OWN delivered receipt: settled and gone — and
+	// NOT resurrected by the other's next save, even though that other
+	// client's stale mirror still carries a copy.
+	if clientA.prune("key-a-1") {
+		t.Fatalf("prune a1: unexpected persist failure")
+	}
+	if clientB.prune("key-b-1") {
+		t.Fatalf("prune b1: unexpected persist failure")
+	}
+	if got := fileKeys(); got != "key-a-2" {
+		t.Fatalf("expected both prunes honored across the shared file, got %q", got)
+	}
+}
+
+func TestConsentFloorMintFailureWithholdsAndRetries(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// GRANT: a failed idempotency-key mint for a CONFIGURED actor must NOT
+	// take the actorless local-only path: the receipt is OWED (retried at
+	// every dispatch point), the granted record is withheld — a restart
+	// meanwhile must not flow events with no receipt ever possible — and
+	// the batch legs hold exactly as behind a failed append.
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	mintErr := errors.New("entropy exhausted")
+	var failing atomic.Bool
+	failing.Store(true)
+	client.consentOwedMu.Lock()
+	client.consentMintIDFn = func() (string, error) {
+		if failing.Load() {
+			return "", mintErr
+		}
+		return uuidv7.New()
+	}
+	client.consentOwedMu.Unlock()
+
+	client.SetConsent(true)
+	if got := client.Consent(); got != ConsentGranted {
+		t.Fatalf("expected the decision applied locally, got %v", got)
+	}
+	if _, ok := loadConsentRecord(dir, spoolTestActorDigest()); ok {
+		t.Fatalf("expected the granted record WITHHELD while the receipt is owed to the failed mint")
+	}
+	if client.consentOutbox.pending() {
+		t.Fatalf("test shape: no receipt may exist while the mint is owed")
+	}
+	if got := client.Snapshot().LastConsentError; got != "consent_receipt_mint_failed" {
+		t.Fatalf("expected the mint failure diagnosed, got %q", got)
+	}
+	if err := client.Enqueue(Event{ID: "evt-mint-1", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Flush(context.Background()); !errors.Is(err, ErrConsentReceiptPending) {
+		t.Fatalf("expected the batch legs held behind the owed mint, got %v", err)
+	}
+	if got := state.batchCount(); got != 0 {
+		t.Fatalf("expected no batch before the receipt exists, got %d", got)
+	}
+
+	// The mint heals: the next dispatch point mints the owed receipt with
+	// the ORIGINAL decision's stamp, appends it, completes the withheld
+	// record, and the receipt precedes the batch on the wire.
+	failing.Store(false)
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush after the heal: %v", err)
+	}
+	waitFor(t, 3*time.Second, "receipt then batch delivered", func() bool {
+		return state.consentCount() == 1 && state.batchCount() == 1
+	})
+	if order := state.snapshotOrder(); len(order) < 2 || order[0] != "consent" || order[1] != "batch" {
+		t.Fatalf("expected the healed receipt to precede the batch, got %v", order)
+	}
+	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentGranted {
+		t.Fatalf("expected the withheld record completed after the mint healed, got (%v, %v)", recorded, ok)
+	}
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// DENIAL: record-first still writes the denied record, but the deny
+	// receipt is owed to the failed mint and Close must PEND (retryable)
+	// rather than read clean over a receipt that is coming.
+	deniedDir := t.TempDir()
+	deniedClient := newFloorTestClient(t, server.URL, deniedDir, nil)
+	var denyFailing atomic.Bool
+	denyFailing.Store(true)
+	deniedClient.consentOwedMu.Lock()
+	deniedClient.consentMintIDFn = func() (string, error) {
+		if denyFailing.Load() {
+			return "", mintErr
+		}
+		return uuidv7.New()
+	}
+	deniedClient.consentOwedMu.Unlock()
+	deniedClient.SetConsent(false)
+	if recorded, ok := loadConsentRecord(deniedDir, spoolTestActorDigest()); !ok || recorded != ConsentDenied {
+		t.Fatalf("expected the denied record written FIRST regardless, got (%v, %v)", recorded, ok)
+	}
+	if err := deniedClient.Close(context.Background()); !errors.Is(err, ErrConsentPending) {
+		t.Fatalf("expected Close pending on the owed mint, got %v", err)
+	}
+	denyFailing.Store(false)
+	if err := deniedClient.Close(context.Background()); err != nil {
+		t.Fatalf("expected the retried Close to mint and deliver, got %v", err)
+	}
+	waitFor(t, 3*time.Second, "the owed deny receipt delivered", func() bool {
+		return state.consentCount() == 2
+	})
+	if consentBoolCategory(t, state.consentAt(1)) {
+		t.Fatalf("expected the denial receipt on the wire, got %v", state.consentAt(1))
+	}
+}
+
+func TestConsentFloorCorruptStampFloorRecordReadsAbsent(t *testing.T) {
+	// A floor-marked record with an empty or garbled decided_at cannot be
+	// ordered against the receipt trail: it must read as ABSENT
+	// (fail-closed), never as an unorderable decision — a stale grant would
+	// otherwise beat a durable NEWER deny receipt purely because the file
+	// was damaged. Legacy (unmarked) records keep loading stampless: their
+	// grants are already vetted by provenance and their denials honored.
+	writeFloorRecord := func(t *testing.T, dir, stamp string) {
+		t.Helper()
+		payload := []byte(fmt.Sprintf(`{"consent_analytics":"granted","actor_digest":%q,"decided_at":%q,"floor":true}`, spoolTestActorDigest(), stamp))
+		if err := os.WriteFile(consentRecordPath(dir), payload, 0o600); err != nil {
+			t.Fatalf("write consent record: %v", err)
+		}
+	}
+
+	// Unit shape: both corrupt-stamp flavors read as no usable decision,
+	// while a legacy stampless record still loads.
+	unitDir := t.TempDir()
+	for _, stamp := range []string{"", "not-a-time"} {
+		writeFloorRecord(t, unitDir, stamp)
+		if _, ok := loadConsentRecordInfo(unitDir, spoolTestActorDigest()); ok {
+			t.Fatalf("expected the floor-marked record with stamp %q unusable (absent)", stamp)
+		}
+	}
+	legacy := []byte(fmt.Sprintf(`{"consent_analytics":"denied","actor_digest":%q}`, spoolTestActorDigest()))
+	if err := os.WriteFile(consentRecordPath(unitDir), legacy, 0o600); err != nil {
+		t.Fatalf("write legacy record: %v", err)
+	}
+	if info, ok := loadConsentRecordInfo(unitDir, spoolTestActorDigest()); !ok || info.state != ConsentDenied || info.floor {
+		t.Fatalf("expected the legacy stampless denial still loading, got (%+v, %v)", info, ok)
+	}
+
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// Reload shape 1: corrupt floor-marked grant, no trail → undecided (a
+	// dark session), never a live grant.
+	bareDir := t.TempDir()
+	writeFloorRecord(t, bareDir, "not-a-time")
+	bare := newFloorTestClient(t, server.URL, bareDir, nil)
+	if got := bare.Consent(); got != ConsentUnknown {
+		t.Fatalf("expected the corrupt-stamp record to start the floor undecided, got %v", got)
+	}
+	if err := bare.Track(context.Background(), Event{Name: "e1"}); !errors.Is(err, ErrConsentUnknown) {
+		t.Fatalf("expected the undecided refusal, got %v", err)
+	}
+	if err := bare.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Reload shape 2: corrupt floor-marked grant PLUS a durable in-scope
+	// deny receipt → the record reads absent, so the proof applies
+	// unconditionally and heals a proper floor-marked denied record with
+	// the receipt's stamp.
+	healDir := t.TempDir()
+	writeFloorRecord(t, healDir, "not-a-time")
+	planted := newConsentOutbox(healDir)
+	deny := testConsentReceipt("key-corrupt-deny-1", false)
+	if planted.append(deny) {
+		t.Fatalf("seeding the deny receipt failed")
+	}
+	healed := newFloorTestClient(t, server.URL, healDir, nil)
+	if got := healed.Consent(); got != ConsentDenied {
+		t.Fatalf("expected the durable deny receipt to beat the corrupt grant record, got %v", got)
+	}
+	info, ok := loadConsentRecordInfo(healDir, spoolTestActorDigest())
+	if !ok || info.state != ConsentDenied || !info.floor || info.decidedAt != deny.DecidedAt {
+		t.Fatalf("expected the record healed from the proof (floor-marked, receipt stamp), got (%+v, %v)", info, ok)
+	}
+	waitFor(t, 3*time.Second, "the retained deny receipt delivered", func() bool {
+		return state.consentCount() == 1
+	})
+	if err := healed.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 }

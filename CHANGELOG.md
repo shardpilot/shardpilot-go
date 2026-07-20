@@ -97,7 +97,20 @@
     (`ErrConsentPending`, retryable) so teardown never reads clean over an incomplete
     pair — and an owed DENIAL record pends `Close` too unless a durable in-scope
     proof receipt exists (the local-only path mints none: nothing durable would
-    contradict the stale pre-denial record). Decision stamps are MONOTONIC per
+    contradict the stale pre-denial record). The pair-incomplete hold is tracked
+    PER RECEIPT, not only in the newest-decision owed slot: a newer denial whose
+    record write also fails cannot release an earlier grant whose record never
+    landed — the retained grant stays held instead of delivering and pruning
+    while the deny proof is held (a grant must never become the server's last
+    word against a local denial), and a successful record write (always the
+    newest decision's) releases the whole trail in order. A failed
+    idempotency-key MINT for a CONFIGURED actor is never the local-only path:
+    the receipt is OWED — re-minted at every dispatch point with the original
+    decision's stamp — a mint-failed GRANT withholds its record and holds the
+    batch legs exactly like a failed append, earlier in-scope grants park
+    behind a mint-owed denial, and `Close` pends (`ErrConsentPending`) until
+    the owed receipt exists; only a client with NO configured identifiers
+    persists a decision receipt-less. Decision stamps are MONOTONIC per
     client AND seeded at reload from the maximum persisted stamp (record and
     retained receipts), so same-tick decisions, backward-stepping clocks, and
     behind-clock restarts all mint strictly increasing `decided_at` values — the
@@ -106,11 +119,23 @@
     receipt promotes an UNPROVEN same-state grant record to the floor-marked,
     receipt-stamped one instead of discarding a grant whose durable proof exists.
     The sanitizer also drops receipts whose `decided_at` does not parse (corrupt
-    data must never become reload truth). Foreign receipts retained in
+    data must never become reload truth), and a FLOOR-MARKED `consent.json`
+    whose `decided_at` is missing or unparsable reads as ABSENT, fail-closed:
+    floor-authored records always carry the stamp the ordering rule runs on, so
+    an unorderable one must not let a stale grant beat a durable newer deny
+    receipt (legacy unmarked records keep loading stampless — their grants are
+    already vetted by provenance, their denials honored). Foreign receipts retained in
     a reused `SpoolDir` are never dispatched with this client's scoped bearer — a
     terminal 401/403 would prune ANOTHER scope's consent receipt — they stay retained
     for a correctly scoped client while this client's own trail dispatches around
-    them in order. Retryable outcomes
+    them in order, and outbox rewrites RELOAD-AND-MERGE the on-disk record
+    exactly like the disk spool's saves (the fresh disk view first, minus the
+    keys this process settled, plus its own unsaved appends; de-duplicated by
+    idempotency key, cap re-applied on the merged view): a sibling floor
+    client's receipts appended to the shared directory after this process
+    loaded are never clobbered by a mirror-only rewrite, and a receipt its
+    owner pruned concurrently never resurrects from this process's stale
+    mirror copy. Retryable outcomes
     (transport failure, `429`, any `5xx`) keep the receipt at the head and park the consent
     plane behind the server's `Retry-After` — parsed on `429` AND `5xx` — or jittered
     backoff, independent of the events plane's pacing; every other outcome is terminal and
