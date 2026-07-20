@@ -247,7 +247,10 @@ func writeConsentRecordFile(t *testing.T, dir, decision string) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	payload := []byte(fmt.Sprintf(`{"consent_analytics":%q,"actor_digest":%q}`, decision, spoolTestActorDigest()))
+	// Floor-marked, with a stamp OLDER than testConsentReceipt's
+	// (2026-07-19T00:00:00Z): floor tests seeding a stale record plus a
+	// newer receipt exercise the strictly-newer override rule.
+	payload := []byte(fmt.Sprintf(`{"consent_analytics":%q,"actor_digest":%q,"decided_at":"2026-07-18T00:00:00Z","floor":true}`, decision, spoolTestActorDigest()))
 	if err := os.WriteFile(consentRecordPath(dir), payload, 0o600); err != nil {
 		t.Fatalf("write consent record: %v", err)
 	}

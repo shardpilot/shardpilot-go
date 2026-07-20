@@ -43,16 +43,39 @@ const (
 
 // consentRecordWire is the consent.json payload:
 // {"consent_analytics":"granted"|"denied"|"denied_forced_minor",
-// "actor_digest":"<sha256 hex>"}. An absent file means no decision.
-// actor_digest scopes the decision to the actor tuple it covered (see
-// consentActorDigest) — a digest, never the verbatim identifiers, so the
-// record stays fixed-size and holds no plaintext identity material. The
+// "actor_digest":"<sha256 hex>","decided_at":"<RFC3339Nano>","floor":bool}.
+// An absent file means no decision. actor_digest scopes the decision to the
+// actor tuple it covered (see consentActorDigest) — a digest, never the
+// verbatim identifiers, so the record stays fixed-size and holds no
+// plaintext identity material. decided_at is the DECISION's stamp — the
+// same instant the decision's receipt carries — so the floor reload can
+// order the record against retained receipts (only a receipt STRICTLY
+// newer than the record's decision may override it; a stale
+// acked-but-unpruned receipt re-read from a failed outbox rewrite must
+// never flip back a newer decision). floor marks FLOOR PROVENANCE: the
+// record was authored under Config.ConsentFloor, where a grant is written
+// only with its receipt trail durably down. A granted record WITHOUT the
+// mark (the floor-off fire-and-forget era — its POST may have failed, no
+// receipt exists) is unproven and never becomes live floor state. The
 // forced-minor value is written only through SetConsentDecision; an SDK
 // build that predates it reads the value as "no usable decision", which
-// fails toward purging — the safe direction.
+// fails toward purging — the safe direction, as with every unknown field
+// shape.
 type consentRecordWire struct {
 	ConsentAnalytics string `json:"consent_analytics"`
 	ActorDigest      string `json:"actor_digest"`
+	DecidedAt        string `json:"decided_at,omitempty"`
+	Floor            bool   `json:"floor,omitempty"`
+}
+
+// consentRecordInfo is a loaded record's full shape for the floor reload:
+// the decision state plus the ordering stamp and floor provenance
+// (decidedAt empty and floor false for a legacy record that predates the
+// fields).
+type consentRecordInfo struct {
+	state     ConsentState
+	decidedAt string
+	floor     bool
 }
 
 // consentActorDigest canonically digests the actor/scope tuple a persisted
@@ -90,41 +113,59 @@ func spoolWipeOwedPath(dir string) string {
 // different actor/scope tuple — which the spool treats exactly like an
 // explicit denial (fail toward purging, never toward loading).
 func loadConsentRecord(dir, actorDigest string) (ConsentState, bool) {
+	info, ok := loadConsentRecordInfo(dir, actorDigest)
+	return info.state, ok
+}
+
+// loadConsentRecordInfo is loadConsentRecord returning the record's full
+// shape — the floor reload needs the ordering stamp and floor provenance
+// alongside the state.
+func loadConsentRecordInfo(dir, actorDigest string) (consentRecordInfo, bool) {
+	none := consentRecordInfo{state: ConsentUnknown}
 	file, err := os.Open(consentRecordPath(dir))
 	if err != nil {
-		return ConsentUnknown, false
+		return none, false
 	}
 	defer file.Close()
 	data, err := io.ReadAll(io.LimitReader(file, consentRecordReadLimit+1))
 	if err != nil || len(data) > consentRecordReadLimit {
-		return ConsentUnknown, false
+		return none, false
 	}
 	var record consentRecordWire
 	if json.Unmarshal(data, &record) != nil {
-		return ConsentUnknown, false
+		return none, false
 	}
 	if record.ActorDigest != actorDigest {
-		return ConsentUnknown, false
+		return none, false
 	}
+	info := consentRecordInfo{decidedAt: record.DecidedAt, floor: record.Floor}
 	switch record.ConsentAnalytics {
 	case "granted":
-		return ConsentGranted, true
+		info.state = ConsentGranted
 	case "denied":
-		return ConsentDenied, true
+		info.state = ConsentDenied
 	case "denied_forced_minor":
-		return ConsentDeniedForcedMinor, true
+		info.state = ConsentDeniedForcedMinor
 	default:
-		return ConsentUnknown, false
+		return none, false
 	}
+	return info, true
 }
 
 // saveConsentRecord persists a consent decision, stamped with the actor
-// digest it covers, with the SDK's private-file discipline (0700 dir —
-// tightened when it pre-exists looser — 0600 file, full temp write + atomic
-// rename). rename and chmod are injectable so tests can exercise persist and
-// refused-tighten failures deterministically.
-func saveConsentRecord(dir string, decision ConsentDecision, actorDigest string, rename func(oldpath, newpath string) error, chmod func(name string, mode os.FileMode) error) error {
-	payload, err := json.Marshal(consentRecordWire{ConsentAnalytics: string(decision), ActorDigest: actorDigest})
+// digest it covers, the decision's own decided-at instant (for the floor
+// reload's receipt-ordering rule), and floor provenance, with the SDK's
+// private-file discipline (0700 dir — tightened when it pre-exists looser —
+// 0600 file, full temp write + atomic rename). rename and chmod are
+// injectable so tests can exercise persist and refused-tighten failures
+// deterministically.
+func saveConsentRecord(dir string, decision ConsentDecision, actorDigest, decidedAt string, floorAuthored bool, rename func(oldpath, newpath string) error, chmod func(name string, mode os.FileMode) error) error {
+	payload, err := json.Marshal(consentRecordWire{
+		ConsentAnalytics: string(decision),
+		ActorDigest:      actorDigest,
+		DecidedAt:        decidedAt,
+		Floor:            floorAuthored,
+	})
 	if err != nil {
 		return err
 	}

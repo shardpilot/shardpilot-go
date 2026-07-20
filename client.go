@@ -172,13 +172,16 @@ type Client struct {
 	consentOwedMu sync.Mutex
 
 	// consentRecordOwed is the floor decision whose durable record write is
-	// still OWED (failed, or deliberately withheld while the grant's receipt
-	// trail write is itself owed — receipt-first). Retried at every dispatch
-	// point (retryOwedConsentRecord); while a DENIAL is owed, the trail's
-	// in-scope proof receipt is held from dispatch so the only durable
-	// evidence of the denial cannot prune away before the record heals. Nil
-	// when nothing is owed; each new decision's slow half overwrites it.
-	consentRecordOwed *ConsentDecision
+	// still OWED (failed, deliberately withheld while the grant's receipt
+	// trail write is itself owed — receipt-first — or a failed reload
+	// heal). Carries the decision's decided-at stamp so the retried record
+	// keeps the ordering instant of the decision it describes. Retried at
+	// every dispatch point (retryOwedConsentRecord); while a DENIAL is
+	// owed, the trail's in-scope proof receipt is held from dispatch so the
+	// only durable evidence of the denial cannot prune away before the
+	// record heals. Nil when nothing is owed; each new decision's slow half
+	// overwrites it.
+	consentRecordOwed *consentOwedRecord
 
 	// initialDeferUntil seeds the flush worker's retry-pacing deadline from
 	// the spool's persisted retry_after_until_ms, so server backpressure
@@ -235,7 +238,7 @@ func NewClient(cfg Config) (*Client, error) {
 	// rule under the floor).
 	if normalized.ConsentFloor != nil {
 		client.consentWake = make(chan struct{}, 1)
-		client.initConsentFloor(os.Chmod)
+		client.initConsentFloor(os.Rename, os.Chmod)
 	}
 	// Spool init runs before the worker starts: it seeds initialDeferUntil
 	// and the resend queue the worker consumes. Dead-letters it produced are

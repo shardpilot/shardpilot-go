@@ -2,6 +2,8 @@ package shardpilot
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,23 +20,42 @@ func TestConsentRecordRoundTrip(t *testing.T) {
 	if _, ok := loadConsentRecord(dir, digest); ok {
 		t.Fatalf("expected no decision from an absent record")
 	}
-	if err := saveConsentRecord(dir, ConsentDecisionGranted, digest, os.Rename, os.Chmod); err != nil {
+	if err := saveConsentRecord(dir, ConsentDecisionGranted, digest, "2026-07-19T00:00:01Z", true, os.Rename, os.Chmod); err != nil {
 		t.Fatalf("save granted: %v", err)
 	}
 	if state, ok := loadConsentRecord(dir, digest); !ok || state != ConsentGranted {
 		t.Fatalf("expected a granted record, got %v %v", state, ok)
 	}
-	if err := saveConsentRecord(dir, ConsentDecisionDenied, digest, os.Rename, os.Chmod); err != nil {
+	// The full shape round-trips: state, decision stamp, floor provenance.
+	if info, ok := loadConsentRecordInfo(dir, digest); !ok || info.state != ConsentGranted ||
+		info.decidedAt != "2026-07-19T00:00:01Z" || !info.floor {
+		t.Fatalf("expected the full record shape round-tripped, got %+v %v", info, ok)
+	}
+	if err := saveConsentRecord(dir, ConsentDecisionDenied, digest, "2026-07-19T00:00:02Z", false, os.Rename, os.Chmod); err != nil {
 		t.Fatalf("save denied: %v", err)
 	}
 	if state, ok := loadConsentRecord(dir, digest); !ok || state != ConsentDenied {
 		t.Fatalf("expected a denied record, got %v %v", state, ok)
 	}
-	if err := saveConsentRecord(dir, ConsentDecisionDeniedForcedMinor, digest, os.Rename, os.Chmod); err != nil {
+	if info, ok := loadConsentRecordInfo(dir, digest); !ok || info.floor {
+		t.Fatalf("expected a floor-off record unmarked, got %+v %v", info, ok)
+	}
+	if err := saveConsentRecord(dir, ConsentDecisionDeniedForcedMinor, digest, "2026-07-19T00:00:03Z", true, os.Rename, os.Chmod); err != nil {
 		t.Fatalf("save forced-minor: %v", err)
 	}
 	if state, ok := loadConsentRecord(dir, digest); !ok || state != ConsentDeniedForcedMinor {
 		t.Fatalf("expected a forced-minor record, got %v %v", state, ok)
+	}
+	// A LEGACY record (no decided_at, no floor field) still loads its state,
+	// with the extras zero — the floor's provenance and ordering rules treat
+	// it fail-closed.
+	legacy := []byte(fmt.Sprintf(`{"consent_analytics":"granted","actor_digest":%q}`, digest))
+	if err := os.WriteFile(consentRecordPath(dir), legacy, 0o600); err != nil {
+		t.Fatalf("write legacy record: %v", err)
+	}
+	if info, ok := loadConsentRecordInfo(dir, digest); !ok || info.state != ConsentGranted ||
+		info.decidedAt != "" || info.floor {
+		t.Fatalf("expected the legacy shape loaded with zero extras, got %+v %v", info, ok)
 	}
 
 	// A record written for a DIFFERENT actor/scope tuple is no decision for
@@ -114,9 +135,15 @@ func TestConsentRecordWrittenAtomicallyWithPrivateModes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	want := `{"consent_analytics":"granted","actor_digest":"` + spoolTestActorDigest() + `"}`
-	if string(data) != want {
-		t.Fatalf("unexpected record content %q (want %q)", data, want)
+	var record consentRecordWire
+	if err := json.Unmarshal(data, &record); err != nil {
+		t.Fatalf("parse record: %v", err)
+	}
+	// A floor-OFF write: the decision value, the scoped digest, its own
+	// decision stamp — and NO floor provenance.
+	if record.ConsentAnalytics != "granted" || record.ActorDigest != spoolTestActorDigest() ||
+		record.DecidedAt == "" || record.Floor {
+		t.Fatalf("unexpected record content %q", data)
 	}
 	// The record carries a fixed-size digest, never the verbatim identity.
 	if strings.Contains(string(data), "anon-spool-1") {

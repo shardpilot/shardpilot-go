@@ -33,7 +33,21 @@
     newest→oldest for the configured workspace/app/environment tuple and the configured
     actor — so a foreign receipt retained in a reused `SpoolDir` can neither flip this
     client's state, nor heal the record for a digest its decision never covered, nor
-    HIDE this client's own latest decision by merely being newer. The scope digest that
+    HIDE this client's own latest decision by merely being newer — and it may override
+    only when its decision is STRICTLY NEWER than the record's decision moment
+    (`consent.json` now carries the decision's `decided_at`, the same instant its
+    receipt carries): a STALE receipt left on disk by a failed prune rewrite — already
+    acknowledged long ago — can never flip the state back over a record persisted for
+    a newer decision. A failed HEAL registers as an owed record write exactly like a
+    live decision's failure, holding the denial's proof receipt until the record
+    lands. `consent.json` also carries FLOOR PROVENANCE: a granted record written
+    without `Config.ConsentFloor` (the fire-and-forget era — its POST may have failed;
+    no receipt exists) is never promoted to live floor state — the floor starts
+    undecided, diagnosed `consent_record_unproven` — while denials are honored
+    regardless of provenance (the fail-closed direction). A floor-confirmed granted
+    record also reopens the spool's write gate at reload, so post-restart retriable
+    failures and close remnants spool durably instead of dead-lettering until a fresh
+    `SetConsent(true)`. The scope digest that
     keys `consent.json` now includes `AppID` (a reused directory across apps in one
     workspace/environment must not let another app's record — whose receipt was
     delivered for the other app's scope — become this app's live floor state); a record
@@ -48,7 +62,10 @@
     different effective actor is refused at intake with the new
     `ErrConsentActorMismatch` (that actor has no local decision and no receipt;
     per-actor decisions beyond the configured identity stay on the server-side path —
-    floor-off, overrides pass through unchanged).
+    floor-off, overrides pass through unchanged). The disk spool's actor eligibility
+    mirrors the same effective-actor rule under the floor: an event the floor ADMITTED
+    (say a secondary AnonymousID override under a configured UserID) is never refused
+    disk retention later; floor-off keeps the released strict both-identifiers rule.
   - Durable consent-receipt outbox (`consent-outbox.json` under `SpoolDir`; in-memory
     without it): exactly one receipt per explicit decision — an append-only trail, a later
     decision never withdraws an earlier receipt — 32-cap FIFO evicting oldest on save, no
@@ -69,7 +86,13 @@
     in-scope proof receipt is HELD from dispatch entirely, so it can never be
     acknowledged and pruned while the stale pre-denial record would rule a restart
     (Close still completes over the durable held proof; the relaunch restores the
-    denial from it and heals the record). Retryable outcomes
+    denial from it and heals the record). A GRANT receipt dispatches only from a
+    DURABLY-RETAINED outbox: while the outbox write is owed (the grant's own failed
+    append included), the dispatch pass holds — an acknowledgement followed by a crash
+    before the write recovered would leave neither a durable receipt nor a granted
+    record, losing the grant across restart though the server recorded it; the pass
+    that recovers the write completes the withheld record pair before the receipt can
+    be acknowledged. Retryable outcomes
     (transport failure, `429`, any `5xx`) keep the receipt at the head and park the consent
     plane behind the server's `Retry-After` — parsed on `429` AND `5xx` — or jittered
     backoff, independent of the events plane's pacing; every other outcome is terminal and

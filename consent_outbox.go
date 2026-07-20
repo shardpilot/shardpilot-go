@@ -499,9 +499,10 @@ func (c *Client) consentFloorEnabled() bool {
 // are left in place for a later run with the permissions fixed). The
 // worker's first dispatch pass re-sends reloaded receipts BEFORE any event
 // batch — the retained grant itself is the dispatch gate; no deferral state
-// persists across launches, and none is needed. chmod is injectable so
-// tests can exercise the refused-tighten gate deterministically.
-func (c *Client) initConsentFloor(chmod func(name string, mode os.FileMode) error) {
+// persists across launches, and none is needed. rename and chmod are
+// injectable so tests can exercise the refused-tighten gate and a failed
+// heal write deterministically.
+func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, chmod func(name string, mode os.FileMode) error) {
 	c.consentOutbox = newConsentOutbox(c.cfg.SpoolDir)
 	if c.cfg.SpoolDir == "" {
 		return
@@ -525,19 +526,25 @@ func (c *Client) initConsentFloor(chmod func(name string, mode os.FileMode) erro
 		c.stats.setLastError("consent_identity_invalid")
 		c.logf("shardpilot consent floor: a configured identifier exceeds the %d-byte clamp; the persisted decision is not loaded and the floor starts undecided: %v", maxConsentIdentifierBytes, err)
 	} else {
-		state, recordOK := loadConsentRecord(c.cfg.SpoolDir, consentActorDigest(c.cfg))
-		// The TRAIL TAIL is the newer truth: the newest retained receipt is
-		// the latest explicit decision, and when the decision record
-		// disagrees — the record write for that decision was still owed
-		// when the previous process ended — trusting the record would
-		// resurrect the SUPERSEDED decision (a stale grant reopening the
-		// pipeline for an actor whose last decision was a denial). The
-		// tail overrides fail-closed, and the owed record write is retried
-		// here so the disagreement heals.
-		// The latest IN-SCOPE receipt is the proof — scanned newest→oldest,
-		// so a foreign receipt retained after it (another scope sharing the
-		// SpoolDir) can never hide this client's own latest decision.
-		if tail, ok := c.consentOutbox.latestMatching(c.consentReceiptInScope); ok {
+		digest := consentActorDigest(c.cfg)
+		record, recordOK := loadConsentRecordInfo(c.cfg.SpoolDir, digest)
+		state := record.state
+		// The trail can be newer truth than the record: when the record
+		// write for the LATEST decision was still owed when the previous
+		// process ended, trusting the record would resurrect the SUPERSEDED
+		// decision (a stale grant reopening the pipeline for an actor whose
+		// last decision was a denial). The proof is the latest IN-SCOPE
+		// receipt — scanned newest→oldest, so a foreign receipt retained
+		// after it (another scope sharing the SpoolDir) can never hide it —
+		// and it may override ONLY when its decision is STRICTLY newer than
+		// the record's decision moment: the outbox can also hold a STALE
+		// receipt (acknowledged long ago, left on disk by a failed prune
+		// rewrite), and re-reading that must never flip the state back over
+		// a record persisted for a NEWER decision (deny record durable,
+		// deny receipt append failed, crash). With no record at all the
+		// proof restores its decision unconditionally.
+		if tail, ok := c.consentOutbox.latestMatching(c.consentReceiptInScope); ok &&
+			(!recordOK || consentReceiptNewerThanRecord(tail.DecidedAt, record.decidedAt)) {
 			tailDecision := ConsentDecisionDenied
 			tailState := ConsentDenied
 			switch {
@@ -548,20 +555,50 @@ func (c *Client) initConsentFloor(chmod func(name string, mode os.FileMode) erro
 			}
 			if !recordOK || state != tailState {
 				state, recordOK = tailState, true
-				if err := saveConsentRecord(c.cfg.SpoolDir, tailDecision, consentActorDigest(c.cfg), os.Rename, chmod); err != nil {
+				// The trail-derived state is floor-proven by construction:
+				// its receipt exists. The heal carries the RECEIPT's stamp,
+				// so a later reload sees record and receipt as the same
+				// decision (no re-override churn).
+				record = consentRecordInfo{state: tailState, decidedAt: tail.DecidedAt, floor: true}
+				if err := saveConsentRecord(c.cfg.SpoolDir, tailDecision, digest, tail.DecidedAt, true, rename, chmod); err != nil {
 					c.stats.setLastError("consent_record_persist_failed")
-					c.logf("shardpilot consent floor: healing the stale decision record from the receipt trail failed (the trail-derived state still applies in memory): %v", err)
+					c.logf("shardpilot consent floor: healing the stale decision record from the receipt trail failed (the trail-derived state still applies in memory and the write stays owed): %v", err)
+					// The failed heal is an OWED record write, registered
+					// BEFORE the worker starts: without it the proof receipt
+					// would not be held (consentDenyProofHeld) and could
+					// deliver and prune the only durable evidence of the
+					// denial — a crash after that would restore the stale
+					// pre-denial record. The retry at every dispatch point
+					// heals it exactly like a live decision's failed write.
+					c.consentRecordApplyMu.Lock()
+					c.setConsentRecordOwed(tailDecision, tail.DecidedAt, false)
+					c.consentRecordApplyMu.Unlock()
 				}
 			}
 		}
 		if recordOK {
-			switch state {
-			case ConsentGranted:
-				c.consent.Store(consentStateGranted)
-			case ConsentDenied:
-				c.consent.Store(consentStateDenied)
-			case ConsentDeniedForcedMinor:
-				c.consent.Store(consentStateDeniedForcedMinor)
+			if state == ConsentGranted && !record.floor {
+				// FLOOR PROVENANCE: a granted record without the floor mark
+				// was authored by the floor-off fire-and-forget era — its
+				// consent POST may have failed and no durable receipt
+				// exists — so promoting it to live floor state would flow
+				// events with no receipt ever sent (receipt-before-events
+				// broken on a strict-consent workspace). Unproven grants
+				// start the floor UNDECIDED, fail-closed and distinctly
+				// diagnosed; the host records a fresh decision to proceed.
+				// DENIALS are honored regardless of provenance — honoring a
+				// denial is the fail-closed direction.
+				c.stats.setLastError("consent_record_unproven")
+				c.logf("shardpilot consent floor: the persisted granted record has no floor provenance (written without Config.ConsentFloor); it is not promoted to live state and the floor starts undecided — record a fresh decision")
+			} else {
+				switch state {
+				case ConsentGranted:
+					c.consent.Store(consentStateGranted)
+				case ConsentDenied:
+					c.consent.Store(consentStateDenied)
+				case ConsentDeniedForcedMinor:
+					c.consent.Store(consentStateDeniedForcedMinor)
+				}
 			}
 		}
 	}
@@ -633,25 +670,34 @@ func (c *Client) validateConsentFloorIdentity() error {
 	return nil
 }
 
+// consentOwedRecord is an owed decision-record write: the decision and its
+// original decided-at stamp (the retried record must carry the instant of
+// the decision it describes, not the retry's).
+type consentOwedRecord struct {
+	decision  ConsentDecision
+	decidedAt string
+}
+
 // setConsentRecordOwed records the outcome of a consent decision's durable
 // record write: persisted clears the owed slot, a failure (or a withheld
 // grant record) owes the exact decision for retry. Must be called under
 // consentRecordApplyMu, right after the write (or withhold) it describes —
 // the slot and the disk state move together. Owed state only ever exists
 // with a spool (memory-only floors have no record at all).
-func (c *Client) setConsentRecordOwed(decision ConsentDecision, persisted bool) {
+func (c *Client) setConsentRecordOwed(decision ConsentDecision, decidedAt string, persisted bool) {
 	c.consentOwedMu.Lock()
 	defer c.consentOwedMu.Unlock()
-	if persisted || c.spool == nil {
+	// SpoolDir (not c.spool) is the durability truth: the reload registers
+	// a failed HEAL as owed before the spool object exists.
+	if persisted || c.cfg.SpoolDir == "" {
 		c.consentRecordOwed = nil
 		return
 	}
-	owed := decision
-	c.consentRecordOwed = &owed
+	c.consentRecordOwed = &consentOwedRecord{decision: decision, decidedAt: decidedAt}
 }
 
 // consentRecordOwedSnapshot reads the owed slot (nil when nothing is owed).
-func (c *Client) consentRecordOwedSnapshot() *ConsentDecision {
+func (c *Client) consentRecordOwedSnapshot() *consentOwedRecord {
 	c.consentOwedMu.Lock()
 	defer c.consentOwedMu.Unlock()
 	return c.consentRecordOwed
@@ -681,19 +727,18 @@ func (c *Client) retryOwedConsentRecord() {
 	var deadLetters []SpoolDeadLetter
 	func() {
 		defer c.consentRecordApplyMu.Unlock()
-		owedPtr := c.consentRecordOwedSnapshot()
-		if owedPtr == nil {
+		owed := c.consentRecordOwedSnapshot()
+		if owed == nil {
 			return
 		}
-		owed := *owedPtr
-		if owed == ConsentDecisionGranted && c.consentOutbox.writeOwed() {
+		if owed.decision == ConsentDecisionGranted && c.consentOutbox.writeOwed() {
 			// Receipt-first: the grant's record stays withheld while the
 			// receipt trail itself is not durably down.
 			return
 		}
 		var persisted bool
-		deadLetters, persisted = c.applySpoolConsent(owed)
-		c.setConsentRecordOwed(owed, persisted)
+		deadLetters, persisted = c.applySpoolConsent(owed.decision, owed.decidedAt)
+		c.setConsentRecordOwed(owed.decision, owed.decidedAt, persisted)
 	}()
 	// Emit outside the lock: the callback is integrator code and may call
 	// back into the client (a retried denial purge is normally empty — the
@@ -712,8 +757,8 @@ func (c *Client) retryOwedConsentRecord() {
 // Grants are never held: their crash direction is fail-CLOSED, and the
 // withheld-record pair completes at the retry site instead.
 func (c *Client) consentDenyProofHeld(receipt consentReceipt) bool {
-	owedPtr := c.consentRecordOwedSnapshot()
-	if owedPtr == nil || *owedPtr == ConsentDecisionGranted {
+	owed := c.consentRecordOwedSnapshot()
+	if owed == nil || owed.decision == ConsentDecisionGranted {
 		return false
 	}
 	proof, ok := c.consentOutbox.latestMatching(c.consentReceiptInScope)
@@ -818,6 +863,19 @@ func (c *Client) dispatchConsentReceipts(ctx context.Context) map[string]struct{
 			// crash after the prune would restore the superseded decision.
 			// The pass stops here (serial order forbids skipping); the
 			// owed-record retry above releases it once the record heals.
+			return handed
+		}
+		if receipt.analyticsGranted() && o.writeOwed() {
+			// A GRANT dispatches only from a DURABLY-RETAINED outbox: with
+			// the outbox write owed (this receipt's own failed append may
+			// BE that write), an acknowledgement now could be followed by a
+			// crash before the write recovers — leaving neither a durable
+			// receipt nor a granted record, losing the user's grant across
+			// restart even though the server recorded it. The pass stops
+			// (serial order); retryPersist at the next dispatch point heals
+			// the outbox and the SAME pass completes the withheld record
+			// pair before this receipt can be acknowledged. Memory-only
+			// outboxes never owe a write and are unaffected.
 			return handed
 		}
 		attemptCtx, cancel := contextWithDefaultTimeout(ctx, c.cfg.HTTPTimeout)
@@ -932,7 +990,7 @@ func (c *Client) drainConsentOutboxEvictions() {
 // receipt's actor can never silently diverge from the events' actor. No
 // configured actor at all means no receipt (the decision still applies
 // locally). The anonymous-id retention snapshot never rides the wire.
-func (c *Client) mintConsentReceipt(analyticsGranted bool, reason string) (consentReceipt, bool) {
+func (c *Client) mintConsentReceipt(analyticsGranted bool, reason, decidedAt string) (consentReceipt, bool) {
 	actor := firstNonEmpty(c.cfg.UserID, c.cfg.AnonymousID)
 	if actor == "" {
 		return consentReceipt{}, false
@@ -948,14 +1006,49 @@ func (c *Client) mintConsentReceipt(analyticsGranted bool, reason string) (conse
 		AppID:           c.cfg.AppID,
 		EnvironmentID:   c.cfg.EnvironmentID,
 		ActorIdentifier: actor,
-		DecidedAt:       c.clock.Now().UTC().Format(time.RFC3339),
-		Reason:          reason,
+		// The DECISION's stamp, shared with the decision record: the reload
+		// orders receipts against the record by this instant, so both sides
+		// of one decision must carry the same one (see consentDecisionStamp).
+		DecidedAt: decidedAt,
+		Reason:    reason,
 	}
 	receipt.Categories.Analytics = &analyticsGranted
 	if validConsentIdentifier(c.cfg.AnonymousID) {
 		receipt.AnonymousID = c.cfg.AnonymousID
 	}
 	return receipt, true
+}
+
+// consentDecisionStamp mints a decision's decided-at instant: RFC3339 with
+// nanoseconds, so two rapid decisions order strictly (plain second
+// precision would tie a grant and a denial recorded in the same second and
+// defeat the reload's strictly-newer rule). Still valid RFC3339 on the
+// wire.
+func (c *Client) consentDecisionStamp() string {
+	return c.clock.Now().UTC().Format(time.RFC3339Nano)
+}
+
+// consentReceiptNewerThanRecord reports whether a retained receipt's
+// decision is STRICTLY newer than the persisted record's decision moment.
+// Only then may the trail override the record at reload: a STALE receipt —
+// acknowledged long ago but re-read from an outbox rewrite that failed to
+// prune it — must never flip the state back over a record persisted for a
+// NEWER decision. A record without a stamp (legacy shape) or an unparsable
+// stamp is never overridden-by-comparison: fail toward the record, which
+// the provenance rule below already vets.
+func consentReceiptNewerThanRecord(receiptDecidedAt, recordDecidedAt string) bool {
+	if receiptDecidedAt == "" || recordDecidedAt == "" {
+		return false
+	}
+	receiptAt, err := time.Parse(time.RFC3339Nano, receiptDecidedAt)
+	if err != nil {
+		return false
+	}
+	recordAt, err := time.Parse(time.RFC3339Nano, recordDecidedAt)
+	if err != nil {
+		return false
+	}
+	return receiptAt.After(recordAt)
 }
 
 // recordDiscardedCloseRemnant accounts for the undelivered events a

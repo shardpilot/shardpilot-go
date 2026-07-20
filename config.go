@@ -125,9 +125,14 @@ type Config struct {
 	//     SpoolDir set, the persisted decision reloads as the LIVE state at
 	//     construction, so a decision survives restarts — with the durable
 	//     receipt trail's newest IN-SCOPE receipt overriding (and healing) a
-	//     stale record, and spooled events reloading only under a grant the
-	//     resolved state confirms. The persisted record is scoped to the
-	//     configured workspace/app/environment/actor tuple.
+	//     stale record when its decision is STRICTLY NEWER than the
+	//     record's, and spooled events reloading only under a grant the
+	//     resolved state confirms (which also reopens the spool write
+	//     gate). The persisted record is scoped to the configured
+	//     workspace/app/environment/actor tuple and carries floor
+	//     provenance: a granted record written without the floor (the
+	//     fire-and-forget era, receipt-less) is never promoted to live
+	//     state — the floor starts undecided; record a fresh decision.
 	//   - Consent receipts ride a durable outbox (32 receipts, FIFO,
 	//     oldest-evicted, retried until acknowledged, delivered strictly in
 	//     decision order — grant-then-deny can never settle reversed; server

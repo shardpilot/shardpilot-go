@@ -322,9 +322,14 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) error {
 			if decision == ConsentDecisionDeniedForcedMinor {
 				reason = consentDecisionReason
 			}
+			// One stamp per decision, shared by the receipt AND the record:
+			// the reload orders retained receipts against the record by this
+			// instant (only a strictly-newer receipt may override), so both
+			// artifacts of one decision must carry the same moment.
+			decidedAt := c.consentDecisionStamp()
 			if analyticsGranted {
 				receiptTrailSafe := true
-				if receipt, ok := c.mintConsentReceipt(true, reason); ok {
+				if receipt, ok := c.mintConsentReceipt(true, reason, decidedAt); ok {
 					if c.consentOutbox.append(receipt) {
 						c.recordConsentOutboxPersistFailure()
 						receiptTrailSafe = false
@@ -335,29 +340,29 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) error {
 				c.consentRecordApplyMu.Lock()
 				if receiptTrailSafe {
 					var recordPersisted bool
-					deadLetters, recordPersisted = c.applySpoolConsent(decision)
-					c.setConsentRecordOwed(decision, recordPersisted)
+					deadLetters, recordPersisted = c.applySpoolConsent(decision, decidedAt)
+					c.setConsentRecordOwed(decision, decidedAt, recordPersisted)
 				} else {
 					// The record write is WITHHELD (receipt-first) and OWED:
 					// the retry at every dispatch point completes the pair
 					// the moment the outbox write lands — an acknowledged
 					// receipt must never prune away leaving no durable grant.
-					c.setConsentRecordOwed(decision, false)
+					c.setConsentRecordOwed(decision, decidedAt, false)
 					c.logf("shardpilot consent floor: the grant receipt could not be written durably; the granted record is withheld (owed — completed when the receipt write lands; a restart meanwhile restores the prior state, or the grant from the trail tail once the owed receipt landed)")
 				}
 				c.consentRecordApplyMu.Unlock()
 			} else {
 				c.consentRecordApplyMu.Lock()
 				var recordPersisted bool
-				deadLetters, recordPersisted = c.applySpoolConsent(decision)
+				deadLetters, recordPersisted = c.applySpoolConsent(decision, decidedAt)
 				// A failed denied-record write is OWED: retried at every
 				// dispatch point, and until it lands the denial's in-scope
 				// proof receipt is HELD from dispatch (consentDenyProofHeld)
 				// so the trail's only durable evidence cannot prune away
 				// while the stale pre-denial record would rule a restart.
-				c.setConsentRecordOwed(decision, recordPersisted)
+				c.setConsentRecordOwed(decision, decidedAt, recordPersisted)
 				c.consentRecordApplyMu.Unlock()
-				if receipt, ok := c.mintConsentReceipt(false, reason); ok {
+				if receipt, ok := c.mintConsentReceipt(false, reason, decidedAt); ok {
 					if c.consentOutbox.append(receipt) {
 						c.recordConsentOutboxPersistFailure()
 					}
@@ -380,7 +385,10 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) error {
 		// spool, never any live state — and the legacy fire-and-forget
 		// post follows. A failed record write stays log-only here (no owed
 		// machinery: without the floor the record never feeds live state).
-		deadLetters, _ = c.applySpoolConsent(decision)
+		// The record carries this decision's stamp and NO floor provenance:
+		// a later floor enablement must not promote a fire-and-forget-era
+		// grant (its POST may have failed; no receipt exists) to live state.
+		deadLetters, _ = c.applySpoolConsent(decision, c.consentDecisionStamp())
 		if actor != "" {
 			idempotencyKey, err := uuidv7.New()
 			if err != nil {

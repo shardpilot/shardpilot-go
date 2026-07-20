@@ -1110,16 +1110,32 @@ func (c *Client) partitionSpoolEligible(request batchRequest) (eligible, refused
 	}
 	for i, envelope := range request.Events {
 		entry := spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: request.rawEvents[i]}
-		// buildEnvelope resolved the effective actor (per-event override,
-		// else the configured default), so equality against the configured
-		// tuple is exactly "the persisted grant covers this envelope".
-		if envelope.UserID == c.cfg.UserID && envelope.AnonymousID == c.cfg.AnonymousID {
+		if c.spoolActorEligible(envelope) {
 			eligible = append(eligible, entry)
 		} else {
 			refused = append(refused, entry)
 		}
 	}
 	return eligible, refused
+}
+
+// spoolActorEligible reports whether the persisted grant's actor scope
+// covers this envelope. UNDER THE FLOOR, eligibility mirrors the intake
+// actor gate exactly (consentFloorActorMismatch): the envelope's EFFECTIVE
+// actor — buildEnvelope already resolved per-event overrides over the
+// configured identifiers — must equal the configured actor the decision
+// covers; a secondary-identifier override (say AnonymousID under a
+// configured UserID) does not change the effective actor, so an event the
+// floor ADMITTED is never refused disk retention later (accepted-then-
+// dead-lettered would contradict the round-4 override semantics). Floor
+// OFF keeps the released strict rule — both envelope identifiers equal to
+// the configured tuple — unchanged.
+func (c *Client) spoolActorEligible(envelope eventEnvelope) bool {
+	if c.consentFloorEnabled() {
+		effective := firstNonEmpty(envelope.UserID, envelope.AnonymousID)
+		return effective == firstNonEmpty(c.cfg.UserID, c.cfg.AnonymousID)
+	}
+	return envelope.UserID == c.cfg.UserID && envelope.AnonymousID == c.cfg.AnonymousID
 }
 
 // spoolFailedBatch appends a retriably failed worker batch to the spool.
@@ -1571,6 +1587,20 @@ func (c *Client) initSpool() []SpoolDeadLetter {
 		// dark). The unconfirmed spool falls through to the purge below,
 		// condemned exactly like a persisted denial.
 		if !c.consentFloorEnabled() || c.consent.Load() == consentStateGranted {
+			if c.consentFloorEnabled() {
+				// The floor confirmed the persisted grant as the LIVE state,
+				// and the record on disk IS that persisted grant: the spool
+				// write gate reopens now. Without this, every restart would
+				// refuse retriable-failure appends and close remnants
+				// (grantPersisted false) until a fresh SetConsent(true) —
+				// dead-lettering events the reloaded grant plainly covers.
+				// Floor-off keeps the documented posture: live state is
+				// memory-only, the host re-applies SetConsent at startup and
+				// the gate opens there.
+				s.mu.Lock()
+				s.grantPersisted = true
+				s.mu.Unlock()
+			}
 			outcome := s.load(c.clock.Now())
 			var letters []SpoolDeadLetter
 			if len(outcome.expired) > 0 {
@@ -1632,11 +1662,12 @@ func (c *Client) initSpool() []SpoolDeadLetter {
 // persisted, and only a SUCCESSFUL persist opens spool writes
 // (grantPersisted): a grant whose record could not be written keeps disk
 // closed, so a load on the next start can always trust the record it finds.
-func (c *Client) applySpoolConsent(decision ConsentDecision) ([]SpoolDeadLetter, bool) {
+func (c *Client) applySpoolConsent(decision ConsentDecision, decidedAt string) ([]SpoolDeadLetter, bool) {
 	s := c.spool
 	if s == nil {
 		return nil, true
 	}
+	floorAuthored := c.consentFloorEnabled()
 	if decision != ConsentDecisionGranted {
 		// Both denial flavors run the full denial path; the persisted record
 		// keeps the exact decision value (a forced-minor denial reloads as
@@ -1651,7 +1682,7 @@ func (c *Client) applySpoolConsent(decision ConsentDecision) ([]SpoolDeadLetter,
 			c.logf("shardpilot spool: consent purge failed; a wipe is owed and the disk spool is disabled until it succeeds: %v", err)
 		}
 		recordPersisted := true
-		if recordErr := saveConsentRecord(s.dir, decision, s.actorDigest, s.renameFn, s.chmodFn); recordErr != nil {
+		if recordErr := saveConsentRecord(s.dir, decision, s.actorDigest, decidedAt, floorAuthored, s.renameFn, s.chmodFn); recordErr != nil {
 			recordPersisted = false
 			c.stats.setLastError("consent_record_persist_failed")
 			c.logf("shardpilot spool: persisting the denied consent record failed (the decision still applies in memory): %v", recordErr)
@@ -1666,7 +1697,7 @@ func (c *Client) applySpoolConsent(decision ConsentDecision) ([]SpoolDeadLetter,
 		c.logf("shardpilot spool: a spool wipe is still owed; the persisted consent decision stays denied and the disk spool stays disabled until the wipe succeeds")
 		return nil, false
 	}
-	if err := saveConsentRecord(s.dir, ConsentDecisionGranted, s.actorDigest, s.renameFn, s.chmodFn); err != nil {
+	if err := saveConsentRecord(s.dir, ConsentDecisionGranted, s.actorDigest, decidedAt, floorAuthored, s.renameFn, s.chmodFn); err != nil {
 		s.mu.Lock()
 		s.grantPersisted = false
 		s.mu.Unlock()
