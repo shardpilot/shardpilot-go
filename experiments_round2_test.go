@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -307,5 +308,236 @@ func TestInitialMintConvergesOnRacingWinner(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join(spoolDir, expSubjectFileName))
 	if err != nil || strings.TrimSpace(string(data)) != winner {
 		t.Fatalf("the winner's file must be untouched: %q / %v", data, err)
+	}
+}
+
+// Unity round-2 class (3): retryable sweep refusals never count as Dropped
+// — only terminal outcomes do.
+func TestRetryableSweepRefusalsDoNotCountDropped(t *testing.T) {
+	script := &expScript{}
+	script.push(200, expAssignedBody("1"))
+	capture := &expWireCapture{}
+	server := newExperimentServer(t, script, capture)
+	defer server.Close()
+	client := newExperimentClient(t, server.URL, nil)
+	defer client.Close(context.Background())
+
+	fetchAssignment(t, client, expTestScopeKey)
+	// Deny: the purge re-arms the exposure; repeated consent-closed sweep
+	// attempts are retryable and must not inflate Dropped.
+	client.SetConsent(false)
+	droppedAfterDeny := client.Snapshot().Dropped
+	for i := 0; i < 5; i++ {
+		client.experimentCycle(context.Background())
+	}
+	if got := client.Snapshot().Dropped; got != droppedAfterDeny {
+		t.Fatalf("consent-closed sweep retries must not count as Dropped: %d -> %d", droppedAfterDeny, got)
+	}
+	client.exp.mu.Lock()
+	owed := len(client.exp.pendingExposure)
+	client.exp.mu.Unlock()
+	if owed == 0 {
+		t.Fatalf("the owed snapshot must survive the refused retries")
+	}
+}
+
+// Unity round-2 class (4): the first subject mint is serialized — two
+// concurrent first fetches use exactly one id.
+func TestConcurrentFirstFetchesShareOneMintedSubject(t *testing.T) {
+	script := &expScript{}
+	server := httptest.NewServer(script.handler(t))
+	defer server.Close()
+	client := newExperimentClient(t, server.URL, func(cfg *Config) { cfg.SpoolDir = t.TempDir() })
+	defer client.Close(context.Background())
+
+	done := make(chan struct{}, 2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			_, _ = client.FetchExperimentAssignment(context.Background(), expTestScopeKey, nil)
+		}()
+	}
+	<-done
+	<-done
+	if script.requestCount() != 2 {
+		t.Fatalf("expected both fetches to dispatch, got %d", script.requestCount())
+	}
+	first := script.request(0).URL.Query().Get("subject_key")
+	second := script.request(1).URL.Query().Get("subject_key")
+	if first != second || !validExperimentSubjectID(first) {
+		t.Fatalf("concurrent first fetches must share one minted subject: %q vs %q", first, second)
+	}
+}
+
+// Round-3 finding 1: a revalidation whose entry vanished aborts INSIDE the
+// fetch lock, before any dispatch — the TOCTOU gap between the lane's
+// pre-dispatch check and the fetch cannot reinstall a dropped experiment.
+func TestRevalidationWithoutEntryDoesNotDispatch(t *testing.T) {
+	script := &expScript{}
+	server := httptest.NewServer(script.handler(t))
+	defer server.Close()
+	client := newExperimentClient(t, server.URL, nil)
+	defer client.Close(context.Background())
+
+	_, err := client.fetchExperimentAssignment(context.Background(), expTestScopeKey, nil, true, nil)
+	if err == nil || !strings.Contains(err.Error(), "revalidation_entry_vanished") {
+		t.Fatalf("a revalidation for an uncached key must abort, got %v", err)
+	}
+	if script.requestCount() != 0 {
+		t.Fatalf("nothing may be dispatched for a vanished key, got %d requests", script.requestCount())
+	}
+	if v := client.ExperimentVariant(expTestScopeKey); v != "" {
+		t.Fatalf("nothing may be reinstalled, got %q", v)
+	}
+}
+
+// Round-3 finding 2: close housekeeping tears the consumer down BEFORE the
+// last durable retry, so a lane response settling in the close window is
+// discarded outright instead of minting an owed intent the exiting process
+// can never retry.
+func TestLateLaneSettleAfterCloseHousekeepingIsDiscarded(t *testing.T) {
+	script := &expScript{}
+	laneGate := make(chan struct{})
+	script.gates = map[int]chan struct{}{1: laneGate}
+	script.push(200, expAssignedBody("1"))
+	script.push(200, `{"assigned":false,"reason":"kill_switch"}`) // the gated lane response
+	server := httptest.NewServer(script.handler(t))
+	defer server.Close()
+	spoolDir := t.TempDir()
+	client := newExperimentClient(t, server.URL, func(cfg *Config) { cfg.SpoolDir = spoolDir })
+	defer client.Close(context.Background())
+
+	fetchAssignment(t, client, expTestScopeKey)
+	// A lane revalidation is in flight (parked at the server) when close
+	// housekeeping runs.
+	fetchDone := make(chan struct{})
+	go func() {
+		_, _ = client.fetchExperimentAssignment(context.Background(), expTestScopeKey, nil, true, nil)
+		close(fetchDone)
+	}()
+	waitFor(t, 5*time.Second, "the lane fetch reaches the server", func() bool { return script.requestCount() == 2 })
+	// Housekeeping (teardown + the LAST durable retry) runs, then the
+	// response lands.
+	client.closeExperimentPreFlush()
+	close(laneGate)
+	<-fetchDone
+	client.exp.mu.Lock()
+	owed := len(client.exp.durablePending)
+	entryStillServedInternally := client.exp.entries[expTestScopeKey] != nil
+	client.exp.mu.Unlock()
+	if owed != 0 {
+		t.Fatalf("a post-teardown settle must not mint owed intents, got %d", owed)
+	}
+	if !entryStillServedInternally {
+		t.Fatalf("a post-teardown settle must not install (the discarded kill re-arrives at the next launch)")
+	}
+	if record := readExperimentRecord(t, spoolDir); record == nil || len(record.Entries) != 1 {
+		t.Fatalf("the durable record must be untouched by the discarded settle: %+v", record)
+	}
+}
+
+// Round-3 finding 5: a deferral armed mid-batch (Retry-After or backoff)
+// stops the rest of the batch.
+func TestBatchStopsWhenDeferralArms(t *testing.T) {
+	script := &expScript{}
+	script.push(200, strings.Replace(expAssignedBody("1"), expTestScopeKey, "exp-a", 1))
+	script.push(200, strings.Replace(expAssignedBody("1"), expTestScopeKey, "exp-b", 1))
+	script.pushRetryAfter(429, ``, "120") // lane exp-a: arms the plane-wide pacing
+	server := httptest.NewServer(script.handler(t))
+	defer server.Close()
+	clock := &expFakeClock{now: time.Now()}
+	client := newExperimentClient(t, server.URL, nil)
+	client.clock = clock
+	defer client.Close(context.Background())
+
+	fetchAssignment(t, client, "exp-a")
+	fetchAssignment(t, client, "exp-b")
+	client.exp.mu.Lock()
+	client.exp.revalidateAtMS = 1
+	client.exp.mu.Unlock()
+	client.experimentCycle(context.Background())
+	if script.requestCount() != 3 {
+		t.Fatalf("the armed deferral must stop the batch after exp-a's 429, got %d requests", script.requestCount())
+	}
+}
+
+// Round-3 finding 4: owed exposure snapshots still stranded at teardown are
+// COUNTED (Stats.Dropped + a distinct diagnostic), never silently lost.
+func TestCloseCountsDiscardedOwedExposures(t *testing.T) {
+	script := &expScript{}
+	script.push(200, expAssignedBody("1"))
+	script.push(200, strings.Replace(expAssignedBody("1"), `"version":1`, `"version":2`, 1))
+	capture := &expWireCapture{}
+	server := newExperimentServer(t, script, capture)
+	defer server.Close()
+	client := newExperimentClient(t, server.URL, func(cfg *Config) {
+		cfg.BatchSize = 1
+		cfg.BufferSize = 1
+	})
+
+	// Two owed applications against a jammed pipeline that NEVER recovers.
+	parkWorkerWithFullQueue(t, client, capture)
+	fetchAssignment(t, client, expTestScopeKey)
+	fetchAssignment(t, client, expTestScopeKey)
+	client.exp.mu.Lock()
+	owed := len(client.exp.pendingExposure[expTestScopeKey])
+	client.exp.mu.Unlock()
+	if owed != 2 {
+		t.Fatalf("precondition: two owed applications, got %d", owed)
+	}
+	before := client.Snapshot().Dropped
+	closeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_ = client.Close(closeCtx) // the ingest stays 500: the drain cannot progress
+	snapshot := client.Snapshot()
+	if snapshot.Dropped < before+2 {
+		t.Fatalf("stranded owed exposures must count in Stats.Dropped: %d -> %d", before, snapshot.Dropped)
+	}
+	if snapshot.LastError != "experiment_exposures_discarded_at_close" {
+		t.Fatalf("the discard must carry its distinct diagnostic, got %q", snapshot.LastError)
+	}
+}
+
+// Round-3 finding 6: the assignment plane parses Retry-After with the batch
+// transport's parser — HTTP-dates included (its documented contract),
+// unlike the remote-config route's digits-only parse.
+func TestAssignmentRetryAfterHTTPDateParses(t *testing.T) {
+	script := &expScript{}
+	script.push(200, expAssignedBody("1"))
+	script.pushRetryAfter(429, ``, time.Now().Add(90*time.Second).UTC().Format(http.TimeFormat))
+	server := httptest.NewServer(script.handler(t))
+	defer server.Close()
+	clock := &expFakeClock{now: time.Now()}
+	client := newExperimentClient(t, server.URL, nil)
+	client.clock = clock
+	defer client.Close(context.Background())
+
+	fetchAssignment(t, client, expTestScopeKey)
+	result := fetchAssignment(t, client, expTestScopeKey) // the dated 429
+	if !result.FromCache || result.Code != "transient_429" {
+		t.Fatalf("expected the paced cache serve, got %+v", result)
+	}
+	// Inside the dated window the cadence is parked...
+	clock.advance(30 * time.Second)
+	client.exp.mu.Lock()
+	client.exp.revalidateAtMS = clock.Now().UnixMilli() - 1
+	parkedUntil := client.exp.retryAfterMS
+	client.exp.mu.Unlock()
+	if parkedUntil == 0 {
+		t.Fatalf("an HTTP-date Retry-After must arm the pacing (batch-parser parity)")
+	}
+	requestsBefore := script.requestCount()
+	client.experimentCycle(context.Background())
+	if script.requestCount() != requestsBefore {
+		t.Fatalf("the dated window must park the cadence")
+	}
+	// ...and past it the cadence resumes.
+	clock.advance(180 * time.Second)
+	client.exp.mu.Lock()
+	client.exp.revalidateAtMS = clock.Now().UnixMilli() - 1
+	client.exp.mu.Unlock()
+	client.experimentCycle(context.Background())
+	if script.requestCount() != requestsBefore+1 {
+		t.Fatalf("an expired dated window must release the cadence")
 	}
 }

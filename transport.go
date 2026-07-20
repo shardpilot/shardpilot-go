@@ -46,6 +46,10 @@ type remoteConfigResponse struct {
 	etag              string
 	retryAfterSeconds int
 	retryAfterPresent bool
+	// retryAfterRaw is the verbatim Retry-After header for consumers whose
+	// documented contract is the BATCH parser (digits + HTTP-date) rather
+	// than this route's digits-only one — the experiment-assignment plane.
+	retryAfterRaw string
 }
 
 // batchResult is the wire decode of the events:batch response (HTTP 202).
@@ -280,6 +284,7 @@ func (t *httpTransport) FetchRemoteConfig(ctx context.Context, request remoteCon
 		etag:              response.Header.Get("Etag"),
 		retryAfterSeconds: seconds,
 		retryAfterPresent: present,
+		retryAfterRaw:     response.Header.Get("Retry-After"),
 	}
 	if readErr != nil && ctx.Err() != nil {
 		return result, fmt.Errorf("read shardpilot remote config response: %w", readErr)

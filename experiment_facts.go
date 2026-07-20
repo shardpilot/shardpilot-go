@@ -74,12 +74,15 @@ func (c *Client) enqueueExperimentFact(event Event, atClose bool) error {
 	if !atClose && c.closed.Load() {
 		return ErrClosed
 	}
+	// Consent refusals here are RETRYABLE for the fact lane (an exposure
+	// snapshot stays owed and re-emits; the caller sees the refusal), so
+	// they deliberately do NOT count in Stats.Dropped — only terminal
+	// outcomes drop facts, and a re-armed snapshot retried across a
+	// consent-closed window must not inflate the counter per attempt.
 	if c.consentDenied() {
-		c.stats.dropped.Add(1)
 		return ErrConsentDenied
 	}
 	if c.consentFloorEnabled() && c.consentUndecided() {
-		c.stats.dropped.Add(1)
 		return ErrConsentUnknown
 	}
 	event, err := c.prepareEvent(event)
@@ -417,6 +420,15 @@ func (c *Client) closeExperimentPreFlush() {
 	if e == nil {
 		return
 	}
+	// Teardown FIRST: an in-flight lane response settling during the close
+	// window is discarded outright (no install, no pacing, no NEW owed
+	// durable intent), so the durable retry below runs against a STABLE
+	// intent set — a kill drop that settled a moment later would otherwise
+	// mint an owed intent after the last retry already ran and lose it at
+	// exit (the discarded response re-arrives at the next launch's
+	// revalidation instead). The close sweeps and the durable retry
+	// deliberately keep working after teardown.
+	e.teardown()
 	e.retryDurableSync()
 	if c.experimentConsentRefusal() == nil {
 		c.sweepAllExperimentExposuresMode(true)
@@ -462,14 +474,19 @@ func (c *Client) closeExperimentPostFlush(ctx context.Context) {
 				}
 			}
 			if after == 0 || after >= before {
-				if after > 0 {
-					c.logf("shardpilot experiments: %d owed exposure fact(s) could not be enqueued at close; live assignments re-arm from the durable record at the next launch", after)
-				}
 				break
 			}
 		}
 	}
-	e.teardown()
+	// Snapshots STILL owed at teardown are lost with the process (a
+	// dropped assignment's or a memory-only client's facts have nothing to
+	// re-arm them; live entries re-arm from the durable record): COUNT
+	// them as dropped with a distinct diagnostic — never a silent loss.
+	if remaining := c.owedExperimentExposureCount(); remaining > 0 {
+		c.stats.dropped.Add(uint64(remaining))
+		c.stats.setLastError("experiment_exposures_discarded_at_close")
+		c.logf("shardpilot experiments: %d owed exposure fact(s) discarded at close (counted in Stats.Dropped); live assignments re-arm from the durable record at the next launch", remaining)
+	}
 }
 
 func (c *Client) owedExperimentExposureCount() int {

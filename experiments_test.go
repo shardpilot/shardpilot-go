@@ -372,8 +372,7 @@ func TestApplyExperimentAssignmentClassification(t *testing.T) {
 			}
 		}
 		resp := expTestResponse(429, ``)
-		resp.retryAfterSeconds = 120
-		resp.retryAfterPresent = true
+		resp.retryAfterRaw = "120"
 		_, outcome, _ := applyExperimentAssignment(cached, resp, scope, 42)
 		if !outcome.retryAfterPresent || outcome.retryAfterSeconds != 120 {
 			t.Fatalf("Retry-After must ride the transient outcome, got %+v", outcome)
@@ -385,8 +384,7 @@ func TestApplyExperimentAssignmentClassification(t *testing.T) {
 		}
 		// 408 carries no Retry-After contract.
 		resp = expTestResponse(408, ``)
-		resp.retryAfterSeconds = 120
-		resp.retryAfterPresent = true
+		resp.retryAfterRaw = "120"
 		_, outcome, _ = applyExperimentAssignment(cached, resp, scope, 42)
 		if outcome.retryAfterPresent {
 			t.Fatalf("408 must not arm Retry-After pacing")

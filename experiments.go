@@ -583,8 +583,14 @@ func applyExperimentAssignment(entry *expEntry, resp remoteConfigResponse, scope
 	if transientCode != "" {
 		outcome := expOutcome{transient: true}
 		if status == 429 || status >= 500 {
-			outcome.retryAfterSeconds = resp.retryAfterSeconds
-			outcome.retryAfterPresent = resp.retryAfterPresent
+			// Batch-transport parity (this plane's documented contract):
+			// Retry-After parses as delta-seconds OR an HTTP-date, day
+			// clamped — unlike the remote-config route's deliberately
+			// digits-only parse.
+			if wait, present := parseRetryAfter(resp.retryAfterRaw); present {
+				outcome.retryAfterSeconds = int(wait / time.Second)
+				outcome.retryAfterPresent = true
+			}
 		}
 		result, failure := serveExperimentEntryOrFail(entry, transientCode)
 		return result, outcome, failureOrEmpty(result, failure)
@@ -2039,6 +2045,16 @@ func (c *Client) fetchExperimentAssignment(ctx context.Context, experimentKey st
 			c.logf("shardpilot experiments: persisting the minted subject id failed; the id rules this process only (a restart re-buckets)")
 		}
 	}
+	if isRevalidation && e.entries[experimentKey] == nil {
+		// The pre-dispatch existence check and this section run under
+		// separate lock acquisitions: the entry can vanish in the gap (a
+		// concurrent host fetch's drop, a re-mint clearing the cache).
+		// Re-check WHILE HOLDING the lock — a revalidation for a vanished
+		// key must not dispatch at all, or its 200 would reinstall (with
+		// no remembered attributes) an experiment the plane just removed.
+		e.mu.Unlock()
+		return ExperimentAssignmentResult{}, expFetchError("revalidation_entry_vanished")
+	}
 	e.fetchSeq++
 	seq := e.fetchSeq
 	// Capture the scope and the auth epoch ONCE per fetch: the URL, the
@@ -2354,8 +2370,15 @@ func (c *Client) experimentCycle(ctx context.Context) {
 		if ctx.Err() != nil || c.experimentConsentRefusal() != nil {
 			return
 		}
+		dispatchNowMS := c.clock.Now().UnixMilli()
 		e.mu.Lock()
 		blocked := e.authBlocked || e.tornDown
+		// A deferral armed MID-BATCH (a 429/5xx Retry-After or the
+		// transient backoff from an earlier key in this very cycle) parks
+		// the whole plane: later GETs must not dispatch inside the
+		// server-requested wait — the batch stops and the cadence resumes
+		// after the deadline.
+		parked := e.retryAfterMS != 0 && dispatchNowMS < e.retryAfterMS
 		// The key must STILL be cached (and under the current subject's
 		// scope) at dispatch: the batch runs from a snapshot, and a
 		// concurrent host fetch can have dropped the entry (a
@@ -2363,10 +2386,12 @@ func (c *Client) experimentCycle(ctx context.Context) {
 		// clearing the cache) since it was taken. A revalidation for a
 		// vanished key is a no-op — dispatching it anyway could REINSTALL
 		// the just-dropped experiment (with no remembered attributes),
-		// resurrecting state the plane deliberately removed.
+		// resurrecting state the plane deliberately removed. (The fetch
+		// re-checks under its own lock too — this gate just avoids the
+		// dispatch.)
 		stillCached := e.entries[key] != nil
 		e.mu.Unlock()
-		if blocked {
+		if blocked || parked {
 			return
 		}
 		if !stillCached {
