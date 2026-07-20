@@ -643,7 +643,11 @@ func testConsentReceipt(key string, analytics bool) consentReceipt {
 		AppID:           "app-test",
 		EnvironmentID:   "develop",
 		ActorIdentifier: "anon-spool-1",
-		DecidedAt:       "2026-07-19T00:00:00Z",
+		// The retention metadata a real mint stamps for this config: the
+		// in-scope rule matches BOTH actor components, so a planted receipt
+		// must carry the anonymous id it was "minted" under.
+		AnonymousID: "anon-spool-1",
+		DecidedAt:   "2026-07-19T00:00:00Z",
 	}
 	receipt.Categories.Analytics = &analytics
 	return receipt
@@ -4108,5 +4112,214 @@ func TestConsentFloorRetriedCloseWaitsForWorkerStop(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join(dir, spoolFileName))
 	if err != nil || !strings.Contains(string(data), "evt-retry-close-1") {
 		t.Fatalf("expected the remnant event durable in spool.json, got (%v, %q)", err, string(data))
+	}
+}
+
+func TestConsentFloorDenialRecordLandsBeforePurge(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// With a durable prior grant, the denial's RECORD must land before the
+	// purge destroys the spool: purge-first opens a crash window where the
+	// spool is gone but no durable evidence of the denial exists yet — a
+	// relaunch would promote the stale granted record over a destroyed
+	// spool. Phase 1 pins the ORDER; phase 2 pins the deferred purge when
+	// the record write fails.
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the grant acknowledged", func() bool {
+		return client.Snapshot().ConsentRecorded == 1
+	})
+	state.setBatchOutcome(http.StatusServiceUnavailable)
+	if err := client.Enqueue(Event{ID: "evt-order-1", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Flush(context.Background()); err == nil {
+		t.Fatalf("expected the retryable batch failure")
+	}
+	waitFor(t, 3*time.Second, "the event spooled durably", func() bool {
+		return client.Snapshot().Spooled == 1
+	})
+
+	var opsMu sync.Mutex
+	var ops []string
+	client.spool.renameFn = func(oldpath, newpath string) error {
+		if strings.Contains(newpath, consentRecordFileName) {
+			opsMu.Lock()
+			ops = append(ops, "record-write")
+			opsMu.Unlock()
+		}
+		return os.Rename(oldpath, newpath)
+	}
+	client.spool.removeFn = func(path string) error {
+		if strings.Contains(path, spoolFileName) {
+			opsMu.Lock()
+			ops = append(ops, "spool-purge")
+			opsMu.Unlock()
+		}
+		return os.Remove(path)
+	}
+	client.SetConsent(false)
+	opsMu.Lock()
+	order := append([]string(nil), ops...)
+	opsMu.Unlock()
+	if len(order) < 2 || order[0] != "record-write" || order[1] != "spool-purge" {
+		t.Fatalf("expected the denied record written BEFORE the spool purge, got %v", order)
+	}
+	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentDenied {
+		t.Fatalf("expected the denied record durable, got (%v, %v)", recorded, ok)
+	}
+	_ = client.Close(context.Background())
+
+	// Phase 2: the record write FAILS — the purge is deferred with it, and
+	// the owed-record retry completes both in the pass the record lands.
+	dir2 := t.TempDir()
+	client2 := newFloorTestClient(t, server.URL, dir2, nil)
+	client2.SetConsent(true)
+	waitFor(t, 3*time.Second, "the second grant acknowledged", func() bool {
+		return client2.Snapshot().ConsentRecorded == 1
+	})
+	if err := client2.Enqueue(Event{ID: "evt-order-2", Name: "e2"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client2.Flush(context.Background()); err == nil {
+		t.Fatalf("expected the retryable batch failure")
+	}
+	waitFor(t, 3*time.Second, "the second event spooled durably", func() bool {
+		return client2.Snapshot().Spooled == 1
+	})
+	recordErr := errors.New("disk full")
+	var failing atomic.Bool
+	failing.Store(true)
+	var purged atomic.Bool
+	client2.spool.renameFn = func(oldpath, newpath string) error {
+		if failing.Load() && strings.Contains(newpath, consentRecordFileName) {
+			return recordErr
+		}
+		return os.Rename(oldpath, newpath)
+	}
+	client2.spool.removeFn = func(path string) error {
+		if strings.Contains(path, spoolFileName) {
+			purged.Store(true)
+		}
+		return os.Remove(path)
+	}
+	client2.SetConsent(false)
+	if purged.Load() {
+		t.Fatalf("expected the purge DEFERRED while the denied record write is owed")
+	}
+	if _, err := os.Stat(filepath.Join(dir2, spoolFileName)); err != nil {
+		t.Fatalf("expected spool.json intact while the record is owed, got %v", err)
+	}
+	failing.Store(false)
+	_ = client2.Flush(context.Background()) // a dispatch point: the owed record retries
+	waitFor(t, 3*time.Second, "the deferred purge completed with the record", func() bool {
+		recorded, ok := loadConsentRecord(dir2, spoolTestActorDigest())
+		return ok && recorded == ConsentDenied && purged.Load()
+	})
+	if _, err := os.Stat(filepath.Join(dir2, spoolFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected the spool purged once the record landed, got %v", err)
+	}
+}
+
+func TestConsentFloorChangedAnonymousIDReceiptOutOfScope(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// A reused SpoolDir with the SAME UserID but a DIFFERENT configured
+	// AnonymousID: the old identity's receipt must be FOREIGN — both actor
+	// components are part of the scope, exactly like the record digest —
+	// never overriding or healing the new digest's state.
+	dir := t.TempDir()
+	oldReceipt := testConsentReceipt("key-old-anon-1", true)
+	oldReceipt.ActorIdentifier = "user-1"
+	oldReceipt.AnonymousID = "anon-A"
+	planted := newConsentOutbox(dir)
+	if planted.append(oldReceipt) {
+		t.Fatalf("seeding the old-identity receipt failed")
+	}
+	client := newFloorTestClient(t, server.URL, dir, func(cfg *Config) {
+		cfg.UserID = "user-1"
+		cfg.AnonymousID = "anon-B"
+	})
+	if got := client.Consent(); got != ConsentUnknown {
+		t.Fatalf("expected the old identity's receipt out of scope (undecided floor), got %v", got)
+	}
+	if err := client.Track(context.Background(), Event{Name: "e1"}); !errors.Is(err, ErrConsentUnknown) {
+		t.Fatalf("expected the undecided refusal, got %v", err)
+	}
+	newDigest := consentActorDigest(Config{
+		WorkspaceID:   "workspace-test",
+		AppID:         "app-test",
+		EnvironmentID: "develop",
+		UserID:        "user-1",
+		AnonymousID:   "anon-B",
+	})
+	if _, ok := loadConsentRecordInfo(dir, newDigest); ok {
+		t.Fatalf("expected NO healed record for the new digest")
+	}
+	if got := state.consentCount(); got != 0 {
+		t.Fatalf("expected the foreign receipt never dispatched with this scope's bearer, got %d", got)
+	}
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if probe := newConsentOutbox(dir); len(probe.readRecordReceipts()) != 1 {
+		t.Fatalf("expected the foreign receipt retained for its own identity")
+	}
+
+	// Control: the SAME both-component identity stays in scope and the
+	// proof still restores the grant.
+	sameDir := t.TempDir()
+	sameReceipt := testConsentReceipt("key-same-anon-1", true)
+	sameReceipt.ActorIdentifier = "user-1"
+	sameReceipt.AnonymousID = "anon-B"
+	planted = newConsentOutbox(sameDir)
+	if planted.append(sameReceipt) {
+		t.Fatalf("seeding the same-identity receipt failed")
+	}
+	sameClient := newFloorTestClient(t, server.URL, sameDir, func(cfg *Config) {
+		cfg.UserID = "user-1"
+		cfg.AnonymousID = "anon-B"
+	})
+	if got := sameClient.Consent(); got != ConsentGranted {
+		t.Fatalf("expected the matching identity's proof to restore the grant, got %v", got)
+	}
+	_ = sameClient.Close(context.Background())
+}
+
+func TestConsentFloorGrantHandoffRechecksUnderDecisionLock(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// TOCTOU at the handoff: a decision mid-flight (the record-apply lock
+	// held) may be appending a held denial AFTER the pass's hold checks ran.
+	// The grant must re-take the decision serialization point before the
+	// transport call — and PARK when it cannot (a decision IS mid-flight),
+	// never posting past a denial that may be landing right now.
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	if !client.consentOutbox.claimDispatch() {
+		t.Fatalf("test shape: claiming the dispatch lock failed")
+	}
+	client.SetConsent(true) // pair completes; receipt retained under the held claim
+	client.consentOutbox.releaseDispatch()
+
+	client.consentRecordApplyMu.Lock() // a decision mid-flight, deterministically
+	_ = client.Flush(context.Background())
+	if got := state.consentCount(); got != 0 {
+		t.Fatalf("expected the grant PARKED while a decision holds the apply lock, got %d posts", got)
+	}
+	client.consentRecordApplyMu.Unlock()
+
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush after the release: %v", err)
+	}
+	waitFor(t, 3*time.Second, "the grant delivered after the lock released", func() bool {
+		return state.consentCount() == 1
+	})
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 }

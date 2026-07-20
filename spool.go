@@ -1706,16 +1706,29 @@ func (c *Client) applySpoolConsent(decision ConsentDecision, decidedAt string) (
 		s.mu.Lock()
 		s.grantPersisted = false
 		s.mu.Unlock()
-		dropped, err := s.purge()
-		if err != nil {
-			c.stats.setLastError("spool_purge_failed")
-			c.logf("shardpilot spool: consent purge failed; a wipe is owed and the disk spool is disabled until it succeeds: %v", err)
-		}
+		// The denied RECORD lands BEFORE the purge destroys anything: with a
+		// durable prior grant on disk, purging first would open a crash
+		// window where the spool is gone but no durable evidence of the
+		// denial exists yet (record unwritten, receipt not yet appended) — a
+		// relaunch would promote the stale granted record over a destroyed
+		// spool. Record-first, every crash interleaving fails CLOSED: a
+		// crash after the record restores denied (and the relaunch purges);
+		// a crash before it changed nothing durable. When the record write
+		// FAILS the purge is DEFERRED with it: the write gate is already
+		// closed (grantPersisted false) and the live denial refuses intake,
+		// so nothing flows meanwhile, and the owed-record retry re-runs this
+		// branch — the purge completes in the same pass the record lands.
 		recordPersisted := true
 		if recordErr := saveConsentRecord(s.dir, decision, s.actorDigest, decidedAt, floorAuthored, s.renameFn, s.chmodFn); recordErr != nil {
 			recordPersisted = false
 			c.stats.setLastError("consent_record_persist_failed")
-			c.logf("shardpilot spool: persisting the denied consent record failed (the decision still applies in memory): %v", recordErr)
+			c.logf("shardpilot spool: persisting the denied consent record failed (the decision still applies in memory; the spool purge is deferred to the record retry): %v", recordErr)
+			return nil, false
+		}
+		dropped, err := s.purge()
+		if err != nil {
+			c.stats.setLastError("spool_purge_failed")
+			c.logf("shardpilot spool: consent purge failed; a wipe is owed and the disk spool is disabled until it succeeds: %v", err)
 		}
 		if len(dropped) == 0 {
 			return nil, recordPersisted

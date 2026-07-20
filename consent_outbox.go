@@ -980,10 +980,20 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 // skipping an out-of-scope override keeps the correctly-scoped record,
 // while adopting a cross-scope tail would apply another scope's decision.
 func (c *Client) consentReceiptInScope(receipt consentReceipt) bool {
+	// BOTH actor components must match, not just the wire identifier: the
+	// receipt retains the AnonymousID it was minted under precisely so a
+	// reused SpoolDir with the same UserID but a DIFFERENT configured
+	// AnonymousID cannot treat the old identity's receipt as this scope's —
+	// the record digest already spans both components, and an
+	// ActorIdentifier-only match would let the old receipt override and
+	// heal the NEW digest (loading spool data the record scoping rejected).
+	// The mint stamps AnonymousID from the same validated config the digest
+	// hashes, so equality here mirrors the digest's actor scope exactly.
 	return receipt.WorkspaceID == c.cfg.WorkspaceID &&
 		receipt.AppID == c.cfg.AppID &&
 		receipt.EnvironmentID == c.cfg.EnvironmentID &&
-		receipt.ActorIdentifier == firstNonEmpty(c.cfg.UserID, c.cfg.AnonymousID)
+		receipt.ActorIdentifier == firstNonEmpty(c.cfg.UserID, c.cfg.AnonymousID) &&
+		receipt.AnonymousID == c.cfg.AnonymousID
 }
 
 // consentFloorActorMismatch reports whether an event's EFFECTIVE actor —
@@ -1417,6 +1427,30 @@ func (c *Client) dispatchConsentReceipts(ctx context.Context, join bool) (map[st
 			// release it. Memory-only outboxes never owe writes and are
 			// unaffected.
 			return handed, true
+		}
+		if receipt.analyticsGranted() {
+			// TOCTOU guard before the handoff: a decision mid-flight can be
+			// appending and marking a NEWER held denial right now — the hold
+			// checks above ran before its append landed in the trail.
+			// Re-take the decision serialization point OPPORTUNISTICALLY:
+			// a failed TryLock means a decision IS mid-flight (possibly that
+			// denial), so the grant parks for the next pass — dispatch never
+			// waits out a stalled decision write — and a successful TryLock
+			// proves no decision is between its append and its marks, so the
+			// held-denial predicates re-run against the settled trail. A
+			// denial recorded AFTER this instant follows the grant on the
+			// wire in decision order (the dispatch claim serializes posts),
+			// which is the legitimate sequential outcome.
+			if !c.consentRecordApplyMu.TryLock() {
+				return handed, true
+			}
+			mo := c.consentMintOwedSnapshot()
+			heldBehindDenial := (mo != nil && mo.decision != ConsentDecisionGranted) ||
+				c.newerInScopeDenialHeld(receipt)
+			c.consentRecordApplyMu.Unlock()
+			if heldBehindDenial {
+				return handed, true
+			}
 		}
 		attemptCtx, cancel := contextWithDefaultTimeout(ctx, c.cfg.HTTPTimeout)
 		_, err := c.transport.PublishConsent(attemptCtx, consentReceiptWire(receipt))
