@@ -31,7 +31,10 @@
     healed — a stale grant can never reopen the pipeline for an actor whose last
     decision was a denial. The override reads the latest IN-SCOPE receipt — scanned
     newest→oldest for the configured workspace/app/environment tuple and the configured
-    actor — so a foreign receipt retained in a reused `SpoolDir` can neither flip this
+    actor, matching BOTH actor components (the wire identifier AND the retained
+    AnonymousID metadata, mirroring the record digest's actor scope), so a reused
+    `SpoolDir` with the same UserID but a different configured AnonymousID treats
+    the old identity's receipts as foreign — so a foreign receipt retained in a reused `SpoolDir` can neither flip this
     client's state, nor heal the record for a digest its decision never covered, nor
     HIDE this client's own latest decision by merely being newer — and it may override
     only when its decision is STRICTLY NEWER than the record's decision moment
@@ -84,7 +87,13 @@
     down — a crash can never leave a restored grant with an empty outbox flowing
     events receipt-less, and a failed receipt write WITHHOLDS the record (fail-closed
     across restart, healed from the trail tail once the owed write lands) — while a
-    DENIAL keeps its record (and the spool purge it condemns) first. A decision-record
+    DENIAL keeps its record (and the spool purge it condemns) first — and WITHIN
+    the denial the RECORD lands before the purge destroys anything: purge-first
+    would open a crash window where the spool is gone with no durable evidence
+    of the denial yet, and a relaunch would promote the stale granted record
+    over a destroyed spool; a failed denied-record write DEFERS the purge with
+    it (the write gate is already closed and the live denial refuses intake),
+    completing both in the owed-record retry pass the record lands. A decision-record
     write that fails (or is withheld) is OWED and retried at every dispatch point: the
     withheld grant record completes its receipt-first PAIR in the same pass the outbox
     write recovers — before the receipt can deliver and prune away the trail's only
@@ -114,7 +123,13 @@
     PARKED newer in-scope denial, whatever parked it — the per-receipt owed
     mark, the owed mint (the receipt not yet in the trail), or the held deny
     proof — while a newer denial with no holds needs no park: the same serial
-    pass delivers grant then denial in decision order. A failed
+    pass delivers grant then denial in decision order. The handoff RE-CHECKS
+    under the decision serialization point: immediately before the transport
+    call a grant re-takes the record-apply lock opportunistically — a failed
+    try means a decision is mid-flight (possibly appending that held denial)
+    and the grant parks for the next pass, while a successful try re-runs the
+    held-denial predicates against the settled trail, closing the window
+    between the pass's hold checks and the post. A failed
     idempotency-key MINT for a CONFIGURED actor is never the local-only path:
     the receipt is OWED — re-minted at every dispatch point with the original
     decision's stamp — a mint-failed GRANT withholds its record and holds the
