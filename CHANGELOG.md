@@ -108,7 +108,12 @@
     record, the wipe-owed marker, or the spool file's removal is durable —
     when the marker creation fails too it escalates in order (retry the
     denied record, which restores record-first and completes the purge; else
-    remove the condemned spool file itself, durable by destruction; else
+    remove the condemned spool file itself, durable by destruction — and
+    destruction counts as durable only once the DIRECTORY entry change is
+    fsynced (settleOwedWipe syncs the spool directory after its unlinks and
+    keeps the wipe owed on a failed sync: POSIX permits a crash to lose an
+    un-synced unlink, and a resurrected spool.json under the stale granted
+    record with no marker would reload the condemned events); else
     surface the failure with the in-memory condemnation holding and the
     owed-record retry re-deriving the debt at every dispatch point), because
     a crash with none of them would leave stale granted state plus the
@@ -265,7 +270,12 @@
     the verdict fold only) all fold the same way — counted PER EVENT through
     the mirror's unpersisted-entry tracking, so a remnant that merely
     de-duplicated against an earlier append whose
-    save had failed counts exactly like a fresh dirty add. The discard fold is
+    save had failed counts exactly like a fresh dirty add; the retry-age
+    discount removes exactly the EXPIRED COPIES (a per-entry multiset,
+    never every entry sharing an id), so a fresh duplicate retained under
+    the same event id as an expired stale copy still reaches the
+    unpersisted-mirror fold instead of silently vanishing from a
+    failed-save close. The discard fold is
     re-applied (idempotently) on every cached-`Close` return: a `Close` whose context
     expired before the worker's stop path finished counting cannot hide a loss
     counted after its verdict was cached — and a RETRIED `Close` (after an

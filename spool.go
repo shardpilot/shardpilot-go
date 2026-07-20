@@ -246,10 +246,13 @@ type diskSpool struct {
 	// deterministically (the same seam discipline as createAnonymousIDWith).
 	// markerFn creates the wipe-owed marker (createWipeOwedMarker),
 	// injectable so tests can exercise a failed debt-marker creation.
+	// syncFn fsyncs the spool directory (syncDir), injectable so tests can
+	// exercise a destruction whose unlink cannot be made durable.
 	removeFn func(path string) error
 	renameFn func(oldpath, newpath string) error
 	chmodFn  func(name string, mode os.FileMode) error
 	markerFn func(dir string) error
+	syncFn   func(dir string) error
 }
 
 // spoolSettledMemory bounds the settled-id memory used to suppress
@@ -271,6 +274,7 @@ func newDiskSpool(cfg Config) *diskSpool {
 		renameFn:     os.Rename,
 		chmodFn:      os.Chmod,
 		markerFn:     createWipeOwedMarker,
+		syncFn:       syncDir,
 	}
 	s.owed = wipeOwedMarkerExists(s.dir)
 	return s
@@ -518,8 +522,6 @@ func (s *diskSpool) settleOwedWipeLocked() bool {
 	if s.removeRecordFile() != nil {
 		return false
 	}
-	// The record file is gone: any deferred capacity evictions are final.
-	s.releaseDeferredCapacityDropsLocked()
 	// The durable marker must come off BEFORE the spool reopens: with the
 	// marker still on disk, a restart would re-run the wipe and destroy
 	// events spooled after this settle — so a failed marker removal keeps
@@ -528,6 +530,20 @@ func (s *diskSpool) settleOwedWipeLocked() bool {
 	if s.removeMarkerFile() != nil {
 		return false
 	}
+	// The unlinks are DURABLE only once the directory entry changes are
+	// fsynced: POSIX permits a crash to lose an un-synced unlink, which
+	// would resurrect the condemned record file — and on the purge-debt
+	// destruction rung this settle IS the only durable outcome (record,
+	// marker, and record-retry all failed), so a resurrected spool.json
+	// under the stale granted record would reload the condemned events. A
+	// failed sync keeps the wipe owed (fail-closed, retried), and the
+	// destruction rung falls to the surfaced posture.
+	if s.syncFn(s.dir) != nil {
+		return false
+	}
+	// The record file is durably gone: any deferred capacity evictions are
+	// final.
+	s.releaseDeferredCapacityDropsLocked()
 	s.owed = false
 	return true
 }
@@ -1243,15 +1259,23 @@ func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned b
 	capacityDropped = len(evicted) + c.drainSpoolCapacityDrops()
 	// Everything eligible that was not dropped for retry age is in the
 	// mirror now — freshly added, or a duplicate of an entry a previous
-	// append already accepted (possibly under a failed write).
-	expiredIDs := make(map[string]struct{}, len(expired))
+	// append already accepted (possibly under a failed write). Expiry is
+	// judged per ENTRY, so remove exactly as many copies of an id as the
+	// append expired (a MULTISET discount), never every copy sharing the
+	// id: a batch can carry an expired stale copy AND a fresh duplicate
+	// under the same event id, and filtering by bare id would drop the
+	// retained fresh copy from the remnant accounting — a failed-save
+	// close would then under-report it (unpersistedOf never asked).
+	expiredCopies := make(map[string]int, len(expired))
 	for _, entry := range expired {
-		expiredIDs[entry.id] = struct{}{}
+		expiredCopies[entry.id]++
 	}
 	for _, entry := range eligible {
-		if _, dropped := expiredIDs[entry.id]; !dropped {
-			mirrored = append(mirrored, entry.id)
+		if expiredCopies[entry.id] > 0 {
+			expiredCopies[entry.id]--
+			continue
 		}
+		mirrored = append(mirrored, entry.id)
 	}
 	return 0, mirrored, capacityDropped, len(expired)
 }

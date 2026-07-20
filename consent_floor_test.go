@@ -4933,3 +4933,145 @@ func TestConsentFloorFailedSaveEvictionFoldsIntoCloseVerdict(t *testing.T) {
 		t.Fatalf("expected BOTH remnant members in the loss accounting (the settled eviction and the unpersisted mirror member), got Dropped=%d", got)
 	}
 }
+
+func TestConsentFloorPurgeDebtDestructionRequiresDirSync(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// The destruction rung's unlink is durable only once the DIRECTORY is
+	// fsynced — POSIX permits a crash to lose an un-synced unlink, and the
+	// rung is only reached when the record, the marker, AND the record
+	// retry all failed, so a resurrected spool.json would sit under a
+	// stale granted record with no marker: the condemned events would
+	// reload. A failed dir-sync must therefore NOT settle the wipe — the
+	// ladder falls to the surfaced-and-retry rung instead.
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the grant acknowledged", func() bool {
+		return client.Snapshot().ConsentRecorded == 1
+	})
+	state.setBatchOutcome(http.StatusServiceUnavailable)
+	if err := client.Enqueue(Event{ID: "evt-sync-1", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Flush(context.Background()); err == nil {
+		t.Fatalf("expected the retryable batch failure that spools the event")
+	}
+	waitFor(t, 3*time.Second, "the event spooled durably", func() bool {
+		return client.Snapshot().Spooled == 1
+	})
+
+	var failing atomic.Bool
+	failing.Store(true)
+	client.spool.mu.Lock()
+	client.spool.renameFn = func(oldpath, newpath string) error {
+		if failing.Load() && strings.HasSuffix(newpath, consentRecordFileName) {
+			return errors.New("disk full")
+		}
+		return os.Rename(oldpath, newpath)
+	}
+	client.spool.markerFn = func(string) error {
+		if failing.Load() {
+			return errors.New("marker refused")
+		}
+		return createWipeOwedMarker(dir)
+	}
+	client.spool.syncFn = func(string) error {
+		if failing.Load() {
+			return errors.New("dir sync refused")
+		}
+		return syncDir(dir)
+	}
+	client.spool.mu.Unlock()
+
+	client.SetConsent(false)
+	// The unlink itself ran but could not be MADE DURABLE: the rung must
+	// not claim the destruction — surfaced posture, wipe still owed.
+	if got := client.Snapshot().LastError; got != "spool_purge_failed" {
+		t.Fatalf("expected the un-synced destruction surfaced as spool_purge_failed, got %q", got)
+	}
+	client.spool.mu.Lock()
+	owed := client.spool.owed
+	heldEntries := len(client.spool.entries)
+	client.spool.mu.Unlock()
+	if !owed {
+		t.Fatalf("expected the wipe STILL OWED while the unlink is not durably synced")
+	}
+	if heldEntries != 0 {
+		t.Fatalf("expected the in-memory condemnation regardless, got %d entries", heldEntries)
+	}
+
+	// Everything heals: the debt re-derives at the next dispatch point and
+	// the denied record + durable purge complete.
+	failing.Store(false)
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush after the heal: %v", err)
+	}
+	waitFor(t, 3*time.Second, "the denied record healed and the wipe settled", func() bool {
+		recorded, ok := loadConsentRecord(dir, spoolTestActorDigest())
+		if !ok || recorded != ConsentDenied {
+			return false
+		}
+		client.spool.mu.Lock()
+		stillOwed := client.spool.owed
+		client.spool.mu.Unlock()
+		return !stillOwed
+	})
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestConsentFloorDuplicateIDExpiredRemnantStillCounted(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// A close-remnant batch can carry an EXPIRED stale copy and a FRESH
+	// duplicate under the same event id (expiry is judged per entry). The
+	// mirrored-remnant accounting must discount exactly the expired
+	// copies, never every entry sharing the id: filtering by bare id
+	// dropped the retained fresh duplicate from the failed-save close
+	// accounting — unpersistedOf was never asked about it, and the close
+	// under-reported the loss.
+	dir := t.TempDir()
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the grant acknowledged", func() bool {
+		return client.Snapshot().ConsentRecorded == 1
+	})
+
+	// spool.json saves fail throughout: the fresh duplicate is only ever
+	// accepted into the mirror under failed writes.
+	client.spool.mu.Lock()
+	client.spool.renameFn = func(oldpath, newpath string) error {
+		if strings.HasSuffix(newpath, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return os.Rename(oldpath, newpath)
+	}
+	client.spool.mu.Unlock()
+	state.setBatchOutcome(http.StatusServiceUnavailable)
+
+	// One batch, same id twice: a stale copy past the spool retry-age cap
+	// and a fresh one.
+	if err := client.Enqueue(Event{ID: "evt-dup-1", Name: "e1", Timestamp: time.Now().Add(-8 * 24 * time.Hour)}); err != nil {
+		t.Fatalf("Enqueue stale copy: %v", err)
+	}
+	if err := client.Enqueue(Event{ID: "evt-dup-1", Name: "e1"}); err != nil {
+		t.Fatalf("Enqueue fresh copy: %v", err)
+	}
+	err := client.Close(context.Background())
+	if !errors.Is(err, ErrEventsDiscarded) {
+		t.Fatalf("expected the close verdict to report the discarded remnant, got %v", err)
+	}
+	// BOTH copies are teardown losses: the expired one through the
+	// retry-age refusal, the fresh one through the unpersisted-mirror
+	// fold. Pre-fix the id-filter hid the fresh copy (Dropped=1).
+	if got := client.Snapshot().Dropped; got != 2 {
+		t.Fatalf("expected both the expired copy and the retained fresh duplicate counted, got Dropped=%d", got)
+	}
+	if got := client.Snapshot().SpoolExpired; got == 0 {
+		t.Fatalf("test shape: expected the stale copy refused for retry age")
+	}
+}
