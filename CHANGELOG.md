@@ -17,12 +17,15 @@
     assignment's `reason` — absent = traffic gate, `kill_switch`,
     `targeting_unmatched` — and the client_id-unit `subject_fact_key` retained: it is
     the only permitted analytics fact subject). Bodies are validated per verdict
-    shape: a syntactically valid but INCOMPLETE verdict (an assigned verdict missing
-    its assignment/variant keys or a known assignment unit — or, for the client_id
-    unit, a grammar-valid subject fact key — a not-assigned verdict with an unknown
-    reason) and wrongly TYPED members (an array/string `variant_payload`, a
-    non-object `boundary`) classify as the transient `malformed_response` and keep
-    serving the last-known-good record, never install as a fresh verdict. The
+    shape AND against the request: a syntactically valid but INCOMPLETE verdict (an
+    assigned verdict missing its assignment/variant keys or a known assignment unit
+    — or, for the client_id unit, a grammar-valid subject fact key — a not-assigned
+    verdict with an unknown reason, a missing or non-positive `version`), wrongly
+    TYPED members (an array/string `variant_payload`, a non-object `boundary`), and
+    a body that does not ECHO the requested app/environment/experiment scope all
+    classify as the transient `malformed_response` and keep serving the
+    last-known-good record, never install as a fresh verdict (preload applies the
+    same echo contract to durable records). The
     ratified remote-config failure canon applies per fetch — transients serve the per-experiment last-known-good
     cached assignment (`FromCache=true`), `401`/`403` fail closed with NO cross-fetch
     latch, `404`/unexpected statuses are permanent — plus the two assignment-only
@@ -31,9 +34,13 @@
     additionally drops the cached record and its subject fact key, and the AUTOMATIC
     revalidation lane (opt-in `Config.ExperimentAssignmentRevalidateInterval`,
     default OFF, 60s floor) halts after an authoritative `401`/`403` until
-    re-initialization — host-triggered fetches keep classifying per fetch and never
+    re-initialization (only a refusal that won the per-scope sequence fence halts —
+    a stale overlapping refusal that lost to a newer settled success halts
+    nothing) — host-triggered fetches keep classifying per fetch and never
     resume the lane. Optional durable records via
-    `Config.ExperimentAssignmentCachePath` (one client per cache path, like the
+    `Config.ExperimentAssignmentCachePath`, scoped by the full (workspace, app,
+    environment, subject, URL, experiment) tuple — a reused cache path never serves
+    one workspace's assignment to another (one client per cache path, like the
     remote-config cache). No cooldown is armed on this plane (it has no `429`
     `Retry-After` contract today).
   - `spcid` experiment subject key: `Config.ExperimentSubjectKey` + the opt-in
@@ -59,8 +66,12 @@
     actor instead of dead-lettering as a consent drop. Exposures deduplicate
     client-side (one per assignment IDENTITY — experiment key + version +
     assignment key — per client instance; a concurrent duplicate waits for the
-    in-flight attempt and reports success only once an exposure actually emitted;
-    refused attempts re-arm), outcomes do not; a not-assigned
+    in-flight attempt — the wait honors the caller's context — and reports success
+    only once an exposure actually emitted; PROVABLY refused attempts re-arm, while
+    a no-status transport failure is ambiguous — the fact may have been accepted —
+    and consumes the slot: at-most-once per launch, an undercount over a double
+    count, and a discarded-after-admission event never re-arms either), outcomes do
+    not; hand-built assignments must carry a positive version; a not-assigned
     verdict is refused (`ErrExperimentNotAssigned`) and an assignment echoing
     another app/environment scope is refused (`ErrExperimentScopeMismatch`) —
     facts are built only from verdicts fetched for THIS client's configured
@@ -76,13 +87,17 @@
   (`If-None-Match` with the cached ETag) so a running client converges on a
   server-side change — a kill switch flip included — within one interval. Each cycle
   waits max(configured interval, the server's `Cache-Control` max-age — 300s before
-  one is seen — floored at 60s), and a fetch that observes a CHANGED cadence
-  re-arms a pending timer to pull the next tick in when the new anchor is shorter
-  (never pushing it out; a stale overlapping response cannot overwrite the cadence
-  — the max-age store sits behind the same per-scope sequence fence as installs
-  and the `429` cooldown); a tick inside an armed `429` `Retry-After` cooldown
-  performs no network call and does not reschedule tighter; and after the TIMER
-  receives an authoritative `401`/`403` it halts until re-initialization, while
+  one is observed, and restored to 300s when a usable success stops advertising one
+  — floored at 60s), and a fetch that observes a CHANGED cadence re-arms a pending
+  timer to pull the next tick in when the new anchor is shorter (never pushing it
+  out). The cadence is observed on USABLE fenced outcomes only — a fresh `200`
+  install or a `304` revalidation; a transient or refused response's incidental
+  `Cache-Control` moves nothing, and a stale overlapping response cannot overwrite
+  the cadence (the max-age store sits behind the same per-scope sequence fence as
+  installs and the `429` cooldown); a tick inside an armed `429` `Retry-After`
+  cooldown performs no network call and does not reschedule tighter; and after the
+  TIMER receives an authoritative `401`/`403` that won the per-scope fence (a stale
+  overlapping refusal halts nothing) it halts until re-initialization, while
   explicit fetches keep classifying per fetch. The schedule anchor and the
   timer-halt rule follow the coordinator-recommended defaults and are pending
   ratification (documented as such in the feature PR).

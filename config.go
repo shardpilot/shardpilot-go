@@ -113,18 +113,24 @@ type Config struct {
 	// RemoteConfigURL is set.
 	//
 	// The schedule anchors to the SERVER's cadence: each cycle waits
-	// max(this interval, the last seen Cache-Control max-age — 300s before
-	// one is seen — floored at 60s), so a positive value here can slow the
-	// timer down but never drive it faster than the server's advertised
-	// cadence or the 60s floor. A tick inside an armed 429 Retry-After
+	// max(this interval, the last observed Cache-Control max-age — 300s
+	// before one is observed, and restored to 300s when a usable success
+	// stops advertising one — floored at 60s), so a positive value here
+	// can slow the timer down but never drive it faster than the server's
+	// advertised cadence or the 60s floor. The cadence is observed on
+	// USABLE fenced outcomes only (a fresh 200 or a 304), never from a
+	// transient or refused response's incidental header, and a fetch that
+	// observes a shorter cadence pulls a pending tick in. A tick inside an armed 429 Retry-After
 	// cooldown performs no network call (the cooldown's cache-served
 	// transient_429 outcome, exactly like an explicit fetch) and does not
 	// reschedule tighter. Timer fetches classify exactly like explicit
 	// fetches with ONE addition: after the TIMER receives an authoritative
 	// 401/403 it halts until the client is re-initialized — an unattended
 	// loop must not keep re-asking an endpoint that authoritatively
-	// refused it. Explicit FetchRemoteConfig calls keep classifying
-	// per-fetch and never resume the halted timer.
+	// refused it. Only a refusal that IS the newest settled word for its
+	// scope halts — a stale overlapping refusal that lost the per-scope
+	// fence to a newer success halts nothing. Explicit FetchRemoteConfig
+	// calls keep classifying per-fetch and never resume the halted timer.
 	RemoteConfigRevalidateInterval time.Duration
 
 	// ExperimentsURL opts this client into the experiment assignment
@@ -172,8 +178,8 @@ type Config struct {
 	// 0700; a pre-existing parent's permissions are never changed. The
 	// file is read back through a hard size limit (an over-limit file is
 	// discarded as corrupt, never loaded whole) and holds ONE client's
-	// scope set: records for another (app, environment, subject, URL)
-	// tuple are misses and are dropped by this client's next persisted
+	// scope set: records for another (workspace, app, environment,
+	// subject, URL) tuple are misses and are dropped by this client's next persisted
 	// change — one client per cache path is the supported topology, like
 	// RemoteConfigCachePath. Empty keeps assignment records in memory
 	// only. Independent of SpoolDir; never enables consent persistence.
@@ -190,8 +196,9 @@ type Config struct {
 	//
 	// Halt contract (ADR-0259 Amendment 2): after the automatic lane
 	// receives ANY authoritative 401/403 — the real-subjects sentinel
-	// included — it stops scheduling assignment fetches until the client
-	// is re-initialized. Host-triggered fetches keep classifying
+	// included — that is the newest settled word for its scope (a stale
+	// overlapping refusal halts nothing), it stops scheduling assignment
+	// fetches until the client is re-initialized. Host-triggered fetches keep classifying
 	// per-fetch, and a later host-fetch success does NOT resume the lane.
 	ExperimentAssignmentRevalidateInterval time.Duration
 

@@ -2,6 +2,7 @@ package shardpilot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"regexp"
@@ -76,6 +77,13 @@ func (c *Client) buildExperimentFactEvent(name string, assignment ExperimentAssi
 	variantKey := strings.TrimSpace(assignment.VariantKey)
 	if experimentKey == "" || assignmentKey == "" || variantKey == "" {
 		return Event{}, fmt.Errorf("%w: assignment is missing experiment_key, assignment_key, or variant_key", ErrInvalidExperimentFact)
+	}
+	if assignment.Version < 1 {
+		// Published experiment versions start at 1 — the fetch parser
+		// enforces this on wire verdicts, and a hand-built or mutated
+		// assignment must meet the same bar rather than emit an
+		// out-of-contract experiment_version.
+		return Event{}, fmt.Errorf("%w: assignment version must be a positive integer (published versions start at 1), got %d", ErrInvalidExperimentFact, assignment.Version)
 	}
 	unit := assignment.Boundary.AssignmentUnit
 	subject := assignmentKey
@@ -155,6 +163,44 @@ func normalizeExperimentOutcomeValue(value any) (any, error) {
 	}
 }
 
+// exposureProvablyUnsent reports whether a failed emission attempt PROVES
+// the exposure never entered the pipeline (or was refused by an observed
+// non-2xx status — for events:batch the 202 is the only acceptance, so an
+// answered refusal is not an acceptance): only those outcomes re-arm the
+// reservation. A failure WITHOUT an observed status — a connection error
+// after the request was written, a timeout awaiting the response, a
+// caller-context abort mid-flight — is AMBIGUOUS: the batch may have
+// reached the wire and been 2xx-accepted, and the server does not
+// de-duplicate a re-EMITTED exposure (a fresh fact gets a fresh event_id),
+// so re-arming would double-count on retry. Ambiguous outcomes consume the
+// reservation instead: exposure emission is at-most-once per assignment
+// identity per launch, preferring an undercount to a double count.
+func exposureProvablyUnsent(err error) bool {
+	switch {
+	case errors.Is(err, ErrConsentDenied),
+		errors.Is(err, ErrConsentUnknown),
+		errors.Is(err, ErrConsentActorMismatch),
+		errors.Is(err, ErrConsentReceiptPending),
+		errors.Is(err, ErrClosed),
+		errors.Is(err, ErrQueueFull),
+		errors.Is(err, ErrInvalidEvent):
+		// Refused before any wire use: intake gates, lifecycle, queue
+		// capacity, validation.
+		return true
+	}
+	var statusErr *HTTPStatusError
+	if errors.As(err, &statusErr) {
+		// The server ANSWERED with a non-2xx: the batch was not ingested.
+		return true
+	}
+	var encodeErr *EncodeError
+	if errors.As(err, &encodeErr) {
+		// The body never marshaled; nothing could have been sent.
+		return true
+	}
+	return false
+}
+
 // experimentExposureDedupeKey is the exposure reservation identity: the
 // FULL assignment identity — experiment key, version, and assignment key —
 // escaped and joined injectively (the scope-join discipline), so two
@@ -176,8 +222,11 @@ func experimentExposureDedupeKey(assignment ExperimentAssignment) string {
 // still fail — nil is returned off another caller's work only once the
 // reservation actually CONVERTED (the fact was admitted). If the in-flight
 // attempt fails and re-arms, a waiting duplicate contends again and
-// performs its own attempt.
-func (c *Client) emitExperimentExposure(assignment ExperimentAssignment, send func(Event) error) error {
+// performs its own attempt. The wait observes the CALLER's context (Track's
+// ctx; Enqueue has none): a cancelled or expired caller gets its context
+// error back promptly instead of waiting out the owner's attempt — and,
+// having claimed nothing, leaves the reservation protocol untouched.
+func (c *Client) emitExperimentExposure(ctx context.Context, assignment ExperimentAssignment, send func(Event) error) error {
 	exp := c.exp
 	if exp == nil {
 		return ErrExperimentsNotConfigured
@@ -193,15 +242,28 @@ func (c *Client) emitExperimentExposure(assignment ExperimentAssignment, send fu
 			// A converted reservation's done is already closed: the
 			// duplicate returns nil immediately. A pending one blocks
 			// until the in-flight attempt settles (bounded by that
-			// attempt's own send semantics).
-			<-claim.done
+			// attempt's own send semantics) — or until the caller's own
+			// context ends the wait.
+			select {
+			case <-claim.done:
+			case <-contextDone(ctx):
+				return contextCause(ctx)
+			}
 			if claim.converted {
 				return nil
 			}
 			continue
 		}
 		err := send(event)
-		exp.settleExposureClaim(dedupeKey, claim, err == nil)
+		// The reservation converts on success AND on any AMBIGUOUS failure
+		// (see exposureProvablyUnsent): only an outcome that proves the
+		// fact never entered the pipeline — or was refused by an observed
+		// status — re-arms it. Enqueue-admitted exposures stay converted
+		// forever, whatever later befalls the queued event (a consent
+		// purge, a spool dead-letter, a terminal batch verdict): a
+		// client-side discard after admission is not "unsent", and a
+		// re-grant must not double-count the exposure.
+		exp.settleExposureClaim(dedupeKey, claim, err == nil || !exposureProvablyUnsent(err))
 		return err
 	}
 }
@@ -216,16 +278,22 @@ func (c *Client) emitExperimentExposure(assignment ExperimentAssignment, send fu
 // experiment key + version + assignment key — per client instance (the
 // server never deduplicates): the first admitted call emits, and later
 // calls for the same identity return nil without emitting — a concurrent
-// duplicate waits for the in-flight attempt and returns nil only if that
-// attempt actually admitted the fact. A refused call (consent, queue,
-// transport) releases the slot so a later (or waiting) attempt can emit.
+// duplicate waits for the in-flight attempt (the wait honors ctx: a
+// cancelled or expired caller gets its context error back promptly) and
+// returns nil only if that attempt converted the reservation. A PROVABLY
+// refused call — a consent gate, lifecycle, queue capacity, validation, or
+// an answered non-2xx status — releases the slot so a later (or waiting)
+// attempt can emit; a no-status transport failure is ambiguous (the fact
+// may have been accepted) and consumes the slot instead: emission is
+// at-most-once per assignment identity per launch, and a discarded-after-
+// admission event (a consent purge, a spool drop) never re-arms it either.
 // Requires the experiment opt-in (ErrExperimentsNotConfigured
 // otherwise) and refuses not-assigned verdicts (ErrExperimentNotAssigned),
 // assignments from another app/environment scope
 // (ErrExperimentScopeMismatch), and out-of-contract facts
 // (ErrInvalidExperimentFact).
 func (c *Client) TrackExperimentExposure(ctx context.Context, assignment ExperimentAssignment) error {
-	return c.emitExperimentExposure(assignment, func(event Event) error {
+	return c.emitExperimentExposure(ctx, assignment, func(event Event) error {
 		return c.Track(ctx, event)
 	})
 }
@@ -233,9 +301,11 @@ func (c *Client) TrackExperimentExposure(ctx context.Context, assignment Experim
 // EnqueueExperimentExposure is TrackExperimentExposure through the
 // asynchronous queue (Enqueue): same validation, same consent inheritance,
 // same one-per-assignment-identity reservation; delivery rides the
-// background flush worker.
+// background flush worker. Enqueue carries no caller context, so a
+// duplicate that finds another attempt in flight waits for it to settle
+// (bounded by that attempt's own send semantics).
 func (c *Client) EnqueueExperimentExposure(assignment ExperimentAssignment) error {
-	return c.emitExperimentExposure(assignment, c.Enqueue)
+	return c.emitExperimentExposure(nil, assignment, c.Enqueue)
 }
 
 // TrackExperimentOutcome publishes one experiment_outcome fact — the

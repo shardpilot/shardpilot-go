@@ -198,16 +198,18 @@ type experimentsState struct {
 	envKey     string
 	subjectKey string
 
-	// scopePrefix stamps every record with the (app, environment, subject,
-	// url) tuple it was fetched for; the full scope appends the escaped
-	// experiment key. Same escaped-join construction as the remote-config
-	// scope, so two distinct tuples can never collide. INVARIANT: the
-	// scope covers every input that varies the fetch URL —
-	// buildExperimentAssignmentURL builds from exactly (base URL incl.
-	// prefix, app_key, environment_key, experiment_key, subject_key) and
-	// this SDK sends NO targeting attributes; if attribute params are ever
-	// added, they must join the scope or records would be served across
-	// attribute sets.
+	// scopePrefix stamps every record with the (workspace, app,
+	// environment, subject, url) tuple it was fetched for; the full scope
+	// appends the escaped experiment key. Same escaped-join construction —
+	// and the same workspace dimension — as the remote-config scope, so
+	// two distinct tuples can never collide and a reused cache path can
+	// never serve one workspace's assignment to another. INVARIANT: the
+	// scope covers the auth scope plus every input that varies the fetch
+	// URL — buildExperimentAssignmentURL builds from exactly (base URL
+	// incl. prefix, app_key, environment_key, experiment_key, subject_key)
+	// and this SDK sends NO targeting attributes; if attribute params are
+	// ever added, they must join the scope or records would be served
+	// across attribute sets.
 	scopePrefix string
 
 	// held is the freshest served record per scope for this process,
@@ -258,7 +260,8 @@ func newExperimentsState(cfg Config) *experimentsState {
 		settled:    make(map[string]uint64),
 		exposures:  make(map[string]*expExposureClaim),
 	}
-	exp.scopePrefix = escapeRemoteConfigSegment(exp.appKey) + rcScopeSeparator +
+	exp.scopePrefix = escapeRemoteConfigSegment(cfg.WorkspaceID) + rcScopeSeparator +
+		escapeRemoteConfigSegment(exp.appKey) + rcScopeSeparator +
 		escapeRemoteConfigSegment(exp.envKey) + rcScopeSeparator +
 		escapeRemoteConfigSegment(exp.subjectKey) + rcScopeSeparator +
 		strings.TrimRight(cfg.ExperimentsURL, "/") + rcScopeSeparator
@@ -296,15 +299,25 @@ const (
 // shape — a syntactically valid but incomplete body must classify as the
 // transient malformed_response (serving the last-known-good cache), never be
 // installed as a fresh verdict the producers and cache would then trust.
+// experimentAssignmentWire is the decode shape for an assignment body: the
+// public struct plus a PRESENCE-aware version member (the outer pointer
+// field shadows the embedded struct's "version" tag), so an omitted version
+// is distinguishable from an explicit zero — both are malformed for a
+// published verdict, whose versions start at 1.
+type experimentAssignmentWire struct {
+	ExperimentAssignment
+	Version *int64 `json:"version"`
+}
+
 // Required per shape (the server contract always sends these):
 //   - both shapes: non-empty experiment_key and assignment_key (the
 //     deterministic assignment identifier is computed before any verdict and
 //     is always present; it is also part of the exposure dedupe identity)
-//     and a non-negative version — the typed decode already rejects
-//     fractional, exponent-form, overflowing, and non-numeric version
-//     values (any of them errors json.Unmarshal into the int64 field, never
-//     silently truncates), so the explicit check covers the one
-//     representable-but-invalid form;
+//     and a PRESENT, POSITIVE version — published experiment versions start
+//     at 1, so an omitted or non-positive version is not a published
+//     verdict; fractional, exponent-form, overflowing, and non-numeric
+//     version values already error the typed int64 decode (never silently
+//     truncate);
 //   - assigned: non-empty variant_key and a KNOWN boundary.assignment_unit —
 //     and for the client_id unit a grammar-valid subject_fact_key, the one
 //     value the analytics facts rely on;
@@ -316,14 +329,16 @@ const (
 // non-object boundary — also fail the typed decode and classify malformed.
 // Returns ok=false for anything unusable.
 func parseExperimentAssignmentBody(body string) (ExperimentAssignment, bool) {
-	var assignment ExperimentAssignment
-	if err := json.Unmarshal([]byte(body), &assignment); err != nil {
+	var wire experimentAssignmentWire
+	if err := json.Unmarshal([]byte(body), &wire); err != nil {
 		return ExperimentAssignment{}, false
 	}
+	if wire.Version == nil || *wire.Version < 1 {
+		return ExperimentAssignment{}, false
+	}
+	assignment := wire.ExperimentAssignment
+	assignment.Version = *wire.Version
 	if strings.TrimSpace(assignment.ExperimentKey) == "" || strings.TrimSpace(assignment.AssignmentKey) == "" {
-		return ExperimentAssignment{}, false
-	}
-	if assignment.Version < 0 {
 		return ExperimentAssignment{}, false
 	}
 	if assignment.Assigned {
@@ -382,8 +397,14 @@ func experimentSentinelBody(body []byte, bodyIncomplete bool) bool {
 }
 
 // applyExperimentAssignment decides one fetch outcome from the transport
-// response and the cache record captured at dispatch. Pure (no IO, no state)
-// so tests can drive every branch. Returns:
+// response and the cache record captured at dispatch, for the request scope
+// (appKey, environmentKey, experimentKey). A 200 body must ECHO that scope
+// back — the server always echoes the routing params it computed the verdict
+// for, so a body naming another app, environment, or experiment is not this
+// request's verdict (a proxy mix-up, a tampered body) and classifies as the
+// transient malformed_response rather than being returned or cached: the
+// fetch-side twin of the producers' scope guard. Pure (no IO, no state) so
+// tests can drive every branch. Returns:
 //   - result — the served outcome, meaningful only when failure is empty;
 //   - newCache — non-nil means "install this record"; only a fresh 200
 //     produces one;
@@ -396,14 +417,17 @@ func experimentSentinelBody(body []byte, bodyIncomplete bool) bool {
 //   - failure — the taxonomy code when the fetch produced no usable verdict.
 //
 // A transport-level error arrives here as status 0.
-func applyExperimentAssignment(cache *expCache, resp remoteConfigResponse, nowMS int64) (result ExperimentAssignmentResult, newCache *expCache, authoritative bool, dropCache bool, failure string) {
+func applyExperimentAssignment(cache *expCache, resp remoteConfigResponse, nowMS int64, appKey, environmentKey, experimentKey string) (result ExperimentAssignmentResult, newCache *expCache, authoritative bool, dropCache bool, failure string) {
 	if resp.status == 200 {
 		// Only a 200 needs its body; every non-200 below classifies by
 		// STATUS alone, so a truncated 401 still fails closed and a
 		// truncated 404 is still permanent. (The sentinel is the one
 		// body-sensitive refinement, and a truncated 403 stays generic.)
 		if !resp.bodyIncomplete && len(resp.body) <= expMaxBodyBytes {
-			if assignment, ok := parseExperimentAssignmentBody(string(resp.body)); ok {
+			if assignment, ok := parseExperimentAssignmentBody(string(resp.body)); ok &&
+				assignment.AppKey == appKey &&
+				assignment.EnvironmentKey == environmentKey &&
+				assignment.ExperimentKey == experimentKey {
 				return ExperimentAssignmentResult{Assignment: assignment},
 					&expCache{Body: string(resp.body), FetchedAtMS: nowMS},
 					true, false, ""
@@ -445,7 +469,10 @@ func applyExperimentAssignment(cache *expCache, resp remoteConfigResponse, nowMS
 }
 
 // preload seeds held from the durable cache file: records inside this
-// client's scope prefix, freshest per scope, caps applied — so transient
+// client's scope prefix whose BODY still parses and echoes the record's own
+// scope (a record written by an older build — or tampered — whose body names
+// another app/environment/experiment is a miss, the same echo contract the
+// live fetch enforces), freshest per scope, caps applied — so transient
 // fallbacks and the automatic lane work across restarts.
 func (e *experimentsState) preload() {
 	if e.cachePath == "" {
@@ -457,7 +484,9 @@ func (e *experimentsState) preload() {
 		if !strings.HasPrefix(record.Scope, e.scopePrefix) || record.ExperimentKey == "" {
 			continue
 		}
-		if _, ok := parseExperimentAssignmentBody(record.Body); !ok {
+		assignment, ok := parseExperimentAssignmentBody(record.Body)
+		if !ok || assignment.AppKey != e.appKey || assignment.EnvironmentKey != e.envKey ||
+			assignment.ExperimentKey != record.ExperimentKey {
 			continue
 		}
 		if prior := e.held[record.Scope]; prior != nil && prior.FetchedAtMS >= record.FetchedAtMS {
@@ -631,7 +660,9 @@ func (e *experimentsState) beginExposureClaim(dedupeKey string) (*expExposureCla
 }
 
 // settleExposureClaim settles the reservation the caller owns: converted
-// keeps it forever (the per-launch dedupe mark); a failed attempt removes it
+// keeps it forever (the per-launch dedupe mark — the emitting caller
+// converts on success AND on ambiguous outcomes that may have reached the
+// wire, see exposureProvablyUnsent); a provably-unsent attempt removes it
 // so a later — or a concurrently waiting — call can emit.
 func (e *experimentsState) settleExposureClaim(dedupeKey string, claim *expExposureClaim, converted bool) {
 	e.mu.Lock()
@@ -697,7 +728,7 @@ func expFetchError(code string) error {
 // halts anything. Only the automatic revalidation lane halts on
 // authoritative refusals, and only for itself.
 func (c *Client) FetchExperimentAssignment(ctx context.Context, experimentKey string) (ExperimentAssignmentResult, error) {
-	result, code, err := c.fetchExperimentAssignmentOutcome(ctx, experimentKey)
+	result, code, _, err := c.fetchExperimentAssignmentOutcome(ctx, experimentKey)
 	if err != nil {
 		return ExperimentAssignmentResult{}, err
 	}
@@ -712,31 +743,36 @@ func (c *Client) FetchExperimentAssignment(ctx context.Context, experimentKey st
 // reads it directly (its halt trigger is the "unauthorized" class). A
 // non-nil error is a lifecycle or caller-context outcome (ErrClosed, the
 // caller's own context error), mutually exclusive with a failure code.
-func (c *Client) fetchExperimentAssignmentOutcome(ctx context.Context, experimentKey string) (ExperimentAssignmentResult, string, error) {
+// wonFence reports whether this fetch's AUTHORITATIVE outcome won the
+// per-scope sequence fence — i.e. it is the newest settled word for its
+// scope. A stale response that lost to a newer settled fetch reports false,
+// so the automatic lane can refuse to halt on outdated refusals (the same
+// staleness rule installs, drops, and the cadence store already follow).
+func (c *Client) fetchExperimentAssignmentOutcome(ctx context.Context, experimentKey string) (ExperimentAssignmentResult, string, bool, error) {
 	// The same lifecycle fence as Track and FetchRemoteConfig: Close either
 	// sees this fetch (and waits for it) or completed its closed store
 	// first (and this fetch is rejected).
 	c.lifecycleMu.Lock()
 	if c.closed.Load() {
 		c.lifecycleMu.Unlock()
-		return ExperimentAssignmentResult{}, "", ErrClosed
+		return ExperimentAssignmentResult{}, "", false, ErrClosed
 	}
 	c.trackWG.Add(1)
 	c.lifecycleMu.Unlock()
 	defer c.trackWG.Done()
 	exp := c.exp
 	if exp == nil {
-		return ExperimentAssignmentResult{}, "experiments_not_configured", nil
+		return ExperimentAssignmentResult{}, "experiments_not_configured", false, nil
 	}
 	experimentKey = strings.TrimSpace(experimentKey)
 	if experimentKey == "" {
-		return ExperimentAssignmentResult{}, "experiment_key_required", nil
+		return ExperimentAssignmentResult{}, "experiment_key_required", false, nil
 	}
 	if exp.subjectKey == "" {
 		// The fetch route and the cache scope both need the subject key;
 		// with none configured there is nothing coherent to fetch. Decided
 		// before any network use, mirroring client_id_unavailable.
-		return ExperimentAssignmentResult{}, "subject_key_unavailable", nil
+		return ExperimentAssignmentResult{}, "subject_key_unavailable", false, nil
 	}
 
 	exp.mu.Lock()
@@ -764,7 +800,7 @@ func (c *Client) fetchExperimentAssignmentOutcome(ctx context.Context, experimen
 				// The CALLER's own context ended the fetch: an abort, not an
 				// endpoint outcome — no cache fallback, no fence side
 				// effects, just the caller's error back.
-				return ExperimentAssignmentResult{}, "", err
+				return ExperimentAssignmentResult{}, "", false, err
 			}
 		}
 		if resp.status == 0 {
@@ -780,9 +816,12 @@ func (c *Client) fetchExperimentAssignmentOutcome(ctx context.Context, experimen
 	}
 
 	now := c.clock.Now()
-	result, newCache, authoritative, dropCache, failure := applyExperimentAssignment(cache, resp, now.UnixMilli())
+	result, newCache, authoritative, dropCache, failure := applyExperimentAssignment(cache, resp, now.UnixMilli(), exp.appKey, exp.envKey, experimentKey)
 
 	exp.mu.Lock()
+	// Computed BEFORE installLocked settles this sequence: an authoritative
+	// outcome "wins" the fence exactly when no newer fetch settled first.
+	wonFence := authoritative && seq > exp.settled[scope]
 	dropped, persistFailed := exp.installLocked(seq, scope, experimentKey, newCache, authoritative, dropCache)
 	exp.mu.Unlock()
 
@@ -794,9 +833,9 @@ func (c *Client) fetchExperimentAssignmentOutcome(ctx context.Context, experimen
 		c.logf("shardpilot experiment assignment: persisting the cache record failed; the in-memory record remains this process's fallback")
 	}
 	if failure != "" {
-		return ExperimentAssignmentResult{}, failure, nil
+		return ExperimentAssignmentResult{}, failure, wonFence, nil
 	}
-	return result, "", nil
+	return result, "", wonFence, nil
 }
 
 // runExperimentAssignmentRevalidation is the opt-in AUTOMATIC assignment
@@ -831,7 +870,7 @@ func (c *Client) revalidateExperimentAssignmentsOnce() (exit bool) {
 		return true
 	}
 	for _, experimentKey := range c.exp.cachedExperimentKeys() {
-		_, code, err := c.fetchExperimentAssignmentOutcome(context.Background(), experimentKey)
+		_, code, wonFence, err := c.fetchExperimentAssignmentOutcome(context.Background(), experimentKey)
 		if err != nil {
 			// Only lifecycle outcomes surface as errors on a background
 			// context; the lane winds down with the client.
@@ -840,10 +879,14 @@ func (c *Client) revalidateExperimentAssignmentsOnce() (exit bool) {
 			}
 			continue
 		}
-		if code == "unauthorized" {
-			// The endpoint authoritatively refused an unattended fetch:
-			// halt the lane until re-init. (The sentinel is a 403 and
-			// halts too — its cache drop already happened in the fetch.)
+		if code == "unauthorized" && wonFence {
+			// The endpoint authoritatively refused an unattended fetch AND
+			// that refusal is the newest settled word for its scope: halt
+			// the lane until re-init. (The sentinel is a 403 and halts
+			// too — its cache drop already happened in the fetch.) A STALE
+			// refusal that lost the per-scope fence to a newer settled
+			// success is outdated — it fails ITS fetch closed, but an
+			// unattended lane must not park itself on old news.
 			c.exp.haltAutoLane()
 			c.logf("shardpilot experiment assignment revalidation: halted after an authoritative 401/403; host-triggered fetches remain available, and the lane resumes only on re-initialization")
 			return true

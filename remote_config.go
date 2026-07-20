@@ -775,7 +775,7 @@ func rcFetchError(code string) error {
 // Close waits (bounded by its own context) for in-flight fetches to settle,
 // so no fetch I/O or durable cache write is still running when Close returns.
 func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, error) {
-	result, code, err := c.fetchRemoteConfigOutcome(ctx)
+	result, code, _, err := c.fetchRemoteConfigOutcome(ctx)
 	if err != nil {
 		return RemoteConfigResult{}, err
 	}
@@ -791,8 +791,13 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 // the "unauthorized" class). A non-nil error is a lifecycle or
 // caller-context outcome (ErrClosed, the caller's own context error),
 // mutually exclusive with a failure code; every path's behavior is the
-// public method's documented contract, unchanged.
-func (c *Client) fetchRemoteConfigOutcome(ctx context.Context) (RemoteConfigResult, string, error) {
+// public method's documented contract, unchanged. wonFence reports whether
+// this fetch's AUTHORITATIVE outcome won the per-scope sequence fence —
+// i.e. it is the newest settled word for its scope. A stale response that
+// lost to a newer settled fetch reports false, so the revalidation timer
+// can refuse to halt on outdated refusals (the same staleness rule
+// installs, the 429 cooldown, and the cadence store already follow).
+func (c *Client) fetchRemoteConfigOutcome(ctx context.Context) (RemoteConfigResult, string, bool, error) {
 	// The same lifecycle fence as Track: registering in trackWG under
 	// lifecycleMu means Close either sees this fetch (and waits for it) or
 	// completed its closed store first (and this fetch is rejected) — an
@@ -801,20 +806,20 @@ func (c *Client) fetchRemoteConfigOutcome(ctx context.Context) (RemoteConfigResu
 	c.lifecycleMu.Lock()
 	if c.closed.Load() {
 		c.lifecycleMu.Unlock()
-		return RemoteConfigResult{}, "", ErrClosed
+		return RemoteConfigResult{}, "", false, ErrClosed
 	}
 	c.trackWG.Add(1)
 	c.lifecycleMu.Unlock()
 	defer c.trackWG.Done()
 	rc := c.rc
 	if rc == nil {
-		return RemoteConfigResult{}, "remote_config_not_configured", nil
+		return RemoteConfigResult{}, "remote_config_not_configured", false, nil
 	}
 	if rc.clientID == "" {
 		// The cache scope and the fetch route both need the client id; with
 		// none configured there is nothing coherent to fetch. Decided before
 		// any network use.
-		return RemoteConfigResult{}, "client_id_unavailable", nil
+		return RemoteConfigResult{}, "client_id_unavailable", false, nil
 	}
 
 	rc.mu.Lock()
@@ -830,7 +835,7 @@ func (c *Client) fetchRemoteConfigOutcome(ctx context.Context) (RemoteConfigResu
 		if ctx != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				rc.mu.Unlock()
-				return RemoteConfigResult{}, "", ctxErr
+				return RemoteConfigResult{}, "", false, ctxErr
 			}
 		}
 		// Inside the 429 cooldown an explicit fetch does not touch the
@@ -840,9 +845,9 @@ func (c *Client) fetchRemoteConfigOutcome(ctx context.Context) (RemoteConfigResu
 		rc.installLocked(seq, result, failure == "", nil, false, cache, nil)
 		rc.mu.Unlock()
 		if failure != "" {
-			return RemoteConfigResult{}, failure, nil
+			return RemoteConfigResult{}, failure, false, nil
 		}
-		return result, "", nil
+		return result, "", false, nil
 	}
 	etag := ""
 	if cache != nil {
@@ -869,7 +874,7 @@ func (c *Client) fetchRemoteConfigOutcome(ctx context.Context) (RemoteConfigResu
 				// fence side effects, just the caller's error back (same
 				// discrimination as callerAbandonedFlush). Any partial
 				// response riding the error is discarded with it.
-				return RemoteConfigResult{}, "", err
+				return RemoteConfigResult{}, "", false, err
 			}
 		}
 		if resp.status == 0 {
@@ -892,20 +897,31 @@ func (c *Client) fetchRemoteConfigOutcome(ctx context.Context) (RemoteConfigResu
 	result, newCache, authoritative, revalidated, failure := applyRemoteConfig(cache, resp, now.UnixMilli())
 
 	rc.mu.Lock()
-	if resp.maxAgePresent && seq > rc.settled[rc.scope] {
+	// Computed BEFORE installLocked settles this sequence: an authoritative
+	// outcome "wins" the fence exactly when no newer fetch settled first.
+	wonFence := authoritative && seq > rc.settled[rc.scope]
+	if (newCache != nil || revalidated != nil) && seq > rc.settled[rc.scope] {
 		// The server's advertised revalidation cadence, remembered for the
-		// opt-in periodic revalidation timer's schedule anchor. Fenced by
-		// the same per-scope sequence as installs and the 429 cooldown: an
-		// older response landing AFTER a newer fetch settled an
-		// authoritative outcome is outdated cadence too — letting it win
-		// would park (or hurry) the timer on a max-age the server has
-		// already moved past. Never a classification input.
-		changed := !rc.maxAgePresent || rc.maxAgeSeconds != resp.maxAgeSeconds
+		// opt-in periodic revalidation timer's schedule anchor — from
+		// USABLE outcomes only (a fresh 200 install or a 304
+		// revalidation): a transient 429/5xx that happens to carry
+		// Cache-Control must not stretch (or hurry) the timer off an
+		// error response's incidental header. The store mirrors the
+		// response's cadence state BOTH ways: a usable success WITHOUT a
+		// max-age restores the pre-observation default anchor — the
+		// server stopped advertising a cadence, so a stale prior one must
+		// not keep governing the timer. Fenced by the same per-scope
+		// sequence as installs and the 429 cooldown: an older response
+		// landing AFTER a newer fetch settled an authoritative outcome is
+		// outdated cadence too. Never a classification input.
+		changed := rc.maxAgePresent != resp.maxAgePresent ||
+			(resp.maxAgePresent && rc.maxAgeSeconds != resp.maxAgeSeconds)
 		rc.maxAgeSeconds = resp.maxAgeSeconds
-		rc.maxAgePresent = true
+		rc.maxAgePresent = resp.maxAgePresent
 		if changed {
 			// Nudge a pending revalidation timer to re-evaluate its
-			// deadline: a SHORTER cadence pulls the next tick in.
+			// deadline: a SHORTER cadence pulls the next tick in (a
+			// lengthened one takes effect from the next cycle).
 			select {
 			case rc.revalidateRecalc <- struct{}{}:
 			default:
@@ -929,9 +945,9 @@ func (c *Client) fetchRemoteConfigOutcome(ctx context.Context) (RemoteConfigResu
 		c.logf("shardpilot remote config: persisting the cache record failed; the fetched configuration stays the in-memory fallback for this process")
 	}
 	if failure != "" {
-		return RemoteConfigResult{}, failure, nil
+		return RemoteConfigResult{}, failure, wonFence, nil
 	}
-	return result, "", nil
+	return result, "", wonFence, nil
 }
 
 // ── periodic revalidation (opt-in) ─────────────────────────────────────────
@@ -1039,13 +1055,17 @@ func (c *Client) revalidateRemoteConfigOnce() (exit bool) {
 	if c.rc.autoLaneHalted() {
 		return true
 	}
-	_, code, err := c.fetchRemoteConfigOutcome(context.Background())
+	_, code, wonFence, err := c.fetchRemoteConfigOutcome(context.Background())
 	if err != nil {
 		// Only lifecycle outcomes surface as errors on a background
 		// context; the timer winds down with the client.
 		return errors.Is(err, ErrClosed)
 	}
-	if code == "unauthorized" {
+	if code == "unauthorized" && wonFence {
+		// Halt only on a refusal that IS the newest settled word for this
+		// scope: a stale 401/403 that lost the per-scope fence to a newer
+		// settled success still fails ITS fetch closed, but an unattended
+		// timer must not park itself on old news.
 		c.rc.haltAutoLane()
 		c.logf("shardpilot remote config revalidation: halted after an authoritative 401/403; explicit fetches remain available, and the timer resumes only on re-initialization")
 		return true

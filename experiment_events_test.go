@@ -462,6 +462,136 @@ func TestExperimentExposureConcurrentDuplicateWaitsForConversion(t *testing.T) {
 	}
 }
 
+func TestExperimentExposureWaiterHonorsCallerContext(t *testing.T) {
+	// A duplicate whose OWN context is already cancelled must get its
+	// context error back promptly instead of waiting out the owner's
+	// in-flight attempt.
+	capture := &envelopeCapture{}
+	firstArrived := make(chan struct{}, 1)
+	releaseFirst := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/events:batch" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"recorded":true}`)
+			return
+		}
+		var request struct {
+			Events []map[string]any `json:"events"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode batch request: %v", err)
+		}
+		firstArrived <- struct{}{}
+		<-releaseFirst
+		capture.mu.Lock()
+		capture.envelopes = append(capture.envelopes, request.Events...)
+		count := len(request.Events)
+		capture.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		fmt.Fprintf(w, `{"accepted":%d,"rejected":0,"duplicates":0}`, count)
+	}))
+	defer server.Close()
+
+	client := newExperimentsClient(t, server.URL, "", func(cfg *Config) {
+		cfg.HTTPTimeout = 5 * time.Second
+	})
+	defer client.Close(context.Background())
+
+	owner := make(chan error, 1)
+	go func() {
+		owner <- client.TrackExperimentExposure(context.Background(), clientIDAssignment())
+	}()
+	<-firstArrived // the owner holds the reservation and is on the wire
+
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	// The owner is still parked in the server: the cancelled duplicate
+	// must return its own context error without waiting for it.
+	if err := client.TrackExperimentExposure(cancelled, clientIDAssignment()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected the cancelled waiter's own context error, got %v", err)
+	}
+
+	close(releaseFirst)
+	if err := <-owner; err != nil {
+		t.Fatalf("owner attempt: %v", err)
+	}
+	// The abandoned wait claimed nothing and converted nothing: the
+	// owner's success stands, and a later duplicate is a clean no-op.
+	if err := client.TrackExperimentExposure(context.Background(), clientIDAssignment()); err != nil {
+		t.Fatalf("post-conversion duplicate: %v", err)
+	}
+	if got := len(capture.all()); got != 1 {
+		t.Fatalf("expected exactly one exposure on the wire, got %d", got)
+	}
+}
+
+func TestExperimentExposureDiscardAfterAdmissionDoesNotReArm(t *testing.T) {
+	// An ADMITTED (enqueued) exposure whose event is later discarded
+	// client-side — here a consent denial draining the queue — must not
+	// re-arm the reservation: the discard is not "unsent", and a re-grant
+	// must not double-count the exposure.
+	capture, server := newIngestCaptureServer(t)
+	defer server.Close()
+	client := newExperimentsClient(t, server.URL, "", nil)
+	defer client.Close(context.Background())
+
+	if err := client.EnqueueExperimentExposure(clientIDAssignment()); err != nil {
+		t.Fatalf("EnqueueExperimentExposure: %v", err)
+	}
+	client.SetConsent(false) // drains the queue; the admitted fact is discarded
+	client.SetConsent(true)
+	if err := client.EnqueueExperimentExposure(clientIDAssignment()); err != nil {
+		t.Fatalf("post-re-grant duplicate must be a nil no-op, got %v", err)
+	}
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if got := len(capture.all()); got != 0 {
+		t.Fatalf("a discarded-after-admission exposure must not re-emit on re-grant, got %d envelopes", got)
+	}
+}
+
+func TestExperimentExposureAmbiguousTransportConsumesReservation(t *testing.T) {
+	// A NO-STATUS transport failure (connection dropped before any
+	// response) is ambiguous — the batch may have been 2xx-accepted — so
+	// the reservation converts: no retry may double-count the exposure.
+	var batchCalls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/events:batch" {
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"recorded":true}`)
+			return
+		}
+		batchCalls.Add(1)
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err == nil {
+			_ = conn.Close()
+		}
+	}))
+	defer server.Close()
+
+	client := newExperimentsClient(t, server.URL, "", nil)
+	defer client.Close(context.Background())
+
+	err := client.TrackExperimentExposure(context.Background(), clientIDAssignment())
+	if err == nil {
+		t.Fatal("expected the no-status transport failure surfaced")
+	}
+	var statusErr *HTTPStatusError
+	if errors.As(err, &statusErr) {
+		t.Fatalf("expected a no-status transport error, got status %d", statusErr.StatusCode)
+	}
+	// The reservation is consumed: the duplicate is an immediate no-op and
+	// nothing re-emits.
+	if err := client.TrackExperimentExposure(context.Background(), clientIDAssignment()); err != nil {
+		t.Fatalf("expected the ambiguous outcome to consume the reservation, got %v", err)
+	}
+	if got := batchCalls.Load(); got != 1 {
+		t.Fatalf("expected no re-emission after the ambiguous outcome, got %d batch attempts", got)
+	}
+}
+
 func TestExperimentProducersFloorConsentGating(t *testing.T) {
 	state, server := newFloorTestServer(t)
 	defer server.Close()
@@ -548,6 +678,8 @@ func TestExperimentProducerValidation(t *testing.T) {
 		{"client_id unit with malformed sfk", func(a *ExperimentAssignment) { a.SubjectFactKey = "sfk1_SHOUTING" }},
 		{"unknown assignment unit", func(a *ExperimentAssignment) { a.Boundary.AssignmentUnit = "device_id" }},
 		{"empty assignment unit", func(a *ExperimentAssignment) { a.Boundary.AssignmentUnit = "" }},
+		{"zero version", func(a *ExperimentAssignment) { a.Version = 0 }},
+		{"negative version", func(a *ExperimentAssignment) { a.Version = -3 }},
 	}
 	for _, tc := range invalid {
 		assignment := clientIDAssignment()

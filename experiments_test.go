@@ -256,9 +256,9 @@ func TestExperimentAssignmentFreshVerdictShapes(t *testing.T) {
 		body       string
 		wantReason string
 	}{
-		{`{"experiment_key":"exp-checkout","version":3,"assigned":false,"assignment_key":"asgn_00","boundary":{"assignment_unit":"client_id"}}`, ""},
-		{`{"experiment_key":"exp-checkout","version":3,"assigned":false,"assignment_key":"asgn_00","reason":"kill_switch","boundary":{"assignment_unit":"client_id"}}`, "kill_switch"},
-		{`{"experiment_key":"exp-checkout","version":3,"assigned":false,"assignment_key":"asgn_00","reason":"targeting_unmatched","boundary":{"assignment_unit":"client_id"}}`, "targeting_unmatched"},
+		{`{"app_key":"app-test","environment_key":"develop","experiment_key":"exp-checkout","version":3,"assigned":false,"assignment_key":"asgn_00","boundary":{"assignment_unit":"client_id"}}`, ""},
+		{`{"app_key":"app-test","environment_key":"develop","experiment_key":"exp-checkout","version":3,"assigned":false,"assignment_key":"asgn_00","reason":"kill_switch","boundary":{"assignment_unit":"client_id"}}`, "kill_switch"},
+		{`{"app_key":"app-test","environment_key":"develop","experiment_key":"exp-checkout","version":3,"assigned":false,"assignment_key":"asgn_00","reason":"targeting_unmatched","boundary":{"assignment_unit":"client_id"}}`, "targeting_unmatched"},
 	}
 	for _, tc := range notAssigned {
 		script.Store(rcScriptStep{status: 200, body: tc.body})
@@ -296,27 +296,33 @@ func TestExperimentAssignmentIncompleteVerdictsAreMalformed(t *testing.T) {
 		t.Fatalf("read cache: %v", err)
 	}
 
+	// Row baselines are COMPLETE verdict bodies (echoed scope + version
+	// included) minus exactly the dimension under test, so each row proves
+	// its own validation and not an incidental one.
+	const echoPrefix = `"app_key":"app-test","environment_key":"develop","experiment_key":"exp-checkout"`
 	incomplete := []struct {
 		name string
 		body string
 	}{
 		{"bare experiment_key only", `{"experiment_key":"exp-checkout"}`},
-		{"assigned without assignment_key", `{"experiment_key":"exp-checkout","assigned":true,"variant_key":"v","boundary":{"assignment_unit":"synthetic_subject_key"}}`},
-		{"assigned without variant_key", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","assigned":true,"boundary":{"assignment_unit":"synthetic_subject_key"}}`},
-		{"assigned without boundary", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","assigned":true,"variant_key":"v"}`},
-		{"assigned with unknown unit", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","assigned":true,"variant_key":"v","boundary":{"assignment_unit":"device_id"}}`},
-		{"assigned client_id without subject_fact_key", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","assigned":true,"variant_key":"v","boundary":{"assignment_unit":"client_id"}}`},
-		{"assigned client_id with a raw spcid subject", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","assigned":true,"variant_key":"v","subject_fact_key":"` + testExperimentSubjectKey + `","boundary":{"assignment_unit":"client_id"}}`},
-		{"not-assigned with unknown reason", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","assigned":false,"reason":"paused"}`},
-		{"fractional version", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","version":3.5}`},
-		{"fractional-form integer version", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","version":3.0}`},
-		{"negative version", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","version":-1}`},
-		{"overflowing version", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","version":9223372036854775808}`},
-		{"string version", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","version":"3"}`},
-		{"array variant_payload", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","assigned":true,"variant_key":"v","variant_payload":[1,2],"boundary":{"assignment_unit":"synthetic_subject_key"}}`},
-		{"string variant_payload", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","assigned":true,"variant_key":"v","variant_payload":"fast","boundary":{"assignment_unit":"synthetic_subject_key"}}`},
-		{"number variant_payload", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","assigned":true,"variant_key":"v","variant_payload":7,"boundary":{"assignment_unit":"synthetic_subject_key"}}`},
-		{"non-object boundary", `{"experiment_key":"exp-checkout","assignment_key":"asgn_00","assigned":true,"variant_key":"v","boundary":"client_id"}`},
+		{"assigned without assignment_key", `{` + echoPrefix + `,"version":3,"assigned":true,"variant_key":"v","boundary":{"assignment_unit":"synthetic_subject_key"}}`},
+		{"assigned without variant_key", `{` + echoPrefix + `,"version":3,"assignment_key":"asgn_00","assigned":true,"boundary":{"assignment_unit":"synthetic_subject_key"}}`},
+		{"assigned without boundary", `{` + echoPrefix + `,"version":3,"assignment_key":"asgn_00","assigned":true,"variant_key":"v"}`},
+		{"assigned with unknown unit", `{` + echoPrefix + `,"version":3,"assignment_key":"asgn_00","assigned":true,"variant_key":"v","boundary":{"assignment_unit":"device_id"}}`},
+		{"assigned client_id without subject_fact_key", `{` + echoPrefix + `,"version":3,"assignment_key":"asgn_00","assigned":true,"variant_key":"v","boundary":{"assignment_unit":"client_id"}}`},
+		{"assigned client_id with a raw spcid subject", `{` + echoPrefix + `,"version":3,"assignment_key":"asgn_00","assigned":true,"variant_key":"v","subject_fact_key":"` + testExperimentSubjectKey + `","boundary":{"assignment_unit":"client_id"}}`},
+		{"not-assigned with unknown reason", `{` + echoPrefix + `,"version":3,"assignment_key":"asgn_00","assigned":false,"reason":"paused"}`},
+		{"missing version", `{` + echoPrefix + `,"assignment_key":"asgn_00","assigned":false}`},
+		{"zero version", `{` + echoPrefix + `,"version":0,"assignment_key":"asgn_00","assigned":false}`},
+		{"fractional version", `{` + echoPrefix + `,"assignment_key":"asgn_00","version":3.5}`},
+		{"fractional-form integer version", `{` + echoPrefix + `,"assignment_key":"asgn_00","version":3.0}`},
+		{"negative version", `{` + echoPrefix + `,"assignment_key":"asgn_00","version":-1}`},
+		{"overflowing version", `{` + echoPrefix + `,"assignment_key":"asgn_00","version":9223372036854775808}`},
+		{"string version", `{` + echoPrefix + `,"assignment_key":"asgn_00","version":"3"}`},
+		{"array variant_payload", `{` + echoPrefix + `,"version":3,"assignment_key":"asgn_00","assigned":true,"variant_key":"v","variant_payload":[1,2],"boundary":{"assignment_unit":"synthetic_subject_key"}}`},
+		{"string variant_payload", `{` + echoPrefix + `,"version":3,"assignment_key":"asgn_00","assigned":true,"variant_key":"v","variant_payload":"fast","boundary":{"assignment_unit":"synthetic_subject_key"}}`},
+		{"number variant_payload", `{` + echoPrefix + `,"version":3,"assignment_key":"asgn_00","assigned":true,"variant_key":"v","variant_payload":7,"boundary":{"assignment_unit":"synthetic_subject_key"}}`},
+		{"non-object boundary", `{` + echoPrefix + `,"version":3,"assignment_key":"asgn_00","assigned":true,"variant_key":"v","boundary":"client_id"}`},
 	}
 	for _, tc := range incomplete {
 		script.Store(rcScriptStep{status: 200, body: tc.body})
@@ -679,6 +685,189 @@ func TestExperimentAssignmentDurableCacheRestartAndScopeMiss(t *testing.T) {
 	defer otherSubject.Close(context.Background())
 	if _, err := otherSubject.FetchExperimentAssignment(context.Background(), "exp-checkout"); err == nil || !strings.Contains(err.Error(), "transient_503") {
 		t.Fatalf("expected a scope miss to hard-fail the transient, got %v", err)
+	}
+}
+
+func TestExperimentAssignmentCacheScopedByWorkspace(t *testing.T) {
+	// Two workspaces, same app/environment/subject/URL: distinct scopes —
+	// a reused cache path must never serve one workspace's assignment to
+	// the other.
+	base := Config{
+		ExperimentsURL:       "https://cp.example.com/api/cp/v1",
+		APIKey:               "k",
+		WorkspaceID:          "workspace-test",
+		AppID:                "app-test",
+		EnvironmentID:        "develop",
+		ExperimentSubjectKey: testExperimentSubjectKey,
+	}
+	other := base
+	other.WorkspaceID = "workspace-other"
+	if newExperimentsState(base).scopePrefix == newExperimentsState(other).scopePrefix {
+		t.Fatal("expected the workspace to be part of the cache scope")
+	}
+
+	var script atomic.Value
+	script.Store(rcScriptStep{status: 200, body: testAssignedBody})
+	server := newRCScriptServer(t, nil, &script)
+	defer server.Close()
+
+	cachePath := filepath.Join(t.TempDir(), "exp-cache.json")
+	first := newExperimentsClient(t, server.URL, cachePath, nil)
+	if _, err := first.FetchExperimentAssignment(context.Background(), "exp-checkout"); err != nil {
+		t.Fatalf("priming fetch: %v", err)
+	}
+	if err := first.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// The other workspace's preload cannot cross: its transient hard-fails.
+	script.Store(rcScriptStep{status: 503, body: ``})
+	otherWorkspace := newExperimentsClient(t, server.URL, cachePath, func(cfg *Config) {
+		cfg.WorkspaceID = "workspace-other"
+	})
+	defer otherWorkspace.Close(context.Background())
+	if _, err := otherWorkspace.FetchExperimentAssignment(context.Background(), "exp-checkout"); err == nil || !strings.Contains(err.Error(), "transient_503") {
+		t.Fatalf("expected a cross-workspace miss to hard-fail the transient, got %v", err)
+	}
+
+	// The record's own workspace still serves it (control).
+	sameWorkspace := newExperimentsClient(t, server.URL, cachePath, nil)
+	defer sameWorkspace.Close(context.Background())
+	if result, err := sameWorkspace.FetchExperimentAssignment(context.Background(), "exp-checkout"); err != nil || !result.FromCache {
+		t.Fatalf("expected the same-workspace record served, got %+v %v", result, err)
+	}
+}
+
+func TestExperimentAssignmentEchoMismatchIsMalformed(t *testing.T) {
+	// The fetch-side twin of the producers' scope guard: a 200 whose body
+	// does not ECHO the requested (app, environment, experiment) scope is
+	// not this request's verdict — malformed, nothing cached, LKG serves.
+	var script atomic.Value
+	script.Store(rcScriptStep{status: 200, body: testAssignedBody})
+	server := newRCScriptServer(t, nil, &script)
+	defer server.Close()
+
+	cachePath := filepath.Join(t.TempDir(), "exp-cache.json")
+	client := newExperimentsClient(t, server.URL, cachePath, nil)
+	defer client.Close(context.Background())
+	if _, err := client.FetchExperimentAssignment(context.Background(), "exp-checkout"); err != nil {
+		t.Fatalf("priming fetch: %v", err)
+	}
+	cacheBefore, _ := os.ReadFile(cachePath)
+
+	mismatched := []struct {
+		name string
+		body string
+	}{
+		{"other app_key echo", strings.Replace(testAssignedBody, `"app_key":"app-test"`, `"app_key":"app-other"`, 1)},
+		{"other environment_key echo", strings.Replace(testAssignedBody, `"environment_key":"develop"`, `"environment_key":"production"`, 1)},
+		{"other experiment_key echo", strings.Replace(testAssignedBody, `"experiment_key":"exp-checkout"`, `"experiment_key":"exp-other"`, 1)},
+	}
+	for _, tc := range mismatched {
+		script.Store(rcScriptStep{status: 200, body: tc.body})
+		result, err := client.FetchExperimentAssignment(context.Background(), "exp-checkout")
+		if err != nil {
+			t.Fatalf("%s: expected the LKG served over the mismatched echo, got %v", tc.name, err)
+		}
+		if !result.FromCache || result.Reason != "malformed_response" {
+			t.Fatalf("%s: expected cache-served malformed_response, got %+v", tc.name, result)
+		}
+	}
+	cacheAfter, _ := os.ReadFile(cachePath)
+	if string(cacheBefore) != string(cacheAfter) {
+		t.Fatalf("mismatched echoes must never disturb the cache record")
+	}
+
+	// PRELOAD applies the same echo contract: a durable record whose body
+	// names another scope (an older build's record, or tampering) is a
+	// miss, never served.
+	tamperedPath := filepath.Join(t.TempDir(), "exp-cache.json")
+	state := newExperimentsState(Config{
+		ExperimentsURL:       server.URL + "/api/cp/v1",
+		APIKey:               "test-exp-key",
+		WorkspaceID:          "workspace-test",
+		AppID:                "app-test",
+		EnvironmentID:        "develop",
+		ExperimentSubjectKey: testExperimentSubjectKey,
+	})
+	tampered, err := json.Marshal(expCacheFile{Records: []expCache{{
+		Scope:         state.scopeFor("exp-checkout"),
+		ExperimentKey: "exp-checkout",
+		Body:          mismatched[0].body,
+		FetchedAtMS:   123,
+	}}})
+	if err != nil {
+		t.Fatalf("marshal tampered cache: %v", err)
+	}
+	if err := os.WriteFile(tamperedPath, tampered, 0o600); err != nil {
+		t.Fatalf("write tampered cache: %v", err)
+	}
+	script.Store(rcScriptStep{status: 503, body: ``})
+	tamperedClient := newExperimentsClient(t, server.URL, tamperedPath, nil)
+	defer tamperedClient.Close(context.Background())
+	if _, err := tamperedClient.FetchExperimentAssignment(context.Background(), "exp-checkout"); err == nil || !strings.Contains(err.Error(), "transient_503") {
+		t.Fatalf("expected the tampered record skipped at preload, got %v", err)
+	}
+}
+
+func TestExperimentAssignmentStaleRefusalDoesNotHaltAutoLane(t *testing.T) {
+	// Item-5's twin on the assignment plane: a delayed 401 that lost the
+	// per-scope fence to a newer settled 200 must not halt the automatic
+	// lane; a fresh fence-winning refusal still does.
+	var requests atomic.Int64
+	tickArrived := make(chan struct{}, 1)
+	releaseTick := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch requests.Add(1) {
+		case 1:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(testAssignedBody))
+		case 2:
+			tickArrived <- struct{}{}
+			<-releaseTick
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"invalid runtime token"}`))
+		case 3:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(testAssignedBody))
+		default:
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"invalid runtime token"}`))
+		}
+	}))
+	defer server.Close()
+
+	client := newExperimentsClient(t, server.URL, "", nil)
+	defer client.Close(context.Background())
+	if _, err := client.FetchExperimentAssignment(context.Background(), "exp-checkout"); err != nil {
+		t.Fatalf("priming fetch: %v", err)
+	}
+
+	// The lane's cycle dispatches and stalls inside the server…
+	cycleExit := make(chan bool, 1)
+	go func() {
+		cycleExit <- client.revalidateExperimentAssignmentsOnce()
+	}()
+	<-tickArrived
+	// …a host fetch settles a fresh 200 FIRST…
+	if result, err := client.FetchExperimentAssignment(context.Background(), "exp-checkout"); err != nil || result.FromCache {
+		t.Fatalf("newer host fetch: %+v %v", result, err)
+	}
+	// …then the stalled 401 lands, having lost the fence: no halt.
+	close(releaseTick)
+	if exit := <-cycleExit; exit {
+		t.Fatal("a stale refusal that lost the fence must not halt the lane")
+	}
+	if client.exp.autoLaneHalted() {
+		t.Fatal("expected the lane not halted by the stale refusal")
+	}
+
+	// The next cycle's refusal wins its fence and halts as designed.
+	if exit := client.revalidateExperimentAssignmentsOnce(); !exit {
+		t.Fatal("expected the fence-winning refusal to halt the lane")
+	}
+	if !client.exp.autoLaneHalted() {
+		t.Fatal("expected the halt flag set by the fence-winning refusal")
 	}
 }
 

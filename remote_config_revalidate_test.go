@@ -345,6 +345,110 @@ func TestRemoteConfigCadenceChangeNudgesRecalc(t *testing.T) {
 	}
 }
 
+func TestRemoteConfigCadenceOnlyFromUsableOutcomes(t *testing.T) {
+	var script atomic.Value
+	script.Store(rcScriptStep{status: 200, body: `{"values":{"k":"v"}}`, headers: map[string]string{"ETag": `"v1"`, "Cache-Control": "private, max-age=60"}})
+	server := newRCScriptServer(t, nil, &script)
+	defer server.Close()
+
+	client := newRemoteConfigClient(t, server.URL, "", "anon-rc-1")
+	defer client.Close(context.Background())
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatalf("priming fetch: %v", err)
+	}
+	anchored := func(want time.Duration, what string) {
+		t.Helper()
+		if got := client.rc.revalidateDelay(0); got != want {
+			t.Fatalf("%s: expected the %v anchor, got %v", what, want, got)
+		}
+	}
+	anchored(60*time.Second, "after the priming 200")
+
+	// A TRANSIENT failure carrying Cache-Control must not move the anchor —
+	// the cadence updates from usable outcomes only.
+	script.Store(rcScriptStep{status: 500, body: `oops`, headers: map[string]string{"Cache-Control": "private, max-age=86400"}})
+	if result, err := client.FetchRemoteConfig(context.Background()); err != nil || result.Reason != "transient_500" {
+		t.Fatalf("expected the cache-served transient_500, got %+v %v", result, err)
+	}
+	anchored(60*time.Second, "after a transient with an incidental max-age")
+
+	// An authoritative REFUSAL carrying Cache-Control moves nothing either.
+	script.Store(rcScriptStep{status: 401, body: `{"error":"nope"}`, headers: map[string]string{"Cache-Control": "private, max-age=86400"}})
+	if _, err := client.FetchRemoteConfig(context.Background()); err == nil || !strings.Contains(err.Error(), "unauthorized") {
+		t.Fatalf("expected unauthorized, got %v", err)
+	}
+	anchored(60*time.Second, "after an unauthorized with an incidental max-age")
+
+	// And a usable success WITHOUT the header restores the default anchor:
+	// the server stopped advertising a cadence, so the stale 60s must not
+	// keep governing the timer.
+	script.Store(rcScriptStep{status: 304, body: ``})
+	if result, err := client.FetchRemoteConfig(context.Background()); err != nil || !result.FromCache || result.Reason != "" {
+		t.Fatalf("expected a clean 304 revalidation, got %+v %v", result, err)
+	}
+	client.rc.mu.Lock()
+	present := client.rc.maxAgePresent
+	client.rc.mu.Unlock()
+	if present {
+		t.Fatal("expected the cadence observation cleared by a usable success without Cache-Control")
+	}
+	anchored(rcRevalidateFallback, "after a 304 without Cache-Control")
+}
+
+func TestRemoteConfigRevalidationStaleRefusalDoesNotHalt(t *testing.T) {
+	// A delayed 401 that LOST the per-scope fence to a newer settled 200 is
+	// old news: it fails its own fetch closed, but the unattended timer
+	// must not halt on it. A fresh (fence-winning) refusal still halts.
+	var requests atomic.Int64
+	firstArrived := make(chan struct{}, 1)
+	releaseFirst := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch requests.Add(1) {
+		case 1:
+			firstArrived <- struct{}{}
+			<-releaseFirst
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"nope"}`))
+		case 2:
+			_, _ = w.Write([]byte(`{"values":{"k":"fresh"}}`))
+		default:
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte(`{"error":"nope"}`))
+		}
+	}))
+	defer server.Close()
+
+	client := newRemoteConfigClient(t, server.URL, "", "anon-rc-1")
+	defer client.Close(context.Background())
+
+	// The timer's tick dispatches and stalls inside the server…
+	tickExit := make(chan bool, 1)
+	go func() {
+		tickExit <- client.revalidateRemoteConfigOnce()
+	}()
+	<-firstArrived
+	// …an explicit fetch settles a fresh 200 FIRST…
+	if result, err := client.FetchRemoteConfig(context.Background()); err != nil || result.Values["k"] != "fresh" {
+		t.Fatalf("newer fetch: %+v %v", result, err)
+	}
+	// …then the stalled 401 lands, having lost the fence: no halt.
+	close(releaseFirst)
+	if exit := <-tickExit; exit {
+		t.Fatal("a stale refusal that lost the fence must not halt the timer")
+	}
+	if client.rc.autoLaneHalted() {
+		t.Fatal("expected the timer not halted by the stale refusal")
+	}
+
+	// The NEXT tick's refusal wins its fence and halts as designed.
+	if exit := client.revalidateRemoteConfigOnce(); !exit {
+		t.Fatal("expected the fence-winning refusal to halt the timer")
+	}
+	if !client.rc.autoLaneHalted() {
+		t.Fatal("expected the halt flag set by the fence-winning refusal")
+	}
+}
+
 func TestRemoteConfigStaleLateResponseDoesNotOverwriteCadence(t *testing.T) {
 	// Overlapping fetches: an older response landing AFTER a newer fetch
 	// settled must not overwrite the revalidation cadence — the max-age
