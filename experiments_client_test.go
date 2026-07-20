@@ -1484,12 +1484,15 @@ func zero() float64 { return 0 }
 
 // ── spool interaction ───────────────────────────────────────────────────────
 
-func TestSpoolRetainsInternalFactsUnderUserScopedFloor(t *testing.T) {
-	// A user-scoped floor client (UserID configured) publishes an exposure
-	// fact; the batch fails retryably. The spool's actor-eligibility must
-	// reach intake's verdict — the fact IS the configured actor's (user_id
-	// omitted by wire contract, not an actor change) — and spool it, never
-	// dead-letter it.
+func TestExperimentFactsGateOnAnonymousActorUnderFloor(t *testing.T) {
+	// The fleet actor rule (review round 7): under a USER-scoped floor
+	// (UserID configured) the recorded grant covers the user actor, but an
+	// experiment fact rides the ANONYMOUS identity alone on the wire — the
+	// actor whose id actually ships has no grant, so the fact REFUSES at
+	// intake (ErrConsentActorMismatch, retryably: owed snapshots stay
+	// armed) and nothing reaches the wire or the spool. An
+	// ANONYMOUS-scoped floor (no UserID) grants the exact actor the fact
+	// carries, and the fact passes.
 	failures := 0
 	var mu sync.Mutex
 	mux := http.NewServeMux()
@@ -1527,21 +1530,48 @@ func TestSpoolRetainsInternalFactsUnderUserScopedFloor(t *testing.T) {
 		t.Fatalf("grant: %v", err)
 	}
 
-	fetchAssignment(t, client, expTestScopeKey)
-	_ = client.Flush(context.Background()) // fails 500 → retryable → spool
-
+	fetchAssignment(t, client, expTestScopeKey) // the PLANE is unaffected
+	if err := client.TrackExperimentOutcome(expTestScopeKey, "score", 1); !errors.Is(err, ErrConsentActorMismatch) {
+		t.Fatalf("a user-scoped floor must refuse the anonymous-actor fact, got %v", err)
+	}
+	if err := client.TrackExperimentExposure(expTestScopeKey); !errors.Is(err, ErrConsentActorMismatch) {
+		t.Fatalf("the explicit re-arm must refuse the same way, got %v", err)
+	}
+	if owed := client.owedExperimentExposureCount(); owed == 0 {
+		t.Fatalf("the automatic exposure must stay owed (retryable), not lost")
+	}
+	_ = client.Flush(context.Background())
+	if _, err := os.Stat(filepath.Join(spoolDir, "spool.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("no fact reached the pipeline, so nothing may spool, got %v", err)
+	}
+	_ = failures
 	dlMu.Lock()
 	letters := len(deadLetters)
 	dlMu.Unlock()
 	if letters != 0 {
-		t.Fatalf("the internal fact must be spool-eligible, got %d dead letters", letters)
+		t.Fatalf("nothing reached the spool, so nothing may dead-letter, got %d", letters)
 	}
-	data, err := os.ReadFile(filepath.Join(spoolDir, "spool.json"))
-	if err != nil {
-		t.Fatalf("the failed fact must be spooled: %v", err)
+
+	// The ANONYMOUS-scoped floor grants the exact actor the fact carries:
+	// the fact passes end-to-end.
+	script.push(200, expAssignedBody("1"))
+	capture2 := &expWireCapture{}
+	server2 := newExperimentServer(t, script, capture2)
+	defer server2.Close()
+	client2 := newExperimentClient(t, server2.URL, func(cfg *Config) {
+		cfg.SpoolDir = t.TempDir()
+		cfg.ConsentFloor = &ConsentFloorConfig{}
+	})
+	defer client2.Close(context.Background())
+	if err := client2.SetConsentDecision(ConsentDecisionGranted); err != nil {
+		t.Fatalf("grant: %v", err)
 	}
-	if !strings.Contains(string(data), experimentExposureName) {
-		t.Fatalf("the spool must hold the exposure fact")
+	fetchAssignment(t, client2, expTestScopeKey)
+	if err := client2.Flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if got := capture2.exposures(); len(got) == 0 {
+		t.Fatalf("an anonymous-scoped floor must pass the fact")
 	}
 }
 

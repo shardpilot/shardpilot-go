@@ -74,7 +74,7 @@ func TestPurgeEpochBumpsAfterQueueDrain(t *testing.T) {
 			}
 			select {
 			case ev := <-client.queue.ch:
-				if isWithdrawnExperimentFactEvent(ev) {
+				if isExperimentFactClassEvent(ev) {
 					seenAtPulls = append(seenAtPulls, seen)
 				}
 			default:
@@ -301,7 +301,7 @@ func TestWithdrawnMatchingIsTypedNotSubstring(t *testing.T) {
 			"look_key": "sfk1_" + strings.Repeat("a", 64),
 		},
 	}
-	if isWithdrawnExperimentFactEvent(hostEvent) {
+	if isExperimentFactClassEvent(hostEvent) {
 		t.Fatalf("a host event mentioning the fact name must not match")
 	}
 	hostRaw := []byte(`{"event_id":"h1","event_name":"host_experiment_exposure_notes","props":{"note":"experiment_exposure","look_key":"sfk1_` + strings.Repeat("a", 64) + `"}}`)

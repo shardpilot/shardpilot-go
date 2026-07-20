@@ -1791,6 +1791,12 @@ func (c *Client) spoolCloseRemnant(batch []Event) (gateRefused int, mirrored []s
 		}
 		break
 	}
+	// The remnant spool is a transport handoff too (the spooled envelopes
+	// resend at the next launch): a fact the real-subjects sentinel
+	// withdrew must not ride it. Runs on the worker's stop path, so the
+	// worker-owned filter applies as at any dispatch point.
+	var remnantBackoff int
+	remnant = c.dropWithdrawnExperimentFacts(remnant, &remnantBackoff)
 	if len(remnant) == 0 {
 		return 0, nil, 0, 0, 0
 	}

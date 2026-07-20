@@ -327,6 +327,7 @@ func NewClient(cfg Config) (*Client, error) {
 		// the ±10% window instead of herding at exactly 300s.
 		client.exp.jitterFn = client.jitterValue
 		client.exp.captureOwedDropFn = client.captureOwedExposuresForDrop
+		client.exp.captureRetryFn = client.appendCaptureEntries
 		client.exp.preload()
 		client.expLaneDone = make(chan struct{})
 	}
@@ -1141,6 +1142,13 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 			}
 		}
 		if len(batch) > 0 {
+			// Last purge re-check at the ACTUAL transport handoff: the
+			// receipt dispatch and spool resends above can block while a
+			// real-subjects sentinel lands, and the batch filtered at the
+			// loop top must not carry a since-withdrawn fact onto the wire.
+			batch = c.dropWithdrawnExperimentFacts(batch, backoffAttempt)
+		}
+		if len(batch) > 0 {
 			// Build THROUGH the retained request: a batch a previous attempt
 			// already marshaled resends its retained bytes verbatim, so the
 			// in-process retry matches what that failure spooled. A member
@@ -1260,6 +1268,14 @@ func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, def
 		*backoffAttempt = 0
 		c.retainedRequest = batchRequest{}
 		return batch[:0]
+	}
+	// Last purge re-check at the ACTUAL transport handoff: the receipt
+	// dispatch and spool resends above can block while a real-subjects
+	// sentinel lands, and the batch filtered at the loop top must not
+	// carry a since-withdrawn fact onto the wire.
+	batch = c.dropWithdrawnExperimentFacts(batch, backoffAttempt)
+	if len(batch) == 0 {
+		return batch
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.HTTPTimeout)
 	defer cancel()

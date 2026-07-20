@@ -997,11 +997,18 @@ type experimentsState struct {
 	// replays it at the next launch, and the deterministic event id
 	// collapses a double delivery server-side). Returns whether the capture
 	// is DURABLE (or moot: nothing capturable, no spool, policy-refused);
-	// false marks a mechanical persist failure — the caller must then keep
-	// the durable record intact and retry the capture+delete PAIR together.
+	// on false it also returns the FROZEN capture payload — the exact
+	// envelopes whose durability the contract demands — for the owed
+	// capture+delete pair to retry via captureRetryFn: the gate releases
+	// only when THOSE envelopes are durably spooled, never merely because
+	// the live sweep emptied the owed snapshots into the volatile queue.
 	// Called under e.mu; the implementation must take no client lock and
 	// defer any integrator callbacks.
-	captureOwedDropFn func(experimentKey string, owed []*expOwedExposure) bool
+	captureOwedDropFn func(experimentKey string, owed []*expOwedExposure) (bool, []spoolEntry)
+
+	// captureRetryFn re-attempts a frozen capture payload's durable spool
+	// append. Same locking contract as captureOwedDropFn.
+	captureRetryFn func(entries []spoolEntry) bool
 
 	// laneParkedForTests suspends the background lane's automatic ticks so
 	// tests can drive tick() deterministically. Never set in production.
@@ -1035,9 +1042,12 @@ type expOwedSync struct {
 	// captureFirst marks a drop whose owed-exposure durable capture has not
 	// landed yet: the record delete must not outrun the replay source, so
 	// the pair retries TOGETHER — the capture attempt first, the record
-	// converge only once it lands (or nothing remains to capture). Such an
-	// intent never folds into sibling saves.
-	captureFirst bool
+	// converge only once it lands. Such an intent never folds into sibling
+	// saves. captureEntries is the FROZEN payload (the exact envelopes to
+	// spool): the gate releases only when they are durable — a live sweep
+	// emptying the owed snapshots into the volatile queue is not enough.
+	captureFirst   bool
+	captureEntries []spoolEntry
 }
 
 // scopedIntentKey is the durablePending map key: the (scope, experiment)
@@ -1647,18 +1657,20 @@ func (e *experimentsState) retryDurableSync() {
 	if len(e.durablePending) == 0 {
 		return
 	}
-	// Capture-gated drops first: re-attempt the durable owed-exposure
-	// capture for every pair whose capture has not landed. Success — or
-	// nothing left to capture (the live sweep delivered the facts, or the
-	// snapshots were discarded) — releases the gate so the drop converges
-	// below; failure keeps the pair owed and the record intact.
+	// Capture-gated drops first: re-attempt the FROZEN capture payload's
+	// durable append for every pair whose capture has not landed. Only a
+	// durable (or policy-moot) append releases the gate — the live sweep
+	// emptying the owed snapshots into the volatile queue is NOT
+	// durability, and a crash with the fact queue-resident would lose it
+	// with no durable assignment left to re-arm it. Failure keeps the pair
+	// owed and the record intact.
 	for intentKey, pending := range e.durablePending {
 		if !pending.captureFirst {
 			continue
 		}
-		owed := e.pendingExposure[pending.experimentKey]
-		if len(owed) == 0 || e.captureOwedDropFn == nil || e.captureOwedDropFn(pending.experimentKey, owed) {
+		if len(pending.captureEntries) == 0 || e.captureRetryFn == nil || e.captureRetryFn(pending.captureEntries) {
 			pending.captureFirst = false
+			pending.captureEntries = nil
 			e.durablePending[intentKey] = pending
 		}
 	}
@@ -1874,10 +1886,11 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 		// cycle re-attempts the capture before converging the record.
 		if e.captureOwedDropFn != nil {
 			if owed := e.pendingExposure[experimentKey]; len(owed) > 0 {
-				if !e.captureOwedDropFn(experimentKey, owed) {
+				if ok, frozen := e.captureOwedDropFn(experimentKey, owed); !ok {
 					e.durablePending[scopedIntentKey(scope, experimentKey)] = expOwedSync{
 						asOf: asOf, drop: true, scope: scope,
-						experimentKey: experimentKey, captureFirst: true,
+						experimentKey: experimentKey,
+						captureFirst:  true, captureEntries: frozen,
 					}
 					return false, true, false
 				}

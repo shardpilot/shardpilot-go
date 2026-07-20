@@ -86,6 +86,18 @@ func (c *Client) enqueueExperimentFact(event Event, atClose bool) error {
 	if c.consentFloorEnabled() && c.consentUndecided() {
 		return ErrConsentUnknown
 	}
+	if c.consentFloorEnabled() && event.omitUserID && c.cfg.UserID != "" {
+		// The floor's grant covers the configured EFFECTIVE actor — with a
+		// UserID configured, the user actor — but this SDK fact rides the
+		// ANONYMOUS identity alone on the wire (user_id omitted by
+		// contract). The actor whose id actually ships has no recorded
+		// grant, so a strict-consent ingest would suppress the fact — or
+		// worse, it would persist under the wrong actor's grant. The same
+		// actor rule Enqueue applies to overridden identities applies
+		// here: refused, retryably (owed snapshots stay armed for a
+		// session whose actor shape may change).
+		return ErrConsentActorMismatch
+	}
 	event, err := c.prepareEvent(event)
 	if err != nil {
 		return err
@@ -133,6 +145,9 @@ func (c *Client) buildExperimentFactEvent(name, experimentKey string, entry *exp
 		// user_id, whatever the client configuration would default.
 		omitUserID:     true,
 		sourceOverride: SourceClient,
+		// The purge generation this fact belongs to: a later sentinel
+		// withdraws only facts built BEFORE it.
+		expFactEpoch: c.expFactPurgeEpoch.Load(),
 	}, ""
 }
 
@@ -421,21 +436,32 @@ func experimentFactError(code string, terminal bool) error {
 		return ErrQueueFull
 	case ErrClosed.Error():
 		return ErrClosed
+	case ErrConsentActorMismatch.Error():
+		return ErrConsentActorMismatch
 	}
 	return fmt.Errorf("%w: %s", ErrInvalidExperimentFact, code)
 }
 
-// isWithdrawnExperimentFactEvent recognizes one of this SDK's own
-// experiment facts carrying a server-minted subject fact key — the exact
-// class the real-subjects sentinel withdraws from delivery. Host events
-// merely sharing a name are not matched (they cannot carry a grammar-valid
-// sfk1_ assignment key they never had).
-func isWithdrawnExperimentFactEvent(event Event) bool {
+// isExperimentFactClassEvent recognizes one of this SDK's own experiment
+// facts carrying a server-minted subject fact key — decided on the
+// TOP-LEVEL event name and the typed assignment_key prop, never substring
+// matching. Host events merely sharing a name are not matched (they cannot
+// carry a grammar-valid sfk1_ assignment key they never had).
+func isExperimentFactClassEvent(event Event) bool {
 	if event.Name != experimentExposureName && event.Name != experimentOutcomeName {
 		return false
 	}
 	key, _ := event.Props["assignment_key"].(string)
 	return expSubjectFactKeyPattern.MatchString(key)
+}
+
+// isWithdrawnExperimentFactEvent recognizes a fact the CURRENT purge state
+// withdraws: the fact class AND a build stamp predating the current purge
+// epoch. A fresh post-purge fact (a new authorized assignment after the
+// platform re-enabled real subjects) carries the current epoch and is never
+// withdrawn for a worker's epoch lag.
+func (c *Client) isWithdrawnExperimentFactEvent(event Event) bool {
+	return isExperimentFactClassEvent(event) && event.expFactEpoch < c.expFactPurgeEpoch.Load()
 }
 
 // withdrawnExperimentFactRaw is the same recognition over a spooled
@@ -477,8 +503,11 @@ func (c *Client) purgeWithdrawnExperimentFacts() {
 	e := c.exp
 	e.emitMu.Lock()
 	c.lifecycleMu.Lock()
+	// The CLASS predicate suffices here: every queued experiment fact was
+	// built before this purge (fresh facts cannot enqueue while the intake
+	// and emit locks are held), so all of them are withdrawn.
 	removedQueued := c.queue.filter(func(event Event) bool {
-		return !isWithdrawnExperimentFactEvent(event)
+		return !isExperimentFactClassEvent(event)
 	})
 	// The epoch bumps AFTER the queue drain: bumping first opens a TOCTOU
 	// window where a worker dispatch point observes the new epoch against
@@ -526,7 +555,7 @@ func (c *Client) dropWithdrawnExperimentFacts(batch []Event, backoffAttempt *int
 	kept := batch[:0]
 	removed := 0
 	for _, event := range batch {
-		if isWithdrawnExperimentFactEvent(event) {
+		if c.isWithdrawnExperimentFactEvent(event) {
 			removed++
 			continue
 		}
@@ -598,11 +627,11 @@ func filterWithdrawnFromBatchRequest(request batchRequest) (batchRequest, int) {
 // Lock discipline: runs under e.mu, so it takes NO client lock (the fact
 // and envelope builders are lock-free; the spool's mutex is a leaf) and
 // DEFERS integrator dead-letter callbacks to the next off-lock drain.
-func (c *Client) captureOwedExposuresForDrop(experimentKey string, owed []*expOwedExposure) bool {
+func (c *Client) captureOwedExposuresForDrop(experimentKey string, owed []*expOwedExposure) (bool, []spoolEntry) {
 	if c.spool == nil {
 		// Memory-only client: no durable capture exists to gate on — the
 		// documented ephemeral posture.
-		return true
+		return true, nil
 	}
 	events := make([]Event, 0, len(owed))
 	for _, snapshot := range owed {
@@ -616,20 +645,40 @@ func (c *Client) captureOwedExposuresForDrop(experimentKey string, owed []*expOw
 		events = append(events, event)
 	}
 	if len(events) == 0 {
-		return true
+		return true, nil
 	}
 	request, err := c.buildBatch(events)
 	if err != nil {
-		return true // unbuildable facts have no capturable form
+		return true, nil // unbuildable facts have no capturable form
 	}
 	eligible, refusedActors := c.partitionSpoolEligible(request)
 	if len(refusedActors) > 0 {
 		c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropConsent, refusedActors))
 	}
 	if len(eligible) == 0 {
+		return true, nil
+	}
+	if c.appendCaptureEntries(eligible) {
+		return true, nil
+	}
+	// The capture payload is FROZEN in the owed intent: the live sweep may
+	// deliver these facts into the queue and empty the owed snapshots, but
+	// queue residency is not durability — the gate releases only when
+	// these exact envelopes land in the spool (double delivery collapses
+	// on the deterministic ids; a live publish settles the spooled copies
+	// by id).
+	return false, eligible
+}
+
+// appendCaptureEntries appends frozen capture envelopes to the disk spool,
+// reporting whether the capture is DURABLE (or moot by policy). Runs under
+// e.mu like the capture itself: leaf spool mutex only, dead-letters
+// deferred.
+func (c *Client) appendCaptureEntries(eligible []spoolEntry) bool {
+	s := c.spool
+	if s == nil || len(eligible) == 0 {
 		return true
 	}
-	s := c.spool
 	refused, added, expired, evicted, persistFailed := s.append(eligible, 0, false, c.clock.Now(), func() bool {
 		return c.consent.Load() == consentStateGranted && s.grantPersisted
 	})
