@@ -35,6 +35,15 @@ func (q *boundedQueue) drainAll() int {
 	}
 }
 
+// NOTE: there is deliberately no drain-and-re-enqueue filter on this queue.
+// A filter draining keepers while the worker keeps receiving from q.ch can
+// reorder unrelated events (a later queued event received mid-drain
+// overtakes an earlier keeper still awaiting re-enqueue) — the intake lock
+// only fences PRODUCERS, never the consumer. Selective removal (the
+// sentinel purge) therefore happens per event on the consumer side, where
+// the worker owns the receive: see admitReceivedEvent and the close
+// remnant's per-member check.
+
 func (q *boundedQueue) drainInto(events []Event, limit int) []Event {
 	for len(events) < limit {
 		select {

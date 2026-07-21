@@ -1,0 +1,1082 @@
+package shardpilot
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"math"
+	"sort"
+	"strings"
+)
+
+// Experiment exposure/outcome fact producers (the analytics half of the
+// consumer in experiments.go): the two runtime experiment facts, emitted
+// THROUGH the client's existing analytics pipeline — the bounded queue, the
+// flush worker, the spool, and the consent gates — so they inherit exactly
+// the consent posture the integrator configured. No new network path, no
+// new queue, no consent bypass.
+//
+// Wire contract (analytics ingest, strict):
+//   - names `experiment_exposure` / `experiment_outcome`;
+//   - source is ALWAYS "client" (these are runtime client facts, whatever
+//     Config.Source says otherwise);
+//   - user_id is ALWAYS omitted; anonymous_id is REQUIRED and carries the
+//     SDK's standard Config.AnonymousID — that identity is what makes the
+//     GDPR erasure cascade reach the fact. A client with no configured
+//     AnonymousID cannot build an in-contract fact and skips it terminally
+//     (diagnosed);
+//   - props are the exact allowlist and nothing else: experiment_key,
+//     experiment_version, assignment_key, variant_key, assignment_unit
+//     (plus outcome_key/outcome_value on the outcome). The assignment_key
+//     prop carries the SERVER-MINTED subject-fact key VERBATIM; the
+//     SDK-minted spcid subject id never rides an analytics fact — an
+//     assignment without a subject-fact key (a synthetic-unit answer
+//     included) emits NO fact.
+//
+// Emission timing (exposures): at most once per (experiment, version,
+// subject) per session — this SDK's session is the client instance — with a
+// DETERMINISTIC event id (experimentExposureEventID) so at-least-once
+// retries and same-session re-emissions collapse server-side as duplicates.
+// Owed emissions (a full queue, a consent-closed window, a cache-restored
+// application) stay armed as snapshots and drain on the lane's sweep in
+// FIFO order per experiment. TrackExperimentExposure is the explicit
+// re-arm: it buys an EXTRA fact with a bumped arm counter — while the
+// automatic arm-0 emission is still owed in the queue, the re-arm takes arm
+// 1 and the owed snapshot keeps its arm 0, so BOTH facts emit with distinct
+// deterministic ids.
+
+// experimentConsentRefusal is the plane's consent gate: the SAME effective
+// consent state the analytics path enforces, composed identically — denial
+// (either flavor, the forced-minor state included) refuses everywhere;
+// unknown refuses under the opt-in ConsentFloor and admits without it
+// (this SDK's documented open-under-unknown posture). Nothing separate is
+// computed. nil = admitted.
+func (c *Client) experimentConsentRefusal() error {
+	if c.consentDenied() {
+		return ErrConsentDenied
+	}
+	if c.consentFloorEnabled() && c.consentUndecided() {
+		return ErrConsentUnknown
+	}
+	return nil
+}
+
+// enqueueExperimentFact is the internal fact intake: the analytics queue
+// with the same gates Enqueue applies — lifecycle, consent, preparation —
+// minus the floor's actor-mismatch check, which reads per-event identity
+// OVERRIDES and does not apply here: an experiment fact carries the
+// configured identity by construction (anonymous_id = Config.AnonymousID;
+// user_id omitted on the wire by contract, not as an actor change).
+// atClose admits the fact past the closed gate: Close's last-chance sweep
+// runs after the closed store, and its facts ride the final flush.
+func (c *Client) enqueueExperimentFact(event Event, atClose bool) error {
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	// The intake stamp, read under lifecycleMu — the same lock a denial's
+	// fast half takes — so it is exact, exactly like Enqueue's: a fact
+	// admitted here is fully enqueued before any later denial's bump and
+	// drain start, and the stamp provably predates that denial.
+	intakeEpoch := c.consentEpoch.Load()
+	if !atClose && c.closed.Load() {
+		return ErrClosed
+	}
+	// Consent refusals here are RETRYABLE for the fact lane (an exposure
+	// snapshot stays owed and re-emits; the caller sees the refusal), so
+	// they deliberately do NOT count in Stats.Dropped — only terminal
+	// outcomes drop facts, and a re-armed snapshot retried across a
+	// consent-closed window must not inflate the counter per attempt.
+	if c.consentDenied() {
+		return ErrConsentDenied
+	}
+	if c.consentFloorEnabled() && c.consentUndecided() {
+		return ErrConsentUnknown
+	}
+	if c.consentFloorEnabled() && event.omitUserID && c.cfg.UserID != "" {
+		// The floor's grant covers the configured EFFECTIVE actor — with a
+		// UserID configured, the user actor — but this SDK fact rides the
+		// ANONYMOUS identity alone on the wire (user_id omitted by
+		// contract). The actor whose id actually ships has no recorded
+		// grant, so a strict-consent ingest would suppress the fact — or
+		// worse, it would persist under the wrong actor's grant. The same
+		// actor rule Enqueue applies to overridden identities applies
+		// here: refused, retryably (owed snapshots stay armed for a
+		// session whose actor shape may change).
+		return ErrConsentActorMismatch
+	}
+	event, err := c.prepareEvent(event)
+	if err != nil {
+		return err
+	}
+	event.intakeConsentEpoch = intakeEpoch
+	if !c.queue.enqueue(event) {
+		return ErrQueueFull
+	}
+	c.stats.enqueued.Add(1)
+	return nil
+}
+
+// buildExperimentFactEvent assembles one strict-allowlist experiment fact
+// from a cached entry. The subject-fact key is the fact's assignment_key —
+// enforced here so the raw spcid subject id can never leave the SDK in
+// experiment props. eventID, when non-empty, presets the deterministic
+// exposure id; empty lets the pipeline mint a fresh one (outcomes).
+// factEpoch is the pipeline purge epoch the CALLER observed UNDER e.mu
+// atomically with the entry snapshot — never loaded here: this builder runs
+// after the snapshot left the lock, and a real-subjects sentinel landing in
+// that gap would stamp a pre-sentinel entry with the post-sentinel epoch,
+// so the purge (blocked on emitMu until the emission completes) would treat
+// the withdrawn fact as fresh and leave its subject-fact key in the
+// queue/spool.
+func (c *Client) buildExperimentFactEvent(name, experimentKey string, entry *expEntry, eventID, sessionID string, factEpoch uint64) (Event, string) {
+	factKey := strings.TrimSpace(entry.SubjectFactKey)
+	if !expSubjectFactKeyPattern.MatchString(factKey) {
+		// The privacy boundary of the fact lane: ONLY a grammar-valid
+		// server-minted sfk1_ key may ride assignment_key. Absent AND
+		// malformed values (a raw spcid_ echo included) alike mean this
+		// assignment produces no fact.
+		return Event{}, "exposure_no_subject_fact_key"
+	}
+	if c.cfg.AnonymousID == "" {
+		// The ingest contract requires the SDK client identity as
+		// anonymous_id on experiment facts (erasure reachability): with
+		// none configured the fact cannot be built in-contract.
+		return Event{}, "exposure_no_anonymous_id"
+	}
+	props := map[string]any{
+		"experiment_key":     experimentKey,
+		"experiment_version": entry.Version,
+		"assignment_key":     factKey,
+		"variant_key":        entry.VariantKey,
+		"assignment_unit":    entry.AssignmentUnit,
+	}
+	return Event{
+		ID:          eventID,
+		Name:        name,
+		AnonymousID: c.cfg.AnonymousID,
+		// The arm-time session identity. The source override below makes
+		// these facts publish as "client" whatever tier the configuration
+		// is, and the ingest contract requires session_id on every
+		// non-backend event — an unstamped fact would be REJECTED once the
+		// producer lane accepts these names. This SDK's session is the
+		// client instance (one marker per construction); an owed snapshot
+		// passes the marker of the session its application belonged to.
+		// Host events under a backend-source configuration are untouched:
+		// they keep publishing as "backend" with the contract's session_id
+		// carve-out.
+		SessionID: sessionID,
+		Props:     props,
+		// Envelope contract for experiment facts: source "client" and no
+		// user_id, whatever the client configuration would default.
+		omitUserID:     true,
+		sourceOverride: SourceClient,
+		// The purge generation this fact belongs to: a later sentinel
+		// withdraws only facts built BEFORE it. The stamp is the caller's
+		// snapshot-time observation (see the function comment), one atomic
+		// (entry, epoch) pair.
+		expFactEpoch: factEpoch,
+	}, ""
+}
+
+// emitEntryExposure emits one exposure fact for one applied-entry snapshot.
+// Callers hold emitMu (never e.mu). Returns:
+//   - ok=true                — emitted, or already emitted this session;
+//   - ok=false, terminal     — terminally skipped (no server-safe fact key,
+//     no anonymous id); the snapshot leaves the queue, diagnosed;
+//   - ok=false, !terminal    — retryable (consent closed, queue full): an
+//     armed snapshot stays for a later sweep.
+//
+// sessionMarker is the marker of the SESSION THE APPLICATION BELONGS TO (an
+// owed snapshot carries its own; "" means the current session): the
+// deterministic id derives from it, and the current session's dedup
+// bookkeeping (exposed) is consulted and updated ONLY for current-session
+// emissions.
+//
+// Arm accounting: exposed[tuple] records the highest arm handed out and
+// whether the AUTOMATIC arm-0 fact has emitted. An explicit re-arm that
+// runs while that automatic emission is still owed in the queue takes arm 1
+// and leaves the owed snapshot its arm 0 — the re-arm buys an EXTRA fact,
+// never the owed one's slot — and the later sweep emits the arm 0 exactly
+// once.
+//
+// factEpoch is the pipeline purge epoch the caller observed UNDER e.mu
+// atomically with its entry snapshot (see buildExperimentFactEvent): the
+// stamp must ride the snapshot, not a later read — a sentinel can land
+// between the caller releasing e.mu and this emission's own lock window,
+// and re-reading here would give the pre-sentinel entry a post-sentinel
+// stamp.
+func (c *Client) emitEntryExposure(experimentKey string, entry *expEntry, rearm bool, sessionMarker string, atClose bool, factEpoch uint64) (ok bool, code string, terminal bool) {
+	if err := c.experimentConsentRefusal(); err != nil {
+		return false, consentRefusalCode(err), false
+	}
+	e := c.exp
+
+	e.mu.Lock()
+	purgeEpoch := e.purgeEpoch
+	marker := sessionMarker
+	if marker == "" {
+		marker = e.sessionMarker
+	}
+	currentSession := marker == e.sessionMarker
+	tuple := exposureTupleKey(experimentKey, entry)
+	exposed, haveExposed := expExposed{}, false
+	if currentSession {
+		exposed, haveExposed = e.exposed[tuple]
+	}
+	if haveExposed && !rearm && exposed.auto {
+		e.mu.Unlock()
+		return true, "", false
+	}
+	var arm int64
+	var next expExposed
+	switch {
+	case rearm && haveExposed:
+		arm = exposed.arm + 1
+		next = expExposed{arm: arm, auto: exposed.auto}
+	case rearm && e.owedTupleArmedLocked(experimentKey, tuple):
+		// The automatic emission is still owed in the queue: the explicit
+		// re-arm counts as the EXTRA fact on top of it.
+		arm = 1
+		next = expExposed{arm: 1, auto: false}
+	case rearm:
+		next = expExposed{arm: 0, auto: true}
+	default:
+		// The automatic emission: arm 0 by definition. Reachable with
+		// exposed already set only while that arm-0 fact was owed behind
+		// explicit re-arms — emitting it completes the auto slot without
+		// lowering the recorded highest arm.
+		if haveExposed {
+			next = expExposed{arm: exposed.arm, auto: true}
+		} else {
+			next = expExposed{arm: 0, auto: true}
+		}
+	}
+	e.mu.Unlock()
+
+	eventID := experimentExposureEventID(marker, entry.SubjectKey, experimentKey, entry.Version, arm)
+	// Seam: the window between the caller's (entry, epoch) snapshot leaving
+	// e.mu and the fact build below — a sentinel landing here is exactly the
+	// race the snapshot-time factEpoch stamp closes.
+	e.fireConsentRaceSeam("exposure_build")
+	event, skipCode := c.buildExperimentFactEvent(experimentExposureName, experimentKey, entry, eventID, marker, factEpoch)
+	if skipCode != "" {
+		c.logf("shardpilot experiments: exposure for experiment %q skipped (%s)", experimentKey, skipCode)
+		return false, skipCode, true
+	}
+	// Seam: the window between this emission's own consent check (above)
+	// and the fact intake's gate re-check — a consent flip landing here is
+	// the raced refusal the intake reports.
+	e.fireConsentRaceSeam("exposure_enqueue")
+	if err := c.enqueueExperimentFact(event, atClose); err != nil {
+		return false, err.Error(), false
+	}
+	// Seam: the window between the successful enqueue and the arm
+	// bookkeeping re-locking below — a purge landing here races the
+	// high-water update.
+	e.fireConsentRaceSeam("exposure_enqueued")
+	if currentSession {
+		e.mu.Lock()
+		if e.purgeEpoch == purgeEpoch {
+			e.exposed[tuple] = next
+		} else {
+			// A purge raced this emission: its drain may have wiped the
+			// queued fact, and its re-arm must stand — the sweep re-emits
+			// the tuple with the SAME deterministic id, so a fact that DID
+			// survive (or had already published) collapses server-side as a
+			// duplicate. The ARM, though, was already handed to the
+			// pipeline with the enqueue above — and the purge kills FACTS,
+			// never the session's id domain (resetExposedKeepArmsLocked) —
+			// so the high-water still records it: skipped, the next
+			// explicit re-arm would recompute the SAME arm, reuse this
+			// emission's deterministic id, and the server's de-dupe would
+			// collapse a REAL new exposure. Only the arm is merged; the
+			// purge's auto slate stands (its re-arm must still emit, so a
+			// wiped queued automatic fact is never marked already-sent).
+			prior, havePrior := e.exposed[tuple]
+			if (havePrior && prior.arm < arm) || (!havePrior && arm > 0) {
+				e.exposed[tuple] = expExposed{arm: arm, auto: havePrior && prior.auto}
+			}
+		}
+		e.mu.Unlock()
+	}
+	return true, "", false
+}
+
+func consentRefusalCode(err error) string {
+	if err == ErrConsentUnknown {
+		return "consent_unknown"
+	}
+	return "consent_denied"
+}
+
+// sweepExperimentExposures drains one experiment's owed-exposure queue in
+// order: emitted and terminally skipped snapshots leave the queue; a
+// retryable failure (queue full, consent closed) stops the drain and keeps
+// the remainder armed for a later sweep, so an older application's fact is
+// never leapfrogged or lost.
+func (c *Client) sweepExperimentExposures(experimentKey string) {
+	c.sweepExperimentExposuresMode(experimentKey, false)
+}
+
+func (c *Client) sweepExperimentExposuresMode(experimentKey string, atClose bool) {
+	e := c.exp
+	e.emitMu.Lock()
+	defer e.emitMu.Unlock()
+	for {
+		e.mu.Lock()
+		list := e.pendingExposure[experimentKey]
+		if len(list) == 0 {
+			delete(e.pendingExposure, experimentKey)
+			e.mu.Unlock()
+			return
+		}
+		head := list[0]
+		// Copy the snapshot's fields UNDER the lock: armExposureLocked
+		// refreshes a same-(session, tuple) tail snapshot in place, so
+		// reading head.entry/head.session after the unlock races that
+		// write. The copies stay a consistent pair; a refresh that lands
+		// mid-emission is tuple-identical by construction (the refresh
+		// gate), so emitting the older copy derives the same deterministic
+		// id and the identity-based removal below is untouched. The purge
+		// epoch joins the same atomic observation: the fact's stamp must
+		// describe the snapshot, not whatever a later sentinel left.
+		headEntry, headSession := head.entry, head.session
+		headEpoch := c.expFactPurgeEpoch.Load()
+		e.mu.Unlock()
+		ok, _, terminal := c.emitEntryExposure(experimentKey, headEntry, false, headSession, atClose, headEpoch)
+		if !ok && !terminal {
+			return
+		}
+		e.mu.Lock()
+		// Remove the settled head — by identity, not position: an arm
+		// racing this sweep may have appended, never removed or reordered.
+		list = e.pendingExposure[experimentKey]
+		if len(list) > 0 && list[0] == head {
+			e.pendingExposure[experimentKey] = list[1:]
+		}
+		e.mu.Unlock()
+	}
+}
+
+// sweepAllExperimentExposures drains every experiment's owed exposures in
+// per-experiment order. Callers gate on consent; the per-snapshot emit
+// re-checks it anyway (a mid-sweep revocation stops the drain retryably).
+func (c *Client) sweepAllExperimentExposures() {
+	c.sweepAllExperimentExposuresMode(false)
+}
+
+func (c *Client) sweepAllExperimentExposuresMode(atClose bool) {
+	e := c.exp
+	e.mu.Lock()
+	keys := make([]string, 0, len(e.pendingExposure))
+	for key := range e.pendingExposure {
+		keys = append(keys, key)
+	}
+	e.mu.Unlock()
+	sort.Strings(keys)
+	for _, key := range keys {
+		c.sweepExperimentExposuresMode(key, atClose)
+	}
+}
+
+// TrackExperimentExposure emits one EXTRA exposure fact for the cached
+// assignment (a distinct deterministic id per re-arm), for hosts that want
+// re-exposure semantics on top of the automatic once-per-session emission —
+// the automatic fact emits at the assignment's application (fetch
+// resolution or cache restore) without any host call. Requires the
+// experiments opt-in (ErrExperimentsNotConfigured), an assignment currently
+// served (ErrExperimentNoAssignment), the plane's consent admission
+// (ErrConsentDenied/ErrConsentUnknown), and a server-minted subject-fact
+// key on the assignment (ErrExperimentFactUnavailable — the SDK subject id
+// never rides analytics facts). ErrQueueFull reports backpressure: the
+// re-arm did not consume its slot and the call can be retried.
+func (c *Client) TrackExperimentExposure(experimentKey string) error {
+	if c.closed.Load() {
+		return ErrClosed
+	}
+	e := c.exp
+	if e == nil {
+		return ErrExperimentsNotConfigured
+	}
+	experimentKey = strings.TrimSpace(experimentKey)
+	if experimentKey == "" {
+		return fmt.Errorf("%w: experiment key is required", ErrInvalidExperimentFact)
+	}
+	// The consent gate comes first (canonical order): a refused plane
+	// reports its refusal, not the cache state behind it.
+	if err := c.experimentConsentRefusal(); err != nil {
+		return err
+	}
+	e.emitMu.Lock()
+	defer e.emitMu.Unlock()
+	e.mu.Lock()
+	if e.tornDown {
+		e.mu.Unlock()
+		return ErrClosed
+	}
+	// The explicit re-arm targets the LIVE assignment only. The purge
+	// epoch is observed under the same lock hold as the entry — one atomic
+	// (entry, epoch) snapshot for the fact stamp.
+	entry := e.entries[experimentKey]
+	factEpoch := c.expFactPurgeEpoch.Load()
+	e.mu.Unlock()
+	if entry == nil {
+		return ErrExperimentNoAssignment
+	}
+	ok, code, terminal := c.emitEntryExposure(experimentKey, entry, true, "", false, factEpoch)
+	if ok {
+		return nil
+	}
+	return experimentFactError(code, terminal)
+}
+
+// TrackExperimentOutcome emits one experiment_outcome fact — the measured
+// outcome for the cached assignment — through the analytics pipeline.
+// outcomeValue must be a finite number. Each admitted call is a distinct
+// fact (a fresh event id); outcomes are never deduplicated. The refusal
+// surface matches TrackExperimentExposure, plus ErrInvalidExperimentFact
+// for an empty outcome key or a non-finite value.
+func (c *Client) TrackExperimentOutcome(experimentKey, outcomeKey string, outcomeValue float64) error {
+	if c.closed.Load() {
+		return ErrClosed
+	}
+	e := c.exp
+	if e == nil {
+		return ErrExperimentsNotConfigured
+	}
+	experimentKey = strings.TrimSpace(experimentKey)
+	outcomeKey = strings.TrimSpace(outcomeKey)
+	if experimentKey == "" {
+		return fmt.Errorf("%w: experiment key is required", ErrInvalidExperimentFact)
+	}
+	if outcomeKey == "" {
+		return fmt.Errorf("%w: outcome key is required", ErrInvalidExperimentFact)
+	}
+	if math.IsNaN(outcomeValue) || math.IsInf(outcomeValue, 0) {
+		return fmt.Errorf("%w: outcome value must be a finite number", ErrInvalidExperimentFact)
+	}
+	if err := c.experimentConsentRefusal(); err != nil {
+		return err
+	}
+	// The emit lock serializes the outcome with a real-subjects sentinel
+	// purge exactly like exposures: without it this path could read a live
+	// entry, lose the race to purgeWithdrawnExperimentFacts, and enqueue a
+	// withdrawn subject-fact key AFTER the queue filter ran. Under the
+	// lock the outcome either enqueues before the filter (and is caught)
+	// or reads the already-cleared cache after it (and refuses).
+	e.emitMu.Lock()
+	defer e.emitMu.Unlock()
+	e.mu.Lock()
+	if e.tornDown {
+		e.mu.Unlock()
+		return ErrClosed
+	}
+	entry := e.entries[experimentKey]
+	// An outcome is measured in THIS session by definition (it has no owed
+	// cross-session machinery): the current marker is its session identity.
+	// The purge epoch joins the same lock hold — one atomic (entry, epoch)
+	// snapshot for the fact stamp.
+	marker := e.sessionMarker
+	factEpoch := c.expFactPurgeEpoch.Load()
+	e.mu.Unlock()
+	if entry == nil {
+		return ErrExperimentNoAssignment
+	}
+	// Seam: the window between the snapshot above leaving e.mu and the fact
+	// build — a sentinel landing here is exactly the race the snapshot-time
+	// factEpoch stamp closes.
+	e.fireConsentRaceSeam("outcome_build")
+	event, skipCode := c.buildExperimentFactEvent(experimentOutcomeName, experimentKey, entry, "", marker, factEpoch)
+	if skipCode != "" {
+		return ErrExperimentFactUnavailable
+	}
+	event.Props["outcome_key"] = outcomeKey
+	event.Props["outcome_value"] = outcomeValue
+	return c.enqueueExperimentFact(event, false)
+}
+
+// experimentFactError maps an emit refusal code back to the public error
+// surface. The consent refusals arrive in TWO spellings: the short codes
+// (consentRefusalCode, from the emission's own pre-check) and the sentinel
+// errors' literal strings — a consent flip landing between that pre-check
+// and the fact intake's gate re-check makes the enqueue itself return
+// ErrConsentDenied/ErrConsentUnknown, and the emission reports err.Error()
+// as the code. Both spellings map to the documented consent errors; without
+// the second, the raced refusal surfaced as ErrInvalidExperimentFact.
+func experimentFactError(code string, terminal bool) error {
+	switch code {
+	case "consent_denied", ErrConsentDenied.Error():
+		return ErrConsentDenied
+	case "consent_unknown", ErrConsentUnknown.Error():
+		return ErrConsentUnknown
+	}
+	if terminal {
+		return ErrExperimentFactUnavailable
+	}
+	switch code {
+	case ErrQueueFull.Error():
+		return ErrQueueFull
+	case ErrClosed.Error():
+		return ErrClosed
+	case ErrConsentActorMismatch.Error():
+		return ErrConsentActorMismatch
+	}
+	return fmt.Errorf("%w: %s", ErrInvalidExperimentFact, code)
+}
+
+// isExperimentFactClassEvent recognizes one of this SDK's own experiment
+// facts carrying a server-minted subject fact key. The decisive test is the
+// SDK-INTERNAL authorship marker (omitUserID — settable only by the fact
+// builders, never through the public Event surface), so a host-authored
+// event that happens to use the reserved-looking name + sfk1_-shaped
+// assignment_key combination is never matched — the sentinel withdraws this
+// SDK's own facts, not host data that merely resembles them. The name and
+// typed-prop checks stay as the class shape on top of the marker (never
+// substring matching).
+func isExperimentFactClassEvent(event Event) bool {
+	if !event.omitUserID {
+		return false
+	}
+	if event.Name != experimentExposureName && event.Name != experimentOutcomeName {
+		return false
+	}
+	key, _ := event.Props["assignment_key"].(string)
+	return expSubjectFactKeyPattern.MatchString(key)
+}
+
+// isWithdrawnExperimentFactEvent recognizes a fact the CURRENT purge state
+// withdraws: the fact class AND a build stamp predating the current purge
+// epoch. A fresh post-purge fact (a new authorized assignment after the
+// platform re-enabled real subjects) carries the current epoch and is never
+// withdrawn for a worker's epoch lag.
+func (c *Client) isWithdrawnExperimentFactEvent(event Event) bool {
+	return isExperimentFactClassEvent(event) && event.expFactEpoch < c.expFactPurgeEpoch.Load()
+}
+
+// withdrawnExperimentFactRaw is the class-SHAPE half of the recognition
+// over a spooled envelope's exact wire bytes. The wire envelope cannot
+// carry the SDK-authorship marker (the ingest contract is a strict
+// allowlist), so every raw-side caller pairs this check with the entry's
+// persisted internalFact flag (spoolEntry.internalFact, stamped from the
+// envelope at spool time and stored in the record) — the shape alone must
+// never condemn a host-authored envelope that resembles a fact.
+func withdrawnExperimentFactRaw(raw json.RawMessage) bool {
+	var wire struct {
+		EventName string `json:"event_name"`
+		Props     struct {
+			AssignmentKey string `json:"assignment_key"`
+		} `json:"props"`
+	}
+	if json.Unmarshal(raw, &wire) != nil {
+		return false
+	}
+	if wire.EventName != experimentExposureName && wire.EventName != experimentOutcomeName {
+		return false
+	}
+	return expSubjectFactKeyPattern.MatchString(wire.Props.AssignmentKey)
+}
+
+// purgeWithdrawnExperimentFacts runs when the real-subjects sentinel LANDS:
+// the platform withdrew the assignments AND their subject fact keys, so
+// experiment facts already ACCEPTED into the pipeline — the shared queue,
+// the worker's held batch, the disk spool — must not ship on the next
+// flush. Owed snapshots were discarded by the install under e.mu; this is
+// the rest of the pipeline:
+//   - QUEUED facts die stamp-fenced at every consumer: admitReceivedEvent
+//     (the worker's receive and the flush drain), the close remnant's
+//     per-member check, and the denial drain — never via a drain/re-enqueue
+//     filter here, which raced the worker's channel receive and could
+//     reorder unrelated keeper events. emitMu is held so an emit in flight
+//     either enqueued a pre-sentinel-stamped fact before this purge (caught
+//     by those stamp fences) or reads the already-cleared state after it
+//     (and emits nothing);
+//   - the worker's held batch filters at its next dispatch point via the
+//     purge epoch (see dropWithdrawnExperimentFacts) — before any send;
+//   - the spool removes matching SDK-authored envelopes and dead-letters
+//     them (SpoolDropTerminal: the server outcome settled them
+//     undeliverable).
+//
+// The residual is a fact already handed to the transport when the sentinel
+// landed: indistinguishable from one already delivered — and if that same
+// in-flight send fails and spools, the spool's retry-age cap bounds it.
+func (c *Client) purgeWithdrawnExperimentFacts() {
+	e := c.exp
+	e.emitMu.Lock()
+	// The QUEUE leg lives entirely on the consumer side. The epoch was
+	// already bumped UNDER e.mu, atomically with the sentinel's decisive
+	// state change (applySentinelWithdrawalLocked), and every path that
+	// takes an event OUT of the queue is stamp-fenced per event: the
+	// worker's receive and the flush drain through admitReceivedEvent (the
+	// intake-epoch idiom applied to the fact stamp), the close remnant's
+	// per-member check, and the denial drain which drops wholesale — each
+	// withdraws exactly the facts built before the sentinel (old epoch),
+	// sparing post-sentinel ones, counted exactly once at the point that
+	// drops them. A drain/re-enqueue filter here (the old shape) held
+	// already-drained keepers out of the channel while the worker could
+	// still receive a LATER queued event, reordering unrelated host events
+	// that merely shared the queue with a purge — so no queue drain runs
+	// at all: withdrawn facts still queue-resident simply die at the next
+	// consumer touch, and they can never egress (admission, dispatch,
+	// built-batch, and spool-handoff re-checks are all stamp-aware).
+	var removedSpooled []spoolEntry
+	persistFailed := false
+	if c.spool != nil {
+		// STILL under emitMu: every fact producer holds it, so no fresh
+		// post-purge fact can be BORN — let alone spooled by a worker's
+		// failed publish — until this sweep completes, which makes the
+		// epoch-blind raw predicate exact (everything it can reach
+		// predates the purge). Pre-purge facts a concurrent respool races
+		// in are re-filtered by the respool's own epoch check instead.
+		// With emitMu released first (the old shape), a fresh authorized
+		// fact enqueued after the bump could reach the spool ahead of this
+		// sweep and be withdrawn — dead-lettered — despite carrying the
+		// current epoch. emitMu → spool mutex is the established order
+		// (the spool's mutex is a leaf); dead-letters still dispatch with
+		// no lock held below.
+		// The post-bump epoch guards the sweep on top of the emitMu window:
+		// the drop-time capture path appends from under e.mu ALONE (no
+		// emitMu — lock order forbids it there), so a capture born after
+		// this purge's bump can land mid-sweep; its entries carry the
+		// current epoch stamp and are spared, while everything older is
+		// withdrawn as before.
+		removedSpooled, persistFailed = c.spool.removeMatching(withdrawnExperimentFactRaw, c.expFactPurgeEpoch.Load())
+	}
+	e.emitMu.Unlock()
+	if persistFailed {
+		c.recordSpoolPersistFailure()
+	}
+	if len(removedSpooled) > 0 {
+		c.logf("shardpilot experiments: withdrew %d spooled experiment fact(s) with the real-subjects sentinel (their subject fact keys must not ship; queue-resident facts die stamp-fenced at the next consumer touch)", len(removedSpooled))
+	}
+	// Dead-letters dispatch with no lock held: the callback is integrator
+	// code.
+	c.notifySpoolDeadLetter(SpoolDropTerminal, removedSpooled)
+}
+
+// sentinelSpoolPurgeUnderLock is the disk-spool leg of the real-subjects
+// sentinel, run UNDER e.mu (via sentinelSpoolPurgeFn) as part of the
+// sentinel's DURABLE commit — before the assignment record clear/tombstone
+// lands. removeMatching persists the withdrawal marker BEFORE the mirror
+// forgets the entries, so once the sentinel's decisive durable state is on
+// disk the spool withdrawal provably is too: no crash ordering can leave
+// the next launch — where initSpool runs before the experiment preload and
+// reloads raw facts with purge epoch zero — resending subject-fact keys the
+// durable state says were withdrawn. Lock discipline: the spool's mutex is
+// a leaf (the captureOwedExposuresForDrop precedent), integrator
+// dead-letters are DEFERRED to the next off-lock drain, and the
+// persist-failure diagnostic follows appendCaptureEntries' under-lock
+// precedent. The off-lock purgeWithdrawnExperimentFacts still owns the
+// queue and worker legs; its own spool pass then finds nothing new.
+func (c *Client) sentinelSpoolPurgeUnderLock() {
+	if c.spool == nil {
+		return
+	}
+	removed, persistFailed := c.spool.removeMatching(withdrawnExperimentFactRaw, c.expFactPurgeEpoch.Load())
+	if persistFailed {
+		c.recordSpoolPersistFailure()
+	}
+	c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropTerminal, removed))
+}
+
+// dropWithdrawnSpoolChunkMembers re-verifies a pulled resend chunk against
+// the CURRENT purge state immediately before transport handoff. A pulled
+// chunk is local raw bytes: the sentinel's spool sweep removes withdrawn
+// entries from the MIRROR (and dead-letters them there), but it cannot
+// reach a chunk the worker already pulled — and spooled chunks never pass
+// dropWithdrawnExperimentFacts (that leg filters the worker's held QUEUE
+// batch) — so without this re-check a withdrawn experiment fact pulled
+// before the sentinel landed would still publish after the purge. The
+// predicate is removeMatching's exactly: the SDK-authorship flag AND the
+// fact class on the entry's wire bytes, stamped before the current purge
+// epoch (a post-purge capture is spared; epoch zero means no purge this
+// process and everything passes).
+// Withheld members are NOT acked, requeued, or dead-lettered here — the
+// sweep owns their mirror removal and their exactly-once dead-letter
+// accounting (it has either already removed them or, when this handoff
+// observes the bump before the off-lock sweep runs, is about to); this
+// filter only keeps their bytes off the wire. Pre-handoff filtering is
+// always allowed: wire ambiguity begins strictly at the handoff itself.
+func (c *Client) dropWithdrawnSpoolChunkMembers(chunk []spoolEntry) []spoolEntry {
+	currentEpoch := c.expFactPurgeEpoch.Load()
+	if currentEpoch == 0 {
+		return chunk
+	}
+	kept := chunk[:0]
+	withheld := 0
+	for _, entry := range chunk {
+		if entry.internalFact && entry.expFactEpoch < currentEpoch && withdrawnExperimentFactRaw(entry.raw) {
+			withheld++
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	if withheld > 0 {
+		c.logf("shardpilot experiments: withheld %d pulled spool member(s) at the transport handoff (withdrawn by the real-subjects sentinel; the purge sweep settles them)", withheld)
+	}
+	return kept
+}
+
+// dropWithdrawnExperimentFacts is the worker-batch leg of the sentinel
+// purge: at every dispatch point (the same spot the consent-epoch drop
+// runs, before any send) the worker checks whether a purge happened since
+// it last looked and filters ITS held batch — events it pulled from the
+// queue before the purge's filter ran are invisible to that filter, exactly
+// like the consent drain. Runs only on the worker goroutine; the seen-epoch
+// field is worker-owned state (the retainedRequest discipline).
+func (c *Client) dropWithdrawnExperimentFacts(batch []Event, backoffAttempt *int) []Event {
+	epoch := c.expFactPurgeEpoch.Load()
+	if epoch == c.workerSeenExpFactPurge {
+		return batch
+	}
+	c.workerSeenExpFactPurge = epoch
+	kept := batch[:0]
+	removed := 0
+	for _, event := range batch {
+		if c.isWithdrawnExperimentFactEvent(event) {
+			removed++
+			continue
+		}
+		kept = append(kept, event)
+	}
+	if removed > 0 {
+		c.stats.dropped.Add(uint64(removed))
+		// The retained wire bytes described the pre-filter batch: filter
+		// them by the SAME predicate so surviving members keep their exact
+		// bytes — the byte-identical retry/spool contract must hold for
+		// host events that merely shared a batch with withdrawn facts (a
+		// wholesale clear would remarshal them, drifting if the caller
+		// mutated nested Props/Context after Enqueue). Filtering both
+		// sides with one predicate keeps the pair positionally aligned for
+		// the prefix-reuse builder; any residual mismatch falls back to
+		// the rebuild path by clearing.
+		// The filtered retained request stays even when the batch is LONGER
+		// than the retained prefix (queued members appended after the
+		// failure that retained the bytes): both filters preserve order, so
+		// the surviving prefix stays aligned, and the prefix-reuse builder
+		// verifies id equality per position anyway (truncating reuse at the
+		// first mismatch). A wholesale clear on the length mismatch
+		// re-marshaled the surviving prefix members and broke the
+		// byte-identical retry/spool contract exactly when a withdrawn fact
+		// shared their batch.
+		filtered, _ := filterWithdrawnFromBatchRequest(c.retainedRequest)
+		c.retainedRequest = filtered
+		if len(kept) == 0 {
+			// The whole held batch was withdrawn: the discarded batch takes
+			// its backoff streak with it (the consent-drop discipline) —
+			// post-sentinel events must never start deep in a schedule that
+			// belonged to condemned data.
+			*backoffAttempt = 0
+		}
+	}
+	return kept
+}
+
+// dropWithdrawnBuiltBatch is the BUILT batch's purge re-check, immediately
+// before the transport/spool handoff on the worker's dispatch and flush
+// paths: the pre-build dispatch check and buildBatchIsolating do not run
+// atomically, so a real-subjects sentinel landing between them leaves
+// pre-sentinel facts inside the just-built request — which the builder
+// stamped with the POST-sentinel epoch (it loads the epoch at build end),
+// so a failed publish would respool the withdrawn facts as fresh
+// (spoolFailedBatch's epoch-mismatch re-filter sees matching epochs and
+// partitionSpoolEligible stamps the entries current, past every later
+// sweep), and a successful publish would send them after withdrawal.
+// Filters the events and the built request BY POSITION with the
+// stamp-aware event predicate — buildBatchIsolating's contract aligns them
+// — so surviving members keep their exact wire bytes and the envelope/raw
+// pairing; a residual misalignment falls back to the two independent
+// filters (the dropWithdrawnExperimentFacts discipline: the raw predicate
+// on the request, with the prefix-reuse builder's per-position id check as
+// the safety net). Dropped members are counted exactly once — they passed
+// the earlier dispatch-point check, and the advanced seen-epoch keeps any
+// later check from recounting. Runs only on the worker goroutine (the
+// seen-epoch field is worker-owned state, exactly like
+// dropWithdrawnExperimentFacts).
+func (c *Client) dropWithdrawnBuiltBatch(request batchRequest, batch []Event, backoffAttempt *int) (batchRequest, []Event) {
+	epoch := c.expFactPurgeEpoch.Load()
+	if epoch == c.workerSeenExpFactPurge {
+		return request, batch
+	}
+	c.workerSeenExpFactPurge = epoch
+	aligned := len(request.Events) == len(batch) && len(request.rawEvents) == len(batch)
+	kept := batch[:0]
+	var keptEnvelopes []eventEnvelope
+	var keptRaws []json.RawMessage
+	if aligned {
+		keptEnvelopes = make([]eventEnvelope, 0, len(request.Events))
+		keptRaws = make([]json.RawMessage, 0, len(request.rawEvents))
+	}
+	removed := 0
+	for i, event := range batch {
+		if isExperimentFactClassEvent(event) && event.expFactEpoch < epoch {
+			removed++
+			continue
+		}
+		kept = append(kept, event)
+		if aligned {
+			keptEnvelopes = append(keptEnvelopes, request.Events[i])
+			keptRaws = append(keptRaws, request.rawEvents[i])
+		}
+	}
+	if removed == 0 {
+		return request, kept
+	}
+	c.stats.dropped.Add(uint64(removed))
+	c.logf("shardpilot experiments: withheld %d built batch member(s) at the transport handoff (withdrawn by the real-subjects sentinel between the dispatch check and the build)", removed)
+	if aligned {
+		request.Events = keptEnvelopes
+		request.rawEvents = keptRaws
+	} else {
+		request, _ = filterWithdrawnFromBatchRequest(request)
+	}
+	if len(kept) == 0 {
+		// The whole built batch was withdrawn: the discarded batch takes
+		// its backoff streak with it (the consent-drop discipline).
+		*backoffAttempt = 0
+	}
+	return request, kept
+}
+
+// filterWithdrawnFromBatchRequest drops withdrawn experiment facts from a
+// built batch request, preserving the surviving members' exact wire bytes
+// and their envelope/raw pairing. The typed envelope rides alongside the
+// raw bytes here, so the SDK-authorship marker (internalIdentityFact) joins
+// the raw-shape check: a host-authored member that merely resembles a fact
+// is never withdrawn.
+func filterWithdrawnFromBatchRequest(request batchRequest) (batchRequest, int) {
+	if len(request.Events) == 0 || len(request.Events) != len(request.rawEvents) {
+		return request, 0
+	}
+	removed := 0
+	envelopes := make([]eventEnvelope, 0, len(request.Events))
+	raws := make([]json.RawMessage, 0, len(request.rawEvents))
+	for i, raw := range request.rawEvents {
+		if request.Events[i].internalIdentityFact && withdrawnExperimentFactRaw(raw) {
+			removed++
+			continue
+		}
+		envelopes = append(envelopes, request.Events[i])
+		raws = append(raws, raw)
+	}
+	if removed == 0 {
+		return request, 0
+	}
+	request.Events = envelopes
+	request.rawEvents = raws
+	return request, removed
+}
+
+// captureOwedExposuresForDrop durably captures an entry's still-owed
+// exposure facts into the disk spool — invoked by the install's drop branch
+// UNDER e.mu, BEFORE the entry's durable delete lands (the fleet contract:
+// a kill/not-assigned drop must not lose the fact of real treatment to a
+// process death before the next sweep). The next launch replays the spooled
+// envelope; a fact the live session ALSO delivers settles its spooled copy
+// by event id, and a double delivery collapses server-side on the
+// deterministic id. Queue-full-without-drop stays memory-only by design.
+//
+// Lock discipline: runs under e.mu, so it takes NO client lock (the fact
+// and envelope builders are lock-free; the spool's mutex is a leaf) and
+// DEFERS integrator dead-letter callbacks to the next off-lock drain.
+func (c *Client) captureOwedExposuresForDrop(experimentKey string, owed []*expOwedExposure) (bool, []spoolEntry) {
+	if c.spool == nil {
+		// Memory-only client: no durable capture exists to gate on — the
+		// documented ephemeral posture.
+		return true, nil
+	}
+	// Under e.mu (the caller's hold), so this observation is atomic with
+	// the owed snapshots it stamps — the same (entry, epoch) pairing every
+	// other build site captures at its snapshot point.
+	factEpoch := c.expFactPurgeEpoch.Load()
+	events := make([]Event, 0, len(owed))
+	for _, snapshot := range owed {
+		// The automatic owed emission is arm 0 by definition, and the id is
+		// exactly the one the live sweep would mint for it.
+		eventID := experimentExposureEventID(snapshot.session, snapshot.entry.SubjectKey, experimentKey, snapshot.entry.Version, 0)
+		event, skipCode := c.buildExperimentFactEvent(experimentExposureName, experimentKey, snapshot.entry, eventID, snapshot.session, factEpoch)
+		if skipCode != "" {
+			continue // no server-safe fact exists for this snapshot
+		}
+		events = append(events, event)
+	}
+	if len(events) == 0 {
+		return true, nil
+	}
+	request, err := c.buildBatch(events)
+	if err != nil {
+		return true, nil // unbuildable facts have no capturable form
+	}
+	eligible, refusedActors := c.partitionSpoolEligible(request)
+	if len(refusedActors) > 0 {
+		c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropConsent, refusedActors))
+	}
+	if len(eligible) == 0 {
+		return true, nil
+	}
+	if c.appendCaptureEntries(eligible) {
+		return true, nil
+	}
+	// The capture payload is FROZEN in the owed intent: the live sweep may
+	// deliver these facts into the queue and empty the owed snapshots, but
+	// queue residency is not durability — the gate releases only when
+	// these exact envelopes land in the spool (double delivery collapses
+	// on the deterministic ids; a live publish settles the spooled copies
+	// by id).
+	return false, eligible
+}
+
+// appendCaptureEntries appends frozen capture envelopes to the disk spool,
+// reporting whether the capture is DURABLE (or moot by policy). Runs under
+// e.mu like the capture itself: leaf spool mutex only, dead-letters
+// deferred.
+func (c *Client) appendCaptureEntries(eligible []spoolEntry) bool {
+	s := c.spool
+	if s == nil || len(eligible) == 0 {
+		return true
+	}
+	refused, added, expired, evicted, persistFailed := s.append(eligible, 0, false, c.clock.Now(), func() bool {
+		return c.consent.Load() == consentStateGranted && s.grantPersisted
+	})
+	if refused {
+		// A POLICY refusal (non-grant / owed-wipe write gate): the spool's
+		// documented posture is dead-letter-instead-of-disk, and gating the
+		// record delete on a state only a consent change can open would
+		// hold the kill's durable side hostage indefinitely.
+		c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropConsent, eligible))
+		return true
+	}
+	if len(expired) > 0 {
+		c.stats.spoolExpired.Add(uint64(len(expired)))
+		c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropExpired, expired))
+	}
+	if len(added) > 0 && !persistFailed {
+		c.stats.spooled.Add(uint64(len(added)))
+	}
+	if len(evicted) > 0 {
+		c.stats.spoolEvicted.Add(uint64(len(evicted)))
+		c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropCapacity, evicted))
+	}
+	if persistFailed {
+		// MECHANICAL failure: the facts sit in the spool mirror but not
+		// durably on disk — the caller keeps the record intact and retries
+		// the capture+delete pair.
+		c.recordSpoolPersistFailure()
+		return false
+	}
+	return true
+}
+
+// deferSpoolLetter queues a dead-letter for the next off-lock drain point —
+// for spool work performed under a state lock, where invoking the
+// integrator callback directly could deadlock or re-enter.
+func (c *Client) deferSpoolLetter(letter SpoolDeadLetter) {
+	if len(letter.Envelopes) == 0 {
+		return
+	}
+	c.deferredLettersMu.Lock()
+	c.deferredSpoolLetters = append(c.deferredSpoolLetters, letter)
+	c.deferredLettersMu.Unlock()
+}
+
+// drainDeferredSpoolLetters dispatches deferred dead-letters with no lock
+// held.
+func (c *Client) drainDeferredSpoolLetters() {
+	c.deferredLettersMu.Lock()
+	letters := c.deferredSpoolLetters
+	c.deferredSpoolLetters = nil
+	c.deferredLettersMu.Unlock()
+	c.emitSpoolDeadLetters(letters)
+}
+
+// closeExperimentPreFlush is the first half of Close's last-chance pass,
+// run after the closed store (no new host calls) and BEFORE the final
+// flush: owed durable syncs get one last retry (a kill/not-assigned drop —
+// or a refresh write — whose cache write failed transiently must not stay
+// reload truth on disk just because no cycle ran after storage recovered),
+// and owed exposure facts sweep into the queue past the closed gate so the
+// flush delivers them.
+func (c *Client) closeExperimentPreFlush() {
+	e := c.exp
+	if e == nil {
+		return
+	}
+	// Teardown FIRST: an in-flight lane response settling during the close
+	// window is discarded outright (no install, no pacing, no NEW owed
+	// durable intent), so the durable retry below runs against a STABLE
+	// intent set — a kill drop that settled a moment later would otherwise
+	// mint an owed intent after the last retry already ran and lose it at
+	// exit (the discarded response re-arrives at the next launch's
+	// revalidation instead). The close sweeps and the durable retry
+	// deliberately keep working after teardown.
+	e.teardown()
+	e.retryDurableSync()
+	if c.experimentConsentRefusal() == nil {
+		c.sweepAllExperimentExposuresMode(true)
+	}
+	// Any dead-letters a locked capture deferred must not be lost at close.
+	c.drainDeferredSpoolLetters()
+}
+
+// closeExperimentPostFlush is the second half: the flush freed queue room,
+// so owed exposure facts that could not enqueue before it get their last
+// chance (a treatment applied under a FULL queue must not exit without its
+// fact — the worker's stop-path drain delivers-or-spools whatever enqueues
+// here), then the consumer tears down: an assignment response still in
+// flight must not install, persist, or pace from now on. Best-effort by
+// design and never silent: whatever cannot be delivered is counted by the
+// close path's accounting, and the durable record re-arms live assignments
+// at the next launch.
+// closeExperimentPostFlush drains close-time owed exposures in a LOOP —
+// sweep, then flush what entered the queue, until nothing is owed or a full
+// pass makes no progress (a bounded-capacity queue can admit as little as
+// one fact per pass, and one sweep+flush would silently lose the rest).
+// Whatever a stuck pass leaves is surfaced (logged and counted by the close
+// path's delivery accounting; live assignments re-arm from the durable
+// record at the next launch), then the consumer tears down.
+func (c *Client) closeExperimentPostFlush(ctx context.Context) {
+	e := c.exp
+	if e == nil {
+		return
+	}
+	if c.experimentConsentRefusal() == nil {
+		for {
+			before := c.owedExperimentExposureCount()
+			if before == 0 {
+				break
+			}
+			c.sweepAllExperimentExposuresMode(true)
+			after := c.owedExperimentExposureCount()
+			if after < before {
+				// Deliver what the sweep enqueued so the next pass has
+				// room; a failed flush leaves the facts for the worker's
+				// stop-path drain (spooled or counted, never silent).
+				if flushErr := c.Flush(ctx); flushErr != nil {
+					c.logf("shardpilot experiments: delivering owed exposure facts at close failed (they spool or are counted with the close remnant): %v", flushErr)
+					break
+				}
+			}
+			if after == 0 || after >= before {
+				break
+			}
+		}
+	}
+	// Snapshots STILL owed at teardown are lost with the process (a
+	// dropped assignment's or a memory-only client's facts have nothing to
+	// re-arm them; live entries re-arm from the durable record): COUNT
+	// them as dropped with a distinct diagnostic — never a silent loss.
+	if remaining := c.owedExperimentExposureCount(); remaining > 0 {
+		c.stats.dropped.Add(uint64(remaining))
+		c.stats.setLastError("experiment_exposures_discarded_at_close")
+		c.logf("shardpilot experiments: %d owed exposure fact(s) discarded at close (counted in Stats.Dropped); live assignments re-arm from the durable record at the next launch", remaining)
+	}
+}
+
+func (c *Client) owedExperimentExposureCount() int {
+	e := c.exp
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	count := 0
+	for _, list := range e.pendingExposure {
+		count += len(list)
+	}
+	return count
+}

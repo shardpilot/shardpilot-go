@@ -97,6 +97,23 @@ type Client struct {
 	// period.
 	consentEpoch atomic.Uint64
 
+	// expFactPurgeEpoch is the real-subjects sentinel purge counter: the
+	// sentinel withdraws experiment facts already accepted into the
+	// pipeline, and the worker — which may hold some in its local batch —
+	// filters that batch when it next observes a moved epoch (see
+	// dropWithdrawnExperimentFacts). workerSeenExpFactPurge is the
+	// worker-goroutine-owned seen mark (the retainedRequest discipline: no
+	// lock, single goroutine).
+	expFactPurgeEpoch      atomic.Uint64
+	workerSeenExpFactPurge uint64
+
+	// deferredSpoolLetters holds dead-letters produced by spool work done
+	// under a state lock (the drop-time owed-exposure capture runs under
+	// e.mu); they dispatch at the next off-lock drain point — the
+	// integrator callback must never run with a lock held.
+	deferredLettersMu    sync.Mutex
+	deferredSpoolLetters []SpoolDeadLetter
+
 	// consentGate carries a context cancelled on consent denial so event
 	// publishes already in flight abort instead of completing against a
 	// freshly denied actor. SetConsent stores the denied state before
@@ -120,6 +137,17 @@ type Client struct {
 	// unset (fetches fail remote_config_not_configured, getters serve
 	// defaults).
 	rc *remoteConfigState
+
+	// exp is the experiment-assignment consumer; nil when
+	// Config.ExperimentsEnabled is false — the default, with no experiment
+	// code paths at all (the public experiment surface refuses
+	// ErrExperimentsNotConfigured).
+	exp *experimentsState
+
+	// expLaneDone is closed when the experiments background lane goroutine
+	// exits; nil when the consumer is not enabled. Close waits on it
+	// (bounded by its context) like workerDone.
+	expLaneDone chan struct{}
 
 	// spool is the opt-in bounded disk spool; nil when Config.SpoolDir is
 	// unset (today's memory-only behavior, unchanged).
@@ -215,6 +243,27 @@ type Client struct {
 	// only before the decision under test starts (no concurrent mutation).
 	consentSlowHalfGate func()
 
+	// drainReceiveSeam, when non-nil, is invoked for each event the bulk
+	// flush drain receives BEFORE its admission — the mid-drain window
+	// where a consent flip can land between the drain's boundary settle
+	// and an event's append. Test seam (the consentSlowHalfGate
+	// discipline); nil in production.
+	drainReceiveSeam func(Event)
+
+	// spoolResendHandoffSeam, when non-nil, is invoked with the pulled
+	// spool chunk after pullResendChunk and BEFORE the transport-handoff
+	// withdrawal re-check — the window where a real-subjects sentinel can
+	// land against an already-pulled chunk. Test seam; nil in production.
+	spoolResendHandoffSeam func(chunk []spoolEntry)
+
+	// builtBatchHandoffSeam, when non-nil, is invoked with the worker's
+	// batch after buildBatchIsolating and BEFORE the built-batch withdrawal
+	// re-check (dropWithdrawnBuiltBatch) — the window where a real-subjects
+	// sentinel can land between the dispatch-point purge check and the
+	// transport/spool handoff of the built bytes, on the dispatch and flush
+	// paths alike. Test seam; nil in production.
+	builtBatchHandoffSeam func(batch []Event)
+
 	// initialDeferUntil seeds the flush worker's retry-pacing deadline from
 	// the spool's persisted retry_after_until_ms, so server backpressure
 	// captured before a restart still holds automatic publishes for the
@@ -287,8 +336,40 @@ func NewClient(cfg Config) (*Client, error) {
 		client.rc = newRemoteConfigState(normalized)
 		client.rc.preload()
 	}
+	if normalized.ExperimentsEnabled {
+		// The experiment-assignment consumer (dark unless opted in — while
+		// off there is no subject-id mint, no fetch, no lane goroutine, no
+		// fact emission, and no new persistence keys). The preload serves
+		// persisted last-known-good assignments immediately and re-arms
+		// their exposure facts for this instance.
+		client.exp = newExperimentsState(normalized)
+		// The cadence jitter rides the client's seeded jitter seam — the
+		// FIRST revalidation arm included, so fresh installs spread across
+		// the ±10% window instead of herding at exactly 300s.
+		client.exp.jitterFn = client.jitterValue
+		client.exp.captureOwedDropFn = client.captureOwedExposuresForDrop
+		client.exp.captureRetryFn = client.appendCaptureEntries
+		// The sentinel bumps the pipeline-fact purge epoch UNDER e.mu,
+		// atomically with its decisive state change, so no post-sentinel
+		// fact can carry a pre-sentinel stamp (the purge filters are
+		// stamp-aware).
+		client.exp.factPurgeEpochBumpFn = func() { client.expFactPurgeEpoch.Add(1) }
+		// The disk-spool leg of the sentinel joins the sentinel's DURABLE
+		// commit under e.mu (see sentinelSpoolPurgeUnderLock): a crash
+		// between the durable withdrawal and the off-lock pipeline purge
+		// must not let the next launch resend withdrawn facts.
+		client.exp.sentinelSpoolPurgeFn = client.sentinelSpoolPurgeUnderLock
+		if client.exp.preload() {
+			client.stats.setLastError("experiment_dir_private_failed")
+			client.logf("shardpilot experiments: the state directory could not be made private (0700); persisted experiment state is not loaded and nothing serves from it")
+		}
+		client.expLaneDone = make(chan struct{})
+	}
 
 	go client.run()
+	if client.exp != nil {
+		go client.runExperimentsLane()
+	}
 	client.emitSpoolDeadLetters(initDeadLetters)
 	return client, nil
 }
@@ -385,6 +466,12 @@ func (c *Client) Enqueue(event Event) error {
 	if err != nil {
 		return err
 	}
+	// The intake stamp: the denial generation this admission happened
+	// under. Enqueue holds lifecycleMu — the same lock a denial's fast
+	// half takes to bump the epoch and drain the queue — so the stamp is
+	// exact: an event admitted here is fully enqueued before any later
+	// denial starts, and its stamp provably predates that denial's bump.
+	event.intakeConsentEpoch = c.consentEpoch.Load()
 	if !c.queue.enqueue(event) {
 		c.stats.dropped.Add(1)
 		return ErrQueueFull
@@ -535,7 +622,21 @@ func (c *Client) finishClose(ctx context.Context) error {
 	c.closeDone = done
 	c.closeMu.Unlock()
 
+	// Experiments last-chance housekeeping runs BEFORE the final flush so
+	// owed durable syncs land and owed exposure facts enter the queue in
+	// time to ride it (a treatment applied under a FULL queue gets its
+	// fact the room the flush frees — see the second sweep below).
+	c.closeExperimentPreFlush()
 	err := c.Flush(ctx)
+	// The flush freed queue room: owed exposure facts drain in a
+	// sweep-then-flush LOOP until nothing is owed or a pass makes no
+	// progress (see closeExperimentPostFlush) — a bounded queue can admit
+	// as little as one fact per pass, and a single pass would silently
+	// lose the rest. Best-effort by design and never silent: whatever
+	// enters the queue is delivered or counted by the close path's
+	// accounting, and the durable record re-arms live assignments at the
+	// next launch.
+	c.closeExperimentPostFlush(ctx)
 	c.stopOnce.Do(func() {
 		close(c.stop)
 	})
@@ -544,6 +645,20 @@ func (c *Client) finishClose(ctx context.Context) error {
 	case <-contextDone(ctx):
 		if err == nil {
 			err = contextCause(ctx)
+		}
+	}
+	// The experiments background lane exits on the same stop signal; wait
+	// for it like workerDone so no lane-scheduled fetch or cache write
+	// outlives Close. (Its in-flight fetches are additionally fenced by
+	// trackWG, already waited out before finishClose, and the consumer is
+	// torn down above — a straggling response discards itself.)
+	if c.expLaneDone != nil {
+		select {
+		case <-c.expLaneDone:
+		case <-contextDone(ctx):
+			if err == nil {
+				err = contextCause(ctx)
+			}
 		}
 	}
 	// The consent sender drains decisions still pending when c.stop closes.
@@ -707,7 +822,7 @@ func (c *Client) run() {
 		}
 		select {
 		case event := <-queueEvents:
-			batch = append(batch, event)
+			batch = c.admitReceivedEvent(batch, event, &seenConsentEpoch, &backoffAttempt)
 			if len(batch) >= c.cfg.BatchSize && !c.publishDeferred(deferUntil) {
 				batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
 			}
@@ -983,6 +1098,9 @@ func (c *Client) jitterValue() float64 {
 // batch takes its backoff streak with it — fresh post-re-grant events must
 // never start deep in a schedule that belonged to condemned data.
 func (c *Client) dropBatchOnConsentEpoch(batch []Event, seenEpoch *uint64, backoffAttempt *int) []Event {
+	// The sentinel-purge filter shares this gate: it runs at exactly the
+	// dispatch points the consent drop does, before any send.
+	batch = c.dropWithdrawnExperimentFacts(batch, backoffAttempt)
 	epoch := c.consentEpoch.Load()
 	if epoch == *seenEpoch {
 		return batch
@@ -994,6 +1112,67 @@ func (c *Client) dropBatchOnConsentEpoch(batch []Event, seenEpoch *uint64, backo
 		*backoffAttempt = 0
 		// The retained wire bytes described the discarded batch.
 		c.retainedRequest = batchRequest{}
+	}
+	return batch
+}
+
+// admitReceivedEvent joins one queue-received event to the worker-held
+// batch. The consent-epoch boundary settles FIRST: a denial that landed
+// while the worker was parked in its select condemned the HELD events
+// only, and after a deny → quick-re-grant round trip the re-grant's fresh
+// events arrive while the worker still holds that stale batch — appended
+// blindly they would be discarded WITH it at the next epoch observation,
+// silently losing events accepted after consent was granted again. The
+// epoch partitions batches: a batch never spans consent epochs, so the
+// epoch drop only ever discards pre-denial events. The received event then
+// joins only when its intake stamp belongs to the settled epoch — a
+// pre-denial event this receive stole from the denial's concurrent queue
+// drain (both consume the same channel) is dropped here, counted exactly
+// once (it escaped the drain's own count), never revived into a later
+// granted period.
+func (c *Client) admitReceivedEvent(batch []Event, event Event, seenEpoch *uint64, backoffAttempt *int) []Event {
+	batch = c.dropBatchOnConsentEpoch(batch, seenEpoch, backoffAttempt)
+	if event.intakeConsentEpoch < *seenEpoch {
+		c.stats.dropped.Add(1)
+		return batch
+	}
+	if c.isWithdrawnExperimentFactEvent(event) {
+		// The sentinel-purge twin of the intake-epoch check above: the
+		// purge epoch bumps under e.mu with the sentinel's decisive state
+		// change — BEFORE the purge's queue drain — so a dispatch point can
+		// observe the moved epoch (filtering its held batch and advancing
+		// its seen mark) while withdrawn old-stamp facts still sit in the
+		// queue, and this receive can steal one from the drain. Admitted
+		// blindly it would ride under a matching seen epoch, unfiltered,
+		// carrying a withdrawn subject-fact key onto the wire. Dropped
+		// here, counted exactly once (it escaped the purge's own count).
+		c.stats.dropped.Add(1)
+		return batch
+	}
+	return append(batch, event)
+}
+
+// drainQueueAdmitted is admitReceivedEvent's bulk form for the flush path.
+// Each drained event re-settles the epoch boundary exactly like the
+// per-event receive path: a deny → re-grant landing MID-drain enqueues
+// post-grant events whose intake stamp is NEWER than the settled epoch —
+// appended blindly they would join the pre-denial held batch and be
+// discarded WITH it at the next epoch observation, silently losing events
+// accepted after consent was granted again. The per-event re-settle drops
+// the stale held batch FIRST, so a newer-stamped event never joins an
+// older-epoch batch, and stale-stamped strays still drop, counted.
+func (c *Client) drainQueueAdmitted(batch []Event, seenEpoch *uint64, backoffAttempt *int) []Event {
+	batch = c.dropBatchOnConsentEpoch(batch, seenEpoch, backoffAttempt)
+	for len(batch) < c.cfg.BatchSize {
+		select {
+		case event := <-c.queue.ch:
+			if c.drainReceiveSeam != nil {
+				c.drainReceiveSeam(event)
+			}
+			batch = c.admitReceivedEvent(batch, event, seenEpoch, backoffAttempt)
+		default:
+			return batch
+		}
 	}
 	return batch
 }
@@ -1064,6 +1243,13 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 			}
 		}
 		if len(batch) > 0 {
+			// Last purge re-check at the ACTUAL transport handoff: the
+			// receipt dispatch and spool resends above can block while a
+			// real-subjects sentinel lands, and the batch filtered at the
+			// loop top must not carry a since-withdrawn fact onto the wire.
+			batch = c.dropWithdrawnExperimentFacts(batch, backoffAttempt)
+		}
+		if len(batch) > 0 {
 			// Build THROUGH the retained request: a batch a previous attempt
 			// already marshaled resends its retained bytes verbatim, so the
 			// in-process retry matches what that failure spooled. A member
@@ -1078,10 +1264,22 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 				}
 				batch = kept
 			}
+			if c.builtBatchHandoffSeam != nil {
+				c.builtBatchHandoffSeam(batch)
+			}
+			if len(batch) > 0 {
+				// The loop-top and pre-build checks and the build do not run
+				// atomically: a sentinel landing between them left
+				// pre-sentinel facts inside the just-built request under a
+				// post-sentinel stamp — re-verify the BUILT pair immediately
+				// before the transport/spool handoff (the same window the
+				// dispatch path closes).
+				request, batch = c.dropWithdrawnBuiltBatch(request, batch, backoffAttempt)
+			}
 			if len(batch) == 0 {
-				// Every member poisoned: nothing is left to publish or
-				// retain. The queue drain below still runs — later enqueued
-				// events are unaffected by the condemned batch.
+				// Every member poisoned or withdrawn: nothing is left to
+				// publish or retain. The queue drain below still runs — later
+				// enqueued events are unaffected by the condemned batch.
 				c.retainedRequest = batchRequest{}
 			} else if result, err := c.publishRequestResult(ctx, request, len(batch)); err != nil {
 				if errors.Is(err, ErrConsentDenied) {
@@ -1137,7 +1335,7 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 				c.retainedRequest = batchRequest{}
 			}
 		}
-		batch = c.queue.drainInto(batch, c.cfg.BatchSize)
+		batch = c.drainQueueAdmitted(batch, seenConsentEpoch, backoffAttempt)
 		if len(c.queue.ch) == 0 {
 			if len(batch) == 0 {
 				return batch, firstErr
@@ -1184,6 +1382,14 @@ func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, def
 		c.retainedRequest = batchRequest{}
 		return batch[:0]
 	}
+	// Last purge re-check at the ACTUAL transport handoff: the receipt
+	// dispatch and spool resends above can block while a real-subjects
+	// sentinel lands, and the batch filtered at the loop top must not
+	// carry a since-withdrawn fact onto the wire.
+	batch = c.dropWithdrawnExperimentFacts(batch, backoffAttempt)
+	if len(batch) == 0 {
+		return batch
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.HTTPTimeout)
 	defer cancel()
 	// Build THROUGH the retained request (see buildBatchIsolating): the prefix
@@ -1202,6 +1408,20 @@ func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, def
 			c.retainedRequest = batchRequest{}
 			return batch[:0]
 		}
+	}
+	if c.builtBatchHandoffSeam != nil {
+		c.builtBatchHandoffSeam(batch)
+	}
+	// The dispatch-point check above and the build do not run atomically: a
+	// sentinel landing between them left pre-sentinel facts inside the
+	// just-built request under a post-sentinel stamp — re-verify the BUILT
+	// pair immediately before the transport/spool handoff.
+	request, batch = c.dropWithdrawnBuiltBatch(request, batch, backoffAttempt)
+	if len(batch) == 0 {
+		// The whole built batch was withdrawn; the retained wire bytes
+		// described it.
+		c.retainedRequest = batchRequest{}
+		return batch[:0]
 	}
 	result, err := c.publishRequestResult(ctx, request, len(batch))
 	c.applyRetryPacing(err, deferUntil, backoffAttempt)

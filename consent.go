@@ -258,6 +258,15 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) error {
 		if dropped := c.queue.drainAll(); dropped > 0 {
 			c.stats.dropped.Add(uint64(dropped))
 		}
+		if c.exp != nil {
+			// The drain above discarded any queued-but-unpublished
+			// experiment exposure facts: re-arm this session's emissions so
+			// a later re-grant of a retained assignment emits its exposure
+			// again (already-published — or wire-ambiguous mid-flight —
+			// facts collapse server-side on their deterministic event ids)
+			// instead of under-counting real treatment.
+			c.exp.onAnalyticsPurge()
+		}
 	}
 	c.lifecycleMu.Unlock()
 

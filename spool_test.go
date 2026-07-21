@@ -280,7 +280,11 @@ func writeSpoolRecordFile(t *testing.T, dir string, deadlineMS int64, envelopes 
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	record := spoolRecordWire{Version: spoolRecordVersion, Events: envelopes, RetryAfterUntilMS: deadlineMS}
+	events := make([]spoolEventWire, 0, len(envelopes))
+	for _, raw := range envelopes {
+		events = append(events, spoolEventWire{Raw: raw})
+	}
+	record := spoolRecordWire{Version: spoolRecordVersion, Events: events, RetryAfterUntilMS: deadlineMS}
 	payload, err := json.Marshal(record)
 	if err != nil {
 		t.Fatalf("marshal spool record: %v", err)
@@ -442,6 +446,17 @@ func containsEventID(t *testing.T, envelopes []json.RawMessage, id string) bool 
 	return false
 }
 
+// recordContainsEventID is containsEventID over the persisted record's
+// wrapped events (version 2 wraps each envelope in spoolEventWire).
+func recordContainsEventID(t *testing.T, events []spoolEventWire, id string) bool {
+	t.Helper()
+	raws := make([]json.RawMessage, 0, len(events))
+	for _, event := range events {
+		raws = append(raws, event.Raw)
+	}
+	return containsEventID(t, raws, id)
+}
+
 func TestSpoolGrantedRetriableFailureSpoolsExactWireBytes(t *testing.T) {
 	state, server := newSpoolTestServer(t)
 	defer server.Close()
@@ -460,8 +475,8 @@ func TestSpoolGrantedRetriableFailureSpoolsExactWireBytes(t *testing.T) {
 	flushUntilSpooled(t, client, dir, 2)
 
 	record := readSpoolRecordFile(t, dir)
-	if record.Version != 1 {
-		t.Fatalf("expected record version 1, got %d", record.Version)
+	if record.Version != spoolRecordVersion {
+		t.Fatalf("expected record version %d, got %d", spoolRecordVersion, record.Version)
 	}
 	// Every spooled envelope is the EXACT bytes some failed publish attempt
 	// put on the wire.
@@ -474,9 +489,9 @@ func TestSpoolGrantedRetriableFailureSpoolsExactWireBytes(t *testing.T) {
 	if len(record.Events) != 2 {
 		t.Fatalf("expected 2 spooled envelopes, got %d", len(record.Events))
 	}
-	for i, raw := range record.Events {
-		if !sent[string(raw)] {
-			t.Fatalf("spooled envelope %d is not byte-identical to any wire attempt:\n%s", i, raw)
+	for i, event := range record.Events {
+		if !sent[string(event.Raw)] {
+			t.Fatalf("spooled envelope %d is not byte-identical to any wire attempt:\n%s", i, event.Raw)
 		}
 	}
 	if stats := client.Snapshot(); stats.Spooled != 2 {
@@ -598,8 +613,8 @@ func TestSpoolResendBeforeFreshAndByteIdenticalAcrossRestart(t *testing.T) {
 		t.Fatalf("expected %d resent envelopes, got %d", len(spooledBytes), len(resendWire))
 	}
 	for i := range spooledBytes {
-		if resendWire[i] != string(spooledBytes[i]) {
-			t.Fatalf("resent envelope %d is not byte-identical to the record:\n%s\n%s", i, spooledBytes[i], resendWire[i])
+		if resendWire[i] != string(spooledBytes[i].Raw) {
+			t.Fatalf("resent envelope %d is not byte-identical to the record:\n%s\n%s", i, spooledBytes[i].Raw, resendWire[i])
 		}
 	}
 	if got := len(readSpoolRecordFile(t, dir).Events); got != 0 {
@@ -639,7 +654,7 @@ func TestSpoolOldestDropAtCountAndByteCaps(t *testing.T) {
 	if len(record.Events) != 3 {
 		t.Fatalf("expected the count cap to keep 3 events, got %d", len(record.Events))
 	}
-	if containsEventID(t, record.Events, "evt-cap-1") {
+	if recordContainsEventID(t, record.Events, "evt-cap-1") {
 		t.Fatalf("expected the OLDEST event evicted first")
 	}
 	capacity := recorder.byReason(SpoolDropCapacity)
@@ -672,7 +687,7 @@ func TestSpoolOldestDropAtCountAndByteCaps(t *testing.T) {
 		cfg.SpoolMaxBytes = len(envelopes[1]) + len(envelopes[2])
 	})
 	record = readSpoolRecordFile(t, byteDir)
-	if len(record.Events) != 2 || containsEventID(t, record.Events, "evt-bytes-1") {
+	if len(record.Events) != 2 || recordContainsEventID(t, record.Events, "evt-bytes-1") {
 		t.Fatalf("expected the byte cap to evict the oldest at load, got %d events", len(record.Events))
 	}
 	if letters := byteRecorder.byReason(SpoolDropCapacity); len(letters) != 1 || !containsEventID(t, letters[0].Envelopes, "evt-bytes-1") {
@@ -705,7 +720,7 @@ func TestSpoolCountCapReappliedAtLoad(t *testing.T) {
 	if len(record.Events) != 3 {
 		t.Fatalf("expected the caps re-applied at load, got %d events", len(record.Events))
 	}
-	if containsEventID(t, record.Events, "evt-load-1") || containsEventID(t, record.Events, "evt-load-2") {
+	if recordContainsEventID(t, record.Events, "evt-load-1") || recordContainsEventID(t, record.Events, "evt-load-2") {
 		t.Fatalf("expected the two oldest evicted at load")
 	}
 	if stats := client.Snapshot(); stats.SpoolEvicted != 2 {
@@ -733,7 +748,7 @@ func TestSpoolRetryAgeCapAtLoad(t *testing.T) {
 	defer client.Close(context.Background())
 
 	record := readSpoolRecordFile(t, dir)
-	if len(record.Events) != 1 || !containsEventID(t, record.Events, "evt-age-fresh") {
+	if len(record.Events) != 1 || !recordContainsEventID(t, record.Events, "evt-age-fresh") {
 		t.Fatalf("expected only the fresh-enough event to survive, got %s", mustJSON(t, record.Events))
 	}
 	expired := recorder.byReason(SpoolDropExpired)
@@ -1198,7 +1213,7 @@ func TestSpoolPersistFailureCountsAndMirrorStaysAuthoritative(t *testing.T) {
 		t.Fatalf("expected the retriable failure surfaced")
 	}
 	record := readSpoolRecordFile(t, dir)
-	if len(record.Events) != 2 || !containsEventID(t, record.Events, "evt-persist-1") || !containsEventID(t, record.Events, "evt-persist-2") {
+	if len(record.Events) != 2 || !recordContainsEventID(t, record.Events, "evt-persist-1") || !recordContainsEventID(t, record.Events, "evt-persist-2") {
 		t.Fatalf("expected both events persisted, got %s", mustJSON(t, record.Events))
 	}
 	if stats := client.Snapshot(); stats.Spooled != 2 {
@@ -1275,7 +1290,7 @@ func TestSpoolCloseSpoolsUndeliveredRemnant(t *testing.T) {
 	_ = client.Close(context.Background())
 
 	record := readSpoolRecordFile(t, dir)
-	if len(record.Events) != 2 || !containsEventID(t, record.Events, "evt-remnant-1") || !containsEventID(t, record.Events, "evt-remnant-2") {
+	if len(record.Events) != 2 || !recordContainsEventID(t, record.Events, "evt-remnant-1") || !recordContainsEventID(t, record.Events, "evt-remnant-2") {
 		t.Fatalf("expected the undelivered remnant spooled at Close, got %s", mustJSON(t, record.Events))
 	}
 
@@ -1457,7 +1472,7 @@ func TestSpoolSharedDirMergePreservesSiblingRecords(t *testing.T) {
 		t.Fatalf("append B: refused=%v persistFailed=%v", refused, persistFailed)
 	}
 	record := readSpoolRecordFile(t, dir)
-	if len(record.Events) != 2 || !containsEventID(t, record.Events, "evt-shared-1") || !containsEventID(t, record.Events, "evt-shared-2") {
+	if len(record.Events) != 2 || !recordContainsEventID(t, record.Events, "evt-shared-1") || !recordContainsEventID(t, record.Events, "evt-shared-2") {
 		t.Fatalf("expected both writers' records to survive interleaved saves, got %s", mustJSON(t, record.Events))
 	}
 	if foreignB == 0 {
@@ -1472,10 +1487,10 @@ func TestSpoolSharedDirMergePreservesSiblingRecords(t *testing.T) {
 		t.Fatalf("ack A: removed=%d persistFailed=%v", len(removed), persistFailed)
 	}
 	record = readSpoolRecordFile(t, dir)
-	if len(record.Events) != 1 || !containsEventID(t, record.Events, "evt-shared-2") {
+	if len(record.Events) != 1 || !recordContainsEventID(t, record.Events, "evt-shared-2") {
 		t.Fatalf("expected only B's record to remain after A's ack, got %s", mustJSON(t, record.Events))
 	}
-	if containsEventID(t, record.Events, "evt-shared-1") {
+	if recordContainsEventID(t, record.Events, "evt-shared-1") {
 		t.Fatalf("A's acked event must not be resurrected by a later save")
 	}
 }
@@ -1597,7 +1612,7 @@ func TestSpoolActorScopedPerEnvelope(t *testing.T) {
 	client.spoolFailedBatch(request, nil, false)
 
 	record := readSpoolRecordFile(t, dir)
-	if len(record.Events) != 1 || !containsEventID(t, record.Events, "evt-own-actor") {
+	if len(record.Events) != 1 || !recordContainsEventID(t, record.Events, "evt-own-actor") {
 		t.Fatalf("expected only the configured actor's envelope spooled, got %s", mustJSON(t, record.Events))
 	}
 	letters := recorder.byReason(SpoolDropConsent)
@@ -1673,7 +1688,7 @@ func TestSpoolMergeCapEvictionSettlesMirror(t *testing.T) {
 		t.Fatalf("expected a1 reported as a local capacity drop, got %+v", drops)
 	}
 	record := readSpoolRecordFile(t, dir)
-	if len(record.Events) != 3 || containsEventID(t, record.Events, "evt-mc-a1") {
+	if len(record.Events) != 3 || recordContainsEventID(t, record.Events, "evt-mc-a1") {
 		t.Fatalf("expected the record to hold [a2 b1 a3], got %s", mustJSON(t, record.Events))
 	}
 	spoolA.mu.Lock()
@@ -1698,7 +1713,7 @@ func TestSpoolMergeCapEvictionSettlesMirror(t *testing.T) {
 		t.Fatalf("ack: removed=%d persistFailed=%v", len(removed), persistFailed)
 	}
 	record = readSpoolRecordFile(t, dir)
-	if containsEventID(t, record.Events, "evt-mc-a1") {
+	if recordContainsEventID(t, record.Events, "evt-mc-a1") {
 		t.Fatalf("a merge-cap-dropped entry must never resurrect, got %s", mustJSON(t, record.Events))
 	}
 }
@@ -1747,7 +1762,7 @@ func TestSpoolAppendExpiresPreAgedEnvelopes(t *testing.T) {
 	}
 	client.spoolFailedBatch(request, nil, false)
 	record := readSpoolRecordFile(t, dir)
-	if len(record.Events) != 1 || !containsEventID(t, record.Events, "evt-fresh-1") {
+	if len(record.Events) != 1 || !recordContainsEventID(t, record.Events, "evt-fresh-1") {
 		t.Fatalf("expected only the fresh envelope spooled, got %s", mustJSON(t, record.Events))
 	}
 	if stats := client.Snapshot(); stats.SpoolExpired != 2 || stats.Spooled != 1 {
@@ -1845,8 +1860,8 @@ func TestSpoolOversizedRecordDiscardedWithoutFullLoad(t *testing.T) {
 	// NO eviction cascade (which would dead-letter every entry).
 	now := time.Now()
 	pad := strings.Repeat("x", 4096)
-	envelopes := make([]json.RawMessage, 0, 20)
-	for i := 0; i < 20; i++ {
+	envelopes := make([]json.RawMessage, 0, 60)
+	for i := 0; i < 60; i++ {
 		envelopes = append(envelopes, json.RawMessage(fmt.Sprintf(
 			`{"event_id":"evt-oversized-%d","event_ts":%q,"pad":%q}`, i, now.UTC().Format(time.RFC3339Nano), pad)))
 	}
@@ -2310,8 +2325,8 @@ func TestSpoolInProcessRetryReusesRetainedBytes(t *testing.T) {
 	if retryWire[0] != firstWire[0] {
 		t.Fatalf("retry bytes drifted from the first attempt:\n first: %s\n retry: %s", firstWire[0], retryWire[0])
 	}
-	if retryWire[0] != string(spooled.Events[0]) {
-		t.Fatalf("retry bytes drifted from the spooled record:\n spool: %s\n retry: %s", spooled.Events[0], retryWire[0])
+	if retryWire[0] != string(spooled.Events[0].Raw) {
+		t.Fatalf("retry bytes drifted from the spooled record:\n spool: %s\n retry: %s", spooled.Events[0].Raw, retryWire[0])
 	}
 	if !strings.Contains(retryWire[0], `"v1"`) || strings.Contains(retryWire[0], `"v2"`) {
 		t.Fatalf("expected the retry to carry the retained pre-mutation encoding, got %s", retryWire[0])
@@ -2342,7 +2357,7 @@ func TestSpoolRetryReusesRetainedBytesForPaddedID(t *testing.T) {
 		t.Fatalf("expected the retriable failure surfaced")
 	}
 	spooled := readSpoolRecordFile(t, dir)
-	if len(spooled.Events) != 1 || !containsEventID(t, spooled.Events, "evt-pad-1") {
+	if len(spooled.Events) != 1 || !recordContainsEventID(t, spooled.Events, "evt-pad-1") {
 		t.Fatalf("expected the failed batch spooled under the trimmed id, got %s", mustJSON(t, spooled.Events))
 	}
 
@@ -2361,8 +2376,8 @@ func TestSpoolRetryReusesRetainedBytesForPaddedID(t *testing.T) {
 	if len(firstWire) != 1 || len(retryWire) != 1 {
 		t.Fatalf("expected single-event bodies, got %d/%d", len(firstWire), len(retryWire))
 	}
-	if retryWire[0] != firstWire[0] || retryWire[0] != string(spooled.Events[0]) {
-		t.Fatalf("padded-id retry drifted from the retained/spooled encoding:\n first: %s\n retry: %s\n spool: %s", firstWire[0], retryWire[0], spooled.Events[0])
+	if retryWire[0] != firstWire[0] || retryWire[0] != string(spooled.Events[0].Raw) {
+		t.Fatalf("padded-id retry drifted from the retained/spooled encoding:\n first: %s\n retry: %s\n spool: %s", firstWire[0], retryWire[0], spooled.Events[0].Raw)
 	}
 	if !strings.Contains(retryWire[0], `"v1"`) || strings.Contains(retryWire[0], `"v2"`) {
 		t.Fatalf("expected the retry to carry the retained pre-mutation encoding, got %s", retryWire[0])
@@ -2425,7 +2440,7 @@ func TestSpoolCapacityDeadLetterDeferredUntilEvictionDurable(t *testing.T) {
 	if stats := client.Snapshot(); stats.SpoolEvicted != 0 {
 		t.Fatalf("expected SpoolEvicted deferred with the letter, got %+v", stats)
 	}
-	if record := readSpoolRecordFile(t, dir); !containsEventID(t, record.Events, "evt-defer-1") {
+	if record := readSpoolRecordFile(t, dir); !recordContainsEventID(t, record.Events, "evt-defer-1") {
 		t.Fatalf("expected the old record still on disk while the rewrite fails, got %s", mustJSON(t, record.Events))
 	}
 
@@ -2435,7 +2450,7 @@ func TestSpoolCapacityDeadLetterDeferredUntilEvictionDurable(t *testing.T) {
 	client.spool.renameFn = os.Rename
 	client.spoolMaintain()
 	record := readSpoolRecordFile(t, dir)
-	if len(record.Events) != 1 || !containsEventID(t, record.Events, "evt-defer-2") {
+	if len(record.Events) != 1 || !recordContainsEventID(t, record.Events, "evt-defer-2") {
 		t.Fatalf("expected the landed record to carry only the survivor, got %s", mustJSON(t, record.Events))
 	}
 	letters := recorder.byReason(SpoolDropCapacity)
@@ -2606,7 +2621,7 @@ func TestSpoolCloseRemnantPoisonMemberIsolated(t *testing.T) {
 	// The poison member is dropped attributed; the rest of the remnant still
 	// spools instead of dying with it (the old whole-remnant drop).
 	record := readSpoolRecordFile(t, dir)
-	if len(record.Events) != 1 || !containsEventID(t, record.Events, "evt-remnant-ok") {
+	if len(record.Events) != 1 || !recordContainsEventID(t, record.Events, "evt-remnant-ok") {
 		t.Fatalf("expected exactly the serializable remnant member spooled, got %s", mustJSON(t, record.Events))
 	}
 	if stats := client.Snapshot(); stats.Dropped != 1 {
@@ -2671,7 +2686,7 @@ func TestSpoolWrongVersionRecordDiscardedAtLoad(t *testing.T) {
 	// Discarded as a clean start exactly like an unparseable record.
 	record := spoolRecordWire{
 		Version:           spoolRecordVersion + 1,
-		Events:            []json.RawMessage{spoolTestEnvelope(t, "evt-wrong-version-1", time.Now())},
+		Events:            []spoolEventWire{{Raw: spoolTestEnvelope(t, "evt-wrong-version-1", time.Now())}},
 		RetryAfterUntilMS: time.Now().Add(time.Hour).UnixMilli(),
 	}
 	payload, err := json.Marshal(record)
@@ -2983,7 +2998,7 @@ func TestSpoolDuplicateAppendRetriesDirtyWrite(t *testing.T) {
 		t.Fatalf("expected the duplicate append to retry and land the write, got refused=%v added=%d persistFailed=%v", refused, len(added), persistFailed)
 	}
 	record := readSpoolRecordFile(t, dir)
-	if len(record.Events) != 1 || !containsEventID(t, record.Events, "evt-dup-1") {
+	if len(record.Events) != 1 || !recordContainsEventID(t, record.Events, "evt-dup-1") {
 		t.Fatalf("expected the recovered write durable, got %s", mustJSON(t, record.Events))
 	}
 	if s.dirty {
@@ -3026,7 +3041,7 @@ func TestSpoolCloseRetriesDirtyWrite(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 	record := readSpoolRecordFile(t, dir)
-	if len(record.Events) != 1 || !containsEventID(t, record.Events, "evt-close-1") {
+	if len(record.Events) != 1 || !recordContainsEventID(t, record.Events, "evt-close-1") {
 		t.Fatalf("expected Close to land the recovered write durably, got %s", mustJSON(t, record.Events))
 	}
 }
@@ -3163,7 +3178,7 @@ func TestSpoolPrivateDirTightensCwdSpoolDir(t *testing.T) {
 		t.Fatalf("a cwd spool dir must be tightened to 0700 like any explicit path, got %v", info.Mode().Perm())
 	}
 	record := readSpoolRecordFile(t, ".")
-	if len(record.Events) != 1 || !containsEventID(t, record.Events, "evt-cwd-1") {
+	if len(record.Events) != 1 || !recordContainsEventID(t, record.Events, "evt-cwd-1") {
 		t.Fatalf("expected the record written through the tightened cwd, got %s", mustJSON(t, record.Events))
 	}
 }
@@ -3273,7 +3288,7 @@ func TestSpoolResendHintlessFailureClearsPersistedDeadline(t *testing.T) {
 	if record.RetryAfterUntilMS != 0 {
 		t.Fatalf("expected the hintless resend failure to clear the persisted deadline, got %d", record.RetryAfterUntilMS)
 	}
-	if len(record.Events) != 1 || !containsEventID(t, record.Events, "evt-resend-clear-1") {
+	if len(record.Events) != 1 || !recordContainsEventID(t, record.Events, "evt-resend-clear-1") {
 		t.Fatalf("expected the event still spooled for retry, got %s", mustJSON(t, record.Events))
 	}
 	state.setOutcome(http.StatusAccepted, "", "")

@@ -2,6 +2,55 @@
 
 ## Unreleased
 
+- Dark opt-in experiment-assignment consumer (`Config.ExperimentsEnabled`, default `false` —
+  while off ZERO experiment code paths execute and nothing new touches the wire or the disk;
+  ADR-0259 SDK leg, defold#35 canonical semantics ported to Go idiom):
+  - `FetchExperimentAssignment(ctx, key, attributes)` against the control-plane assignment
+    endpoint (`RemoteConfigURL` host, path-swapped; publishable `APIKey` bearer): full verdict
+    parsing (assigned / the three not-assigned shapes distinguished by `reason` — absent,
+    `kill_switch`, `targeting_unmatched`; unknown reasons are malformed), strict verdict-shape
+    validation (present positive `version`, non-empty keys, known unit member, echo-consistent
+    `app_key`/`environment_key`/`experiment_key`), and the server-evaluated targeting attribute
+    vocabulary (allowlist + `custom_attribute_*`, ≤512-byte values, 64-attribute cap, sorted,
+    out-of-vocabulary dropped never sent).
+  - The ratified failure canon on this plane: transients (offline/`408`/`429`/`5xx` incl. the
+    kill-state `503`, malformed bodies) serve the durable last-known-good record; `401`/generic
+    `403` fail closed per fetch, halt serving and the automatic lane until a later authorized
+    fetch, and leave the durable record untouched; the real-subjects sentinel `403` additionally
+    drops the record and its subject-fact keys durably; `404` and non-grammar `400`s drop the
+    cached entry permanently; the subject-grammar `400` sentinel re-mints the subject once per
+    process and retries with the exact normalized attribute set of the rejected request.
+    `Retry-After` (429 and 5xx) paces the revalidation cadence only. Per-(scope, experiment)
+    sequence fences with auth-epoch gating: stale in-flight responses install nothing, pace
+    nothing, re-mint nothing, and their callers receive the SETTLED state, never the discarded
+    variant. Durable writes converge to memory through owed-sync intent (writes cancelled by an
+    ordinary latch, authoritative drops still land, whole-record clears demote to per-key drops
+    the moment fresh state installs) with clock-rollback-proof stamps.
+  - SDK-managed `spcid_` subject id (UUIDv7, dashes stripped, 32 hex; full wire grammar accepted
+    on load for stickiness; no host override path), persisted under `SpoolDir` when set.
+    Scope-stamped durable cache (workspace, app, environment, subject, base URL, and a
+    non-secret credential fingerprint; corrupt = miss, bounded read-back).
+  - Granted-only consent posture from the SAME effective consent state the analytics path uses
+    (`ConsentFloor` composition included): denial — the forced-minor state included — closes the
+    whole plane (zero experiment traffic on both planes); floor-off keeps this SDK's documented
+    open-under-unknown posture; downgrades retain the cache unserved, re-grants re-serve.
+  - Automatic revalidation every 300s ± 10% jitter over the cached assignments (the SDK-side
+    kill-switch reach), with transport-parity backoff, a day-clamped `Retry-After` park, and a
+    lane that never blocks `Close`.
+  - Consent-gated `experiment_exposure`/`experiment_outcome` producers through the existing
+    analytics pipeline: strict props allowlist, `sfk1_` subject-fact key verbatim as
+    `assignment_key` (the raw subject id never egresses; no fact without one), `source: client`,
+    `user_id` omitted, `anonymous_id` = the configured client identity; once per (experiment,
+    version, subject) per client instance with DETERMINISTIC event ids (retries and purge
+    re-emissions collapse server-side); `TrackExperimentExposure` re-arms an extra fact with a
+    distinct id — while the automatic arm-0 emission is still owed, both facts emit; owed
+    emissions ride bounded FIFO snapshots swept by the lane and once more at `Close` after the
+    flush frees room, with owed durable syncs retried before teardown. NOTE: the producer lane
+    is dark end-to-end today — the analytics service rejects these event names from publishable
+    client keys until the platform's producer-lane decision lands.
+  - `ExperimentVariant`/`ExperimentVariantPayload` cached-variant getters (consent- and
+    latch-gated, deep-copied payloads). New errors: `ErrExperimentsNotConfigured`,
+    `ErrExperimentNoAssignment`, `ErrExperimentFactUnavailable`, `ErrInvalidExperimentFact`.
 - Opt-in client-side consent floor (`Config.ConsentFloor`), adopting the engine SDKs'
   consent-first contract for integrations that need client-side enforcement (per the
   sdk-stability-1.0 disposition: user-facing adopters bound by the DPIA condition opt in;

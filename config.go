@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -101,6 +102,34 @@ type Config struct {
 	// served snapshot within the process). Independent of SpoolDir — setting
 	// it never enables consent persistence or the disk spool.
 	RemoteConfigCachePath string
+
+	// ExperimentsEnabled opts this client into the experiment-assignment
+	// consumer (ADR-0259): the assignment fetch, the cached-variant
+	// getters, periodic revalidation, and the exposure/outcome fact
+	// producers. Default false — DARK: while off, zero experiment code
+	// paths execute (no subject-id mint, no fetch, no revalidation
+	// goroutine, no fact emission, no new persistence keys and no reads of
+	// previously persisted ones), and the public experiment surface
+	// refuses ErrExperimentsNotConfigured.
+	//
+	// The assignment endpoint lives on the same control-plane host as the
+	// remote-config fetch and authenticates with the same publishable
+	// APIKey, so the flag requires RemoteConfigURL (which in turn requires
+	// APIKey). With SpoolDir set, the consumer persists its subject id and
+	// its assignment cache there (files 0600); without it both are
+	// in-memory only — a restart re-buckets the subject, documented
+	// ephemeral.
+	//
+	// Dark-phase note: the platform's experimentation flags are OFF in
+	// every environment today, so an enabled consumer receives 403 on
+	// every fetch until platform enablement — the expected fail-closed
+	// posture. Until the control-plane auth leg grants publishable keys
+	// the experiment-assignment read scope, only an explicitly scoped
+	// runtime token authenticates (401 otherwise). The exposure/outcome
+	// lane is additionally dark END-TO-END: the analytics service rejects
+	// these event names from publishable client keys until the platform's
+	// producer-lane decision lands.
+	ExperimentsEnabled bool
 
 	// SpoolDir, when set, is the opt-in state directory for the bounded disk
 	// spool and the persisted consent decision (`spool.json`, `consent.json`,
@@ -215,6 +244,13 @@ type Config struct {
 	// Snapshot().ByStatus breakdown for the same statuses. See
 	// ConsentUnknown and SetConsent.
 	OnBatchResult func(BatchResult)
+
+	// experimentDirChmodForTests substitutes the chmod the experiment
+	// preload uses when it establishes SpoolDir privacy (the spool's
+	// injectable-chmod discipline), so tests can exercise the
+	// refused-tighten fail-closed path deterministically — a real chmod on
+	// a test-owned directory always succeeds. nil in production (os.Chmod).
+	experimentDirChmodForTests func(name string, mode os.FileMode) error
 }
 
 // ConsentFloorConfig configures the opt-in client-side consent floor. The
@@ -292,6 +328,16 @@ func normalizeConfig(cfg Config) (Config, error) {
 			return Config{}, err
 		}
 		cfg.RemoteConfigURL = normalizedRC
+	}
+
+	if cfg.ExperimentsEnabled && cfg.RemoteConfigURL == "" {
+		// The assignment endpoint is the control-plane host the
+		// remote-config fetch already points at (path-swapped), and it
+		// authenticates with the same publishable APIKey the
+		// RemoteConfigURL branch above already required: enabling
+		// experiments without that base could never produce a working
+		// fetch.
+		return Config{}, fmt.Errorf("%w: experiments require RemoteConfigURL (the assignment endpoint shares the control-plane host)", ErrInvalidConfig)
 	}
 
 	if cfg.SpoolDir != "" {

@@ -84,7 +84,7 @@ type SpoolDeadLetter struct {
 
 const (
 	spoolFileName      = "spool.json"
-	spoolRecordVersion = 1
+	spoolRecordVersion = 2
 
 	// spoolRetryAgeCap bounds how long an undelivered event may wait in the
 	// spool, mirroring the crash-plane retention contract; age derives from
@@ -101,6 +101,34 @@ const (
 	// retry_after_until_ms, matching the ingest plane's Retry-After clamp so
 	// wall-clock skew in the stored deadline cannot park the client longer.
 	spoolMaxDeferralSeed = 24 * time.Hour
+
+	// spoolWithdrawnFileName is the durable withdrawal marker: event ids the
+	// real-subjects sentinel purge removed from the spool whose record
+	// rewrite has not landed yet. Terminal withdrawal is not an ordinary
+	// at-least-once ack — a crash between the purge and a successful
+	// rewrite must NOT resurrect withdrawn facts into the next process's
+	// resend queue — so the ids persist first and the marker spends only
+	// once a rewrite without those entries lands. Honored at load.
+	spoolWithdrawnFileName = "spool.withdrawn.json"
+
+	// spoolWithdrawnReadLimit is the FLOOR of the marker read bound: small
+	// configurations keep this generous legacy bound, while larger
+	// configured spools derive a capacity-proportional bound instead (see
+	// withdrawnMarkerReadLimit) — a fixed cap would read a legitimately
+	// large marker as absent after a crash and reload withdrawn facts for
+	// resend.
+	spoolWithdrawnReadLimit = 256 << 10
+
+	// spoolWithdrawnPerIDBytes is the per-id allowance behind the derived
+	// marker read bound: a UUID-shaped event id's JSON envelope (36 chars,
+	// quotes, separator) is ~40 bytes; 128 leaves headroom for longer
+	// deterministic ids and a second unspent generation's merge.
+	spoolWithdrawnPerIDBytes = 128
+
+	// spoolWithdrawnReadCeiling clamps the derived marker bound (overflow
+	// safety for absurd SpoolMaxEvents values): past this the marker is not
+	// a file this spool could legitimately have written.
+	spoolWithdrawnReadCeiling = 1 << 30
 
 	// spoolRecordReadOverhead is the fixed allowance over SpoolMaxBytes for
 	// the record's own JSON framing when reading spool.json back. Every save
@@ -121,10 +149,25 @@ var errSpoolRecordOversized = errors.New("spool record exceeds the bounded read 
 // spoolRecordWire is the spool.json payload. Events hold the exact
 // wire-serialized envelope bytes; retry_after_until_ms carries a live server
 // Retry-After deadline captured when a batch was spooled under one.
+// Version 2 wraps each event in spoolEventWire — the exact envelope bytes
+// plus SDK-side metadata that must survive a restart but can never ride the
+// wire envelope itself (the ingest contract is a strict allowlist): the
+// SDK-authorship marker the sentinel's spool predicates require. Version 1
+// records (bare raw arrays) fail the version gate at load and start clean —
+// the pre-release breaking-format posture.
 type spoolRecordWire struct {
-	Version           int               `json:"version"`
-	Events            []json.RawMessage `json:"events"`
-	RetryAfterUntilMS int64             `json:"retry_after_until_ms,omitempty"`
+	Version           int              `json:"version"`
+	Events            []spoolEventWire `json:"events"`
+	RetryAfterUntilMS int64            `json:"retry_after_until_ms,omitempty"`
+}
+
+// spoolEventWire is one persisted spool entry: the envelope's exact wire
+// bytes (joined verbatim on resend — byte identity is the de-dupe contract)
+// and the internal experiment-fact flag, so a reloaded record can tell this
+// SDK's own facts from host events that merely resemble them.
+type spoolEventWire struct {
+	Raw          json.RawMessage `json:"raw"`
+	InternalFact bool            `json:"internal_fact,omitempty"`
 }
 
 // spoolEnvelopeWire is the minimal per-envelope parse a loaded record needs:
@@ -140,6 +183,24 @@ type spoolEntry struct {
 	id  string
 	ts  string
 	raw json.RawMessage
+
+	// expFactEpoch is the real-subjects purge generation the entry's batch
+	// was BUILT under (stamped at partitionSpoolEligible from the request;
+	// zero for entries loaded from disk — a previous process's facts
+	// predate any purge this process runs). The sentinel's spool sweep
+	// spares entries stamped AT its own post-bump epoch: a drop-time
+	// capture appended under e.mu alone (no emitMu) can land mid-sweep,
+	// and an epoch-blind raw predicate would withdraw that current-epoch
+	// fact.
+	expFactEpoch uint64
+
+	// internalFact marks an entry whose envelope this SDK authored as one
+	// of its own experiment facts (envelope.internalIdentityFact, persisted
+	// through the record as spoolEventWire.InternalFact): the sentinel's
+	// spool predicates require it, so a host-authored envelope that merely
+	// resembles a fact — the reserved-looking name + sfk1_-shaped
+	// assignment_key — is never withdrawn, class-condemned, or withheld.
+	internalFact bool
 }
 
 // spoolEntryExpired applies the retry-age cap: expired when the event_ts is
@@ -170,6 +231,34 @@ type diskSpool struct {
 	dir       string
 	maxEvents int
 	maxBytes  int
+
+	// experimentsEnabled mirrors Config.ExperimentsEnabled for the
+	// load-time withdrawal-marker adjudication. The marker itself is
+	// honored flag-independently — a durable purge debt outlives the
+	// opt-in that created it — but a DAMAGED marker's remedy is
+	// flag-scoped: an experiments-enabled client escalates to the
+	// whole-record wipe rung, while a dark client fails closed WITHIN the
+	// experiment-fact class only, keeping the ordinary spool alive (see
+	// load).
+	experimentsEnabled bool
+
+	// withdrawnMarkerOwed reports an unspent withdrawal DEBT: a marker may
+	// be live on disk (the crash protection), or its write may have failed
+	// — the debt arms either way and spends (removing any marker file,
+	// durably) after the next successful record rewrite, which by then
+	// excludes the withdrawn entries.
+	withdrawnMarkerOwed bool
+
+	// withdrawnOwedIDs holds the UNSPENT withdrawal debt's full id set —
+	// populated when a withdrawal happens (marker write SUCCESSFUL OR NOT)
+	// or when a marker is honored at load, retained across merged
+	// generations, cleared only when the debt spends. The reload-and-merge
+	// save excludes these ids DIRECTLY: a withdrawal larger than
+	// spoolSettledMemory would evict its oldest ids from the bounded
+	// settled cache before the save runs, and the merge would read them
+	// back from the stale on-disk record — writing a "clean" file that
+	// resurrects facts the mirror already dead-lettered.
+	withdrawnOwedIDs map[string]struct{}
 
 	entries    []spoolEntry
 	ids        map[string]struct{}
@@ -263,18 +352,19 @@ const spoolSettledMemory = 4096
 
 func newDiskSpool(cfg Config) *diskSpool {
 	s := &diskSpool{
-		dir:          cfg.SpoolDir,
-		maxEvents:    cfg.SpoolMaxEvents,
-		maxBytes:     cfg.SpoolMaxBytes,
-		ids:          make(map[string]struct{}),
-		settledIDs:   make(map[string]struct{}),
-		uncountedIDs: make(map[string]struct{}),
-		actorDigest:  consentActorDigest(cfg),
-		removeFn:     os.Remove,
-		renameFn:     os.Rename,
-		chmodFn:      os.Chmod,
-		markerFn:     createWipeOwedMarker,
-		syncFn:       syncDir,
+		dir:                cfg.SpoolDir,
+		experimentsEnabled: cfg.ExperimentsEnabled,
+		maxEvents:          cfg.SpoolMaxEvents,
+		maxBytes:           cfg.SpoolMaxBytes,
+		ids:                make(map[string]struct{}),
+		settledIDs:         make(map[string]struct{}),
+		uncountedIDs:       make(map[string]struct{}),
+		actorDigest:        consentActorDigest(cfg),
+		removeFn:           os.Remove,
+		renameFn:           os.Rename,
+		chmodFn:            os.Chmod,
+		markerFn:           createWipeOwedMarker,
+		syncFn:             syncDir,
 	}
 	s.owed = wipeOwedMarkerExists(s.dir)
 	return s
@@ -329,6 +419,12 @@ func (s *diskSpool) saveLocked() error {
 			continue
 		}
 		if _, settled := s.settledIDs[entry.id]; settled {
+			continue
+		}
+		if _, withdrawn := s.withdrawnOwedIDs[entry.id]; withdrawn {
+			// The unspent withdrawal marker's FULL id set — never the
+			// bounded settled cache alone — keeps withdrawn facts out of
+			// the merge (see the field comment).
 			continue
 		}
 		if _, dup := seen[entry.id]; dup {
@@ -392,11 +488,11 @@ func (s *diskSpool) saveLocked() error {
 	}
 	record := spoolRecordWire{
 		Version:           spoolRecordVersion,
-		Events:            make([]json.RawMessage, 0, len(merged)),
+		Events:            make([]spoolEventWire, 0, len(merged)),
 		RetryAfterUntilMS: s.retryAfterUntilMS,
 	}
 	for _, entry := range merged {
-		record.Events = append(record.Events, entry.raw)
+		record.Events = append(record.Events, spoolEventWire{Raw: entry.raw, InternalFact: entry.internalFact})
 	}
 	payload, err := json.Marshal(record)
 	if err == nil {
@@ -425,8 +521,30 @@ func (s *diskSpool) saveLocked() error {
 		}
 		s.uncountedIDs = make(map[string]struct{})
 	}
+	if s.withdrawnMarkerOwed {
+		if s.removeWithdrawnMarkerLocked() {
+			// The record that just landed excludes the withdrawn entries
+			// (the owed-id set kept them out of the merge): the marker is
+			// spent.
+			s.withdrawnMarkerOwed = false
+			s.withdrawnOwedIDs = nil
+		} else {
+			// The clean record landed but the marker did not spend. A stale
+			// marker honored at the next load would condemn a same-id FRESH
+			// fact spooled after a re-enable, so an unspent marker is
+			// unfinished save work: report the save failed and keep the
+			// spool dirty so the flush-cadence retry re-attempts the spend.
+			s.dirty = true
+			return errSpoolMarkerSpendFailed
+		}
+	}
 	return nil
 }
+
+// errSpoolMarkerSpendFailed reports a save whose record rewrite landed but
+// whose withdrawal-marker spend did not (the marker file could not be
+// removed): the save cycle is incomplete and retries on the flush cadence.
+var errSpoolMarkerSpendFailed = errors.New("spool withdrawal marker spend failed")
 
 // releaseDeferredCapacityDropsLocked moves evictions whose removal from disk
 // has now durably happened — a successful rewrite that excluded them, or the
@@ -545,13 +663,21 @@ func (s *diskSpool) settleOwedWipeLocked() bool {
 	// settle, so its removal must be durable too before the wipe settles.
 	// A failed removal or sync keeps the spool fail-closed (the record
 	// file is already durably gone; the next settle retries just the
-	// marker half).
+	// marker half). The WITHDRAWAL marker goes with it: the record's total
+	// destruction subsumes any partial-withdrawal debt (a damaged marker's
+	// unknowable id set included), and left behind it would condemn — or,
+	// damaged, re-wipe — facts spooled fresh after this settle.
 	if s.removeMarkerFile() != nil {
+		return false
+	}
+	if err := s.removeFn(spoolWithdrawnPath(s.dir)); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return false
 	}
 	if s.syncFn(s.dir) != nil {
 		return false
 	}
+	s.withdrawnMarkerOwed = false
+	s.withdrawnOwedIDs = nil
 	// The record file is durably gone: any deferred capacity evictions are
 	// final.
 	s.releaseDeferredCapacityDropsLocked()
@@ -593,10 +719,12 @@ func (s *diskSpool) condemnEntriesLocked() []spoolEntry {
 
 // purge condemns the whole spool: the mirror and resend queue are cleared
 // unconditionally (the entries are returned for dead-lettering — they are
-// dropped from delivery either way), and the record file is removed. A
-// failed file removal owes a wipe: the durable marker is created
-// (best-effort; an in-memory owed flag fails closed regardless) and the
-// spool refuses all disk work until a later wipe succeeds.
+// dropped from delivery either way), the record file is removed, and the
+// WITHDRAWAL marker is spent with it. A failed record removal — or a
+// withdrawal-marker spend that could not be made durable — owes a wipe: the
+// durable wipe marker is created (best-effort; an in-memory owed flag fails
+// closed regardless) and the spool refuses all disk work until a later wipe
+// succeeds (the wipe's settle removes both markers, sync-fenced).
 func (s *diskSpool) purge() (dropped []spoolEntry, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -608,6 +736,32 @@ func (s *diskSpool) purge() (dropped []spoolEntry, err error) {
 	}
 	// The record file is gone: any deferred capacity evictions are final.
 	s.releaseDeferredCapacityDropsLocked()
+	// The WITHDRAWAL marker goes with the record: the purge is a
+	// total-destruction rung exactly like the owed wipe, whose settle
+	// already subsumes any partial-withdrawal debt — a damaged marker's
+	// unknowable id set included — so spending it here is always safe. A
+	// stale spool.withdrawn.json left behind would never be loaded by a
+	// purge-path start (withdrawnMarkerOwed never arms, so no save spends
+	// it) and a LATER granted restart would honor it against the record:
+	// condemning fresh same-id facts, or — damaged — escalating that start
+	// to the wipe rung. The spend follows the durable-unlink discipline
+	// (ENOENT-tolerant unlink, then the parent sync) BEFORE the purge
+	// reports complete: unlike the record's un-synced unlink, whose loss
+	// re-purges idempotently at the next non-grant init, a resurrected
+	// withdrawal marker is not idempotently healed. A failed spend fails
+	// closed onto the owed-wipe rung.
+	if removeErr := s.removeFn(spoolWithdrawnPath(s.dir)); removeErr != nil && !errors.Is(removeErr, fs.ErrNotExist) {
+		s.owed = true
+		_ = createWipeOwedMarker(s.dir)
+		return dropped, removeErr
+	}
+	if syncErr := s.syncFn(s.dir); syncErr != nil {
+		s.owed = true
+		_ = createWipeOwedMarker(s.dir)
+		return dropped, syncErr
+	}
+	s.withdrawnMarkerOwed = false
+	s.withdrawnOwedIDs = nil
 	if s.owed {
 		// The purge itself succeeded, but the spool reopens only once the
 		// durable marker is off disk too — a stale marker would re-condemn
@@ -642,11 +796,13 @@ func (s *diskSpool) readRecordBytesLocked() ([]byte, error) {
 	}
 	defer file.Close()
 	// The framing allowance scales with the EVENT cap as well: past ~64k
-	// retained envelopes the array separators alone outgrow the fixed
+	// retained envelopes the per-event framing alone outgrows the fixed
 	// overhead, and a self-written cap-full record must never read back as
-	// oversized. Four bytes per allowed event covers the separator with
-	// room to spare.
-	limit := int64(s.maxBytes) + spoolRecordReadOverhead + 4*int64(s.maxEvents)
+	// oversized. Forty bytes per allowed event covers the version-2
+	// spoolEventWire wrapper ({"raw":...} plus the optional internal-fact
+	// flag, worst case 29 bytes) and the array separator with room to
+	// spare.
+	limit := int64(s.maxBytes) + spoolRecordReadOverhead + 40*int64(s.maxEvents)
 	data, err := io.ReadAll(io.LimitReader(file, limit+1))
 	if err != nil {
 		return nil, err
@@ -663,14 +819,14 @@ func (s *diskSpool) readRecordEntriesLocked() []spoolEntry {
 		return nil
 	}
 	var record spoolRecordWire
-	if json.Unmarshal(data, &record) != nil {
+	if json.Unmarshal(data, &record) != nil || record.Version != spoolRecordVersion {
 		return nil
 	}
 	entries := make([]spoolEntry, 0, len(record.Events))
-	for _, raw := range record.Events {
+	for _, wire := range record.Events {
 		var envelope spoolEnvelopeWire
-		_ = json.Unmarshal(raw, &envelope)
-		entries = append(entries, spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: raw})
+		_ = json.Unmarshal(wire.Raw, &envelope)
+		entries = append(entries, spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: wire.Raw, internalFact: wire.InternalFact})
 	}
 	return entries
 }
@@ -679,8 +835,12 @@ func (s *diskSpool) readRecordEntriesLocked() []spoolEntry {
 // the re-seeded deferral (zero when none), and whether the init rewrite
 // failed.
 type spoolLoadOutcome struct {
-	expired       []spoolEntry
-	evicted       []spoolEntry
+	expired []spoolEntry
+	evicted []spoolEntry
+	// condemned holds experiment-fact-class entries a DARK client dropped
+	// under a damaged withdrawal marker (the class-scoped fail-closed
+	// remedy; see load) — dead-lettered terminal by the caller.
+	condemned     []spoolEntry
 	deferUntil    time.Time
 	persistFailed bool
 }
@@ -710,10 +870,81 @@ func (s *diskSpool) load(now time.Time) spoolLoadOutcome {
 		_ = s.removeRecordFile()
 		return outcome
 	}
-	for _, raw := range record.Events {
+	withdrawn, markerDamaged := readWithdrawnMarker(s.dir, s.withdrawnMarkerReadLimit())
+	factClassCondemned := false
+	if markerDamaged {
+		// A PRESENT-but-unusable withdrawal marker (unreadable, over the
+		// bound, corrupt) is a withdrawal whose id set is UNKNOWABLE — it
+		// must never collapse to "absent" and reload withdrawn facts for
+		// resend (the terminal-withdrawal contract is privacy-side). The
+		// REMEDY is scoped by the experiments opt-in:
+		//   - ENABLED: fail closed by escalating to the wipe rung — total
+		//     durable destruction of the record subsumes the unknowable
+		//     partial withdrawal, the owed wipe blocks all disk work until
+		//     it settles durably (record first, then both markers, each
+		//     sync-fenced), and facts spooled after the settle are FRESH —
+		//     never condemned by the stale marker, which the settle
+		//     removed.
+		//   - DARK: the marker is an experiment-only artifact, and only
+		//     experiment facts can be the withdrawal's subject — so fail
+		//     closed WITHIN the experiment-fact class instead: every
+		//     fact-class entry is dropped below (a superset of whatever
+		//     the unreadable id set named), the ordinary spool stays alive
+		//     and serving, and the damaged marker stays ON DISK — unspent,
+		//     still owed — for a future experiments-enabled session to
+		//     adjudicate on the wipe rung. Escalating a dark client to the
+		//     whole-record wipe would let an experiment-only persistence
+		//     artifact destroy ordinary analytics durability the dark-off
+		//     guarantee promises to leave untouched.
+		if s.experimentsEnabled {
+			s.owed = true
+			_ = s.markerFn(s.dir)
+			return outcome
+		}
+		factClassCondemned = true
+	}
+	withdrawnIDs := make(map[string]struct{}, len(withdrawn))
+	for _, id := range withdrawn {
+		withdrawnIDs[id] = struct{}{}
+	}
+	if len(withdrawnIDs) > 0 {
+		s.withdrawnMarkerOwed = true
+		// The FULL marker set backs the merge exclusion until the marker
+		// spends — the bounded settled cache alone cannot (see
+		// withdrawnOwedIDs).
+		s.withdrawnOwedIDs = withdrawnIDs
+	}
+	for _, wire := range record.Events {
 		var envelope spoolEnvelopeWire
-		_ = json.Unmarshal(raw, &envelope)
-		entry := spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: raw}
+		_ = json.Unmarshal(wire.Raw, &envelope)
+		entry := spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: wire.Raw, internalFact: wire.InternalFact}
+		if _, isWithdrawn := withdrawnIDs[entry.id]; isWithdrawn {
+			// A previous process withdrew this envelope (the real-subjects
+			// sentinel) but exited before the clean rewrite landed: honor
+			// the durable withdrawal — never resend. Settled, so the
+			// merging save cannot resurrect it; the marker spends when the
+			// rewrite below (or any later one) lands.
+			s.recordSettledLocked(entry.id)
+			continue
+		}
+		if factClassCondemned && entry.internalFact && withdrawnExperimentFactRaw(entry.raw) {
+			// The dark client's class-scoped fail-closed under a damaged
+			// marker: the marker testified that SOME experiment facts were
+			// withdrawn, and the whole fact class is the smallest knowable
+			// superset of its unreadable id set. Settled so the merging
+			// save cannot resurrect them — with the unbounded owed-id set
+			// backing that exclusion past the bounded settled cache — and
+			// returned for the caller's terminal dead-letter; the damaged
+			// marker itself is deliberately NOT spent (withdrawnMarkerOwed
+			// stays unarmed, so no rewrite removes the file).
+			s.recordSettledLocked(entry.id)
+			if s.withdrawnOwedIDs == nil {
+				s.withdrawnOwedIDs = make(map[string]struct{})
+			}
+			s.withdrawnOwedIDs[entry.id] = struct{}{}
+			outcome.condemned = append(outcome.condemned, entry)
+			continue
+		}
 		if spoolEntryExpired(entry, now) {
 			s.recordSettledLocked(entry.id)
 			outcome.expired = append(outcome.expired, entry)
@@ -936,6 +1167,190 @@ func (s *diskSpool) ack(ids []string) (removed []spoolEntry, persistFailed bool)
 	return removed, persistFailed
 }
 
+// removeMatching removes every spooled envelope the predicate matches (the
+// predicate reads the entry's exact wire bytes), with ack's mechanics: the
+// mirror, id set, byte total, and resend queue all forget the removed
+// entries, the removal is persisted, and the removed entries are returned
+// for the caller to dead-letter. Unlike an ack, this removal is a TERMINAL
+// WITHDRAWAL: before the mirror forgets anything, the removed ids persist
+// in the withdrawal marker, so a crash before a successful record rewrite
+// cannot resurrect withdrawn facts into the next process's resend queue —
+// the marker is honored at load and spends once a rewrite without those
+// entries lands. A failed persist is reported the same way ack reports one
+// — the mirror is authoritative and the next save retries.
+func (s *diskSpool) removeMatching(matches func(raw json.RawMessage) bool, currentExpEpoch uint64) (removed []spoolEntry, persistFailed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.entries) == 0 {
+		return nil, false
+	}
+	removedIDs := make(map[string]struct{})
+	for _, entry := range s.entries {
+		if currentExpEpoch > 0 && entry.expFactEpoch >= currentExpEpoch {
+			// Stamped AT the sweeping purge's own (post-bump) epoch: a
+			// fresh post-purge fact — typically a drop-time capture that
+			// landed mid-sweep from under e.mu, outside the emitMu window —
+			// is never withdrawn by the purge that predates it.
+			continue
+		}
+		if entry.internalFact && matches(entry.raw) {
+			// The SDK-authorship flag joins the raw-shape match: only this
+			// SDK's own facts are ever withdrawn — a host-authored envelope
+			// that resembles one is never condemned by the sentinel.
+			removed = append(removed, entry)
+			removedIDs[entry.id] = struct{}{}
+		}
+	}
+	if len(removed) == 0 {
+		return nil, false
+	}
+	// Durability first: persist the withdrawal intent BEFORE the mirror
+	// forgets the entries. A failed marker write proceeds regardless — the
+	// save below may still land the clean record; both failing is the
+	// storage-dead residual the persist flag surfaces. The debt arms and
+	// the in-memory FULL id set backs the merge exclusion EITHER WAY
+	// (writeWithdrawnMarkerLocked populates it before attempting the
+	// write): a failed marker write must not degrade the exclusion to the
+	// bounded settled cache, which a large withdrawal overflows — the save
+	// would merge the oldest withdrawn ids back from the stale record and
+	// report clean, resurrecting dead-lettered facts. The spend tolerates
+	// a marker that never reached disk.
+	ids := make([]string, 0, len(removed))
+	for _, entry := range removed {
+		ids = append(ids, entry.id)
+	}
+	_ = s.writeWithdrawnMarkerLocked(ids)
+	s.withdrawnMarkerOwed = true
+	kept := s.entries[:0]
+	for _, entry := range s.entries {
+		if _, isRemoved := removedIDs[entry.id]; isRemoved {
+			delete(s.ids, entry.id)
+			s.recordSettledLocked(entry.id)
+			s.totalBytes -= len(entry.raw)
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	s.entries = kept
+	keptResend := s.resend[:0]
+	for _, entry := range s.resend {
+		if _, isRemoved := removedIDs[entry.id]; !isRemoved {
+			keptResend = append(keptResend, entry)
+		}
+	}
+	s.resend = keptResend
+	persistFailed = s.saveLocked() != nil
+	return removed, persistFailed
+}
+
+// writeWithdrawnMarkerLocked arms the withdrawal debt and persists the
+// withdrawn-id set, merging the still-unspent prior generation (a second
+// purge before the first rewrite lands) from BOTH sources — the readable
+// disk marker and the in-memory owed set. The in-memory FULL set backs the
+// merge exclusion BEFORE the file write is attempted: even a FAILED marker
+// write must keep withdrawn ids out of every following reload-and-merge
+// save (the bounded settled cache alone lets the oldest ids of a large
+// withdrawal merge back from the stale on-disk record and report a clean
+// save), and the union means a damaged or unwritable disk generation never
+// drops ids this process still remembers.
+func (s *diskSpool) writeWithdrawnMarkerLocked(ids []string) error {
+	prior, _ := readWithdrawnMarker(s.dir, s.withdrawnMarkerReadLimit())
+	seen := make(map[string]struct{})
+	all := make([]string, 0, len(ids))
+	for priorOwed := range s.withdrawnOwedIDs {
+		prior = append(prior, priorOwed)
+	}
+	for _, id := range append(prior, ids...) {
+		if id == "" {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		all = append(all, id)
+	}
+	s.withdrawnOwedIDs = seen
+	payload, err := json.Marshal(all)
+	if err != nil {
+		return err
+	}
+	if err := writePrivateFileAtomic(spoolWithdrawnPath(s.dir), payload, s.renameFn, s.chmodFn); err != nil {
+		return err
+	}
+	// The recovery-marker durability idiom (createWipeOwedMarker): the
+	// marker's directory entry is fsynced before the withdrawal intent is
+	// considered durably persisted — an un-synced marker could vanish in a
+	// crash while the stale record survives, resurrecting withdrawn facts
+	// at the next load.
+	return s.syncFn(s.dir)
+}
+
+// removeWithdrawnMarkerLocked spends the marker; a missing file counts as
+// removed, but the spend completes only once the directory entry's removal
+// is durably synced — POSIX may lose an un-synced unlink in a crash, and a
+// resurrected marker honored after the owed state cleared would condemn
+// same-id FRESH facts spooled after re-enable (the settleOwedWipeLocked
+// unlink discipline). The sync runs on the missing-file path too: a prior
+// attempt may have unlinked and then failed exactly this sync.
+func (s *diskSpool) removeWithdrawnMarkerLocked() bool {
+	if err := s.removeFn(spoolWithdrawnPath(s.dir)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return false
+	}
+	return s.syncFn(s.dir) == nil
+}
+
+func spoolWithdrawnPath(dir string) string {
+	return filepath.Join(dir, spoolWithdrawnFileName)
+}
+
+// withdrawnMarkerReadLimit derives the marker read bound from the
+// CONFIGURED spool capacity — never a fixed constant: a marker for a
+// legitimately large configured withdrawal must read back after a crash.
+// Floored at the legacy generous bound, ceiling-clamped for overflow
+// safety.
+func (s *diskSpool) withdrawnMarkerReadLimit() int64 {
+	limit := int64(spoolWithdrawnReadLimit)
+	if s.maxEvents > 0 {
+		if s.maxEvents > spoolWithdrawnReadCeiling/spoolWithdrawnPerIDBytes {
+			return spoolWithdrawnReadCeiling
+		}
+		derived := int64(s.maxEvents)*spoolWithdrawnPerIDBytes + int64(spoolRecordReadOverhead)
+		if derived > limit {
+			limit = derived
+		}
+	}
+	if limit > spoolWithdrawnReadCeiling {
+		limit = spoolWithdrawnReadCeiling
+	}
+	return limit
+}
+
+// readWithdrawnMarker reads the withdrawn-id set. damaged distinguishes a
+// PRESENT-but-unusable marker — unreadable, over the bound, or corrupt —
+// from a genuinely absent one: a damaged marker still testifies that a
+// withdrawal happened whose id set is now unknowable, and callers must
+// fail CLOSED on it (the load escalates to the wipe rung) instead of
+// collapsing it to "no marker" and reloading withdrawn facts for resend.
+func readWithdrawnMarker(dir string, limit int64) (ids []string, damaged bool) {
+	file, err := os.Open(spoolWithdrawnPath(dir))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, false
+		}
+		return nil, true
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil || int64(len(data)) > limit {
+		return nil, true
+	}
+	if json.Unmarshal(data, &ids) != nil {
+		return nil, true
+	}
+	return ids, false
+}
+
 // pullResendChunk takes up to limit startup-loaded entries for re-publish,
 // applying the retry-age cap at selection time (entries that expired while
 // waiting are dropped from the mirror and returned as expired). Entries no
@@ -1044,7 +1459,7 @@ func spoolEntriesFromRequest(request batchRequest) []spoolEntry {
 	}
 	entries := make([]spoolEntry, 0, len(request.Events))
 	for i, envelope := range request.Events {
-		entries = append(entries, spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: request.rawEvents[i]})
+		entries = append(entries, spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: request.rawEvents[i], internalFact: envelope.internalIdentityFact})
 	}
 	return entries
 }
@@ -1176,7 +1591,9 @@ func (c *Client) partitionSpoolEligible(request batchRequest) (eligible, refused
 		return nil, nil
 	}
 	for i, envelope := range request.Events {
-		entry := spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: request.rawEvents[i]}
+		// The request's purge-epoch stamp rides each entry: the sentinel's
+		// spool sweep spares entries born at its own epoch.
+		entry := spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: request.rawEvents[i], expFactEpoch: request.expPurgeEpoch, internalFact: envelope.internalIdentityFact}
 		if c.spoolActorEligible(envelope) {
 			eligible = append(eligible, entry)
 		} else {
@@ -1198,6 +1615,31 @@ func (c *Client) partitionSpoolEligible(request batchRequest) (eligible, refused
 // OFF keeps the released strict rule — both envelope identifiers equal to
 // the configured tuple — unchanged.
 func (c *Client) spoolActorEligible(envelope eventEnvelope) bool {
+	if envelope.internalIdentityFact {
+		if c.consentFloorEnabled() && c.cfg.UserID != "" {
+			// The mirror of intake's anonymous-actor gate
+			// (enqueueExperimentFact → ErrConsentActorMismatch): under an
+			// enabled floor with a UserID configured, the grant covers the
+			// USER actor while the fact ships the anonymous identity alone
+			// — the actor whose id actually rides the wire has no recorded
+			// grant. Intake refuses such facts live; the drop-time capture
+			// path reaches this eligibility check WITHOUT passing intake,
+			// and admitting here would give an ungranted actor disk
+			// retention (and a later publish) through the capture
+			// side-door. Refused: the capture dead-letters as a consent
+			// drop and the durable drop proceeds without it — the
+			// documented consent-first posture.
+			return false
+		}
+		// Otherwise the SDK's OWN experiment facts are the one envelope
+		// shape whose wire identifiers deliberately differ from the
+		// configured tuple WITHOUT an actor change: user_id is omitted by
+		// the ingest contract for those event names while anonymous_id
+		// carries the configured client identity. Their eligibility is the
+		// same decision intake made, matched on the anonymous_id the fact
+		// actually carries.
+		return c.cfg.AnonymousID != "" && envelope.AnonymousID == c.cfg.AnonymousID
+	}
 	if c.consentFloorEnabled() {
 		effective := firstNonEmpty(envelope.UserID, envelope.AnonymousID)
 		return effective == firstNonEmpty(c.cfg.UserID, c.cfg.AnonymousID)
@@ -1227,6 +1669,21 @@ func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned b
 	s := c.spool
 	if s == nil {
 		return 0, nil, 0, 0
+	}
+	if c.exp != nil && request.expPurgeEpoch != c.expFactPurgeEpoch.Load() {
+		// A real-subjects sentinel purge landed AFTER this batch was built
+		// (it was in transport when the sentinel arrived): its withdrawn
+		// experiment facts must not be written back into the pipeline the
+		// purge just cleaned. Re-filter at respool time; the surviving
+		// members keep their exact bytes. Deliberately NOT counted in
+		// Stats.Dropped here: the same events still sit in the worker's
+		// retained batch on the retriable path, and the worker-batch filter
+		// counts them exactly once at its next dispatch point.
+		filtered, removed := filterWithdrawnFromBatchRequest(request)
+		if removed > 0 {
+			request = filtered
+			c.logf("shardpilot experiments: withheld %d withdrawn experiment fact(s) from a post-sentinel respool", removed)
+		}
 	}
 	eligible, refusedActors := c.partitionSpoolEligible(request)
 	c.notifySpoolDeadLetter(SpoolDropConsent, refusedActors)
@@ -1454,6 +1911,17 @@ func (c *Client) resendSpooledChunks(deferUntil *time.Time, backoffAttempt *int)
 		if len(chunk) == 0 {
 			return true
 		}
+		if c.spoolResendHandoffSeam != nil {
+			c.spoolResendHandoffSeam(chunk)
+		}
+		// Re-verify the pulled chunk against the current purge state at the
+		// transport handoff: a real-subjects sentinel landing between the
+		// pull and this point condemned members the mirror sweep cannot
+		// reach (see dropWithdrawnSpoolChunkMembers).
+		chunk = c.dropWithdrawnSpoolChunkMembers(chunk)
+		if len(chunk) == 0 {
+			continue
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), c.cfg.HTTPTimeout)
 		result, err := c.publishRequestResult(ctx, spoolChunkRequest(chunk), len(chunk))
 		cancel()
@@ -1529,6 +1997,16 @@ func (c *Client) flushSpooledChunks(ctx context.Context, backoffAttempt *int) er
 		c.drainSpoolCapacityDrops()
 		if len(chunk) == 0 {
 			return firstErr
+		}
+		if c.spoolResendHandoffSeam != nil {
+			c.spoolResendHandoffSeam(chunk)
+		}
+		// The same handoff re-check as the automatic resend path: a
+		// sentinel racing the pulled chunk must not publish withdrawn
+		// facts through the explicit flush either.
+		chunk = c.dropWithdrawnSpoolChunkMembers(chunk)
+		if len(chunk) == 0 {
+			continue
 		}
 		result, err := c.publishRequestResult(ctx, spoolChunkRequest(chunk), len(chunk))
 		if err == nil {
@@ -1611,6 +2089,52 @@ func (c *Client) spoolCloseRemnant(batch []Event) (gateRefused int, mirrored []s
 		default:
 		}
 		break
+	}
+	// The remnant spool is a transport handoff too (the spooled envelopes
+	// resend at the next launch): a fact the real-subjects sentinel
+	// withdrew must not ride it. Runs on the worker's stop path, so the
+	// worker-owned filter applies as at any dispatch point — but that gate
+	// alone only covers the batch the worker HELD: the members just
+	// drained from the queue above never passed the worker's admission,
+	// and with the seen mark already advanced past the sentinel's bump the
+	// gate short-circuits without inspecting them. A pre-sentinel fact
+	// surviving here would be REBUILT under the current request epoch,
+	// bypassing spoolFailedBatch's epoch-mismatch re-filter and landing
+	// its withdrawn subject-fact key durably in the spool — a crash before
+	// the sentinel's spool sweep would resurrect it at the next launch. So
+	// the handoff also checks PER MEMBER below (the admitReceivedEvent
+	// idiom: the fact's own build stamp against the purge state), exactly
+	// like the consent-epoch boundary.
+	var remnantBackoff int
+	remnant = c.dropWithdrawnExperimentFacts(remnant, &remnantBackoff)
+	// The consent-epoch boundary applies at this handoff too: a denial that
+	// bumped the epoch while the worker held its batch — with Close's final
+	// flush abandoned before the worker's next boundary observation —
+	// condemned those events, and spooling them would durably resend them
+	// under a later grant. The intake stamp decides per member (the remnant
+	// legitimately mixes the possibly-stale held batch with post-re-grant
+	// queue events); dropped members count once, exactly like the boundary
+	// drop they missed, and any drop invalidates the retained bytes (they
+	// described the pre-filter held batch). The withdrawn-fact stamp check
+	// rides the same pass, with the same accounting.
+	currentConsentEpoch := c.consentEpoch.Load()
+	keptRemnant := remnant[:0]
+	boundaryDropped := 0
+	for _, event := range remnant {
+		if event.intakeConsentEpoch < currentConsentEpoch {
+			boundaryDropped++
+			continue
+		}
+		if c.isWithdrawnExperimentFactEvent(event) {
+			boundaryDropped++
+			continue
+		}
+		keptRemnant = append(keptRemnant, event)
+	}
+	remnant = keptRemnant
+	if boundaryDropped > 0 {
+		c.stats.dropped.Add(uint64(boundaryDropped))
+		c.retainedRequest = batchRequest{}
 	}
 	if len(remnant) == 0 {
 		return 0, nil, 0, 0, 0
@@ -1700,6 +2224,14 @@ func (c *Client) initSpool() []SpoolDeadLetter {
 			}
 			outcome := s.load(c.clock.Now())
 			var letters []SpoolDeadLetter
+			if len(outcome.condemned) > 0 {
+				// The dark client's damaged-marker remedy (see load): the
+				// experiment-fact class fails closed alone, terminal like
+				// every sentinel withdrawal; the ordinary spool loaded and
+				// serves.
+				c.logf("shardpilot spool: dropped %d experiment fact(s) at load — the withdrawal marker is damaged and experiments are disabled, so the unknowable withdrawal fails closed within the experiment-fact class (the marker stays owed for a future experiments-enabled session; ordinary events are untouched)", len(outcome.condemned))
+				letters = append(letters, spoolDeadLetterFrom(SpoolDropTerminal, outcome.condemned))
+			}
 			if len(outcome.expired) > 0 {
 				c.stats.spoolExpired.Add(uint64(len(outcome.expired)))
 				letters = append(letters, spoolDeadLetterFrom(SpoolDropExpired, outcome.expired))
