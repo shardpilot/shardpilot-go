@@ -685,10 +685,12 @@ func (s *diskSpool) condemnEntriesLocked() []spoolEntry {
 
 // purge condemns the whole spool: the mirror and resend queue are cleared
 // unconditionally (the entries are returned for dead-lettering — they are
-// dropped from delivery either way), and the record file is removed. A
-// failed file removal owes a wipe: the durable marker is created
-// (best-effort; an in-memory owed flag fails closed regardless) and the
-// spool refuses all disk work until a later wipe succeeds.
+// dropped from delivery either way), the record file is removed, and the
+// WITHDRAWAL marker is spent with it. A failed record removal — or a
+// withdrawal-marker spend that could not be made durable — owes a wipe: the
+// durable wipe marker is created (best-effort; an in-memory owed flag fails
+// closed regardless) and the spool refuses all disk work until a later wipe
+// succeeds (the wipe's settle removes both markers, sync-fenced).
 func (s *diskSpool) purge() (dropped []spoolEntry, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -700,6 +702,32 @@ func (s *diskSpool) purge() (dropped []spoolEntry, err error) {
 	}
 	// The record file is gone: any deferred capacity evictions are final.
 	s.releaseDeferredCapacityDropsLocked()
+	// The WITHDRAWAL marker goes with the record: the purge is a
+	// total-destruction rung exactly like the owed wipe, whose settle
+	// already subsumes any partial-withdrawal debt — a damaged marker's
+	// unknowable id set included — so spending it here is always safe. A
+	// stale spool.withdrawn.json left behind would never be loaded by a
+	// purge-path start (withdrawnMarkerOwed never arms, so no save spends
+	// it) and a LATER granted restart would honor it against the record:
+	// condemning fresh same-id facts, or — damaged — escalating that start
+	// to the wipe rung. The spend follows the durable-unlink discipline
+	// (ENOENT-tolerant unlink, then the parent sync) BEFORE the purge
+	// reports complete: unlike the record's un-synced unlink, whose loss
+	// re-purges idempotently at the next non-grant init, a resurrected
+	// withdrawal marker is not idempotently healed. A failed spend fails
+	// closed onto the owed-wipe rung.
+	if removeErr := s.removeFn(spoolWithdrawnPath(s.dir)); removeErr != nil && !errors.Is(removeErr, fs.ErrNotExist) {
+		s.owed = true
+		_ = createWipeOwedMarker(s.dir)
+		return dropped, removeErr
+	}
+	if syncErr := s.syncFn(s.dir); syncErr != nil {
+		s.owed = true
+		_ = createWipeOwedMarker(s.dir)
+		return dropped, syncErr
+	}
+	s.withdrawnMarkerOwed = false
+	s.withdrawnOwedIDs = nil
 	if s.owed {
 		// The purge itself succeeded, but the spool reopens only once the
 		// durable marker is off disk too — a stale marker would re-condemn

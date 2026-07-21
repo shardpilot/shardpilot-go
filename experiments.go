@@ -931,6 +931,18 @@ type experimentsState struct {
 	// key.
 	entries map[string]*expEntry
 
+	// latchRetained is the RETAINED-unserved assignment set: the serving
+	// state an ordinary 401/403 latch cleared from entries while the
+	// durable record deliberately kept it (the disk-free memory mirror of
+	// that retention). The consent purge's re-arm pass reads it so
+	// latch-cleared assignments count as RETAINED — their exposure intents
+	// re-arm at the grant moment like any live entry's — never as drops
+	// (whose snapshots the ratified purge rule kills). Keys leave when the
+	// server actually withdraws them (applyEntryDropLocked), when a fresh
+	// install supersedes them, and wholesale on the sentinel withdrawal
+	// and on a subject rotation. Never consulted for serving.
+	latchRetained map[string]*expEntry
+
 	// pendingExposure holds applications whose exposure fact is still OWED:
 	// experiment key → a bounded FIFO of {entry, session} snapshots, each
 	// carrying THE SESSION THE APPLICATION BELONGS TO. Swept while consent
@@ -1150,6 +1162,7 @@ func newExperimentsState(cfg Config) *experimentsState {
 		keyPrint:        experimentAPIKeyFingerprint(cfg.APIKey),
 		spoolDir:        cfg.SpoolDir,
 		entries:         make(map[string]*expEntry),
+		latchRetained:   make(map[string]*expEntry),
 		pendingExposure: make(map[string][]*expOwedExposure),
 		durablePending:  make(map[string]expOwedSync),
 		exposed:         make(map[string]expExposed),
@@ -1278,6 +1291,10 @@ func (e *experimentsState) adoptMintedSubjectIDLocked() (subject string, persist
 	}
 	initialMint := e.subjectID == ""
 	e.entries = make(map[string]*expEntry)
+	// The rotation retires the scope: the old subject's retained set is
+	// dead weight (scope-missed on disk) and never re-arms under the new
+	// subject.
+	e.latchRetained = make(map[string]*expEntry)
 	e.exposed = make(map[string]expExposed)
 	// The rotation retires the previous scope: owed WRITES lose their
 	// in-memory source and cancel; owed DROPS were authoritative server
@@ -1948,6 +1965,10 @@ func (e *experimentsState) retryDurableSync() {
 func (e *experimentsState) applyEntryDropLocked(scope, experimentKey string, resolvedAtMS int64) (persistFailed bool) {
 	dropped := e.entries[experimentKey]
 	delete(e.entries, experimentKey)
+	// A server-directed withdrawal ends the key's RETAINED status too: a
+	// later consent purge must not re-arm an exposure intent for an
+	// assignment the server dropped (the ratified since-dropped rule).
+	delete(e.latchRetained, experimentKey)
 	// The OWED exposures deliberately survive the drop: an application
 	// that already happened is a fact — the drop stops future serving,
 	// not the record of real treatment. The durable drop converges
@@ -1997,6 +2018,9 @@ func (e *experimentsState) applySentinelWithdrawalLocked(scope string, resolvedA
 	e.authBlocked = true
 	e.authEpoch++
 	e.entries = make(map[string]*expEntry)
+	// The sentinel withdraws the retained set outright — nothing survives
+	// as a re-arm source.
+	e.latchRetained = make(map[string]*expEntry)
 	// The sentinel withdraws the assignments AND their subject-fact
 	// keys outright: owed exposure snapshots carry those keys and
 	// go with them. The AUTO dedupe slate resets with them — a purged
@@ -2096,6 +2120,15 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 		}
 		e.authBlocked = true
 		e.authEpoch++
+		// The latch RETAINS the assignments it stops serving (the durable
+		// record keeps them; a re-init or unlatch re-serves): mirror them
+		// into latchRetained so a consent purge can tell latch-cleared
+		// retained state from true drops — its re-arm pass must keep those
+		// assignments' exposure intents alive (grant-moment re-arms for
+		// RETAINED assignments), not lose them with the emptied entries.
+		for key, entry := range e.entries {
+			e.latchRetained[key] = entry
+		}
 		e.entries = make(map[string]*expEntry)
 		// An ORDINARY 401/403 retains the durable record — and the owed
 		// EXPOSURE snapshots: a treatment that already ran is a fact
@@ -2144,6 +2177,9 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 		entry.SubjectKey = subject
 		entry.Attributes = outcome.attributes
 		e.entries[experimentKey] = entry
+		// The fresh install supersedes any latch-retained copy: the LIVE
+		// entry is the re-arm source from here on.
+		delete(e.latchRetained, experimentKey)
 		// A fresh authorized assignment supersedes any owed whole-record
 		// clear RIGHT NOW, not at the next cycle: waiting would leave the
 		// stale clear armed across an ordinary auth latch (which empties
@@ -2250,6 +2286,22 @@ func (e *experimentsState) onAnalyticsPurge() {
 	// undercount a real new re-exposure.
 	e.resetExposedKeepArmsLocked()
 	for key, entry := range e.entries {
+		e.armExposureLocked(key, entry)
+	}
+	// Latch-cleared serving state is RETAINED, not dropped: an ordinary
+	// 401/403 latch emptied e.entries while the durable record kept the
+	// assignments (and the re-arm-from-entries pass above cannot see
+	// them), so without this pass a denial landing under a latch would
+	// silently lose a retained treatment's owed exposure — nothing left to
+	// sweep after the re-grant. Re-arm the retained set exactly like live
+	// entries (grant-moment intents for retained assignments): the auto
+	// snapshot re-derives the same deterministic arm-0 id, so anything
+	// that HAD published collapses server-side, and the arm high-water
+	// preserved above keeps explicit re-arms distinct.
+	for key, entry := range e.latchRetained {
+		if e.entries[key] != nil {
+			continue // the live entry already re-armed above
+		}
 		e.armExposureLocked(key, entry)
 	}
 }
