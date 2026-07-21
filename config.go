@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -243,6 +244,13 @@ type Config struct {
 	// Snapshot().ByStatus breakdown for the same statuses. See
 	// ConsentUnknown and SetConsent.
 	OnBatchResult func(BatchResult)
+
+	// experimentDirChmodForTests substitutes the chmod the experiment
+	// preload uses when it establishes SpoolDir privacy (the spool's
+	// injectable-chmod discipline), so tests can exercise the
+	// refused-tighten fail-closed path deterministically — a real chmod on
+	// a test-owned directory always succeeds. nil in production (os.Chmod).
+	experimentDirChmodForTests func(name string, mode os.FileMode) error
 }
 
 // ConsentFloorConfig configures the opt-in client-side consent floor. The

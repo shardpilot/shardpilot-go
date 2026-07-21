@@ -250,6 +250,12 @@ type Client struct {
 	// discipline); nil in production.
 	drainReceiveSeam func(Event)
 
+	// spoolResendHandoffSeam, when non-nil, is invoked with the pulled
+	// spool chunk after pullResendChunk and BEFORE the transport-handoff
+	// withdrawal re-check — the window where a real-subjects sentinel can
+	// land against an already-pulled chunk. Test seam; nil in production.
+	spoolResendHandoffSeam func(chunk []spoolEntry)
+
 	// initialDeferUntil seeds the flush worker's retry-pacing deadline from
 	// the spool's persisted retry_after_until_ms, so server backpressure
 	// captured before a restart still holds automatic publishes for the
@@ -340,7 +346,15 @@ func NewClient(cfg Config) (*Client, error) {
 		// fact can carry a pre-sentinel stamp (the purge filters are
 		// stamp-aware).
 		client.exp.factPurgeEpochBumpFn = func() { client.expFactPurgeEpoch.Add(1) }
-		client.exp.preload()
+		// The disk-spool leg of the sentinel joins the sentinel's DURABLE
+		// commit under e.mu (see sentinelSpoolPurgeUnderLock): a crash
+		// between the durable withdrawal and the off-lock pipeline purge
+		// must not let the next launch resend withdrawn facts.
+		client.exp.sentinelSpoolPurgeFn = client.sentinelSpoolPurgeUnderLock
+		if client.exp.preload() {
+			client.stats.setLastError("experiment_dir_private_failed")
+			client.logf("shardpilot experiments: the state directory could not be made private (0700); persisted experiment state is not loaded and nothing serves from it")
+		}
 		client.expLaneDone = make(chan struct{})
 	}
 

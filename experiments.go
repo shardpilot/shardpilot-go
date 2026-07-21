@@ -1064,10 +1064,14 @@ type experimentsState struct {
 	// "mint_adopted" (between the lazy mint's adoption and its commit
 	// re-check), "settle_entry" (a response settle before its locked
 	// section — via fireConsentRaceSeam, so a test can land a denial that
-	// fully precedes the settle), and "settle_locked" (the settle inside
-	// the locked section, before the under-lock consent read) — so tests
-	// can land a consent flip deterministically inside the race windows
-	// the commit checks close. Never set in production (the
+	// fully precedes the settle), "settle_locked" (the settle inside
+	// the locked section, before the under-lock consent read), and the
+	// emission pair "exposure_enqueue" / "exposure_enqueued" (immediately
+	// before the fact intake's own gate re-check, and immediately after a
+	// successful enqueue before the arm bookkeeping re-locks — the raced
+	// consent refusal and the raced purge-vs-high-water windows) — so
+	// tests can land a consent flip or purge deterministically inside the
+	// race windows the commit checks close. Never set in production (the
 	// consentSlowHalfGate discipline).
 	consentRaceSeam func(stage string)
 
@@ -1095,6 +1099,25 @@ type experimentsState struct {
 	// epoch stamp — the pipeline purge's stamp-aware filters then spare
 	// exactly the post-sentinel facts. nil only in bare test states.
 	factPurgeEpochBumpFn func()
+
+	// sentinelSpoolPurgeFn, wired at construction, runs the DISK-SPOOL leg
+	// of the real-subjects sentinel (Client.sentinelSpoolPurgeUnderLock)
+	// as part of the sentinel's durable commit. Called UNDER e.mu by the
+	// sentinel package, after the fact-epoch bump and BEFORE the record
+	// clear/tombstone, so no crash ordering can leave the assignment
+	// withdrawal durably settled while the withdrawn facts are still armed
+	// for the next launch's spool resend. Same locking contract as
+	// captureOwedDropFn: leaf spool mutex only, integrator dead-letters
+	// deferred. nil only in bare test states (and memory-only clients
+	// no-op inside).
+	sentinelSpoolPurgeFn func()
+
+	// chmodFn is the chmod used when preload establishes the state
+	// directory's privacy (nil never occurs in a constructed state:
+	// newExperimentsState defaults it to os.Chmod, tests inject a failing
+	// one via Config.experimentDirChmodForTests to pin the refused-tighten
+	// fail-closed path).
+	chmodFn func(name string, mode os.FileMode) error
 }
 
 // syncDirLocked is the state's directory-sync primitive (the syncDirFn
@@ -1154,6 +1177,10 @@ func newExperimentsState(cfg Config) *experimentsState {
 		// failing construction.
 		marker = "session-" + strconv.FormatInt(int64(os.Getpid()), 10)
 	}
+	chmod := cfg.experimentDirChmodForTests
+	if chmod == nil {
+		chmod = os.Chmod
+	}
 	return &experimentsState{
 		workspaceID:     cfg.WorkspaceID,
 		appKey:          cfg.AppID,
@@ -1168,6 +1195,7 @@ func newExperimentsState(cfg Config) *experimentsState {
 		exposed:         make(map[string]expExposed),
 		sessionMarker:   marker,
 		settled:         make(map[string]uint64),
+		chmodFn:         chmod,
 	}
 }
 
@@ -1175,9 +1203,37 @@ func newExperimentsState(cfg Config) *experimentsState {
 // after a restart when a stored subject id exists and the record matches
 // this exact scope; their exposures re-arm for this instance and are
 // emitted by the first admitted sweep. No subject id is minted here.
-func (e *experimentsState) preload() {
+// Returns whether the state directory's privacy could not be established —
+// the preload then refused to read anything (the caller diagnoses it).
+func (e *experimentsState) preload() (privacyRefused bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.spoolDir != "" {
+		// The persisted experiment state may be READ — the subject id, the
+		// assignment record, the condemnation tombstone — only through a
+		// directory whose privacy is established, exactly like the spool
+		// and consent-floor startup paths (initSpool's ensurePrivateDir
+		// discipline): with ExperimentsEnabled and a SpoolDir but no
+		// persisted grant, initSpool skips its load path and never runs the
+		// tighten, so without this the preload would be the FIRST touch of
+		// the directory and would seed served variants from files in a
+		// loose (0755, possibly other-user-writable) directory before any
+		// experiment write ran its own tighten. An existing SpoolDir that
+		// cannot be tightened to 0700 fails the preload CLOSED instead:
+		// nothing is read, nothing serves — the on-disk state is left for
+		// a later run with the permissions fixed, matching the spool's
+		// refused-tighten posture.
+		if ensurePrivateDir(e.spoolDir, e.chmodFn) != nil {
+			// Latch the subject as checked-and-absent: the lazy first read
+			// (a later fetch's currentSubjectIDLocked) would otherwise pull
+			// the subject id from the untrusted directory mid-session. A
+			// lazily minted subject still rules this process memory-only —
+			// its persist attempts keep failing closed through the write
+			// path's own tighten.
+			e.subjectChecked = true
+			return true
+		}
+	}
 	if condemned := e.condemnedScopeLocked(); condemned != "" {
 		// A previous process's real-subjects sentinel clear never landed:
 		// the tombstone condemns that scope's record. Refuse to serve it
@@ -1207,6 +1263,7 @@ func (e *experimentsState) preload() {
 			{entry: &entry, session: e.sessionMarker},
 		}
 	}
+	return false
 }
 
 func (e *experimentsState) scopeForLocked(subjectID string) string {
@@ -2053,6 +2110,26 @@ func (e *experimentsState) applySentinelWithdrawalLocked(scope string, resolvedA
 		// moment is stamped past the purge, and the stamp-aware queue,
 		// worker, and spool filters spare exactly those.
 		e.factPurgeEpochBumpFn()
+	}
+	if e.sentinelSpoolPurgeFn != nil {
+		// The DISK-SPOOL leg of the withdrawal runs HERE, under e.mu, as
+		// part of the sentinel's durable commit — after the epoch bump
+		// (the sweep spares current-epoch captures) and BEFORE the record
+		// clear/tombstone below. Off-lock only (the pipeline purge), a
+		// crash after the durable clear or tombstone but before that purge
+		// left the next startup loading the old raw facts with purge epoch
+		// zero — initSpool runs before the experiment preload — and
+		// RESENDING subject-fact keys the durable state says were
+		// withdrawn. removeMatching persists the withdrawal marker before
+		// the mirror forgets anything, so this leg is individually
+		// crash-durable, and the facts-first order keeps every crash point
+		// fail-closed: facts withdrawn with the assignment withdrawal
+		// still unsettled just re-encounter the sentinel at the next
+		// server contact, while the reverse order would let a settled
+		// sentinel resend withdrawn facts. The off-lock pipeline purge
+		// still runs after the install settles (the queue and worker legs'
+		// home); its spool pass then finds nothing new.
+		e.sentinelSpoolPurgeFn()
 	}
 	if e.clearDurableRecordLocked() {
 		e.durablePending = make(map[string]expOwedSync)
@@ -2997,6 +3074,13 @@ func (c *Client) experimentCycle(ctx context.Context) {
 		c.logf("shardpilot experiments: %d owed exposure snapshot(s) dropped (bounded queue overflow) — oldest first", overflowed)
 	}
 	e.retryDurableSync()
+	// The retry sync defers integrator dead-letters under e.mu (a capture
+	// retry's policy refusal, expiry, or eviction): dispatch them THIS
+	// cycle, before the consent gate's early return below — on a quiet
+	// client (no fetch settling, no close) a letter deferred here would
+	// otherwise sit until an unrelated settle or Close fires the next
+	// off-lock drain.
+	c.drainDeferredSpoolLetters()
 	if c.experimentConsentRefusal() != nil {
 		return
 	}

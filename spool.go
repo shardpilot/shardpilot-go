@@ -1833,6 +1833,17 @@ func (c *Client) resendSpooledChunks(deferUntil *time.Time, backoffAttempt *int)
 		if len(chunk) == 0 {
 			return true
 		}
+		if c.spoolResendHandoffSeam != nil {
+			c.spoolResendHandoffSeam(chunk)
+		}
+		// Re-verify the pulled chunk against the current purge state at the
+		// transport handoff: a real-subjects sentinel landing between the
+		// pull and this point condemned members the mirror sweep cannot
+		// reach (see dropWithdrawnSpoolChunkMembers).
+		chunk = c.dropWithdrawnSpoolChunkMembers(chunk)
+		if len(chunk) == 0 {
+			continue
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), c.cfg.HTTPTimeout)
 		result, err := c.publishRequestResult(ctx, spoolChunkRequest(chunk), len(chunk))
 		cancel()
@@ -1908,6 +1919,16 @@ func (c *Client) flushSpooledChunks(ctx context.Context, backoffAttempt *int) er
 		c.drainSpoolCapacityDrops()
 		if len(chunk) == 0 {
 			return firstErr
+		}
+		if c.spoolResendHandoffSeam != nil {
+			c.spoolResendHandoffSeam(chunk)
+		}
+		// The same handoff re-check as the automatic resend path: a
+		// sentinel racing the pulled chunk must not publish withdrawn
+		// facts through the explicit flush either.
+		chunk = c.dropWithdrawnSpoolChunkMembers(chunk)
+		if len(chunk) == 0 {
+			continue
 		}
 		result, err := c.publishRequestResult(ctx, spoolChunkRequest(chunk), len(chunk))
 		if err == nil {

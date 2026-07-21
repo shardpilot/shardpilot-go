@@ -242,18 +242,40 @@ func (c *Client) emitEntryExposure(experimentKey string, entry *expEntry, rearm 
 		c.logf("shardpilot experiments: exposure for experiment %q skipped (%s)", experimentKey, skipCode)
 		return false, skipCode, true
 	}
+	// Seam: the window between this emission's own consent check (above)
+	// and the fact intake's gate re-check — a consent flip landing here is
+	// the raced refusal the intake reports.
+	e.fireConsentRaceSeam("exposure_enqueue")
 	if err := c.enqueueExperimentFact(event, atClose); err != nil {
 		return false, err.Error(), false
 	}
+	// Seam: the window between the successful enqueue and the arm
+	// bookkeeping re-locking below — a purge landing here races the
+	// high-water update.
+	e.fireConsentRaceSeam("exposure_enqueued")
 	if currentSession {
 		e.mu.Lock()
 		if e.purgeEpoch == purgeEpoch {
 			e.exposed[tuple] = next
+		} else {
+			// A purge raced this emission: its drain may have wiped the
+			// queued fact, and its re-arm must stand — the sweep re-emits
+			// the tuple with the SAME deterministic id, so a fact that DID
+			// survive (or had already published) collapses server-side as a
+			// duplicate. The ARM, though, was already handed to the
+			// pipeline with the enqueue above — and the purge kills FACTS,
+			// never the session's id domain (resetExposedKeepArmsLocked) —
+			// so the high-water still records it: skipped, the next
+			// explicit re-arm would recompute the SAME arm, reuse this
+			// emission's deterministic id, and the server's de-dupe would
+			// collapse a REAL new exposure. Only the arm is merged; the
+			// purge's auto slate stands (its re-arm must still emit, so a
+			// wiped queued automatic fact is never marked already-sent).
+			prior, havePrior := e.exposed[tuple]
+			if (havePrior && prior.arm < arm) || (!havePrior && arm > 0) {
+				e.exposed[tuple] = expExposed{arm: arm, auto: havePrior && prior.auto}
+			}
 		}
-		// A purge raced this emission: its drain may have wiped the queued
-		// fact, and its re-arm must stand — the sweep re-emits the tuple
-		// with the SAME deterministic id, so a fact that DID survive (or
-		// had already published) collapses server-side as a duplicate.
 		e.mu.Unlock()
 	}
 	return true, "", false
@@ -440,12 +462,18 @@ func (c *Client) TrackExperimentOutcome(experimentKey, outcomeKey string, outcom
 }
 
 // experimentFactError maps an emit refusal code back to the public error
-// surface.
+// surface. The consent refusals arrive in TWO spellings: the short codes
+// (consentRefusalCode, from the emission's own pre-check) and the sentinel
+// errors' literal strings — a consent flip landing between that pre-check
+// and the fact intake's gate re-check makes the enqueue itself return
+// ErrConsentDenied/ErrConsentUnknown, and the emission reports err.Error()
+// as the code. Both spellings map to the documented consent errors; without
+// the second, the raced refusal surfaced as ErrInvalidExperimentFact.
 func experimentFactError(code string, terminal bool) error {
 	switch code {
-	case "consent_denied":
+	case "consent_denied", ErrConsentDenied.Error():
 		return ErrConsentDenied
-	case "consent_unknown":
+	case "consent_unknown", ErrConsentUnknown.Error():
 		return ErrConsentUnknown
 	}
 	if terminal {
@@ -576,6 +604,68 @@ func (c *Client) purgeWithdrawnExperimentFacts() {
 	// Dead-letters dispatch with no lock held: the callback is integrator
 	// code.
 	c.notifySpoolDeadLetter(SpoolDropTerminal, removedSpooled)
+}
+
+// sentinelSpoolPurgeUnderLock is the disk-spool leg of the real-subjects
+// sentinel, run UNDER e.mu (via sentinelSpoolPurgeFn) as part of the
+// sentinel's DURABLE commit — before the assignment record clear/tombstone
+// lands. removeMatching persists the withdrawal marker BEFORE the mirror
+// forgets the entries, so once the sentinel's decisive durable state is on
+// disk the spool withdrawal provably is too: no crash ordering can leave
+// the next launch — where initSpool runs before the experiment preload and
+// reloads raw facts with purge epoch zero — resending subject-fact keys the
+// durable state says were withdrawn. Lock discipline: the spool's mutex is
+// a leaf (the captureOwedExposuresForDrop precedent), integrator
+// dead-letters are DEFERRED to the next off-lock drain, and the
+// persist-failure diagnostic follows appendCaptureEntries' under-lock
+// precedent. The off-lock purgeWithdrawnExperimentFacts still owns the
+// queue and worker legs; its own spool pass then finds nothing new.
+func (c *Client) sentinelSpoolPurgeUnderLock() {
+	if c.spool == nil {
+		return
+	}
+	removed, persistFailed := c.spool.removeMatching(withdrawnExperimentFactRaw, c.expFactPurgeEpoch.Load())
+	if persistFailed {
+		c.recordSpoolPersistFailure()
+	}
+	c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropTerminal, removed))
+}
+
+// dropWithdrawnSpoolChunkMembers re-verifies a pulled resend chunk against
+// the CURRENT purge state immediately before transport handoff. A pulled
+// chunk is local raw bytes: the sentinel's spool sweep removes withdrawn
+// entries from the MIRROR (and dead-letters them there), but it cannot
+// reach a chunk the worker already pulled — and spooled chunks never pass
+// dropWithdrawnExperimentFacts (that leg filters the worker's held QUEUE
+// batch) — so without this re-check a withdrawn experiment fact pulled
+// before the sentinel landed would still publish after the purge. The
+// predicate is removeMatching's exactly: the fact class on the entry's wire
+// bytes, stamped before the current purge epoch (a post-purge capture is
+// spared; epoch zero means no purge this process and everything passes).
+// Withheld members are NOT acked, requeued, or dead-lettered here — the
+// sweep owns their mirror removal and their exactly-once dead-letter
+// accounting (it has either already removed them or, when this handoff
+// observes the bump before the off-lock sweep runs, is about to); this
+// filter only keeps their bytes off the wire. Pre-handoff filtering is
+// always allowed: wire ambiguity begins strictly at the handoff itself.
+func (c *Client) dropWithdrawnSpoolChunkMembers(chunk []spoolEntry) []spoolEntry {
+	currentEpoch := c.expFactPurgeEpoch.Load()
+	if currentEpoch == 0 {
+		return chunk
+	}
+	kept := chunk[:0]
+	withheld := 0
+	for _, entry := range chunk {
+		if entry.expFactEpoch < currentEpoch && withdrawnExperimentFactRaw(entry.raw) {
+			withheld++
+			continue
+		}
+		kept = append(kept, entry)
+	}
+	if withheld > 0 {
+		c.logf("shardpilot experiments: withheld %d pulled spool member(s) at the transport handoff (withdrawn by the real-subjects sentinel; the purge sweep settles them)", withheld)
+	}
+	return kept
 }
 
 // dropWithdrawnExperimentFacts is the worker-batch leg of the sentinel
