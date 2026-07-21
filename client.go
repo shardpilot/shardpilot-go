@@ -335,6 +335,11 @@ func NewClient(cfg Config) (*Client, error) {
 		client.exp.jitterFn = client.jitterValue
 		client.exp.captureOwedDropFn = client.captureOwedExposuresForDrop
 		client.exp.captureRetryFn = client.appendCaptureEntries
+		// The sentinel bumps the pipeline-fact purge epoch UNDER e.mu,
+		// atomically with its decisive state change, so no post-sentinel
+		// fact can carry a pre-sentinel stamp (the purge filters are
+		// stamp-aware).
+		client.exp.factPurgeEpochBumpFn = func() { client.expFactPurgeEpoch.Add(1) }
 		client.exp.preload()
 		client.expLaneDone = make(chan struct{})
 	}
@@ -1106,6 +1111,19 @@ func (c *Client) dropBatchOnConsentEpoch(batch []Event, seenEpoch *uint64, backo
 func (c *Client) admitReceivedEvent(batch []Event, event Event, seenEpoch *uint64, backoffAttempt *int) []Event {
 	batch = c.dropBatchOnConsentEpoch(batch, seenEpoch, backoffAttempt)
 	if event.intakeConsentEpoch < *seenEpoch {
+		c.stats.dropped.Add(1)
+		return batch
+	}
+	if c.isWithdrawnExperimentFactEvent(event) {
+		// The sentinel-purge twin of the intake-epoch check above: the
+		// purge epoch bumps under e.mu with the sentinel's decisive state
+		// change — BEFORE the purge's queue drain — so a dispatch point can
+		// observe the moved epoch (filtering its held batch and advancing
+		// its seen mark) while withdrawn old-stamp facts still sit in the
+		// queue, and this receive can steal one from the drain. Admitted
+		// blindly it would ride under a matching seen epoch, unfiltered,
+		// carrying a withdrawn subject-fact key onto the wire. Dropped
+		// here, counted exactly once (it escaped the purge's own count).
 		c.stats.dropped.Add(1)
 		return batch
 	}

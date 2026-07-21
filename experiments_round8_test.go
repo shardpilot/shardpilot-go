@@ -14,9 +14,10 @@ package shardpilot
 //     the request at the transport (granted-only plane, forced-minor's
 //     zero-traffic promise) instead of letting it run out its window with
 //     only the settle-time discard.
-//  3. The sentinel's spool sweep cannot withdraw a FRESH post-purge fact:
-//     the sweep runs inside the emitMu window, so nothing born after the
-//     purge can be spool-resident while the epoch-blind raw predicate runs.
+//  3. The sentinel's spool sweep cannot withdraw a FRESH post-sentinel
+//     fact (re-ruled by round 11): the decisive epoch bump lands under
+//     e.mu before the pipeline purge, so a fact born in the gap carries
+//     the post-sentinel stamp and the sweep's epoch guard spares it.
 //  4. A transient park pulls the pre-armed revalidation deadline DOWN, so
 //     the parked batch's failed and skipped keys retry at the pacing
 //     deadline instead of stranding until the full 300s interval.
@@ -29,7 +30,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -305,33 +305,18 @@ func TestSentinelSpoolSweepSparesFreshPostPurgeFacts(t *testing.T) {
 			t.Fatalf("iteration %d: the seed fact must be spool-resident before the purge (err=%v)", i, err)
 		}
 
-		// The competitor models a fresh fact producer: it queues on emitMu
-		// the moment the purge's epoch bump becomes visible (the bump
-		// happens inside the emit window) and reports whether the spool
-		// sweep had ALREADY run when it acquired the window. Inside the
-		// window (the fix) the sweep is always done — nothing born after
-		// the purge can reach the spool ahead of the epoch-blind raw
-		// predicate. Released first (the old shape), the producer can win
-		// the window before the sweep and its freshly spooled fact would
-		// be withdrawn.
-		target := client.expFactPurgeEpoch.Load() + 1
-		sweepDoneAtAcquisition := make(chan bool, 1)
-		go func() {
-			for client.expFactPurgeEpoch.Load() < target {
-				runtime.Gosched()
-			}
-			client.exp.emitMu.Lock()
-			data, readErr := os.ReadFile(spoolPath)
-			client.exp.emitMu.Unlock()
-			sweepDoneAtAcquisition <- readErr == nil && !strings.Contains(string(data), seedID)
-		}()
-		client.purgeWithdrawnExperimentFacts()
-		if !<-sweepDoneAtAcquisition {
-			t.Fatalf("iteration %d: a fact producer acquired the emit window BEFORE the sentinel's spool sweep ran — a fresh post-purge fact could be spooled ahead of the epoch-blind predicate and withdrawn", i)
-		}
+		// Round 11 re-ruled the protection from mutual exclusion to STAMPS:
+		// the sentinel's decisive bump happens under e.mu BEFORE the
+		// pipeline purge even starts, so a fresh fact born anywhere in the
+		// gap — after the sentinel, before (or racing) the purge's spool
+		// sweep — carries the post-sentinel stamp and is spared by the
+		// sweep's epoch guard, while everything stamped before the
+		// sentinel is withdrawn. Model exactly that worst case: the fresh
+		// fact is built and spooled BETWEEN the bump and the sweep.
+		client.exp.mu.Lock()
+		client.exp.factPurgeEpochBumpFn()
+		client.exp.mu.Unlock()
 
-		// And the functional consequence, race-free: a fact born and
-		// spooled after the purge completes must be untouched by it.
 		freshID := fmt.Sprintf("expfact-fresh-%04d", i)
 		freshEvent, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-race", entry, freshID, client.exp.sessionMarker)
 		if skip != "" {
@@ -342,12 +327,20 @@ func TestSentinelSpoolSweepSparesFreshPostPurgeFacts(t *testing.T) {
 			t.Fatalf("iteration %d: buildBatch: %v", i, err)
 		}
 		client.spoolFailedBatch(freshRequest, errors.New("http 500"), false)
+
+		// The pipeline purge sweeps AFTER the gap-born fact reached the
+		// spool: stamp-aware, it withdraws the pre-sentinel seed and
+		// spares the post-sentinel fact.
+		client.purgeWithdrawnExperimentFacts()
 		data, err := os.ReadFile(spoolPath)
 		if err != nil {
 			t.Fatalf("iteration %d: read spool: %v", i, err)
 		}
+		if strings.Contains(string(data), seedID) {
+			t.Fatalf("iteration %d: the pre-sentinel fact must be withdrawn by the sweep, spool: %s", i, data)
+		}
 		if !strings.Contains(string(data), freshID) {
-			t.Fatalf("iteration %d: the fresh post-purge fact must survive, spool: %s", i, data)
+			t.Fatalf("iteration %d: the fresh post-sentinel fact must survive the sweep that follows it, spool: %s", i, data)
 		}
 	}
 }

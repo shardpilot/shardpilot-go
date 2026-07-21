@@ -432,7 +432,12 @@ type expAssignmentWire struct {
 	AppKey         json.RawMessage `json:"app_key"`
 	EnvironmentKey json.RawMessage `json:"environment_key"`
 	ExperimentKey  json.RawMessage `json:"experiment_key"`
-	Version        *int64          `json:"version"`
+	// Version decodes presence-aware too: a bare *int64 receives nil for
+	// BOTH an absent member and an explicit JSON null, and null must not
+	// inherit absent's traffic-gate tolerance on the not-assigned shape —
+	// it is present-non-number, malformed (the fleet's null-presence
+	// ruling).
+	Version        json.RawMessage `json:"version"`
 	Assigned       *bool           `json:"assigned"`
 	AssignmentKey  string          `json:"assignment_key"`
 	VariantKey     string          `json:"variant_key"`
@@ -651,9 +656,22 @@ func parseExperimentVerdict(resp remoteConfigResponse, scope expRequestScope, no
 		!expEchoMatches(wire.ExperimentKey, scope.experimentKey) {
 		return ExperimentAssignmentResult{}, expOutcome{}, false
 	}
+	// Presence-aware version decode, shared by both shapes: absent is nil
+	// raw; PRESENT must be a JSON integer — an explicit null (which a bare
+	// *int64 decode silently collapses into the absent shape), a string, or
+	// a fractional number is not a verdict this contract sends and must not
+	// slip the positivity rule into the authoritative paths (null needs the
+	// pointer decode: unmarshalling null into a bare int64 is a silent
+	// no-op).
+	var version *int64
+	if wire.Version != nil {
+		if json.Unmarshal(wire.Version, &version) != nil || version == nil {
+			return ExperimentAssignmentResult{}, expOutcome{}, false
+		}
+	}
 
 	if *wire.Assigned {
-		if wire.Version == nil || *wire.Version < 1 {
+		if version == nil || *version < 1 {
 			return ExperimentAssignmentResult{}, expOutcome{}, false
 		}
 		assignmentKey := strings.TrimSpace(wire.AssignmentKey)
@@ -682,7 +700,7 @@ func parseExperimentVerdict(resp remoteConfigResponse, scope expRequestScope, no
 			AssignmentKey:  assignmentKey,
 			VariantKey:     variantKey,
 			VariantPayload: deepCopyJSONMap(wire.VariantPayload, 0),
-			Version:        *wire.Version,
+			Version:        *version,
 			AssignmentUnit: assignmentUnit,
 			SubjectFactKey: subjectFactKey,
 			FetchedAtMS:    nowMS,
@@ -691,7 +709,7 @@ func parseExperimentVerdict(resp remoteConfigResponse, scope expRequestScope, no
 			Assigned:       true,
 			VariantKey:     variantKey,
 			VariantPayload: deepCopyJSONMap(wire.VariantPayload, 0),
-			Version:        *wire.Version,
+			Version:        *version,
 			Boundary:       deepCopyJSONMap(wire.Boundary, 0),
 		}, expOutcome{authoritative: true, newEntry: entry}, true
 	}
@@ -716,9 +734,9 @@ func parseExperimentVerdict(resp remoteConfigResponse, scope expRequestScope, no
 		// kill_switch, targeting_unmatched}.
 		return ExperimentAssignmentResult{}, expOutcome{}, false
 	}
-	version := int64(0)
-	if wire.Version != nil {
-		if *wire.Version < 1 {
+	notAssignedVersion := int64(0)
+	if version != nil {
+		if *version < 1 {
 			// The SAME positivity rule the assigned branch enforces
 			// (published versions start at 1): a PRESENT non-positive
 			// version is not a verdict this contract sends — treating
@@ -727,10 +745,13 @@ func parseExperimentVerdict(resp remoteConfigResponse, scope expRequestScope, no
 			// on a malformed body, instead of the malformed_response
 			// transient path that retains and serve-stales the
 			// last-known-good record. Absent stays tolerated (the
-			// traffic-gate shape carries no version).
+			// traffic-gate shape carries no version); an explicit null is
+			// PRESENT and already classified malformed by the
+			// presence-aware decode above, never coerced to this
+			// tolerance.
 			return ExperimentAssignmentResult{}, expOutcome{}, false
 		}
-		version = *wire.Version
+		notAssignedVersion = *version
 	}
 	// Every not-assigned shape drops the cached assignment: the server just
 	// said this subject has no variant NOW, and a kill in particular must
@@ -738,7 +759,7 @@ func parseExperimentVerdict(resp remoteConfigResponse, scope expRequestScope, no
 	return ExperimentAssignmentResult{
 		Assigned: false,
 		Reason:   reason,
-		Version:  version,
+		Version:  notAssignedVersion,
 		Boundary: deepCopyJSONMap(wire.Boundary, 0),
 	}, expOutcome{authoritative: true, dropEntry: true}, true
 }
@@ -1027,13 +1048,15 @@ type experimentsState struct {
 	// tests can drive tick() deterministically. Never set in production.
 	laneParkedForTests bool
 
-	// consentRaceSeam, when set, fires at the two consent commit points —
+	// consentRaceSeam, when set, fires at the consent commit points —
 	// "mint_adopted" (between the lazy mint's adoption and its commit
-	// re-check) and "settle_locked" (a response settle entering the locked
-	// section, before the under-lock consent read) — so tests can land a
-	// consent flip deterministically inside the race window the commit
-	// checks close. Never set in production (the consentSlowHalfGate
-	// discipline).
+	// re-check), "settle_entry" (a response settle before its locked
+	// section — via fireConsentRaceSeam, so a test can land a denial that
+	// fully precedes the settle), and "settle_locked" (the settle inside
+	// the locked section, before the under-lock consent read) — so tests
+	// can land a consent flip deterministically inside the race windows
+	// the commit checks close. Never set in production (the
+	// consentSlowHalfGate discipline).
 	consentRaceSeam func(stage string)
 
 	// failDurableWritesForTests makes every durable save/clear report
@@ -1041,6 +1064,34 @@ type experimentsState struct {
 	// deterministically (the createAnonymousIDWith seam shape). Never set
 	// in production.
 	failDurableWritesForTests bool
+
+	// syncDirFn substitutes the directory-sync primitive (nil = syncDir),
+	// so tests can record and fail parent-directory syncs to pin the
+	// unlink-durability sequences (the spool syncFn seam shape). Never set
+	// in production.
+	syncDirFn func(dir string) error
+
+	// writeSubjectFileForTests substitutes the subject file's atomic write,
+	// so tests can inject partial-durability failures — the rename/link
+	// landed but the parent sync failed. Never set in production.
+	writeSubjectFileForTests func(path string, payload []byte, initialMint bool) error
+
+	// factPurgeEpochBumpFn, wired at construction, bumps the CLIENT's
+	// pipeline-fact purge epoch (Client.expFactPurgeEpoch). Called UNDER
+	// e.mu by the sentinel package, atomically with its decisive state
+	// change, so no fact built after the sentinel can carry a pre-sentinel
+	// epoch stamp — the pipeline purge's stamp-aware filters then spare
+	// exactly the post-sentinel facts. nil only in bare test states.
+	factPurgeEpochBumpFn func()
+}
+
+// syncDirLocked is the state's directory-sync primitive (the syncDirFn
+// seam, defaulting to syncDir).
+func (e *experimentsState) syncDirLocked(dir string) error {
+	if e.syncDirFn != nil {
+		return e.syncDirFn(dir)
+	}
+	return syncDir(dir)
 }
 
 type expOwedExposure struct {
@@ -1210,10 +1261,16 @@ func (e *experimentsState) currentSubjectIDLocked() string {
 // CONVERGES on the winner's id, so two clients racing a shared state dir
 // end on one subject instead of two. A RE-MINT (grammar sentinel, corrupt
 // load) replaces the stored value outright: rotation is the point.
-// ownFile reports whether THIS call published the persisted file — false
-// when the id converged on another process's winner (that file is the
-// winner's property and an undo must never remove it), when the persist
-// failed, or when the client is memory-only.
+// ownFile reports whether THIS mint is RESPONSIBLE for whatever exists at
+// the persisted path — true from the moment this mint's write attempt
+// begins, a FAILED write included: writePrivateFileAtomic can error after
+// its link/rename already published the file (a parent-directory fsync
+// failure), and an undo that trusted the failure report would leave the
+// refused session's freshly minted spcid_ on disk for a later granted
+// session to converge on. ownFile is false only when no write was attempted
+// (memory-only, mint failure) or when the id converged on another process's
+// winner — that pre-existing file is the winner's property and an undo must
+// never remove it.
 func (e *experimentsState) adoptMintedSubjectIDLocked() (subject string, persisted, ownFile bool) {
 	minted, err := mintExperimentSubjectID()
 	if err != nil {
@@ -1235,49 +1292,68 @@ func (e *experimentsState) adoptMintedSubjectIDLocked() (subject string, persist
 	e.subjectChecked = true
 	persisted = true
 	if path := e.subjectFilePath(); path != "" {
-		// The chmod hook tightens a pre-existing loose state dir/file (the
-		// spool's ensurePrivateDir discipline) — the subject id is private
-		// state whatever permissions the directory arrived with.
-		rename := os.Rename
-		if initialMint {
-			// Create-only publish: os.Link fails with EEXIST when another
-			// process won the initial-mint race — converge on its id.
-			rename = func(oldpath, newpath string) error { return os.Link(oldpath, newpath) }
-		}
-		if err := writePrivateFileAtomic(path, []byte(minted+"\n"), rename, os.Chmod); err != nil {
+		// Responsibility attaches BEFORE the write's outcome is known: a
+		// write that reports failure may still have published the file
+		// (rename landed, parent sync failed), and the undo must cover
+		// exactly that residue.
+		ownFile = true
+		if err := e.writeSubjectFileLocked(path, minted, initialMint); err != nil {
 			converged := false
 			if initialMint && errors.Is(err, os.ErrExist) {
 				if winner := e.readSubjectFileLocked(); validExperimentSubjectID(winner) {
 					// Lost the initial publish race to a VALID winner:
 					// converge on its id — one subject rules the shared
-					// state dir.
+					// state dir. The winner's file is NOT this mint's
+					// property (never removed by an undo).
 					e.subjectID = winner
 					return winner, true, false
 				}
 				// The existing file is CORRUPT (this is why the mint ran):
 				// replace it outright — fresh-install semantics must not be
 				// blocked by the garbage they exist to heal.
-				converged = writePrivateFileAtomic(path, []byte(minted+"\n"), os.Rename, os.Chmod) == nil
+				converged = e.writeSubjectFileLocked(path, minted, false) == nil
 			}
 			persisted = converged
 		}
-		ownFile = persisted
 	} else {
 		e.memorySubjectID = minted
 	}
 	return minted, persisted, ownFile
 }
 
+// writeSubjectFileLocked publishes the subject file — create-only (link
+// semantics, EEXIST when another process already published) for the initial
+// mint, replace (rename) otherwise. The chmod hook tightens a pre-existing
+// loose state dir/file (the spool's ensurePrivateDir discipline) — the
+// subject id is private state whatever permissions the directory arrived
+// with. writeSubjectFileForTests substitutes the whole write so tests can
+// inject partial-durability failures (the rename landed, the parent sync
+// did not).
+func (e *experimentsState) writeSubjectFileLocked(path, minted string, initialMint bool) error {
+	if e.writeSubjectFileForTests != nil {
+		return e.writeSubjectFileForTests(path, []byte(minted+"\n"), initialMint)
+	}
+	rename := os.Rename
+	if initialMint {
+		rename = func(oldpath, newpath string) error { return os.Link(oldpath, newpath) }
+	}
+	return writePrivateFileAtomic(path, []byte(minted+"\n"), rename, os.Chmod)
+}
+
 // unadoptFreshMintLocked reverses a lazy mint whose commit-point consent
 // re-check found the plane refused: the adopted id leaves memory, and the
-// persisted file — when THIS call published it — is removed so nothing of
-// the refused-session mint outlives the abort. A converged-on-winner file
-// is another process's pre-existing subject state, not this mint's, and is
-// left in place (the invariant holds vacuously: this process created no
-// durable state). Returns whether a file THIS mint owned could not be
-// removed — the caller surfaces that residual (the file then reads as a
-// pre-existing id a later granted session converges on, exactly like any
-// other process's publish).
+// persisted path — when THIS mint is responsible for it (ownFile: the write
+// ATTEMPT began, whatever it reported; a "failed" write can still have
+// published the file when only the parent sync failed) — is cleared with an
+// ENOENT-tolerant unlink plus a parent-directory sync, so nothing of the
+// refused-session mint outlives the abort DURABLY: an unsynced unlink could
+// resurrect the spcid_ file at the next launch for a later granted session
+// to converge on. A converged-on-winner file is another process's
+// pre-existing subject state, not this mint's, and is left in place (the
+// invariant holds vacuously: this process created no durable state).
+// Returns whether the undo could not be made durable — the caller surfaces
+// that residual (the file then reads as a pre-existing id a later granted
+// session converges on, exactly like any other process's publish).
 func (e *experimentsState) unadoptFreshMintLocked(ownFile bool) bool {
 	e.subjectID = ""
 	e.memorySubjectID = ""
@@ -1285,6 +1361,11 @@ func (e *experimentsState) unadoptFreshMintLocked(ownFile bool) bool {
 	if ownFile {
 		if path := e.subjectFilePath(); path != "" {
 			if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				removeFailed = true
+			} else if e.syncDirLocked(filepath.Dir(path)) != nil {
+				// The unlink (this call's, or the one a failed write never
+				// performed — ENOENT) is durable only once the parent
+				// metadata is synced; a failed sync is a failed undo.
 				removeFailed = true
 			}
 		}
@@ -1347,13 +1428,17 @@ func (e *experimentsState) condemnedScopeLocked() string {
 }
 
 // clearCondemnationTombstoneLocked removes a tombstone naming scope (or any
-// tombstone when scope is ""), reporting whether the spend DURABLY landed
-// (a missing tombstone counts as spent). The unlink is durable only once
-// the parent directory's metadata is synced: a crash after the record save
-// but before a durable unlink would resurrect the tombstone and condemn the
-// FRESH record at the next launch (the tombstone is scope-stamped, and the
-// replacement record usually carries the same scope). A failed spend fails
-// CLOSED — the caller keeps the save owed and retries the pair.
+// tombstone when scope is ""), reporting whether the spend DURABLY landed.
+// The unlink is durable only once the parent directory's metadata is
+// synced: a crash after the record save but before a durable unlink would
+// resurrect the tombstone and condemn the FRESH record at the next launch
+// (the tombstone is scope-stamped, and the replacement record usually
+// carries the same scope). The MISSING-tombstone path syncs too: an absent
+// name is indistinguishable from a PRIOR attempt's unlink whose directory
+// sync never landed — reporting that spend durable without the sync leaves
+// the same resurrection window the fresh-unlink path closes (the
+// recovery-marker missing-file discipline). A failed spend fails CLOSED —
+// the caller keeps the save owed and retries the pair.
 func (e *experimentsState) clearCondemnationTombstoneLocked(scope string) bool {
 	path := e.tombstoneFilePath()
 	if path == "" {
@@ -1362,11 +1447,10 @@ func (e *experimentsState) clearCondemnationTombstoneLocked(scope string) bool {
 	if scope != "" && e.condemnedScopeLocked() != scope {
 		return true
 	}
-	err := os.Remove(path)
-	if err != nil {
-		return errors.Is(err, os.ErrNotExist)
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false
 	}
-	return syncDir(filepath.Dir(path)) == nil
+	return e.syncDirLocked(filepath.Dir(path)) == nil
 }
 
 // loadDurableRecordLocked loads the stored record, or nil when absent or
@@ -1456,20 +1540,20 @@ func (e *experimentsState) clearDurableRecordLocked() bool {
 		e.memoryRecord = nil
 		return true
 	}
-	err := os.Remove(path)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return false
 	}
-	if err == nil {
-		// The unlink is durable only once the parent directory's metadata
-		// is on stable storage: a crash right after a synced-nothing Remove
-		// can resurrect the withdrawn record, serving assignments the
-		// real-subjects sentinel just condemned. A failed sync keeps the
-		// clear OWED (the caller retries), matching the write path's
-		// syncDir discipline.
-		if syncDir(filepath.Dir(path)) != nil {
-			return false
-		}
+	// The unlink is durable only once the parent directory's metadata is on
+	// stable storage: a crash right after a synced-nothing Remove can
+	// resurrect the withdrawn record, serving assignments the real-subjects
+	// sentinel just condemned. The ErrNotExist path syncs too — an absent
+	// name is indistinguishable from a PRIOR unlink (this process's failed
+	// attempt, or a crashed predecessor's) whose directory sync never
+	// landed, and reporting the clear landed without the sync would leave
+	// that same resurrection window. A failed sync keeps the clear OWED
+	// (the caller retries), matching the write path's syncDir discipline.
+	if e.syncDirLocked(filepath.Dir(path)) != nil {
+		return false
 	}
 	// The withdrawn record is gone: any condemnation tombstone is spent —
 	// durably, or the clear stays owed (a resurrected tombstone would
@@ -1725,11 +1809,20 @@ func (e *experimentsState) retryDurableSync() {
 			record := e.loadDurableRecordLocked()
 			switch {
 			case record == nil:
-				// Nothing stored (or unreadable = miss): the withdrawn
-				// record is gone either way.
-				e.durableClearPending = false
-				e.durableClearAsOf = 0
-				e.durableClearScope = ""
+				// Nothing in the NAMESPACE (or unreadable = miss) — but an
+				// absent record is indistinguishable from a prior unlink
+				// whose directory sync failed (exactly how a failed clear
+				// leaves the disk), so absence alone must not settle the
+				// clear: a crash could resurrect the withdrawn record and
+				// serve it at the next launch. Route through the clear —
+				// its missing-file path performs the durable-absence work
+				// (parent sync, tombstone spend) — and settle only when it
+				// reports landed.
+				if e.clearDurableRecordLocked() {
+					e.durableClearPending = false
+					e.durableClearAsOf = 0
+					e.durableClearScope = ""
+				}
 			case e.durableClearScope != "" && record.Scope != e.durableClearScope:
 				// Another scope's write replaced the withdrawn record: the
 				// clear's target no longer exists.
@@ -1906,18 +1999,37 @@ func (e *experimentsState) applySentinelWithdrawalLocked(scope string, resolvedA
 	e.entries = make(map[string]*expEntry)
 	// The sentinel withdraws the assignments AND their subject-fact
 	// keys outright: owed exposure snapshots carry those keys and
-	// go with them. The dedupe slate resets with them — a purged
+	// go with them. The AUTO dedupe slate resets with them — a purged
 	// queued-undelivered automatic exposure must not leave its tuple
 	// marked emitted, or a later authorized re-fetch in this session
 	// would arm a replacement and suppress it as already-sent
-	// (under-counting real treatment). The blanket clear is safe on
-	// both sides of the delivery ambiguity: a fact that HAD
+	// (under-counting real treatment). The blanket auto reset is safe
+	// on both sides of the delivery ambiguity: a fact that HAD
 	// delivered re-derives the SAME deterministic id and collapses
-	// server-side. The purge epoch bump fences emissions already in
-	// flight past their gates, exactly like the consent purge.
-	e.exposed = make(map[string]expExposed)
+	// server-side. The purge kills FACTS, never the session's
+	// id-domain bookkeeping: the highest arm each tuple handed out
+	// stays claimed (resetExposedKeepArmsLocked), so a post-re-enable
+	// explicit re-arm continues from high-water+1 with a DISTINCT
+	// deterministic id instead of reusing an arm a delivered
+	// pre-sentinel fact already spent (which the server would dedupe,
+	// undercounting a real re-exposure). The purge epoch bump fences
+	// emissions already in flight past their gates, exactly like the
+	// consent purge.
+	e.resetExposedKeepArmsLocked()
 	e.purgeEpoch++
 	e.pendingExposure = make(map[string][]*expOwedExposure)
+	if e.factPurgeEpochBumpFn != nil {
+		// The PIPELINE-fact purge epoch bumps here, under e.mu, atomically
+		// with the sentinel's decisive state change — NOT later inside the
+		// off-lock pipeline purge: a fresh authorized fetch can install and
+		// enqueue an exposure in the scheduling window between this lock's
+		// release and that purge taking emitMu, and with a late bump that
+		// post-sentinel fact would carry the pre-sentinel epoch and be
+		// swept as withdrawn. Bumped here, every fact built after this
+		// moment is stamped past the purge, and the stamp-aware queue,
+		// worker, and spool filters spare exactly those.
+		e.factPurgeEpochBumpFn()
+	}
 	if e.clearDurableRecordLocked() {
 		e.durablePending = make(map[string]expOwedSync)
 	} else {
@@ -2129,9 +2241,30 @@ func (e *experimentsState) onAnalyticsPurge() {
 	// re-armed live tuple derives the same id its purged fact carried, so
 	// a wire-ambiguous survivor still collapses server-side.
 	e.pendingExposure = make(map[string][]*expOwedExposure)
-	e.exposed = make(map[string]expExposed)
+	// The purge kills FACTS, never the session's id-domain bookkeeping:
+	// each tuple's highest handed-out arm survives the reset (only the
+	// auto slate re-arms), so a post-re-grant TrackExperimentExposure
+	// continues from high-water+1 with a DISTINCT deterministic id — a
+	// reset-to-zero counter would hand out arm 1 again, colliding with the
+	// pre-denial explicit fact's id, and the server's de-dupe would
+	// undercount a real new re-exposure.
+	e.resetExposedKeepArmsLocked()
 	for key, entry := range e.entries {
 		e.armExposureLocked(key, entry)
+	}
+}
+
+// resetExposedKeepArmsLocked re-arms every tuple's AUTOMATIC emission slot
+// while preserving its arm high-water: purge semantics for the dedup
+// bookkeeping. The arm counter is the session's deterministic-id domain —
+// arms already handed out stay spent forever (their facts may have
+// published), while auto=false makes the next automatic emission (the
+// purge's re-arm, a restore, a fresh install of the same tuple) emit again
+// with its unchanged arm-0 id, collapsing server-side if a survivor already
+// carried it.
+func (e *experimentsState) resetExposedKeepArmsLocked() {
+	for tuple, prior := range e.exposed {
+		e.exposed[tuple] = expExposed{arm: prior.arm, auto: false}
 	}
 }
 
@@ -2141,6 +2274,18 @@ func (e *experimentsState) teardown() {
 	e.mu.Lock()
 	e.tornDown = true
 	e.mu.Unlock()
+}
+
+// fireConsentRaceSeam fires a consent-race test stage from OUTSIDE e.mu
+// (the seam field itself is mu-guarded, so the read synchronizes with the
+// test's under-lock set/clear). Production leaves the seam nil.
+func (e *experimentsState) fireConsentRaceSeam(stage string) {
+	e.mu.Lock()
+	seam := e.consentRaceSeam
+	e.mu.Unlock()
+	if seam != nil {
+		seam(stage)
+	}
 }
 
 // ── revalidation cadence state ──────────────────────────────────────────────
@@ -2286,6 +2431,16 @@ func (c *Client) fetchExperimentAssignment(ctx context.Context, experimentKey st
 		c.lifecycleMu.Unlock()
 		return ExperimentAssignmentResult{}, ErrClosed
 	}
+	// The dispatch-time consent stamp, read under lifecycleMu — the same
+	// lock a denial's fast half takes — so it is exact, exactly like the
+	// event intake's: a fetch admitted here is provably admitted before
+	// any later denial's epoch bump. The settle's commit point compares it
+	// against the then-current epoch, so a deny → re-grant completing
+	// while the response is in flight is caught even though the CURRENT
+	// consent state admits again — a pre-revocation response must not
+	// install constructively across the revoked interval (the event-intake
+	// epoch idiom, applied to fetches).
+	dispatchConsentEpoch := c.consentEpoch.Load()
 	if !isRevalidation {
 		c.trackWG.Add(1)
 		defer c.trackWG.Done()
@@ -2478,21 +2633,23 @@ func (c *Client) fetchExperimentAssignment(ctx context.Context, experimentKey st
 		// stalled 401/403 fails closed (and can never be a sentinel), a
 		// stalled 404 stays permanent, only a stalled 200 is transient.
 	}
-	return c.settleExperimentFetch(ctx, experimentKey, attributes, isRevalidation, seq, scope, authEpoch, normalizedAttributes, resp)
+	return c.settleExperimentFetch(ctx, experimentKey, attributes, isRevalidation, seq, scope, authEpoch, dispatchConsentEpoch, normalizedAttributes, resp)
 }
 
 // settleExperimentFetch is the response half of a fetch: the consent
 // re-check, the pure classification against the CURRENT fenced entry, the
 // grammar-remint path, pacing, the install, and the caller-result guards.
-func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string, attributes map[string]string, isRevalidation bool, seq uint64, scope string, authEpoch uint64, normalizedAttributes []expAttribute, resp remoteConfigResponse) (ExperimentAssignmentResult, error) {
+// A revocation while the request was in flight is decided at the LOCKED
+// commit point, never before it: an early pre-lock return would discard the
+// response wholesale — destructive server verdicts included — so a denial
+// landing with a kill_switch (or permanent-drop, or sentinel) response
+// already in hand would leave the withdrawn assignment cached and re-served
+// after a later re-grant. Every response classifies; the partition below
+// strips the constructive halves and lands the destructive ones, and the
+// caller still receives the refusal.
+func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string, attributes map[string]string, isRevalidation bool, seq uint64, scope string, authEpoch uint64, dispatchConsentEpoch uint64, normalizedAttributes []expAttribute, resp remoteConfigResponse) (ExperimentAssignmentResult, error) {
 	e := c.exp
-	// A revocation while the request was in flight closes the plane.
-	// Nothing installs, nothing paces, nothing re-mints, and the caller
-	// receives the refusal — never a healthy assignment fetched under a
-	// consent that no longer holds.
-	if err := c.experimentConsentRefusal(); err != nil {
-		return ExperimentAssignmentResult{}, err
-	}
+	e.fireConsentRaceSeam("settle_entry")
 
 	nowMS := c.clock.Now().UnixMilli()
 	e.mu.Lock()
@@ -2506,24 +2663,39 @@ func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string
 	if e.consentRaceSeam != nil {
 		e.consentRaceSeam("settle_locked")
 	}
-	// The consent re-check UNDER e.mu, at the commit point: the entry check
-	// above runs before this lock, and a denial completing in the gap —
-	// SetConsentDecision's fast half flips the atomic without e.mu — must
-	// not let a 200 install memory/disk state or arm exposure debt while
-	// the plane is refused; after a re-grant the client would serve an
-	// assignment fetched across the revoked interval. The fleet partition
-	// (defold R22) splits the refused settle instead of discarding it
-	// whole: CONSTRUCTIVE halves — the install, exposure arming, the
-	// grammar re-mint's subject adoption, pacing, a healthy caller result —
-	// are discarded, while DESTRUCTIVE server verdicts from a request
-	// dispatched under grant (an authoritative not-assigned, a permanent
-	// drop, the real-subjects sentinel) still apply to durable state: the
-	// cache is retained across denial by design, so a discarded withdrawal
-	// would re-serve a server-killed assignment at the next re-grant.
+	// The consent check UNDER e.mu, at the commit point — the ONLY consent
+	// gate on the settle path: a denial completing anywhere between this
+	// fetch's admission and this read — SetConsentDecision's fast half
+	// flips the atomic without e.mu — must not let a 200 install
+	// memory/disk state or arm exposure debt for a refused (or
+	// interrupted, below) plane; after a re-grant the client would serve
+	// an assignment fetched across the revoked interval. The fleet
+	// partition (defold R22) splits the refused settle instead of
+	// discarding it whole: CONSTRUCTIVE halves — the install, exposure
+	// arming, the grammar re-mint's subject adoption, pacing, a healthy
+	// caller result — are discarded, while DESTRUCTIVE server verdicts
+	// from a request dispatched under grant (an authoritative
+	// not-assigned, a permanent drop, the real-subjects sentinel) still
+	// apply to durable state: the cache is retained across denial by
+	// design, so a discarded withdrawal would re-serve a server-killed
+	// assignment at the next re-grant.
 	// A flip landing after this read linearizes the settle before the
 	// denial (its e.mu purge queues behind this section) — the response
 	// then predates the revocation.
 	consentRefusal := c.experimentConsentRefusal()
+	if consentRefusal == nil && c.consentEpoch.Load() != dispatchConsentEpoch {
+		// The CURRENT state admits, but the denial generation moved since
+		// this fetch's admission (the epoch was captured under lifecycleMu
+		// — the same lock a denial's fast half takes — so it is exact): a
+		// deny → re-grant completed while the response was in flight. The
+		// response belongs to a consent interval that CLOSED — installing
+		// it would serve an assignment fetched across the revoked interval
+		// — so the settle takes the same partition a still-standing denial
+		// takes, and the caller receives the refusal the interrupting
+		// denial owed it (the mid-flight gate-abort precedent: the refusal
+		// is returned regardless of the current, re-granted state).
+		consentRefusal = ErrConsentDenied
+	}
 	// Classification reads the CURRENT fenced entry, not the one captured
 	// at dispatch: a kill or supersede that resolved while this request was
 	// in flight must not be undone in the RESULT either — a caller must

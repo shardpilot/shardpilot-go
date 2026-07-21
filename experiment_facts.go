@@ -523,21 +523,22 @@ func (c *Client) purgeWithdrawnExperimentFacts() {
 	e := c.exp
 	e.emitMu.Lock()
 	c.lifecycleMu.Lock()
-	// The CLASS predicate suffices here: every queued experiment fact was
-	// built before this purge (fresh facts cannot enqueue while the intake
-	// and emit locks are held), so all of them are withdrawn.
+	// The epoch was already bumped UNDER e.mu, atomically with the
+	// sentinel's decisive state change (applySentinelWithdrawalLocked): a
+	// fresh authorized fetch can install and enqueue an exposure in the
+	// scheduling window between the sentinel releasing e.mu and this purge
+	// taking emitMu, and that post-sentinel fact — stamped with the
+	// already-bumped epoch — must survive this sweep. The queue filter is
+	// therefore STAMP-aware, never class-only: it withdraws exactly the
+	// facts built before the sentinel (old epoch), sparing post-sentinel
+	// ones. The early bump's worker TOCTOU (a dispatch point observing the
+	// new epoch against a filtered batch, then stealing a still-queued
+	// old-epoch fact this filter had not drained yet) is closed at batch
+	// ADMISSION: admitReceivedEvent drops withdrawn facts per event, the
+	// intake-epoch idiom applied to the fact stamp.
 	removedQueued := c.queue.filter(func(event Event) bool {
-		return !isExperimentFactClassEvent(event)
+		return !c.isWithdrawnExperimentFactEvent(event)
 	})
-	// The epoch bumps AFTER the queue drain: bumping first opens a TOCTOU
-	// window where a worker dispatch point observes the new epoch against
-	// an empty batch (advancing its seen mark), then receives a withdrawn
-	// fact the filter had not drained yet — the fact would ride under a
-	// matching seen epoch, unfiltered. Bumped after, any fact a worker
-	// stole from the queue mid-drain was pulled under the OLD epoch: its
-	// next dispatch point observes the move and filters the batch before
-	// any send.
-	c.expFactPurgeEpoch.Add(1)
 	c.lifecycleMu.Unlock()
 	var removedSpooled []spoolEntry
 	persistFailed := false

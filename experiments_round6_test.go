@@ -15,13 +15,19 @@ import (
 
 // ── review round 6 ──────────────────────────────────────────────────────────
 
-// Finding 1 (P1): the purge epoch bumps AFTER the queue drain. Bumping first
-// opens a TOCTOU window: a worker dispatch point observes the new epoch
-// against an empty batch (advancing its seen mark), then receives a
-// withdrawn fact the filter has not drained yet — and ships it under a
-// matching seen epoch. The emulation below reproduces the worker's exact
-// dispatch discipline against the real purge, under -race.
-func TestPurgeEpochBumpsAfterQueueDrain(t *testing.T) {
+// Finding 1 (P1), as re-ruled by review round 11: the purge epoch bumps
+// UNDER e.mu with the sentinel's decisive state change — BEFORE the queue
+// drain — so no post-sentinel fact can carry a pre-sentinel stamp. The
+// worker TOCTOU that the old bump-after-drain ordering guarded against (a
+// dispatch point observes the new epoch against an empty batch, advances
+// its seen mark, then steals a still-queued withdrawn fact the purge's
+// filter has not drained yet) is closed at batch ADMISSION instead:
+// admitReceivedEvent drops withdrawn facts per event, the intake-epoch
+// idiom applied to the fact stamp. The emulation below reproduces the
+// worker's exact dispatch-plus-admission discipline against the real
+// sentinel bump + purge pair, under -race: no withdrawn fact may ever
+// survive in the held batch at a dispatch point.
+func TestWithdrawnFactNeverSurvivesWorkerAdmission(t *testing.T) {
 	script := &expScript{}
 	capture := &expWireCapture{}
 	server := newExperimentServer(t, script, capture)
@@ -38,60 +44,61 @@ func TestPurgeEpochBumpsAfterQueueDrain(t *testing.T) {
 		SubjectFactKey: "sfk1_" + strings.Repeat("a", 64),
 		SubjectKey:     "spcid_" + strings.Repeat("b", 32),
 	}
-	factEvent, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-toctou", entry, "", client.exp.sessionMarker)
-	if skip != "" {
-		t.Fatalf("test setup: fact build refused (%s)", skip)
-	}
 
-	// The closed bug's signature: the worker had ALREADY advanced its seen
-	// mark to the post-purge epoch when it pulled the withdrawn fact from
-	// the queue — no later dispatch point will ever filter it. (A fact
-	// pulled while seen was still pre-purge is either filtered at the next
-	// dispatch or is the documented in-transport residual — dispatched
-	// entirely before the epoch moved.)
 	red := false
 	for i := 0; i < 300 && !red; i++ {
+		// The facts are built BEFORE this iteration's sentinel: their
+		// stamps predate the bump, so every one of them is withdrawn.
+		factEvent, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-toctou", entry, "", client.exp.sessionMarker)
+		if skip != "" {
+			t.Fatalf("test setup: fact build refused (%s)", skip)
+		}
 		// Many queued facts stretch the drain, so the emulator can race it
-		// realistically on both sides of the epoch bump.
+		// realistically on both sides of the sentinel's bump.
 		for n := 0; n < 12; n++ {
 			if !client.queue.enqueue(factEvent) {
 				t.Fatalf("test setup: enqueue refused")
 			}
 		}
-		seen := client.expFactPurgeEpoch.Load()
-		var seenAtPulls []uint64
+		seenConsent := client.consentEpoch.Load()
+		backoff := 0
+		var batch []Event
 		var wg sync.WaitGroup
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			// The settle's sentinel sequence: the decisive bump under
+			// e.mu, then the off-lock pipeline purge.
+			client.exp.mu.Lock()
+			client.exp.factPurgeEpochBumpFn()
+			client.exp.mu.Unlock()
 			client.purgeWithdrawnExperimentFacts()
 		}()
-		// The worker's dispatch discipline: check the epoch (filtering the
-		// held batch when it moved), then receive.
+		// The worker's discipline: a dispatch-point filter, then per-event
+		// ADMISSION — exactly the production receive path.
 		for spins := 0; spins < 20000; spins++ {
-			if epoch := client.expFactPurgeEpoch.Load(); epoch != seen {
-				seen = epoch // dispatch point: (empty) batch filtered
-			}
+			batch = client.dropBatchOnConsentEpoch(batch, &seenConsent, &backoff)
 			select {
 			case ev := <-client.queue.ch:
-				if isExperimentFactClassEvent(ev) {
-					seenAtPulls = append(seenAtPulls, seen)
-				}
+				batch = client.admitReceivedEvent(batch, ev, &seenConsent, &backoff)
 			default:
 			}
 			runtime.Gosched()
 		}
 		wg.Wait()
+		// The final dispatch point before any send.
+		batch = client.dropBatchOnConsentEpoch(batch, &seenConsent, &backoff)
 		final := client.expFactPurgeEpoch.Load()
-		for _, seenAtPull := range seenAtPulls {
-			if seenAtPull == final {
+		for _, ev := range batch {
+			if isExperimentFactClassEvent(ev) && ev.expFactEpoch < final {
 				red = true
 			}
 		}
+		batch = batch[:0]
 		client.queue.drainAll()
 	}
 	if red {
-		t.Fatalf("a withdrawn fact was pulled AFTER the worker observed the post-purge epoch: no dispatch point can ever filter it")
+		t.Fatalf("a withdrawn fact survived in the worker's held batch past a dispatch point: the admission check must drop old-stamp facts a receive steals from the purge's drain")
 	}
 }
 
