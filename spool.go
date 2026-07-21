@@ -1994,7 +1994,18 @@ func (c *Client) spoolCloseRemnant(batch []Event) (gateRefused int, mirrored []s
 	// The remnant spool is a transport handoff too (the spooled envelopes
 	// resend at the next launch): a fact the real-subjects sentinel
 	// withdrew must not ride it. Runs on the worker's stop path, so the
-	// worker-owned filter applies as at any dispatch point.
+	// worker-owned filter applies as at any dispatch point — but that gate
+	// alone only covers the batch the worker HELD: the members just
+	// drained from the queue above never passed the worker's admission,
+	// and with the seen mark already advanced past the sentinel's bump the
+	// gate short-circuits without inspecting them. A pre-sentinel fact
+	// surviving here would be REBUILT under the current request epoch,
+	// bypassing spoolFailedBatch's epoch-mismatch re-filter and landing
+	// its withdrawn subject-fact key durably in the spool — a crash before
+	// the sentinel's spool sweep would resurrect it at the next launch. So
+	// the handoff also checks PER MEMBER below (the admitReceivedEvent
+	// idiom: the fact's own build stamp against the purge state), exactly
+	// like the consent-epoch boundary.
 	var remnantBackoff int
 	remnant = c.dropWithdrawnExperimentFacts(remnant, &remnantBackoff)
 	// The consent-epoch boundary applies at this handoff too: a denial that
@@ -2005,20 +2016,25 @@ func (c *Client) spoolCloseRemnant(batch []Event) (gateRefused int, mirrored []s
 	// legitimately mixes the possibly-stale held batch with post-re-grant
 	// queue events); dropped members count once, exactly like the boundary
 	// drop they missed, and any drop invalidates the retained bytes (they
-	// described the pre-filter held batch).
+	// described the pre-filter held batch). The withdrawn-fact stamp check
+	// rides the same pass, with the same accounting.
 	currentConsentEpoch := c.consentEpoch.Load()
 	keptRemnant := remnant[:0]
-	consentDropped := 0
+	boundaryDropped := 0
 	for _, event := range remnant {
 		if event.intakeConsentEpoch < currentConsentEpoch {
-			consentDropped++
+			boundaryDropped++
+			continue
+		}
+		if c.isWithdrawnExperimentFactEvent(event) {
+			boundaryDropped++
 			continue
 		}
 		keptRemnant = append(keptRemnant, event)
 	}
 	remnant = keptRemnant
-	if consentDropped > 0 {
-		c.stats.dropped.Add(uint64(consentDropped))
+	if boundaryDropped > 0 {
+		c.stats.dropped.Add(uint64(boundaryDropped))
 		c.retainedRequest = batchRequest{}
 	}
 	if len(remnant) == 0 {
