@@ -195,7 +195,7 @@ func TestWithdrawnFilterKeepsRetainedPrefixWithAppendedTail(t *testing.T) {
 		SubjectFactKey: "sfk1_" + strings.Repeat("a", 64),
 		SubjectKey:     "spcid_" + strings.Repeat("b", 32),
 	}
-	factEvent, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-prefix", entry, "", client.exp.sessionMarker)
+	factEvent, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-prefix", entry, "", client.exp.sessionMarker, client.expFactPurgeEpoch.Load())
 	if skip != "" {
 		t.Fatalf("fact build refused (%s)", skip)
 	}

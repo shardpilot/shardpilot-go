@@ -332,7 +332,7 @@ func TestSentinelGapFactSurvivesPipelinePurge(t *testing.T) {
 		}
 
 		// A fact built and queued BEFORE the sentinel: withdrawn.
-		staleEvent, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-gap", entry, "stale-fact", client.exp.sessionMarker)
+		staleEvent, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-gap", entry, "stale-fact", client.exp.sessionMarker, client.expFactPurgeEpoch.Load())
 		if skip != "" {
 			t.Fatalf("stale build refused (%s)", skip)
 		}
@@ -349,7 +349,7 @@ func TestSentinelGapFactSurvivesPipelinePurge(t *testing.T) {
 		// The GAP: a fresh authorized fetch installs and enqueues its
 		// exposure after the sentinel released e.mu but before the purge
 		// takes emitMu. The fact is stamped with the post-sentinel epoch.
-		freshEvent, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-gap", entry, "fresh-fact", client.exp.sessionMarker)
+		freshEvent, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-gap", entry, "fresh-fact", client.exp.sessionMarker, client.expFactPurgeEpoch.Load())
 		if skip != "" {
 			t.Fatalf("fresh build refused (%s)", skip)
 		}
@@ -388,7 +388,7 @@ func TestSentinelGapFactSurvivesPipelinePurge(t *testing.T) {
 			SubjectFactKey: "sfk1_" + strings.Repeat("a", 64),
 			SubjectKey:     "spcid_" + strings.Repeat("b", 32),
 		}
-		staleEvent, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-steal", entry, "stolen-fact", client.exp.sessionMarker)
+		staleEvent, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-steal", entry, "stolen-fact", client.exp.sessionMarker, client.expFactPurgeEpoch.Load())
 		if skip != "" {
 			t.Fatalf("stale build refused (%s)", skip)
 		}

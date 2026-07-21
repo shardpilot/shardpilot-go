@@ -292,7 +292,7 @@ func TestSentinelSpoolSweepSparesFreshPostPurgeFacts(t *testing.T) {
 		// Seed one withdrawn (pre-purge) fact: the observable for WHEN the
 		// sweep ran relative to the emit window's release.
 		seedID := fmt.Sprintf("expfact-seed-%04d", i)
-		seedEvent, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-race", entry, seedID, client.exp.sessionMarker)
+		seedEvent, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-race", entry, seedID, client.exp.sessionMarker, client.expFactPurgeEpoch.Load())
 		if skip != "" {
 			t.Fatalf("iteration %d: seed build refused (%s)", i, skip)
 		}
@@ -318,7 +318,7 @@ func TestSentinelSpoolSweepSparesFreshPostPurgeFacts(t *testing.T) {
 		client.exp.mu.Unlock()
 
 		freshID := fmt.Sprintf("expfact-fresh-%04d", i)
-		freshEvent, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-race", entry, freshID, client.exp.sessionMarker)
+		freshEvent, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-race", entry, freshID, client.exp.sessionMarker, client.expFactPurgeEpoch.Load())
 		if skip != "" {
 			t.Fatalf("iteration %d: fresh build refused (%s)", i, skip)
 		}

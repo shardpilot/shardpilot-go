@@ -452,7 +452,11 @@ func TestWithdrawnMarkerReadBoundScalesWithConfig(t *testing.T) {
 	})
 	t.Run("damaged_marker_fails_closed", func(t *testing.T) {
 		dir := t.TempDir()
-		cfg := Config{SpoolDir: dir, SpoolMaxEvents: 100, SpoolMaxBytes: 1 << 20}
+		// The wipe-rung escalation asserted below is the EXPERIMENTS-ENABLED
+		// posture (round 16 scoped the damaged-marker remedy by the opt-in:
+		// a dark client fails closed within the experiment-fact class
+		// instead — see TestDarkClientDamagedMarkerFailsClosedWithinFactClass).
+		cfg := Config{SpoolDir: dir, SpoolMaxEvents: 100, SpoolMaxBytes: 1 << 20, ExperimentsEnabled: true}
 		s := newDiskSpool(cfg)
 		now := time.Now()
 		entry := spoolEntry{id: "fact-damaged", ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw("fact-damaged")}

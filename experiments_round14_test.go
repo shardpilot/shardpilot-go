@@ -37,7 +37,7 @@ func TestCloseRemnantFiltersFactsDrainedPastSeenEpoch(t *testing.T) {
 		SubjectKey:     "spcid_" + strings.Repeat("b", 32),
 	}
 	// Built BEFORE the sentinel: the fact carries the pre-sentinel stamp.
-	factEvent, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-remnant", entry, "remnant-fact", client.exp.sessionMarker)
+	factEvent, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-remnant", entry, "remnant-fact", client.exp.sessionMarker, client.expFactPurgeEpoch.Load())
 	if skip != "" {
 		t.Fatalf("fact build refused (%s)", skip)
 	}

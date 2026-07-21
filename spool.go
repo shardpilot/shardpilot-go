@@ -209,6 +209,16 @@ type diskSpool struct {
 	maxEvents int
 	maxBytes  int
 
+	// experimentsEnabled mirrors Config.ExperimentsEnabled for the
+	// load-time withdrawal-marker adjudication. The marker itself is
+	// honored flag-independently — a durable purge debt outlives the
+	// opt-in that created it — but a DAMAGED marker's remedy is
+	// flag-scoped: an experiments-enabled client escalates to the
+	// whole-record wipe rung, while a dark client fails closed WITHIN the
+	// experiment-fact class only, keeping the ordinary spool alive (see
+	// load).
+	experimentsEnabled bool
+
 	// withdrawnMarkerOwed reports an unspent withdrawal DEBT: a marker may
 	// be live on disk (the crash protection), or its write may have failed
 	// — the debt arms either way and spends (removing any marker file,
@@ -319,18 +329,19 @@ const spoolSettledMemory = 4096
 
 func newDiskSpool(cfg Config) *diskSpool {
 	s := &diskSpool{
-		dir:          cfg.SpoolDir,
-		maxEvents:    cfg.SpoolMaxEvents,
-		maxBytes:     cfg.SpoolMaxBytes,
-		ids:          make(map[string]struct{}),
-		settledIDs:   make(map[string]struct{}),
-		uncountedIDs: make(map[string]struct{}),
-		actorDigest:  consentActorDigest(cfg),
-		removeFn:     os.Remove,
-		renameFn:     os.Rename,
-		chmodFn:      os.Chmod,
-		markerFn:     createWipeOwedMarker,
-		syncFn:       syncDir,
+		dir:                cfg.SpoolDir,
+		experimentsEnabled: cfg.ExperimentsEnabled,
+		maxEvents:          cfg.SpoolMaxEvents,
+		maxBytes:           cfg.SpoolMaxBytes,
+		ids:                make(map[string]struct{}),
+		settledIDs:         make(map[string]struct{}),
+		uncountedIDs:       make(map[string]struct{}),
+		actorDigest:        consentActorDigest(cfg),
+		removeFn:           os.Remove,
+		renameFn:           os.Rename,
+		chmodFn:            os.Chmod,
+		markerFn:           createWipeOwedMarker,
+		syncFn:             syncDir,
 	}
 	s.owed = wipeOwedMarkerExists(s.dir)
 	return s
@@ -799,8 +810,12 @@ func (s *diskSpool) readRecordEntriesLocked() []spoolEntry {
 // the re-seeded deferral (zero when none), and whether the init rewrite
 // failed.
 type spoolLoadOutcome struct {
-	expired       []spoolEntry
-	evicted       []spoolEntry
+	expired []spoolEntry
+	evicted []spoolEntry
+	// condemned holds experiment-fact-class entries a DARK client dropped
+	// under a damaged withdrawal marker (the class-scoped fail-closed
+	// remedy; see load) — dead-lettered terminal by the caller.
+	condemned     []spoolEntry
 	deferUntil    time.Time
 	persistFailed bool
 }
@@ -831,20 +846,37 @@ func (s *diskSpool) load(now time.Time) spoolLoadOutcome {
 		return outcome
 	}
 	withdrawn, markerDamaged := readWithdrawnMarker(s.dir, s.withdrawnMarkerReadLimit())
+	factClassCondemned := false
 	if markerDamaged {
 		// A PRESENT-but-unusable withdrawal marker (unreadable, over the
 		// bound, corrupt) is a withdrawal whose id set is UNKNOWABLE — it
 		// must never collapse to "absent" and reload withdrawn facts for
-		// resend (the terminal-withdrawal contract is privacy-side).
-		// Fail closed by escalating to the wipe rung: total durable
-		// destruction of the record subsumes the unknowable partial
-		// withdrawal, the owed wipe blocks all disk work until it settles
-		// durably (record first, then both markers, each sync-fenced), and
-		// facts spooled after the settle are FRESH — never condemned by
-		// the stale marker, which the settle removed.
-		s.owed = true
-		_ = s.markerFn(s.dir)
-		return outcome
+		// resend (the terminal-withdrawal contract is privacy-side). The
+		// REMEDY is scoped by the experiments opt-in:
+		//   - ENABLED: fail closed by escalating to the wipe rung — total
+		//     durable destruction of the record subsumes the unknowable
+		//     partial withdrawal, the owed wipe blocks all disk work until
+		//     it settles durably (record first, then both markers, each
+		//     sync-fenced), and facts spooled after the settle are FRESH —
+		//     never condemned by the stale marker, which the settle
+		//     removed.
+		//   - DARK: the marker is an experiment-only artifact, and only
+		//     experiment facts can be the withdrawal's subject — so fail
+		//     closed WITHIN the experiment-fact class instead: every
+		//     fact-class entry is dropped below (a superset of whatever
+		//     the unreadable id set named), the ordinary spool stays alive
+		//     and serving, and the damaged marker stays ON DISK — unspent,
+		//     still owed — for a future experiments-enabled session to
+		//     adjudicate on the wipe rung. Escalating a dark client to the
+		//     whole-record wipe would let an experiment-only persistence
+		//     artifact destroy ordinary analytics durability the dark-off
+		//     guarantee promises to leave untouched.
+		if s.experimentsEnabled {
+			s.owed = true
+			_ = s.markerFn(s.dir)
+			return outcome
+		}
+		factClassCondemned = true
 	}
 	withdrawnIDs := make(map[string]struct{}, len(withdrawn))
 	for _, id := range withdrawn {
@@ -868,6 +900,24 @@ func (s *diskSpool) load(now time.Time) spoolLoadOutcome {
 			// merging save cannot resurrect it; the marker spends when the
 			// rewrite below (or any later one) lands.
 			s.recordSettledLocked(entry.id)
+			continue
+		}
+		if factClassCondemned && withdrawnExperimentFactRaw(entry.raw) {
+			// The dark client's class-scoped fail-closed under a damaged
+			// marker: the marker testified that SOME experiment facts were
+			// withdrawn, and the whole fact class is the smallest knowable
+			// superset of its unreadable id set. Settled so the merging
+			// save cannot resurrect them — with the unbounded owed-id set
+			// backing that exclusion past the bounded settled cache — and
+			// returned for the caller's terminal dead-letter; the damaged
+			// marker itself is deliberately NOT spent (withdrawnMarkerOwed
+			// stays unarmed, so no rewrite removes the file).
+			s.recordSettledLocked(entry.id)
+			if s.withdrawnOwedIDs == nil {
+				s.withdrawnOwedIDs = make(map[string]struct{})
+			}
+			s.withdrawnOwedIDs[entry.id] = struct{}{}
+			outcome.condemned = append(outcome.condemned, entry)
 			continue
 		}
 		if spoolEntryExpired(entry, now) {
@@ -2146,6 +2196,14 @@ func (c *Client) initSpool() []SpoolDeadLetter {
 			}
 			outcome := s.load(c.clock.Now())
 			var letters []SpoolDeadLetter
+			if len(outcome.condemned) > 0 {
+				// The dark client's damaged-marker remedy (see load): the
+				// experiment-fact class fails closed alone, terminal like
+				// every sentinel withdrawal; the ordinary spool loaded and
+				// serves.
+				c.logf("shardpilot spool: dropped %d experiment fact(s) at load — the withdrawal marker is damaged and experiments are disabled, so the unknowable withdrawal fails closed within the experiment-fact class (the marker stays owed for a future experiments-enabled session; ordinary events are untouched)", len(outcome.condemned))
+				letters = append(letters, spoolDeadLetterFrom(SpoolDropTerminal, outcome.condemned))
+			}
 			if len(outcome.expired) > 0 {
 				c.stats.spoolExpired.Add(uint64(len(outcome.expired)))
 				letters = append(letters, spoolDeadLetterFrom(SpoolDropExpired, outcome.expired))

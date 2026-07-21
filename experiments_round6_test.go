@@ -49,7 +49,7 @@ func TestWithdrawnFactNeverSurvivesWorkerAdmission(t *testing.T) {
 	for i := 0; i < 300 && !red; i++ {
 		// The facts are built BEFORE this iteration's sentinel: their
 		// stamps predate the bump, so every one of them is withdrawn.
-		factEvent, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-toctou", entry, "", client.exp.sessionMarker)
+		factEvent, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-toctou", entry, "", client.exp.sessionMarker, client.expFactPurgeEpoch.Load())
 		if skip != "" {
 			t.Fatalf("test setup: fact build refused (%s)", skip)
 		}
@@ -268,7 +268,7 @@ func TestRespoolDropsCountOnce(t *testing.T) {
 		SubjectFactKey: "sfk1_" + strings.Repeat("a", 64),
 		SubjectKey:     "spcid_" + strings.Repeat("b", 32),
 	}
-	factEvent, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-count", entry, "", client.exp.sessionMarker)
+	factEvent, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-count", entry, "", client.exp.sessionMarker, client.expFactPurgeEpoch.Load())
 	if skip != "" {
 		t.Fatalf("test setup: fact build refused (%s)", skip)
 	}

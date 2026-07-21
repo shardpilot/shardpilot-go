@@ -256,6 +256,14 @@ type Client struct {
 	// land against an already-pulled chunk. Test seam; nil in production.
 	spoolResendHandoffSeam func(chunk []spoolEntry)
 
+	// builtBatchHandoffSeam, when non-nil, is invoked with the worker's
+	// batch after buildBatchIsolating and BEFORE the built-batch withdrawal
+	// re-check (dropWithdrawnBuiltBatch) — the window where a real-subjects
+	// sentinel can land between the dispatch-point purge check and the
+	// transport/spool handoff of the built bytes, on the dispatch and flush
+	// paths alike. Test seam; nil in production.
+	builtBatchHandoffSeam func(batch []Event)
+
 	// initialDeferUntil seeds the flush worker's retry-pacing deadline from
 	// the spool's persisted retry_after_until_ms, so server backpressure
 	// captured before a restart still holds automatic publishes for the
@@ -1256,10 +1264,22 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 				}
 				batch = kept
 			}
+			if c.builtBatchHandoffSeam != nil {
+				c.builtBatchHandoffSeam(batch)
+			}
+			if len(batch) > 0 {
+				// The loop-top and pre-build checks and the build do not run
+				// atomically: a sentinel landing between them left
+				// pre-sentinel facts inside the just-built request under a
+				// post-sentinel stamp — re-verify the BUILT pair immediately
+				// before the transport/spool handoff (the same window the
+				// dispatch path closes).
+				request, batch = c.dropWithdrawnBuiltBatch(request, batch, backoffAttempt)
+			}
 			if len(batch) == 0 {
-				// Every member poisoned: nothing is left to publish or
-				// retain. The queue drain below still runs — later enqueued
-				// events are unaffected by the condemned batch.
+				// Every member poisoned or withdrawn: nothing is left to
+				// publish or retain. The queue drain below still runs — later
+				// enqueued events are unaffected by the condemned batch.
 				c.retainedRequest = batchRequest{}
 			} else if result, err := c.publishRequestResult(ctx, request, len(batch)); err != nil {
 				if errors.Is(err, ErrConsentDenied) {
@@ -1388,6 +1408,20 @@ func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, def
 			c.retainedRequest = batchRequest{}
 			return batch[:0]
 		}
+	}
+	if c.builtBatchHandoffSeam != nil {
+		c.builtBatchHandoffSeam(batch)
+	}
+	// The dispatch-point check above and the build do not run atomically: a
+	// sentinel landing between them left pre-sentinel facts inside the
+	// just-built request under a post-sentinel stamp — re-verify the BUILT
+	// pair immediately before the transport/spool handoff.
+	request, batch = c.dropWithdrawnBuiltBatch(request, batch, backoffAttempt)
+	if len(batch) == 0 {
+		// The whole built batch was withdrawn; the retained wire bytes
+		// described it.
+		c.retainedRequest = batchRequest{}
+		return batch[:0]
 	}
 	result, err := c.publishRequestResult(ctx, request, len(batch))
 	c.applyRetryPacing(err, deferUntil, backoffAttempt)

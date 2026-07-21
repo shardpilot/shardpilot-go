@@ -1062,17 +1062,21 @@ type experimentsState struct {
 
 	// consentRaceSeam, when set, fires at the consent commit points —
 	// "mint_adopted" (between the lazy mint's adoption and its commit
-	// re-check), "settle_entry" (a response settle before its locked
-	// section — via fireConsentRaceSeam, so a test can land a denial that
-	// fully precedes the settle), "settle_locked" (the settle inside
-	// the locked section, before the under-lock consent read), and the
+	// re-check), "remint_adopted" (the same window at the grammar
+	// re-mint's adoption), "settle_entry" (a response settle before its
+	// locked section — via fireConsentRaceSeam, so a test can land a
+	// denial that fully precedes the settle), "settle_locked" (the settle
+	// inside the locked section, before the under-lock consent read), the
 	// emission pair "exposure_enqueue" / "exposure_enqueued" (immediately
 	// before the fact intake's own gate re-check, and immediately after a
 	// successful enqueue before the arm bookkeeping re-locks — the raced
-	// consent refusal and the raced purge-vs-high-water windows) — so
-	// tests can land a consent flip or purge deterministically inside the
-	// race windows the commit checks close. Never set in production (the
-	// consentSlowHalfGate discipline).
+	// consent refusal and the raced purge-vs-high-water windows), and the
+	// build pair "exposure_build" / "outcome_build" (between a fact's
+	// (entry, epoch) snapshot leaving e.mu and its builder running — the
+	// raced-sentinel window the snapshot-time epoch stamp closes) — so
+	// tests can land a consent flip, purge, or sentinel deterministically
+	// inside the race windows the commit checks close. Never set in
+	// production (the consentSlowHalfGate discipline).
 	consentRaceSeam func(stage string)
 
 	// failDurableWritesForTests makes every durable save/clear report
@@ -2144,6 +2148,26 @@ func (e *experimentsState) applySentinelWithdrawalLocked(scope string, resolvedA
 		e.durableClearPending = true
 		e.durableClearAsOf = resolvedAtMS
 		e.durableClearScope = scope
+		// The sentinel cancels this scope's FROZEN capture debts even
+		// while the record clear stays owed: a prior kill/not-assigned
+		// drop's durablePending captureFirst payload holds pre-sentinel
+		// exposure envelopes, and the next retryDurableSync runs its
+		// capture retry regardless of the still-failing clear — it would
+		// re-append those withdrawn facts into the spool AFTER the
+		// under-lock sentinel sweep above purged it, and a crash/restart
+		// then reloads them with no in-memory purge epoch and resends
+		// withdrawn subject-fact keys. Only the frozen payloads die (they
+		// carry exactly what the sentinel withdrew — the owed exposure
+		// snapshots died wholesale above for the same reason, silently by
+		// the same precedent); the DROP half of each pair survives, aimed
+		// at the record the owed clear and the tombstone already condemn.
+		for key, pending := range e.durablePending {
+			if pending.scope == scope && pending.captureFirst {
+				pending.captureFirst = false
+				pending.captureEntries = nil
+				e.durablePending[key] = pending
+			}
+		}
 		e.writeCondemnationTombstoneLocked(scope)
 		return true, true
 	}
@@ -2887,19 +2911,79 @@ func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string
 		// per process and retry as a fresh subject — from the revalidation
 		// path too, or a rejected cached subject would never heal until an
 		// explicit host fetch happens to run. A second grammar reject with
-		// a freshly minted id is a bug, never a loop. (Never reached under
-		// a mid-flight revocation: the consent gate above returns first,
-		// and the under-lock re-check gates the constructive re-mint — a
-		// subject adoption — race-free, so no id is minted
-		// post-revocation.) The re-mint honors the SAME
-		// fences as any other outcome — a grammar reject that is fenced
-		// out, stale by epoch, or stale by scope must not rotate the
-		// persisted subject, wipe entries, or consume the one-shot budget:
-		// it falls through and is discarded like the stale outcome it is.
+		// a freshly minted id is a bug, never a loop. The re-mint honors
+		// the SAME fences as any other outcome — a grammar reject that is
+		// fenced out, stale by epoch, or stale by scope must not rotate
+		// the persisted subject, wipe entries, or consume the one-shot
+		// budget: it falls through and is discarded like the stale outcome
+		// it is.
 		if subjectNow := e.currentSubjectIDLocked(); subjectNow != "" && e.scopeForLocked(subjectNow) == scope {
 			if !e.reminted {
 				e.reminted = true
-				_, persisted, _ := e.adoptMintedSubjectIDLocked()
+				// Snapshot the rotation's in-memory casualties BEFORE the
+				// adopt: the settle-time consent read above is not the
+				// commit point — a denial's fast half flips the consent
+				// atomic OUTSIDE e.mu (its e.mu purge only queues BEHIND
+				// this section), so the flip can land between that read
+				// and the persist below, and a refused/forced-minor
+				// session must end with the SAME zero-new-state the
+				// initial lazy mint's commit-point undo guarantees: no
+				// freshly minted spcid_ in memory or on disk, no spent
+				// one-shot budget, no rotation wreckage. The maps are
+				// REPLACED by the adopt (the prior references stay valid
+				// snapshots); durablePending is mutated in place and needs
+				// a copy.
+				priorSubject := e.subjectID
+				priorMemorySubject := e.memorySubjectID
+				priorEntries := e.entries
+				priorLatchRetained := e.latchRetained
+				priorExposed := e.exposed
+				priorPending := make(map[string]expOwedSync, len(e.durablePending))
+				for key, pending := range e.durablePending {
+					priorPending[key] = pending
+				}
+				_, persisted, ownFile := e.adoptMintedSubjectIDLocked()
+				if e.consentRaceSeam != nil {
+					e.consentRaceSeam("remint_adopted")
+				}
+				// COMMIT-POINT double check, after the adopt/persist — the
+				// r11 lazy-mint idiom at the re-mint site: consent moved →
+				// the re-mint aborts whole. The undo covers the persisted
+				// key (unadoptFreshMintLocked's ownFile-responsibility
+				// unlink + parent sync — the minted id must not outlive
+				// the abort durably), the rotation (the prior subject and
+				// the maps the adopt wiped return; the denial's own
+				// contract then governs them, exactly as if no re-mint had
+				// run), and the one-shot budget (a later granted session
+				// must still be able to heal the rejected subject). A flip
+				// landing after THIS read linearizes the re-mint before
+				// the denial, which is the pre-denial-rotation case whose
+				// state the denial retains by design.
+				if refusal := c.experimentConsentRefusal(); refusal != nil {
+					removeFailed := e.unadoptFreshMintLocked(ownFile)
+					e.subjectID = priorSubject
+					e.memorySubjectID = priorMemorySubject
+					e.entries = priorEntries
+					e.latchRetained = priorLatchRetained
+					e.exposed = priorExposed
+					e.durablePending = priorPending
+					e.reminted = false
+					if removeFailed {
+						// Whatever survived the failed unlink — the minted
+						// id, or the OLD (server-rejected) id when the
+						// replace itself never landed — must not let the
+						// next launch preload and serve the old scope's
+						// assignments: condemn that record exactly like
+						// the non-refused failed-persist path below.
+						e.writeCondemnationTombstoneLocked(scope)
+					}
+					e.mu.Unlock()
+					if removeFailed {
+						c.stats.setLastError("experiment_subject_unmint_failed")
+						c.logf("shardpilot experiments: removing the subject id re-minted across a consent revocation failed; the orphaned file reads as a pre-existing id at the next granted session")
+					}
+					return ExperimentAssignmentResult{}, refusal
+				}
 				if !persisted {
 					// The OLD subject file may outlive this process (the
 					// replace failed): durably condemn the OLD scope's

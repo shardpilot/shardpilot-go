@@ -155,12 +155,12 @@ func TestPostPurgeFreshExposureSurvivesFilter(t *testing.T) {
 		SubjectFactKey: "sfk1_" + strings.Repeat("a", 64),
 		SubjectKey:     "spcid_" + strings.Repeat("b", 32),
 	}
-	stale, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-stale", entry, "", client.exp.sessionMarker)
+	stale, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-stale", entry, "", client.exp.sessionMarker, client.expFactPurgeEpoch.Load())
 	if skip != "" {
 		t.Fatalf("test setup: fact build refused (%s)", skip)
 	}
 	client.expFactPurgeEpoch.Add(1) // the sentinel lands
-	fresh, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-fresh", entry, "", client.exp.sessionMarker)
+	fresh, skip := client.buildExperimentFactEvent(experimentExposureName, "exp-fresh", entry, "", client.exp.sessionMarker, client.expFactPurgeEpoch.Load())
 	if skip != "" {
 		t.Fatalf("test setup: fact build refused (%s)", skip)
 	}

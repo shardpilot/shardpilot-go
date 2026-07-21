@@ -120,7 +120,14 @@ func (c *Client) enqueueExperimentFact(event Event, atClose bool) error {
 // enforced here so the raw spcid subject id can never leave the SDK in
 // experiment props. eventID, when non-empty, presets the deterministic
 // exposure id; empty lets the pipeline mint a fresh one (outcomes).
-func (c *Client) buildExperimentFactEvent(name, experimentKey string, entry *expEntry, eventID, sessionID string) (Event, string) {
+// factEpoch is the pipeline purge epoch the CALLER observed UNDER e.mu
+// atomically with the entry snapshot — never loaded here: this builder runs
+// after the snapshot left the lock, and a real-subjects sentinel landing in
+// that gap would stamp a pre-sentinel entry with the post-sentinel epoch,
+// so the purge (blocked on emitMu until the emission completes) would treat
+// the withdrawn fact as fresh and leave its subject-fact key in the
+// queue/spool.
+func (c *Client) buildExperimentFactEvent(name, experimentKey string, entry *expEntry, eventID, sessionID string, factEpoch uint64) (Event, string) {
 	factKey := strings.TrimSpace(entry.SubjectFactKey)
 	if !expSubjectFactKeyPattern.MatchString(factKey) {
 		// The privacy boundary of the fact lane: ONLY a grammar-valid
@@ -163,8 +170,10 @@ func (c *Client) buildExperimentFactEvent(name, experimentKey string, entry *exp
 		omitUserID:     true,
 		sourceOverride: SourceClient,
 		// The purge generation this fact belongs to: a later sentinel
-		// withdraws only facts built BEFORE it.
-		expFactEpoch: c.expFactPurgeEpoch.Load(),
+		// withdraws only facts built BEFORE it. The stamp is the caller's
+		// snapshot-time observation (see the function comment), one atomic
+		// (entry, epoch) pair.
+		expFactEpoch: factEpoch,
 	}, ""
 }
 
@@ -188,7 +197,14 @@ func (c *Client) buildExperimentFactEvent(name, experimentKey string, entry *exp
 // and leaves the owed snapshot its arm 0 — the re-arm buys an EXTRA fact,
 // never the owed one's slot — and the later sweep emits the arm 0 exactly
 // once.
-func (c *Client) emitEntryExposure(experimentKey string, entry *expEntry, rearm bool, sessionMarker string, atClose bool) (ok bool, code string, terminal bool) {
+//
+// factEpoch is the pipeline purge epoch the caller observed UNDER e.mu
+// atomically with its entry snapshot (see buildExperimentFactEvent): the
+// stamp must ride the snapshot, not a later read — a sentinel can land
+// between the caller releasing e.mu and this emission's own lock window,
+// and re-reading here would give the pre-sentinel entry a post-sentinel
+// stamp.
+func (c *Client) emitEntryExposure(experimentKey string, entry *expEntry, rearm bool, sessionMarker string, atClose bool, factEpoch uint64) (ok bool, code string, terminal bool) {
 	if err := c.experimentConsentRefusal(); err != nil {
 		return false, consentRefusalCode(err), false
 	}
@@ -237,7 +253,11 @@ func (c *Client) emitEntryExposure(experimentKey string, entry *expEntry, rearm 
 	e.mu.Unlock()
 
 	eventID := experimentExposureEventID(marker, entry.SubjectKey, experimentKey, entry.Version, arm)
-	event, skipCode := c.buildExperimentFactEvent(experimentExposureName, experimentKey, entry, eventID, marker)
+	// Seam: the window between the caller's (entry, epoch) snapshot leaving
+	// e.mu and the fact build below — a sentinel landing here is exactly the
+	// race the snapshot-time factEpoch stamp closes.
+	e.fireConsentRaceSeam("exposure_build")
+	event, skipCode := c.buildExperimentFactEvent(experimentExposureName, experimentKey, entry, eventID, marker, factEpoch)
 	if skipCode != "" {
 		c.logf("shardpilot experiments: exposure for experiment %q skipped (%s)", experimentKey, skipCode)
 		return false, skipCode, true
@@ -316,10 +336,13 @@ func (c *Client) sweepExperimentExposuresMode(experimentKey string, atClose bool
 		// write. The copies stay a consistent pair; a refresh that lands
 		// mid-emission is tuple-identical by construction (the refresh
 		// gate), so emitting the older copy derives the same deterministic
-		// id and the identity-based removal below is untouched.
+		// id and the identity-based removal below is untouched. The purge
+		// epoch joins the same atomic observation: the fact's stamp must
+		// describe the snapshot, not whatever a later sentinel left.
 		headEntry, headSession := head.entry, head.session
+		headEpoch := c.expFactPurgeEpoch.Load()
 		e.mu.Unlock()
-		ok, _, terminal := c.emitEntryExposure(experimentKey, headEntry, false, headSession, atClose)
+		ok, _, terminal := c.emitEntryExposure(experimentKey, headEntry, false, headSession, atClose, headEpoch)
 		if !ok && !terminal {
 			return
 		}
@@ -390,13 +413,16 @@ func (c *Client) TrackExperimentExposure(experimentKey string) error {
 		e.mu.Unlock()
 		return ErrClosed
 	}
-	// The explicit re-arm targets the LIVE assignment only.
+	// The explicit re-arm targets the LIVE assignment only. The purge
+	// epoch is observed under the same lock hold as the entry — one atomic
+	// (entry, epoch) snapshot for the fact stamp.
 	entry := e.entries[experimentKey]
+	factEpoch := c.expFactPurgeEpoch.Load()
 	e.mu.Unlock()
 	if entry == nil {
 		return ErrExperimentNoAssignment
 	}
-	ok, code, terminal := c.emitEntryExposure(experimentKey, entry, true, "", false)
+	ok, code, terminal := c.emitEntryExposure(experimentKey, entry, true, "", false, factEpoch)
 	if ok {
 		return nil
 	}
@@ -447,12 +473,19 @@ func (c *Client) TrackExperimentOutcome(experimentKey, outcomeKey string, outcom
 	entry := e.entries[experimentKey]
 	// An outcome is measured in THIS session by definition (it has no owed
 	// cross-session machinery): the current marker is its session identity.
+	// The purge epoch joins the same lock hold — one atomic (entry, epoch)
+	// snapshot for the fact stamp.
 	marker := e.sessionMarker
+	factEpoch := c.expFactPurgeEpoch.Load()
 	e.mu.Unlock()
 	if entry == nil {
 		return ErrExperimentNoAssignment
 	}
-	event, skipCode := c.buildExperimentFactEvent(experimentOutcomeName, experimentKey, entry, "", marker)
+	// Seam: the window between the snapshot above leaving e.mu and the fact
+	// build — a sentinel landing here is exactly the race the snapshot-time
+	// factEpoch stamp closes.
+	e.fireConsentRaceSeam("outcome_build")
+	event, skipCode := c.buildExperimentFactEvent(experimentOutcomeName, experimentKey, entry, "", marker, factEpoch)
 	if skipCode != "" {
 		return ErrExperimentFactUnavailable
 	}
@@ -723,6 +756,72 @@ func (c *Client) dropWithdrawnExperimentFacts(batch []Event, backoffAttempt *int
 	return kept
 }
 
+// dropWithdrawnBuiltBatch is the BUILT batch's purge re-check, immediately
+// before the transport/spool handoff on the worker's dispatch and flush
+// paths: the pre-build dispatch check and buildBatchIsolating do not run
+// atomically, so a real-subjects sentinel landing between them leaves
+// pre-sentinel facts inside the just-built request — which the builder
+// stamped with the POST-sentinel epoch (it loads the epoch at build end),
+// so a failed publish would respool the withdrawn facts as fresh
+// (spoolFailedBatch's epoch-mismatch re-filter sees matching epochs and
+// partitionSpoolEligible stamps the entries current, past every later
+// sweep), and a successful publish would send them after withdrawal.
+// Filters the events and the built request BY POSITION with the
+// stamp-aware event predicate — buildBatchIsolating's contract aligns them
+// — so surviving members keep their exact wire bytes and the envelope/raw
+// pairing; a residual misalignment falls back to the two independent
+// filters (the dropWithdrawnExperimentFacts discipline: the raw predicate
+// on the request, with the prefix-reuse builder's per-position id check as
+// the safety net). Dropped members are counted exactly once — they passed
+// the earlier dispatch-point check, and the advanced seen-epoch keeps any
+// later check from recounting. Runs only on the worker goroutine (the
+// seen-epoch field is worker-owned state, exactly like
+// dropWithdrawnExperimentFacts).
+func (c *Client) dropWithdrawnBuiltBatch(request batchRequest, batch []Event, backoffAttempt *int) (batchRequest, []Event) {
+	epoch := c.expFactPurgeEpoch.Load()
+	if epoch == c.workerSeenExpFactPurge {
+		return request, batch
+	}
+	c.workerSeenExpFactPurge = epoch
+	aligned := len(request.Events) == len(batch) && len(request.rawEvents) == len(batch)
+	kept := batch[:0]
+	var keptEnvelopes []eventEnvelope
+	var keptRaws []json.RawMessage
+	if aligned {
+		keptEnvelopes = make([]eventEnvelope, 0, len(request.Events))
+		keptRaws = make([]json.RawMessage, 0, len(request.rawEvents))
+	}
+	removed := 0
+	for i, event := range batch {
+		if isExperimentFactClassEvent(event) && event.expFactEpoch < epoch {
+			removed++
+			continue
+		}
+		kept = append(kept, event)
+		if aligned {
+			keptEnvelopes = append(keptEnvelopes, request.Events[i])
+			keptRaws = append(keptRaws, request.rawEvents[i])
+		}
+	}
+	if removed == 0 {
+		return request, kept
+	}
+	c.stats.dropped.Add(uint64(removed))
+	c.logf("shardpilot experiments: withheld %d built batch member(s) at the transport handoff (withdrawn by the real-subjects sentinel between the dispatch check and the build)", removed)
+	if aligned {
+		request.Events = keptEnvelopes
+		request.rawEvents = keptRaws
+	} else {
+		request, _ = filterWithdrawnFromBatchRequest(request)
+	}
+	if len(kept) == 0 {
+		// The whole built batch was withdrawn: the discarded batch takes
+		// its backoff streak with it (the consent-drop discipline).
+		*backoffAttempt = 0
+	}
+	return request, kept
+}
+
 // filterWithdrawnFromBatchRequest drops withdrawn experiment facts from a
 // built batch request, preserving the surviving members' exact wire bytes
 // and their envelope/raw pairing.
@@ -767,12 +866,16 @@ func (c *Client) captureOwedExposuresForDrop(experimentKey string, owed []*expOw
 		// documented ephemeral posture.
 		return true, nil
 	}
+	// Under e.mu (the caller's hold), so this observation is atomic with
+	// the owed snapshots it stamps — the same (entry, epoch) pairing every
+	// other build site captures at its snapshot point.
+	factEpoch := c.expFactPurgeEpoch.Load()
 	events := make([]Event, 0, len(owed))
 	for _, snapshot := range owed {
 		// The automatic owed emission is arm 0 by definition, and the id is
 		// exactly the one the live sweep would mint for it.
 		eventID := experimentExposureEventID(snapshot.session, snapshot.entry.SubjectKey, experimentKey, snapshot.entry.Version, 0)
-		event, skipCode := c.buildExperimentFactEvent(experimentExposureName, experimentKey, snapshot.entry, eventID, snapshot.session)
+		event, skipCode := c.buildExperimentFactEvent(experimentExposureName, experimentKey, snapshot.entry, eventID, snapshot.session, factEpoch)
 		if skipCode != "" {
 			continue // no server-safe fact exists for this snapshot
 		}
