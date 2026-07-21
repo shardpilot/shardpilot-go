@@ -35,30 +35,14 @@ func (q *boundedQueue) drainAll() int {
 	}
 }
 
-// filter drains the queue and re-enqueues, in order, only the events keep
-// admits; the count removed is returned. The caller must hold the intake
-// lock (lifecycleMu) so no producer interleaves the refill — capacity freed
-// by the drain then always readmits every keeper. A consumer pulling
-// concurrently is harmless: it sees either the pre-filter order or the
-// filtered tail, never a reorder.
-func (q *boundedQueue) filter(keep func(Event) bool) (removed int) {
-	var kept []Event
-	for {
-		select {
-		case event := <-q.ch:
-			if keep(event) {
-				kept = append(kept, event)
-			} else {
-				removed++
-			}
-		default:
-			for _, event := range kept {
-				q.enqueue(event)
-			}
-			return removed
-		}
-	}
-}
+// NOTE: there is deliberately no drain-and-re-enqueue filter on this queue.
+// A filter draining keepers while the worker keeps receiving from q.ch can
+// reorder unrelated events (a later queued event received mid-drain
+// overtakes an earlier keeper still awaiting re-enqueue) — the intake lock
+// only fences PRODUCERS, never the consumer. Selective removal (the
+// sentinel purge) therefore happens per event on the consumer side, where
+// the worker owns the receive: see admitReceivedEvent and the close
+// remnant's per-member check.
 
 func (q *boundedQueue) drainInto(events []Event, limit int) []Event {
 	for len(events) < limit {

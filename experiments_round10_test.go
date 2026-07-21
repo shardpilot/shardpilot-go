@@ -332,7 +332,7 @@ func TestWithdrawnMarkerSpendRequiresDurableUnlink(t *testing.T) {
 		dir := t.TempDir()
 		s := newDiskSpool(Config{SpoolDir: dir, SpoolMaxEvents: 100, SpoolMaxBytes: 1 << 20})
 		now := time.Now()
-		entry := spoolEntry{id: "fact-durable-unlink", ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw("fact-durable-unlink")}
+		entry := spoolEntry{id: "fact-durable-unlink", ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw("fact-durable-unlink"), internalFact: true}
 		if refused, added, _, _, _ := s.append([]spoolEntry{entry}, 0, false, now, func() bool { return true }); refused || len(added) != 1 {
 			t.Fatalf("test setup: append failed")
 		}
@@ -379,7 +379,7 @@ func TestWithdrawnMarkerSpendRequiresDurableUnlink(t *testing.T) {
 		dir := t.TempDir()
 		s := newDiskSpool(Config{SpoolDir: dir, SpoolMaxEvents: 100, SpoolMaxBytes: 1 << 20})
 		now := time.Now()
-		entry := spoolEntry{id: "fact-order", ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw("fact-order")}
+		entry := spoolEntry{id: "fact-order", ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw("fact-order"), internalFact: true}
 		if refused, added, _, _, _ := s.append([]spoolEntry{entry}, 0, false, now, func() bool { return true }); refused || len(added) != 1 {
 			t.Fatalf("test setup: append failed")
 		}
@@ -408,8 +408,8 @@ func TestWithdrawnMarkerReadBoundScalesWithConfig(t *testing.T) {
 		s := newDiskSpool(cfg)
 		now := time.Now()
 		entries := []spoolEntry{
-			{id: "fact-large-0", ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw("fact-large-0")},
-			{id: "fact-large-1", ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw("fact-large-1")},
+			{id: "fact-large-0", ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw("fact-large-0"), internalFact: true},
+			{id: "fact-large-1", ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw("fact-large-1"), internalFact: true},
 		}
 		if refused, added, _, _, _ := s.append(entries, 0, false, now, func() bool { return true }); refused || len(added) != 2 {
 			t.Fatalf("test setup: append failed")
@@ -459,7 +459,7 @@ func TestWithdrawnMarkerReadBoundScalesWithConfig(t *testing.T) {
 		cfg := Config{SpoolDir: dir, SpoolMaxEvents: 100, SpoolMaxBytes: 1 << 20, ExperimentsEnabled: true}
 		s := newDiskSpool(cfg)
 		now := time.Now()
-		entry := spoolEntry{id: "fact-damaged", ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw("fact-damaged")}
+		entry := spoolEntry{id: "fact-damaged", ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw("fact-damaged"), internalFact: true}
 		if refused, added, _, _, _ := s.append([]spoolEntry{entry}, 0, false, now, func() bool { return true }); refused || len(added) != 1 {
 			t.Fatalf("test setup: append failed")
 		}
@@ -486,7 +486,7 @@ func TestWithdrawnMarkerReadBoundScalesWithConfig(t *testing.T) {
 		if _, err := os.Stat(spoolWithdrawnPath(dir)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("the settle must durably remove the damaged marker, stat err=%v", err)
 		}
-		fresh := spoolEntry{id: "fact-fresh", ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw("fact-fresh")}
+		fresh := spoolEntry{id: "fact-fresh", ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw("fact-fresh"), internalFact: true}
 		if refused, added, _, _, _ := restarted.append([]spoolEntry{fresh}, 0, false, now, func() bool { return true }); refused || len(added) != 1 {
 			t.Fatalf("the reopened spool must admit fresh facts (refused=%v added=%d)", refused, len(added))
 		}
@@ -503,7 +503,7 @@ func TestFailedMarkerWriteStillBacksMergeWithFullSet(t *testing.T) {
 	entries := make([]spoolEntry, 0, total)
 	for i := 0; i < total; i++ {
 		id := fmt.Sprintf("fact-%05d", i)
-		entries = append(entries, spoolEntry{id: id, ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw(id)})
+		entries = append(entries, spoolEntry{id: id, ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw(id), internalFact: true})
 	}
 	if refused, added, _, _, _ := s.append(entries, 0, false, now, func() bool { return true }); refused || len(added) != total {
 		t.Fatalf("test setup: append failed (added %d)", len(added))

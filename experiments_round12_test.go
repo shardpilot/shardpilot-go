@@ -162,7 +162,7 @@ func TestPurgeSpendsStaleWithdrawalMarker(t *testing.T) {
 		// A later granted session spools a FRESH fact that legitimately
 		// reuses the id (deterministic event ids recur by design).
 		now := time.Now()
-		fresh := spoolEntry{id: "fact-recur", ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw("fact-recur")}
+		fresh := spoolEntry{id: "fact-recur", ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw("fact-recur"), internalFact: true}
 		if refused, added, _, _, persistFailed := s.append([]spoolEntry{fresh}, 0, false, now, func() bool { return true }); refused || len(added) != 1 || persistFailed {
 			t.Fatalf("the reopened spool must admit and persist the fresh fact (refused=%v added=%d persistFailed=%v)", refused, len(added), persistFailed)
 		}

@@ -112,7 +112,7 @@ func TestSentinelCancelsFrozenCaptureDebts(t *testing.T) {
 
 	// A prior kill drop left a FROZEN captureFirst debt (its spool append
 	// failed at drop time; the payload carries pre-sentinel facts).
-	frozen := spoolEntry{id: "g16-2-frozen", ts: time.Now().UTC().Format(time.RFC3339Nano), raw: round5FactRaw("g16-2-frozen")}
+	frozen := spoolEntry{id: "g16-2-frozen", ts: time.Now().UTC().Format(time.RFC3339Nano), raw: round5FactRaw("g16-2-frozen"), internalFact: true}
 	client.exp.mu.Lock()
 	client.exp.durablePending[scopedIntentKey("g16-2-scope", "exp-frozen")] = expOwedSync{
 		asOf: 1, drop: true, scope: "g16-2-scope", experimentKey: "exp-frozen",

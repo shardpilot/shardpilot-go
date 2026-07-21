@@ -359,16 +359,39 @@ func TestSentinelGapFactSurvivesPipelinePurge(t *testing.T) {
 
 		client.purgeWithdrawnExperimentFacts()
 
-		var survivors []string
+		// Round 17 moved the queue leg entirely to the consumer side: the
+		// purge drains NOTHING (a drain/re-enqueue raced the worker's
+		// receive and could reorder unrelated keepers), so both facts stay
+		// queue-resident...
+		var queued []Event
+		var residents []string
 		for _, event := range drainQueuedEvents(client) {
-			survivors = append(survivors, event.ID)
+			queued = append(queued, event)
+			residents = append(residents, event.ID)
 		}
-		joined := strings.Join(survivors, ",")
+		joined := strings.Join(residents, ",")
+		if !strings.Contains(joined, "stale-fact") || !strings.Contains(joined, "fresh-fact") {
+			t.Fatalf("the purge must not drain the queue (the no-reorder posture); residents: %q", joined)
+		}
+		// ...and the ADMISSION boundary — the queue leg's new home — is
+		// where the stamp decides: the pre-sentinel fact drops, the fresh
+		// gap-born fact (post-sentinel stamp) survives.
+		seenConsent := client.consentEpoch.Load()
+		backoff := 0
+		batch := client.dropBatchOnConsentEpoch(nil, &seenConsent, &backoff)
+		for _, event := range queued {
+			batch = client.admitReceivedEvent(batch, event, &seenConsent, &backoff)
+		}
+		var admitted []string
+		for _, event := range batch {
+			admitted = append(admitted, event.ID)
+		}
+		joined = strings.Join(admitted, ",")
 		if !strings.Contains(joined, "fresh-fact") {
-			t.Fatalf("the class-only queue sweep withdrew a FRESH post-sentinel fact born in the emitMu gap — the filter must compare the per-fact epoch stamp (survivors: %q)", joined)
+			t.Fatalf("a class-only sweep withdrew a FRESH post-sentinel fact born in the emitMu gap — the consumer filter must compare the per-fact epoch stamp (admitted: %q)", joined)
 		}
 		if strings.Contains(joined, "stale-fact") {
-			t.Fatalf("the pre-sentinel fact must be withdrawn (survivors: %q)", joined)
+			t.Fatalf("the pre-sentinel fact must be withdrawn at admission (admitted: %q)", joined)
 		}
 	})
 

@@ -524,11 +524,18 @@ func experimentFactError(code string, terminal bool) error {
 }
 
 // isExperimentFactClassEvent recognizes one of this SDK's own experiment
-// facts carrying a server-minted subject fact key — decided on the
-// TOP-LEVEL event name and the typed assignment_key prop, never substring
-// matching. Host events merely sharing a name are not matched (they cannot
-// carry a grammar-valid sfk1_ assignment key they never had).
+// facts carrying a server-minted subject fact key. The decisive test is the
+// SDK-INTERNAL authorship marker (omitUserID — settable only by the fact
+// builders, never through the public Event surface), so a host-authored
+// event that happens to use the reserved-looking name + sfk1_-shaped
+// assignment_key combination is never matched — the sentinel withdraws this
+// SDK's own facts, not host data that merely resembles them. The name and
+// typed-prop checks stay as the class shape on top of the marker (never
+// substring matching).
 func isExperimentFactClassEvent(event Event) bool {
+	if !event.omitUserID {
+		return false
+	}
 	if event.Name != experimentExposureName && event.Name != experimentOutcomeName {
 		return false
 	}
@@ -545,8 +552,13 @@ func (c *Client) isWithdrawnExperimentFactEvent(event Event) bool {
 	return isExperimentFactClassEvent(event) && event.expFactEpoch < c.expFactPurgeEpoch.Load()
 }
 
-// withdrawnExperimentFactRaw is the same recognition over a spooled
-// envelope's exact wire bytes.
+// withdrawnExperimentFactRaw is the class-SHAPE half of the recognition
+// over a spooled envelope's exact wire bytes. The wire envelope cannot
+// carry the SDK-authorship marker (the ingest contract is a strict
+// allowlist), so every raw-side caller pairs this check with the entry's
+// persisted internalFact flag (spoolEntry.internalFact, stamped from the
+// envelope at spool time and stored in the record) — the shape alone must
+// never condemn a host-authored envelope that resembles a fact.
 func withdrawnExperimentFactRaw(raw json.RawMessage) bool {
 	var wire struct {
 		EventName string `json:"event_name"`
@@ -569,13 +581,19 @@ func withdrawnExperimentFactRaw(raw json.RawMessage) bool {
 // the worker's held batch, the disk spool — must not ship on the next
 // flush. Owed snapshots were discarded by the install under e.mu; this is
 // the rest of the pipeline:
-//   - the queue filters under the intake lock, with emitMu held so an emit
-//     in flight either enqueued before the filter (and is caught) or reads
-//     the already-cleared state after it (and emits nothing);
+//   - QUEUED facts die stamp-fenced at every consumer: admitReceivedEvent
+//     (the worker's receive and the flush drain), the close remnant's
+//     per-member check, and the denial drain — never via a drain/re-enqueue
+//     filter here, which raced the worker's channel receive and could
+//     reorder unrelated keeper events. emitMu is held so an emit in flight
+//     either enqueued a pre-sentinel-stamped fact before this purge (caught
+//     by those stamp fences) or reads the already-cleared state after it
+//     (and emits nothing);
 //   - the worker's held batch filters at its next dispatch point via the
 //     purge epoch (see dropWithdrawnExperimentFacts) — before any send;
-//   - the spool removes matching envelopes and dead-letters them
-//     (SpoolDropTerminal: the server outcome settled them undeliverable).
+//   - the spool removes matching SDK-authored envelopes and dead-letters
+//     them (SpoolDropTerminal: the server outcome settled them
+//     undeliverable).
 //
 // The residual is a fact already handed to the transport when the sentinel
 // landed: indistinguishable from one already delivered — and if that same
@@ -583,24 +601,22 @@ func withdrawnExperimentFactRaw(raw json.RawMessage) bool {
 func (c *Client) purgeWithdrawnExperimentFacts() {
 	e := c.exp
 	e.emitMu.Lock()
-	c.lifecycleMu.Lock()
-	// The epoch was already bumped UNDER e.mu, atomically with the
-	// sentinel's decisive state change (applySentinelWithdrawalLocked): a
-	// fresh authorized fetch can install and enqueue an exposure in the
-	// scheduling window between the sentinel releasing e.mu and this purge
-	// taking emitMu, and that post-sentinel fact — stamped with the
-	// already-bumped epoch — must survive this sweep. The queue filter is
-	// therefore STAMP-aware, never class-only: it withdraws exactly the
-	// facts built before the sentinel (old epoch), sparing post-sentinel
-	// ones. The early bump's worker TOCTOU (a dispatch point observing the
-	// new epoch against a filtered batch, then stealing a still-queued
-	// old-epoch fact this filter had not drained yet) is closed at batch
-	// ADMISSION: admitReceivedEvent drops withdrawn facts per event, the
-	// intake-epoch idiom applied to the fact stamp.
-	removedQueued := c.queue.filter(func(event Event) bool {
-		return !c.isWithdrawnExperimentFactEvent(event)
-	})
-	c.lifecycleMu.Unlock()
+	// The QUEUE leg lives entirely on the consumer side. The epoch was
+	// already bumped UNDER e.mu, atomically with the sentinel's decisive
+	// state change (applySentinelWithdrawalLocked), and every path that
+	// takes an event OUT of the queue is stamp-fenced per event: the
+	// worker's receive and the flush drain through admitReceivedEvent (the
+	// intake-epoch idiom applied to the fact stamp), the close remnant's
+	// per-member check, and the denial drain which drops wholesale — each
+	// withdraws exactly the facts built before the sentinel (old epoch),
+	// sparing post-sentinel ones, counted exactly once at the point that
+	// drops them. A drain/re-enqueue filter here (the old shape) held
+	// already-drained keepers out of the channel while the worker could
+	// still receive a LATER queued event, reordering unrelated host events
+	// that merely shared the queue with a purge — so no queue drain runs
+	// at all: withdrawn facts still queue-resident simply die at the next
+	// consumer touch, and they can never egress (admission, dispatch,
+	// built-batch, and spool-handoff re-checks are all stamp-aware).
 	var removedSpooled []spoolEntry
 	persistFailed := false
 	if c.spool != nil {
@@ -625,14 +641,11 @@ func (c *Client) purgeWithdrawnExperimentFacts() {
 		removedSpooled, persistFailed = c.spool.removeMatching(withdrawnExperimentFactRaw, c.expFactPurgeEpoch.Load())
 	}
 	e.emitMu.Unlock()
-	if removedQueued > 0 {
-		c.stats.dropped.Add(uint64(removedQueued))
-	}
 	if persistFailed {
 		c.recordSpoolPersistFailure()
 	}
-	if removedQueued > 0 || len(removedSpooled) > 0 {
-		c.logf("shardpilot experiments: withdrew %d queued and %d spooled experiment fact(s) with the real-subjects sentinel (their subject fact keys must not ship)", removedQueued, len(removedSpooled))
+	if len(removedSpooled) > 0 {
+		c.logf("shardpilot experiments: withdrew %d spooled experiment fact(s) with the real-subjects sentinel (their subject fact keys must not ship; queue-resident facts die stamp-fenced at the next consumer touch)", len(removedSpooled))
 	}
 	// Dead-letters dispatch with no lock held: the callback is integrator
 	// code.
@@ -672,9 +685,10 @@ func (c *Client) sentinelSpoolPurgeUnderLock() {
 // dropWithdrawnExperimentFacts (that leg filters the worker's held QUEUE
 // batch) — so without this re-check a withdrawn experiment fact pulled
 // before the sentinel landed would still publish after the purge. The
-// predicate is removeMatching's exactly: the fact class on the entry's wire
-// bytes, stamped before the current purge epoch (a post-purge capture is
-// spared; epoch zero means no purge this process and everything passes).
+// predicate is removeMatching's exactly: the SDK-authorship flag AND the
+// fact class on the entry's wire bytes, stamped before the current purge
+// epoch (a post-purge capture is spared; epoch zero means no purge this
+// process and everything passes).
 // Withheld members are NOT acked, requeued, or dead-lettered here — the
 // sweep owns their mirror removal and their exactly-once dead-letter
 // accounting (it has either already removed them or, when this handoff
@@ -689,7 +703,7 @@ func (c *Client) dropWithdrawnSpoolChunkMembers(chunk []spoolEntry) []spoolEntry
 	kept := chunk[:0]
 	withheld := 0
 	for _, entry := range chunk {
-		if entry.expFactEpoch < currentEpoch && withdrawnExperimentFactRaw(entry.raw) {
+		if entry.internalFact && entry.expFactEpoch < currentEpoch && withdrawnExperimentFactRaw(entry.raw) {
 			withheld++
 			continue
 		}
@@ -824,7 +838,10 @@ func (c *Client) dropWithdrawnBuiltBatch(request batchRequest, batch []Event, ba
 
 // filterWithdrawnFromBatchRequest drops withdrawn experiment facts from a
 // built batch request, preserving the surviving members' exact wire bytes
-// and their envelope/raw pairing.
+// and their envelope/raw pairing. The typed envelope rides alongside the
+// raw bytes here, so the SDK-authorship marker (internalIdentityFact) joins
+// the raw-shape check: a host-authored member that merely resembles a fact
+// is never withdrawn.
 func filterWithdrawnFromBatchRequest(request batchRequest) (batchRequest, int) {
 	if len(request.Events) == 0 || len(request.Events) != len(request.rawEvents) {
 		return request, 0
@@ -833,7 +850,7 @@ func filterWithdrawnFromBatchRequest(request batchRequest) (batchRequest, int) {
 	envelopes := make([]eventEnvelope, 0, len(request.Events))
 	raws := make([]json.RawMessage, 0, len(request.rawEvents))
 	for i, raw := range request.rawEvents {
-		if withdrawnExperimentFactRaw(raw) {
+		if request.Events[i].internalIdentityFact && withdrawnExperimentFactRaw(raw) {
 			removed++
 			continue
 		}

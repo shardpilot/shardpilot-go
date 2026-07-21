@@ -2537,6 +2537,21 @@ func (e *experimentsState) paceTransientLocked(nowMS int64, retryAfterSeconds in
 	}
 	e.backoffAttempt++
 	if e.backoffAttempt < 2 {
+		// The first transient is free for the backoff LADDER (transport
+		// parity: no deferral fence arms, the streak only starts counting) —
+		// but never free for the armed CADENCE: the due cycle arms the next
+		// 300s interval BEFORE dispatching its batch, so returning here left
+		// that pre-armed deadline standing and the FIRST outage probe waited
+		// out the full interval instead of entering the documented base
+		// backoff — a brief blip delayed kill-switch and republish
+		// convergence by up to five minutes. Pull the armed deadline DOWN to
+		// the base delay — pull-down only, the defold-canon rule: an unarmed
+		// cadence stays unarmed (nothing cached is waiting to probe), and a
+		// deadline already sooner stands.
+		deadline := nowMS + int64(expBackoffBaseSeconds)*1000
+		if e.revalidateAtMS > 0 && e.revalidateAtMS > deadline {
+			e.revalidateAtMS = deadline
+		}
 		return
 	}
 	exp := e.backoffAttempt - 2

@@ -80,7 +80,7 @@ func TestFailedWithdrawalMarkerSpendKeepsSaveDirty(t *testing.T) {
 	dir := t.TempDir()
 	s := newDiskSpool(Config{SpoolDir: dir, SpoolMaxEvents: 100, SpoolMaxBytes: 1 << 20})
 	now := time.Now()
-	entry := spoolEntry{id: "fact-marker", ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw("fact-marker")}
+	entry := spoolEntry{id: "fact-marker", ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw("fact-marker"), internalFact: true}
 	if refused, added, _, _, _ := s.append([]spoolEntry{entry}, 0, false, now, func() bool { return true }); refused || len(added) != 1 {
 		t.Fatalf("test setup: append failed")
 	}
@@ -156,8 +156,8 @@ func TestSentinelSweepSparesEpochStampedCapture(t *testing.T) {
 	dir := t.TempDir()
 	s := newDiskSpool(Config{SpoolDir: dir, SpoolMaxEvents: 100, SpoolMaxBytes: 1 << 20})
 	now := time.Now()
-	stale := spoolEntry{id: "fact-stale", ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw("fact-stale"), expFactEpoch: 1}
-	fresh := spoolEntry{id: "fact-fresh", ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw("fact-fresh"), expFactEpoch: 2}
+	stale := spoolEntry{id: "fact-stale", ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw("fact-stale"), expFactEpoch: 1, internalFact: true}
+	fresh := spoolEntry{id: "fact-fresh", ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw("fact-fresh"), expFactEpoch: 2, internalFact: true}
 	if refused, added, _, _, _ := s.append([]spoolEntry{stale, fresh}, 0, false, now, func() bool { return true }); refused || len(added) != 2 {
 		t.Fatalf("test setup: append failed")
 	}
@@ -389,7 +389,7 @@ func TestWithdrawalMergeExcludesBeyondSettledMemory(t *testing.T) {
 	entries := make([]spoolEntry, 0, total)
 	for i := 0; i < total; i++ {
 		id := fmt.Sprintf("fact-%05d", i)
-		entries = append(entries, spoolEntry{id: id, ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw(id)})
+		entries = append(entries, spoolEntry{id: id, ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw(id), internalFact: true})
 	}
 	if refused, added, _, _, _ := s.append(entries, 0, false, now, func() bool { return true }); refused || len(added) != total {
 		t.Fatalf("test setup: append failed (added %d)", len(added))

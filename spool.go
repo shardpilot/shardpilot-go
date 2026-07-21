@@ -84,7 +84,7 @@ type SpoolDeadLetter struct {
 
 const (
 	spoolFileName      = "spool.json"
-	spoolRecordVersion = 1
+	spoolRecordVersion = 2
 
 	// spoolRetryAgeCap bounds how long an undelivered event may wait in the
 	// spool, mirroring the crash-plane retention contract; age derives from
@@ -149,10 +149,25 @@ var errSpoolRecordOversized = errors.New("spool record exceeds the bounded read 
 // spoolRecordWire is the spool.json payload. Events hold the exact
 // wire-serialized envelope bytes; retry_after_until_ms carries a live server
 // Retry-After deadline captured when a batch was spooled under one.
+// Version 2 wraps each event in spoolEventWire — the exact envelope bytes
+// plus SDK-side metadata that must survive a restart but can never ride the
+// wire envelope itself (the ingest contract is a strict allowlist): the
+// SDK-authorship marker the sentinel's spool predicates require. Version 1
+// records (bare raw arrays) fail the version gate at load and start clean —
+// the pre-release breaking-format posture.
 type spoolRecordWire struct {
-	Version           int               `json:"version"`
-	Events            []json.RawMessage `json:"events"`
-	RetryAfterUntilMS int64             `json:"retry_after_until_ms,omitempty"`
+	Version           int              `json:"version"`
+	Events            []spoolEventWire `json:"events"`
+	RetryAfterUntilMS int64            `json:"retry_after_until_ms,omitempty"`
+}
+
+// spoolEventWire is one persisted spool entry: the envelope's exact wire
+// bytes (joined verbatim on resend — byte identity is the de-dupe contract)
+// and the internal experiment-fact flag, so a reloaded record can tell this
+// SDK's own facts from host events that merely resemble them.
+type spoolEventWire struct {
+	Raw          json.RawMessage `json:"raw"`
+	InternalFact bool            `json:"internal_fact,omitempty"`
 }
 
 // spoolEnvelopeWire is the minimal per-envelope parse a loaded record needs:
@@ -178,6 +193,14 @@ type spoolEntry struct {
 	// and an epoch-blind raw predicate would withdraw that current-epoch
 	// fact.
 	expFactEpoch uint64
+
+	// internalFact marks an entry whose envelope this SDK authored as one
+	// of its own experiment facts (envelope.internalIdentityFact, persisted
+	// through the record as spoolEventWire.InternalFact): the sentinel's
+	// spool predicates require it, so a host-authored envelope that merely
+	// resembles a fact — the reserved-looking name + sfk1_-shaped
+	// assignment_key — is never withdrawn, class-condemned, or withheld.
+	internalFact bool
 }
 
 // spoolEntryExpired applies the retry-age cap: expired when the event_ts is
@@ -465,11 +488,11 @@ func (s *diskSpool) saveLocked() error {
 	}
 	record := spoolRecordWire{
 		Version:           spoolRecordVersion,
-		Events:            make([]json.RawMessage, 0, len(merged)),
+		Events:            make([]spoolEventWire, 0, len(merged)),
 		RetryAfterUntilMS: s.retryAfterUntilMS,
 	}
 	for _, entry := range merged {
-		record.Events = append(record.Events, entry.raw)
+		record.Events = append(record.Events, spoolEventWire{Raw: entry.raw, InternalFact: entry.internalFact})
 	}
 	payload, err := json.Marshal(record)
 	if err == nil {
@@ -773,11 +796,13 @@ func (s *diskSpool) readRecordBytesLocked() ([]byte, error) {
 	}
 	defer file.Close()
 	// The framing allowance scales with the EVENT cap as well: past ~64k
-	// retained envelopes the array separators alone outgrow the fixed
+	// retained envelopes the per-event framing alone outgrows the fixed
 	// overhead, and a self-written cap-full record must never read back as
-	// oversized. Four bytes per allowed event covers the separator with
-	// room to spare.
-	limit := int64(s.maxBytes) + spoolRecordReadOverhead + 4*int64(s.maxEvents)
+	// oversized. Forty bytes per allowed event covers the version-2
+	// spoolEventWire wrapper ({"raw":...} plus the optional internal-fact
+	// flag, worst case 29 bytes) and the array separator with room to
+	// spare.
+	limit := int64(s.maxBytes) + spoolRecordReadOverhead + 40*int64(s.maxEvents)
 	data, err := io.ReadAll(io.LimitReader(file, limit+1))
 	if err != nil {
 		return nil, err
@@ -794,14 +819,14 @@ func (s *diskSpool) readRecordEntriesLocked() []spoolEntry {
 		return nil
 	}
 	var record spoolRecordWire
-	if json.Unmarshal(data, &record) != nil {
+	if json.Unmarshal(data, &record) != nil || record.Version != spoolRecordVersion {
 		return nil
 	}
 	entries := make([]spoolEntry, 0, len(record.Events))
-	for _, raw := range record.Events {
+	for _, wire := range record.Events {
 		var envelope spoolEnvelopeWire
-		_ = json.Unmarshal(raw, &envelope)
-		entries = append(entries, spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: raw})
+		_ = json.Unmarshal(wire.Raw, &envelope)
+		entries = append(entries, spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: wire.Raw, internalFact: wire.InternalFact})
 	}
 	return entries
 }
@@ -889,10 +914,10 @@ func (s *diskSpool) load(now time.Time) spoolLoadOutcome {
 		// withdrawnOwedIDs).
 		s.withdrawnOwedIDs = withdrawnIDs
 	}
-	for _, raw := range record.Events {
+	for _, wire := range record.Events {
 		var envelope spoolEnvelopeWire
-		_ = json.Unmarshal(raw, &envelope)
-		entry := spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: raw}
+		_ = json.Unmarshal(wire.Raw, &envelope)
+		entry := spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: wire.Raw, internalFact: wire.InternalFact}
 		if _, isWithdrawn := withdrawnIDs[entry.id]; isWithdrawn {
 			// A previous process withdrew this envelope (the real-subjects
 			// sentinel) but exited before the clean rewrite landed: honor
@@ -902,7 +927,7 @@ func (s *diskSpool) load(now time.Time) spoolLoadOutcome {
 			s.recordSettledLocked(entry.id)
 			continue
 		}
-		if factClassCondemned && withdrawnExperimentFactRaw(entry.raw) {
+		if factClassCondemned && entry.internalFact && withdrawnExperimentFactRaw(entry.raw) {
 			// The dark client's class-scoped fail-closed under a damaged
 			// marker: the marker testified that SOME experiment facts were
 			// withdrawn, and the whole fact class is the smallest knowable
@@ -1168,7 +1193,10 @@ func (s *diskSpool) removeMatching(matches func(raw json.RawMessage) bool, curre
 			// is never withdrawn by the purge that predates it.
 			continue
 		}
-		if matches(entry.raw) {
+		if entry.internalFact && matches(entry.raw) {
+			// The SDK-authorship flag joins the raw-shape match: only this
+			// SDK's own facts are ever withdrawn — a host-authored envelope
+			// that resembles one is never condemned by the sentinel.
 			removed = append(removed, entry)
 			removedIDs[entry.id] = struct{}{}
 		}
@@ -1431,7 +1459,7 @@ func spoolEntriesFromRequest(request batchRequest) []spoolEntry {
 	}
 	entries := make([]spoolEntry, 0, len(request.Events))
 	for i, envelope := range request.Events {
-		entries = append(entries, spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: request.rawEvents[i]})
+		entries = append(entries, spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: request.rawEvents[i], internalFact: envelope.internalIdentityFact})
 	}
 	return entries
 }
@@ -1565,7 +1593,7 @@ func (c *Client) partitionSpoolEligible(request batchRequest) (eligible, refused
 	for i, envelope := range request.Events {
 		// The request's purge-epoch stamp rides each entry: the sentinel's
 		// spool sweep spares entries born at its own epoch.
-		entry := spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: request.rawEvents[i], expFactEpoch: request.expPurgeEpoch}
+		entry := spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: request.rawEvents[i], expFactEpoch: request.expPurgeEpoch, internalFact: envelope.internalIdentityFact}
 		if c.spoolActorEligible(envelope) {
 			eligible = append(eligible, entry)
 		} else {
