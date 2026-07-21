@@ -2156,6 +2156,29 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 		// everything else) is excluded: the fleet contract pins the latch
 		// invariant in both directions — a stray 409 neither latches nor
 		// unlatches.
+		if e.authBlocked {
+			// The unlatch RESTORES the retained assignments, not just the
+			// flag: the latch cleared e.entries while deliberately
+			// retaining the assignments (durably, mirrored in
+			// latchRetained), and an unlatch driven by ONE experiment's
+			// fetch must not strand the others — unserved by the getters
+			// and invisible to the revalidation lane (which iterates
+			// entries) until a process restart. The mirror restores with
+			// its ORIGINAL entries — stamps, attributes, and fences
+			// untouched (no disk writes: the record already holds them; no
+			// stamp raises: nothing was superseded) — and this fetch's own
+			// outcome then applies on top: a fresh install replaces its
+			// key, a drop removes it. Owed exposures were never touched by
+			// the latch, so nothing re-arms here — restoring an entry is
+			// not a new application (the R12 grant-moment re-arms belong
+			// to the consent purge alone).
+			for key, entry := range e.latchRetained {
+				if e.entries[key] == nil {
+					e.entries[key] = entry
+				}
+			}
+			e.latchRetained = make(map[string]*expEntry)
+		}
 		e.authBlocked = false
 	}
 	if outcome.transient {
