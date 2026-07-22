@@ -16,7 +16,9 @@ import (
 // the exact identity `dump_syms` emits for ELF, so a crash joins `elf` symbols
 // uploaded under that id) and falling back to the SHA-256 of the Go build id note
 // (also lowercase hex; reproducible from the shipped binary via
-// `go tool buildid <binary> | sha256sum`). Both renderings are deliberately
+// `printf %s "$(go tool buildid <binary>)" | sha256sum` — printf %s, because
+// piping `go tool buildid` straight into sha256sum would hash its trailing
+// newline, which the note bytes do not carry). Both renderings are deliberately
 // hex-only: the raw Go build id is a '/'-separated string that path-shaped PII
 // scrubbers (the SDK's own and the ingest server's) would mangle, which would
 // invalidate the module and drop the whole crash.

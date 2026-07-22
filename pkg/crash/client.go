@@ -58,8 +58,10 @@ type ClientOptions struct {
 	// executable's base name plus a debug_id read from the binary itself — the ELF
 	// GNU build-id as lowercase hex (the identity `dump_syms` emits for ELF, so
 	// the crash joins symbols uploaded under that id), falling back to the
-	// lowercase-hex SHA-256 of the Go build id (`go tool buildid <binary> |
-	// sha256sum`) when no GNU note is present (the default Go linker emits none).
+	// lowercase-hex SHA-256 of the Go build id when no GNU note is present (the
+	// default Go linker emits none) — reproducible from the shipped binary via
+	// `printf %s "$(go tool buildid <binary>)" | sha256sum` (printf %s, so the
+	// tool's trailing newline is not hashed).
 	// The identity is resolved ONCE at NewClient; on a non-ELF platform or an
 	// unreadable binary the fill is skipped and capture proceeds unchanged.
 	// Manual Emit/EmitFatal events are never touched — their modules stay

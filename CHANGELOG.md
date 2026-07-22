@@ -9,7 +9,7 @@
   - `ClientOptions.DebugIDFillEnabled` — the running binary's self-module on every
     auto-captured event: executable base name + `debug_id` self-read from the binary (ELF GNU
     build-id as lowercase hex, else lowercase-hex SHA-256 of the Go build id — both scrubber-
-    safe renderings; `go tool buildid <binary> | sha256sum` reproduces the fallback), resolved
+    safe renderings; `printf %s "$(go tool buildid <binary>)" | sha256sum` reproduces the fallback), resolved
     once at `NewClient`, fail-open on non-ELF/unreadable binaries, `load_address` pinned to the
     schema-required `0x0` placeholder (frames stay function-only).
   - `ClientOptions.AllGoroutineCaptureEnabled` — all-goroutine snapshot at panic time
