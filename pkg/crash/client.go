@@ -32,6 +32,12 @@ type Client struct {
 	maxAttempts  int
 	retryBackoff time.Duration
 	onResult     func(Result)
+	// selfModule is the running binary's identity, resolved ONCE at NewClient when
+	// DebugIDFillEnabled is on (nil when the flag is off OR the binary is
+	// unreadable), so the panic path does no file I/O.
+	selfModule *Module
+	// allGoroutines mirrors AllGoroutineCaptureEnabled.
+	allGoroutines bool
 }
 
 type ClientOptions struct {
@@ -46,12 +52,44 @@ type ClientOptions struct {
 	// Source is the component slug stamped on every event that doesn't set
 	// its own: which repo/service in a multi-component product this crash came from
 	// (e.g. main-server, game-server). Optional.
-	Source       string
-	HTTPClient   *http.Client
-	Logger       Logger
-	Sampler      Sampler
-	MaxAttempts  int
-	RetryBackoff time.Duration
+	Source string
+	// DebugIDFillEnabled opts auto-capture (Recover/CapturePanic) into attaching
+	// the RUNNING BINARY's identity as the event's single modules[] entry: the
+	// executable's base name plus a debug_id read from the binary itself — the ELF
+	// GNU build-id as lowercase hex (the identity `dump_syms` emits for ELF, so
+	// the crash joins symbols uploaded under that id), falling back to the
+	// lowercase-hex SHA-256 of the Go build id when no GNU note is present (the
+	// default Go linker emits none) — reproducible from the shipped binary via
+	// `printf %s "$(go tool buildid <binary>)" | sha256sum` (printf %s, so the
+	// tool's trailing newline is not hashed).
+	// The identity is resolved ONCE at NewClient; on a non-ELF platform or an
+	// unreadable binary the fill is skipped and capture proceeds unchanged.
+	// Manual Emit/EmitFatal events are never touched — their modules stay
+	// caller-owned.
+	//
+	// Default false — DARK (ADR-0297 §7d): while off, zero self-read code paths
+	// execute and the auto-captured wire shape stays byte-identical to the
+	// pre-fill SDK. Phase-D arming order (§12): enable only after the SDK's
+	// client-side consent gate and durable spool have landed — new capture detail
+	// must not ship ahead of consent parity.
+	DebugIDFillEnabled bool
+	// AllGoroutineCaptureEnabled opts auto-capture into snapshotting EVERY
+	// goroutine at panic time (runtime.Stack all): the other goroutines ship as
+	// additional pre-symbolicated threads[] beside the precise crashed thread,
+	// each named by its goroutine id with the scheduler state (e.g. "chan
+	// receive") as the thread name. Bounded by the event's caps — 64 threads and
+	// 256 total frames, in dump order, at most 16 frames per non-crashing
+	// goroutine.
+	//
+	// Default false — DARK (ADR-0297 §7d): while off, the dump is never taken and
+	// the auto-captured wire shape stays byte-identical. Same Phase-D arming
+	// order as DebugIDFillEnabled (§12): consent gate + durable spool first.
+	AllGoroutineCaptureEnabled bool
+	HTTPClient                 *http.Client
+	Logger                     Logger
+	Sampler                    Sampler
+	MaxAttempts                int
+	RetryBackoff               time.Duration
 	// OnResult, when set, is called after each successful ingest with the server's
 	// Result (whether the crash was suppressed, plus any warnings). It runs on the
 	// calling goroutine — including the auto-capture path during a panic — so keep it
@@ -127,6 +165,16 @@ func NewClient(opts ClientOptions) (*Client, error) {
 	if retryBackoff <= 0 {
 		retryBackoff = defaultRetryBackoff
 	}
+	var selfModule *Module
+	if opts.DebugIDFillEnabled {
+		if m, ok := readSelfModule(); ok {
+			selfModule = &m
+		} else if opts.Logger != nil {
+			// Fail open: an unreadable binary must not fail client construction or
+			// capture — the event just ships without a self-module, as before.
+			opts.Logger.Printf("shardpilot crash: debug-id fill enabled but the running binary's identity is unreadable; capturing without a self-module")
+		}
+	}
 
 	return &Client{
 		ingestURL: ingestURL,
@@ -136,14 +184,16 @@ func NewClient(opts ClientOptions) (*Client, error) {
 			Version: strings.TrimSpace(opts.App.Version),
 			BuildID: strings.TrimSpace(opts.App.BuildID),
 		},
-		source:       strings.TrimSpace(opts.Source),
-		httpClient:   httpClient,
-		logger:       opts.Logger,
-		sampler:      sampler,
-		breadcrumbs:  newBreadcrumbRing(),
-		maxAttempts:  maxAttempts,
-		retryBackoff: retryBackoff,
-		onResult:     opts.OnResult,
+		source:        strings.TrimSpace(opts.Source),
+		httpClient:    httpClient,
+		logger:        opts.Logger,
+		sampler:       sampler,
+		breadcrumbs:   newBreadcrumbRing(),
+		maxAttempts:   maxAttempts,
+		retryBackoff:  retryBackoff,
+		onResult:      opts.OnResult,
+		selfModule:    selfModule,
+		allGoroutines: opts.AllGoroutineCaptureEnabled,
 	}, nil
 }
 

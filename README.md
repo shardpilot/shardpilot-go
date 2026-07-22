@@ -142,6 +142,11 @@ func handleRequest(ctx context.Context) {
 
 Captured frames are **pre-symbolicated** from the Go runtime (package-qualified function, file, line — no native modules or addresses, accepted by the crash ingest API). `App` fields and `Source` are stamped onto every event that doesn't set its own; a per-event value always wins.
 
+Two **default-off** capture opt-ins extend automatic capture (both dark by default — while off, zero new code paths execute and the captured wire shape is byte-identical; the ShardPilot platform's crash-v2 rollout gates enabling them on the SDK's client-side consent gate and durable crash spool landing first):
+
+- `DebugIDFillEnabled` attaches the **running binary's identity** as the event's single `modules[]` entry: the executable's base name plus a `debug_id` read from the binary itself — the ELF GNU build-id as lowercase hex (the identity `dump_syms` emits, so the crash joins symbols uploaded under that id), falling back to the lowercase-hex SHA-256 of the Go build id (reproducible from the shipped binary: `printf %s "$(go tool buildid <binary>)" | sha256sum`) when no GNU note is present (the default Go linker emits none). Resolved once at `NewClient` (no file I/O on the panic path); on a non-ELF platform or an unreadable binary the fill is skipped and capture proceeds unchanged. Manual `Emit`/`EmitFatal` events are never touched. The module's `load_address` is the schema-required placeholder `0x0` — captured frames stay function-only, so nothing is ever resolved against it.
+- `AllGoroutineCaptureEnabled` snapshots **every goroutine** at panic time (`runtime.Stack` all) and ships the other goroutines as additional pre-symbolicated `threads[]` beside the precise crashed thread, each named by goroutine id with the scheduler state (e.g. `chan receive, 3 minutes`) as the thread name and its leading runtime park frames trimmed. Bounded by the event caps — 64 threads and 256 total frames, in dump order, at most 16 frames per non-crashing goroutine — and everything passes the same PII scrub as every other frame.
+
 ## Configuration
 
 `shardpilot.Config` fields:
@@ -176,7 +181,7 @@ Captured frames are **pre-symbolicated** from the Go runtime (package-qualified 
 
 The example programs read these from `SHARDPILOT_*` environment variables; the SDK itself reads no environment variables.
 
-Crash client (`crash.ClientOptions`): `IngestURL` (crash ingest base URL), `APIKey` (needs `crash:write`), plus optional `App` (`AppInfo{ID,Version,BuildID}` — defaulted onto every event; **required for automatic panic capture**, and `App.ID` must equal the API key's app scope), `Source` (component slug), `HTTPClient`, `Logger`, `Sampler`, `MaxAttempts` (default 2), `RetryBackoff` (default 50ms). Default HTTP timeout is 30s.
+Crash client (`crash.ClientOptions`): `IngestURL` (crash ingest base URL), `APIKey` (needs `crash:write`), plus optional `App` (`AppInfo{ID,Version,BuildID}` — defaulted onto every event; **required for automatic panic capture**, and `App.ID` must equal the API key's app scope), `Source` (component slug), `DebugIDFillEnabled` (default `false` — dark; self-module debug-id fill, see "Automatic panic capture"), `AllGoroutineCaptureEnabled` (default `false` — dark; all-goroutine threads at panic time, same section), `HTTPClient`, `Logger`, `Sampler`, `MaxAttempts` (default 2), `RetryBackoff` (default 50ms). Default HTTP timeout is 30s.
 
 ## Wire contract
 
