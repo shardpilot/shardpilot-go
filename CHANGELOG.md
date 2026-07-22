@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Dark Phase-D crash-capture opt-ins in `pkg/crash` (ADR-0297 §7d; both default `false` —
+  while off zero new code paths execute and the auto-captured wire shape is byte-identical;
+  enabling is gated by the platform's Phase-D arming order on the SDK's consent gate + durable
+  crash spool landing first):
+  - `ClientOptions.DebugIDFillEnabled` — the running binary's self-module on every
+    auto-captured event: executable base name + `debug_id` self-read from the binary (ELF GNU
+    build-id as lowercase hex, else lowercase-hex SHA-256 of the Go build id — both scrubber-
+    safe renderings; `go tool buildid <binary> | sha256sum` reproduces the fallback), resolved
+    once at `NewClient`, fail-open on non-ELF/unreadable binaries, `load_address` pinned to the
+    schema-required `0x0` placeholder (frames stay function-only).
+  - `ClientOptions.AllGoroutineCaptureEnabled` — all-goroutine snapshot at panic time
+    (`runtime.Stack` all) parsed into additional pre-symbolicated `threads[]` (id
+    `goroutine-<n>`, scheduler state as the thread name, leading runtime park frames trimmed,
+    created-by spawn site kept) beside the precise crashed thread, bounded by the event caps
+    (64 threads / 256 total frames, ≤16 frames per non-crashing goroutine).
 - Dark opt-in experiment-assignment consumer (`Config.ExperimentsEnabled`, default `false` —
   while off ZERO experiment code paths execute and nothing new touches the wire or the disk;
   ADR-0259 SDK leg, defold#35 canonical semantics ported to Go idiom):
