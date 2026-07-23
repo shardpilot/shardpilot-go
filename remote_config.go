@@ -107,6 +107,15 @@ type rcCache struct {
 	ETag        string `json:"etag"`
 	Body        string `json:"body"`
 	FetchedAtMS int64  `json:"fetched_at_ms"`
+	// The ADR-0310 attribute signature of the fetch that produced this
+	// record ("" = attribute-less, which every pre-ADR-0310 durable record
+	// unmarshals to). The ETag revalidates ONLY against a fetch carrying
+	// the SAME signature: a shared publication validator must never 304 a
+	// differently-targeted request into serving the previous target's body.
+	// Value SERVING stays scope-keyed regardless of signature (the
+	// documented v1 limit — a cached body may reflect the previously sent
+	// attribute set until the next successful fetch).
+	AttributeSignature string `json:"attribute_signature,omitempty"`
 }
 
 // remoteConfigState is the per-client remote-config machinery: the held
@@ -752,6 +761,35 @@ func rcFetchError(code string) error {
 	return fmt.Errorf("shardpilot remote config fetch failed: %s", code)
 }
 
+// SetRemoteConfigAttributes replaces the client's targeting attribute set
+// for the ADR-0310 remote-config attribute pass-through (nil or empty
+// clears). Inert while Config.RemoteConfigAttributesEnabled is false: the
+// call returns without retaining anything — the dark posture stores zero
+// bytes of the personal-data-shaped input, not just "never sends it". With
+// the opt-in on, attributes ride a fetch ONLY while consent is
+// ConsentGranted — the gate is read at dispatch time, per fetch, so a
+// consent downgrade makes the very next fetch attribute-less. Values are
+// stored raw and normalized at fetch time against the experiment attribute
+// vocabulary (out-of-vocabulary keys are dropped; bounds and ordering per
+// normalizeExperimentAttributes). A no-op when the remote-config fetch is
+// not configured.
+func (c *Client) SetRemoteConfigAttributes(attributes map[string]string) {
+	rc := c.rc
+	if rc == nil || !c.cfg.RemoteConfigAttributesEnabled {
+		return
+	}
+	var copied map[string]string
+	if len(attributes) > 0 {
+		copied = make(map[string]string, len(attributes))
+		for name, value := range attributes {
+			copied[name] = value
+		}
+	}
+	rc.mu.Lock()
+	rc.attributes = copied
+	rc.mu.Unlock()
+}
+
 // FetchRemoteConfig performs one explicit remote-config fetch and blocks for
 // its outcome. A nil error means the caller has usable values — fresh
 // (FromCache=false), revalidated, or served from the last-known-good cache
@@ -772,32 +810,6 @@ func rcFetchError(code string) error {
 // legal; an older response never overwrites a newer settled outcome. Fetches
 // are fenced by the client lifecycle exactly like synchronous Track
 // publishes: a fetch that begins after Close is rejected with ErrClosed, and
-// SetRemoteConfigAttributes replaces the client's targeting attribute set
-// for the ADR-0310 remote-config attribute pass-through (nil or empty
-// clears). Inert unless Config.RemoteConfigAttributesEnabled is true; even
-// then, attributes ride a fetch ONLY while consent is ConsentGranted —
-// evaluated per fetch, so a consent downgrade makes the very next fetch
-// attribute-less. Values are stored raw and normalized at fetch time against
-// the experiment attribute vocabulary (out-of-vocabulary keys are dropped;
-// bounds and ordering per normalizeExperimentAttributes). A no-op when the
-// remote-config fetch is not configured.
-func (c *Client) SetRemoteConfigAttributes(attributes map[string]string) {
-	rc := c.rc
-	if rc == nil {
-		return
-	}
-	var copied map[string]string
-	if len(attributes) > 0 {
-		copied = make(map[string]string, len(attributes))
-		for name, value := range attributes {
-			copied[name] = value
-		}
-	}
-	rc.mu.Lock()
-	rc.attributes = copied
-	rc.mu.Unlock()
-}
-
 // Close waits (bounded by its own context) for in-flight fetches to settle,
 // so no fetch I/O or durable cache write is still running when Close returns.
 func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, error) {
@@ -853,8 +865,10 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 		return result, nil
 	}
 	etag := ""
+	cacheSignature := ""
 	if cache != nil {
 		etag = cache.ETag
+		cacheSignature = cache.AttributeSignature
 	}
 	fetchURL := rc.fetchURL
 	apiKey := rc.apiKey
@@ -867,22 +881,45 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 	}
 	rc.mu.Unlock()
 
-	// ADR-0310 attribute pass-through: opt-in AND ConsentGranted, evaluated
-	// per fetch. Deliberately STRICTER than this SDK's open-under-unknown
-	// event posture — unknown consent (and both denied states) keeps the
-	// fetch byte-identical to the attribute-less URL, and the fetch itself
-	// still happens (config delivery stays consent-neutral).
-	if len(storedAttributes) > 0 && c.Consent() == ConsentGranted {
+	// ADR-0310 attribute pass-through: opt-in AND ConsentGranted. The URL is
+	// PREPARED here but the consent gate is read at the LAST moment before
+	// dispatch (below), so a downgrade landing while the fetch is being
+	// prepared still strips the attributes; one landing after dispatch
+	// cannot recall a request already on the wire — the very next fetch is
+	// attribute-less. Deliberately STRICTER than this SDK's
+	// open-under-unknown event posture: unknown consent (and both denied
+	// states) keeps the fetch byte-identical to the attribute-less URL, and
+	// the fetch itself still happens (config delivery stays
+	// consent-neutral).
+	attributedURL := ""
+	attributedSignature := ""
+	if len(storedAttributes) > 0 {
 		if pairs, _ := normalizeExperimentAttributes(storedAttributes); len(pairs) > 0 {
-			fetchURL = appendRemoteConfigAttributes(fetchURL, pairs)
+			attributedURL = appendRemoteConfigAttributes(fetchURL, pairs)
+			attributedSignature = strings.TrimPrefix(attributedURL, fetchURL)
 		}
 	}
 
 	callerCtx := ctx
 	ctx, cancel := contextWithDefaultTimeout(ctx, c.cfg.HTTPTimeout)
 	defer cancel()
+	// The last-moment consent read: the decision and the dispatch are
+	// adjacent, with no work between them a downgrade could hide behind.
+	requestURL := fetchURL
+	usedSignature := ""
+	if attributedURL != "" && c.Consent() == ConsentGranted {
+		requestURL = attributedURL
+		usedSignature = attributedSignature
+	}
+	// The cached ETag revalidates only a SAME-SIGNATURE request: a 304
+	// against a differently-attributed URL could otherwise serve the
+	// previous target's body as "current" under a shared publication
+	// validator. A signature change forces a full fetch instead.
+	if cache != nil && cacheSignature != usedSignature {
+		etag = ""
+	}
 	resp, err := c.transport.FetchRemoteConfig(ctx, remoteConfigRequest{
-		url:         fetchURL,
+		url:         requestURL,
 		bearer:      apiKey,
 		ifNoneMatch: etag,
 	})
@@ -916,6 +953,12 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 
 	now := c.clock.Now()
 	result, newCache, authoritative, revalidated, failure := applyRemoteConfig(cache, resp, now.UnixMilli())
+	if newCache != nil {
+		// A fresh 200 record carries the signature of the fetch that
+		// produced it (a 304-revalidated record keeps its own — the ETag
+		// only rode a same-signature request).
+		newCache.AttributeSignature = usedSignature
+	}
 
 	rc.mu.Lock()
 	if resp.status == 429 && seq > rc.settled[rc.scope] {

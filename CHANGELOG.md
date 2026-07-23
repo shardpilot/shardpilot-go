@@ -83,8 +83,14 @@
     and serves the untargeted defaults. Deliberately STRICTER than this SDK's
     open-under-unknown analytics posture: "unknown = zero bytes of personal data" holds on
     this leg. A consent downgrade strips attributes from the very next fetch.
-  - Last-known-good caching unchanged and scope-keyed; a cached body may reflect the
-    previously sent attribute set until the next successful fetch (documented v1 limit).
+  - Last-known-good caching stays scope-keyed for value serving (a cached body may reflect
+    the previously sent attribute set until the next successful fetch — documented v1
+    limit), and the cached ETag revalidates ONLY a fetch carrying the SAME attribute
+    signature — a signature change (opt-in, set change, consent downgrade) forces a full
+    fetch so a shared publication validator can never 304 a differently-targeted request
+    into the previous target's body. The setter is inert at the MEMORY level while the
+    opt-in is off (nothing is retained), and the consent gate is read at the last moment
+    before dispatch.
 - Opt-in client-side consent floor (`Config.ConsentFloor`), adopting the engine SDKs'
   consent-first contract for integrations that need client-side enforcement (per the
   sdk-stability-1.0 disposition: user-facing adopters bound by the DPIA condition opt in;

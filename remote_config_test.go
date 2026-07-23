@@ -1877,6 +1877,119 @@ func TestRemoteConfigAttributePassThroughConsentGate(t *testing.T) {
 	granted.Close(context.Background())
 }
 
+// TestSetRemoteConfigAttributesInertWhileDark pins the dark posture at the
+// MEMORY level, not just the wire: while the opt-in is off the setter
+// retains nothing — an opt-out integration defensively calling it leaves
+// zero bytes of the personal-data-shaped input in SDK state.
+func TestSetRemoteConfigAttributesInertWhileDark(t *testing.T) {
+	client, err := NewClient(Config{
+		IngestURL:       "https://ingest.example.test",
+		Token:           "test-token",
+		WorkspaceID:     "workspace-test",
+		AppID:           "app-test",
+		EnvironmentID:   "develop",
+		Source:          SourceBackend,
+		AnonymousID:     "anon-attr-dark",
+		APIKey:          "test-rc-key",
+		RemoteConfigURL: "https://cfg.example.test",
+		FlushInterval:   time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close(context.Background())
+	client.SetRemoteConfigAttributes(map[string]string{"geo": "US"})
+	client.rc.mu.Lock()
+	retained := client.rc.attributes
+	client.rc.mu.Unlock()
+	if retained != nil {
+		t.Fatalf("dark setter must retain nothing, got %v", retained)
+	}
+}
+
+// TestRemoteConfigAttributeSignatureKeysRevalidation pins the ADR-0310
+// ETag/attribute interplay: the cached ETag revalidates ONLY a fetch
+// carrying the SAME attribute signature. A signature change (attribute-less
+// -> attributed, attributed -> different set, attributed -> downgraded)
+// forces a full fetch with no If-None-Match, so a shared publication
+// validator can never 304 a differently-targeted request into serving the
+// previous target's body; a same-signature refetch keeps revalidating.
+func TestRemoteConfigAttributeSignatureKeysRevalidation(t *testing.T) {
+	type probe struct {
+		query       string
+		ifNoneMatch string
+	}
+	seen := make(chan probe, 8)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/config/v1/") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		seen <- probe{query: r.URL.RawQuery, ifNoneMatch: r.Header.Get("If-None-Match")}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("ETag", `"shared-validator"`)
+		_, _ = w.Write([]byte(`{"version":1,"values":{"k":"v"}}`))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(Config{
+		IngestURL:                     server.URL,
+		Token:                         "test-token",
+		WorkspaceID:                   "workspace-test",
+		AppID:                         "app-test",
+		EnvironmentID:                 "develop",
+		Source:                        SourceBackend,
+		AnonymousID:                   "anon-attr-etag",
+		APIKey:                        "test-rc-key",
+		RemoteConfigURL:               server.URL,
+		RemoteConfigAttributesEnabled: true,
+		FlushInterval:                 time.Hour,
+		HTTPTimeout:                   time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	fetch := func(t *testing.T) probe {
+		t.Helper()
+		if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+			t.Fatalf("FetchRemoteConfig: %v", err)
+		}
+		return <-seen
+	}
+
+	// Attribute-less 200 primes the cache + ETag.
+	if p := fetch(t); p.query != "" || p.ifNoneMatch != "" {
+		t.Fatalf("priming fetch mismatch: %+v", p)
+	}
+	// Same signature (still attribute-less): the ETag revalidates.
+	if p := fetch(t); p.ifNoneMatch != `"shared-validator"` {
+		t.Fatalf("same-signature refetch must revalidate, got %+v", p)
+	}
+	// Signature change (attributes now ride): NO If-None-Match — a 304
+	// against the attribute-less validator must be impossible.
+	client.SetRemoteConfigAttributes(map[string]string{"geo": "US"})
+	client.SetConsent(true)
+	p := fetch(t)
+	if p.query != "geo=US" {
+		t.Fatalf("attributed fetch query mismatch: %+v", p)
+	}
+	if p.ifNoneMatch != "" {
+		t.Fatalf("a signature change must drop If-None-Match, got %+v", p)
+	}
+	// Same attributed signature again: revalidation resumes.
+	if p := fetch(t); p.query != "geo=US" || p.ifNoneMatch != `"shared-validator"` {
+		t.Fatalf("same attributed signature must revalidate, got %+v", p)
+	}
+	// Downgrade (attribute-less again): the attributed record's ETag must
+	// not ride the attribute-less fetch.
+	client.SetConsent(false)
+	if p := fetch(t); p.query != "" || p.ifNoneMatch != "" {
+		t.Fatalf("post-downgrade fetch must drop the attributed ETag, got %+v", p)
+	}
+}
+
 // TestAppendRemoteConfigAttributesEscapes pins the query assembly: the same
 // injective escaper as the path segments, name=value joined with ?/&, and a
 // nil/empty list returning the URL unchanged.

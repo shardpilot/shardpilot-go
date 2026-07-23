@@ -152,9 +152,13 @@ type Config struct {
 	// verbatim: geo, app_version, device_type, install_date, user_segment,
 	// custom_attribute_<name> (names ≤64, values ≤512 bytes, ≤64 attributes,
 	// sorted; out-of-vocabulary keys are dropped client-side). Requires
-	// RemoteConfigURL. Last-known-good caching is unchanged and scope-keyed:
-	// a cached body may reflect the previously sent attribute set until the
-	// next successful fetch (documented v1 limit).
+	// RemoteConfigURL. Last-known-good caching stays scope-keyed for value
+	// SERVING — a cached body may reflect the previously sent attribute set
+	// until the next successful fetch (documented v1 limit) — but the
+	// cached ETag revalidates ONLY a fetch carrying the SAME attribute
+	// signature: a signature change forces a full fetch, so a shared
+	// publication validator can never 304 a differently-targeted request
+	// into serving the previous target's body.
 	RemoteConfigAttributesEnabled bool
 
 	// SpoolDir, when set, is the opt-in state directory for the bounded disk
