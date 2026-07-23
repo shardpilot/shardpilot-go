@@ -131,6 +131,32 @@ type Config struct {
 	// producer-lane decision lands.
 	ExperimentsEnabled bool
 
+	// RemoteConfigAttributesEnabled opts this client into the ADR-0310
+	// attribute pass-through on the remote-config fetch: the attributes set
+	// via SetRemoteConfigAttributes ride the GET /config/v1/... request as
+	// query parameters, letting server-side delivery rules target this
+	// client. Default false — DARK: while off the fetch URL is byte-identical
+	// to today's attribute-less path.
+	//
+	// PRIVACY CONTRACT (non-negotiable): attributes are personal-data-shaped
+	// egress, so they ride ONLY while BOTH this opt-in is true AND the
+	// consent state is ConsentGranted. This is deliberately STRICTER than
+	// this SDK's open-under-unknown event posture: unknown consent (and both
+	// denied states) keeps the remote-config fetch attribute-less — the
+	// fetch itself still happens (config delivery stays consent-neutral) and
+	// serves whatever the server publishes for an attribute-less client,
+	// typically the default values. "Unknown = zero bytes of personal data"
+	// therefore holds for this leg even on the Go SDK.
+	//
+	// The attribute vocabulary and bounds are the experiment consumer's,
+	// verbatim: geo, app_version, device_type, install_date, user_segment,
+	// custom_attribute_<name> (names ≤64, values ≤512 bytes, ≤64 attributes,
+	// sorted; out-of-vocabulary keys are dropped client-side). Requires
+	// RemoteConfigURL. Last-known-good caching is unchanged and scope-keyed:
+	// a cached body may reflect the previously sent attribute set until the
+	// next successful fetch (documented v1 limit).
+	RemoteConfigAttributesEnabled bool
+
 	// SpoolDir, when set, is the opt-in state directory for the bounded disk
 	// spool and the persisted consent decision (`spool.json`, `consent.json`,
 	// and the `spool-wipe-owed` marker; directory 0700, files 0600). Empty —
@@ -338,6 +364,12 @@ func normalizeConfig(cfg Config) (Config, error) {
 		// experiments without that base could never produce a working
 		// fetch.
 		return Config{}, fmt.Errorf("%w: experiments require RemoteConfigURL (the assignment endpoint shares the control-plane host)", ErrInvalidConfig)
+	}
+
+	if cfg.RemoteConfigAttributesEnabled && cfg.RemoteConfigURL == "" {
+		// Attributes only ever ride the remote-config fetch; opting in
+		// without the fetch configured could never produce a working leg.
+		return Config{}, fmt.Errorf("%w: remote-config attributes require RemoteConfigURL", ErrInvalidConfig)
 	}
 
 	if cfg.SpoolDir != "" {

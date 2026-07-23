@@ -66,6 +66,25 @@
   - `ExperimentVariant`/`ExperimentVariantPayload` cached-variant getters (consent- and
     latch-gated, deep-copied payloads). New errors: `ErrExperimentsNotConfigured`,
     `ErrExperimentNoAssignment`, `ErrExperimentFactUnavailable`, `ErrInvalidExperimentFact`.
+- Dark opt-in remote-config targeting-attribute pass-through
+  (`Config.RemoteConfigAttributesEnabled`, default `false` — while off the fetch URL is
+  byte-identical to today's attribute-less path and `SetRemoteConfigAttributes` is inert;
+  ADR-0310 SDK leg):
+  - `SetRemoteConfigAttributes(map[string]string)` stores the client's targeting attribute
+    set (`nil`/empty clears); enabled fetches append it to the `GET /config/v1/...` request
+    as sorted, percent-escaped query parameters so server-side delivery rules can target
+    this client. The vocabulary and bounds are the experiment consumer's, verbatim: `geo`,
+    `app_version`, `device_type`, `install_date`, `user_segment`, `custom_attribute_<name>`;
+    ≤512-byte values, 64-attribute cap; out-of-vocabulary keys dropped client-side, never
+    sent. Targeting stays 100% server-evaluated.
+  - PRIVACY CONTRACT: attributes ride ONLY while BOTH the opt-in is true AND consent is
+    granted. Unknown consent and both denied states (forced-minor included) keep the fetch
+    attribute-less — the fetch itself still happens (config delivery stays consent-neutral)
+    and serves the untargeted defaults. Deliberately STRICTER than this SDK's
+    open-under-unknown analytics posture: "unknown = zero bytes of personal data" holds on
+    this leg. A consent downgrade strips attributes from the very next fetch.
+  - Last-known-good caching unchanged and scope-keyed; a cached body may reflect the
+    previously sent attribute set until the next successful fetch (documented v1 limit).
 - Opt-in client-side consent floor (`Config.ConsentFloor`), adopting the engine SDKs'
   consent-first contract for integrations that need client-side enforcement (per the
   sdk-stability-1.0 disposition: user-facing adopters bound by the DPIA condition opt in;

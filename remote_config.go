@@ -123,6 +123,14 @@ type remoteConfigState struct {
 	clientID  string
 	scope     string
 
+	// attributes is the developer-supplied targeting attribute set
+	// (ADR-0310, dark behind Config.RemoteConfigAttributesEnabled). Stored
+	// RAW: normalization (vocabulary allowlist, bounds, sort) happens at
+	// FETCH time so it always reflects the current experiment vocabulary,
+	// and the consent gate is evaluated per fetch — a downgrade after
+	// SetRemoteConfigAttributes makes the very next fetch attribute-less.
+	attributes map[string]string
+
 	// held is the freshest served record for this process. It is updated
 	// even when the durable write fails, so a later offline fetch falls back
 	// to the freshest served configuration rather than reviving an older
@@ -217,6 +225,29 @@ func buildRemoteConfigURL(baseURL, workspaceID, environmentID, clientID string) 
 		escapeRemoteConfigSegment(workspaceID) + "/" +
 		escapeRemoteConfigSegment(environmentID) + "/" +
 		escapeRemoteConfigSegment(clientID)
+}
+
+// appendRemoteConfigAttributes appends the ADR-0310 targeting attributes as
+// query parameters — already normalized (allowlisted, bounded, SORTED) by
+// normalizeExperimentAttributes, escaped with the same injective escaper the
+// path segments use (the experiment assignment URL's exact discipline).
+func appendRemoteConfigAttributes(fetchURL string, attributes []expAttribute) string {
+	if len(attributes) == 0 {
+		return fetchURL
+	}
+	var b strings.Builder
+	b.WriteString(fetchURL)
+	for i, attribute := range attributes {
+		if i == 0 {
+			b.WriteByte('?')
+		} else {
+			b.WriteByte('&')
+		}
+		b.WriteString(escapeRemoteConfigSegment(attribute.Name))
+		b.WriteByte('=')
+		b.WriteString(escapeRemoteConfigSegment(attribute.Value))
+	}
+	return b.String()
 }
 
 // buildRemoteConfigScope stamps a cache record with the (workspace,
@@ -741,6 +772,32 @@ func rcFetchError(code string) error {
 // legal; an older response never overwrites a newer settled outcome. Fetches
 // are fenced by the client lifecycle exactly like synchronous Track
 // publishes: a fetch that begins after Close is rejected with ErrClosed, and
+// SetRemoteConfigAttributes replaces the client's targeting attribute set
+// for the ADR-0310 remote-config attribute pass-through (nil or empty
+// clears). Inert unless Config.RemoteConfigAttributesEnabled is true; even
+// then, attributes ride a fetch ONLY while consent is ConsentGranted —
+// evaluated per fetch, so a consent downgrade makes the very next fetch
+// attribute-less. Values are stored raw and normalized at fetch time against
+// the experiment attribute vocabulary (out-of-vocabulary keys are dropped;
+// bounds and ordering per normalizeExperimentAttributes). A no-op when the
+// remote-config fetch is not configured.
+func (c *Client) SetRemoteConfigAttributes(attributes map[string]string) {
+	rc := c.rc
+	if rc == nil {
+		return
+	}
+	var copied map[string]string
+	if len(attributes) > 0 {
+		copied = make(map[string]string, len(attributes))
+		for name, value := range attributes {
+			copied[name] = value
+		}
+	}
+	rc.mu.Lock()
+	rc.attributes = copied
+	rc.mu.Unlock()
+}
+
 // Close waits (bounded by its own context) for in-flight fetches to settle,
 // so no fetch I/O or durable cache write is still running when Close returns.
 func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, error) {
@@ -801,7 +858,25 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 	}
 	fetchURL := rc.fetchURL
 	apiKey := rc.apiKey
+	var storedAttributes map[string]string
+	if c.cfg.RemoteConfigAttributesEnabled && len(rc.attributes) > 0 {
+		storedAttributes = make(map[string]string, len(rc.attributes))
+		for name, value := range rc.attributes {
+			storedAttributes[name] = value
+		}
+	}
 	rc.mu.Unlock()
+
+	// ADR-0310 attribute pass-through: opt-in AND ConsentGranted, evaluated
+	// per fetch. Deliberately STRICTER than this SDK's open-under-unknown
+	// event posture — unknown consent (and both denied states) keeps the
+	// fetch byte-identical to the attribute-less URL, and the fetch itself
+	// still happens (config delivery stays consent-neutral).
+	if len(storedAttributes) > 0 && c.Consent() == ConsentGranted {
+		if pairs, _ := normalizeExperimentAttributes(storedAttributes); len(pairs) > 0 {
+			fetchURL = appendRemoteConfigAttributes(fetchURL, pairs)
+		}
+	}
 
 	callerCtx := ctx
 	ctx, cancel := contextWithDefaultTimeout(ctx, c.cfg.HTTPTimeout)

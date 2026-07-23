@@ -1755,3 +1755,142 @@ func TestWritePrivateFileAtomicReportsDirSyncFailure(t *testing.T) {
 		t.Fatalf("expected the unsyncable parent directory surfaced as a failed write")
 	}
 }
+
+// TestRemoteConfigAttributePassThroughConsentGate pins the ADR-0310 attribute
+// leg's full truth table: attributes ride the fetch ONLY under opt-in AND
+// ConsentGranted — explicitly STRICTER than this SDK's open-under-unknown
+// event posture — and the attribute-less legs stay byte-identical to the
+// pre-ADR-0310 URL (path only, no query). The granted leg carries the
+// experiment vocabulary normalized and sorted; a consent downgrade strips the
+// query from the very next fetch.
+func TestRemoteConfigAttributePassThroughConsentGate(t *testing.T) {
+	type fetchProbe struct {
+		path  string
+		query string
+	}
+	seen := make(chan fetchProbe, 8)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Only RC fetches are probed: the same server also receives the
+		// client's analytics/consent traffic (IngestURL points here too),
+		// which must never block the probe channel.
+		if !strings.HasPrefix(r.URL.Path, "/config/v1/") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		seen <- fetchProbe{path: r.URL.EscapedPath(), query: r.URL.RawQuery}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"version":1,"values":{"k":"v"}}`))
+	}))
+	defer server.Close()
+
+	newAttributeClient := func(t *testing.T, enabled bool) *Client {
+		t.Helper()
+		client, err := NewClient(Config{
+			IngestURL:                     server.URL,
+			Token:                         "test-token",
+			WorkspaceID:                   "workspace-test",
+			AppID:                         "app-test",
+			EnvironmentID:                 "develop",
+			Source:                        SourceBackend,
+			AnonymousID:                   "anon-attr-1",
+			APIKey:                        "test-rc-key",
+			RemoteConfigURL:               server.URL,
+			RemoteConfigAttributesEnabled: enabled,
+			BatchSize:                     2,
+			BufferSize:                    4,
+			FlushInterval:                 time.Hour,
+			HTTPTimeout:                   time.Second,
+		})
+		if err != nil {
+			t.Fatalf("NewClient: %v", err)
+		}
+		return client
+	}
+	attributes := map[string]string{
+		"geo":                  " US ",
+		"app_version":          "1.2.3",
+		"custom_attribute_vip": "yes",
+		"not_in_vocabulary":    "dropped",
+	}
+	fetchQuery := func(t *testing.T, client *Client) string {
+		t.Helper()
+		if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+			t.Fatalf("FetchRemoteConfig: %v", err)
+		}
+		probe := <-seen
+		if want := "/config/v1/workspace-test/develop/anon-attr-1"; probe.path != want {
+			t.Fatalf("path mismatch: got %q want %q", probe.path, want)
+		}
+		return probe.query
+	}
+
+	// Opt-out: attributes set + granted consent still yields the byte-
+	// identical attribute-less URL.
+	optOut := newAttributeClient(t, false)
+	optOut.SetConsent(true)
+	optOut.SetRemoteConfigAttributes(attributes)
+	if query := fetchQuery(t, optOut); query != "" {
+		t.Fatalf("opt-out fetch must be attribute-less, got query %q", query)
+	}
+	optOut.Close(context.Background())
+
+	// Opt-in + unknown consent: attribute-less (unknown = zero bytes of
+	// personal data holds on this leg even for the Go SDK).
+	unknown := newAttributeClient(t, true)
+	unknown.SetRemoteConfigAttributes(attributes)
+	if query := fetchQuery(t, unknown); query != "" {
+		t.Fatalf("unknown-consent fetch must be attribute-less, got query %q", query)
+	}
+	unknown.Close(context.Background())
+
+	// Opt-in + denied (both flavors): attribute-less.
+	denied := newAttributeClient(t, true)
+	denied.SetRemoteConfigAttributes(attributes)
+	denied.SetConsent(false)
+	if query := fetchQuery(t, denied); query != "" {
+		t.Fatalf("denied-consent fetch must be attribute-less, got query %q", query)
+	}
+	denied.Close(context.Background())
+	minor := newAttributeClient(t, true)
+	minor.SetRemoteConfigAttributes(attributes)
+	if err := minor.SetConsentDecision(ConsentDecisionDeniedForcedMinor); err != nil {
+		t.Fatalf("SetConsentDecision: %v", err)
+	}
+	if query := fetchQuery(t, minor); query != "" {
+		t.Fatalf("forced-minor fetch must be attribute-less, got query %q", query)
+	}
+	minor.Close(context.Background())
+
+	// Opt-in + granted: the normalized, sorted vocabulary rides the query
+	// (trimmed geo, custom_attribute_ passes, out-of-vocabulary dropped),
+	// then a downgrade strips the very next fetch.
+	granted := newAttributeClient(t, true)
+	granted.SetRemoteConfigAttributes(attributes)
+	granted.SetConsent(true)
+	if query := fetchQuery(t, granted); query != "app_version=1.2.3&custom_attribute_vip=yes&geo=US" {
+		t.Fatalf("granted fetch query mismatch: %q", query)
+	}
+	granted.SetConsent(false)
+	if query := fetchQuery(t, granted); query != "" {
+		t.Fatalf("post-downgrade fetch must be attribute-less, got query %q", query)
+	}
+	granted.Close(context.Background())
+}
+
+// TestAppendRemoteConfigAttributesEscapes pins the query assembly: the same
+// injective escaper as the path segments, name=value joined with ?/&, and a
+// nil/empty list returning the URL unchanged.
+func TestAppendRemoteConfigAttributesEscapes(t *testing.T) {
+	base := "https://cfg.example.test/config/v1/w/e/c"
+	if got := appendRemoteConfigAttributes(base, nil); got != base {
+		t.Fatalf("empty attribute list must not change the URL, got %q", got)
+	}
+	got := appendRemoteConfigAttributes(base, []expAttribute{
+		{Name: "geo", Value: "U S/1%x"},
+		{Name: "user_segment", Value: "beta&testers"},
+	})
+	want := base + "?geo=U%20S%2F1%25x&user_segment=beta%26testers"
+	if got != want {
+		t.Fatalf("escaped query mismatch:\n got %q\nwant %q", got, want)
+	}
+}
