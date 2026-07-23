@@ -66,6 +66,39 @@
   - `ExperimentVariant`/`ExperimentVariantPayload` cached-variant getters (consent- and
     latch-gated, deep-copied payloads). New errors: `ErrExperimentsNotConfigured`,
     `ErrExperimentNoAssignment`, `ErrExperimentFactUnavailable`, `ErrInvalidExperimentFact`.
+- Dark opt-in remote-config targeting-attribute pass-through
+  (`Config.RemoteConfigAttributesEnabled`, default `false` — while off the fetch URL is
+  byte-identical to today's attribute-less path and `SetRemoteConfigAttributes` is inert;
+  ADR-0310 SDK leg):
+  - `SetRemoteConfigAttributes(map[string]string)` stores the client's targeting attribute
+    set (`nil`/empty clears); enabled fetches append it to the `GET /config/v1/...` request
+    as sorted, percent-escaped query parameters so server-side delivery rules can target
+    this client. The vocabulary and bounds are the experiment consumer's, verbatim: `geo`,
+    `app_version`, `device_type`, `install_date`, `user_segment`, `custom_attribute_<name>`;
+    ≤512-byte values, 64-attribute cap; out-of-vocabulary keys dropped client-side, never
+    sent. Targeting stays 100% server-evaluated.
+  - PRIVACY CONTRACT: attributes ride ONLY while BOTH the opt-in is true AND consent is
+    granted. Unknown consent and both denied states (forced-minor included) keep the fetch
+    attribute-less — the fetch itself still happens (config delivery stays consent-neutral)
+    and serves the untargeted defaults. Deliberately STRICTER than this SDK's
+    open-under-unknown analytics posture: "unknown = zero bytes of personal data" holds on
+    this leg. A consent downgrade strips attributes from the very next fetch.
+  - Last-known-good caching stays scope-keyed for value serving (a cached body may reflect
+    the previously sent attribute set until the next successful fetch — documented v1
+    limit), and the cached ETag revalidates ONLY a fetch carrying the SAME attribute
+    signature — a signature change (opt-in, set change, consent downgrade) forces a full
+    fetch so a shared publication validator can never 304 a differently-targeted request
+    into the previous target's body. The signature is an IN-MEMORY-ONLY equality token
+    (never persisted — even a digest of the small targeting vocabulary is
+    dictionary-guessable, so zero attribute-derived bytes go to disk), and an attributed
+    record persists WITHOUT its ETag — a reloaded record could not prove a
+    same-signature fetch — so the first fetch after a restart of a previously-attributed
+    record is a full fetch on every leg. The setter is inert at the MEMORY
+    level while the opt-in is off (nothing is retained), and the consent gate is read at
+    the last moment before dispatch. Under the opt-in `ConsentFloor`, the grant-receipt
+    dispatch gate holds this leg exactly like the event legs: while an analytics-grant
+    receipt is retained undispatched, fetches stay attribute-less so attributes can never
+    overtake the grant on the wire.
 - Opt-in client-side consent floor (`Config.ConsentFloor`), adopting the engine SDKs'
   consent-first contract for integrations that need client-side enforcement (per the
   sdk-stability-1.0 disposition: user-facing adopters bound by the DPIA condition opt in;

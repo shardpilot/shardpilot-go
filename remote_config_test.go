@@ -1755,3 +1755,446 @@ func TestWritePrivateFileAtomicReportsDirSyncFailure(t *testing.T) {
 		t.Fatalf("expected the unsyncable parent directory surfaced as a failed write")
 	}
 }
+
+// TestRemoteConfigAttributePassThroughConsentGate pins the ADR-0310 attribute
+// leg's full truth table: attributes ride the fetch ONLY under opt-in AND
+// ConsentGranted — explicitly STRICTER than this SDK's open-under-unknown
+// event posture — and the attribute-less legs stay byte-identical to the
+// pre-ADR-0310 URL (path only, no query). The granted leg carries the
+// experiment vocabulary normalized and sorted; a consent downgrade strips the
+// query from the very next fetch.
+func TestRemoteConfigAttributePassThroughConsentGate(t *testing.T) {
+	type fetchProbe struct {
+		path  string
+		query string
+	}
+	seen := make(chan fetchProbe, 8)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Only RC fetches are probed: the same server also receives the
+		// client's analytics/consent traffic (IngestURL points here too),
+		// which must never block the probe channel.
+		if !strings.HasPrefix(r.URL.Path, "/config/v1/") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		seen <- fetchProbe{path: r.URL.EscapedPath(), query: r.URL.RawQuery}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"version":1,"values":{"k":"v"}}`))
+	}))
+	defer server.Close()
+
+	newAttributeClient := func(t *testing.T, enabled bool) *Client {
+		t.Helper()
+		client, err := NewClient(Config{
+			IngestURL:                     server.URL,
+			Token:                         "test-token",
+			WorkspaceID:                   "workspace-test",
+			AppID:                         "app-test",
+			EnvironmentID:                 "develop",
+			Source:                        SourceBackend,
+			AnonymousID:                   "anon-attr-1",
+			APIKey:                        "test-rc-key",
+			RemoteConfigURL:               server.URL,
+			RemoteConfigAttributesEnabled: enabled,
+			BatchSize:                     2,
+			BufferSize:                    4,
+			FlushInterval:                 time.Hour,
+			HTTPTimeout:                   time.Second,
+		})
+		if err != nil {
+			t.Fatalf("NewClient: %v", err)
+		}
+		return client
+	}
+	attributes := map[string]string{
+		"geo":                  " US ",
+		"app_version":          "1.2.3",
+		"custom_attribute_vip": "yes",
+		"not_in_vocabulary":    "dropped",
+	}
+	fetchQuery := func(t *testing.T, client *Client) string {
+		t.Helper()
+		if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+			t.Fatalf("FetchRemoteConfig: %v", err)
+		}
+		probe := <-seen
+		if want := "/config/v1/workspace-test/develop/anon-attr-1"; probe.path != want {
+			t.Fatalf("path mismatch: got %q want %q", probe.path, want)
+		}
+		return probe.query
+	}
+
+	// Opt-out: attributes set + granted consent still yields the byte-
+	// identical attribute-less URL.
+	optOut := newAttributeClient(t, false)
+	optOut.SetConsent(true)
+	optOut.SetRemoteConfigAttributes(attributes)
+	if query := fetchQuery(t, optOut); query != "" {
+		t.Fatalf("opt-out fetch must be attribute-less, got query %q", query)
+	}
+	optOut.Close(context.Background())
+
+	// Opt-in + unknown consent: attribute-less (unknown = zero bytes of
+	// personal data holds on this leg even for the Go SDK).
+	unknown := newAttributeClient(t, true)
+	unknown.SetRemoteConfigAttributes(attributes)
+	if query := fetchQuery(t, unknown); query != "" {
+		t.Fatalf("unknown-consent fetch must be attribute-less, got query %q", query)
+	}
+	unknown.Close(context.Background())
+
+	// Opt-in + denied (both flavors): attribute-less.
+	denied := newAttributeClient(t, true)
+	denied.SetRemoteConfigAttributes(attributes)
+	denied.SetConsent(false)
+	if query := fetchQuery(t, denied); query != "" {
+		t.Fatalf("denied-consent fetch must be attribute-less, got query %q", query)
+	}
+	denied.Close(context.Background())
+	minor := newAttributeClient(t, true)
+	minor.SetRemoteConfigAttributes(attributes)
+	if err := minor.SetConsentDecision(ConsentDecisionDeniedForcedMinor); err != nil {
+		t.Fatalf("SetConsentDecision: %v", err)
+	}
+	if query := fetchQuery(t, minor); query != "" {
+		t.Fatalf("forced-minor fetch must be attribute-less, got query %q", query)
+	}
+	minor.Close(context.Background())
+
+	// Opt-in + granted: the normalized, sorted vocabulary rides the query
+	// (trimmed geo, custom_attribute_ passes, out-of-vocabulary dropped),
+	// then a downgrade strips the very next fetch.
+	granted := newAttributeClient(t, true)
+	granted.SetRemoteConfigAttributes(attributes)
+	granted.SetConsent(true)
+	if query := fetchQuery(t, granted); query != "app_version=1.2.3&custom_attribute_vip=yes&geo=US" {
+		t.Fatalf("granted fetch query mismatch: %q", query)
+	}
+	granted.SetConsent(false)
+	if query := fetchQuery(t, granted); query != "" {
+		t.Fatalf("post-downgrade fetch must be attribute-less, got query %q", query)
+	}
+	granted.Close(context.Background())
+}
+
+// TestSetRemoteConfigAttributesInertWhileDark pins the dark posture at the
+// MEMORY level, not just the wire: while the opt-in is off the setter
+// retains nothing — an opt-out integration defensively calling it leaves
+// zero bytes of the personal-data-shaped input in SDK state.
+func TestSetRemoteConfigAttributesInertWhileDark(t *testing.T) {
+	client, err := NewClient(Config{
+		IngestURL:       "https://ingest.example.test",
+		Token:           "test-token",
+		WorkspaceID:     "workspace-test",
+		AppID:           "app-test",
+		EnvironmentID:   "develop",
+		Source:          SourceBackend,
+		AnonymousID:     "anon-attr-dark",
+		APIKey:          "test-rc-key",
+		RemoteConfigURL: "https://cfg.example.test",
+		FlushInterval:   time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close(context.Background())
+	client.SetRemoteConfigAttributes(map[string]string{"geo": "US"})
+	client.rc.mu.Lock()
+	retained := client.rc.attributes
+	client.rc.mu.Unlock()
+	if retained != nil {
+		t.Fatalf("dark setter must retain nothing, got %v", retained)
+	}
+}
+
+// TestRemoteConfigAttributeSignatureKeysRevalidation pins the ADR-0310
+// ETag/attribute interplay: the cached ETag revalidates ONLY a fetch
+// carrying the SAME attribute signature. A signature change (attribute-less
+// -> attributed, attributed -> different set, attributed -> downgraded)
+// forces a full fetch with no If-None-Match, so a shared publication
+// validator can never 304 a differently-targeted request into serving the
+// previous target's body; a same-signature refetch keeps revalidating —
+// INCLUDING immediately after a 304 (the renewed record keeps its
+// signature; no alternating 304/full-200 pattern). The stored signature is
+// a non-reversible digest: zero attribute bytes at rest.
+func TestRemoteConfigAttributeSignatureKeysRevalidation(t *testing.T) {
+	type probe struct {
+		query       string
+		ifNoneMatch string
+	}
+	seen := make(chan probe, 12)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/config/v1/") {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		seen <- probe{query: r.URL.RawQuery, ifNoneMatch: r.Header.Get("If-None-Match")}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("ETag", `"shared-validator"`)
+		if r.Header.Get("If-None-Match") == `"shared-validator"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		_, _ = w.Write([]byte(`{"version":1,"values":{"k":"v"}}`))
+	}))
+	defer server.Close()
+
+	cachePath := filepath.Join(t.TempDir(), "rc-cache.json")
+	client, err := NewClient(Config{
+		IngestURL:                     server.URL,
+		Token:                         "test-token",
+		WorkspaceID:                   "workspace-test",
+		AppID:                         "app-test",
+		EnvironmentID:                 "develop",
+		Source:                        SourceBackend,
+		AnonymousID:                   "anon-attr-etag",
+		APIKey:                        "test-rc-key",
+		RemoteConfigURL:               server.URL,
+		RemoteConfigCachePath:         cachePath,
+		RemoteConfigAttributesEnabled: true,
+		FlushInterval:                 time.Hour,
+		HTTPTimeout:                   time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	fetch := func(t *testing.T) probe {
+		t.Helper()
+		if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+			t.Fatalf("FetchRemoteConfig: %v", err)
+		}
+		return <-seen
+	}
+
+	// Attribute-less 200 primes the cache + ETag.
+	if p := fetch(t); p.query != "" || p.ifNoneMatch != "" {
+		t.Fatalf("priming fetch mismatch: %+v", p)
+	}
+	// Same signature (still attribute-less): the ETag revalidates (304)...
+	if p := fetch(t); p.ifNoneMatch != `"shared-validator"` {
+		t.Fatalf("same-signature refetch must revalidate, got %+v", p)
+	}
+	// ...and KEEPS revalidating after the 304 (the renewed record retained
+	// its signature).
+	if p := fetch(t); p.ifNoneMatch != `"shared-validator"` {
+		t.Fatalf("revalidation must continue after a 304, got %+v", p)
+	}
+	// Signature change (attributes now ride): NO If-None-Match — a 304
+	// against the attribute-less validator must be impossible.
+	client.SetRemoteConfigAttributes(map[string]string{"geo": "US"})
+	client.SetConsent(true)
+	p := fetch(t)
+	if p.query != "geo=US" {
+		t.Fatalf("attributed fetch query mismatch: %+v", p)
+	}
+	if p.ifNoneMatch != "" {
+		t.Fatalf("a signature change must drop If-None-Match, got %+v", p)
+	}
+	// Same attributed signature again: revalidation resumes (304), and the
+	// record's stored signature is a 64-hex digest carrying no attribute
+	// bytes at rest.
+	if p := fetch(t); p.query != "geo=US" || p.ifNoneMatch != `"shared-validator"` {
+		t.Fatalf("same attributed signature must revalidate, got %+v", p)
+	}
+	client.rc.mu.Lock()
+	storedSignature := ""
+	if client.rc.held != nil {
+		storedSignature = client.rc.held.AttributeSignature
+	}
+	client.rc.mu.Unlock()
+	if len(storedSignature) != 64 || strings.Contains(storedSignature, "geo") ||
+		strings.Contains(storedSignature, "US") {
+		t.Fatalf("the in-memory signature must be a digest, got %q", storedSignature)
+	}
+	// The DURABLE record persists NOTHING attribute-derived: no signature
+	// field (even a digest of the small targeting vocabulary is
+	// dictionary-guessable) and no attribute bytes — a restart forgets the
+	// signature and the first attributed refetch is a full fetch.
+	durable, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("read durable cache: %v", err)
+	}
+	if strings.Contains(string(durable), "attribute_signature") ||
+		strings.Contains(string(durable), "geo") ||
+		strings.Contains(string(durable), storedSignature) {
+		t.Fatalf("the durable record must carry nothing attribute-derived, got %s", durable)
+	}
+	// An attributed record persists WITHOUT its ETag: the signature that
+	// scopes the validator is not persisted, so a reloaded copy could never
+	// prove a same-signature fetch — while the in-process record keeps its
+	// ETag (the revalidation legs above and below ride it).
+	var durableRecord rcCache
+	if err := json.Unmarshal(durable, &durableRecord); err != nil {
+		t.Fatalf("unmarshal durable cache: %v", err)
+	}
+	if durableRecord.ETag != "" {
+		t.Fatalf("an attributed record must persist without its ETag, got %q", durableRecord.ETag)
+	}
+	client.rc.mu.Lock()
+	heldETag := ""
+	if client.rc.held != nil {
+		heldETag = client.rc.held.ETag
+	}
+	client.rc.mu.Unlock()
+	if heldETag != `"shared-validator"` {
+		t.Fatalf("the in-process attributed record must keep its ETag, got %q", heldETag)
+	}
+	// The 304-renewed attributed record keeps revalidating too.
+	if p := fetch(t); p.query != "geo=US" || p.ifNoneMatch != `"shared-validator"` {
+		t.Fatalf("attributed revalidation must continue after a 304, got %+v", p)
+	}
+	// Downgrade (attribute-less again): the attributed record's ETag must
+	// not ride the attribute-less fetch.
+	client.SetConsent(false)
+	if p := fetch(t); p.query != "" || p.ifNoneMatch != "" {
+		t.Fatalf("post-downgrade fetch must drop the attributed ETag, got %+v", p)
+	}
+
+	// RESTART: a fresh process reloads the attributed record with neither
+	// signature nor ETag. The hole this closes: with an ETag at rest, an
+	// attribute-less restart fetch would read cacheSignature ==
+	// usedSignature == "" and send the TARGETED validator — a shared
+	// publication validator could then 304 the previous target's body into
+	// serving as untargeted. With no ETag at rest, the first fetch after a
+	// reload is a full fetch on every leg.
+	restartFetch := func(t *testing.T, attributed bool) probe {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "rc-cache-restart.json")
+		if err := os.WriteFile(path, durable, 0o600); err != nil {
+			t.Fatalf("seed restart cache: %v", err)
+		}
+		restarted, err := NewClient(Config{
+			IngestURL:                     server.URL,
+			Token:                         "test-token",
+			WorkspaceID:                   "workspace-test",
+			AppID:                         "app-test",
+			EnvironmentID:                 "develop",
+			Source:                        SourceBackend,
+			AnonymousID:                   "anon-attr-etag",
+			APIKey:                        "test-rc-key",
+			RemoteConfigURL:               server.URL,
+			RemoteConfigCachePath:         path,
+			RemoteConfigAttributesEnabled: true,
+			FlushInterval:                 time.Hour,
+			HTTPTimeout:                   time.Second,
+		})
+		if err != nil {
+			t.Fatalf("NewClient (restart): %v", err)
+		}
+		defer restarted.Close(context.Background())
+		if attributed {
+			restarted.SetRemoteConfigAttributes(map[string]string{"geo": "US"})
+			restarted.SetConsent(true)
+		}
+		if _, err := restarted.FetchRemoteConfig(context.Background()); err != nil {
+			t.Fatalf("FetchRemoteConfig (restart): %v", err)
+		}
+		return <-seen
+	}
+	if p := restartFetch(t, false); p.query != "" || p.ifNoneMatch != "" {
+		t.Fatalf("an attribute-less fetch after reload must be a FULL fetch, got %+v", p)
+	}
+	if p := restartFetch(t, true); p.query != "geo=US" || p.ifNoneMatch != "" {
+		t.Fatalf("an attributed fetch after reload must be a FULL fetch, got %+v", p)
+	}
+}
+
+// TestRemoteConfigAttributesHoldWhileGrantReceiptPending pins the consent-
+// floor interplay: under Config.ConsentFloor, a granted state whose
+// analytics-grant RECEIPT is still retained undispatched holds the
+// attribute leg exactly like the event legs — the fetch goes out
+// attribute-less (never gated as a whole; config delivery stays
+// consent-neutral), so targeting attributes can never overtake the grant
+// on the wire on a strict-consent workspace. Once the receipt has
+// dispatched, attributes ride.
+func TestRemoteConfigAttributesHoldWhileGrantReceiptPending(t *testing.T) {
+	var consentBlocked atomic.Bool
+	consentBlocked.Store(true)
+	seen := make(chan string, 8)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/config/v1/") {
+			seen <- r.URL.RawQuery
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"version":1,"values":{"k":"v"}}`))
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/v1/consent") && consentBlocked.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	newFloorClient := func(t *testing.T, anonymousID string) *Client {
+		t.Helper()
+		client, err := NewClient(Config{
+			IngestURL:                     server.URL,
+			Token:                         "test-token",
+			WorkspaceID:                   "workspace-test",
+			AppID:                         "app-test",
+			EnvironmentID:                 "develop",
+			Source:                        SourceBackend,
+			AnonymousID:                   anonymousID,
+			APIKey:                        "test-rc-key",
+			RemoteConfigURL:               server.URL,
+			RemoteConfigAttributesEnabled: true,
+			ConsentFloor:                  &ConsentFloorConfig{},
+			FlushInterval:                 time.Hour,
+			HTTPTimeout:                   time.Second,
+		})
+		if err != nil {
+			t.Fatalf("NewClient: %v", err)
+		}
+		return client
+	}
+	fetchQuery := func(t *testing.T, client *Client) string {
+		t.Helper()
+		if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+			t.Fatalf("FetchRemoteConfig: %v", err)
+		}
+		return <-seen
+	}
+
+	// Gate armed: the grant's receipt cannot dispatch (consent endpoint
+	// failing), so it stays retained — the fetch happens attribute-less.
+	held := newFloorClient(t, "anon-floor-held")
+	held.SetRemoteConfigAttributes(map[string]string{"geo": "US"})
+	held.SetConsent(true)
+	if query := fetchQuery(t, held); query != "" {
+		t.Fatalf("a retained grant receipt must hold attributes, got query %q", query)
+	}
+	held.Close(context.Background())
+
+	// Gate released: the receipt dispatches (Track is a dispatch point;
+	// the consent endpoint accepts) and the next fetch carries attributes.
+	consentBlocked.Store(false)
+	released := newFloorClient(t, "anon-floor-open")
+	released.SetRemoteConfigAttributes(map[string]string{"geo": "US"})
+	released.SetConsent(true)
+	_ = released.Track(context.Background(), Event{Name: "receipt_dispatch_probe"})
+	if query := fetchQuery(t, released); query != "geo=US" {
+		t.Fatalf("a dispatched grant receipt must release attributes, got query %q", query)
+	}
+	released.Close(context.Background())
+}
+
+// TestAppendRemoteConfigAttributesEscapes pins the query assembly: the same
+// injective escaper as the path segments, name=value joined with ?/&, and a
+// nil/empty list returning the URL unchanged.
+func TestAppendRemoteConfigAttributesEscapes(t *testing.T) {
+	base := "https://cfg.example.test/config/v1/w/e/c"
+	if got := appendRemoteConfigAttributes(base, nil); got != base {
+		t.Fatalf("empty attribute list must not change the URL, got %q", got)
+	}
+	got := appendRemoteConfigAttributes(base, []expAttribute{
+		{Name: "geo", Value: "U S/1%x"},
+		{Name: "user_segment", Value: "beta&testers"},
+	})
+	want := base + "?geo=U%20S%2F1%25x&user_segment=beta%26testers"
+	if got != want {
+		t.Fatalf("escaped query mismatch:\n got %q\nwant %q", got, want)
+	}
+}

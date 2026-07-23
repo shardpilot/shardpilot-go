@@ -298,6 +298,17 @@ speed := client.RemoteConfigNumber("scroll_speed", 1.0)
   clears the config cache — configuration is client-public tuning, not
   telemetry. `RemoteConfigCachePath` works without `SpoolDir` and never
   enables consent persistence.
+- **Targeting attributes are dark and opt-in (ADR-0310)** — and, unlike the
+  fetch itself, granted-only: `RemoteConfigAttributesEnabled: true` plus
+  `SetRemoteConfigAttributes(map[string]string)` makes fetches carry the
+  experiment attribute vocabulary (`geo`, `app_version`, `device_type`,
+  `install_date`, `user_segment`, `custom_attribute_<name>`; ≤512-byte
+  values, 64-attribute cap, sorted; out-of-vocabulary keys dropped, never
+  sent) as query parameters for server-side delivery rules. Attributes ride
+  ONLY while consent is granted — unknown or denied consent (forced-minor
+  included) fetches attribute-less and serves the untargeted defaults.
+  Default `false`: the fetch URL stays byte-identical to the attribute-less
+  path and the setter is inert.
 
 ## Crash reporting (`pkg/crash`)
 
