@@ -1913,13 +1913,16 @@ func TestSetRemoteConfigAttributesInertWhileDark(t *testing.T) {
 // -> attributed, attributed -> different set, attributed -> downgraded)
 // forces a full fetch with no If-None-Match, so a shared publication
 // validator can never 304 a differently-targeted request into serving the
-// previous target's body; a same-signature refetch keeps revalidating.
+// previous target's body; a same-signature refetch keeps revalidating —
+// INCLUDING immediately after a 304 (the renewed record keeps its
+// signature; no alternating 304/full-200 pattern). The stored signature is
+// a non-reversible digest: zero attribute bytes at rest.
 func TestRemoteConfigAttributeSignatureKeysRevalidation(t *testing.T) {
 	type probe struct {
 		query       string
 		ifNoneMatch string
 	}
-	seen := make(chan probe, 8)
+	seen := make(chan probe, 12)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/config/v1/") {
 			w.WriteHeader(http.StatusOK)
@@ -1928,6 +1931,10 @@ func TestRemoteConfigAttributeSignatureKeysRevalidation(t *testing.T) {
 		seen <- probe{query: r.URL.RawQuery, ifNoneMatch: r.Header.Get("If-None-Match")}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("ETag", `"shared-validator"`)
+		if r.Header.Get("If-None-Match") == `"shared-validator"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
 		_, _ = w.Write([]byte(`{"version":1,"values":{"k":"v"}}`))
 	}))
 	defer server.Close()
@@ -1963,9 +1970,14 @@ func TestRemoteConfigAttributeSignatureKeysRevalidation(t *testing.T) {
 	if p := fetch(t); p.query != "" || p.ifNoneMatch != "" {
 		t.Fatalf("priming fetch mismatch: %+v", p)
 	}
-	// Same signature (still attribute-less): the ETag revalidates.
+	// Same signature (still attribute-less): the ETag revalidates (304)...
 	if p := fetch(t); p.ifNoneMatch != `"shared-validator"` {
 		t.Fatalf("same-signature refetch must revalidate, got %+v", p)
+	}
+	// ...and KEEPS revalidating after the 304 (the renewed record retained
+	// its signature).
+	if p := fetch(t); p.ifNoneMatch != `"shared-validator"` {
+		t.Fatalf("revalidation must continue after a 304, got %+v", p)
 	}
 	// Signature change (attributes now ride): NO If-None-Match — a 304
 	// against the attribute-less validator must be impossible.
@@ -1978,9 +1990,25 @@ func TestRemoteConfigAttributeSignatureKeysRevalidation(t *testing.T) {
 	if p.ifNoneMatch != "" {
 		t.Fatalf("a signature change must drop If-None-Match, got %+v", p)
 	}
-	// Same attributed signature again: revalidation resumes.
+	// Same attributed signature again: revalidation resumes (304), and the
+	// record's stored signature is a 64-hex digest carrying no attribute
+	// bytes at rest.
 	if p := fetch(t); p.query != "geo=US" || p.ifNoneMatch != `"shared-validator"` {
 		t.Fatalf("same attributed signature must revalidate, got %+v", p)
+	}
+	client.rc.mu.Lock()
+	storedSignature := ""
+	if client.rc.held != nil {
+		storedSignature = client.rc.held.AttributeSignature
+	}
+	client.rc.mu.Unlock()
+	if len(storedSignature) != 64 || strings.Contains(storedSignature, "geo") ||
+		strings.Contains(storedSignature, "US") {
+		t.Fatalf("the stored signature must be a non-reversible digest, got %q", storedSignature)
+	}
+	// The 304-renewed attributed record keeps revalidating too.
+	if p := fetch(t); p.query != "geo=US" || p.ifNoneMatch != `"shared-validator"` {
+		t.Fatalf("attributed revalidation must continue after a 304, got %+v", p)
 	}
 	// Downgrade (attribute-less again): the attributed record's ETag must
 	// not ride the attribute-less fetch.

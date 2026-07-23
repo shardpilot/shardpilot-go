@@ -3,6 +3,8 @@ package shardpilot
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -109,7 +111,11 @@ type rcCache struct {
 	FetchedAtMS int64  `json:"fetched_at_ms"`
 	// The ADR-0310 attribute signature of the fetch that produced this
 	// record ("" = attribute-less, which every pre-ADR-0310 durable record
-	// unmarshals to). The ETag revalidates ONLY against a fetch carrying
+	// unmarshals to; otherwise a NON-REVERSIBLE SHA-256 digest of the
+	// normalized attribute query — never the attribute values themselves,
+	// so the durable cache puts zero personal-data-shaped bytes at rest and
+	// nothing about the targeting set survives a consent downgrade in
+	// readable form). The ETag revalidates ONLY against a fetch carrying
 	// the SAME signature: a shared publication validator must never 304 a
 	// differently-targeted request into serving the previous target's body.
 	// Value SERVING stays scope-keyed regardless of signature (the
@@ -761,6 +767,20 @@ func rcFetchError(code string) error {
 	return fmt.Errorf("shardpilot remote config fetch failed: %s", code)
 }
 
+// rcAttributeSignature is the equality token the ETag-revalidation keying
+// stores for an attributed fetch: a non-reversible SHA-256 digest of the
+// normalized attribute query — never the query itself, so the durable cache
+// record carries zero personal-data-shaped bytes (an equality comparison is
+// the signature's ONLY use). The attribute-less signature stays the empty
+// string, which every pre-ADR-0310 durable record also unmarshals to.
+func rcAttributeSignature(query string) string {
+	if query == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(query))
+	return hex.EncodeToString(sum[:])
+}
+
 // SetRemoteConfigAttributes replaces the client's targeting attribute set
 // for the ADR-0310 remote-config attribute pass-through (nil or empty
 // clears). Inert while Config.RemoteConfigAttributesEnabled is false: the
@@ -896,7 +916,7 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 	if len(storedAttributes) > 0 {
 		if pairs, _ := normalizeExperimentAttributes(storedAttributes); len(pairs) > 0 {
 			attributedURL = appendRemoteConfigAttributes(fetchURL, pairs)
-			attributedSignature = strings.TrimPrefix(attributedURL, fetchURL)
+			attributedSignature = rcAttributeSignature(strings.TrimPrefix(attributedURL, fetchURL))
 		}
 	}
 
@@ -955,9 +975,17 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 	result, newCache, authoritative, revalidated, failure := applyRemoteConfig(cache, resp, now.UnixMilli())
 	if newCache != nil {
 		// A fresh 200 record carries the signature of the fetch that
-		// produced it (a 304-revalidated record keeps its own — the ETag
-		// only rode a same-signature request).
+		// produced it.
 		newCache.AttributeSignature = usedSignature
+	}
+	if revalidated != nil {
+		// The 304-renewed record is REBUILT by applyRemoteConfig, so the
+		// signature must be re-stamped here too — the ETag only rode a
+		// same-signature request, so usedSignature is that record's own.
+		// Without this a revalidation would persist the empty signature and
+		// force an alternating 304/full-200 pattern on every later
+		// same-signature fetch.
+		revalidated.AttributeSignature = usedSignature
 	}
 
 	rc.mu.Lock()
