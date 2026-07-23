@@ -88,9 +88,15 @@
     limit), and the cached ETag revalidates ONLY a fetch carrying the SAME attribute
     signature — a signature change (opt-in, set change, consent downgrade) forces a full
     fetch so a shared publication validator can never 304 a differently-targeted request
-    into the previous target's body. The setter is inert at the MEMORY level while the
-    opt-in is off (nothing is retained), and the consent gate is read at the last moment
-    before dispatch.
+    into the previous target's body. The signature is an IN-MEMORY-ONLY equality token
+    (never persisted — even a digest of the small targeting vocabulary is
+    dictionary-guessable, so zero attribute-derived bytes go to disk; a restart forgets it
+    and the first attributed refetch is a full fetch). The setter is inert at the MEMORY
+    level while the opt-in is off (nothing is retained), and the consent gate is read at
+    the last moment before dispatch. Under the opt-in `ConsentFloor`, the grant-receipt
+    dispatch gate holds this leg exactly like the event legs: while an analytics-grant
+    receipt is retained undispatched, fetches stay attribute-less so attributes can never
+    overtake the grant on the wire.
 - Opt-in client-side consent floor (`Config.ConsentFloor`), adopting the engine SDKs'
   consent-first contract for integrations that need client-side enforcement (per the
   sdk-stability-1.0 disposition: user-facing adopters bound by the DPIA condition opt in;

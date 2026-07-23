@@ -110,18 +110,20 @@ type rcCache struct {
 	Body        string `json:"body"`
 	FetchedAtMS int64  `json:"fetched_at_ms"`
 	// The ADR-0310 attribute signature of the fetch that produced this
-	// record ("" = attribute-less, which every pre-ADR-0310 durable record
-	// unmarshals to; otherwise a NON-REVERSIBLE SHA-256 digest of the
-	// normalized attribute query — never the attribute values themselves,
-	// so the durable cache puts zero personal-data-shaped bytes at rest and
-	// nothing about the targeting set survives a consent downgrade in
-	// readable form). The ETag revalidates ONLY against a fetch carrying
-	// the SAME signature: a shared publication validator must never 304 a
-	// differently-targeted request into serving the previous target's body.
-	// Value SERVING stays scope-keyed regardless of signature (the
-	// documented v1 limit — a cached body may reflect the previously sent
-	// attribute set until the next successful fetch).
-	AttributeSignature string `json:"attribute_signature,omitempty"`
+	// record ("" = attribute-less; otherwise a SHA-256 digest of the
+	// normalized attribute query). IN-MEMORY ONLY — deliberately never
+	// serialized (json:"-"): even a digest of the small, known targeting
+	// vocabulary is dictionary-guessable, so NOTHING attribute-derived goes
+	// to disk — zero attribute-shaped bytes at rest, and a restart forgets
+	// the signature entirely (every reloaded record reads as
+	// attribute-less; the first attributed refetch after a restart is a
+	// full fetch, by design). The ETag revalidates ONLY against a fetch
+	// carrying the SAME signature: a shared publication validator must
+	// never 304 a differently-targeted request into serving the previous
+	// target's body. Value SERVING stays scope-keyed regardless of
+	// signature (the documented v1 limit — a cached body may reflect the
+	// previously sent attribute set until the next successful fetch).
+	AttributeSignature string `json:"-"`
 }
 
 // remoteConfigState is the per-client remote-config machinery: the held
@@ -925,9 +927,16 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 	defer cancel()
 	// The last-moment consent read: the decision and the dispatch are
 	// adjacent, with no work between them a downgrade could hide behind.
+	// Under the opt-in consent floor the GRANT-RECEIPT DISPATCH GATE holds
+	// this leg exactly like the event legs (grantReceiptGateArmed): while
+	// an analytics-grant receipt is retained undispatched, attributes must
+	// not overtake the grant on the wire — the fetch still goes out,
+	// attribute-less, and a later fetch attaches once the receipt has
+	// dispatched (the outbox retries at every dispatch point). Floor-off
+	// keeps the plain granted-only gate.
 	requestURL := fetchURL
 	usedSignature := ""
-	if attributedURL != "" && c.Consent() == ConsentGranted {
+	if attributedURL != "" && c.Consent() == ConsentGranted && !c.grantReceiptGateArmed(nil) {
 		requestURL = attributedURL
 		usedSignature = attributedSignature
 	}

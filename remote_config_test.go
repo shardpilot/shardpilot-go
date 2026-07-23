@@ -1939,6 +1939,7 @@ func TestRemoteConfigAttributeSignatureKeysRevalidation(t *testing.T) {
 	}))
 	defer server.Close()
 
+	cachePath := filepath.Join(t.TempDir(), "rc-cache.json")
 	client, err := NewClient(Config{
 		IngestURL:                     server.URL,
 		Token:                         "test-token",
@@ -1949,6 +1950,7 @@ func TestRemoteConfigAttributeSignatureKeysRevalidation(t *testing.T) {
 		AnonymousID:                   "anon-attr-etag",
 		APIKey:                        "test-rc-key",
 		RemoteConfigURL:               server.URL,
+		RemoteConfigCachePath:         cachePath,
 		RemoteConfigAttributesEnabled: true,
 		FlushInterval:                 time.Hour,
 		HTTPTimeout:                   time.Second,
@@ -2004,7 +2006,20 @@ func TestRemoteConfigAttributeSignatureKeysRevalidation(t *testing.T) {
 	client.rc.mu.Unlock()
 	if len(storedSignature) != 64 || strings.Contains(storedSignature, "geo") ||
 		strings.Contains(storedSignature, "US") {
-		t.Fatalf("the stored signature must be a non-reversible digest, got %q", storedSignature)
+		t.Fatalf("the in-memory signature must be a digest, got %q", storedSignature)
+	}
+	// The DURABLE record persists NOTHING attribute-derived: no signature
+	// field (even a digest of the small targeting vocabulary is
+	// dictionary-guessable) and no attribute bytes — a restart forgets the
+	// signature and the first attributed refetch is a full fetch.
+	durable, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatalf("read durable cache: %v", err)
+	}
+	if strings.Contains(string(durable), "attribute_signature") ||
+		strings.Contains(string(durable), "geo") ||
+		strings.Contains(string(durable), storedSignature) {
+		t.Fatalf("the durable record must carry nothing attribute-derived, got %s", durable)
 	}
 	// The 304-renewed attributed record keeps revalidating too.
 	if p := fetch(t); p.query != "geo=US" || p.ifNoneMatch != `"shared-validator"` {
@@ -2016,6 +2031,86 @@ func TestRemoteConfigAttributeSignatureKeysRevalidation(t *testing.T) {
 	if p := fetch(t); p.query != "" || p.ifNoneMatch != "" {
 		t.Fatalf("post-downgrade fetch must drop the attributed ETag, got %+v", p)
 	}
+}
+
+// TestRemoteConfigAttributesHoldWhileGrantReceiptPending pins the consent-
+// floor interplay: under Config.ConsentFloor, a granted state whose
+// analytics-grant RECEIPT is still retained undispatched holds the
+// attribute leg exactly like the event legs — the fetch goes out
+// attribute-less (never gated as a whole; config delivery stays
+// consent-neutral), so targeting attributes can never overtake the grant
+// on the wire on a strict-consent workspace. Once the receipt has
+// dispatched, attributes ride.
+func TestRemoteConfigAttributesHoldWhileGrantReceiptPending(t *testing.T) {
+	var consentBlocked atomic.Bool
+	consentBlocked.Store(true)
+	seen := make(chan string, 8)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/config/v1/") {
+			seen <- r.URL.RawQuery
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"version":1,"values":{"k":"v"}}`))
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/v1/consent") && consentBlocked.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	newFloorClient := func(t *testing.T, anonymousID string) *Client {
+		t.Helper()
+		client, err := NewClient(Config{
+			IngestURL:                     server.URL,
+			Token:                         "test-token",
+			WorkspaceID:                   "workspace-test",
+			AppID:                         "app-test",
+			EnvironmentID:                 "develop",
+			Source:                        SourceBackend,
+			AnonymousID:                   anonymousID,
+			APIKey:                        "test-rc-key",
+			RemoteConfigURL:               server.URL,
+			RemoteConfigAttributesEnabled: true,
+			ConsentFloor:                  &ConsentFloorConfig{},
+			FlushInterval:                 time.Hour,
+			HTTPTimeout:                   time.Second,
+		})
+		if err != nil {
+			t.Fatalf("NewClient: %v", err)
+		}
+		return client
+	}
+	fetchQuery := func(t *testing.T, client *Client) string {
+		t.Helper()
+		if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+			t.Fatalf("FetchRemoteConfig: %v", err)
+		}
+		return <-seen
+	}
+
+	// Gate armed: the grant's receipt cannot dispatch (consent endpoint
+	// failing), so it stays retained — the fetch happens attribute-less.
+	held := newFloorClient(t, "anon-floor-held")
+	held.SetRemoteConfigAttributes(map[string]string{"geo": "US"})
+	held.SetConsent(true)
+	if query := fetchQuery(t, held); query != "" {
+		t.Fatalf("a retained grant receipt must hold attributes, got query %q", query)
+	}
+	held.Close(context.Background())
+
+	// Gate released: the receipt dispatches (Track is a dispatch point;
+	// the consent endpoint accepts) and the next fetch carries attributes.
+	consentBlocked.Store(false)
+	released := newFloorClient(t, "anon-floor-open")
+	released.SetRemoteConfigAttributes(map[string]string{"geo": "US"})
+	released.SetConsent(true)
+	_ = released.Track(context.Background(), Event{Name: "receipt_dispatch_probe"})
+	if query := fetchQuery(t, released); query != "geo=US" {
+		t.Fatalf("a dispatched grant receipt must release attributes, got query %q", query)
+	}
+	released.Close(context.Background())
 }
 
 // TestAppendRemoteConfigAttributesEscapes pins the query assembly: the same
