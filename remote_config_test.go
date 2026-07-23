@@ -2021,6 +2021,26 @@ func TestRemoteConfigAttributeSignatureKeysRevalidation(t *testing.T) {
 		strings.Contains(string(durable), storedSignature) {
 		t.Fatalf("the durable record must carry nothing attribute-derived, got %s", durable)
 	}
+	// An attributed record persists WITHOUT its ETag: the signature that
+	// scopes the validator is not persisted, so a reloaded copy could never
+	// prove a same-signature fetch — while the in-process record keeps its
+	// ETag (the revalidation legs above and below ride it).
+	var durableRecord rcCache
+	if err := json.Unmarshal(durable, &durableRecord); err != nil {
+		t.Fatalf("unmarshal durable cache: %v", err)
+	}
+	if durableRecord.ETag != "" {
+		t.Fatalf("an attributed record must persist without its ETag, got %q", durableRecord.ETag)
+	}
+	client.rc.mu.Lock()
+	heldETag := ""
+	if client.rc.held != nil {
+		heldETag = client.rc.held.ETag
+	}
+	client.rc.mu.Unlock()
+	if heldETag != `"shared-validator"` {
+		t.Fatalf("the in-process attributed record must keep its ETag, got %q", heldETag)
+	}
 	// The 304-renewed attributed record keeps revalidating too.
 	if p := fetch(t); p.query != "geo=US" || p.ifNoneMatch != `"shared-validator"` {
 		t.Fatalf("attributed revalidation must continue after a 304, got %+v", p)
@@ -2030,6 +2050,54 @@ func TestRemoteConfigAttributeSignatureKeysRevalidation(t *testing.T) {
 	client.SetConsent(false)
 	if p := fetch(t); p.query != "" || p.ifNoneMatch != "" {
 		t.Fatalf("post-downgrade fetch must drop the attributed ETag, got %+v", p)
+	}
+
+	// RESTART: a fresh process reloads the attributed record with neither
+	// signature nor ETag. The hole this closes: with an ETag at rest, an
+	// attribute-less restart fetch would read cacheSignature ==
+	// usedSignature == "" and send the TARGETED validator — a shared
+	// publication validator could then 304 the previous target's body into
+	// serving as untargeted. With no ETag at rest, the first fetch after a
+	// reload is a full fetch on every leg.
+	restartFetch := func(t *testing.T, attributed bool) probe {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "rc-cache-restart.json")
+		if err := os.WriteFile(path, durable, 0o600); err != nil {
+			t.Fatalf("seed restart cache: %v", err)
+		}
+		restarted, err := NewClient(Config{
+			IngestURL:                     server.URL,
+			Token:                         "test-token",
+			WorkspaceID:                   "workspace-test",
+			AppID:                         "app-test",
+			EnvironmentID:                 "develop",
+			Source:                        SourceBackend,
+			AnonymousID:                   "anon-attr-etag",
+			APIKey:                        "test-rc-key",
+			RemoteConfigURL:               server.URL,
+			RemoteConfigCachePath:         path,
+			RemoteConfigAttributesEnabled: true,
+			FlushInterval:                 time.Hour,
+			HTTPTimeout:                   time.Second,
+		})
+		if err != nil {
+			t.Fatalf("NewClient (restart): %v", err)
+		}
+		defer restarted.Close(context.Background())
+		if attributed {
+			restarted.SetRemoteConfigAttributes(map[string]string{"geo": "US"})
+			restarted.SetConsent(true)
+		}
+		if _, err := restarted.FetchRemoteConfig(context.Background()); err != nil {
+			t.Fatalf("FetchRemoteConfig (restart): %v", err)
+		}
+		return <-seen
+	}
+	if p := restartFetch(t, false); p.query != "" || p.ifNoneMatch != "" {
+		t.Fatalf("an attribute-less fetch after reload must be a FULL fetch, got %+v", p)
+	}
+	if p := restartFetch(t, true); p.query != "geo=US" || p.ifNoneMatch != "" {
+		t.Fatalf("an attributed fetch after reload must be a FULL fetch, got %+v", p)
 	}
 }
 

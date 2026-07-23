@@ -114,15 +114,19 @@ type rcCache struct {
 	// normalized attribute query). IN-MEMORY ONLY — deliberately never
 	// serialized (json:"-"): even a digest of the small, known targeting
 	// vocabulary is dictionary-guessable, so NOTHING attribute-derived goes
-	// to disk — zero attribute-shaped bytes at rest, and a restart forgets
-	// the signature entirely (every reloaded record reads as
-	// attribute-less; the first attributed refetch after a restart is a
-	// full fetch, by design). The ETag revalidates ONLY against a fetch
-	// carrying the SAME signature: a shared publication validator must
-	// never 304 a differently-targeted request into serving the previous
-	// target's body. Value SERVING stays scope-keyed regardless of
-	// signature (the documented v1 limit — a cached body may reflect the
-	// previously sent attribute set until the next successful fetch).
+	// to disk — zero attribute-shaped bytes at rest. Because a restart
+	// forgets the signature, an attributed record's ETag must not survive
+	// either: saveDurable blanks the ETag at rest for signed records. A
+	// reloaded record whose signature cannot be PROVEN equal to the next
+	// fetch's must never revalidate — an attribute-less restart fetch
+	// reusing a targeted validator would let a shared publication validator
+	// 304 the previous target's body into serving as untargeted — so the
+	// first fetch after reloading a previously-attributed record is a full
+	// fetch on EVERY leg, by design. The ETag revalidates ONLY against a
+	// fetch carrying the SAME signature. Value SERVING stays scope-keyed
+	// regardless of signature (the documented v1 limit — a cached body may
+	// reflect the previously sent attribute set until the next successful
+	// fetch).
 	AttributeSignature string `json:"-"`
 }
 
@@ -509,8 +513,20 @@ func (rc *remoteConfigState) loadCacheLocked() *rcCache {
 // caller chose — often shared (/tmp, an XDG cache dir) — so a pre-existing
 // parent's permissions are never changed; tightening is reserved for the
 // dedicated SpoolDir state directory the SDK owns.
+//
+// An ATTRIBUTED record persists WITHOUT its ETag: the signature that scopes
+// the validator is never written (json:"-"), so a reloaded copy could not
+// tell a targeted validator apart from an attribute-less one — and an
+// attribute-less fetch reusing it would let a shared publication validator
+// 304 the previous target's body into serving as untargeted. The in-process
+// held record keeps its ETag, so same-process revalidation is unaffected;
+// only a reload (restart or sibling process) pays a full fetch.
 func (rc *remoteConfigState) saveDurable(record *rcCache) error {
-	payload, err := marshalRCCache(record)
+	durable := *record
+	if durable.AttributeSignature != "" {
+		durable.ETag = ""
+	}
+	payload, err := marshalRCCache(&durable)
 	if err != nil {
 		return err
 	}
@@ -925,27 +941,40 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 	callerCtx := ctx
 	ctx, cancel := contextWithDefaultTimeout(ctx, c.cfg.HTTPTimeout)
 	defer cancel()
-	// The last-moment consent read: the decision and the dispatch are
-	// adjacent, with no work between them a downgrade could hide behind.
-	// Under the opt-in consent floor the GRANT-RECEIPT DISPATCH GATE holds
-	// this leg exactly like the event legs (grantReceiptGateArmed): while
-	// an analytics-grant receipt is retained undispatched, attributes must
-	// not overtake the grant on the wire — the fetch still goes out,
-	// attribute-less, and a later fetch attaches once the receipt has
-	// dispatched (the outbox retries at every dispatch point). Floor-off
-	// keeps the plain granted-only gate.
-	requestURL := fetchURL
-	usedSignature := ""
-	if attributedURL != "" && c.Consent() == ConsentGranted && !c.grantReceiptGateArmed(nil) {
-		requestURL = attributedURL
-		usedSignature = attributedSignature
-	}
 	// The cached ETag revalidates only a SAME-SIGNATURE request: a 304
 	// against a differently-attributed URL could otherwise serve the
 	// previous target's body as "current" under a shared publication
-	// validator. A signature change forces a full fetch instead.
-	if cache != nil && cacheSignature != usedSignature {
-		etag = ""
+	// validator. A signature change forces a full fetch instead. Both
+	// legs' validators are decided BEFORE the consent read below, so
+	// nothing sits between that read and the dispatch.
+	baselineEtag, attributedEtag := etag, etag
+	if cache != nil && cacheSignature != "" {
+		baselineEtag = ""
+	}
+	if cache != nil && cacheSignature != attributedSignature {
+		attributedEtag = ""
+	}
+	// The consent read at the transport handoff: this gate is the FINAL
+	// statement before the transport call — no work between the read and
+	// the dispatch for a downgrade to hide behind. The residual window (a
+	// downgrade completing between this read and the request bytes
+	// reaching the wire) is irreducible without recalling sent requests —
+	// closing it with a lock would make consent writes block on network
+	// I/O. Its response still lands signature-stamped, so the very next
+	// fetch — attribute-less after the downgrade — sees the signature
+	// mismatch, drops If-None-Match, and replaces the targeted body with a
+	// full fetch. Under the opt-in consent floor the GRANT-RECEIPT
+	// DISPATCH GATE holds this leg exactly like the event legs
+	// (grantReceiptGateArmed): while an analytics-grant receipt is
+	// retained undispatched, attributes must not overtake the grant on the
+	// wire — the fetch still goes out, attribute-less, and a later fetch
+	// attaches once the receipt has dispatched (the outbox retries at
+	// every dispatch point). Floor-off keeps the plain granted-only gate.
+	requestURL := fetchURL
+	usedSignature := ""
+	etag = baselineEtag
+	if attributedURL != "" && c.Consent() == ConsentGranted && !c.grantReceiptGateArmed(nil) {
+		requestURL, usedSignature, etag = attributedURL, attributedSignature, attributedEtag
 	}
 	resp, err := c.transport.FetchRemoteConfig(ctx, remoteConfigRequest{
 		url:         requestURL,
