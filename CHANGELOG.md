@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Optional pseudonymous actor keys on crash reports: `Event.AnonymousID` / `Event.SessionID`,
+  with `ClientOptions.AnonymousID` / `ClientOptions.SessionID` as client-wide defaults that a
+  per-event value overrides (the same rule as `Source`). Both fields are `omitempty`, so a
+  client that does not opt in keeps a byte-identical wire shape.
+  - Setting an anonymous id is what lets a crash be measured against an active-user
+    denominator, honour a per-subject diagnostics opt-out, and be reached by a per-subject
+    erasure. It is hashed server-side; the raw value is not stored on the occurrence.
+  - No default and no host-derived fallback. A backend process serves many players, so a
+    process-wide identity would attribute every crash to one synthetic actor; prefer the
+    per-event field, set from the request being served.
+  - A raw account id is deliberately **not** carried: crash ingest authenticates with an API
+    key, so a client-asserted account id is unverified and is never used as the actor key.
+  - A malformed value (free text, email, IP, JWT, raw `user_`/`player_`/`device_` id, or over
+    512 bytes) drops the field only — never the crash report.
+
 - Dark Phase-D crash-capture opt-ins in `pkg/crash` (ADR-0297 §7d; both default `false` —
   while off zero new code paths execute and the auto-captured wire shape is byte-identical;
   enabling is gated by the platform's Phase-D arming order on the SDK's consent gate + durable

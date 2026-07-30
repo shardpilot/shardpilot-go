@@ -25,6 +25,8 @@ type Client struct {
 	apiKey       string
 	app          AppInfo
 	source       string
+	anonymousID  string
+	sessionID    string
 	httpClient   *http.Client
 	logger       Logger
 	sampler      Sampler
@@ -95,6 +97,23 @@ type ClientOptions struct {
 	// calling goroutine — including the auto-capture path during a panic — so keep it
 	// fast and non-blocking; a panic inside it is recovered and ignored.
 	OnResult func(Result)
+	// AnonymousID is the pseudonymous actor key stamped on every event that does not
+	// set its own (a per-event value always wins), exactly like Source. Setting it
+	// links this process's crashes to a diagnostics-consent decision, makes them
+	// reachable by a per-subject erasure, and lets them count against an active-user
+	// denominator.
+	//
+	// It has NO DEFAULT and is deliberately not derived from the host. This SDK
+	// reports crashes for BACKEND services, where one process serves many players:
+	// a process-wide identity would attribute every server crash to a single
+	// synthetic actor, and a "share of actors who did not crash" computed over that
+	// population would describe the fleet, not the players. Set it only where the
+	// process genuinely represents one subject — a tool, an agent, a single-tenant
+	// job — or set the per-event field from the request being served.
+	AnonymousID string
+	// SessionID is the session id stamped on every event that does not set its own.
+	// Same per-event-wins rule and the same caution as AnonymousID.
+	SessionID string
 }
 
 // Result is the outcome of a crash ingest, parsed from the server's response.
@@ -184,7 +203,12 @@ func NewClient(opts ClientOptions) (*Client, error) {
 			Version: strings.TrimSpace(opts.App.Version),
 			BuildID: strings.TrimSpace(opts.App.BuildID),
 		},
-		source:        strings.TrimSpace(opts.Source),
+		source: strings.TrimSpace(opts.Source),
+		// Validated once here rather than on every event: a client-wide identity
+		// that cannot reach the wire should be inert from construction, not
+		// re-checked (and re-dropped) per crash.
+		anonymousID:   sanitizeActorIdentifier(opts.AnonymousID),
+		sessionID:     sanitizeActorIdentifier(opts.SessionID),
 		httpClient:    httpClient,
 		logger:        opts.Logger,
 		sampler:       sampler,
@@ -257,6 +281,14 @@ func (c *Client) prepareEvent(event Event, trustedFrameFunctions bool) (Event, e
 	}
 	if strings.TrimSpace(event.Source) == "" {
 		event.Source = c.source
+	}
+	// Actor keys follow the same per-event-wins rule as Source. Both stay empty
+	// unless the caller opted in somewhere: there is no host-derived fallback.
+	if strings.TrimSpace(event.AnonymousID) == "" {
+		event.AnonymousID = c.anonymousID
+	}
+	if strings.TrimSpace(event.SessionID) == "" {
+		event.SessionID = c.sessionID
 	}
 	if event.CrashID == "" {
 		id, err := newCrashID()

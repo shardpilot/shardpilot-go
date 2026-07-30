@@ -340,6 +340,20 @@ crashClient, err := crash.NewClient(crash.ClientOptions{
 - `RecordBreadcrumb(name)` — ring buffer attached to subsequent events.
 - Events are PII-scrubbed and sanitized before send; retries default to 2
   attempts with backoff, honoring `Retry-After`.
+- `Event.AnonymousID` / `Event.SessionID` — optional pseudonymous actor keys,
+  omitted from the payload when unset. Setting an anonymous id is what lets a
+  crash be counted against an active-user denominator, honour a per-subject
+  diagnostics opt-out, and be reached by a per-subject erasure. Use the SAME
+  anonymous id the analytics client uses, or the two will not join. The value
+  is hashed server-side; the raw id is not stored on the occurrence.
+  `ClientOptions.AnonymousID`/`SessionID` set a client-wide default (per-event
+  wins, like `Source`), but **leave the client-wide value unset in a normal
+  backend service**: one process serves many players, so a process-wide
+  identity attributes every crash to one synthetic actor. Set the per-event
+  field from the request being served. A raw ACCOUNT id is not carried at all —
+  crash ingest is API-key authenticated, so a client-asserted account id is
+  unverified and never becomes the actor key. A malformed value drops the
+  field, never the report.
 - The crash `IngestURL` must be HTTPS outside localhost/loopback — unlike
   the analytics client, there is **no** private-network HTTP option here.
 
