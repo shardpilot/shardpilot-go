@@ -336,3 +336,115 @@ func validEventForBenchmark() Event {
 		Breadcrumbs: []Breadcrumb{{Name: "screen_open", Timestamp: time.Unix(1700000001, 0).UTC()}},
 	}
 }
+
+func TestClientActorKeyDefaultsAndPerEventOverride(t *testing.T) {
+	var bodies []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		bodies = append(bodies, string(body))
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	const clientAnon = "0198f2c1-4b3a-7c2d-8e9f-a1b2c3d4e5f6"
+	const eventAnon = "0198f2c1-4b3a-7c2d-8e9f-ffffffffffff"
+
+	client, err := NewClient(ClientOptions{
+		IngestURL:   server.URL,
+		APIKey:      "workspace-api-key-test",
+		App:         AppInfo{ID: "app-test"},
+		Sampler:     alwaysSampler{},
+		AnonymousID: clientAnon,
+		SessionID:   "session-abc",
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	// 1. The client-wide key is stamped on an event that sets none.
+	if err := client.Emit(context.Background(), validEvent(t)); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	// 2. A per-event key wins, exactly like Source.
+	override := validEvent(t)
+	override.AnonymousID = eventAnon
+	if err := client.Emit(context.Background(), override); err != nil {
+		t.Fatalf("Emit override: %v", err)
+	}
+
+	if len(bodies) != 2 {
+		t.Fatalf("expected 2 posts, got %d", len(bodies))
+	}
+	if !strings.Contains(bodies[0], clientAnon) {
+		t.Fatalf("client-wide anonymous_id not stamped: %s", bodies[0])
+	}
+	if !strings.Contains(bodies[0], `"session_id":"session-abc"`) {
+		t.Fatalf("client-wide session_id not stamped: %s", bodies[0])
+	}
+	if !strings.Contains(bodies[1], eventAnon) || strings.Contains(bodies[1], clientAnon) {
+		t.Fatalf("per-event anonymous_id did not win: %s", bodies[1])
+	}
+}
+
+func TestClientWithoutActorKeyKeepsWireShapeUnchanged(t *testing.T) {
+	// The dark-default guarantee every prior crash feature made: a client that
+	// does not opt in must produce a payload with no identity keys at all, not
+	// keys with empty values.
+	var body string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		body = string(raw)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+
+	client, err := NewClient(ClientOptions{
+		IngestURL: server.URL,
+		APIKey:    "workspace-api-key-test",
+		App:       AppInfo{ID: "app-test"},
+		Sampler:   alwaysSampler{},
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	if err := client.Emit(context.Background(), validEvent(t)); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	// Decode to TOP-LEVEL keys: a substring check would false-positive on the
+	// caller's own context.session_id, which is a different, long-standing field.
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(body), &top); err != nil {
+		t.Fatalf("no decodable payload was posted, so the omission check would be vacuous: %q", body)
+	}
+	if _, ok := top["crash_id"]; !ok {
+		t.Fatalf("payload did not look like a crash report: %s", body)
+	}
+	for _, key := range []string{"anonymous_id", "session_id", "user_id"} {
+		if _, present := top[key]; present {
+			t.Fatalf("payload must omit top-level %q entirely when unset: %s", key, body)
+		}
+	}
+}
+
+func TestClientRejectsUnusableClientWideActorKeyWithoutFailing(t *testing.T) {
+	// A malformed client-wide identity is inert from construction: the client
+	// still builds and still reports crashes, just without the correlation key.
+	client, err := NewClient(ClientOptions{
+		IngestURL:   "https://ingest.invalid",
+		APIKey:      "workspace-api-key-test",
+		App:         AppInfo{ID: "app-test"},
+		AnonymousID: "user_4242",
+	})
+	if err != nil {
+		t.Fatalf("a bad actor key must not fail client construction: %v", err)
+	}
+	if client.anonymousID != "" {
+		t.Fatalf("expected raw-id anonymous_id to be dropped, got %q", client.anonymousID)
+	}
+}

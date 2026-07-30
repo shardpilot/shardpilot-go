@@ -352,3 +352,85 @@ func TestSanitizeEventBlanksTokenInManualFrameFunction(t *testing.T) {
 		t.Fatalf("token-like manual frame function must be blanked on the wire, got %q", got)
 	}
 }
+
+func TestSanitizeActorIdentifierKeepsEveryRealisticIDFormat(t *testing.T) {
+	// The formats a game or service realistically uses as an anonymous id. All
+	// must survive verbatim: a scrub tier that silently blanks one of these
+	// would make crash-to-actor linkage depend on which id format the caller
+	// happened to pick, which is worse than not linking at all.
+	for _, value := range []string{
+		"0198f2c1-4b3a-7c2d-8e9f-a1b2c3d4e5f6",                             // UUIDv7
+		"0198f2c14b3a7c2d8e9fa1b2c3d4e5f6",                                 // UUID, no dashes
+		"3f786850e387550fdab836ed7e6dc881de23001b3f786850e387550fdab836ed", // 64-char hex digest
+		"aGVsbG93b3JsZGhlbGxvd29ybGRoZWxsb3dvcmxkMTIzNA",                   // base64url token
+		"anon-123",
+		"install.4f2a:9",
+	} {
+		if got := sanitizeActorIdentifier(value); got != value {
+			t.Fatalf("sanitizeActorIdentifier(%q) = %q, want it kept verbatim", value, got)
+		}
+	}
+}
+
+func TestSanitizeActorIdentifierDropsIdentityBearingValues(t *testing.T) {
+	for name, value := range map[string]string{
+		"raw user id":     "user_4242",
+		"raw player id":   "player_77",
+		"raw device id":   "device_abc123",
+		"email":           "player@example.invalid",
+		"ipv4":            "198.51.100.23",
+		"jwt":             "header.eyJzdWIiOiJ0ZXN0In0.signature",
+		"free text":       "not an id at all",
+		"leading symbol":  "-leading-dash",
+		"over byte bound": strings.Repeat("a", maxActorIdentifierBytes+1),
+	} {
+		if got := sanitizeActorIdentifier(value); got != "" {
+			t.Fatalf("%s: sanitizeActorIdentifier(%q) = %q, want dropped", name, value, got)
+		}
+	}
+	// Exactly at the bound is still acceptable — the service accepts it too.
+	atBound := strings.Repeat("a", maxActorIdentifierBytes)
+	if got := sanitizeActorIdentifier(atBound); got != atBound {
+		t.Fatalf("identifier at the byte bound was dropped")
+	}
+}
+
+func TestSanitizeEventDropsBadActorKeyButKeepsTheReport(t *testing.T) {
+	// The load-bearing asymmetry: a malformed actor key costs the FIELD, never
+	// the crash. Contrast TestSanitizeEventRejectsUnsafeSessionID, where the
+	// same material inside the caller's context map fails the whole event.
+	event := validEvent(t)
+	event.AnonymousID = "user_4242"
+	event.SessionID = "player@example.invalid"
+
+	sanitized, err := SanitizeEvent(event)
+	if err != nil {
+		t.Fatalf("SanitizeEvent must not reject a report over a bad actor key: %v", err)
+	}
+	if sanitized.AnonymousID != "" {
+		t.Fatalf("expected raw-id anonymous_id to be dropped, got %q", sanitized.AnonymousID)
+	}
+	if sanitized.SessionID != "" {
+		t.Fatalf("expected email-like session_id to be dropped, got %q", sanitized.SessionID)
+	}
+	if sanitized.CrashID == "" || sanitized.Exception.Type == "" {
+		t.Fatalf("the report itself must survive intact")
+	}
+}
+
+func TestSanitizeEventKeepsGoodActorKey(t *testing.T) {
+	event := validEvent(t)
+	event.AnonymousID = "0198f2c1-4b3a-7c2d-8e9f-a1b2c3d4e5f6"
+	event.SessionID = "0198f2c1-4b3a-7c2d-8e9f-000000000001"
+
+	sanitized, err := SanitizeEvent(event)
+	if err != nil {
+		t.Fatalf("SanitizeEvent returned error: %v", err)
+	}
+	if sanitized.AnonymousID != event.AnonymousID {
+		t.Fatalf("anonymous_id = %q, want %q", sanitized.AnonymousID, event.AnonymousID)
+	}
+	if sanitized.SessionID != event.SessionID {
+		t.Fatalf("session_id = %q, want %q", sanitized.SessionID, event.SessionID)
+	}
+}

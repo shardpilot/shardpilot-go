@@ -53,6 +53,15 @@ func sanitizeEvent(event Event, trustedFrameFunctions bool) (Event, error) {
 	if sessionID := event.Context["session_id"]; containsDisallowedContent(sessionID) {
 		return Event{}, fmt.Errorf("%w: context.session_id contains disallowed identifier material", ErrInvalidEvent)
 	}
+	// The actor keys are SDK-owned top-level fields, so a bad value DROPS THE
+	// FIELD rather than failing the event. That is deliberately the opposite of
+	// the context.session_id rule directly above: that one guards a caller's
+	// free-form context map, where a raw identifier is a caller mistake worth
+	// surfacing loudly. Here the report itself is the payload of record — losing
+	// a crash because an identity provider returned a malformed id would trade a
+	// diagnostic for a correlation key, which is the wrong way round.
+	event.AnonymousID = sanitizeActorIdentifier(event.AnonymousID)
+	event.SessionID = sanitizeActorIdentifier(event.SessionID)
 	event.Device = sanitizeStringMap(event.Device)
 	event.Context = sanitizeStringMap(event.Context)
 	event.Metadata = sanitizeStringMap(event.Metadata)

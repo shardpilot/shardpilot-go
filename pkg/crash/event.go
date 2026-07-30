@@ -3,6 +3,7 @@ package crash
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -46,6 +47,59 @@ type Event struct {
 	Breadcrumbs           []Breadcrumb      `json:"breadcrumbs,omitempty"`
 	FingerprintComponents []string          `json:"fingerprint_components,omitempty"`
 	Metadata              map[string]string `json:"metadata,omitempty"`
+	// AnonymousID is the pseudonymous actor key this crash belongs to — the same
+	// device/installation-scoped id the analytics plane stamps on events. The
+	// service hashes it server-side into the canonical actor key, which is what
+	// links a crash to its diagnostics-consent decision, makes the occurrence
+	// reachable by a per-subject erasure, and lets a crash be counted against an
+	// active-user denominator. Omitted from the wire when unset, so a client that
+	// never sets it keeps the previous byte-identical payload shape.
+	//
+	// A raw ACCOUNT id is deliberately not carried on this struct. Crash ingest
+	// authenticates with an API key, so there is no verified bound subject: an
+	// account id asserted by the client is unverified and the service never keys
+	// the actor on it. Sending one would put a raw account identifier on the wire
+	// for no analytical gain.
+	AnonymousID string `json:"anonymous_id,omitempty"`
+	// SessionID is the analytics session the crash happened in, when the caller
+	// tracks one. Optional and omitted when unset; it is hashed server-side like
+	// AnonymousID and is never used as the actor key.
+	SessionID string `json:"session_id,omitempty"`
+}
+
+// maxActorIdentifierBytes bounds a raw actor identifier on the wire. It matches
+// the bound the ingest service enforces (and the other engine SDKs apply), so an
+// identifier this SDK sends is one the service will accept: over-long values are
+// dropped here rather than rejected there, which would cost the whole report.
+const maxActorIdentifierBytes = 512
+
+// actorIdentifierPattern is the token shape an actor identifier must have: an
+// alphanumeric first character followed by id-safe characters. It admits every
+// identifier format a game realistically uses — a UUID, a hex digest, a
+// base64url token, a short slug — while refusing free-form text (spaces,
+// punctuation, a sentence, an email local part) that is not a stable key.
+var actorIdentifierPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]*$`)
+
+// sanitizeActorIdentifier returns the identifier when it is a safe key, and ""
+// when it is not. A rejected identifier DROPS THE FIELD ONLY — never the report:
+// a crash is the payload of record and must survive a caller's malformed id.
+//
+// Content rules come from containsDisallowedContent (raw-id prefixes, emails, IP
+// addresses, JWT-shaped values), which is the same bar every other caller string
+// on this event clears. The shape and length rules are additional: an actor key
+// is a token, not free text.
+func sanitizeActorIdentifier(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || len(value) > maxActorIdentifierBytes {
+		return ""
+	}
+	if !actorIdentifierPattern.MatchString(value) {
+		return ""
+	}
+	if containsDisallowedContent(value) {
+		return ""
+	}
+	return value
 }
 
 type AppInfo struct {

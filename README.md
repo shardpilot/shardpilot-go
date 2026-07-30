@@ -182,7 +182,25 @@ Two **default-off** capture opt-ins extend automatic capture (both dark by defau
 
 The example programs read these from `SHARDPILOT_*` environment variables; the SDK itself reads no environment variables.
 
-Crash client (`crash.ClientOptions`): `IngestURL` (crash ingest base URL), `APIKey` (needs `crash:write`), plus optional `App` (`AppInfo{ID,Version,BuildID}` — defaulted onto every event; **required for automatic panic capture**, and `App.ID` must equal the API key's app scope), `Source` (component slug), `DebugIDFillEnabled` (default `false` — dark; self-module debug-id fill, see "Automatic panic capture"), `AllGoroutineCaptureEnabled` (default `false` — dark; all-goroutine threads at panic time, same section), `HTTPClient`, `Logger`, `Sampler`, `MaxAttempts` (default 2), `RetryBackoff` (default 50ms). Default HTTP timeout is 30s.
+Crash client (`crash.ClientOptions`): `IngestURL` (crash ingest base URL), `APIKey` (needs `crash:write`), plus optional `App` (`AppInfo{ID,Version,BuildID}` — defaulted onto every event; **required for automatic panic capture**, and `App.ID` must equal the API key's app scope), `Source` (component slug), `AnonymousID`/`SessionID` (optional actor keys — see "Actor identity on crash reports"), `DebugIDFillEnabled` (default `false` — dark; self-module debug-id fill, see "Automatic panic capture"), `AllGoroutineCaptureEnabled` (default `false` — dark; all-goroutine threads at panic time, same section), `HTTPClient`, `Logger`, `Sampler`, `MaxAttempts` (default 2), `RetryBackoff` (default 50ms). Default HTTP timeout is 30s.
+
+### Actor identity on crash reports
+
+`Event.AnonymousID` and `Event.SessionID` are optional pseudonymous keys that say *who* a crash happened to. Both are omitted from the payload entirely when unset, so a client that ignores them sends exactly the bytes it sent before.
+
+Setting `AnonymousID` is what makes a crash:
+
+- **countable** — a crash can be measured against an active-user denominator (the "share of players who did not crash" reliability metric), which is impossible when reports carry no actor key;
+- **consent-aware** — the service can honour a diagnostics opt-out for that subject;
+- **erasable** — the occurrence becomes reachable by a per-subject deletion request.
+
+The service hashes the value server-side with a keyed digest; the raw id is not stored on the occurrence. Use the same anonymous id your analytics client uses, or the ids will not join.
+
+A raw **account** id is deliberately not part of this struct. Crash ingest authenticates with an API key, so there is no verified bound subject: any account id the client asserts is unverified, and the service never keys the actor on it.
+
+`ClientOptions.AnonymousID`/`SessionID` set a client-wide default stamped on every event that does not set its own (per-event wins, like `Source`). **There is no default and no host-derived fallback**, and for most Go services you should leave the client-wide value unset: one backend process serves many players, so a process-wide identity would attribute every server crash to a single synthetic actor. Set the per-event field from the request being served instead — or set the client-wide value only where the process genuinely represents one subject (a CLI tool, an agent, a single-tenant job).
+
+A malformed value (free-form text, an email, an IP, a JWT, a raw `user_`/`player_`/`device_`-prefixed id, or anything over 512 bytes) **drops the field, never the report** — a crash is worth more than a correlation key.
 
 ## Wire contract
 
