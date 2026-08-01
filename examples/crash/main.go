@@ -17,8 +17,22 @@ func main() {
 	*/
 	ingestURL := os.Getenv("SHARDPILOT_CRASH_INGEST_URL")
 	apiKey := os.Getenv("SHARDPILOT_API_KEY")
-	if ingestURL == "" || apiKey == "" {
-		log.Fatal("SHARDPILOT_CRASH_INGEST_URL and SHARDPILOT_API_KEY are required")
+	// The app id is REQUIRED, not decorative: an API key is bound to a single app, and
+	// crash ingest rejects a mismatch with
+	//   403 {"code":"forbidden","message":"crash app.id does not match API key app scope"}.
+	// A hardcoded placeholder therefore cannot work against any real workspace, so the id
+	// is read from the environment — the same shape examples/basic uses for its scope.
+	appID := os.Getenv("SHARDPILOT_APP_ID")
+	if ingestURL == "" || apiKey == "" || appID == "" {
+		log.Fatal("SHARDPILOT_CRASH_INGEST_URL, SHARDPILOT_API_KEY and SHARDPILOT_APP_ID are required")
+	}
+	appVersion := os.Getenv("SHARDPILOT_APP_VERSION")
+	if appVersion == "" {
+		appVersion = "0.2.0-alpha"
+	}
+	appBuild := os.Getenv("SHARDPILOT_APP_BUILD")
+	if appBuild == "" {
+		appBuild = "synthetic-build"
 	}
 
 	client, err := crash.NewClient(crash.ClientOptions{
@@ -38,7 +52,7 @@ func main() {
 
 	err = client.EmitFatal(ctx, crash.Event{
 		OccurredAt: time.Now().UTC(),
-		App:        crash.AppInfo{ID: "app_example", Version: "0.2.0-alpha", BuildID: "synthetic-build"},
+		App:        crash.AppInfo{ID: appID, Version: appVersion, BuildID: appBuild},
 		Platform:   "linux",
 		OS:         crash.OSInfo{Name: "linux", Version: "synthetic"},
 		Device:     map[string]string{"class": crash.DeviceClassDesktop, "arch": "x86_64"},
