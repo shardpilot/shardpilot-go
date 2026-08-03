@@ -34,10 +34,11 @@ stdlib-only with zero third-party dependencies. It:
 
 It deliberately does **not**: manage session lifecycles (`Event.SessionID` /
 `Event.SessionSequence` are passed through verbatim), refresh remote config
-on its own (no polling, no experiment assignment — every fetch is an
-explicit call), write anything to disk unless explicitly opted in
-(`SpoolDir` / `RemoteConfigCachePath` / `LoadOrCreateAnonymousID`; the live
-consent state is never restored from disk), or auto-instrument anything. On
+on its own (no polling — every remote-config fetch is an explicit call;
+experiment ASSIGNMENT is a separate dark opt-in, see below), write anything
+to disk unless explicitly opted in (`SpoolDir` / `RemoteConfigCachePath` /
+`LoadOrCreateAnonymousID`; the live consent state is restored from disk only
+under `Config.ConsentFloor`), or auto-instrument anything. On
 the network it sends telemetry and fetches remote config when asked — no
 other calls, no automatic actions.
 
@@ -150,9 +151,16 @@ environment variables.
 
 ## Consent model — READ THIS FIRST, IT IS INVERTED
 
-**This SDK's consent posture is deliberately the OPPOSITE of ShardPilot's
-consent-first client SDKs (Defold/Unity/Unreal).** Those SDKs transmit
-nothing while consent is unknown. This server-side SDK does the inverse:
+**Since `v0.6.0-alpha` this section describes TWO modes.** Everything below
+is the DEFAULT posture, with `Config.ConsentFloor` nil. Setting
+`Config.ConsentFloor` opts into the consent-first behaviour the client SDKs
+(Defold/Unity/Unreal) ship, and changes four of the statements below —
+each one is marked `WITH THE FLOOR`. Read the mode you are actually
+configuring; the default is unchanged from `v0.5.0-alpha`.
+
+**In the DEFAULT mode this SDK's consent posture is deliberately the
+OPPOSITE of the consent-first client SDKs.** Those SDKs transmit nothing
+while consent is unknown. This server-side SDK does the inverse:
 
 - **`unknown` (initial state) = the event pipeline is fully OPEN.** The SDK
   transmits events immediately, with no consent recorded. The integrating
@@ -161,6 +169,8 @@ nothing while consent is unknown. This server-side SDK does the inverse:
   track. Do not port client-SDK assumptions ("unknown means nothing is
   sent") into a Go backend integration; here that assumption silently
   becomes "everything is sent".
+  - **WITH THE FLOOR:** inverted — `Track`/`Enqueue` refuse with
+    `ErrConsentUnknown` until an explicit decision is recorded.
 - **`denied` = hard stop.** `SetConsent(false)` immediately makes `Track` /
   `Enqueue` return `ErrConsentDenied`, clears the pending queue (cleared
   events count as `Dropped`), and aborts any batch publish already in flight
@@ -171,6 +181,11 @@ nothing while consent is unknown. This server-side SDK does the inverse:
   "Offline behavior / spool"), never to re-apply it. If consent must survive
   restarts, store the decision yourself and re-apply it with `SetConsent` on
   startup, before publishing.
+  - **WITH THE FLOOR and `SpoolDir` set:** the persisted decision reloads as
+    the live state at construction, scoped to the configured
+    workspace/app/environment/actor tuple. A grant written in the
+    receipt-less default mode is never promoted — the floor starts
+    undecided, so record a fresh decision.
 - **Consent receipts are fire-and-forget.** A `SetConsent` call also
   transmits the decision to ShardPilot in the background — but only when an
   actor identity is configured (`Config.UserID`, else `Config.AnonymousID`);
@@ -179,6 +194,11 @@ nothing while consent is unknown. This server-side SDK does the inverse:
   (overflow discards the oldest; the newest decision wins server-side).
   Failures are only logged. `Close` waits (bounded by its context) for
   pending receipt sends.
+  - **WITH THE FLOOR:** receipts ride a durable outbox instead — 32
+    receipts, FIFO, retried until acknowledged and delivered strictly in
+    decision order, so grant-then-deny can never settle reversed. With
+    `SpoolDir` it survives process death; without it `Close` reports
+    `ErrConsentPending` while any remain undelivered.
 - **There is NO receipts-before-batch guarantee.** `SetConsent(true)` does
   not synchronize admission: events flushed before the background consent
   write lands on the server are still treated as consent-unknown there. On a
@@ -193,10 +213,12 @@ nothing while consent is unknown. This server-side SDK does the inverse:
   covers only the configured actor; events that override the actor per event
   (`Event.UserID` / `Event.AnonymousID`) need consent recorded for each such
   actor through that same service path.
-- **No forced-minor consent state.** The client SDKs' `denied_forced_minor`
-  state and its associated flow do not exist in this SDK; `SetConsent` takes
-  a plain bool and the states are exactly `unknown` / `granted` / `denied`
-  (read via `Consent()`).
+- **No forced-minor consent state through `SetConsent`.** `SetConsent` takes
+  a plain bool and the states it can reach are exactly `unknown` /
+  `granted` / `denied` (read via `Consent()`). Since `v0.6.0-alpha` the
+  client SDKs' `denied_forced_minor` state DOES exist here, reachable only
+  through `SetConsentDecision(ConsentDecisionDeniedForcedMinor)`; it gates
+  like a denial.
 
 ## Sending analytics events
 

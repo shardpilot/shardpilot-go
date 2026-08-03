@@ -30,7 +30,7 @@ Install the latest tagged release:
 go get github.com/shardpilot/shardpilot-go@v0.6.0-alpha
 ```
 
-`v0.6.0-alpha` is the latest tag. It ships the optional pseudonymous actor key on crash reports (`Event.AnonymousID` / `Event.SessionID`, both `omitempty` so a client that does not opt in keeps a byte-identical wire shape), the dark opt-in experiment-assignment consumer with consent-gated exposure/outcome producers, the dark opt-in remote-config targeting-attribute pass-through (ADR-0310 leg C), the Phase-D crash capture opt-ins (self-module debug-id fill and all-goroutine threads), and the opt-in client-side consent floor (`Config.ConsentFloor`), on top of the v0.5.0-alpha remote config client, disk spool, schema-revision declaration and full-jitter retry backoff documented in this README. To pin the previous tag that ships none of the above, use:
+`v0.6.0-alpha` is the latest tag. It ships the optional pseudonymous actor key on crash reports — `Event.AnonymousID`, the ONLY field the service keys the actor on, with `Event.SessionID` alongside it as session linkage that is never used as the actor key (both `omitempty`, so a client that does not opt in keeps a byte-identical wire shape) — the dark opt-in experiment-assignment consumer with consent-gated exposure/outcome producers, the dark opt-in remote-config targeting-attribute pass-through (ADR-0310 leg C), the Phase-D crash capture opt-ins (self-module debug-id fill and all-goroutine threads), and the opt-in client-side consent floor (`Config.ConsentFloor`), on top of the v0.5.0-alpha remote config client, disk spool, schema-revision declaration and full-jitter retry backoff documented in this README. To pin the previous tag that ships none of the above, use:
 
 ```bash
 go get github.com/shardpilot/shardpilot-go@v0.5.0-alpha
@@ -321,7 +321,7 @@ gofmt -l .
 
 Pre-v1; the API is explicitly unstable.
 
-- The crash actor key (`Event.AnonymousID` / `Event.SessionID`), the experiment-assignment consumer, the remote-config targeting-attribute pass-through, the Phase-D crash capture opt-ins and the client-side consent floor shipped in `v0.6.0-alpha`; the changelog's `Unreleased` section is currently empty.
+- The crash actor key (`Event.AnonymousID`; `Event.SessionID` is session linkage, not the actor key), the experiment-assignment consumer, the remote-config targeting-attribute pass-through, the Phase-D crash capture opt-ins and the client-side consent floor shipped in `v0.6.0-alpha`; the changelog's `Unreleased` section is currently empty.
 - Public developer docs are planned for `docs.shardpilot.com`; that domain is not yet provisioned.
 
 `v0.3.0-alpha` (tagged) removed the game-flavored `MatchID` field from the universal `Event` envelope; carry that context in `Props["match_id"]` instead (wire payload unchanged).
