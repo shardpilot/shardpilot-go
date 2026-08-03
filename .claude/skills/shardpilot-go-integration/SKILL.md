@@ -6,7 +6,7 @@ description: Use when integrating the ShardPilot Go SDK (shardpilot-go) into a G
 # Integrating the ShardPilot Go SDK
 
 This skill describes the SDK exactly as shipped in the
-pinned release tag `v0.5.0-alpha`. Every behavioral claim below was verified
+pinned release tag `v0.6.0-alpha`. Every behavioral claim below was verified
 against that tag's source. Where the SDK does not have a capability, this
 skill says so — do not invent config fields, endpoints, or behaviors beyond
 what is documented here.
@@ -44,7 +44,7 @@ other calls, no automatic actions.
 ## Install
 
 ```bash
-go get github.com/shardpilot/shardpilot-go@v0.5.0-alpha
+go get github.com/shardpilot/shardpilot-go@v0.6.0-alpha
 ```
 
 - Requires **Go 1.24+**.
@@ -460,7 +460,14 @@ Run against your dev/staging deployment credentials, then check each item:
    shutdown, and that `Close` returns `nil` (pending events + consent
    receipts flushed within the deadline).
 
-## Known limitations (verified 2026-07-19)
+## Known limitations (verified 2026-08-03 for `v0.6.0-alpha`)
+
+Re-verified against this tag's source: the experiment/remote-config bullet
+below (which `v0.6.0-alpha` made partly false), and the crash-consent bullet
+(`Config.ConsentFloor` is new in this tag but gates the ANALYTICS pipeline —
+it does not appear in `pkg/crash`, so the crash bullet still holds). The rest
+are carried forward from the 2026-07-19 verification against `v0.5.0-alpha`;
+every change in this release is additive and off by default.
 
 Stated plainly so integrations are designed around them, not surprised by
 them:
@@ -480,9 +487,14 @@ them:
   need a separate consent-write-capable service credential.
 - **No `denied_forced_minor` / forced-minor flow** (exists in ShardPilot's
   client SDKs, not here).
-- **Remote config is explicit-fetch-only** — no background refresh, no
-  experiment assignment or rule evaluation, and every fetch requires
-  `Config.AnonymousID` (the `client_id`).
+- **Remote config is explicit-fetch-only** — no background refresh, and every
+  fetch requires `Config.AnonymousID` (the `client_id`). Rule evaluation still
+  happens server-side only. Since `v0.6.0-alpha` there IS an experiment-assignment
+  consumer (`Config.ExperimentsEnabled`) and an attribute pass-through
+  (`Config.RemoteConfigAttributesEnabled`), but both are DARK: default `false`,
+  and with the platform's experimentation flags off in every environment an
+  enabled consumer receives 403 on every fetch. Do not design an integration
+  around either yet.
 - **Whole-batch loss on a permanent 4xx** — one invalid event drops its
   entire batch (partial-batch recovery is a known TODO).
 - **Non-fatal crash sampling defaults to 1-in-10 per client**, and a
