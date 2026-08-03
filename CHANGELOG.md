@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-## v0.6.0-alpha — 2026-08-03 — crash actor keys, experiments, remote-config targeting
+## v0.6.0-alpha — 2026-08-03 — crash actor key, experiments, remote-config targeting
 
 - Optional pseudonymous actor keys on crash reports: `Event.AnonymousID` / `Event.SessionID`,
   with `ClientOptions.AnonymousID` / `ClientOptions.SessionID` as client-wide defaults that a

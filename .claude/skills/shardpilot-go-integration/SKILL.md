@@ -54,7 +54,7 @@ go get github.com/shardpilot/shardpilot-go@v0.6.0-alpha
   - `github.com/shardpilot/shardpilot-go/pkg/crash` — crash reporting
     (package `crash`).
 - **`v0.1.0` is retracted** in `go.mod`; never pin it. Older usable pins
-  (`v0.4.0-alpha`, `v0.3.0-alpha`, `v0.2.0-alpha`, `v0.1.2`) ship
+  (`v0.5.0-alpha`, `v0.4.0-alpha`, `v0.3.0-alpha`, `v0.2.0-alpha`, `v0.1.2`) ship
   progressively less surface — prefer the pin above.
 - Pre-launch: there is no public production ingest endpoint yet. `IngestURL`
   is the base URL of the ShardPilot deployment you were given (or a local
@@ -487,6 +487,11 @@ Run against your dev/staging deployment credentials, then check each item:
 
 ## Known limitations (verified 2026-08-03 for `v0.6.0-alpha`)
 
+**Same scope as the consent section: these describe the DEFAULT posture,
+with `Config.ConsentFloor` nil.** Several of the consent-related bullets
+below do not hold with the floor enabled — its contract is the
+`Config.ConsentFloor` godoc, not this list.
+
 Re-verified against this tag's source: the experiment/remote-config bullet
 below (which `v0.6.0-alpha` made partly false), and the crash-consent bullet
 (`Config.ConsentFloor` is new in this tag but gates the ANALYTICS pipeline —
@@ -513,8 +518,9 @@ them:
   batches (`SetConsent(true)` does not gate or synchronize admission).
 - **Mode-A publishable keys cannot record grants** — denials only; grants
   need a separate consent-write-capable service credential.
-- **No `denied_forced_minor` / forced-minor flow** (exists in ShardPilot's
-  client SDKs, not here).
+- **The forced-minor state is not reachable through `SetConsent`** — it takes
+  a plain bool. Since `v0.6.0-alpha` `denied_forced_minor` does exist here,
+  recorded through `SetConsentDecision`, and gates like a denial.
 - **Remote config is explicit-fetch-only** — no background refresh, and every
   fetch requires `Config.AnonymousID` (the `client_id`). Rule evaluation still
   happens server-side only. Since `v0.6.0-alpha` there IS an experiment-assignment
