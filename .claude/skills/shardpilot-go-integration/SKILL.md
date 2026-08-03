@@ -11,6 +11,19 @@ against that tag's source. Where the SDK does not have a capability, this
 skill says so — do not invent config fields, endpoints, or behaviors beyond
 what is documented here.
 
+**SCOPE: the DEFAULT configuration.** `v0.6.0-alpha` added three opt-ins that
+change behaviour this guide states categorically, and it does not describe
+them — each has a large contract of its own, documented on the field:
+
+| opt-in | what it changes here |
+|---|---|
+| `Config.ConsentFloor` | intake under unknown consent, restart survival, receipt queueing/retry/ordering, whether admission waits on a receipt, which states are reachable, and which actor a spooled event is gated on |
+| `Config.ExperimentsEnabled` | adds a background revalidation lane, so the SDK is no longer call-only-when-asked |
+| `Config.RemoteConfigAttributesEnabled` | attributes ride the fetch, and a cached targeted response outlives the consent state that permitted it until the next fetch |
+
+If you enable any of them, read that field's godoc for its contract — a claim
+below that contradicts it is describing the default, not a bug.
+
 ## What the SDK does today
 
 `shardpilot-go` is ShardPilot's **server-side** Go SDK (backend/service tier),
