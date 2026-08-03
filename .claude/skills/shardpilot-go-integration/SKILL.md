@@ -6,10 +6,23 @@ description: Use when integrating the ShardPilot Go SDK (shardpilot-go) into a G
 # Integrating the ShardPilot Go SDK
 
 This skill describes the SDK exactly as shipped in the
-pinned release tag `v0.5.0-alpha`. Every behavioral claim below was verified
+pinned release tag `v0.6.0-alpha`. Every behavioral claim below was verified
 against that tag's source. Where the SDK does not have a capability, this
 skill says so — do not invent config fields, endpoints, or behaviors beyond
 what is documented here.
+
+**SCOPE: the DEFAULT configuration.** `v0.6.0-alpha` added three opt-ins that
+change behaviour this guide states categorically, and it does not describe
+them — each has a large contract of its own, documented on the field:
+
+| opt-in | what it changes here |
+|---|---|
+| `Config.ConsentFloor` | intake under unknown consent, restart survival, receipt queueing/retry/ordering, whether admission waits on a receipt, and which actor a spooled event is gated on. It does NOT gate the forced-minor state — `SetConsentDecision(ConsentDecisionDeniedForcedMinor)` works in either mode |
+| `Config.ExperimentsEnabled` | adds a background revalidation lane, so the SDK is no longer call-only-when-asked |
+| `Config.RemoteConfigAttributesEnabled` | attributes ride the fetch, and a cached targeted response outlives the consent state that permitted it until the next SUCCESSFUL fetch — a failed or offline attempt leaves the targeted values serving |
+
+If you enable any of them, read that field's godoc for its contract — a claim
+below that contradicts it is describing the default, not a bug.
 
 ## What the SDK does today
 
@@ -34,17 +47,18 @@ stdlib-only with zero third-party dependencies. It:
 
 It deliberately does **not**: manage session lifecycles (`Event.SessionID` /
 `Event.SessionSequence` are passed through verbatim), refresh remote config
-on its own (no polling, no experiment assignment — every fetch is an
-explicit call), write anything to disk unless explicitly opted in
-(`SpoolDir` / `RemoteConfigCachePath` / `LoadOrCreateAnonymousID`; the live
-consent state is never restored from disk), or auto-instrument anything. On
+on its own (no polling — every remote-config fetch is an explicit call;
+experiment ASSIGNMENT is a separate dark opt-in, see below), write anything
+to disk unless explicitly opted in (`SpoolDir` / `RemoteConfigCachePath` /
+`LoadOrCreateAnonymousID`; the live consent state is restored from disk only
+under `Config.ConsentFloor`), or auto-instrument anything. On
 the network it sends telemetry and fetches remote config when asked — no
 other calls, no automatic actions.
 
 ## Install
 
 ```bash
-go get github.com/shardpilot/shardpilot-go@v0.5.0-alpha
+go get github.com/shardpilot/shardpilot-go@v0.6.0-alpha
 ```
 
 - Requires **Go 1.24+**.
@@ -53,7 +67,7 @@ go get github.com/shardpilot/shardpilot-go@v0.5.0-alpha
   - `github.com/shardpilot/shardpilot-go/pkg/crash` — crash reporting
     (package `crash`).
 - **`v0.1.0` is retracted** in `go.mod`; never pin it. Older usable pins
-  (`v0.4.0-alpha`, `v0.3.0-alpha`, `v0.2.0-alpha`, `v0.1.2`) ship
+  (`v0.5.0-alpha`, `v0.4.0-alpha`, `v0.3.0-alpha`, `v0.2.0-alpha`, `v0.1.2`) ship
   progressively less surface — prefer the pin above.
 - Pre-launch: there is no public production ingest endpoint yet. `IngestURL`
   is the base URL of the ShardPilot deployment you were given (or a local
@@ -63,6 +77,14 @@ go get github.com/shardpilot/shardpilot-go@v0.5.0-alpha
   literals** — the SDK never resolves DNS names, so an internal hostname
   (e.g. a `.internal` alias) still requires HTTPS. The crash client has no
   such option and rejects any plain-HTTP URL outside localhost/loopback.
+
+- **`HTTPClient`** — when set, every request this SDK makes goes through it
+  (event-batch publishes, consent posts, remote-config fetches), so you can
+  supply a pooled transport, a proxy, mTLS, or instrumentation. Nil keeps the
+  SDK's internal clients. Two contracts survive injection: every attempt is
+  still bounded by the SOONER of `HTTPTimeout` and your context deadline, and
+  remote-config fetches still refuse to follow redirects (the SDK derives that
+  client from yours with `CheckRedirect` pinned, sharing Transport and Jar).
 
 ## Credentials
 
@@ -150,9 +172,24 @@ environment variables.
 
 ## Consent model — READ THIS FIRST, IT IS INVERTED
 
-**This SDK's consent posture is deliberately the OPPOSITE of ShardPilot's
-consent-first client SDKs (Defold/Unity/Unreal).** Those SDKs transmit
-nothing while consent is unknown. This server-side SDK does the inverse:
+**SCOPE — read this before the bullets.** This section documents the
+DEFAULT posture, with `Config.ConsentFloor` nil, which is unchanged from
+`v0.5.0-alpha`. `v0.6.0-alpha` added `Config.ConsentFloor`, an opt-in that
+switches this SDK to the consent-first behaviour the client SDKs
+(Defold/Unity/Unreal) ship — and it changes MOST of what follows: intake
+under unknown consent, whether a decision survives a restart, how receipts
+are queued, retried and ordered, and whether admission waits on a receipt.
+It does NOT change which consent states are reachable — the forced-minor
+decision is available in either mode.
+
+**This guide does not describe the floor's contract.** It is a large
+surface with its own failure modes, and its authoritative documentation is
+the `Config.ConsentFloor` godoc — read that, not this section, if you
+enable it. What follows applies with the floor off.
+
+**With the floor off, this SDK's consent posture is deliberately the
+OPPOSITE of the consent-first client SDKs.** Those SDKs transmit nothing
+while consent is unknown. This server-side SDK does the inverse:
 
 - **`unknown` (initial state) = the event pipeline is fully OPEN.** The SDK
   transmits events immediately, with no consent recorded. The integrating
@@ -193,10 +230,12 @@ nothing while consent is unknown. This server-side SDK does the inverse:
   covers only the configured actor; events that override the actor per event
   (`Event.UserID` / `Event.AnonymousID`) need consent recorded for each such
   actor through that same service path.
-- **No forced-minor consent state.** The client SDKs' `denied_forced_minor`
-  state and its associated flow do not exist in this SDK; `SetConsent` takes
-  a plain bool and the states are exactly `unknown` / `granted` / `denied`
-  (read via `Consent()`).
+- **`SetConsent` cannot reach the forced-minor state.** It takes a plain
+  bool, and the states it reaches are exactly `unknown` / `granted` /
+  `denied` (read via `Consent()`). Since `v0.6.0-alpha` the client SDKs'
+  `denied_forced_minor` state does exist in this SDK, reachable only through
+  `SetConsentDecision(ConsentDecisionDeniedForcedMinor)`, and it gates like
+  a denial.
 
 ## Sending analytics events
 
@@ -261,7 +300,7 @@ Facts that keep integrations correct:
 
 ## Remote config
 
-Available from this release — **explicit fetch only**. Configure
+Available since `v0.5.0-alpha` — **explicit fetch only**. Configure
 `RemoteConfigURL` (a dedicated config origin, never the ingest URL) plus
 `APIKey` (a publishable `sp_ingest_` client key — remote config is **never**
 authenticated with `Config.Token`; a Mode-B JWT cannot fetch config), and
@@ -354,6 +393,24 @@ crashClient, err := crash.NewClient(crash.ClientOptions{
   crash ingest is API-key authenticated, so a client-asserted account id is
   unverified and never becomes the actor key. A malformed value drops the
   field, never the report.
+- **Two auto-capture opt-ins, both DARK by default** (ADR-0297 §7d — while off
+  the auto-captured wire shape is byte-identical, and manual `Emit`/`EmitFatal`
+  events are never touched by either). Both carry the same Phase-D arming
+  order (§12): enable them only after this SDK's client-side consent gate and
+  durable spool are in place — new capture detail must not ship ahead of
+  consent parity:
+  - `ClientOptions.DebugIDFillEnabled` attaches the RUNNING BINARY's identity as
+    the event's single `modules[]` entry — base name plus a debug id read from
+    the binary (ELF GNU build-id as lowercase hex, the identity `dump_syms`
+    emits, falling back to the lowercase-hex SHA-256 of the Go build id). It is
+    what joins a crash to symbols uploaded under that id. Resolved once at
+    `NewClient`; on a non-ELF platform, an unreadable binary or one with no
+    usable id the fill is skipped and capture proceeds unchanged (reported
+    through `ClientOptions.Logger` when one is configured).
+  - `ClientOptions.AllGoroutineCaptureEnabled` snapshots every goroutine at
+    panic time as additional pre-symbolicated `threads[]`, each named by
+    goroutine id with its scheduler state. Bounded: 64 threads, 256 total
+    frames, at most 16 frames per non-crashing goroutine.
 - The crash `IngestURL` must be HTTPS outside localhost/loopback — unlike
   the analytics client, there is **no** private-network HTTP option here.
 
@@ -460,7 +517,22 @@ Run against your dev/staging deployment credentials, then check each item:
    shutdown, and that `Close` returns `nil` (pending events + consent
    receipts flushed within the deadline).
 
-## Known limitations (verified 2026-07-19)
+## Known limitations (verified 2026-08-03 for `v0.6.0-alpha`)
+
+**Same scope as the consent section: these describe the DEFAULT posture,
+with `Config.ConsentFloor` nil.** Several of the consent-related bullets
+below do not hold with the floor enabled — its contract is the
+`Config.ConsentFloor` godoc, not this list.
+
+Re-verified against this tag's source: the experiment/remote-config bullet
+below (which `v0.6.0-alpha` made partly false), and the crash-consent bullet
+(`Config.ConsentFloor` is new in this tag but gates the ANALYTICS pipeline —
+it does not appear in `pkg/crash`, so the crash bullet still holds). The rest
+are carried forward from the 2026-07-19 verification against `v0.5.0-alpha`.
+Note that this release is NOT purely additive — it carries default-on
+behavioural fixes as well as the opt-ins — so a bullet that is not called
+out above was checked for the change it could plausibly interact with, not
+re-derived from scratch.
 
 Stated plainly so integrations are designed around them, not surprised by
 them:
@@ -478,11 +550,19 @@ them:
   batches (`SetConsent(true)` does not gate or synchronize admission).
 - **Mode-A publishable keys cannot record grants** — denials only; grants
   need a separate consent-write-capable service credential.
-- **No `denied_forced_minor` / forced-minor flow** (exists in ShardPilot's
-  client SDKs, not here).
-- **Remote config is explicit-fetch-only** — no background refresh, no
-  experiment assignment or rule evaluation, and every fetch requires
-  `Config.AnonymousID` (the `client_id`).
+- **The forced-minor state is not reachable through `SetConsent`** — it takes
+  a plain bool. Since `v0.6.0-alpha` `denied_forced_minor` does exist here,
+  recorded through `SetConsentDecision`, and gates like a denial.
+- **Remote config is explicit-fetch-only** — no background refresh, and every
+  fetch requires `Config.AnonymousID` (the `client_id`). Rule evaluation still
+  happens server-side only. Since `v0.6.0-alpha` there IS an experiment-assignment
+  consumer (`Config.ExperimentsEnabled`) and an attribute pass-through
+  (`Config.RemoteConfigAttributesEnabled`), but both are DARK: default `false`,
+  and with the platform's experimentation flags off in every environment an
+  enabled consumer receives 403 on every fetch — that applies to the
+  EXPERIMENT lane; `RemoteConfigAttributesEnabled` alone still uses the ordinary
+  remote-config fetch and is not affected. Do not design an integration around
+  the experiment surface yet.
 - **Whole-batch loss on a permanent 4xx** — one invalid event drops its
   entire batch (partial-batch recovery is a known TODO).
 - **Non-fatal crash sampling defaults to 1-in-10 per client**, and a
