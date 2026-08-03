@@ -17,7 +17,7 @@ them — each has a large contract of its own, documented on the field:
 
 | opt-in | what it changes here |
 |---|---|
-| `Config.ConsentFloor` | intake under unknown consent, restart survival, receipt queueing/retry/ordering, whether admission waits on a receipt, which states are reachable, and which actor a spooled event is gated on |
+| `Config.ConsentFloor` | intake under unknown consent, restart survival, receipt queueing/retry/ordering, whether admission waits on a receipt, and which actor a spooled event is gated on. It does NOT gate the forced-minor state — `SetConsentDecision(ConsentDecisionDeniedForcedMinor)` works in either mode |
 | `Config.ExperimentsEnabled` | adds a background revalidation lane, so the SDK is no longer call-only-when-asked |
 | `Config.RemoteConfigAttributesEnabled` | attributes ride the fetch, and a cached targeted response outlives the consent state that permitted it until the next fetch |
 
@@ -299,7 +299,7 @@ Facts that keep integrations correct:
 
 ## Remote config
 
-Available from this release — **explicit fetch only**. Configure
+Available since `v0.5.0-alpha` — **explicit fetch only**. Configure
 `RemoteConfigURL` (a dedicated config origin, never the ingest URL) plus
 `APIKey` (a publishable `sp_ingest_` client key — remote config is **never**
 authenticated with `Config.Token`; a Mode-B JWT cannot fetch config), and
@@ -400,7 +400,9 @@ crashClient, err := crash.NewClient(crash.ClientOptions{
     the binary (ELF GNU build-id as lowercase hex, the identity `dump_syms`
     emits, falling back to the lowercase-hex SHA-256 of the Go build id). It is
     what joins a crash to symbols uploaded under that id. Resolved once at
-    `NewClient`; skipped silently on a non-ELF platform or an unreadable binary.
+    `NewClient`; on a non-ELF platform, an unreadable binary or one with no
+    usable id the fill is skipped and capture proceeds unchanged (reported
+    through `ClientOptions.Logger` when one is configured).
   - `ClientOptions.AllGoroutineCaptureEnabled` snapshots every goroutine at
     panic time as additional pre-symbolicated `threads[]`, each named by
     goroutine id with its scheduler state. Bounded: 64 threads, 256 total
