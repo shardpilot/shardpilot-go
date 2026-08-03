@@ -65,6 +65,14 @@ go get github.com/shardpilot/shardpilot-go@v0.6.0-alpha
   (e.g. a `.internal` alias) still requires HTTPS. The crash client has no
   such option and rejects any plain-HTTP URL outside localhost/loopback.
 
+- **`HTTPClient`** — when set, every request this SDK makes goes through it
+  (event-batch publishes, consent posts, remote-config fetches), so you can
+  supply a pooled transport, a proxy, mTLS, or instrumentation. Nil keeps the
+  SDK's internal clients. Two contracts survive injection: every attempt is
+  still bounded by the SOONER of `HTTPTimeout` and your context deadline, and
+  remote-config fetches still refuse to follow redirects (the SDK derives that
+  client from yours with `CheckRedirect` pinned, sharing Transport and Jar).
+
 ## Credentials
 
 The analytics client has a **single `Config.Token` bearer field**. It holds
@@ -151,14 +159,21 @@ environment variables.
 
 ## Consent model — READ THIS FIRST, IT IS INVERTED
 
-**Since `v0.6.0-alpha` this section describes TWO modes.** Everything below
-is the DEFAULT posture, with `Config.ConsentFloor` nil. Setting
-`Config.ConsentFloor` opts into the consent-first behaviour the client SDKs
-(Defold/Unity/Unreal) ship, and changes four of the statements below —
-each one is marked `WITH THE FLOOR`. Read the mode you are actually
-configuring; the default is unchanged from `v0.5.0-alpha`.
+**SCOPE — read this before the bullets.** This section documents the
+DEFAULT posture, with `Config.ConsentFloor` nil, which is unchanged from
+`v0.5.0-alpha`. `v0.6.0-alpha` added `Config.ConsentFloor`, an opt-in that
+switches this SDK to the consent-first behaviour the client SDKs
+(Defold/Unity/Unreal) ship — and it changes MOST of what follows: intake
+under unknown consent, whether a decision survives a restart, how receipts
+are queued, retried and ordered, whether admission waits on a receipt, and
+which consent states are reachable.
 
-**In the DEFAULT mode this SDK's consent posture is deliberately the
+**This guide does not describe the floor's contract.** It is a large
+surface with its own failure modes, and its authoritative documentation is
+the `Config.ConsentFloor` godoc — read that, not this section, if you
+enable it. What follows applies with the floor off.
+
+**With the floor off, this SDK's consent posture is deliberately the
 OPPOSITE of the consent-first client SDKs.** Those SDKs transmit nothing
 while consent is unknown. This server-side SDK does the inverse:
 
@@ -169,8 +184,6 @@ while consent is unknown. This server-side SDK does the inverse:
   track. Do not port client-SDK assumptions ("unknown means nothing is
   sent") into a Go backend integration; here that assumption silently
   becomes "everything is sent".
-  - **WITH THE FLOOR:** inverted — `Track`/`Enqueue` refuse with
-    `ErrConsentUnknown` until an explicit decision is recorded.
 - **`denied` = hard stop.** `SetConsent(false)` immediately makes `Track` /
   `Enqueue` return `ErrConsentDenied`, clears the pending queue (cleared
   events count as `Dropped`), and aborts any batch publish already in flight
@@ -181,11 +194,6 @@ while consent is unknown. This server-side SDK does the inverse:
   "Offline behavior / spool"), never to re-apply it. If consent must survive
   restarts, store the decision yourself and re-apply it with `SetConsent` on
   startup, before publishing.
-  - **WITH THE FLOOR and `SpoolDir` set:** the persisted decision reloads as
-    the live state at construction, scoped to the configured
-    workspace/app/environment/actor tuple. A grant written in the
-    receipt-less default mode is never promoted — the floor starts
-    undecided, so record a fresh decision.
 - **Consent receipts are fire-and-forget.** A `SetConsent` call also
   transmits the decision to ShardPilot in the background — but only when an
   actor identity is configured (`Config.UserID`, else `Config.AnonymousID`);
@@ -194,11 +202,6 @@ while consent is unknown. This server-side SDK does the inverse:
   (overflow discards the oldest; the newest decision wins server-side).
   Failures are only logged. `Close` waits (bounded by its context) for
   pending receipt sends.
-  - **WITH THE FLOOR:** receipts ride a durable outbox instead — 32
-    receipts, FIFO, retried until acknowledged and delivered strictly in
-    decision order, so grant-then-deny can never settle reversed. With
-    `SpoolDir` it survives process death; without it `Close` reports
-    `ErrConsentPending` while any remain undelivered.
 - **There is NO receipts-before-batch guarantee.** `SetConsent(true)` does
   not synchronize admission: events flushed before the background consent
   write lands on the server are still treated as consent-unknown there. On a
@@ -213,12 +216,12 @@ while consent is unknown. This server-side SDK does the inverse:
   covers only the configured actor; events that override the actor per event
   (`Event.UserID` / `Event.AnonymousID`) need consent recorded for each such
   actor through that same service path.
-- **No forced-minor consent state through `SetConsent`.** `SetConsent` takes
-  a plain bool and the states it can reach are exactly `unknown` /
-  `granted` / `denied` (read via `Consent()`). Since `v0.6.0-alpha` the
-  client SDKs' `denied_forced_minor` state DOES exist here, reachable only
-  through `SetConsentDecision(ConsentDecisionDeniedForcedMinor)`; it gates
-  like a denial.
+- **`SetConsent` cannot reach the forced-minor state.** It takes a plain
+  bool, and the states it reaches are exactly `unknown` / `granted` /
+  `denied` (read via `Consent()`). Since `v0.6.0-alpha` the client SDKs'
+  `denied_forced_minor` state does exist in this SDK, reachable only through
+  `SetConsentDecision(ConsentDecisionDeniedForcedMinor)`, and it gates like
+  a denial.
 
 ## Sending analytics events
 
@@ -488,8 +491,11 @@ Re-verified against this tag's source: the experiment/remote-config bullet
 below (which `v0.6.0-alpha` made partly false), and the crash-consent bullet
 (`Config.ConsentFloor` is new in this tag but gates the ANALYTICS pipeline —
 it does not appear in `pkg/crash`, so the crash bullet still holds). The rest
-are carried forward from the 2026-07-19 verification against `v0.5.0-alpha`;
-every change in this release is additive and off by default.
+are carried forward from the 2026-07-19 verification against `v0.5.0-alpha`.
+Note that this release is NOT purely additive — it carries default-on
+behavioural fixes as well as the opt-ins — so a bullet that is not called
+out above was checked for the change it could plausibly interact with, not
+re-derived from scratch.
 
 Stated plainly so integrations are designed around them, not surprised by
 them:
