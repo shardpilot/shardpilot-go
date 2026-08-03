@@ -392,6 +392,19 @@ crashClient, err := crash.NewClient(crash.ClientOptions{
   crash ingest is API-key authenticated, so a client-asserted account id is
   unverified and never becomes the actor key. A malformed value drops the
   field, never the report.
+- **Two auto-capture opt-ins, both DARK by default** (ADR-0297 §7d — while off
+  the auto-captured wire shape is byte-identical, and manual `Emit`/`EmitFatal`
+  events are never touched by either):
+  - `ClientOptions.DebugIDFillEnabled` attaches the RUNNING BINARY's identity as
+    the event's single `modules[]` entry — base name plus a debug id read from
+    the binary (ELF GNU build-id as lowercase hex, the identity `dump_syms`
+    emits, falling back to the lowercase-hex SHA-256 of the Go build id). It is
+    what joins a crash to symbols uploaded under that id. Resolved once at
+    `NewClient`; skipped silently on a non-ELF platform or an unreadable binary.
+  - `ClientOptions.AllGoroutineCaptureEnabled` snapshots every goroutine at
+    panic time as additional pre-symbolicated `threads[]`, each named by
+    goroutine id with its scheduler state. Bounded: 64 threads, 256 total
+    frames, at most 16 frames per non-crashing goroutine.
 - The crash `IngestURL` must be HTTPS outside localhost/loopback — unlike
   the analytics client, there is **no** private-network HTTP option here.
 
