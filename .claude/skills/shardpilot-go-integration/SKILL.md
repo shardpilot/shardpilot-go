@@ -19,7 +19,7 @@ them — each has a large contract of its own, documented on the field:
 |---|---|
 | `Config.ConsentFloor` | intake under unknown consent, restart survival, receipt queueing/retry/ordering, whether admission waits on a receipt, and which actor a spooled event is gated on. It does NOT gate the forced-minor state — `SetConsentDecision(ConsentDecisionDeniedForcedMinor)` works in either mode |
 | `Config.ExperimentsEnabled` | adds a background revalidation lane, so the SDK is no longer call-only-when-asked |
-| `Config.RemoteConfigAttributesEnabled` | attributes ride the fetch, and a cached targeted response outlives the consent state that permitted it until the next fetch |
+| `Config.RemoteConfigAttributesEnabled` | attributes ride the fetch, and a cached targeted response outlives the consent state that permitted it until the next SUCCESSFUL fetch — a failed or offline attempt leaves the targeted values serving |
 
 If you enable any of them, read that field's godoc for its contract — a claim
 below that contradicts it is describing the default, not a bug.
@@ -178,8 +178,9 @@ DEFAULT posture, with `Config.ConsentFloor` nil, which is unchanged from
 switches this SDK to the consent-first behaviour the client SDKs
 (Defold/Unity/Unreal) ship — and it changes MOST of what follows: intake
 under unknown consent, whether a decision survives a restart, how receipts
-are queued, retried and ordered, whether admission waits on a receipt, and
-which consent states are reachable.
+are queued, retried and ordered, and whether admission waits on a receipt.
+It does NOT change which consent states are reachable — the forced-minor
+decision is available in either mode.
 
 **This guide does not describe the floor's contract.** It is a large
 surface with its own failure modes, and its authoritative documentation is
@@ -394,7 +395,10 @@ crashClient, err := crash.NewClient(crash.ClientOptions{
   field, never the report.
 - **Two auto-capture opt-ins, both DARK by default** (ADR-0297 §7d — while off
   the auto-captured wire shape is byte-identical, and manual `Emit`/`EmitFatal`
-  events are never touched by either):
+  events are never touched by either). Both carry the same Phase-D arming
+  order (§12): enable them only after this SDK's client-side consent gate and
+  durable spool are in place — new capture detail must not ship ahead of
+  consent parity:
   - `ClientOptions.DebugIDFillEnabled` attaches the RUNNING BINARY's identity as
     the event's single `modules[]` entry — base name plus a debug id read from
     the binary (ELF GNU build-id as lowercase hex, the identity `dump_syms`
@@ -555,8 +559,10 @@ them:
   consumer (`Config.ExperimentsEnabled`) and an attribute pass-through
   (`Config.RemoteConfigAttributesEnabled`), but both are DARK: default `false`,
   and with the platform's experimentation flags off in every environment an
-  enabled consumer receives 403 on every fetch. Do not design an integration
-  around either yet.
+  enabled consumer receives 403 on every fetch — that applies to the
+  EXPERIMENT lane; `RemoteConfigAttributesEnabled` alone still uses the ordinary
+  remote-config fetch and is not affected. Do not design an integration around
+  the experiment surface yet.
 - **Whole-batch loss on a permanent 4xx** — one invalid event drops its
   entire batch (partial-batch recovery is a known TODO).
 - **Non-fatal crash sampling defaults to 1-in-10 per client**, and a
