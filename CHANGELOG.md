@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **`FlushInterval` now defaults to 15s (was 1s).** BEHAVIOUR CHANGE for integrations that
+  never set it: an otherwise idle process now talks to ingest four times a minute instead of
+  sixty. The batch-size trigger is untouched, so a busy process still publishes the moment it
+  has a full `BatchSize`, and `Flush()` still publishes on demand — this is the *idle* cadence
+  only. An explicit `FlushInterval` always wins, including one below the new default; this is
+  a default, not a floor. Set `FlushInterval: time.Second` to keep the old behaviour.
+
 ## v0.6.0-alpha — 2026-08-03 — crash actor key, experiments, remote-config targeting
 
 - Optional pseudonymous actor keys on crash reports: `Event.AnonymousID` / `Event.SessionID`,

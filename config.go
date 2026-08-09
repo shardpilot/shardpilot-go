@@ -290,10 +290,22 @@ type Config struct {
 type ConsentFloorConfig struct{}
 
 const (
-	defaultBatchSize     = 25
-	maxBatchSize         = 100
-	defaultBufferSize    = 1000
-	defaultFlushInterval = time.Second
+	defaultBatchSize  = 25
+	maxBatchSize      = 100
+	defaultBufferSize = 1000
+	// defaultFlushInterval was 1 SECOND, which is a request per second per
+	// process for the whole life of the process, whether or not anything was
+	// tracked. On a fleet of dedicated servers that is a standing load nobody
+	// asked for, and it is the number a prospect quotes back when comparing
+	// SDKs. 15s is the low end of the cross-SDK 15-30s band; the batch-size
+	// trigger is unchanged, so a busy process still publishes as soon as it has
+	// a full batch and only an IDLE one waits the longer interval.
+	//
+	// This is a DEFAULT, not a cap: an integration that wants the old cadence
+	// sets FlushInterval explicitly, and latency-sensitive callers already have
+	// Flush(). Nothing here changes how long an event can sit unpublished when
+	// the caller has said what they want.
+	defaultFlushInterval = 15 * time.Second
 	defaultHTTPTimeout   = 2 * time.Second
 
 	// Disk-spool caps: the cross-SDK canonical bound of 2000 events / 1 MiB
