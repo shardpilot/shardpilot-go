@@ -1300,7 +1300,12 @@ func TestRetryPacingIsIndependentOfTheFlushInterval(t *testing.T) {
 		t.Fatalf("enqueue: %v", err)
 	}
 
-	waitFor(t, defaultFlushInterval+10*time.Second, "the retry", func() bool { return calls.Load() >= 2 })
+	// Wait on the TIMESTAMP, not the call counter. The handler increments
+	// calls before storing the stamp, so a scheduler preemption between those
+	// two atomics lets a counter-only wait read stamps[1] as zero and compute
+	// a huge negative gap — failing the lower bound below while retry pacing
+	// was in fact correct (Codex on #48).
+	waitFor(t, defaultFlushInterval+10*time.Second, "the retry", func() bool { return stamps[1].Load() != 0 })
 	gap := time.Duration(stamps[1].Load()-stamps[0].Load()) * time.Millisecond
 
 	// Comfortably below the flush interval: this is the assertion that fails

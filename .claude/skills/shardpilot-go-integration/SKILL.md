@@ -177,7 +177,12 @@ remote-config fields (`RemoteConfigURL` + `APIKey` +
 publishes and consent writes both. A batch body is the same envelope keys
 repeated per event, so it compresses hard: a 100-event batch measures 41.7 KB
 down to 2.4 KB on the wire (17x), at ~36 microseconds and 2 allocations per
-batch, paid on the publish path and never on the caller's `Track`. Smaller
+batch. WHERE that cost lands depends on the API: an `Enqueue`d batch is
+published by the background worker so the caller pays nothing, while a
+synchronous `Track` publishes on the CALLER's goroutine — so a single event
+whose JSON exceeds the 1 KiB threshold (a large props payload) pays the
+compression there. Most `Track` events are a few hundred bytes and never
+cross it. Smaller
 bodies are sent uncompressed, because gzip's 18 bytes of framing make a
 single-event batch bigger rather than smaller.
 

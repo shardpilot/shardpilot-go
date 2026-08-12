@@ -3517,3 +3517,38 @@ func TestSpoolReadLimitScalesWithEventCap(t *testing.T) {
 			len(s.entries), n, len(outcome.evicted), len(outcome.expired))
 	}
 }
+
+// TestStartupSpoolResendDoesNotWaitForTheFlushTick covers the restart the
+// recovery-wake test cannot: a process that comes back up with undelivered
+// spool entries and then does NOTHING.
+//
+// TestSpoolRecoveryWakeResendsSpoolOnlyWork drives its resend from a
+// synchronous Track — a success elsewhere kicks the requeued chunk. Here there
+// is no Track, no Enqueue and no Flush: initSpool fills the resend queue,
+// the persisted deadline is zero, and nothing arms the worker's timer. Before
+// the fix that chunk waited for the first flush tick, which raising the flush
+// default stretched from one second to fifteen; the FlushInterval below is an
+// hour, so a regression parks it effectively forever (Codex on #48).
+func TestStartupSpoolResendDoesNotWaitForTheFlushTick(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+
+	dir := t.TempDir()
+	writeConsentRecordFile(t, dir, "granted")
+	writeSpoolRecordFile(t, dir, 0, spoolTestEnvelope(t, "evt-restart-1", time.Now()))
+
+	state.setOutcome(http.StatusAccepted, "", "")
+	client := newSpoolTestClient(t, server.URL, dir, nil, func(cfg *Config) {
+		// An hour: only the retry clock can produce a resend inside the wait
+		// below, never the batching tick.
+		cfg.FlushInterval = time.Hour
+	})
+	defer func() { _ = client.Close(context.Background()) }()
+
+	waitFor(t, 10*time.Second,
+		"the startup-loaded spool chunk resent on the retry clock, not the hourly flush tick",
+		func() bool {
+			return client.Snapshot().SpoolResent == 1 && len(readSpoolRecordFile(t, dir).Events) == 0
+		})
+	_ = state
+}

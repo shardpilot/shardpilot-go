@@ -807,6 +807,16 @@ func (c *Client) run() {
 			batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
 			continue
 		}
+		if c.consentOutbox != nil && c.consentOutbox.consumeElapsedDeferral(c.clock.Now()) {
+			// The consent plane's retry came due while the worker was busy
+			// with another case. Dispatch NOW: the wake arithmetic below
+			// cannot see an elapsed deadline (deferRemaining reports zero for
+			// "passed" and for "none" alike), so without this the timer is
+			// disarmed and the receipt waits for the flush tick — the exact
+			// coupling retry pacing was separated from. Mirrors the events
+			// plane's elapsed-deadline fast path above.
+			c.dispatchConsentReceipts(context.Background(), false)
+		}
 		var deferWake <-chan time.Time
 		// The timer serves BOTH planes: it is armed at the earliest live
 		// pacing deadline of either, so a consent receipt's own retry
@@ -849,11 +859,23 @@ func (c *Client) run() {
 			// below returns: a receipt whose retry came due while the events
 			// plane was healthy has no other wake source but the flush tick.
 			c.dispatchConsentReceipts(context.Background(), false)
-			if deferUntil.IsZero() || c.publishDeferred(deferUntil) {
-				// Either this wake was the consent plane's alone, or the
-				// events deadline has not passed yet. Publishing here would
-				// flush a partial batch early and defeat the BatchSize /
-				// FlushInterval batching this whole loop exists to do.
+			if c.publishDeferred(deferUntil) {
+				// The events deadline has not passed yet.
+				continue
+			}
+			if deferUntil.IsZero() && !(c.spool != nil && c.spool.hasResendWork()) {
+				// This wake was the consent plane's alone. Publishing here
+				// would flush a partial batch early and defeat the BatchSize
+				// / FlushInterval batching this whole loop exists to do.
+				//
+				// Startup spool recovery is the exception, and the reason
+				// this is not simply `deferUntil.IsZero()`: undelivered
+				// entries reloaded with no deadline of their own arm a wake
+				// through nextPacingWake, and returning here would swallow it
+				// — the work would sit until the flush tick, which is exactly
+				// what that wake exists to avoid. Bounded: hasResendWork goes
+				// false once the queue drains, and a failing resend arms a
+				// real deadline that publishDeferred then gates.
 				continue
 			}
 			// The backpressure deadline passed: retry the held batch now
@@ -941,11 +963,28 @@ func (c *Client) run() {
 // backoff never asked for fifteen.
 func (c *Client) nextPacingWake(eventsDeferUntil time.Time) time.Duration {
 	wake := c.deferRemaining(eventsDeferUntil)
-	if c.consentOutbox == nil {
-		return wake
+	if c.consentOutbox != nil {
+		if remaining := c.consentOutbox.deferRemaining(c.clock.Now()); remaining > 0 && (wake <= 0 || remaining < wake) {
+			wake = remaining
+		}
 	}
-	if remaining := c.consentOutbox.deferRemaining(c.clock.Now()); remaining > 0 && (wake <= 0 || remaining < wake) {
-		wake = remaining
+	// Undelivered spool work with NO deadline of its own is due on the RETRY
+	// clock, not the batching one. initSpool reloads it before the worker
+	// starts, and when its persisted deadline is zero or already past nothing
+	// arms the timer — so a restarted process with no enqueue and no explicit
+	// Flush would leave durable retries sitting until the first flush tick,
+	// which raising the flush default just stretched from one second to
+	// fifteen. That is outstanding recovery work, not a partial idle batch
+	// (Codex on #48).
+	//
+	// Arming a wake rather than publishing inline is deliberate: a startup
+	// Flush racing this would otherwise be doubled into two attempts at a
+	// failing endpoint. By the time this wake fires, either the work is gone
+	// or a real deadline is armed and publishDeferred gates it. The clause
+	// self-clears — hasResendWork goes false once the queue drains — so it
+	// cannot keep the worker awake past recovery.
+	if c.spool != nil && c.spool.hasResendWork() && wake <= 0 {
+		wake = publishBackoffBase
 	}
 	return wake
 }

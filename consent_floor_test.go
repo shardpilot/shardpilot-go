@@ -5291,3 +5291,131 @@ func TestConsentReceiptRetryDoesNotLengthenWithTheFlushInterval(t *testing.T) {
 		return state.consentCount() >= 2
 	})
 }
+
+// TestConsentRetryDispatchesWhenItsDeadlineAlreadyElapsed covers the case the
+// existing pacing test cannot reach: a worker that is BUSY.
+//
+// TestConsentReceiptRetryDoesNotLengthenWithTheFlushInterval leaves the worker
+// idle, so it parks on a timer armed for the consent deadline and wakes on it.
+// If another select case is handled just before that deadline — an enqueue, a
+// pacing nudge — the worker loops back and re-derives its wake, and by then the
+// deadline has passed. deferRemaining reports ZERO for "already passed" and for
+// "no deadline at all" alike, so the wake arithmetic disarms the timer and the
+// receipt sits until the flush tick: here an hour (Codex on #48).
+//
+// The events plane has always had an elapsed-deadline fast path. This is the
+// consent plane's.
+func TestConsentRetryDispatchesWhenItsDeadlineAlreadyElapsed(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	state.setConsentOutcome(http.StatusServiceUnavailable, "1")
+	client := newFloorTestClient(t, server.URL, t.TempDir(), nil)
+	defer func() { _ = client.Close(context.Background()) }()
+
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the first receipt attempt", func() bool {
+		return state.consentCount() >= 1
+	})
+
+	// Heal the endpoint, then put the plane in the exact state a busy worker
+	// produces: a consent deadline that has ALREADY passed. The pacing nudge
+	// stands in for whichever other select case won the race; it makes the
+	// worker loop back and re-derive its wake, which is the moment the defect
+	// occurs. Nothing else is touched — no Flush, no SetConsent, no enqueue —
+	// so the only thing that can produce a second attempt is the fast path.
+	state.setConsentOutcome(http.StatusOK, "")
+	client.consentOutbox.mu.Lock()
+	client.consentOutbox.deferUntil = client.clock.Now().Add(-time.Second)
+	client.consentOutbox.mu.Unlock()
+	select {
+	case client.pacingWake <- struct{}{}:
+	default:
+	}
+
+	waitFor(t, 5*time.Second,
+		"an ELAPSED consent deadline dispatches on the next worker pass, not at the hourly flush tick",
+		func() bool { return state.consentCount() >= 2 })
+}
+
+// TestArmingConsentDeferralWakesTheWorker pins the other half of the same
+// coupling: the deadline created AFTER the worker evaluated its wakes.
+//
+// A synchronous Track dispatches retained receipts on the caller's goroutine,
+// so it can arm a consent deferral while the worker is already parked in
+// select with no wake armed. The deadline exists but nothing told the worker,
+// and with no other activity the one-second retry waits out the whole flush
+// interval. Asserted directly on the nudge rather than through a live worker:
+// the race is precisely that the worker is ALREADY blocked, which a test
+// cannot schedule reliably.
+func TestArmingConsentDeferralWakesTheWorker(t *testing.T) {
+	_, server := newFloorTestServer(t)
+	defer server.Close()
+
+	client := newFloorTestClient(t, server.URL, t.TempDir(), nil)
+	defer func() { _ = client.Close(context.Background()) }()
+
+	// Drain any nudge the client's own start-up left pending, so what the
+	// assertion below sees can only have come from arming.
+	select {
+	case <-client.consentWake:
+	default:
+	}
+
+	client.armConsentDeferral(&HTTPStatusError{StatusCode: http.StatusServiceUnavailable})
+
+	client.consentOutbox.mu.Lock()
+	deferUntil := client.consentOutbox.deferUntil
+	client.consentOutbox.mu.Unlock()
+	if deferUntil.IsZero() {
+		t.Fatal("arming a deferral must set a deadline")
+	}
+
+	select {
+	case <-client.consentWake:
+	default:
+		t.Fatal("arming a consent deferral did not wake the worker: a deadline created while the worker is parked has no other wake source, so the retry waits out the flush interval")
+	}
+}
+
+// TestConsumeElapsedConsentDeferralIsIdempotent pins that the fast path cannot
+// spin. Clearing the elapsed deadline is what makes it safe to run on every
+// worker pass: a dispatch with nothing owed leaves it clear instead of
+// re-triggering forever on a deadline that can never expire again.
+func TestConsumeElapsedConsentDeferralIsIdempotent(t *testing.T) {
+	_, server := newFloorTestServer(t)
+	defer server.Close()
+
+	client := newFloorTestClient(t, server.URL, t.TempDir(), nil)
+	defer func() { _ = client.Close(context.Background()) }()
+
+	now := client.clock.Now()
+	outbox := client.consentOutbox
+
+	if outbox.consumeElapsedDeferral(now) {
+		t.Fatal("no deadline must not report as elapsed")
+	}
+
+	outbox.mu.Lock()
+	outbox.deferUntil = now.Add(time.Minute)
+	outbox.mu.Unlock()
+	if outbox.consumeElapsedDeferral(now) {
+		t.Fatal("a live deadline must not report as elapsed")
+	}
+	outbox.mu.Lock()
+	stillArmed := !outbox.deferUntil.IsZero()
+	outbox.mu.Unlock()
+	if !stillArmed {
+		t.Fatal("a live deadline must survive the check")
+	}
+
+	outbox.mu.Lock()
+	outbox.deferUntil = now.Add(-time.Second)
+	outbox.mu.Unlock()
+	if !outbox.consumeElapsedDeferral(now) {
+		t.Fatal("an elapsed deadline must report as elapsed")
+	}
+	if outbox.consumeElapsedDeferral(now) {
+		t.Fatal("the elapsed deadline must be CONSUMED: a second report would spin the worker")
+	}
+}

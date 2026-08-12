@@ -804,6 +804,32 @@ func (o *consentOutbox) deferralActive(now time.Time) bool {
 	return !o.deferUntil.IsZero() && now.Before(o.deferUntil)
 }
 
+// consumeElapsedDeferral clears a consent-retry deadline that has already
+// passed and reports whether it did.
+//
+// It exists because deferRemaining reports ZERO for two different states —
+// "no deadline" and "deadline already passed" — so the worker's wake
+// arithmetic cannot tell them apart and would disarm its timer on an elapsed
+// deadline, parking the receipt until the next flush tick. That is exactly the
+// cadence coupling this SDK's retry pacing was separated from; the events
+// plane has always had a fast path for its own elapsed deadline, and the
+// consent plane did not (Codex on #48).
+//
+// CLEARING rather than merely reporting is what makes the caller's fast path
+// safe to loop on: the parking window is over, so the deadline has done its
+// job. A dispatch that fails again re-arms a fresh one; a dispatch with
+// nothing owed leaves it clear instead of spinning the worker on a deadline
+// that can never expire again.
+func (o *consentOutbox) consumeElapsedDeferral(now time.Time) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.deferUntil.IsZero() || now.Before(o.deferUntil) {
+		return false
+	}
+	o.deferUntil = time.Time{}
+	return true
+}
+
 // deferRemaining is how long the consent plane is still parked for, or zero
 // when it is not parked (or the deadline has already passed).
 //
@@ -1582,6 +1608,17 @@ func (c *Client) dispatchConsentReceipts(ctx context.Context, join bool) (map[st
 // is independent of the events plane's pacing: a denial clears the publish
 // deferral while receipt retries must keep backing off.
 func (c *Client) armConsentDeferral(err error) {
+	// The worker may already be parked in select with NO wake armed: it
+	// evaluated its pacing deadlines before this deferral existed (a
+	// synchronous Track can dispatch a retained receipt concurrently), and
+	// with nothing else pending it has no wake source but the flush tick.
+	// Nudge it so it re-evaluates and arms a timer for the deadline set
+	// below — otherwise a one-second consent retry waits out the whole flush
+	// interval, which is the coupling this SDK's pacing was separated from
+	// (Codex on #48). Non-blocking and idempotent; deferred so it runs after
+	// the deadline is actually visible.
+	defer c.wakeConsentDispatch()
+
 	o := c.consentOutbox
 	o.mu.Lock()
 	defer o.mu.Unlock()

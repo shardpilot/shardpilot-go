@@ -3,11 +3,60 @@
 ## Unreleased
 
 - **`FlushInterval` now defaults to 15s (was 1s).** BEHAVIOUR CHANGE for integrations that
-  never set it: an otherwise idle process now talks to ingest four times a minute instead of
-  sixty. The batch-size trigger is untouched, so a busy process still publishes the moment it
-  has a full `BatchSize`, and `Flush()` still publishes on demand — this is the *idle* cadence
-  only. An explicit `FlushInterval` always wins, including one below the new default; this is
-  a default, not a floor. Set `FlushInterval: time.Second` to keep the old behaviour.
+  never set it: a PARTIAL batch can now wait up to 15s before it is published, instead of up
+  to 1s.
+
+  It is **not** a heartbeat, and an earlier draft of this note said it was. An idle process
+  makes no requests at either value: every tick reaches `publishWorkerBatch`, which returns
+  without a request when there is no pending batch, spool resend, or consent receipt. What
+  `1s` actually cost was batching itself — a process emitting an event every few seconds
+  never reached `BatchSize` inside the window, so every event became its own request with its
+  own TLS handshake. The reduction in requests is therefore proportional to the event rate,
+  not a fixed four-per-minute.
+
+  The batch-size trigger is untouched, so a busy process still publishes the moment it has a
+  full `BatchSize`, and `Flush()` still publishes on demand. An explicit `FlushInterval`
+  always wins, including one below the new default; this is a default, not a floor. Set
+  `FlushInterval: time.Second` to keep the old behaviour.
+
+- **Retry pacing no longer follows `FlushInterval`.** A retryable publish failure without a
+  `Retry-After` hint now waits on its own clock — every failure, the first included, a
+  full-jitter random wait in [1s, ceiling], the ceiling doubling from the third consecutive
+  failure up to 60s, reset on success. Previously the first hint-less failure retried at the
+  flush cadence, which with the new 15s default would have stretched a one-second retry to
+  fifteen. Consent-receipt retries and retained-batch retries ride the same independent
+  clock, and a server-sent `Retry-After` still binds ahead of it.
+
+  Two places that clock could still be preempted by the flush tick are closed
+  here: a consent-retry deadline that elapsed while the worker was busy with
+  another select case (the wake arithmetic reports zero for "already passed"
+  and "no deadline" alike, so the timer was disarmed), and a deadline armed by
+  a concurrent synchronous `Track` after the worker had already parked with no
+  wake source. Undelivered spool entries reloaded at startup are on the same
+  clock: a restarted process with no enqueue and no explicit `Flush` no longer
+  waits out a flush interval before retrying them.
+
+- **Request bodies over 1 KiB are now gzip-compressed by default**
+  (`Content-Encoding: gzip`), on batch publishes and consent writes alike. A batch body is
+  the same envelope keys repeated per event, so it compresses hard: measured on a real
+  100-event batch, 41.7 KB becomes 2.4 KB on the wire — 17x, for ~36 microseconds and 2
+  allocations.
+
+  **This is an upgrade-visible WIRE-FORMAT change.** Anything that inspects raw request
+  bodies — a custom ingest deployment, a proxy, a logging sidecar, your own test servers —
+  must decode gzip or set `Config.DisableRequestCompression: true`. Two of this repo's own
+  test servers had to be updated for exactly that reason.
+
+  Bodies under 1 KiB are sent uncompressed (gzip's 18 bytes of framing make a single-event
+  batch bigger, not smaller), as is any body compression fails to shrink. The ingest body cap
+  applies to the **uncompressed** body, so compression buys throughput and not headroom.
+
+  A server that cannot read the coding is handled without data loss, but only through the
+  documented detail codes: a `400` carrying `unsupported_content_encoding` or
+  `invalid_content_encoding` latches compression off for the process and re-sends the same
+  batch uncompressed. A deployment that refuses a compressed body some OTHER way — a bare
+  400 with no envelope, a connection reset, a proxy 502 — is **not** covered by that
+  fallback; set `DisableRequestCompression` for those.
 
 ## v0.6.0-alpha — 2026-08-03 — crash actor key, experiments, remote-config targeting
 
