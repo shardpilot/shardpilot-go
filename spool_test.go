@@ -3673,3 +3673,58 @@ func TestStartupSpoolResendSurvivesAWakeThatSpansItsDeadline(t *testing.T) {
 			return client.Snapshot().SpoolResent == 1
 		})
 }
+
+// TestStartupWakeStandsDownUnderAPersistedDeferral covers the restart shape
+// that has BOTH conditions at once: undelivered spool entries and a persisted
+// retry_after_until_ms still in the future.
+//
+// The startup-recovery clause invents a one-second deadline for spool work
+// that carries none of its own. Under a live events deferral that invention
+// is not merely redundant, it spins: the wake it produces reaches the
+// deferWake case, publishDeferred refuses the publish, and nothing clears the
+// deadline — only publishWorkerBatch does. "Expired reports due now, floored
+// to a positive duration" then re-arms the timer a millisecond out, on every
+// pass, for as long as the persisted deferral has left to run — up to the
+// 24-hour clamp.
+//
+// The events deferral is the better wake source for that work regardless:
+// when it expires the deferWake case publishes, which IS the resend. So the
+// clause stands down while it is armed (Codex on #48).
+func TestStartupWakeStandsDownUnderAPersistedDeferral(t *testing.T) {
+	clock := &stubClock{now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	client := &Client{clock: clock, spool: &diskSpool{
+		resend: []spoolEntry{{id: "evt-restart-deferred", raw: json.RawMessage(`{}`)}},
+	}}
+
+	// The persisted deferral, comfortably longer than the startup window.
+	deferUntil := clock.now.Add(30 * time.Second)
+
+	if wake := client.nextPacingWake(deferUntil); wake < 29*time.Second {
+		t.Fatalf("the deferral owns the wake while it is armed, got %v", wake)
+	}
+	if !client.startupResendWakeAt.IsZero() {
+		t.Fatalf("no startup deadline may be armed under a live deferral, got %v", client.startupResendWakeAt)
+	}
+
+	// Past where the invented one-second deadline would have expired. This is
+	// where the spin started: the deadline stayed expired because no publish
+	// could clear it.
+	clock.now = clock.now.Add(2 * time.Second)
+	wake := client.nextPacingWake(deferUntil)
+	if wake <= 10*time.Millisecond {
+		t.Fatalf("the worker is spinning: wake %v, which re-arms immediately and gets nowhere", wake)
+	}
+	if want := 28 * time.Second; wake < want-time.Second || wake > want+time.Second {
+		t.Fatalf("expected the wake to be the deferral's remainder (~%v), got %v", want, wake)
+	}
+
+	// Once the deferral lapses, the clause arms again — the recovery path it
+	// exists for is untouched.
+	clock.now = clock.now.Add(30 * time.Second)
+	if wake := client.nextPacingWake(deferUntil); wake <= 0 || wake > publishBackoffBase {
+		t.Fatalf("expected the startup window armed once the deferral lapsed, got %v", wake)
+	}
+	if client.startupResendWakeAt.IsZero() {
+		t.Fatal("expected an absolute startup deadline once the deferral lapsed")
+	}
+}

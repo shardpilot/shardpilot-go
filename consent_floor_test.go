@@ -5497,3 +5497,77 @@ func TestARefusedDispatchClaimLeavesTheDeadlineAndWakesOnRelease(t *testing.T) {
 	}
 	outbox.releaseDispatch()
 }
+
+// TestAbortedConsentDispatchWakesOnlyAfterReleasingTheClaim pins the ORDER of
+// the two things a caller-aborted dispatch does on its way out.
+//
+// The abort arms no deadline on purpose — it observed no outcome — so the
+// wake is the receipt's only route back to a dispatch point before the flush
+// tick. But the worker's wake handler takes the dispatch claim NON-JOINING,
+// and claimDispatch records a miss only for the worker's own elapsed-deadline
+// pass. So a wake emitted while this pass still holds the claim is refused
+// AND forgotten, and the release that follows finds no miss to wake for: the
+// nudge is swallowed by the handshake built to preserve it, and the receipt
+// waits out the fifteen-second flush interval after all.
+//
+// Asserted at the moment of the send rather than by racing a real worker,
+// because the losing interleaving is one instant wide (Codex on #48).
+func TestAbortedConsentDispatchWakesOnlyAfterReleasingTheClaim(t *testing.T) {
+	hang := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/consent" {
+			<-hang
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"recorded":true,"replayed":false}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		fmt.Fprint(w, `{"accepted":0,"rejected":0,"duplicates":0}`)
+	}))
+	releaseHang := sync.OnceFunc(func() { close(hang) })
+	defer server.Close()
+	defer releaseHang()
+
+	client := newFloorTestClient(t, server.URL, t.TempDir(), func(cfg *Config) {
+		cfg.HTTPTimeout = 5 * time.Second
+		// An hour, so the worker stays parked: the only wake in the window
+		// below is the one this test is about.
+		cfg.FlushInterval = time.Hour
+	})
+
+	var wakes, heldAtWake atomic.Int32
+	client.consentWakeHook.Store(func() {
+		wakes.Add(1)
+		client.consentOutbox.mu.Lock()
+		held := client.consentOutbox.dispatching
+		client.consentOutbox.mu.Unlock()
+		if held {
+			heldAtWake.Add(1)
+		}
+	})
+
+	client.consent.Store(consentStateGranted)
+	if client.consentOutbox.append(testConsentReceipt("key-abort-wake-1", true)) {
+		t.Fatalf("seeding the outbox failed")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := client.Track(ctx, Event{Name: "e1"}); !errors.Is(err, ErrConsentReceiptPending) {
+		t.Fatalf("expected the gate armed after the no-response abort, got %v", err)
+	}
+
+	if wakes.Load() == 0 {
+		t.Fatal("a caller-aborted dispatch must nudge the worker: it arms no deadline to retry from")
+	}
+	if got := heldAtWake.Load(); got != 0 {
+		t.Fatalf("%d wake(s) were emitted while the dispatch claim was still held: "+
+			"the worker's non-joining pass is refused the claim and records no miss, so the nudge is lost", got)
+	}
+
+	releaseHang()
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}

@@ -1396,6 +1396,15 @@ func (c *Client) wakeConsentDispatch() {
 	if c.consentWake == nil {
 		return
 	}
+	// Test-only. "The wake is emitted with the dispatch claim already
+	// released" is an ORDERING property, and the failure it guards against is
+	// the worker consuming the nudge at one specific instant — which a test
+	// cannot schedule and a repeat-until-flaky run cannot pin. Observing the
+	// claim state at the moment of the send says the same thing and says it
+	// deterministically. Never set in production.
+	if hook, _ := c.consentWakeHook.Load().(func()); hook != nil {
+		hook()
+	}
 	select {
 	case c.consentWake <- struct{}{}:
 	default:
@@ -1497,8 +1506,16 @@ func (c *Client) dispatchConsentReceiptsFrom(ctx context.Context, join bool, byW
 	} else if !o.claimDispatch(byWorker) {
 		return nil, false
 	}
+	// Set by the caller-abort branch below instead of waking inline. The wake
+	// has to be emitted AFTER the claim is released: the worker's wake handler
+	// takes the claim non-joining, so a wake sent while this pass still holds
+	// it is refused — and refused WITHOUT recording a miss, because that
+	// handler is not the worker's own elapsed-deadline pass. The nudge would
+	// then be swallowed by the very handshake meant to preserve it, and the
+	// abort arms no deadline to retry from.
+	wakeOnRelease := false
 	defer func() {
-		if o.releaseDispatch() {
+		if o.releaseDispatch() || wakeOnRelease {
 			// A pass was refused this claim while it was held, so give it
 			// another look now that the claim is free. It cannot loop: a
 			// dispatch that failed re-armed a FUTURE deadline, and one that
@@ -1664,7 +1681,11 @@ func (c *Client) dispatchConsentReceiptsFrom(ctx context.Context, join bool, byW
 				// dispatch point at once; arming would have delayed the very
 				// retry this is trying not to delay, and advanced a backoff
 				// streak on an endpoint that told us nothing.
-				c.wakeConsentDispatch()
+				//
+				// Deferred to the release above rather than sent here: this
+				// pass still holds the dispatch claim, and a wake the worker
+				// consumes now is refused it without recording a miss.
+				wakeOnRelease = true
 				return handed, false
 			}
 		}

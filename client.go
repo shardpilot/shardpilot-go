@@ -26,6 +26,12 @@ type Client struct {
 	// the worker goroutine alone.
 	startupResendWakeAt time.Time
 
+	// consentWakeHook holds a func() invoked immediately before a consent
+	// wake is emitted. Test-only; see wakeConsentDispatch. An atomic because
+	// the worker is already running when a test installs it. Never set in
+	// production.
+	consentWakeHook atomic.Value
+
 	// jitter is the uniform [0, 1) source for the publish backoff's full
 	// jitter; tests pin it for deterministic schedules. Only the flush
 	// worker goroutine reads it. Nil falls back to the shared math/rand
@@ -1004,7 +1010,22 @@ func (c *Client) nextPacingWake(eventsDeferUntil time.Time) time.Duration {
 	// and postpone the recovery indefinitely, which is the coupling this
 	// clause exists to break rather than a smaller version of it. Recomputing
 	// the REMAINING time instead means other activity can only shorten it.
-	if c.spool != nil && c.spool.hasResendWork() {
+	//
+	// NOT armed while the events plane is deferred, and that guard is load-
+	// bearing rather than an optimisation. A restart with spool entries AND a
+	// still-future persisted retry_after_until_ms has both conditions at once:
+	// this clause armed a one-second deadline, the wake it produced hit the
+	// deferWake case, publishDeferred refused the publish, and so nothing
+	// cleared the deadline — only publishWorkerBatch does. Expired-reports-
+	// due-now then floored it to a millisecond, on every pass, for as long as
+	// the persisted deferral had left to run (up to the 24-hour clamp). A
+	// millisecond spin, in a client SDK, on a path taken by any process
+	// restarting under server backpressure.
+	//
+	// The events deferral is a strictly better wake source for that work
+	// anyway: when it expires the deferWake case publishes, which is the
+	// resend. Nothing is lost by standing down.
+	if c.spool != nil && c.spool.hasResendWork() && !c.publishDeferred(eventsDeferUntil) {
 		now := c.clock.Now()
 		if c.startupResendWakeAt.IsZero() {
 			c.startupResendWakeAt = now.Add(publishBackoffBase)
