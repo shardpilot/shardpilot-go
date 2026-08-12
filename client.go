@@ -1025,7 +1025,8 @@ func (c *Client) nextPacingWake(eventsDeferUntil time.Time) time.Duration {
 	// The events deferral is a strictly better wake source for that work
 	// anyway: when it expires the deferWake case publishes, which is the
 	// resend. Nothing is lost by standing down.
-	if c.spool != nil && c.spool.hasResendWork() && !c.publishDeferred(eventsDeferUntil) {
+	if c.spool != nil && c.spool.hasResendWork() && !c.publishDeferred(eventsDeferUntil) &&
+		!c.consentGatedResendParked() {
 		now := c.clock.Now()
 		if c.startupResendWakeAt.IsZero() {
 			c.startupResendWakeAt = now.Add(publishBackoffBase)
@@ -1054,6 +1055,27 @@ func (c *Client) nextPacingWake(eventsDeferUntil time.Time) time.Duration {
 		c.startupResendWakeAt = time.Time{}
 	}
 	return wake
+}
+
+// consentGatedResendParked reports whether startup-loaded spool work is held
+// behind an analytics-grant receipt whose OWN retry is parked.
+//
+// The events deferral is not the only thing that can gate that work, and the
+// startup clause spins the same way behind either: the wake it arms reaches
+// publishWorkerBatch, which clears the deadline and returns at the still-armed
+// grant gate without attempting the spool, so the next pass arms another one
+// — once a second for the whole consent deferral, up to the 24-hour clamp.
+//
+// Parked is the operative word. A grant gate with no deferral behind it
+// dispatches at the next point and the startup wake is the right nudge; a
+// PARKED one already has an authoritative wake source, because
+// nextPacingWake takes the consent plane's own remaining time as one of its
+// terms (Codex on #48).
+func (c *Client) consentGatedResendParked() bool {
+	if c.consentOutbox == nil || !c.consentOutbox.deferralActive(c.clock.Now()) {
+		return false
+	}
+	return c.grantReceiptGateArmed(nil)
 }
 
 func (c *Client) deferRemaining(deferUntil time.Time) time.Duration {

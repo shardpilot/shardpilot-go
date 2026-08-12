@@ -3695,6 +3695,7 @@ func TestStartupWakeStandsDownUnderAPersistedDeferral(t *testing.T) {
 	client := &Client{clock: clock, spool: &diskSpool{
 		resend: []spoolEntry{{id: "evt-restart-deferred", raw: json.RawMessage(`{}`)}},
 	}}
+	client.cfg.ConsentFloor = &ConsentFloorConfig{}
 
 	// The persisted deferral, comfortably longer than the startup window.
 	deferUntil := clock.now.Add(30 * time.Second)
@@ -3717,6 +3718,24 @@ func TestStartupWakeStandsDownUnderAPersistedDeferral(t *testing.T) {
 	if want := 28 * time.Second; wake < want-time.Second || wake > want+time.Second {
 		t.Fatalf("expected the wake to be the deferral's remainder (~%v), got %v", want, wake)
 	}
+
+	// The same stand-down applies to the OTHER thing that can gate this work.
+	// A parked analytics-grant receipt holds the spool legs, and the startup
+	// clause spins behind it identically: its wake reaches publishWorkerBatch,
+	// which clears the deadline and returns at the still-armed gate without
+	// attempting the spool, so the next pass arms another one.
+	clock.now = clock.now.Add(30 * time.Second)
+	client.consentOutbox = &consentOutbox{deferUntil: clock.now.Add(30 * time.Second)}
+	client.consentGrantArming.Store(1)
+	if wake := client.nextPacingWake(time.Time{}); wake < 29*time.Second {
+		t.Fatalf("a parked grant gate owns the wake while it holds the spool legs, got %v", wake)
+	}
+	clock.now = clock.now.Add(2 * time.Second)
+	if wake := client.nextPacingWake(time.Time{}); wake <= 10*time.Millisecond {
+		t.Fatalf("the worker is spinning behind the consent gate: wake %v", wake)
+	}
+	client.consentGrantArming.Store(0)
+	client.consentOutbox = nil
 
 	// Once the deferral lapses, the clause arms again — the recovery path it
 	// exists for is untouched.
