@@ -74,6 +74,19 @@ type Config struct {
 	// revision in the same response header once its handshake is armed).
 	SchemaRevision string
 
+	// DisableRequestCompression stops the client from gzip-compressing request
+	// bodies. Default false — the client COMPRESSES: batch bodies are the same
+	// envelope keys repeated per event and come down to a few percent of their
+	// size, which is the point of the change.
+	//
+	// The escape hatch exists for deployments where something between the SDK
+	// and ingest cannot be trusted with a compressed body. It should rarely be
+	// needed: a server that refuses the coding says so with a distinct detail
+	// code, and the client falls back to uncompressed for the rest of the
+	// process on its own after one rejected request, rather than dropping
+	// batches. Set this to skip even that one round-trip.
+	DisableRequestCompression bool
+
 	// DisableSchemaRevision stops the client from declaring a schema-set
 	// revision at all: no X-ShardPilot-Schema-Revision header on any request.
 	// An undeclared revision always passes the server's handshake in every

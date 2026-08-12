@@ -221,7 +221,7 @@ func TestConsentDenialAbortsInFlightAssignmentGET(t *testing.T) {
 		_, _ = w.Write([]byte(`{}`))
 	})
 	capture := &expWireCapture{}
-	mux.HandleFunc("/", capture.handler())
+	mux.HandleFunc("/", capture.handler(t))
 	server := httptest.NewServer(mux)
 	defer server.Close()
 

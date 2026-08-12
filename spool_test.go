@@ -68,15 +68,7 @@ func newSpoolTestServer(t *testing.T) (*spoolTestServer, *httptest.Server) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/events:batch":
-			body := make([]byte, 0, 1024)
-			buffer := make([]byte, 4096)
-			for {
-				n, err := r.Body.Read(buffer)
-				body = append(body, buffer[:n]...)
-				if err != nil {
-					break
-				}
-			}
+			body := ingestRequestBytes(t, r)
 			var request struct {
 				Events []struct {
 					EventID string `json:"event_id"`
@@ -117,7 +109,7 @@ func newSpoolTestServer(t *testing.T) (*spoolTestServer, *httptest.Server) {
 			fmt.Fprintf(w, `{"accepted":%d,"rejected":0,"duplicates":0}`, len(ids))
 		case "/v1/consent":
 			var body map[string]any
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			if err := json.NewDecoder(ingestRequestBody(t, r)).Decode(&body); err != nil {
 				t.Errorf("decode consent request: %v", err)
 			}
 			state.mu.Lock()

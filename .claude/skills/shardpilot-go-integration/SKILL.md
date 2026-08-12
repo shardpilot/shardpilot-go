@@ -169,9 +169,29 @@ clock, so this is how often an otherwise-silent process talks to ingest),
 remote-config fields (`RemoteConfigURL` + `APIKey` +
 `RemoteConfigCachePath`; see "Remote config"), the disk-spool fields
 (`SpoolDir`, `SpoolMaxEvents`, `SpoolMaxBytes`, `OnSpoolDeadLetter`; see
-"Offline behavior / spool"), and `SchemaRevision` /
-`DisableSchemaRevision` (see the facts list below). The SDK itself reads no
-environment variables.
+"Offline behavior / spool"), `SchemaRevision` /
+`DisableSchemaRevision` (see the facts list below), and
+`DisableRequestCompression`. The SDK itself reads no environment variables.
+
+**Request bodies over 1 KiB are gzip-compressed by default** — batch
+publishes and consent writes both. A batch body is the same envelope keys
+repeated per event, so it compresses hard: a 100-event batch measures 41.7 KB
+down to 2.4 KB on the wire (17x), at ~36 microseconds and 2 allocations per
+batch, paid on the publish path and never on the caller's `Track`. Smaller
+bodies are sent uncompressed, because gzip's 18 bytes of framing make a
+single-event batch bigger rather than smaller.
+
+Two things follow that matter when you integrate:
+
+- **The ingest body cap applies to the UNCOMPRESSED body.** Compression buys
+  throughput, not headroom — size batches against the decompressed JSON
+  exactly as before.
+- **You do not need to coordinate the rollout.** If the ingest deployment
+  cannot read the coding it answers `400` with detail code
+  `unsupported_content_encoding`, and the client latches compression off for
+  the rest of the process and re-sends the same batch uncompressed. The cost
+  of pointing a new SDK at an older server is one round-trip, not lost data.
+  Set `DisableRequestCompression: true` to skip even that.
 
 ## Consent model — READ THIS FIRST, IT IS INVERTED
 

@@ -46,7 +46,7 @@ func newFloorTestServer(t *testing.T) (*floorTestServer, *httptest.Server) {
 					EventID string `json:"event_id"`
 				} `json:"events"`
 			}
-			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			if err := json.NewDecoder(ingestRequestBody(t, r)).Decode(&request); err != nil {
 				t.Errorf("decode batch request: %v", err)
 			}
 			ids := make([]string, 0, len(request.Events))
@@ -68,7 +68,7 @@ func newFloorTestServer(t *testing.T) (*floorTestServer, *httptest.Server) {
 			fmt.Fprintf(w, `{"accepted":%d,"rejected":0,"duplicates":0}`, len(ids))
 		case "/v1/consent":
 			var body map[string]any
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			if err := json.NewDecoder(ingestRequestBody(t, r)).Decode(&body); err != nil {
 				t.Errorf("decode consent request: %v", err)
 			}
 			state.mu.Lock()

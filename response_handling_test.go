@@ -1013,7 +1013,7 @@ func TestEventArrivingDuringDeferralKeepsTheDeadlineRetry(t *testing.T) {
 			return
 		}
 		var request batchRequest
-		_ = json.NewDecoder(r.Body).Decode(&request)
+		_ = json.NewDecoder(ingestRequestBody(t, r)).Decode(&request)
 		if call == 2 {
 			secondAttempt.Store(time.Now().UnixMilli())
 			secondAttemptEvents.Store(int64(len(request.Events)))

@@ -20,7 +20,7 @@ func TestTrackSendsAppFirstEnvelope(t *testing.T) {
 		requestPath = r.URL.Path
 		authHeader = r.Header.Get("Authorization")
 		var raw map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+		if err := json.NewDecoder(ingestRequestBody(t, r)).Decode(&raw); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
 		encoded, err := json.Marshal(raw)
