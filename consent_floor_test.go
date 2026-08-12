@@ -1402,7 +1402,7 @@ func TestConsentFloorFlushDispatchesReceiptsUnderDenial(t *testing.T) {
 	// re-arm a deferral under the flush.
 	dir := t.TempDir()
 	client := newFloorTestClient(t, server.URL, dir, nil)
-	if !client.consentOutbox.claimDispatch() {
+	if !client.consentOutbox.claimDispatch(false) {
 		t.Fatalf("test shape: claiming the dispatch lock failed")
 	}
 	client.SetConsent(true)
@@ -3452,7 +3452,7 @@ func TestConsentFloorFlushJoinsInFlightDispatchPass(t *testing.T) {
 	// the decision's worker wake cannot deliver either.
 	dir := t.TempDir()
 	client := newFloorTestClient(t, server.URL, dir, nil)
-	if !client.consentOutbox.claimDispatch() {
+	if !client.consentOutbox.claimDispatch(false) {
 		t.Fatalf("test shape: claiming the dispatch lock failed")
 	}
 	client.SetConsent(false) // the deny receipt is retained; every pass loses the claim
@@ -3573,7 +3573,7 @@ func TestConsentFloorRetryableCloseSurfacesCallerBound(t *testing.T) {
 		t.Fatalf("expected the memory-only parked receipt to pend Close, got %v", err)
 	}
 
-	if !client.consentOutbox.claimDispatch() {
+	if !client.consentOutbox.claimDispatch(false) {
 		t.Fatalf("test shape: claiming the dispatch lock failed")
 	}
 	shortCtx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
@@ -3942,7 +3942,7 @@ func TestConsentFloorGrantHeldBehindParkedNewerDenial(t *testing.T) {
 	// against the local denial for as long as the heal keeps failing.
 	dir := t.TempDir()
 	client := newFloorTestClient(t, server.URL, dir, nil)
-	if !client.consentOutbox.claimDispatch() {
+	if !client.consentOutbox.claimDispatch(false) {
 		t.Fatalf("test shape: claiming the dispatch lock failed")
 	}
 	client.SetConsent(true) // pair completes cleanly; receipt retained (claim held)
@@ -4061,7 +4061,7 @@ func TestConsentFloorRetriedCloseWaitsForWorkerStop(t *testing.T) {
 	// would exit before the close remnant is spooled or counted.
 	dir := t.TempDir()
 	client := newFloorTestClient(t, server.URL, dir, nil)
-	if !client.consentOutbox.claimDispatch() {
+	if !client.consentOutbox.claimDispatch(false) {
 		t.Fatalf("test shape: claiming the dispatch lock failed")
 	}
 	client.SetConsent(true) // pair completes; receipt retained under the held claim
@@ -4321,7 +4321,7 @@ func TestConsentFloorGrantHandoffRechecksUnderDecisionLock(t *testing.T) {
 	// never posting past a denial that may be landing right now.
 	dir := t.TempDir()
 	client := newFloorTestClient(t, server.URL, dir, nil)
-	if !client.consentOutbox.claimDispatch() {
+	if !client.consentOutbox.claimDispatch(false) {
 		t.Fatalf("test shape: claiming the dispatch lock failed")
 	}
 	client.SetConsent(true) // pair completes; receipt retained under the held claim
@@ -4559,7 +4559,7 @@ func TestConsentFloorFastHalfDenialParksGrantHandoff(t *testing.T) {
 	// re-wake can hand the receipt to the transport before the window
 	// under test exists (a stray worker pass released early would
 	// legitimately deliver the grant pre-denial and void the pin).
-	if !client.consentOutbox.claimDispatch() {
+	if !client.consentOutbox.claimDispatch(false) {
 		t.Fatalf("test shape: claiming the dispatch lock failed")
 	}
 	client.SetConsent(true)
@@ -5450,10 +5450,10 @@ func TestARefusedDispatchClaimLeavesTheDeadlineAndWakesOnRelease(t *testing.T) {
 	}
 
 	// A caller-side dispatch holds the claim; the worker's pass is turned away.
-	if !outbox.claimDispatch() {
+	if !outbox.claimDispatch(false) {
 		t.Fatal("the first claim must succeed")
 	}
-	if outbox.claimDispatch() {
+	if outbox.claimDispatch(true) {
 		t.Fatal("a second claim must be refused while the first is held")
 	}
 	if !outbox.deferralElapsed(now) {
@@ -5463,15 +5463,30 @@ func TestARefusedDispatchClaimLeavesTheDeadlineAndWakesOnRelease(t *testing.T) {
 	if !outbox.releaseDispatch() {
 		t.Fatal("release must report the refused pass, or nothing wakes the worker and the receipt waits for the flush tick")
 	}
-	if outbox.claimDispatch() {
+	if outbox.claimDispatch(false) {
 		// Re-claiming is fine; what must NOT persist is the missed flag.
 		if outbox.releaseDispatch() {
 			t.Fatal("the missed-claim flag must be cleared by the release that reported it")
 		}
 	}
 
+	// A CALLER-side miss must not be recorded: the release that follows would
+	// wake the worker, whose wake handler runs a publish pass, and an
+	// unrelated concurrent Track could then drain a partial batch early — the
+	// eager drain this handshake exists to remove, arriving through the other
+	// door.
+	if !outbox.claimDispatch(false) {
+		t.Fatal("claiming after release must succeed")
+	}
+	if outbox.claimDispatch(false) {
+		t.Fatal("a second claim must be refused while the first is held")
+	}
+	if outbox.releaseDispatch() {
+		t.Fatal("a caller-side miss must not earn the worker a wake")
+	}
+
 	// And the deadline is retired by the pass that actually holds the claim.
-	if !outbox.claimDispatch() {
+	if !outbox.claimDispatch(false) {
 		t.Fatal("claiming after release must succeed")
 	}
 	if !outbox.consumeElapsedDeferral(now) {

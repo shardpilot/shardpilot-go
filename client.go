@@ -826,8 +826,10 @@ func (c *Client) run() {
 			// The check does NOT consume the deadline; the dispatch does, once
 			// it holds the claim. A pass refused the claim by a concurrent
 			// caller-side dispatch has sent nothing, and must leave the
-			// deadline standing for the wake that release triggers.
-			c.dispatchConsentReceipts(context.Background(), false)
+			// deadline standing for the wake that release triggers — which is
+			// why THIS pass identifies itself as the worker's and the
+			// caller-side ones do not.
+			c.dispatchConsentReceiptsFrom(context.Background(), false, true)
 		}
 		var deferWake <-chan time.Time
 		// The timer serves BOTH planes: it is armed at the earliest live
@@ -1004,13 +1006,27 @@ func (c *Client) nextPacingWake(eventsDeferUntil time.Time) time.Duration {
 	// the REMAINING time instead means other activity can only shorten it.
 	if c.spool != nil && c.spool.hasResendWork() {
 		now := c.clock.Now()
-		if c.startupResendWakeAt.IsZero() || !c.startupResendWakeAt.After(now) {
-			// A fresh cycle: either this is the first pass to see the work, or
-			// the previous deadline has fired and the pass it woke has already
-			// run. Everything in between leaves the deadline alone.
+		if c.startupResendWakeAt.IsZero() {
 			c.startupResendWakeAt = now.Add(publishBackoffBase)
 		}
-		if remaining := c.startupResendWakeAt.Sub(now); wake <= 0 || remaining < wake {
+
+		// An EXPIRED deadline is not rolled here, and that is the point. This
+		// function computes a wake; only publishWorkerBatch attempts the
+		// resend, and only it clears the deadline. Rolling on expiry meant an
+		// unrelated case that merely SPANNED the deadline — a consent HTTP
+		// dispatch, slow spool maintenance — pushed the recovery out by a
+		// fresh second without anything having tried it, and repeated cases
+		// could do that indefinitely to a deadline described as absolute.
+		//
+		// Expired therefore reports "due now", floored to a positive duration
+		// so the shared timer actually fires rather than being disarmed. The
+		// pass it wakes clears the deadline, and the next one arms a full
+		// window — or the work is gone and the branch below clears it.
+		remaining := c.startupResendWakeAt.Sub(now)
+		if remaining <= 0 {
+			remaining = time.Millisecond
+		}
+		if wake <= 0 || remaining < wake {
 			wake = remaining
 		}
 	} else {
@@ -1466,6 +1482,14 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 }
 
 func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, deferUntil *time.Time, backoffAttempt *int) []Event {
+	// The startup-recovery deadline belongs to the pass that ATTEMPTS the
+	// resend, which is this one. Clearing it here — rather than rolling it in
+	// nextPacingWake when it happens to be expired — is what keeps unrelated
+	// worker activity from postponing recovery: only a real attempt starts the
+	// next window. A failed attempt arms an ordinary publish deferral, which
+	// gates the next one on its own schedule.
+	c.startupResendWakeAt = time.Time{}
+
 	// Every automatic caller gates on the deadline having passed, so consume
 	// it here: a follow-up failure re-arms it through applyRetryPacing (from
 	// its own Retry-After hint, or the backoff schedule) instead of

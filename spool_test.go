@@ -3612,3 +3612,64 @@ func TestStartupSpoolResendSurvivesFrequentUnrelatedWakes(t *testing.T) {
 			return client.Snapshot().SpoolResent == 1
 		})
 }
+
+// TestStartupSpoolResendSurvivesAWakeThatSpansItsDeadline is the third pass at
+// this, and the two before it both left the same hole open from a different
+// side.
+//
+// The first fix re-derived a fresh one-second duration each iteration, so any
+// wake restarted it. The second made the deadline absolute but ROLLED it on
+// expiry inside the wake computation — so a worker case that merely SPANNED
+// the deadline (a consent HTTP dispatch, slow spool maintenance) pushed
+// recovery out by a fresh second without anything having attempted it, and
+// repeated cases could do that indefinitely to a deadline described as
+// absolute. The previous test could not see it: its wakes all arrived BEFORE
+// expiry.
+//
+// Here the noise is deliberately slower than the one-second recovery window,
+// so every wake lands after it — the shape that used to roll the deadline
+// forever. Only an attempt may clear it now, so the resend lands regardless.
+func TestStartupSpoolResendSurvivesAWakeThatSpansItsDeadline(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+
+	dir := t.TempDir()
+	writeConsentRecordFile(t, dir, "granted")
+	writeSpoolRecordFile(t, dir, 0, spoolTestEnvelope(t, "evt-restart-spanning-1", time.Now()))
+
+	state.setOutcome(http.StatusAccepted, "", "")
+	client := newSpoolTestClient(t, server.URL, dir, nil, func(cfg *Config) {
+		cfg.FlushInterval = time.Hour
+		cfg.BatchSize = 100
+		cfg.BufferSize = 512
+	})
+	defer func() { _ = client.Close(context.Background()) }()
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// 1.4s apart: every one of these wakes arrives AFTER the
+			// one-second recovery deadline has passed, which is exactly the
+			// case that used to roll it forward instead of attempting.
+			_ = client.Enqueue(Event{ID: fmt.Sprintf("evt-spanning-noise-%d", i), Name: "noise"})
+			time.Sleep(1400 * time.Millisecond)
+		}
+	}()
+	defer func() {
+		close(stop)
+		<-done
+	}()
+
+	waitFor(t, 5*time.Second,
+		"the startup-loaded spool chunk resent despite wakes that span its deadline",
+		func() bool {
+			return client.Snapshot().SpoolResent == 1
+		})
+}

@@ -206,9 +206,10 @@ type consentOutbox struct {
 	// its turn instead of silently skipping receipt work.
 	dispatching     bool
 	dispatchWaiters []chan struct{}
-	// dispatchMissed records that a NON-JOINING pass (the worker's) asked for
-	// the claim while it was held and was turned away. releaseDispatch reports
-	// and clears it, and its holder wakes the worker — see claimDispatch.
+	// dispatchMissed records that the WORKER's non-joining pass asked for the
+	// claim while it was held and was turned away. releaseDispatch reports and
+	// clears it, and its holder wakes the worker — see claimDispatch, which
+	// explains why a caller-side miss must NOT set it.
 	dispatchMissed bool
 
 	// deferUntil parks the consent plane after a retryable delivery failure
@@ -751,17 +752,25 @@ func (o *consentOutbox) grantPendingDispatch(handed map[string]struct{}, inScope
 // claimDispatch takes the serial-dispatch claim; false when another pass is
 // already running (its receipts count as in flight; the caller's gate check
 // treats everything it did not hand itself as pending).
-func (o *consentOutbox) claimDispatch() bool {
+// claimDispatch takes the serial-dispatch claim without joining, reporting
+// whether it was obtained.
+//
+// byWorker discriminates the WORKER's pass from a caller-side one, and it is
+// load-bearing rather than bookkeeping. Only the worker has an elapsed retry
+// deadline it consumed and nothing left to re-arm a timer with, so only the
+// worker's miss is worth a wake on release. Recording a caller's miss too —
+// a synchronous Track overlapping an in-flight dispatch — made that release
+// wake the worker, and the worker's wake handler runs a publish pass: an
+// unrelated concurrent Track could then transmit a queued PARTIAL batch
+// before its FlushInterval, which is precisely the eager drain this handshake
+// was introduced to remove. It came back through the other door.
+func (o *consentOutbox) claimDispatch(byWorker bool) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.dispatching {
-		// Remember that a pass wanted this claim and did not get it, so the
-		// holder can wake it on release. A worker pass that found an elapsed
-		// retry deadline and then lost the claim has dispatched nothing and
-		// has nothing left to re-arm its timer with, so without the wake the
-		// receipt waits for the flush tick — the coupling this plane's own
-		// clock exists to avoid.
-		o.dispatchMissed = true
+		if byWorker {
+			o.dispatchMissed = true
+		}
 		return false
 	}
 	o.dispatching = true
@@ -1454,6 +1463,14 @@ func consentDeliveryRetryable(err error) bool {
 // or mid-attempt — so the caller must not report success over receipts it
 // never drained.
 func (c *Client) dispatchConsentReceipts(ctx context.Context, join bool) (map[string]struct{}, bool) {
+	return c.dispatchConsentReceiptsFrom(ctx, join, false)
+}
+
+// dispatchConsentReceiptsFrom is dispatchConsentReceipts with the caller
+// identified. byWorker is true ONLY for the worker's own elapsed-deadline
+// pass; see claimDispatch for why that distinction decides whether losing the
+// claim earns a wake.
+func (c *Client) dispatchConsentReceiptsFrom(ctx context.Context, join bool, byWorker bool) (map[string]struct{}, bool) {
 	if !c.consentFloorEnabled() {
 		return nil, true
 	}
@@ -1477,7 +1494,7 @@ func (c *Client) dispatchConsentReceipts(ctx context.Context, join bool) (map[st
 		if !o.claimDispatchWait(ctx) {
 			return nil, false
 		}
-	} else if !o.claimDispatch() {
+	} else if !o.claimDispatch(byWorker) {
 		return nil, false
 	}
 	defer func() {
@@ -1633,6 +1650,21 @@ func (c *Client) dispatchConsentReceipts(ctx context.Context, join bool) (map[st
 				// The CALLER's own context ended the attempt (cancellation
 				// or its deadline): an abort, not an endpoint outcome — and
 				// for a caller-driven drain, an incomplete drain.
+				//
+				// WAKE, but arm NOTHING. This pass consumed the elapsed
+				// deadline it claimed under and the abort leaves no
+				// replacement, so without a nudge the receipt waits for the
+				// flush tick — the coupling this plane's own clock exists to
+				// avoid.
+				//
+				// A deferral would be the wrong repair, and there is a test
+				// that says so: an abort is NO outcome, so the receipt stays
+				// immediately available at the head for the next dispatch
+				// point rather than being parked. Waking gives it that
+				// dispatch point at once; arming would have delayed the very
+				// retry this is trying not to delay, and advanced a backoff
+				// streak on an endpoint that told us nothing.
+				c.wakeConsentDispatch()
 				return handed, false
 			}
 		}
