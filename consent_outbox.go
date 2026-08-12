@@ -206,6 +206,11 @@ type consentOutbox struct {
 	// its turn instead of silently skipping receipt work.
 	dispatching     bool
 	dispatchWaiters []chan struct{}
+	// dispatchMissed records that the WORKER's non-joining pass asked for the
+	// claim while it was held and was turned away. releaseDispatch reports and
+	// clears it, and its holder wakes the worker — see claimDispatch, which
+	// explains why a caller-side miss must NOT set it.
+	dispatchMissed bool
 
 	// deferUntil parks the consent plane after a retryable delivery failure
 	// (server Retry-After, or jittered backoff); backoffAttempt counts the
@@ -747,10 +752,25 @@ func (o *consentOutbox) grantPendingDispatch(handed map[string]struct{}, inScope
 // claimDispatch takes the serial-dispatch claim; false when another pass is
 // already running (its receipts count as in flight; the caller's gate check
 // treats everything it did not hand itself as pending).
-func (o *consentOutbox) claimDispatch() bool {
+// claimDispatch takes the serial-dispatch claim without joining, reporting
+// whether it was obtained.
+//
+// byWorker discriminates the WORKER's pass from a caller-side one, and it is
+// load-bearing rather than bookkeeping. Only the worker has an elapsed retry
+// deadline it consumed and nothing left to re-arm a timer with, so only the
+// worker's miss is worth a wake on release. Recording a caller's miss too —
+// a synchronous Track overlapping an in-flight dispatch — made that release
+// wake the worker, and the worker's wake handler runs a publish pass: an
+// unrelated concurrent Track could then transmit a queued PARTIAL batch
+// before its FlushInterval, which is precisely the eager drain this handshake
+// was introduced to remove. It came back through the other door.
+func (o *consentOutbox) claimDispatch(byWorker bool) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.dispatching {
+		if byWorker {
+			o.dispatchMissed = true
+		}
 		return false
 	}
 	o.dispatching = true
@@ -785,15 +805,24 @@ func (o *consentOutbox) claimDispatchWait(ctx context.Context) bool {
 	}
 }
 
-func (o *consentOutbox) releaseDispatch() {
+// releaseDispatch drops the serial-dispatch claim and reports whether a
+// NON-JOINING pass was refused it while it was held — the caller wakes the
+// worker in that case, and only in that case. Waking unconditionally would
+// make the worker run a publish pass after every consent dispatch, which is a
+// different and larger behaviour change: a queued event that used to wait for
+// its flush trigger would go out early, which the Close-drain test caught.
+func (o *consentOutbox) releaseDispatch() bool {
 	o.mu.Lock()
 	o.dispatching = false
+	missed := o.dispatchMissed
+	o.dispatchMissed = false
 	waiters := o.dispatchWaiters
 	o.dispatchWaiters = nil
 	o.mu.Unlock()
 	for _, wait := range waiters {
 		close(wait)
 	}
+	return missed
 }
 
 // deferralActive reports whether the consent plane is parked (a retryable
@@ -802,6 +831,80 @@ func (o *consentOutbox) deferralActive(now time.Time) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	return !o.deferUntil.IsZero() && now.Before(o.deferUntil)
+}
+
+// consumeElapsedDeferral clears a consent-retry deadline that has already
+// passed and reports whether it did.
+//
+// It exists because deferRemaining reports ZERO for two different states —
+// "no deadline" and "deadline already passed" — so the worker's wake
+// arithmetic cannot tell them apart and would disarm its timer on an elapsed
+// deadline, parking the receipt until the next flush tick. That is exactly the
+// cadence coupling this SDK's retry pacing was separated from; the events
+// plane has always had a fast path for its own elapsed deadline, and the
+// consent plane did not (Codex on #48).
+//
+// CLEARING rather than merely reporting is what makes the caller's fast path
+// safe to loop on: the parking window is over, so the deadline has done its
+// job. A dispatch that fails again re-arms a fresh one; a dispatch with
+// nothing owed leaves it clear instead of spinning the worker on a deadline
+// that can never expire again.
+//
+// It is consumed only ONCE THE DISPATCH CLAIM IS HELD, which is why this sits
+// inside dispatchConsentReceipts rather than at the worker's check. Consuming
+// it at the check and then losing the claim to a concurrent caller-side
+// dispatch left neither pass sending the receipt — the caller had already
+// decided to skip on a deadline that was still live when it looked — and with
+// the deadline gone nothing armed a timer, so the receipt waited for the flush
+// tick after all (Codex on #48).
+func (o *consentOutbox) consumeElapsedDeferral(now time.Time) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.deferUntil.IsZero() || now.Before(o.deferUntil) {
+		return false
+	}
+	o.deferUntil = time.Time{}
+	return true
+}
+
+// deferralElapsed reports whether a consent-retry deadline has come due,
+// WITHOUT consuming it. The worker uses this to decide it has dispatch work;
+// the dispatch consumes the deadline once it holds the claim.
+func (o *consentOutbox) deferralElapsed(now time.Time) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return !o.deferUntil.IsZero() && !now.Before(o.deferUntil)
+}
+
+// deferRemaining is how long the consent plane is still parked for, or zero
+// when it is not parked (or the deadline has already passed).
+//
+// The worker uses this to arm its wake timer, which is why it exists
+// separately from deferralActive: knowing THAT the plane is parked is enough
+// to skip a dispatch, but waking at the right moment needs to know for how
+// long. Without it a receipt retry deferred one second would sit until the
+// next flush tick — fifteen seconds by default — even though the consent
+// plane's own schedule said one.
+// hasDeferral reports whether a retry deadline is ARMED, elapsed or not.
+// deferralActive answers "still parked"; this answers "there is a deadline to
+// consume", which is what separates a just-expired window from no window at
+// all when the wake is computed.
+func (o *consentOutbox) hasDeferral() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return !o.deferUntil.IsZero()
+}
+
+func (o *consentOutbox) deferRemaining(now time.Time) time.Duration {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.deferUntil.IsZero() {
+		return 0
+	}
+	if remaining := o.deferUntil.Sub(now); remaining > 0 {
+		return remaining
+	}
+	return 0
 }
 
 // ── Client-level orchestration ──────────────────────────────────────────────
@@ -1303,6 +1406,15 @@ func (c *Client) wakeConsentDispatch() {
 	if c.consentWake == nil {
 		return
 	}
+	// Test-only. "The wake is emitted with the dispatch claim already
+	// released" is an ORDERING property, and the failure it guards against is
+	// the worker consuming the nudge at one specific instant — which a test
+	// cannot schedule and a repeat-until-flaky run cannot pin. Observing the
+	// claim state at the moment of the send says the same thing and says it
+	// deterministically. Never set in production.
+	if hook, _ := c.consentWakeHook.Load().(func()); hook != nil {
+		hook()
+	}
 	select {
 	case c.consentWake <- struct{}{}:
 	default:
@@ -1370,6 +1482,14 @@ func consentDeliveryRetryable(err error) bool {
 // or mid-attempt — so the caller must not report success over receipts it
 // never drained.
 func (c *Client) dispatchConsentReceipts(ctx context.Context, join bool) (map[string]struct{}, bool) {
+	return c.dispatchConsentReceiptsFrom(ctx, join, false)
+}
+
+// dispatchConsentReceiptsFrom is dispatchConsentReceipts with the caller
+// identified. byWorker is true ONLY for the worker's own elapsed-deadline
+// pass; see claimDispatch for why that distinction decides whether losing the
+// claim earns a wake.
+func (c *Client) dispatchConsentReceiptsFrom(ctx context.Context, join bool, byWorker bool) (map[string]struct{}, bool) {
 	if !c.consentFloorEnabled() {
 		return nil, true
 	}
@@ -1393,10 +1513,31 @@ func (c *Client) dispatchConsentReceipts(ctx context.Context, join bool) (map[st
 		if !o.claimDispatchWait(ctx) {
 			return nil, false
 		}
-	} else if !o.claimDispatch() {
+	} else if !o.claimDispatch(byWorker) {
 		return nil, false
 	}
-	defer o.releaseDispatch()
+	// Set by the caller-abort branch below instead of waking inline. The wake
+	// has to be emitted AFTER the claim is released: the worker's wake handler
+	// takes the claim non-joining, so a wake sent while this pass still holds
+	// it is refused — and refused WITHOUT recording a miss, because that
+	// handler is not the worker's own elapsed-deadline pass. The nudge would
+	// then be swallowed by the very handshake meant to preserve it, and the
+	// abort arms no deadline to retry from.
+	wakeOnRelease := false
+	defer func() {
+		if o.releaseDispatch() || wakeOnRelease {
+			// A pass was refused this claim while it was held, so give it
+			// another look now that the claim is free. It cannot loop: a
+			// dispatch that failed re-armed a FUTURE deadline, and one that
+			// succeeded left nothing owed.
+			c.wakeConsentDispatch()
+		}
+	}()
+
+	// The claim is held, so the parking window can be retired: the worker's
+	// elapsed-deadline check deliberately does not consume it, because a pass
+	// that never obtains the claim has not dispatched anything.
+	o.consumeElapsedDeferral(c.clock.Now())
 	handed := make(map[string]struct{})
 	for {
 		if o.deferralActive(c.clock.Now()) {
@@ -1503,9 +1644,10 @@ func (c *Client) dispatchConsentReceipts(ctx context.Context, join bool) (map[st
 				return handed, true
 			}
 		}
-		attemptCtx, cancel := contextWithDefaultTimeout(ctx, c.cfg.HTTPTimeout)
-		_, err := c.transport.PublishConsent(attemptCtx, consentReceiptWire(receipt))
-		cancel()
+		// The transport bounds each HTTP attempt by HTTPTimeout; this used to
+		// bound the whole dispatch, which left a gzip-refusal fallback with
+		// only what the refusal had not already spent.
+		_, err := c.transport.PublishConsent(ctx, consentReceiptWire(receipt))
 		// The dispatch gate releases only on an OBSERVED HTTP outcome: a
 		// success, or a status error — proof the request reached the server
 		// and was answered, so an event batch following in this cycle
@@ -1535,6 +1677,25 @@ func (c *Client) dispatchConsentReceipts(ctx context.Context, join bool) (map[st
 				// The CALLER's own context ended the attempt (cancellation
 				// or its deadline): an abort, not an endpoint outcome — and
 				// for a caller-driven drain, an incomplete drain.
+				//
+				// WAKE, but arm NOTHING. This pass consumed the elapsed
+				// deadline it claimed under and the abort leaves no
+				// replacement, so without a nudge the receipt waits for the
+				// flush tick — the coupling this plane's own clock exists to
+				// avoid.
+				//
+				// A deferral would be the wrong repair, and there is a test
+				// that says so: an abort is NO outcome, so the receipt stays
+				// immediately available at the head for the next dispatch
+				// point rather than being parked. Waking gives it that
+				// dispatch point at once; arming would have delayed the very
+				// retry this is trying not to delay, and advanced a backoff
+				// streak on an endpoint that told us nothing.
+				//
+				// Deferred to the release above rather than sent here: this
+				// pass still holds the dispatch claim, and a wake the worker
+				// consumes now is refused it without recording a miss.
+				wakeOnRelease = true
 				return handed, false
 			}
 		}
@@ -1561,6 +1722,17 @@ func (c *Client) dispatchConsentReceipts(ctx context.Context, join bool) (map[st
 // is independent of the events plane's pacing: a denial clears the publish
 // deferral while receipt retries must keep backing off.
 func (c *Client) armConsentDeferral(err error) {
+	// The worker may already be parked in select with NO wake armed: it
+	// evaluated its pacing deadlines before this deferral existed (a
+	// synchronous Track can dispatch a retained receipt concurrently), and
+	// with nothing else pending it has no wake source but the flush tick.
+	// Nudge it so it re-evaluates and arms a timer for the deadline set
+	// below — otherwise a one-second consent retry waits out the whole flush
+	// interval, which is the coupling this SDK's pacing was separated from
+	// (Codex on #48). Non-blocking and idempotent; deferred so it runs after
+	// the deadline is actually visible.
+	defer c.wakeConsentDispatch()
+
 	o := c.consentOutbox
 	o.mu.Lock()
 	defer o.mu.Unlock()

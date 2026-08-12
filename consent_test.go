@@ -29,7 +29,7 @@ func newConsentTestServer(t *testing.T, eventCount *atomic.Int64, consents chan 
 		switch r.URL.Path {
 		case "/v1/events:batch":
 			var request batchRequest
-			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			if err := json.NewDecoder(ingestRequestBody(t, r)).Decode(&request); err != nil {
 				t.Errorf("decode batch request: %v", err)
 			}
 			eventCount.Add(int64(len(request.Events)))
@@ -38,7 +38,7 @@ func newConsentTestServer(t *testing.T, eventCount *atomic.Int64, consents chan 
 			_, _ = w.Write([]byte(`{"accepted":0,"rejected":0,"duplicates":0}`))
 		case "/v1/consent":
 			var body map[string]any
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			if err := json.NewDecoder(ingestRequestBody(t, r)).Decode(&body); err != nil {
 				t.Errorf("decode consent request: %v", err)
 			}
 			if consents != nil {
@@ -730,7 +730,7 @@ func TestSetConsentDecisionsArriveInCallOrder(t *testing.T) {
 			return
 		}
 		var body consentRequest
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if err := json.NewDecoder(ingestRequestBody(t, r)).Decode(&body); err != nil {
 			t.Errorf("decode consent request: %v", err)
 		}
 		// Hold every request briefly: concurrent unordered senders would

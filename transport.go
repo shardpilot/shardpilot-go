@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -177,6 +178,34 @@ type httpTransport struct {
 	// transient malformed_response — the wrong class, and one that serves the
 	// cache for an endpoint that authoritatively is not here.
 	rcClient *http.Client
+
+	// compressionOptOut is the caller's Config.DisableRequestCompression:
+	// fixed for the client's lifetime.
+	compressionOptOut bool
+	// compressionRefused latches when the server tells us it cannot read our
+	// content coding. Atomic because the flush worker, synchronous Track
+	// callers and the consent outbox all publish concurrently, and the latch
+	// must be seen by all of them after any one of them trips it.
+	compressionRefused atomic.Bool
+	// attemptTimeout bounds ONE HTTP attempt. It lives here rather than at the
+	// call sites because postJSON can make two attempts for one logical
+	// request — a gzip refusal is answered by re-sending the same body
+	// uncompressed — and the second one needs its own budget. Bounding the
+	// operation instead left the retry with whatever the refusal response had
+	// not already spent, so a slow refusal made the advertised fallback time
+	// out on its first use.
+	attemptTimeout time.Duration
+	// logger reports the one-time fallback. Nil is silent.
+	logger Logger
+}
+
+// compressionEnabled reports whether this publish may gzip its body.
+func (t *httpTransport) compressionEnabled() bool {
+	return !t.compressionOptOut && !t.compressionRefused.Load()
+}
+
+func (t *httpTransport) disableCompression() {
+	t.compressionRefused.Store(true)
 }
 
 func newHTTPTransport(cfg Config) *httpTransport {
@@ -203,12 +232,15 @@ func newHTTPTransport(cfg Config) *httpTransport {
 		rcClient = &derived
 	}
 	return &httpTransport{
-		endpoint:        base + "/v1/events:batch",
-		consentEndpoint: base + "/v1/consent",
-		token:           cfg.Token,
-		schemaRevision:  effectiveSchemaRevision(cfg),
-		client:          client,
-		rcClient:        rcClient,
+		endpoint:          base + "/v1/events:batch",
+		consentEndpoint:   base + "/v1/consent",
+		token:             cfg.Token,
+		schemaRevision:    effectiveSchemaRevision(cfg),
+		client:            client,
+		rcClient:          rcClient,
+		compressionOptOut: cfg.DisableRequestCompression,
+		attemptTimeout:    cfg.HTTPTimeout,
+		logger:            cfg.Logger,
 	}
 }
 
@@ -327,12 +359,57 @@ func (t *httpTransport) postJSON(ctx context.Context, endpoint string, request a
 		return &EncodeError{Err: err}
 	}
 
-	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(payload))
+	err = t.postBody(ctx, endpoint, payload, result, schemaRevision, t.compressionEnabled())
+	if !serverRefusedCompression(err) {
+		return err
+	}
+
+	// The server cannot read this request's content coding — either the
+	// deployment predates gzip acceptance, or something between here and it
+	// mangled the body. Stop compressing for the rest of this process and send
+	// the SAME request again, uncompressed.
+	//
+	// Retrying is safe because the request was REJECTED: nothing was ingested,
+	// and the batch route is idempotent per event_id regardless. Without this,
+	// an SDK upgrade pointed at an older ingest deployment would drop every
+	// batch permanently — a transport detail turned into total data loss.
+	// With it the cost is one failed round-trip per process, once.
+	t.disableCompression()
+	if t.logger != nil {
+		t.logger.Printf("shardpilot: ingest refused gzip request bodies (%v); sending uncompressed for the rest of this process", err)
+	}
+
+	return t.postBody(ctx, endpoint, payload, result, schemaRevision, false)
+}
+
+// postBody sends one already-marshalled request body, optionally gzipped.
+//
+// The SDK attempt timeout is applied HERE, per attempt, so the uncompressed
+// retry above gets a full budget rather than the remainder of the refusal's.
+// It still only ever shortens: context.WithTimeout never extends a caller's
+// earlier deadline, so a Flush(ctx) deadline continues to bound everything.
+func (t *httpTransport) postBody(ctx context.Context, endpoint string, payload []byte, result any, schemaRevision string, allowCompression bool) error {
+	ctx, cancelAttempt := contextWithDefaultTimeout(ctx, t.attemptTimeout)
+	defer cancelAttempt()
+
+	body := payload
+	compressed := false
+	if allowCompression {
+		if encoded, ok := compressRequestBody(payload); ok {
+			body = encoded
+			compressed = true
+		}
+	}
+
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("create shardpilot ingest request: %w", err)
 	}
 	httpRequest.Header.Set("Content-Type", "application/json")
 	httpRequest.Header.Set("Authorization", "Bearer "+t.token)
+	if compressed {
+		httpRequest.Header.Set("Content-Encoding", "gzip")
+	}
 	if schemaRevision != "" {
 		httpRequest.Header.Set(schemaRevisionHeader, schemaRevision)
 	}

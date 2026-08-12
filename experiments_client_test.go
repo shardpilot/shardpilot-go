@@ -126,12 +126,14 @@ type expWireCapture struct {
 	envelopes []map[string]any
 }
 
-func (w *expWireCapture) handler() http.HandlerFunc {
+func (w *expWireCapture) handler(t *testing.T) http.HandlerFunc {
+	t.Helper()
+
 	return func(rw http.ResponseWriter, r *http.Request) {
 		var batch struct {
 			Events []map[string]any `json:"events"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&batch)
+		_ = json.NewDecoder(ingestRequestBody(t, r)).Decode(&batch)
 		w.mu.Lock()
 		w.hits++
 		status := w.status
@@ -188,7 +190,7 @@ func newExperimentServer(t *testing.T, script *expScript, capture *expWireCaptur
 		w.WriteHeader(http.StatusAccepted)
 		_, _ = w.Write([]byte(`{}`))
 	})
-	mux.HandleFunc("/", capture.handler())
+	mux.HandleFunc("/", capture.handler(t))
 	return httptest.NewServer(mux)
 }
 
@@ -1379,7 +1381,7 @@ func TestExperimentFactWireEnvelope(t *testing.T) {
 	mux.HandleFunc(expAssignmentRoute, script.handler(t))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		var batch captured
-		_ = json.NewDecoder(r.Body).Decode(&batch)
+		_ = json.NewDecoder(ingestRequestBody(t, r)).Decode(&batch)
 		mu.Lock()
 		for _, raw := range batch.Events {
 			var envelope map[string]any

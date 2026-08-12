@@ -41,7 +41,7 @@ func perEventStatusServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request batchRequest
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		if err := json.NewDecoder(ingestRequestBody(t, r)).Decode(&request); err != nil {
 			t.Errorf("decode request: %v", err)
 			w.WriteHeader(http.StatusBadRequest)
 			return
@@ -294,7 +294,7 @@ func TestOnBatchResultPanicDoesNotStopDelivery(t *testing.T) {
 	var mu sync.Mutex
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request batchRequest
-		_ = json.NewDecoder(r.Body).Decode(&request)
+		_ = json.NewDecoder(ingestRequestBody(t, r)).Decode(&request)
 		mu.Lock()
 		received += len(request.Events)
 		mu.Unlock()
@@ -334,7 +334,7 @@ func TestOnBatchResultPanicViaWorkerDoesNotStopDelivery(t *testing.T) {
 	var mu sync.Mutex
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request batchRequest
-		_ = json.NewDecoder(r.Body).Decode(&request)
+		_ = json.NewDecoder(ingestRequestBody(t, r)).Decode(&request)
 		mu.Lock()
 		received += len(request.Events)
 		mu.Unlock()
@@ -382,7 +382,7 @@ func TestOnBatchResultPanicViaWorkerDoesNotStopDelivery(t *testing.T) {
 func TestBatchResultWithoutPerEventList(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request batchRequest
-		_ = json.NewDecoder(r.Body).Decode(&request)
+		_ = json.NewDecoder(ingestRequestBody(t, r)).Decode(&request)
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
 		// No "events" key: an older or minimal server returns aggregates only.

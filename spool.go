@@ -337,11 +337,27 @@ type diskSpool struct {
 	// injectable so tests can exercise a failed debt-marker creation.
 	// syncFn fsyncs the spool directory (syncDir), injectable so tests can
 	// exercise a destruction whose unlink cannot be made durable.
+	//
+	// Production sets them once at construction and never touches them again,
+	// but tests swap one MID-FLIGHT to model a disk healing, so every read
+	// outside the spool lock is a data race with that swap. It is a race the
+	// race detector only sees when the timing lines up — a change elsewhere in
+	// the worker's wake behaviour surfaced it, having been latent — so the
+	// reads on the unlocked paths go through fileFuncs() below rather than
+	// touching the fields.
 	removeFn func(path string) error
 	renameFn func(oldpath, newpath string) error
 	chmodFn  func(name string, mode os.FileMode) error
 	markerFn func(dir string) error
 	syncFn   func(dir string) error
+}
+
+// fileFuncs reads the injectable rename/chmod pair under the spool lock. See
+// the field declarations: a test may swap them while the worker is running.
+func (s *diskSpool) fileFuncs() (func(string, string) error, func(string, os.FileMode) error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.renameFn, s.chmodFn
 }
 
 // spoolSettledMemory bounds the settled-id memory used to suppress
@@ -1922,9 +1938,9 @@ func (c *Client) resendSpooledChunks(deferUntil *time.Time, backoffAttempt *int)
 		if len(chunk) == 0 {
 			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), c.cfg.HTTPTimeout)
-		result, err := c.publishRequestResult(ctx, spoolChunkRequest(chunk), len(chunk))
-		cancel()
+		// Unbounded here: the transport bounds each HTTP attempt, so the
+		// gzip-refusal fallback gets its own budget.
+		result, err := c.publishRequestResult(context.Background(), spoolChunkRequest(chunk), len(chunk))
 		c.applyRetryPacing(err, deferUntil, backoffAttempt)
 		if err == nil {
 			// Settle the delivered chunk off the spool BEFORE the callback:
@@ -2297,6 +2313,10 @@ func (c *Client) applySpoolConsent(decision ConsentDecision, decidedAt string) (
 		return nil, true
 	}
 	floorAuthored := c.consentFloorEnabled()
+	// Read the injectable file primitives ONCE, under the lock. Every
+	// saveConsentRecord below runs with the spool lock released, so touching
+	// the fields directly races a test swapping one to model a healing disk.
+	renameFn, chmodFn := s.fileFuncs()
 	if decision != ConsentDecisionGranted {
 		// Both denial flavors run the full denial path; the persisted record
 		// keeps the exact decision value (a forced-minor denial reloads as
@@ -2319,7 +2339,7 @@ func (c *Client) applySpoolConsent(decision ConsentDecision, decidedAt string) (
 		// branch — the purge completes in the same pass the record lands.
 		recordPersisted := true
 		var condemned []spoolEntry
-		if recordErr := saveConsentRecord(s.dir, decision, s.actorDigest, decidedAt, floorAuthored, s.renameFn, s.chmodFn); recordErr != nil {
+		if recordErr := saveConsentRecord(s.dir, decision, s.actorDigest, decidedAt, floorAuthored, renameFn, chmodFn); recordErr != nil {
 			recordPersisted = false
 			c.stats.setLastError("consent_record_persist_failed")
 			c.logf("shardpilot spool: persisting the denied consent record failed (the decision still applies in memory; the spool purge is deferred to the record retry and owed durably): %v", recordErr)
@@ -2364,7 +2384,7 @@ func (c *Client) applySpoolConsent(decision ConsentDecision, decidedAt string) (
 				// events under the old grant (in the actorless local-only
 				// path no deny receipt would ever exist to override it).
 				// Escalate through the remaining durable outcomes in order.
-				if retryErr := saveConsentRecord(s.dir, decision, s.actorDigest, decidedAt, floorAuthored, s.renameFn, s.chmodFn); retryErr == nil {
+				if retryErr := saveConsentRecord(s.dir, decision, s.actorDigest, decidedAt, floorAuthored, renameFn, chmodFn); retryErr == nil {
 					// The denied RECORD is durable after all: record-first
 					// is restored, and every crash interleaving from here
 					// fails closed (a relaunch restores denied and purges at
@@ -2423,7 +2443,7 @@ func (c *Client) applySpoolConsent(decision ConsentDecision, decidedAt string) (
 		c.logf("shardpilot spool: a spool wipe is still owed; the persisted consent decision stays denied and the disk spool stays disabled until the wipe succeeds")
 		return nil, false
 	}
-	if err := saveConsentRecord(s.dir, ConsentDecisionGranted, s.actorDigest, decidedAt, floorAuthored, s.renameFn, s.chmodFn); err != nil {
+	if err := saveConsentRecord(s.dir, ConsentDecisionGranted, s.actorDigest, decidedAt, floorAuthored, renameFn, chmodFn); err != nil {
 		s.mu.Lock()
 		s.grantPersisted = false
 		s.mu.Unlock()

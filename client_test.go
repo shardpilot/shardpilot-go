@@ -18,7 +18,7 @@ func TestFlushPublishesQueuedEvents(t *testing.T) {
 	var received atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request batchRequest
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		if err := json.NewDecoder(ingestRequestBody(t, r)).Decode(&request); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
 		received.Add(int64(len(request.Events)))
@@ -353,7 +353,7 @@ func TestEnqueueSnapshotsMutableEventMaps(t *testing.T) {
 	requests := make(chan batchRequest, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request batchRequest
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		if err := json.NewDecoder(ingestRequestBody(t, r)).Decode(&request); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
 		requests <- request
@@ -507,7 +507,7 @@ func TestPermanentEncodeErrorDoesNotBlockLaterValidEvents(t *testing.T) {
 	requests := make(chan batchRequest, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var request batchRequest
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		if err := json.NewDecoder(ingestRequestBody(t, r)).Decode(&request); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
 		requests <- request

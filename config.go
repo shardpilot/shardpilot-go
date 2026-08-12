@@ -74,6 +74,19 @@ type Config struct {
 	// revision in the same response header once its handshake is armed).
 	SchemaRevision string
 
+	// DisableRequestCompression stops the client from gzip-compressing request
+	// bodies. Default false — the client COMPRESSES: batch bodies are the same
+	// envelope keys repeated per event and come down to a few percent of their
+	// size, which is the point of the change.
+	//
+	// The escape hatch exists for deployments where something between the SDK
+	// and ingest cannot be trusted with a compressed body. It should rarely be
+	// needed: a server that refuses the coding says so with a distinct detail
+	// code, and the client falls back to uncompressed for the rest of the
+	// process on its own after one rejected request, rather than dropping
+	// batches. Set this to skip even that one round-trip.
+	DisableRequestCompression bool
+
 	// DisableSchemaRevision stops the client from declaring a schema-set
 	// revision at all: no X-ShardPilot-Schema-Revision header on any request.
 	// An undeclared revision always passes the server's handshake in every
@@ -290,10 +303,29 @@ type Config struct {
 type ConsentFloorConfig struct{}
 
 const (
-	defaultBatchSize     = 25
-	maxBatchSize         = 100
-	defaultBufferSize    = 1000
-	defaultFlushInterval = time.Second
+	defaultBatchSize  = 25
+	maxBatchSize      = 100
+	defaultBufferSize = 1000
+	// defaultFlushInterval is how long a PARTIAL batch waits before it
+	// publishes. It was 1 SECOND.
+	//
+	// It is NOT a heartbeat, and an earlier version of this comment said it
+	// was. The worker returns without a request when the batch is empty
+	// (publishWorkerBatch), so a process that tracks nothing makes no requests
+	// at either value — there was never an idle request-per-second to remove.
+	//
+	// The real cost is that at 1s, batching barely happened: a service
+	// emitting an event every few seconds never reached BatchSize, so the
+	// tick fired on a batch of one and every event became its own request.
+	// 15s — the low end of the cross-SDK 15-30s band — is long enough for
+	// events to actually accumulate. The batch-size trigger is unchanged, so
+	// a busy process still publishes the moment it has a full batch.
+	//
+	// This is a DEFAULT, not a cap: an integration that wants the old cadence
+	// sets FlushInterval explicitly, and latency-sensitive callers already have
+	// Flush(). Nothing here changes how long an event can sit unpublished when
+	// the caller has said what they want.
+	defaultFlushInterval = 15 * time.Second
 	defaultHTTPTimeout   = 2 * time.Second
 
 	// Disk-spool caps: the cross-SDK canonical bound of 2000 events / 1 MiB

@@ -19,6 +19,19 @@ type Client struct {
 	transport transport
 	stats     statsCollector
 
+	// startupResendWakeAt is the absolute deadline for the next look at
+	// spool work that carries no deadline of its own (see nextPacingWake).
+	// Absolute, not a duration recomputed per iteration: unrelated wakes must
+	// only be able to SHORTEN the wait, never restart it. Read and written on
+	// the worker goroutine alone.
+	startupResendWakeAt time.Time
+
+	// consentWakeHook holds a func() invoked immediately before a consent
+	// wake is emitted. Test-only; see wakeConsentDispatch. An atomic because
+	// the worker is already running when a test installs it. Never set in
+	// production.
+	consentWakeHook atomic.Value
+
 	// jitter is the uniform [0, 1) source for the publish backoff's full
 	// jitter; tests pin it for deterministic schedules. Only the flush
 	// worker goroutine reads it. Nil falls back to the shared math/rand
@@ -794,29 +807,49 @@ func (c *Client) run() {
 		if len(batch) >= c.cfg.BatchSize {
 			queueEvents = nil
 		}
-		var deferWake <-chan time.Time
-		if !deferUntil.IsZero() {
-			if remaining := c.deferRemaining(deferUntil); remaining > 0 {
-				if deferTimer == nil {
-					deferTimer = time.NewTimer(remaining)
-				} else {
-					stopAndDrainTimer(deferTimer)
-					deferTimer.Reset(remaining)
-				}
-				deferWake = deferTimer.C
-			} else {
-				// The backpressure deadline elapsed while the worker was busy
-				// with another case — e.g. the queue case won the select in
-				// the same instant the timer fired, drained its tick, and the
-				// held batch stayed below BatchSize. Retry NOW instead of
-				// silently disarming and waiting for the next flush tick.
-				// (publishWorkerBatch consumes the elapsed deadline.)
-				if deferTimer != nil {
-					stopAndDrainTimer(deferTimer)
-				}
-				batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
-				continue
+		if !deferUntil.IsZero() && c.deferRemaining(deferUntil) <= 0 {
+			// The backpressure deadline elapsed while the worker was busy
+			// with another case — e.g. the queue case won the select in
+			// the same instant the timer fired, drained its tick, and the
+			// held batch stayed below BatchSize. Retry NOW instead of
+			// silently disarming and waiting for the next flush tick.
+			// (publishWorkerBatch consumes the elapsed deadline.)
+			if deferTimer != nil {
+				stopAndDrainTimer(deferTimer)
 			}
+			batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
+			continue
+		}
+		if c.consentOutbox != nil && c.consentOutbox.deferralElapsed(c.clock.Now()) {
+			// The consent plane's retry came due while the worker was busy
+			// with another case. Dispatch NOW: the wake arithmetic below
+			// cannot see an elapsed deadline (deferRemaining reports zero for
+			// "passed" and for "none" alike), so without this the timer is
+			// disarmed and the receipt waits for the flush tick — the exact
+			// coupling retry pacing was separated from. Mirrors the events
+			// plane's elapsed-deadline fast path above.
+			//
+			// The check does NOT consume the deadline; the dispatch does, once
+			// it holds the claim. A pass refused the claim by a concurrent
+			// caller-side dispatch has sent nothing, and must leave the
+			// deadline standing for the wake that release triggers — which is
+			// why THIS pass identifies itself as the worker's and the
+			// caller-side ones do not.
+			c.dispatchConsentReceiptsFrom(context.Background(), false, true)
+		}
+		var deferWake <-chan time.Time
+		// The timer serves BOTH planes: it is armed at the earliest live
+		// pacing deadline of either, so a consent receipt's own retry
+		// schedule cannot be stretched to the flush interval by an events
+		// plane that has nothing pending. See nextPacingWake.
+		if wake := c.nextPacingWake(deferUntil); wake > 0 {
+			if deferTimer == nil {
+				deferTimer = time.NewTimer(wake)
+			} else {
+				stopAndDrainTimer(deferTimer)
+				deferTimer.Reset(wake)
+			}
+			deferWake = deferTimer.C
 		} else if deferTimer != nil {
 			stopAndDrainTimer(deferTimer)
 		}
@@ -840,11 +873,33 @@ func (c *Client) run() {
 			}
 			batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
 		case <-deferWake:
-			// The backpressure deadline passed: retry the held batch now
-			// rather than waiting out the remainder of the flush interval.
+			// This wake may belong to EITHER plane, so both get their turn.
+			// The consent dispatch is a no-op when that plane is still parked
+			// or has nothing owed, and it must run before the events check
+			// below returns: a receipt whose retry came due while the events
+			// plane was healthy has no other wake source but the flush tick.
+			c.dispatchConsentReceipts(context.Background(), false)
 			if c.publishDeferred(deferUntil) {
+				// The events deadline has not passed yet.
 				continue
 			}
+			if deferUntil.IsZero() && !(c.spool != nil && c.spool.hasResendWork()) {
+				// This wake was the consent plane's alone. Publishing here
+				// would flush a partial batch early and defeat the BatchSize
+				// / FlushInterval batching this whole loop exists to do.
+				//
+				// Startup spool recovery is the exception, and the reason
+				// this is not simply `deferUntil.IsZero()`: undelivered
+				// entries reloaded with no deadline of their own arm a wake
+				// through nextPacingWake, and returning here would swallow it
+				// — the work would sit until the flush tick, which is exactly
+				// what that wake exists to avoid. Bounded: hasResendWork goes
+				// false once the queue drains, and a failing resend arms a
+				// real deadline that publishDeferred then gates.
+				continue
+			}
+			// The backpressure deadline passed: retry the held batch now
+			// rather than waiting out the remainder of the flush interval.
 			batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
 		case <-c.pacingWake:
 			// A publish succeeded elsewhere (typically a synchronous Track)
@@ -916,6 +971,132 @@ func (c *Client) run() {
 
 // deferRemaining is the time left until the backpressure deadline, or zero
 // when no deferral is active.
+// nextPacingWake is the shortest live pacing deadline across the two planes,
+// or zero when neither is parked.
+//
+// Both planes back off on their own schedules, but only ONE timer wakes the
+// worker, so it has to be armed at whichever comes first. Arming it from the
+// events deadline alone was the defect: a consent receipt deferred one second
+// while the events plane was healthy had no wake source at all except the
+// flush ticker, so its retry silently inherited the batching cadence — one
+// second when that was the default, fifteen now. The consent plane's own
+// backoff never asked for fifteen.
+func (c *Client) nextPacingWake(eventsDeferUntil time.Time) time.Duration {
+	// An ARMED deadline that has already elapsed reports "due now", not "no
+	// deadline". deferRemaining collapses the two to zero, and the loop's
+	// elapsed fast paths run BEFORE this computation — so a deadline that
+	// expires in between (a preemption is enough) leaves this returning no
+	// wake at all, the timer disarmed, and an otherwise idle client waiting
+	// out the 15-second flush tick. The window is small and the cost is a
+	// whole flush interval, on both planes (Codex on #48).
+	//
+	// Floored to a positive duration so the shared timer actually fires. The
+	// pass it wakes runs the fast paths again, which is what consumes the
+	// deadline — so this cannot repeat.
+	wake := c.deferRemaining(eventsDeferUntil)
+	if wake <= 0 && !eventsDeferUntil.IsZero() {
+		wake = time.Millisecond
+	}
+	if c.consentOutbox != nil {
+		now := c.clock.Now()
+		remaining := c.consentOutbox.deferRemaining(now)
+		if remaining <= 0 && c.consentOutbox.hasDeferral() {
+			remaining = time.Millisecond
+		}
+		if remaining > 0 && (wake <= 0 || remaining < wake) {
+			wake = remaining
+		}
+	}
+	// Undelivered spool work with NO deadline of its own is due on the RETRY
+	// clock, not the batching one. initSpool reloads it before the worker
+	// starts, and when its persisted deadline is zero or already past nothing
+	// arms the timer — so a restarted process with no enqueue and no explicit
+	// Flush would leave durable retries sitting until the first flush tick,
+	// which raising the flush default just stretched from one second to
+	// fifteen. That is outstanding recovery work, not a partial idle batch
+	// (Codex on #48).
+	//
+	// Arming a wake rather than publishing inline is deliberate: a startup
+	// Flush racing this would otherwise be doubled into two attempts at a
+	// failing endpoint. By the time this wake fires, either the work is gone
+	// or a real deadline is armed and publishDeferred gates it. The clause
+	// self-clears — hasResendWork goes false once the queue drains — so it
+	// cannot keep the worker awake past recovery.
+	//
+	// The deadline is ABSOLUTE, remembered across iterations. Re-deriving a
+	// fresh one-second duration on every pass would let unrelated wakes —
+	// enqueues arriving faster than once a second — reset the timer each time
+	// and postpone the recovery indefinitely, which is the coupling this
+	// clause exists to break rather than a smaller version of it. Recomputing
+	// the REMAINING time instead means other activity can only shorten it.
+	//
+	// NOT armed while the events plane is deferred, and that guard is load-
+	// bearing rather than an optimisation. A restart with spool entries AND a
+	// still-future persisted retry_after_until_ms has both conditions at once:
+	// this clause armed a one-second deadline, the wake it produced hit the
+	// deferWake case, publishDeferred refused the publish, and so nothing
+	// cleared the deadline — only publishWorkerBatch does. Expired-reports-
+	// due-now then floored it to a millisecond, on every pass, for as long as
+	// the persisted deferral had left to run (up to the 24-hour clamp). A
+	// millisecond spin, in a client SDK, on a path taken by any process
+	// restarting under server backpressure.
+	//
+	// The events deferral is a strictly better wake source for that work
+	// anyway: when it expires the deferWake case publishes, which is the
+	// resend. Nothing is lost by standing down.
+	if c.spool != nil && c.spool.hasResendWork() && !c.publishDeferred(eventsDeferUntil) &&
+		!c.consentGatedResendParked() {
+		now := c.clock.Now()
+		if c.startupResendWakeAt.IsZero() {
+			c.startupResendWakeAt = now.Add(publishBackoffBase)
+		}
+
+		// An EXPIRED deadline is not rolled here, and that is the point. This
+		// function computes a wake; only publishWorkerBatch attempts the
+		// resend, and only it clears the deadline. Rolling on expiry meant an
+		// unrelated case that merely SPANNED the deadline — a consent HTTP
+		// dispatch, slow spool maintenance — pushed the recovery out by a
+		// fresh second without anything having tried it, and repeated cases
+		// could do that indefinitely to a deadline described as absolute.
+		//
+		// Expired therefore reports "due now", floored to a positive duration
+		// so the shared timer actually fires rather than being disarmed. The
+		// pass it wakes clears the deadline, and the next one arms a full
+		// window — or the work is gone and the branch below clears it.
+		remaining := c.startupResendWakeAt.Sub(now)
+		if remaining <= 0 {
+			remaining = time.Millisecond
+		}
+		if wake <= 0 || remaining < wake {
+			wake = remaining
+		}
+	} else {
+		c.startupResendWakeAt = time.Time{}
+	}
+	return wake
+}
+
+// consentGatedResendParked reports whether startup-loaded spool work is held
+// behind an analytics-grant receipt whose OWN retry is parked.
+//
+// The events deferral is not the only thing that can gate that work, and the
+// startup clause spins the same way behind either: the wake it arms reaches
+// publishWorkerBatch, which clears the deadline and returns at the still-armed
+// grant gate without attempting the spool, so the next pass arms another one
+// — once a second for the whole consent deferral, up to the 24-hour clamp.
+//
+// Parked is the operative word. A grant gate with no deferral behind it
+// dispatches at the next point and the startup wake is the right nudge; a
+// PARKED one already has an authoritative wake source, because
+// nextPacingWake takes the consent plane's own remaining time as one of its
+// terms (Codex on #48).
+func (c *Client) consentGatedResendParked() bool {
+	if c.consentOutbox == nil || !c.consentOutbox.deferralActive(c.clock.Now()) {
+		return false
+	}
+	return c.grantReceiptGateArmed(nil)
+}
+
 func (c *Client) deferRemaining(deferUntil time.Time) time.Duration {
 	if deferUntil.IsZero() {
 		return 0
@@ -1039,11 +1220,17 @@ const minRetryNowSpacing = 100 * time.Millisecond
 // Client-side fallback pacing for retryable publish failures that carry no
 // Retry-After hint (server unreachable, or a 5xx without the header):
 // exponential backoff with full jitter, mirroring the shardpilot-defold
-// reference semantics. The first failure retries at the normal flush cadence
-// with no extra wait; sustained failures then defer by a random duration in
-// [base, ceiling], with the ceiling doubling per consecutive failure up to
-// the cap and the jitter de-synchronizing clients so a recovering server
-// does not face the whole fleet at once.
+// reference semantics. Every failure — the FIRST included — defers by a
+// random duration in [base, ceiling], with the ceiling doubling per
+// consecutive failure up to the cap and the jitter de-synchronizing clients
+// so a recovering server does not face the whole fleet at once.
+//
+// The first failure used to defer by NOTHING, which read as "retry promptly"
+// only because the flush interval was one second. It was never prompt on its
+// own — it was the flush tick wearing a retry's clothes, and raising the idle
+// flush default to 15s turned the same code path into a 15-second stall with
+// the queue stopped at BatchSize. Retry pacing owns its own clock now, so the
+// batching cadence can move without dragging the retry cadence with it.
 const (
 	publishBackoffBase = time.Second
 	publishBackoffCap  = 60 * time.Second
@@ -1052,13 +1239,24 @@ const (
 // backoffCeiling is the deterministic upper bound of the jitter window for
 // the given consecutive-failure attempt: base·2^(attempt−2), clamped to the
 // cap (the exponent is clamped too, so an arbitrarily long outage cannot
-// overflow the shift). Attempts before the second have no window — the first
-// failure does not defer.
+// overflow the shift).
+//
+// The FIRST failure shares the second's window rather than having none. Its
+// old zero meant "no deferral", which handed the retry to the flush tick —
+// fine at a one-second interval and a fifteen-second stall at the current
+// default. Giving it exactly `base` reproduces the timing the old default
+// actually delivered (~1s) while making it independent of FlushInterval,
+// which is the entire point: an operator lengthening the idle flush interval
+// is asking for fewer requests when nothing is happening, not for a slower
+// recovery when something is wrong.
 func backoffCeiling(attempt int) time.Duration {
-	if attempt < 2 {
+	if attempt < 1 {
 		return 0
 	}
 	exp := attempt - 2
+	if exp < 0 {
+		exp = 0
+	}
 	if exp > 16 {
 		exp = 16
 	}
@@ -1346,6 +1544,14 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 }
 
 func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, deferUntil *time.Time, backoffAttempt *int) []Event {
+	// The startup-recovery deadline belongs to the pass that ATTEMPTS the
+	// resend, which is this one. Clearing it here — rather than rolling it in
+	// nextPacingWake when it happens to be expired — is what keeps unrelated
+	// worker activity from postponing recovery: only a real attempt starts the
+	// next window. A failed attempt arms an ordinary publish deferral, which
+	// gates the next one on its own schedule.
+	c.startupResendWakeAt = time.Time{}
+
 	// Every automatic caller gates on the deadline having passed, so consume
 	// it here: a follow-up failure re-arms it through applyRetryPacing (from
 	// its own Retry-After hint, or the backoff schedule) instead of
@@ -1390,8 +1596,9 @@ func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, def
 	if len(batch) == 0 {
 		return batch
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.HTTPTimeout)
-	defer cancel()
+	// Unbounded here: the transport bounds each HTTP attempt, so the
+	// gzip-refusal fallback gets its own budget.
+	ctx := context.Background()
 	// Build THROUGH the retained request (see buildBatchIsolating): the prefix
 	// a previous failed attempt already marshaled resends its exact bytes. A
 	// member that no longer serializes is dropped alone — settled and counted
@@ -1529,8 +1736,10 @@ func (c *Client) publishRequest(ctx context.Context, request batchRequest, size 
 // consent flip would purge (and dead-letter) entries the 202 already
 // settled.
 func (c *Client) publishRequestResult(ctx context.Context, request batchRequest, size int) (batchResult, error) {
-	ctx, cancel := contextWithDefaultTimeout(ctx, c.cfg.HTTPTimeout)
-	defer cancel()
+	// The SDK attempt timeout is applied inside the transport, per HTTP
+	// attempt, NOT here: one publish can make two attempts (a gzip refusal is
+	// answered by re-sending uncompressed), and bounding the pair together
+	// left the second with the remainder of the first.
 
 	// Load the denial gate BEFORE re-checking consent: a denial completed
 	// after the load cancels the loaded gate (aborting the in-flight HTTP

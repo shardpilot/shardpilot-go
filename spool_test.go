@@ -68,15 +68,7 @@ func newSpoolTestServer(t *testing.T) (*spoolTestServer, *httptest.Server) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/events:batch":
-			body := make([]byte, 0, 1024)
-			buffer := make([]byte, 4096)
-			for {
-				n, err := r.Body.Read(buffer)
-				body = append(body, buffer[:n]...)
-				if err != nil {
-					break
-				}
-			}
+			body := ingestRequestBytes(t, r)
 			var request struct {
 				Events []struct {
 					EventID string `json:"event_id"`
@@ -117,7 +109,7 @@ func newSpoolTestServer(t *testing.T) (*spoolTestServer, *httptest.Server) {
 			fmt.Fprintf(w, `{"accepted":%d,"rejected":0,"duplicates":0}`, len(ids))
 		case "/v1/consent":
 			var body map[string]any
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			if err := json.NewDecoder(ingestRequestBody(t, r)).Decode(&body); err != nil {
 				t.Errorf("decode consent request: %v", err)
 			}
 			state.mu.Lock()
@@ -3523,5 +3515,266 @@ func TestSpoolReadLimitScalesWithEventCap(t *testing.T) {
 	if len(s.entries) != n {
 		t.Fatalf("expected the cap-full record loaded whole, got %d of %d entries (evicted %d, expired %d)",
 			len(s.entries), n, len(outcome.evicted), len(outcome.expired))
+	}
+}
+
+// TestStartupSpoolResendDoesNotWaitForTheFlushTick covers the restart the
+// recovery-wake test cannot: a process that comes back up with undelivered
+// spool entries and then does NOTHING.
+//
+// TestSpoolRecoveryWakeResendsSpoolOnlyWork drives its resend from a
+// synchronous Track — a success elsewhere kicks the requeued chunk. Here there
+// is no Track, no Enqueue and no Flush: initSpool fills the resend queue,
+// the persisted deadline is zero, and nothing arms the worker's timer. Before
+// the fix that chunk waited for the first flush tick, which raising the flush
+// default stretched from one second to fifteen; the FlushInterval below is an
+// hour, so a regression parks it effectively forever (Codex on #48).
+func TestStartupSpoolResendDoesNotWaitForTheFlushTick(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+
+	dir := t.TempDir()
+	writeConsentRecordFile(t, dir, "granted")
+	writeSpoolRecordFile(t, dir, 0, spoolTestEnvelope(t, "evt-restart-1", time.Now()))
+
+	state.setOutcome(http.StatusAccepted, "", "")
+	client := newSpoolTestClient(t, server.URL, dir, nil, func(cfg *Config) {
+		// An hour: only the retry clock can produce a resend inside the wait
+		// below, never the batching tick.
+		cfg.FlushInterval = time.Hour
+	})
+	defer func() { _ = client.Close(context.Background()) }()
+
+	waitFor(t, 10*time.Second,
+		"the startup-loaded spool chunk resent on the retry clock, not the hourly flush tick",
+		func() bool {
+			return client.Snapshot().SpoolResent == 1 && len(readSpoolRecordFile(t, dir).Events) == 0
+		})
+	_ = state
+}
+
+// TestStartupSpoolResendSurvivesFrequentUnrelatedWakes is the second half of
+// TestStartupSpoolResendDoesNotWaitForTheFlushTick, and it exists because the
+// first version of that fix passed it while still being wrong.
+//
+// The startup resend has no deadline of its own, so the worker invents one.
+// Inventing a FRESH one-second duration on every loop iteration looks correct
+// in a quiet process — nothing else wakes the worker, so the first timer
+// fires. Under any other activity it is not a fix at all: each unrelated wake
+// stops the timer and resets it to a full second, so a process enqueueing more
+// than once a second postpones its own durable recovery indefinitely.
+//
+// The flush interval is an hour and the noise enqueues arrive every 100ms
+// against a BatchSize of 100, so the batch cannot fill for ten seconds — they
+// exist only to keep waking the worker. The three-second bound sits between
+// the two outcomes: the recovery wake lands at ~1s, while under the defect
+// nothing publishes until the batch fills at ~10s (Codex on #48).
+func TestStartupSpoolResendSurvivesFrequentUnrelatedWakes(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+
+	dir := t.TempDir()
+	writeConsentRecordFile(t, dir, "granted")
+	writeSpoolRecordFile(t, dir, 0, spoolTestEnvelope(t, "evt-restart-busy-1", time.Now()))
+
+	state.setOutcome(http.StatusAccepted, "", "")
+	client := newSpoolTestClient(t, server.URL, dir, nil, func(cfg *Config) {
+		cfg.FlushInterval = time.Hour
+		cfg.BatchSize = 100
+		cfg.BufferSize = 512
+	})
+	defer func() { _ = client.Close(context.Background()) }()
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// Faster than the one-second recovery wake: every one of these
+			// resets the timer under the defect.
+			_ = client.Enqueue(Event{ID: fmt.Sprintf("evt-busy-%d", i), Name: "noise"})
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
+	defer func() {
+		close(stop)
+		<-done
+	}()
+
+	waitFor(t, 3*time.Second,
+		"the startup-loaded spool chunk resent despite a steady stream of unrelated wakes",
+		func() bool {
+			return client.Snapshot().SpoolResent == 1
+		})
+}
+
+// TestStartupSpoolResendSurvivesAWakeThatSpansItsDeadline is the third pass at
+// this, and the two before it both left the same hole open from a different
+// side.
+//
+// The first fix re-derived a fresh one-second duration each iteration, so any
+// wake restarted it. The second made the deadline absolute but ROLLED it on
+// expiry inside the wake computation — so a worker case that merely SPANNED
+// the deadline (a consent HTTP dispatch, slow spool maintenance) pushed
+// recovery out by a fresh second without anything having attempted it, and
+// repeated cases could do that indefinitely to a deadline described as
+// absolute. The previous test could not see it: its wakes all arrived BEFORE
+// expiry.
+//
+// Here the noise is deliberately slower than the one-second recovery window,
+// so every wake lands after it — the shape that used to roll the deadline
+// forever. Only an attempt may clear it now, so the resend lands regardless.
+func TestStartupSpoolResendSurvivesAWakeThatSpansItsDeadline(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+
+	dir := t.TempDir()
+	writeConsentRecordFile(t, dir, "granted")
+	writeSpoolRecordFile(t, dir, 0, spoolTestEnvelope(t, "evt-restart-spanning-1", time.Now()))
+
+	state.setOutcome(http.StatusAccepted, "", "")
+	client := newSpoolTestClient(t, server.URL, dir, nil, func(cfg *Config) {
+		cfg.FlushInterval = time.Hour
+		cfg.BatchSize = 100
+		cfg.BufferSize = 512
+	})
+	defer func() { _ = client.Close(context.Background()) }()
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// 1.4s apart: every one of these wakes arrives AFTER the
+			// one-second recovery deadline has passed, which is exactly the
+			// case that used to roll it forward instead of attempting.
+			_ = client.Enqueue(Event{ID: fmt.Sprintf("evt-spanning-noise-%d", i), Name: "noise"})
+			time.Sleep(1400 * time.Millisecond)
+		}
+	}()
+	defer func() {
+		close(stop)
+		<-done
+	}()
+
+	waitFor(t, 5*time.Second,
+		"the startup-loaded spool chunk resent despite wakes that span its deadline",
+		func() bool {
+			return client.Snapshot().SpoolResent == 1
+		})
+}
+
+// TestStartupWakeStandsDownUnderAPersistedDeferral covers the restart shape
+// that has BOTH conditions at once: undelivered spool entries and a persisted
+// retry_after_until_ms still in the future.
+//
+// The startup-recovery clause invents a one-second deadline for spool work
+// that carries none of its own. Under a live events deferral that invention
+// is not merely redundant, it spins: the wake it produces reaches the
+// deferWake case, publishDeferred refuses the publish, and nothing clears the
+// deadline — only publishWorkerBatch does. "Expired reports due now, floored
+// to a positive duration" then re-arms the timer a millisecond out, on every
+// pass, for as long as the persisted deferral has left to run — up to the
+// 24-hour clamp.
+//
+// The events deferral is the better wake source for that work regardless:
+// when it expires the deferWake case publishes, which IS the resend. So the
+// clause stands down while it is armed (Codex on #48).
+func TestStartupWakeStandsDownUnderAPersistedDeferral(t *testing.T) {
+	clock := &stubClock{now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
+	client := &Client{clock: clock, spool: &diskSpool{
+		resend: []spoolEntry{{id: "evt-restart-deferred", raw: json.RawMessage(`{}`)}},
+	}}
+	client.cfg.ConsentFloor = &ConsentFloorConfig{}
+
+	// The persisted deferral, comfortably longer than the startup window.
+	deferUntil := clock.now.Add(30 * time.Second)
+
+	if wake := client.nextPacingWake(deferUntil); wake < 29*time.Second {
+		t.Fatalf("the deferral owns the wake while it is armed, got %v", wake)
+	}
+	if !client.startupResendWakeAt.IsZero() {
+		t.Fatalf("no startup deadline may be armed under a live deferral, got %v", client.startupResendWakeAt)
+	}
+
+	// Past where the invented one-second deadline would have expired. This is
+	// where the spin started: the deadline stayed expired because no publish
+	// could clear it.
+	clock.now = clock.now.Add(2 * time.Second)
+	wake := client.nextPacingWake(deferUntil)
+	if wake <= 10*time.Millisecond {
+		t.Fatalf("the worker is spinning: wake %v, which re-arms immediately and gets nowhere", wake)
+	}
+	if want := 28 * time.Second; wake < want-time.Second || wake > want+time.Second {
+		t.Fatalf("expected the wake to be the deferral's remainder (~%v), got %v", want, wake)
+	}
+
+	// The same stand-down applies to the OTHER thing that can gate this work.
+	// A parked analytics-grant receipt holds the spool legs, and the startup
+	// clause spins behind it identically: its wake reaches publishWorkerBatch,
+	// which clears the deadline and returns at the still-armed gate without
+	// attempting the spool, so the next pass arms another one.
+	clock.now = clock.now.Add(30 * time.Second)
+	client.consentOutbox = &consentOutbox{deferUntil: clock.now.Add(30 * time.Second)}
+	client.consentGrantArming.Store(1)
+	if wake := client.nextPacingWake(time.Time{}); wake < 29*time.Second {
+		t.Fatalf("a parked grant gate owns the wake while it holds the spool legs, got %v", wake)
+	}
+	clock.now = clock.now.Add(2 * time.Second)
+	if wake := client.nextPacingWake(time.Time{}); wake <= 10*time.Millisecond {
+		t.Fatalf("the worker is spinning behind the consent gate: wake %v", wake)
+	}
+	client.consentGrantArming.Store(0)
+	client.consentOutbox = nil
+
+	// An ARMED-but-elapsed deadline reports due-now, not "no deadline".
+	// deferRemaining collapses both to zero, and the loop's elapsed fast paths
+	// run before this computation — so a deadline expiring in between (a
+	// preemption suffices) would otherwise disarm the timer and leave an idle
+	// client waiting out the whole flush interval. Both planes.
+	// The spool is cleared FIRST: with recovery work present the startup
+	// clause arms its own second and masks this entirely — the mutation
+	// survived until it did.
+	client.consentOutbox = nil
+	client.spool = &diskSpool{}
+	elapsed := clock.now.Add(-time.Second)
+	if wake := client.nextPacingWake(elapsed); wake <= 0 || wake > time.Second {
+		t.Fatalf("an elapsed events deadline must still arm a wake, got %v", wake)
+	}
+	client.consentOutbox = &consentOutbox{deferUntil: elapsed}
+	if wake := client.nextPacingWake(time.Time{}); wake <= 0 || wake > time.Second {
+		t.Fatalf("an elapsed consent deadline must still arm a wake, got %v", wake)
+	}
+	// The control: with no deadline on either plane AND no startup recovery
+	// work, nothing is armed. The spool is cleared for it because the startup
+	// clause would legitimately arm its own second here — which is the whole
+	// point of that clause, not a leak from these two.
+	client.consentOutbox = nil
+	client.spool = &diskSpool{}
+	if wake := client.nextPacingWake(time.Time{}); wake != 0 {
+		t.Fatalf("no deadline and no recovery work must arm nothing, got %v", wake)
+	}
+	client.spool = &diskSpool{
+		resend: []spoolEntry{{id: "evt-restart-deferred", raw: json.RawMessage(`{}`)}},
+	}
+
+	// Once the deferral lapses, the clause arms again — the recovery path it
+	// exists for is untouched.
+	clock.now = clock.now.Add(30 * time.Second)
+	if wake := client.nextPacingWake(deferUntil); wake <= 0 || wake > publishBackoffBase {
+		t.Fatalf("expected the startup window armed once the deferral lapsed, got %v", wake)
+	}
+	if client.startupResendWakeAt.IsZero() {
+		t.Fatal("expected an absolute startup deadline once the deferral lapsed")
 	}
 }

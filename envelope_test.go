@@ -20,7 +20,7 @@ func TestTrackSendsAppFirstEnvelope(t *testing.T) {
 		requestPath = r.URL.Path
 		authHeader = r.Header.Get("Authorization")
 		var raw map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+		if err := json.NewDecoder(ingestRequestBody(t, r)).Decode(&raw); err != nil {
 			t.Fatalf("decode request: %v", err)
 		}
 		encoded, err := json.Marshal(raw)
@@ -175,6 +175,56 @@ func TestConfigValidationAndDefaults(t *testing.T) {
 	}
 	if client.cfg.BufferSize != defaultBufferSize {
 		t.Fatalf("expected default buffer size %d, got %d", defaultBufferSize, client.cfg.BufferSize)
+	}
+	// The flush default is pinned BOTH here and at the normalisation below,
+	// because there are two ways to set it and fixing one is the shape this
+	// class of defect keeps taking: a zero-valued FlushInterval takes the
+	// `<= 0` branch in normalizeConfig, not the constant's declaration, so a
+	// change to one without the other leaves the old cadence live for exactly
+	// the callers who did not choose a value.
+	if client.cfg.FlushInterval != defaultFlushInterval {
+		t.Fatalf("expected default flush interval %s, got %s", defaultFlushInterval, client.cfg.FlushInterval)
+	}
+	if defaultFlushInterval < 15*time.Second || defaultFlushInterval > 30*time.Second {
+		t.Fatalf("default flush interval %s is outside the cross-SDK 15-30s band; a per-second default is a request per second per process for the life of the process", defaultFlushInterval)
+	}
+}
+
+// A zero FlushInterval is the case that matters: it is what every integration
+// that does not name a cadence gets, and it does NOT read the field's declared
+// default — it takes normalizeConfig's `<= 0` branch. An explicit value must
+// still win, including one below the new default, since the change is a
+// default and not a floor.
+func TestNormalizeConfigFlushIntervalDefaulting(t *testing.T) {
+	t.Parallel()
+
+	base := func() Config {
+		return Config{
+			IngestURL:     "http://localhost:8080",
+			Token:         "test-token",
+			WorkspaceID:   "workspace-test",
+			AppID:         "app-test",
+			EnvironmentID: "develop",
+			Source:        SourceBackend,
+		}
+	}
+
+	unset, err := normalizeConfig(base())
+	if err != nil {
+		t.Fatalf("normalizeConfig: %v", err)
+	}
+	if unset.FlushInterval != defaultFlushInterval {
+		t.Fatalf("unset flush interval = %s, want the default %s", unset.FlushInterval, defaultFlushInterval)
+	}
+
+	chosen := base()
+	chosen.FlushInterval = time.Second
+	explicit, err := normalizeConfig(chosen)
+	if err != nil {
+		t.Fatalf("normalizeConfig: %v", err)
+	}
+	if explicit.FlushInterval != time.Second {
+		t.Fatalf("explicit flush interval = %s, want it preserved at 1s", explicit.FlushInterval)
 	}
 }
 

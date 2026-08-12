@@ -599,9 +599,10 @@ func (c *Client) consentSender() {
 }
 
 func (c *Client) publishConsent(request consentRequest) {
-	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.HTTPTimeout)
-	defer cancel()
-	if _, err := c.transport.PublishConsent(ctx, request); err != nil {
+	// Unbounded here on purpose: the transport bounds each HTTP attempt by
+	// HTTPTimeout, so a gzip-refusal fallback gets its own budget instead of
+	// the refusal's leftovers.
+	if _, err := c.transport.PublishConsent(context.Background(), request); err != nil {
 		c.logf("shardpilot consent publish failed: %v", err)
 	}
 }

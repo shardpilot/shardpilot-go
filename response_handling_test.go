@@ -231,13 +231,18 @@ func TestApplyRetryPacingArmsAndClearsDeadline(t *testing.T) {
 		t.Fatalf("expected hinted failures to leave the backoff attempt at 0, got %d", attempt)
 	}
 
-	// The FIRST hint-less retryable failure retries at the flush cadence:
-	// it advances the backoff count and CLEARS the stale hint deadline —
-	// the latest failure's schedule wins, so an old longer hint from a
-	// previous attempt cannot park the batch past its cadence slot.
+	// The FIRST hint-less retryable failure advances the backoff count and
+	// REPLACES the stale hint deadline with its own — the latest failure's
+	// schedule wins, so an old hint from a previous attempt cannot park the
+	// batch past its slot.
+	//
+	// It used to clear the deadline outright, which handed the retry to the
+	// flush tick. That read as "retry promptly" only while the flush interval
+	// was one second; it is a fifteen-second stall at the current default.
+	// The first failure now paces on the RETRY clock like every other.
 	client.applyRetryPacing(&HTTPStatusError{StatusCode: 500}, &deferUntil, &attempt)
-	if !deferUntil.IsZero() {
-		t.Fatalf("expected the first hintless failure to clear the stale hint deadline, got %v", deferUntil)
+	if want := clock.now.Add(publishBackoffBase); !deferUntil.Equal(want) {
+		t.Fatalf("expected the first hintless failure to arm its own %v deadline, got %v", publishBackoffBase, deferUntil)
 	}
 	if attempt != 1 {
 		t.Fatalf("expected the hintless failure to advance the backoff attempt to 1, got %d", attempt)
@@ -280,7 +285,10 @@ func TestBackoffCeilingGrowthAndCap(t *testing.T) {
 		want    time.Duration
 	}{
 		{0, 0},
-		{1, 0}, // first failure: no window, retry at the flush cadence
+		// The first failure shares the second's window. It used to be 0 —
+		// "no deferral", which meant the flush tick decided, and that tick is
+		// now fifteen seconds by default.
+		{1, time.Second},
 		{2, time.Second},
 		{3, 2 * time.Second},
 		{4, 4 * time.Second},
@@ -321,9 +329,15 @@ func TestBackoffDelayJitterBounds(t *testing.T) {
 		}
 	}
 
-	// First failure never defers regardless of jitter.
-	if got := client.backoffDelay(1); got != 0 {
-		t.Fatalf("backoffDelay(1) = %v, want 0", got)
+	// The first failure defers by exactly the base regardless of jitter: its
+	// window has zero width (ceiling == base), so there is nothing to jitter
+	// over — and, deliberately, nothing that can make the first retry LATER
+	// than the ~1s the old flush-tick path actually delivered.
+	for _, jitter := range []float64{0, 0.5, math.Nextafter(1, 0)} {
+		client.jitter = func() float64 { return jitter }
+		if got := client.backoffDelay(1); got != publishBackoffBase {
+			t.Fatalf("backoffDelay(1) with jitter %v = %v, want %v", jitter, got, publishBackoffBase)
+		}
 	}
 
 	// The default (real) jitter source stays within the window and actually
@@ -350,13 +364,16 @@ func TestApplyRetryPacingBacksOffWithoutHint(t *testing.T) {
 	var deferUntil time.Time
 	attempt := 0
 
-	// Failure 1 (5xx, no header): no deferral — the next flush tick retries.
+	// Failure 1 (5xx, no header): arms the 1s floor on the RETRY clock. It
+	// used to arm nothing and let the flush tick decide, which is a
+	// fifteen-second stall at the current default.
 	client.applyRetryPacing(&HTTPStatusError{StatusCode: 500}, &deferUntil, &attempt)
-	if attempt != 1 || !deferUntil.IsZero() {
-		t.Fatalf("after failure 1: attempt=%d deferUntil=%v, want 1 and zero", attempt, deferUntil)
+	if want := clock.now.Add(publishBackoffBase); attempt != 1 || !deferUntil.Equal(want) {
+		t.Fatalf("after failure 1: attempt=%d deferUntil=%v, want 1 and %v", attempt, deferUntil, want)
 	}
 
-	// Failure 2: arms the 1s backoff floor (window [1s, 1s]).
+	// Failure 2: same 1s floor — the window does not start growing until the
+	// third (window [1s, 1s]).
 	client.applyRetryPacing(&HTTPStatusError{StatusCode: 503}, &deferUntil, &attempt)
 	if want := clock.now.Add(publishBackoffBase); attempt != 2 || !deferUntil.Equal(want) {
 		t.Fatalf("after failure 2: attempt=%d deferUntil=%v, want 2 and %v", attempt, deferUntil, want)
@@ -399,15 +416,15 @@ func TestApplyRetryPacingBacksOffWithoutHint(t *testing.T) {
 		t.Fatalf("after permanent HTTP failure: attempt=%d deferUntil=%v, want 0 and %v", attempt, deferUntil, before)
 	}
 
-	// Success clears the deadline; the next hint-less failure starts over
-	// at "retry at the flush cadence".
+	// Success clears the deadline; the next hint-less failure starts the
+	// schedule over at the 1s floor rather than deep in the grown window.
 	client.applyRetryPacing(nil, &deferUntil, &attempt)
 	if !deferUntil.IsZero() {
 		t.Fatalf("after success: deferUntil=%v, want zero", deferUntil)
 	}
 	client.applyRetryPacing(&HTTPStatusError{StatusCode: 500}, &deferUntil, &attempt)
-	if attempt != 1 || !deferUntil.IsZero() {
-		t.Fatalf("after reset + failure: attempt=%d deferUntil=%v, want 1 and zero", attempt, deferUntil)
+	if want := clock.now.Add(publishBackoffBase); attempt != 1 || !deferUntil.Equal(want) {
+		t.Fatalf("after reset + failure: attempt=%d deferUntil=%v, want 1 and %v", attempt, deferUntil, want)
 	}
 }
 
@@ -640,10 +657,16 @@ func TestFlushSwallowedPermanentHTTPResetsStreak(t *testing.T) {
 		t.Fatalf("expected the swallowed permanent HTTP response to reset the streak, got %d", backoffAttempt)
 	}
 
+	// The reset is what this pins, and the DEADLINE is the sharper witness of
+	// it than the counter: a streak that had not reset would arm a window
+	// grown to attempt 6, not the 1s floor.
 	var deferUntil time.Time
+	before := client.clock.Now()
 	client.applyRetryPacing(err, &deferUntil, &backoffAttempt)
-	if backoffAttempt != 1 || !deferUntil.IsZero() {
-		t.Fatalf("expected the post-flush failure to pace as attempt 1 at the cadence, got attempt=%d deferUntil=%v", backoffAttempt, deferUntil)
+	// A real clock, so the window is a bound rather than an equality — but a
+	// wide one is still decisive here: attempt 6 would arm 32 seconds.
+	if delay := deferUntil.Sub(before); backoffAttempt != 1 || delay < publishBackoffBase || delay > publishBackoffBase+time.Second {
+		t.Fatalf("expected the post-flush failure to pace as a fresh attempt 1 at the %v floor, got attempt=%d deferUntil=+%v", publishBackoffBase, backoffAttempt, deferUntil.Sub(before))
 	}
 }
 
@@ -703,11 +726,17 @@ func TestFlushMidSuccessResetsBackoffStreak(t *testing.T) {
 	}
 
 	// The worker's pacing call then treats the returned failure as the
-	// streak's first: cadence slot, no deferral.
+	// streak's first.
+	// The reset is what this pins, and the DEADLINE is the sharper witness of
+	// it than the counter: a streak that had not reset would arm a window
+	// grown to attempt 6, not the 1s floor.
 	var deferUntil time.Time
+	before := client.clock.Now()
 	client.applyRetryPacing(err, &deferUntil, &backoffAttempt)
-	if backoffAttempt != 1 || !deferUntil.IsZero() {
-		t.Fatalf("expected the post-flush failure to pace as attempt 1 at the cadence, got attempt=%d deferUntil=%v", backoffAttempt, deferUntil)
+	// A real clock, so the window is a bound rather than an equality — but a
+	// wide one is still decisive here: attempt 6 would arm 32 seconds.
+	if delay := deferUntil.Sub(before); backoffAttempt != 1 || delay < publishBackoffBase || delay > publishBackoffBase+time.Second {
+		t.Fatalf("expected the post-flush failure to pace as a fresh attempt 1 at the %v floor, got attempt=%d deferUntil=+%v", publishBackoffBase, backoffAttempt, deferUntil.Sub(before))
 	}
 }
 
@@ -731,9 +760,10 @@ func TestHintlessFailureBacksOffEndToEnd(t *testing.T) {
 	}))
 	defer server.Close()
 
-	// A short flush interval so the fixed cadence would hammer: the first
-	// failure retries at the cadence, but the second must arm the 1s
-	// backoff floor and hold the third attempt back.
+	// A DELIBERATELY tiny flush interval — 50ms, far below the 1s backoff
+	// floor. It is the control: if retry pacing were still riding the flush
+	// ticker, every retry would land at ~50ms. Both retries holding at ~1s
+	// is what proves the two clocks are separate.
 	client, err := NewClient(Config{
 		IngestURL:     server.URL,
 		Token:         "token-value",
@@ -754,16 +784,20 @@ func TestHintlessFailureBacksOffEndToEnd(t *testing.T) {
 	}
 
 	waitFor(t, 5*time.Second, "three publish attempts", func() bool { return calls.Load() >= 3 })
-	cadenceGap := stamps[1].Load() - stamps[0].Load()
-	backoffGap := stamps[2].Load() - stamps[1].Load()
-	if cadenceGap >= 800 {
-		t.Fatalf("expected the first retry at the flush cadence, got %dms", cadenceGap)
+	firstGap := stamps[1].Load() - stamps[0].Load()
+	secondGap := stamps[2].Load() - stamps[1].Load()
+	// The FIRST failure now paces on the retry clock too. It used to fall
+	// through to the flush tick, which was indistinguishable from prompt only
+	// because that tick was a second; the same path is a fifteen-second stall
+	// at the current default.
+	if firstGap < 800 {
+		t.Fatalf("expected the FIRST retry to wait out the 1s backoff floor rather than riding the 50ms flush tick, got %dms", firstGap)
 	}
-	if backoffGap < 800 {
-		t.Fatalf("expected the second retry to wait out the 1s backoff floor, got %dms", backoffGap)
+	if secondGap < 800 {
+		t.Fatalf("expected the second retry to wait out the 1s backoff floor, got %dms", secondGap)
 	}
-	if backoffGap > 4000 {
-		t.Fatalf("expected the second retry at the backoff deadline, got %dms", backoffGap)
+	if firstGap > 4000 || secondGap > 4000 {
+		t.Fatalf("expected both retries at the backoff deadline, got %dms and %dms", firstGap, secondGap)
 	}
 }
 
@@ -979,7 +1013,7 @@ func TestEventArrivingDuringDeferralKeepsTheDeadlineRetry(t *testing.T) {
 			return
 		}
 		var request batchRequest
-		_ = json.NewDecoder(r.Body).Decode(&request)
+		_ = json.NewDecoder(ingestRequestBody(t, r)).Decode(&request)
 		if call == 2 {
 			secondAttempt.Store(time.Now().UnixMilli())
 			secondAttemptEvents.Store(int64(len(request.Events)))
@@ -1209,5 +1243,79 @@ func waitFor(t *testing.T, timeout time.Duration, what string, done func() bool)
 			t.Fatalf("timed out waiting for %s", what)
 		case <-ticker.C:
 		}
+	}
+}
+
+// TestRetryPacingIsIndependentOfTheFlushInterval is A6's separation
+// acceptance for this SDK, and it is deliberately taken at the SHIPPED
+// default rather than at a test-friendly interval.
+//
+// The regression it pins is specific. `defaultFlushInterval` moved from 1s to
+// 15s to stop an idle process issuing a request per second. That change is
+// correct on its own terms, but the first retryable publish failure used to
+// arm no deadline at all and let the flush ticker decide when to retry — so
+// raising the idle cadence silently multiplied the recovery delay by fifteen,
+// on a path where the worker has stopped reading the queue (`queueEvents` is
+// nil at BatchSize) and enqueues are being refused with ErrQueueFull.
+//
+// A test that sets its own FlushInterval cannot catch this: it measures the
+// interval it chose. This one takes the default and asserts the retry lands
+// nowhere near it.
+func TestRetryPacingIsIndependentOfTheFlushInterval(t *testing.T) {
+	var calls atomic.Int64
+	var stamps [2]atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := calls.Add(1)
+		if call <= 2 {
+			stamps[call-1].Store(time.Now().UnixMilli())
+		}
+		if call == 1 {
+			// Retryable, and NO Retry-After: pacing is entirely the client's.
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":{"code":"internal_error","message":"broker unavailable"}}`))
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"accepted":1,"rejected":0,"duplicates":0}`))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(Config{
+		IngestURL:     server.URL,
+		Token:         "token-value",
+		WorkspaceID:   "workspace-test",
+		AppID:         "app-test",
+		EnvironmentID: "develop",
+		Source:        SourceBackend,
+		BatchSize:     1,
+		// FlushInterval DELIBERATELY unset: this exercises the shipped
+		// default, which is the whole subject of the test.
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	if err := client.Enqueue(Event{Name: "independent_pacing"}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+
+	// Wait on the TIMESTAMP, not the call counter. The handler increments
+	// calls before storing the stamp, so a scheduler preemption between those
+	// two atomics lets a counter-only wait read stamps[1] as zero and compute
+	// a huge negative gap — failing the lower bound below while retry pacing
+	// was in fact correct (Codex on #48).
+	waitFor(t, defaultFlushInterval+10*time.Second, "the retry", func() bool { return stamps[1].Load() != 0 })
+	gap := time.Duration(stamps[1].Load()-stamps[0].Load()) * time.Millisecond
+
+	// Comfortably below the flush interval: this is the assertion that fails
+	// if retry pacing is ever handed back to the ticker.
+	if ceiling := defaultFlushInterval / 3; gap > ceiling {
+		t.Fatalf("the retry waited %v — with a %v flush interval that is the ticker pacing the retry, not the backoff schedule (want under %v)",
+			gap, defaultFlushInterval, ceiling)
+	}
+	// And not a hot loop either: the 1s floor still applies.
+	if gap < publishBackoffBase-200*time.Millisecond {
+		t.Fatalf("the retry came back in %v, under the %v backoff floor", gap, publishBackoffBase)
 	}
 }

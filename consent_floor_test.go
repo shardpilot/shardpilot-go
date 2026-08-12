@@ -46,7 +46,7 @@ func newFloorTestServer(t *testing.T) (*floorTestServer, *httptest.Server) {
 					EventID string `json:"event_id"`
 				} `json:"events"`
 			}
-			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			if err := json.NewDecoder(ingestRequestBody(t, r)).Decode(&request); err != nil {
 				t.Errorf("decode batch request: %v", err)
 			}
 			ids := make([]string, 0, len(request.Events))
@@ -68,7 +68,7 @@ func newFloorTestServer(t *testing.T) (*floorTestServer, *httptest.Server) {
 			fmt.Fprintf(w, `{"accepted":%d,"rejected":0,"duplicates":0}`, len(ids))
 		case "/v1/consent":
 			var body map[string]any
-			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			if err := json.NewDecoder(ingestRequestBody(t, r)).Decode(&body); err != nil {
 				t.Errorf("decode consent request: %v", err)
 			}
 			state.mu.Lock()
@@ -1402,7 +1402,7 @@ func TestConsentFloorFlushDispatchesReceiptsUnderDenial(t *testing.T) {
 	// re-arm a deferral under the flush.
 	dir := t.TempDir()
 	client := newFloorTestClient(t, server.URL, dir, nil)
-	if !client.consentOutbox.claimDispatch() {
+	if !client.consentOutbox.claimDispatch(false) {
 		t.Fatalf("test shape: claiming the dispatch lock failed")
 	}
 	client.SetConsent(true)
@@ -3452,7 +3452,7 @@ func TestConsentFloorFlushJoinsInFlightDispatchPass(t *testing.T) {
 	// the decision's worker wake cannot deliver either.
 	dir := t.TempDir()
 	client := newFloorTestClient(t, server.URL, dir, nil)
-	if !client.consentOutbox.claimDispatch() {
+	if !client.consentOutbox.claimDispatch(false) {
 		t.Fatalf("test shape: claiming the dispatch lock failed")
 	}
 	client.SetConsent(false) // the deny receipt is retained; every pass loses the claim
@@ -3573,7 +3573,7 @@ func TestConsentFloorRetryableCloseSurfacesCallerBound(t *testing.T) {
 		t.Fatalf("expected the memory-only parked receipt to pend Close, got %v", err)
 	}
 
-	if !client.consentOutbox.claimDispatch() {
+	if !client.consentOutbox.claimDispatch(false) {
 		t.Fatalf("test shape: claiming the dispatch lock failed")
 	}
 	shortCtx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
@@ -3942,7 +3942,7 @@ func TestConsentFloorGrantHeldBehindParkedNewerDenial(t *testing.T) {
 	// against the local denial for as long as the heal keeps failing.
 	dir := t.TempDir()
 	client := newFloorTestClient(t, server.URL, dir, nil)
-	if !client.consentOutbox.claimDispatch() {
+	if !client.consentOutbox.claimDispatch(false) {
 		t.Fatalf("test shape: claiming the dispatch lock failed")
 	}
 	client.SetConsent(true) // pair completes cleanly; receipt retained (claim held)
@@ -4061,7 +4061,7 @@ func TestConsentFloorRetriedCloseWaitsForWorkerStop(t *testing.T) {
 	// would exit before the close remnant is spooled or counted.
 	dir := t.TempDir()
 	client := newFloorTestClient(t, server.URL, dir, nil)
-	if !client.consentOutbox.claimDispatch() {
+	if !client.consentOutbox.claimDispatch(false) {
 		t.Fatalf("test shape: claiming the dispatch lock failed")
 	}
 	client.SetConsent(true) // pair completes; receipt retained under the held claim
@@ -4321,7 +4321,7 @@ func TestConsentFloorGrantHandoffRechecksUnderDecisionLock(t *testing.T) {
 	// never posting past a denial that may be landing right now.
 	dir := t.TempDir()
 	client := newFloorTestClient(t, server.URL, dir, nil)
-	if !client.consentOutbox.claimDispatch() {
+	if !client.consentOutbox.claimDispatch(false) {
 		t.Fatalf("test shape: claiming the dispatch lock failed")
 	}
 	client.SetConsent(true) // pair completes; receipt retained under the held claim
@@ -4559,7 +4559,7 @@ func TestConsentFloorFastHalfDenialParksGrantHandoff(t *testing.T) {
 	// re-wake can hand the receipt to the transport before the window
 	// under test exists (a stray worker pass released early would
 	// legitimately deliver the grant pre-denial and void the pin).
-	if !client.consentOutbox.claimDispatch() {
+	if !client.consentOutbox.claimDispatch(false) {
 		t.Fatalf("test shape: claiming the dispatch lock failed")
 	}
 	client.SetConsent(true)
@@ -5244,6 +5244,329 @@ func TestConsentFloorMarkerCreateSerializedWithOwedFlag(t *testing.T) {
 		client.spool.mu.Unlock()
 		return !owed && !wipeOwedMarkerExists(dir)
 	})
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// TestConsentReceiptRetryDoesNotLengthenWithTheFlushInterval is A6's second
+// separation acceptance for this SDK.
+//
+// The consent plane keeps its OWN retry schedule — Retry-After when the
+// server sends one, the shared jittered backoff otherwise — but only one
+// timer wakes the worker, and it used to be armed from the EVENTS plane's
+// deadline alone. So a receipt deferred one second by the server, on a client
+// whose events plane was perfectly healthy, had no wake source at all except
+// the flush ticker: its retry silently inherited the batching cadence.
+//
+// The harness flush interval here is an HOUR, which is what makes this
+// decisive. If the consent retry still rode the ticker, this test would take
+// an hour; the timeout is five seconds.
+//
+// (That the existing floor tests need `clearConsentDeferral` to get past a
+// parked window is the same fact from the other side — before this, waiting
+// out a consent deferral was not something a test could do.)
+func TestConsentReceiptRetryDoesNotLengthenWithTheFlushInterval(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// One second is the server's word, and it is three orders of magnitude
+	// below the flush interval — no ambiguity about which clock answered.
+	state.setConsentOutcome(http.StatusServiceUnavailable, "1")
+
+	client := newFloorTestClient(t, server.URL, t.TempDir(), nil)
+	defer func() { _ = client.Close(context.Background()) }()
+
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the first receipt attempt", func() bool {
+		return state.consentCount() >= 1
+	})
+
+	// Heal the endpoint but touch NOTHING else: no Flush, no SetConsent, no
+	// enqueue, no clearConsentDeferral. The only thing that can produce a
+	// second attempt is the worker waking on the consent plane's own
+	// deadline.
+	state.setConsentOutcome(http.StatusOK, "")
+	waitFor(t, 5*time.Second, "the receipt retried on the consent plane's own clock, not the hourly flush tick", func() bool {
+		return state.consentCount() >= 2
+	})
+}
+
+// TestConsentRetryDispatchesWhenItsDeadlineAlreadyElapsed covers the case the
+// existing pacing test cannot reach: a worker that is BUSY.
+//
+// TestConsentReceiptRetryDoesNotLengthenWithTheFlushInterval leaves the worker
+// idle, so it parks on a timer armed for the consent deadline and wakes on it.
+// If another select case is handled just before that deadline — an enqueue, a
+// pacing nudge — the worker loops back and re-derives its wake, and by then the
+// deadline has passed. deferRemaining reports ZERO for "already passed" and for
+// "no deadline at all" alike, so the wake arithmetic disarms the timer and the
+// receipt sits until the flush tick: here an hour (Codex on #48).
+//
+// The events plane has always had an elapsed-deadline fast path. This is the
+// consent plane's.
+func TestConsentRetryDispatchesWhenItsDeadlineAlreadyElapsed(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	state.setConsentOutcome(http.StatusServiceUnavailable, "1")
+	client := newFloorTestClient(t, server.URL, t.TempDir(), nil)
+	defer func() { _ = client.Close(context.Background()) }()
+
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the first receipt attempt", func() bool {
+		return state.consentCount() >= 1
+	})
+
+	// Heal the endpoint, then put the plane in the exact state a busy worker
+	// produces: a consent deadline that has ALREADY passed. The pacing nudge
+	// stands in for whichever other select case won the race; it makes the
+	// worker loop back and re-derive its wake, which is the moment the defect
+	// occurs. Nothing else is touched — no Flush, no SetConsent, no enqueue —
+	// so the only thing that can produce a second attempt is the fast path.
+	state.setConsentOutcome(http.StatusOK, "")
+	client.consentOutbox.mu.Lock()
+	client.consentOutbox.deferUntil = client.clock.Now().Add(-time.Second)
+	client.consentOutbox.mu.Unlock()
+	select {
+	case client.pacingWake <- struct{}{}:
+	default:
+	}
+
+	waitFor(t, 5*time.Second,
+		"an ELAPSED consent deadline dispatches on the next worker pass, not at the hourly flush tick",
+		func() bool { return state.consentCount() >= 2 })
+}
+
+// TestArmingConsentDeferralWakesTheWorker pins the other half of the same
+// coupling: the deadline created AFTER the worker evaluated its wakes.
+//
+// A synchronous Track dispatches retained receipts on the caller's goroutine,
+// so it can arm a consent deferral while the worker is already parked in
+// select with no wake armed. The deadline exists but nothing told the worker,
+// and with no other activity the one-second retry waits out the whole flush
+// interval. Asserted directly on the nudge rather than through a live worker:
+// the race is precisely that the worker is ALREADY blocked, which a test
+// cannot schedule reliably.
+func TestArmingConsentDeferralWakesTheWorker(t *testing.T) {
+	_, server := newFloorTestServer(t)
+	defer server.Close()
+
+	client := newFloorTestClient(t, server.URL, t.TempDir(), nil)
+	defer func() { _ = client.Close(context.Background()) }()
+
+	// Drain any nudge the client's own start-up left pending, so what the
+	// assertion below sees can only have come from arming.
+	select {
+	case <-client.consentWake:
+	default:
+	}
+
+	client.armConsentDeferral(&HTTPStatusError{StatusCode: http.StatusServiceUnavailable})
+
+	client.consentOutbox.mu.Lock()
+	deferUntil := client.consentOutbox.deferUntil
+	client.consentOutbox.mu.Unlock()
+	if deferUntil.IsZero() {
+		t.Fatal("arming a deferral must set a deadline")
+	}
+
+	select {
+	case <-client.consentWake:
+	default:
+		t.Fatal("arming a consent deferral did not wake the worker: a deadline created while the worker is parked has no other wake source, so the retry waits out the flush interval")
+	}
+}
+
+// TestConsumeElapsedConsentDeferralIsIdempotent pins that the fast path cannot
+// spin. Clearing the elapsed deadline is what makes it safe to run on every
+// worker pass: a dispatch with nothing owed leaves it clear instead of
+// re-triggering forever on a deadline that can never expire again.
+func TestConsumeElapsedConsentDeferralIsIdempotent(t *testing.T) {
+	_, server := newFloorTestServer(t)
+	defer server.Close()
+
+	client := newFloorTestClient(t, server.URL, t.TempDir(), nil)
+	defer func() { _ = client.Close(context.Background()) }()
+
+	now := client.clock.Now()
+	outbox := client.consentOutbox
+
+	if outbox.consumeElapsedDeferral(now) {
+		t.Fatal("no deadline must not report as elapsed")
+	}
+
+	outbox.mu.Lock()
+	outbox.deferUntil = now.Add(time.Minute)
+	outbox.mu.Unlock()
+	if outbox.consumeElapsedDeferral(now) {
+		t.Fatal("a live deadline must not report as elapsed")
+	}
+	outbox.mu.Lock()
+	stillArmed := !outbox.deferUntil.IsZero()
+	outbox.mu.Unlock()
+	if !stillArmed {
+		t.Fatal("a live deadline must survive the check")
+	}
+
+	outbox.mu.Lock()
+	outbox.deferUntil = now.Add(-time.Second)
+	outbox.mu.Unlock()
+	if !outbox.consumeElapsedDeferral(now) {
+		t.Fatal("an elapsed deadline must report as elapsed")
+	}
+	if outbox.consumeElapsedDeferral(now) {
+		t.Fatal("the elapsed deadline must be CONSUMED: a second report would spin the worker")
+	}
+}
+
+// TestARefusedDispatchClaimLeavesTheDeadlineAndWakesOnRelease pins the
+// handshake between the worker's elapsed-deadline check and a concurrent
+// caller-side dispatch.
+//
+// The worker used to CONSUME the elapsed retry deadline and then ask for the
+// dispatch claim. If a caller-side Track held the claim — and had already
+// decided to skip, on a deadline that was still live when it looked — neither
+// pass sent the receipt, and with the deadline consumed nothing was left to
+// arm a timer. The receipt then waited for the flush tick, which is exactly
+// the cadence coupling the consent plane's own clock exists to avoid.
+//
+// So: the check reports without consuming, and the claim holder reports on
+// release that someone was turned away, which is what the worker's wake hangs
+// off (Codex on #48).
+func TestARefusedDispatchClaimLeavesTheDeadlineAndWakesOnRelease(t *testing.T) {
+	outbox := newConsentOutbox(t.TempDir())
+	now := time.Now()
+
+	outbox.mu.Lock()
+	outbox.deferUntil = now.Add(-time.Millisecond)
+	outbox.mu.Unlock()
+
+	if !outbox.deferralElapsed(now) {
+		t.Fatal("an elapsed deadline must report as due")
+	}
+	if !outbox.deferralElapsed(now) {
+		t.Fatal("the check must not consume the deadline: a pass that never dispatches has to leave it standing")
+	}
+
+	// A caller-side dispatch holds the claim; the worker's pass is turned away.
+	if !outbox.claimDispatch(false) {
+		t.Fatal("the first claim must succeed")
+	}
+	if outbox.claimDispatch(true) {
+		t.Fatal("a second claim must be refused while the first is held")
+	}
+	if !outbox.deferralElapsed(now) {
+		t.Fatal("the refused pass dispatched nothing, so the deadline must survive it")
+	}
+
+	if !outbox.releaseDispatch() {
+		t.Fatal("release must report the refused pass, or nothing wakes the worker and the receipt waits for the flush tick")
+	}
+	if outbox.claimDispatch(false) {
+		// Re-claiming is fine; what must NOT persist is the missed flag.
+		if outbox.releaseDispatch() {
+			t.Fatal("the missed-claim flag must be cleared by the release that reported it")
+		}
+	}
+
+	// A CALLER-side miss must not be recorded: the release that follows would
+	// wake the worker, whose wake handler runs a publish pass, and an
+	// unrelated concurrent Track could then drain a partial batch early — the
+	// eager drain this handshake exists to remove, arriving through the other
+	// door.
+	if !outbox.claimDispatch(false) {
+		t.Fatal("claiming after release must succeed")
+	}
+	if outbox.claimDispatch(false) {
+		t.Fatal("a second claim must be refused while the first is held")
+	}
+	if outbox.releaseDispatch() {
+		t.Fatal("a caller-side miss must not earn the worker a wake")
+	}
+
+	// And the deadline is retired by the pass that actually holds the claim.
+	if !outbox.claimDispatch(false) {
+		t.Fatal("claiming after release must succeed")
+	}
+	if !outbox.consumeElapsedDeferral(now) {
+		t.Fatal("the holder retires the elapsed deadline")
+	}
+	if outbox.deferralElapsed(now) {
+		t.Fatal("a consumed deadline must not report as due again")
+	}
+	outbox.releaseDispatch()
+}
+
+// TestAbortedConsentDispatchWakesOnlyAfterReleasingTheClaim pins the ORDER of
+// the two things a caller-aborted dispatch does on its way out.
+//
+// The abort arms no deadline on purpose — it observed no outcome — so the
+// wake is the receipt's only route back to a dispatch point before the flush
+// tick. But the worker's wake handler takes the dispatch claim NON-JOINING,
+// and claimDispatch records a miss only for the worker's own elapsed-deadline
+// pass. So a wake emitted while this pass still holds the claim is refused
+// AND forgotten, and the release that follows finds no miss to wake for: the
+// nudge is swallowed by the handshake built to preserve it, and the receipt
+// waits out the fifteen-second flush interval after all.
+//
+// Asserted at the moment of the send rather than by racing a real worker,
+// because the losing interleaving is one instant wide (Codex on #48).
+func TestAbortedConsentDispatchWakesOnlyAfterReleasingTheClaim(t *testing.T) {
+	hang := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/consent" {
+			<-hang
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprint(w, `{"recorded":true,"replayed":false}`)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		fmt.Fprint(w, `{"accepted":0,"rejected":0,"duplicates":0}`)
+	}))
+	releaseHang := sync.OnceFunc(func() { close(hang) })
+	defer server.Close()
+	defer releaseHang()
+
+	client := newFloorTestClient(t, server.URL, t.TempDir(), func(cfg *Config) {
+		cfg.HTTPTimeout = 5 * time.Second
+		// An hour, so the worker stays parked: the only wake in the window
+		// below is the one this test is about.
+		cfg.FlushInterval = time.Hour
+	})
+
+	var wakes, heldAtWake atomic.Int32
+	client.consentWakeHook.Store(func() {
+		wakes.Add(1)
+		client.consentOutbox.mu.Lock()
+		held := client.consentOutbox.dispatching
+		client.consentOutbox.mu.Unlock()
+		if held {
+			heldAtWake.Add(1)
+		}
+	})
+
+	client.consent.Store(consentStateGranted)
+	if client.consentOutbox.append(testConsentReceipt("key-abort-wake-1", true)) {
+		t.Fatalf("seeding the outbox failed")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := client.Track(ctx, Event{Name: "e1"}); !errors.Is(err, ErrConsentReceiptPending) {
+		t.Fatalf("expected the gate armed after the no-response abort, got %v", err)
+	}
+
+	if wakes.Load() == 0 {
+		t.Fatal("a caller-aborted dispatch must nudge the worker: it arms no deadline to retry from")
+	}
+	if got := heldAtWake.Load(); got != 0 {
+		t.Fatalf("%d wake(s) were emitted while the dispatch claim was still held: "+
+			"the worker's non-joining pass is refused the claim and records no miss, so the nudge is lost", got)
+	}
+
+	releaseHang()
 	if err := client.Close(context.Background()); err != nil {
 		t.Fatalf("Close: %v", err)
 	}

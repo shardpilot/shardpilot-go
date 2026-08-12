@@ -19,7 +19,7 @@ func TestQuickstartPurchaseEventIsBackendLegal(t *testing.T) {
 		var raw struct {
 			Events []map[string]any `json:"events"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
+		if err := json.NewDecoder(ingestRequestBody(t, r)).Decode(&raw); err != nil {
 			t.Errorf("decode request: %v", err)
 		}
 		if len(raw.Events) == 1 {

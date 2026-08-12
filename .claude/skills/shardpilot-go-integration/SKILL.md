@@ -161,14 +161,43 @@ and non-HTTPS URLs outside localhost/loopback (plain HTTP to a private
 RFC1918 **IP literal** only, via `AllowInsecurePrivateNetwork` — hostnames
 are never resolved). Optional tuning: `BatchSize` (default 25, max
 100), `BufferSize` (async queue capacity, default 1000), `FlushInterval`
-(default 1s), `HTTPTimeout` (default 2s), `Logger`, `UserID`/`AnonymousID`
+(default 15s — the longest a PARTIAL batch waits before it is published, not
+a heartbeat: an empty batch publishes nothing, so an otherwise-silent process
+makes no requests at any value. A full `BatchSize` publishes immediately,
+`Flush()` publishes on demand, and retry pacing runs on its own clock),
+`HTTPTimeout` (default 2s), `Logger`, `UserID`/`AnonymousID`
 (default actor identity), `OnBatchResult` (see verification), the
 remote-config fields (`RemoteConfigURL` + `APIKey` +
 `RemoteConfigCachePath`; see "Remote config"), the disk-spool fields
 (`SpoolDir`, `SpoolMaxEvents`, `SpoolMaxBytes`, `OnSpoolDeadLetter`; see
-"Offline behavior / spool"), and `SchemaRevision` /
-`DisableSchemaRevision` (see the facts list below). The SDK itself reads no
-environment variables.
+"Offline behavior / spool"), `SchemaRevision` /
+`DisableSchemaRevision` (see the facts list below), and
+`DisableRequestCompression`. The SDK itself reads no environment variables.
+
+**Request bodies over 1 KiB are gzip-compressed by default** — batch
+publishes and consent writes both. A batch body is the same envelope keys
+repeated per event, so it compresses hard: a 100-event batch measures 41.7 KB
+down to 2.4 KB on the wire (17x), at ~36 microseconds and 2 allocations per
+batch. WHERE that cost lands depends on the API: an `Enqueue`d batch is
+published by the background worker so the caller pays nothing, while a
+synchronous `Track` publishes on the CALLER's goroutine — so a single event
+whose JSON exceeds the 1 KiB threshold (a large props payload) pays the
+compression there. Most `Track` events are a few hundred bytes and never
+cross it. Smaller
+bodies are sent uncompressed, because gzip's 18 bytes of framing make a
+single-event batch bigger rather than smaller.
+
+Two things follow that matter when you integrate:
+
+- **The ingest body cap applies to the UNCOMPRESSED body.** Compression buys
+  throughput, not headroom — size batches against the decompressed JSON
+  exactly as before.
+- **You do not need to coordinate the rollout.** If the ingest deployment
+  cannot read the coding it answers `400` with detail code
+  `unsupported_content_encoding`, and the client latches compression off for
+  the rest of the process and re-sends the same batch uncompressed. The cost
+  of pointing a new SDK at an older server is one round-trip, not lost data.
+  Set `DisableRequestCompression: true` to skip even that.
 
 ## Consent model — READ THIS FIRST, IT IS INVERTED
 
@@ -277,9 +306,10 @@ Facts that keep integrations correct:
 - **Only queued publishes are retried.** The background flush worker retains
   a batch that failed retryably (429/5xx or transport error) and retries it,
   honoring the server's `Retry-After` hint; a retryable failure **without** a
-  hint paces itself with full-jitter exponential backoff (first failure at
-  the flush cadence, then a random wait in [1s, ceiling] with the ceiling
-  doubling per consecutive failure up to 60s, reset on success). With
+  hint paces itself with full-jitter exponential backoff on its OWN clock,
+  independent of `FlushInterval` (every failure — the first included — waits
+  at least 1s, with the ceiling doubling from the third consecutive failure
+  up to 60s, reset on success). With
   `SpoolDir` set such batches also spool to disk as crash insurance (see
   "Offline behavior / spool"). Synchronous `Track` does **not** retry and
   never spools: it publishes once and returns the error, so `Track` callers
