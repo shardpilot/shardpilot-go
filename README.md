@@ -161,7 +161,7 @@ Two **default-off** capture opt-ins extend automatic capture (both dark by defau
 | `UserID` / `AnonymousID` | no | Default actor identity; also the consent `actor_identifier` (UserID preferred). |
 | `BatchSize` | no | Default 25, capped at 100. |
 | `BufferSize` | no | Async queue capacity, default 1000. |
-| `FlushInterval` | no | Default 15s (was 1s). The idle cadence only — a full `BatchSize` publishes immediately, and `Flush()` still publishes on demand — so this is how often an *otherwise silent* process talks to ingest. Set it explicitly for a different cadence; an explicit value below the default is honoured. |
+| `FlushInterval` | no | Default 15s (was 1s). How long a **partial** batch waits before publishing — not a heartbeat: an empty batch publishes nothing, so a process that tracks nothing makes no requests at either value. At 1s a service emitting an event every few seconds never filled a batch, so every event became its own request; 15s lets batching actually happen. A full `BatchSize` still publishes immediately and `Flush()` on demand. Retry pacing does not follow this value. Set it explicitly for a different cadence; an explicit value below the default is honoured. |
 | `HTTPTimeout` | no | Default 2s. |
 | `Logger` | no | `Printf`-style logger; never receives tokens or full payloads. |
 | `AllowInsecurePrivateNetwork` | no | Allow plain HTTP to RFC1918 private addresses. |

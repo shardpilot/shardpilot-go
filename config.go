@@ -293,13 +293,20 @@ const (
 	defaultBatchSize  = 25
 	maxBatchSize      = 100
 	defaultBufferSize = 1000
-	// defaultFlushInterval was 1 SECOND, which is a request per second per
-	// process for the whole life of the process, whether or not anything was
-	// tracked. On a fleet of dedicated servers that is a standing load nobody
-	// asked for, and it is the number a prospect quotes back when comparing
-	// SDKs. 15s is the low end of the cross-SDK 15-30s band; the batch-size
-	// trigger is unchanged, so a busy process still publishes as soon as it has
-	// a full batch and only an IDLE one waits the longer interval.
+	// defaultFlushInterval is how long a PARTIAL batch waits before it
+	// publishes. It was 1 SECOND.
+	//
+	// It is NOT a heartbeat, and an earlier version of this comment said it
+	// was. The worker returns without a request when the batch is empty
+	// (publishWorkerBatch), so a process that tracks nothing makes no requests
+	// at either value — there was never an idle request-per-second to remove.
+	//
+	// The real cost is that at 1s, batching barely happened: a service
+	// emitting an event every few seconds never reached BatchSize, so the
+	// tick fired on a batch of one and every event became its own request.
+	// 15s — the low end of the cross-SDK 15-30s band — is long enough for
+	// events to actually accumulate. The batch-size trigger is unchanged, so
+	// a busy process still publishes the moment it has a full batch.
 	//
 	// This is a DEFAULT, not a cap: an integration that wants the old cadence
 	// sets FlushInterval explicitly, and latency-sensitive callers already have
