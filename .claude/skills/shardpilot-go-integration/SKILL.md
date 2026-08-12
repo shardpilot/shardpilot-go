@@ -280,9 +280,10 @@ Facts that keep integrations correct:
 - **Only queued publishes are retried.** The background flush worker retains
   a batch that failed retryably (429/5xx or transport error) and retries it,
   honoring the server's `Retry-After` hint; a retryable failure **without** a
-  hint paces itself with full-jitter exponential backoff (first failure at
-  the flush cadence, then a random wait in [1s, ceiling] with the ceiling
-  doubling per consecutive failure up to 60s, reset on success). With
+  hint paces itself with full-jitter exponential backoff on its OWN clock,
+  independent of `FlushInterval` (every failure — the first included — waits
+  at least 1s, with the ceiling doubling from the third consecutive failure
+  up to 60s, reset on success). With
   `SpoolDir` set such batches also spool to disk as crash insurance (see
   "Offline behavior / spool"). Synchronous `Track` does **not** retry and
   never spools: it publishes once and returns the error, so `Track` callers
