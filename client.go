@@ -982,9 +982,28 @@ func (c *Client) run() {
 // second when that was the default, fifteen now. The consent plane's own
 // backoff never asked for fifteen.
 func (c *Client) nextPacingWake(eventsDeferUntil time.Time) time.Duration {
+	// An ARMED deadline that has already elapsed reports "due now", not "no
+	// deadline". deferRemaining collapses the two to zero, and the loop's
+	// elapsed fast paths run BEFORE this computation — so a deadline that
+	// expires in between (a preemption is enough) leaves this returning no
+	// wake at all, the timer disarmed, and an otherwise idle client waiting
+	// out the 15-second flush tick. The window is small and the cost is a
+	// whole flush interval, on both planes (Codex on #48).
+	//
+	// Floored to a positive duration so the shared timer actually fires. The
+	// pass it wakes runs the fast paths again, which is what consumes the
+	// deadline — so this cannot repeat.
 	wake := c.deferRemaining(eventsDeferUntil)
+	if wake <= 0 && !eventsDeferUntil.IsZero() {
+		wake = time.Millisecond
+	}
 	if c.consentOutbox != nil {
-		if remaining := c.consentOutbox.deferRemaining(c.clock.Now()); remaining > 0 && (wake <= 0 || remaining < wake) {
+		now := c.clock.Now()
+		remaining := c.consentOutbox.deferRemaining(now)
+		if remaining <= 0 && c.consentOutbox.hasDeferral() {
+			remaining = time.Millisecond
+		}
+		if remaining > 0 && (wake <= 0 || remaining < wake) {
 			wake = remaining
 		}
 	}

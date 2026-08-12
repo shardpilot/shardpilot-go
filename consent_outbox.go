@@ -885,6 +885,16 @@ func (o *consentOutbox) deferralElapsed(now time.Time) bool {
 // long. Without it a receipt retry deferred one second would sit until the
 // next flush tick — fifteen seconds by default — even though the consent
 // plane's own schedule said one.
+// hasDeferral reports whether a retry deadline is ARMED, elapsed or not.
+// deferralActive answers "still parked"; this answers "there is a deadline to
+// consume", which is what separates a just-expired window from no window at
+// all when the wake is computed.
+func (o *consentOutbox) hasDeferral() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return !o.deferUntil.IsZero()
+}
+
 func (o *consentOutbox) deferRemaining(now time.Time) time.Duration {
 	o.mu.Lock()
 	defer o.mu.Unlock()

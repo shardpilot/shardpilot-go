@@ -3737,6 +3737,37 @@ func TestStartupWakeStandsDownUnderAPersistedDeferral(t *testing.T) {
 	client.consentGrantArming.Store(0)
 	client.consentOutbox = nil
 
+	// An ARMED-but-elapsed deadline reports due-now, not "no deadline".
+	// deferRemaining collapses both to zero, and the loop's elapsed fast paths
+	// run before this computation — so a deadline expiring in between (a
+	// preemption suffices) would otherwise disarm the timer and leave an idle
+	// client waiting out the whole flush interval. Both planes.
+	// The spool is cleared FIRST: with recovery work present the startup
+	// clause arms its own second and masks this entirely — the mutation
+	// survived until it did.
+	client.consentOutbox = nil
+	client.spool = &diskSpool{}
+	elapsed := clock.now.Add(-time.Second)
+	if wake := client.nextPacingWake(elapsed); wake <= 0 || wake > time.Second {
+		t.Fatalf("an elapsed events deadline must still arm a wake, got %v", wake)
+	}
+	client.consentOutbox = &consentOutbox{deferUntil: elapsed}
+	if wake := client.nextPacingWake(time.Time{}); wake <= 0 || wake > time.Second {
+		t.Fatalf("an elapsed consent deadline must still arm a wake, got %v", wake)
+	}
+	// The control: with no deadline on either plane AND no startup recovery
+	// work, nothing is armed. The spool is cleared for it because the startup
+	// clause would legitimately arm its own second here — which is the whole
+	// point of that clause, not a leak from these two.
+	client.consentOutbox = nil
+	client.spool = &diskSpool{}
+	if wake := client.nextPacingWake(time.Time{}); wake != 0 {
+		t.Fatalf("no deadline and no recovery work must arm nothing, got %v", wake)
+	}
+	client.spool = &diskSpool{
+		resend: []spoolEntry{{id: "evt-restart-deferred", raw: json.RawMessage(`{}`)}},
+	}
+
 	// Once the deferral lapses, the clause arms again — the recovery path it
 	// exists for is untouched.
 	clock.now = clock.now.Add(30 * time.Second)
