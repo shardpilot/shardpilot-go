@@ -794,29 +794,32 @@ func (c *Client) run() {
 		if len(batch) >= c.cfg.BatchSize {
 			queueEvents = nil
 		}
-		var deferWake <-chan time.Time
-		if !deferUntil.IsZero() {
-			if remaining := c.deferRemaining(deferUntil); remaining > 0 {
-				if deferTimer == nil {
-					deferTimer = time.NewTimer(remaining)
-				} else {
-					stopAndDrainTimer(deferTimer)
-					deferTimer.Reset(remaining)
-				}
-				deferWake = deferTimer.C
-			} else {
-				// The backpressure deadline elapsed while the worker was busy
-				// with another case — e.g. the queue case won the select in
-				// the same instant the timer fired, drained its tick, and the
-				// held batch stayed below BatchSize. Retry NOW instead of
-				// silently disarming and waiting for the next flush tick.
-				// (publishWorkerBatch consumes the elapsed deadline.)
-				if deferTimer != nil {
-					stopAndDrainTimer(deferTimer)
-				}
-				batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
-				continue
+		if !deferUntil.IsZero() && c.deferRemaining(deferUntil) <= 0 {
+			// The backpressure deadline elapsed while the worker was busy
+			// with another case — e.g. the queue case won the select in
+			// the same instant the timer fired, drained its tick, and the
+			// held batch stayed below BatchSize. Retry NOW instead of
+			// silently disarming and waiting for the next flush tick.
+			// (publishWorkerBatch consumes the elapsed deadline.)
+			if deferTimer != nil {
+				stopAndDrainTimer(deferTimer)
 			}
+			batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
+			continue
+		}
+		var deferWake <-chan time.Time
+		// The timer serves BOTH planes: it is armed at the earliest live
+		// pacing deadline of either, so a consent receipt's own retry
+		// schedule cannot be stretched to the flush interval by an events
+		// plane that has nothing pending. See nextPacingWake.
+		if wake := c.nextPacingWake(deferUntil); wake > 0 {
+			if deferTimer == nil {
+				deferTimer = time.NewTimer(wake)
+			} else {
+				stopAndDrainTimer(deferTimer)
+				deferTimer.Reset(wake)
+			}
+			deferWake = deferTimer.C
 		} else if deferTimer != nil {
 			stopAndDrainTimer(deferTimer)
 		}
@@ -840,11 +843,21 @@ func (c *Client) run() {
 			}
 			batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
 		case <-deferWake:
-			// The backpressure deadline passed: retry the held batch now
-			// rather than waiting out the remainder of the flush interval.
-			if c.publishDeferred(deferUntil) {
+			// This wake may belong to EITHER plane, so both get their turn.
+			// The consent dispatch is a no-op when that plane is still parked
+			// or has nothing owed, and it must run before the events check
+			// below returns: a receipt whose retry came due while the events
+			// plane was healthy has no other wake source but the flush tick.
+			c.dispatchConsentReceipts(context.Background(), false)
+			if deferUntil.IsZero() || c.publishDeferred(deferUntil) {
+				// Either this wake was the consent plane's alone, or the
+				// events deadline has not passed yet. Publishing here would
+				// flush a partial batch early and defeat the BatchSize /
+				// FlushInterval batching this whole loop exists to do.
 				continue
 			}
+			// The backpressure deadline passed: retry the held batch now
+			// rather than waiting out the remainder of the flush interval.
 			batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
 		case <-c.pacingWake:
 			// A publish succeeded elsewhere (typically a synchronous Track)
@@ -916,6 +929,27 @@ func (c *Client) run() {
 
 // deferRemaining is the time left until the backpressure deadline, or zero
 // when no deferral is active.
+// nextPacingWake is the shortest live pacing deadline across the two planes,
+// or zero when neither is parked.
+//
+// Both planes back off on their own schedules, but only ONE timer wakes the
+// worker, so it has to be armed at whichever comes first. Arming it from the
+// events deadline alone was the defect: a consent receipt deferred one second
+// while the events plane was healthy had no wake source at all except the
+// flush ticker, so its retry silently inherited the batching cadence — one
+// second when that was the default, fifteen now. The consent plane's own
+// backoff never asked for fifteen.
+func (c *Client) nextPacingWake(eventsDeferUntil time.Time) time.Duration {
+	wake := c.deferRemaining(eventsDeferUntil)
+	if c.consentOutbox == nil {
+		return wake
+	}
+	if remaining := c.consentOutbox.deferRemaining(c.clock.Now()); remaining > 0 && (wake <= 0 || remaining < wake) {
+		wake = remaining
+	}
+	return wake
+}
+
 func (c *Client) deferRemaining(deferUntil time.Time) time.Duration {
 	if deferUntil.IsZero() {
 		return 0
@@ -1039,11 +1073,17 @@ const minRetryNowSpacing = 100 * time.Millisecond
 // Client-side fallback pacing for retryable publish failures that carry no
 // Retry-After hint (server unreachable, or a 5xx without the header):
 // exponential backoff with full jitter, mirroring the shardpilot-defold
-// reference semantics. The first failure retries at the normal flush cadence
-// with no extra wait; sustained failures then defer by a random duration in
-// [base, ceiling], with the ceiling doubling per consecutive failure up to
-// the cap and the jitter de-synchronizing clients so a recovering server
-// does not face the whole fleet at once.
+// reference semantics. Every failure — the FIRST included — defers by a
+// random duration in [base, ceiling], with the ceiling doubling per
+// consecutive failure up to the cap and the jitter de-synchronizing clients
+// so a recovering server does not face the whole fleet at once.
+//
+// The first failure used to defer by NOTHING, which read as "retry promptly"
+// only because the flush interval was one second. It was never prompt on its
+// own — it was the flush tick wearing a retry's clothes, and raising the idle
+// flush default to 15s turned the same code path into a 15-second stall with
+// the queue stopped at BatchSize. Retry pacing owns its own clock now, so the
+// batching cadence can move without dragging the retry cadence with it.
 const (
 	publishBackoffBase = time.Second
 	publishBackoffCap  = 60 * time.Second
@@ -1052,13 +1092,24 @@ const (
 // backoffCeiling is the deterministic upper bound of the jitter window for
 // the given consecutive-failure attempt: base·2^(attempt−2), clamped to the
 // cap (the exponent is clamped too, so an arbitrarily long outage cannot
-// overflow the shift). Attempts before the second have no window — the first
-// failure does not defer.
+// overflow the shift).
+//
+// The FIRST failure shares the second's window rather than having none. Its
+// old zero meant "no deferral", which handed the retry to the flush tick —
+// fine at a one-second interval and a fifteen-second stall at the current
+// default. Giving it exactly `base` reproduces the timing the old default
+// actually delivered (~1s) while making it independent of FlushInterval,
+// which is the entire point: an operator lengthening the idle flush interval
+// is asking for fewer requests when nothing is happening, not for a slower
+// recovery when something is wrong.
 func backoffCeiling(attempt int) time.Duration {
-	if attempt < 2 {
+	if attempt < 1 {
 		return 0
 	}
 	exp := attempt - 2
+	if exp < 0 {
+		exp = 0
+	}
 	if exp > 16 {
 		exp = 16
 	}

@@ -161,7 +161,10 @@ and non-HTTPS URLs outside localhost/loopback (plain HTTP to a private
 RFC1918 **IP literal** only, via `AllowInsecurePrivateNetwork` — hostnames
 are never resolved). Optional tuning: `BatchSize` (default 25, max
 100), `BufferSize` (async queue capacity, default 1000), `FlushInterval`
-(default 1s), `HTTPTimeout` (default 2s), `Logger`, `UserID`/`AnonymousID`
+(default 15s — the IDLE cadence only: a full `BatchSize` publishes
+immediately, `Flush()` publishes on demand, and retry pacing runs on its own
+clock, so this is how often an otherwise-silent process talks to ingest),
+`HTTPTimeout` (default 2s), `Logger`, `UserID`/`AnonymousID`
 (default actor identity), `OnBatchResult` (see verification), the
 remote-config fields (`RemoteConfigURL` + `APIKey` +
 `RemoteConfigCachePath`; see "Remote config"), the disk-spool fields

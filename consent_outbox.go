@@ -804,6 +804,27 @@ func (o *consentOutbox) deferralActive(now time.Time) bool {
 	return !o.deferUntil.IsZero() && now.Before(o.deferUntil)
 }
 
+// deferRemaining is how long the consent plane is still parked for, or zero
+// when it is not parked (or the deadline has already passed).
+//
+// The worker uses this to arm its wake timer, which is why it exists
+// separately from deferralActive: knowing THAT the plane is parked is enough
+// to skip a dispatch, but waking at the right moment needs to know for how
+// long. Without it a receipt retry deferred one second would sit until the
+// next flush tick — fifteen seconds by default — even though the consent
+// plane's own schedule said one.
+func (o *consentOutbox) deferRemaining(now time.Time) time.Duration {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.deferUntil.IsZero() {
+		return 0
+	}
+	if remaining := o.deferUntil.Sub(now); remaining > 0 {
+		return remaining
+	}
+	return 0
+}
+
 // ── Client-level orchestration ──────────────────────────────────────────────
 
 // consentFloorEnabled reports the opt-in.

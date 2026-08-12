@@ -5248,3 +5248,46 @@ func TestConsentFloorMarkerCreateSerializedWithOwedFlag(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 }
+
+// TestConsentReceiptRetryDoesNotLengthenWithTheFlushInterval is A6's second
+// separation acceptance for this SDK.
+//
+// The consent plane keeps its OWN retry schedule — Retry-After when the
+// server sends one, the shared jittered backoff otherwise — but only one
+// timer wakes the worker, and it used to be armed from the EVENTS plane's
+// deadline alone. So a receipt deferred one second by the server, on a client
+// whose events plane was perfectly healthy, had no wake source at all except
+// the flush ticker: its retry silently inherited the batching cadence.
+//
+// The harness flush interval here is an HOUR, which is what makes this
+// decisive. If the consent retry still rode the ticker, this test would take
+// an hour; the timeout is five seconds.
+//
+// (That the existing floor tests need `clearConsentDeferral` to get past a
+// parked window is the same fact from the other side — before this, waiting
+// out a consent deferral was not something a test could do.)
+func TestConsentReceiptRetryDoesNotLengthenWithTheFlushInterval(t *testing.T) {
+	state, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// One second is the server's word, and it is three orders of magnitude
+	// below the flush interval — no ambiguity about which clock answered.
+	state.setConsentOutcome(http.StatusServiceUnavailable, "1")
+
+	client := newFloorTestClient(t, server.URL, t.TempDir(), nil)
+	defer func() { _ = client.Close(context.Background()) }()
+
+	client.SetConsent(true)
+	waitFor(t, 3*time.Second, "the first receipt attempt", func() bool {
+		return state.consentCount() >= 1
+	})
+
+	// Heal the endpoint but touch NOTHING else: no Flush, no SetConsent, no
+	// enqueue, no clearConsentDeferral. The only thing that can produce a
+	// second attempt is the worker waking on the consent plane's own
+	// deadline.
+	state.setConsentOutcome(http.StatusOK, "")
+	waitFor(t, 5*time.Second, "the receipt retried on the consent plane's own clock, not the hourly flush tick", func() bool {
+		return state.consentCount() >= 2
+	})
+}
