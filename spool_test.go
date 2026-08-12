@@ -3552,3 +3552,63 @@ func TestStartupSpoolResendDoesNotWaitForTheFlushTick(t *testing.T) {
 		})
 	_ = state
 }
+
+// TestStartupSpoolResendSurvivesFrequentUnrelatedWakes is the second half of
+// TestStartupSpoolResendDoesNotWaitForTheFlushTick, and it exists because the
+// first version of that fix passed it while still being wrong.
+//
+// The startup resend has no deadline of its own, so the worker invents one.
+// Inventing a FRESH one-second duration on every loop iteration looks correct
+// in a quiet process — nothing else wakes the worker, so the first timer
+// fires. Under any other activity it is not a fix at all: each unrelated wake
+// stops the timer and resets it to a full second, so a process enqueueing more
+// than once a second postpones its own durable recovery indefinitely.
+//
+// The flush interval is an hour and the noise enqueues arrive every 100ms
+// against a BatchSize of 100, so the batch cannot fill for ten seconds — they
+// exist only to keep waking the worker. The three-second bound sits between
+// the two outcomes: the recovery wake lands at ~1s, while under the defect
+// nothing publishes until the batch fills at ~10s (Codex on #48).
+func TestStartupSpoolResendSurvivesFrequentUnrelatedWakes(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+
+	dir := t.TempDir()
+	writeConsentRecordFile(t, dir, "granted")
+	writeSpoolRecordFile(t, dir, 0, spoolTestEnvelope(t, "evt-restart-busy-1", time.Now()))
+
+	state.setOutcome(http.StatusAccepted, "", "")
+	client := newSpoolTestClient(t, server.URL, dir, nil, func(cfg *Config) {
+		cfg.FlushInterval = time.Hour
+		cfg.BatchSize = 100
+		cfg.BufferSize = 512
+	})
+	defer func() { _ = client.Close(context.Background()) }()
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// Faster than the one-second recovery wake: every one of these
+			// resets the timer under the defect.
+			_ = client.Enqueue(Event{ID: fmt.Sprintf("evt-busy-%d", i), Name: "noise"})
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
+	defer func() {
+		close(stop)
+		<-done
+	}()
+
+	waitFor(t, 3*time.Second,
+		"the startup-loaded spool chunk resent despite a steady stream of unrelated wakes",
+		func() bool {
+			return client.Snapshot().SpoolResent == 1
+		})
+}

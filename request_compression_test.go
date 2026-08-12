@@ -654,3 +654,105 @@ func BenchmarkCompressBatchBody(b *testing.B) {
 		_ = encoded
 	}
 }
+
+// TestTheUncompressedRetryGetsItsOwnAttemptTimeout pins that the fallback is
+// a real fallback and not a formality.
+//
+// The refusal is the response of a server that does NOT understand the coding,
+// and there is no reason such a server answers quickly — an old deployment
+// behind a proxy can spend most of the request budget deciding. The attempt
+// timeout used to be applied to the whole publish by the CALLER, so whatever
+// the refusal spent came out of the retry: the retry then timed out, the
+// synchronous Track failed, and the advertised compatibility path did not
+// deliver on the one occasion it exists for.
+//
+// It is driven through a real Client rather than the transport directly,
+// because the caller is where the old budget was applied — a transport-level
+// test passes a fresh context and cannot see the defect at all.
+//
+// The server burns 80% of HTTPTimeout before refusing, so a retry sharing that
+// budget cannot finish.
+func TestTheUncompressedRetryGetsItsOwnAttemptTimeout(t *testing.T) {
+	const attemptTimeout = 600 * time.Millisecond
+
+	var uncompressed atomic.Int64
+	server, _ := compressionCapturingServer(t, func(w http.ResponseWriter, r *http.Request, decoded []byte) {
+		if r.Header.Get("Content-Encoding") == "gzip" {
+			time.Sleep(attemptTimeout * 8 / 10)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"code":"validation_error","message":"request validation failed",` +
+				`"details":[{"field":"content-encoding","code":"unsupported_content_encoding",` +
+				`"message":"content encoding gzip is not supported"}]}}`))
+			return
+		}
+		// The retry takes half the attempt budget: comfortably inside a FRESH
+		// one, and comfortably OUTSIDE the fifth the refusal left over. Both
+		// numbers matter — a retry that answers instantly would succeed on the
+		// leftovers too, and the test would pass against the defect.
+		time.Sleep(attemptTimeout / 2)
+		uncompressed.Add(1)
+		acceptBatch(w, r, decoded)
+	})
+	defer server.Close()
+
+	client, err := NewClient(Config{
+		IngestURL:     server.URL,
+		Token:         "test-token",
+		WorkspaceID:   "workspace-test",
+		AppID:         "app-test",
+		EnvironmentID: "develop",
+		Source:        SourceBackend,
+		FlushInterval: time.Hour,
+		HTTPTimeout:   attemptTimeout,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer func() { _ = client.Close(context.Background()) }()
+
+	// A synchronous Track publishes on the CALLER's goroutine, under the
+	// caller's context — which is where the shared budget used to be applied.
+	// The props push the single-event body over the compression threshold.
+	if err := client.Track(context.Background(), Event{
+		ID:    "evt-slow-refusal-1",
+		Name:  "level_complete",
+		Props: map[string]any{"blob": strings.Repeat("compressible-", 200)},
+	}); err != nil {
+		t.Fatalf("the uncompressed retry must have its own attempt budget: %v", err)
+	}
+	if got := uncompressed.Load(); got != 1 {
+		t.Fatalf("expected exactly one uncompressed retry to land, got %d", got)
+	}
+}
+
+// TestACallerDeadlineStillBoundsBothAttempts is the other half: giving each
+// attempt its own budget must not let the transport outlive the caller's own
+// deadline. context.WithTimeout never EXTENDS an earlier deadline, and this is
+// the assertion that keeps it that way.
+func TestACallerDeadlineStillBoundsBothAttempts(t *testing.T) {
+	server, _ := compressionCapturingServer(t, func(w http.ResponseWriter, r *http.Request, decoded []byte) {
+		time.Sleep(2 * time.Second)
+		acceptBatch(w, r, decoded)
+	})
+	defer server.Close()
+
+	transport := newHTTPTransport(Config{
+		IngestURL:   server.URL,
+		Token:       "test-token",
+		HTTPTimeout: time.Minute,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	started := time.Now()
+	if _, err := transport.Publish(ctx, compressionTestBatch(100)); err == nil {
+		t.Fatal("expected the caller deadline to abort the publish")
+	}
+	// The deadline is 200ms and the server answers at 2s, so anything near a
+	// second means the transport waited for the server rather than the caller.
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("the caller deadline did not bound the attempt: took %v", elapsed)
+	}
+}

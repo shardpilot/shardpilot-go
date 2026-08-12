@@ -19,6 +19,13 @@ type Client struct {
 	transport transport
 	stats     statsCollector
 
+	// startupResendWakeAt is the absolute deadline for the next look at
+	// spool work that carries no deadline of its own (see nextPacingWake).
+	// Absolute, not a duration recomputed per iteration: unrelated wakes must
+	// only be able to SHORTEN the wait, never restart it. Read and written on
+	// the worker goroutine alone.
+	startupResendWakeAt time.Time
+
 	// jitter is the uniform [0, 1) source for the publish backoff's full
 	// jitter; tests pin it for deterministic schedules. Only the flush
 	// worker goroutine reads it. Nil falls back to the shared math/rand
@@ -807,7 +814,7 @@ func (c *Client) run() {
 			batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
 			continue
 		}
-		if c.consentOutbox != nil && c.consentOutbox.consumeElapsedDeferral(c.clock.Now()) {
+		if c.consentOutbox != nil && c.consentOutbox.deferralElapsed(c.clock.Now()) {
 			// The consent plane's retry came due while the worker was busy
 			// with another case. Dispatch NOW: the wake arithmetic below
 			// cannot see an elapsed deadline (deferRemaining reports zero for
@@ -815,6 +822,11 @@ func (c *Client) run() {
 			// disarmed and the receipt waits for the flush tick — the exact
 			// coupling retry pacing was separated from. Mirrors the events
 			// plane's elapsed-deadline fast path above.
+			//
+			// The check does NOT consume the deadline; the dispatch does, once
+			// it holds the claim. A pass refused the claim by a concurrent
+			// caller-side dispatch has sent nothing, and must leave the
+			// deadline standing for the wake that release triggers.
 			c.dispatchConsentReceipts(context.Background(), false)
 		}
 		var deferWake <-chan time.Time
@@ -983,8 +995,26 @@ func (c *Client) nextPacingWake(eventsDeferUntil time.Time) time.Duration {
 	// or a real deadline is armed and publishDeferred gates it. The clause
 	// self-clears — hasResendWork goes false once the queue drains — so it
 	// cannot keep the worker awake past recovery.
-	if c.spool != nil && c.spool.hasResendWork() && wake <= 0 {
-		wake = publishBackoffBase
+	//
+	// The deadline is ABSOLUTE, remembered across iterations. Re-deriving a
+	// fresh one-second duration on every pass would let unrelated wakes —
+	// enqueues arriving faster than once a second — reset the timer each time
+	// and postpone the recovery indefinitely, which is the coupling this
+	// clause exists to break rather than a smaller version of it. Recomputing
+	// the REMAINING time instead means other activity can only shorten it.
+	if c.spool != nil && c.spool.hasResendWork() {
+		now := c.clock.Now()
+		if c.startupResendWakeAt.IsZero() || !c.startupResendWakeAt.After(now) {
+			// A fresh cycle: either this is the first pass to see the work, or
+			// the previous deadline has fired and the pass it woke has already
+			// run. Everything in between leaves the deadline alone.
+			c.startupResendWakeAt = now.Add(publishBackoffBase)
+		}
+		if remaining := c.startupResendWakeAt.Sub(now); wake <= 0 || remaining < wake {
+			wake = remaining
+		}
+	} else {
+		c.startupResendWakeAt = time.Time{}
 	}
 	return wake
 }
@@ -1480,8 +1510,9 @@ func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, def
 	if len(batch) == 0 {
 		return batch
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.HTTPTimeout)
-	defer cancel()
+	// Unbounded here: the transport bounds each HTTP attempt, so the
+	// gzip-refusal fallback gets its own budget.
+	ctx := context.Background()
 	// Build THROUGH the retained request (see buildBatchIsolating): the prefix
 	// a previous failed attempt already marshaled resends its exact bytes. A
 	// member that no longer serializes is dropped alone — settled and counted
@@ -1619,8 +1650,10 @@ func (c *Client) publishRequest(ctx context.Context, request batchRequest, size 
 // consent flip would purge (and dead-letter) entries the 202 already
 // settled.
 func (c *Client) publishRequestResult(ctx context.Context, request batchRequest, size int) (batchResult, error) {
-	ctx, cancel := contextWithDefaultTimeout(ctx, c.cfg.HTTPTimeout)
-	defer cancel()
+	// The SDK attempt timeout is applied inside the transport, per HTTP
+	// attempt, NOT here: one publish can make two attempts (a gzip refusal is
+	// answered by re-sending uncompressed), and bounding the pair together
+	// left the second with the remainder of the first.
 
 	// Load the denial gate BEFORE re-checking consent: a denial completed
 	// after the load cancels the loaded gate (aborting the in-flight HTTP

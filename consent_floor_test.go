@@ -5419,3 +5419,66 @@ func TestConsumeElapsedConsentDeferralIsIdempotent(t *testing.T) {
 		t.Fatal("the elapsed deadline must be CONSUMED: a second report would spin the worker")
 	}
 }
+
+// TestARefusedDispatchClaimLeavesTheDeadlineAndWakesOnRelease pins the
+// handshake between the worker's elapsed-deadline check and a concurrent
+// caller-side dispatch.
+//
+// The worker used to CONSUME the elapsed retry deadline and then ask for the
+// dispatch claim. If a caller-side Track held the claim — and had already
+// decided to skip, on a deadline that was still live when it looked — neither
+// pass sent the receipt, and with the deadline consumed nothing was left to
+// arm a timer. The receipt then waited for the flush tick, which is exactly
+// the cadence coupling the consent plane's own clock exists to avoid.
+//
+// So: the check reports without consuming, and the claim holder reports on
+// release that someone was turned away, which is what the worker's wake hangs
+// off (Codex on #48).
+func TestARefusedDispatchClaimLeavesTheDeadlineAndWakesOnRelease(t *testing.T) {
+	outbox := newConsentOutbox(t.TempDir())
+	now := time.Now()
+
+	outbox.mu.Lock()
+	outbox.deferUntil = now.Add(-time.Millisecond)
+	outbox.mu.Unlock()
+
+	if !outbox.deferralElapsed(now) {
+		t.Fatal("an elapsed deadline must report as due")
+	}
+	if !outbox.deferralElapsed(now) {
+		t.Fatal("the check must not consume the deadline: a pass that never dispatches has to leave it standing")
+	}
+
+	// A caller-side dispatch holds the claim; the worker's pass is turned away.
+	if !outbox.claimDispatch() {
+		t.Fatal("the first claim must succeed")
+	}
+	if outbox.claimDispatch() {
+		t.Fatal("a second claim must be refused while the first is held")
+	}
+	if !outbox.deferralElapsed(now) {
+		t.Fatal("the refused pass dispatched nothing, so the deadline must survive it")
+	}
+
+	if !outbox.releaseDispatch() {
+		t.Fatal("release must report the refused pass, or nothing wakes the worker and the receipt waits for the flush tick")
+	}
+	if outbox.claimDispatch() {
+		// Re-claiming is fine; what must NOT persist is the missed flag.
+		if outbox.releaseDispatch() {
+			t.Fatal("the missed-claim flag must be cleared by the release that reported it")
+		}
+	}
+
+	// And the deadline is retired by the pass that actually holds the claim.
+	if !outbox.claimDispatch() {
+		t.Fatal("claiming after release must succeed")
+	}
+	if !outbox.consumeElapsedDeferral(now) {
+		t.Fatal("the holder retires the elapsed deadline")
+	}
+	if outbox.deferralElapsed(now) {
+		t.Fatal("a consumed deadline must not report as due again")
+	}
+	outbox.releaseDispatch()
+}

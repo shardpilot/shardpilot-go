@@ -3,6 +3,7 @@ package shardpilot
 import (
 	"bytes"
 	"compress/gzip"
+	"io"
 	"sync"
 )
 
@@ -48,7 +49,17 @@ func compressRequestBody(payload []byte) ([]byte, bool) {
 	}
 
 	writer, _ := gzipWriterPool.Get().(*gzip.Writer)
-	defer gzipWriterPool.Put(writer)
+	defer func() {
+		// Point the writer at a sink that holds nothing BEFORE pooling it.
+		// Close does not release the destination — gzip.Writer keeps it in
+		// its own field and the flate compressor keeps it again underneath —
+		// so returning the writer as-is keeps `buf` and its backing array
+		// reachable for as long as the writer sits idle in the pool. The
+		// buffer is pre-grown to half the payload, so one large publish would
+		// pin megabytes per pooled writer, multiplied by concurrency.
+		writer.Reset(io.Discard)
+		gzipWriterPool.Put(writer)
+	}()
 
 	var buf bytes.Buffer
 	buf.Grow(len(payload) / 2)

@@ -187,6 +187,14 @@ type httpTransport struct {
 	// callers and the consent outbox all publish concurrently, and the latch
 	// must be seen by all of them after any one of them trips it.
 	compressionRefused atomic.Bool
+	// attemptTimeout bounds ONE HTTP attempt. It lives here rather than at the
+	// call sites because postJSON can make two attempts for one logical
+	// request — a gzip refusal is answered by re-sending the same body
+	// uncompressed — and the second one needs its own budget. Bounding the
+	// operation instead left the retry with whatever the refusal response had
+	// not already spent, so a slow refusal made the advertised fallback time
+	// out on its first use.
+	attemptTimeout time.Duration
 	// logger reports the one-time fallback. Nil is silent.
 	logger Logger
 }
@@ -231,6 +239,7 @@ func newHTTPTransport(cfg Config) *httpTransport {
 		client:            client,
 		rcClient:          rcClient,
 		compressionOptOut: cfg.DisableRequestCompression,
+		attemptTimeout:    cfg.HTTPTimeout,
 		logger:            cfg.Logger,
 	}
 }
@@ -374,7 +383,15 @@ func (t *httpTransport) postJSON(ctx context.Context, endpoint string, request a
 }
 
 // postBody sends one already-marshalled request body, optionally gzipped.
+//
+// The SDK attempt timeout is applied HERE, per attempt, so the uncompressed
+// retry above gets a full budget rather than the remainder of the refusal's.
+// It still only ever shortens: context.WithTimeout never extends a caller's
+// earlier deadline, so a Flush(ctx) deadline continues to bound everything.
 func (t *httpTransport) postBody(ctx context.Context, endpoint string, payload []byte, result any, schemaRevision string, allowCompression bool) error {
+	ctx, cancelAttempt := contextWithDefaultTimeout(ctx, t.attemptTimeout)
+	defer cancelAttempt()
+
 	body := payload
 	compressed := false
 	if allowCompression {

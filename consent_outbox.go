@@ -206,6 +206,10 @@ type consentOutbox struct {
 	// its turn instead of silently skipping receipt work.
 	dispatching     bool
 	dispatchWaiters []chan struct{}
+	// dispatchMissed records that a NON-JOINING pass (the worker's) asked for
+	// the claim while it was held and was turned away. releaseDispatch reports
+	// and clears it, and its holder wakes the worker — see claimDispatch.
+	dispatchMissed bool
 
 	// deferUntil parks the consent plane after a retryable delivery failure
 	// (server Retry-After, or jittered backoff); backoffAttempt counts the
@@ -751,6 +755,13 @@ func (o *consentOutbox) claimDispatch() bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.dispatching {
+		// Remember that a pass wanted this claim and did not get it, so the
+		// holder can wake it on release. A worker pass that found an elapsed
+		// retry deadline and then lost the claim has dispatched nothing and
+		// has nothing left to re-arm its timer with, so without the wake the
+		// receipt waits for the flush tick — the coupling this plane's own
+		// clock exists to avoid.
+		o.dispatchMissed = true
 		return false
 	}
 	o.dispatching = true
@@ -785,15 +796,24 @@ func (o *consentOutbox) claimDispatchWait(ctx context.Context) bool {
 	}
 }
 
-func (o *consentOutbox) releaseDispatch() {
+// releaseDispatch drops the serial-dispatch claim and reports whether a
+// NON-JOINING pass was refused it while it was held — the caller wakes the
+// worker in that case, and only in that case. Waking unconditionally would
+// make the worker run a publish pass after every consent dispatch, which is a
+// different and larger behaviour change: a queued event that used to wait for
+// its flush trigger would go out early, which the Close-drain test caught.
+func (o *consentOutbox) releaseDispatch() bool {
 	o.mu.Lock()
 	o.dispatching = false
+	missed := o.dispatchMissed
+	o.dispatchMissed = false
 	waiters := o.dispatchWaiters
 	o.dispatchWaiters = nil
 	o.mu.Unlock()
 	for _, wait := range waiters {
 		close(wait)
 	}
+	return missed
 }
 
 // deferralActive reports whether the consent plane is parked (a retryable
@@ -820,6 +840,14 @@ func (o *consentOutbox) deferralActive(now time.Time) bool {
 // job. A dispatch that fails again re-arms a fresh one; a dispatch with
 // nothing owed leaves it clear instead of spinning the worker on a deadline
 // that can never expire again.
+//
+// It is consumed only ONCE THE DISPATCH CLAIM IS HELD, which is why this sits
+// inside dispatchConsentReceipts rather than at the worker's check. Consuming
+// it at the check and then losing the claim to a concurrent caller-side
+// dispatch left neither pass sending the receipt — the caller had already
+// decided to skip on a deadline that was still live when it looked — and with
+// the deadline gone nothing armed a timer, so the receipt waited for the flush
+// tick after all (Codex on #48).
 func (o *consentOutbox) consumeElapsedDeferral(now time.Time) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -828,6 +856,15 @@ func (o *consentOutbox) consumeElapsedDeferral(now time.Time) bool {
 	}
 	o.deferUntil = time.Time{}
 	return true
+}
+
+// deferralElapsed reports whether a consent-retry deadline has come due,
+// WITHOUT consuming it. The worker uses this to decide it has dispatch work;
+// the dispatch consumes the deadline once it holds the claim.
+func (o *consentOutbox) deferralElapsed(now time.Time) bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return !o.deferUntil.IsZero() && !now.Before(o.deferUntil)
 }
 
 // deferRemaining is how long the consent plane is still parked for, or zero
@@ -1443,7 +1480,20 @@ func (c *Client) dispatchConsentReceipts(ctx context.Context, join bool) (map[st
 	} else if !o.claimDispatch() {
 		return nil, false
 	}
-	defer o.releaseDispatch()
+	defer func() {
+		if o.releaseDispatch() {
+			// A pass was refused this claim while it was held, so give it
+			// another look now that the claim is free. It cannot loop: a
+			// dispatch that failed re-armed a FUTURE deadline, and one that
+			// succeeded left nothing owed.
+			c.wakeConsentDispatch()
+		}
+	}()
+
+	// The claim is held, so the parking window can be retired: the worker's
+	// elapsed-deadline check deliberately does not consume it, because a pass
+	// that never obtains the claim has not dispatched anything.
+	o.consumeElapsedDeferral(c.clock.Now())
 	handed := make(map[string]struct{})
 	for {
 		if o.deferralActive(c.clock.Now()) {
@@ -1550,9 +1600,10 @@ func (c *Client) dispatchConsentReceipts(ctx context.Context, join bool) (map[st
 				return handed, true
 			}
 		}
-		attemptCtx, cancel := contextWithDefaultTimeout(ctx, c.cfg.HTTPTimeout)
-		_, err := c.transport.PublishConsent(attemptCtx, consentReceiptWire(receipt))
-		cancel()
+		// The transport bounds each HTTP attempt by HTTPTimeout; this used to
+		// bound the whole dispatch, which left a gzip-refusal fallback with
+		// only what the refusal had not already spent.
+		_, err := c.transport.PublishConsent(ctx, consentReceiptWire(receipt))
 		// The dispatch gate releases only on an OBSERVED HTTP outcome: a
 		// success, or a status error — proof the request reached the server
 		// and was answered, so an event batch following in this cycle
