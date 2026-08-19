@@ -69,9 +69,8 @@ go get github.com/shardpilot/shardpilot-go@v0.6.0-alpha
 - **`v0.1.0` is retracted** in `go.mod`; never pin it. Older usable pins
   (`v0.5.0-alpha`, `v0.4.0-alpha`, `v0.3.0-alpha`, `v0.2.0-alpha`, `v0.1.2`) ship
   progressively less surface — prefer the pin above.
-- Pre-launch: there is no public production ingest endpoint yet. `IngestURL`
-  is the base URL of the ShardPilot deployment you were given (or a local
-  stack). HTTPS is required outside localhost/loopback. The **analytics
+- `IngestURL` is the base URL of the ShardPilot ingest deployment you were
+  given, or of a local stack you run yourself. HTTPS is required outside localhost/loopback. The **analytics
   client only** can opt into private-network HTTP via
   `Config.AllowInsecurePrivateNetwork`, and only for private (RFC1918) **IP
   literals** — the SDK never resolves DNS names, so an internal hostname
@@ -588,8 +587,8 @@ them:
   happens server-side only. Since `v0.6.0-alpha` there IS an experiment-assignment
   consumer (`Config.ExperimentsEnabled`) and an attribute pass-through
   (`Config.RemoteConfigAttributesEnabled`), but both are DARK: default `false`,
-  and with the platform's experimentation flags off in every environment an
-  enabled consumer receives 403 on every fetch — that applies to the
+  and until server-side enablement is done for your workspace an enabled
+  consumer receives 403 on every fetch — that applies to the
   EXPERIMENT lane; `RemoteConfigAttributesEnabled` alone still uses the ordinary
   remote-config fetch and is not affected. Do not design an integration around
   the experiment surface yet.

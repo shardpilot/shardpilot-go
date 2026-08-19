@@ -512,7 +512,7 @@
   - Consent-plane observability on `Snapshot()`: `ConsentRecorded`, `ConsentFailed`,
     `ConsentOutboxEvicted`, `ConsentOutboxPersistFailed`, `LastConsentError`.
 
-- Fleet-audit follow-ups on the GAP-075 spool and transport machinery:
+- Audit follow-ups on the spool and transport machinery:
   - Poison-member isolation on the worker publish paths: a batch member whose nested
     `Props`/`Context` values no longer serialize (mutated after `Enqueue`) is now dropped
     ALONE — attributed by event id in the log, counted `Dropped`, and folded into an explicit
@@ -551,7 +551,7 @@
 
 ## v0.5.0-alpha — 2026-07-19 — remote config, disk spool, schema revision
 
-- Remote config client (GAP-075): explicit `FetchRemoteConfig` plus never-fail typed getters
+- Remote config client: explicit `FetchRemoteConfig` plus never-fail typed getters
   (`RemoteConfigValue/String/Number/Bool/Values/Version`) over a durable last-known-good cache
   (`Config.RemoteConfigURL`, `Config.APIKey`, `Config.RemoteConfigCachePath`), scoped by
   (workspace, environment, client_id, base URL) with ETag/`If-None-Match` revalidation. The
@@ -577,7 +577,7 @@
   the cache without touching the network — the client half of the server-side remote-config
   fetch rate limit.
 
-- Bounded disk spool (GAP-075; closes the long-standing follow-up in `queue.go`): opt-in via
+- Bounded disk spool (closes the long-standing follow-up in `queue.go`): opt-in via
   `Config.SpoolDir`; 2000 events / 1 MiB caps with oldest-first eviction, and the record is
   read back through a hard limit derived from the byte cap (an over-limit `spool.json` is
   discarded as corrupt, never loaded whole); verbatim single-stamp envelope records — the

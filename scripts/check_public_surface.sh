@@ -7,94 +7,291 @@
 # repository) enumerates publication CANDIDATES — repositories that are private
 # and might be flipped. This repository is not a candidate, because it is
 # already public. Nothing scanned it, and that is exactly how an internal
-# review-process skill, an internal decision-record id, an internal service
-# name and an internal commit sha came to sit in a public repository for
-# months. A gate that runs where the exposure already exists is the fix.
+# review-process skill, internal decision-record ids, an internal service name
+# and an internal commit sha came to sit in a public repository for months. A
+# gate that runs where the exposure already exists is the fix.
 #
-# ── SCOPE, STATED SO A PASS IS NOT READ AS MORE THAN IT IS ───────────────────
+# ── THE PATTERNS ARE SHAPES, NOT A ROSTER ───────────────────────────────────
+# A gate against internal names, written as a list of internal names, publishes
+# that list. The first draft of this file did exactly that: it introduced five
+# internal names into this repository that had never appeared in it, and then
+# exempted itself from the lane it gates. It was a leak wearing the costume of
+# a fix.
+#
+# So the patterns below match SHAPES wherever a shape works. `ADR-[0-9]+`,
+# `GAP-[0-9]{3}` and `main @ <sha>` name no record, no ticket and no branch.
+# `ADR-[0-9]+` and `GAP-[0-9]+` name no decision and no ticket. The only
+# literals that remain are ones this repository's published history already
+# carries, so the file discloses nothing that a `git log` does not.
+#
+# THREE SHAPES WERE TRIED AND WITHDRAWN, because a gate that cries wolf gets
+# silenced, and a silenced gate is the one that misses the real thing:
+#   `-plane`     — this SDK's own vocabulary says event plane, consent plane,
+#                  analytics plane. Narrowed to `control-plane`, the one that
+#                  is a service.
+#   `-platform`  — fired on "per-platform" and "cross-platform". Dropped; the
+#                  only internal `-platform` name appears in zero commits here.
+#   `-service`   — fired on "self-service". Replaced by the two service names
+#                  this repository's own history already carries, which is
+#                  the rule the whole list follows.
+#
+# ⚠ THE GAP THAT LEAVES, NAMED RATHER THAN IMPLIED: a service name that has
+# never appeared here would not be caught, and this repository is outside the
+# org-wide check that would catch it (it enumerates PRIVATE candidates). Until
+# that check covers already-public repositories, a NEW internal name reaching
+# this tree is caught by review or not at all.
+#   `[0-9a-f]{40}` — fired on a legitimate pinned engine sha1 in CI. Narrowed
+#                  to `main @ <sha>`, which is the shape that actually leaked.
+# Each withdrawal is a real gap, and each is why the innocent half of the
+# self-test exists: re-broadening any of them fails the run instead of
+# producing noise somebody turns off. Shapes are chosen against THIS tree's
+# prose, not in the abstract.
+#
+# The cost is stated rather than hidden: a single-word internal name with no
+# structural tell (a bare codename, a one-word service) is NOT matched, and
+# the shape patterns will occasionally fire on innocent prose. A false
+# positive here is a sentence to reword. A false negative is a publication.
+#
+# ── SCOPE, STATED SO A PASS IS NOT READ AS MORE THAN IT IS ──────────────────
 # LANE A is GATED at zero: every tracked file that is not Go source.
 # LANE B is REPORTED, NOT GATED: Go source (*.go). Those comments are owned by
-#   another workstream (the SDK wire freeze) and editing them here would collide
-#   with it. Lane B prints its count on every run so the debt stays visible
-#   instead of being implied away by lane A's green.
+#   another workstream (the SDK wire freeze) and editing them here would
+#   collide with it. Lane B prints its count on every run so the debt stays
+#   visible instead of being implied away by lane A's green.
 # Neither lane looks at git HISTORY. Deleting a line does not unpublish the
 # commit that carried it.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-# One pattern list, used by both lanes — two spellings is how the second lane
-# comes to check something different from the first.
-PATTERNS='ADR-[0-9]+|control[-_ ]plane|analytics[-_ ]service|crash[-_ ]symbolicator|metadata[-_ ]api|admin[-_ ]service|work[-_ ]service|ai[-_ ]platform|admindoor|dbmigrate|shardpilot/(docs|qa|infra|integrations|console|marketing-site|design-system|admin-console|billing-service|status-page)|[Pp]roject[-_ ][Tt]ower|thunderstrike|shepherd-pr|verification-discipline|Codex (review|#|unity#|unreal#|godot#|defold#|go#)'
+# One pattern list, used by both lanes and by the self-test — two spellings is
+# how the second consumer comes to check something different from the first.
+PATTERNS='ADR-[0-9]+|§[0-9]|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|analytics[-_ ]service|crash[-_ ]symbolicator|control[-_ ]plane|shardpilot/(docs|qa|infra|integrations)|[Pp]roject[-_ ][Tt]ower|shepherd-pr|verification-discipline|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 
-# Prove the matcher before trusting a clean result: a regex that matches
-# nothing reports every repository clean, and prints the same line as a pass.
-SELFTEST='per ADR-0221 §3
+# Files the gate must not read as content: this script is the one place the
+# patterns are written down, by construction.
+is_exempt() { [ "$1" = "scripts/check_public_surface.sh" ]; }
+
+# ---------------------------------------------------------------------------
+# scan_tree <root> — runs the REAL scan over one checkout and sets the globals
+# below. Factored out so the self-test can exercise THE SCAN, not just the
+# regex. The first draft self-tested the regex alone, which cannot detect a
+# broken file list or a broken grep invocation — and a broken file list is the
+# failure that reports a repository clean by scanning nothing.
+# ---------------------------------------------------------------------------
+scan_lane_a=""      # "path:line:text" per hit, newline separated
+scan_lane_b_files=0
+scan_lane_b_lines=0
+scan_files=0
+
+scan_tree() {
+  local root="$1" f hits status prefix line
+  scan_lane_a=""; scan_lane_b_files=0; scan_lane_b_lines=0; scan_files=0
+
+  # `git ls-files -z` and PROCESS substitution, not a heredoc. A command
+  # substitution used as a heredoc body is invisible to `set -e` and to
+  # `pipefail`: if git fails, the list is empty, the loop never runs, and the
+  # gate reports clean and exits 0. `-z` additionally defeats core.quotePath,
+  # which C-quotes any path holding a non-ASCII byte, a newline, a backslash
+  # or a quote — such a path arrives as the literal `"caf\303\251.md"`, fails
+  # `[ -f ]`, and is skipped in silence.
+  #
+  # NOT `files=$(git ls-files -z)`: bash discards NUL bytes in a command
+  # substitution, so that form loses every delimiter and `read -d ''` never
+  # terminates a field. It scans zero files on a HEALTHY repository, which is
+  # the same fail-open unconditionally.
+  while IFS= read -r -d '' f; do
+    is_exempt "$f" && continue
+    # -h: a symlink's published blob content IS its target path, so read the
+    # link rather than skipping it or following it out of the checkout.
+    if [ -L "$root/$f" ]; then
+      hits="$(readlink "$root/$f" | grep -nE -- "$PATTERNS" || true)"
+      [ -n "$hits" ] && scan_lane_a="${scan_lane_a}${f}:symlink-target:$(readlink "$root/$f")"$'\n'
+      scan_files=$((scan_files + 1))
+      continue
+    fi
+    [ -f "$root/$f" ] || continue
+    scan_files=$((scan_files + 1))
+    # -a treats a NUL-bearing file as text: GNU grep >= 3.5 otherwise prints
+    # "binary file matches" to STDERR and nothing to stdout, so a hit inside a
+    # committed binary reads as a clean file.
+    #
+    # ⚠ AND THE FIXTURE FOR THIS ONLY FAILS UNDER THE CI GREP. Dropping -a
+    # here was mutation-tested twice: under GNU grep 3.11 (ubuntu-latest, what
+    # CI runs) the NUL fixture correctly goes unmatched and the self-test
+    # refuses; on the machine this was written on, where `grep` resolves to
+    # ugrep 7.5.0, the same mutation passed green. A local green is not
+    # evidence for this line — run it in the CI image.
+    # -- ends option parsing: a tracked path beginning with `-` is otherwise
+    # parsed as option letters.
+    # The exit status is TRICHOTOMOUS and all three are handled: 0 = matched,
+    # 1 = no match, >=2 = grep ERROR. Collapsing 2 into 1 (the `|| true` the
+    # first draft used) turns every unreadable file into a clean one.
+    # `| tr -d '\000'` and the explicit `exit`: bash prints
+    # "warning: command substitution: ignored null byte in input" for every NUL
+    # that reaches a substitution, once per matching binary, straight into CI's
+    # log. Stripping it inside the subshell removes the noise; `exit
+    # "${PIPESTATUS[0]}"` carries GREP's status out, because the status of the
+    # assignment itself would be tr's and tr always succeeds.
+    set +e
+    hits="$(grep -anE -- "$PATTERNS" "$root/$f" 2>/dev/null | tr -d '\000'; exit "${PIPESTATUS[0]}")"
+    status=$?
+    set -e
+    if [ "$status" -ge 2 ]; then
+      echo "REFUSING: grep could not read '$f' (exit $status)." >&2
+      echo "  An unreadable file is an UNSCANNED file, and this gate must not" >&2
+      echo "  report a repository clean on the strength of one." >&2
+      exit 2
+    fi
+    [ "$status" -ne 0 ] && continue
+    case "$f" in
+      *.go)
+        scan_lane_b_files=$((scan_lane_b_files + 1))
+        while IFS= read -r line; do
+          [ -n "$line" ] && scan_lane_b_lines=$((scan_lane_b_lines + 1))
+        done <<< "$hits"
+        ;;
+      *)
+        # No `sed "s|^|$f:|"`: the filename lands in the s-command's delimiter
+        # position, so a `|` in a path is a syntax error that aborts the run
+        # with exit 1 — the same code a genuine finding uses.
+        while IFS= read -r line; do
+          [ -n "$line" ] && scan_lane_a="${scan_lane_a}${f}:${line}"$'\n'
+        done <<< "$hits"
+        ;;
+    esac
+  done < <(cd "$root" && git ls-files -z)
+
+  prefix=""  # keeps shellcheck from flagging the unused local
+  : "$prefix"
+}
+
+# ---------------------------------------------------------------------------
+# SELF-TEST — proves the MATCHER and THE SCAN, on a throwaway git repository.
+# A clean result means nothing until the thing producing it has been shown to
+# fail, and "the patterns compile" is not that demonstration.
+# ---------------------------------------------------------------------------
+KNOWN_INTERNAL='per ADR-0221 §3
+a bare §7c left behind by a citation strip
+tracked as GAP-075 internally
 the control-plane assignment endpoint
 pinned to analytics-service main @ 7d118c5
 see shardpilot/docs for context
 Project Tower-specific event names
 the shepherd-pr skill
-(Codex go#48 round 3)'
-selftest_misses=0
-while IFS= read -r line; do
-  [ -z "$line" ] && continue
-  if ! printf '%s\n' "$line" | grep -qE "$PATTERNS"; then
-    printf 'SELFTEST MISS: %s\n' "$line" >&2
-    selftest_misses=$((selftest_misses + 1))
-  fi
-done <<EOF
-$SELFTEST
+the verification-discipline references
+(Codex go#48 round 3)
+INGEST_CONSENT_KIND_MODE=off'
+KNOWN_INNOCENT='go get github.com/shardpilot/shardpilot-go@v0.6.0-alpha
+IngestURL: os.Getenv("SHARDPILOT_INGEST_URL")
+POST {IngestURL}/v1/events:batch
+https://localhost:8080 during local development
+a documented per-platform adaptation, not drift
+DEFOLD_SHA1="f735c12192bf95684e6ae1ae27c400b8170fc6d8"
+a self-service signup flow, a micro-service boundary
+the event plane and the consent plane are separate
+an analytics-plane request, zero event batches'
+
+selftest() {
+  local line misses=0 falses=0 tested=0 innocent=0 tmp scanned_a
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    tested=$((tested + 1))
+    printf '%s\n' "$line" | grep -qE -- "$PATTERNS" || {
+      printf 'SELFTEST MISS: %s\n' "$line" >&2; misses=$((misses + 1)); }
+  done <<EOF
+$KNOWN_INTERNAL
 EOF
-if [ "$selftest_misses" -ne 0 ]; then
-  echo "REFUSING: the pattern list failed its own self-test ($selftest_misses miss(es))." >&2
-  echo "  A scan that cannot match known-internal strings would report this" >&2
-  echo "  repository clean by finding nothing. Fix the patterns, not the test." >&2
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    innocent=$((innocent + 1))
+    if printf '%s\n' "$line" | grep -qE -- "$PATTERNS"; then
+      printf 'SELFTEST FALSE POSITIVE: %s\n' "$line" >&2; falses=$((falses + 1))
+    fi
+  done <<EOF
+$KNOWN_INNOCENT
+EOF
+  if [ "$misses" -ne 0 ] || [ "$falses" -ne 0 ]; then
+    echo "REFUSING: the pattern list failed its own self-test ($misses miss(es), $falses false positive(s))." >&2
+    echo "  A scan that cannot match known-internal strings would report this" >&2
+    echo "  repository clean by finding nothing, and print the same line as a pass." >&2
+    exit 2
+  fi
+
+  # THE SCAN ITSELF, over a fixture whose expected answer is known. This is the
+  # half the first draft did not have: the regex can be perfect while the file
+  # list is empty, and only this catches that.
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  (
+    cd "$tmp"
+    git init -q .
+    git config user.email t@t; git config user.name t
+    printf 'clean customer prose\n' > clean.md
+    printf 'see ADR-0221 for context\n' > dirty.md
+    printf '// GAP-075 note\npackage x\n' > lane_b.go
+    printf 'internal: control-plane\n' > "café.md"   # C-quoted by git ls-files
+    printf 'x\0see ADR-0999 here\n' > binary.bin      # NUL: "binary" to grep
+    git add -A >/dev/null 2>&1
+  )
+  scan_tree "$tmp"
+  scanned_a="$scan_lane_a"
+  rm -rf "$tmp"; trap - RETURN
+
+  local fixture_fail=0
+  printf '%s' "$scanned_a" | grep -q '^dirty\.md:' || {
+    echo "SELFTEST: the scan missed dirty.md" >&2; fixture_fail=1; }
+  printf '%s' "$scanned_a" | grep -q 'caf' || {
+    echo "SELFTEST: the scan missed the non-ASCII path (core.quotePath)" >&2; fixture_fail=1; }
+  printf '%s' "$scanned_a" | grep -q '^binary\.bin:' || {
+    echo "SELFTEST: the scan missed the NUL-bearing file (grep -a)" >&2; fixture_fail=1; }
+  printf '%s' "$scanned_a" | grep -q '^clean\.md:' && {
+    echo "SELFTEST: the scan flagged clean.md" >&2; fixture_fail=1; }
+  [ "$scan_lane_b_files" -eq 1 ] || {
+    echo "SELFTEST: lane B counted $scan_lane_b_files files, expected 1" >&2; fixture_fail=1; }
+  if [ "$fixture_fail" -ne 0 ]; then
+    echo "REFUSING: the scan failed its own fixture." >&2
+    exit 2
+  fi
+  echo "self-test: OK — $tested known-internal string(s) matched, $innocent innocent string(s) passed, scan fixture 5/5"
+}
+
+selftest
+
+# ---------------------------------------------------------------------------
+# THE REAL SCAN
+# ---------------------------------------------------------------------------
+scan_tree "$PWD"
+
+# An empty file list is the shape of every fail-open above, and it is the ONE
+# symptom they all share — so it is checked directly rather than only through
+# the exit status of the command that produced it.
+if [ "$scan_files" -eq 0 ]; then
+  echo "REFUSING: the scan processed zero files." >&2
+  echo "  A real checkout is never empty, so this means git ls-files failed or" >&2
+  echo "  this is not a checkout. Reporting 'clean' here would be a gate that" >&2
+  echo "  passes by looking at nothing." >&2
   exit 2
 fi
-echo "matcher self-test: OK (7/7 known-internal strings matched)"
-
-lane_a_hits=""
-lane_b_files=0
-lane_b_hits=0
-
-while IFS= read -r f; do
-  [ -f "$f" ] || continue
-  case "$f" in
-    scripts/check_public_surface.sh) continue ;;  # this file names them on purpose
-  esac
-  hits="$(grep -nE "$PATTERNS" "$f" 2>/dev/null || true)"
-  [ -z "$hits" ] && continue
-  case "$f" in
-    *.go)
-      lane_b_files=$((lane_b_files + 1))
-      lane_b_hits=$((lane_b_hits + $(printf '%s\n' "$hits" | grep -c '' )))
-      ;;
-    *)
-      lane_a_hits="${lane_a_hits}$(printf '%s\n' "$hits" | sed "s|^|${f}:|")
-"
-      ;;
-  esac
-done <<EOF
-$(git ls-files)
-EOF
 
 echo
-echo "LANE B (REPORTED, NOT GATED) — Go source: ${lane_b_files} file(s), ${lane_b_hits} line(s)."
-if [ "$lane_b_files" -eq 0 ]; then
+echo "LANE B (REPORTED, NOT GATED) — Go source: ${scan_lane_b_files} file(s), ${scan_lane_b_lines} matching line(s)."
+if [ "$scan_lane_b_files" -eq 0 ]; then
   echo "  LANE B IS EMPTY. The debt this lane tracked is paid: fold *.go into lane A"
   echo "  and delete this section, so the scope note stops describing a gap that"
   echo "  no longer exists."
 else
-  echo "  These are doc comments that publish verbatim to pkg.go.dev. They are owed"
-  echo "  work, not accepted risk, and they are not gated HERE because this"
-  echo "  repository's Go sources are owned by the SDK wire-freeze workstream."
+  echo "  Doc comments here publish verbatim to pkg.go.dev. They are owed work, not"
+  echo "  accepted risk, and they are not gated HERE because this repository's Go"
+  echo "  sources are owned by the SDK wire-freeze workstream. The count is lines"
+  echo "  MATCHING THE PATTERNS ABOVE — not a total of internal material, which the"
+  echo "  scope note above says these shapes cannot bound."
 fi
 
 echo
-if [ -n "$(printf '%s' "$lane_a_hits" | tr -d '[:space:]')" ]; then
+if [ -n "$scan_lane_a" ]; then
   echo "FAIL — internal material in the published non-source surface:" >&2
-  printf '%s' "$lane_a_hits" >&2
+  printf '%s' "$scan_lane_a" >&2
   exit 1
 fi
-echo "LANE A (GATED) — non-source tracked files: clean."
+echo "LANE A (GATED) — non-source tracked files: clean (${scan_files} file(s) scanned)."
