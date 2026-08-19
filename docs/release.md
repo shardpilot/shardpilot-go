@@ -34,9 +34,13 @@ v1.
    `scripts/check_release_consistency.sh --release` additionally asserts the
    tag exists — run it at the tagged commit before publishing the Release.
 
-Tags and GitHub Releases are cut only by a maintainer, and only from a
-commit that has passed the release-consistency job above. A tag is not
-reversible: see "Bad versions".
+**A tag and a GitHub Release require explicit release authorization, and must
+not be cut without it.** The requirement is unchanged; what changed is that
+this file no longer cites the internal decision record it comes from, which
+named a repository a reader outside ShardPilot cannot open.
+
+The reason the requirement exists is in the next section: a tag is not
+reversible. Cutting one is the only irreversible step in this procedure.
 
 ## Bad versions
 

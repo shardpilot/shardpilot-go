@@ -85,7 +85,7 @@ scan_lane_b_lines=0
 scan_files=0
 
 scan_tree() {
-  local root="$1" f hits status prefix line
+  local root="$1" f hits status line list
   scan_lane_a=""; scan_lane_b_files=0; scan_lane_b_lines=0; scan_files=0
 
   # `git ls-files -z` and PROCESS substitution, not a heredoc. A command
@@ -100,8 +100,30 @@ scan_tree() {
   # substitution, so that form loses every delimiter and `read -d ''` never
   # terminates a field. It scans zero files on a HEALTHY repository, which is
   # the same fail-open unconditionally.
+  # The list is MATERIALISED with an explicit status check, not streamed from a
+  # process substitution. A substitution's exit status is unreachable, so a
+  # producer that emits SOME paths and then fails — an index or I/O error part
+  # way through enumeration — hands over a short list that the zero-files
+  # refusal below cannot see. Measured: a producer emitting one path then
+  # exiting 1 yields one scanned file and a green run.
+  list="$(mktemp)"
+  if ! (cd "$root" && git ls-files -z) > "$list"; then
+    rm -f "$list"
+    echo "REFUSING: git ls-files failed in '$root'." >&2
+    echo "  A partial or absent file list is an UNSCANNED repository, and this" >&2
+    echo "  gate must not report one clean." >&2
+    exit 2
+  fi
+
   while IFS= read -r -d '' f; do
     is_exempt "$f" && continue
+    # THE PATH ITSELF IS PUBLISHED CONTENT. An internal identifier in a file
+    # NAME — a decision-record id, a ticket, a service name in a directory —
+    # reaches every consumer and appears in no file's body, so scanning only
+    # contents misses it entirely.
+    if printf '%s\n' "$f" | grep -qE -- "$PATTERNS"; then
+      scan_lane_a="${scan_lane_a}${f}:path:${f}"$'\n'
+    fi
     # -h: a symlink's published blob content IS its target path, so read the
     # link rather than skipping it or following it out of the checkout.
     if [ -L "$root/$f" ]; then
@@ -160,10 +182,8 @@ scan_tree() {
         done <<< "$hits"
         ;;
     esac
-  done < <(cd "$root" && git ls-files -z)
-
-  prefix=""  # keeps shellcheck from flagging the unused local
-  : "$prefix"
+  done < "$list"
+  rm -f "$list"
 }
 
 # ---------------------------------------------------------------------------
@@ -228,6 +248,7 @@ EOF
     git init -q .
     git config user.email t@t; git config user.name t
     printf 'clean customer prose\n' > clean.md
+    printf 'nothing internal in the body\n' > ADR-0999-notes.md   # hit is the NAME
     printf 'see ADR-0221 for context\n' > dirty.md
     printf '// GAP-075 note\npackage x\n' > lane_b.go
     printf 'internal: control-plane\n' > "café.md"   # C-quoted by git ls-files
@@ -245,6 +266,8 @@ EOF
     echo "SELFTEST: the scan missed the non-ASCII path (core.quotePath)" >&2; fixture_fail=1; }
   printf '%s' "$scanned_a" | grep -q '^binary\.bin:' || {
     echo "SELFTEST: the scan missed the NUL-bearing file (grep -a)" >&2; fixture_fail=1; }
+  printf '%s' "$scanned_a" | grep -q '^ADR-0999-notes\.md:path:' || {
+    echo "SELFTEST: the scan missed an internal identifier in a PATH NAME" >&2; fixture_fail=1; }
   printf '%s' "$scanned_a" | grep -q '^clean\.md:' && {
     echo "SELFTEST: the scan flagged clean.md" >&2; fixture_fail=1; }
   [ "$scan_lane_b_files" -eq 1 ] || {
@@ -253,7 +276,7 @@ EOF
     echo "REFUSING: the scan failed its own fixture." >&2
     exit 2
   fi
-  echo "self-test: OK — $tested known-internal string(s) matched, $innocent innocent string(s) passed, scan fixture 5/5"
+  echo "self-test: OK — $tested known-internal string(s) matched, $innocent innocent string(s) passed, scan fixture 6/6"
 }
 
 selftest
