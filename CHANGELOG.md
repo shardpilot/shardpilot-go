@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **Documentation-only: internal ShardPilot material removed from the published tree, and a
+  gate added so it does not come back.** No API, wire format or behaviour changes.
+
+  This repository is public, so every tracked byte is published. Two internal agent skills
+  under `.claude/skills/` were tracked here and described ShardPilot's own review process and
+  backend stack; they are gone — and the gate below is why this note does not name them.
+  Internal decision-record ids, internal
+  service names, an internal commit sha and internal deployment state have been removed from
+  `README.md`, this changelog, `docs/release.md` and the customer integration skill — the
+  engineering content each one annotated stays, restated so a reader outside ShardPilot can
+  act on it.
+
+  Two things this deliberately does NOT claim. It does not unpublish the history: removing a
+  file at HEAD leaves every commit that carried it, and this repository has been public
+  throughout. And it does not cover Go source: `scripts/check_public_surface.sh` gates the
+  non-source surface at zero and separately REPORTS the remaining doc-comment hits in `*.go`
+  on every run, because those are owned by another workstream. A green run means lane A is
+  clean, and the report line is what lane B still owes.
+
 - **`FlushInterval` now defaults to 15s (was 1s).** BEHAVIOUR CHANGE for integrations that
   never set it: a PARTIAL batch can now wait up to 15s before it is published, instead of up
   to 1s.
@@ -75,9 +94,9 @@
   - A malformed value (free text, email, IP, JWT, raw `user_`/`player_`/`device_` id, or over
     512 bytes) drops the field only — never the crash report.
 
-- Dark Phase-D crash-capture opt-ins in `pkg/crash` (ADR-0297 §7d; both default `false` —
+- Dark phase-D crash-capture opt-ins in `pkg/crash` (both default `false` —
   while off zero new code paths execute and the auto-captured wire shape is byte-identical;
-  enabling is gated by the platform's Phase-D arming order on the SDK's consent gate + durable
+  enabling is gated by the service-side arming order on the SDK's consent gate + durable
   crash spool landing first):
   - `ClientOptions.DebugIDFillEnabled` — the running binary's self-module on every
     auto-captured event: executable base name + `debug_id` self-read from the binary (ELF GNU
@@ -92,8 +111,8 @@
     (64 threads / 256 total frames, ≤16 frames per non-crashing goroutine).
 - Dark opt-in experiment-assignment consumer (`Config.ExperimentsEnabled`, default `false` —
   while off ZERO experiment code paths execute and nothing new touches the wire or the disk;
-  ADR-0259 SDK leg, defold#35 canonical semantics ported to Go idiom):
-  - `FetchExperimentAssignment(ctx, key, attributes)` against the control-plane assignment
+  the same semantics the other ShardPilot SDKs carry, in Go idiom):
+  - `FetchExperimentAssignment(ctx, key, attributes)` against the assignment
     endpoint (`RemoteConfigURL` host, path-swapped; publishable `APIKey` bearer): full verdict
     parsing (assigned / the three not-assigned shapes distinguished by `reason` — absent,
     `kill_switch`, `targeting_unmatched`; unknown reasons are malformed), strict verdict-shape
@@ -134,15 +153,15 @@
     distinct id — while the automatic arm-0 emission is still owed, both facts emit; owed
     emissions ride bounded FIFO snapshots swept by the lane and once more at `Close` after the
     flush frees room, with owed durable syncs retried before teardown. NOTE: the producer lane
-    is dark end-to-end today — the analytics service rejects these event names from publishable
-    client keys until the platform's producer-lane decision lands.
+    is dark end-to-end today — the ingest service rejects these event names from publishable
+    client keys until the lane is enabled for the workspace.
   - `ExperimentVariant`/`ExperimentVariantPayload` cached-variant getters (consent- and
     latch-gated, deep-copied payloads). New errors: `ErrExperimentsNotConfigured`,
     `ErrExperimentNoAssignment`, `ErrExperimentFactUnavailable`, `ErrInvalidExperimentFact`.
 - Dark opt-in remote-config targeting-attribute pass-through
   (`Config.RemoteConfigAttributesEnabled`, default `false` — while off the fetch URL is
   byte-identical to today's attribute-less path and `SetRemoteConfigAttributes` is inert;
-  ADR-0310 SDK leg):
+  the remote-config leg):
   - `SetRemoteConfigAttributes(map[string]string)` stores the client's targeting attribute
     set (`nil`/empty clears); enabled fetches append it to the `GET /config/v1/...` request
     as sorted, percent-escaped query parameters so server-side delivery rules can target
@@ -611,7 +630,7 @@
 - Every `events:batch` publish now declares the ingest envelope schema-set revision this
   SDK build was coordinated against via the `X-ShardPilot-Schema-Revision` request header
   (`DefaultSchemaRevision` — the digest of the ingest service's embedded schema set,
-  currently pinned to analytics-service `main` @ `7d118c5`). The header rides on the batch
+  pinned to the schema set this SDK build was released against). The header rides on the batch
   route ONLY — the consent route never carries it — and is provably inert while the ingest
   service's schema-revision handshake runs in its default `off` mode (the header is neither
   read nor echoed there); it arms the server-side staleness alarm for the future `log` /

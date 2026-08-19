@@ -1,7 +1,7 @@
 # Release
 
 The ShardPilot Go SDK is published as semver git tags plus a GitHub Release
-per tag (currently `v0.4.0-alpha`). There is no packaging step: Go modules
+per tag. There is no packaging step: Go modules
 resolve `go get github.com/shardpilot/shardpilot-go@vX.Y.Z` directly off the
 git tag. The SDK carries no in-code version constant, so the version surfaces
 that must agree are the README's Installation section, `CHANGELOG.md`, and
@@ -34,8 +34,9 @@ v1.
    `scripts/check_release_consistency.sh --release` additionally asserts the
    tag exists — run it at the tagged commit before publishing the Release.
 
-Tags and GitHub Releases require explicit release authorization per
-ADR-0161 in `shardpilot/docs` — do not tag or publish without it.
+Tags and GitHub Releases are cut only by a maintainer, and only from a
+commit that has passed the release-consistency job above. A tag is not
+reversible: see "Bad versions".
 
 ## Bad versions
 

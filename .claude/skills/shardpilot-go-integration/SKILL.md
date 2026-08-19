@@ -367,7 +367,7 @@ speed := client.RemoteConfigNumber("scroll_speed", 1.0)
   clears the config cache — configuration is client-public tuning, not
   telemetry. `RemoteConfigCachePath` works without `SpoolDir` and never
   enables consent persistence.
-- **Targeting attributes are dark and opt-in (ADR-0310)** — and, unlike the
+- **Targeting attributes are dark and opt-in** — and, unlike the
   fetch itself, granted-only: `RemoteConfigAttributesEnabled: true` plus
   `SetRemoteConfigAttributes(map[string]string)` makes fetches carry the
   experiment attribute vocabulary (`geo`, `app_version`, `device_type`,
@@ -423,12 +423,12 @@ crashClient, err := crash.NewClient(crash.ClientOptions{
   crash ingest is API-key authenticated, so a client-asserted account id is
   unverified and never becomes the actor key. A malformed value drops the
   field, never the report.
-- **Two auto-capture opt-ins, both DARK by default** (ADR-0297 §7d — while off
-  the auto-captured wire shape is byte-identical, and manual `Emit`/`EmitFatal`
-  events are never touched by either). Both carry the same Phase-D arming
-  order (§12): enable them only after this SDK's client-side consent gate and
-  durable spool are in place — new capture detail must not ship ahead of
-  consent parity:
+- **Two auto-capture opt-ins, both DARK by default** (while off the
+  auto-captured wire shape is byte-identical, and manual `Emit`/`EmitFatal`
+  events are never touched by either). Both carry the same arming order:
+  enable them only after this SDK's client-side consent gate and durable
+  spool are in place — new capture detail must not ship ahead of consent
+  parity:
   - `ClientOptions.DebugIDFillEnabled` attaches the RUNNING BINARY's identity as
     the event's single `modules[]` entry — base name plus a debug id read from
     the binary (ELF GNU build-id as lowercase hex, the identity `dump_syms`

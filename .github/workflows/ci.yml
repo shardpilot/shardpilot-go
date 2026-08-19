@@ -54,3 +54,17 @@ jobs:
 
       - name: Version consistency (README latest tag == CHANGELOG head == skill pin)
         run: ./scripts/check_release_consistency.sh
+
+  public-surface:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # This repository is already public, so it is NOT in the org's
+      # publication-candidate list and nothing else scans it. See the script's
+      # header for what the two lanes do and do not cover.
+      - name: No internal material in the published non-source surface
+        run: ./scripts/check_public_surface.sh
