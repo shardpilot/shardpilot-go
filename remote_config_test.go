@@ -2175,6 +2175,14 @@ func TestRemoteConfigAttributesHoldWhileGrantReceiptPending(t *testing.T) {
 	released.SetRemoteConfigAttributes(map[string]string{"geo": "US"})
 	released.SetConsent(true)
 	_ = released.Track(context.Background(), Event{Name: "receipt_dispatch_probe"})
+	// Track only ENQUEUES; the worker dispatches. Without this the fetch below
+	// races the dispatch and intermittently observes the gate still armed —
+	// reproducible under -race, which is what surfaced it. Flush is the
+	// synchronous join: it hands the worker a request and waits for its reply,
+	// so on return the receipt has actually gone out.
+	if err := released.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
 	if query := fetchQuery(t, released); query != "geo=US" {
 		t.Fatalf("a dispatched grant receipt must release attributes, got query %q", query)
 	}
