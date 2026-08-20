@@ -8,7 +8,7 @@ description: Use when integrating the ShardPilot Go SDK (shardpilot-go) into a G
 This skill is written against `main`, which is AHEAD of it.
 The pinned release tag `v0.6.1-alpha` is what an install actually gets. That tag is `v0.6.0-alpha` with two internal
 agent skills deleted and no Go source difference between them, so behavioural
-claims verified against `v0.6.0-alpha`'s source hold at the pin — **with two
+claims verified against `v0.6.0-alpha`'s source hold at the pin — **with THREE
 exceptions, marked *(unreleased)* where they appear below**:
 `Config.DisableRequestCompression`, which does not exist at the tag; the
 15-second `FlushInterval` default, which is 1 second there; and the independent

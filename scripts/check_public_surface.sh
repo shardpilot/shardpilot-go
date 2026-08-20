@@ -407,6 +407,26 @@ EOF
 $(grep -oE 'shardpilot/[a-z][a-z-]*' "$0" | sort -u)
 EOF
 
+  # ⚠ AND DECISION-RECORD IDS, for the same reason and with the same history.
+  # The exemption skips this whole file, so a comment or a diagnostic added
+  # here publishes whatever it names. That is not hypothetical: a live ADR id
+  # sat in a self-test fixture in this file, under a paragraph asserting every
+  # fixture was synthetic. Only the two reserved synthetic ids are admissible;
+  # anything else is a real record being published by the gate against
+  # publishing them.
+  while IFS= read -r lit; do
+    [ -n "$lit" ] || continue
+    case "$lit" in
+      ADR-0000|ADR-0999) continue ;;
+    esac
+    printf 'PROSE VIOLATION: %s is a real decision-record id written in this file.\n' "$lit" >&2
+    printf '  Use ADR-0000 or ADR-0999 in fixtures and prose; a shape is exercised\n' >&2
+    printf '  just as well by a reserved id, and this file publishes what it names.\n' >&2
+    novel=$((novel + 1))
+  done <<EOF
+$(grep -oE 'ADR-[0-9]+' "$0" | sort -u)
+EOF
+
   rm -f "$found"
   if [ "$novel" -ne 0 ]; then
     echo "REFUSING: the roster introduces $novel internal name(s) this public" >&2
