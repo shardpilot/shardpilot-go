@@ -362,14 +362,14 @@ func applyRemoteConfig(cache *rcCache, resp remoteConfigResponse, nowMS int64) (
 		if !resp.bodyIncomplete && len(resp.body) <= rcMaxBodyBytes {
 			if values, version, hasVersion, ok := parseRemoteConfigBody(string(resp.body)); ok {
 				return RemoteConfigResult{
-						Values:     values,
-						Version:    version,
-						HasVersion: hasVersion,
-					}, &rcCache{
-						ETag:        resp.etag,
-						Body:        string(resp.body),
-						FetchedAtMS: nowMS,
-					}, true, nil, ""
+					Values:     values,
+					Version:    version,
+					HasVersion: hasVersion,
+				}, &rcCache{
+					ETag:        resp.etag,
+					Body:        string(resp.body),
+					FetchedAtMS: nowMS,
+				}, true, nil, ""
 			}
 		}
 		result, failure = serveRemoteConfigCache(cache, "malformed_response")
@@ -382,15 +382,15 @@ func applyRemoteConfig(cache *rcCache, resp remoteConfigResponse, nowMS int64) (
 			// confirmed the cached ETag as CURRENT, so an older in-flight
 			// response must not overwrite it afterwards.
 			return RemoteConfigResult{
-					FromCache:  true,
-					Values:     values,
-					Version:    version,
-					HasVersion: hasVersion,
-				}, nil, true, &rcCache{
-					ETag:        cache.ETag,
-					Body:        cache.Body,
-					FetchedAtMS: nowMS,
-				}, ""
+				FromCache:  true,
+				Values:     values,
+				Version:    version,
+				HasVersion: hasVersion,
+			}, nil, true, &rcCache{
+				ETag:        cache.ETag,
+				Body:        cache.Body,
+				FetchedAtMS: nowMS,
+			}, ""
 		}
 		// The revalidated cache turned out unreadable: there is nothing left
 		// to serve (a 304 carries no body), so this fails rather than
