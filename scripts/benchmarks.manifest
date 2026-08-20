@@ -1,0 +1,21 @@
+# Which benchmarks are meant to exist, as `package<TAB>name`.
+#
+# scripts/run_benchmarks.sh enumerates the tree with `go test -list` and
+# compares it against this file. The comparison is what makes a DELETED
+# benchmark loud: an enumeration checked only against itself would simply
+# produce a smaller set, match everything in it, and report success.
+#
+# Adding or removing a benchmark fails CI until this file is updated in the
+# same change. That is the point — the diff here is the only place anyone
+# states that a benchmark is meant to be gone rather than accidentally
+# missing.
+#
+# Regenerate:
+#   go test -list '^Benchmark' ./... \
+#     | awk '/^(ok|FAIL|\?)[ \t]/ { for (i=1;i<=n;i++) print $2 "\t" names[i]; n=0; next }
+#            /^Benchmark/ { names[++n]=$1 }' | sort
+github.com/shardpilot/shardpilot-go	BenchmarkBuildBatchMapPayloads
+github.com/shardpilot/shardpilot-go	BenchmarkCompressBatchBody
+github.com/shardpilot/shardpilot-go	BenchmarkEnqueueMapPayload
+github.com/shardpilot/shardpilot-go	BenchmarkStatsCollectorAggregation
+github.com/shardpilot/shardpilot-go/pkg/crash	BenchmarkClientEmit

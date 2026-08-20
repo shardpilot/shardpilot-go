@@ -34,4 +34,8 @@ go.work.sum
 # Benchmark output — produced by scripts/run_benchmarks.sh in CI and
 # published as a step summary and an artifact. Never committed: a checked-in
 # number is a claim about whichever machine last ran it.
-bench/
+#
+# Anchored. An unanchored `bench/` matches that directory name at ANY depth, so
+# a future `internal/bench/` or `pkg/bench/` package would be silently
+# untracked — files missing from commits with no error anywhere.
+/bench/
