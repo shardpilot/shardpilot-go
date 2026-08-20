@@ -170,7 +170,9 @@ are never resolved). Optional tuning: `BatchSize` (default 25, max
 (default 15s *(unreleased — 1s at `v0.6.1-alpha`)* — the longest a PARTIAL batch waits before it is published, not
 a heartbeat: an empty batch publishes nothing, so an otherwise-silent process
 makes no requests at any value. A full `BatchSize` publishes immediately,
-`Flush()` publishes on demand, and retry pacing runs on its own clock),
+`Flush()` publishes on demand, and retry pacing runs on its own clock
+*(unreleased — at `v0.6.1-alpha` `backoffCeiling(1)` is 0, so the FIRST failure
+waits for the flush tick)*),
 `HTTPTimeout` (default 2s), `Logger`, `UserID`/`AnonymousID`
 (default actor identity), `OnBatchResult` (see verification), the
 remote-config fields (`RemoteConfigURL` + `APIKey` +
@@ -179,6 +181,10 @@ remote-config fields (`RemoteConfigURL` + `APIKey` +
 "Offline behavior / spool"), `SchemaRevision` /
 `DisableSchemaRevision` (see the facts list below), and
 `DisableRequestCompression`. The SDK itself reads no environment variables.
+
+*(This whole subsection is unreleased: `v0.6.1-alpha` has no gzip path at all —
+zero `gzip` references in `client.go` at the tag — so at the pin every body is
+sent uncompressed.)*
 
 **Request bodies over 1 KiB are gzip-compressed by default** — batch
 publishes and consent writes both. A batch body is the same envelope keys

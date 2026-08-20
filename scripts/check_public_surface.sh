@@ -211,7 +211,7 @@ scan_tree() {
     # by magic rather than by extension, because the extension is the part an
     # author controls.
     case "$(od -An -tx1 -N4 "$root/$f" 2>/dev/null | tr -d ' \n')" in
-      1f8b*|504b0304|504b0506|fd377a58|425a68*|28b52ffd|25504446|4d5a*|7f454c46)
+      1f8b*|504b0304|504b0506|fd377a58|425a68*|28b52ffd|25504446|4d5a*|7f454c46|377abcaf|52617221)
         echo "REFUSING: '$f' begins with container magic (archive, PDF or executable)," >&2
         echo "  and this gate reads files as text. Its real contents are not scanned by" >&2
         echo "  any pass here, so a clean result would say nothing about what it carries." >&2
@@ -542,7 +542,7 @@ if [ "$scan_files" -eq 0 ]; then
 fi
 
 echo
-echo "LANE B (REPORTED, NOT GATED) — Go source: ${scan_lane_b_files} file(s), ${scan_lane_b_lines} matching line(s)."
+echo "LANE B (REPORTED, NOT GATED) — Go source: ${scan_lane_b_files} file(s) WITH A MATCH, ${scan_lane_b_lines} matching line(s). Not a count of Go files scanned: a clean one is not counted here."
 if [ "$scan_lane_b_files" -eq 0 ]; then
   echo "  LANE B IS EMPTY. The debt this lane tracked is paid: fold *.go into lane A"
   echo "  and delete this section, so the scope note stops describing a gap that"
