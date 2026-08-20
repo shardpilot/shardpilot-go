@@ -18,8 +18,8 @@ jobs:
       fail-fast: false
       matrix:
         go-version:
-          - '1.24.x'
-          - '1.26.5'
+          - '1.25.x'
+          - '1.27.x'
 
     steps:
       - name: Checkout
@@ -30,6 +30,38 @@ jobs:
         with:
           go-version: ${{ matrix.go-version }}
 
+      - name: Test
+        run: go test ./...
+
+      - name: Vet
+        run: go vet ./...
+
+  # gofmt is checked ONCE, on the newest toolchain this repo tests, and
+  # deliberately NOT inside the version matrix.
+  #
+  # gofmt's output changes between Go releases: 1.27 de-indents the
+  # continuation lines of a multi-value return whose operands are composite
+  # literals, which 1.25 indents. A source file therefore cannot satisfy
+  # 1.25's gofmt and 1.27's at the same time, and running the check on every
+  # matrix leg asserts precisely that impossibility — it turned this workflow
+  # red the moment 1.27.x joined the matrix.
+  #
+  # The newest toolchain wins because that is what contributors have installed.
+  # Formatting is not a compatibility constraint: it has no bearing on what the
+  # 1.25 baseline can compile, which is what the matrix is actually for.
+  format:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.x'
+
       - name: gofmt check
         run: |
           unformatted="$(gofmt -l $(git ls-files '*.go'))"
@@ -38,33 +70,46 @@ jobs:
             exit 1
           fi
 
-      - name: Test
-        run: go test ./...
+  # The committed benchmarks, SHOWN EXECUTING. They lived in this repository
+  # unrun, which makes them a file rather than a measurement — and they rot as
+  # silently as an unrun test would.
+  #
+  # The script, not a bare `go test -bench`, because `go test -bench .` EXITS 0
+  # when it matches no benchmarks: a rename or a build tag leaves such a step
+  # green over zero measurements. The script establishes what is supposed to
+  # run, asserts each one reported, and names anything that did not.
+  #
+  # Its own job, on ONE toolchain, deliberately NOT inside the version matrix —
+  # the same shape the gofmt job above uses, for a related reason. The numbers
+  # measure this code, not the toolchain, so publishing one set per matrix leg
+  # invites a comparison between runners that nothing here controls.
+  #
+  # A job rather than a matrix leg guarded by `if: matrix.go-version == '…'`,
+  # which is how this was first written and is a trap: when the matrix moved
+  # from 1.26.5 to 1.27.x, that condition matched nothing and the benchmarks
+  # would have stopped running with the workflow still green. A check that a
+  # version bump can silently switch off is the failure this script exists to
+  # refuse; it should not be reintroduced by the way the script is invoked.
+  benchmarks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
 
-      - name: Vet
-        run: go vet ./...
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
 
-      # The committed benchmarks, SHOWN EXECUTING. They have lived in this
-      # repository unrun, which makes them a file rather than a measurement —
-      # and they rot as silently as an unrun test would.
-      #
-      # The script, not a bare `go test -bench`, because `go test -bench .`
-      # EXITS 0 when it matches no benchmarks: a rename or a build tag leaves
-      # this step green over zero measurements. It asserts every expected
-      # benchmark actually reported a result and names the ones that did not.
-      #
-      # Runs on ONE Go version. The numbers are a measurement of this code, not
-      # of the toolchain, and publishing two sets per push invites a comparison
-      # between runners that nothing here controls.
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.x'
+
       - name: Benchmarks
-        if: matrix.go-version == '1.26.5'
         run: scripts/run_benchmarks.sh bench/latest.txt
 
       # Published so the numbers are readable without opening a log, which is
       # what makes them evidence somebody can cite rather than something that
       # scrolled past.
       - name: Publish benchmark results
-        if: matrix.go-version == '1.26.5'
         run: |
           {
             echo '### Benchmarks'
@@ -75,7 +120,6 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload benchmark results
-        if: matrix.go-version == '1.26.5'
         uses: actions/upload-artifact@v4
         with:
           name: benchmarks

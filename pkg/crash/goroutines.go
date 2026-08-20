@@ -157,11 +157,34 @@ func parseGoroutineDump(dump string) []goroutineRecord {
 	return records
 }
 
-// parseGoroutineHeader matches "goroutine <id> [<state>]:" — the state may carry
+// parseGoroutineHeader matches "goroutine <id> [<state>]" — the state may carry
 // qualifiers ("chan receive, 5 minutes", "select, locked to thread").
+//
+// Anything after the state bracket is ignored, and that is load-bearing rather
+// than lenient. Go 1.27 appends the goroutine's runtime/pprof labels to the
+// header for modules built with a go 1.27+ directive:
+//
+//	goroutine 1 [running] {route: /v1/ingest, tenant: "acme-123"}:
+//
+// Two consequences, both handled by scanning to the FIRST ']' after '[' rather
+// than the last one in the line.
+//
+//   - A label VALUE may itself contain ']'. Scanning to the last ']' would then
+//     return a state like `select] {route: "/v1/items[id` — silent corruption of
+//     a field that ships as Thread.Name.
+//   - Label contents are set by the embedding application and routinely name a
+//     tenant, a route or a user. They must not ride out inside a crash report.
+//     Bounding the state at its own bracket keeps the label block out of
+//     everything this parser returns, which is the only thing that leaves here —
+//     the raw dump text is never carried into the payload.
+//
+// The trailing ':' is likewise not required. It is present on every runtime
+// version we know of, but the header is already unambiguous without it, and a
+// stricter check would have silently dropped every non-crashing thread if the
+// label block had landed after the colon instead of before it.
 func parseGoroutineHeader(line string) (id, state string, ok bool) {
 	rest, found := strings.CutPrefix(line, "goroutine ")
-	if !found || !strings.HasSuffix(rest, ":") {
+	if !found {
 		return "", "", false
 	}
 	sp := strings.IndexByte(rest, ' ')
@@ -173,11 +196,14 @@ func parseGoroutineHeader(line string) (id, state string, ok bool) {
 		return "", "", false
 	}
 	open := strings.IndexByte(rest, '[')
-	closing := strings.LastIndexByte(rest, ']')
-	if open < 0 || closing < open {
+	if open < 0 {
 		return "", "", false
 	}
-	return id, rest[open+1 : closing], true
+	closing := strings.IndexByte(rest[open+1:], ']')
+	if closing < 0 {
+		return "", "", false
+	}
+	return id, rest[open+1 : open+1+closing], true
 }
 
 // parseDumpFunctionLine extracts the function symbol from a dump call line. A

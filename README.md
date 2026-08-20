@@ -7,7 +7,7 @@
 Real, tested, working code — **early alpha**. The API is pre-v1 and may change before v1.
 
 - Two import paths: the root `shardpilot` package (analytics) and `pkg/crash` (crash reporting).
-- Module `go` directive is **1.24** (the source-compatibility baseline for SDK consumers). CI verifies both Go 1.24.x and the current toolchain (1.26.5).
+- Module `go` directive is **1.25** (the source-compatibility baseline for SDK consumers). CI verifies both Go 1.25.x and the current toolchain (1.27.x).
 - Pre-launch: ingest endpoints are reached via the local Compose stack or a deployed environment you provide; there is no public production endpoint.
 
 ## What it does
@@ -36,7 +36,7 @@ go get github.com/shardpilot/shardpilot-go@v0.6.0-alpha
 go get github.com/shardpilot/shardpilot-go@v0.5.0-alpha
 ```
 
-For analytics only, `v0.1.2` is available. **`v0.1.0` is retracted** in the module's `go.mod` (use `v0.1.2` or `v0.2.0-alpha` or later). `v0.1.2` and later require **Go 1.24+**.
+For analytics only, `v0.1.2` is available. **`v0.1.0` is retracted** in the module's `go.mod` (use `v0.1.2` or `v0.2.0-alpha` or later). `v0.1.2` requires **Go 1.24+** — it is the Go 1.24 modernization release and its `go` directive is immutable. The **1.25** baseline stated above applies to the next release and to the current `main`, not retroactively to any existing tag.
 
 ## Quick start (analytics)
 
@@ -303,7 +303,9 @@ Defaults: issuer `shardpilot`, audience `shardpilot-ingest`, lifetime 5m (equal 
 
 ## Build & test
 
-No Makefile — standard Go tooling. CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `gofmt` check, `go test ./...`, and `go vet ./...` on Go 1.24.x and 1.26.5, plus a release version-consistency check (`scripts/check_release_consistency.sh`; see [`docs/release.md`](docs/release.md)).
+No Makefile — standard Go tooling. CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `go test ./...` and `go vet ./...` on **both** Go 1.25.x (the baseline) and 1.27.x, plus a release version-consistency check (`scripts/check_release_consistency.sh`; see [`docs/release.md`](docs/release.md)).
+
+**`gofmt` is checked once, on Go 1.27.x only**, in a separate `format` job outside the version matrix. gofmt's output changes between releases — 1.27 de-indents the continuation lines of a multi-value `return` whose operands are composite literals, which 1.25 indents — so a file cannot satisfy both formatters and running the check on every matrix leg asserts an impossibility. **Format with Go 1.27's `gofmt` even if you develop against the 1.25 baseline**: 1.25's formatter will produce a diff CI rejects. This costs nothing at runtime — formatting has no bearing on what the 1.25 baseline compiles, which is what the matrix is there to prove.
 
 ```bash
 go build ./...
@@ -318,13 +320,13 @@ gofmt -l .
 - **No domain logic in core.** No product-specific event names or game/vertical fields in the universal envelope.
 - **The SDK only sends telemetry.** It performs no provider, model, GitHub, billing, or account-management write calls, and triggers no automatic actions.
 - **Fail-safe HTTP.** HTTPS required outside localhost/loopback (private-network HTTP only via explicit opt-in). No durable local queue unless the opt-in disk spool is configured (`SpoolDir`); no retry storms; the worker retains at most one failed in-memory batch.
-- The `go` directive stays at **1.24** for consumer compatibility even though CI also exercises the current toolchain.
+- The `go` directive is held deliberately below the current toolchain for consumer compatibility — **1.25** today — even though CI also exercises the current toolchain. It moves only when the SDK needs something the older baseline cannot express: 1.25 was taken for `testing/synctest`, which is available to tests written against it from here on. It did **not** retire the existing suite's real-time waits, and no test currently imports it — the retry and flush-pacing tests still run on the real clock. See the `Unreleased` entry in [`CHANGELOG.md`](CHANGELOG.md) for the measurement behind that.
 
 ## Roadmap
 
 Pre-v1; the API is explicitly unstable.
 
-- The crash actor key (`Event.AnonymousID`; `Event.SessionID` is session linkage, not the actor key), the experiment-assignment consumer, the remote-config targeting-attribute pass-through, the Phase-D crash capture opt-ins and the client-side consent floor shipped in `v0.6.0-alpha`; the changelog's `Unreleased` section is currently empty.
+- The crash actor key (`Event.AnonymousID`; `Event.SessionID` is session linkage, not the actor key), the experiment-assignment consumer, the remote-config targeting-attribute pass-through, the Phase-D crash capture opt-ins and the client-side consent floor shipped in `v0.6.0-alpha`. The changelog's `Unreleased` section now carries two entries — the `go` directive moving to 1.25, and the goroutine-dump parser tolerating Go 1.27 traceback labels — so read it before upgrading.
 - Public developer docs are planned for `docs.shardpilot.com`; that domain is not yet provisioned.
 
 `v0.3.0-alpha` (tagged) removed the game-flavored `MatchID` field from the universal `Event` envelope; carry that context in `Props["match_id"]` instead (wire payload unchanged).
