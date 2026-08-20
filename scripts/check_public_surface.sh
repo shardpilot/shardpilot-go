@@ -80,6 +80,12 @@ cd "$(dirname "$0")/.."
 # how the second consumer comes to check something different from the first.
 PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here is (no|NO) [A-Za-z]+ (harness|coverage|test|suite)|(is|are) not (tested|covered|scanned|audited|monitored)|no (automated )?(tests?|coverage|scanning|monitoring) (for|of|in)|nobody (looks|checks|monitors)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|analytics[-_ ]service|crash[-_ ]symbolicator|control[-_ ]plane|shardpilot/(docs|qa|infra|integrations)|[Pp]roject[-_ ][Tt]ower|shepherd-pr|verification-discipline|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 
+# The one legitimate collision with the `§` class, in ONE place so the scan
+# and the self-test cannot disagree about it. The first attempt put the
+# exclusion only in the scan; the innocent self-test then failed, correctly,
+# because it was testing a different rule from the one that runs.
+EXCLUDE='Apache[- ]2\.0 §|Apache License[^§]{0,40}§|LICENSE §'
+
 # Files the gate must not read as content: this script is the one place the
 # patterns are written down, by construction.
 is_exempt() { [ "$1" = "scripts/check_public_surface.sh" ]; }
@@ -168,7 +174,17 @@ scan_tree() {
     # "${PIPESTATUS[0]}"` carries GREP's status out, because the status of the
     # assignment itself would be tr's and tr always succeeds.
     set +e
-    hits="$(grep -anE -- "$PATTERNS" "$root/$f" 2>/dev/null | tr -d '\000'; exit "${PIPESTATUS[0]}")"
+    # ⚠ ONE LEGITIMATE COLLISION WITH THE `§` CLASS, AND IT RECURS.
+    # "Apache-2.0 §4(d)" is a correct public citation of a public document, and
+    # it turns up wherever a NOTICE obligation is explained — it fired three
+    # times in a sibling repository. The class exists for a DANGLING internal
+    # section: a bare `§7c` left behind when a decision-record id was stripped,
+    # naming a document the reader cannot open. Keeping the false positive
+    # would train a reader to skim § hits, which is how the real one gets
+    # waved through.
+    hits="$(grep -anE -- "$PATTERNS" "$root/$f" 2>/dev/null \
+      | grep -avE -- "$EXCLUDE" \
+      | tr -d '\000'; exit "${PIPESTATUS[0]}")"
     status=$?
     set -e
     if [ "$status" -ge 2 ]; then
@@ -224,6 +240,7 @@ https://localhost:8080 during local development
 a documented per-platform adaptation, not drift
 DEFOLD_SHA1="f735c12192bf95684e6ae1ae27c400b8170fc6d8"
 a self-service signup flow, a micro-service boundary
+Apache-2.0 §4(d) obliges a redistributor to carry the NOTICE
 the event plane and the consent plane are separate
 an analytics-plane request, zero event batches'
 
@@ -240,7 +257,8 @@ EOF
   while IFS= read -r line; do
     [ -z "$line" ] && continue
     innocent=$((innocent + 1))
-    if printf '%s\n' "$line" | grep -qE -- "$PATTERNS"; then
+    # The SAME exclusion the scan applies, so the two cannot drift.
+    if printf '%s\n' "$line" | grep -E -- "$PATTERNS" | grep -qvE -- "$EXCLUDE"; then
       printf 'SELFTEST FALSE POSITIVE: %s\n' "$line" >&2; falses=$((falses + 1))
     fi
   done <<EOF
