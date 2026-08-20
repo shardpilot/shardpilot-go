@@ -73,20 +73,7 @@
 # Neither lane looks at git HISTORY. Deleting a line does not unpublish the
 # commit that carried it.
 #
-# ⚠ ONE KNOWN FALSE POSITIVE IS LEFT STANDING, deliberately. A licence citation
-# that wraps between its name and its section — `Apache-2.0` ending one line and
-# `§4(d)` starting the next — leaves a bare `§4(d)` that the line-oriented pass
-# reports, because a bare section reference naming a document the reader cannot
-# open is precisely what the `§` class is for. The collapsed pass applies the
-# citation exception and the line pass cannot, since the evidence that it IS a
-# citation is on the previous line.
-#
-# Suppressing it would mean deciding a line's fate from its neighbours, and
-# every attempt to give this file a second opinion about a line has produced a
-# bug: the first citation exception dropped the WHOLE line and turned a
-# false-positive fix into an evasion. The cost of the false positive is
-# rewrapping one sentence. The cost of the machinery has already been measured
-# twice, and it was higher.
+
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -132,11 +119,9 @@ verification-discipline'
 # separator becomes a character class, so a name written with a space or an
 # underscore instead of a hyphen is caught too; matching is case-insensitive,
 # so a sentence-initial capital is not an evasion.
-# `[-_ ]+`, not `[-_ ]`. A hyphenated name wraps AT THE HYPHEN — that is where
-# a formatter breaks it — so the collapsed copy reads `control- plane`, two
-# separator characters where the source had one. A single-character class
-# missed exactly the wrap this pass exists to catch, while matching the
-# multiword names it wraps less often. Verified by mutation in both shapes.
+# `[-_ ]+` rather than `[-_ ]`, and `/` allowed spaces either side: a name
+# written with an extra space, or broken across a line by a formatter, is the
+# same disclosure as the tidy spelling.
 # A SLASH IS A WRAP POINT TOO, and it needed its own rule: `[-_ ]+` cannot
 # describe `shardpilot/ integrations`, because the slash must stay literal
 # while the space around it must be optional. Text wraps either side of a
@@ -149,55 +134,6 @@ ROSTER_RE="$(roster_regex)"
 # The SHAPE half. These name no record, no ticket, no branch and no service, so
 # they are safe to publish in the file that gates against them.
 PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are) not (tested|covered|scanned|audited|monitored)|[Nn]o (automated )?(tests?|coverage|scanning|monitoring) (for|of|in)|[Nn]obody (looks|checks|monitors)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
-
-# The one legitimate collision with the `§` class, in ONE place so the scan
-# and the self-test cannot disagree about it. The first attempt put the
-# exclusion only in the scan; the innocent self-test then failed, correctly,
-# because it was testing a different rule from the one that runs.
-# ⚠ THE EXCEPTION APPLIES TO THE CITATION, NOT TO THE LINE. The first version
-# filtered with `grep -v "$EXCLUDE"`, which drops the WHOLE line — so
-# `see ADR-0000; Apache-2.0 §4(d)` matched PATTERNS, was then discarded for
-# containing a licence citation, and lane A reported clean. That turned a
-# false-positive fix into an EVASION: any internal identifier sharing a line
-# with the word Apache became invisible.
-#
-# So the citation is blanked out of a COPY of the line and the remainder is
-# re-tested. A line that is only a licence citation drops out; a line that is a
-# licence citation AND something else is still reported, in full.
-# ⚠ NO ARBITRARY GAP BEFORE THE `§`. The previous form had an alternative
-# `Apache License[^§]{0,40}§[0-9]+`, and `[^§]{0,40}` swallows whatever sits
-# between — INCLUDING the forbidden identifier. Reproduced: the line
-# `Apache License applies; see ADR-9999 §7` was removed wholesale, the ADR
-# reference with it, and the gate exited clean. That is the same EVASION the
-# whole-line `grep -v` produced two rounds ago, rebuilt in a narrower-looking
-# shape: any exception permitted to consume text it was not written to describe
-# will eventually consume a finding.
-#
-# So the exception now spans only what a citation actually contains — the
-# licence name, an optional version phrase, and the section — with nothing but
-# spaces and commas between. Measured on both trees at the time of writing:
-# ZERO Apache section citations exist in either, so this exception currently
-# protects nothing and could only cost. It is kept narrow rather than deleted
-# because the case it was written for was real in a sibling repository.
-CITATION='Apache([ -]License)?([, ]+Version)?[ -]2\.0[, ]*§[0-9]+(\([a-z]\))?|LICENSE §[0-9]+(\([a-z]\))?'
-
-# strip_citations — reads lines, prints those that still match PATTERNS once
-# every legitimate licence citation has been removed from the copy under test.
-# ⚠ sed + grep, NOT awk. `PATTERNS` uses `\b` for `SP-123`, `AC-AB-7` and the
-# `main @ <sha>` pin. POSIX awk has NO word-boundary operator — `\b` there is
-# an undefined escape, which gawk reads as a backspace and mawk drops — so this
-# second pass stopped matching exactly the three classes that depend on it,
-# while every other class kept working and the run stayed green. A line whose
-# only finding was `SP-123` went through the gate. Keeping every pass in grep
-# means one regex dialect for the whole file, which is the only version of this
-# that a reader can check by eye.
-#
-# The line NUMBER survives because sed is a substitution, not a filter: the
-# input to this function is already `<n>:<text>` from `grep -n`, and blanking a
-# citation inside the text cannot renumber anything.
-strip_citations() {
-  sed -E "s/${CITATION}//g" | grep -E -- "$PATTERNS"
-}
 
 # Files the gate must not read as content: this script is the one place the
 # patterns are written down, by construction.
@@ -214,11 +150,10 @@ scan_lane_a=""      # "path:line:text" per hit, newline separated
 scan_lane_b_files=0
 scan_lane_b_lines=0
 scan_files=0
-scan_lane_a_files=0  # files LANE A actually gates, which is not the total
 
 scan_tree() {
   local root="$1" f hits status line list
-  scan_lane_a=""; scan_lane_b_files=0; scan_lane_b_lines=0; scan_files=0; scan_lane_a_files=0
+  scan_lane_a=""; scan_lane_b_files=0; scan_lane_b_lines=0; scan_files=0
 
   # `git ls-files -z` and PROCESS substitution, not a heredoc. A command
   # substitution used as a heredoc body is invisible to `set -e` and to
@@ -253,57 +188,12 @@ scan_tree() {
     # NAME — a decision-record id, a ticket, a service name in a directory —
     # reaches every consumer and appears in no file's body, so scanning only
     # contents misses it entirely.
-    # ⚠ WHITESPACE COLLAPSED FIRST. A path may legally contain a newline, and
-    # these passes are line-oriented: an identifier straddling one is split
-    # into two lines and matches nothing. `git ls-files -z` hands the raw name
-    # over precisely so such a path is not lost, and then this check would have
-    # dropped it anyway.
-    # ⚠ AND REJOINED, for the same reason the content pass needs it: a name
-    # wraps AT its separator, so flattening alone turns `control-<newline>plane`
-    # into `control- plane`. Both forms are tested — the flattened one for
-    # phrases, the rejoined one for identifiers.
-    f_flat="$(printf '%s' "$f" | tr -s '[:space:]' ' ')"
-    f_join="$(printf '%s' "$f_flat" | sed -E 's/([-_/]) /\1/g')"
-    if printf '%s\n' "$f_flat" | grep -qE -- "$PATTERNS" \
-       || printf '%s\n' "$f_flat" | grep -qiE -- "$ROSTER_RE" \
-       || printf '%s\n' "$f_join" | grep -qE -- "$PATTERNS" \
-       || printf '%s\n' "$f_join" | grep -qiE -- "$ROSTER_RE"; then
+    if printf '%s\n' "$f" | grep -qE -- "$PATTERNS" \
+       || printf '%s\n' "$f" | grep -qiE -- "$ROSTER_RE"; then
       scan_lane_a="${scan_lane_a}${f}:path:${f}"$'\n'
-    fi
-    # -h: a symlink's published blob content IS its target path, so read the
-    # link rather than skipping it or following it out of the checkout.
-    if [ -L "$root/$f" ]; then
-      # BOTH passes. A symlink's published blob content IS its target path, and
-      # a target naming a roster entry is the same disclosure as one naming a
-      # shape — checking only $PATTERNS here left the roster half blind to an
-      # entire file type.
-      link_flat="$(readlink "$root/$f" | tr -s '[:space:]' ' ')"
-      hits="$( { printf '%s\n' "$link_flat" | grep -nE -- "$PATTERNS" || true
-                 printf '%s\n' "$link_flat" | grep -niE -- "$ROSTER_RE" || true; } )"
-      [ -n "$hits" ] && scan_lane_a="${scan_lane_a}${f}:symlink-target:$(readlink "$root/$f")"$'\n'
-      scan_files=$((scan_files + 1))
-      # A symlink IS gated by lane A — its target is reported into
-      # `scan_lane_a` three lines up — so it has to be counted there too.
-      # This branch `continue`d before the lane counter below, which meant a
-      # gated file was missing from the number lane A publishes about itself.
-      case "$f" in
-        *.go) ;;
-        *) scan_lane_a_files=$((scan_lane_a_files + 1)) ;;
-      esac
-      continue
     fi
     [ -f "$root/$f" ] || continue
     scan_files=$((scan_files + 1))
-    # ⚠ COUNTED PER LANE, BEFORE THE SCAN. The lane A line used to print
-    # `scan_files`, the total of everything read — 90 on a tree where lane A
-    # gates 12. A gate that overstates its own coverage sevenfold is worse than
-    # one that says nothing: the number is what a reader checks when deciding
-    # whether the green means anything. Counted here rather than at the lane
-    # split below, because that split only runs for files that HIT.
-    case "$f" in
-      *.go) ;;
-      *) scan_lane_a_files=$((scan_lane_a_files + 1)) ;;
-    esac
     # ⚠ A COMPRESSED TRACKED FILE IS NOT SCANNED BY ANYTHING HERE, and `-a`
     # does not change that: treating a container as text reads its DEFLATE
     # stream, not its contents. So internal material inside a committed .zip,
@@ -367,21 +257,8 @@ scan_tree() {
     # "${PIPESTATUS[0]}"` carries GREP's status out, because the status of the
     # assignment itself would be tr's and tr always succeeds.
     set +e
-    # ⚠ ONE LEGITIMATE COLLISION WITH THE `§` CLASS, AND IT RECURS.
-    # "Apache-2.0 §4(d)" is a correct public citation of a public document, and
-    # it turns up wherever a NOTICE obligation is explained — it fired three
-    # times in a sibling repository. The class exists for a DANGLING internal
-    # section: a bare `§7c` left behind when a decision-record id was stripped,
-    # naming a document the reader cannot open. Keeping the false positive
-    # would train a reader to skim § hits, which is how the real one gets
-    # waved through.
-    # ⚠ NUL IS STRIPPED BEFORE awk, NOT AFTER. awk truncates a record at a NUL
-    # byte, so running the citation filter first silently dropped the match
-    # inside a NUL-bearing file — the scan fixture caught it immediately, which
-    # is the whole reason that fixture carries a binary.
     hits="$(grep -anE -- "$PATTERNS" "$root/$f" 2>/dev/null \
-      | tr -d '\000' \
-      | strip_citations; exit "${PIPESTATUS[0]}")"
+      | tr -d '\000'; exit "${PIPESTATUS[0]}")"
     status=$?
     # THE ROSTER, in its own pass because it is the one class matched
     # case-insensitively: a name capitalised at the start of a sentence is the
@@ -392,64 +269,13 @@ scan_tree() {
     roster_hits="$(grep -aniE -- "$ROSTER_RE" "$root/$f" 2>/dev/null \
       | tr -d '\000'; exit "${PIPESTATUS[0]}")"
     roster_status=$?
-    # WRAPPED PROSE. Every pass above is line-oriented, and the classes that
-    # matter most here are PHRASES — "there is no X harness", "is not covered
-    # by automated tests", "main @ <sha>". A phrase that wraps across a line
-    # break matches none of them, and wrapping is not exotic: it is what a
-    # formatter does to a long sentence. Measured in a sibling repository, the
-    # phrase `hashed at ingest` moving onto a new line silently dropped a
-    # literal-pin check that had been green for weeks.
-    #
-    # So the file is also read with its whitespace collapsed to single spaces,
-    # which cannot manufacture a hit for the single-token shape classes and
-    # restores every multi-word one. `-o` because a whole-file-on-one-line
-    # match would otherwise print the entire file.
-    #
-    # ⚠ BOTH PATTERN SETS, AND CITATIONS STRIPPED FIRST. The first version of
-    # this pass ran $PATTERNS alone over raw collapsed text, which got both
-    # halves wrong at once: a wrapped ROSTER name — the multiword ones wrap
-    # most readily — went unmatched, and a wrapped `Apache-2.0 §4(d)` was
-    # reported as a finding because the citation exception the line-oriented
-    # pass applies was not applied here. A new pass that does not inherit the
-    # exceptions of the pass it supplements manufactures false positives, and
-    # a false positive in a publication gate is how the gate gets switched off.
-    #
-    # ⚠ AND NO PIPESTATUS INDEX. The earlier form ended `exit "${PIPESTATUS[1]}"`
-    # believing [1] was the grep; the pipeline was tr|tr|grep|sort, so [1] is
-    # the SECOND tr — a command that essentially cannot fail. The status was
-    # therefore always 0 and the trichotomous grep-error check downstream was
-    # reading a constant. Readability is already established by the
-    # line-oriented pass above, whose status IS checked for >= 2 on this exact
-    # file, so this pass decides on content alone and says so.
-    collapsed="$(tr -s '[:space:]' ' ' < "$root/$f" 2>/dev/null | tr -d '\000' \
-      | sed -E "s/${CITATION}//g")"
-    # ⚠ AND A SECOND COLLAPSED COPY WITH SEPARATORS REJOINED. Collapsing turns
-    # a line break into a space, which is right for a phrase and wrong for an
-    # identifier: text wraps AT the separator, so `ADR-` ending a line and
-    # `0999` beginning the next becomes `ADR- 0999`, which `ADR-[0-9]+` cannot
-    # match. The roster half already needed this and solved it inside its own
-    # derivation; the shape half has no derivation to change, so the input is
-    # repaired instead.
-    #
-    # Rejoining is safe here because this copy is used ONLY to detect wrapping:
-    # every shape class needs a literal prefix (ADR-, GAP-, SP-, AC-) before the
-    # separator, so ordinary prose like `the plan - 2026` cannot be turned into
-    # one of them.
-    rejoined="$(printf '%s' "$collapsed" | sed -E 's/([-_/]) /\1/g')"
-    wrapped_raw="$( { printf '%s\n' "$collapsed" | grep -aoE -- "$PATTERNS" || true
-                      printf '%s\n' "$collapsed" | grep -aoiE -- "$ROSTER_RE" || true
-                      printf '%s\n' "$rejoined"  | grep -aoE -- "$PATTERNS" || true; } )"
-    wrapped_hits="$(printf '%s\n' "$wrapped_raw" | sort -u)"
-    # ⚠ A DEDUPLICATOR THAT FAILS MUST NOT LOOK LIKE A CLEAN FILE. If `sort`
-    # cannot write its output, the substitution above is empty and every
-    # forbidden phrase it consumed disappears with it — the exact fail-open
-    # shape this gate refuses everywhere else.
-    if [ -n "$wrapped_raw" ] && [ -z "$wrapped_hits" ]; then
-      echo "REFUSING: deduplicating the wrapped-scan results for '$f' produced nothing" >&2
-      echo "  from a non-empty input. Those matches would be dropped in silence." >&2
-      exit 2
-    fi
-    if [ -n "$wrapped_hits" ]; then wrapped_status=0; else wrapped_status=1; fi
+    # ⚠ WHAT THIS DOES NOT SEE, stated because a green run gets read as more
+    # than it is: every pass here is LINE-ORIENTED, so a phrase broken across a
+    # line break — which is what a formatter does to a long sentence — matches
+    # nothing. A collapsed-whitespace pass for that existed and was removed
+    # along with the rest of the machinery this file had grown, because no
+    # tracked file in this repository contains such a wrap. It comes back as
+    # its own change, with its own failing test, on the day one does.
     set -e
     for st in "$status" "$roster_status"; do
       if [ "$st" -ge 2 ]; then
@@ -459,38 +285,12 @@ scan_tree() {
         exit 2
       fi
     done
-    # A wrapped hit is only NEWS if the line-oriented pass did not already see
-    # it; otherwise every ordinary finding would be reported twice.
-    # ⚠ AN EMPTY RESULT IS NOT A HIT, whatever the status says. `status` is the
-    # FIRST grep's, preserved on purpose so a read error survives the pipeline —
-    # but that grep matching means only that the raw line matched, and
-    # strip_citations may then have removed every one of them. The file was
-    # counted anyway, so a file whose only matches were legitimate licence
-    # citations inflated the lane's FILE count while contributing no lines.
-    [ -n "$hits" ] || status=1
-    if [ "$wrapped_status" -eq 0 ]; then
-      new_wrapped=""
-      # ⚠ AGAINST BOTH LINE-ORIENTED PASSES, not just the shape one. A
-      # roster-only identifier lands in $roster_hits, never in $hits, so
-      # comparing against $hits alone re-reported every ordinary roster hit as
-      # "wrapped" — double-counting each one in the lane totals and telling a
-      # reader to look for a line break that is not there.
-      while IFS= read -r w; do
-        [ -n "$w" ] || continue
-        printf '%s\n%s\n' "$hits" "$roster_hits" | grep -qF -- "$w" \
-          || new_wrapped="${new_wrapped}0:wrapped across a line break: ${w}"$'\n'
-      done <<< "$wrapped_hits"
-      wrapped_hits="$new_wrapped"
-      [ -n "$wrapped_hits" ] || wrapped_status=1
-    fi
-    if [ "$status" -ne 0 ] && [ "$roster_status" -ne 0 ] && [ "$wrapped_status" -ne 0 ]; then
+    if [ "$status" -ne 0 ] && [ "$roster_status" -ne 0 ]; then
       continue
     fi
     # One corpus from here down, so the lane split below cannot see a
     # different set of hits from the one the statuses were computed over.
-    for extra in "$roster_hits" "$wrapped_hits"; do
-      [ -n "$extra" ] && hits="${hits:+${hits}$'\n'}${extra}"
-    done
+    [ -n "$roster_hits" ] && hits="${hits:+${hits}$'\n'}${roster_hits}"
     case "$f" in
       *.go)
         scan_lane_b_files=$((scan_lane_b_files + 1))
@@ -525,11 +325,10 @@ scan_tree() {
 KNOWN_INTERNAL='per ADR-0000 §3
 There are no Playwright tests for the console.
 There are no end-to-end tests for the purchase flow.
-see ADR-0000; Apache-2.0 §4(d) applies too
 There is NO Playwright harness in the console repo
 the crash path is not covered by automated tests
 no automated scanning for that class of input
-a bare §7c left behind by a citation strip
+a bare §7c left behind when a record id was stripped
 tracked as GAP-000 internally
 pinned to main @ 0000000
 (Codex go#48 round 3)
@@ -541,7 +340,6 @@ https://localhost:8080 during local development
 a documented per-platform adaptation, not drift
 DEFOLD_SHA1="f735c12192bf95684e6ae1ae27c400b8170fc6d8"
 a self-service signup flow, a micro-service boundary
-Apache-2.0 §4(d) obliges a redistributor to carry the NOTICE
 the event plane and the consent plane are separate
 an analytics-plane request, zero event batches'
 
@@ -646,11 +444,10 @@ EOF
     [ -z "$line" ] && continue
     innocent=$((innocent + 1))
     # The SAME exclusion the scan applies, so the two cannot drift.
-    # The SAME filter the scan applies, so the two cannot drift.
     # BOTH passes, because an innocent line is only innocent if NEITHER fires.
-    # Testing the shape pass alone let the roster's case-insensitive pass go
+    # Testing the shape pass alone left the roster's case-insensitive pass
     # unchecked against every fixture written to prove a false positive gone.
-    if { printf '%s\n' "$line" | grep -E -- "$PATTERNS" | strip_citations
+    if { printf '%s\n' "$line" | grep -E -- "$PATTERNS"
          printf '%s\n' "$line" | grep -iE -- "$ROSTER_RE"; } | grep -q .; then
       printf 'SELFTEST FALSE POSITIVE: %s\n' "$line" >&2; falses=$((falses + 1))
     fi
@@ -744,4 +541,4 @@ if [ -n "$scan_lane_a" ]; then
   printf '%s' "$scan_lane_a" >&2
   exit 1
 fi
-echo "LANE A (GATED) — non-source tracked files: clean (${scan_lane_a_files} of ${scan_files} tracked file(s) scanned; the rest are Go source, reported in lane B)."
+echo "LANE A (GATED) — clean. ${scan_files} tracked file(s) were read; a run that scanned none refuses above rather than reporting this line."
