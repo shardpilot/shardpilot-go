@@ -137,7 +137,13 @@ verification-discipline'
 # separator characters where the source had one. A single-character class
 # missed exactly the wrap this pass exists to catch, while matching the
 # multiword names it wraps less often. Verified by mutation in both shapes.
-roster_regex() { printf '%s' "$ROSTER" | sed -e 's![-_ ]![-_ ]+!g' | paste -sd'|' -; }
+# A SLASH IS A WRAP POINT TOO, and it needed its own rule: `[-_ ]+` cannot
+# describe `shardpilot/ integrations`, because the slash must stay literal
+# while the space around it must be optional. Text wraps either side of a
+# slash, so both are allowed.
+roster_regex() {
+  printf '%s' "$ROSTER" | sed -e 's![-_ ]![-_ ]+!g' -e 's!/! */ *!g' | paste -sd'|' -
+}
 ROSTER_RE="$(roster_regex)"
 
 # The SHAPE half. These name no record, no ticket, no branch and no service, so
@@ -158,7 +164,22 @@ PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here is [Nn][Oo] [A-Za-z]+ (harness|coverage|te
 # So the citation is blanked out of a COPY of the line and the remainder is
 # re-tested. A line that is only a licence citation drops out; a line that is a
 # licence citation AND something else is still reported, in full.
-CITATION='Apache[- ]2\.0 §[0-9]+(\([a-z]\))?|Apache License[^§]{0,40}§[0-9]+|LICENSE §[0-9]+'
+# ⚠ NO ARBITRARY GAP BEFORE THE `§`. The previous form had an alternative
+# `Apache License[^§]{0,40}§[0-9]+`, and `[^§]{0,40}` swallows whatever sits
+# between — INCLUDING the forbidden identifier. Reproduced: the line
+# `Apache License applies; see ADR-9999 §7` was removed wholesale, the ADR
+# reference with it, and the gate exited clean. That is the same EVASION the
+# whole-line `grep -v` produced two rounds ago, rebuilt in a narrower-looking
+# shape: any exception permitted to consume text it was not written to describe
+# will eventually consume a finding.
+#
+# So the exception now spans only what a citation actually contains — the
+# licence name, an optional version phrase, and the section — with nothing but
+# spaces and commas between. Measured on both trees at the time of writing:
+# ZERO Apache section citations exist in either, so this exception currently
+# protects nothing and could only cost. It is kept narrow rather than deleted
+# because the case it was written for was real in a sibling repository.
+CITATION='Apache([ -]License)?([, ]+Version)?[ -]2\.0[, ]*§[0-9]+(\([a-z]\))?|LICENSE §[0-9]+(\([a-z]\))?'
 
 # strip_citations — reads lines, prints those that still match PATTERNS once
 # every legitimate licence citation has been removed from the copy under test.
@@ -344,9 +365,15 @@ scan_tree() {
     # it; otherwise every ordinary finding would be reported twice.
     if [ "$wrapped_status" -eq 0 ]; then
       new_wrapped=""
+      # ⚠ AGAINST BOTH LINE-ORIENTED PASSES, not just the shape one. A
+      # roster-only identifier lands in $roster_hits, never in $hits, so
+      # comparing against $hits alone re-reported every ordinary roster hit as
+      # "wrapped" — double-counting each one in the lane totals and telling a
+      # reader to look for a line break that is not there.
       while IFS= read -r w; do
         [ -n "$w" ] || continue
-        printf '%s\n' "$hits" | grep -qF -- "$w" || new_wrapped="${new_wrapped}0:wrapped across a line break: ${w}"$'\n'
+        printf '%s\n%s\n' "$hits" "$roster_hits" | grep -qF -- "$w" \
+          || new_wrapped="${new_wrapped}0:wrapped across a line break: ${w}"$'\n'
       done <<< "$wrapped_hits"
       wrapped_hits="$new_wrapped"
       [ -n "$wrapped_hits" ] || wrapped_status=1
