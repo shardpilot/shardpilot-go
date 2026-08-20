@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+- **Module `go` directive moves to 1.25 (was 1.24).** The source-compatibility
+  baseline for SDK consumers rises with it: the next release requires
+  **Go 1.25+**. Already-published tags are unaffected — every tag from `v0.1.2`
+  onward declares `go 1.24` in its own immutable `go.mod` and keeps requiring
+  Go 1.24+, as it always did. CI's matrix moves to `1.25.x` (the baseline) and
+  `1.27.x` (the current toolchain).
+
+  Stated honestly, because the reason it was taken did not survive
+  measurement: 1.25 was chosen for `testing/synctest`, expecting it to retire
+  the SDK suite's real-time waits. It does not, on the suite as written. The
+  root package spends 28.0s, of which only 6.55s is literal `time.Sleep`; the
+  rest is genuine machinery — 21 test files stand up an `httptest.NewServer`
+  and there are 287 `t.TempDir()` calls, and a real listener and a real
+  filesystem both defeat a fake clock. The piece that would make those
+  convertible, `httptest.NewTestServer`'s in-memory network, is Go **1.27**,
+  above a baseline this module holds below the current toolchain on purpose.
+  So `synctest` is available for tests written against it from here on, and
+  converting the existing retry-pacing cluster stays a separate question that
+  a 1.25 baseline does not answer.
+
+- **Goroutine-dump parsing tolerates Go 1.27 traceback labels.** For a consumer
+  built with a `go 1.27+` directive the runtime appends the goroutine's
+  `runtime/pprof` labels to each header:
+  `goroutine 1 [running] {route: /v1/ingest, tenant: "acme-123"}:`.
+
+  `parseGoroutineHeader` scanned to the LAST `]` on the line, so a label value
+  containing `]` produced a corrupted state such as
+  `select] {route: "/v1/items[id`, and the label block could otherwise ride
+  into `Thread.Name` and out with the crash report. Label contents are the
+  embedding application's own text and routinely name a tenant, a route or a
+  user, so this is a privacy boundary and not only a parsing bug. The state is
+  now bounded by its own bracket, which keeps labels out of every field the
+  parser returns — and the raw dump text has never been carried into the
+  payload. The trailing `:` is no longer required either, so a future runtime
+  that moves the block would not silently drop every non-crashing thread.
+
 - **`FlushInterval` now defaults to 15s (was 1s).** BEHAVIOUR CHANGE for integrations that
   never set it: a PARTIAL batch can now wait up to 15s before it is published, instead of up
   to 1s.
