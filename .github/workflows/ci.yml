@@ -44,6 +44,44 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      # The committed benchmarks, SHOWN EXECUTING. They have lived in this
+      # repository unrun, which makes them a file rather than a measurement —
+      # and they rot as silently as an unrun test would.
+      #
+      # The script, not a bare `go test -bench`, because `go test -bench .`
+      # EXITS 0 when it matches no benchmarks: a rename or a build tag leaves
+      # this step green over zero measurements. It asserts every expected
+      # benchmark actually reported a result and names the ones that did not.
+      #
+      # Runs on ONE Go version. The numbers are a measurement of this code, not
+      # of the toolchain, and publishing two sets per push invites a comparison
+      # between runners that nothing here controls.
+      - name: Benchmarks
+        if: matrix.go-version == '1.26.5'
+        run: scripts/run_benchmarks.sh bench/latest.txt
+
+      # Published so the numbers are readable without opening a log, which is
+      # what makes them evidence somebody can cite rather than something that
+      # scrolled past.
+      - name: Publish benchmark results
+        if: matrix.go-version == '1.26.5'
+        run: |
+          {
+            echo '### Benchmarks'
+            echo
+            echo '```'
+            cat bench/latest.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark results
+        if: matrix.go-version == '1.26.5'
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks
+          path: bench/latest.txt
+          retention-days: 30
+
   release-consistency:
     runs-on: ubuntu-latest
     timeout-minutes: 5

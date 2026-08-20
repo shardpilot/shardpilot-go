@@ -30,3 +30,8 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Benchmark output — produced by scripts/run_benchmarks.sh in CI and
+# published as a step summary and an artifact. Never committed: a checked-in
+# number is a claim about whichever machine last ran it.
+bench/
