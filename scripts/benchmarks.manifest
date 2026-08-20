@@ -1,19 +1,26 @@
 # Which benchmarks are meant to exist, as `package<TAB>name`.
 #
-# scripts/run_benchmarks.sh enumerates the tree with `go test -list` and
-# compares it against this file. The comparison is what makes a DELETED
-# benchmark loud: an enumeration checked only against itself would simply
-# produce a smaller set, match everything in it, and report success.
+# scripts/run_benchmarks.sh compares this file against everything it can find
+# in the tree and fails until the two agree. The comparison is what makes a
+# DELETED benchmark loud: an enumeration checked only against itself would
+# simply produce a smaller set, match everything in it, and report success.
+#
+# It is also what makes a benchmark this platform cannot compile visible at
+# all. `go test -list` answers only for the configuration it is running in, so
+# a `//go:build windows` benchmark is invisible to it on a Linux runner — the
+# script reads the tracked test files the toolchain did not compile, and their
+# benchmarks are listed here too, alongside an entry in
+# BENCHMARKS_NOT_RUN_IN_CI saying they cannot run.
 #
 # Adding or removing a benchmark fails CI until this file is updated in the
 # same change. That is the point — the diff here is the only place anyone
 # states that a benchmark is meant to be gone rather than accidentally
 # missing.
 #
-# Regenerate:
-#   go test -list '^Benchmark' ./... \
-#     | awk '/^(ok|FAIL|\?)[ \t]/ { for (i=1;i<=n;i++) print $2 "\t" names[i]; n=0; next }
-#            /^Benchmark/ { names[++n]=$1 }' | sort
+# To update: run scripts/run_benchmarks.sh and apply the diff it prints. There
+# is no regeneration command, deliberately: one would have to run under every
+# build configuration to be correct, and a command that is right on Linux and
+# quietly wrong on Windows is worse than a diff a human applies.
 github.com/shardpilot/shardpilot-go	BenchmarkBuildBatchMapPayloads
 github.com/shardpilot/shardpilot-go	BenchmarkCompressBatchBody
 github.com/shardpilot/shardpilot-go	BenchmarkEnqueueMapPayload
