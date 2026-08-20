@@ -72,6 +72,21 @@
 #   visible instead of being implied away by lane A's green.
 # Neither lane looks at git HISTORY. Deleting a line does not unpublish the
 # commit that carried it.
+#
+# ⚠ ONE KNOWN FALSE POSITIVE IS LEFT STANDING, deliberately. A licence citation
+# that wraps between its name and its section — `Apache-2.0` ending one line and
+# `§4(d)` starting the next — leaves a bare `§4(d)` that the line-oriented pass
+# reports, because a bare section reference naming a document the reader cannot
+# open is precisely what the `§` class is for. The collapsed pass applies the
+# citation exception and the line pass cannot, since the evidence that it IS a
+# citation is on the previous line.
+#
+# Suppressing it would mean deciding a line's fate from its neighbours, and
+# every attempt to give this file a second opinion about a line has produced a
+# bug: the first citation exception dropped the WHOLE line and turned a
+# false-positive fix into an evasion. The cost of the false positive is
+# rewrapping one sentence. The cost of the machinery has already been measured
+# twice, and it was higher.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -117,12 +132,17 @@ verification-discipline'
 # separator becomes a character class, so a name written with a space or an
 # underscore instead of a hyphen is caught too; matching is case-insensitive,
 # so a sentence-initial capital is not an evasion.
-roster_regex() { printf '%s' "$ROSTER" | sed -e 's![-_ ]![-_ ]!g' | paste -sd'|' -; }
+# `[-_ ]+`, not `[-_ ]`. A hyphenated name wraps AT THE HYPHEN — that is where
+# a formatter breaks it — so the collapsed copy reads `control- plane`, two
+# separator characters where the source had one. A single-character class
+# missed exactly the wrap this pass exists to catch, while matching the
+# multiword names it wraps less often. Verified by mutation in both shapes.
+roster_regex() { printf '%s' "$ROSTER" | sed -e 's![-_ ]![-_ ]+!g' | paste -sd'|' -; }
 ROSTER_RE="$(roster_regex)"
 
 # The SHAPE half. These name no record, no ticket, no branch and no service, so
 # they are safe to publish in the file that gates against them.
-PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here is (no|NO) [A-Za-z]+ (harness|coverage|test|suite)|(is|are) not (tested|covered|scanned|audited|monitored)|no (automated )?(tests?|coverage|scanning|monitoring) (for|of|in)|nobody (looks|checks|monitors)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
+PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here is [Nn][Oo] [A-Za-z]+ (harness|coverage|test|suite)|(is|are) not (tested|covered|scanned|audited|monitored)|[Nn]o (automated )?(tests?|coverage|scanning|monitoring) (for|of|in)|[Nn]obody (looks|checks|monitors)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 
 # The one legitimate collision with the `§` class, in ONE place so the scan
 # and the self-test cannot disagree about it. The first attempt put the
@@ -218,7 +238,12 @@ scan_tree() {
     # -h: a symlink's published blob content IS its target path, so read the
     # link rather than skipping it or following it out of the checkout.
     if [ -L "$root/$f" ]; then
-      hits="$(readlink "$root/$f" | grep -nE -- "$PATTERNS" || true)"
+      # BOTH passes. A symlink's published blob content IS its target path, and
+      # a target naming a roster entry is the same disclosure as one naming a
+      # shape — checking only $PATTERNS here left the roster half blind to an
+      # entire file type.
+      hits="$( { readlink "$root/$f" | grep -nE -- "$PATTERNS" || true
+                 readlink "$root/$f" | grep -niE -- "$ROSTER_RE" || true; } )"
       [ -n "$hits" ] && scan_lane_a="${scan_lane_a}${f}:symlink-target:$(readlink "$root/$f")"$'\n'
       scan_files=$((scan_files + 1))
       continue
@@ -284,11 +309,30 @@ scan_tree() {
     # which cannot manufacture a hit for the single-token shape classes and
     # restores every multi-word one. `-o` because a whole-file-on-one-line
     # match would otherwise print the entire file.
-    wrapped_hits="$(tr -s '[:space:]' ' ' < "$root/$f" 2>/dev/null \
-      | tr -d '\000' | grep -aoE -- "$PATTERNS" | sort -u; exit "${PIPESTATUS[1]}")"
-    wrapped_status=$?
+    #
+    # ⚠ BOTH PATTERN SETS, AND CITATIONS STRIPPED FIRST. The first version of
+    # this pass ran $PATTERNS alone over raw collapsed text, which got both
+    # halves wrong at once: a wrapped ROSTER name — the multiword ones wrap
+    # most readily — went unmatched, and a wrapped `Apache-2.0 §4(d)` was
+    # reported as a finding because the citation exception the line-oriented
+    # pass applies was not applied here. A new pass that does not inherit the
+    # exceptions of the pass it supplements manufactures false positives, and
+    # a false positive in a publication gate is how the gate gets switched off.
+    #
+    # ⚠ AND NO PIPESTATUS INDEX. The earlier form ended `exit "${PIPESTATUS[1]}"`
+    # believing [1] was the grep; the pipeline was tr|tr|grep|sort, so [1] is
+    # the SECOND tr — a command that essentially cannot fail. The status was
+    # therefore always 0 and the trichotomous grep-error check downstream was
+    # reading a constant. Readability is already established by the
+    # line-oriented pass above, whose status IS checked for >= 2 on this exact
+    # file, so this pass decides on content alone and says so.
+    collapsed="$(tr -s '[:space:]' ' ' < "$root/$f" 2>/dev/null | tr -d '\000' \
+      | sed -E "s/${CITATION}//g")"
+    wrapped_hits="$( { printf '%s\n' "$collapsed" | grep -aoE -- "$PATTERNS" || true
+                       printf '%s\n' "$collapsed" | grep -aoiE -- "$ROSTER_RE" || true; } | sort -u )"
+    if [ -n "$wrapped_hits" ]; then wrapped_status=0; else wrapped_status=1; fi
     set -e
-    for st in "$status" "$roster_status" "$wrapped_status"; do
+    for st in "$status" "$roster_status"; do
       if [ "$st" -ge 2 ]; then
         echo "REFUSING: grep could not read '$f' (exit $st)." >&2
         echo "  An unreadable file is an UNSCANNED file, and this gate must not" >&2
