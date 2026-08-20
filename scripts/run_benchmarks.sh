@@ -44,10 +44,10 @@
 #      deleting a benchmark fails until the same change updates it. That is one
 #      line of reviewable diff, and the only place a human states "yes, this
 #      benchmark is meant to be gone".
-#   2. UNBUILDABLE ⊆ EXEMPT — a benchmark this configuration cannot even
-#      compile can never report a result here, so it must be named in
-#      BENCHMARKS_NOT_RUN_IN_CI. Otherwise "it did not run" and "it cannot run"
-#      are the same silence.
+#   2. UNBUILDABLE ⊆ EXEMPT — a benchmark that exists but that this
+#      configuration cannot build can never report a result here, so it must be
+#      named in BENCHMARKS_NOT_RUN_IN_CI. Otherwise "it did not run" and "it
+#      cannot run" are the same silence.
 #   3. RUNNABLE vs RESULTS — did every benchmark that could run actually run?
 #      This catches one going unreachable, skipped, or filtered out while still
 #      sitting in the tree.
@@ -61,11 +61,12 @@
 # name scan cannot give: two packages may define the same benchmark name, and a
 # repository-wide name match would let either one satisfy both.
 #
-# Text scanning survives in exactly one place: the files the toolchain told us
-# it did not compile, which it therefore cannot enumerate for us. That set is
-# small, explicitly identified, and scanned with a deliberately OVER-broad
-# pattern — over-matching there costs one line of declaration, under-matching
-# would restore the hole.
+# For the configurations the toolchain will NOT answer for, the answer comes
+# from go/parser rather than from a pattern (scripts/benchlist.go). A pattern
+# that skips the comment in `func /* requires API (Windows) */ BenchmarkFoo`
+# has to decide what a comment may contain, and the answer is "anything" —
+# including the delimiters the pattern stops at. Under-reading there is silent:
+# the benchmark lands outside every check and CI reports success.
 #
 # Usage:
 #   scripts/run_benchmarks.sh                  # run, assert, print
@@ -135,70 +136,48 @@ if [ -z "$enumerated" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 2. Find the benchmarks this configuration CANNOT see.
+# 2. Read what EXISTS — in every configuration, not just this one.
 #
-# Every tracked *_test.go that the toolchain did not compile here — excluded by
-# a build constraint, in a directory `./...` does not walk, in a package whose
-# every file is constrained away. `go list` reports what it compiled; git
-# reports what exists. The difference is the blind spot, and it is scanned
-# rather than enumerated because there is no toolchain that will enumerate a
-# configuration it is not running in.
+# The enumeration above answered for this platform and these tags. A benchmark
+# behind `//go:build windows`, or in a directory `./...` does not walk, is
+# invisible to it: not enumerated, so not run, so never reported missing.
+#
+# scripts/benchlist.go parses every tracked test file with go/parser, which has
+# no build configuration to be blind to. What it finds and the toolchain does
+# not is exactly the set that cannot run here.
 # ---------------------------------------------------------------------------
-if ! MODULE="$(go list -m 2>"$tmp/moderr")"; then
+if ! MODULE="$(GOWORK=off go list -m 2>"$tmp/moderr")"; then
   cat "$tmp/moderr" >&2
   fail "go list -m failed — cannot map directories to import paths"
 fi
 
-if ! go list -e -f '{{.ImportPath}}{{"\t"}}{{.Dir}}{{"\t"}}{{join .TestGoFiles " "}}{{"\t"}}{{join .XTestGoFiles " "}}' ./... >"$tmp/golist" 2>"$tmp/golisterr"; then
-  cat "$tmp/golisterr" >&2
-  fail "go list failed — the set of compiled test files could not be determined"
-fi
+# GOWORK=off is load-bearing, and is the whole reason this is not a bare
+# `go list -m`: inside a Go workspace that prints EVERY module the workspace
+# uses, and a multi-line module path yields import paths that no manifest or
+# opt-out entry can ever match — so every benchmark outside the active build
+# would read as undeclared, forever. `go.work` is gitignored here, so a
+# contributor having one is expected rather than exotic.
 
-awk -F'\t' -v root="$PWD/" '
-  {
-    dir = $2
-    if (substr(dir, 1, length(root)) == root) dir = substr(dir, length(root) + 1)
-    else if (dir "/" == root)                 dir = ""
-    for (col = 3; col <= 4; col++) {
-      n = split($col, files, " ")
-      for (i = 1; i <= n; i++)
-        if (files[i] != "") print (dir == "" ? files[i] : dir "/" files[i])
-    }
-  }
-' "$tmp/golist" | sort -u >"$tmp/compiled"
-
-# NUL-delimited: a path containing a space or a tab must survive intact. A path
-# containing a NEWLINE cannot survive a line-oriented set comparison at all, so
-# it is refused rather than silently mis-compared — the count of NULs and the
-# count of lines have to agree.
+# NUL-separated end to end, so a test file whose name contains a space, a tab
+# or a newline reaches the parser intact. Splitting on whitespace anywhere in
+# this path would turn one real file into several that do not exist, and its
+# benchmarks would drop out of every check below without failing anything.
 if ! git ls-files -z -- '*_test.go' >"$tmp/tracked_z"; then
   fail "git ls-files failed — cannot determine which test files are tracked"
 fi
-nul_count="$(tr -dc '\0' <"$tmp/tracked_z" | wc -c | tr -d ' ')"
-tr '\0' '\n' <"$tmp/tracked_z" | sed '/^$/d' | sort >"$tmp/tracked"
-line_count="$(wc -l <"$tmp/tracked" | tr -d ' ')"
-[ "$nul_count" = "$line_count" ] || \
-  fail "a tracked test file name contains a newline — refusing to compare file sets line by line"
 
-unconsidered="$(comm -23 "$tmp/tracked" "$tmp/compiled")"
+if ! go run scripts/benchlist.go "$MODULE" <"$tmp/tracked_z" >"$tmp/parsed" 2>"$tmp/parsederr"; then
+  cat "$tmp/parsederr" >&2
+  fail "could not read the tracked test files — see above"
+fi
 
-unbuildable="$(
-  printf '%s\n' "$unconsidered" | while IFS= read -r file; do
-    [ -n "$file" ] || continue
-    [ -f "$file" ] || fail "tracked test file $file is missing from the worktree"
-    dir="$(dirname "$file")"
-    if [ "$dir" = "." ]; then pkg="$MODULE"; else pkg="$MODULE/$dir"; fi
-    # Newlines are flattened first so a declaration wrapped across lines is
-    # still seen, and `[^(){}]*` lets a comment sit between `func` and the
-    # identifier without letting the match wander into a function body.
-    tr '\n' ' ' <"$file" \
-      | grep -oE 'func[^(){}]*Benchmark[A-Za-z0-9_]*' \
-      | grep -oE 'Benchmark[A-Za-z0-9_]*$' \
-      | awk -v p="$pkg" '{ print p "\t" $0 }' || true
-  done | sort -u
-)"
+declared="$(printf '%s\n' "$enumerated" | cat - "$tmp/parsed" | sed '/^$/d' | sort -u)"
 
-declared="$(printf '%s\n%s\n' "$enumerated" "$unbuildable" | sed '/^$/d' | sort -u)"
+# What exists but this configuration cannot build. A benchmark defined once per
+# platform — the same name in `_linux_test.go` and `_windows_test.go` — is NOT
+# in here: that identity IS enumerated, so it runs and is asserted, and
+# demanding an opt-out for it would drop the runnable one out of the run.
+unbuildable="$(printf '%s\n' "$declared" | comm -23 - <(printf '%s\n' "$enumerated"))"
 
 # ---------------------------------------------------------------------------
 # 3. Normalise the escape hatch into "package<TAB>name" rows.
