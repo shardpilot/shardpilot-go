@@ -1,4 +1,10 @@
-# Which benchmarks are meant to exist, as `package<TAB>name`.
+# Which benchmarks are meant to exist, as `package<TAB>name<TAB>file`.
+#
+# One row per DECLARATION, not per benchmark identity. A package may define one
+# benchmark name in mutually exclusive platform files — a `_linux_test.go` and
+# a `_windows_test.go` — and collapsing those to a single row would make
+# deleting either of them invisible here, since the surviving one keeps the
+# identity alive. The deletion this file exists to expose is exactly that.
 #
 # scripts/run_benchmarks.sh compares this file against everything it can find
 # in the tree and fails until the two agree. The comparison is what makes a
@@ -13,8 +19,8 @@
 # exists but cannot be built here is listed below too, alongside an entry in
 # BENCHMARKS_NOT_RUN_IN_CI saying it cannot run.
 #
-# Adding or removing a benchmark fails CI until this file is updated in the
-# same change. That is the point — the diff here is the only place anyone
+# Adding, removing or MOVING a benchmark fails CI until this file is updated in
+# the same change. That is the point — the diff here is the only place anyone
 # states that a benchmark is meant to be gone rather than accidentally
 # missing.
 #
@@ -22,8 +28,8 @@
 # is no regeneration command, deliberately: one would have to run under every
 # build configuration to be correct, and a command that is right on Linux and
 # quietly wrong on Windows is worse than a diff a human applies.
-github.com/shardpilot/shardpilot-go	BenchmarkBuildBatchMapPayloads
-github.com/shardpilot/shardpilot-go	BenchmarkCompressBatchBody
-github.com/shardpilot/shardpilot-go	BenchmarkEnqueueMapPayload
-github.com/shardpilot/shardpilot-go	BenchmarkStatsCollectorAggregation
-github.com/shardpilot/shardpilot-go/pkg/crash	BenchmarkClientEmit
+github.com/shardpilot/shardpilot-go	BenchmarkBuildBatchMapPayloads	client_benchmark_test.go
+github.com/shardpilot/shardpilot-go	BenchmarkCompressBatchBody	request_compression_test.go
+github.com/shardpilot/shardpilot-go	BenchmarkEnqueueMapPayload	client_benchmark_test.go
+github.com/shardpilot/shardpilot-go	BenchmarkStatsCollectorAggregation	client_benchmark_test.go
+github.com/shardpilot/shardpilot-go/pkg/crash	BenchmarkClientEmit	pkg/crash/client_test.go

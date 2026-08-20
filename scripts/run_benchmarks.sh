@@ -73,6 +73,17 @@
 # benchmark name, and a repository-wide name match would let either one satisfy
 # both.
 #
+# WHAT THIS CANNOT DO
+# -------------------
+# Every byte the execution check reads is written by the package under test.
+# `go test` offers its stdout and an exit status, and both are the program's.
+# So a package that sets out to lie — printing result-shaped rows while
+# bypassing the harness — cannot be caught by any amount of parsing, and these
+# checks are calibrated for ACCIDENTS: renames, build tags, skips, unreachable
+# packages, a TestMain that forgets m.Run. The one signal that is not the
+# benchmark's to write is the harness's own `--- SKIP:` marker, and even that
+# exists only once the harness has started.
+#
 # Usage:
 #   scripts/run_benchmarks.sh                  # run, assert, print
 #   scripts/run_benchmarks.sh out/bench.txt    # …and write the raw output there
@@ -208,9 +219,17 @@ if ! GOFLAGS="$goflags -overlay=" go run scripts/benchlist.go "$MODULE" "$goflag
   fail "scripts/benchlist.go refused or failed — see above"
 fi
 
+# `declared` is one row per DECLARATION, carrying the file. The manifest
+# records declarations rather than identities because a package may define one
+# benchmark name in mutually exclusive platform files, and collapsing those to
+# a single row makes deleting either of them invisible — the exact deletion the
+# manifest exists to expose. Identities are derived from it where identity is
+# what matters: what runs, and what must be opted out.
+declared="$(awk -F'\t' 'NF >= 4 { print $2 "\t" $3 "\t" $4 }' "$tmp/rows" | sort -u)"
+declared_ids="$(printf '%s\n' "$declared" | cut -f1,2 | sed '/^$/d' | sort -u)"
 active_rows="$(awk -F'\t' '$1 == "A" { print $2 "\t" $3 }' "$tmp/rows")"
+no_harness="$(awk -F'\t' '$1 == "X" { print $2 }' "$tmp/rows" | sort -u)"
 enumerated="$(printf '%s\n' "$active_rows" | sed '/^$/d' | sort -u)"
-declared="$(awk -F'\t' '{ print $2 "\t" $3 }' "$tmp/rows" | sed '/^$/d' | sort -u)"
 
 # Vacuity guard on the enumeration itself: reading zero names would make every
 # check below pass over nothing and report success, which is the exact shape of
@@ -236,7 +255,7 @@ if [ -n "$dupes" ]; then
   fail "duplicate active benchmark declarations"
 fi
 
-unbuildable="$(printf '%s\n' "$declared" | comm -23 - <(printf '%s\n' "$enumerated"))"
+unbuildable="$(printf '%s\n' "$declared_ids" | comm -23 - <(printf '%s\n' "$enumerated"))"
 
 # ---------------------------------------------------------------------------
 # 3. Normalise the escape hatch into "package<TAB>name" rows.
@@ -266,13 +285,16 @@ if ! manifest_diff="$(diff "$tmp/declared" "$tmp/manifest" 2>&1)"; then
   echo "  Adding a benchmark? Add its line. Deleting one? Remove its line, in the" >&2
   echo "  SAME change — that removal is the only place anyone states the benchmark" >&2
   echo "  is meant to be gone rather than accidentally missing. Apply the diff" >&2
-  echo "  above: '<' lines belong in $MANIFEST, '>' lines do not." >&2
+  echo "  above: '<' lines belong in $MANIFEST, '>' lines do not. Rows are one" >&2
+  echo "  per DECLARATION and carry the file, so deleting one platform's copy of" >&2
+  echo "  a name shows up even while another platform's copy still exists." >&2
   fail "tree and $MANIFEST disagree about which benchmarks exist"
 fi
 
 # An exemption naming a benchmark that no longer exists is a stale opt-out, and
 # a stale opt-out is how a benchmark comes back and stays unmeasured.
-stale="$(printf '%s\n' "$exempt" | sed '/^$/d' | comm -23 - "$tmp/manifest")"
+cut -f1,2 "$tmp/manifest" | sort -u >"$tmp/manifest_ids"
+stale="$(printf '%s\n' "$exempt" | sed '/^$/d' | comm -23 - "$tmp/manifest_ids")"
 if [ -n "$stale" ]; then
   echo >&2
   echo "BENCHMARKS_NOT_RUN_IN_CI names benchmarks that are not in $MANIFEST:" >&2
@@ -308,6 +330,26 @@ fi
 to_run="$(printf '%s\n' "$enumerated" | comm -23 - <(printf '%s\n' "$exempt" | sed '/^$/d'))"
 
 [ -n "$to_run" ] || fail "every enumerated benchmark is in BENCHMARKS_NOT_RUN_IN_CI — nothing would be measured"
+
+# A package whose TestMain never calls m.Run runs no benchmarks at all: the go
+# command calls TestMain INSTEAD of the harness, so it exits zero having
+# measured nothing — and with the harness never started there are no skip
+# markers either, so anything the package prints reads as a result.
+#
+# This catches the honest mistake, a TestMain that forgets the harness. It does
+# not close the class; see WHAT THIS CANNOT DO at the top of this file.
+if [ -n "$no_harness" ]; then
+  affected="$(printf '%s\n' "$no_harness" | comm -12 - <(printf '%s\n' "$to_run" | cut -f1 | sort -u))"
+  if [ -n "$affected" ]; then
+    echo >&2
+    echo "These packages define a TestMain that never calls m.Run:" >&2
+    printf '%s\n' "$affected" | sed 's/^/    /' >&2
+    echo >&2
+    echo "  go test calls TestMain INSTEAD of the harness, so their benchmarks" >&2
+    echo "  never run and nothing reports them missing. Call m.Run." >&2
+    fail "a TestMain would bypass the benchmark harness"
+  fi
+fi
 
 # `-benchtime=100x` rather than the default 1s per benchmark: a fixed iteration
 # count keeps the CI step bounded and the allocation figures (the part worth
@@ -362,14 +404,22 @@ while IFS= read -r pkg; do
       # Written by the harness, and a benchmark cannot suppress its own — which
       # is what makes it usable as evidence when a printed result row is not.
       #
+      # Looked for ANYWHERE in the line, not just at its start: a benchmark that
+      # prints without a trailing newline leaves the marker appended to its own
+      # output, as in `BenchmarkX-8  100  1 ns/op--- SKIP: BenchmarkX`. An
+      # anchored match misses exactly the case where the row is a forgery.
+      #
       # Recorded under exactly the name printed, deliberately: a skipped
       # SUB-benchmark is marked `Parent/child`, which never matches the
       # top-level row `Parent`. So a child skipping cannot disqualify a parent
       # that measured its other children, and that falls out of the naming
       # rather than needing a rule of its own.
-      /^--- SKIP: / {
-        skipped[$3] = 1
-        next
+      {
+        at = index($0, "--- SKIP: ")
+        if (at > 0) {
+          split(substr($0, at + 10), sf, /[ \t]/)
+          if (sf[1] != "") skipped[sf[1]] = 1
+        }
       }
       /^Benchmark/ {
         name = $1
@@ -386,7 +436,12 @@ while IFS= read -r pkg; do
         # None of this makes the row TRUSTWORTHY — the benchmark owns stdout
         # and can print a perfectly shaped one — which is why the skip marker
         # above is what actually decides.
-        if (NF >= 4 && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]/ && $4 ~ /^[^0-9]/) reported[name] = 1
+        # The value may be negative or non-finite: b.ReportMetric takes any
+        # float64, so a benchmark reporting only custom metrics can legitimately
+        # print `-1.000 items/op`, `NaN score` or `+Inf score`. Demanding a
+        # leading digit called those "no result".
+        if (NF >= 4 && $2 ~ /^[0-9]+$/ &&
+            $3 ~ /^[-+]?([0-9]|[Nn][Aa][Nn]|[Ii][Nn][Ff])/ && $4 ~ /^[^0-9]/) reported[name] = 1
       }
       END {
         for (k in expected) if (!(k in reported) || (k in skipped)) print pkg "\t" k
