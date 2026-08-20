@@ -3,13 +3,13 @@
 # published. This gate fails when internal ShardPilot material appears in the
 # part of the tree it covers.
 #
-# WHY IT EXISTS. The org-wide publication-readiness check (in the internal `qa`
-# repository) enumerates publication CANDIDATES — repositories that are private
-# and might be flipped. This repository is not a candidate, because it is
-# already public. Nothing scanned it, and that is exactly how an internal
-# review-process skill, internal decision-record ids, an internal service name
-# and an internal commit sha came to sit in a public repository for months. A
-# gate that runs where the exposure already exists is the fix.
+# WHY IT EXISTS. The org-wide publication-readiness check enumerates
+# publication CANDIDATES — repositories that are private and might be flipped.
+# This repository is not a candidate, because it is already public. Nothing
+# scanned it, and that is exactly how an internal review-process skill,
+# internal decision-record ids, an internal service name and an internal commit
+# sha came to sit in a public repository for months. A gate that runs where the
+# exposure already exists is the fix.
 #
 # ── ONE CLASS IS NOT ABOUT NAMES AT ALL ─────────────────────────────────────
 # NEGATIVE STATEMENTS ABOUT COVERAGE. "There is NO Playwright harness in the
@@ -78,7 +78,51 @@ cd "$(dirname "$0")/.."
 
 # One pattern list, used by both lanes and by the self-test — two spellings is
 # how the second consumer comes to check something different from the first.
-PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here is (no|NO) [A-Za-z]+ (harness|coverage|test|suite)|(is|are) not (tested|covered|scanned|audited|monitored)|no (automated )?(tests?|coverage|scanning|monitoring) (for|of|in)|nobody (looks|checks|monitors)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|analytics[-_ ]service|crash[-_ ]symbolicator|control[-_ ]plane|shardpilot/(docs|qa|infra|integrations)|[Pp]roject[-_ ][Tt]ower|shepherd-pr|verification-discipline|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
+# ── THE ROSTER HALF, AND THE RULE THAT NOW ENFORCES ITSELF ──────────────────
+# These are the only literal internal names in this file. Each is admissible
+# under one rule: **this repository's published history must already carry it**,
+# so the file discloses nothing a `git log` of a repository anyone can clone
+# does not already give up.
+#
+# That rule was PROSE until 2026-08-20, and prose does not hold. Measured on
+# that date by two independent methods — `git log -S` over every ref, and a
+# content grep across every commit — TWO entries in this list appeared in ZERO
+# commits of this repository. The gate written to stop internal names reaching
+# a public repository was introducing two of them, for the first time, in the
+# same commit that claimed the opposite. Both are gone, and
+# `roster_is_already_published` below runs the check on every invocation so the
+# next one fails instead of shipping.
+#
+# ⚠ AND THEY ARE NOT NAMED IN THIS COMMENT, which took a second attempt to get
+# right. The first draft of this paragraph spelled both removed names out in
+# order to explain the removal — publishing them in the very edit that took
+# them out of the list. A finding about a disclosure is itself a disclosure;
+# the detail belongs in the internal record, and here the count is enough.
+#
+# A name is dropped from this list rather than kept and justified. The cost is
+# stated: a name removed here stops being gated at PR time, and until the
+# org-wide check covers already-public repositories it is caught by review or
+# not at all.
+ROSTER='analytics-service
+crash-symbolicator
+control-plane
+shardpilot/docs
+shardpilot/integrations
+Project Tower
+shepherd-pr
+verification-discipline'
+
+# Derived, never spelled twice — the defect this whole file keeps finding is a
+# correction landing in one copy while another keeps the old value. Each
+# separator becomes a character class, so a name written with a space or an
+# underscore instead of a hyphen is caught too; matching is case-insensitive,
+# so a sentence-initial capital is not an evasion.
+roster_regex() { printf '%s' "$ROSTER" | sed -e 's![-_ ]![-_ ]!g' | paste -sd'|' -; }
+ROSTER_RE="$(roster_regex)"
+
+# The SHAPE half. These name no record, no ticket, no branch and no service, so
+# they are safe to publish in the file that gates against them.
+PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here is (no|NO) [A-Za-z]+ (harness|coverage|test|suite)|(is|are) not (tested|covered|scanned|audited|monitored)|no (automated )?(tests?|coverage|scanning|monitoring) (for|of|in)|nobody (looks|checks|monitors)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 
 # The one legitimate collision with the `§` class, in ONE place so the scan
 # and the self-test cannot disagree about it. The first attempt put the
@@ -86,7 +130,7 @@ PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here is (no|NO) [A-Za-z]+ (harness|coverage|tes
 # because it was testing a different rule from the one that runs.
 # ⚠ THE EXCEPTION APPLIES TO THE CITATION, NOT TO THE LINE. The first version
 # filtered with `grep -v "$EXCLUDE"`, which drops the WHOLE line — so
-# `see ADR-0221; Apache-2.0 §4(d)` matched PATTERNS, was then discarded for
+# `see ADR-0000; Apache-2.0 §4(d)` matched PATTERNS, was then discarded for
 # containing a licence citation, and lane A reported clean. That turned a
 # false-positive fix into an EVASION: any internal identifier sharing a line
 # with the word Apache became invisible.
@@ -98,8 +142,20 @@ CITATION='Apache[- ]2\.0 §[0-9]+(\([a-z]\))?|Apache License[^§]{0,40}§[0-9]+|
 
 # strip_citations — reads lines, prints those that still match PATTERNS once
 # every legitimate licence citation has been removed from the copy under test.
+# ⚠ sed + grep, NOT awk. `PATTERNS` uses `\b` for `SP-123`, `AC-AB-7` and the
+# `main @ <sha>` pin. POSIX awk has NO word-boundary operator — `\b` there is
+# an undefined escape, which gawk reads as a backspace and mawk drops — so this
+# second pass stopped matching exactly the three classes that depend on it,
+# while every other class kept working and the run stayed green. A line whose
+# only finding was `SP-123` went through the gate. Keeping every pass in grep
+# means one regex dialect for the whole file, which is the only version of this
+# that a reader can check by eye.
+#
+# The line NUMBER survives because sed is a substitution, not a filter: the
+# input to this function is already `<n>:<text>` from `grep -n`, and blanking a
+# citation inside the text cannot renumber anything.
 strip_citations() {
-  awk -v pat="$PATTERNS" -v cit="$CITATION" '{ t=$0; gsub(cit, "", t); if (t ~ pat) print }'
+  sed -E "s/${CITATION}//g" | grep -E -- "$PATTERNS"
 }
 
 # Files the gate must not read as content: this script is the one place the
@@ -155,7 +211,8 @@ scan_tree() {
     # NAME — a decision-record id, a ticket, a service name in a directory —
     # reaches every consumer and appears in no file's body, so scanning only
     # contents misses it entirely.
-    if printf '%s\n' "$f" | grep -qE -- "$PATTERNS"; then
+    if printf '%s\n' "$f" | grep -qE -- "$PATTERNS" \
+       || printf '%s\n' "$f" | grep -qiE -- "$ROSTER_RE"; then
       scan_lane_a="${scan_lane_a}${f}:path:${f}"$'\n'
     fi
     # -h: a symlink's published blob content IS its target path, so read the
@@ -206,14 +263,58 @@ scan_tree() {
       | tr -d '\000' \
       | strip_citations; exit "${PIPESTATUS[0]}")"
     status=$?
+    # THE ROSTER, in its own pass because it is the one class matched
+    # case-insensitively: a name capitalised at the start of a sentence is the
+    # same disclosure as the lower-case spelling, and folding `-i` into the
+    # shape pass
+    # would make `[Tt]here is` and the ALLCAPS flag class match prose they
+    # were written to leave alone.
+    roster_hits="$(grep -aniE -- "$ROSTER_RE" "$root/$f" 2>/dev/null \
+      | tr -d '\000'; exit "${PIPESTATUS[0]}")"
+    roster_status=$?
+    # WRAPPED PROSE. Every pass above is line-oriented, and the classes that
+    # matter most here are PHRASES — "there is no X harness", "is not covered
+    # by automated tests", "main @ <sha>". A phrase that wraps across a line
+    # break matches none of them, and wrapping is not exotic: it is what a
+    # formatter does to a long sentence. Measured in a sibling repository, the
+    # phrase `hashed at ingest` moving onto a new line silently dropped a
+    # literal-pin check that had been green for weeks.
+    #
+    # So the file is also read with its whitespace collapsed to single spaces,
+    # which cannot manufacture a hit for the single-token shape classes and
+    # restores every multi-word one. `-o` because a whole-file-on-one-line
+    # match would otherwise print the entire file.
+    wrapped_hits="$(tr -s '[:space:]' ' ' < "$root/$f" 2>/dev/null \
+      | tr -d '\000' | grep -aoE -- "$PATTERNS" | sort -u; exit "${PIPESTATUS[1]}")"
+    wrapped_status=$?
     set -e
-    if [ "$status" -ge 2 ]; then
-      echo "REFUSING: grep could not read '$f' (exit $status)." >&2
-      echo "  An unreadable file is an UNSCANNED file, and this gate must not" >&2
-      echo "  report a repository clean on the strength of one." >&2
-      exit 2
+    for st in "$status" "$roster_status" "$wrapped_status"; do
+      if [ "$st" -ge 2 ]; then
+        echo "REFUSING: grep could not read '$f' (exit $st)." >&2
+        echo "  An unreadable file is an UNSCANNED file, and this gate must not" >&2
+        echo "  report a repository clean on the strength of one." >&2
+        exit 2
+      fi
+    done
+    # A wrapped hit is only NEWS if the line-oriented pass did not already see
+    # it; otherwise every ordinary finding would be reported twice.
+    if [ "$wrapped_status" -eq 0 ]; then
+      new_wrapped=""
+      while IFS= read -r w; do
+        [ -n "$w" ] || continue
+        printf '%s\n' "$hits" | grep -qF -- "$w" || new_wrapped="${new_wrapped}0:wrapped across a line break: ${w}"$'\n'
+      done <<< "$wrapped_hits"
+      wrapped_hits="$new_wrapped"
+      [ -n "$wrapped_hits" ] || wrapped_status=1
     fi
-    [ "$status" -ne 0 ] && continue
+    if [ "$status" -ne 0 ] && [ "$roster_status" -ne 0 ] && [ "$wrapped_status" -ne 0 ]; then
+      continue
+    fi
+    # One corpus from here down, so the lane split below cannot see a
+    # different set of hits from the one the statuses were computed over.
+    for extra in "$roster_hits" "$wrapped_hits"; do
+      [ -n "$extra" ] && hits="${hits:+${hits}$'\n'}${extra}"
+    done
     case "$f" in
       *.go)
         scan_lane_b_files=$((scan_lane_b_files + 1))
@@ -239,21 +340,22 @@ scan_tree() {
 # A clean result means nothing until the thing producing it has been shown to
 # fail, and "the patterns compile" is not that demonstration.
 # ---------------------------------------------------------------------------
-KNOWN_INTERNAL='per ADR-0221 §3
-see ADR-0221; Apache-2.0 §4(d) applies too
+# ⚠ EVERY IDENTIFIER BELOW IS SYNTHETIC. These fixtures exercise SHAPES, and a
+# shape is exercised just as well by `ADR-0000` as by a real decision-record
+# number — while a real one would make this fixture block the same kind of
+# roster the ROSTER rule above exists to bound. The earlier version used a live
+# ADR id, a live feature-flag name and a live ticket number, none of which the
+# test needed.
+KNOWN_INTERNAL='per ADR-0000 §3
+see ADR-0000; Apache-2.0 §4(d) applies too
 There is NO Playwright harness in the console repo
 the crash path is not covered by automated tests
 no automated scanning for that class of input
 a bare §7c left behind by a citation strip
-tracked as GAP-075 internally
-the control-plane assignment endpoint
-pinned to analytics-service main @ 7d118c5
-see shardpilot/docs for context
-Project Tower-specific event names
-the shepherd-pr skill
-the verification-discipline references
+tracked as GAP-000 internally
+pinned to main @ 0000000
 (Codex go#48 round 3)
-INGEST_CONSENT_KIND_MODE=off'
+EXAMPLE_SYNTHETIC_FLAG_MODE=off'
 KNOWN_INNOCENT='go get github.com/shardpilot/shardpilot-go@v0.6.0-alpha
 IngestURL: os.Getenv("SHARDPILOT_INGEST_URL")
 POST {IngestURL}/v1/events:batch
@@ -265,6 +367,81 @@ Apache-2.0 §4(d) obliges a redistributor to carry the NOTICE
 the event plane and the consent plane are separate
 an analytics-plane request, zero event batches'
 
+# roster_is_already_published — the rule from the ROSTER block, executed.
+#
+# Every literal in ROSTER must appear in this repository's PUBLISHED history.
+# If it does not, this file is the first thing to publish it, and the gate is
+# committing the disclosure it exists to prevent.
+#
+# ⚠ THIS FILE IS EXCLUDED FROM THE SEARCH, and without that the check is
+# self-satisfying: add a name here, commit, and `git log -S` finds it — in this
+# very file — from the next run onward. The exclusion is what makes the answer
+# be about the rest of the repository.
+#
+# ⚠ AND IT REFUSES ON A SHALLOW CLONE rather than reporting names unpublished.
+# A truncated history makes every literal look novel, which would fail the run
+# with a message pointing at the roster instead of at the checkout — sending
+# the reader to delete correct entries.
+roster_is_already_published() {
+  local lit novel=0
+  if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+    echo "REFUSING: shallow checkout — the roster rule needs full history." >&2
+    echo "  Every literal would read as unpublished and the run would blame" >&2
+    echo "  the roster for a property of the clone. Use fetch-depth: 0." >&2
+    exit 2
+  fi
+  # ⚠ NO PIPE INTO `grep -q`, AND THIS EXACT FUNCTION IS WHY. The first version
+  # asked `git log … | grep -q .`. `grep -q` exits at the FIRST match and closes
+  # the pipe, `git` then dies of SIGPIPE with status 141, and `set -o pipefail`
+  # reports the pipeline as failed — so `if !` turned every MATCH into a miss.
+  # It declared all eight roster names unpublished in a repository whose history
+  # carries every one of them, and the BETTER the match the sooner it fired.
+  # A guard that fails loudly on a correct tree is a guard somebody deletes.
+  #
+  # Materialised to a file and tested with `-s`: no pipeline, so no status to
+  # invert.
+  local found; found="$(mktemp)"
+  while IFS= read -r lit; do
+    [ -n "$lit" ] || continue
+    git log --all --format=%H -S"$lit" -- . ':(exclude)scripts/check_public_surface.sh' > "$found" 2>/dev/null || :
+    if [ ! -s "$found" ]; then
+      printf 'ROSTER VIOLATION: %s appears in no commit of this repository outside this file.\n' "$lit" >&2
+      novel=$((novel + 1))
+    fi
+  done <<EOF
+$ROSTER
+EOF
+
+  # ⚠ THE SAME RULE, APPLIED TO THIS FILE'S OWN PROSE — because the scan
+  # exempts this file, and that exemption is exactly where the last one hid.
+  # The comment announcing the removal of two internal repository names spelled
+  # both of them out, and no pass in this gate reads its own comments.
+  #
+  # A shape rather than a list, so it needs no roster of its own: every
+  # `shardpilot/<name>` written ANYWHERE in this file must satisfy the rule
+  # above. Both offenders were exactly that shape.
+  while IFS= read -r lit; do
+    [ -n "$lit" ] || continue
+    git log --all --format=%H -S"$lit" -- . ':(exclude)scripts/check_public_surface.sh' > "$found" 2>/dev/null || :
+    if [ ! -s "$found" ]; then
+      printf 'PROSE VIOLATION: %s is written in this file and appears in no commit of this repository.\n' "$lit" >&2
+      novel=$((novel + 1))
+    fi
+  done <<EOF
+$(grep -oE 'shardpilot/[a-z][a-z-]*' "$0" | sort -u)
+EOF
+
+  rm -f "$found"
+  if [ "$novel" -ne 0 ]; then
+    echo "REFUSING: the roster introduces $novel internal name(s) this public" >&2
+    echo "  repository has never carried. A gate against publishing internal" >&2
+    echo "  names must not be the commit that publishes them — remove them from" >&2
+    echo "  ROSTER. They stop being gated here; say so rather than keeping them." >&2
+    exit 2
+  fi
+  echo "roster rule: OK — all $(printf '%s\n' "$ROSTER" | grep -c .) literal(s) already present in published history"
+}
+
 selftest() {
   local line misses=0 falses=0 tested=0 innocent=0 tmp scanned_a
   while IFS= read -r line; do
@@ -275,12 +452,28 @@ selftest() {
   done <<EOF
 $KNOWN_INTERNAL
 EOF
+  # THE ROSTER HALF, with its fixtures DERIVED from ROSTER rather than written
+  # out again. A hand-written copy is a second spelling, and the failure it
+  # produces is the quiet one: drop a name from ROSTER and a stale fixture goes
+  # on passing against a pattern nothing scans with any more.
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    tested=$((tested + 1))
+    printf 'a sentence mentioning %s in passing\n' "$line" | grep -qiE -- "$ROSTER_RE" || {
+      printf 'SELFTEST MISS (roster): %s\n' "$line" >&2; misses=$((misses + 1)); }
+  done <<EOF
+$ROSTER
+EOF
   while IFS= read -r line; do
     [ -z "$line" ] && continue
     innocent=$((innocent + 1))
     # The SAME exclusion the scan applies, so the two cannot drift.
     # The SAME filter the scan applies, so the two cannot drift.
-    if printf '%s\n' "$line" | grep -E -- "$PATTERNS" | strip_citations | grep -q .; then
+    # BOTH passes, because an innocent line is only innocent if NEITHER fires.
+    # Testing the shape pass alone let the roster's case-insensitive pass go
+    # unchecked against every fixture written to prove a false positive gone.
+    if { printf '%s\n' "$line" | grep -E -- "$PATTERNS" | strip_citations
+         printf '%s\n' "$line" | grep -iE -- "$ROSTER_RE"; } | grep -q .; then
       printf 'SELFTEST FALSE POSITIVE: %s\n' "$line" >&2; falses=$((falses + 1))
     fi
   done <<EOF
@@ -304,7 +497,7 @@ EOF
     git config user.email t@t; git config user.name t
     printf 'clean customer prose\n' > clean.md
     printf 'nothing internal in the body\n' > ADR-0999-notes.md   # hit is the NAME
-    printf 'see ADR-0221 for context\n' > dirty.md
+    printf 'see ADR-0000 for context\n' > dirty.md
     printf '// GAP-075 note\npackage x\n' > lane_b.go
     printf 'internal: control-plane\n' > "café.md"   # C-quoted by git ls-files
     printf 'x\0see ADR-0999 here\n' > binary.bin      # NUL: "binary" to grep
@@ -334,6 +527,7 @@ EOF
   echo "self-test: OK — $tested known-internal string(s) matched, $innocent innocent string(s) passed, scan fixture 6/6"
 }
 
+roster_is_already_published
 selftest
 
 # ---------------------------------------------------------------------------
