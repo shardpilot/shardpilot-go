@@ -55,9 +55,10 @@
 #
 # THE ENUMERATOR IS THE GO GRAMMAR, NOT grep AND NOT STDOUT
 # ---------------------------------------------------------
-# Both questions — what exists, and what runs here — are answered by
-# scripts/benchlist.go, which parses declarations with go/parser and classifies
-# files with go/build.
+# What EXISTS comes from go/parser, over every tracked test file
+# (scripts/benchlist.go). What RUNS HERE comes from `go list`, which already
+# knows what this configuration compiles — build tags, -race, CGO_ENABLED, GOOS
+# and the rest — so nothing here re-derives it and gets one of them wrong.
 #
 # Not a pattern, because `func /* requires API (Windows) */ BenchmarkFoo` is
 # legal and gofmt-clean, and a pattern that skips the comment has to decide
@@ -171,20 +172,34 @@ if ! git ls-files -z -- '*_test.go' >"$tmp/tracked_z"; then
   fail "git ls-files failed — cannot determine which test files are tracked"
 fi
 
-# The flags the accompanying `go test` will build with. `go test` reads GOFLAGS
-# itself, but go/build does not — so without handing them over, a benchmark
-# behind `//go:build integration` would be called unbuildable in the very run
-# that is about to execute it. `go env` rather than $GOFLAGS so a value set by
-# `go env -w` counts too. The string is passed on whole and parsed with Go's
-# quoting grammar there, because GOFLAGS may legally be quoted.
+# The effective GOFLAGS, read only so an `-overlay` can be refused: it makes
+# `go test` build content that is not what is on disk, while everything here is
+# read from the tracked working tree. `go env` rather than $GOFLAGS so a value
+# set by `go env -w` counts too, and the string is passed on whole because
+# GOFLAGS may legally be quoted — parsing it belongs where that grammar is.
 if ! goflags="$(go env -json=false GOFLAGS 2>"$tmp/flagerr")"; then
   cat "$tmp/flagerr" >&2
   fail "go env GOFLAGS failed — cannot determine the build flags in effect"
 fi
 
-if ! go run scripts/benchlist.go "$MODULE" "$goflags" <"$tmp/tracked_z" >"$tmp/rows" 2>"$tmp/rowserr"; then
+# Which test files THIS configuration compiles, asked of the go command rather
+# than worked out here. That answer depends on -tags (whose value has its own
+# space-separated grammar), -race, a CGO_ENABLED persisted by `go env -w`,
+# GOOS, GOARCH — and on whatever is added next. Re-deriving it was a second
+# description of the same set, free to disagree with the one that matters.
+#
+# One NUL around each path, so a file name containing a space, a tab or a
+# newline survives, and `go list`'s own per-package newline lands between two
+# NULs as a record of its own rather than glued to a path.
+# shellcheck disable=SC2016  # $d is a Go template variable, not a shell one
+if ! go list -e -json=false -f '{{$d := .Dir}}{{range .TestGoFiles}}{{"\x00"}}{{$d}}/{{.}}{{"\x00"}}{{end}}{{range .XTestGoFiles}}{{"\x00"}}{{$d}}/{{.}}{{"\x00"}}{{end}}' ./... >"$tmp/compiled_z" 2>"$tmp/listerr"; then
+  cat "$tmp/listerr" >&2
+  fail "go list failed — the set of compiled test files could not be determined"
+fi
+
+if ! go run scripts/benchlist.go "$MODULE" "$goflags" "$tmp/compiled_z" <"$tmp/tracked_z" >"$tmp/rows" 2>"$tmp/rowserr"; then
   cat "$tmp/rowserr" >&2
-  fail "could not read the tracked test files — see above"
+  fail "scripts/benchlist.go refused or failed — see above"
 fi
 
 active_rows="$(awk -F'\t' '$1 == "A" { print $2 "\t" $3 }' "$tmp/rows")"

@@ -10,12 +10,20 @@
 //	A\t<import path>\t<BenchmarkName>   this configuration compiles the file
 //	I\t<import path>\t<BenchmarkName>   it does not
 //
-// A second argument, the effective GOFLAGS string, supplies the build tags the
-// accompanying `go test` will use — go/build has no way to learn those on its
-// own. It is parsed here, with Go's own quoting grammar, rather than in the
-// shell: `GOFLAGS="'-tags=integration'"` is valid and the go command strips
-// those quotes, so a field-splitting extractor silently finds no tags and
-// classifies a runnable benchmark as unbuildable.
+// The active/inactive split is NOT decided here. The third argument names a
+// file holding the test files `go list` says this configuration compiles, and
+// a declaration is active exactly when its file is in that set.
+//
+// That indirection is the point. Deciding it here meant re-deriving "what
+// would go test compile", and every input that answer depends on is another
+// chance to get it wrong: -tags (whose value has its own space-separated
+// grammar), -race, a CGO_ENABLED persisted with `go env -w`, and whatever is
+// added next. The go command already computes it, and its answer cannot
+// disagree with itself.
+//
+// The second argument, the effective GOFLAGS, is read only to refuse
+// `-overlay`: it makes the built content differ from the tracked files this
+// tool reads, and those two answers cannot be reconciled here.
 //
 // Rows are printed once per DECLARATION, not per identity, so the caller can
 // see a name declared twice in one package — which `go test` permits (an
@@ -59,7 +67,6 @@ import (
 	"bufio"
 	"fmt"
 	"go/ast"
-	"go/build"
 	"go/parser"
 	"go/token"
 	"io"
@@ -72,30 +79,27 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 2 || len(os.Args) > 3 {
-		fmt.Fprintln(os.Stderr, "usage: benchlist <module-path> [GOFLAGS] < NUL-separated-paths")
+	if len(os.Args) != 4 {
+		fmt.Fprintln(os.Stderr, "usage: benchlist <module-path> <GOFLAGS> <compiled-list-file> < NUL-separated-paths")
 		os.Exit(2)
 	}
 	module := os.Args[1]
 
-	// `go test -tags=x` compiles files guarded by `//go:build x`, but nothing
-	// tells go/build that: `-tags` is a command-line flag, and Default.BuildTags
-	// is empty. Without this, a benchmark the accompanying run WILL execute is
-	// classified inactive, which either fails the unbuildable check or has to be
-	// opted out — and opting it out then stops it running for real.
-	//
-	// GOOS and GOARCH need no such handling: go/build.Default already reads them
-	// from the environment, so a GOARCH=386 run classifies `_386_test.go` files
-	// correctly on its own.
-	if len(os.Args) == 3 && os.Args[2] != "" {
-		tags, err := tagsFromGOFLAGS(os.Args[2])
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "benchlist: GOFLAGS:", err)
-			os.Exit(1)
-		}
-		if len(tags) > 0 {
-			build.Default.BuildTags = tags
-		}
+	if err := refuseOverlay(os.Args[2]); err != nil {
+		fmt.Fprintln(os.Stderr, "benchlist:", err)
+		os.Exit(1)
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "benchlist: cwd:", err)
+		os.Exit(1)
+	}
+
+	compiled, err := compiledSet(os.Args[3], cwd)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "benchlist:", err)
+		os.Exit(1)
 	}
 
 	data, err := io.ReadAll(os.Stdin)
@@ -130,15 +134,8 @@ func main() {
 			pkg = module + "/" + dir
 		}
 
-		active, err := isActive(rel, dir)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "benchlist:", err)
-			failed = true
-
-			continue
-		}
 		tag := "I"
-		if active {
+		if compiled[rel] {
 			tag = "A"
 		}
 
@@ -160,29 +157,6 @@ func main() {
 	if failed {
 		os.Exit(1)
 	}
-}
-
-// tagsFromGOFLAGS returns the build tags the go command would apply from this
-// GOFLAGS value: the last -tags flag wins, as it does in Go's own parsing.
-func tagsFromGOFLAGS(goflags string) ([]string, error) {
-	fields, err := splitQuoted(goflags)
-	if err != nil {
-		return nil, err
-	}
-
-	tags := ""
-	for _, f := range fields {
-		for _, prefix := range []string{"-tags=", "--tags="} {
-			if v, ok := strings.CutPrefix(f, prefix); ok {
-				tags = v
-			}
-		}
-	}
-	if tags == "" {
-		return nil, nil
-	}
-
-	return strings.Split(tags, ","), nil
 }
 
 // splitQuoted mirrors cmd/internal/quoted.Split, which is what the go command
@@ -227,6 +201,63 @@ func isSpaceByte(c byte) bool {
 	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
 }
 
+// compiledSet reads the paths `go list` reported for this configuration and
+// returns them as repository-relative names, matching the form the tracked
+// file list arrives in.
+func compiledSet(listFile, cwd string) (map[string]bool, error) {
+	data, err := os.ReadFile(listFile)
+	if err != nil {
+		return nil, fmt.Errorf("reading the compiled-file list: %w", err)
+	}
+
+	set := map[string]bool{}
+	for _, p := range strings.Split(string(data), "\x00") {
+		// `go list -f` writes a newline after each package's template output,
+		// which lands between two NULs as a record of its own.
+		if strings.TrimSpace(p) == "" {
+			continue
+		}
+		rel, err := filepath.Rel(cwd, p)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", p, err)
+		}
+		set[filepath.ToSlash(rel)] = true
+	}
+	// No vacuity guard here on purpose: an empty set makes every declaration
+	// inactive, and refusing to report a pass over nothing is already the
+	// caller's job one step later.
+	return set, nil
+}
+
+// refuseOverlay rejects a GOFLAGS carrying -overlay.
+//
+// An overlay makes `go test` build file contents that are not the ones on
+// disk, while everything here is read from the tracked working tree. The two
+// answers about which benchmarks exist would then differ with nothing to
+// reconcile them: an overlay that adds a benchmark leaves it undeclared,
+// unselected and unasserted, and CI reports success over it.
+//
+// GOFLAGS is split with the grammar cmd/internal/quoted.Split implements,
+// which is what the go command uses to read it — `GOFLAGS="'-overlay=x.json'"`
+// is a valid way to set it, and a plain whitespace split would not see the
+// flag through the quotes.
+func refuseOverlay(goflags string) error {
+	fields, err := splitQuoted(goflags)
+	if err != nil {
+		return fmt.Errorf("GOFLAGS: %w", err)
+	}
+
+	for _, f := range fields {
+		if f == "-overlay" || f == "--overlay" ||
+			strings.HasPrefix(f, "-overlay=") || strings.HasPrefix(f, "--overlay=") {
+			return fmt.Errorf("GOFLAGS carries %s; this reads the tracked files on disk, so "+
+				"an overlay's benchmarks would be built but never declared or asserted", f)
+		}
+	}
+
+	return nil
+}
+
 // skipped reports whether a file sits INSIDE a vendored tree, which `./...`
 // never walks. Vendored code is not authored here, so demanding that the
 // repository declare its benchmarks would be noise rather than a signal.
@@ -237,6 +268,12 @@ func isSpaceByte(c byte) bool {
 // ./...` reports it and runs its benchmarks. Only a package BELOW such a
 // directory is vendored, so the `vendor` element has to be followed by at
 // least one more directory before the file name.
+//
+// This is the only walk rule left here. `testdata`, and directories beginning
+// with `.` or `_`, need none: the go command does not walk them either, so
+// their files are simply absent from the compiled set and come out inactive —
+// which is what should happen, since a benchmark sitting in one needs someone
+// to say out loud that it is not meant to run.
 func skipped(rel string) bool {
 	segs := strings.Split(rel, "/")
 
@@ -249,32 +286,6 @@ func skipped(rel string) bool {
 	}
 
 	return false
-}
-
-// isActive reports whether `go test ./...` would compile this file here.
-//
-// Two things have to be true. The go command must WALK the directory: it skips
-// `testdata` and any element beginning with `.` or `_`. And the build context
-// must ACCEPT the file: `//go:build` constraints and the `_windows_test.go`
-// style name suffixes, both of which go/build already evaluates.
-//
-// `testdata` is deliberately reported inactive rather than skipped outright.
-// The go command ignores it, which is exactly why a benchmark sitting there
-// needs someone to say out loud that it is not meant to run — the difference
-// between "excluded on purpose" and "moved here and forgotten".
-func isActive(rel, dir string) (bool, error) {
-	for _, seg := range strings.Split(rel, "/") {
-		if seg == "testdata" || strings.HasPrefix(seg, ".") || strings.HasPrefix(seg, "_") {
-			return false, nil
-		}
-	}
-
-	match, err := build.Default.MatchFile(filepath.FromSlash(dir), path.Base(rel))
-	if err != nil {
-		return false, fmt.Errorf("%s: %w", rel, err)
-	}
-
-	return match, nil
 }
 
 // isBenchmarkFunc mirrors cmd/go's own test for which declarations `go test`
