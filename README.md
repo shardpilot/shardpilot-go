@@ -7,7 +7,7 @@
 Real, tested, working code — **early alpha**. The API is pre-v1 and may change before v1.
 
 - Two import paths: the root `shardpilot` package (analytics) and `pkg/crash` (crash reporting).
-- Module `go` directive is **1.24** (the source-compatibility baseline for SDK consumers). CI verifies both Go 1.24.x and the current toolchain (1.26.5).
+- Module `go` directive is **1.25** (the source-compatibility baseline for SDK consumers). CI verifies both Go 1.25.x and the current toolchain (1.27.x).
 - Pre-launch: ingest endpoints are reached via the local Compose stack or a deployed environment you provide; there is no public production endpoint.
 
 ## What it does
@@ -36,7 +36,7 @@ go get github.com/shardpilot/shardpilot-go@v0.6.0-alpha
 go get github.com/shardpilot/shardpilot-go@v0.5.0-alpha
 ```
 
-For analytics only, `v0.1.2` is available. **`v0.1.0` is retracted** in the module's `go.mod` (use `v0.1.2` or `v0.2.0-alpha` or later). `v0.1.2` and later require **Go 1.24+**.
+For analytics only, `v0.1.2` is available. **`v0.1.0` is retracted** in the module's `go.mod` (use `v0.1.2` or `v0.2.0-alpha` or later). `v0.1.2` and later require **Go 1.25+**.
 
 ## Quick start (analytics)
 
@@ -303,7 +303,7 @@ Defaults: issuer `shardpilot`, audience `shardpilot-ingest`, lifetime 5m (equal 
 
 ## Build & test
 
-No Makefile — standard Go tooling. CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `gofmt` check, `go test ./...`, and `go vet ./...` on Go 1.24.x and 1.26.5, plus a release version-consistency check (`scripts/check_release_consistency.sh`; see [`docs/release.md`](docs/release.md)).
+No Makefile — standard Go tooling. CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `gofmt` check, `go test ./...`, and `go vet ./...` on Go 1.25.x and 1.27.x, plus a release version-consistency check (`scripts/check_release_consistency.sh`; see [`docs/release.md`](docs/release.md)).
 
 ```bash
 go build ./...
@@ -318,7 +318,7 @@ gofmt -l .
 - **No domain logic in core.** No product-specific event names or game/vertical fields in the universal envelope.
 - **The SDK only sends telemetry.** It performs no provider, model, GitHub, billing, or account-management write calls, and triggers no automatic actions.
 - **Fail-safe HTTP.** HTTPS required outside localhost/loopback (private-network HTTP only via explicit opt-in). No durable local queue unless the opt-in disk spool is configured (`SpoolDir`); no retry storms; the worker retains at most one failed in-memory batch.
-- The `go` directive stays at **1.24** for consumer compatibility even though CI also exercises the current toolchain.
+- The `go` directive is held deliberately below the current toolchain for consumer compatibility — **1.25** today — even though CI also exercises the current toolchain. It moves only when the SDK needs something the older baseline cannot express: 1.25 was taken for `testing/synctest`, which lets the retry and flush-pacing tests run on a fake clock instead of real sleeps.
 
 ## Roadmap
 

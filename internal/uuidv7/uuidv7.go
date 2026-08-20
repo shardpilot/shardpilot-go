@@ -2,6 +2,13 @@
 //
 // It is the single UUIDv7 implementation shared by the analytics SDK
 // (anonymous IDs, consent idempotency keys) and the crash SDK (crash IDs).
+//
+// Go 1.27 added a standard-library uuid package whose NewV7 would replace this
+// file exactly. It is deliberately not used: the module's go directive is the
+// source-compatibility baseline for SDK consumers and sits below 1.27 on
+// purpose, so importing it would push every consumer onto a newer toolchain to
+// save us seventy lines. Revisit only if the baseline reaches 1.27 for a reason
+// of its own.
 package uuidv7
 
 import (

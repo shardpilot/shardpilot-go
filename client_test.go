@@ -765,24 +765,97 @@ func TestPublishWorkerBatchRetainsFailedBatch(t *testing.T) {
 	}
 }
 
+// TestSourceCompatibilityBaselineAndCIMatrix asserts the invariant, not the
+// numbers: whatever go.mod declares as the source-compatibility baseline must
+// actually be exercised by CI, alongside at least one newer toolchain.
+//
+// It used to pin the literals ("go 1.24", "'1.24.x'", "'1.26.5'"), which meant
+// every baseline bump broke this test in a way that looked like a failure
+// rather than a decision, and tempted whoever hit it to edit the constant
+// without checking the matrix. Deriving the expectation from go.mod keeps the
+// guard — a baseline nothing builds against is not a baseline — while letting
+// the version move in one place.
 func TestSourceCompatibilityBaselineAndCIMatrix(t *testing.T) {
 	goMod, err := os.ReadFile("go.mod")
 	if err != nil {
 		t.Fatalf("read go.mod: %v", err)
 	}
-	if !strings.Contains(string(goMod), "\ngo 1.24\n") {
-		t.Fatalf("go.mod must keep Go 1.24 source-compatibility baseline:\n%s", string(goMod))
-	}
+	baseline := goDirectiveVersion(t, string(goMod))
+	majorMinor := baselineMajorMinor(t, baseline)
 
 	workflow, err := os.ReadFile(".github/workflows/ci.yml")
 	if err != nil {
 		t.Fatalf("read CI workflow: %v", err)
 	}
-	for _, version := range []string{"'1.24.x'", "'1.26.5'"} {
-		if !strings.Contains(string(workflow), version) {
-			t.Fatalf("CI workflow missing Go matrix version %s", version)
+	legs := ciMatrixGoVersions(string(workflow))
+	if len(legs) < 2 {
+		t.Fatalf("CI matrix must exercise the baseline AND a newer toolchain, got %v", legs)
+	}
+
+	baselineCovered := false
+	newerCovered := false
+	for _, leg := range legs {
+		switch {
+		case strings.HasPrefix(leg, majorMinor+"."):
+			baselineCovered = true
+		case leg > majorMinor:
+			newerCovered = true
 		}
 	}
+	if !baselineCovered {
+		t.Errorf("go.mod declares baseline go %s but no CI matrix leg builds %s.x; legs = %v",
+			baseline, majorMinor, legs)
+	}
+	if !newerCovered {
+		t.Errorf("CI matrix has no leg newer than the %s baseline, so nothing checks the SDK against a current toolchain; legs = %v",
+			majorMinor, legs)
+	}
+}
+
+// goDirectiveVersion returns the version on go.mod's `go` line.
+func goDirectiveVersion(t *testing.T, goMod string) string {
+	t.Helper()
+	for _, line := range strings.Split(goMod, "\n") {
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), "go "); ok {
+			return strings.TrimSpace(rest)
+		}
+	}
+	t.Fatalf("go.mod has no go directive:\n%s", goMod)
+	return ""
+}
+
+// baselineMajorMinor reduces "1.25.0" (or "1.25") to "1.25", which is the form
+// a setup-go matrix leg is written in.
+func baselineMajorMinor(t *testing.T, version string) string {
+	t.Helper()
+	parts := strings.Split(version, ".")
+	if len(parts) < 2 {
+		t.Fatalf("go directive %q is not major.minor[.patch]", version)
+	}
+	return parts[0] + "." + parts[1]
+}
+
+// ciMatrixGoVersions pulls the quoted versions out of the workflow's
+// go-version matrix list.
+func ciMatrixGoVersions(workflow string) []string {
+	var versions []string
+	inMatrix := false
+	for _, line := range strings.Split(workflow, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "go-version:" {
+			inMatrix = true
+			continue
+		}
+		if !inMatrix {
+			continue
+		}
+		if !strings.HasPrefix(trimmed, "- ") {
+			inMatrix = false
+			continue
+		}
+		versions = append(versions, strings.Trim(strings.TrimPrefix(trimmed, "- "), "'\""))
+	}
+	return versions
 }
 
 func waitForClientClosed(t *testing.T, client *Client) {

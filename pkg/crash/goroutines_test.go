@@ -167,3 +167,117 @@ func TestExtraGoroutineThreadsExcludesSelfAndBudgets(t *testing.T) {
 		t.Fatalf("no captured thread parks in parkedForGoroutineTest; threads: %+v", threads)
 	}
 }
+
+// labelledGoroutineDumpFixture is what runtime.Stack(all) produces once the
+// embedding application sets runtime/pprof labels and is built with a go 1.27+
+// directive. The labels are the application's own text: here a route, a tenant
+// and a value containing ']', which is the shape that used to corrupt the state.
+const labelledGoroutineDumpFixture = "goroutine 1 [running] {route: /v1/ingest, tenant: \"acme-123\"}:\n" +
+	"main.main()\n" +
+	"\t/home/build/work/app/main.go:10 +0x1a\n" +
+	"\n" +
+	"goroutine 7 [select] {route: \"/v1/items[id]\", user_id: \"u-42\"}:\n" +
+	"github.com/acme/game/server.(*Loop).run(0xc000010000)\n" +
+	"\t/home/build/work/app/server/loop.go:42 +0x25\n" +
+	"\n" +
+	"goroutine 18 [chan receive, 3 minutes] {email: \"player@example.com\"}:\n" +
+	"github.com/acme/game/server.(*Queue).pop()\n" +
+	"\t/home/build/work/app/server/queue.go:8 +0x11\n"
+
+// TestParseGoroutineHeaderIgnoresGo127Labels pins both halves of the Go 1.27
+// traceback-label change: the state must stay exactly what the runtime reported,
+// and no label text may survive into anything the parser returns. Thread.Name is
+// built from that state and ships in the crash report, so a label leaking into it
+// would put caller-supplied tenant or user text on the wire.
+func TestParseGoroutineHeaderIgnoresGo127Labels(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		line      string
+		wantID    string
+		wantState string
+	}{
+		{
+			name:      "unlabelled header is unchanged",
+			line:      "goroutine 1 [running]:",
+			wantID:    "1",
+			wantState: "running",
+		},
+		{
+			name:      "qualified state is unchanged",
+			line:      "goroutine 18 [chan receive, 5 minutes]:",
+			wantID:    "18",
+			wantState: "chan receive, 5 minutes",
+		},
+		{
+			name:      "labels after the state are ignored",
+			line:      "goroutine 1 [running] {route: /v1/ingest, tenant: \"acme-123\"}:",
+			wantID:    "1",
+			wantState: "running",
+		},
+		{
+			name:      "a label value containing ] does not extend the state",
+			line:      "goroutine 7 [select] {route: \"/v1/items[id]\", user_id: \"u-42\"}:",
+			wantID:    "7",
+			wantState: "select",
+		},
+		{
+			name:      "labels without the trailing colon still parse",
+			line:      "goroutine 9 [IO wait] {tenant: \"acme\"}",
+			wantID:    "9",
+			wantState: "IO wait",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id, state, ok := parseGoroutineHeader(tc.line)
+			if !ok {
+				t.Fatalf("header not parsed: %q", tc.line)
+			}
+			if id != tc.wantID {
+				t.Errorf("id = %q, want %q", id, tc.wantID)
+			}
+			if state != tc.wantState {
+				t.Errorf("state = %q, want %q", state, tc.wantState)
+			}
+		})
+	}
+}
+
+// TestLabelledDumpKeepsLabelsOutOfThreads is the end-to-end half: every thread
+// this produces must be free of label text, since Thread.Name is the field the
+// state reaches and the whole record is what leaves the process.
+func TestLabelledDumpKeepsLabelsOutOfThreads(t *testing.T) {
+	records := parseGoroutineDump(labelledGoroutineDumpFixture)
+	if len(records) != 3 {
+		t.Fatalf("parsed %d records, want 3: %+v", len(records), records)
+	}
+
+	wantStates := map[string]string{
+		"1":  "running",
+		"7":  "select",
+		"18": "chan receive, 3 minutes",
+	}
+	for _, rec := range records {
+		want, known := wantStates[rec.id]
+		if !known {
+			t.Errorf("unexpected goroutine id %q", rec.id)
+			continue
+		}
+		if rec.state != want {
+			t.Errorf("goroutine %s state = %q, want %q", rec.id, rec.state, want)
+		}
+	}
+
+	// Nothing the parser returns may carry label text, in any field.
+	for _, forbidden := range []string{"tenant", "acme-123", "route", "/v1/ingest", "u-42", "player@example.com", "{", "}"} {
+		for _, rec := range records {
+			if strings.Contains(rec.state, forbidden) {
+				t.Errorf("goroutine %s state %q leaks label text %q", rec.id, rec.state, forbidden)
+			}
+			for _, frame := range rec.frames {
+				if strings.Contains(frame.Function, forbidden) || strings.Contains(frame.File, forbidden) {
+					t.Errorf("goroutine %s frame %+v leaks label text %q", rec.id, frame, forbidden)
+				}
+			}
+		}
+	}
+}
