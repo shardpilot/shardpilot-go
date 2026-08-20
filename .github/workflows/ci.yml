@@ -60,16 +60,14 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      # ⚠ fetch-depth: 0. The gate's roster rule asks whether each literal
-      # internal name already appears in this repository's PUBLISHED history,
-      # and actions/checkout defaults to a ONE-COMMIT clone. On that clone every
-      # literal reads as novel, so the gate refuses with exit 2 and blames the
-      # roster for a property of the checkout. Verified by cloning this branch
-      # with --depth 1 and running the gate: exit 2, "shallow checkout".
+      # No fetch-depth here on purpose. The gate's roster rule now asks whether
+      # each literal still appears in the TRACKED TREE, which a one-commit clone
+      # answers perfectly well — the earlier `fetch-depth: 0` existed only for
+      # the history-based version of that rule and was pure cost once the rule
+      # changed. Verified by cloning this branch with --depth 1 and running the
+      # gate: exit 0.
       - name: Checkout
         uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
 
       # This repository is already public, so it is NOT in the org's
       # publication-candidate list and nothing else scans it. See the script's

@@ -134,7 +134,7 @@ ROSTER_RE="$(roster_regex)"
 
 # The SHAPE half. These name no record, no ticket, no branch and no service, so
 # they are safe to publish in the file that gates against them.
-PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are) not (tested|covered|scanned|audited|monitored)|[Nn]o (automated )?(tests?|coverage|scanning|monitoring) (for|of|in)|[Nn]obody (looks|checks|monitors)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
+PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are) not (tested|covered|scanned|audited|monitored)|[Nn]o (automated )?(tests?|coverage|scanning|monitoring) (for|of|in)|[Nn]obody (looks|checks|monitors)|[Ll]acks( any| automated| an?)* ?[A-Za-z-]*[ ]?(harness|harnesses|coverage|tests?|suites?|monitoring)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 
 # Files the gate must not read as content: this script is the one place the
 # patterns are written down, by construction.
@@ -291,7 +291,10 @@ scan_tree() {
     fi
     # One corpus from here down, so the lane split below cannot see a
     # different set of hits from the one the statuses were computed over.
-    [ -n "$roster_hits" ] && hits="${hits:+${hits}$'\n'}${roster_hits}"
+    # `sort -u`: a single line can match BOTH passes — a comment carrying an
+    # ADR reference next to a service name — and would then be recorded twice,
+    # inflating the line count by one per such line. One command, no new pass.
+    [ -n "$roster_hits" ] && hits="$(printf '%s\n%s\n' "$hits" "$roster_hits" | grep -v '^$' | sort -u)"
     case "$f" in
       *.go)
         scan_lane_b_files=$((scan_lane_b_files + 1))
@@ -332,6 +335,10 @@ no automated scanning for that class of input
 a bare §7c left behind when a record id was stripped
 tracked as GAP-000 internally
 pinned to main @ 0000000
+nobody looks at that dashboard
+tracked as SP-123 in the internal board
+filed as AC-QA-7 during triage
+the console lacks automated tests
 (Codex go#48 round 3)
 EXAMPLE_SYNTHETIC_FLAG_MODE=off'
 KNOWN_INNOCENT='go get github.com/shardpilot/shardpilot-go@v0.6.0-alpha
