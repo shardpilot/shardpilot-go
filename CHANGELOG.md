@@ -5,9 +5,9 @@
 - **Module `go` directive moves to 1.25 (was 1.24).** The source-compatibility
   baseline for SDK consumers rises with it: the next release requires
   **Go 1.25+**. Already-published tags are unaffected — every tag from `v0.1.2`
-  through `v0.6.1-alpha` declares `go 1.24` in its own immutable `go.mod` and
-  keeps requiring Go 1.24+, as it always did. CI's matrix moves to `1.25.x`
-  (the baseline) and `1.27.x` (the current toolchain).
+  onward declares `go 1.24` in its own immutable `go.mod` and keeps requiring
+  Go 1.24+, as it always did. CI's matrix moves to `1.25.x` (the baseline) and
+  `1.27.x` (the current toolchain).
 
   Stated honestly, because the reason it was taken did not survive
   measurement: 1.25 was chosen for `testing/synctest`, expecting it to retire

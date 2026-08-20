@@ -324,7 +324,7 @@ gofmt -l .
 
 Pre-v1; the API is explicitly unstable.
 
-- The crash actor key (`Event.AnonymousID`; `Event.SessionID` is session linkage, not the actor key), the experiment-assignment consumer, the remote-config targeting-attribute pass-through, the Phase-D crash capture opt-ins and the client-side consent floor shipped in `v0.6.0-alpha`; the changelog's `Unreleased` section is currently empty.
+- The crash actor key (`Event.AnonymousID`; `Event.SessionID` is session linkage, not the actor key), the experiment-assignment consumer, the remote-config targeting-attribute pass-through, the Phase-D crash capture opt-ins and the client-side consent floor shipped in `v0.6.0-alpha`. The changelog's `Unreleased` section now carries two entries — the `go` directive moving to 1.25, and the goroutine-dump parser tolerating Go 1.27 traceback labels — so read it before upgrading.
 - Public developer docs are planned for `docs.shardpilot.com`; that domain is not yet provisioned.
 
 `v0.3.0-alpha` (tagged) removed the game-flavored `MatchID` field from the universal `Event` envelope; carry that context in `Props["match_id"]` instead (wire payload unchanged).
