@@ -36,7 +36,7 @@ go get github.com/shardpilot/shardpilot-go@v0.6.0-alpha
 go get github.com/shardpilot/shardpilot-go@v0.5.0-alpha
 ```
 
-For analytics only, `v0.1.2` is available. **`v0.1.0` is retracted** in the module's `go.mod` (use `v0.1.2` or `v0.2.0-alpha` or later). `v0.1.2` and later require **Go 1.25+**.
+For analytics only, `v0.1.2` is available. **`v0.1.0` is retracted** in the module's `go.mod` (use `v0.1.2` or `v0.2.0-alpha` or later). `v0.1.2` requires **Go 1.24+** — it is the Go 1.24 modernization release and its `go` directive is immutable. The **1.25** baseline stated above applies to the next release and to the current `main`, not retroactively to any existing tag.
 
 ## Quick start (analytics)
 
@@ -318,7 +318,7 @@ gofmt -l .
 - **No domain logic in core.** No product-specific event names or game/vertical fields in the universal envelope.
 - **The SDK only sends telemetry.** It performs no provider, model, GitHub, billing, or account-management write calls, and triggers no automatic actions.
 - **Fail-safe HTTP.** HTTPS required outside localhost/loopback (private-network HTTP only via explicit opt-in). No durable local queue unless the opt-in disk spool is configured (`SpoolDir`); no retry storms; the worker retains at most one failed in-memory batch.
-- The `go` directive is held deliberately below the current toolchain for consumer compatibility — **1.25** today — even though CI also exercises the current toolchain. It moves only when the SDK needs something the older baseline cannot express: 1.25 was taken for `testing/synctest`, which lets the retry and flush-pacing tests run on a fake clock instead of real sleeps.
+- The `go` directive is held deliberately below the current toolchain for consumer compatibility — **1.25** today — even though CI also exercises the current toolchain. It moves only when the SDK needs something the older baseline cannot express: 1.25 was taken for `testing/synctest`, which is available to tests written against it from here on. It did **not** retire the existing suite's real-time waits, and no test currently imports it — the retry and flush-pacing tests still run on the real clock. See the `Unreleased` entry in [`CHANGELOG.md`](CHANGELOG.md) for the measurement behind that.
 
 ## Roadmap
 
