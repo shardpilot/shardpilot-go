@@ -160,38 +160,51 @@ func main() {
 }
 
 // splitQuoted mirrors cmd/internal/quoted.Split, which is what the go command
-// uses to read GOFLAGS. Fields are separated by whitespace; single and double
-// quotes group without nesting and are removed; there are no escapes. So
-// `'-tags=integration'` is one field reading -tags=integration, which a plain
-// whitespace split would leave with its quotes attached and fail to recognise.
+// uses to read GOFLAGS.
+//
+// The rule that is easy to get wrong — and that I did get wrong — is WHERE a
+// quote counts. A quote is a delimiter only at the start of a field; one
+// further in is an ordinary character, as the upstream comment says outright:
+// "Quotes further inside the string do not count." So
+//
+//	-ldflags=-X=example.com/x.Version='dev
+//
+// is one perfectly valid field that `go test` accepts, not an unterminated
+// string. Treating that apostrophe as an opening quote made this refuse a
+// configuration the go command is happy with.
 func splitQuoted(s string) ([]string, error) {
 	var fields []string
 
-	for i := 0; i < len(s); {
-		for i < len(s) && isSpaceByte(s[i]) {
-			i++
+	for len(s) > 0 {
+		for len(s) > 0 && isSpaceByte(s[0]) {
+			s = s[1:]
 		}
-		if i >= len(s) {
+		if len(s) == 0 {
 			break
 		}
 
-		var b strings.Builder
-		var quote byte
-		for i < len(s) && (quote != 0 || !isSpaceByte(s[i])) {
-			switch {
-			case quote != 0 && s[i] == quote:
-				quote = 0
-			case quote == 0 && (s[i] == '\'' || s[i] == '"'):
-				quote = s[i]
-			default:
-				b.WriteByte(s[i])
+		if s[0] == '"' || s[0] == '\'' {
+			quote := s[0]
+			s = s[1:]
+			i := 0
+			for i < len(s) && s[i] != quote {
+				i++
 			}
+			if i >= len(s) {
+				return nil, fmt.Errorf("unterminated %c string", quote)
+			}
+			fields = append(fields, s[:i])
+			s = s[i+1:]
+
+			continue
+		}
+
+		i := 0
+		for i < len(s) && !isSpaceByte(s[i]) {
 			i++
 		}
-		if quote != 0 {
-			return nil, fmt.Errorf("unterminated %c string", quote)
-		}
-		fields = append(fields, b.String())
+		fields = append(fields, s[:i])
+		s = s[i:]
 	}
 
 	return fields, nil
