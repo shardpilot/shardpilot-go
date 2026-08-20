@@ -84,6 +84,11 @@
 # benchmark's to write is the harness's own `--- SKIP:` marker, and even that
 # exists only once the harness has started.
 #
+# The practical form of that boundary: a check earns its place by what it makes
+# impossible for an ACCIDENT, because that is the only class it can decide. A
+# check aimed at the liar buys a step of inconvenience at the price of refusing
+# honest code, and this file has paid that price more than once.
+#
 # Usage:
 #   scripts/run_benchmarks.sh                  # run, assert, print
 #   scripts/run_benchmarks.sh out/bench.txt    # …and write the raw output there
@@ -147,7 +152,26 @@ fail() {
 if ! git ls-files -- 'go.mod' '*/go.mod' >"$tmp/gomods"; then
   fail "git ls-files failed — cannot check for nested modules"
 fi
-nested_modules="$(grep -v '^go\.mod$' "$tmp/gomods" || true)"
+# Only modules in directories `./...` can actually reach. `go help packages` is
+# explicit that the go tool ignores directories named testdata and those
+# beginning with `.` or `_`, so a module fixture under one of them is not a
+# module this script would ever walk into — refusing the repository over
+# testdata/example/go.mod protected nothing and blocked a normal way to write a
+# test. Vendored trees follow the same rule benchlist.go uses: a `vendor`
+# element ABOVE the module directory means the module is inside vendored code,
+# while a go.mod in a directory that is itself named vendor is an ordinary
+# nested module and still refused.
+nested_modules="$(grep -v '^go\.mod$' "$tmp/gomods" | awk '
+  {
+    n = split($0, seg, "/")
+    for (i = 1; i < n; i++) {
+      s = seg[i]
+      if (s == "testdata" || substr(s, 1, 1) == "." || substr(s, 1, 1) == "_") next
+      if (s == "vendor" && i < n - 1) next
+    }
+    print
+  }
+' || true)"
 if [ -n "$nested_modules" ]; then
   echo >&2
   echo "This repository has modules below the root:" >&2
@@ -228,7 +252,6 @@ fi
 declared="$(awk -F'\t' 'NF >= 4 { print $2 "\t" $3 "\t" $4 }' "$tmp/rows" | sort -u)"
 declared_ids="$(printf '%s\n' "$declared" | cut -f1,2 | sed '/^$/d' | sort -u)"
 active_rows="$(awk -F'\t' '$1 == "A" { print $2 "\t" $3 }' "$tmp/rows")"
-no_harness="$(awk -F'\t' '$1 == "X" { print $2 }' "$tmp/rows" | sort -u)"
 enumerated="$(printf '%s\n' "$active_rows" | sed '/^$/d' | sort -u)"
 
 # Vacuity guard on the enumeration itself: reading zero names would make every
@@ -331,25 +354,13 @@ to_run="$(printf '%s\n' "$enumerated" | comm -23 - <(printf '%s\n' "$exempt" | s
 
 [ -n "$to_run" ] || fail "every enumerated benchmark is in BENCHMARKS_NOT_RUN_IN_CI — nothing would be measured"
 
-# A package whose TestMain never calls m.Run runs no benchmarks at all: the go
-# command calls TestMain INSTEAD of the harness, so it exits zero having
-# measured nothing — and with the harness never started there are no skip
-# markers either, so anything the package prints reads as a result.
-#
-# This catches the honest mistake, a TestMain that forgets the harness. It does
-# not close the class; see WHAT THIS CANNOT DO at the top of this file.
-if [ -n "$no_harness" ]; then
-  affected="$(printf '%s\n' "$no_harness" | comm -12 - <(printf '%s\n' "$to_run" | cut -f1 | sort -u))"
-  if [ -n "$affected" ]; then
-    echo >&2
-    echo "These packages define a TestMain that never calls m.Run:" >&2
-    printf '%s\n' "$affected" | sed 's/^/    /' >&2
-    echo >&2
-    echo "  go test calls TestMain INSTEAD of the harness, so their benchmarks" >&2
-    echo "  never run and nothing reports them missing. Call m.Run." >&2
-    fail "a TestMain would bypass the benchmark harness"
-  fi
-fi
+# There is deliberately no TestMain check here. A TestMain that never calls
+# m.Run does bypass the harness — but the package then reports nothing, and the
+# execution check below already names every benchmark that failed to report.
+# The only case the syntactic check added was a package ALSO printing forged
+# rows, and one unreachable `m.Run()` satisfied it while the harness still
+# never started. It refused a legitimate TestMain that delegates through a
+# helper, which is the cost it was charging for that. See WHAT THIS CANNOT DO.
 
 # `-benchtime=100x` rather than the default 1s per benchmark: a fixed iteration
 # count keeps the CI step bounded and the allocation figures (the part worth
@@ -440,8 +451,14 @@ while IFS= read -r pkg; do
         # float64, so a benchmark reporting only custom metrics can legitimately
         # print `-1.000 items/op`, `NaN score` or `+Inf score`. Demanding a
         # leading digit called those "no result".
+        #
+        # The unit is not tested at all. b.ReportMetric accepts any non-empty
+        # unit without whitespace — `3widgets/op` among them — and awk has
+        # already split on whitespace, so `NF >= 4` says everything about $4
+        # that is true of every unit. Requiring a non-digit there rejected a
+        # row the harness really prints.
         if (NF >= 4 && $2 ~ /^[0-9]+$/ &&
-            $3 ~ /^[-+]?([0-9]|[Nn][Aa][Nn]|[Ii][Nn][Ff])/ && $4 ~ /^[^0-9]/) reported[name] = 1
+            $3 ~ /^[-+]?([0-9]|[Nn][Aa][Nn]|[Ii][Nn][Ff])/) reported[name] = 1
       }
       END {
         for (k in expected) if (!(k in reported) || (k in skipped)) print pkg "\t" k

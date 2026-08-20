@@ -134,20 +134,6 @@ func main() {
 			continue
 		}
 
-		// The manifest is line- and tab-separated and now records the declaring
-		// file, so a name carrying either delimiter has no representable row.
-		// Refusing is justified by what it makes impossible rather than by the
-		// shape of the input: the alternative is a manifest that cannot state
-		// what exists. Only files that actually declare something are affected,
-		// which is checked below.
-		if strings.ContainsAny(rel, "\t\n") {
-			fmt.Fprintf(os.Stderr, "benchlist: %q: a test file name containing a tab or a newline "+
-				"cannot be recorded in the manifest\n", rel)
-			failed = true
-
-			continue
-		}
-
 		dir := path.Dir(rel)
 		pkg := module
 		if dir != "." {
@@ -164,14 +150,26 @@ func main() {
 			if !ok || fn.Recv != nil || fn.Name == nil {
 				continue
 			}
-			if isBenchmarkFunc(fn) {
-				fmt.Fprintf(out, "%s\t%s\t%s\t%s\n", tag, pkg, fn.Name.Name, rel)
+			if !isBenchmarkFunc(fn) {
+				continue
 			}
-			// Only worth reporting for a file this configuration compiles: an
-			// inactive TestMain cannot affect this run.
-			if compiled[rel] && isTestMainWithoutRun(fn) {
-				fmt.Fprintf(out, "X\t%s\t%s\n", pkg, rel)
+
+			// The manifest is line- and tab-separated and records the declaring
+			// file, so a DECLARATION in a file whose name carries either
+			// delimiter has no representable row. The refusal belongs here, at
+			// the declaration, and not at the file: an ordinary test in a
+			// tab-named file needs no manifest row and `go test` runs it
+			// perfectly well, so refusing the repository over it was a refusal
+			// justified by the shape of a name rather than by a consequence.
+			if strings.ContainsAny(rel, "\t\n") {
+				fmt.Fprintf(os.Stderr, "benchlist: %q: a benchmark declared in a file whose name "+
+					"contains a tab or a newline cannot be recorded in the manifest\n", rel)
+				failed = true
+
+				continue
 			}
+
+			fmt.Fprintf(out, "%s\t%s\t%s\t%s\n", tag, pkg, fn.Name.Name, rel)
 		}
 	}
 
@@ -338,73 +336,6 @@ func skipped(rel string) bool {
 		if segs[i] == "vendor" {
 			return true
 		}
-	}
-
-	return false
-}
-
-// isTestMainWithoutRun reports whether fn is a TestMain that never invokes the
-// testing harness.
-//
-// When a package defines TestMain, `go test` calls it INSTEAD of running tests
-// and benchmarks itself; the harness only starts if TestMain calls m.Run. One
-// that returns without doing so exits zero having run nothing — and since the
-// harness never started, it emits no skip markers either, so a package can
-// print result-shaped lines and every check downstream reads them as
-// measurements.
-//
-// This is syntactic: it asks whether the parameter's Run method is called
-// anywhere in the body, not whether that call is reached. It therefore catches
-// the honest mistake — a TestMain that forgets the harness — and not a
-// deliberate one. That limit is real and the script header states it: every
-// byte these checks read is written by the package under test, so nothing can
-// distinguish "measured" from "claimed to have measured" against a package
-// that sets out to lie.
-func isTestMainWithoutRun(fn *ast.FuncDecl) bool {
-	if fn.Name.Name != "TestMain" || fn.Body == nil {
-		return false
-	}
-	if fn.Type.Params == nil || len(fn.Type.Params.List) != 1 ||
-		len(fn.Type.Params.List[0].Names) != 1 {
-		return false
-	}
-	ptr, ok := fn.Type.Params.List[0].Type.(*ast.StarExpr)
-	if !ok || !isNamed(ptr.X, "M") {
-		return false
-	}
-
-	param := fn.Type.Params.List[0].Names[0].Name
-	found := false
-	ast.Inspect(fn.Body, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok || sel.Sel.Name != "Run" {
-			return true
-		}
-		if ident, ok := sel.X.(*ast.Ident); ok && ident.Name == param {
-			found = true
-
-			return false
-		}
-
-		return true
-	})
-
-	return !found
-}
-
-// isNamed reports whether an expression is the identifier `name`, or a selector
-// ending in it — `M` or `testing.M`, since the import may be aliased and cmd/go
-// does not try to know which package it came from either.
-func isNamed(expr ast.Expr, name string) bool {
-	if ident, ok := expr.(*ast.Ident); ok {
-		return ident.Name == name
-	}
-	if sel, ok := expr.(*ast.SelectorExpr); ok {
-		return sel.Sel.Name == name
 	}
 
 	return false
