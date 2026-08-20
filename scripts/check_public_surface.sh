@@ -11,7 +11,19 @@
 # and an internal commit sha came to sit in a public repository for months. A
 # gate that runs where the exposure already exists is the fix.
 #
-# ── THE PATTERNS ARE SHAPES, NOT A ROSTER ───────────────────────────────────
+# ── ONE CLASS IS NOT ABOUT NAMES AT ALL ─────────────────────────────────────
+# NEGATIVE STATEMENTS ABOUT COVERAGE. "There is NO Playwright harness in the
+# console repo" names no service, no host and no credential, and it was the
+# single most valuable line in the material this gate was built after. It is
+# a published map of where our testing does not reach — an outsider does not
+# need a secret if they are told where nobody is looking.
+#
+# Deleting the file that carried it is not enough, because the next such
+# sentence will be written in good faith by someone documenting an honest
+# limit. Honesty about limits belongs in internal docs; in a repository that
+# publishes, it is reconnaissance. Hence a class rather than a cleanup.
+#
+# ── THE OTHER PATTERNS ARE SHAPES, NOT A ROSTER ─────────────────────────────
 # A gate against internal names, written as a list of internal names, publishes
 # that list. The first draft of this file did exactly that: it introduced five
 # internal names into this repository that had never appeared in it, and then
@@ -66,7 +78,7 @@ cd "$(dirname "$0")/.."
 
 # One pattern list, used by both lanes and by the self-test — two spellings is
 # how the second consumer comes to check something different from the first.
-PATTERNS='ADR-[0-9]+|§[0-9]|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|analytics[-_ ]service|crash[-_ ]symbolicator|control[-_ ]plane|shardpilot/(docs|qa|infra|integrations)|[Pp]roject[-_ ][Tt]ower|shepherd-pr|verification-discipline|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
+PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here is (no|NO) [A-Za-z]+ (harness|coverage|test|suite)|(is|are) not (tested|covered|scanned|audited|monitored)|no (automated )?(tests?|coverage|scanning|monitoring) (for|of|in)|nobody (looks|checks|monitors)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|analytics[-_ ]service|crash[-_ ]symbolicator|control[-_ ]plane|shardpilot/(docs|qa|infra|integrations)|[Pp]roject[-_ ][Tt]ower|shepherd-pr|verification-discipline|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 
 # Files the gate must not read as content: this script is the one place the
 # patterns are written down, by construction.
@@ -192,6 +204,9 @@ scan_tree() {
 # fail, and "the patterns compile" is not that demonstration.
 # ---------------------------------------------------------------------------
 KNOWN_INTERNAL='per ADR-0221 §3
+There is NO Playwright harness in the console repo
+the crash path is not covered by automated tests
+no automated scanning for that class of input
 a bare §7c left behind by a citation strip
 tracked as GAP-075 internally
 the control-plane assignment endpoint
