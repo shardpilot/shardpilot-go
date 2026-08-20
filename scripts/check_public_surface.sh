@@ -148,7 +148,7 @@ ROSTER_RE="$(roster_regex)"
 
 # The SHAPE half. These name no record, no ticket, no branch and no service, so
 # they are safe to publish in the file that gates against them.
-PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z]+ (harness|harnesses|coverage|tests?|suites?)|(is|are) not (tested|covered|scanned|audited|monitored)|[Nn]o (automated )?(tests?|coverage|scanning|monitoring) (for|of|in)|[Nn]obody (looks|checks|monitors)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
+PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are) not (tested|covered|scanned|audited|monitored)|[Nn]o (automated )?(tests?|coverage|scanning|monitoring) (for|of|in)|[Nn]obody (looks|checks|monitors)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 
 # The one legitimate collision with the `§` class, in ONE place so the scan
 # and the self-test cannot disagree about it. The first attempt put the
@@ -258,9 +258,16 @@ scan_tree() {
     # into two lines and matches nothing. `git ls-files -z` hands the raw name
     # over precisely so such a path is not lost, and then this check would have
     # dropped it anyway.
+    # ⚠ AND REJOINED, for the same reason the content pass needs it: a name
+    # wraps AT its separator, so flattening alone turns `control-<newline>plane`
+    # into `control- plane`. Both forms are tested — the flattened one for
+    # phrases, the rejoined one for identifiers.
     f_flat="$(printf '%s' "$f" | tr -s '[:space:]' ' ')"
+    f_join="$(printf '%s' "$f_flat" | sed -E 's/([-_/]) /\1/g')"
     if printf '%s\n' "$f_flat" | grep -qE -- "$PATTERNS" \
-       || printf '%s\n' "$f_flat" | grep -qiE -- "$ROSTER_RE"; then
+       || printf '%s\n' "$f_flat" | grep -qiE -- "$ROSTER_RE" \
+       || printf '%s\n' "$f_join" | grep -qE -- "$PATTERNS" \
+       || printf '%s\n' "$f_join" | grep -qiE -- "$ROSTER_RE"; then
       scan_lane_a="${scan_lane_a}${f}:path:${f}"$'\n'
     fi
     # -h: a symlink's published blob content IS its target path, so read the
@@ -275,6 +282,14 @@ scan_tree() {
                  printf '%s\n' "$link_flat" | grep -niE -- "$ROSTER_RE" || true; } )"
       [ -n "$hits" ] && scan_lane_a="${scan_lane_a}${f}:symlink-target:$(readlink "$root/$f")"$'\n'
       scan_files=$((scan_files + 1))
+      # A symlink IS gated by lane A — its target is reported into
+      # `scan_lane_a` three lines up — so it has to be counted there too.
+      # This branch `continue`d before the lane counter below, which meant a
+      # gated file was missing from the number lane A publishes about itself.
+      case "$f" in
+        *.go) ;;
+        *) scan_lane_a_files=$((scan_lane_a_files + 1)) ;;
+      esac
       continue
     fi
     [ -f "$root/$f" ] || continue
@@ -315,6 +330,21 @@ scan_tree() {
         exit 2
         ;;
     esac
+    # ⚠ AND A CONTAINER CAN HIDE BEHIND ANY PREAMBLE, not just an executable
+    # one: a shell script with a ZIP appended begins `#!/bin/sh` and passes
+    # every magic test above. Rather than widen the magic list one preamble at
+    # a time, refuse on the ZIP local-file signature ANYWHERE in the file.
+    #
+    # Still a refusal, not a parse — the point is that a human looks at it. The
+    # false-positive risk is a tracked file that happens to contain those four
+    # bytes, which is a thing worth looking at in a text-only tree anyway.
+    if grep -qa -- "$(printf 'PK\003\004')" "$root/$f" 2>/dev/null; then
+      echo "REFUSING: '$f' contains a ZIP local-file signature." >&2
+      echo "  Something in this file is a container, whatever its first bytes say," >&2
+      echo "  and no pass here reads container contents. Remove it, or extend this" >&2
+      echo "  gate to walk containers deliberately." >&2
+      exit 2
+    fi
     # -a treats a NUL-bearing file as text: GNU grep >= 3.5 otherwise prints
     # "binary file matches" to STDERR and nothing to stdout, so a hit inside a
     # committed binary reads as a clean file.
@@ -494,6 +524,7 @@ scan_tree() {
 # test needed.
 KNOWN_INTERNAL='per ADR-0000 §3
 There are no Playwright tests for the console.
+There are no end-to-end tests for the purchase flow.
 see ADR-0000; Apache-2.0 §4(d) applies too
 There is NO Playwright harness in the console repo
 the crash path is not covered by automated tests
