@@ -254,26 +254,35 @@ func compiledSet(listFile, cwd string) (map[string]bool, error) {
 // which is what the go command uses to read it — `GOFLAGS="'-overlay=x.json'"`
 // is a valid way to set it, and a plain whitespace split would not see the
 // flag through the quotes.
+//
+// The caller must build THIS FILE with overlays disabled. Otherwise an overlay
+// can replace the guard with something that approves of it, which is not a
+// hypothetical: swapping this file for one that printed the expected rows made
+// a run carrying an extra overlaid benchmark report OK over it.
 func refuseOverlay(goflags string) error {
 	fields, err := splitQuoted(goflags)
 	if err != nil {
 		return fmt.Errorf("GOFLAGS: %w", err)
 	}
 
+	// Last assignment wins, as it does in Go's own flag parsing: with
+	// `-overlay=x.json -overlay=` the empty one is effective and no overlay is
+	// applied, so refusing on the earlier field would reject a configuration
+	// under which disk and build contents cannot differ.
+	//
+	// A bare `-overlay` with no value is left alone: the go command rejects it
+	// as a usage error, and its message is the accurate one.
+	overlay := ""
 	for _, f := range fields {
 		for _, prefix := range []string{"-overlay=", "--overlay="} {
-			// Only a NON-EMPTY value is an overlay. `-overlay=` is a no-op to the
-			// go command — cmd/go/internal/fsys.Init returns immediately when the
-			// file name is empty — so refusing it would reject a configuration
-			// under which disk and build contents cannot differ.
-			//
-			// A bare `-overlay` with no value is left alone too: the go command
-			// rejects it as a usage error, and its message is the accurate one.
-			if v, ok := strings.CutPrefix(f, prefix); ok && v != "" {
-				return fmt.Errorf("GOFLAGS carries %s; this reads the tracked files on disk, so "+
-					"an overlay's benchmarks would be built but never declared or asserted", f)
+			if v, ok := strings.CutPrefix(f, prefix); ok {
+				overlay = v
 			}
 		}
+	}
+	if overlay != "" {
+		return fmt.Errorf("GOFLAGS sets -overlay=%s; this reads the tracked files on disk, so "+
+			"an overlay's benchmarks would be built but never declared or asserted", overlay)
 	}
 
 	return nil

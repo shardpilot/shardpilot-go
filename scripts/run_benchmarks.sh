@@ -197,7 +197,13 @@ if ! go list -e -json=false -f '{{$d := .Dir}}{{range .TestGoFiles}}{{"\x00"}}{{
   fail "go list failed — the set of compiled test files could not be determined"
 fi
 
-if ! go run scripts/benchlist.go "$MODULE" "$goflags" "$tmp/compiled_z" <"$tmp/tracked_z" >"$tmp/rows" 2>"$tmp/rowserr"; then
+# The helper is compiled by the go command, so an overlay can REPLACE it — and
+# the guard that refuses overlays would then be supplied by the overlay it is
+# meant to refuse. Appending `-overlay=` makes the last assignment empty, so
+# this one invocation is built from the tracked source; the captured GOFLAGS
+# still goes in as an argument, so what gets validated is the real
+# configuration rather than this deliberately weakened one.
+if ! GOFLAGS="$goflags -overlay=" go run scripts/benchlist.go "$MODULE" "$goflags" "$tmp/compiled_z" <"$tmp/tracked_z" >"$tmp/rows" 2>"$tmp/rowserr"; then
   cat "$tmp/rowserr" >&2
   fail "scripts/benchlist.go refused or failed — see above"
 fi
