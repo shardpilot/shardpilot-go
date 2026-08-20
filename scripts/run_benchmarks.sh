@@ -325,7 +325,12 @@ while IFS= read -r pkg; do
   # Anchored, so `BenchmarkFoo` cannot also select `BenchmarkFooBar`.
   # `-run '^$'` so no TEST runs here — this step measures, the test step tests,
   # and mixing them makes a benchmark failure look like a test failure.
-  if ! go test -json=false -run '^$' -bench "^(${names})"'$' -benchmem -benchtime="$BENCHTIME" "$pkg" >"$tmp/pkgout" 2>&1; then
+  # -v so the harness emits `--- SKIP:` for a benchmark that skips. A result
+  # row proves nothing on its own — the benchmark owns stdout and can print
+  # one — but it cannot suppress its own skip marker, so the two together are
+  # evidence where the row alone is not. The only cost is a bare name line per
+  # benchmark in the published output.
+  if ! go test -json=false -v -run '^$' -bench "^(${names})"'$' -benchmem -benchtime="$BENCHTIME" "$pkg" >"$tmp/pkgout" 2>&1; then
     cat "$raw" "$tmp/pkgout" >&2
     fail "benchmark run exited non-zero for $pkg"
   fi
@@ -354,19 +359,37 @@ while IFS= read -r pkg; do
           if (f[1] == pkg) expected[f[2]] = 1
         }
       }
+      # Written by the harness, and a benchmark cannot suppress its own — which
+      # is what makes it usable as evidence when a printed result row is not.
+      #
+      # Recorded under exactly the name printed, deliberately: a skipped
+      # SUB-benchmark is marked `Parent/child`, which never matches the
+      # top-level row `Parent`. So a child skipping cannot disqualify a parent
+      # that measured its other children, and that falls out of the naming
+      # rather than needing a rule of its own.
+      /^--- SKIP: / {
+        skipped[$3] = 1
+        next
+      }
       /^Benchmark/ {
         name = $1
         sub(/-[0-9]+$/, "", name)
         sub(/\/.*$/, "", name)
-        # Requiring the unit is what keeps an ordinary stdout line — `BenchmarkFoo 1`,
-        # printed by the benchmark itself before it skips — from passing as a
-        # measurement: in non-verbose output there is no skip marker to tell them
-        # apart. (A benchmark that suppresses ns/op via b.ReportMetric would need
-        # an opt-out; nothing here does that.)
-        if (NF >= 4 && $2 ~ /^[0-9]+$/ && $4 == "ns/op") seen[name] = 1
+        # A harness row is: name, iteration count, a number, a unit. That
+        # SHAPE is what separates a result from an ordinary diagnostic — not
+        # any particular unit. Demanding `ns/op` specifically called a
+        # benchmark reporting only custom metrics "no result", and
+        # b.ReportMetric(0, "ns/op") suppressing the built-in unit is a
+        # supported thing to do, so that was a false failure rather than a
+        # strictness worth keeping.
+        #
+        # None of this makes the row TRUSTWORTHY — the benchmark owns stdout
+        # and can print a perfectly shaped one — which is why the skip marker
+        # above is what actually decides.
+        if (NF >= 4 && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]/ && $4 ~ /^[^0-9]/) reported[name] = 1
       }
       END {
-        for (k in expected) if (!(k in seen)) print pkg "\t" k
+        for (k in expected) if (!(k in reported) || (k in skipped)) print pkg "\t" k
       }
     ' "$tmp/pkgout"
   )"
