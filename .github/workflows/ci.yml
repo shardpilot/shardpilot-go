@@ -11,6 +11,44 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Workspace security baseline, mirroring the pattern the other SDK
+  # repositories already run (godot/unity/unreal/cli). Both passes: the working
+  # tree and the full history across all refs, so a secret can neither live at
+  # HEAD nor hide in an earlier commit. Exact-pinned image; no .gitleaks.toml,
+  # because an allowlist entry is added only for a real, named false positive.
+  #
+  # ⚠ THIS REPOSITORY IS PUBLIC, which inverts the usual urgency. Everywhere
+  # else a missing secret scan is a gap to close before a visibility flip; here
+  # a credential is exposed at the moment it is pushed. It was measured on
+  # 2026-08-20 that this was one of only two candidate repositories running no
+  # secret scanner at all — and the only two already public.
+  #
+  # fetch-depth: 0 is required by the history pass and by nothing else in this
+  # workflow.
+  secret-scan:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Scan working tree for secrets
+        uses: docker://ghcr.io/gitleaks/gitleaks:v8.30.1
+        with:
+          args: dir --verbose --redact /github/workspace
+
+      - name: Scan git history for secrets
+        uses: docker://ghcr.io/gitleaks/gitleaks:v8.30.1
+        env:
+          GIT_CONFIG_COUNT: 1
+          GIT_CONFIG_KEY_0: safe.directory
+          GIT_CONFIG_VALUE_0: /github/workspace
+        with:
+          args: git --verbose --redact --log-opts=--all /github/workspace
   go:
     runs-on: ubuntu-latest
     timeout-minutes: 10
