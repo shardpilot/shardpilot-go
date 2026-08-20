@@ -6,12 +6,12 @@
 # simply produce a smaller set, match everything in it, and report success.
 #
 # It is also what makes a benchmark this platform cannot compile visible at
-# all. `go test -list` answers only for the configuration it is running in, so
-# a `//go:build windows` benchmark is invisible to it on a Linux runner. Every
-# tracked test file is therefore also parsed with go/parser, which has no build
-# configuration to be blind to, and anything it finds that the toolchain cannot
-# build is listed here too — alongside an entry in BENCHMARKS_NOT_RUN_IN_CI
-# saying it cannot run.
+# all. A `//go:build windows` benchmark cannot be enumerated by anything
+# running on a Linux runner, so every tracked test file is instead PARSED —
+# go/parser has no build configuration to be blind to — and go/build says which
+# of those files this configuration would actually compile. Anything that
+# exists but cannot be built here is listed below too, alongside an entry in
+# BENCHMARKS_NOT_RUN_IN_CI saying it cannot run.
 #
 # Adding or removing a benchmark fails CI until this file is updated in the
 # same change. That is the point — the diff here is the only place anyone

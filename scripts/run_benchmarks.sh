@@ -32,9 +32,10 @@
 # checked against the same tree it enumerates cannot notice a subtraction.
 #
 # And an enumeration made in ONE build configuration cannot notice a benchmark
-# that exists in another. `go test -list` answers for the platform and tags it
-# is invoked with; a `//go:build windows` benchmark is invisible to it on a
-# Linux runner — not run, not asserted, not reported missing.
+# that exists in another. Anything that enumerates by building answers only for
+# the platform and tags it runs under; a `//go:build windows` benchmark is
+# invisible to it on a Linux runner — not run, not asserted, not reported
+# missing.
 #
 # So:
 #
@@ -52,21 +53,24 @@
 #      This catches one going unreachable, skipped, or filtered out while still
 #      sitting in the tree.
 #
-# THE ENUMERATOR IS THE GO TOOLCHAIN, NOT grep
-# --------------------------------------------
-# `go test -list` is the compiler's own answer to "what benchmarks are here",
-# which a text scan only approximates. `func /* reason */ BenchmarkFoo(...)` is
-# a legal, gofmt-clean declaration that `^func Benchmark` never matches — and
-# `go test` runs it. Listing also comes back grouped BY PACKAGE, which a flat
-# name scan cannot give: two packages may define the same benchmark name, and a
-# repository-wide name match would let either one satisfy both.
+# THE ENUMERATOR IS THE GO GRAMMAR, NOT grep AND NOT STDOUT
+# ---------------------------------------------------------
+# Both questions — what exists, and what runs here — are answered by
+# scripts/benchlist.go, which parses declarations with go/parser and classifies
+# files with go/build.
 #
-# For the configurations the toolchain will NOT answer for, the answer comes
-# from go/parser rather than from a pattern (scripts/benchlist.go). A pattern
-# that skips the comment in `func /* requires API (Windows) */ BenchmarkFoo`
-# has to decide what a comment may contain, and the answer is "anything" —
-# including the delimiters the pattern stops at. Under-reading there is silent:
-# the benchmark lands outside every check and CI reports success.
+# Not a pattern, because `func /* requires API (Windows) */ BenchmarkFoo` is
+# legal and gofmt-clean, and a pattern that skips the comment has to decide
+# what a comment may contain. The answer is "anything", including the
+# delimiters the pattern stops at. Under-reading is silent: the benchmark lands
+# outside every check and CI reports success.
+#
+# Not `go test -list`, because its answer shares stdout with the package under
+# test, so a diagnostic beginning with "Benchmark" becomes a declaration.
+#
+# Identity is package-qualified throughout. Two packages may define the same
+# benchmark name, and a repository-wide name match would let either one satisfy
+# both.
 #
 # Usage:
 #   scripts/run_benchmarks.sh                  # run, assert, print
@@ -98,7 +102,6 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
 raw="$tmp/raw"
-listing="$tmp/listing"
 
 fail() {
   echo "FAIL: $*" >&2
@@ -106,46 +109,41 @@ fail() {
 }
 
 # ---------------------------------------------------------------------------
-# 1. Enumerate what the toolchain can see here, as "package<TAB>BenchmarkName".
+# 1. Establish what EXISTS, and what THIS configuration can run.
 #
-# `go test -list` prints the matching names for a package, then the package's
-# own `ok`/`?`/`FAIL` line — so names are attributed to the package whose
-# terminator follows them.
+# Both answers come from scripts/benchlist.go: it parses every tracked test
+# file with go/parser and asks go/build whether `go test ./...` would compile
+# each one here. Rows come back tagged `A` (active) or `I` (inactive), one row
+# per DECLARATION rather than per identity.
+#
+# `go test -list` is deliberately not the enumerator. It writes its answer to
+# the same stdout the package under test writes to, so a package printing a
+# line that begins with "Benchmark" while listing invents a declaration nobody
+# wrote — and the manifest check then fails over a benchmark that does not
+# exist. go/build answers the same question without running anything.
 # ---------------------------------------------------------------------------
-if ! go test -list '^Benchmark' ./... >"$listing" 2>&1; then
-  cat "$listing" >&2
-  fail "go test -list failed — the benchmark set could not be enumerated"
+
+# One module, asserted rather than assumed. `go test ./...` from the root does
+# not reach a nested module, while every import path here is derived from the
+# ROOT module — so a nested module's benchmarks would be demanded under an
+# import path that does not exist, and would never run even once declared.
+# Refusing is honest; attributing them correctly and still never running them
+# would merely look handled.
+if ! git ls-files -- '*go.mod' >"$tmp/gomods"; then
+  fail "git ls-files failed — cannot check for nested modules"
+fi
+nested_modules="$(grep -v '^go\.mod$' "$tmp/gomods" || true)"
+if [ -n "$nested_modules" ]; then
+  echo >&2
+  echo "This repository has modules below the root:" >&2
+  printf '%s\n' "$nested_modules" | sed 's/^/    /' >&2
+  echo >&2
+  echo "  Benchmarks inside them are not reached by 'go test ./...' here, and" >&2
+  echo "  this script would file them under a root-derived import path that" >&2
+  echo "  does not exist. Teach it to walk each module before adding one." >&2
+  fail "nested modules are not supported"
 fi
 
-enumerated="$(
-  awk '
-    /^(ok|FAIL|\?)[ \t]/ {
-      for (i = 1; i <= n; i++) print $2 "\t" names[i]
-      n = 0
-      next
-    }
-    /^Benchmark/ { names[++n] = $1 }
-  ' "$listing" | sort
-)"
-
-# Vacuity guard on the enumeration itself: reading zero names would make every
-# check below pass over nothing and report success, which is the exact shape of
-# failure this script exists to refuse.
-if [ -z "$enumerated" ]; then
-  fail "go test -list found no benchmarks at all — refusing to report a pass over nothing"
-fi
-
-# ---------------------------------------------------------------------------
-# 2. Read what EXISTS — in every configuration, not just this one.
-#
-# The enumeration above answered for this platform and these tags. A benchmark
-# behind `//go:build windows`, or in a directory `./...` does not walk, is
-# invisible to it: not enumerated, so not run, so never reported missing.
-#
-# scripts/benchlist.go parses every tracked test file with go/parser, which has
-# no build configuration to be blind to. What it finds and the toolchain does
-# not is exactly the set that cannot run here.
-# ---------------------------------------------------------------------------
 if ! MODULE="$(GOWORK=off go list -m 2>"$tmp/moderr")"; then
   cat "$tmp/moderr" >&2
   fail "go list -m failed — cannot map directories to import paths"
@@ -158,25 +156,47 @@ fi
 # would read as undeclared, forever. `go.work` is gitignored here, so a
 # contributor having one is expected rather than exotic.
 
-# NUL-separated end to end, so a test file whose name contains a space, a tab
-# or a newline reaches the parser intact. Splitting on whitespace anywhere in
-# this path would turn one real file into several that do not exist, and its
-# benchmarks would drop out of every check below without failing anything.
+# NUL-separated, so a test file whose name contains a space, a tab or a newline
+# reaches the parser intact. Splitting on whitespace anywhere in this path
+# would turn one real file into several that do not exist, and its benchmarks
+# would drop out of every check below without failing anything.
 if ! git ls-files -z -- '*_test.go' >"$tmp/tracked_z"; then
   fail "git ls-files failed — cannot determine which test files are tracked"
 fi
 
-if ! go run scripts/benchlist.go "$MODULE" <"$tmp/tracked_z" >"$tmp/parsed" 2>"$tmp/parsederr"; then
-  cat "$tmp/parsederr" >&2
+if ! go run scripts/benchlist.go "$MODULE" <"$tmp/tracked_z" >"$tmp/rows" 2>"$tmp/rowserr"; then
+  cat "$tmp/rowserr" >&2
   fail "could not read the tracked test files — see above"
 fi
 
-declared="$(printf '%s\n' "$enumerated" | cat - "$tmp/parsed" | sed '/^$/d' | sort -u)"
+active_rows="$(awk -F'\t' '$1 == "A" { print $2 "\t" $3 }' "$tmp/rows")"
+enumerated="$(printf '%s\n' "$active_rows" | sed '/^$/d' | sort -u)"
+declared="$(awk -F'\t' '{ print $2 "\t" $3 }' "$tmp/rows" | sed '/^$/d' | sort -u)"
 
-# What exists but this configuration cannot build. A benchmark defined once per
-# platform — the same name in `_linux_test.go` and `_windows_test.go` — is NOT
-# in here: that identity IS enumerated, so it runs and is asserted, and
-# demanding an opt-out for it would drop the runnable one out of the run.
+# Vacuity guard on the enumeration itself: reading zero names would make every
+# check below pass over nothing and report success, which is the exact shape of
+# failure this script exists to refuse.
+if [ -z "$enumerated" ]; then
+  fail "no runnable benchmarks found at all — refusing to report a pass over nothing"
+fi
+
+# TWO ACTIVE declarations of one identity. An internal and an external test
+# package in the same directory may both define `BenchmarkFoo`; `go test` runs
+# both and reports both under that one name. Either result would then satisfy
+# the identity's single row, so deleting one implementation would go unnoticed
+# — the deletion this whole manifest exists to catch. Nothing in the output
+# distinguishes the two, so this refuses rather than pretending to.
+dupes="$(printf '%s\n' "$active_rows" | sed '/^$/d' | sort | uniq -d)"
+if [ -n "$dupes" ]; then
+  echo >&2
+  echo "These benchmark identities are declared twice in the same package:" >&2
+  printf '%s\n' "$dupes" | sed 's/^/    /' >&2
+  echo >&2
+  echo "  Both run, both report under one name, and one result would satisfy" >&2
+  echo "  the other — so losing either would be invisible here. Rename one." >&2
+  fail "duplicate active benchmark declarations"
+fi
+
 unbuildable="$(printf '%s\n' "$declared" | comm -23 - <(printf '%s\n' "$enumerated"))"
 
 # ---------------------------------------------------------------------------
@@ -302,7 +322,13 @@ missing="$(
       name = $1
       sub(/-[0-9]+$/, "", name)
       sub(/\/.*$/, "", name)
-      if (NF >= 2 && $2 ~ /^[0-9]+$/) seen[pkg SUBSEP name] = 1
+      # A real result row is name, iterations, value, "ns/op". Requiring the
+      # unit is what keeps an ordinary stdout line — `BenchmarkFoo 1`, printed
+      # by the benchmark itself before it skips — from passing as a
+      # measurement: in non-verbose output there is no skip marker to tell them
+      # apart. (A benchmark that suppresses ns/op via b.ReportMetric would need
+      # an opt-out; nothing here does that.)
+      if (NF >= 4 && $2 ~ /^[0-9]+$/ && $4 == "ns/op") seen[pkg SUBSEP name] = 1
     }
     END {
       for (k in expected) if (!(k in seen)) { split(k, f, SUBSEP); print f[1] "\t" f[2] }
