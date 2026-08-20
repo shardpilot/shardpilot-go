@@ -75,19 +75,32 @@
 #
 # WHAT THIS CANNOT DO
 # -------------------
-# Every byte the execution check reads is written by the package under test.
-# `go test` offers its stdout and an exit status, and both are the program's.
-# So a package that sets out to lie — printing result-shaped rows while
-# bypassing the harness — cannot be caught by any amount of parsing, and these
-# checks are calibrated for ACCIDENTS: renames, build tags, skips, unreachable
-# packages, a TestMain that forgets m.Run. The one signal that is not the
-# benchmark's to write is the harness's own `--- SKIP:` marker, and even that
-# exists only once the harness has started.
+# The text output of `go test` is ONE stream that the harness and the package
+# under test both write to, and it does not record which of them wrote a line.
+# Every rule this script had over that stream was wrong in one direction or the
+# other: anchored, it missed a `--- SKIP:` marker that landed mid-line; searched
+# for anywhere, any benchmark printing that substring could disqualify another.
 #
-# The practical form of that boundary: a check earns its place by what it makes
-# impossible for an ACCIDENT, because that is the only class it can decide. A
-# check aimed at the liar buys a step of inconvenience at the price of refusing
-# honest code, and this file has paid that price more than once.
+# So the run does not read text. `go test -json` puts the binary in test2json
+# mode, where the harness's own actions are EVENTS a package cannot emit, and
+# everything a package prints is attributed to whatever benchmark was running.
+# A skip is {"Action":"skip"}; a printed marker is just that benchmark's output;
+# a result row printed for someone else counts for nobody.
+#
+# What that leaves is narrow and worth stating exactly. Rows arrive attributed,
+# so a package can no longer claim a measurement for a benchmark that did not
+# run — rows printed with no benchmark running belong to no one, which is what
+# a TestMain bypassing the harness produces. What remains is that the NUMBERS
+# are the benchmark's own: a benchmark whose measured loop does nothing really
+# did run, really does report, and no parsing distinguishes it from a fast one.
+# That is a question about what the code measures, not about whether it ran,
+# and this script only claims the latter.
+#
+# The rule that follows, learned the expensive way: a check earns its place by
+# what it makes impossible for an ACCIDENT, because that is the only class it
+# can decide from the outside. A check aimed at a liar buys a step of
+# inconvenience at the price of refusing honest code, and this file has paid
+# that price more than once.
 #
 # Usage:
 #   scripts/run_benchmarks.sh                  # run, assert, print
@@ -149,7 +162,14 @@ fail() {
 # 'go.mod' '*/go.mod' rather than '*go.mod': git's wildcard matches any run of
 # characters, so '*go.mod' also selects an ordinary tracked file called
 # something like fixtures/notgo.mod and would refuse the repository over it.
-if ! git ls-files -- 'go.mod' '*/go.mod' >"$tmp/gomods"; then
+# -z, for the same reason the test-file list uses it: WITHOUT it git C-quotes
+# any path containing an unusual character — a newline, a quote, a non-ASCII
+# byte under core.quotePath — wrapping the whole name in double quotes. A
+# fixture at `testdata/fixture<newline>name/go.mod` then arrives as the literal
+# `"testdata/fixture\nname/go.mod"`, whose first path component is `"testdata`
+# rather than `testdata`, so the walk rules below miss it and the repository is
+# refused over a module the go tool would never look at.
+if ! git ls-files -z -- 'go.mod' '*/go.mod' >"$tmp/gomods_z"; then
   fail "git ls-files failed — cannot check for nested modules"
 fi
 # Only modules in directories `./...` can actually reach. `go help packages` is
@@ -161,17 +181,48 @@ fi
 # element ABOVE the module directory means the module is inside vendored code,
 # while a go.mod in a directory that is itself named vendor is an ordinary
 # nested module and still refused.
-nested_modules="$(grep -v '^go\.mod$' "$tmp/gomods" | awk '
-  {
-    n = split($0, seg, "/")
-    for (i = 1; i < n; i++) {
-      s = seg[i]
-      if (s == "testdata" || substr(s, 1, 1) == "." || substr(s, 1, 1) == "_") next
-      if (s == "vendor" && i < n - 1) next
-    }
-    print
-  }
-' || true)"
+nested_modules=""
+while IFS= read -r -d '' modfile; do
+  [ "$modfile" = "go.mod" ] && continue
+
+  # Split the DIRECTORY into components by hand rather than with `read -a`: a
+  # here-string stops at the first newline, which is precisely the path this
+  # check has to survive.
+  segs=()
+  rest="${modfile%/go.mod}"
+  while :; do
+    case "$rest" in
+      */*)
+        segs+=("${rest%%/*}")
+        rest="${rest#*/}"
+        ;;
+      *)
+        segs+=("$rest")
+        break
+        ;;
+    esac
+  done
+
+  reachable=1
+  for ((i = 0; i < ${#segs[@]}; i++)); do
+    case "${segs[$i]}" in
+      testdata | .* | _*)
+        reachable=0
+        break
+        ;;
+    esac
+    # A `vendor` element ABOVE the module's own directory means the module sits
+    # inside vendored code. A go.mod in a directory that is ITSELF named vendor
+    # is an ordinary nested module — `cmd/vendor` is a command named vendor —
+    # and stays refused. Same rule benchlist.go applies to packages.
+    if [ "${segs[$i]}" = "vendor" ] && [ "$i" -lt "$((${#segs[@]} - 1))" ]; then
+      reachable=0
+      break
+    fi
+  done
+
+  [ "$reachable" -eq 1 ] && nested_modules="${nested_modules}${nested_modules:+$'\n'}${modfile}"
+done <"$tmp/gomods_z"
 if [ -n "$nested_modules" ]; then
   echo >&2
   echo "This repository has modules below the root:" >&2
@@ -374,97 +425,40 @@ echo "running benchmarks (-benchtime=${BENCHTIME}, -benchmem) …" >&2
 missing=""
 while IFS= read -r pkg; do
   [ -n "$pkg" ] || continue
-  names="$(printf '%s\n' "$to_run" | awk -F'\t' -v p="$pkg" '$1 == p { print $2 }' | sort -u | paste -sd '|' -)"
+  printf '%s\n' "$to_run" | awk -F'\t' -v p="$pkg" '$1 == p { print $2 }' | sort -u >"$tmp/expected"
+  names="$(paste -sd '|' - <"$tmp/expected")"
   # Anchored, so `BenchmarkFoo` cannot also select `BenchmarkFooBar`.
   # `-run '^$'` so no TEST runs here — this step measures, the test step tests,
   # and mixing them makes a benchmark failure look like a test failure.
-  # -v so the harness emits `--- SKIP:` for a benchmark that skips. A result
-  # row proves nothing on its own — the benchmark owns stdout and can print
-  # one — but it cannot suppress its own skip marker, so the two together are
-  # evidence where the row alone is not. The only cost is a bare name line per
-  # benchmark in the published output.
-  if ! go test -json=false -v -run '^$' -bench "^(${names})"'$' -benchmem -benchtime="$BENCHTIME" "$pkg" >"$tmp/pkgout" 2>&1; then
-    cat "$raw" "$tmp/pkgout" >&2
+  #
+  # `-json`, because the text output is one stream that the harness and the
+  # package under test SHARE, and no rule written over it can tell which of them
+  # wrote a line. Under -json the harness's own events are events — a skip is
+  # {"Action":"skip"}, which a package cannot emit — and everything the package
+  # prints is attributed to the benchmark that was running. scripts/benchcheck.go
+  # reads that stream; the reasoning is in its header.
+  #
+  # -v is gone with it: -json puts the binary in test2json mode, which is
+  # verbose by construction, so asking for both only duplicated the framing.
+  #
+  # A command-line flag beats GOFLAGS, so `GOFLAGS=-json=false` cannot quietly
+  # turn the stream back into text and leave benchcheck reading nothing.
+  set +e
+  go test -json -run '^$' -bench "^(${names})"'$' -benchmem -benchtime="$BENCHTIME" "$pkg" 2>"$tmp/pkgerr" |
+    GOFLAGS="$goflags -overlay=" go run scripts/benchcheck.go "$raw" "$tmp/expected" >"$tmp/pkgmissing" 2>"$tmp/checkerr"
+  rc=("${PIPESTATUS[@]}")
+  set -e
+  if [ "${rc[0]}" -ne 0 ]; then
+    cat "$raw" "$tmp/pkgerr" >&2
     fail "benchmark run exited non-zero for $pkg"
   fi
-  cat "$tmp/pkgout" >>"$raw"
+  if [ "${rc[1]}" -ne 0 ]; then
+    cat "$tmp/checkerr" >&2
+    fail "scripts/benchcheck.go failed for $pkg — see above"
+  fi
+  cat "$tmp/pkgerr" >>"$raw"
+  pkg_missing="$(sed "s|^|${pkg}\t|" "$tmp/pkgmissing")"
 
-  # -------------------------------------------------------------------------
-  # The EXECUTION check, for THIS package, against the package name we invoked.
-  #
-  # Reading the package from a `pkg:` line in the output would be trusting the
-  # package under test to tell the truth about itself: a benchmark printing
-  # "pkg: anything" reassigns it, and every genuine result after that line is
-  # filed under a package nobody asked for and reported missing. Packages are
-  # run one at a time here, so the answer is already known.
-  #
-  # A result row is the name, optionally a `/sub` path when the benchmark uses
-  # b.Run (Go emits `BenchmarkParent/child-8` and NO bare parent line, so
-  # demanding one would fail a benchmark that ran perfectly well), optionally a
-  # `-<GOMAXPROCS>` suffix, then the iteration count and the ns/op column.
-  # -------------------------------------------------------------------------
-  pkg_missing="$(
-    awk -v want="$to_run" -v pkg="$pkg" '
-      BEGIN {
-        n = split(want, rows, "\n")
-        for (i = 1; i <= n; i++) {
-          split(rows[i], f, "\t")
-          if (f[1] == pkg) expected[f[2]] = 1
-        }
-      }
-      # Written by the harness, and a benchmark cannot suppress its own — which
-      # is what makes it usable as evidence when a printed result row is not.
-      #
-      # Looked for ANYWHERE in the line, not just at its start: a benchmark that
-      # prints without a trailing newline leaves the marker appended to its own
-      # output, as in `BenchmarkX-8  100  1 ns/op--- SKIP: BenchmarkX`. An
-      # anchored match misses exactly the case where the row is a forgery.
-      #
-      # Recorded under exactly the name printed, deliberately: a skipped
-      # SUB-benchmark is marked `Parent/child`, which never matches the
-      # top-level row `Parent`. So a child skipping cannot disqualify a parent
-      # that measured its other children, and that falls out of the naming
-      # rather than needing a rule of its own.
-      {
-        at = index($0, "--- SKIP: ")
-        if (at > 0) {
-          split(substr($0, at + 10), sf, /[ \t]/)
-          if (sf[1] != "") skipped[sf[1]] = 1
-        }
-      }
-      /^Benchmark/ {
-        name = $1
-        sub(/-[0-9]+$/, "", name)
-        sub(/\/.*$/, "", name)
-        # A harness row is: name, iteration count, a number, a unit. That
-        # SHAPE is what separates a result from an ordinary diagnostic — not
-        # any particular unit. Demanding `ns/op` specifically called a
-        # benchmark reporting only custom metrics "no result", and
-        # b.ReportMetric(0, "ns/op") suppressing the built-in unit is a
-        # supported thing to do, so that was a false failure rather than a
-        # strictness worth keeping.
-        #
-        # None of this makes the row TRUSTWORTHY — the benchmark owns stdout
-        # and can print a perfectly shaped one — which is why the skip marker
-        # above is what actually decides.
-        # The value may be negative or non-finite: b.ReportMetric takes any
-        # float64, so a benchmark reporting only custom metrics can legitimately
-        # print `-1.000 items/op`, `NaN score` or `+Inf score`. Demanding a
-        # leading digit called those "no result".
-        #
-        # The unit is not tested at all. b.ReportMetric accepts any non-empty
-        # unit without whitespace — `3widgets/op` among them — and awk has
-        # already split on whitespace, so `NF >= 4` says everything about $4
-        # that is true of every unit. Requiring a non-digit there rejected a
-        # row the harness really prints.
-        if (NF >= 4 && $2 ~ /^[0-9]+$/ &&
-            $3 ~ /^[-+]?([0-9]|[Nn][Aa][Nn]|[Ii][Nn][Ff])/) reported[name] = 1
-      }
-      END {
-        for (k in expected) if (!(k in reported) || (k in skipped)) print pkg "\t" k
-      }
-    ' "$tmp/pkgout"
-  )"
   if [ -n "$pkg_missing" ]; then
     missing="${missing}${missing:+$'\n'}${pkg_missing}"
   fi

@@ -126,8 +126,21 @@ func main() {
 		// A tracked file that cannot be read or parsed is a loud failure, never
 		// a file that quietly contributes no benchmarks. Silence here would put
 		// its benchmarks outside every check with nothing to show for it.
+		//
+		// EXCEPT in a directory the go tool never walks. Deliberately invalid Go
+		// is a normal fixture there — a parser's own test data, say — and `go
+		// test ./...` does not look at it, so nothing can be hidden that was not
+		// already excluded from running. Refusing the whole repository over one
+		// was a refusal justified by the shape of a file rather than by any
+		// consequence. It is reported rather than swallowed, because the
+		// enumeration for that file really is incomplete.
 		file, err := parser.ParseFile(fset, rel, nil, parser.SkipObjectResolution)
 		if err != nil {
+			if neverWalked(rel) {
+				fmt.Fprintf(os.Stderr, "benchlist: note: %v (in a directory the go tool does not walk; ignored)\n", err)
+
+				continue
+			}
 			fmt.Fprintln(os.Stderr, "benchlist:", err)
 			failed = true
 
@@ -334,6 +347,28 @@ func skipped(rel string) bool {
 	// `vendor` element at or before that directory's parent is a vendored tree.
 	for i := 0; i < len(segs)-2; i++ {
 		if segs[i] == "vendor" {
+			return true
+		}
+	}
+
+	return false
+}
+
+// neverWalked reports whether a file sits in a directory `go list ./...` does
+// not descend into. `go help packages`: "Directory and file names that begin
+// with "." or "_" are ignored by the go tool, as are directories named
+// testdata."
+//
+// This is NOT a second walk rule competing with `go list` — the compiled set
+// still decides what is active. It answers a narrower question: whether a file
+// this tool could not parse is one the go command would have ignored anyway.
+func neverWalked(rel string) bool {
+	segs := strings.Split(rel, "/")
+
+	// The last element is the file name; the go tool's rules for those are
+	// cmd/go's business, and a `_test.go` file is reached by definition.
+	for _, seg := range segs[:len(segs)-1] {
+		if seg == "testdata" || strings.HasPrefix(seg, ".") || strings.HasPrefix(seg, "_") {
 			return true
 		}
 	}
