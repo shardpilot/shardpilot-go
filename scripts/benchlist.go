@@ -10,9 +10,12 @@
 //	A\t<import path>\t<BenchmarkName>   this configuration compiles the file
 //	I\t<import path>\t<BenchmarkName>   it does not
 //
-// A second argument, a comma-separated build-tag list, is added to the build
-// context — the caller passes whatever `-tags` the accompanying `go test` will
-// be run with, since go/build has no way to learn that on its own.
+// A second argument, the effective GOFLAGS string, supplies the build tags the
+// accompanying `go test` will use — go/build has no way to learn those on its
+// own. It is parsed here, with Go's own quoting grammar, rather than in the
+// shell: `GOFLAGS="'-tags=integration'"` is valid and the go command strips
+// those quotes, so a field-splitting extractor silently finds no tags and
+// classifies a runnable benchmark as unbuildable.
 //
 // Rows are printed once per DECLARATION, not per identity, so the caller can
 // see a name declared twice in one package — which `go test` permits (an
@@ -70,7 +73,7 @@ import (
 
 func main() {
 	if len(os.Args) < 2 || len(os.Args) > 3 {
-		fmt.Fprintln(os.Stderr, "usage: benchlist <module-path> [comma,separated,tags] < NUL-separated-paths")
+		fmt.Fprintln(os.Stderr, "usage: benchlist <module-path> [GOFLAGS] < NUL-separated-paths")
 		os.Exit(2)
 	}
 	module := os.Args[1]
@@ -85,7 +88,14 @@ func main() {
 	// from the environment, so a GOARCH=386 run classifies `_386_test.go` files
 	// correctly on its own.
 	if len(os.Args) == 3 && os.Args[2] != "" {
-		build.Default.BuildTags = strings.Split(os.Args[2], ",")
+		tags, err := tagsFromGOFLAGS(os.Args[2])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "benchlist: GOFLAGS:", err)
+			os.Exit(1)
+		}
+		if len(tags) > 0 {
+			build.Default.BuildTags = tags
+		}
 	}
 
 	data, err := io.ReadAll(os.Stdin)
@@ -150,6 +160,71 @@ func main() {
 	if failed {
 		os.Exit(1)
 	}
+}
+
+// tagsFromGOFLAGS returns the build tags the go command would apply from this
+// GOFLAGS value: the last -tags flag wins, as it does in Go's own parsing.
+func tagsFromGOFLAGS(goflags string) ([]string, error) {
+	fields, err := splitQuoted(goflags)
+	if err != nil {
+		return nil, err
+	}
+
+	tags := ""
+	for _, f := range fields {
+		for _, prefix := range []string{"-tags=", "--tags="} {
+			if v, ok := strings.CutPrefix(f, prefix); ok {
+				tags = v
+			}
+		}
+	}
+	if tags == "" {
+		return nil, nil
+	}
+
+	return strings.Split(tags, ","), nil
+}
+
+// splitQuoted mirrors cmd/internal/quoted.Split, which is what the go command
+// uses to read GOFLAGS. Fields are separated by whitespace; single and double
+// quotes group without nesting and are removed; there are no escapes. So
+// `'-tags=integration'` is one field reading -tags=integration, which a plain
+// whitespace split would leave with its quotes attached and fail to recognise.
+func splitQuoted(s string) ([]string, error) {
+	var fields []string
+
+	for i := 0; i < len(s); {
+		for i < len(s) && isSpaceByte(s[i]) {
+			i++
+		}
+		if i >= len(s) {
+			break
+		}
+
+		var b strings.Builder
+		var quote byte
+		for i < len(s) && (quote != 0 || !isSpaceByte(s[i])) {
+			switch {
+			case quote != 0 && s[i] == quote:
+				quote = 0
+			case quote == 0 && (s[i] == '\'' || s[i] == '"'):
+				quote = s[i]
+			default:
+				b.WriteByte(s[i])
+			}
+			i++
+		}
+		if quote != 0 {
+			return nil, fmt.Errorf("unterminated %c string", quote)
+		}
+		fields = append(fields, b.String())
+	}
+
+	return fields, nil
+}
+
+func isSpaceByte(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
 }
 
 // skipped reports whether a file sits INSIDE a vendored tree, which `./...`

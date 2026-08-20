@@ -147,7 +147,11 @@ if [ -n "$nested_modules" ]; then
   fail "nested modules are not supported"
 fi
 
-if ! MODULE="$(GOWORK=off go list -m 2>"$tmp/moderr")"; then
+# -json=false on every go command whose stdout is read as text here: GOFLAGS
+# may carry `-json`, which turns `go env` and `go list` into JSON objects and
+# `go test` into a stream of test2json events. Inheriting that silently would
+# make MODULE a JSON blob and every derived import path meaningless.
+if ! MODULE="$(GOWORK=off go list -m -json=false 2>"$tmp/moderr")"; then
   cat "$tmp/moderr" >&2
   fail "go list -m failed — cannot map directories to import paths"
 fi
@@ -167,18 +171,18 @@ if ! git ls-files -z -- '*_test.go' >"$tmp/tracked_z"; then
   fail "git ls-files failed — cannot determine which test files are tracked"
 fi
 
-# The tags the accompanying `go test` will build with. `go test` reads GOFLAGS
+# The flags the accompanying `go test` will build with. `go test` reads GOFLAGS
 # itself, but go/build does not — so without handing them over, a benchmark
 # behind `//go:build integration` would be called unbuildable in the very run
 # that is about to execute it. `go env` rather than $GOFLAGS so a value set by
-# `go env -w` counts too; the last -tags wins, as it does in Go's own parsing.
-if ! goflags="$(go env GOFLAGS 2>"$tmp/flagerr")"; then
+# `go env -w` counts too. The string is passed on whole and parsed with Go's
+# quoting grammar there, because GOFLAGS may legally be quoted.
+if ! goflags="$(go env -json=false GOFLAGS 2>"$tmp/flagerr")"; then
   cat "$tmp/flagerr" >&2
-  fail "go env GOFLAGS failed — cannot determine the build tags in effect"
+  fail "go env GOFLAGS failed — cannot determine the build flags in effect"
 fi
-build_tags="$(printf '%s\n' "$goflags" | tr ' ' '\n' | sed -n -e 's/^-tags=//p' -e 's/^--tags=//p' | tail -1)"
 
-if ! go run scripts/benchlist.go "$MODULE" "$build_tags" <"$tmp/tracked_z" >"$tmp/rows" 2>"$tmp/rowserr"; then
+if ! go run scripts/benchlist.go "$MODULE" "$goflags" <"$tmp/tracked_z" >"$tmp/rows" 2>"$tmp/rowserr"; then
   cat "$tmp/rowserr" >&2
   fail "could not read the tracked test files — see above"
 fi
@@ -300,7 +304,7 @@ while IFS= read -r pkg; do
   # Anchored, so `BenchmarkFoo` cannot also select `BenchmarkFooBar`.
   # `-run '^$'` so no TEST runs here — this step measures, the test step tests,
   # and mixing them makes a benchmark failure look like a test failure.
-  if ! go test -run '^$' -bench "^(${names})"'$' -benchmem -benchtime="$BENCHTIME" "$pkg" >"$tmp/pkgout" 2>&1; then
+  if ! go test -json=false -run '^$' -bench "^(${names})"'$' -benchmem -benchtime="$BENCHTIME" "$pkg" >"$tmp/pkgout" 2>&1; then
     cat "$raw" "$tmp/pkgout" >&2
     fail "benchmark run exited non-zero for $pkg"
   fi
