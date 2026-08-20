@@ -129,7 +129,10 @@ fail() {
 # import path that does not exist, and would never run even once declared.
 # Refusing is honest; attributing them correctly and still never running them
 # would merely look handled.
-if ! git ls-files -- '*go.mod' >"$tmp/gomods"; then
+# 'go.mod' '*/go.mod' rather than '*go.mod': git's wildcard matches any run of
+# characters, so '*go.mod' also selects an ordinary tracked file called
+# something like fixtures/notgo.mod and would refuse the repository over it.
+if ! git ls-files -- 'go.mod' '*/go.mod' >"$tmp/gomods"; then
   fail "git ls-files failed — cannot check for nested modules"
 fi
 nested_modules="$(grep -v '^go\.mod$' "$tmp/gomods" || true)"
@@ -279,15 +282,60 @@ BENCHTIME="${SHARDPILOT_BENCHTIME:-100x}"
 echo "running benchmarks (-benchtime=${BENCHTIME}, -benchmem) …" >&2
 
 : >"$raw"
+missing=""
 while IFS= read -r pkg; do
   [ -n "$pkg" ] || continue
   names="$(printf '%s\n' "$to_run" | awk -F'\t' -v p="$pkg" '$1 == p { print $2 }' | sort -u | paste -sd '|' -)"
   # Anchored, so `BenchmarkFoo` cannot also select `BenchmarkFooBar`.
   # `-run '^$'` so no TEST runs here — this step measures, the test step tests,
   # and mixing them makes a benchmark failure look like a test failure.
-  if ! go test -run '^$' -bench "^(${names})"'$' -benchmem -benchtime="$BENCHTIME" "$pkg" >>"$raw" 2>&1; then
-    cat "$raw" >&2
+  if ! go test -run '^$' -bench "^(${names})"'$' -benchmem -benchtime="$BENCHTIME" "$pkg" >"$tmp/pkgout" 2>&1; then
+    cat "$raw" "$tmp/pkgout" >&2
     fail "benchmark run exited non-zero for $pkg"
+  fi
+  cat "$tmp/pkgout" >>"$raw"
+
+  # -------------------------------------------------------------------------
+  # The EXECUTION check, for THIS package, against the package name we invoked.
+  #
+  # Reading the package from a `pkg:` line in the output would be trusting the
+  # package under test to tell the truth about itself: a benchmark printing
+  # "pkg: anything" reassigns it, and every genuine result after that line is
+  # filed under a package nobody asked for and reported missing. Packages are
+  # run one at a time here, so the answer is already known.
+  #
+  # A result row is the name, optionally a `/sub` path when the benchmark uses
+  # b.Run (Go emits `BenchmarkParent/child-8` and NO bare parent line, so
+  # demanding one would fail a benchmark that ran perfectly well), optionally a
+  # `-<GOMAXPROCS>` suffix, then the iteration count and the ns/op column.
+  # -------------------------------------------------------------------------
+  pkg_missing="$(
+    awk -v want="$to_run" -v pkg="$pkg" '
+      BEGIN {
+        n = split(want, rows, "\n")
+        for (i = 1; i <= n; i++) {
+          split(rows[i], f, "\t")
+          if (f[1] == pkg) expected[f[2]] = 1
+        }
+      }
+      /^Benchmark/ {
+        name = $1
+        sub(/-[0-9]+$/, "", name)
+        sub(/\/.*$/, "", name)
+        # Requiring the unit is what keeps an ordinary stdout line — `BenchmarkFoo 1`,
+        # printed by the benchmark itself before it skips — from passing as a
+        # measurement: in non-verbose output there is no skip marker to tell them
+        # apart. (A benchmark that suppresses ns/op via b.ReportMetric would need
+        # an opt-out; nothing here does that.)
+        if (NF >= 4 && $2 ~ /^[0-9]+$/ && $4 == "ns/op") seen[name] = 1
+      }
+      END {
+        for (k in expected) if (!(k in seen)) print pkg "\t" k
+      }
+    ' "$tmp/pkgout"
+  )"
+  if [ -n "$pkg_missing" ]; then
+    missing="${missing}${missing:+$'\n'}${pkg_missing}"
   fi
 done <<< "$(printf '%s\n' "$to_run" | cut -f1 | sort -u)"
 
@@ -299,42 +347,7 @@ if [ -n "$output_file" ]; then
   echo "wrote $output_file" >&2
 fi
 
-# ---------------------------------------------------------------------------
-# 7. The EXECUTION check: every benchmark that should have run, reported —
-#    matched WITHIN its own package's section of the output.
-#
-# A result line is the name, optionally a `/sub` path when the benchmark uses
-# b.Run (Go emits `BenchmarkParent/child-8` and NO bare parent line, so
-# demanding one would fail a benchmark that ran perfectly well), optionally a
-# `-<GOMAXPROCS>` suffix, then the iteration count.
-# ---------------------------------------------------------------------------
-missing="$(
-  awk -v want="$to_run" '
-    BEGIN {
-      n = split(want, rows, "\n")
-      for (i = 1; i <= n; i++) {
-        split(rows[i], f, "\t")
-        expected[f[1] SUBSEP f[2]] = 1
-      }
-    }
-    /^pkg:[ \t]/ { pkg = $2; next }
-    /^Benchmark/ {
-      name = $1
-      sub(/-[0-9]+$/, "", name)
-      sub(/\/.*$/, "", name)
-      # A real result row is name, iterations, value, "ns/op". Requiring the
-      # unit is what keeps an ordinary stdout line — `BenchmarkFoo 1`, printed
-      # by the benchmark itself before it skips — from passing as a
-      # measurement: in non-verbose output there is no skip marker to tell them
-      # apart. (A benchmark that suppresses ns/op via b.ReportMetric would need
-      # an opt-out; nothing here does that.)
-      if (NF >= 4 && $2 ~ /^[0-9]+$/ && $4 == "ns/op") seen[pkg SUBSEP name] = 1
-    }
-    END {
-      for (k in expected) if (!(k in seen)) { split(k, f, SUBSEP); print f[1] "\t" f[2] }
-    }
-  ' "$raw" | sort
-)"
+missing="$(printf '%s\n' "$missing" | sed '/^$/d' | sort)"
 
 if [ -n "$missing" ]; then
   echo >&2
@@ -342,10 +355,11 @@ if [ -n "$missing" ]; then
   printf '%s\n' "$missing" | sed 's/^/    /' >&2
   echo >&2
   echo "  'go test -bench' passes over a benchmark it cannot reach and says" >&2
-  echo "  nothing. Usual causes: a b.Skip at the top, or a benchmark whose body" >&2
-  echo "  never reaches the measured loop. If it genuinely cannot run here, add" >&2
-  echo "  '<import path> <BenchmarkName>' to BENCHMARKS_NOT_RUN_IN_CI in $0 and" >&2
-  echo "  say why." >&2
+  echo "  nothing. Usual causes: a b.Skip at the top, a benchmark whose body" >&2
+  echo "  never reaches the measured loop, or one printing to stdout while it" >&2
+  echo "  runs, which splits its own result row. If it genuinely cannot run" >&2
+  echo "  here, add '<import path> <BenchmarkName>' to BENCHMARKS_NOT_RUN_IN_CI" >&2
+  echo "  in $0 and say why." >&2
   fail "$(printf '%s\n' "$missing" | wc -l | tr -d ' ') benchmark(s) reported no result"
 fi
 

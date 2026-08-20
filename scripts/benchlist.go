@@ -135,13 +135,23 @@ func main() {
 	}
 }
 
-// skipped mirrors the one exclusion the go command applies that this tool must
-// respect completely: `./...` never walks a vendor directory. Vendored code is
-// not authored here, so demanding that the repository declare its benchmarks
-// would be noise rather than a signal.
+// skipped reports whether a file sits INSIDE a vendored tree, which `./...`
+// never walks. Vendored code is not authored here, so demanding that the
+// repository declare its benchmarks would be noise rather than a signal.
+//
+// "Inside" is the whole subtlety. A directory named `vendor` that itself holds
+// code is an ordinary package — cmd/go's own documentation notes that
+// `cmd/vendor` is a command named vendor, not a vendored one — and `go list
+// ./...` reports it and runs its benchmarks. Only a package BELOW such a
+// directory is vendored, so the `vendor` element has to be followed by at
+// least one more directory before the file name.
 func skipped(rel string) bool {
-	for _, seg := range strings.Split(rel, "/") {
-		if seg == "vendor" {
+	segs := strings.Split(rel, "/")
+
+	// len(segs)-1 is the file name and len(segs)-2 is its own directory; a
+	// `vendor` element at or before that directory's parent is a vendored tree.
+	for i := 0; i < len(segs)-2; i++ {
+		if segs[i] == "vendor" {
 			return true
 		}
 	}
