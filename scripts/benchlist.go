@@ -261,10 +261,18 @@ func refuseOverlay(goflags string) error {
 	}
 
 	for _, f := range fields {
-		if f == "-overlay" || f == "--overlay" ||
-			strings.HasPrefix(f, "-overlay=") || strings.HasPrefix(f, "--overlay=") {
-			return fmt.Errorf("GOFLAGS carries %s; this reads the tracked files on disk, so "+
-				"an overlay's benchmarks would be built but never declared or asserted", f)
+		for _, prefix := range []string{"-overlay=", "--overlay="} {
+			// Only a NON-EMPTY value is an overlay. `-overlay=` is a no-op to the
+			// go command — cmd/go/internal/fsys.Init returns immediately when the
+			// file name is empty — so refusing it would reject a configuration
+			// under which disk and build contents cannot differ.
+			//
+			// A bare `-overlay` with no value is left alone too: the go command
+			// rejects it as a usage error, and its message is the accurate one.
+			if v, ok := strings.CutPrefix(f, prefix); ok && v != "" {
+				return fmt.Errorf("GOFLAGS carries %s; this reads the tracked files on disk, so "+
+					"an overlay's benchmarks would be built but never declared or asserted", f)
+			}
 		}
 	}
 
