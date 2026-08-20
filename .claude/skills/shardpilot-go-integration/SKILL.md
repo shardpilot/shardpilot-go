@@ -5,11 +5,14 @@ description: Use when integrating the ShardPilot Go SDK (shardpilot-go) into a G
 
 # Integrating the ShardPilot Go SDK
 
-This skill describes the SDK exactly as shipped in the
-pinned release tag `v0.6.1-alpha`. That tag is `v0.6.0-alpha` with two
-internal agent skills deleted and no Go source difference between them, so
-every behavioral claim below — verified against `v0.6.0-alpha`'s source —
-holds unchanged at the pin. Where the SDK does not have a capability, this
+This skill is written against `main`, which is AHEAD of it.
+The pinned release tag `v0.6.1-alpha` is what an install actually gets. That tag is `v0.6.0-alpha` with two internal
+agent skills deleted and no Go source difference between them, so behavioural
+claims verified against `v0.6.0-alpha`'s source hold at the pin — **with two
+exceptions, marked *(unreleased)* where they appear below**:
+`Config.DisableRequestCompression`, which does not exist at the tag, and the
+15-second `FlushInterval` default, which is 1 second there. Everything else
+describes the pinned release. Where the SDK does not have a capability, this
 skill says so — do not invent config fields, endpoints, or behaviors beyond
 what is documented here.
 
@@ -162,7 +165,7 @@ and non-HTTPS URLs outside localhost/loopback (plain HTTP to a private
 RFC1918 **IP literal** only, via `AllowInsecurePrivateNetwork` — hostnames
 are never resolved). Optional tuning: `BatchSize` (default 25, max
 100), `BufferSize` (async queue capacity, default 1000), `FlushInterval`
-(default 15s — the longest a PARTIAL batch waits before it is published, not
+(default 15s *(unreleased — 1s at `v0.6.1-alpha`)* — the longest a PARTIAL batch waits before it is published, not
 a heartbeat: an empty batch publishes nothing, so an otherwise-silent process
 makes no requests at any value. A full `BatchSize` publishes immediately,
 `Flush()` publishes on demand, and retry pacing runs on its own clock),
@@ -198,7 +201,8 @@ Two things follow that matter when you integrate:
   `unsupported_content_encoding`, and the client latches compression off for
   the rest of the process and re-sends the same batch uncompressed. The cost
   of pointing a new SDK at an older server is one round-trip, not lost data.
-  Set `DisableRequestCompression: true` to skip even that.
+  Set `DisableRequestCompression: true` to skip even that. *(unreleased — this
+  field does not exist at `v0.6.1-alpha`.)*
 
 ## Consent model — READ THIS FIRST, IT IS INVERTED
 

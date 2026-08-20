@@ -214,10 +214,11 @@ scan_lane_a=""      # "path:line:text" per hit, newline separated
 scan_lane_b_files=0
 scan_lane_b_lines=0
 scan_files=0
+scan_lane_a_files=0  # files LANE A actually gates, which is not the total
 
 scan_tree() {
   local root="$1" f hits status line list
-  scan_lane_a=""; scan_lane_b_files=0; scan_lane_b_lines=0; scan_files=0
+  scan_lane_a=""; scan_lane_b_files=0; scan_lane_b_lines=0; scan_files=0; scan_lane_a_files=0
 
   # `git ls-files -z` and PROCESS substitution, not a heredoc. A command
   # substitution used as a heredoc body is invisible to `set -e` and to
@@ -252,8 +253,14 @@ scan_tree() {
     # NAME — a decision-record id, a ticket, a service name in a directory —
     # reaches every consumer and appears in no file's body, so scanning only
     # contents misses it entirely.
-    if printf '%s\n' "$f" | grep -qE -- "$PATTERNS" \
-       || printf '%s\n' "$f" | grep -qiE -- "$ROSTER_RE"; then
+    # ⚠ WHITESPACE COLLAPSED FIRST. A path may legally contain a newline, and
+    # these passes are line-oriented: an identifier straddling one is split
+    # into two lines and matches nothing. `git ls-files -z` hands the raw name
+    # over precisely so such a path is not lost, and then this check would have
+    # dropped it anyway.
+    f_flat="$(printf '%s' "$f" | tr -s '[:space:]' ' ')"
+    if printf '%s\n' "$f_flat" | grep -qE -- "$PATTERNS" \
+       || printf '%s\n' "$f_flat" | grep -qiE -- "$ROSTER_RE"; then
       scan_lane_a="${scan_lane_a}${f}:path:${f}"$'\n'
     fi
     # -h: a symlink's published blob content IS its target path, so read the
@@ -263,14 +270,44 @@ scan_tree() {
       # a target naming a roster entry is the same disclosure as one naming a
       # shape — checking only $PATTERNS here left the roster half blind to an
       # entire file type.
-      hits="$( { readlink "$root/$f" | grep -nE -- "$PATTERNS" || true
-                 readlink "$root/$f" | grep -niE -- "$ROSTER_RE" || true; } )"
+      link_flat="$(readlink "$root/$f" | tr -s '[:space:]' ' ')"
+      hits="$( { printf '%s\n' "$link_flat" | grep -nE -- "$PATTERNS" || true
+                 printf '%s\n' "$link_flat" | grep -niE -- "$ROSTER_RE" || true; } )"
       [ -n "$hits" ] && scan_lane_a="${scan_lane_a}${f}:symlink-target:$(readlink "$root/$f")"$'\n'
       scan_files=$((scan_files + 1))
       continue
     fi
     [ -f "$root/$f" ] || continue
     scan_files=$((scan_files + 1))
+    # ⚠ COUNTED PER LANE, BEFORE THE SCAN. The lane A line used to print
+    # `scan_files`, the total of everything read — 90 on a tree where lane A
+    # gates 12. A gate that overstates its own coverage sevenfold is worse than
+    # one that says nothing: the number is what a reader checks when deciding
+    # whether the green means anything. Counted here rather than at the lane
+    # split below, because that split only runs for files that HIT.
+    case "$f" in
+      *.go) ;;
+      *) scan_lane_a_files=$((scan_lane_a_files + 1)) ;;
+    esac
+    # ⚠ A COMPRESSED TRACKED FILE IS NOT SCANNED BY ANYTHING HERE, and `-a`
+    # does not change that: treating a container as text reads its DEFLATE
+    # stream, not its contents. So internal material inside a committed .zip,
+    # .gz or .jar would pass every pass above and print as clean.
+    #
+    # This REFUSES rather than decompressing. Neither SDK tree tracks a single
+    # compressed artifact today (measured), so a decompressor here would be
+    # untested code guarding nothing, and the archive-walking machinery it
+    # would need is genuinely large. A refusal costs nothing while the answer
+    # is zero and turns into a deliberate decision the day it stops being zero.
+    case "$(od -An -tx1 -N4 "$root/$f" 2>/dev/null | tr -d ' \n')" in
+      1f8b*|504b0304|504b0506|fd377a58|425a68*|28b52ffd)
+        echo "REFUSING: '$f' is a compressed archive, and this gate reads files as text." >&2
+        echo "  Its contents are not scanned by any pass here, so a clean result would" >&2
+        echo "  say nothing about what it carries. Remove it from the tracked tree, or" >&2
+        echo "  extend this gate to walk archives deliberately." >&2
+        exit 2
+        ;;
+    esac
     # -a treats a NUL-bearing file as text: GNU grep >= 3.5 otherwise prints
     # "binary file matches" to STDERR and nothing to stdout, so a hit inside a
     # committed binary reads as a clean file.
@@ -363,6 +400,13 @@ scan_tree() {
     done
     # A wrapped hit is only NEWS if the line-oriented pass did not already see
     # it; otherwise every ordinary finding would be reported twice.
+    # ⚠ AN EMPTY RESULT IS NOT A HIT, whatever the status says. `status` is the
+    # FIRST grep's, preserved on purpose so a read error survives the pipeline —
+    # but that grep matching means only that the raw line matched, and
+    # strip_citations may then have removed every one of them. The file was
+    # counted anyway, so a file whose only matches were legitimate licence
+    # citations inflated the lane's FILE count while contributing no lines.
+    [ -n "$hits" ] || status=1
     if [ "$wrapped_status" -eq 0 ]; then
       new_wrapped=""
       # ⚠ AGAINST BOTH LINE-ORIENTED PASSES, not just the shape one. A
@@ -637,4 +681,4 @@ if [ -n "$scan_lane_a" ]; then
   printf '%s' "$scan_lane_a" >&2
   exit 1
 fi
-echo "LANE A (GATED) — non-source tracked files: clean (${scan_files} file(s) scanned)."
+echo "LANE A (GATED) — non-source tracked files: clean (${scan_lane_a_files} of ${scan_files} tracked file(s) scanned; the rest are Go source, reported in lane B)."
