@@ -299,12 +299,19 @@ scan_tree() {
     # untested code guarding nothing, and the archive-walking machinery it
     # would need is genuinely large. A refusal costs nothing while the answer
     # is zero and turns into a deliberate decision the day it stops being zero.
+    # ⚠ FOUR BYTES IS NOT THE WHOLE QUESTION, and two shapes get past it. A PDF
+    # begins `%PDF` and keeps its text in a Flate stream, so it reads as text
+    # and scans as noise. A self-extracting archive begins with an executable
+    # preamble — MZ or ELF — and carries the ZIP further in. Both are refused
+    # by magic rather than by extension, because the extension is the part an
+    # author controls.
     case "$(od -An -tx1 -N4 "$root/$f" 2>/dev/null | tr -d ' \n')" in
-      1f8b*|504b0304|504b0506|fd377a58|425a68*|28b52ffd)
-        echo "REFUSING: '$f' is a compressed archive, and this gate reads files as text." >&2
-        echo "  Its contents are not scanned by any pass here, so a clean result would" >&2
-        echo "  say nothing about what it carries. Remove it from the tracked tree, or" >&2
-        echo "  extend this gate to walk archives deliberately." >&2
+      1f8b*|504b0304|504b0506|fd377a58|425a68*|28b52ffd|25504446|4d5a*|7f454c46)
+        echo "REFUSING: '$f' begins with container magic (archive, PDF or executable)," >&2
+        echo "  and this gate reads files as text. Its real contents are not scanned by" >&2
+        echo "  any pass here, so a clean result would say nothing about what it carries." >&2
+        echo "  Remove it from the tracked tree, or extend this gate to walk containers" >&2
+        echo "  deliberately." >&2
         exit 2
         ;;
     esac
@@ -386,8 +393,32 @@ scan_tree() {
     # file, so this pass decides on content alone and says so.
     collapsed="$(tr -s '[:space:]' ' ' < "$root/$f" 2>/dev/null | tr -d '\000' \
       | sed -E "s/${CITATION}//g")"
-    wrapped_hits="$( { printf '%s\n' "$collapsed" | grep -aoE -- "$PATTERNS" || true
-                       printf '%s\n' "$collapsed" | grep -aoiE -- "$ROSTER_RE" || true; } | sort -u )"
+    # ⚠ AND A SECOND COLLAPSED COPY WITH SEPARATORS REJOINED. Collapsing turns
+    # a line break into a space, which is right for a phrase and wrong for an
+    # identifier: text wraps AT the separator, so `ADR-` ending a line and
+    # `0999` beginning the next becomes `ADR- 0999`, which `ADR-[0-9]+` cannot
+    # match. The roster half already needed this and solved it inside its own
+    # derivation; the shape half has no derivation to change, so the input is
+    # repaired instead.
+    #
+    # Rejoining is safe here because this copy is used ONLY to detect wrapping:
+    # every shape class needs a literal prefix (ADR-, GAP-, SP-, AC-) before the
+    # separator, so ordinary prose like `the plan - 2026` cannot be turned into
+    # one of them.
+    rejoined="$(printf '%s' "$collapsed" | sed -E 's/([-_/]) /\1/g')"
+    wrapped_raw="$( { printf '%s\n' "$collapsed" | grep -aoE -- "$PATTERNS" || true
+                      printf '%s\n' "$collapsed" | grep -aoiE -- "$ROSTER_RE" || true
+                      printf '%s\n' "$rejoined"  | grep -aoE -- "$PATTERNS" || true; } )"
+    wrapped_hits="$(printf '%s\n' "$wrapped_raw" | sort -u)"
+    # ⚠ A DEDUPLICATOR THAT FAILS MUST NOT LOOK LIKE A CLEAN FILE. If `sort`
+    # cannot write its output, the substitution above is empty and every
+    # forbidden phrase it consumed disappears with it — the exact fail-open
+    # shape this gate refuses everywhere else.
+    if [ -n "$wrapped_raw" ] && [ -z "$wrapped_hits" ]; then
+      echo "REFUSING: deduplicating the wrapped-scan results for '$f' produced nothing" >&2
+      echo "  from a non-empty input. Those matches would be dropped in silence." >&2
+      exit 2
+    fi
     if [ -n "$wrapped_hits" ]; then wrapped_status=0; else wrapped_status=1; fi
     set -e
     for st in "$status" "$roster_status"; do
@@ -614,7 +645,7 @@ EOF
     printf 'clean customer prose\n' > clean.md
     printf 'nothing internal in the body\n' > ADR-0999-notes.md   # hit is the NAME
     printf 'see ADR-0000 for context\n' > dirty.md
-    printf '// GAP-075 note\npackage x\n' > lane_b.go
+    printf '// GAP-000 note\npackage x\n' > lane_b.go
     printf 'internal: control-plane\n' > "café.md"   # C-quoted by git ls-files
     printf 'x\0see ADR-0999 here\n' > binary.bin      # NUL: "binary" to grep
     git add -A >/dev/null 2>&1
