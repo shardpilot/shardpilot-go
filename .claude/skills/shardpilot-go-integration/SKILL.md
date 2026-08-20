@@ -10,9 +10,11 @@ The pinned release tag `v0.6.1-alpha` is what an install actually gets. That tag
 agent skills deleted and no Go source difference between them, so behavioural
 claims verified against `v0.6.0-alpha`'s source hold at the pin — **with two
 exceptions, marked *(unreleased)* where they appear below**:
-`Config.DisableRequestCompression`, which does not exist at the tag, and the
-15-second `FlushInterval` default, which is 1 second there. Everything else
-describes the pinned release. Where the SDK does not have a capability, this
+`Config.DisableRequestCompression`, which does not exist at the tag; the
+15-second `FlushInterval` default, which is 1 second there; and the independent
+pacing of the FIRST retry — at the tag `backoffCeiling(1)` returns 0, so a first
+failure without a `Retry-After` hint waits for the next flush tick rather than
+its own jittered delay. Everything else describes the pinned release. Where the SDK does not have a capability, this
 skill says so — do not invent config fields, endpoints, or behaviors beyond
 what is documented here.
 
@@ -312,7 +314,7 @@ Facts that keep integrations correct:
   a batch that failed retryably (429/5xx or transport error) and retries it,
   honoring the server's `Retry-After` hint; a retryable failure **without** a
   hint paces itself with full-jitter exponential backoff on its OWN clock,
-  independent of `FlushInterval` (every failure — the first included — waits
+  independent of `FlushInterval` (every failure — the first included *(the FIRST failure's independent delay is unreleased — at `v0.6.1-alpha` `backoffCeiling(1)` is 0, so the first retry waits for the flush tick instead)* — waits
   at least 1s, with the ceiling doubling from the third consecutive failure
   up to 60s, reset on success). With
   `SpoolDir` set such batches also spool to disk as crash insurance (see
