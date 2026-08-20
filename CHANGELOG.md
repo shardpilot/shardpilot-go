@@ -77,6 +77,27 @@
   400 with no envelope, a connection reset, a proxy 502 — is **not** covered by that
   fallback; set `DisableRequestCompression` for those.
 
+## v0.6.1-alpha - 2026-08-20
+
+- **Removed two internal agent skills from the published artifact.** No API,
+  wire-format or behaviour change: this tag is `v0.6.0-alpha` with eight files
+  deleted and no Go source difference.
+
+  They were not merely present in this repository's history. `go get
+  github.com/shardpilot/shardpilot-go@v0.6.0-alpha` DELIVERED NINE OF THEIR
+  FILES — the module zip is cached by the module proxy, so following the
+  documented install command handed them out. One described an internal review
+  process; the other published the backend stack with versions, the
+  tenant-isolation mechanism in operational detail with a named runtime role,
+  an inventory of internal repositories with their build commands, and
+  statements about where automated coverage does not reach.
+
+  **Forward-only, and the limit is worth stating.** `v0.6.0-alpha` stays
+  reachable, its zip stays cached on the module proxy and its hash stays in the
+  checksum database, where nothing ShardPilot does can withdraw it — deleting
+  this repository would not. This stops new installs that follow the
+  documentation; it recalls nothing.
+
 ## v0.6.0-alpha — 2026-08-03 — crash actor key, experiments, remote-config targeting
 
 - Optional pseudonymous actor keys on crash reports: `Event.AnonymousID` / `Event.SessionID`,

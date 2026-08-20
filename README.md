@@ -27,10 +27,10 @@ Real, tested, working code — **early alpha**. The API is pre-v1 and may change
 Install the latest tagged release:
 
 ```bash
-go get github.com/shardpilot/shardpilot-go@v0.6.0-alpha
+go get github.com/shardpilot/shardpilot-go@v0.6.1-alpha
 ```
 
-`v0.6.0-alpha` is the latest tag. It ships the optional pseudonymous actor key on crash reports — `Event.AnonymousID`, the ONLY field the service keys the actor on, with `Event.SessionID` alongside it as session linkage that is never used as the actor key (both `omitempty`, so a client that does not opt in keeps a byte-identical wire shape) — the dark opt-in experiment-assignment consumer with consent-gated exposure/outcome producers, the dark opt-in remote-config targeting-attribute pass-through, the phase-D crash capture opt-ins (self-module debug-id fill and all-goroutine threads), and the opt-in client-side consent floor (`Config.ConsentFloor`), on top of the v0.5.0-alpha remote config client, disk spool, schema-revision declaration and full-jitter retry backoff documented in this README. To pin the previous tag that ships none of the above, use:
+`v0.6.1-alpha` is the latest tag. It is `v0.6.0-alpha` with two internal agent skills deleted and nothing else — no Go source differs between them — so everything below describes both. `v0.6.0-alpha` shipped the optional pseudonymous actor key on crash reports — `Event.AnonymousID`, the ONLY field the service keys the actor on, with `Event.SessionID` alongside it as session linkage that is never used as the actor key (both `omitempty`, so a client that does not opt in keeps a byte-identical wire shape) — the dark opt-in experiment-assignment consumer with consent-gated exposure/outcome producers, the dark opt-in remote-config targeting-attribute pass-through, the phase-D crash capture opt-ins (self-module debug-id fill and all-goroutine threads), and the opt-in client-side consent floor (`Config.ConsentFloor`), on top of the v0.5.0-alpha remote config client, disk spool, schema-revision declaration and full-jitter retry backoff documented in this README. To pin the previous tag that ships none of the above, use:
 
 ```bash
 go get github.com/shardpilot/shardpilot-go@v0.5.0-alpha

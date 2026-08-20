@@ -6,8 +6,10 @@ description: Use when integrating the ShardPilot Go SDK (shardpilot-go) into a G
 # Integrating the ShardPilot Go SDK
 
 This skill describes the SDK exactly as shipped in the
-pinned release tag `v0.6.0-alpha`. Every behavioral claim below was verified
-against that tag's source. Where the SDK does not have a capability, this
+pinned release tag `v0.6.1-alpha`. That tag is `v0.6.0-alpha` with two
+internal agent skills deleted and no Go source difference between them, so
+every behavioral claim below — verified against `v0.6.0-alpha`'s source —
+holds unchanged at the pin. Where the SDK does not have a capability, this
 skill says so — do not invent config fields, endpoints, or behaviors beyond
 what is documented here.
 
@@ -58,7 +60,7 @@ other calls, no automatic actions.
 ## Install
 
 ```bash
-go get github.com/shardpilot/shardpilot-go@v0.6.0-alpha
+go get github.com/shardpilot/shardpilot-go@v0.6.1-alpha
 ```
 
 - Requires **Go 1.24+**.
