@@ -33,8 +33,8 @@
 # So the patterns below match SHAPES wherever a shape works. `ADR-[0-9]+`,
 # `GAP-[0-9]{3}` and `main @ <sha>` name no record, no ticket and no branch.
 # `ADR-[0-9]+` and `GAP-[0-9]+` name no decision and no ticket. The only
-# literals that remain are ones this repository's published history already
-# carries, so the file discloses nothing that a `git log` does not.
+# literals that remain are ones this repository's TREE still carries elsewhere,
+# so the file adds nothing to what a clone of it already hands over.
 #
 # THREE SHAPES WERE TRIED AND WITHDRAWN, because a gate that cries wolf gets
 # silenced, and a silenced gate is the one that misses the real thing:
@@ -44,7 +44,7 @@
 #   `-platform`  — fired on "per-platform" and "cross-platform". Dropped; the
 #                  only internal `-platform` name appears in zero commits here.
 #   `-service`   — fired on "self-service". Replaced by the two service names
-#                  this repository's own history already carries, which is
+#                  this repository's tree still carries elsewhere, which is
 #                  the rule the whole list follows.
 #
 # ⚠ THE GAP THAT LEAVES, NAMED RATHER THAN IMPLIED: a service name that has
@@ -82,9 +82,16 @@ cd "$(dirname "$0")/.."
 # how the second consumer comes to check something different from the first.
 # ── THE ROSTER HALF, AND THE RULE THAT NOW ENFORCES ITSELF ──────────────────
 # These are the only literal internal names in this file. Each is admissible
-# under one rule: **this repository's published history must already carry it**,
-# so the file discloses nothing a `git log` of a repository anyone can clone
-# does not already give up.
+# under one rule: **this repository's tracked tree must still carry it
+# somewhere else**, so the file adds nothing to what a clone already hands over.
+#
+# That rule started as "published history must carry it", which is weaker in the
+# way that matters: history keeps everything, so a name stayed admissible
+# forever once it had ever appeared. Under it, SIX of eight entries here existed
+# nowhere but this file — the cleanup had removed them everywhere else, and the
+# gate had quietly become their sole carrier, shipping in every release archive
+# a set of names the cleanup existed to remove. Tree-presence closes both that
+# and the original case.
 #
 # That rule was PROSE until 2026-08-20, and prose does not hold. Measured on
 # that date by two independent methods — `git log -S` over every ref, and a
@@ -92,8 +99,8 @@ cd "$(dirname "$0")/.."
 # commits of this repository. The gate written to stop internal names reaching
 # a public repository was introducing two of them, for the first time, in the
 # same commit that claimed the opposite. Both are gone, and
-# `roster_is_already_published` below runs the check on every invocation so the
-# next one fails instead of shipping.
+# `roster_is_present_in_the_tree` below runs the check on every invocation so
+# the next one fails instead of shipping.
 #
 # ⚠ AND THEY ARE NOT NAMED IN THIS COMMENT, which took a second attempt to get
 # right. The first draft of this paragraph spelled both removed names out in
@@ -106,13 +113,7 @@ cd "$(dirname "$0")/.."
 # org-wide check covers already-public repositories it is caught by review or
 # not at all.
 ROSTER='analytics-service
-crash-symbolicator
-control-plane
-shardpilot/docs
-shardpilot/integrations
-Project Tower
-shepherd-pr
-verification-discipline'
+control-plane'
 
 # Derived, never spelled twice — the defect this whole file keeps finding is a
 # correction landing in one copy while another keeps the old value. Each
@@ -343,45 +344,39 @@ a self-service signup flow, a micro-service boundary
 the event plane and the consent plane are separate
 an analytics-plane request, zero event batches'
 
-# roster_is_already_published — the rule from the ROSTER block, executed.
+# roster_is_present_in_the_tree — the rule from the ROSTER block, executed.
 #
-# Every literal in ROSTER must appear in this repository's PUBLISHED history.
-# If it does not, this file is the first thing to publish it, and the gate is
-# committing the disclosure it exists to prevent.
+# Every literal in ROSTER must still appear in this repository's TRACKED TREE
+# OUTSIDE this file. Two different failures are covered by that one condition:
+#
+#   a name that was never here    — the gate would be the first thing to
+#                                   publish it (found twice: two internal
+#                                   repository names with zero commits here);
+#   a name that is no longer here — the cleanup removed it everywhere else and
+#                                   the gate became its SOLE carrier, so every
+#                                   future release archive ships a name the
+#                                   cleanup existed to remove.
+#
+# The earlier version of this rule asked whether published HISTORY carried the
+# literal, which is a weaker question: history keeps everything, so a name
+# stayed admissible forever once it had ever appeared. It passed a tree in
+# which six of eight roster entries existed nowhere but here.
 #
 # ⚠ THIS FILE IS EXCLUDED FROM THE SEARCH, and without that the check is
-# self-satisfying: add a name here, commit, and `git log -S` finds it — in this
-# very file — from the next run onward. The exclusion is what makes the answer
-# be about the rest of the repository.
+# self-satisfying: the roster itself would count as the occurrence.
 #
-# ⚠ AND IT REFUSES ON A SHALLOW CLONE rather than reporting names unpublished.
-# A truncated history makes every literal look novel, which would fail the run
-# with a message pointing at the roster instead of at the checkout — sending
-# the reader to delete correct entries.
-roster_is_already_published() {
-  local lit novel=0
-  if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
-    echo "REFUSING: shallow checkout — the roster rule needs full history." >&2
-    echo "  Every literal would read as unpublished and the run would blame" >&2
-    echo "  the roster for a property of the clone. Use fetch-depth: 0." >&2
-    exit 2
-  fi
-  # ⚠ NO PIPE INTO `grep -q`, AND THIS EXACT FUNCTION IS WHY. The first version
-  # asked `git log … | grep -q .`. `grep -q` exits at the FIRST match and closes
-  # the pipe, `git` then dies of SIGPIPE with status 141, and `set -o pipefail`
-  # reports the pipeline as failed — so `if !` turned every MATCH into a miss.
-  # It declared all eight roster names unpublished in a repository whose history
-  # carries every one of them, and the BETTER the match the sooner it fired.
-  # A guard that fails loudly on a correct tree is a guard somebody deletes.
-  #
-  # Materialised to a file and tested with `-s`: no pipeline, so no status to
-  # invert.
-  local found; found="$(mktemp)"
+# The cost, stated rather than implied: a name removed from ROSTER stops being
+# gated at PR time in this repository. Its coverage is the org-wide
+# publication check, which reads the class library rather than a roster and
+# therefore needs no literal in a public file.
+roster_is_present_in_the_tree() {
+  local lit novel=0 found
+  found="$(mktemp)"
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
-    git log --all --format=%H -S"$lit" -- . ':(exclude)scripts/check_public_surface.sh' > "$found" 2>/dev/null || :
+    git grep -l -F -- "$lit" -- . ':(exclude)scripts/check_public_surface.sh' > "$found" 2>/dev/null || :
     if [ ! -s "$found" ]; then
-      printf 'ROSTER VIOLATION: %s appears in no commit of this repository outside this file.\n' "$lit" >&2
+      printf 'ROSTER VIOLATION: %s appears nowhere in this tree except this file.\n' "$lit" >&2
       novel=$((novel + 1))
     fi
   done <<EOF
@@ -390,38 +385,23 @@ EOF
 
   # ⚠ THE SAME RULE, APPLIED TO THIS FILE'S OWN PROSE — because the scan
   # exempts this file, and that exemption is exactly where the last one hid.
-  # The comment announcing the removal of two internal repository names spelled
-  # both of them out, and no pass in this gate reads its own comments.
-  #
-  # A shape rather than a list, so it needs no roster of its own: every
-  # `shardpilot/<name>` written ANYWHERE in this file must satisfy the rule
-  # above. Both offenders were exactly that shape.
+  # A shape rather than a list, so it needs no roster of its own.
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
-    git log --all --format=%H -S"$lit" -- . ':(exclude)scripts/check_public_surface.sh' > "$found" 2>/dev/null || :
+    git grep -l -F -- "$lit" -- . ':(exclude)scripts/check_public_surface.sh' > "$found" 2>/dev/null || :
     if [ ! -s "$found" ]; then
-      printf 'PROSE VIOLATION: %s is written in this file and appears in no commit of this repository.\n' "$lit" >&2
+      printf 'PROSE VIOLATION: %s is written in this file and appears nowhere else in this tree.\n' "$lit" >&2
       novel=$((novel + 1))
     fi
   done <<EOF
 $(grep -oE 'shardpilot/[a-z][a-z-]*' "$0" | sort -u)
 EOF
 
-  # ⚠ AND DECISION-RECORD IDS, for the same reason and with the same history.
-  # The exemption skips this whole file, so a comment or a diagnostic added
-  # here publishes whatever it names. That is not hypothetical: a live ADR id
-  # sat in a self-test fixture in this file, under a paragraph asserting every
-  # fixture was synthetic. Only the two reserved synthetic ids are admissible;
-  # anything else is a real record being published by the gate against
-  # publishing them.
+  # Decision-record ids: only the two reserved synthetic ones are admissible.
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
-    case "$lit" in
-      ADR-0000|ADR-0999) continue ;;
-    esac
+    case "$lit" in ADR-0000|ADR-0999) continue ;; esac
     printf 'PROSE VIOLATION: %s is a real decision-record id written in this file.\n' "$lit" >&2
-    printf '  Use ADR-0000 or ADR-0999 in fixtures and prose; a shape is exercised\n' >&2
-    printf '  just as well by a reserved id, and this file publishes what it names.\n' >&2
     novel=$((novel + 1))
   done <<EOF
 $(grep -oE 'ADR-[0-9]+' "$0" | sort -u)
@@ -429,13 +409,13 @@ EOF
 
   rm -f "$found"
   if [ "$novel" -ne 0 ]; then
-    echo "REFUSING: the roster introduces $novel internal name(s) this public" >&2
-    echo "  repository has never carried. A gate against publishing internal" >&2
-    echo "  names must not be the commit that publishes them — remove them from" >&2
-    echo "  ROSTER. They stop being gated here; say so rather than keeping them." >&2
+    echo "REFUSING: $novel literal(s) in this file exist nowhere else in this tree." >&2
+    echo "  A gate against publishing internal names must not be the only thing" >&2
+    echo "  publishing them — every release archive carries this file. Remove them" >&2
+    echo "  from ROSTER and say so; the org-wide check covers what leaves here." >&2
     exit 2
   fi
-  echo "roster rule: OK — all $(printf '%s\n' "$ROSTER" | grep -c .) literal(s) already present in published history"
+  echo "roster rule: OK — all $(printf '%s\n' "$ROSTER" | grep -c .) literal(s) still present elsewhere in this tree"
 }
 
 selftest() {
@@ -465,10 +445,21 @@ EOF
     innocent=$((innocent + 1))
     # The SAME exclusion the scan applies, so the two cannot drift.
     # BOTH passes, because an innocent line is only innocent if NEITHER fires.
-    # Testing the shape pass alone left the roster's case-insensitive pass
-    # unchecked against every fixture written to prove a false positive gone.
-    if { printf '%s\n' "$line" | grep -E -- "$PATTERNS"
-         printf '%s\n' "$line" | grep -iE -- "$ROSTER_RE"; } | grep -q .; then
+    #
+    # ⚠ EVALUATED SEPARATELY, NOT PIPED. The previous form ran both greps into
+    # a group and piped it to `grep -q .`. Under `set -o pipefail` the group's
+    # status is the LAST command's — the roster grep — so an innocent line that
+    # matched $PATTERNS but not $ROSTER_RE made the pipeline non-zero and the
+    # `if` FALSE. That is the ordinary shape of a shape-class false positive,
+    # which means this half of the self-test could not detect the thing it
+    # exists to detect: every innocent fixture was passing vacuously.
+    #
+    # Third time this exact inversion has appeared in this file's history. A
+    # herestring avoids it structurally — no pipeline, so no status to invert.
+    fp=0
+    grep -qE  -- "$PATTERNS"  <<<"$line" && fp=1
+    grep -qiE -- "$ROSTER_RE" <<<"$line" && fp=1
+    if [ "$fp" -eq 1 ]; then
       printf 'SELFTEST FALSE POSITIVE: %s\n' "$line" >&2; falses=$((falses + 1))
     fi
   done <<EOF
@@ -522,7 +513,7 @@ EOF
   echo "self-test: OK — $tested known-internal string(s) matched, $innocent innocent string(s) passed, scan fixture 6/6"
 }
 
-roster_is_already_published
+roster_is_present_in_the_tree
 selftest
 
 # ---------------------------------------------------------------------------
