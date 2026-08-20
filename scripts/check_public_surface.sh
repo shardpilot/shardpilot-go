@@ -84,7 +84,23 @@ PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here is (no|NO) [A-Za-z]+ (harness|coverage|tes
 # and the self-test cannot disagree about it. The first attempt put the
 # exclusion only in the scan; the innocent self-test then failed, correctly,
 # because it was testing a different rule from the one that runs.
-EXCLUDE='Apache[- ]2\.0 §|Apache License[^§]{0,40}§|LICENSE §'
+# ⚠ THE EXCEPTION APPLIES TO THE CITATION, NOT TO THE LINE. The first version
+# filtered with `grep -v "$EXCLUDE"`, which drops the WHOLE line — so
+# `see ADR-0221; Apache-2.0 §4(d)` matched PATTERNS, was then discarded for
+# containing a licence citation, and lane A reported clean. That turned a
+# false-positive fix into an EVASION: any internal identifier sharing a line
+# with the word Apache became invisible.
+#
+# So the citation is blanked out of a COPY of the line and the remainder is
+# re-tested. A line that is only a licence citation drops out; a line that is a
+# licence citation AND something else is still reported, in full.
+CITATION='Apache[- ]2\.0 §[0-9]+(\([a-z]\))?|Apache License[^§]{0,40}§[0-9]+|LICENSE §[0-9]+'
+
+# strip_citations — reads lines, prints those that still match PATTERNS once
+# every legitimate licence citation has been removed from the copy under test.
+strip_citations() {
+  awk -v pat="$PATTERNS" -v cit="$CITATION" '{ t=$0; gsub(cit, "", t); if (t ~ pat) print }'
+}
 
 # Files the gate must not read as content: this script is the one place the
 # patterns are written down, by construction.
@@ -182,9 +198,13 @@ scan_tree() {
     # naming a document the reader cannot open. Keeping the false positive
     # would train a reader to skim § hits, which is how the real one gets
     # waved through.
+    # ⚠ NUL IS STRIPPED BEFORE awk, NOT AFTER. awk truncates a record at a NUL
+    # byte, so running the citation filter first silently dropped the match
+    # inside a NUL-bearing file — the scan fixture caught it immediately, which
+    # is the whole reason that fixture carries a binary.
     hits="$(grep -anE -- "$PATTERNS" "$root/$f" 2>/dev/null \
-      | grep -avE -- "$EXCLUDE" \
-      | tr -d '\000'; exit "${PIPESTATUS[0]}")"
+      | tr -d '\000' \
+      | strip_citations; exit "${PIPESTATUS[0]}")"
     status=$?
     set -e
     if [ "$status" -ge 2 ]; then
@@ -220,6 +240,7 @@ scan_tree() {
 # fail, and "the patterns compile" is not that demonstration.
 # ---------------------------------------------------------------------------
 KNOWN_INTERNAL='per ADR-0221 §3
+see ADR-0221; Apache-2.0 §4(d) applies too
 There is NO Playwright harness in the console repo
 the crash path is not covered by automated tests
 no automated scanning for that class of input
@@ -258,7 +279,8 @@ EOF
     [ -z "$line" ] && continue
     innocent=$((innocent + 1))
     # The SAME exclusion the scan applies, so the two cannot drift.
-    if printf '%s\n' "$line" | grep -E -- "$PATTERNS" | grep -qvE -- "$EXCLUDE"; then
+    # The SAME filter the scan applies, so the two cannot drift.
+    if printf '%s\n' "$line" | grep -E -- "$PATTERNS" | strip_citations | grep -q .; then
       printf 'SELFTEST FALSE POSITIVE: %s\n' "$line" >&2; falses=$((falses + 1))
     fi
   done <<EOF

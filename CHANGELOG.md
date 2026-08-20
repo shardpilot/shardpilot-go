@@ -84,9 +84,11 @@
   deleted and no Go source difference.
 
   They were not merely present in this repository's history. `go get
-  github.com/shardpilot/shardpilot-go@v0.6.0-alpha` DELIVERED NINE OF THEIR
+  github.com/shardpilot/shardpilot-go@v0.6.0-alpha` DELIVERED EIGHT OF THEIR
   FILES — the module zip is cached by the module proxy, so following the
-  documented install command handed them out. One described an internal review
+  documented install command handed them out. (The `.claude/skills/` tree in
+  that zip holds nine files; the ninth is the customer-facing integration
+  skill, which stays.) One described an internal review
   process; the other published the backend stack with versions, the
   tenant-isolation mechanism in operational detail with a named runtime role,
   an inventory of internal repositories with their build commands, and
