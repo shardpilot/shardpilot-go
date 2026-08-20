@@ -148,7 +148,7 @@ ROSTER_RE="$(roster_regex)"
 
 # The SHAPE half. These name no record, no ticket, no branch and no service, so
 # they are safe to publish in the file that gates against them.
-PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here is [Nn][Oo] [A-Za-z]+ (harness|coverage|test|suite)|(is|are) not (tested|covered|scanned|audited|monitored)|[Nn]o (automated )?(tests?|coverage|scanning|monitoring) (for|of|in)|[Nn]obody (looks|checks|monitors)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
+PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z]+ (harness|harnesses|coverage|tests?|suites?)|(is|are) not (tested|covered|scanned|audited|monitored)|[Nn]o (automated )?(tests?|coverage|scanning|monitoring) (for|of|in)|[Nn]obody (looks|checks|monitors)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 
 # The one legitimate collision with the `§` class, in ONE place so the scan
 # and the self-test cannot disagree about it. The first attempt put the
@@ -462,6 +462,7 @@ scan_tree() {
 # ADR id, a live feature-flag name and a live ticket number, none of which the
 # test needed.
 KNOWN_INTERNAL='per ADR-0000 §3
+There are no Playwright tests for the console.
 see ADR-0000; Apache-2.0 §4(d) applies too
 There is NO Playwright harness in the console repo
 the crash path is not covered by automated tests
