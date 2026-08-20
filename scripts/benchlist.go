@@ -10,6 +10,10 @@
 //	A\t<import path>\t<BenchmarkName>   this configuration compiles the file
 //	I\t<import path>\t<BenchmarkName>   it does not
 //
+// A second argument, a comma-separated build-tag list, is added to the build
+// context — the caller passes whatever `-tags` the accompanying `go test` will
+// be run with, since go/build has no way to learn that on its own.
+//
 // Rows are printed once per DECLARATION, not per identity, so the caller can
 // see a name declared twice in one package — which `go test` permits (an
 // internal and an external test package may both define it), runs twice, and
@@ -65,11 +69,24 @@ import (
 )
 
 func main() {
-	if len(os.Args) != 2 {
-		fmt.Fprintln(os.Stderr, "usage: benchlist <module-path> < NUL-separated-paths")
+	if len(os.Args) < 2 || len(os.Args) > 3 {
+		fmt.Fprintln(os.Stderr, "usage: benchlist <module-path> [comma,separated,tags] < NUL-separated-paths")
 		os.Exit(2)
 	}
 	module := os.Args[1]
+
+	// `go test -tags=x` compiles files guarded by `//go:build x`, but nothing
+	// tells go/build that: `-tags` is a command-line flag, and Default.BuildTags
+	// is empty. Without this, a benchmark the accompanying run WILL execute is
+	// classified inactive, which either fails the unbuildable check or has to be
+	// opted out — and opting it out then stops it running for real.
+	//
+	// GOOS and GOARCH need no such handling: go/build.Default already reads them
+	// from the environment, so a GOARCH=386 run classifies `_386_test.go` files
+	// correctly on its own.
+	if len(os.Args) == 3 && os.Args[2] != "" {
+		build.Default.BuildTags = strings.Split(os.Args[2], ",")
+	}
 
 	data, err := io.ReadAll(os.Stdin)
 	if err != nil {

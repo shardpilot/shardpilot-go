@@ -167,7 +167,18 @@ if ! git ls-files -z -- '*_test.go' >"$tmp/tracked_z"; then
   fail "git ls-files failed — cannot determine which test files are tracked"
 fi
 
-if ! go run scripts/benchlist.go "$MODULE" <"$tmp/tracked_z" >"$tmp/rows" 2>"$tmp/rowserr"; then
+# The tags the accompanying `go test` will build with. `go test` reads GOFLAGS
+# itself, but go/build does not — so without handing them over, a benchmark
+# behind `//go:build integration` would be called unbuildable in the very run
+# that is about to execute it. `go env` rather than $GOFLAGS so a value set by
+# `go env -w` counts too; the last -tags wins, as it does in Go's own parsing.
+if ! goflags="$(go env GOFLAGS 2>"$tmp/flagerr")"; then
+  cat "$tmp/flagerr" >&2
+  fail "go env GOFLAGS failed — cannot determine the build tags in effect"
+fi
+build_tags="$(printf '%s\n' "$goflags" | tr ' ' '\n' | sed -n -e 's/^-tags=//p' -e 's/^--tags=//p' | tail -1)"
+
+if ! go run scripts/benchlist.go "$MODULE" "$build_tags" <"$tmp/tracked_z" >"$tmp/rows" 2>"$tmp/rowserr"; then
   cat "$tmp/rowserr" >&2
   fail "could not read the tracked test files — see above"
 fi
