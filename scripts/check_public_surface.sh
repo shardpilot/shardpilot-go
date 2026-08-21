@@ -199,8 +199,10 @@ FIXTURE_NAMEHIT_NAME KNOWN_INNOCENT KNOWN_INTERNAL PATTERNS ROSTER'
 # ends the string there — so everything after it stays in the published file
 # and reaches neither `declare -p`, nor the value audit, nor the self-test,
 # which goes on counting the fixtures it can still see. The grammar therefore
-# admits exactly one escape form inside `$'…'`: three octal digits that are not
-# 000. `\x00`, `\u0000`, `\c@` and a bare `\0` are all refused without being
+# admits exactly one escape form inside `$'…'`: three octal digits in the byte
+# range that are not 000. The range matters as much as the value — bash reduces
+# an octal escape modulo 256, so `\400` is also a NUL and `^[0-7]{3}$` admitted
+# it. `\x00`, `\u0000`, `\c@` and a bare `\0` are all refused without being
 # named, which is the point — the spellings of NUL are not a list worth keeping.
 #
 # ⚠ THE GRAMMAR RUNS FIRST, BEFORE ANYTHING SOURCES THIS FILE. A subshell
@@ -241,7 +243,7 @@ if ! corpus_grammar="$(awk -v expected="$corpus_expected" '
       } else if (c == q) q = ""
       else if (ansi && c == "\\") {
         esc = substr(s, i + 1, 3)
-        if (esc !~ /^[0-7][0-7][0-7]$/ || esc == "000") {
+        if (esc !~ /^[0-3][0-7][0-7]$/ || esc == "000") {
           if (!hit) print NR ": escape in an ANSI-C fragment is not a non-NUL octal byte -- " $0
           hit = 1
         }
@@ -355,7 +357,11 @@ CONTAINER_SIGS="$CONTAINER_SIGS"' \122\141\162\041\032\007 \177\105\114\106'
 # all zeros, all nines or all f's, so that is the whole rule, and no reference
 # value needs to be written down here.
 is_sentinel_run() {
-  [ -n "$1" ] || return 1
+  # ⚠ LENGTH IS PART OF THE SHAPE. A one-character run is uniformly valued by
+  # definition, so a real identifier numbered 0 or 9 was vacuously a sentinel
+  # in every class whose suffix may be a single digit. Three is the shortest
+  # run any synthetic value here uses.
+  [ "${#1}" -ge 3 ] || return 1
   case "$1" in *[!0]*) ;; *) return 0 ;; esac
   case "$1" in *[!9]*) ;; *) return 0 ;; esac
   case "$1" in *[!f]*) ;; *) return 0 ;; esac
@@ -455,6 +461,7 @@ scan_tree() {
   # refusal below cannot see. Measured: a producer emitting one path then
   # exiting 1 yields one scanned file and a green run.
   list="$(mktemp)"
+  blob="$(mktemp)"
   if ! (cd "$root" && git ls-files -z) > "$list"; then
     rm -f "$list"
     echo "REFUSING: git ls-files failed in '$root'." >&2
@@ -476,37 +483,42 @@ scan_tree() {
        || printf '%s\n' "$f" | grep -qiE -- "$ROSTER_RE"; then
       scan_lane_a="${scan_lane_a}${f}:path:${f}"$'\n'
     fi
-    # ⚠ TRACKED IS THE INDEX; THIS SCAN READS THE WORKING TREE. A path staged
-    # and then removed from the tree is listed by `git ls-files` and absent
-    # from disk, so the old `[ -f ] || continue` skipped it — and a commit
-    # publishes it, because a commit is made from the index. This gate reported
-    # LANE A CLEAN over exactly that state and the file it skipped reached a
-    # public branch; it was removed by amending, and this refusal is why that
-    # cannot happen quietly again. In a fresh checkout the condition is never
-    # true, which is precisely why it went unnoticed on a developer machine.
-    if [ ! -f "$root/$f" ] && [ ! -L "$root/$f" ]; then
-      echo "REFUSING: '$f' is tracked but is not a file in the working tree." >&2
-      echo "  The scan reads the tree; a path that exists only in the index is" >&2
-      echo "  content no pass here has looked at, and a commit would carry it." >&2
-      echo "  Restore it or unstage it, then run again." >&2
+    # ⚠ EVERY CONTENT CHECK BELOW READS THE INDEX, NOT THE WORKING TREE.
+    # `git ls-files` lists the index and `git commit` commits the index; the
+    # tree is a third thing that merely usually agrees with both. Staging a
+    # file and editing the worktree copy left this reading bytes no commit
+    # would contain; staging one and deleting the copy left it reading nothing
+    # at all, and that one is not hypothetical — a probe file skipped exactly
+    # that way reached a public branch under a clean report. Refusing the
+    # second case was the partial answer and has been deleted with this change:
+    # the blob git would commit is the only thing worth scanning.
+    #
+    # It also removes the symlink special case. A symlink's blob IS its target
+    # path, so the string the repository publishes arrives here as content,
+    # without following anything.
+    ls_entry="$(cd "$root" && git ls-files -s -z -- "$f" | tr -d '\000')"
+    mode="${ls_entry%% *}"
+    if [ "$mode" = 160000 ]; then
+      echo "REFUSING: '$f' is a gitlink, so its contents are another repository." >&2
+      echo "  Nothing here reads across that boundary, and a clean result would" >&2
+      echo "  say nothing about what the submodule publishes." >&2
       exit 2
     fi
-    # ⚠ A TRACKED SYMLINK PUBLISHES ITS TARGET PATH. That path is the object
-    # git stores and ships; the file it points at may not even exist in the
-    # tree. `-f` follows the link, so this read the TARGET's contents when the
-    # target existed and skipped the entry entirely when it did not — in both
-    # cases never reading the one string the repository actually publishes.
-    if [ -L "$root/$f" ]; then
-      link="$(readlink "$root/$f" 2>/dev/null || true)"
+    if ! (cd "$root" && git cat-file blob ":$f") > "$blob" 2>/dev/null; then
+      echo "REFUSING: the staged blob for '$f' could not be read." >&2
+      echo "  It is listed in the index, so a commit would carry it; an" >&2
+      echo "  unreadable one cannot be reported clean." >&2
+      exit 2
+    fi
+    scan_files=$((scan_files + 1))
+    if [ "$mode" = 120000 ]; then
+      link="$(cat "$blob")"
       if printf '%s\n' "$link" | grep -qE -- "$PATTERNS" \
          || printf '%s\n' "$link" | grep -qiE -- "$ROSTER_RE"; then
         scan_lane_a="${scan_lane_a}${f}:link:${link}"$'\n'
       fi
-      scan_files=$((scan_files + 1))
       continue
     fi
-    [ -f "$root/$f" ] || continue
-    scan_files=$((scan_files + 1))
     # ⚠ A COMPRESSED TRACKED FILE IS NOT SCANNED BY ANYTHING HERE, and `-a`
     # does not change that: treating a container as text reads its DEFLATE
     # stream, not its contents. So internal material inside a committed .zip,
@@ -524,6 +536,11 @@ scan_tree() {
     # by magic rather than by extension, because the extension is the part an
     # author controls.
     #
+    # ⚠ AND AN ASCII RASTER CARRIES NO NUL AT ALL. Netpbm's P1 through P6 hold
+    # their pixels as decimal text, so neither the NUL refusal nor a
+    # compression signature sees them while the picture renders whatever it
+    # renders. Two printable magic bytes, on the same footing as `MZ`.
+    #
     # ⚠ A RASTER IMAGE IS A CONTAINER FOR TEXT. A screenshot rendering an
     # internal identifier holds it as pixels, so `grep -a` reads the file,
     # counts it, and reports nothing — a clean line about a file whose contents
@@ -532,8 +549,9 @@ scan_tree() {
     # costs nothing while the answer is zero and becomes a deliberate decision
     # the day it stops being zero. Deciding then means adding OCR or an
     # explicit exception, not discovering the hole afterwards.
-    case "$(od -An -tx1 -N4 "$root/$f" 2>/dev/null | tr -d ' \n')" in
-      25504446|4d5a*|89504e47|ffd8ff*|47494638|52494646|424d*|49492a00|4d4d002a)
+    case "$(od -An -tx1 -N4 "$blob" 2>/dev/null | tr -d ' \n')" in
+      25504446|4d5a*|89504e47|ffd8ff*|47494638|52494646|424d*|49492a00|4d4d002a|\
+      5031*|5032*|5033*|5034*|5035*|5036*)
         echo "REFUSING: '$f' begins with container magic (archive, PDF, executable" >&2
         echo "  or raster image)," >&2
         echo "  and this gate reads files as text. No pass here opens a container, so" >&2
@@ -559,7 +577,7 @@ scan_tree() {
     # bzip2 one is four printable characters, which is why every signature here
     # is written in octal — spelled out, this gate refused itself, correctly.
     for sig in $CONTAINER_SIGS; do
-      grep -qaF -- "$(printf "$sig")" "$root/$f" 2>/dev/null || continue
+      grep -qaF -- "$(printf "$sig")" "$blob" 2>/dev/null || continue
       echo "REFUSING: '$f' contains a compressed-container signature." >&2
       echo "  Something in this file is a container, whatever its first bytes say," >&2
       echo "  and no pass here reads container contents. Remove it, or extend this" >&2
@@ -577,8 +595,8 @@ scan_tree() {
     # NUL-bearing tracked files, so a decoder here would be untested code
     # guarding nothing. This covers UTF-16 and UTF-32 with or without a BOM,
     # which a BOM test would not.
-    nul_bytes=$(wc -c < "$root/$f" | tr -d ' ')
-    nul_stripped=$(LC_ALL=C tr -d '\000' < "$root/$f" | wc -c | tr -d ' ')
+    nul_bytes=$(wc -c < "$blob" | tr -d ' ')
+    nul_stripped=$(LC_ALL=C tr -d '\000' < "$blob" | wc -c | tr -d ' ')
     if [ "$nul_bytes" -ne "$nul_stripped" ]; then
       echo "REFUSING: '$f' contains NUL bytes, so it is not the text this reads." >&2
       echo "  UTF-16 and UTF-32 hold ASCII interleaved with NULs and match no" >&2
@@ -610,11 +628,10 @@ scan_tree() {
     # "${PIPESTATUS[0]}"` carries GREP's status out, because the status of the
     # assignment itself would be tr's and tr always succeeds.
     set +e
-    # This file is read with its definition and fixture regions blanked out;
-    # every other file is read as-is. `self_scan_body` preserves line numbering
-    # by emitting an empty line per removed line, so reported line numbers stay
-    # true to the file on disk.
-    scan_src="$root/$f"
+    # The staged blob, so a reported line number is a line number in what a
+    # commit would carry. For a path whose tree copy matches its index entry —
+    # every path in a fresh checkout — that is the same file.
+    scan_src="$blob"
     hits="$(grep -anE -- "$PATTERNS" "$scan_src" 2>/dev/null \
       | tr -d '\000'; exit "${PIPESTATUS[0]}")"
     status=$?
@@ -750,7 +767,10 @@ EOF
   # file its sole publisher and everything stayed green.
   #
   # Top-level alternatives are split on `|` outside brackets and groups, and
-  # each must carry a regex metacharacter. Names belong in the roster, which is
+  # each must carry a metacharacter that makes it a SHAPE — a character class,
+  # a quantifier or an escape. Parentheses do not count: they are grouping, and
+  # `(private-daemon)` is the same name in a costume, which is exactly what got
+  # past the first version of this check. Names belong in the roster, which is
   # checked against the tree.
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
@@ -760,7 +780,7 @@ EOF
 $(printf '%s' "$PATTERNS" | awk '
   function check(a) {
     if (a == "") return
-    if (a ~ /[][(){}+*?\\]/) return
+    if (a ~ /[][{}+*?\\]/) return
     print a
   }
   {
@@ -830,6 +850,7 @@ EOF
 
 selftest() {
   local line misses=0 falses=0 tested=0 innocent=0 tmp scanned_a
+  local fixname fixval fixseen=
   while IFS= read -r line; do
     [ -z "$line" ] && continue
     tested=$((tested + 1))
@@ -900,6 +921,30 @@ EOF
   # Every name and body comes from the corpus file. This block used to carry
   # them inline and needed its own exemption; with the literals gone it is
   # ordinary code and is scanned like the rest of this file.
+  # ⚠ THESE NAMES BECOME REDIRECTION TARGETS. A fixture name carrying a slash
+  # — or an absolute path — writes outside the temporary repository, into the
+  # real workspace, before anything is scanned. Verified: an absolute name
+  # overwrote a staged disclosure with clean prose, after which the self-test
+  # reported 6/6 and the gate exited 0 while the index still carried it.
+  for fixname in $CORPUS_EXPECTED_NAMES; do
+    case "$fixname" in *_NAME) ;; *) continue ;; esac
+    eval "fixval=\${$fixname:-}"
+    case "$fixval" in
+      ''|.|..|*/*|-*)
+        echo "REFUSING: $CORPUS gives $fixname a name that is not a plain basename." >&2
+        echo "  The self-test writes these; a path component would put a fixture" >&2
+        echo "  outside the temporary repository and into the real workspace." >&2
+        exit 2 ;;
+    esac
+    if [ "$(printf '%s\n' "$fixseen" | grep -cxF -- "$fixval")" -ne 0 ]; then
+      echo "REFUSING: $CORPUS reuses the fixture name $fixval." >&2
+      echo "  Two fixtures writing one path leave the self-test asserting over" >&2
+      echo "  whichever was written last." >&2
+      exit 2
+    fi
+    fixseen="$fixseen$fixval"$'\n'
+  done
+
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
   (

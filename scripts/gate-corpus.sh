@@ -56,7 +56,7 @@ tracked as GAP-000 internally
 pinned to main @ 0000000
 nobody looks at that dashboard
 tracked as SP-999 in the internal board
-filed as AC-QA-9 during triage
+filed as AC-QA-999 during triage
 the console lacks automated tests
 Codex review
 EXAMPLE_SYNTHETIC_FLAG_MODE=off
