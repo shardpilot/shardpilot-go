@@ -264,6 +264,28 @@ for required in PATTERNS ROSTER ROSTER_RE RESERVED_ADR_IDS KNOWN_INTERNAL KNOWN_
   fi
 done
 
+# The corpus is excluded from every search BY PATH, and the comment refusal
+# above deliberately skips the header — which left this header as the one
+# stretch of prose in the repository that nothing reads. Codex put
+# a tracker-style identifier in it and the whole gate still exited 0 — this
+# very comment had to be reworded because the gate then caught the literal.
+# The exclusion exists for the assignments, whose values match the classes by
+# construction; it was never meant to cover prose. So the header is scanned
+# with the same classes as every other file, and it is the only part of this
+# file that can be.
+corpus_header="$(awk '/^[A-Za-z_][A-Za-z0-9_]*=/ { exit } { print NR ": " $0 }' "$CORPUS")"
+corpus_header_hits="$( {
+    printf '%s\n' "$corpus_header" | { grep -aE  -- "$PATTERNS"  || true; }
+    printf '%s\n' "$corpus_header" | { grep -aiE -- "$ROSTER_RE" || true; }
+  } | sort -u)"
+if [ -n "$corpus_header_hits" ]; then
+  echo "REFUSING: $CORPUS carries internal material in its header:" >&2
+  printf '  %s\n' "$corpus_header_hits" >&2
+  echo "  Nothing else reads this text. Reword it, or move what it says into" >&2
+  echo "  the gate, which is scanned end to end." >&2
+  exit 2
+fi
+
 # ⚠ THIS FILE IS SCANNED END TO END, WITH NO EXEMPTIONS AT ALL.
 #
 # It used to exempt regions of itself, marked off with comments, and every

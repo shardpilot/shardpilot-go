@@ -75,9 +75,13 @@ go get github.com/shardpilot/shardpilot-go@v0.6.1-alpha
   - `github.com/shardpilot/shardpilot-go` — analytics (package `shardpilot`);
   - `github.com/shardpilot/shardpilot-go/pkg/crash` — crash reporting
     (package `crash`).
-- **`v0.1.0` is retracted** in `go.mod`; never pin it. Older usable pins
-  (`v0.5.0-alpha`, `v0.4.0-alpha`, `v0.3.0-alpha`, `v0.2.0-alpha`, `v0.1.2`) ship
-  progressively less surface — prefer the pin above.
+- **`v0.1.0` is retracted** in `go.mod`; never pin it. **Do not reach back to an
+  earlier tag at all**, and do not offer one as a fallback. `v0.5.0-alpha` and
+  `v0.6.0-alpha` distribute eight internal agent-skill files through `go get`;
+  `v0.6.1-alpha` is the deletion-only patch that removes them, and no Go source
+  differs between the two. `v0.4.0-alpha` and below predate those files, but
+  they also predate most of what this skill documents. If you need a release
+  without the features described here, wait for one cut from the cleaned tree.
 - `IngestURL` is the base URL of the ShardPilot ingest deployment you were
   given, or of a local stack you run yourself. HTTPS is required outside localhost/loopback. The **analytics
   client only** can opt into private-network HTTP via
