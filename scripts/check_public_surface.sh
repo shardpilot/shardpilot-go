@@ -99,13 +99,33 @@
 # close this; a reviewer can.
 #
 # ⚠ SOURCE AND RENDERED PAGE ARE DIFFERENT SURFACES, and the published one is
-# the page. A token split by emphasis, an escaped hyphen, a character reference
-# and a carriage return before end-of-line all read as clean bytes and disclose
-# on the page; each is normalised or refused below for that reason, and the one
-# instance this gate has caught in already-committed content was of exactly
-# that kind. What is still NOT read is anything a renderer assembles that those
-# normalisations do not undo — across markup elements, across a line break. The
-# formats whose whole purpose is rendering are refused rather than parsed.
+# the page. What is normalised here is PROSE WHOSE RENDERED MEANING DIFFERS
+# FROM ITS SOURCE: Markdown emphasis, backslash escapes, and a carriage return
+# sitting before end-of-line. Nobody writes those to hide anything — the one
+# instance this gate has ever caught in already-committed content was exactly
+# that, `**not**` inside a sentence about coverage, where a person wrote two
+# asterisks as people do and the meaning changed on the page.
+#
+# ⚠ AND WHAT IS DELIBERATELY ENCODED IS OUT OF SCOPE, which is why the
+# character-reference refusal, the inline-tag normalisation and the XML, RTF
+# and PostScript refusals were REMOVED rather than extended. Nobody types
+# `&#65;DR-0331` by accident. Defending against it with eight refusals while
+# the paragraph below declares deliberate concealment out of scope is the same
+# document-says-one-thing-machinery-does-another this whole change exists to
+# remove — only inside a single file.
+#
+# ⚠ THE PUBLISHING SURFACE DOES RENDER THEM, MEASURED. Against GitHub's own
+# GFM endpoint on 2026-08-21, every one of these produced a contiguous
+# identifier on the page: emphasis, a backslash escape, a numeric character
+# reference, an inline element, an HTML comment, and link syntax. One did not:
+# a named reference for a hyphen yields U+2010, not the ASCII character, so it
+# cannot form an identifier in any class here at all. The boundary below is
+# therefore NOT "the surface does not render it" — it does. It is "a person did
+# not do it by accident", and against the other kind stands review.
+#
+# What is consequently NOT read: anything a renderer assembles that emphasis
+# and escape normalisation do not undo. Images are still refused, because
+# committing a screenshot IS an accident.
 #
 # ⚠ AND THIS GATE DOES NOT CATCH A NAME HIDDEN DELIBERATELY. Its subject is
 # material that reaches the public surface WITHOUT ANYONE INTENDING IT. A
@@ -121,6 +141,10 @@
 # pattern list is asserted against fixtures on every run, and a name added to
 # either is a visible line in a diff. That is a stated BOUNDARY, not an
 # oversight — a green run is not evidence about it.
+#
+# ⚠ AND A COMMENT IN THIS FILE LIVES ON THE SCANNED SURFACE. Three times while
+# this was written, explaining a rule by quoting the literal it looks for made
+# the gate fail on itself — correctly. Describe the shape; do not spell it.
 #
 
 set -euo pipefail
@@ -416,25 +440,6 @@ AUDIT_CLASSES="$AUDIT_CLASSES"'|(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 # published live reference the self-test calls correct.
 AUDIT_CLASSES="$AUDIT_CLASSES"'|Codex [a-z]*#[0-9]+'
 
-# ⚠ NUMERIC ALWAYS, NAMED ONLY WHERE DEFINED. A renderer substitutes the
-# references it knows and leaves the rest as written, so `&madeupentity;` is
-# literal text — refusing it blocked a merge over a placeholder. The named list
-# is the ASCII punctuation that can join a token: an entity producing an
-# accented letter cannot form an identifier in any class here.
-CHARACTER_REFERENCE='&#[0-9]+;|&#[xX][0-9A-Fa-f]+;'
-CHARACTER_REFERENCE="$CHARACTER_REFERENCE"'|&(amp|lt|gt|quot|apos|nbsp|hyphen'
-CHARACTER_REFERENCE="$CHARACTER_REFERENCE"'|dash|ndash|mdash|minus|num|sol'
-CHARACTER_REFERENCE="$CHARACTER_REFERENCE"'|period|lowbar|commat|colon|semi'
-CHARACTER_REFERENCE="$CHARACTER_REFERENCE"'|comma|excl|quest|lpar|rpar|lsqb'
-CHARACTER_REFERENCE="$CHARACTER_REFERENCE"'|rsqb|lcub|rcub|verbar|plus|ast'
-CHARACTER_REFERENCE="$CHARACTER_REFERENCE"'|lowast|midast|equals'
-# ⚠ AND THE HTML5 ALIASES FOR THE SAME CHARACTERS. `&UnderBar;` renders `_`
-# exactly as `&lowbar;` does, and a flag-shaped identifier assembled from them
-# reaches the page while the bytes show only entity text. An alias omitted is
-# the same hole as a character omitted.
-CHARACTER_REFERENCE="$CHARACTER_REFERENCE"'|UnderBar|VerticalLine|vert|Hat'
-CHARACTER_REFERENCE="$CHARACTER_REFERENCE"'|NewLine|Tab|bsol|commat|excl);'
-
 roster_regex() {
   printf '%s' "$ROSTER" | sed -e 's![-_ ]![-_ ]+!g' -e 's!/! */ *!g' | paste -sd'|' -
 }
@@ -614,53 +619,6 @@ scan_tree() {
     # by magic rather than by extension, because the extension is the part an
     # author controls.
     #
-    # ⚠ AND MARKUP RENDERS TEXT THAT IS NOT IN ITS BYTES. An SVG splitting an
-    # identifier across two elements draws it whole and contains no run
-    # matching anything here — a refusal of those formats, not a claim to have
-    # solved rendered text, which the scope note states as a limit.
-    #
-    # ⚠ RECOGNISED AFTER THE LEADING CONTENT XML PERMITS, not at byte zero. A
-    # valid document may begin with a byte-order mark, blank lines or a comment,
-    # and a four-byte test sees none of that. The question asked instead is
-    # whether the first thing that is not whitespace or a BOM is a `<` — which
-    # is true of every XML-family document and, measured today, of no tracked
-    # file in either tree.
-    # ⚠ A TAG, NOT AN ANGLE BRACKET. `< 5 ms latency target.` opens with one and
-    # is prose; refusing it blocked a merge over a threshold. The next character
-    # has to start a name, a closing tag, a declaration or a processing
-    # instruction for this to be a document.
-    # ⚠ `cut`, NOT `head -c`. `head` closes the pipe at its byte count, the
-    # process feeding it takes SIGPIPE, and an ASSIGNMENT takes the pipeline's
-    # status — 141, which `set -e` turns into a dead run. It read as 141 for
-    # every probe at once, which is what a dead run looks like: uniform, and
-    # nothing like the mixture of 0, 1 and 2 the table expected.
-    # ⚠ LEADING WHITESPACE ONLY. `tr -d '[:space:]'` removed every space in the
-    # file, so `< alpha is the current threshold.` became `<alpha` and was
-    # refused as markup — a false refusal on prose, from a fix for a false
-    # refusal on prose.
-    markup_head="$(sed -e '1s/^\xef\xbb\xbf//' "$blob" \
-      | sed -e '/^[[:space:]]*$/d' -e 's/^[[:space:]]*//' \
-      | sed -n '1s/^\(..\).*$/\1/p')"
-    # ⚠ NO PIPE. `printf | grep -q` exits 141 under `pipefail`: grep stops at the
-    # first match and closes the pipe, printf takes SIGPIPE, and the whole run
-    # dies with a status nobody reads as "matched". A case does the same job
-    # with no second process.
-    markup_doc=no
-    case "$markup_head" in
-      # An XML name may begin with a letter, an underscore or a colon; a
-      # document may also open with a declaration, a processing instruction or
-      # a closing tag. `<_root>` is valid XML and was reading as prose.
-      '<'[A-Za-z_:!?/]*) markup_doc=yes ;;
-    esac
-    if [ "$printable_sigs" = yes ] && [ "$markup_doc" = yes ]; then
-      # refusal:hazard
-      echo "REFUSING: '$f' begins as a markup document." >&2
-      echo "  Its renderer assembles text this gate reads only as bytes — an" >&2
-      echo "  identifier split across two elements draws whole and matches" >&2
-      echo "  nothing here. Remove it, or extend this gate to render." >&2
-      exit 2
-    fi
-    #
     # ⚠ AND AN ASCII RASTER CARRIES NO NUL AT ALL. XPM comes in two shapes and
     # both are printable: the C-source form opening `/* X`, and XPM2 opening
     # `! XPM2` — plain text throughout, so neither the NUL refusal nor a
@@ -693,7 +651,7 @@ scan_tree() {
     case "$flc" in
       *.png|*.jpg|*.jpeg|*.gif|*.webp|*.bmp|*.tif|*.tiff|*.ico|*.svg|*.xpm|\
       *.xbm|*.ppm|*.pgm|*.pbm|*.pnm|*.pcx|*.tga|*.psd|*.ai|*.eps|*.heic|\
-      *.heif|*.avif|*.ps|*.eps|*.rtf)
+      *.heif|*.avif)
         # refusal:hazard
         echo "REFUSING: '$f' is an image, and this gate reads files as text." >&2
         echo "  Pixels are not searchable prose: an identifier drawn in a" >&2
@@ -788,57 +746,6 @@ scan_tree() {
       echo "  Store it as UTF-8, or extend this gate to decode deliberately." >&2
       exit 2
     fi
-    # ⚠ A CHARACTER REFERENCE RENDERS AS SOMETHING THIS NEVER SEES. A ticket id
-    # whose hyphen is written as a numeric reference is not that token in bytes
-    # and is exactly that token on the page, so a
-    # byte-oriented pass reports clean over a document that discloses. Refused
-    # rather than decoded, and on the same footing as the containers: measured
-    # today, both trees contain ZERO character references of any kind, numeric
-    # or named, so a decoder would be untested code guarding nothing. The day a
-    # document needs one — an ampersand entity in prose about HTML, say — this
-    # becomes a decision rather than a discovery. Note this comment cannot
-    # give an example: writing one made the gate refuse itself, correctly.
-    #
-    # ⚠ AND ONLY FOR FORMATS THAT RENDER ONE. In source, the same characters are
-    # data: a file holding an entity as a string constant is ordinary and was
-    # being refused outright — which also broke this file's promise that source
-    # is REPORTED rather than gated, since a refusal ends the run before the
-    # lane split can honour it.
-    refs_apply=no
-    case "$flc" in
-      *.md|*.markdown|*.html|*.htm) refs_apply=yes ;;
-    esac
-    # ⚠ NOT INSIDE A CODE SPAN. A fenced block or backticked run DISPLAYS the
-    # reference rather than decoding it, so refusing a document that documents
-    # an entity blocked a merge over an example. Code is removed before the
-    # question is asked; everywhere else it still counts.
-    if [ "$refs_apply" = yes ]; then
-      sed -e 's/`[^`]*`//g' -e '/^```/,/^```/d' "$blob" > "$md_blob" || cat "$blob" > "$md_blob"
-    fi
-    if [ "$refs_apply" = yes ] &&
-       grep -qaE "$CHARACTER_REFERENCE" "$md_blob" 2>/dev/null; then
-      # refusal:hazard
-      echo "REFUSING: '$f' contains a character reference." >&2
-      echo "  It renders as a character this gate never reads, so a clean result" >&2
-      echo "  would be about the bytes rather than about the page. Write the" >&2
-      echo "  character itself, or extend this gate to decode deliberately." >&2
-      exit 2
-    fi
-    # ⚠ AND AN ENCODING THE PATTERNS CANNOT MATCH IS AN UNREAD FILE. A document
-    # in EBCDIC or another non-ASCII-compatible encoding carries no NUL and no
-    # container signature, so every pass above admits it and every pattern
-    # below misses it — a clean line about a file nothing here could read.
-    # Refused rather than transcoded, on the same footing: both trees are UTF-8
-    # today, accents included, so a transcoder would be untested code guarding
-    # nothing.
-    if ! iconv -f UTF-8 -t UTF-8 < "$blob" >/dev/null 2>&1; then
-      # refusal:hazard
-      echo "REFUSING: '$f' is not valid UTF-8." >&2
-      echo "  The classes below are ASCII-oriented, so an encoding they cannot" >&2
-      echo "  read would report clean whatever it says. Store it as UTF-8, or" >&2
-      echo "  extend this gate to transcode deliberately." >&2
-      exit 2
-    fi
     # -a remains for a file with high-bit bytes and no NUL, which GNU grep also
     # calls binary. It is defence behind the refusal above, not the front line.
     # -a treats a NUL-bearing file as text: GNU grep >= 3.5 otherwise prints
@@ -871,20 +778,7 @@ scan_tree() {
     # nothing wrong. The substitution is per-line, so reported line numbers
     # stay true to the file.
     #
-    # ⚠ MARKDOWN AND HTML ARE NORMALISED DIFFERENTLY. A browser renders `*` and
-    # a backtick as themselves, so stripping them from HTML turns `ADR-*1234`
-    # into an identifier the page never shows — a false lane-A failure I
-    # introduced by widening one arm instead of adding a second.
     case "$flc" in
-      *.html|*.htm)
-        if sed -e 's|</\{0,1\}[A-Za-z][A-Za-z0-9-]*\( [^>]*\)\{0,1\}/\{0,1\}>||g' \
-               "$blob" > "$md_blob"; then
-          cat "$md_blob" > "$blob"
-        else
-          echo "REFUSING: could not normalise markup in '$f'." >&2
-          exit 2
-        fi
-        ;;
       *.md|*.markdown)
         # ⚠ EMPHASIS SPLITS A TOKEN ON THE PAGE AND NOT IN THE BYTES: an
         # identifier written with its digits bolded renders contiguously and
@@ -904,15 +798,7 @@ scan_tree() {
         # Written in BASIC regex on purpose: `-E` applies to every script in
         # the same sed, and the two substitutions above are BRE. Reaching for
         # it broke both of them and the gate refused the whole file.
-        # ⚠ COMMENTS AND LINK SYNTAX SIT BETWEEN TOKEN PIECES TOO. A renderer
-        # drops an HTML comment entirely and shows a link's TEXT, so
-        # `ADR-<!-- x -->1234` and `ADR-[1234](url)` both draw the identifier
-        # whole while the bytes have delimiters in the middle. The comment goes;
-        # the link keeps its text and loses its target.
-        if sed -e 's/\\\([^A-Za-z0-9]\)/\1/g' -e 's/[*`]//g' \
-               -e 's|<!--.*-->||g' \
-               -e 's|\[\([^]]*\)\](\([^)]*\))|\1|g' \
-               -e 's|</\{0,1\}[A-Za-z][A-Za-z0-9-]*\( [^>]*\)\{0,1\}/\{0,1\}>||g' "$blob" > "$md_blob"; then
+        if sed -e 's/\\\([^A-Za-z0-9]\)/\1/g' -e 's/[*`]//g' "$blob" > "$md_blob"; then
           cat "$md_blob" > "$blob"
         else
           # refusal:structural
