@@ -192,8 +192,14 @@ self_scan_body() {
   # onto a comment, the other never written), 117 of 609 lines survived, and a
   # mutation test still passed because the planted line sat above the first
   # marker. A guard whose failure mode is "sees less" must say so.
+  # `|| true`, like the two counts above. A no-match grep exits 1, and whether
+  # that aborts under `set -euo pipefail` before the explicit check below can
+  # run depends on how bash treats a failing substitution in an assignment —
+  # empirically it does not here, but a refusal that depends on that reading is
+  # a refusal resting on a subtlety. The explicit check is meant to be the
+  # thing that reports; this makes sure it is the thing that runs.
   labels="$(grep -oE '^[[:space:]]*# gate-self-exempt:begin .*' "$1" \
-    | sed -E 's/.*:begin //' | sort | tr '\n' ',')"
+    | sed -E 's/.*:begin //' | sort | tr '\n' ',' || true)"
   if [ "$labels" != "definitions,fixtures,scan fixture," ]; then
     echo "REFUSING: $1 has exempt regions [$labels], expected exactly" >&2
     echo "  [definitions,fixtures,scan fixture,]. Balanced and non-nested was not" >&2
