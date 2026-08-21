@@ -166,23 +166,48 @@ if [ ! -f "$CORPUS" ]; then
   echo "  gate would scan with an empty pattern list and report clean." >&2
   exit 2
 fi
-# shellcheck source=/dev/null
-. "$CORPUS"
-# ⚠ THE CORPUS IS THE ONE PATH THE GATE SKIPS, so it gets its own grammar check.
-# Below its header it must contain assignments and their continuations and
-# nothing else: no comments, which is where prose hid six times when the
-# exemptions were regions inside this file. It cannot be a hiding place if it
-# cannot hold a sentence that is not a fixture.
-# `;#` counts too: a comment after a control operator is valid shell and was
-# the seventh way prose got into an unread place, found after the sixth was
-# closed. The residual limit is stated rather than chased — a sentence inside a
-# fixture STRING is indistinguishable from a fixture, by construction, which is
-# why this file is kept to a corpus small enough to read as a list of sentences.
-# ⚠ THE HEADER ENDS WHERE THE DATA BEGINS, detected rather than counted. The
-# first version skipped a fixed number of lines, which is a magic number that
-# is wrong the moment the header changes length — and it was: it silently
-# excused the first assignment, so the very case this check was added for went
-# unseen.
+# ⚠ THE CORPUS IS NEVER SOURCED INTO THIS SHELL. It used to be, before its own
+# validators ran — so a single `exit 0` appended to it ended the gate with
+# status 0 and NO OUTPUT AT ALL. Not a weakened check: the whole run, silently.
+# A file this script skips must not also be a file this script executes.
+#
+# It is read in a subshell instead, which reports back only variable VALUES via
+# `declare -p`. An `exit` there kills the subshell, `declare -p` never runs, the
+# dump is empty, and the required-variable check below refuses. The failure mode
+# of tampering is a refusal rather than a silent success.
+#
+# `env -i` for the same reason the name comparison needs it: starting from a
+# clean environment means an assignment to an INHERITED name — `HOME=`, say —
+# shows up as newly defined instead of being invisible against the parent's
+# variables. PATH is carried in so the subshell can find its utilities; it is
+# excluded from the comparison by name.
+CORPUS_EXPECTED_NAMES='FIXTURE_ACCENT_BODY FIXTURE_ACCENT_NAME FIXTURE_BINARY_BODY
+FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY
+FIXTURE_DIRTY_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY
+FIXTURE_NAMEHIT_NAME KNOWN_INNOCENT KNOWN_INTERNAL PATTERNS RESERVED_ADR_IDS
+ROSTER'
+
+corpus_defined="$(env -i PATH="$PATH" bash -c '
+  before=$(compgen -v | sort)
+  . "$1" >/dev/null 2>&1
+  after=$(compgen -v | sort)
+  comm -13 <(printf "%s\n" "$before") <(printf "%s\n" "$after")
+' _ "$CORPUS" 2>/dev/null | { grep -vxE 'before|after|PATH|PIPESTATUS|_' || true; } | sort | tr '\n' ' ')"
+corpus_expected="$(printf '%s\n' $CORPUS_EXPECTED_NAMES | sort | tr '\n' ' ')"
+if [ "$corpus_defined" != "$corpus_expected" ]; then
+  echo "REFUSING: $CORPUS defines a different set of names than expected." >&2
+  echo "  defined:  $corpus_defined" >&2
+  echo "  expected: $corpus_expected" >&2
+  echo "  The gate skips this file, so an unexpected assignment is unread text in" >&2
+  echo "  a published repository. Adding one means naming it in the gate. An EMPTY" >&2
+  echo "  list here also means the file stopped the subshell early." >&2
+  exit 2
+fi
+
+# Below its header the corpus may contain no comments — leading, after a
+# semicolon, or anywhere whitespace precedes a hash. The header boundary is
+# DETECTED rather than counted: a fixed line number excuses the first
+# assignment the moment the header changes length, and it did.
 if awk '
     !started && /^[[:space:]]*(#|$)/ { next }
     { started = 1 }
@@ -195,40 +220,40 @@ if awk '
   exit 2
 fi
 
-# ⚠ WHAT THE CORPUS DEFINES MUST BE EXACTLY THIS SET. Forbidding comments was
-# not enough: an ordinary assignment carries prose just as well, and the corpus
-# is skipped by the scan entirely. So the gate asks BASH what the file defines
-# and refuses on any difference — an extra name, or a missing one.
-#
-# Asked of the shell rather than of grep, deliberately. A line-based reader
-# cannot tell an assignment from a fixture that looks like one, and this corpus
-# contains a fixture that does: a flag-shaped sentence inside KNOWN_INTERNAL,
-# which is there precisely because the gate must match that shape. `compgen -v`
-# reports what was actually defined, so the confusable line is not counted.
-#
-# Adding a corpus variable therefore means naming it here — a line a reviewer
-# sees — which is the same property the exempt-region labels had, kept after
-# the regions themselves were removed.
-CORPUS_EXPECTED_NAMES='FIXTURE_ACCENT_BODY FIXTURE_ACCENT_NAME FIXTURE_BINARY_BODY
-FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY
-FIXTURE_DIRTY_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY
-FIXTURE_NAMEHIT_NAME KNOWN_INNOCENT KNOWN_INTERNAL PATTERNS RESERVED_ADR_IDS
-ROSTER ROSTER_RE'
-corpus_defined="$(bash -c '
-  before=$(compgen -v | sort)
-  . "$1" >/dev/null 2>&1
-  after=$(compgen -v | sort)
-  comm -13 <(printf "%s\n" "$before") <(printf "%s\n" "$after")
-' _ "$CORPUS" | grep -vxE 'before|after|PIPESTATUS|_' | sort | tr '\n' ' ')"
-corpus_expected="$(printf '%s\n' $CORPUS_EXPECTED_NAMES | sort | tr '\n' ' ')"
-if [ "$corpus_defined" != "$corpus_expected" ]; then
-  echo "REFUSING: $CORPUS defines a different set of names than expected." >&2
-  echo "  defined:  $corpus_defined" >&2
-  echo "  expected: $corpus_expected" >&2
-  echo "  The gate skips this file, so an unexpected assignment is unread text in" >&2
-  echo "  a published repository. Adding one means naming it in the gate." >&2
+corpus_ran="$(env -i PATH="$PATH" bash -c 'PS4=@; set -x; . "$1"' \
+  _ "$CORPUS" 2>&1 >/dev/null | { grep '^@@' || true; })"
+if [ -z "$corpus_ran" ]; then
+  echo "REFUSING: $CORPUS ran no statements at all." >&2
   exit 2
 fi
+corpus_odd="$(printf '%s\n' "$corpus_ran" |
+  { grep -vE '^@@[A-Za-z_][A-Za-z0-9_]*=' || true; })"
+if [ -n "$corpus_odd" ]; then
+  echo "REFUSING: $CORPUS runs statements that are not plain assignments:" >&2
+  printf '  %s\n' "$corpus_odd" >&2
+  echo "  Every line above is text in a file the gate never scans. A statement" >&2
+  echo "  defining no variable clears the name check; a substitution nests one" >&2
+  echo "  level deeper. This file holds assignments to the named variables and" >&2
+  echo "  nothing else." >&2
+  exit 2
+fi
+
+corpus_dump="$(env -i PATH="$PATH" bash -c '
+  . "$1" >/dev/null 2>&1
+  declare -p $2
+' _ "$CORPUS" "$CORPUS_EXPECTED_NAMES" 2>/dev/null)"
+if [ -z "$corpus_dump" ]; then
+  echo "REFUSING: $CORPUS produced no values." >&2
+  echo "  Its variables are read in a subshell; an empty result means the file" >&2
+  echo "  ended that subshell before reporting them." >&2
+  exit 2
+fi
+eval "$corpus_dump"
+
+roster_regex() {
+  printf '%s' "$ROSTER" | sed -e 's![-_ ]![-_ ]+!g' -e 's!/! */ *!g' | paste -sd'|' -
+}
+ROSTER_RE="$(roster_regex)"
 
 for required in PATTERNS ROSTER ROSTER_RE RESERVED_ADR_IDS KNOWN_INTERNAL KNOWN_INNOCENT; do
   eval "value=\${$required:-}"

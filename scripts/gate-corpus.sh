@@ -34,10 +34,6 @@
 RESERVED_ADR_IDS='ADR-0000 ADR-0999'
 ROSTER='analytics-service
 control-plane'
-roster_regex() {
-  printf '%s' "$ROSTER" | sed -e 's![-_ ]![-_ ]+!g' -e 's!/! */ *!g' | paste -sd'|' -
-}
-ROSTER_RE="$(roster_regex)"
 PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (for|of|in)|[.,;]|$)|[Nn]obody (looks|checks|monitors)|[Ll]acks( any| automated| an?)* ?[A-Za-z-]*[ ]?(harness|harnesses|coverage|tests?|suites?|monitoring)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 
 KNOWN_INTERNAL='per ADR-0000 §3
@@ -60,8 +56,8 @@ the console lacks automated tests
 (Codex go#48 round 3)
 EXAMPLE_SYNTHETIC_FLAG_MODE=off'
 KNOWN_INTERNAL="$KNOWN_INTERNAL
-The crash path isn$(printf '\047')t tested.
-The console doesn$(printf '\342\200\231')t have automated tests."
+The crash path isn"$'\047'"t tested.
+The console doesn"$'\342\200\231'"t have automated tests."
 
 KNOWN_INNOCENT='go get github.com/shardpilot/shardpilot-go@v0.6.0-alpha
 IngestURL: os.Getenv("SHARDPILOT_INGEST_URL")
