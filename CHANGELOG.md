@@ -109,7 +109,7 @@
   documented detail codes: a `400` carrying `unsupported_content_encoding` or
   `invalid_content_encoding` latches compression off for the process and re-sends the same
   batch uncompressed. A deployment that refuses a compressed body some OTHER way — a bare
-  400 with no envelope, a connection reset, a proxy 502 — is **not** covered by that
+  400 with no envelope, a connection reset, a proxy 502 — does **not** reach that
   fallback; set `DisableRequestCompression` for those.
 
 ## v0.6.1-alpha - 2026-08-20

@@ -395,13 +395,15 @@ eval "$corpus_dump"
 # behind a preamble is not a shape anyone here produces.
 CONTAINER_SIGS='\120\113\003\004 \120\113\005\006 \037\213\010'
 CONTAINER_SIGS="$CONTAINER_SIGS"' \375\067\172\130\132 \050\265\057\375'
-CONTAINER_SIGS="$CONTAINER_SIGS"' \102\132\150\061 \102\132\150\062'
-CONTAINER_SIGS="$CONTAINER_SIGS"' \102\132\150\063 \102\132\150\064'
-CONTAINER_SIGS="$CONTAINER_SIGS"' \102\132\150\065 \102\132\150\066'
-CONTAINER_SIGS="$CONTAINER_SIGS"' \102\132\150\067 \102\132\150\070'
-CONTAINER_SIGS="$CONTAINER_SIGS"' \102\132\150\071 \067\172\274\257'
+CONTAINER_SIGS="$CONTAINER_SIGS"' \067\172\274\257'
+# Printable ones, held apart: in source they are ordinary string constants, and
+# a refusal ends the run before the lane split could report rather than gate.
+CONTAINER_SIGS_TXT='\102\132\150\061 \102\132\150\062 \102\132\150\063'
+CONTAINER_SIGS_TXT="$CONTAINER_SIGS_TXT"' \102\132\150\064 \102\132\150\065'
+CONTAINER_SIGS_TXT="$CONTAINER_SIGS_TXT"' \102\132\150\066 \102\132\150\067'
+CONTAINER_SIGS_TXT="$CONTAINER_SIGS_TXT"' \102\132\150\070 \102\132\150\071'
+CONTAINER_SIGS_TXT="$CONTAINER_SIGS_TXT"' \045\120\104\106'
 CONTAINER_SIGS="$CONTAINER_SIGS"' \122\141\162\041\032\007 \177\105\114\106'
-CONTAINER_SIGS="$CONTAINER_SIGS"' \045\120\104\106'
 
 # Identifiers are admitted by SHAPE. A list of admissible ones was the first
 # answer and it cannot fail: the same change that publishes a live record can
@@ -550,6 +552,22 @@ scan_tree() {
     # It also removes the symlink special case. A symlink's blob IS its target
     # path, so the string the repository publishes arrives here as content,
     # without following anything.
+    # ⚠ AND A PRINTABLE SIGNATURE IN SOURCE IS A STRING CONSTANT. Code that
+    # writes a PDF, or names a compression header, holds those characters
+    # legitimately — and a refusal ends the run before the lane split, so an
+    # unconditional test on printable bytes silently outranks this file's own
+    # promise that source is REPORTED rather than gated. The refusals that rest
+    # on NON-printable bytes are unambiguous and still apply everywhere; the
+    # printable ones are skipped for the reported lane, which is the narrowest
+    # place to draw the line.
+    #
+    # ⚠ DECIDED BEFORE THE FIRST REFUSAL THAT CONSULTS IT. Placed after one, it
+    # was an unbound variable under `set -u` and the run died there — with the
+    # probes reading that as a pass, because a dead run refuses nothing.
+    printable_sigs=yes
+    case "$f" in
+      *.go) printable_sigs=no ;;
+    esac
     ls_entry="$(cd "$root" && git ls-files -s -z -- "$f" | tr -d '\000')"
     mode="${ls_entry%% *}"
     if [ "$mode" = 160000 ]; then
@@ -592,9 +610,23 @@ scan_tree() {
     #
     # ⚠ AND MARKUP RENDERS TEXT THAT IS NOT IN ITS BYTES. An SVG splitting an
     # identifier across two elements draws it whole and contains no run
-    # matching anything here. XML, SVG and DOCTYPE-led files are refused by
-    # their first bytes — a refusal of those formats, not a claim to have
+    # matching anything here — a refusal of those formats, not a claim to have
     # solved rendered text, which the scope note states as a limit.
+    #
+    # ⚠ RECOGNISED AFTER THE LEADING CONTENT XML PERMITS, not at byte zero. A
+    # valid document may begin with a byte-order mark, blank lines or a comment,
+    # and a four-byte test sees none of that. The question asked instead is
+    # whether the first thing that is not whitespace or a BOM is a `<` — which
+    # is true of every XML-family document and, measured today, of no tracked
+    # file in either tree.
+    if [ "$printable_sigs" = yes ] &&
+       [ "$(sed -e '1s/^\xef\xbb\xbf//' "$blob" | tr -d '[:space:]' | head -c 1)" = '<' ]; then
+      echo "REFUSING: '$f' begins as a markup document." >&2
+      echo "  Its renderer assembles text this gate reads only as bytes — an" >&2
+      echo "  identifier split across two elements draws whole and matches" >&2
+      echo "  nothing here. Remove it, or extend this gate to render." >&2
+      exit 2
+    fi
     #
     # ⚠ AND AN ASCII RASTER CARRIES NO NUL AT ALL. XPM is printable C source
     # from its `/* X` header to its pixel array; Netpbm's P1 through P6 hold
@@ -610,9 +642,17 @@ scan_tree() {
     # costs nothing while the answer is zero and becomes a deliberate decision
     # the day it stops being zero. Deciding then means adding OCR or an
     # explicit exception, not discovering the hole afterwards.
-    case "$(od -An -tx1 -N4 "$blob" 2>/dev/null | tr -d ' \n')" in
-      4d5a*|89504e47|ffd8ff*|47494638|52494646|424d*|49492a00|4d4d002a|\
-      5031*|5032*|5033*|5034*|5035*|5036*|2f2a2058|3c3f786d|3c737667|3c21444f)
+    magic4="$(od -An -tx1 -N4 "$blob" 2>/dev/null | tr -d ' \n')"
+    # The BINARY headers, which cannot be a string constant in readable source
+    # and so apply to every file, and the PRINTABLE ones, which can and do not.
+    case "$magic4" in
+      89504e47|ffd8ff*|49492a00|4d4d002a) magic_hit=yes ;;
+      4d5a*|47494638|52494646|424d*|5031*|5032*|5033*|5034*|5035*|5036*|2f2a2058)
+        magic_hit="$printable_sigs" ;;
+      *) magic_hit=no ;;
+    esac
+    case "$magic_hit" in
+      yes)
         echo "REFUSING: '$f' begins with container magic (archive, PDF, executable" >&2
         echo "  or raster image)," >&2
         echo "  and this gate reads files as text. No pass here opens a container, so" >&2
@@ -637,7 +677,9 @@ scan_tree() {
     # sequences. Three of them cannot occur in valid UTF-8 text at all; the
     # bzip2 one is four printable characters, which is why every signature here
     # is written in octal — spelled out, this gate refused itself, correctly.
-    for sig in $CONTAINER_SIGS; do
+    sigs="$CONTAINER_SIGS"
+    [ "$printable_sigs" = yes ] && sigs="$sigs $CONTAINER_SIGS_TXT"
+    for sig in $sigs; do
       grep -qaF -- "$(printf "$sig")" "$blob" 2>/dev/null || continue
       echo "REFUSING: '$f' contains a compressed-container signature." >&2
       echo "  Something in this file is a container, whatever its first bytes say," >&2
@@ -740,7 +782,12 @@ scan_tree() {
     # stay true to the file.
     case "$f" in
       *.md|*.markdown)
-        if sed 's/\\\([^A-Za-z0-9]\)/\1/g' "$blob" > "$md_blob"; then
+        # ⚠ EMPHASIS SPLITS A TOKEN ON THE PAGE AND NOT IN THE BYTES: an
+        # identifier written with its digits bolded renders contiguously and
+        # matches nothing. Asterisks and backticks are removed with the
+        # escapes. UNDERSCORES ARE NOT — the feature-flag class is built from
+        # them, and stripping them would break the one class that needs them.
+        if sed -e 's/\\\([^A-Za-z0-9]\)/\1/g' -e 's/[*`]//g' "$blob" > "$md_blob"; then
           cat "$md_blob" > "$blob"
         else
           echo "REFUSING: could not normalise Markdown escapes in '$f'." >&2
@@ -748,6 +795,19 @@ scan_tree() {
         fi
         ;;
     esac
+    # ⚠ A CARRIAGE RETURN SITS BEFORE END-OF-LINE, so every alternative
+    # anchored on `$` stops matching in a file with Windows line endings — `No
+    # tests` at the end of a CRLF line goes unseen while the same sentence
+    # followed by a full stop is caught. The self-test only ever built LF
+    # fixtures, so nothing here would have shown it. Stripped per line before
+    # any pattern runs, which leaves line COUNT untouched and reported numbers
+    # true.
+    if sed 's/\r$//' "$blob" > "$md_blob"; then
+      cat "$md_blob" > "$blob"
+    else
+      echo "REFUSING: could not normalise line endings in '$f'." >&2
+      exit 2
+    fi
     # The staged blob, so a reported line number is a line number in what a
     # commit would carry. For a path whose tree copy matches its index entry —
     # every path in a fresh checkout — that is the same file.
