@@ -126,13 +126,16 @@ cd "$(dirname "$0")/.."
 # stated: a name removed here stops being gated at PR time, and until the
 # org-wide check covers already-public repositories it is caught by review or
 # not at all.
-# gate-self-exempt:begin definitions
+# ⚠ THE EXEMPT REGION BELOW HOLDS DATA ONLY, and these comments sit OUTSIDE it
+# deliberately. An exempt region is blanked before the file is scanned, so any
+# prose inside it is prose the gate cannot read — and an ordinary ticket
+# reference dropped among these comments passed the whole gate. The region now
+# contains the assignments that match by construction and nothing else; every
+# word of explanation is scanned like any other line in this repository.
+#
 # The two decision-record ids reserved for fixtures and prose in this file.
 # Everything else of that shape is a real record and fails the prose check.
-RESERVED_ADR_IDS='ADR-0000 ADR-0999'
 
-ROSTER='analytics-service
-control-plane'
 
 # Derived, never spelled twice — the defect this whole file keeps finding is a
 # correction landing in one copy while another keeps the old value. Each
@@ -146,17 +149,22 @@ control-plane'
 # describe `shardpilot/ integrations`, because the slash must stay literal
 # while the space around it must be optional. Text wraps either side of a
 # slash, so both are allowed.
+
+# The SHAPE half. These name no record, no ticket, no branch and no service, so
+# they are safe to publish in the file that gates against them.
+
+# Files the gate must not read as content: this script is the one place the
+# patterns are written down, by construction.
+
+# gate-self-exempt:begin definitions
+RESERVED_ADR_IDS='ADR-0000 ADR-0999'
+ROSTER='analytics-service
+control-plane'
 roster_regex() {
   printf '%s' "$ROSTER" | sed -e 's![-_ ]![-_ ]+!g' -e 's!/! */ *!g' | paste -sd'|' -
 }
 ROSTER_RE="$(roster_regex)"
-
-# The SHAPE half. These name no record, no ticket, no branch and no service, so
-# they are safe to publish in the file that gates against them.
 PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (for|of|in)|[.,;]|$)|[Nn]obody (looks|checks|monitors)|[Ll]acks( any| automated| an?)* ?[A-Za-z-]*[ ]?(harness|harnesses|coverage|tests?|suites?|monitoring)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
-
-# Files the gate must not read as content: this script is the one place the
-# patterns are written down, by construction.
 # gate-self-exempt:end
 
 # ⚠ THIS FILE IS SCANNED TOO, with only two regions removed first.
@@ -183,8 +191,22 @@ self_scan_body() {
   # whitespace, awk demanded column zero. An indented marker therefore counted
   # as balanced while the stripper never saw it — the same silent over-blanking
   # this check was added to catch, reintroduced by the check itself.
-  begins="$(grep -cE '^[[:space:]]*# gate-self-exempt:begin' "$1" || true)"
-  ends="$(grep -cE '^[[:space:]]*# gate-self-exempt:end' "$1" || true)"
+  # ⚠ ONE MARKER GRAMMAR, USED BY ALL THREE READERS. Every hole this mechanism
+  # has had came from readers disagreeing about what a marker IS. The counters
+  # and the stripper accepted any line STARTING with the token, while the label
+  # extractor required a space and a label after it — so a block written
+  # `:beginX` / `:endX` counted, was blanked by the stripper, and contributed no
+  # label, leaving the label set looking exactly right while a fourth region
+  # quietly swallowed whatever it wrapped.
+  #
+  # The grammar is now exact and shared: a begin marker is the token, one space
+  # and a lower-case label to end of line; an end marker is the token and
+  # nothing else. Anything that merely resembles one is not a marker at all —
+  # it is an ordinary comment, which means it is SCANNED rather than trusted.
+  BEGIN_RE='^[[:space:]]*# gate-self-exempt:begin [a-z][a-z ]*$'
+  END_RE='^[[:space:]]*# gate-self-exempt:end$'
+  begins="$(grep -cE "$BEGIN_RE" "$1" || true)"
+  ends="$(grep -cE "$END_RE" "$1" || true)"
   # ⚠ BALANCED, AND CHECKED — because an unterminated block fails SILENTLY and
   # generously. `skip` never resets, every line after the opener is blanked,
   # and the scan reports a file it did not read as clean. Both blocks were
@@ -198,7 +220,7 @@ self_scan_body() {
   # empirically it does not here, but a refusal that depends on that reading is
   # a refusal resting on a subtlety. The explicit check is meant to be the
   # thing that reports; this makes sure it is the thing that runs.
-  labels="$(grep -oE '^[[:space:]]*# gate-self-exempt:begin .*' "$1" \
+  labels="$(grep -oE "$BEGIN_RE" "$1" \
     | sed -E 's/.*:begin //' | sort | tr '\n' ',' || true)"
   if [ "$labels" != "definitions,fixtures,scan fixture," ]; then
     echo "REFUSING: $1 has exempt regions [$labels], expected exactly" >&2
@@ -214,13 +236,34 @@ self_scan_body() {
     echo "  each must start its own line." >&2
     exit 2
   fi
-  if ! awk '
-    /^[[:space:]]*# gate-self-exempt:begin/ {
+  # ⚠ NO PROSE INSIDE AN EXEMPT REGION. Shrinking the regions to data reduced
+  # this surface; it did not close it, because a comment inserted among the
+  # assignments is still blanked and therefore still unreadable. A region
+  # exists to hold text that matches BY CONSTRUCTION — assignments and fixture
+  # corpora — and a sentence is never that. Refusing comments outright makes
+  # "hide prose in the exemption" impossible rather than merely unlikely, and
+  # it costs one pass.
+  if awk -v b="$BEGIN_RE" -v e="$END_RE" '
+    $0 ~ b { inside = 1; next }
+    $0 ~ e { inside = 0; next }
+    inside && $0 ~ /^[[:space:]]*#/ { print NR ": " $0; found = 1 }
+    END { exit !found }
+  ' "$1"; then
+    echo "REFUSING: $1 has comment lines inside a gate-self-exempt region (above)." >&2
+    echo "  Those lines are blanked before scanning, so they are prose the gate" >&2
+    echo "  cannot read. A region holds text that matches by construction; move" >&2
+    echo "  the explanation outside the markers, where it is scanned like any" >&2
+    echo "  other line." >&2
+    exit 2
+  fi
+
+  if ! awk -v b="$BEGIN_RE" -v e="$END_RE" '
+    $0 ~ b {
       depth++
       if (depth > 1) { print "nested exempt region at line " NR > "/dev/stderr"; exit 3 }
     }
     { if (!depth) print; else print "" }
-    /^[[:space:]]*# gate-self-exempt:end/ {
+    $0 ~ e {
       depth--
       if (depth < 0) { print "unopened end marker at line " NR > "/dev/stderr"; exit 3 }
     }
