@@ -415,7 +415,13 @@ CHARACTER_REFERENCE="$CHARACTER_REFERENCE"'|dash|ndash|mdash|minus|num|sol'
 CHARACTER_REFERENCE="$CHARACTER_REFERENCE"'|period|lowbar|commat|colon|semi'
 CHARACTER_REFERENCE="$CHARACTER_REFERENCE"'|comma|excl|quest|lpar|rpar|lsqb'
 CHARACTER_REFERENCE="$CHARACTER_REFERENCE"'|rsqb|lcub|rcub|verbar|plus|ast'
-CHARACTER_REFERENCE="$CHARACTER_REFERENCE"'|lowast|midast|equals);'
+CHARACTER_REFERENCE="$CHARACTER_REFERENCE"'|lowast|midast|equals'
+# ⚠ AND THE HTML5 ALIASES FOR THE SAME CHARACTERS. `&UnderBar;` renders `_`
+# exactly as `&lowbar;` does, and a flag-shaped identifier assembled from them
+# reaches the page while the bytes show only entity text. An alias omitted is
+# the same hole as a character omitted.
+CHARACTER_REFERENCE="$CHARACTER_REFERENCE"'|UnderBar|VerticalLine|vert|Hat'
+CHARACTER_REFERENCE="$CHARACTER_REFERENCE"'|NewLine|Tab|bsol|commat|excl);'
 
 roster_regex() {
   printf '%s' "$ROSTER" | sed -e 's![-_ ]![-_ ]+!g' -e 's!/! */ *!g' | paste -sd'|' -
@@ -623,7 +629,10 @@ scan_tree() {
     # with no second process.
     markup_doc=no
     case "$markup_head" in
-      '<'[A-Za-z!?/]*) markup_doc=yes ;;
+      # An XML name may begin with a letter, an underscore or a colon; a
+      # document may also open with a declaration, a processing instruction or
+      # a closing tag. `<_root>` is valid XML and was reading as prose.
+      '<'[A-Za-z_:!?/]*) markup_doc=yes ;;
     esac
     if [ "$printable_sigs" = yes ] && [ "$markup_doc" = yes ]; then
       # refusal:hazard
@@ -836,8 +845,22 @@ scan_tree() {
     # trees today — measured — so refusing them would reject prose doing
     # nothing wrong. The substitution is per-line, so reported line numbers
     # stay true to the file.
+    #
+    # ⚠ MARKDOWN AND HTML ARE NORMALISED DIFFERENTLY. A browser renders `*` and
+    # a backtick as themselves, so stripping them from HTML turns `ADR-*1234`
+    # into an identifier the page never shows — a false lane-A failure I
+    # introduced by widening one arm instead of adding a second.
     case "$flc" in
-      *.md|*.markdown|*.html|*.htm)
+      *.html|*.htm)
+        if sed -e 's|</\{0,1\}[A-Za-z][A-Za-z0-9-]*\( [^>]*\)\{0,1\}/\{0,1\}>||g' \
+               "$blob" > "$md_blob"; then
+          cat "$md_blob" > "$blob"
+        else
+          echo "REFUSING: could not normalise markup in '$f'." >&2
+          exit 2
+        fi
+        ;;
+      *.md|*.markdown)
         # ⚠ EMPHASIS SPLITS A TOKEN ON THE PAGE AND NOT IN THE BYTES: an
         # identifier written with its digits bolded renders contiguously and
         # matches nothing. Asterisks and backticks are removed with the
