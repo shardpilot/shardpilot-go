@@ -21,6 +21,16 @@
 # assignments to an expected set of names, and no comments below this header.
 # It is small and it is entirely fixtures, so it is reviewable as what it is.
 # The gate refuses if that stops being true.
+#
+# Every name below is consumed by the script that sources this file. The linter
+# cannot see that consumer from here, hence the blanket SC2034 below. It is a
+# file-level directive because the gate refuses comments BELOW this header, and
+# a per-line one would be exactly that.
+#
+# (Note the wrapping above: a comment line BEGINNING with the linter's name is
+# parsed as a directive, so this paragraph keeps it mid-sentence. That cost a
+# round.)
+# shellcheck disable=SC2034
 RESERVED_ADR_IDS='ADR-0000 ADR-0999'
 ROSTER='analytics-service
 control-plane'
