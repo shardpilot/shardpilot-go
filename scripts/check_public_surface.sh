@@ -186,22 +186,12 @@ FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY
 FIXTURE_DIRTY_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY
 FIXTURE_NAMEHIT_NAME KNOWN_INNOCENT KNOWN_INTERNAL PATTERNS ROSTER'
 
-corpus_defined="$(env -i PATH="$PATH" bash -c '
-  before=$(compgen -v | sort)
-  . "$1" >/dev/null 2>&1
-  after=$(compgen -v | sort)
-  comm -13 <(printf "%s\n" "$before") <(printf "%s\n" "$after")
-' _ "$CORPUS" 2>/dev/null | { grep -vxE 'before|after|PATH|PIPESTATUS|_' || true; } | sort | tr '\n' ' ')"
+# ⚠ THE GRAMMAR RUNS FIRST, BEFORE ANYTHING SOURCES THIS FILE. A subshell
+# contains variables, not the filesystem: `touch`, a redirect or an `rm` in the
+# corpus takes effect and only then gets refused, so the checks below were
+# reading a tree the file had already been allowed to change. The grammar reads
+# raw text and executes nothing, so it is the only check that can go first.
 corpus_expected="$(printf '%s\n' $CORPUS_EXPECTED_NAMES | sort | tr '\n' ' ')"
-if [ "$corpus_defined" != "$corpus_expected" ]; then
-  echo "REFUSING: $CORPUS defines a different set of names than expected." >&2
-  echo "  defined:  $corpus_defined" >&2
-  echo "  expected: $corpus_expected" >&2
-  echo "  The gate skips this file, so an unexpected assignment is unread text in" >&2
-  echo "  a published repository. Adding one means naming it in the gate. An EMPTY" >&2
-  echo "  list here also means the file stopped the subshell early." >&2
-  exit 2
-fi
 
 # The corpus is validated by GRAMMAR, not by a list of forbidden shapes. Each
 # predicate caught the variant it was written for and left the next one: a
@@ -271,6 +261,23 @@ if [ -n "$corpus_grammar" ]; then
   exit 2
 fi
 
+
+corpus_defined="$(env -i PATH="$PATH" bash -c '
+  before=$(compgen -v | sort)
+  . "$1" >/dev/null 2>&1
+  after=$(compgen -v | sort)
+  comm -13 <(printf "%s\n" "$before") <(printf "%s\n" "$after")
+' _ "$CORPUS" 2>/dev/null | { grep -vxE 'before|after|PATH|PIPESTATUS|_' || true; } | sort | tr '\n' ' ')"
+if [ "$corpus_defined" != "$corpus_expected" ]; then
+  echo "REFUSING: $CORPUS defines a different set of names than expected." >&2
+  echo "  defined:  $corpus_defined" >&2
+  echo "  expected: $corpus_expected" >&2
+  echo "  The gate skips this file, so an unexpected assignment is unread text in" >&2
+  echo "  a published repository. Adding one means naming it in the gate. An EMPTY" >&2
+  echo "  list here also means the file stopped the subshell early." >&2
+  exit 2
+fi
+
 corpus_ran="$(env -i PATH="$PATH" bash -c 'PS4=@; set -x; . "$1"' \
   _ "$CORPUS" 2>&1 >/dev/null | { grep '^@@' || true; })"
 if [ -z "$corpus_ran" ]; then
@@ -301,14 +308,23 @@ if [ -z "$corpus_dump" ]; then
 fi
 eval "$corpus_dump"
 
-# Reference identifiers, held HERE rather than in the corpus. A list that
-# lives inside the file it excuses can be extended by the same commit that
-# publishes a live id, which is an assertion derived from its own subject. The
-# quotes interrupt each prefix so this gate does not report itself — a class
-# wants an unbroken prefix and digits, and finds a quote instead. (Writing the
-# unbroken form in this very comment made the gate fail on itself, correctly.)
-RESERVED_ADR_IDS="ADR-""0000 ADR-""0999"
-RESERVED_TICKET_IDS="GAP-""000 SP-""123 AC-""QA-7"
+# Identifiers are admitted by SHAPE. A list of admissible ones was the first
+# answer and it cannot fail: the same change that publishes a live record can
+# add it to the list excusing it, wherever that list is kept. A shape cannot be
+# edited into admitting a live record. Nothing in this organisation is numbered
+# all zeros, all nines or all f's, so that is the whole rule, and no reference
+# value needs to be written down here.
+is_sentinel_run() {
+  [ -n "$1" ] || return 1
+  case "$1" in *[!0]*) ;; *) return 0 ;; esac
+  case "$1" in *[!9]*) ;; *) return 0 ;; esac
+  case "$1" in *[!f]*) ;; *) return 0 ;; esac
+  return 1
+}
+
+AUDIT_CLASSES='ADR-[0-9]+|GAP-[0-9]{3}|SP-[0-9]{3}|AC-[A-Z]{2}-[0-9]+'
+AUDIT_CLASSES="$AUDIT_CLASSES"'|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)'
+AUDIT_CLASSES="$AUDIT_CLASSES"'|(main|master|HEAD) @ *[0-9a-f]{7,40}'
 
 roster_regex() {
   printf '%s' "$ROSTER" | sed -e 's![-_ ]![-_ ]+!g' -e 's!/! */ *!g' | paste -sd'|' -
@@ -459,16 +475,24 @@ scan_tree() {
     # every magic test above. Rather than widen the magic list one preamble at
     # a time, refuse on the ZIP local-file signature ANYWHERE in the file.
     #
+    # ⚠ AND NOT ONLY ZIP. This searched for the ZIP signature alone, so a gzip
+    # stream appended after `#!/bin/sh` passed both tests: the preamble hid it
+    # from the magic check and it is not ZIP. Every signature the magic check
+    # recognises is searched for anywhere in the file now.
+    #
     # Still a refusal, not a parse — the point is that a human looks at it. The
-    # false-positive risk is a tracked file that happens to contain those four
-    # bytes, which is a thing worth looking at in a text-only tree anyway.
-    if grep -qa -- "$(printf 'PK\003\004')" "$root/$f" 2>/dev/null; then
-      echo "REFUSING: '$f' contains a ZIP local-file signature." >&2
+    # false-positive risk is a tracked file that happens to contain one of these
+    # sequences. Three of them cannot occur in valid UTF-8 text at all; the
+    # bzip2 one is four printable characters, which is why every signature here
+    # is written in octal — spelled out, this gate refused itself, correctly.
+    for sig in 'PK\003\004' '\037\213\010' '\375\067zXZ' '\050\265\057\375' '\102\132\150\071'; do
+      grep -qaF -- "$(printf "$sig")" "$root/$f" 2>/dev/null || continue
+      echo "REFUSING: '$f' contains a compressed-container signature." >&2
       echo "  Something in this file is a container, whatever its first bytes say," >&2
       echo "  and no pass here reads container contents. Remove it, or extend this" >&2
       echo "  gate to walk containers deliberately." >&2
       exit 2
-    fi
+    done
     # -a treats a NUL-bearing file as text: GNU grep >= 3.5 otherwise prints
     # "binary file matches" to STDERR and nothing to stdout, so a hit inside a
     # committed binary reads as a clean file.
@@ -610,6 +634,10 @@ $ROSTER
 EOF
 
   # ⚠ THESE TWO PASSES NOW COVER THE EXEMPT REGIONS, and only those. The main
+  # ⚠ THE EXTRACTOR TAKES THE WHOLE TOKEN. It read `[a-z][a-z-]*`, so a name
+  # carrying a digit was truncated at the digit and the SHORTER prefix — which
+  # exists everywhere in this tree — was what got checked. A repository name
+  # ending in a digit passed while the literal stayed published.
   # scan reads this file's prose like any other file's. What no pass reads is
   # the corpus, excluded by path — so these checks read IT as well as this
   # file. Both of this gate's own past disclosures were of exactly this kind:
@@ -624,25 +652,29 @@ EOF
       novel=$((novel + 1))
     fi
   done <<EOF
-$(grep -hoE 'shardpilot/[a-z][a-z-]*' "$SELF" "$CORPUS" | sort -u)
+$(grep -hoE 'shardpilot/[A-Za-z0-9][A-Za-z0-9._-]*' "$SELF" "$CORPUS" | sort -u)
 EOF
 
-  # Identifiers: only the reserved synthetic ones are admissible, in EVERY
-  # class. Checking decision records alone left the ticket classes free, and a
-  # fixture is exactly where a live ticket id gets pasted — someone extending
-  # the known-internal corpus reaches for the ticket they happen to be looking
-  # at. The corpus is read here because nothing else reads it.
+  # Identifiers, in every class the patterns name, admitted by shape alone. A
+  # fixture is exactly where a live id gets pasted — someone extending the
+  # known-internal corpus reaches for whatever they were looking at.
+  #
+  # ⚠ READ OVER THE VALUES AS WELL AS THE RAW TEXT. A literal split across
+  # adjacent quotes is invisible to a grep of the file and perfectly legible to
+  # everyone reading the published fixture, so the loaded values are searched
+  # too and the two results are merged.
+  corpus_values="$(for v in $CORPUS_EXPECTED_NAMES; do
+    eval "printf '%s\n' \"\${$v:-}\""
+  done)"
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
-    reserved=no
-    for ok in $RESERVED_ADR_IDS $RESERVED_TICKET_IDS; do
-      [ "$lit" = "$ok" ] && reserved=yes
-    done
-    [ "$reserved" = yes ] && continue
-    printf 'PROSE VIOLATION: %s is a real identifier written in a file nothing scans.\n' "$lit" >&2
+    case "$lit" in EXAMPLE_*) continue ;; esac
+    is_sentinel_run "${lit##*[!0-9a-f]}" && continue
+    printf 'PROSE VIOLATION: %s is a live identifier written where nothing scans.\n' "$lit" >&2
     novel=$((novel + 1))
   done <<EOF
-$(grep -hoE 'ADR-[0-9]+|GAP-[0-9]{3}|SP-[0-9]{3}|AC-[A-Z]{2}-[0-9]+' "$SELF" "$CORPUS" | sort -u)
+$( { grep -hoE -- "$AUDIT_CLASSES" "$SELF" "$CORPUS"
+     printf '%s\n' "$corpus_values" | grep -oE -- "$AUDIT_CLASSES"; } | sort -u )
 EOF
 
   rm -f "$found"
