@@ -669,6 +669,20 @@ scan_tree() {
       echo "  character itself, or extend this gate to decode deliberately." >&2
       exit 2
     fi
+    # ⚠ AND AN ENCODING THE PATTERNS CANNOT MATCH IS AN UNREAD FILE. A document
+    # in EBCDIC or another non-ASCII-compatible encoding carries no NUL and no
+    # container signature, so every pass above admits it and every pattern
+    # below misses it — a clean line about a file nothing here could read.
+    # Refused rather than transcoded, on the same footing: both trees are UTF-8
+    # today, accents included, so a transcoder would be untested code guarding
+    # nothing.
+    if ! iconv -f UTF-8 -t UTF-8 < "$blob" >/dev/null 2>&1; then
+      echo "REFUSING: '$f' is not valid UTF-8." >&2
+      echo "  The classes below are ASCII-oriented, so an encoding they cannot" >&2
+      echo "  read would report clean whatever it says. Store it as UTF-8, or" >&2
+      echo "  extend this gate to transcode deliberately." >&2
+      exit 2
+    fi
     # -a remains for a file with high-bit bytes and no NUL, which GNU grep also
     # calls binary. It is defence behind the refusal above, not the front line.
     # -a treats a NUL-bearing file as text: GNU grep >= 3.5 otherwise prints
@@ -843,10 +857,12 @@ EOF
   # spelling of the same trick got past the previous version: parentheses with
   # nothing to branch between are grouping and come off, and a one-character
   # class is one character, and a backslash before an ordinary character is
-  # no-op syntax that grep discards — `private\-daemon` is the same name and
-  # was approved for carrying a backslash. Each reduction was written after a
-  # costume got through, which is why the rule below does not rely on this
-  # one alone.
+  # no-op syntax that grep discards, and an exact-count quantifier of one
+  # quantifies nothing — each was approved as proof of shape while grep
+  # reconstructed the plain name. Each reduction was written after a costume
+  # got through, which is why the rule below does not rely on this one alone,
+  # and why a single-word name is the case to watch: the hyphenated-run rule
+  # cannot see one, so only this test stands between it and the tree.
   #
   # Names belong in the roster, which is checked against the tree.
   while IFS= read -r lit; do
@@ -859,6 +875,7 @@ $(printf '%s' "$PATTERNS" | awk '
     if (a == "") return
     r = a
     gsub(/\\([^bBwWsSdD<>])/, "\\1", r)
+    gsub(/\{1\}|\{1,1\}/, "", r)
     if (index(r, "|") == 0) gsub(/[()]/, "", r)
     gsub(/\[.\]/, "c", r)
     if (r ~ /[][{}+*?\\|]/) return
