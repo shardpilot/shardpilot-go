@@ -109,7 +109,12 @@
 # ⚠ AND WHAT IS DELIBERATELY ENCODED IS OUT OF SCOPE, which is why the
 # character-reference refusal, the inline-tag normalisation and the XML, RTF
 # and PostScript refusals were REMOVED rather than extended. Nobody types
-# `&#65;DR-0331` by accident. Defending against it with eight refusals while
+# `&#65;DR-0000` by accident — and the number in that example is a SENTINEL
+# because nothing else here could be: the encoding this file has just declared
+# out of scope is the encoding its own audits cannot see through, so an example
+# carrying a live id would be published by the one file that could not report
+# it. That is how two internal repository names got here the first time.
+# Defending against it with eight refusals while
 # the paragraph below declares deliberate concealment out of scope is the same
 # document-says-one-thing-machinery-does-another this whole change exists to
 # remove — only inside a single file.
@@ -224,9 +229,11 @@ cd "$(dirname "$0")/.."
 # Files the gate must not read as content: this script is the one place the
 # patterns are written down, by construction.
 
-# The by-construction material — patterns, roster, fixture corpora — lives in
-# its own file so that THIS file can be scanned end to end with no exemptions.
-# See scripts/gate-corpus.sh for why that separation exists.
+# The by-construction material — patterns, roster, fixture corpora — is INLINE
+# below. It lived in a second file, excluded by PATH, until that exclusion cost
+# more than it bought: eight refusals existed only to police the excluded
+# file's grammar and went out with it. No path is exempt from the scan now; the
+# visible break is what keeps these values from matching themselves.
 # Every temporary file this gate makes, removed on every exit path. They were
 # created in four places and removed in one, so a successful run left five
 # behind — including copies of staged repository content.
@@ -330,9 +337,9 @@ fi
 #
 # `$PATTERNS` and `$KNOWN_INNOCENT` carry no break: measured, neither matches
 # the classes, so they are written plainly.
-GATE_DATA_NAMES='ROSTER KNOWN_INTERNAL KNOWN_INNOCENT FIXTURE_ACCENT_BODY FIXTURE_ACCENT_NAME FIXTURE_BINARY_BODY FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY FIXTURE_DIRTY_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY FIXTURE_NAMEHIT_NAME'
+GATE_DATA_NAMES='ROSTER KNOWN_INTERNAL KNOWN_INNOCENT FIXTURE_ACCENT_BODY FIXTURE_ACCENT_NAME FIXTURE_BINARY_BODY FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY FIXTURE_DIRTY_NAME FIXTURE_EMPHASIS_BODY FIXTURE_EMPHASIS_NAME FIXTURE_ESCAPE_BODY FIXTURE_ESCAPE_NAME FIXTURE_FLAG_BODY FIXTURE_FLAG_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY FIXTURE_NAMEHIT_NAME'
 
-PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not| never) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( [a-z]+)?( (for|of|in)|[.,;]|$)|[Tt]here (is|are)(n.{1,3}t| not) (any |no )?(harness|harnesses|coverage|tests?|suites?)|[Tt]here (is|are) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?)|[Nn]obody (looks|checks|monitors)|[Ll]acks( any| automated| an?)* ?[A-Za-z-]*[ ]?(harness|harnesses|coverage|tests?|suites?|monitoring)|(has|have|had)(n.{1,3}t| not| never) been (tested|covered|scanned|audited|monitored)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
+PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not| never) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (exists?|existed|remains?|remained|runs?|ran|covers?|covered|exercises?|exercised|guards?|guarded))?( (for|of|in)|[.,;]|$)|[Tt]here (is|are)(n.{1,3}t| not) (any |no )?(harness|harnesses|coverage|tests?|suites?)|[Tt]here (is|are) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?)|(has|have|had) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Nn]obody (looks|checks|monitors)|[Ll]acks( any| automated| an?)* ?[A-Za-z-]*[ ]?(harness|harnesses|coverage|tests?|suites?|monitoring)|(has|have|had)(n.{1,3}t| not| never) been (tested|covered|scanned|audited|monitored)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 ROSTER='analytic[]s-service
 contro[]l-plane'
 KNOWN_INTERNAL='per ADR-[]0000 §[]000
@@ -360,6 +367,7 @@ The console doesn’t have a[]utomated tests.
 The console has never b[]een audited.
 The crash path was neve[]r tested.
 There are []zero tests for the payment parser.
+The payment parser has zero t[]ests.
 There aren'"'"'[][]t any tests for the payment parser.'
 KNOWN_INNOCENT='go get github.com/shardpilot/shardpilot-go@v0.6.0-alpha
 IngestURL: os.Getenv("SHARDPILOT_INGEST_URL")
@@ -369,7 +377,10 @@ a documented per-platform adaptation, not drift
 DEFOLD_SHA1="f735c12192bf95684e6ae1ae27c400b8170fc6d8"
 a self-service signup flow, a micro-service boundary
 the event plane and the consent plane are separate
-an analytics-plane request, zero event batches'
+an analytics-plane request, zero event batches
+No tests fail in CI.
+The suite has zero test failures.
+Every test suite runs on both toolchains.'
 FIXTURE_ACCENT_BODY='internal: contro[]l-plane'
 FIXTURE_ACCENT_NAME='café.md'
 FIXTURE_BINARY_BODY='see ADR-[]9999 here'
@@ -378,6 +389,12 @@ FIXTURE_CLEAN_BODY='clean customer prose'
 FIXTURE_CLEAN_NAME=clean.md
 FIXTURE_DIRTY_BODY='see ADR-[]0000 for context'
 FIXTURE_DIRTY_NAME=dirty.md
+FIXTURE_EMPHASIS_BODY='see ADR-[]_0000_ for context'
+FIXTURE_EMPHASIS_NAME=emphasis.md
+FIXTURE_ESCAPE_BODY='see ADR-\*[]0000 for context'
+FIXTURE_ESCAPE_NAME=escape.md
+FIXTURE_FLAG_BODY='EXAMPLE_SYNTH[]ETIC_FL[]AG_ENABLED is off'
+FIXTURE_FLAG_NAME=flag.md
 FIXTURE_LANEB_BODY='// GAP[]-000 note
 package x'
 FIXTURE_LANEB_NAME=lane_b.go
@@ -469,9 +486,10 @@ done
 # comment likewise; and finally an ordinary data line. Each fix produced the
 # next variant, because the shape was wrong rather than the implementation.
 #
-# The material that matches by construction now lives in scripts/gate-corpus.sh
-# and is excluded by PATH — a fact about the repository, not a marker anyone can
-# write into a file. This one is read like every other file here.
+# The material that matches by construction is INLINE in this file and carries
+# a visible break instead, so no path is excluded and no marker has to be
+# trusted. Region markers were tried first and produced a new variant every
+# round; a break is data rather than syntax, and has produced none.
 # ---------------------------------------------------------------------------
 # scan_tree <root> — runs the REAL scan over one checkout and sets the globals
 # below. Factored out so the self-test can exercise THE SCAN, not just the
@@ -519,9 +537,9 @@ scan_tree() {
   fi
 
   while IFS= read -r -d '' f; do
-    # The corpus is the one path this gate does not read: its entire content
-    # matches by construction. Excluded by path rather than by a marker, so
-    # nothing written INSIDE a file can extend the exemption.
+    # NO PATH IS EXEMPT FROM THIS LOOP, including this script. The
+    # by-construction material is inline and broken so that it cannot match
+    # itself, which is why nothing here needs an exemption to stay green.
     # THE PATH ITSELF IS PUBLISHED CONTENT. An internal identifier in a file
     # NAME — a decision-record id, a ticket, a service name in a directory —
     # reaches every consumer and appears in no file's body, so scanning only
@@ -660,28 +678,87 @@ scan_tree() {
         exit 2
         ;;
     esac
-    magic4="$(od -An -tx1 -N4 "$blob" 2>/dev/null | tr -d ' \n')"
+    magic16="$(od -An -tx1 -N16 "$blob" 2>/dev/null | tr -d ' \n')"
+    magic4="${magic16:0:8}"
     # The BINARY headers, which cannot be a string constant in readable source
     # and so apply to every file, and the PRINTABLE ones, which can and do not.
+    #
+    # ⚠ EVERY PRINTABLE SIGNATURE IS A PREFIX OF ORDINARY ENGLISH, so each one
+    # below is confirmed by a byte BEYOND the prefix. Four notes in a row were
+    # refused as pictures — one opening `! XP`, one opening `P1`, one opening
+    # `! XPM2`, one opening `BM` — because a prefix was read as a decision. A
+    # false refusal blocks a merge over prose, which is the expensive
+    # direction; a container that also lies about its extension is the cheap
+    # one, and the extension list above is what actually carries that case.
     case "$magic4" in
       89504e47|ffd8ff*|49492a00|4d4d002a) magic_hit=yes ;;
-      4d5a*|47494638|52494646|424d*|2f2a2058)
-        magic_hit="$printable_sigs" ;;
+      # ⚠ `BM` OPENS A SENTENCE ABOUT RANKING. A bitmap's two reserved 16-bit
+      # fields at offset 6 are zero in every writer's output; prose has text
+      # there.
+      424d*)
+        case "${magic16:12:8}" in
+          00000000) magic_hit="$printable_sigs" ;;
+          *)        magic_hit=no ;;
+        esac ;;
+      # The GIF version follows the signature and is 87a or 89a, nothing else.
+      47494638)
+        case "${magic16:8:4}" in
+          3761|3961) magic_hit="$printable_sigs" ;;
+          *)         magic_hit=no ;;
+        esac ;;
+      # ⚠ `RIFF` IS ALSO A WORD. A real one carries a four-character form type
+      # at offset 8 — upper-case letters or spaces; a sentence about the format
+      # has lower-case prose there.
+      52494646)
+        magic_fourcc=ok
+        for magic_i in 16 18 20 22; do
+          case "${magic16:$magic_i:2}" in
+            20|4[0-9a-f]|5[0-9a]) : ;;
+            *) magic_fourcc=no ;;
+          esac
+        done
+        case "$magic_fourcc" in
+          ok) magic_hit="$printable_sigs" ;;
+          *)  magic_hit=no ;;
+        esac ;;
+      # An executable carries a NUL inside its first 64 bytes. Prose opening
+      # `MZ` does not. Read BYTE-ALIGNED: `00` also spans two neighbouring
+      # bytes in a flat hex string, which is a match that means nothing.
+      4d5a*)
+        magic_nul="$(od -An -tx1 -N64 "$blob" 2>/dev/null | tr -s ' \n' ' ')"
+        case " $magic_nul " in
+          *" 00 "*) magic_hit="$printable_sigs" ;;
+          *)        magic_hit=no ;;
+        esac ;;
+      # ⚠ `/* X` ALSO OPENS AN ORDINARY COMMENT. The XPM C header is `/* XPM */`
+      # and all nine bytes are read.
+      2f2a2058)
+        case "${magic16:0:18}" in
+          2f2a2058504d202a2f) magic_hit="$printable_sigs" ;;
+          *)                  magic_hit=no ;;
+        esac ;;
       # ⚠ FOUR BYTES ARE NOT THE XPM2 SIGNATURE. `! XP` also opens an ordinary
       # note — `! XPrivacy` — and refusing on the prefix blocked a merge over
       # prose. The header is six bytes and six are read.
       21205850)
-        magic6="$(od -An -tx1 -N6 "$blob" 2>/dev/null | tr -d ' \n')"
-        case "$magic6" in
-          212058504d32) magic_hit="$printable_sigs" ;;
-          *)            magic_hit=no ;;
+        case "${magic16:0:12}" in
+          212058504d32)
+            # ⚠ AND THE MARKER MUST END THE LINE. `! XPM2Factor notes` shares
+            # all six bytes and is a note, not a picture. An empty seventh byte
+            # is a file that is nothing but the marker, which no prose is.
+            case "${magic16:12:2}" in
+              0a|0d) magic_hit="$printable_sigs" ;;
+              "")    magic_hit="$printable_sigs" ;;
+              *)     magic_hit=no ;;
+            esac ;;
+          *) magic_hit=no ;;
         esac ;;
       # ⚠ NETPBM NEEDS ITS DELIMITER. `P1` through `P6` are a magic number only
       # when whitespace follows; without that test an ordinary note opening
       # `P1-priority planning` was refused as a raster — a false refusal on
       # prose, which is the expensive direction for a gate that blocks merges.
       503[1-6]*)
-        case "${magic4:4:2}" in
+        case "${magic16:4:2}" in
           09|0a|0d|20) magic_hit="$printable_sigs" ;;
           *)           magic_hit=no ;;
         esac ;;
@@ -782,23 +859,35 @@ scan_tree() {
       *.md|*.markdown)
         # ⚠ EMPHASIS SPLITS A TOKEN ON THE PAGE AND NOT IN THE BYTES: an
         # identifier written with its digits bolded renders contiguously and
-        # matches nothing. Asterisks and backticks are removed with the
-        # escapes. UNDERSCORES ARE NOT — the feature-flag class is built from
-        # them, and stripping them would break the one class that needs them.
-        # ⚠ AND INLINE TAGS ANYWHERE IN THE DOCUMENT, not only a markup file.
-        # `ADR-<span>1234</span>` renders contiguously and matches nothing; the
-        # head-of-file check cannot see it because the file opens as prose.
-        # Tags are removed with the escapes and the emphasis.
+        # matches nothing. Measured against the publishing surface itself:
+        # asterisk emphasis, UNDERSCORE emphasis and a backslash escape each
+        # render one contiguous identifier.
         #
-        # ⚠ TAG-SHAPED ONLY. `<[^>]*>` also ate a Markdown autolink, whose
-        # contents are VISIBLE text — an autolink whose URL ends in a record
-        # id renders that id, and this deleted it, so the first fix made
-        # the gate blinder than before it. A tag opens with a name.
+        # ⚠ UNDERSCORES ONLY WHERE THEY FLANK. The feature-flag class is built
+        # from underscores and deleting them all would destroy the one class
+        # that needs them — but the surface does not emphasise an underscore
+        # between two word characters either, so the two rules coincide: a run
+        # is removed only where a non-word character sits outside it. Measured:
+        # a flag name renders with every separator intact.
+        #
+        # ⚠ EMPHASIS IS STRIPPED BEFORE THE ESCAPE IS DECODED, not after. The
+        # other order turned `ADR-\*1234` — which renders WITH the asterisk and
+        # is therefore clean prose — into a refusal, by decoding the escape and
+        # then deleting the character the escape existed to keep.
         #
         # Written in BASIC regex on purpose: `-E` applies to every script in
-        # the same sed, and the two substitutions above are BRE. Reaching for
-        # it broke both of them and the gate refused the whole file.
-        if sed -e 's/\\\([^A-Za-z0-9]\)/\1/g' -e 's/[*`]//g' "$blob" > "$md_blob"; then
+        # the same sed, and these substitutions are BRE. Reaching for it broke
+        # them and the gate refused the whole file.
+        #
+        # The underscore substitution runs TWICE: `g` resumes after the
+        # boundary character it consumed, so two emphasised runs separated by a
+        # single space leave the second one standing on the first pass.
+        if sed -e 's/[*`]//g' \
+               -e 's/^/ /' -e 's/$/ /' \
+               -e 's/\([^A-Za-z0-9_]\)_\{1,2\}\([^_ ][^_]*\)_\{1,2\}\([^A-Za-z0-9_]\)/\1\2\3/g' \
+               -e 's/\([^A-Za-z0-9_]\)_\{1,2\}\([^_ ][^_]*\)_\{1,2\}\([^A-Za-z0-9_]\)/\1\2\3/g' \
+               -e 's/^ //' -e 's/ $//' \
+               -e 's/\\\([^A-Za-z0-9]\)/\1/g' "$blob" > "$md_blob"; then
           cat "$md_blob" > "$blob"
         else
           # refusal:structural
@@ -960,10 +1049,9 @@ EOF
   # ending in a digit passed while the literal stayed published.
   # ⚠ THE PATTERN LIST HOLDS SHAPES, AND THAT IS NOW EXECUTED RATHER THAN
   # ASSERTED. A bare alternative — a name with no metacharacter in it — is a
-  # roster entry hiding in the one variable no rule covered: the corpus is
-  # excluded by path, the grammar sees a well-formed assignment, and the
-  # identifier and repository audits look for their own classes, not for
-  # arbitrary words. Adding a literal internal name as an alternative made this
+  # roster entry hiding in the one variable no rule covered: the grammar sees a
+  # well-formed assignment, and the identifier and repository audits look for
+  # their own classes, not for arbitrary words. Adding a literal internal name as an alternative made this
   # file its sole publisher and everything stayed green.
   #
   # Top-level alternatives are split on `|` outside brackets and groups, and
@@ -1073,15 +1161,21 @@ $(printf '%s' "$PATTERNS" | sed -e 's/\[[^]]*\]//g' -e 's/\\\([^bBwWsSdD<>]\)/\1
   | grep -oE '[A-Za-z][A-Za-z0-9]*(-[A-Za-z0-9]+)+' | sort -u)
 EOF
 
-  # scan reads this file's prose like any other file's. What no pass reads is
-  # the corpus, excluded by path — so these checks read IT as well as this
-  # file. Both of this gate's own past disclosures were of exactly this kind:
+  # scan reads this file's prose like any other file's, and the loaded VALUES
+  # are read beside it, so a literal that only exists after the break is
+  # removed is covered too. Both of this gate's own past disclosures were of
+  # exactly this kind:
   # two internal repository names in the roster, and a live decision-record id
   # among the fixtures. A header comment naming a repository that exists
   # nowhere else in the tree was demonstrated to pass everything else.
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
-    git grep --cached -l -F -- "$lit" -- . $GATE_EXCLUDES > "$found" 2>/dev/null || :
+    # ⚠ CASE-INSENSITIVELY, BECAUSE THE EXTRACTION ABOVE IS. A repository
+    # spelled with capitals here and in the ordinary lower case everywhere else
+    # would be found nowhere by a case-sensitive lookup, and a clean tree would
+    # be refused as a novel disclosure. Repository names are case-insensitive
+    # on the host, so the two halves must agree.
+    git grep --cached -l -iF -- "$lit" -- . $GATE_EXCLUDES > "$found" 2>/dev/null || :
     if [ ! -s "$found" ]; then
       printf 'PROSE VIOLATION: %s is written in this file and appears nowhere else in this tree.\n' "$lit" >&2
       novel=$((novel + 1))
@@ -1190,12 +1284,22 @@ EOF
   #   the accented file C-quoted by git ls-files, so it proves -z is honoured
   #   the binary file   carries a NUL, and is scanned in a tree of its own
   #                     because it must REFUSE rather than report
+  #   the emphasis file an identifier split by an underscore pair, which the
+  #                     publishing surface renders contiguously
+  #   the escape file   an identifier followed by an ESCAPED asterisk, which
+  #                     the surface renders WITH the asterisk — clean prose,
+  #                     and the fixture that fails if normalisation invents an
+  #                     identifier the page never shows
+  #   the flag file     a flag name, whose underscores must survive the
+  #                     emphasis pass or the one class built from them stops
+  #                     being scannable
   #
   # The filenames are described rather than written: this prose is scanned like
   # any other, and naming the fixtures here would put their identifiers into a
   # part of the file the gate reads.
-  # Every name and body comes from the corpus file. This block used to carry
-  # them inline and needed its own exemption; with the literals gone it is
+  # Every name and body comes from the data block above, where the visible
+  # break keeps them from matching themselves. This block used to carry the
+  # literals directly and needed its own exemption; with them gone it is
   # ordinary code and is scanned like the rest of this file.
   # ⚠ THESE NAMES BECOME REDIRECTION TARGETS. A fixture name carrying a slash
   # — or an absolute path — writes outside the temporary repository, into the
@@ -1234,15 +1338,33 @@ EOF
     printf '%s\n' "$FIXTURE_DIRTY_BODY"   > "$FIXTURE_DIRTY_NAME"
     printf '%s\n' "$FIXTURE_LANEB_BODY"   > "$FIXTURE_LANEB_NAME"
     printf '%s\n' "$FIXTURE_ACCENT_BODY"  > "$FIXTURE_ACCENT_NAME"
+    printf '%s\n' "$FIXTURE_EMPHASIS_BODY" > "$FIXTURE_EMPHASIS_NAME"
+    printf '%s\n' "$FIXTURE_ESCAPE_BODY"   > "$FIXTURE_ESCAPE_NAME"
+    printf '%s\n' "$FIXTURE_FLAG_BODY"     > "$FIXTURE_FLAG_NAME"
     git add -A >/dev/null 2>&1
   )
   scan_tree "$tmp"
   scanned_a="$scan_lane_a"
   rm -rf "$tmp"; trap - RETURN
 
-  local fixture_fail=0
+  local fixture_fail=0 fixture_checks=0
+  fixture_checks=$((fixture_checks + 1))
   printf '%s' "$scanned_a" | grep -q '^dirty\.md:' || {
     echo "SELFTEST: the scan missed dirty.md" >&2; fixture_fail=1; }
+  # ⚠ THE THREE NORMALISATION FIXTURES, IN BOTH DIRECTIONS. A pass that only
+  # asserts what must be FOUND cannot see a normalisation that invents an
+  # identifier out of clean prose, and that is the failure this gate pays for
+  # in blocked merges.
+  fixture_checks=$((fixture_checks + 1))
+  printf '%s' "$scanned_a" | grep -q '^emphasis\.md:' || {
+    echo "SELFTEST: the scan missed an identifier split by underscore emphasis" >&2; fixture_fail=1; }
+  fixture_checks=$((fixture_checks + 1))
+  printf '%s' "$scanned_a" | grep -q '^flag\.md:' || {
+    echo "SELFTEST: the emphasis pass destroyed a flag name's separators" >&2; fixture_fail=1; }
+  fixture_checks=$((fixture_checks + 1))
+  printf '%s' "$scanned_a" | grep -q '^escape\.md:' && {
+    echo "SELFTEST: the scan flagged an escaped asterisk the page renders as itself" >&2; fixture_fail=1; }
+  fixture_checks=$((fixture_checks + 1))
   printf '%s' "$scanned_a" | grep -q 'caf' || {
     echo "SELFTEST: the scan missed the non-ASCII path (core.quotePath)" >&2; fixture_fail=1; }
   # The NUL fixture gets its own tree: a refusal ends the run it happens in,
@@ -1265,21 +1387,32 @@ EOF
   # files the parent still needs.
   ( GATE_TMPFILES=(); trap 'rm -f "${GATE_TMPFILES[@]}"' EXIT
     scan_tree "$nul_tmp" ) >/dev/null 2>&1 || nul_status=$?
+  fixture_checks=$((fixture_checks + 1))
   [ "$nul_status" -eq 2 ] || {
     echo "SELFTEST: a NUL-bearing tracked file was not refused" >&2; fixture_fail=1; }
   rm -rf "$nul_tmp"
+  fixture_checks=$((fixture_checks + 1))
   printf '%s' "$scanned_a" | grep -qF -- "$FIXTURE_NAMEHIT_NAME:path:" || {
     echo "SELFTEST: the scan missed an internal identifier in a PATH NAME" >&2; fixture_fail=1; }
+  fixture_checks=$((fixture_checks + 1))
   printf '%s' "$scanned_a" | grep -q '^clean\.md:' && {
     echo "SELFTEST: the scan flagged clean.md" >&2; fixture_fail=1; }
+  fixture_checks=$((fixture_checks + 1))
   [ "$scan_lane_b_files" -eq 1 ] || {
     echo "SELFTEST: lane B counted $scan_lane_b_files files, expected 1" >&2; fixture_fail=1; }
+  # ⚠ A COUNT THAT MUST BE REACHED. Every assertion above is invisible when it
+  # is deleted, and a run that asserts nothing prints the same closing line as
+  # a run that asserted everything. The floor moves up when assertions are
+  # added and refuses when they go.
+  [ "$fixture_checks" -ge 9 ] || {
+    echo "SELFTEST: only $fixture_checks scan assertion(s) ran, expected at least 9" >&2
+    fixture_fail=1; }
   if [ "$fixture_fail" -ne 0 ]; then
     # refusal:structural
     echo "REFUSING: the scan failed its own fixture." >&2
     exit 2
   fi
-  echo "self-test: OK — $tested known-internal string(s) matched, $innocent innocent string(s) passed, scan fixture 6/6"
+  echo "self-test: OK — $tested known-internal string(s) matched, $innocent innocent string(s) passed, $fixture_checks scan assertion(s)"
 }
 
 roster_is_present_in_the_tree
