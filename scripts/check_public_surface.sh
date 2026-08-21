@@ -168,6 +168,22 @@ cd "$(dirname "$0")/.."
 # The by-construction material — patterns, roster, fixture corpora — lives in
 # its own file so that THIS file can be scanned end to end with no exemptions.
 # See scripts/gate-corpus.sh for why that separation exists.
+# Every temporary file this gate makes, removed on every exit path. They were
+# created in four places and removed in one, so a successful run left five
+# behind — including copies of staged repository content.
+GATE_TMPFILES=""
+# ⚠ IT SETS A VARIABLE RATHER THAN PRINTING ONE. Called as `$(gate_tmp)` the
+# function would run in a subshell, so every path it recorded would be
+# discarded with that subshell and this trap would remove an empty list — a
+# cleanup that reads as working and frees nothing. It was written that way
+# first, and the file count is what showed it.
+gate_tmp() {
+  GATE_TMP="$(mktemp)" || return 1
+  GATE_TMPFILES="$GATE_TMPFILES $GATE_TMP"
+}
+# shellcheck disable=SC2064
+trap 'rm -f $GATE_TMPFILES' EXIT
+
 CORPUS_PATH="$(dirname "$SELF")/gate-corpus.sh"
 if [ ! -f "$CORPUS_PATH" ]; then
   echo "REFUSING: $CORPUS_PATH is missing." >&2
@@ -185,8 +201,16 @@ fi
 # add` it before this gate reflects the change. That is the same discipline as
 # running CI after committing rather than before, and it is what makes a green
 # run a statement about the commit rather than about the desk it was run on.
-CORPUS="$(mktemp)"
+gate_tmp; CORPUS="$GATE_TMP"
 CORPUS_REL="scripts/$(basename "$CORPUS_PATH")"
+SELF_REL="scripts/$(basename "$SELF")"
+gate_tmp; SELF_BLOB="$GATE_TMP"
+if ! (cd "$(dirname "$SELF")/.." && git cat-file blob ":$SELF_REL") > "$SELF_BLOB" 2>/dev/null; then
+  echo "REFUSING: the staged blob for $SELF_REL could not be read." >&2
+  echo "  The audits below read this script for literals it alone would" >&2
+  echo "  publish, and a commit carries the staged copy, not this one." >&2
+  exit 2
+fi
 if ! (cd "$(dirname "$CORPUS_PATH")/.." && git cat-file blob ":$CORPUS_REL") > "$CORPUS" 2>/dev/null; then
   echo "REFUSING: the staged blob for $CORPUS_REL could not be read." >&2
   echo "  A commit would carry that blob, so it is the one worth validating;" >&2
@@ -483,8 +507,8 @@ scan_tree() {
   # way through enumeration — hands over a short list that the zero-files
   # refusal below cannot see. Measured: a producer emitting one path then
   # exiting 1 yields one scanned file and a green run.
-  list="$(mktemp)"
-  blob="$(mktemp)"
+  gate_tmp; list="$GATE_TMP"
+  gate_tmp; blob="$GATE_TMP"
   if ! (cd "$root" && git ls-files -z) > "$list"; then
     rm -f "$list"
     echo "REFUSING: git ls-files failed in '$root'." >&2
@@ -559,7 +583,8 @@ scan_tree() {
     # by magic rather than by extension, because the extension is the part an
     # author controls.
     #
-    # ⚠ AND AN ASCII RASTER CARRIES NO NUL AT ALL. Netpbm's P1 through P6 hold
+    # ⚠ AND AN ASCII RASTER CARRIES NO NUL AT ALL. XPM is printable C source
+    # from its `/* X` header to its pixel array; Netpbm's P1 through P6 hold
     # their pixels as decimal text, so neither the NUL refusal nor a
     # compression signature sees them while the picture renders whatever it
     # renders. Two printable magic bytes, on the same footing as `MZ`.
@@ -574,7 +599,7 @@ scan_tree() {
     # explicit exception, not discovering the hole afterwards.
     case "$(od -An -tx1 -N4 "$blob" 2>/dev/null | tr -d ' \n')" in
       4d5a*|89504e47|ffd8ff*|47494638|52494646|424d*|49492a00|4d4d002a|\
-      5031*|5032*|5033*|5034*|5035*|5036*)
+      5031*|5032*|5033*|5034*|5035*|5036*|2f2a2058)
         echo "REFUSING: '$f' begins with container magic (archive, PDF, executable" >&2
         echo "  or raster image)," >&2
         echo "  and this gate reads files as text. No pass here opens a container, so" >&2
@@ -625,6 +650,23 @@ scan_tree() {
       echo "  UTF-16 and UTF-32 hold ASCII interleaved with NULs and match no" >&2
       echo "  pattern here, so a clean result would say nothing about them." >&2
       echo "  Store it as UTF-8, or extend this gate to decode deliberately." >&2
+      exit 2
+    fi
+    # ⚠ A CHARACTER REFERENCE RENDERS AS SOMETHING THIS NEVER SEES. A ticket id
+    # whose hyphen is written as a numeric reference is not that token in bytes
+    # and is exactly that token on the page, so a
+    # byte-oriented pass reports clean over a document that discloses. Refused
+    # rather than decoded, and on the same footing as the containers: measured
+    # today, both trees contain ZERO character references of any kind, numeric
+    # or named, so a decoder would be untested code guarding nothing. The day a
+    # document needs one — an ampersand entity in prose about HTML, say — this
+    # becomes a decision rather than a discovery. Note this comment cannot
+    # give an example: writing one made the gate refuse itself, correctly.
+    if grep -qaE '&#[0-9]+;|&#[xX][0-9A-Fa-f]+;|&[A-Za-z][A-Za-z0-9]{1,31};' "$blob" 2>/dev/null; then
+      echo "REFUSING: '$f' contains a character reference." >&2
+      echo "  It renders as a character this gate never reads, so a clean result" >&2
+      echo "  would be about the bytes rather than about the page. Write the" >&2
+      echo "  character itself, or extend this gate to decode deliberately." >&2
       exit 2
     fi
     # -a remains for a file with high-bit bytes and no NUL, which GNU grep also
@@ -749,6 +791,12 @@ scan_tree() {
 # gated at PR time in this repository. Its coverage is the org-wide
 # publication check, which reads the class library rather than a roster and
 # therefore needs no literal in a public file.
+# ⚠ EVERY PRESENCE SEARCH ASKS THE INDEX (`--cached`), because everything else
+# here does. Asked of the working tree it answered about files a commit would
+# not contain: staging the removal of the last real occurrences of a roster
+# name while leaving the old copies on disk left the search satisfied and the
+# corpus about to become that name's sole publisher.
+#
 # Both halves of the gate, excluded from every presence search as one list.
 # The rule asks whether a literal survives ELSEWHERE in the tree; a file that
 # exists to hold those literals cannot be part of the answer.
@@ -756,10 +804,10 @@ GATE_EXCLUDES=":(exclude)scripts/check_public_surface.sh :(exclude)scripts/gate-
 
 roster_is_present_in_the_tree() {
   local lit novel=0 found
-  found="$(mktemp)"
+  gate_tmp; found="$GATE_TMP"
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
-    git grep -l -F -- "$lit" -- . $GATE_EXCLUDES > "$found" 2>/dev/null || :
+    git grep --cached -l -F -- "$lit" -- . $GATE_EXCLUDES > "$found" 2>/dev/null || :
     if [ ! -s "$found" ]; then
       printf 'ROSTER VIOLATION: %s appears nowhere in this tree except this file.\n' "$lit" >&2
       novel=$((novel + 1))
@@ -794,8 +842,11 @@ EOF
   # a quantifier or an escape. The disguises are REDUCED first, because each
   # spelling of the same trick got past the previous version: parentheses with
   # nothing to branch between are grouping and come off, and a one-character
-  # class is one character. Both reductions were written after a costume got
-  # through, which is why the rule below does not rely on this one alone.
+  # class is one character, and a backslash before an ordinary character is
+  # no-op syntax that grep discards — `private\-daemon` is the same name and
+  # was approved for carrying a backslash. Each reduction was written after a
+  # costume got through, which is why the rule below does not rely on this
+  # one alone.
   #
   # Names belong in the roster, which is checked against the tree.
   while IFS= read -r lit; do
@@ -807,6 +858,7 @@ $(printf '%s' "$PATTERNS" | awk '
   function check(a,   r) {
     if (a == "") return
     r = a
+    gsub(/\\([^bBwWsSdD<>])/, "\\1", r)
     if (index(r, "|") == 0) gsub(/[()]/, "", r)
     gsub(/\[.\]/, "c", r)
     if (r ~ /[][{}+*?\\|]/) return
@@ -828,23 +880,30 @@ $(printf '%s' "$PATTERNS" | awk '
   }')
 EOF
 
+  # ⚠ READ FROM THE INDEX, both of them. These audits look for literals this
+  # gate alone would publish, so they must read the copy a commit carries: a
+  # novel repository name staged here and removed from the working copy was
+  # invisible to them while the scan read the staged blob.
+  #
   # ⚠ AND THE SAME QUESTION ASKED OF THE CHARACTERS, NOT THE STRUCTURE. Every
   # hyphenated literal run in the pattern list must exist elsewhere in this
   # tree, exactly as a roster entry must. `[p]rivate-daemon` reduces to a
   # hyphenated run whatever regex syntax surrounds it, so this holds where a
   # structural test can be dressed around. Character classes are removed first
-  # so a class's own contents are not read as a name. Measured when written:
+  # so a class's own contents are not read as a name, and a backslash before an
+  # ordinary character is dropped for the same reason the structural test drops
+  # it. Measured when written:
   # both pattern lists contain zero such runs, so this costs nothing today and
   # refuses the day one appears.
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
-    git grep -l -F -- "$lit" -- . $GATE_EXCLUDES > "$found" 2>/dev/null || :
+    git grep --cached -l -F -- "$lit" -- . $GATE_EXCLUDES > "$found" 2>/dev/null || :
     if [ ! -s "$found" ]; then
       printf 'PROSE VIOLATION: the pattern list carries the literal %s, which is nowhere else in this tree.\n' "$lit" >&2
       novel=$((novel + 1))
     fi
   done <<EOF
-$(printf '%s' "$PATTERNS" | sed 's/\[[^]]*\]//g' \
+$(printf '%s' "$PATTERNS" | sed -e 's/\[[^]]*\]//g' -e 's/\\\([^bBwWsSdD<>]\)/\1/g' \
   | grep -oE '[A-Za-z][A-Za-z0-9]*(-[A-Za-z0-9]+)+' | sort -u)
 EOF
 
@@ -856,13 +915,13 @@ EOF
   # nowhere else in the tree was demonstrated to pass everything else.
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
-    git grep -l -F -- "$lit" -- . $GATE_EXCLUDES > "$found" 2>/dev/null || :
+    git grep --cached -l -F -- "$lit" -- . $GATE_EXCLUDES > "$found" 2>/dev/null || :
     if [ ! -s "$found" ]; then
       printf 'PROSE VIOLATION: %s is written in this file and appears nowhere else in this tree.\n' "$lit" >&2
       novel=$((novel + 1))
     fi
   done <<EOF
-$( { grep -hoE 'shardpilot/[A-Za-z0-9][A-Za-z0-9._-]*' "$SELF" "$CORPUS"
+$( { grep -hoE 'shardpilot/[A-Za-z0-9][A-Za-z0-9._-]*' "$SELF_BLOB" "$CORPUS"
      printf '%s\n' "$corpus_values" | grep -oE 'shardpilot/[A-Za-z0-9][A-Za-z0-9._-]*'; } | sort -u )
 EOF
 
@@ -882,7 +941,7 @@ EOF
     printf 'PROSE VIOLATION: %s is a live identifier written where nothing scans.\n' "$lit" >&2
     novel=$((novel + 1))
   done <<EOF
-$( { grep -hoE -- "$AUDIT_CLASSES" "$SELF" "$CORPUS"
+$( { grep -hoE -- "$AUDIT_CLASSES" "$SELF_BLOB" "$CORPUS"
      printf '%s\n' "$corpus_values" | grep -oE -- "$AUDIT_CLASSES"; } | sort -u )
 EOF
 
@@ -1031,7 +1090,11 @@ EOF
   # subshell ends the whole run before its status can be read, which killed
   # this gate with no output at all the first time it was written.
   nul_status=0
-  ( scan_tree "$nul_tmp" ) >/dev/null 2>&1 || nul_status=$?
+  # Its own accumulator and its own trap: the subshell cannot add to the
+  # parent's list, and clearing the inherited copy keeps its trap from removing
+  # files the parent still needs.
+  ( GATE_TMPFILES=""; trap 'rm -f $GATE_TMPFILES' EXIT
+    scan_tree "$nul_tmp" ) >/dev/null 2>&1 || nul_status=$?
   [ "$nul_status" -eq 2 ] || {
     echo "SELFTEST: a NUL-bearing tracked file was not refused" >&2; fixture_fail=1; }
   rm -rf "$nul_tmp"

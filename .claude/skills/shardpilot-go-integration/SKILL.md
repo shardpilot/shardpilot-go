@@ -74,7 +74,7 @@ other calls, no automatic actions.
 go get github.com/shardpilot/shardpilot-go@v0.6.1-alpha
 ```
 
-- Requires **Go 1.24+**.
+- Requires **Go 1.24+** at the pinned tag. *(unreleased — `main` declares `go 1.25.0`, so a checkout of `main` needs **Go 1.25+**; the pin above is what 1.24 buys you.)*
 - Two import paths:
   - `github.com/shardpilot/shardpilot-go` — analytics (package `shardpilot`);
   - `github.com/shardpilot/shardpilot-go/pkg/crash` — crash reporting
