@@ -184,8 +184,7 @@ fi
 CORPUS_EXPECTED_NAMES='FIXTURE_ACCENT_BODY FIXTURE_ACCENT_NAME FIXTURE_BINARY_BODY
 FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY
 FIXTURE_DIRTY_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY
-FIXTURE_NAMEHIT_NAME KNOWN_INNOCENT KNOWN_INTERNAL PATTERNS RESERVED_ADR_IDS
-ROSTER'
+FIXTURE_NAMEHIT_NAME KNOWN_INNOCENT KNOWN_INTERNAL PATTERNS ROSTER'
 
 corpus_defined="$(env -i PATH="$PATH" bash -c '
   before=$(compgen -v | sort)
@@ -302,12 +301,21 @@ if [ -z "$corpus_dump" ]; then
 fi
 eval "$corpus_dump"
 
+# Reference identifiers, held HERE rather than in the corpus. A list that
+# lives inside the file it excuses can be extended by the same commit that
+# publishes a live id, which is an assertion derived from its own subject. The
+# quotes interrupt each prefix so this gate does not report itself — a class
+# wants an unbroken prefix and digits, and finds a quote instead. (Writing the
+# unbroken form in this very comment made the gate fail on itself, correctly.)
+RESERVED_ADR_IDS="ADR-""0000 ADR-""0999"
+RESERVED_TICKET_IDS="GAP-""000 SP-""123 AC-""QA-7"
+
 roster_regex() {
   printf '%s' "$ROSTER" | sed -e 's![-_ ]![-_ ]+!g' -e 's!/! */ *!g' | paste -sd'|' -
 }
 ROSTER_RE="$(roster_regex)"
 
-for required in PATTERNS ROSTER ROSTER_RE RESERVED_ADR_IDS KNOWN_INTERNAL KNOWN_INNOCENT; do
+for required in PATTERNS ROSTER ROSTER_RE KNOWN_INTERNAL KNOWN_INNOCENT; do
   eval "value=\${$required:-}"
   if [ -z "$value" ]; then
     echo "REFUSING: $CORPUS did not define $required." >&2
@@ -425,9 +433,20 @@ scan_tree() {
     # preamble — MZ or ELF — and carries the ZIP further in. Both are refused
     # by magic rather than by extension, because the extension is the part an
     # author controls.
+    #
+    # ⚠ A RASTER IMAGE IS A CONTAINER FOR TEXT. A screenshot rendering an
+    # internal identifier holds it as pixels, so `grep -a` reads the file,
+    # counts it, and reports nothing — a clean line about a file whose contents
+    # were never legible. There are zero tracked images in this repository
+    # today, which is the same footing the archive refusal stands on: a refusal
+    # costs nothing while the answer is zero and becomes a deliberate decision
+    # the day it stops being zero. Deciding then means adding OCR or an
+    # explicit exception, not discovering the hole afterwards.
     case "$(od -An -tx1 -N4 "$root/$f" 2>/dev/null | tr -d ' \n')" in
-      1f8b*|504b0304|504b0506|fd377a58|425a68*|28b52ffd|25504446|4d5a*|7f454c46|377abcaf|52617221)
-        echo "REFUSING: '$f' begins with container magic (archive, PDF or executable)," >&2
+      1f8b*|504b0304|504b0506|fd377a58|425a68*|28b52ffd|25504446|4d5a*|7f454c46|377abcaf|52617221|\
+      89504e47|ffd8ff*|47494638|52494646|424d*|49492a00|4d4d002a)
+        echo "REFUSING: '$f' begins with container magic (archive, PDF, executable" >&2
+        echo "  or raster image)," >&2
         echo "  and this gate reads files as text. No pass here opens a container, so" >&2
         echo "  a clean result would say nothing about what it carries." >&2
         echo "  Remove it from the tracked tree, or extend this gate to walk containers" >&2
@@ -608,16 +627,22 @@ EOF
 $(grep -hoE 'shardpilot/[a-z][a-z-]*' "$SELF" "$CORPUS" | sort -u)
 EOF
 
-  # Decision-record ids: only the two reserved synthetic ones are admissible.
+  # Identifiers: only the reserved synthetic ones are admissible, in EVERY
+  # class. Checking decision records alone left the ticket classes free, and a
+  # fixture is exactly where a live ticket id gets pasted — someone extending
+  # the known-internal corpus reaches for the ticket they happen to be looking
+  # at. The corpus is read here because nothing else reads it.
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
     reserved=no
-    for ok in $RESERVED_ADR_IDS; do [ "$lit" = "$ok" ] && reserved=yes; done
+    for ok in $RESERVED_ADR_IDS $RESERVED_TICKET_IDS; do
+      [ "$lit" = "$ok" ] && reserved=yes
+    done
     [ "$reserved" = yes ] && continue
-    printf 'PROSE VIOLATION: %s is a real decision-record id written in this file.\n' "$lit" >&2
+    printf 'PROSE VIOLATION: %s is a real identifier written in a file nothing scans.\n' "$lit" >&2
     novel=$((novel + 1))
   done <<EOF
-$(grep -hoE 'ADR-[0-9]+' "$SELF" "$CORPUS" | sort -u)
+$(grep -hoE 'ADR-[0-9]+|GAP-[0-9]{3}|SP-[0-9]{3}|AC-[A-Z]{2}-[0-9]+' "$SELF" "$CORPUS" | sort -u)
 EOF
 
   rm -f "$found"
