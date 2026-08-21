@@ -8,10 +8,12 @@ description: Use when integrating the ShardPilot Go SDK (shardpilot-go) into a G
 This skill is written against `main`, which is AHEAD of it.
 The pinned release tag `v0.6.1-alpha` is what an install actually gets. That tag is `v0.6.0-alpha` with two internal
 agent skills deleted and no Go source difference between them, so behavioural
-claims verified against `v0.6.0-alpha`'s source hold at the pin — **with THREE
-exceptions, marked *(unreleased)* where they appear below**:
+claims verified against `v0.6.0-alpha`'s source hold at the pin — **except for
+the behaviours listed here, marked *(unreleased)* where they appear below**:
 `Config.DisableRequestCompression`, which does not exist at the tag; the
-15-second `FlushInterval` default, which is 1 second there; and the independent
+15-second `FlushInterval` default, which is 1 second there; the goroutine-label
+fix, without which a `runtime/pprof` label containing `]` can reach
+`Thread.Name` in a crash payload on Go 1.27+; and the independent
 pacing of the FIRST retry — at the tag `backoffCeiling(1)` returns 0, so a first
 failure without a `Retry-After` hint waits for the next flush tick rather than
 its own jittered delay. Everything else describes the pinned release. Where the SDK does not have a capability, this
@@ -450,7 +452,9 @@ crashClient, err := crash.NewClient(crash.ClientOptions{
     `NewClient`; on a non-ELF platform, an unreadable binary or one with no
     usable id the fill is skipped and capture proceeds unchanged (reported
     through `ClientOptions.Logger` when one is configured).
-  - `ClientOptions.AllGoroutineCaptureEnabled` snapshots every goroutine at
+  - `ClientOptions.AllGoroutineCaptureEnabled` *(the goroutine-label fix is
+    unreleased — at `v0.6.1-alpha` a `runtime/pprof` label containing `]` can
+    reach `Thread.Name`)* snapshots every goroutine at
     panic time as additional pre-symbolicated `threads[]`, each named by
     goroutine id with its scheduler state. Bounded: 64 threads, 256 total
     frames, at most 16 frames per non-crashing goroutine.
