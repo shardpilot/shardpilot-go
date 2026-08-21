@@ -14,9 +14,18 @@ on:
   # cost of running the rest of the suite on a branch push is CI minutes.
   push:
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+# ⚠ NO WORKFLOW-LEVEL CONCURRENCY, DELIBERATELY. `cancel-in-progress` at this
+# level cancels the run for a superseded push — which is exactly the disclosure
+# case: a branch pushed with a credential and force-pushed a minute later. The
+# cancelled run never scanned the commit that was public, and the replacement
+# run checks out history in which that commit is no longer reachable, so not
+# even the `--log-opts=--all` pass can reach it. Cancelling a security scan on
+# the grounds that a newer commit exists is cancelling it for the one push that
+# mattered.
+#
+# So the publication-sensitive jobs carry no concurrency group at all and always
+# run to completion. The rest opt in per job, keyed by job as well as ref so
+# they do not queue behind one another.
 
 jobs:
   # Workspace security baseline, mirroring the pattern the other SDK
@@ -63,6 +72,9 @@ jobs:
           args: git --verbose --redact --log-opts=--all /github/workspace
   go:
     runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.job }}-${{ github.ref }}
+      cancel-in-progress: true
     timeout-minutes: 10
     strategy:
       fail-fast: false
@@ -101,6 +113,9 @@ jobs:
   # 1.25 baseline can compile, which is what the matrix is actually for.
   format:
     runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.job }}-${{ github.ref }}
+      cancel-in-progress: true
     timeout-minutes: 5
 
     steps:
@@ -122,6 +137,9 @@ jobs:
 
   release-consistency:
     runs-on: ubuntu-latest
+    concurrency:
+      group: ${{ github.workflow }}-${{ github.job }}-${{ github.ref }}
+      cancel-in-progress: true
     timeout-minutes: 5
 
     steps:

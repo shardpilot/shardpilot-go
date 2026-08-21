@@ -23,8 +23,10 @@
 # assignment repeated so its first value never reaches the self-test, then a
 # comment after a semicolon. The rule is now what a line MAY be — below this
 # header, it either continues an open quoted value or begins an assignment to
-# one expected name, each name exactly once, with no hash or semicolon outside
-# a quoted value. Anything else is refused.
+# one expected name, each name exactly once, and outside a quoted literal only
+# name characters, `=`, `'` and `$'` may appear. Anything else is refused —
+# including an expansion or an array, both of which put text in this file that
+# no value ever carries.
 #
 # Every name below is consumed by the script that sources this file. The linter
 # cannot see that consumer from here, hence the blanket SC2034 below. It is a
