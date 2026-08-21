@@ -334,8 +334,16 @@ func loadConsentRecordRead(dir, actorDigest string) (consentRecordInfo, bool, co
 		// A withheld record. The real decision lives in WithheldAnalytics;
 		// the mark and its stamp ride as usual, so recovery works exactly as
 		// it does for a record marked the additive way.
+		//
+		// info is built ABOVE, from the redundant boolean, so the sentinel
+		// has to set it here too. Without that line a record whose sentinel
+		// survived but whose boolean was cleared or lost returned a usable,
+		// WITNESSED grant on the successful path — the sentinel exists
+		// precisely because a single flag can go missing, so deriving the
+		// outcome from that flag alone gives the sentinel nothing to do.
 		record.ConsentAnalytics = record.WithheldAnalytics
 		record.Unwitnessed = true
+		info.unwitnessed = true
 		none.unwitnessed = true
 	}
 	switch record.ConsentAnalytics {

@@ -6858,3 +6858,70 @@ func TestEvidenceHoldIsNotCountedAsAPersistFailure(t *testing.T) {
 		t.Fatalf("a successful write was counted as a failure")
 	}
 }
+
+// TestTrailShapeViolationsAreUnusable covers three ways a record can PARSE and
+// still be untrustworthy. Each was reported as sound before: the reader
+// validated every entry on its own and never asked whether the entries make
+// sense TOGETHER.
+func TestTrailShapeViolationsAreUnusable(t *testing.T) {
+	grant := testConsentReceipt("key-shared", true)
+	grant.DecidedAt = "2026-07-19T00:00:00Z"
+
+	t.Run("duplicate_idempotency_key", func(t *testing.T) {
+		// A newer DENIAL under the same key. The dedup keeps the first and
+		// silently dropped the second — which may be exactly the denial that
+		// supersedes it. A duplicate key cannot come from a healthy writer.
+		deny := testConsentReceipt("key-shared", false)
+		deny.DecidedAt = "2026-07-21T00:00:00Z"
+		_, state := readOutboxFixture(t, grant, deny)
+		if state != consentOutboxReadUnusable {
+			t.Fatalf("a duplicate key read as state %d, not unusable", state)
+		}
+	})
+
+	t.Run("non_monotonic_order", func(t *testing.T) {
+		// Reordered so an OLDER grant sits last. latestMatching trusts the
+		// array tail, so the grant would override the newer denial, heal
+		// over the record, and dispatch after it — both sides granted.
+		newerDeny := testConsentReceipt("key-newer-deny", false)
+		newerDeny.DecidedAt = "2026-07-21T00:00:00Z"
+		_, state := readOutboxFixture(t, newerDeny, grant)
+		if state != consentOutboxReadUnusable {
+			t.Fatalf("a reordered trail read as state %d, not unusable", state)
+		}
+		// The same two entries in the writer's own order are fine.
+		_, ok := readOutboxFixture(t, grant, newerDeny)
+		if ok != consentOutboxReadParsed {
+			t.Fatalf("a correctly ordered trail was rejected: state %d", ok)
+		}
+	})
+
+	t.Run("sentinel_without_the_boolean", func(t *testing.T) {
+		// The redundant flag is gone; the sentinel alone must still withhold.
+		dir := t.TempDir()
+		payload := []byte(`{"consent_analytics":"unwitnessed","withheld_analytics":"granted","actor_digest":"` +
+			spoolTestActorDigest() + `","decided_at":"2026-07-19T00:00:00Z","floor":true}`)
+		if err := os.WriteFile(consentRecordPath(dir), payload, 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		info, ok, _ := loadConsentRecordRead(dir, spoolTestActorDigest())
+		if !ok {
+			t.Fatalf("the record did not load at all: %+v", info)
+		}
+		if !info.unwitnessed {
+			t.Fatalf("the sentinel returned a WITNESSED grant when the boolean was absent: %+v", info)
+		}
+	})
+}
+
+// readOutboxFixture writes the receipts verbatim — bypassing the writer, which
+// is the point: these are shapes only corruption produces.
+func readOutboxFixture(t *testing.T, receipts ...consentReceipt) ([]consentReceipt, consentOutboxRead) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName),
+		mustMarshalOutbox(t, receipts...), 0o600); err != nil {
+		t.Fatalf("seed outbox: %v", err)
+	}
+	return newConsentOutbox(dir).readRecordReceipts()
+}

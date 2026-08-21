@@ -441,6 +441,7 @@ func (o *consentOutbox) readRecordReceipts() ([]consentReceipt, consentOutboxRea
 	// a persisted GRANT is not promoted on the strength of a trail we know
 	// is incomplete.
 	rejected := false
+	lastDecidedAt := make(map[string]string, len(entries))
 	for _, entry := range entries {
 		sanitized, ok := sanitizeConsentReceipt(entry)
 		if !ok {
@@ -456,9 +457,32 @@ func (o *consentOutbox) readRecordReceipts() ([]consentReceipt, consentOutboxRea
 			// idempotency key and honors the first body it saw, answering
 			// replays with `replayed`, so a later conflicting body under the
 			// same key could never take effect server-side anyway.
+			//
+			// But the DROPPED body is content this trail cannot account
+			// for, and it may be the denial that supersedes the one kept.
+			// Keeping the first is right; reporting the record as PARSED
+			// afterwards is not — the surviving grant would then override,
+			// heal and dispatch on the strength of a trail with a hole in
+			// it. The server's keep-first rule is no rescue here: neither
+			// entry need have reached the server yet.
+			rejected = true
 			continue
 		}
 		seen[sanitized.IdempotencyKey] = struct{}{}
+		// The writer appends in strictly increasing decision order per
+		// scope. A trail that does not increase has been reordered by
+		// something other than this SDK, and the array TAIL is what
+		// latestMatching trusts as the operative decision — so a reordering
+		// that puts an older grant last makes that grant override a newer
+		// denial, heal over the record, and dispatch after it, leaving both
+		// sides granted. Validating each stamp on its own cannot see this;
+		// only the relation between them can.
+		scope := sanitized.WorkspaceID + "\x00" + sanitized.AppID + "\x00" +
+			sanitized.EnvironmentID + "\x00" + sanitized.ActorIdentifier
+		if prev, ok := lastDecidedAt[scope]; ok && !consentDecisionSupersedes(sanitized.DecidedAt, prev) {
+			rejected = true
+		}
+		lastDecidedAt[scope] = sanitized.DecidedAt
 		loaded = append(loaded, sanitized)
 	}
 	if rejected {
