@@ -468,7 +468,13 @@ scan_tree() {
     # case-sensitive and a file system is not: `probe.XPM` and `probe.MD`
     # walked past the image refusal and the Markdown normalisation
     # respectively, which is a rename away from any file that would be caught.
-    flc="$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]')"
+    # ⚠ `x` AND THEN STRIP IT: command substitution removes trailing newlines,
+    # and this script goes to lengths elsewhere to carry NUL-delimited paths
+    # that may contain them. `notes.PNG` followed by a newline is not a PNG,
+    # and folding it into one would refuse a file whose name it misread.
+    # `${f,,}` would be simpler and needs bash 4; the local shell here is 3.2.
+    flc="$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]'; printf x)"
+    flc="${flc%x}"
 
     # ⚠ AND A PRINTABLE SIGNATURE IN SOURCE IS A STRING CONSTANT. Code that
     # writes a PDF, or names a compression header, holds those characters
@@ -482,8 +488,14 @@ scan_tree() {
     # ⚠ DECIDED BEFORE THE FIRST REFUSAL THAT CONSULTS IT. Placed after one, it
     # was an unbound variable under `set -u` and the run died there — with the
     # probes reading that as a pass, because a dead run refuses nothing.
+    # ⚠ THE SAME PREDICATE THE go SPLIT USES, deliberately case-SENSITIVE
+    # and deliberately `$f`. Folding it here while the split reads `$f` made a
+    # file named `logo.GO` exempt from the printable checks and gated by
+    # lane A at the same time — a raster renamed that way passed both the
+    # extension refusal and the magic one. Two predicates for one question is
+    # the defect; which one wins matters less than that they agree.
     printable_sigs=yes
-    case "$flc" in
+    case "$f" in
       *.go) printable_sigs=no ;;
     esac
     ls_entry="$(cd "$root" && git ls-files -s -z -- "$f" | tr -d '\000')"
@@ -595,8 +607,17 @@ scan_tree() {
     # and so apply to every file, and the PRINTABLE ones, which can and do not.
     case "$magic4" in
       89504e47|ffd8ff*|49492a00|4d4d002a) magic_hit=yes ;;
-      4d5a*|47494638|52494646|424d*|2f2a2058|21205850)
+      4d5a*|47494638|52494646|424d*|2f2a2058)
         magic_hit="$printable_sigs" ;;
+      # ⚠ FOUR BYTES ARE NOT THE XPM2 SIGNATURE. `! XP` also opens an ordinary
+      # note — `! XPrivacy` — and refusing on the prefix blocked a merge over
+      # prose. The header is six bytes and six are read.
+      21205850)
+        magic6="$(od -An -tx1 -N6 "$blob" 2>/dev/null | tr -d ' \n')"
+        case "$magic6" in
+          212058504d32) magic_hit="$printable_sigs" ;;
+          *)            magic_hit=no ;;
+        esac ;;
       # ⚠ NETPBM NEEDS ITS DELIMITER. `P1` through `P6` are a magic number only
       # when whitespace follows; without that test an ordinary note opening
       # `P1-priority planning` was refused as a raster — a false refusal on
@@ -753,7 +774,16 @@ scan_tree() {
         # `ADR-<span>1234</span>` renders contiguously and matches nothing; the
         # head-of-file check cannot see it because the file opens as prose.
         # Tags are removed with the escapes and the emphasis.
-        if sed -e 's/\\\([^A-Za-z0-9]\)/\1/g' -e 's/[*`]//g' -e 's/<[^>]*>//g' "$blob" > "$md_blob"; then
+        #
+        # ⚠ TAG-SHAPED ONLY. `<[^>]*>` also ate a Markdown autolink, whose
+        # contents are VISIBLE text — an autolink whose URL ends in a record
+        # id renders that id, and this deleted it, so the first fix made
+        # the gate blinder than before it. A tag opens with a name.
+        #
+        # Written in BASIC regex on purpose: `-E` applies to every script in
+        # the same sed, and the two substitutions above are BRE. Reaching for
+        # it broke both of them and the gate refused the whole file.
+        if sed -e 's/\\\([^A-Za-z0-9]\)/\1/g' -e 's/[*`]//g' -e 's|</\{0,1\}[A-Za-z][A-Za-z0-9-]*\( [^>]*\)\{0,1\}/\{0,1\}>||g' "$blob" > "$md_blob"; then
           cat "$md_blob" > "$blob"
         else
           # refusal:structural
