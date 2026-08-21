@@ -195,6 +195,41 @@ if awk '
   exit 2
 fi
 
+# ⚠ WHAT THE CORPUS DEFINES MUST BE EXACTLY THIS SET. Forbidding comments was
+# not enough: an ordinary assignment carries prose just as well, and the corpus
+# is skipped by the scan entirely. So the gate asks BASH what the file defines
+# and refuses on any difference — an extra name, or a missing one.
+#
+# Asked of the shell rather than of grep, deliberately. A line-based reader
+# cannot tell an assignment from a fixture that looks like one, and this corpus
+# contains a fixture that does: a flag-shaped sentence inside KNOWN_INTERNAL,
+# which is there precisely because the gate must match that shape. `compgen -v`
+# reports what was actually defined, so the confusable line is not counted.
+#
+# Adding a corpus variable therefore means naming it here — a line a reviewer
+# sees — which is the same property the exempt-region labels had, kept after
+# the regions themselves were removed.
+CORPUS_EXPECTED_NAMES='FIXTURE_ACCENT_BODY FIXTURE_ACCENT_NAME FIXTURE_BINARY_BODY
+FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY
+FIXTURE_DIRTY_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY
+FIXTURE_NAMEHIT_NAME KNOWN_INNOCENT KNOWN_INTERNAL PATTERNS RESERVED_ADR_IDS
+ROSTER ROSTER_RE'
+corpus_defined="$(bash -c '
+  before=$(compgen -v | sort)
+  . "$1" >/dev/null 2>&1
+  after=$(compgen -v | sort)
+  comm -13 <(printf "%s\n" "$before") <(printf "%s\n" "$after")
+' _ "$CORPUS" | grep -vxE 'before|after|PIPESTATUS|_' | sort | tr '\n' ' ')"
+corpus_expected="$(printf '%s\n' $CORPUS_EXPECTED_NAMES | sort | tr '\n' ' ')"
+if [ "$corpus_defined" != "$corpus_expected" ]; then
+  echo "REFUSING: $CORPUS defines a different set of names than expected." >&2
+  echo "  defined:  $corpus_defined" >&2
+  echo "  expected: $corpus_expected" >&2
+  echo "  The gate skips this file, so an unexpected assignment is unread text in" >&2
+  echo "  a published repository. Adding one means naming it in the gate." >&2
+  exit 2
+fi
+
 for required in PATTERNS ROSTER ROSTER_RE RESERVED_ADR_IDS KNOWN_INTERNAL KNOWN_INNOCENT; do
   eval "value=\${$required:-}"
   if [ -z "$value" ]; then
