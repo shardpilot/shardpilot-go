@@ -21,6 +21,153 @@
   recurrence — a check that fails on internal material in the published surface is a separate
   change, deliberately kept out of this one so that removing what is exposed today does not
   wait on it.
+
+- **An unreadable consent outbox no longer resurrects a superseded grant
+  (privacy fix).** The durable outbox is this SDK's only cross-restart
+  witness to a DENIAL. Its reader treated a record it could not parse the
+  same as a record that parsed and held nothing: file unreadable, over the
+  read limit, corrupt, or written by an unknown version all returned "no
+  receipts". When `consent.json` still held an older GRANT — the state the
+  SDK produces on its own, because a denial whose spool purge fails leaves
+  the record write owed while the deny receipt is already on disk — the
+  denial became invisible and the stale grant was promoted to live state.
+  Consent read back as granted and events published.
+
+  The reader now distinguishes three states instead of two. A MISSING file
+  is honestly empty and behaves exactly as before — a fresh install has
+  expressed nothing, and reading absence as refusal would disable analytics
+  for every new install. A file that EXISTS and cannot be understood is
+  UNKNOWN, and a persisted grant is not promoted on the strength of a
+  witness we cannot read: the floor starts undecided, which every publish
+  gate already treats as closed, and the host records a fresh decision to
+  proceed. This is not "denied" as a finding about the person — nothing was
+  learned about them — it is "not entitled to act". Denials are honored
+  regardless, as they always were.
+
+  `Stats.ConsentOutboxUnreadable` is new and counts loads that found an
+  unreadable record; it was previously impossible to see this in the field,
+  because every outbox diagnostic reported a WRITE. `LastConsentError`
+  surfaces `consent_outbox_unreadable` for the read itself and
+  `consent_grant_unwitnessed` when a grant is held back because of it.
+
+  "Could not be understood" includes records that parse but are not sound:
+  a missing or `null` receipts list (this SDK always writes `[]`, so neither
+  can come from a healthy writer), and any record with an entry the
+  sanitizer rejected — a rejected entry is a hole in the trail, and a
+  superseding denial is exactly what it might have been. Entries that DID
+  survive are still honored, so a readable denial alongside a malformed
+  entry still denies rather than falling back to undecided.
+
+  **The consent RECORD's reader had the same defect, and it was worse.** It
+  collapsed every failure — an unreadable file, an over-limit read,
+  unparseable JSON, an unknown decision value — into the same answer as "no
+  record", and the reload treats that as "no record at all", which makes a
+  retained grant receipt apply UNCONDITIONALLY. That branch then HEALS, so
+  the unreadable decision was OVERWRITTEN with a floor-proven grant: the
+  denial was destroyed, not merely ignored. The record reader is now
+  three-valued too, and a grant receipt is refused whenever EITHER witness is
+  unreadable. A grant whose stamp alone is unorderable stays a deliberate
+  discard, not an opaque failure — its decision was read, so it hides
+  nothing and a readable trail may still decide.
+
+  The conclusion is DURABLE, because withholding a grant only in memory is
+  undone by ordinary housekeeping: the trail can be pruned clean underneath
+  it and the next start would promote the grant this one refused. A withheld
+  grant is marked `unwitnessed` on the decision RECORD. A fresh decision for
+  THIS scope rewrites its record and clears the mark, which is the way back.
+
+  The record is NOT per-scope, and an earlier draft of this entry claimed it
+  was: `consent.json` is one file per `SpoolDir`, STAMPED with an actor
+  digest rather than keyed by one, and overwritten whole. So a sibling
+  scope's decision — a login that sets a `UserID`, a tenant switch, a second
+  app — erases this scope's mark, while that sibling's own merging outbox
+  save sanitizes the unreadable trail away at the same moment. Both
+  witnesses disappear together, and the refused grant would be promoted and
+  healed to disk. A record carrying a DIFFERENT digest is therefore treated
+  as its own tombstone: it records nothing about this scope, and it cannot
+  be ruled out that it replaced a mark, so a retained grant receipt is
+  refused beside it. Denials are unaffected.
+
+  Whether a grant may take effect is decided ONCE at startup, from every
+  signal at, and every grant-affecting path reads that one verdict — local
+  promotion, the trail-tail heal, and the dispatch worker. The same asymmetry
+  was found six separate times, each because one site consulted a subset of
+  the signals and a grant took effect through the door that had not been
+  widened; the last of them let a marked record's grant be POSTed to the
+  server while local state correctly refused it. The verdict is persisted
+  whatever the record says — including over a DENIAL, where an earlier
+  revision wrote nothing, so a surviving deny receipt's prune could rewrite
+  the outbox clean and let the next start's grant supersede the denial. A
+  fresh explicit decision clears all of it at once.
+
+  The mark carries a STAMP — the newest decision time the trail showed when it
+  was applied — and is an ordering question rather than a veto. Eight review
+  rounds widened *which paths must consult the mark*; the ninth found the guard
+  too STRONG, which is a different signal: receipt-first means a fresh
+  decision's receipt lands durably before the record is rewritten, so a crash
+  in that window leaves a marked record beside a clean, strictly newer receipt.
+  An unconditional mark refuses that receipt forever and loses a decision that
+  was already durable. Anything strictly newer than the stamp is provably a
+  decision the mark could not have been about, and supersedes it.
+
+  **An absent stamp reads as infinitely NEW.** Records written before this
+  field existed carry none, and reading absence as infinitely OLD would let
+  every retained receipt clear the mark — reopening the defect on every
+  upgraded client at once. Unstamped marks therefore keep behaving exactly as
+  before: they block, and only a fresh decision clears them. The field is
+  additive at the SAME record version, deliberately: a version bump would make
+  existing records unreadable, and unreadable means unusable, which would
+  withhold every persisted grant in the fleet on upgrade. An older build
+  reading a newer record ignores the unknown key and sees the boolean alone —
+  strictly more blocking, so safe in the direction that matters. This is local
+  SDK state on the device's own disk; it is not part of any wire contract.
+
+  Comparing stamps across restarts uses the device clock, so a backward jump
+  yields a decision that is genuinely newer but does not compare newer, and the
+  mark STICKS until the host records another decision. That is the safe
+  direction and it is chosen rather than overlooked.
+
+  Two reads also stopped treating a DANGLING SYMLINK as an absent file: `Open`
+  returns ENOENT for both, but a dangling link leaves a directory entry
+  pointing at a witness that cannot be read, and only `Lstat` separates them.
+
+  The mark is honoured at every point a grant is trusted, because guarding
+  one path and not another guards nothing: a retained grant receipt cannot
+  override — and so heal away — a marked record; the ordinary state-only
+  loader refuses a marked grant, so disabling `ConsentFloor` on a later run
+  cannot turn an explicit "unprovable" back into authorization for the
+  floor-off spool path (the full-info loader still returns it, because the
+  floor must see the mark to withhold and to recover); and if the mark itself
+  cannot be written, maintenance rewrites are held so the unreadable bytes
+  survive as the remaining evidence rather than being sanitized away before
+  the mark lands, while a FRESH explicit decision still writes through and
+  lifts the hold — it is newer than anything the unreadable bytes could have
+  held, and without that carve-out the documented recovery does not exist.
+
+  A grant recovered from an unprovable trail is also held from the WIRE, not
+  just from local state: dispatching it would leave the server granted for an
+  actor whose rejected entry may be the very denial that made the trail
+  unusable, and the server side outlives the device. It is deferred, not
+  dropped — a fresh decision releases it. Denials are never held; sending a
+  denial is the fail-closed direction.
+
+  Finally, the mark is read out of the record BEFORE any other field can
+  invalidate it, and the record's shape is checked before its identity. A
+  damaged timestamp, an empty object, a JSON `null` or a missing
+  `actor_digest` previously read as "some other scope's record" — honestly
+  absent — which let a retained grant receipt apply unconditionally and heal
+  over the file. Corruption anywhere in the record is not a way to launder a
+  deliberate withholding.
+
+  KNOWN RESIDUAL, named rather than left to be discovered: a DELETED outbox
+  beside a persisted grant still promotes that grant. The file is not
+  distinguishable from one that was never written, and refusing that
+  combination would make every seeded or legacy proven grant start undecided
+  and demand a fresh decision.
+
+  Behaviour is unchanged for every other class of state: a corrupt cache or
+  telemetry spool still means "start over", and a corrupt record still never
+  crashes into the host.
 - **Module `go` directive moves to 1.25 (was 1.24).** The source-compatibility
   baseline for SDK consumers rises with it: the next release requires
   **Go 1.25+**. Already-published tags are unaffected — every tag from `v0.1.2`

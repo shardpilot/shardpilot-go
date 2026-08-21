@@ -26,6 +26,19 @@ import (
 // open-by-default posture. RemoteConfigCachePath alone never enables consent
 // persistence.
 
+// consentAnalyticsUnwitnessed is the decision value written for a WITHHELD
+// grant. No released build recognises it, so every decoder — including this
+// one's predecessors — refuses to treat the record as authorization.
+// consentAnalyticsUnwitnessed is the decision value written for a WITHHELD
+// grant: the legacy-understood DENIED, so an older build honours it as a
+// denial. An earlier revision used an unknown value on the reasoning that an
+// old decoder would reject the record — it does, and rejecting lands it in
+// the MORE permissive branch, because a build that sees no usable record lets
+// its trail-tail override apply a retained grant unconditionally. Rejecting
+// the record is not the same as refusing the authorization, and only the
+// second one was ever the goal.
+const consentAnalyticsUnwitnessed = "denied"
+
 const (
 	consentRecordFileName = "consent.json"
 	spoolWipeOwedFileName = "spool-wipe-owed"
@@ -68,10 +81,87 @@ const (
 // fails toward purging — the safe direction, as with every unknown field
 // shape.
 type consentRecordWire struct {
+	// ConsentAnalytics carries the decision. A grant that has been WITHHELD
+	// as unprovable is written as consentAnalyticsUnwitnessed instead, and
+	// its real state moves to WithheldAnalytics — see the note there.
 	ConsentAnalytics string `json:"consent_analytics"`
-	ActorDigest      string `json:"actor_digest"`
-	DecidedAt        string `json:"decided_at,omitempty"`
-	Floor            bool   `json:"floor,omitempty"`
+	// WithheldAnalytics holds the decision a withheld record would carry if
+	// it were usable. It exists because an ADDITIVE flag cannot fail closed
+	// against an OLDER decoder: a rollback to any previously released build
+	// ignores an unknown key and reads `consent_analytics:"granted"` as
+	// ordinary authorization, resurrecting exactly the grant the mark
+	// withheld — and by then maintenance may have rewritten the outbox
+	// clean, so nothing else objects either.
+	//
+	// So the fail-closed part is encoded in a field every decoder ALREADY
+	// consults: `consent_analytics` becomes a value no build recognises.
+	// An older decoder hits its `default:` arm and reports no usable record;
+	// this build recognises the sentinel and recovers the real state from
+	// here. Fail-closed by construction rather than by the reader's version.
+	//
+	// This is affordable because there is no installed base to migrate: a
+	// shape that is RIGHT once one exists beats a shape that is cheap to
+	// migrate from today.
+	WithheldAnalytics string `json:"withheld_analytics,omitempty"`
+	ActorDigest       string `json:"actor_digest"`
+	DecidedAt         string `json:"decided_at,omitempty"`
+	Floor             bool   `json:"floor,omitempty"`
+	// Unwitnessed marks a GRANT whose receipt trail could not be proven
+	// intact when it was last read. It lives HERE, on the per-scope record,
+	// rather than on the shared outbox, and the placement is the whole
+	// point: the outbox file is one per SpoolDir and is shared across every
+	// scope using that directory, so a mark kept there is cleared by a
+	// fresh decision belonging to a DIFFERENT workspace, app or actor —
+	// which supersedes nothing about this scope's unknown trail. The record
+	// is keyed by ActorDigest, so a mark on it is per-scope by
+	// construction, and a fresh decision for this scope rewrites the record
+	// whole and clears it for free.
+	Unwitnessed bool `json:"unwitnessed,omitempty"`
+	// UnwitnessedAt orders the mark against decisions and receipts. It is
+	// the newest DecidedAt observed in the trail when the mark was applied,
+	// so anything STRICTLY NEWER is provably a decision the mark could not
+	// have been about, and may supersede it.
+	//
+	// Without an order the mark is a boolean, and a boolean can only be a
+	// veto over everything or over nothing. Both are wrong: vetoing
+	// everything loses a decision that was already durable (record a fresh
+	// grant, its receipt lands, the process crashes before the record write
+	// — the next start sees the old marked record beside a clean, strictly
+	// newer receipt and refuses it forever), while vetoing nothing reopens
+	// the defect the mark exists to close. Eight review rounds widened
+	// "which paths must consult the boolean"; the ninth showed the guard
+	// was too STRONG, which is the signal that the shape was wrong rather
+	// than the coverage.
+	//
+	// ABSENT MEANS INFINITELY NEW, and the direction is load-bearing.
+	// Records written before this field existed carry no stamp, and reading
+	// that as infinitely OLD would let every retained receipt supersede the
+	// mark — reopening the P0 through the exact mechanism it closed, on
+	// every upgraded client at once. Infinitely NEW keeps those records
+	// behaving as they do today: they block, and only a fresh decision
+	// clears them. Absence does not resolve to the permissive answer; that
+	// is the same rule the readers above follow.
+	//
+	// FORMAT: additive at the SAME record version, deliberately. A version
+	// bump would make every existing record unreadable, and unreadable now
+	// means UNUSABLE, which would withhold every persisted grant in the
+	// fleet on upgrade — a privacy fix turned into a fleet refusal, the
+	// failure mode this whole change is built to avoid. An older build
+	// reading a newer record ignores the unknown key and sees the boolean
+	// alone, which is the pre-stamp behaviour: strictly more blocking, and
+	// so safe in the direction that matters.
+	//
+	// This is local SDK state on the device's own disk. It is not part of
+	// any wire contract, is never transmitted, and no server reads it.
+	//
+	// CLOCKS GO BACKWARD, and this compares stamps across restarts using a
+	// device clock. A backward jump yields a decision that is genuinely
+	// newer than the mark but does not compare newer, so the mark STICKS
+	// and the grant stays withheld until the host records another decision.
+	// That is the safe direction and it is chosen, not overlooked: the
+	// alternative — trusting a clock that just moved backward — is how a
+	// stale grant would supersede a live mark.
+	UnwitnessedAt string `json:"unwitnessed_at,omitempty"`
 }
 
 // consentRecordInfo is a loaded record's full shape for the floor reload:
@@ -79,9 +169,11 @@ type consentRecordWire struct {
 // (decidedAt empty and floor false for a legacy record that predates the
 // fields).
 type consentRecordInfo struct {
-	state     ConsentState
-	decidedAt string
-	floor     bool
+	state         ConsentState
+	decidedAt     string
+	floor         bool
+	unwitnessed   bool
+	unwitnessedAt string
 }
 
 // consentActorDigest canonically digests the actor/scope tuple a persisted
@@ -120,31 +212,148 @@ func spoolWipeOwedPath(dir string) string {
 // explicit denial (fail toward purging, never toward loading).
 func loadConsentRecord(dir, actorDigest string) (ConsentState, bool) {
 	info, ok := loadConsentRecordInfo(dir, actorDigest)
+	if ok && info.state == ConsentGranted && info.unwitnessed {
+		// A grant a floor-enabled run marked UNPROVABLE is not authorization
+		// for anyone, and least of all for a later run started with
+		// ConsentFloor unset. This is the ordinary loader — initSpool's
+		// floor-off path uses it to decide whether a persisted grant may
+		// load and resend spool.json — so returning the mark as a usable
+		// grant would let disabling the live floor turn an explicit
+		// "unprovable" back into permission. Floor-off already honors
+		// persisted DENIALS and already requires a persisted grant for disk
+		// loads; refusing a marked grant keeps both properties.
+		//
+		// The full-info loader deliberately still returns it, because the
+		// floor needs to SEE the mark to withhold and to recover from it.
+		return ConsentUnknown, false
+	}
 	return info.state, ok
 }
 
+// consentRecordRead classifies what a read of the decision record LEARNED,
+// by the same rule the outbox reader follows and for the same reason: a
+// failure that is indistinguishable from a determinate answer is how an
+// emergency stop silently stops stopping. "No record" and "a record I could
+// not read" lead to OPPOSITE safe actions, so they may not share a value.
+type consentRecordRead uint8
+
+const (
+	// consentRecordReadParsed: read and understood.
+	consentRecordReadParsed consentRecordRead = iota
+	// consentRecordReadAbsent: no record file, or one belonging to a
+	// DIFFERENT actor digest. Both are honestly "nothing recorded for this
+	// scope" — a fresh install and a shared SpoolDir respectively.
+	consentRecordReadAbsent
+	// consentRecordReadUnusable: a record exists for this scope and could
+	// not be understood. The decision it held is unknown, and it may have
+	// been a denial.
+	consentRecordReadUnusable
+	// consentRecordReadForeign: the file exists and is well-formed but
+	// carries a DIFFERENT actor digest. Nothing is recorded for THIS scope
+	// — and, crucially, that other scope's write DESTROYED whatever this
+	// scope had, because the record is one file per SpoolDir overwritten
+	// whole. So a foreign record is its own tombstone: it cannot be ruled
+	// out that it replaced an unwitnessed mark.
+	consentRecordReadForeign
+)
+
 // loadConsentRecordInfo is loadConsentRecord returning the record's full
 // shape — the floor reload needs the ordering stamp and floor provenance
-// alongside the state.
+// alongside the state. It preserves the two-value signature every existing
+// caller uses; callers that must act on the DIFFERENCE between absent and
+// unreadable take loadConsentRecordRead instead.
 func loadConsentRecordInfo(dir, actorDigest string) (consentRecordInfo, bool) {
+	info, ok, _ := loadConsentRecordRead(dir, actorDigest)
+	return info, ok
+}
+
+// loadConsentRecordRead is loadConsentRecordInfo plus what the read learned.
+// The third value exists because `!ok` is NOT "there is no record": it is
+// also every opaque failure, and initConsentFloor's trail-tail override
+// treats a false ok as "no record at all" and applies a receipt
+// UNCONDITIONALLY — including a stale grant receipt over a denial it cannot
+// read, which it then HEALS onto disk, destroying the denial rather than
+// merely ignoring it.
+func loadConsentRecordRead(dir, actorDigest string) (consentRecordInfo, bool, consentRecordRead) {
 	none := consentRecordInfo{state: ConsentUnknown}
 	file, err := os.Open(consentRecordPath(dir))
 	if err != nil {
-		return none, false
+		// Same distinction as the outbox door: a dangling symlink makes
+		// Open return ENOENT while the directory entry exists, and that
+		// entry is a record whose target we cannot read. Lstat does not
+		// follow the link.
+		if errors.Is(err, fs.ErrNotExist) && !pathExists(consentRecordPath(dir)) {
+			return none, false, consentRecordReadAbsent
+		}
+		return none, false, consentRecordReadUnusable
 	}
 	defer file.Close()
 	data, err := io.ReadAll(io.LimitReader(file, consentRecordReadLimit+1))
 	if err != nil || len(data) > consentRecordReadLimit {
-		return none, false
+		return none, false, consentRecordReadUnusable
 	}
 	var record consentRecordWire
 	if json.Unmarshal(data, &record) != nil {
-		return none, false
+		return none, false, consentRecordReadUnusable
+	}
+	// The mark is captured BEFORE anything else can discard it. Every later
+	// failure path returns `none`, and a `none` that dropped the mark turns
+	// damage to an unrelated field into permission: the grant-tail block
+	// stops seeing record.unwitnessed, `!recordOK` lets a retained receipt
+	// apply unconditionally, and the heal rewrites an unmarked granted
+	// record. Corruption anywhere in this file must not become a way to
+	// launder a deliberate withholding.
+	none.unwitnessed = record.Unwitnessed
+	none.unwitnessedAt = record.UnwitnessedAt
+
+	// SHAPE before identity. `null`, `{}`, and a record with a missing
+	// actor_digest or decision all unmarshal cleanly, and comparing the
+	// digest first classified them as ANOTHER scope's record — honestly
+	// absent — when they are in fact this file damaged. Absent lets the
+	// trail-tail override apply a retained grant UNCONDITIONALLY and heal
+	// over the file, so a damaged DENIAL for this very scope would be
+	// replaced by a grant.
+	if record.ActorDigest == "" || record.ConsentAnalytics == "" {
+		return none, false, consentRecordReadUnusable
 	}
 	if record.ActorDigest != actorDigest {
-		return none, false
+		// Carry the foreign record's OWN stamp out with it. It is the only
+		// thing that dates the scope switch, and a caller that must decide
+		// whether a receipt predates or postdates that switch has nothing
+		// else to compare against. Discarding it makes every foreign record
+		// an unbounded veto.
+		none.decidedAt = record.DecidedAt
+		// A well-formed record for a DIFFERENT actor records nothing about
+		// THIS scope — but it is not the same as no file at all, and an
+		// earlier revision of this code collapsed the two and said so in a
+		// comment that was wrong. consentRecordPath takes only the
+		// directory: it is ONE file per SpoolDir, stamped with a digest
+		// rather than keyed by one, and saveConsentRecord overwrites it
+		// whole. So a sibling scope's decision — a login that sets a
+		// UserID, a tenant switch, a second AppID — erases this scope's
+		// unwitnessed mark, and the same sibling's merging outbox save
+		// sanitizes the unreadable trail into a clean record. Both pieces
+		// of evidence vanish and the grant a previous start refused is
+		// promoted AND healed to disk. FOREIGN keeps the two apart.
+		return none, false, consentRecordReadForeign
 	}
-	info := consentRecordInfo{decidedAt: record.DecidedAt, floor: record.Floor}
+	info := consentRecordInfo{decidedAt: record.DecidedAt, floor: record.Floor, unwitnessed: record.Unwitnessed, unwitnessedAt: record.UnwitnessedAt}
+	if record.ConsentAnalytics == consentAnalyticsUnwitnessed && record.WithheldAnalytics != "" {
+		// A withheld record. The real decision lives in WithheldAnalytics;
+		// the mark and its stamp ride as usual, so recovery works exactly as
+		// it does for a record marked the additive way.
+		//
+		// info is built ABOVE, from the redundant boolean, so the sentinel
+		// has to set it here too. Without that line a record whose sentinel
+		// survived but whose boolean was cleared or lost returned a usable,
+		// WITNESSED grant on the successful path — the sentinel exists
+		// precisely because a single flag can go missing, so deriving the
+		// outcome from that flag alone gives the sentinel nothing to do.
+		record.ConsentAnalytics = record.WithheldAnalytics
+		record.Unwitnessed = true
+		info.unwitnessed = true
+		none.unwitnessed = true
+	}
 	switch record.ConsentAnalytics {
 	case "granted":
 		info.state = ConsentGranted
@@ -153,7 +362,10 @@ func loadConsentRecordInfo(dir, actorDigest string) (consentRecordInfo, bool) {
 	case "denied_forced_minor":
 		info.state = ConsentDeniedForcedMinor
 	default:
-		return none, false
+		// An unknown decision value is OPAQUE, not absent: a newer build's
+		// record read by an older one lands here, and what it decided is
+		// exactly what we cannot tell.
+		return none, false, consentRecordReadUnusable
 	}
 	if record.Floor {
 		// A floor-authored record ALWAYS carries its decision's stamp (the
@@ -179,12 +391,23 @@ func loadConsentRecordInfo(dir, actorDigest string) (consentRecordInfo, bool) {
 		// both directions (they predate the stamping build).
 		if _, err := time.Parse(time.RFC3339Nano, record.DecidedAt); err != nil {
 			if info.state == ConsentGranted {
-				return none, false
+				// `none` already carries the mark (captured above), so a
+				// damaged stamp cannot strip a deliberate withholding off a
+				// grant on its way out.
+				// ABSENT, deliberately, and NOT unusable: this failure is
+				// not opaque. The decision was read — it said granted — and
+				// only its STAMP is unorderable, so discarding it hides no
+				// denial, and the readable trail may decide. Reporting it
+				// unusable here would block a legitimate proof-driven
+				// recovery (an unorderable grant record beside a valid
+				// grant receipt) for no safety gain. The opaque classes
+				// above are the ones where what the record SAID is unknown.
+				return none, false, consentRecordReadAbsent
 			}
 			info.decidedAt = ""
 		}
 	}
-	return info, true
+	return info, true, consentRecordReadParsed
 }
 
 // saveConsentRecord persists a consent decision, stamped with the actor
@@ -194,6 +417,106 @@ func loadConsentRecordInfo(dir, actorDigest string) (consentRecordInfo, bool) {
 // 0600 file, full temp write + atomic rename). rename and chmod are
 // injectable so tests can exercise persist and refused-tighten failures
 // deterministically.
+// markConsentRecordUnwitnessed re-writes an existing record with the
+// unwitnessed mark set, preserving its decision, stamp and provenance. It is
+// how the withholding of an unprovable GRANT becomes DURABLE: without it the
+// refusal lives only in this process, and the next start — reading the same
+// record with a trail that has since been pruned clean — promotes exactly
+// the grant this start refused. saveConsentRecord writes the mark as false,
+// so any FRESH decision for this scope clears it for free, which is the
+// documented way back.
+// consentMarkSupersededBy reports whether a decision stamped decidedAt is
+// provably NEWER than the mark on info, and so may clear it.
+//
+// The absent-stamp case is the one that matters: a record written before the
+// stamp existed reads as INFINITELY NEW, so nothing supersedes it and it
+// behaves exactly as it does today. Reading absence the other way would let
+// any retained receipt clear the mark and reopen the defect fleet-wide on
+// upgrade.
+// consentDecisionSupersedes reports whether a decision stamped `at` is
+// provably newer than one stamped `than`. An absent or unparsable `than`
+// reads as INFINITELY NEW — nothing supersedes it — the same direction the
+// mark uses, and for the same reason: absence must not resolve permissively.
+func consentDecisionSupersedes(at string, than string) bool {
+	if than == "" || at == "" {
+		return false
+	}
+	base, err := time.Parse(time.RFC3339Nano, than)
+	if err != nil {
+		return false
+	}
+	when, err := time.Parse(time.RFC3339Nano, at)
+	if err != nil {
+		return false
+	}
+	return when.After(base)
+}
+
+func consentMarkSupersededBy(info consentRecordInfo, decidedAt string) bool {
+	if !info.unwitnessed {
+		return true
+	}
+	if info.unwitnessedAt == "" || decidedAt == "" {
+		return false
+	}
+	markAt, err := time.Parse(time.RFC3339Nano, info.unwitnessedAt)
+	if err != nil {
+		// An unparsable stamp is not an old one. Same rule again.
+		return false
+	}
+	at, err := time.Parse(time.RFC3339Nano, decidedAt)
+	if err != nil {
+		return false
+	}
+	return at.After(markAt)
+}
+
+func markConsentRecordUnwitnessed(dir string, info consentRecordInfo, actorDigest string, unwitnessedAt string, rename func(oldpath, newpath string) error, chmod func(name string, mode os.FileMode) error) error {
+	var decision ConsentDecision
+	switch info.state {
+	case ConsentGranted:
+		decision = ConsentDecisionGranted
+	case ConsentDenied:
+		decision = ConsentDecisionDenied
+	case ConsentDeniedForcedMinor:
+		decision = ConsentDecisionDeniedForcedMinor
+	default:
+		return nil
+	}
+	wire := consentRecordWire{
+		ConsentAnalytics: string(decision),
+		ActorDigest:      actorDigest,
+		DecidedAt:        info.decidedAt,
+		Floor:            info.floor,
+		Unwitnessed:      true,
+		UnwitnessedAt:    unwitnessedAt,
+	}
+	if decision == ConsentDecisionGranted {
+		// The legacy tombstone needs an ORDER an older build can use, not
+		// just a spelling it understands. Written at the record's own t0
+		// while the mark covers a trail reaching t1, an older build reads a
+		// denial at t0, finds the retained grant at t1 strictly newer, and
+		// heals it back into authorization — the rollback hole again, one
+		// level down: the sentinel was legacy-understood but not
+		// legacy-ORDERED. Stamp it through the mark so nothing the mark
+		// covers can out-order it.
+		if consentDecisionSupersedes(unwitnessedAt, wire.DecidedAt) {
+			wire.DecidedAt = unwitnessedAt
+		}
+		// Only a GRANT needs the older-decoder guard: a withheld DENIAL is
+		// already the restrictive answer, and rewriting it into a sentinel
+		// would make an old build read no record where it would otherwise
+		// have honoured the denial.
+		wire.WithheldAnalytics = string(decision)
+		wire.ConsentAnalytics = consentAnalyticsUnwitnessed
+	}
+	payload, err := json.Marshal(wire)
+	if err != nil {
+		return err
+	}
+	return writePrivateFileAtomic(consentRecordPath(dir), payload, rename, chmod)
+}
+
 func saveConsentRecord(dir string, decision ConsentDecision, actorDigest, decidedAt string, floorAuthored bool, rename func(oldpath, newpath string) error, chmod func(name string, mode os.FileMode) error) error {
 	payload, err := json.Marshal(consentRecordWire{
 		ConsentAnalytics: string(decision),
