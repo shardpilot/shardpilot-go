@@ -119,6 +119,10 @@ cd "$(dirname "$0")/.."
 # org-wide check covers already-public repositories it is caught by review or
 # not at all.
 # gate-self-exempt:begin definitions
+# The two decision-record ids reserved for fixtures and prose in this file.
+# Everything else of that shape is a real record and fails the prose check.
+RESERVED_ADR_IDS='ADR-0000 ADR-0999'
+
 ROSTER='analytics-service
 control-plane'
 
@@ -141,10 +145,11 @@ ROSTER_RE="$(roster_regex)"
 
 # The SHAPE half. These name no record, no ticket, no branch and no service, so
 # they are safe to publish in the file that gates against them.
-PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are) not (tested|covered|scanned|audited|monitored)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?) (for|of|in)|[Nn]obody (looks|checks|monitors)|[Ll]acks( any| automated| an?)* ?[A-Za-z-]*[ ]?(harness|harnesses|coverage|tests?|suites?|monitoring)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
+PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are) not (tested|covered|scanned|audited|monitored)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?) (for|of|in)|[Nn]obody (looks|checks|monitors)|[Ll]acks( any| automated| an?)* ?[A-Za-z-]*[ ]?(harness|harnesses|coverage|tests?|suites?|monitoring)|(does|do|did) not have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 
 # Files the gate must not read as content: this script is the one place the
-# patterns are written down, by construction.# gate-self-exempt:end
+# patterns are written down, by construction.
+# gate-self-exempt:end
 
 # ⚠ THIS FILE IS SCANNED TOO, with only two regions removed first.
 #
@@ -154,8 +159,8 @@ PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Z
 # published statement of where our testing does not reach. Each was found by a
 # reviewer rather than by the gate, because the gate could not read its own
 # prose. Two bespoke checks were bolted on for two of those shapes, and the
-# rest stayed unreadable — `tracked as GAP-777 internally` in a comment here
-# passed the whole gate.
+# rest stayed unreadable — a comment here carrying an ordinary ticket
+# reference passed the whole gate.
 #
 # So the exemption is now the SMALLEST thing that cannot be scanned: the
 # pattern definitions and the synthetic fixture corpus, both delimited by
@@ -164,11 +169,43 @@ PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Z
 # also retires the two bespoke passes, because the real classes now cover
 # what they covered.
 self_scan_body() {
+  local begins ends kept total
+  # ⚠ ONE ANCHOR, USED BY BOTH THE COUNT AND THE STRIPPER. They were written
+  # separately and disagreed: the count accepted a marker with leading
+  # whitespace, awk demanded column zero. An indented marker therefore counted
+  # as balanced while the stripper never saw it — the same silent over-blanking
+  # this check was added to catch, reintroduced by the check itself.
+  begins="$(grep -cE '^[[:space:]]*# gate-self-exempt:begin' "$1" || true)"
+  ends="$(grep -cE '^[[:space:]]*# gate-self-exempt:end' "$1" || true)"
+  # ⚠ BALANCED, AND CHECKED — because an unterminated block fails SILENTLY and
+  # generously. `skip` never resets, every line after the opener is blanked,
+  # and the scan reports a file it did not read as clean. Both blocks were
+  # unterminated when this function was introduced (one marker concatenated
+  # onto a comment, the other never written), 117 of 609 lines survived, and a
+  # mutation test still passed because the planted line sat above the first
+  # marker. A guard whose failure mode is "sees less" must say so.
+  if [ "$begins" != "$ends" ] || [ "$begins" -eq 0 ]; then
+    echo "REFUSING: $1 has $begins gate-self-exempt:begin marker(s) and $ends end marker(s)." >&2
+    echo "  An unterminated block blanks the rest of the file and the scan then" >&2
+    echo "  reports what it never read as clean. Markers must be balanced and" >&2
+    echo "  each must start its own line." >&2
+    exit 2
+  fi
   awk '
-    /^# gate-self-exempt:begin/ { skip = 1 }
+    /^[[:space:]]*# gate-self-exempt:begin/ { skip = 1 }
     { if (!skip) print; else print "" }
-    /^# gate-self-exempt:end/   { skip = 0 }
-  ' "$1"
+    /^[[:space:]]*# gate-self-exempt:end/   { skip = 0 }
+  ' "$1" > "$2"
+  # And a floor on how much survives. Balanced markers can still swallow the
+  # file if a block is opened early and closed late; this is cheap and catches
+  # that without pretending to know the right number.
+  total="$(grep -c '' "$1")"
+  kept="$(grep -c . "$2" || true)"
+  if [ "$kept" -lt $(( total / 4 )) ]; then
+    echo "REFUSING: stripping the exempt regions of $1 left $kept non-blank lines of $total." >&2
+    echo "  That is not an exemption, it is the file disappearing." >&2
+    exit 2
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -244,8 +281,8 @@ scan_tree() {
     case "$(od -An -tx1 -N4 "$root/$f" 2>/dev/null | tr -d ' \n')" in
       1f8b*|504b0304|504b0506|fd377a58|425a68*|28b52ffd|25504446|4d5a*|7f454c46|377abcaf|52617221)
         echo "REFUSING: '$f' begins with container magic (archive, PDF or executable)," >&2
-        echo "  and this gate reads files as text. Its real contents are not scanned by" >&2
-        echo "  any pass here, so a clean result would say nothing about what it carries." >&2
+        echo "  and this gate reads files as text. No pass here opens a container, so" >&2
+        echo "  a clean result would say nothing about what it carries." >&2
         echo "  Remove it from the tracked tree, or extend this gate to walk containers" >&2
         echo "  deliberately." >&2
         exit 2
@@ -293,7 +330,7 @@ scan_tree() {
     # by emitting an empty line per removed line, so reported line numbers stay
     # true to the file on disk.
     if [ "$f" = "scripts/check_public_surface.sh" ]; then
-      scan_src="$(mktemp)"; self_scan_body "$root/$f" > "$scan_src"
+      scan_src="$(mktemp)"; self_scan_body "$root/$f" "$scan_src"
     else
       scan_src="$root/$f"
     fi
@@ -361,8 +398,8 @@ scan_tree() {
 # fail, and "the patterns compile" is not that demonstration.
 # ---------------------------------------------------------------------------
 # ⚠ EVERY IDENTIFIER BELOW IS SYNTHETIC. These fixtures exercise SHAPES, and a
-# shape is exercised just as well by `ADR-0000` as by a real decision-record
-# number — while a real one would make this fixture block the same kind of
+# shape is exercised just as well by a reserved synthetic id as by a real
+# decision-record number — while a real one would make this fixture block the same kind of
 # roster the ROSTER rule above exists to bound. The earlier version used a live
 # ADR id, a live feature-flag name and a live ticket number, none of which the
 # test needed.
@@ -371,6 +408,7 @@ KNOWN_INTERNAL='per ADR-0000 §3
 There are no Playwright tests for the console.
 There are no end-to-end tests for the purchase flow.
 The console has no end-to-end tests for purchase callbacks.
+The console does not have automated tests.
 There is NO Playwright harness in the console repo
 the crash path is not covered by automated tests
 no automated scanning for that class of input
@@ -392,6 +430,7 @@ DEFOLD_SHA1="f735c12192bf95684e6ae1ae27c400b8170fc6d8"
 a self-service signup flow, a micro-service boundary
 the event plane and the consent plane are separate
 an analytics-plane request, zero event batches'
+# gate-self-exempt:end
 
 # roster_is_present_in_the_tree — the rule from the ROSTER block, executed.
 #
@@ -454,7 +493,9 @@ EOF
   # Decision-record ids: only the two reserved synthetic ones are admissible.
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
-    case "$lit" in ADR-0000|ADR-0999) continue ;; esac
+    reserved=no
+    for ok in $RESERVED_ADR_IDS; do [ "$lit" = "$ok" ] && reserved=yes; done
+    [ "$reserved" = yes ] && continue
     printf 'PROSE VIOLATION: %s is a real decision-record id written in this file.\n' "$lit" >&2
     novel=$((novel + 1))
   done <<EOF
@@ -529,6 +570,7 @@ EOF
   # THE SCAN ITSELF, over a fixture whose expected answer is known. This is the
   # half the first draft did not have: the regex can be perfect while the file
   # list is empty, and only this catches that.
+  # gate-self-exempt:begin scan fixture
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
   (
@@ -560,6 +602,7 @@ EOF
     echo "SELFTEST: the scan flagged clean.md" >&2; fixture_fail=1; }
   [ "$scan_lane_b_files" -eq 1 ] || {
     echo "SELFTEST: lane B counted $scan_lane_b_files files, expected 1" >&2; fixture_fail=1; }
+  # gate-self-exempt:end
   if [ "$fixture_fail" -ne 0 ]; then
     echo "REFUSING: the scan failed its own fixture." >&2
     exit 2
