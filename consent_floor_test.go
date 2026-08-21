@@ -6744,14 +6744,13 @@ func TestOutboxWriterNeverExceedsItsOwnReadLimit(t *testing.T) {
 	}
 }
 
-// TestForeignRecordDoesNotStrandAPostSwitchGrant bounds the foreign-record
-// tombstone by ORDER. A foreign record stands for what it may have
-// overwritten — but only for what came before it. A receipt strictly newer
-// than the foreign record's own stamp was created after that scope switch
-// completed, so it cannot be what the switch destroyed; vetoing it strands a
-// grant whose receipt landed durably and whose record write was lost to a
-// crash.
-func TestForeignRecordDoesNotStrandAPostSwitchGrant(t *testing.T) {
+// TestForeignRecordVetoesGrantsRegardlessOfWallClock pins that the tombstone
+// is NOT bounded by timestamp. Both stamps come from the device clock, and the
+// client that wrote the foreign record may have had the floor disabled and
+// stamped it with its own current clock; a backward jump then makes a
+// PRE-switch grant compare newer and heal over the tombstone. Deferring a
+// decision is recoverable, admitting a stale grant is not.
+func TestForeignRecordVetoesGrantsRegardlessOfWallClock(t *testing.T) {
 	_, server := newFloorTestServer(t)
 	defer server.Close()
 
@@ -6770,10 +6769,16 @@ func TestForeignRecordDoesNotStrandAPostSwitchGrant(t *testing.T) {
 		t.Fatalf("seed outbox: %v", err)
 	}
 
+	// WITHHELD, deliberately. An earlier revision let this through on the
+	// reasoning that the receipt is strictly newer than the foreign record,
+	// but both stamps come from the device clock and a backward jump makes a
+	// PRE-switch grant compare newer. A wrong answer here ADMITS, so the
+	// comparison is not affordable; the decision is deferred until the host
+	// records another one.
 	client := newFloorTestClient(t, server.URL, dir, nil)
 	defer func() { _ = client.Close(context.Background()) }()
-	if got := client.Consent(); got != ConsentGranted {
-		t.Fatalf("a post-switch grant was stranded by a foreign record: %v", got)
+	if got := client.Consent(); got == ConsentGranted {
+		t.Fatalf("a grant was promoted beside a foreign record on wall-clock ordering alone: %v", got)
 	}
 
 	// The PRE-switch direction must still be vetoed: a receipt not newer
@@ -6793,5 +6798,63 @@ func TestForeignRecordDoesNotStrandAPostSwitchGrant(t *testing.T) {
 	defer func() { _ = second.Close(context.Background()) }()
 	if got := second.Consent(); got == ConsentGranted {
 		t.Fatalf("a pre-switch grant was promoted beside a foreign record: %v", got)
+	}
+}
+
+// TestOversizedSoleReceiptIsRefusedNotDiscarded pins the boundary of the
+// shed-oldest recovery. A receipt can be oversized all by itself, and evicting
+// the sole newest one while reporting the append SUCCESSFUL would make a
+// denial disappear before it ever dispatched: Close sees nothing pending, the
+// host is told the decision was recorded, and the server stays granted.
+func TestOversizedSoleReceiptIsRefusedNotDiscarded(t *testing.T) {
+	dir := t.TempDir()
+	outbox := newConsentOutbox(dir)
+	deny := testConsentReceipt("key-sole-oversized-deny", false)
+	deny.WorkspaceID = strings.Repeat("w", consentOutboxReadLimit+1)
+
+	if failed := outbox.append(deny); !failed {
+		t.Fatalf("an oversized sole receipt was reported as successfully persisted")
+	}
+	// Refused, not discarded: the decision survives in the mirror and the
+	// write stays owed, so the host is not told a denial is durable when it
+	// is not.
+	if got := len(outbox.snapshot()); got != 1 {
+		t.Fatalf("the receipt was dropped rather than kept owed: %d in the mirror", got)
+	}
+	if !outbox.writeOwed() {
+		t.Fatalf("the refused write was not recorded as owed")
+	}
+}
+
+// TestEvidenceHoldIsNotCountedAsAPersistFailure keeps a deliberate refusal out
+// of disk-failure accounting. A hold attempts no write: counting it inflates
+// the persist-failure metric, logs a disk failure for a disk that refused
+// nothing, and replaces the specific diagnosis that tells an operator the
+// conclusion never reached the record.
+//
+// This binds the DECISION — the predicate every caller routes through — rather
+// than the end-to-end accounting. Reaching the counter from a live client needs
+// a maintenance write that is both owed and held, and the states that produce a
+// hold leave nothing for prune to write; that path is not reproduced here, and
+// saying so is better than a test that passes because it never got there.
+func TestEvidenceHoldIsNotCountedAsAPersistFailure(t *testing.T) {
+	if consentSaveFailedDurably(errConsentEvidenceHeld) {
+		t.Fatalf("a withheld write was reported as a durable persist failure")
+	}
+	if consentSaveFailedDurably(fmt.Errorf("wrapped: %w", errConsentEvidenceHeld)) {
+		t.Fatalf("a wrapped withheld write was reported as a durable persist failure")
+	}
+	// Everything else still counts, including the record-too-large refusal,
+	// which IS a real inability to store the decision.
+	for _, err := range []error{
+		errors.New("disk full"),
+		errConsentRecordTooLarge,
+	} {
+		if !consentSaveFailedDurably(err) {
+			t.Fatalf("a real write failure was not counted: %v", err)
+		}
+	}
+	if consentSaveFailedDurably(nil) {
+		t.Fatalf("a successful write was counted as a failure")
 	}
 }

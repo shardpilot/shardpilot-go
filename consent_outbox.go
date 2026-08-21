@@ -646,7 +646,15 @@ func (o *consentOutbox) saveLocked(carriesFreshDecision bool) error {
 		// choice available: a receipt that has waited longest is the one
 		// most likely already delivered, and the alternative (writing
 		// nothing) loses the whole trail including its newest denial.
-		for len(payload) > consentOutboxReadLimit && len(merged) > 0 {
+		// Shed OLDEST first — but never the last one standing. A receipt can
+		// be oversized ALL BY ITSELF (the scope identifiers are unbounded),
+		// and evicting the sole newest receipt while reporting the append
+		// successful would make a DENIAL disappear before it ever
+		// dispatched: Close would see nothing pending, the host would be
+		// told the decision was recorded, and the server would stay granted.
+		// A decision that cannot be stored must be refused loudly, not
+		// silently discarded as if it were an aged-out duplicate.
+		for len(payload) > consentOutboxReadLimit && len(merged) > 1 {
 			evictKeys = append(evictKeys, merged[0].IdempotencyKey)
 			merged = merged[1:]
 			record.Receipts = &merged
@@ -656,9 +664,10 @@ func (o *consentOutbox) saveLocked(carriesFreshDecision bool) error {
 			}
 		}
 		if err == nil && len(payload) > consentOutboxReadLimit {
-			// Even an empty trail does not fit, which means the fixed part
-			// of the record is over the limit. Refuse the write rather than
-			// lay down a record the reader will call corrupt.
+			// One receipt on its own does not fit. Refuse the write and say
+			// so: the mirror keeps the receipt, the write stays owed, and
+			// the caller learns the decision is not durable instead of
+			// being told it was stored.
 			o.dirty = true
 			return errConsentRecordTooLarge
 		}
@@ -687,7 +696,7 @@ func (o *consentOutbox) append(receipt consentReceipt) (persistFailed bool) {
 	// yet.
 	o.ownKeys[receipt.IdempotencyKey] = struct{}{}
 	o.receipts = append(o.receipts, receipt)
-	return o.saveLocked(true) != nil
+	return consentSaveFailedDurably(o.saveLocked(true))
 }
 
 // head returns the oldest retained receipt for dispatch, when one exists.
@@ -779,7 +788,7 @@ func (o *consentOutbox) prune(idempotencyKey string) (persistFailed bool) {
 		pruned = append(pruned, o.receipts[:i]...)
 		pruned = append(pruned, o.receipts[i+1:]...)
 		o.receipts = pruned
-		return o.saveLocked(false) != nil
+		return consentSaveFailedDurably(o.saveLocked(false))
 	}
 	return false
 }
@@ -883,13 +892,24 @@ func (o *consentOutbox) writeOwed() bool {
 
 // retryPersist re-attempts an owed durable write. The first return reports
 // whether a write was attempted at all.
+// consentSaveFailedDurably reports whether a save error is a real write
+// failure. An evidence hold is NOT: no write was attempted, the mirror is
+// intact, and counting it inflates ConsentOutboxPersistFailed, emits a
+// disk-failure log for a disk that never refused anything, and — worst —
+// replaces the specific consent_unwitnessed_mark_failed diagnosis that told
+// the operator the conclusion is not on disk. A refusal to write is not the
+// same event as a write that failed.
+func consentSaveFailedDurably(err error) bool {
+	return err != nil && !errors.Is(err, errConsentEvidenceHeld)
+}
+
 func (o *consentOutbox) retryPersist() (attempted, failed bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if !o.dirty {
 		return false, false
 	}
-	return true, o.saveLocked(false) != nil
+	return true, consentSaveFailedDurably(o.saveLocked(false))
 }
 
 // takeEvicted drains the cap-eviction count for Stats.ConsentOutboxEvicted.
@@ -1230,17 +1250,32 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 				return true
 			}
 			if recordRead == consentRecordReadForeign {
-				// A foreign record is a tombstone for anything it may have
-				// overwritten — but only for what came BEFORE it. A receipt
-				// strictly newer than the foreign record's own stamp was
-				// created after that scope switch completed, so it cannot be
-				// the thing the switch destroyed. Vetoing it unconditionally
-				// strands a fresh grant whose receipt landed durably and
-				// whose record write was lost to a crash: consent stays
-				// unknown and the receipt never dispatches until the host
-				// decides again. An unstamped foreign record still vetoes
-				// everything, by the same infinitely-new rule the mark uses.
-				return !consentDecisionSupersedes(tail.DecidedAt, record.decidedAt)
+				// A foreign record vetoes a grant UNCONDITIONALLY, and the
+				// timestamp exception an earlier revision put here is
+				// withdrawn.
+				//
+				// That exception let a receipt "strictly newer than the
+				// foreign record" through, on the reasoning that it must
+				// postdate the scope switch. The ordering is not sound
+				// across a switch: both stamps come from the DEVICE clock,
+				// a backward jump is ordinary, and the intervening client —
+				// which may have the floor disabled — writes consent.json
+				// with its current clock without seeding from the retained
+				// trail. A pre-switch grant can therefore compare newer and
+				// heal over the tombstone.
+				//
+				// The mark can afford a wall-clock comparison because a
+				// wrong answer there STICKS (the safe direction). Here a
+				// wrong answer ADMITS, so the same imprecision is not
+				// affordable. Nothing in this SDK's receipt carries causal
+				// or generation information, and adding it would change what
+				// is POSTed — out of proportion to the liveness it buys.
+				//
+				// The cost is named rather than hidden: a fresh grant whose
+				// receipt landed durably and whose record write was lost to
+				// a crash stays withheld until the host records a decision
+				// again. That is a decision deferred, not lost.
+				return true
 			}
 			// The MARK is an ordering question, not a veto. A receipt
 			// strictly newer than the stamp is provably a decision the mark
