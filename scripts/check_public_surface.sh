@@ -560,6 +560,30 @@ scan_tree() {
     # costs nothing while the answer is zero and becomes a deliberate decision
     # the day it stops being zero. Deciding then means adding OCR or an
     # explicit exception, not discovering the hole afterwards.
+    # ⚠ AN IMAGE IS REFUSED BY ITS NAME, NOT ONLY BY ITS FIRST BYTES. XPM alone
+    # has four valid headers — C source, natural XPM2, XPM1 `#define`, and XPM2
+    # Lisp — and two of them are ordinary text a magic test cannot claim
+    # without refusing C headers and shell comments as well. Enumerating header
+    # spellings is the losing shape; the extension is what someone writes when
+    # they commit a picture without thinking, which is the case this gate is
+    # for. Measured: ZERO tracked files carry any of these extensions in either
+    # tree today.
+    #
+    # The magic tests stay for a file that lies about its extension. What
+    # neither catches is an image whose extension AND first bytes are both
+    # innocent — stated, not solved.
+    case "$f" in
+      *.png|*.jpg|*.jpeg|*.gif|*.webp|*.bmp|*.tif|*.tiff|*.ico|*.svg|*.xpm|\
+      *.xbm|*.ppm|*.pgm|*.pbm|*.pnm|*.pcx|*.tga|*.psd|*.ai|*.eps|*.heic|\
+      *.heif|*.avif)
+        # refusal:hazard
+        echo "REFUSING: '$f' is an image, and this gate reads files as text." >&2
+        echo "  Pixels are not searchable prose: an identifier drawn in a" >&2
+        echo "  picture reads as clean bytes and discloses on the page." >&2
+        echo "  Remove it, or extend this gate to read images deliberately." >&2
+        exit 2
+        ;;
+    esac
     magic4="$(od -An -tx1 -N4 "$blob" 2>/dev/null | tr -d ' \n')"
     # The BINARY headers, which cannot be a string constant in readable source
     # and so apply to every file, and the PRINTABLE ones, which can and do not.
