@@ -339,7 +339,7 @@ fi
 # the classes, so they are written plainly.
 GATE_DATA_NAMES='ROSTER KNOWN_INTERNAL KNOWN_INNOCENT FIXTURE_ACCENT_BODY FIXTURE_ACCENT_NAME FIXTURE_BINARY_BODY FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY FIXTURE_DIRTY_NAME FIXTURE_EMPHASIS_BODY FIXTURE_EMPHASIS_NAME FIXTURE_ESCAPE_BODY FIXTURE_ESCAPE_NAME FIXTURE_FLAG_BODY FIXTURE_FLAG_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY FIXTURE_NAMEHIT_NAME'
 
-PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not| never) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (exists?|existed|remains?|remained|runs?|ran|covers?|covered|exercises?|exercised|guards?|guarded))?( (for|of|in)|[.,;]|$)|[Tt]here (is|are)(n.{1,3}t| not) (any |no )?(harness|harnesses|coverage|tests?|suites?)|[Tt]here (is|are) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?)|(has|have|had) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Nn]obody (looks|checks|monitors)|[Ll]acks( any| automated| an?)* ?[A-Za-z-]*[ ]?(harness|harnesses|coverage|tests?|suites?|monitoring)|(has|have|had)(n.{1,3}t| not| never) been (tested|covered|scanned|audited|monitored)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
+PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not| never) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (exists?|existed|remains?|remained|runs?|ran|covers?|covered|exercises?|exercised|guards?|guarded))?( (for|of|in)|[.,;]|$)|[Tt]here (is|are)(n.{1,3}t| not) (any |no )?(harness|harnesses|coverage|tests?|suites?)|[Tt]here (is|are) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?)|(has|have|had) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|without( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Nn]obody (looks|checks|monitors)|[Ll]acks( any| automated| an?)* ?[A-Za-z-]*[ ]?(harness|harnesses|coverage|tests?|suites?|monitoring)|(has|have|had)(n.{1,3}t| not| never) been (tested|covered|scanned|audited|monitored)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 ROSTER='analytic[]s-service
 contro[]l-plane'
 KNOWN_INTERNAL='per ADR-[]0000 §[]000
@@ -368,6 +368,8 @@ The console has never b[]een audited.
 The crash path was neve[]r tested.
 There are []zero tests for the payment parser.
 The payment parser has zero t[]ests.
+The parser ships without t[]ests.
+The crash path is released without automated c[]overage.
 There aren'"'"'[][]t any tests for the payment parser.'
 KNOWN_INNOCENT='go get github.com/shardpilot/shardpilot-go@v0.6.0-alpha
 IngestURL: os.Getenv("SHARDPILOT_INGEST_URL")
@@ -380,6 +382,7 @@ the event plane and the consent plane are separate
 an analytics-plane request, zero event batches
 No tests fail in CI.
 The suite has zero test failures.
+The parser runs without test failures in CI.
 Every test suite runs on both toolchains.'
 FIXTURE_ACCENT_BODY='internal: contro[]l-plane'
 FIXTURE_ACCENT_NAME='café.md'
@@ -668,13 +671,29 @@ scan_tree() {
     # innocent — stated, not solved.
     case "$flc" in
       *.png|*.jpg|*.jpeg|*.gif|*.webp|*.bmp|*.tif|*.tiff|*.ico|*.svg|*.xpm|\
-      *.xbm|*.ppm|*.pgm|*.pbm|*.pnm|*.pcx|*.tga|*.psd|*.ai|*.eps|*.heic|\
+      *.xbm|*.ppm|*.pgm|*.pbm|*.pnm|*.pam|*.pcx|*.tga|*.psd|*.ai|*.eps|*.heic|\
       *.heif|*.avif)
         # refusal:hazard
         echo "REFUSING: '$f' is an image, and this gate reads files as text." >&2
         echo "  Pixels are not searchable prose: an identifier drawn in a" >&2
         echo "  picture reads as clean bytes and discloses on the page." >&2
         echo "  Remove it, or extend this gate to read images deliberately." >&2
+        exit 2
+        ;;
+    esac
+    # ⚠ THE ONE COMPRESSED FORMAT WITH NO SIGNATURE TO FIND. Every other
+    # container here is caught by bytes searched anywhere in the file; a Brotli
+    # stream has no header at all, so an extension is the only handle there is.
+    # In practice such a blob carries NUL bytes and is refused as binary before
+    # this, but "in practice" is not a rule, and this one costs three lines.
+    # Measured: zero tracked files carry it in either tree today.
+    case "$flc" in
+      *.br)
+        # refusal:hazard
+        echo "REFUSING: '$f' is a Brotli stream, and this gate reads files as text." >&2
+        echo "  No pass here decompresses it, so a clean result would say nothing" >&2
+        echo "  about what it carries. Remove it, or extend this gate to walk" >&2
+        echo "  containers deliberately." >&2
         exit 2
         ;;
     esac
@@ -706,20 +725,24 @@ scan_tree() {
           3761|3961) magic_hit="$printable_sigs" ;;
           *)         magic_hit=no ;;
         esac ;;
-      # ⚠ `RIFF` IS ALSO A WORD. A real one carries a four-character form type
-      # at offset 8 — upper-case letters or spaces; a sentence about the format
-      # has lower-case prose there.
+      # ⚠ `RIFF` IS ALSO A WORD, AND A SENTENCE ABOUT THE FORMAT CAN CARRY AN
+      # UPPER-CASE FOURCC: `RIFF is WEBP format` puts `WEBP` at offset 8
+      # exactly where a real one does. A form type is a guess; the SIZE FIELD
+      # is the format's own invariant — bytes 4..7 count the bytes that follow
+      # them, so a container agrees with its own length and prose does not.
+      #
+      # A real container whose size field is wrong (a truncated download) is
+      # missed by this, and the extension list above is what carries that case.
       52494646)
-        magic_fourcc=ok
-        for magic_i in 16 18 20 22; do
-          case "${magic16:$magic_i:2}" in
-            20|4[0-9a-f]|5[0-9a]) : ;;
-            *) magic_fourcc=no ;;
-          esac
-        done
-        case "$magic_fourcc" in
-          ok) magic_hit="$printable_sigs" ;;
-          *)  magic_hit=no ;;
+        magic_riff=no
+        if [ ${#magic16} -ge 32 ]; then
+          riff_declared=$(( 16#${magic16:14:2}${magic16:12:2}${magic16:10:2}${magic16:8:2} ))
+          riff_actual=$(( $(wc -c < "$blob") - 8 ))
+          if [ "$riff_declared" -eq "$riff_actual" ]; then magic_riff=yes; fi
+        fi
+        case "$magic_riff" in
+          yes) magic_hit="$printable_sigs" ;;
+          *)   magic_hit=no ;;
         esac ;;
       # An executable carries a NUL inside its first 64 bytes. Prose opening
       # `MZ` does not. Read BYTE-ALIGNED: `00` also spans two neighbouring
@@ -759,8 +782,27 @@ scan_tree() {
       # prose, which is the expensive direction for a gate that blocks merges.
       503[1-6]*)
         case "${magic16:4:2}" in
-          09|0a|0d|20) magic_hit="$printable_sigs" ;;
-          *)           magic_hit=no ;;
+          09|0a|0d|20)
+            # ⚠ AND THE DIMENSIONS MUST FOLLOW. `P1 planning notes` satisfies
+            # the delimiter and is a note, not a raster: a Netpbm header
+            # continues with an ASCII decimal width. The first non-blank byte
+            # after the delimiter decides. (A header comment between the two is
+            # legal and is not handled — a picture committed by accident does
+            # not carry one, and the extension list above is what covers the
+            # one that does.)
+            magic_np=no
+            for magic_i in 6 8 10 12 14 16 18 20 22 24 26 28 30; do
+              case "${magic16:$magic_i:2}" in
+                09|0a|0d|20) continue ;;
+                3[0-9])      magic_np=yes ;;
+              esac
+              break
+            done
+            case "$magic_np" in
+              yes) magic_hit="$printable_sigs" ;;
+              *)   magic_hit=no ;;
+            esac ;;
+          *) magic_hit=no ;;
         esac ;;
       *) magic_hit=no ;;
     esac
@@ -860,32 +902,41 @@ scan_tree() {
         # ⚠ EMPHASIS SPLITS A TOKEN ON THE PAGE AND NOT IN THE BYTES: an
         # identifier written with its digits bolded renders contiguously and
         # matches nothing. Measured against the publishing surface itself:
-        # asterisk emphasis, UNDERSCORE emphasis and a backslash escape each
-        # render one contiguous identifier.
+        # asterisk emphasis, underscore emphasis, a code span and a backslash
+        # escape each render one contiguous identifier.
         #
-        # ⚠ UNDERSCORES ONLY WHERE THEY FLANK. The feature-flag class is built
-        # from underscores and deleting them all would destroy the one class
-        # that needs them — but the surface does not emphasise an underscore
-        # between two word characters either, so the two rules coincide: a run
-        # is removed only where a non-word character sits outside it. Measured:
-        # a flag name renders with every separator intact.
+        # ⚠ A MARKER IS ONLY EMPHASIS WHEN IT IS PAIRED, and deleting every one
+        # of them INVENTED identifiers the page never showed: `ADR-*1234` with
+        # a single unmatched asterisk renders WITH the asterisk — measured —
+        # and was refused as though it did not. Each rule now needs an opening
+        # run and a closing run, which is also what the surface needs.
         #
-        # ⚠ EMPHASIS IS STRIPPED BEFORE THE ESCAPE IS DECODED, not after. The
-        # other order turned `ADR-\*1234` — which renders WITH the asterisk and
-        # is therefore clean prose — into a refusal, by decoding the escape and
-        # then deleting the character the escape existed to keep.
+        # ⚠ THE RUN IS ONE TO THREE. `___1234___` is bold-italic and renders
+        # contiguously; a rule written for one or two markers walked past it.
+        #
+        # ⚠ UNDERSCORES ALSO NEED A BOUNDARY, ASTERISKS DO NOT. The surface
+        # does not emphasise an underscore between two word characters, which
+        # is the same rule that keeps the feature-flag class intact — measured:
+        # a flag name renders with every separator in place. Asterisks emphasise
+        # anywhere, so requiring a boundary there would open a hole.
+        #
+        # ⚠ MARKERS ARE STRIPPED BEFORE THE ESCAPE IS DECODED, not after. The
+        # other order turned `ADR-\*1234` — clean prose, which renders WITH the
+        # asterisk — into a refusal, by decoding the escape and then deleting
+        # the character the escape existed to keep.
         #
         # Written in BASIC regex on purpose: `-E` applies to every script in
         # the same sed, and these substitutions are BRE. Reaching for it broke
         # them and the gate refused the whole file.
         #
-        # The underscore substitution runs TWICE: `g` resumes after the
-        # boundary character it consumed, so two emphasised runs separated by a
-        # single space leave the second one standing on the first pass.
-        if sed -e 's/[*`]//g' \
+        # The underscore substitution runs TWICE: it consumes the boundary
+        # character on each side, so `g` resumes past the opening boundary of a
+        # second run and leaves it standing on the first pass.
+        if sed -e 's/\*\{1,3\}\([^* ][^*]*\)\*\{1,3\}/\1/g' \
+               -e 's/`\{1,3\}\([^` ][^`]*\)`\{1,3\}/\1/g' \
                -e 's/^/ /' -e 's/$/ /' \
-               -e 's/\([^A-Za-z0-9_]\)_\{1,2\}\([^_ ][^_]*\)_\{1,2\}\([^A-Za-z0-9_]\)/\1\2\3/g' \
-               -e 's/\([^A-Za-z0-9_]\)_\{1,2\}\([^_ ][^_]*\)_\{1,2\}\([^A-Za-z0-9_]\)/\1\2\3/g' \
+               -e 's/\([^A-Za-z0-9_]\)_\{1,3\}\([^_ ][^_]*\)_\{1,3\}\([^A-Za-z0-9_]\)/\1\2\3/g' \
+               -e 's/\([^A-Za-z0-9_]\)_\{1,3\}\([^_ ][^_]*\)_\{1,3\}\([^A-Za-z0-9_]\)/\1\2\3/g' \
                -e 's/^ //' -e 's/ $//' \
                -e 's/\\\([^A-Za-z0-9]\)/\1/g' "$blob" > "$md_blob"; then
           cat "$md_blob" > "$blob"
@@ -1025,7 +1076,13 @@ roster_is_present_in_the_tree() {
   gate_tmp; found="$GATE_TMP"
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
-    git grep --cached -l -F -- "$lit" -- . $GATE_EXCLUDES > "$found" 2>/dev/null || :
+    # ⚠ CASE-INSENSITIVELY, BECAUSE THE SCAN THAT USES THIS ROSTER IS. The
+    # matcher runs `grep -qiE`, so a name capitalised anywhere in the tree is
+    # still caught — but a case-SENSITIVE presence lookup would find none of
+    # those occurrences and refuse a clean tree for a literal it is scanning
+    # for perfectly well. Same defect as the repository lookup below, and it
+    # was left here once already on the argument that both halves agreed.
+    git grep --cached -l -iF -- "$lit" -- . $GATE_EXCLUDES > "$found" 2>/dev/null || :
     if [ ! -s "$found" ]; then
       printf 'ROSTER VIOLATION: %s appears nowhere in this tree except this file.\n' "$lit" >&2
       novel=$((novel + 1))
