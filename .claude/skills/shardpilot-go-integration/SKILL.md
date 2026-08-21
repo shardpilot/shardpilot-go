@@ -5,9 +5,22 @@ description: Use when integrating the ShardPilot Go SDK (shardpilot-go) into a G
 
 # Integrating the ShardPilot Go SDK
 
-This skill describes the SDK exactly as shipped in the
-pinned release tag `v0.6.0-alpha`. Every behavioral claim below was verified
-against that tag's source. Where the SDK does not have a capability, this
+This skill is written against `main`, which is AHEAD of it.
+The pinned release tag `v0.6.1-alpha` is what an install actually gets. That tag is `v0.6.0-alpha` with two internal
+agent skills deleted and no Go source difference between them, so behavioural
+claims verified against `v0.6.0-alpha`'s source hold at the pin — **except for
+the behaviours listed here, marked *(unreleased)* where they appear below**:
+`Config.DisableRequestCompression`, which does not exist at the tag; the
+15-second `FlushInterval` default, which is 1 second there; the goroutine-label
+fix, without which a `runtime/pprof` label containing `]` can reach
+`Thread.Name` in a crash payload on Go 1.27+; and the independent
+pacing of the FIRST retry — at the tag `backoffCeiling(1)` returns 0, so a first
+failure without a `Retry-After` hint waits for the next flush tick rather than
+its own jittered delay — and the rest of the retry-clock work with it: the tag
+has no `nextPacingWake`, so a consent-retry deadline that elapsed while the
+worker was busy, a deadline armed by a concurrent synchronous `Track` after the
+worker had parked, and spool entries reloaded at startup all wait for the flush
+tick there rather than their own clock. Everything else describes the pinned release. Where the SDK does not have a capability, this
 skill says so — do not invent config fields, endpoints, or behaviors beyond
 what is documented here.
 
@@ -58,20 +71,23 @@ other calls, no automatic actions.
 ## Install
 
 ```bash
-go get github.com/shardpilot/shardpilot-go@v0.6.0-alpha
+go get github.com/shardpilot/shardpilot-go@v0.6.1-alpha
 ```
 
-- Requires **Go 1.24+**.
+- Requires **Go 1.24+** at the pinned tag. *(unreleased — `main` declares `go 1.25.0`, so a checkout of `main` needs **Go 1.25+**; the pin above is what 1.24 buys you.)*
 - Two import paths:
   - `github.com/shardpilot/shardpilot-go` — analytics (package `shardpilot`);
   - `github.com/shardpilot/shardpilot-go/pkg/crash` — crash reporting
     (package `crash`).
-- **`v0.1.0` is retracted** in `go.mod`; never pin it. Older usable pins
-  (`v0.5.0-alpha`, `v0.4.0-alpha`, `v0.3.0-alpha`, `v0.2.0-alpha`, `v0.1.2`) ship
-  progressively less surface — prefer the pin above.
-- Pre-launch: there is no public production ingest endpoint yet. `IngestURL`
-  is the base URL of the ShardPilot deployment you were given (or a local
-  stack). HTTPS is required outside localhost/loopback. The **analytics
+- **`v0.1.0` is retracted** in `go.mod`; never pin it. **Do not reach back to an
+  earlier tag at all**, and do not offer one as a fallback. `v0.5.0-alpha` and
+  `v0.6.0-alpha` distribute eight internal agent-skill files through `go get`;
+  `v0.6.1-alpha` is the deletion-only patch that removes them, and no Go source
+  differs between the two. `v0.4.0-alpha` and below predate those files, but
+  they also predate most of what this skill documents. If you need a release
+  without the features described here, wait for one cut from the cleaned tree.
+- `IngestURL` is the base URL of the ShardPilot ingest deployment you were
+  given, or of a local stack you run yourself. HTTPS is required outside localhost/loopback. The **analytics
   client only** can opt into private-network HTTP via
   `Config.AllowInsecurePrivateNetwork`, and only for private (RFC1918) **IP
   literals** — the SDK never resolves DNS names, so an internal hostname
@@ -161,10 +177,14 @@ and non-HTTPS URLs outside localhost/loopback (plain HTTP to a private
 RFC1918 **IP literal** only, via `AllowInsecurePrivateNetwork` — hostnames
 are never resolved). Optional tuning: `BatchSize` (default 25, max
 100), `BufferSize` (async queue capacity, default 1000), `FlushInterval`
-(default 15s — the longest a PARTIAL batch waits before it is published, not
+(default 15s *(unreleased — 1s at `v0.6.1-alpha`)* — the longest a PARTIAL batch waits before it is published, not
 a heartbeat: an empty batch publishes nothing, so an otherwise-silent process
 makes no requests at any value. A full `BatchSize` publishes immediately,
-`Flush()` publishes on demand, and retry pacing runs on its own clock),
+`Flush()` publishes on demand, and retry pacing runs on its own clock
+*(partly unreleased — at `v0.6.1-alpha` `backoffCeiling(1)` is 0 and
+`nextPacingWake` does not exist, so the FIRST failure, an elapsed consent-retry
+deadline, a deadline armed by a concurrent `Track`, and spool entries reloaded
+at startup all wait for the flush tick)*),
 `HTTPTimeout` (default 2s), `Logger`, `UserID`/`AnonymousID`
 (default actor identity), `OnBatchResult` (see verification), the
 remote-config fields (`RemoteConfigURL` + `APIKey` +
@@ -173,6 +193,10 @@ remote-config fields (`RemoteConfigURL` + `APIKey` +
 "Offline behavior / spool"), `SchemaRevision` /
 `DisableSchemaRevision` (see the facts list below), and
 `DisableRequestCompression`. The SDK itself reads no environment variables.
+
+*(This whole subsection is unreleased: `v0.6.1-alpha` has no gzip path at all —
+zero `gzip` references in `client.go` at the tag — so at the pin every body is
+sent uncompressed.)*
 
 **Request bodies over 1 KiB are gzip-compressed by default** — batch
 publishes and consent writes both. A batch body is the same envelope keys
@@ -197,7 +221,8 @@ Two things follow that matter when you integrate:
   `unsupported_content_encoding`, and the client latches compression off for
   the rest of the process and re-sends the same batch uncompressed. The cost
   of pointing a new SDK at an older server is one round-trip, not lost data.
-  Set `DisableRequestCompression: true` to skip even that.
+  Set `DisableRequestCompression: true` to skip even that. *(unreleased — this
+  field does not exist at `v0.6.1-alpha`.)*
 
 ## Consent model — READ THIS FIRST, IT IS INVERTED
 
@@ -307,7 +332,7 @@ Facts that keep integrations correct:
   a batch that failed retryably (429/5xx or transport error) and retries it,
   honoring the server's `Retry-After` hint; a retryable failure **without** a
   hint paces itself with full-jitter exponential backoff on its OWN clock,
-  independent of `FlushInterval` (every failure — the first included — waits
+  independent of `FlushInterval` (every failure — the first included *(partly unreleased — at `v0.6.1-alpha` `backoffCeiling(1)` is 0 and there is no `nextPacingWake`, so the first hintless failure, an elapsed consent-retry deadline, a deadline armed by a concurrent `Track`, and startup-reloaded spool entries all wait for the flush tick instead)* — waits
   at least 1s, with the ceiling doubling from the third consecutive failure
   up to 60s, reset on success). With
   `SpoolDir` set such batches also spool to disk as crash insurance (see
@@ -367,7 +392,7 @@ speed := client.RemoteConfigNumber("scroll_speed", 1.0)
   clears the config cache — configuration is client-public tuning, not
   telemetry. `RemoteConfigCachePath` works without `SpoolDir` and never
   enables consent persistence.
-- **Targeting attributes are dark and opt-in (ADR-0310)** — and, unlike the
+- **Targeting attributes are dark and opt-in** — and, unlike the
   fetch itself, granted-only: `RemoteConfigAttributesEnabled: true` plus
   `SetRemoteConfigAttributes(map[string]string)` makes fetches carry the
   experiment attribute vocabulary (`geo`, `app_version`, `device_type`,
@@ -423,12 +448,12 @@ crashClient, err := crash.NewClient(crash.ClientOptions{
   crash ingest is API-key authenticated, so a client-asserted account id is
   unverified and never becomes the actor key. A malformed value drops the
   field, never the report.
-- **Two auto-capture opt-ins, both DARK by default** (ADR-0297 §7d — while off
-  the auto-captured wire shape is byte-identical, and manual `Emit`/`EmitFatal`
-  events are never touched by either). Both carry the same Phase-D arming
-  order (§12): enable them only after this SDK's client-side consent gate and
-  durable spool are in place — new capture detail must not ship ahead of
-  consent parity:
+- **Two auto-capture opt-ins, both DARK by default** (while off the
+  auto-captured wire shape is byte-identical, and manual `Emit`/`EmitFatal`
+  events are never touched by either). Both carry the same arming order:
+  enable them only after this SDK's client-side consent gate and durable
+  spool are in place — new capture detail must not ship ahead of consent
+  parity:
   - `ClientOptions.DebugIDFillEnabled` attaches the RUNNING BINARY's identity as
     the event's single `modules[]` entry — base name plus a debug id read from
     the binary (ELF GNU build-id as lowercase hex, the identity `dump_syms`
@@ -437,7 +462,9 @@ crashClient, err := crash.NewClient(crash.ClientOptions{
     `NewClient`; on a non-ELF platform, an unreadable binary or one with no
     usable id the fill is skipped and capture proceeds unchanged (reported
     through `ClientOptions.Logger` when one is configured).
-  - `ClientOptions.AllGoroutineCaptureEnabled` snapshots every goroutine at
+  - `ClientOptions.AllGoroutineCaptureEnabled` *(the goroutine-label fix is
+    unreleased — at `v0.6.1-alpha` a `runtime/pprof` label containing `]` can
+    reach `Thread.Name`)* snapshots every goroutine at
     panic time as additional pre-symbolicated `threads[]`, each named by
     goroutine id with its scheduler state. Bounded: 64 threads, 256 total
     frames, at most 16 frames per non-crashing goroutine.
@@ -588,8 +615,8 @@ them:
   happens server-side only. Since `v0.6.0-alpha` there IS an experiment-assignment
   consumer (`Config.ExperimentsEnabled`) and an attribute pass-through
   (`Config.RemoteConfigAttributesEnabled`), but both are DARK: default `false`,
-  and with the platform's experimentation flags off in every environment an
-  enabled consumer receives 403 on every fetch — that applies to the
+  and until server-side enablement is done for your workspace an enabled
+  consumer receives 403 on every fetch — that applies to the
   EXPERIMENT lane; `RemoteConfigAttributesEnabled` alone still uses the ordinary
   remote-config fetch and is not affected. Do not design an integration around
   the experiment surface yet.

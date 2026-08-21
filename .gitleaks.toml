@@ -1,0 +1,40 @@
+# gitleaks configuration for shardpilot-go.
+#
+# ⚠ NO `paths` CLAUSE ANYWHERE IN THIS FILE, AND THAT IS THE WHOLE DESIGN.
+# Measured against gitleaks v8.30.1 by planting a realistic AWS key into an
+# allowlisted file:
+#
+#   allowlist with `paths` + `regexes`, condition = "AND"   -> planted key MISSED
+#   allowlist with `regexes` only                            -> planted key CAUGHT
+#
+# `condition = "AND"` does not narrow it: a `paths` entry excuses the whole
+# file regardless, so every allowlisted path becomes a place a real secret can
+# be committed unseen. Since the files needing exceptions here are TEST files —
+# exactly where a careless credential is most likely to be pasted — that is the
+# worst possible blind spot.
+#
+# So exceptions name the LITERAL and nothing else. Wider in one direction (the
+# literal is excused wherever it appears) and far narrower in the one that
+# matters (no file stops being scanned).
+#
+# ⚠ AND THE PROBE MATTERS. The first attempt planted `AKIAIOSFODNN7EXAMPLE`,
+# AWS's canonical documentation key, which gitleaks allowlists by default — it
+# reported MISSED under every configuration and would have condemned the
+# correct one. Mutation-test with a key that is not already excused upstream.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = """
+A JWT-SHAPED string built by the crash-symbol sanitiser's own test. Its payload
+is base64 for {"sub":"test"}; the test asserts that this exact shape does NOT
+survive sanitisation, so it would be pointless with anything else.
+
+UUIDv7 actor identifiers used as test constants. An anonymous id is a
+pseudonymous actor key, not a credential — it authenticates nothing — and both
+are visibly synthetic (the second ends in twelve f's).
+"""
+regexes = [
+  '''header\.eyJzdWIiOiJ0ZXN0In0\.signature''',
+  '''0198f2c1-4b3a-7c2d-8e9f-[0-9a-f]{12}''',
+]
