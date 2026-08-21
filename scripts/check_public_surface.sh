@@ -12,11 +12,17 @@
 # exposure already exists is the fix.
 #
 # ── ONE CLASS IS NOT ABOUT NAMES AT ALL ─────────────────────────────────────
-# NEGATIVE STATEMENTS ABOUT COVERAGE. "There is NO Playwright harness in the
-# console repo" names no service, no host and no credential, and it was the
-# single most valuable line in the material this gate was built after. It is
-# a published map of where our testing does not reach — an outsider does not
-# need a secret if they are told where nobody is looking.
+# NEGATIVE STATEMENTS ABOUT COVERAGE. A sentence naming a test tool, a
+# repository, and the fact that the one does not exist in the other. It names
+# no service, no host and no credential, and it was the single most valuable
+# line in the material this gate was built after: a published map of where our
+# testing does not reach. An outsider does not need a secret if they are told
+# where nobody is looking.
+#
+# The example is described rather than quoted, and that is not fastidiousness —
+# the first version of this paragraph reproduced the sentence verbatim, so the
+# file explaining why such a sentence must not be published was publishing one.
+# It went unseen while this file exempted itself from its own scan.
 #
 # Deleting the file that carried it is not enough, because the next such
 # sentence will be written in good faith by someone documenting an honest
@@ -39,8 +45,8 @@
 # THREE SHAPES WERE TRIED AND WITHDRAWN, because a gate that cries wolf gets
 # silenced, and a silenced gate is the one that misses the real thing:
 #   `-plane`     — this SDK's own vocabulary says event plane, consent plane,
-#                  analytics plane. Narrowed to `control-plane`, the one that
-#                  is a service.
+#                  analytics plane. Narrowed to the single `-plane` name that
+#                  is a service rather than a concept; it is in ROSTER above.
 #   `-platform`  — fired on "per-platform" and "cross-platform". Dropped; the
 #                  only internal `-platform` name appears in zero commits here.
 #   `-service`   — fired on "self-service". Replaced by the two service names
@@ -112,6 +118,7 @@ cd "$(dirname "$0")/.."
 # stated: a name removed here stops being gated at PR time, and until the
 # org-wide check covers already-public repositories it is caught by review or
 # not at all.
+# gate-self-exempt:begin definitions
 ROSTER='analytics-service
 control-plane'
 
@@ -137,8 +144,32 @@ ROSTER_RE="$(roster_regex)"
 PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are) not (tested|covered|scanned|audited|monitored)|[Nn]o (automated )?(tests?|coverage|scanning|monitoring) (for|of|in)|[Nn]obody (looks|checks|monitors)|[Ll]acks( any| automated| an?)* ?[A-Za-z-]*[ ]?(harness|harnesses|coverage|tests?|suites?|monitoring)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 
 # Files the gate must not read as content: this script is the one place the
-# patterns are written down, by construction.
-is_exempt() { [ "$1" = "scripts/check_public_surface.sh" ]; }
+# patterns are written down, by construction.# gate-self-exempt:end
+
+# ⚠ THIS FILE IS SCANNED TOO, with only two regions removed first.
+#
+# It used to exempt itself entirely, and that exemption is where every one of
+# this file's own disclosures hid: a paragraph naming two internal repositories
+# while announcing their removal, a live decision-record id in a fixture, and a
+# published statement of where our testing does not reach. Each was found by a
+# reviewer rather than by the gate, because the gate could not read its own
+# prose. Two bespoke checks were bolted on for two of those shapes, and the
+# rest stayed unreadable — `tracked as GAP-777 internally` in a comment here
+# passed the whole gate.
+#
+# So the exemption is now the SMALLEST thing that cannot be scanned: the
+# pattern definitions and the synthetic fixture corpus, both delimited by
+# `gate-self-exempt` markers below. They match by construction; every other
+# line of this file is ordinary published prose and is treated as such. That
+# also retires the two bespoke passes, because the real classes now cover
+# what they covered.
+self_scan_body() {
+  awk '
+    /^# gate-self-exempt:begin/ { skip = 1 }
+    { if (!skip) print; else print "" }
+    /^# gate-self-exempt:end/   { skip = 0 }
+  ' "$1"
+}
 
 # ---------------------------------------------------------------------------
 # scan_tree <root> — runs the REAL scan over one checkout and sets the globals
@@ -184,7 +215,6 @@ scan_tree() {
   fi
 
   while IFS= read -r -d '' f; do
-    is_exempt "$f" && continue
     # THE PATH ITSELF IS PUBLISHED CONTENT. An internal identifier in a file
     # NAME — a decision-record id, a ticket, a service name in a directory —
     # reaches every consumer and appears in no file's body, so scanning only
@@ -258,7 +288,16 @@ scan_tree() {
     # "${PIPESTATUS[0]}"` carries GREP's status out, because the status of the
     # assignment itself would be tr's and tr always succeeds.
     set +e
-    hits="$(grep -anE -- "$PATTERNS" "$root/$f" 2>/dev/null \
+    # This file is read with its definition and fixture regions blanked out;
+    # every other file is read as-is. `self_scan_body` preserves line numbering
+    # by emitting an empty line per removed line, so reported line numbers stay
+    # true to the file on disk.
+    if [ "$f" = "scripts/check_public_surface.sh" ]; then
+      scan_src="$(mktemp)"; self_scan_body "$root/$f" > "$scan_src"
+    else
+      scan_src="$root/$f"
+    fi
+    hits="$(grep -anE -- "$PATTERNS" "$scan_src" 2>/dev/null \
       | tr -d '\000'; exit "${PIPESTATUS[0]}")"
     status=$?
     # THE ROSTER, in its own pass because it is the one class matched
@@ -267,7 +306,7 @@ scan_tree() {
     # shape pass
     # would make `[Tt]here is` and the ALLCAPS flag class match prose they
     # were written to leave alone.
-    roster_hits="$(grep -aniE -- "$ROSTER_RE" "$root/$f" 2>/dev/null \
+    roster_hits="$(grep -aniE -- "$ROSTER_RE" "$scan_src" 2>/dev/null \
       | tr -d '\000'; exit "${PIPESTATUS[0]}")"
     roster_status=$?
     # ⚠ WHAT THIS DOES NOT SEE, stated because a green run gets read as more
@@ -286,6 +325,7 @@ scan_tree() {
         exit 2
       fi
     done
+    [ "$scan_src" = "$root/$f" ] || rm -f "$scan_src"
     if [ "$status" -ne 0 ] && [ "$roster_status" -ne 0 ]; then
       continue
     fi
@@ -326,6 +366,7 @@ scan_tree() {
 # roster the ROSTER rule above exists to bound. The earlier version used a live
 # ADR id, a live feature-flag name and a live ticket number, none of which the
 # test needed.
+# gate-self-exempt:begin fixtures
 KNOWN_INTERNAL='per ADR-0000 §3
 There are no Playwright tests for the console.
 There are no end-to-end tests for the purchase flow.
@@ -390,9 +431,14 @@ roster_is_present_in_the_tree() {
 $ROSTER
 EOF
 
-  # ⚠ THE SAME RULE, APPLIED TO THIS FILE'S OWN PROSE — because the scan
-  # exempts this file, and that exemption is exactly where the last one hid.
-  # A shape rather than a list, so it needs no roster of its own.
+  # ⚠ THESE TWO PASSES NOW COVER THE EXEMPT REGIONS, and only those. The main
+  # scan reads this file's prose like any other file's; what it cannot read is
+  # the pattern-definition and fixture blocks, which match by construction and
+  # are blanked out before scanning. So these are not a duplicate of the main
+  # scan — they are the part of this file the main scan is blind to, and both
+  # of this file's own past disclosures lived exactly there: two internal
+  # repository names in the ROSTER block, and a live decision-record id among
+  # the fixtures.
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
     git grep -l -F -- "$lit" -- . ':(exclude)scripts/check_public_surface.sh' > "$found" 2>/dev/null || :
