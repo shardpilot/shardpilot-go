@@ -171,7 +171,10 @@ cd "$(dirname "$0")/.."
 # Every temporary file this gate makes, removed on every exit path. They were
 # created in four places and removed in one, so a successful run left five
 # behind — including copies of staged repository content.
-GATE_TMPFILES=""
+# An ARRAY, because a temporary directory may contain whitespace: a
+# space-delimited list with an unquoted expansion would split one path into
+# several and remove neither.
+GATE_TMPFILES=()
 # ⚠ IT SETS A VARIABLE RATHER THAN PRINTING ONE. Called as `$(gate_tmp)` the
 # function would run in a subshell, so every path it recorded would be
 # discarded with that subshell and this trap would remove an empty list — a
@@ -179,10 +182,9 @@ GATE_TMPFILES=""
 # first, and the file count is what showed it.
 gate_tmp() {
   GATE_TMP="$(mktemp)" || return 1
-  GATE_TMPFILES="$GATE_TMPFILES $GATE_TMP"
+  GATE_TMPFILES+=("$GATE_TMP")
 }
-# shellcheck disable=SC2064
-trap 'rm -f $GATE_TMPFILES' EXIT
+trap 'rm -f "${GATE_TMPFILES[@]}"' EXIT
 
 CORPUS_PATH="$(dirname "$SELF")/gate-corpus.sh"
 if [ ! -f "$CORPUS_PATH" ]; then
@@ -393,7 +395,11 @@ eval "$corpus_dump"
 # behind a preamble is not a shape anyone here produces.
 CONTAINER_SIGS='\120\113\003\004 \120\113\005\006 \037\213\010'
 CONTAINER_SIGS="$CONTAINER_SIGS"' \375\067\172\130\132 \050\265\057\375'
-CONTAINER_SIGS="$CONTAINER_SIGS"' \102\132\150 \067\172\274\257'
+CONTAINER_SIGS="$CONTAINER_SIGS"' \102\132\150\061 \102\132\150\062'
+CONTAINER_SIGS="$CONTAINER_SIGS"' \102\132\150\063 \102\132\150\064'
+CONTAINER_SIGS="$CONTAINER_SIGS"' \102\132\150\065 \102\132\150\066'
+CONTAINER_SIGS="$CONTAINER_SIGS"' \102\132\150\067 \102\132\150\070'
+CONTAINER_SIGS="$CONTAINER_SIGS"' \102\132\150\071 \067\172\274\257'
 CONTAINER_SIGS="$CONTAINER_SIGS"' \122\141\162\041\032\007 \177\105\114\106'
 CONTAINER_SIGS="$CONTAINER_SIGS"' \045\120\104\106'
 
@@ -509,6 +515,7 @@ scan_tree() {
   # exiting 1 yields one scanned file and a green run.
   gate_tmp; list="$GATE_TMP"
   gate_tmp; blob="$GATE_TMP"
+  gate_tmp; md_blob="$GATE_TMP"
   if ! (cd "$root" && git ls-files -z) > "$list"; then
     rm -f "$list"
     echo "REFUSING: git ls-files failed in '$root'." >&2
@@ -583,6 +590,12 @@ scan_tree() {
     # by magic rather than by extension, because the extension is the part an
     # author controls.
     #
+    # ⚠ AND MARKUP RENDERS TEXT THAT IS NOT IN ITS BYTES. An SVG splitting an
+    # identifier across two elements draws it whole and contains no run
+    # matching anything here. XML, SVG and DOCTYPE-led files are refused by
+    # their first bytes — a refusal of those formats, not a claim to have
+    # solved rendered text, which the scope note states as a limit.
+    #
     # ⚠ AND AN ASCII RASTER CARRIES NO NUL AT ALL. XPM is printable C source
     # from its `/* X` header to its pixel array; Netpbm's P1 through P6 hold
     # their pixels as decimal text, so neither the NUL refusal nor a
@@ -599,7 +612,7 @@ scan_tree() {
     # explicit exception, not discovering the hole afterwards.
     case "$(od -An -tx1 -N4 "$blob" 2>/dev/null | tr -d ' \n')" in
       4d5a*|89504e47|ffd8ff*|47494638|52494646|424d*|49492a00|4d4d002a|\
-      5031*|5032*|5033*|5034*|5035*|5036*|2f2a2058)
+      5031*|5032*|5033*|5034*|5035*|5036*|2f2a2058|3c3f786d|3c737667|3c21444f)
         echo "REFUSING: '$f' begins with container magic (archive, PDF, executable" >&2
         echo "  or raster image)," >&2
         echo "  and this gate reads files as text. No pass here opens a container, so" >&2
@@ -707,6 +720,23 @@ scan_tree() {
     # "${PIPESTATUS[0]}"` carries GREP's status out, because the status of the
     # assignment itself would be tr's and tr always succeeds.
     set +e
+    # ⚠ MARKDOWN RENDERS A BACKSLASH ESCAPE AS THE CHARACTER ALONE, so an
+    # identifier whose hyphen is escaped is that identifier on the page and not
+    # in the bytes. DECODED rather than refused, unlike a character reference,
+    # for the reason the refusals give in reverse: escapes ARE present in these
+    # trees today — measured — so refusing them would reject prose doing
+    # nothing wrong. The substitution is per-line, so reported line numbers
+    # stay true to the file.
+    case "$f" in
+      *.md|*.markdown)
+        if sed 's/\\\([^A-Za-z0-9]\)/\1/g' "$blob" > "$md_blob"; then
+          cat "$md_blob" > "$blob"
+        else
+          echo "REFUSING: could not normalise Markdown escapes in '$f'." >&2
+          exit 2
+        fi
+        ;;
+    esac
     # The staged blob, so a reported line number is a line number in what a
     # commit would carry. For a path whose tree copy matches its index entry —
     # every path in a fresh checkout — that is the same file.
@@ -852,17 +882,23 @@ EOF
   # file its sole publisher and everything stayed green.
   #
   # Top-level alternatives are split on `|` outside brackets and groups, and
-  # each must carry a metacharacter that makes it a SHAPE — a character class,
-  # a quantifier or an escape. The disguises are REDUCED first, because each
-  # spelling of the same trick got past the previous version: parentheses with
-  # nothing to branch between are grouping and come off, and a one-character
-  # class is one character, and a backslash before an ordinary character is
-  # no-op syntax that grep discards, and an exact-count quantifier of one
-  # quantifies nothing — each was approved as proof of shape while grep
-  # reconstructed the plain name. Each reduction was written after a costume
-  # got through, which is why the rule below does not rely on this one alone,
-  # and why a single-word name is the case to watch: the hyphenated-run rule
-  # cannot see one, so only this test stands between it and the tree.
+  # each must contain a CHARACTER CLASS THAT CAN MATCH MORE THAN ONE CHARACTER,
+  # or a BRANCH. That is a whitelist of what makes a pattern a shape, and it
+  # replaced a blacklist of disguises that lost six times running: grouping
+  # with nothing to branch between, a one-character class, a backslash before
+  # an ordinary character, an exact-count quantifier of one, the same
+  # quantifier zero-padded, and a class listing one character twice. Each was
+  # approved as proof of shape while grep reconstructed the plain name, and
+  # each fix bought exactly one round.
+  #
+  # Asking for a real class or a branch ends that: a quantifier, an escape and
+  # a group are none of those things however they are spelled, and a class is
+  # COUNTED rather than merely seen — its distinct characters are expanded,
+  # ranges included, so a class of one character reduces to that character.
+  #
+  # The cost, stated: a structural pattern built only from escapes would be
+  # refused and must be written with a class instead. Every alternative in the
+  # list today satisfies this on its own.
   #
   # Names belong in the roster, which is checked against the tree.
   while IFS= read -r lit; do
@@ -871,14 +907,42 @@ EOF
     novel=$((novel + 1))
   done <<EOF
 $(printf '%s' "$PATTERNS" | awk '
+  function distinct(body,   j, ch, nx, set, k, cnt) {
+    delete set
+    j = 1
+    while (j <= length(body)) {
+      ch = substr(body, j, 1)
+      if (substr(body, j + 1, 1) == "-" && j + 2 <= length(body)) {
+        nx = substr(body, j + 2, 1)
+        if (ch != nx) return 2
+        set[ch] = 1; j += 3; continue
+      }
+      set[ch] = 1; j++
+    }
+    cnt = 0
+    for (k in set) cnt++
+    return cnt
+  }
+  function shrink(r,   out, i, ch, e, body) {
+    out = ""; i = 1
+    while (i <= length(r)) {
+      ch = substr(r, i, 1)
+      if (ch != "[") { out = out ch; i++; continue }
+      e = i + 1
+      if (substr(r, e, 1) == "^") e++
+      if (substr(r, e, 1) == "]") e++
+      while (e <= length(r) && substr(r, e, 1) != "]") e++
+      body = substr(r, i + 1, e - i - 1)
+      if (distinct(body) <= 1) out = out substr(body, 1, 1)
+      else out = out "[" body "]"
+      i = e + 1
+    }
+    return out
+  }
   function check(a,   r) {
     if (a == "") return
-    r = a
-    gsub(/\\([^bBwWsSdD<>])/, "\\1", r)
-    gsub(/\{1\}|\{1,1\}/, "", r)
-    if (index(r, "|") == 0) gsub(/[()]/, "", r)
-    gsub(/\[.\]/, "c", r)
-    if (r ~ /[][{}+*?\\|]/) return
+    r = shrink(a)
+    if (r ~ /[[|]/) return
     print a
   }
   {
@@ -1110,7 +1174,7 @@ EOF
   # Its own accumulator and its own trap: the subshell cannot add to the
   # parent's list, and clearing the inherited copy keeps its trap from removing
   # files the parent still needs.
-  ( GATE_TMPFILES=""; trap 'rm -f $GATE_TMPFILES' EXIT
+  ( GATE_TMPFILES=(); trap 'rm -f "${GATE_TMPFILES[@]}"' EXIT
     scan_tree "$nul_tmp" ) >/dev/null 2>&1 || nul_status=$?
   [ "$nul_status" -eq 2 ] || {
     echo "SELFTEST: a NUL-bearing tracked file was not refused" >&2; fixture_fail=1; }
