@@ -73,13 +73,20 @@
   The conclusion is DURABLE, because withholding a grant only in memory is
   undone by ordinary housekeeping: the trail can be pruned clean underneath
   it and the next start would promote the grant this one refused. A withheld
-  grant is marked `unwitnessed` on the decision RECORD, which is per-scope
-  (keyed by the actor digest). The placement is the point — the outbox file
-  is shared by every scope using a `SpoolDir`, so a mark kept there is
-  cleared by a fresh decision belonging to a different workspace, app or
-  actor, which supersedes nothing about this scope's unknown trail. A fresh
-  decision for THIS scope rewrites its record and clears the mark, which is
-  the way back.
+  grant is marked `unwitnessed` on the decision RECORD. A fresh decision for
+  THIS scope rewrites its record and clears the mark, which is the way back.
+
+  The record is NOT per-scope, and an earlier draft of this entry claimed it
+  was: `consent.json` is one file per `SpoolDir`, STAMPED with an actor
+  digest rather than keyed by one, and overwritten whole. So a sibling
+  scope's decision — a login that sets a `UserID`, a tenant switch, a second
+  app — erases this scope's mark, while that sibling's own merging outbox
+  save sanitizes the unreadable trail away at the same moment. Both
+  witnesses disappear together, and the refused grant would be promoted and
+  healed to disk. A record carrying a DIFFERENT digest is therefore treated
+  as its own tombstone: it records nothing about this scope, and it cannot
+  be ruled out that it replaced a mark, so a retained grant receipt is
+  refused beside it. Denials are unaffected.
 
   The mark is honoured at every point a grant is trusted, because guarding
   one path and not another guards nothing: a retained grant receipt cannot

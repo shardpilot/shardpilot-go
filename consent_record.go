@@ -168,6 +168,13 @@ const (
 	// not be understood. The decision it held is unknown, and it may have
 	// been a denial.
 	consentRecordReadUnusable
+	// consentRecordReadForeign: the file exists and is well-formed but
+	// carries a DIFFERENT actor digest. Nothing is recorded for THIS scope
+	// — and, crucially, that other scope's write DESTROYED whatever this
+	// scope had, because the record is one file per SpoolDir overwritten
+	// whole. So a foreign record is its own tombstone: it cannot be ruled
+	// out that it replaced an unwitnessed mark.
+	consentRecordReadForeign
 )
 
 // loadConsentRecordInfo is loadConsentRecord returning the record's full
@@ -225,10 +232,19 @@ func loadConsentRecordRead(dir, actorDigest string) (consentRecordInfo, bool, co
 		return none, false, consentRecordReadUnusable
 	}
 	if record.ActorDigest != actorDigest {
-		// A well-formed record for a DIFFERENT actor is not this scope's
-		// record and is not evidence about it — honestly absent, the shared
-		// SpoolDir case rather than a corruption case.
-		return none, false, consentRecordReadAbsent
+		// A well-formed record for a DIFFERENT actor records nothing about
+		// THIS scope — but it is not the same as no file at all, and an
+		// earlier revision of this code collapsed the two and said so in a
+		// comment that was wrong. consentRecordPath takes only the
+		// directory: it is ONE file per SpoolDir, stamped with a digest
+		// rather than keyed by one, and saveConsentRecord overwrites it
+		// whole. So a sibling scope's decision — a login that sets a
+		// UserID, a tenant switch, a second AppID — erases this scope's
+		// unwitnessed mark, and the same sibling's merging outbox save
+		// sanitizes the unreadable trail into a clean record. Both pieces
+		// of evidence vanish and the grant a previous start refused is
+		// promoted AND healed to disk. FOREIGN keeps the two apart.
+		return none, false, consentRecordReadForeign
 	}
 	info := consentRecordInfo{decidedAt: record.DecidedAt, floor: record.Floor, unwitnessed: record.Unwitnessed}
 	switch record.ConsentAnalytics {

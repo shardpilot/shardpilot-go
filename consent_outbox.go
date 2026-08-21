@@ -1164,6 +1164,7 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 			}
 			return c.consentOutbox.lastRead == consentOutboxReadUnusable ||
 				recordRead == consentRecordReadUnusable ||
+				recordRead == consentRecordReadForeign ||
 				record.unwitnessed
 		}
 		if tail, ok := c.consentOutbox.latestMatching(c.consentReceiptInScope); ok &&
@@ -1223,6 +1224,7 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 			// underneath it.
 			grantUnwitnessed := c.consentOutbox.lastRead == consentOutboxReadUnusable ||
 				recordRead == consentRecordReadUnusable ||
+				recordRead == consentRecordReadForeign ||
 				record.unwitnessed
 			if state == ConsentGranted && grantUnwitnessed {
 				// UNREADABLE WITNESS: a record file EXISTS and could not be

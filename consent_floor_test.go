@@ -5932,8 +5932,13 @@ func TestConsentOutboxUnusableTrailSurvivesMaintenanceRewrite(t *testing.T) {
 	// Now launder the outbox exactly as ordinary housekeeping would: a
 	// clean, fully-parseable record with nothing left to object to. The
 	// grant must STILL be withheld, on the strength of the mark alone.
+	// A genuinely CLEAN record: an explicitly empty receipts list, which is
+	// what a fully-pruned outbox writes. mustMarshalOutbox with no receipts
+	// emits `"receipts":null` — which this reader classifies as UNUSABLE —
+	// so using it here made the test pass for the wrong reason and it
+	// survived deleting the mark rule entirely.
 	if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName),
-		mustMarshalOutbox(t), 0o600); err != nil {
+		[]byte(`{"version":1,"receipts":[]}`), 0o600); err != nil {
 		t.Fatalf("launder outbox: %v", err)
 	}
 	second := newFloorTestClient(t, server.URL, dir, nil)
@@ -6348,4 +6353,97 @@ func TestUnprovableGrantIsHeldFromTheWireAndRecoverable(t *testing.T) {
 			})
 		}
 	})
+}
+
+// TestForeignRecordDoesNotResurrectAWithheldGrant pins the correction to a
+// claim this branch made and got wrong twice over. The code and the CHANGELOG
+// both said the unwitnessed mark is "per-scope by construction, keyed by the
+// actor digest". consentRecordPath takes only the DIRECTORY: it is one file
+// per SpoolDir, STAMPED with a digest rather than keyed by one, and
+// saveConsentRecord overwrites it whole. So a sibling scope's decision erases
+// this scope's mark — and the same sibling's merging outbox save sanitizes the
+// unreadable trail away — leaving both witnesses gone and the refused grant
+// free to be promoted and healed to disk. The very argument used to move the
+// mark OFF the shared outbox applied to the file it was moved ONTO.
+func TestForeignRecordDoesNotResurrectAWithheldGrant(t *testing.T) {
+	_, server := newFloorTestServer(t)
+	defer server.Close()
+
+	dir := t.TempDir()
+	// A record belonging to ANOTHER scope, well-formed and readable, plus a
+	// clean outbox holding this scope's retained grant receipt. Both
+	// witnesses for THIS scope are gone: the mark was overwritten by the
+	// sibling and the trail no longer objects to anything.
+	if err := saveConsentRecord(dir, ConsentDecisionGranted, "some-other-scope-digest",
+		"2026-07-21T00:00:00Z", true, os.Rename, os.Chmod); err != nil {
+		t.Fatalf("seed foreign record: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName),
+		mustMarshalOutbox(t, testConsentReceipt("key-retained-grant", true)), 0o600); err != nil {
+		t.Fatalf("seed outbox: %v", err)
+	}
+
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	defer func() { _ = client.Close(context.Background()) }()
+
+	if got := client.Consent(); got == ConsentGranted {
+		t.Fatalf("a retained grant was promoted beside a foreign record: %v", got)
+	}
+	// And it must not have been healed onto disk under THIS scope's digest,
+	// which is what makes the resurrection permanent.
+	after, ok := loadConsentRecordInfo(dir, spoolTestActorDigest())
+	if ok && after.state == ConsentGranted {
+		t.Fatalf("the grant was healed into this scope's record: %+v", after)
+	}
+}
+
+// TestConsentRecordUnusableClassesAreAllCovered exercises the two UNUSABLE
+// classes of the record reader that no other test reaches. Each of them fails
+// OPEN into the exact P0 this branch closes, so leaving them untested would
+// mean two of four arms shipping unguarded.
+func TestConsentRecordUnusableClassesAreAllCovered(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		write func(t *testing.T, dir string)
+	}{
+		{
+			name: "open_error_not_enoent",
+			write: func(t *testing.T, dir string) {
+				// A self-referential symlink yields ELOOP for every user,
+				// root included — root does not bypass symlink resolution.
+				path := consentRecordPath(dir)
+				if err := os.Symlink(path, path); err != nil {
+					t.Skipf("symlinks unavailable: %v", err)
+				}
+			},
+		},
+		{
+			name: "over_read_limit",
+			write: func(t *testing.T, dir string) {
+				payload := append([]byte(`{"consent_analytics":"granted","actor_digest":"`),
+					bytes.Repeat([]byte("a"), consentRecordReadLimit+1)...)
+				payload = append(payload, []byte(`"}`)...)
+				if err := os.WriteFile(consentRecordPath(dir), payload, 0o600); err != nil {
+					t.Fatalf("write: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, server := newFloorTestServer(t)
+			defer server.Close()
+			dir := t.TempDir()
+			tc.write(t, dir)
+			if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName),
+				mustMarshalOutbox(t, testConsentReceipt("key-retained-grant", true)), 0o600); err != nil {
+				t.Fatalf("seed outbox: %v", err)
+			}
+
+			client := newFloorTestClient(t, server.URL, dir, nil)
+			defer func() { _ = client.Close(context.Background()) }()
+			if got := client.Consent(); got == ConsentGranted {
+				t.Fatalf("%s: a retained grant receipt promoted the floor: %v", tc.name, got)
+			}
+		})
+	}
 }
