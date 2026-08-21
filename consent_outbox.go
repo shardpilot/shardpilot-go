@@ -119,6 +119,17 @@ type consentOutboxWire struct {
 	// witness that is a reason to distrust the whole file rather than to
 	// read it as "nothing was ever refused".
 	Receipts *[]consentReceipt `json:"receipts"`
+	// TrailIncomplete is STICKY evidence that this record was written while
+	// the trail on disk could not be fully understood. Without it a routine
+	// prune launders the hole: sanitizing an unusable disk view produces a
+	// clean, parseable record, and the next start promotes a persisted
+	// grant that THIS start deliberately withheld. Carrying the mark in the
+	// record keeps the conclusion durable while still letting maintenance
+	// write — blocking the write instead would wedge the outbox, leaving
+	// receipts undeliverable-durably and Close permanently reporting
+	// pending. Cleared only by a save carrying a FRESH explicit decision,
+	// which is newer than anything the unreadable bytes could have held.
+	TrailIncomplete bool `json:"trail_incomplete,omitempty"`
 }
 
 // sanitizeConsentReceipt validates one stored entry and copies it down to
@@ -389,6 +400,19 @@ func (o *consentOutbox) readRecordReceipts() ([]consentReceipt, consentOutboxRea
 	if record.Receipts == nil {
 		return nil, consentOutboxReadUnusable
 	}
+	// A record that DECLARES its own trail incomplete stays unusable however
+	// clean it now parses: this is the sticky mark a maintenance rewrite
+	// carried forward.
+	if record.TrailIncomplete {
+		entries := *record.Receipts
+		loaded := make([]consentReceipt, 0, len(entries))
+		for _, entry := range entries {
+			if sanitized, ok := sanitizeConsentReceipt(entry); ok {
+				loaded = append(loaded, sanitized)
+			}
+		}
+		return loaded, consentOutboxReadUnusable
+	}
 	entries := *record.Receipts
 	loaded := make([]consentReceipt, 0, len(entries))
 	seen := make(map[string]struct{}, len(entries))
@@ -495,7 +519,27 @@ func (o *consentOutbox) load(own func(consentReceipt) bool) {
 // turn a transient failure into a "successfully written" smaller record,
 // silently dropping a receipt while reporting success. Must be called with
 // mu held.
-func (o *consentOutbox) saveLocked() error {
+// saveLocked persists the merged view. carriesFreshDecision distinguishes a
+// save that ADDS a new decision from routine maintenance (a prune, an owed
+// retry), and the distinction is what keeps an UNUSABLE trail from being
+// laundered: sanitizing a corrupt disk view into a clean record erases the
+// only evidence that the trail had a hole, and the next start would then
+// promote a persisted grant this process deliberately withheld. So while the
+// load read UNUSABLE, maintenance does not write — the mirror stays
+// authoritative, the write stays owed, and the corrupt bytes stay on disk so
+// every restart re-derives the same conclusion. A FRESH explicit decision is
+// the one thing allowed to supersede an unknown trail: it is newer than
+// anything the unreadable file could hold, so it both may write and clears
+// the unusable mark, which is how the SDK recovers instead of being wedged
+// undecided forever.
+func (o *consentOutbox) saveLocked(carriesFreshDecision bool) error {
+	// A fresh explicit decision is the one thing that safely supersedes an
+	// unknown trail — it is newer than anything the unreadable file could
+	// have held — so it clears the mark. Maintenance does not.
+	if o.durable() && o.lastRead == consentOutboxReadUnusable && carriesFreshDecision {
+		o.lastRead = consentOutboxReadParsed
+	}
+	trailIncomplete := o.durable() && o.lastRead == consentOutboxReadUnusable
 	seen := make(map[string]struct{}, len(o.receipts))
 	merged := make([]consentReceipt, 0, len(o.receipts))
 	diskReceipts, _ := o.readRecordReceipts()
@@ -549,7 +593,7 @@ func (o *consentOutbox) saveLocked() error {
 		settleEvictions()
 		return nil
 	}
-	record := consentOutboxWire{Version: consentOutboxRecordVersion, Receipts: &merged}
+	record := consentOutboxWire{Version: consentOutboxRecordVersion, Receipts: &merged, TrailIncomplete: trailIncomplete}
 	payload, err := json.Marshal(record)
 	if err == nil {
 		err = writePrivateFileAtomic(o.filePath(), payload, o.renameFn, o.chmodFn)
@@ -575,7 +619,7 @@ func (o *consentOutbox) append(receipt consentReceipt) (persistFailed bool) {
 	// yet.
 	o.ownKeys[receipt.IdempotencyKey] = struct{}{}
 	o.receipts = append(o.receipts, receipt)
-	return o.saveLocked() != nil
+	return o.saveLocked(true) != nil
 }
 
 // head returns the oldest retained receipt for dispatch, when one exists.
@@ -667,7 +711,7 @@ func (o *consentOutbox) prune(idempotencyKey string) (persistFailed bool) {
 		pruned = append(pruned, o.receipts[:i]...)
 		pruned = append(pruned, o.receipts[i+1:]...)
 		o.receipts = pruned
-		return o.saveLocked() != nil
+		return o.saveLocked(false) != nil
 	}
 	return false
 }
@@ -761,7 +805,7 @@ func (o *consentOutbox) retryPersist() (attempted, failed bool) {
 	if !o.dirty {
 		return false, false
 	}
-	return true, o.saveLocked() != nil
+	return true, o.saveLocked(false) != nil
 }
 
 // takeEvicted drains the cap-eviction count for Stats.ConsentOutboxEvicted.
@@ -1074,7 +1118,20 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 		// floor-marked stampless record (the preserved corrupt denial)
 		// never yields by comparison. With no record at all the proof
 		// restores its decision unconditionally.
+		// A GRANT surviving an UNUSABLE trail may not drive the override or
+		// the heal. The sanitizer can return a valid newer grant while a
+		// malformed entry beside it is exactly the denial that would
+		// supersede it, and the heal WRITES a floor-proven granted record —
+		// so an in-memory-only withholding below would be undone durably:
+		// once the surviving grant is acknowledged and pruned, the next
+		// restart sees a clean outbox and promotes the healed grant. A
+		// surviving DENIAL still applies: it is readable, real, and
+		// restrictive, and an incomplete trail cannot make it less true.
+		tailBlockedByUnusableTrail := func(tail consentReceipt) bool {
+			return c.consentOutbox.lastRead == consentOutboxReadUnusable && tail.analyticsGranted()
+		}
 		if tail, ok := c.consentOutbox.latestMatching(c.consentReceiptInScope); ok &&
+			!tailBlockedByUnusableTrail(tail) &&
 			(!recordOK || consentReceiptSupersedesRecord(tail.DecidedAt, record)) {
 			tailDecision := ConsentDecisionDenied
 			tailState := ConsentDenied

@@ -5802,3 +5802,114 @@ func TestConsentOutboxPartialTrailStillHonorsAValidDenial(t *testing.T) {
 		t.Fatalf("partial trail: ConsentOutboxUnreadable = %d, want 1", got)
 	}
 }
+
+// TestConsentOutboxUnusableTrailSurvivesMaintenanceRewrite is the regression
+// for the durability half of the rule. Withholding a grant only in memory is
+// not enough: a routine prune sanitizes the unusable disk view into a clean,
+// parseable record, and the NEXT start would then promote the very grant this
+// start withheld — the fix undone by ordinary housekeeping.
+//
+// The trail therefore carries a sticky `trail_incomplete` mark across
+// maintenance writes. It is deliberately NOT enforced by refusing to write:
+// that wedges the outbox, leaving receipts undeliverable-durably and Close
+// permanently reporting pending.
+func TestConsentOutboxUnusableTrailSurvivesMaintenanceRewrite(t *testing.T) {
+	_, server := newFloorTestServer(t)
+	defer server.Close()
+
+	// A surviving in-scope receipt plus a malformed one: the record parses,
+	// the sanitizer drops the broken entry, and the trail is unusable.
+	surviving := testConsentReceipt("key-surviving", false)
+	surviving.DecidedAt = "2026-07-20T00:00:00Z"
+	malformed := testConsentReceipt("key-broken", true)
+	malformed.WorkspaceID = ""
+
+	dir := t.TempDir()
+	if err := saveConsentRecord(dir, ConsentDecisionGranted, spoolTestActorDigest(),
+		"2026-07-19T00:00:00Z", true, os.Rename, os.Chmod); err != nil {
+		t.Fatalf("seed granted record: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName),
+		mustMarshalOutbox(t, surviving, malformed), 0o600); err != nil {
+		t.Fatalf("seed outbox: %v", err)
+	}
+
+	// First start: the surviving entry is a DENIAL, so it legitimately
+	// applies; the point here is what the maintenance write leaves behind.
+	first := newFloorTestClient(t, server.URL, dir, nil)
+	if err := first.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if err := first.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// The rewritten record must parse cleanly AND still declare the hole.
+	data, err := os.ReadFile(filepath.Join(dir, consentOutboxFileName))
+	if err != nil {
+		t.Fatalf("read rewritten outbox: %v", err)
+	}
+	var rewritten consentOutboxWire
+	if err := json.Unmarshal(data, &rewritten); err != nil {
+		t.Fatalf("the rewritten record does not parse: %v", err)
+	}
+	if !rewritten.TrailIncomplete {
+		t.Fatalf("maintenance rewrite laundered the unusable trail: %s", data)
+	}
+
+	// Second start reads a syntactically clean record and must still refuse
+	// to promote the persisted grant.
+	second := newFloorTestClient(t, server.URL, dir, nil)
+	defer func() { _ = second.Close(context.Background()) }()
+	if got := second.Consent(); got == ConsentGranted {
+		t.Fatalf("restart after maintenance promoted the withheld grant: %v", got)
+	}
+	if got := second.Snapshot().ConsentOutboxUnreadable; got != 1 {
+		t.Fatalf("restart: ConsentOutboxUnreadable = %d, want 1", got)
+	}
+}
+
+// TestConsentOutboxUnusableTrailGrantDoesNotHealPersistedDenial covers the
+// third leak: withholding at the END of initConsentFloor is too late, because
+// the trail-tail override runs BEFORE it and WRITES. A valid newer grant
+// surviving an unusable trail would heal an older persisted denial into a
+// floor-proven grant on disk; the in-memory withholding would then be undone
+// the moment that grant is acknowledged and pruned. The malformed entry beside
+// it is exactly the denial that might have superseded it, so a grant from an
+// incomplete trail may not participate in the override at all.
+func TestConsentOutboxUnusableTrailGrantDoesNotHealPersistedDenial(t *testing.T) {
+	_, server := newFloorTestServer(t)
+	defer server.Close()
+
+	grant := testConsentReceipt("key-newer-grant", true)
+	grant.DecidedAt = "2026-07-21T00:00:00Z" // newer than the record below
+	malformed := testConsentReceipt("key-broken-deny", false)
+	malformed.ActorIdentifier = "" // required field: dropped by the sanitizer
+
+	dir := t.TempDir()
+	if err := saveConsentRecord(dir, ConsentDecisionDenied, spoolTestActorDigest(),
+		"2026-07-19T00:00:00Z", true, os.Rename, os.Chmod); err != nil {
+		t.Fatalf("seed denied record: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName),
+		mustMarshalOutbox(t, grant, malformed), 0o600); err != nil {
+		t.Fatalf("seed outbox: %v", err)
+	}
+
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	defer func() { _ = client.Close(context.Background()) }()
+
+	// The denial stands: a grant we cannot corroborate does not lift it.
+	if got := client.Consent(); got == ConsentGranted {
+		t.Fatalf("an unusable trail's grant lifted a persisted denial: %v", got)
+	}
+	// And it must not have been healed onto DISK, or the next start would
+	// promote it however this start behaved.
+	record, ok := loadConsentRecordInfo(dir, spoolTestActorDigest())
+	if !ok {
+		t.Fatalf("the persisted record disappeared")
+	}
+	if record.state == ConsentGranted {
+		t.Fatalf("the persisted denial was healed into a grant on disk: %+v", record)
+	}
+}

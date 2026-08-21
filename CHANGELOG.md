@@ -58,6 +58,23 @@
   survive are still honored, so a readable denial alongside a malformed
   entry still denies rather than falling back to undecided.
 
+  The conclusion is DURABLE, because withholding a grant only in memory is
+  undone by ordinary housekeeping. A grant surviving an unreadable trail may
+  not drive the trail-tail override, which writes a floor-proven record; and
+  a record rewritten while the trail was unreadable carries a sticky
+  `trail_incomplete` mark, so a prune cannot launder the hole into a clean
+  record the next start would trust. A save carrying a FRESH explicit
+  decision clears the mark — it is newer than anything the unreadable bytes
+  could have held — which is how a client recovers rather than being wedged
+  undecided. Blocking the write instead was rejected: it leaves receipts
+  undeliverable-durably and `Close` permanently reporting pending.
+
+  KNOWN RESIDUAL, named rather than left to be discovered: a DELETED outbox
+  beside a persisted grant still promotes that grant. The file is not
+  distinguishable from one that was never written, and refusing that
+  combination would make every seeded or legacy proven grant start undecided
+  and demand a fresh decision.
+
   Behaviour is unchanged for every other class of state: a corrupt cache or
   telemetry spool still means "start over", and a corrupt record still never
   crashes into the host.
