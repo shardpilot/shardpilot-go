@@ -230,6 +230,49 @@ if ! (cd "$(dirname "$SELF")/.." && git cat-file blob ":$SELF_REL") > "$SELF_BLO
   echo "  publish, and a commit carries the staged copy, not this one." >&2
   exit 2
 fi
+# ⚠ THE RUNNING COPY MUST BE THE STAGED ONE. Everything this gate reads comes
+# from the index — every tracked blob, and this script for its own audits — but
+# the DATA below is read by bash from the file it is executing, which is the
+# working copy. Stage a change to the matcher or the fixtures, restore the
+# working copy, and the values that run are not the values that would be
+# committed: a local green run describing a different tree, which is the exact
+# failure this gate spent a day removing everywhere else.
+#
+# refusal:structural
+if ! cmp -s "$SELF" "$SELF_BLOB"; then
+  echo "REFUSING: this script differs from its staged copy." >&2
+  echo "  Its data is read by the shell from the file being executed, while" >&2
+  echo "  everything else here reads the index. Running one and reporting on" >&2
+  echo "  the other is how a green run stops describing the commit." >&2
+  echo "  Stage this file, then run again." >&2
+  exit 2
+fi
+
+# ⚠ AND NO ANSI-C QUOTED FRAGMENT ANYWHERE IN IT. `$'\400'` is a NUL, and bash
+# truncates a value there — everything after it stays in the published file and
+# reaches neither the decode, nor the audits, nor the self-test, which goes on
+# counting the fixtures it can still see. Rather than validate escape
+# spellings, of which there are more than anyone enumerates, the construct that
+# admits them is refused outright: measured, this script contains none, and an
+# apostrophe is written `'\''` instead.
+#
+# refusal:structural
+# The needle is BUILT, not written: spelling it here would put the construct
+# into the file this check reads, and the gate refused itself the first time.
+# IN THE DATA BLOCK, not the whole script: the code below uses the same
+# construct legitimately to append a newline, and refusing that would be a
+# rule against an idiom rather than against a hazard.
+ansi_c="$(printf '\044\047')"
+data_block="$(sed -n '/^GATE_DATA_NAMES=/,/^unset gate_var$/p' "$SELF_BLOB")"
+if printf '%s' "$data_block" | grep -qF -- "$ansi_c"; then
+  echo "REFUSING: the data block contains an ANSI-C quoted fragment." >&2
+  { printf '%s' "$data_block" | grep -nF -- "$ansi_c" || true; } | head -5 | sed 's/^/    /' >&2
+  echo "  Those admit escapes that produce a NUL, which truncates a value and" >&2
+  echo "  leaves the rest of it published and unread. Use '\'' for an" >&2
+  echo "  apostrophe and write other characters literally." >&2
+  exit 2
+fi
+
 # ── THE MATERIAL THAT MATCHES BY CONSTRUCTION, IN THIS FILE AND SCANNED ─────
 # It lived in a separate file excluded from the scan BY PATH, and that
 # exclusion was the whole problem: an unscanned file is somewhere to put
@@ -360,6 +403,19 @@ AUDIT_CLASSES="$AUDIT_CLASSES"'|(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 # reference entirely. A class the matcher rewards and the audit ignores is a
 # published live reference the self-test calls correct.
 AUDIT_CLASSES="$AUDIT_CLASSES"'|Codex [a-z]*#[0-9]+'
+
+# ⚠ NUMERIC ALWAYS, NAMED ONLY WHERE DEFINED. A renderer substitutes the
+# references it knows and leaves the rest as written, so `&madeupentity;` is
+# literal text — refusing it blocked a merge over a placeholder. The named list
+# is the ASCII punctuation that can join a token: an entity producing an
+# accented letter cannot form an identifier in any class here.
+CHARACTER_REFERENCE='&#[0-9]+;|&#[xX][0-9A-Fa-f]+;'
+CHARACTER_REFERENCE="$CHARACTER_REFERENCE"'|&(amp|lt|gt|quot|apos|nbsp|hyphen'
+CHARACTER_REFERENCE="$CHARACTER_REFERENCE"'|dash|ndash|mdash|minus|num|sol'
+CHARACTER_REFERENCE="$CHARACTER_REFERENCE"'|period|lowbar|commat|colon|semi'
+CHARACTER_REFERENCE="$CHARACTER_REFERENCE"'|comma|excl|quest|lpar|rpar|lsqb'
+CHARACTER_REFERENCE="$CHARACTER_REFERENCE"'|rsqb|lcub|rcub|verbar|plus|ast'
+CHARACTER_REFERENCE="$CHARACTER_REFERENCE"'|lowast|midast|equals);'
 
 roster_regex() {
   printf '%s' "$ROSTER" | sed -e 's![-_ ]![-_ ]+!g' -e 's!/! */ *!g' | paste -sd'|' -
@@ -551,8 +607,25 @@ scan_tree() {
     # whether the first thing that is not whitespace or a BOM is a `<` — which
     # is true of every XML-family document and, measured today, of no tracked
     # file in either tree.
-    if [ "$printable_sigs" = yes ] &&
-       [ "$(sed -e '1s/^\xef\xbb\xbf//' "$blob" | tr -d '[:space:]' | head -c 1)" = '<' ]; then
+    # ⚠ A TAG, NOT AN ANGLE BRACKET. `< 5 ms latency target.` opens with one and
+    # is prose; refusing it blocked a merge over a threshold. The next character
+    # has to start a name, a closing tag, a declaration or a processing
+    # instruction for this to be a document.
+    # ⚠ `cut`, NOT `head -c`. `head` closes the pipe at its byte count, the
+    # process feeding it takes SIGPIPE, and an ASSIGNMENT takes the pipeline's
+    # status — 141, which `set -e` turns into a dead run. It read as 141 for
+    # every probe at once, which is what a dead run looks like: uniform, and
+    # nothing like the mixture of 0, 1 and 2 the table expected.
+    markup_head="$(sed -e '1s/^\xef\xbb\xbf//' "$blob" | tr -d '[:space:]' | cut -c1-2)"
+    # ⚠ NO PIPE. `printf | grep -q` exits 141 under `pipefail`: grep stops at the
+    # first match and closes the pipe, printf takes SIGPIPE, and the whole run
+    # dies with a status nobody reads as "matched". A case does the same job
+    # with no second process.
+    markup_doc=no
+    case "$markup_head" in
+      '<'[A-Za-z!?/]*) markup_doc=yes ;;
+    esac
+    if [ "$printable_sigs" = yes ] && [ "$markup_doc" = yes ]; then
       # refusal:hazard
       echo "REFUSING: '$f' begins as a markup document." >&2
       echo "  Its renderer assembles text this gate reads only as bytes — an" >&2
@@ -593,7 +666,7 @@ scan_tree() {
     case "$flc" in
       *.png|*.jpg|*.jpeg|*.gif|*.webp|*.bmp|*.tif|*.tiff|*.ico|*.svg|*.xpm|\
       *.xbm|*.ppm|*.pgm|*.pbm|*.pnm|*.pcx|*.tga|*.psd|*.ai|*.eps|*.heic|\
-      *.heif|*.avif)
+      *.heif|*.avif|*.ps|*.eps)
         # refusal:hazard
         echo "REFUSING: '$f' is an image, and this gate reads files as text." >&2
         echo "  Pixels are not searchable prose: an identifier drawn in a" >&2
@@ -709,7 +782,7 @@ scan_tree() {
       *.md|*.markdown|*.html|*.htm) refs_apply=yes ;;
     esac
     if [ "$refs_apply" = yes ] &&
-       grep -qaE '&#[0-9]+;|&#[xX][0-9A-Fa-f]+;|&[A-Za-z][A-Za-z0-9]{1,31};' "$blob" 2>/dev/null; then
+       grep -qaE "$CHARACTER_REFERENCE" "$blob" 2>/dev/null; then
       # refusal:hazard
       echo "REFUSING: '$f' contains a character reference." >&2
       echo "  It renders as a character this gate never reads, so a clean result" >&2
@@ -764,7 +837,7 @@ scan_tree() {
     # nothing wrong. The substitution is per-line, so reported line numbers
     # stay true to the file.
     case "$flc" in
-      *.md|*.markdown)
+      *.md|*.markdown|*.html|*.htm)
         # ⚠ EMPHASIS SPLITS A TOKEN ON THE PAGE AND NOT IN THE BYTES: an
         # identifier written with its digits bolded renders contiguously and
         # matches nothing. Asterisks and backticks are removed with the
