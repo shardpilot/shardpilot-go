@@ -112,6 +112,11 @@ func (r consentReceipt) analyticsGranted() bool {
 // errConsentEvidenceHeld reports a maintenance write withheld to preserve the
 // last evidence that a grant is unprovable. It is an owed write, not a disk
 // failure.
+// errConsentRecordTooLarge reports a save refused because the serialized
+// record would exceed what the reader accepts. Refusing is the safe end: a
+// record written past the limit reads back as corrupt.
+var errConsentRecordTooLarge = errors.New("consent outbox: record exceeds the read limit even when empty")
+
 var errConsentEvidenceHeld = errors.New("consent outbox: unreadable record preserved as evidence, maintenance write owed")
 
 type consentOutboxWire struct {
@@ -626,6 +631,38 @@ func (o *consentOutbox) saveLocked(carriesFreshDecision bool) error {
 	}
 	record := consentOutboxWire{Version: consentOutboxRecordVersion, Receipts: &merged}
 	payload, err := json.Marshal(record)
+	if err == nil && len(payload) > consentOutboxReadLimit {
+		// The writer must never produce a record this reader would refuse.
+		// Scope identifiers are caller-supplied and unbounded, so a large
+		// workspace/app/environment id — or simply enough receipts — can
+		// serialize past the read limit. The next start would then classify
+		// the SDK's OWN well-formed record as UNUSABLE and withhold a
+		// perfectly proven grant until the host decides again: a
+		// self-inflicted refusal, and one that looks exactly like the
+		// corruption this limit exists to catch.
+		//
+		// Shed from the FRONT — oldest first, the same order the cap uses —
+		// until it fits. Dropping the oldest is the least destructive
+		// choice available: a receipt that has waited longest is the one
+		// most likely already delivered, and the alternative (writing
+		// nothing) loses the whole trail including its newest denial.
+		for len(payload) > consentOutboxReadLimit && len(merged) > 0 {
+			evictKeys = append(evictKeys, merged[0].IdempotencyKey)
+			merged = merged[1:]
+			record.Receipts = &merged
+			payload, err = json.Marshal(record)
+			if err != nil {
+				break
+			}
+		}
+		if err == nil && len(payload) > consentOutboxReadLimit {
+			// Even an empty trail does not fit, which means the fixed part
+			// of the record is over the limit. Refuse the write rather than
+			// lay down a record the reader will call corrupt.
+			o.dirty = true
+			return errConsentRecordTooLarge
+		}
+	}
 	if err == nil {
 		err = writePrivateFileAtomic(o.filePath(), payload, o.renameFn, o.chmodFn)
 	}
@@ -1189,9 +1226,21 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 				return false
 			}
 			if c.consentOutbox.lastRead == consentOutboxReadUnusable ||
-				recordRead == consentRecordReadUnusable ||
-				recordRead == consentRecordReadForeign {
+				recordRead == consentRecordReadUnusable {
 				return true
+			}
+			if recordRead == consentRecordReadForeign {
+				// A foreign record is a tombstone for anything it may have
+				// overwritten — but only for what came BEFORE it. A receipt
+				// strictly newer than the foreign record's own stamp was
+				// created after that scope switch completed, so it cannot be
+				// the thing the switch destroyed. Vetoing it unconditionally
+				// strands a fresh grant whose receipt landed durably and
+				// whose record write was lost to a crash: consent stays
+				// unknown and the receipt never dispatches until the host
+				// decides again. An unstamped foreign record still vetoes
+				// everything, by the same infinitely-new rule the mark uses.
+				return !consentDecisionSupersedes(tail.DecidedAt, record.decidedAt)
 			}
 			// The MARK is an ordering question, not a veto. A receipt
 			// strictly newer than the stamp is provably a decision the mark
@@ -1227,6 +1276,12 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 			staleRecord, staleOK := record, recordOK
 			state, recordOK = tailState, true
 			record = consentRecordInfo{state: tailState, decidedAt: tail.DecidedAt, floor: true}
+			// The heal writes THIS scope's record over whatever was there,
+			// so the read classification that described the old file no
+			// longer describes the new one. Leaving it FOREIGN would let
+			// the verdict below withhold the very decision the override
+			// just established — the tombstone outliving the grave.
+			recordRead = consentRecordReadParsed
 			if err := saveConsentRecord(c.cfg.SpoolDir, tailDecision, digest, tail.DecidedAt, true, rename, chmod); err != nil {
 				c.stats.setLastError("consent_record_persist_failed")
 				c.logf("shardpilot consent floor: healing the stale decision record from the receipt trail failed (the trail-derived state still applies in memory and the write stays owed): %v", err)

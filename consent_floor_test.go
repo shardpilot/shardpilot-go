@@ -6649,3 +6649,149 @@ func TestStaleMarkIsRefreshedByANewerUnusableTrail(t *testing.T) {
 		t.Fatalf("a grant covered by the refreshed mark was healed into live consent: %v", got)
 	}
 }
+
+// TestWithheldGrantIsFailClosedForOlderDecoders pins the shape that makes the
+// withholding survive a ROLLBACK. An additive flag cannot fail closed against
+// an older decoder: it ignores the unknown key and reads
+// `consent_analytics:"granted"` as ordinary authorization, resurrecting the
+// grant the mark withheld — and by then maintenance may have rewritten the
+// outbox clean, so nothing else objects either. The fail-closed part therefore
+// lives in a field EVERY decoder already consults.
+func TestWithheldGrantIsFailClosedForOlderDecoders(t *testing.T) {
+	dir := t.TempDir()
+	info := consentRecordInfo{state: ConsentGranted, decidedAt: "2026-07-19T00:00:00Z", floor: true}
+	if err := markConsentRecordUnwitnessed(dir, info, spoolTestActorDigest(),
+		"2026-07-19T00:00:00Z", os.Rename, os.Chmod); err != nil {
+		t.Fatalf("mark: %v", err)
+	}
+	raw, err := os.ReadFile(consentRecordPath(dir))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatalf("record does not parse: %v", err)
+	}
+	// An older build switches on consent_analytics and has no case for this,
+	// so it falls to its default arm and reports no usable record.
+	if got := wire["consent_analytics"]; got == "granted" {
+		t.Fatalf("a withheld grant is still spelled \"granted\"; a rollback would read it as authorization: %s", raw)
+	}
+	if got := wire["withheld_analytics"]; got != "granted" {
+		t.Fatalf("the real decision was not preserved for recovery: %s", raw)
+	}
+	// And THIS build still recovers everything it needs.
+	back, ok, _ := loadConsentRecordRead(dir, spoolTestActorDigest())
+	if !ok || back.state != ConsentGranted || !back.unwitnessed || back.unwitnessedAt == "" {
+		t.Fatalf("this build lost the withheld grant: %+v ok=%v", back, ok)
+	}
+	// A withheld DENIAL keeps its own spelling — an old build must still
+	// honour it, and rewriting it into a sentinel would erase that.
+	denyDir := t.TempDir()
+	deny := consentRecordInfo{state: ConsentDenied, decidedAt: "2026-07-19T00:00:00Z", floor: true}
+	if err := markConsentRecordUnwitnessed(denyDir, deny, spoolTestActorDigest(),
+		"2026-07-19T00:00:00Z", os.Rename, os.Chmod); err != nil {
+		t.Fatalf("mark denial: %v", err)
+	}
+	denyRaw, err := os.ReadFile(consentRecordPath(denyDir))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var denyWire map[string]any
+	if err := json.Unmarshal(denyRaw, &denyWire); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got := denyWire["consent_analytics"]; got != "denied" {
+		t.Fatalf("a withheld DENIAL stopped reading as denied to older builds: %s", denyRaw)
+	}
+}
+
+// TestOutboxWriterNeverExceedsItsOwnReadLimit closes a self-inflicted refusal:
+// scope identifiers are caller-supplied and unbounded, so the SDK could
+// serialize a record past the limit its own reader enforces, and the next
+// start would call that well-formed record corrupt and withhold a proven
+// grant.
+func TestOutboxWriterNeverExceedsItsOwnReadLimit(t *testing.T) {
+	dir := t.TempDir()
+	outbox := newConsentOutbox(dir)
+	// ONLY the genuinely unbounded fields. WorkspaceID, AppID and
+	// EnvironmentID are checked for non-emptiness and nothing else;
+	// ActorIdentifier and AnonymousID go through validConsentIdentifier and
+	// are clamped at maxConsentIdentifierBytes, so padding THOSE makes the
+	// sanitizer drop the whole receipt and the test passes for the wrong
+	// reason — which is exactly what an earlier version of it did.
+	huge := strings.Repeat("w", 64<<10)
+	for i := 0; i < 8; i++ {
+		r := testConsentReceipt(fmt.Sprintf("key-big-%02d", i), false)
+		r.WorkspaceID = huge
+		r.AppID = huge
+		r.EnvironmentID = huge
+		if failed := outbox.append(r); failed {
+			t.Fatalf("append %d reported a persist failure", i)
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(dir, consentOutboxFileName))
+	if err != nil {
+		t.Fatalf("read record: %v", err)
+	}
+	if len(data) > consentOutboxReadLimit {
+		t.Fatalf("the writer produced %d bytes, past its own %d-byte read limit", len(data), consentOutboxReadLimit)
+	}
+	// And the record it wrote must read back as USABLE, not as corruption.
+	_, state := newConsentOutbox(dir).readRecordReceipts()
+	if state != consentOutboxReadParsed {
+		t.Fatalf("the SDK's own record reads back as state %d, not parsed", state)
+	}
+}
+
+// TestForeignRecordDoesNotStrandAPostSwitchGrant bounds the foreign-record
+// tombstone by ORDER. A foreign record stands for what it may have
+// overwritten — but only for what came before it. A receipt strictly newer
+// than the foreign record's own stamp was created after that scope switch
+// completed, so it cannot be what the switch destroyed; vetoing it strands a
+// grant whose receipt landed durably and whose record write was lost to a
+// crash.
+func TestForeignRecordDoesNotStrandAPostSwitchGrant(t *testing.T) {
+	_, server := newFloorTestServer(t)
+	defer server.Close()
+
+	dir := t.TempDir()
+	// The previous scope's record, well-formed, with its own stamp.
+	if err := saveConsentRecord(dir, ConsentDecisionGranted, "some-other-scope-digest",
+		"2026-07-19T00:00:00Z", true, os.Rename, os.Chmod); err != nil {
+		t.Fatalf("seed foreign record: %v", err)
+	}
+	// This scope's fresh grant: receipt-first, so it is durable even though
+	// the record write was lost.
+	post := testConsentReceipt("key-post-switch-grant", true)
+	post.DecidedAt = "2026-07-21T00:00:00Z"
+	if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName),
+		mustMarshalOutbox(t, post), 0o600); err != nil {
+		t.Fatalf("seed outbox: %v", err)
+	}
+
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	defer func() { _ = client.Close(context.Background()) }()
+	if got := client.Consent(); got != ConsentGranted {
+		t.Fatalf("a post-switch grant was stranded by a foreign record: %v", got)
+	}
+
+	// The PRE-switch direction must still be vetoed: a receipt not newer
+	// than the foreign record could be exactly what the switch destroyed.
+	stale := t.TempDir()
+	if err := saveConsentRecord(stale, ConsentDecisionGranted, "some-other-scope-digest",
+		"2026-07-21T00:00:00Z", true, os.Rename, os.Chmod); err != nil {
+		t.Fatalf("seed foreign record: %v", err)
+	}
+	older := testConsentReceipt("key-pre-switch-grant", true)
+	older.DecidedAt = "2026-07-19T00:00:00Z"
+	if err := os.WriteFile(filepath.Join(stale, consentOutboxFileName),
+		mustMarshalOutbox(t, older), 0o600); err != nil {
+		t.Fatalf("seed outbox: %v", err)
+	}
+	second := newFloorTestClient(t, server.URL, stale, nil)
+	defer func() { _ = second.Close(context.Background()) }()
+	if got := second.Consent(); got == ConsentGranted {
+		t.Fatalf("a pre-switch grant was promoted beside a foreign record: %v", got)
+	}
+}
