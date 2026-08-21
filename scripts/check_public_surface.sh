@@ -240,13 +240,15 @@ self_scan_body() {
   # this surface; it did not close it, because a comment inserted among the
   # assignments is still blanked and therefore still unreadable. A region
   # exists to hold text that matches BY CONSTRUCTION — assignments and fixture
-  # corpora — and a sentence is never that. Refusing comments outright makes
+  # corpora — and a sentence is never that. INLINE comments count: the whole
+  # line is blanked either way, so a sentence appended to the end of a fixture
+  # line is exactly as unreadable as one on its own line. Refusing both makes
   # "hide prose in the exemption" impossible rather than merely unlikely, and
   # it costs one pass.
   if awk -v b="$BEGIN_RE" -v e="$END_RE" '
     $0 ~ b { inside = 1; next }
     $0 ~ e { inside = 0; next }
-    inside && $0 ~ /^[[:space:]]*#/ { print NR ": " $0; found = 1 }
+    inside && $0 ~ /^[[:space:]]*#|[[:space:]]#/ { print NR ": " $0; found = 1 }
     END { exit !found }
   ' "$1"; then
     echo "REFUSING: $1 has comment lines inside a gate-self-exempt region (above)." >&2
@@ -655,6 +657,17 @@ EOF
   # THE SCAN ITSELF, over a fixture whose expected answer is known. This is the
   # half the first draft did not have: the regex can be perfect while the file
   # list is empty, and only this catches that.
+  # What the fixture files below are for, kept OUTSIDE the region because a
+  # region is blanked before scanning and prose inside one is prose the gate
+  # cannot read:
+  #   the notes file    nothing internal in its BODY — the hit is the NAME,
+  #                     which is why the path itself is scanned
+  #   the accented file C-quoted by git ls-files, so it proves -z is honoured
+  #   the binary file   carries a NUL, so grep calls it binary without -a
+  #
+  # The filenames are described rather than written: this prose is scanned like
+  # any other, and naming the fixtures here would put their identifiers into a
+  # part of the file the gate reads.
   # gate-self-exempt:begin scan fixture
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
@@ -663,11 +676,11 @@ EOF
     git init -q .
     git config user.email t@t; git config user.name t
     printf 'clean customer prose\n' > clean.md
-    printf 'nothing internal in the body\n' > ADR-0999-notes.md   # hit is the NAME
+    printf 'nothing internal in the body\n' > ADR-0999-notes.md
     printf 'see ADR-0000 for context\n' > dirty.md
     printf '// GAP-000 note\npackage x\n' > lane_b.go
-    printf 'internal: control-plane\n' > "café.md"   # C-quoted by git ls-files
-    printf 'x\0see ADR-0999 here\n' > binary.bin      # NUL: "binary" to grep
+    printf 'internal: control-plane\n' > "café.md"
+    printf 'x\0see ADR-0999 here\n' > binary.bin
     git add -A >/dev/null 2>&1
   )
   scan_tree "$tmp"
