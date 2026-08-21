@@ -88,6 +88,30 @@
 # coverage-shaped sentence, and that the file is small enough to read. A
 # gate cannot close this; a reviewer can.
 #
+# ⚠ SOURCE AND RENDERED PAGE ARE DIFFERENT SURFACES, and the published one is
+# the page. A token split by emphasis, an escaped hyphen, a character reference
+# and a carriage return before end-of-line all read as clean bytes and disclose
+# on the page; each is normalised or refused below for that reason, and the one
+# instance this gate has caught in already-committed content was of exactly
+# that kind. What is still NOT read is anything a renderer assembles that those
+# normalisations do not undo — across markup elements, across a line break. The
+# formats whose whole purpose is rendering are refused rather than parsed.
+#
+# ⚠ AND THIS GATE DOES NOT CATCH A NAME HIDDEN DELIBERATELY. Its subject is
+# material that reaches the public surface WITHOUT ANYONE INTENDING IT. A
+# single-word internal name placed inside a branch of the pattern list is
+# indistinguishable from the English words that list legitimately contains, and
+# both ways of telling them apart were measured and rejected: requiring every
+# long word to exist elsewhere in the tree refuses a clean repository —
+# thirteen ordinary words here appear nowhere else — and a dictionary of
+# admissible words is a list the same change can extend, which is the defect
+# the identifier allowlist was removed for.
+#
+# What stands there instead is review: this corpus is one small file, the
+# pattern list is asserted against fixtures on every run, and a name added to
+# either is a visible line in a diff. That is a stated BOUNDARY, not an
+# oversight — a green run is not evidence about it.
+#
 
 set -euo pipefail
 
