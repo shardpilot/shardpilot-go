@@ -4,8 +4,9 @@ on:
   pull_request:
   # ⚠ EVERY PUSH, NOT ONLY main. This repository is PUBLIC: a branch pushed here
   # is readable the moment it lands, whether or not a pull request ever opens.
-  # A `branches: [main]` filter meant the secret scan skipped exactly the case
-  # where the contents are already exposed and nobody is looking. Tags are included for the same reason and a stronger one — a tag
+  # A `branches: [main]` filter meant the secret scan and the publication gate
+  # skipped exactly the case where the contents are already exposed and nobody
+  # is looking. Tags are included for the same reason and a stronger one — a tag
   # is the artifact people install, and one release here was cut off-main.
   #
   # No job is conditioned to narrow this back down. A condition is how a gate
@@ -208,3 +209,23 @@ jobs:
 
       - name: Version consistency (README latest tag == CHANGELOG head == skill pin)
         run: ./scripts/check_release_consistency.sh
+
+  public-surface:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      # No fetch-depth here on purpose. The gate's roster rule now asks whether
+      # each literal still appears in the TRACKED TREE, which a one-commit clone
+      # answers perfectly well — the earlier `fetch-depth: 0` existed only for
+      # the history-based version of that rule and was pure cost once the rule
+      # changed. Verified by cloning this branch with --depth 1 and running the
+      # gate: exit 0.
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # This repository is already public, so it is NOT in the org's
+      # publication-candidate list and nothing else scans it. See the script's
+      # header for what the two lanes do and do not cover.
+      - name: No internal material in the published non-source surface
+        run: ./scripts/check_public_surface.sh
