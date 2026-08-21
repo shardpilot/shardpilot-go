@@ -464,6 +464,12 @@ scan_tree() {
     # It also removes the symlink special case. A symlink's blob IS its target
     # path, so the string the repository publishes arrives here as content,
     # without following anything.
+    # ⚠ EVERY EXTENSION TEST USES THIS, NOT `$f`. Shell patterns are
+    # case-sensitive and a file system is not: `probe.XPM` and `probe.MD`
+    # walked past the image refusal and the Markdown normalisation
+    # respectively, which is a rename away from any file that would be caught.
+    flc="$(printf '%s' "$f" | tr '[:upper:]' '[:lower:]')"
+
     # ⚠ AND A PRINTABLE SIGNATURE IN SOURCE IS A STRING CONSTANT. Code that
     # writes a PDF, or names a compression header, holds those characters
     # legitimately — and a refusal ends the run before the lane split, so an
@@ -477,7 +483,7 @@ scan_tree() {
     # was an unbound variable under `set -u` and the run died there — with the
     # probes reading that as a pass, because a dead run refuses nothing.
     printable_sigs=yes
-    case "$f" in
+    case "$flc" in
       *.go) printable_sigs=no ;;
     esac
     ls_entry="$(cd "$root" && git ls-files -s -z -- "$f" | tr -d '\000')"
@@ -572,7 +578,7 @@ scan_tree() {
     # The magic tests stay for a file that lies about its extension. What
     # neither catches is an image whose extension AND first bytes are both
     # innocent — stated, not solved.
-    case "$f" in
+    case "$flc" in
       *.png|*.jpg|*.jpeg|*.gif|*.webp|*.bmp|*.tif|*.tiff|*.ico|*.svg|*.xpm|\
       *.xbm|*.ppm|*.pgm|*.pbm|*.pnm|*.pcx|*.tga|*.psd|*.ai|*.eps|*.heic|\
       *.heif|*.avif)
@@ -589,8 +595,17 @@ scan_tree() {
     # and so apply to every file, and the PRINTABLE ones, which can and do not.
     case "$magic4" in
       89504e47|ffd8ff*|49492a00|4d4d002a) magic_hit=yes ;;
-      4d5a*|47494638|52494646|424d*|5031*|5032*|5033*|5034*|5035*|5036*|2f2a2058|21205850)
+      4d5a*|47494638|52494646|424d*|2f2a2058|21205850)
         magic_hit="$printable_sigs" ;;
+      # ⚠ NETPBM NEEDS ITS DELIMITER. `P1` through `P6` are a magic number only
+      # when whitespace follows; without that test an ordinary note opening
+      # `P1-priority planning` was refused as a raster — a false refusal on
+      # prose, which is the expensive direction for a gate that blocks merges.
+      503[1-6]*)
+        case "${magic4:4:2}" in
+          09|0a|0d|20) magic_hit="$printable_sigs" ;;
+          *)           magic_hit=no ;;
+        esac ;;
       *) magic_hit=no ;;
     esac
     case "$magic_hit" in
@@ -669,7 +684,7 @@ scan_tree() {
     # is REPORTED rather than gated, since a refusal ends the run before the
     # lane split can honour it.
     refs_apply=no
-    case "$f" in
+    case "$flc" in
       *.md|*.markdown|*.html|*.htm) refs_apply=yes ;;
     esac
     if [ "$refs_apply" = yes ] &&
@@ -727,14 +742,18 @@ scan_tree() {
     # trees today — measured — so refusing them would reject prose doing
     # nothing wrong. The substitution is per-line, so reported line numbers
     # stay true to the file.
-    case "$f" in
+    case "$flc" in
       *.md|*.markdown)
         # ⚠ EMPHASIS SPLITS A TOKEN ON THE PAGE AND NOT IN THE BYTES: an
         # identifier written with its digits bolded renders contiguously and
         # matches nothing. Asterisks and backticks are removed with the
         # escapes. UNDERSCORES ARE NOT — the feature-flag class is built from
         # them, and stripping them would break the one class that needs them.
-        if sed -e 's/\\\([^A-Za-z0-9]\)/\1/g' -e 's/[*`]//g' "$blob" > "$md_blob"; then
+        # ⚠ AND INLINE TAGS ANYWHERE IN THE DOCUMENT, not only a markup file.
+        # `ADR-<span>1234</span>` renders contiguously and matches nothing; the
+        # head-of-file check cannot see it because the file opens as prose.
+        # Tags are removed with the escapes and the emphasis.
+        if sed -e 's/\\\([^A-Za-z0-9]\)/\1/g' -e 's/[*`]//g' -e 's/<[^>]*>//g' "$blob" > "$md_blob"; then
           cat "$md_blob" > "$blob"
         else
           # refusal:structural
