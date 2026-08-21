@@ -219,9 +219,17 @@ cd "$(dirname "$0")/.."
 # written with an extra space, or broken across a line by a formatter, is the
 # same disclosure as the tidy spelling.
 # A SLASH IS A WRAP POINT TOO, and it needed its own rule: `[-_ ]+` cannot
-# describe `shardpilot/ integrations`, because the slash must stay literal
-# while the space around it must be optional. Text wraps either side of a
-# slash, so both are allowed.
+# describe an owner and a repository separated by a slash with a space beside
+# it, because the slash must stay literal while the space around it must be
+# optional. Text wraps either side of a slash, so both are allowed.
+#
+# ⚠ THE EXAMPLE THAT STOOD HERE WAS A LIVE INTERNAL REPOSITORY NAME. It was
+# published by this file and by nothing else in either tree, and it was
+# invisible to the audit below for exactly the reason this paragraph
+# describes — one space after the slash. It survived every round of review of
+# the change that introduced it. Illustrate the SHAPE, never an instance: an
+# example is the one place a real name gets written down without anybody
+# reading it as a disclosure.
 
 # The SHAPE half. These name no record, no ticket, no branch and no service, so
 # they are safe to publish in the file that gates against them.
@@ -250,7 +258,33 @@ gate_tmp() {
   GATE_TMP="$(mktemp)" || return 1
   GATE_TMPFILES+=("$GATE_TMP")
 }
-trap 'rm -f "${GATE_TMPFILES[@]}"' EXIT
+# ⚠ AND A RUN THAT DID NOT REACH ITS OWN END EXITS NON-ZERO, whatever the
+# shell says. Measured on bash 3.2: after a `set -u` failure the EXIT trap is
+# entered with `$?` ALREADY ZERO — the status of the last command that
+# completed — so capturing it recovers nothing and the gate reports success
+# having died mid-run. A flag set on the last line is the only thing that
+# distinguishes finishing from stopping, so that is what the trap reads.
+gate_finished=no
+
+# ⚠ THE TRAP PRESERVES THE STATUS, and does not touch an EMPTY array.
+# Measured on bash 3.2: a `set -u` failure followed by an EXIT trap whose last
+# command SUCCEEDS exits 0 — the shell dies mid-run, prints nothing on stdout,
+# and reports success. That is a dead run reading as a clean one, in the one
+# control here that must fail closed. An explicit `exit 2` was preserved, so
+# every refusal looked fine and only the fatal path was silent. The status is
+# captured before the cleanup and restored after it.
+#
+# `${a[@]+"${a[@]}"}` rather than `"${a[@]}"`: on that shell an EMPTY array is
+# itself an unbound variable, so the cleanup would fail before it could restore
+# anything.
+trap 'gate_rc=$?; rm -f ${GATE_TMPFILES[@]+"${GATE_TMPFILES[@]}"};
+      if [ "$gate_finished" != yes ] && [ "$gate_rc" = 0 ]; then
+        echo "REFUSING: this gate stopped before its own last line and the shell" >&2
+        echo "  reported success. Nothing here has been established; read the" >&2
+        echo "  error above this line, not the absence of findings." >&2
+        gate_rc=3
+      fi
+      exit "$gate_rc"' EXIT
 
 SELF_REL="scripts/$(basename "$SELF")"
 gate_tmp; SELF_BLOB="$GATE_TMP"
@@ -339,7 +373,7 @@ fi
 # the classes, so they are written plainly.
 GATE_DATA_NAMES='ROSTER KNOWN_INTERNAL KNOWN_INNOCENT FIXTURE_ACCENT_BODY FIXTURE_ACCENT_NAME FIXTURE_BINARY_BODY FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY FIXTURE_DIRTY_NAME FIXTURE_EMPHASIS_BODY FIXTURE_EMPHASIS_NAME FIXTURE_ESCAPE_BODY FIXTURE_ESCAPE_NAME FIXTURE_FLAG_BODY FIXTURE_FLAG_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY FIXTURE_NAMEHIT_NAME'
 
-PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not| never) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (exists?|existed|remains?|remained|runs?|ran|covers?|covered|exercises?|exercised|guards?|guarded))?( (for|of|in)|[.,;]|$)|[Tt]here (is|are)(n.{1,3}t| not) (any |no )?(harness|harnesses|coverage|tests?|suites?)|[Tt]here (is|are) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?)|(has|have|had) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|without( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Nn]obody (looks|checks|monitors)|[Ll]acks( any| automated| an?)* ?[A-Za-z-]*[ ]?(harness|harnesses|coverage|tests?|suites?|monitoring)|(has|have|had)(n.{1,3}t| not| never) been (tested|covered|scanned|audited|monitored)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
+PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not| never) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (exists?|existed|remains?|remained|runs?|ran|covers?|covered|exercises?|exercised|guards?|guarded))?( (for|of|in)|[.,;]|$)|[Tt]here (is|are)(n.{1,3}t| not) (any |no )?(harness|harnesses|coverage|tests?|suites?)|[Tt]here (is|are) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?)|(has|have|had) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Ww]ithout( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Nn]obody (looks|checks|monitors)|[Ll]acks( any| automated| an?)* ?[A-Za-z-]*[ ]?(harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|(has|have|had)(n.{1,3}t| not| never) been (tested|covered|scanned|audited|monitored)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 ROSTER='analytic[]s-service
 contro[]l-plane'
 KNOWN_INTERNAL='per ADR-[]0000 §[]000
@@ -369,6 +403,7 @@ The crash path was neve[]r tested.
 There are []zero tests for the payment parser.
 The payment parser has zero t[]ests.
 The parser ships without t[]ests.
+Without t[]ests for the parser this is a guess.
 The crash path is released without automated c[]overage.
 There aren'"'"'[][]t any tests for the payment parser.'
 KNOWN_INNOCENT='go get github.com/shardpilot/shardpilot-go@v0.6.0-alpha
@@ -383,6 +418,7 @@ an analytics-plane request, zero event batches
 No tests fail in CI.
 The suite has zero test failures.
 The parser runs without test failures in CI.
+The release lacks any test failures.
 Every test suite runs on both toolchains.'
 FIXTURE_ACCENT_BODY='internal: contro[]l-plane'
 FIXTURE_ACCENT_NAME='café.md'
@@ -407,6 +443,64 @@ for gate_var in $GATE_DATA_NAMES; do
   eval "$gate_var=\"\${$gate_var//\[\]/}\""
 done
 unset gate_var
+
+# ⚠ EVERY ASSIGNMENT IN THE BLOCK MUST BE ENUMERATED. The audits downstream
+# read the DECODED values, and they reach them through the name list — so an
+# assignment added to the block and forgotten in the list is decoded by nothing
+# and audited by nothing, while the raw scan sees only its broken spelling and
+# passes. A fixture carrying a live identifier could sit here indefinitely.
+# Checked against the block read from the INDEX, like everything else here.
+# ⚠ AND IT MUST READ THE QUOTING, not the line shape. A line INSIDE a
+# multi-line value can look exactly like an assignment — one of the innocent
+# strings is a pinned revision written as `NAME="..."` — and a line-shape test
+# called it an unlisted variable and refused the clean tree on its first run.
+# A BACKSLASH ESCAPES INSIDE DOUBLE QUOTES AND NOT INSIDE SINGLE ONES, and a
+# machine that ignored that left `\"` looking like a closing quote — the decode
+# loop's own `eval` line put it permanently inside a string, so every
+# assignment after it was invisible and the check passed anything added there.
+# The state machine below carries BOTH quote states across lines: the
+# `'\''` idiom leaves single-quote parity looking balanced when it is not, and
+# a machine that watched only one of the two ended a multi-line value early
+# and refused the clean tree. Only a name at quote depth zero counts.
+data_block_names="$(printf '%s\n' "$data_block" | awk '
+  BEGIN { inq = 0; ind = 0; sq = sprintf("%c", 39); dq = sprintf("%c", 34); bs = sprintf("%c", 92) }
+  {
+    if (inq == 0 && ind == 0 && $0 ~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
+      name = $0; sub(/=.*/, "", name); print name
+    }
+    i = 1
+    while (i <= length($0)) {
+      c = substr($0, i, 1)
+      if (inq) { if (c == sq) inq = 0; i++; continue }
+      if (ind) { if (c == bs) { i += 2; continue } ; if (c == dq) ind = 0; i++; continue }
+      if (c == bs) { i += 2; continue }
+      if (c == sq) inq = 1
+      else if (c == dq) ind = 1
+      i++
+    }
+  }' | sort -u)"
+while IFS= read -r data_name; do
+  [ -n "$data_name" ] || continue
+  # ⚠ TWO NAMES ARE EXEMPT, AND FOR STATED REASONS. `GATE_DATA_NAMES` is the
+  # list itself. `PATTERNS` carries no visible break — measured: it matches
+  # none of the classes — and it is not decoded by the loop, so it cannot be in
+  # the list; it is audited instead by the pattern-list rules below, which read
+  # it more strictly than any fixture. Nothing else is exempt.
+  case " GATE_DATA_NAMES PATTERNS $GATE_DATA_NAMES " in
+    *" $data_name "*) ;;
+    *)
+      # refusal:structural
+      echo "REFUSING: '$data_name' is assigned inside the data block but is not" >&2
+      echo "  listed in GATE_DATA_NAMES. Nothing decodes it and no audit reads" >&2
+      echo "  its value, so a live identifier written there would publish and" >&2
+      echo "  this gate would report clean. Add it to the list or move it out." >&2
+      exit 2
+      ;;
+  esac
+done <<EOF
+$data_block_names
+EOF
+
 
 # Container signatures, in ONE list, searched for ANYWHERE in a file — which
 # subsumes searching at byte zero, so there is nothing here for a second list
@@ -908,11 +1002,38 @@ scan_tree() {
         # ⚠ A MARKER IS ONLY EMPHASIS WHEN IT IS PAIRED, and deleting every one
         # of them INVENTED identifiers the page never showed: `ADR-*1234` with
         # a single unmatched asterisk renders WITH the asterisk — measured —
-        # and was refused as though it did not. Each rule now needs an opening
-        # run and a closing run, which is also what the surface needs.
+        # and was refused as though it did not. Each rule needs an opening run
+        # and a closing run, which is also what the surface needs.
+        #
+        # ⚠ AND NEITHER END OF THE CONTENT MAY BE A SPACE. Measured:
+        # `ADR-**1234 **` renders its asterisks LITERALLY, because a closing
+        # run cannot follow whitespace — and a rule that took the pair anyway
+        # invented a contiguous identifier out of clean prose. Both ends are
+        # checked, which
+        # is the same condition on the opening side.
+        #
+        # ⚠ AND THE TWO RUNS MUST BE THE SAME LENGTH. Measured: a two-marker
+        # opener against a one-marker closer renders `ADR-*1234` — the leftover
+        # stays on the side that had more, and the identifier is NOT contiguous
+        # — while a rule that swallowed both runs made it one and refused clean
+        # prose. Three substitutions per marker, longest first, so the excess
+        # is left exactly where the renderer leaves it.
+        #
+        # What that does NOT reproduce is the full delimiter-matching algorithm:
+        # a mismatched run whose leftover falls on the RIGHT (`_1234__`) is
+        # still consumed as a pair here and correctly reported, but a longer
+        # mismatch may be skipped rather than partially consumed. That direction
+        # is a MISS on a typo'd emphasis, not a false refusal, and the scope
+        # note says what stands against deliberate splitting.
         #
         # ⚠ THE RUN IS ONE TO THREE. `___1234___` is bold-italic and renders
         # contiguously; a rule written for one or two markers walked past it.
+        #
+        # ⚠ A CODE SPAN DROPS ONE SPACE FROM EACH END, and only when BOTH ends
+        # have one: measured, `` ` 1234 ` `` renders `1234` and `` ` 1234` ``
+        # renders with the space kept. Both forms are handled, because the
+        # first makes an identifier contiguous on the page and the second does
+        # not.
         #
         # ⚠ UNDERSCORES ALSO NEED A BOUNDARY, ASTERISKS DO NOT. The surface
         # does not emphasise an underscore between two word characters, which
@@ -932,11 +1053,22 @@ scan_tree() {
         # The underscore substitution runs TWICE: it consumes the boundary
         # character on each side, so `g` resumes past the opening boundary of a
         # second run and leaves it standing on the first pass.
-        if sed -e 's/\*\{1,3\}\([^* ][^*]*\)\*\{1,3\}/\1/g' \
-               -e 's/`\{1,3\}\([^` ][^`]*\)`\{1,3\}/\1/g' \
+        if sed -e 's/\*\{3\}\([^* ]\([^*]*[^* ]\)\{0,1\}\)\*\{3\}/\1/g' \
+               -e 's/\*\{2\}\([^* ]\([^*]*[^* ]\)\{0,1\}\)\*\{2\}/\1/g' \
+               -e 's/\*\([^* ]\([^*]*[^* ]\)\{0,1\}\)\*/\1/g' \
+               -e 's/`\{3\} \([^` ]\([^`]*[^` ]\)\{0,1\}\) `\{3\}/\1/g' \
+               -e 's/`\{3\}\([^` ]\([^`]*[^` ]\)\{0,1\}\)`\{3\}/\1/g' \
+               -e 's/`\{2\} \([^` ]\([^`]*[^` ]\)\{0,1\}\) `\{2\}/\1/g' \
+               -e 's/`\{2\}\([^` ]\([^`]*[^` ]\)\{0,1\}\)`\{2\}/\1/g' \
+               -e 's/` \([^` ]\([^`]*[^` ]\)\{0,1\}\) `/\1/g' \
+               -e 's/`\([^` ]\([^`]*[^` ]\)\{0,1\}\)`/\1/g' \
                -e 's/^/ /' -e 's/$/ /' \
-               -e 's/\([^A-Za-z0-9_]\)_\{1,3\}\([^_ ][^_]*\)_\{1,3\}\([^A-Za-z0-9_]\)/\1\2\3/g' \
-               -e 's/\([^A-Za-z0-9_]\)_\{1,3\}\([^_ ][^_]*\)_\{1,3\}\([^A-Za-z0-9_]\)/\1\2\3/g' \
+               -e 's/\([^A-Za-z0-9_]\)_\{3\}\([^_ ]\([^_]*[^_ ]\)\{0,1\}\)_\{3\}\([^A-Za-z0-9]\)/\1\2\4/g' \
+               -e 's/\([^A-Za-z0-9_]\)_\{3\}\([^_ ]\([^_]*[^_ ]\)\{0,1\}\)_\{3\}\([^A-Za-z0-9]\)/\1\2\4/g' \
+               -e 's/\([^A-Za-z0-9_]\)_\{2\}\([^_ ]\([^_]*[^_ ]\)\{0,1\}\)_\{2\}\([^A-Za-z0-9]\)/\1\2\4/g' \
+               -e 's/\([^A-Za-z0-9_]\)_\{2\}\([^_ ]\([^_]*[^_ ]\)\{0,1\}\)_\{2\}\([^A-Za-z0-9]\)/\1\2\4/g' \
+               -e 's/\([^A-Za-z0-9_]\)_\([^_ ]\([^_]*[^_ ]\)\{0,1\}\)_\([^A-Za-z0-9]\)/\1\2\4/g' \
+               -e 's/\([^A-Za-z0-9_]\)_\([^_ ]\([^_]*[^_ ]\)\{0,1\}\)_\([^A-Za-z0-9]\)/\1\2\4/g' \
                -e 's/^ //' -e 's/ $//' \
                -e 's/\\\([^A-Za-z0-9]\)/\1/g' "$blob" > "$md_blob"; then
           cat "$md_blob" > "$blob"
@@ -1071,6 +1203,84 @@ scan_tree() {
 # exists to hold those literals cannot be part of the answer.
 GATE_EXCLUDES=":(exclude)scripts/check_public_surface.sh"
 
+SHAPE_CANARY=zzzcanaryzzz
+SHAPE_AWK='  function distinct(body,   j, ch, nx, set, k, cnt) {
+    delete set
+    j = 1
+    while (j <= length(body)) {
+      ch = substr(body, j, 1)
+      if (substr(body, j + 1, 1) == "-" && j + 2 <= length(body)) {
+        nx = substr(body, j + 2, 1)
+        if (ch != nx) return 2
+        set[ch] = 1; j += 3; continue
+      }
+      set[ch] = 1; j++
+    }
+    cnt = 0
+    for (k in set) cnt++
+    return cnt
+  }
+  function shrink(r,   out, i, ch, e, body) {
+    out = ""; i = 1
+    while (i <= length(r)) {
+      ch = substr(r, i, 1)
+      if (ch != "[") { out = out ch; i++; continue }
+      e = i + 1
+      if (substr(r, e, 1) == "^") e++
+      if (substr(r, e, 1) == "]") e++
+      while (e <= length(r) && substr(r, e, 1) != "]") e++
+      body = substr(r, i + 1, e - i - 1)
+      if (distinct(body) <= 1) out = out substr(body, 1, 1)
+      else out = out "[" body "]"
+      i = e + 1
+    }
+    return out
+  }
+  # `cpos`/`opos`, NOT `close`/`open`: `close` is an awk BUILT-IN, and using it
+  # as a parameter name is a PARSE error — which writes nothing, exits 2, and
+  # leaves the caller reading an empty result as a clean pattern list. This
+  # whole audit was silent that way and every run stayed green.
+  function collapse(r,   cpos, opos, i, body, n, parts, seen, cnt, rep) {
+    while (1) {
+      cpos = index(r, ")")
+      if (cpos == 0) break
+      opos = 0
+      for (i = cpos - 1; i >= 1; i--) if (substr(r, i, 1) == "(") { opos = i; break }
+      if (opos == 0) break
+      body = substr(r, opos + 1, cpos - opos - 1)
+      if (body ~ /\[/) rep = "|"
+      else {
+        n = split(body, parts, "|")
+        delete seen; cnt = 0
+        for (i = 1; i <= n; i++) if (!(parts[i] in seen)) { seen[parts[i]] = 1; cnt++ }
+        rep = (cnt <= 1) ? parts[1] : "|"
+      }
+      r = substr(r, 1, opos - 1) rep substr(r, cpos + 1)
+    }
+    return r
+  }
+  function check(a,   r) {
+    if (a == "") return
+    r = collapse(shrink(a))
+    if (r ~ /[[|]/) return
+    print a
+  }
+  {
+    depth = 0; inbr = 0; alt = ""
+    for (i = 1; i <= length($0); i++) {
+      c = substr($0, i, 1)
+      if (c == "\\") { alt = alt c substr($0, i + 1, 1); i++; continue }
+      if (inbr) { if (c == "]") inbr = 0; alt = alt c; continue }
+      if (c == "[") { inbr = 1; alt = alt c; continue }
+      if (c == "(") { depth++; alt = alt c; continue }
+      if (c == ")") { depth--; alt = alt c; continue }
+      if (c == "|" && depth == 0) { check(alt); alt = ""; continue }
+      alt = alt c
+    }
+    check(alt)
+  }'
+
+
 roster_is_present_in_the_tree() {
   local lit novel=0 found
   gate_tmp; found="$GATE_TMP"
@@ -1111,6 +1321,13 @@ EOF
   # their own classes, not for arbitrary words. Adding a literal internal name as an alternative made this
   # file its sole publisher and everything stayed green.
   #
+  # ⚠ AND A BRANCH WHOSE ARMS ARE THE SAME IS NOT A BRANCH. `(-|-)` put a `|`
+  # in the text without letting the pattern match anything a plain hyphen could
+  # not, so a literal name could be dressed as a shape and the character-level
+  # audit below could not reconstruct it across the group syntax. Groups are
+  # now collapsed innermost-first: identical arms reduce to the arm, and only a
+  # group that can genuinely match two different things survives as a branch.
+  #
   # Top-level alternatives are split on `|` outside brackets and groups, and
   # each must contain a CHARACTER CLASS THAT CAN MATCH MORE THAN ONE CHARACTER,
   # or a BRANCH. That is a whitelist of what makes a pattern a shape, and it
@@ -1131,64 +1348,30 @@ EOF
   # list today satisfies this on its own.
   #
   # Names belong in the roster, which is checked against the tree.
+  # ⚠ ONE SPELLING OF THIS PROGRAM, AND IT IS ASKED TO FLAG SOMETHING ON EVERY
+  # RUN. An awk that fails to PARSE writes nothing and exits non-zero into a
+  # command substitution, where the status is discarded — so the loop below
+  # reads an empty result and reports a clean pattern list. That is exactly
+  # what happened: a built-in name used as a parameter silenced this audit
+  # completely while every run stayed green, and no output could distinguish it
+  # from a pattern list with nothing wrong. A canary that MUST be reported is
+  # the only thing that tells those two apart.
+  shape_canary="$(printf '%s' "$SHAPE_CANARY" | awk "$SHAPE_AWK" 2>/dev/null || true)"
+  if [ "$shape_canary" != "$SHAPE_CANARY" ]; then
+    # refusal:structural
+    echo "REFUSING: the pattern-shape audit did not report its own canary." >&2
+    echo "  It is handed one bare literal alternative that must come back, and" >&2
+    echo "  it came back as '$shape_canary'. The audit is not running, so its" >&2
+    echo "  silence on the real pattern list means nothing." >&2
+    exit 2
+  fi
+
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
     printf 'PROSE VIOLATION: the pattern list holds a bare literal alternative: %s\n' "$lit" >&2
     novel=$((novel + 1))
   done <<EOF
-$(printf '%s' "$PATTERNS" | awk '
-  function distinct(body,   j, ch, nx, set, k, cnt) {
-    delete set
-    j = 1
-    while (j <= length(body)) {
-      ch = substr(body, j, 1)
-      if (substr(body, j + 1, 1) == "-" && j + 2 <= length(body)) {
-        nx = substr(body, j + 2, 1)
-        if (ch != nx) return 2
-        set[ch] = 1; j += 3; continue
-      }
-      set[ch] = 1; j++
-    }
-    cnt = 0
-    for (k in set) cnt++
-    return cnt
-  }
-  function shrink(r,   out, i, ch, e, body) {
-    out = ""; i = 1
-    while (i <= length(r)) {
-      ch = substr(r, i, 1)
-      if (ch != "[") { out = out ch; i++; continue }
-      e = i + 1
-      if (substr(r, e, 1) == "^") e++
-      if (substr(r, e, 1) == "]") e++
-      while (e <= length(r) && substr(r, e, 1) != "]") e++
-      body = substr(r, i + 1, e - i - 1)
-      if (distinct(body) <= 1) out = out substr(body, 1, 1)
-      else out = out "[" body "]"
-      i = e + 1
-    }
-    return out
-  }
-  function check(a,   r) {
-    if (a == "") return
-    r = shrink(a)
-    if (r ~ /[[|]/) return
-    print a
-  }
-  {
-    depth = 0; inbr = 0; alt = ""
-    for (i = 1; i <= length($0); i++) {
-      c = substr($0, i, 1)
-      if (c == "\\") { alt = alt c substr($0, i + 1, 1); i++; continue }
-      if (inbr) { if (c == "]") inbr = 0; alt = alt c; continue }
-      if (c == "[") { inbr = 1; alt = alt c; continue }
-      if (c == "(") { depth++; alt = alt c; continue }
-      if (c == ")") { depth--; alt = alt c; continue }
-      if (c == "|" && depth == 0) { check(alt); alt = ""; continue }
-      alt = alt c
-    }
-    check(alt)
-  }')
+$(printf '%s' "$PATTERNS" | awk "$SHAPE_AWK")
 EOF
 
   # ⚠ READ FROM THE INDEX, both of them. These audits look for literals this
@@ -1227,7 +1410,16 @@ EOF
   # nowhere else in the tree was demonstrated to pass everything else.
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
-    # ⚠ CASE-INSENSITIVELY, BECAUSE THE EXTRACTION ABOVE IS. A repository
+  # ⚠ WHITESPACE AROUND THE SLASH IS REMOVED FIRST. An owner and a repository
+  # written with a space beside the slash are as legible to a reader as the
+  # tight spelling and matched neither this audit nor the ordinary patterns, so
+  # the one file that could report such a name was its sole publisher and
+  # stayed green. Not hypothetical: the first run of this rule found one that
+  # had been standing in the header comment above, on the default branch of
+  # both repositories. Canonicalised before extraction rather than added as a
+  # second pattern, so there is one spelling to keep correct.
+  #
+  # ⚠ CASE-INSENSITIVELY, BECAUSE THE EXTRACTION ABOVE IS. A repository
     # spelled with capitals here and in the ordinary lower case everywhere else
     # would be found nowhere by a case-sensitive lookup, and a clean tree would
     # be refused as a novel disclosure. Repository names are case-insensitive
@@ -1238,8 +1430,10 @@ EOF
       novel=$((novel + 1))
     fi
   done <<EOF
-$( { grep -hoiE 'shardpilot/[A-Za-z0-9][A-Za-z0-9._-]*' "$SELF_BLOB"
-     printf '%s\n' "$corpus_values" | grep -oiE 'shardpilot/[A-Za-z0-9][A-Za-z0-9._-]*'; } | sort -u )
+$( { sed -E 's#([A-Za-z0-9])[[:space:]]+/[[:space:]]*#\1/#g; s#([A-Za-z0-9])/[[:space:]]+#\1/#g' "$SELF_BLOB"
+     printf '%s\n' "$corpus_values" \
+       | sed -E 's#([A-Za-z0-9])[[:space:]]+/[[:space:]]*#\1/#g; s#([A-Za-z0-9])/[[:space:]]+#\1/#g'
+   } | grep -hoiE 'shardpilot/[A-Za-z0-9][A-Za-z0-9._-]*' | sort -u )
 EOF
 
   # Identifiers, in every class the patterns name, admitted by shape alone. A
@@ -1442,7 +1636,7 @@ EOF
   # Its own accumulator and its own trap: the subshell cannot add to the
   # parent's list, and clearing the inherited copy keeps its trap from removing
   # files the parent still needs.
-  ( GATE_TMPFILES=(); trap 'rm -f "${GATE_TMPFILES[@]}"' EXIT
+  ( GATE_TMPFILES=(); trap 'gate_rc=$?; rm -f ${GATE_TMPFILES[@]+"${GATE_TMPFILES[@]}"}; exit "$gate_rc"' EXIT
     scan_tree "$nul_tmp" ) >/dev/null 2>&1 || nul_status=$?
   fixture_checks=$((fixture_checks + 1))
   [ "$nul_status" -eq 2 ] || {
@@ -1512,4 +1706,5 @@ if [ -n "$scan_lane_a" ]; then
   printf '%s' "$scan_lane_a" >&2
   exit 1
 fi
+gate_finished=yes
 echo "LANE A (GATED) — clean. ${scan_files} tracked file(s) were read; a run that scanned none refuses above rather than reporting this line."
