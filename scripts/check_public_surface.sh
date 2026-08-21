@@ -156,139 +156,67 @@ cd "$(dirname "$0")/.."
 # Files the gate must not read as content: this script is the one place the
 # patterns are written down, by construction.
 
-# gate-self-exempt:begin definitions
-RESERVED_ADR_IDS='ADR-0000 ADR-0999'
-ROSTER='analytics-service
-control-plane'
-roster_regex() {
-  printf '%s' "$ROSTER" | sed -e 's![-_ ]![-_ ]+!g' -e 's!/! */ *!g' | paste -sd'|' -
-}
-ROSTER_RE="$(roster_regex)"
-PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (for|of|in)|[.,;]|$)|[Nn]obody (looks|checks|monitors)|[Ll]acks( any| automated| an?)* ?[A-Za-z-]*[ ]?(harness|harnesses|coverage|tests?|suites?|monitoring)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
-# gate-self-exempt:end
-
-# ⚠ THIS FILE IS SCANNED TOO, with only two regions removed first.
-#
-# It used to exempt itself entirely, and that exemption is where every one of
-# this file's own disclosures hid: a paragraph naming two internal repositories
-# while announcing their removal, a live decision-record id in a fixture, and a
-# published statement of where our testing does not reach. Each was found by a
-# reviewer rather than by the gate, because the gate could not read its own
-# prose. Two bespoke checks were bolted on for two of those shapes, and the
-# rest stayed unreadable — a comment here carrying an ordinary ticket
-# reference passed the whole gate.
-#
-# So the exemption is now the SMALLEST thing that cannot be scanned: the
-# pattern definitions and the synthetic fixture corpus, both delimited by
-# `gate-self-exempt` markers below. They match by construction; every other
-# line of this file is ordinary published prose and is treated as such. That
-# also retires the two bespoke passes, because the real classes now cover
-# what they covered.
-self_scan_body() {
-  local begins ends kept total
-  # ⚠ ONE ANCHOR, USED BY BOTH THE COUNT AND THE STRIPPER. They were written
-  # separately and disagreed: the count accepted a marker with leading
-  # whitespace, awk demanded column zero. An indented marker therefore counted
-  # as balanced while the stripper never saw it — the same silent over-blanking
-  # this check was added to catch, reintroduced by the check itself.
-  # ⚠ ONE MARKER GRAMMAR, USED BY ALL THREE READERS. Every hole this mechanism
-  # has had came from readers disagreeing about what a marker IS. The counters
-  # and the stripper accepted any line STARTING with the token, while the label
-  # extractor required a space and a label after it — so a block written
-  # `:beginX` / `:endX` counted, was blanked by the stripper, and contributed no
-  # label, leaving the label set looking exactly right while a fourth region
-  # quietly swallowed whatever it wrapped.
-  #
-  # The grammar is now exact and shared: a begin marker is the token, one space
-  # and a lower-case label to end of line; an end marker is the token and
-  # nothing else. Anything that merely resembles one is not a marker at all —
-  # it is an ordinary comment, which means it is SCANNED rather than trusted.
-  BEGIN_RE='^[[:space:]]*# gate-self-exempt:begin [a-z][a-z ]*$'
-  END_RE='^[[:space:]]*# gate-self-exempt:end$'
-  begins="$(grep -cE "$BEGIN_RE" "$1" || true)"
-  ends="$(grep -cE "$END_RE" "$1" || true)"
-  # ⚠ BALANCED, AND CHECKED — because an unterminated block fails SILENTLY and
-  # generously. `skip` never resets, every line after the opener is blanked,
-  # and the scan reports a file it did not read as clean. Both blocks were
-  # unterminated when this function was introduced (one marker concatenated
-  # onto a comment, the other never written), 117 of 609 lines survived, and a
-  # mutation test still passed because the planted line sat above the first
-  # marker. A guard whose failure mode is "sees less" must say so.
-  # `|| true`, like the two counts above. A no-match grep exits 1, and whether
-  # that aborts under `set -euo pipefail` before the explicit check below can
-  # run depends on how bash treats a failing substitution in an assignment —
-  # empirically it does not here, but a refusal that depends on that reading is
-  # a refusal resting on a subtlety. The explicit check is meant to be the
-  # thing that reports; this makes sure it is the thing that runs.
-  labels="$(grep -oE "$BEGIN_RE" "$1" \
-    | sed -E 's/.*:begin //' | sort | tr '\n' ',' || true)"
-  if [ "$labels" != "definitions,fixtures,scan fixture," ]; then
-    echo "REFUSING: $1 has exempt regions [$labels], expected exactly" >&2
-    echo "  [definitions,fixtures,scan fixture,]. Balanced and non-nested was not" >&2
-    echo "  enough — any number of well-formed blocks passed, so a new one could" >&2
-    echo "  blank arbitrary prose silently. Adding a region means naming it here." >&2
-    exit 2
-  fi
-  if [ "$begins" != "$ends" ] || [ "$begins" -eq 0 ]; then
-    echo "REFUSING: $1 has $begins gate-self-exempt:begin marker(s) and $ends end marker(s)." >&2
-    echo "  An unterminated block blanks the rest of the file and the scan then" >&2
-    echo "  reports what it never read as clean. Markers must be balanced and" >&2
-    echo "  each must start its own line." >&2
-    exit 2
-  fi
-  # ⚠ NO PROSE INSIDE AN EXEMPT REGION. Shrinking the regions to data reduced
-  # this surface; it did not close it, because a comment inserted among the
-  # assignments is still blanked and therefore still unreadable. A region
-  # exists to hold text that matches BY CONSTRUCTION — assignments and fixture
-  # corpora — and a sentence is never that. INLINE comments count: the whole
-  # line is blanked either way, so a sentence appended to the end of a fixture
-  # line is exactly as unreadable as one on its own line. Refusing both makes
-  # "hide prose in the exemption" impossible rather than merely unlikely, and
-  # it costs one pass.
-  if awk -v b="$BEGIN_RE" -v e="$END_RE" '
-    $0 ~ b { inside = 1; next }
-    $0 ~ e { inside = 0; next }
-    inside && $0 ~ /^[[:space:]]*#|[[:space:]]#/ { print NR ": " $0; found = 1 }
+# The by-construction material — patterns, roster, fixture corpora — lives in
+# its own file so that THIS file can be scanned end to end with no exemptions.
+# See scripts/gate-corpus.sh for why that separation exists.
+CORPUS="$(dirname "$SELF")/gate-corpus.sh"
+if [ ! -f "$CORPUS" ]; then
+  echo "REFUSING: $CORPUS is missing." >&2
+  echo "  It holds the class patterns and the fixture corpora; without it the" >&2
+  echo "  gate would scan with an empty pattern list and report clean." >&2
+  exit 2
+fi
+# shellcheck source=/dev/null
+. "$CORPUS"
+# ⚠ THE CORPUS IS THE ONE PATH THE GATE SKIPS, so it gets its own grammar check.
+# Below its header it must contain assignments and their continuations and
+# nothing else: no comments, which is where prose hid six times when the
+# exemptions were regions inside this file. It cannot be a hiding place if it
+# cannot hold a sentence that is not a fixture.
+# `;#` counts too: a comment after a control operator is valid shell and was
+# the seventh way prose got into an unread place, found after the sixth was
+# closed. The residual limit is stated rather than chased — a sentence inside a
+# fixture STRING is indistinguishable from a fixture, by construction, which is
+# why this file is kept to a corpus small enough to read as a list of sentences.
+# ⚠ THE HEADER ENDS WHERE THE DATA BEGINS, detected rather than counted. The
+# first version skipped a fixed number of lines, which is a magic number that
+# is wrong the moment the header changes length — and it was: it silently
+# excused the first assignment, so the very case this check was added for went
+# unseen.
+if awk '
+    !started && /^[[:space:]]*(#|$)/ { next }
+    { started = 1 }
+    started && ($0 ~ /^[[:space:]]*#/ || $0 ~ /;[[:space:]]*#/) { print NR ": " $0; found = 1 }
     END { exit !found }
-  ' "$1"; then
-    echo "REFUSING: $1 has comment lines inside a gate-self-exempt region (above)." >&2
-    echo "  Those lines are blanked before scanning, so they are prose the gate" >&2
-    echo "  cannot read. A region holds text that matches by construction; move" >&2
-    echo "  the explanation outside the markers, where it is scanned like any" >&2
-    echo "  other line." >&2
-    exit 2
-  fi
+  ' "$CORPUS"; then
+  echo "REFUSING: $CORPUS has comments below its header (listed above)." >&2
+  echo "  The gate skips this path, so a comment here is prose no pass reads —" >&2
+  echo "  in a published repository. It holds assignments and continuations." >&2
+  exit 2
+fi
 
-  if ! awk -v b="$BEGIN_RE" -v e="$END_RE" '
-    $0 ~ b {
-      depth++
-      if (depth > 1) { print "nested exempt region at line " NR > "/dev/stderr"; exit 3 }
-    }
-    { if (!depth) print; else print "" }
-    $0 ~ e {
-      depth--
-      if (depth < 0) { print "unopened end marker at line " NR > "/dev/stderr"; exit 3 }
-    }
-    END { if (depth != 0) { print "unterminated exempt region" > "/dev/stderr"; exit 3 } }
-  ' "$1" > "$2"; then
-    echo "REFUSING: $1 has a malformed gate-self-exempt region (see above)." >&2
-    echo "  Nesting is refused rather than supported: one exempt region has no" >&2
-    echo "  reason to contain another, and the stripper closing on the first end" >&2
-    echo "  marker would blank prose after it while the counts still balanced." >&2
+for required in PATTERNS ROSTER ROSTER_RE RESERVED_ADR_IDS KNOWN_INTERNAL KNOWN_INNOCENT; do
+  eval "value=\${$required:-}"
+  if [ -z "$value" ]; then
+    echo "REFUSING: $CORPUS did not define $required." >&2
+    echo "  An empty pattern list matches nothing and reports every file clean." >&2
     exit 2
   fi
-  # And a floor on how much survives. Balanced markers can still swallow the
-  # file if a block is opened early and closed late; this is cheap and catches
-  # that without pretending to know the right number.
-  total="$(grep -c '' "$1")"
-  kept="$(grep -c . "$2" || true)"
-  if [ "$kept" -lt $(( total / 4 )) ]; then
-    echo "REFUSING: stripping the exempt regions of $1 left $kept non-blank lines of $total." >&2
-    echo "  That is not an exemption, it is the file disappearing." >&2
-    exit 2
-  fi
-}
+done
 
+# ⚠ THIS FILE IS SCANNED END TO END, WITH NO EXEMPTIONS AT ALL.
+#
+# It used to exempt regions of itself, marked off with comments, and every
+# version of that arrangement turned out to be somewhere to hide things — six
+# variants in six review rounds: an unterminated region blanked the rest of the
+# file; a nested one closed early; a suffixed marker counted without
+# contributing a label; a comment inside a region was unreadable; an inline
+# comment likewise; and finally an ordinary data line. Each fix produced the
+# next variant, because the shape was wrong rather than the implementation.
+#
+# The material that matches by construction now lives in scripts/gate-corpus.sh
+# and is excluded by PATH — a fact about the repository, not a marker anyone can
+# write into a file. This one is read like every other file here.
 # ---------------------------------------------------------------------------
 # scan_tree <root> — runs the REAL scan over one checkout and sets the globals
 # below. Factored out so the self-test can exercise THE SCAN, not just the
@@ -333,6 +261,10 @@ scan_tree() {
   fi
 
   while IFS= read -r -d '' f; do
+    # The corpus is the one path this gate does not read: its entire content
+    # matches by construction. Excluded by path rather than by a marker, so
+    # nothing written INSIDE a file can extend the exemption.
+    [ "$f" = "scripts/gate-corpus.sh" ] && continue
     # THE PATH ITSELF IS PUBLISHED CONTENT. An internal identifier in a file
     # NAME — a decision-record id, a ticket, a service name in a directory —
     # reaches every consumer and appears in no file's body, so scanning only
@@ -410,11 +342,7 @@ scan_tree() {
     # every other file is read as-is. `self_scan_body` preserves line numbering
     # by emitting an empty line per removed line, so reported line numbers stay
     # true to the file on disk.
-    if [ "$f" = "scripts/check_public_surface.sh" ]; then
-      scan_src="$(mktemp)"; self_scan_body "$root/$f" "$scan_src"
-    else
-      scan_src="$root/$f"
-    fi
+    scan_src="$root/$f"
     hits="$(grep -anE -- "$PATTERNS" "$scan_src" 2>/dev/null \
       | tr -d '\000'; exit "${PIPESTATUS[0]}")"
     status=$?
@@ -443,7 +371,6 @@ scan_tree() {
         exit 2
       fi
     done
-    [ "$scan_src" = "$root/$f" ] || rm -f "$scan_src"
     if [ "$status" -ne 0 ] && [ "$roster_status" -ne 0 ]; then
       continue
     fi
@@ -484,40 +411,6 @@ scan_tree() {
 # roster the ROSTER rule above exists to bound. The earlier version used a live
 # ADR id, a live feature-flag name and a live ticket number, none of which the
 # test needed.
-# gate-self-exempt:begin fixtures
-KNOWN_INTERNAL='per ADR-0000 §3
-There are no Playwright tests for the console.
-There are no end-to-end tests for the purchase flow.
-The console has no end-to-end tests for purchase callbacks.
-The console does not have automated tests.
-The console has no tests.
-The crash path is untested.
-There is NO Playwright harness in the console repo
-the crash path is not covered by automated tests
-no automated scanning for that class of input
-a bare §7c left behind when a record id was stripped
-tracked as GAP-000 internally
-pinned to main @ 0000000
-nobody looks at that dashboard
-tracked as SP-123 in the internal board
-filed as AC-QA-7 during triage
-the console lacks automated tests
-(Codex go#48 round 3)
-EXAMPLE_SYNTHETIC_FLAG_MODE=off'
-KNOWN_INTERNAL="$KNOWN_INTERNAL
-The crash path isn$(printf '\047')t tested.
-The console doesn$(printf '\342\200\231')t have automated tests."
-
-KNOWN_INNOCENT='go get github.com/shardpilot/shardpilot-go@v0.6.0-alpha
-IngestURL: os.Getenv("SHARDPILOT_INGEST_URL")
-POST {IngestURL}/v1/events:batch
-https://localhost:8080 during local development
-a documented per-platform adaptation, not drift
-DEFOLD_SHA1="f735c12192bf95684e6ae1ae27c400b8170fc6d8"
-a self-service signup flow, a micro-service boundary
-the event plane and the consent plane are separate
-an analytics-plane request, zero event batches'
-# gate-self-exempt:end
 
 # roster_is_present_in_the_tree — the rule from the ROSTER block, executed.
 #
@@ -668,19 +561,21 @@ EOF
   # The filenames are described rather than written: this prose is scanned like
   # any other, and naming the fixtures here would put their identifiers into a
   # part of the file the gate reads.
-  # gate-self-exempt:begin scan fixture
+  # Every name and body comes from the corpus file. This block used to carry
+  # them inline and needed its own exemption; with the literals gone it is
+  # ordinary code and is scanned like the rest of this file.
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
   (
     cd "$tmp"
     git init -q .
     git config user.email t@t; git config user.name t
-    printf 'clean customer prose\n' > clean.md
-    printf 'nothing internal in the body\n' > ADR-0999-notes.md
-    printf 'see ADR-0000 for context\n' > dirty.md
-    printf '// GAP-000 note\npackage x\n' > lane_b.go
-    printf 'internal: control-plane\n' > "café.md"
-    printf 'x\0see ADR-0999 here\n' > binary.bin
+    printf '%s\n' "$FIXTURE_CLEAN_BODY"   > "$FIXTURE_CLEAN_NAME"
+    printf '%s\n' "$FIXTURE_NAMEHIT_BODY" > "$FIXTURE_NAMEHIT_NAME"
+    printf '%s\n' "$FIXTURE_DIRTY_BODY"   > "$FIXTURE_DIRTY_NAME"
+    printf '%s\n' "$FIXTURE_LANEB_BODY"   > "$FIXTURE_LANEB_NAME"
+    printf '%s\n' "$FIXTURE_ACCENT_BODY"  > "$FIXTURE_ACCENT_NAME"
+    printf 'x\0%s\n' "$FIXTURE_BINARY_BODY" > "$FIXTURE_BINARY_NAME"
     git add -A >/dev/null 2>&1
   )
   scan_tree "$tmp"
@@ -694,13 +589,12 @@ EOF
     echo "SELFTEST: the scan missed the non-ASCII path (core.quotePath)" >&2; fixture_fail=1; }
   printf '%s' "$scanned_a" | grep -q '^binary\.bin:' || {
     echo "SELFTEST: the scan missed the NUL-bearing file (grep -a)" >&2; fixture_fail=1; }
-  printf '%s' "$scanned_a" | grep -q '^ADR-0999-notes\.md:path:' || {
+  printf '%s' "$scanned_a" | grep -qF -- "$FIXTURE_NAMEHIT_NAME:path:" || {
     echo "SELFTEST: the scan missed an internal identifier in a PATH NAME" >&2; fixture_fail=1; }
   printf '%s' "$scanned_a" | grep -q '^clean\.md:' && {
     echo "SELFTEST: the scan flagged clean.md" >&2; fixture_fail=1; }
   [ "$scan_lane_b_files" -eq 1 ] || {
     echo "SELFTEST: lane B counted $scan_lane_b_files files, expected 1" >&2; fixture_fail=1; }
-  # gate-self-exempt:end
   if [ "$fixture_fail" -ne 0 ]; then
     echo "REFUSING: the scan failed its own fixture." >&2
     exit 2
