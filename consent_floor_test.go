@@ -6594,3 +6594,58 @@ func TestAbsentStampReadsAsInfinitelyNew(t *testing.T) {
 		}
 	}
 }
+
+// TestStaleMarkIsRefreshedByANewerUnusableTrail closes the liveness half of
+// the ordering rule. Turning the mark from a veto into a comparison creates a
+// second obligation: the stamp has to MOVE when the uncertainty is renewed.
+// An already-marked record whose trail becomes unusable again — now holding a
+// grant newer than the old stamp — would otherwise keep its stale stamp, and
+// that grant compares newer and heals into live consent on the next start.
+func TestStaleMarkIsRefreshedByANewerUnusableTrail(t *testing.T) {
+	_, server := newFloorTestServer(t)
+	defer server.Close()
+
+	dir := t.TempDir()
+	// Already marked, with an OLD stamp.
+	old := consentRecordInfo{state: ConsentGranted, decidedAt: "2026-07-19T00:00:00Z", floor: true}
+	if err := markConsentRecordUnwitnessed(dir, old, spoolTestActorDigest(),
+		"2026-07-19T00:00:00Z", os.Rename, os.Chmod); err != nil {
+		t.Fatalf("seed marked record: %v", err)
+	}
+	// A trail that is unusable NOW and holds a grant newer than that stamp.
+	newerGrant := testConsentReceipt("key-newer-grant", true)
+	newerGrant.DecidedAt = "2026-07-22T00:00:00Z"
+	malformed := testConsentReceipt("key-later-deny-broken", false)
+	malformed.WorkspaceID = ""
+	if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName),
+		mustMarshalOutbox(t, newerGrant, malformed), 0o600); err != nil {
+		t.Fatalf("seed outbox: %v", err)
+	}
+
+	first := newFloorTestClient(t, server.URL, dir, nil)
+	if got := first.Consent(); got == ConsentGranted {
+		t.Fatalf("first start promoted the grant: %v", got)
+	}
+	_ = first.Close(context.Background())
+
+	// The stamp must have moved to cover the trail seen on this start.
+	refreshed, ok := loadConsentRecordInfo(dir, spoolTestActorDigest())
+	if !ok || !refreshed.unwitnessed {
+		t.Fatalf("the mark disappeared: %+v ok=%v", refreshed, ok)
+	}
+	if refreshed.unwitnessedAt != "2026-07-22T00:00:00Z" {
+		t.Fatalf("stale stamp survived a newer unusable trail: %q", refreshed.unwitnessedAt)
+	}
+
+	// And the OUTCOME: launder the outbox as housekeeping would, leaving only
+	// the grant. It must still not take effect.
+	if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName),
+		mustMarshalOutbox(t, newerGrant), 0o600); err != nil {
+		t.Fatalf("launder outbox: %v", err)
+	}
+	second := newFloorTestClient(t, server.URL, dir, nil)
+	defer func() { _ = second.Close(context.Background()) }()
+	if got := second.Consent(); got == ConsentGranted {
+		t.Fatalf("a grant covered by the refreshed mark was healed into live consent: %v", got)
+	}
+}

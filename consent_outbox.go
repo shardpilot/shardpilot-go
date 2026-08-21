@@ -1286,17 +1286,12 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 		markFailed := false
 		if grantsUnprovable {
 			switch {
-			case recordOK && record.state != ConsentUnknown && !record.unwitnessed:
+			case recordOK && record.state != ConsentUnknown &&
+				consentMarkSupersededBy(record, c.consentOutboxMarkStamp(record)):
 				// Mark whatever decision is on file — grant or denial. The
 				// helper preserves the state, the stamp and the provenance
 				// and only adds the mark.
-				// The stamp is the newest DecidedAt the trail shows right
-				// now, so a decision recorded LATER is provably one this
-				// mark could not have been about.
-				markAt := c.consentOutbox.maxDecidedAt()
-				if markAt == "" {
-					markAt = record.decidedAt
-				}
+				markAt := c.consentOutboxMarkStamp(record)
 				if err := markConsentRecordUnwitnessed(c.cfg.SpoolDir, record, digest, markAt, rename, chmod); err != nil {
 					markFailed = true
 					c.consentOutbox.preserveEvidence()
@@ -1393,6 +1388,17 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 		// nudge is consumed by the worker's select as soon as it starts.
 		c.wakeConsentDispatch()
 	}
+}
+
+// consentOutboxMarkStamp is the stamp a mark applied RIGHT NOW would carry:
+// the newest decision time the trail currently shows, falling back to the
+// record's own stamp when the trail is empty. A decision recorded later than
+// this is provably one the mark could not have been about.
+func (c *Client) consentOutboxMarkStamp(record consentRecordInfo) string {
+	if at := c.consentOutbox.maxDecidedAt(); at != "" {
+		return at
+	}
+	return record.decidedAt
 }
 
 // consentReceiptInScope reports whether a retained receipt describes THIS
