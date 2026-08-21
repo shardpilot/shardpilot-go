@@ -6721,30 +6721,43 @@ func TestOutboxWriterNeverExceedsItsOwnReadLimit(t *testing.T) {
 	// ONLY the genuinely unbounded fields. WorkspaceID, AppID and
 	// EnvironmentID are checked for non-emptiness and nothing else;
 	// ActorIdentifier and AnonymousID go through validConsentIdentifier and
-	// are clamped at maxConsentIdentifierBytes, so padding THOSE makes the
-	// sanitizer drop the whole receipt and the test passes for the wrong
-	// reason — which is exactly what an earlier version of it did.
+	// are clamped, so padding THOSE makes the sanitizer drop the whole
+	// receipt and the test passes for the wrong reason — which is what an
+	// earlier version of it did.
 	huge := strings.Repeat("w", 64<<10)
+	refused := false
 	for i := 0; i < 8; i++ {
 		r := testConsentReceipt(fmt.Sprintf("key-big-%02d", i), false)
 		r.WorkspaceID = huge
 		r.AppID = huge
 		r.EnvironmentID = huge
-		if failed := outbox.append(r); failed {
-			t.Fatalf("append %d reported a persist failure", i)
+		if outbox.append(r) {
+			refused = true
 		}
 	}
+
+	// TWO acceptable outcomes, and one forbidden one. The writer may make
+	// room by shedding entries that are already SETTLED, or it may refuse —
+	// but it may never leave a file its own reader would call corrupt, and
+	// it may never silently discard a decision that has not been delivered.
 	data, err := os.ReadFile(filepath.Join(dir, consentOutboxFileName))
-	if err != nil {
+	if err != nil && !os.IsNotExist(err) {
 		t.Fatalf("read record: %v", err)
 	}
-	if len(data) > consentOutboxReadLimit {
-		t.Fatalf("the writer produced %d bytes, past its own %d-byte read limit", len(data), consentOutboxReadLimit)
+	if err == nil {
+		if len(data) > consentOutboxReadLimit {
+			t.Fatalf("the writer produced %d bytes, past its own %d-byte read limit", len(data), consentOutboxReadLimit)
+		}
+		if _, state := newConsentOutbox(dir).readRecordReceipts(); state != consentOutboxReadParsed {
+			t.Fatalf("the SDK's own record reads back as state %d, not parsed", state)
+		}
 	}
-	// And the record it wrote must read back as USABLE, not as corruption.
-	_, state := newConsentOutbox(dir).readRecordReceipts()
-	if state != consentOutboxReadParsed {
-		t.Fatalf("the SDK's own record reads back as state %d, not parsed", state)
+	// Nothing pending was dropped: every appended decision is still held.
+	if got := len(outbox.snapshot()); got != 8 {
+		t.Fatalf("undelivered decisions were discarded to make room: %d of 8 remain", got)
+	}
+	if refused && !outbox.writeOwed() {
+		t.Fatalf("a refused write was not recorded as owed")
 	}
 }
 
@@ -7012,5 +7025,80 @@ func TestRollbackCannotAuthorizeOnAWithheldRecord(t *testing.T) {
 	}
 	if s, ok := legacyDecodeConsentRecord(t, denyRaw); !ok || s != ConsentDenied {
 		t.Fatalf("an older build stopped honouring a withheld denial: (%v, %v) %s", s, ok, denyRaw)
+	}
+}
+
+// TestSupersedingAnUnusableTrailKeepsOtherScopesReceipts pins the boundary of
+// "a fresh decision supersedes the unknown trail": it supersedes ITS OWN scope
+// and nothing else. This client never dispatches foreign receipts, so erasing
+// another scope's pending denial loses it permanently and leaves that server
+// granted.
+func TestSupersedingAnUnusableTrailKeepsOtherScopesReceipts(t *testing.T) {
+	dir := t.TempDir()
+	foreignDeny := testConsentReceipt("key-scope-b-deny", false)
+	foreignDeny.WorkspaceID = "workspace-other"
+	foreignDeny.ActorIdentifier = "anon-other"
+	foreignDeny.AnonymousID = "anon-other"
+	malformed := testConsentReceipt("key-broken", true)
+	malformed.EnvironmentID = ""
+	if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName),
+		mustMarshalOutbox(t, foreignDeny, malformed), 0o600); err != nil {
+		t.Fatalf("seed outbox: %v", err)
+	}
+
+	outbox := newConsentOutbox(dir)
+	// A REAL in-scope predicate. load(nil) adopts every entry as this
+	// process's own, so the foreign receipt would survive through the
+	// own-keys path and the test would pass without exercising the disk-view
+	// preservation at all — which is exactly what an earlier version did.
+	outbox.load(func(r consentReceipt) bool { return r.WorkspaceID == "workspace-test" })
+	if outbox.lastRead != consentOutboxReadUnusable {
+		t.Fatalf("test shape: the seeded trail is not unusable (state %d)", outbox.lastRead)
+	}
+	// Scope A records a fresh decision, which supersedes A's unknown history.
+	if failed := outbox.append(testConsentReceipt("key-scope-a-fresh", true)); failed {
+		t.Fatalf("the fresh decision could not persist")
+	}
+
+	onDisk, _ := newConsentOutbox(dir).readRecordReceipts()
+	var keptForeign bool
+	for _, r := range onDisk {
+		if r.IdempotencyKey == "key-scope-b-deny" {
+			keptForeign = true
+		}
+	}
+	if !keptForeign {
+		t.Fatalf("another scope's pending denial was erased by a decision that does not supersede it: %+v", onDisk)
+	}
+}
+
+// TestLegacyTombstoneOutOrdersEveryGrantItCovers closes the rollback hole one
+// level below the spelling. The sentinel is a legacy-understood denial, but an
+// older build also ORDERS: written at the record's own t0 while the mark covers
+// a trail reaching t1, that build reads a denial at t0, finds the retained
+// grant at t1 strictly newer, and heals it back into authorization.
+func TestLegacyTombstoneOutOrdersEveryGrantItCovers(t *testing.T) {
+	dir := t.TempDir()
+	old := consentRecordInfo{state: ConsentGranted, decidedAt: "2026-07-19T00:00:00Z", floor: true}
+	markAt := "2026-07-25T00:00:00Z" // the newest decision the unusable trail showed
+	if err := markConsentRecordUnwitnessed(dir, old, spoolTestActorDigest(), markAt, os.Rename, os.Chmod); err != nil {
+		t.Fatalf("mark: %v", err)
+	}
+	raw, err := os.ReadFile(consentRecordPath(dir))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var wire map[string]any
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	got, _ := wire["decided_at"].(string)
+	if consentDecisionSupersedes(markAt, got) {
+		t.Fatalf("the legacy tombstone is stamped at %q, behind the mark at %q — a grant the mark covers out-orders it: %s", got, markAt, raw)
+	}
+	// The new decoder still recovers the real decision and its own ordering.
+	back, ok, _ := loadConsentRecordRead(dir, spoolTestActorDigest())
+	if !ok || back.state != ConsentGranted || !back.unwitnessed || back.unwitnessedAt != markAt {
+		t.Fatalf("this build lost the withheld grant or its stamp: %+v ok=%v", back, ok)
 	}
 }

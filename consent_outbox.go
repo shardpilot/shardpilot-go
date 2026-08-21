@@ -629,15 +629,34 @@ func (o *consentOutbox) preserveEvidence() {
 }
 
 func (o *consentOutbox) saveLocked(carriesFreshDecision bool) error {
+	// ownScope reports whether an entry belongs to the scope this process
+	// speaks for. Used when a fresh decision supersedes an unusable trail:
+	// it may replace its own history and nobody else's.
+	// ownScope reports whether an entry is one THIS process speaks for. It
+	// asks ownKeys, not the mirror: the mirror also holds FOREIGN entries
+	// (load retains them so a sibling's undelivered receipts are not
+	// clobbered), so matching against it calls everything own and a fresh
+	// decision would erase the very receipts the mirror exists to protect.
+	ownScope := func(entry consentReceipt) bool {
+		_, own := o.ownKeys[entry.IdempotencyKey]
+		return own
+	}
 	diskReceipts, diskRead := o.readRecordReceipts()
 	if carriesFreshDecision && diskRead == consentOutboxReadUnusable {
-		// A fresh decision supersedes the unknown trail OUTRIGHT, and that
-		// has to include not writing the unknown trail back. Merging the
-		// disk view here would carry the very entries that made it
-		// unusable — a non-monotonic sequence, say — into the rewritten
-		// record, so it would read unusable again on the next start and the
-		// documented recovery would never complete. Own receipts only.
-		diskReceipts = nil
+		// A fresh decision supersedes the unknown trail — but only for ITS
+		// OWN scope. An earlier revision dropped the whole disk view here,
+		// and the merge below restores only this process's own keys, so a
+		// valid pending denial belonging to ANOTHER scope sharing the
+		// SpoolDir was erased by a decision that supersedes nothing about
+		// it. This client never dispatches foreign receipts, so that denial
+		// would be lost permanently and its server left granted.
+		kept := make([]consentReceipt, 0, len(diskReceipts))
+		for _, entry := range diskReceipts {
+			if !ownScope(entry) {
+				kept = append(kept, entry)
+			}
+		}
+		diskReceipts = kept
 	}
 	if carriesFreshDecision {
 		// A FRESH explicit decision supersedes the unknown trail outright:
@@ -739,6 +758,16 @@ func (o *consentOutbox) saveLocked(carriesFreshDecision bool) error {
 		// A decision that cannot be stored must be refused loudly, not
 		// silently discarded as if it were an aged-out duplicate.
 		for len(payload) > consentOutboxReadLimit && len(merged) > 1 {
+			// Never buy room with an UNDELIVERED decision. The sole-receipt
+			// guard below does not cover this: with two entries the loop
+			// evicts the older one — a pending denial — and the remaining
+			// grant then fits, so the append reports success, the denial is
+			// settled, Close stops waiting for it, and only the grant
+			// reaches the server. An undelivered decision is not surplus.
+			if _, settled := o.settledKeys[merged[0].IdempotencyKey]; !settled {
+				o.dirty = true
+				return errConsentRecordTooLarge
+			}
 			evictKeys = append(evictKeys, merged[0].IdempotencyKey)
 			merged = merged[1:]
 			record.Receipts = &merged

@@ -492,6 +492,17 @@ func markConsentRecordUnwitnessed(dir string, info consentRecordInfo, actorDiges
 		UnwitnessedAt:    unwitnessedAt,
 	}
 	if decision == ConsentDecisionGranted {
+		// The legacy tombstone needs an ORDER an older build can use, not
+		// just a spelling it understands. Written at the record's own t0
+		// while the mark covers a trail reaching t1, an older build reads a
+		// denial at t0, finds the retained grant at t1 strictly newer, and
+		// heals it back into authorization — the rollback hole again, one
+		// level down: the sentinel was legacy-understood but not
+		// legacy-ORDERED. Stamp it through the mark so nothing the mark
+		// covers can out-order it.
+		if consentDecisionSupersedes(unwitnessedAt, wire.DecidedAt) {
+			wire.DecidedAt = unwitnessedAt
+		}
 		// Only a GRANT needs the older-decoder guard: a withheld DENIAL is
 		// already the restrictive answer, and rewriting it into a sentinel
 		// would make an old build read no record where it would otherwise
