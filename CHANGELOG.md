@@ -81,6 +81,17 @@
   decision for THIS scope rewrites its record and clears the mark, which is
   the way back.
 
+  The mark is honoured at every point a grant is trusted, because guarding
+  one path and not another guards nothing: a retained grant receipt cannot
+  override — and so heal away — a marked record; the ordinary state-only
+  loader refuses a marked grant, so disabling `ConsentFloor` on a later run
+  cannot turn an explicit "unprovable" back into authorization for the
+  floor-off spool path (the full-info loader still returns it, because the
+  floor must see the mark to withhold and to recover); and if the mark itself
+  cannot be written, maintenance rewrites are held so the unreadable bytes
+  survive as the remaining evidence rather than being sanitized away before
+  the mark lands.
+
   KNOWN RESIDUAL, named rather than left to be discovered: a DELETED outbox
   beside a persisted grant still promotes that grant. The file is not
   distinguishable from one that was never written, and refusing that

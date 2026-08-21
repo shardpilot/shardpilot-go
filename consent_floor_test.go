@@ -6095,3 +6095,114 @@ func mustMarshalOversizeOutbox(t *testing.T) []byte {
 	}
 	return payload
 }
+
+// TestConsentUnwitnessedMarkIsHonoredEverywhereAGrantIsTrusted covers the
+// three places a durable "this grant is unprovable" mark was NOT consulted.
+// Each is the same asymmetry: the mark blocked one path to trusting the grant
+// while another path still trusted it, and any one of them is enough to
+// promote a potentially superseded grant.
+func TestConsentUnwitnessedMarkIsHonoredEverywhereAGrantIsTrusted(t *testing.T) {
+	seedMarkedGrant := func(t *testing.T, dir string) {
+		t.Helper()
+		info := consentRecordInfo{state: ConsentGranted, decidedAt: "2026-07-19T00:00:00Z", floor: true}
+		if err := markConsentRecordUnwitnessed(dir, info, spoolTestActorDigest(), os.Rename, os.Chmod); err != nil {
+			t.Fatalf("seed marked grant: %v", err)
+		}
+	}
+
+	// (B) A retained grant receipt must not override — and thereby HEAL
+	// away — a record already marked unprovable. Both reads parse here:
+	// the outbox is clean and the record is readable. Only the mark stands
+	// between the receipt and a rewritten, unmarked, floor-proven grant.
+	t.Run("grant_tail_cannot_heal_away_the_mark", func(t *testing.T) {
+		_, server := newFloorTestServer(t)
+		defer server.Close()
+		dir := t.TempDir()
+		seedMarkedGrant(t, dir)
+		newer := testConsentReceipt("key-newer-grant", true)
+		newer.DecidedAt = "2026-07-21T00:00:00Z"
+		if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName),
+			mustMarshalOutbox(t, newer), 0o600); err != nil {
+			t.Fatalf("seed outbox: %v", err)
+		}
+
+		client := newFloorTestClient(t, server.URL, dir, nil)
+		defer func() { _ = client.Close(context.Background()) }()
+		if got := client.Consent(); got == ConsentGranted {
+			t.Fatalf("a retained grant receipt promoted a marked record: %v", got)
+		}
+		after, ok := loadConsentRecordInfo(dir, spoolTestActorDigest())
+		if !ok || !after.unwitnessed {
+			t.Fatalf("the heal erased the durable mark: %+v ok=%v", after, ok)
+		}
+	})
+
+	// (C) The ordinary two-value loader is what the floor-OFF spool path
+	// consults. A grant a floor run marked unprovable must not become
+	// authorization again merely because ConsentFloor was unset.
+	t.Run("floor_off_loader_refuses_a_marked_grant", func(t *testing.T) {
+		dir := t.TempDir()
+		seedMarkedGrant(t, dir)
+		if state, ok := loadConsentRecord(dir, spoolTestActorDigest()); ok || state == ConsentGranted {
+			t.Fatalf("the ordinary loader returned a marked grant as usable: (%v, %v)", state, ok)
+		}
+		// The floor's own loader must still SEE it, or it can neither
+		// withhold nor recover.
+		info, ok := loadConsentRecordInfo(dir, spoolTestActorDigest())
+		if !ok || info.state != ConsentGranted || !info.unwitnessed {
+			t.Fatalf("the full-info loader lost the marked grant: %+v ok=%v", info, ok)
+		}
+	})
+
+	// (A) When the mark cannot be persisted, the unreadable bytes are the
+	// only evidence left, so maintenance must not sanitize them away.
+	t.Run("failed_mark_preserves_the_unreadable_evidence", func(t *testing.T) {
+		_, server := newFloorTestServer(t)
+		defer server.Close()
+		dir := t.TempDir()
+		if err := saveConsentRecord(dir, ConsentDecisionGranted, spoolTestActorDigest(),
+			"2026-07-19T00:00:00Z", true, os.Rename, os.Chmod); err != nil {
+			t.Fatalf("seed granted record: %v", err)
+		}
+		broken := testConsentReceipt("key-broken", false)
+		broken.WorkspaceID = ""
+		corrupt := mustMarshalOutbox(t, broken)
+		if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName), corrupt, 0o600); err != nil {
+			t.Fatalf("seed outbox: %v", err)
+		}
+
+		cfg := Config{
+			WorkspaceID: "workspace-test", AppID: "app-test", EnvironmentID: "develop",
+			AnonymousID: "anon-spool-1", SpoolDir: dir, ConsentFloor: &ConsentFloorConfig{},
+		}
+		client := &Client{cfg: cfg, clock: realClock{}}
+		// Fail exactly the mark write, nothing else.
+		client.initConsentFloor(func(oldpath, newpath string) error {
+			if strings.Contains(newpath, consentRecordFileName) {
+				return errors.New("disk full")
+			}
+			return os.Rename(oldpath, newpath)
+		}, os.Chmod)
+
+		if got := client.Consent(); got == ConsentGranted {
+			t.Fatalf("failed mark still promoted the grant: %v", got)
+		}
+		if got := client.Snapshot().LastConsentError; got != "consent_unwitnessed_mark_failed" {
+			t.Fatalf("LastConsentError = %q, want consent_unwitnessed_mark_failed", got)
+		}
+		// Maintenance must now be held: the corrupt bytes stay put.
+		client.consentOutbox.mu.Lock()
+		err := client.consentOutbox.saveLocked()
+		client.consentOutbox.mu.Unlock()
+		if !errors.Is(err, errConsentEvidenceHeld) {
+			t.Fatalf("maintenance write was not held: %v", err)
+		}
+		after, readErr := os.ReadFile(filepath.Join(dir, consentOutboxFileName))
+		if readErr != nil {
+			t.Fatalf("read outbox: %v", readErr)
+		}
+		if !bytes.Equal(after, corrupt) {
+			t.Fatalf("maintenance laundered the evidence:\n before: %s\n after:  %s", corrupt, after)
+		}
+	})
+}

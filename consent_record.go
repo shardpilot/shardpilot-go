@@ -132,6 +132,21 @@ func spoolWipeOwedPath(dir string) string {
 // explicit denial (fail toward purging, never toward loading).
 func loadConsentRecord(dir, actorDigest string) (ConsentState, bool) {
 	info, ok := loadConsentRecordInfo(dir, actorDigest)
+	if ok && info.state == ConsentGranted && info.unwitnessed {
+		// A grant a floor-enabled run marked UNPROVABLE is not authorization
+		// for anyone, and least of all for a later run started with
+		// ConsentFloor unset. This is the ordinary loader — initSpool's
+		// floor-off path uses it to decide whether a persisted grant may
+		// load and resend spool.json — so returning the mark as a usable
+		// grant would let disabling the live floor turn an explicit
+		// "unprovable" back into permission. Floor-off already honors
+		// persisted DENIALS and already requires a persisted grant for disk
+		// loads; refusing a marked grant keeps both properties.
+		//
+		// The full-info loader deliberately still returns it, because the
+		// floor needs to SEE the mark to withhold and to recover from it.
+		return ConsentUnknown, false
+	}
 	return info.state, ok
 }
 

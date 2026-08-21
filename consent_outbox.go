@@ -109,6 +109,11 @@ func (r consentReceipt) analyticsGranted() bool {
 }
 
 // consentOutboxWire is the consent-outbox.json payload.
+// errConsentEvidenceHeld reports a maintenance write withheld to preserve the
+// last evidence that a grant is unprovable. It is an owed write, not a disk
+// failure.
+var errConsentEvidenceHeld = errors.New("consent outbox: unreadable record preserved as evidence, maintenance write owed")
+
 type consentOutboxWire struct {
 	Version int `json:"version"`
 	// Receipts is a POINTER so an explicitly empty list — the record a
@@ -197,6 +202,13 @@ type consentOutbox struct {
 
 	dir      string
 	receipts []consentReceipt
+
+	// preserveUnusable holds maintenance writes back because the durable
+	// mark for an unprovable grant could not be persisted. Normally the
+	// mark lands and housekeeping proceeds untouched; with no mark on disk
+	// the corrupt bytes are the last evidence, and sanitizing them away
+	// would hand the next start a clean outbox beside an unmarked grant.
+	preserveUnusable bool
 
 	// lastRead records what the LOAD-time read of the durable record
 	// learned, so the floor can tell an honestly empty outbox from one it
@@ -495,10 +507,27 @@ func (o *consentOutbox) load(own func(consentReceipt) bool) {
 // turn a transient failure into a "successfully written" smaller record,
 // silently dropping a receipt while reporting success. Must be called with
 // mu held.
+// preserveEvidence holds back maintenance rewrites while an unreadable
+// record is the only surviving proof that a grant is unprovable.
+func (o *consentOutbox) preserveEvidence() {
+	o.mu.Lock()
+	o.preserveUnusable = true
+	o.mu.Unlock()
+}
+
 func (o *consentOutbox) saveLocked() error {
+	diskReceipts, diskRead := o.readRecordReceipts()
+	if o.durable() && o.preserveUnusable && diskRead == consentOutboxReadUnusable {
+		// Sanitizing this view into a clean record would erase the only
+		// remaining evidence that a persisted grant is unprovable. The
+		// mirror stays authoritative and the write stays owed; the hold
+		// lifts as soon as the mark lands or a fresh decision supersedes
+		// the unknown trail.
+		o.dirty = true
+		return errConsentEvidenceHeld
+	}
 	seen := make(map[string]struct{}, len(o.receipts))
 	merged := make([]consentReceipt, 0, len(o.receipts))
-	diskReceipts, _ := o.readRecordReceipts()
 	for _, entry := range diskReceipts {
 		if _, settled := o.settledKeys[entry.IdempotencyKey]; settled {
 			continue
@@ -1098,7 +1127,8 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 				return false
 			}
 			return c.consentOutbox.lastRead == consentOutboxReadUnusable ||
-				recordRead == consentRecordReadUnusable
+				recordRead == consentRecordReadUnusable ||
+				record.unwitnessed
 		}
 		if tail, ok := c.consentOutbox.latestMatching(c.consentReceiptInScope); ok &&
 			!tailBlockedByUnusableTrail(tail) &&
@@ -1197,8 +1227,20 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 				// witness is still unreadable.
 				if !record.unwitnessed {
 					if err := markConsentRecordUnwitnessed(c.cfg.SpoolDir, record, digest, rename, chmod); err != nil {
+						// The mark is the ONLY durable form of this
+						// conclusion, so a failed write cannot be shrugged
+						// off as "re-derived at the next start": the witness
+						// it would be re-derived FROM is exactly what
+						// ordinary maintenance is about to sanitize away.
+						// Until the mark lands the unreadable bytes are the
+						// remaining evidence and must not be laundered, so
+						// maintenance writes are held — the mirror stays
+						// authoritative and the write stays owed. A fresh
+						// decision still writes through: it supersedes the
+						// unknown trail outright.
+						c.consentOutbox.preserveEvidence()
 						c.stats.setLastConsentError("consent_unwitnessed_mark_failed")
-						c.logf("shardpilot consent floor: persisting the unwitnessed mark on the granted record failed; the grant stays withheld in this process and the mark is re-derived at the next start: %v", err)
+						c.logf("shardpilot consent floor: persisting the unwitnessed mark on the granted record failed; the grant stays withheld and the unreadable outbox is preserved as the remaining evidence until the mark lands: %v", err)
 					}
 				}
 			} else if state == ConsentGranted && !record.floor {
