@@ -72,6 +72,17 @@ type consentRecordWire struct {
 	ActorDigest      string `json:"actor_digest"`
 	DecidedAt        string `json:"decided_at,omitempty"`
 	Floor            bool   `json:"floor,omitempty"`
+	// Unwitnessed marks a GRANT whose receipt trail could not be proven
+	// intact when it was last read. It lives HERE, on the per-scope record,
+	// rather than on the shared outbox, and the placement is the whole
+	// point: the outbox file is one per SpoolDir and is shared across every
+	// scope using that directory, so a mark kept there is cleared by a
+	// fresh decision belonging to a DIFFERENT workspace, app or actor —
+	// which supersedes nothing about this scope's unknown trail. The record
+	// is keyed by ActorDigest, so a mark on it is per-scope by
+	// construction, and a fresh decision for this scope rewrites the record
+	// whole and clears it for free.
+	Unwitnessed bool `json:"unwitnessed,omitempty"`
 }
 
 // consentRecordInfo is a loaded record's full shape for the floor reload:
@@ -79,9 +90,10 @@ type consentRecordWire struct {
 // (decidedAt empty and floor false for a legacy record that predates the
 // fields).
 type consentRecordInfo struct {
-	state     ConsentState
-	decidedAt string
-	floor     bool
+	state       ConsentState
+	decidedAt   string
+	floor       bool
+	unwitnessed bool
 }
 
 // consentActorDigest canonically digests the actor/scope tuple a persisted
@@ -123,28 +135,68 @@ func loadConsentRecord(dir, actorDigest string) (ConsentState, bool) {
 	return info.state, ok
 }
 
+// consentRecordRead classifies what a read of the decision record LEARNED,
+// by the same rule the outbox reader follows and for the same reason: a
+// failure that is indistinguishable from a determinate answer is how an
+// emergency stop silently stops stopping. "No record" and "a record I could
+// not read" lead to OPPOSITE safe actions, so they may not share a value.
+type consentRecordRead uint8
+
+const (
+	// consentRecordReadParsed: read and understood.
+	consentRecordReadParsed consentRecordRead = iota
+	// consentRecordReadAbsent: no record file, or one belonging to a
+	// DIFFERENT actor digest. Both are honestly "nothing recorded for this
+	// scope" — a fresh install and a shared SpoolDir respectively.
+	consentRecordReadAbsent
+	// consentRecordReadUnusable: a record exists for this scope and could
+	// not be understood. The decision it held is unknown, and it may have
+	// been a denial.
+	consentRecordReadUnusable
+)
+
 // loadConsentRecordInfo is loadConsentRecord returning the record's full
 // shape — the floor reload needs the ordering stamp and floor provenance
-// alongside the state.
+// alongside the state. It preserves the two-value signature every existing
+// caller uses; callers that must act on the DIFFERENCE between absent and
+// unreadable take loadConsentRecordRead instead.
 func loadConsentRecordInfo(dir, actorDigest string) (consentRecordInfo, bool) {
+	info, ok, _ := loadConsentRecordRead(dir, actorDigest)
+	return info, ok
+}
+
+// loadConsentRecordRead is loadConsentRecordInfo plus what the read learned.
+// The third value exists because `!ok` is NOT "there is no record": it is
+// also every opaque failure, and initConsentFloor's trail-tail override
+// treats a false ok as "no record at all" and applies a receipt
+// UNCONDITIONALLY — including a stale grant receipt over a denial it cannot
+// read, which it then HEALS onto disk, destroying the denial rather than
+// merely ignoring it.
+func loadConsentRecordRead(dir, actorDigest string) (consentRecordInfo, bool, consentRecordRead) {
 	none := consentRecordInfo{state: ConsentUnknown}
 	file, err := os.Open(consentRecordPath(dir))
 	if err != nil {
-		return none, false
+		if errors.Is(err, fs.ErrNotExist) {
+			return none, false, consentRecordReadAbsent
+		}
+		return none, false, consentRecordReadUnusable
 	}
 	defer file.Close()
 	data, err := io.ReadAll(io.LimitReader(file, consentRecordReadLimit+1))
 	if err != nil || len(data) > consentRecordReadLimit {
-		return none, false
+		return none, false, consentRecordReadUnusable
 	}
 	var record consentRecordWire
 	if json.Unmarshal(data, &record) != nil {
-		return none, false
+		return none, false, consentRecordReadUnusable
 	}
 	if record.ActorDigest != actorDigest {
-		return none, false
+		// A record for a DIFFERENT actor is not this scope's record and is
+		// not evidence about it — honestly absent here, and the shared
+		// SpoolDir case rather than a corruption case.
+		return none, false, consentRecordReadAbsent
 	}
-	info := consentRecordInfo{decidedAt: record.DecidedAt, floor: record.Floor}
+	info := consentRecordInfo{decidedAt: record.DecidedAt, floor: record.Floor, unwitnessed: record.Unwitnessed}
 	switch record.ConsentAnalytics {
 	case "granted":
 		info.state = ConsentGranted
@@ -153,7 +205,10 @@ func loadConsentRecordInfo(dir, actorDigest string) (consentRecordInfo, bool) {
 	case "denied_forced_minor":
 		info.state = ConsentDeniedForcedMinor
 	default:
-		return none, false
+		// An unknown decision value is OPAQUE, not absent: a newer build's
+		// record read by an older one lands here, and what it decided is
+		// exactly what we cannot tell.
+		return none, false, consentRecordReadUnusable
 	}
 	if record.Floor {
 		// A floor-authored record ALWAYS carries its decision's stamp (the
@@ -179,12 +234,20 @@ func loadConsentRecordInfo(dir, actorDigest string) (consentRecordInfo, bool) {
 		// both directions (they predate the stamping build).
 		if _, err := time.Parse(time.RFC3339Nano, record.DecidedAt); err != nil {
 			if info.state == ConsentGranted {
-				return none, false
+				// ABSENT, deliberately, and NOT unusable: this failure is
+				// not opaque. The decision was read — it said granted — and
+				// only its STAMP is unorderable, so discarding it hides no
+				// denial, and the readable trail may decide. Reporting it
+				// unusable here would block a legitimate proof-driven
+				// recovery (an unorderable grant record beside a valid
+				// grant receipt) for no safety gain. The opaque classes
+				// above are the ones where what the record SAID is unknown.
+				return none, false, consentRecordReadAbsent
 			}
 			info.decidedAt = ""
 		}
 	}
-	return info, true
+	return info, true, consentRecordReadParsed
 }
 
 // saveConsentRecord persists a consent decision, stamped with the actor
@@ -194,6 +257,39 @@ func loadConsentRecordInfo(dir, actorDigest string) (consentRecordInfo, bool) {
 // 0600 file, full temp write + atomic rename). rename and chmod are
 // injectable so tests can exercise persist and refused-tighten failures
 // deterministically.
+// markConsentRecordUnwitnessed re-writes an existing record with the
+// unwitnessed mark set, preserving its decision, stamp and provenance. It is
+// how the withholding of an unprovable GRANT becomes DURABLE: without it the
+// refusal lives only in this process, and the next start — reading the same
+// record with a trail that has since been pruned clean — promotes exactly
+// the grant this start refused. saveConsentRecord writes the mark as false,
+// so any FRESH decision for this scope clears it for free, which is the
+// documented way back.
+func markConsentRecordUnwitnessed(dir string, info consentRecordInfo, actorDigest string, rename func(oldpath, newpath string) error, chmod func(name string, mode os.FileMode) error) error {
+	var decision ConsentDecision
+	switch info.state {
+	case ConsentGranted:
+		decision = ConsentDecisionGranted
+	case ConsentDenied:
+		decision = ConsentDecisionDenied
+	case ConsentDeniedForcedMinor:
+		decision = ConsentDecisionDeniedForcedMinor
+	default:
+		return nil
+	}
+	payload, err := json.Marshal(consentRecordWire{
+		ConsentAnalytics: string(decision),
+		ActorDigest:      actorDigest,
+		DecidedAt:        info.decidedAt,
+		Floor:            info.floor,
+		Unwitnessed:      true,
+	})
+	if err != nil {
+		return err
+	}
+	return writePrivateFileAtomic(consentRecordPath(dir), payload, rename, chmod)
+}
+
 func saveConsentRecord(dir string, decision ConsentDecision, actorDigest, decidedAt string, floorAuthored bool, rename func(oldpath, newpath string) error, chmod func(name string, mode os.FileMode) error) error {
 	payload, err := json.Marshal(consentRecordWire{
 		ConsentAnalytics: string(decision),

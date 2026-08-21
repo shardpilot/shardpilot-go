@@ -5817,11 +5817,11 @@ func TestConsentOutboxUnusableTrailSurvivesMaintenanceRewrite(t *testing.T) {
 	_, server := newFloorTestServer(t)
 	defer server.Close()
 
-	// A surviving in-scope receipt plus a malformed one: the record parses,
-	// the sanitizer drops the broken entry, and the trail is unusable.
-	surviving := testConsentReceipt("key-surviving", false)
-	surviving.DecidedAt = "2026-07-20T00:00:00Z"
-	malformed := testConsentReceipt("key-broken", true)
+	// A floor-proven GRANT whose trail cannot be proven intact: the only
+	// entry beside it is one the sanitizer rejects, so the record parses
+	// but the trail has a hole — and the hole is exactly where a
+	// superseding denial would have been.
+	malformed := testConsentReceipt("key-broken", false)
 	malformed.WorkspaceID = ""
 
 	dir := t.TempDir()
@@ -5830,42 +5830,52 @@ func TestConsentOutboxUnusableTrailSurvivesMaintenanceRewrite(t *testing.T) {
 		t.Fatalf("seed granted record: %v", err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName),
-		mustMarshalOutbox(t, surviving, malformed), 0o600); err != nil {
+		mustMarshalOutbox(t, malformed), 0o600); err != nil {
 		t.Fatalf("seed outbox: %v", err)
 	}
 
-	// First start: the surviving entry is a DENIAL, so it legitimately
-	// applies; the point here is what the maintenance write leaves behind.
 	first := newFloorTestClient(t, server.URL, dir, nil)
-	if err := first.Flush(context.Background()); err != nil {
-		t.Fatalf("Flush: %v", err)
+	if got := first.Consent(); got == ConsentGranted {
+		t.Fatalf("first start promoted an unwitnessed grant: %v", got)
 	}
 	if err := first.Close(context.Background()); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// The rewritten record must parse cleanly AND still declare the hole.
-	data, err := os.ReadFile(filepath.Join(dir, consentOutboxFileName))
-	if err != nil {
-		t.Fatalf("read rewritten outbox: %v", err)
+	// The DECISION RECORD — not the shared outbox — must carry the mark,
+	// and it must say so for THIS scope.
+	marked, ok := loadConsentRecordInfo(dir, spoolTestActorDigest())
+	if !ok {
+		t.Fatalf("the persisted record disappeared")
 	}
-	var rewritten consentOutboxWire
-	if err := json.Unmarshal(data, &rewritten); err != nil {
-		t.Fatalf("the rewritten record does not parse: %v", err)
-	}
-	if !rewritten.TrailIncomplete {
-		t.Fatalf("maintenance rewrite laundered the unusable trail: %s", data)
+	if !marked.unwitnessed {
+		t.Fatalf("the withholding was not made durable: %+v", marked)
 	}
 
-	// Second start reads a syntactically clean record and must still refuse
-	// to promote the persisted grant.
+	// Now launder the outbox exactly as ordinary housekeeping would: a
+	// clean, fully-parseable record with nothing left to object to. The
+	// grant must STILL be withheld, on the strength of the mark alone.
+	if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName),
+		mustMarshalOutbox(t), 0o600); err != nil {
+		t.Fatalf("launder outbox: %v", err)
+	}
 	second := newFloorTestClient(t, server.URL, dir, nil)
 	defer func() { _ = second.Close(context.Background()) }()
 	if got := second.Consent(); got == ConsentGranted {
-		t.Fatalf("restart after maintenance promoted the withheld grant: %v", got)
+		t.Fatalf("restart on a laundered outbox promoted the withheld grant: %v", got)
 	}
-	if got := second.Snapshot().ConsentOutboxUnreadable; got != 1 {
-		t.Fatalf("restart: ConsentOutboxUnreadable = %d, want 1", got)
+	if got := second.Snapshot().LastConsentError; got != "consent_grant_unwitnessed" {
+		t.Fatalf("restart: LastConsentError = %q, want consent_grant_unwitnessed", got)
+	}
+
+	// And a FRESH decision for this scope is the documented way back.
+	second.SetConsent(true)
+	if got := second.Consent(); got != ConsentGranted {
+		t.Fatalf("a fresh decision did not clear the mark: %v", got)
+	}
+	cleared, ok := loadConsentRecordInfo(dir, spoolTestActorDigest())
+	if !ok || cleared.unwitnessed {
+		t.Fatalf("a fresh decision left the mark set: %+v ok=%v", cleared, ok)
 	}
 }
 
@@ -5911,5 +5921,59 @@ func TestConsentOutboxUnusableTrailGrantDoesNotHealPersistedDenial(t *testing.T)
 	}
 	if record.state == ConsentGranted {
 		t.Fatalf("the persisted denial was healed into a grant on disk: %+v", record)
+	}
+}
+
+// TestConsentRecordUnreadableBlocksGrantTailAndPreservesDenial covers the
+// SECOND door, which the first version of this fix left wide open: the
+// outbox reader learned to tell "unreadable" from "absent", but the consent
+// RECORD's reader still collapsed them, and initConsentFloor reads a false
+// ok as "no record at all". The trail-tail override's condition begins
+// `!recordOK ||`, so an unreadable record made a stale grant receipt apply
+// UNCONDITIONALLY — and that branch HEALS, so saveConsentRecord overwrote
+// whatever the record held with a floor-proven grant. The denial was not
+// ignored, it was destroyed.
+func TestConsentRecordUnreadableBlocksGrantTailAndPreservesDenial(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload []byte
+	}{
+		{name: "unparseable", payload: []byte(`{"consent_analytics":`)},
+		{name: "unknown_decision_value", payload: []byte(
+			`{"consent_analytics":"revoked_pending","actor_digest":"DIGEST","floor":true,"decided_at":"2026-07-19T00:00:00Z"}`)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, server := newFloorTestServer(t)
+			defer server.Close()
+
+			dir := t.TempDir()
+			payload := bytes.ReplaceAll(tc.payload, []byte("DIGEST"), []byte(spoolTestActorDigest()))
+			if err := os.WriteFile(consentRecordPath(dir), payload, 0o600); err != nil {
+				t.Fatalf("write unreadable record: %v", err)
+			}
+			// A readable, valid, in-scope GRANT receipt — the stale
+			// acked-but-unpruned shape the code names itself.
+			if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName),
+				mustMarshalOutbox(t, testConsentReceipt("key-stale-grant", true)), 0o600); err != nil {
+				t.Fatalf("seed outbox: %v", err)
+			}
+
+			client := newFloorTestClient(t, server.URL, dir, nil)
+			defer func() { _ = client.Close(context.Background()) }()
+
+			if got := client.Consent(); got == ConsentGranted {
+				t.Fatalf("an unreadable record let a grant receipt promote the floor: %v", got)
+			}
+			// The decisive half: the unreadable bytes must still be there.
+			// Healing would have replaced them with a granted record,
+			// destroying whatever decision they held.
+			after, err := os.ReadFile(consentRecordPath(dir))
+			if err != nil {
+				t.Fatalf("read record after start: %v", err)
+			}
+			if !bytes.Equal(after, payload) {
+				t.Fatalf("the unreadable record was overwritten by a heal:\n before: %s\n after:  %s", payload, after)
+			}
+		})
 	}
 }

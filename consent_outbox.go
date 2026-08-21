@@ -119,17 +119,6 @@ type consentOutboxWire struct {
 	// witness that is a reason to distrust the whole file rather than to
 	// read it as "nothing was ever refused".
 	Receipts *[]consentReceipt `json:"receipts"`
-	// TrailIncomplete is STICKY evidence that this record was written while
-	// the trail on disk could not be fully understood. Without it a routine
-	// prune launders the hole: sanitizing an unusable disk view produces a
-	// clean, parseable record, and the next start promotes a persisted
-	// grant that THIS start deliberately withheld. Carrying the mark in the
-	// record keeps the conclusion durable while still letting maintenance
-	// write — blocking the write instead would wedge the outbox, leaving
-	// receipts undeliverable-durably and Close permanently reporting
-	// pending. Cleared only by a save carrying a FRESH explicit decision,
-	// which is newer than anything the unreadable bytes could have held.
-	TrailIncomplete bool `json:"trail_incomplete,omitempty"`
 }
 
 // sanitizeConsentReceipt validates one stored entry and copies it down to
@@ -400,19 +389,6 @@ func (o *consentOutbox) readRecordReceipts() ([]consentReceipt, consentOutboxRea
 	if record.Receipts == nil {
 		return nil, consentOutboxReadUnusable
 	}
-	// A record that DECLARES its own trail incomplete stays unusable however
-	// clean it now parses: this is the sticky mark a maintenance rewrite
-	// carried forward.
-	if record.TrailIncomplete {
-		entries := *record.Receipts
-		loaded := make([]consentReceipt, 0, len(entries))
-		for _, entry := range entries {
-			if sanitized, ok := sanitizeConsentReceipt(entry); ok {
-				loaded = append(loaded, sanitized)
-			}
-		}
-		return loaded, consentOutboxReadUnusable
-	}
 	entries := *record.Receipts
 	loaded := make([]consentReceipt, 0, len(entries))
 	seen := make(map[string]struct{}, len(entries))
@@ -519,27 +495,7 @@ func (o *consentOutbox) load(own func(consentReceipt) bool) {
 // turn a transient failure into a "successfully written" smaller record,
 // silently dropping a receipt while reporting success. Must be called with
 // mu held.
-// saveLocked persists the merged view. carriesFreshDecision distinguishes a
-// save that ADDS a new decision from routine maintenance (a prune, an owed
-// retry), and the distinction is what keeps an UNUSABLE trail from being
-// laundered: sanitizing a corrupt disk view into a clean record erases the
-// only evidence that the trail had a hole, and the next start would then
-// promote a persisted grant this process deliberately withheld. So while the
-// load read UNUSABLE, maintenance does not write — the mirror stays
-// authoritative, the write stays owed, and the corrupt bytes stay on disk so
-// every restart re-derives the same conclusion. A FRESH explicit decision is
-// the one thing allowed to supersede an unknown trail: it is newer than
-// anything the unreadable file could hold, so it both may write and clears
-// the unusable mark, which is how the SDK recovers instead of being wedged
-// undecided forever.
-func (o *consentOutbox) saveLocked(carriesFreshDecision bool) error {
-	// A fresh explicit decision is the one thing that safely supersedes an
-	// unknown trail — it is newer than anything the unreadable file could
-	// have held — so it clears the mark. Maintenance does not.
-	if o.durable() && o.lastRead == consentOutboxReadUnusable && carriesFreshDecision {
-		o.lastRead = consentOutboxReadParsed
-	}
-	trailIncomplete := o.durable() && o.lastRead == consentOutboxReadUnusable
+func (o *consentOutbox) saveLocked() error {
 	seen := make(map[string]struct{}, len(o.receipts))
 	merged := make([]consentReceipt, 0, len(o.receipts))
 	diskReceipts, _ := o.readRecordReceipts()
@@ -593,7 +549,7 @@ func (o *consentOutbox) saveLocked(carriesFreshDecision bool) error {
 		settleEvictions()
 		return nil
 	}
-	record := consentOutboxWire{Version: consentOutboxRecordVersion, Receipts: &merged, TrailIncomplete: trailIncomplete}
+	record := consentOutboxWire{Version: consentOutboxRecordVersion, Receipts: &merged}
 	payload, err := json.Marshal(record)
 	if err == nil {
 		err = writePrivateFileAtomic(o.filePath(), payload, o.renameFn, o.chmodFn)
@@ -619,7 +575,7 @@ func (o *consentOutbox) append(receipt consentReceipt) (persistFailed bool) {
 	// yet.
 	o.ownKeys[receipt.IdempotencyKey] = struct{}{}
 	o.receipts = append(o.receipts, receipt)
-	return o.saveLocked(true) != nil
+	return o.saveLocked() != nil
 }
 
 // head returns the oldest retained receipt for dispatch, when one exists.
@@ -711,7 +667,7 @@ func (o *consentOutbox) prune(idempotencyKey string) (persistFailed bool) {
 		pruned = append(pruned, o.receipts[:i]...)
 		pruned = append(pruned, o.receipts[i+1:]...)
 		o.receipts = pruned
-		return o.saveLocked(false) != nil
+		return o.saveLocked() != nil
 	}
 	return false
 }
@@ -805,7 +761,7 @@ func (o *consentOutbox) retryPersist() (attempted, failed bool) {
 	if !o.dirty {
 		return false, false
 	}
-	return true, o.saveLocked(false) != nil
+	return true, o.saveLocked() != nil
 }
 
 // takeEvicted drains the cap-eviction count for Stats.ConsentOutboxEvicted.
@@ -1091,7 +1047,7 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 		c.logf("shardpilot consent floor: a configured identifier exceeds the %d-byte clamp; the persisted decision is not loaded and the floor starts undecided: %v", maxConsentIdentifierBytes, err)
 	} else {
 		digest := consentActorDigest(c.cfg)
-		record, recordOK := loadConsentRecordInfo(c.cfg.SpoolDir, digest)
+		record, recordOK, recordRead := loadConsentRecordRead(c.cfg.SpoolDir, digest)
 		state := record.state
 		// Seed the monotonic stamp floor from PERSISTED state before any
 		// new decision can mint: a restart on a system clock running behind
@@ -1127,8 +1083,22 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 		// restart sees a clean outbox and promotes the healed grant. A
 		// surviving DENIAL still applies: it is readable, real, and
 		// restrictive, and an incomplete trail cannot make it less true.
+		//
+		// The RECORD's own readability is the second half, and omitting it
+		// was a worse hole than the one this guard was written for: the
+		// override's condition is `!recordOK || supersedes(...)`, and
+		// `!recordOK` is not "no record at all" — it is also every opaque
+		// failure. An unreadable DENIAL therefore let a stale grant receipt
+		// apply UNCONDITIONALLY, and the branch heals, so
+		// saveConsentRecord OVERWROTE the denial with a floor-proven grant.
+		// That destroys the evidence instead of merely ignoring it. A grant
+		// tail is blocked when EITHER witness is unreadable.
 		tailBlockedByUnusableTrail := func(tail consentReceipt) bool {
-			return c.consentOutbox.lastRead == consentOutboxReadUnusable && tail.analyticsGranted()
+			if !tail.analyticsGranted() {
+				return false
+			}
+			return c.consentOutbox.lastRead == consentOutboxReadUnusable ||
+				recordRead == consentRecordReadUnusable
 		}
 		if tail, ok := c.consentOutbox.latestMatching(c.consentReceiptInScope); ok &&
 			!tailBlockedByUnusableTrail(tail) &&
@@ -1181,8 +1151,14 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 			}
 		}
 		if recordOK {
-			outboxUnusable := c.consentOutbox.lastRead == consentOutboxReadUnusable
-			if state == ConsentGranted && outboxUnusable {
+			// Either witness being unreadable makes a grant unprovable, and
+			// so does a mark a PREVIOUS start already persisted: the
+			// conclusion has to survive the trail being pruned clean
+			// underneath it.
+			grantUnwitnessed := c.consentOutbox.lastRead == consentOutboxReadUnusable ||
+				recordRead == consentRecordReadUnusable ||
+				record.unwitnessed
+			if state == ConsentGranted && grantUnwitnessed {
 				// UNREADABLE WITNESS: a record file EXISTS and could not be
 				// parsed, so the receipt trail that would supersede this
 				// grant is exactly what we cannot see. The trail-tail
@@ -1210,7 +1186,21 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 				// unreadable trail cannot make a recorded denial less true,
 				// and honoring it is the fail-closed direction.
 				c.stats.setLastConsentError("consent_grant_unwitnessed")
-				c.logf("shardpilot consent floor: the durable consent outbox exists but could not be read, so a receipt superseding the persisted GRANT cannot be ruled out; the grant is not promoted to live state and the floor starts undecided — record a fresh decision")
+				c.logf("shardpilot consent floor: the persisted GRANT has no provable receipt trail (a witness exists and could not be read), so a receipt superseding it cannot be ruled out; the grant is not promoted to live state and the floor starts undecided — record a fresh decision")
+				// Persist the conclusion, or it dies with this process and
+				// the next start promotes the very grant refused here: the
+				// unreadable trail may be pruned away by ordinary
+				// housekeeping, leaving a clean outbox and an unmarked
+				// grant. Best effort — a failed mark leaves the in-memory
+				// withholding standing, which is the same fail-closed
+				// posture, and the next start re-derives it from whichever
+				// witness is still unreadable.
+				if !record.unwitnessed {
+					if err := markConsentRecordUnwitnessed(c.cfg.SpoolDir, record, digest, rename, chmod); err != nil {
+						c.stats.setLastConsentError("consent_unwitnessed_mark_failed")
+						c.logf("shardpilot consent floor: persisting the unwitnessed mark on the granted record failed; the grant stays withheld in this process and the mark is re-derived at the next start: %v", err)
+					}
+				}
 			} else if state == ConsentGranted && !record.floor {
 				// FLOOR PROVENANCE: a granted record without the floor mark
 				// was authored by the floor-off fire-and-forget era — its

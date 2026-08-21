@@ -58,16 +58,28 @@
   survive are still honored, so a readable denial alongside a malformed
   entry still denies rather than falling back to undecided.
 
+  **The consent RECORD's reader had the same defect, and it was worse.** It
+  collapsed every failure — an unreadable file, an over-limit read,
+  unparseable JSON, an unknown decision value — into the same answer as "no
+  record", and the reload treats that as "no record at all", which makes a
+  retained grant receipt apply UNCONDITIONALLY. That branch then HEALS, so
+  the unreadable decision was OVERWRITTEN with a floor-proven grant: the
+  denial was destroyed, not merely ignored. The record reader is now
+  three-valued too, and a grant receipt is refused whenever EITHER witness is
+  unreadable. A grant whose stamp alone is unorderable stays a deliberate
+  discard, not an opaque failure — its decision was read, so it hides
+  nothing and a readable trail may still decide.
+
   The conclusion is DURABLE, because withholding a grant only in memory is
-  undone by ordinary housekeeping. A grant surviving an unreadable trail may
-  not drive the trail-tail override, which writes a floor-proven record; and
-  a record rewritten while the trail was unreadable carries a sticky
-  `trail_incomplete` mark, so a prune cannot launder the hole into a clean
-  record the next start would trust. A save carrying a FRESH explicit
-  decision clears the mark — it is newer than anything the unreadable bytes
-  could have held — which is how a client recovers rather than being wedged
-  undecided. Blocking the write instead was rejected: it leaves receipts
-  undeliverable-durably and `Close` permanently reporting pending.
+  undone by ordinary housekeeping: the trail can be pruned clean underneath
+  it and the next start would promote the grant this one refused. A withheld
+  grant is marked `unwitnessed` on the decision RECORD, which is per-scope
+  (keyed by the actor digest). The placement is the point — the outbox file
+  is shared by every scope using a `SpoolDir`, so a mark kept there is
+  cleared by a fresh decision belonging to a different workspace, app or
+  actor, which supersedes nothing about this scope's unknown trail. A fresh
+  decision for THIS scope rewrites its record and clears the mark, which is
+  the way back.
 
   KNOWN RESIDUAL, named rather than left to be discovered: a DELETED outbox
   beside a persisted grant still promotes that grant. The file is not
