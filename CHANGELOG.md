@@ -21,6 +21,38 @@
   recurrence — a check that fails on internal material in the published surface is a separate
   change, deliberately kept out of this one so that removing what is exposed today does not
   wait on it.
+
+- **An unreadable consent outbox no longer resurrects a superseded grant
+  (privacy fix).** The durable outbox is this SDK's only cross-restart
+  witness to a DENIAL. Its reader treated a record it could not parse the
+  same as a record that parsed and held nothing: file unreadable, over the
+  read limit, corrupt, or written by an unknown version all returned "no
+  receipts". When `consent.json` still held an older GRANT — the state the
+  SDK produces on its own, because a denial whose spool purge fails leaves
+  the record write owed while the deny receipt is already on disk — the
+  denial became invisible and the stale grant was promoted to live state.
+  Consent read back as granted and events published.
+
+  The reader now distinguishes three states instead of two. A MISSING file
+  is honestly empty and behaves exactly as before — a fresh install has
+  expressed nothing, and reading absence as refusal would disable analytics
+  for every new install. A file that EXISTS and cannot be understood is
+  UNKNOWN, and a persisted grant is not promoted on the strength of a
+  witness we cannot read: the floor starts undecided, which every publish
+  gate already treats as closed, and the host records a fresh decision to
+  proceed. This is not "denied" as a finding about the person — nothing was
+  learned about them — it is "not entitled to act". Denials are honored
+  regardless, as they always were.
+
+  `Stats.ConsentOutboxUnreadable` is new and counts loads that found an
+  unreadable record; it was previously impossible to see this in the field,
+  because every outbox diagnostic reported a WRITE. `LastConsentError`
+  surfaces `consent_outbox_unreadable` for the read itself and
+  `consent_grant_unwitnessed` when a grant is held back because of it.
+
+  Behaviour is unchanged for every other class of state: a corrupt cache or
+  telemetry spool still means "start over", and a corrupt record still never
+  crashes into the host.
 - **Module `go` directive moves to 1.25 (was 1.24).** The source-compatibility
   baseline for SDK consumers rises with it: the next release requires
   **Go 1.25+**. Already-published tags are unaffected — every tag from `v0.1.2`
