@@ -204,19 +204,65 @@ if [ "$corpus_defined" != "$corpus_expected" ]; then
   exit 2
 fi
 
-# Below its header the corpus may contain no comments — leading, after a
-# semicolon, or anywhere whitespace precedes a hash. The header boundary is
-# DETECTED rather than counted: a fixed line number excuses the first
-# assignment the moment the header changes length, and it did.
-if awk '
-    !started && /^[[:space:]]*(#|$)/ { next }
-    { started = 1 }
-    started && ($0 ~ /^[[:space:]]*#/ || $0 ~ /[[:space:]]#/) { print NR ": " $0; found = 1 }
-    END { exit !found }
-  ' "$CORPUS"; then
-  echo "REFUSING: $CORPUS has comments below its header (listed above)." >&2
-  echo "  The gate skips this path, so a comment here is prose no pass reads —" >&2
-  echo "  in a published repository. It holds assignments and continuations." >&2
+# The corpus is validated by GRAMMAR, not by a list of forbidden shapes. Each
+# predicate caught the variant it was written for and left the next one: a
+# comment, then a function declaration (bash emits neither a definition under
+# xtrace nor a name under `compgen -v`), then an assignment repeated so its
+# first value is overwritten before the self-test ever reads it, then a comment
+# after a `;`. They are one thing — text in a file no pass reads — so the rule
+# states what a line MAY be instead of what it may not.
+if ! corpus_grammar="$(awk -v expected="$corpus_expected" '
+  BEGIN {
+    sq = sprintf("%c", 39); dq = sprintf("%c", 34); q = ""
+    n = split(expected, a, /[ \t\n]+/)
+    for (i = 1; i <= n; i++) if (a[i] != "") ok[a[i]] = 1
+  }
+  function scan(s,   i, c) {
+    i = 1
+    while (i <= length(s)) {
+      c = substr(s, i, 1)
+      if (q == "") {
+        if (c == sq || c == dq) q = c
+        else if (c == "\\") i++
+        else if (c == "#" || c == ";")
+          print NR ": " c " outside a quoted value -- " $0
+      } else if (c == q) q = ""
+      else if (q == dq && c == "\\") i++
+      i++
+    }
+  }
+  !started && /^[[:space:]]*(#|$)/ { next }
+  { started = 1 }
+  {
+    if (q == "" && $0 ~ /^[[:space:]]*$/) next
+    if (q == "") {
+      if ($0 !~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
+        print NR ": not an assignment -- " $0
+      } else {
+        name = $0; sub(/=.*/, "", name)
+        if (!(name in ok)) print NR ": unexpected name " name
+        seen[name]++
+        if (seen[name] > 1) print NR ": " name " is assigned again"
+      }
+    }
+    scan($0)
+  }
+  END {
+    if (q != "") print "end of file: a quoted value is never closed"
+    for (k in ok) if (!(k in seen)) print "no assignment for " k
+  }
+' "$CORPUS" 2>&1)"; then
+  echo "REFUSING: the corpus grammar check could not run:" >&2
+  printf '  %s\n' "$corpus_grammar" >&2
+  echo "  A checker that fails to start writes nothing, and nothing reads as" >&2
+  echo "  clean. Its status decides, not its output." >&2
+  exit 2
+fi
+if [ -n "$corpus_grammar" ]; then
+  echo "REFUSING: $CORPUS does not parse as the assignments it is limited to:" >&2
+  printf '  %s\n' "$corpus_grammar" >&2
+  echo "  Every line above is text in a file the gate never scans. This file" >&2
+  echo "  holds one assignment per expected name and nothing else." >&2
   exit 2
 fi
 
@@ -539,13 +585,12 @@ $ROSTER
 EOF
 
   # ⚠ THESE TWO PASSES NOW COVER THE EXEMPT REGIONS, and only those. The main
-  # scan reads this file's prose like any other file's; what it cannot read is
-  # the pattern-definition and fixture blocks, which match by construction and
-  # are blanked out before scanning. So these are not a duplicate of the main
-  # scan — they are the part of this file the main scan is blind to, and both
-  # of this file's own past disclosures lived exactly there: two internal
-  # repository names in the ROSTER block, and a live decision-record id among
-  # the fixtures.
+  # scan reads this file's prose like any other file's. What no pass reads is
+  # the corpus, excluded by path — so these checks read IT as well as this
+  # file. Both of this gate's own past disclosures were of exactly this kind:
+  # two internal repository names in the roster, and a live decision-record id
+  # among the fixtures. A header comment naming a repository that exists
+  # nowhere else in the tree was demonstrated to pass everything else.
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
     git grep -l -F -- "$lit" -- . $GATE_EXCLUDES > "$found" 2>/dev/null || :
@@ -554,7 +599,7 @@ EOF
       novel=$((novel + 1))
     fi
   done <<EOF
-$(grep -oE 'shardpilot/[a-z][a-z-]*' "$SELF" | sort -u)
+$(grep -hoE 'shardpilot/[a-z][a-z-]*' "$SELF" "$CORPUS" | sort -u)
 EOF
 
   # Decision-record ids: only the two reserved synthetic ones are admissible.
@@ -566,7 +611,7 @@ EOF
     printf 'PROSE VIOLATION: %s is a real decision-record id written in this file.\n' "$lit" >&2
     novel=$((novel + 1))
   done <<EOF
-$(grep -oE 'ADR-[0-9]+' "$SELF" | sort -u)
+$(grep -hoE 'ADR-[0-9]+' "$SELF" "$CORPUS" | sort -u)
 EOF
 
   rm -f "$found"

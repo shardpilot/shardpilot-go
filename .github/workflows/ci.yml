@@ -2,9 +2,17 @@ name: ci
 
 on:
   pull_request:
+  # ⚠ EVERY PUSH, NOT ONLY main. This repository is PUBLIC: a branch pushed here
+  # is readable the moment it lands, whether or not a pull request ever opens.
+  # A `branches: [main]` filter meant the secret scan and the publication gate
+  # skipped exactly the case where the contents are already exposed and nobody
+  # is looking. Tags are included for the same reason and a stronger one — a tag
+  # is the artifact people install, and one release here was cut off-main.
+  #
+  # No job is conditioned to narrow this back down. A condition is how a gate
+  # stops running without anyone noticing, which is the failure being fixed; the
+  # cost of running the rest of the suite on a branch push is CI minutes.
   push:
-    branches:
-      - main
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

@@ -17,10 +17,14 @@
 # by-construction material lives here. This file is excluded by PATH, which is
 # a fact about the repository rather than a marker anyone can write.
 #
-# WHAT KEEPS THIS FILE HONEST. It is checked by the gate to contain nothing but
-# assignments to an expected set of names, and no comments below this header.
-# It is small and it is entirely fixtures, so it is reviewable as what it is.
-# The gate refuses if that stops being true.
+# WHAT KEEPS THIS FILE HONEST. The gate reads this file with a GRAMMAR rather
+# than a list of forbidden shapes, because the list approach caught one variant
+# per round and left the next: a comment, then a function declaration, then an
+# assignment repeated so its first value never reaches the self-test, then a
+# comment after a semicolon. The rule is now what a line MAY be — below this
+# header, it either continues an open quoted value or begins an assignment to
+# one expected name, each name exactly once, with no hash or semicolon outside
+# a quoted value. Anything else is refused.
 #
 # Every name below is consumed by the script that sources this file. The linter
 # cannot see that consumer from here, hence the blanket SC2034 below. It is a
@@ -34,7 +38,7 @@
 RESERVED_ADR_IDS='ADR-0000 ADR-0999'
 ROSTER='analytics-service
 control-plane'
-PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (for|of|in)|[.,;]|$)|[Nn]obody (looks|checks|monitors)|[Ll]acks( any| automated| an?)* ?[A-Za-z-]*[ ]?(harness|harnesses|coverage|tests?|suites?|monitoring)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
+PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (for|of|in)|[.,;]|$)|[Nn]obody (looks|checks|monitors)|[Ll]acks( any| automated| an?)* ?[A-Za-z-]*[ ]?(harness|harnesses|coverage|tests?|suites?|monitoring)|(has|have|had)(n.{1,3}t| not| never) been (tested|covered|scanned|audited|monitored)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 
 KNOWN_INTERNAL='per ADR-0000 §3
 There are no Playwright tests for the console.
@@ -54,10 +58,11 @@ tracked as SP-123 in the internal board
 filed as AC-QA-7 during triage
 the console lacks automated tests
 (Codex go#48 round 3)
-EXAMPLE_SYNTHETIC_FLAG_MODE=off'
-KNOWN_INTERNAL="$KNOWN_INTERNAL
-The crash path isn"$'\047'"t tested.
-The console doesn"$'\342\200\231'"t have automated tests."
+EXAMPLE_SYNTHETIC_FLAG_MODE=off
+The crash path isn'$'\047''t tested.
+The crash path hasn'$'\047''t been tested.
+The console doesn'$'\342\200\231''t have automated tests.
+The console has never been audited.'
 
 KNOWN_INNOCENT='go get github.com/shardpilot/shardpilot-go@v0.6.0-alpha
 IngestURL: os.Getenv("SHARDPILOT_INGEST_URL")
