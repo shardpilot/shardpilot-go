@@ -82,6 +82,14 @@
 
 set -euo pipefail
 
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+if [ ! -f "$SELF" ]; then
+  echo "REFUSING: cannot resolve this script's own path ($SELF)." >&2
+  echo "  The self-audit greps read it by path; an unresolvable one makes them" >&2
+  echo "  read nothing and report clean." >&2
+  exit 2
+fi
+
 cd "$(dirname "$0")/.."
 
 # One pattern list, used by both lanes and by the self-test — two spellings is
@@ -145,7 +153,7 @@ ROSTER_RE="$(roster_regex)"
 
 # The SHAPE half. These name no record, no ticket, no branch and no service, so
 # they are safe to publish in the file that gates against them.
-PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are) not (tested|covered|scanned|audited|monitored)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?) (for|of|in)|[Nn]obody (looks|checks|monitors)|[Ll]acks( any| automated| an?)* ?[A-Za-z-]*[ ]?(harness|harnesses|coverage|tests?|suites?|monitoring)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
+PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are) not (tested|covered|scanned|audited|monitored)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (for|of|in)|[.,;]|$)|[Nn]obody (looks|checks|monitors)|[Ll]acks( any| automated| an?)* ?[A-Za-z-]*[ ]?(harness|harnesses|coverage|tests?|suites?|monitoring)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 
 # Files the gate must not read as content: this script is the one place the
 # patterns are written down, by construction.
@@ -191,11 +199,24 @@ self_scan_body() {
     echo "  each must start its own line." >&2
     exit 2
   fi
-  awk '
-    /^[[:space:]]*# gate-self-exempt:begin/ { skip = 1 }
-    { if (!skip) print; else print "" }
-    /^[[:space:]]*# gate-self-exempt:end/   { skip = 0 }
-  ' "$1" > "$2"
+  if ! awk '
+    /^[[:space:]]*# gate-self-exempt:begin/ {
+      depth++
+      if (depth > 1) { print "nested exempt region at line " NR > "/dev/stderr"; exit 3 }
+    }
+    { if (!depth) print; else print "" }
+    /^[[:space:]]*# gate-self-exempt:end/ {
+      depth--
+      if (depth < 0) { print "unopened end marker at line " NR > "/dev/stderr"; exit 3 }
+    }
+    END { if (depth != 0) { print "unterminated exempt region" > "/dev/stderr"; exit 3 } }
+  ' "$1" > "$2"; then
+    echo "REFUSING: $1 has a malformed gate-self-exempt region (see above)." >&2
+    echo "  Nesting is refused rather than supported: one exempt region has no" >&2
+    echo "  reason to contain another, and the stripper closing on the first end" >&2
+    echo "  marker would blank prose after it while the counts still balanced." >&2
+    exit 2
+  fi
   # And a floor on how much survives. Balanced markers can still swallow the
   # file if a block is opened early and closed late; this is cheap and catches
   # that without pretending to know the right number.
@@ -409,6 +430,7 @@ There are no Playwright tests for the console.
 There are no end-to-end tests for the purchase flow.
 The console has no end-to-end tests for purchase callbacks.
 The console does not have automated tests.
+The console has no tests.
 There is NO Playwright harness in the console repo
 the crash path is not covered by automated tests
 no automated scanning for that class of input
@@ -490,7 +512,7 @@ EOF
       novel=$((novel + 1))
     fi
   done <<EOF
-$(grep -oE 'shardpilot/[a-z][a-z-]*' "$0" | sort -u)
+$(grep -oE 'shardpilot/[a-z][a-z-]*' "$SELF" | sort -u)
 EOF
 
   # Decision-record ids: only the two reserved synthetic ones are admissible.
@@ -502,7 +524,7 @@ EOF
     printf 'PROSE VIOLATION: %s is a real decision-record id written in this file.\n' "$lit" >&2
     novel=$((novel + 1))
   done <<EOF
-$(grep -oE 'ADR-[0-9]+' "$0" | sort -u)
+$(grep -oE 'ADR-[0-9]+' "$SELF" | sort -u)
 EOF
 
   rm -f "$found"
