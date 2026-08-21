@@ -168,11 +168,29 @@ cd "$(dirname "$0")/.."
 # The by-construction material — patterns, roster, fixture corpora — lives in
 # its own file so that THIS file can be scanned end to end with no exemptions.
 # See scripts/gate-corpus.sh for why that separation exists.
-CORPUS="$(dirname "$SELF")/gate-corpus.sh"
-if [ ! -f "$CORPUS" ]; then
-  echo "REFUSING: $CORPUS is missing." >&2
+CORPUS_PATH="$(dirname "$SELF")/gate-corpus.sh"
+if [ ! -f "$CORPUS_PATH" ]; then
+  echo "REFUSING: $CORPUS_PATH is missing." >&2
   echo "  It holds the class patterns and the fixture corpora; without it the" >&2
   echo "  gate would scan with an empty pattern list and report clean." >&2
+  exit 2
+fi
+# ⚠ AND IT IS READ FROM THE INDEX, like every other tracked file. It was the
+# one working-tree exception left: its grammar, its values and its audits all
+# read the copy on disk while the scan skipped the staged blob by path, so
+# staging a disclosure into it and restoring the disk copy left every validator
+# looking at the clean version and the scan looking away.
+#
+# The consequence is worth stating: while editing this corpus you must `git
+# add` it before this gate reflects the change. That is the same discipline as
+# running CI after committing rather than before, and it is what makes a green
+# run a statement about the commit rather than about the desk it was run on.
+CORPUS="$(mktemp)"
+CORPUS_REL="scripts/$(basename "$CORPUS_PATH")"
+if ! (cd "$(dirname "$CORPUS_PATH")/.." && git cat-file blob ":$CORPUS_REL") > "$CORPUS" 2>/dev/null; then
+  echo "REFUSING: the staged blob for $CORPUS_REL could not be read." >&2
+  echo "  A commit would carry that blob, so it is the one worth validating;" >&2
+  echo "  if the file is newly added, stage it before running this gate." >&2
   exit 2
 fi
 # ⚠ THE CORPUS IS NEVER SOURCED INTO THIS SHELL. It used to be, before its own
@@ -343,12 +361,17 @@ eval "$corpus_dump"
 # exists, so the shorter list was the one that mattered.
 #
 # Octal throughout: written out, several of these made this gate refuse itself.
-# `%PDF` and `MZ` are NOT here and stay a byte-zero test — they are printable
-# and occur in prose about them, including in this file.
+# The PDF header joined them once a polyglot with a shell preamble was shown to
+# render text without carrying it as bytes — which is why the literal spelling
+# of that header no longer appears anywhere in this file, in prose or
+# otherwise. `MZ` alone stays a byte-zero test: two printable characters
+# searched for anywhere would refuse ordinary prose, and a DOS executable
+# behind a preamble is not a shape anyone here produces.
 CONTAINER_SIGS='\120\113\003\004 \120\113\005\006 \037\213\010'
 CONTAINER_SIGS="$CONTAINER_SIGS"' \375\067\172\130\132 \050\265\057\375'
 CONTAINER_SIGS="$CONTAINER_SIGS"' \102\132\150 \067\172\274\257'
 CONTAINER_SIGS="$CONTAINER_SIGS"' \122\141\162\041\032\007 \177\105\114\106'
+CONTAINER_SIGS="$CONTAINER_SIGS"' \045\120\104\106'
 
 # Identifiers are admitted by SHAPE. A list of admissible ones was the first
 # answer and it cannot fail: the same change that publishes a live record can
@@ -530,8 +553,8 @@ scan_tree() {
     # would need is genuinely large. A refusal costs nothing while the answer
     # is zero and turns into a deliberate decision the day it stops being zero.
     # ⚠ FOUR BYTES IS NOT THE WHOLE QUESTION, and two shapes get past it. A PDF
-    # begins `%PDF` and keeps its text in a Flate stream, so it reads as text
-    # and scans as noise. A self-extracting archive begins with an executable
+    # begins with its own four-character header and keeps its text in a Flate
+    # stream, so it reads as text and scans as noise. A self-extracting archive begins with an executable
     # preamble — MZ or ELF — and carries the ZIP further in. Both are refused
     # by magic rather than by extension, because the extension is the part an
     # author controls.
@@ -550,7 +573,7 @@ scan_tree() {
     # the day it stops being zero. Deciding then means adding OCR or an
     # explicit exception, not discovering the hole afterwards.
     case "$(od -An -tx1 -N4 "$blob" 2>/dev/null | tr -d ' \n')" in
-      25504446|4d5a*|89504e47|ffd8ff*|47494638|52494646|424d*|49492a00|4d4d002a|\
+      4d5a*|89504e47|ffd8ff*|47494638|52494646|424d*|49492a00|4d4d002a|\
       5031*|5032*|5033*|5034*|5035*|5036*)
         echo "REFUSING: '$f' begins with container magic (archive, PDF, executable" >&2
         echo "  or raster image)," >&2
@@ -768,19 +791,25 @@ EOF
   #
   # Top-level alternatives are split on `|` outside brackets and groups, and
   # each must carry a metacharacter that makes it a SHAPE — a character class,
-  # a quantifier or an escape. Parentheses do not count: they are grouping, and
-  # `(private-daemon)` is the same name in a costume, which is exactly what got
-  # past the first version of this check. Names belong in the roster, which is
-  # checked against the tree.
+  # a quantifier or an escape. The disguises are REDUCED first, because each
+  # spelling of the same trick got past the previous version: parentheses with
+  # nothing to branch between are grouping and come off, and a one-character
+  # class is one character. Both reductions were written after a costume got
+  # through, which is why the rule below does not rely on this one alone.
+  #
+  # Names belong in the roster, which is checked against the tree.
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
     printf 'PROSE VIOLATION: the pattern list holds a bare literal alternative: %s\n' "$lit" >&2
     novel=$((novel + 1))
   done <<EOF
 $(printf '%s' "$PATTERNS" | awk '
-  function check(a) {
+  function check(a,   r) {
     if (a == "") return
-    if (a ~ /[][{}+*?\\]/) return
+    r = a
+    if (index(r, "|") == 0) gsub(/[()]/, "", r)
+    gsub(/\[.\]/, "c", r)
+    if (r ~ /[][{}+*?\\|]/) return
     print a
   }
   {
@@ -797,6 +826,26 @@ $(printf '%s' "$PATTERNS" | awk '
     }
     check(alt)
   }')
+EOF
+
+  # ⚠ AND THE SAME QUESTION ASKED OF THE CHARACTERS, NOT THE STRUCTURE. Every
+  # hyphenated literal run in the pattern list must exist elsewhere in this
+  # tree, exactly as a roster entry must. `[p]rivate-daemon` reduces to a
+  # hyphenated run whatever regex syntax surrounds it, so this holds where a
+  # structural test can be dressed around. Character classes are removed first
+  # so a class's own contents are not read as a name. Measured when written:
+  # both pattern lists contain zero such runs, so this costs nothing today and
+  # refuses the day one appears.
+  while IFS= read -r lit; do
+    [ -n "$lit" ] || continue
+    git grep -l -F -- "$lit" -- . $GATE_EXCLUDES > "$found" 2>/dev/null || :
+    if [ ! -s "$found" ]; then
+      printf 'PROSE VIOLATION: the pattern list carries the literal %s, which is nowhere else in this tree.\n' "$lit" >&2
+      novel=$((novel + 1))
+    fi
+  done <<EOF
+$(printf '%s' "$PATTERNS" | sed 's/\[[^]]*\]//g' \
+  | grep -oE '[A-Za-z][A-Za-z0-9]*(-[A-Za-z0-9]+)+' | sort -u)
 EOF
 
   # scan reads this file's prose like any other file's. What no pass reads is
