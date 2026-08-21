@@ -77,7 +77,11 @@ jobs:
       # reported as nothing at all. A gate that silently drops legs is the
       # failure this whole change is about.
     concurrency:
-      group: ${{ github.workflow }}-${{ github.job }}-${{ matrix.go-version }}-${{ github.ref }}
+      # ⚠ THE EVENT IS PART OF THE GROUP. A push and a pull_request run on the
+      # same commit are different work to CI, and without it they cancelled
+      # each other — leaving a cancelled check on the pull request, which reads
+      # as a failure and blocks the merge it was never about.
+      group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.job }}-${{ matrix.go-version }}-${{ github.ref }}
       cancel-in-progress: true
     timeout-minutes: 10
     strategy:
@@ -118,7 +122,11 @@ jobs:
   format:
     runs-on: ubuntu-latest
     concurrency:
-      group: ${{ github.workflow }}-${{ github.job }}-${{ github.ref }}
+      # ⚠ THE EVENT IS PART OF THE GROUP. A push and a pull_request run on the
+      # same commit are different work to CI, and without it they cancelled
+      # each other — leaving a cancelled check on the pull request, which reads
+      # as a failure and blocks the merge it was never about.
+      group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.job }}-${{ github.ref }}
       cancel-in-progress: true
     timeout-minutes: 5
 
@@ -198,7 +206,11 @@ jobs:
   release-consistency:
     runs-on: ubuntu-latest
     concurrency:
-      group: ${{ github.workflow }}-${{ github.job }}-${{ github.ref }}
+      # ⚠ THE EVENT IS PART OF THE GROUP. A push and a pull_request run on the
+      # same commit are different work to CI, and without it they cancelled
+      # each other — leaving a cancelled check on the pull request, which reads
+      # as a failure and blocks the merge it was never about.
+      group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.job }}-${{ github.ref }}
       cancel-in-progress: true
     timeout-minutes: 5
 
