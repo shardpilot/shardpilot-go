@@ -476,6 +476,21 @@ scan_tree() {
        || printf '%s\n' "$f" | grep -qiE -- "$ROSTER_RE"; then
       scan_lane_a="${scan_lane_a}${f}:path:${f}"$'\n'
     fi
+    # ⚠ TRACKED IS THE INDEX; THIS SCAN READS THE WORKING TREE. A path staged
+    # and then removed from the tree is listed by `git ls-files` and absent
+    # from disk, so the old `[ -f ] || continue` skipped it — and a commit
+    # publishes it, because a commit is made from the index. This gate reported
+    # LANE A CLEAN over exactly that state and the file it skipped reached a
+    # public branch; it was removed by amending, and this refusal is why that
+    # cannot happen quietly again. In a fresh checkout the condition is never
+    # true, which is precisely why it went unnoticed on a developer machine.
+    if [ ! -f "$root/$f" ] && [ ! -L "$root/$f" ]; then
+      echo "REFUSING: '$f' is tracked but is not a file in the working tree." >&2
+      echo "  The scan reads the tree; a path that exists only in the index is" >&2
+      echo "  content no pass here has looked at, and a commit would carry it." >&2
+      echo "  Restore it or unstage it, then run again." >&2
+      exit 2
+    fi
     # ⚠ A TRACKED SYMLINK PUBLISHES ITS TARGET PATH. That path is the object
     # git stores and ships; the file it points at may not even exist in the
     # tree. `-f` follows the link, so this read the TARGET's contents when the
