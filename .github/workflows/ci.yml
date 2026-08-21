@@ -135,6 +135,62 @@ jobs:
             exit 1
           fi
 
+  # The committed benchmarks, SHOWN EXECUTING. They lived in this repository
+  # unrun, which makes them a file rather than a measurement — and they rot as
+  # silently as an unrun test would.
+  #
+  # The script, not a bare `go test -bench`, because `go test -bench .` EXITS 0
+  # when it matches no benchmarks: a rename or a build tag leaves such a step
+  # green over zero measurements. The script establishes what is supposed to
+  # run, asserts each one reported, and names anything that did not.
+  #
+  # Its own job, on ONE toolchain, deliberately NOT inside the version matrix —
+  # the same shape the gofmt job above uses, for a related reason. The numbers
+  # measure this code, not the toolchain, so publishing one set per matrix leg
+  # invites a comparison between runners that nothing here controls.
+  #
+  # A job rather than a matrix leg guarded by `if: matrix.go-version == '…'`,
+  # which is how this was first written and is a trap: when the matrix moved
+  # from 1.26.5 to 1.27.x, that condition matched nothing and the benchmarks
+  # would have stopped running with the workflow still green. A check that a
+  # version bump can silently switch off is the failure this script exists to
+  # refuse; it should not be reintroduced by the way the script is invoked.
+  benchmarks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.x'
+
+      - name: Benchmarks
+        run: scripts/run_benchmarks.sh bench/latest.txt
+
+      # Published so the numbers are readable without opening a log, which is
+      # what makes them evidence somebody can cite rather than something that
+      # scrolled past.
+      - name: Publish benchmark results
+        run: |
+          {
+            echo '### Benchmarks'
+            echo
+            echo '```'
+            cat bench/latest.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmarks
+          path: bench/latest.txt
+          retention-days: 30
+
   release-consistency:
     runs-on: ubuntu-latest
     concurrency:

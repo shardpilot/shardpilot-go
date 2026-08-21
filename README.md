@@ -314,7 +314,22 @@ No Makefile — standard Go tooling. CI ([`.github/workflows/ci.yml`](.github/wo
 go build ./...
 go test ./...
 go vet ./...
-gofmt -l .
+
+# NOT a bare `gofmt -l .` and NOT `go fmt ./...` — both run whichever gofmt is on
+# PATH, which on the 1.25 baseline this module targets produces a diff the 1.27
+# `format` job rejects. Resolve 1.27's binary explicitly, and check the resolution
+# rather than assuming it: GOROOT is tested for emptiness BEFORE /bin/gofmt is
+# appended (an empty one makes that /bin/gofmt, which often exists), and the
+# resolved version is compared against the requested one (a `go` older than 1.21
+# ignores GOTOOLCHAIN entirely and hands back its own GOROOT, so the ask succeeds
+# and the pin does nothing). The version comes from `go env GOVERSION`, not from
+# $GOROOT/VERSION — that file is optional, so reading it would reject a correctly
+# repackaged 1.27.0.
+goroot="$(GOTOOLCHAIN=go1.27.0 go env GOROOT)" || goroot=""
+[ -n "$goroot" ] || { echo "cannot resolve go1.27.0 GOROOT" >&2; exit 1; }
+[ "$(GOTOOLCHAIN=go1.27.0 go env GOVERSION)" = go1.27.0 ] || { echo "resolved the wrong toolchain" >&2; exit 1; }
+"$goroot"/bin/gofmt -l .   # must print nothing
+"$goroot"/bin/gofmt -w .   # to fix
 ```
 
 ## Conventions & boundaries
