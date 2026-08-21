@@ -854,7 +854,7 @@ func TestConsentOutboxAbsentRecordIsHonestlyEmpty(t *testing.T) {
 func TestConsentRecordUnwitnessedWireKeyIsPinned(t *testing.T) {
 	dir := t.TempDir()
 	info := consentRecordInfo{state: ConsentGranted, decidedAt: "2026-07-19T00:00:00Z", floor: true}
-	if err := markConsentRecordUnwitnessed(dir, info, spoolTestActorDigest(), os.Rename, os.Chmod); err != nil {
+	if err := markConsentRecordUnwitnessed(dir, info, spoolTestActorDigest(), "2026-07-19T00:00:00Z", os.Rename, os.Chmod); err != nil {
 		t.Fatalf("mark: %v", err)
 	}
 	data, err := os.ReadFile(consentRecordPath(dir))
@@ -5764,6 +5764,10 @@ func TestConsentOutboxUnreadableWitnessDoesNotResurrectSupersededGrant(t *testin
 		// reads green. Root does not bypass symlink resolution, so a
 		// self-referential link yields ELOOP for every user.
 		{name: "open_error_not_enoent", payload: nil, mode: 0o600},
+		// A DANGLING symlink: Open returns ENOENT exactly as a missing file
+		// does, but a directory entry exists and it points at a witness we
+		// cannot read. Only Lstat separates the two.
+		{name: "dangling_symlink", payload: nil, mode: 0o601},
 		// Syntactically valid at the right version, structurally corrupt.
 		// Each of these unmarshals cleanly and yields zero receipts, so
 		// before the structural check they reported PARSED and the stale
@@ -5788,13 +5792,16 @@ func TestConsentOutboxUnreadableWitnessDoesNotResurrectSupersededGrant(t *testin
 			dir := t.TempDir()
 			seedCrashState(t, dir, tc.payload)
 			if tc.payload == nil {
-				// The self-referential symlink case: no regular file at all.
 				path := filepath.Join(dir, consentOutboxFileName)
-				if err := os.Symlink(path, path); err != nil {
+				target := path // self-referential: ELOOP
+				if tc.mode == 0o601 {
+					target = filepath.Join(dir, "no-such-witness.json") // dangling: ENOENT
+				}
+				if err := os.Symlink(target, path); err != nil {
 					t.Skipf("symlinks unavailable on this filesystem: %v", err)
 				}
 			}
-			if tc.mode != 0o600 {
+			if tc.mode != 0o600 && tc.mode != 0o601 {
 				if err := os.Chmod(filepath.Join(dir, consentOutboxFileName), tc.mode); err != nil {
 					t.Fatalf("chmod outbox: %v", err)
 				}
@@ -6110,7 +6117,7 @@ func TestConsentUnwitnessedMarkIsHonoredEverywhereAGrantIsTrusted(t *testing.T) 
 	seedMarkedGrant := func(t *testing.T, dir string) {
 		t.Helper()
 		info := consentRecordInfo{state: ConsentGranted, decidedAt: "2026-07-19T00:00:00Z", floor: true}
-		if err := markConsentRecordUnwitnessed(dir, info, spoolTestActorDigest(), os.Rename, os.Chmod); err != nil {
+		if err := markConsentRecordUnwitnessed(dir, info, spoolTestActorDigest(), "2026-07-19T00:00:00Z", os.Rename, os.Chmod); err != nil {
 			t.Fatalf("seed marked grant: %v", err)
 		}
 	}
@@ -6124,10 +6131,12 @@ func TestConsentUnwitnessedMarkIsHonoredEverywhereAGrantIsTrusted(t *testing.T) 
 		defer server.Close()
 		dir := t.TempDir()
 		seedMarkedGrant(t, dir)
-		newer := testConsentReceipt("key-newer-grant", true)
-		newer.DecidedAt = "2026-07-21T00:00:00Z"
+		// PRE-mark: not strictly newer than the stamp, so it is a receipt
+		// the mark could have been about and must not clear it.
+		stale := testConsentReceipt("key-stale-grant", true)
+		stale.DecidedAt = "2026-07-18T00:00:00Z"
 		if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName),
-			mustMarshalOutbox(t, newer), 0o600); err != nil {
+			mustMarshalOutbox(t, stale), 0o600); err != nil {
 			t.Fatalf("seed outbox: %v", err)
 		}
 
@@ -6463,7 +6472,7 @@ func TestBlockedGrantIsDurableWhateverTheRecordSays(t *testing.T) {
 		defer server.Close()
 		dir := t.TempDir()
 		info := consentRecordInfo{state: ConsentGranted, decidedAt: "2026-07-19T00:00:00Z", floor: true}
-		if err := markConsentRecordUnwitnessed(dir, info, spoolTestActorDigest(), os.Rename, os.Chmod); err != nil {
+		if err := markConsentRecordUnwitnessed(dir, info, spoolTestActorDigest(), "2026-07-19T00:00:00Z", os.Rename, os.Chmod); err != nil {
 			t.Fatalf("seed marked record: %v", err)
 		}
 		// A CLEAN outbox — nothing here is unusable — carrying a grant.
@@ -6518,4 +6527,70 @@ func TestBlockedGrantIsDurableWhateverTheRecordSays(t *testing.T) {
 			t.Fatalf("housekeeping lifted the denial: restart consent = %v", got)
 		}
 	})
+}
+
+// TestPostMarkDecisionRecoversAfterACrash is the case that showed the mark was
+// the wrong SHAPE rather than under-applied. Eight rounds widened "which paths
+// must consult the boolean"; the ninth found the guard too STRONG.
+//
+// Receipt-first is the protocol: a fresh decision's receipt lands durably
+// BEFORE consent.json is rewritten. So a client that starts from a marked
+// record, records a grant, persists its receipt, and then crashes leaves the
+// next start looking at the old marked record beside a clean, strictly newer
+// receipt. An unconditional mark check refuses that receipt forever and loses a
+// decision that was already durable. The stamp makes the question an ordering
+// one: strictly newer than the mark is provably post-mark.
+func TestPostMarkDecisionRecoversAfterACrash(t *testing.T) {
+	_, server := newFloorTestServer(t)
+	defer server.Close()
+
+	dir := t.TempDir()
+	marked := consentRecordInfo{state: ConsentGranted, decidedAt: "2026-07-19T00:00:00Z", floor: true}
+	if err := markConsentRecordUnwitnessed(dir, marked, spoolTestActorDigest(),
+		"2026-07-19T00:00:00Z", os.Rename, os.Chmod); err != nil {
+		t.Fatalf("seed marked record: %v", err)
+	}
+	// The post-mark decision's receipt: durable, clean, strictly newer.
+	post := testConsentReceipt("key-post-mark-grant", true)
+	post.DecidedAt = "2026-07-20T00:00:00Z"
+	if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName),
+		mustMarshalOutbox(t, post), 0o600); err != nil {
+		t.Fatalf("seed outbox: %v", err)
+	}
+
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	defer func() { _ = client.Close(context.Background()) }()
+
+	if got := client.Consent(); got != ConsentGranted {
+		t.Fatalf("a durable post-mark decision was lost: floor = %v, want ConsentGranted", got)
+	}
+	after, ok := loadConsentRecordInfo(dir, spoolTestActorDigest())
+	if !ok || after.unwitnessed {
+		t.Fatalf("the mark survived a decision that supersedes it: %+v ok=%v", after, ok)
+	}
+}
+
+// TestAbsentStampReadsAsInfinitelyNew pins the direction of the absence rule,
+// which is the half that decides whether an upgrade reopens the defect. A
+// record written before the stamp existed carries none; reading that as
+// infinitely OLD would let every retained receipt clear the mark on every
+// upgraded client at once.
+func TestAbsentStampReadsAsInfinitelyNew(t *testing.T) {
+	dir := t.TempDir()
+	// A pre-stamp record: marked, no unwitnessed_at.
+	payload := []byte(`{"consent_analytics":"granted","actor_digest":"` + spoolTestActorDigest() +
+		`","decided_at":"2026-07-19T00:00:00Z","floor":true,"unwitnessed":true}`)
+	if err := os.WriteFile(consentRecordPath(dir), payload, 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	info, ok, _ := loadConsentRecordRead(dir, spoolTestActorDigest())
+	if !ok || !info.unwitnessed || info.unwitnessedAt != "" {
+		t.Fatalf("test shape: %+v ok=%v", info, ok)
+	}
+	// Nothing supersedes an unstamped mark — not even a far-future decision.
+	for _, at := range []string{"2026-07-18T00:00:00Z", "2099-01-01T00:00:00Z", ""} {
+		if consentMarkSupersededBy(info, at) {
+			t.Fatalf("an unstamped mark was superseded by %q; absence must read as infinitely NEW", at)
+		}
+	}
 }

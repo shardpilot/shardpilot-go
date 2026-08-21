@@ -100,6 +100,37 @@
   the outbox clean and let the next start's grant supersede the denial. A
   fresh explicit decision clears all of it at once.
 
+  The mark carries a STAMP — the newest decision time the trail showed when it
+  was applied — and is an ordering question rather than a veto. Eight review
+  rounds widened *which paths must consult the mark*; the ninth found the guard
+  too STRONG, which is a different signal: receipt-first means a fresh
+  decision's receipt lands durably before the record is rewritten, so a crash
+  in that window leaves a marked record beside a clean, strictly newer receipt.
+  An unconditional mark refuses that receipt forever and loses a decision that
+  was already durable. Anything strictly newer than the stamp is provably a
+  decision the mark could not have been about, and supersedes it.
+
+  **An absent stamp reads as infinitely NEW.** Records written before this
+  field existed carry none, and reading absence as infinitely OLD would let
+  every retained receipt clear the mark — reopening the defect on every
+  upgraded client at once. Unstamped marks therefore keep behaving exactly as
+  before: they block, and only a fresh decision clears them. The field is
+  additive at the SAME record version, deliberately: a version bump would make
+  existing records unreadable, and unreadable means unusable, which would
+  withhold every persisted grant in the fleet on upgrade. An older build
+  reading a newer record ignores the unknown key and sees the boolean alone —
+  strictly more blocking, so safe in the direction that matters. This is local
+  SDK state on the device's own disk; it is not part of any wire contract.
+
+  Comparing stamps across restarts uses the device clock, so a backward jump
+  yields a decision that is genuinely newer but does not compare newer, and the
+  mark STICKS until the host records another decision. That is the safe
+  direction and it is chosen rather than overlooked.
+
+  Two reads also stopped treating a DANGLING SYMLINK as an absent file: `Open`
+  returns ENOENT for both, but a dangling link leaves a directory entry
+  pointing at a witness that cannot be read, and only `Lstat` separates them.
+
   The mark is honoured at every point a grant is trusted, because guarding
   one path and not another guards nothing: a retained grant receipt cannot
   override — and so heal away — a marked record; the ordinary state-only

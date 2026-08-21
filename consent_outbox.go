@@ -336,6 +336,15 @@ func (o *consentOutbox) durable() bool {
 	return o.dir != ""
 }
 
+// pathExists reports whether a directory entry exists at path WITHOUT
+// following it. A dangling symlink yields ENOENT from Open but is present
+// here, which is the distinction that keeps an unreadable witness from being
+// classified as an absent one.
+func pathExists(path string) bool {
+	_, err := os.Lstat(path)
+	return err == nil
+}
+
 func (o *consentOutbox) filePath() string {
 	return filepath.Join(o.dir, consentOutboxFileName)
 }
@@ -388,7 +397,13 @@ func (o *consentOutbox) readRecordReceipts() ([]consentReceipt, consentOutboxRea
 		// has been expressed yet. Any other open error (permissions, an
 		// unreadable mount, a directory in its place) means a record may
 		// well exist behind it.
-		if errors.Is(err, fs.ErrNotExist) {
+		//
+		// ENOENT alone does not establish "missing": a DANGLING SYMLINK
+		// makes Open return ENOENT while a directory entry very much
+		// exists, and that entry is a witness whose target we cannot read.
+		// Lstat does not follow the link, so it separates "no name here"
+		// from "a name pointing at nothing".
+		if errors.Is(err, fs.ErrNotExist) && !pathExists(o.filePath()) {
 			return nil, consentOutboxReadAbsent
 		}
 		return nil, consentOutboxReadUnusable
@@ -1173,10 +1188,19 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 			if !tail.analyticsGranted() {
 				return false
 			}
-			return c.consentOutbox.lastRead == consentOutboxReadUnusable ||
+			if c.consentOutbox.lastRead == consentOutboxReadUnusable ||
 				recordRead == consentRecordReadUnusable ||
-				recordRead == consentRecordReadForeign ||
-				record.unwitnessed
+				recordRead == consentRecordReadForeign {
+				return true
+			}
+			// The MARK is an ordering question, not a veto. A receipt
+			// strictly newer than the stamp is provably a decision the mark
+			// could not have been about — the receipt-first protocol lands
+			// it durably before the record write, so this is the ordinary
+			// crash window after a post-mark decision, not an attack. An
+			// unconditional block loses that decision until the host makes
+			// another one; an unconditional pass reopens the defect.
+			return !consentMarkSupersededBy(record, tail.DecidedAt)
 		}
 		if tail, ok := c.consentOutbox.latestMatching(c.consentReceiptInScope); ok &&
 			!tailBlockedByUnusableTrail(tail) &&
@@ -1231,10 +1255,19 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 		// THE ONE VERDICT. Either witness being unreadable makes a grant
 		// unprovable, and so does a mark a PREVIOUS start persisted. It is
 		// computed here, once, and every grant-affecting decision reads it —
-		// local promotion, the trail-tail heal, and the dispatch worker. Four
+		// local promotion, the trail-tail heal, and the dispatch worker. Six
 		// separate rounds found the same asymmetry, each time because one
 		// site consulted a subset of these signals and a grant took effect
 		// through the door that had not been widened.
+		//
+		// `record.unwitnessed` appears here as a plain boolean ON PURPOSE,
+		// and it is NOT a second ordering check. Ordering is decided once,
+		// in the trail-tail guard above: if a receipt supersedes the mark,
+		// that branch heals and `record` is replaced by the tail's own
+		// decision, which carries no mark. So by the time control reaches
+		// here the boolean already IS the answer to "did anything supersede
+		// it". Adding a second comparison would be the duplication this
+		// consolidation removed.
 		grantsUnprovable := c.consentOutbox.lastRead == consentOutboxReadUnusable ||
 			recordRead == consentRecordReadUnusable ||
 			recordRead == consentRecordReadForeign ||
@@ -1257,7 +1290,14 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 				// Mark whatever decision is on file — grant or denial. The
 				// helper preserves the state, the stamp and the provenance
 				// and only adds the mark.
-				if err := markConsentRecordUnwitnessed(c.cfg.SpoolDir, record, digest, rename, chmod); err != nil {
+				// The stamp is the newest DecidedAt the trail shows right
+				// now, so a decision recorded LATER is provably one this
+				// mark could not have been about.
+				markAt := c.consentOutbox.maxDecidedAt()
+				if markAt == "" {
+					markAt = record.decidedAt
+				}
+				if err := markConsentRecordUnwitnessed(c.cfg.SpoolDir, record, digest, markAt, rename, chmod); err != nil {
 					markFailed = true
 					c.consentOutbox.preserveEvidence()
 					c.stats.setLastConsentError("consent_unwitnessed_mark_failed")

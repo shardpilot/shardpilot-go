@@ -83,6 +83,52 @@ type consentRecordWire struct {
 	// construction, and a fresh decision for this scope rewrites the record
 	// whole and clears it for free.
 	Unwitnessed bool `json:"unwitnessed,omitempty"`
+	// UnwitnessedAt orders the mark against decisions and receipts. It is
+	// the newest DecidedAt observed in the trail when the mark was applied,
+	// so anything STRICTLY NEWER is provably a decision the mark could not
+	// have been about, and may supersede it.
+	//
+	// Without an order the mark is a boolean, and a boolean can only be a
+	// veto over everything or over nothing. Both are wrong: vetoing
+	// everything loses a decision that was already durable (record a fresh
+	// grant, its receipt lands, the process crashes before the record write
+	// — the next start sees the old marked record beside a clean, strictly
+	// newer receipt and refuses it forever), while vetoing nothing reopens
+	// the defect the mark exists to close. Eight review rounds widened
+	// "which paths must consult the boolean"; the ninth showed the guard
+	// was too STRONG, which is the signal that the shape was wrong rather
+	// than the coverage.
+	//
+	// ABSENT MEANS INFINITELY NEW, and the direction is load-bearing.
+	// Records written before this field existed carry no stamp, and reading
+	// that as infinitely OLD would let every retained receipt supersede the
+	// mark — reopening the P0 through the exact mechanism it closed, on
+	// every upgraded client at once. Infinitely NEW keeps those records
+	// behaving as they do today: they block, and only a fresh decision
+	// clears them. Absence does not resolve to the permissive answer; that
+	// is the same rule the readers above follow.
+	//
+	// FORMAT: additive at the SAME record version, deliberately. A version
+	// bump would make every existing record unreadable, and unreadable now
+	// means UNUSABLE, which would withhold every persisted grant in the
+	// fleet on upgrade — a privacy fix turned into a fleet refusal, the
+	// failure mode this whole change is built to avoid. An older build
+	// reading a newer record ignores the unknown key and sees the boolean
+	// alone, which is the pre-stamp behaviour: strictly more blocking, and
+	// so safe in the direction that matters.
+	//
+	// NOT part of the ADR-0331 wire freeze. That contract governs what
+	// rides the wire on events and crashes; this is local SDK state on the
+	// device's own disk and never leaves it.
+	//
+	// CLOCKS GO BACKWARD, and this compares stamps across restarts using a
+	// device clock. A backward jump yields a decision that is genuinely
+	// newer than the mark but does not compare newer, so the mark STICKS
+	// and the grant stays withheld until the host records another decision.
+	// That is the safe direction and it is chosen, not overlooked: the
+	// alternative — trusting a clock that just moved backward — is how a
+	// stale grant would supersede a live mark.
+	UnwitnessedAt string `json:"unwitnessed_at,omitempty"`
 }
 
 // consentRecordInfo is a loaded record's full shape for the floor reload:
@@ -90,10 +136,11 @@ type consentRecordWire struct {
 // (decidedAt empty and floor false for a legacy record that predates the
 // fields).
 type consentRecordInfo struct {
-	state       ConsentState
-	decidedAt   string
-	floor       bool
-	unwitnessed bool
+	state         ConsentState
+	decidedAt     string
+	floor         bool
+	unwitnessed   bool
+	unwitnessedAt string
 }
 
 // consentActorDigest canonically digests the actor/scope tuple a persisted
@@ -198,7 +245,11 @@ func loadConsentRecordRead(dir, actorDigest string) (consentRecordInfo, bool, co
 	none := consentRecordInfo{state: ConsentUnknown}
 	file, err := os.Open(consentRecordPath(dir))
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
+		// Same distinction as the outbox door: a dangling symlink makes
+		// Open return ENOENT while the directory entry exists, and that
+		// entry is a record whose target we cannot read. Lstat does not
+		// follow the link.
+		if errors.Is(err, fs.ErrNotExist) && !pathExists(consentRecordPath(dir)) {
 			return none, false, consentRecordReadAbsent
 		}
 		return none, false, consentRecordReadUnusable
@@ -220,6 +271,7 @@ func loadConsentRecordRead(dir, actorDigest string) (consentRecordInfo, bool, co
 	// record. Corruption anywhere in this file must not become a way to
 	// launder a deliberate withholding.
 	none.unwitnessed = record.Unwitnessed
+	none.unwitnessedAt = record.UnwitnessedAt
 
 	// SHAPE before identity. `null`, `{}`, and a record with a missing
 	// actor_digest or decision all unmarshal cleanly, and comparing the
@@ -246,7 +298,7 @@ func loadConsentRecordRead(dir, actorDigest string) (consentRecordInfo, bool, co
 		// promoted AND healed to disk. FOREIGN keeps the two apart.
 		return none, false, consentRecordReadForeign
 	}
-	info := consentRecordInfo{decidedAt: record.DecidedAt, floor: record.Floor, unwitnessed: record.Unwitnessed}
+	info := consentRecordInfo{decidedAt: record.DecidedAt, floor: record.Floor, unwitnessed: record.Unwitnessed, unwitnessedAt: record.UnwitnessedAt}
 	switch record.ConsentAnalytics {
 	case "granted":
 		info.state = ConsentGranted
@@ -318,7 +370,34 @@ func loadConsentRecordRead(dir, actorDigest string) (consentRecordInfo, bool, co
 // the grant this start refused. saveConsentRecord writes the mark as false,
 // so any FRESH decision for this scope clears it for free, which is the
 // documented way back.
-func markConsentRecordUnwitnessed(dir string, info consentRecordInfo, actorDigest string, rename func(oldpath, newpath string) error, chmod func(name string, mode os.FileMode) error) error {
+// consentMarkSupersededBy reports whether a decision stamped decidedAt is
+// provably NEWER than the mark on info, and so may clear it.
+//
+// The absent-stamp case is the one that matters: a record written before the
+// stamp existed reads as INFINITELY NEW, so nothing supersedes it and it
+// behaves exactly as it does today. Reading absence the other way would let
+// any retained receipt clear the mark and reopen the defect fleet-wide on
+// upgrade.
+func consentMarkSupersededBy(info consentRecordInfo, decidedAt string) bool {
+	if !info.unwitnessed {
+		return true
+	}
+	if info.unwitnessedAt == "" || decidedAt == "" {
+		return false
+	}
+	markAt, err := time.Parse(time.RFC3339Nano, info.unwitnessedAt)
+	if err != nil {
+		// An unparsable stamp is not an old one. Same rule again.
+		return false
+	}
+	at, err := time.Parse(time.RFC3339Nano, decidedAt)
+	if err != nil {
+		return false
+	}
+	return at.After(markAt)
+}
+
+func markConsentRecordUnwitnessed(dir string, info consentRecordInfo, actorDigest string, unwitnessedAt string, rename func(oldpath, newpath string) error, chmod func(name string, mode os.FileMode) error) error {
 	var decision ConsentDecision
 	switch info.state {
 	case ConsentGranted:
@@ -336,6 +415,7 @@ func markConsentRecordUnwitnessed(dir string, info consentRecordInfo, actorDiges
 		DecidedAt:        info.decidedAt,
 		Floor:            info.floor,
 		Unwitnessed:      true,
+		UnwitnessedAt:    unwitnessedAt,
 	})
 	if err != nil {
 		return err
