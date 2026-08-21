@@ -79,6 +79,15 @@
 # Neither lane looks at git HISTORY. Deleting a line does not unpublish the
 # commit that carried it.
 #
+# ⚠ AND THE CORPUS'S OWN COVERAGE SENTENCES ARE NOT BOUNDED BY ANYTHING
+# HERE. Identifiers in it are, by shape — nothing real is numbered all
+# zeros, nines or f's — but a coverage disclosure has no synthetic form: a
+# sentence about missing tests reads identically whether its subject is
+# invented or real. What narrows it is that every known-internal line must
+# MATCH a class, so the only thing that fits there is another
+# coverage-shaped sentence, and that the file is small enough to read. A
+# gate cannot close this; a reviewer can.
+#
 
 set -euo pipefail
 
@@ -308,6 +317,21 @@ if [ -z "$corpus_dump" ]; then
 fi
 eval "$corpus_dump"
 
+# Container signatures, in ONE list, searched for ANYWHERE in a file — which
+# subsumes searching at byte zero, so there is nothing here for a second list
+# to disagree with. There were two, and they did: the byte-zero check knew 7z
+# and RAR while the fallback did not, and the fallback knew one bzip2 level out
+# of nine. A container behind a preamble is the whole reason the fallback
+# exists, so the shorter list was the one that mattered.
+#
+# Octal throughout: written out, several of these made this gate refuse itself.
+# `%PDF` and `MZ` are NOT here and stay a byte-zero test — they are printable
+# and occur in prose about them, including in this file.
+CONTAINER_SIGS='\120\113\003\004 \120\113\005\006 \037\213\010'
+CONTAINER_SIGS="$CONTAINER_SIGS"' \375\067\172\130\132 \050\265\057\375'
+CONTAINER_SIGS="$CONTAINER_SIGS"' \102\132\150 \067\172\274\257'
+CONTAINER_SIGS="$CONTAINER_SIGS"' \122\141\162\041\032\007 \177\105\114\106'
+
 # Identifiers are admitted by SHAPE. A list of admissible ones was the first
 # answer and it cannot fail: the same change that publishes a live record can
 # add it to the list excusing it, wherever that list is kept. A shape cannot be
@@ -324,7 +348,12 @@ is_sentinel_run() {
 
 AUDIT_CLASSES='ADR-[0-9]+|GAP-[0-9]{3}|SP-[0-9]{3}|AC-[A-Z]{2}-[0-9]+'
 AUDIT_CLASSES="$AUDIT_CLASSES"'|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)'
-AUDIT_CLASSES="$AUDIT_CLASSES"'|(main|master|HEAD) @ *[0-9a-f]{7,40}'
+AUDIT_CLASSES="$AUDIT_CLASSES"'|(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
+# ⚠ EVERY IDENTIFIER-BEARING ALTERNATIVE THE MATCHER ACCEPTS BELONGS HERE. Two
+# were missing: the optional backtick in the commit form, and the review
+# reference entirely. A class the matcher rewards and the audit ignores is a
+# published live reference the self-test calls correct.
+AUDIT_CLASSES="$AUDIT_CLASSES"'|Codex [a-z]*#[0-9]+'
 
 roster_regex() {
   printf '%s' "$ROSTER" | sed -e 's![-_ ]![-_ ]+!g' -e 's!/! */ *!g' | paste -sd'|' -
@@ -431,6 +460,20 @@ scan_tree() {
        || printf '%s\n' "$f" | grep -qiE -- "$ROSTER_RE"; then
       scan_lane_a="${scan_lane_a}${f}:path:${f}"$'\n'
     fi
+    # ⚠ A TRACKED SYMLINK PUBLISHES ITS TARGET PATH. That path is the object
+    # git stores and ships; the file it points at may not even exist in the
+    # tree. `-f` follows the link, so this read the TARGET's contents when the
+    # target existed and skipped the entry entirely when it did not — in both
+    # cases never reading the one string the repository actually publishes.
+    if [ -L "$root/$f" ]; then
+      link="$(readlink "$root/$f" 2>/dev/null || true)"
+      if printf '%s\n' "$link" | grep -qE -- "$PATTERNS" \
+         || printf '%s\n' "$link" | grep -qiE -- "$ROSTER_RE"; then
+        scan_lane_a="${scan_lane_a}${f}:link:${link}"$'\n'
+      fi
+      scan_files=$((scan_files + 1))
+      continue
+    fi
     [ -f "$root/$f" ] || continue
     scan_files=$((scan_files + 1))
     # ⚠ A COMPRESSED TRACKED FILE IS NOT SCANNED BY ANYTHING HERE, and `-a`
@@ -459,8 +502,7 @@ scan_tree() {
     # the day it stops being zero. Deciding then means adding OCR or an
     # explicit exception, not discovering the hole afterwards.
     case "$(od -An -tx1 -N4 "$root/$f" 2>/dev/null | tr -d ' \n')" in
-      1f8b*|504b0304|504b0506|fd377a58|425a68*|28b52ffd|25504446|4d5a*|7f454c46|377abcaf|52617221|\
-      89504e47|ffd8ff*|47494638|52494646|424d*|49492a00|4d4d002a)
+      25504446|4d5a*|89504e47|ffd8ff*|47494638|52494646|424d*|49492a00|4d4d002a)
         echo "REFUSING: '$f' begins with container magic (archive, PDF, executable" >&2
         echo "  or raster image)," >&2
         echo "  and this gate reads files as text. No pass here opens a container, so" >&2
@@ -485,7 +527,7 @@ scan_tree() {
     # sequences. Three of them cannot occur in valid UTF-8 text at all; the
     # bzip2 one is four printable characters, which is why every signature here
     # is written in octal — spelled out, this gate refused itself, correctly.
-    for sig in 'PK\003\004' '\037\213\010' '\375\067zXZ' '\050\265\057\375' '\102\132\150\071'; do
+    for sig in $CONTAINER_SIGS; do
       grep -qaF -- "$(printf "$sig")" "$root/$f" 2>/dev/null || continue
       echo "REFUSING: '$f' contains a compressed-container signature." >&2
       echo "  Something in this file is a container, whatever its first bytes say," >&2
@@ -669,7 +711,8 @@ EOF
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
     case "$lit" in EXAMPLE_*) continue ;; esac
-    is_sentinel_run "${lit##*[!0-9a-f]}" && continue
+    run="$(printf '%s' "$lit" | tr -d '\140')"
+    is_sentinel_run "${run##*[!0-9a-f]}" && continue
     printf 'PROSE VIOLATION: %s is a live identifier written where nothing scans.\n' "$lit" >&2
     novel=$((novel + 1))
   done <<EOF

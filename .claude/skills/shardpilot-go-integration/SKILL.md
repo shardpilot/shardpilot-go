@@ -16,7 +16,11 @@ fix, without which a `runtime/pprof` label containing `]` can reach
 `Thread.Name` in a crash payload on Go 1.27+; and the independent
 pacing of the FIRST retry — at the tag `backoffCeiling(1)` returns 0, so a first
 failure without a `Retry-After` hint waits for the next flush tick rather than
-its own jittered delay. Everything else describes the pinned release. Where the SDK does not have a capability, this
+its own jittered delay — and the rest of the retry-clock work with it: the tag
+has no `nextPacingWake`, so a consent-retry deadline that elapsed while the
+worker was busy, a deadline armed by a concurrent synchronous `Track` after the
+worker had parked, and spool entries reloaded at startup all wait for the flush
+tick there rather than their own clock. Everything else describes the pinned release. Where the SDK does not have a capability, this
 skill says so — do not invent config fields, endpoints, or behaviors beyond
 what is documented here.
 
@@ -177,8 +181,10 @@ are never resolved). Optional tuning: `BatchSize` (default 25, max
 a heartbeat: an empty batch publishes nothing, so an otherwise-silent process
 makes no requests at any value. A full `BatchSize` publishes immediately,
 `Flush()` publishes on demand, and retry pacing runs on its own clock
-*(unreleased — at `v0.6.1-alpha` `backoffCeiling(1)` is 0, so the FIRST failure
-waits for the flush tick)*),
+*(partly unreleased — at `v0.6.1-alpha` `backoffCeiling(1)` is 0 and
+`nextPacingWake` does not exist, so the FIRST failure, an elapsed consent-retry
+deadline, a deadline armed by a concurrent `Track`, and spool entries reloaded
+at startup all wait for the flush tick)*),
 `HTTPTimeout` (default 2s), `Logger`, `UserID`/`AnonymousID`
 (default actor identity), `OnBatchResult` (see verification), the
 remote-config fields (`RemoteConfigURL` + `APIKey` +
@@ -326,7 +332,7 @@ Facts that keep integrations correct:
   a batch that failed retryably (429/5xx or transport error) and retries it,
   honoring the server's `Retry-After` hint; a retryable failure **without** a
   hint paces itself with full-jitter exponential backoff on its OWN clock,
-  independent of `FlushInterval` (every failure — the first included *(the FIRST failure's independent delay is unreleased — at `v0.6.1-alpha` `backoffCeiling(1)` is 0, so the first retry waits for the flush tick instead)* — waits
+  independent of `FlushInterval` (every failure — the first included *(partly unreleased — at `v0.6.1-alpha` `backoffCeiling(1)` is 0 and there is no `nextPacingWake`, so the first hintless failure, an elapsed consent-retry deadline, a deadline armed by a concurrent `Track`, and startup-reloaded spool entries all wait for the flush tick instead)* — waits
   at least 1s, with the ceiling doubling from the third consecutive failure
   up to 60s, reset on success). With
   `SpoolDir` set such batches also spool to disk as crash insurance (see
