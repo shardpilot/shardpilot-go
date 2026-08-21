@@ -195,6 +195,14 @@ FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY
 FIXTURE_DIRTY_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY
 FIXTURE_NAMEHIT_NAME KNOWN_INNOCENT KNOWN_INTERNAL PATTERNS ROSTER'
 
+# ⚠ AN ANSI-C FRAGMENT CAN TRUNCATE ITS OWN VALUE. `$'\0'` is a NUL, and bash
+# ends the string there — so everything after it stays in the published file
+# and reaches neither `declare -p`, nor the value audit, nor the self-test,
+# which goes on counting the fixtures it can still see. The grammar therefore
+# admits exactly one escape form inside `$'…'`: three octal digits that are not
+# 000. `\x00`, `\u0000`, `\c@` and a bare `\0` are all refused without being
+# named, which is the point — the spellings of NUL are not a list worth keeping.
+#
 # ⚠ THE GRAMMAR RUNS FIRST, BEFORE ANYTHING SOURCES THIS FILE. A subshell
 # contains variables, not the filesystem: `touch`, a redirect or an `rm` in the
 # corpus takes effect and only then gets refused, so the checks below were
@@ -219,18 +227,26 @@ if ! corpus_grammar="$(awk -v expected="$corpus_expected" '
     n = split(expected, a, /[ \t\n]+/)
     for (i = 1; i <= n; i++) if (a[i] != "") ok[a[i]] = 1
   }
-  function scan(s,   i, c) {
+  function scan(s,   i, c, esc) {
     i = 1
     while (i <= length(s)) {
       c = substr(s, i, 1)
       if (q == "") {
-        if (c == sq) q = sq
-        else if (c == dl && substr(s, i + 1, 1) == sq) { q = sq; i++ }
+        if (c == sq) { q = sq; ansi = 0 }
+        else if (c == dl && substr(s, i + 1, 1) == sq) { q = sq; ansi = 1; i++ }
         else if (c !~ /[A-Za-z0-9_=]/) {
           if (!hit) print NR ": " c " outside a quoted value -- " $0
           hit = 1
         }
       } else if (c == q) q = ""
+      else if (ansi && c == "\\") {
+        esc = substr(s, i + 1, 3)
+        if (esc !~ /^[0-7][0-7][0-7]$/ || esc == "000") {
+          if (!hit) print NR ": escape in an ANSI-C fragment is not a non-NUL octal byte -- " $0
+          hit = 1
+        }
+        i += 3
+      }
       i++
     }
   }
@@ -535,6 +551,28 @@ scan_tree() {
       echo "  gate to walk containers deliberately." >&2
       exit 2
     done
+    # ⚠ A NUL-BEARING FILE IS REFUSED, NOT SCANNED. UTF-16 holds its text as
+    # ASCII interleaved with NULs, so a line-oriented ASCII pattern cannot
+    # match it — the file reads, counts, and reports clean while carrying the
+    # identifier in plain sight of anyone who opens it. Codex demonstrated
+    # exactly that with a tracked UTF-16LE document.
+    #
+    # Refused rather than decoded, on the footing the container refusal already
+    # stands on and for the same reason: measured today, both trees hold ZERO
+    # NUL-bearing tracked files, so a decoder here would be untested code
+    # guarding nothing. This covers UTF-16 and UTF-32 with or without a BOM,
+    # which a BOM test would not.
+    nul_bytes=$(wc -c < "$root/$f" | tr -d ' ')
+    nul_stripped=$(LC_ALL=C tr -d '\000' < "$root/$f" | wc -c | tr -d ' ')
+    if [ "$nul_bytes" -ne "$nul_stripped" ]; then
+      echo "REFUSING: '$f' contains NUL bytes, so it is not the text this reads." >&2
+      echo "  UTF-16 and UTF-32 hold ASCII interleaved with NULs and match no" >&2
+      echo "  pattern here, so a clean result would say nothing about them." >&2
+      echo "  Store it as UTF-8, or extend this gate to decode deliberately." >&2
+      exit 2
+    fi
+    # -a remains for a file with high-bit bytes and no NUL, which GNU grep also
+    # calls binary. It is defence behind the refusal above, not the front line.
     # -a treats a NUL-bearing file as text: GNU grep >= 3.5 otherwise prints
     # "binary file matches" to STDERR and nothing to stdout, so a hit inside a
     # committed binary reads as a clean file.
@@ -676,10 +714,56 @@ $ROSTER
 EOF
 
   # ⚠ THESE TWO PASSES NOW COVER THE EXEMPT REGIONS, and only those. The main
+  # The loaded values, read by every audit below. ⚠ ASSIGNED BEFORE THE FIRST
+  # OF THEM: this sat between two audits once, so the earlier one interpolated
+  # an unset variable, found nothing extra, and looked exactly like a working
+  # fix. Its own probe is what caught it.
+  corpus_values="$(for v in $CORPUS_EXPECTED_NAMES; do
+    eval "printf '%s\n' \"\${$v:-}\""
+  done)"
+
   # ⚠ THE EXTRACTOR TAKES THE WHOLE TOKEN. It read `[a-z][a-z-]*`, so a name
   # carrying a digit was truncated at the digit and the SHORTER prefix — which
   # exists everywhere in this tree — was what got checked. A repository name
   # ending in a digit passed while the literal stayed published.
+  # ⚠ THE PATTERN LIST HOLDS SHAPES, AND THAT IS NOW EXECUTED RATHER THAN
+  # ASSERTED. A bare alternative — a name with no metacharacter in it — is a
+  # roster entry hiding in the one variable no rule covered: the corpus is
+  # excluded by path, the grammar sees a well-formed assignment, and the
+  # identifier and repository audits look for their own classes, not for
+  # arbitrary words. Adding a literal internal name as an alternative made this
+  # file its sole publisher and everything stayed green.
+  #
+  # Top-level alternatives are split on `|` outside brackets and groups, and
+  # each must carry a regex metacharacter. Names belong in the roster, which is
+  # checked against the tree.
+  while IFS= read -r lit; do
+    [ -n "$lit" ] || continue
+    printf 'PROSE VIOLATION: the pattern list holds a bare literal alternative: %s\n' "$lit" >&2
+    novel=$((novel + 1))
+  done <<EOF
+$(printf '%s' "$PATTERNS" | awk '
+  function check(a) {
+    if (a == "") return
+    if (a ~ /[][(){}+*?\\]/) return
+    print a
+  }
+  {
+    depth = 0; inbr = 0; alt = ""
+    for (i = 1; i <= length($0); i++) {
+      c = substr($0, i, 1)
+      if (c == "\\") { alt = alt c substr($0, i + 1, 1); i++; continue }
+      if (inbr) { if (c == "]") inbr = 0; alt = alt c; continue }
+      if (c == "[") { inbr = 1; alt = alt c; continue }
+      if (c == "(") { depth++; alt = alt c; continue }
+      if (c == ")") { depth--; alt = alt c; continue }
+      if (c == "|" && depth == 0) { check(alt); alt = ""; continue }
+      alt = alt c
+    }
+    check(alt)
+  }')
+EOF
+
   # scan reads this file's prose like any other file's. What no pass reads is
   # the corpus, excluded by path — so these checks read IT as well as this
   # file. Both of this gate's own past disclosures were of exactly this kind:
@@ -694,7 +778,8 @@ EOF
       novel=$((novel + 1))
     fi
   done <<EOF
-$(grep -hoE 'shardpilot/[A-Za-z0-9][A-Za-z0-9._-]*' "$SELF" "$CORPUS" | sort -u)
+$( { grep -hoE 'shardpilot/[A-Za-z0-9][A-Za-z0-9._-]*' "$SELF" "$CORPUS"
+     printf '%s\n' "$corpus_values" | grep -oE 'shardpilot/[A-Za-z0-9][A-Za-z0-9._-]*'; } | sort -u )
 EOF
 
   # Identifiers, in every class the patterns name, admitted by shape alone. A
@@ -705,9 +790,6 @@ EOF
   # adjacent quotes is invisible to a grep of the file and perfectly legible to
   # everyone reading the published fixture, so the loaded values are searched
   # too and the two results are merged.
-  corpus_values="$(for v in $CORPUS_EXPECTED_NAMES; do
-    eval "printf '%s\n' \"\${$v:-}\""
-  done)"
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
     case "$lit" in EXAMPLE_*) continue ;; esac
@@ -794,7 +876,8 @@ EOF
   #   the notes file    nothing internal in its BODY — the hit is the NAME,
   #                     which is why the path itself is scanned
   #   the accented file C-quoted by git ls-files, so it proves -z is honoured
-  #   the binary file   carries a NUL, so grep calls it binary without -a
+  #   the binary file   carries a NUL, and is scanned in a tree of its own
+  #                     because it must REFUSE rather than report
   #
   # The filenames are described rather than written: this prose is scanned like
   # any other, and naming the fixtures here would put their identifiers into a
@@ -813,7 +896,6 @@ EOF
     printf '%s\n' "$FIXTURE_DIRTY_BODY"   > "$FIXTURE_DIRTY_NAME"
     printf '%s\n' "$FIXTURE_LANEB_BODY"   > "$FIXTURE_LANEB_NAME"
     printf '%s\n' "$FIXTURE_ACCENT_BODY"  > "$FIXTURE_ACCENT_NAME"
-    printf 'x\0%s\n' "$FIXTURE_BINARY_BODY" > "$FIXTURE_BINARY_NAME"
     git add -A >/dev/null 2>&1
   )
   scan_tree "$tmp"
@@ -825,8 +907,25 @@ EOF
     echo "SELFTEST: the scan missed dirty.md" >&2; fixture_fail=1; }
   printf '%s' "$scanned_a" | grep -q 'caf' || {
     echo "SELFTEST: the scan missed the non-ASCII path (core.quotePath)" >&2; fixture_fail=1; }
-  printf '%s' "$scanned_a" | grep -q '^binary\.bin:' || {
-    echo "SELFTEST: the scan missed the NUL-bearing file (grep -a)" >&2; fixture_fail=1; }
+  # The NUL fixture gets its own tree: a refusal ends the run it happens in,
+  # so it cannot sit beside the fixtures whose results are read afterwards. The
+  # scan runs in a subshell precisely so its exit status can be read.
+  nul_tmp="$(mktemp -d)"
+  (
+    cd "$nul_tmp"
+    git init -q .
+    git config user.email t@t; git config user.name t
+    printf 'x\000%s\n' "$FIXTURE_BINARY_BODY" > "$FIXTURE_BINARY_NAME"
+    git add -A >/dev/null 2>&1
+  )
+  # `|| nul_status=$?` rather than a bare call: under `set -e` the failing
+  # subshell ends the whole run before its status can be read, which killed
+  # this gate with no output at all the first time it was written.
+  nul_status=0
+  ( scan_tree "$nul_tmp" ) >/dev/null 2>&1 || nul_status=$?
+  [ "$nul_status" -eq 2 ] || {
+    echo "SELFTEST: a NUL-bearing tracked file was not refused" >&2; fixture_fail=1; }
+  rm -rf "$nul_tmp"
   printf '%s' "$scanned_a" | grep -qF -- "$FIXTURE_NAMEHIT_NAME:path:" || {
     echo "SELFTEST: the scan missed an internal identifier in a PATH NAME" >&2; fixture_fail=1; }
   printf '%s' "$scanned_a" | grep -q '^clean\.md:' && {
