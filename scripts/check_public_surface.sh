@@ -675,7 +675,18 @@ scan_tree() {
     # document needs one — an ampersand entity in prose about HTML, say — this
     # becomes a decision rather than a discovery. Note this comment cannot
     # give an example: writing one made the gate refuse itself, correctly.
-    if grep -qaE '&#[0-9]+;|&#[xX][0-9A-Fa-f]+;|&[A-Za-z][A-Za-z0-9]{1,31};' "$blob" 2>/dev/null; then
+    #
+    # ⚠ AND ONLY FOR FORMATS THAT RENDER ONE. In source, the same characters are
+    # data: a file holding an entity as a string constant is ordinary and was
+    # being refused outright — which also broke this file's promise that source
+    # is REPORTED rather than gated, since a refusal ends the run before the
+    # lane split can honour it.
+    refs_apply=no
+    case "$f" in
+      *.md|*.markdown|*.html|*.htm) refs_apply=yes ;;
+    esac
+    if [ "$refs_apply" = yes ] &&
+       grep -qaE '&#[0-9]+;|&#[xX][0-9A-Fa-f]+;|&[A-Za-z][A-Za-z0-9]{1,31};' "$blob" 2>/dev/null; then
       echo "REFUSING: '$f' contains a character reference." >&2
       echo "  It renders as a character this gate never reads, so a clean result" >&2
       echo "  would be about the bytes rather than about the page. Write the" >&2
