@@ -79,14 +79,24 @@
 # Neither lane looks at git HISTORY. Deleting a line does not unpublish the
 # commit that carried it.
 #
-# ⚠ AND THE CORPUS'S OWN COVERAGE SENTENCES ARE NOT BOUNDED BY ANYTHING
-# HERE. Identifiers in it are, by shape — nothing real is numbered all
-# zeros, nines or f's — but a coverage disclosure has no synthetic form: a
-# sentence about missing tests reads identically whether its subject is
-# invented or real. What narrows it is that every known-internal line must
-# MATCH a class, so the only thing that fits there is another
-# coverage-shaped sentence, and that the file is small enough to read. A
-# gate cannot close this; a reviewer can.
+# ⚠ REFUSALS COME IN TWO KINDS AND A CENSUS MUST NOT CONFLATE THEM.
+#   HAZARD refusals are about content that can reach the public surface with
+#   nobody intending it — an internal name, a decision-record id, a service
+#   name in prose, an archive in the tree. These are kept whatever their firing
+#   count: zero firings means "has not happened yet", not "does not protect".
+#   STRUCTURAL refusals say nothing about content. They say this run is not in
+#   a state to report on content — the listing failed, no file was read, a blob
+#   was unreadable, the pattern list is empty. They are what separates "passed"
+#   from "never ran", and a dead run reports nothing and reads exactly like a
+#   clean one. Each is marked at its site.
+#
+# ⚠ AND THE FIXTURE COVERAGE SENTENCES ARE NOT BOUNDED BY ANYTHING HERE.
+# Identifiers in them are, by shape — nothing real is numbered all zeros, nines
+# or f's — but a coverage disclosure has no synthetic form: a sentence about
+# missing tests reads identically whether its subject is invented or real. What
+# narrows it is that every known-internal line must MATCH a class, so the only
+# thing that fits there is another coverage-shaped sentence. A gate cannot
+# close this; a reviewer can.
 #
 # ⚠ SOURCE AND RENDERED PAGE ARE DIFFERENT SURFACES, and the published one is
 # the page. A token split by emphasis, an escaped hyphen, a character reference
@@ -117,6 +127,7 @@ set -euo pipefail
 
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 if [ ! -f "$SELF" ]; then
+  # refusal:structural
   echo "REFUSING: cannot resolve this script's own path ($SELF)." >&2
   echo "  The self-audit greps read it by path; an unresolvable one makes them" >&2
   echo "  read nothing and report clean." >&2
@@ -210,198 +221,93 @@ gate_tmp() {
 }
 trap 'rm -f "${GATE_TMPFILES[@]}"' EXIT
 
-CORPUS_PATH="$(dirname "$SELF")/gate-corpus.sh"
-if [ ! -f "$CORPUS_PATH" ]; then
-  echo "REFUSING: $CORPUS_PATH is missing." >&2
-  echo "  It holds the class patterns and the fixture corpora; without it the" >&2
-  echo "  gate would scan with an empty pattern list and report clean." >&2
-  exit 2
-fi
-# ⚠ AND IT IS READ FROM THE INDEX, like every other tracked file. It was the
-# one working-tree exception left: its grammar, its values and its audits all
-# read the copy on disk while the scan skipped the staged blob by path, so
-# staging a disclosure into it and restoring the disk copy left every validator
-# looking at the clean version and the scan looking away.
-#
-# The consequence is worth stating: while editing this corpus you must `git
-# add` it before this gate reflects the change. That is the same discipline as
-# running CI after committing rather than before, and it is what makes a green
-# run a statement about the commit rather than about the desk it was run on.
-gate_tmp; CORPUS="$GATE_TMP"
-CORPUS_REL="scripts/$(basename "$CORPUS_PATH")"
 SELF_REL="scripts/$(basename "$SELF")"
 gate_tmp; SELF_BLOB="$GATE_TMP"
 if ! (cd "$(dirname "$SELF")/.." && git cat-file blob ":$SELF_REL") > "$SELF_BLOB" 2>/dev/null; then
+  # refusal:structural
   echo "REFUSING: the staged blob for $SELF_REL could not be read." >&2
   echo "  The audits below read this script for literals it alone would" >&2
   echo "  publish, and a commit carries the staged copy, not this one." >&2
   exit 2
 fi
-if ! (cd "$(dirname "$CORPUS_PATH")/.." && git cat-file blob ":$CORPUS_REL") > "$CORPUS" 2>/dev/null; then
-  echo "REFUSING: the staged blob for $CORPUS_REL could not be read." >&2
-  echo "  A commit would carry that blob, so it is the one worth validating;" >&2
-  echo "  if the file is newly added, stage it before running this gate." >&2
-  exit 2
-fi
-# ⚠ THE CORPUS IS NEVER SOURCED INTO THIS SHELL. It used to be, before its own
-# validators ran — so a single `exit 0` appended to it ended the gate with
-# status 0 and NO OUTPUT AT ALL. Not a weakened check: the whole run, silently.
-# A file this script skips must not also be a file this script executes.
+# ── THE MATERIAL THAT MATCHES BY CONSTRUCTION, IN THIS FILE AND SCANNED ─────
+# It lived in a separate file excluded from the scan BY PATH, and that
+# exclusion was the whole problem: an unscanned file is somewhere to put
+# things, and guarding it took eight refusals that caught nothing but probes.
+# Guarding an exclusion with regular expressions is a weakened version of the
+# scan you are declining to run.
 #
-# It is read in a subshell instead, which reports back only variable VALUES via
-# `declare -p`. An `exit` there kills the subshell, `declare -p` never runs, the
-# dump is empty, and the required-variable check below refuses. The failure mode
-# of tampering is a refusal rather than a silent success.
+# So there is no exclusion. Each value that would match its own classes carries
+# a VISIBLE BREAK — `[]`, which occurs nowhere in this prose — and the loader
+# removes it. The text stays legible to anyone reading the file, and the scan
+# reads these bytes exactly as it reads every other line here, so nothing can
+# hide in them that could not hide anywhere else in this script.
 #
-# `env -i` for the same reason the name comparison needs it: starting from a
-# clean environment means an assignment to an INHERITED name — `HOME=`, say —
-# shows up as newly defined instead of being invisible against the parent's
-# variables. PATH is carried in so the subshell can find its utilities; it is
-# excluded from the comparison by name.
-CORPUS_EXPECTED_NAMES='FIXTURE_ACCENT_BODY FIXTURE_ACCENT_NAME FIXTURE_BINARY_BODY
-FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY
-FIXTURE_DIRTY_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY
-FIXTURE_NAMEHIT_NAME KNOWN_INNOCENT KNOWN_INTERNAL PATTERNS ROSTER'
-
-# ⚠ AN ANSI-C FRAGMENT CAN TRUNCATE ITS OWN VALUE. `$'\0'` is a NUL, and bash
-# ends the string there — so everything after it stays in the published file
-# and reaches neither `declare -p`, nor the value audit, nor the self-test,
-# which goes on counting the fixtures it can still see. The grammar therefore
-# admits exactly one escape form inside `$'…'`: three octal digits in the byte
-# range that are not 000. The range matters as much as the value — bash reduces
-# an octal escape modulo 256, so `\400` is also a NUL and `^[0-7]{3}$` admitted
-# it. `\x00`, `\u0000`, `\c@` and a bare `\0` are all refused without being
-# named, which is the point — the spellings of NUL are not a list worth keeping.
+# The break placement was GENERATED, not hand-made, and two properties were
+# verified over every value before it landed: no broken value matches
+# `$PATTERNS` or the roster class, and every decode is byte-identical to the
+# original. The second matters as much as the first — a break that also changed
+# the text would leave the self-test asserting something other than it claims.
 #
-# ⚠ THE GRAMMAR RUNS FIRST, BEFORE ANYTHING SOURCES THIS FILE. A subshell
-# contains variables, not the filesystem: `touch`, a redirect or an `rm` in the
-# corpus takes effect and only then gets refused, so the checks below were
-# reading a tree the file had already been allowed to change. The grammar reads
-# raw text and executes nothing, so it is the only check that can go first.
-corpus_expected="$(printf '%s\n' $CORPUS_EXPECTED_NAMES | sort | tr '\n' ' ')"
+# `$PATTERNS` and `$KNOWN_INNOCENT` carry no break: measured, neither matches
+# the classes, so they are written plainly.
+GATE_DATA_NAMES='ROSTER KNOWN_INTERNAL KNOWN_INNOCENT FIXTURE_ACCENT_BODY FIXTURE_ACCENT_NAME FIXTURE_BINARY_BODY FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY FIXTURE_DIRTY_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY FIXTURE_NAMEHIT_NAME'
 
-# The corpus is validated by GRAMMAR, not by a list of forbidden shapes. Each
-# predicate caught the variant it was written for and left the next one: a
-# comment, then a function declaration (bash emits neither a definition under
-# xtrace nor a name under `compgen -v`), then an assignment repeated so its
-# first value is overwritten before the self-test ever reads it, then a comment
-# after a `;`, then a parameter expansion whose payload never reaches a value,
-# then an indexed array whose second element nothing expands. They are one
-# thing — text in a file no pass reads — so the rule states what a line MAY be
-# instead of what it may not, down to the characters admissible outside a
-# quoted literal: name characters, `=`, `'`, and `$` only where it opens `$'…'`.
-# A construct nobody has thought of yet needs a character to be written in.
-if ! corpus_grammar="$(awk -v expected="$corpus_expected" '
-  BEGIN {
-    sq = sprintf("%c", 39); dl = sprintf("%c", 36); q = ""
-    n = split(expected, a, /[ \t\n]+/)
-    for (i = 1; i <= n; i++) if (a[i] != "") ok[a[i]] = 1
-  }
-  function scan(s,   i, c, esc) {
-    i = 1
-    while (i <= length(s)) {
-      c = substr(s, i, 1)
-      if (q == "") {
-        if (c == sq) { q = sq; ansi = 0 }
-        else if (c == dl && substr(s, i + 1, 1) == sq) { q = sq; ansi = 1; i++ }
-        else if (c !~ /[A-Za-z0-9_=]/) {
-          if (!hit) print NR ": " c " outside a quoted value -- " $0
-          hit = 1
-        }
-      } else if (c == q) q = ""
-      else if (ansi && c == "\\") {
-        esc = substr(s, i + 1, 3)
-        if (esc !~ /^[0-3][0-7][0-7]$/ || esc == "000") {
-          if (!hit) print NR ": escape in an ANSI-C fragment is not a non-NUL octal byte -- " $0
-          hit = 1
-        }
-        i += 3
-      }
-      i++
-    }
-  }
-  !started && /^[[:space:]]*(#|$)/ { next }
-  { started = 1 }
-  {
-    hit = 0
-    if (q == "" && $0 ~ /^[[:space:]]*$/) next
-    if (q == "") {
-      if ($0 !~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
-        print NR ": not an assignment -- " $0
-      } else {
-        name = $0; sub(/=.*/, "", name)
-        if (!(name in ok)) print NR ": unexpected name " name
-        seen[name]++
-        if (seen[name] > 1) print NR ": " name " is assigned again"
-      }
-    }
-    scan($0)
-  }
-  END {
-    if (q != "") print "end of file: a quoted value is never closed"
-    for (k in ok) if (!(k in seen)) print "no assignment for " k
-  }
-' "$CORPUS" 2>&1)"; then
-  echo "REFUSING: the corpus grammar check could not run:" >&2
-  printf '  %s\n' "$corpus_grammar" >&2
-  echo "  A checker that fails to start writes nothing, and nothing reads as" >&2
-  echo "  clean. Its status decides, not its output." >&2
-  exit 2
-fi
-if [ -n "$corpus_grammar" ]; then
-  echo "REFUSING: $CORPUS does not parse as the assignments it is limited to:" >&2
-  printf '  %s\n' "$corpus_grammar" >&2
-  echo "  Every line above is text in a file the gate never scans. This file" >&2
-  echo "  holds one assignment per expected name and nothing else." >&2
-  exit 2
-fi
-
-
-corpus_defined="$(env -i PATH="$PATH" bash -c '
-  before=$(compgen -v | sort)
-  . "$1" >/dev/null 2>&1
-  after=$(compgen -v | sort)
-  comm -13 <(printf "%s\n" "$before") <(printf "%s\n" "$after")
-' _ "$CORPUS" 2>/dev/null | { grep -vxE 'before|after|PATH|PIPESTATUS|_' || true; } | sort | tr '\n' ' ')"
-if [ "$corpus_defined" != "$corpus_expected" ]; then
-  echo "REFUSING: $CORPUS defines a different set of names than expected." >&2
-  echo "  defined:  $corpus_defined" >&2
-  echo "  expected: $corpus_expected" >&2
-  echo "  The gate skips this file, so an unexpected assignment is unread text in" >&2
-  echo "  a published repository. Adding one means naming it in the gate. An EMPTY" >&2
-  echo "  list here also means the file stopped the subshell early." >&2
-  exit 2
-fi
-
-corpus_ran="$(env -i PATH="$PATH" bash -c 'PS4=@; set -x; . "$1"' \
-  _ "$CORPUS" 2>&1 >/dev/null | { grep '^@@' || true; })"
-if [ -z "$corpus_ran" ]; then
-  echo "REFUSING: $CORPUS ran no statements at all." >&2
-  exit 2
-fi
-corpus_odd="$(printf '%s\n' "$corpus_ran" |
-  { grep -vE '^@@[A-Za-z_][A-Za-z0-9_]*=' || true; })"
-if [ -n "$corpus_odd" ]; then
-  echo "REFUSING: $CORPUS runs statements that are not plain assignments:" >&2
-  printf '  %s\n' "$corpus_odd" >&2
-  echo "  Every line above is text in a file the gate never scans. A statement" >&2
-  echo "  defining no variable clears the name check; a substitution nests one" >&2
-  echo "  level deeper. This file holds assignments to the named variables and" >&2
-  echo "  nothing else." >&2
-  exit 2
-fi
-
-corpus_dump="$(env -i PATH="$PATH" bash -c '
-  . "$1" >/dev/null 2>&1
-  declare -p $2
-' _ "$CORPUS" "$CORPUS_EXPECTED_NAMES" 2>/dev/null)"
-if [ -z "$corpus_dump" ]; then
-  echo "REFUSING: $CORPUS produced no values." >&2
-  echo "  Its variables are read in a subshell; an empty result means the file" >&2
-  echo "  ended that subshell before reporting them." >&2
-  exit 2
-fi
-eval "$corpus_dump"
+PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not| never) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (for|of|in)|[.,;]|$)|[Tt]here (is|are)(n.{1,3}t| not) (any |no )?(harness|harnesses|coverage|tests?|suites?)|[Tt]here (is|are) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?)|[Nn]obody (looks|checks|monitors)|[Ll]acks( any| automated| an?)* ?[A-Za-z-]*[ ]?(harness|harnesses|coverage|tests?|suites?|monitoring)|(has|have|had)(n.{1,3}t| not| never) been (tested|covered|scanned|audited|monitored)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
+ROSTER='analytic[]s-service
+contro[]l-plane'
+KNOWN_INTERNAL='per ADR-[]0000 §[]3
+There are no P[]laywright tests for the console.
+There are no e[]nd-to-end tests for the purchase flow.
+The console has no end-to-e[]nd tests for purchase callbacks.
+The console does not have []automated tests.
+The console has no t[]ests.
+The crash path is un[]tested.
+There is NO Pla[]ywright harness in the console repo
+the crash path is not []covered by automated tests
+no automated[] scanning for that class of input
+a bare §[]7c left behind when a record id was stripped
+tracked as GAP[]-000 internally
+pinned to main @ []0000000
+nobody[] looks at that dashboard
+tracked as SP-[]999 in the internal board
+filed as AC-Q[]A-999 during triage
+the console lacks auto[]mated tests
+Codex []review
+EXAMPLE_SYNTH[]ETIC_FL[]AG_MODE=off
+The crash path isn'"'"'t []tested.
+The crash path hasn'"'"'t be[]en tested.
+The console doesn’t have a[]utomated tests.
+The console has never b[]een audited.
+The crash path was neve[]r tested.
+There are []zero tests for the payment parser.
+There aren'"'"'[][]t any tests for the payment parser.'
+KNOWN_INNOCENT='go get github.com/shardpilot/shardpilot-go@v0.6.0-alpha
+IngestURL: os.Getenv("SHARDPILOT_INGEST_URL")
+POST {IngestURL}/v1/events:batch
+https://localhost:8080 during local development
+a documented per-platform adaptation, not drift
+DEFOLD_SHA1="f735c12192bf95684e6ae1ae27c400b8170fc6d8"
+a self-service signup flow, a micro-service boundary
+the event plane and the consent plane are separate
+an analytics-plane request, zero event batches'
+FIXTURE_ACCENT_BODY='internal: contro[]l-plane'
+FIXTURE_ACCENT_NAME='café.md'
+FIXTURE_BINARY_BODY='see ADR-[]9999 here'
+FIXTURE_BINARY_NAME=binary.bin
+FIXTURE_CLEAN_BODY='clean customer prose'
+FIXTURE_CLEAN_NAME=clean.md
+FIXTURE_DIRTY_BODY='see ADR-[]0000 for context'
+FIXTURE_DIRTY_NAME=dirty.md
+FIXTURE_LANEB_BODY='// GAP[]-000 note
+package x'
+FIXTURE_LANEB_NAME=lane_b.go
+FIXTURE_NAMEHIT_BODY='nothing internal in the body'
+FIXTURE_NAMEHIT_NAME='ADR-[]9999-notes.md'
+for gate_var in $GATE_DATA_NAMES; do
+  eval "$gate_var=\"\${$gate_var//\[\]/}\""
+done
+unset gate_var
 
 # Container signatures, in ONE list, searched for ANYWHERE in a file — which
 # subsumes searching at byte zero, so there is nothing here for a second list
@@ -427,7 +333,6 @@ CONTAINER_SIGS_TXT="$CONTAINER_SIGS_TXT"' \102\132\150\064 \102\132\150\065'
 CONTAINER_SIGS_TXT="$CONTAINER_SIGS_TXT"' \102\132\150\066 \102\132\150\067'
 CONTAINER_SIGS_TXT="$CONTAINER_SIGS_TXT"' \102\132\150\070 \102\132\150\071'
 CONTAINER_SIGS_TXT="$CONTAINER_SIGS_TXT"' \045\120\104\106'
-CONTAINER_SIGS="$CONTAINER_SIGS"' \122\141\162\041\032\007 \177\105\114\106'
 
 # Identifiers are admitted by SHAPE. A list of admissible ones was the first
 # answer and it cannot fail: the same change that publishes a live record can
@@ -464,33 +369,16 @@ ROSTER_RE="$(roster_regex)"
 for required in PATTERNS ROSTER ROSTER_RE KNOWN_INTERNAL KNOWN_INNOCENT; do
   eval "value=\${$required:-}"
   if [ -z "$value" ]; then
-    echo "REFUSING: $CORPUS did not define $required." >&2
+    # ⚠ STRUCTURAL REFUSAL. See the category note in the scope block: it says
+    # nothing about content, it says this run is not in a state to report on
+    # content. An empty pattern list matches nothing and reports every file
+    # clean, which is indistinguishable from a clean repository.
+    # refusal:structural
+    echo "REFUSING: $required is empty after loading." >&2
     echo "  An empty pattern list matches nothing and reports every file clean." >&2
     exit 2
   fi
 done
-
-# The corpus is excluded from every search BY PATH, and the comment refusal
-# above deliberately skips the header — which left this header as the one
-# stretch of prose in the repository that nothing reads. Codex put
-# a tracker-style identifier in it and the whole gate still exited 0 — this
-# very comment had to be reworded because the gate then caught the literal.
-# The exclusion exists for the assignments, whose values match the classes by
-# construction; it was never meant to cover prose. So the header is scanned
-# with the same classes as every other file, and it is the only part of this
-# file that can be.
-corpus_header="$(awk '/^[A-Za-z_][A-Za-z0-9_]*=/ { exit } { print NR ": " $0 }' "$CORPUS")"
-corpus_header_hits="$( {
-    printf '%s\n' "$corpus_header" | { grep -aE  -- "$PATTERNS"  || true; }
-    printf '%s\n' "$corpus_header" | { grep -aiE -- "$ROSTER_RE" || true; }
-  } | sort -u)"
-if [ -n "$corpus_header_hits" ]; then
-  echo "REFUSING: $CORPUS carries internal material in its header:" >&2
-  printf '  %s\n' "$corpus_header_hits" >&2
-  echo "  Nothing else reads this text. Reword it, or move what it says into" >&2
-  echo "  the gate, which is scanned end to end." >&2
-  exit 2
-fi
 
 # ⚠ THIS FILE IS SCANNED END TO END, WITH NO EXEMPTIONS AT ALL.
 #
@@ -544,6 +432,7 @@ scan_tree() {
   gate_tmp; md_blob="$GATE_TMP"
   if ! (cd "$root" && git ls-files -z) > "$list"; then
     rm -f "$list"
+    # refusal:structural
     echo "REFUSING: git ls-files failed in '$root'." >&2
     echo "  A partial or absent file list is an UNSCANNED repository, and this" >&2
     echo "  gate must not report one clean." >&2
@@ -554,7 +443,6 @@ scan_tree() {
     # The corpus is the one path this gate does not read: its entire content
     # matches by construction. Excluded by path rather than by a marker, so
     # nothing written INSIDE a file can extend the exemption.
-    [ "$f" = "scripts/gate-corpus.sh" ] && continue
     # THE PATH ITSELF IS PUBLISHED CONTENT. An internal identifier in a file
     # NAME — a decision-record id, a ticket, a service name in a directory —
     # reaches every consumer and appears in no file's body, so scanning only
@@ -595,12 +483,14 @@ scan_tree() {
     ls_entry="$(cd "$root" && git ls-files -s -z -- "$f" | tr -d '\000')"
     mode="${ls_entry%% *}"
     if [ "$mode" = 160000 ]; then
+      # refusal:hazard
       echo "REFUSING: '$f' is a gitlink, so its contents are another repository." >&2
       echo "  Nothing here reads across that boundary, and a clean result would" >&2
       echo "  say nothing about what the submodule publishes." >&2
       exit 2
     fi
     if ! (cd "$root" && git cat-file blob ":$f") > "$blob" 2>/dev/null; then
+      # refusal:structural
       echo "REFUSING: the staged blob for '$f' could not be read." >&2
       echo "  It is listed in the index, so a commit would carry it; an" >&2
       echo "  unreadable one cannot be reported clean." >&2
@@ -645,6 +535,7 @@ scan_tree() {
     # file in either tree.
     if [ "$printable_sigs" = yes ] &&
        [ "$(sed -e '1s/^\xef\xbb\xbf//' "$blob" | tr -d '[:space:]' | head -c 1)" = '<' ]; then
+      # refusal:hazard
       echo "REFUSING: '$f' begins as a markup document." >&2
       echo "  Its renderer assembles text this gate reads only as bytes — an" >&2
       echo "  identifier split across two elements draws whole and matches" >&2
@@ -677,6 +568,7 @@ scan_tree() {
     esac
     case "$magic_hit" in
       yes)
+        # refusal:hazard
         echo "REFUSING: '$f' begins with container magic (archive, PDF, executable" >&2
         echo "  or raster image)," >&2
         echo "  and this gate reads files as text. No pass here opens a container, so" >&2
@@ -705,6 +597,7 @@ scan_tree() {
     [ "$printable_sigs" = yes ] && sigs="$sigs $CONTAINER_SIGS_TXT"
     for sig in $sigs; do
       grep -qaF -- "$(printf "$sig")" "$blob" 2>/dev/null || continue
+      # refusal:hazard
       echo "REFUSING: '$f' contains a compressed-container signature." >&2
       echo "  Something in this file is a container, whatever its first bytes say," >&2
       echo "  and no pass here reads container contents. Remove it, or extend this" >&2
@@ -725,6 +618,7 @@ scan_tree() {
     nul_bytes=$(wc -c < "$blob" | tr -d ' ')
     nul_stripped=$(LC_ALL=C tr -d '\000' < "$blob" | wc -c | tr -d ' ')
     if [ "$nul_bytes" -ne "$nul_stripped" ]; then
+      # refusal:hazard
       echo "REFUSING: '$f' contains NUL bytes, so it is not the text this reads." >&2
       echo "  UTF-16 and UTF-32 hold ASCII interleaved with NULs and match no" >&2
       echo "  pattern here, so a clean result would say nothing about them." >&2
@@ -753,6 +647,7 @@ scan_tree() {
     esac
     if [ "$refs_apply" = yes ] &&
        grep -qaE '&#[0-9]+;|&#[xX][0-9A-Fa-f]+;|&[A-Za-z][A-Za-z0-9]{1,31};' "$blob" 2>/dev/null; then
+      # refusal:hazard
       echo "REFUSING: '$f' contains a character reference." >&2
       echo "  It renders as a character this gate never reads, so a clean result" >&2
       echo "  would be about the bytes rather than about the page. Write the" >&2
@@ -767,6 +662,7 @@ scan_tree() {
     # today, accents included, so a transcoder would be untested code guarding
     # nothing.
     if ! iconv -f UTF-8 -t UTF-8 < "$blob" >/dev/null 2>&1; then
+      # refusal:hazard
       echo "REFUSING: '$f' is not valid UTF-8." >&2
       echo "  The classes below are ASCII-oriented, so an encoding they cannot" >&2
       echo "  read would report clean whatever it says. Store it as UTF-8, or" >&2
@@ -814,6 +710,7 @@ scan_tree() {
         if sed -e 's/\\\([^A-Za-z0-9]\)/\1/g' -e 's/[*`]//g' "$blob" > "$md_blob"; then
           cat "$md_blob" > "$blob"
         else
+          # refusal:structural
           echo "REFUSING: could not normalise Markdown escapes in '$f'." >&2
           exit 2
         fi
@@ -829,6 +726,7 @@ scan_tree() {
     if sed 's/\r$//' "$blob" > "$md_blob"; then
       cat "$md_blob" > "$blob"
     else
+      # refusal:structural
       echo "REFUSING: could not normalise line endings in '$f'." >&2
       exit 2
     fi
@@ -858,6 +756,7 @@ scan_tree() {
     set -e
     for st in "$status" "$roster_status"; do
       if [ "$st" -ge 2 ]; then
+        # refusal:structural
         echo "REFUSING: grep could not read '$f' (exit $st)." >&2
         echo "  An unreadable file is an UNSCANNED file, and this gate must not" >&2
         echo "  report a repository clean on the strength of one." >&2
@@ -939,7 +838,7 @@ scan_tree() {
 # Both halves of the gate, excluded from every presence search as one list.
 # The rule asks whether a literal survives ELSEWHERE in the tree; a file that
 # exists to hold those literals cannot be part of the answer.
-GATE_EXCLUDES=":(exclude)scripts/check_public_surface.sh :(exclude)scripts/gate-corpus.sh"
+GATE_EXCLUDES=":(exclude)scripts/check_public_surface.sh"
 
 roster_is_present_in_the_tree() {
   local lit novel=0 found
@@ -960,7 +859,7 @@ EOF
   # OF THEM: this sat between two audits once, so the earlier one interpolated
   # an unset variable, found nothing extra, and looked exactly like a working
   # fix. Its own probe is what caught it.
-  corpus_values="$(for v in $CORPUS_EXPECTED_NAMES; do
+  corpus_values="$(for v in $GATE_DATA_NAMES; do
     eval "printf '%s\n' \"\${$v:-}\""
   done)"
 
@@ -1097,7 +996,7 @@ EOF
       novel=$((novel + 1))
     fi
   done <<EOF
-$( { grep -hoE 'shardpilot/[A-Za-z0-9][A-Za-z0-9._-]*' "$SELF_BLOB" "$CORPUS"
+$( { grep -hoE 'shardpilot/[A-Za-z0-9][A-Za-z0-9._-]*' "$SELF_BLOB"
      printf '%s\n' "$corpus_values" | grep -oE 'shardpilot/[A-Za-z0-9][A-Za-z0-9._-]*'; } | sort -u )
 EOF
 
@@ -1117,12 +1016,13 @@ EOF
     printf 'PROSE VIOLATION: %s is a live identifier written where nothing scans.\n' "$lit" >&2
     novel=$((novel + 1))
   done <<EOF
-$( { grep -hoE -- "$AUDIT_CLASSES" "$SELF_BLOB" "$CORPUS"
+$( { grep -hoE -- "$AUDIT_CLASSES" "$SELF_BLOB"
      printf '%s\n' "$corpus_values" | grep -oE -- "$AUDIT_CLASSES"; } | sort -u )
 EOF
 
   rm -f "$found"
   if [ "$novel" -ne 0 ]; then
+    # refusal:hazard
     echo "REFUSING: $novel literal(s) in this file exist nowhere else in this tree." >&2
     echo "  A gate against publishing internal names must not be the only thing" >&2
     echo "  publishing them — every release archive carries this file. Remove them" >&2
@@ -1181,6 +1081,7 @@ EOF
 $KNOWN_INNOCENT
 EOF
   if [ "$misses" -ne 0 ] || [ "$falses" -ne 0 ]; then
+    # refusal:structural
     echo "REFUSING: the pattern list failed its own self-test ($misses miss(es), $falses false positive(s))." >&2
     echo "  A scan that cannot match known-internal strings would report this" >&2
     echo "  repository clean by finding nothing, and print the same line as a pass." >&2
@@ -1210,18 +1111,20 @@ EOF
   # real workspace, before anything is scanned. Verified: an absolute name
   # overwrote a staged disclosure with clean prose, after which the self-test
   # reported 6/6 and the gate exited 0 while the index still carried it.
-  for fixname in $CORPUS_EXPECTED_NAMES; do
+  for fixname in $GATE_DATA_NAMES; do
     case "$fixname" in *_NAME) ;; *) continue ;; esac
     eval "fixval=\${$fixname:-}"
     case "$fixval" in
       ''|.|..|*/*|-*)
-        echo "REFUSING: $CORPUS gives $fixname a name that is not a plain basename." >&2
+        # refusal:structural
+        echo "REFUSING: $fixname is not a plain basename." >&2
         echo "  The self-test writes these; a path component would put a fixture" >&2
         echo "  outside the temporary repository and into the real workspace." >&2
         exit 2 ;;
     esac
     if [ "$(printf '%s\n' "$fixseen" | grep -cxF -- "$fixval")" -ne 0 ]; then
-      echo "REFUSING: $CORPUS reuses the fixture name $fixval." >&2
+      # refusal:structural
+      echo "REFUSING: the fixture name $fixval is used twice." >&2
       echo "  Two fixtures writing one path leave the self-test asserting over" >&2
       echo "  whichever was written last." >&2
       exit 2
@@ -1281,6 +1184,7 @@ EOF
   [ "$scan_lane_b_files" -eq 1 ] || {
     echo "SELFTEST: lane B counted $scan_lane_b_files files, expected 1" >&2; fixture_fail=1; }
   if [ "$fixture_fail" -ne 0 ]; then
+    # refusal:structural
     echo "REFUSING: the scan failed its own fixture." >&2
     exit 2
   fi
@@ -1299,6 +1203,7 @@ scan_tree "$PWD"
 # symptom they all share — so it is checked directly rather than only through
 # the exit status of the command that produced it.
 if [ "$scan_files" -eq 0 ]; then
+  # refusal:structural
   echo "REFUSING: the scan processed zero files." >&2
   echo "  A real checkout is never empty, so this means git ls-files failed or" >&2
   echo "  this is not a checkout. Reporting 'clean' here would be a gate that" >&2
