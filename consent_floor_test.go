@@ -6192,7 +6192,7 @@ func TestConsentUnwitnessedMarkIsHonoredEverywhereAGrantIsTrusted(t *testing.T) 
 		}
 		// Maintenance must now be held: the corrupt bytes stay put.
 		client.consentOutbox.mu.Lock()
-		err := client.consentOutbox.saveLocked()
+		err := client.consentOutbox.saveLocked(false) // maintenance, not a fresh decision
 		client.consentOutbox.mu.Unlock()
 		if !errors.Is(err, errConsentEvidenceHeld) {
 			t.Fatalf("maintenance write was not held: %v", err)
@@ -6203,6 +6203,149 @@ func TestConsentUnwitnessedMarkIsHonoredEverywhereAGrantIsTrusted(t *testing.T) 
 		}
 		if !bytes.Equal(after, corrupt) {
 			t.Fatalf("maintenance laundered the evidence:\n before: %s\n after:  %s", corrupt, after)
+		}
+	})
+}
+
+// TestUnprovableGrantIsHeldFromTheWireAndRecoverable covers round 6's four
+// findings, which are one question asked four ways: what else still trusts a
+// grant, and what else can strip the mark that says it is unprovable.
+func TestUnprovableGrantIsHeldFromTheWireAndRecoverable(t *testing.T) {
+	// (1) Withholding a grant LOCALLY while still POSTing it leaves the
+	// server granted for an actor whose rejected entry may be the very
+	// denial that made the trail unusable — and the server side outlives
+	// the device.
+	t.Run("grant_from_an_unusable_trail_is_not_dispatched", func(t *testing.T) {
+		state, server := newFloorTestServer(t)
+		defer server.Close()
+		dir := t.TempDir()
+		grant := testConsentReceipt("key-unprovable-grant", true)
+		broken := testConsentReceipt("key-broken", false)
+		broken.WorkspaceID = ""
+		if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName),
+			mustMarshalOutbox(t, grant, broken), 0o600); err != nil {
+			t.Fatalf("seed outbox: %v", err)
+		}
+
+		// Close DRAINS the outbox; Flush does not wait for the dispatch
+		// worker, so asserting on a post-Flush count would pass on timing
+		// alone and kill no mutant. Close is what forces the question.
+		client := newFloorTestClient(t, server.URL, dir, nil)
+		closeErr := client.Close(context.Background())
+		if got := state.consentCount(); got != 0 {
+			t.Fatalf("a grant from an unusable trail reached the server: %d receipts", got)
+		}
+		_ = closeErr
+		// Held, not DROPPED: the receipt survives in the outbox, so the
+		// decision it carries is not lost — only deferred.
+		reloaded := newConsentOutbox(dir)
+		reloaded.load(nil)
+		if got := len(reloaded.snapshot()); got != 1 {
+			t.Fatalf("the held grant was dropped rather than deferred: %d receipts on disk", got)
+		}
+
+		// A fresh decision resolves the uncertainty and the trail delivers.
+		second := newFloorTestClient(t, server.URL, dir, nil)
+		second.SetConsent(true)
+		if err := second.Close(context.Background()); err != nil {
+			t.Fatalf("Close after a fresh decision: %v", err)
+		}
+		if got := state.consentCount(); got == 0 {
+			t.Fatalf("a fresh decision did not release the held trail")
+		}
+	})
+
+	// (2) The evidence hold must not wedge the client: the documented
+	// recovery is a fresh decision, and it has to be able to WRITE.
+	t.Run("failed_mark_still_allows_a_fresh_decision_through", func(t *testing.T) {
+		_, server := newFloorTestServer(t)
+		defer server.Close()
+		dir := t.TempDir()
+		if err := saveConsentRecord(dir, ConsentDecisionGranted, spoolTestActorDigest(),
+			"2026-07-19T00:00:00Z", true, os.Rename, os.Chmod); err != nil {
+			t.Fatalf("seed granted record: %v", err)
+		}
+		broken := testConsentReceipt("key-broken", false)
+		broken.WorkspaceID = ""
+		if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName),
+			mustMarshalOutbox(t, broken), 0o600); err != nil {
+			t.Fatalf("seed outbox: %v", err)
+		}
+		cfg := Config{
+			WorkspaceID: "workspace-test", AppID: "app-test", EnvironmentID: "develop",
+			AnonymousID: "anon-spool-1", SpoolDir: dir, ConsentFloor: &ConsentFloorConfig{},
+			IngestURL: server.URL, APIKey: "wk_test",
+		}
+		client := &Client{cfg: cfg, clock: realClock{}}
+		client.initConsentFloor(func(oldpath, newpath string) error {
+			if strings.Contains(newpath, consentRecordFileName) {
+				return errors.New("disk full")
+			}
+			return os.Rename(oldpath, newpath)
+		}, os.Chmod)
+		if got := client.Snapshot().LastConsentError; got != "consent_unwitnessed_mark_failed" {
+			t.Fatalf("test shape: LastConsentError = %q", got)
+		}
+		// Maintenance is held...
+		client.consentOutbox.mu.Lock()
+		held := client.consentOutbox.saveLocked(false)
+		client.consentOutbox.mu.Unlock()
+		if !errors.Is(held, errConsentEvidenceHeld) {
+			t.Fatalf("maintenance was not held: %v", held)
+		}
+		// ...but a fresh decision writes through and lifts the hold.
+		client.consentOutbox.mu.Lock()
+		fresh := client.consentOutbox.saveLocked(true)
+		client.consentOutbox.mu.Unlock()
+		if fresh != nil {
+			t.Fatalf("a fresh decision could not persist: %v", fresh)
+		}
+		client.consentOutbox.mu.Lock()
+		stillHeld := client.consentOutbox.preserveUnusable
+		client.consentOutbox.mu.Unlock()
+		if stillHeld {
+			t.Fatalf("the evidence hold survived a fresh decision")
+		}
+	})
+
+	// (3)+(4) The mark must survive damage anywhere else in the record, and
+	// a structurally corrupt record must not read as another scope's.
+	t.Run("the_mark_survives_damage_elsewhere_in_the_record", func(t *testing.T) {
+		for _, tc := range []struct {
+			name    string
+			payload string
+		}{
+			{name: "damaged_stamp", payload: `{"consent_analytics":"granted","actor_digest":"DIGEST","floor":true,"decided_at":"not-a-time","unwitnessed":true}`},
+			{name: "empty_object", payload: `{}`},
+			{name: "json_null", payload: `null`},
+			{name: "missing_actor_digest", payload: `{"consent_analytics":"granted","floor":true,"decided_at":"2026-07-19T00:00:00Z"}`},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				_, server := newFloorTestServer(t)
+				defer server.Close()
+				dir := t.TempDir()
+				payload := strings.ReplaceAll(tc.payload, "DIGEST", spoolTestActorDigest())
+				if err := os.WriteFile(consentRecordPath(dir), []byte(payload), 0o600); err != nil {
+					t.Fatalf("write record: %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName),
+					mustMarshalOutbox(t, testConsentReceipt("key-retained-grant", true)), 0o600); err != nil {
+					t.Fatalf("seed outbox: %v", err)
+				}
+
+				client := newFloorTestClient(t, server.URL, dir, nil)
+				defer func() { _ = client.Close(context.Background()) }()
+				if got := client.Consent(); got == ConsentGranted {
+					t.Fatalf("%s: a retained grant receipt promoted the floor: %v", tc.name, got)
+				}
+				after, err := os.ReadFile(consentRecordPath(dir))
+				if err != nil {
+					t.Fatalf("read record: %v", err)
+				}
+				if string(after) != payload {
+					t.Fatalf("%s: the record was healed over:\n before: %s\n after:  %s", tc.name, payload, after)
+				}
+			})
 		}
 	})
 }

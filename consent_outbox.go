@@ -515,16 +515,36 @@ func (o *consentOutbox) preserveEvidence() {
 	o.mu.Unlock()
 }
 
-func (o *consentOutbox) saveLocked() error {
+func (o *consentOutbox) saveLocked(carriesFreshDecision bool) error {
 	diskReceipts, diskRead := o.readRecordReceipts()
+	if carriesFreshDecision && o.lastRead == consentOutboxReadUnusable {
+		// A FRESH explicit decision supersedes the unknown trail outright:
+		// it is newer than anything the unreadable bytes could have held.
+		// One rule, applied here rather than only in the rare failed-mark
+		// branch below — otherwise lastRead stays UNUSABLE for the life of
+		// the process, and the grant-dispatch hold keeps holding the very
+		// receipt the host just recorded to resolve the uncertainty.
+		o.lastRead = consentOutboxReadParsed
+	}
 	if o.durable() && o.preserveUnusable && diskRead == consentOutboxReadUnusable {
-		// Sanitizing this view into a clean record would erase the only
-		// remaining evidence that a persisted grant is unprovable. The
-		// mirror stays authoritative and the write stays owed; the hold
-		// lifts as soon as the mark lands or a fresh decision supersedes
-		// the unknown trail.
-		o.dirty = true
-		return errConsentEvidenceHeld
+		if !carriesFreshDecision {
+			// Sanitizing this view into a clean record would erase the only
+			// remaining evidence that a persisted grant is unprovable, and
+			// the mark that would have replaced that evidence could not be
+			// written. The mirror stays authoritative, the write stays owed.
+			o.dirty = true
+			return errConsentEvidenceHeld
+		}
+		// The same decision also lifts the evidence hold: with a fresh
+		// decision on record the unreadable bytes no longer carry anything
+		// that could supersede it. Without this the documented recovery does
+		// not exist — every later save, including the one carrying the new
+		// decision, is refused, the receipt can never persist, and Close
+		// reports pending forever even after the underlying write failure is
+		// repaired. The previous revision claimed this carve-out in its
+		// comment and in the CHANGELOG while the parameter implementing it
+		// had been dropped in a redesign.
+		o.preserveUnusable = false
 	}
 	seen := make(map[string]struct{}, len(o.receipts))
 	merged := make([]consentReceipt, 0, len(o.receipts))
@@ -604,7 +624,7 @@ func (o *consentOutbox) append(receipt consentReceipt) (persistFailed bool) {
 	// yet.
 	o.ownKeys[receipt.IdempotencyKey] = struct{}{}
 	o.receipts = append(o.receipts, receipt)
-	return o.saveLocked() != nil
+	return o.saveLocked(true) != nil
 }
 
 // head returns the oldest retained receipt for dispatch, when one exists.
@@ -696,7 +716,7 @@ func (o *consentOutbox) prune(idempotencyKey string) (persistFailed bool) {
 		pruned = append(pruned, o.receipts[:i]...)
 		pruned = append(pruned, o.receipts[i+1:]...)
 		o.receipts = pruned
-		return o.saveLocked() != nil
+		return o.saveLocked(false) != nil
 	}
 	return false
 }
@@ -764,10 +784,26 @@ func (o *consentOutbox) snapshot() []consentReceipt {
 func (o *consentOutbox) nextDispatchable(inScope func(consentReceipt) bool) (consentReceipt, bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	// A GRANT recovered from an UNUSABLE trail is held from the wire, not
+	// merely from local state. Withholding it locally while still POSTing
+	// it leaves the SERVER granted for an actor whose rejected entry may be
+	// the very denial that made the trail unusable — the record on the
+	// authoritative side would then say the opposite of what this client
+	// decided, and it is the side that outlives the device. The receipt is
+	// not dropped: it stays in the mirror and dispatches once a fresh
+	// explicit decision resolves the uncertainty (which clears lastRead).
+	// DENIALS are never held — sending a denial is the fail-closed
+	// direction in every case, and holding one is how a denial fails to
+	// take effect.
+	holdGrants := o.durable() && o.lastRead == consentOutboxReadUnusable
 	for _, entry := range o.receipts {
-		if inScope(entry) {
-			return entry, true
+		if !inScope(entry) {
+			continue
 		}
+		if holdGrants && entry.analyticsGranted() {
+			continue
+		}
+		return entry, true
 	}
 	return consentReceipt{}, false
 }
@@ -790,7 +826,7 @@ func (o *consentOutbox) retryPersist() (attempted, failed bool) {
 	if !o.dirty {
 		return false, false
 	}
-	return true, o.saveLocked() != nil
+	return true, o.saveLocked(false) != nil
 }
 
 // takeEvicted drains the cap-eviction count for Stats.ConsentOutboxEvicted.

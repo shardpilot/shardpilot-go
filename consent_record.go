@@ -205,9 +205,28 @@ func loadConsentRecordRead(dir, actorDigest string) (consentRecordInfo, bool, co
 	if json.Unmarshal(data, &record) != nil {
 		return none, false, consentRecordReadUnusable
 	}
+	// The mark is captured BEFORE anything else can discard it. Every later
+	// failure path returns `none`, and a `none` that dropped the mark turns
+	// damage to an unrelated field into permission: the grant-tail block
+	// stops seeing record.unwitnessed, `!recordOK` lets a retained receipt
+	// apply unconditionally, and the heal rewrites an unmarked granted
+	// record. Corruption anywhere in this file must not become a way to
+	// launder a deliberate withholding.
+	none.unwitnessed = record.Unwitnessed
+
+	// SHAPE before identity. `null`, `{}`, and a record with a missing
+	// actor_digest or decision all unmarshal cleanly, and comparing the
+	// digest first classified them as ANOTHER scope's record — honestly
+	// absent — when they are in fact this file damaged. Absent lets the
+	// trail-tail override apply a retained grant UNCONDITIONALLY and heal
+	// over the file, so a damaged DENIAL for this very scope would be
+	// replaced by a grant.
+	if record.ActorDigest == "" || record.ConsentAnalytics == "" {
+		return none, false, consentRecordReadUnusable
+	}
 	if record.ActorDigest != actorDigest {
-		// A record for a DIFFERENT actor is not this scope's record and is
-		// not evidence about it — honestly absent here, and the shared
+		// A well-formed record for a DIFFERENT actor is not this scope's
+		// record and is not evidence about it — honestly absent, the shared
 		// SpoolDir case rather than a corruption case.
 		return none, false, consentRecordReadAbsent
 	}
@@ -249,6 +268,9 @@ func loadConsentRecordRead(dir, actorDigest string) (consentRecordInfo, bool, co
 		// both directions (they predate the stamping build).
 		if _, err := time.Parse(time.RFC3339Nano, record.DecidedAt); err != nil {
 			if info.state == ConsentGranted {
+				// `none` already carries the mark (captured above), so a
+				// damaged stamp cannot strip a deliberate withholding off a
+				// grant on its way out.
 				// ABSENT, deliberately, and NOT unusable: this failure is
 				// not opaque. The decision was read — it said granted — and
 				// only its STAMP is unorderable, so discarding it hides no

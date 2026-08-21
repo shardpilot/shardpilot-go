@@ -90,7 +90,24 @@
   floor must see the mark to withhold and to recover); and if the mark itself
   cannot be written, maintenance rewrites are held so the unreadable bytes
   survive as the remaining evidence rather than being sanitized away before
-  the mark lands.
+  the mark lands, while a FRESH explicit decision still writes through and
+  lifts the hold — it is newer than anything the unreadable bytes could have
+  held, and without that carve-out the documented recovery does not exist.
+
+  A grant recovered from an unprovable trail is also held from the WIRE, not
+  just from local state: dispatching it would leave the server granted for an
+  actor whose rejected entry may be the very denial that made the trail
+  unusable, and the server side outlives the device. It is deferred, not
+  dropped — a fresh decision releases it. Denials are never held; sending a
+  denial is the fail-closed direction.
+
+  Finally, the mark is read out of the record BEFORE any other field can
+  invalidate it, and the record's shape is checked before its identity. A
+  damaged timestamp, an empty object, a JSON `null` or a missing
+  `actor_digest` previously read as "some other scope's record" — honestly
+  absent — which let a retained grant receipt apply unconditionally and heal
+  over the file. Corruption anywhere in the record is not a way to launder a
+  deliberate withholding.
 
   KNOWN RESIDUAL, named rather than left to be discovered: a DELETED outbox
   beside a persisted grant still promotes that grant. The file is not
