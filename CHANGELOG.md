@@ -88,6 +88,18 @@
   be ruled out that it replaced a mark, so a retained grant receipt is
   refused beside it. Denials are unaffected.
 
+  Whether a grant may take effect is decided ONCE at startup, from every
+  signal at, and every grant-affecting path reads that one verdict — local
+  promotion, the trail-tail heal, and the dispatch worker. The same asymmetry
+  was found six separate times, each because one site consulted a subset of
+  the signals and a grant took effect through the door that had not been
+  widened; the last of them let a marked record's grant be POSTed to the
+  server while local state correctly refused it. The verdict is persisted
+  whatever the record says — including over a DENIAL, where an earlier
+  revision wrote nothing, so a surviving deny receipt's prune could rewrite
+  the outbox clean and let the next start's grant supersede the denial. A
+  fresh explicit decision clears all of it at once.
+
   The mark is honoured at every point a grant is trusted, because guarding
   one path and not another guards nothing: a retained grant receipt cannot
   override — and so heal away — a marked record; the ordinary state-only

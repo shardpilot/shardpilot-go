@@ -6447,3 +6447,75 @@ func TestConsentRecordUnusableClassesAreAllCovered(t *testing.T) {
 		})
 	}
 }
+
+// TestBlockedGrantIsDurableWhateverTheRecordSays covers round 7, which found
+// the same asymmetry for the fifth and sixth time: a grant took effect through
+// a door the previous fix had not widened.
+func TestBlockedGrantIsDurableWhateverTheRecordSays(t *testing.T) {
+	// (A) The dispatch hold consulted only the OUTBOX read. With the outbox
+	// parsing cleanly — reachable the moment maintenance or a sibling
+	// sanitizes an incomplete trail — a record marked unwitnessed left the
+	// worker free to POST and prune the retained grant, so the server was
+	// changed to granted while the durable marker said the grant is
+	// unprovable.
+	t.Run("marked_record_holds_the_grant_off_the_wire", func(t *testing.T) {
+		state, server := newFloorTestServer(t)
+		defer server.Close()
+		dir := t.TempDir()
+		info := consentRecordInfo{state: ConsentGranted, decidedAt: "2026-07-19T00:00:00Z", floor: true}
+		if err := markConsentRecordUnwitnessed(dir, info, spoolTestActorDigest(), os.Rename, os.Chmod); err != nil {
+			t.Fatalf("seed marked record: %v", err)
+		}
+		// A CLEAN outbox — nothing here is unusable — carrying a grant.
+		if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName),
+			mustMarshalOutbox(t, testConsentReceipt("key-retained-grant", true)), 0o600); err != nil {
+			t.Fatalf("seed outbox: %v", err)
+		}
+
+		client := newFloorTestClient(t, server.URL, dir, nil)
+		_ = client.Close(context.Background())
+		if got := state.consentCount(); got != 0 {
+			t.Fatalf("a grant was POSTed while the record says unprovable: %d receipts", got)
+		}
+	})
+
+	// (B) The durable marker was written only when the CURRENT record was
+	// itself a grant. With an older DENIAL on file and a trail holding an
+	// older deny, a newer grant and a malformed latest deny, the grant tail
+	// is blocked on this start — but the deny then dispatches, its prune
+	// rewrites the outbox clean with only the grant, and the next start lets
+	// that grant supersede the denial. A denial lifted by housekeeping.
+	t.Run("blocked_tail_is_durable_over_a_denied_record", func(t *testing.T) {
+		_, server := newFloorTestServer(t)
+		defer server.Close()
+		dir := t.TempDir()
+		if err := saveConsentRecord(dir, ConsentDecisionDenied, spoolTestActorDigest(),
+			"2026-07-18T00:00:00Z", true, os.Rename, os.Chmod); err != nil {
+			t.Fatalf("seed denied record: %v", err)
+		}
+		olderDeny := testConsentReceipt("key-older-deny", false)
+		olderDeny.DecidedAt = "2026-07-18T00:00:00Z"
+		newerGrant := testConsentReceipt("key-newer-grant", true)
+		newerGrant.DecidedAt = "2026-07-20T00:00:00Z"
+		malformed := testConsentReceipt("key-latest-deny-broken", false)
+		malformed.WorkspaceID = ""
+		if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName),
+			mustMarshalOutbox(t, olderDeny, newerGrant, malformed), 0o600); err != nil {
+			t.Fatalf("seed outbox: %v", err)
+		}
+
+		first := newFloorTestClient(t, server.URL, dir, nil)
+		if got := first.Consent(); got == ConsentGranted {
+			t.Fatalf("first start promoted the grant: %v", got)
+		}
+		_ = first.Flush(context.Background())
+		_ = first.Close(context.Background())
+
+		// Whatever housekeeping did, the conclusion must have survived it.
+		second := newFloorTestClient(t, server.URL, dir, nil)
+		defer func() { _ = second.Close(context.Background()) }()
+		if got := second.Consent(); got == ConsentGranted {
+			t.Fatalf("housekeeping lifted the denial: restart consent = %v", got)
+		}
+	})
+}
