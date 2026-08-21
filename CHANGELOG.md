@@ -50,6 +50,14 @@
   surfaces `consent_outbox_unreadable` for the read itself and
   `consent_grant_unwitnessed` when a grant is held back because of it.
 
+  "Could not be understood" includes records that parse but are not sound:
+  a missing or `null` receipts list (this SDK always writes `[]`, so neither
+  can come from a healthy writer), and any record with an entry the
+  sanitizer rejected — a rejected entry is a hole in the trail, and a
+  superseding denial is exactly what it might have been. Entries that DID
+  survive are still honored, so a readable denial alongside a malformed
+  entry still denies rather than falling back to undecided.
+
   Behaviour is unchanged for every other class of state: a corrupt cache or
   telemetry spool still means "start over", and a corrupt record still never
   crashes into the host.

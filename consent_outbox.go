@@ -110,8 +110,15 @@ func (r consentReceipt) analyticsGranted() bool {
 
 // consentOutboxWire is the consent-outbox.json payload.
 type consentOutboxWire struct {
-	Version  int              `json:"version"`
-	Receipts []consentReceipt `json:"receipts"`
+	Version int `json:"version"`
+	// Receipts is a POINTER so an explicitly empty list — the record a
+	// fully-pruned outbox writes — stays distinguishable from a missing or
+	// null one. This SDK never writes null: saveLocked always builds the
+	// slice with make(…, 0, …), which marshals to []. So a nil here means
+	// the record did not come from a healthy writer, and for a denial
+	// witness that is a reason to distrust the whole file rather than to
+	// read it as "nothing was ever refused".
+	Receipts *[]consentReceipt `json:"receipts"`
 }
 
 // sanitizeConsentReceipt validates one stored entry and copies it down to
@@ -374,11 +381,29 @@ func (o *consentOutbox) readRecordReceipts() ([]consentReceipt, consentOutboxRea
 	if json.Unmarshal(data, &record) != nil || record.Version != consentOutboxRecordVersion {
 		return nil, consentOutboxReadUnusable
 	}
-	loaded := make([]consentReceipt, 0, len(record.Receipts))
-	seen := make(map[string]struct{}, len(record.Receipts))
-	for _, entry := range record.Receipts {
+	// Syntactically valid is not structurally sound. `{"version":1}` and
+	// `{"version":1,"receipts":null}` both unmarshal cleanly at the right
+	// version and would otherwise report PARSED with zero receipts — the
+	// same silent "no denial was ever recorded" this type exists to stop,
+	// reached one layer in.
+	if record.Receipts == nil {
+		return nil, consentOutboxReadUnusable
+	}
+	entries := *record.Receipts
+	loaded := make([]consentReceipt, 0, len(entries))
+	seen := make(map[string]struct{}, len(entries))
+	// rejected tracks entries the sanitizer refused. A refused entry is a
+	// HOLE in the trail: we cannot say what it was, and a superseding
+	// denial is exactly what it might have been. The surviving entries are
+	// still returned — a valid denial among them is real and the trail-tail
+	// override must still honor it — but the record is reported UNUSABLE so
+	// a persisted GRANT is not promoted on the strength of a trail we know
+	// is incomplete.
+	rejected := false
+	for _, entry := range entries {
 		sanitized, ok := sanitizeConsentReceipt(entry)
 		if !ok {
+			rejected = true
 			continue
 		}
 		if _, dup := seen[sanitized.IdempotencyKey]; dup {
@@ -394,6 +419,9 @@ func (o *consentOutbox) readRecordReceipts() ([]consentReceipt, consentOutboxRea
 		}
 		seen[sanitized.IdempotencyKey] = struct{}{}
 		loaded = append(loaded, sanitized)
+	}
+	if rejected {
+		return loaded, consentOutboxReadUnusable
 	}
 	return loaded, consentOutboxReadParsed
 }
@@ -521,7 +549,7 @@ func (o *consentOutbox) saveLocked() error {
 		settleEvictions()
 		return nil
 	}
-	record := consentOutboxWire{Version: consentOutboxRecordVersion, Receipts: merged}
+	record := consentOutboxWire{Version: consentOutboxRecordVersion, Receipts: &merged}
 	payload, err := json.Marshal(record)
 	if err == nil {
 		err = writePrivateFileAtomic(o.filePath(), payload, o.renameFn, o.chmodFn)

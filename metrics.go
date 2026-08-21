@@ -60,9 +60,16 @@ type Stats struct {
 	// loads that found a durable outbox record they could not parse — the
 	// only READ-side outbox signal, and the one whose absence made an
 	// unreadable denial witness silent in the field: every other code here
-	// reports a write. A non-zero value means at least one process start
-	// could not rule out a denial and therefore refused to promote a
-	// persisted grant (see initConsentFloor); LastConsentError is the most
+	// reports a write. It is incremented for the READ itself, before the
+	// persisted decision record is inspected, so a non-zero value means at
+	// least one process start could not see its receipt trail — NOT that a
+	// grant was withheld. Whether anything was withheld depends on what the
+	// record then said: a grant is held back (LastConsentError
+	// `consent_grant_unwitnessed`), while an absent record or a denial
+	// needs no intervention and none happens. Read this as "the trail was
+	// unreadable", and treat the withholding as the conditional
+	// consequence, or a monitor will report incidents that did not occur;
+	// LastConsentError is the most
 	// recent consent-plane error, machine-readable where the failure had a
 	// taxonomy code.
 	ConsentRecorded            uint64

@@ -3171,7 +3171,7 @@ func TestConsentOutboxMalformedStampDroppedAndNeverReloadTruth(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 	valid := testConsentReceipt("key-valid-deny-1", false)
-	payload, err := json.Marshal(consentOutboxWire{Version: consentOutboxRecordVersion, Receipts: []consentReceipt{valid, malformed}})
+	payload, err := json.Marshal(consentOutboxWire{Version: consentOutboxRecordVersion, Receipts: &[]consentReceipt{valid, malformed}})
 	if err != nil {
 		t.Fatalf("marshal outbox: %v", err)
 	}
@@ -3743,10 +3743,11 @@ func TestConsentOutboxOverCapLoadTrimLandsDurably(t *testing.T) {
 	// lands it at the first retry.
 	dir := t.TempDir()
 	over := maxConsentOutboxEntries + 8
-	record := consentOutboxWire{Version: consentOutboxRecordVersion}
+	seeded := make([]consentReceipt, 0, over)
 	for i := 0; i < over; i++ {
-		record.Receipts = append(record.Receipts, testConsentReceipt(fmt.Sprintf("key-trim-%02d", i), false))
+		seeded = append(seeded, testConsentReceipt(fmt.Sprintf("key-trim-%02d", i), false))
 	}
+	record := consentOutboxWire{Version: consentOutboxRecordVersion, Receipts: &seeded}
 	payload, err := json.Marshal(record)
 	if err != nil {
 		t.Fatalf("marshal seed record: %v", err)
@@ -3921,7 +3922,7 @@ func TestConsentOutboxDuplicateKeysKeepFirstAtLoad(t *testing.T) {
 	conflicting := testConsentReceipt("key-dup-1", false)
 	conflicting.DecidedAt = "2026-07-19T01:00:00Z"
 	other := testConsentReceipt("key-uniq-1", false)
-	record := consentOutboxWire{Version: consentOutboxRecordVersion, Receipts: []consentReceipt{first, conflicting, other}}
+	record := consentOutboxWire{Version: consentOutboxRecordVersion, Receipts: &[]consentReceipt{first, conflicting, other}}
 	payload, err := json.Marshal(record)
 	if err != nil {
 		t.Fatalf("marshal seed record: %v", err)
@@ -5645,7 +5646,7 @@ func TestConsentOutboxUnreadableWitnessDoesNotResurrectSupersededGrant(t *testin
 	denyReceipt.DecidedAt = "2026-07-20T00:00:00Z"
 	goodPayload, err := json.Marshal(consentOutboxWire{
 		Version:  consentOutboxRecordVersion,
-		Receipts: []consentReceipt{denyReceipt},
+		Receipts: &[]consentReceipt{denyReceipt},
 	})
 	if err != nil {
 		t.Fatalf("marshal outbox: %v", err)
@@ -5698,6 +5699,17 @@ func TestConsentOutboxUnreadableWitnessDoesNotResurrectSupersededGrant(t *testin
 		{name: "over_read_limit", payload: append(append([]byte(`{"version":1,"receipts":[`),
 			bytes.Repeat([]byte("A"), consentOutboxReadLimit+1)...), []byte(`]}`)...), mode: 0o600},
 		{name: "unreadable_permissions", payload: goodPayload, mode: 0o000},
+		// Syntactically valid at the right version, structurally corrupt.
+		// Each of these unmarshals cleanly and yields zero receipts, so
+		// before the structural check they reported PARSED and the stale
+		// grant was restored — the same defect one layer in.
+		{name: "receipts_key_missing", payload: []byte(`{"version":1}`), mode: 0o600},
+		{name: "receipts_null", payload: []byte(`{"version":1,"receipts":null}`), mode: 0o600},
+		{name: "sole_deny_receipt_malformed", payload: mustMarshalOutbox(t, func() consentReceipt {
+			broken := denyReceipt
+			broken.ActorIdentifier = "" // required field: the sanitizer drops it
+			return broken
+		}()), mode: 0o600},
 	} {
 		t.Run("direction2_"+tc.name, func(t *testing.T) {
 			if tc.mode == 0o000 && os.Geteuid() == 0 {
@@ -5737,5 +5749,56 @@ func TestConsentOutboxUnreadableWitnessDoesNotResurrectSupersededGrant(t *testin
 				t.Fatalf("erased witness (%s): no diagnostic code surfaced", tc.name)
 			}
 		})
+	}
+}
+
+// mustMarshalOutbox builds a version-current outbox record around the given
+// receipts. Used by the structural-corruption cases, where the record must
+// be well-formed JSON at the right version and unsound only in its content.
+func mustMarshalOutbox(t *testing.T, receipts ...consentReceipt) []byte {
+	t.Helper()
+	list := append([]consentReceipt(nil), receipts...)
+	payload, err := json.Marshal(consentOutboxWire{Version: consentOutboxRecordVersion, Receipts: &list})
+	if err != nil {
+		t.Fatalf("marshal outbox: %v", err)
+	}
+	return payload
+}
+
+// TestConsentOutboxPartialTrailStillHonorsAValidDenial pins the boundary of
+// the "rejected entry means unusable" rule: UNUSABLE withholds a GRANT, it
+// does not discard a denial we can actually read. A record carrying one
+// valid deny receipt alongside a malformed entry is an incomplete trail —
+// but what survived is a real denial, and honoring it is the fail-closed
+// direction, so the floor must land on denied rather than on undecided.
+func TestConsentOutboxPartialTrailStillHonorsAValidDenial(t *testing.T) {
+	_, server := newFloorTestServer(t)
+	defer server.Close()
+
+	valid := testConsentReceipt("key-valid-deny", false)
+	valid.DecidedAt = "2026-07-20T00:00:00Z"
+	malformed := testConsentReceipt("key-broken", true)
+	malformed.WorkspaceID = "" // required field: dropped by the sanitizer
+
+	dir := t.TempDir()
+	if err := saveConsentRecord(dir, ConsentDecisionGranted, spoolTestActorDigest(),
+		"2026-07-19T00:00:00Z", true, os.Rename, os.Chmod); err != nil {
+		t.Fatalf("seed granted record: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName),
+		mustMarshalOutbox(t, valid, malformed), 0o600); err != nil {
+		t.Fatalf("seed outbox: %v", err)
+	}
+
+	client := newFloorTestClient(t, server.URL, dir, nil)
+	defer func() { _ = client.Close(context.Background()) }()
+
+	if got := client.Consent(); got != ConsentDenied {
+		t.Fatalf("partial trail with a readable denial: floor = %v, want ConsentDenied", got)
+	}
+	// The incompleteness is still reported: the operator should learn the
+	// trail had a hole even though this particular outcome did not need it.
+	if got := client.Snapshot().ConsentOutboxUnreadable; got != 1 {
+		t.Fatalf("partial trail: ConsentOutboxUnreadable = %d, want 1", got)
 	}
 }
