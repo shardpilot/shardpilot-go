@@ -2,17 +2,92 @@ name: ci
 
 on:
   pull_request:
+  # ⚠ EVERY PUSH, NOT ONLY main. This repository is PUBLIC: a branch pushed here
+  # is readable the moment it lands, whether or not a pull request ever opens.
+  # A `branches: [main]` filter meant the secret scan skipped exactly the case
+  # where the contents are already exposed and nobody is looking. Tags are included for the same reason and a stronger one — a tag
+  # is the artifact people install, and one release here was cut off-main.
+  #
+  # No job is conditioned to narrow this back down. A condition is how a gate
+  # stops running without anyone noticing, which is the failure being fixed; the
+  # cost of running the rest of the suite on a branch push is CI minutes.
   push:
-    branches:
-      - main
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+# ⚠ NO WORKFLOW-LEVEL CONCURRENCY, DELIBERATELY. `cancel-in-progress` at this
+# level cancels the run for a superseded push — which is exactly the disclosure
+# case: a branch pushed with a credential and force-pushed a minute later. The
+# cancelled run never scanned the commit that was public, and the replacement
+# run checks out history in which that commit is no longer reachable, so not
+# even the `--log-opts=--all` pass can reach it. Cancelling a security scan on
+# the grounds that a newer commit exists is cancelling it for the one push that
+# mattered.
+#
+# So the publication-sensitive jobs carry no concurrency group at all and always
+# run to completion. The rest opt in per job, keyed by job as well as ref so
+# they do not queue behind one another.
 
 jobs:
+  # Workspace security baseline, mirroring the pattern the other SDK
+  # repositories already run (godot/unity/unreal/cli). Both passes: the working
+  # tree and the full history across all refs, so a secret can neither live at
+  # HEAD nor hide in an earlier commit. Exact-pinned image.
+  #
+  # There IS a .gitleaks.toml here, and it carries no `paths` clause on purpose:
+  # measured against v8.30.1, an allowlist with `paths` excuses the whole FILE
+  # even with condition = "AND", and the files needing exceptions are test files
+  # — the likeliest place for a pasted credential. Exceptions name the literal.
+  #
+  # ⚠ THIS REPOSITORY IS PUBLIC, which inverts the usual urgency. Everywhere
+  # else a missing secret scan is a gap to close before a visibility flip; here
+  # a credential is exposed at the moment it is pushed. It was measured on
+  # 2026-08-20 that this was one of only two candidate repositories running no
+  # secret scanner at all — and the only two already public.
+  #
+  # fetch-depth: 0 is required by the history pass and by nothing else in this
+  # workflow.
+  secret-scan:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Scan working tree for secrets
+        uses: docker://ghcr.io/gitleaks/gitleaks:v8.30.1
+        with:
+          args: dir --verbose --redact /github/workspace
+
+      - name: Scan git history for secrets
+        uses: docker://ghcr.io/gitleaks/gitleaks:v8.30.1
+        env:
+          GIT_CONFIG_COUNT: 1
+          GIT_CONFIG_KEY_0: safe.directory
+          GIT_CONFIG_VALUE_0: /github/workspace
+        with:
+          args: git --verbose --redact --log-opts=--all /github/workspace
   go:
     runs-on: ubuntu-latest
+      # ⚠ THE MATRIX AXIS IS PART OF THE GROUP. Without it every leg of the
+      # matrix shares one group, and `cancel-in-progress` has the legs cancel
+      # each other as they start — leaving one runtime tested and the others
+      # reported as nothing at all. A gate that silently drops legs is the
+      # failure this whole change is about.
+    concurrency:
+      # ⚠ A LITERAL JOB NAME, NOT `github.job`. That context is not populated
+      # when the group is evaluated, so every job sharing an event and a ref
+      # collapsed into ONE group and they cancelled each other — one gate lost
+      # per run, whichever started second. It was visible as a single cancelled
+      # check with no competing run to explain it.
+      # ⚠ THE EVENT IS PART OF THE GROUP. A push and a pull_request run on the
+      # same commit are different work to CI, and without it they cancelled
+      # each other — leaving a cancelled check on the pull request, which reads
+      # as a failure and blocks the merge it was never about.
+      group: ${{ github.workflow }}-${{ github.event_name }}-go-${{ matrix.go-version }}-${{ github.ref }}
+      cancel-in-progress: true
     timeout-minutes: 10
     strategy:
       fail-fast: false
@@ -51,6 +126,18 @@ jobs:
   # 1.25 baseline can compile, which is what the matrix is actually for.
   format:
     runs-on: ubuntu-latest
+    concurrency:
+      # ⚠ A LITERAL JOB NAME, NOT `github.job`. That context is not populated
+      # when the group is evaluated, so every job sharing an event and a ref
+      # collapsed into ONE group and they cancelled each other — one gate lost
+      # per run, whichever started second. It was visible as a single cancelled
+      # check with no competing run to explain it.
+      # ⚠ THE EVENT IS PART OF THE GROUP. A push and a pull_request run on the
+      # same commit are different work to CI, and without it they cancelled
+      # each other — leaving a cancelled check on the pull request, which reads
+      # as a failure and blocks the merge it was never about.
+      group: ${{ github.workflow }}-${{ github.event_name }}-format-${{ github.ref }}
+      cancel-in-progress: true
     timeout-minutes: 5
 
     steps:
@@ -128,6 +215,18 @@ jobs:
 
   release-consistency:
     runs-on: ubuntu-latest
+    concurrency:
+      # ⚠ A LITERAL JOB NAME, NOT `github.job`. That context is not populated
+      # when the group is evaluated, so every job sharing an event and a ref
+      # collapsed into ONE group and they cancelled each other — one gate lost
+      # per run, whichever started second. It was visible as a single cancelled
+      # check with no competing run to explain it.
+      # ⚠ THE EVENT IS PART OF THE GROUP. A push and a pull_request run on the
+      # same commit are different work to CI, and without it they cancelled
+      # each other — leaving a cancelled check on the pull request, which reads
+      # as a failure and blocks the merge it was never about.
+      group: ${{ github.workflow }}-${{ github.event_name }}-release-consistency-${{ github.ref }}
+      cancel-in-progress: true
     timeout-minutes: 5
 
     steps:

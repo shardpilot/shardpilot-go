@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+- **Documentation-only: internal ShardPilot material removed from the published tree.**
+  No API, wire format or behaviour changes.
+
+  This repository is public, so every tracked byte is published. Two internal agent skills
+  under `.claude/skills/` were tracked here and described ShardPilot's own review process and
+  backend stack; they are gone, and this note does not name them because naming them here
+  would publish the same thing again. Internal decision-record ids, internal
+  service names, an internal commit sha and internal deployment state have been removed from
+  `README.md`, this changelog, `docs/release.md` and the customer integration skill — the
+  engineering content each one annotated stays, restated so a reader outside ShardPilot can
+  act on it.
+
+  Three things this deliberately does NOT claim. It does not unpublish the history: removing
+  a file at HEAD leaves every commit that carried it, and this repository has been public
+  throughout. It does not cover Go doc comments, which still carry internal citations; that
+  is owed work in another workstream and is not touched here. And it does not prevent a
+  recurrence — a check that fails on internal material in the published surface is a separate
+  change, deliberately kept out of this one so that removing what is exposed today does not
+  wait on it.
 - **Module `go` directive moves to 1.25 (was 1.24).** The source-compatibility
   baseline for SDK consumers rises with it: the next release requires
   **Go 1.25+**. Already-published tags are unaffected — every tag from `v0.1.2`
@@ -91,8 +110,31 @@
   documented detail codes: a `400` carrying `unsupported_content_encoding` or
   `invalid_content_encoding` latches compression off for the process and re-sends the same
   batch uncompressed. A deployment that refuses a compressed body some OTHER way — a bare
-  400 with no envelope, a connection reset, a proxy 502 — is **not** covered by that
+  400 with no envelope, a connection reset, a proxy 502 — does **not** reach that
   fallback; set `DisableRequestCompression` for those.
+
+## v0.6.1-alpha - 2026-08-20
+
+- **Removed two internal agent skills from the published artifact.** No API,
+  wire-format or behaviour change: this tag is `v0.6.0-alpha` with eight files
+  deleted and no Go source difference.
+
+  They were not merely present in this repository's history. `go get
+  github.com/shardpilot/shardpilot-go@v0.6.0-alpha` DELIVERED EIGHT OF THEIR
+  FILES — the module zip is cached by the module proxy, so following the
+  documented install command handed them out. (The `.claude/skills/` tree in
+  that zip holds nine files; the ninth is the customer-facing integration
+  skill, which stays.) One described an internal review
+  process; the other published the backend stack with versions, the
+  tenant-isolation mechanism in operational detail with a named runtime role,
+  an inventory of internal repositories with their build commands, and
+  statements about where automated coverage does not reach.
+
+  **Forward-only, and the limit is worth stating.** `v0.6.0-alpha` stays
+  reachable, its zip stays cached on the module proxy and its hash stays in the
+  checksum database, where nothing ShardPilot does can withdraw it — deleting
+  this repository would not. This stops new installs that follow the
+  documentation; it recalls nothing.
 
 ## v0.6.0-alpha — 2026-08-03 — crash actor key, experiments, remote-config targeting
 
@@ -111,9 +153,9 @@
   - A malformed value (free text, email, IP, JWT, raw `user_`/`player_`/`device_` id, or over
     512 bytes) drops the field only — never the crash report.
 
-- Dark Phase-D crash-capture opt-ins in `pkg/crash` (ADR-0297 §7d; both default `false` —
+- Dark phase-D crash-capture opt-ins in `pkg/crash` (both default `false` —
   while off zero new code paths execute and the auto-captured wire shape is byte-identical;
-  enabling is gated by the platform's Phase-D arming order on the SDK's consent gate + durable
+  enabling is gated by the service-side arming order on the SDK's consent gate + durable
   crash spool landing first):
   - `ClientOptions.DebugIDFillEnabled` — the running binary's self-module on every
     auto-captured event: executable base name + `debug_id` self-read from the binary (ELF GNU
@@ -128,8 +170,8 @@
     (64 threads / 256 total frames, ≤16 frames per non-crashing goroutine).
 - Dark opt-in experiment-assignment consumer (`Config.ExperimentsEnabled`, default `false` —
   while off ZERO experiment code paths execute and nothing new touches the wire or the disk;
-  ADR-0259 SDK leg, defold#35 canonical semantics ported to Go idiom):
-  - `FetchExperimentAssignment(ctx, key, attributes)` against the control-plane assignment
+  the same semantics the other ShardPilot SDKs carry, in Go idiom):
+  - `FetchExperimentAssignment(ctx, key, attributes)` against the assignment
     endpoint (`RemoteConfigURL` host, path-swapped; publishable `APIKey` bearer): full verdict
     parsing (assigned / the three not-assigned shapes distinguished by `reason` — absent,
     `kill_switch`, `targeting_unmatched`; unknown reasons are malformed), strict verdict-shape
@@ -170,15 +212,15 @@
     distinct id — while the automatic arm-0 emission is still owed, both facts emit; owed
     emissions ride bounded FIFO snapshots swept by the lane and once more at `Close` after the
     flush frees room, with owed durable syncs retried before teardown. NOTE: the producer lane
-    is dark end-to-end today — the analytics service rejects these event names from publishable
-    client keys until the platform's producer-lane decision lands.
+    is dark end-to-end today — the ingest service rejects these event names from publishable
+    client keys until the lane is enabled for the workspace.
   - `ExperimentVariant`/`ExperimentVariantPayload` cached-variant getters (consent- and
     latch-gated, deep-copied payloads). New errors: `ErrExperimentsNotConfigured`,
     `ErrExperimentNoAssignment`, `ErrExperimentFactUnavailable`, `ErrInvalidExperimentFact`.
 - Dark opt-in remote-config targeting-attribute pass-through
   (`Config.RemoteConfigAttributesEnabled`, default `false` — while off the fetch URL is
   byte-identical to today's attribute-less path and `SetRemoteConfigAttributes` is inert;
-  ADR-0310 SDK leg):
+  the remote-config leg):
   - `SetRemoteConfigAttributes(map[string]string)` stores the client's targeting attribute
     set (`nil`/empty clears); enabled fetches append it to the `GET /config/v1/...` request
     as sorted, percent-escaped query parameters so server-side delivery rules can target
@@ -529,7 +571,7 @@
   - Consent-plane observability on `Snapshot()`: `ConsentRecorded`, `ConsentFailed`,
     `ConsentOutboxEvicted`, `ConsentOutboxPersistFailed`, `LastConsentError`.
 
-- Fleet-audit follow-ups on the GAP-075 spool and transport machinery:
+- Audit follow-ups on the spool and transport machinery:
   - Poison-member isolation on the worker publish paths: a batch member whose nested
     `Props`/`Context` values no longer serialize (mutated after `Enqueue`) is now dropped
     ALONE — attributed by event id in the log, counted `Dropped`, and folded into an explicit
@@ -568,7 +610,7 @@
 
 ## v0.5.0-alpha — 2026-07-19 — remote config, disk spool, schema revision
 
-- Remote config client (GAP-075): explicit `FetchRemoteConfig` plus never-fail typed getters
+- Remote config client: explicit `FetchRemoteConfig` plus never-fail typed getters
   (`RemoteConfigValue/String/Number/Bool/Values/Version`) over a durable last-known-good cache
   (`Config.RemoteConfigURL`, `Config.APIKey`, `Config.RemoteConfigCachePath`), scoped by
   (workspace, environment, client_id, base URL) with ETag/`If-None-Match` revalidation. The
@@ -594,7 +636,7 @@
   the cache without touching the network — the client half of the server-side remote-config
   fetch rate limit.
 
-- Bounded disk spool (GAP-075; closes the long-standing follow-up in `queue.go`): opt-in via
+- Bounded disk spool (closes the long-standing follow-up in `queue.go`): opt-in via
   `Config.SpoolDir`; 2000 events / 1 MiB caps with oldest-first eviction, and the record is
   read back through a hard limit derived from the byte cap (an over-limit `spool.json` is
   discarded as corrupt, never loaded whole); verbatim single-stamp envelope records — the
@@ -647,7 +689,7 @@
 - Every `events:batch` publish now declares the ingest envelope schema-set revision this
   SDK build was coordinated against via the `X-ShardPilot-Schema-Revision` request header
   (`DefaultSchemaRevision` — the digest of the ingest service's embedded schema set,
-  currently pinned to analytics-service `main` @ `7d118c5`). The header rides on the batch
+  pinned to the schema set this SDK build was released against). The header rides on the batch
   route ONLY — the consent route never carries it — and is provably inert while the ingest
   service's schema-revision handshake runs in its default `off` mode (the header is neither
   read nor echoed there); it arms the server-side staleness alarm for the future `log` /

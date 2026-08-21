@@ -1,8 +1,12 @@
 # Security Policy
 
-The ShardPilot Go SDK is public-preview source software. Do not use it with
-production secrets or production customer/player data until a later release wave
-explicitly approves production use.
+The ShardPilot Go SDK is pre-v1 software: the API is unstable and may change
+before v1.
+
+**Do not use it with production secrets or production customer/player data.**
+That prohibition is unchanged; what changed is that this file no longer states
+it in terms of an internal release process a reader outside ShardPilot cannot
+observe. It lifts when ShardPilot says so, not when you decide you are ready.
 
 ## Reporting
 
