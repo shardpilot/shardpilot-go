@@ -78,11 +78,16 @@ jobs:
       # reported as nothing at all. A gate that silently drops legs is the
       # failure this whole change is about.
     concurrency:
+      # ⚠ A LITERAL JOB NAME, NOT `github.job`. That context is not populated
+      # when the group is evaluated, so every job sharing an event and a ref
+      # collapsed into ONE group and they cancelled each other — one gate lost
+      # per run, whichever started second. It was visible as a single cancelled
+      # check with no competing run to explain it.
       # ⚠ THE EVENT IS PART OF THE GROUP. A push and a pull_request run on the
       # same commit are different work to CI, and without it they cancelled
       # each other — leaving a cancelled check on the pull request, which reads
       # as a failure and blocks the merge it was never about.
-      group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.job }}-${{ matrix.go-version }}-${{ github.ref }}
+      group: ${{ github.workflow }}-${{ github.event_name }}-go-${{ matrix.go-version }}-${{ github.ref }}
       cancel-in-progress: true
     timeout-minutes: 10
     strategy:
@@ -123,11 +128,16 @@ jobs:
   format:
     runs-on: ubuntu-latest
     concurrency:
+      # ⚠ A LITERAL JOB NAME, NOT `github.job`. That context is not populated
+      # when the group is evaluated, so every job sharing an event and a ref
+      # collapsed into ONE group and they cancelled each other — one gate lost
+      # per run, whichever started second. It was visible as a single cancelled
+      # check with no competing run to explain it.
       # ⚠ THE EVENT IS PART OF THE GROUP. A push and a pull_request run on the
       # same commit are different work to CI, and without it they cancelled
       # each other — leaving a cancelled check on the pull request, which reads
       # as a failure and blocks the merge it was never about.
-      group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.job }}-${{ github.ref }}
+      group: ${{ github.workflow }}-${{ github.event_name }}-format-${{ github.ref }}
       cancel-in-progress: true
     timeout-minutes: 5
 
@@ -207,11 +217,16 @@ jobs:
   release-consistency:
     runs-on: ubuntu-latest
     concurrency:
+      # ⚠ A LITERAL JOB NAME, NOT `github.job`. That context is not populated
+      # when the group is evaluated, so every job sharing an event and a ref
+      # collapsed into ONE group and they cancelled each other — one gate lost
+      # per run, whichever started second. It was visible as a single cancelled
+      # check with no competing run to explain it.
       # ⚠ THE EVENT IS PART OF THE GROUP. A push and a pull_request run on the
       # same commit are different work to CI, and without it they cancelled
       # each other — leaving a cancelled check on the pull request, which reads
       # as a failure and blocks the merge it was never about.
-      group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.job }}-${{ github.ref }}
+      group: ${{ github.workflow }}-${{ github.event_name }}-release-consistency-${{ github.ref }}
       cancel-in-progress: true
     timeout-minutes: 5
 
