@@ -821,6 +821,58 @@ func TestConsentOutboxAbsentRecordIsHonestlyEmpty(t *testing.T) {
 	if got := client.Consent(); got != ConsentGranted {
 		t.Fatalf("absent outbox: after SetConsent(true) floor = %v, want ConsentGranted", got)
 	}
+
+	// THE LOAD-BEARING HALF, and the one the assertions above do not carry:
+	// an absent outbox beside a floor-proven persisted GRANT must still
+	// promote that grant. This is the residual the CHANGELOG names — the
+	// file is indistinguishable from one that was never written, and
+	// refusing the combination would make every seeded or legacy proven
+	// grant demand a fresh decision. Everything above holds on an unfixed
+	// client too; this is what fails if the fleet-refusal direction is ever
+	// taken by accident.
+	seeded := t.TempDir()
+	if err := saveConsentRecord(seeded, ConsentDecisionGranted, spoolTestActorDigest(),
+		"2026-07-19T00:00:00Z", true, os.Rename, os.Chmod); err != nil {
+		t.Fatalf("seed granted record: %v", err)
+	}
+	proven := newFloorTestClient(t, server.URL, seeded, nil)
+	defer func() { _ = proven.Close(context.Background()) }()
+	if got := proven.Consent(); got != ConsentGranted {
+		t.Fatalf("absent outbox beside a proven grant: floor = %v, want ConsentGranted", got)
+	}
+	if got := proven.Snapshot().ConsentOutboxUnreadable; got != 0 {
+		t.Fatalf("absent outbox beside a proven grant counted as unreadable: %d", got)
+	}
+}
+
+// TestConsentRecordUnwitnessedWireKeyIsPinned pins the literal JSON key of the
+// durable mark. Every other assertion reads it back through the same struct
+// that writes it, so a tag rename or typo is invisible to them — and this key
+// is a cross-restart, cross-build contract: a record written by one build and
+// read by another that spells it differently parses as clean and promotes the
+// withheld grant, silently.
+func TestConsentRecordUnwitnessedWireKeyIsPinned(t *testing.T) {
+	dir := t.TempDir()
+	info := consentRecordInfo{state: ConsentGranted, decidedAt: "2026-07-19T00:00:00Z", floor: true}
+	if err := markConsentRecordUnwitnessed(dir, info, spoolTestActorDigest(), os.Rename, os.Chmod); err != nil {
+		t.Fatalf("mark: %v", err)
+	}
+	data, err := os.ReadFile(consentRecordPath(dir))
+	if err != nil {
+		t.Fatalf("read record: %v", err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("record does not parse: %v", err)
+	}
+	if got, ok := raw["unwitnessed"]; !ok || got != true {
+		t.Fatalf("the durable mark is not spelled \"unwitnessed\": %s", data)
+	}
+	// And the reader must honour that exact spelling, not just the struct.
+	back, ok, _ := loadConsentRecordRead(dir, spoolTestActorDigest())
+	if !ok || !back.unwitnessed {
+		t.Fatalf("the reader did not honour the on-disk mark: %+v ok=%v", back, ok)
+	}
 }
 
 func TestConsentFloorRejectsOutOfContractIdentity(t *testing.T) {
@@ -5696,9 +5748,22 @@ func TestConsentOutboxUnreadableWitnessDoesNotResurrectSupersededGrant(t *testin
 	}{
 		{name: "garbled", payload: []byte(`{"version":1,"receipts":[{`), mode: 0o600},
 		{name: "wrong_version", payload: []byte(`{"version":99,"receipts":[]}`), mode: 0o600},
-		{name: "over_read_limit", payload: append(append([]byte(`{"version":1,"receipts":[`),
-			bytes.Repeat([]byte("A"), consentOutboxReadLimit+1)...), []byte(`]}`)...), mode: 0o600},
+		// Over the limit and otherwise PERFECT: a version-current record
+		// whose bytes parse fine. An earlier version of this case padded
+		// with raw A's, which is ALSO invalid JSON — so it re-tested
+		// `garbled` under another name and the length check could be
+		// deleted without it noticing. The padding here rides inside a
+		// string field, so the length check is the only thing that can
+		// refuse the record.
+		{name: "over_read_limit", payload: mustMarshalOversizeOutbox(t), mode: 0o600},
 		{name: "unreadable_permissions", payload: goodPayload, mode: 0o000},
+		// A non-ENOENT open error that ROOT CANNOT BYPASS. The permissions
+		// case above is skipped under euid 0, and it is otherwise the only
+		// test producing a non-ENOENT open error — so on any root runner
+		// that whole arm of the rule would ship unguarded while the run
+		// reads green. Root does not bypass symlink resolution, so a
+		// self-referential link yields ELOOP for every user.
+		{name: "open_error_not_enoent", payload: nil, mode: 0o600},
 		// Syntactically valid at the right version, structurally corrupt.
 		// Each of these unmarshals cleanly and yields zero receipts, so
 		// before the structural check they reported PARSED and the stale
@@ -5722,6 +5787,13 @@ func TestConsentOutboxUnreadableWitnessDoesNotResurrectSupersededGrant(t *testin
 			defer server.Close()
 			dir := t.TempDir()
 			seedCrashState(t, dir, tc.payload)
+			if tc.payload == nil {
+				// The self-referential symlink case: no regular file at all.
+				path := filepath.Join(dir, consentOutboxFileName)
+				if err := os.Symlink(path, path); err != nil {
+					t.Skipf("symlinks unavailable on this filesystem: %v", err)
+				}
+			}
 			if tc.mode != 0o600 {
 				if err := os.Chmod(filepath.Join(dir, consentOutboxFileName), tc.mode); err != nil {
 					t.Fatalf("chmod outbox: %v", err)
@@ -5745,8 +5817,13 @@ func TestConsentOutboxUnreadableWitnessDoesNotResurrectSupersededGrant(t *testin
 			if got := client.Snapshot().ConsentOutboxUnreadable; got != 1 {
 				t.Fatalf("erased witness (%s): ConsentOutboxUnreadable = %d, want 1", tc.name, got)
 			}
-			if got := client.Snapshot().LastConsentError; got == "" {
-				t.Fatalf("erased witness (%s): no diagnostic code surfaced", tc.name)
+			// The EXACT published code, not merely "something": the
+			// load-time read already sets consent_outbox_unreadable and
+			// this subtest asserts that read happened, so a non-empty check
+			// is guaranteed by the thing under test and kills no mutant.
+			// consent_grant_unwitnessed is what an operator monitors for.
+			if got := client.Snapshot().LastConsentError; got != "consent_grant_unwitnessed" {
+				t.Fatalf("erased witness (%s): LastConsentError = %q, want consent_grant_unwitnessed", tc.name, got)
 			}
 		})
 	}
@@ -5976,4 +6053,45 @@ func TestConsentRecordUnreadableBlocksGrantTailAndPreservesDenial(t *testing.T) 
 			}
 		})
 	}
+}
+
+// mustMarshalOversizeOutbox builds a record that is over consentOutboxReadLimit
+// by EXACTLY ONE BYTE and is otherwise perfect: valid JSON, current version,
+// every entry passing the sanitizer.
+//
+// The exactness is the whole point, and two earlier shapes failed to bind the
+// rule they claimed to test. Padding with raw bytes inside the array makes the
+// record invalid JSON, so it merely re-tests `garbled`. Padding a receipt field
+// past maxConsentIdentifierBytes makes the sanitizer reject the entry, so it
+// re-tests the rejected-entry rule. And ANY payload comfortably over the limit
+// is truncated by io.LimitReader into broken JSON, which fails to unmarshal —
+// so deleting the length check changes nothing and the case cannot fail.
+//
+// At exactly limit+1 the truncated view is the COMPLETE object, so it parses
+// and would be adopted. The length comparison is then the only rule standing
+// between an over-sized record and adoption, which is what makes this case
+// able to fail. The padding is trailing whitespace: valid JSON to Unmarshal,
+// and outside every entry the sanitizer inspects.
+func mustMarshalOversizeOutbox(t *testing.T) []byte {
+	t.Helper()
+	receipts := make([]consentReceipt, 0, 64)
+	var payload []byte
+	for i := 0; ; i++ {
+		receipts = append(receipts, testConsentReceipt(fmt.Sprintf("key-oversize-%04d", i), false))
+		payload = mustMarshalOutbox(t, receipts...)
+		if len(payload) > consentOutboxReadLimit {
+			t.Fatalf("test shape: overshot the limit at %d bytes; pad in smaller steps", len(payload))
+		}
+		if consentOutboxReadLimit+1-len(payload) < 64 {
+			break
+		}
+	}
+	payload = append(payload, bytes.Repeat([]byte(" "), consentOutboxReadLimit+1-len(payload))...)
+	if len(payload) != consentOutboxReadLimit+1 {
+		t.Fatalf("test shape: payload is %d bytes, want exactly %d", len(payload), consentOutboxReadLimit+1)
+	}
+	if !json.Valid(payload) {
+		t.Fatalf("test shape: the oversize payload must still be valid JSON")
+	}
+	return payload
 }
