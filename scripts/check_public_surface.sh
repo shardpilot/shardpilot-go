@@ -263,6 +263,18 @@ fi
 # construct legitimately to append a newline, and refusing that would be a
 # rule against an idiom rather than against a hazard.
 ansi_c="$(printf '\044\047')"
+# ⚠ THE SENTINEL MUST BE THE LAST ONE, not the first. A second `unset
+# gate_var` inserted right after the names ends this range before the
+# assignments it exists to validate — the range walked past its own subject.
+# Counted first: exactly one closing sentinel, or this cannot delimit anything.
+sentinels="$(grep -c '^unset gate_var$' "$SELF_BLOB" || true)"
+if [ "$sentinels" != 1 ]; then
+  # refusal:structural
+  echo "REFUSING: the data block has $sentinels closing sentinel(s), expected 1." >&2
+  echo "  The validated range is delimited by it; more than one ends the range" >&2
+  echo "  early and leaves the assignments after it unchecked." >&2
+  exit 2
+fi
 data_block="$(sed -n '/^GATE_DATA_NAMES=/,/^unset gate_var$/p' "$SELF_BLOB")"
 if printf '%s' "$data_block" | grep -qF -- "$ansi_c"; then
   echo "REFUSING: the data block contains an ANSI-C quoted fragment." >&2
@@ -296,10 +308,10 @@ fi
 # the classes, so they are written plainly.
 GATE_DATA_NAMES='ROSTER KNOWN_INTERNAL KNOWN_INNOCENT FIXTURE_ACCENT_BODY FIXTURE_ACCENT_NAME FIXTURE_BINARY_BODY FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY FIXTURE_DIRTY_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY FIXTURE_NAMEHIT_NAME'
 
-PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not| never) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (for|of|in)|[.,;]|$)|[Tt]here (is|are)(n.{1,3}t| not) (any |no )?(harness|harnesses|coverage|tests?|suites?)|[Tt]here (is|are) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?)|[Nn]obody (looks|checks|monitors)|[Ll]acks( any| automated| an?)* ?[A-Za-z-]*[ ]?(harness|harnesses|coverage|tests?|suites?|monitoring)|(has|have|had)(n.{1,3}t| not| never) been (tested|covered|scanned|audited|monitored)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
+PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not| never) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( [a-z]+)?( (for|of|in)|[.,;]|$)|[Tt]here (is|are)(n.{1,3}t| not) (any |no )?(harness|harnesses|coverage|tests?|suites?)|[Tt]here (is|are) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?)|[Nn]obody (looks|checks|monitors)|[Ll]acks( any| automated| an?)* ?[A-Za-z-]*[ ]?(harness|harnesses|coverage|tests?|suites?|monitoring)|(has|have|had)(n.{1,3}t| not| never) been (tested|covered|scanned|audited|monitored)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 ROSTER='analytic[]s-service
 contro[]l-plane'
-KNOWN_INTERNAL='per ADR-[]0000 §[]3
+KNOWN_INTERNAL='per ADR-[]0000 §[]000
 There are no P[]laywright tests for the console.
 There are no e[]nd-to-end tests for the purchase flow.
 The console has no end-to-e[]nd tests for purchase callbacks.
@@ -309,7 +321,7 @@ The crash path is un[]tested.
 There is NO Pla[]ywright harness in the console repo
 the crash path is not []covered by automated tests
 no automated[] scanning for that class of input
-a bare §[]7c left behind when a record id was stripped
+a bare §[]999c left behind when a record id was stripped
 tracked as GAP[]-000 internally
 pinned to main @ []0000000
 nobody[] looks at that dashboard
@@ -395,7 +407,7 @@ is_sentinel_run() {
   return 1
 }
 
-AUDIT_CLASSES='ADR-[0-9]+|GAP-[0-9]{3}|SP-[0-9]{3}|AC-[A-Z]{2}-[0-9]+'
+AUDIT_CLASSES='ADR-[0-9]+|GAP-[0-9]{3}|SP-[0-9]{3}|AC-[A-Z]{2}-[0-9]+|§[0-9]+'
 AUDIT_CLASSES="$AUDIT_CLASSES"'|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)'
 AUDIT_CLASSES="$AUDIT_CLASSES"'|(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 # ⚠ EVERY IDENTIFIER-BEARING ALTERNATIVE THE MATCHER ACCEPTS BELONGS HERE. Two
@@ -622,7 +634,13 @@ scan_tree() {
     # status — 141, which `set -e` turns into a dead run. It read as 141 for
     # every probe at once, which is what a dead run looks like: uniform, and
     # nothing like the mixture of 0, 1 and 2 the table expected.
-    markup_head="$(sed -e '1s/^\xef\xbb\xbf//' "$blob" | tr -d '[:space:]' | cut -c1-2)"
+    # ⚠ LEADING WHITESPACE ONLY. `tr -d '[:space:]'` removed every space in the
+    # file, so `< alpha is the current threshold.` became `<alpha` and was
+    # refused as markup — a false refusal on prose, from a fix for a false
+    # refusal on prose.
+    markup_head="$(sed -e '1s/^\xef\xbb\xbf//' "$blob" \
+      | sed -e '/^[[:space:]]*$/d' -e 's/^[[:space:]]*//' \
+      | sed -n '1s/^\(..\).*$/\1/p')"
     # ⚠ NO PIPE. `printf | grep -q` exits 141 under `pipefail`: grep stops at the
     # first match and closes the pipe, printf takes SIGPIPE, and the whole run
     # dies with a status nobody reads as "matched". A case does the same job
@@ -675,7 +693,7 @@ scan_tree() {
     case "$flc" in
       *.png|*.jpg|*.jpeg|*.gif|*.webp|*.bmp|*.tif|*.tiff|*.ico|*.svg|*.xpm|\
       *.xbm|*.ppm|*.pgm|*.pbm|*.pnm|*.pcx|*.tga|*.psd|*.ai|*.eps|*.heic|\
-      *.heif|*.avif|*.ps|*.eps)
+      *.heif|*.avif|*.ps|*.eps|*.rtf)
         # refusal:hazard
         echo "REFUSING: '$f' is an image, and this gate reads files as text." >&2
         echo "  Pixels are not searchable prose: an identifier drawn in a" >&2
@@ -790,8 +808,15 @@ scan_tree() {
     case "$flc" in
       *.md|*.markdown|*.html|*.htm) refs_apply=yes ;;
     esac
+    # ⚠ NOT INSIDE A CODE SPAN. A fenced block or backticked run DISPLAYS the
+    # reference rather than decoding it, so refusing a document that documents
+    # an entity blocked a merge over an example. Code is removed before the
+    # question is asked; everywhere else it still counts.
+    if [ "$refs_apply" = yes ]; then
+      sed -e 's/`[^`]*`//g' -e '/^```/,/^```/d' "$blob" > "$md_blob" || cat "$blob" > "$md_blob"
+    fi
     if [ "$refs_apply" = yes ] &&
-       grep -qaE "$CHARACTER_REFERENCE" "$blob" 2>/dev/null; then
+       grep -qaE "$CHARACTER_REFERENCE" "$md_blob" 2>/dev/null; then
       # refusal:hazard
       echo "REFUSING: '$f' contains a character reference." >&2
       echo "  It renders as a character this gate never reads, so a clean result" >&2
@@ -879,7 +904,15 @@ scan_tree() {
         # Written in BASIC regex on purpose: `-E` applies to every script in
         # the same sed, and the two substitutions above are BRE. Reaching for
         # it broke both of them and the gate refused the whole file.
-        if sed -e 's/\\\([^A-Za-z0-9]\)/\1/g' -e 's/[*`]//g' -e 's|</\{0,1\}[A-Za-z][A-Za-z0-9-]*\( [^>]*\)\{0,1\}/\{0,1\}>||g' "$blob" > "$md_blob"; then
+        # ⚠ COMMENTS AND LINK SYNTAX SIT BETWEEN TOKEN PIECES TOO. A renderer
+        # drops an HTML comment entirely and shows a link's TEXT, so
+        # `ADR-<!-- x -->1234` and `ADR-[1234](url)` both draw the identifier
+        # whole while the bytes have delimiters in the middle. The comment goes;
+        # the link keeps its text and loses its target.
+        if sed -e 's/\\\([^A-Za-z0-9]\)/\1/g' -e 's/[*`]//g' \
+               -e 's|<!--.*-->||g' \
+               -e 's|\[\([^]]*\)\](\([^)]*\))|\1|g' \
+               -e 's|</\{0,1\}[A-Za-z][A-Za-z0-9-]*\( [^>]*\)\{0,1\}/\{0,1\}>||g' "$blob" > "$md_blob"; then
           cat "$md_blob" > "$blob"
         else
           # refusal:structural
@@ -1168,8 +1201,8 @@ EOF
       novel=$((novel + 1))
     fi
   done <<EOF
-$( { grep -hoE 'shardpilot/[A-Za-z0-9][A-Za-z0-9._-]*' "$SELF_BLOB"
-     printf '%s\n' "$corpus_values" | grep -oE 'shardpilot/[A-Za-z0-9][A-Za-z0-9._-]*'; } | sort -u )
+$( { grep -hoiE 'shardpilot/[A-Za-z0-9][A-Za-z0-9._-]*' "$SELF_BLOB"
+     printf '%s\n' "$corpus_values" | grep -oiE 'shardpilot/[A-Za-z0-9][A-Za-z0-9._-]*'; } | sort -u )
 EOF
 
   # Identifiers, in every class the patterns name, admitted by shape alone. A
