@@ -29,7 +29,15 @@ import (
 // consentAnalyticsUnwitnessed is the decision value written for a WITHHELD
 // grant. No released build recognises it, so every decoder — including this
 // one's predecessors — refuses to treat the record as authorization.
-const consentAnalyticsUnwitnessed = "unwitnessed"
+// consentAnalyticsUnwitnessed is the decision value written for a WITHHELD
+// grant: the legacy-understood DENIED, so an older build honours it as a
+// denial. An earlier revision used an unknown value on the reasoning that an
+// old decoder would reject the record — it does, and rejecting lands it in
+// the MORE permissive branch, because a build that sees no usable record lets
+// its trail-tail override apply a retained grant unconditionally. Rejecting
+// the record is not the same as refusing the authorization, and only the
+// second one was ever the goal.
+const consentAnalyticsUnwitnessed = "denied"
 
 const (
 	consentRecordFileName = "consent.json"
@@ -330,7 +338,7 @@ func loadConsentRecordRead(dir, actorDigest string) (consentRecordInfo, bool, co
 		return none, false, consentRecordReadForeign
 	}
 	info := consentRecordInfo{decidedAt: record.DecidedAt, floor: record.Floor, unwitnessed: record.Unwitnessed, unwitnessedAt: record.UnwitnessedAt}
-	if record.ConsentAnalytics == consentAnalyticsUnwitnessed {
+	if record.ConsentAnalytics == consentAnalyticsUnwitnessed && record.WithheldAnalytics != "" {
 		// A withheld record. The real decision lives in WithheldAnalytics;
 		// the mark and its stamp ride as usual, so recovery works exactly as
 		// it does for a record marked the additive way.

@@ -6674,8 +6674,12 @@ func TestWithheldGrantIsFailClosedForOlderDecoders(t *testing.T) {
 	}
 	// An older build switches on consent_analytics and has no case for this,
 	// so it falls to its default arm and reports no usable record.
-	if got := wire["consent_analytics"]; got == "granted" {
-		t.Fatalf("a withheld grant is still spelled \"granted\"; a rollback would read it as authorization: %s", raw)
+	// The spelling has to be one an OLDER build both understands AND refuses
+	// to authorize on. An unknown value fails the first half: the old build
+	// rejects the record and then applies a retained grant unconditionally,
+	// which is more permissive than honouring a denial.
+	if got := wire["consent_analytics"]; got != "denied" {
+		t.Fatalf("a withheld grant is not spelled as a legacy-understood denial: %s", raw)
 	}
 	if got := wire["withheld_analytics"]; got != "granted" {
 		t.Fatalf("the real decision was not preserved for recovery: %s", raw)
@@ -6899,7 +6903,10 @@ func TestTrailShapeViolationsAreUnusable(t *testing.T) {
 	t.Run("sentinel_without_the_boolean", func(t *testing.T) {
 		// The redundant flag is gone; the sentinel alone must still withhold.
 		dir := t.TempDir()
-		payload := []byte(`{"consent_analytics":"unwitnessed","withheld_analytics":"granted","actor_digest":"` +
+		// The sentinel is the legacy-understood "denied": an older build
+		// honours it as a denial instead of falling into its permissive
+		// no-usable-record branch.
+		payload := []byte(`{"consent_analytics":"denied","withheld_analytics":"granted","actor_digest":"` +
 			spoolTestActorDigest() + `","decided_at":"2026-07-19T00:00:00Z","floor":true}`)
 		if err := os.WriteFile(consentRecordPath(dir), payload, 0o600); err != nil {
 			t.Fatalf("write: %v", err)
@@ -6924,4 +6931,86 @@ func readOutboxFixture(t *testing.T, receipts ...consentReceipt) ([]consentRecei
 		t.Fatalf("seed outbox: %v", err)
 	}
 	return newConsentOutbox(dir).readRecordReceipts()
+}
+
+// legacyDecodeConsentRecord is the decoder as it stood BEFORE this change, kept
+// verbatim in shape: the same switch with the same four arms, and the same
+// `default` that reports no usable record. It exists so the rollback claim can
+// be tested against a build that does not know any of the new fields, rather
+// than argued about in a comment.
+func legacyDecodeConsentRecord(t *testing.T, raw []byte) (ConsentState, bool) {
+	t.Helper()
+	var record struct {
+		ConsentAnalytics string `json:"consent_analytics"`
+		ActorDigest      string `json:"actor_digest"`
+	}
+	if json.Unmarshal(raw, &record) != nil {
+		return ConsentUnknown, false
+	}
+	if record.ActorDigest != spoolTestActorDigest() {
+		return ConsentUnknown, false
+	}
+	switch record.ConsentAnalytics {
+	case "granted":
+		return ConsentGranted, true
+	case "denied":
+		return ConsentDenied, true
+	case "denied_forced_minor":
+		return ConsentDeniedForcedMinor, true
+	default:
+		return ConsentUnknown, false
+	}
+}
+
+// TestRollbackCannotAuthorizeOnAWithheldRecord asserts the OUTCOME an older
+// build reaches, not whether it parses the record.
+//
+// Three revisions of this encoding were wrong in three consecutive rounds, and
+// each was right about the property being checked and wrong about the
+// consequence. The last one made the decision value UNKNOWN so an older decoder
+// would reject the record — it does, and rejecting is the PERMISSIVE outcome
+// there: a build that finds no usable record lets its trail-tail override apply
+// a retained grant unconditionally and heal it. Refusing the record and refusing
+// the authorization are different things, and only the second was ever the goal.
+//
+// So the assertion is: the old decoder must reach a state that HOLDS — a
+// legacy-understood denial — never `ok == false`, and never Granted.
+func TestRollbackCannotAuthorizeOnAWithheldRecord(t *testing.T) {
+	dir := t.TempDir()
+	info := consentRecordInfo{state: ConsentGranted, decidedAt: "2026-07-19T00:00:00Z", floor: true}
+	if err := markConsentRecordUnwitnessed(dir, info, spoolTestActorDigest(),
+		"2026-07-19T00:00:00Z", os.Rename, os.Chmod); err != nil {
+		t.Fatalf("mark: %v", err)
+	}
+	raw, err := os.ReadFile(consentRecordPath(dir))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	state, ok := legacyDecodeConsentRecord(t, raw)
+	if state == ConsentGranted {
+		t.Fatalf("an older build reads a withheld grant as authorization: %s", raw)
+	}
+	if !ok {
+		t.Fatalf("an older build finds NO usable record, which is its permissive branch — "+
+			"a retained grant would then apply unconditionally: %s", raw)
+	}
+	if state != ConsentDenied {
+		t.Fatalf("an older build reaches %v, not a state that holds: %s", state, raw)
+	}
+
+	// And a withheld DENIAL must keep reading as a denial to that same build.
+	denyDir := t.TempDir()
+	deny := consentRecordInfo{state: ConsentDenied, decidedAt: "2026-07-19T00:00:00Z", floor: true}
+	if err := markConsentRecordUnwitnessed(denyDir, deny, spoolTestActorDigest(),
+		"2026-07-19T00:00:00Z", os.Rename, os.Chmod); err != nil {
+		t.Fatalf("mark denial: %v", err)
+	}
+	denyRaw, err := os.ReadFile(consentRecordPath(denyDir))
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if s, ok := legacyDecodeConsentRecord(t, denyRaw); !ok || s != ConsentDenied {
+		t.Fatalf("an older build stopped honouring a withheld denial: (%v, %v) %s", s, ok, denyRaw)
+	}
 }

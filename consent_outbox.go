@@ -354,6 +354,57 @@ func (o *consentOutbox) filePath() string {
 	return filepath.Join(o.dir, consentOutboxFileName)
 }
 
+// EIGHT INVARIANTS GOVERN THIS STATE, AND THEY WERE NOT CHECKED PAIRWISE.
+//
+// Read this before changing anything here. The rules below accumulated one per
+// review round, and each was correct on its own; what review then began finding
+// was not new CLASSES of defect but INTERSECTIONS between rules that already
+// existed. Five consecutive rounds produced exactly three findings each — a
+// plateau, and the shape of one: eight rules make twenty-eight pairs, and a
+// review round consumes about three.
+//
+//  1. A read of durable state is THREE-VALUED — absent / unusable / parsed —
+//     in both files, because "I could not read it" and "there is nothing
+//     recorded" lead to opposite safe actions.
+//  2. Unusable resolves RESTRICTIVELY: a grant is withheld, a denial honoured.
+//     "Not entitled to act", never "denied" as a finding about the person.
+//  3. The withholding is DURABLE, marked on the per-scope decision record,
+//     because a memory-only refusal is undone by ordinary housekeeping.
+//  4. The mark carries a STAMP and is an ORDERING question, not a veto: a
+//     decision strictly newer than the stamp is provably one the mark could
+//     not have been about. Absence of a stamp reads as infinitely NEW.
+//  5. A withheld grant is written in a shape an OLDER build both understands
+//     and refuses to authorize on — refusing the RECORD is not refusing the
+//     AUTHORIZATION, and the two came apart three times.
+//  6. A record belonging to another scope is a TOMBSTONE and vetoes a grant
+//     unconditionally: no wall-clock comparison is sound across a scope
+//     switch, and here a wrong answer admits rather than sticks.
+//  7. The trail's SHAPE is validated, not only each entry: duplicate keys and
+//     non-monotonic order make it unusable, because those are visible only in
+//     the relation between entries.
+//  8. The writer never produces a record its own reader would refuse, and a
+//     decision that cannot be stored is refused loudly rather than dropped.
+//
+// HOW FAR THIS IS VERIFIED. Each rule has tests, and every guard was broken and
+// seen to fail before being restored. The INTERSECTIONS were sampled, not
+// enumerated: review picked a handful of pairs per round and the ones it picked
+// were real, which says nothing about the ones it did not. Treat "these eight
+// hold together" as unproven.
+//
+// KNOWN AND DEFERRED, both restrictive in direction — they make recovery fail
+// to arrive, never authorization arrive wrongly, and that is the only reason
+// they were not blockers. They are NOT unimportant, and being deferred once is
+// not a reason to defer them again:
+//   - a fresh receipt-bearing recovery does not replace a non-monotonic
+//     history in every path, so such a trail can stay unusable longer than it
+//     should;
+//   - an actorless (local-only) client has no receipt to carry a fresh
+//     decision, so the paths keyed on one do not release for it.
+//
+// The next change here should start by REDUCING the eight rather than testing
+// more pairs: several are consequences of others, and the pair surface falls
+// quadratically.
+
 // consentOutboxRead classifies what a read of the durable record LEARNED,
 // which is not the same question as what it returned. Absent and unusable
 // both yield zero receipts, and collapsing them is what let an unreadable
@@ -579,6 +630,15 @@ func (o *consentOutbox) preserveEvidence() {
 
 func (o *consentOutbox) saveLocked(carriesFreshDecision bool) error {
 	diskReceipts, diskRead := o.readRecordReceipts()
+	if carriesFreshDecision && diskRead == consentOutboxReadUnusable {
+		// A fresh decision supersedes the unknown trail OUTRIGHT, and that
+		// has to include not writing the unknown trail back. Merging the
+		// disk view here would carry the very entries that made it
+		// unusable — a non-monotonic sequence, say — into the rewritten
+		// record, so it would read unusable again on the next start and the
+		// documented recovery would never complete. Own receipts only.
+		diskReceipts = nil
+	}
 	if carriesFreshDecision {
 		// A FRESH explicit decision supersedes the unknown trail outright:
 		// it is newer than anything the unreadable bytes could have held. It
@@ -1217,6 +1277,15 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 		// in contract).
 		c.stats.setLastError("consent_identity_invalid")
 		c.logf("shardpilot consent floor: a configured identifier exceeds the %d-byte clamp; the persisted decision is not loaded and the floor starts undecided: %v", maxConsentIdentifierBytes, err)
+		if c.consentOutbox.lastRead == consentOutboxReadUnusable {
+			// This start refuses the persisted decision for a reason of its
+			// own, so nothing below runs — but an UNREADABLE trail is still
+			// the only evidence that a grant is unprovable, and ordinary
+			// maintenance would sanitize it away before a later start (with
+			// a corrected identifier) could see it. Preserving it here costs
+			// nothing: the floor is already undecided.
+			c.consentOutbox.preserveEvidence()
+		}
 	} else {
 		digest := consentActorDigest(c.cfg)
 		record, recordOK, recordRead := loadConsentRecordRead(c.cfg.SpoolDir, digest)
