@@ -4,9 +4,8 @@ on:
   pull_request:
   # ⚠ EVERY PUSH, NOT ONLY main. This repository is PUBLIC: a branch pushed here
   # is readable the moment it lands, whether or not a pull request ever opens.
-  # A `branches: [main]` filter meant the secret scan and the publication gate
-  # skipped exactly the case where the contents are already exposed and nobody
-  # is looking. Tags are included for the same reason and a stronger one — a tag
+  # A `branches: [main]` filter meant the secret scan skipped exactly the case
+  # where the contents are already exposed and nobody is looking. Tags are included for the same reason and a stronger one — a tag
   # is the artifact people install, and one release here was cut off-main.
   #
   # No job is conditioned to narrow this back down. A condition is how a gate
@@ -236,7 +235,6 @@ jobs:
 
       - name: Version consistency (README latest tag == CHANGELOG head == skill pin)
         run: ./scripts/check_release_consistency.sh
-
   public-surface:
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -256,3 +254,4 @@ jobs:
       # header for what the two lanes do and do not cover.
       - name: No internal material in the published non-source surface
         run: ./scripts/check_public_surface.sh
+
