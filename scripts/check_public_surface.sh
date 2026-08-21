@@ -543,7 +543,10 @@ scan_tree() {
       exit 2
     fi
     #
-    # ⚠ AND AN ASCII RASTER CARRIES NO NUL AT ALL. XPM is printable C source
+    # ⚠ AND AN ASCII RASTER CARRIES NO NUL AT ALL. XPM comes in two shapes and
+    # both are printable: the C-source form opening `/* X`, and XPM2 opening
+    # `! XPM2` — plain text throughout, so neither the NUL refusal nor a
+    # compression signature sees either. XPM is printable C source
     # from its `/* X` header to its pixel array; Netpbm's P1 through P6 hold
     # their pixels as decimal text, so neither the NUL refusal nor a
     # compression signature sees them while the picture renders whatever it
@@ -562,7 +565,7 @@ scan_tree() {
     # and so apply to every file, and the PRINTABLE ones, which can and do not.
     case "$magic4" in
       89504e47|ffd8ff*|49492a00|4d4d002a) magic_hit=yes ;;
-      4d5a*|47494638|52494646|424d*|5031*|5032*|5033*|5034*|5035*|5036*|2f2a2058)
+      4d5a*|47494638|52494646|424d*|5031*|5032*|5033*|5034*|5035*|5036*|2f2a2058|21205850)
         magic_hit="$printable_sigs" ;;
       *) magic_hit=no ;;
     esac
