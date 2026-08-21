@@ -117,9 +117,8 @@ type consentRecordWire struct {
 	// alone, which is the pre-stamp behaviour: strictly more blocking, and
 	// so safe in the direction that matters.
 	//
-	// NOT part of the ADR-0331 wire freeze. That contract governs what
-	// rides the wire on events and crashes; this is local SDK state on the
-	// device's own disk and never leaves it.
+	// This is local SDK state on the device's own disk. It is not part of
+	// any wire contract, is never transmitted, and no server reads it.
 	//
 	// CLOCKS GO BACKWARD, and this compares stamps across restarts using a
 	// device clock. A backward jump yields a decision that is genuinely
