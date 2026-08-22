@@ -534,6 +534,29 @@ data_block_names="$(printf '%s\n' "$data_block" | awk '
       i++
     }
     if (assign_line && bare ~ /[[:space:]][A-Za-z_][A-Za-z0-9_]*=/) print "!CTRL " name
+    # ⚠ AND NOTHING BUT ASSIGNMENTS LIVES HERE. Seven rounds of review found
+    # seven ways to hide a second assignment from a parser that only looked at
+    # the shapes it expected; the eighth would be a plain shell command, which
+    # nothing above rejects. So the grammar is stated in full and everything
+    # outside it refuses: at quote depth zero this block holds blank lines,
+    # comments, unindented assignments, and the four lines of the decode loop.
+    # A continuation of a multi-line value is inside a quote and never reaches
+    # this test.
+    if (inq == 0 && ind == 0 && was_open == 0) {
+      probe = $0
+      sub(/[[:space:]]+$/, "", probe)
+      if (probe != "" \
+          && probe !~ /^[[:space:]]*#/ \
+          && probe !~ /^[A-Za-z_][A-Za-z0-9_]*=/ \
+          && probe !~ /^[[:space:]]+[A-Za-z_][A-Za-z0-9_]*=/ \
+          && probe != "for gate_var in $GATE_DATA_NAMES; do" \
+          && probe != "done" \
+          && probe != "unset gate_var" \
+          && probe !~ /^[[:space:]]*eval "\$gate_var=/) {
+        print "!CMD " probe
+      }
+    }
+    was_open = (inq || ind)
   }' | sort)"
 # ⚠ ASSIGNED ONCE, NOT MERELY LISTED. Deduplicating the names here let a second
 # assignment overwrite the first before the values are read: the raw scan sees
@@ -558,6 +581,16 @@ while IFS= read -r data_name; do
   # the list; it is audited instead by the pattern-list rules below, which read
   # it more strictly than any fixture. Nothing else is exempt.
   case "$data_name" in
+    '!CMD '*)
+      # refusal:structural
+      echo "REFUSING: the data block holds a line that is not an assignment:" >&2
+      echo "    ${data_name#!CMD }" >&2
+      echo "  This block is DATA. Its grammar is blank lines, comments," >&2
+      echo "  unindented NAME=value assignments, and the decode loop — nothing" >&2
+      echo "  else, because anything else runs while being decoded by nothing" >&2
+      echo "  and audited by nothing." >&2
+      exit 2
+      ;;
     '!CTRL '*)
       # refusal:structural
       echo "REFUSING: the data-block assignment ${data_name#!CTRL } does not stand alone" >&2
@@ -610,11 +643,14 @@ CONTAINER_SIGS="$CONTAINER_SIGS"' \067\172\274\257'
 # format does not, so the block header is part of the signature here.
 # An EMPTY archive carries only the end-of-stream marker, which falls outside
 # these nine and is not worth a tenth entry; the tree holds no such file.
-BZBLK='\061\101\131\046\123\131'
-CONTAINER_SIGS_TXT="\102\132\150\061$BZBLK \102\132\150\062$BZBLK \102\132\150\063$BZBLK"
-CONTAINER_SIGS_TXT="$CONTAINER_SIGS_TXT \102\132\150\064$BZBLK \102\132\150\065$BZBLK"
-CONTAINER_SIGS_TXT="$CONTAINER_SIGS_TXT \102\132\150\066$BZBLK \102\132\150\067$BZBLK"
-CONTAINER_SIGS_TXT="$CONTAINER_SIGS_TXT \102\132\150\070$BZBLK \102\132\150\071$BZBLK"
+# ⚠ THE PRINTABLE COMPRESSION SIGNATURE IS GONE, for the reason the document
+# header lost its anywhere-search: ten printable characters are also a quotation.
+# Documentation about the format writes the whole block prefix, and a search
+# anywhere in the file cannot tell that from a stream. What covers the real
+# thing instead: a compressed stream carries NUL bytes and is refused as binary
+# below, and the extension is refused by name above. Both are checked; neither
+# depends on a sentence not mentioning a format.
+CONTAINER_SIGS_TXT=""
 # ⚠ THE DOCUMENT HEADER IS NOT IN THIS LIST, and its version bytes did not
 # rescue it: seven printable characters are also a sentence about the format,
 # and documentation quotes the version too. It is checked separately below,
@@ -995,14 +1031,27 @@ scan_tree() {
             # legal and is not handled — a picture committed by accident does
             # not carry one, and the extension list above is what covers the
             # one that does.)
+            # ⚠ AND BOTH DIMENSIONS, NOT JUST A DIGIT. `P1 2026 planning
+            # priorities` opens with a level and a YEAR, which satisfies "a
+            # number follows the delimiter" exactly as a width does. A raster
+            # header carries a width AND a height, both decimal; the note
+            # carries a word where the height would be.
             magic_np=no
+            magic_fields=0
+            magic_indigit=0
             for magic_i in 6 8 10 12 14 16 18 20 22 24 26 28 30; do
               case "${magic16:$magic_i:2}" in
-                09|0a|0b|0c|0d|20) continue ;;
-                3[0-9])            magic_np=yes ;;
+                09|0a|0b|0c|0d|20)
+                  if [ "$magic_indigit" -eq 1 ]; then
+                    magic_fields=$((magic_fields + 1)); magic_indigit=0
+                  fi ;;
+                3[0-9]) magic_indigit=1 ;;
+                *)
+                  magic_indigit=0; magic_fields=0; break ;;
               esac
-              break
+              if [ "$magic_fields" -ge 2 ]; then magic_np=yes; break; fi
             done
+            if [ "$magic_fields" -ge 2 ]; then magic_np=yes; fi
             case "$magic_np" in
               yes) magic_hit="$printable_sigs" ;;
               *)   magic_hit=no ;;
@@ -1044,6 +1093,14 @@ scan_tree() {
     # way it does for pictures — narrowing the signature above is what makes
     # that necessary rather than merely tidy.
     case "$flc" in
+      *.bz2|*.gz|*.zip|*.xz|*.zst|*.7z|*.tar|*.tgz|*.rar)
+        # refusal:hazard
+        echo "REFUSING: '$f' is a compressed archive, and this gate reads files as text." >&2
+        echo "  No pass here opens it, so a clean result would say nothing about" >&2
+        echo "  what it carries. Remove it, or extend this gate to walk containers" >&2
+        echo "  deliberately." >&2
+        exit 2
+        ;;
       *.pdf)
         # refusal:hazard
         echo "REFUSING: '$f' is a rendered document, and this gate reads files as text." >&2
@@ -1067,9 +1124,9 @@ scan_tree() {
     if [ "$printable_sigs" = yes ] \
        && [ "${magic16:0:10}" = "255044462d" ]; then
       # refusal:hazard
-      echo "REFUSING: '$f' carries a rendered-document stream." >&2
-      echo "  Its header and its object terminator are both present, and no pass" >&2
-      echo "  here reads document contents. Remove it, or extend this gate to" >&2
+      echo "REFUSING: '$f' BEGINS with a rendered-document header." >&2
+      echo "  A file whose first bytes are that header is one, and no pass here" >&2
+      echo "  reads document contents. Remove it, or extend this gate to" >&2
       echo "  walk containers deliberately." >&2
       exit 2
     fi
@@ -1412,7 +1469,7 @@ SHAPE_AWK='  function distinct(body,   j, ch, nx, set, k, cnt) {
         # and a backslash before an ordinary character is the character.
         for (i = 1; i <= n; i++) {
           arm = parts[i]
-          gsub(/\{0*1\}/, "", arm)
+          gsub(/\{0*1(,0*1)?\}/, "", arm)
           gsub(/\\([^bBwWsSdD<>])/, "\\1", arm)
           if (!(arm in seen)) { seen[arm] = 1; cnt++ }
         }
@@ -1629,7 +1686,13 @@ EOF
     novel=$((novel + 1))
   done <<EOF
 $( { grep -hoE -- "$AUDIT_CLASSES" "$SELF_BLOB"
-     printf '%s\n' "$corpus_values" | grep -oE -- "$AUDIT_CLASSES"; } | sort -u )
+     printf '%s\n' "$corpus_values" | grep -oE -- "$AUDIT_CLASSES"
+     # ⚠ AND THE MARKER-FREE FORM OF THE VALUES. The decorated fixtures added
+     # for the rendered-surface probes hold their identifiers with markers
+     # between the characters, so the raw read sees no class at all — the one
+     # place a live id could be pasted into a fixture and audited by nothing,
+     # which is exactly the paste this audit exists to catch.
+     printf '%s\n' "$corpus_values" | tr -d '*_`~\\' | grep -oE -- "$AUDIT_CLASSES"; } | sort -u )
 EOF
 
   rm -f "$found"
