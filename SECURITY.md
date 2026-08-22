@@ -10,9 +10,17 @@ observe. It lifts when ShardPilot says so, not when you decide you are ready.
 
 ## Reporting
 
-Report suspected vulnerabilities privately through the repository security
-advisory flow when available, or contact the maintainers through a private
-project channel.
+Report suspected vulnerabilities privately through this repository's **security
+advisory flow** — open a draft advisory from the Security tab, or go straight to
+`/security/advisories/new` on this repository. Private reporting is enabled
+here, so that route is open to anyone; you do not need a prior contact with us.
+
+Please do not open a public issue describing a suspected vulnerability. If for
+any reason the advisory form will not accept your report, open a public issue
+that says only that you have a security report and asks for a private channel —
+no version, no reproduction, no description of the flaw. A request for a channel
+discloses nothing, and we will reply with somewhere private to send the
+details.
 
 ## Boundaries
 
