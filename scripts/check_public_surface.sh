@@ -492,7 +492,7 @@ data_block_names="$(printf '%s\n' "$data_block" | awk '
   {
     if (inq == 0 && ind == 0 && $0 ~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
       name = $0; sub(/=.*/, "", name); print name
-      assign_line = 1
+      assign_line = 1; bare = ""
     } else assign_line = 0
     i = 1
     while (i <= length($0)) {
@@ -507,15 +507,18 @@ data_block_names="$(printf '%s\n' "$data_block" | awk '
       # stayed green.
       if (c == "#") break
       # ⚠ ONE ASSIGNMENT PER LINE. Only the assignment at the START of a line
-      # is recorded, so a second one appended behind a control operator runs,
-      # publishes its value, and appears in no list — undecoded and unaudited.
-      # The parser cannot follow shell grammar, so the grammar is restricted
-      # instead: an assignment line carries no unquoted `;`, `&` or `|`.
+      # is recorded, so a second one on the same line runs, publishes its
+      # value, and appears in no list — undecoded and unaudited. The parser
+      # cannot follow shell grammar, so the grammar is restricted instead: an
+      # assignment line carries no unquoted control operator AND no second
+      # `NAME=` behind whitespace, which the shell accepts just as happily.
       if (assign_line && (c == ";" || c == "&" || c == "|")) { print "!CTRL " name; assign_line = 0 }
+      if (assign_line) bare = bare c
       if (c == sq) inq = 1
       else if (c == dq) ind = 1
       i++
     }
+    if (assign_line && bare ~ /[[:space:]][A-Za-z_][A-Za-z0-9_]*=/) print "!CTRL " name
   }' | sort)"
 # ⚠ ASSIGNED ONCE, NOT MERELY LISTED. Deduplicating the names here let a second
 # assignment overwrite the first before the values are read: the raw scan sees
@@ -1115,6 +1118,23 @@ scan_tree() {
     # fixtures, so nothing here would have shown it. Stripped per line before
     # any pattern runs, which leaves line COUNT untouched and reported numbers
     # true.
+    # ⚠ AND A CR-ONLY FILE HAS NO LINE ENDINGS AT ALL as far as this reads.
+    # Classic Mac text separates lines with a bare CR, so the whole blob
+    # arrives as ONE line: every alternative anchored on `$` sees only the last
+    # phrase in the file, and a disclosure followed by a CR and more prose is
+    # invisible. Translated to newlines FIRST, and only when the blob carries a
+    # CR and no LF at all — doing it unconditionally would double every line of
+    # a CRLF file and make every reported line number wrong.
+    if ! LC_ALL=C grep -qa "$(printf '\012')" "$blob" 2>/dev/null \
+       && LC_ALL=C grep -qa "$(printf '\015')" "$blob" 2>/dev/null; then
+      if LC_ALL=C tr '\015' '\012' < "$blob" > "$md_blob"; then
+        cat "$md_blob" > "$blob"
+      else
+        # refusal:structural
+        echo "REFUSING: could not normalise CR-only line endings in '$f'." >&2
+        exit 2
+      fi
+    fi
     if sed 's/\r$//' "$blob" > "$md_blob"; then
       cat "$md_blob" > "$blob"
     else
@@ -1177,7 +1197,11 @@ scan_tree() {
     # merge by taking the worse: that turned a hit in the raw text into a miss
     # whenever the stripped copy had none, and the fixtures caught it
     # immediately. Error wins over match, match wins over no-match.
-    if [ "$status" -eq 2 ] || [ "$strip_status" -eq 2 ]; then status=2
+    # ⚠ ANY STATUS ABOVE "NO MATCH" IS AN ERROR, not just 2. A grep killed by
+    # the kernel exits 137, which is neither 0 nor 2 — treated as "no match" it
+    # would let an unscanned file report clean, which is the one outcome this
+    # gate must never produce.
+    if [ "$status" -gt 1 ] || [ "$strip_status" -gt 1 ]; then status=2
     elif [ "$status" -eq 0 ] || [ "$strip_status" -eq 0 ]; then status=0
     else status=1
     fi
@@ -1197,7 +1221,7 @@ scan_tree() {
     roster_hits_strip="$(grep -aniE -- "$ROSTER_RE" "$strip_blob" 2>/dev/null \
       | tr -d '\000'; exit "${PIPESTATUS[0]}")"
     roster_strip_status=$?
-    if [ "$roster_status" -eq 2 ] || [ "$roster_strip_status" -eq 2 ]; then roster_status=2
+    if [ "$roster_status" -gt 1 ] || [ "$roster_strip_status" -gt 1 ]; then roster_status=2
     elif [ "$roster_status" -eq 0 ] || [ "$roster_strip_status" -eq 0 ]; then roster_status=0
     else roster_status=1
     fi
@@ -1235,7 +1259,12 @@ scan_tree() {
     # `sort -u`: a single line can match BOTH passes — a comment carrying an
     # ADR reference next to a service name — and would then be recorded twice,
     # inflating the line count by one per such line. One command, no new pass.
-    [ -n "$roster_hits" ] && hits="$(printf '%s\n%s\n' "$hits" "$roster_hits" | grep -v '^$' | sort -u)"
+    # ⚠ DEDUPLICATED BY LINE NUMBER, not by text. One physical line can match
+    # the shape pass on its raw bytes and the roster pass on its marker-free
+    # copy, and the two records differ as strings — `sort -u` kept both and the
+    # lane counts read one line as two.
+    [ -n "$roster_hits" ] && hits="$(printf '%s\n%s\n' "$hits" "$roster_hits" \
+      | grep -v '^$' | sort -t: -k1,1n | awk -F: '!seen[$1]++')"
     case "$f" in
       *.go)
         scan_lane_b_files=$((scan_lane_b_files + 1))
@@ -1360,7 +1389,7 @@ SHAPE_AWK='  function distinct(body,   j, ch, nx, set, k, cnt) {
         # and a backslash before an ordinary character is the character.
         for (i = 1; i <= n; i++) {
           arm = parts[i]
-          gsub(/\{1\}/, "", arm)
+          gsub(/\{0*1\}/, "", arm)
           gsub(/\\([^bBwWsSdD<>])/, "\\1", arm)
           if (!(arm in seen)) { seen[arm] = 1; cnt++ }
         }
