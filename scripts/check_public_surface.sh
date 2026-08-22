@@ -957,12 +957,15 @@ scan_tree() {
           00000000) magic_hit="$printable_sigs" ;;
           *)        magic_hit=no ;;
         esac ;;
-      # The GIF version follows the signature and is 87a or 89a, nothing else.
-      47494638)
-        case "${magic16:8:4}" in
-          3761|3961) magic_hit="$printable_sigs" ;;
-          *)         magic_hit=no ;;
-        esac ;;
+      # ⚠ THE IMAGE SIGNATURE IS GONE FOR THE SAME REASON AS THE OTHER TWO
+      # PRINTABLE ONES. Six printable characters are also a quotation, and a
+      # document demonstrating the format writes them in full — the bytes of a
+      # quotation and of a header are identical, so nothing further at the byte
+      # level can separate them. The extension above refuses this format by name, and a
+      # real one carries NUL bytes and is refused as binary below. Third
+      # printable signature retired on this reasoning; the pattern is that a
+      # signature a document can QUOTE belongs to the extension list, not to a
+      # byte search.
       # ⚠ `RIFF` IS ALSO A WORD, AND A SENTENCE ABOUT THE FORMAT CAN CARRY AN
       # UPPER-CASE FOURCC: `RIFF is WEBP format` puts `WEBP` at offset 8
       # exactly where a real one does. A form type is a guess; the SIZE FIELD
@@ -1430,6 +1433,29 @@ SHAPE_AWK='  function distinct(body,   j, ch, nx, set, k, cnt) {
     for (k in set) cnt++
     return cnt
   }
+  # ⚠ A BRACKET EXPRESSION CAN CONTAIN `]` WITHOUT ENDING. POSIX collating
+  # symbols and equivalence classes — `[.a.]`, `[=a=]` — carry their own `]`,
+  # so a scan that stops at the first one reads `novel[[.a.]]service` as a
+  # class and calls the alternative structural, while the expression matches
+  # exactly the literal `novelaservice`. The sub-forms are skipped whole, and a
+  # collating symbol standing for one character is reduced to that character
+  # before the class is counted. A NAMED class (`[:alpha:]`) is left alone: it
+  # really does match more than one character.
+  function unsub(b,   o, j, k, kind) {
+    o = ""; j = 1
+    while (j <= length(b)) {
+      if (substr(b, j, 2) == "[." || substr(b, j, 2) == "[=") {
+        kind = substr(b, j + 1, 1)
+        k = index(substr(b, j + 2), kind "]")
+        if (k == 0) { o = o substr(b, j, 2); j += 2; continue }
+        o = o substr(b, j + 2, k - 1)
+        j = j + 2 + k + 1
+        continue
+      }
+      o = o substr(b, j, 1); j++
+    }
+    return o
+  }
   function shrink(r,   out, i, ch, e, body) {
     out = ""; i = 1
     while (i <= length(r)) {
@@ -1438,8 +1464,15 @@ SHAPE_AWK='  function distinct(body,   j, ch, nx, set, k, cnt) {
       e = i + 1
       if (substr(r, e, 1) == "^") e++
       if (substr(r, e, 1) == "]") e++
-      while (e <= length(r) && substr(r, e, 1) != "]") e++
-      body = substr(r, i + 1, e - i - 1)
+      while (e <= length(r) && substr(r, e, 1) != "]") {
+        if (substr(r, e, 2) == "[." || substr(r, e, 2) == "[=" || substr(r, e, 2) == "[:") {
+          ch2 = substr(r, e + 1, 1)
+          k2 = index(substr(r, e + 2), ch2 "]")
+          if (k2 > 0) { e = e + 2 + k2 + 1; continue }
+        }
+        e++
+      }
+      body = unsub(substr(r, i + 1, e - i - 1))
       if (distinct(body) <= 1) out = out substr(body, 1, 1)
       else out = out "[" body "]"
       i = e + 1
@@ -1513,6 +1546,22 @@ roster_is_present_in_the_tree() {
     # for perfectly well. Same defect as the repository lookup below, and it
     # was left here once already on the argument that both halves agreed.
     git grep --cached -l -iF -- "$lit" -- . $GATE_EXCLUDES > "$found" 2>/dev/null || :
+    # ⚠ AND A SECOND LOOK AT THE MARKER-FREE FORM, because the SCAN reads that
+    # form. If every occurrence elsewhere in the tree is written with markers
+    # between its characters, the raw lookup finds none and a clean tree is
+    # refused for a name the matcher is catching perfectly well. Only reached
+    # when the raw lookup came back empty, which is rare enough to afford
+    # reading the tree once more.
+    if [ ! -s "$found" ]; then
+      while IFS= read -r cand; do
+        [ -n "$cand" ] || continue
+        hit="$( (cd "$root" && git cat-file blob ":$cand") 2>/dev/null \
+          | tr -d '*_`~\\' | grep -ciF -- "$lit" || true )"
+        if [ "${hit:-0}" -gt 0 ]; then printf '%s\n' "$cand" > "$found"; break; fi
+      done <<EOF
+$( (cd "$root" && git ls-files -- . $GATE_EXCLUDES) )
+EOF
+    fi
     if [ ! -s "$found" ]; then
       printf 'ROSTER VIOLATION: %s appears nowhere in this tree except this file.\n' "$lit" >&2
       novel=$((novel + 1))
