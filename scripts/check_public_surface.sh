@@ -490,7 +490,16 @@ unset gate_var
 data_block_names="$(printf '%s\n' "$data_block" | awk '
   BEGIN { inq = 0; ind = 0; sq = sprintf("%c", 39); dq = sprintf("%c", 34); bs = sprintf("%c", 92) }
   {
-    if (inq == 0 && ind == 0 && $0 ~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
+    # ⚠ AND AN INDENTED ASSIGNMENT IS STILL AN ASSIGNMENT. Bash executes
+    # `  NAME=value` exactly as it executes the unindented form, while a
+    # start-anchored parser sees nothing — the value is published, decoded by
+    # nothing and audited by nothing. The block grammar is one UNINDENTED
+    # assignment per line, so an indented one is reported rather than parsed.
+    if (inq == 0 && ind == 0 && $0 ~ /^[[:space:]]+[A-Za-z_][A-Za-z0-9_]*=/) {
+      iname = $0; sub(/^[[:space:]]+/, "", iname); sub(/=.*/, "", iname)
+      print "!CTRL " iname
+      assign_line = 0
+    } else if (inq == 0 && ind == 0 && $0 ~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
       name = $0; sub(/=.*/, "", name); print name
       assign_line = 1; bare = ""
     } else assign_line = 0
@@ -505,7 +514,13 @@ data_block_names="$(printf '%s\n' "$data_block" | awk '
       # comment carrying one — every assignment after it vanished from the
       # list, and the duplicate and unlisted checks went blind while the gate
       # stayed green.
-      if (c == "#") break
+      #
+      # ⚠ BUT ONLY AT THE START OF A WORD. `#` also trims a parameter
+      # expansion, and `${name#prefix}` is not a comment — treating it as one
+      # truncates the line there and loses whatever follows, which is the same
+      # blindness arriving from the opposite direction. The rule the shell uses is
+      # word-start, and that is the rule here too: line start, or after a space.
+      if (c == "#" && (i == 1 || substr($0, i - 1, 1) == " " || substr($0, i - 1, 1) == "\t")) break
       # ⚠ ONE ASSIGNMENT PER LINE. Only the assignment at the START of a line
       # is recorded, so a second one on the same line runs, publishes its
       # value, and appears in no list — undecoded and unaudited. The parser
@@ -545,10 +560,11 @@ while IFS= read -r data_name; do
   case "$data_name" in
     '!CTRL '*)
       # refusal:structural
-      echo "REFUSING: the data-block assignment ${data_name#!CTRL } shares its line with" >&2
-      echo "  a control operator. Only the assignment at the start of a line is" >&2
-      echo "  recorded, so anything behind a ';', '&' or '|' runs, publishes its" >&2
-      echo "  value, and is decoded and audited by nothing. One assignment per line." >&2
+      echo "REFUSING: the data-block assignment ${data_name#!CTRL } does not stand alone" >&2
+      echo "  at the start of its own line. Only such an assignment is recorded," >&2
+      echo "  so anything indented, or behind a ';', '&', '|' or a space, runs and" >&2
+      echo "  publishes its value while being decoded and audited by nothing." >&2
+      echo "  The block grammar is ONE UNINDENTED assignment per line." >&2
       exit 2
       ;;
   esac
@@ -1125,8 +1141,15 @@ scan_tree() {
     # invisible. Translated to newlines FIRST, and only when the blob carries a
     # CR and no LF at all — doing it unconditionally would double every line of
     # a CRLF file and make every reported line number wrong.
-    if ! LC_ALL=C grep -qa "$(printf '\012')" "$blob" 2>/dev/null \
-       && LC_ALL=C grep -qa "$(printf '\015')" "$blob" 2>/dev/null; then
+    # ⚠ A NEWLINE CANNOT RIDE THROUGH `$( )` — command substitution strips
+    # trailing newlines, so a grep pattern built that way is the EMPTY string
+    # and matches every file. The first version of this arm was therefore never
+    # entered, and the probe for it failed on the first run. Counted instead,
+    # the way the NUL test below already counts.
+    cr_total="$(wc -c < "$blob" | tr -d ' ')"
+    cr_no_lf="$(LC_ALL=C tr -d '\012' < "$blob" | wc -c | tr -d ' ')"
+    cr_no_cr="$(LC_ALL=C tr -d '\015' < "$blob" | wc -c | tr -d ' ')"
+    if [ "$cr_total" -eq "$cr_no_lf" ] && [ "$cr_total" -ne "$cr_no_cr" ]; then
       if LC_ALL=C tr '\015' '\012' < "$blob" > "$md_blob"; then
         cat "$md_blob" > "$blob"
       else
