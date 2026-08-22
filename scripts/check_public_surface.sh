@@ -154,12 +154,15 @@
 # review round; the whole family does not. Writing the character itself costs
 # one keystroke.
 #
-# NAMED references are treated by what they DECODE TO, and the set that can
-# reach this gate's alphabet was derived from the HTML5 table rather than
-# recalled: exactly two names, both for the underscore. Everything else — the
-# ampersand, the non-breaking space, the dashes, the quotes — decodes outside
-# the alphabet and cannot assemble an identifier, so it is left alone. Refusing
-# those would be a false-refusal factory over ordinary prose.
+# NAMED references are ALL refused when terminated, and the narrow policy this
+# paragraph used to describe is gone. Picking the ones decoding into the
+# identifier alphabet was the first revision, and review found its edge in both
+# directions inside one round. Every narrowing needs a decode table, and the
+# table grew by an entry per round.
+#
+# The cost of refusing them whole was measured rather than feared: across the 26
+# repositories in this workspace, character references appear in markdown twice,
+# and in this repository the only occurrence is this gate's own fixture.
 #
 # ⚠ THE PUBLISHING SURFACE DOES RENDER THEM, MEASURED. Against GitHub's own
 # GFM endpoint on 2026-08-21, every one of these produced a contiguous
@@ -490,7 +493,7 @@ FIXTURE_NBSPPHRASE_BODY='There&nb[]sp;are&nb[]sp;no&nb[]sp;tests for the parser.
 FIXTURE_NBSPPHRASE_NAME=nbspphrase.md
 FIXTURE_RAWHTMLENT_BODY='<span>&#[]65DR-[]0417</span>'
 FIXTURE_RAWHTMLENT_NAME=rawhtmlent.md
-FIXTURE_LEGACYSECT_BODY='see &se[]ct123 for context'
+FIXTURE_LEGACYSECT_BODY='<span>There&nb[]spare&nb[]spno&nb[]sptests for the parser.</span>'
 FIXTURE_LEGACYSECT_NAME=legacysect.md
 FIXTURE_ENTITYLANEB_BODY='// GAP[]-000 note, beside the bytes of a reference
 package x
@@ -790,15 +793,21 @@ is_sentinel_run() {
 # named arm keeps the terminator, because an unterminated `&word` IS ordinary
 # prose — `AT&Tea` would otherwise be refused.
 #
-# ONE LEGACY NAME BREAKS THAT SYMMETRY, and it was found by deriving rather than
-# by recalling: of the 106 HTML5 named references that decode WITHOUT a
-# semicolon, exactly ONE lands in a character this gate's classes are built
-# from — the section sign. A longer English word beginning with that same
-# unterminated name decodes to the sign followed by the rest of the word in a
-# browser, so refusing the unterminated spelling is correct rather than
-# collateral. If a pattern class ever adds a character, that
-# derivation has to be re-run; it is a script over a fixed table, not a list
-# somebody maintains.
+# SEVEN LEGACY NAMES BREAK THAT SYMMETRY, and the number is a derivation's
+# output rather than a memory. Of the 106 HTML5 named references that decode
+# WITHOUT a semicolon, seven land on a character a reader cannot tell from this
+# gate's alphabet. The first pass of that derivation asked for characters IN the
+# alphabet and found one; review then produced a sentence spaced with
+# unterminated non-breaking references, which renders as a gated phrase while
+# the bytes hold no spaces at all. So the criterion is equivalence to a READER,
+# not byte identity — which also pulls in the ordinals and the superscript
+# digits.
+#
+# A longer English word beginning with one of these unterminated names decodes
+# to the character followed by the rest of the word in a browser, so refusing
+# the unterminated spelling is correct rather than collateral. If a pattern
+# class ever adds a character, re-run the derivation; it is a script over a
+# fixed table, not a list somebody maintains.
 #
 # DIGIT COUNTS ARE NOT BOUNDED, and the attempt to bound them is why this
 # paragraph exists. Review asked for the grammar's limits — seven decimal, six
@@ -808,12 +817,11 @@ is_sentinel_run() {
 # regardless. Enforcing the bound needs a trailing-boundary assertion, which is
 # the grammar model again. Measured cost of leaving it out: zero, since `&#`
 # followed by digits does not occur in this workspace outside this file.
-# ⚠ THE LEGACY NAME IS SPELLED IN HALVES. This file sits on the surface it
-# scans, so writing that alternative whole makes the gate refuse itself —
-# correctly, and for the fourth time in this file's history. Same reason the
-# fixtures above carry markers.
-ENTITY_LEGACY='&se'"ct"
-ENTITY_RE='&#[0-9]+;?|&#[xX][0-9a-fA-F]+;?|&[A-Za-z][A-Za-z0-9]{1,31};|'"$ENTITY_LEGACY"
+# The alternation below is self-defusing: an opening parenthesis sits where a
+# letter would have to be, so this file does not refuse itself over its own
+# pattern. That has happened four times in this file's history, and it is why
+# every fixture above carries markers.
+ENTITY_RE='&#[0-9]+;?|&#[xX][0-9a-fA-F]+;?|&[A-Za-z][A-Za-z0-9]{1,31};|&(nbsp|ordf|ordm|sect|sup1|sup2|sup3)'
 
 AUDIT_CLASSES='ADR-[0-9]+|GAP-[0-9]{3}|SP-[0-9]{3}|AC-[A-Z]{2}-[0-9]+|§[0-9]+'
 AUDIT_CLASSES="$AUDIT_CLASSES"'|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)'
@@ -2188,7 +2196,7 @@ EOF
       "$FIXTURE_NBSPPHRASE_NAME|$FIXTURE_NBSPPHRASE_BODY|a gated phrase spaced with non-breaking references" \
       "$FIXTURE_AMPPROSE_NAME|$FIXTURE_AMPPROSE_BODY|an ordinary ampersand entity in prose" \
       "$FIXTURE_RAWHTMLENT_NAME|$FIXTURE_RAWHTMLENT_BODY|a terminator-less numeric reference an HTML parser decodes" \
-      "$FIXTURE_LEGACYSECT_NAME|$FIXTURE_LEGACYSECT_BODY|the one legacy named reference that reaches these classes"; do
+      "$FIXTURE_LEGACYSECT_NAME|$FIXTURE_LEGACYSECT_BODY|an unterminated legacy reference an HTML parser decodes"; do
     entity_name="${entity_case%%|*}"
     entity_rest="${entity_case#*|}"
     entity_body="${entity_rest%|*}"
