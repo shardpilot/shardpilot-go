@@ -391,7 +391,7 @@ fi
 # the classes, so they are written plainly.
 GATE_DATA_NAMES='ROSTER KNOWN_INTERNAL KNOWN_INNOCENT FIXTURE_ACCENT_BODY FIXTURE_ACCENT_NAME FIXTURE_BINARY_BODY FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY FIXTURE_DIRTY_NAME FIXTURE_EMPHASIS_BODY FIXTURE_EMPHASIS_NAME FIXTURE_ESCAPE_BODY FIXTURE_ESCAPE_NAME FIXTURE_FLAG_BODY FIXTURE_FLAG_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY FIXTURE_NAMEHIT_NAME'
 
-PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not| never) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (exists?|existed|remains?|remained|runs?|ran|covers?|covered|exercises?|exercised|guards?|guarded))?( (for|of|in)|[.,;]|$)|[Tt]here (is|are)(n.{1,3}t| not) (any |no )?(harness|harnesses|coverage|tests?|suites?)|[Tt]here (is|are) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?)|(has|have|had) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Ww]ithout( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Nn]obody (looks|checks|monitors)( at| on)?( [A-Za-z][A-Za-z-]*){0,3} (dashboard|dashboards|alert|alerts|log|logs|metric|metrics|queue|queues|report|reports|test|tests|coverage|monitoring)( (for|of|in)|[.,;]|$)|(is|are|was|were)(n.{1,3}t| not| never) under (test|testing|coverage|monitoring|observation)( (for|of|in)|[.,;]|$)|[Ll]acks( any| automated| an?)* ?[A-Za-z-]*[ ]?(harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|(has|have|had)(n.{1,3}t| not| never) been (tested|covered|scanned|audited|monitored)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
+PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not| never) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (exists?|existed|remains?|remained|runs?|ran|covers?|covered|exercises?|exercised|guards?|guarded))?( (for|of|in)|[.,;]|$)|[Tt]here (is|are)(n.{1,3}t| not) (any |no )?(harness|harnesses|coverage|tests?|suites?)|[Tt]here (is|are) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?)|(has|have|had) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Ww]ithout( (automated|manual|unit|integration|end-to-end|regression|any|meaningful))* (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Nn]obody (looks|checks|monitors)( at| on)?( [A-Za-z][A-Za-z-]*){0,3} (dashboard|dashboards|alert|alerts|log|logs|metric|metrics|queue|queues|report|reports|test|tests|coverage|monitoring)( (for|of|in)|[.,;]|$)|(is|are|was|were)(n.{1,3}t| not| never) under (test|testing|coverage|monitoring|observation)( (for|of|in)|[.,;]|$)|[Ll]acks( any| automated| an?)* ?[A-Za-z-]*[ ]?(harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|(has|have|had)(n.{1,3}t| not| never) been (tested|covered|scanned|audited|monitored)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 ROSTER='analytic[]s-service
 contro[]l-plane'
 KNOWN_INTERNAL='per ADR-[]0000 §[]000
@@ -437,6 +437,7 @@ an analytics-plane request, zero event batches
 No tests fail in CI.
 The suite has zero test failures.
 The parser runs without test failures in CI.
+The parser runs without failing tests in CI.
 The release lacks any test failures.
 Nobody checks out until the payment transaction succeeds.
 The property is not under testamentary restriction.
@@ -500,7 +501,22 @@ data_block_names="$(printf '%s\n' "$data_block" | awk '
       else if (c == dq) ind = 1
       i++
     }
-  }' | sort -u)"
+  }' | sort)"
+# ⚠ ASSIGNED ONCE, NOT MERELY LISTED. Deduplicating the names here let a second
+# assignment overwrite the first before the values are read: the raw scan sees
+# only the broken spelling of the shadowed line and no decoded audit ever reads
+# it, so a live identifier could sit in the block indefinitely. The duplicate is
+# the finding, so it is reported instead of collapsed.
+data_block_dups="$(printf '%s\n' "$data_block_names" | uniq -d | grep . || true)"
+if [ -n "$data_block_dups" ]; then
+  # refusal:structural
+  echo "REFUSING: these data-block names are assigned more than once:" >&2
+  printf '%s\n' "$data_block_dups" | sed 's/^/    /' >&2
+  echo "  The later assignment wins and the earlier value is decoded by nothing," >&2
+  echo "  so anything written in it is published and read by no audit here." >&2
+  exit 2
+fi
+data_block_names="$(printf '%s\n' "$data_block_names" | sort -u)"
 while IFS= read -r data_name; do
   [ -n "$data_name" ] || continue
   # ⚠ TWO NAMES ARE EXEMPT, AND FOR STATED REASONS. `GATE_DATA_NAMES` is the
@@ -555,10 +571,10 @@ CONTAINER_SIGS_TXT="\102\132\150\061$BZBLK \102\132\150\062$BZBLK \102\132\150\0
 CONTAINER_SIGS_TXT="$CONTAINER_SIGS_TXT \102\132\150\064$BZBLK \102\132\150\065$BZBLK"
 CONTAINER_SIGS_TXT="$CONTAINER_SIGS_TXT \102\132\150\066$BZBLK \102\132\150\067$BZBLK"
 CONTAINER_SIGS_TXT="$CONTAINER_SIGS_TXT \102\132\150\070$BZBLK \102\132\150\071$BZBLK"
-# The document header carries its version, which is what separates the stream
-# from a sentence naming it.
-CONTAINER_SIGS_TXT="$CONTAINER_SIGS_TXT \045\120\104\106\055\061\056"
-CONTAINER_SIGS_TXT="$CONTAINER_SIGS_TXT \045\120\104\106\055\062\056"
+# ⚠ THE DOCUMENT HEADER IS NOT IN THIS LIST, and its version bytes did not
+# rescue it: seven printable characters are also a sentence about the format,
+# and documentation quotes the version too. It is checked separately below,
+# where a second invariant can be required alongside it.
 
 # Identifiers are admitted by SHAPE. A list of admissible ones was the first
 # answer and it cannot fail: the same change that publishes a live record can
@@ -965,6 +981,35 @@ scan_tree() {
     # is written in octal — spelled out, this gate refused itself, correctly.
     sigs="$CONTAINER_SIGS"
     [ "$printable_sigs" = yes ] && sigs="$sigs $CONTAINER_SIGS_TXT"
+    # The extension carries the commit-by-accident case for this format, the
+    # way it does for pictures — narrowing the signature above is what makes
+    # that necessary rather than merely tidy.
+    case "$flc" in
+      *.pdf)
+        # refusal:hazard
+        echo "REFUSING: '$f' is a rendered document, and this gate reads files as text." >&2
+        echo "  No pass here reads document contents, so a clean result would say" >&2
+        echo "  nothing about what it carries. Remove it, or extend this gate to" >&2
+        echo "  walk containers deliberately." >&2
+        exit 2
+        ;;
+    esac
+    # ⚠ THE DOCUMENT FORMAT NEEDS TWO FACTS, NOT ONE. Its header is printable
+    # and short enough to appear in prose about the format — it refused a
+    # Markdown code span quoting it — but a real one also carries an object
+    # terminator or an end-of-file marker, and a sentence naming the header
+    # does not. Neither alone; both together.
+    if [ "$printable_sigs" = yes ] \
+       && grep -qaF -- "$(printf '\045\120\104\106\055')" "$blob" 2>/dev/null \
+       && { grep -qaF -- "$(printf '\145\156\144\157\142\152')" "$blob" 2>/dev/null \
+            || grep -qaF -- "$(printf '\045\045\105\117\106')" "$blob" 2>/dev/null; }; then
+      # refusal:hazard
+      echo "REFUSING: '$f' carries a rendered-document stream." >&2
+      echo "  Its header and its object terminator are both present, and no pass" >&2
+      echo "  here reads document contents. Remove it, or extend this gate to" >&2
+      echo "  walk containers deliberately." >&2
+      exit 2
+    fi
     for sig in $sigs; do
       grep -qaF -- "$(printf "$sig")" "$blob" 2>/dev/null || continue
       # refusal:hazard
@@ -1456,6 +1501,19 @@ EOF
   # adjacent quotes is invisible to a grep of the file and perfectly legible to
   # everyone reading the published fixture, so the loaded values are searched
   # too and the two results are merged.
+  # ⚠ AND THIS AUDIT IS ASKED TO EXTRACT SOMETHING ON EVERY RUN. Both greps
+  # below feed a `sort -u` whose success masks theirs, so an invalid class list
+  # would produce an empty result and the loop would report no live identifiers
+  # — indistinguishable from a file that carries none. The canary is written
+  # with the visible break, so this line is not itself a disclosure.
+  audit_canary="$(printf '%s' 'ADR-[]0000' | sed 's/\[\]//')"
+  if [ "$(printf '%s' "$audit_canary" | grep -oE -- "$AUDIT_CLASSES" || true)" != "$audit_canary" ]; then
+    # refusal:structural
+    echo "REFUSING: the identifier audit could not extract its own canary." >&2
+    echo "  The class list is not matching, so this audit finding nothing says" >&2
+    echo "  nothing about the file." >&2
+    exit 2
+  fi
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
     case "$lit" in EXAMPLE_*) continue ;; esac
