@@ -99,12 +99,30 @@
 # close this; a reviewer can.
 #
 # ⚠ SOURCE AND RENDERED PAGE ARE DIFFERENT SURFACES, and the published one is
-# the page. What is normalised here is PROSE WHOSE RENDERED MEANING DIFFERS
-# FROM ITS SOURCE: Markdown emphasis, backslash escapes, and a carriage return
-# sitting before end-of-line. Nobody writes those to hide anything — the one
-# instance this gate has ever caught in already-committed content was exactly
-# that, `**not**` inside a sentence about coverage, where a person wrote two
-# asterisks as people do and the meaning changed on the page.
+# the page. THIS GATE DOES NOT MODEL THE RENDERER. It compares against a form
+# that DOMINATES any output the renderer could produce — a copy with every
+# inline marker character removed — so whatever a renderer would join, that
+# copy joins too. There is no false miss along this axis by construction rather
+# than by testing, and nothing to add when the next construct appears.
+#
+# That line is the whole design and it replaced a normalisation pipeline that
+# tried to predict the rendered string. The pipeline was correct five times
+# over five rounds of review and wrong on the sixth construct every time,
+# because the list of constructs is CommonMark's to close and not this file's.
+# Anyone reading a Markdown form this gate did not catch should reach for the
+# dominating form, not for another rule.
+#
+# The criterion is therefore "can a reader SEE the identifier", not "does the
+# page render it contiguously". A record id whose digits are wrapped in
+# emphasis shows the number to whoever reads the page. Measured before the
+# change: over every lane-A file in both trees the marker-free copy adds ZERO
+# matches the raw text does not already have, and the measurement was itself
+# checked against a planted decorated identifier so that a silent instrument
+# could not read as a clean result.
+#
+# The one instance this gate has ever caught in already-committed content sits
+# inside that class — `**not**` in a sentence about coverage, where a person
+# wrote two asterisks as people do and the meaning changed on the page.
 #
 # ⚠ AND WHAT IS DELIBERATELY ENCODED IS OUT OF SCOPE, which is why the
 # character-reference refusal, the inline-tag normalisation and the XML, RTF
@@ -428,7 +446,7 @@ FIXTURE_ACCENT_BODY='internal: contro[]l-plane'
 FIXTURE_ACCENT_NAME='café.md'
 FIXTURE_BINARY_BODY='see ADR-[]9999 here'
 FIXTURE_BINARY_NAME=binary.bin
-FIXTURE_CLEAN_BODY='clean customer prose'
+FIXTURE_CLEAN_BODY='clean *customer* prose about `throughput` and _latency_'
 FIXTURE_CLEAN_NAME=clean.md
 FIXTURE_DIRTY_BODY='see ADR-[]0000 for context'
 FIXTURE_DIRTY_NAME=dirty.md
@@ -1001,115 +1019,6 @@ scan_tree() {
     # "${PIPESTATUS[0]}"` carries GREP's status out, because the status of the
     # assignment itself would be tr's and tr always succeeds.
     set +e
-    # ⚠ MARKDOWN RENDERS A BACKSLASH ESCAPE AS THE CHARACTER ALONE, so an
-    # identifier whose hyphen is escaped is that identifier on the page and not
-    # in the bytes. DECODED rather than refused, unlike a character reference,
-    # for the reason the refusals give in reverse: escapes ARE present in these
-    # trees today — measured — so refusing them would reject prose doing
-    # nothing wrong. The substitution is per-line, so reported line numbers
-    # stay true to the file.
-    #
-    case "$flc" in
-      *.md|*.markdown)
-        # ⚠ EMPHASIS SPLITS A TOKEN ON THE PAGE AND NOT IN THE BYTES: an
-        # identifier written with its digits bolded renders contiguously and
-        # matches nothing. Measured against the publishing surface itself:
-        # asterisk emphasis, underscore emphasis, a code span and a backslash
-        # escape each render one contiguous identifier.
-        #
-        # ⚠ A MARKER IS ONLY EMPHASIS WHEN IT IS PAIRED, and deleting every one
-        # of them INVENTED identifiers the page never showed: `ADR-*1234` with
-        # a single unmatched asterisk renders WITH the asterisk — measured —
-        # and was refused as though it did not. Each rule needs an opening run
-        # and a closing run, which is also what the surface needs.
-        #
-        # ⚠ A CODE SPAN RENDERS VERBATIM, so a line that carries a backtick gets
-        # NOTHING normalised except the backticks themselves. `ADR` followed by a
-        # code span holding an escaped hyphen renders the backslash — measured —
-        # and decoding it invented an identifier the page never showed. Doing
-        # this per line rather than per span is deliberate: the cost is a MISS on
-        # emphasis elsewhere on a line that also has a code span, and a miss is
-        # the side this gate can afford. Reproducing the renderer's span
-        # boundaries in sed is the road that produced four rounds of this arm.
-        #
-        # ⚠ AND NEITHER END OF THE CONTENT MAY BE A SPACE. Measured:
-        # `ADR-**1234 **` renders its asterisks LITERALLY, because a closing
-        # run cannot follow whitespace — and a rule that took the pair anyway
-        # invented a contiguous identifier out of clean prose. Both ends are
-        # checked, which
-        # is the same condition on the opening side.
-        #
-        # ⚠ AND THE TWO RUNS MUST BE THE SAME LENGTH. Measured: a two-marker
-        # opener against a one-marker closer renders `ADR-*1234` — the leftover
-        # stays on the side that had more, and the identifier is NOT contiguous
-        # — while a rule that swallowed both runs made it one and refused clean
-        # prose. Three substitutions per marker, longest first, so the excess
-        # is left exactly where the renderer leaves it.
-        #
-        # What that does NOT reproduce is the full delimiter-matching algorithm:
-        # a mismatched run whose leftover falls on the RIGHT (`_1234__`) is
-        # still consumed as a pair here and correctly reported, but a longer
-        # mismatch may be skipped rather than partially consumed. That direction
-        # is a MISS on a typo'd emphasis, not a false refusal, and the scope
-        # note says what stands against deliberate splitting.
-        #
-        # ⚠ THE RUN IS ONE TO THREE. `___1234___` is bold-italic and renders
-        # contiguously; a rule written for one or two markers walked past it.
-        #
-        # ⚠ A CODE SPAN DROPS ONE SPACE FROM EACH END, and only when BOTH ends
-        # have one: measured, `` ` 1234 ` `` renders `1234` and `` ` 1234` ``
-        # renders with the space kept. Both forms are handled, because the
-        # first makes an identifier contiguous on the page and the second does
-        # not.
-        #
-        # ⚠ UNDERSCORES ALSO NEED A BOUNDARY, ASTERISKS DO NOT. The surface
-        # does not emphasise an underscore between two word characters, which
-        # is the same rule that keeps the feature-flag class intact — measured:
-        # a flag name renders with every separator in place. Asterisks emphasise
-        # anywhere, so requiring a boundary there would open a hole.
-        #
-        # ⚠ MARKERS ARE STRIPPED BEFORE THE ESCAPE IS DECODED, not after. The
-        # other order turned `ADR-\*1234` — clean prose, which renders WITH the
-        # asterisk — into a refusal, by decoding the escape and then deleting
-        # the character the escape existed to keep.
-        #
-        # Written in BASIC regex on purpose: `-E` applies to every script in
-        # the same sed, and these substitutions are BRE. Reaching for it broke
-        # them and the gate refused the whole file.
-        #
-        # The underscore substitution runs TWICE: it consumes the boundary
-        # character on each side, so `g` resumes past the opening boundary of a
-        # second run and leaves it standing on the first pass.
-        if sed -e '/`/!{
-s/\*\{3\}\([^* ]\([^*]*[^* ]\)\{0,1\}\)\*\{3\}/\1/g
-s/\*\{2\}\([^* ]\([^*]*[^* ]\)\{0,1\}\)\*\{2\}/\1/g
-s/\*\([^* ]\([^*]*[^* ]\)\{0,1\}\)\*/\1/g
-s/^/ /
-s/$/ /
-s/\([^A-Za-z0-9_]\)_\{3\}\([^_ ]\([^_]*[^_ ]\)\{0,1\}\)_\{3\}\([^A-Za-z0-9]\)/\1\2\4/g
-s/\([^A-Za-z0-9_]\)_\{3\}\([^_ ]\([^_]*[^_ ]\)\{0,1\}\)_\{3\}\([^A-Za-z0-9]\)/\1\2\4/g
-s/\([^A-Za-z0-9_]\)_\{2\}\([^_ ]\([^_]*[^_ ]\)\{0,1\}\)_\{2\}\([^A-Za-z0-9]\)/\1\2\4/g
-s/\([^A-Za-z0-9_]\)_\{2\}\([^_ ]\([^_]*[^_ ]\)\{0,1\}\)_\{2\}\([^A-Za-z0-9]\)/\1\2\4/g
-s/\([^A-Za-z0-9_]\)_\([^_ ]\([^_]*[^_ ]\)\{0,1\}\)_\([^A-Za-z0-9]\)/\1\2\4/g
-s/\([^A-Za-z0-9_]\)_\([^_ ]\([^_]*[^_ ]\)\{0,1\}\)_\([^A-Za-z0-9]\)/\1\2\4/g
-s/^ //
-s/ $//
-s/\\\([^A-Za-z0-9]\)/\1/g
-}' "$blob" \
-             | sed -e 's/`\{3\} \([^` ]\([^`]*[^` ]\)\{0,1\}\) `\{3\}/\1/g' \
-                   -e 's/`\{3\}\([^` ]\([^`]*[^` ]\)\{0,1\}\)`\{3\}/\1/g' \
-                   -e 's/`\{2\} \([^` ]\([^`]*[^` ]\)\{0,1\}\) `\{2\}/\1/g' \
-                   -e 's/`\{2\}\([^` ]\([^`]*[^` ]\)\{0,1\}\)`\{2\}/\1/g' \
-                   -e 's/` \([^` ]\([^`]*[^` ]\)\{0,1\}\) `/\1/g' \
-                   -e 's/`\([^` ]\([^`]*[^` ]\)\{0,1\}\)`/\1/g' > "$md_blob"; then
-          cat "$md_blob" > "$blob"
-        else
-          # refusal:structural
-          echo "REFUSING: could not normalise Markdown escapes in '$f'." >&2
-          exit 2
-        fi
-        ;;
-    esac
     # ⚠ A CARRIAGE RETURN SITS BEFORE END-OF-LINE, so every alternative
     # anchored on `$` stops matching in a file with Windows line endings — `No
     # tests` at the end of a CRLF line goes unseen while the same sentence
@@ -1128,22 +1037,94 @@ s/\\\([^A-Za-z0-9]\)/\1/g
     # commit would carry. For a path whose tree copy matches its index entry —
     # every path in a fresh checkout — that is the same file.
     scan_src="$blob"
-    hits="$(grep -anE -- "$PATTERNS" "$scan_src" 2>/dev/null \
+    # ⚠ THIS GATE DOES NOT MODEL THE RENDERER. It compares against a form that
+    # DOMINATES any output the renderer could produce: a copy with every inline
+    # marker character removed. Whatever a renderer joins, the marker-free copy
+    # joins too, so there is no false miss along this axis BY CONSTRUCTION
+    # rather than by testing — and no rule to add when the next construct
+    # appears.
+    #
+    # What stood here before was a normalisation pipeline that tried to predict
+    # the rendered string: emphasis pairing, run lengths, whitespace flanking,
+    # code-span boundaries, backslash escapes. Five rounds of review, every
+    # finding correct, each fix exposing the next construct — because the list
+    # of constructs is CommonMark's to close, not this file's. In the same
+    # period the pipeline caught ONE real disclosure.
+    #
+    # The criterion moved with it. It is no longer "does the page render a
+    # CONTIGUOUS identifier" but "can a reader SEE one": a record id whose
+    # digits are wrapped in emphasis shows the number to anyone reading the
+    # page, decorated. A match in the marker-free copy can only happen when the
+    # identifier's own characters stand in order, which is the hazard restated.
+    #
+    # ⚠ AND THIS COMMENT CANNOT CARRY AN EXAMPLE. Under the new criterion the
+    # scan sees through the markers, so a decorated id written here would be a
+    # disclosure the way an undecorated one is — which the gate demonstrated by
+    # refusing the first draft of this paragraph.
+    #
+    # BOTH copies are scanned, not just the stripped one: the feature-flag class
+    # is built from underscores and only survives in the raw text. Measured
+    # before this landed — over every lane-A file in both trees, the stripped
+    # copy adds ZERO matches the raw text does not already have, and the
+    # measurement was itself checked against a planted decorated identifier so
+    # that a silent instrument could not read as a clean result.
+    #
+    # Link syntax and character references are NOT in the stripped set. Those
+    # are the deliberate-encoding class the scope note puts out of scope, and
+    # widening the set here would reopen a decided question sideways.
+    gate_tmp; strip_blob="$GATE_TMP"
+    if ! tr -d '*_`~\\' < "$blob" > "$strip_blob"; then
+      # refusal:structural
+      echo "REFUSING: could not build the marker-free copy of '$f'." >&2
+      exit 2
+    fi
+    hits_raw="$(grep -anE -- "$PATTERNS" "$scan_src" 2>/dev/null \
       | tr -d '\000'; exit "${PIPESTATUS[0]}")"
     status=$?
+    hits_strip="$(grep -anE -- "$PATTERNS" "$strip_blob" 2>/dev/null \
+      | tr -d '\000'; exit "${PIPESTATUS[0]}")"
+    strip_status=$?
+    # ⚠ grep's 1 MEANS "NO MATCH", NOT "FAILED", so the two statuses do not
+    # merge by taking the worse: that turned a hit in the raw text into a miss
+    # whenever the stripped copy had none, and the fixtures caught it
+    # immediately. Error wins over match, match wins over no-match.
+    if [ "$status" -eq 2 ] || [ "$strip_status" -eq 2 ]; then status=2
+    elif [ "$status" -eq 0 ] || [ "$strip_status" -eq 0 ]; then status=0
+    else status=1
+    fi
+    # The RAW text wins a shared line number, so the report shows what the file
+    # actually says rather than a stripped rendering of it.
+    hits="$( { printf '%s\n' "$hits_raw"; printf '%s\n' "$hits_strip"; } \
+      | grep -v '^$' | awk -F: '!seen[$1]++' )"
     # THE ROSTER, in its own pass because it is the one class matched
     # case-insensitively: a name capitalised at the start of a sentence is the
     # same disclosure as the lower-case spelling, and folding `-i` into the
     # shape pass
     # would make `[Tt]here is` and the ALLCAPS flag class match prose they
     # were written to leave alone.
-    roster_hits="$(grep -aniE -- "$ROSTER_RE" "$scan_src" 2>/dev/null \
+    roster_hits_raw="$(grep -aniE -- "$ROSTER_RE" "$scan_src" 2>/dev/null \
       | tr -d '\000'; exit "${PIPESTATUS[0]}")"
     roster_status=$?
+    roster_hits_strip="$(grep -aniE -- "$ROSTER_RE" "$strip_blob" 2>/dev/null \
+      | tr -d '\000'; exit "${PIPESTATUS[0]}")"
+    roster_strip_status=$?
+    if [ "$roster_status" -eq 2 ] || [ "$roster_strip_status" -eq 2 ]; then roster_status=2
+    elif [ "$roster_status" -eq 0 ] || [ "$roster_strip_status" -eq 0 ]; then roster_status=0
+    else roster_status=1
+    fi
+    roster_hits="$( { printf '%s\n' "$roster_hits_raw"; printf '%s\n' "$roster_hits_strip"; } \
+      | grep -v '^$' | awk -F: '!seen[$1]++' )"
     # ⚠ WHAT THIS DOES NOT SEE, stated because a green run gets read as more
-    # than it is: every pass here is LINE-ORIENTED, so a phrase broken across a
-    # line break — which is what a formatter does to a long sentence — matches
-    # nothing. A collapsed-whitespace pass for that existed and was removed
+    # than it is. The dominating form covers MARKER characters, not WHITESPACE,
+    # and a renderer moves whitespace too: a code span drops one space from each
+    # end, so an identifier written with spaces inside one renders contiguously
+    # and the marker-free copy still has the spaces. Removing whitespace as well
+    # would join every neighbouring word in the tree, which is a different and
+    # much worse rule. Measured: no tracked file carries that shape.
+    #
+    # For the same reason every pass here is LINE-ORIENTED, so a phrase broken
+    # across a line break — which is what a formatter does to a long sentence —
+    # matches nothing. A collapsed-whitespace pass for that existed and was removed
     # along with the rest of the machinery this file had grown, because no
     # tracked file in this repository contains such a wrap. It comes back as
     # its own change, with its own failing test, on the day one does.
@@ -1568,10 +1549,12 @@ EOF
   #                     because it must REFUSE rather than report
   #   the emphasis file an identifier split by an underscore pair, which the
   #                     publishing surface renders contiguously
-  #   the escape file   an identifier followed by an ESCAPED asterisk, which
-  #                     the surface renders WITH the asterisk — clean prose,
-  #                     and the fixture that fails if normalisation invents an
-  #                     identifier the page never shows
+  #   the escape file   an identifier written with an ESCAPED marker. The page
+  #                     shows the marker, so this is not a CONTIGUOUS render —
+  #                     and it is still a disclosure, because a reader sees the
+  #                     record number. It flipped from must-not-match to
+  #                     must-match when the criterion moved, and it is kept
+  #                     because it is the case the two criteria disagree on
   #   the flag file     a flag name, whose underscores must survive the
   #                     emphasis pass or the one class built from them stops
   #                     being scannable
@@ -1644,8 +1627,8 @@ EOF
   printf '%s' "$scanned_a" | grep -q '^flag\.md:' || {
     echo "SELFTEST: the emphasis pass destroyed a flag name's separators" >&2; fixture_fail=1; }
   fixture_checks=$((fixture_checks + 1))
-  printf '%s' "$scanned_a" | grep -q '^escape\.md:' && {
-    echo "SELFTEST: the scan flagged an escaped asterisk the page renders as itself" >&2; fixture_fail=1; }
+  printf '%s' "$scanned_a" | grep -q '^escape\.md:' || {
+    echo "SELFTEST: the scan missed an identifier written with an escaped marker" >&2; fixture_fail=1; }
   fixture_checks=$((fixture_checks + 1))
   printf '%s' "$scanned_a" | grep -q 'caf' || {
     echo "SELFTEST: the scan missed the non-ASCII path (core.quotePath)" >&2; fixture_fail=1; }
