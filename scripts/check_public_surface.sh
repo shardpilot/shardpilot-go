@@ -391,7 +391,7 @@ fi
 # the classes, so they are written plainly.
 GATE_DATA_NAMES='ROSTER KNOWN_INTERNAL KNOWN_INNOCENT FIXTURE_ACCENT_BODY FIXTURE_ACCENT_NAME FIXTURE_BINARY_BODY FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY FIXTURE_DIRTY_NAME FIXTURE_EMPHASIS_BODY FIXTURE_EMPHASIS_NAME FIXTURE_ESCAPE_BODY FIXTURE_ESCAPE_NAME FIXTURE_FLAG_BODY FIXTURE_FLAG_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY FIXTURE_NAMEHIT_NAME'
 
-PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not| never) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (exists?|existed|remains?|remained|runs?|ran|covers?|covered|exercises?|exercised|guards?|guarded))?( (for|of|in)|[.,;]|$)|[Tt]here (is|are)(n.{1,3}t| not) (any |no )?(harness|harnesses|coverage|tests?|suites?)|[Tt]here (is|are) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?)|(has|have|had) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Ww]ithout( (automated|manual|unit|integration|end-to-end|regression|any|meaningful))* (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Nn]obody (looks|checks|monitors)( at| on)?( [A-Za-z][A-Za-z-]*){0,3} (dashboard|dashboards|alert|alerts|log|logs|metric|metrics|queue|queues|report|reports|test|tests|coverage|monitoring)( (for|of|in)|[.,;]|$)|(is|are|was|were)(n.{1,3}t| not| never) under (test|testing|coverage|monitoring|observation)( (for|of|in)|[.,;]|$)|[Ll]acks( any| automated| an?)*( [A-Za-z][A-Za-z-]*)? (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|(has|have|had)(n.{1,3}t| not| never) been (tested|covered|scanned|audited|monitored)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
+PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not| never) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (exists?|existed|remains?|remained|runs?|ran|covers?|covered|exercises?|exercised|guards?|guarded))?( (for|of|in)|[.,;]|$)|[Tt]here (is|are)(n.{1,3}t| not) (any |no )?(harness|harnesses|coverage|tests?|suites?)|[Tt]here (is|are) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?)|(has|have|had) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Ww]ithout( (automated|manual|unit|integration|end-to-end|regression|any|meaningful))* (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Nn]obody (looks|checks|monitors)( at| on)?( [A-Za-z][A-Za-z-]*){0,3} (dashboard|dashboards|alert|alerts|log|logs|metric|metrics|queue|queues|report|reports|test|tests|coverage|monitoring)( (for|of|in)|[.,;]|$)|(is|are|was|were)(n.{1,3}t| not| never) under (test|testing|coverage|monitoring|observation)( (for|of|in)|[.,;]|$)|[Ll]acks( any| automated| an?)*( [A-Za-z][A-Za-z-]*)? (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|(has|have|had)(n.{1,3}t| not| never) been (tested|covered|scanned|audited|monitored)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 ROSTER='analytic[]s-service
 contro[]l-plane'
 KNOWN_INTERNAL='per ADR-[]0000 §[]000
@@ -438,6 +438,7 @@ No tests fail in CI.
 The suite has zero test failures.
 The parser runs without test failures in CI.
 The parser runs without failing tests in CI.
+The release does not have test failures.
 The release lacks any test failures.
 The tournament lacks contests.
 The park lacks protests.
@@ -503,6 +504,10 @@ data_block_names="$(printf '%s\n' "$data_block" | awk '
       name = $0; sub(/=.*/, "", name); print name
       assign_line = 1; bare = ""
     } else assign_line = 0
+    # Reset unconditionally: a continuation line must start with an EMPTY tail,
+    # otherwise it inherits the opener from the line that began the value and
+    # reports that as a command after the closing quote.
+    bare0 = ""
     i = 1
     while (i <= length($0)) {
       c = substr($0, i, 1)
@@ -529,11 +534,30 @@ data_block_names="$(printf '%s\n' "$data_block" | awk '
       # `NAME=` behind whitespace, which the shell accepts just as happily.
       if (assign_line && (c == ";" || c == "&" || c == "|")) { print "!CTRL " name; assign_line = 0 }
       if (assign_line) bare = bare c
+      # Depth-zero characters of EVERY line, not only an assignment line: the
+      # line that CLOSES a multi-line value can carry a command after the
+      # closing quote, and the whole-line tests above skip it because it began
+      # inside a quote.
+      bare0 = bare0 c
       if (c == sq) inq = 1
       else if (c == dq) ind = 1
       i++
     }
     if (assign_line && bare ~ /[[:space:]][A-Za-z_][A-Za-z0-9_]*=/) print "!CTRL " name
+    # ⚠ AND THE TAIL OF A LINE THAT CLOSED A MULTI-LINE VALUE. It began inside
+    # a quote, so every whole-line test above skipped it, and everything after
+    # the closing quote ran unexamined — an assignment appended there is
+    # executed, listed nowhere and decoded by nothing.
+    # Not conditioned on where the line ENDS: the tail after a closing quote can
+    # open a quote of its own, and requiring the line to finish at depth zero
+    # let exactly that shape through. (No example is written here: an
+    # apostrophe in this comment closes the shell quoting of this very awk
+    # program, which is how the check was silently disabled once already.)
+    if (was_open == 1 \
+        && (bare0 ~ /[;&|]/ || bare0 ~ /[A-Za-z_][A-Za-z0-9_]*=/)) {
+      tail = bare0; sub(/^[[:space:]]+/, "", tail)
+      print "!CMD " tail
+    }
     # ⚠ AND NOTHING BUT ASSIGNMENTS LIVES HERE. Seven rounds of review found
     # seven ways to hide a second assignment from a parser that only looked at
     # the shapes it expected; the eighth would be a plain shell command, which
@@ -573,6 +597,29 @@ if [ -n "$data_block_dups" ]; then
   exit 2
 fi
 data_block_names="$(printf '%s\n' "$data_block_names" | sort -u)"
+# ⚠ THE PARSER MUST HAVE PRODUCED SOMETHING. An awk that fails to parse writes
+# nothing and its status is swallowed by the `sort` beside it, so the checks
+# below — enumeration, duplicates, one-assignment-per-line, the grammar — all
+# go silent together and the gate reports clean. That has happened twice in
+# this file, both times from an apostrophe inside a comment in the program. The
+# list always contains the name of the list itself; if it does not, the parser
+# did not run.
+case "
+$data_block_names
+" in
+  *"
+GATE_DATA_NAMES
+"*) ;;
+  *)
+    # refusal:structural
+    echo "REFUSING: the data-block parser produced no usable names." >&2
+    echo "  It always finds GATE_DATA_NAMES at minimum, so an output without it" >&2
+    echo "  means the parser did not run — and every check that reads its output" >&2
+    echo "  is silent rather than satisfied." >&2
+    exit 2
+    ;;
+esac
+
 while IFS= read -r data_name; do
   [ -n "$data_name" ] || continue
   # ⚠ TWO NAMES ARE EXEMPT, AND FOR STATED REASONS. `GATE_DATA_NAMES` is the
@@ -753,7 +800,12 @@ scan_tree() {
   gate_tmp; list="$GATE_TMP"
   gate_tmp; blob="$GATE_TMP"
   gate_tmp; md_blob="$GATE_TMP"
-  if ! (cd "$root" && git ls-files -z) > "$list"; then
+  # ⚠ THE TREE A COMMIT WOULD WRITE, NOT THE INDEX LISTING. `git ls-files`
+  # includes an INTENT-TO-ADD placeholder — `git add -N draft.png` — which
+  # `git write-tree` and `git commit` both omit, so the gate refused a picture
+  # no commit was going to carry. Reading the written tree answers the question
+  # this file actually asks: what would this commit publish.
+  if ! (cd "$root" && git ls-tree -r -z --name-only "$(git write-tree)") > "$list"; then
     rm -f "$list"
     # refusal:structural
     echo "REFUSING: git ls-files failed in '$root'." >&2
@@ -1201,28 +1253,25 @@ scan_tree() {
     # invisible. Translated to newlines FIRST, and only when the blob carries a
     # CR and no LF at all — doing it unconditionally would double every line of
     # a CRLF file and make every reported line number wrong.
-    # ⚠ A NEWLINE CANNOT RIDE THROUGH `$( )` — command substitution strips
-    # trailing newlines, so a grep pattern built that way is the EMPTY string
-    # and matches every file. The first version of this arm was therefore never
-    # entered, and the probe for it failed on the first run. Counted instead,
-    # the way the NUL test below already counts.
-    cr_total="$(wc -c < "$blob" | tr -d ' ')"
-    cr_no_lf="$(LC_ALL=C tr -d '\012' < "$blob" | wc -c | tr -d ' ')"
-    cr_no_cr="$(LC_ALL=C tr -d '\015' < "$blob" | wc -c | tr -d ' ')"
-    if [ "$cr_total" -eq "$cr_no_lf" ] && [ "$cr_total" -ne "$cr_no_cr" ]; then
-      if LC_ALL=C tr '\015' '\012' < "$blob" > "$md_blob"; then
-        cat "$md_blob" > "$blob"
-      else
-        # refusal:structural
-        echo "REFUSING: could not normalise CR-only line endings in '$f'." >&2
-        exit 2
-      fi
-    fi
     if sed 's/\r$//' "$blob" > "$md_blob"; then
       cat "$md_blob" > "$blob"
     else
       # refusal:structural
       echo "REFUSING: could not normalise line endings in '$f'." >&2
+      exit 2
+    fi
+    # ⚠ AND ANY CR STILL STANDING IS A SEPARATOR. The pass above removes the CR
+    # of a CRLF pair; whatever is left is a bare CR, which classic Mac text uses
+    # as a line ending and which a MIXED file uses beside LF. Either way the
+    # bytes after it are a new line to a renderer and were a mid-line
+    # continuation to `sed`, so an end-anchored alternative could not see a
+    # disclosure that had one behind it. Translated unconditionally, which is a
+    # no-op for the LF and CRLF files that make up every tracked file today.
+    if LC_ALL=C tr '\015' '\012' < "$blob" > "$md_blob"; then
+      cat "$md_blob" > "$blob"
+    else
+      # refusal:structural
+      echo "REFUSING: could not normalise bare carriage returns in '$f'." >&2
       exit 2
     fi
     # The staged blob, so a reported line number is a line number in what a
@@ -1290,8 +1339,21 @@ scan_tree() {
     fi
     # The RAW text wins a shared line number, so the report shows what the file
     # actually says rather than a stripped rendering of it.
+    # ⚠ AND A FAILURE HERE MUST NOT LOOK LIKE "NO HITS". This runs under
+    # `set +e`, so a killed `awk` would empty the list while the grep status
+    # above still says 0 — a matched file reported clean by the post-processing
+    # of its own match. The status is read and a non-zero one refuses.
     hits="$( { printf '%s\n' "$hits_raw"; printf '%s\n' "$hits_strip"; } \
       | grep -v '^$' | awk -F: '!seen[$1]++' )"
+    merge_status=$?
+    if [ "$merge_status" -gt 1 ]; then
+      set -e
+      # refusal:structural
+      echo "REFUSING: could not post-process the matches for '$f' (exit $merge_status)." >&2
+      echo "  The scan found this file readable and the merge then failed, so an" >&2
+      echo "  empty result here means nothing about the file." >&2
+      exit 2
+    fi
     # THE ROSTER, in its own pass because it is the one class matched
     # case-insensitively: a name capitalised at the start of a sentence is the
     # same disclosure as the lower-case spelling, and folding `-i` into the
@@ -1473,6 +1535,15 @@ SHAPE_AWK='  function distinct(body,   j, ch, nx, set, k, cnt) {
         e++
       }
       body = unsub(substr(r, i + 1, e - i - 1))
+      # ⚠ AND A CLASS REPEATED ZERO TIMES CONSUMES NOTHING. `novel[ab]{0}-service`
+      # matches exactly the bare literal it is dressed as, while leaving a `[`
+      # behind for a test that only looks for one. The class and its quantifier
+      # are dropped together.
+      if (substr(r, e + 1) ~ /^\{0(,0)?\}/) {
+        k3 = index(substr(r, e + 1), "}")
+        i = e + 1 + k3
+        continue
+      }
       if (distinct(body) <= 1) out = out substr(body, 1, 1)
       else out = out "[" body "]"
       i = e + 1
@@ -1547,7 +1618,11 @@ roster_is_present_in_the_tree() {
     # was left here once already on the argument that both halves agreed.
     git grep --cached -l -iF -- "$lit" -- . $GATE_EXCLUDES > "$found" 2>/dev/null || :
     # ⚠ AND A SECOND LOOK AT THE MARKER-FREE FORM, because the SCAN reads that
-    # form. If every occurrence elsewhere in the tree is written with markers
+    # form. Run from THIS repository, not from a scan root: this function runs
+    # before any scan and `$root` does not exist here — under `set -u` naming it
+    # would have killed the gate outright, in a branch nothing reaches on a
+    # tree where the raw lookup succeeds. An unexercised branch is where an
+    # undefined name hides. If every occurrence elsewhere in the tree is written with markers
     # between its characters, the raw lookup finds none and a clean tree is
     # refused for a name the matcher is catching perfectly well. Only reached
     # when the raw lookup came back empty, which is rare enough to afford
@@ -1555,11 +1630,11 @@ roster_is_present_in_the_tree() {
     if [ ! -s "$found" ]; then
       while IFS= read -r cand; do
         [ -n "$cand" ] || continue
-        hit="$( (cd "$root" && git cat-file blob ":$cand") 2>/dev/null \
+        hit="$(git cat-file blob ":$cand" 2>/dev/null \
           | tr -d '*_`~\\' | grep -ciF -- "$lit" || true )"
         if [ "${hit:-0}" -gt 0 ]; then printf '%s\n' "$cand" > "$found"; break; fi
       done <<EOF
-$( (cd "$root" && git ls-files -- . $GATE_EXCLUDES) )
+$(git ls-files -- . $GATE_EXCLUDES)
 EOF
     fi
     if [ ! -s "$found" ]; then
