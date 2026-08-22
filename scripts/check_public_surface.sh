@@ -413,7 +413,7 @@ fi
 #
 # `$PATTERNS` and `$KNOWN_INNOCENT` carry no break: measured, neither matches
 # the classes, so they are written plainly.
-GATE_DATA_NAMES='ROSTER KNOWN_INTERNAL KNOWN_INNOCENT FIXTURE_ACCENT_BODY FIXTURE_ACCENT_NAME FIXTURE_BINARY_BODY FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY FIXTURE_DIRTY_NAME FIXTURE_EMPHASIS_BODY FIXTURE_EMPHASIS_NAME FIXTURE_ESCAPE_BODY FIXTURE_ESCAPE_NAME FIXTURE_ENTITY_BODY FIXTURE_ENTITY_NAME FIXTURE_AMPPROSE_BODY FIXTURE_AMPPROSE_NAME FIXTURE_NBSPPHRASE_BODY FIXTURE_NBSPPHRASE_NAME FIXTURE_ENTITYLANEB_BODY FIXTURE_ENTITYLANEB_NAME FIXTURE_FLAG_BODY FIXTURE_FLAG_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY FIXTURE_NAMEHIT_NAME'
+GATE_DATA_NAMES='ROSTER KNOWN_INTERNAL KNOWN_INNOCENT FIXTURE_ACCENT_BODY FIXTURE_ACCENT_NAME FIXTURE_BINARY_BODY FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY FIXTURE_DIRTY_NAME FIXTURE_EMPHASIS_BODY FIXTURE_EMPHASIS_NAME FIXTURE_ESCAPE_BODY FIXTURE_ESCAPE_NAME FIXTURE_ENTITY_BODY FIXTURE_ENTITY_NAME FIXTURE_AMPPROSE_BODY FIXTURE_AMPPROSE_NAME FIXTURE_NBSPPHRASE_BODY FIXTURE_NBSPPHRASE_NAME FIXTURE_RAWHTMLENT_BODY FIXTURE_RAWHTMLENT_NAME FIXTURE_LEGACYSECT_BODY FIXTURE_LEGACYSECT_NAME FIXTURE_ENTITYLANEB_BODY FIXTURE_ENTITYLANEB_NAME FIXTURE_FLAG_BODY FIXTURE_FLAG_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY FIXTURE_NAMEHIT_NAME'
 
 PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not| never) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (exists?|existed|remains?|remained|runs?|ran|covers?|covered|exercises?|exercised|guards?|guarded))?( (for|of|in)|[.,;]|$)|[Tt]here (is|are)(n.{1,3}t| not) (any |no )?(harness|harnesses|coverage|tests?|suites?)|[Tt]here (is|are) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?)|(has|have|had) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Ww]ithout( (automated|manual|unit|integration|end-to-end|regression|any|meaningful))* (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Nn]obody (looks|checks|monitors)( at| on)?( [A-Za-z][A-Za-z-]*){0,3} (dashboard|dashboards|alert|alerts|log|logs|metric|metrics|queue|queues|report|reports|test|tests|coverage|monitoring)( (for|of|in)|[.,;]|$)|(is|are|was|were)(n.{1,3}t| not| never) under (test|testing|coverage|monitoring|observation)( (for|of|in)|[.,;]|$)|[Ll]acks( any| automated| an?)*( [A-Za-z][A-Za-z-]*)? (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|(has|have|had)(n.{1,3}t| not| never) been (tested|covered|scanned|audited|monitored)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 ROSTER='analytic[]s-service
@@ -488,6 +488,10 @@ FIXTURE_AMPPROSE_BODY='latency &a[]mp; throughput and a café'
 FIXTURE_AMPPROSE_NAME=ampprose.md
 FIXTURE_NBSPPHRASE_BODY='There&nb[]sp;are&nb[]sp;no&nb[]sp;tests for the parser.'
 FIXTURE_NBSPPHRASE_NAME=nbspphrase.md
+FIXTURE_RAWHTMLENT_BODY='<span>&#[]65DR-[]0417</span>'
+FIXTURE_RAWHTMLENT_NAME=rawhtmlent.md
+FIXTURE_LEGACYSECT_BODY='see &se[]ct123 for context'
+FIXTURE_LEGACYSECT_NAME=legacysect.md
 FIXTURE_ENTITYLANEB_BODY='// GAP[]-000 note, beside the bytes of a reference
 package x
 
@@ -771,13 +775,45 @@ is_sentinel_run() {
 # the family whole costs nothing a writer will notice, and it ends the class
 # instead of trading one edge for the next.
 #
-# THE SEMICOLON IS REQUIRED, because a reference without one is not a
-# reference: GFM renders it literally, so refusing it would be a refusal over
-# text the page shows as typed. Digit counts are NOT bounded here — a
-# reference too long for the grammar renders as a replacement character rather
-# than as anything readable, and bounding it is the renderer model this gate
-# does not keep.
-ENTITY_RE='&#[0-9]+;|&#[xX][0-9a-fA-F]+;|&[A-Za-z][A-Za-z0-9]{1,31};'
+# THE TERMINATOR IS OPTIONAL ON THE NUMERIC ARMS AND REQUIRED ON THE NAMED ONE,
+# and that asymmetry is the third round of review deciding it rather than a
+# preference. Round two said a semicolon-less reference is rendered literally by
+# GFM, so refusing it is a refusal over text the page shows as typed — true in
+# Markdown text. Round three said an HTML parser decodes it anyway, so inside
+# raw HTML an unterminated numeric escape still assembles the identifier beside
+# it — also true. Which one applies
+# depends on whether the position is inside raw HTML, and deciding that is the
+# renderer model this gate does not keep.
+#
+# So the numeric arms refuse both spellings. `&#` followed by digits is not
+# something prose contains by accident, so the refusal costs nothing real. The
+# named arm keeps the terminator, because an unterminated `&word` IS ordinary
+# prose — `AT&Tea` would otherwise be refused.
+#
+# ONE LEGACY NAME BREAKS THAT SYMMETRY, and it was found by deriving rather than
+# by recalling: of the 106 HTML5 named references that decode WITHOUT a
+# semicolon, exactly ONE lands in a character this gate's classes are built
+# from — the section sign. A longer English word beginning with that same
+# unterminated name decodes to the sign followed by the rest of the word in a
+# browser, so refusing the unterminated spelling is correct rather than
+# collateral. If a pattern class ever adds a character, that
+# derivation has to be re-run; it is a script over a fixed table, not a list
+# somebody maintains.
+#
+# DIGIT COUNTS ARE NOT BOUNDED, and the attempt to bound them is why this
+# paragraph exists. Review asked for the grammar's limits — seven decimal, six
+# hexadecimal — so that an undecodable run is not refused. The bound cannot hold
+# beside an optional terminator: a twelve-digit run contains a seven-digit
+# prefix, so the bounded pattern matches it anyway and the refusal happens
+# regardless. Enforcing the bound needs a trailing-boundary assertion, which is
+# the grammar model again. Measured cost of leaving it out: zero, since `&#`
+# followed by digits does not occur in this workspace outside this file.
+# ⚠ THE LEGACY NAME IS SPELLED IN HALVES. This file sits on the surface it
+# scans, so writing that alternative whole makes the gate refuse itself —
+# correctly, and for the fourth time in this file's history. Same reason the
+# fixtures above carry markers.
+ENTITY_LEGACY='&se'"ct"
+ENTITY_RE='&#[0-9]+;?|&#[xX][0-9a-fA-F]+;?|&[A-Za-z][A-Za-z0-9]{1,31};|'"$ENTITY_LEGACY"
 
 AUDIT_CLASSES='ADR-[0-9]+|GAP-[0-9]{3}|SP-[0-9]{3}|AC-[A-Z]{2}-[0-9]+|§[0-9]+'
 AUDIT_CLASSES="$AUDIT_CLASSES"'|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)'
@@ -2150,7 +2186,9 @@ EOF
   for entity_case in \
       "$FIXTURE_ENTITY_NAME|$FIXTURE_ENTITY_BODY|an identifier written with a character reference" \
       "$FIXTURE_NBSPPHRASE_NAME|$FIXTURE_NBSPPHRASE_BODY|a gated phrase spaced with non-breaking references" \
-      "$FIXTURE_AMPPROSE_NAME|$FIXTURE_AMPPROSE_BODY|an ordinary ampersand entity in prose"; do
+      "$FIXTURE_AMPPROSE_NAME|$FIXTURE_AMPPROSE_BODY|an ordinary ampersand entity in prose" \
+      "$FIXTURE_RAWHTMLENT_NAME|$FIXTURE_RAWHTMLENT_BODY|a terminator-less numeric reference an HTML parser decodes" \
+      "$FIXTURE_LEGACYSECT_NAME|$FIXTURE_LEGACYSECT_BODY|the one legacy named reference that reaches these classes"; do
     entity_name="${entity_case%%|*}"
     entity_rest="${entity_case#*|}"
     entity_body="${entity_rest%|*}"
@@ -2186,8 +2224,8 @@ EOF
   # is deleted, and a run that asserts nothing prints the same closing line as
   # a run that asserted everything. The floor moves up when assertions are
   # added and refuses when they go.
-  [ "$fixture_checks" -ge 12 ] || {
-    echo "SELFTEST: only $fixture_checks scan assertion(s) ran, expected at least 12" >&2
+  [ "$fixture_checks" -ge 15 ] || {
+    echo "SELFTEST: only $fixture_checks scan assertion(s) ran, expected at least 15" >&2
     fixture_fail=1; }
   if [ "$fixture_fail" -ne 0 ]; then
     # refusal:structural
