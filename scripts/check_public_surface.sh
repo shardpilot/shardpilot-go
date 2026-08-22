@@ -413,7 +413,7 @@ fi
 #
 # `$PATTERNS` and `$KNOWN_INNOCENT` carry no break: measured, neither matches
 # the classes, so they are written plainly.
-GATE_DATA_NAMES='ROSTER KNOWN_INTERNAL KNOWN_INNOCENT FIXTURE_ACCENT_BODY FIXTURE_ACCENT_NAME FIXTURE_BINARY_BODY FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY FIXTURE_DIRTY_NAME FIXTURE_EMPHASIS_BODY FIXTURE_EMPHASIS_NAME FIXTURE_ESCAPE_BODY FIXTURE_ESCAPE_NAME FIXTURE_ENTITY_BODY FIXTURE_ENTITY_NAME FIXTURE_AMPPROSE_BODY FIXTURE_AMPPROSE_NAME FIXTURE_FLAG_BODY FIXTURE_FLAG_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY FIXTURE_NAMEHIT_NAME'
+GATE_DATA_NAMES='ROSTER KNOWN_INTERNAL KNOWN_INNOCENT FIXTURE_ACCENT_BODY FIXTURE_ACCENT_NAME FIXTURE_BINARY_BODY FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY FIXTURE_DIRTY_NAME FIXTURE_EMPHASIS_BODY FIXTURE_EMPHASIS_NAME FIXTURE_ESCAPE_BODY FIXTURE_ESCAPE_NAME FIXTURE_ENTITY_BODY FIXTURE_ENTITY_NAME FIXTURE_AMPPROSE_BODY FIXTURE_AMPPROSE_NAME FIXTURE_NBSPPHRASE_BODY FIXTURE_NBSPPHRASE_NAME FIXTURE_ENTITYLANEB_BODY FIXTURE_ENTITYLANEB_NAME FIXTURE_FLAG_BODY FIXTURE_FLAG_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY FIXTURE_NAMEHIT_NAME'
 
 PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not| never) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (exists?|existed|remains?|remained|runs?|ran|covers?|covered|exercises?|exercised|guards?|guarded))?( (for|of|in)|[.,;]|$)|[Tt]here (is|are)(n.{1,3}t| not) (any |no )?(harness|harnesses|coverage|tests?|suites?)|[Tt]here (is|are) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?)|(has|have|had) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Ww]ithout( (automated|manual|unit|integration|end-to-end|regression|any|meaningful))* (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Nn]obody (looks|checks|monitors)( at| on)?( [A-Za-z][A-Za-z-]*){0,3} (dashboard|dashboards|alert|alerts|log|logs|metric|metrics|queue|queues|report|reports|test|tests|coverage|monitoring)( (for|of|in)|[.,;]|$)|(is|are|was|were)(n.{1,3}t| not| never) under (test|testing|coverage|monitoring|observation)( (for|of|in)|[.,;]|$)|[Ll]acks( any| automated| an?)*( [A-Za-z][A-Za-z-]*)? (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|(has|have|had)(n.{1,3}t| not| never) been (tested|covered|scanned|audited|monitored)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 ROSTER='analytic[]s-service
@@ -484,8 +484,15 @@ FIXTURE_ESCAPE_BODY='see ADR-\*[]0000 for context'
 FIXTURE_ESCAPE_NAME=escape.md
 FIXTURE_ENTITY_BODY='see &#[]65;DR-[]0000 for context'
 FIXTURE_ENTITY_NAME=entity.md
-FIXTURE_AMPPROSE_BODY='latency &amp; throughput, an em dash — and a café'
+FIXTURE_AMPPROSE_BODY='latency &a[]mp; throughput and a café'
 FIXTURE_AMPPROSE_NAME=ampprose.md
+FIXTURE_NBSPPHRASE_BODY='There&nb[]sp;are&nb[]sp;no&nb[]sp;tests for the parser.'
+FIXTURE_NBSPPHRASE_NAME=nbspphrase.md
+FIXTURE_ENTITYLANEB_BODY='// GAP[]-000 note, beside the bytes of a reference
+package x
+
+const s = "&#[]65;"'
+FIXTURE_ENTITYLANEB_NAME=entity_lane_b.go
 FIXTURE_FLAG_BODY='EXAMPLE_SYNTH[]ETIC_FL[]AG_ENABLED is off'
 FIXTURE_FLAG_NAME=flag.md
 FIXTURE_LANEB_BODY='// GAP[]-000 note
@@ -749,11 +756,28 @@ is_sentinel_run() {
   return 1
 }
 
-# The character-reference family this gate REFUSES rather than reads. Numeric
-# references whole; named ones only where the HTML5 table decodes them into
-# this gate's own alphabet, which is exactly the two spellings of the
-# underscore. Derived from that table, not recalled from memory.
-ENTITY_RE='&#[0-9]+;?|&#[xX][0-9a-fA-F]+;?|&(lowbar|UnderBar);'
+# EVERY character reference, refused. Not a chosen subset — the first version
+# of this picked the ones decoding into the identifier alphabet, and review
+# found the edge in both directions within one round: the named reference for
+# the section sign reaches a pattern class the alphabet does not contain, and a
+# sentence spaced with non-breaking references renders as a gated phrase whose
+# raw bytes hold no spaces at all. Every narrowing needs a decode table, and
+# the table grows by one entry per round. This does not.
+#
+# THE COST WAS MEASURED, NOT ESTIMATED, because refusing an innocent entity is
+# a real cost to a writer. Across all 26 repositories in this workspace,
+# character references appear in markdown TWICE. In these two repositories the
+# only occurrence is this gate's own fixture. The input is closed, so refusing
+# the family whole costs nothing a writer will notice, and it ends the class
+# instead of trading one edge for the next.
+#
+# THE SEMICOLON IS REQUIRED, because a reference without one is not a
+# reference: GFM renders it literally, so refusing it would be a refusal over
+# text the page shows as typed. Digit counts are NOT bounded here — a
+# reference too long for the grammar renders as a replacement character rather
+# than as anything readable, and bounding it is the renderer model this gate
+# does not keep.
+ENTITY_RE='&#[0-9]+;|&#[xX][0-9a-fA-F]+;|&[A-Za-z][A-Za-z0-9]{1,31};'
 
 AUDIT_CLASSES='ADR-[0-9]+|GAP-[0-9]{3}|SP-[0-9]{3}|AC-[A-Z]{2}-[0-9]+|§[0-9]+'
 AUDIT_CLASSES="$AUDIT_CLASSES"'|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)'
@@ -1322,8 +1346,20 @@ scan_tree() {
     # The message says what to do, which is the whole reason this can be a
     # refusal instead of a miss: the remedy is one keystroke, so a false
     # refusal costs a contributor a character rather than an argument.
-    entity_hits="$(grep -anoE -- "$ENTITY_RE" "$scan_src" 2>/dev/null)"
-    entity_status=$?
+    # ⚠ LANE B IS REPORTED, NOT GATED, and this refusal has to honour that or it
+    # silently promotes a whole lane. A source file may legitimately carry the
+    # bytes of a character reference inside a string literal, and a source
+    # viewer shows those bytes rather than a decoded character — the hazard
+    # this refuses does not exist there. The signature check above already
+    # takes the same exemption, on the same line-shape.
+    entity_status=1
+    case "$f" in
+      *.go) ;;
+      *)
+        entity_hits="$(grep -anoE -- "$ENTITY_RE" "$scan_src" 2>/dev/null)"
+        entity_status=$?
+        ;;
+    esac
     if [ "$entity_status" -gt 1 ]; then
       # refusal:structural
       echo "REFUSING: the character-reference scan of '$f' failed (grep exit $entity_status)." >&2
@@ -1338,10 +1374,13 @@ scan_tree() {
       echo "  character. So an identifier assembled this way is invisible to" >&2
       echo "  this gate and plain to a reader, which is the one shape it must" >&2
       echo "  not let through." >&2
-      echo "  Write the character as a letter. The ampersand, the non-breaking" >&2
-      echo "  space, the dashes and the quotes are not refused — only the" >&2
-      echo "  numeric family and the two named spellings of the underscore," >&2
-      echo "  which are the ones that can build an identifier." >&2
+      echo "  Write the character itself. EVERY character reference is refused" >&2
+      echo "  here, including harmless ones: choosing a subset needs a decode" >&2
+      echo "  table, and two rounds of review each found another entry it was" >&2
+      echo "  missing. Across this whole workspace, references appear in" >&2
+      echo "  markdown twice, so the whole family costs less than the table." >&2
+      echo "  Source files on the reported lane are exempt — their bytes are" >&2
+      echo "  what a source viewer shows." >&2
       exit 2
     fi
     # ⚠ THIS GATE DOES NOT MODEL THE RENDERER. It compares against a form that
@@ -2025,7 +2064,7 @@ EOF
     printf '%s\n' "$FIXTURE_EMPHASIS_BODY" > "$FIXTURE_EMPHASIS_NAME"
     printf '%s\n' "$FIXTURE_ESCAPE_BODY"   > "$FIXTURE_ESCAPE_NAME"
     printf '%s\n' "$FIXTURE_FLAG_BODY"     > "$FIXTURE_FLAG_NAME"
-    printf '%s\n' "$FIXTURE_AMPPROSE_BODY" > "$FIXTURE_AMPPROSE_NAME"
+    printf '%s\n' "$FIXTURE_ENTITYLANEB_BODY" > "$FIXTURE_ENTITYLANEB_NAME"
     git add -A >/dev/null 2>&1
   )
   scan_tree "$tmp"
@@ -2052,19 +2091,23 @@ EOF
   fixture_checks=$((fixture_checks + 1))
   printf '%s' "$scanned_a" | grep -q 'caf' || {
     echo "SELFTEST: the scan missed the non-ASCII path (core.quotePath)" >&2; fixture_fail=1; }
-  # ⚠ THE OTHER DIRECTION OF THE CHARACTER-REFERENCE RULE. Refusing the numeric
-  # family is only safe if the entities ordinary prose actually uses are left
-  # alone; without this arm the rule could tighten into a false-refusal factory
-  # and every run would still print a clean line.
+  # ⚠ THE OTHER DIRECTION, AND IT IS THE LANE BOUNDARY. Refusing every character
+  # reference is only tolerable while it stays out of the lane this gate reports
+  # rather than gates: a source file may carry those bytes in a string literal,
+  # and a source viewer shows the bytes. The main tree above contains exactly
+  # such a file, so if the refusal ignored the lane split this whole fixture run
+  # would have been refused before reaching here — and the arm below would never
+  # print. That is why the assertion is on the lane count rather than on a
+  # message: the failure it guards against is silence.
   #
   # No pipe here, deliberately: `printf | grep -q` can die on SIGPIPE under
   # pipefail and report 141, which reads as "did not match". For an arm
-  # asserting PRESENCE that is harmless; for this one it would turn a real hit
-  # into a pass, which is the direction that matters.
+  # asserting PRESENCE that is harmless; for one asserting absence it would turn
+  # a real hit into a pass, which is the direction that matters.
   fixture_checks=$((fixture_checks + 1))
   case "$scanned_a" in
-    *"$FIXTURE_AMPPROSE_NAME"*)
-      echo "SELFTEST: prose carrying an ampersand entity, an em dash and an accent was reported as a hit" >&2
+    *"$FIXTURE_ENTITYLANEB_NAME"*)
+      echo "SELFTEST: a lane-B source file was reported on the gated lane" >&2
       fixture_fail=1 ;;
   esac
   # The NUL fixture gets its own tree: a refusal ends the run it happens in,
@@ -2095,22 +2138,40 @@ EOF
   # exact tree PASSED while the same identifier written plainly was refused,
   # measured on a clone of a public repository. It gets its own tree for the
   # same reason the NUL one does: a refusal ends the run it happens in.
-  entity_tmp="$(mktemp -d)"
-  (
-    cd "$entity_tmp"
-    git init -q .
-    git config user.email t@t; git config user.name t
-    printf '%s\n' "$FIXTURE_ENTITY_BODY" > "$FIXTURE_ENTITY_NAME"
-    git add -A >/dev/null 2>&1
-  )
-  entity_selftest_status=0
-  ( GATE_TMPFILES=(); trap 'gate_rc=$?; rm -f ${GATE_TMPFILES[@]+"${GATE_TMPFILES[@]}"}; exit "$gate_rc"' EXIT
-    scan_tree "$entity_tmp" ) >/dev/null 2>&1 || entity_selftest_status=$?
-  fixture_checks=$((fixture_checks + 1))
-  [ "$entity_selftest_status" -eq 2 ] || {
-    echo "SELFTEST: an identifier written with a character reference was not refused (status $entity_selftest_status)" >&2
-    fixture_fail=1; }
-  rm -rf "$entity_tmp"
+  # Each in its own tree, for the same reason the NUL fixture gets one: a
+  # refusal ends the run it happens in. The second and third are the inputs
+  # review produced against the first version of this rule, which refused only
+  # the family reaching the identifier alphabet:
+  #
+  #   - a sentence spaced with non-breaking references renders as a gated
+  #     phrase whose raw bytes contain no spaces at those positions;
+  #   - an ordinary ampersand in prose is refused too, and that is the stated
+  #     cost of refusing the family whole rather than a bug to fix later.
+  for entity_case in \
+      "$FIXTURE_ENTITY_NAME|$FIXTURE_ENTITY_BODY|an identifier written with a character reference" \
+      "$FIXTURE_NBSPPHRASE_NAME|$FIXTURE_NBSPPHRASE_BODY|a gated phrase spaced with non-breaking references" \
+      "$FIXTURE_AMPPROSE_NAME|$FIXTURE_AMPPROSE_BODY|an ordinary ampersand entity in prose"; do
+    entity_name="${entity_case%%|*}"
+    entity_rest="${entity_case#*|}"
+    entity_body="${entity_rest%|*}"
+    entity_label="${entity_case##*|}"
+    entity_tmp="$(mktemp -d)"
+    (
+      cd "$entity_tmp"
+      git init -q .
+      git config user.email t@t; git config user.name t
+      printf '%s\n' "$entity_body" > "$entity_name"
+      git add -A >/dev/null 2>&1
+    )
+    entity_selftest_status=0
+    ( GATE_TMPFILES=(); trap 'gate_rc=$?; rm -f ${GATE_TMPFILES[@]+"${GATE_TMPFILES[@]}"}; exit "$gate_rc"' EXIT
+      scan_tree "$entity_tmp" ) >/dev/null 2>&1 || entity_selftest_status=$?
+    fixture_checks=$((fixture_checks + 1))
+    [ "$entity_selftest_status" -eq 2 ] || {
+      echo "SELFTEST: $entity_label was not refused (status $entity_selftest_status)" >&2
+      fixture_fail=1; }
+    rm -rf "$entity_tmp"
+  done
 
   fixture_checks=$((fixture_checks + 1))
   printf '%s' "$scanned_a" | grep -qF -- "$FIXTURE_NAMEHIT_NAME:path:" || {
@@ -2119,14 +2180,14 @@ EOF
   printf '%s' "$scanned_a" | grep -q '^clean\.md:' && {
     echo "SELFTEST: the scan flagged clean.md" >&2; fixture_fail=1; }
   fixture_checks=$((fixture_checks + 1))
-  [ "$scan_lane_b_files" -eq 1 ] || {
-    echo "SELFTEST: lane B counted $scan_lane_b_files files, expected 1" >&2; fixture_fail=1; }
+  [ "$scan_lane_b_files" -eq 2 ] || {
+    echo "SELFTEST: lane B counted $scan_lane_b_files files, expected 2" >&2; fixture_fail=1; }
   # ⚠ A COUNT THAT MUST BE REACHED. Every assertion above is invisible when it
   # is deleted, and a run that asserts nothing prints the same closing line as
   # a run that asserted everything. The floor moves up when assertions are
   # added and refuses when they go.
-  [ "$fixture_checks" -ge 9 ] || {
-    echo "SELFTEST: only $fixture_checks scan assertion(s) ran, expected at least 9" >&2
+  [ "$fixture_checks" -ge 12 ] || {
+    echo "SELFTEST: only $fixture_checks scan assertion(s) ran, expected at least 12" >&2
     fixture_fail=1; }
   if [ "$fixture_fail" -ne 0 ]; then
     # refusal:structural
