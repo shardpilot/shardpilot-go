@@ -391,7 +391,7 @@ fi
 # the classes, so they are written plainly.
 GATE_DATA_NAMES='ROSTER KNOWN_INTERNAL KNOWN_INNOCENT FIXTURE_ACCENT_BODY FIXTURE_ACCENT_NAME FIXTURE_BINARY_BODY FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY FIXTURE_DIRTY_NAME FIXTURE_EMPHASIS_BODY FIXTURE_EMPHASIS_NAME FIXTURE_ESCAPE_BODY FIXTURE_ESCAPE_NAME FIXTURE_FLAG_BODY FIXTURE_FLAG_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY FIXTURE_NAMEHIT_NAME'
 
-PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not| never) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (exists?|existed|remains?|remained|runs?|ran|covers?|covered|exercises?|exercised|guards?|guarded))?( (for|of|in)|[.,;]|$)|[Tt]here (is|are)(n.{1,3}t| not) (any |no )?(harness|harnesses|coverage|tests?|suites?)|[Tt]here (is|are) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?)|(has|have|had) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Ww]ithout( (automated|manual|unit|integration|end-to-end|regression|any|meaningful))* (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Nn]obody (looks|checks|monitors)( at| on)?( [A-Za-z][A-Za-z-]*){0,3} (dashboard|dashboards|alert|alerts|log|logs|metric|metrics|queue|queues|report|reports|test|tests|coverage|monitoring)( (for|of|in)|[.,;]|$)|(is|are|was|were)(n.{1,3}t| not| never) under (test|testing|coverage|monitoring|observation)( (for|of|in)|[.,;]|$)|[Ll]acks( any| automated| an?)* ?[A-Za-z-]*[ ]?(harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|(has|have|had)(n.{1,3}t| not| never) been (tested|covered|scanned|audited|monitored)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
+PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not| never) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (exists?|existed|remains?|remained|runs?|ran|covers?|covered|exercises?|exercised|guards?|guarded))?( (for|of|in)|[.,;]|$)|[Tt]here (is|are)(n.{1,3}t| not) (any |no )?(harness|harnesses|coverage|tests?|suites?)|[Tt]here (is|are) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?)|(has|have|had) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Ww]ithout( (automated|manual|unit|integration|end-to-end|regression|any|meaningful))* (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Nn]obody (looks|checks|monitors)( at| on)?( [A-Za-z][A-Za-z-]*){0,3} (dashboard|dashboards|alert|alerts|log|logs|metric|metrics|queue|queues|report|reports|test|tests|coverage|monitoring)( (for|of|in)|[.,;]|$)|(is|are|was|were)(n.{1,3}t| not| never) under (test|testing|coverage|monitoring|observation)( (for|of|in)|[.,;]|$)|[Ll]acks( any| automated| an?)*( [A-Za-z][A-Za-z-]*)? (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|(has|have|had)(n.{1,3}t| not| never) been (tested|covered|scanned|audited|monitored)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 ROSTER='analytic[]s-service
 contro[]l-plane'
 KNOWN_INTERNAL='per ADR-[]0000 §[]000
@@ -439,6 +439,8 @@ The suite has zero test failures.
 The parser runs without test failures in CI.
 The parser runs without failing tests in CI.
 The release lacks any test failures.
+The tournament lacks contests.
+The park lacks protests.
 Nobody checks out until the payment transaction succeeds.
 The property is not under testamentary restriction.
 Nobody monitors tests more closely than the CI team.
@@ -490,13 +492,26 @@ data_block_names="$(printf '%s\n' "$data_block" | awk '
   {
     if (inq == 0 && ind == 0 && $0 ~ /^[A-Za-z_][A-Za-z0-9_]*=/) {
       name = $0; sub(/=.*/, "", name); print name
-    }
+      assign_line = 1
+    } else assign_line = 0
     i = 1
     while (i <= length($0)) {
       c = substr($0, i, 1)
       if (inq) { if (c == sq) inq = 0; i++; continue }
       if (ind) { if (c == bs) { i += 2; continue } ; if (c == dq) ind = 0; i++; continue }
       if (c == bs) { i += 2; continue }
+      # ⚠ AN APOSTROPHE IN A COMMENT IS NOT A QUOTE. The shell stops reading at
+      # an unquoted `#`, and a machine that did not desynchronised on the first
+      # comment carrying one — every assignment after it vanished from the
+      # list, and the duplicate and unlisted checks went blind while the gate
+      # stayed green.
+      if (c == "#") break
+      # ⚠ ONE ASSIGNMENT PER LINE. Only the assignment at the START of a line
+      # is recorded, so a second one appended behind a control operator runs,
+      # publishes its value, and appears in no list — undecoded and unaudited.
+      # The parser cannot follow shell grammar, so the grammar is restricted
+      # instead: an assignment line carries no unquoted `;`, `&` or `|`.
+      if (assign_line && (c == ";" || c == "&" || c == "|")) { print "!CTRL " name; assign_line = 0 }
       if (c == sq) inq = 1
       else if (c == dq) ind = 1
       i++
@@ -524,6 +539,16 @@ while IFS= read -r data_name; do
   # none of the classes — and it is not decoded by the loop, so it cannot be in
   # the list; it is audited instead by the pattern-list rules below, which read
   # it more strictly than any fixture. Nothing else is exempt.
+  case "$data_name" in
+    '!CTRL '*)
+      # refusal:structural
+      echo "REFUSING: the data-block assignment ${data_name#!CTRL } shares its line with" >&2
+      echo "  a control operator. Only the assignment at the start of a line is" >&2
+      echo "  recorded, so anything behind a ';', '&' or '|' runs, publishes its" >&2
+      echo "  value, and is decoded and audited by nothing. One assignment per line." >&2
+      exit 2
+      ;;
+  esac
   case " GATE_DATA_NAMES PATTERNS $GATE_DATA_NAMES " in
     *" $data_name "*) ;;
     *)
@@ -690,8 +715,16 @@ scan_tree() {
     # NAME — a decision-record id, a ticket, a service name in a directory —
     # reaches every consumer and appears in no file's body, so scanning only
     # contents misses it entirely.
+    # ⚠ AND THE SAME DOMINATING FORM, because a path is read by a person the
+    # way a line of prose is. A file NAMED with markers between the characters
+    # of a record id was scanned raw and passed, while the identical string in
+    # the body was reported — one criterion, two answers, depending on where
+    # the bytes sat.
+    f_stripped="$(printf '%s' "$f" | tr -d '*_`~\\')"
     if printf '%s\n' "$f" | grep -qE -- "$PATTERNS" \
-       || printf '%s\n' "$f" | grep -qiE -- "$ROSTER_RE"; then
+       || printf '%s\n' "$f" | grep -qiE -- "$ROSTER_RE" \
+       || printf '%s\n' "$f_stripped" | grep -qE -- "$PATTERNS" \
+       || printf '%s\n' "$f_stripped" | grep -qiE -- "$ROSTER_RE"; then
       scan_lane_a="${scan_lane_a}${f}:path:${f}"$'\n'
     fi
     # ⚠ EVERY CONTENT CHECK BELOW READS THE INDEX, NOT THE WORKING TREE.
@@ -760,8 +793,15 @@ scan_tree() {
     scan_files=$((scan_files + 1))
     if [ "$mode" = 120000 ]; then
       link="$(cat "$blob")"
+      # ⚠ AND THE MARKER-FREE FORM, like a path and like a body. This branch
+      # returns before the content pass, so it was the one place the criterion
+      # did not reach: a target decorating an identifier with markers was
+      # published in plain sight and reported clean.
+      link_stripped="$(printf '%s' "$link" | tr -d '*_`~\\')"
       if printf '%s\n' "$link" | grep -qE -- "$PATTERNS" \
-         || printf '%s\n' "$link" | grep -qiE -- "$ROSTER_RE"; then
+         || printf '%s\n' "$link" | grep -qiE -- "$ROSTER_RE" \
+         || printf '%s\n' "$link_stripped" | grep -qE -- "$PATTERNS" \
+         || printf '%s\n' "$link_stripped" | grep -qiE -- "$ROSTER_RE"; then
         scan_lane_a="${scan_lane_a}${f}:link:${link}"$'\n'
       fi
       continue
@@ -994,15 +1034,19 @@ scan_tree() {
         exit 2
         ;;
     esac
-    # ⚠ THE DOCUMENT FORMAT NEEDS TWO FACTS, NOT ONE. Its header is printable
-    # and short enough to appear in prose about the format — it refused a
-    # Markdown code span quoting it — but a real one also carries an object
-    # terminator or an end-of-file marker, and a sentence naming the header
-    # does not. Neither alone; both together.
+    # ⚠ THE DOCUMENT HEADER IS POSITIONAL, and two rounds of trying to make it
+    # work anywhere in the file were both wrong. The header alone matched prose
+    # about the format; the header plus a terminator matched a note that
+    # mentions BOTH tokens, which documentation about the format naturally
+    # does. They are common examples, not evidence about the blob.
+    #
+    # At BYTE ZERO the question is different: a file that literally begins with
+    # the header is one. What that gives up is the polyglot — a document behind
+    # a preamble — and that is covered in practice by the NUL refusal below,
+    # since a real one carries binary streams, and by name through the
+    # extension above. Stated, not assumed.
     if [ "$printable_sigs" = yes ] \
-       && grep -qaF -- "$(printf '\045\120\104\106\055')" "$blob" 2>/dev/null \
-       && { grep -qaF -- "$(printf '\145\156\144\157\142\152')" "$blob" 2>/dev/null \
-            || grep -qaF -- "$(printf '\045\045\105\117\106')" "$blob" 2>/dev/null; }; then
+       && [ "${magic16:0:10}" = "255044462d" ]; then
       # refusal:hazard
       echo "REFUSING: '$f' carries a rendered-document stream." >&2
       echo "  Its header and its object terminator are both present, and no pass" >&2
@@ -1309,7 +1353,17 @@ SHAPE_AWK='  function distinct(body,   j, ch, nx, set, k, cnt) {
       else {
         n = split(body, parts, "|")
         delete seen; cnt = 0
-        for (i = 1; i <= n; i++) if (!(parts[i] in seen)) { seen[parts[i]] = 1; cnt++ }
+        # ⚠ COMPARED BY WHAT THEY RECOGNISE, NOT BY THEIR TEXT. `-` and `-{1}`
+        # are different strings and the same single character, so a literal
+        # could be dressed as a branch by quantifying one arm. The cheap
+        # normalisations that cover the dodges: a `{1}` repeat means nothing,
+        # and a backslash before an ordinary character is the character.
+        for (i = 1; i <= n; i++) {
+          arm = parts[i]
+          gsub(/\{1\}/, "", arm)
+          gsub(/\\([^bBwWsSdD<>])/, "\\1", arm)
+          if (!(arm in seen)) { seen[arm] = 1; cnt++ }
+        }
         rep = (cnt <= 1) ? parts[1] : "|"
       }
       r = substr(r, 1, opos - 1) rep substr(r, cpos + 1)
