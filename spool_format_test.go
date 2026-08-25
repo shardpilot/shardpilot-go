@@ -3,6 +3,7 @@ package shardpilot
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -228,8 +229,8 @@ func TestTornTailCostsOneRecordAndForcesReconcile(t *testing.T) {
 	if !doc.ok {
 		t.Fatalf("a torn tail must not discard the document")
 	}
-	if len(doc.entries) != 5 {
-		t.Fatalf("torn tail cost %d records, want exactly the one being appended (5 kept)", 5-len(doc.entries))
+	if len(doc.records) != 5 {
+		t.Fatalf("torn tail cost %d records, want exactly the one being appended (5 kept)", 5-len(doc.records))
 	}
 	if !doc.tornTail {
 		t.Fatalf("the tear must be REPORTED, or nothing forces the reconcile")
@@ -240,14 +241,20 @@ func TestTornTailCostsOneRecordAndForcesReconcile(t *testing.T) {
 	reloaded.mu.Lock()
 	reloaded.tornTailOwed = doc.tornTail
 	reloaded.fileAppendable = true // the state a naive implementation would be in
-	ok, _ := reloaded.appendRecordsLocked([]spoolEntry{{id: "x", raw: []byte(`{"event_id":"x"}`)}})
+	ok, _ := reloaded.appendRecordsLocked([]spoolEntry{{id: "x", raw: []byte(`{"event_id":"x"}`)}}, nil)
 	reloaded.mu.Unlock()
 	if ok {
 		t.Fatalf("an owed reconcile must refuse the append fast path — otherwise the new record fuses to the torn bytes")
 	}
 }
 
-// TestRaisedCapCannotResurrectEvictedRecords is why the caps are in the header.
+// TestRaisedCapCannotResurrectEvictedRecords: a later run with a larger cap
+// must not resurrect what an earlier run dropped and dead-lettered.
+//
+// This used to hold because the file stated the caps it was written under and
+// the reader re-trimmed to them. It now holds for a stronger reason: the drops
+// are RECORDED, so no cap the reader knows about — old or new — can put an
+// evicted record back.
 func TestRaisedCapCannotResurrectEvictedRecords(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now()
@@ -269,59 +276,67 @@ func TestRaisedCapCannotResurrectEvictedRecords(t *testing.T) {
 		t.Fatalf("read: %v", err)
 	}
 	doc := parseSpoolDocument(data)
-	if doc.headerMaxEvents != 3 {
-		t.Fatalf("the file must state the caps it was written under, got max_events=%d", doc.headerMaxEvents)
+	if !doc.ok {
+		t.Fatalf("parse failed")
+	}
+	got := idsOf(doc.live())
+	if len(got) != 3 {
+		t.Fatalf("run 1's file holds %v, want the 3 it kept — the other 3 were dead-lettered", got)
+	}
+
+	// Run 2 opens the same directory with a cap twice as large.
+	big := formatTestSpool(t, dir, 6, 1<<20)
+	big.mu.Lock()
+	live := idsOf(big.readRecordEntriesLocked())
+	big.mu.Unlock()
+	if len(live) != 3 {
+		t.Fatalf("a raised cap resurrected drops: backlog = %v, want the same 3 run 1 kept", live)
 	}
 }
 
-// TestLastOccurrenceWins is the dedup rule, and first-occurrence is wrong in
-// BOTH directions at once — it resurrects a record the writing run dropped
-// while losing one it still held.
-func TestLastOccurrenceWins(t *testing.T) {
-	header := `{"version":3,"max_events":3,"max_bytes":1048576}` + "\n"
+// TestRecordedDropsAreAppliedNotInferred is the format's whole contract in one
+// case: the reader applies what the writer recorded and decides nothing.
+//
+// ⚠ THE READER USED TO RE-DERIVE THIS FROM THE CAPS, and being a second
+// implementation of eviction is what made it wrong four times. Here the same
+// history is read under a header that states NO caps at all — a reader that
+// still inferred evictions would have nothing to infer from and would hand
+// back every record, including the two the writer dropped.
+func TestRecordedDropsAreAppliedNotInferred(t *testing.T) {
+	header := `{"version":3}` + "\n"
 	rec := func(id string) string {
 		return fmt.Sprintf(`{"raw":{"event_id":%q,"event_ts":"2026-08-25T00:00:00Z"}}`, id) + "\n"
 	}
-	// A,B,C,D,A on disk under a cap of 3 is the backlog C,D,A.
-	data := []byte(header + rec("A") + rec("B") + rec("C") + rec("D") + rec("A"))
+	drop := func(id string) string { return fmt.Sprintf(`{"drop":%q}`, id) + "\n" }
+
+	// The writer held A,B,C,D, evicted A and B, then re-appended A.
+	data := []byte(header + rec("A") + rec("B") + rec("C") + rec("D") +
+		drop("A") + drop("B") + rec("A"))
 
 	doc := parseSpoolDocument(data)
 	if !doc.ok {
 		t.Fatalf("parse failed")
 	}
-	// The design's own worked example: under a cap of 3, A,B,C,D,A is C,D,A.
-	assertIDs(t, doc.liveUnderHeaderCaps(), []string{"C", "D", "A"},
-		"first-occurrence gives [A B C D], which trims to [B C D] — resurrecting A's dead copy while losing the live one")
+	// A's SECOND generation is live and holds the position it was appended at;
+	// B stays dropped.
+	assertIDs(t, doc.live(), []string{"C", "D", "A"},
+		"a drop record removes the generation live at that point, and a later re-append is a new one")
 }
 
-// TestByteCapReplayedInAppendOrder is the byte-cap half, and dedup-then-trim
-// gets it wrong for a different reason than the count cap does.
-//
-// ⚠ REMOVING AN ID'S EARLIER COPY ERASES THE BYTE PRESSURE IT EXERTED — pressure
-// that had already evicted other records. The trim then runs against a total
-// the writing run never saw, and lets back in something that was dropped and
-// dead-lettered. Reconstruction has to REPLAY, because eviction depends on the
-// order and size of everything before it.
-func TestByteCapReplayedInAppendOrder(t *testing.T) {
-	// Envelopes sized to the example: X(1), A(9), C(2), A(1) under a 10-byte cap.
-	// The writer ends holding C,A.
-	header := `{"version":3,"max_events":100,"max_bytes":10}` + "\n"
-	rec := func(id string, pad int) string {
-		return fmt.Sprintf(`{"raw":{"event_id":%q,"p":%q}}`, id, strings.Repeat("x", pad)) + "\n"
+// TestADropRecordOutlivesTheCapsThatCausedIt: the drops must survive a reader
+// configured differently from the writer, in both directions.
+func TestADropRecordOutlivesTheCapsThatCausedIt(t *testing.T) {
+	header := `{"version":3,"max_events":2,"max_bytes":64}` + "\n"
+	rec := func(id string) string {
+		return fmt.Sprintf(`{"raw":{"event_id":%q,"event_ts":"2026-08-25T00:00:00Z"}}`, id) + "\n"
 	}
-	// Sizes are the raw envelope lengths; exact padding does not matter, only
-	// that A's first copy is much larger than its second.
-	data := []byte(header + rec("X", 0) + rec("A", 40) + rec("C", 4) + rec("A", 0))
+	// One record, explicitly dropped. Any cap in the header leaves room for it,
+	// so ONLY the drop record can remove it.
+	data := []byte(header + rec("A") + fmt.Sprintf(`{"drop":%q}`, "A") + "\n")
 
 	doc := parseSpoolDocument(data)
-	if !doc.ok {
-		t.Fatalf("parse failed")
-	}
-	live := doc.liveUnderHeaderCaps()
-	for _, e := range live {
-		if e.id == "X" {
-			t.Fatalf("X was evicted by A's first copy and dead-lettered; a reload must not resurrect it (got %v)", idsOf(live))
-		}
+	if got := idsOf(doc.live()); len(got) != 0 {
+		t.Fatalf("live = %v, want empty — A was dropped and the caps had room for it", got)
 	}
 }
 
@@ -368,8 +383,8 @@ func TestV2FileStillLoads(t *testing.T) {
 	if !doc.ok || !doc.legacy {
 		t.Fatalf("a v2 document must load and be marked legacy (ok=%v legacy=%v)", doc.ok, doc.legacy)
 	}
-	if len(doc.entries) != 3 {
-		t.Fatalf("v2 load produced %d entries, want 3", len(doc.entries))
+	if len(doc.records) != 3 {
+		t.Fatalf("v2 load produced %d entries, want 3", len(doc.records))
 	}
 }
 
@@ -417,7 +432,7 @@ func TestFileNeverOutgrowsTheReadBound(t *testing.T) {
 		t.Fatalf("read: %v", err)
 	}
 	doc := parseSpoolDocument(data)
-	live := doc.liveUnderHeaderCaps()
+	live := doc.live()
 	if !doc.ok || len(live) == 0 {
 		t.Fatalf("the file must still load and hold a backlog, got ok=%v live=%d", doc.ok, len(live))
 	}
@@ -428,8 +443,17 @@ func TestFileNeverOutgrowsTheReadBound(t *testing.T) {
 	for _, e := range live {
 		total += len(e.raw)
 	}
-	if total > doc.headerMaxBytes {
-		t.Fatalf("live backlog is %d bytes, over the file's own %d cap", total, doc.headerMaxBytes)
+	// The caps live in the header as DIAGNOSTICS — production never reads them
+	// back — so this test reads that line itself rather than through the
+	// document.
+	var head struct {
+		MaxBytes int `json:"max_bytes"`
+	}
+	if err := json.Unmarshal(bytes.SplitN(data, []byte{'\n'}, 2)[0], &head); err != nil {
+		t.Fatalf("header: %v", err)
+	}
+	if total > head.MaxBytes {
+		t.Fatalf("live backlog is %d bytes, over the file's own %d cap", total, head.MaxBytes)
 	}
 
 }
@@ -457,5 +481,318 @@ func TestLoosenedPermissionsFallBackToTheRewrite(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("the spool is %v after an append onto a loosened file; the rewrite must have re-established 0600", info.Mode().Perm())
+	}
+}
+
+// TestReloadMatchesTheWritersBacklog is the invariant every replay defect broke,
+// asserted directly instead of one worked example at a time.
+//
+// ⚠ FOUR SEPARATE DEFECTS SHARED ONE STATEMENT: what a restart loads is not
+// what the writing run held. Each was found by a reviewer constructing the
+// history that exposed it — dedup-before-trim, a re-appended id, a batch member
+// evicted on arrival, and the position a settled id left behind — and each was
+// fixed without the next one becoming any less likely, because the reader was
+// re-deriving decisions the writer never wrote down.
+//
+// So this drives the REAL writer through appends, batches, re-appends and acks
+// against caps tight enough that most appends evict, and after every operation
+// asserts the file reloads to exactly the mirror's backlog, in order. It is
+// deliberately not a table of cases: the cases were never the problem.
+func TestReloadMatchesTheWritersBacklog(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	// Tight caps so eviction is the common case, not the edge.
+	s := formatTestSpool(t, dir, 6, 3<<10)
+
+	// A deterministic, non-uniform sequence: batch sizes and paddings vary so
+	// byte pressure and count pressure take turns binding, and ids repeat so
+	// re-appends land on both live and evicted generations.
+	seq := 0
+	nextID := func() string { seq++; return fmt.Sprintf("evt-%d", seq) }
+	var acked []string
+
+	check := func(step string) {
+		t.Helper()
+		s.mu.Lock()
+		want := idsOf(s.entries)
+		got := idsOf(s.readRecordEntriesLocked())
+		s.mu.Unlock()
+		if len(want) != len(got) {
+			t.Fatalf("%s: reload holds %v, writer holds %v", step, got, want)
+		}
+		for i := range want {
+			if want[i] != got[i] {
+				t.Fatalf("%s: reload holds %v, writer holds %v (differ at %d)", step, got, want, i)
+			}
+		}
+	}
+
+	for round := 0; round < 40; round++ {
+		// Batches of 1..4, padded on a rotating schedule.
+		batch := make([]spoolEntry, 0, 4)
+		for i := 0; i <= round%4; i++ {
+			id := nextID()
+			raw := spoolTestEnvelope(t, id, now)
+			pad := (round * 37) % 900
+			inflated := append([]byte(nil), raw[:len(raw)-1]...)
+			inflated = append(inflated, []byte(fmt.Sprintf(`,"pad":%q}`, strings.Repeat("x", pad)))...)
+			batch = append(batch, spoolEntry{id: id, ts: now.UTC().Format(time.RFC3339Nano), raw: inflated})
+		}
+		refused, added, _, _, persistFailed := s.append(batch, 0, false, now, func() bool { return true })
+		if refused || persistFailed {
+			t.Fatalf("round %d: refused=%v persistFailed=%v", round, refused, persistFailed)
+		}
+		check(fmt.Sprintf("round %d append", round))
+
+		// Every third round, ack the oldest live record — this is what leaves a
+		// settled id behind for a later generation to collide with.
+		if round%3 == 2 {
+			s.mu.Lock()
+			var victim string
+			if len(s.entries) > 0 {
+				victim = s.entries[0].id
+			}
+			s.mu.Unlock()
+			if victim != "" {
+				s.ack([]string{victim})
+				acked = append(acked, victim)
+				check(fmt.Sprintf("round %d ack %s", round, victim))
+			}
+		}
+
+		// Every fourth round, re-append an id already used — sometimes still
+		// live, sometimes long evicted, sometimes acked.
+		if round%4 == 3 && len(added) > 0 && len(acked) > 0 {
+			id := acked[len(acked)-1]
+			raw := spoolTestEnvelope(t, id, now)
+			re := []spoolEntry{{id: id, ts: now.UTC().Format(time.RFC3339Nano), raw: raw}}
+			if refused, _, _, _, pf := s.append(re, 0, false, now, func() bool { return true }); refused || pf {
+				t.Fatalf("round %d re-append: refused=%v persistFailed=%v", round, refused, pf)
+			}
+			check(fmt.Sprintf("round %d re-append %s", round, id))
+		}
+	}
+
+	// The run has to have exercised eviction, or the whole thing proves nothing.
+	s.mu.Lock()
+	held := len(s.entries)
+	s.mu.Unlock()
+	if seq <= held {
+		t.Fatalf("appended %d records and still hold %d — eviction never ran, so this asserted nothing", seq, held)
+	}
+}
+
+// TestAnEvictionIsReportedExactlyOnce: append RETURNS its evictions, so it must
+// not also queue them.
+//
+// ⚠ THE TWO QUEUES ARE FOR DIFFERENT CALLERS. pendingCapacityDrops carries
+// evictions the caller never sees — the ones a merging save makes against
+// foreign records — and the client drains it after every operation. Putting
+// append's own evictions there too means the client dead-letters and counts
+// each dropped event twice: once from the return value, once from the drain.
+func TestAnEvictionIsReportedExactlyOnce(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	s := formatTestSpool(t, dir, 3, 1<<20)
+
+	for i := 0; i < 3; i++ {
+		formatAppend(t, s, fmt.Sprintf("evt-once-%d", i), now)
+	}
+	// This one evicts evt-once-0 on the fast path.
+	entry := spoolEntry{id: "evt-once-3", ts: now.UTC().Format(time.RFC3339Nano), raw: spoolTestEnvelope(t, "evt-once-3", now)}
+	_, _, _, evicted, persistFailed := s.append([]spoolEntry{entry}, 0, false, now, func() bool { return true })
+	if persistFailed {
+		t.Fatalf("append failed")
+	}
+	if len(evicted) != 1 || evicted[0].id != "evt-once-0" {
+		t.Fatalf("returned evictions = %v, want [evt-once-0]", idsOf(evicted))
+	}
+
+	queued := s.takeCapacityDrops()
+	if len(queued) != 0 {
+		t.Fatalf("the same eviction was queued as well as returned (%v) — the client reports it twice", idsOf(queued))
+	}
+}
+
+// TestFailedCompactionKeepsSyncedAppendsCounted: the append's durability is not
+// the compaction's.
+//
+// ⚠ THE RECORDS ARE FSYNCED BEFORE COMPACTION IS EVEN CONSIDERED. A rewrite
+// that then fails has reclaimed nothing and undone nothing, so treating its
+// failure as the append's marked durable records uncounted — and a disk-full
+// Close would then report events as discarded that the next start loads.
+func TestFailedCompactionKeepsSyncedAppendsCounted(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	s := formatTestSpool(t, dir, 2000, 1<<20)
+
+	// Grow the file to just under the three-quarter compaction threshold with
+	// real appends — faking fileBytes would trip the foreign-writer check
+	// instead — so that the ONE append below crosses it.
+	for i := 0; ; i++ {
+		s.mu.Lock()
+		room := s.readLimitLocked()*3/4 - s.fileBytes
+		s.mu.Unlock()
+		if room < 2<<10 {
+			break
+		}
+		if i > 20000 {
+			t.Fatalf("never approached the compaction threshold")
+		}
+		formatAppendPadded(t, s, fmt.Sprintf("evt-cf-fill-%d", i), now, 2<<10)
+	}
+	// Only the REWRITE fails; the append seam is untouched.
+	rewrites := 0
+	s.mu.Lock()
+	s.renameFn = func(string, string) error { rewrites++; return errors.New("disk full") }
+	s.mu.Unlock()
+
+	// Padded so it CROSSES the threshold rather than merely approaching it.
+	raw := spoolTestEnvelope(t, "evt-cf-1", now)
+	inflated := append(append([]byte(nil), raw[:len(raw)-1]...),
+		[]byte(fmt.Sprintf(`,"pad":%q}`, strings.Repeat("x", 4<<10)))...)
+	entry := spoolEntry{id: "evt-cf-1", ts: now.UTC().Format(time.RFC3339Nano), raw: inflated}
+	_, added, _, _, persistFailed := s.append([]spoolEntry{entry}, 0, false, now, func() bool { return true })
+	if len(added) != 1 {
+		t.Fatalf("added = %d, want 1", len(added))
+	}
+	if persistFailed {
+		t.Fatalf("the append synced; a failed compaction must not report it as not durable")
+	}
+	s.mu.Lock()
+	uncounted := len(s.uncountedIDs)
+	s.mu.Unlock()
+	if uncounted != 0 {
+		t.Fatalf("%d addition(s) marked uncounted for a failure that did not touch them", uncounted)
+	}
+	// ⚠ AND THE COMPACTION MUST ACTUALLY HAVE BEEN ATTEMPTED. Without this the
+	// test passes for a spool that never crossed the threshold, which is how
+	// three earlier tests in this change passed against the unfixed code.
+	if rewrites == 0 {
+		t.Fatalf("the failing rewrite never ran — this asserted nothing")
+	}
+}
+
+// TestReloadOfALargeSpoolStaysLinear guards the cost of reconstruction, which
+// the recorded-drop format makes O(n) and the re-derivation did not.
+//
+// ⚠ THE BOUND IS FIXED HERE, NOT CHOSEN FROM THE RESULT: a 100,000-record spool
+// — the top of the range this repository's caps already allow — must reload in
+// under a second. Measured against the re-deriving reader this change removes:
+// 10k took 41ms, 40k 1.14s and 80k 7.22s, quadratic, extrapolating to roughly
+// 11s at 100k, so the first restart after a large spool stalled startup. The
+// same inputs on the recorded-drop reader took 1.4ms, 7.7ms and 27ms.
+func TestReloadOfALargeSpoolStaysLinear(t *testing.T) {
+	if testing.Short() {
+		t.Skip("timing bound")
+	}
+	const n = 100000
+	const bound = time.Second
+
+	var buf []byte
+	buf = append(buf, []byte(`{"version":3,"max_events":100000,"max_bytes":268435456}`+"\n")...)
+	for i := 0; i < n; i++ {
+		buf = append(buf, []byte(fmt.Sprintf(
+			`{"raw":{"event_id":"evt-scale-%d","event_ts":"2026-08-25T00:00:00Z"}}`, i)+"\n")...)
+	}
+	doc := parseSpoolDocument(buf)
+	if !doc.ok || len(doc.records) != n {
+		t.Fatalf("fixture did not parse: ok=%v records=%d", doc.ok, len(doc.records))
+	}
+
+	start := time.Now()
+	live := doc.live()
+	elapsed := time.Since(start)
+
+	if len(live) != n {
+		t.Fatalf("live = %d, want %d — the fixture must actually be reconstructed", len(live), n)
+	}
+	if elapsed > bound {
+		t.Fatalf("reconstructing %d records took %v, over the %v bound — reconstruction is superlinear again", n, elapsed, bound)
+	}
+}
+
+// TestOneBatchCannotCrossTheReadBound: compaction runs AFTER the append, so it
+// cannot rescue a batch big enough to cross the loader's bound by itself.
+//
+// ⚠ THE RECORDS ARE FSYNCED BEFORE COMPACTION IS CONSIDERED. A crash in that
+// window leaves a file the next startup reads as oversized, removes, and loses
+// the entire live backlog for — a change meant to be latency-only deleting a
+// backlog. The batch has to be refused BEFORE the write, which routes it to the
+// rewrite, whose size is bounded by the live set.
+func TestOneBatchCannotCrossTheReadBound(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	// A byte-cap-dominant spool: the payload one batch may carry is bounded by
+	// maxBytes, so only a large one can cross the loader's allowance in a
+	// single append.
+	s := formatTestSpool(t, dir, 10, 1<<20)
+
+	big := func(id string) spoolEntry {
+		raw := spoolTestEnvelope(t, id, now)
+		inflated := append(append([]byte(nil), raw[:len(raw)-1]...),
+			[]byte(fmt.Sprintf(`,"pad":%q}`, strings.Repeat("x", 100<<10)))...)
+		return spoolEntry{id: id, ts: now.UTC().Format(time.RFC3339Nano), raw: inflated}
+	}
+
+	// ⚠ THE END STATE IS NOT THE INVARIANT — the compaction that runs after the
+	// append shrinks the file back before any assertion here could see it, and
+	// the whole point is the window BETWEEN the two, where a crash finds the
+	// file. So watch the size each append itself leaves behind.
+	var peak int64
+	inner := s.appendFn
+	s.appendFn = func(p string, b []byte) error {
+		err := inner(p, b)
+		if info, statErr := os.Stat(p); statErr == nil && info.Size() > peak {
+			peak = info.Size()
+		}
+		return err
+	}
+
+	// Grow the file with dead records until it sits just below the compaction
+	// threshold, then let one full batch land on top of it.
+	for i := 0; i < 200; i++ {
+		s.mu.Lock()
+		near := s.fileBytes*10 > s.readLimitLocked()*7
+		s.mu.Unlock()
+		if near {
+			break
+		}
+		if refused, _, _, _, pf := s.append([]spoolEntry{big(fmt.Sprintf("evt-fill-%d", i))},
+			0, false, now, func() bool { return true }); refused || pf {
+			t.Fatalf("fill %d: refused=%v persistFailed=%v", i, refused, pf)
+		}
+	}
+
+	s.mu.Lock()
+	before, limit := s.fileBytes, s.readLimitLocked()
+	s.mu.Unlock()
+	batch := make([]spoolEntry, 0, 10)
+	payload := 0
+	for i := 0; i < 10; i++ {
+		e := big(fmt.Sprintf("evt-bound-%d", i))
+		payload += len(e.raw)
+		batch = append(batch, e)
+	}
+	if int64(payload)+before <= limit {
+		t.Fatalf("fixture too small: %d bytes onto %d does not reach the %d bound", payload, before, limit)
+	}
+
+	if refused, _, _, _, pf := s.append(batch, 0, false, now, func() bool { return true }); refused || pf {
+		t.Fatalf("append: refused=%v persistFailed=%v", refused, pf)
+	}
+
+	s.mu.Lock()
+	limit = s.readLimitLocked()
+	s.mu.Unlock()
+	if peak > limit {
+		t.Fatalf("an append left the file at %d bytes, past the loader's %d limit — a crash before the rewrite would delete the backlog", peak, limit)
+	}
+	// And the backlog is still there: the bound is not met by writing nothing.
+	s.mu.Lock()
+	live := len(s.readRecordEntriesLocked())
+	s.mu.Unlock()
+	if live == 0 {
+		t.Fatalf("the file holds no backlog at all")
 	}
 }

@@ -232,7 +232,6 @@ func breakSpoolWrites(s *diskSpool, err error) func() {
 	return func() {
 		s.renameFn = os.Rename
 		s.appendFn = appendPrivateFile
-		s.appendFn = appendPrivateFile
 	}
 }
 
@@ -247,7 +246,7 @@ func readSpoolRecordFile(t *testing.T, dir string) spoolRecordWire {
 		t.Fatalf("parse spool record: not a recognised spool document (%d bytes)", len(data))
 	}
 	record := spoolRecordWire{Version: spoolRecordVersion, RetryAfterUntilMS: doc.retryAfterUntilMS}
-	for _, entry := range doc.liveUnderHeaderCaps() {
+	for _, entry := range doc.live() {
 		record.Events = append(record.Events, spoolEventWire{Raw: entry.raw, InternalFact: entry.internalFact})
 	}
 	return record
@@ -349,7 +348,7 @@ func spoolRecordEventCount(dir string) (int, bool) {
 	if !doc.ok {
 		return 0, false
 	}
-	return len(doc.liveUnderHeaderCaps()), true
+	return len(doc.live()), true
 }
 
 // flushUntilSpooled flushes (tolerating the expected failures) until the

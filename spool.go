@@ -169,6 +169,11 @@ type spoolRecordWire struct {
 type spoolEventWire struct {
 	Raw          json.RawMessage `json:"raw"`
 	InternalFact bool            `json:"internal_fact,omitempty"`
+	// Drop names an id this run evicted. A line carrying it is a RECORDED
+	// DECISION rather than an event: it has no envelope, and the reader
+	// applies it instead of re-deriving that the eviction must have
+	// happened. See spoolDocument.live.
+	Drop string `json:"drop,omitempty"`
 }
 
 // ── v3: one record per line ─────────────────────────────────────────────────
@@ -551,8 +556,8 @@ func (s *diskSpool) liveContentBytesLocked() int64 {
 // one owing a reconcile after a recovered tear, must take the rewrite path
 // instead. The caller does not need to know which — "not appendable" is one
 // answer with one remedy.
-func (s *diskSpool) appendRecordsLocked(entries []spoolEntry) (ok bool, err error) {
-	if !s.fileAppendable || s.tornTailOwed || len(entries) == 0 {
+func (s *diskSpool) appendRecordsLocked(entries []spoolEntry, drops []string) (ok bool, err error) {
+	if !s.fileAppendable || s.tornTailOwed || (len(entries) == 0 && len(drops) == 0) {
 		return false, nil
 	}
 	// ⚠ A FOREIGN WRITER SENDS THIS BACK TO THE REWRITE, and the rewrite is
@@ -591,7 +596,28 @@ func (s *diskSpool) appendRecordsLocked(entries []spoolEntry) (ok bool, err erro
 		buf.Write(line)
 		buf.WriteByte('\n')
 	}
+	// The drops follow the entries they may refer to: a batch member evicted
+	// on arrival is written and then dropped, so the log states what happened
+	// rather than requiring the reader to work out that it must have.
+	for _, id := range drops {
+		line, marshalErr := json.Marshal(spoolEventWire{Drop: id})
+		if marshalErr != nil {
+			return false, nil
+		}
+		buf.Write(line)
+		buf.WriteByte('\n')
+	}
 	payload := buf.Bytes()
+	// ⚠ THE READ BOUND IS CHECKED BEFORE THE WRITE, NOT AFTER IT. Compacting
+	// afterwards cannot help a batch big enough to cross the bound in one
+	// append: the records are fsynced first, so a crash between the sync and
+	// the rewrite leaves a file the next startup reads as oversized, removes,
+	// and loses the whole backlog for. A batch that would cross it is not
+	// appended at all — it goes to the rewrite, which is bounded by the live
+	// set and cannot overshoot.
+	if s.fileBytes+int64(len(payload)) > s.readLimitLocked() {
+		return false, nil
+	}
 	err = s.appendFn(s.filePath(), payload)
 	written := len(payload)
 	if err != nil {
@@ -663,7 +689,16 @@ func (s *diskSpool) saveLocked() error {
 			continue
 		}
 		if _, settled := s.settledIDs[entry.id]; settled {
-			continue
+			// ⚠ SUPPRESSION IS PER-ID BUT THE HISTORY IS PER-GENERATION. An
+			// id stays settled after the generation it settled was removed,
+			// so a NEWER live occurrence read from the append log was being
+			// skipped here and then re-added from s.entries at the end of the
+			// merge — losing its position, and with it the order the caps
+			// evict in. If the mirror still holds the id, this occurrence is
+			// that live generation and the settle does not apply to it.
+			if _, live := s.ids[entry.id]; !live {
+				continue
+			}
 		}
 		if _, withdrawn := s.withdrawnOwedIDs[entry.id]; withdrawn {
 			// The unspent withdrawal marker's FULL id set — never the
@@ -1060,15 +1095,16 @@ func (s *diskSpool) readRecordBytesLocked() ([]byte, error) {
 }
 
 // spoolDocument is one parsed spool file, whatever version wrote it.
+// spoolRecord is one line of the append log: either an appended entry, or a
+// recorded eviction naming the id it removed.
+type spoolRecord struct {
+	entry spoolEntry
+	drop  string
+}
+
 type spoolDocument struct {
-	entries           []spoolEntry
+	records           []spoolRecord
 	retryAfterUntilMS int64
-	// headerMaxEvents / headerMaxBytes are the caps the FILE was written
-	// under, zero when it did not state them (v2, or a v3 header predating
-	// the fields). Zero reads as "use the configured caps", which is what
-	// those files were already doing.
-	headerMaxEvents int
-	headerMaxBytes  int
 	// tornTail is set when the final line had no terminator: its bytes are
 	// still on disk and the file MUST be rewritten before anything extends
 	// it — see reconcile below.
@@ -1101,9 +1137,9 @@ func parseSpoolDocument(data []byte) spoolDocument {
 		doc.ok = true
 		doc.legacy = true
 		doc.retryAfterUntilMS = legacy.RetryAfterUntilMS
-		doc.entries = make([]spoolEntry, 0, len(legacy.Events))
+		doc.records = make([]spoolRecord, 0, len(legacy.Events))
 		for _, wire := range legacy.Events {
-			doc.entries = append(doc.entries, spoolEntryFromWire(wire))
+			doc.records = append(doc.records, spoolRecord{entry: spoolEntryFromWire(wire)})
 		}
 		return doc
 	}
@@ -1128,116 +1164,94 @@ func parseSpoolDocument(data []byte) spoolDocument {
 	}
 	doc.ok = true
 	doc.retryAfterUntilMS = header.RetryAfterUntilMS
-	doc.headerMaxEvents = header.MaxEvents
-	doc.headerMaxBytes = header.MaxBytes
-
-	// ⚠ THE PARSER KEEPS EVERY OCCURRENCE, IN ORDER. De-duplicating here would
-	// throw away the one thing the reconstruction needs: an evicted id can be
-	// re-appended, so a repeated id means the earlier copy was dropped — and
-	// WHEN it was dropped, relative to everything else, is what decides the
-	// backlog. liveUnderHeaderCaps replays that sequence under the file's caps.
-	ordered := make([]spoolEntry, 0, len(lines))
+	// The parser keeps every line, in order, and interprets none of them: an
+	// entry record and a drop record are both just what the writer put there.
+	ordered := make([]spoolRecord, 0, len(lines))
 	for _, line := range lines[1:] {
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
 		var wire spoolEventWire
-		if json.Unmarshal(line, &wire) != nil || len(wire.Raw) == 0 {
+		if json.Unmarshal(line, &wire) != nil {
 			// A record line that does not parse is damage in the MIDDLE of the
 			// file, not a tear at its end. Skipping it keeps every other
 			// record rather than discarding the backlog for one bad line.
+			continue
+		}
+		if wire.Drop != "" {
+			ordered = append(ordered, spoolRecord{drop: wire.Drop})
+			continue
+		}
+		if len(wire.Raw) == 0 {
 			continue
 		}
 		entry := spoolEntryFromWire(wire)
 		if entry.id == "" {
 			continue
 		}
-		ordered = append(ordered, entry)
+		ordered = append(ordered, spoolRecord{entry: entry})
 	}
-	doc.entries = ordered
+	doc.records = ordered
 	return doc
 }
 
-// liveUnderHeaderCaps is the backlog the writing run held, reconstructed by
-// REPLAYING the append sequence under the caps the file states.
+// live is the backlog the writing run held: the append log's records applied
+// in order.
 //
-// ⚠ DEDUPLICATE-THEN-TRIM GETS THE BYTE CAP WRONG, and that was this function's
-// first shape. Removing an id's earlier copy before applying max_bytes erases
-// the byte pressure that copy exerted — pressure that had already evicted other
-// records — so the trim runs against a total the writing run never saw. Under a
-// 10-byte cap the history X(1), A(9), C(2), A(1) leaves the writer holding
-// C,A; dedup-then-trim yields X,C,A at four bytes, so a restart RESURRECTS X
-// after it was capacity-dead-lettered.
+// ⚠ THIS USED TO RE-DERIVE THE WRITER'S EVICTIONS INSTEAD OF READING THEM, and
+// that was the single most expensive decision in this change. Replaying the
+// caps here made the reader a SECOND IMPLEMENTATION of eviction that had to
+// agree with the writer's in every detail — and it did not, four separate
+// times: it got the byte cap wrong by de-duplicating first, it mis-ordered
+// re-appended ids, it lost the pressure of batch members evicted on arrival,
+// and it cost O(n²) to run. Each was found, one review round apart, and each
+// fix taught the copy one more thing the original already knew.
 //
-// Replaying is not merely a safer trim, it is the only reconstruction that can
-// be right: eviction depends on the order and size of everything that came
-// before, which is exactly what a set-then-trim throws away.
-func (doc spoolDocument) liveUnderHeaderCaps() []spoolEntry {
-	maxEvents := doc.headerMaxEvents
-	maxBytes := doc.headerMaxBytes
-	if maxEvents <= 0 && maxBytes <= 0 {
-		return doc.entries
-	}
-
-	live := make([]spoolEntry, 0, len(doc.entries))
-	at := make(map[string]int, len(doc.entries))
-	bytes := 0
-	for _, entry := range doc.entries {
-		// A re-appended id replaces its live copy in place, which is what the
-		// writer does: the append path skips ids the index still holds, so a
-		// second copy can only mean the first was evicted — but a first copy
-		// that IS still live must not be double-counted either.
-		if idx, dup := at[entry.id]; dup && idx >= 0 {
-			bytes -= len(live[idx].raw)
-			live[idx] = spoolEntry{}
-		}
-		at[entry.id] = len(live)
-		live = append(live, entry)
-		bytes += len(entry.raw)
-
-		// Evict oldest-first, exactly as the writer did.
-		for i := 0; i < len(live); i++ {
-			overCount := maxEvents > 0 && countLive(live) > maxEvents
-			overBytes := maxBytes > 0 && bytes > maxBytes
-			if !overCount && !overBytes {
-				break
-			}
-			oldest := -1
-			for j := range live {
-				if live[j].id != "" {
-					oldest = j
-					break
-				}
-			}
-			if oldest < 0 {
-				break
-			}
-			bytes -= len(live[oldest].raw)
-			if at[live[oldest].id] == oldest {
-				at[live[oldest].id] = -1
-			}
-			live[oldest] = spoolEntry{}
+// A reader cannot re-derive a decision that depended on state the writer had
+// and the file does not. So the writer now WRITES THE DECISION: an eviction
+// appends a drop record naming the id. This function applies drops; it does
+// not decide them. That is why it no longer consults the caps at all, and why
+// there is nothing here left to disagree with.
+func (doc spoolDocument) live() []spoolEntry {
+	ordered := make([]spoolEntry, 0, len(doc.records))
+	// ⚠ LIVENESS IS TRACKED SEPARATELY, NOT SIGNALLED BY A BLANK id. Using the
+	// empty id as the tombstone conflated "this was evicted" with "this record
+	// never carried an id" — and the second is data the LOAD has to see, so it
+	// can dead-letter it as unprovable rather than have the parser discard it.
+	alive := make([]bool, 0, len(doc.records))
+	at := make(map[string]int, len(doc.records))
+	kill := func(id string) {
+		if idx, ok := at[id]; ok && idx >= 0 {
+			alive[idx] = false
+			at[id] = -1
 		}
 	}
-
-	out := make([]spoolEntry, 0, len(live))
-	for _, entry := range live {
-		if entry.id == "" {
+	for _, rec := range doc.records {
+		if rec.drop != "" {
+			kill(rec.drop)
+			continue
+		}
+		// An id-less record cannot be named by a drop and cannot collide with
+		// a later generation, so it is simply carried.
+		if rec.entry.id != "" {
+			// A re-appended id supersedes its live copy in place. The writer
+			// only appends an id the index does not hold, so this can only be
+			// a generation the file records as dropped further up — but
+			// applying it unconditionally keeps the two readings identical.
+			kill(rec.entry.id)
+			at[rec.entry.id] = len(ordered)
+		}
+		ordered = append(ordered, rec.entry)
+		alive = append(alive, true)
+	}
+	out := make([]spoolEntry, 0, len(ordered))
+	for i, entry := range ordered {
+		if !alive[i] {
 			continue
 		}
 		out = append(out, entry)
 	}
 	return out
-}
-
-func countLive(entries []spoolEntry) int {
-	n := 0
-	for i := range entries {
-		if entries[i].id != "" {
-			n++
-		}
-	}
-	return n
 }
 
 func spoolEntryFromWire(wire spoolEventWire) spoolEntry {
@@ -1275,7 +1289,7 @@ func (s *diskSpool) readRecordEntriesLocked() []spoolEntry {
 	if !doc.ok {
 		return nil
 	}
-	return doc.liveUnderHeaderCaps()
+	return doc.live()
 }
 
 // spoolLoadOutcome is what a startup load produced: the drops to report,
@@ -1324,7 +1338,7 @@ func (s *diskSpool) load(now time.Time) spoolLoadOutcome {
 	// resend as events this SDK reported dropped. Trimming under the header's
 	// caps reproduces the writing run's cut; the configured caps, applied by
 	// the existing re-cap below, can then only shrink it further.
-	for _, entry := range doc.liveUnderHeaderCaps() {
+	for _, entry := range doc.live() {
 		record.Events = append(record.Events, spoolEventWire{Raw: entry.raw, InternalFact: entry.internalFact})
 	}
 	// A recovered tear, or a v2 file, owes the reconcile rewrite before
@@ -1562,9 +1576,9 @@ func (s *diskSpool) append(batch []spoolEntry, deadlineMS int64, clearStaleDeadl
 	// entry leaves the mirror at once, its bytes stay on disk as a dead
 	// record, and compaction reclaims them amortised.
 	//
-	// The load needs no cooperation and gets none — it re-trims oldest-first
-	// under the file's own caps, and dead records are by construction the
-	// oldest, so a reload reproduces the writing run's cut exactly.
+	// The load needs no cooperation because it is TOLD: each eviction appends a
+	// drop record naming the id, so a reload applies the writing run's cut
+	// instead of trying to reconstruct it (see spoolDocument.live).
 	//
 	// What DOES disqualify it is state that only a rewrite can settle: a
 	// deadline change (it lives in the header), and anything owed from an
@@ -1576,29 +1590,38 @@ func (s *diskSpool) append(batch []spoolEntry, deadlineMS int64, clearStaleDeadl
 		for _, entry := range added {
 			appendedEntries = append(appendedEntries, entry)
 		}
-		wrote, _ := s.appendRecordsLocked(appendedEntries)
+		droppedIDs := make([]string, 0, len(evicted))
+		for _, entry := range evicted {
+			droppedIDs = append(droppedIDs, entry.id)
+		}
+		wrote, _ := s.appendRecordsLocked(appendedEntries, droppedIDs)
 		if wrote {
 			fastPath = true
 			s.dirty = false
-			// ⚠ THE COMPACTION OUTCOME COMES FIRST, or the same eviction is
-			// reported twice. Queuing the drop here and then compacting lets a
-			// FAILED compaction take the failure path below, which defers the
-			// very same eviction — the caller drains the immediate copy now
-			// and the deferred copy when a later save lands, so one dropped
-			// event dead-letters twice and is counted twice.
+			// ⚠ THE APPEND'S DURABILITY IS NOT THE COMPACTION'S. The records
+			// above are fsynced before this line; a compaction rewrite that
+			// then fails has not undone them. Conflating the two marked every
+			// addition uncounted for a failure that did not touch it, so a
+			// disk-full Close reported durable records as discarded — and
+			// once an ack removed the id, nothing was left to repair the
+			// count from.
 			if s.compactionOwedLocked() {
 				// Dead records past the slack: reclaim them now. This is the
-				// amortised O(live) rewrite, not a per-append one.
-				persistFailed = s.saveLocked() != nil
+				// amortised O(live) rewrite, not a per-append one. Its
+				// failure costs only the reclaim: the records and the drops
+				// are already on disk, so nothing above is less durable for
+				// it and there is nothing to defer.
+				_ = s.saveLocked()
 			}
-			if !persistFailed {
-				// The eviction is final the moment the mirror drops it: the
-				// append landed, the mirror is authoritative, and a reload
-				// replays the same cut from the header's caps. So the capacity
-				// dead-letters release now rather than waiting for a rewrite
-				// that logical eviction no longer owes.
-				s.pendingCapacityDrops = append(s.pendingCapacityDrops, evicted...)
-			}
+			// ⚠ THE EVICTIONS ARE RETURNED, SO THEY MUST NOT ALSO BE QUEUED.
+			// pendingCapacityDrops carries evictions the caller never sees —
+			// the ones a MERGING save makes. These the caller already has as
+			// the append's return value; queuing them too made ordinary
+			// overflow dead-letter and count every dropped event twice.
+			//
+			// Nor are they deferred: the drop records landed with the batch,
+			// so a reload applies the same cut and no crash can resurrect
+			// them.
 		}
 	}
 	if !fastPath {
