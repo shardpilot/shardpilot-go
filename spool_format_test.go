@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -27,6 +28,20 @@ func formatTestSpool(t *testing.T, dir string, maxEvents int, maxBytes int) *dis
 		EnvironmentID:  "develop",
 		AnonymousID:    "anon-format",
 	})
+}
+
+// formatAppendPadded appends an envelope inflated to put the BYTE cap in
+// charge — see TestFileNeverOutgrowsTheReadBound for why that matters.
+func formatAppendPadded(t *testing.T, s *diskSpool, id string, now time.Time, pad int) {
+	t.Helper()
+	raw := spoolTestEnvelope(t, id, now)
+	inflated := append([]byte(nil), raw[:len(raw)-1]...)
+	inflated = append(inflated, []byte(fmt.Sprintf(`,"pad":%q}`, strings.Repeat("x", pad)))...)
+	entry := spoolEntry{id: id, ts: now.UTC().Format(time.RFC3339Nano), raw: inflated}
+	refused, _, _, _, persistFailed := s.append([]spoolEntry{entry}, 0, false, now, func() bool { return true })
+	if refused || persistFailed {
+		t.Fatalf("append %s: refused=%v persistFailed=%v", id, refused, persistFailed)
+	}
 }
 
 func formatAppend(t *testing.T, s *diskSpool, id string, now time.Time) {
@@ -274,17 +289,59 @@ func TestLastOccurrenceWins(t *testing.T) {
 	if !doc.ok {
 		t.Fatalf("parse failed")
 	}
-	got := make([]string, 0, len(doc.entries))
-	for _, e := range doc.entries {
-		got = append(got, e.id)
+	// The design's own worked example: under a cap of 3, A,B,C,D,A is C,D,A.
+	assertIDs(t, doc.liveUnderHeaderCaps(), []string{"C", "D", "A"},
+		"first-occurrence gives [A B C D], which trims to [B C D] — resurrecting A's dead copy while losing the live one")
+}
+
+// TestByteCapReplayedInAppendOrder is the byte-cap half, and dedup-then-trim
+// gets it wrong for a different reason than the count cap does.
+//
+// ⚠ REMOVING AN ID'S EARLIER COPY ERASES THE BYTE PRESSURE IT EXERTED — pressure
+// that had already evicted other records. The trim then runs against a total
+// the writing run never saw, and lets back in something that was dropped and
+// dead-lettered. Reconstruction has to REPLAY, because eviction depends on the
+// order and size of everything before it.
+func TestByteCapReplayedInAppendOrder(t *testing.T) {
+	// Envelopes sized to the example: X(1), A(9), C(2), A(1) under a 10-byte cap.
+	// The writer ends holding C,A.
+	header := `{"version":3,"max_events":100,"max_bytes":10}` + "\n"
+	rec := func(id string, pad int) string {
+		return fmt.Sprintf(`{"raw":{"event_id":%q,"p":%q}}`, id, strings.Repeat("x", pad)) + "\n"
 	}
-	want := []string{"B", "C", "D", "A"}
+	// Sizes are the raw envelope lengths; exact padding does not matter, only
+	// that A's first copy is much larger than its second.
+	data := []byte(header + rec("X", 0) + rec("A", 40) + rec("C", 4) + rec("A", 0))
+
+	doc := parseSpoolDocument(data)
+	if !doc.ok {
+		t.Fatalf("parse failed")
+	}
+	live := doc.liveUnderHeaderCaps()
+	for _, e := range live {
+		if e.id == "X" {
+			t.Fatalf("X was evicted by A's first copy and dead-lettered; a reload must not resurrect it (got %v)", idsOf(live))
+		}
+	}
+}
+
+func idsOf(entries []spoolEntry) []string {
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, e.id)
+	}
+	return out
+}
+
+func assertIDs(t *testing.T, entries []spoolEntry, want []string, why string) {
+	t.Helper()
+	got := idsOf(entries)
 	if len(got) != len(want) {
-		t.Fatalf("ids = %v, want %v", got, want)
+		t.Fatalf("ids = %v, want %v — %s", got, want, why)
 	}
 	for i := range want {
 		if got[i] != want[i] {
-			t.Fatalf("ids = %v, want %v — first-occurrence would give [A B C D], which trims to [B C D] and so resurrects A's dead copy while losing the live one", got, want)
+			t.Fatalf("ids = %v, want %v — %s", got, want, why)
 		}
 	}
 }
@@ -313,5 +370,92 @@ func TestV2FileStillLoads(t *testing.T) {
 	}
 	if len(doc.entries) != 3 {
 		t.Fatalf("v2 load produced %d entries, want 3", len(doc.entries))
+	}
+}
+
+// TestFileNeverOutgrowsTheReadBound is the one that would have deleted a live
+// backlog: compaction is relative to the live content, the loader's bound was
+// relative to the live content too — but they were derived differently, and the
+// file could legitimately exceed what the loader would read. A restart in that
+// window classifies this spool's OWN file as oversized and removes it.
+func TestFileNeverOutgrowsTheReadBound(t *testing.T) {
+	// ⚠ THE SPOOL HAS TO BE BYTE-CAP DOMINANT, and two earlier versions of this
+	// test were not — they passed against the unfixed code and proved nothing.
+	//
+	// The loader's old bound was max_bytes + 64 KiB + 40 x max_events. For the
+	// file to exceed it, 1.5x the live content must be larger than that, which
+	// needs the BYTE cap to be the one that binds: with small caps the fixed
+	// 64 KiB dominates, and with the default 219-byte test envelope the EVENT
+	// cap binds at 438 KB of live content, half the byte cap. Padding the
+	// envelopes to ~600 bytes puts the byte cap in charge, which is the
+	// configuration the finding describes.
+	dir := t.TempDir()
+	const maxEvents = 2000
+	s := formatTestSpool(t, dir, maxEvents, 1<<20)
+	now := time.Now()
+	path := filepath.Join(dir, spoolFileName)
+
+	s.mu.Lock()
+	limit := s.readLimitLocked()
+	s.mu.Unlock()
+
+	for i := 0; i < 6000; i++ {
+		formatAppendPadded(t, s, fmt.Sprintf("evt-readbound-%05d", i), now, 420)
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat %d: %v", i, err)
+		}
+		if info.Size() > limit {
+			t.Fatalf("append %d left the file at %d bytes, past the loader's %d limit — the next start would delete it",
+				i, info.Size(), limit)
+		}
+	}
+
+	// And it still loads: the bound is not met by writing something unreadable.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	doc := parseSpoolDocument(data)
+	live := doc.liveUnderHeaderCaps()
+	if !doc.ok || len(live) == 0 {
+		t.Fatalf("the file must still load and hold a backlog, got ok=%v live=%d", doc.ok, len(live))
+	}
+	// The BYTE cap binds here, not the event cap — 8 KiB of ~230-byte
+	// envelopes is well under 60 — so the check is that the backlog fills the
+	// cap it is actually bound by, not that it reaches maxEvents.
+	total := 0
+	for _, e := range live {
+		total += len(e.raw)
+	}
+	if total > doc.headerMaxBytes {
+		t.Fatalf("live backlog is %d bytes, over the file's own %d cap", total, doc.headerMaxBytes)
+	}
+
+}
+
+// TestLoosenedPermissionsFallBackToTheRewrite: O_APPEND ignores the mode on an
+// existing file, so an append would keep adding event payloads to a
+// world-readable spool where the atomic rewrite replaced it with 0600 every
+// time.
+func TestLoosenedPermissionsFallBackToTheRewrite(t *testing.T) {
+	dir := t.TempDir()
+	s := formatTestSpool(t, dir, 2000, 1<<20)
+	now := time.Now()
+	path := filepath.Join(dir, spoolFileName)
+
+	formatAppend(t, s, "evt-perm-0", now)
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+
+	formatAppend(t, s, "evt-perm-1", now)
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("the spool is %v after an append onto a loosened file; the rewrite must have re-established 0600", info.Mode().Perm())
 	}
 }

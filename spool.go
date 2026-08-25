@@ -562,7 +562,23 @@ func (s *diskSpool) appendRecordsLocked(entries []spoolEntry) (ok bool, err erro
 	// would never apply the caps to the combined view, nor settle the local
 	// state of an entry that view evicts. fileBytes is what THIS instance
 	// believes it wrote, so a size that disagrees is somebody else's write.
-	if info, err := os.Stat(s.filePath()); err != nil || info.Size() != s.fileBytes {
+	info, err := os.Stat(s.filePath())
+	if err != nil || info.Size() != s.fileBytes {
+		s.fileAppendable = false
+		return false, nil
+	}
+	// ⚠ AND A LOOSENED MODE SENDS IT BACK TOO. O_APPEND on an existing file
+	// IGNORES the mode argument, and this path never touches the directory —
+	// so where the atomic rewrite re-ran the private-directory check and
+	// replaced the destination with a 0600 file on EVERY write, an append
+	// would happily add event payloads to a world-readable one. The rewrite
+	// re-establishes both, which is why the remedy is to fall back to it
+	// rather than to chmod here.
+	if info.Mode().Perm() != 0o600 {
+		s.fileAppendable = false
+		return false, nil
+	}
+	if err := ensurePrivateDir(s.dir, s.chmodFn); err != nil {
 		s.fileAppendable = false
 		return false, nil
 	}
@@ -594,12 +610,25 @@ func (s *diskSpool) appendRecordsLocked(entries []spoolEntry) (ok bool, err erro
 
 // appendPrivateFile appends to an existing 0600 spool file. It does not create
 // one: appendability is established by a rewrite, which is what sets the mode.
+//
+// ⚠ IT SYNCS, AND THE PREVIOUS VERSION OF THIS FUNCTION DID NOT. The atomic
+// rewrite it replaces syncs the temp file before the rename, so a write that
+// returned meant the bytes were on the device. An append that only writes and
+// closes returns as soon as the kernel has the page — so a host crash loses
+// records this spool has already reported durably spooled, and the resend
+// contract is exactly the promise that does not survive that. The whole
+// sequencing argument for Phase 1 is "durability is exactly as strong as
+// today", which was false without this line.
 func appendPrivateFile(path string, payload []byte) error {
 	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return err
 	}
 	if _, err = file.Write(payload); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err = file.Sync(); err != nil {
 		_ = file.Close()
 		return err
 	}
@@ -613,7 +642,16 @@ func (s *diskSpool) compactionOwedLocked() bool {
 		return false
 	}
 	live := s.liveContentBytesLocked()
-	return s.fileBytes*2 > live*spoolCompactionSlack
+	if s.fileBytes*2 > live*spoolCompactionSlack {
+		return true
+	}
+	// ⚠ AND NEVER PAST WHAT THE LOADER WILL READ. The slack trigger above is
+	// relative to the LIVE content, so a spool whose live set is small while
+	// its file is large is covered by it — but the two bounds are derived
+	// differently and only this one is the loader's. Compacting at three
+	// quarters of the read limit leaves room for the appends between this
+	// check and the next.
+	return s.fileBytes*4 > s.readLimitLocked()*3
 }
 
 func (s *diskSpool) saveLocked() error {
@@ -1010,7 +1048,7 @@ func (s *diskSpool) readRecordBytesLocked() ([]byte, error) {
 	// spoolEventWire wrapper ({"raw":...} plus the optional internal-fact
 	// flag, worst case 29 bytes) and the array separator with room to
 	// spare.
-	limit := int64(s.maxBytes) + spoolRecordReadOverhead + 40*int64(s.maxEvents)
+	limit := s.readLimitLocked()
 	data, err := io.ReadAll(io.LimitReader(file, limit+1))
 	if err != nil {
 		return nil, err
@@ -1093,17 +1131,11 @@ func parseSpoolDocument(data []byte) spoolDocument {
 	doc.headerMaxEvents = header.MaxEvents
 	doc.headerMaxBytes = header.MaxBytes
 
-	// ⚠ LAST OCCURRENCE WINS, and first-occurrence is wrong in both directions
-	// at once. Eviction drops the id from the index as well as the backlog,
-	// which is what makes a record re-appendable — so an evicted id can appear
-	// twice, and the OLDER copy is by construction the dead one. With a cap of
-	// 3, `A,B,C,D,A` on disk is the backlog `C,D,A`; keeping the first
-	// occurrence loads `A,B,C,D`, trims to `B,C,D`, and so resurrects a record
-	// the writing run had dropped WHILE losing one it still held. Eviction is
-	// strictly FIFO, so the live list is always the tail of the append
-	// sequence with earlier duplicates removed — which is what taking the last
-	// occurrence leaves for the cap trim to work on.
-	seen := make(map[string]int, len(lines))
+	// ⚠ THE PARSER KEEPS EVERY OCCURRENCE, IN ORDER. De-duplicating here would
+	// throw away the one thing the reconstruction needs: an evicted id can be
+	// re-appended, so a repeated id means the earlier copy was dropped — and
+	// WHEN it was dropped, relative to everything else, is what decides the
+	// backlog. liveUnderHeaderCaps replays that sequence under the file's caps.
 	ordered := make([]spoolEntry, 0, len(lines))
 	for _, line := range lines[1:] {
 		if len(bytes.TrimSpace(line)) == 0 {
@@ -1120,54 +1152,118 @@ func parseSpoolDocument(data []byte) spoolDocument {
 		if entry.id == "" {
 			continue
 		}
-		if at, dup := seen[entry.id]; dup {
-			ordered[at] = spoolEntry{}
-		}
-		seen[entry.id] = len(ordered)
 		ordered = append(ordered, entry)
 	}
-	doc.entries = make([]spoolEntry, 0, len(ordered))
-	for _, entry := range ordered {
-		if entry.id == "" {
-			continue
-		}
-		doc.entries = append(doc.entries, entry)
-	}
+	doc.entries = ordered
 	return doc
 }
 
-// liveUnderHeaderCaps is the backlog the writing run held: every parsed record
-// trimmed oldest-first under the caps THE FILE STATES.
+// liveUnderHeaderCaps is the backlog the writing run held, reconstructed by
+// REPLAYING the append sequence under the caps the file states.
 //
-// ⚠ THE PARSER DELIBERATELY DOES NOT DO THIS. Logical eviction means the file
-// holds dead records, and nothing in a record says which — the live set is
-// whatever survives the cap trim, so the trim IS the definition of live. It is
-// one function rather than two because a reader that trims differently from the
-// loader would report a backlog the SDK will not actually send.
+// ⚠ DEDUPLICATE-THEN-TRIM GETS THE BYTE CAP WRONG, and that was this function's
+// first shape. Removing an id's earlier copy before applying max_bytes erases
+// the byte pressure that copy exerted — pressure that had already evicted other
+// records — so the trim runs against a total the writing run never saw. Under a
+// 10-byte cap the history X(1), A(9), C(2), A(1) leaves the writer holding
+// C,A; dedup-then-trim yields X,C,A at four bytes, so a restart RESURRECTS X
+// after it was capacity-dead-lettered.
+//
+// Replaying is not merely a safer trim, it is the only reconstruction that can
+// be right: eviction depends on the order and size of everything that came
+// before, which is exactly what a set-then-trim throws away.
 func (doc spoolDocument) liveUnderHeaderCaps() []spoolEntry {
-	entries := doc.entries
-	if doc.headerMaxEvents > 0 && doc.headerMaxEvents < len(entries) {
-		entries = entries[len(entries)-doc.headerMaxEvents:]
+	maxEvents := doc.headerMaxEvents
+	maxBytes := doc.headerMaxBytes
+	if maxEvents <= 0 && maxBytes <= 0 {
+		return doc.entries
 	}
-	if doc.headerMaxBytes > 0 {
-		total := 0
-		cut := 0
-		for i := len(entries) - 1; i >= 0; i-- {
-			total += len(entries[i].raw)
-			if total > doc.headerMaxBytes {
-				cut = i + 1
+
+	live := make([]spoolEntry, 0, len(doc.entries))
+	at := make(map[string]int, len(doc.entries))
+	bytes := 0
+	for _, entry := range doc.entries {
+		// A re-appended id replaces its live copy in place, which is what the
+		// writer does: the append path skips ids the index still holds, so a
+		// second copy can only mean the first was evicted — but a first copy
+		// that IS still live must not be double-counted either.
+		if idx, dup := at[entry.id]; dup && idx >= 0 {
+			bytes -= len(live[idx].raw)
+			live[idx] = spoolEntry{}
+		}
+		at[entry.id] = len(live)
+		live = append(live, entry)
+		bytes += len(entry.raw)
+
+		// Evict oldest-first, exactly as the writer did.
+		for i := 0; i < len(live); i++ {
+			overCount := maxEvents > 0 && countLive(live) > maxEvents
+			overBytes := maxBytes > 0 && bytes > maxBytes
+			if !overCount && !overBytes {
 				break
 			}
+			oldest := -1
+			for j := range live {
+				if live[j].id != "" {
+					oldest = j
+					break
+				}
+			}
+			if oldest < 0 {
+				break
+			}
+			bytes -= len(live[oldest].raw)
+			if at[live[oldest].id] == oldest {
+				at[live[oldest].id] = -1
+			}
+			live[oldest] = spoolEntry{}
 		}
-		entries = entries[cut:]
 	}
-	return entries
+
+	out := make([]spoolEntry, 0, len(live))
+	for _, entry := range live {
+		if entry.id == "" {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+func countLive(entries []spoolEntry) int {
+	n := 0
+	for i := range entries {
+		if entries[i].id != "" {
+			n++
+		}
+	}
+	return n
 }
 
 func spoolEntryFromWire(wire spoolEventWire) spoolEntry {
 	var envelope spoolEnvelopeWire
 	_ = json.Unmarshal(wire.Raw, &envelope)
 	return spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: wire.Raw, internalFact: wire.InternalFact}
+}
+
+// readLimitLocked bounds what the loader will read.
+//
+// ⚠ IT HAS TO ADMIT THE LARGEST FILE THIS SPOOL CAN LEGITIMATELY WRITE, and
+// before logical eviction it did — the file was a rewrite of the live backlog,
+// so live content plus framing was the whole of it. It is not any more: dead
+// records ride the file until compaction, deliberately, up to the slack. A
+// reader still bounded by the live size classifies a file this very process
+// wrote as oversized, deletes it, and loses the entire backlog on the next
+// start — the durability failure being introduced by the change that was
+// supposed to be latency-only.
+//
+// So the bound scales with the slack, matching what the design already states:
+// SpoolMaxBytes bounds the DELIVERABLE backlog, and the file holding it may
+// reach about 1.5x that.
+func (s *diskSpool) readLimitLocked() int64 {
+	live := int64(s.maxBytes) + 40*int64(s.maxEvents)
+
+	return live*spoolCompactionSlack/2 + spoolRecordReadOverhead
 }
 
 func (s *diskSpool) readRecordEntriesLocked() []spoolEntry {
@@ -1484,16 +1580,24 @@ func (s *diskSpool) append(batch []spoolEntry, deadlineMS int64, clearStaleDeadl
 		if wrote {
 			fastPath = true
 			s.dirty = false
-			// The eviction is final the moment the mirror drops it: the
-			// append landed, the mirror is authoritative, and a reload
-			// reproduces the same cut from the header's caps. So the capacity
-			// dead-letters release now rather than waiting for a rewrite that
-			// logical eviction no longer owes.
-			s.pendingCapacityDrops = append(s.pendingCapacityDrops, evicted...)
+			// ⚠ THE COMPACTION OUTCOME COMES FIRST, or the same eviction is
+			// reported twice. Queuing the drop here and then compacting lets a
+			// FAILED compaction take the failure path below, which defers the
+			// very same eviction — the caller drains the immediate copy now
+			// and the deferred copy when a later save lands, so one dropped
+			// event dead-letters twice and is counted twice.
 			if s.compactionOwedLocked() {
 				// Dead records past the slack: reclaim them now. This is the
 				// amortised O(live) rewrite, not a per-append one.
 				persistFailed = s.saveLocked() != nil
+			}
+			if !persistFailed {
+				// The eviction is final the moment the mirror drops it: the
+				// append landed, the mirror is authoritative, and a reload
+				// replays the same cut from the header's caps. So the capacity
+				// dead-letters release now rather than waiting for a rewrite
+				// that logical eviction no longer owes.
+				s.pendingCapacityDrops = append(s.pendingCapacityDrops, evicted...)
 			}
 		}
 	}

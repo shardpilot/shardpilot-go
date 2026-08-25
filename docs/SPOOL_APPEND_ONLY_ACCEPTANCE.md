@@ -83,6 +83,48 @@ disabled because eviction was still rewriting, which kept the file small for the
 wrong reason — the same defect the bound caught, showing up as a test that could
 not fail.
 
+## Review round 2 — five findings, two of them severe
+
+| Finding | What it was |
+|---|---|
+| **no `fsync`** | The append wrote and closed. The atomic rewrite it replaces syncs before renaming, so "durably spooled" had quietly become "the kernel has the page" — falsifying the one claim the Phase 1 / Phase 2 split rests on. |
+| **file could outgrow the loader's own bound** | Compaction let the file reach ~1.5x live; `readRecordBytesLocked` rejected above `max_bytes + 64 KiB + 40 x max_events`. In between, a restart classifies this spool's OWN file as oversized, deletes it, and loses the whole backlog. |
+| double dead-letter | An evicting append that then failed its compaction queued the drop twice — immediately, and again deferred. |
+| permissions | `O_APPEND` ignores the mode on an existing file and never touches the directory, where the rewrite re-established both on every write. |
+| byte-cap replay | De-duplicating before applying `max_bytes` erases the byte pressure the removed copy exerted, so a reload resurrects a record that was already capacity-dead-lettered. |
+
+The last one is the fourth thing logical eviction cost that was not anticipated,
+after the three the design document lists. The reconstruction now **replays** the
+append sequence under the file's caps rather than de-duplicating and trimming,
+because eviction depends on the order and size of everything before it — which
+is exactly what a set-then-trim throws away.
+
+### ⚠ Three versions of one test proved nothing
+
+`TestFileNeverOutgrowsTheReadBound` passed against the **unfixed** code twice
+before it reproduced anything.
+
+- At 8 KiB caps the loader's fixed 64 KiB overhead dominates its bound, so 1.5x
+  the live content never approaches it.
+- At the default caps with the standard 219-byte test envelope, the **event**
+  cap binds at 438 KB of live content — half the byte cap — so again the file
+  stays small.
+
+The finding needs a **byte-cap-dominant** spool. Padding the envelopes to ~640
+bytes puts the byte cap in charge, and the pre-fix code then fails on append
+1803 at 1 194 300 bytes against a 1 194 112 limit.
+
+The pattern across this review is now unmistakable and worth stating once: **the
+tests that failed to fail were all tests whose fixture could not reach the
+condition they described.** Not wrong assertions — unreachable ones.
+
+### The fsync has no test
+
+Observing `fsync` from Go needs a syscall seam, and adding a mechanism to test a
+one-line fix is the wrong trade. It is verified by inspection against the path
+it replaces (`writePrivateFileAtomic` syncs the temp file before renaming) and
+recorded here as uncovered rather than implied covered.
+
 ## What is owed and not produced here
 
 - **Phase 2**: the write moves off the caller's goroutine, and with it the
