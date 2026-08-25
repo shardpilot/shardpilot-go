@@ -53,6 +53,12 @@ func TestWithdrawnSpoolRemovalSurvivesFailedSave(t *testing.T) {
 		}
 		return os.Rename(oldpath, newpath)
 	}
+	s.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
+	}
 	removed, persistFailed := s.removeMatching(withdrawnExperimentFactRaw, 1)
 	if len(removed) != 1 || removed[0].id != "fact-1" {
 		t.Fatalf("expected the fact withdrawn, got %v", removed)

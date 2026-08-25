@@ -1661,6 +1661,12 @@ func TestConsentFloorTrailTailOverridesStaleRecord(t *testing.T) {
 	client.spool.renameFn = func(oldpath, newpath string) error {
 		return errors.New("disk full")
 	}
+	client.spool.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
+	}
 	client.SetConsent(false)
 	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentGranted {
 		t.Fatalf("test setup: expected the record write to have failed (stale grant), got (%v, %v)", recorded, ok)
@@ -1717,6 +1723,12 @@ func TestConsentFloorGrantNotObservableBeforeReceiptArmed(t *testing.T) {
 			<-release
 		})
 		return os.Rename(oldpath, newpath)
+	}
+	client.spool.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
 	}
 	denyDone := make(chan struct{})
 	go func() {
@@ -2254,6 +2266,12 @@ func TestConsentFloorGatedCloseReportsUnspooledRemnant(t *testing.T) {
 	client.spool.renameFn = func(oldpath, newpath string) error {
 		return errors.New("disk full")
 	}
+	client.spool.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
+	}
 	client.spool.mu.Unlock()
 
 	// Close: the final flush is GATED (parked grant), the consent drain
@@ -2351,6 +2369,12 @@ func TestConsentFloorDenyProofHeldUntilRecordDurable(t *testing.T) {
 	client.spool.renameFn = func(oldpath, newpath string) error {
 		return errors.New("disk full")
 	}
+	client.spool.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
+	}
 	client.spool.mu.Unlock()
 	client.SetConsent(false)
 	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentGranted {
@@ -2399,6 +2423,12 @@ func TestConsentFloorHeldDenyProofRestoresDenialAcrossRestart(t *testing.T) {
 	client.spool.mu.Lock()
 	client.spool.renameFn = func(oldpath, newpath string) error {
 		return errors.New("disk full")
+	}
+	client.spool.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
 	}
 	client.spool.mu.Unlock()
 	client.SetConsent(false)
@@ -2494,6 +2524,12 @@ func TestConsentFloorDirtyDuplicateRemnantCountsDiscarded(t *testing.T) {
 	client.spool.mu.Lock()
 	client.spool.renameFn = func(oldpath, newpath string) error {
 		return errors.New("disk full")
+	}
+	client.spool.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
 	}
 	client.spool.mu.Unlock()
 	if err := client.Enqueue(Event{ID: "evt-dupremnant-1", Name: "e1"}); err != nil {
@@ -2908,6 +2944,12 @@ func TestConsentFloorGrantReceiptHeldWhileRecordOwed(t *testing.T) {
 		}
 		return os.Rename(oldpath, newpath)
 	}
+	client.spool.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
+	}
 	client.spool.mu.Unlock()
 	client.SetConsent(true)
 	_ = client.Flush(context.Background()) // a dispatch point; the grant must hold
@@ -3032,6 +3074,12 @@ func TestConsentFloorLateDiscardFoldsIntoCachedClose(t *testing.T) {
 		<-release
 		return writeErr
 	}
+	client.spool.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
+	}
 	client.spool.mu.Unlock()
 
 	expiring, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
@@ -3087,6 +3135,12 @@ func TestConsentFloorReloadSeedsStampsPastPersistedState(t *testing.T) {
 	client.spool.renameFn = func(oldpath, newpath string) error {
 		return writeErr
 	}
+	client.spool.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
+	}
 	client.spool.mu.Unlock()
 	client.SetConsent(false)
 	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentGranted {
@@ -3135,6 +3189,12 @@ func TestConsentFloorOwnerlessOwedDenialPendsClose(t *testing.T) {
 			return writeErr
 		}
 		return os.Rename(oldpath, newpath)
+	}
+	client.spool.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
 	}
 	client.spool.mu.Unlock()
 	client.SetConsent(false)
@@ -3266,6 +3326,12 @@ func TestConsentFloorOwedGrantHoldSurvivesNewerOwedDenialOverwrite(t *testing.T)
 			return recordErr
 		}
 		return os.Rename(oldpath, newpath)
+	}
+	client.spool.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
 	}
 
 	client.SetConsent(true)  // receipt durable; the granted record write fails (owed)
@@ -4061,6 +4127,12 @@ func TestConsentFloorGrantHeldBehindParkedNewerDenial(t *testing.T) {
 		}
 		return os.Rename(oldpath, newpath)
 	}
+	client.spool.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
+	}
 	client.SetConsent(false) // denied record write fails: deny receipt durable but HELD
 	client.consentOutbox.releaseDispatch()
 
@@ -4203,6 +4275,12 @@ func TestConsentFloorRetriedCloseWaitsForWorkerStop(t *testing.T) {
 		}
 		return os.Rename(oldpath, newpath)
 	}
+	client.spool.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
+	}
 	state.setBatchOutcome(http.StatusServiceUnavailable)
 	if err := client.Enqueue(Event{ID: "evt-retry-close-1", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
@@ -4275,6 +4353,12 @@ func TestConsentFloorDenialRecordLandsBeforePurge(t *testing.T) {
 			opsMu.Unlock()
 		}
 		return os.Rename(oldpath, newpath)
+	}
+	client.spool.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
 	}
 	client.spool.removeFn = func(path string) error {
 		if strings.Contains(path, spoolFileName) {
@@ -4567,6 +4651,12 @@ func TestConsentFloorSupersedingGrantSettlesPurgeDebt(t *testing.T) {
 		}
 		return os.Rename(oldpath, newpath)
 	}
+	client.spool.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
+	}
 	client.spool.mu.Unlock()
 
 	client.SetConsent(false)
@@ -4758,6 +4848,12 @@ func TestConsentFloorPurgeDebtMarkerFailureRecordRetryRules(t *testing.T) {
 		}
 		return os.Rename(oldpath, newpath)
 	}
+	client.spool.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
+	}
 	client.spool.markerFn = func(string) error {
 		return errors.New("marker refused")
 	}
@@ -4836,6 +4932,12 @@ func TestConsentFloorPurgeDebtMarkerFailureWipesSpoolFile(t *testing.T) {
 		}
 		return os.Rename(oldpath, newpath)
 	}
+	client.spool.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
+	}
 	client.spool.markerFn = func(string) error {
 		return errors.New("marker refused")
 	}
@@ -4909,6 +5011,12 @@ func TestConsentFloorPurgeDebtNothingDurableSurfacesAndRetries(t *testing.T) {
 			return errors.New("disk full")
 		}
 		return os.Rename(oldpath, newpath)
+	}
+	client.spool.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
 	}
 	client.spool.markerFn = func(string) error {
 		if failing.Load() {
@@ -5001,6 +5109,12 @@ func TestConsentFloorFailedSaveEvictionFoldsIntoCloseVerdict(t *testing.T) {
 		}
 		return os.Rename(oldpath, newpath)
 	}
+	client.spool.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
+	}
 	client.spool.mu.Unlock()
 	state.setBatchOutcome(http.StatusServiceUnavailable)
 	if err := client.Enqueue(Event{ID: "evt-cap-lost-1", Name: "e1"}); err != nil {
@@ -5073,6 +5187,12 @@ func TestConsentFloorPurgeDebtDestructionRequiresDirSync(t *testing.T) {
 			return errors.New("disk full")
 		}
 		return os.Rename(oldpath, newpath)
+	}
+	client.spool.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
 	}
 	client.spool.markerFn = func(string) error {
 		if failing.Load() {
@@ -5152,6 +5272,12 @@ func TestConsentFloorDuplicateIDExpiredRemnantStillCounted(t *testing.T) {
 			return errors.New("disk full")
 		}
 		return os.Rename(oldpath, newpath)
+	}
+	client.spool.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
 	}
 	client.spool.mu.Unlock()
 	state.setBatchOutcome(http.StatusServiceUnavailable)
@@ -5303,6 +5429,12 @@ func TestConsentFloorMarkerCreateSerializedWithOwedFlag(t *testing.T) {
 			return errors.New("disk full")
 		}
 		return os.Rename(oldpath, newpath)
+	}
+	client.spool.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
 	}
 	client.spool.markerFn = func(string) error {
 		// The serialization probe: if the owed-flag mutex can be taken

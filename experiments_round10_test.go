@@ -516,6 +516,12 @@ func TestFailedMarkerWriteStillBacksMergeWithFullSet(t *testing.T) {
 		}
 		return os.Rename(oldpath, newpath)
 	}
+	s.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
+	}
 	s.mu.Unlock()
 	removed, persistFailed := s.removeMatching(withdrawnExperimentFactRaw, 1)
 	if len(removed) != total {

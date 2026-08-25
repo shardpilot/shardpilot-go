@@ -134,6 +134,12 @@ func TestCaptureFailureKeepsCacheUntilPairLands(t *testing.T) {
 		}
 		return os.Rename(oldpath, newpath)
 	}
+	client.spool.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
+	}
 	client.spool.mu.Unlock()
 
 	result, err := client.FetchExperimentAssignment(context.Background(), expTestScopeKey, nil)

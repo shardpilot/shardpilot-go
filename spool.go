@@ -1,6 +1,7 @@
 package shardpilot
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -170,6 +171,63 @@ type spoolEventWire struct {
 	InternalFact bool            `json:"internal_fact,omitempty"`
 }
 
+// ── v3: one record per line ─────────────────────────────────────────────────
+//
+// The v2 document is a single JSON object holding every envelope, so an append
+// re-reads it, re-marshals it, and rewrites it — O(spool size) per event, and
+// on this SDK O(2x) because the merge reads first. docs/SPOOL_APPEND_ONLY_DESIGN.md
+// (shipped with the Unity SDK, the reference implementation) works through why
+// splicing into the array format is unsafe and settles on a line format:
+//
+//	{"version":3,"max_events":2000,"max_bytes":1048576,"retry_after_until_ms":0}
+//	{"raw":{...},"internal_fact":true}
+//	{"raw":{...}}
+//
+// ⚠ THE NEWLINE IS THE RECORD BOUNDARY, AND THAT IS THE WHOLE POINT. A torn
+// append leaves a final line with no terminator; the load drops exactly that
+// line and keeps every complete one. The boundary is unambiguous because the
+// JSON serializer escapes newlines inside strings, so a raw newline byte in the
+// file can only be a terminator — where in the array format `},{` can occur inside a
+// string a game chose to send, which is why a recovery scanning for it would
+// silently truncate good records.
+//
+// ⚠ THE CAPS ARE IN THE HEADER, and that is load-bearing rather than
+// decorative. Eviction is LOGICAL — an evicted entry leaves the mirror at once
+// and its bytes stay in the file as a dead record — so nothing in a record says
+// whether it is live, and the load rebuilds the live set by trimming
+// oldest-first to the caps. That reproduces the writing run's cut exactly only
+// while the caps are the same. Raise SpoolMaxEvents in a new build and records
+// the previous run had already dropped would fit again, load, and resend as
+// events this SDK had already reported dropped. So the file states the caps it
+// was written under, the load trims under THOSE first, and only then under the
+// configured ones: a config change can shrink what a file carries forward, and
+// can never resurrect what was already gone.
+const spoolRecordVersionLines = 3
+
+// spoolHeaderWire is the v3 first line.
+type spoolHeaderWire struct {
+	Version           int   `json:"version"`
+	MaxEvents         int   `json:"max_events,omitempty"`
+	MaxBytes          int   `json:"max_bytes,omitempty"`
+	RetryAfterUntilMS int64 `json:"retry_after_until_ms,omitempty"`
+}
+
+// spoolCompactionSlack is how far the file may exceed the live content it
+// holds before a rewrite reclaims the dead records: 1.5x.
+//
+// ⚠ EVICTION MUST NOT REWRITE PER APPEND, which is what this constant buys.
+// Eviction happens when the spool is FULL — precisely the window the bound
+// measures p95 in — so a rewrite there would put an O(spool) cost back exactly
+// where it was removed from. At the 2000-event default a rewrite lands roughly
+// once per (live record count) appends, ~0.1% of calls, a factor of ten below
+// where p99 reads.
+const spoolCompactionSlack = 3
+
+// spoolHeaderAllowance is the header line's contribution to the live-content
+// yardstick, so a nearly-empty spool does not read as mostly-dead and compact
+// on every append.
+const spoolHeaderAllowance = 4 << 10
+
 // spoolEnvelopeWire is the minimal per-envelope parse a loaded record needs:
 // the de-duplication/ack key and the age source.
 type spoolEnvelopeWire struct {
@@ -276,6 +334,20 @@ type diskSpool struct {
 	// the write is retried on the flush cadence.
 	dirty bool
 
+	// fileAppendable: the bytes on disk are a v3 document matching the
+	// committed state, so appendRecordsLocked may extend it. Set only by a
+	// landed rewrite; cleared by every failed write.
+	fileAppendable bool
+	// fileBytes: what this instance has written to the file, LIVE AND DEAD
+	// together. Logical eviction means the file holds records the committed
+	// state has dropped, so this is >= a rewrite's size and is what the
+	// compaction trigger reads.
+	fileBytes int64
+	// tornTailOwed: a load recovered an unterminated final line, or an append
+	// wrote partially. Either way the torn bytes are still there and the file
+	// must be rewritten before anything extends it.
+	tornTailOwed bool
+
 	// owed marks a failed purge: the spool is fail-closed (no append, no
 	// load, no resend) until the wipe succeeds. Mirrored by the durable
 	// spool-wipe-owed marker when that marker could be created.
@@ -347,6 +419,16 @@ type diskSpool struct {
 	// touching the fields.
 	removeFn func(path string) error
 	renameFn func(oldpath, newpath string) error
+	// appendFn is the append path's write seam, the counterpart of renameFn
+	// for the rewrite path.
+	//
+	// ⚠ TWO WRITE PATHS NEED TWO SEAMS, and leaving this one out was a real
+	// gap rather than a test inconvenience: fault-injection tests break
+	// renameFn to make "the disk write fails" true, and an append that went
+	// straight to the file would have kept succeeding under exactly the
+	// condition those tests establish — so the spool would have reported
+	// durability it did not have, in the tests written to catch that.
+	appendFn func(path string, payload []byte) error
 	chmodFn  func(name string, mode os.FileMode) error
 	markerFn func(dir string) error
 	syncFn   func(dir string) error
@@ -378,6 +460,7 @@ func newDiskSpool(cfg Config) *diskSpool {
 		actorDigest:        consentActorDigest(cfg),
 		removeFn:           os.Remove,
 		renameFn:           os.Rename,
+		appendFn:           appendPrivateFile,
 		chmodFn:            os.Chmod,
 		markerFn:           createWipeOwedMarker,
 		syncFn:             syncDir,
@@ -426,6 +509,113 @@ func (s *diskSpool) recordSettledLocked(id string) {
 // an event's fate); an evicted foreign entry is only settled, so it does not
 // resurrect through a later save. On failure the mirror stays authoritative
 // and dirty marks the flush-cadence retry.
+// renderDocumentLocked renders the whole v3 document: header line, then one
+// record per line, each newline-terminated.
+func (s *diskSpool) renderDocumentLocked(entries []spoolEntry) ([]byte, error) {
+	header, err := json.Marshal(spoolHeaderWire{
+		Version:           spoolRecordVersionLines,
+		MaxEvents:         s.maxEvents,
+		MaxBytes:          s.maxBytes,
+		RetryAfterUntilMS: s.retryAfterUntilMS,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	buf.Grow(len(header) + 1 + s.totalBytes + 32*len(entries))
+	buf.Write(header)
+	buf.WriteByte('\n')
+	for _, entry := range entries {
+		line, err := json.Marshal(spoolEventWire{Raw: entry.raw, InternalFact: entry.internalFact})
+		if err != nil {
+			return nil, err
+		}
+		buf.Write(line)
+		buf.WriteByte('\n')
+	}
+	return buf.Bytes(), nil
+}
+
+// liveContentBytesLocked is what a rewrite of the committed state would cost on
+// disk: the yardstick the compaction trigger measures the file against.
+func (s *diskSpool) liveContentBytesLocked() int64 {
+	// 32 bytes per record covers the {"raw":…} wrapper, the optional
+	// internal-fact flag and the terminator, with room to spare.
+	return int64(s.totalBytes) + 32*int64(len(s.entries)) + spoolHeaderAllowance
+}
+
+// appendRecordsLocked writes new records to the end of the file and nothing
+// else. O(record).
+//
+// It reports whether it could: a file that is not a known-good v3 document, or
+// one owing a reconcile after a recovered tear, must take the rewrite path
+// instead. The caller does not need to know which — "not appendable" is one
+// answer with one remedy.
+func (s *diskSpool) appendRecordsLocked(entries []spoolEntry) (ok bool, err error) {
+	if !s.fileAppendable || s.tornTailOwed || len(entries) == 0 {
+		return false, nil
+	}
+	// ⚠ A FOREIGN WRITER SENDS THIS BACK TO THE REWRITE, and the rewrite is
+	// where the cross-process merge lives. One client per SpoolDir is the
+	// supported topology and the merge is its safety net — appending past a
+	// sibling's records would keep them (append-only does not clobber) but
+	// would never apply the caps to the combined view, nor settle the local
+	// state of an entry that view evicts. fileBytes is what THIS instance
+	// believes it wrote, so a size that disagrees is somebody else's write.
+	if info, err := os.Stat(s.filePath()); err != nil || info.Size() != s.fileBytes {
+		s.fileAppendable = false
+		return false, nil
+	}
+	var buf bytes.Buffer
+	for _, entry := range entries {
+		line, marshalErr := json.Marshal(spoolEventWire{Raw: entry.raw, InternalFact: entry.internalFact})
+		if marshalErr != nil {
+			return false, nil
+		}
+		buf.Write(line)
+		buf.WriteByte('\n')
+	}
+	payload := buf.Bytes()
+	err = s.appendFn(s.filePath(), payload)
+	written := len(payload)
+	if err != nil {
+		// A partial write leaves a torn tail THIS process put there. It owes
+		// the same reconcile a crash-torn tail owes, and the rewrite that
+		// settles it is the caller's fallback.
+		s.fileAppendable = false
+		if written > 0 {
+			s.tornTailOwed = true
+		}
+		return false, err
+	}
+	s.fileBytes += int64(written)
+	return true, nil
+}
+
+// appendPrivateFile appends to an existing 0600 spool file. It does not create
+// one: appendability is established by a rewrite, which is what sets the mode.
+func appendPrivateFile(path string, payload []byte) error {
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err = file.Write(payload); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
+}
+
+// compactionOwedLocked reports whether dead records have accumulated past the
+// slack — see spoolCompactionSlack for why this is not per-append.
+func (s *diskSpool) compactionOwedLocked() bool {
+	if !s.fileAppendable {
+		return false
+	}
+	live := s.liveContentBytesLocked()
+	return s.fileBytes*2 > live*spoolCompactionSlack
+}
+
 func (s *diskSpool) saveLocked() error {
 	merged := make([]spoolEntry, 0, len(s.entries))
 	seen := make(map[string]struct{}, len(s.entries))
@@ -502,19 +692,21 @@ func (s *diskSpool) saveLocked() error {
 		// Retry-After deadline.
 		s.retryAfterUntilMS = 0
 	}
-	record := spoolRecordWire{
-		Version:           spoolRecordVersion,
-		Events:            make([]spoolEventWire, 0, len(merged)),
-		RetryAfterUntilMS: s.retryAfterUntilMS,
-	}
-	for _, entry := range merged {
-		record.Events = append(record.Events, spoolEventWire{Raw: entry.raw, InternalFact: entry.internalFact})
-	}
-	payload, err := json.Marshal(record)
+	payload, err := s.renderDocumentLocked(merged)
 	if err == nil {
 		err = writePrivateFileAtomic(s.filePath(), payload, s.renameFn, s.chmodFn)
 	}
 	s.dirty = err != nil
+	// A landed rewrite is the ONLY thing that makes the file appendable: it is
+	// the moment the bytes on disk are known to be a v3 document matching the
+	// committed state. A failed one clears the flag, which is also how a
+	// legacy file, an absent file, and a recovered tear all take the rewrite
+	// path without any of them needing a separate check.
+	s.fileAppendable = err == nil
+	s.tornTailOwed = s.tornTailOwed && err != nil
+	if err == nil {
+		s.fileBytes = int64(len(payload))
+	}
 	if err != nil {
 		// The rewrite that would have removed these merge evictions from
 		// disk did not land: their dead-letters wait for the save that does.
@@ -829,22 +1021,165 @@ func (s *diskSpool) readRecordBytesLocked() ([]byte, error) {
 	return data, nil
 }
 
+// spoolDocument is one parsed spool file, whatever version wrote it.
+type spoolDocument struct {
+	entries           []spoolEntry
+	retryAfterUntilMS int64
+	// headerMaxEvents / headerMaxBytes are the caps the FILE was written
+	// under, zero when it did not state them (v2, or a v3 header predating
+	// the fields). Zero reads as "use the configured caps", which is what
+	// those files were already doing.
+	headerMaxEvents int
+	headerMaxBytes  int
+	// tornTail is set when the final line had no terminator: its bytes are
+	// still on disk and the file MUST be rewritten before anything extends
+	// it — see reconcile below.
+	tornTail bool
+	// legacy is set for a v2 document, which is rewritten as v3 on first save.
+	legacy bool
+	ok     bool
+}
+
+// parseSpoolDocument reads either format.
+//
+// ⚠ THE TORN TAIL IS NOT MERELY DROPPED, IT IS OWED A REWRITE. Discarding the
+// unterminated final line keeps the RECORDS intact, but its bytes are still at
+// the end of the file. Appending onto them concatenates the new record to a
+// half-written one, and the new record's terminator turns the pair into a
+// COMPLETE malformed line — which the next launch reads, correctly, as damage,
+// and discards the whole backlog for. A crash that should have cost one record
+// would cost every record, through the very mechanism chosen to prevent that.
+func parseSpoolDocument(data []byte) spoolDocument {
+	var doc spoolDocument
+	if len(data) == 0 {
+		return doc
+	}
+
+	// v2: a single JSON object. Recognised by its version field rather than
+	// by shape, so a v3 header — also a JSON object on line one — cannot be
+	// mistaken for one.
+	var legacy spoolRecordWire
+	if json.Unmarshal(data, &legacy) == nil && legacy.Version == spoolRecordVersion {
+		doc.ok = true
+		doc.legacy = true
+		doc.retryAfterUntilMS = legacy.RetryAfterUntilMS
+		doc.entries = make([]spoolEntry, 0, len(legacy.Events))
+		for _, wire := range legacy.Events {
+			doc.entries = append(doc.entries, spoolEntryFromWire(wire))
+		}
+		return doc
+	}
+
+	lines := bytes.Split(data, []byte{'\n'})
+	// A file ending in a terminator splits with a trailing empty element; one
+	// that does not ends with the torn bytes.
+	if len(lines) > 0 && len(lines[len(lines)-1]) == 0 {
+		lines = lines[:len(lines)-1]
+	} else if len(lines) > 1 {
+		doc.tornTail = true
+		lines = lines[:len(lines)-1]
+	} else {
+		// A single unterminated line is a header that never completed: there
+		// is nothing provable to keep.
+		return doc
+	}
+
+	var header spoolHeaderWire
+	if json.Unmarshal(lines[0], &header) != nil || header.Version != spoolRecordVersionLines {
+		return doc
+	}
+	doc.ok = true
+	doc.retryAfterUntilMS = header.RetryAfterUntilMS
+	doc.headerMaxEvents = header.MaxEvents
+	doc.headerMaxBytes = header.MaxBytes
+
+	// ⚠ LAST OCCURRENCE WINS, and first-occurrence is wrong in both directions
+	// at once. Eviction drops the id from the index as well as the backlog,
+	// which is what makes a record re-appendable — so an evicted id can appear
+	// twice, and the OLDER copy is by construction the dead one. With a cap of
+	// 3, `A,B,C,D,A` on disk is the backlog `C,D,A`; keeping the first
+	// occurrence loads `A,B,C,D`, trims to `B,C,D`, and so resurrects a record
+	// the writing run had dropped WHILE losing one it still held. Eviction is
+	// strictly FIFO, so the live list is always the tail of the append
+	// sequence with earlier duplicates removed — which is what taking the last
+	// occurrence leaves for the cap trim to work on.
+	seen := make(map[string]int, len(lines))
+	ordered := make([]spoolEntry, 0, len(lines))
+	for _, line := range lines[1:] {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var wire spoolEventWire
+		if json.Unmarshal(line, &wire) != nil || len(wire.Raw) == 0 {
+			// A record line that does not parse is damage in the MIDDLE of the
+			// file, not a tear at its end. Skipping it keeps every other
+			// record rather than discarding the backlog for one bad line.
+			continue
+		}
+		entry := spoolEntryFromWire(wire)
+		if entry.id == "" {
+			continue
+		}
+		if at, dup := seen[entry.id]; dup {
+			ordered[at] = spoolEntry{}
+		}
+		seen[entry.id] = len(ordered)
+		ordered = append(ordered, entry)
+	}
+	doc.entries = make([]spoolEntry, 0, len(ordered))
+	for _, entry := range ordered {
+		if entry.id == "" {
+			continue
+		}
+		doc.entries = append(doc.entries, entry)
+	}
+	return doc
+}
+
+// liveUnderHeaderCaps is the backlog the writing run held: every parsed record
+// trimmed oldest-first under the caps THE FILE STATES.
+//
+// ⚠ THE PARSER DELIBERATELY DOES NOT DO THIS. Logical eviction means the file
+// holds dead records, and nothing in a record says which — the live set is
+// whatever survives the cap trim, so the trim IS the definition of live. It is
+// one function rather than two because a reader that trims differently from the
+// loader would report a backlog the SDK will not actually send.
+func (doc spoolDocument) liveUnderHeaderCaps() []spoolEntry {
+	entries := doc.entries
+	if doc.headerMaxEvents > 0 && doc.headerMaxEvents < len(entries) {
+		entries = entries[len(entries)-doc.headerMaxEvents:]
+	}
+	if doc.headerMaxBytes > 0 {
+		total := 0
+		cut := 0
+		for i := len(entries) - 1; i >= 0; i-- {
+			total += len(entries[i].raw)
+			if total > doc.headerMaxBytes {
+				cut = i + 1
+				break
+			}
+		}
+		entries = entries[cut:]
+	}
+	return entries
+}
+
+func spoolEntryFromWire(wire spoolEventWire) spoolEntry {
+	var envelope spoolEnvelopeWire
+	_ = json.Unmarshal(wire.Raw, &envelope)
+	return spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: wire.Raw, internalFact: wire.InternalFact}
+}
+
 func (s *diskSpool) readRecordEntriesLocked() []spoolEntry {
 	data, err := s.readRecordBytesLocked()
 	if err != nil {
 		return nil
 	}
-	var record spoolRecordWire
-	if json.Unmarshal(data, &record) != nil || record.Version != spoolRecordVersion {
+	doc := parseSpoolDocument(data)
+	if !doc.ok {
 		return nil
 	}
-	entries := make([]spoolEntry, 0, len(record.Events))
-	for _, wire := range record.Events {
-		var envelope spoolEnvelopeWire
-		_ = json.Unmarshal(wire.Raw, &envelope)
-		entries = append(entries, spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: wire.Raw, internalFact: wire.InternalFact})
-	}
-	return entries
+	return doc.liveUnderHeaderCaps()
 }
 
 // spoolLoadOutcome is what a startup load produced: the drops to report,
@@ -881,11 +1216,25 @@ func (s *diskSpool) load(now time.Time) spoolLoadOutcome {
 		}
 		return outcome
 	}
-	var record spoolRecordWire
-	if json.Unmarshal(data, &record) != nil || record.Version != spoolRecordVersion {
+	doc := parseSpoolDocument(data)
+	if !doc.ok {
 		_ = s.removeRecordFile()
 		return outcome
 	}
+	record := spoolRecordWire{Version: spoolRecordVersion, RetryAfterUntilMS: doc.retryAfterUntilMS}
+	// ⚠ THE FILE'S OWN CAPS BIND FIRST. Trimming under the configured caps
+	// alone would let a build that RAISED SpoolMaxEvents resurrect records the
+	// writing run had already evicted — they fit again, so they load and
+	// resend as events this SDK reported dropped. Trimming under the header's
+	// caps reproduces the writing run's cut; the configured caps, applied by
+	// the existing re-cap below, can then only shrink it further.
+	for _, entry := range doc.liveUnderHeaderCaps() {
+		record.Events = append(record.Events, spoolEventWire{Raw: entry.raw, InternalFact: entry.internalFact})
+	}
+	// A recovered tear, or a v2 file, owes the reconcile rewrite before
+	// anything may extend the file. load's own rewrite settles it.
+	s.tornTailOwed = doc.tornTail
+	s.fileAppendable = false
 	withdrawn, markerDamaged := readWithdrawnMarker(s.dir, s.withdrawnMarkerReadLimit())
 	factClassCondemned := false
 	if markerDamaged {
@@ -1108,7 +1457,49 @@ func (s *diskSpool) append(batch []spoolEntry, deadlineMS int64, clearStaleDeadl
 			added = append(added, entry)
 		}
 	}
-	persistFailed = s.saveLocked() != nil
+	// ⚠ EVICTION MUST NOT DISQUALIFY THE FAST PATH, and gating on it was a
+	// defect that measured 234x against a 2x bound. Eviction happens when the
+	// spool is FULL — which is exactly the window the bound measures p95 in —
+	// so sending every eviction to the rewrite puts the O(spool) cost back
+	// precisely where this change removes it, while a measurement that stops
+	// at the cap never sees it. That is why eviction here is LOGICAL: the
+	// entry leaves the mirror at once, its bytes stay on disk as a dead
+	// record, and compaction reclaims them amortised.
+	//
+	// The load needs no cooperation and gets none — it re-trims oldest-first
+	// under the file's own caps, and dead records are by construction the
+	// oldest, so a reload reproduces the writing run's cut exactly.
+	//
+	// What DOES disqualify it is state that only a rewrite can settle: a
+	// deadline change (it lives in the header), and anything owed from an
+	// earlier failure.
+	fastPath := false
+	if !deadlineChanged && !s.dirty && len(s.uncountedIDs) == 0 &&
+		!s.withdrawnMarkerOwed && len(s.deferredCapacityDrops) == 0 {
+		appendedEntries := make([]spoolEntry, 0, len(added))
+		for _, entry := range added {
+			appendedEntries = append(appendedEntries, entry)
+		}
+		wrote, _ := s.appendRecordsLocked(appendedEntries)
+		if wrote {
+			fastPath = true
+			s.dirty = false
+			// The eviction is final the moment the mirror drops it: the
+			// append landed, the mirror is authoritative, and a reload
+			// reproduces the same cut from the header's caps. So the capacity
+			// dead-letters release now rather than waiting for a rewrite that
+			// logical eviction no longer owes.
+			s.pendingCapacityDrops = append(s.pendingCapacityDrops, evicted...)
+			if s.compactionOwedLocked() {
+				// Dead records past the slack: reclaim them now. This is the
+				// amortised O(live) rewrite, not a per-append one.
+				persistFailed = s.saveLocked() != nil
+			}
+		}
+	}
+	if !fastPath {
+		persistFailed = s.saveLocked() != nil
+	}
 	if persistFailed {
 		// Accepted into the mirror but not durable: deliberately uncounted
 		// until a later save lands (see uncountedIDs).
