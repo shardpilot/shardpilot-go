@@ -32,6 +32,19 @@ type Client struct {
 	// production.
 	consentWakeHook atomic.Value
 
+	// warnedPlatforms remembers which unmapped platform values have already
+	// been reported, so a misconfigured host is told ONCE per distinct value
+	// rather than once per event. A warning that repeats per event is a
+	// warning that gets filtered out, and a filtered warning is the silence
+	// it was added to end.
+	// Distinct host-supplied platform values already reported, so each is
+	// named once rather than on every event. BOUNDED: the key is untrusted
+	// host input (`Event.Platform` is per-event), so an unbounded set here
+	// grows with the caller's cardinality, not with ours.
+	warnedMu            sync.Mutex
+	warnedPlatforms     map[string]bool
+	warnedPlatformsFull bool
+
 	// jitter is the uniform [0, 1) source for the publish backoff's full
 	// jitter; tests pin it for deterministic schedules. Only the flush
 	// worker goroutine reads it. Nil falls back to the shared math/rand
