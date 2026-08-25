@@ -101,7 +101,20 @@ func (c *Client) buildEnvelope(event Event) (eventEnvelope, error) {
 
 	props := cloneMap(event.Props)
 
-	platform := firstNonEmpty(event.Platform, c.cfg.Platform)
+	// The ingest vocabulary is closed and one out-of-vocabulary value fails
+	// the WHOLE batch, so the host-supplied platform is folded here rather
+	// than sent as typed. An unmapped value becomes "" and `omitempty` drops
+	// the key -- `platform` is optional at the door, so an omitted key is
+	// accepted while a wrong one is not.
+	rawPlatform := firstNonEmpty(event.Platform, c.cfg.Platform)
+	platform := normalizeEnvelopePlatform(rawPlatform)
+	if rawPlatform != "" && platform == "" {
+		// WARN ONLY WHAT THE HOST SET. Nothing set is the ordinary default
+		// path and must stay silent: warning there would be noise on every
+		// correctly-configured client, which is how a diagnostic gets
+		// switched off before the day it matters.
+		c.warnUnmappedPlatform(rawPlatform)
+	}
 	appVersion := firstNonEmpty(event.AppVersion, c.cfg.AppVersion)
 	appBuild := firstNonEmpty(event.AppBuild, c.cfg.AppBuild)
 	userID := firstNonEmpty(event.UserID, c.cfg.UserID)
