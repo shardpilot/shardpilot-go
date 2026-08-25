@@ -47,6 +47,12 @@ func TestCaptureGateHoldsUntilDurable(t *testing.T) {
 		}
 		return os.Rename(oldpath, newpath)
 	}
+	client.spool.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
+	}
 	client.spool.mu.Unlock()
 	if result, err := client.FetchExperimentAssignment(context.Background(), expTestScopeKey, nil); err != nil || result.Code != "not_found" {
 		t.Fatalf("the kill fetch must land not_found, got %+v err=%v", result, err)
@@ -77,6 +83,7 @@ func TestCaptureGateHoldsUntilDurable(t *testing.T) {
 	// same-id entry by design) and the record converges.
 	client.spool.mu.Lock()
 	client.spool.renameFn = os.Rename
+	client.spool.appendFn = appendPrivateFile
 	client.spool.mu.Unlock()
 	client.exp.retryDurableSync()
 	record, err = os.ReadFile(filepath.Join(spoolDir, expCacheFileName))

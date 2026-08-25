@@ -205,15 +205,49 @@ func newSpoolTestClient(t *testing.T, serverURL, spoolDir string, recorder *spoo
 	return client
 }
 
+// readSpoolRecordFile reads the spool file and returns it in the shape these
+// tests assert on.
+//
+// It parses through the PRODUCTION parser rather than a copy: the file is a v3
+// line document, and a test-local reader would be a second implementation of
+// the format that can agree with the file while disagreeing with the loader —
+// which is precisely the class of bug these tests exist to catch.
+//
+// ⚠ WHAT IT RETURNS IS THE LIVE BACKLOG, NOT EVERY LINE ON DISK. Eviction is
+// logical, so the file also holds dead records; the parser applies the
+// last-occurrence and ordering rules that decide which are live. A test
+// wanting the raw lines should read them directly and say so.
+// breakSpoolWrites makes EVERY spool write path fail with err, and returns the
+// restore.
+//
+// ⚠ ONE CALL, NOT ONE PER SEAM. Tests used to break renameFn alone, which meant
+// "the disk write fails" was only true of the rewrite path — so when the append
+// path arrived, fifteen fault-injection tests silently stopped covering the
+// thing they were written for, and the spool reported durability it did not
+// have while they stayed green. A helper is the fix that keeps working: a new
+// write path is covered by every existing test the moment it is added here.
+func breakSpoolWrites(s *diskSpool, err error) func() {
+	s.renameFn = func(string, string) error { return err }
+	s.appendFn = func(string, []byte) error { return err }
+	return func() {
+		s.renameFn = os.Rename
+		s.appendFn = appendPrivateFile
+	}
+}
+
 func readSpoolRecordFile(t *testing.T, dir string) spoolRecordWire {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join(dir, spoolFileName))
 	if err != nil {
 		t.Fatalf("read spool record: %v", err)
 	}
-	var record spoolRecordWire
-	if err := json.Unmarshal(data, &record); err != nil {
-		t.Fatalf("unmarshal spool record: %v", err)
+	doc := parseSpoolDocument(data)
+	if !doc.ok {
+		t.Fatalf("parse spool record: not a recognised spool document (%d bytes)", len(data))
+	}
+	record := spoolRecordWire{Version: spoolRecordVersion, RetryAfterUntilMS: doc.retryAfterUntilMS}
+	for _, entry := range doc.live() {
+		record.Events = append(record.Events, spoolEventWire{Raw: entry.raw, InternalFact: entry.internalFact})
 	}
 	return record
 }
@@ -303,16 +337,18 @@ func wireEventBytes(t *testing.T, body []byte) []string {
 
 // spoolRecordEventCount reads the record's event count without failing on an
 // absent file.
+// spoolRecordEventCount is the LIVE backlog size on disk — parsed through the
+// production parser, for the reason readSpoolRecordFile states.
 func spoolRecordEventCount(dir string) (int, bool) {
 	data, err := os.ReadFile(filepath.Join(dir, spoolFileName))
 	if err != nil {
 		return 0, false
 	}
-	var record spoolRecordWire
-	if json.Unmarshal(data, &record) != nil {
+	doc := parseSpoolDocument(data)
+	if !doc.ok {
 		return 0, false
 	}
-	return len(record.Events), true
+	return len(doc.live()), true
 }
 
 // flushUntilSpooled flushes (tolerating the expected failures) until the
@@ -1105,7 +1141,7 @@ func TestSpoolGrantPersistFailureKeepsSpoolClosed(t *testing.T) {
 	// The grant's record write fails: the LIVE pipeline opens as documented,
 	// but disk stays closed — writes require a PERSISTED grant.
 	injectedErr := errors.New("injected rename failure")
-	client.spool.renameFn = func(string, string) error { return injectedErr }
+	breakSpoolWrites(client.spool, injectedErr)
 	client.SetConsent(true)
 	if _, ok := loadConsentRecord(dir, spoolTestActorDigest()); ok {
 		t.Fatalf("expected no consent record after the failed persist")
@@ -1136,6 +1172,7 @@ func TestSpoolGrantPersistFailureKeepsSpoolClosed(t *testing.T) {
 
 	// A later successful persist opens the spool.
 	client.spool.renameFn = os.Rename
+	client.spool.appendFn = appendPrivateFile
 	client.SetConsent(true)
 	if state2, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || state2 != ConsentGranted {
 		t.Fatalf("expected the granted record persisted on retry, got %v %v", state2, ok)
@@ -1160,7 +1197,7 @@ func TestSpoolPersistFailureCountsAndMirrorStaysAuthoritative(t *testing.T) {
 	client.SetConsent(true)
 
 	injectedErr := errors.New("injected rename failure")
-	client.spool.renameFn = func(string, string) error { return injectedErr }
+	breakSpoolWrites(client.spool, injectedErr)
 	if err := client.Enqueue(Event{ID: "evt-persist-1", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
@@ -1184,6 +1221,7 @@ func TestSpoolPersistFailureCountsAndMirrorStaysAuthoritative(t *testing.T) {
 	// mirror: the entries that just became durable count into Spooled now —
 	// exactly once.
 	client.spool.renameFn = os.Rename
+	client.spool.appendFn = appendPrivateFile
 	client.spoolMaintain()
 	if got := len(readSpoolRecordFile(t, dir).Events); got != 1 {
 		t.Fatalf("expected the retried write to land the mirror, got %d events", got)
@@ -2410,7 +2448,7 @@ func TestSpoolCapacityDeadLetterDeferredUntilEvictionDurable(t *testing.T) {
 	// what to retry is a scheduler coin flip, and losing it retried only the
 	// retained first event with no eviction attempted at all.
 	injectedErr := errors.New("injected rename failure")
-	client.spool.renameFn = func(string, string) error { return injectedErr }
+	breakSpoolWrites(client.spool, injectedErr)
 	now := time.Now()
 	_, added, _, evicted, persistFailed := client.spool.append([]spoolEntry{{
 		id:  "evt-defer-2",
@@ -2440,6 +2478,7 @@ func TestSpoolCapacityDeadLetterDeferredUntilEvictionDurable(t *testing.T) {
 	// WITHOUT the evicted entry — the eviction is now final, so the deferred
 	// capacity dead-letter fires exactly once.
 	client.spool.renameFn = os.Rename
+	client.spool.appendFn = appendPrivateFile
 	client.spoolMaintain()
 	record := readSpoolRecordFile(t, dir)
 	if len(record.Events) != 1 || !recordContainsEventID(t, record.Events, "evt-defer-2") {
@@ -2737,6 +2776,12 @@ func TestSetConsentDiskStallDoesNotBlockIntake(t *testing.T) {
 		})
 		return os.Rename(oldpath, newpath)
 	}
+	client.spool.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
+	}
 
 	decisionDone := make(chan struct{})
 	go func() {
@@ -2791,6 +2836,12 @@ func TestDenialAppliesToIntakeWhileEarlierDecisionDiskStalls(t *testing.T) {
 			<-release
 		})
 		return os.Rename(oldpath, newpath)
+	}
+	client.spool.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
 	}
 
 	grantDone := make(chan struct{})
@@ -2874,6 +2925,12 @@ func TestCloseWaitsForStalledGrantDecision(t *testing.T) {
 			<-release
 		})
 		return os.Rename(oldpath, newpath)
+	}
+	client.spool.appendFn = func(path string, payload []byte) error {
+		if strings.HasSuffix(path, spoolFileName) {
+			return errors.New("disk full")
+		}
+		return appendPrivateFile(path, payload)
 	}
 
 	decisionDone := make(chan struct{})
@@ -2971,7 +3028,7 @@ func TestSpoolDuplicateAppendRetriesDirtyWrite(t *testing.T) {
 	entry := spoolEntry{id: "evt-dup-1", ts: now.UTC().Format(time.RFC3339Nano), raw: spoolTestEnvelope(t, "evt-dup-1", now)}
 
 	injectedErr := errors.New("injected rename failure")
-	s.renameFn = func(string, string) error { return injectedErr }
+	breakSpoolWrites(s, injectedErr)
 	refused, added, _, _, persistFailed := s.append([]spoolEntry{entry}, 0, false, now, func() bool { return true })
 	if refused || len(added) != 1 || !persistFailed {
 		t.Fatalf("expected the first append accepted with a failed write, got refused=%v added=%d persistFailed=%v", refused, len(added), persistFailed)
@@ -2985,6 +3042,7 @@ func TestSpoolDuplicateAppendRetriesDirtyWrite(t *testing.T) {
 	// and no deadline rides along: before the fix this early-returned without
 	// ever retrying the dirty write.
 	s.renameFn = os.Rename
+	s.appendFn = appendPrivateFile
 	refused, added, _, _, persistFailed = s.append([]spoolEntry{entry}, 0, false, now, func() bool { return true })
 	if refused || len(added) != 0 || persistFailed {
 		t.Fatalf("expected the duplicate append to retry and land the write, got refused=%v added=%d persistFailed=%v", refused, len(added), persistFailed)
@@ -3010,7 +3068,7 @@ func TestSpoolCloseRetriesDirtyWrite(t *testing.T) {
 
 	// An append accepts the entry into the mirror but the record write fails.
 	injectedErr := errors.New("injected rename failure")
-	client.spool.renameFn = func(string, string) error { return injectedErr }
+	breakSpoolWrites(client.spool, injectedErr)
 	now := time.Now()
 	_, added, _, _, persistFailed := client.spool.append([]spoolEntry{{
 		id:  "evt-close-1",
@@ -3029,6 +3087,7 @@ func TestSpoolCloseRetriesDirtyWrite(t *testing.T) {
 	// remnant, no flush-cadence tick left) — exiting without it would lose
 	// the event despite the disk having recovered.
 	client.spool.renameFn = os.Rename
+	client.spool.appendFn = appendPrivateFile
 	if err := client.Close(context.Background()); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
