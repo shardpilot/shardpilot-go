@@ -49,6 +49,11 @@ var envelopePlatformVocabulary = map[string]string{
 	"windows":   "windows",
 }
 
+// maxWarnedPlatforms caps the reported-value set. A correct caller produces a
+// handful; a caller interpolating a version or a device id into `platform`
+// produces one per event, and that must cost a bounded amount of memory.
+const maxWarnedPlatforms = 32
+
 // normalizeEnvelopePlatform folds a host-supplied platform to the accepted
 // vocabulary, or returns "" when it maps to nothing. An empty answer means the
 // key is OMITTED from the envelope -- `platform` is optional at the door, so an
@@ -69,9 +74,40 @@ func normalizeEnvelopePlatform(value string) string {
 // Only what the host SET is reported. An unset platform is the ordinary default
 // path, and warning there would fire on every correctly-configured client.
 func (c *Client) warnUnmappedPlatform(raw string) {
-	if _, seen := c.warnedPlatforms.LoadOrStore(raw, struct{}{}); seen {
+	// NOTHING TO SAY MEANS NOTHING TO REMEMBER. `logf` is a no-op without a
+	// logger (consent.go:641), so caching here would retain unbounded host
+	// input to suppress a message that is never printed.
+	if c.cfg.Logger == nil {
 		return
 	}
+
+	c.warnedMu.Lock()
+	switch {
+	case c.warnedPlatforms[raw]:
+		c.warnedMu.Unlock()
+		return
+	case len(c.warnedPlatforms) >= maxWarnedPlatforms:
+		announce := !c.warnedPlatformsFull
+		c.warnedPlatformsFull = true
+		c.warnedMu.Unlock()
+		// SAY THAT IT STOPPED. Going quiet at the ceiling would leave a reader
+		// of the log believing the values after it were understood, which is
+		// the exact silence this diagnostic exists to break.
+		if announce {
+			c.logf("shardpilot platform: more than %d distinct unrecognised "+
+				"platform values have been configured; each is still omitted "+
+				"from the envelope, but they will no longer be logged "+
+				"individually", maxWarnedPlatforms)
+		}
+		return
+	}
+	if c.warnedPlatforms == nil {
+		c.warnedPlatforms = make(map[string]bool, maxWarnedPlatforms)
+	}
+	c.warnedPlatforms[raw] = true
+	c.warnedMu.Unlock()
+
+	// Logged OUTSIDE the lock: Printf is host code and may block or re-enter.
 	c.logf("shardpilot platform: configured platform %q is not one of the "+
 		"accepted values (web, ios, android, windows, macos, linux); it is "+
 		"omitted from the event envelope rather than sent, which would fail "+

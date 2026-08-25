@@ -3,6 +3,7 @@ package shardpilot
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -198,5 +199,57 @@ func TestSetAndUnmappedPlatformWarnsWhileUnsetIsSilent(t *testing.T) {
 				t.Errorf("warned=%v, want %v (messages: %v)", got, tc.wantWarn, *msgs)
 			}
 		})
+	}
+}
+
+// THE CACHE IS BOUNDED, AND IT SAYS WHEN IT STOPS.
+//
+// `Event.Platform` is per-event host input, so the reported-value set is keyed
+// on a cardinality the caller chooses, not one we do. A caller interpolating a
+// build id into `platform` produces a distinct value per event; retaining all of
+// them for the client's lifetime is unbounded growth driven from outside.
+func TestWarnedPlatformCacheIsBounded(t *testing.T) {
+	c, msgs, mu := newPlatformTestClient(t, "")
+	for i := 0; i < maxWarnedPlatforms*8; i++ {
+		c.warnUnmappedPlatform(fmt.Sprintf("build-%d", i))
+	}
+
+	c.warnedMu.Lock()
+	held := len(c.warnedPlatforms)
+	c.warnedMu.Unlock()
+	if held > maxWarnedPlatforms {
+		t.Errorf("retained %d distinct values, cap is %d", held, maxWarnedPlatforms)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	// One line per remembered value, plus exactly one ceiling notice -- not zero
+	// (going quiet reads as "understood") and not one per event.
+	ceilings := 0
+	for _, m := range *msgs {
+		if strings.Contains(m, "no longer be logged") {
+			ceilings++
+		}
+	}
+	if ceilings != 1 {
+		t.Errorf("ceiling announced %d time(s), want exactly 1", ceilings)
+	}
+	if len(*msgs) > maxWarnedPlatforms+1 {
+		t.Errorf("emitted %d messages for %d events; the cap did not hold",
+			len(*msgs), maxWarnedPlatforms*8)
+	}
+}
+
+// Without a logger there is nothing to suppress, so there is nothing to retain.
+func TestNoLoggerRetainsNothing(t *testing.T) {
+	c := &Client{cfg: Config{}, clock: realClock{}}
+	for i := 0; i < maxWarnedPlatforms*4; i++ {
+		c.warnUnmappedPlatform(fmt.Sprintf("build-%d", i))
+	}
+	c.warnedMu.Lock()
+	defer c.warnedMu.Unlock()
+	if n := len(c.warnedPlatforms); n != 0 {
+		t.Errorf("retained %d values with no logger configured; logf is a no-op "+
+			"there, so the cache buys nothing and costs host-controlled memory", n)
 	}
 }
