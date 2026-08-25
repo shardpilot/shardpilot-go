@@ -9,8 +9,7 @@ import (
 	"testing"
 )
 
-// TIER 1 OF THE SHARED CONFORMANCE CORPUS, copied in verbatim from
-// docs/engineering/platform-fold-corpus/vectors.json.
+// THE SHARED PLATFORM VOCABULARY, copied in verbatim.
 //
 // These vectors are NOT authored here. They were generated from the two SDKs
 // that already fold -- shardpilot-unreal's NormalizeEnvelopePlatform, compiled
@@ -97,8 +96,8 @@ func TestCorpusCopyMatchesItsDigest(t *testing.T) {
 	}
 	sum := sha256.Sum256([]byte(b.String()))
 	if got := hex.EncodeToString(sum[:])[:16]; got != corpusAssociationDigest {
-		t.Fatalf("the embedded corpus copy has drifted from the corpus: computed %s, corpus records %s -- "+
-			"re-copy from docs/engineering/platform-fold-corpus/vectors.json rather than editing a vector here",
+		t.Fatalf("the embedded copy has drifted from the shared vocabulary: computed %s, recorded %s -- "+
+			"re-copy the shared set rather than editing a vector here",
 			got, corpusAssociationDigest)
 	}
 }

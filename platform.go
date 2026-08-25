@@ -7,15 +7,16 @@ import "strings"
 // the host typed it, and the ingest vocabulary is closed -- one out-of-vocabulary
 // value fails the WHOLE batch, every event in it, not just the offending one.
 //
-// THE TABLE IS NOT AUTHORED HERE. It is tier 1 of the shared conformance corpus
-// at `docs/engineering/platform-fold-corpus/`, which was generated from the two
-// SDKs that already fold: shardpilot-unreal's NormalizeEnvelopePlatform
-// (compiled and executed) and shardpilot-godot's real vocabulary. Corpus
-// association digest: 1bd5acee111988d8 -- `platform_conformance_test.go` pins it, so this
-// table and the corpus cannot drift apart quietly.
+// THE TABLE IS NOT AUTHORED HERE. It is one shared vocabulary, generated from
+// the ShardPilot SDKs that already fold -- shardpilot-unreal's
+// NormalizeEnvelopePlatform (compiled and executed) and shardpilot-godot's real
+// vocabulary -- so that every SDK answers a given spelling identically. Its
+// revision is 1bd5acee111988d8, and `platform_conformance_test.go` recomputes
+// that from its own copy, so this table and the shared set cannot drift apart
+// quietly.
 //
-// TIER 2 (Unreal's suffix strip: "WindowsNoEditor" -> "windows") IS DELIBERATELY
-// NOT IMPLEMENTED, and the corpus permits that. Unreal has it because
+// THE SUFFIX STRIP (Unreal's "WindowsNoEditor" -> "windows") IS DELIBERATELY
+// NOT IMPLEMENTED, and the shared set permits that. Unreal has it because
 // FPlatformProperties::PlatformName() PRODUCES those spellings -- a closed source
 // with an enumerable set. Here the value is typed by a human ("Windows 11",
 // "win-x64", "PC"), so nine suffixes would not approach completeness; they would
