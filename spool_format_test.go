@@ -796,3 +796,149 @@ func TestOneBatchCannotCrossTheReadBound(t *testing.T) {
 		t.Fatalf("the file holds no backlog at all")
 	}
 }
+
+// TestAFreshGenerationInABatchIsTheOneWritten: when a batch carries an expired
+// occurrence of an id followed by a fresh one, the fresh envelope is what
+// reaches the file.
+//
+// ⚠ REBUILDING THE APPEND PAYLOAD BY ID TAKES THE FIRST OCCURRENCE, which is
+// the stale one here. The insert loop rejects the expired copy and stores the
+// fresh one, so a payload reconstructed from the original batch disagrees with
+// the mirror: the call reports the fresh event durable while the file holds the
+// copy the next start expires and drops.
+func TestAFreshGenerationInABatchIsTheOneWritten(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	s := formatTestSpool(t, dir, 2000, 1<<20)
+
+	stale := spoolEntry{
+		id:  "evt-gen",
+		ts:  now.Add(-30 * 24 * time.Hour).UTC().Format(time.RFC3339Nano),
+		raw: spoolTestEnvelope(t, "evt-gen", now.Add(-30*24*time.Hour)),
+	}
+	fresh := spoolEntry{
+		id:  "evt-gen",
+		ts:  now.UTC().Format(time.RFC3339Nano),
+		raw: spoolTestEnvelope(t, "evt-gen", now),
+	}
+	if string(stale.raw) == string(fresh.raw) {
+		t.Fatalf("fixture cannot distinguish the generations — both envelopes are identical")
+	}
+
+	refused, added, expired, _, pf := s.append([]spoolEntry{stale, fresh}, 0, false, now, func() bool { return true })
+	if refused || pf {
+		t.Fatalf("append: refused=%v persistFailed=%v", refused, pf)
+	}
+	if len(expired) != 1 {
+		t.Fatalf("the stale copy must be reported expired, got %d", len(expired))
+	}
+	if len(added) != 1 || string(added[0].raw) != string(fresh.raw) {
+		t.Fatalf("added reports the wrong generation")
+	}
+
+	s.mu.Lock()
+	onDisk := s.readRecordEntriesLocked()
+	s.mu.Unlock()
+	if len(onDisk) != 1 {
+		t.Fatalf("file holds %d records, want 1", len(onDisk))
+	}
+	if string(onDisk[0].raw) != string(fresh.raw) {
+		t.Fatalf("the file holds the STALE envelope while the call reported the fresh one durable:\n on disk: %s\n wanted:  %s",
+			onDisk[0].raw, fresh.raw)
+	}
+}
+
+// TestTheMirrorsEnvelopeSurvivesAFailedRemoval: a settled generation left on
+// disk by a failed rewrite must not overwrite the live one that replaced it.
+//
+// ⚠ SHARING AN ID IS NOT BEING THE SAME GENERATION. An ack whose rewrite failed
+// leaves the settled envelope on disk; an id reused before that retry lands
+// makes both exist at once. Merging the disk copy there persists the OLD
+// envelope while reporting the new one durable, and a restart resends the
+// settled payload and loses its replacement.
+func TestTheMirrorsEnvelopeSurvivesAFailedRemoval(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now()
+	s := formatTestSpool(t, dir, 2000, 1<<20)
+
+	oldRaw := spoolTestEnvelope(t, "evt-reuse", now.Add(-time.Hour))
+	formatAppendRaw(t, s, "evt-reuse", now.Add(-time.Hour), oldRaw)
+
+	// Ack it, but the removing rewrite fails — the settled copy stays on disk.
+	s.mu.Lock()
+	s.renameFn = func(string, string) error { return errors.New("disk full") }
+	s.appendFn = func(string, []byte) error { return errors.New("disk full") }
+	s.mu.Unlock()
+	if _, pf := s.ack([]string{"evt-reuse"}); !pf {
+		t.Fatalf("the ack's rewrite was supposed to fail — fixture cannot reach the state it describes")
+	}
+	s.mu.Lock()
+	stillOnDisk := len(s.readRecordEntriesLocked())
+	s.mu.Unlock()
+	if stillOnDisk != 1 {
+		t.Fatalf("the settled copy must still be on disk, got %d records", stillOnDisk)
+	}
+
+	// Writes recover, and the id is reused with a DIFFERENT envelope.
+	s.mu.Lock()
+	s.renameFn = os.Rename
+	s.appendFn = appendPrivateFile
+	s.mu.Unlock()
+	newRaw := spoolTestEnvelope(t, "evt-reuse", now)
+	if string(newRaw) == string(oldRaw) {
+		t.Fatalf("fixture cannot distinguish the generations")
+	}
+	formatAppendRaw(t, s, "evt-reuse", now, newRaw)
+
+	s.mu.Lock()
+	onDisk := s.readRecordEntriesLocked()
+	s.mu.Unlock()
+	if len(onDisk) != 1 {
+		t.Fatalf("file holds %d records, want 1", len(onDisk))
+	}
+	if string(onDisk[0].raw) != string(newRaw) {
+		t.Fatalf("the settled generation overwrote the live one:\n on disk: %s\n wanted:  %s",
+			onDisk[0].raw, newRaw)
+	}
+}
+
+// TestIDLessV3RecordIsAccountedNotSwallowed: an envelope with no usable
+// event_id is unprovable, not absent.
+//
+// ⚠ FILTERING IT IN THE PARSER MAKES IT VANISH WITH NO ACCOUNTING. The
+// documented behaviour is a reported fail-closed drop — load classifies it,
+// SpoolExpired counts it, OnSpoolDeadLetter surfaces it — and the v2 path has
+// always passed it through. A silent parser-level drop is a different outcome
+// wearing the same green suite.
+func TestIDLessV3RecordIsAccountedNotSwallowed(t *testing.T) {
+	header := `{"version":3}` + "\n"
+	withID := `{"raw":{"event_id":"evt-ok","event_ts":"2026-08-25T00:00:00Z"}}` + "\n"
+	noID := `{"raw":{"event_ts":"2026-08-25T00:00:00Z"}}` + "\n"
+
+	doc := parseSpoolDocument([]byte(header + withID + noID))
+	if !doc.ok {
+		t.Fatalf("parse failed")
+	}
+	live := doc.live()
+	if len(live) != 2 {
+		t.Fatalf("live = %d records, want 2 — the id-less record must reach load to be classified there, not be dropped here", len(live))
+	}
+	blank := 0
+	for _, e := range live {
+		if e.id == "" {
+			blank++
+		}
+	}
+	if blank != 1 {
+		t.Fatalf("expected exactly one id-less record carried through, got %d", blank)
+	}
+}
+
+func formatAppendRaw(t *testing.T, s *diskSpool, id string, now time.Time, raw json.RawMessage) {
+	t.Helper()
+	entry := spoolEntry{id: id, ts: now.UTC().Format(time.RFC3339Nano), raw: raw}
+	refused, _, _, _, persistFailed := s.append([]spoolEntry{entry}, 0, false, time.Now(), func() bool { return true })
+	if refused || persistFailed {
+		t.Fatalf("append %s: refused=%v persistFailed=%v", id, refused, persistFailed)
+	}
+}

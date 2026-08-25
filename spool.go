@@ -684,19 +684,35 @@ func (s *diskSpool) saveLocked() error {
 	merged := make([]spoolEntry, 0, len(s.entries))
 	seen := make(map[string]struct{}, len(s.entries))
 	foreign := 0
+	// ⚠ THE MIRROR'S ENVELOPE WINS, AND THE DISK ONLY SUPPLIES THE POSITION.
+	// A disk occurrence sharing an id with a live mirror entry is NOT proof
+	// that the two are the same generation: an ack or eviction whose rewrite
+	// failed leaves the settled envelope on disk, and an id reused before that
+	// retry lands makes both exist at once. Emitting the disk copy there would
+	// persist the OLD envelope while reporting the new one durable, and a
+	// restart would resend the settled payload and lose its replacement.
+	//
+	// Taking the mirror's entry is right in both cases: when the disk
+	// occurrence IS the live generation the two are equal, and when it is not,
+	// the mirror is authoritative. This is the rewrite path, which is already
+	// O(live), so indexing the mirror costs it nothing it was not paying.
+	live := make(map[string]spoolEntry, len(s.entries))
+	for _, entry := range s.entries {
+		live[entry.id] = entry
+	}
 	for _, entry := range s.readRecordEntriesLocked() {
 		if entry.id == "" {
 			continue
 		}
+		mirrored, isLive := live[entry.id]
 		if _, settled := s.settledIDs[entry.id]; settled {
-			// ⚠ SUPPRESSION IS PER-ID BUT THE HISTORY IS PER-GENERATION. An
-			// id stays settled after the generation it settled was removed,
-			// so a NEWER live occurrence read from the append log was being
-			// skipped here and then re-added from s.entries at the end of the
-			// merge — losing its position, and with it the order the caps
-			// evict in. If the mirror still holds the id, this occurrence is
-			// that live generation and the settle does not apply to it.
-			if _, live := s.ids[entry.id]; !live {
+			// Suppression is per-id but the history is per-generation: an id
+			// stays settled after the generation that settled it was removed,
+			// so a newer live occurrence read from the append log must not
+			// inherit it — skipping it here and re-adding it from s.entries at
+			// the end of the merge loses its position, and with it the order
+			// the caps evict in.
+			if !isLive {
 				continue
 			}
 		}
@@ -710,10 +726,12 @@ func (s *diskSpool) saveLocked() error {
 			continue
 		}
 		seen[entry.id] = struct{}{}
-		if _, ours := s.ids[entry.id]; !ours {
+		if !isLive {
 			foreign++
+			merged = append(merged, entry)
+			continue
 		}
-		merged = append(merged, entry)
+		merged = append(merged, mirrored)
 	}
 	for _, entry := range s.entries {
 		if _, dup := seen[entry.id]; dup {
@@ -1185,11 +1203,14 @@ func parseSpoolDocument(data []byte) spoolDocument {
 		if len(wire.Raw) == 0 {
 			continue
 		}
-		entry := spoolEntryFromWire(wire)
-		if entry.id == "" {
-			continue
-		}
-		ordered = append(ordered, spoolRecord{entry: entry})
+		// ⚠ AN ID-LESS RECORD IS KEPT, NOT DROPPED HERE. A syntactically valid
+		// envelope with no usable event_id is UNPROVABLE, not absent: load
+		// classifies it through spoolEntryExpired, counts it in SpoolExpired
+		// and surfaces it on OnSpoolDeadLetter. Filtering it in the parser
+		// makes it disappear with no accounting at all — a silent loss where
+		// the documented behaviour is a reported fail-closed drop, and the v2
+		// path has always passed it through.
+		ordered = append(ordered, spoolRecord{entry: spoolEntryFromWire(wire)})
 	}
 	doc.records = ordered
 	return doc
@@ -1508,6 +1529,13 @@ func (s *diskSpool) append(batch []spoolEntry, deadlineMS int64, clearStaleDeadl
 		return true, nil, nil, nil, false
 	}
 	appended := make(map[string]struct{}, len(batch))
+	// ⚠ THE ENTRIES ACTUALLY INSERTED, NOT THE BATCH THEY CAME FROM. Rebuilding
+	// this by id from `batch` takes the FIRST occurrence of an id, which is the
+	// wrong one whenever an expired copy precedes a fresh one: the loop below
+	// rejects the stale entry and stores the fresh one, but the reconstruction
+	// would hand the stale envelope to the append. The call then reports the
+	// fresh event durable while the file holds the copy a restart expires.
+	inserted := make([]spoolEntry, 0, len(batch))
 	for _, entry := range batch {
 		if entry.id == "" {
 			continue
@@ -1523,6 +1551,7 @@ func (s *diskSpool) append(batch []spoolEntry, deadlineMS int64, clearStaleDeadl
 		s.ids[entry.id] = struct{}{}
 		s.totalBytes += len(entry.raw)
 		appended[entry.id] = struct{}{}
+		inserted = append(inserted, entry)
 	}
 	deadlineChanged := false
 	if deadlineMS > 0 {
@@ -1550,20 +1579,11 @@ func (s *diskSpool) append(batch []spoolEntry, deadlineMS int64, clearStaleDeadl
 		return false, nil, expired, nil, persistFailed
 	}
 	evicted = s.evictOverCapsLocked()
-	countedAdded := make(map[string]struct{}, len(appended))
-	for _, entry := range batch {
-		if _, wasAppended := appended[entry.id]; !wasAppended {
-			continue
-		}
-		if _, counted := countedAdded[entry.id]; counted {
-			// A duplicate id within THIS batch stored only its first
-			// envelope (the insert loop's s.ids check skipped the rest):
-			// counting later occurrences would report more durably spooled
-			// events than the record holds.
-			continue
-		}
+	for _, entry := range inserted {
+		// `inserted` already holds exactly one entry per id — the one the loop
+		// above stored — so no de-duplication is needed here, and none may be
+		// applied by id lest it pick a different envelope than the mirror has.
 		if _, survived := s.ids[entry.id]; survived {
-			countedAdded[entry.id] = struct{}{}
 			added = append(added, entry)
 		}
 	}

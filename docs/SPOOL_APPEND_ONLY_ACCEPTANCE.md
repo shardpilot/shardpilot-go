@@ -82,6 +82,9 @@ flaky, so they live in the bound document instead.
 | `TestFailedCompactionKeepsSyncedAppendsCounted` | a failed rewrite does not un-count a synced append |
 | `TestOneBatchCannotCrossTheReadBound` | no single append leaves the file unloadable |
 | `TestReloadOfALargeSpoolStaysLinear` | 100k records reload in under a second |
+| `TestAFreshGenerationInABatchIsTheOneWritten` | a stale copy earlier in the batch is not the one appended |
+| `TestTheMirrorsEnvelopeSurvivesAFailedRemoval` | a settled copy left by a failed rewrite does not overwrite its replacement |
+| `TestIDLessV3RecordIsAccountedNotSwallowed` | an unprovable envelope reaches load to be classified, not dropped in the parser |
 | `TestV2FileStillLoads` | the previous release's file is not discarded |
 
 ### Mutations
@@ -101,6 +104,9 @@ stated reason:
 | evictions queued as well as returned | `TestAnEvictionIsReportedExactlyOnce` fails |
 | compaction failure treated as append failure | `TestFailedCompactionKeepsSyncedAppendsCounted` fails |
 | a per-record rescan of the replay | `TestReloadOfALargeSpoolStaysLinear` — *"took 2.98s, over the 1s bound"* |
+| append payload rebuilt by id from the batch | `TestAFreshGenerationInABatchIsTheOneWritten` — *"added reports the wrong generation"* |
+| disk copy assumed to be the live generation | `TestTheMirrorsEnvelopeSurvivesAFailedRemoval` — *"the settled generation overwrote the live one"* |
+| id-less v3 record filtered in the parser | `TestIDLessV3RecordIsAccountedNotSwallowed` — *"live = 1 records, want 2"* |
 
 ⚠ **Five of these mutations survived the first time, and every one of them was a
 wrong TEST rather than wrong code — always the same shape: the assertion was
@@ -222,3 +228,22 @@ against, so it needs this change before Godot, Unreal and Defold implement the
 older rule. Tracked as part of A6-spool rather than done here: this repository
 does not own that document, and editing another SDK's design doc from inside a
 Go PR would be the wrong place to make a cross-SDK format decision visible.
+
+
+## ⚠ Sharing an id is not being the same generation
+
+Three of round 4's findings are one mistake in three places: **an event id is not
+a version.** The same id can exist twice at once — a settled copy a failed
+rewrite left on disk beside the live one that replaced it, an expired copy
+earlier in the same batch as a fresh one — and every place that indexed *by id*
+and then acted on the entry it found could act on the wrong one:
+
+| where | what it picked | what it should have |
+|---|---|---|
+| the append payload | the first batch occurrence of the id | the entry actually inserted |
+| the merge | the disk occurrence, on the grounds the mirror held that id | the mirror's entry, positioned by the disk's |
+| round 3's settled filter | suppressed by id, ignoring generation | keyed to the live entry |
+
+The rule that falls out, and the one the four remaining ports need: **an id
+identifies which record, never which version of it.** Where a version matters,
+carry the entry, not the id.
