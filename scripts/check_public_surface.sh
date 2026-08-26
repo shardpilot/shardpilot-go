@@ -2408,7 +2408,11 @@ fi
 # wrong file -- observed, not imagined, while testing this very change. A
 # marker turns that into a refusal instead of a confident wrong answer.
 LANE_B_FORMAT=2
-lane_b_version="$(grep -m1 '^# format-version:' "$LANE_B_BASELINE" | tr -dc '0-9' || true)"
+# Same rule as above: grep's 1 is "no such line" and is legitimate (a format-1
+# file has no marker); anything higher is a read failure and must not arrive
+# here disguised as an old format.
+lane_b_version="$(grep -m1 '^# format-version:' "$LANE_B_BASELINE" || [ $? -eq 1 ])"
+lane_b_version="$(printf '%s' "$lane_b_version" | tr -dc '0-9')"
 if [ "${lane_b_version:-1}" != "$LANE_B_FORMAT" ]; then
   # refusal:structural
   echo "REFUSING: $LANE_B_BASELINE is format ${lane_b_version:-1}, this script reads $LANE_B_FORMAT." >&2
@@ -2456,23 +2460,28 @@ if [ -n "${PUBLIC_SURFACE_BASE_REF:-}" ]; then
   # run while the branch run stayed green, because only the merge run has a base.
   base_copy=""
 
-  # ⚠ ABSENCE AND FAILURE, SEPARATED BY A SEPARATE QUESTION. `git show` failing
-  # covers both "the target has no such path" and "the object store is
-  # incomplete or unreadable", and only the first is a fact about the world.
-  # cat-file -e answers existence alone, so a failure AFTER it is an instrument
-  # problem and refuses instead of quietly skipping the anti-cheat.
-  if git cat-file -e "${PUBLIC_SURFACE_BASE_REF}:${LANE_B_BASELINE}" 2>/dev/null; then
+  # ⚠ THE PROBE ITSELF MUST BE UNAMBIGUOUS -- this is the sixth time on this
+  # change that a "nothing came back" was read as "there is nothing". Patching
+  # each site was not working, so the SHAPE of the question changed instead.
+  #
+  # `cat-file -e` fails for BOTH a missing path and a broken lookup, so its
+  # nonzero says nothing on its own. `ls-tree <ref> -- <path>` separates them:
+  # it exits 0 whether or not the path is there and prints a line only when it
+  # is, so success-with-empty-output IS absence and a nonzero IS an instrument
+  # failure. One question, one meaning per answer.
+  if ! base_listing="$(git ls-tree --name-only "${PUBLIC_SURFACE_BASE_REF}" -- "${LANE_B_BASELINE}")"; then
+    # refusal:structural
+    echo "REFUSING: could not list ${LANE_B_BASELINE} on ${PUBLIC_SURFACE_BASE_REF}." >&2
+    echo "  That is a broken object store or an unreadable tree, not an absent" >&2
+    echo "  baseline, and skipping the anti-cheat on it is how this gate stops" >&2
+    echo "  being one." >&2
+    exit 2
+  fi
+  if [ -n "$base_listing" ]; then
     if ! base_copy="$(git show "${PUBLIC_SURFACE_BASE_REF}:${LANE_B_BASELINE}")"; then
       # refusal:structural
-      echo "REFUSING: ${PUBLIC_SURFACE_BASE_REF}:${LANE_B_BASELINE} exists but could not be read." >&2
+      echo "REFUSING: ${PUBLIC_SURFACE_BASE_REF}:${LANE_B_BASELINE} is listed but could not be read." >&2
       exit 2
-    fi
-    base_version="$(printf '%s' "$base_copy" | grep -m1 '^# format-version:' | tr -dc '0-9' || true)"
-    if [ "${base_version:-1}" != "$LANE_B_FORMAT" ]; then
-      # A version skew is not a finding about the code; say so and stop rather
-      # than comparing numbers that mean different things.
-      echo "  (baseline-vs-target check skipped: target baseline is format ${base_version:-1}, this script reads $LANE_B_FORMAT)"
-      base_copy=""
     fi
   fi
   if [ -n "$base_copy" ]; then
