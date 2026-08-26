@@ -2301,6 +2301,17 @@ else
 fi
 
 echo
+echo
+# ⚠ LANE A IS JUDGED FIRST, and the ratchet below depends on that ordering.
+# --write-baseline exits early on success, so running it here rather than above
+# means the command recommended for paying lane B debt can no longer report
+# success over an unreported lane A violation on the gated surface.
+if [ -n "$scan_lane_a" ]; then
+  echo "FAIL — internal material in the published non-source surface:" >&2
+  printf '%s' "$scan_lane_a" >&2
+  exit 1
+fi
+
 # ── LANE B RATCHET ────────────────────────────────────────────────────────────
 # Lane B cannot be gated AT ZERO today: 33 matching lines already exist, and
 # failing on them would break every build until that debt is paid. That is why
@@ -2325,7 +2336,12 @@ echo
 # upward in the same change is not a ratchet — it is a comment.
 LANE_B_BASELINE="${LANE_B_BASELINE:-scripts/public-surface-lane-b-baseline.txt}"
 
-lane_b_now="$(printf '%s' "$scan_lane_b_counts" | grep -v '^$' | sort)"
+# `|| true`: grep exits 1 on NO MATCH, and under `set -euo pipefail` that kills
+# the assignment. An empty tally is not an error -- it is the state this whole
+# lane exists to reach, the one where the debt is paid and *.go folds into lane
+# A. Without this the ratchet aborts on the last removal, so the gate could
+# never arrive at its own success condition.
+lane_b_now="$(printf '%s' "$scan_lane_b_counts" | grep -v '^$' | sort || true)"
 
 if [ "${1:-}" = "--write-baseline" ]; then
   {
@@ -2359,7 +2375,8 @@ if [ ! -f "$LANE_B_BASELINE" ]; then
   exit 2
 fi
 
-lane_b_base="$(grep -v '^#' "$LANE_B_BASELINE" | grep -v '^$' | sort)"
+# Same reason: a baseline holding only its header comments is the paid state.
+lane_b_base="$(grep -v '^#' "$LANE_B_BASELINE" | grep -v '^$' | sort || true)"
 
 if [ "$lane_b_now" != "$lane_b_base" ]; then
   echo "FAIL — lane B moved and the baseline did not agree:" >&2
@@ -2394,8 +2411,20 @@ if [ -n "${PUBLIC_SURFACE_BASE_REF:-}" ]; then
   if base_copy="$(git show "${PUBLIC_SURFACE_BASE_REF}:${LANE_B_BASELINE}" 2>/dev/null)"; then
     while read -r path count; do
       [ -n "$path" ] || continue
-      was="$(printf '%s' "$base_copy" | grep -v '^#' | awk -v p="$path" '$1 == p {print $2}')"
-      [ -n "$was" ] || continue
+      was="$(printf '%s' "$base_copy" | grep -v '^#' | awk -v p="$path" '$1 == p {print $2}' || true)"
+      if [ -z "$was" ]; then
+        # ⚠ ABSENT IS ZERO, NOT "NOTHING TO COMPARE". Skipping here was the hole:
+        # a change that puts the first matching line into a previously CLEAN file
+        # and regenerates the baseline produces an entry with no counterpart, so
+        # the scan agrees with the baseline and the target check had nothing to
+        # object to. That is the same cheat this block exists to stop, entering
+        # by a different door. A renamed file lands here too, and that is right:
+        # carrying internal material to a new path is a decision, not a move.
+        echo "FAIL — $path carries $count lane B occurrence(s) and is absent from" >&2
+        echo "  the target's baseline. A file with no entry there had none: this is" >&2
+        echo "  new internal material in a public SDK, however the baseline reads." >&2
+        exit 1
+      fi
       if [ "$count" -gt "$was" ]; then
         echo "FAIL — the baseline was raised for $path ($was -> $count)." >&2
         echo "  Editing this file upward is not a way to introduce internal material." >&2
@@ -2412,11 +2441,5 @@ fi
 
 echo "LANE B RATCHET — held at $(printf '%s' "$lane_b_now" | grep -c . ) file(s), $(printf '%s' "$lane_b_now" | awk '{n += $2} END {print n + 0}') occurrence(s). The number may fall and may not rise."
 
-echo
-if [ -n "$scan_lane_a" ]; then
-  echo "FAIL — internal material in the published non-source surface:" >&2
-  printf '%s' "$scan_lane_a" >&2
-  exit 1
-fi
 gate_finished=yes
 echo "LANE A (GATED) — clean. ${scan_files} tracked file(s) were read; a run that scanned none refuses above rather than reporting this line."
