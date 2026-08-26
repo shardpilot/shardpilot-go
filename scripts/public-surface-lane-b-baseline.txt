@@ -1,0 +1,21 @@
+# Lane B occurrences per file, as of the commit that wrote this.
+# Written by: scripts/check_public_surface.sh --write-baseline
+#
+# THIS FILE ONLY EVER SHRINKS. The scan fails when a count here rises,
+# when a file appears that is not here, and when a number here is higher
+# than the same number on the merge target. It also fails when a count
+# FALLS without this file being updated, so paying debt is recorded
+# rather than silently banked as slack.
+#
+# Format: <path> <occurrences>
+config.go 7
+consent_outbox.go 1
+experiments.go 4
+pkg/crash/capture.go 1
+pkg/crash/capture_phase_d_test.go 2
+pkg/crash/client.go 4
+pkg/crash/goroutines.go 1
+pkg/crash/selfmodule.go 1
+remote_config.go 7
+remote_config_test.go 3
+schema_revision.go 2
