@@ -267,12 +267,19 @@ jobs:
       #
       # push to an existing ref: github.event.before is the pre-push tip.
       #
-      # push CREATING a ref: before is all zeros -- because the REF did not
-      #   exist, not because the commit has no parent. Leaving the base unset
-      #   there would let an ordinary new branch, cut from an existing commit,
-      #   add a match and raise the baseline together. So deepen the shallow
-      #   clone by one and compare against the pushed commit's own parent. Only
-      #   a genuine parentless commit ends with no base.
+      # push CREATING a ref: NO BASE, AND THIS ARM DOES NOT GATE. before is all
+      #   zeros here and there is no honest substitute. The pushed commit's
+      #   first parent may itself be newly published -- a branch pushing several
+      #   commits at once -- so comparing against it compares new work with new
+      #   work, and finding a genuinely published ancestor needs history a
+      #   shallow clone does not have.
+      #
+      #   That is acceptable because a new ref cannot reach main without passing
+      #   one of the other two arms: the pull_request arm on the PR that merges
+      #   it, or, for a direct push to main, the existing-ref arm above where
+      #   before is real. A branch is not a publication. Saying this arm does
+      #   not gate is better than a comparison that looks like one and is not.
+
       - name: Fetch the comparison base for the lane B ratchet
         run: |
           set -euo pipefail
@@ -285,9 +292,6 @@ jobs:
           elif [ -n "$before" ] && [ "$before" != "$zero" ]; then
             git fetch --depth=1 origin "$before"
             echo "SP_LANE_B_BASE=FETCH_HEAD" >> "$GITHUB_ENV"
-          elif git fetch --deepen=1 origin && git rev-parse --verify --quiet 'HEAD^{commit}' >/dev/null \
-            && git rev-parse --verify --quiet 'HEAD~1^{commit}' >/dev/null; then
-            echo "SP_LANE_B_BASE=HEAD~1" >> "$GITHUB_ENV"
           else
             echo "SP_LANE_B_BASE=" >> "$GITHUB_ENV"
           fi

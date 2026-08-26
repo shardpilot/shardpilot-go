@@ -2448,7 +2448,17 @@ if [ -n "${PUBLIC_SURFACE_BASE_REF:-}" ]; then
     echo "  variable deliberately if there is genuinely nothing to compare." >&2
     exit 2
   fi
-  if base_copy="$(git show "${PUBLIC_SURFACE_BASE_REF}:${LANE_B_BASELINE}" 2>/dev/null)"; then
+  # ⚠ ABSENCE AND FAILURE, SEPARATED BY A SEPARATE QUESTION. `git show` failing
+  # covers both "the target has no such path" and "the object store is
+  # incomplete or unreadable", and only the first is a fact about the world.
+  # cat-file -e answers existence alone, so a failure AFTER it is an instrument
+  # problem and refuses instead of quietly skipping the anti-cheat.
+  if git cat-file -e "${PUBLIC_SURFACE_BASE_REF}:${LANE_B_BASELINE}" 2>/dev/null; then
+    if ! base_copy="$(git show "${PUBLIC_SURFACE_BASE_REF}:${LANE_B_BASELINE}")"; then
+      # refusal:structural
+      echo "REFUSING: ${PUBLIC_SURFACE_BASE_REF}:${LANE_B_BASELINE} exists but could not be read." >&2
+      exit 2
+    fi
     base_version="$(printf '%s' "$base_copy" | grep -m1 '^# format-version:' | tr -dc '0-9' || true)"
     if [ "${base_version:-1}" != "$LANE_B_FORMAT" ]; then
       # A version skew is not a finding about the code; say so and stop rather
@@ -2458,7 +2468,16 @@ if [ -n "${PUBLIC_SURFACE_BASE_REF:-}" ]; then
     fi
   fi
   if [ -n "$base_copy" ]; then
-    while read -r count path; do
+    # ⚠ IFS= AND A MANUAL SPLIT. `read -r count path` uses the default
+    # whitespace IFS, which strips LEADING spaces from the last field: a file
+    # named " config.go" serializes as "7  config.go" and would be read as
+    # path "config.go", matching the ordinary file's target entry and passing.
+    # git permits that filename. The count is everything before the first
+    # space; the path is everything after it, byte for byte.
+    while IFS= read -r row; do
+      [ -n "$row" ] || continue
+      count="${row%% *}"
+      path="${row#* }"
       [ -n "$path" ] || continue
       # $1 is the count and everything after it is the path, matching the
       # writer above; a path with spaces still compares whole.
