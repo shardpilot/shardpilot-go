@@ -1577,7 +1577,26 @@ scan_tree() {
         # PER-FILE tally, for the ratchet below. Counting per file rather than
         # one grand total is what makes the baseline diffable and the failure
         # legible: a reviewer sees WHICH file grew, not that a number moved.
-        scan_lane_b_counts="${scan_lane_b_counts}${f} ${scan_lane_b_this_file}"$'\n'
+        #
+        # ⚠ COUNT FIRST, PATH LAST, and that order is the point. git permits a
+        # path to contain spaces, and `read -r path count` on "a.go 1 b.go 1"
+        # would bind count to "1 b.go 1"; the later `-gt` then errors, evaluates
+        # FALSE inside its `if`, and the gate passes over a real increase. With
+        # the count leading, `read -r count path` gives the rest of the line to
+        # the path and the arithmetic always sees a number.
+        # $'\n' and not "$(printf '\n')": command substitution STRIPS trailing
+        # newlines, so the latter is the empty string and the pattern *""*
+        # matches every path. Caught by this gate refusing on a perfectly
+        # ordinary filename, which is the failure mode fail-closed buys you.
+        case "$f" in
+          *$'\n'*)
+            # refusal:structural — a newline in a path breaks any line-oriented
+            # record, and silently mis-parsing one is how this gate would lie.
+            echo "REFUSING: tracked path contains a newline: $f" >&2
+            exit 2
+            ;;
+        esac
+        scan_lane_b_counts="${scan_lane_b_counts}${scan_lane_b_this_file} ${f}"$'\n'
         ;;
       *)
         # No `sed "s|^|$f:|"`: the filename lands in the s-command's delimiter
@@ -2249,7 +2268,7 @@ EOF
     echo "SELFTEST: the per-file lane B tally holds $(printf '%s' "$scan_lane_b_counts" | grep -c .) row(s), expected 2" >&2
     fixture_fail=1; }
   fixture_checks=$((fixture_checks + 1))
-  [ "$(printf '%s' "$scan_lane_b_counts" | awk '{n += $2} END {print n + 0}')" -eq "$scan_lane_b_lines" ] || {
+  [ "$(printf '%s' "$scan_lane_b_counts" | awk '{n += $1} END {print n + 0}')" -eq "$scan_lane_b_lines" ] || {
     echo "SELFTEST: the per-file tally does not sum to the lane B line count" >&2; fixture_fail=1; }
   # ⚠ A COUNT THAT MUST BE REACHED. Every assertion above is invisible when it
   # is deleted, and a run that asserts nothing prints the same closing line as
@@ -2336,12 +2355,17 @@ fi
 # upward in the same change is not a ratchet — it is a comment.
 LANE_B_BASELINE="${LANE_B_BASELINE:-scripts/public-surface-lane-b-baseline.txt}"
 
-# `|| true`: grep exits 1 on NO MATCH, and under `set -euo pipefail` that kills
-# the assignment. An empty tally is not an error -- it is the state this whole
-# lane exists to reach, the one where the debt is paid and *.go folds into lane
-# A. Without this the ratchet aborts on the last removal, so the gate could
-# never arrive at its own success condition.
-lane_b_now="$(printf '%s' "$scan_lane_b_counts" | grep -v '^$' | sort || true)"
+# ⚠ STATUS 1 IS "NO MATCH"; ANYTHING ABOVE IT IS A BROKEN INSTRUMENT. An empty
+# result is not an error -- it is the state this lane exists to reach, where the
+# debt is paid and *.go folds into lane A -- so grep's 1 must not kill the
+# assignment under `set -euo pipefail`. But a blanket `|| true` also swallows a
+# real read failure, and at zero debt that converts an unreadable baseline into
+# the same empty string a paid one produces: both sides empty, equality passes,
+# and the gate reports success WITHOUT HAVING READ ITS BASELINE. So the status
+# is captured and only 0 and 1 are accepted.
+lane_b_now="$(printf '%s' "$scan_lane_b_counts" | { grep -v '^$' || [ $? -eq 1 ]; } | sort -k2)"
+
+
 
 if [ "${1:-}" = "--write-baseline" ]; then
   {
@@ -2354,7 +2378,8 @@ if [ "${1:-}" = "--write-baseline" ]; then
     echo "# FALLS without this file being updated, so paying debt is recorded"
     echo "# rather than silently banked as slack."
     echo "#"
-    echo "# Format: <path> <occurrences>"
+    echo "# format-version: 2"
+    echo "# Format: <occurrences> <path> -- count FIRST so a path may contain spaces"
     printf '%s\n' "$lane_b_now"
   } > "$LANE_B_BASELINE"
   echo "WROTE $LANE_B_BASELINE"
@@ -2375,8 +2400,23 @@ if [ ! -f "$LANE_B_BASELINE" ]; then
   exit 2
 fi
 
-# Same reason: a baseline holding only its header comments is the paid state.
-lane_b_base="$(grep -v '^#' "$LANE_B_BASELINE" | grep -v '^$' | sort || true)"
+# Same rule, and this is the read the P2 above is really about: `-f` passed, so
+# the file exists; a failure here is permission or I/O, not absence.
+# ⚠ THE TARGET'S COPY IS FROM AN EARLIER COMMIT, so it can predate a change to
+# this format. Version 1 was "<path> <occurrences>"; reading one of those with
+# the version 2 parser binds the PATH to the count field and reports about the
+# wrong file -- observed, not imagined, while testing this very change. A
+# marker turns that into a refusal instead of a confident wrong answer.
+LANE_B_FORMAT=2
+lane_b_version="$(grep -m1 '^# format-version:' "$LANE_B_BASELINE" | tr -dc '0-9' || true)"
+if [ "${lane_b_version:-1}" != "$LANE_B_FORMAT" ]; then
+  # refusal:structural
+  echo "REFUSING: $LANE_B_BASELINE is format ${lane_b_version:-1}, this script reads $LANE_B_FORMAT." >&2
+  echo "  Regenerate it with: $0 --write-baseline" >&2
+  exit 2
+fi
+
+lane_b_base="$(grep -v '^#' "$LANE_B_BASELINE" | { grep -v '^$' || [ $? -eq 1 ]; } | sort -k2)"
 
 if [ "$lane_b_now" != "$lane_b_base" ]; then
   echo "FAIL — lane B moved and the baseline did not agree:" >&2
@@ -2409,9 +2449,21 @@ if [ -n "${PUBLIC_SURFACE_BASE_REF:-}" ]; then
     exit 2
   fi
   if base_copy="$(git show "${PUBLIC_SURFACE_BASE_REF}:${LANE_B_BASELINE}" 2>/dev/null)"; then
-    while read -r path count; do
+    base_version="$(printf '%s' "$base_copy" | grep -m1 '^# format-version:' | tr -dc '0-9' || true)"
+    if [ "${base_version:-1}" != "$LANE_B_FORMAT" ]; then
+      # A version skew is not a finding about the code; say so and stop rather
+      # than comparing numbers that mean different things.
+      echo "  (baseline-vs-target check skipped: target baseline is format ${base_version:-1}, this script reads $LANE_B_FORMAT)"
+      base_copy=""
+    fi
+  fi
+  if [ -n "$base_copy" ]; then
+    while read -r count path; do
       [ -n "$path" ] || continue
-      was="$(printf '%s' "$base_copy" | grep -v '^#' | awk -v p="$path" '$1 == p {print $2}' || true)"
+      # $1 is the count and everything after it is the path, matching the
+      # writer above; a path with spaces still compares whole.
+      was="$(printf '%s' "$base_copy" | grep -v '^#' \
+        | awk -v p="$path" '{ c = $1; $1 = ""; sub(/^ /, ""); if ($0 == p) print c }')"
       if [ -z "$was" ]; then
         # ⚠ ABSENT IS ZERO, NOT "NOTHING TO COMPARE". Skipping here was the hole:
         # a change that puts the first matching line into a previously CLEAN file
@@ -2439,7 +2491,7 @@ else
   echo "  (baseline-vs-target check skipped: PUBLIC_SURFACE_BASE_REF unset — CI sets it)"
 fi
 
-echo "LANE B RATCHET — held at $(printf '%s' "$lane_b_now" | grep -c . ) file(s), $(printf '%s' "$lane_b_now" | awk '{n += $2} END {print n + 0}') occurrence(s). The number may fall and may not rise."
+echo "LANE B RATCHET — held at $(printf '%s' "$lane_b_now" | grep -c . ) file(s), $(printf '%s' "$lane_b_now" | awk '{n += $1} END {print n + 0}') occurrence(s). The number may fall and may not rise."
 
 gate_finished=yes
 echo "LANE A (GATED) — clean. ${scan_files} tracked file(s) were read; a run that scanned none refuses above rather than reporting this line."

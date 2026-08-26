@@ -7,15 +7,16 @@
 # FALLS without this file being updated, so paying debt is recorded
 # rather than silently banked as slack.
 #
-# Format: <path> <occurrences>
-config.go 7
-consent_outbox.go 1
-experiments.go 4
-pkg/crash/capture.go 1
-pkg/crash/capture_phase_d_test.go 2
-pkg/crash/client.go 4
-pkg/crash/goroutines.go 1
-pkg/crash/selfmodule.go 1
-remote_config.go 7
-remote_config_test.go 3
-schema_revision.go 2
+# format-version: 2
+# Format: <occurrences> <path> -- count FIRST so a path may contain spaces
+7 config.go
+1 consent_outbox.go
+4 experiments.go
+1 pkg/crash/capture.go
+2 pkg/crash/capture_phase_d_test.go
+4 pkg/crash/client.go
+1 pkg/crash/goroutines.go
+1 pkg/crash/selfmodule.go
+7 remote_config.go
+3 remote_config_test.go
+2 schema_revision.go

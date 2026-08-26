@@ -256,24 +256,38 @@ jobs:
       # tree's baseline against an EARLIER one, so that raising a number in the
       # same change that adds the occurrence is caught.
       #
-      # ⚠ BOTH EVENTS NEED A BASE, and only one of them is the merge target. On
-      # a pull_request that is the base branch. On a PUSH -- including a direct
-      # push to main -- github.base_ref is empty, and leaving the variable unset
-      # there would disable the anti-cheat on exactly the path that has no
-      # review in front of it: one commit could add a lane B match and rewrite
-      # the baseline together. github.event.before is that commit's predecessor
-      # and is the right comparison. It is all zeros when a branch is created,
-      # which genuinely has no predecessor; that is the only case left unset.
+      # ⚠ THREE CASES, AND EACH NEEDED ITS OWN ANSWER.
+      #
+      # pull_request: fetch the event's IMMUTABLE base sha, not the branch NAME.
+      #   A refspec resolves in the remote at fetch time, so if the base branch
+      #   pays lane B debt between the event and this job, the checked-out
+      #   merge commit would be compared against a newer, smaller baseline and
+      #   an untouched PR would fail. The event's base.sha is the snapshot the
+      #   event was built from and cannot move under us.
+      #
+      # push to an existing ref: github.event.before is the pre-push tip.
+      #
+      # push CREATING a ref: before is all zeros -- because the REF did not
+      #   exist, not because the commit has no parent. Leaving the base unset
+      #   there would let an ordinary new branch, cut from an existing commit,
+      #   add a match and raise the baseline together. So deepen the shallow
+      #   clone by one and compare against the pushed commit's own parent. Only
+      #   a genuine parentless commit ends with no base.
       - name: Fetch the comparison base for the lane B ratchet
         run: |
           set -euo pipefail
+          base_sha='${{ github.event.pull_request.base.sha }}'
           before='${{ github.event.before }}'
-          if [ -n '${{ github.base_ref }}' ]; then
-            git fetch --depth=1 origin '${{ github.base_ref }}'
+          zero='0000000000000000000000000000000000000000'
+          if [ -n "$base_sha" ]; then
+            git fetch --depth=1 origin "$base_sha"
             echo "SP_LANE_B_BASE=FETCH_HEAD" >> "$GITHUB_ENV"
-          elif [ -n "$before" ] && [ "$before" != "0000000000000000000000000000000000000000" ]; then
+          elif [ -n "$before" ] && [ "$before" != "$zero" ]; then
             git fetch --depth=1 origin "$before"
             echo "SP_LANE_B_BASE=FETCH_HEAD" >> "$GITHUB_ENV"
+          elif git fetch --deepen=1 origin && git rev-parse --verify --quiet 'HEAD^{commit}' >/dev/null \
+            && git rev-parse --verify --quiet 'HEAD~1^{commit}' >/dev/null; then
+            echo "SP_LANE_B_BASE=HEAD~1" >> "$GITHUB_ENV"
           else
             echo "SP_LANE_B_BASE=" >> "$GITHUB_ENV"
           fi
