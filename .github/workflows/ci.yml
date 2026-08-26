@@ -252,6 +252,61 @@ jobs:
       # This repository is already public, so it is NOT in the org's
       # publication-candidate list and nothing else scans it. See the script's
       # header for what the two lanes do and do not cover.
+      # One extra commit, not a full history: the lane B ratchet compares this
+      # tree's baseline against an EARLIER one, so that raising a number in the
+      # same change that adds the occurrence is caught.
+      #
+      # ⚠ THREE CASES, AND EACH NEEDED ITS OWN ANSWER.
+      #
+      # pull_request: fetch the event's IMMUTABLE base sha, not the branch NAME.
+      #   A refspec resolves in the remote at fetch time, so if the base branch
+      #   pays lane B debt between the event and this job, the checked-out
+      #   merge commit would be compared against a newer, smaller baseline and
+      #   an untouched PR would fail. The event's base.sha is the snapshot the
+      #   event was built from and cannot move under us.
+      #
+      # push to an existing ref: github.event.before is the pre-push tip.
+      #
+      # push CREATING a ref: COMPARE AGAINST THE DEFAULT BRANCH.
+      #
+      #   I removed this arm once, arguing "a branch is not a publication" and
+      #   that a new ref reaches main only through the other two arms. THE
+      #   HEADER OF THIS FILE SAYS OTHERWISE, three lines from where I was
+      #   editing: "This repository is PUBLIC: a branch pushed here is readable
+      #   the moment it lands, whether or not a pull request ever opens", and
+      #   tags are "the artifact people install, and one release here was cut
+      #   off-main". Publication is not reaching main. It is being readable.
+      #
+      #   `before` is all zeros here, and the pushed commit's own parent is not a
+      #   baseline either -- on a branch publishing several commits it is itself
+      #   newly published. So the comparison is against the DEFAULT BRANCH: a ref
+      #   that certainly exists, certainly is published, and answers the question
+      #   this arm actually asks -- does this ref expose more internal material
+      #   than what is already public?
+      #
+      #   A branch cut from an older main can fail here after main pays debt. That
+      #   is a false alarm with an obvious remedy (rebase, or regenerate), and it
+      #   is the cheaper error: the alternative was publishing unreviewed material
+      #   with a green tick.
+      - name: Fetch the comparison base for the lane B ratchet
+        run: |
+          set -euo pipefail
+          base_sha='${{ github.event.pull_request.base.sha }}'
+          before='${{ github.event.before }}'
+          zero='0000000000000000000000000000000000000000'
+          if [ -n "$base_sha" ]; then
+            git fetch --depth=1 origin "$base_sha"
+            echo "SP_LANE_B_BASE=FETCH_HEAD" >> "$GITHUB_ENV"
+          elif [ -n "$before" ] && [ "$before" != "$zero" ]; then
+            git fetch --depth=1 origin "$before"
+            echo "SP_LANE_B_BASE=FETCH_HEAD" >> "$GITHUB_ENV"
+          else
+            git fetch --depth=1 origin "${{ github.event.repository.default_branch }}"
+            echo "SP_LANE_B_BASE=FETCH_HEAD" >> "$GITHUB_ENV"
+          fi
+
       - name: No internal material in the published non-source surface
         run: ./scripts/check_public_surface.sh
+        env:
+          PUBLIC_SURFACE_BASE_REF: ${{ env.SP_LANE_B_BASE }}
 
