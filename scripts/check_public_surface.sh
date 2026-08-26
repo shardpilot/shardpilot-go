@@ -2448,6 +2448,14 @@ if [ -n "${PUBLIC_SURFACE_BASE_REF:-}" ]; then
     echo "  variable deliberately if there is genuinely nothing to compare." >&2
     exit 2
   fi
+  # ⚠ SET BEFORE ASKED. `set -u` makes an unassigned base_copy fatal at the
+  # first expansion, and the branch that leaves it unassigned is precisely the
+  # advertised legal skip -- a target that predates this file. So the skip
+  # aborted the run instead of skipping, on every change that introduces the
+  # baseline, this one included. Observed as a red `public-surface` on the merge
+  # run while the branch run stayed green, because only the merge run has a base.
+  base_copy=""
+
   # ⚠ ABSENCE AND FAILURE, SEPARATED BY A SEPARATE QUESTION. `git show` failing
   # covers both "the target has no such path" and "the object store is
   # incomplete or unreadable", and only the first is a fact about the world.
@@ -2479,10 +2487,19 @@ if [ -n "${PUBLIC_SURFACE_BASE_REF:-}" ]; then
       count="${row%% *}"
       path="${row#* }"
       [ -n "$path" ] || continue
-      # $1 is the count and everything after it is the path, matching the
-      # writer above; a path with spaces still compares whole.
-      was="$(printf '%s' "$base_copy" | grep -v '^#' \
-        | awk -v p="$path" '{ c = $1; $1 = ""; sub(/^ /, ""); if ($0 == p) print c }')"
+      # ⚠ NO awk -v FOR THE PATH. A -v assignment PROCESSES BACKSLASH ESCAPES,
+      # so a tracked `foo\141.go` would be decoded to `fooa.go` and borrow that
+      # file's count -- an increase passing as an existing entry. The comparison
+      # is done in the shell instead, where the two strings are compared byte
+      # for byte and nothing interprets anything.
+      was=""
+      while IFS= read -r brow; do
+        case "$brow" in '#'*|'') continue ;; esac
+        if [ "${brow#* }" = "$path" ]; then
+          was="${brow%% *}"
+          break
+        fi
+      done <<< "$base_copy"
       if [ -z "$was" ]; then
         # ⚠ ABSENT IS ZERO, NOT "NOTHING TO COMPARE". Skipping here was the hole:
         # a change that puts the first matching line into a previously CLEAN file
