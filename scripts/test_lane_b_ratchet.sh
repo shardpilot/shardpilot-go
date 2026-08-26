@@ -36,6 +36,16 @@ export LANE_B_BASELINE="$BASELINE"
 # overwrote that file and the trap could not restore it. ENV is the same hazard
 # for a POSIX sh child.
 unset BASH_ENV ENV
+
+# ⚠ AND THE COMPARISON REF IS AMBIENT TOO. The gate reads
+# PUBLIC_SURFACE_BASE_REF with a default, so an exported value reaches every
+# plain `expect` below -- which are the controls meant to exercise the
+# CURRENT-TREE behaviour and nothing else. An unresolvable inherited ref turns
+# the clean control into an exit 2; a resolvable one with a smaller baseline
+# turns it into the anti-cheat refusal. Either way the harness fails for a
+# reason that has nothing to do with the control under test. expect_ref supplies
+# it explicitly, per call, and is the only thing that may.
+unset PUBLIC_SURFACE_BASE_REF
 # ⚠ EVERY TARGET IS SYNTHESIZED FROM HEAD, and none is fetched. CI clones at
 # depth 1, so `origin/main~1` does not exist there and a harness leaning on it
 # would silently skip its own controls on the one machine that matters. Building
@@ -111,6 +121,32 @@ SAVED="$(mktemp)"; cp "$BASELINE" "$SAVED"
 RESTORE_PATHS=("$BASELINE" config.go)
 NEW_FILE=zz_lane_b_probe.go
 
+# ⚠ A HARD LINK IS A SECOND NAME FOR ONE INODE, AND GIT KNOWS ONLY THE FIRST.
+# Linking config.go or the baseline to a path outside this worktree leaves
+# `git status --porcelain` clean, so the dirty-tree guard passes. The appends
+# below then write THROUGH the inode and change every name for it, while the
+# restore replaces only the worktree entry -- with a NEW inode, since
+# `git checkout` writes a fresh file. So the outside name keeps the harness's
+# edit permanently, and nothing in this script can reach it to undo that.
+#
+# `ls -ld` field 2 is the link count on GNU and BSD alike; `stat` spells it
+# differently on each, and this gate documents bash 3.2 systems as supported.
+for linked in "${RESTORE_PATHS[@]}"; do
+  links="$(ls -ld "$linked" 2>/dev/null | awk '{print $2}')"
+  case "$links" in
+    ''|*[!0-9]*)
+      echo "REFUSING: could not read the hard-link count of $linked." >&2
+      exit 2
+      ;;
+  esac
+  if [ "$links" -gt 1 ]; then
+    echo "REFUSING: $linked has $links hard links." >&2
+    echo "  This test writes through the inode, so it would modify every other" >&2
+    echo "  name for it, and the restore can only put back this one." >&2
+    exit 2
+  fi
+done
+
 # ⚠ SCRATCH NAMES ARE NOT AUTOMATICALLY FREE. An IGNORED file at one of these
 # paths -- via .git/info/exclude or a global ignore -- is invisible to
 # `git status --porcelain`, so the dirty-tree guard passes, the redirection
@@ -125,7 +161,12 @@ for scratch in "$NEW_FILE" "$BASELINE.bak" "$BASELINE.real" "$BASELINE.link" "$B
   fi
 done
 restore() {
-  rm -f "$NEW_FILE" "$BASELINE.bak" "$BASELINE.real" "$BASELINE.link"
+  # $BASELINE.tmp is listed here as well as in the index cleanup below: the
+  # rewrites above redirect into it and then `mv`, so an interruption between
+  # the two leaves it UNTRACKED in the worktree, where `git rm --cached` cannot
+  # reach it. Removing the record without removing the file is the same half-
+  # restore as removing the file without the record.
+  rm -f "$NEW_FILE" "$BASELINE.bak" "$BASELINE.real" "$BASELINE.link" "$BASELINE.tmp"
   git checkout -q HEAD -- "${RESTORE_PATHS[@]}" 2>/dev/null || true
   # ⚠ EVERY SCRATCH PATH, NOT JUST THE PROBE. Controls stage before running, so
   # an interruption after the missing- or symlink-baseline setup leaves .bak,
@@ -288,11 +329,15 @@ expect_ref "an unreadable baseline blob on the target refuses" "$no_blob_commit"
 # detect, reproduced inside the detector. Equality forces the number to move when
 # a control is added, so a later removal cannot hide behind it.
 #
-# No count is written in prose here or anywhere else, deliberately: a number
-# repeated outside the place that enforces it is a number that rots, and this
-# file has already had to be corrected for exactly that.
-if [ "$checks" -ne 14 ]; then
-  echo "REFUSING: $checks control(s) ran, expected exactly 14" >&2
+# The number appears exactly ONCE, in EXPECTED_CHECKS, and the message READS it
+# instead of repeating it. The revision before this one spelled "expected
+# exactly 14" as a second literal directly beneath this paragraph -- the drift
+# this paragraph forbids, one line from where it forbids it, and passing every
+# healthy run because a stale expectation only shows up once some other count
+# disagrees.
+EXPECTED_CHECKS=14
+if [ "$checks" -ne "$EXPECTED_CHECKS" ]; then
+  echo "REFUSING: $checks control(s) ran, expected exactly $EXPECTED_CHECKS" >&2
   exit 2
 fi
 if [ "$failures" -ne 0 ]; then
