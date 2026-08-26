@@ -252,11 +252,12 @@ func safeTypeName(t string) string {
 // this switch has never heard of -- freebsd, openbsd, a future port -- passes
 // through verbatim and is ingested. Do not "tighten" this to reject unknown
 // values: that constraint belongs to the EVENT plane, where platform really is a
-// closed six (analytics-service internal/ingest/validate.go: "platform must be one
-// of: web, ios, android, windows, macos, linux") and one bad value fails the whole
-// batch. Importing the event rule here would drop crashes from every port the
-// switch does not name. darwin -> macos is the only rewrite, because that one IS
-// a spelling difference rather than an unknown platform.
+// closed set -- the accepted values are web, ios, android, windows, macos and
+// linux, as normalizeEnvelopePlatform enforces -- and one value outside it fails
+// the whole BATCH, not just its own event. Importing that rule here would drop
+// crashes from every port this switch does not name. darwin -> macos is the only
+// rewrite, because that one IS a spelling difference rather than an unknown
+// platform.
 func goPlatform() string {
 	switch runtime.GOOS {
 	case "darwin":
