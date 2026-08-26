@@ -238,13 +238,13 @@ jobs:
   # ⚠ ITS OWN JOB, WITH ITS OWN CLOCK, AND THE REASON IS ARITHMETIC. The harness
   # drives each refusal by running the WHOLE gate once per control, so its cost
   # is controls x gate-cost and both grow. Measured in this workflow on 2026-08-26
-  # (run 32982169739): the gate step ~9s, the harness ~108s at twelve controls, so
-  # about nine seconds a control. The fourteen controls here come to roughly two
-  # minutes against the ten below. A snapshot, not a definition: both numbers move
-  # with the runner and with the corpus. Sharing public-surface's five-minute
-  # budget would have put it past half of that on day one, and the failure mode of
-  # outgrowing a timeout is a cancelled job that reads like an outage rather than
-  # like a check that got too expensive. Separate clock, stated size.
+  # (run 33000651338, this job): ~130s at the fourteen controls below, which is the
+  # gate costing about nine seconds and being paid fourteen times. A snapshot, not
+  # a definition: both factors move, one with the runner and one with this file.
+  # Sharing public-surface's five-minute budget would have put it past half of that
+  # on day one, and the failure mode of outgrowing a timeout is a cancelled job
+  # that reads like an outage rather than like a check that got too expensive.
+  # Separate clock, stated size.
   lane-b-ratchet-controls:
     runs-on: ubuntu-latest
     timeout-minutes: 10
