@@ -878,11 +878,13 @@ done
 scan_lane_a=""      # "path:line:text" per hit, newline separated
 scan_lane_b_files=0
 scan_lane_b_lines=0
+scan_lane_b_counts=""
 scan_files=0
 
 scan_tree() {
   local root="$1" f hits status line list
   scan_lane_a=""; scan_lane_b_files=0; scan_lane_b_lines=0; scan_files=0
+  scan_lane_b_counts=""
 
   # `git ls-files -z` and PROCESS substitution, not a heredoc. A command
   # substitution used as a heredoc body is invisible to `set -e` and to
@@ -1567,9 +1569,15 @@ scan_tree() {
     case "$f" in
       *.go)
         scan_lane_b_files=$((scan_lane_b_files + 1))
+        scan_lane_b_this_file=0
         while IFS= read -r line; do
           [ -n "$line" ] && scan_lane_b_lines=$((scan_lane_b_lines + 1))
+          [ -n "$line" ] && scan_lane_b_this_file=$((scan_lane_b_this_file + 1))
         done <<< "$hits"
+        # PER-FILE tally, for the ratchet below. Counting per file rather than
+        # one grand total is what makes the baseline diffable and the failure
+        # legible: a reviewer sees WHICH file grew, not that a number moved.
+        scan_lane_b_counts="${scan_lane_b_counts}${f} ${scan_lane_b_this_file}"$'\n'
         ;;
       *)
         # No `sed "s|^|$f:|"`: the filename lands in the s-command's delimiter
@@ -2231,12 +2239,24 @@ EOF
   fixture_checks=$((fixture_checks + 1))
   [ "$scan_lane_b_files" -eq 2 ] || {
     echo "SELFTEST: lane B counted $scan_lane_b_files files, expected 2" >&2; fixture_fail=1; }
+  # The ratchet reads scan_lane_b_counts, so the fixture pins that it is
+  # actually populated. A tally that silently stayed empty would make the
+  # ratchet compare nothing against nothing and report "held" forever -- a gate
+  # passing by looking at zero occurrences, which is the failure this script
+  # refuses elsewhere by name.
+  fixture_checks=$((fixture_checks + 1))
+  [ "$(printf '%s' "$scan_lane_b_counts" | grep -c .)" -eq 2 ] || {
+    echo "SELFTEST: the per-file lane B tally holds $(printf '%s' "$scan_lane_b_counts" | grep -c .) row(s), expected 2" >&2
+    fixture_fail=1; }
+  fixture_checks=$((fixture_checks + 1))
+  [ "$(printf '%s' "$scan_lane_b_counts" | awk '{n += $2} END {print n + 0}')" -eq "$scan_lane_b_lines" ] || {
+    echo "SELFTEST: the per-file tally does not sum to the lane B line count" >&2; fixture_fail=1; }
   # ⚠ A COUNT THAT MUST BE REACHED. Every assertion above is invisible when it
   # is deleted, and a run that asserts nothing prints the same closing line as
   # a run that asserted everything. The floor moves up when assertions are
   # added and refuses when they go.
-  [ "$fixture_checks" -ge 15 ] || {
-    echo "SELFTEST: only $fixture_checks scan assertion(s) ran, expected at least 15" >&2
+  [ "$fixture_checks" -ge 17 ] || {
+    echo "SELFTEST: only $fixture_checks scan assertion(s) ran, expected at least 17" >&2
     fixture_fail=1; }
   if [ "$fixture_fail" -ne 0 ]; then
     # refusal:structural
@@ -2279,6 +2299,118 @@ else
   echo "  MATCHING THE PATTERNS ABOVE — not a total of internal material, which the"
   echo "  scope note above says these shapes cannot bound."
 fi
+
+echo
+# ── LANE B RATCHET ────────────────────────────────────────────────────────────
+# Lane B cannot be gated AT ZERO today: 33 matching lines already exist, and
+# failing on them would break every build until that debt is paid. That is why
+# this lane reports. But a report is only useful if someone can see it, and a
+# 34th line arriving among 33 existing ones is invisible — not because nobody
+# looked, but because there is nothing there to see. That is the actual
+# mechanism by which internal paths reached this public SDK twice.
+#
+# So the lane is gated on CHANGE instead of on zero. The number may fall and may
+# not rise. Existing debt costs nothing; a new occurrence fails immediately.
+#
+# ⚠ WHAT THIS DOES NOT CATCH, stated rather than implied: the counts are PER
+# FILE, so removing one matching line and adding another in the SAME file in the
+# same change nets to zero and passes. Identity pinning (hash per occurrence)
+# would close that, at the price of failing every reword of an already-grandfathered
+# line. The swap is a deliberate act visible in the diff; the reword is an
+# accident that would train people to edit the baseline. This trades the rarer
+# hole for the commoner false alarm, on purpose.
+#
+# ⚠ THE BASELINE IS NOT AN ESCAPE HATCH. Raising a number in it is checked
+# against the merge target below, because a ratchet whose baseline can be edited
+# upward in the same change is not a ratchet — it is a comment.
+LANE_B_BASELINE="${LANE_B_BASELINE:-scripts/public-surface-lane-b-baseline.txt}"
+
+lane_b_now="$(printf '%s' "$scan_lane_b_counts" | grep -v '^$' | sort)"
+
+if [ "${1:-}" = "--write-baseline" ]; then
+  {
+    echo "# Lane B occurrences per file, as of the commit that wrote this."
+    echo "# Written by: scripts/check_public_surface.sh --write-baseline"
+    echo "#"
+    echo "# THIS FILE ONLY EVER SHRINKS. The scan fails when a count here rises,"
+    echo "# when a file appears that is not here, and when a number here is higher"
+    echo "# than the same number on the merge target. It also fails when a count"
+    echo "# FALLS without this file being updated, so paying debt is recorded"
+    echo "# rather than silently banked as slack."
+    echo "#"
+    echo "# Format: <path> <occurrences>"
+    printf '%s\n' "$lane_b_now"
+  } > "$LANE_B_BASELINE"
+  echo "WROTE $LANE_B_BASELINE"
+  # The EXIT trap treats rc=0 without this as a run that died mid-flight, which
+  # is exactly right for every other early return here. Writing the baseline is
+  # the one legitimate short path, so it says so rather than tripping the
+  # dead-run detector and printing a refusal over a success.
+  gate_finished=yes
+  exit 0
+fi
+
+if [ ! -f "$LANE_B_BASELINE" ]; then
+  # refusal:structural — fail closed. An absent baseline is indistinguishable
+  # from a deleted one, and treating it as "nothing to compare" would let anyone
+  # disable this gate with rm.
+  echo "REFUSING: $LANE_B_BASELINE is missing." >&2
+  echo "  Regenerate it with: $0 --write-baseline" >&2
+  exit 2
+fi
+
+lane_b_base="$(grep -v '^#' "$LANE_B_BASELINE" | grep -v '^$' | sort)"
+
+if [ "$lane_b_now" != "$lane_b_base" ]; then
+  echo "FAIL — lane B moved and the baseline did not agree:" >&2
+  # Two directions, named separately, because the fix differs.
+  diff <(printf '%s\n' "$lane_b_base") <(printf '%s\n' "$lane_b_now") \
+    | grep -E '^[<>]' >&2 || true
+  echo "  '>' is what the scan found now; '<' is what the baseline expects." >&2
+  echo "  A count that ROSE, or a file that is new here, is new internal material" >&2
+  echo "  in a public SDK: remove the reference. Do not re-baseline it." >&2
+  echo "  A count that FELL is debt you paid: rerun with --write-baseline and" >&2
+  echo "  commit the smaller file in this same change." >&2
+  exit 1
+fi
+
+# The anti-cheat. Without this, the two rules above are satisfiable by editing
+# the baseline upward in the same commit that adds the occurrence.
+if [ -n "${PUBLIC_SURFACE_BASE_REF:-}" ]; then
+  # ⚠ TWO REASONS THE COMPARISON CAN BE UNAVAILABLE, and they are not the same
+  # fact. A ref that does not RESOLVE is a broken instrument -- a shallow clone
+  # that never fetched the base -- and reporting "skipped" for it would let the
+  # anti-cheat evaporate exactly where it is needed. A ref that resolves but
+  # carries no baseline is a true statement about the world: the target predates
+  # this file, which is the case on the change that introduces it.
+  if ! git rev-parse --verify --quiet "${PUBLIC_SURFACE_BASE_REF}^{commit}" >/dev/null; then
+    # refusal:structural
+    echo "REFUSING: PUBLIC_SURFACE_BASE_REF=${PUBLIC_SURFACE_BASE_REF} does not resolve." >&2
+    echo "  The baseline-vs-target check cannot run, and skipping it silently is" >&2
+    echo "  how a ratchet becomes a comment. Fetch the base ref, or unset the" >&2
+    echo "  variable deliberately if there is genuinely nothing to compare." >&2
+    exit 2
+  fi
+  if base_copy="$(git show "${PUBLIC_SURFACE_BASE_REF}:${LANE_B_BASELINE}" 2>/dev/null)"; then
+    while read -r path count; do
+      [ -n "$path" ] || continue
+      was="$(printf '%s' "$base_copy" | grep -v '^#' | awk -v p="$path" '$1 == p {print $2}')"
+      [ -n "$was" ] || continue
+      if [ "$count" -gt "$was" ]; then
+        echo "FAIL — the baseline was raised for $path ($was -> $count)." >&2
+        echo "  Editing this file upward is not a way to introduce internal material." >&2
+        exit 1
+      fi
+    done <<< "$lane_b_base"
+  else
+    # Named, not swallowed: the target may predate the baseline.
+    echo "  (baseline-vs-target check skipped: ${PUBLIC_SURFACE_BASE_REF} carries no $LANE_B_BASELINE)"
+  fi
+else
+  echo "  (baseline-vs-target check skipped: PUBLIC_SURFACE_BASE_REF unset — CI sets it)"
+fi
+
+echo "LANE B RATCHET — held at $(printf '%s' "$lane_b_now" | grep -c . ) file(s), $(printf '%s' "$lane_b_now" | awk '{n += $2} END {print n + 0}') occurrence(s). The number may fall and may not rise."
 
 echo
 if [ -n "$scan_lane_a" ]; then
