@@ -2391,6 +2391,23 @@ if [ "${1:-}" = "--write-baseline" ]; then
   exit 0
 fi
 
+# ⚠ A SYMLINK IS NOT A BASELINE, and `-f` cannot tell you so -- it FOLLOWS the
+# link. Replace this file with a link to another tracked baseline and every
+# current-tree read follows it, so the change passes; but `git show <ref>:<path>`
+# on the merge target returns the LINK BLOB, the target's pathname, and every
+# later PR is then reported as adding paths the target does not have. The two
+# sides must read the same kind of object, so the index entry's mode is checked
+# rather than the filesystem's answer about what it points at.
+lane_b_mode="$(git ls-files -s -- "$LANE_B_BASELINE" | awk '{print $1}' || true)"
+case "${lane_b_mode:-}" in
+  120000)
+    # refusal:structural
+    echo "REFUSING: $LANE_B_BASELINE is a symlink in the index." >&2
+    echo "  The working tree would follow it and the merge target would not," >&2
+    echo "  so the two sides of this ratchet would compare different files." >&2
+    exit 2
+    ;;
+esac
 if [ ! -f "$LANE_B_BASELINE" ]; then
   # refusal:structural — fail closed. An absent baseline is indistinguishable
   # from a deleted one, and treating it as "nothing to compare" would let anyone
@@ -2420,7 +2437,13 @@ if [ "${lane_b_version:-1}" != "$LANE_B_FORMAT" ]; then
   exit 2
 fi
 
-lane_b_base="$(grep -v '^#' "$LANE_B_BASELINE" | { grep -v '^$' || [ $? -eq 1 ]; } | sort -k2)"
+# ⚠ BOTH GREPS, NOT JUST THE SECOND. A comments-only baseline -- the paid state
+# this lane exists to reach -- makes the FIRST filter exit 1, and pipefail kills
+# the assignment before the second one's careful handling is ever reached. Fixing
+# the downstream filter and leaving the upstream one was fixing the half I was
+# looking at.
+lane_b_base="$({ grep -v '^#' "$LANE_B_BASELINE" || [ $? -eq 1 ]; } \
+  | { grep -v '^$' || [ $? -eq 1 ]; } | sort -k2)"
 
 if [ "$lane_b_now" != "$lane_b_base" ]; then
   echo "FAIL — lane B moved and the baseline did not agree:" >&2
@@ -2482,6 +2505,19 @@ if [ -n "${PUBLIC_SURFACE_BASE_REF:-}" ]; then
       # refusal:structural
       echo "REFUSING: ${PUBLIC_SURFACE_BASE_REF}:${LANE_B_BASELINE} is listed but could not be read." >&2
       exit 2
+    fi
+  fi
+  # ⚠ THE TARGET'S FORMAT, ASKED BEFORE ITS ROWS ARE READ. I had this check and
+  # lost it while restructuring the probe: a format-1 target parsed by the
+  # format-2 reader binds every path to the count field, so every current path
+  # looks absent and an untouched PR fails. A skew is not a finding about the
+  # code; it is announced and skipped, which is the same treatment a target that
+  # predates the file gets.
+  if [ -n "$base_copy" ]; then
+    base_version="$(printf '%s' "$base_copy" | { grep -m1 '^# format-version:' || [ $? -eq 1 ]; } | tr -dc '0-9')"
+    if [ "${base_version:-1}" != "$LANE_B_FORMAT" ]; then
+      echo "  (baseline-vs-target check skipped: target baseline is format ${base_version:-1}, this script reads $LANE_B_FORMAT)"
+      base_copy=""
     fi
   fi
   if [ -n "$base_copy" ]; then

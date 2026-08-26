@@ -267,19 +267,27 @@ jobs:
       #
       # push to an existing ref: github.event.before is the pre-push tip.
       #
-      # push CREATING a ref: NO BASE, AND THIS ARM DOES NOT GATE. before is all
-      #   zeros here and there is no honest substitute. The pushed commit's
-      #   first parent may itself be newly published -- a branch pushing several
-      #   commits at once -- so comparing against it compares new work with new
-      #   work, and finding a genuinely published ancestor needs history a
-      #   shallow clone does not have.
+      # push CREATING a ref: COMPARE AGAINST THE DEFAULT BRANCH.
       #
-      #   That is acceptable because a new ref cannot reach main without passing
-      #   one of the other two arms: the pull_request arm on the PR that merges
-      #   it, or, for a direct push to main, the existing-ref arm above where
-      #   before is real. A branch is not a publication. Saying this arm does
-      #   not gate is better than a comparison that looks like one and is not.
-
+      #   I removed this arm once, arguing "a branch is not a publication" and
+      #   that a new ref reaches main only through the other two arms. THE
+      #   HEADER OF THIS FILE SAYS OTHERWISE, three lines from where I was
+      #   editing: "This repository is PUBLIC: a branch pushed here is readable
+      #   the moment it lands, whether or not a pull request ever opens", and
+      #   tags are "the artifact people install, and one release here was cut
+      #   off-main". Publication is not reaching main. It is being readable.
+      #
+      #   `before` is all zeros here, and the pushed commit's own parent is not a
+      #   baseline either -- on a branch publishing several commits it is itself
+      #   newly published. So the comparison is against the DEFAULT BRANCH: a ref
+      #   that certainly exists, certainly is published, and answers the question
+      #   this arm actually asks -- does this ref expose more internal material
+      #   than what is already public?
+      #
+      #   A branch cut from an older main can fail here after main pays debt. That
+      #   is a false alarm with an obvious remedy (rebase, or regenerate), and it
+      #   is the cheaper error: the alternative was publishing unreviewed material
+      #   with a green tick.
       - name: Fetch the comparison base for the lane B ratchet
         run: |
           set -euo pipefail
@@ -293,7 +301,8 @@ jobs:
             git fetch --depth=1 origin "$before"
             echo "SP_LANE_B_BASE=FETCH_HEAD" >> "$GITHUB_ENV"
           else
-            echo "SP_LANE_B_BASE=" >> "$GITHUB_ENV"
+            git fetch --depth=1 origin "${{ github.event.repository.default_branch }}"
+            echo "SP_LANE_B_BASE=FETCH_HEAD" >> "$GITHUB_ENV"
           fi
 
       - name: No internal material in the published non-source surface
