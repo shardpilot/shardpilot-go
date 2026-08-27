@@ -187,9 +187,20 @@ restore() {
 # later controls still need. Measured, because I did exactly that first: eleven
 # controls failed at once.
 cleanup_dirs() {
+  chmod 755 scripts 2>/dev/null || true
+  chattr -i scripts 2>/dev/null || true
   [ -n "${STUB:-}" ] && rm -rf "$STUB"
   [ -n "${STUBDIR:-}" ] && rm -rf "$STUBDIR"
-  [ -L scripts ] && { rm -f scripts; [ -d scripts.real ] && mv scripts.real scripts; }
+  # ⚠ EVERY INTERMEDIATE STATE, NOT THE TIDY ONE. The swap control does
+  # `mv scripts scripts.real` then `ln -s`, and undoes it with `rm -f` then `mv`.
+  # Interrupted between either pair, `scripts` is ABSENT rather than a symlink --
+  # and a condition that only recognises the symlink leaves the repository's
+  # entire scripts/ directory stranded as scripts.real. Keyed on what must be
+  # restored (scripts.real exists) rather than on how far the swap got.
+  if [ -e scripts.real ] || [ -L scripts.real ]; then
+    [ -L scripts ] && rm -f scripts
+    [ -e scripts ] || mv scripts.real scripts
+  fi
   return 0
 }
 # ⚠ EMPTIED BEFORE THE TRAP CAN READ THEM. cleanup_dirs does `rm -rf` on these,
@@ -433,23 +444,47 @@ judge "a parent swapped before the anchor refuses" "${lane_b_swap_rc:-0}" 2 "is 
 # make this control pass vacuously, which is the exact failure it exists to
 # catch one level down. So the control writes a probe first: if the probe
 # SUCCEEDS, the route is not in force and this reports that rather than a pass.
-checks=$((checks + 1))
-lane_b_route=ok
-chattr +i scripts 2>/dev/null || lane_b_route=unavailable
-if [ "$lane_b_route" = ok ] && { : > "scripts/.route_probe.$$"; } 2>/dev/null; then
+# ⚠ TWO LEVERS, PERMISSIONS FIRST, EACH PROBED. The first version reached for
+# the immutable attribute because that is what works HERE, where the harness can
+# run as uid 0 -- and it needs CAP_LINUX_IMMUTABLE, which the CI runner does not
+# have. So the control that refuses to pass vacuously did the honest thing and
+# reddened a required job. Choosing a lever that works in my environment is the
+# same defect as trusting one: the lever has to be chosen for where the harness
+# RUNS, not where it was written.
+#
+# Permissions are tried first because they are the lever that works on an
+# unprivileged runner, which is where CI lives. Under uid 0 they are advisory --
+# measured, a 555 directory accepts writes -- so the probe rejects that route and
+# the immutable attribute takes over locally. Neither in force: report it, do not
+# pass.
+lane_b_route=none
+chmod 555 scripts 2>/dev/null || true
+if ! { : > "scripts/.route_probe.$$"; } 2>/dev/null; then
+  lane_b_route=chmod
+else
   rm -f "scripts/.route_probe.$$"
-  lane_b_route=unavailable
+  chmod 755 scripts 2>/dev/null || true
+  if chattr +i scripts 2>/dev/null && ! { : > "scripts/.route_probe.$$"; } 2>/dev/null; then
+    lane_b_route=immutable
+  else
+    rm -f "scripts/.route_probe.$$"
+    chattr -i scripts 2>/dev/null || true
+  fi
 fi
-if [ "$lane_b_route" != ok ]; then
-  echo "FAIL [a failed serialisation refuses]: the route is not available here --" >&2
-  echo "  the directory could not be made unwritable, so this control would have" >&2
-  echo "  passed without exercising anything. Reported rather than skipped." >&2
+checks=$((checks + 1))
+if [ "$lane_b_route" = none ]; then
+  echo "FAIL [a failed serialisation refuses]: no lever makes this directory" >&2
+  echo "  unwritable here -- permissions are advisory under uid 0 and the" >&2
+  echo "  immutable attribute needs CAP_LINUX_IMMUTABLE. Reported rather than" >&2
+  echo "  skipped: a control that cannot run must not look like one that passed." >&2
   failures=$((failures + 1))
 else
   lane_b_out="$("$GATE" --write-baseline 2>&1)" || lane_b_rc=$?
+  chmod 755 scripts 2>/dev/null || true
   chattr -i scripts 2>/dev/null || true
   judge "a failed serialisation refuses" "${lane_b_rc:-0}" 2 "serialisation failed" "$lane_b_out"
 fi
+chmod 755 scripts 2>/dev/null || true
 chattr -i scripts 2>/dev/null || true
 
 # ⚠ THE VARIABLE IS REFUSED, NOT IGNORED. Removing an input silently is a worse
