@@ -191,6 +191,12 @@ restore() {
 # controls failed at once.
 cleanup_dirs() {
   rmdir escape 2>/dev/null || true
+  # `a/` is a nested repository a later control builds. It was added to the
+  # startup scratch guard and not here, so an interruption during that control
+  # left it in the checkout -- and the guard then refuses the NEXT run. The same
+  # asymmetry as `escape/`, reintroduced one control later by the person who had
+  # just fixed it.
+  rm -rf a
   [ -n "${OUTSIDE:-}" ] && rm -rf "$OUTSIDE"
   [ -n "${STUB:-}" ] && rm -rf "$STUB"
   return 0

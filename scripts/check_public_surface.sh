@@ -2607,8 +2607,25 @@ lane_b_guard() {  # $1 = check | write
         echo "# because the layout changed -- reading a format-2 file with this"
         echo "# parser would understate every count that has such a line."
         printf '%s\n' "$lane_b_now"
-      } > "$lane_b_leaf.tmp.$$"
-      mv -f "$lane_b_leaf.tmp.$$" "$lane_b_leaf"
+      } > "$lane_b_leaf.tmp.$$" || {
+        # ⚠ CHECKED EXPLICITLY, BECAUSE `set -e` IS NOT IN FORCE HERE. This
+        # function is invoked on the left of `||`, which suspends errexit for
+        # its whole body -- so a serialisation that dies partway (ENOSPC, a
+        # quota, a full pipe) would fall through to the rename below, and the
+        # rename SUCCEEDS on a partially written file. The gate would then print
+        # WROTE and exit 0 over a truncated baseline, which is worse than any
+        # refusal: the next run compares against a number nobody computed and
+        # reads the missing rows as debt that was paid.
+        echo "REFUSING: could not write the baseline (serialisation failed)." >&2
+        echo "  The partial file is removed rather than renamed into place." >&2
+        rm -f "$lane_b_leaf.tmp.$$"
+        exit 2
+      }
+      mv -f "$lane_b_leaf.tmp.$$" "$lane_b_leaf" || {
+        echo "REFUSING: could not put the new baseline in place." >&2
+        rm -f "$lane_b_leaf.tmp.$$"
+        exit 2
+      }
     fi
   )
 }
