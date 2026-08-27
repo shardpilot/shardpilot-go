@@ -13,11 +13,61 @@
 # state. So those are exercised here, against the real script in a real
 # checkout, one condition at a time.
 #
-# ⚠ THIS SCRIPT MUTATES THE WORKING TREE AND INDEX and restores them. It refuses
-# to start if anything is already dirty, because a failed restore over
-# uncommitted work is a worse outcome than not running.
+# ⚠ IT RUNS IN A THROWAWAY CLONE OF HEAD, and mutates that. Six review rounds
+# produced six cleanup defects here, each introduced by the fix for the previous
+# one -- a stranded directory, an inherited `rm -rf`, a cleanup keyed on the step
+# reached, a guard broken by trap ORDERING. Three correct rules, all applied, and
+# the mechanism kept producing them. What every one of those defects needed was a
+# LIVE tree to damage; the clone removes the tree rather than the defects.
+#
+# The refusal on a dirty tree STAYS, and its reason is now a different one. It
+# used to say: a failed restore over uncommitted work is worse than not running.
+# That hazard is gone. The one that is not gone was never written down, because
+# it came free with the first: THE SUBJECT OF A RUN IS A COMMIT. Clone HEAD while
+# the caller has uncommitted edits and the harness reports green about code it
+# never loaded -- the emptiest pass there is, arriving precisely when someone is
+# editing the gate and wants to see a mutant bite.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+if [ -z "${LANE_B_HARNESS_CLONE:-}" ]; then
+  if [ -n "$(git status --porcelain)" ]; then
+    echo "REFUSING: working tree is dirty." >&2
+    echo "  This harness clones HEAD and runs there, so uncommitted work would" >&2
+    echo "  not be the thing under test -- the run would report green about code" >&2
+    echo "  it never loaded. Commit or stash first." >&2
+    exit 2
+  fi
+  # ⚠ `git status` DOES NOT SEE EVERYTHING, and the same reason applies. A path
+  # marked --assume-unchanged or --skip-worktree is omitted from --porcelain, so
+  # the guard above passes while the worktree differs from HEAD -- and those
+  # differences are exactly what the clone will not carry. `ls-files -v` reports
+  # assume-unchanged by LOWERCASING the status letter; skip-worktree gets its own
+  # UPPERCASE `S`, so a lowercase-only test walks past it. Measured earlier:
+  # `^[a-z]` matched 0 and `^[a-zS]` matched 1 on a skip-worktree path.
+  if git ls-files -v | grep -q '^[a-zS]'; then
+    echo "REFUSING: some tracked paths carry assume-unchanged or skip-worktree." >&2
+    echo "  git status cannot see edits to those, so the dirty-tree guard above" >&2
+    echo "  is not answering the question it appears to answer, and the clone" >&2
+    echo "  would silently test HEAD instead of what you are holding." >&2
+    git ls-files -v | grep '^[a-zS]' | head -5 >&2
+    exit 2
+  fi
+  lane_b_head="$(git rev-parse HEAD)"
+  lane_b_tmp_root="$(mktemp -d)"
+  trap 'rm -rf "$lane_b_tmp_root"' EXIT
+  # --no-hardlinks is load-bearing: an ordinary local clone hard-links the object
+  # store, and a write into .git/objects would reach through to the real
+  # repository -- the same second-name-for-one-inode hazard this gate refuses on
+  # its baseline, arriving through git's own optimisation.
+  if ! git clone -q --no-hardlinks "$PWD" "$lane_b_tmp_root/repo" 2>/dev/null; then
+    echo "REFUSING: could not clone this repository to run against." >&2
+    exit 2
+  fi
+  LANE_B_HARNESS_CLONE="$lane_b_head" "$lane_b_tmp_root/repo/scripts/test_lane_b_ratchet.sh"
+  exit $?
+fi
+
 
 GATE=scripts/check_public_surface.sh
 BASELINE=scripts/public-surface-lane-b-baseline.txt
@@ -75,31 +125,6 @@ synth_target() {  # $1 = sed program applied to the baseline, or "" to delete it
 
 WITH_BASE="$(git rev-parse HEAD)"
 WITHOUT_BASE="$(synth_target "")"
-
-if [ -n "$(git status --porcelain)" ]; then
-  echo "REFUSING: working tree is dirty; this test mutates it." >&2
-  exit 2
-fi
-
-# ⚠ `git status` DOES NOT SEE EVERYTHING. A path marked --assume-unchanged or
-# --skip-worktree is omitted from --porcelain, so the guard above passes while
-# real uncommitted edits exist -- and a restore would then destroy work the
-# guard promised was not there. `ls-files -v` prints those flags in LOWERCASE.
-# ⚠ LOWERCASE **AND** `S`. `ls-files -v` reports assume-unchanged by lowercasing
-# the status letter, but skip-worktree gets its own UPPERCASE `S` -- so a
-# lowercase-only test walks straight past it. Measured: with config.go marked
-# skip-worktree, `^[a-z]` matches 0 and `^[a-zS]` matches 1. That path is worse
-# than assume-unchanged here, because `git checkout HEAD -- <path>` silently
-# does nothing for it, so the restore would leave the probe in a developer's
-# file. `H` (normal) and the transient M/R/C/K states are deliberately not
-# matched: they hide nothing.
-if git ls-files -v | grep -q '^[a-zS]'; then
-  echo "REFUSING: some tracked paths carry assume-unchanged or skip-worktree." >&2
-  echo "  git status cannot see edits to those, so the dirty-tree guard above" >&2
-  echo "  is not answering the question it appears to answer." >&2
-  git ls-files -v | grep '^[a-zS]' | head -5 >&2
-  exit 2
-fi
 
 checks=0; failures=0
 SAVED="$(mktemp)"; cp "$BASELINE" "$SAVED"
@@ -444,6 +469,87 @@ judge "a parent swapped before the anchor refuses" "${lane_b_swap_rc:-0}" 2 "is 
 # make this control pass vacuously, which is the exact failure it exists to
 # catch one level down. So the control writes a probe first: if the probe
 # SUCCEEDS, the route is not in force and this reports that rather than a pass.
+# ⚠ THE PARENT SWAPPED *AFTER* THE ANCHOR, and this needs a hook rather than a
+# race. The other swap scene replaces scripts/ before the gate starts, so it
+# exits at containment and never proves what the held cwd is for. This one lets
+# the gate anchor, then swaps the parent from inside the run -- a stub `mv`,
+# which the gate invokes only after `cd -P` and after the temporary is written.
+#
+# If the rename used the PATH (`$LANE_B_BASELINE`) it would re-resolve scripts/
+# and land outside. Using the bare leaf, the kernel resolves against the held
+# working directory -- a descriptor, which the swap cannot reach. The assertion
+# is the external file, not the exit code: the gate should SUCCEED here, and the
+# outside copy should be untouched.
+lane_b_outside="$(mktemp -d)"
+mkdir -p "$lane_b_outside/scripts"
+printf 'PRECIOUS OUTSIDE\n' > "$lane_b_outside/scripts/public-surface-lane-b-baseline.txt"
+lane_b_swapstub="$(mktemp -d)"
+{
+  echo '#!/bin/sh'
+  echo "REAL_MV=$(command -v mv)"
+  echo 'case " $* " in'
+  echo '  *public-surface-lane-b-baseline.txt.tmp.*)'
+  echo "    \"\$REAL_MV\" $PWD/scripts $PWD/scripts.real 2>/dev/null"
+  echo "    ln -s $lane_b_outside/scripts $PWD/scripts 2>/dev/null"
+  echo '    ;;'
+  echo 'esac'
+  echo 'exec "$REAL_MV" "$@"'
+} > "$lane_b_swapstub/mv"
+chmod +x "$lane_b_swapstub/mv"
+checks=$((checks + 1))
+lane_b_anchor_out="$(env "PATH=$lane_b_swapstub:$PATH" "$GATE" --write-baseline 2>&1)" || lane_b_anchor_rc=$?
+rm -f scripts 2>/dev/null || true
+[ -d scripts.real ] && mv scripts.real scripts
+if [ "$(head -1 "$lane_b_outside/scripts/public-surface-lane-b-baseline.txt")" != "PRECIOUS OUTSIDE" ]; then
+  echo "FAIL [the held cwd survives a parent swapped after anchoring]: the write" >&2
+  echo "  followed the replacement instead of the held directory." >&2
+  failures=$((failures + 1))
+elif [ "${lane_b_anchor_rc:-0}" -ne 0 ]; then
+  echo "FAIL [the held cwd survives a parent swapped after anchoring]: exit ${lane_b_anchor_rc}, expected 0" >&2
+  failures=$((failures + 1))
+fi
+rm -rf "$lane_b_swapstub" "$lane_b_outside"
+restore
+
+# ⚠ THE RENAME FAILURE, BOUGHT BACK. The audit claimed the writer's guards were
+# covered; they were not. The serialisation control makes the REDIRECT fail and
+# asserts the earlier branch, so deleting the rename handler left every control
+# green. Two adjacent handlers, one exercised -- the same "fixed the half I was
+# looking at" this file keeps producing.
+#
+# A selective stub: `mv` fails only for the baseline's temporary, and defers to
+# the real one otherwise, so the refusal that fires is this one and not some
+# earlier mover's.
+lane_b_mvstub="$(mktemp -d)"
+{
+  echo '#!/bin/sh'
+  echo 'case " $* " in *public-surface-lane-b-baseline.txt.tmp.*) exit 1 ;; esac'
+  echo "exec $(command -v mv) \"\$@\""
+} > "$lane_b_mvstub/mv"
+chmod +x "$lane_b_mvstub/mv"
+expect_env "a failed rename refuses" \
+  "PATH=$lane_b_mvstub:$PATH" 2 "could not put the new baseline in place" --write-baseline
+rm -rf "$lane_b_mvstub"
+restore
+
+# ⚠ AND THE UNREADABLE LINK COUNT. The hard-link scene only ever supplies a
+# valid count greater than one, so the branch that refuses when `ls -ld` gives
+# something non-numeric was uncovered -- and that branch is what stops the gate
+# writing without having established the baseline has one name. A stub whose
+# `ls -ld` returns a non-numeric second field, deferring to the real one for
+# every other invocation.
+lane_b_lsstub="$(mktemp -d)"
+{
+  echo '#!/bin/sh'
+  echo 'case " $* " in *public-surface-lane-b-baseline.txt*) echo "-rw-r--r-- ? nobody nobody 0 Jan 1 00:00 x"; exit 0 ;; esac'
+  echo "exec $(command -v ls) \"\$@\""
+} > "$lane_b_lsstub/ls"
+chmod +x "$lane_b_lsstub/ls"
+expect_env "an unreadable link count refuses" \
+  "PATH=$lane_b_lsstub:$PATH" 2 "could not read the hard-link count"
+rm -rf "$lane_b_lsstub"
+restore
+
 # ⚠ TWO LEVERS, PERMISSIONS FIRST, EACH PROBED. The first version reached for
 # the immutable attribute because that is what works HERE, where the harness can
 # run as uid 0 -- and it needs CAP_LINUX_IMMUTABLE, which the CI runner does not
@@ -619,7 +725,7 @@ restore
 # this paragraph forbids, one line from where it forbids it, and passing every
 # healthy run because a stale expectation only shows up once some other count
 # disagrees.
-EXPECTED_CHECKS=24
+EXPECTED_CHECKS=27
 if [ "$checks" -ne "$EXPECTED_CHECKS" ]; then
   echo "REFUSING: $checks control(s) ran, expected exactly $EXPECTED_CHECKS" >&2
   exit 2
@@ -628,4 +734,4 @@ if [ "$failures" -ne 0 ]; then
   echo "lane B ratchet: $failures of $checks control(s) FAILED" >&2
   exit 1
 fi
-echo "lane B ratchet: $checks control(s), 0 failure(s)"
+echo "lane B ratchet: $checks control(s), 0 failure(s) — against ${LANE_B_HARNESS_CLONE}"
