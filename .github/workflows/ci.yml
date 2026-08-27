@@ -56,6 +56,9 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Fetch pull-request refs for the history scan
+        run: git fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*'
+
       - name: Scan working tree for secrets
         uses: docker://ghcr.io/gitleaks/gitleaks:v8.30.1
         with:
