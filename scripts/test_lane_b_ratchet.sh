@@ -511,48 +511,60 @@ fi
 rm -rf "$lane_b_swapstub" "$lane_b_outside"
 restore
 
-# ⚠ A SYMLINK SWAPPED IN AT THE LEAF, in the last instant before the rename.
+# ⚠ A SYMLINK SWAPPED IN AT THE LEAF, after the checks and before the write.
 # The working-tree symlink refusal runs during the scan; between it and the
 # put-in-place there is a window, and the PR body used to carry this as a named
-# limit -- "no deterministic control, removed by construction". It is not a
-# limit any more: the same hook that drives the parent swap drives this one,
-# because the gate hands over control to `mv` at exactly the instant needed.
+# limit -- "no deterministic control, removed by construction".
 #
-# The property under test is NOT a property of `mv`. Measured: GNU `mv` renames
-# over the destination NAME and leaves the outside file alone -- but only on the
-# rename(2) path, and it falls back to copying across filesystems, where the
-# copy follows the link. The gate is safe because the temporary is a SIBLING of
-# the leaf, so the rename can never be cross-device. That is a property of the
-# construction, and this control is what stops a later "tidy the temp into
-# $TMPDIR" from quietly removing it.
+# ⚠ AND THE FIRST HOOK I REACHED FOR WAS THE SUBJECT ITSELF. A stub `mv` swaps
+# the leaf and defers, which looks like the parent-swap control one scene up.
+# It is not: the mutation this control exists to catch is "write THROUGH the
+# leaf instead of renaming over it", and that mutation removes the `mv` call --
+# so the hook never fires, the swap never happens, and the control passes.
+# Measured, not reasoned: against `cat "$tmp" > "$leaf"` the mv-hooked version
+# reported a pass and a DIFFERENT control caught the mutant.
+#
+#   A hook inside the step under test cannot survive that step being replaced.
+#
+# So the hook is `ls`, which the gate runs for the hard-link count -- after both
+# symlink refusals, before the writer, and untouched by how the write is done.
+# The stub swaps the leaf for a link outside the worktree, then defers to the
+# real `ls`, which reports link count 1 on the link and lets the gate proceed.
+#
+# The property is not a property of `mv`. Measured: GNU `mv` renames over the
+# destination NAME and leaves the outside file alone -- but only on the
+# rename(2) path; it falls back to copying across filesystems, and the copy
+# follows the link. The gate is safe because the temporary is a SIBLING of the
+# leaf, so the rename is never cross-device. That is a property of the
+# construction, and this is what stops a later tidy-up from losing it.
 lane_b_leafout="$(mktemp -d)"
 printf 'PRECIOUS LEAF\n' > "$lane_b_leafout/target.txt"
 lane_b_leafstub="$(mktemp -d)"
 {
   echo '#!/bin/sh'
-  echo "REAL_MV=$(command -v mv)"
+  echo "REAL_LS=$(command -v ls)"
   echo 'case " $* " in'
-  echo '  *public-surface-lane-b-baseline.txt.tmp.*)'
-  echo '    rm -f public-surface-lane-b-baseline.txt 2>/dev/null'
-  echo "    ln -s $lane_b_leafout/target.txt public-surface-lane-b-baseline.txt 2>/dev/null"
+  echo '  *scripts/public-surface-lane-b-baseline.txt*)'
+  echo '    rm -f scripts/public-surface-lane-b-baseline.txt 2>/dev/null'
+  echo "    ln -s $lane_b_leafout/target.txt scripts/public-surface-lane-b-baseline.txt 2>/dev/null"
   echo '    ;;'
   echo 'esac'
-  echo 'exec "$REAL_MV" "$@"'
-} > "$lane_b_leafstub/mv"
-chmod +x "$lane_b_leafstub/mv"
+  echo 'exec "$REAL_LS" "$@"'
+} > "$lane_b_leafstub/ls"
+chmod +x "$lane_b_leafstub/ls"
 checks=$((checks + 1))
 lane_b_leaf_rc=0
 lane_b_leaf_out="$(env "PATH=$lane_b_leafstub:$PATH" "$GATE" --write-baseline 2>&1)" || lane_b_leaf_rc=$?
 if [ "$(head -1 "$lane_b_leafout/target.txt")" != "PRECIOUS LEAF" ]; then
-  echo "FAIL [a leaf swapped in before the rename is replaced, not followed]: the" >&2
+  echo "FAIL [a leaf swapped in before the write is replaced, not followed]: the" >&2
   echo "  baseline was written THROUGH the link, into the outside file." >&2
   failures=$((failures + 1))
 elif [ "$lane_b_leaf_rc" -ne 0 ]; then
-  echo "FAIL [a leaf swapped in before the rename is replaced, not followed]: exit $lane_b_leaf_rc, expected 0" >&2
+  echo "FAIL [a leaf swapped in before the write is replaced, not followed]: exit $lane_b_leaf_rc, expected 0" >&2
   printf '%s\n' "$lane_b_leaf_out" | sed 's/^/    /' >&2
   failures=$((failures + 1))
 elif [ -L scripts/public-surface-lane-b-baseline.txt ]; then
-  echo "FAIL [a leaf swapped in before the rename is replaced, not followed]: the" >&2
+  echo "FAIL [a leaf swapped in before the write is replaced, not followed]: the" >&2
   echo "  link is still standing at the baseline path after the write." >&2
   failures=$((failures + 1))
 fi
