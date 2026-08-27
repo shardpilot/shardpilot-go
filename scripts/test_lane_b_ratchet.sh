@@ -511,6 +511,54 @@ fi
 rm -rf "$lane_b_swapstub" "$lane_b_outside"
 restore
 
+# ⚠ A SYMLINK SWAPPED IN AT THE LEAF, in the last instant before the rename.
+# The working-tree symlink refusal runs during the scan; between it and the
+# put-in-place there is a window, and the PR body used to carry this as a named
+# limit -- "no deterministic control, removed by construction". It is not a
+# limit any more: the same hook that drives the parent swap drives this one,
+# because the gate hands over control to `mv` at exactly the instant needed.
+#
+# The property under test is NOT a property of `mv`. Measured: GNU `mv` renames
+# over the destination NAME and leaves the outside file alone -- but only on the
+# rename(2) path, and it falls back to copying across filesystems, where the
+# copy follows the link. The gate is safe because the temporary is a SIBLING of
+# the leaf, so the rename can never be cross-device. That is a property of the
+# construction, and this control is what stops a later "tidy the temp into
+# $TMPDIR" from quietly removing it.
+lane_b_leafout="$(mktemp -d)"
+printf 'PRECIOUS LEAF\n' > "$lane_b_leafout/target.txt"
+lane_b_leafstub="$(mktemp -d)"
+{
+  echo '#!/bin/sh'
+  echo "REAL_MV=$(command -v mv)"
+  echo 'case " $* " in'
+  echo '  *public-surface-lane-b-baseline.txt.tmp.*)'
+  echo '    rm -f public-surface-lane-b-baseline.txt 2>/dev/null'
+  echo "    ln -s $lane_b_leafout/target.txt public-surface-lane-b-baseline.txt 2>/dev/null"
+  echo '    ;;'
+  echo 'esac'
+  echo 'exec "$REAL_MV" "$@"'
+} > "$lane_b_leafstub/mv"
+chmod +x "$lane_b_leafstub/mv"
+checks=$((checks + 1))
+lane_b_leaf_rc=0
+lane_b_leaf_out="$(env "PATH=$lane_b_leafstub:$PATH" "$GATE" --write-baseline 2>&1)" || lane_b_leaf_rc=$?
+if [ "$(head -1 "$lane_b_leafout/target.txt")" != "PRECIOUS LEAF" ]; then
+  echo "FAIL [a leaf swapped in before the rename is replaced, not followed]: the" >&2
+  echo "  baseline was written THROUGH the link, into the outside file." >&2
+  failures=$((failures + 1))
+elif [ "$lane_b_leaf_rc" -ne 0 ]; then
+  echo "FAIL [a leaf swapped in before the rename is replaced, not followed]: exit $lane_b_leaf_rc, expected 0" >&2
+  printf '%s\n' "$lane_b_leaf_out" | sed 's/^/    /' >&2
+  failures=$((failures + 1))
+elif [ -L scripts/public-surface-lane-b-baseline.txt ]; then
+  echo "FAIL [a leaf swapped in before the rename is replaced, not followed]: the" >&2
+  echo "  link is still standing at the baseline path after the write." >&2
+  failures=$((failures + 1))
+fi
+rm -rf "$lane_b_leafstub" "$lane_b_leafout"
+restore
+
 # ⚠ THE RENAME FAILURE, BOUGHT BACK. The audit claimed the writer's guards were
 # covered; they were not. The serialisation control makes the REDIRECT fail and
 # asserts the earlier branch, so deleting the rename handler left every control
@@ -725,7 +773,7 @@ restore
 # this paragraph forbids, one line from where it forbids it, and passing every
 # healthy run because a stale expectation only shows up once some other count
 # disagrees.
-EXPECTED_CHECKS=27
+EXPECTED_CHECKS=28
 if [ "$checks" -ne "$EXPECTED_CHECKS" ]; then
   echo "REFUSING: $checks control(s) ran, expected exactly $EXPECTED_CHECKS" >&2
   exit 2
