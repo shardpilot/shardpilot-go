@@ -2445,6 +2445,24 @@ fi
 #     fixed path with no variable at all, only a filesystem;
 #   the write-aside and its status check -- a partial serialisation renamed into
 #     place is a truncated baseline the next run reads as paid debt.
+# ⚠ A SETTER IS TOLD, NOT IGNORED -- AND THIS RUNS BEFORE THE ASSIGNMENT, since
+# afterwards the name is always set. Removing the override left one thing worse
+# than before: whoever exports this now gets SILENCE. Their baseline goes to the
+# constant rather than where they asked, and nothing says so. A removed input
+# that fails quietly is a worse interface than one that fails loudly.
+#
+# It also turns "nothing sets it" from a claim resting on a grep -- which cannot
+# see a wrapper script, a runner image or a shell profile -- into something this
+# gate asserts on every run. The premise the whole deletion rests on stops being
+# a search result and becomes a check.
+if [ -n "${LANE_B_BASELINE+set}" ]; then
+  # refusal:structural
+  echo "REFUSING: LANE_B_BASELINE is set, and is no longer an input." >&2
+  echo "  The baseline path is fixed at scripts/public-surface-lane-b-baseline.txt." >&2
+  echo "  Refusing rather than ignoring you: a value that is silently discarded" >&2
+  echo "  is worse than one that is turned away." >&2
+  exit 2
+fi
 LANE_B_BASELINE=scripts/public-surface-lane-b-baseline.txt
 
 # ⚠ A SYMLINK IS NOT A BASELINE, and `-f` cannot tell you so -- it FOLLOWS the
@@ -2470,6 +2488,16 @@ if [ -L "$LANE_B_BASELINE" ]; then
   # refusal:structural
   echo "REFUSING: $LANE_B_BASELINE is a symlink in the working tree." >&2
   echo "  --write-baseline would follow it and write through to its target." >&2
+  exit 2
+fi
+if [ -e "$LANE_B_BASELINE" ] && [ ! -f "$LANE_B_BASELINE" ]; then
+  # refusal:structural
+  # ⚠ A DIRECTORY HERE PASSES EVERY OTHER CHECK. Its link count is 1, it is not
+  # a symlink, and `mv` then moves the temporary INSIDE it rather than replacing
+  # the baseline -- while the gate prints WROTE and exits 0. Reachable with no
+  # variable at all, only a filesystem, which is why it survived the removal of
+  # the override and should not have been deleted with it.
+  echo "REFUSING: $LANE_B_BASELINE is not a regular file." >&2
   exit 2
 fi
 if [ -e "$LANE_B_BASELINE" ]; then
@@ -2511,7 +2539,24 @@ lane_b_now="$(printf '%s' "$scan_lane_b_counts" | { grep -v '^$' || [ $? -eq 1 ]
 
 
 if [ "${1:-}" = "--write-baseline" ]; then
-  lane_b_tmp="$LANE_B_BASELINE.tmp.$$"
+  # ⚠ THE PARENT IS HELD, NOT NAMED. A constant leaf does not fix its parent:
+  # another process can rename `scripts/` and put a symlink there, and a relative
+  # temporary path is then re-resolved through the replacement -- so both the
+  # write and the rename land outside the repository. `cd -P` makes the process's
+  # own working directory the anchor, a kernel reference rather than a name, and
+  # only the leaf is handed to the redirect afterwards.
+  #
+  # This survived the override's removal and I deleted it anyway, because it
+  # lived inside the function that carried the containment checks. A mechanism
+  # with no refusal message of its own leaves no trace in a diff of refusals,
+  # which is how it left without being noticed.
+  (
+    cd -P "$(dirname "$LANE_B_BASELINE")" || {
+      echo "REFUSING: could not enter the directory holding $LANE_B_BASELINE." >&2
+      exit 2
+    }
+    lane_b_leaf="$(basename "$LANE_B_BASELINE")"
+    lane_b_tmp="$lane_b_leaf.tmp.$$"
   {
     echo "# Lane B occurrences per file, as of the commit that wrote this."
     echo "# Written by: scripts/check_public_surface.sh --write-baseline"
@@ -2550,11 +2595,12 @@ if [ "${1:-}" = "--write-baseline" ]; then
     rm -f "$lane_b_tmp"
     exit 2
   }
-  mv -f "$lane_b_tmp" "$LANE_B_BASELINE" || {
-    echo "REFUSING: could not put the new baseline in place." >&2
-    rm -f "$lane_b_tmp"
-    exit 2
-  }
+    mv -f "$lane_b_tmp" "$lane_b_leaf" || {
+      echo "REFUSING: could not put the new baseline in place." >&2
+      rm -f "$lane_b_tmp"
+      exit 2
+    }
+  ) || exit $?
   echo "WROTE $LANE_B_BASELINE"
   # The EXIT trap treats rc=0 without this as a run that died mid-flight, which
   # is exactly right for every other early return here. Writing the baseline is

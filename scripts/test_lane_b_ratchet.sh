@@ -399,6 +399,34 @@ no_blob_commit="$(git -c user.name="lane-b-ratchet-test" -c user.email="lane-b-r
   commit-tree "$missing_blob_tree" -p HEAD -m "synthetic unreadable blob")"
 expect_ref "an unreadable baseline blob on the target refuses" "$no_blob_commit" 2 "could not be read"
 
+# ⚠ THE VARIABLE IS REFUSED, NOT IGNORED. Removing an input silently is a worse
+# interface than refusing it, and this control is also what turns "nothing sets
+# it" from a grep result into a checked property.
+expect_env "a set LANE_B_BASELINE is refused, not discarded" \
+  "LANE_B_BASELINE=/tmp/anywhere" 2 "no longer an input"
+
+# ⚠ A DIRECTORY AT THE FIXED PATH. Link count 1, not a symlink, so every other
+# check passes it -- and `mv` then moves the temporary INSIDE it while the gate
+# prints WROTE. Needs no variable, only a filesystem, which is why the refusal
+# survived the override's removal. Not staged: staging records the deletion and
+# the run would refuse for a different reason before reaching this one.
+mv "$BASELINE" "$BASELINE.real"
+mkdir "$BASELINE"
+expect_nostage "a directory at the baseline path refuses" 2 "is not a regular file"
+rmdir "$BASELINE"; mv "$BASELINE.real" "$BASELINE"
+
+# ⚠ THE INDEX DISAGREEING WITH THE WORKING TREE, which is the only state that
+# isolates the index-mode refusal: with a symlink in BOTH, the working-tree check
+# fires first. The scene that used to carry this left with the odd-spelling
+# controls, and the surviving refusal was then uncontrolled -- breaking it left
+# all nineteen green. Not staged, because `git add -A` is precisely what erases
+# the disagreement.
+lane_b_link_blob="$(printf '%s' "$BASELINE.real" | git hash-object -w --stdin)"
+git update-index --add --cacheinfo "120000,$lane_b_link_blob,$BASELINE"
+expect_nostage "an index-only symlink refuses" 2 "is a symlink in the index"
+git update-index --add --cacheinfo "100644,$(git hash-object -w "$BASELINE"),$BASELINE"
+restore
+
 # ⚠ FIFTEEN CONTROLS USED TO STAND HERE, and they are gone because their
 # SUBJECT is gone -- not because coverage was traded away. Every one drove a
 # refusal that existed to defend LANE_B_BASELINE as an override: an out-of-tree
@@ -503,7 +531,7 @@ restore
 # this paragraph forbids, one line from where it forbids it, and passing every
 # healthy run because a stale expectation only shows up once some other count
 # disagrees.
-EXPECTED_CHECKS=19
+EXPECTED_CHECKS=22
 if [ "$checks" -ne "$EXPECTED_CHECKS" ]; then
   echo "REFUSING: $checks control(s) ran, expected exactly $EXPECTED_CHECKS" >&2
   exit 2
