@@ -1595,10 +1595,33 @@ scan_tree() {
         # it. Taking the largest count any single pass reports for a given
         # (line, text) keeps a genuine repeat -- the same identifier twice on
         # one line -- at two, without inventing copies out of the passes.
-        lane_b_occ_1="$({ grep -aonE -- "$PATTERNS" "$scan_src" 2>/dev/null || [ $? -eq 1 ]; } | tr -d '\000')"
-        lane_b_occ_2="$({ grep -aonE -- "$PATTERNS" "$strip_blob" 2>/dev/null || [ $? -eq 1 ]; } | tr -d '\000')"
-        lane_b_occ_3="$({ grep -aoniE -- "$ROSTER_RE" "$scan_src" 2>/dev/null || [ $? -eq 1 ]; } | tr -d '\000')"
-        lane_b_occ_4="$({ grep -aoniE -- "$ROSTER_RE" "$strip_blob" 2>/dev/null || [ $? -eq 1 ]; } | tr -d '\000')"
+        # ⚠ grep's 1 IS "NO MATCH"; ANYTHING ABOVE IT IS A BROKEN INSTRUMENT --
+        # the same rule the passes above already keep, and the first draft of
+        # this block broke it. `|| [ $? -eq 1 ]` flattens every status into 1,
+        # so an I/O error on a file that HAS matches would have produced an
+        # empty result, a count of zero, and a ratchet comparing against a
+        # number it never managed to compute.
+        set +e
+        lane_b_occ_1="$(grep -aonE -- "$PATTERNS" "$scan_src" 2>/dev/null | tr -d '\000'; exit "${PIPESTATUS[0]}")"
+        lane_b_st_1=$?
+        lane_b_occ_2="$(grep -aonE -- "$PATTERNS" "$strip_blob" 2>/dev/null | tr -d '\000'; exit "${PIPESTATUS[0]}")"
+        lane_b_st_2=$?
+        lane_b_occ_3="$(grep -aoniE -- "$ROSTER_RE" "$scan_src" 2>/dev/null | tr -d '\000'; exit "${PIPESTATUS[0]}")"
+        lane_b_st_3=$?
+        lane_b_occ_4="$(grep -aoniE -- "$ROSTER_RE" "$strip_blob" 2>/dev/null | tr -d '\000'; exit "${PIPESTATUS[0]}")"
+        lane_b_st_4=$?
+        set -e
+        for st in "$lane_b_st_1" "$lane_b_st_2" "$lane_b_st_3" "$lane_b_st_4"; do
+          if [ "$st" -ge 2 ]; then
+            # refusal:structural
+            echo "REFUSING: grep could not count occurrences in '$f' (exit $st)." >&2
+            echo "  A file whose occurrences could not be counted is an UNCOUNTED" >&2
+            echo "  file, and this ratchet must not compare against a number it" >&2
+            echo "  failed to produce -- least of all the zero that a swallowed" >&2
+            echo "  error produces, which reads exactly like paid-off debt." >&2
+            exit 2
+          fi
+        done
         scan_lane_b_this_file="$(
           for pass in 1 2 3 4; do
             eval "printf '%s\n' \"\$lane_b_occ_$pass\"" | sed "s/^/$pass:/"
@@ -2404,25 +2427,43 @@ LANE_B_BASELINE="${LANE_B_BASELINE:-scripts/public-surface-lane-b-baseline.txt}"
 # ⚠ VALIDATED HERE BECAUSE --write-baseline NEVER REACHES WHAT FOLLOWS IT. The
 # writer redirects into this path and then `exit 0`s, so every check placed
 # below that branch is not LATE for the writing path -- it is UNREACHABLE from
-# it. The reachability question is the same one that finds a branch no input can
-# enter; this is its mirror, a guard no path can arrive at.
+# it. And the path is env-overridable one line above, so an arbitrary target
+# reaches the redirect.
 #
-# And the path is env-overridable one line above. An earlier round fixed this by
-# pinning the variable in the control HARNESS -- which fixed one caller and left
-# the writer, the single place that serves every caller, exactly as exposed. The
-# fix belongs where the defect is, not where it was noticed.
+# ⚠ THIS IS AN IDENTITY CHECK, NOT A LIST OF KNOWN TRICKS, and the difference is
+# the whole point. The first attempt here was three separate tests -- path
+# shape, a symlink at the final component, the link count -- each correct, and
+# together still an open question rather than a closed one. Review found the
+# fourth door immediately: a symlinked PARENT directory, which every one of the
+# three walks straight past. Counting doors is a losing game; this asks instead
+# what the target IS, and refuses everything the answer does not cover:
 #
-# Repository-relative, checked by shape: no realpath is available on every
-# system this gate supports (BSD `readlink` has no -f, and bash 3.2 is
-# documented as supported), and an absolute path or one climbing out with .. is
-# the whole of what the override can reach for.
-case "$LANE_B_BASELINE" in
-  /*|*..*)
+#   the containing directory, RESOLVED (`cd` + `pwd -P` walks out every
+#     symlinked ancestor, and is POSIX -- BSD has no `readlink -f`, and this
+#     gate documents bash 3.2 systems as supported)
+#   ...lies inside the resolved worktree
+#   ...the final component is not itself a symlink
+#   ...and if it exists, it is a regular file with exactly one name
+#
+# A fifth door does not get to exist, not because we guessed it, but because the
+# accepted set is closed.
+lane_b_parent="$(cd "$(dirname "$LANE_B_BASELINE")" 2>/dev/null && pwd -P)" || lane_b_parent=""
+if [ -z "$lane_b_parent" ]; then
+  # refusal:structural
+  echo "REFUSING: could not resolve the directory holding $LANE_B_BASELINE." >&2
+  exit 2
+fi
+lane_b_root="$(cd "$(git rev-parse --show-toplevel)" && pwd -P)"
+case "$lane_b_parent/" in
+  "$lane_b_root"/*) : ;;
+  *)
     # refusal:structural
-    echo "REFUSING: LANE_B_BASELINE must be a repository-relative path." >&2
-    echo "  Got: $LANE_B_BASELINE" >&2
-    echo "  --write-baseline redirects into it, so an absolute or climbing path" >&2
-    echo "  would overwrite a file this gate has no business touching." >&2
+    echo "REFUSING: LANE_B_BASELINE resolves outside this repository." >&2
+    echo "  Given:    $LANE_B_BASELINE" >&2
+    echo "  Resolves: $lane_b_parent" >&2
+    echo "  --write-baseline redirects into it, so a path that leaves the" >&2
+    echo "  worktree -- directly, or through a symlinked parent -- would" >&2
+    echo "  overwrite a file this gate has no business touching." >&2
     exit 2
     ;;
 esac
@@ -2443,18 +2484,20 @@ case "${lane_b_mode:-}" in
     exit 2
     ;;
 esac
-# The index says nothing about an UNTRACKED symlink sitting at the same path,
-# and the writer's redirect follows that one too.
 if [ -L "$LANE_B_BASELINE" ]; then
   # refusal:structural
   echo "REFUSING: $LANE_B_BASELINE is a symlink in the working tree." >&2
   echo "  --write-baseline would follow it and write through to its target." >&2
   exit 2
 fi
-# A hard link is a second name for one inode, and a redirect writes THROUGH it:
-# the other name changes too, and nothing here can put it back. `ls -ld` field 2
-# is the link count on GNU and BSD alike; `stat` spells it differently on each.
 if [ -e "$LANE_B_BASELINE" ]; then
+  if [ ! -f "$LANE_B_BASELINE" ]; then
+    # refusal:structural
+    echo "REFUSING: $LANE_B_BASELINE is not a regular file." >&2
+    exit 2
+  fi
+  # A hard link is a second name for one inode, and a redirect writes THROUGH
+  # it: the other name changes too, and nothing here can put it back.
   lane_b_links="$(ls -ld "$LANE_B_BASELINE" 2>/dev/null | awk '{print $2}')"
   case "${lane_b_links:-}" in
     ''|*[!0-9]*)
@@ -2472,14 +2515,6 @@ if [ -e "$LANE_B_BASELINE" ]; then
   fi
 fi
 
-# ⚠ STATUS 1 IS "NO MATCH"; ANYTHING ABOVE IT IS A BROKEN INSTRUMENT. An empty
-# result is not an error -- it is the state this lane exists to reach, where the
-# debt is paid and *.go folds into lane A -- so grep's 1 must not kill the
-# assignment under `set -euo pipefail`. But a blanket `|| true` also swallows a
-# real read failure, and at zero debt that converts an unreadable baseline into
-# the same empty string a paid one produces: both sides empty, equality passes,
-# and the gate reports success WITHOUT HAVING READ ITS BASELINE. So the status
-# is captured and only 0 and 1 are accepted.
 lane_b_now="$(printf '%s' "$scan_lane_b_counts" | { grep -v '^$' || [ $? -eq 1 ]; } | sort -k2)"
 
 

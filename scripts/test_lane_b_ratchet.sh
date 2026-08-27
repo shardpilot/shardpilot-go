@@ -152,7 +152,7 @@ done
 # `git status --porcelain`, so the dirty-tree guard passes, the redirection
 # below truncates it, and the trap then deletes it. The guard cannot see it, so
 # the existence check has to be a plain filesystem test.
-for scratch in "$NEW_FILE" "$BASELINE.bak" "$BASELINE.real" "$BASELINE.link" "$BASELINE.tmp" "$BASELINE.hard" config.go.tmp; do
+for scratch in "$NEW_FILE" "$BASELINE.bak" "$BASELINE.real" "$BASELINE.link" "$BASELINE.tmp" "$BASELINE.hard" config.go.tmp lane-b-parent-link; do
   if [ -e "$scratch" ] || [ -L "$scratch" ]; then
     echo "REFUSING: $scratch already exists; this test would overwrite and then delete it." >&2
     echo "  git status may not show it (an ignored path is invisible there), so" >&2
@@ -166,7 +166,7 @@ restore() {
   # the two leaves it UNTRACKED in the worktree, where `git rm --cached` cannot
   # reach it. Removing the record without removing the file is the same half-
   # restore as removing the file without the record.
-  rm -f "$NEW_FILE" "$BASELINE.bak" "$BASELINE.real" "$BASELINE.link" "$BASELINE.tmp" "$BASELINE.hard" config.go.tmp
+  rm -f "$NEW_FILE" "$BASELINE.bak" "$BASELINE.real" "$BASELINE.link" "$BASELINE.tmp" "$BASELINE.hard" config.go.tmp lane-b-parent-link
   git checkout -q HEAD -- "${RESTORE_PATHS[@]}" 2>/dev/null || true
   # ⚠ EVERY SCRATCH PATH, NOT JUST THE PROBE. Controls stage before running, so
   # an interruption after the missing- or symlink-baseline setup leaves .bak,
@@ -175,7 +175,7 @@ restore() {
   # the record is not a restore.
   git rm -q --cached --ignore-unmatch \
     "$NEW_FILE" "$BASELINE.bak" "$BASELINE.real" "$BASELINE.link" "$BASELINE.tmp" \
-    "$BASELINE.hard" config.go.tmp \
+    "$BASELINE.hard" config.go.tmp lane-b-parent-link \
     >/dev/null 2>&1 || true
 }
 trap 'restore; rm -f "$SAVED"' EXIT
@@ -186,6 +186,21 @@ trap 'restore; rm -f "$SAVED"' EXIT
 # different defects and a message that merges them names the wrong one. An
 # earlier copy of this in expect_ref did exactly that: it printed "reason not
 # found" whenever the EXIT disagreed, including when the reason was present.
+# must_write_baseline <label> -- a SETUP write, and its status is checked.
+# `--write-baseline || true` in a fixture is the quietest way to build a control
+# that cannot fail: if the write does not happen, the old baseline stays, the
+# gate still disagrees with the tree, and the control observes exactly the exit
+# and message it wanted -- from a state it never established. Review found this
+# in two of the controls added for this very kind of defect.
+must_write_baseline() {
+  local label="$1"
+  if ! "$GATE" --write-baseline >/dev/null 2>&1; then
+    echo "FAIL [$label]: setup --write-baseline failed, so this control would" >&2
+    echo "  have judged a state it never reached." >&2
+    failures=$((failures + 1))
+  fi
+}
+
 judge() {
   local label="$1" rc="$2" want="$3" needle="$4" out="$5"
   if [ "$rc" -ne "$want" ]; then
@@ -293,7 +308,7 @@ cp "$SAVED" "$BASELINE"
 marker="ADR-"'0331'
 printf '\n// See %s for the freeze this follows.\n' "$marker" >> config.go
 git add -A >/dev/null 2>&1 || true
-"$GATE" --write-baseline >/dev/null 2>&1 || true
+must_write_baseline "a raised baseline is caught by the target"
 expect_ref "a raised baseline is caught by the target" "$WITH_BASE" 1 "the baseline was raised"
 restore
 
@@ -312,7 +327,7 @@ restore
 # a harness tested as working rather than as covering its own motive.
 printf 'package shardpilot\n\n// See %s for the freeze this follows.\nfunc zzLaneBProbe() {}\n' "$marker" > "$NEW_FILE"
 git add -A >/dev/null 2>&1 || true
-"$GATE" --write-baseline >/dev/null 2>&1 || true
+must_write_baseline "a file absent from the target is caught"
 expect_ref "a file absent from the target is caught" "$WITH_BASE" 1 "is absent from"
 restore
 
@@ -365,14 +380,58 @@ expect_ref "an unreadable baseline blob on the target refuses" "$no_blob_commit"
 #
 # The control drives the WRITING path, not the reading one: a guard proven only
 # on the read path says nothing about the branch that motivated it.
-printf 'PRECIOUS UNRELATED FILE\n' > "$BASELINE.hard"
-expect_env "an absolute baseline path refuses the writer" \
-  "LANE_B_BASELINE=$PWD/$BASELINE.hard" 2 "must be a repository-relative path" --write-baseline
-if [ "$(head -1 "$BASELINE.hard")" != "PRECIOUS UNRELATED FILE" ]; then
-  echo "FAIL [an absolute baseline path refuses the writer]: the file was written anyway" >&2
+OUTSIDE="$(mktemp -d)"
+printf 'PRECIOUS UNRELATED FILE\n' > "$OUTSIDE/precious.txt"
+expect_env "an out-of-tree baseline path refuses the writer" \
+  "LANE_B_BASELINE=$OUTSIDE/precious.txt" 2 "resolves outside this repository" --write-baseline
+if [ "$(head -1 "$OUTSIDE/precious.txt")" != "PRECIOUS UNRELATED FILE" ]; then
+  echo "FAIL [an out-of-tree baseline path refuses the writer]: the file was written anyway" >&2
   failures=$((failures + 1))
 fi
-rm -f "$BASELINE.hard"
+
+# ⚠ THE FOURTH DOOR, and the reason the check above is an identity test rather
+# than a list. The first three guards here -- path shape, a symlink at the final
+# component, the link count -- all pass a REGULAR file sitting under a SYMLINKED
+# PARENT, and the redirect then lands outside the repository exactly as before.
+# Reproduced by review: `LANE_B_BASELINE=lane-b-parent-link/out` with the link
+# pointing at a temporary directory, --write-baseline exit 0, external file
+# overwritten. Resolving the parent with `pwd -P` is what closes it, and this
+# control is what proves the closing is real rather than asserted.
+printf 'PRECIOUS BEHIND A LINKED PARENT\n' > "$OUTSIDE/out"
+ln -s "$OUTSIDE" lane-b-parent-link
+expect_env "a symlinked parent directory refuses the writer" \
+  "LANE_B_BASELINE=lane-b-parent-link/out" 2 "resolves outside this repository" --write-baseline
+if [ "$(head -1 "$OUTSIDE/out")" != "PRECIOUS BEHIND A LINKED PARENT" ]; then
+  echo "FAIL [a symlinked parent directory refuses the writer]: the file was written anyway" >&2
+  failures=$((failures + 1))
+fi
+rm -f lane-b-parent-link
+rm -rf "$OUTSIDE"
+
+# ⚠ A BROKEN COUNTING INSTRUMENT, DRIVEN RATHER THAN DECLARED UNREACHABLE. The
+# occurrence passes must not flatten grep's 2 into 1: an I/O error on a file
+# that HAS matches would otherwise yield an empty result, a count of zero, and a
+# ratchet comparing against a number it never computed -- which reads exactly
+# like paid-off debt.
+#
+# Earlier in this file's history two refusals were written off as impossible to
+# drive without corrupting the repository. That was false, and the note saying
+# so shipped in the gate where the next person would have believed it. So this
+# one gets a route instead of a note: a stub `grep` earlier in PATH that fails
+# ONLY for the -o invocations the occurrence counter makes, and defers to the
+# real one for every other pass -- so the refusal that fires is this one and not
+# some earlier reader's.
+STUB="$(mktemp -d)"
+REAL_GREP="$(command -v grep)"
+{
+  echo '#!/bin/sh'
+  echo 'case " $* " in *" -aonE "*|*" -aoniE "*) exit 2 ;; esac'
+  echo "exec $REAL_GREP \"\$@\""
+} > "$STUB/grep"
+chmod +x "$STUB/grep"
+expect_env "an unreadable occurrence pass refuses" \
+  "PATH=$STUB:$PATH" 2 "could not count occurrences"
+rm -rf "$STUB"
 
 # A hard link is a second name for one inode and a redirect writes THROUGH it.
 ln "$BASELINE" "$BASELINE.hard"
@@ -401,7 +460,7 @@ rm -f "$BASELINE"; mv "$BASELINE.real" "$BASELINE"
 # the defect was about, reached honestly rather than assumed.
 printf '\n// See %s for the freeze this follows.\n' "$marker" >> config.go
 git add -A >/dev/null 2>&1 || true
-"$GATE" --write-baseline >/dev/null 2>&1 || true
+must_write_baseline "a second match on an existing line is counted"
 awk -v m="$marker" '{ lines[NR] = $0; if (index($0, m) > 0) last = NR }
                     END { for (i = 1; i <= NR; i++)
                             print (i == last ? lines[i] " " m : lines[i]) }' \
@@ -419,7 +478,7 @@ restore
 # control exists to see.
 printf '\n// See %s for the freeze this follows.\n' "$marker" >> config.go
 git add config.go >/dev/null 2>&1 || true
-"$GATE" --write-baseline >/dev/null 2>&1 || true
+must_write_baseline "an unstaged baseline is not the one that would be committed"
 expect_nostage "an unstaged baseline is not the one that would be committed" \
   1 "moved and the baseline did not agree"
 restore
@@ -437,7 +496,7 @@ restore
 # this paragraph forbids, one line from where it forbids it, and passing every
 # healthy run because a stale expectation only shows up once some other count
 # disagrees.
-EXPECTED_CHECKS=19
+EXPECTED_CHECKS=21
 if [ "$checks" -ne "$EXPECTED_CHECKS" ]; then
   echo "REFUSING: $checks control(s) ran, expected exactly $EXPECTED_CHECKS" >&2
   exit 2
