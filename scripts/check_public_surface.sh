@@ -2455,19 +2455,15 @@ LANE_B_BASELINE="${LANE_B_BASELINE:-scripts/public-surface-lane-b-baseline.txt}"
 # later PR is then reported as adding paths the target does not have. This one
 # is an INDEX question, so it is asked of the index and stays out of the
 # filesystem guard below.
-lane_b_mode="$(git ls-files -s -- "$LANE_B_BASELINE" | awk '{print $1}' || true)"
-case "${lane_b_mode:-}" in
-  120000)
-    # refusal:structural
-    echo "REFUSING: $LANE_B_BASELINE is a symlink in the index." >&2
-    echo "  The working tree would follow it and the merge target would not," >&2
-    echo "  so the two sides of this ratchet would compare different files." >&2
-    exit 2
-    ;;
-esac
 
 lane_b_root="$(cd -P "$(git rev-parse --show-toplevel)" && pwd -P)"
+# ⚠ BOTH ADMINISTRATIVE DIRECTORIES. `--git-dir` is the per-worktree one; with a
+# linked worktree it can sit OUTSIDE the checkout while `--git-common-dir` --
+# holding config, objects and refs -- sits inside it. Excluding only the first
+# leaves the shared half writable through this override. They are the same path
+# in an ordinary checkout, which is why one test looked sufficient.
 lane_b_gitdir="$(cd -P "$(git rev-parse --git-dir)" && pwd -P)"
+lane_b_commondir="$(cd -P "$(git rev-parse --git-common-dir)" && pwd -P)"
 
 # ⚠ ONE SUBSHELL VALIDATES AND WRITES, AND THAT IS THE POINT -- not tidiness.
 #
@@ -2519,7 +2515,7 @@ lane_b_guard() {  # $1 = check | write
     # its resolved path, not by its name, so a `.git` file or a linked worktree
     # is covered by the same test.
     case "$lane_b_here/" in
-      "$lane_b_gitdir"/*|"$lane_b_gitdir/")
+      "$lane_b_gitdir"/*|"$lane_b_gitdir/"|"$lane_b_commondir"/*|"$lane_b_commondir/")
         # refusal:structural
         echo "REFUSING: LANE_B_BASELINE resolves inside the git directory." >&2
         echo "  Resolves: $lane_b_here" >&2
@@ -2561,7 +2557,22 @@ lane_b_guard() {  # $1 = check | write
       fi
     fi
     if [ "$1" = canon ]; then
-      printf '%s%s\n' "$(git rev-parse --show-prefix)" "$lane_b_leaf"
+      # ⚠ THE PREFIX COMES FROM THE PAIR WE ALREADY HOLD, NOT FROM A FRESH
+      # DISCOVERY. `git rev-parse --show-prefix` run from the resolved directory
+      # asks "which repository am I in", and inside a submodule or an embedded
+      # repository the answer is the NEARER one -- so `a/q/baseline` under a
+      # nested repo at `a` derives as `q/baseline`, which the outer root then
+      # resolves to a different file entirely. Containment above has already
+      # established that this directory is under the outer root, both physically
+      # resolved, so the prefix is the difference between two strings we hold and
+      # no repository needs to be discovered again.
+      lane_b_prefix="${lane_b_here#$lane_b_root}"
+      lane_b_prefix="${lane_b_prefix#/}"
+      if [ -n "$lane_b_prefix" ]; then
+        printf '%s/%s\n' "$lane_b_prefix" "$lane_b_leaf"
+      else
+        printf '%s\n' "$lane_b_leaf"
+      fi
     fi
     if [ "$1" = write ]; then
       # ⚠ WRITTEN ASIDE AND RENAMED, NOT OPENED BY NAME. The held cwd anchors the
@@ -2598,6 +2609,23 @@ lane_b_canon="$(lane_b_guard canon)" || exit $?
 # Everything downstream -- the index read, the mode probe, every message -- now
 # speaks the derived spelling rather than whatever was handed in.
 LANE_B_BASELINE="$lane_b_canon"
+
+# ⚠ PROBED WITH THE DERIVED SPELLING, AND ONLY AFTER DERIVING IT. Asked of the
+# spelling as given, `git ls-files -s -- "scripts/baseline.txt/"` returns no
+# entry at all -- so an index carrying a symlink while the working tree carries a
+# regular file slipped past this refusal entirely, and the writer then succeeded
+# against the working file while the index still held the link blob. The probe is
+# about the index, so it has to speak the name the index uses.
+lane_b_mode="$(git ls-files -s -- "$LANE_B_BASELINE" | awk '{print $1}' || true)"
+case "${lane_b_mode:-}" in
+  120000)
+    # refusal:structural
+    echo "REFUSING: $LANE_B_BASELINE is a symlink in the index." >&2
+    echo "  The working tree would follow it and the merge target would not," >&2
+    echo "  so the two sides of this ratchet would compare different files." >&2
+    exit 2
+    ;;
+esac
 
 lane_b_now="$(printf '%s' "$scan_lane_b_counts" | { grep -v '^$' || [ $? -eq 1 ]; } | sort -k2)"
 

@@ -152,7 +152,7 @@ done
 # `git status --porcelain`, so the dirty-tree guard passes, the redirection
 # below truncates it, and the trap then deletes it. The guard cannot see it, so
 # the existence check has to be a plain filesystem test.
-for scratch in "$NEW_FILE" "$BASELINE.bak" "$BASELINE.real" "$BASELINE.link" "$BASELINE.tmp" "$BASELINE.hard" config.go.tmp lane-b-parent-link escape; do
+for scratch in "$NEW_FILE" "$BASELINE.bak" "$BASELINE.real" "$BASELINE.link" "$BASELINE.tmp" "$BASELINE.hard" config.go.tmp lane-b-parent-link escape a; do
   if [ -e "$scratch" ] || [ -L "$scratch" ]; then
     echo "REFUSING: $scratch already exists; this test would overwrite and then delete it." >&2
     echo "  git status may not show it (an ignored path is invisible there), so" >&2
@@ -195,6 +195,15 @@ cleanup_dirs() {
   [ -n "${STUB:-}" ] && rm -rf "$STUB"
   return 0
 }
+# ⚠ EMPTIED BEFORE THE TRAP CAN READ THEM. cleanup_dirs does `rm -rf` on these,
+# and they are assigned hundreds of lines below -- so an exit between here and
+# there ran the removal against whatever the CALLER had exported under those
+# names. An inherited value is not ours to delete, and this is the third ambient
+# input this harness has had to stop trusting, after LANE_B_BASELINE and
+# BASH_ENV. I introduced it while fixing a cleanup that only ran when nothing
+# went wrong.
+OUTSIDE=""
+STUB=""
 trap 'restore; cleanup_dirs; rm -f "$SAVED"' EXIT
 
 # judge <label> <rc> <want> <needle> <output> -- ONE judgement, every caller.
@@ -247,7 +256,14 @@ mv "$BASELINE" "$BASELINE.bak"
 expect "a missing baseline refuses"  2 "is missing"
 mv "$BASELINE.bak" "$BASELINE"
 ln -sf /dev/null "$BASELINE.link"; mv "$BASELINE" "$BASELINE.real"; ln -sf "$(basename "$BASELINE.real")" "$BASELINE"
-expect "a symlinked baseline refuses" 2 "is a symlink in the index"
+# ⚠ THIS SCENE IS A SYMLINK IN BOTH PLACES, so the WORKING-TREE refusal is the
+# one it reaches: the index probe now runs after canonicalisation, which runs
+# after the filesystem checks. It used to assert the index message and stopped
+# being able to reach it the moment the probe moved -- caught by this control
+# failing rather than by my noticing. The index refusal has its own scene below,
+# where the index and the working tree DISAGREE, which is the only state that
+# isolates it.
+expect "a symlinked baseline refuses" 2 "is a symlink in the working tree"
 rm -f "$BASELINE" "$BASELINE.link"; mv "$BASELINE.real" "$BASELINE"
 # `sed -i` with no argument is GNU-only too -- BSD sed reads the next word as
 # the backup suffix. Write to a temporary file and move it, everywhere.
@@ -286,6 +302,16 @@ expect_nostage() {
   local label="$1" want="$2" needle="$3" rc=0 out
   checks=$((checks + 1))
   out="$("$GATE" 2>&1)" || rc=$?
+  judge "$label" "$rc" "$want" "$needle" "$out"
+}
+
+# expect_env_nostage <label> <VAR=value> <wanted-exit> <substring> -- both at once,
+# because the index-mode scene needs an index that DISAGREES with the working
+# tree, and `git add -A` is precisely what erases that disagreement.
+expect_env_nostage() {
+  local label="$1" assign="$2" want="$3" needle="$4" rc=0 out
+  checks=$((checks + 1))
+  out="$(env "$assign" "$GATE" 2>&1)" || rc=$?
   judge "$label" "$rc" "$want" "$needle" "$out"
 }
 
@@ -482,6 +508,30 @@ restore
 # administrative directory is inside the root without being inside the worktree.
 expect_env "the git directory refuses the writer" \
   "LANE_B_BASELINE=.git/index" 2 "resolves inside the git directory" --write-baseline
+
+# ⚠ THE PREFIX IS THE DIFFERENCE BETWEEN TWO PATHS WE HOLD, NOT A FRESH
+# DISCOVERY. Asked from inside a nested repository, `git rev-parse --show-prefix`
+# answers about THAT repository: `a/q/baseline` under a repo at `a` derived as
+# `q/baseline`, which the outer root then resolves to an entirely different file.
+# The refusal names the derived path, so the message discriminates -- outer
+# anchoring says `a/q/baseline`, rediscovery says `q/baseline`.
+mkdir -p a/q && git init -q a && printf 'x\n' > a/q/baseline
+expect_env "canonicalisation is anchored to the outer repository" \
+  "LANE_B_BASELINE=a/q/baseline" 2 "a/q/baseline is missing from the index"
+rm -rf a
+
+# ⚠ THE INDEX MODE IS PROBED WITH THE DERIVED SPELLING. Asked of the spelling as
+# given, `git ls-files -s -- "scripts/baseline.txt/"` returns no entry at all, so
+# an index holding a SYMLINK while the working tree holds a regular file walked
+# straight past the refusal -- and the writer then succeeded against the working
+# file while the index still carried the link blob. Not staged, deliberately:
+# staging is what erases the disagreement this scene is made of.
+lane_b_link_blob="$(printf '%s' "$BASELINE.real" | git hash-object -w --stdin)"
+git update-index --add --cacheinfo "120000,$lane_b_link_blob,$BASELINE"
+expect_env_nostage "the index mode is probed with the derived spelling" \
+  "LANE_B_BASELINE=$BASELINE/" 2 "is a symlink in the index"
+git update-index --add --cacheinfo "100644,$(git hash-object -w "$BASELINE"),$BASELINE"
+restore
 rm -f lane-b-parent-link
 rm -rf "$OUTSIDE"
 
@@ -573,7 +623,7 @@ restore
 # this paragraph forbids, one line from where it forbids it, and passing every
 # healthy run because a stale expectation only shows up once some other count
 # disagrees.
-EXPECTED_CHECKS=32
+EXPECTED_CHECKS=34
 if [ "$checks" -ne "$EXPECTED_CHECKS" ]; then
   echo "REFUSING: $checks control(s) ran, expected exactly $EXPECTED_CHECKS" >&2
   exit 2
