@@ -72,10 +72,13 @@
 #
 # ── SCOPE, STATED SO A PASS IS NOT READ AS MORE THAN IT IS ──────────────────
 # LANE A is GATED at zero: every tracked file that is not Go source.
-# LANE B is REPORTED, NOT GATED: Go source (*.go). Those comments are owned by
-#   another workstream (the SDK wire freeze) and editing them here would
-#   collide with it. Lane B prints its count on every run so the debt stays
-#   visible instead of being implied away by lane A's green.
+# LANE B is REPORTED AT ZERO, GATED ON CHANGE: Go source (*.go). Those comments
+#   are owned by another workstream (the SDK wire freeze) and editing them here
+#   would collide with it, so existing debt does not fail the run -- but the
+#   per-file counts are held against a baseline, and a count that RISES, or that
+#   FALLS without the baseline being updated, does fail. Two different things
+#   share the word "gated" and the distinction is the whole design: not gated at
+#   zero, gated on change.
 # Neither lane looks at git HISTORY. Deleting a line does not unpublish the
 # commit that carried it.
 #
@@ -1569,11 +1572,54 @@ scan_tree() {
     case "$f" in
       *.go)
         scan_lane_b_files=$((scan_lane_b_files + 1))
-        scan_lane_b_this_file=0
         while IFS= read -r line; do
           [ -n "$line" ] && scan_lane_b_lines=$((scan_lane_b_lines + 1))
-          [ -n "$line" ] && scan_lane_b_this_file=$((scan_lane_b_this_file + 1))
         done <<< "$hits"
+        # ⚠ OCCURRENCES, NOT MATCHING LINES, AND THAT WAS A REAL HOLE. The
+        # records above are deduplicated by LINE NUMBER -- necessarily, because
+        # one physical line can match the shape pass on its raw bytes and the
+        # roster pass on its marker-free copy -- and the per-file tally then
+        # ticked once per surviving record. So appending a SECOND identifier to
+        # an already-matching line moved no number, and the ratchet passed with
+        # no baseline edit, because that line's debt was already recorded. The
+        # stated rule is that a new occurrence fails; the unit being counted
+        # said otherwise, and the two had drifted apart unnoticed.
+        #
+        # The key that fixes it is (line, marker-free match text): the raw and
+        # the marker-free spelling of ONE identifier normalise to the same
+        # string and collapse, while two DIFFERENT identifiers on one line stay
+        # apart. -o gives the matched text rather than the line.
+        #
+        # ⚠ MAX ACROSS PASSES, NOT SUM. Every pass reads the same physical line,
+        # so summing would multiply one occurrence by however many passes saw
+        # it. Taking the largest count any single pass reports for a given
+        # (line, text) keeps a genuine repeat -- the same identifier twice on
+        # one line -- at two, without inventing copies out of the passes.
+        lane_b_occ_1="$({ grep -aonE -- "$PATTERNS" "$scan_src" 2>/dev/null || [ $? -eq 1 ]; } | tr -d '\000')"
+        lane_b_occ_2="$({ grep -aonE -- "$PATTERNS" "$strip_blob" 2>/dev/null || [ $? -eq 1 ]; } | tr -d '\000')"
+        lane_b_occ_3="$({ grep -aoniE -- "$ROSTER_RE" "$scan_src" 2>/dev/null || [ $? -eq 1 ]; } | tr -d '\000')"
+        lane_b_occ_4="$({ grep -aoniE -- "$ROSTER_RE" "$strip_blob" 2>/dev/null || [ $? -eq 1 ]; } | tr -d '\000')"
+        scan_lane_b_this_file="$(
+          for pass in 1 2 3 4; do
+            eval "printf '%s\n' \"\$lane_b_occ_$pass\"" | sed "s/^/$pass:/"
+          done | awk -F: '
+            NF > 2 {
+              pass = $1; n = $2
+              m = substr($0, index($0, ":") + 1)
+              m = substr(m, index(m, ":") + 1)
+              gsub(/[*_`~\\]/, "", m)
+              if (m != "") seen[pass SUBSEP n ":" m]++
+            }
+            END {
+              for (k in seen) {
+                split(k, a, SUBSEP)
+                if (seen[k] > best[a[2]]) best[a[2]] = seen[k]
+              }
+              total = 0
+              for (k in best) total += best[k]
+              print total
+            }'
+        )"
         # PER-FILE tally, for the ratchet below. Counting per file rather than
         # one grand total is what makes the baseline diffable and the failure
         # legible: a reviewer sees WHICH file grew, not that a number moved.
@@ -2306,7 +2352,7 @@ if [ "$scan_files" -eq 0 ]; then
 fi
 
 echo
-echo "LANE B (REPORTED, NOT GATED) — Go source: ${scan_lane_b_files} file(s) WITH A MATCH, ${scan_lane_b_lines} matching line(s). Not a count of Go files scanned: a clean one is not counted here."
+echo "LANE B (REPORTED AT ZERO, GATED ON CHANGE) — Go source: ${scan_lane_b_files} file(s) WITH A MATCH, ${scan_lane_b_lines} matching line(s). The RATCHET holds occurrences, which is the larger number when a line carries more than one; both are printed because only one of them is gated. Not a count of Go files scanned: a clean one is not counted here."
 if [ "$scan_lane_b_files" -eq 0 ]; then
   echo "  LANE B IS EMPTY. The debt this lane tracked is paid: fold *.go into lane A"
   echo "  and delete this section, so the scope note stops describing a gap that"
@@ -2355,6 +2401,77 @@ fi
 # upward in the same change is not a ratchet — it is a comment.
 LANE_B_BASELINE="${LANE_B_BASELINE:-scripts/public-surface-lane-b-baseline.txt}"
 
+# ⚠ VALIDATED HERE BECAUSE --write-baseline NEVER REACHES WHAT FOLLOWS IT. The
+# writer redirects into this path and then `exit 0`s, so every check placed
+# below that branch is not LATE for the writing path -- it is UNREACHABLE from
+# it. The reachability question is the same one that finds a branch no input can
+# enter; this is its mirror, a guard no path can arrive at.
+#
+# And the path is env-overridable one line above. An earlier round fixed this by
+# pinning the variable in the control HARNESS -- which fixed one caller and left
+# the writer, the single place that serves every caller, exactly as exposed. The
+# fix belongs where the defect is, not where it was noticed.
+#
+# Repository-relative, checked by shape: no realpath is available on every
+# system this gate supports (BSD `readlink` has no -f, and bash 3.2 is
+# documented as supported), and an absolute path or one climbing out with .. is
+# the whole of what the override can reach for.
+case "$LANE_B_BASELINE" in
+  /*|*..*)
+    # refusal:structural
+    echo "REFUSING: LANE_B_BASELINE must be a repository-relative path." >&2
+    echo "  Got: $LANE_B_BASELINE" >&2
+    echo "  --write-baseline redirects into it, so an absolute or climbing path" >&2
+    echo "  would overwrite a file this gate has no business touching." >&2
+    exit 2
+    ;;
+esac
+# ⚠ A SYMLINK IS NOT A BASELINE, and `-f` cannot tell you so -- it FOLLOWS the
+# link. Replace this file with a link to another tracked baseline and every
+# current-tree read follows it, so the change passes; but `git show <ref>:<path>`
+# on the merge target returns the LINK BLOB, the target's pathname, and every
+# later PR is then reported as adding paths the target does not have. The two
+# sides must read the same kind of object, so the index entry's mode is checked
+# rather than the filesystem's answer about what it points at.
+lane_b_mode="$(git ls-files -s -- "$LANE_B_BASELINE" | awk '{print $1}' || true)"
+case "${lane_b_mode:-}" in
+  120000)
+    # refusal:structural
+    echo "REFUSING: $LANE_B_BASELINE is a symlink in the index." >&2
+    echo "  The working tree would follow it and the merge target would not," >&2
+    echo "  so the two sides of this ratchet would compare different files." >&2
+    exit 2
+    ;;
+esac
+# The index says nothing about an UNTRACKED symlink sitting at the same path,
+# and the writer's redirect follows that one too.
+if [ -L "$LANE_B_BASELINE" ]; then
+  # refusal:structural
+  echo "REFUSING: $LANE_B_BASELINE is a symlink in the working tree." >&2
+  echo "  --write-baseline would follow it and write through to its target." >&2
+  exit 2
+fi
+# A hard link is a second name for one inode, and a redirect writes THROUGH it:
+# the other name changes too, and nothing here can put it back. `ls -ld` field 2
+# is the link count on GNU and BSD alike; `stat` spells it differently on each.
+if [ -e "$LANE_B_BASELINE" ]; then
+  lane_b_links="$(ls -ld "$LANE_B_BASELINE" 2>/dev/null | awk '{print $2}')"
+  case "${lane_b_links:-}" in
+    ''|*[!0-9]*)
+      # refusal:structural
+      echo "REFUSING: could not read the hard-link count of $LANE_B_BASELINE." >&2
+      exit 2
+      ;;
+  esac
+  if [ "$lane_b_links" -gt 1 ]; then
+    # refusal:structural
+    echo "REFUSING: $LANE_B_BASELINE has $lane_b_links hard links." >&2
+    echo "  --write-baseline writes through the inode, so every other name for" >&2
+    echo "  it would change and this gate could put none of them back." >&2
+    exit 2
+  fi
+fi
+
 # ⚠ STATUS 1 IS "NO MATCH"; ANYTHING ABOVE IT IS A BROKEN INSTRUMENT. An empty
 # result is not an error -- it is the state this lane exists to reach, where the
 # debt is paid and *.go folds into lane A -- so grep's 1 must not kill the
@@ -2378,8 +2495,15 @@ if [ "${1:-}" = "--write-baseline" ]; then
     echo "# FALLS without this file being updated, so paying debt is recorded"
     echo "# rather than silently banked as slack."
     echo "#"
-    echo "# format-version: 2"
+    echo "# format-version: 3"
     echo "# Format: <occurrences> <path> -- count FIRST so a path may contain spaces"
+    echo "#"
+    echo "# format 3 counts OCCURRENCES; format 2 counted MATCHING LINES. Two"
+    echo "# identifiers on one line were one tick in format 2, so a second one"
+    echo "# could be added to an existing line without any number moving. The"
+    echo "# version moved because the numbers mean something different, not"
+    echo "# because the layout changed -- reading a format-2 file with this"
+    echo "# parser would understate every count that has such a line."
     printf '%s\n' "$lane_b_now"
   } > "$LANE_B_BASELINE"
   echo "WROTE $LANE_B_BASELINE"
@@ -2391,29 +2515,25 @@ if [ "${1:-}" = "--write-baseline" ]; then
   exit 0
 fi
 
-# ⚠ A SYMLINK IS NOT A BASELINE, and `-f` cannot tell you so -- it FOLLOWS the
-# link. Replace this file with a link to another tracked baseline and every
-# current-tree read follows it, so the change passes; but `git show <ref>:<path>`
-# on the merge target returns the LINK BLOB, the target's pathname, and every
-# later PR is then reported as adding paths the target does not have. The two
-# sides must read the same kind of object, so the index entry's mode is checked
-# rather than the filesystem's answer about what it points at.
-lane_b_mode="$(git ls-files -s -- "$LANE_B_BASELINE" | awk '{print $1}' || true)"
-case "${lane_b_mode:-}" in
-  120000)
-    # refusal:structural
-    echo "REFUSING: $LANE_B_BASELINE is a symlink in the index." >&2
-    echo "  The working tree would follow it and the merge target would not," >&2
-    echo "  so the two sides of this ratchet would compare different files." >&2
-    exit 2
-    ;;
-esac
-if [ ! -f "$LANE_B_BASELINE" ]; then
+# ⚠ READ FROM THE INDEX, LIKE EVERY OTHER INPUT THIS GATE COMPARES. scan_tree
+# lists paths from `git write-tree` and reads each blob with
+# `git cat-file blob :<path>` -- deliberately, because the question this file
+# asks is what a commit would PUBLISH. The baseline was the one input still read
+# from the working tree, so staging a source change while leaving the matching
+# baseline edit unstaged compared a staged tree against an unstaged baseline and
+# passed -- while the commit being built still carried the stale one. Two sides,
+# two universes, and the gate reported on neither.
+gate_tmp; lane_b_base_blob="$GATE_TMP"
+if ! git cat-file blob ":$LANE_B_BASELINE" > "$lane_b_base_blob" 2>/dev/null; then
   # refusal:structural — fail closed. An absent baseline is indistinguishable
   # from a deleted one, and treating it as "nothing to compare" would let anyone
-  # disable this gate with rm.
-  echo "REFUSING: $LANE_B_BASELINE is missing." >&2
+  # disable this gate with rm. Absent FROM THE INDEX is the reading that matters
+  # now: a baseline written but never staged is not yet the file this commit
+  # would carry, and saying so is more useful than comparing against it.
+  echo "REFUSING: $LANE_B_BASELINE is missing from the index." >&2
   echo "  Regenerate it with: $0 --write-baseline" >&2
+  echo "  If you just regenerated it, stage it: the gate reads what would be" >&2
+  echo "  committed, not what is sitting in the working tree." >&2
   exit 2
 fi
 
@@ -2424,11 +2544,11 @@ fi
 # the version 2 parser binds the PATH to the count field and reports about the
 # wrong file -- observed, not imagined, while testing this very change. A
 # marker turns that into a refusal instead of a confident wrong answer.
-LANE_B_FORMAT=2
+LANE_B_FORMAT=3
 # Same rule as above: grep's 1 is "no such line" and is legitimate (a format-1
 # file has no marker); anything higher is a read failure and must not arrive
 # here disguised as an old format.
-lane_b_version="$(grep -m1 '^# format-version:' "$LANE_B_BASELINE" || [ $? -eq 1 ])"
+lane_b_version="$(grep -m1 '^# format-version:' "$lane_b_base_blob" || [ $? -eq 1 ])"
 lane_b_version="$(printf '%s' "$lane_b_version" | tr -dc '0-9')"
 if [ "${lane_b_version:-1}" != "$LANE_B_FORMAT" ]; then
   # refusal:structural
@@ -2442,7 +2562,7 @@ fi
 # the assignment before the second one's careful handling is ever reached. Fixing
 # the downstream filter and leaving the upstream one was fixing the half I was
 # looking at.
-lane_b_base="$({ grep -v '^#' "$LANE_B_BASELINE" || [ $? -eq 1 ]; } \
+lane_b_base="$({ grep -v '^#' "$lane_b_base_blob" || [ $? -eq 1 ]; } \
   | { grep -v '^$' || [ $? -eq 1 ]; } | sort -k2)"
 
 if [ "$lane_b_now" != "$lane_b_base" ]; then

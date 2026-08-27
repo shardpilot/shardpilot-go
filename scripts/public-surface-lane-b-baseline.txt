@@ -7,16 +7,23 @@
 # FALLS without this file being updated, so paying debt is recorded
 # rather than silently banked as slack.
 #
-# format-version: 2
+# format-version: 3
 # Format: <occurrences> <path> -- count FIRST so a path may contain spaces
+#
+# format 3 counts OCCURRENCES; format 2 counted MATCHING LINES. Two
+# identifiers on one line were one tick in format 2, so a second one
+# could be added to an existing line without any number moving. The
+# version moved because the numbers mean something different, not
+# because the layout changed -- reading a format-2 file with this
+# parser would understate every count that has such a line.
 7 config.go
 1 consent_outbox.go
 4 experiments.go
 1 pkg/crash/capture.go
-2 pkg/crash/capture_phase_d_test.go
-4 pkg/crash/client.go
-1 pkg/crash/goroutines.go
-1 pkg/crash/selfmodule.go
+3 pkg/crash/capture_phase_d_test.go
+6 pkg/crash/client.go
+2 pkg/crash/goroutines.go
+2 pkg/crash/selfmodule.go
 7 remote_config.go
 3 remote_config_test.go
-2 schema_revision.go
+3 schema_revision.go

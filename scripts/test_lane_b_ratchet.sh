@@ -152,7 +152,7 @@ done
 # `git status --porcelain`, so the dirty-tree guard passes, the redirection
 # below truncates it, and the trap then deletes it. The guard cannot see it, so
 # the existence check has to be a plain filesystem test.
-for scratch in "$NEW_FILE" "$BASELINE.bak" "$BASELINE.real" "$BASELINE.link" "$BASELINE.tmp"; do
+for scratch in "$NEW_FILE" "$BASELINE.bak" "$BASELINE.real" "$BASELINE.link" "$BASELINE.tmp" "$BASELINE.hard" config.go.tmp; do
   if [ -e "$scratch" ] || [ -L "$scratch" ]; then
     echo "REFUSING: $scratch already exists; this test would overwrite and then delete it." >&2
     echo "  git status may not show it (an ignored path is invisible there), so" >&2
@@ -166,7 +166,7 @@ restore() {
   # the two leaves it UNTRACKED in the worktree, where `git rm --cached` cannot
   # reach it. Removing the record without removing the file is the same half-
   # restore as removing the file without the record.
-  rm -f "$NEW_FILE" "$BASELINE.bak" "$BASELINE.real" "$BASELINE.link" "$BASELINE.tmp"
+  rm -f "$NEW_FILE" "$BASELINE.bak" "$BASELINE.real" "$BASELINE.link" "$BASELINE.tmp" "$BASELINE.hard" config.go.tmp
   git checkout -q HEAD -- "${RESTORE_PATHS[@]}" 2>/dev/null || true
   # ⚠ EVERY SCRATCH PATH, NOT JUST THE PROBE. Controls stage before running, so
   # an interruption after the missing- or symlink-baseline setup leaves .bak,
@@ -175,16 +175,19 @@ restore() {
   # the record is not a restore.
   git rm -q --cached --ignore-unmatch \
     "$NEW_FILE" "$BASELINE.bak" "$BASELINE.real" "$BASELINE.link" "$BASELINE.tmp" \
+    "$BASELINE.hard" config.go.tmp \
     >/dev/null 2>&1 || true
 }
 trap 'restore; rm -f "$SAVED"' EXIT
 
-# expect <label> <wanted-exit> <substring> -- runs the gate and judges both.
-expect() {
-  local label="$1" want="$2" needle="$3" rc=0 out
-  checks=$((checks + 1))
-  git add -A >/dev/null 2>&1 || true
-  out="$("$GATE" 2>&1)" || rc=$?
+# judge <label> <rc> <want> <needle> <output> -- ONE judgement, every caller.
+# The two halves are reported separately and the exit is checked first, because
+# "exit 1 for the wrong reason" and "the right reason at the wrong exit" are
+# different defects and a message that merges them names the wrong one. An
+# earlier copy of this in expect_ref did exactly that: it printed "reason not
+# found" whenever the EXIT disagreed, including when the reason was present.
+judge() {
+  local label="$1" rc="$2" want="$3" needle="$4" out="$5"
   if [ "$rc" -ne "$want" ]; then
     echo "FAIL [$label]: exit $rc, expected $want" >&2
     failures=$((failures + 1))
@@ -198,6 +201,15 @@ expect() {
   fi
 }
 
+# expect <label> <wanted-exit> <substring> -- runs the gate and judges both.
+expect() {
+  local label="$1" want="$2" needle="$3" rc=0 out
+  checks=$((checks + 1))
+  git add -A >/dev/null 2>&1 || true
+  out="$("$GATE" 2>&1)" || rc=$?
+  judge "$label" "$rc" "$want" "$needle" "$out"
+}
+
 expect "clean tree holds"            0 "LANE B RATCHET — held at"
 mv "$BASELINE" "$BASELINE.bak"
 expect "a missing baseline refuses"  2 "is missing"
@@ -207,7 +219,7 @@ expect "a symlinked baseline refuses" 2 "is a symlink in the index"
 rm -f "$BASELINE" "$BASELINE.link"; mv "$BASELINE.real" "$BASELINE"
 # `sed -i` with no argument is GNU-only too -- BSD sed reads the next word as
 # the backup suffix. Write to a temporary file and move it, everywhere.
-sed 's/^# format-version: 2/# format-version: 1/' "$BASELINE" > "$BASELINE.tmp"
+sed 's/^# format-version: .*/# format-version: 1/' "$BASELINE" > "$BASELINE.tmp"
 mv "$BASELINE.tmp" "$BASELINE"
 expect "a format skew refuses"       2 "this script reads"
 cp "$SAVED" "$BASELINE"
@@ -219,15 +231,38 @@ mv "$BASELINE.tmp" "$BASELINE"
 expect "a disagreeing count fails"   1 "moved and the baseline did not agree"
 cp "$SAVED" "$BASELINE"
 
+# expect_env <label> <VAR=value> <wanted-exit> <substring> -- one ambient value,
+# supplied per call, the way expect_ref supplies the comparison ref. The harness
+# drops these variables globally on purpose, so a control that needs one has to
+# hand it over deliberately rather than inherit it.
+expect_env() {
+  local label="$1" assign="$2" want="$3" needle="$4" rc=0 out
+  checks=$((checks + 1))
+  git add -A >/dev/null 2>&1 || true
+  shift 4
+  out="$(env "$assign" "$GATE" "$@" 2>&1)" || rc=$?
+  judge "$label" "$rc" "$want" "$needle" "$out"
+}
+
+# expect_nostage <label> <wanted-exit> <substring> -- runs WITHOUT `git add -A`.
+# Every other control stages first, which is right for them: the gate reads the
+# index. But a refusal about the WORKING TREE cannot be driven that way -- stage
+# a symlink and the index carries mode 120000, so the index check fires first
+# and the working-tree check is never reached. The two refusals exist precisely
+# because those are different states.
+expect_nostage() {
+  local label="$1" want="$2" needle="$3" rc=0 out
+  checks=$((checks + 1))
+  out="$("$GATE" 2>&1)" || rc=$?
+  judge "$label" "$rc" "$want" "$needle" "$out"
+}
+
 expect_ref() {
   local label="$1" ref="$2" want="$3" needle="$4" rc=0 out
   checks=$((checks + 1))
   git add -A >/dev/null 2>&1 || true
   out="$(PUBLIC_SURFACE_BASE_REF="$ref" "$GATE" 2>&1)" || rc=$?
-  if [ "$rc" -ne "$want" ] || { [ -n "$needle" ] && ! printf '%s' "$out" | grep -qF -- "$needle"; }; then
-    echo "FAIL [$label]: exit $rc (wanted $want), reason '$needle' not found" >&2
-    failures=$((failures + 1))
-  fi
+  judge "$label" "$rc" "$want" "$needle" "$out"
 }
 
 expect_ref "an unresolvable base refuses" "no/such/ref"   2 "does not resolve"
@@ -322,6 +357,73 @@ no_blob_commit="$(git -c user.name="lane-b-ratchet-test" -c user.email="lane-b-r
   commit-tree "$missing_blob_tree" -p HEAD -m "synthetic unreadable blob")"
 expect_ref "an unreadable baseline blob on the target refuses" "$no_blob_commit" 2 "could not be read"
 
+# ⚠ THE WRITER'S GUARD, DRIVEN THROUGH THE WRITER. --write-baseline redirected
+# into LANE_B_BASELINE and then exited, so every check below that branch was
+# unreachable from it -- and the path is env-overridable, so an arbitrary target
+# reached the redirect. Reproduced against the pre-fix gate: an unrelated file
+# was overwritten with the baseline header and the gate exited 0.
+#
+# The control drives the WRITING path, not the reading one: a guard proven only
+# on the read path says nothing about the branch that motivated it.
+printf 'PRECIOUS UNRELATED FILE\n' > "$BASELINE.hard"
+expect_env "an absolute baseline path refuses the writer" \
+  "LANE_B_BASELINE=$PWD/$BASELINE.hard" 2 "must be a repository-relative path" --write-baseline
+if [ "$(head -1 "$BASELINE.hard")" != "PRECIOUS UNRELATED FILE" ]; then
+  echo "FAIL [an absolute baseline path refuses the writer]: the file was written anyway" >&2
+  failures=$((failures + 1))
+fi
+rm -f "$BASELINE.hard"
+
+# A hard link is a second name for one inode and a redirect writes THROUGH it.
+ln "$BASELINE" "$BASELINE.hard"
+expect "a hard-linked baseline refuses" 2 "hard links"
+rm -f "$BASELINE.hard"
+restore
+
+# ⚠ NOT STAGED, DELIBERATELY. Staging a symlink puts mode 120000 in the index,
+# so the INDEX check fires and this one is never reached. The two refusals exist
+# because the index and the working tree can disagree, and a control that stages
+# first can only ever drive one of them.
+mv "$BASELINE" "$BASELINE.real"
+ln -s "$(basename "$BASELINE.real")" "$BASELINE"
+expect_nostage "a working-tree symlink refuses" 2 "is a symlink in the working tree"
+rm -f "$BASELINE"; mv "$BASELINE.real" "$BASELINE"
+
+# ⚠ A SECOND IDENTIFIER ON AN ALREADY-MATCHING LINE. The records the scan keeps
+# are deduplicated by line number, so the old per-file tally ticked once per
+# LINE: appending another identifier to a line already carrying one moved no
+# number and the ratchet passed with no baseline edit. That is the gate's stated
+# rule -- a new occurrence fails -- disagreeing with the unit it counted.
+# Two steps, because config.go carries no marker of its own: its lane B count
+# comes from other patterns and there is no way to name one of those lines from
+# here. So the control MAKES a counted line, records it in the baseline, and
+# only then adds the second identifier to that same line -- which is the state
+# the defect was about, reached honestly rather than assumed.
+printf '\n// See %s for the freeze this follows.\n' "$marker" >> config.go
+git add -A >/dev/null 2>&1 || true
+"$GATE" --write-baseline >/dev/null 2>&1 || true
+awk -v m="$marker" '{ lines[NR] = $0; if (index($0, m) > 0) last = NR }
+                    END { for (i = 1; i <= NR; i++)
+                            print (i == last ? lines[i] " " m : lines[i]) }' \
+  config.go > config.go.tmp
+mv config.go.tmp config.go
+expect "a second match on an existing line is counted" 1 "moved and the baseline did not agree"
+restore
+
+# ⚠ THE BASELINE IS READ FROM THE INDEX, LIKE EVERY OTHER INPUT. scan_tree lists
+# paths from `git write-tree` and reads blobs with `git cat-file blob :<path>`;
+# the baseline was the one input still read from the working tree, so a staged
+# source change plus an UNSTAGED baseline edit compared a staged tree against an
+# unstaged baseline and passed -- while the commit being built carried the stale
+# one. Not staged here, deliberately: staging is what erases the difference this
+# control exists to see.
+printf '\n// See %s for the freeze this follows.\n' "$marker" >> config.go
+git add config.go >/dev/null 2>&1 || true
+"$GATE" --write-baseline >/dev/null 2>&1 || true
+expect_nostage "an unstaged baseline is not the one that would be committed" \
+  1 "moved and the baseline did not agree"
+restore
+
 # ⚠ EXACTLY, NOT AT LEAST, AND THE NUMBER LIVES ONLY ON THE NEXT LINE. A floor
 # accepts a stale count: add a control without touching it and the expected
 # number silently drifts, after which that control can be deleted and the stale
@@ -335,7 +437,7 @@ expect_ref "an unreadable baseline blob on the target refuses" "$no_blob_commit"
 # this paragraph forbids, one line from where it forbids it, and passing every
 # healthy run because a stale expectation only shows up once some other count
 # disagrees.
-EXPECTED_CHECKS=14
+EXPECTED_CHECKS=19
 if [ "$checks" -ne "$EXPECTED_CHECKS" ]; then
   echo "REFUSING: $checks control(s) ran, expected exactly $EXPECTED_CHECKS" >&2
   exit 2
