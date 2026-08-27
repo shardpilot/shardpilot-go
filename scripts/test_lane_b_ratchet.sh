@@ -531,12 +531,21 @@ restore
 # The stub swaps the leaf for a link outside the worktree, then defers to the
 # real `ls`, which reports link count 1 on the link and lets the gate proceed.
 #
-# The property is not a property of `mv`. Measured: GNU `mv` renames over the
-# destination NAME and leaves the outside file alone -- but only on the
-# rename(2) path; it falls back to copying across filesystems, and the copy
-# follows the link. The gate is safe because the temporary is a SIBLING of the
-# leaf, so the rename is never cross-device. That is a property of the
-# construction, and this is what stops a later tidy-up from losing it.
+# ⚠ AND THE PROPERTY IS NOT THE ONE I FIRST WROTE DOWN. I claimed `mv` is safe
+# only on the rename(2) path and follows the link when it falls back to copying
+# across filesystems. Measured, both ways -- and it is false: GNU `mv` unlinks
+# the destination NAME first on the copy fallback too, so the outside file
+# survives a cross-device move as well.
+#
+#   mv  (same device)   -> link replaced, outside intact
+#   mv  (/dev/shm -> /) -> link replaced, outside intact
+#   cp                  -> link FOLLOWED, outside clobbered, link still standing
+#   cat >               -> link FOLLOWED, outside clobbered
+#
+# So what this control holds is narrower and more useful than a fact about
+# filesystems: the put-in-place must stay a RENAME. Turn it into a copy or a
+# redirect -- the ordinary shape of a later tidy-up -- and the write goes
+# through the link. That is the mutant this control is driven against.
 lane_b_leafout="$(mktemp -d)"
 printf 'PRECIOUS LEAF\n' > "$lane_b_leafout/target.txt"
 lane_b_leafstub="$(mktemp -d)"
