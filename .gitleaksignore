@@ -1,0 +1,13 @@
+# Six generic-api-key hits on 3bf08ff8f6, contained in refs/pull/39/head and no
+# branch or tag. Classified 2026-08-24 as NOT credentials: each value is an
+# ordered counting run or a descriptive test token — a property of the value,
+# not a reading of its purpose. Recorded in the qa publication gate's
+# SECRET_SCAN_2026_08_24 cohort as findings: 6 with that remainder.
+# Pinned per finding, not allowlisted by shape: these entries die when the
+# commit stops being advertised, and forgive nothing anywhere else.
+3bf08ff8f6f46bca38f7f42513e9bd2b086e5402:experiment_events_test.go:generic-api-key:67
+3bf08ff8f6f46bca38f7f42513e9bd2b086e5402:experiment_events_test.go:generic-api-key:337
+3bf08ff8f6f46bca38f7f42513e9bd2b086e5402:experiments_test.go:generic-api-key:17
+3bf08ff8f6f46bca38f7f42513e9bd2b086e5402:experiments_test.go:generic-api-key:24
+3bf08ff8f6f46bca38f7f42513e9bd2b086e5402:experiments_test.go:generic-api-key:187
+3bf08ff8f6f46bca38f7f42513e9bd2b086e5402:experiments_test.go:generic-api-key:611
