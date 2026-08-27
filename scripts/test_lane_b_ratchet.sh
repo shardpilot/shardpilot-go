@@ -21,13 +21,10 @@ cd "$(dirname "$0")/.."
 
 GATE=scripts/check_public_surface.sh
 BASELINE=scripts/public-surface-lane-b-baseline.txt
-# ⚠ PINNED, NOT INHERITED. The gate reads LANE_B_BASELINE with a default, so an
-# exported value would redirect --write-baseline at whatever the caller named --
-# possibly outside this worktree, where neither the saved copy nor the EXIT trap
-# could put it back. Every invocation below passes this explicitly, and the
-# ambient value is dropped here so nothing can reach the gate by accident.
-unset LANE_B_BASELINE
-export LANE_B_BASELINE="$BASELINE"
+# ⚠ THE PIN IS GONE WITH THE OVERRIDE. This used to unset and re-export
+# LANE_B_BASELINE so nothing could redirect the gate's writer at an arbitrary
+# path. The gate no longer reads that variable at all, so there is nothing to
+# pin and nothing to leak -- the hazard is removed rather than defended.
 
 # ⚠ AND THE PIN IS NOT ENOUGH ON ITS OWN. The gate is a bash script, and a
 # non-interactive bash sources $BASH_ENV at startup -- AFTER this export -- so a
@@ -152,7 +149,7 @@ done
 # `git status --porcelain`, so the dirty-tree guard passes, the redirection
 # below truncates it, and the trap then deletes it. The guard cannot see it, so
 # the existence check has to be a plain filesystem test.
-for scratch in "$NEW_FILE" "$BASELINE.bak" "$BASELINE.real" "$BASELINE.link" "$BASELINE.tmp" "$BASELINE.hard" config.go.tmp lane-b-parent-link escape a; do
+for scratch in "$NEW_FILE" "$BASELINE.bak" "$BASELINE.real" "$BASELINE.link" "$BASELINE.tmp" "$BASELINE.hard" config.go.tmp; do
   if [ -e "$scratch" ] || [ -L "$scratch" ]; then
     echo "REFUSING: $scratch already exists; this test would overwrite and then delete it." >&2
     echo "  git status may not show it (an ignored path is invisible there), so" >&2
@@ -166,7 +163,7 @@ restore() {
   # the two leaves it UNTRACKED in the worktree, where `git rm --cached` cannot
   # reach it. Removing the record without removing the file is the same half-
   # restore as removing the file without the record.
-  rm -f "$NEW_FILE" "$BASELINE.bak" "$BASELINE.real" "$BASELINE.link" "$BASELINE.tmp" "$BASELINE.hard" config.go.tmp lane-b-parent-link
+  rm -f "$NEW_FILE" "$BASELINE.bak" "$BASELINE.real" "$BASELINE.link" "$BASELINE.tmp" "$BASELINE.hard" config.go.tmp
   git checkout -q HEAD -- "${RESTORE_PATHS[@]}" 2>/dev/null || true
   # ⚠ EVERY SCRATCH PATH, NOT JUST THE PROBE. Controls stage before running, so
   # an interruption after the missing- or symlink-baseline setup leaves .bak,
@@ -175,7 +172,7 @@ restore() {
   # the record is not a restore.
   git rm -q --cached --ignore-unmatch \
     "$NEW_FILE" "$BASELINE.bak" "$BASELINE.real" "$BASELINE.link" "$BASELINE.tmp" \
-    "$BASELINE.hard" config.go.tmp lane-b-parent-link \
+    "$BASELINE.hard" config.go.tmp \
     >/dev/null 2>&1 || true
 }
 # ⚠ TRAP-ONLY, AND SEPARATE FROM restore(). The scratch DIRECTORIES were removed
@@ -190,14 +187,6 @@ restore() {
 # later controls still need. Measured, because I did exactly that first: eleven
 # controls failed at once.
 cleanup_dirs() {
-  rmdir escape 2>/dev/null || true
-  # `a/` is a nested repository a later control builds. It was added to the
-  # startup scratch guard and not here, so an interruption during that control
-  # left it in the checkout -- and the guard then refuses the NEXT run. The same
-  # asymmetry as `escape/`, reintroduced one control later by the person who had
-  # just fixed it.
-  rm -rf a
-  [ -n "${OUTSIDE:-}" ] && rm -rf "$OUTSIDE"
   [ -n "${STUB:-}" ] && rm -rf "$STUB"
   return 0
 }
@@ -208,7 +197,6 @@ cleanup_dirs() {
 # input this harness has had to stop trusting, after LANE_B_BASELINE and
 # BASH_ENV. I introduced it while fixing a cleanup that only ran when nothing
 # went wrong.
-OUTSIDE=""
 STUB=""
 trap 'restore; cleanup_dirs; rm -f "$SAVED"' EXIT
 
@@ -308,16 +296,6 @@ expect_nostage() {
   local label="$1" want="$2" needle="$3" rc=0 out
   checks=$((checks + 1))
   out="$("$GATE" 2>&1)" || rc=$?
-  judge "$label" "$rc" "$want" "$needle" "$out"
-}
-
-# expect_env_nostage <label> <VAR=value> <wanted-exit> <substring> -- both at once,
-# because the index-mode scene needs an index that DISAGREES with the working
-# tree, and `git add -A` is precisely what erases that disagreement.
-expect_env_nostage() {
-  local label="$1" assign="$2" want="$3" needle="$4" rc=0 out
-  checks=$((checks + 1))
-  out="$(env "$assign" "$GATE" 2>&1)" || rc=$?
   judge "$label" "$rc" "$want" "$needle" "$out"
 }
 
@@ -421,125 +399,21 @@ no_blob_commit="$(git -c user.name="lane-b-ratchet-test" -c user.email="lane-b-r
   commit-tree "$missing_blob_tree" -p HEAD -m "synthetic unreadable blob")"
 expect_ref "an unreadable baseline blob on the target refuses" "$no_blob_commit" 2 "could not be read"
 
-# ⚠ THE WRITER'S GUARD, DRIVEN THROUGH THE WRITER. --write-baseline redirected
-# into LANE_B_BASELINE and then exited, so every check below that branch was
-# unreachable from it -- and the path is env-overridable, so an arbitrary target
-# reached the redirect. Reproduced against the pre-fix gate: an unrelated file
-# was overwritten with the baseline header and the gate exited 0.
+# ⚠ FIFTEEN CONTROLS USED TO STAND HERE, and they are gone because their
+# SUBJECT is gone -- not because coverage was traded away. Every one drove a
+# refusal that existed to defend LANE_B_BASELINE as an override: an out-of-tree
+# target, a symlinked parent, physical traversal, seven spellings, a written
+# baseline read back, the git directory, the outer-repository anchor, and the
+# index probe against a raw spelling.
 #
-# The control drives the WRITING path, not the reading one: a guard proven only
-# on the read path says nothing about the branch that motivated it.
-OUTSIDE="$(mktemp -d)"
-printf 'PRECIOUS UNRELATED FILE\n' > "$OUTSIDE/precious.txt"
-expect_env "an out-of-tree baseline path refuses the writer" \
-  "LANE_B_BASELINE=$OUTSIDE/precious.txt" 2 "resolves outside this repository" --write-baseline
-if [ "$(head -1 "$OUTSIDE/precious.txt")" != "PRECIOUS UNRELATED FILE" ]; then
-  echo "FAIL [an out-of-tree baseline path refuses the writer]: the file was written anyway" >&2
-  failures=$((failures + 1))
-fi
-
-# ⚠ THE FOURTH DOOR, and the reason the check above is an identity test rather
-# than a list. The first three guards here -- path shape, a symlink at the final
-# component, the link count -- all pass a REGULAR file sitting under a SYMLINKED
-# PARENT, and the redirect then lands outside the repository exactly as before.
-# Reproduced by review: `LANE_B_BASELINE=lane-b-parent-link/out` with the link
-# pointing at a temporary directory, --write-baseline exit 0, external file
-# overwritten. Resolving the parent with `pwd -P` is what closes it, and this
-# control is what proves the closing is real rather than asserted.
-mkdir -p "$OUTSIDE/escape"
-printf 'PRECIOUS BEHIND A LINKED PARENT\n' > "$OUTSIDE/out"
-ln -s "$OUTSIDE" lane-b-parent-link
-expect_env "a symlinked parent directory refuses the writer" \
-  "LANE_B_BASELINE=lane-b-parent-link/out" 2 "resolves outside this repository" --write-baseline
-if [ "$(head -1 "$OUTSIDE/out")" != "PRECIOUS BEHIND A LINKED PARENT" ]; then
-  echo "FAIL [a symlinked parent directory refuses the writer]: the file was written anyway" >&2
-  failures=$((failures + 1))
-fi
-rm -f lane-b-parent-link
-
-# ⚠ THE ONE CONTROL THAT REACHES `cd -P`, AND IT COULD NOT BEFORE. While the
-# guard refused `..` outright, this scene exited at the spelling check and the
-# primitive was never executed -- measured: reverting `cd -P` to `cd` left all 23
-# controls green, so the control named for physical traversal was decoration.
-# Review found that, and it also means my earlier mutant proved the PAIR rather
-# than the primitive: it removed the spelling guard and `cd -P` together.
+# The gate now takes that path as a constant, so none of those states can be
+# constructed by anything short of editing the gate itself -- at which point the
+# controls would not help either. A refusal with no reachable input is not a
+# guard, and a control for it is not evidence.
 #
-# Deriving instead of refusing accepts `..`, which is what finally lets this
-# scene through to the resolver. `link -> OUTSIDE/sub`, with `escape/` present on
-# both sides: logical `cd` collapses `link/..` textually to the repo and passes
-# containment, physical `cd -P` lands in OUTSIDE and refuses.
-mkdir -p "$OUTSIDE/sub" "$OUTSIDE/escape" escape
-printf 'PRECIOUS BESIDE THE LINK\n' > "$OUTSIDE/escape/out"
-ln -s "$OUTSIDE/sub" lane-b-parent-link
-expect_env "physical traversal is used when resolving the parent" \
-  "LANE_B_BASELINE=lane-b-parent-link/../escape/out" 2 "resolves outside this repository" --write-baseline
-if [ "$(head -1 "$OUTSIDE/escape/out")" != "PRECIOUS BESIDE THE LINK" ]; then
-  echo "FAIL [physical traversal is used when resolving the parent]: the file was written anyway" >&2
-  failures=$((failures + 1))
-fi
-rm -f lane-b-parent-link; rmdir escape 2>/dev/null || true
-
-# ⚠ EVERY SPELLING IS ACCEPTED, BECAUSE THE GUARD DERIVES INSTEAD OF JUDGING.
-# The previous version of this control compared the guard's refusal list against
-# what git can read -- a reasonable check of an unreasonable design, and the list
-# still gained a fifth entry after it. There is no list now: the canonical path
-# is computed from the resolved directory, so every one of these reaches the same
-# file. The control runs the GATE rather than re-deriving here, because a harness
-# that reimplements the thing it tests is the defect one level up.
-for spelling in \
-    "$BASELINE" \
-    "./$BASELINE" \
-    "scripts//public-surface-lane-b-baseline.txt" \
-    "scripts/./public-surface-lane-b-baseline.txt" \
-    "$PWD/$BASELINE" \
-    "scripts/../$BASELINE" \
-    "$BASELINE/"; do
-  expect_env "the gate accepts the spelling: $spelling" "LANE_B_BASELINE=$spelling" 0 "LANE B RATCHET"
-done
-
-# ⚠ WRITTEN, THEN READ BACK, UNDER ONE SPELLING. The defect was never that a
-# spelling was rejected -- it was that --write-baseline SUCCEEDED and the next
-# run then reported the file it had just written as missing from the index. Two
-# runs, because one cannot see that.
-expect_env "a baseline written under an odd spelling reads back" \
-  "LANE_B_BASELINE=scripts//public-surface-lane-b-baseline.txt" 0 "WROTE" --write-baseline
-expect_env "...and the next run finds it" \
-  "LANE_B_BASELINE=scripts//public-surface-lane-b-baseline.txt" 0 "LANE B RATCHET"
-restore
-
-# ⚠ THE GIT DIRECTORY IS NOT A BASELINE TARGET. `.git/index` resolves beneath the
-# worktree root, carries no index mode, and is a one-link regular file -- so
-# containment, the mode probe and the link count all pass it, and the writer
-# would truncate git's live index. Containment is about the worktree, and the
-# administrative directory is inside the root without being inside the worktree.
-expect_env "the git directory refuses the writer" \
-  "LANE_B_BASELINE=.git/index" 2 "resolves inside the git directory" --write-baseline
-
-# ⚠ THE PREFIX IS THE DIFFERENCE BETWEEN TWO PATHS WE HOLD, NOT A FRESH
-# DISCOVERY. Asked from inside a nested repository, `git rev-parse --show-prefix`
-# answers about THAT repository: `a/q/baseline` under a repo at `a` derived as
-# `q/baseline`, which the outer root then resolves to an entirely different file.
-# The refusal names the derived path, so the message discriminates -- outer
-# anchoring says `a/q/baseline`, rediscovery says `q/baseline`.
-mkdir -p a/q && git init -q a && printf 'x\n' > a/q/baseline
-expect_env "canonicalisation is anchored to the outer repository" \
-  "LANE_B_BASELINE=a/q/baseline" 2 "a/q/baseline is missing from the index"
-rm -rf a
-
-# ⚠ THE INDEX MODE IS PROBED WITH THE DERIVED SPELLING. Asked of the spelling as
-# given, `git ls-files -s -- "scripts/baseline.txt/"` returns no entry at all, so
-# an index holding a SYMLINK while the working tree holds a regular file walked
-# straight past the refusal -- and the writer then succeeded against the working
-# file while the index still carried the link blob. Not staged, deliberately:
-# staging is what erases the disagreement this scene is made of.
-lane_b_link_blob="$(printf '%s' "$BASELINE.real" | git hash-object -w --stdin)"
-git update-index --add --cacheinfo "120000,$lane_b_link_blob,$BASELINE"
-expect_env_nostage "the index mode is probed with the derived spelling" \
-  "LANE_B_BASELINE=$BASELINE/" 2 "is a symlink in the index"
-git update-index --add --cacheinfo "100644,$(git hash-object -w "$BASELINE"),$BASELINE"
-restore
-rm -f lane-b-parent-link
-rm -rf "$OUTSIDE"
+# What did NOT leave: the index-symlink refusal, which is about a COMMITTED
+# state rather than an override, and the serialisation check on the writer.
+# Both keep their controls.
 
 # ⚠ A BROKEN COUNTING INSTRUMENT, DRIVEN RATHER THAN DECLARED UNREACHABLE. The
 # occurrence passes must not flatten grep's 2 into 1: an I/O error on a file
@@ -629,7 +503,7 @@ restore
 # this paragraph forbids, one line from where it forbids it, and passing every
 # healthy run because a stale expectation only shows up once some other count
 # disagrees.
-EXPECTED_CHECKS=34
+EXPECTED_CHECKS=19
 if [ "$checks" -ne "$EXPECTED_CHECKS" ]; then
   echo "REFUSING: $checks control(s) ran, expected exactly $EXPECTED_CHECKS" >&2
   exit 2
