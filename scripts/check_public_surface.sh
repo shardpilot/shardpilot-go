@@ -2566,7 +2566,14 @@ lane_b_guard() {  # $1 = check | write
       # established that this directory is under the outer root, both physically
       # resolved, so the prefix is the difference between two strings we hold and
       # no repository needs to be discovered again.
-      lane_b_prefix="${lane_b_here#$lane_b_root}"
+      # ⚠ QUOTED, BECAUSE THE RIGHT SIDE OF # IS A PATTERN, NOT A STRING. An
+      # unquoted expansion here is glob-matched: a repository living under a
+      # path containing `[`...`]` fails to strip at all, and the derived value
+      # keeps the whole absolute prefix. Measured -- `br[ack]ets` in the root
+      # path left the canonical path as the entire absolute location minus its
+      # leading slash, which git then cannot resolve. `*` and `?` happened to
+      # survive, which is worse than failing: it made the bug look absent.
+      lane_b_prefix="${lane_b_here#"$lane_b_root"}"
       lane_b_prefix="${lane_b_prefix#/}"
       if [ -n "$lane_b_prefix" ]; then
         printf '%s/%s\n' "$lane_b_prefix" "$lane_b_leaf"
