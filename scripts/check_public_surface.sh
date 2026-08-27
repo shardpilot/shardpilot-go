@@ -2538,6 +2538,7 @@ lane_b_now="$(printf '%s' "$scan_lane_b_counts" | { grep -v '^$' || [ $? -eq 1 ]
 
 
 
+lane_b_root="$(cd -P "$(git rev-parse --show-toplevel)" && pwd -P)"
 if [ "${1:-}" = "--write-baseline" ]; then
   # ⚠ THE PARENT IS HELD, NOT NAMED. A constant leaf does not fix its parent:
   # another process can rename `scripts/` and put a symlink there, and a relative
@@ -2555,6 +2556,23 @@ if [ "${1:-}" = "--write-baseline" ]; then
       echo "REFUSING: could not enter the directory holding $LANE_B_BASELINE." >&2
       exit 2
     }
+    # ⚠ AND CHECK WHERE WE LANDED. Anchoring and containment are ONE property in
+    # two halves: the cwd defends against a swap AFTER `cd`, and this defends
+    # against a swap BEFORE it -- `cd -P` would otherwise follow a replacement
+    # and anchor the subshell permanently to the wrong directory, after which
+    # every later check is asking about the attacker's choice.
+    #
+    # I restored the anchor and deleted this half, and each looked whole on its
+    # own. A pair whose halves are individually plausible is invisible to an
+    # audit that enumerates guards one at a time, which is exactly how the
+    # fifteen-line audit missed it.
+    if [ "$(pwd -P)" != "$lane_b_root/$(dirname "$LANE_B_BASELINE")" ]; then
+      # refusal:structural
+      echo "REFUSING: $(dirname "$LANE_B_BASELINE") is not where it should be." >&2
+      echo "  Entered:  $(pwd -P)" >&2
+      echo "  Expected: $lane_b_root/$(dirname "$LANE_B_BASELINE")" >&2
+      exit 2
+    fi
     lane_b_leaf="$(basename "$LANE_B_BASELINE")"
     lane_b_tmp="$lane_b_leaf.tmp.$$"
   {

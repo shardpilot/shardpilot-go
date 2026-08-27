@@ -188,6 +188,8 @@ restore() {
 # controls failed at once.
 cleanup_dirs() {
   [ -n "${STUB:-}" ] && rm -rf "$STUB"
+  [ -n "${STUBDIR:-}" ] && rm -rf "$STUBDIR"
+  [ -L scripts ] && { rm -f scripts; [ -d scripts.real ] && mv scripts.real scripts; }
   return 0
 }
 # ⚠ EMPTIED BEFORE THE TRAP CAN READ THEM. cleanup_dirs does `rm -rf` on these,
@@ -198,6 +200,7 @@ cleanup_dirs() {
 # BASH_ENV. I introduced it while fixing a cleanup that only ran when nothing
 # went wrong.
 STUB=""
+STUBDIR="$(mktemp -d)"
 trap 'restore; cleanup_dirs; rm -f "$SAVED"' EXIT
 
 # judge <label> <rc> <want> <needle> <output> -- ONE judgement, every caller.
@@ -399,6 +402,56 @@ no_blob_commit="$(git -c user.name="lane-b-ratchet-test" -c user.email="lane-b-r
   commit-tree "$missing_blob_tree" -p HEAD -m "synthetic unreadable blob")"
 expect_ref "an unreadable baseline blob on the target refuses" "$no_blob_commit" 2 "could not be read"
 
+# ⚠ THE PARENT SWAPPED BEFORE `cd`, AND IT NEEDS NO RACE. The anchor and the
+# containment check are one property in two halves -- the cwd defends against a
+# swap AFTER `cd`, this defends against one before it. I restored the first and
+# deleted the second, and each looked whole alone, which is how a paired guard
+# escapes an audit that enumerates guards one at a time.
+#
+# Constructible as a static state rather than a race: replace `scripts` with a
+# symlink to a copy outside the worktree. `cd -P` then lands there permanently
+# and every later check asks about the wrong directory.
+cp -a scripts "$STUBDIR/fake"
+mv scripts scripts.real && ln -s "$STUBDIR/fake" scripts
+lane_b_swap_out="$(./scripts/check_public_surface.sh --write-baseline 2>&1)" || lane_b_swap_rc=$?
+rm -f scripts && mv scripts.real scripts
+rm -rf "$STUBDIR/fake"
+checks=$((checks + 1))
+judge "a parent swapped before the anchor refuses" "${lane_b_swap_rc:-0}" 2 "is not where it should be" "$lane_b_swap_out"
+
+# ⚠ THE SERIALISATION CHECK, DRIVEN -- and the route is VERIFIED before it is
+# trusted. The audit claimed this refusal kept a control; it did not. Nothing
+# here made the redirect fail: must_write_baseline only exercises successful
+# writes, and the grep stub dies during scanning, long before the writer.
+#
+# `chmod` is not a route: this harness can run as root, where permissions are
+# advisory -- measured, uid 0 writes into a 555 directory without complaint, so
+# a chmod-based control would be green because of the environment rather than
+# the subject. The immutable attribute stops root too, and that is the route.
+#
+# ⚠ AND THE ROUTE IS PROBED. An attribute the filesystem silently ignores would
+# make this control pass vacuously, which is the exact failure it exists to
+# catch one level down. So the control writes a probe first: if the probe
+# SUCCEEDS, the route is not in force and this reports that rather than a pass.
+checks=$((checks + 1))
+lane_b_route=ok
+chattr +i scripts 2>/dev/null || lane_b_route=unavailable
+if [ "$lane_b_route" = ok ] && { : > "scripts/.route_probe.$$"; } 2>/dev/null; then
+  rm -f "scripts/.route_probe.$$"
+  lane_b_route=unavailable
+fi
+if [ "$lane_b_route" != ok ]; then
+  echo "FAIL [a failed serialisation refuses]: the route is not available here --" >&2
+  echo "  the directory could not be made unwritable, so this control would have" >&2
+  echo "  passed without exercising anything. Reported rather than skipped." >&2
+  failures=$((failures + 1))
+else
+  lane_b_out="$("$GATE" --write-baseline 2>&1)" || lane_b_rc=$?
+  chattr -i scripts 2>/dev/null || true
+  judge "a failed serialisation refuses" "${lane_b_rc:-0}" 2 "serialisation failed" "$lane_b_out"
+fi
+chattr -i scripts 2>/dev/null || true
+
 # ⚠ THE VARIABLE IS REFUSED, NOT IGNORED. Removing an input silently is a worse
 # interface than refusing it, and this control is also what turns "nothing sets
 # it" from a grep result into a checked property.
@@ -531,7 +584,7 @@ restore
 # this paragraph forbids, one line from where it forbids it, and passing every
 # healthy run because a stale expectation only shows up once some other count
 # disagrees.
-EXPECTED_CHECKS=22
+EXPECTED_CHECKS=24
 if [ "$checks" -ne "$EXPECTED_CHECKS" ]; then
   echo "REFUSING: $checks control(s) ran, expected exactly $EXPECTED_CHECKS" >&2
   exit 2
