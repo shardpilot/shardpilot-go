@@ -2439,8 +2439,16 @@ LANE_B_BASELINE="${LANE_B_BASELINE:-scripts/public-surface-lane-b-baseline.txt}"
 # Refused rather than normalised: a canonicaliser is one more thing that has to
 # agree with git about path syntax, and the shorter promise is to accept only
 # what git already takes.
+#
+# ⚠ AND THE LIST IS CHECKED AGAINST GIT, NOT GUESSED. The first version of this
+# was written from the two spellings the finding named, and measuring it turned
+# up two more that git rejects and it accepted -- `a//b` and `a/./b` -- each of
+# which would write successfully and read as missing. An enumeration asserted
+# from examples is a sample; the harness now walks a list of spellings and
+# requires this guard to refuse EXACTLY those git cannot resolve, so the next
+# one that appears arrives as a failing control rather than as a silent hole.
 case "$LANE_B_BASELINE" in
-  /*|*/../*|../*|*/..|..)
+  /*|*/../*|../*|*/..|..|*//*|*/./*)
     # refusal:structural
     echo "REFUSING: LANE_B_BASELINE must be a plain worktree-relative path." >&2
     echo "  Got: $LANE_B_BASELINE" >&2

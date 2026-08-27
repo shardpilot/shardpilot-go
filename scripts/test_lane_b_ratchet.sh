@@ -431,6 +431,36 @@ if [ "$(head -1 "$OUTSIDE/escape/out")" != "PRECIOUS BEHIND A CLIMB" ]; then
   failures=$((failures + 1))
 fi
 rm -f lane-b-parent-link; rmdir escape 2>/dev/null || true
+
+# ⚠ THE GUARD'S ENUMERATION, CHECKED AGAINST GIT ITSELF. The spelling refusal
+# lists what git cannot consume as `:<path>`. A list written from examples is a
+# sample, not an enumeration -- measured, the first version missed `a//b` and
+# `a/./b`, both of which git rejects and it let through, so --write-baseline
+# would succeed and the next run would report the file it had just written as
+# missing. This asserts the two agree, spelling by spelling, so a disagreement
+# arrives as a failing control instead of as a hole.
+checks=$((checks + 1))
+spelling_bad=0
+for spelling in \
+    "$BASELINE" \
+    "./$BASELINE" \
+    "scripts//public-surface-lane-b-baseline.txt" \
+    "scripts/./public-surface-lane-b-baseline.txt" \
+    "$PWD/$BASELINE" \
+    "scripts/../$BASELINE"; do
+  if git cat-file blob ":$spelling" >/dev/null 2>&1; then git_reads=yes; else git_reads=no; fi
+  case "$spelling" in
+    /*|*/../*|../*|*/..|..|*//*|*/./*) guard_refuses=yes ;;
+    *) guard_refuses=no ;;
+  esac
+  # git can read it  <=>  the guard lets it through
+  if [ "$git_reads" = "$guard_refuses" ]; then
+    echo "FAIL [the spelling guard matches what git can read]: '$spelling'" >&2
+    echo "  git reads it: $git_reads, guard refuses it: $guard_refuses" >&2
+    spelling_bad=1
+  fi
+done
+[ "$spelling_bad" -eq 0 ] || failures=$((failures + 1))
 rm -f lane-b-parent-link
 rm -rf "$OUTSIDE"
 
@@ -522,7 +552,7 @@ restore
 # this paragraph forbids, one line from where it forbids it, and passing every
 # healthy run because a stale expectation only shows up once some other count
 # disagrees.
-EXPECTED_CHECKS=22
+EXPECTED_CHECKS=23
 if [ "$checks" -ne "$EXPECTED_CHECKS" ]; then
   echo "REFUSING: $checks control(s) ran, expected exactly $EXPECTED_CHECKS" >&2
   exit 2
