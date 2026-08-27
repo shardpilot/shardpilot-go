@@ -2382,7 +2382,7 @@ if [ "$scan_lane_b_files" -eq 0 ]; then
   echo "  no longer exists."
 else
   echo "  Doc comments here publish verbatim to pkg.go.dev. They are owed work, not"
-  echo "  accepted risk, and they are not gated HERE because this repository's Go"
+  echo "  accepted risk, and they are not gated AT ZERO here because this repository's Go"
   echo "  sources are owned by the SDK wire-freeze workstream. The count is lines"
   echo "  MATCHING THE PATTERNS ABOVE — not a total of internal material, which the"
   echo "  scope note above says these shapes cannot bound."
@@ -2430,34 +2430,24 @@ LANE_B_BASELINE="${LANE_B_BASELINE:-scripts/public-surface-lane-b-baseline.txt}"
 # it. And the path is env-overridable one line above, so an arbitrary target
 # reaches the redirect.
 #
-# ⚠ FIRST, THE SPELLINGS GIT CANNOT CONSUME. An absolute path, or a relative one
-# carrying an ordinary `..`, can name a file that is genuinely inside this
-# worktree -- so containment below would accept it -- while the READ side builds
-# `git cat-file blob ":$LANE_B_BASELINE"`, and git rejects object names like
-# `:/abs/path` or `:scripts/../scripts/x`. The writer would succeed and the very
-# next run would report the file it had just written as missing from the index.
-# Refused rather than normalised: a canonicaliser is one more thing that has to
-# agree with git about path syntax, and the shorter promise is to accept only
-# what git already takes.
+# ⚠ THE SPELLING IS DERIVED, NOT VETTED. This was a list of forms git cannot
+# consume as `:<path>` -- and it grew a fifth entry in as many rounds, because a
+# list of refusals is open by construction: `//`, `/./`, `..`, an absolute path,
+# a trailing slash, and whatever the next reader finds. Two of those I found in
+# my own list an hour after writing it.
 #
-# ⚠ AND THE LIST IS CHECKED AGAINST GIT, NOT GUESSED. The first version of this
-# was written from the two spellings the finding named, and measuring it turned
-# up two more that git rejects and it accepted -- `a//b` and `a/./b` -- each of
-# which would write successfully and read as missing. An enumeration asserted
-# from examples is a sample; the harness now walks a list of spellings and
-# requires this guard to refuse EXACTLY those git cannot resolve, so the next
-# one that appears arrives as a failing control rather than as a silent hole.
-case "$LANE_B_BASELINE" in
-  /*|*/../*|../*|*/..|..|*//*|*/./*)
-    # refusal:structural
-    echo "REFUSING: LANE_B_BASELINE must be a plain worktree-relative path." >&2
-    echo "  Got: $LANE_B_BASELINE" >&2
-    echo "  The ratchet reads it back as a git object name (:<path>), and git" >&2
-    echo "  takes neither an absolute path nor one containing '..' -- so this" >&2
-    echo "  spelling would write successfully and then read as missing." >&2
-    exit 2
-    ;;
-esac
+# So the guard stops judging the spelling and computes the canonical one instead.
+# From the directory it has already resolved, `git rev-parse --show-prefix` gives
+# the worktree-relative prefix, and the leaf completes it. Measured -- every
+# spelling below collapses to the same path, which git then reads:
+#
+#   scripts/b.txt · ./scripts/b.txt · scripts//b.txt · scripts/./b.txt
+#   scripts/../scripts/b.txt · /abs/.../scripts/b.txt · scripts/b.txt/
+#
+# A refusal for each of those is a patch; deriving one answer is a shape. What
+# remains is not a spelling question at all: the result must name a FILE, and a
+# path whose leaf is a directory (`scripts/`) derives to a directory -- caught by
+# the regular-file check below, which exists anyway.
 # ⚠ A SYMLINK IS NOT A BASELINE, and `-f` cannot tell you so -- it FOLLOWS the
 # link. Replace this file with a link to another tracked baseline and every
 # current-tree read follows it, so the change passes; but `git show <ref>:<path>`
@@ -2477,6 +2467,7 @@ case "${lane_b_mode:-}" in
 esac
 
 lane_b_root="$(cd -P "$(git rev-parse --show-toplevel)" && pwd -P)"
+lane_b_gitdir="$(cd -P "$(git rev-parse --git-dir)" && pwd -P)"
 
 # ⚠ ONE SUBSHELL VALIDATES AND WRITES, AND THAT IS THE POINT -- not tidiness.
 #
@@ -2521,6 +2512,21 @@ lane_b_guard() {  # $1 = check | write
         exit 2
         ;;
     esac
+    # ⚠ INSIDE THE WORKTREE IS NOT ENOUGH: `.git` resolves beneath the root too.
+    # `LANE_B_BASELINE=.git/index` passes containment, carries no index mode, and
+    # is a one-link regular file -- so the writer would truncate git's live index
+    # and report success. Measured. The administrative directory is excluded by
+    # its resolved path, not by its name, so a `.git` file or a linked worktree
+    # is covered by the same test.
+    case "$lane_b_here/" in
+      "$lane_b_gitdir"/*|"$lane_b_gitdir/")
+        # refusal:structural
+        echo "REFUSING: LANE_B_BASELINE resolves inside the git directory." >&2
+        echo "  Resolves: $lane_b_here" >&2
+        echo "  --write-baseline would truncate repository administrative state." >&2
+        exit 2
+        ;;
+    esac
     lane_b_leaf="$(basename "$LANE_B_BASELINE")"
     if [ -L "$lane_b_leaf" ]; then
       # refusal:structural
@@ -2554,7 +2560,15 @@ lane_b_guard() {  # $1 = check | write
         exit 2
       fi
     fi
+    if [ "$1" = canon ]; then
+      printf '%s%s\n' "$(git rev-parse --show-prefix)" "$lane_b_leaf"
+    fi
     if [ "$1" = write ]; then
+      # ⚠ WRITTEN ASIDE AND RENAMED, NOT OPENED BY NAME. The held cwd anchors the
+      # PARENT; the leaf is still resolved at redirect time, so a process that
+      # swaps it for a symlink after the checks above would have the write follow
+      # it out of the tree. `mv` renames over the name itself and never follows a
+      # symlink standing there, so the swap loses instead of winning.
       {
         echo "# Lane B occurrences per file, as of the commit that wrote this."
         echo "# Written by: scripts/check_public_surface.sh --write-baseline"
@@ -2575,11 +2589,15 @@ lane_b_guard() {  # $1 = check | write
         echo "# because the layout changed -- reading a format-2 file with this"
         echo "# parser would understate every count that has such a line."
         printf '%s\n' "$lane_b_now"
-      } > "$lane_b_leaf"
+      } > "$lane_b_leaf.tmp.$$"
+      mv -f "$lane_b_leaf.tmp.$$" "$lane_b_leaf"
     fi
   )
 }
-lane_b_guard check || exit $?
+lane_b_canon="$(lane_b_guard canon)" || exit $?
+# Everything downstream -- the index read, the mode probe, every message -- now
+# speaks the derived spelling rather than whatever was handed in.
+LANE_B_BASELINE="$lane_b_canon"
 
 lane_b_now="$(printf '%s' "$scan_lane_b_counts" | { grep -v '^$' || [ $? -eq 1 ]; } | sort -k2)"
 

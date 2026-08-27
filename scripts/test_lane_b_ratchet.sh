@@ -178,7 +178,24 @@ restore() {
     "$BASELINE.hard" config.go.tmp lane-b-parent-link \
     >/dev/null 2>&1 || true
 }
-trap 'restore; rm -f "$SAVED"' EXIT
+# ⚠ TRAP-ONLY, AND SEPARATE FROM restore(). The scratch DIRECTORIES were removed
+# on the normal path only, so an interruption left `escape/` in the checkout --
+# which the scratch-name guard then refuses on the NEXT run, turning one
+# interrupted run into a harness that will not start -- and leaked the temporary
+# directories outside it. A cleanup that only runs when nothing went wrong is not
+# cleanup.
+#
+# It is NOT folded into restore(): controls call restore() mid-run to undo their
+# own mutation, and folding directory removal in there deletes fixtures the
+# later controls still need. Measured, because I did exactly that first: eleven
+# controls failed at once.
+cleanup_dirs() {
+  rmdir escape 2>/dev/null || true
+  [ -n "${OUTSIDE:-}" ] && rm -rf "$OUTSIDE"
+  [ -n "${STUB:-}" ] && rm -rf "$STUB"
+  return 0
+}
+trap 'restore; cleanup_dirs; rm -f "$SAVED"' EXIT
 
 # judge <label> <rc> <want> <needle> <output> -- ONE judgement, every caller.
 # The two halves are reported separately and the exit is checked first, because
@@ -382,10 +399,10 @@ expect_ref "an unreadable baseline blob on the target refuses" "$no_blob_commit"
 # on the read path says nothing about the branch that motivated it.
 OUTSIDE="$(mktemp -d)"
 printf 'PRECIOUS UNRELATED FILE\n' > "$OUTSIDE/precious.txt"
-expect_env "an absolute baseline path refuses the writer" \
-  "LANE_B_BASELINE=$OUTSIDE/precious.txt" 2 "must be a plain worktree-relative path" --write-baseline
+expect_env "an out-of-tree baseline path refuses the writer" \
+  "LANE_B_BASELINE=$OUTSIDE/precious.txt" 2 "resolves outside this repository" --write-baseline
 if [ "$(head -1 "$OUTSIDE/precious.txt")" != "PRECIOUS UNRELATED FILE" ]; then
-  echo "FAIL [an absolute baseline path refuses the writer]: the file was written anyway" >&2
+  echo "FAIL [an out-of-tree baseline path refuses the writer]: the file was written anyway" >&2
   failures=$((failures + 1))
 fi
 
@@ -406,61 +423,65 @@ if [ "$(head -1 "$OUTSIDE/out")" != "PRECIOUS BEHIND A LINKED PARENT" ]; then
   echo "FAIL [a symlinked parent directory refuses the writer]: the file was written anyway" >&2
   failures=$((failures + 1))
 fi
+rm -f lane-b-parent-link
 
-# ⚠ THE LOGICAL-cd SCENE, DRIVEN AS ITS OWN CONTROL. `cd` without -P collapses
-# `link/..` textually and lands somewhere the kernel would not, so validation
-# and the redirect can disagree about which directory the path names. Measured
-# on this exact shape: the guard resolved to repo/escape and passed, while the
-# write went to the external escape/ and repo/escape/out was never created.
+# ⚠ THE ONE CONTROL THAT REACHES `cd -P`, AND IT COULD NOT BEFORE. While the
+# guard refused `..` outright, this scene exited at the spelling check and the
+# primitive was never executed -- measured: reverting `cd -P` to `cd` left all 23
+# controls green, so the control named for physical traversal was decoration.
+# Review found that, and it also means my earlier mutant proved the PAIR rather
+# than the primitive: it removed the spelling guard and `cd -P` together.
 #
-# WHICH refusal fires here is worth being precise about, because it is not the
-# containment one. The `..` spelling is turned away earlier -- git cannot
-# consume `:a/../b` as an object name, so it is refused for that reason before
-# the directory is ever resolved. That earlier guard is what closes this route
-# today; `cd -P` stays because it is the correct primitive for the step it
-# performs, and because two guards protecting one route must not depend on each
-# other's ordering to be correct. This control asserts the OUTCOME the scene is
-# about -- the external file untouched -- rather than which guard got there.
-mkdir -p escape
-printf 'PRECIOUS BEHIND A CLIMB\n' > "$OUTSIDE/escape/out"
-ln -s "$OUTSIDE" lane-b-parent-link
-expect_env "a path climbing out through a symlink refuses the writer" \
-  "LANE_B_BASELINE=lane-b-parent-link/../escape/out" 2 "must be a plain worktree-relative path" --write-baseline
-if [ "$(head -1 "$OUTSIDE/escape/out")" != "PRECIOUS BEHIND A CLIMB" ]; then
-  echo "FAIL [a path climbing out through a symlink refuses the writer]: the file was written anyway" >&2
+# Deriving instead of refusing accepts `..`, which is what finally lets this
+# scene through to the resolver. `link -> OUTSIDE/sub`, with `escape/` present on
+# both sides: logical `cd` collapses `link/..` textually to the repo and passes
+# containment, physical `cd -P` lands in OUTSIDE and refuses.
+mkdir -p "$OUTSIDE/sub" "$OUTSIDE/escape" escape
+printf 'PRECIOUS BESIDE THE LINK\n' > "$OUTSIDE/escape/out"
+ln -s "$OUTSIDE/sub" lane-b-parent-link
+expect_env "physical traversal is used when resolving the parent" \
+  "LANE_B_BASELINE=lane-b-parent-link/../escape/out" 2 "resolves outside this repository" --write-baseline
+if [ "$(head -1 "$OUTSIDE/escape/out")" != "PRECIOUS BESIDE THE LINK" ]; then
+  echo "FAIL [physical traversal is used when resolving the parent]: the file was written anyway" >&2
   failures=$((failures + 1))
 fi
 rm -f lane-b-parent-link; rmdir escape 2>/dev/null || true
 
-# ⚠ THE GUARD'S ENUMERATION, CHECKED AGAINST GIT ITSELF. The spelling refusal
-# lists what git cannot consume as `:<path>`. A list written from examples is a
-# sample, not an enumeration -- measured, the first version missed `a//b` and
-# `a/./b`, both of which git rejects and it let through, so --write-baseline
-# would succeed and the next run would report the file it had just written as
-# missing. This asserts the two agree, spelling by spelling, so a disagreement
-# arrives as a failing control instead of as a hole.
-checks=$((checks + 1))
-spelling_bad=0
+# ⚠ EVERY SPELLING IS ACCEPTED, BECAUSE THE GUARD DERIVES INSTEAD OF JUDGING.
+# The previous version of this control compared the guard's refusal list against
+# what git can read -- a reasonable check of an unreasonable design, and the list
+# still gained a fifth entry after it. There is no list now: the canonical path
+# is computed from the resolved directory, so every one of these reaches the same
+# file. The control runs the GATE rather than re-deriving here, because a harness
+# that reimplements the thing it tests is the defect one level up.
 for spelling in \
     "$BASELINE" \
     "./$BASELINE" \
     "scripts//public-surface-lane-b-baseline.txt" \
     "scripts/./public-surface-lane-b-baseline.txt" \
     "$PWD/$BASELINE" \
-    "scripts/../$BASELINE"; do
-  if git cat-file blob ":$spelling" >/dev/null 2>&1; then git_reads=yes; else git_reads=no; fi
-  case "$spelling" in
-    /*|*/../*|../*|*/..|..|*//*|*/./*) guard_refuses=yes ;;
-    *) guard_refuses=no ;;
-  esac
-  # git can read it  <=>  the guard lets it through
-  if [ "$git_reads" = "$guard_refuses" ]; then
-    echo "FAIL [the spelling guard matches what git can read]: '$spelling'" >&2
-    echo "  git reads it: $git_reads, guard refuses it: $guard_refuses" >&2
-    spelling_bad=1
-  fi
+    "scripts/../$BASELINE" \
+    "$BASELINE/"; do
+  expect_env "the gate accepts the spelling: $spelling" "LANE_B_BASELINE=$spelling" 0 "LANE B RATCHET"
 done
-[ "$spelling_bad" -eq 0 ] || failures=$((failures + 1))
+
+# ⚠ WRITTEN, THEN READ BACK, UNDER ONE SPELLING. The defect was never that a
+# spelling was rejected -- it was that --write-baseline SUCCEEDED and the next
+# run then reported the file it had just written as missing from the index. Two
+# runs, because one cannot see that.
+expect_env "a baseline written under an odd spelling reads back" \
+  "LANE_B_BASELINE=scripts//public-surface-lane-b-baseline.txt" 0 "WROTE" --write-baseline
+expect_env "...and the next run finds it" \
+  "LANE_B_BASELINE=scripts//public-surface-lane-b-baseline.txt" 0 "LANE B RATCHET"
+restore
+
+# ⚠ THE GIT DIRECTORY IS NOT A BASELINE TARGET. `.git/index` resolves beneath the
+# worktree root, carries no index mode, and is a one-link regular file -- so
+# containment, the mode probe and the link count all pass it, and the writer
+# would truncate git's live index. Containment is about the worktree, and the
+# administrative directory is inside the root without being inside the worktree.
+expect_env "the git directory refuses the writer" \
+  "LANE_B_BASELINE=.git/index" 2 "resolves inside the git directory" --write-baseline
 rm -f lane-b-parent-link
 rm -rf "$OUTSIDE"
 
@@ -552,7 +573,7 @@ restore
 # this paragraph forbids, one line from where it forbids it, and passing every
 # healthy run because a stale expectation only shows up once some other count
 # disagrees.
-EXPECTED_CHECKS=23
+EXPECTED_CHECKS=32
 if [ "$checks" -ne "$EXPECTED_CHECKS" ]; then
   echo "REFUSING: $checks control(s) ran, expected exactly $EXPECTED_CHECKS" >&2
   exit 2
