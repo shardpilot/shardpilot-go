@@ -236,17 +236,36 @@ jobs:
       - name: Version consistency (README latest tag == CHANGELOG head == skill pin)
         run: ./scripts/check_release_consistency.sh
   # ⚠ ITS OWN JOB, WITH ITS OWN CLOCK, AND THE REASON IS ARITHMETIC. The harness
-  # drives each refusal by running the WHOLE gate once per control, so its cost
-  # is controls x gate-cost and both grow. Measured in this workflow on 2026-08-26,
-  # six runs of this job at the fourteen controls below: 130-157s, the slowest
-  # being run 33005583955. That is the gate costing nine to eleven seconds and
-  # being paid fourteen times.
+  # clones HEAD once, then drives each refusal by running the WHOLE gate once per
+  # control, so its cost is controls x gate-cost. Measured in this workflow on
+  # 2026-08-27, five runs at the construction that ships here, harness step only:
+  #
+  #   27 controls   242s (run 33122936887), 245s (run 33122939194)
+  #   28 controls   229s (run 33125130837), 230s (run 33125127958),
+  #                 254s (run 33125648040 -- the slowest, and this exact head)
+  #
+  # -- 8.2 to 9.1 seconds per control, and the two ends of that band are the
+  # 245s and the 254s, at different control counts. The count is the term that
+  # grows; the per-control cost is runner noise.
+  #
+  # ⚠ AND THE PRICE IS NOT WHERE I FIRST PUT IT. This job roughly doubled when
+  # the harness moved into a throwaway clone, and the clone was the visible new
+  # thing, so the clone is what I wrote down. The fourteen-control figure this
+  # comment used to carry -- 130-157s on 2026-08-26, run 33005583955 the slowest
+  # -- is 9.3 to 11.2s per control, which is the same band or slightly worse. The
+  # clone did not make the gate more expensive. The job doubled because the
+  # CONTROL COUNT doubled, and the visible change was not the responsible one.
   #
   # The SLOWEST is quoted deliberately. A number justifying a bound has to be
   # argued from the side the risk is on, and for a timeout the risk is overrun --
   # so the fastest run, though equally true and equally citable, argues in the
   # wrong direction. A snapshot, not a definition: both factors move, one with the
   # runner and one with this file.
+  #
+  # What the bound means in the unit that actually grows: at the slowest
+  # per-control cost this job has ever shown, ten minutes is reached at about
+  # FIFTY controls; at today's, about sixty-five. Fifty is the number to plan
+  # against, and this harness is at twenty-eight.
   # Sharing public-surface's five-minute budget would have put it past half of that
   # on day one, and the failure mode of outgrowing a timeout is a cancelled job
   # that reads like an outage rather than like a check that got too expensive.
