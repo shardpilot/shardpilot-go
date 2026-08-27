@@ -2430,40 +2430,23 @@ LANE_B_BASELINE="${LANE_B_BASELINE:-scripts/public-surface-lane-b-baseline.txt}"
 # it. And the path is env-overridable one line above, so an arbitrary target
 # reaches the redirect.
 #
-# ⚠ THIS IS AN IDENTITY CHECK, NOT A LIST OF KNOWN TRICKS, and the difference is
-# the whole point. The first attempt here was three separate tests -- path
-# shape, a symlink at the final component, the link count -- each correct, and
-# together still an open question rather than a closed one. Review found the
-# fourth door immediately: a symlinked PARENT directory, which every one of the
-# three walks straight past. Counting doors is a losing game; this asks instead
-# what the target IS, and refuses everything the answer does not cover:
-#
-#   the containing directory, RESOLVED (`cd` + `pwd -P` walks out every
-#     symlinked ancestor, and is POSIX -- BSD has no `readlink -f`, and this
-#     gate documents bash 3.2 systems as supported)
-#   ...lies inside the resolved worktree
-#   ...the final component is not itself a symlink
-#   ...and if it exists, it is a regular file with exactly one name
-#
-# A fifth door does not get to exist, not because we guessed it, but because the
-# accepted set is closed.
-lane_b_parent="$(cd "$(dirname "$LANE_B_BASELINE")" 2>/dev/null && pwd -P)" || lane_b_parent=""
-if [ -z "$lane_b_parent" ]; then
-  # refusal:structural
-  echo "REFUSING: could not resolve the directory holding $LANE_B_BASELINE." >&2
-  exit 2
-fi
-lane_b_root="$(cd "$(git rev-parse --show-toplevel)" && pwd -P)"
-case "$lane_b_parent/" in
-  "$lane_b_root"/*) : ;;
-  *)
+# ⚠ FIRST, THE SPELLINGS GIT CANNOT CONSUME. An absolute path, or a relative one
+# carrying an ordinary `..`, can name a file that is genuinely inside this
+# worktree -- so containment below would accept it -- while the READ side builds
+# `git cat-file blob ":$LANE_B_BASELINE"`, and git rejects object names like
+# `:/abs/path` or `:scripts/../scripts/x`. The writer would succeed and the very
+# next run would report the file it had just written as missing from the index.
+# Refused rather than normalised: a canonicaliser is one more thing that has to
+# agree with git about path syntax, and the shorter promise is to accept only
+# what git already takes.
+case "$LANE_B_BASELINE" in
+  /*|*/../*|../*|*/..|..)
     # refusal:structural
-    echo "REFUSING: LANE_B_BASELINE resolves outside this repository." >&2
-    echo "  Given:    $LANE_B_BASELINE" >&2
-    echo "  Resolves: $lane_b_parent" >&2
-    echo "  --write-baseline redirects into it, so a path that leaves the" >&2
-    echo "  worktree -- directly, or through a symlinked parent -- would" >&2
-    echo "  overwrite a file this gate has no business touching." >&2
+    echo "REFUSING: LANE_B_BASELINE must be a plain worktree-relative path." >&2
+    echo "  Got: $LANE_B_BASELINE" >&2
+    echo "  The ratchet reads it back as a git object name (:<path>), and git" >&2
+    echo "  takes neither an absolute path nor one containing '..' -- so this" >&2
+    echo "  spelling would write successfully and then read as missing." >&2
     exit 2
     ;;
 esac
@@ -2471,9 +2454,9 @@ esac
 # link. Replace this file with a link to another tracked baseline and every
 # current-tree read follows it, so the change passes; but `git show <ref>:<path>`
 # on the merge target returns the LINK BLOB, the target's pathname, and every
-# later PR is then reported as adding paths the target does not have. The two
-# sides must read the same kind of object, so the index entry's mode is checked
-# rather than the filesystem's answer about what it points at.
+# later PR is then reported as adding paths the target does not have. This one
+# is an INDEX question, so it is asked of the index and stays out of the
+# filesystem guard below.
 lane_b_mode="$(git ls-files -s -- "$LANE_B_BASELINE" | awk '{print $1}' || true)"
 case "${lane_b_mode:-}" in
   120000)
@@ -2484,63 +2467,118 @@ case "${lane_b_mode:-}" in
     exit 2
     ;;
 esac
-if [ -L "$LANE_B_BASELINE" ]; then
-  # refusal:structural
-  echo "REFUSING: $LANE_B_BASELINE is a symlink in the working tree." >&2
-  echo "  --write-baseline would follow it and write through to its target." >&2
-  exit 2
-fi
-if [ -e "$LANE_B_BASELINE" ]; then
-  if [ ! -f "$LANE_B_BASELINE" ]; then
-    # refusal:structural
-    echo "REFUSING: $LANE_B_BASELINE is not a regular file." >&2
-    exit 2
-  fi
-  # A hard link is a second name for one inode, and a redirect writes THROUGH
-  # it: the other name changes too, and nothing here can put it back.
-  lane_b_links="$(ls -ld "$LANE_B_BASELINE" 2>/dev/null | awk '{print $2}')"
-  case "${lane_b_links:-}" in
-    ''|*[!0-9]*)
-      # refusal:structural
-      echo "REFUSING: could not read the hard-link count of $LANE_B_BASELINE." >&2
+
+lane_b_root="$(cd -P "$(git rev-parse --show-toplevel)" && pwd -P)"
+
+# ⚠ ONE SUBSHELL VALIDATES AND WRITES, AND THAT IS THE POINT -- not tidiness.
+#
+# Two defects share this shape and one movement closes both:
+#
+#   `cd` IS LOGICAL BY DEFAULT. It collapses `link/..` textually and lands
+#   somewhere else than the kernel would, while `pwd -P` then honestly prints
+#   the physical path OF THE WRONG DIRECTORY. Measured: with `link -> outside`
+#   and `escape/` existing on both sides, `link/../escape` resolved to
+#   `repo/escape` -- containment passed -- while the redirect wrote to
+#   `outside/escape/out`, and `repo/escape/out` was never created. The `-P`
+#   belongs on `cd`, which chooses the directory, not only on `pwd`, which
+#   reports it.
+#
+#   AND A VALIDATED PATHNAME IS NOT A VALIDATED DIRECTORY. Between the check and
+#   the redirect, another process can rename the in-tree parent and put a
+#   symlink in its place; re-resolving the same pathname later then reaches
+#   somewhere else. So the write does not re-resolve: after `cd -P` the
+#   directory is held by the process's own working directory -- a kernel
+#   reference, not a name -- and only the final component is handed to the
+#   redirect.
+#
+# That is a hazard REMOVED rather than assumed away, which is the order this
+# repository keeps: establish, refuse, remove, and only then assume.
+lane_b_guard() {  # $1 = check | write
+  (
+    cd -P "$(dirname "$LANE_B_BASELINE")" 2>/dev/null || {
+      echo "REFUSING: could not resolve the directory holding $LANE_B_BASELINE." >&2
       exit 2
-      ;;
-  esac
-  if [ "$lane_b_links" -gt 1 ]; then
-    # refusal:structural
-    echo "REFUSING: $LANE_B_BASELINE has $lane_b_links hard links." >&2
-    echo "  --write-baseline writes through the inode, so every other name for" >&2
-    echo "  it would change and this gate could put none of them back." >&2
-    exit 2
-  fi
-fi
+    }
+    lane_b_here="$(pwd -P)"
+    case "$lane_b_here/" in
+      "$lane_b_root"/*) : ;;
+      *)
+        # refusal:structural
+        echo "REFUSING: LANE_B_BASELINE resolves outside this repository." >&2
+        echo "  Given:    $LANE_B_BASELINE" >&2
+        echo "  Resolves: $lane_b_here" >&2
+        echo "  --write-baseline redirects into it, so a path that leaves the" >&2
+        echo "  worktree -- directly, or through a symlinked parent -- would" >&2
+        echo "  overwrite a file this gate has no business touching." >&2
+        exit 2
+        ;;
+    esac
+    lane_b_leaf="$(basename "$LANE_B_BASELINE")"
+    if [ -L "$lane_b_leaf" ]; then
+      # refusal:structural
+      echo "REFUSING: $LANE_B_BASELINE is a symlink in the working tree." >&2
+      echo "  --write-baseline would follow it and write through to its target." >&2
+      exit 2
+    fi
+    if [ -e "$lane_b_leaf" ]; then
+      if [ ! -f "$lane_b_leaf" ]; then
+        # refusal:structural
+        echo "REFUSING: $LANE_B_BASELINE is not a regular file." >&2
+        exit 2
+      fi
+      # A hard link is a second name for one inode, and a redirect writes
+      # THROUGH it: the other name changes too, and nothing here can put it
+      # back. `ls -ld` field 2 is the link count on GNU and BSD alike; `stat`
+      # spells it differently on each.
+      lane_b_links="$(ls -ld "$lane_b_leaf" 2>/dev/null | awk '{print $2}')"
+      case "${lane_b_links:-}" in
+        ''|*[!0-9]*)
+          # refusal:structural
+          echo "REFUSING: could not read the hard-link count of $LANE_B_BASELINE." >&2
+          exit 2
+          ;;
+      esac
+      if [ "$lane_b_links" -gt 1 ]; then
+        # refusal:structural
+        echo "REFUSING: $LANE_B_BASELINE has $lane_b_links hard links." >&2
+        echo "  --write-baseline writes through the inode, so every other name" >&2
+        echo "  for it would change and this gate could put none of them back." >&2
+        exit 2
+      fi
+    fi
+    if [ "$1" = write ]; then
+      {
+        echo "# Lane B occurrences per file, as of the commit that wrote this."
+        echo "# Written by: scripts/check_public_surface.sh --write-baseline"
+        echo "#"
+        echo "# THIS FILE ONLY EVER SHRINKS. The scan fails when a count here rises,"
+        echo "# when a file appears that is not here, and when a number here is higher"
+        echo "# than the same number on the merge target. It also fails when a count"
+        echo "# FALLS without this file being updated, so paying debt is recorded"
+        echo "# rather than silently banked as slack."
+        echo "#"
+        echo "# format-version: 3"
+        echo "# Format: <occurrences> <path> -- count FIRST so a path may contain spaces"
+        echo "#"
+        echo "# format 3 counts OCCURRENCES; format 2 counted MATCHING LINES. Two"
+        echo "# identifiers on one line were one tick in format 2, so a second one"
+        echo "# could be added to an existing line without any number moving. The"
+        echo "# version moved because the numbers mean something different, not"
+        echo "# because the layout changed -- reading a format-2 file with this"
+        echo "# parser would understate every count that has such a line."
+        printf '%s\n' "$lane_b_now"
+      } > "$lane_b_leaf"
+    fi
+  )
+}
+lane_b_guard check || exit $?
 
 lane_b_now="$(printf '%s' "$scan_lane_b_counts" | { grep -v '^$' || [ $? -eq 1 ]; } | sort -k2)"
 
 
 
 if [ "${1:-}" = "--write-baseline" ]; then
-  {
-    echo "# Lane B occurrences per file, as of the commit that wrote this."
-    echo "# Written by: scripts/check_public_surface.sh --write-baseline"
-    echo "#"
-    echo "# THIS FILE ONLY EVER SHRINKS. The scan fails when a count here rises,"
-    echo "# when a file appears that is not here, and when a number here is higher"
-    echo "# than the same number on the merge target. It also fails when a count"
-    echo "# FALLS without this file being updated, so paying debt is recorded"
-    echo "# rather than silently banked as slack."
-    echo "#"
-    echo "# format-version: 3"
-    echo "# Format: <occurrences> <path> -- count FIRST so a path may contain spaces"
-    echo "#"
-    echo "# format 3 counts OCCURRENCES; format 2 counted MATCHING LINES. Two"
-    echo "# identifiers on one line were one tick in format 2, so a second one"
-    echo "# could be added to an existing line without any number moving. The"
-    echo "# version moved because the numbers mean something different, not"
-    echo "# because the layout changed -- reading a format-2 file with this"
-    echo "# parser would understate every count that has such a line."
-    printf '%s\n' "$lane_b_now"
-  } > "$LANE_B_BASELINE"
+  lane_b_guard write || exit $?
   echo "WROTE $LANE_B_BASELINE"
   # The EXIT trap treats rc=0 without this as a run that died mid-flight, which
   # is exactly right for every other early return here. Writing the baseline is

@@ -152,7 +152,7 @@ done
 # `git status --porcelain`, so the dirty-tree guard passes, the redirection
 # below truncates it, and the trap then deletes it. The guard cannot see it, so
 # the existence check has to be a plain filesystem test.
-for scratch in "$NEW_FILE" "$BASELINE.bak" "$BASELINE.real" "$BASELINE.link" "$BASELINE.tmp" "$BASELINE.hard" config.go.tmp lane-b-parent-link; do
+for scratch in "$NEW_FILE" "$BASELINE.bak" "$BASELINE.real" "$BASELINE.link" "$BASELINE.tmp" "$BASELINE.hard" config.go.tmp lane-b-parent-link escape; do
   if [ -e "$scratch" ] || [ -L "$scratch" ]; then
     echo "REFUSING: $scratch already exists; this test would overwrite and then delete it." >&2
     echo "  git status may not show it (an ignored path is invisible there), so" >&2
@@ -382,10 +382,10 @@ expect_ref "an unreadable baseline blob on the target refuses" "$no_blob_commit"
 # on the read path says nothing about the branch that motivated it.
 OUTSIDE="$(mktemp -d)"
 printf 'PRECIOUS UNRELATED FILE\n' > "$OUTSIDE/precious.txt"
-expect_env "an out-of-tree baseline path refuses the writer" \
-  "LANE_B_BASELINE=$OUTSIDE/precious.txt" 2 "resolves outside this repository" --write-baseline
+expect_env "an absolute baseline path refuses the writer" \
+  "LANE_B_BASELINE=$OUTSIDE/precious.txt" 2 "must be a plain worktree-relative path" --write-baseline
 if [ "$(head -1 "$OUTSIDE/precious.txt")" != "PRECIOUS UNRELATED FILE" ]; then
-  echo "FAIL [an out-of-tree baseline path refuses the writer]: the file was written anyway" >&2
+  echo "FAIL [an absolute baseline path refuses the writer]: the file was written anyway" >&2
   failures=$((failures + 1))
 fi
 
@@ -397,6 +397,7 @@ fi
 # pointing at a temporary directory, --write-baseline exit 0, external file
 # overwritten. Resolving the parent with `pwd -P` is what closes it, and this
 # control is what proves the closing is real rather than asserted.
+mkdir -p "$OUTSIDE/escape"
 printf 'PRECIOUS BEHIND A LINKED PARENT\n' > "$OUTSIDE/out"
 ln -s "$OUTSIDE" lane-b-parent-link
 expect_env "a symlinked parent directory refuses the writer" \
@@ -405,6 +406,31 @@ if [ "$(head -1 "$OUTSIDE/out")" != "PRECIOUS BEHIND A LINKED PARENT" ]; then
   echo "FAIL [a symlinked parent directory refuses the writer]: the file was written anyway" >&2
   failures=$((failures + 1))
 fi
+
+# ⚠ THE LOGICAL-cd SCENE, DRIVEN AS ITS OWN CONTROL. `cd` without -P collapses
+# `link/..` textually and lands somewhere the kernel would not, so validation
+# and the redirect can disagree about which directory the path names. Measured
+# on this exact shape: the guard resolved to repo/escape and passed, while the
+# write went to the external escape/ and repo/escape/out was never created.
+#
+# WHICH refusal fires here is worth being precise about, because it is not the
+# containment one. The `..` spelling is turned away earlier -- git cannot
+# consume `:a/../b` as an object name, so it is refused for that reason before
+# the directory is ever resolved. That earlier guard is what closes this route
+# today; `cd -P` stays because it is the correct primitive for the step it
+# performs, and because two guards protecting one route must not depend on each
+# other's ordering to be correct. This control asserts the OUTCOME the scene is
+# about -- the external file untouched -- rather than which guard got there.
+mkdir -p escape
+printf 'PRECIOUS BEHIND A CLIMB\n' > "$OUTSIDE/escape/out"
+ln -s "$OUTSIDE" lane-b-parent-link
+expect_env "a path climbing out through a symlink refuses the writer" \
+  "LANE_B_BASELINE=lane-b-parent-link/../escape/out" 2 "must be a plain worktree-relative path" --write-baseline
+if [ "$(head -1 "$OUTSIDE/escape/out")" != "PRECIOUS BEHIND A CLIMB" ]; then
+  echo "FAIL [a path climbing out through a symlink refuses the writer]: the file was written anyway" >&2
+  failures=$((failures + 1))
+fi
+rm -f lane-b-parent-link; rmdir escape 2>/dev/null || true
 rm -f lane-b-parent-link
 rm -rf "$OUTSIDE"
 
@@ -496,7 +522,7 @@ restore
 # this paragraph forbids, one line from where it forbids it, and passing every
 # healthy run because a stale expectation only shows up once some other count
 # disagrees.
-EXPECTED_CHECKS=21
+EXPECTED_CHECKS=22
 if [ "$checks" -ne "$EXPECTED_CHECKS" ]; then
   echo "REFUSING: $checks control(s) ran, expected exactly $EXPECTED_CHECKS" >&2
   exit 2
