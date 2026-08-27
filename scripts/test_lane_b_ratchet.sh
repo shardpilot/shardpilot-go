@@ -531,6 +531,13 @@ restore
 # The stub swaps the leaf for a link outside the worktree, then defers to the
 # real `ls`, which reports link count 1 on the link and lets the gate proceed.
 #
+# ⚠ AND THE HOOK FIRES EXACTLY ONCE, measured rather than assumed: a logging
+# stub counted every `ls` in a full --write-baseline run, and there is one, this
+# probe. That is what makes it a single deterministic instant instead of an
+# unknown number of them -- a stub that fired again after the write would put
+# the link back and fail this control for a reason that is not its subject. The
+# match is the exact argument list for the same reason.
+#
 # ⚠ AND THE PROPERTY IS NOT THE ONE I FIRST WROTE DOWN. I claimed `mv` is safe
 # only on the rename(2) path and follows the link when it falls back to copying
 # across filesystems. Measured, both ways -- and it is false: GNU `mv` unlinks
@@ -552,8 +559,8 @@ lane_b_leafstub="$(mktemp -d)"
 {
   echo '#!/bin/sh'
   echo "REAL_LS=$(command -v ls)"
-  echo 'case " $* " in'
-  echo '  *scripts/public-surface-lane-b-baseline.txt*)'
+  echo 'case "$*" in'
+  echo '  "-ld scripts/public-surface-lane-b-baseline.txt")'
   echo '    rm -f scripts/public-surface-lane-b-baseline.txt 2>/dev/null'
   echo "    ln -s $lane_b_leafout/target.txt scripts/public-surface-lane-b-baseline.txt 2>/dev/null"
   echo '    ;;'
