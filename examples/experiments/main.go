@@ -42,6 +42,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -108,12 +109,48 @@ func (e *exchange) resp() []byte {
 // REMOVED rather than recomputed. A recomputed length would describe the
 // redacted body and quietly assert that this is what arrived; the header is
 // dropped and its absence says the body was altered, which is the true thing.
+// fenceFor returns a backtick run longer than any run inside the content, so a
+// captured body cannot close its own container.
+//
+// A non-JSON error body carrying a line of three backticks ended the fence early
+// and let the remainder appear as report prose -- forged verdict sections in an
+// artifact whose whole purpose is to be published
+// (shardpilot/shardpilot-go#73 review).
+func fenceFor(content string) string {
+	longest := 0
+	run := 0
+	for i := 0; i < len(content); i++ {
+		if content[i] == '`' {
+			run++
+			if run > longest {
+				longest = run
+			}
+		} else {
+			run = 0
+		}
+	}
+	n := longest + 1
+	if n < 3 {
+		n = 3
+	}
+	return strings.Repeat("`", n)
+}
+
 func dropFraming(dump string) string {
 	lines := strings.Split(dump, "\n")
 	out := make([]string, 0, len(lines))
 	for _, l := range lines {
-		if strings.HasPrefix(strings.ToLower(l), "content-length:") {
+		low := strings.ToLower(l)
+		if strings.HasPrefix(low, "content-length:") {
 			out = append(out, "X-Capture-Note: Content-Length removed — the body below is redacted")
+			continue
+		}
+		// net/http hands us the DECODED body, so a recorded `Transfer-Encoding:
+		// chunked` describes framing the bytes below do not carry: no chunk sizes,
+		// no terminator. Removing Content-Length alone left this common shape
+		// unparsable (shardpilot/shardpilot-go#73 review).
+		if strings.HasPrefix(low, "transfer-encoding:") {
+			out = append(out, "X-Capture-Note: Transfer-Encoding removed — the body below is decoded")
 			continue
 		}
 		out = append(out, l)
@@ -247,7 +284,11 @@ func redactQuery(line string) string {
 		if eq < 0 {
 			continue
 		}
-		parts[k] = p[:eq+1] + fmt.Sprintf("<redacted, %d chars>", len(p[eq+1:]))
+		// URL-SAFE, no spaces. A request line is space-delimited, so the readable
+		// `<redacted, N chars>` form turned the recorded request into something no
+		// HTTP parser accepts -- and being parseable is the reason this artifact is
+		// kept (shardpilot/shardpilot-go#73 review).
+		parts[k] = p[:eq+1] + fmt.Sprintf("redacted-%d-chars", len(p[eq+1:]))
 	}
 	return head + strings.Join(parts, "&") + tail
 }
@@ -340,6 +381,16 @@ func scrubSupplied(text string) string {
 			continue
 		}
 		text = replaceValue(text, v)
+		// AND ITS JSON-ESCAPED FORM. A response serialises `a"b` as `a\"b`, so a
+		// search for the literal value finds nothing and the identifier is
+		// printed reconstructably in the body this program calls publishable.
+		// Same for backslashes and \uXXXX forms -- strconv.Quote produces what
+		// encoding/json would write (shardpilot/shardpilot-go#73 review).
+		if q := strconv.Quote(v); len(q) >= 2 {
+			if inner := q[1 : len(q)-1]; inner != v {
+				text = replaceValue(text, inner)
+			}
+		}
 	}
 	return text
 }
@@ -461,8 +512,10 @@ func main() {
 		if len(rec.exchanges) > 1 {
 			label = fmt.Sprintf(" %d", i+1)
 		}
-		fmt.Printf("## Request%s, as the SDK sent it\n\n```\n%s\n```\n\n",
-			label, strings.TrimRight(string(ex.req), "\r\n"))
+		reqText := strings.TrimRight(string(ex.req), "\r\n")
+		f := fenceFor(reqText)
+		fmt.Printf("## Request%s, as the SDK sent it\n\n%s\n%s\n%s\n\n",
+			label, f, reqText, f)
 		switch {
 		case ex.transErr != nil:
 			fmt.Printf("## Response%s\n\nNONE — the request was formed and no "+
@@ -470,11 +523,15 @@ func main() {
 		case ex.truncErr() != nil:
 			fmt.Printf("## Response%s — TRUNCATED, and the SDK was told so\n\n"+
 				"The body could not be read whole (%v). What arrived is below; it "+
-				"is NOT a complete response.\n\n```\n%s\n```\n\n",
-				label, sanitize(ex.truncErr()), dropFraming(scrubSupplied(strings.TrimRight(string(ex.resp()), "\r\n"))))
+				"is NOT a complete response.\n\n%s\n%s\n%s\n\n",
+				label, sanitize(ex.truncErr()),
+				fenceFor(dropFraming(scrubSupplied(strings.TrimRight(string(ex.resp()), "\r\n")))),
+				dropFraming(scrubSupplied(strings.TrimRight(string(ex.resp()), "\r\n"))),
+				fenceFor(dropFraming(scrubSupplied(strings.TrimRight(string(ex.resp()), "\r\n")))))
 		default:
-			fmt.Printf("## Response%s\n\n```\n%s\n```\n\n",
-				label, dropFraming(scrubSupplied(strings.TrimRight(string(ex.resp()), "\r\n"))))
+			respText := dropFraming(scrubSupplied(strings.TrimRight(string(ex.resp()), "\r\n")))
+			rf := fenceFor(respText)
+			fmt.Printf("## Response%s\n\n%s\n%s\n%s\n\n", label, rf, respText, rf)
 		}
 	}
 
@@ -510,9 +567,18 @@ func main() {
 			"the body did not arrive whole; what it did read is above, and it is not " +
 			"a complete answer.\n")
 		os.Exit(3)
-	case last.status == http.StatusOK && fetchErr == nil:
+	case last.status == http.StatusOK && fetchErr == nil && result.Assigned:
 		fmt.Printf("\nSERVED. The pair above is the capture.\n")
 		os.Exit(0)
+	case last.status == http.StatusOK && fetchErr == nil:
+		// A supported 200 that assigns nothing: a traffic-gate miss, a targeting
+		// mismatch, a kill switch. The exchange is complete and the endpoint
+		// refused to assign, which is exit 1 -- exit 0 says an assignment was
+		// SERVED (shardpilot/shardpilot-go#73 review).
+		fmt.Printf("\nCOMPLETE BUT NOT ASSIGNED (exit 1). The endpoint answered 200 "+
+			"and assigned nothing; reason %q, code %q.\n",
+			scrubSupplied(result.Reason), scrubSupplied(result.Code))
+		os.Exit(1)
 	case fetchErr != nil && errors.Is(fetchErr, context.DeadlineExceeded):
 		fmt.Printf("\nNOT captured (exit 3) — the request timed out.\n")
 		os.Exit(3)
