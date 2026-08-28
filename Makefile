@@ -70,13 +70,21 @@ SHELL := /usr/bin/env bash
 # naming a remote is fetched too; one that names no known remote cannot be
 # refreshed here and says so.
 #
-# ⚠ AND A PLAIN `git fetch <remote>` DOES NOT GUARANTEE THE OVERRIDE MOVED. The
+# ⚠ AND A PLAIN `git fetch <remote>` DOES NOT GUARANTEE THE NAMED REF MOVED. The
 # remote's configured `remote.<name>.fetch` refspec decides what a bare fetch
 # updates: a remote configured to fetch only `release` returns success while
 # `upstream/main` stays at its old commit, and the gate then compares against a
 # stale, higher baseline. So the named ref is ALSO fetched by explicit refspec,
 # and the target refuses if it does not resolve afterwards
 # (shardpilot/shardpilot-go#77 review, reproduced by the reviewer).
+#
+# ONE PATH, NOT TWO. The first fix protected only the override arm and left the
+# two automatically selected bases on the bare-fetch path -- the same defect,
+# fixed in one of the two places it lived. Every base now goes through
+# `refresh_base`, which also matches the LONGEST configured remote prefix (git
+# accepts a remote named `foo/bar`, and splitting at the first slash mistook it
+# for `foo`) and treats a failed explicit fetch as a REFUSAL for a required base
+# rather than falling back on whatever local tracking ref survived a deletion.
 #
 # Cost: about a minute per base. Duplicate bases are scanned once.
 check:
@@ -102,37 +110,54 @@ check:
 	    exit 2; \
 	  fi; \
 	}; \
-	bases=(); \
-	if [ -n "$${PUBLIC_SURFACE_BASE_REF:-}" ]; then \
-	  ref="$$PUBLIC_SURFACE_BASE_REF"; \
-	  remote="$${ref%%/*}"; \
-	  rest="$${ref#*/}"; \
-	  if [ "$$remote" != "$$ref" ] && git remote | grep -qxF "$$remote"; then \
-	    fetch_remote "$$remote"; \
-	    before=$$(git rev-parse --verify --quiet "$$ref^{commit}" 2>/dev/null || true); \
-	    if ! git fetch --quiet "$$remote" \
-	         "+refs/heads/$$rest:refs/remotes/$$remote/$$rest" 2>/dev/null; then \
-	      printf 'NOTE: could not fetch %s explicitly; if the plain fetch above did\n' "$$ref" >&2; \
-	      printf '  not cover it, this base may be stale.\n' >&2; \
-	    fi; \
-	    after=$$(git rev-parse --verify --quiet "$$ref^{commit}" 2>/dev/null || true); \
-	    if [ -z "$$after" ]; then \
-	      printf 'REFUSING: %s does not resolve after fetching %s.\n' "$$ref" "$$remote" >&2; \
-	      exit 2; \
-	    fi; \
-	    [ "$$before" != "$$after" ] && printf 'public surface: %s refreshed %s -> %s\n' \
-	      "$$ref" "$${before:-absent}" "$$after"; \
-	  else \
+	remote_of() { \
+	  best=; \
+	  for r in $$(git remote); do \
+	    case "$$1" in "$$r"/*) [ $${#r} -gt $${#best} ] && best="$$r";; esac; \
+	  done; \
+	  printf '%s' "$$best"; \
+	}; \
+	refresh_base() { \
+	  ref="$$1"; required="$$2"; \
+	  remote=$$(remote_of "$$ref"); \
+	  if [ -z "$$remote" ]; then \
 	    printf 'NOTE: %s names no known remote, so this gate cannot refresh it.\n' "$$ref" >&2; \
 	    printf '  If it is a remote-tracking ref, fetch it yourself first; a stale\n' >&2; \
 	    printf '  base sits at an older, higher baseline and weakens the check.\n' >&2; \
+	    git rev-parse --verify --quiet "$$ref^{commit}" >/dev/null 2>&1 && bases+=("$$ref"); \
+	    return 0; \
 	  fi; \
+	  branch="$${ref#$$remote/}"; \
+	  fetch_remote "$$remote"; \
+	  before=$$(git rev-parse --verify --quiet "$$ref^{commit}" 2>/dev/null || true); \
+	  if ! git fetch --quiet "$$remote" \
+	       "+refs/heads/$$branch:refs/remotes/$$remote/$$branch" 2>/dev/null; then \
+	    if [ "$$required" = required ]; then \
+	      printf 'REFUSING: %s could not be fetched explicitly.\n' "$$ref" >&2; \
+	      printf '  A local tracking ref may survive the branch being deleted or\n' >&2; \
+	      printf '  unadvertised, so proceeding would compare against a ref the\n' >&2; \
+	      printf '  remote no longer has -- an older, higher baseline.\n' >&2; \
+	      exit 2; \
+	    fi; \
+	    printf 'NOTE: %s has no counterpart on %s; dropping it as a base.\n' "$$ref" "$$remote" >&2; \
+	    return 0; \
+	  fi; \
+	  after=$$(git rev-parse --verify --quiet "$$ref^{commit}" 2>/dev/null || true); \
+	  if [ -z "$$after" ]; then \
+	    printf 'REFUSING: %s does not resolve after fetching %s.\n' "$$ref" "$$remote" >&2; \
+	    exit 2; \
+	  fi; \
+	  [ "$$before" != "$$after" ] && printf 'public surface: %s refreshed %s -> %s\n' \
+	    "$$ref" "$${before:-absent}" "$$after"; \
 	  bases+=("$$ref"); \
+	}; \
+	bases=(); \
+	if [ -n "$${PUBLIC_SURFACE_BASE_REF:-}" ]; then \
+	  refresh_base "$$PUBLIC_SURFACE_BASE_REF" required; \
 	else \
 	  fetch_remote origin; \
 	  branch=$$(git rev-parse --abbrev-ref HEAD); \
-	  git rev-parse --verify --quiet "origin/$$branch^{commit}" >/dev/null 2>&1 \
-	    && bases+=("origin/$$branch"); \
+	  refresh_base "origin/$$branch" optional; \
 	  git remote set-head --auto origin >/dev/null 2>&1 || true; \
 	  default=$$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true); \
 	  if [ -z "$$default" ]; then \
@@ -141,8 +166,7 @@ check:
 	    printf '  rename that base can be the wrong one.\n' >&2; \
 	    default=origin/main; \
 	  fi; \
-	  git rev-parse --verify --quiet "$$default^{commit}" >/dev/null 2>&1 \
-	    && bases+=("$$default"); \
+	  refresh_base "$$default" required; \
 	fi; \
 	if [ $${#bases[@]} -eq 0 ]; then \
 	  printf 'REFUSING: no comparison base resolves. Fetch origin first.\n' >&2; \
