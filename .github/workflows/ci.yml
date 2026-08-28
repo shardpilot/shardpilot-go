@@ -245,8 +245,9 @@ jobs:
   #   28 controls   229s, 230s, 254s, 255s  (runs 33125130837, 33125127958,
   #                                          33125648040, 33125989847)
   #   29 controls   283s                    (run 33148391256)
+  #   33 controls   259s                    (run 33159212463)
   #
-  # -- 229 to 283s, which is 8.2 to 9.8 seconds per control. The band widened
+  # -- 229 to 283s, which is 7.9 to 9.8 seconds per control. The band widened
   # when the twenty-ninth control landed, which is the model working rather than
   # failing: the count is the term that moves the total, and a band recorded
   # against named runs and their counts can absorb that without becoming false.
@@ -275,8 +276,8 @@ jobs:
   #
   # What the bound means in the unit that actually grows: at the slow end of the
   # two bands recorded here (11.2s), ten minutes is reached at about FIFTY
-  # controls; at today's (9.8s), about sixty. Fifty is the number to plan
-  # against, and this harness is at twenty-nine.
+  # controls; at today's (7.9-9.8s), sixty to seventy-five. Fifty is the number
+  # to plan against, and this harness is at thirty-three.
   # Sharing public-surface's five-minute budget would have put it past half of that
   # on day one, and the failure mode of outgrowing a timeout is a cancelled job
   # that reads like an outage rather than like a check that got too expensive.
