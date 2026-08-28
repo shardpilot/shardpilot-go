@@ -238,34 +238,32 @@ jobs:
   # ⚠ ITS OWN JOB, WITH ITS OWN CLOCK, AND THE REASON IS ARITHMETIC. The harness
   # clones HEAD once, then drives each refusal by running the WHOLE gate once per
   # control, so its cost is controls x gate-cost. Measured in this workflow on
-  # 2026-08-27/28, seven runs at the construction that ships here, harness step
-  # only:
+  # 2026-08-27/28, eight runs at the construction that ships here, harness step
+  # only, as SECONDS PER CONTROL -- which is the quantity that holds still:
   #
-  #   27 controls   242s, 245s              (runs 33122936887, 33122939194)
-  #   28 controls   229s, 230s, 254s, 255s  (runs 33125130837, 33125127958,
-  #                                          33125648040, 33125989847)
-  #   29 controls   283s                    (run 33148391256)
-  #   33 controls   259s                    (run 33159212463)
+  #   27 controls   242s, 245s              9.0, 9.1
+  #   28 controls   229s, 230s, 254s, 255s  8.2, 8.2, 9.1, 9.1
+  #   29 controls   283s                    9.8
+  #   33 controls   259s, 311s              7.9, 9.4
   #
-  # -- 229 to 283s, which is 7.9 to 9.8 seconds per control. The band widened
-  # when the twenty-ninth control landed, which is the model working rather than
-  # failing: the count is the term that moves the total, and a band recorded
-  # against named runs and their counts can absorb that without becoming false.
+  # -- 7.9 to 9.8 seconds per control, and the total is that times the count.
   #
-  # ⚠ A RANGE OVER NAMED RUNS, NOT A SLOWEST-EVER. This comment used to crown one
-  # run the slowest; the next run beat it by a second and the superlative was
-  # false. A figure that a later measurement can falsify does not belong in a
-  # file -- so what is recorded is the observed band, its date and its runs, and
-  # the bound below is argued from the slow END of that band. The count is the
-  # term that grows; per-control cost inside the band is runner noise.
+  # ⚠ RECORDED PER CONTROL BECAUSE A TOTAL KEEPS BEING FALSIFIED BY ITS OWN
+  # SUCCESS. This comment first crowned one run the slowest; the next run beat
+  # it. It then recorded a band of totals, 229-283s; the next run after that
+  # measured 311s -- not because the job got slower but because the harness
+  # gained four controls, which is the thing this job is FOR. A figure that a
+  # later measurement can falsify does not belong in a file, and a total is
+  # exactly that as long as the count is meant to grow. Per control is stable
+  # across every run above, at three different counts.
   #
   # ⚠ AND THE PRICE IS NOT WHERE I FIRST PUT IT. This job roughly doubled when
   # the harness moved into a throwaway clone, and the clone was the visible new
   # thing, so the clone is what I wrote down. The fourteen-control figure this
   # comment used to carry -- 130-157s across six runs on 2026-08-26, the slow end
   # being run 33005583955 -- is 9.3 to 11.2s per control, the same band or
-  # slightly worse. The
-  # clone did not make the gate more expensive. The job doubled because the
+  # slightly worse. The clone did not make the gate more expensive: the job grew
+  # because the
   # CONTROL COUNT doubled, and the visible change was not the responsible one.
   #
   # The SLOW END is what the bound is argued from, deliberately. A number
