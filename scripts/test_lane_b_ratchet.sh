@@ -117,8 +117,21 @@ if [ "$lane_b_am_clone" = no ]; then
     done <<< "$lane_b_flagged"
     exit 2
   fi
+  # ⚠ ARMED BEFORE THE ALLOCATION, AND THIS ONE MY OWN SWEEP FOUND AND MY
+  # TRIAGE DISMISSED. The class list caught it -- "allocation one line above its
+  # trap" -- and I wrote it off as a negligible window next to the three real
+  # instances. It is not negligible: what leaks here is the entire clone root,
+  # the largest object this harness creates, and "one line" is not a measure of
+  # probability, only of how much code I have to read to see it.
+  #
+  #   The grep was right and the judgement was wrong. A triage that discards
+  #   an instance of a class needs the same evidence as a fix.
+  #
+  # `${var:+"$var"}` expands to nothing while the variable is empty, and `rm -rf`
+  # with no operand exits 0 -- measured, rather than assumed.
+  lane_b_tmp_root=""
+  trap 'rm -rf ${lane_b_tmp_root:+"$lane_b_tmp_root"}' EXIT
   lane_b_tmp_root="$(mktemp -d)"
-  trap 'rm -rf "$lane_b_tmp_root"' EXIT
   # --no-hardlinks is load-bearing: an ordinary local clone hard-links the object
   # store, and a write into .git/objects would reach through to the real
   # repository -- the same second-name-for-one-inode hazard this gate refuses on
@@ -146,6 +159,22 @@ if [ "$lane_b_am_clone" = no ]; then
   lane_b_child_here="$(cd -P "$lane_b_tmp_root/repo" && cd -P "$(git rev-parse --show-toplevel)" && pwd -P)"
   lane_b_child_marker="$(dirname "$lane_b_child_here")/.lane-b-harness-clone"
   printf '%s\n' "$lane_b_child_here" > "$lane_b_child_marker"
+  # ⚠ AND THE SKIP MARKER IS PROPAGATED, DERIVED RATHER THAN PASSED. The
+  # recursion control below invokes this harness; my defence was that a nested
+  # run needs about five minutes to reach that line and the bound is thirty
+  # seconds. That defence rests on the SUBJECT STAYING SLOW -- a regression that
+  # made every gate invocation return at once would carry the nested run all the
+  # way to the terminal control, which would then launch another, and the count
+  # of clone roots would report the control's own recursion rather than the
+  # mutation under test. A control must not be able to fail for its own reason.
+  #
+  # Not an environment variable: that is the input this branch spent two rounds
+  # removing. A file beside the clone, propagated the same way the clone marker
+  # is, and invisible to any caller who has not put one beside their own
+  # checkout.
+  if [ -e "$(dirname "$lane_b_here")/.lane-b-skip-recursion-control" ]; then
+    : > "$(dirname "$lane_b_child_here")/.lane-b-skip-recursion-control"
+  fi
   if [ "$(cat "$lane_b_child_marker" 2>/dev/null)" != "$lane_b_child_here" ]; then
     echo "REFUSING: the clone marker does not name the clone as the child will" >&2
     echo "  resolve it, so the child would not recognise itself and would clone" >&2
@@ -947,7 +976,11 @@ else
   lane_b_out="$("$GATE" --write-baseline 2>&1)" || lane_b_rc=$?
   chmod 755 scripts 2>/dev/null || true
   chattr -i scripts 2>/dev/null || true
-  judge "a failed serialisation refuses" "${lane_b_rc:-0}" 2 "serialisation failed" "$lane_b_out"
+  # The needle names the OPEN failure, which is what this lever actually causes.
+  # It used to name the string both handlers shared, which read as covering the
+  # partial-write handler too; that one has no lever and is named as a limit in
+  # the gate rather than implied to be covered here.
+  judge "a failed write-aside create refuses" "${lane_b_rc:-0}" 2 "could not create the write-aside" "$lane_b_out"
 fi
 chmod 755 scripts 2>/dev/null || true
 chattr -i scripts 2>/dev/null || true
@@ -1112,7 +1145,13 @@ lane_b_symreal="$(mktemp -d "$lane_b_scratch/XXXXXX")"
 lane_b_symlink="$lane_b_scratch/symlinked-tmpdir"
 ln -sfn "$lane_b_symreal" "$lane_b_symlink"
 checks=$((checks + 1))
-if ! command -v timeout >/dev/null 2>&1; then
+if [ -e "$(dirname "$lane_b_here")/.lane-b-skip-recursion-control" ]; then
+  # This run IS the nested one this control started. It counts the check so the
+  # exact-count refusal below stays consistent, and tests nothing -- deliberately
+  # vacuous, and safe only because nothing ever reads a nested run's verdict:
+  # the outer control asserts clone roots, not the inner exit status.
+  :
+elif ! command -v timeout >/dev/null 2>&1; then
   echo "FAIL [a symlinked TMPDIR does not make the clone recurse]: no timeout(1)," >&2
   echo "  so this control cannot bound a recursive subject. Reporting the" >&2
   echo "  unavailable route rather than a pass." >&2
@@ -1125,6 +1164,9 @@ else
   # of passing, which is the branch this file grew one commit ago; the scene
   # still had to be rebuilt. A fresh clone is clean by construction.
   git clone -q --no-hardlinks "$lane_b_here" "$lane_b_symreal/pristine" 2>/dev/null
+  # the nested run must not reach this control; the marker rides beside the copy
+  # and is propagated to its clone by the parent branch above
+  : > "$lane_b_symreal/.lane-b-skip-recursion-control"
   ( TMPDIR="$lane_b_symlink" timeout 30 "$lane_b_symreal/pristine/scripts/test_lane_b_ratchet.sh" \
       > "$lane_b_symreal/.out" 2>&1 ) &
   lane_b_sym_bg=$!
@@ -1161,6 +1203,45 @@ fi
 rm -f "$lane_b_symlink"
 rm -rf "$lane_b_symreal"
 
+# ⚠ THE COUNT IS DEFINED HERE, ABOVE THE FIRST THING THAT READS IT. It used to
+# sit beside the equality check at the bottom, which was fine while nothing else
+# read it -- and then the control below read it and got an empty string, because
+# a variable defined after its reader is not a variable. Still exactly one
+# literal in the file; only its position moved.
+EXPECTED_CHECKS=35
+
+# ⚠ THE WORKFLOW'S STATED SIZE IS GATED, BECAUSE CORRECTING IT BY HAND HAS NOW
+# FAILED THREE TIMES. That comment carries a planning threshold -- how many
+# controls fit in ten minutes -- and beside it the current count. It has said
+# fourteen, then twenty-nine, then thirty-three, each time one edit behind the
+# harness, and each time the staleness was found by a reader rather than by the
+# build. A number in prose that must equal a number in code is a number that
+# will drift; the only thing that has ever stopped drift in this file is a check
+# that fails.
+#
+# So the count is read out of the workflow and compared to the enforced one. It
+# is the same rule as EXPECTED_CHECKS itself, applied one file over.
+lane_b_ciyml=".github/workflows/ci.yml"
+checks=$((checks + 1))
+if [ ! -f "$lane_b_ciyml" ]; then
+  echo "FAIL [the workflow states this harness's size]: $lane_b_ciyml is missing," >&2
+  echo "  so the stated size cannot be checked and this control would otherwise" >&2
+  echo "  have passed without reading anything." >&2
+  failures=$((failures + 1))
+else
+  lane_b_stated="$(sed -n 's/.*this harness is at \([0-9][0-9]*\) controls.*/\1/p' "$lane_b_ciyml" | head -1)"
+  if [ -z "$lane_b_stated" ]; then
+    echo "FAIL [the workflow states this harness's size]: no 'this harness is at N" >&2
+    echo "  controls' line found in $lane_b_ciyml -- the sentence this control" >&2
+    echo "  reads was reworded, so the check stopped checking." >&2
+    failures=$((failures + 1))
+  elif [ "$lane_b_stated" -ne "$EXPECTED_CHECKS" ]; then
+    echo "FAIL [the workflow states this harness's size]: the workflow says" >&2
+    echo "  $lane_b_stated control(s), this harness enforces $EXPECTED_CHECKS." >&2
+    failures=$((failures + 1))
+  fi
+fi
+
 # ⚠ EXACTLY, NOT AT LEAST, AND THE NUMBER LIVES ONLY ON THE NEXT LINE. A floor
 # accepts a stale count: add a control without touching it and the expected
 # number silently drifts, after which that control can be deleted and the stale
@@ -1174,7 +1255,6 @@ rm -rf "$lane_b_symreal"
 # this paragraph forbids, one line from where it forbids it, and passing every
 # healthy run because a stale expectation only shows up once some other count
 # disagrees.
-EXPECTED_CHECKS=34
 if [ "$checks" -ne "$EXPECTED_CHECKS" ]; then
   echo "REFUSING: $checks control(s) ran, expected exactly $EXPECTED_CHECKS" >&2
   exit 2

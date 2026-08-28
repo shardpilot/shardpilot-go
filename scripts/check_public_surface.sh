@@ -2629,7 +2629,13 @@ if [ "${1:-}" = "--write-baseline" ]; then
     set +C
     if [ "$lane_b_aside" = no ]; then
       # refusal:structural
-      echo "REFUSING: could not write the baseline (serialisation failed)." >&2
+      # ⚠ ITS OWN MESSAGE, BECAUSE SHARING ONE HID A COVERAGE GAP. This said
+      # "serialisation failed" so that the existing control -- whose lever makes
+      # the directory unwritable, and therefore fails HERE -- would keep matching.
+      # That convenience made one control look like it covered two handlers: the
+      # partial-write handler below could be deleted with every control green.
+      # A shared message is a shared alibi.
+      echo "REFUSING: could not create the write-aside for the baseline." >&2
       if [ -e "$lane_b_tmp" ] || [ -L "$lane_b_tmp" ]; then
         echo "  Something already stands at the write-aside path. An exclusive" >&2
         echo "  create refuses it rather than writing through whatever it" >&2
@@ -2672,6 +2678,13 @@ if [ "${1:-}" = "--write-baseline" ]; then
     # body and every statement in it merely LOOKED protected; the function is
     # gone, and the explicit check stays, because a redirect's status is worth
     # naming where the failure is silent and the consequence is a wrong number.
+    # ⚠ NOT DRIVEN, AND THE LEVER SEARCH IS RECORDED RATHER THAN OMITTED. This
+    # fires when the open SUCCEEDED and the writes then failed -- ENOSPC, a
+    # quota, a full pipe. Every lever available to an unprivileged control fails
+    # the OPEN instead: measured, this gate writes temporaries of up to 299158
+    # bytes during a run while the baseline is 1195, so no `ulimit -f` threshold
+    # lets the scan through and stops this write. A filesystem genuinely full at
+    # this instant needs privileges CI does not have. Named, not implied.
     echo "REFUSING: could not write the baseline (serialisation failed)." >&2
     echo "  The partial file is removed rather than renamed into place." >&2
     exec 9>&-

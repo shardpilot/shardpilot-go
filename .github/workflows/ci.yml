@@ -275,7 +275,7 @@ jobs:
   # What the bound means in the unit that actually grows: at the slow end of the
   # two bands recorded here (11.2s), ten minutes is reached at about FIFTY
   # controls; at today's (7.9-9.8s), sixty to seventy-five. Fifty is the number
-  # to plan against, and this harness is at thirty-three.
+  # to plan against, and this harness is at 35 controls.
   # Sharing public-surface's five-minute budget would have put it past half of that
   # on day one, and the failure mode of outgrowing a timeout is a cancelled job
   # that reads like an outage rather than like a check that got too expensive.
