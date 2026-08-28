@@ -2422,224 +2422,123 @@ fi
 # ⚠ THE BASELINE IS NOT AN ESCAPE HATCH. Raising a number in it is checked
 # against the merge target below, because a ratchet whose baseline can be edited
 # upward in the same change is not a ratchet — it is a comment.
-LANE_B_BASELINE="${LANE_B_BASELINE:-scripts/public-surface-lane-b-baseline.txt}"
+# ⚠ A CONSTANT, NOT AN INPUT, AND THAT IS THE WHOLE OF THE HARDENING. This was
+# `${LANE_B_BASELINE:-...}` -- an override nothing outside the control harness
+# ever set. Measured before removing it: zero assignments in .github, zero in a
+# Makefile, zero across five sibling SDK repositories, and the harness's own use
+# was a pin to this very path.
+#
+# Six review rounds went into defending that override: containment against the
+# resolved worktree, a canonical-path derivation with an outer-repository
+# anchor, exclusions for both administrative directories, working-tree and
+# index symlink checks, a hard-link count, and a rename that could not be raced.
+# Every P1 among them -- a truncated .git/index, an escape through a symlinked
+# parent, a hard-linked target -- was reachable ONLY by someone who set the
+# variable. Removing the variable removes the reachability, and the guards with
+# it. What is deleted here is not coverage; it is refusals whose subject can no
+# longer be constructed.
+#
+# WHAT SURVIVES, and why each is about the repository rather than the override:
+#   the index-mode check -- a COMMITTED symlink at this path travels to everyone
+#     who checks out, and is a state a constant path does not prevent;
+#   the working-tree symlink and hard-link checks -- both reachable at this
+#     fixed path with no variable at all, only a filesystem;
+#   the write-aside and its status check -- a partial serialisation renamed into
+#     place is a truncated baseline the next run reads as paid debt.
+# ⚠ A SETTER IS TOLD, NOT IGNORED -- AND THIS RUNS BEFORE THE ASSIGNMENT, since
+# afterwards the name is always set. Removing the override left one thing worse
+# than before: whoever exports this now gets SILENCE. Their baseline goes to the
+# constant rather than where they asked, and nothing says so. A removed input
+# that fails quietly is a worse interface than one that fails loudly.
+#
+# It also turns "nothing sets it" from a claim resting on a grep -- which cannot
+# see a wrapper script, a runner image or a shell profile -- into something this
+# gate asserts on every run. The premise the whole deletion rests on stops being
+# a search result and becomes a check.
+if [ -n "${LANE_B_BASELINE+set}" ]; then
+  # refusal:structural
+  echo "REFUSING: LANE_B_BASELINE is set, and is no longer an input." >&2
+  echo "  The baseline path is fixed at scripts/public-surface-lane-b-baseline.txt." >&2
+  echo "  Refusing rather than ignoring you: a value that is silently discarded" >&2
+  echo "  is worse than one that is turned away." >&2
+  exit 2
+fi
+LANE_B_BASELINE=scripts/public-surface-lane-b-baseline.txt
 
-# ⚠ VALIDATED HERE BECAUSE --write-baseline NEVER REACHES WHAT FOLLOWS IT. The
-# writer redirects into this path and then `exit 0`s, so every check placed
-# below that branch is not LATE for the writing path -- it is UNREACHABLE from
-# it. And the path is env-overridable one line above, so an arbitrary target
-# reaches the redirect.
-#
-# ⚠ THE SPELLING IS DERIVED, NOT VETTED. This was a list of forms git cannot
-# consume as `:<path>` -- and it grew a fifth entry in as many rounds, because a
-# list of refusals is open by construction: `//`, `/./`, `..`, an absolute path,
-# a trailing slash, and whatever the next reader finds. Two of those I found in
-# my own list an hour after writing it.
-#
-# So the guard stops judging the spelling and computes the canonical one instead.
-# From the directory it has already resolved, `git rev-parse --show-prefix` gives
-# the worktree-relative prefix, and the leaf completes it. Measured -- every
-# spelling below collapses to the same path, which git then reads:
-#
-#   scripts/b.txt · ./scripts/b.txt · scripts//b.txt · scripts/./b.txt
-#   scripts/../scripts/b.txt · /abs/.../scripts/b.txt · scripts/b.txt/
-#
-# A refusal for each of those is a patch; deriving one answer is a shape. What
-# remains is not a spelling question at all: the result must name a FILE, and a
-# path whose leaf is a directory (`scripts/`) derives to a directory -- caught by
-# the regular-file check below, which exists anyway.
 # ⚠ A SYMLINK IS NOT A BASELINE, and `-f` cannot tell you so -- it FOLLOWS the
 # link. Replace this file with a link to another tracked baseline and every
 # current-tree read follows it, so the change passes; but `git show <ref>:<path>`
 # on the merge target returns the LINK BLOB, the target's pathname, and every
-# later PR is then reported as adding paths the target does not have. This one
-# is an INDEX question, so it is asked of the index and stays out of the
-# filesystem guard below.
-
-lane_b_root="$(cd -P "$(git rev-parse --show-toplevel)" && pwd -P)"
-# ⚠ BOTH ADMINISTRATIVE DIRECTORIES. `--git-dir` is the per-worktree one; with a
-# linked worktree it can sit OUTSIDE the checkout while `--git-common-dir` --
-# holding config, objects and refs -- sits inside it. Excluding only the first
-# leaves the shared half writable through this override. They are the same path
-# in an ordinary checkout, which is why one test looked sufficient.
-lane_b_gitdir="$(cd -P "$(git rev-parse --git-dir)" && pwd -P)"
-lane_b_commondir="$(cd -P "$(git rev-parse --git-common-dir)" && pwd -P)"
-
-# ⚠ ONE SUBSHELL VALIDATES AND WRITES, AND THAT IS THE POINT -- not tidiness.
+# later PR is then reported as adding paths the target does not have. The two
+# sides must read the same kind of object, so the index entry's mode is checked
+# rather than the filesystem's answer about what it points at.
 #
-# Two defects share this shape and one movement closes both:
-#
-#   `cd` IS LOGICAL BY DEFAULT. It collapses `link/..` textually and lands
-#   somewhere else than the kernel would, while `pwd -P` then honestly prints
-#   the physical path OF THE WRONG DIRECTORY. Measured: with `link -> outside`
-#   and `escape/` existing on both sides, `link/../escape` resolved to
-#   `repo/escape` -- containment passed -- while the redirect wrote to
-#   `outside/escape/out`, and `repo/escape/out` was never created. The `-P`
-#   belongs on `cd`, which chooses the directory, not only on `pwd`, which
-#   reports it.
-#
-#   AND A VALIDATED PATHNAME IS NOT A VALIDATED DIRECTORY. Between the check and
-#   the redirect, another process can rename the in-tree parent and put a
-#   symlink in its place; re-resolving the same pathname later then reaches
-#   somewhere else. So the write does not re-resolve: after `cd -P` the
-#   directory is held by the process's own working directory -- a kernel
-#   reference, not a name -- and only the final component is handed to the
-#   redirect.
-#
-# That is a hazard REMOVED rather than assumed away, which is the order this
-# repository keeps: establish, refuse, remove, and only then assume.
-lane_b_guard() {  # $1 = check | write
-  (
-    cd -P "$(dirname "$LANE_B_BASELINE")" 2>/dev/null || {
-      echo "REFUSING: could not resolve the directory holding $LANE_B_BASELINE." >&2
-      exit 2
-    }
-    lane_b_here="$(pwd -P)"
-    case "$lane_b_here/" in
-      "$lane_b_root"/*) : ;;
-      *)
-        # refusal:structural
-        echo "REFUSING: LANE_B_BASELINE resolves outside this repository." >&2
-        echo "  Given:    $LANE_B_BASELINE" >&2
-        echo "  Resolves: $lane_b_here" >&2
-        echo "  --write-baseline redirects into it, so a path that leaves the" >&2
-        echo "  worktree -- directly, or through a symlinked parent -- would" >&2
-        echo "  overwrite a file this gate has no business touching." >&2
-        exit 2
-        ;;
-    esac
-    # ⚠ INSIDE THE WORKTREE IS NOT ENOUGH: `.git` resolves beneath the root too.
-    # `LANE_B_BASELINE=.git/index` passes containment, carries no index mode, and
-    # is a one-link regular file -- so the writer would truncate git's live index
-    # and report success. Measured. The administrative directory is excluded by
-    # its resolved path, not by its name, so a `.git` file or a linked worktree
-    # is covered by the same test.
-    case "$lane_b_here/" in
-      "$lane_b_gitdir"/*|"$lane_b_gitdir/"|"$lane_b_commondir"/*|"$lane_b_commondir/")
-        # refusal:structural
-        echo "REFUSING: LANE_B_BASELINE resolves inside the git directory." >&2
-        echo "  Resolves: $lane_b_here" >&2
-        echo "  --write-baseline would truncate repository administrative state." >&2
-        exit 2
-        ;;
-    esac
-    lane_b_leaf="$(basename "$LANE_B_BASELINE")"
-    if [ -L "$lane_b_leaf" ]; then
+# ⚠ AND IT RUNS BEFORE THE WRITER, because --write-baseline exits early: a check
+# placed after that branch is not late for the writing path, it is unreachable
+# from it. That lesson cost this file four review rounds and is the one piece of
+# the removed machinery worth carrying forward.
+# ⚠ AND THE WORKING TREE, WHICH THE CONSTANT DOES NOT SETTLE. Removing the
+# override removed every state reachable by POINTING the gate elsewhere. It did
+# not remove the states reachable at this fixed path: a symlink or a second hard
+# link put there needs no variable, only a filesystem, and --write-baseline
+# would write through either. I deleted both of these with the rest and the
+# control harness refused within one run -- which is the whole argument for
+# keeping controls for guards whose subject survives.
+if [ -L "$LANE_B_BASELINE" ]; then
+  # refusal:structural
+  echo "REFUSING: $LANE_B_BASELINE is a symlink in the working tree." >&2
+  echo "  --write-baseline would follow it and write through to its target." >&2
+  exit 2
+fi
+if [ -e "$LANE_B_BASELINE" ] && [ ! -f "$LANE_B_BASELINE" ]; then
+  # refusal:structural
+  # ⚠ A DIRECTORY HERE PASSES EVERY OTHER CHECK. Its link count is 1, it is not
+  # a symlink, and `mv` then moves the temporary INSIDE it rather than replacing
+  # the baseline -- while the gate prints WROTE and exits 0. Reachable with no
+  # variable at all, only a filesystem, which is why it survived the removal of
+  # the override and should not have been deleted with it.
+  echo "REFUSING: $LANE_B_BASELINE is not a regular file." >&2
+  exit 2
+fi
+if [ -e "$LANE_B_BASELINE" ]; then
+  # A hard link is a second name for one inode, and a redirect writes THROUGH
+  # it: the other name changes too, and nothing here can put it back. `ls -ld`
+  # field 2 is the link count on GNU and BSD alike; `stat` spells it differently
+  # on each, and this gate documents bash 3.2 systems as supported.
+  # ⚠ THE PROBE CAN FAIL AS WELL AS LIE, AND ERREXIT WAS EATING THE FIRST. This
+  # assignment sits at the top level under `set -e` and `pipefail`: an `ls` that
+  # exits nonzero -- an I/O error, a permission failure, a stub -- aborted the
+  # gate with status 1 and NO refusal, before the case below could speak. The
+  # control added for this guard supplied a successful `ls` with nonnumeric
+  # output, so it exercised the lie and never the failure: the same
+  # one-shape-of-input gap the guard itself was bought back for.
+  set +e
+  lane_b_links="$(ls -ld "$LANE_B_BASELINE" 2>/dev/null | awk '{print $2}'; exit "${PIPESTATUS[0]}")"
+  lane_b_links_st=$?
+  set -e
+  if [ "$lane_b_links_st" -ne 0 ]; then
+    # refusal:structural
+    echo "REFUSING: could not read the hard-link count of $LANE_B_BASELINE." >&2
+    echo "  The probe itself failed (exit $lane_b_links_st), so the gate cannot" >&2
+    echo "  establish that the baseline has only one name." >&2
+    exit 2
+  fi
+  case "${lane_b_links:-}" in
+    ''|*[!0-9]*)
       # refusal:structural
-      echo "REFUSING: $LANE_B_BASELINE is a symlink in the working tree." >&2
-      echo "  --write-baseline would follow it and write through to its target." >&2
+      echo "REFUSING: could not read the hard-link count of $LANE_B_BASELINE." >&2
       exit 2
-    fi
-    if [ -e "$lane_b_leaf" ]; then
-      if [ ! -f "$lane_b_leaf" ]; then
-        # refusal:structural
-        echo "REFUSING: $LANE_B_BASELINE is not a regular file." >&2
-        exit 2
-      fi
-      # A hard link is a second name for one inode, and a redirect writes
-      # THROUGH it: the other name changes too, and nothing here can put it
-      # back. `ls -ld` field 2 is the link count on GNU and BSD alike; `stat`
-      # spells it differently on each.
-      lane_b_links="$(ls -ld "$lane_b_leaf" 2>/dev/null | awk '{print $2}')"
-      case "${lane_b_links:-}" in
-        ''|*[!0-9]*)
-          # refusal:structural
-          echo "REFUSING: could not read the hard-link count of $LANE_B_BASELINE." >&2
-          exit 2
-          ;;
-      esac
-      if [ "$lane_b_links" -gt 1 ]; then
-        # refusal:structural
-        echo "REFUSING: $LANE_B_BASELINE has $lane_b_links hard links." >&2
-        echo "  --write-baseline writes through the inode, so every other name" >&2
-        echo "  for it would change and this gate could put none of them back." >&2
-        exit 2
-      fi
-    fi
-    if [ "$1" = canon ]; then
-      # ⚠ THE PREFIX COMES FROM THE PAIR WE ALREADY HOLD, NOT FROM A FRESH
-      # DISCOVERY. `git rev-parse --show-prefix` run from the resolved directory
-      # asks "which repository am I in", and inside a submodule or an embedded
-      # repository the answer is the NEARER one -- so `a/q/baseline` under a
-      # nested repo at `a` derives as `q/baseline`, which the outer root then
-      # resolves to a different file entirely. Containment above has already
-      # established that this directory is under the outer root, both physically
-      # resolved, so the prefix is the difference between two strings we hold and
-      # no repository needs to be discovered again.
-      # ⚠ QUOTED, BECAUSE THE RIGHT SIDE OF # IS A PATTERN, NOT A STRING. An
-      # unquoted expansion here is glob-matched: a repository living under a
-      # path containing `[`...`]` fails to strip at all, and the derived value
-      # keeps the whole absolute prefix. Measured -- `br[ack]ets` in the root
-      # path left the canonical path as the entire absolute location minus its
-      # leading slash, which git then cannot resolve. `*` and `?` happened to
-      # survive, which is worse than failing: it made the bug look absent.
-      lane_b_prefix="${lane_b_here#"$lane_b_root"}"
-      lane_b_prefix="${lane_b_prefix#/}"
-      if [ -n "$lane_b_prefix" ]; then
-        printf '%s/%s\n' "$lane_b_prefix" "$lane_b_leaf"
-      else
-        printf '%s\n' "$lane_b_leaf"
-      fi
-    fi
-    if [ "$1" = write ]; then
-      # ⚠ WRITTEN ASIDE AND RENAMED, NOT OPENED BY NAME. The held cwd anchors the
-      # PARENT; the leaf is still resolved at redirect time, so a process that
-      # swaps it for a symlink after the checks above would have the write follow
-      # it out of the tree. `mv` renames over the name itself and never follows a
-      # symlink standing there, so the swap loses instead of winning.
-      {
-        echo "# Lane B occurrences per file, as of the commit that wrote this."
-        echo "# Written by: scripts/check_public_surface.sh --write-baseline"
-        echo "#"
-        echo "# THIS FILE ONLY EVER SHRINKS. The scan fails when a count here rises,"
-        echo "# when a file appears that is not here, and when a number here is higher"
-        echo "# than the same number on the merge target. It also fails when a count"
-        echo "# FALLS without this file being updated, so paying debt is recorded"
-        echo "# rather than silently banked as slack."
-        echo "#"
-        echo "# format-version: 3"
-        echo "# Format: <occurrences> <path> -- count FIRST so a path may contain spaces"
-        echo "#"
-        echo "# format 3 counts OCCURRENCES; format 2 counted MATCHING LINES. Two"
-        echo "# identifiers on one line were one tick in format 2, so a second one"
-        echo "# could be added to an existing line without any number moving. The"
-        echo "# version moved because the numbers mean something different, not"
-        echo "# because the layout changed -- reading a format-2 file with this"
-        echo "# parser would understate every count that has such a line."
-        printf '%s\n' "$lane_b_now"
-      } > "$lane_b_leaf.tmp.$$" || {
-        # ⚠ CHECKED EXPLICITLY, BECAUSE `set -e` IS NOT IN FORCE HERE. This
-        # function is invoked on the left of `||`, which suspends errexit for
-        # its whole body -- so a serialisation that dies partway (ENOSPC, a
-        # quota, a full pipe) would fall through to the rename below, and the
-        # rename SUCCEEDS on a partially written file. The gate would then print
-        # WROTE and exit 0 over a truncated baseline, which is worse than any
-        # refusal: the next run compares against a number nobody computed and
-        # reads the missing rows as debt that was paid.
-        echo "REFUSING: could not write the baseline (serialisation failed)." >&2
-        echo "  The partial file is removed rather than renamed into place." >&2
-        rm -f "$lane_b_leaf.tmp.$$"
-        exit 2
-      }
-      mv -f "$lane_b_leaf.tmp.$$" "$lane_b_leaf" || {
-        echo "REFUSING: could not put the new baseline in place." >&2
-        rm -f "$lane_b_leaf.tmp.$$"
-        exit 2
-      }
-    fi
-  )
-}
-lane_b_canon="$(lane_b_guard canon)" || exit $?
-# Everything downstream -- the index read, the mode probe, every message -- now
-# speaks the derived spelling rather than whatever was handed in.
-LANE_B_BASELINE="$lane_b_canon"
+      ;;
+  esac
+  if [ "$lane_b_links" -gt 1 ]; then
+    # refusal:structural
+    echo "REFUSING: $LANE_B_BASELINE has $lane_b_links hard links." >&2
+    echo "  --write-baseline writes through the inode, so every other name for" >&2
+    echo "  it would change and this gate could put none of them back." >&2
+    exit 2
+  fi
+fi
 
-# ⚠ PROBED WITH THE DERIVED SPELLING, AND ONLY AFTER DERIVING IT. Asked of the
-# spelling as given, `git ls-files -s -- "scripts/baseline.txt/"` returns no
-# entry at all -- so an index carrying a symlink while the working tree carries a
-# regular file slipped past this refusal entirely, and the writer then succeeded
-# against the working file while the index still held the link blob. The probe is
-# about the index, so it has to speak the name the index uses.
 lane_b_mode="$(git ls-files -s -- "$LANE_B_BASELINE" | awk '{print $1}' || true)"
 case "${lane_b_mode:-}" in
   120000)
@@ -2651,12 +2550,192 @@ case "${lane_b_mode:-}" in
     ;;
 esac
 
+
 lane_b_now="$(printf '%s' "$scan_lane_b_counts" | { grep -v '^$' || [ $? -eq 1 ]; } | sort -k2)"
 
 
 
+lane_b_root="$(cd -P "$(git rev-parse --show-toplevel)" && pwd -P)"
 if [ "${1:-}" = "--write-baseline" ]; then
-  lane_b_guard write || exit $?
+  # ⚠ THE PARENT IS HELD, NOT NAMED. A constant leaf does not fix its parent:
+  # another process can rename `scripts/` and put a symlink there, and a relative
+  # temporary path is then re-resolved through the replacement -- so both the
+  # write and the rename land outside the repository. `cd -P` makes the process's
+  # own working directory the anchor, a kernel reference rather than a name, and
+  # only the leaf is handed to the redirect afterwards.
+  #
+  # This survived the override's removal and I deleted it anyway, because it
+  # lived inside the function that carried the containment checks. A mechanism
+  # with no refusal message of its own leaves no trace in a diff of refusals,
+  # which is how it left without being noticed.
+  (
+    cd -P "$(dirname "$LANE_B_BASELINE")" || {
+      echo "REFUSING: could not enter the directory holding $LANE_B_BASELINE." >&2
+      exit 2
+    }
+    # ⚠ AND CHECK WHERE WE LANDED. Anchoring and containment are ONE property in
+    # two halves: the cwd defends against a swap AFTER `cd`, and this defends
+    # against a swap BEFORE it -- `cd -P` would otherwise follow a replacement
+    # and anchor the subshell permanently to the wrong directory, after which
+    # every later check is asking about the attacker's choice.
+    #
+    # I restored the anchor and deleted this half, and each looked whole on its
+    # own. A pair whose halves are individually plausible is invisible to an
+    # audit that enumerates guards one at a time, which is exactly how the
+    # fifteen-line audit missed it.
+    if [ "$(pwd -P)" != "$lane_b_root/$(dirname "$LANE_B_BASELINE")" ]; then
+      # refusal:structural
+      echo "REFUSING: $(dirname "$LANE_B_BASELINE") is not where it should be." >&2
+      echo "  Entered:  $(pwd -P)" >&2
+      echo "  Expected: $lane_b_root/$(dirname "$LANE_B_BASELINE")" >&2
+      exit 2
+    fi
+    lane_b_leaf="$(basename "$LANE_B_BASELINE")"
+    # ⚠ THE WRITE-ASIDE IS A PATH TOO, AND NOTHING ABOVE CHECKS IT. Every guard
+    # so far inspects the BASELINE leaf -- symlink, regular file, link count. The
+    # temporary had a predictable name and was opened with an ordinary redirect,
+    # so a symlink planted at that name is followed: the redirect truncates
+    # whatever it points at, and the rename then installs the symlink as the
+    # baseline while the gate prints WROTE. Measured, by what stands at the path:
+    #
+    #   plain  > t   with t -> outside.txt     the outside file was TRUNCATED
+    #   set -C > t   nothing at the path       rc 0
+    #   set -C > t   regular / symlink-to-file / symlink-to-dir / dangling
+    #                                          rc 1, outside file intact
+    #
+    # `set -C` makes bash open with O_CREAT|O_EXCL, and O_EXCL refuses a symlink,
+    # even a dangling one -- so the open IS the check, with no window between
+    # them. The random suffix is not the guarantee, only a way to stop a blind
+    # pre-creation from turning every write into a refusal.
+    lane_b_tmp="$lane_b_leaf.tmp.$$.${RANDOM}${RANDOM}"
+    #
+    # Opened ONCE, in this shell, and its status read. A probe in a subshell
+    # would create the file and then make the real open fail on its own probe --
+    # and a failed `exec` redirect does not abort the shell when its status is
+    # taken (measured: the check below is reached, rc 0), so this needs no
+    # errexit gymnastics.
+    #
+    # ⚠ AND NO `2>/dev/null` ON THIS LINE. `exec` applies its redirections to the
+    # SHELL, not to a command, so `exec 9>tmp 2>/dev/null` opens the write-aside
+    # and silences this gate's stderr for the rest of the run. Every refusal
+    # after it went to /dev/null: the rename failure below exited 2 with no
+    # message at all, which is precisely the silent write this block exists to
+    # prevent, introduced by the block itself. The harness caught it because
+    # judge() separates "wrong exit" from "right exit, wrong reason" -- the exit
+    # was 2, exactly as expected, and only the reason showed the damage.
+    lane_b_aside=yes
+    set -C
+    exec 9>"$lane_b_tmp" || lane_b_aside=no
+    set +C
+    if [ "$lane_b_aside" = no ]; then
+      # refusal:structural
+      # ⚠ ITS OWN MESSAGE, BECAUSE SHARING ONE HID A COVERAGE GAP. This said
+      # "serialisation failed" so that the existing control -- whose lever makes
+      # the directory unwritable, and therefore fails HERE -- would keep matching.
+      # That convenience made one control look like it covered two handlers: the
+      # partial-write handler below could be deleted with every control green.
+      # A shared message is a shared alibi.
+      echo "REFUSING: could not create the write-aside for the baseline." >&2
+      if [ -e "$lane_b_tmp" ] || [ -L "$lane_b_tmp" ]; then
+        echo "  Something already stands at the write-aside path. An exclusive" >&2
+        echo "  create refuses it rather than writing through whatever it" >&2
+        echo "  points at, so nothing outside this directory was touched." >&2
+      else
+        echo "  The directory would not accept a new file." >&2
+      fi
+      exit 2
+    fi
+  {
+    echo "# Lane B occurrences per file, as of the commit that wrote this."
+    echo "# Written by: scripts/check_public_surface.sh --write-baseline"
+    echo "#"
+    echo "# THIS FILE ONLY EVER SHRINKS. The scan fails when a count here rises,"
+    echo "# when a file appears that is not here, and when a number here is higher"
+    echo "# than the same number on the merge target. It also fails when a count"
+    echo "# FALLS without this file being updated, so paying debt is recorded"
+    echo "# rather than silently banked as slack."
+    echo "#"
+    echo "# format-version: 3"
+    echo "# Format: <occurrences> <path> -- count FIRST so a path may contain spaces"
+    echo "#"
+    echo "# format 3 counts OCCURRENCES; format 2 counted MATCHING LINES. Two"
+    echo "# identifiers on one line were one tick in format 2, so a second one"
+    echo "# could be added to an existing line without any number moving. The"
+    echo "# version moved because the numbers mean something different, not"
+    echo "# because the layout changed -- reading a format-2 file with this"
+    echo "# parser would understate every count that has such a line."
+    printf '%s\n' "$lane_b_now"
+  } >&9 || {
+    # ⚠ WRITTEN ASIDE AND CHECKED, NOT REDIRECTED STRAIGHT AT THE BASELINE. A
+    # serialisation that dies partway -- ENOSPC, a quota, a full pipe -- leaves a
+    # SHORT file, and a rename succeeds on it just as happily as on a whole one.
+    # The gate would print WROTE and exit 0 over a truncated baseline, which is
+    # worse than any refusal it can print: the next run compares against a number
+    # nobody computed, and the missing rows read as debt that was paid.
+    #
+    # Checked explicitly rather than left to errexit. When this lived inside a
+    # function invoked on the left of `||`, errexit was suspended for the whole
+    # body and every statement in it merely LOOKED protected; the function is
+    # gone, and the explicit check stays, because a redirect's status is worth
+    # naming where the failure is silent and the consequence is a wrong number.
+    # ⚠ NOT DRIVEN, AND THE LEVER SEARCH IS RECORDED RATHER THAN OMITTED. This
+    # fires when the open SUCCEEDED and the writes then failed -- ENOSPC, a
+    # quota, a full pipe. Every lever available to an unprivileged control fails
+    # the OPEN instead: measured, this gate writes temporaries of up to 299158
+    # bytes during a run while the baseline is 1195, so no `ulimit -f` threshold
+    # lets the scan through and stops this write. A filesystem genuinely full at
+    # this instant needs privileges CI does not have. Named, not implied.
+    echo "REFUSING: could not write the baseline (serialisation failed)." >&2
+    echo "  The partial file is removed rather than renamed into place." >&2
+    exec 9>&-
+    rm -f "$lane_b_tmp"
+    exit 2
+  }
+  exec 9>&-
+    # ⚠ -T, AND THE REASON IS AN AXIS I MEASURED WITHOUT VARYING. Last round I
+    # recorded that `mv` renames over the destination NAME and does not follow a
+    # symlink standing there. That was measured on two filesystems and ONE shape
+    # of target -- a symlink to a regular file. Varying the shape:
+    #
+    #   leaf -> regular file   rc 0   link replaced        outside intact
+    #   leaf -> DIRECTORY      rc 0   link still standing  temp moved INSIDE it
+    #   leaf -> dangling       rc 0   link replaced        outside intact
+    #
+    # so with a symlink to a directory the gate printed WROTE and exited 0 while
+    # the baseline was never written. `-T` treats the destination as a normal
+    # file in all three shapes. Measured with -T: link replaced every time, the
+    # outside copy intact every time.
+    #
+    # And the option is PROBED rather than assumed, because it is a GNU
+    # extension: a real rename in the held directory, not a scrape of --help.
+    # Where it is missing the gate refuses instead of falling back to semantics
+    # it has just measured to be unsafe.
+    lane_b_tprobe=".lane_b_rename_probe.$$.${RANDOM}${RANDOM}"
+    lane_b_have_T=no
+    if : > "$lane_b_tprobe" 2>/dev/null; then
+      if mv -fT "$lane_b_tprobe" "$lane_b_tprobe.dst" 2>/dev/null; then
+        lane_b_have_T=yes
+        rm -f "$lane_b_tprobe.dst"
+      else
+        rm -f "$lane_b_tprobe"
+      fi
+    fi
+    if [ "$lane_b_have_T" != yes ]; then
+      # refusal:structural
+      echo "REFUSING: this mv has no --no-target-directory." >&2
+      echo "  Without it, a symlink to a directory at the baseline path makes" >&2
+      echo "  the rename move the new baseline INSIDE that directory while this" >&2
+      echo "  gate reports success. Refusing to write rather than report a write" >&2
+      echo "  that did not happen." >&2
+      rm -f "$lane_b_tmp"
+      exit 2
+    fi
+    mv -fT "$lane_b_tmp" "$lane_b_leaf" || {
+      echo "REFUSING: could not put the new baseline in place." >&2
+      rm -f "$lane_b_tmp"
+      exit 2
+    }
+  ) || exit $?
   echo "WROTE $LANE_B_BASELINE"
   # The EXIT trap treats rc=0 without this as a run that died mid-flight, which
   # is exactly right for every other early return here. Writing the baseline is
