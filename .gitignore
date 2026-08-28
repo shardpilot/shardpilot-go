@@ -44,3 +44,8 @@ go.work.sum
 # repository root, and `git add -A` then commits them: a 10.7 MB artifact that
 # every clone of a public SDK carries forever. Happened once (go#73).
 /experiments
+# ...but not a source directory of that name. A rooted pattern with no trailing
+# slash matches a file AND a directory, so `/experiments` alone would silently
+# hide every file under a future root-level package
+# (shardpilot/shardpilot-go#73 review).
+!/experiments/

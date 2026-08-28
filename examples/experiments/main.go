@@ -21,8 +21,16 @@
 //	SP_EXPERIMENT_KEY=... \
 //	go run ./examples/experiments
 //
-// Exit codes: 0 the pair was captured and the assignment was served; 1 the pair
-// was captured and the platform refused it; 2 no request was made at all.
+// Exit codes, and they are distinct because a consumer of this program reads
+// them rather than the prose:
+//
+//	0  a complete pair was captured and the assignment was served
+//	1  a complete pair was captured and the endpoint refused it
+//	2  no request was made at all
+//	3  a request was made and NO COMPLETE PAIR came back -- transport failure,
+//	   a truncated body, or a deadline. Distinct from 1 on purpose: 1 says the
+//	   endpoint answered and the answer is in the record, and an incomplete run
+//	   reported as 1 would be read as a refusal that was never observed.
 package main
 
 import (
@@ -49,10 +57,33 @@ import (
 // that way.
 type exchange struct {
 	req      []byte
-	resp     []byte
+	head     []byte
 	status   int
 	transErr error // set when no response arrived at all
-	truncErr error // set when the body could not be read whole
+	captured *teeBody
+}
+
+// body is what the SDK actually read, and truncErr is the SDK's own read
+// failure if there was one -- observed rather than caused.
+func (e *exchange) body() []byte {
+	if e.captured == nil {
+		return nil
+	}
+	return e.captured.buf.Bytes()
+}
+
+func (e *exchange) truncErr() error {
+	if e.captured == nil {
+		return nil
+	}
+	return e.captured.err
+}
+
+func (e *exchange) resp() []byte {
+	if e.head == nil {
+		return nil
+	}
+	return append(append([]byte{}, e.head...), e.body()...)
 }
 
 type recorder struct {
@@ -87,31 +118,54 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 
-	body, readErr := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if readErr != nil {
-		// A body that arrived short is not a short body. Handing the SDK the
-		// partial bytes as if they were whole would make a truncated response
-		// indistinguishable from a complete one -- to the SDK and to this
-		// record both. The error goes to the SDK, and the partial bytes are
-		// kept in the record so a reader can see how far it got.
-		ex.truncErr = readErr
-		ex.status = resp.StatusCode
-		if d, derr := httputil.DumpResponse(resp, false); derr == nil {
-			ex.resp = append(d, body...)
-		}
-		r.exchanges = append(r.exchanges, ex)
-		return nil, readErr
-	}
-
-	resp.Body = io.NopCloser(bytes.NewReader(body))
-	if d, derr := httputil.DumpResponse(resp, false); derr == nil {
-		ex.resp = append(d, body...)
-	}
+	// TEE, DO NOT PRE-READ. Draining the body here and handing back a copy
+	// changed the subject twice over: returning `nil, readErr` on a truncated
+	// body made net/http report a PRE-response transport failure, so the SDK
+	// saw status 0 and could classify a truncated 401 as transient rather than
+	// fail-closed -- the recorder altering the verdict it claims to observe.
+	// And an unbounded ReadAll drained past the SDK's own io.LimitReader, so a
+	// body larger than its 1 MiB contract was buffered here instead of being
+	// refused there. The SDK now reads its own response, under its own bound,
+	// and this records what passes through.
+	captured := &teeBody{inner: resp.Body}
+	resp.Body = captured
 	ex.status = resp.StatusCode
+	if d, derr := httputil.DumpResponse(resp, false); derr == nil {
+		ex.head = d
+	}
+	ex.captured = captured
 	r.exchanges = append(r.exchanges, ex)
 	return resp, nil
 }
+
+// teeBody hands every byte to the SDK unchanged and keeps a bounded copy. The
+// bound is this recorder's own, not the SDK's: a capture is a record, and a
+// record that can be made to allocate without limit by the thing it observes is
+// a denial of service wearing evidence.
+type teeBody struct {
+	inner io.ReadCloser
+	buf   bytes.Buffer
+	err   error
+}
+
+const capturedBodyMax = 1 << 20
+
+func (t *teeBody) Read(p []byte) (int, error) {
+	n, err := t.inner.Read(p)
+	if n > 0 && t.buf.Len() < capturedBodyMax {
+		room := capturedBodyMax - t.buf.Len()
+		if room > n {
+			room = n
+		}
+		t.buf.Write(p[:room])
+	}
+	if err != nil && err != io.EOF {
+		t.err = err
+	}
+	return n, err
+}
+
+func (t *teeBody) Close() error { return t.inner.Close() }
 
 // redact removes identifying VALUES from the recorded request while keeping
 // every NAME and every length.
@@ -177,6 +231,35 @@ func redact(dump []byte) []byte {
 // alike, so a run cannot end on a limit none of them was given.
 const captureDeadline = 30 * time.Second
 
+// sanitize redacts any request URL an error carries. `url.Error` wraps the FULL
+// url, so printing a deadline or transport failure verbatim republished the
+// unredacted subject_key and every targeting value -- the same leak the request
+// dump had already been fixed for, arriving by a second road
+// (shardpilot/shardpilot-go#73 review).
+func sanitize(err error) string {
+	if err == nil {
+		return ""
+	}
+	out := err.Error()
+	for {
+		i := strings.Index(out, "?")
+		if i < 0 {
+			return out
+		}
+		end := strings.IndexAny(out[i:], " \"")
+		seg := out[i:]
+		if end >= 0 {
+			seg = out[i : i+end]
+		}
+		red := redactQuery("X " + seg)
+		red = strings.TrimPrefix(red, "X ")
+		if red == seg {
+			return out
+		}
+		out = out[:i] + red + out[i+len(seg):]
+	}
+}
+
 func env(name string) string { return strings.TrimSpace(os.Getenv(name)) }
 
 func main() {
@@ -240,7 +323,7 @@ func main() {
 	if len(rec.exchanges) == 0 {
 		fmt.Fprintf(os.Stderr,
 			"no request made: the SDK returned %v without issuing one, so this "+
-				"run says nothing about the endpoint\n", fetchErr)
+				"run says nothing about the endpoint\n", sanitize(fetchErr))
 		os.Exit(2)
 	}
 
@@ -259,15 +342,15 @@ func main() {
 		switch {
 		case ex.transErr != nil:
 			fmt.Printf("## Response%s\n\nNONE — the request was formed and no "+
-				"response arrived: %v\n\n", label, ex.transErr)
-		case ex.truncErr != nil:
+				"response arrived: %s\n\n", label, sanitize(ex.transErr))
+		case ex.truncErr() != nil:
 			fmt.Printf("## Response%s — TRUNCATED, and the SDK was told so\n\n"+
 				"The body could not be read whole (%v). What arrived is below; it "+
 				"is NOT a complete response.\n\n```\n%s\n```\n\n",
-				label, ex.truncErr, strings.TrimRight(string(ex.resp), "\r\n"))
+				label, sanitize(ex.truncErr()), strings.TrimRight(string(ex.resp()), "\r\n"))
 		default:
 			fmt.Printf("## Response%s\n\n```\n%s\n```\n\n",
-				label, strings.TrimRight(string(ex.resp), "\r\n"))
+				label, strings.TrimRight(string(ex.resp()), "\r\n"))
 		}
 	}
 
@@ -280,7 +363,7 @@ func main() {
 	fmt.Printf("    reason:   %q\n", result.Reason)
 	fmt.Printf("    version:  %d\n", result.Version)
 	if fetchErr != nil {
-		fmt.Printf("    error:    %v\n", fetchErr)
+		fmt.Printf("    error:    %s\n", sanitize(fetchErr))
 	}
 
 	switch {
@@ -289,7 +372,7 @@ func main() {
 			"back, so this run says nothing about what the endpoint would have " +
 			"answered.\n")
 		os.Exit(1)
-	case last.truncErr != nil:
+	case last.truncErr() != nil:
 		fmt.Printf("\nRESPONSE TRUNCATED. The SDK was handed the error rather than " +
 			"the partial body, so nothing downstream mistook it for a complete " +
 			"answer.\n")
@@ -298,8 +381,8 @@ func main() {
 		fmt.Printf("\nSERVED. The pair above is the capture.\n")
 		os.Exit(0)
 	case fetchErr != nil && errors.Is(fetchErr, context.DeadlineExceeded):
-		fmt.Printf("\nNOT captured — the request timed out.\n")
-		os.Exit(1)
+		fmt.Printf("\nNOT captured (exit 3) — the request timed out.\n")
+		os.Exit(3)
 	default:
 		fmt.Printf("\nNOT served. The SDK reached the endpoint and it answered "+
 			"%d; the pair above is what it answered, and it is not a served "+
