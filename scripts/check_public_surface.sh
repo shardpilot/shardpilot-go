@@ -303,7 +303,23 @@ GATE_TMPFILES=()
 # cleanup that reads as working and frees nothing. It was written that way
 # first, and the file count is what showed it.
 gate_tmp() {
-  GATE_TMP="$(mktemp)" || return 1
+  # ⚠ IT REFUSES RATHER THAN RETURNING. Every caller writes
+  # `gate_tmp; something="$GATE_TMP"` on one line, so a failure that merely
+  # returned non-zero would leave the PREVIOUS temporary path in GATE_TMP and
+  # the new name would alias the old file -- two logical files silently
+  # becoming one, with the second overwriting what the first still needs.
+  #
+  # Errexit does not save this: the scan takes its grep statuses under
+  # "set +e", and a call landing in that window would continue past the
+  # failure. Seven call sites would each need their own check; the function
+  # having no failing return is one place instead of seven.
+  GATE_TMP="$(mktemp)" || {
+    # refusal:structural
+    echo "REFUSING: could not create a temporary file." >&2
+    echo "  Callers take this path immediately, so continuing would alias the" >&2
+    echo "  previous temporary and let one file overwrite another." >&2
+    exit 2
+  }
   GATE_TMPFILES+=("$GATE_TMP")
 }
 # ⚠ AND A RUN THAT DID NOT REACH ITS OWN END EXITS NON-ZERO, whatever the
@@ -2446,10 +2462,22 @@ EOF
   rm -rf "$splitid_tmp"
   # ⚠ A COUNT THAT MUST BE REACHED. Every assertion above is invisible when it
   # is deleted, and a run that asserts nothing prints the same closing line as
-  # a run that asserted everything. The floor moves up when assertions are
-  # added and refuses when they go.
-  [ "$fixture_checks" -ge 17 ] || {
-    echo "SELFTEST: only $fixture_checks scan assertion(s) ran, expected at least 17" >&2
+  # a run that asserted everything.
+  #
+  # ⚠ EQUALITY, NOT A FLOOR, AND THE FLOOR PROVED THE POINT ON ITS OWN. It read
+  # `-ge 17` while eighteen assertions ran: this unit added one and left the
+  # bound alone, so any single assertion -- including the one just added --
+  # could be deleted and the remaining seventeen would still satisfy it. A floor
+  # accepts a stale count by construction, which is the silently-lost-check
+  # failure this guard exists to detect, reproduced inside the detector.
+  #
+  # The control harness one file over already settled this shape for its own
+  # count, for the same reason and in the same words. Equality forces the number
+  # to move when an assertion is added, so a later removal cannot hide behind a
+  # bound nobody updated.
+  FIXTURE_CHECKS_EXPECTED=18
+  [ "$fixture_checks" -eq "$FIXTURE_CHECKS_EXPECTED" ] || {
+    echo "SELFTEST: $fixture_checks scan assertion(s) ran, expected exactly $FIXTURE_CHECKS_EXPECTED" >&2
     fixture_fail=1; }
   if [ "$fixture_fail" -ne 0 ]; then
     # refusal:structural
