@@ -419,7 +419,7 @@ fi
 #
 # `$PATTERNS` and `$KNOWN_INNOCENT` carry no break: measured, neither matches
 # the classes, so they are written plainly.
-GATE_DATA_NAMES='ROSTER KNOWN_INTERNAL KNOWN_INNOCENT FIXTURE_ACCENT_BODY FIXTURE_ACCENT_NAME FIXTURE_BINARY_BODY FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY FIXTURE_DIRTY_NAME FIXTURE_EMPHASIS_BODY FIXTURE_EMPHASIS_NAME FIXTURE_ESCAPE_BODY FIXTURE_ESCAPE_NAME FIXTURE_ENTITY_BODY FIXTURE_ENTITY_NAME FIXTURE_AMPPROSE_BODY FIXTURE_AMPPROSE_NAME FIXTURE_NBSPPHRASE_BODY FIXTURE_NBSPPHRASE_NAME FIXTURE_RAWHTMLENT_BODY FIXTURE_RAWHTMLENT_NAME FIXTURE_LEGACYSECT_BODY FIXTURE_LEGACYSECT_NAME FIXTURE_ENTITYLANEB_BODY FIXTURE_ENTITYLANEB_NAME FIXTURE_FLAG_BODY FIXTURE_FLAG_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY FIXTURE_NAMEHIT_NAME'
+GATE_DATA_NAMES='ROSTER KNOWN_INTERNAL KNOWN_INNOCENT FIXTURE_ACCENT_BODY FIXTURE_ACCENT_NAME FIXTURE_BINARY_BODY FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY FIXTURE_DIRTY_NAME FIXTURE_EMPHASIS_BODY FIXTURE_EMPHASIS_NAME FIXTURE_ESCAPE_BODY FIXTURE_ESCAPE_NAME FIXTURE_ENTITY_BODY FIXTURE_ENTITY_NAME FIXTURE_AMPPROSE_BODY FIXTURE_AMPPROSE_NAME FIXTURE_NBSPPHRASE_BODY FIXTURE_NBSPPHRASE_NAME FIXTURE_RAWHTMLENT_BODY FIXTURE_RAWHTMLENT_NAME FIXTURE_LEGACYSECT_BODY FIXTURE_LEGACYSECT_NAME FIXTURE_ENTITYLANEB_BODY FIXTURE_ENTITYLANEB_NAME FIXTURE_FLAG_BODY FIXTURE_FLAG_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY FIXTURE_NAMEHIT_NAME FIXTURE_SPLITID_BODY FIXTURE_SPLITID_NAME'
 
 PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not| never) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (exists?|existed|remains?|remained|runs?|ran|covers?|covered|exercises?|exercised|guards?|guarded))?( (for|of|in)|[.,;]|$)|[Tt]here (is|are)(n.{1,3}t| not) (any |no )?(harness|harnesses|coverage|tests?|suites?)|[Tt]here (is|are) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?)|(has|have|had) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Ww]ithout( (automated|manual|unit|integration|end-to-end|regression|any|meaningful))* (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Nn]obody (looks|checks|monitors)( at| on)?( [A-Za-z][A-Za-z-]*){0,3} (dashboard|dashboards|alert|alerts|log|logs|metric|metrics|queue|queues|report|reports|test|tests|coverage|monitoring)( (for|of|in)|[.,;]|$)|(is|are|was|were)(n.{1,3}t| not| never) under (test|testing|coverage|monitoring|observation)( (for|of|in)|[.,;]|$)|[Ll]acks( any| automated| an?)*( [A-Za-z][A-Za-z-]*)? (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|(has|have|had)(n.{1,3}t| not| never) been (tested|covered|scanned|audited|monitored)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 ROSTER='analytic[]s-service
@@ -508,6 +508,9 @@ FIXTURE_FLAG_NAME=flag.md
 FIXTURE_LANEB_BODY='// GAP[]-000 note
 package x'
 FIXTURE_LANEB_NAME=lane_b.go
+FIXTURE_SPLITID_BODY='// see ADR-[]000**00** and EXAMPLE_SYNTH[]ETIC_FL[]AG_ENABLED
+package x'
+FIXTURE_SPLITID_NAME=split_id.go
 FIXTURE_NAMEHIT_BODY='nothing internal in the body'
 FIXTURE_NAMEHIT_NAME='ADR-[]9999-notes.md'
 for gate_var in $GATE_DATA_NAMES; do
@@ -1478,6 +1481,46 @@ scan_tree() {
       echo "REFUSING: could not build the marker-free copy of '$f'." >&2
       exit 2
     fi
+    # ⚠ A SECOND NORMAL FORM, FOR COUNTING ONLY, AND THE ASYMMETRY IS THE WHOLE
+    # POINT. Detection above takes the UNION of a raw pass and a stripped pass,
+    # which is correct there: a union is boolean and cannot double-count.
+    # Counting cannot use a union. `ADR-[]000**00**` yields `ADR-[]000` from
+    # the raw text -- `ADR-[0-9]+` stops at the `*` -- and `ADR-[]00000` from
+    # the stripped
+    # copy; the occurrence key is (line, marker-free text), the two texts
+    # differ, and ONE occurrence is tallied TWICE. Removing emphasis from around
+    # a grandfathered identifier then moves the ratchet with nothing added.
+    #
+    # The fix is not a third approximation to reconcile the two. It is ONE
+    # normal form that counting reads, and the shape of it comes from a
+    # measurement of THIS gate's patterns rather than from a claim about
+    # markdown:
+    #
+    #   *  ~  \   appear in PATTERNS only as regex syntax, never as literals
+    #   `         appears once, and only as an OPTIONAL literal
+    #   _         appears as a REQUIRED literal, in
+    #             [A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)
+    #
+    # So deleting every marker -- what strip_blob does -- destroys real matches:
+    # SHARDPILOT[]_DEBUG_MODE becomes SHARDPILOTDEBUGMODE and matches nothing.
+    # (The breaks are this file's own convention: it must not be the thing
+    # that publishes a live name, and a comment is prose like any other.)
+    # That is exactly why two passes existed, and why "just count the stripped
+    # copy" UNDERCOUNTS, which is the one direction a ratchet must never err in.
+    #
+    # Underscore is therefore deleted only where it cannot be part of an
+    # identifier: not flanked by alphanumerics on both sides. Everything else
+    # goes unconditionally.
+    gate_tmp; count_blob="$GATE_TMP"
+    if ! tr -d '*`~\\' < "$blob" \
+         | sed -E 's/(^|[^A-Za-z0-9])_+/\1/g; s/_+([^A-Za-z0-9]|$)/\1/g' \
+         > "$count_blob"; then
+      # refusal:structural
+      echo "REFUSING: could not build the counting copy of '$f'." >&2
+      echo "  The occurrence tally is what the ratchet compares, so a copy that" >&2
+      echo "  was not fully built is a count that must not be produced." >&2
+      exit 2
+    fi
     hits_raw="$(grep -anE -- "$PATTERNS" "$scan_src" 2>/dev/null \
       | tr -d '\000'; exit "${PIPESTATUS[0]}")"
     status=$?
@@ -1601,17 +1644,34 @@ scan_tree() {
         # so an I/O error on a file that HAS matches would have produced an
         # empty result, a count of zero, and a ratchet comparing against a
         # number it never managed to compute.
+        # ⚠ TWO PASSES OVER ONE TEXT, NOT FOUR OVER TWO. The four were the raw
+        # and stripped copies crossed with the two pattern families, and the
+        # tally then took a max across them to undo the disagreement they
+        # created. What remains is two PATTERNS -- not two approximations --
+        # read over the single counting normal form, so the dedup below is
+        # between two regexes over one text, which is a comparison that means
+        # something.
+        #
+        # ⚠ AND `tr`'S STATUS IS READ. `exit "${PIPESTATUS[0]}"` carried grep's
+        # status out and dropped the rest of the pipeline: a `tr` killed after
+        # grep had produced matches handed back TRUNCATED output with a status
+        # of success, and a tally that still equalled the baseline passed on
+        # data it never fully read. The round-2 fix for the sibling defect
+        # landed on the instance; this is the class.
+        lane_b_count_pass() {  # $1 = grep flags, $2 = pattern, prints matches
+          local lane_b_ps
+          grep "$1" -aon -- "$2" "$count_blob" 2>/dev/null | tr -d '\000'
+          lane_b_ps=("${PIPESTATUS[@]}")
+          if [ "${lane_b_ps[1]}" -ne 0 ]; then return 2; fi
+          return "${lane_b_ps[0]}"
+        }
         set +e
-        lane_b_occ_1="$(grep -aonE -- "$PATTERNS" "$scan_src" 2>/dev/null | tr -d '\000'; exit "${PIPESTATUS[0]}")"
+        lane_b_occ_1="$(lane_b_count_pass -E "$PATTERNS")"
         lane_b_st_1=$?
-        lane_b_occ_2="$(grep -aonE -- "$PATTERNS" "$strip_blob" 2>/dev/null | tr -d '\000'; exit "${PIPESTATUS[0]}")"
+        lane_b_occ_2="$(lane_b_count_pass -iE "$ROSTER_RE")"
         lane_b_st_2=$?
-        lane_b_occ_3="$(grep -aoniE -- "$ROSTER_RE" "$scan_src" 2>/dev/null | tr -d '\000'; exit "${PIPESTATUS[0]}")"
-        lane_b_st_3=$?
-        lane_b_occ_4="$(grep -aoniE -- "$ROSTER_RE" "$strip_blob" 2>/dev/null | tr -d '\000'; exit "${PIPESTATUS[0]}")"
-        lane_b_st_4=$?
         set -e
-        for st in "$lane_b_st_1" "$lane_b_st_2" "$lane_b_st_3" "$lane_b_st_4"; do
+        for st in "$lane_b_st_1" "$lane_b_st_2"; do
           if [ "$st" -ge 2 ]; then
             # refusal:structural
             echo "REFUSING: grep could not count occurrences in '$f' (exit $st)." >&2
@@ -1623,14 +1683,21 @@ scan_tree() {
           fi
         done
         scan_lane_b_this_file="$(
-          for pass in 1 2 3 4; do
+          for pass in 1 2; do
             eval "printf '%s\n' \"\$lane_b_occ_$pass\"" | sed "s/^/$pass:/"
           done | awk -F: '
             NF > 2 {
               pass = $1; n = $2
               m = substr($0, index($0, ":") + 1)
               m = substr(m, index(m, ":") + 1)
-              gsub(/[*_`~\\]/, "", m)
+              # ⚠ NO SECOND CLEANING HERE. This used to gsub the marker set out
+              # of the captured match, which was the OTHER approximation: the
+              # text arrived from one copy and was cleaned by a different rule,
+              # and the two disagreeing is the whole defect. The text now comes
+              # from the counting normal form already, so cleaning it again
+              # would only re-introduce a disagreement -- and would strip the
+              # underscores that normal form deliberately keeps, collapsing two
+              # distinct identifiers on one line into one key.
               if (m != "") seen[pass SUBSEP n ":" m]++
             }
             END {
@@ -2203,6 +2270,7 @@ EOF
     printf '%s\n' "$FIXTURE_NAMEHIT_BODY" > "$FIXTURE_NAMEHIT_NAME"
     printf '%s\n' "$FIXTURE_DIRTY_BODY"   > "$FIXTURE_DIRTY_NAME"
     printf '%s\n' "$FIXTURE_LANEB_BODY"   > "$FIXTURE_LANEB_NAME"
+    printf '%s\n' "$FIXTURE_SPLITID_BODY" > "$FIXTURE_SPLITID_NAME"
     printf '%s\n' "$FIXTURE_ACCENT_BODY"  > "$FIXTURE_ACCENT_NAME"
     printf '%s\n' "$FIXTURE_EMPHASIS_BODY" > "$FIXTURE_EMPHASIS_NAME"
     printf '%s\n' "$FIXTURE_ESCAPE_BODY"   > "$FIXTURE_ESCAPE_NAME"
@@ -2325,20 +2393,40 @@ EOF
   printf '%s' "$scanned_a" | grep -q '^clean\.md:' && {
     echo "SELFTEST: the scan flagged clean.md" >&2; fixture_fail=1; }
   fixture_checks=$((fixture_checks + 1))
-  [ "$scan_lane_b_files" -eq 2 ] || {
-    echo "SELFTEST: lane B counted $scan_lane_b_files files, expected 2" >&2; fixture_fail=1; }
+  [ "$scan_lane_b_files" -eq 3 ] || {
+    echo "SELFTEST: lane B counted $scan_lane_b_files files, expected 3" >&2; fixture_fail=1; }
   # The ratchet reads scan_lane_b_counts, so the fixture pins that it is
   # actually populated. A tally that silently stayed empty would make the
   # ratchet compare nothing against nothing and report "held" forever -- a gate
   # passing by looking at zero occurrences, which is the failure this script
   # refuses elsewhere by name.
   fixture_checks=$((fixture_checks + 1))
-  [ "$(printf '%s' "$scan_lane_b_counts" | grep -c .)" -eq 2 ] || {
-    echo "SELFTEST: the per-file lane B tally holds $(printf '%s' "$scan_lane_b_counts" | grep -c .) row(s), expected 2" >&2
+  [ "$(printf '%s' "$scan_lane_b_counts" | grep -c .)" -eq 3 ] || {
+    echo "SELFTEST: the per-file lane B tally holds $(printf '%s' "$scan_lane_b_counts" | grep -c .) row(s), expected 3" >&2
     fixture_fail=1; }
+  # ⚠ THE SUM NO LONGER EQUALS THE LINE COUNT, AND THAT IS THE ASSERTION. It
+  # used to, and while it did, a counter that had quietly reverted to tallying
+  # matching LINES would have satisfied it -- format 2's number wearing format
+  # 3's name. The split-identifier fixture carries TWO occurrences on ONE line,
+  # so occurrences and lines now differ by exactly one, and the check fails if
+  # they are ever equal again.
   fixture_checks=$((fixture_checks + 1))
-  [ "$(printf '%s' "$scan_lane_b_counts" | awk '{n += $1} END {print n + 0}')" -eq "$scan_lane_b_lines" ] || {
-    echo "SELFTEST: the per-file tally does not sum to the lane B line count" >&2; fixture_fail=1; }
+  [ "$(printf '%s' "$scan_lane_b_counts" | awk '{n += $1} END {print n + 0}')" \
+      -eq "$((scan_lane_b_lines + 1))" ] || {
+    echo "SELFTEST: lane B occurrences $(printf '%s' "$scan_lane_b_counts" | awk '{n += $1} END {print n + 0}') vs lines $scan_lane_b_lines; expected occurrences to exceed lines by exactly 1" >&2
+    fixture_fail=1; }
+  # ⚠ AND THE SPLIT IDENTIFIER COUNTS ONCE. This is the unit's whole subject:
+  # `ADR-[]000**00**` reads as `ADR-[]000` in the raw text and `ADR-[]00000` in a
+  # marker-free copy, and the old key -- (line, marker-free match text) --
+  # therefore held BOTH, tallying one occurrence twice. Measured on this
+  # fixture: the previous counter said 3 for this file, this one says 2.
+  fixture_checks=$((fixture_checks + 1))
+  [ "$(printf '%s' "$scan_lane_b_counts" | awk -v f="$FIXTURE_SPLITID_NAME" '$2 == f {print $1}')" = "2" ] || {
+    echo "SELFTEST: $FIXTURE_SPLITID_NAME tallied $(printf '%s' "$scan_lane_b_counts" | awk -v f="$FIXTURE_SPLITID_NAME" '$2 == f {print $1}'), expected 2" >&2
+    echo "  One emphasis-split identifier plus one underscore identifier is two" >&2
+    echo "  occurrences; 3 means the split one was counted twice, and 1 means the" >&2
+    echo "  underscore one was lost to the marker-free copy." >&2
+    fixture_fail=1; }
   # ⚠ A COUNT THAT MUST BE REACHED. Every assertion above is invisible when it
   # is deleted, and a run that asserts nothing prints the same closing line as
   # a run that asserted everything. The floor moves up when assertions are
