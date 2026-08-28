@@ -1118,12 +1118,19 @@ if ! command -v timeout >/dev/null 2>&1; then
   echo "  unavailable route rather than a pass." >&2
   failures=$((failures + 1))
 else
-  ( TMPDIR="$lane_b_symlink" timeout 30 "$lane_b_here/scripts/test_lane_b_ratchet.sh" \
+  # ⚠ AGAINST A PRISTINE COPY, NOT THE TREE THIS RUN IS STANDING IN. Invoking
+  # the harness out of the outer clone made it refuse on a dirty tree -- by this
+  # point thirty-three controls have mutated and restored it -- so no clone root
+  # was ever created and the scene did not happen. The control said so instead
+  # of passing, which is the branch this file grew one commit ago; the scene
+  # still had to be rebuilt. A fresh clone is clean by construction.
+  git clone -q --no-hardlinks "$lane_b_here" "$lane_b_symreal/pristine" 2>/dev/null
+  ( TMPDIR="$lane_b_symlink" timeout 30 "$lane_b_symreal/pristine/scripts/test_lane_b_ratchet.sh" \
       > "$lane_b_symreal/.out" 2>&1 ) &
   lane_b_sym_bg=$!
   sleep 12
   lane_b_roots=0
-  for lane_b_d in "$lane_b_symreal"/tmp.*; do
+  for lane_b_d in "$lane_b_symreal"/tmp.*; do  # clone roots only; the pristine copy is not one
     [ -e "$lane_b_d/.lane-b-harness-clone" ] && lane_b_roots=$((lane_b_roots + 1))
   done
   kill "$lane_b_sym_bg" 2>/dev/null || true
@@ -1137,7 +1144,17 @@ else
     echo "FAIL [a symlinked TMPDIR does not make the clone recurse]: no clone root" >&2
     echo "  was alive at all, so the run never got started and this control" >&2
     echo "  would have passed without testing anything." >&2
-    sed 's/^/    /' "$lane_b_symreal/.out" 2>/dev/null | head -5 >&2
+    # ⚠ AND NOT `sed file | head -5`. I wrote the early-consumer shape into a
+    # diagnostic one commit after sweeping the codebase for it -- the fourth
+    # instance, and the second inside a fix for the third. Diagnostics are where
+    # it hides, because a diagnostic that silently prints nothing looks like a
+    # diagnostic with nothing to say.
+    lane_b_diag=0
+    while IFS= read -r lane_b_dline; do
+      [ "$lane_b_diag" -ge 5 ] && break
+      printf '    %s\n' "$lane_b_dline" >&2
+      lane_b_diag=$((lane_b_diag + 1))
+    done < "$lane_b_symreal/.out"
     failures=$((failures + 1))
   fi
 fi
