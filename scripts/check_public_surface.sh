@@ -1481,46 +1481,6 @@ scan_tree() {
       echo "REFUSING: could not build the marker-free copy of '$f'." >&2
       exit 2
     fi
-    # ⚠ A SECOND NORMAL FORM, FOR COUNTING ONLY, AND THE ASYMMETRY IS THE WHOLE
-    # POINT. Detection above takes the UNION of a raw pass and a stripped pass,
-    # which is correct there: a union is boolean and cannot double-count.
-    # Counting cannot use a union. `ADR-[]000**00**` yields `ADR-[]000` from
-    # the raw text -- `ADR-[0-9]+` stops at the `*` -- and `ADR-[]00000` from
-    # the stripped
-    # copy; the occurrence key is (line, marker-free text), the two texts
-    # differ, and ONE occurrence is tallied TWICE. Removing emphasis from around
-    # a grandfathered identifier then moves the ratchet with nothing added.
-    #
-    # The fix is not a third approximation to reconcile the two. It is ONE
-    # normal form that counting reads, and the shape of it comes from a
-    # measurement of THIS gate's patterns rather than from a claim about
-    # markdown:
-    #
-    #   *  ~  \   appear in PATTERNS only as regex syntax, never as literals
-    #   `         appears once, and only as an OPTIONAL literal
-    #   _         appears as a REQUIRED literal, in
-    #             [A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)
-    #
-    # So deleting every marker -- what strip_blob does -- destroys real matches:
-    # SHARDPILOT[]_DEBUG_MODE becomes SHARDPILOTDEBUGMODE and matches nothing.
-    # (The breaks are this file's own convention: it must not be the thing
-    # that publishes a live name, and a comment is prose like any other.)
-    # That is exactly why two passes existed, and why "just count the stripped
-    # copy" UNDERCOUNTS, which is the one direction a ratchet must never err in.
-    #
-    # Underscore is therefore deleted only where it cannot be part of an
-    # identifier: not flanked by alphanumerics on both sides. Everything else
-    # goes unconditionally.
-    gate_tmp; count_blob="$GATE_TMP"
-    if ! tr -d '*`~\\' < "$blob" \
-         | sed -E 's/(^|[^A-Za-z0-9])_+/\1/g; s/_+([^A-Za-z0-9]|$)/\1/g' \
-         > "$count_blob"; then
-      # refusal:structural
-      echo "REFUSING: could not build the counting copy of '$f'." >&2
-      echo "  The occurrence tally is what the ratchet compares, so a copy that" >&2
-      echo "  was not fully built is a count that must not be produced." >&2
-      exit 2
-    fi
     hits_raw="$(grep -anE -- "$PATTERNS" "$scan_src" 2>/dev/null \
       | tr -d '\000'; exit "${PIPESTATUS[0]}")"
     status=$?
@@ -1644,13 +1604,24 @@ scan_tree() {
         # so an I/O error on a file that HAS matches would have produced an
         # empty result, a count of zero, and a ratchet comparing against a
         # number it never managed to compute.
-        # ⚠ TWO PASSES OVER ONE TEXT, NOT FOUR OVER TWO. The four were the raw
-        # and stripped copies crossed with the two pattern families, and the
-        # tally then took a max across them to undo the disagreement they
-        # created. What remains is two PATTERNS -- not two approximations --
-        # read over the single counting normal form, so the dedup below is
-        # between two regexes over one text, which is a comparison that means
-        # something.
+        # ⚠ COUNTED ON THE RAW TEXT, AND AMBIGUITY IS REFUSED RATHER THAN
+        # RESOLVED. Three attempts at a transformation policy died here, and the
+        # third died from three directions at once: in this pattern family the
+        # same marker character plays three incompatible roles --
+        #
+        #   _  inside the environment-flag class     a LITERAL that must survive
+        #   ** inside `n.{1,3}t`                     FILLER a wildcard consumes
+        #   *  between two adjacent flags            a BOUNDARY separating two
+        #
+        # -- so any single delete-or-keep rule is wrong about at least one of
+        # them, whichever way it is written. That is not a defect in a rule; it
+        # is a refutation of rules of that shape, and it is the fourth
+        # recurrence of the class #66 names in its own title.
+        #
+        # So counting does not normalise at all. It reads the raw text, and the
+        # spellings that would make the count ambiguous are REFUSED below --
+        # the move that closed the path class in #65: enumerate what is
+        # accepted, refuse the rest, canonicalise nothing.
         #
         # ⚠ AND `tr`'S STATUS IS READ. `exit "${PIPESTATUS[0]}"` carried grep's
         # status out and dropped the rest of the pipeline: a `tr` killed after
@@ -1658,20 +1629,24 @@ scan_tree() {
         # of success, and a tally that still equalled the baseline passed on
         # data it never fully read. The round-2 fix for the sibling defect
         # landed on the instance; this is the class.
-        lane_b_count_pass() {  # $1 = grep flags, $2 = pattern, prints matches
+        lane_b_count_pass() {  # $1 = grep flags, $2 = pattern, $3 = file
           local lane_b_ps
-          grep "$1" -aon -- "$2" "$count_blob" 2>/dev/null | tr -d '\000'
+          grep "$1" -aon -- "$2" "$3" 2>/dev/null | tr -d '\000'
           lane_b_ps=("${PIPESTATUS[@]}")
           if [ "${lane_b_ps[1]}" -ne 0 ]; then return 2; fi
           return "${lane_b_ps[0]}"
         }
         set +e
-        lane_b_occ_1="$(lane_b_count_pass -E "$PATTERNS")"
+        lane_b_occ_1="$(lane_b_count_pass -E "$PATTERNS" "$scan_src")"
         lane_b_st_1=$?
-        lane_b_occ_2="$(lane_b_count_pass -iE "$ROSTER_RE")"
+        lane_b_occ_2="$(lane_b_count_pass -iE "$ROSTER_RE" "$scan_src")"
         lane_b_st_2=$?
+        lane_b_chk_1="$(lane_b_count_pass -E "$PATTERNS" "$strip_blob")"
+        lane_b_st_3=$?
+        lane_b_chk_2="$(lane_b_count_pass -iE "$ROSTER_RE" "$strip_blob")"
+        lane_b_st_4=$?
         set -e
-        for st in "$lane_b_st_1" "$lane_b_st_2"; do
+        for st in "$lane_b_st_1" "$lane_b_st_2" "$lane_b_st_3" "$lane_b_st_4"; do
           if [ "$st" -ge 2 ]; then
             # refusal:structural
             echo "REFUSING: grep could not count occurrences in '$f' (exit $st)." >&2
@@ -1682,6 +1657,44 @@ scan_tree() {
             exit 2
           fi
         done
+        # ⚠ THE ACCEPTED SPELLINGS, AND A REFUSAL FOR THE REST. Counting on the
+        # raw text is exact exactly when the raw and marker-free readings of a
+        # line agree. Where they disagree, a marker is participating in a match
+        # -- splitting an identifier, being eaten by a wildcard, or separating
+        # two occurrences -- and there is no reading of that line the tally can
+        # defend. So the gate stops instead of picking one.
+        #
+        # This compares; it does not canonicalise. Markers are deleted from the
+        # raw matches ONLY to put the two readings in the same alphabet for the
+        # comparison, and the result is never counted -- which is the whole
+        # difference between this and the three policies that failed.
+        #
+        # Measured before choosing it: on this tree, 11 lane B files carry
+        # matches and 0 disagree, so the refusal is satisfiable today with
+        # nothing grandfathered.
+        #
+        # ⚠ ITS PRICE, STATED. A line where the two readings differ becomes
+        # unwritable in Go source -- including innocent ones, such as an
+        # environment-flag name in a doc comment, which the raw pass matches and
+        # the marker-free pass does not. Zero such lines exist today. The trade
+        # is deliberate: a refusal is visible and strict, and the alternative on
+        # offer was a tally that silently undercounts, which is the direction a
+        # ratchet must never err in.
+        lane_b_seen_raw="$(printf '%s\n' "$lane_b_occ_1" "$lane_b_occ_2" \
+          | grep -v '^$' | tr -d '*_`~\\' | sort || true)"
+        lane_b_seen_strip="$(printf '%s\n' "$lane_b_chk_1" "$lane_b_chk_2" \
+          | grep -v '^$' | tr -d '*_`~\\' | sort || true)"
+        if [ "$lane_b_seen_raw" != "$lane_b_seen_strip" ]; then
+          # refusal:structural
+          echo "REFUSING: '$f' is spelled so that its occurrences cannot be counted." >&2
+          echo "  The raw text and the marker-free reading of it disagree about" >&2
+          echo "  what matches, which means an emphasis or quoting marker is part" >&2
+          echo "  of a match -- splitting an identifier, being consumed by a" >&2
+          echo "  wildcard, or separating two occurrences. There is no count this" >&2
+          echo "  gate could defend, so it refuses rather than choose one." >&2
+          echo "  Write the identifier without a marker inside it." >&2
+          exit 2
+        fi
         scan_lane_b_this_file="$(
           for pass in 1 2; do
             eval "printf '%s\n' \"\$lane_b_occ_$pass\"" | sed "s/^/$pass:/"
@@ -2270,7 +2283,6 @@ EOF
     printf '%s\n' "$FIXTURE_NAMEHIT_BODY" > "$FIXTURE_NAMEHIT_NAME"
     printf '%s\n' "$FIXTURE_DIRTY_BODY"   > "$FIXTURE_DIRTY_NAME"
     printf '%s\n' "$FIXTURE_LANEB_BODY"   > "$FIXTURE_LANEB_NAME"
-    printf '%s\n' "$FIXTURE_SPLITID_BODY" > "$FIXTURE_SPLITID_NAME"
     printf '%s\n' "$FIXTURE_ACCENT_BODY"  > "$FIXTURE_ACCENT_NAME"
     printf '%s\n' "$FIXTURE_EMPHASIS_BODY" > "$FIXTURE_EMPHASIS_NAME"
     printf '%s\n' "$FIXTURE_ESCAPE_BODY"   > "$FIXTURE_ESCAPE_NAME"
@@ -2393,40 +2405,45 @@ EOF
   printf '%s' "$scanned_a" | grep -q '^clean\.md:' && {
     echo "SELFTEST: the scan flagged clean.md" >&2; fixture_fail=1; }
   fixture_checks=$((fixture_checks + 1))
-  [ "$scan_lane_b_files" -eq 3 ] || {
-    echo "SELFTEST: lane B counted $scan_lane_b_files files, expected 3" >&2; fixture_fail=1; }
+  [ "$scan_lane_b_files" -eq 2 ] || {
+    echo "SELFTEST: lane B counted $scan_lane_b_files files, expected 2" >&2; fixture_fail=1; }
   # The ratchet reads scan_lane_b_counts, so the fixture pins that it is
   # actually populated. A tally that silently stayed empty would make the
   # ratchet compare nothing against nothing and report "held" forever -- a gate
   # passing by looking at zero occurrences, which is the failure this script
   # refuses elsewhere by name.
   fixture_checks=$((fixture_checks + 1))
-  [ "$(printf '%s' "$scan_lane_b_counts" | grep -c .)" -eq 3 ] || {
-    echo "SELFTEST: the per-file lane B tally holds $(printf '%s' "$scan_lane_b_counts" | grep -c .) row(s), expected 3" >&2
+  [ "$(printf '%s' "$scan_lane_b_counts" | grep -c .)" -eq 2 ] || {
+    echo "SELFTEST: the per-file lane B tally holds $(printf '%s' "$scan_lane_b_counts" | grep -c .) row(s), expected 2" >&2
     fixture_fail=1; }
-  # ⚠ THE SUM NO LONGER EQUALS THE LINE COUNT, AND THAT IS THE ASSERTION. It
-  # used to, and while it did, a counter that had quietly reverted to tallying
-  # matching LINES would have satisfied it -- format 2's number wearing format
-  # 3's name. The split-identifier fixture carries TWO occurrences on ONE line,
-  # so occurrences and lines now differ by exactly one, and the check fails if
-  # they are ever equal again.
   fixture_checks=$((fixture_checks + 1))
-  [ "$(printf '%s' "$scan_lane_b_counts" | awk '{n += $1} END {print n + 0}')" \
-      -eq "$((scan_lane_b_lines + 1))" ] || {
-    echo "SELFTEST: lane B occurrences $(printf '%s' "$scan_lane_b_counts" | awk '{n += $1} END {print n + 0}') vs lines $scan_lane_b_lines; expected occurrences to exceed lines by exactly 1" >&2
-    fixture_fail=1; }
-  # ⚠ AND THE SPLIT IDENTIFIER COUNTS ONCE. This is the unit's whole subject:
-  # `ADR-[]000**00**` reads as `ADR-[]000` in the raw text and `ADR-[]00000` in a
-  # marker-free copy, and the old key -- (line, marker-free match text) --
-  # therefore held BOTH, tallying one occurrence twice. Measured on this
-  # fixture: the previous counter said 3 for this file, this one says 2.
+  [ "$(printf '%s' "$scan_lane_b_counts" | awk '{n += $1} END {print n + 0}')" -eq "$scan_lane_b_lines" ] || {
+    echo "SELFTEST: the per-file tally does not sum to the lane B line count" >&2; fixture_fail=1; }
+  # ⚠ THE AMBIGUOUS SPELLING IS REFUSED, AND IT NEEDS ITS OWN TREE. A refusal
+  # ends the run it happens in, so this fixture cannot sit beside the ones whose
+  # results are read afterwards -- the same reason the NUL and character-
+  # reference fixtures each get a tree of their own.
+  #
+  # It carries an emphasis-split identifier next to an underscore identifier:
+  # `ADR-[]000**00**` reads as `ADR-[]000` raw and `ADR-[]00000` marker-free,
+  # and no reading of that line is defensible. Under the counting policies this
+  # unit tried before, the same file tallied 3, then 2, and both were guesses.
+  splitid_tmp="$(mktemp -d)"
+  (
+    cd "$splitid_tmp"
+    git init -q .
+    git config user.email t@t; git config user.name t
+    printf '%s\n' "$FIXTURE_SPLITID_BODY" > "$FIXTURE_SPLITID_NAME"
+    git add -A >/dev/null 2>&1
+  )
+  splitid_status=0
+  ( GATE_TMPFILES=(); trap 'gate_rc=$?; rm -f ${GATE_TMPFILES[@]+"${GATE_TMPFILES[@]}"}; exit "$gate_rc"' EXIT
+    scan_tree "$splitid_tmp" ) >/dev/null 2>&1 || splitid_status=$?
   fixture_checks=$((fixture_checks + 1))
-  [ "$(printf '%s' "$scan_lane_b_counts" | awk -v f="$FIXTURE_SPLITID_NAME" '$2 == f {print $1}')" = "2" ] || {
-    echo "SELFTEST: $FIXTURE_SPLITID_NAME tallied $(printf '%s' "$scan_lane_b_counts" | awk -v f="$FIXTURE_SPLITID_NAME" '$2 == f {print $1}'), expected 2" >&2
-    echo "  One emphasis-split identifier plus one underscore identifier is two" >&2
-    echo "  occurrences; 3 means the split one was counted twice, and 1 means the" >&2
-    echo "  underscore one was lost to the marker-free copy." >&2
+  [ "$splitid_status" -eq 2 ] || {
+    echo "SELFTEST: the ambiguous spelling was not refused (status $splitid_status)" >&2
     fixture_fail=1; }
+  rm -rf "$splitid_tmp"
   # ⚠ A COUNT THAT MUST BE REACHED. Every assertion above is invisible when it
   # is deleted, and a run that asserts nothing prints the same closing line as
   # a run that asserted everything. The floor moves up when assertions are
