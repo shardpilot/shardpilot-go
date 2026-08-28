@@ -238,13 +238,18 @@ jobs:
   # ⚠ ITS OWN JOB, WITH ITS OWN CLOCK, AND THE REASON IS ARITHMETIC. The harness
   # clones HEAD once, then drives each refusal by running the WHOLE gate once per
   # control, so its cost is controls x gate-cost. Measured in this workflow on
-  # 2026-08-27, six runs at the construction that ships here, harness step only:
+  # 2026-08-27/28, seven runs at the construction that ships here, harness step
+  # only:
   #
   #   27 controls   242s, 245s              (runs 33122936887, 33122939194)
   #   28 controls   229s, 230s, 254s, 255s  (runs 33125130837, 33125127958,
   #                                          33125648040, 33125989847)
+  #   29 controls   283s                    (run 33148391256)
   #
-  # -- 229 to 255s, which is 8.2 to 9.1 seconds per control.
+  # -- 229 to 283s, which is 8.2 to 9.8 seconds per control. The band widened
+  # when the twenty-ninth control landed, which is the model working rather than
+  # failing: the count is the term that moves the total, and a band recorded
+  # against named runs and their counts can absorb that without becoming false.
   #
   # ⚠ A RANGE OVER NAMED RUNS, NOT A SLOWEST-EVER. This comment used to crown one
   # run the slowest; the next run beat it by a second and the superlative was
@@ -270,8 +275,8 @@ jobs:
   #
   # What the bound means in the unit that actually grows: at the slow end of the
   # two bands recorded here (11.2s), ten minutes is reached at about FIFTY
-  # controls; at today's (9.1s), about sixty-five. Fifty is the number to plan
-  # against, and this harness is at twenty-eight.
+  # controls; at today's (9.8s), about sixty. Fifty is the number to plan
+  # against, and this harness is at twenty-nine.
   # Sharing public-surface's five-minute budget would have put it past half of that
   # on day one, and the failure mode of outgrowing a timeout is a cancelled job
   # that reads like an outage rather than like a check that got too expensive.
