@@ -117,8 +117,20 @@ if [ "$lane_b_am_clone" = no ]; then
     exit 2
   fi
   printf '%s\n' "$lane_b_tmp_root/repo" > "$lane_b_tmp_root/.lane-b-harness-clone"
-  "$lane_b_tmp_root/repo/scripts/test_lane_b_ratchet.sh"
-  exit $?
+  # ⚠ THE CHILD IS WAITED ON, NOT JUST RUN, SO AN INTERRUPT CAN BE HANDLED.
+  # Measured, because the obvious version leaks: with the child in the
+  # foreground, a TERM to this process removes the clone root while the child is
+  # still alive in it -- the child keeps writing, the tree comes back half
+  # populated, and an interrupted run leaves a clone root behind. Backgrounding
+  # it and waiting means the signal handler can end the child FIRST and then
+  # remove the root once nothing is writing to it.
+  "$lane_b_tmp_root/repo/scripts/test_lane_b_ratchet.sh" &
+  lane_b_child=$!
+  trap 'kill "$lane_b_child" 2>/dev/null || true; wait "$lane_b_child" 2>/dev/null || true; rm -rf "$lane_b_tmp_root"; exit 130' INT
+  trap 'kill "$lane_b_child" 2>/dev/null || true; wait "$lane_b_child" 2>/dev/null || true; rm -rf "$lane_b_tmp_root"; exit 143' TERM
+  lane_b_child_rc=0
+  wait "$lane_b_child" || lane_b_child_rc=$?
+  exit "$lane_b_child_rc"
 fi
 
 # ⚠ THE WITNESS IS MEASURED HERE, IN THE TREE UNDER TEST. It used to be the
