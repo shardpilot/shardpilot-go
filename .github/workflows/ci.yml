@@ -239,17 +239,46 @@ jobs:
       - name: Version consistency (README latest tag == CHANGELOG head == skill pin)
         run: ./scripts/check_release_consistency.sh
   # ⚠ ITS OWN JOB, WITH ITS OWN CLOCK, AND THE REASON IS ARITHMETIC. The harness
-  # drives each refusal by running the WHOLE gate once per control, so its cost
-  # is controls x gate-cost and both grow. Measured in this workflow on 2026-08-26,
-  # six runs of this job at the fourteen controls below: 130-157s, the slowest
-  # being run 33005583955. That is the gate costing nine to eleven seconds and
-  # being paid fourteen times.
+  # clones HEAD once, then drives each refusal by running the WHOLE gate once per
+  # control, so its cost is controls x gate-cost. Measured in this workflow on
+  # 2026-08-27/28, eight runs at the construction that ships here, harness step
+  # only, as SECONDS PER CONTROL -- which is the quantity that holds still:
   #
-  # The SLOWEST is quoted deliberately. A number justifying a bound has to be
-  # argued from the side the risk is on, and for a timeout the risk is overrun --
-  # so the fastest run, though equally true and equally citable, argues in the
-  # wrong direction. A snapshot, not a definition: both factors move, one with the
-  # runner and one with this file.
+  #   27 controls   242s, 245s              9.0, 9.1
+  #   28 controls   229s, 230s, 254s, 255s  8.2, 8.2, 9.1, 9.1
+  #   29 controls   283s                    9.8
+  #   33 controls   259s, 311s              7.9, 9.4
+  #
+  # -- 7.9 to 9.8 seconds per control, and the total is that times the count.
+  #
+  # ⚠ RECORDED PER CONTROL BECAUSE A TOTAL KEEPS BEING FALSIFIED BY ITS OWN
+  # SUCCESS. This comment first crowned one run the slowest; the next run beat
+  # it. It then recorded a band of totals, 229-283s; the next run after that
+  # measured 311s -- not because the job got slower but because the harness
+  # gained four controls, which is the thing this job is FOR. A figure that a
+  # later measurement can falsify does not belong in a file, and a total is
+  # exactly that as long as the count is meant to grow. Per control is stable
+  # across every run above, at three different counts.
+  #
+  # ⚠ AND THE PRICE IS NOT WHERE I FIRST PUT IT. This job roughly doubled when
+  # the harness moved into a throwaway clone, and the clone was the visible new
+  # thing, so the clone is what I wrote down. The fourteen-control figure this
+  # comment used to carry -- 130-157s across six runs on 2026-08-26, the slow end
+  # being run 33005583955 -- is 9.3 to 11.2s per control, the same band or
+  # slightly worse. The clone did not make the gate more expensive: the job grew
+  # because the
+  # CONTROL COUNT doubled, and the visible change was not the responsible one.
+  #
+  # The SLOW END is what the bound is argued from, deliberately. A number
+  # justifying a bound has to be argued from the side the risk is on, and for a
+  # timeout the risk is overrun -- so the fast end, though equally true and
+  # equally citable, argues in the wrong direction. A snapshot, not a definition:
+  # both factors move, one with the runner and one with this file.
+  #
+  # What the bound means in the unit that actually grows: at the slow end of the
+  # two bands recorded here (11.2s), ten minutes is reached at about FIFTY
+  # controls; at today's (7.9-9.8s), sixty to seventy-five. Fifty is the number
+  # to plan against, and this harness is at 35 controls.
   # Sharing public-surface's five-minute budget would have put it past half of that
   # on day one, and the failure mode of outgrowing a timeout is a cancelled job
   # that reads like an outage rather than like a check that got too expensive.
