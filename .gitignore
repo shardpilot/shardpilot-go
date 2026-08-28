@@ -39,3 +39,8 @@ go.work.sum
 # a future `internal/bench/` or `pkg/bench/` package would be silently
 # untracked — files missing from commits with no error anywhere.
 /bench/
+
+# Built example binaries. `go build ./examples/...` writes them into the
+# repository root, and `git add -A` then commits them: a 10.7 MB artifact that
+# every clone of a public SDK carries forever. Happened once (go#73).
+/experiments
