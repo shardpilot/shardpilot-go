@@ -36,12 +36,16 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -60,7 +64,8 @@ type exchange struct {
 	req      []byte
 	head     []byte
 	status   int
-	transErr error // set when no response arrived at all
+	proto    string // the protocol actually negotiated, which the request dump is not
+	transErr error  // set when no response arrived at all
 	captured *teeBody
 }
 
@@ -77,7 +82,7 @@ func (e *exchange) truncErr() error {
 	if e.captured == nil {
 		return nil
 	}
-	if e.captured.err == nil && e.captured.overflowed {
+	if e.captured.err == nil && (e.captured.overflowed || e.captured.atCeiling) {
 		return errOversizedForCapture
 	}
 	return e.captured.err
@@ -88,14 +93,27 @@ func (e *exchange) truncErr() error {
 // copy, and the run is reported as an incomplete capture rather than as a
 // complete one that happens to be short.
 var errOversizedForCapture = errors.New(
-	"more body reached the SDK than this record holds; the capture is incomplete, " +
-		"and the SDK's own verdict above is unaffected")
+	"the body reached the read ceiling this record shares with the SDK, so whether " +
+		"more followed is not knowable from here; the capture is reported incomplete " +
+		"rather than guessed, and the SDK's own verdict above is unaffected")
 
 func (e *exchange) resp() []byte {
 	if e.head == nil {
 		return nil
 	}
-	return append(append([]byte{}, e.head...), e.body()...)
+	out := append(append([]byte{}, e.head...), e.body()...)
+	if e.captured == nil || len(e.captured.trailer) == 0 {
+		return out
+	}
+	// Appended AFTER the body, where the wire carries them, and labelled so the
+	// block is not read as a second header section.
+	out = append(out, []byte("\r\nX-Capture-Note: trailer fields, received after the body\r\n")...)
+	for _, k := range slices.Sorted(maps.Keys(e.captured.trailer)) {
+		for _, v := range e.captured.trailer[k] {
+			out = append(out, []byte(k+": "+v+"\r\n")...)
+		}
+	}
+	return out
 }
 
 // dropFraming removes Content-Length from a recorded response.
@@ -116,6 +134,22 @@ func (e *exchange) resp() []byte {
 // and let the remainder appear as report prose -- forged verdict sections in an
 // artifact whose whole purpose is to be published
 // (shardpilot/shardpilot-go#73 review).
+// forFence guarantees a trailing newline so a fence closes on its own line, and
+// changes nothing else.
+//
+// ⚠ IT REPLACES A TrimRight THAT DELETED THE HTTP MESSAGE TERMINATOR. Every
+// bodyless GET dump ends with the required CRLF CRLF; trimming "\r\n" removed
+// the whole empty line, and the single newline printed before the closing fence
+// did not recreate it -- so a strict parser reached unexpected EOF after the
+// last header, and legitimate trailing newlines were stripped from response
+// bodies too (shardpilot/shardpilot-go#73 review).
+func forFence(content string) string {
+	if strings.HasSuffix(content, "\n") {
+		return content
+	}
+	return content + "\n"
+}
+
 func fenceFor(content string) string {
 	longest := 0
 	run := 0
@@ -136,10 +170,22 @@ func fenceFor(content string) string {
 	return strings.Repeat("`", n)
 }
 
+// ⚠ HEADER BLOCK ONLY. The first version walked every line, so a plain-text or
+// multiline body containing a line beginning `Content-Length:` had that line
+// REPLACED by a capture note -- the recorder editing endpoint-provided evidence
+// that had nothing to do with redaction (shardpilot/shardpilot-go#73 review).
 func dropFraming(dump string) string {
 	lines := strings.Split(dump, "\n")
 	out := make([]string, 0, len(lines))
+	inHeaders := true
 	for _, l := range lines {
+		if inHeaders && strings.TrimRight(l, "\r") == "" {
+			inHeaders = false
+		}
+		if !inHeaders {
+			out = append(out, l)
+			continue
+		}
 		low := strings.ToLower(l)
 		if strings.HasPrefix(low, "content-length:") {
 			out = append(out, "X-Capture-Note: Content-Length removed — the body below is redacted")
@@ -199,9 +245,10 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 	// body larger than its 1 MiB contract was buffered here instead of being
 	// refused there. The SDK now reads its own response, under its own bound,
 	// and this records what passes through.
-	captured := &teeBody{inner: resp.Body}
+	captured := &teeBody{inner: resp.Body, resp: resp}
 	resp.Body = captured
 	ex.status = resp.StatusCode
+	ex.proto = resp.Proto
 	if d, derr := httputil.DumpResponse(resp, false); derr == nil {
 		ex.head = d
 	}
@@ -219,13 +266,26 @@ type teeBody struct {
 	buf        bytes.Buffer
 	err        error
 	overflowed bool
+	atCeiling  bool
+	resp       *http.Response // for the trailer snapshot at EOF
+	trailer    http.Header
+	sawEOF     bool
 }
 
-// One byte MORE than the SDK's own limit, deliberately. The SDK reads
-// rcMaxBodyBytes+1 precisely so it can tell "at the limit" from "over it"; a
-// copy capped one byte lower cannot represent the case it is meant to witness,
-// and the record would show a shortened body as a whole one
+// The SDK's own read ceiling, matched exactly.
+//
+// ⚠ AND THAT IS WHY COUNTING CANNOT DETECT OVERFLOW. An earlier round set this
+// one byte above 1 MiB so `room < n` could witness a body larger than the copy.
+// It cannot: the SDK reads through io.LimitReader(body, ceiling), so this
+// wrapper is never called again once the ceiling is reached, `room < n` never
+// becomes true, and a response the SDK itself truncated was labelled complete
 // (shardpilot/shardpilot-go#73 review).
+//
+// A recorder downstream of a limit cannot see past it. So the honest signal is
+// not "overflowed" but "AT THE CEILING, therefore INDETERMINATE": the body may
+// be whole and exactly this long, or the SDK's read may have stopped short.
+// Both are reported as an incomplete capture, because a record cannot tell them
+// apart and guessing is the defect.
 const capturedBodyMax = (1 << 20) + 1
 
 func (t *teeBody) Read(p []byte) (int, error) {
@@ -239,10 +299,23 @@ func (t *teeBody) Read(p []byte) (int, error) {
 			t.buf.Write(p[:room])
 		}
 		if room < n {
-			// Bytes reached the SDK that this record does not hold. Saying so
-			// is the point: an incomplete copy presented as complete is the
-			// defect, not the incompleteness.
 			t.overflowed = true
+		}
+		if t.buf.Len() >= capturedBodyMax {
+			// Reached the ceiling the SDK also reads to. Whether anything
+			// followed is UNKNOWABLE from here -- see capturedBodyMax.
+			t.atCeiling = true
+		}
+	}
+	if err == io.EOF && !t.sawEOF {
+		t.sawEOF = true
+		// TRAILERS ARRIVE WITH THE LAST CHUNK, NOT WITH THE HEAD. The response
+		// head was dumped before the SDK read anything, when resp.Trailer held
+		// only DECLARED keys and no values; a record built from that head
+		// announced `Trailer: X` and then omitted X entirely, while still
+		// calling the pair complete (shardpilot/shardpilot-go#73 review).
+		if t.resp != nil && len(t.resp.Trailer) > 0 {
+			t.trailer = t.resp.Trailer.Clone()
 		}
 	}
 	if err != nil && err != io.EOF {
@@ -386,13 +459,113 @@ func scrubSupplied(text string) string {
 		// printed reconstructably in the body this program calls publishable.
 		// Same for backslashes and \uXXXX forms -- strconv.Quote produces what
 		// encoding/json would write (shardpilot/shardpilot-go#73 review).
-		if q := strconv.Quote(v); len(q) >= 2 {
-			if inner := q[1 : len(q)-1]; inner != v {
-				text = replaceValue(text, inner)
-			}
+		for _, enc := range encodingsOf(v) {
+			text = replaceValue(text, enc)
 		}
 	}
 	return text
+}
+
+// encodingsOf returns the spellings of v this program can CONSTRUCT. It is
+// deliberately not presented as complete -- see assertNoLeak, which is what
+// makes the incompleteness safe.
+//
+// The Go-quoted form alone was not enough: a comment here claimed strconv.Quote
+// "produces what encoding/json would write", and it does not. encoding/json
+// escapes `<`, `>` and `&` as \u003c, \u003e, \u0026 by default, so an
+// experiment key `a<b` survived both passes and was printed reconstructably in
+// the body this program calls publishable. A response echoing the request URL
+// in a Location header carries a third spelling again, percent-encoded
+// (shardpilot/shardpilot-go#73 review).
+func encodingsOf(v string) []string {
+	var out []string
+	add := func(e string) {
+		if e != "" && e != v {
+			out = append(out, e)
+		}
+	}
+	if q := strconv.Quote(v); len(q) >= 2 {
+		add(q[1 : len(q)-1])
+	}
+	if j, err := json.Marshal(v); err == nil && len(j) >= 2 {
+		add(string(j[1 : len(j)-1]))
+	}
+	add(url.QueryEscape(v))
+	add(url.PathEscape(v))
+	return out
+}
+
+// assertNoLeak is the reason the list above does not have to be complete.
+//
+// Every previous round closed ONE more spelling: the literal, then the Go
+// escape, then the JSON \uXXXX form, then percent-encoding. A list that gains
+// an entry per round is the wrong shape of defence for a publishable artifact,
+// because the round that misses one publishes it silently. So the artifact is
+// checked before it is printed: the text is DECODED -- percent-escapes and
+// \uXXXX escapes undone -- and every supplied value must be absent from every
+// decoded form. An encoding nobody anticipated does not leak; it makes this
+// program refuse to emit the record at all.
+func assertNoLeak(text string) error {
+	forms := []string{text, undoPercent(text), undoUnicodeEscapes(text)}
+	forms = append(forms, undoUnicodeEscapes(undoPercent(text)))
+	for _, v := range suppliedValues {
+		if v == "" {
+			continue
+		}
+		for _, f := range forms {
+			if strings.Contains(f, v) {
+				return fmt.Errorf(
+					"a supplied value of %d characters survived redaction in some "+
+						"encoding; the record is NOT publishable and was not printed",
+					len(v))
+			}
+		}
+	}
+	return nil
+}
+
+// undoPercent decodes percent-escapes leniently -- url.QueryUnescape refuses a
+// whole string for one malformed escape, and a partial decode is exactly what a
+// leak check wants.
+func undoPercent(text string) string {
+	var b strings.Builder
+	for i := 0; i < len(text); i++ {
+		if text[i] == '%' && i+2 < len(text) {
+			if h, err := strconv.ParseUint(text[i+1:i+3], 16, 8); err == nil {
+				b.WriteByte(byte(h))
+				i += 2
+				continue
+			}
+		}
+		b.WriteByte(text[i])
+	}
+	return b.String()
+}
+
+// undoUnicodeEscapes decodes \uXXXX sequences wherever they appear, without
+// requiring the surrounding text to be valid JSON -- a header or a log line may
+// carry one outside any JSON document.
+func undoUnicodeEscapes(text string) string {
+	var b strings.Builder
+	for i := 0; i < len(text); i++ {
+		if text[i] == '\\' && i+5 < len(text) && (text[i+1] == 'u' || text[i+1] == 'U') {
+			if r, err := strconv.ParseUint(text[i+2:i+6], 16, 32); err == nil {
+				b.WriteRune(rune(r))
+				i += 5
+				continue
+			}
+		}
+		if text[i] == '\\' && i+1 < len(text) {
+			switch text[i+1] {
+			case '"', '\\', '/':
+				b.WriteByte(text[i+1])
+				i++
+				continue
+			}
+		}
+		b.WriteByte(text[i])
+	}
+	return b.String()
 }
 
 // replaceValue redacts every occurrence of v. A long value is replaced outright;
@@ -502,9 +675,10 @@ func main() {
 		os.Exit(2)
 	}
 
-	fmt.Printf("# assignment capture — %s\n\n", time.Now().UTC().Format(time.RFC3339))
+	var report strings.Builder
+	fmt.Fprintf(&report, "# assignment capture — %s\n\n", time.Now().UTC().Format(time.RFC3339))
 	if len(rec.exchanges) > 1 {
-		fmt.Printf("The SDK made **%d attempts**. All are below; the verdict is the "+
+		fmt.Fprintf(&report, "The SDK made **%d attempts**. All are below; the verdict is the "+
 			"last, because that is the one it acted on.\n\n", len(rec.exchanges))
 	}
 	for i, ex := range rec.exchanges {
@@ -512,49 +686,73 @@ func main() {
 		if len(rec.exchanges) > 1 {
 			label = fmt.Sprintf(" %d", i+1)
 		}
-		reqText := strings.TrimRight(string(ex.req), "\r\n")
+		reqText := forFence(string(ex.req))
 		f := fenceFor(reqText)
-		fmt.Printf("## Request%s, as the SDK sent it\n\n%s\n%s\n%s\n\n",
-			label, f, reqText, f)
+		// ⚠ NOT "as the SDK sent it". DumpRequestOut serialises the request as
+		// HTTP/1.1 through a separate fake transport, BEFORE the real one
+		// negotiates a protocol. On an HTTP/2 connection the report paired a
+		// fabricated `HTTP/1.1` request line with a genuine `HTTP/2.0` status
+		// line and called the two a single wire exchange
+		// (shardpilot/shardpilot-go#73 review). The negotiated protocol is
+		// reported beside it, from the response, which is measured rather than
+		// serialised.
+		wire := ex.proto
+		if wire == "" {
+			wire = "not established — no response arrived"
+		}
+		fmt.Fprintf(&report,
+			"## Request%s — canonical HTTP/1.1 representation\n\n"+
+				"Serialised by `httputil.DumpRequestOut`, which always writes HTTP/1.1. "+
+				"The connection negotiated **%s**, so this is the request's canonical form "+
+				"and its header set, not the bytes on the wire.\n\n%s\n%s%s\n\n",
+			label, wire, f, reqText, f)
 		switch {
 		case ex.transErr != nil:
-			fmt.Printf("## Response%s\n\nNONE — the request was formed and no "+
+			fmt.Fprintf(&report, "## Response%s\n\nNONE — the request was formed and no "+
 				"response arrived: %s\n\n", label, sanitize(ex.transErr))
 		case ex.truncErr() != nil:
-			fmt.Printf("## Response%s — TRUNCATED, and the SDK was told so\n\n"+
-				"The body could not be read whole (%v). What arrived is below; it "+
-				"is NOT a complete response.\n\n%s\n%s\n%s\n\n",
-				label, sanitize(ex.truncErr()),
-				fenceFor(dropFraming(scrubSupplied(strings.TrimRight(string(ex.resp()), "\r\n")))),
-				dropFraming(scrubSupplied(strings.TrimRight(string(ex.resp()), "\r\n"))),
-				fenceFor(dropFraming(scrubSupplied(strings.TrimRight(string(ex.resp()), "\r\n")))))
+			body := forFence(dropFraming(scrubSupplied(string(ex.resp()))))
+			fmt.Fprintf(&report, "## Response%s — INCOMPLETE, and the SDK was told so\n\n"+
+				"The body is not established as whole (%v). What arrived is below; it "+
+				"is NOT a complete response.\n\n%s\n%s%s\n\n",
+				label, sanitize(ex.truncErr()), fenceFor(body), body, fenceFor(body))
 		default:
-			respText := dropFraming(scrubSupplied(strings.TrimRight(string(ex.resp()), "\r\n")))
+			respText := forFence(dropFraming(scrubSupplied(string(ex.resp()))))
 			rf := fenceFor(respText)
-			fmt.Printf("## Response%s\n\n%s\n%s\n%s\n\n", label, rf, respText, rf)
+			fmt.Fprintf(&report, "## Response%s\n\n%s\n%s%s\n\n", label, rf, respText, rf)
 		}
 	}
 
 	last := rec.last()
-	fmt.Printf("## SDK verdict\n\n")
-	fmt.Printf("    attempts: %d\n", len(rec.exchanges))
-	fmt.Printf("    status:   %d\n", last.status)
-	fmt.Printf("    assigned: %t\n", result.Assigned)
+	fmt.Fprintf(&report, "## SDK verdict\n\n")
+	fmt.Fprintf(&report, "    attempts: %d\n", len(rec.exchanges))
+	fmt.Fprintf(&report, "    status:   %d\n", last.status)
+	fmt.Fprintf(&report, "    assigned: %t\n", result.Assigned)
+	fmt.Fprintf(&report, "    protocol: %q\n", last.proto)
 	// Scrubbed like everything else: a variant key may legally equal a supplied
 	// identifier -- an experiment and a variant both named `control` is a valid
 	// response -- and the property is that a supplied value is never printed
 	// back WHEREVER it appears, not only in the body.
-	fmt.Printf("    variant:  %q\n", scrubSupplied(result.VariantKey))
-	fmt.Printf("    reason:   %q\n", scrubSupplied(result.Reason))
+	fmt.Fprintf(&report, "    variant:  %q\n", scrubSupplied(result.VariantKey))
+	fmt.Fprintf(&report, "    reason:   %q\n", scrubSupplied(result.Reason))
 	// The SDK's own classification. A 404 returns a usable result with
 	// Code "not_found", Assigned false and a NIL error, so omitting this showed
 	// only zero-valued fields and then called the run generically not-served --
 	// losing the first-class verdict this program exists to report.
-	fmt.Printf("    code:     %q\n", scrubSupplied(result.Code))
-	fmt.Printf("    version:  %d\n", result.Version)
+	fmt.Fprintf(&report, "    code:     %q\n", scrubSupplied(result.Code))
+	fmt.Fprintf(&report, "    version:  %d\n", result.Version)
 	if fetchErr != nil {
-		fmt.Printf("    error:    %s\n", sanitize(fetchErr))
+		fmt.Fprintf(&report, "    error:    %s\n", sanitize(fetchErr))
 	}
+
+	// THE ARTIFACT IS CHECKED BEFORE IT IS PUBLISHED, not as it is assembled.
+	// One gate over the finished text, so a value that slipped through any one
+	// of the scrub passes stops the record instead of riding out in it.
+	if err := assertNoLeak(report.String()); err != nil {
+		fmt.Fprintf(os.Stderr, "REFUSING TO PRINT: %v\n", err)
+		os.Exit(4)
+	}
+	fmt.Print(report.String())
 
 	switch {
 	case last.transErr != nil:
