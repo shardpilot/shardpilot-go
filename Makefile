@@ -23,22 +23,45 @@ SHELL := /usr/bin/env bash
 #     caught by neither. That is a real hole and it is shared with CI -- named
 #     here rather than left for someone to discover after a push.
 #
-# ⚠ AND THE COMPARISON BASE IS NOT ALWAYS THE SAME ONE. CI's rule:
+# ⚠ WHAT IT DOES NOT COVER, AND THIS CLAIM HAS BEEN WRONG TWICE.
 #
+# Earlier versions said this target was "at least as strong as CI whichever rule
+# applies". It is not, and could not be: CI compares against the tip of the ref
+# you actually push, and a Makefile cannot know your refspec.
+#
+#     git push                              -> covered
+#     git push origin HEAD:release          -> NOT covered: CI compares against
+#                                              release's tip, which is not in the
+#                                              base set below
+#     git push origin other-branch:release  -> NOT covered: a different SOURCE
+#                                              tree is published, not this HEAD
+#     git push --tags                       -> NOT covered: tags may point at
+#                                              arbitrary commits
+#
+# For anything but a plain push of the checked-out branch, run the gate yourself
+# against the destination's tip:
+#
+#     PUBLIC_SURFACE_BASE_REF=origin/release make check
+#
+# and remember it still scans THIS working tree, not the source you are pushing.
+# Stating the gap is the point: a gate that overstates its coverage gives
+# grounds not to check, which is the failure this file exists to remove.
+#
+# CI's rule, for reference:
 #     pull request                -> the event's base.sha
 #     push to an EXISTING ref     -> github.event.before, the pre-push tip
 #     push CREATING a ref         -> the default branch
 #
-# A Makefile cannot know the refspec you will use -- `git push origin HEAD:other`
-# and `git push --tags` both create refs from the same HEAD -- so this does not
-# guess. It runs the gate against EVERY plausible base and requires all of them
-# to pass, which is at least as strong as CI whichever rule applies.
+# The bases below cover the plain case: this branch's remote tip if it has one,
+# and the default branch. Both are FETCHED first -- a stale origin/* sits at an
+# older, higher baseline, so comparing against it silently weakens the gate, and
+# nothing in a local ref announces that it is behind.
 #
 # Override with the ENVIRONMENT form, never as a make variable:
 #     PUBLIC_SURFACE_BASE_REF=upstream/main make check
 # Make expands `$` in a command-line variable value -- `feature/foo$bar` becomes
-# `feature/fooar`, and `$(value ...)` does not save it either -- so a make-variable
-# override is refused rather than silently altered.
+# `feature/fooar`, and `$(value ...)` does not save it either -- so a
+# make-variable override is refused rather than silently altered.
 #
 # Cost: about a minute per base.
 check:
@@ -55,6 +78,11 @@ check:
 	  printf '  This gate reads the tree your INDEX would write, and a push\n' >&2; \
 	  printf '  publishes your commits. Commit or stash first, so what is\n' >&2; \
 	  printf '  checked is what is published.\n' >&2; \
+	  exit 2; \
+	fi; \
+	if ! git fetch --quiet origin 2>/dev/null; then \
+	  printf 'REFUSING: could not fetch origin. A stale remote-tracking ref sits\n' >&2; \
+	  printf '  at an older baseline and would silently weaken this gate.\n' >&2; \
 	  exit 2; \
 	fi; \
 	bases=(); \

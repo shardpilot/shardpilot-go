@@ -306,7 +306,9 @@ Defaults: issuer `shardpilot`, audience `shardpilot-ingest`, lifetime 5m (equal 
 
 ## Build & test
 
-No Makefile — standard Go tooling. CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `go test ./...` and `go vet ./...` on **both** Go 1.25.x (the baseline) and 1.27.x, plus a release version-consistency check (`scripts/check_release_consistency.sh`; see [`docs/release.md`](docs/release.md)).
+**Run `make check` before you push.** It is the only target in the Makefile and it runs `scripts/check_public_surface.sh`, the gate that keeps internal material out of this repository — which is **public**, and publishes its history along with its tree, so a commit carrying internal material is published when it is pushed rather than when it merges. The target's own header states what it covers and what it does not.
+
+Otherwise standard Go tooling. CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `go test ./...` and `go vet ./...` on **both** Go 1.25.x (the baseline) and 1.27.x, plus a release version-consistency check (`scripts/check_release_consistency.sh`; see [`docs/release.md`](docs/release.md)).
 
 **`gofmt` is checked once, on Go 1.27.x only**, in a separate `format` job outside the version matrix. gofmt's output changes between releases — 1.27 de-indents the continuation lines of a multi-value `return` whose operands are composite literals, which 1.25 indents — so a file cannot satisfy both formatters and running the check on every matrix leg asserts an impossibility. **Format with Go 1.27's `gofmt` even if you develop against the 1.25 baseline**: 1.25's formatter will produce a diff CI rejects. This costs nothing at runtime — formatting has no bearing on what the 1.25 baseline compiles, which is what the matrix is there to prove.
 
