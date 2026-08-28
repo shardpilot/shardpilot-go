@@ -1092,6 +1092,58 @@ expect_nostage "an unstaged baseline is not the one that would be committed" \
   1 "moved and the baseline did not agree"
 restore
 
+# ⚠ A SYMLINKED ANCESTOR IN TMPDIR, WHICH IS THE DEFAULT ON macOS. /tmp there is
+# a symlink to /private/tmp, and the lanes run on a macbook -- so the marker
+# holding the logical spelling while the child resolved the physical one made
+# the child fail to recognise itself and clone AGAIN, at every level. Measured
+# here: /tmp on this Linux container is NOT a symlink, which is exactly why the
+# defect could not appear on the machine that wrote the code.
+#
+# ⚠ AND IT IS DELIBERATELY THE LAST CONTROL IN THE FILE. It invokes this harness
+# recursively, bounded by `timeout`, so a nested run must never reach this line
+# -- from the top it is roughly five minutes away and the bound is thirty
+# seconds. Placed anywhere earlier, the control would recurse on itself, which
+# is the very defect it exists to detect.
+#
+# The assertion is the number of clone roots alive DURING the run, not after:
+# the parent's trap removes its root on the way out, so counting afterwards
+# cannot tell one run from a hundred. Recognised once -> exactly one root.
+lane_b_symreal="$(mktemp -d "$lane_b_scratch/XXXXXX")"
+lane_b_symlink="$lane_b_scratch/symlinked-tmpdir"
+ln -sfn "$lane_b_symreal" "$lane_b_symlink"
+checks=$((checks + 1))
+if ! command -v timeout >/dev/null 2>&1; then
+  echo "FAIL [a symlinked TMPDIR does not make the clone recurse]: no timeout(1)," >&2
+  echo "  so this control cannot bound a recursive subject. Reporting the" >&2
+  echo "  unavailable route rather than a pass." >&2
+  failures=$((failures + 1))
+else
+  ( TMPDIR="$lane_b_symlink" timeout 30 "$lane_b_here/scripts/test_lane_b_ratchet.sh" \
+      > "$lane_b_symreal/.out" 2>&1 ) &
+  lane_b_sym_bg=$!
+  sleep 12
+  lane_b_roots=0
+  for lane_b_d in "$lane_b_symreal"/tmp.*; do
+    [ -e "$lane_b_d/.lane-b-harness-clone" ] && lane_b_roots=$((lane_b_roots + 1))
+  done
+  kill "$lane_b_sym_bg" 2>/dev/null || true
+  wait "$lane_b_sym_bg" 2>/dev/null || true
+  if [ "$lane_b_roots" -gt 1 ]; then
+    echo "FAIL [a symlinked TMPDIR does not make the clone recurse]: $lane_b_roots" >&2
+    echo "  clone roots alive at once -- the child did not recognise itself and" >&2
+    echo "  cloned again." >&2
+    failures=$((failures + 1))
+  elif [ "$lane_b_roots" -lt 1 ]; then
+    echo "FAIL [a symlinked TMPDIR does not make the clone recurse]: no clone root" >&2
+    echo "  was alive at all, so the run never got started and this control" >&2
+    echo "  would have passed without testing anything." >&2
+    sed 's/^/    /' "$lane_b_symreal/.out" 2>/dev/null | head -5 >&2
+    failures=$((failures + 1))
+  fi
+fi
+rm -f "$lane_b_symlink"
+rm -rf "$lane_b_symreal"
+
 # ⚠ EXACTLY, NOT AT LEAST, AND THE NUMBER LIVES ONLY ON THE NEXT LINE. A floor
 # accepts a stale count: add a control without touching it and the expected
 # number silently drifts, after which that control can be deleted and the stale
@@ -1105,7 +1157,7 @@ restore
 # this paragraph forbids, one line from where it forbids it, and passing every
 # healthy run because a stale expectation only shows up once some other count
 # disagrees.
-EXPECTED_CHECKS=33
+EXPECTED_CHECKS=34
 if [ "$checks" -ne "$EXPECTED_CHECKS" ]; then
   echo "REFUSING: $checks control(s) ran, expected exactly $EXPECTED_CHECKS" >&2
   exit 2
