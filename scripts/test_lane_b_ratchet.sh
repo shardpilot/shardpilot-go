@@ -786,6 +786,42 @@ chmod +x "$lane_b_notstub/mv"
 expect_env "an mv without --no-target-directory refuses" \
   "PATH=$lane_b_notstub:$PATH" 2 "has no --no-target-directory" --write-baseline
 rm -rf "$lane_b_notstub"
+
+# ⚠ AND THE OTHER BRANCH THE SWEEP FOUND WITH NOTHING POINTING AT IT: the
+# writer's `cd -P` failing. The obvious lever is directory permissions, and this
+# harness can run as uid 0 where they are advisory -- a control built on them
+# would be red here and green in CI, the environment-dependent shape already
+# rejected once in this file. A lever that stops root too: make the parent not a
+# directory at all. Nobody enters a regular file.
+#
+# It has to happen mid-run. Before the gate starts, the self-integrity check
+# reads $SELF out of scripts/ and refuses for a different reason entirely. So
+# the hook is the same `ls -ld` probe -- but the stub defers to the real `ls`
+# FIRST and swaps afterwards, because the gate consumes that probe's output
+# immediately and a failed probe would fire the hard-link refusal instead.
+lane_b_cdstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
+{
+  echo '#!/bin/sh'
+  echo "REAL_LS=$(command -v ls)"
+  echo 'case "$*" in'
+  echo '  "-ld scripts/public-surface-lane-b-baseline.txt")'
+  echo '    out="$("$REAL_LS" "$@" 2>&1)"; st=$?'
+  echo '    mv scripts scripts.real 2>/dev/null && : > scripts 2>/dev/null'
+  echo '    printf "%s\n" "$out"; exit "$st"'
+  echo '    ;;'
+  echo 'esac'
+  echo 'exec "$REAL_LS" "$@"'
+} > "$lane_b_cdstub/ls"
+chmod +x "$lane_b_cdstub/ls"
+checks=$((checks + 1))
+lane_b_cd_rc=0
+lane_b_cd_out="$(env "PATH=$lane_b_cdstub:$PATH" "$GATE" --write-baseline 2>&1)" || lane_b_cd_rc=$?
+[ -f scripts ] && rm -f scripts
+[ -e scripts.real ] && [ ! -e scripts ] && mv scripts.real scripts
+judge "a parent that is not a directory refuses" \
+  "$lane_b_cd_rc" 2 "could not enter the directory" "$lane_b_cd_out"
+rm -rf "$lane_b_cdstub"
+restore
 restore
 
 # ⚠ AND THE UNREADABLE LINK COUNT. The hard-link scene only ever supplies a
@@ -1016,7 +1052,7 @@ restore
 # this paragraph forbids, one line from where it forbids it, and passing every
 # healthy run because a stale expectation only shows up once some other count
 # disagrees.
-EXPECTED_CHECKS=32
+EXPECTED_CHECKS=33
 if [ "$checks" -ne "$EXPECTED_CHECKS" ]; then
   echo "REFUSING: $checks control(s) ran, expected exactly $EXPECTED_CHECKS" >&2
   exit 2
