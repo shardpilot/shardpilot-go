@@ -30,7 +30,42 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-if [ -z "${LANE_B_HARNESS_CLONE:-}" ]; then
+# ⚠ THE RE-ENTRY SENTINEL IS NOT AN INPUT, AND THIS IS THE SECOND TIME THAT
+# SENTENCE HAS HAD TO BE WRITTEN HERE. #67 took LANE_B_BASELINE away from the
+# gate for exactly this reason; then this harness, in the act of removing a
+# degree of freedom, introduced a control variable for its own mechanism -- and
+# a nonempty LANE_B_HARNESS_CLONE in the environment skipped the clone, skipped
+# both dirty-tree refusals, mutated the caller's live checkout, and printed the
+# caller's own string as the commit tested.
+#
+#   A rebuild that removes a degree of freedom tends to add a sentry, and the
+#   sentry is the new degree of freedom.
+#
+# So it is refused rather than ignored, like the variable in the gate: an
+# exported leftover from an older copy of this script must stop the run loudly
+# instead of quietly turning the clone off.
+if [ -n "${LANE_B_HARNESS_CLONE+set}" ]; then
+  echo "REFUSING: LANE_B_HARNESS_CLONE is set, and is not an input." >&2
+  echo "  This harness decides whether it is the clone by looking at where it" >&2
+  echo "  is, not by being told. A set value here is a leftover from an older" >&2
+  echo "  copy of this script, and honouring it would skip the clone, skip the" >&2
+  echo "  dirty-tree refusals, and let the closing line name a commit nobody" >&2
+  echo "  measured. Unset it and run again." >&2
+  exit 2
+fi
+
+# ⚠ AND "AM I THE CLONE" IS DERIVED, NOT DECLARED. The parent writes a marker
+# BESIDE the clone -- outside its worktree, so no control's `git status` ever
+# sees it -- containing the path it created. The child recognises itself when
+# that marker names its own toplevel. Nothing inherited, nothing exported.
+lane_b_here="$(cd -P "$(git rev-parse --show-toplevel)" && pwd -P)"
+lane_b_marker="$(dirname "$lane_b_here")/.lane-b-harness-clone"
+lane_b_am_clone=no
+if [ -f "$lane_b_marker" ] && [ "$(cat "$lane_b_marker" 2>/dev/null)" = "$lane_b_here" ]; then
+  lane_b_am_clone=yes
+fi
+
+if [ "$lane_b_am_clone" = no ]; then
   if [ -n "$(git status --porcelain)" ]; then
     echo "REFUSING: working tree is dirty." >&2
     echo "  This harness clones HEAD and runs there, so uncommitted work would" >&2
@@ -45,15 +80,32 @@ if [ -z "${LANE_B_HARNESS_CLONE:-}" ]; then
   # assume-unchanged by LOWERCASING the status letter; skip-worktree gets its own
   # UPPERCASE `S`, so a lowercase-only test walks past it. Measured earlier:
   # `^[a-z]` matched 0 and `^[a-zS]` matched 1 on a skip-worktree path.
-  if git ls-files -v | grep -q '^[a-zS]'; then
+  #
+  # ⚠ AND IT IS NOT `| grep -q`. Under pipefail, `grep -q` exits at the FIRST
+  # match; if the index listing is larger than the pipe buffer, `git` then dies
+  # of SIGPIPE, pipefail makes the whole condition nonzero, and A MATCH READS AS
+  # NO MATCH. Not a missed refusal -- an inverted one, arriving only in the big
+  # repositories where the flagged path is likeliest. The fix is to consume the
+  # whole listing, which also lets git's own status survive to be checked and
+  # runs the walk once instead of twice.
+  set +e
+  lane_b_flagged="$(git ls-files -v 2>/dev/null | grep '^[a-zS]'; exit "${PIPESTATUS[0]}")"
+  lane_b_flag_st=$?
+  set -e
+  if [ "$lane_b_flag_st" -ne 0 ]; then
+    echo "REFUSING: could not read the index flags (git ls-files -v exit $lane_b_flag_st)." >&2
+    echo "  The dirty-tree guard above cannot be trusted without this, so the" >&2
+    echo "  run stops rather than clone something it has not checked." >&2
+    exit 2
+  fi
+  if [ -n "$lane_b_flagged" ]; then
     echo "REFUSING: some tracked paths carry assume-unchanged or skip-worktree." >&2
     echo "  git status cannot see edits to those, so the dirty-tree guard above" >&2
     echo "  is not answering the question it appears to answer, and the clone" >&2
     echo "  would silently test HEAD instead of what you are holding." >&2
-    git ls-files -v | grep '^[a-zS]' | head -5 >&2
+    printf '%s\n' "$lane_b_flagged" | head -5 >&2
     exit 2
   fi
-  lane_b_head="$(git rev-parse HEAD)"
   lane_b_tmp_root="$(mktemp -d)"
   trap 'rm -rf "$lane_b_tmp_root"' EXIT
   # --no-hardlinks is load-bearing: an ordinary local clone hard-links the object
@@ -64,9 +116,17 @@ if [ -z "${LANE_B_HARNESS_CLONE:-}" ]; then
     echo "REFUSING: could not clone this repository to run against." >&2
     exit 2
   fi
-  LANE_B_HARNESS_CLONE="$lane_b_head" "$lane_b_tmp_root/repo/scripts/test_lane_b_ratchet.sh"
+  printf '%s\n' "$lane_b_tmp_root/repo" > "$lane_b_tmp_root/.lane-b-harness-clone"
+  "$lane_b_tmp_root/repo/scripts/test_lane_b_ratchet.sh"
   exit $?
 fi
+
+# ⚠ THE WITNESS IS MEASURED HERE, IN THE TREE UNDER TEST. It used to be the
+# string the parent passed in, which made the closing line a repeater rather
+# than an instrument: whoever set the variable chose what the run claimed to
+# have tested. This reads the commit out of the checkout the controls are about
+# to run against.
+lane_b_tested="$(git rev-parse HEAD)"
 
 
 GATE=scripts/check_public_surface.sh
@@ -216,6 +276,13 @@ cleanup_dirs() {
   chattr -i scripts 2>/dev/null || true
   [ -n "${STUB:-}" ] && rm -rf "$STUB"
   [ -n "${STUBDIR:-}" ] && rm -rf "$STUBDIR"
+  # ⚠ AND THE PER-CONTROL SCRATCH, WHICH LIVES OUTSIDE THE CLONE. Six controls
+  # build stub PATH directories and "precious" copies outside the worktree, so
+  # deleting the clone does not reach them: on any exit before their inline
+  # `rm -rf`, they leak. That is the same class as the gate's own untrapped
+  # mktemp sites (go#71) -- and this instance is mine, in this round's code.
+  # One root, removed from the trap, so a new scratch site cannot forget.
+  [ -n "${lane_b_scratch:-}" ] && rm -rf "$lane_b_scratch"
   # ⚠ EVERY INTERMEDIATE STATE, NOT THE TIDY ONE. The swap control does
   # `mv scripts scripts.real` then `ln -s`, and undoes it with `rm -f` then `mv`.
   # Interrupted between either pair, `scripts` is ABSENT rather than a symlink --
@@ -236,7 +303,9 @@ cleanup_dirs() {
 # BASH_ENV. I introduced it while fixing a cleanup that only ran when nothing
 # went wrong.
 STUB=""
+lane_b_scratch=""
 STUBDIR="$(mktemp -d)"
+lane_b_scratch="$(mktemp -d)"
 trap 'restore; cleanup_dirs; rm -f "$SAVED"' EXIT
 
 # judge <label> <rc> <want> <needle> <output> -- ONE judgement, every caller.
@@ -267,7 +336,17 @@ judge() {
     failures=$((failures + 1))
     return
   fi
-  if [ -n "$needle" ] && ! printf '%s' "$out" | grep -qF -- "$needle"; then
+  # ⚠ NO PIPE HERE, AND THE REASON CAME FROM THE INDEX-FLAG FINDING. That one
+  # was `git ls-files -v | grep -q` inverting under pipefail on SIGPIPE; this
+  # was the same shape, in the instrument that decides every pass and fail.
+  # `printf` is a builtin, so its EPIPE is the shell's: grep -q exits at the
+  # first match, printf dies writing the rest, pipefail makes the pipeline
+  # nonzero, and `!` turns FOUND into "the reason was not '$needle'" -- a
+  # control failing precisely because it succeeded, on outputs longer than a
+  # pipe buffer. A shell pattern match asks the question with no pipe at all.
+  local found=no
+  case "$out" in *"$needle"*) found=yes ;; esac
+  if [ -n "$needle" ] && [ "$found" = no ]; then
     echo "FAIL [$label]: exit $want as expected, but the reason was not '$needle'" >&2
     echo "  -- an exit code alone does not say WHICH refusal fired, and two" >&2
     echo "     conditions sharing a code is how a check goes missing unnoticed." >&2
@@ -480,10 +559,10 @@ judge "a parent swapped before the anchor refuses" "${lane_b_swap_rc:-0}" 2 "is 
 # working directory -- a descriptor, which the swap cannot reach. The assertion
 # is the external file, not the exit code: the gate should SUCCEED here, and the
 # outside copy should be untouched.
-lane_b_outside="$(mktemp -d)"
+lane_b_outside="$(mktemp -d "$lane_b_scratch/XXXXXX")"
 mkdir -p "$lane_b_outside/scripts"
 printf 'PRECIOUS OUTSIDE\n' > "$lane_b_outside/scripts/public-surface-lane-b-baseline.txt"
-lane_b_swapstub="$(mktemp -d)"
+lane_b_swapstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
 {
   echo '#!/bin/sh'
   echo "REAL_MV=$(command -v mv)"
@@ -553,9 +632,9 @@ restore
 # filesystems: the put-in-place must stay a RENAME. Turn it into a copy or a
 # redirect -- the ordinary shape of a later tidy-up -- and the write goes
 # through the link. That is the mutant this control is driven against.
-lane_b_leafout="$(mktemp -d)"
+lane_b_leafout="$(mktemp -d "$lane_b_scratch/XXXXXX")"
 printf 'PRECIOUS LEAF\n' > "$lane_b_leafout/target.txt"
-lane_b_leafstub="$(mktemp -d)"
+lane_b_leafstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
 {
   echo '#!/bin/sh'
   echo "REAL_LS=$(command -v ls)"
@@ -596,7 +675,7 @@ restore
 # A selective stub: `mv` fails only for the baseline's temporary, and defers to
 # the real one otherwise, so the refusal that fires is this one and not some
 # earlier mover's.
-lane_b_mvstub="$(mktemp -d)"
+lane_b_mvstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
 {
   echo '#!/bin/sh'
   echo 'case " $* " in *public-surface-lane-b-baseline.txt.tmp.*) exit 1 ;; esac'
@@ -614,7 +693,7 @@ restore
 # writing without having established the baseline has one name. A stub whose
 # `ls -ld` returns a non-numeric second field, deferring to the real one for
 # every other invocation.
-lane_b_lsstub="$(mktemp -d)"
+lane_b_lsstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
 {
   echo '#!/bin/sh'
   echo 'case " $* " in *public-surface-lane-b-baseline.txt*) echo "-rw-r--r-- ? nobody nobody 0 Jan 1 00:00 x"; exit 0 ;; esac'
@@ -674,6 +753,27 @@ chattr -i scripts 2>/dev/null || true
 # it" from a grep result into a checked property.
 expect_env "a set LANE_B_BASELINE is refused, not discarded" \
   "LANE_B_BASELINE=/tmp/anywhere" 2 "no longer an input"
+
+# ⚠ THE HARNESS'S OWN SENTINEL, REFUSED THE SAME WAY. The subject here is this
+# script rather than the gate, and it is reachable cheaply because the refusal
+# is the FIRST thing the script does: it exits before the marker check, before
+# any clone, before a single control. Without the refusal the same invocation
+# runs a full nested harness instead, so this is bounded by `timeout` and the
+# lever is probed -- an unavailable `timeout` reports rather than passes, since
+# a control that cannot bound its subject is not a control.
+checks=$((checks + 1))
+if ! command -v timeout >/dev/null 2>&1; then
+  echo "FAIL [an exported LANE_B_HARNESS_CLONE is refused]: no timeout(1), so" >&2
+  echo "  this control cannot bound a subject that would otherwise nest a full" >&2
+  echo "  harness run. Reporting the unavailable route rather than a pass." >&2
+  failures=$((failures + 1))
+else
+  lane_b_sentinel_rc=0
+  lane_b_sentinel_out="$(LANE_B_HARNESS_CLONE=anything timeout 60 \
+    ./scripts/test_lane_b_ratchet.sh 2>&1)" || lane_b_sentinel_rc=$?
+  judge "an exported LANE_B_HARNESS_CLONE is refused" \
+    "$lane_b_sentinel_rc" 2 "is not an input" "$lane_b_sentinel_out"
+fi
 
 # ⚠ A DIRECTORY AT THE FIXED PATH. Link count 1, not a symlink, so every other
 # check passes it -- and `mv` then moves the temporary INSIDE it while the gate
@@ -801,7 +901,7 @@ restore
 # this paragraph forbids, one line from where it forbids it, and passing every
 # healthy run because a stale expectation only shows up once some other count
 # disagrees.
-EXPECTED_CHECKS=28
+EXPECTED_CHECKS=29
 if [ "$checks" -ne "$EXPECTED_CHECKS" ]; then
   echo "REFUSING: $checks control(s) ran, expected exactly $EXPECTED_CHECKS" >&2
   exit 2
@@ -810,4 +910,4 @@ if [ "$failures" -ne 0 ]; then
   echo "lane B ratchet: $failures of $checks control(s) FAILED" >&2
   exit 1
 fi
-echo "lane B ratchet: $checks control(s), 0 failure(s) — against ${LANE_B_HARNESS_CLONE}"
+echo "lane B ratchet: $checks control(s), 0 failure(s) — against ${lane_b_tested}"
