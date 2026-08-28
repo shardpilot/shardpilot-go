@@ -76,8 +76,19 @@ func (e *exchange) truncErr() error {
 	if e.captured == nil {
 		return nil
 	}
+	if e.captured.err == nil && e.captured.overflowed {
+		return errOversizedForCapture
+	}
 	return e.captured.err
 }
+
+// errOversizedForCapture is not the SDK's failure -- it is THIS RECORD's. The
+// SDK may have handled the oversized body perfectly; what is incomplete is the
+// copy, and the run is reported as an incomplete capture rather than as a
+// complete one that happens to be short.
+var errOversizedForCapture = errors.New(
+	"more body reached the SDK than this record holds; the capture is incomplete, " +
+		"and the SDK's own verdict above is unaffected")
 
 func (e *exchange) resp() []byte {
 	if e.head == nil {
@@ -143,21 +154,35 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 // record that can be made to allocate without limit by the thing it observes is
 // a denial of service wearing evidence.
 type teeBody struct {
-	inner io.ReadCloser
-	buf   bytes.Buffer
-	err   error
+	inner      io.ReadCloser
+	buf        bytes.Buffer
+	err        error
+	overflowed bool
 }
 
-const capturedBodyMax = 1 << 20
+// One byte MORE than the SDK's own limit, deliberately. The SDK reads
+// rcMaxBodyBytes+1 precisely so it can tell "at the limit" from "over it"; a
+// copy capped one byte lower cannot represent the case it is meant to witness,
+// and the record would show a shortened body as a whole one
+// (shardpilot/shardpilot-go#73 review).
+const capturedBodyMax = (1 << 20) + 1
 
 func (t *teeBody) Read(p []byte) (int, error) {
 	n, err := t.inner.Read(p)
-	if n > 0 && t.buf.Len() < capturedBodyMax {
+	if n > 0 {
 		room := capturedBodyMax - t.buf.Len()
 		if room > n {
 			room = n
 		}
-		t.buf.Write(p[:room])
+		if room > 0 {
+			t.buf.Write(p[:room])
+		}
+		if room < n {
+			// Bytes reached the SDK that this record does not hold. Saying so
+			// is the point: an incomplete copy presented as complete is the
+			// defect, not the incompleteness.
+			t.overflowed = true
+		}
 	}
 	if err != nil && err != io.EOF {
 		t.err = err
@@ -240,27 +265,61 @@ func sanitize(err error) string {
 	if err == nil {
 		return ""
 	}
-	out := err.Error()
+	return scrubSupplied(sanitizeText(err.Error()))
+}
+
+// sanitizeText redacts every query string in a piece of text, scanning FORWARD
+// past each replacement.
+//
+// The first version restarted from the beginning after each substitution, and
+// the `?` it had just processed was still there -- so it selected the same
+// marker again, and because the inserted text contains a space the next segment
+// was shorter each time while the string grew. On the very case this exists for,
+// a url.Error carrying a query, it never terminated
+// (shardpilot/shardpilot-go#73 review).
+func sanitizeText(out string) string {
+	var b strings.Builder
 	for {
 		i := strings.Index(out, "?")
 		if i < 0 {
-			return out
+			b.WriteString(out)
+			return b.String()
 		}
-		end := strings.IndexAny(out[i:], " \"")
 		seg := out[i:]
-		if end >= 0 {
-			seg = out[i : i+end]
+		if end := strings.IndexAny(seg, " \""); end >= 0 {
+			seg = seg[:end]
 		}
-		red := redactQuery("X " + seg)
-		red = strings.TrimPrefix(red, "X ")
-		if red == seg {
-			return out
-		}
-		out = out[:i] + red + out[i+len(seg):]
+		red := strings.TrimPrefix(redactQuery("X "+seg), "X ")
+		b.WriteString(out[:i])
+		b.WriteString(red)
+		out = out[i+len(seg):]
 	}
 }
 
 func env(name string) string { return strings.TrimSpace(os.Getenv(name)) }
+
+// suppliedValues are the identifying values this program handed the SDK. The
+// response echoes them -- an assignment body carries app_key, environment_key
+// and experiment_key -- so a 200 capture would republish through the RESPONSE
+// what the request dump redacts.
+//
+// Stated as a PROPERTY rather than as a list of echo fields: a value this
+// program supplied is never printed back, wherever it appears. A list of fields
+// to scrub is the same mistake as a list of query parameters to shorten, one
+// surface over, and this is the fourth road the same values have taken --
+// request line, error text, and now response body.
+var suppliedValues []string
+
+func scrubSupplied(text string) string {
+	for _, v := range suppliedValues {
+		if len(v) < 4 {
+			continue
+		}
+		text = strings.ReplaceAll(text, v,
+			fmt.Sprintf("<redacted, %d chars>", len(v)))
+	}
+	return text
+}
 
 func main() {
 	required := []string{
@@ -280,6 +339,11 @@ func main() {
 				"minting one is an owner action, not this program's.\n",
 			strings.Join(missing, ", "))
 		os.Exit(2)
+	}
+
+	suppliedValues = []string{
+		env("SP_API_KEY"), env("SP_WORKSPACE_ID"), env("SP_APP_ID"),
+		env("SP_ENVIRONMENT_ID"), env("SP_EXPERIMENT_KEY"),
 	}
 
 	rec := &recorder{inner: http.DefaultTransport}
@@ -347,10 +411,10 @@ func main() {
 			fmt.Printf("## Response%s — TRUNCATED, and the SDK was told so\n\n"+
 				"The body could not be read whole (%v). What arrived is below; it "+
 				"is NOT a complete response.\n\n```\n%s\n```\n\n",
-				label, sanitize(ex.truncErr()), strings.TrimRight(string(ex.resp()), "\r\n"))
+				label, sanitize(ex.truncErr()), scrubSupplied(strings.TrimRight(string(ex.resp()), "\r\n")))
 		default:
 			fmt.Printf("## Response%s\n\n```\n%s\n```\n\n",
-				label, strings.TrimRight(string(ex.resp()), "\r\n"))
+				label, scrubSupplied(strings.TrimRight(string(ex.resp()), "\r\n")))
 		}
 	}
 
@@ -368,10 +432,10 @@ func main() {
 
 	switch {
 	case last.transErr != nil:
-		fmt.Printf("\nNO RESPONSE. The SDK formed the request and nothing came " +
-			"back, so this run says nothing about what the endpoint would have " +
-			"answered.\n")
-		os.Exit(1)
+		fmt.Printf("\nNO RESPONSE (exit 3). The SDK formed the request and nothing " +
+			"came back, so this run says nothing about what the endpoint would " +
+			"have answered.\n")
+		os.Exit(3)
 	case last.truncErr() != nil:
 		fmt.Printf("\nRESPONSE TRUNCATED. The SDK was handed the error rather than " +
 			"the partial body, so nothing downstream mistook it for a complete " +
