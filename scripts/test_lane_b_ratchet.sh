@@ -103,7 +103,18 @@ if [ "$lane_b_am_clone" = no ]; then
     echo "  git status cannot see edits to those, so the dirty-tree guard above" >&2
     echo "  is not answering the question it appears to answer, and the clone" >&2
     echo "  would silently test HEAD instead of what you are holding." >&2
-    printf '%s\n' "$lane_b_flagged" | head -5 >&2
+    # ⚠ AND NOT `| head -5`, WHICH IS THE SHAPE THIS BLOCK EXISTS TO REMOVE.
+    # I fixed the `grep -q` above, swept the class, found a second instance in
+    # judge() -- and wrote a third one here, in the fix, on the line below the
+    # comment describing it. `head` exits after five lines, the builtin printf
+    # takes SIGPIPE, pipefail makes the harness die 141 before the `exit 2` that
+    # carries the refusal. No pipe: the shell reads its own string.
+    lane_b_shown=0
+    while IFS= read -r lane_b_line; do
+      [ "$lane_b_shown" -ge 5 ] && break
+      printf '  %s\n' "$lane_b_line" >&2
+      lane_b_shown=$((lane_b_shown + 1))
+    done <<< "$lane_b_flagged"
     exit 2
   fi
   lane_b_tmp_root="$(mktemp -d)"
@@ -199,7 +210,6 @@ WITH_BASE="$(git rev-parse HEAD)"
 WITHOUT_BASE="$(synth_target "")"
 
 checks=0; failures=0
-SAVED="$(mktemp)"; cp "$BASELINE" "$SAVED"
 
 # ⚠ FROM HEAD, NOT FROM THE INDEX. `git checkout -- <path>` restores from the
 # INDEX, and the cheat control below stages its own mutation, so an index-based
@@ -314,11 +324,28 @@ cleanup_dirs() {
 # input this harness has had to stop trusting, after LANE_B_BASELINE and
 # BASH_ENV. I introduced it while fixing a cleanup that only ran when nothing
 # went wrong.
+# ⚠ THE TRAP IS INSTALLED FIRST, AND THE COMMENT ABOVE ALREADY SAID SO. The
+# names were emptied before the trap could read them -- and then both scratch
+# roots were ALLOCATED above the trap line, so an INT/TERM between the two
+# `mktemp -d` calls, or a failure of the second under `set -e`, leaked the first
+# outside the throwaway clone where the parent's cleanup cannot reach it. The
+# lesson was written directly above the line that broke it; installing the trap
+# before any allocation is the version that does not depend on remembering it.
 STUB=""
+STUBDIR=""
 lane_b_scratch=""
+SAVED=""
+trap 'restore; cleanup_dirs; rm -f "$SAVED"' EXIT
+# ⚠ AND SAVED MOVED DOWN HERE FOR THE SAME REASON, FOUND BY THE SAME QUESTION.
+# It was allocated ninety-four lines above the trap that removes it -- the exact
+# shape of the finding about the scratch roots, in a temp FILE rather than a
+# temp directory, which is why looking for "where else is mktemp -d" would not
+# have found it. Looking for "where else does an allocation stand above its
+# trap" does. Nothing between the old site and here touches the baseline, so the
+# pristine copy is still pristine.
+SAVED="$(mktemp)"; cp "$BASELINE" "$SAVED"
 STUBDIR="$(mktemp -d)"
 lane_b_scratch="$(mktemp -d)"
-trap 'restore; cleanup_dirs; rm -f "$SAVED"' EXIT
 
 # judge <label> <rc> <want> <needle> <output> -- ONE judgement, every caller.
 # The two halves are reported separately and the exit is checked first, because
@@ -644,39 +671,68 @@ restore
 # filesystems: the put-in-place must stay a RENAME. Turn it into a copy or a
 # redirect -- the ordinary shape of a later tidy-up -- and the write goes
 # through the link. That is the mutant this control is driven against.
-lane_b_leafout="$(mktemp -d "$lane_b_scratch/XXXXXX")"
-printf 'PRECIOUS LEAF\n' > "$lane_b_leafout/target.txt"
-lane_b_leafstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
-{
-  echo '#!/bin/sh'
-  echo "REAL_LS=$(command -v ls)"
-  echo 'case "$*" in'
-  echo '  "-ld scripts/public-surface-lane-b-baseline.txt")'
-  echo '    rm -f scripts/public-surface-lane-b-baseline.txt 2>/dev/null'
-  echo "    ln -s $lane_b_leafout/target.txt scripts/public-surface-lane-b-baseline.txt 2>/dev/null"
-  echo '    ;;'
-  echo 'esac'
-  echo 'exec "$REAL_LS" "$@"'
-} > "$lane_b_leafstub/ls"
-chmod +x "$lane_b_leafstub/ls"
-checks=$((checks + 1))
-lane_b_leaf_rc=0
-lane_b_leaf_out="$(env "PATH=$lane_b_leafstub:$PATH" "$GATE" --write-baseline 2>&1)" || lane_b_leaf_rc=$?
-if [ "$(head -1 "$lane_b_leafout/target.txt")" != "PRECIOUS LEAF" ]; then
-  echo "FAIL [a leaf swapped in before the write is replaced, not followed]: the" >&2
-  echo "  baseline was written THROUGH the link, into the outside file." >&2
-  failures=$((failures + 1))
-elif [ "$lane_b_leaf_rc" -ne 0 ]; then
-  echo "FAIL [a leaf swapped in before the write is replaced, not followed]: exit $lane_b_leaf_rc, expected 0" >&2
-  printf '%s\n' "$lane_b_leaf_out" | sed 's/^/    /' >&2
-  failures=$((failures + 1))
-elif [ -L scripts/public-surface-lane-b-baseline.txt ]; then
-  echo "FAIL [a leaf swapped in before the write is replaced, not followed]: the" >&2
-  echo "  link is still standing at the baseline path after the write." >&2
-  failures=$((failures + 1))
-fi
-rm -rf "$lane_b_leafstub" "$lane_b_leafout"
-restore
+#
+# ⚠ AND THE MEASUREMENT ABOVE WAS UNDER-SAMPLED ON AN AXIS THE TABLE DID NOT
+# NAME. Two filesystems, and exactly ONE shape of target: a symlink to a regular
+# file. Varying the shape is the whole finding:
+#
+#   leaf -> regular file   mv     link replaced        outside intact
+#   leaf -> DIRECTORY      mv     link still standing  temp moved INSIDE it,
+#                                 and the gate printed WROTE and exited 0
+#   leaf -> dangling       mv     link replaced        outside intact
+#   all three              mv -T  link replaced        outside intact
+#
+# A table of results reads as the full list of axes varied. Mine listed
+# filesystems, so the shape of the target looked settled when it had never been
+# moved. The control now walks both shapes under one label, because a second
+# control with its own name would hide that this one was half an axis.
+for lane_b_shape in file dir; do
+  lane_b_leafout="$(mktemp -d "$lane_b_scratch/XXXXXX")"
+  printf 'PRECIOUS LEAF\n' > "$lane_b_leafout/target.txt"
+  mkdir -p "$lane_b_leafout/target.d"
+  if [ "$lane_b_shape" = file ]; then
+    lane_b_leaftgt="$lane_b_leafout/target.txt"
+  else
+    lane_b_leaftgt="$lane_b_leafout/target.d"
+  fi
+  lane_b_leafstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
+  {
+    echo '#!/bin/sh'
+    echo "REAL_LS=$(command -v ls)"
+    echo 'case "$*" in'
+    echo '  "-ld scripts/public-surface-lane-b-baseline.txt")'
+    echo '    rm -f scripts/public-surface-lane-b-baseline.txt 2>/dev/null'
+    echo "    ln -s $lane_b_leaftgt scripts/public-surface-lane-b-baseline.txt 2>/dev/null"
+    echo '    ;;'
+    echo 'esac'
+    echo 'exec "$REAL_LS" "$@"'
+  } > "$lane_b_leafstub/ls"
+  chmod +x "$lane_b_leafstub/ls"
+  checks=$((checks + 1))
+  lane_b_leaf_label="a leaf swapped in before the write is replaced, not followed (target: $lane_b_shape)"
+  lane_b_leaf_rc=0
+  lane_b_leaf_out="$(env "PATH=$lane_b_leafstub:$PATH" "$GATE" --write-baseline 2>&1)" || lane_b_leaf_rc=$?
+  lane_b_intruded="$(find "$lane_b_leafout/target.d" -mindepth 1 | wc -l)"
+  if [ "$(head -1 "$lane_b_leafout/target.txt")" != "PRECIOUS LEAF" ]; then
+    echo "FAIL [$lane_b_leaf_label]: the baseline was written THROUGH the link," >&2
+    echo "  into the outside file." >&2
+    failures=$((failures + 1))
+  elif [ "$lane_b_intruded" -ne 0 ]; then
+    echo "FAIL [$lane_b_leaf_label]: the rename treated the link as a DIRECTORY" >&2
+    echo "  and put the new baseline inside it, outside the worktree." >&2
+    failures=$((failures + 1))
+  elif [ "$lane_b_leaf_rc" -ne 0 ]; then
+    echo "FAIL [$lane_b_leaf_label]: exit $lane_b_leaf_rc, expected 0" >&2
+    printf '%s\n' "$lane_b_leaf_out" | sed 's/^/    /' >&2
+    failures=$((failures + 1))
+  elif [ -L scripts/public-surface-lane-b-baseline.txt ]; then
+    echo "FAIL [$lane_b_leaf_label]: the link is still standing at the baseline" >&2
+    echo "  path after the write." >&2
+    failures=$((failures + 1))
+  fi
+  rm -rf "$lane_b_leafstub" "$lane_b_leafout"
+  restore
+done
 
 # ⚠ THE RENAME FAILURE, BOUGHT BACK. The audit claimed the writer's guards were
 # covered; they were not. The serialisation control makes the REDIRECT fail and
@@ -705,17 +761,31 @@ restore
 # writing without having established the baseline has one name. A stub whose
 # `ls -ld` returns a non-numeric second field, deferring to the real one for
 # every other invocation.
-lane_b_lsstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
-{
-  echo '#!/bin/sh'
-  echo 'case " $* " in *public-surface-lane-b-baseline.txt*) echo "-rw-r--r-- ? nobody nobody 0 Jan 1 00:00 x"; exit 0 ;; esac'
-  echo "exec $(command -v ls) \"\$@\""
-} > "$lane_b_lsstub/ls"
-chmod +x "$lane_b_lsstub/ls"
-expect_env "an unreadable link count refuses" \
-  "PATH=$lane_b_lsstub:$PATH" 2 "could not read the hard-link count"
-rm -rf "$lane_b_lsstub"
-restore
+#
+# ⚠ AND IT HAS TWO FORMS OF INPUT, WHICH IS WHY IT IS EXTENDED RATHER THAN
+# JOINED BY A NEW CONTROL. The probe can LIE (exit 0, nonsense in field 2) or it
+# can FAIL (nonzero exit). Only the lie was driven, and the failure went to a
+# different place entirely: the assignment sits under errexit, so a failing `ls`
+# killed the gate with status 1 and no refusal at all. A second control with its
+# own name would have hidden that the first one was half an axis; the label
+# carries the form instead, so the pair reads as one guard with two points.
+for lane_b_form in nonnumeric probe-fails; do
+  lane_b_lsstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
+  {
+    echo '#!/bin/sh'
+    if [ "$lane_b_form" = nonnumeric ]; then
+      echo 'case " $* " in *public-surface-lane-b-baseline.txt*) echo "-rw-r--r-- ? nobody nobody 0 Jan 1 00:00 x"; exit 0 ;; esac'
+    else
+      echo 'case " $* " in *public-surface-lane-b-baseline.txt*) exit 1 ;; esac'
+    fi
+    echo "exec $(command -v ls) \"\$@\""
+  } > "$lane_b_lsstub/ls"
+  chmod +x "$lane_b_lsstub/ls"
+  expect_env "an unreadable link count refuses ($lane_b_form)" \
+    "PATH=$lane_b_lsstub:$PATH" 2 "could not read the hard-link count"
+  rm -rf "$lane_b_lsstub"
+  restore
+done
 
 # ⚠ TWO LEVERS, PERMISSIONS FIRST, EACH PROBED. The first version reached for
 # the immutable attribute because that is what works HERE, where the harness can
@@ -913,7 +983,7 @@ restore
 # this paragraph forbids, one line from where it forbids it, and passing every
 # healthy run because a stale expectation only shows up once some other count
 # disagrees.
-EXPECTED_CHECKS=29
+EXPECTED_CHECKS=31
 if [ "$checks" -ne "$EXPECTED_CHECKS" ]; then
   echo "REFUSING: $checks control(s) ran, expected exactly $EXPECTED_CHECKS" >&2
   exit 2

@@ -2505,7 +2505,24 @@ if [ -e "$LANE_B_BASELINE" ]; then
   # it: the other name changes too, and nothing here can put it back. `ls -ld`
   # field 2 is the link count on GNU and BSD alike; `stat` spells it differently
   # on each, and this gate documents bash 3.2 systems as supported.
-  lane_b_links="$(ls -ld "$LANE_B_BASELINE" 2>/dev/null | awk '{print $2}')"
+  # ⚠ THE PROBE CAN FAIL AS WELL AS LIE, AND ERREXIT WAS EATING THE FIRST. This
+  # assignment sits at the top level under `set -e` and `pipefail`: an `ls` that
+  # exits nonzero -- an I/O error, a permission failure, a stub -- aborted the
+  # gate with status 1 and NO refusal, before the case below could speak. The
+  # control added for this guard supplied a successful `ls` with nonnumeric
+  # output, so it exercised the lie and never the failure: the same
+  # one-shape-of-input gap the guard itself was bought back for.
+  set +e
+  lane_b_links="$(ls -ld "$LANE_B_BASELINE" 2>/dev/null | awk '{print $2}'; exit "${PIPESTATUS[0]}")"
+  lane_b_links_st=$?
+  set -e
+  if [ "$lane_b_links_st" -ne 0 ]; then
+    # refusal:structural
+    echo "REFUSING: could not read the hard-link count of $LANE_B_BASELINE." >&2
+    echo "  The probe itself failed (exit $lane_b_links_st), so the gate cannot" >&2
+    echo "  establish that the baseline has only one name." >&2
+    exit 2
+  fi
   case "${lane_b_links:-}" in
     ''|*[!0-9]*)
       # refusal:structural
@@ -2574,7 +2591,45 @@ if [ "${1:-}" = "--write-baseline" ]; then
       exit 2
     fi
     lane_b_leaf="$(basename "$LANE_B_BASELINE")"
-    lane_b_tmp="$lane_b_leaf.tmp.$$"
+    # ⚠ THE WRITE-ASIDE IS A PATH TOO, AND NOTHING ABOVE CHECKS IT. Every guard
+    # so far inspects the BASELINE leaf -- symlink, regular file, link count. The
+    # temporary had a predictable name and was opened with an ordinary redirect,
+    # so a symlink planted at that name is followed: the redirect truncates
+    # whatever it points at, and the rename then installs the symlink as the
+    # baseline while the gate prints WROTE. Measured, by what stands at the path:
+    #
+    #   plain  > t   with t -> outside.txt     the outside file was TRUNCATED
+    #   set -C > t   nothing at the path       rc 0
+    #   set -C > t   regular / symlink-to-file / symlink-to-dir / dangling
+    #                                          rc 1, outside file intact
+    #
+    # `set -C` makes bash open with O_CREAT|O_EXCL, and O_EXCL refuses a symlink,
+    # even a dangling one -- so the open IS the check, with no window between
+    # them. The random suffix is not the guarantee, only a way to stop a blind
+    # pre-creation from turning every write into a refusal.
+    lane_b_tmp="$lane_b_leaf.tmp.$$.${RANDOM}${RANDOM}"
+    #
+    # Opened ONCE, in this shell, and its status read. A probe in a subshell
+    # would create the file and then make the real open fail on its own probe --
+    # and a failed `exec` redirect does not abort the shell when its status is
+    # taken (measured: the check below is reached, rc 0), so this needs no
+    # errexit gymnastics.
+    lane_b_aside=yes
+    set -C
+    exec 9>"$lane_b_tmp" 2>/dev/null || lane_b_aside=no
+    set +C
+    if [ "$lane_b_aside" = no ]; then
+      # refusal:structural
+      echo "REFUSING: could not write the baseline (serialisation failed)." >&2
+      if [ -e "$lane_b_tmp" ] || [ -L "$lane_b_tmp" ]; then
+        echo "  Something already stands at the write-aside path. An exclusive" >&2
+        echo "  create refuses it rather than writing through whatever it" >&2
+        echo "  points at, so nothing outside this directory was touched." >&2
+      else
+        echo "  The directory would not accept a new file." >&2
+      fi
+      exit 2
+    fi
   {
     echo "# Lane B occurrences per file, as of the commit that wrote this."
     echo "# Written by: scripts/check_public_surface.sh --write-baseline"
@@ -2595,7 +2650,7 @@ if [ "${1:-}" = "--write-baseline" ]; then
     echo "# because the layout changed -- reading a format-2 file with this"
     echo "# parser would understate every count that has such a line."
     printf '%s\n' "$lane_b_now"
-  } > "$lane_b_tmp" || {
+  } >&9 || {
     # ⚠ WRITTEN ASIDE AND CHECKED, NOT REDIRECTED STRAIGHT AT THE BASELINE. A
     # serialisation that dies partway -- ENOSPC, a quota, a full pipe -- leaves a
     # SHORT file, and a rename succeeds on it just as happily as on a whole one.
@@ -2610,10 +2665,50 @@ if [ "${1:-}" = "--write-baseline" ]; then
     # naming where the failure is silent and the consequence is a wrong number.
     echo "REFUSING: could not write the baseline (serialisation failed)." >&2
     echo "  The partial file is removed rather than renamed into place." >&2
+    exec 9>&-
     rm -f "$lane_b_tmp"
     exit 2
   }
-    mv -f "$lane_b_tmp" "$lane_b_leaf" || {
+  exec 9>&-
+    # ⚠ -T, AND THE REASON IS AN AXIS I MEASURED WITHOUT VARYING. Last round I
+    # recorded that `mv` renames over the destination NAME and does not follow a
+    # symlink standing there. That was measured on two filesystems and ONE shape
+    # of target -- a symlink to a regular file. Varying the shape:
+    #
+    #   leaf -> regular file   rc 0   link replaced        outside intact
+    #   leaf -> DIRECTORY      rc 0   link still standing  temp moved INSIDE it
+    #   leaf -> dangling       rc 0   link replaced        outside intact
+    #
+    # so with a symlink to a directory the gate printed WROTE and exited 0 while
+    # the baseline was never written. `-T` treats the destination as a normal
+    # file in all three shapes. Measured with -T: link replaced every time, the
+    # outside copy intact every time.
+    #
+    # And the option is PROBED rather than assumed, because it is a GNU
+    # extension: a real rename in the held directory, not a scrape of --help.
+    # Where it is missing the gate refuses instead of falling back to semantics
+    # it has just measured to be unsafe.
+    lane_b_tprobe=".lane_b_rename_probe.$$.${RANDOM}${RANDOM}"
+    lane_b_have_T=no
+    if : > "$lane_b_tprobe" 2>/dev/null; then
+      if mv -fT "$lane_b_tprobe" "$lane_b_tprobe.dst" 2>/dev/null; then
+        lane_b_have_T=yes
+        rm -f "$lane_b_tprobe.dst"
+      else
+        rm -f "$lane_b_tprobe"
+      fi
+    fi
+    if [ "$lane_b_have_T" != yes ]; then
+      # refusal:structural
+      echo "REFUSING: this mv has no --no-target-directory." >&2
+      echo "  Without it, a symlink to a directory at the baseline path makes" >&2
+      echo "  the rename move the new baseline INSIDE that directory while this" >&2
+      echo "  gate reports success. Refusing to write rather than report a write" >&2
+      echo "  that did not happen." >&2
+      rm -f "$lane_b_tmp"
+      exit 2
+    fi
+    mv -fT "$lane_b_tmp" "$lane_b_leaf" || {
       echo "REFUSING: could not put the new baseline in place." >&2
       rm -f "$lane_b_tmp"
       exit 2
