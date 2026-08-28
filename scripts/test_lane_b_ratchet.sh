@@ -127,7 +127,31 @@ if [ "$lane_b_am_clone" = no ]; then
     echo "REFUSING: could not clone this repository to run against." >&2
     exit 2
   fi
-  printf '%s\n' "$lane_b_tmp_root/repo" > "$lane_b_tmp_root/.lane-b-harness-clone"
+  # ⚠ THE MARKER IS WRITTEN IN THE SPELLING THE CHILD WILL COMPUTE, AND THEN
+  # READ BACK. `mktemp` hands out whatever TMPDIR is spelled as; the child
+  # resolves its own root with `cd -P`, so a symlinked ancestor made the two
+  # differ -- and a child that does not recognise itself CLONES AGAIN, at every
+  # level, until the machine runs out. Not hypothetical: /tmp is a symlink to
+  # /private/tmp on macOS, which is where the lanes run. It is NOT a symlink on
+  # this Linux container, which is exactly why I could not have met it here.
+  #
+  #   the cure for a degree of freedom introduced a comparison,
+  #   and a comparison has a canonical form.
+  #
+  # The variable this replaced needed no canonicalisation, because it carried no
+  # path. So the fix is checked the only way that survives a later edit: compute
+  # the child's own answer the way the child computes it, write THAT, then read
+  # it back and refuse if they disagree. A mismatch becomes a refusal at the
+  # point of disagreement instead of a run that looks hung.
+  lane_b_child_here="$(cd -P "$lane_b_tmp_root/repo" && cd -P "$(git rev-parse --show-toplevel)" && pwd -P)"
+  lane_b_child_marker="$(dirname "$lane_b_child_here")/.lane-b-harness-clone"
+  printf '%s\n' "$lane_b_child_here" > "$lane_b_child_marker"
+  if [ "$(cat "$lane_b_child_marker" 2>/dev/null)" != "$lane_b_child_here" ]; then
+    echo "REFUSING: the clone marker does not name the clone as the child will" >&2
+    echo "  resolve it, so the child would not recognise itself and would clone" >&2
+    echo "  again, and again. Refusing here rather than recursing." >&2
+    exit 2
+  fi
   # ⚠ THE CHILD IS WAITED ON, NOT JUST RUN, SO AN INTERRUPT CAN BE HANDLED.
   # Measured, because the obvious version leaks: with the child in the
   # foreground, a TERM to this process removes the clone root while the child is
@@ -135,10 +159,21 @@ if [ "$lane_b_am_clone" = no ]; then
   # populated, and an interrupted run leaves a clone root behind. Backgrounding
   # it and waiting means the signal handler can end the child FIRST and then
   # remove the root once nothing is writing to it.
+  #
+  # ⚠ AND THE HANDLERS ARE ARMED BEFORE THE CHILD IS RUNNABLE, not after. They
+  # were installed on the two lines following the launch, which leaves a window
+  # where a signal finds only the EXIT cleanup armed: the parent then removes the
+  # clone root without killing or waiting for a child that is already running in
+  # it. That is the same half-populated root the backgrounding was added to
+  # prevent -- third instance this round of "install it before you need it", and
+  # the third one inside my own fix for the previous one. An empty PID is the
+  # initialised state, and the handler tolerates it.
+  lane_b_child=""
+  lane_b_end_child='if [ -n "$lane_b_child" ]; then kill "$lane_b_child" 2>/dev/null || true; wait "$lane_b_child" 2>/dev/null || true; fi; rm -rf "$lane_b_tmp_root";'
+  trap "$lane_b_end_child exit 130" INT
+  trap "$lane_b_end_child exit 143" TERM
   "$lane_b_tmp_root/repo/scripts/test_lane_b_ratchet.sh" &
   lane_b_child=$!
-  trap 'kill "$lane_b_child" 2>/dev/null || true; wait "$lane_b_child" 2>/dev/null || true; rm -rf "$lane_b_tmp_root"; exit 130' INT
-  trap 'kill "$lane_b_child" 2>/dev/null || true; wait "$lane_b_child" 2>/dev/null || true; rm -rf "$lane_b_tmp_root"; exit 143' TERM
   lane_b_child_rc=0
   wait "$lane_b_child" || lane_b_child_rc=$?
   exit "$lane_b_child_rc"
@@ -618,11 +653,12 @@ printf 'PRECIOUS OUTSIDE\n' > "$lane_b_outside/scripts/public-surface-lane-b-bas
 lane_b_swapstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
 {
   echo '#!/bin/sh'
-  echo "REAL_MV=$(command -v mv)"
+  printf 'REAL_MV=%q\n' "$(command -v mv)"
   echo 'case " $* " in'
   echo '  *public-surface-lane-b-baseline.txt.tmp.*)'
-  echo "    \"\$REAL_MV\" $PWD/scripts $PWD/scripts.real 2>/dev/null"
-  echo "    ln -s $lane_b_outside/scripts $PWD/scripts 2>/dev/null"
+  printf '    "$REAL_MV" %q %q 2>/dev/null &&\n' "$PWD/scripts" "$PWD/scripts.real"
+  printf '      ln -s %q %q 2>/dev/null &&\n' "$lane_b_outside/scripts" "$PWD/scripts"
+  printf '      : > %q\n' "$lane_b_outside/.hook-fired"
   echo '    ;;'
   echo 'esac'
   echo 'exec "$REAL_MV" "$@"'
@@ -632,7 +668,19 @@ checks=$((checks + 1))
 lane_b_anchor_out="$(env "PATH=$lane_b_swapstub:$PATH" "$GATE" --write-baseline 2>&1)" || lane_b_anchor_rc=$?
 rm -f scripts 2>/dev/null || true
 [ -d scripts.real ] && mv scripts.real scripts
-if [ "$(head -1 "$lane_b_outside/scripts/public-surface-lane-b-baseline.txt")" != "PRECIOUS OUTSIDE" ]; then
+# ⚠ AND THE SCENE ASSERTS THAT IT HAPPENED. Every mutation in that hook is
+# `2>/dev/null` with its status discarded, so a hook that silently did nothing --
+# a path with a space splitting the arguments, which is exactly how this was
+# found -- left the gate running normally, the outside copy untouched, and this
+# control reporting a pass for a swap that never occurred. The paths are quoted
+# with %q now, and the hook records that it fired; a scene that did not happen
+# fails rather than passes, the same rule as must_write_baseline.
+if [ ! -e "$lane_b_outside/.hook-fired" ]; then
+  echo "FAIL [the held cwd survives a parent swapped after anchoring]: the hook" >&2
+  echo "  never fired, so this control would have passed without swapping" >&2
+  echo "  anything. The scene was not established." >&2
+  failures=$((failures + 1))
+elif [ "$(head -1 "$lane_b_outside/scripts/public-surface-lane-b-baseline.txt")" != "PRECIOUS OUTSIDE" ]; then
   echo "FAIL [the held cwd survives a parent swapped after anchoring]: the write" >&2
   echo "  followed the replacement instead of the held directory." >&2
   failures=$((failures + 1))
@@ -712,11 +760,12 @@ for lane_b_shape in file dir; do
   lane_b_leafstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
   {
     echo '#!/bin/sh'
-    echo "REAL_LS=$(command -v ls)"
+    printf 'REAL_LS=%q\n' "$(command -v ls)"
     echo 'case "$*" in'
     echo '  "-ld scripts/public-surface-lane-b-baseline.txt")'
     echo '    rm -f scripts/public-surface-lane-b-baseline.txt 2>/dev/null'
-    echo "    ln -s $lane_b_leaftgt scripts/public-surface-lane-b-baseline.txt 2>/dev/null"
+    printf '    ln -s %q scripts/public-surface-lane-b-baseline.txt 2>/dev/null &&\n' "$lane_b_leaftgt"
+    printf '      : > %q\n' "$lane_b_leafout/.hook-fired"
     echo '    ;;'
     echo 'esac'
     echo 'exec "$REAL_LS" "$@"'
@@ -727,7 +776,11 @@ for lane_b_shape in file dir; do
   lane_b_leaf_rc=0
   lane_b_leaf_out="$(env "PATH=$lane_b_leafstub:$PATH" "$GATE" --write-baseline 2>&1)" || lane_b_leaf_rc=$?
   lane_b_intruded="$(find "$lane_b_leafout/target.d" -mindepth 1 | wc -l)"
-  if [ "$(head -1 "$lane_b_leafout/target.txt")" != "PRECIOUS LEAF" ]; then
+  if [ ! -e "$lane_b_leafout/.hook-fired" ]; then
+    echo "FAIL [$lane_b_leaf_label]: the hook never fired, so this control would" >&2
+    echo "  have passed without planting a link. The scene was not established." >&2
+    failures=$((failures + 1))
+  elif [ "$(head -1 "$lane_b_leafout/target.txt")" != "PRECIOUS LEAF" ]; then
     echo "FAIL [$lane_b_leaf_label]: the baseline was written THROUGH the link," >&2
     echo "  into the outside file." >&2
     failures=$((failures + 1))
@@ -761,7 +814,7 @@ lane_b_mvstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
 {
   echo '#!/bin/sh'
   echo 'case " $* " in *public-surface-lane-b-baseline.txt.tmp.*) exit 1 ;; esac'
-  echo "exec $(command -v mv) \"\$@\""
+  printf 'exec %q "$@"\n' "$(command -v mv)"
 } > "$lane_b_mvstub/mv"
 chmod +x "$lane_b_mvstub/mv"
 expect_env "a failed rename refuses" \
@@ -780,7 +833,7 @@ lane_b_notstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
 {
   echo '#!/bin/sh'
   echo 'for a in "$@"; do case "$a" in -*T*) exit 1 ;; esac; done'
-  echo "exec $(command -v mv) \"\$@\""
+  printf 'exec %q "$@"\n' "$(command -v mv)"
 } > "$lane_b_notstub/mv"
 chmod +x "$lane_b_notstub/mv"
 expect_env "an mv without --no-target-directory refuses" \
@@ -802,7 +855,7 @@ rm -rf "$lane_b_notstub"
 lane_b_cdstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
 {
   echo '#!/bin/sh'
-  echo "REAL_LS=$(command -v ls)"
+  printf 'REAL_LS=%q\n' "$(command -v ls)"
   echo 'case "$*" in'
   echo '  "-ld scripts/public-surface-lane-b-baseline.txt")'
   echo '    out="$("$REAL_LS" "$@" 2>&1)"; st=$?'
@@ -847,7 +900,7 @@ for lane_b_form in nonnumeric probe-fails; do
     else
       echo 'case " $* " in *public-surface-lane-b-baseline.txt*) exit 1 ;; esac'
     fi
-    echo "exec $(command -v ls) \"\$@\""
+    printf 'exec %q "$@"\n' "$(command -v ls)"
   } > "$lane_b_lsstub/ls"
   chmod +x "$lane_b_lsstub/ls"
   expect_env "an unreadable link count refuses ($lane_b_form)" \
@@ -982,7 +1035,7 @@ REAL_GREP="$(command -v grep)"
 {
   echo '#!/bin/sh'
   echo 'case " $* " in *" -aonE "*|*" -aoniE "*) exit 2 ;; esac'
-  echo "exec $REAL_GREP \"\$@\""
+  printf 'exec %q "$@"\n' "$REAL_GREP"
 } > "$STUB/grep"
 chmod +x "$STUB/grep"
 expect_env "an unreadable occurrence pass refuses" \
