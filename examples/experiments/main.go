@@ -97,6 +97,30 @@ func (e *exchange) resp() []byte {
 	return append(append([]byte{}, e.head...), e.body()...)
 }
 
+// dropFraming removes Content-Length from a recorded response.
+//
+// Redaction replaces identifiers with longer placeholders, so the recorded
+// length stops describing the recorded body: a parser honouring it would stop
+// inside the redacted text or read the remainder as trailing data, and the
+// artifact would not be a valid HTTP response at all -- which defeats the point
+// of keeping one (shardpilot/shardpilot-go#73 review).
+//
+// REMOVED rather than recomputed. A recomputed length would describe the
+// redacted body and quietly assert that this is what arrived; the header is
+// dropped and its absence says the body was altered, which is the true thing.
+func dropFraming(dump string) string {
+	lines := strings.Split(dump, "\n")
+	out := make([]string, 0, len(lines))
+	for _, l := range lines {
+		if strings.HasPrefix(strings.ToLower(l), "content-length:") {
+			out = append(out, "X-Capture-Note: Content-Length removed — the body below is redacted")
+			continue
+		}
+		out = append(out, l)
+	}
+	return strings.Join(out, "\n")
+}
+
 type recorder struct {
 	inner     http.RoundTripper
 	exchanges []exchange
@@ -312,13 +336,49 @@ var suppliedValues []string
 
 func scrubSupplied(text string) string {
 	for _, v := range suppliedValues {
-		if len(v) < 4 {
+		if v == "" {
 			continue
 		}
-		text = strings.ReplaceAll(text, v,
-			fmt.Sprintf("<redacted, %d chars>", len(v)))
+		text = replaceValue(text, v)
 	}
 	return text
+}
+
+// replaceValue redacts every occurrence of v. A long value is replaced outright;
+// a SHORT one only where it stands as a whole token, because the SDK validates
+// these fields as non-empty and nothing more -- an experiment key may legally be
+// `ab`, and the first version skipped anything under four characters, printing
+// exactly those verbatim in the response it calls publishable
+// (shardpilot/shardpilot-go#73 review). Blind substring replacement of `ab`
+// would instead corrupt unrelated words, so short values are matched at
+// boundaries and long ones are not.
+func replaceValue(text, v string) string {
+	red := fmt.Sprintf("<redacted, %d chars>", len(v))
+	if len(v) >= 8 {
+		return strings.ReplaceAll(text, v, red)
+	}
+	var b strings.Builder
+	for {
+		i := strings.Index(text, v)
+		if i < 0 {
+			b.WriteString(text)
+			return b.String()
+		}
+		endOK := i+len(v) >= len(text) || !isWordByte(text[i+len(v)])
+		startOK := i == 0 || !isWordByte(text[i-1])
+		b.WriteString(text[:i])
+		if startOK && endOK {
+			b.WriteString(red)
+		} else {
+			b.WriteString(v)
+		}
+		text = text[i+len(v):]
+	}
+}
+
+func isWordByte(c byte) bool {
+	return c == '_' || c == '-' ||
+		(c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 }
 
 func main() {
@@ -411,10 +471,10 @@ func main() {
 			fmt.Printf("## Response%s — TRUNCATED, and the SDK was told so\n\n"+
 				"The body could not be read whole (%v). What arrived is below; it "+
 				"is NOT a complete response.\n\n```\n%s\n```\n\n",
-				label, sanitize(ex.truncErr()), scrubSupplied(strings.TrimRight(string(ex.resp()), "\r\n")))
+				label, sanitize(ex.truncErr()), dropFraming(scrubSupplied(strings.TrimRight(string(ex.resp()), "\r\n"))))
 		default:
 			fmt.Printf("## Response%s\n\n```\n%s\n```\n\n",
-				label, scrubSupplied(strings.TrimRight(string(ex.resp()), "\r\n")))
+				label, dropFraming(scrubSupplied(strings.TrimRight(string(ex.resp()), "\r\n"))))
 		}
 	}
 
@@ -423,8 +483,17 @@ func main() {
 	fmt.Printf("    attempts: %d\n", len(rec.exchanges))
 	fmt.Printf("    status:   %d\n", last.status)
 	fmt.Printf("    assigned: %t\n", result.Assigned)
-	fmt.Printf("    variant:  %q\n", result.VariantKey)
-	fmt.Printf("    reason:   %q\n", result.Reason)
+	// Scrubbed like everything else: a variant key may legally equal a supplied
+	// identifier -- an experiment and a variant both named `control` is a valid
+	// response -- and the property is that a supplied value is never printed
+	// back WHEREVER it appears, not only in the body.
+	fmt.Printf("    variant:  %q\n", scrubSupplied(result.VariantKey))
+	fmt.Printf("    reason:   %q\n", scrubSupplied(result.Reason))
+	// The SDK's own classification. A 404 returns a usable result with
+	// Code "not_found", Assigned false and a NIL error, so omitting this showed
+	// only zero-valued fields and then called the run generically not-served --
+	// losing the first-class verdict this program exists to report.
+	fmt.Printf("    code:     %q\n", scrubSupplied(result.Code))
 	fmt.Printf("    version:  %d\n", result.Version)
 	if fetchErr != nil {
 		fmt.Printf("    error:    %s\n", sanitize(fetchErr))
@@ -437,10 +506,10 @@ func main() {
 			"have answered.\n")
 		os.Exit(3)
 	case last.truncErr() != nil:
-		fmt.Printf("\nRESPONSE TRUNCATED. The SDK was handed the error rather than " +
-			"the partial body, so nothing downstream mistook it for a complete " +
-			"answer.\n")
-		os.Exit(1)
+		fmt.Printf("\nRESPONSE TRUNCATED (exit 3). The SDK read its own response and " +
+			"the body did not arrive whole; what it did read is above, and it is not " +
+			"a complete answer.\n")
+		os.Exit(3)
 	case last.status == http.StatusOK && fetchErr == nil:
 		fmt.Printf("\nSERVED. The pair above is the capture.\n")
 		os.Exit(0)
