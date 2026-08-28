@@ -27,15 +27,55 @@ func TestDropFramingStopsAtTheHeaderBlock(t *testing.T) {
 	}
 }
 
-func TestForFenceKeepsTheMessageTerminator(t *testing.T) {
+func TestFencedBlockDoesNotAlterTheMessage(t *testing.T) {
 	req := "GET /x HTTP/1.1\r\nHost: h\r\n\r\n"
-	got := forFence(req)
-	if !strings.HasSuffix(got, "\r\n\r\n") {
-		t.Fatalf("the header terminator was removed: %q", got)
+	got := fencedBlock(req)
+	if !strings.Contains(got, req) {
+		t.Fatalf("the message was altered inside the fence: %q", got)
 	}
-	// A body already ending in a newline must not gain a second one.
-	if forFence("a\n") != "a\n" {
-		t.Fatalf("forFence added a newline to text that had one")
+	// Compact JSON has no trailing newline, and the block must not invent one
+	// INSIDE the fence -- with framing removed a parser would read it as payload.
+	body := "HTTP/1.1 200 OK\r\n\r\n{\"a\":1}"
+	gotB := fencedBlock(body)
+	if !strings.Contains(gotB, body+"\n```") && !strings.Contains(gotB, body+"\n") {
+		t.Fatalf("body not present verbatim: %q", gotB)
+	}
+	if !strings.Contains(gotB, "does not end with a newline") {
+		t.Fatal("the manufactured separator was not disclosed to the reader")
+	}
+}
+
+func TestGuardDoesNotRefuseALegalShortKeyInProse(t *testing.T) {
+	suppliedValues = []string{"a"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// The SDK accepts any non-empty experiment key. Ordinary report prose
+	// contains the letter inside words, and that is not an occurrence.
+	if err := assertNoLeak("# assignment capture — 2026-08-29\n"); err != nil {
+		t.Fatalf("the guard refused a valid run over prose: %v", err)
+	}
+	// A whole-token occurrence is still a leak.
+	if err := assertNoLeak("experiment_key=a&x=1"); err == nil {
+		t.Fatal("the guard missed a short value standing as its own token")
+	}
+}
+
+func TestGuardDecodesSurrogatePairs(t *testing.T) {
+	suppliedValues = []string{"a\U0001F600b"}
+	t.Cleanup(func() { suppliedValues = nil })
+	esc := `{"k":"a` + "\\ud83d\\ude00" + `b"}`
+	if err := assertNoLeak(esc); err == nil {
+		t.Fatalf("a surrogate-pair spelling was not decoded: %q", esc)
+	}
+}
+
+func TestTrailerReportIsOutsideTheMessage(t *testing.T) {
+	tee := &teeBody{trailer: http.Header{"X-Late": []string{"value"}}}
+	ex := exchange{head: []byte("HTTP/1.1 200 OK\r\n\r\n"), captured: tee}
+	if strings.Contains(string(ex.resp()), "X-Late") {
+		t.Fatal("trailers were appended into the HTTP message body")
+	}
+	if !strings.Contains(ex.trailerReport(), "X-Late: value") {
+		t.Fatal("trailers were dropped instead of being reported beside the message")
 	}
 }
 
@@ -98,7 +138,7 @@ func TestBodyAtTheReadCeilingIsReportedIncomplete(t *testing.T) {
 	}
 }
 
-func TestTrailersAppearAfterTheBody(t *testing.T) {
+func TestTrailersAreSnapshotAtEOFNotFromTheHead(t *testing.T) {
 	resp := &http.Response{Trailer: http.Header{}}
 	tee := &teeBody{inner: io.NopCloser(strings.NewReader("BODY")), resp: resp}
 	buf := make([]byte, 8)
@@ -110,15 +150,15 @@ func TestTrailersAppearAfterTheBody(t *testing.T) {
 		if err != nil {
 			t.Fatalf("read: %v", err)
 		}
-		// The trailer values arrive with the last chunk, not with the head.
+		// The values arrive with the last chunk, not with the head, so a
+		// snapshot taken when the head was dumped would see nothing.
 		resp.Trailer.Set("X-Late", "value")
 	}
 	ex := exchange{head: []byte("HTTP/1.1 200 OK\r\nTrailer: X-Late\r\n\r\n"), captured: tee}
-	got := string(ex.resp())
-	if !strings.Contains(got, "X-Late: value") {
-		t.Fatalf("a declared trailer was announced and then omitted: %q", got)
+	if !strings.Contains(ex.trailerReport(), "X-Late: value") {
+		t.Fatal("a declared trailer was announced and then omitted")
 	}
-	if strings.Index(got, "X-Late: value") < strings.Index(got, "BODY") {
-		t.Fatalf("the trailer was placed before the body: %q", got)
+	if strings.Contains(string(ex.resp()), "X-Late: value") {
+		t.Fatal("the trailer was written into the HTTP message instead of beside it")
 	}
 }

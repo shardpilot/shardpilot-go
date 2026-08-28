@@ -31,6 +31,14 @@
 //	   a truncated body, or a deadline. Distinct from 1 on purpose: 1 says the
 //	   endpoint answered and the answer is in the record, and an incomplete run
 //	   reported as 1 would be read as a refusal that was never observed.
+//	4  THE RECORD WAS NOT PUBLISHED. Either a supplied value survived redaction
+//	   in some encoding and the report was withheld, or the report could not be
+//	   written whole. Nothing is claimed about the exchange: it may have been a
+//	   perfect 200. This is a failure OF THE RECORDER, kept distinct from 3 --
+//	   which is a failure of the exchange -- because the remedies differ and a
+//	   consumer reads these codes rather than the prose. Added when the leak
+//	   guard landed, which had been returning an undocumented status
+//	   (shardpilot/shardpilot-go#73 review).
 package main
 
 import (
@@ -49,6 +57,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf16"
 
 	shardpilot "github.com/shardpilot/shardpilot-go"
 )
@@ -101,19 +110,34 @@ func (e *exchange) resp() []byte {
 	if e.head == nil {
 		return nil
 	}
-	out := append(append([]byte{}, e.head...), e.body()...)
+	return append(append([]byte{}, e.head...), e.body()...)
+}
+
+// trailerReport renders captured trailers as REPORT METADATA, outside the HTTP
+// message entirely.
+//
+// ⚠ THE FIRST FIX APPENDED THEM TO THE BODY. With the framing headers removed,
+// a parser reads a close-delimited body, so the capture note and the trailer
+// lines became payload: the artifact both altered the body the SDK received and
+// still did not represent trailers semantically -- and HTTP/2 trailers are a
+// separate header block in any case (shardpilot/shardpilot-go#73 review). The
+// fenced block is now exactly the bytes; everything the report adds lives
+// outside it.
+func (e *exchange) trailerReport() string {
 	if e.captured == nil || len(e.captured.trailer) == 0 {
-		return out
+		return ""
 	}
-	// Appended AFTER the body, where the wire carries them, and labelled so the
-	// block is not read as a second header section.
-	out = append(out, []byte("\r\nX-Capture-Note: trailer fields, received after the body\r\n")...)
+	var b strings.Builder
+	b.WriteString("Trailer fields, received after the body and recorded here rather than\n" +
+		"inside the message above, because the framing that carries them is not in\n" +
+		"the decoded bytes:\n\n")
 	for _, k := range slices.Sorted(maps.Keys(e.captured.trailer)) {
 		for _, v := range e.captured.trailer[k] {
-			out = append(out, []byte(k+": "+v+"\r\n")...)
+			fmt.Fprintf(&b, "    %s: %s\n", k, scrubSupplied(v))
 		}
 	}
-	return out
+	b.WriteString("\n")
+	return b.String()
 }
 
 // dropFraming removes Content-Length from a recorded response.
@@ -134,8 +158,13 @@ func (e *exchange) resp() []byte {
 // and let the remainder appear as report prose -- forged verdict sections in an
 // artifact whose whole purpose is to be published
 // (shardpilot/shardpilot-go#73 review).
-// forFence guarantees a trailing newline so a fence closes on its own line, and
-// changes nothing else.
+// forFence is GONE as a content transform. See fencedBlock: the newline a
+// Markdown fence needs is emitted by the printer, outside the content, and the
+// report says so when the content did not end with one.
+//
+// The retired comment, kept because the defect it records is easy to reintroduce:
+// forFence guaranteed a trailing newline so a fence closes on its own line, and
+// changed nothing else.
 //
 // ⚠ IT REPLACES A TrimRight THAT DELETED THE HTTP MESSAGE TERMINATOR. Every
 // bodyless GET dump ends with the required CRLF CRLF; trimming "\r\n" removed
@@ -143,11 +172,23 @@ func (e *exchange) resp() []byte {
 // did not recreate it -- so a strict parser reached unexpected EOF after the
 // last header, and legitimate trailing newlines were stripped from response
 // bodies too (shardpilot/shardpilot-go#73 review).
-func forFence(content string) string {
+// fencedBlock renders content inside a Markdown fence WITHOUT altering it.
+//
+// ⚠ ITS PREDECESSOR APPENDED A NEWLINE WHEN THE CONTENT LACKED ONE -- the normal
+// shape for compact JSON. With the framing headers removed, a parser reads the
+// recorded response as close-delimited, so that manufactured byte became payload
+// and the artifact no longer held the body the SDK received
+// (shardpilot/shardpilot-go#73 review). The newline a fence needs is the
+// PRINTER'S, and when it is not part of the content the report says so on the
+// line after the block.
+func fencedBlock(content string) string {
+	f := fenceFor(content)
 	if strings.HasSuffix(content, "\n") {
-		return content
+		return f + "\n" + content + f + "\n"
 	}
-	return content + "\n"
+	return f + "\n" + content + "\n" + f + "\n" +
+		"*(The content above does not end with a newline; the one before the closing\n" +
+		"fence is Markdown's, not the message's.)*\n"
 }
 
 func fenceFor(content string) string {
@@ -513,7 +554,7 @@ func assertNoLeak(text string) error {
 			continue
 		}
 		for _, f := range forms {
-			if strings.Contains(f, v) {
+			if containsValue(f, v) {
 				return fmt.Errorf(
 					"a supplied value of %d characters survived redaction in some "+
 						"encoding; the record is NOT publishable and was not printed",
@@ -550,6 +591,21 @@ func undoUnicodeEscapes(text string) string {
 	for i := 0; i < len(text); i++ {
 		if text[i] == '\\' && i+5 < len(text) && (text[i+1] == 'u' || text[i+1] == 'U') {
 			if r, err := strconv.ParseUint(text[i+2:i+6], 16, 32); err == nil {
+				// A NON-BMP CHARACTER IS SPELLED AS A SURROGATE PAIR, and writing
+				// the halves separately yields two replacement runes instead of the
+				// character -- so an identifier containing one was invisible to this
+				// decoder and to the guard behind it
+				// (shardpilot/shardpilot-go#73 review).
+				if utf16.IsSurrogate(rune(r)) && i+11 < len(text) &&
+					text[i+6] == '\\' && (text[i+7] == 'u' || text[i+7] == 'U') {
+					if lo, err2 := strconv.ParseUint(text[i+8:i+12], 16, 32); err2 == nil {
+						if dec := utf16.DecodeRune(rune(r), rune(lo)); dec != 0xFFFD {
+							b.WriteRune(dec)
+							i += 11
+							continue
+						}
+					}
+				}
 				b.WriteRune(rune(r))
 				i += 5
 				continue
@@ -576,6 +632,38 @@ func undoUnicodeEscapes(text string) string {
 // (shardpilot/shardpilot-go#73 review). Blind substring replacement of `ab`
 // would instead corrupt unrelated words, so short values are matched at
 // boundaries and long ones are not.
+// containsValue asks the question replaceValue answers, under the SAME rule:
+// a long value counts anywhere, a short one only where it stands as a whole
+// token.
+//
+// ⚠ THE GUARD USED strings.Contains AND THAT MADE IT REFUSE VALID RUNS. The SDK
+// accepts any non-empty experiment key, so `SP_EXPERIMENT_KEY=a` made the letter
+// `a` in ordinary report prose -- "assignment capture" -- look like a leak, and
+// every otherwise good run exited 4 without printing. A guard whose matching is
+// stricter than the redaction it checks does not find leaks; it finds itself
+// (shardpilot/shardpilot-go#73 review).
+func containsValue(text, v string) bool {
+	if v == "" {
+		return false
+	}
+	if len(v) >= 8 {
+		return strings.Contains(text, v)
+	}
+	for i := 0; ; {
+		j := strings.Index(text[i:], v)
+		if j < 0 {
+			return false
+		}
+		j += i
+		startOK := j == 0 || !isWordByte(text[j-1])
+		endOK := j+len(v) >= len(text) || !isWordByte(text[j+len(v)])
+		if startOK && endOK {
+			return true
+		}
+		i = j + 1
+	}
+}
+
 func replaceValue(text, v string) string {
 	red := fmt.Sprintf("<redacted, %d chars>", len(v))
 	if len(v) >= 8 {
@@ -686,8 +774,7 @@ func main() {
 		if len(rec.exchanges) > 1 {
 			label = fmt.Sprintf(" %d", i+1)
 		}
-		reqText := forFence(string(ex.req))
-		f := fenceFor(reqText)
+		reqText := string(ex.req)
 		// ⚠ NOT "as the SDK sent it". DumpRequestOut serialises the request as
 		// HTTP/1.1 through a separate fake transport, BEFORE the real one
 		// negotiates a protocol. On an HTTP/2 connection the report paired a
@@ -704,22 +791,22 @@ func main() {
 			"## Request%s — canonical HTTP/1.1 representation\n\n"+
 				"Serialised by `httputil.DumpRequestOut`, which always writes HTTP/1.1. "+
 				"The connection negotiated **%s**, so this is the request's canonical form "+
-				"and its header set, not the bytes on the wire.\n\n%s\n%s%s\n\n",
-			label, wire, f, reqText, f)
+				"and its header set, not the bytes on the wire.\n\n%s\n",
+			label, wire, fencedBlock(reqText))
 		switch {
 		case ex.transErr != nil:
 			fmt.Fprintf(&report, "## Response%s\n\nNONE — the request was formed and no "+
 				"response arrived: %s\n\n", label, sanitize(ex.transErr))
 		case ex.truncErr() != nil:
-			body := forFence(dropFraming(scrubSupplied(string(ex.resp()))))
+			body := dropFraming(scrubSupplied(string(ex.resp())))
 			fmt.Fprintf(&report, "## Response%s — INCOMPLETE, and the SDK was told so\n\n"+
 				"The body is not established as whole (%v). What arrived is below; it "+
-				"is NOT a complete response.\n\n%s\n%s%s\n\n",
-				label, sanitize(ex.truncErr()), fenceFor(body), body, fenceFor(body))
+				"is NOT a complete response.\n\n%s\n%s\n",
+				label, sanitize(ex.truncErr()), fencedBlock(body), ex.trailerReport())
 		default:
-			respText := forFence(dropFraming(scrubSupplied(string(ex.resp()))))
-			rf := fenceFor(respText)
-			fmt.Fprintf(&report, "## Response%s\n\n%s\n%s%s\n\n", label, rf, respText, rf)
+			respText := dropFraming(scrubSupplied(string(ex.resp())))
+			fmt.Fprintf(&report, "## Response%s\n\n%s\n%s\n", label,
+				fencedBlock(respText), ex.trailerReport())
 		}
 	}
 
@@ -752,7 +839,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, "REFUSING TO PRINT: %v\n", err)
 		os.Exit(4)
 	}
-	fmt.Print(report.String())
+	// A CAPTURE NOBODY RECEIVED IS NOT A CAPTURE. An ignored write error let a
+	// report truncated by a full filesystem -- or never written at all -- be
+	// followed by "SERVED" and exit 0 (shardpilot/shardpilot-go#73 review).
+	if _, werr := io.WriteString(os.Stdout, report.String()); werr != nil {
+		fmt.Fprintf(os.Stderr, "REFUSING: the capture could not be written whole: %v\n", werr)
+		os.Exit(4)
+	}
 
 	switch {
 	case last.transErr != nil:
