@@ -151,6 +151,18 @@ fi
 # to run against.
 lane_b_tested="$(git rev-parse HEAD)"
 
+# ⚠ A REGISTRY AND A TRAP BEFORE THE FIRST ALLOCATION, because sweeping for
+# "where else does an allocation stand above its trap" found two temp FILES that
+# a search for `mktemp -d` could never have shown: the synthetic index inside
+# synth_target, called at line 210, and the one for the missing-blob target --
+# both removed on the normal path only, both leaked by any errexit exit in
+# between. synth_target runs long before the main EXIT trap exists, so the fix
+# is a registry that the trap drains, which is the shape the gate already uses
+# for GATE_TMPFILES. The `${a[@]+"${a[@]}"}` spelling is the gate's too: on bash
+# 3.2 an EMPTY array is itself an unbound variable under `set -u`.
+LANE_B_TMPFILES=()
+trap 'rm -f ${LANE_B_TMPFILES[@]+"${LANE_B_TMPFILES[@]}"}' EXIT
+
 
 GATE=scripts/check_public_surface.sh
 BASELINE=scripts/public-surface-lane-b-baseline.txt
@@ -187,6 +199,7 @@ unset PUBLIC_SURFACE_BASE_REF
 synth_target() {  # $1 = sed program applied to the baseline, or "" to delete it
   local idx blob tree
   idx="$(mktemp)"
+  LANE_B_TMPFILES+=("$idx")
   GIT_INDEX_FILE="$idx" git read-tree HEAD
   if [ -z "$1" ]; then
     GIT_INDEX_FILE="$idx" git update-index --force-remove "$BASELINE"
@@ -335,7 +348,7 @@ STUB=""
 STUBDIR=""
 lane_b_scratch=""
 SAVED=""
-trap 'restore; cleanup_dirs; rm -f "$SAVED"' EXIT
+trap 'restore; cleanup_dirs; rm -f "$SAVED" ${LANE_B_TMPFILES[@]+"${LANE_B_TMPFILES[@]}"}' EXIT
 # ⚠ AND SAVED MOVED DOWN HERE FOR THE SAME REASON, FOUND BY THE SAME QUESTION.
 # It was allocated ninety-four lines above the trap that removes it -- the exact
 # shape of the finding about the scratch roots, in a temp FILE rather than a
@@ -547,6 +560,7 @@ no_tree_commit="$(git -c user.name="lane-b-ratchet-test" -c user.email="lane-b-r
 expect_ref "an unreadable tree on the target refuses" "$no_tree_commit" 2 "could not list"
 
 idx_missing="$(mktemp)"
+LANE_B_TMPFILES+=("$idx_missing")
 GIT_INDEX_FILE="$idx_missing" git read-tree HEAD
 GIT_INDEX_FILE="$idx_missing" git update-index --add \
   --cacheinfo "100644,0000000000000000000000000000000000000001,$BASELINE"
@@ -753,6 +767,25 @@ chmod +x "$lane_b_mvstub/mv"
 expect_env "a failed rename refuses" \
   "PATH=$lane_b_mvstub:$PATH" 2 "could not put the new baseline in place" --write-baseline
 rm -rf "$lane_b_mvstub"
+
+# ⚠ AND AN mv WITHOUT -T REFUSES RATHER THAN FALLING BACK. Found by the sweep,
+# not by review: mapping every lane B refusal to the control needles that assert
+# it left this one with nothing pointing at it. It is a refusal I added in this
+# same round, which is the audit line without a control that this file exists to
+# stop. Deterministic, no lever: a stub `mv` that fails when it is handed -T, as
+# a pre-GNU mv would, and defers otherwise -- so the gate's behavioural probe
+# concludes the option is missing and refuses instead of using semantics it has
+# measured to be unsafe.
+lane_b_notstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
+{
+  echo '#!/bin/sh'
+  echo 'for a in "$@"; do case "$a" in -*T*) exit 1 ;; esac; done'
+  echo "exec $(command -v mv) \"\$@\""
+} > "$lane_b_notstub/mv"
+chmod +x "$lane_b_notstub/mv"
+expect_env "an mv without --no-target-directory refuses" \
+  "PATH=$lane_b_notstub:$PATH" 2 "has no --no-target-directory" --write-baseline
+rm -rf "$lane_b_notstub"
 restore
 
 # ⚠ AND THE UNREADABLE LINK COUNT. The hard-link scene only ever supplies a
@@ -983,7 +1016,7 @@ restore
 # this paragraph forbids, one line from where it forbids it, and passing every
 # healthy run because a stale expectation only shows up once some other count
 # disagrees.
-EXPECTED_CHECKS=31
+EXPECTED_CHECKS=32
 if [ "$checks" -ne "$EXPECTED_CHECKS" ]; then
   echo "REFUSING: $checks control(s) ran, expected exactly $EXPECTED_CHECKS" >&2
   exit 2

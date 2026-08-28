@@ -2614,9 +2614,18 @@ if [ "${1:-}" = "--write-baseline" ]; then
     # and a failed `exec` redirect does not abort the shell when its status is
     # taken (measured: the check below is reached, rc 0), so this needs no
     # errexit gymnastics.
+    #
+    # ⚠ AND NO `2>/dev/null` ON THIS LINE. `exec` applies its redirections to the
+    # SHELL, not to a command, so `exec 9>tmp 2>/dev/null` opens the write-aside
+    # and silences this gate's stderr for the rest of the run. Every refusal
+    # after it went to /dev/null: the rename failure below exited 2 with no
+    # message at all, which is precisely the silent write this block exists to
+    # prevent, introduced by the block itself. The harness caught it because
+    # judge() separates "wrong exit" from "right exit, wrong reason" -- the exit
+    # was 2, exactly as expected, and only the reason showed the damage.
     lane_b_aside=yes
     set -C
-    exec 9>"$lane_b_tmp" 2>/dev/null || lane_b_aside=no
+    exec 9>"$lane_b_tmp" || lane_b_aside=no
     set +C
     if [ "$lane_b_aside" = no ]; then
       # refusal:structural
