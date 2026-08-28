@@ -1696,10 +1696,42 @@ scan_tree() {
         # is deliberate: a refusal is visible and strict, and the alternative on
         # offer was a tally that silently undercounts, which is the direction a
         # ratchet must never err in.
-        lane_b_seen_raw="$(printf '%s\n' "$lane_b_occ_1" "$lane_b_occ_2" \
-          | grep -v '^$' | tr -d '*_`~\\' | sort || true)"
-        lane_b_seen_strip="$(printf '%s\n' "$lane_b_chk_1" "$lane_b_chk_2" \
-          | grep -v '^$' | tr -d '*_`~\\' | sort || true)"
+        # ⚠ `|| true` HERE WOULD HIDE THE FAILURE OF THE COMPARISON ITSELF, and
+        # this whole refusal is the comparison. I wrote one, to absorb `grep -v`
+        # exiting 1 when every line is filtered out -- which is "nothing
+        # matched", not an error -- and in absorbing it swallowed `tr` and
+        # `sort` as well. Measured: with a `tr` that fails, both sides come back
+        # empty, compare EQUAL, and the refusal does not fire on a file that
+        # must be refused.
+        #
+        # That is the swallowed-status class this same unit fixed two commits
+        # earlier in the counting passes, reappearing in the code written to fix
+        # it. So each stage is read separately: grep may say 1, nothing else may
+        # say anything but 0.
+        lane_b_compare() {  # $1 $2 = pass outputs -> the comparable form
+          local ps
+          printf '%s\n' "$1" "$2" | grep -v '^$' | tr -d '*_`~\\' | sort
+          ps=("${PIPESTATUS[@]}")
+          [ "${ps[0]}" -eq 0 ] || return 2
+          [ "${ps[1]}" -le 1 ] || return 2
+          [ "${ps[2]}" -eq 0 ] || return 2
+          [ "${ps[3]}" -eq 0 ] || return 2
+          return 0
+        }
+        set +e
+        lane_b_seen_raw="$(lane_b_compare "$lane_b_occ_1" "$lane_b_occ_2")"
+        lane_b_cmp_st_1=$?
+        lane_b_seen_strip="$(lane_b_compare "$lane_b_chk_1" "$lane_b_chk_2")"
+        lane_b_cmp_st_2=$?
+        set -e
+        if [ "$lane_b_cmp_st_1" -ne 0 ] || [ "$lane_b_cmp_st_2" -ne 0 ]; then
+          # refusal:structural
+          echo "REFUSING: could not compare the two readings of '$f'." >&2
+          echo "  The comparison IS the refusal below, so a comparison that did" >&2
+          echo "  not complete cannot be read as agreement -- two empty results" >&2
+          echo "  are equal, and equality here means 'nothing to refuse'." >&2
+          exit 2
+        fi
         if [ "$lane_b_seen_raw" != "$lane_b_seen_strip" ]; then
           # refusal:structural
           echo "REFUSING: '$f' is spelled so that its occurrences cannot be counted." >&2
