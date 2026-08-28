@@ -1067,7 +1067,17 @@ STUB="$(mktemp -d)"
 REAL_GREP="$(command -v grep)"
 {
   echo '#!/bin/sh'
-  echo 'case " $* " in *" -aonE "*|*" -aoniE "*) exit 2 ;; esac'
+  # ⚠ KEYED ON THE COUNTING CLUSTER, IN EITHER SPELLING. This matched the exact
+  # flag strings the counting passes used to be written with, `-aonE` and
+  # `-aoniE`. When those passes were rewritten to take the pattern-family flag
+  # separately, the stub stopped matching, never fired, and the gate counted
+  # normally -- the control reported exit 0 where it wanted 2. It was right to:
+  # a control keyed on the SPELLING of a call rather than on what the call does
+  # stops testing the moment the call is reworded, and this one said so loudly
+  # instead of going quiet. The narrow key stays deliberate: a stub that fired
+  # for every `-o` grep would break the audit passes first and the control would
+  # then fail on the wrong reason.
+  echo 'case " $* " in *" -aonE "*|*" -aoniE "*|*" -aon "*) exit 2 ;; esac'
   printf 'exec %q "$@"\n' "$REAL_GREP"
 } > "$STUB/grep"
 chmod +x "$STUB/grep"
