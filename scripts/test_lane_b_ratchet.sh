@@ -665,6 +665,36 @@ judge "a parent swapped before the anchor refuses" "${lane_b_swap_rc:-0}" 2 "is 
 # make this control pass vacuously, which is the exact failure it exists to
 # catch one level down. So the control writes a probe first: if the probe
 # SUCCEEDS, the route is not in force and this reports that rather than a pass.
+# ⚠ WHAT EVERY STUB IN THIS FILE IS ALLOWED TO KEY ON, AND WHY THE ANSWER IS
+# NOT "SOMETHING SEMANTIC". A control keyed on the SPELLING of a call stops
+# testing the moment the call is reworded -- the occurrence-pass control keyed
+# on the flag cluster `-aonE`, the counting passes were rewritten to take the
+# pattern flag separately, and the stub silently stopped matching. It failed
+# loudly, and that is the whole point of what follows.
+#
+# The stubs here key on paths and flag fragments, and mostly cannot do better:
+# a stub that fires for every `-o` grep breaks the audit passes first and the
+# control then fails for the wrong reason. Narrowness is not the defect. SILENCE
+# is. So the rule is about what a control ASSERTS, not about what its stub
+# matches:
+#
+#   a control that asserts a REFUSAL cannot go quiet. An inert stub produces
+#   no refusal, the exit is 0 where 2 was wanted, and the control fails.
+#
+#   a control that asserts SUCCESS can. The gate exits 0 either way, the
+#   "precious" copy outside is untouched either way, and a stub that never
+#   fired reads exactly like a guard that worked.
+#
+# Counted at the time of writing: 26 stub-backed controls assert a refusal and
+# are immune by construction; exactly TWO assert success -- the two below -- and
+# both write a marker when the hook fires and check it FIRST, before any other
+# assertion. That is not decoration. The symlinked-TMPDIR control was caught by
+# its own version of this branch within the hour of it being added.
+#
+# So: a new control that asserts success and installs a stub must carry a fired
+# marker. This is a written rule and not a gate -- nothing here enforces it, and
+# saying otherwise would be the kind of claim this file exists to distrust.
+
 # ⚠ THE PARENT SWAPPED *AFTER* THE ANCHOR, and this needs a hook rather than a
 # race. The other swap scene replaces scripts/ before the gate starts, so it
 # exits at containment and never proves what the held cwd is for. This one lets
