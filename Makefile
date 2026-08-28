@@ -70,6 +70,14 @@ SHELL := /usr/bin/env bash
 # naming a remote is fetched too; one that names no known remote cannot be
 # refreshed here and says so.
 #
+# ⚠ AND A PLAIN `git fetch <remote>` DOES NOT GUARANTEE THE OVERRIDE MOVED. The
+# remote's configured `remote.<name>.fetch` refspec decides what a bare fetch
+# updates: a remote configured to fetch only `release` returns success while
+# `upstream/main` stays at its old commit, and the gate then compares against a
+# stale, higher baseline. So the named ref is ALSO fetched by explicit refspec,
+# and the target refuses if it does not resolve afterwards
+# (shardpilot/shardpilot-go#77 review, reproduced by the reviewer).
+#
 # Cost: about a minute per base. Duplicate bases are scanned once.
 check:
 	@set -euo pipefail; \
@@ -98,8 +106,22 @@ check:
 	if [ -n "$${PUBLIC_SURFACE_BASE_REF:-}" ]; then \
 	  ref="$$PUBLIC_SURFACE_BASE_REF"; \
 	  remote="$${ref%%/*}"; \
+	  rest="$${ref#*/}"; \
 	  if [ "$$remote" != "$$ref" ] && git remote | grep -qxF "$$remote"; then \
 	    fetch_remote "$$remote"; \
+	    before=$$(git rev-parse --verify --quiet "$$ref^{commit}" 2>/dev/null || true); \
+	    if ! git fetch --quiet "$$remote" \
+	         "+refs/heads/$$rest:refs/remotes/$$remote/$$rest" 2>/dev/null; then \
+	      printf 'NOTE: could not fetch %s explicitly; if the plain fetch above did\n' "$$ref" >&2; \
+	      printf '  not cover it, this base may be stale.\n' >&2; \
+	    fi; \
+	    after=$$(git rev-parse --verify --quiet "$$ref^{commit}" 2>/dev/null || true); \
+	    if [ -z "$$after" ]; then \
+	      printf 'REFUSING: %s does not resolve after fetching %s.\n' "$$ref" "$$remote" >&2; \
+	      exit 2; \
+	    fi; \
+	    [ "$$before" != "$$after" ] && printf 'public surface: %s refreshed %s -> %s\n' \
+	      "$$ref" "$${before:-absent}" "$$after"; \
 	  else \
 	    printf 'NOTE: %s names no known remote, so this gate cannot refresh it.\n' "$$ref" >&2; \
 	    printf '  If it is a remote-tracking ref, fetch it yourself first; a stale\n' >&2; \
