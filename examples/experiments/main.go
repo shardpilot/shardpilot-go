@@ -26,6 +26,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -42,31 +43,73 @@ import (
 // recorder captures the one exchange the SDK performs. It is deliberately not
 // a general proxy: a capture that summarises is a capture that can omit the
 // thing under test.
+// exchange is one attempt. The SDK may make several -- a refusal can send it
+// round again with a fresh subject -- and a recorder that keeps only the last
+// one reports a multi-attempt sequence as a single request that never happened
+// that way.
+type exchange struct {
+	req      []byte
+	resp     []byte
+	status   int
+	transErr error // set when no response arrived at all
+	truncErr error // set when the body could not be read whole
+}
+
 type recorder struct {
-	inner  http.RoundTripper
-	req    []byte
-	resp   []byte
-	status int
+	inner     http.RoundTripper
+	exchanges []exchange
+}
+
+// last is the attempt whose verdict the program reports. It is the last one
+// BECAUSE that is the one the SDK acted on, not because the others did not
+// happen -- every one of them is printed.
+func (r *recorder) last() *exchange {
+	if len(r.exchanges) == 0 {
+		return nil
+	}
+	return &r.exchanges[len(r.exchanges)-1]
 }
 
 func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
-	dump, err := httputil.DumpRequestOut(req, true)
-	if err == nil {
-		r.req = redact(dump)
+	ex := exchange{}
+	if dump, err := httputil.DumpRequestOut(req, true); err == nil {
+		ex.req = redact(dump)
 	}
+
 	resp, err := r.inner.RoundTrip(req)
 	if err != nil {
+		// DNS, TLS, connection setup: the request was formed but nothing came
+		// back. Recorded as an attempt WITH NO RESPONSE rather than dropped,
+		// because a recorder that keeps the request and loses the failure lets
+		// the program print a pair whose second half never existed.
+		ex.transErr = err
+		r.exchanges = append(r.exchanges, ex)
 		return nil, err
 	}
+
 	body, readErr := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	resp.Body = io.NopCloser(strings.NewReader(string(body)))
-	if readErr == nil {
+	if readErr != nil {
+		// A body that arrived short is not a short body. Handing the SDK the
+		// partial bytes as if they were whole would make a truncated response
+		// indistinguishable from a complete one -- to the SDK and to this
+		// record both. The error goes to the SDK, and the partial bytes are
+		// kept in the record so a reader can see how far it got.
+		ex.truncErr = readErr
+		ex.status = resp.StatusCode
 		if d, derr := httputil.DumpResponse(resp, false); derr == nil {
-			r.resp = append(d, body...)
+			ex.resp = append(d, body...)
 		}
+		r.exchanges = append(r.exchanges, ex)
+		return nil, readErr
 	}
-	r.status = resp.StatusCode
+
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	if d, derr := httputil.DumpResponse(resp, false); derr == nil {
+		ex.resp = append(d, body...)
+	}
+	ex.status = resp.StatusCode
+	r.exchanges = append(r.exchanges, ex)
 	return resp, nil
 }
 
@@ -130,6 +173,10 @@ func redact(dump []byte) []byte {
 	return []byte(strings.Join(out, "\n"))
 }
 
+// captureDeadline bounds the SDK, its HTTP client and this program's context
+// alike, so a run cannot end on a limit none of them was given.
+const captureDeadline = 30 * time.Second
+
 func env(name string) string { return strings.TrimSpace(os.Getenv(name)) }
 
 func main() {
@@ -167,7 +214,11 @@ func main() {
 		APIKey:             env("SP_API_KEY"),
 		RemoteConfigURL:    env("SP_REMOTE_CONFIG_URL"),
 		ExperimentsEnabled: true,
-		HTTPClient:         &http.Client{Transport: rec, Timeout: 30 * time.Second},
+		// Matched to the capture deadline on purpose: leaving the SDK's own
+		// timeout at its default lets the two disagree, and a run that ends
+		// on whichever fires first records a deadline nobody chose.
+		HTTPTimeout: captureDeadline,
+		HTTPClient:  &http.Client{Transport: rec, Timeout: captureDeadline},
 	}
 
 	client, err := shardpilot.NewClient(cfg)
@@ -181,23 +232,49 @@ func main() {
 		_ = client.Close(closeCtx)
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), captureDeadline)
 	defer cancel()
 
 	result, fetchErr := client.FetchExperimentAssignment(ctx, env("SP_EXPERIMENT_KEY"), nil)
 
-	if rec.req == nil {
+	if len(rec.exchanges) == 0 {
 		fmt.Fprintf(os.Stderr,
 			"no request made: the SDK returned %v without issuing one, so this "+
-				"run says nothing about the edge\n", fetchErr)
+				"run says nothing about the endpoint\n", fetchErr)
 		os.Exit(2)
 	}
 
 	fmt.Printf("# assignment capture — %s\n\n", time.Now().UTC().Format(time.RFC3339))
-	fmt.Printf("## Request, as the SDK sent it\n\n```\n%s\n```\n\n", strings.TrimRight(string(rec.req), "\r\n"))
-	fmt.Printf("## Response\n\n```\n%s\n```\n\n", strings.TrimRight(string(rec.resp), "\r\n"))
+	if len(rec.exchanges) > 1 {
+		fmt.Printf("The SDK made **%d attempts**. All are below; the verdict is the "+
+			"last, because that is the one it acted on.\n\n", len(rec.exchanges))
+	}
+	for i, ex := range rec.exchanges {
+		label := ""
+		if len(rec.exchanges) > 1 {
+			label = fmt.Sprintf(" %d", i+1)
+		}
+		fmt.Printf("## Request%s, as the SDK sent it\n\n```\n%s\n```\n\n",
+			label, strings.TrimRight(string(ex.req), "\r\n"))
+		switch {
+		case ex.transErr != nil:
+			fmt.Printf("## Response%s\n\nNONE — the request was formed and no "+
+				"response arrived: %v\n\n", label, ex.transErr)
+		case ex.truncErr != nil:
+			fmt.Printf("## Response%s — TRUNCATED, and the SDK was told so\n\n"+
+				"The body could not be read whole (%v). What arrived is below; it "+
+				"is NOT a complete response.\n\n```\n%s\n```\n\n",
+				label, ex.truncErr, strings.TrimRight(string(ex.resp), "\r\n"))
+		default:
+			fmt.Printf("## Response%s\n\n```\n%s\n```\n\n",
+				label, strings.TrimRight(string(ex.resp), "\r\n"))
+		}
+	}
+
+	last := rec.last()
 	fmt.Printf("## SDK verdict\n\n")
-	fmt.Printf("    status:   %d\n", rec.status)
+	fmt.Printf("    attempts: %d\n", len(rec.exchanges))
+	fmt.Printf("    status:   %d\n", last.status)
 	fmt.Printf("    assigned: %t\n", result.Assigned)
 	fmt.Printf("    variant:  %q\n", result.VariantKey)
 	fmt.Printf("    reason:   %q\n", result.Reason)
@@ -207,16 +284,26 @@ func main() {
 	}
 
 	switch {
-	case rec.status == http.StatusOK && fetchErr == nil:
+	case last.transErr != nil:
+		fmt.Printf("\nNO RESPONSE. The SDK formed the request and nothing came " +
+			"back, so this run says nothing about what the endpoint would have " +
+			"answered.\n")
+		os.Exit(1)
+	case last.truncErr != nil:
+		fmt.Printf("\nRESPONSE TRUNCATED. The SDK was handed the error rather than " +
+			"the partial body, so nothing downstream mistook it for a complete " +
+			"answer.\n")
+		os.Exit(1)
+	case last.status == http.StatusOK && fetchErr == nil:
 		fmt.Printf("\nSERVED. The pair above is the capture.\n")
 		os.Exit(0)
 	case fetchErr != nil && errors.Is(fetchErr, context.DeadlineExceeded):
 		fmt.Printf("\nNOT captured — the request timed out.\n")
 		os.Exit(1)
 	default:
-		fmt.Printf("\nNOT served. The SDK reached the endpoint and it "+
-			"answered %d; the pair above is what it answered, and it is not a\n"+
-			"served assignment.\n", rec.status)
+		fmt.Printf("\nNOT served. The SDK reached the endpoint and it answered "+
+			"%d; the pair above is what it answered, and it is not a served "+
+			"assignment.\n", last.status)
 		os.Exit(1)
 	}
 }
