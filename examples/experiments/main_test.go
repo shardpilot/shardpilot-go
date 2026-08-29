@@ -272,6 +272,83 @@ func TestRedactedAuthorizationKeepsItsTerminator(t *testing.T) {
 	}
 }
 
+func TestGuardDecodesHTMLEntities(t *testing.T) {
+	suppliedValues = []string{"a&b"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak("<p>rejected key a&amp;b</p>"); err == nil {
+		t.Fatal("an HTML entity spelling passed the guard")
+	}
+}
+
+func TestGuardDoesNotMaskAValueShapedLikeAPlaceholder(t *testing.T) {
+	suppliedValues = []string{"redacted-38-chars"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// A legal experiment key that happens to look like a generated placeholder.
+	if err := assertNoLeak("GET /x?experiment_key=redacted-38-chars HTTP/1.1"); err == nil {
+		t.Fatal("the mask swallowed the very value it was protecting")
+	}
+}
+
+func TestResponseHeaderNamesAreScrubbed(t *testing.T) {
+	suppliedValues = []string{"Secret"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := dropFraming("HTTP/1.1 200 OK\r\nX-Secret: value\r\n\r\n{}")
+	if strings.Contains(got, "X-Secret") {
+		t.Fatalf("an identifier was published in a response header NAME: %q", got)
+	}
+}
+
+func TestLocationQueryValuesAreRedacted(t *testing.T) {
+	suppliedValues = nil
+	t.Cleanup(func() { suppliedValues = nil })
+	got := dropFraming("HTTP/1.1 302 Found\r\nLocation: /cb?state=abc123&token=zzz\r\n\r\n")
+	for _, leaked := range []string{"abc123", "zzz"} {
+		if strings.Contains(got, leaked) {
+			t.Fatalf("a server-generated redirect value was published: %q", got)
+		}
+	}
+	if !strings.Contains(got, "state=") || !strings.Contains(got, "token=") {
+		t.Fatalf("structural redaction dropped the parameter names: %q", got)
+	}
+}
+
+func TestReplacedFramingHeadersKeepTheirTerminator(t *testing.T) {
+	got := dropFraming("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n{}")
+	for _, line := range strings.Split(got, "\n") {
+		if strings.HasPrefix(line, "X-Capture-Note") && !strings.HasSuffix(line, "\r") {
+			t.Fatalf("a replacement line lost its CR: %q in %q", line, got)
+		}
+	}
+}
+
+func TestCookieLengthIsTheCookiesNotThePlaceholders(t *testing.T) {
+	suppliedValues = []string{"abc12345"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// The cookie value equals a supplied identifier: the structural redactor must
+	// see the cookie, not a substitution made before it.
+	ex := exchange{head: []byte("HTTP/1.1 200 OK\r\nSet-Cookie: sid=abc12345; Path=/\r\n\r\n")}
+	got := responseText(&ex)
+	if !strings.Contains(got, "<redacted, 8 chars>") {
+		t.Fatalf("the cookie's own length was not reported: %q", got)
+	}
+}
+
+func TestCeilingWithAnExactContentLengthIsComplete(t *testing.T) {
+	// Production's outer io.LimitReader can synthesise EOF without calling the
+	// tee again, so sawEOF stays false on a complete body.
+	src := bytes.Repeat([]byte("x"), capturedBodyMax)
+	tee := &teeBody{inner: io.NopCloser(bytes.NewReader(src)), declared: int64(capturedBodyMax)}
+	if _, err := io.CopyN(io.Discard, tee, int64(capturedBodyMax)); err != nil {
+		t.Fatalf("copyN: %v", err)
+	}
+	if tee.sawEOF {
+		t.Fatal("precondition: this case is about NOT seeing EOF")
+	}
+	if (&exchange{head: []byte("x"), captured: tee}).truncErr() != nil {
+		t.Fatal("a complete body with an exact Content-Length was called incomplete")
+	}
+}
+
 func TestTrailersAreSnapshotAtEOFNotFromTheHead(t *testing.T) {
 	resp := &http.Response{Trailer: http.Header{}}
 	tee := &teeBody{inner: io.NopCloser(strings.NewReader("BODY")), resp: resp}

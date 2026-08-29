@@ -47,6 +47,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"maps"
 	"net/http"
@@ -101,7 +102,16 @@ func (e *exchange) truncErr() error {
 	if e.captured.err == nil && e.captured.overflowed {
 		return errOversizedForCapture
 	}
-	if e.captured.err == nil && e.captured.atCeiling && !e.captured.sawEOF {
+	// ⚠ EOF CAN BE SYNTHESISED ABOVE THIS WRAPPER. The SDK reads through
+	// io.LimitReader, and when the limit is reached exactly, the limiter returns
+	// EOF itself WITHOUT calling teeBody.Read again -- so `sawEOF` stays false on
+	// a body that is complete, and a complete refusal reported exit 3 instead of
+	// 1. The earlier test read the tee directly and performed the extra read that
+	// production suppresses, which is why it passed
+	// (shardpilot/shardpilot-go#73 review). An exact Content-Length is a signal
+	// visible ABOVE the limiter and settles the case without one.
+	if e.captured.err == nil && e.captured.atCeiling && !e.captured.sawEOF &&
+		e.captured.declared != int64(e.captured.buf.Len()) {
 		return errOversizedForCapture
 	}
 	return e.captured.err
@@ -232,6 +242,45 @@ func fenceFor(content string) string {
 // that had nothing to do with redaction (shardpilot/shardpilot-go#73 review).
 // redactSetCookie keeps `Set-Cookie: <name>=` and every attribute after the
 // first `;`, and replaces only the value.
+//
+// ⚠ IT MUST RUN BEFORE THE SUPPLIED-VALUE SUBSTITUTION, which is why the call
+// sites read `scrubSupplied(dropFraming(...))` and not the reverse. With the
+// old order, a cookie whose value equalled a supplied identifier was already
+// `<redacted, N chars>` by the time this function measured it, so the header
+// reported the PLACEHOLDER's length -- an 8-byte cookie printed as
+// `<redacted, 19 chars>`, a second wrong number where this function promises
+// the real one (shardpilot/shardpilot-go#73 review).
+// headerNameEnd returns the index just past a header line's name, and whether
+// the line looks like a header at all. The status line and the body have no
+// name to scrub.
+func headerNameEnd(line string) (int, bool) {
+	i := strings.IndexByte(line, ':')
+	if i <= 0 || strings.HasPrefix(line, "HTTP/") {
+		return 0, false
+	}
+	for j := 0; j < i; j++ {
+		c := line[j]
+		if !isWordByte(c) {
+			return 0, false
+		}
+	}
+	return i, true
+}
+
+// responseText is the ONE place the response pipeline is composed, and the
+// order inside it is load-bearing: structural redaction first, supplied-value
+// substitution second. See redactSetCookie for why.
+//
+// ⚠ IT EXISTS BECAUSE A TEST OF THE COMPOSITION IS NOT A TEST OF THE CALL SITE.
+// The first fixture for that ordering called `scrubSupplied(dropFraming(...))`
+// itself, so a mutant that restored the wrong order at the two call sites
+// SURVIVED it -- the test was checking its own copy of the pipeline
+// (shardpilot/shardpilot-go#73 review, found by mutating rather than by
+// reading). Naming it once removes the copy.
+func responseText(ex *exchange) string {
+	return scrubSupplied(dropFraming(string(ex.resp())))
+}
+
 func redactSetCookie(line string) string {
 	cr := ""
 	body := line
@@ -267,10 +316,28 @@ func dropFraming(dump string) string {
 			continue
 		}
 		low := strings.ToLower(l)
+		cr := ""
+		if strings.HasSuffix(l, "\r") {
+			cr = "\r"
+		}
 		if strings.HasPrefix(low, "content-length:") {
-			out = append(out, "X-Capture-Note: Content-Length removed — the body below is redacted")
+			out = append(out, "X-Capture-Note: Content-Length removed — the body below is redacted"+cr)
 			continue
 		}
+		// ⚠ A REDIRECT TARGET IS A CREDENTIAL SURFACE. `Location` query values are
+		// server-generated -- `state`, signed tokens, one-time callbacks -- so no
+		// list of values THIS program supplied can reach them, exactly as with
+		// Set-Cookie (shardpilot/shardpilot-go#73 review). Redacted structurally,
+		// by the same function the request line uses: names kept, values lengthed.
+		if strings.HasPrefix(low, "location:") {
+			out = append(out, redactQuery(strings.TrimSuffix(l, "\r"))+cr)
+			continue
+		}
+		// ⚠ AND A HEADER NAME CAN CARRY THE IDENTIFIER. `X-<key>: v` published it
+		// in the name, and the guard's short-value rule counts `-` as a word byte
+		// so the boundary check waved it through. The trailer path already did
+		// this; the response's own header block did not -- fixed where it was
+		// found and not where the question is asked, one more time.
 		// net/http hands us the DECODED body, so a recorded `Transfer-Encoding:
 		// chunked` describes framing the bytes below do not carry: no chunk sizes,
 		// no terminator. Removing Content-Length alone left this common shape
@@ -286,7 +353,19 @@ func dropFraming(dump string) string {
 			continue
 		}
 		if strings.HasPrefix(low, "transfer-encoding:") {
-			out = append(out, "X-Capture-Note: Transfer-Encoding removed — the body below is decoded")
+			out = append(out, "X-Capture-Note: Transfer-Encoding removed — the body below is decoded"+cr)
+			continue
+		}
+		// ⚠ AND A HEADER NAME CAN CARRY THE IDENTIFIER, so this comes LAST: the
+		// specific rules above own their lines, and everything else keeps its
+		// value untouched while its NAME is scrubbed. `X-<key>: v` published the
+		// identifier in the name, and the guard's short-value rule counts `-` as
+		// a word byte so the boundary check waved it through. The trailer path
+		// already did this; the response's own header block did not -- fixed
+		// where it was found and not where the question is asked, once more
+		// (shardpilot/shardpilot-go#73 review).
+		if i, ok := headerNameEnd(l); ok {
+			out = append(out, scrubHeaderName(l[:i])+l[i:])
 			continue
 		}
 		out = append(out, l)
@@ -350,7 +429,7 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 	// body larger than its 1 MiB contract was buffered here instead of being
 	// refused there. The SDK now reads its own response, under its own bound,
 	// and this records what passes through.
-	captured := &teeBody{inner: resp.Body, resp: resp}
+	captured := &teeBody{inner: resp.Body, resp: resp, declared: resp.ContentLength}
 	resp.Body = captured
 	ex.status = resp.StatusCode
 	ex.proto = resp.Proto
@@ -372,6 +451,7 @@ type teeBody struct {
 	err        error
 	overflowed bool
 	atCeiling  bool
+	declared   int64          // Content-Length, or -1 when unknown
 	resp       *http.Response // for the trailer snapshot at EOF
 	trailer    http.Header
 	sawEOF     bool
@@ -642,7 +722,21 @@ func encodingsOf(v string) []string {
 var placeholderPattern = regexp.MustCompile(`redacted-[0-9]+-chars|<redacted, [0-9]+ chars>`)
 
 func assertNoLeak(text string) error {
-	text = placeholderPattern.ReplaceAllString(text, "\x00")
+	// ⚠ MASK ONLY WHAT CANNOT BE A VALUE. Blanking every placeholder shape hid a
+	// supplied value that HAPPENS to look like one: `SP_EXPERIMENT_KEY=redacted-38-chars`
+	// is a legal key, it is printed verbatim in the canonical request, and the
+	// mask erased it before the check (shardpilot/shardpilot-go#73 review). A
+	// mask that can swallow the thing it is protecting is worse than no mask.
+	maskable := true
+	for _, v := range suppliedValues {
+		if v != "" && placeholderPattern.MatchString(v) {
+			maskable = false
+			break
+		}
+	}
+	if maskable {
+		text = placeholderPattern.ReplaceAllString(text, "\x00")
+	}
 	// DECODE TO A FIXED POINT. One pass left `a%2522b` -- the ordinary shape when
 	// a URL is embedded in another URL's parameter -- decoding only to `a%22b`,
 	// which matches no supplied value, so a doubly-encoded identifier walked
@@ -657,11 +751,25 @@ func assertNoLeak(text string) error {
 	// space, which cannot be undone, so it cannot cycle and cannot run longer
 	// than the input. len(text)+1 is therefore a real bound rather than a guess,
 	// and reaching it is a defect worth failing on rather than passing quietly.
+	// ⚠ AND THE BUDGET IS WORK, NOT DEPTH. `len(text)+1` bounds the rounds but
+	// not the cost: a near-limit body whose escape is nested `%25` deep peels one
+	// two-byte layer per pass while rescanning and re-allocating almost the whole
+	// report, which is quadratic and lets a crafted response hang this program
+	// instead of being refused by it (shardpilot/shardpilot-go#73 review). The
+	// budget counts bytes examined and fails CLOSED.
+	const decodeWorkMax = 64 << 20
+	work := 0
 	forms := []string{text}
 	cur := text
 	settled := false
 	for i := 0; i <= len(text); i++ {
-		next := undoPlus(undoUnicodeEscapes(undoPercent(cur)))
+		work += len(cur)
+		if work > decodeWorkMax {
+			return fmt.Errorf(
+				"decoding exceeded its work budget (%d bytes examined); the record "+
+					"is NOT publishable and was not printed", work)
+		}
+		next := undoEntities(undoPlus(undoUnicodeEscapes(undoPercent(cur))))
 		if next == cur {
 			settled = true
 			break
@@ -698,6 +806,15 @@ func assertNoLeak(text string) error {
 // `a%2Bb`, which percent-decoding alone reduces to `a+b` and no further, so the
 // value was never reconstructed and both the scrub and the gate missed it
 // (shardpilot/shardpilot-go#73 review).
+// undoEntities decodes HTML entity spellings. A gateway or validation endpoint
+// answering with an HTML diagnostic writes `a&amp;b` for `a&b`, which no
+// percent, unicode or plus decoding reconstructs -- so the value reached the
+// artifact while the guard reported it absent
+// (shardpilot/shardpilot-go#73 review).
+func undoEntities(text string) string {
+	return html.UnescapeString(text)
+}
+
 func undoPlus(text string) string {
 	return strings.ReplaceAll(text, "+", " ")
 }
@@ -950,13 +1067,13 @@ func main() {
 			fmt.Fprintf(&report, "## Response%s\n\nNONE — the request was formed and no "+
 				"response arrived: %s\n\n", label, sanitize(ex.transErr))
 		case ex.truncErr() != nil:
-			body := dropFraming(scrubSupplied(string(ex.resp())))
+			body := responseText(&ex)
 			fmt.Fprintf(&report, "## Response%s — INCOMPLETE, and the SDK was told so\n\n"+
 				"The body is not established as whole (%v). What arrived is below; it "+
 				"is NOT a complete response.\n\n%s\n%s\n",
 				label, sanitize(ex.truncErr()), fencedBlock(body), ex.trailerReport())
 		default:
-			respText := dropFraming(scrubSupplied(string(ex.resp())))
+			respText := responseText(&ex)
 			fmt.Fprintf(&report, "## Response%s\n\n%s\n%s\n", label,
 				fencedBlock(respText), ex.trailerReport())
 		}
