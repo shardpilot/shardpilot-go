@@ -378,25 +378,61 @@ var mintedNames = []string{"subject_fact_key", "subject_key_hash"}
 // dropQuery removes a URL's query and fragment entirely, keeping the path. This
 // half cannot say how long each value was without the structural redactor, and a
 // length it cannot compute is not a length it may guess.
-func dropQuery(url string) string {
-	cut := len(url)
+func dropQuery(line string) string {
+	cut := len(line)
 	for _, c := range []byte{'?', '#'} {
-		if i := strings.IndexByte(url, c); i >= 0 && i < cut {
+		if i := strings.IndexByte(line, c); i >= 0 && i < cut {
 			cut = i
 		}
 	}
-	if cut == len(url) {
-		return url
+	if cut == len(line) {
+		return line
 	}
-	return url[:cut] + marked("<query withheld>")
+	// ⚠ ONLY THE REQUEST-TARGET, NOT THE REST OF THE LINE. A request line is
+	// space-delimited -- `GET /p?x=y HTTP/1.1\r` -- and every assignment URL this
+	// program builds carries a query, so cutting from `?` to end of string
+	// removed the HTTP version and the terminator from EVERY published request
+	// block, while the report went on calling it a canonical HTTP/1.1
+	// representation (shardpilot/shardpilot-go#84 review). A bare URL has no
+	// space and keeps the old behaviour.
+	tail := ""
+	if j := strings.IndexByte(line[cut:], ' '); j >= 0 {
+		tail = line[cut+j:]
+	}
+	return line[:cut] + marked("<query withheld>") + tail
 }
 
 // noteMinted records a server-minted field's presence and returns the body
 // unchanged -- the caller does not publish a body this reports on.
+// ⚠ MEMBER NAMES ARE DECODED, NOT MATCHED LITERALLY. `"subject_\u0066act_key"`
+// is the same field to `encoding/json` and to the endpoint, and a substring
+// check on the raw spelling did not see it -- so the capture was PUBLISHED with
+// the minted key intact instead of refused, and the leak guard cannot help
+// because a server-minted value is not in suppliedValues
+// (shardpilot/shardpilot-go#84 review). This is the same defect the redaction
+// half had in its own pattern, reintroduced here by writing a second, simpler
+// detector for the same question.
+var jsonMember = regexp.MustCompile(
+	`"((?:[^"\\]|\\.)*)"(\s*:\s*)`)
+
+// jsonString decodes a JSON string body -- the bytes BETWEEN the quotes -- to
+// what it denotes, using the same decoder that produced the response.
+func jsonString(raw string) (string, bool) {
+	var out string
+	if err := json.Unmarshal([]byte(`"`+raw+`"`), &out); err != nil {
+		return "", false
+	}
+	return out, true
+}
+
 func noteMinted(body string) string {
-	for _, n := range mintedNames {
-		if strings.Contains(body, n) {
-			noteStructural("the server-minted " + n)
+	for _, m := range jsonMember.FindAllStringSubmatch(body, -1) {
+		name, ok := jsonString(m[1])
+		if !ok {
+			continue
+		}
+		if slices.Contains(mintedNames, name) {
+			noteStructural("the server-minted " + name)
 		}
 	}
 	return body
@@ -990,11 +1026,48 @@ func assertNoLeak(text string) error {
 	// mask erased it before the check (shardpilot/shardpilot-go#73 review). A
 	// mask that can swallow the thing it is protecting is worse than no mask.
 	// Only what was CAPTURED is in question; prose and placeholders are ours.
-	var captured strings.Builder
+	// ⚠ AND PROTOCOL SYNTAX IS NOT CAPTURED DATA. A legal supplied value can be
+	// `GET` or `200`; the scrub deliberately leaves the request and status lines
+	// alone, because rewriting them produces an unparsable message -- and this
+	// collected them anyway, so the guard reported the method or the status code
+	// as a surviving value and those keys could never produce a capture at all
+	// (shardpilot/shardpilot-go#84 review). The exemption has to be the same on
+	// both sides or the scrub's deliberate silence becomes the guard's false
+	// alarm.
+	//
+	// The NAMES the boundary rule reads are collected per span and stop at the
+	// blank line that ends a header block: a body line shaped like `X-foo-bar:
+	// explanation` is prose, and reading it as a field name refused a completely
+	// safe capture (same review).
+	var captured, names strings.Builder
 	for _, span := range capturedSpan.FindAllString(text, -1) {
-		captured.WriteString(genSpan.ReplaceAllString(span, " "))
-		captured.WriteString("\n")
+		span = genSpan.ReplaceAllString(span, " ")
+		inHead := true
+		for _, ln := range strings.Split(span, "\n") {
+			bare := strings.TrimSuffix(strings.TrimSpace(stripMarks(ln)), "\r")
+			if inHead && bare == "" {
+				inHead = false
+			}
+			keep, ok := dataOf(bare)
+			if !ok {
+				continue
+			}
+			if keep != bare {
+				captured.WriteString(keep)
+				captured.WriteString("\n")
+				continue
+			}
+			captured.WriteString(ln)
+			captured.WriteString("\n")
+			if inHead {
+				if i, ok := headerNameEnd(bare); ok {
+					names.WriteString(bare[:i])
+					names.WriteByte('\n')
+				}
+			}
+		}
 	}
+	capturedNames := names.String()
 	text = captured.String()
 	// DECODE TO A FIXED POINT. One pass left `a%2522b` -- the ordinary shape when
 	// a URL is embedded in another URL's parameter -- decoding only to `a%22b`,
@@ -1070,7 +1143,7 @@ func assertNoLeak(text string) error {
 			continue
 		}
 		for _, f := range forms {
-			if containsValue(f, v) {
+			if containsValue(f, capturedNames, v) {
 				return fmt.Errorf(
 					"a supplied value of %d characters survived redaction in some "+
 						"encoding; the record is NOT publishable and was not printed",
@@ -1361,7 +1434,7 @@ func isNameByte(c byte) bool {
 // every otherwise good run exited 4 without printing. A guard whose matching is
 // stricter than the redaction it checks does not find leaks; it finds itself
 // (shardpilot/shardpilot-go#73 review).
-func containsValue(text, v string) bool {
+func containsValue(text, names, v string) bool {
 	if v == "" {
 		return false
 	}
@@ -1379,30 +1452,10 @@ func containsValue(text, v string) bool {
 	// both hyphens as boundaries and the capture exited 4
 	// (shardpilot/shardpilot-go#73 review). The permissive rule exists for field
 	// NAMES, where `-` is structural, so it is asked of the field names.
-	if containsValueWith(headerNames(text), v, isNameByte) {
+	if containsValueWith(names, v, isNameByte) {
 		return true
 	}
 	return containsValueWith(text, v, isWordByte)
-}
-
-// headerNames returns just the field NAMES in text, one per line -- the region
-// where the hyphen is structural rather than part of a word. Leading whitespace
-// is trimmed because the trailer block indents its lines.
-func headerNames(text string) string {
-	var b strings.Builder
-	for _, ln := range strings.Split(text, "\n") {
-		// ⚠ STRIP THE MARKS FIRST. The guard reads CAPTURED SPANS, and a span
-		// arrives with its provenance marks still attached -- so every line began
-		// with a byte that is not a token byte and no line was ever recognised as
-		// a header. The fixture that caught it is the one this convention exists
-		// for (shardpilot/shardpilot-go#73 review).
-		ln = strings.TrimSuffix(strings.TrimSpace(stripMarks(ln)), "\r")
-		if i, ok := headerNameEnd(ln); ok {
-			b.WriteString(ln[:i])
-			b.WriteByte('\n')
-		}
-	}
-	return b.String()
 }
 
 func containsValueWith(text, v string, isWord func(byte) bool) bool {
@@ -1460,6 +1513,29 @@ func replaceTokenFold(text, v, red string, isWord func(byte) bool) string {
 		}
 		text, lt = text[i+len(v):], lt[i+len(lv):]
 	}
+}
+
+// dataOf returns the part of a line the guard must read, dropping canonical
+// protocol SYNTAX this program re-serialises.
+//
+// ⚠ THE SYNTAX, NOT THE LINE. Dropping a whole request line also drops the
+// request TARGET, which is the query -- the most value-bearing bytes in the
+// capture -- and the fixture that pins "a mask must not swallow what it
+// protects" said so immediately. A status line carries no data; a request line
+// carries exactly one field of it.
+func dataOf(bare string) (string, bool) {
+	if strings.HasPrefix(bare, "HTTP/") {
+		return "", false
+	}
+	i := strings.LastIndex(bare, " HTTP/")
+	if i <= 0 {
+		return bare, true
+	}
+	target := bare[:i]
+	if j := strings.IndexByte(target, ' '); j >= 0 {
+		target = target[j+1:]
+	}
+	return target, true
 }
 
 func isASCII(s string) bool {

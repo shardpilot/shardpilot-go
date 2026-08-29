@@ -670,3 +670,63 @@ func TestARequestQueryIsWithheldWhole(t *testing.T) {
 		t.Fatalf("the path was destroyed with the query: %q", got)
 	}
 }
+
+// ---- round on bfac48f ----
+
+func TestWithholdingTheQueryKeepsTheRequestLine(t *testing.T) {
+	got := stripMarks(dropQuery("GET /v1/assign?subject_key=abc HTTP/1.1\r"))
+	if strings.Contains(got, "abc") {
+		t.Fatalf("a query value survived: %q", got)
+	}
+	if !strings.HasSuffix(got, " HTTP/1.1\r") {
+		t.Fatalf("the version and terminator were cut with the query: %q", got)
+	}
+	// A bare URL has no space and must still lose its query.
+	if bare := stripMarks(dropQuery("https://e.example/cb?t=1")); strings.Contains(bare, "t=1") {
+		t.Fatalf("a bare URL kept its query: %q", bare)
+	}
+}
+
+func TestAnEscapedMemberNameStillMakesTheCaptureUnpublishable(t *testing.T) {
+	structuralSurfaces = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	// ⚠ THE NAME IS SPELLED WITH AN ESCAPE. `\u0066` is `f`, so this is the same
+	// field to encoding/json and to the endpoint. Written with the PLAIN name --
+	// which is what I did first, twice in one day, in both halves -- this fixture
+	// asserts only what already passed, and the mutant said so both times.
+	dropFraming("HTTP/1.1 200 OK\r\n\r\n" + `{"subject_\u0066act_key":"sfk1_abababababab"}`)
+	if len(structuralSurfaces) == 0 {
+		t.Fatal("an escaped member name hid a minted key from the refusal")
+	}
+}
+
+func TestProtocolSyntaxIsNotReadAsCapturedData(t *testing.T) {
+	for _, v := range []string{"GET", "200"} {
+		suppliedValues = []string{v}
+		dump := asCaptured("GET /v1/assign HTTP/1.1\r\nHost: e.example\r\n") +
+			asCaptured("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nbody\r\n")
+		if err := assertNoLeak(dump); err != nil {
+			t.Errorf("supplied %q: protocol syntax was read as a leak: %v", v, err)
+		}
+		suppliedValues = nil
+	}
+	// But the same token in the request TARGET is data, and must still be caught.
+	suppliedValues = []string{"200"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured("GET /v1/200 HTTP/1.1\r\n")); err == nil {
+		t.Fatal("the request target was dropped along with the syntax")
+	}
+}
+
+func TestABodyLineShapedLikeAHeaderIsNotAFieldName(t *testing.T) {
+	suppliedValues = []string{"bar"}
+	t.Cleanup(func() { suppliedValues = nil })
+	dump := asCaptured("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nX-foo-bar: explanation\r\n")
+	if err := assertNoLeak(dump); err != nil {
+		t.Fatalf("a header-shaped BODY line was read as a field name: %v", err)
+	}
+	// And a real header name still is one.
+	if err := assertNoLeak(asCaptured("HTTP/1.1 200 OK\r\nX-foo-bar: v\r\n\r\n")); err == nil {
+		t.Fatal("a genuine field name stopped being checked under the name rule")
+	}
+}
