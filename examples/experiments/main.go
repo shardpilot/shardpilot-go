@@ -433,6 +433,28 @@ const respSection = "## Response%s — header block re-serialised by " +
 	"bodyless dump and is forbidden in HTTP/2, so a header here is not " +
 	"evidence that it was received.\n\n%s\n%s\n"
 
+// benignTopLevel are the assignment response's members this program has judged
+// non-identifying. A top-level member in neither this set nor mintedNames
+// refuses the capture.
+//
+// ⚠ THIS INVERTS WHERE A MISTAKE IN THE LIST LANDS. `mintedNames` is a JUDGEMENT
+// about which fields carry a subject, not a vocabulary, and it cannot be derived
+// here: the wire struct is unexported and the public result type does not carry
+// those members. So it is a list typed from memory -- and a list typed from
+// memory falls behind. `assignment_key` was missing until a reviewer named it,
+// and until then the harness PUBLISHED it (shardpilot/shardpilot-go#85 review).
+//
+// Asking the question the other way round does not make the list right; it makes
+// being wrong LOUD. A member neither list knows now refuses the capture and names
+// itself, so the fix is one line and the failure shows on the first run. The
+// trade is deliberate: a privacy tool that refuses an unfamiliar identifier costs
+// an operator a minute; one that publishes it costs the subject.
+var benignTopLevel = map[string]bool{
+	"assigned": true, "variant_key": true, "variant_payload": true,
+	"version": true, "reason": true, "boundary": true, "code": true,
+	"assignment_unit": true, "attributes": true, "experiment_key": true,
+}
+
 // ── the minted-field test, shared with the half this change builds on ────────
 //
 // ⚠ ONE PLACE ANSWERS "IS THIS A MINTED FIELD". The guard half REFUSES a capture
@@ -836,7 +858,7 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 		noteRequestName(req.URL.Host)
 	}
 	if dump, err := httputil.DumpRequestOut(req, true); err == nil {
-		ex.req = redact([]byte(escapeMarks(string(dump))))
+		ex.req = redact([]byte(escapeMarks(string(dump))), req.Header)
 	}
 
 	resp, err := r.inner.RoundTrip(req)
@@ -974,9 +996,23 @@ func (t *teeBody) Close() error {
 // program's own output and refused every run (shardpilot/shardpilot-go#84
 // review). The property is "written by the serialiser, not chosen by anyone", and
 // net/http writes exactly these two.
-var serialiserWritten = map[string]bool{"accept-encoding": true, "user-agent": true}
+// ⚠ DERIVED, NOT RECALLED. This was a list of the two header values I had seen
+// `net/http` add, and it fell behind once already: `Accept-Encoding` was there
+// and `User-Agent` was not, so a legal experiment key equal to the default agent
+// refused every run (shardpilot/shardpilot-go#84 review). The recorder knows
+// exactly which headers the SDK set, because it holds the request -- so a field
+// in the DUMP that is not in the request's own header map was written by the
+// serialiser, whatever it is called. The question "is this list derived or
+// recalled" has an answer here, and it did not before.
+func writtenBySerialiser(name string, ours http.Header) bool {
+	if ours == nil {
+		return false
+	}
+	_, set := ours[http.CanonicalHeaderKey(strings.TrimSpace(name))]
+	return !set
+}
 
-func redact(dump []byte) []byte {
+func redact(dump []byte, ours http.Header) []byte {
 	out := make([]string, 0, 32)
 	for _, line := range strings.Split(string(dump), "\n") {
 		if strings.HasPrefix(line, "GET ") || strings.HasPrefix(line, "POST ") {
@@ -1021,7 +1057,7 @@ func redact(dump []byte) []byte {
 			// endpoint did not send -- so a legal experiment key of `gzip` was
 			// found there and refused every run, exactly as the header NAMES and
 			// the auth scheme did before it (shardpilot/shardpilot-go#84 review).
-			if serialiserWritten[strings.ToLower(strings.TrimSpace(line[:i]))] {
+			if writtenBySerialiser(line[:i], ours) {
 				line = marked(strings.TrimSuffix(line, "\r")) + strings.TrimPrefix(line[len(strings.TrimSuffix(line, "\r")):], "")
 			} else {
 				line = marked(line[:i+1]) + line[i+1:]

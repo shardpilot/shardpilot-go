@@ -130,9 +130,9 @@ func redactQuery(line string) string {
 // so it is not mistaken for an oversight.
 var requestNames = map[string]bool{}
 
-func noteRequestName(n string) { requestNames[strings.TrimSpace(n)] = true }
+func noteRequestName(n string) { requestNames[ows(n)] = true }
 
-func nameIsOurs(n string) bool { return requestNames[strings.TrimSpace(n)] }
+func nameIsOurs(n string) bool { return requestNames[ows(n)] }
 
 func redactPairs(rest, opaqueNameBytes string) string {
 	parts := strings.Split(rest, "&")
@@ -246,7 +246,7 @@ func isSchemeName(v string) bool {
 }
 
 func parsesAsURI(target string) bool {
-	u, err := url.Parse(strings.TrimSpace(target))
+	u, err := url.Parse(ows(target))
 	if err != nil {
 		return false
 	}
@@ -415,7 +415,7 @@ func redactSetCookie(line string) string {
 		return marked("<withheld: unparseable Set-Cookie>")
 	}
 	pair, attrs, hasAttrs := strings.Cut(rest, ";")
-	name, value, hasValue := strings.Cut(strings.TrimSpace(pair), "=")
+	name, value, hasValue := strings.Cut(ows(pair), "=")
 	if !hasValue {
 		// `Set-Cookie: server-secret` is transport-valid and net/http keeps it.
 		// Returning it unchanged published a server-generated value the guard
@@ -466,7 +466,7 @@ func redactSetCookie(line string) string {
 					continue
 				}
 				{
-					parts[i] = " " + tokenPlaceholder(strings.TrimSpace(an))
+					parts[i] = " " + tokenPlaceholder(ows(an))
 				}
 				continue
 			}
@@ -481,14 +481,14 @@ func redactSetCookie(line string) string {
 				// stripped placeholder is captured text to the later scrub, which
 				// rewrote its prefix into the prose form and produced a name no
 				// cookie parser accepts (shardpilot/shardpilot-go#85 review).
-				parts[i] = " " + tokenPlaceholder(strings.TrimSpace(an)) +
-					"=" + placeholder(strings.TrimSpace(av))
+				parts[i] = " " + tokenPlaceholder(ows(an)) +
+					"=" + placeholder(ows(av))
 				continue
 			}
-			if cookieAttrVerbatim(an, strings.TrimSpace(av)) {
+			if cookieAttrVerbatim(an, ows(av)) {
 				continue
 			}
-			parts[i] = an + "=" + placeholder(strings.TrimSpace(av))
+			parts[i] = an + "=" + placeholder(ows(av))
 		}
 		out += ";" + strings.Join(parts, ";")
 	}
@@ -630,6 +630,18 @@ func redactMintedBody(body string) string {
 	// is nested", so a partial credential reached the artifact by the path that
 	// exists to publish what arrived (shardpilot/shardpilot-go#85 review). A
 	// parse that fails is not an answer about depth.
+	// ⚠ AND AN UNFAMILIAR TOP-LEVEL MEMBER REFUSES HERE TOO. The guard half asks
+	// this question in `noteMinted`; this half replaced that function with
+	// redaction and would have inherited nothing -- the fourth time the seam has
+	// dropped something the half it replaced was doing
+	// (shardpilot/shardpilot-go#85 review, found by the sweep).
+	for _, n := range topLevelMembers(body) {
+		low := strings.ToLower(n)
+		if !mintedNames[low] && !benignTopLevel[low] {
+			noteStructural("an unfamiliar top-level member, " + low +
+				", which this program has not judged")
+		}
+	}
 	parsed := topLevelMembers(body)
 	unparsable := parsed == nil && strings.Contains(body, "{")
 	top := map[string]bool{}
@@ -800,7 +812,7 @@ func isMediaTypeWithoutParameters(v string) bool {
 	// so `application/server-secret` printed an endpoint-chosen string through a
 	// field the criterion had declared safe (shardpilot/shardpilot-go#85 review).
 	// The same gap the directive lists had, in the one place I did not close it.
-	return registeredMediaTypes[strings.ToLower(strings.TrimSpace(v))]
+	return registeredMediaTypes[strings.ToLower(ows(v))]
 }
 
 // registeredDirectives are the closed vocabularies the specification fixes, per
@@ -851,16 +863,16 @@ func isDirectiveList(field string) func(string) bool {
 			return false
 		}
 		for _, part := range strings.Split(v, ",") {
-			part = strings.TrimSpace(part)
+			part = ows(part)
 			if part == "" {
 				return false
 			}
 			name, arg, hasArg := strings.Cut(part, "=")
-			if !known[strings.ToLower(strings.TrimSpace(name))] {
+			if !known[strings.ToLower(ows(name))] {
 				return false
 			}
 			if hasArg {
-				a := strings.TrimSpace(arg)
+				a := ows(arg)
 				if !isDigits(a) && !known[strings.ToLower(a)] {
 					return false
 				}
@@ -921,10 +933,10 @@ func admitFieldName(name string) string {
 }
 
 func redactFieldName(name string) string {
-	if registeredFieldNames[strings.ToLower(strings.TrimSpace(name))] {
+	if registeredFieldNames[strings.ToLower(ows(name))] {
 		return name
 	}
-	return tokenPlaceholder(strings.TrimSpace(name))
+	return tokenPlaceholder(ows(name))
 }
 
 // redactUnlessVerbatim lengthens a header value unless its field passes the
@@ -936,7 +948,7 @@ func redactFieldName(name string) string {
 // origin invents, and are lengthened.
 // standardCookieAttr reports a cookie attribute name the specification fixes.
 func standardCookieAttr(name string) bool {
-	switch strings.ToLower(strings.TrimSpace(name)) {
+	switch strings.ToLower(ows(name)) {
 	case "secure", "httponly", "partitioned", "path", "domain", "expires",
 		"max-age", "samesite", "priority":
 		return true
@@ -945,7 +957,7 @@ func standardCookieAttr(name string) bool {
 }
 
 func cookieAttrVerbatim(name, value string) bool {
-	switch strings.ToLower(strings.TrimSpace(name)) {
+	switch strings.ToLower(ows(name)) {
 	case "max-age":
 		return isDigits(value)
 	case "expires":
@@ -1022,7 +1034,7 @@ func redactUnlessVerbatim(line string) string {
 		return line
 	}
 	name, value, ok := strings.Cut(body, ":")
-	if !ok || !isTokenOnly(strings.TrimSpace(name)) {
+	if !ok || !isTokenOnly(ows(name)) {
 		return line
 	}
 	check, known := verbatimHeaders[strings.ToLower(ows(name))]

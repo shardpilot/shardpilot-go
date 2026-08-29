@@ -277,3 +277,55 @@ func TestStructureSurvivesTheNewerClauses(t *testing.T) {
 		}
 	})
 }
+
+// ── the two questions the coordinator turned into rules ──────────────────────
+//
+// "Is this list DERIVED or RECALLED?" and "what does this library predicate
+// accept BEYOND the grammar?" — asked of every list and every borrowed predicate
+// in this file, and pinned here so a new one has to answer them too.
+func TestListsAndBorrowedPredicates(t *testing.T) {
+	t.Run("an unfamiliar top-level member refuses rather than publishing", func(t *testing.T) {
+		structuralSurfaces = nil
+		suppliedValues = nil
+		t.Cleanup(func() { structuralSurfaces = nil })
+		dropFraming("HTTP/1.1 200 OK\r\n\r\n" + `{"assigned":true,"brand_new_identifier":"SRVGEN"}`)
+		if len(structuralSurfaces) == 0 {
+			t.Fatal("a member neither list knows was published instead of refused")
+		}
+	})
+	t.Run("a familiar response is still publishable", func(t *testing.T) {
+		structuralSurfaces = nil
+		suppliedValues = nil
+		t.Cleanup(func() { structuralSurfaces = nil })
+		dropFraming("HTTP/1.1 200 OK\r\n\r\n" +
+			`{"assigned":true,"variant_key":"a","version":3,"reason":"","boundary":{}}`)
+		if len(structuralSurfaces) != 0 {
+			t.Fatalf("an ordinary verdict was refused: %v", structuralSurfaces)
+		}
+	})
+	t.Run("serialiser-written values are derived from the request", func(t *testing.T) {
+		suppliedValues = []string{"gzip"}
+		t.Cleanup(func() { suppliedValues = nil })
+		raw := "GET /p HTTP/1.1\r\nHost: e.example\r\nAccept-Encoding: gzip\r\nX-Ours: gzip\r\n\r\n"
+		ours := http.Header{"Host": nil, "X-Ours": nil}
+		got := string(redact([]byte(escapeMarks(raw)), ours))
+		// The one WE set stays captured, so the scrub still reaches it; the one
+		// net/http wrote is generated. Neither is a name anyone typed into a list.
+		// A serialiser-written field is marked WHOLE; one we set has only its
+		// NAME marked, so the scrub still reaches its value.
+		if !strings.Contains(got, marked("Accept-Encoding: gzip")) {
+			t.Fatalf("a serialiser-written field was not derived as generated: %q", got)
+		}
+		if strings.Contains(got, marked("X-Ours: gzip")) {
+			t.Fatalf("a field WE set was misclassified as generated: %q", got)
+		}
+	})
+	t.Run("ows trims what HTTP calls whitespace and no more", func(t *testing.T) {
+		if ows(" x ") != " x " {
+			t.Fatal("ows removed a byte HTTP does not call whitespace")
+		}
+		if ows(" \tx\t ") != "x" {
+			t.Fatal("ows failed to remove real OWS")
+		}
+	})
+}

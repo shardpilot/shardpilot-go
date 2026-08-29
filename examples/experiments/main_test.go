@@ -243,7 +243,7 @@ func TestTrailerNamesAreScrubbedToo(t *testing.T) {
 
 func TestRedactedAuthorizationKeepsItsTerminator(t *testing.T) {
 	dump := []byte("GET /x HTTP/1.1\r\nAuthorization: Bearer tok\r\nHost: h\r\n\r\n")
-	got := string(redact(dump))
+	got := string(redact(dump, http.Header{"Host": nil}))
 	for _, line := range strings.Split(got, "\n") {
 		if line == "" {
 			continue
@@ -901,7 +901,7 @@ func TestProtocolTokensDoNotRefuseTheCapture(t *testing.T) {
 	for _, v := range []string{"Bearer", "Authorization", "Host", "User-Agent"} {
 		suppliedValues = []string{v}
 		raw := "GET /p HTTP/1.1\r\nHost: e.example\r\nAuthorization: Bearer abcdefgh\r\nUser-Agent: sp/1\r\n\r\n"
-		if err := assertNoLeak(asCaptured(string(redact([]byte(escapeMarks(raw)))))); err != nil {
+		if err := assertNoLeak(asCaptured(string(redact([]byte(escapeMarks(raw)), http.Header{"Host": nil})))); err != nil {
 			t.Errorf("supplied %q: fixed request syntax was read as a leak: %v", v, err)
 		}
 		suppliedValues = nil
@@ -988,7 +988,7 @@ func TestSerialiserWrittenHeaderValuesAreGenerated(t *testing.T) {
 	suppliedValues = []string{"gzip"}
 	t.Cleanup(func() { suppliedValues = nil })
 	raw := "GET /p HTTP/1.1\r\nHost: e.example\r\nAccept-Encoding: gzip\r\n\r\n"
-	if err := assertNoLeak(asCaptured(string(redact([]byte(escapeMarks(raw)))))); err != nil {
+	if err := assertNoLeak(asCaptured(string(redact([]byte(escapeMarks(raw)), http.Header{"Host": nil})))); err != nil {
 		t.Fatalf("a value net/http wrote itself was read as a leak: %v", err)
 	}
 }
@@ -1038,7 +1038,7 @@ func TestTheSerialiserUserAgentIsGenerated(t *testing.T) {
 	suppliedValues = []string{"Go-http-client/1.1"}
 	t.Cleanup(func() { suppliedValues = nil })
 	raw := "GET /p HTTP/1.1\r\nHost: e.example\r\nUser-Agent: Go-http-client/1.1\r\n\r\n"
-	if err := assertNoLeak(asCaptured(string(redact([]byte(escapeMarks(raw)))))); err != nil {
+	if err := assertNoLeak(asCaptured(string(redact([]byte(escapeMarks(raw)), http.Header{"Host": nil})))); err != nil {
 		t.Fatalf("the serialiser's own User-Agent was read as a leak: %v", err)
 	}
 }
