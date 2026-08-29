@@ -39,7 +39,13 @@
 #
 # ⚠ INSTALL BY COPY, NOT BY POINTING AT TRACKED CONTENT.
 #
-#     cp .githooks/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+#     h="$(git rev-parse --git-dir)/hooks"
+#     cp .githooks/pre-push "$h/pre-push"
+#     cp scripts/check_public_surface.sh "$h/"
+#     chmod +x "$h/pre-push" "$h/check_public_surface.sh"
+#
+# BOTH files, and for the same reason: everything this hook EXECUTES must come
+# from outside tracked content, or a branch you are inspecting supplies it.
 #
 # The earlier instruction was `git config core.hooksPath .githooks`, and it was
 # the vulnerability rather than the installation: core.hooksPath names a
@@ -101,8 +107,35 @@ hooks_off="$(mktemp -d)"
 git_safe() { git -c core.hooksPath="$hooks_off" "$@"; }
 
 root="$(git rev-parse --show-toplevel)"
-scanner="$root/scripts/check_public_surface.sh"
-[ -x "$scanner" ] || { printf 'pre-push: %s is missing or not executable\n' "$scanner" >&2; exit 1; }
+tracked_scanner="$root/scripts/check_public_surface.sh"
+
+# ⚠ THE SCANNER MUST BE TRUSTED TOO, AND THE TRACKED ONE IS NOT.
+#
+# Installing the HOOK outside the worktree closed one execution path and left
+# its twin open: `scripts/check_public_surface.sh` is tracked, so checking out an
+# untrusted contributor's branch and pushing it made this hook copy THAT
+# branch's scanner into the worktree and run it -- arbitrary code, before any
+# trustworthy scan, exactly the thing the hook exists to prevent
+# (shardpilot/shardpilot-go#79 review). Fixing the hook's own installation was
+# necessary and not sufficient: everything this hook EXECUTES has to come from
+# outside tracked content.
+scanner="$(git rev-parse --git-dir)/hooks/check_public_surface.sh"
+if [ ! -x "$scanner" ]; then
+  printf 'REFUSING: no trusted scanner at %s.\n' "$scanner" >&2
+  printf '  Install it beside the hook, from a checkout you trust:\n' >&2
+  printf '    cp scripts/check_public_surface.sh "$(git rev-parse --git-dir)/hooks/"\n' >&2
+  printf '    chmod +x "$(git rev-parse --git-dir)/hooks/check_public_surface.sh"\n' >&2
+  printf '  Running the TRACKED copy would execute whatever the checked-out\n' >&2
+  printf '  branch says it is.\n' >&2
+  exit 2
+fi
+# Reading tracked content is safe; executing it is not. A drift warning keeps the
+# trusted copy honest without trusting the branch.
+if [ -r "$tracked_scanner" ] && ! cmp -s "$scanner" "$tracked_scanner"; then
+  printf 'NOTE: the trusted scanner differs from %s.\n' "scripts/check_public_surface.sh" >&2
+  printf '  If that is an update you want, re-copy it; if it is a branch you are\n' >&2
+  printf '  inspecting, this is exactly why the copy exists.\n' >&2
+fi
 
 remote_name="${1:-origin}"
 # githooks(5): $2 is where the push is actually going. $1 may be a name or, for a
@@ -151,6 +184,7 @@ status=0
 # scanner's own path, and the rules applied are TODAY'S rather than the ones
 # that shipped with C. That is the right direction -- a rule added since C
 # should still catch what C published -- and it is a difference, so it is named.
+# scan_commit <commit> <base> <published-ref-name>
 scan_commit() {
   wt="$tmpdir/wt"
   rm -rf "$wt"
@@ -193,24 +227,31 @@ scan_commit() {
   # (shardpilot/shardpilot-go#79 review). Refused, not repaired: a commit
   # tracking this name is a finding.
   stage_evidence() {
-    if [ -e "$wt/$2" ] || [ -L "$wt/$2" ]; then
+    # ⚠ ASK THE COMMIT, NOT THE CHECKOUT. `git worktree add` preserves sparse
+    # checkout rules, so a path can be present in the index and absent from the
+    # filesystem -- and `[ -e ]` then reports a reserved evidence path free while
+    # the commit owns it (shardpilot/shardpilot-go#79 review).
+    if git cat-file -e "$1:$2" 2>/dev/null || [ -e "$wt/$2" ] || [ -L "$wt/$2" ]; then
       printf 'REFUSING: %s already tracks %s, which this gate needs as an\n' "$1" "$2" >&2
       printf '  evidence path. A commit that owns it can hide content from the\n' >&2
       printf '  scan or redirect this write outside the worktree.\n' >&2
       exit 2
     fi
-    cp "$3" "$wt/$2"
-    # ⚠ FORCED, AND A FAILURE REFUSES. A commit whose .gitignore covers the
-    # evidence path made the plain `git add` fail; `|| true` swallowed it, the
-    # scanner reads only the index, and the run reported clean without ever
-    # seeing the message or the committed scanner -- a silent skip wearing a
-    # pass (shardpilot/shardpilot-go#79 review).
-    if ! ( cd "$wt" && git_safe add -f "$2" >/dev/null 2>&1 ); then
+    # ⚠ WRITTEN TO THE INDEX DIRECTLY, PAST EVERY COMMIT-CONTROLLED FILTER.
+    # `git add` applies clean filters, so a commit adding `.gitattributes` with
+    # `filter=lfs` on a reserved path staged an LFS POINTER instead of the
+    # evidence -- the scanner reads the index, so the content it was given to
+    # examine was replaced by something clean (shardpilot/shardpilot-go#79
+    # review). `hash-object -w` plus `update-index --cacheinfo` writes the bytes
+    # as they are. A failure refuses: unstaged evidence is unread evidence, and
+    # this gate does not report on what it has not read.
+    blob="$( cd "$wt" && git_safe hash-object -w --no-filters -- "$3" 2>/dev/null )"
+    if [ -z "$blob" ] || ! ( cd "$wt" && git_safe update-index --add \
+         --cacheinfo "100644,$blob,$2" 2>/dev/null ); then
       printf 'REFUSING: could not stage %s for scanning in %s.\n' "$2" "$1" >&2
-      printf '  Unstaged evidence is unread evidence, and this gate does not\n' >&2
-      printf '  report on what it has not read.\n' >&2
       exit 2
     fi
+    cp "$3" "$wt/$2" 2>/dev/null || true
   }
 
   if [ -e "$wt/scripts/check_public_surface.sh" ]; then
@@ -229,6 +270,14 @@ scan_commit() {
   # and no second pattern list to drift.
   git cat-file commit "$1" > "$tmpdir/committed-object" 2>/dev/null || : > "$tmpdir/committed-object"
   stage_evidence "$1" scripts/commit-object-as-committed.txt "$tmpdir/committed-object"
+
+  # ⚠ AND THE REF NAME IS PUBLISHED. A clean tree, a clean object, and a branch
+  # called after an internal identifier still puts that identifier in the public
+  # repository -- the third widening of "what does a push make reachable", after
+  # trees and then commit objects (shardpilot/shardpilot-go#79 review). It is
+  # staged like the rest so the same rules read it.
+  printf '%s\n' "$3" > "$tmpdir/pushed-ref-name"
+  stage_evidence "$1" scripts/pushed-ref-as-committed.txt "$tmpdir/pushed-ref-name"
 
   cp "$scanner" "$wt/scripts/check_public_surface.sh"
   chmod +x "$wt/scripts/check_public_surface.sh"
@@ -331,7 +380,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       continue
     fi
     printf 'public surface: scanning %s (%s/%s)\n' "$(git rev-parse --short "$c")" "$i" "$n"
-    scan_commit "$c" "$base" || status=$?
+    scan_commit "$c" "$base" "$remote_ref" || status=$?
   done <<< "$commits"
   if [ -n "$skipped" ]; then
     # ⚠ REFUSING, NOT WARNING. The first version printed this and exited 0,

@@ -311,8 +311,13 @@ No Makefile — standard Go tooling.
 **Install the pre-push hook once, before your first push:**
 
 ```
-cp .githooks/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+h="$(git rev-parse --git-dir)/hooks"
+cp .githooks/pre-push "$h/pre-push"
+cp scripts/check_public_surface.sh "$h/"
+chmod +x "$h/pre-push" "$h/check_public_surface.sh"
 ```
+
+**Both files.** Everything the hook executes has to come from outside tracked content — the scanner as much as the hook — or a branch you are inspecting supplies its own checker.
 
 Copied rather than `core.hooksPath .githooks`: that setting names a directory, so pointing it at tracked content makes the hook that runs whatever the checked-out branch says it is — checking out someone else's branch and pushing it would execute their copy of the hook first. `.git/hooks/` is outside the worktree and no branch can write to it. Re-copy when the file changes.
 
