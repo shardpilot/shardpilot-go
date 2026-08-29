@@ -48,3 +48,12 @@
 # visible: a fixture needs a value's SHAPE, never its randomness. Repeat a short
 # pattern to the required length.
 fa107e25a30f2e0345fecacbc600ba7735b66ed2:examples/experiments/main_test.go:generic-api-key:398
+
+#
+# ⚠ NOT THIS BRANCH'S FINDING, AND THAT IS THE POINT. `ci.yml` fetches
+# `+refs/pull/*/head` before scanning history, so a fixture on ANY open pull
+# request reddens EVERY open pull request. This pin is for a commit on
+# shardpilot-go#73, carried here because the gate this branch must pass reads
+# that commit too. It dies when that ref stops being advertised, exactly like
+# every other entry -- pinned by finding, never by shape or path.
+4a63dd612905af4d4702d70e39d22b93806ed7ab:examples/experiments/main_test.go:generic-api-key:697

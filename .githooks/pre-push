@@ -304,13 +304,20 @@ scan_commit() {
   }
 
   # ⚠ THE BLOB, NOT THE CHECKOUT. `worktree add` runs the branch's own
-  # `.gitattributes`, so a commit assigning this path `ident` has its
-  # `$Id: ADR-0123 $` rewritten to `$Id: <blob-id> $` DURING checkout -- before
-  # anything here could read it. The clean transformed bytes were staged as
-  # evidence, the entry was then replaced by the trusted scanner, and the scanner
-  # excludes its own path, so the committed bytes were never examined by anything
-  # (shardpilot/shardpilot-go#79 review). The object database is the one copy the
-  # inspected branch cannot rewrite on the way out.
+  # `.gitattributes`, so the bytes that land in the worktree are not necessarily
+  # the bytes that were committed: with `working-tree-encoding` set on this path,
+  # a blob whose ASCII carries an internal identifier is transcoded on the way
+  # out and that identifier is absent from the file this used to copy. The
+  # transformed bytes were staged as evidence, the entry was then replaced by the
+  # trusted scanner, and the scanner excludes its own path, so the committed
+  # bytes were examined by nothing (shardpilot/shardpilot-go#79 review). The
+  # object database is the one copy the inspected branch cannot rewrite.
+  #
+  # ⚠ AND THE COMMENT DOES NOT CARRY THE EXAMPLE. The first version of these
+  # lines quoted the reviewer's sample identifier verbatim, and this repository's
+  # own public-surface gate refused the push that added it -- correctly. A review
+  # thread is not published; a comment in tracked content is. Describe the shape,
+  # never the instance.
   if git_safe cat-file -e "$1:scripts/check_public_surface.sh" 2>/dev/null; then
     if ! git_safe cat-file blob "$1:scripts/check_public_surface.sh" \
          > "$tmpdir/committed-scanner" 2>/dev/null; then
