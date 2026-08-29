@@ -95,12 +95,23 @@ remote_name="${1:-origin}"
 # direct-URL push, the URL itself.
 dest="${2:-$remote_name}"
 
+# ⚠ AND NEVER PRINT IT. A direct push URL or `remote.<name>.pushurl` can embed
+# `user:token@`, and a diagnostic that echoes it puts the credential in terminal
+# scrollback and CI logs -- a gate that exists to stop publication leaking one
+# by complaining (shardpilot/shardpilot-go#79 review). Messages use the NAME, or
+# a userinfo-stripped form when the name is itself a URL; the unmodified value
+# goes only to ls-remote and fetch.
+safe_dest="$remote_name"
+case "$safe_dest" in
+  *://*@*) safe_dest="$(printf '%s' "$safe_dest" | sed -E 's#(://)[^/@]*@#\1<redacted>@#')" ;;
+esac
+
 tmpdir="$(mktemp -d)"
 cleanup() {
   git_safe worktree remove --force "$tmpdir/wt" >/dev/null 2>&1 || true
   rm -rf "$tmpdir" "$hooks_off"
   git_safe worktree prune >/dev/null 2>&1 || true
-  git update-ref -d refs/prepush-base 2>/dev/null || true
+  git update-ref -d "refs/prepush-base-$$" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -157,10 +168,42 @@ scan_commit() {
   # pass and self-audits the staged replacement, so material added to THAT file
   # in THAT commit would never be examined and would publish anyway. It is moved
   # to a plain tracked path first, where it is read like any other file.
+  # stage_evidence <source-file> <relative-dest> -- puts something the scanner
+  # must read into the tree it is about to read.
+  #
+  # ⚠ THE DESTINATION MUST NOT ALREADY EXIST. A commit that tracks the evidence
+  # path would have its own file overwritten -- so material stored THERE would
+  # never be scanned -- and a destination shaped as a symlink would make the
+  # write land outside the worktree, which is the filesystem escape closed one
+  # finding earlier arriving through a second door
+  # (shardpilot/shardpilot-go#79 review). Refused, not repaired: a commit
+  # tracking this name is a finding.
+  stage_evidence() {
+    if [ -e "$wt/$2" ] || [ -L "$wt/$2" ]; then
+      printf 'REFUSING: %s already tracks %s, which this gate needs as an\n' "$1" "$2" >&2
+      printf '  evidence path. A commit that owns it can hide content from the\n' >&2
+      printf '  scan or redirect this write outside the worktree.\n' >&2
+      exit 2
+    fi
+    cp "$3" "$wt/$2"
+    ( cd "$wt" && git_safe add "$2" >/dev/null 2>&1 ) || true
+  }
+
   if [ -e "$wt/scripts/check_public_surface.sh" ]; then
-    mv "$wt/scripts/check_public_surface.sh" "$wt/scripts/scanner-as-committed.txt"
-    ( cd "$wt" && git_safe add scripts/scanner-as-committed.txt >/dev/null 2>&1 ) || true
+    cp "$wt/scripts/check_public_surface.sh" "$tmpdir/committed-scanner"
+    rm -f "$wt/scripts/check_public_surface.sh"
+    stage_evidence "$1" scripts/scanner-as-committed.txt "$tmpdir/committed-scanner"
   fi
+
+  # ⚠ A COMMIT MESSAGE IS PUBLISHED TOO. The tree is not the whole of what a
+  # push makes reachable: a clean tree with an internal identifier in its
+  # message publishes that identifier just as surely, and this hook read only
+  # trees (shardpilot/shardpilot-go#79 review). The message is staged as an
+  # ordinary file so the SAME rules read it -- no second scanner, no second
+  # pattern list to drift.
+  git log -1 --format=%B "$1" > "$tmpdir/committed-message" 2>/dev/null || : > "$tmpdir/committed-message"
+  stage_evidence "$1" scripts/commit-message-as-committed.txt "$tmpdir/committed-message"
+
   cp "$scanner" "$wt/scripts/check_public_surface.sh"
   chmod +x "$wt/scripts/check_public_surface.sh"
   ( cd "$wt" && git_safe add scripts/check_public_surface.sh >/dev/null 2>&1 ) || true
@@ -201,14 +244,20 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       branch="$(git ls-remote --symref -- "$dest" HEAD 2>/dev/null \
         | awk '$1=="ref:" && $3=="HEAD" {sub("refs/heads/","",$2); print $2; exit}')"
       if [ -z "$branch" ]; then
-        printf 'REFUSING: %s did not advertise a default branch (HEAD symref).\n' "$dest" >&2
+        printf 'REFUSING: %s did not advertise a default branch (HEAD symref).\n' "$safe_dest" >&2
         printf '  Guessing a name is how a fork or a rename becomes the wrong,\n' >&2
         printf '  higher baseline.\n' >&2
         exit 2
       fi
+      # ⚠ A UNIQUE REF PER INVOCATION. Resolving a shared ref "immediately"
+      # after fetching it is still two commands, and a concurrent push can land
+      # between them -- so the previous fix narrowed the window instead of
+      # closing it (shardpilot/shardpilot-go#79 review). A name no other
+      # invocation uses has no window at all.
+      base_ref="refs/prepush-base-$$"
       if ! git fetch --quiet -- "$dest" \
-           "+refs/heads/$branch:refs/prepush-base" 2>/dev/null; then
-        printf 'REFUSING: could not fetch %s from %s to compare against.\n' "$branch" "$dest" >&2
+           "+refs/heads/$branch:$base_ref" 2>/dev/null; then
+        printf 'REFUSING: could not fetch %s from %s to compare against.\n' "$branch" "$safe_dest" >&2
         exit 2
       fi
       # ⚠ RESOLVED TO A SHA IMMEDIATELY, and the ref dropped. Two concurrent
@@ -217,10 +266,10 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       # other's assignment and its scan -- comparing against another
       # destination's baseline (shardpilot/shardpilot-go#79 review). A SHA
       # cannot be overwritten.
-      base="$(git rev-parse --verify --quiet refs/prepush-base^{commit} || true)"
-      git update-ref -d refs/prepush-base 2>/dev/null || true
+      base="$(git rev-parse --verify --quiet "$base_ref^{commit}" || true)"
+      git update-ref -d "$base_ref" 2>/dev/null || true
       if [ -z "$base" ]; then
-        printf 'REFUSING: fetched %s from %s but it did not resolve.\n' "$branch" "$dest" >&2
+        printf 'REFUSING: fetched %s from %s but it did not resolve.\n' "$branch" "$safe_dest" >&2
         exit 2
       fi
       why="the default branch of the destination, ${branch}, because this push CREATES ${remote_ref:-the ref}"
