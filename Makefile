@@ -78,6 +78,30 @@ SHELL := /usr/bin/env bash
 # and the target refuses if it does not resolve afterwards
 # (shardpilot/shardpilot-go#77 review, reproduced by the reviewer).
 #
+# ⚠ AND DISCOVERY ASKS THE REMOTE, NOT THE LOCAL REPOSITORY. Six successive
+# findings were all one mistake: reimplementing git's ref resolution here and
+# keeping a list of its facts. `git remote set-head --auto` FAILS when the
+# tracking ref does not exist yet (a narrow fetch mapping, a default branch
+# called `trunk`), and the `|| true` hid it; a short name like `origin/main`
+# resolves to `refs/tags/origin/main` FIRST if such a tag exists; a fully
+# qualified `refs/remotes/origin/release` matched no remote prefix; a remote
+# whose name starts with `-` parsed as a fetch option. So:
+#
+#   * the default branch comes from `git ls-remote --symref origin HEAD` -- the
+#     remote's own answer -- and its absence is a REFUSAL, not a guess at `main`;
+#   * a failed explicit fetch is separated from an absent branch by asking
+#     `git ls-remote --heads`, so a transient error can no longer masquerade as
+#     "this branch does not exist" and silently drop a base;
+#   * every base is passed to the scanner as a canonical `refs/remotes/...`
+#     path, so no tag can shadow it;
+#   * `--` terminates options before every remote name;
+#   * GIT_NO_REPLACE_OBJECTS=1 is exported, because `refs/replace/*` is honoured
+#     by the diffs AND by `git write-tree` while a push publishes the ORIGINAL
+#     object and does not transfer the replacement -- so the gate could scan a
+#     clean replacement and publish the real one.
+#
+# Cost: one `ls-remote` round trip in addition to the fetches.
+#
 # ONE PATH, NOT TWO. The first fix protected only the override arm and left the
 # two automatically selected bases on the bare-fetch path -- the same defect,
 # fixed in one of the two places it lived. Every base now goes through
@@ -89,6 +113,7 @@ SHELL := /usr/bin/env bash
 # Cost: about a minute per base. Duplicate bases are scanned once.
 check:
 	@set -euo pipefail; \
+	export GIT_NO_REPLACE_OBJECTS=1; \
 	if [ "$(origin PUBLIC_SURFACE_BASE_REF)" = "command line" ]; then \
 	  printf 'REFUSING: pass the base ref in the ENVIRONMENT, not as a make variable.\n' >&2; \
 	  printf '  Make expands $$ in a command-line value, so a legal ref like\n' >&2; \
@@ -104,16 +129,17 @@ check:
 	  exit 2; \
 	fi; \
 	fetch_remote() { \
-	  if ! git fetch --quiet "$$1" 2>/dev/null; then \
+	  if ! git fetch --quiet -- "$$1" 2>/dev/null; then \
 	    printf 'REFUSING: could not fetch %s. A stale remote-tracking ref sits\n' "$$1" >&2; \
 	    printf '  at an older baseline and would silently weaken this gate.\n' >&2; \
 	    exit 2; \
 	  fi; \
 	}; \
 	remote_of() { \
+	  cand="$${1#refs/remotes/}"; \
 	  best=; \
 	  for r in $$(git remote); do \
-	    case "$$1" in "$$r"/*) [ $${#r} -gt $${#best} ] && best="$$r";; esac; \
+	    case "$$cand" in "$$r"/*) [ $${#r} -gt $${#best} ] && best="$$r";; esac; \
 	  done; \
 	  printf '%s' "$$best"; \
 	}; \
@@ -127,29 +153,38 @@ check:
 	    git rev-parse --verify --quiet "$$ref^{commit}" >/dev/null 2>&1 && bases+=("$$ref"); \
 	    return 0; \
 	  fi; \
-	  branch="$${ref#$$remote/}"; \
+	  branch="$${ref#refs/remotes/}"; branch="$${branch#$$remote/}"; \
+	  canon="refs/remotes/$$remote/$$branch"; \
 	  fetch_remote "$$remote"; \
-	  before=$$(git rev-parse --verify --quiet "$$ref^{commit}" 2>/dev/null || true); \
-	  if ! git fetch --quiet "$$remote" \
-	       "+refs/heads/$$branch:refs/remotes/$$remote/$$branch" 2>/dev/null; then \
-	    if [ "$$required" = required ]; then \
-	      printf 'REFUSING: %s could not be fetched explicitly.\n' "$$ref" >&2; \
-	      printf '  A local tracking ref may survive the branch being deleted or\n' >&2; \
-	      printf '  unadvertised, so proceeding would compare against a ref the\n' >&2; \
-	      printf '  remote no longer has -- an older, higher baseline.\n' >&2; \
+	  before=$$(git rev-parse --verify --quiet "$$canon^{commit}" 2>/dev/null || true); \
+	  if git fetch --quiet -- "$$remote" \
+	       "+refs/heads/$$branch:$$canon" 2>/dev/null; then \
+	    : ; \
+	  else \
+	    if git ls-remote --quiet --exit-code --heads -- "$$remote" \
+	         "refs/heads/$$branch" >/dev/null 2>&1; then \
+	      printf 'REFUSING: %s exists on %s but could not be fetched.\n' "$$branch" "$$remote" >&2; \
+	      printf '  That is a failure, not an absence -- a transient network error or a\n' >&2; \
+	      printf '  locked ref -- and treating it as absence would silently drop a base.\n' >&2; \
 	      exit 2; \
 	    fi; \
-	    printf 'NOTE: %s has no counterpart on %s; dropping it as a base.\n' "$$ref" "$$remote" >&2; \
+	    if [ "$$required" = required ]; then \
+	      printf 'REFUSING: %s is not on %s.\n' "$$branch" "$$remote" >&2; \
+	      printf '  A local tracking ref survives the branch being deleted, so proceeding\n' >&2; \
+	      printf '  would compare against a ref the remote no longer has.\n' >&2; \
+	      exit 2; \
+	    fi; \
+	    printf 'NOTE: %s has no counterpart on %s; dropping it as a base.\n' "$$branch" "$$remote" >&2; \
 	    return 0; \
 	  fi; \
-	  after=$$(git rev-parse --verify --quiet "$$ref^{commit}" 2>/dev/null || true); \
+	  after=$$(git rev-parse --verify --quiet "$$canon^{commit}" 2>/dev/null || true); \
 	  if [ -z "$$after" ]; then \
-	    printf 'REFUSING: %s does not resolve after fetching %s.\n' "$$ref" "$$remote" >&2; \
+	    printf 'REFUSING: %s does not resolve after fetching %s.\n' "$$canon" "$$remote" >&2; \
 	    exit 2; \
 	  fi; \
 	  [ "$$before" != "$$after" ] && printf 'public surface: %s refreshed %s -> %s\n' \
-	    "$$ref" "$${before:-absent}" "$$after"; \
-	  bases+=("$$ref"); \
+	    "$$canon" "$${before:-absent}" "$$after"; \
+	  bases+=("$$canon"); \
 	}; \
 	bases=(); \
 	if [ -n "$${PUBLIC_SURFACE_BASE_REF:-}" ]; then \
@@ -158,15 +193,15 @@ check:
 	  fetch_remote origin; \
 	  branch=$$(git rev-parse --abbrev-ref HEAD); \
 	  refresh_base "origin/$$branch" optional; \
-	  git remote set-head --auto origin >/dev/null 2>&1 || true; \
-	  default=$$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true); \
+	  default=$$(git ls-remote --symref -- origin HEAD 2>/dev/null \
+	    | awk '$$1=="ref:" && $$3=="HEAD" {sub("refs/heads/","",$$2); print $$2; exit}'); \
 	  if [ -z "$$default" ]; then \
-	    printf 'NOTE: origin/HEAD does not resolve, so the default branch is not\n' >&2; \
-	    printf '  known here; falling back to origin/main. On a fork or after a\n' >&2; \
-	    printf '  rename that base can be the wrong one.\n' >&2; \
-	    default=origin/main; \
+	    printf 'REFUSING: origin did not advertise a default branch (HEAD symref).\n' >&2; \
+	    printf '  Guessing a name here is how a fork or a renamed default silently\n' >&2; \
+	    printf '  becomes the wrong, higher baseline.\n' >&2; \
+	    exit 2; \
 	  fi; \
-	  refresh_base "$$default" required; \
+	  refresh_base "origin/$$default" required; \
 	fi; \
 	if [ $${#bases[@]} -eq 0 ]; then \
 	  printf 'REFUSING: no comparison base resolves. Fetch origin first.\n' >&2; \
