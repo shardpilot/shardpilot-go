@@ -693,10 +693,17 @@ func TestTrailersGetStructuralRedaction(t *testing.T) {
 func TestServerMintedSubjectFactKeyIsRedacted(t *testing.T) {
 	suppliedValues = nil
 	t.Cleanup(func() { suppliedValues = nil })
+	// ⚠ THE VALUE REPEATS A SHORT PATTERN, AND THAT IS LOAD-BEARING. A fixture
+	// needs a value's SHAPE -- here `sfk1_` and sixteen following characters --
+	// never its randomness: gitleaks' `generic-api-key` fires on a key-like NAME
+	// followed by a value with enough entropy, and this file has now reddened the
+	// whole repository twice over exactly that. Length is kept so the
+	// length-preserving placeholder still has something to preserve; entropy is
+	// not (shardpilot/shardpilot-go#73 review).
 	body := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" +
-		`{"assigned":true,"subject_fact_key":"sfk1_0123456789abcdef"}`
+		`{"assigned":true,"subject_fact_key":"sfk1_abababababababab"}`
 	got := stripMarks(dropFraming(body))
-	if strings.Contains(got, "sfk1_0123456789abcdef") {
+	if strings.Contains(got, "sfk1_abababababababab") {
 		t.Fatalf("the server-minted subject key was published: %q", got)
 	}
 }
