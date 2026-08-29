@@ -374,7 +374,10 @@ func noteStructural(what string) {
 
 // mintedNames are the fields the SERVER mints -- the fact lane's subject and its
 // privacy boundary, defined as such in experiments.go.
-var mintedNames = []string{"subject_fact_key", "subject_key_hash"}
+var mintedNames = map[string]bool{
+	"subject_fact_key": true,
+	"subject_key_hash": true,
+}
 
 // dropQuery removes a URL's query and fragment entirely, keeping the path. This
 // half cannot say how long each value was without the structural redactor, and a
@@ -413,7 +416,7 @@ func dropQuery(line string) string {
 // (shardpilot/shardpilot-go#84 review). This is the same defect the redaction
 // half had in its own pattern, reintroduced here by writing a second, simpler
 // detector for the same question.
-var jsonMember = regexp.MustCompile(
+var jsonMemberName = regexp.MustCompile(
 	`"((?:[^"\\]|\\.)*)"(\s*:\s*)`)
 
 // jsonString decodes a JSON string body -- the bytes BETWEEN the quotes -- to
@@ -426,28 +429,36 @@ func jsonString(raw string) (string, bool) {
 	return out, true
 }
 
-func noteMinted(body string) string {
-	for _, m := range jsonMember.FindAllStringSubmatch(body, -1) {
-		name, ok := jsonString(m[1])
-		if !ok {
-			continue
+// isMinted reports whether a raw JSON member name denotes a server-minted field,
+// under the decoding AND the folding `encoding/json` itself applies.
+//
+// ⚠ THIS IS THE ONE PLACE THAT ANSWERS THE QUESTION, and that is the fix for a
+// class rather than a case. The change that adds structural redaction needs the
+// same test in order to REDACT what this half REFUSES, and it used to answer it
+// again in its own file. The two copies then drifted three rounds running --
+// literal substring, ASCII case, Unicode fold -- each time the copy that had
+// already been corrected failing to correct the other
+// (shardpilot/shardpilot-go#84, #85 review). A stand-in cannot inherit a history
+// of fixes; shared code does not need to.
+func isMinted(raw string) bool {
+	name, ok := jsonString(raw)
+	if !ok {
+		return false
+	}
+	for n := range mintedNames {
+		if strings.EqualFold(name, n) {
+			return true
 		}
-		// ⚠ FOLDED: `encoding/json` matches a field case-insensitively, so
-		// `SUBJECT_FACT_KEY` is the same field to the SDK and to the endpoint
-		// (shardpilot/shardpilot-go#84 review).
-		// ⚠ `encoding/json` FOLDS WITH UNICODE SEMANTICS, and `strings.ToLower` does
-		// not -- it leaves the long-s `ſ` alone while the decoder binds it to `s`
-		// and populates the field (shardpilot/shardpilot-go#84 review). When a
-		// check exists to AGREE WITH A DECODER, the comparison must be the
-		// decoder's, not a convenient approximation.
-		//
-		// ⚠ AND THIS IS THE THIRD DEFECT THIS STAND-IN HAS ACQUIRED THAT THE
-		// REDACTOR IT STANDS IN FOR HAD ALREADY FIXED -- literal match, then
-		// ASCII case, now Unicode fold. A stand-in is simpler than the original
-		// because it does not carry what the original learned, and it keeps
-		// learning the same things again.
-		if slices.ContainsFunc(mintedNames, func(n string) bool { return strings.EqualFold(name, n) }) {
-			noteStructural("the server-minted " + name)
+	}
+	return false
+}
+
+// noteMinted records a server-minted field's presence and returns the body
+// unchanged -- the caller does not publish a body this reports on.
+func noteMinted(body string) string {
+	for _, m := range jsonMemberName.FindAllStringSubmatch(body, -1) {
+		if isMinted(m[1]) {
+			noteStructural("the server-minted " + strings.ToLower(m[1]))
 		}
 	}
 	return body
