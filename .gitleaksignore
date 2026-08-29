@@ -30,3 +30,21 @@
 # Pinned per finding, not allowlisted by shape, per this file's rule: this entry
 # dies when the commit stops being advertised and forgives nothing anywhere else.
 626d0f95da37c5b853cb9adf02772ffaf828741c:examples/experiments/main_test.go:generic-api-key:199
+
+# One generic-api-key hit on fa107e25, in refs/pull/73/head and no branch or tag.
+# Classified 2026-08-29 as NOT a credential: a 38-character hex literal in a test
+# fixture, standing in for an SDK-minted `spcid_` subject id so the fixture can
+# check that a GENERATED placeholder is not read as a leak. The rule fired on the
+# entropy of the literal, not on its meaning.
+#
+# ⚠ SECOND ENTRY OF THIS EXACT SHAPE TODAY, and by the same author. The first
+# (626d0f95, above) taught the cure -- pin by finding, never by shape -- and not
+# the prevention, so a high-entropy literal went into another fixture four hours
+# later. shardpilot-go#73 has replaced it with a repeating low-entropy value of
+# the same length, so no tree contains it; only the pull ref does, and only until
+# that ref stops being advertised.
+#
+# The prevention, written here because this file is where the recurrence is
+# visible: a fixture needs a value's SHAPE, never its randomness. Repeat a short
+# pattern to the required length.
+fa107e25a30f2e0345fecacbc600ba7735b66ed2:examples/experiments/main_test.go:generic-api-key:398
