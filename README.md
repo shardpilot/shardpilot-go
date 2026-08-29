@@ -318,10 +318,19 @@ cp scripts/check_public_surface.sh "$h/.check_public_surface.sh.new" &&
 chmod +x "$h/.pre-push.new" "$h/.check_public_surface.sh.new" &&
 mv "$h/.pre-push.new" "$h/pre-push" &&
 mv "$h/.check_public_surface.sh.new" "$h/check_public_surface.sh" &&
-git config --local core.hooksPath "$h"
+git config --worktree --unset-all core.hooksPath 2>/dev/null || true &&
+git config --local core.hooksPath "$h" &&
+test "$(git rev-parse --path-format=absolute --git-path hooks)" = "$h"
 ```
 
-**Both files**, an ABSOLUTE path, published by RENAME, and `core.hooksPath` **pinned locally** rather than unset. Everything the hook executes must come from outside tracked content — the scanner as much as the hook. `--git-dir` names the per-worktree directory in a linked worktree while git reads hooks from the common one. And an unqualified `--unset` cannot clear a *global* or *system* `core.hooksPath`: with one inherited, git keeps resolving hooks from there and the gate is never invoked. A local setting overrides an inherited one.
+**Both files**, an ABSOLUTE path, published by RENAME, and `core.hooksPath` **pinned locally** rather than unset. Everything the hook executes must come from outside tracked content — the scanner as much as the hook. `--git-dir` names the per-worktree directory in a linked worktree while git reads hooks from the common one. And an unqualified `--unset` cannot clear a *global* or *system* `core.hooksPath`: with one inherited, git keeps resolving hooks from there and the gate is never invoked. A local setting overrides an inherited one — but NOT a worktree-scoped one.
+
+With `extensions.worktreeConfig` enabled, a `core.hooksPath` written at worktree
+scope outranks `--local`, so the install could report success while pushes went
+on running the previous hook directory, or none. The worktree value is cleared
+first, and the last line VERIFIES the effective path rather than trusting the
+write: an installation that cannot show git resolving hooks where it put them has
+not installed anything.
 
 Two more things that look like fussiness and are not. `--git-common-dir` answers
 `.git` in the main worktree, and git resolves a RELATIVE `core.hooksPath` against

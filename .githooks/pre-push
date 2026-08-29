@@ -95,7 +95,11 @@ tmpdir="$(mktemp -d)"
 cleanup() {
   git_safe worktree remove --force "$tmpdir/wt" >/dev/null 2>&1 || true
   rm -rf "$tmpdir" "$hooks_off"
-  git_safe worktree prune >/dev/null 2>&1 || true
+  # ⚠ NO GLOBAL PRUNE. `git worktree prune` removes the administrative record of
+  # EVERY missing worktree, not only this one -- so an unrelated worktree on a
+  # temporarily disconnected mount lost its metadata, and came back as "not a
+  # repository" (shardpilot/shardpilot-go#79 review). Cleanup removes what this
+  # hook created and nothing else.
   git update-ref -d "refs/prepush-base-$$" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -235,8 +239,26 @@ scan_ref_name() {
 scan_commit() {
   wt="$tmpdir/wt"
   rm -rf "$wt"
-  if ! git_safe worktree add --detach --quiet "$wt" "$1" 2>/dev/null; then
+  # ⚠ NO CHECKOUT. `worktree add` runs the CLEAN and SMUDGE drivers a
+  # `.gitattributes` in the inspected history names -- so a commit that assigns a
+  # locally configured filter, even one a later commit removes, made this hook
+  # execute that program on attacker-controlled bytes BEFORE the scanner ran.
+  # Redirecting hooks does not help: a filter driver is not a hook
+  # (shardpilot/shardpilot-go#79 review). The scanner reads its bytes with
+  # `git cat-file blob :<path>`, from the INDEX, so an index is all it needs and
+  # a working tree is what it never wanted.
+  if ! git_safe worktree add --detach --no-checkout --quiet "$wt" "$1" 2>/dev/null; then
     printf 'REFUSING: could not create a worktree at %s to scan it.\n' "$1" >&2
+    exit 2
+  fi
+  # ⚠ `--no-checkout` LEAVES THE INDEX EMPTY, IT DOES NOT POPULATE IT. The
+  # scanner enumerates with `git ls-files` and reads with `cat-file blob :<path>`,
+  # so an empty index makes every file invisible and the run reports a clean tree
+  # it never looked at -- which is the worst outcome this hook has, and the first
+  # rig probe caught it immediately (the scanner's own roster self-check failed,
+  # because nothing existed to find the names in).
+  if ! ( cd "$wt" && git_safe read-tree "$1" ) 2>/dev/null; then
+    printf 'REFUSING: could not read the tree of %s into an index to scan it.\n' "$1" >&2
     exit 2
   fi
 
@@ -364,9 +386,19 @@ scan_commit() {
     stage_evidence "$1" scripts/tag-object-as-committed.txt "$4"
   fi
 
+  # ⚠ AND `git add` IS A CLEAN FILTER TOO. Staging the trusted scanner with it
+  # would run whatever driver the branch's attributes name, on the way in
+  # (shardpilot/shardpilot-go#79 review). The file is written to disk because the
+  # shell must execute it -- these are OUR bytes, not the branch's -- and staged
+  # by object id, past the filters entirely.
+  mkdir -p "$wt/scripts"
   cp "$scanner" "$wt/scripts/check_public_surface.sh"
   chmod +x "$wt/scripts/check_public_surface.sh"
-  ( cd "$wt" && git_safe add scripts/check_public_surface.sh >/dev/null 2>&1 ) || true
+  sblob="$( git_safe hash-object -w --no-filters -- "$scanner" 2>/dev/null )"
+  if [ -n "$sblob" ]; then
+    ( cd "$wt" && git_safe update-index --add \
+      --cacheinfo "100755,$sblob,scripts/check_public_surface.sh" >/dev/null 2>&1 ) || true
+  fi
   ( cd "$wt" && PUBLIC_SURFACE_BASE_REF="$2" ./scripts/check_public_surface.sh )
   rc=$?
   git_safe worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
@@ -397,7 +429,12 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # LIGHTWEIGHT tag points straight at the commit and peels to itself -- so
   # `git push origin tag v1` for a tag on an earlier commit was refused, though
   # its target is exactly as scannable (shardpilot/shardpilot-go#79 review).
-  case "$local_ref" in
+  # ⚠ THE DESTINATION SAYS WHAT IS BEING PUBLISHED, NOT THE SOURCE.
+  # `git push origin HEAD~1:refs/tags/v1` supplies `HEAD~1` as the local ref, so
+  # classifying by it rejected a valid tag push and demanded --no-verify for an
+  # operation git explicitly permits (shardpilot/shardpilot-go#79 review). What
+  # the remote will hold is what matters.
+  case "$remote_ref" in
     refs/tags/*) is_tag=yes ;;
     *) is_tag=no ;;
   esac
