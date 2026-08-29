@@ -61,6 +61,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf16"
 	"unicode/utf8"
@@ -431,11 +432,30 @@ func noteMinted(body string) string {
 		if !ok {
 			continue
 		}
-		if slices.Contains(mintedNames, name) {
+		// ⚠ FOLDED: `encoding/json` matches a field case-insensitively, so
+		// `SUBJECT_FACT_KEY` is the same field to the SDK and to the endpoint
+		// (shardpilot/shardpilot-go#84 review).
+		if slices.Contains(mintedNames, strings.ToLower(name)) {
 			noteStructural("the server-minted " + name)
 		}
 	}
 	return body
+}
+
+// verdictValue renders a value the SDK decoded, for the verdict block.
+//
+// ⚠ IT IS A FUNCTION SO THE FIXTURE READS THE CALL SITE. Written inline, the
+// test could only re-assemble the same three calls in its own body and would
+// have passed while the report did something else -- which is exactly what
+// happened: the mutant that reverted the call site survived a fixture composing
+// the pipeline itself (shardpilot/shardpilot-go#84 review).
+//
+// ⚠ AND THE ORDER IS escape, scrub, strip. A variant key containing a reserved
+// marker byte was DELETED by stripMarks -- `a<NUL>b` reported as `ab` -- while
+// the response block, which escapes first, kept it, so the artifact misstated
+// the assignment the SDK served.
+func verdictValue(v string) string {
+	return stripMarks(scrubSupplied(escapeMarks(v)))
 }
 
 func dropFraming(dump string) string {
@@ -528,21 +548,54 @@ func dropFraming(dump string) string {
 }
 
 type recorder struct {
+	// ⚠ GUARDED, because this transport is shared with the SDK's ingest worker,
+	// which flushes on its own timer from another goroutine. Even with the
+	// off-route filter above returning early, the counter and the slice are
+	// touched concurrently (shardpilot/shardpilot-go#84 review).
+	mu        sync.Mutex
 	inner     http.RoundTripper
 	exchanges []exchange
+	// offRoute counts requests this recorder deliberately did not record. It is
+	// PRINTED: "the ingest leg is not exercised" then stops being a comment and
+	// becomes a number the run either shows as zero or does not.
+	offRoute int
 }
 
 // last is the attempt whose verdict the program reports. It is the last one
 // BECAUSE that is the one the SDK acted on, not because the others did not
 // happen -- every one of them is printed.
 func (r *recorder) last() *exchange {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if len(r.exchanges) == 0 {
 		return nil
 	}
 	return &r.exchanges[len(r.exchanges)-1]
 }
 
+// assignmentRoute is the ONLY path this recorder records.
+//
+// ⚠ THE SDK HAS A SECOND LEG, AND IT SHARES THIS TRANSPORT. Applying an
+// assignment enqueues an automatic `experiment_exposure`, and the ingest worker
+// flushes on its own timer through the same `HTTPClient` -- so on a run that
+// settles near the tick, an ingest POST was recorded as another supposed
+// assignment attempt, could change which exchange `last()` returns, and raced
+// the report's own reads of `exchanges`. The configuration comment claiming
+// the ingest leg is "NOT exercised" was an intention, not a fact
+// (shardpilot/shardpilot-go#84 review).
+//
+// Filtering here rather than trusting a config knob makes it a fact: anything
+// that is not an assignment passes through unrecorded, and is COUNTED, so the
+// claim is checked on every run instead of asserted once in a comment.
+const assignmentRoute = "/api/v1/runtime/experiments/assignment"
+
 func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL == nil || !strings.HasSuffix(req.URL.Path, assignmentRoute) {
+		r.mu.Lock()
+		r.offRoute++
+		r.mu.Unlock()
+		return http.DefaultTransport.RoundTrip(req)
+	}
 	ex := exchange{}
 	// EVERY QUERY VALUE THE SDK SENDS JOINS THE SCRUB SET, not only the values
 	// this program supplied from the environment.
@@ -570,7 +623,11 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 		// because a recorder that keeps the request and loses the failure lets
 		// the program print a pair whose second half never existed.
 		ex.transErr = err
+		r.mu.Lock()
+		r.mu.Lock()
 		r.exchanges = append(r.exchanges, ex)
+		r.mu.Unlock()
+		r.mu.Unlock()
 		return nil, err
 	}
 
@@ -591,7 +648,9 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 		ex.head = d
 	}
 	ex.captured = captured
+	r.mu.Lock()
 	r.exchanges = append(r.exchanges, ex)
+	r.mu.Unlock()
 	return resp, nil
 }
 
@@ -627,6 +686,19 @@ type teeBody struct {
 // apart and guessing is the defect.
 const capturedBodyMax = (1 << 20) + 1
 
+// snapTrailers copies the trailer block as it stands now.
+//
+// ⚠ IT IS CALLED ON CLOSE AS WELL AS AT EOF. When a body is EXACTLY the read
+// ceiling and also carries trailers -- a legal HTTP/2 shape -- the SDK's own
+// io.LimitReader synthesises EOF without calling Read again, so this wrapper
+// never saw one. The record then announced a `Trailer` field and omitted its
+// contents while calling the pair complete (shardpilot/shardpilot-go#84 review).
+func (t *teeBody) snapTrailers() {
+	if t.resp != nil && len(t.resp.Trailer) > 0 {
+		t.trailer = t.resp.Trailer.Clone()
+	}
+}
+
 func (t *teeBody) Read(p []byte) (int, error) {
 	n, err := t.inner.Read(p)
 	if n > 0 {
@@ -648,14 +720,12 @@ func (t *teeBody) Read(p []byte) (int, error) {
 	}
 	if err == io.EOF && !t.sawEOF {
 		t.sawEOF = true
+		t.snapTrailers()
 		// TRAILERS ARRIVE WITH THE LAST CHUNK, NOT WITH THE HEAD. The response
 		// head was dumped before the SDK read anything, when resp.Trailer held
 		// only DECLARED keys and no values; a record built from that head
 		// announced `Trailer: X` and then omitted X entirely, while still
 		// calling the pair complete (shardpilot/shardpilot-go#73 review).
-		if t.resp != nil && len(t.resp.Trailer) > 0 {
-			t.trailer = t.resp.Trailer.Clone()
-		}
 	}
 	if err != nil && err != io.EOF {
 		t.err = err
@@ -663,7 +733,12 @@ func (t *teeBody) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func (t *teeBody) Close() error { return t.inner.Close() }
+func (t *teeBody) Close() error {
+	// The last chance to see trailers: an exact-ceiling body reaches EOF inside
+	// the SDK's own limiter and never calls Read again.
+	t.snapTrailers()
+	return t.inner.Close()
+}
 
 func redact(dump []byte) []byte {
 	out := make([]string, 0, 32)
@@ -1068,6 +1143,9 @@ func assertNoLeak(text string) error {
 		}
 	}
 	capturedNames := names.String()
+	curNames := capturedNames
+	nameForms := []string{capturedNames}
+	var extra []string
 	text = captured.String()
 	// DECODE TO A FIXED POINT. One pass left `a%2522b` -- the ordinary shape when
 	// a URL is embedded in another URL's parameter -- decoding only to `a%22b`,
@@ -1112,6 +1190,22 @@ func assertNoLeak(text string) error {
 		// limit that undercounts by the number of stages is not fail-closed
 		// (shardpilot/shardpilot-go#73 review).
 		for _, stage := range []func(string) string{undoPercent, undoUnicodeEscapes, undoBase64, undoHex, undoPlus, undoEntities} {
+			// ⚠ THE NAMES DECODE TOO, IN LOCKSTEP. `capturedNames` was extracted
+			// once from the RAW span, so a field name spelling a short supplied
+			// value in an escape -- `X-%62ar` for `bar` -- decoded in the text but
+			// never in the names, and the name-boundary rule that exists for
+			// exactly that case never saw it (shardpilot/shardpilot-go#84 review).
+			curNames = stage(curNames)
+			nameForms = append(nameForms, curNames)
+			// ⚠ THE EXTRA CANDIDATE GOES IN ITS OWN SLICE. base64 is MIME-WRAPPED at
+			// column 76 and the scanner reads each line as its own token, so every
+			// fragment decoded separately and no retained form held the value a
+			// standard decoder reconstructs directly (shardpilot/shardpilot-go#84
+			// review). It must NOT join `forms`: that slice's length is the
+			// fixed-point comparison's arithmetic, and adding to it per stage made
+			// the loop compare against a mid-round form and settle early -- three
+			// existing decoder fixtures said so immediately.
+			extra = append(extra, strings.Join(strings.Fields(cur), ""))
 			work += len(cur)
 			if work > decodeWorkMax {
 				return fmt.Errorf(
@@ -1142,8 +1236,8 @@ func assertNoLeak(text string) error {
 		if v == "" {
 			continue
 		}
-		for _, f := range forms {
-			if containsValue(f, capturedNames, v) {
+		for _, f := range append(append([]string{}, forms...), extra...) {
+			if containsValue(f, strings.Join(nameForms, "\n"), v) {
 				return fmt.Errorf(
 					"a supplied value of %d characters survived redaction in some "+
 						"encoding; the record is NOT publishable and was not printed",
@@ -1309,6 +1403,17 @@ func undoPercent(text string) string {
 func undoUnicodeEscapes(text string) string {
 	var b strings.Builder
 	for i := 0; i < len(text); i++ {
+		// ⚠ `\U` IS EIGHT DIGITS, `\u` IS FOUR. Treating them alike consumed only
+		// the first four of `\U0001F600`, yielding U+0001 and leaving `F600`
+		// behind, so a non-BMP character in a supplied value was never
+		// reconstructed (shardpilot/shardpilot-go#84 review).
+		if text[i] == '\\' && i+9 < len(text) && text[i+1] == 'U' {
+			if r, err := strconv.ParseUint(text[i+2:i+10], 16, 32); err == nil && r <= 0x10FFFF {
+				b.WriteRune(rune(r))
+				i += 9
+				continue
+			}
+		}
 		if text[i] == '\\' && i+5 < len(text) && (text[i+1] == 'u' || text[i+1] == 'U') {
 			if r, err := strconv.ParseUint(text[i+2:i+6], 16, 32); err == nil {
 				// A NON-BMP CHARACTER IS SPELLED AS A SURROGATE PAIR, and writing
@@ -1525,6 +1630,16 @@ func replaceTokenFold(text, v, red string, isWord func(byte) bool) string {
 // carries exactly one field of it.
 func dataOf(bare string) (string, bool) {
 	if strings.HasPrefix(bare, "HTTP/") {
+		// ⚠ THE REASON PHRASE IS NOT SYNTAX. `Response.Write` re-serialises the
+		// version and the numeric code, but it carries the PARSED reason through
+		// -- so `HTTP/1.1 400 secret99` from an endpoint or proxy is server text,
+		// and dropping the whole line published it while the scrub was
+		// deliberately leaving the line alone (shardpilot/shardpilot-go#84
+		// review). Version and code go; whatever follows them stays.
+		f := strings.SplitN(bare, " ", 3)
+		if len(f) == 3 {
+			return f[2], true
+		}
 		return "", false
 	}
 	i := strings.LastIndex(bare, " HTTP/")
@@ -1638,7 +1753,11 @@ func main() {
 
 	result, fetchErr := client.FetchExperimentAssignment(ctx, env("SP_EXPERIMENT_KEY"), nil)
 
-	if len(rec.exchanges) == 0 {
+	rec.mu.Lock()
+	exchanges := append([]exchange{}, rec.exchanges...)
+	offRoute := rec.offRoute
+	rec.mu.Unlock()
+	if len(exchanges) == 0 {
 		fmt.Fprintf(os.Stderr,
 			"no request made: the SDK returned %v without issuing one, so this "+
 				"run says nothing about the endpoint\n", sanitize(fetchErr))
@@ -1647,13 +1766,21 @@ func main() {
 
 	var report strings.Builder
 	fmt.Fprintf(&report, "# assignment capture — %s\n\n", time.Now().UTC().Format(time.RFC3339))
-	if len(rec.exchanges) > 1 {
+	// ⚠ PRINTED, SO THE CLAIM IS CHECKED. The configuration says the ingest leg
+	// is not exercised; this is the run's own answer to that, and a non-zero
+	// value means the SDK's exposure worker used the same transport while the
+	// capture was being taken (shardpilot/shardpilot-go#84 review). A counter
+	// nothing reads would be worse than no counter.
+	fmt.Fprintf(&report, "Requests seen on other routes and NOT recorded: **%d**. "+
+		"The ingest leg shares this transport; zero is the expected answer and the "+
+		"reason it is printed rather than assumed.\n\n", offRoute)
+	if len(exchanges) > 1 {
 		fmt.Fprintf(&report, "The SDK made **%d attempts**. All are below; the verdict is the "+
-			"last, because that is the one it acted on.\n\n", len(rec.exchanges))
+			"last, because that is the one it acted on.\n\n", len(exchanges))
 	}
-	for i, ex := range rec.exchanges {
+	for i, ex := range exchanges {
 		label := ""
-		if len(rec.exchanges) > 1 {
+		if len(exchanges) > 1 {
 			label = fmt.Sprintf(" %d", i+1)
 		}
 		reqText := asCaptured(string(ex.req))
@@ -1694,7 +1821,7 @@ func main() {
 
 	last := rec.last()
 	fmt.Fprintf(&report, "## SDK verdict\n\n")
-	fmt.Fprintf(&report, "    attempts: %d\n", len(rec.exchanges))
+	fmt.Fprintf(&report, "    attempts: %d\n", len(exchanges))
 	fmt.Fprintf(&report, "    status:   %d\n", last.status)
 	fmt.Fprintf(&report, "    assigned: %t\n", result.Assigned)
 	fmt.Fprintf(&report, "    protocol: %q\n", last.proto)
@@ -1702,7 +1829,11 @@ func main() {
 	// identifier -- an experiment and a variant both named `control` is a valid
 	// response -- and the property is that a supplied value is never printed
 	// back WHEREVER it appears, not only in the body.
-	fmt.Fprintf(&report, "    variant:  %q\n", stripMarks(scrubSupplied(result.VariantKey)))
+	// ⚠ ESCAPED FIRST. A variant key containing a reserved marker byte was DELETED
+	// from the verdict by stripMarks -- `a<NUL>b` reported as `ab` -- while the
+	// response block, which escapes before stripping, kept it. The artifact then
+	// misstated the assignment the SDK served (shardpilot/shardpilot-go#84 review).
+	fmt.Fprintf(&report, "    variant:  %q\n", verdictValue(result.VariantKey))
 	fmt.Fprintf(&report, "    reason:   %q\n", stripMarks(scrubSupplied(result.Reason)))
 	// The SDK's own classification. A 404 returns a usable result with
 	// Code "not_found", Assigned false and a NIL error, so omitting this showed

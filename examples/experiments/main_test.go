@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"io"
 	"net/http"
 	"net/url"
@@ -730,3 +731,97 @@ func TestABodyLineShapedLikeAHeaderIsNotAFieldName(t *testing.T) {
 		t.Fatal("a genuine field name stopped being checked under the name rule")
 	}
 }
+
+// ---- round on 6b28540 ----
+
+func TestFieldNamesAreDecodedBeforeTheNameBoundaryApplies(t *testing.T) {
+	suppliedValues = []string{"bar"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured("HTTP/1.1 200 OK\r\nX-%62ar: v\r\n\r\n")); err == nil {
+		t.Fatal("an escaped field name hid a supplied value from the name rule")
+	}
+}
+
+func TestTheReasonPhraseIsCheckedLikeData(t *testing.T) {
+	suppliedValues = []string{"secret99"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured("HTTP/1.1 400 secret99\r\n\r\n")); err == nil {
+		t.Fatal("a custom reason phrase was exempted along with the status syntax")
+	}
+	// The version and code are still syntax, not data.
+	suppliedValues = []string{"400"}
+	if err := assertNoLeak(asCaptured("HTTP/1.1 400 Bad Request\r\n\r\n")); err != nil {
+		t.Fatalf("the numeric code was read as data: %v", err)
+	}
+}
+
+func TestMintedNamesAreDetectedCaseInsensitively(t *testing.T) {
+	structuralSurfaces = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	dropFraming("HTTP/1.1 200 OK\r\n\r\n" + `{"SUBJECT_FACT_KEY":"sfk1_abababababab"}`)
+	if len(structuralSurfaces) == 0 {
+		t.Fatal("a case variant of a minted member name was not detected")
+	}
+}
+
+func TestGuardDecodesEightDigitUnicodeEscapes(t *testing.T) {
+	suppliedValues = []string{"a\U0001F600b"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured(`{"k":"a\U0001F600b"}`)); err == nil {
+		t.Fatal("an eight-digit escape passed the guard")
+	}
+}
+
+func TestGuardDecodesMimeWrappedBase64(t *testing.T) {
+	suppliedValues = []string{"abcdefghijklmnopqrstuvwxyz012345678901234567890123456789"}
+	t.Cleanup(func() { suppliedValues = nil })
+	enc := base64.StdEncoding.EncodeToString([]byte(suppliedValues[0]))
+	wrapped := enc[:40] + "\r\n" + enc[40:]
+	if err := assertNoLeak(asCaptured("body:\r\n" + wrapped + "\r\n")); err == nil {
+		t.Fatal("a MIME-wrapped base64 value passed the guard")
+	}
+}
+
+func TestTrailersAreSnapshotOnCloseToo(t *testing.T) {
+	resp := &http.Response{Trailer: http.Header{"X-Late": []string{"v"}}}
+	tee := &teeBody{inner: io.NopCloser(strings.NewReader("")), resp: resp}
+	// No Read at all: the SDK's own limiter can synthesise EOF above us.
+	if err := tee.Close(); err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+	if len(tee.trailer) == 0 {
+		t.Fatal("trailers were never snapshot, so the record would omit them")
+	}
+}
+
+func TestTheVerdictEscapesMarkerBytesBeforeStripping(t *testing.T) {
+	suppliedValues = nil
+	t.Cleanup(func() { suppliedValues = nil })
+	got := verdictValue("a" + capturedMark + "b")
+	if got == "ab" {
+		t.Fatal("a marker byte in the SDK verdict was deleted rather than shown")
+	}
+}
+
+func TestOffRouteTrafficIsNotRecorded(t *testing.T) {
+	r := &recorder{inner: rtFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 204, Body: io.NopCloser(strings.NewReader("")),
+			Header: http.Header{}, Proto: "HTTP/1.1"}, nil
+	})}
+	req, _ := http.NewRequest("POST", "https://e.example/api/v1/ingest", strings.NewReader("{}"))
+	if _, err := r.RoundTrip(req); err == nil {
+		// DefaultTransport will fail against a fake host; what matters is that
+		// nothing was recorded and the counter moved.
+		_ = err
+	}
+	if len(r.exchanges) != 0 {
+		t.Fatalf("ingest traffic was recorded as an assignment attempt: %d", len(r.exchanges))
+	}
+	if r.offRoute != 1 {
+		t.Fatalf("off-route traffic was not counted: %d", r.offRoute)
+	}
+}
+
+type rtFunc func(*http.Request) (*http.Response, error)
+
+func (f rtFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
