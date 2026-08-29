@@ -487,8 +487,18 @@ func TestLocationUserinfoIsRedacted(t *testing.T) {
 	if strings.Contains(got, "secret") || strings.Contains(got, "user:") {
 		t.Fatalf("userinfo credentials were published: %q", got)
 	}
-	if !strings.Contains(got, "e.example/cb") {
+	// ⚠ THIS ASSERTION WAS NARROWED, DELIBERATELY. It used to require
+	// `e.example/cb` verbatim, which now contradicts a later finding: a redirect
+	// PATH segment is server-generated and can carry a credential
+	// (`/reset/<token>`), so segments are redacted too. What this test actually
+	// protects -- its own failure message says so -- is that the target is not
+	// DESTROYED: the host and the path structure must survive. That is what it
+	// asks now, and the segment is checked to be lengthened rather than dropped.
+	if !strings.Contains(got, "e.example/") {
 		t.Fatalf("the redirect target itself was destroyed: %q", got)
+	}
+	if !strings.Contains(got, "e.example/redacted-2-chars") {
+		t.Fatalf("the path segment was dropped rather than lengthened: %q", got)
 	}
 }
 
@@ -727,5 +737,91 @@ func TestQueryAndFragmentAreMeasuredSeparately(t *testing.T) {
 	}
 	if strings.Contains(got, "frag-only") {
 		t.Errorf("the fragment was published: %q", got)
+	}
+}
+
+// ---- round on 45eb421: eight findings ----
+
+func TestMintedKeyIsRedactedAcrossALineBreak(t *testing.T) {
+	suppliedValues = nil
+	t.Cleanup(func() { suppliedValues = nil })
+	body := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" +
+		"{\"assigned\":true,\"subject_fact_key\":\n\"sfk1_abababababababab\"}"
+	got := stripMarks(dropFraming(body))
+	if strings.Contains(got, "sfk1_abababababababab") {
+		t.Fatalf("a minted key split across lines was published: %q", got)
+	}
+}
+
+func TestMintedKeyPlaceholderIsNotDoubleMarked(t *testing.T) {
+	suppliedValues = nil
+	t.Cleanup(func() { suppliedValues = nil })
+	body := "HTTP/1.1 200 OK\r\n\r\n" + `{"subject_fact_key":"sfk1_abababababababab"}`
+	out := scrubSupplied(dropFraming(body))
+	if strings.Contains(stripMarks(out), "chars>,") {
+		t.Fatalf("the placeholder was rewritten inside itself: %q", stripMarks(out))
+	}
+	if strings.Contains(out, genMark+genMark) {
+		t.Fatalf("adjacent nested provenance marks: %q", out)
+	}
+}
+
+func TestGuardDecodesShortBase64Tokens(t *testing.T) {
+	suppliedValues = []string{"bar"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured(`{"k":"YmFy"}`)); err == nil {
+		t.Fatal("a four-byte base64 token passed the guard")
+	}
+}
+
+func TestRedirectPathSegmentsAreRedacted(t *testing.T) {
+	suppliedValues = nil
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(dropFraming(
+		"HTTP/1.1 302 Found\r\nLocation: https://e.example/reset/server-secret\r\n\r\n"))
+	if strings.Contains(got, "server-secret") {
+		t.Fatalf("a credential in a redirect path was published: %q", got)
+	}
+	if !strings.Contains(got, "e.example/") {
+		t.Fatalf("the host was destroyed with it: %q", got)
+	}
+}
+
+func TestMarkEscapingIsInjective(t *testing.T) {
+	fromWire := escapeMarks("a" + capturedMark + "b")
+	literal := escapeMarks(`a\x00b`)
+	if fromWire == literal {
+		t.Fatalf("a real marker byte and its literal spelling render alike: %q", fromWire)
+	}
+}
+
+func TestSuppliedValueInACanonicalisedHeaderNameIsScrubbed(t *testing.T) {
+	suppliedValues = []string{"secret"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// net/http canonicalises `X-secret` to `X-Secret` before the dump.
+	got := stripMarks(dropFraming("HTTP/1.1 200 OK\r\nX-Secret: v\r\n\r\n"))
+	if strings.Contains(got, "Secret") {
+		t.Fatalf("a folded supplied identifier survived in a field name: %q", got)
+	}
+}
+
+func TestEncodedFormPlaceholderMeasuresTheValue(t *testing.T) {
+	suppliedValues = []string{`a"b`}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied(`{"k":"a\"b"}`))
+	if strings.Contains(got, "4 chars") {
+		t.Fatalf("the placeholder measured the encoding, not the value: %q", got)
+	}
+	if !strings.Contains(got, "3 chars") {
+		t.Fatalf("the placeholder did not measure the value: %q", got)
+	}
+}
+
+func TestReportDoesNotClaimTheBodyIsAsReceived(t *testing.T) {
+	if strings.Contains(respSection, "status line and body are as received") {
+		t.Fatal("the report claims as-received bytes for a body it redacts")
+	}
+	if !strings.Contains(respSection, "REDACTED capture") {
+		t.Fatal("the report does not say the body is redacted")
 	}
 }

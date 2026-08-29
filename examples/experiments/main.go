@@ -383,9 +383,57 @@ func redactFragment(line string) string {
 // there first is what the grammar says.
 func redactTarget(line string) string {
 	if i := strings.IndexByte(line, '#'); i >= 0 {
-		return redactUserinfo(redactQuery(line[:i])) + redactFragment(line[i:])
+		return redactPath(redactUserinfo(redactQuery(line[:i]))) + redactFragment(line[i:])
 	}
-	return redactUserinfo(redactQuery(line))
+	return redactPath(redactUserinfo(redactQuery(line)))
+}
+
+// redactPath replaces every non-empty path segment of a redirect target with its
+// length, keeping the separators.
+//
+// ⚠ THE PATH CARRIES CREDENTIALS AS READILY AS THE QUERY. `/reset/<token>` is
+// an ordinary shape, the segment is SERVER-generated, and so no list of values
+// this program supplied can reach it -- userinfo, query and fragment were all
+// covered and the path was published whole (shardpilot/shardpilot-go#73 review).
+// Every segment goes, not a chosen few: picking which ones "look opaque" is the
+// entropy guess this file has already been burnt by, and a redirect path is
+// server-generated in its entirety.
+func redactPath(line string) string {
+	head, url, ok := strings.Cut(line, ": ")
+	if !ok {
+		return line
+	}
+	tail := ""
+	if j := strings.IndexByte(url, ' '); j >= 0 {
+		url, tail = url[:j], url[j:]
+	}
+	// ⚠ THE PATH ENDS AT `?`. Running after redactQuery, this first version took
+	// the whole redacted query as one more path segment and replaced it with a
+	// single length -- destroying the parameter NAMES that structural redaction
+	// exists to keep. Caught by the fixture that pins them.
+	if k := strings.IndexByte(url, '?'); k >= 0 {
+		url, tail = url[:k], url[k:]+tail
+	}
+	start := 0
+	if i := strings.Index(url, "://"); i >= 0 {
+		start = i + 3
+	} else if strings.HasPrefix(url, "//") {
+		start = 2
+	}
+	if start > 0 {
+		k := strings.IndexByte(url[start:], '/')
+		if k < 0 {
+			return line
+		}
+		start += k
+	}
+	segs := strings.Split(url[start:], "/")
+	for i, seg := range segs {
+		if seg != "" {
+			segs[i] = tokenPlaceholder(seg)
+		}
+	}
+	return head + ": " + url[:start] + strings.Join(segs, "/") + tail
 }
 
 // structuralRedact applies the rules a field NAME selects, for fields whose
@@ -442,20 +490,45 @@ var mintedBodyKeys = regexp.MustCompile(
 func redactMintedBody(body string) string {
 	return mintedBodyKeys.ReplaceAllStringFunc(body, func(m string) string {
 		g := mintedBodyKeys.FindStringSubmatch(m)
-		return `"` + g[1] + `"` + g[2] + `"` + marked(placeholder(g[3])) + `"`
+		// ⚠ NO OUTER `marked`: placeholder ALREADY returns one. Wrapping it made
+		// adjacent nested provenance marks, `overCaptured` then read the
+		// placeholder itself as captured text and rewrote it, and the output was
+		// `<<redacted, 8 chars>, 21 chars>` (shardpilot/shardpilot-go#73 review).
+		return `"` + g[1] + `"` + g[2] + `"` + placeholder(g[3]) + `"`
 	})
 }
+
+// respSection is the response section's prose, named rather than inlined so the
+// fixture that checks what it CLAIMS reads the same bytes the report prints. A
+// test carrying its own copy of the sentence would pass while the report says
+// something else (shardpilot/shardpilot-go#73 review).
+const respSection = "## Response%s — header block re-serialised by " +
+	"`httputil.DumpResponse`\n\nThe status line is as received. The BODY is " +
+	"the received bytes with supplied values and server-minted subject keys " +
+	"replaced by their lengths, and the two reserved marker bytes written as " +
+	"`\\x00` and `\\x01` — a pre-existing spelling of either carries one extra " +
+	"backslash, so the substitution stays reversible. What is below is " +
+	"therefore a REDACTED capture, not a transcript; saying otherwise while " +
+	"printing placeholders is the artifact contradicting itself. The " +
+	"HEADER block is written back out by `net/http`, which can add what it " +
+	"would send rather than what arrived — `Connection: close` appears on a " +
+	"bodyless dump and is forbidden in HTTP/2, so a header here is not " +
+	"evidence that it was received.\n\n%s\n%s\n"
 
 func dropFraming(dump string) string {
 	lines := strings.Split(dump, "\n")
 	out := make([]string, 0, len(lines))
 	inHeaders := true
+	bodyStart := -1
 	for _, l := range lines {
 		if inHeaders && strings.TrimRight(l, "\r") == "" {
 			inHeaders = false
 		}
 		if !inHeaders {
-			out = append(out, redactMintedBody(l))
+			if bodyStart < 0 {
+				bodyStart = len(out)
+			}
+			out = append(out, l)
 			continue
 		}
 		low := strings.ToLower(l)
@@ -517,7 +590,16 @@ func dropFraming(dump string) string {
 		}
 		out = append(out, l)
 	}
-	return strings.Join(out, "\n")
+	// ⚠ THE WHOLE BODY, NOT ONE LINE AT A TIME. JSON may put a newline between a
+	// field's colon and its value, so `"subject_fact_key":\n"sfk1_..."` matched
+	// nothing while the pattern that permits the whitespace sat right there --
+	// and the value is server-minted, so the guard behind this cannot see it
+	// either (shardpilot/shardpilot-go#73 review).
+	if bodyStart < 0 {
+		return strings.Join(out, "\n")
+	}
+	return strings.Join(out[:bodyStart], "\n") + "\n" +
+		redactMintedBody(strings.Join(out[bodyStart:], "\n"))
 }
 
 type recorder struct {
@@ -893,8 +975,14 @@ func scrubSuppliedRaw(text string) string {
 		// printed reconstructably in the body this program calls publishable.
 		// Same for backslashes and \uXXXX forms -- strconv.Quote produces what
 		// encoding/json would write (shardpilot/shardpilot-go#73 review).
+		// ⚠ MATCH ON THE SPELLING, MEASURE THE VALUE. Passing the encoded form to
+		// replaceValue made the placeholder describe the ENCODING: `a"b` is
+		// serialised as `a\"b` and was reported as `<redacted, 4 chars>` for a
+		// three-character identifier. The same defect as the request-query wire
+		// length, arriving in the response path (shardpilot/shardpilot-go#73
+		// review). One value has one length wherever it is printed.
 		for _, enc := range encodingsOf(v) {
-			text = replaceValue(text, enc)
+			text = replaceTokenWith(text, enc, placeholder(v), isWordByte)
 		}
 	}
 	return text
@@ -1008,7 +1096,23 @@ var genSpan = regexp.MustCompile(genMark + "[^" + genMark + "]*" + genMark)
 // escapeMarks keeps captured bytes rather than deleting them: a body may legally
 // contain either marker byte, and the artifact must still hold what arrived. The
 // escape is visible and reversible; deletion was neither.
+// escapeMarks replaces the two reserved marker bytes with readable text.
+//
+// ⚠ IT MUST BE INJECTIVE, AND IT WAS NOT. A response containing an actual NUL
+// and a response containing the four literal bytes `\x00` both rendered as
+// `\x00`, so the artifact could not say which the SDK received -- and this
+// function's whole claim is that the substitution is reversible
+// (shardpilot/shardpilot-go#73 review). Pre-existing spellings are lengthened by
+// one backslash FIRST, so `\x00` from the wire becomes `\\x00` and only a real
+// NUL produces the single-backslash form.
+//
+// ⚠ ONLY THE RESERVED SPELLINGS ARE TOUCHED. Escaping every backslash would
+// rewrite `\uXXXX` and `\xNN` as well, and the guard's decoders would then fail
+// to reconstruct an identifier they currently catch -- an injective escape that
+// blinds the leak check is a worse trade than the ambiguity it fixes.
 func escapeMarks(s string) string {
+	s = strings.ReplaceAll(s, `\x00`, `\\x00`)
+	s = strings.ReplaceAll(s, `\x01`, `\\x01`)
 	s = strings.ReplaceAll(s, capturedMark, `\x00`)
 	return strings.ReplaceAll(s, genMark, `\x01`)
 }
@@ -1136,7 +1240,12 @@ func assertNoLeak(text string) error {
 // Garbage produced from a non-base64 run can only ever ADD a match, which fails
 // closed.
 func undoBase64(text string) string {
-	const minToken = 8
+	// ⚠ FOUR, NOT EIGHT. A three-character key is legal and `bar` travels as the
+	// four-byte `YmFy`, which an eight-byte floor skipped entirely -- the guard
+	// settled and approved a reconstructable identifier
+	// (shardpilot/shardpilot-go#73 review). Four is the smallest token that
+	// encodes anything; below it there is nothing to decode.
+	const minToken = 4
 	var b strings.Builder
 	for i := 0; i < len(text); {
 		j := i
@@ -1303,7 +1412,12 @@ func scrubHeaderName(name string) string {
 	// the split was reaching for and could not express.
 	for _, v := range longestFirst(suppliedValues) {
 		if v != "" {
-			name = replaceTokenWith(name, v, nameSafe(v), isNameByte)
+			// ⚠ FOLDED, BECAUSE A FIELD NAME IS CASE-INSENSITIVE AND net/http
+			// CANONICALISES IT. A wire header `X-secret` reaches this function as
+			// `X-Secret`, so a case-sensitive search missed the supplied `secret`
+			// and published it in the name (shardpilot/shardpilot-go#73 review).
+			// Folding is applied HERE and not to values, whose case is data.
+			name = replaceTokenFold(name, v, nameSafe(v), isNameByte)
 		}
 	}
 	return name
@@ -1406,6 +1520,44 @@ func replaceValueWith(text, v string, isWord func(byte) bool) string {
 	// placeholder had, in the other function (shardpilot/shardpilot-go#73 review).
 	return replaceTokenWith(text, v,
 		placeholder(v), isWord)
+}
+
+// replaceTokenFold is replaceTokenWith under ASCII case folding, for field NAMES
+// only. Non-ASCII falls back to the exact form: folding can change a string's
+// LENGTH outside ASCII, and an index computed on the folded copy would then cut
+// the original in the wrong place -- a redaction that corrupts is worse than one
+// that misses, because the miss is still caught by the guard.
+func replaceTokenFold(text, v, red string, isWord func(byte) bool) string {
+	if !isASCII(text) || !isASCII(v) {
+		return replaceTokenWith(text, v, red, isWord)
+	}
+	lt, lv := strings.ToLower(text), strings.ToLower(v)
+	var b strings.Builder
+	for {
+		i := strings.Index(lt, lv)
+		if i < 0 {
+			b.WriteString(text)
+			return b.String()
+		}
+		startOK := i == 0 || !isWord(lt[i-1])
+		endOK := i+len(lv) >= len(lt) || !isWord(lt[i+len(lv)])
+		b.WriteString(text[:i])
+		if startOK && endOK {
+			b.WriteString(red)
+		} else {
+			b.WriteString(text[i : i+len(v)])
+		}
+		text, lt = text[i+len(v):], lt[i+len(lv):]
+	}
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
 }
 
 func replaceTokenWith(text, v, red string, isWord func(byte) bool) string {
@@ -1548,12 +1700,7 @@ func main() {
 				label, sanitize(ex.truncErr()), fencedBlock(body), ex.trailerReport())
 		default:
 			respText := responseText(&ex)
-			fmt.Fprintf(&report, "## Response%s — header block re-serialised by "+
-				"`httputil.DumpResponse`\n\nThe status line and body are as received. The "+
-				"HEADER block is written back out by `net/http`, which can add what it "+
-				"would send rather than what arrived — `Connection: close` appears on a "+
-				"bodyless dump and is forbidden in HTTP/2, so a header here is not "+
-				"evidence that it was received.\n\n%s\n%s\n", label,
+			fmt.Fprintf(&report, respSection, label,
 				fencedBlock(respText), ex.trailerReport())
 		}
 	}
