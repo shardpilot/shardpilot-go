@@ -417,7 +417,14 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # an ordinary operation (shardpilot/shardpilot-go#79 review). The peeled object
   # decides eligibility; the tag object is scanned in its own right below,
   # because its annotation and signer metadata are published too.
+  # ⚠ A TAG NEED NOT POINT AT A COMMIT. `git tag` accepts `[<commit> | <object>]`,
+  # so an annotated tag on a tree or a blob peels to nothing and this fallback
+  # left `peeled` as the tag's own id -- which can neither equal HEAD nor be an
+  # ancestor of it, so a valid tag push was refused before it was scanned
+  # (shardpilot/shardpilot-go#79 review). Such a tag has no tree to scan; what it
+  # publishes is the tag OBJECT, and that is collected either way.
   peeled="$(git rev-parse --verify --quiet "$local_sha^{commit}" 2>/dev/null || printf '%s' "$local_sha")"
+  target_kind="$(git cat-file -t "$peeled" 2>/dev/null || printf 'unknown')"
   # ⚠ AN ANCESTOR IS ELIGIBLE FOR A TAG. `--follow-tags` publishes missing
   # annotated tags reachable from the refs being pushed, not only tags whose
   # target IS HEAD -- so requiring equality refused an otherwise standard branch
@@ -439,7 +446,11 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     *) is_tag=no ;;
   esac
   eligible=no
-  if [ "$peeled" = "$head_sha" ]; then
+  if [ "$is_tag" = yes ] && [ "$target_kind" != commit ]; then
+    # No commit means no tree and no ratchet baseline to compare against; the
+    # object being published is the tag itself, which scan_ref_name collects.
+    eligible=yes
+  elif [ "$peeled" = "$head_sha" ]; then
     eligible=yes
   elif { [ "$peeled" != "$local_sha" ] || [ "$is_tag" = yes ]; } &&
        git merge-base --is-ancestor "$peeled" "$head_sha" 2>/dev/null; then
@@ -574,7 +585,13 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   : > "$tmpdir/tag-object"
   walk="$local_sha"
   depth=0
-  while [ "$walk" != "$peeled" ] && [ "$depth" -lt 32 ]; do
+  # ⚠ WALK WHILE THE OBJECT IS A TAG, not until it equals the peeled id. For a
+  # tag on a TREE OR A BLOB the peel fails and `peeled` is the tag's own id, so
+  # this loop exited before its first iteration and the tag object -- the only
+  # thing such a push publishes -- was never collected. The rig found it: the
+  # clean case passed and so did one whose message carried material
+  # (shardpilot/shardpilot-go#79 review).
+  while [ "$(git cat-file -t "$walk" 2>/dev/null)" = tag ] && [ "$depth" -lt 32 ]; do
     git cat-file tag "$walk" >> "$tmpdir/tag-object" 2>/dev/null || break
     printf '\n' >> "$tmpdir/tag-object"
     tag_object="$tmpdir/tag-object"
@@ -594,7 +611,18 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # and the name is new, public, and was going unscanned because the loop exited
   # first (shardpilot/shardpilot-go#79 review).
   if [ "$n" = 0 ]; then
-    scan_ref_name "$peeled" "$base" "$remote_ref" "$tag_object" || status=$?
+    # ⚠ A NON-COMMIT TAG HAS NO TREE TO SCAN. `git tag` accepts a tree or a blob,
+    # and `worktree add` on one fails -- so the eligibility fix alone turned a
+    # refusal-before-scanning into a refusal-while-scanning
+    # (shardpilot/shardpilot-go#79 review, and the rig caught the second half
+    # immediately). What such a push publishes is the tag OBJECT and the ref
+    # NAME; both are staged as evidence, and the tree the scanner walks is our
+    # own HEAD, which is already published and is its own base.
+    scan_target="$peeled"
+    if [ "$target_kind" != commit ]; then
+      scan_target="$head_sha"
+    fi
+    scan_ref_name "$scan_target" "$base" "$remote_ref" "$tag_object" || status=$?
     continue
   fi
 

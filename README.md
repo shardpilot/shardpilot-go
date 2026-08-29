@@ -313,12 +313,13 @@ No Makefile — standard Go tooling.
 ```
 h="$(cd "$(git rev-parse --git-common-dir)" && pwd)/hooks" &&
 mkdir -p "$h" &&
+test ! -e "$h/pre-push" &&
 cp .githooks/pre-push "$h/.pre-push.new" &&
 cp scripts/check_public_surface.sh "$h/.check_public_surface.sh.new" &&
 chmod +x "$h/.pre-push.new" "$h/.check_public_surface.sh.new" &&
 mv "$h/.pre-push.new" "$h/pre-push" &&
 mv "$h/.check_public_surface.sh.new" "$h/check_public_surface.sh" &&
-git config --worktree --unset-all core.hooksPath 2>/dev/null || true &&
+{ git config --worktree --unset-all core.hooksPath 2>/dev/null || true; } &&
 git config --local core.hooksPath "$h" &&
 test "$(git rev-parse --path-format=absolute --git-path hooks)" = "$h"
 ```
@@ -331,6 +332,22 @@ on running the previous hook directory, or none. The worktree value is cleared
 first, and the last line VERIFIES the effective path rather than trusting the
 write: an installation that cannot show git resolving hooks where it put them has
 not installed anything.
+
+⚠ TWO THINGS IN THAT CHAIN ARE EASY TO READ PAST.
+
+`{ … || true; }` is BRACED, and ungrouped it would be a bug rather than a
+nicety: `&&` and `||` form one left-associative list, so a bare `|| true` after
+the chain recovers from ANY earlier failure — an unwritable hooks directory, a
+failed copy — and execution still reaches `git config`. The final `test` would
+then pass, because it verifies only where git resolves hooks, not what is
+sitting there. Braced, the tolerance applies to the unset alone.
+
+`test ! -e "$h/pre-push"` REFUSES an occupied destination instead of overwriting
+it. `mv` replaces silently, and a checkout may already have a pre-push hook that
+matters — Git LFS installs one, and replacing it lets refs carrying LFS pointers
+be published without their objects, so later checkouts cannot retrieve those
+files. If something is there, look at it and decide; this install will not
+choose for you.
 
 Two more things that look like fussiness and are not. `--git-common-dir` answers
 `.git` in the main worktree, and git resolves a RELATIVE `core.hooksPath` against
