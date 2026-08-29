@@ -546,7 +546,18 @@ func redactQuery(line string) string {
 		// `<redacted, N chars>` form turned the recorded request into something no
 		// HTTP parser accepts -- and being parseable is the reason this artifact is
 		// kept (shardpilot/shardpilot-go#73 review).
-		parts[k] = p[:eq+1] + fmt.Sprintf("redacted-%d-chars", len(p[eq+1:]))
+		// ⚠ MEASURE THE VALUE, NOT ITS WIRE SPELLING. A percent-encoded parameter
+		// is longer than the identifier it carries -- `a"b` travels as `a%22b` --
+		// so measuring the raw segment printed `redacted-5-chars` for a
+		// three-character key, while the same key in an echoed body printed
+		// `<redacted, 3 chars>`. Two lengths for one value in one capture is
+		// evidence that contradicts itself (shardpilot/shardpilot-go#73 review).
+		raw := p[eq+1:]
+		n := len(raw)
+		if dec, err := url.QueryUnescape(raw); err == nil {
+			n = len(dec)
+		}
+		parts[k] = p[:eq+1] + fmt.Sprintf("redacted-%d-chars", n)
 	}
 	return head + strings.Join(parts, "&") + tail
 }
@@ -862,6 +873,17 @@ func undoUnicodeEscapes(text string) string {
 				continue
 			}
 		}
+		if text[i] == '\\' && i+3 < len(text) && (text[i+1] == 'x' || text[i+1] == 'X') {
+			// A plain-text or JavaScript-style diagnostic spells a byte as \xNN,
+			// which no percent, unicode, plus or entity decoding reconstructs -- so
+			// `\x61bcdefgh` reached the artifact with every decoding round already
+			// settled (shardpilot/shardpilot-go#73 review).
+			if v8, err := strconv.ParseUint(text[i+2:i+4], 16, 8); err == nil {
+				b.WriteByte(byte(v8))
+				i += 3
+				continue
+			}
+		}
 		if text[i] == '\\' && i+1 < len(text) {
 			switch text[i+1] {
 			case '"', '\\', '/':
@@ -886,12 +908,23 @@ func undoUnicodeEscapes(text string) string {
 // it through (shardpilot/shardpilot-go#73 review). The rule is not loosened for
 // values; the name is split on its own separator first.
 func scrubHeaderName(name string) string {
-	parts := strings.Split(name, "-")
-	for i, p := range parts {
-		parts[i] = scrubSupplied(p)
+	// ⚠ SPLITTING FIRST CANNOT MATCH A HYPHENATED VALUE. The previous version cut
+	// the name on `-` and scrubbed each piece, so a legal key `foo-bar` matched no
+	// component and `X-foo-bar` was published whole
+	// (shardpilot/shardpilot-go#73 review). The value is matched against the
+	// COMPLETE name under a boundary rule where `-` separates -- which is what
+	// the split was reaching for and could not express.
+	for _, v := range suppliedValues {
+		if v != "" {
+			name = replaceValueWith(name, v, isNameByte)
+		}
 	}
-	return strings.Join(parts, "-")
+	return name
 }
+
+// isNameByte is isWordByte without `-`: in a header NAME the hyphen separates
+// words, while in a VALUE it may belong to one.
+func isNameByte(c byte) bool { return c != '-' && isWordByte(c) }
 
 // replaceValue redacts every occurrence of v. A long value is replaced outright;
 // a SHORT one only where it stands as a whole token, because the SDK validates
@@ -918,14 +951,26 @@ func containsValue(text, v string) bool {
 	if len(v) >= 8 {
 		return strings.Contains(text, v)
 	}
+	// ⚠ EITHER BOUNDARY CONVENTION COUNTS. A hyphenated value inside a header
+	// name -- `foo-bar` in `X-foo-bar` -- has a `-` before it, which the VALUE
+	// rule reads as a word byte and so as "not a whole token". The guard must be
+	// at least as permissive as every redaction it checks, so it asks under both
+	// rules and a hit under either is a hit.
+	if containsValueWith(text, v, isNameByte) {
+		return true
+	}
+	return containsValueWith(text, v, isWordByte)
+}
+
+func containsValueWith(text, v string, isWord func(byte) bool) bool {
 	for i := 0; ; {
 		j := strings.Index(text[i:], v)
 		if j < 0 {
 			return false
 		}
 		j += i
-		startOK := j == 0 || !isWordByte(text[j-1])
-		endOK := j+len(v) >= len(text) || !isWordByte(text[j+len(v)])
+		startOK := j == 0 || !isWord(text[j-1])
+		endOK := j+len(v) >= len(text) || !isWord(text[j+len(v)])
 		if startOK && endOK {
 			return true
 		}
@@ -934,6 +979,10 @@ func containsValue(text, v string) bool {
 }
 
 func replaceValue(text, v string) string {
+	return replaceValueWith(text, v, isWordByte)
+}
+
+func replaceValueWith(text, v string, isWord func(byte) bool) string {
 	red := fmt.Sprintf("<redacted, %d chars>", len(v))
 	if len(v) >= 8 {
 		return strings.ReplaceAll(text, v, red)
@@ -945,8 +994,8 @@ func replaceValue(text, v string) string {
 			b.WriteString(text)
 			return b.String()
 		}
-		endOK := i+len(v) >= len(text) || !isWordByte(text[i+len(v)])
-		startOK := i == 0 || !isWordByte(text[i-1])
+		endOK := i+len(v) >= len(text) || !isWord(text[i+len(v)])
+		startOK := i == 0 || !isWord(text[i-1])
 		b.WriteString(text[:i])
 		if startOK && endOK {
 			b.WriteString(red)

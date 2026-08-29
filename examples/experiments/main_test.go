@@ -349,6 +349,41 @@ func TestCeilingWithAnExactContentLengthIsComplete(t *testing.T) {
 	}
 }
 
+func TestHyphenatedIdentifierInAHeaderName(t *testing.T) {
+	suppliedValues = []string{"foo-bar"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if got := scrubHeaderName("X-foo-bar"); strings.Contains(got, "foo-bar") {
+		t.Fatalf("a hyphenated identifier survived the name scrub: %q", got)
+	}
+	// And the guard must see it too, under the name convention.
+	if err := assertNoLeak("X-foo-bar: value"); err == nil {
+		t.Fatal("the guard missed a hyphenated identifier in a header name")
+	}
+}
+
+func TestGuardDecodesHexEscapes(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	hidden := `{"k":"\\x61bcdefgh"}`
+	if scrubSupplied(hidden) != hidden {
+		t.Fatal("precondition: the scrub is expected to miss this spelling")
+	}
+	err := assertNoLeak(hidden)
+	if err == nil {
+		t.Fatal("a hex-escape spelling passed the guard")
+	}
+	if !strings.Contains(err.Error(), "survived redaction") {
+		t.Fatalf("refused for the wrong reason: %v", err)
+	}
+}
+
+func TestQueryLengthIsTheValueNotItsWireSpelling(t *testing.T) {
+	got := redactQuery(`GET /x?experiment_key=a%22b HTTP/1.1`)
+	if !strings.Contains(got, "redacted-3-chars") {
+		t.Fatalf("the encoded length was reported instead of the value's: %q", got)
+	}
+}
+
 func TestTrailersAreSnapshotAtEOFNotFromTheHead(t *testing.T) {
 	resp := &http.Response{Trailer: http.Header{}}
 	tee := &teeBody{inner: io.NopCloser(strings.NewReader("BODY")), resp: resp}
