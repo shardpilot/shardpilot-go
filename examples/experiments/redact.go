@@ -36,10 +36,12 @@ package main
 
 import (
 	"encoding/json"
+	"net/http"
 	"net/url"
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 )
 
 // jsonMemberValue matches a JSON member together with its string VALUE. The
@@ -129,6 +131,19 @@ func redactQuery(line string) string {
 // by their length. `opaqueNameBytes` names bytes that CANNOT appear in a name in
 // this context -- a component carrying one is not a name/value pair at all, so it
 // is replaced whole.
+// requestNames are the parameter names and the authority the HARNESS put on the
+// wire. Collected but NOT yet used to redact: see the note on the three open
+// name-side findings in shardpilot/shardpilot-go#85. A name this program sent is
+// one it can vouch for; the machinery is here so the decision, when it is made,
+// is a two-line change rather than a redesign.
+var requestNames = map[string]bool{}
+
+func noteRequestName(n string) { requestNames[n] = true }
+
+func nameIsOurs(n string) bool { return requestNames[strings.TrimSpace(n)] }
+
+var _ = nameIsOurs
+
 func redactPairs(rest, opaqueNameBytes string) string {
 	parts := strings.Split(rest, "&")
 	for k, p := range parts {
@@ -188,7 +203,7 @@ func redactFragment(line string) string {
 		return line
 	}
 	if !strings.Contains(frag, "=") {
-		return head + tokenPlaceholder(frag) + tail
+		return head + tokenPlaceholder(queryDecoded(frag)) + tail
 	}
 	// ⚠ `?` IS ORDINARY FRAGMENT DATA, NOT A QUERY INTRODUCER. This delegated to
 	// redactQuery, which cut at the first `?` and kept everything before it as a
@@ -213,15 +228,14 @@ func redactTarget(line string) string {
 	// keeps the whole opaque value -- so the redactors below treated everything
 	// after the space as request-line syntax and appended it unexamined
 	// (shardpilot/shardpilot-go#85 review).
-	if _, url, ok := strings.Cut(line, ": "); ok {
+	if head, gap, url, ok := splitField(line); ok {
 		if strings.ContainsAny(strings.TrimSuffix(url, "\r"), " \t") {
 			noteStructural("a Location header whose target is not a valid URI")
-			head, _, _ := strings.Cut(line, ": ")
 			cr := ""
 			if strings.HasSuffix(line, "\r") {
 				cr = "\r"
 			}
-			return head + ": " + marked("<withheld: malformed target>") + cr
+			return head + ":" + gap + marked("<withheld: malformed target>") + cr
 		}
 	}
 	if i := strings.IndexByte(line, '#'); i >= 0 {
@@ -230,11 +244,32 @@ func redactTarget(line string) string {
 	return redactPath(redactUserinfo(redactQuery(line)))
 }
 
+// splitField cuts a header line into its name, the whitespace after the colon,
+// and its value.
+//
+// ⚠ THE SPACE AFTER THE COLON IS OPTIONAL. Cutting on ": " meant `Location:/cb`
+// -- transport-valid, OWS is what the grammar calls it -- matched nothing and was
+// returned unredacted (shardpilot/shardpilot-go#85 review). One splitter, so the
+// callers cannot disagree about where a value begins.
+func splitField(line string) (name, gap, value string, ok bool) {
+	i := strings.IndexByte(line, ':')
+	if i <= 0 {
+		return "", "", "", false
+	}
+	rest := line[i+1:]
+	j := 0
+	for j < len(rest) && (rest[j] == ' ' || rest[j] == '\t') {
+		j++
+	}
+	return line[:i], rest[:j], rest[j:], true
+}
+
 func redactPath(line string) string {
-	head, url, ok := strings.Cut(line, ": ")
+	head, gap, url, ok := splitField(line)
 	if !ok {
 		return line
 	}
+	head += ":" + gap
 	tail := ""
 	if j := strings.IndexByte(url, ' '); j >= 0 {
 		url, tail = url[:j], url[j:]
@@ -261,6 +296,14 @@ func redactPath(line string) string {
 	}
 	segs := strings.Split(url[start:], "/")
 	for i, seg := range segs {
+		// ⚠ `.` AND `..` ARE NAVIGATION, NOT DATA. Replacing them with
+		// placeholders made the recorded target resolve somewhere else and
+		// erased whether the endpoint redirected relative to this path or its
+		// parent -- which is exactly the structure this capture exists to show
+		// (shardpilot/shardpilot-go#85 review).
+		if seg == "." || seg == ".." {
+			continue
+		}
 		if seg != "" {
 			// ⚠ MEASURE THE VALUE, NOT ITS WIRE SPELLING -- the same rule the query
 			// path already follows. `%C3%A9` is the single character `é` and was
@@ -269,7 +312,7 @@ func redactPath(line string) string {
 			segs[i] = tokenPlaceholder(pathDecoded(seg))
 		}
 	}
-	return head + ": " + url[:start] + strings.Join(segs, "/") + tail
+	return head + url[:start] + strings.Join(segs, "/") + tail
 }
 
 func redactSetCookie(line string) string {
@@ -302,7 +345,24 @@ func redactSetCookie(line string) string {
 	}
 	out := head + ": " + name + "=" + placeholder(measured)
 	if hasAttrs {
-		out += ";" + attrs
+		// ⚠ ATTRIBUTE VALUES ARE SERVER-GENERATED TOO. `; Path=/reset/<token>`,
+		// or an extension attribute carrying a nonce, went through unchanged
+		// while the cookie's own value was lengthened -- the same bytes treated
+		// two ways in one line (shardpilot/shardpilot-go#85 review). Attribute
+		// NAMES are a closed set in the specification and are kept; their values
+		// are not, and are lengthened.
+		parts := strings.Split(attrs, ";")
+		for i, a := range parts {
+			an, av, has := strings.Cut(a, "=")
+			if !has {
+				continue
+			}
+			if cookieAttrVerbatim(an, strings.TrimSpace(av)) {
+				continue
+			}
+			parts[i] = an + "=" + placeholder(strings.TrimSpace(av))
+		}
+		out += ";" + strings.Join(parts, ";")
 	}
 	return out + cr
 }
@@ -336,7 +396,9 @@ func redactUserinfo(line string) string {
 			return line
 		}
 	}
-	return line[:i+skip] + tokenPlaceholder(rest[:at]) + rest[at:]
+	// MEASURED DECODED, like every other component here: `us%C3%A9r:p` is six
+	// characters, not eleven (shardpilot/shardpilot-go#85 review).
+	return line[:i+skip] + tokenPlaceholder(queryDecoded(rest[:at])) + rest[at:]
 }
 
 // structuralRedact applies the rules a field NAME selects, for fields whose
@@ -384,8 +446,27 @@ func redactMintedBody(body string) string {
 	// ⚠ AND A MINTED NAME THIS PATTERN COULD NOT DESCRIBE IS REFUSED, NOT
 	// PUBLISHED. Anything left carrying a minted member name after the pass above
 	// held a value shape these rules do not cover.
-	for _, m := range jsonMemberName.FindAllStringSubmatch(out, -1) {
-		if isMinted(m[1]) {
+	// ⚠ SCAN WHAT WAS NOT REDACTED, NOT WHAT WAS. Run over `out`, this found the
+	// member name the replacement above had just left in place, refused the body,
+	// and made EVERY ordinary fact response unpublishable -- the exact responses
+	// this change exists to publish (shardpilot/shardpilot-go#85 review). The
+	// scan runs on the ORIGINAL body and skips the spans the value pattern
+	// covered, so it reports only shapes that pattern could not describe.
+	covered := jsonMemberValue.FindAllStringIndex(body, -1)
+	inCovered := func(i int) bool {
+		for _, c := range covered {
+			if i >= c[0] && i < c[1] {
+				return true
+			}
+		}
+		return false
+	}
+	for _, loc := range jsonMemberName.FindAllStringSubmatchIndex(body, -1) {
+		if inCovered(loc[0]) {
+			continue
+		}
+		name := body[loc[2]:loc[3]]
+		if isMinted(name) {
 			// ⚠ NOTED AND WITHHELD, not noted alone. The capture is refused at
 			// publication either way, but the rule a reader has to hold is
 			// simpler if it has no exceptions: a surface these rules cannot
@@ -433,4 +514,163 @@ func queryDecoded(s string) string {
 		return dec
 	}
 	return s
+}
+
+// ── which header values may be printed as received ───────────────────────────
+//
+// ⚠ THIS IS AN INVERSION, AND THE INVERSION IS THE POINT. The dispatch above
+// names the fields it redacts -- `Set-Cookie`, `Location` -- which makes it an
+// ENUMERATION, complete only from the inside. A sweep of ten unrecognised forms
+// found seven published: `Content-Location`, `Refresh`, `Link`,
+// `WWW-Authenticate`, `Set-Cookie2` each carry a server-generated URL or token
+// and each went straight through, because the only other tool is a scrub built
+// from values the HARNESS supplied, which by construction cannot see them
+// (shardpilot/shardpilot-go#85 review).
+//
+// Adding five names would confirm the enumeration. So the question is turned
+// round: a value is printed as received only if it PASSES a test, and everything
+// else is replaced by its length. Unknown fails closed.
+//
+// ⚠ THE CRITERION, WRITTEN OUT SO THE NEXT FIELD IS JUDGED BY IT RATHER THAN BY
+// MEMORY OF WHY THESE WERE CHOSEN:
+//
+//	A header value may be published verbatim only if every token in it is drawn
+//	from a vocabulary the SPECIFICATION fixes -- an HTTP-date, an integer, or a
+//	registered keyword -- so that the origin had no opportunity to choose a
+//	string. Any free-form token, quoted-string, URI or parameter fails,
+//	whatever the field is called.
+//
+// ⚠ AND THE CRITERION WAS CHECKED AGAINST THE LIST IT PRODUCED, which is the
+// only way to know it is a criterion and not a description. `Content-Type` looks
+// obviously safe and is NOT: `multipart/form-data; boundary=----a8f3` carries a
+// string the origin invented. The criterion catches that, so `Content-Type`
+// passes only WITHOUT parameters -- and the fact that it caught a field I had
+// listed as safe by instinct is the evidence that the rule does work, and that
+// my instinct did not.
+//
+// A field that fails is not refused; its VALUE is replaced by its length. A
+// length is enough to show the shape of the exchange, and refusing every capture
+// carrying a `Server:` banner would make the harness useless. Refusal is
+// reserved for the surfaces above, where a value's EXTENT cannot be determined.
+var verbatimHeaders = map[string]func(string) bool{
+	"date":              isHTTPDate,
+	"expires":           isHTTPDate,
+	"last-modified":     isHTTPDate,
+	"content-length":    isDigits,
+	"age":               isDigits,
+	"content-type":      isMediaTypeWithoutParameters,
+	"content-encoding":  isDirectiveList,
+	"transfer-encoding": isDirectiveList,
+	"connection":        isDirectiveList,
+	"vary":              isDirectiveList,
+	"accept-ranges":     isDirectiveList,
+	"allow":             isDirectiveList,
+	"cache-control":     isDirectiveList,
+}
+
+func isHTTPDate(v string) bool {
+	for _, f := range []string{http.TimeFormat, time.RFC850, time.ANSIC} {
+		if _, err := time.Parse(f, strings.TrimSpace(v)); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func isDigits(v string) bool {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		if v[i] < '0' || v[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isMediaTypeWithoutParameters(v string) bool {
+	// ⚠ NO SEPARATE PARAMETER CHECK. An explicit `ContainsAny(v, ";\"")` guard
+	// stood here and a mutant removing it survived -- correctly, because it was
+	// EQUIVALENT: neither `;` nor `"` nor a space is a token byte, so a value
+	// carrying parameters already fails `isTokenOnly`. Code that looks
+	// load-bearing and is not teaches the next reader a rule the program does
+	// not have.
+	t, sub, ok := strings.Cut(strings.TrimSpace(v), "/")
+	return ok && isTokenOnly(t) && isTokenOnly(sub)
+}
+
+// isDirectiveList accepts comma-separated tokens, each optionally `=` a token or
+// an integer -- `no-cache`, `max-age=600`, `gzip`. A quoted-string fails: that is
+// where a free-form value would live.
+func isDirectiveList(v string) bool {
+	if strings.Contains(v, `"`) {
+		return false
+	}
+	for _, part := range strings.Split(v, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return false
+		}
+		name, arg, hasArg := strings.Cut(part, "=")
+		if !isTokenOnly(strings.TrimSpace(name)) {
+			return false
+		}
+		if hasArg && !isTokenOnly(strings.TrimSpace(arg)) {
+			return false
+		}
+	}
+	return true
+}
+
+func isTokenOnly(v string) bool {
+	if v == "" {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		if !isTokenByte(v[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// redactUnlessVerbatim lengthens a header value unless its field passes the
+// criterion above. The NAME is kept: it is what makes the artifact readable, and
+// it is scrubbed separately for supplied values.
+// cookieAttrVerbatim applies the SAME criterion to a cookie attribute: kept only
+// if the specification fixes the vocabulary. `Max-Age` is an integer, `Expires`
+// an HTTP-date, `SameSite` three keywords. `Path` and `Domain` are strings the
+// origin invents, and are lengthened.
+func cookieAttrVerbatim(name, value string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "max-age":
+		return isDigits(value)
+	case "expires":
+		return isHTTPDate(value)
+	case "samesite":
+		switch strings.ToLower(value) {
+		case "lax", "strict", "none":
+			return true
+		}
+	}
+	return false
+}
+
+func redactUnlessVerbatim(line string) string {
+	cr := ""
+	body := line
+	if strings.HasSuffix(body, "\r") {
+		cr, body = "\r", strings.TrimSuffix(body, "\r")
+	}
+	name, value, ok := strings.Cut(body, ":")
+	if !ok || !isTokenOnly(strings.TrimSpace(name)) {
+		return line
+	}
+	check, known := verbatimHeaders[strings.ToLower(strings.TrimSpace(name))]
+	if known && check(strings.TrimSpace(value)) {
+		return line
+	}
+	return name + ": " + placeholder(strings.TrimSpace(value)) + cr
 }

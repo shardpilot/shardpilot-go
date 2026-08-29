@@ -89,7 +89,11 @@ func TestSetCookieIsRedactedStructurally(t *testing.T) {
 	if strings.Contains(got, "abc123def456") {
 		t.Fatalf("a server-set cookie was published verbatim: %q", got)
 	}
-	for _, keep := range []string{"sid=", "Path=/", "HttpOnly"} {
+	// ⚠ `Path=/` WAS NARROWED TO `Path=`. A cookie path is chosen by the origin
+	// (`Path=/reset/<token>` is the shape the finding named), so its value is
+	// lengthened like any other free-form string. What this test protects is the
+	// attribute STRUCTURE: names kept, valueless attributes untouched.
+	for _, keep := range []string{"sid=", "Path=", "HttpOnly"} {
 		if !strings.Contains(got, keep) {
 			t.Fatalf("structural redaction dropped %q: %q", keep, got)
 		}

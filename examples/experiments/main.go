@@ -367,6 +367,16 @@ func verdictValue(v string) string {
 	return stripMarks(scrubSupplied(escapeMarks(v)))
 }
 
+// scrubStructuralName applies the token-safe name scrub to a line the structural
+// redactors produced, so a supplied value equal to a field NAME cannot reach the
+// generic prose placeholder and make the field unparsable.
+func scrubStructuralName(line string) string {
+	if i := strings.IndexByte(line, ':'); i > 0 {
+		return scrubHeaderName(line[:i]) + line[i:]
+	}
+	return line
+}
+
 func dropFraming(dump string) string {
 	lines := strings.Split(dump, "\n")
 	out := make([]string, 0, len(lines))
@@ -402,7 +412,12 @@ func dropFraming(dump string) string {
 			// carries its credential after `#` -- `#access_token=…` never reaches
 			// the server and is exactly the value a capture must not publish, and
 			// `redactQuery` saw only `?` (shardpilot/shardpilot-go#73 review).
-			out = append(out, redactTarget(strings.TrimSuffix(l, "\r"))+cr)
+			// ⚠ THE NAME TOO, THROUGH THE TOKEN-SAFE SCRUB. This branch handed the
+			// line straight on, so a supplied value equal to the field NAME fell
+			// to the generic scrub and became `<redacted, 8 chars>` -- spaces and
+			// angle brackets inside a field name, an unparsable response. The
+			// trailer path already did this (shardpilot/shardpilot-go#85 review).
+			out = append(out, scrubStructuralName(redactTarget(strings.TrimSuffix(l, "\r")))+cr)
 			continue
 		}
 		// ⚠ AND A HEADER NAME CAN CARRY THE IDENTIFIER. `X-<key>: v` published it
@@ -421,7 +436,7 @@ func dropFraming(dump string) string {
 		// Redacted STRUCTURALLY, like the query string: the cookie's name and
 		// its attributes stay, the value becomes a length.
 		if strings.HasPrefix(low, "set-cookie:") {
-			out = append(out, redactSetCookie(l))
+			out = append(out, scrubStructuralName(redactSetCookie(l)))
 			continue
 		}
 		if strings.HasPrefix(low, "transfer-encoding:") {
@@ -436,11 +451,19 @@ func dropFraming(dump string) string {
 		// already did this; the response's own header block did not -- fixed
 		// where it was found and not where the question is asked, once more
 		// (shardpilot/shardpilot-go#73 review).
+		// ⚠ AND THE VALUE GOES THROUGH THE CRITERION, not only the name. The
+		// sentence above said "everything else keeps its value untouched", and
+		// that was the hole: `Content-Location`, `Refresh`, `Link`,
+		// `WWW-Authenticate`, `Set-Cookie2`, an `ETag`, a `Server` banner, a
+		// `Content-Type` boundary -- each carries a string the ORIGIN chose, none
+		// is in `suppliedValues`, and the guard behind this cannot see any of
+		// them (shardpilot/shardpilot-go#85 review, a sweep of fourteen forms).
+		// Unknown fails closed now: see verbatimHeaders for the criterion.
 		if i, ok := headerNameEnd(l); ok {
-			out = append(out, scrubHeaderName(l[:i])+l[i:])
+			out = append(out, scrubHeaderName(l[:i])+redactUnlessVerbatim(l)[i:])
 			continue
 		}
-		out = append(out, l)
+		out = append(out, scrubStructuralName(redactUnlessVerbatim(l)))
 	}
 	// ⚠ THE WHOLE BODY, NOT ONE LINE AT A TIME. JSON may put a newline between a
 	// field's colon and its value, so `"subject_fact_key":\n"sfk1_..."` matched
@@ -528,10 +551,16 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 	// (shardpilot/shardpilot-go#73 review). The request redactor already treats
 	// every query value as identifying; this makes the RESPONSE side agree,
 	// which is the property, not a longer list of names.
-	for _, vs := range req.URL.Query() {
+	for k, vs := range req.URL.Query() {
+		// The NAMES this program put on the wire are names it can vouch for; the
+		// response echoing one back is structure, not an endpoint's choice.
+		noteRequestName(k)
 		for _, v := range vs {
 			addSuppliedValue(v)
 		}
+	}
+	if req.URL.Host != "" {
+		noteRequestName(req.URL.Host)
 	}
 	if dump, err := httputil.DumpRequestOut(req, true); err == nil {
 		ex.req = redact([]byte(escapeMarks(string(dump))))

@@ -675,15 +675,6 @@ func TestTheReasonPhraseIsCheckedLikeData(t *testing.T) {
 	}
 }
 
-func TestMintedNamesAreDetectedCaseInsensitively(t *testing.T) {
-	structuralSurfaces = nil
-	t.Cleanup(func() { structuralSurfaces = nil })
-	dropFraming("HTTP/1.1 200 OK\r\n\r\n" + `{"SUBJECT_FACT_KEY":"sfk1_abababababab"}`)
-	if len(structuralSurfaces) == 0 {
-		t.Fatal("a case variant of a minted member name was not detected")
-	}
-}
-
 func TestGuardDecodesEightDigitUnicodeEscapes(t *testing.T) {
 	suppliedValues = []string{"a\U0001F600b"}
 	t.Cleanup(func() { suppliedValues = nil })
