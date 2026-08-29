@@ -1115,3 +1115,54 @@ func TestTheSerialiserUserAgentIsGenerated(t *testing.T) {
 		t.Fatalf("the serialiser's own User-Agent was read as a leak: %v", err)
 	}
 }
+
+// ---- round on 4b472c8 ----
+
+func TestGrammarLiteralsAreFoundByParsing(t *testing.T) {
+	suppliedValues = []string{"false"}
+	t.Cleanup(func() { suppliedValues = nil })
+	for _, c := range []struct {
+		name, body string
+		published  bool
+	}{
+		{"a literal node", `{"assigned":false}`, true},
+		{"inside a string", `{"message":"saw false value"}`, false},
+		{"a plain-text body", `error: false`, false},
+	} {
+		got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n" + c.body)))
+		has := strings.Contains(got, "false")
+		if has != c.published {
+			t.Errorf("%s: `false` present=%v, want %v: %q", c.name, has, c.published, got)
+		}
+	}
+}
+
+func TestFieldNameComponentsDecodeIndependently(t *testing.T) {
+	suppliedValues = []string{"bar"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured("HTTP/1.1 200 OK\r\nX-YmFy: v\r\n\r\n")); err == nil {
+		t.Fatal("a base64 component of a field name hid a supplied value")
+	}
+}
+
+func TestTheSynthesisedHTTP2ReasonIsNotCapturedData(t *testing.T) {
+	suppliedValues = []string{"OK"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured("HTTP/2.0 200 OK\r\n\r\n")); err != nil {
+		t.Fatalf("HTTP/2's synthesised phrase was read as a leak: %v", err)
+	}
+	// An HTTP/1 phrase the endpoint really sent is still data.
+	suppliedValues = []string{"secret99"}
+	if err := assertNoLeak(asCaptured("HTTP/1.1 400 secret99\r\n\r\n")); err == nil {
+		t.Fatal("an HTTP/1 reason phrase stopped being checked")
+	}
+}
+
+func TestTheSerialiserConnectionHeaderIsGenerated(t *testing.T) {
+	suppliedValues = []string{"close"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied(dropFraming("HTTP/2.0 200 OK\r\nConnection: close\r\n\r\n")))
+	if strings.Contains(got, "<redacted") {
+		t.Fatalf("a serialiser-added Connection header was scrubbed into an invalid response: %q", got)
+	}
+}

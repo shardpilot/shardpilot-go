@@ -592,6 +592,17 @@ func dropFraming(dump string) string {
 		if strings.HasSuffix(l, "\r") {
 			cr = "\r"
 		}
+		// ⚠ `DumpResponse` ADDS `Connection: close` when the length is unknown,
+		// and HTTP/2 forbids that field -- so it is generated syntax on a
+		// response that never carried it, and a key of `close` produced
+		// `Connection: <redacted, 5 chars>`: an invalid canonical response the
+		// guard then approved because the placeholder is generated
+		// (shardpilot/shardpilot-go#84 review). Same treatment as the framing
+		// headers directly below.
+		if strings.HasPrefix(low, "connection:") {
+			out = append(out, marked(strings.TrimSuffix(l, "\r"))+cr)
+			continue
+		}
 		if strings.HasPrefix(low, "content-length:") {
 			out = append(out, marked("X-Capture-Note: Content-Length removed — the body below is redacted")+cr)
 			continue
@@ -1120,46 +1131,55 @@ func overCaptured(text string, f func(string) string) string {
 // and the guard already blanks them, so both rules follow from one mark rather
 // than from two copies of a list.
 func markBareJSONLiterals(text string) string {
-	var b strings.Builder
-	i := 0
-	for i < len(text) {
-		matched := ""
-		for lit := range jsonLiterals {
-			if strings.HasPrefix(text[i:], lit) {
-				matched = lit
+	// ⚠ PARSED, NOT GUESSED. The first version tested the bytes around the token,
+	// which marks `{"message":"saw false value"}` and `error: false` as grammar --
+	// and a marked span is skipped by BOTH the scrub and the guard, so the
+	// supplied value was published (shardpilot/shardpilot-go#84 review). A
+	// heuristic about where a token sits is not a statement about the grammar it
+	// sits in. `encoding/json` knows which of them is a literal NODE; nothing
+	// else does.
+	//
+	// A body that does not parse is left alone: there is no JSON grammar in it to
+	// protect, so the ordinary scrub applies and the value is redacted.
+	start := strings.IndexAny(text, "{[")
+	if start < 0 {
+		return text
+	}
+	dec := json.NewDecoder(strings.NewReader(text[start:]))
+	type span struct{ a, b int }
+	var spans []span
+	for {
+		off := dec.InputOffset()
+		tok, err := dec.Token()
+		if err != nil {
+			if err == io.EOF {
 				break
 			}
+			return text // malformed: no grammar to protect
 		}
-		if matched == "" {
-			b.WriteByte(text[i])
-			i++
-			continue
+		_ = off
+		switch tok.(type) {
+		case bool, nil:
+			end := int(dec.InputOffset())
+			lit := "null"
+			if b, ok := tok.(bool); ok {
+				if b {
+					lit = "true"
+				} else {
+					lit = "false"
+				}
+			}
+			if end-len(lit) >= 0 &&
+				text[start+end-len(lit):start+end] == lit {
+				spans = append(spans, span{start + end - len(lit), start + end})
+			}
 		}
-		before := byte(0)
-		if i > 0 {
-			before = text[i-1]
-		}
-		after := byte(0)
-		if i+len(matched) < len(text) {
-			after = text[i+len(matched)]
-		}
-		// ⚠ THE PAIR IS THE RULE, AND NEITHER HALF IS LOAD-BEARING ALONE. Mutating
-		// either side to admit `"` leaves the other refusing, so a single-sided
-		// mutant survives on the case that matters (`"experiment_key":"false"`).
-		// Two guards cover it; killing one would need an input contrived so only
-		// that half applies. Said here rather than fixtured around.
-		bareBefore := before == ':' || before == ',' || before == '[' ||
-			before == ' ' || before == '\n' || before == '\t' || before == 0
-		bareAfter := after == ',' || after == '}' || after == ']' ||
-			after == ' ' || after == '\n' || after == '\r' || after == '\t' || after == 0
-		if bareBefore && bareAfter {
-			b.WriteString(marked(matched))
-		} else {
-			b.WriteString(matched)
-		}
-		i += len(matched)
 	}
-	return b.String()
+	for k := len(spans) - 1; k >= 0; k-- {
+		sp := spans[k]
+		text = text[:sp.a] + marked(text[sp.a:sp.b]) + text[sp.b:]
+	}
+	return text
 }
 
 // jsonLiterals are the three bare tokens of JSON grammar. A supplied value equal
@@ -1424,6 +1444,17 @@ func assertNoLeak(text string) error {
 				if i, ok := headerNameEnd(bare); ok {
 					names.WriteString(bare[:i])
 					names.WriteByte('\n')
+					// ⚠ AND EACH COMPONENT ON ITS OWN LINE. base64's alphabet
+					// includes `-`, so decoding a whole field name in lockstep
+					// treats `X-YmFy` as one token and never produces `bar` --
+					// the encoding defeats the very component boundary
+					// `isNameByte` uses (shardpilot/shardpilot-go#84 review).
+					for _, part := range strings.Split(bare[:i], "-") {
+						if part != "" {
+							names.WriteString(part)
+							names.WriteByte('\n')
+						}
+					}
 				}
 			}
 		}
@@ -2008,6 +2039,17 @@ func dataOf(bare string) (string, bool) {
 		// review). Version and code go; whatever follows them stays.
 		f := strings.SplitN(bare, " ", 3)
 		if len(f) == 3 {
+			// ⚠ ON HTTP/2 THE PHRASE IS SYNTHESISED. The protocol carries only
+			// `:status`; Go builds `resp.Status` as "200 OK" and DumpResponse
+			// writes it, so returning it as captured data refused every HTTP/2
+			// response whose key happened to be a standard phrase
+			// (shardpilot/shardpilot-go#84 review). An HTTP/1 reason phrase is
+			// still endpoint text and is still checked.
+			if strings.HasPrefix(bare, "HTTP/2") {
+				if code, err := strconv.Atoi(f[1]); err == nil && f[2] == http.StatusText(code) {
+					return "", false
+				}
+			}
 			return f[2], true
 		}
 		return "", false
