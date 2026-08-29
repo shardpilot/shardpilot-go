@@ -11,3 +11,18 @@
 3bf08ff8f6f46bca38f7f42513e9bd2b086e5402:experiments_test.go:generic-api-key:24
 3bf08ff8f6f46bca38f7f42513e9bd2b086e5402:experiments_test.go:generic-api-key:187
 3bf08ff8f6f46bca38f7f42513e9bd2b086e5402:experiments_test.go:generic-api-key:611
+
+# One generic-api-key hit on 626d0f95, in refs/pull/73/head and no branch or tag.
+# Classified 2026-08-29 as NOT a credential: the value is a MADE-UP subject
+# identifier in a test fixture — `spcid_` followed by sequential hex digits —
+# asserting that a redirect `Location` echoing the request URL gets scrubbed.
+# `spcid_` values are SDK-minted subject ids, never access credentials; the rule
+# fired on the entropy of the literal, not on its meaning.
+#
+# The tree no longer contains it: 3870b15 replaced the fixture with a repeating
+# low-entropy value of the same wire shape, so the scanner is clean against the
+# working tree and this entry covers only the commit that already carries it.
+# Pinned per finding rather than allowlisted by shape, per this file's rule: a
+# `regexes` entry would forgive the literal everywhere and forever, while this
+# dies when the commit stops being advertised.
+626d0f95da37c5b853cb9adf02772ffaf828741c:examples/experiments/main_test.go:generic-api-key:199
