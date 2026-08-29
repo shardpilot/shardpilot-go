@@ -37,52 +37,32 @@
 # Makefile scanned anyway and documented the gap in a comment; a comment is not
 # a gate.
 #
-# ⚠ INSTALL BY COPY, NOT BY POINTING AT TRACKED CONTENT.
+# ⚠ INSTALL BY COPY, AND PIN core.hooksPath TO THE PHYSICAL DIRECTORY.
 #
-#     h="$(git rev-parse --git-path hooks)"
+#     h="$(git rev-parse --git-common-dir)/hooks"
 #     cp .githooks/pre-push "$h/pre-push"
 #     cp scripts/check_public_surface.sh "$h/"
 #     chmod +x "$h/pre-push" "$h/check_public_surface.sh"
+#     git config --local core.hooksPath "$h"
 #
-# BOTH files, and for the same reason: everything this hook EXECUTES must come
-# from outside tracked content, or a branch you are inspecting supplies it.
+# Three things, each closing a way the gate was silently absent:
 #
-# The earlier instruction was `git config core.hooksPath .githooks`, and it was
-# the vulnerability rather than the installation: core.hooksPath names a
-# DIRECTORY, so pointing it at a TRACKED one makes the hook that runs whatever
-# the checked-out branch says it is. Checking out an untrusted contributor's
-# branch and pushing it would execute THAT branch's copy of this file before any
-# trusted code ran -- the same class as the post-checkout execution closed one
-# round earlier, arriving through the door this file itself recommended
-# (shardpilot/shardpilot-go#79 review).
+#   * BOTH FILES. Everything this hook EXECUTES must come from outside tracked
+#     content -- the scanner as much as the hook -- or a branch you are
+#     inspecting supplies its own checker.
+#   * `--git-common-dir`, NOT `--git-dir`. In a linked worktree the latter names
+#     `.git/worktrees/<name>` while git reads hooks from the common directory,
+#     so the copy lands where git never looks.
+#   * `git config --local core.hooksPath "$h"`. The earlier instruction was
+#     `git config --unset core.hooksPath`, which cannot clear a GLOBAL or SYSTEM
+#     setting -- measured: with an inherited value, `--git-path hooks` still
+#     resolves to it and the hook is never invoked. A LOCAL setting overrides an
+#     inherited one, so the path is pinned rather than unset
+#     (shardpilot/shardpilot-go#79 review).
 #
-# `.git/hooks/` is outside the worktree and no branch can write to it. The cost
-# is that the copy does not update itself: re-copy when this file changes. That
-# is the trade, and it is the right way round -- a hook that updates itself from
-# the branch it is inspecting is not a gate.
-#
-# ⚠ EVERY COMMIT THE PUSH INTRODUCES IS SCANNED, not just its tip. A commit that
-# adds internal material and a later commit that removes it leave the tree clean
-# and the COMMIT published -- and `check_public_surface.sh` reads a tree, not a
-# history. The scanner is entirely index-driven (`git write-tree`, and
-# `git cat-file blob :path`), so each commit is scanned by pointing GIT_INDEX_FILE
-# at a temporary index read from that commit. The working tree is never touched.
-#
-# This is STRICTER than CI on the lane-B ratchet, deliberately: CI judges the
-# final state, and a pre-push gate that refuses an intermediate increase refuses
-# a commit that would nonetheless be published. Refusing more than CI is safe
-# here; refusing less is the failure this file exists to prevent.
-#
-# ⚠ NETWORK LOOKUPS USE $2, THE PUSH DESTINATION. `remote.<name>.pushurl` makes
-# the fetch URL and the receiving repository two different places, and for a
-# direct-URL push `$1` IS the URL -- so asking `$1` can compare against another
-# repository's default branch. githooks(5) supplies the actual location as `$2`.
-#
-# ⚠ AND REPLACEMENT OBJECTS ARE DISABLED. `refs/replace/*` is honoured by every
-# read here while a push transfers the ORIGINAL object and not the replacement,
-# so a replacement carrying a lower baseline or cleaner content could let the
-# real one through. Carried over from the `make check` target this hook replaces
-# -- a protection does not move to a new vehicle by itself.
+# The copies do not update themselves: re-copy when either file changes. That is
+# the trade, and it is the right way round -- a hook that updates itself from the
+# branch it is inspecting is not a gate.
 #
 # Bypassing is `git push --no-verify`, which is a decision to publish unscanned.
 
@@ -147,8 +127,13 @@ scanner="$hooks_dir/check_public_surface.sh"
 if [ ! -x "$scanner" ]; then
   printf 'REFUSING: no trusted scanner at %s.\n' "$scanner" >&2
   printf '  Install it beside the hook, from a checkout you trust:\n' >&2
-  printf '    cp scripts/check_public_surface.sh "$(git rev-parse --git-dir)/hooks/"\n' >&2
-  printf '    chmod +x "$(git rev-parse --git-dir)/hooks/check_public_surface.sh"\n' >&2
+  # ⚠ THE HINT MUST NAME THE DIRECTORY THE CHECK USES. It printed `--git-dir`
+  # while the lookup above searches `--git-common-dir`, so in a linked worktree
+  # following the recovery instruction copied somewhere the next push would not
+  # look, and refused identically (shardpilot/shardpilot-go#79 review). A
+  # recovery hint that does not recover is a loop with a message attached.
+  printf '    cp scripts/check_public_surface.sh %s/\n' "$hooks_dir" >&2
+  printf '    chmod +x %s/check_public_surface.sh\n' "$hooks_dir" >&2
   printf '  Running the TRACKED copy would execute whatever the checked-out\n' >&2
   printf '  branch says it is.\n' >&2
   exit 2
@@ -355,7 +340,19 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # decides eligibility; the tag object is scanned in its own right below,
   # because its annotation and signer metadata are published too.
   peeled="$(git rev-parse --verify --quiet "$local_sha^{commit}" 2>/dev/null || printf '%s' "$local_sha")"
-  if [ "$peeled" != "$head_sha" ]; then
+  # ⚠ AN ANCESTOR IS ELIGIBLE FOR A TAG. `--follow-tags` publishes missing
+  # annotated tags reachable from the refs being pushed, not only tags whose
+  # target IS HEAD -- so requiring equality refused an otherwise standard branch
+  # push because one of its tags pointed at the first of two commits
+  # (shardpilot/shardpilot-go#79 review). A tag target that HEAD contains is
+  # scannable from this checkout, which is all the eligibility test is for.
+  eligible=no
+  if [ "$peeled" = "$head_sha" ]; then
+    eligible=yes
+  elif [ "$peeled" != "$local_sha" ] && git merge-base --is-ancestor "$peeled" "$head_sha" 2>/dev/null; then
+    eligible=yes
+  fi
+  if [ "$eligible" = no ]; then
     printf 'REFUSING: pushing %s, which is not your HEAD.\n' "${local_ref:-?}" >&2
     printf '  The commits are scanned from their own trees, but the base and the\n' >&2
     printf '  ratchet are read relative to the checked-out repository state.\n' >&2
@@ -441,7 +438,12 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   published="$(git ls-remote --heads --tags -- "$dest" 2>/dev/null | awk '{print $1}')"
   excl=""
   for p in $published; do
-    [ "$p" = "$local_sha" ] && continue
+    # ⚠ THE PUSHED SHA IS NOT AN EXCEPTION -- IT IS THE EVIDENCE. Creating a ref
+    # at the tip of an already-published branch means `ls-remote` advertises
+    # exactly that SHA, and skipping it made the hook treat public history as
+    # newly introduced: rescanned against the default branch, and refusable on
+    # the budget or the ratchet for publishing nothing but a name
+    # (shardpilot/shardpilot-go#79 review).
     # ⚠ FETCH WHAT IS NOT HERE. Silently skipping an unresolvable advertised tip
     # counted history that IS already public as newly introduced, which can
     # refuse a legitimate push at the budget (shardpilot/shardpilot-go#79
@@ -455,10 +457,27 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # An annotated tag publishes its own message and signer, which no tree or
   # commit scan reaches. It rides along with the peeled commit's scan as one more
   # staged evidence file.
+  # ⚠ A TAG CHAIN IS A CHAIN. `^{}` peels RECURSIVELY, so an outer tag pointing
+  # at another annotated tag reaches the commit in one step while the inner tag
+  # object is transferred and published unscanned -- reading only `$local_sha`
+  # saw the outer one and stopped (shardpilot/shardpilot-go#79 review). Every
+  # object on the way down is staged.
   tag_object=""
-  if [ "$peeled" != "$local_sha" ]; then
-    git cat-file tag "$local_sha" > "$tmpdir/tag-object" 2>/dev/null \
-      && tag_object="$tmpdir/tag-object"
+  : > "$tmpdir/tag-object"
+  walk="$local_sha"
+  depth=0
+  while [ "$walk" != "$peeled" ] && [ "$depth" -lt 32 ]; do
+    git cat-file tag "$walk" >> "$tmpdir/tag-object" 2>/dev/null || break
+    printf '\n' >> "$tmpdir/tag-object"
+    tag_object="$tmpdir/tag-object"
+    nxt="$(git cat-file tag "$walk" 2>/dev/null | awk '$1=="object"{print $2; exit}')"
+    [ -n "$nxt" ] || break
+    walk="$nxt"
+    depth=$((depth + 1))
+  done
+  if [ "$depth" -ge 32 ]; then
+    printf 'REFUSING: tag chain deeper than 32 at %s; not scanning further.\n' "$local_sha" >&2
+    exit 2
   fi
   n="$(printf '%s\n' "$commits" | grep -c . || true)"
   printf 'public surface: comparing against %s (%s); %s commit(s) introduced\n' "$base" "$why" "$n"
