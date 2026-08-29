@@ -945,3 +945,59 @@ func TestTheWithheldQueryMarkerIsOneToken(t *testing.T) {
 		t.Fatalf("the request line has %d components, not 3: %q", n, line)
 	}
 }
+
+// ---- round on 3d334a3 ----
+
+func TestNormalisedCandidateReachesAFixedPoint(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// TWO layers of percent encoding inside MIME-wrapped base64.
+	inner := base64.StdEncoding.EncodeToString([]byte("%2561bcdefgh"))
+	wrapped := inner[:5] + "\r\n" + inner[5:]
+	if err := assertNoLeak(asCaptured("body:\r\n" + wrapped + "\r\n")); err == nil {
+		t.Fatal("a doubly-encoded value inside wrapped base64 passed the guard")
+	}
+}
+
+func TestTheGuardHonoursTheJSONLiteralExemption(t *testing.T) {
+	suppliedValues = []string{"false"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured(`{"assigned":false}`)); err != nil {
+		t.Fatalf("a JSON grammar literal refused a publishable capture: %v", err)
+	}
+}
+
+func TestSerialiserWrittenHeaderValuesAreGenerated(t *testing.T) {
+	suppliedValues = []string{"gzip"}
+	t.Cleanup(func() { suppliedValues = nil })
+	raw := "GET /p HTTP/1.1\r\nHost: e.example\r\nAccept-Encoding: gzip\r\n\r\n"
+	if err := assertNoLeak(asCaptured(string(redact([]byte(escapeMarks(raw)))))); err != nil {
+		t.Fatalf("a value net/http wrote itself was read as a leak: %v", err)
+	}
+}
+
+func TestAnUndecodableContentCodingIsRefused(t *testing.T) {
+	for _, c := range []struct {
+		enc     string
+		refused bool
+	}{{"deflate", true}, {"br", true}, {"identity", false}} {
+		structuralSurfaces = nil
+		suppliedValues = nil
+		dropFraming("HTTP/1.1 200 OK\r\nContent-Encoding: " + c.enc + "\r\n\r\nbody")
+		if got := len(structuralSurfaces) > 0; got != c.refused {
+			t.Errorf("%s: refused=%v, want %v", c.enc, got, c.refused)
+		}
+		structuralSurfaces = nil
+	}
+}
+
+func TestTransportErrorTextIsReadByTheGuard(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// Go's parser puts the offending line into the error it returns.
+	enc := base64.StdEncoding.EncodeToString([]byte("abcdefgh"))
+	err := errors.New("malformed HTTP response \"X-Bad " + enc + "\"")
+	if e := assertNoLeak(sanitizeCaptured(err)); e == nil {
+		t.Fatal("endpoint bytes carried by a transport error were never decoded")
+	}
+}
