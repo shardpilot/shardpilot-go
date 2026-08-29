@@ -91,7 +91,12 @@ SHELL := /usr/bin/env bash
 #     remote's own answer -- and its absence is a REFUSAL, not a guess at `main`;
 #   * a failed explicit fetch is separated from an absent branch by asking
 #     `git ls-remote --heads`, so a transient error can no longer masquerade as
-#     "this branch does not exist" and silently drop a base;
+#     "this branch does not exist" and silently drop a base -- AND the probe's own
+#     status is read three ways, not two: measured against this git, 0 means the
+#     ref exists, 2 means no matching ref, and 128 is a transport failure. Only 2
+#     is absence; collapsing every nonzero into absence let a probe that failed
+#     for the same transient reason as the fetch drop the branch base and leave a
+#     higher default one standing;
 #   * every base is passed to the scanner as a canonical `refs/remotes/...`
 #     path, so no tag can shadow it;
 #   * `--` terminates options before every remote name;
@@ -161,11 +166,20 @@ check:
 	       "+refs/heads/$$branch:$$canon" 2>/dev/null; then \
 	    : ; \
 	  else \
-	    if git ls-remote --quiet --exit-code --heads -- "$$remote" \
-	         "refs/heads/$$branch" >/dev/null 2>&1; then \
+	    probe=0; \
+	    git ls-remote --quiet --exit-code --heads -- "$$remote" \
+	      "refs/heads/$$branch" >/dev/null 2>&1 || probe=$$?; \
+	    if [ "$$probe" -eq 0 ]; then \
 	      printf 'REFUSING: %s exists on %s but could not be fetched.\n' "$$branch" "$$remote" >&2; \
 	      printf '  That is a failure, not an absence -- a transient network error or a\n' >&2; \
 	      printf '  locked ref -- and treating it as absence would silently drop a base.\n' >&2; \
+	      exit 2; \
+	    fi; \
+	    if [ "$$probe" -ne 2 ]; then \
+	      printf 'REFUSING: could not determine whether %s exists on %s (ls-remote\n' "$$branch" "$$remote" >&2; \
+	      printf '  exited %s). ONLY status 2 means "no matching ref"; anything else is\n' "$$probe" >&2; \
+	      printf '  the probe itself failing, and reading it as absence would drop a base\n' >&2; \
+	      printf '  whose baseline may be lower than the one left standing.\n' >&2; \
 	      exit 2; \
 	    fi; \
 	    if [ "$$required" = required ]; then \
