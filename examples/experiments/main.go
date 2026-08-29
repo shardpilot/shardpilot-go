@@ -403,6 +403,66 @@ const respSection = "## Response%s — header block re-serialised by " +
 	"bodyless dump and is forbidden in HTTP/2, so a header here is not " +
 	"evidence that it was received.\n\n%s\n%s\n"
 
+// ── the minted-field test, shared with the half this change builds on ────────
+//
+// ⚠ ONE PLACE ANSWERS "IS THIS A MINTED FIELD". The guard half REFUSES a capture
+// carrying one; this half REDACTS it. Same question, and it used to be answered
+// twice -- once there, once here -- after which the two copies drifted three
+// rounds running. Inherited now, extended below rather than restated.
+// mintedNames are the fields the SERVER mints -- the fact lane's subject and its
+// privacy boundary, defined as such in experiments.go.
+var mintedNames = map[string]bool{
+	"subject_fact_key": true,
+	"subject_key_hash": true,
+}
+
+// noteMinted records a server-minted field's presence and returns the body
+// unchanged -- the caller does not publish a body this reports on.
+// ⚠ MEMBER NAMES ARE DECODED, NOT MATCHED LITERALLY. `"subject_\u0066act_key"`
+// is the same field to `encoding/json` and to the endpoint, and a substring
+// check on the raw spelling did not see it -- so the capture was PUBLISHED with
+// the minted key intact instead of refused, and the leak guard cannot help
+// because a server-minted value is not in suppliedValues
+// (shardpilot/shardpilot-go#84 review). This is the same defect the redaction
+// half had in its own pattern, reintroduced here by writing a second, simpler
+// detector for the same question.
+var jsonMemberName = regexp.MustCompile(
+	`"((?:[^"\\]|\\.)*)"(\s*:\s*)`)
+
+// jsonString decodes a JSON string body -- the bytes BETWEEN the quotes -- to
+// what it denotes, using the same decoder that produced the response.
+func jsonString(raw string) (string, bool) {
+	var out string
+	if err := json.Unmarshal([]byte(`"`+raw+`"`), &out); err != nil {
+		return "", false
+	}
+	return out, true
+}
+
+// isMinted reports whether a raw JSON member name denotes a server-minted field,
+// under the decoding AND the folding `encoding/json` itself applies.
+//
+// ⚠ THIS IS THE ONE PLACE THAT ANSWERS THE QUESTION, and that is the fix for a
+// class rather than a case. The change that adds structural redaction needs the
+// same test in order to REDACT what this half REFUSES, and it used to answer it
+// again in its own file. The two copies then drifted three rounds running --
+// literal substring, ASCII case, Unicode fold -- each time the copy that had
+// already been corrected failing to correct the other
+// (shardpilot/shardpilot-go#84, #85 review). A stand-in cannot inherit a history
+// of fixes; shared code does not need to.
+func isMinted(raw string) bool {
+	name, ok := jsonString(raw)
+	if !ok {
+		return false
+	}
+	for n := range mintedNames {
+		if strings.EqualFold(name, n) {
+			return true
+		}
+	}
+	return false
+}
+
 // verdictValue renders a value the SDK decoded, for the verdict block.
 //
 // ⚠ IT IS A FUNCTION SO THE FIXTURE READS THE CALL SITE. Written inline, the test

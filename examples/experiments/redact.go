@@ -35,7 +35,6 @@ package main
 // simpler detector for the same question and reopened the same hole.
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -69,32 +68,6 @@ func noteStructural(what string) {
 		structuralSurfaces = append(structuralSurfaces, what)
 	}
 }
-
-// mintedNames are the fields the SERVER mints -- the fact lane's subject and its
-// privacy boundary, defined as such in experiments.go.
-var mintedNames = map[string]bool{
-	"subject_fact_key": true,
-	"subject_key_hash": true,
-}
-
-// jsonString decodes a JSON string body -- the bytes BETWEEN the quotes -- to
-// what it denotes, using the same decoder that produced the response.
-func jsonString(raw string) (string, bool) {
-	var out string
-	if err := json.Unmarshal([]byte(`"`+raw+`"`), &out); err != nil {
-		return "", false
-	}
-	return out, true
-}
-
-// jsonMemberName matches a member NAME and its colon, without requiring the
-// value to be a string. It exists to catch the shapes jsonMemberValue cannot
-// describe -- `{"subject_fact_key":{"token":"..."}}` is legal JSON, the SDK
-// accepts it, and a pattern anchored on a quoted value simply does not match, so
-// the nested server-generated value was published and the supplied-value guard
-// is blind to it (shardpilot/shardpilot-go#85 review).
-var jsonMemberName = regexp.MustCompile(
-	`"((?:[^"\\]|\\.)*)"(\s*:\s*)`)
 
 var jsonMemberValue = regexp.MustCompile(
 	`"((?:[^"\\]|\\.)*)"(\s*:\s*)"((?:[^"\\]|\\.)*)"`)
@@ -578,25 +551,6 @@ func redactMintedBody(body string) string {
 		}
 	}
 	return out
-}
-
-// isMinted reports whether a raw JSON member name denotes a server-minted field,
-// under the decoding and the ASCII case-folding `encoding/json` itself applies.
-func isMinted(raw string) bool {
-	name, ok := jsonString(raw)
-	if !ok {
-		return false
-	}
-	// ⚠ `encoding/json` FOLDS WITH UNICODE SEMANTICS, and `strings.ToLower` does
-	// not: it leaves the long-s `ſ` alone, while the decoder matches it to `s`
-	// and populates the field (shardpilot/shardpilot-go#85 review). The
-	// comparison must be the DECODER's, not a convenient approximation of it.
-	for n := range mintedNames {
-		if strings.EqualFold(name, n) {
-			return true
-		}
-	}
-	return false
 }
 
 // redactPath replaces every non-empty path segment of a redirect target with its
