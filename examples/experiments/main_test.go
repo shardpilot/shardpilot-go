@@ -951,3 +951,70 @@ func TestGeneratedCaptureNotesAreMarked(t *testing.T) {
 		t.Fatalf("the generated note was destroyed: %q", got)
 	}
 }
+
+// ---- round on 0cdc4ee / 03cba8b ----
+
+func TestDecodedFieldNamesAreFoldedBeforeApproval(t *testing.T) {
+	suppliedValues = []string{"secret"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured("HTTP/1.1 200 OK\r\nX-%53ecret: v\r\n\r\n")); err == nil {
+		t.Fatal("an encoded name that decodes to a case variant passed the guard")
+	}
+}
+
+func TestNormalisedBase64GoesBackThroughEveryDecoder(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	inner := base64.StdEncoding.EncodeToString([]byte("%61bcdefgh"))
+	wrapped := inner[:5] + "\r\n" + inner[5:]
+	if err := assertNoLeak(asCaptured("body:\r\n" + wrapped + "\r\n")); err == nil {
+		t.Fatal("an encoding nested inside MIME-wrapped base64 passed the guard")
+	}
+}
+
+func TestProtocolTokensDoNotRefuseTheCapture(t *testing.T) {
+	// ⚠ THROUGH `redact`, NOT A HAND-BUILT DUMP. My first version composed the
+	// marked line itself and so could not see the call site at all -- the third
+	// fixture in this branch to do that. What `redact` produces is what the guard
+	// reads, so that is what the test reads.
+	for _, v := range []string{"Bearer", "Authorization", "Host", "User-Agent"} {
+		suppliedValues = []string{v}
+		raw := "GET /p HTTP/1.1\r\nHost: e.example\r\nAuthorization: Bearer abcdefgh\r\nUser-Agent: sp/1\r\n\r\n"
+		if err := assertNoLeak(asCaptured(string(redact([]byte(escapeMarks(raw)))))); err != nil {
+			t.Errorf("supplied %q: fixed request syntax was read as a leak: %v", v, err)
+		}
+		suppliedValues = nil
+	}
+}
+
+func TestAJSONLiteralIsNotRewritten(t *testing.T) {
+	suppliedValues = []string{"false"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied(`{"assigned":false}`))
+	if got != `{"assigned":false}` {
+		t.Fatalf("a JSON literal was rewritten into invalid JSON: %q", got)
+	}
+}
+
+func TestANestedMintedNameIsNotTheVerdictsField(t *testing.T) {
+	structuralSurfaces = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	dropFraming("HTTP/1.1 200 OK\r\n\r\n" + `{"assigned":true,"variant_payload":{"subject_fact_key":"label"}}`)
+	if len(structuralSurfaces) != 0 {
+		t.Fatalf("a payload member refused a publishable capture: %v", structuralSurfaces)
+	}
+	// And the real one still does.
+	structuralSurfaces = nil
+	dropFraming("HTTP/1.1 200 OK\r\n\r\n" + `{"subject_fact_key":"sfk1_abab"}`)
+	if len(structuralSurfaces) == 0 {
+		t.Fatal("the top-level minted field stopped being detected")
+	}
+}
+
+func TestTheWithheldQueryMarkerIsOneToken(t *testing.T) {
+	got := stripMarks(dropQuery("GET /v1/assign?a=b HTTP/1.1\r"))
+	line := strings.TrimSuffix(got, "\r")
+	if n := len(strings.Fields(line)); n != 3 {
+		t.Fatalf("the request line has %d components, not 3: %q", n, line)
+	}
+}
