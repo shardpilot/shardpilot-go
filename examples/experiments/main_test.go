@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Each test below stands for one review finding on this program. They are here
@@ -804,15 +806,22 @@ func TestTheVerdictEscapesMarkerBytesBeforeStripping(t *testing.T) {
 }
 
 func TestOffRouteTrafficIsNotRecorded(t *testing.T) {
+	sent := false
 	r := &recorder{inner: rtFunc(func(*http.Request) (*http.Response, error) {
+		sent = true
 		return &http.Response{StatusCode: 204, Body: io.NopCloser(strings.NewReader("")),
 			Header: http.Header{}, Proto: "HTTP/1.1"}, nil
 	})}
 	req, _ := http.NewRequest("POST", "https://e.example/api/v1/ingest", strings.NewReader("{}"))
-	if _, err := r.RoundTrip(req); err == nil {
-		// DefaultTransport will fail against a fake host; what matters is that
-		// nothing was recorded and the counter moved.
-		_ = err
+	resp, err := r.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("off-route request errored instead of being absorbed: %v", err)
+	}
+	if resp.StatusCode != 204 {
+		t.Fatalf("off-route request was not absorbed: %d", resp.StatusCode)
+	}
+	if sent {
+		t.Fatal("off-route request was FORWARDED — the harness emitted analytics")
 	}
 	if len(r.exchanges) != 0 {
 		t.Fatalf("ingest traffic was recorded as an assignment attempt: %d", len(r.exchanges))
@@ -825,3 +834,63 @@ func TestOffRouteTrafficIsNotRecorded(t *testing.T) {
 type rtFunc func(*http.Request) (*http.Response, error)
 
 func (f rtFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// ---- round on 7854bd8 ----
+
+func TestATransportErrorDoesNotDeadlockTheRecorder(t *testing.T) {
+	r := &recorder{inner: rtFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("dial: no route")
+	})}
+	req, _ := http.NewRequest("GET", "https://e.example"+assignmentRoute+"?a=b", nil)
+	done := make(chan struct{})
+	go func() { _, _ = r.RoundTrip(req); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the transport-error path did not return: the recorder deadlocked on its own mutex")
+	}
+	if len(r.exchanges) != 1 {
+		t.Fatalf("the failed attempt was not recorded: %d", len(r.exchanges))
+	}
+}
+
+func TestNormalisedBase64CandidateIsDecoded(t *testing.T) {
+	suppliedValues = []string{"abcdefghijklmnopqrstuvwxyz012345678901234567890123456789"}
+	t.Cleanup(func() { suppliedValues = nil })
+	enc := base64.StdEncoding.EncodeToString([]byte(suppliedValues[0]))
+	// Wrapped at 41 — NOT a quartet boundary, so no fragment decodes to anything.
+	wrapped := enc[:41] + "\r\n" + enc[41:]
+	if err := assertNoLeak(asCaptured("body:\r\n" + wrapped + "\r\n")); err == nil {
+		t.Fatal("a MIME wrap off the quartet boundary passed the guard")
+	}
+}
+
+func TestTheProtocolExemptionAppliesToTheFirstLineOnly(t *testing.T) {
+	suppliedValues = []string{"200"}
+	t.Cleanup(func() { suppliedValues = nil })
+	dump := asCaptured("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n" +
+		"HTTP/1.1 %32%30%30 OK\r\n")
+	if err := assertNoLeak(dump); err == nil {
+		t.Fatal("a status-shaped BODY line was exempted and hid a supplied value")
+	}
+}
+
+func TestTrailersAreSnapshotAfterCloseAsWell(t *testing.T) {
+	resp := &http.Response{Trailer: http.Header{}}
+	tee := &teeBody{inner: closerFunc(func() error {
+		// Values become visible during close, which is legal for HTTP/2.
+		resp.Trailer.Set("X-Late", "v")
+		return nil
+	}), resp: resp}
+	if err := tee.Close(); err != nil {
+		t.Fatalf("close failed: %v", err)
+	}
+	if len(tee.trailer) == 0 {
+		t.Fatal("trailers that appeared during close were never recorded")
+	}
+}
+
+type closerFunc func() error
+
+func (f closerFunc) Close() error             { return f() }
+func (f closerFunc) Read([]byte) (int, error) { return 0, io.EOF }

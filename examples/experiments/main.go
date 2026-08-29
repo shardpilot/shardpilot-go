@@ -594,7 +594,21 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 		r.mu.Lock()
 		r.offRoute++
 		r.mu.Unlock()
-		return http.DefaultTransport.RoundTrip(req)
+		// ⚠ ABSORBED, NOT FORWARDED. Filtering it out of the RECORD while still
+		// sending it left the side effect this harness must not have: an
+		// automatic exposure delivered to the ingest endpoint from a run whose
+		// only purpose is to observe one assignment
+		// (shardpilot/shardpilot-go#84 review). A capture tool that emits
+		// analytics is not observing, it is participating.
+		if req.Body != nil {
+			_ = req.Body.Close()
+		}
+		return &http.Response{
+			Status: "204 No Content", StatusCode: http.StatusNoContent,
+			Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+			Header: make(http.Header), Body: io.NopCloser(strings.NewReader("")),
+			ContentLength: 0, Request: req,
+		}, nil
 	}
 	ex := exchange{}
 	// EVERY QUERY VALUE THE SDK SENDS JOINS THE SCRUB SET, not only the values
@@ -624,9 +638,7 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 		// the program print a pair whose second half never existed.
 		ex.transErr = err
 		r.mu.Lock()
-		r.mu.Lock()
 		r.exchanges = append(r.exchanges, ex)
-		r.mu.Unlock()
 		r.mu.Unlock()
 		return nil, err
 	}
@@ -737,7 +749,13 @@ func (t *teeBody) Close() error {
 	// The last chance to see trailers: an exact-ceiling body reaches EOF inside
 	// the SDK's own limiter and never calls Read again.
 	t.snapTrailers()
-	return t.inner.Close()
+	err := t.inner.Close()
+	// ⚠ AND AGAIN AFTER. Trailer values can become visible DURING close, and a
+	// snapshot taken only before it left the report announcing a Trailer field,
+	// omitting its contents, and calling the pair complete
+	// (shardpilot/shardpilot-go#84 review).
+	t.snapTrailers()
+	return err
 }
 
 func redact(dump []byte) []byte {
@@ -1118,12 +1136,23 @@ func assertNoLeak(text string) error {
 	for _, span := range capturedSpan.FindAllString(text, -1) {
 		span = genSpan.ReplaceAllString(span, " ")
 		inHead := true
+		first := true
 		for _, ln := range strings.Split(span, "\n") {
 			bare := strings.TrimSuffix(strings.TrimSpace(stripMarks(ln)), "\r")
 			if inHead && bare == "" {
 				inHead = false
 			}
-			keep, ok := dataOf(bare)
+			// ⚠ THE EXEMPTION IS POSITIONAL, NOT SHAPED. Applied to every line, a
+			// plain-text BODY line that merely looks like a status line had its
+			// first two tokens discarded before decoding -- so a percent-spelled
+			// supplied value inside it was never checked and was published
+			// (shardpilot/shardpilot-go#84 review). Only the message's own first
+			// line is protocol syntax.
+			keep, ok := bare, true
+			if first {
+				keep, ok = dataOf(bare)
+				first = false
+			}
 			if !ok {
 				continue
 			}
@@ -1205,7 +1234,13 @@ func assertNoLeak(text string) error {
 			// fixed-point comparison's arithmetic, and adding to it per stage made
 			// the loop compare against a mid-round form and settle early -- three
 			// existing decoder fixtures said so immediately.
-			extra = append(extra, strings.Join(strings.Fields(cur), ""))
+			// ⚠ AND IT IS DECODED. Storing the normalised form alone checked the
+			// wrapped SPELLING, which no supplied value ever equals -- the whole
+			// point is that a MIME decoder reconstructs the value FROM it
+			// (shardpilot/shardpilot-go#84 review). Both forms are kept: the
+			// normalisation, and what base64 makes of it.
+			norm := strings.Join(strings.Fields(cur), "")
+			extra = append(extra, norm, undoBase64(norm))
 			work += len(cur)
 			if work > decodeWorkMax {
 				return fmt.Errorf(
