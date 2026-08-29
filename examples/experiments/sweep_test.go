@@ -35,16 +35,15 @@ func TestNoUnrecognisedFormPublishesServerGeneratedText(t *testing.T) {
 		{"Server banner", "HTTP/1.1 200 OK\r\nServer: nginx/SRVGEN\r\n\r\n"},
 		{"ETag", "HTTP/1.1 200 OK\r\nETag: \"SRVGEN\"\r\n\r\n"},
 		{"an unregistered X- field", "HTTP/1.1 200 OK\r\nX-Request-Id: SRVGEN\r\n\r\n"},
-		// ⚠ FOUR CASES ARE DELIBERATELY ABSENT, and their absence is the honest
-		// record of an open decision rather than an oversight: an identifier in
-		// the redirect HOST, in a query or fragment parameter NAME, or as the
-		// cookie NAME. Each is a real hole, reported on shardpilot-go#85 and NOT
-		// closed here. Closing them means lengthening the name side too, and the
-		// measured artifact then reads
-		// `Location: /redacted-2-chars?redacted-5-chars=redacted-6-chars`, which
-		// four existing fixtures pin against on purpose. That is a trade between
-		// coverage and a readable artifact, and it belongs to whoever owns the
-		// tool, not to the change that noticed it.
+		{"identifier as a query parameter NAME", "HTTP/1.1 302 Found\r\nLocation: /cb?SRVGEN=x\r\n\r\n"},
+		{"identifier as a fragment parameter NAME", "HTTP/1.1 302 Found\r\nLocation: /cb#SRVGEN=x\r\n\r\n"},
+		{"identifier as the cookie NAME", "HTTP/1.1 200 OK\r\nSet-Cookie: SRVGEN=x\r\n\r\n"},
+		// ⚠ ONE CASE IS DELIBERATELY ABSENT, and its absence is a decision rather
+		// than an oversight: an identifier in the redirect HOST. The host is
+		// structurally constrained, publicly resolvable, and the first thing a
+		// reader looks for -- hiding it hides the subject of the capture. The
+		// name-side rule covers parameter and cookie names because those are
+		// unbounded strings the endpoint invents; a host is not.
 	} {
 		structuralSurfaces = nil
 		suppliedValues = nil

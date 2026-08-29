@@ -131,18 +131,34 @@ func redactQuery(line string) string {
 // by their length. `opaqueNameBytes` names bytes that CANNOT appear in a name in
 // this context -- a component carrying one is not a name/value pair at all, so it
 // is replaced whole.
-// requestNames are the parameter names and the authority the HARNESS put on the
-// wire. Collected but NOT yet used to redact: see the note on the three open
-// name-side findings in shardpilot/shardpilot-go#85. A name this program sent is
-// one it can vouch for; the machinery is here so the decision, when it is made,
-// is a two-line change rather than a redesign.
+// requestNames are the parameter names the HARNESS put on the wire.
+//
+// ⚠ THE NAME SIDE IS SPLIT BY PROVENANCE, NOT COVERED OR ABANDONED. An
+// identifier can sit in a parameter NAME as easily as in its value -- the design
+// said "names kept, values lengthened", and `?server-secret=x` published it
+// (shardpilot/shardpilot-go#85 review). Lengthening every name closes that and
+// produces `/cb?redacted-5-chars=redacted-6-chars`, an artifact nobody can read
+// -- and a rule nobody can work with is relaxed by whoever next needs to read a
+// capture. A strict version that gets switched off protects less than a workable
+// one that runs.
+//
+// So the SAME provenance test the value side already uses is applied to names: a
+// name this program itself sent is one it can vouch for and is printed; a name
+// that came back and is not in that set was chosen by the endpoint and is
+// lengthened.
+//
+//	/cb?state=redacted-6-chars     state was sent by us -- readable
+//	/cb?redacted-6-chars=…         the endpoint invented this name
+//
+// ⚠ THE REDIRECT HOST IS DELIBERATELY NOT COVERED. It is structurally
+// constrained, publicly resolvable, and the first thing a reader looks for;
+// hiding it hides the subject of the capture. That is a decision, recorded here
+// so it is not mistaken for an oversight.
 var requestNames = map[string]bool{}
 
-func noteRequestName(n string) { requestNames[n] = true }
+func noteRequestName(n string) { requestNames[strings.TrimSpace(n)] = true }
 
 func nameIsOurs(n string) bool { return requestNames[strings.TrimSpace(n)] }
-
-var _ = nameIsOurs
 
 func redactPairs(rest, opaqueNameBytes string) string {
 	parts := strings.Split(rest, "&")
@@ -180,7 +196,16 @@ func redactPairs(rest, opaqueNameBytes string) string {
 		// COUNT CHARACTERS OF THE DECODED VALUE: the placeholder says "chars",
 		// and `len` says bytes -- `%C3%A9` decoded to one character reported as
 		// two (shardpilot/shardpilot-go#73 review).
-		parts[k] = p[:eq+1] + tokenPlaceholder(queryDecoded(p[eq+1:]))
+		name := p[:eq]
+		if !nameIsOurs(name) {
+			// ⚠ MARKED, NOT STRIPPED. Stripping the provenance marks to keep the
+			// name looking like a name let the supplied-value scrub reach INSIDE
+			// the placeholder it had just generated -- `<redacted, 8 chars>-5-chars`
+			// (caught by the fixture that exists for exactly that). A placeholder
+			// is generated text wherever it sits.
+			name = tokenPlaceholder(queryDecoded(name))
+		}
+		parts[k] = name + "=" + tokenPlaceholder(queryDecoded(p[eq+1:]))
 	}
 	return strings.Join(parts, "&")
 }
@@ -342,6 +367,12 @@ func redactSetCookie(line string) string {
 	measured := value
 	if len(measured) >= 2 && measured[0] == '"' && measured[len(measured)-1] == '"' {
 		measured = measured[1 : len(measured)-1]
+	}
+	// A cookie NAME is never something this program sent, so it is lengthened by
+	// the same rule -- there is nothing on the name side of a Set-Cookie whose
+	// provenance the harness can attest to.
+	if !nameIsOurs(name) {
+		name = tokenPlaceholder(name)
 	}
 	out := head + ": " + name + "=" + placeholder(measured)
 	if hasAttrs {

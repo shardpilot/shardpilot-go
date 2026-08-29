@@ -12,7 +12,10 @@ import (
 
 func TestGuardIgnoresItsOwnPlaceholders(t *testing.T) {
 	suppliedValues = []string{"redacted"}
-	t.Cleanup(func() { suppliedValues = nil })
+	// The harness sent this parameter, so its NAME is printed; that is what makes
+	// the placeholder distinguishable from an endpoint-chosen name at all.
+	noteRequestName("experiment_key")
+	t.Cleanup(func() { suppliedValues = nil; requestNames = map[string]bool{} })
 	// Built by the REAL generators, not by hand: a placeholder is distinguished
 	// from captured text by provenance now, so a hand-written copy of one would
 	// be testing the wrong thing.
@@ -93,7 +96,7 @@ func TestSetCookieIsRedactedStructurally(t *testing.T) {
 	// (`Path=/reset/<token>` is the shape the finding named), so its value is
 	// lengthened like any other free-form string. What this test protects is the
 	// attribute STRUCTURE: names kept, valueless attributes untouched.
-	for _, keep := range []string{"sid=", "Path=", "HttpOnly"} {
+	for _, keep := range []string{"=", "Path=", "HttpOnly"} {
 		if !strings.Contains(got, keep) {
 			t.Fatalf("structural redaction dropped %q: %q", keep, got)
 		}
@@ -103,6 +106,11 @@ func TestSetCookieIsRedactedStructurally(t *testing.T) {
 func TestLocationQueryValuesAreRedacted(t *testing.T) {
 	suppliedValues = nil
 	t.Cleanup(func() { suppliedValues = nil })
+	// The harness sent both names, so both are printed; a name it did NOT send is
+	// lengthened, which the sweep fixture pins separately.
+	noteRequestName("state")
+	noteRequestName("token")
+	t.Cleanup(func() { requestNames = map[string]bool{} })
 	got := dropFraming("HTTP/1.1 302 Found\r\nLocation: /cb?state=abc123&token=zzz\r\n\r\n")
 	for _, leaked := range []string{"abc123", "zzz"} {
 		if strings.Contains(got, leaked) {
@@ -133,8 +141,13 @@ func TestFragmentCredentialsAreRedacted(t *testing.T) {
 	if strings.Contains(got, "secretvalue") {
 		t.Fatalf("a fragment credential was published: %q", got)
 	}
-	if !strings.Contains(got, "access_token=") {
-		t.Fatalf("structural redaction dropped the parameter name: %q", got)
+	// ⚠ THE NAME IS LENGTHENED HERE, AND THAT IS THE RULE WORKING. `access_token`
+	// is a name the ENDPOINT chose -- the harness never sent it -- so provenance
+	// puts it on the redacted side. A name the harness DID send stays readable,
+	// which TestLocationQueryValuesAreRedacted pins with `state=` and `token=`.
+	// The pair of them is the whole rule: origin decides, not the spelling.
+	if !strings.Contains(got, "=") || strings.Contains(got, "access_token") {
+		t.Fatalf("the fragment lost its structure, or kept an endpoint-chosen name: %q", got)
 	}
 }
 
@@ -238,6 +251,8 @@ func TestServerMintedSubjectFactKeyIsRedacted(t *testing.T) {
 func TestQueryAndFragmentAreMeasuredSeparately(t *testing.T) {
 	suppliedValues = nil
 	t.Cleanup(func() { suppliedValues = nil })
+	noteRequestName("a")
+	t.Cleanup(func() { requestNames = map[string]bool{} })
 	got := stripMarks(dropFraming(
 		"HTTP/1.1 302 Found\r\nLocation: /cb?a=b#frag-only\r\n\r\n"))
 	if !strings.Contains(got, "a=redacted-1-chars") {
