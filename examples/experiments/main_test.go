@@ -395,7 +395,7 @@ func TestAValueShapedLikeAPlaceholderStillPublishes(t *testing.T) {
 	if err := assertNoLeak("GET /x?experiment_key=redacted-38-chars HTTP/1.1"); err == nil {
 		t.Fatal("the mask swallowed the value it was protecting")
 	}
-	clean := redactQuery("GET /x?subject_key=0123456789abcdef0123456789abcdef012345 HTTP/1.1")
+	clean := redactQuery("GET /x?subject_key=ababababababababababababababababababab HTTP/1.1")
 	if err := assertNoLeak(clean); err != nil {
 		t.Fatalf("a generated placeholder was read as a leak: %v", err)
 	}
