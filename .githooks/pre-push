@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+#
+# RUN THE PUBLIC-SURFACE GATE AGAINST WHAT IS ACTUALLY BEING PUSHED.
+#
+# This is the only PUBLIC repository in the platform, and a repository publishes
+# its HISTORY along with its tree. A commit carrying internal material is
+# published the moment it is pushed -- not when it merges -- so a gate that runs
+# only in CI catches it one step too late, and the remedy is a branch rewrite
+# rather than a fix.
+#
+# WHY A HOOK AND NOT A make TARGET. The question the gate has to answer is
+# "which commit will CI compare this against", and CI's answer depends on the
+# REFSPEC being pushed:
+#
+#     push to an EXISTING ref  -> github.event.before, the pre-push tip
+#     push CREATING a ref      -> the repository's default branch
+#
+# A Makefile cannot know the refspec. A `make check` target tried, and ten
+# review rounds each found another way the guess was wrong -- narrow fetch
+# configurations, `push.default`, forks whose default is not `main`, tags
+# shadowing short names, remotes named with slashes or leading dashes. Every
+# fix modelled a little more of git's own ref resolution.
+#
+# git hands a pre-push hook exactly what it could not guess. Per `githooks(5)`,
+# each line on stdin is:
+#
+#     <local ref> <local sha> <remote ref> <remote sha>
+#
+# `<remote sha>` IS `github.event.before` for an existing ref, and all zeros
+# when the ref is being created. So the base is read, not derived.
+#
+# ⚠ WHAT THIS REFUSES RATHER THAN GUESSES. `check_public_surface.sh` scans the
+# tree `git write-tree` writes -- your INDEX. That is only the tree being
+# pushed when the pushed tip IS your HEAD and nothing is uncommitted. When it is
+# not -- `git push origin other-branch:main`, a dirty tree, a detached push --
+# this hook REFUSES instead of scanning something else and reporting on it. The
+# Makefile scanned anyway and documented the gap in a comment; a comment is not
+# a gate.
+#
+# Install once:
+#
+#     git config core.hooksPath .githooks
+#
+# ⚠ EVERY COMMIT THE PUSH INTRODUCES IS SCANNED, not just its tip. A commit that
+# adds internal material and a later commit that removes it leave the tree clean
+# and the COMMIT published -- and `check_public_surface.sh` reads a tree, not a
+# history. The scanner is entirely index-driven (`git write-tree`, and
+# `git cat-file blob :path`), so each commit is scanned by pointing GIT_INDEX_FILE
+# at a temporary index read from that commit. The working tree is never touched.
+#
+# This is STRICTER than CI on the lane-B ratchet, deliberately: CI judges the
+# final state, and a pre-push gate that refuses an intermediate increase refuses
+# a commit that would nonetheless be published. Refusing more than CI is safe
+# here; refusing less is the failure this file exists to prevent.
+#
+# ⚠ NETWORK LOOKUPS USE $2, THE PUSH DESTINATION. `remote.<name>.pushurl` makes
+# the fetch URL and the receiving repository two different places, and for a
+# direct-URL push `$1` IS the URL -- so asking `$1` can compare against another
+# repository's default branch. githooks(5) supplies the actual location as `$2`.
+#
+# ⚠ AND REPLACEMENT OBJECTS ARE DISABLED. `refs/replace/*` is honoured by every
+# read here while a push transfers the ORIGINAL object and not the replacement,
+# so a replacement carrying a lower baseline or cleaner content could let the
+# real one through. Carried over from the `make check` target this hook replaces
+# -- a protection does not move to a new vehicle by itself.
+#
+# Bypassing is `git push --no-verify`, which is a decision to publish unscanned.
+
+set -euo pipefail
+
+# See the note above: every read below must see the objects a push transfers.
+export GIT_NO_REPLACE_OBJECTS=1
+
+root="$(git rev-parse --show-toplevel)"
+scanner="$root/scripts/check_public_surface.sh"
+[ -x "$scanner" ] || { printf 'pre-push: %s is missing or not executable\n' "$scanner" >&2; exit 1; }
+
+remote_name="${1:-origin}"
+# githooks(5): $2 is where the push is actually going. $1 may be a name or, for a
+# direct-URL push, the URL itself.
+dest="${2:-$remote_name}"
+
+tmpdir="$(mktemp -d)"
+cleanup() { git worktree remove --force "$tmpdir/wt" >/dev/null 2>&1 || true; rm -rf "$tmpdir"; git worktree prune >/dev/null 2>&1 || true; git update-ref -d refs/prepush-base 2>/dev/null || true; }
+trap cleanup EXIT
+
+head_sha="$(git rev-parse HEAD)"
+status=0
+
+# scan_commit <commit> <base> -- scans that commit's tree, with TODAY'S scanner.
+#
+# ⚠ A TEMPORARY WORKTREE, NOT A TEMPORARY INDEX. The scanner is index-driven --
+# `git write-tree` for the file list, `git cat-file blob :path` for content --
+# so pointing GIT_INDEX_FILE at a per-commit index looks like the cheap answer.
+# It is not: the scanner SELF-TESTS by building fixture repositories and running
+# `git add -A` inside them, and an inherited GIT_INDEX_FILE redirects those
+# writes into the per-commit index. Measured, not guessed: the index is
+# corrupted mid-run, `git write-tree` then yields something that is not a tree,
+# and the scanner refuses with "git ls-files failed". A worktree has its own
+# index and the fixtures have theirs, so nothing collides.
+#
+# ⚠ AND TODAY'S SCANNER IS STAGED INTO IT. The scanner refuses to run unless it
+# matches its staged copy -- a real protection, since an edited gate reporting
+# clean is its worst failure. So the current scanner is written into the
+# worktree and staged there: the tree examined is commit C's, except at the
+# scanner's own path, and the rules applied are TODAY'S rather than the ones
+# that shipped with C. That is the right direction -- a rule added since C
+# should still catch what C published -- and it is a difference, so it is named.
+scan_commit() {
+  wt="$tmpdir/wt"
+  rm -rf "$wt"
+  if ! git worktree add --detach --quiet "$wt" "$1" 2>/dev/null; then
+    printf 'REFUSING: could not create a worktree at %s to scan it.\n' "$1" >&2
+    exit 2
+  fi
+  if [ ! -e "$wt/scripts/check_public_surface.sh" ]; then
+    mkdir -p "$wt/scripts"
+  fi
+  cp "$scanner" "$wt/scripts/check_public_surface.sh"
+  chmod +x "$wt/scripts/check_public_surface.sh"
+  ( cd "$wt" && git add scripts/check_public_surface.sh >/dev/null 2>&1 ) || true
+  ( cd "$wt" && PUBLIC_SURFACE_BASE_REF="$2" ./scripts/check_public_surface.sh )
+  rc=$?
+  git worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
+  return $rc
+}
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  case "$local_sha" in *[!0]*) ;; *) continue ;; esac
+
+  if [ "$local_sha" != "$head_sha" ]; then
+    printf 'REFUSING: pushing %s, which is not your HEAD.\n' "${local_ref:-?}" >&2
+    printf '  The commits are scanned from their own trees, but the base and the\n' >&2
+    printf '  ratchet are read relative to the checked-out repository state.\n' >&2
+    printf '  Check out %s and push again, or --no-verify and own it.\n' "${local_ref:-that ref}" >&2
+    exit 2
+  fi
+  if ! git diff --quiet HEAD -- || ! git diff --cached --quiet; then
+    printf 'REFUSING: the index or working tree differs from HEAD.\n' >&2
+    printf '  Commit or stash first, so what is scanned is what is published.\n' >&2
+    exit 2
+  fi
+
+  case "$remote_sha" in
+    *[!0]*)
+      base="$remote_sha"
+      why="the pre-push tip of ${remote_ref:-the remote ref}"
+      if ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null 2>&1; then
+        if ! git fetch --quiet -- "$dest" "$base" 2>/dev/null; then
+          printf 'REFUSING: the pre-push tip %s is not here and could not be fetched.\n' "$base" >&2
+          exit 2
+        fi
+      fi
+      ;;
+    *)
+      branch="$(git ls-remote --symref -- "$dest" HEAD 2>/dev/null \
+        | awk '$1=="ref:" && $3=="HEAD" {sub("refs/heads/","",$2); print $2; exit}')"
+      if [ -z "$branch" ]; then
+        printf 'REFUSING: %s did not advertise a default branch (HEAD symref).\n' "$dest" >&2
+        printf '  Guessing a name is how a fork or a rename becomes the wrong,\n' >&2
+        printf '  higher baseline.\n' >&2
+        exit 2
+      fi
+      if ! git fetch --quiet -- "$dest" \
+           "+refs/heads/$branch:refs/prepush-base" 2>/dev/null; then
+        printf 'REFUSING: could not fetch %s from %s to compare against.\n' "$branch" "$dest" >&2
+        exit 2
+      fi
+      base=refs/prepush-base
+      why="the default branch of the destination, ${branch}, because this push CREATES ${remote_ref:-the ref}"
+      ;;
+  esac
+
+  # EVERY COMMIT THE PUSH INTRODUCES, oldest first. Each one becomes reachable
+  # in a public repository the moment this push succeeds.
+  commits="$(git rev-list --reverse "$base..$local_sha")"
+  n="$(printf '%s\n' "$commits" | grep -c . || true)"
+  printf 'public surface: comparing against %s (%s); %s commit(s) introduced\n' "$base" "$why" "$n"
+  if [ "$n" = 0 ]; then
+    continue
+  fi
+
+  # ⚠ A DISCLOSED BUDGET, AND EVERY SKIPPED COMMIT IS NAMED.
+  #
+  # One scan is a full pass over the tracked tree -- 15-20s here -- so a branch
+  # sitting 28 commits off main takes over eight minutes, measured. A gate that
+  # slow is bypassed, and a bypassed gate protects nothing. So the budget is
+  # explicit, overridable, and its remainder is PRINTED rather than dropped
+  # quietly: an unscanned commit that nobody names looks exactly like a scanned
+  # one. The durable cure is a scanner that can be pointed at a tree without a
+  # worktree per commit; until it exists, this states its own coverage.
+  budget="${PUBLIC_SURFACE_MAX_COMMITS:-10}"
+  i=0
+  skipped=""
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    i=$((i + 1))
+    if [ "$i" -gt "$budget" ] && [ "$c" != "$local_sha" ]; then
+      skipped="$skipped $(git rev-parse --short "$c")"
+      continue
+    fi
+    printf 'public surface: scanning %s (%s/%s)\n' "$(git rev-parse --short "$c")" "$i" "$n"
+    scan_commit "$c" "$base" || status=$?
+  done <<< "$commits"
+  if [ -n "$skipped" ]; then
+    printf '\n⚠ NOT SCANNED, and they WILL be published by this push:%s\n' "$skipped" >&2
+    printf '  The budget is %s commits (PUBLIC_SURFACE_MAX_COMMITS). Raise it and\n' "$budget" >&2
+    printf '  push again to cover them, or push in smaller steps. This gate does\n' >&2
+    printf '  not claim they are clean -- it claims it did not look.\n' >&2
+  fi
+done
+
+exit "$status"

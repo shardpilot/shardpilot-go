@@ -306,7 +306,15 @@ Defaults: issuer `shardpilot`, audience `shardpilot-ingest`, lifetime 5m (equal 
 
 ## Build & test
 
-No Makefile — standard Go tooling. CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `go test ./...` and `go vet ./...` on **both** Go 1.25.x (the baseline) and 1.27.x, plus a release version-consistency check (`scripts/check_release_consistency.sh`; see [`docs/release.md`](docs/release.md)).
+No Makefile — standard Go tooling.
+
+**Install the pre-push hook once, before your first push:**
+
+```
+git config core.hooksPath .githooks
+```
+
+This repository is public, and a repository publishes its **history** along with its tree — a commit carrying internal material is published the moment it is **pushed**, not when it merges, and the remedy then is a branch rewrite rather than a fix. [`.githooks/pre-push`](.githooks/pre-push) runs [`scripts/check_public_surface.sh`](scripts/check_public_surface.sh) against the commit CI will compare yours to, which it can do because git hands a pre-push hook the actual refspec: the pre-push tip for an existing ref, the remote's default branch when the ref is being created. It refuses — rather than scanning something else — when the pushed tip is not your HEAD or the tree is dirty. `git push --no-verify` bypasses it, which is a decision to publish unscanned. CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `go test ./...` and `go vet ./...` on **both** Go 1.25.x (the baseline) and 1.27.x, plus a release version-consistency check (`scripts/check_release_consistency.sh`; see [`docs/release.md`](docs/release.md)).
 
 **`gofmt` is checked once, on Go 1.27.x only**, in a separate `format` job outside the version matrix. gofmt's output changes between releases — 1.27 de-indents the continuation lines of a multi-value `return` whose operands are composite literals, which 1.25 indents — so a file cannot satisfy both formatters and running the check on every matrix leg asserts an impossibility. **Format with Go 1.27's `gofmt` even if you develop against the 1.25 baseline**: 1.25's formatter will produce a diff CI rejects. This costs nothing at runtime — formatting has no bearing on what the 1.25 baseline compiles, which is what the matrix is there to prove.
 
