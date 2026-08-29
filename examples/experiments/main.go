@@ -260,14 +260,31 @@ func fenceFor(content string) string {
 // headerNameEnd returns the index just past a header line's name, and whether
 // the line looks like a header at all. The status line and the body have no
 // name to scrub.
+// isTokenByte is RFC 7230's `tchar`: the characters a field name may legally
+// contain.
+//
+// ⚠ `isWordByte` IS NOT THAT GRAMMAR. It admits letters, digits, `_` and `-`,
+// so a legal name like `X.Secret` failed the header test, the line fell through
+// to the generic scrub, and the NAME got the prose placeholder
+// `X.<redacted, 6 chars>` -- spaces and angle brackets inside a field name, an
+// unparsable response, produced by the very code that exists to keep it
+// parsable (shardpilot/shardpilot-go#73 review). The token-safe fix was there;
+// these names never reached it.
+func isTokenByte(c byte) bool {
+	switch c {
+	case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+		return true
+	}
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
 func headerNameEnd(line string) (int, bool) {
 	i := strings.IndexByte(line, ':')
 	if i <= 0 || strings.HasPrefix(line, "HTTP/") {
 		return 0, false
 	}
 	for j := 0; j < i; j++ {
-		c := line[j]
-		if !isWordByte(c) {
+		if !isTokenByte(line[j]) {
 			return 0, false
 		}
 	}
@@ -602,6 +619,15 @@ func redactQuery(line string) string {
 	for k, p := range parts {
 		eq := strings.IndexByte(p, '=')
 		if eq < 0 {
+			// ⚠ NO `=` MEANS NO NAME TO KEEP. `?server-secret-token` is a legal
+			// query component and a perfectly good place for a server-generated
+			// credential, which no list of supplied values can reach -- and this
+			// branch let it through untouched (shardpilot/shardpilot-go#73
+			// review). Replaced whole, as redactFragment already does for the
+			// same shape.
+			if p != "" {
+				parts[k] = tokenPlaceholder(p)
+			}
 			continue
 		}
 		// URL-SAFE, no spaces. A request line is space-delimited, so the readable
@@ -734,7 +760,43 @@ func addSuppliedValue(v string) {
 	suppliedValues = append(suppliedValues, v)
 }
 
+// scrubSupplied replaces every supplied value, and NEVER reaches inside text
+// this program generated.
+//
+// ⚠ IT USED TO. `dropFraming` writes a marked `redacted-3-chars`, and a supplied
+// identifier of `redacted` then had its own substring replaced INSIDE that
+// placeholder -- producing nested marks that `genSpan` pairs wrongly, so
+// `assertNoLeak` reported a survivor and every such capture exited 4 without
+// publishing (shardpilot/shardpilot-go#73 review). The marks already record
+// which text is ours; the scrub simply was not consulting them.
 func scrubSupplied(text string) string {
+	return overCaptured(text, scrubSuppliedRaw)
+}
+
+// overCaptured applies `f` to the parts of `text` this program did NOT generate,
+// leaving marked spans exactly as they are.
+func overCaptured(text string, f func(string) string) string {
+	var b strings.Builder
+	rest := text
+	for {
+		i := strings.Index(rest, genMark)
+		if i < 0 {
+			b.WriteString(f(rest))
+			return b.String()
+		}
+		j := strings.Index(rest[i+len(genMark):], genMark)
+		if j < 0 {
+			b.WriteString(f(rest))
+			return b.String()
+		}
+		end := i + len(genMark) + j + len(genMark)
+		b.WriteString(f(rest[:i]))
+		b.WriteString(rest[i:end])
+		rest = rest[end:]
+	}
+}
+
+func scrubSuppliedRaw(text string) string {
 	// ⚠ LONGEST FIRST. With `abcdefgh` supplied before `abcdefghi`, the shorter
 	// value replaced its own prefix inside the longer one, leaving
 	// `<redacted, 8 chars>i` -- a published suffix AND a wrong length, and the
@@ -1023,6 +1085,19 @@ func undoUnicodeEscapes(text string) string {
 				continue
 			}
 		}
+		// `\u{XXXX}` is the code-point form of the same escape, and a decoder
+		// accepting only exactly four hex digits never sees it
+		// (shardpilot/shardpilot-go#73 review).
+		if text[i] == '\\' && i+3 < len(text) &&
+			(text[i+1] == 'u' || text[i+1] == 'U') && text[i+2] == '{' {
+			if close := strings.IndexByte(text[i+3:], '}'); close > 0 && close <= 6 {
+				if r, err := strconv.ParseUint(text[i+3:i+3+close], 16, 32); err == nil {
+					b.WriteRune(rune(r))
+					i += 3 + close
+					continue
+				}
+			}
+		}
 		if text[i] == '\\' && i+3 < len(text) && (text[i+1] == 'x' || text[i+1] == 'X') {
 			// A plain-text or JavaScript-style diagnostic spells a byte as \xNN,
 			// which no percent, unicode, plus or entity decoding reconstructs -- so
@@ -1083,7 +1158,12 @@ func scrubHeaderName(name string) string {
 
 // isNameByte is isWordByte without `-`: in a header NAME the hyphen separates
 // words, while in a VALUE it may belong to one.
-func isNameByte(c byte) bool { return c != '-' && isWordByte(c) }
+// isNameByte: inside a field NAME, every token punctuation separates words --
+// `-` was only the one I had met.
+func isNameByte(c byte) bool {
+	return isTokenByte(c) && (c == '_' || (c >= '0' && c <= '9') ||
+		(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))
+}
 
 // replaceValue redacts every occurrence of v. A long value is replaced outright;
 // a SHORT one only where it stands as a whole token, because the SDK validates

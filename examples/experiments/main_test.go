@@ -546,6 +546,75 @@ func TestEveryPlaceholderCountsCharacters(t *testing.T) {
 	}
 }
 
+func TestOpaqueQueryComponentIsRedacted(t *testing.T) {
+	suppliedValues = nil
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(dropFraming("HTTP/1.1 302 Found\r\nLocation: /cb?server-secret-token\r\n\r\n"))
+	if strings.Contains(got, "server-secret-token") {
+		t.Fatalf("a key-only query component was published: %q", got)
+	}
+}
+
+func TestScrubDoesNotReachInsideGeneratedText(t *testing.T) {
+	suppliedValues = []string{"redacted"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// dropFraming writes a marked placeholder; the general scrub must leave it
+	// alone, or the marks nest and the guard reports a survivor that is its own
+	// output.
+	body := dropFraming("HTTP/1.1 302 Found\r\nLocation: /cb?token=abc\r\n\r\n")
+	out := scrubSupplied(body)
+	if err := assertNoLeak(asCaptured(out)); err != nil {
+		t.Fatalf("the guard flagged its own placeholder: %v (%q)", err, stripMarks(out))
+	}
+	if strings.Contains(stripMarks(out), "-3-chars") && strings.Contains(stripMarks(out), "chars>-") {
+		t.Fatalf("a placeholder was scrubbed inside itself: %q", stripMarks(out))
+	}
+}
+
+func TestGuardDecodesBraceFormUnicodeEscapes(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	hidden := `{"k":"\\u{61}bcdefgh"}`
+	err := assertNoLeak(asCaptured(hidden))
+	if err == nil {
+		t.Fatal("a brace-form escape passed the guard")
+	}
+	if !strings.Contains(err.Error(), "survived redaction") {
+		t.Fatalf("refused for the wrong reason: %v", err)
+	}
+}
+
+func TestLegalTokenHeaderNamesAreRecognised(t *testing.T) {
+	suppliedValues = []string{"Secret"}
+	t.Cleanup(func() { suppliedValues = nil })
+	for _, name := range []string{"X.Secret", "X+Secret", "X^Secret", "X-Secret"} {
+		got := stripMarks(dropFraming("HTTP/1.1 200 OK\r\n" + name + ": v\r\n\r\n"))
+		if strings.Contains(got, "Secret") {
+			t.Errorf("%s: the identifier survived: %q", name, got)
+		}
+		// The NAME is the part of the HEADER line before its colon -- not of the
+		// whole dump, whose status line carries spaces of its own. The first
+		// version of this assertion split the dump and failed on correct output.
+		var field string
+		for _, ln := range strings.Split(got, "\r\n") {
+			if i := strings.IndexByte(ln, ':'); i > 0 && !strings.HasPrefix(ln, "HTTP/") {
+				field = ln[:i]
+				break
+			}
+		}
+		if field == "" {
+			t.Errorf("%s: no header line survived: %q", name, got)
+			continue
+		}
+		for j := 0; j < len(field); j++ {
+			if !isTokenByte(field[j]) {
+				t.Errorf("%s: %q is not a legal field name (byte %q)", name, field, field[j])
+				break
+			}
+		}
+	}
+}
+
 func TestTrailersAreSnapshotAtEOFNotFromTheHead(t *testing.T) {
 	resp := &http.Response{Trailer: http.Header{}}
 	tee := &teeBody{inner: io.NopCloser(strings.NewReader("BODY")), resp: resp}
