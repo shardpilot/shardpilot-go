@@ -435,7 +435,18 @@ func noteMinted(body string) string {
 		// ⚠ FOLDED: `encoding/json` matches a field case-insensitively, so
 		// `SUBJECT_FACT_KEY` is the same field to the SDK and to the endpoint
 		// (shardpilot/shardpilot-go#84 review).
-		if slices.Contains(mintedNames, strings.ToLower(name)) {
+		// ⚠ `encoding/json` FOLDS WITH UNICODE SEMANTICS, and `strings.ToLower` does
+		// not -- it leaves the long-s `ſ` alone while the decoder binds it to `s`
+		// and populates the field (shardpilot/shardpilot-go#84 review). When a
+		// check exists to AGREE WITH A DECODER, the comparison must be the
+		// decoder's, not a convenient approximation.
+		//
+		// ⚠ AND THIS IS THE THIRD DEFECT THIS STAND-IN HAS ACQUIRED THAT THE
+		// REDACTOR IT STANDS IN FOR HAD ALREADY FIXED -- literal match, then
+		// ASCII case, now Unicode fold. A stand-in is simpler than the original
+		// because it does not carry what the original learned, and it keeps
+		// learning the same things again.
+		if slices.ContainsFunc(mintedNames, func(n string) bool { return strings.EqualFold(name, n) }) {
 			noteStructural("the server-minted " + name)
 		}
 	}
@@ -474,13 +485,20 @@ func dropFraming(dump string) string {
 			out = append(out, l)
 			continue
 		}
+		// ⚠ THE NOTES BELOW ARE GENERATED, AND ARE MARKED AS SUCH. Left unmarked,
+		// a supplied identifier equal to `Capture-Note` reached them through the
+		// generic scrub and produced `X-<redacted, 12 chars>` -- spaces and angle
+		// brackets inside a field name, an unparsable response block, which the
+		// guard then approved because the placeholder carries generated marks
+		// (shardpilot/shardpilot-go#84 review). Text this program wrote is not
+		// captured text.
 		low := strings.ToLower(l)
 		cr := ""
 		if strings.HasSuffix(l, "\r") {
 			cr = "\r"
 		}
 		if strings.HasPrefix(low, "content-length:") {
-			out = append(out, "X-Capture-Note: Content-Length removed — the body below is redacted"+cr)
+			out = append(out, marked("X-Capture-Note: Content-Length removed — the body below is redacted")+cr)
 			continue
 		}
 		// ⚠ A REDIRECT TARGET IS A CREDENTIAL SURFACE. `Location` query values are
@@ -518,7 +536,7 @@ func dropFraming(dump string) string {
 			continue
 		}
 		if strings.HasPrefix(low, "transfer-encoding:") {
-			out = append(out, "X-Capture-Note: Transfer-Encoding removed — the body below is decoded"+cr)
+			out = append(out, marked("X-Capture-Note: Transfer-Encoding removed — the body below is decoded")+cr)
 			continue
 		}
 		// ⚠ AND A HEADER NAME CAN CARRY THE IDENTIFIER, so this comes LAST: the
@@ -529,6 +547,22 @@ func dropFraming(dump string) string {
 		// already did this; the response's own header block did not -- fixed
 		// where it was found and not where the question is asked, once more
 		// (shardpilot/shardpilot-go#73 review).
+		// ⚠ `Trailer:` LISTS FIELD NAMES IN ITS VALUE. Scrubbing only the field
+		// name `Trailer` left `Trailer: X-Bar` carrying a supplied `Bar`, which
+		// ordinary value matching misses because the hyphen is a word byte and
+		// the guard's name-aware check extracts only `Trailer` -- while the
+		// trailer report itself scrubs the real name, so the two disagreed about
+		// the same string (shardpilot/shardpilot-go#84 review).
+		if strings.HasPrefix(low, "trailer:") {
+			if i, ok := headerNameEnd(l); ok {
+				names := strings.Split(l[i+1:], ",")
+				for k, n := range names {
+					names[k] = scrubHeaderName(n)
+				}
+				out = append(out, scrubHeaderName(l[:i])+":"+strings.Join(names, ","))
+				continue
+			}
+		}
 		if i, ok := headerNameEnd(l); ok {
 			out = append(out, scrubHeaderName(l[:i])+l[i:])
 			continue
@@ -1239,7 +1273,14 @@ func assertNoLeak(text string) error {
 			// point is that a MIME decoder reconstructs the value FROM it
 			// (shardpilot/shardpilot-go#84 review). Both forms are kept: the
 			// normalisation, and what base64 makes of it.
-			norm := strings.Join(strings.Fields(cur), "")
+			// ⚠ WITHIN THE RUN, NOT ACROSS THE SPAN. Joining every field of the
+			// whole captured text removed the header/body separator too, so a
+			// header value ending in base64 letters merged into the encoded body
+			// and the combined token decoded to something else -- while the
+			// per-line candidates still could not reconstruct the value
+			// (shardpilot/shardpilot-go#84 review). Only runs of CONSECUTIVE
+			// lines that are entirely base64 alphabet are joined.
+			norm := joinBase64Runs(cur)
 			extra = append(extra, norm, undoBase64(norm))
 			work += len(cur)
 			if work > decodeWorkMax {
@@ -1387,6 +1428,42 @@ func undoHex(text string) string {
 
 func isHexByte(c byte) bool {
 	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+// joinBase64Runs removes the wrapping from MIME base64 without touching anything
+// else: consecutive lines made entirely of base64 alphabet are joined, and every
+// other line is left where it is, separator included.
+func joinBase64Runs(text string) string {
+	lines := strings.Split(text, "\n")
+	var b strings.Builder
+	run := false
+	for i, ln := range lines {
+		bare := strings.TrimSuffix(ln, "\r")
+		isRun := bare != "" && allBase64(bare)
+		if isRun {
+			b.WriteString(bare)
+			run = true
+			continue
+		}
+		if run {
+			b.WriteByte('\n')
+			run = false
+		}
+		b.WriteString(ln)
+		if i < len(lines)-1 {
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+func allBase64(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if !isBase64Byte(s[i]) && s[i] != '=' {
+			return false
+		}
+	}
+	return true
 }
 
 func isBase64Byte(c byte) bool {
@@ -1685,7 +1762,12 @@ func dataOf(bare string) (string, bool) {
 	if j := strings.IndexByte(target, ' '); j >= 0 {
 		target = target[j+1:]
 	}
-	return target, true
+	// ⚠ THE ROUTE IS SDK SYNTAX, NOT CAPTURED DATA. It is a constant this program
+	// did not choose and the endpoint did not send, so with a legal experiment
+	// key of `assignment` the guard reported the SDK's own path as a survivor and
+	// exited 4 on every run (shardpilot/shardpilot-go#84 review). Only the
+	// variable part of the target is data.
+	return strings.ReplaceAll(target, assignmentRoute, "/"), true
 }
 
 func isASCII(s string) bool {
