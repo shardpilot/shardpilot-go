@@ -340,6 +340,20 @@ func redactPath(line string) string {
 		url, tail = url[:k], url[k:]+tail
 	}
 	start := 0
+	// ⚠ A SCHEME DOES NOT REQUIRE AN AUTHORITY. `https:/cb` is a valid absolute
+	// URI with no `//`, and treating `https:` as a path segment rewrote the target
+	// into a relative reference that resolves somewhere else
+	// (shardpilot/shardpilot-go#85 review).
+	if c := strings.IndexByte(url, ':'); c > 0 && isSchemeName(url[:c]) &&
+		!strings.HasPrefix(url[c:], "://") {
+		switch strings.ToLower(url[:c]) {
+		case "http", "https":
+			start = c + 1
+		default:
+			noteStructural("a Location header with an unapproved URI scheme")
+			return head + marked("<withheld: unapproved scheme>") + tail
+		}
+	}
 	// ⚠ ANCHORED. An unrestricted search read the `://` inside `/cb/http://x` as
 	// introducing a scheme called `/cb/http`, refused the capture, and exited 4 on
 	// a target Go parses as an ordinary relative path
@@ -433,6 +447,12 @@ func redactSetCookie(line string) string {
 		// are not, and are lengthened.
 		parts := strings.Split(attrs, ";")
 		for i, a := range parts {
+			if ows(a) == "" {
+				// A trailing `;` produces an empty component. Replacing it invented
+				// an attribute the response did not carry
+				// (shardpilot/shardpilot-go#85 review).
+				continue
+			}
 			an, av, has := strings.Cut(a, "=")
 			if !has {
 				// ⚠ A VALUELESS ATTRIBUTE IS NOT AUTOMATICALLY A FLAG.
@@ -485,7 +505,17 @@ func redactSetCookie(line string) string {
 func redactUserinfo(line string) string {
 	// A network-path reference -- `//user:secret@host/cb` -- is a legal Location
 	// and carries userinfo without a scheme (shardpilot/shardpilot-go#73 review).
-	i := strings.Index(line, "://")
+	// ⚠ AT THE START. An unrestricted search read the `http://` inside
+	// `/cb/http://foo@bar/x` as an authority and redacted `foo` as userinfo, after
+	// which the generated token was measured again and the seven-character segment
+	// was reported as twenty-two (shardpilot/shardpilot-go#85 review). The
+	// network-path branch was already anchored; this one was not.
+	i := -1
+	if _, _, u, ok := splitField(line); ok {
+		if j := strings.Index(u, "://"); j >= 0 && isSchemeName(u[:j]) {
+			i = len(line) - len(u) + j
+		}
+	}
 	skip := 3
 	if i < 0 {
 		// ⚠ AT THE START OF THE TARGET. An unrestricted search read `//foo@bar`
@@ -594,8 +624,16 @@ func redactMintedBody(body string) string {
 	// (shardpilot/shardpilot-go#84 review). The REDACTION above stays depth-blind
 	// on purpose -- lengthening a payload member costs a reader a label, while
 	// publishing a minted key costs the subject.
+	// ⚠ AND A BODY THAT WILL NOT PARSE FAILS CLOSED. `topLevelMembers` returns
+	// nothing for a truncated body -- `{"subject_fact_key":"sfk1_…` with no
+	// closing quote -- and "no top-level names" was then read as "this occurrence
+	// is nested", so a partial credential reached the artifact by the path that
+	// exists to publish what arrived (shardpilot/shardpilot-go#85 review). A
+	// parse that fails is not an answer about depth.
+	parsed := topLevelMembers(body)
+	unparsable := parsed == nil && strings.Contains(body, "{")
 	top := map[string]bool{}
-	for _, n := range topLevelMembers(body) {
+	for _, n := range parsed {
 		top[n] = true
 	}
 	for _, loc := range jsonMemberName.FindAllStringSubmatchIndex(body, -1) {
@@ -604,7 +642,7 @@ func redactMintedBody(body string) string {
 		}
 		name := body[loc[2]:loc[3]]
 		dec, _ := jsonString(name)
-		if !top[dec] {
+		if !unparsable && (jsonDepthAt(body, loc[0]) != 1 || !top[dec]) {
 			continue
 		}
 		if isMinted(name) {
@@ -699,8 +737,18 @@ var verbatimHeaders = map[string]func(string) bool{
 	"cache-control":     isDirectiveList("cache-control"),
 }
 
+// ows trims exactly what HTTP calls optional whitespace: space and tab.
+//
+// ⚠ `strings.TrimSpace` IS WIDER THAN THE GRAMMAR. It removes non-breaking space
+// and other Unicode whitespace, which net/http preserves in the value -- so a
+// validator that trimmed with it approved bytes the endpoint chose and the
+// publisher then printed verbatim (shardpilot/shardpilot-go#85 review). Trimming
+// more than the grammar allows is the same class as parsing more leniently than
+// it: the check stops describing the thing it guards.
+func ows(v string) string { return strings.Trim(v, " \t") }
+
 func isHTTPDate(v string) bool {
-	v = strings.TrimSpace(v)
+	v = ows(v)
 	// ⚠ THE ZONE IS FIXED TO `GMT`, AND Go's LAYOUT IS NOT. `MST` accepts any
 	// three-letter zone, so `Monday, 02-Jan-06 15:04:05 XYZ` parsed and the
 	// endpoint-chosen token was published through a field the criterion had
@@ -716,7 +764,7 @@ func isHTTPDate(v string) bool {
 }
 
 func isDigits(v string) bool {
-	v = strings.TrimSpace(v)
+	v = ows(v)
 	if v == "" {
 		return false
 	}
@@ -743,7 +791,7 @@ func isMediaTypeWithoutParameters(v string) bool {
 	// carrying parameters already fails `isTokenOnly`. Code that looks
 	// load-bearing and is not teaches the next reader a rule the program does
 	// not have.
-	t, sub, ok := strings.Cut(strings.TrimSpace(v), "/")
+	t, sub, ok := strings.Cut(ows(v), "/")
 	if !ok || !isTokenOnly(t) || !isTokenOnly(sub) {
 		return false
 	}
@@ -836,15 +884,41 @@ func isTokenOnly(v string) bool {
 
 // registeredFieldNames are response field names the specification fixes. A name
 // outside it was chosen by the endpoint.
+// ⚠ A HAND-WRITTEN SUBSET IS NOT THE REGISTRY. `Access-Control-Allow-Origin` is
+// a specification-defined field and was classified as endpoint-invented, so the
+// capture lost which standard header arrived (shardpilot/shardpilot-go#85
+// review). The criterion says "the registry"; a list I typed from memory is the
+// same enumeration this whole change exists to replace, one level down.
 var registeredFieldNames = set(
-	"date", "expires", "last-modified", "content-length", "content-type",
-	"content-encoding", "content-language", "content-location", "content-range",
-	"transfer-encoding", "connection", "vary", "accept-ranges", "allow", "age",
-	"cache-control", "etag", "location", "server", "set-cookie", "trailer",
-	"retry-after", "www-authenticate", "proxy-authenticate", "upgrade", "via",
-	"warning", "pragma", "link", "refresh", "strict-transport-security",
+	"accept-ch", "accept-patch", "accept-post", "accept-ranges",
+	"access-control-allow-credentials", "access-control-allow-headers",
+	"access-control-allow-methods", "access-control-allow-origin",
+	"access-control-expose-headers", "access-control-max-age", "age", "allow",
+	"alt-svc", "cache-control", "clear-site-data", "connection",
+	"content-disposition", "content-encoding", "content-language",
+	"content-length", "content-location", "content-range",
+	"content-security-policy", "content-security-policy-report-only",
+	"content-type", "cross-origin-embedder-policy", "cross-origin-opener-policy",
+	"cross-origin-resource-policy", "date", "etag", "expires", "last-modified",
+	"link", "location", "permissions-policy", "pragma", "proxy-authenticate",
+	"referrer-policy", "refresh", "report-to", "retry-after", "server",
+	"server-timing", "set-cookie", "sourcemap", "strict-transport-security",
+	"timing-allow-origin", "trailer", "transfer-encoding", "upgrade", "vary",
+	"via", "warning", "www-authenticate", "x-content-type-options",
+	"x-frame-options", "x-xss-protection",
+	// written by this program itself
 	"x-capture-note",
 )
+
+// admitFieldName decides on the RECEIVED name and only then scrubs it. The two
+// steps answer different questions and must not be composed the other way round:
+// the registry asks what the endpoint sent, the scrub asks what we supplied.
+func admitFieldName(name string) string {
+	if !registeredFieldNames[strings.ToLower(ows(name))] {
+		return tokenPlaceholder(ows(name))
+	}
+	return scrubHeaderName(name)
+}
 
 func redactFieldName(name string) string {
 	if registeredFieldNames[strings.ToLower(strings.TrimSpace(name))] {
@@ -885,6 +959,41 @@ func cookieAttrVerbatim(name, value string) bool {
 	return false
 }
 
+// unescapeMarks reverses escapeMarks for MEASUREMENT only -- never for output.
+// The escape is injective by parity: an odd run of backslashes before `x00` was
+// a real marker byte, an even run was literal text.
+func unescapeMarks(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] != '\\' {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+		j := i
+		for j < len(s) && s[j] == '\\' {
+			j++
+		}
+		n := j - i
+		rest := s[j:]
+		if strings.HasPrefix(rest, "x00") || strings.HasPrefix(rest, "x01") {
+			if n%2 == 1 {
+				b.WriteString(strings.Repeat(`\`, (n-1)/2))
+				b.WriteByte(0)
+				i = j + 3
+				continue
+			}
+			b.WriteString(strings.Repeat(`\`, (n-2)/2))
+			b.WriteString(rest[:3])
+			i = j + 3
+			continue
+		}
+		b.WriteString(strings.Repeat(`\`, n))
+		i = j
+	}
+	return b.String()
+}
+
 func redactUnlessVerbatim(line string) string {
 	cr := ""
 	body := line
@@ -916,9 +1025,14 @@ func redactUnlessVerbatim(line string) string {
 	if !ok || !isTokenOnly(strings.TrimSpace(name)) {
 		return line
 	}
-	check, known := verbatimHeaders[strings.ToLower(strings.TrimSpace(name))]
-	if known && check(strings.TrimSpace(value)) {
+	check, known := verbatimHeaders[strings.ToLower(ows(name))]
+	if known && check(ows(value)) {
 		return line
 	}
-	return name + ": " + placeholder(strings.TrimSpace(value)) + cr
+	// ⚠ MEASURED BEFORE OUR OWN ESCAPE. `escapeMarks` lengthens a backslash run
+	// on the way in, so a header carrying the literal `\x00` was reported four
+	// characters longer than it arrived -- the length describing the recorder's
+	// reversible escape rather than the endpoint's bytes
+	// (shardpilot/shardpilot-go#85 review).
+	return name + ": " + placeholder(unescapeMarks(ows(value))) + cr
 }

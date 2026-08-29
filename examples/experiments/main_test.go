@@ -911,9 +911,19 @@ func TestProtocolTokensDoNotRefuseTheCapture(t *testing.T) {
 func TestAJSONLiteralIsNotRewritten(t *testing.T) {
 	suppliedValues = []string{"false"}
 	t.Cleanup(func() { suppliedValues = nil })
-	got := stripMarks(scrubSupplied(`{"assigned":false}`))
-	if got != `{"assigned":false}` {
+	// ⚠ THROUGH `dropFraming`, WHERE THE GRAMMAR IS MARKED. The exemption is a
+	// POSITION now, not a value, so a fixture calling the scrub on a bare string
+	// exercises neither half of it.
+	body := "HTTP/1.1 200 OK\r\n\r\n" + `{"assigned":false}`
+	got := stripMarks(scrubSupplied(dropFraming(body)))
+	if !strings.Contains(got, `{"assigned":false}`) {
 		t.Fatalf("a JSON literal was rewritten into invalid JSON: %q", got)
+	}
+	// And the SAME word inside a string is data, not grammar.
+	quoted := "HTTP/1.1 200 OK\r\n\r\n" + `{"experiment_key":"false"}`
+	got = stripMarks(scrubSupplied(dropFraming(quoted)))
+	if strings.Contains(got, `"false"`) {
+		t.Fatalf("the key echoed as a JSON string was published: %q", got)
 	}
 }
 
@@ -962,8 +972,15 @@ func TestNormalisedCandidateReachesAFixedPoint(t *testing.T) {
 func TestTheGuardHonoursTheJSONLiteralExemption(t *testing.T) {
 	suppliedValues = []string{"false"}
 	t.Cleanup(func() { suppliedValues = nil })
-	if err := assertNoLeak(asCaptured(`{"assigned":false}`)); err != nil {
+	body := "HTTP/1.1 200 OK\r\n\r\n" + `{"assigned":false}`
+	if err := assertNoLeak(asCaptured(scrubSupplied(dropFraming(body)))); err != nil {
 		t.Fatalf("a JSON grammar literal refused a publishable capture: %v", err)
+	}
+	// And a quoted occurrence is still checked: the scrub above replaces it, so
+	// what reaches the guard is a placeholder, not the word.
+	quoted := "HTTP/1.1 200 OK\r\n\r\n" + `{"experiment_key":"false"}`
+	if err := assertNoLeak(asCaptured(scrubSupplied(dropFraming(quoted)))); err != nil {
+		t.Fatalf("the guard flagged its own placeholder: %v", err)
 	}
 }
 
@@ -997,7 +1014,31 @@ func TestTransportErrorTextIsReadByTheGuard(t *testing.T) {
 	// Go's parser puts the offending line into the error it returns.
 	enc := base64.StdEncoding.EncodeToString([]byte("abcdefgh"))
 	err := errors.New("malformed HTTP response \"X-Bad " + enc + "\"")
-	if e := assertNoLeak(sanitizeCaptured(err)); e == nil {
+	if e := assertNoLeak(transportErrorLine(err)); e == nil {
 		t.Fatal("endpoint bytes carried by a transport error were never decoded")
+	}
+}
+
+func TestARefusalDoesNotPrintWhatItRefusesOver(t *testing.T) {
+	structuralSurfaces = nil
+	suppliedValues = []string{"deflate"}
+	t.Cleanup(func() { structuralSurfaces = nil; suppliedValues = nil })
+	dropFraming("HTTP/1.1 200 OK\r\nContent-Encoding: deflate\r\n\r\nbody")
+	if len(structuralSurfaces) == 0 {
+		t.Fatal("an undecodable coding stopped being refused")
+	}
+	for _, w := range structuralSurfaces {
+		if strings.Contains(w, "deflate") {
+			t.Fatalf("the refusal message carries the value it refuses over: %q", w)
+		}
+	}
+}
+
+func TestTheSerialiserUserAgentIsGenerated(t *testing.T) {
+	suppliedValues = []string{"Go-http-client/1.1"}
+	t.Cleanup(func() { suppliedValues = nil })
+	raw := "GET /p HTTP/1.1\r\nHost: e.example\r\nUser-Agent: Go-http-client/1.1\r\n\r\n"
+	if err := assertNoLeak(asCaptured(string(redact([]byte(escapeMarks(raw)))))); err != nil {
+		t.Fatalf("the serialiser's own User-Agent was read as a leak: %v", err)
 	}
 }

@@ -269,7 +269,7 @@ func (e *exchange) trailerReport() string {
 			// path only (shardpilot/shardpilot-go#85 review). Second site, same
 			// rule -- the fifth time in these two changes.
 			if i := strings.IndexByte(red, ':'); i > 0 {
-				red = redactFieldName(scrubHeaderName(red[:i])) + red[i:]
+				red = admitFieldName(red[:i]) + red[i:]
 			}
 			fmt.Fprintf(&b, "    %s\n", asCaptured(scrubSupplied(red)))
 		}
@@ -444,6 +444,12 @@ const respSection = "## Response%s — header block re-serialised by " +
 var mintedNames = map[string]bool{
 	"subject_fact_key": true,
 	"subject_key_hash": true,
+	// ⚠ AND THE ASSIGNMENT KEY. A normal assigned response carries both, and this
+	// set named one -- so once `subject_fact_key` was redacted the response became
+	// publishable and carried the other out with it. A change that turns a refusal
+	// into a capture must cover EVERYTHING that refusal stood in front of
+	// (shardpilot/shardpilot-go#85 review).
+	"assignment_key": true,
 }
 
 // noteMinted records a server-minted field's presence and returns the body
@@ -488,6 +494,35 @@ func isMinted(raw string) bool {
 	return isMintedName(name)
 }
 
+// jsonDepthAt reports the object nesting depth of the byte at index i, counting
+// braces outside strings. Depth 1 is a member of the top-level object.
+//
+// ⚠ NAME MEMBERSHIP IS NOT DEPTH. A top-level minted string beside a nested
+// member of the SAME name made every nested occurrence look top-level, and the
+// whole response was withheld -- while the comment two lines above the check said
+// such payload is ordinary. The code and its own comment disagreed
+// (shardpilot/shardpilot-go#85 review).
+func jsonDepthAt(body string, i int) int {
+	depth, inStr, esc := 0, false, false
+	for k := 0; k < i && k < len(body); k++ {
+		c := body[k]
+		switch {
+		case esc:
+			esc = false
+		case inStr && c == '\\':
+			esc = true
+		case c == '"':
+			inStr = !inStr
+		case inStr:
+		case c == '{':
+			depth++
+		case c == '}':
+			depth--
+		}
+	}
+	return depth
+}
+
 // noteMinted records a server-minted field's presence and returns the body
 // unchanged -- the caller does not publish a body this reports on.
 // ⚠ TOP-LEVEL ONLY. `encoding/json` binds the SDK's field from the top-level
@@ -527,7 +562,20 @@ func isMintedName(name string) bool {
 //
 // ⚠ AND THE ORDER IS escape, scrub, strip. A variant key containing a reserved
 // marker byte was DELETED by stripMarks -- `a<NUL>b` reported as `ab` -- while
-// the response block, which escapes first, kept it.
+// the response block, which escapes first, kept it, so the artifact misstated
+// the assignment the SDK served.
+// transportErrorLine renders a transport failure for the REPORT.
+//
+// ⚠ IT IS A FUNCTION SO THE FIXTURE READS THE CALL SITE. Written inline, a test
+// could only re-assemble the same call in its own body and would pass while the
+// report used the unmarked form -- which is exactly what happened, for the third
+// time in this branch (shardpilot/shardpilot-go#84 review). Go's parser puts the
+// offending response line into the error, so this is a CHANNEL from the endpoint
+// into report prose, and everything on it is captured input.
+func transportErrorLine(err error) string {
+	return sanitizeCaptured(err)
+}
+
 func verdictValue(v string) string {
 	return stripMarks(scrubSupplied(escapeMarks(v)))
 }
@@ -589,8 +637,11 @@ func dropFraming(dump string) string {
 		if strings.HasPrefix(low, "content-encoding:") {
 			if v := strings.TrimSpace(strings.TrimSuffix(l[len("content-encoding:"):], "\r")); v != "" &&
 				!strings.EqualFold(v, "identity") {
-				noteStructural("a body in the content coding " + strings.ToLower(v) +
-					", which this build cannot decode")
+				// ⚠ A CLASSIFICATION, NOT THE VALUE. With a supplied key of
+				// `deflate` the scrub hid the header and this diagnostic printed
+				// it verbatim to stderr -- the refusal publishing what the refusal
+				// was for (shardpilot/shardpilot-go#84 review).
+				noteStructural("a body in a content coding this build cannot decode")
 			}
 		}
 		if strings.HasPrefix(low, "location:") {
@@ -653,7 +704,7 @@ func dropFraming(dump string) string {
 					// the announcement itself was published
 					// (shardpilot/shardpilot-go#85 review). Sixth site of this same
 					// rule, and the sweep found this one before the review did.
-					names[k] = redactFieldName(scrubHeaderName(n))
+					names[k] = admitFieldName(n)
 				}
 				out = append(out, scrubHeaderName(l[:i])+":"+strings.Join(names, ","))
 				continue
@@ -675,7 +726,14 @@ func dropFraming(dump string) string {
 			// the half it had just opened (shardpilot/shardpilot-go#85 review).
 			// Field names are an IANA registry: registered ones print, the rest
 			// are strings the origin invented.
-			out = append(out, redactFieldName(scrubHeaderName(l[:i]))+redactUnlessVerbatim(l)[i:])
+			// ⚠ CLASSIFY FIRST, SCRUB SECOND. Run the other way round, a supplied
+			// value that is a COMPONENT of a registered name turned `Content-Type`
+			// into `redacted-7-chars-Type`, which the registry then read as an
+			// endpoint-invented name and replaced whole -- so the capture lost the
+			// fact that a Content-Type arrived at all, and reported the length of
+			// generated text (shardpilot/shardpilot-go#85 review). The registry
+			// asks about the RECEIVED name; the scrub is about what we supplied.
+			out = append(out, admitFieldName(l[:i])+redactUnlessVerbatim(l)[i:])
 			continue
 		}
 		out = append(out, scrubStructuralName(redactUnlessVerbatim(l)))
@@ -689,7 +747,7 @@ func dropFraming(dump string) string {
 		return strings.Join(out, "\n")
 	}
 	return strings.Join(out[:bodyStart], "\n") + "\n" +
-		redactMintedBody(strings.Join(out[bodyStart:], "\n"))
+		markBareJSONLiterals(redactMintedBody(strings.Join(out[bodyStart:], "\n")))
 }
 
 type recorder struct {
@@ -911,7 +969,12 @@ func (t *teeBody) Close() error {
 
 // serialiserWritten are request headers `net/http` adds while dumping, whose
 // values are as invariant as their names.
-var serialiserWritten = map[string]bool{"accept-encoding": true}
+// ⚠ BOTH OF THEM. `DumpRequestOut` supplies a default `User-Agent` as well as
+// `Accept-Encoding`, and a key equal to `Go-http-client/1.1` was found in this
+// program's own output and refused every run (shardpilot/shardpilot-go#84
+// review). The property is "written by the serialiser, not chosen by anyone", and
+// net/http writes exactly these two.
+var serialiserWritten = map[string]bool{"accept-encoding": true, "user-agent": true}
 
 func redact(dump []byte) []byte {
 	out := make([]string, 0, 32)
@@ -1108,6 +1171,60 @@ func overCaptured(text string, f func(string) string) string {
 	}
 }
 
+// markBareJSONLiterals wraps `true`, `false` and `null` in generated-provenance
+// marks WHERE THEY STAND AS GRAMMAR -- after `:` `,` `[` and before `,` `}` `]`
+// or the end.
+//
+// ⚠ THE EXEMPTION IS A POSITION, NOT A VALUE. Skipping the value outright let a
+// response echo the key back as a STRING -- `"experiment_key":"false"` -- and
+// neither the scrub nor the guard would touch it, so the supplied value was
+// published (shardpilot/shardpilot-go#84 review). Marking the grammar instead
+// costs nothing to maintain: `overCaptured` already leaves generated spans alone
+// and the guard already blanks them, so both rules follow from one mark rather
+// than from two copies of a list.
+func markBareJSONLiterals(text string) string {
+	var b strings.Builder
+	i := 0
+	for i < len(text) {
+		matched := ""
+		for lit := range jsonLiterals {
+			if strings.HasPrefix(text[i:], lit) {
+				matched = lit
+				break
+			}
+		}
+		if matched == "" {
+			b.WriteByte(text[i])
+			i++
+			continue
+		}
+		before := byte(0)
+		if i > 0 {
+			before = text[i-1]
+		}
+		after := byte(0)
+		if i+len(matched) < len(text) {
+			after = text[i+len(matched)]
+		}
+		// ⚠ THE PAIR IS THE RULE, AND NEITHER HALF IS LOAD-BEARING ALONE. Mutating
+		// either side to admit `"` leaves the other refusing, so a single-sided
+		// mutant survives on the case that matters (`"experiment_key":"false"`).
+		// Two guards cover it; killing one would need an input contrived so only
+		// that half applies. Said here rather than fixtured around.
+		bareBefore := before == ':' || before == ',' || before == '[' ||
+			before == ' ' || before == '\n' || before == '\t' || before == 0
+		bareAfter := after == ',' || after == '}' || after == ']' ||
+			after == ' ' || after == '\n' || after == '\r' || after == '\t' || after == 0
+		if bareBefore && bareAfter {
+			b.WriteString(marked(matched))
+		} else {
+			b.WriteString(matched)
+		}
+		i += len(matched)
+	}
+	return b.String()
+}
+
 // jsonLiterals are the three bare tokens of JSON grammar. A supplied value equal
 // to one of them cannot be distinguished from the grammar itself, and replacing
 // it turned every not-assigned body into `{"assigned":<redacted, 5 chars>}` --
@@ -1124,7 +1241,7 @@ func scrubSuppliedRaw(text string) string {
 	// review). Order is not a detail here: a substitution that destroys a longer
 	// match is unrecoverable by any later pass.
 	for _, v := range longestFirst(suppliedValues) {
-		if v == "" || jsonLiterals[v] {
+		if v == "" {
 			continue
 		}
 		text = replaceValue(text, v)
@@ -1507,7 +1624,7 @@ func assertNoLeak(text string) error {
 		// defect rather than removing it (shardpilot/shardpilot-go#84 review). An
 		// exemption honoured by one of two rules is a disagreement, not an
 		// exemption.
-		if v == "" || jsonLiterals[v] {
+		if v == "" {
 			continue
 		}
 		for _, f := range append(append([]string{}, forms...), extra...) {
@@ -2126,7 +2243,7 @@ func main() {
 		switch {
 		case ex.transErr != nil:
 			fmt.Fprintf(&report, "## Response%s\n\nNONE — the request was formed and no "+
-				"response arrived: %s\n\n", label, sanitize(ex.transErr))
+				"response arrived: %s\n\n", label, transportErrorLine(ex.transErr))
 		case ex.truncErr() != nil:
 			body := responseText(&ex)
 			fmt.Fprintf(&report, "## Response%s — INCOMPLETE, and the SDK was told so\n\n"+

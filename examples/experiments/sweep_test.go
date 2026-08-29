@@ -54,6 +54,9 @@ func TestNoUnrecognisedFormPublishesServerGeneratedText(t *testing.T) {
 		{"a custom status reason phrase", "HTTP/1.1 200 SRVGEN\r\nSet-Cookie: a=b\r\n\r\n"},
 		{"userinfo before a second at-sign", "HTTP/1.1 302 Found\r\nLocation: https://user@SRVGEN@host/cb\r\n\r\n"},
 		{"an unregistered trailer NAME", "HTTP/1.1 200 OK\r\nTrailer: SRVGEN-Late\r\n\r\n"},
+		{"a server-minted assignment key", "HTTP/1.1 200 OK\r\n\r\n{\"assignment_key\":\"SRVGEN\"}"},
+		{"a minted member in a truncated body", "HTTP/1.1 200 OK\r\n\r\n{\"subject_fact_key\":\"SRVGEN"},
+
 		{"identifier as a query parameter NAME", "HTTP/1.1 302 Found\r\nLocation: /cb?SRVGEN=x\r\n\r\n"},
 		{"identifier as a fragment parameter NAME", "HTTP/1.1 302 Found\r\nLocation: /cb#SRVGEN=x\r\n\r\n"},
 		{"identifier as the cookie NAME", "HTTP/1.1 200 OK\r\nSet-Cookie: SRVGEN=x\r\n\r\n"},
@@ -177,6 +180,17 @@ func TestTheCriterionStillAdmitsWhatItShould(t *testing.T) {
 // own cases rather than being left to a sweep that structurally cannot reach
 // them; a probe that cannot express the case is not covering it.
 func TestClausesTheSweepCannotExpress(t *testing.T) {
+	t.Run("only HTTP OWS is trimmed when validating", func(t *testing.T) {
+		// The sweep cannot express this: what leaks is a non-breaking space, and
+		// a marker cannot be spelled with one. `strings.TrimSpace` removes it and
+		// the date then parses, so the endpoint's byte is published verbatim.
+		if isHTTPDate("Mon, 02 Jan 2006 15:04:05 GMT\u00a0") {
+			t.Fatal("obs-text around a date was trimmed away and the value approved")
+		}
+		if !isHTTPDate(" Mon, 02 Jan 2006 15:04:05 GMT\t") {
+			t.Fatal("real HTTP OWS was rejected")
+		}
+	})
 	t.Run("an obsolete date's zone is fixed to GMT", func(t *testing.T) {
 		if isHTTPDate("Monday, 02-Jan-06 15:04:05 XYZ") {
 			t.Fatal("an arbitrary three-letter zone was accepted as an HTTP-date")
@@ -208,6 +222,58 @@ func TestClausesTheSweepCannotExpress(t *testing.T) {
 		// marks produced.
 		if strings.Contains(got, "chars>-") {
 			t.Fatalf("the scrub rewrote a generated attribute name: %q", got)
+		}
+	})
+}
+
+// Structure that must survive, for the clauses added this round.
+func TestStructureSurvivesTheNewerClauses(t *testing.T) {
+	for _, c := range []struct{ name, dump, keep string }{
+		{"a registered CORS field name", "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\n\r\n", "Access-Control-Allow-Origin"},
+		{"a scheme with no authority", "HTTP/1.1 302 Found\r\nLocation: https:/cb\r\n\r\n", "https:"},
+		// ⚠ THE LENGTH, NOT MERELY THE SURVIVAL OF A SLASH. Reading the interior
+		// `http://` as an authority redacts `foo` as userinfo and then measures
+		// the GENERATED token, so the seven-character segment is reported as
+		// twenty-two. Asserting only that a `/` survives cannot see that, and a
+		// mutant proved it.
+		{"an interior scheme in a path", "HTTP/1.1 302 Found\r\nLocation: /cb/http://foo@bar/x\r\n\r\n", "redacted-7-chars"},
+		{"a trailing semicolon", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x;\r\n\r\n", ";"},
+	} {
+		suppliedValues = nil
+		structuralSurfaces = nil
+		got := stripMarks(dropFraming(c.dump))
+		if !strings.Contains(got, c.keep) {
+			t.Errorf("%s: the criterion lost what it admits: %q", c.name, got)
+		}
+		if strings.Contains(got, "redacted-0-chars") {
+			t.Errorf("%s: an attribute that was not there was invented: %q", c.name, got)
+		}
+		structuralSurfaces = nil
+	}
+	t.Run("a nested minted member beside a top-level one", func(t *testing.T) {
+		suppliedValues = nil
+		structuralSurfaces = nil
+		t.Cleanup(func() { structuralSurfaces = nil })
+		body := "HTTP/1.1 200 OK\r\n\r\n" +
+			`{"subject_fact_key":"top","variant_payload":{"subject_fact_key":{"value":"payload"}}}`
+		got := stripMarks(dropFraming(body))
+		if strings.Contains(got, "withheld") {
+			t.Fatalf("a payload member withheld the whole response: %q", got)
+		}
+	})
+	t.Run("a header value is measured before our own escape", func(t *testing.T) {
+		suppliedValues = nil
+		got := stripMarks(dropFraming("HTTP/1.1 200 OK\r\nServer: " + escapeMarks(`\x00`) + "\r\n\r\n"))
+		if !strings.Contains(got, "4 chars") {
+			t.Fatalf("the length described the recorder's escape, not the value: %q", got)
+		}
+	})
+	t.Run("a name we sent survives a registered-name scrub", func(t *testing.T) {
+		suppliedValues = []string{"content"}
+		t.Cleanup(func() { suppliedValues = nil })
+		got := stripMarks(dropFraming("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n"))
+		if !strings.Contains(got, "Type") {
+			t.Fatalf("a registered field name was destroyed by the value scrub: %q", got)
 		}
 	})
 }
