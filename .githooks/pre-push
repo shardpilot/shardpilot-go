@@ -106,6 +106,15 @@ unset GIT_INDEX_FILE
 hooks_off="$(mktemp -d)"
 git_safe() { git -c core.hooksPath="$hooks_off" "$@"; }
 
+# ⚠ THE REFSPEC IS BUFFERED BEFORE ANYTHING TOUCHES A COMMIT-CONTROLLED PATH.
+# A commit replacing the tracked scanner with a symlink to `/dev/stdin` made the
+# drift check below read the hook's own input through it: `cmp` consumed the
+# refspec line, `cat` then returned empty, the loop processed no updates, and the
+# hook exited 0 without scanning the commit that did it
+# (shardpilot/shardpilot-go#79 review). Reading anything the branch controls
+# before this line is reading with the gate's own input at stake.
+pushed_lines="$(cat)"
+
 root="$(git rev-parse --show-toplevel)"
 tracked_scanner="$root/scripts/check_public_surface.sh"
 
@@ -125,7 +134,16 @@ tracked_scanner="$root/scripts/check_public_surface.sh"
 # is silently absent while appearing installed (shardpilot/shardpilot-go#79
 # review). Measured here: `--git-dir` gave `.git/worktrees/…-hook`, and
 # `--git-path hooks` gave `.git/hooks`, which is what git actually reads.
-scanner="$(git rev-parse --git-path hooks)/check_public_surface.sh"
+# ⚠ THE PHYSICAL HOOKS DIRECTORY, NOT THE CONFIGURED ONE. `--git-path hooks`
+# HONOURS `core.hooksPath`, so on a repository still carrying the setting this
+# file used to recommend it resolves back to `.githooks` -- tracked,
+# branch-controlled, and the exact thing moving out of tracked content was meant
+# to escape (shardpilot/shardpilot-go#79 review). Measured:
+# `git -c core.hooksPath=.githooks rev-parse --git-path hooks` prints `.githooks`,
+# while `--git-common-dir` prints the real one either way. Asking the authority
+# was right; asking the resolver the USER can relocate was not.
+hooks_dir="$(git rev-parse --git-common-dir)/hooks"
+scanner="$hooks_dir/check_public_surface.sh"
 if [ ! -x "$scanner" ]; then
   printf 'REFUSING: no trusted scanner at %s.\n' "$scanner" >&2
   printf '  Install it beside the hook, from a checkout you trust:\n' >&2
@@ -137,7 +155,12 @@ if [ ! -x "$scanner" ]; then
 fi
 # Reading tracked content is safe; executing it is not. A drift warning keeps the
 # trusted copy honest without trusting the branch.
-if [ -r "$tracked_scanner" ] && ! cmp -s "$scanner" "$tracked_scanner"; then
+# The drift note reads tracked content, so it refuses a symlink rather than
+# following one: the point of reading is to compare bytes, and a symlink is a
+# request to read somewhere else.
+if [ -L "$tracked_scanner" ]; then
+  printf 'NOTE: %s is a symlink; not comparing against it.\n' "scripts/check_public_surface.sh" >&2
+elif [ -r "$tracked_scanner" ] && ! cmp -s "$scanner" "$tracked_scanner"; then
   printf 'NOTE: the trusted scanner differs from %s.\n' "scripts/check_public_surface.sh" >&2
   printf '  If that is an update you want, re-copy it; if it is a branch you are\n' >&2
   printf '  inspecting, this is exactly why the copy exists.\n' >&2
@@ -194,10 +217,10 @@ status=0
 # the tree is already published, the NAME is not.
 scan_ref_name() {
   printf 'public surface: no new commits; scanning the published ref name\n'
-  scan_commit "$1" "$2" "$3"
+  scan_commit "$1" "$2" "$3" "$4"
 }
 
-# scan_commit <commit> <base> <published-ref-name>
+# scan_commit <commit> <base> <published-ref-name> [tag-object-file]
 scan_commit() {
   wt="$tmpdir/wt"
   rm -rf "$wt"
@@ -205,6 +228,14 @@ scan_commit() {
     printf 'REFUSING: could not create a worktree at %s to scan it.\n' "$1" >&2
     exit 2
   fi
+
+  # ⚠ SPARSITY OFF FIRST, THEN VALIDATE. Checking before expanding validated an
+  # ABSENCE: sparse rules can omit `scripts/`, the symlink tests saw nothing,
+  # and `sparse-checkout disable` then materialised the commit's symlink for the
+  # copy to follow -- into an external file, or into `/dev/zero`
+  # (shardpilot/shardpilot-go#79 review). A check that runs before the thing it
+  # checks exists is not a check.
+  ( cd "$wt" && git_safe sparse-checkout disable >/dev/null 2>&1 ) || true
 
   # ⚠ THE COMMIT CONTROLS THIS PATH. A commit that replaces `scripts` with a
   # symlink would make the copy below follow it and overwrite a file OUTSIDE
@@ -228,7 +259,6 @@ scan_commit() {
   # tracks (shardpilot/shardpilot-go#79 review). Disabling sparsity for the
   # temporary worktree costs nothing -- it exists only to be scanned, and a scan
   # of a partial tree is the failure this whole hook is about.
-  ( cd "$wt" && git_safe sparse-checkout disable >/dev/null 2>&1 ) || true
   mkdir -p "$wt/scripts"
 
   # ⚠ AND THE COMMIT'S OWN SCANNER IS EVIDENCE, NOT SCAFFOLDING. Overwriting it
@@ -299,6 +329,10 @@ scan_commit() {
   printf '%s\n' "$3" > "$tmpdir/pushed-ref-name"
   stage_evidence "$1" scripts/pushed-ref-as-committed.txt "$tmpdir/pushed-ref-name"
 
+  if [ -n "${4:-}" ] && [ -s "$4" ]; then
+    stage_evidence "$1" scripts/tag-object-as-committed.txt "$4"
+  fi
+
   cp "$scanner" "$wt/scripts/check_public_surface.sh"
   chmod +x "$wt/scripts/check_public_surface.sh"
   ( cd "$wt" && git_safe add scripts/check_public_surface.sh >/dev/null 2>&1 ) || true
@@ -311,12 +345,17 @@ scan_commit() {
 # The whole push, read once: a single ref cannot answer questions about the push
 # it is part of. A here-string keeps the loop in this shell, so `status` survives
 # it -- a pipe would run it in a subshell and every failure would be discarded.
-pushed_lines="$(cat)"
-
 while read -r local_ref local_sha remote_ref remote_sha; do
   case "$local_sha" in *[!0]*) ;; *) continue ;; esac
 
-  if [ "$local_sha" != "$head_sha" ]; then
+  # ⚠ A TAG IS NOT ITS COMMIT. githooks(5) supplies the TAG OBJECT's id for an
+  # annotated or signed tag, so comparing it to HEAD refused a standard release
+  # push -- and `--follow-tags` with it -- forcing --no-verify past this gate for
+  # an ordinary operation (shardpilot/shardpilot-go#79 review). The peeled object
+  # decides eligibility; the tag object is scanned in its own right below,
+  # because its annotation and signer metadata are published too.
+  peeled="$(git rev-parse --verify --quiet "$local_sha^{commit}" 2>/dev/null || printf '%s' "$local_sha")"
+  if [ "$peeled" != "$head_sha" ]; then
     printf 'REFUSING: pushing %s, which is not your HEAD.\n' "${local_ref:-?}" >&2
     printf '  The commits are scanned from their own trees, but the base and the\n' >&2
     printf '  ratchet are read relative to the checked-out repository state.\n' >&2
@@ -403,10 +442,24 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   excl=""
   for p in $published; do
     [ "$p" = "$local_sha" ] && continue
+    # ⚠ FETCH WHAT IS NOT HERE. Silently skipping an unresolvable advertised tip
+    # counted history that IS already public as newly introduced, which can
+    # refuse a legitimate push at the budget (shardpilot/shardpilot-go#79
+    # review). One fetch answers it; a failure only costs the exclusion.
+    git cat-file -e "$p^{commit}" 2>/dev/null \
+      || git fetch --quiet --no-tags -- "$dest" "$p" 2>/dev/null || true
     git cat-file -e "$p^{commit}" 2>/dev/null && excl="$excl ^$p"
   done
   # shellcheck disable=SC2086
-  commits="$(git rev-list --reverse "$base..$local_sha" $excl)"
+  commits="$(git rev-list --reverse "$base..$peeled" $excl)"
+  # An annotated tag publishes its own message and signer, which no tree or
+  # commit scan reaches. It rides along with the peeled commit's scan as one more
+  # staged evidence file.
+  tag_object=""
+  if [ "$peeled" != "$local_sha" ]; then
+    git cat-file tag "$local_sha" > "$tmpdir/tag-object" 2>/dev/null \
+      && tag_object="$tmpdir/tag-object"
+  fi
   n="$(printf '%s\n' "$commits" | grep -c . || true)"
   printf 'public surface: comparing against %s (%s); %s commit(s) introduced\n' "$base" "$why" "$n"
   # ⚠ A REF WITH NO NEW COMMITS STILL PUBLISHES ITS NAME. Pointing a new branch
@@ -414,7 +467,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # and the name is new, public, and was going unscanned because the loop exited
   # first (shardpilot/shardpilot-go#79 review).
   if [ "$n" = 0 ]; then
-    scan_ref_name "$local_sha" "$base" "$remote_ref" || status=$?
+    scan_ref_name "$peeled" "$base" "$remote_ref" "$tag_object" || status=$?
     continue
   fi
 
@@ -438,7 +491,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       continue
     fi
     printf 'public surface: scanning %s (%s/%s)\n' "$(git rev-parse --short "$c")" "$i" "$n"
-    scan_commit "$c" "$base" "$remote_ref" || status=$?
+    scan_commit "$c" "$base" "$remote_ref" "$tag_object" || status=$?
   done <<< "$commits"
   if [ -n "$skipped" ]; then
     # ⚠ REFUSING, NOT WARNING. The first version printed this and exited 0,

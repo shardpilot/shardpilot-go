@@ -311,13 +311,14 @@ No Makefile — standard Go tooling.
 **Install the pre-push hook once, before your first push:**
 
 ```
-h="$(git rev-parse --git-path hooks)"
+git config --unset core.hooksPath 2>/dev/null || true
+h="$(git rev-parse --git-common-dir)/hooks"
 cp .githooks/pre-push "$h/pre-push"
 cp scripts/check_public_surface.sh "$h/"
 chmod +x "$h/pre-push" "$h/check_public_surface.sh"
 ```
 
-**Both files**, and `--git-path hooks` rather than `--git-dir`: in a linked worktree the latter names `.git/worktrees/<name>`, while git reads hooks from the common directory — an install built on it puts the hook where git never looks, so the gate is absent while appearing installed. Everything the hook executes has to come from outside tracked content — the scanner as much as the hook — or a branch you are inspecting supplies its own checker.
+**Both files**, `--git-common-dir` rather than `--git-path hooks` or `--git-dir`, and the old `core.hooksPath` unset first — `--git-path hooks` *honours* that setting, so a repository still carrying the instruction this file used to give resolves straight back into tracked content: in a linked worktree the latter names `.git/worktrees/<name>`, while git reads hooks from the common directory — an install built on it puts the hook where git never looks, so the gate is absent while appearing installed. Everything the hook executes has to come from outside tracked content — the scanner as much as the hook — or a branch you are inspecting supplies its own checker.
 
 Copied rather than `core.hooksPath .githooks`: that setting names a directory, so pointing it at tracked content makes the hook that runs whatever the checked-out branch says it is — checking out someone else's branch and pushing it would execute their copy of the hook first. `.git/hooks/` is outside the worktree and no branch can write to it. Re-copy when the file changes.
 
