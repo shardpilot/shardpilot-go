@@ -453,6 +453,15 @@ var benignTopLevel = map[string]bool{
 	"assigned": true, "variant_key": true, "variant_payload": true,
 	"version": true, "reason": true, "boundary": true, "code": true,
 	"assignment_unit": true, "attributes": true, "experiment_key": true,
+	// ⚠ AND THE ONES THE SDK ITSELF ACCEPTS. A `401` body is
+	// `{"error":"unauthorized"}` and an echoed assignment carries `app_key` and
+	// `environment_key`; omitting them refused documented, ordinary responses
+	// (shardpilot/shardpilot-go#85 review). The reviewer's better suggestion --
+	// derive this from the wire contract -- is not reachable from here: that
+	// struct is unexported and in another package, and the public result type
+	// does not carry these members. So the list stays a list, and its failure
+	// side stays "refuse loudly" rather than "publish quietly".
+	"error": true, "app_key": true, "environment_key": true,
 }
 
 // ── the minted-field test, shared with the half this change builds on ────────
@@ -563,6 +572,19 @@ func topLevelMembers(body string) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// isBenignName is benignTopLevel under the SAME folding `encoding/json` applies,
+// which is what `isMintedName` already used. `{"aſſigned":true}` populates the
+// SDK's field and must not be reported as unfamiliar
+// (shardpilot/shardpilot-go#85 review).
+func isBenignName(name string) bool {
+	for n := range benignTopLevel {
+		if strings.EqualFold(name, n) {
+			return true
+		}
+	}
+	return false
 }
 
 // isMintedName is isMinted for a name already decoded.
@@ -729,7 +751,12 @@ func dropFraming(dump string) string {
 		// the same string (shardpilot/shardpilot-go#84 review).
 		if strings.HasPrefix(low, "trailer:") {
 			if i, ok := headerNameEnd(l); ok {
-				names := strings.Split(l[i+1:], ",")
+				// ⚠ STRIP THE TERMINATOR FIRST. The last element of a CRLF
+				// declaration is ` Location\r`, and OWS does not include CR, so
+				// the registered name was misclassified and lengthened -- on the
+				// last announced name of EVERY canonical trailer declaration
+				// (shardpilot/shardpilot-go#85 review).
+				names := strings.Split(strings.TrimSuffix(l[i+1:], "\r"), ",")
 				for k, n := range names {
 					// ⚠ THE REGISTRY CRITERION TOO, not only the supplied-value
 					// scrub -- `Trailer: Server-Secret` names a field the endpoint
@@ -739,7 +766,7 @@ func dropFraming(dump string) string {
 					// rule, and the sweep found this one before the review did.
 					names[k] = admitFieldName(n)
 				}
-				out = append(out, scrubHeaderName(l[:i])+":"+strings.Join(names, ","))
+				out = append(out, scrubHeaderName(l[:i])+":"+strings.Join(names, ",")+cr)
 				continue
 			}
 		}
@@ -869,7 +896,13 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 		noteRequestName(req.URL.Host)
 	}
 	if dump, err := httputil.DumpRequestOut(req, true); err == nil {
-		ex.req = redact([]byte(escapeMarks(string(dump))), req.Header)
+		// ⚠ THE AUTHORITY IS OURS AND IS NOT IN `req.Header`. Go stores it in
+		// `Request.Host`/`URL.Host`, so a derivation asking only the header map
+		// called every `Host:` line serialiser-written -- and a supplied value
+		// equal to the configured host was then skipped by the scrub AND the
+		// guard, and printed (shardpilot/shardpilot-go#85 review). Deriving from
+		// one of two places the data lives in is not deriving.
+		ex.req = redact([]byte(escapeMarks(string(dump))), requestOwnedHeaders(req))
 	}
 
 	resp, err := r.inner.RoundTrip(req)
@@ -1015,6 +1048,29 @@ func (t *teeBody) Close() error {
 // in the DUMP that is not in the request's own header map was written by the
 // serialiser, whatever it is called. The question "is this list derived or
 // recalled" has an answer here, and it did not before.
+// requestOwnedHeaders is the set of fields the SDK and this program put on the
+// wire, as opposed to those `DumpRequestOut` writes.
+//
+// ⚠ IT IS A FUNCTION SO THE FIXTURE READS THE CALL SITE -- the fourth time in
+// these two changes that a test composed the value itself and could therefore
+// not see the site it was checking (shardpilot/shardpilot-go#85 review).
+func requestOwnedHeaders(req *http.Request) http.Header {
+	ours := http.Header{}
+	if req != nil {
+		ours = req.Header.Clone()
+		if ours == nil {
+			ours = http.Header{}
+		}
+	}
+	// ⚠ THE AUTHORITY IS OURS AND IS NOT IN `req.Header`. Go stores it in
+	// `Request.Host`/`URL.Host`, so asking only the header map called every
+	// `Host:` line serialiser-written -- and a supplied value equal to the
+	// configured host was then skipped by the scrub AND the guard, and printed.
+	// Deriving from one of the two places the data lives in is not deriving.
+	ours.Set("Host", "")
+	return ours
+}
+
 func writtenBySerialiser(name string, ours http.Header) bool {
 	if ours == nil {
 		return false

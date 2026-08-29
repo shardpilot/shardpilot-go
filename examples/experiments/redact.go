@@ -636,10 +636,8 @@ func redactMintedBody(body string) string {
 	// dropped something the half it replaced was doing
 	// (shardpilot/shardpilot-go#85 review, found by the sweep).
 	for _, n := range topLevelMembers(body) {
-		low := strings.ToLower(n)
-		if !mintedNames[low] && !benignTopLevel[low] {
-			noteStructural("an unfamiliar top-level member, " + low +
-				", which this program has not judged")
+		if !isMintedName(n) && !isBenignName(n) {
+			noteStructural("a top-level member this program has not judged")
 		}
 	}
 	parsed := topLevelMembers(body)

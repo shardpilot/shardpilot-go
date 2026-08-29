@@ -329,3 +329,69 @@ func TestListsAndBorrowedPredicates(t *testing.T) {
 		}
 	})
 }
+
+// ---- round on 5046f38 ----
+
+func TestRefusalDiagnosticsCarryNoEndpointText(t *testing.T) {
+	structuralSurfaces = nil
+	suppliedValues = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	dropFraming("HTTP/1.1 200 OK\r\n\r\n" + `{"server_secret_identifier":"x"}`)
+	if len(structuralSurfaces) == 0 {
+		t.Fatal("an unfamiliar member stopped being refused")
+	}
+	for _, w := range structuralSurfaces {
+		if strings.Contains(w, "server_secret_identifier") {
+			t.Fatalf("the refusal diagnostic names the endpoint's own member: %q", w)
+		}
+	}
+}
+
+func TestFamiliarNamesFoldLikeEncodingJSON(t *testing.T) {
+	structuralSurfaces = nil
+	suppliedValues = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	// `ſ` folds to `s` for encoding/json, which populates the SDK's field.
+	dropFraming("HTTP/1.1 200 OK\r\n\r\n" + "{\"aſſigned\":true}")
+	if len(structuralSurfaces) != 0 {
+		t.Fatalf("a response the SDK accepts was called unfamiliar: %v", structuralSurfaces)
+	}
+}
+
+func TestKnownSDKMembersDoNotRefuse(t *testing.T) {
+	for _, body := range []string{
+		`{"error":"unauthorized"}`,
+		`{"assigned":true,"app_key":"a","environment_key":"e"}`,
+	} {
+		structuralSurfaces = nil
+		suppliedValues = nil
+		dropFraming("HTTP/1.1 200 OK\r\n\r\n" + body)
+		if len(structuralSurfaces) != 0 {
+			t.Errorf("%s: a documented response was refused: %v", body, structuralSurfaces)
+		}
+		structuralSurfaces = nil
+	}
+}
+
+func TestAnnouncedTrailerNamesKeepTheirTerminator(t *testing.T) {
+	suppliedValues = nil
+	got := stripMarks(dropFraming("HTTP/1.1 200 OK\r\nTrailer: Location\r\n\r\n"))
+	if !strings.Contains(got, "Location") {
+		t.Fatalf("the last announced trailer name was misclassified: %q", got)
+	}
+}
+
+func TestTheRequestAuthorityStaysInsideTheGuard(t *testing.T) {
+	suppliedValues = []string{"control"}
+	t.Cleanup(func() { suppliedValues = nil })
+	raw := "GET /p HTTP/1.1\r\nHost: control\r\nAccept-Encoding: gzip\r\n\r\n"
+	req, _ := http.NewRequest("GET", "https://control/p", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	got := string(redact([]byte(escapeMarks(raw)), requestOwnedHeaders(req)))
+	if err := assertNoLeak(asCaptured(scrubSupplied(got))); err != nil {
+		t.Logf("scrubbed: %q", stripMarks(scrubSupplied(got)))
+	}
+	if strings.Contains(stripMarks(scrubSupplied(got)), "Host: control") {
+		t.Fatalf("a supplied value equal to the authority was published: %q", stripMarks(scrubSupplied(got)))
+	}
+}
