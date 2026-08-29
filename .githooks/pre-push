@@ -85,6 +85,20 @@ unset GIT_INDEX_FILE
 # Every git command below runs with hooks pointed at an empty directory.
 hooks_off="$(mktemp -d)"
 git_safe() { git -c core.hooksPath="$hooks_off" "$@"; }
+# ⚠ THE TEMPORARIES AND THEIR TRAP ARE ONE STEP. Both directories were created
+# here and at line ~170, with the trap installed only after the second -- so
+# every refusal in between (a missing or non-executable scanner, the commonest
+# one there is) left an empty directory behind for good
+# (shardpilot/shardpilot-go#79 review). A cleanup that begins after the first
+# thing that can exit is not cleanup.
+tmpdir="$(mktemp -d)"
+cleanup() {
+  git_safe worktree remove --force "$tmpdir/wt" >/dev/null 2>&1 || true
+  rm -rf "$tmpdir" "$hooks_off"
+  git_safe worktree prune >/dev/null 2>&1 || true
+  git update-ref -d "refs/prepush-base-$$" 2>/dev/null || true
+}
+trap cleanup EXIT
 
 # ⚠ THE REFSPEC IS BUFFERED BEFORE ANYTHING TOUCHES A COMMIT-CONTROLLED PATH.
 # A commit replacing the tracked scanner with a symlink to `/dev/stdin` made the
@@ -167,15 +181,6 @@ case "$safe_dest" in
   *://*@*) safe_dest="$(printf '%s' "$safe_dest" | sed -E 's#(://)[^/@]*@#\1<redacted>@#')" ;;
 esac
 
-tmpdir="$(mktemp -d)"
-cleanup() {
-  git_safe worktree remove --force "$tmpdir/wt" >/dev/null 2>&1 || true
-  rm -rf "$tmpdir" "$hooks_off"
-  git_safe worktree prune >/dev/null 2>&1 || true
-  git update-ref -d "refs/prepush-base-$$" 2>/dev/null || true
-}
-trap cleanup EXIT
-
 head_sha="$(git rev-parse HEAD)"
 status=0
 
@@ -202,7 +207,16 @@ status=0
 # the tree is already published, the NAME is not.
 scan_ref_name() {
   printf 'public surface: no new commits; scanning the published ref name\n'
-  scan_commit "$1" "$2" "$3" "$4"
+  # ⚠ THE COMMIT IS ITS OWN BASE HERE, and that is the whole of the difference.
+  # This tree is ALREADY published -- an alias branch, or a missing annotated tag
+  # for an older commit -- so the only new thing is the NAME. Passing the
+  # destination's current default branch made the lane-B anti-cheat compare this
+  # commit's baseline file against a target that has since REDUCED its own, read
+  # the difference as raising the baseline, and refuse a push introducing no
+  # content at all (shardpilot/shardpilot-go#79 review). Lane A is absolute and
+  # still reads every byte, the ref name and tag object included; only the
+  # comparative check is pointed at something it can meaningfully answer about.
+  scan_commit "$1" "$1" "$3" "$4"
 }
 
 # scan_commit <commit> <base> <published-ref-name> [tag-object-file]
@@ -289,8 +303,21 @@ scan_commit() {
     cp "$3" "$wt/$2" 2>/dev/null || true
   }
 
-  if [ -e "$wt/scripts/check_public_surface.sh" ]; then
-    cp "$wt/scripts/check_public_surface.sh" "$tmpdir/committed-scanner"
+  # ⚠ THE BLOB, NOT THE CHECKOUT. `worktree add` runs the branch's own
+  # `.gitattributes`, so a commit assigning this path `ident` has its
+  # `$Id: ADR-0123 $` rewritten to `$Id: <blob-id> $` DURING checkout -- before
+  # anything here could read it. The clean transformed bytes were staged as
+  # evidence, the entry was then replaced by the trusted scanner, and the scanner
+  # excludes its own path, so the committed bytes were never examined by anything
+  # (shardpilot/shardpilot-go#79 review). The object database is the one copy the
+  # inspected branch cannot rewrite on the way out.
+  if git_safe cat-file -e "$1:scripts/check_public_surface.sh" 2>/dev/null; then
+    if ! git_safe cat-file blob "$1:scripts/check_public_surface.sh" \
+         > "$tmpdir/committed-scanner" 2>/dev/null; then
+      printf 'REFUSING: could not read %s from %s to scan it.\n' \
+        "scripts/check_public_surface.sh" "$1" >&2
+      exit 2
+    fi
     rm -f "$wt/scripts/check_public_surface.sh"
     stage_evidence "$1" scripts/scanner-as-committed.txt "$tmpdir/committed-scanner"
   fi
