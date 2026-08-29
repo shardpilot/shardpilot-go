@@ -44,6 +44,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -164,8 +165,14 @@ func (e *exchange) trailerReport() string {
 			// outside a captured span the leak check does not read them at all --
 			// so an unanticipated encoding of a supplied value in a trailer was
 			// published unexamined (shardpilot/shardpilot-go#73 review).
-			fmt.Fprintf(&b, "    %s\n",
-				asCaptured(scrubHeaderName(escapeMarks(k))+": "+scrubSupplied(escapeMarks(v))))
+			// ⚠ AND THE STRUCTURAL RULES, NOT ONLY THE SUPPLIED-VALUE SCRUB. A
+			// `Set-Cookie` or `Location` arriving as a trailer -- both legal, and
+			// net/http accepts them -- carries a SERVER-generated value, which no
+			// list of values this program supplied can reach, so it was published
+			// verbatim (shardpilot/shardpilot-go#73 review). Same dispatch as the
+			// header block, same order: structural first, supplied-value second.
+			line := structuralRedact(scrubHeaderName(escapeMarks(k)) + ": " + escapeMarks(v))
+			fmt.Fprintf(&b, "    %s\n", asCaptured(scrubSupplied(line)))
 		}
 	}
 	b.WriteString("\n")
@@ -347,13 +354,57 @@ func redactFragment(line string) string {
 		return line
 	}
 	head, frag := line[:i+1], line[i+1:]
+	tail := ""
+	if j := strings.IndexByte(frag, ' '); j >= 0 {
+		frag, tail = frag[:j], frag[j:]
+	}
 	if frag == "" {
 		return line
 	}
 	if !strings.Contains(frag, "=") {
-		return head + tokenPlaceholder(frag)
+		return head + tokenPlaceholder(frag) + tail
 	}
-	return head + strings.TrimPrefix(redactQuery("X ?"+frag), "X ?")
+	// ⚠ `?` IS ORDINARY FRAGMENT DATA, NOT A QUERY INTRODUCER. This delegated to
+	// redactQuery, which cut at the first `?` and kept everything before it as a
+	// parameter NAME -- so `#server-secret?x=y` published `server-secret`
+	// verbatim while reporting the fragment redacted
+	// (shardpilot/shardpilot-go#73 review). A fragment component whose name side
+	// carries a `?` is not a name/value pair; it is opaque.
+	return head + redactPairs(frag, "?") + tail
+}
+
+// redactTarget redacts a header line carrying a URL.
+//
+// ⚠ THE FRAGMENT IS CUT BEFORE ANY QUERY IS INTERPRETED. Composed the other way
+// round -- redactFragment(redactQuery(line)) -- redactQuery saw the `?` INSIDE
+// the fragment, split there, and by the time redactFragment ran the fragment
+// contained a generated `x=` component and no longer looked opaque
+// (shardpilot/shardpilot-go#73 review). A `#` always ends the query, so cutting
+// there first is what the grammar says.
+func redactTarget(line string) string {
+	if i := strings.IndexByte(line, '#'); i >= 0 {
+		return redactUserinfo(redactQuery(line[:i])) + redactFragment(line[i:])
+	}
+	return redactUserinfo(redactQuery(line))
+}
+
+// structuralRedact applies the rules a field NAME selects, for fields whose
+// values are server-generated and therefore unreachable by any scrub built from
+// values THIS program supplied.
+//
+// ⚠ IT IS A FUNCTION BECAUSE IT HAS TWO CALL SITES. The header block had these
+// rules and the trailer block did not, so the same `Set-Cookie` was redacted in
+// one position and published in the other (shardpilot/shardpilot-go#73 review).
+// A trailer is a header that arrived late; it is not a different kind of secret.
+func structuralRedact(line string) string {
+	low := strings.ToLower(line)
+	switch {
+	case strings.HasPrefix(low, "set-cookie:"):
+		return redactSetCookie(line)
+	case strings.HasPrefix(low, "location:"):
+		return redactTarget(line)
+	}
+	return line
 }
 
 func redactSetCookie(line string) string {
@@ -378,6 +429,23 @@ func redactSetCookie(line string) string {
 	return out + cr
 }
 
+// mintedBodyKeys are JSON fields the SERVER mints. They are the fact lane's
+// subject identifier and its privacy boundary, defined as such in
+// experiments.go -- and being server-minted, they are exactly what a scrub
+// built from supplied values cannot see (shardpilot/shardpilot-go#73 review).
+var mintedBodyKeys = regexp.MustCompile(
+	`"(subject_fact_key|subject_key_hash)"(\s*:\s*)"([^"]*)"`)
+
+// redactMintedBody replaces server-minted identifiers in a JSON body with a
+// length-preserving placeholder, structurally -- by FIELD NAME, the only handle
+// that exists when the value itself is unknown to this program.
+func redactMintedBody(body string) string {
+	return mintedBodyKeys.ReplaceAllStringFunc(body, func(m string) string {
+		g := mintedBodyKeys.FindStringSubmatch(m)
+		return `"` + g[1] + `"` + g[2] + `"` + marked(placeholder(g[3])) + `"`
+	})
+}
+
 func dropFraming(dump string) string {
 	lines := strings.Split(dump, "\n")
 	out := make([]string, 0, len(lines))
@@ -387,7 +455,7 @@ func dropFraming(dump string) string {
 			inHeaders = false
 		}
 		if !inHeaders {
-			out = append(out, l)
+			out = append(out, redactMintedBody(l))
 			continue
 		}
 		low := strings.ToLower(l)
@@ -409,7 +477,7 @@ func dropFraming(dump string) string {
 			// carries its credential after `#` -- `#access_token=…` never reaches
 			// the server and is exactly the value a capture must not publish, and
 			// `redactQuery` saw only `?` (shardpilot/shardpilot-go#73 review).
-			out = append(out, redactUserinfo(redactFragment(redactQuery(strings.TrimSuffix(l, "\r"))))+cr)
+			out = append(out, redactTarget(strings.TrimSuffix(l, "\r"))+cr)
 			continue
 		}
 		// ⚠ AND A HEADER NAME CAN CARRY THE IDENTIFIER. `X-<key>: v` published it
@@ -615,10 +683,22 @@ func redactQuery(line string) string {
 	if j := strings.IndexByte(rest, ' '); j >= 0 {
 		rest, tail = rest[:j], rest[j:]
 	}
+	return head + redactPairs(rest, "") + tail
+}
+
+// redactPairs redacts a form-encoded component list: names kept, values replaced
+// by their length. `opaqueNameBytes` names bytes that CANNOT appear in a name in
+// this context -- a component carrying one is not a name/value pair at all, so it
+// is replaced whole.
+func redactPairs(rest, opaqueNameBytes string) string {
 	parts := strings.Split(rest, "&")
 	for k, p := range parts {
 		eq := strings.IndexByte(p, '=')
-		if eq < 0 {
+		opaque := eq < 0
+		if !opaque && opaqueNameBytes != "" {
+			opaque = strings.ContainsAny(p[:eq], opaqueNameBytes)
+		}
+		if opaque {
 			// ⚠ NO `=` MEANS NO NAME TO KEEP. `?server-secret-token` is a legal
 			// query component and a perfectly good place for a server-generated
 			// credential, which no list of supplied values can reach -- and this
@@ -650,7 +730,7 @@ func redactQuery(line string) string {
 		}
 		parts[k] = p[:eq+1] + marked(fmt.Sprintf("redacted-%d-chars", n))
 	}
-	return head + strings.Join(parts, "&") + tail
+	return strings.Join(parts, "&")
 }
 
 func redact(dump []byte) []byte {
@@ -988,12 +1068,16 @@ func assertNoLeak(text string) error {
 		// percent-decodes to the supplied `abcdefghi+j` and `undoPlus` turned it
 		// into `abcdefghi j` inside the same expression, so the one form that
 		// matched was never retained (shardpilot/shardpilot-go#73 review).
-		for _, stage := range []func(string) string{undoPercent, undoUnicodeEscapes, undoPlus, undoEntities} {
+		for _, stage := range []func(string) string{undoPercent, undoUnicodeEscapes, undoBase64, undoPlus, undoEntities} {
 			cur = stage(cur)
 			forms = append(forms, cur)
 		}
 		next := cur
-		if next == forms[len(forms)-5] {
+		// ⚠ THE INDEX IS THE STAGE COUNT PLUS ONE, and it is a stage count, not a
+		// constant: it must name the form this round STARTED from. Adding a
+		// decoder without moving it would compare against a mid-round form and
+		// settle early.
+		if next == forms[len(forms)-6] {
 			settled = true
 			break
 		}
@@ -1034,6 +1118,75 @@ func assertNoLeak(text string) error {
 // percent, unicode or plus decoding reconstructs -- so the value reached the
 // artifact while the guard reported it absent
 // (shardpilot/shardpilot-go#73 review).
+// undoBase64 decodes bounded base64 tokens. A diagnostic body that
+// base64-encodes a supplied identifier reconstructs it for anyone who reads the
+// artifact, while percent, unicode, plus and entity decoding all leave it
+// untouched and the gate reported it absent (shardpilot/shardpilot-go#73
+// review).
+//
+// ⚠ IT RUNS BEFORE undoPlus, WHICH DESTROYS ITS ALPHABET. `+` is a base64 byte
+// and undoPlus rewrites it as a space, so ordered the other way this decoder
+// would be handed text whose tokens no longer decode.
+//
+// ⚠ AND IT IS DESTRUCTIVE ON PURPOSE, WHICH IS ONLY SAFE BECAUSE EVERY
+// INTERMEDIATE FORM IS KEPT. A supplied value can itself be legal base64 --
+// `abcdefgh` is -- so this stage replaces the plain occurrence with the bytes it
+// decodes to. The guard checks every retained form, and the form before this
+// stage still carries the plain text, so nothing is lost by rewriting it here.
+// Garbage produced from a non-base64 run can only ever ADD a match, which fails
+// closed.
+func undoBase64(text string) string {
+	const minToken = 8
+	var b strings.Builder
+	for i := 0; i < len(text); {
+		j := i
+		for j < len(text) && isBase64Byte(text[j]) {
+			j++
+		}
+		for j < len(text) && text[j] == '=' {
+			j++
+		}
+		tok := text[i:j]
+		if len(tok) < minToken {
+			if j == i {
+				b.WriteByte(text[i])
+				i++
+				continue
+			}
+			b.WriteString(tok)
+			i = j
+			continue
+		}
+		if dec, ok := decodeBase64(tok); ok {
+			b.WriteString(dec)
+		} else {
+			b.WriteString(tok)
+		}
+		i = j
+	}
+	return b.String()
+}
+
+func isBase64Byte(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+		(c >= 'A' && c <= 'Z') || c == '+' || c == '/' || c == '-' || c == '_'
+}
+
+// decodeBase64 tries the standard and URL alphabets, padded and unpadded. It
+// reports failure rather than a partial decode: half a token tells the guard
+// nothing and would only add noise to every later round.
+func decodeBase64(tok string) (string, bool) {
+	for _, enc := range []*base64.Encoding{
+		base64.StdEncoding, base64.RawStdEncoding,
+		base64.URLEncoding, base64.RawURLEncoding,
+	} {
+		if raw, err := enc.DecodeString(tok); err == nil && utf8.Valid(raw) {
+			return string(raw), true
+		}
+	}
+	return "", false
+}
+
 func undoEntities(text string) string {
 	return html.UnescapeString(text)
 }
@@ -1195,10 +1348,36 @@ func containsValue(text, v string) bool {
 	// rule reads as a word byte and so as "not a whole token". The guard must be
 	// at least as permissive as every redaction it checks, so it asks under both
 	// rules and a hit under either is a hit.
-	if containsValueWith(text, v, isNameByte) {
+	// ⚠ AND ONLY WHERE NAMES ARE. Asked of the WHOLE report, this convention
+	// refused ordinary captured body text: with experiment key `bar`, the JSON
+	// `{"reason":"foo-bar-baz"}` needs no redaction at all, but isNameByte reads
+	// both hyphens as boundaries and the capture exited 4
+	// (shardpilot/shardpilot-go#73 review). The permissive rule exists for field
+	// NAMES, where `-` is structural, so it is asked of the field names.
+	if containsValueWith(headerNames(text), v, isNameByte) {
 		return true
 	}
 	return containsValueWith(text, v, isWordByte)
+}
+
+// headerNames returns just the field NAMES in text, one per line -- the region
+// where the hyphen is structural rather than part of a word. Leading whitespace
+// is trimmed because the trailer block indents its lines.
+func headerNames(text string) string {
+	var b strings.Builder
+	for _, ln := range strings.Split(text, "\n") {
+		// ⚠ STRIP THE MARKS FIRST. The guard reads CAPTURED SPANS, and a span
+		// arrives with its provenance marks still attached -- so every line began
+		// with a byte that is not a token byte and no line was ever recognised as
+		// a header. The fixture that caught it is the one this convention exists
+		// for (shardpilot/shardpilot-go#73 review).
+		ln = strings.TrimSuffix(strings.TrimSpace(stripMarks(ln)), "\r")
+		if i, ok := headerNameEnd(ln); ok {
+			b.WriteString(ln[:i])
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
 }
 
 func containsValueWith(text, v string, isWord func(byte) bool) bool {

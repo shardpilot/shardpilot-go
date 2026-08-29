@@ -639,3 +639,86 @@ func TestTrailersAreSnapshotAtEOFNotFromTheHead(t *testing.T) {
 		t.Fatal("the trailer was written into the HTTP message instead of beside it")
 	}
 }
+
+// ---- round on c0fbd19: five findings, one property each ----
+
+func TestOpaqueFragmentPrefixWithQuestionMarkIsRedacted(t *testing.T) {
+	suppliedValues = nil
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(dropFraming(
+		"HTTP/1.1 302 Found\r\nLocation: /cb#server-secret?x=y\r\n\r\n"))
+	if strings.Contains(got, "server-secret") {
+		t.Fatalf("an opaque fragment prefix was published: %q", got)
+	}
+}
+
+func TestNameBoundariesDoNotReachOrdinaryBodyText(t *testing.T) {
+	suppliedValues = []string{"bar"}
+	t.Cleanup(func() { suppliedValues = nil })
+	body := `{"reason":"foo-bar-baz"}`
+	if err := assertNoLeak(asCaptured(body)); err != nil {
+		t.Fatalf("ordinary hyphenated body text was refused: %v", err)
+	}
+}
+
+func TestGuardDecodesBase64(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	hidden := `{"k":"YWJjZGVmZ2g="}`
+	err := assertNoLeak(asCaptured(hidden))
+	if err == nil {
+		t.Fatal("a base64-encoded identifier passed the guard")
+	}
+	if !strings.Contains(err.Error(), "survived redaction") {
+		t.Fatalf("refused for the wrong reason: %v", err)
+	}
+}
+
+func TestTrailersGetStructuralRedaction(t *testing.T) {
+	suppliedValues = nil
+	t.Cleanup(func() { suppliedValues = nil })
+	tee := &teeBody{trailer: http.Header{
+		"Set-Cookie": []string{"sid=server-secret"},
+		"Location":   []string{"/cb?state=server-state"},
+	}}
+	e := exchange{head: []byte("x"), captured: tee}
+	got := stripMarks(e.trailerReport())
+	for _, leak := range []string{"server-secret", "server-state"} {
+		if strings.Contains(got, leak) {
+			t.Errorf("a trailer published %q: %q", leak, got)
+		}
+	}
+}
+
+func TestServerMintedSubjectFactKeyIsRedacted(t *testing.T) {
+	suppliedValues = nil
+	t.Cleanup(func() { suppliedValues = nil })
+	body := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" +
+		`{"assigned":true,"subject_fact_key":"sfk1_0123456789abcdef"}`
+	got := stripMarks(dropFraming(body))
+	if strings.Contains(got, "sfk1_0123456789abcdef") {
+		t.Fatalf("the server-minted subject key was published: %q", got)
+	}
+}
+
+// A Location carrying BOTH a query and a fragment is where the composition
+// order is load-bearing on its own. Composed the other way round, redactQuery
+// cuts at the first `?`, swallows the whole `#fragment` into the last parameter
+// VALUE and reports one length for the two of them -- the fragment vanishes as a
+// structure and the number printed describes neither part. The `?`-opaque rule
+// cannot see this: there is no `?` inside the fragment to make it opaque.
+func TestQueryAndFragmentAreMeasuredSeparately(t *testing.T) {
+	suppliedValues = nil
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(dropFraming(
+		"HTTP/1.1 302 Found\r\nLocation: /cb?a=b#frag-only\r\n\r\n"))
+	if !strings.Contains(got, "a=redacted-1-chars") {
+		t.Errorf("the query value was not measured on its own: %q", got)
+	}
+	if !strings.Contains(got, "#redacted-9-chars") {
+		t.Errorf("the fragment was not redacted as a fragment: %q", got)
+	}
+	if strings.Contains(got, "frag-only") {
+		t.Errorf("the fragment was published: %q", got)
+	}
+}
