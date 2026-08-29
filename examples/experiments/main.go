@@ -1794,6 +1794,19 @@ func main() {
 		fmt.Fprintf(os.Stderr, "REFUSING TO PRINT: %v\n", err)
 		os.Exit(4)
 	}
+	// ⚠ AND A SURFACE THE STRUCTURAL RULES COULD NOT DESCRIBE IS THE SAME FACT AS
+	// A SURVIVING LEAK: the program cannot show the bytes are safe. Redact what
+	// you recognise, refuse what you do not.
+	if len(structuralSurfaces) > 0 {
+		fmt.Fprintf(os.Stderr,
+			"REFUSING TO PRINT: the response carries %d server-generated surface(s) "+
+				"in a shape the structural rules do not describe, so the capture is "+
+				"NOT publishable:\n", len(structuralSurfaces))
+		for _, w := range structuralSurfaces {
+			fmt.Fprintf(os.Stderr, "  - %s\n", w)
+		}
+		os.Exit(4)
+	}
 	// A CAPTURE NOBODY RECEIVED IS NOT A CAPTURE. An ignored write error let a
 	// report truncated by a full filesystem -- or never written at all -- be
 	// followed by "SERVED" and exit 0 (shardpilot/shardpilot-go#73 review).

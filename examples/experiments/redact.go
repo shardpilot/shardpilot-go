@@ -38,12 +38,36 @@ import (
 	"encoding/json"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 )
 
 // jsonMemberValue matches a JSON member together with its string VALUE. The
 // guard half already carries `jsonMember`, which matches a name and its colon;
 // this needs the value too, in order to replace it.
+// ── what redaction does not recognise, it still refuses ─────────────────────
+//
+// ⚠ THE GUARD HALF'S REFUSAL IS NARROWED HERE, NOT REMOVED, and getting that
+// wrong is the seam this split created. That half refused every response
+// carrying a server-generated surface, because it could redact none of them.
+// The obvious reading of "this change turns refusals into captures" is to delete
+// the refusal -- and then every shape the redactors below do NOT recognise
+// silently becomes a publication: an opaque `Set-Cookie: <token>` with no `=`, a
+// minted field whose value is an object rather than a string, a `Location` whose
+// target is not a valid URI. Each was refused before this change and published
+// after it (shardpilot/shardpilot-go#85 review, three findings of one shape).
+//
+// So the refusal survives, narrowed to exactly what it should always have meant:
+// redact what you recognise, refuse what you do not. The capture is unpublishable
+// whenever a structural surface reached a shape these rules cannot describe.
+var structuralSurfaces []string
+
+func noteStructural(what string) {
+	if !slices.Contains(structuralSurfaces, what) {
+		structuralSurfaces = append(structuralSurfaces, what)
+	}
+}
+
 // mintedNames are the fields the SERVER mints -- the fact lane's subject and its
 // privacy boundary, defined as such in experiments.go.
 var mintedNames = map[string]bool{
@@ -60,6 +84,15 @@ func jsonString(raw string) (string, bool) {
 	}
 	return out, true
 }
+
+// jsonMemberName matches a member NAME and its colon, without requiring the
+// value to be a string. It exists to catch the shapes jsonMemberValue cannot
+// describe -- `{"subject_fact_key":{"token":"..."}}` is legal JSON, the SDK
+// accepts it, and a pattern anchored on a quoted value simply does not match, so
+// the nested server-generated value was published and the supplied-value guard
+// is blind to it (shardpilot/shardpilot-go#85 review).
+var jsonMemberName = regexp.MustCompile(
+	`"((?:[^"\\]|\\.)*)"(\s*:\s*)`)
 
 var jsonMemberValue = regexp.MustCompile(
 	`"((?:[^"\\]|\\.)*)"(\s*:\s*)"((?:[^"\\]|\\.)*)"`)
@@ -112,7 +145,10 @@ func redactPairs(rest, opaqueNameBytes string) string {
 			// review). Replaced whole, as redactFragment already does for the
 			// same shape.
 			if p != "" {
-				parts[k] = tokenPlaceholder(p)
+				// MEASURED DECODED, like every other branch here: `%C3%A9` is one
+				// character, and reporting six put two lengths for one value in
+				// one capture (shardpilot/shardpilot-go#85 review).
+				parts[k] = tokenPlaceholder(queryDecoded(p))
 			}
 			continue
 		}
@@ -172,6 +208,22 @@ func redactFragment(line string) string {
 // (shardpilot/shardpilot-go#73 review). A `#` always ends the query, so cutting
 // there first is what the grammar says.
 func redactTarget(line string) string {
+	// ⚠ A TARGET THAT IS NOT A URI IS NOT PARSED, IT IS WITHHELD. A raw space is
+	// illegal in a request target but transport-valid in a header, and net/http
+	// keeps the whole opaque value -- so the redactors below treated everything
+	// after the space as request-line syntax and appended it unexamined
+	// (shardpilot/shardpilot-go#85 review).
+	if _, url, ok := strings.Cut(line, ": "); ok {
+		if strings.ContainsAny(strings.TrimSuffix(url, "\r"), " \t") {
+			noteStructural("a Location header whose target is not a valid URI")
+			head, _, _ := strings.Cut(line, ": ")
+			cr := ""
+			if strings.HasSuffix(line, "\r") {
+				cr = "\r"
+			}
+			return head + ": " + marked("<withheld: malformed target>") + cr
+		}
+	}
 	if i := strings.IndexByte(line, '#'); i >= 0 {
 		return redactPath(redactUserinfo(redactQuery(line[:i]))) + redactFragment(line[i:])
 	}
@@ -228,14 +280,27 @@ func redactSetCookie(line string) string {
 	}
 	head, rest, ok := strings.Cut(body, ":")
 	if !ok {
-		return line
+		noteStructural("an unparseable Set-Cookie header")
+		return marked("<withheld: unparseable Set-Cookie>")
 	}
 	pair, attrs, hasAttrs := strings.Cut(rest, ";")
 	name, value, hasValue := strings.Cut(strings.TrimSpace(pair), "=")
 	if !hasValue {
-		return line
+		// `Set-Cookie: server-secret` is transport-valid and net/http keeps it.
+		// Returning it unchanged published a server-generated value the guard
+		// cannot see (shardpilot/shardpilot-go#85 review).
+		noteStructural("a Set-Cookie header with no name=value pair")
+		return head + ": " + marked("<withheld>") + cr
 	}
-	out := head + ": " + name + "=" + placeholder(value)
+	// ⚠ THE QUOTES ARE DELIMITERS, NOT VALUE. A quoted cookie `sid="abc"` was
+	// reported as five characters for a three-character value -- the same
+	// measure-the-spelling defect the query path has been fixed for twice
+	// (shardpilot/shardpilot-go#85 review).
+	measured := value
+	if len(measured) >= 2 && measured[0] == '"' && measured[len(measured)-1] == '"' {
+		measured = measured[1 : len(measured)-1]
+	}
+	out := head + ": " + name + "=" + placeholder(measured)
 	if hasAttrs {
 		out += ";" + attrs
 	}
@@ -297,21 +362,17 @@ func structuralRedact(line string) string {
 // length-preserving placeholder, structurally -- by FIELD NAME, the only handle
 // that exists when the value itself is unknown to this program.
 func redactMintedBody(body string) string {
-	// ⚠ THE MEMBER NAME IS MATCHED BY WHAT IT DENOTES, NOT BY ONE SPELLING OF IT.
-	// A response may escape any character in a name -- `"subject\u005ffact_key"`
-	// is the same field -- and a pattern requiring the literal form published the
-	// server-minted value unchanged. Only the VALUE grammar had been made
-	// escape-aware (shardpilot/shardpilot-go#73 review). Every member is decoded
-	// and compared to the set, so no spelling can hide one.
+	// ⚠ MEMBER NAMES ARE MATCHED BY WHAT THEY DENOTE, NOT BY ONE SPELLING, and
+	// ASCII case does not distinguish them: `encoding/json` matches a field
+	// case-insensitively, so `SUBJECT_FACT_KEY` is the same field to the SDK and
+	// to the endpoint (shardpilot/shardpilot-go#84, #85 review).
 	//
 	// ⚠ NO OUTER `marked`: placeholder ALREADY returns one. Wrapping it made
 	// adjacent nested provenance marks, `overCaptured` then read the placeholder
-	// itself as captured text and rewrote it, and the output was
-	// `<<redacted, 8 chars>, 21 chars>` (shardpilot/shardpilot-go#73 review).
-	return jsonMemberValue.ReplaceAllStringFunc(body, func(m string) string {
+	// itself as captured text and rewrote it.
+	out := jsonMemberValue.ReplaceAllStringFunc(body, func(m string) string {
 		g := jsonMemberValue.FindStringSubmatch(m)
-		name, ok := jsonString(g[1])
-		if !ok || !mintedNames[name] {
+		if !isMinted(g[1]) {
 			return m
 		}
 		val, ok := jsonString(g[3])
@@ -320,6 +381,32 @@ func redactMintedBody(body string) string {
 		}
 		return `"` + g[1] + `"` + g[2] + `"` + placeholder(val) + `"`
 	})
+	// ⚠ AND A MINTED NAME THIS PATTERN COULD NOT DESCRIBE IS REFUSED, NOT
+	// PUBLISHED. Anything left carrying a minted member name after the pass above
+	// held a value shape these rules do not cover.
+	for _, m := range jsonMemberName.FindAllStringSubmatch(out, -1) {
+		if isMinted(m[1]) {
+			// ⚠ NOTED AND WITHHELD, not noted alone. The capture is refused at
+			// publication either way, but the rule a reader has to hold is
+			// simpler if it has no exceptions: a surface these rules cannot
+			// describe does not appear in what this function returns. The body
+			// goes whole, because the shape that defeated the pattern is exactly
+			// the shape whose extent cannot be determined.
+			noteStructural("a server-minted field whose value shape is not covered")
+			return marked("<withheld: a minted field in an undescribed shape>")
+		}
+	}
+	return out
+}
+
+// isMinted reports whether a raw JSON member name denotes a server-minted field,
+// under the decoding and the ASCII case-folding `encoding/json` itself applies.
+func isMinted(raw string) bool {
+	name, ok := jsonString(raw)
+	if !ok {
+		return false
+	}
+	return mintedNames[strings.ToLower(name)]
 }
 
 // redactPath replaces every non-empty path segment of a redirect target with its

@@ -339,3 +339,58 @@ func TestTrailerDispatchesOnTheOriginalFieldName(t *testing.T) {
 		suppliedValues = nil
 	}
 }
+
+// ---- the seam: what these rules do not recognise must still be refused ----
+
+func TestUnrecognisedStructuralShapesAreRefusedNotPublished(t *testing.T) {
+	for _, c := range []struct{ name, dump, leak string }{
+		{"opaque Set-Cookie",
+			"HTTP/1.1 200 OK\r\nSet-Cookie: server-secret\r\n\r\n", "server-secret"},
+		{"malformed Location target",
+			"HTTP/1.1 302 Found\r\nLocation: /cb?state=x server-secret\r\n\r\n", "server-secret"},
+		{"minted field with a non-string value",
+			"HTTP/1.1 200 OK\r\n\r\n" + `{"subject_fact_key":{"token":"server-secret"}}`, "server-secret"},
+	} {
+		structuralSurfaces = nil
+		suppliedValues = nil
+		got := stripMarks(dropFraming(c.dump))
+		if len(structuralSurfaces) == 0 {
+			t.Errorf("%s: a shape these rules do not cover was accepted: %q", c.name, got)
+		}
+		if strings.Contains(got, c.leak) {
+			t.Errorf("%s: the server-generated value was published: %q", c.name, got)
+		}
+		structuralSurfaces = nil
+	}
+}
+
+func TestMintedMemberNamesAreMatchedCaseInsensitively(t *testing.T) {
+	structuralSurfaces = nil
+	suppliedValues = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	got := stripMarks(dropFraming(
+		"HTTP/1.1 200 OK\r\n\r\n" + `{"SUBJECT_FACT_KEY":"sfk1_abababababab"}`))
+	if strings.Contains(got, "sfk1_abababababab") {
+		t.Fatalf("a case variant of a minted name was published: %q", got)
+	}
+}
+
+func TestQuotedCookieValueIsMeasuredWithoutItsDelimiters(t *testing.T) {
+	suppliedValues = nil
+	structuralSurfaces = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	got := stripMarks(dropFraming("HTTP/1.1 200 OK\r\nSet-Cookie: sid=\"abc\"\r\n\r\n"))
+	if !strings.Contains(got, "3 chars") {
+		t.Fatalf("the quotes were counted as value: %q", got)
+	}
+}
+
+func TestOpaqueQueryComponentIsMeasuredDecoded(t *testing.T) {
+	suppliedValues = nil
+	structuralSurfaces = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	got := stripMarks(dropFraming("HTTP/1.1 302 Found\r\nLocation: /cb?%C3%A9\r\n\r\n"))
+	if !strings.Contains(got, "redacted-1-chars") {
+		t.Fatalf("an opaque component was measured on its wire spelling: %q", got)
+	}
+}
