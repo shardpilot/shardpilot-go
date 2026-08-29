@@ -1,0 +1,672 @@
+package main
+
+import (
+	"bytes"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"testing"
+)
+
+// Each test below stands for one review finding on this program. They are here
+// because the findings were all of one kind -- the record claiming something the
+// bytes do not support -- and that kind is invisible to a run that succeeds.
+
+func TestDropFramingStopsAtTheHeaderBlock(t *testing.T) {
+	dump := "HTTP/1.1 200 OK\r\n" +
+		"Content-Length: 42\r\n" +
+		"\r\n" +
+		"a diagnostic line the endpoint sent:\r\n" +
+		"Content-Length: 42 was the value we saw\r\n"
+	got := dropFraming(dump)
+	if strings.Count(got, "X-Capture-Note") != 1 {
+		t.Fatalf("framing cleanup escaped the header block: %q", got)
+	}
+	if !strings.Contains(got, "Content-Length: 42 was the value we saw") {
+		t.Fatalf("a body line was rewritten by the recorder: %q", got)
+	}
+}
+
+func TestFencedBlockDoesNotAlterTheMessage(t *testing.T) {
+	req := "GET /x HTTP/1.1\r\nHost: h\r\n\r\n"
+	got := fencedBlock(req)
+	if !strings.Contains(got, req) {
+		t.Fatalf("the message was altered inside the fence: %q", got)
+	}
+	// Compact JSON has no trailing newline, and the block must not invent one
+	// INSIDE the fence -- with framing removed a parser would read it as payload.
+	body := "HTTP/1.1 200 OK\r\n\r\n{\"a\":1}"
+	gotB := fencedBlock(body)
+	if !strings.Contains(gotB, body+"\n```") && !strings.Contains(gotB, body+"\n") {
+		t.Fatalf("body not present verbatim: %q", gotB)
+	}
+	if !strings.Contains(gotB, "does not end with a newline") {
+		t.Fatal("the manufactured separator was not disclosed to the reader")
+	}
+}
+
+func TestGuardDoesNotRefuseALegalShortKeyInProse(t *testing.T) {
+	suppliedValues = []string{"a"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// The SDK accepts any non-empty experiment key. Ordinary report prose
+	// contains the letter inside words, and that is not an occurrence.
+	if err := assertNoLeak(asCaptured("# assignment capture — 2026-08-29\n")); err != nil {
+		t.Fatalf("the guard refused a valid run over prose: %v", err)
+	}
+	// A whole-token occurrence is still a leak.
+	if err := assertNoLeak(asCaptured("experiment_key=a&x=1")); err == nil {
+		t.Fatal("the guard missed a short value standing as its own token")
+	}
+}
+
+func TestGuardDecodesSurrogatePairs(t *testing.T) {
+	suppliedValues = []string{"a\U0001F600b"}
+	t.Cleanup(func() { suppliedValues = nil })
+	esc := `{"k":"a` + "\\ud83d\\ude00" + `b"}`
+	if err := assertNoLeak(asCaptured(esc)); err == nil {
+		t.Fatalf("a surrogate-pair spelling was not decoded: %q", esc)
+	}
+}
+
+func TestTrailerReportIsOutsideTheMessage(t *testing.T) {
+	tee := &teeBody{trailer: http.Header{"X-Late": []string{"value"}}}
+	ex := exchange{head: []byte("HTTP/1.1 200 OK\r\n\r\n"), captured: tee}
+	if strings.Contains(string(ex.resp()), "X-Late") {
+		t.Fatal("trailers were appended into the HTTP message body")
+	}
+	if !strings.Contains(ex.trailerReport(), "X-Late: value") {
+		t.Fatal("trailers were dropped instead of being reported beside the message")
+	}
+}
+
+func TestScrubCoversTheJSONUnicodeSpelling(t *testing.T) {
+	suppliedValues = []string{"a<b"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// encoding/json writes `<` as \u003c by default; strconv.Quote leaves it literal.
+	body := `{"experiment_key":"a\u003cb"}`
+	if !strings.Contains(body, `\u003c`) {
+		t.Fatal("precondition: the fixture must carry the escape spelling, not the literal")
+	}
+	got := scrubSupplied(body)
+	if strings.Contains(got, `a\u003cb`) {
+		t.Fatalf("the JSON escape spelling survived: %q", got)
+	}
+}
+
+func TestScrubCoversThePercentSpelling(t *testing.T) {
+	suppliedValues = []string{`a"b`}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := scrubSupplied("Location: /x?experiment_key=a%22b\r\n")
+	if strings.Contains(got, "a%22b") {
+		t.Fatalf("the percent spelling survived: %q", got)
+	}
+}
+
+// The one that makes the list above safe to be incomplete.
+func TestAssertNoLeakCatchesASpellingNobodyConstructed(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// json.Marshal does not escape these characters, so encodingsOf never
+	// produces this spelling and scrubSupplied cannot match it.
+	hidden := `{"k":"\u0061bcdefgh"}`
+	if scrubSupplied(hidden) != hidden {
+		t.Fatalf("precondition failed: the scrub was expected to miss this spelling")
+	}
+	if err := assertNoLeak(asCaptured(hidden)); err == nil {
+		t.Fatal("assertNoLeak passed a value it should have decoded and caught")
+	}
+	if err := assertNoLeak(asCaptured(`{"k":"nothing here"}`)); err != nil {
+		t.Fatalf("assertNoLeak refused a clean artifact: %v", err)
+	}
+}
+
+func TestCeilingWithAConclusiveEOFIsComplete(t *testing.T) {
+	// Exactly the ceiling, delivered with io.EOF: the body IS whole, and the
+	// SDK's refusal of an oversized response is a complete refusal.
+	src := bytes.Repeat([]byte("x"), capturedBodyMax)
+	tee := &teeBody{inner: io.NopCloser(bytes.NewReader(src))}
+	if _, err := io.Copy(io.Discard, tee); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	if !tee.sawEOF {
+		t.Fatal("precondition: the reader did not deliver EOF")
+	}
+	if (&exchange{head: []byte("x"), captured: tee}).truncErr() != nil {
+		t.Fatal("a ceiling-sized body confirmed by EOF was reported incomplete")
+	}
+}
+
+func TestCeilingWithoutEOFIsIndeterminate(t *testing.T) {
+	// The SDK reads through io.LimitReader, so the wrapper stops at the ceiling
+	// with more bytes behind it and never sees EOF. Nothing here can tell a
+	// whole body from a truncated one.
+	src := bytes.Repeat([]byte("x"), capturedBodyMax+512)
+	tee := &teeBody{inner: io.NopCloser(bytes.NewReader(src))}
+	if _, err := io.CopyN(io.Discard, tee, int64(capturedBodyMax)); err != nil {
+		t.Fatalf("copyN: %v", err)
+	}
+	if tee.sawEOF {
+		t.Fatal("precondition: EOF was seen, which is not this case")
+	}
+	if (&exchange{head: []byte("x"), captured: tee}).truncErr() == nil {
+		t.Fatal("a ceiling-sized body with no EOF was reported complete")
+	}
+	short := &teeBody{inner: io.NopCloser(bytes.NewReader([]byte("ok")))}
+	_, _ = io.Copy(io.Discard, short)
+	if (&exchange{head: []byte("x"), captured: short}).truncErr() != nil {
+		t.Fatal("a short body was reported incomplete")
+	}
+}
+
+func TestGuardDecodesNestedPercentEscapes(t *testing.T) {
+	suppliedValues = []string{`a"b`}
+	t.Cleanup(func() { suppliedValues = nil })
+	// A URL embedded in another URL's parameter encodes the identifier twice.
+	if err := assertNoLeak(asCaptured("Location: /r?next=%2Fx%3Fexperiment_key%3Da%2522b")); err == nil {
+		t.Fatal("a doubly percent-encoded identifier passed the guard")
+	}
+}
+
+func TestEveryQueryValueTheSDKSendsIsScrubbed(t *testing.T) {
+	suppliedValues = nil
+	t.Cleanup(func() { suppliedValues = nil })
+	u, err := url.Parse("https://h/a?subject_key=spcid_abababababababababababababababab&app_key=k")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	for _, vs := range u.Query() {
+		for _, v := range vs {
+			addSuppliedValue(v)
+		}
+	}
+	// The minted subject is not an environment value, and it is what a redirect
+	// Location echoes back.
+	got := scrubSupplied("Location: /r?subject_key=spcid_abababababababababababababababab")
+	if strings.Contains(got, "spcid_abababababababababababababababab") {
+		t.Fatalf("the SDK-minted subject was published verbatim: %q", got)
+	}
+}
+
+func TestGuardDecodesPlusAsSpace(t *testing.T) {
+	suppliedValues = []string{"a b"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// A URL nested in another URL's query: the inner `+` is itself encoded.
+	if err := assertNoLeak(asCaptured("Location: /r?next=%3Fexperiment_key%3Da%2Bb")); err == nil {
+		t.Fatal("a nested query-plus spelling passed the guard")
+	}
+}
+
+func TestGuardHasNoFixedDecodingDepth(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// Wrap the percent-escape in many %25 layers -- more than any fixed cap.
+	v := "%61bcdefgh"
+	for i := 0; i < 40; i++ {
+		v = strings.ReplaceAll(v, "%", "%25")
+	}
+	// ⚠ ASSERT THE REASON, NOT MERELY AN ERROR. The first version of this test
+	// checked only `err != nil`, and the mutant that restores the 16-round cap
+	// SURVIVED it: that version also errors, but with "did not settle" rather
+	// than by finding the value. Two different verdicts, one indistinguishable
+	// assertion.
+	err := assertNoLeak(asCaptured(v))
+	if err == nil {
+		t.Fatal("a deeply nested encoding walked through the guard")
+	}
+	if !strings.Contains(err.Error(), "survived redaction") {
+		t.Fatalf("the guard refused for the wrong reason -- it did not reach the "+
+			"value, it ran out of rounds: %v", err)
+	}
+}
+
+func TestTrailerNamesAreScrubbedToo(t *testing.T) {
+	suppliedValues = []string{"secret"}
+	t.Cleanup(func() { suppliedValues = nil })
+	tee := &teeBody{trailer: http.Header{"X-secret": []string{"v"}}}
+	got := (&exchange{head: []byte("x"), captured: tee}).trailerReport()
+	if strings.Contains(got, "secret") {
+		t.Fatalf("the identifier was published in a trailer NAME: %q", got)
+	}
+}
+
+func TestRedactedAuthorizationKeepsItsTerminator(t *testing.T) {
+	dump := []byte("GET /x HTTP/1.1\r\nAuthorization: Bearer tok\r\nHost: h\r\n\r\n")
+	got := string(redact(dump))
+	for _, line := range strings.Split(got, "\n") {
+		if line == "" {
+			continue
+		}
+		if !strings.HasSuffix(line, "\r") {
+			t.Fatalf("line lost its CR, giving mixed endings: %q in %q", line, got)
+		}
+	}
+}
+
+func TestGuardDecodesHTMLEntities(t *testing.T) {
+	suppliedValues = []string{"a&b"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured("<p>rejected key a&amp;b</p>")); err == nil {
+		t.Fatal("an HTML entity spelling passed the guard")
+	}
+}
+
+func TestGuardDoesNotMaskAValueShapedLikeAPlaceholder(t *testing.T) {
+	suppliedValues = []string{"redacted-38-chars"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// A legal experiment key that happens to look like a generated placeholder.
+	if err := assertNoLeak(asCaptured("GET /x?experiment_key=redacted-38-chars HTTP/1.1")); err == nil {
+		t.Fatal("the mask swallowed the very value it was protecting")
+	}
+}
+
+func TestResponseHeaderNamesAreScrubbed(t *testing.T) {
+	suppliedValues = []string{"Secret"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := dropFraming("HTTP/1.1 200 OK\r\nX-Secret: value\r\n\r\n{}")
+	if strings.Contains(got, "X-Secret") {
+		t.Fatalf("an identifier was published in a response header NAME: %q", got)
+	}
+}
+
+func TestReplacedFramingHeadersKeepTheirTerminator(t *testing.T) {
+	got := dropFraming("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n{}")
+	for _, line := range strings.Split(got, "\n") {
+		if strings.HasPrefix(line, "X-Capture-Note") && !strings.HasSuffix(line, "\r") {
+			t.Fatalf("a replacement line lost its CR: %q in %q", line, got)
+		}
+	}
+}
+
+func TestCeilingWithAnExactContentLengthIsComplete(t *testing.T) {
+	// Production's outer io.LimitReader can synthesise EOF without calling the
+	// tee again, so sawEOF stays false on a complete body.
+	src := bytes.Repeat([]byte("x"), capturedBodyMax)
+	tee := &teeBody{inner: io.NopCloser(bytes.NewReader(src)), declared: int64(capturedBodyMax)}
+	if _, err := io.CopyN(io.Discard, tee, int64(capturedBodyMax)); err != nil {
+		t.Fatalf("copyN: %v", err)
+	}
+	if tee.sawEOF {
+		t.Fatal("precondition: this case is about NOT seeing EOF")
+	}
+	if (&exchange{head: []byte("x"), captured: tee}).truncErr() != nil {
+		t.Fatal("a complete body with an exact Content-Length was called incomplete")
+	}
+}
+
+func TestHyphenatedIdentifierInAHeaderName(t *testing.T) {
+	suppliedValues = []string{"foo-bar"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if got := scrubHeaderName("X-foo-bar"); strings.Contains(got, "foo-bar") {
+		t.Fatalf("a hyphenated identifier survived the name scrub: %q", got)
+	}
+	// And the guard must see it too, under the name convention.
+	if err := assertNoLeak(asCaptured("X-foo-bar: value")); err == nil {
+		t.Fatal("the guard missed a hyphenated identifier in a header name")
+	}
+}
+
+func TestGuardDecodesHexEscapes(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	hidden := `{"k":"\\x61bcdefgh"}`
+	if scrubSupplied(hidden) != hidden {
+		t.Fatal("precondition: the scrub is expected to miss this spelling")
+	}
+	err := assertNoLeak(asCaptured(hidden))
+	if err == nil {
+		t.Fatal("a hex-escape spelling passed the guard")
+	}
+	if !strings.Contains(err.Error(), "survived redaction") {
+		t.Fatalf("refused for the wrong reason: %v", err)
+	}
+}
+
+func TestLongestSuppliedValueWins(t *testing.T) {
+	suppliedValues = []string{"abcdefgh", "abcdefghi"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := scrubSupplied("echoed abcdefghi here")
+	if strings.Contains(got, "i here") && strings.Contains(got, "8 chars") {
+		t.Fatalf("the shorter value destroyed the longer match: %q", got)
+	}
+	if !strings.Contains(got, "9 chars") {
+		t.Fatalf("the longer value was not redacted as itself: %q", got)
+	}
+}
+
+func TestGeneratedProseIsNotCheckedForLeaks(t *testing.T) {
+	suppliedValues = []string{"assignment"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// The recorder's own heading contains the word; only captured spans are in
+	// question, and prose carries no mark at all.
+	if err := assertNoLeak("# assignment capture — 2026-08-29\n"); err != nil {
+		t.Fatalf("the guard read its own prose as captured content: %v", err)
+	}
+	if err := assertNoLeak(asCaptured("experiment_key=assignment&x=1")); err == nil {
+		t.Fatal("the guard missed a real occurrence inside captured text")
+	}
+}
+
+func TestCapturedNULIsEscapedNotDeleted(t *testing.T) {
+	ex := exchange{head: []byte("HTTP/1.1 200 OK\r\n\r\n"),
+		captured: &teeBody{buf: *bytes.NewBufferString("a\x00b")}}
+	got := responseText(&ex)
+	if strings.Contains(stripMarks(got), "ab") {
+		t.Fatalf("a captured NUL was deleted, joining separated bytes: %q", got)
+	}
+	if !strings.Contains(got, `\x00`) {
+		t.Fatalf("a captured NUL was not disclosed: %q", got)
+	}
+}
+
+func TestHeaderNamePlaceholderIsTokenSafe(t *testing.T) {
+	suppliedValues = []string{"secret"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubHeaderName("X-secret"))
+	for _, bad := range []string{" ", ",", "<", ">"} {
+		if strings.Contains(got, bad) {
+			t.Fatalf("a header name got a non-token placeholder %q: %q", bad, got)
+		}
+	}
+	if strings.Contains(got, "secret") {
+		t.Fatalf("the identifier survived: %q", got)
+	}
+}
+
+func TestPercentDecodedFormIsCheckedBeforePlus(t *testing.T) {
+	suppliedValues = []string{"abcdefghi+j"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// Percent-decoding reconstructs the value; undoPlus would then destroy it.
+	if err := assertNoLeak(asCaptured("k=%61bcdefghi%2Bj")); err == nil {
+		t.Fatal("the intermediate percent-decoded form was never checked")
+	}
+}
+
+func TestSchemeRelativeUserinfoIsRedacted(t *testing.T) {
+	suppliedValues = nil
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(dropFraming("HTTP/1.1 302 Found\r\nLocation: //user:secret@e.example/cb\r\n\r\n"))
+	if strings.Contains(got, "secret") {
+		t.Fatalf("userinfo in a network-path reference was published: %q", got)
+	}
+}
+
+func TestTrailerContentIsInsideACapturedSpan(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	tee := &teeBody{trailer: http.Header{"X-Late": []string{`\\x61bcdefgh`}}}
+	ex := exchange{head: []byte("x"), captured: tee}
+	if err := assertNoLeak(ex.trailerReport()); err == nil {
+		t.Fatal("a trailer's content was never read by the guard")
+	}
+}
+
+func TestResponsePlaceholderCountsRunes(t *testing.T) {
+	suppliedValues = []string{"é"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied("echoed é here"))
+	if !strings.Contains(got, "1 chars") {
+		t.Fatalf("a one-character value was measured in bytes: %q", got)
+	}
+}
+
+func TestGuardDecodesBraceFormUnicodeEscapes(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	hidden := `{"k":"\\u{61}bcdefgh"}`
+	err := assertNoLeak(asCaptured(hidden))
+	if err == nil {
+		t.Fatal("a brace-form escape passed the guard")
+	}
+	if !strings.Contains(err.Error(), "survived redaction") {
+		t.Fatalf("refused for the wrong reason: %v", err)
+	}
+}
+
+func TestLegalTokenHeaderNamesAreRecognised(t *testing.T) {
+	suppliedValues = []string{"Secret"}
+	t.Cleanup(func() { suppliedValues = nil })
+	for _, name := range []string{"X.Secret", "X+Secret", "X^Secret", "X-Secret"} {
+		got := stripMarks(dropFraming("HTTP/1.1 200 OK\r\n" + name + ": v\r\n\r\n"))
+		if strings.Contains(got, "Secret") {
+			t.Errorf("%s: the identifier survived: %q", name, got)
+		}
+		// The NAME is the part of the HEADER line before its colon -- not of the
+		// whole dump, whose status line carries spaces of its own. The first
+		// version of this assertion split the dump and failed on correct output.
+		var field string
+		for _, ln := range strings.Split(got, "\r\n") {
+			if i := strings.IndexByte(ln, ':'); i > 0 && !strings.HasPrefix(ln, "HTTP/") {
+				field = ln[:i]
+				break
+			}
+		}
+		if field == "" {
+			t.Errorf("%s: no header line survived: %q", name, got)
+			continue
+		}
+		for j := 0; j < len(field); j++ {
+			if !isTokenByte(field[j]) {
+				t.Errorf("%s: %q is not a legal field name (byte %q)", name, field, field[j])
+				break
+			}
+		}
+	}
+}
+
+func TestTrailersAreSnapshotAtEOFNotFromTheHead(t *testing.T) {
+	resp := &http.Response{Trailer: http.Header{}}
+	tee := &teeBody{inner: io.NopCloser(strings.NewReader("BODY")), resp: resp}
+	buf := make([]byte, 8)
+	for {
+		_, err := tee.Read(buf)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		// The values arrive with the last chunk, not with the head, so a
+		// snapshot taken when the head was dumped would see nothing.
+		resp.Trailer.Set("X-Late", "value")
+	}
+	ex := exchange{head: []byte("HTTP/1.1 200 OK\r\nTrailer: X-Late\r\n\r\n"), captured: tee}
+	if !strings.Contains(ex.trailerReport(), "X-Late: value") {
+		t.Fatal("a declared trailer was announced and then omitted")
+	}
+	if strings.Contains(string(ex.resp()), "X-Late: value") {
+		t.Fatal("the trailer was written into the HTTP message instead of beside it")
+	}
+}
+
+// ---- round on c0fbd19: five findings, one property each ----
+
+func TestNameBoundariesDoNotReachOrdinaryBodyText(t *testing.T) {
+	suppliedValues = []string{"bar"}
+	t.Cleanup(func() { suppliedValues = nil })
+	body := `{"reason":"foo-bar-baz"}`
+	if err := assertNoLeak(asCaptured(body)); err != nil {
+		t.Fatalf("ordinary hyphenated body text was refused: %v", err)
+	}
+}
+
+func TestGuardDecodesBase64(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	hidden := `{"k":"YWJjZGVmZ2g="}`
+	err := assertNoLeak(asCaptured(hidden))
+	if err == nil {
+		t.Fatal("a base64-encoded identifier passed the guard")
+	}
+	if !strings.Contains(err.Error(), "survived redaction") {
+		t.Fatalf("refused for the wrong reason: %v", err)
+	}
+}
+
+func TestGuardDecodesShortBase64Tokens(t *testing.T) {
+	suppliedValues = []string{"bar"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured(`{"k":"YmFy"}`)); err == nil {
+		t.Fatal("a four-byte base64 token passed the guard")
+	}
+}
+
+func TestMarkEscapingIsInjective(t *testing.T) {
+	fromWire := escapeMarks("a" + capturedMark + "b")
+	literal := escapeMarks(`a\x00b`)
+	if fromWire == literal {
+		t.Fatalf("a real marker byte and its literal spelling render alike: %q", fromWire)
+	}
+}
+
+func TestSuppliedValueInACanonicalisedHeaderNameIsScrubbed(t *testing.T) {
+	suppliedValues = []string{"secret"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// net/http canonicalises `X-secret` to `X-Secret` before the dump.
+	got := stripMarks(dropFraming("HTTP/1.1 200 OK\r\nX-Secret: v\r\n\r\n"))
+	if strings.Contains(got, "Secret") {
+		t.Fatalf("a folded supplied identifier survived in a field name: %q", got)
+	}
+}
+
+func TestEncodedFormPlaceholderMeasuresTheValue(t *testing.T) {
+	suppliedValues = []string{`a"b`}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied(`{"k":"a\"b"}`))
+	if strings.Contains(got, "4 chars") {
+		t.Fatalf("the placeholder measured the encoding, not the value: %q", got)
+	}
+	if !strings.Contains(got, "3 chars") {
+		t.Fatalf("the placeholder did not measure the value: %q", got)
+	}
+}
+
+func TestReportDoesNotClaimTheBodyIsAsReceived(t *testing.T) {
+	if strings.Contains(respSection, "status line and body are as received") {
+		t.Fatal("the report claims as-received bytes for a body it redacts")
+	}
+	if !strings.Contains(respSection, "REDACTED capture") {
+		t.Fatal("the report does not say the body is redacted")
+	}
+}
+
+// ---- round on 0dc23aa: six findings ----
+
+func TestEscapingSeparatesABackslashNextToAMarker(t *testing.T) {
+	adjacent := escapeMarks(`\` + capturedMark) // a backslash then a REAL marker byte
+	literal := escapeMarks(`\` + `\x00`)        // a backslash then the wire spelling
+	if adjacent == literal {
+		t.Fatalf("a backslash beside a marker collides with its literal form: %q", adjacent)
+	}
+	if bare := escapeMarks(capturedMark); bare == adjacent || bare == literal {
+		t.Fatalf("a bare marker collides with an escaped form: %q", bare)
+	}
+	// And an ordinary escape the guard's decoders rely on is untouched.
+	if got := escapeMarks(`a`); got != `a` {
+		t.Fatalf("an unrelated escape was rewritten: %q", got)
+	}
+}
+
+func TestGuardDecodesBareHexadecimal(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured(`{"k":"6162636465666768"}`)); err == nil {
+		t.Fatal("a bare hexadecimal identifier passed the guard")
+	}
+}
+
+func TestDecodeBudgetChargesEveryStage(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// ~1 MiB of filler plus an escape nested deeply enough that the rounds
+	// needed, times the FIVE decoders each round runs, exceeds the budget --
+	// while one charge per round would stay well inside it.
+	// ⚠ NESTED, NOT REPEATED. `%25%25%25…` all peels in ONE pass, because
+	// undoPercent decodes each escape independently; the nesting that costs a
+	// round each is in the encoding of the percent SIGN -- `%2525` -> `%25` -> `%`.
+	// And the payload decodes to something harmless, so only the budget can fire.
+	nested := "%" + strings.Repeat("25", 20) + "41"
+	body := nested + strings.Repeat("f", 1<<20)
+	err := assertNoLeak(asCaptured(body))
+	if err == nil || !strings.Contains(err.Error(), "work budget") {
+		t.Fatalf("the work budget did not fire: %v", err)
+	}
+}
+
+func TestStatusLineIsNotRewrittenByTheValueScrub(t *testing.T) {
+	suppliedValues = []string{"200"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied("HTTP/1.1 200 OK\r\n\r\nbody 200 here"))
+	if !strings.HasPrefix(got, "HTTP/1.1 200 OK") {
+		t.Fatalf("the status line was rewritten into something unparsable: %q", got)
+	}
+	if strings.Contains(got, "body 200 here") {
+		t.Fatalf("the BODY occurrence was left unredacted: %q", got)
+	}
+}
+
+// ---- round on 51eeaaf: three findings ----
+
+func TestReportDoesNotClaimTheStatusLineIsReceived(t *testing.T) {
+	if strings.Contains(respSection, "status line is as received") {
+		t.Fatal("the status line is synthesised by Response.Write; the report claims otherwise")
+	}
+	if !strings.Contains(respSection, "CANONICAL") {
+		t.Fatal("the report does not label the status line as a representation")
+	}
+}
+
+// ---- what this half REFUSES, which is its half of the contract ----
+
+func TestAServerGeneratedHeaderMakesTheCaptureUnpublishable(t *testing.T) {
+	for _, c := range []struct{ dump, want string }{
+		{"HTTP/1.1 302 Found\r\nLocation: /cb?state=server-state\r\n\r\n", "server-state"},
+		{"HTTP/1.1 200 OK\r\nSet-Cookie: sid=server-secret\r\n\r\n", "server-secret"},
+	} {
+		structuralSurfaces = nil
+		got := stripMarks(dropFraming(c.dump))
+		if len(structuralSurfaces) == 0 {
+			t.Errorf("a server-generated surface was not noted: %q", got)
+		}
+		if strings.Contains(got, c.want) {
+			t.Errorf("the value was published rather than withheld: %q", got)
+		}
+		structuralSurfaces = nil
+	}
+}
+
+func TestAMintedSubjectKeyMakesTheCaptureUnpublishable(t *testing.T) {
+	structuralSurfaces = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	body := "HTTP/1.1 200 OK\r\n\r\n" + `{"assigned":true,"subject_fact_key":"sfk1_abababababababab"}`
+	dropFraming(body)
+	if len(structuralSurfaces) == 0 {
+		t.Fatal("a server-minted subject key did not make the capture unpublishable")
+	}
+}
+
+func TestAServerGeneratedTrailerMakesTheCaptureUnpublishable(t *testing.T) {
+	structuralSurfaces = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	tee := &teeBody{trailer: http.Header{"Set-Cookie": []string{"sid=server-secret"}}}
+	e := exchange{head: []byte("x"), captured: tee}
+	got := stripMarks(e.trailerReport())
+	if len(structuralSurfaces) == 0 {
+		t.Fatal("a Set-Cookie trailer did not make the capture unpublishable")
+	}
+	if strings.Contains(got, "server-secret") {
+		t.Fatalf("the trailer value was published rather than withheld: %q", got)
+	}
+}
+
+func TestARequestQueryIsWithheldWhole(t *testing.T) {
+	// This half cannot say how long each value was, and a length it cannot
+	// compute is not a length it may guess.
+	got := stripMarks(dropQuery("/v1/assign?subject_key=abc&x=y"))
+	if strings.Contains(got, "abc") || strings.Contains(got, "x=y") {
+		t.Fatalf("a query value survived: %q", got)
+	}
+	if !strings.HasPrefix(got, "/v1/assign") {
+		t.Fatalf("the path was destroyed with the query: %q", got)
+	}
+}
