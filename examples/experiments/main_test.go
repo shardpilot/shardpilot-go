@@ -520,6 +520,32 @@ func TestResponsePlaceholderCountsRunes(t *testing.T) {
 	}
 }
 
+func TestEveryPlaceholderCountsCharacters(t *testing.T) {
+	// One measure, one place: this asserts the PROPERTY across every surface
+	// that produces a placeholder, so a new one measuring bytes fails here
+	// rather than in a review round two days later.
+	suppliedValues = []string{"éé"}
+	t.Cleanup(func() { suppliedValues = nil })
+	for name, got := range map[string]string{
+		"value":         stripMarks(scrubSupplied("body éé here")),
+		"header name":   stripMarks(scrubHeaderName("X-éé")),
+		"query":         stripMarks(redactQuery("GET /x?k=%C3%A9%C3%A9 HTTP/1.1")),
+		"cookie":        stripMarks(redactSetCookie("Set-Cookie: s=éé; Path=/")),
+		"userinfo":      stripMarks(redactUserinfo("Location: https://éé@h/cb")),
+		"fragment":      stripMarks(redactFragment("Location: /cb#éé")),
+		"authorization": stripMarks(string(redact([]byte("GET / HTTP/1.1\r\nAuthorization: Bearer éé\r\n\r\n")))),
+	} {
+		// Two placeholder shapes, one measure: `<redacted, N chars>` and
+		// `redacted-N-chars`. The property is the NUMBER, not the spelling.
+		if strings.Contains(got, "4 chars") || strings.Contains(got, "4-chars") {
+			t.Errorf("%s measured bytes, not characters: %q", name, got)
+		}
+		if !strings.Contains(got, "2 chars") && !strings.Contains(got, "2-chars") {
+			t.Errorf("%s did not report 2 characters: %q", name, got)
+		}
+	}
+}
+
 func TestTrailersAreSnapshotAtEOFNotFromTheHead(t *testing.T) {
 	resp := &http.Response{Trailer: http.Header{}}
 	tee := &teeBody{inner: io.NopCloser(strings.NewReader("BODY")), resp: resp}

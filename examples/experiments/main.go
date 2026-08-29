@@ -317,7 +317,7 @@ func redactUserinfo(line string) string {
 			return line
 		}
 	}
-	return line[:i+skip] + marked(fmt.Sprintf("redacted-%d-chars", utf8.RuneCountInString(rest[:at]))) + rest[at:]
+	return line[:i+skip] + tokenPlaceholder(rest[:at]) + rest[at:]
 }
 
 // redactFragment applies the query treatment to a URL fragment: parameter names
@@ -334,7 +334,7 @@ func redactFragment(line string) string {
 		return line
 	}
 	if !strings.Contains(frag, "=") {
-		return head + marked(fmt.Sprintf("redacted-%d-chars", utf8.RuneCountInString(frag)))
+		return head + tokenPlaceholder(frag)
 	}
 	return head + strings.TrimPrefix(redactQuery("X ?"+frag), "X ?")
 }
@@ -354,7 +354,7 @@ func redactSetCookie(line string) string {
 	if !hasValue {
 		return line
 	}
-	out := head + ": " + name + "=" + marked(fmt.Sprintf("<redacted, %d chars>", len(value)))
+	out := head + ": " + name + "=" + placeholder(value)
 	if hasAttrs {
 		out += ";" + attrs
 	}
@@ -641,7 +641,7 @@ func redact(dump []byte) []byte {
 			scheme := "<redacted>"
 			if len(field) == 2 {
 				if parts := strings.SplitN(strings.TrimSpace(field[1]), " ", 2); len(parts) == 2 {
-					scheme = parts[0] + " <redacted, " + fmt.Sprint(len(parts[1])) + " chars>"
+					scheme = parts[0] + " " + placeholder(parts[1])
 				}
 			}
 			// KEEP THE LINE'S OWN TERMINATOR. Splitting on "\n" leaves the
@@ -833,6 +833,26 @@ const genMark = "\x01"
 
 func marked(s string) string { return genMark + s + genMark }
 
+// ⚠ ONE MEASURE, ONE PLACE. Seven sites produced a "chars" placeholder and each
+// counted for itself; TWO of them were still counting bytes when the label said
+// characters, and the same defect was fixed twice in two different functions
+// before it was seen as a set (shardpilot/shardpilot-go#73 review). A quantity
+// with several independent implementations diverges by construction -- the
+// question is only which copy is found next.
+//
+// `placeholder` is the prose form and `tokenPlaceholder` the one legal inside an
+// HTTP field name. Both mark themselves as generated, and both count runes,
+// because "chars" is what they say.
+func chars(v string) int { return utf8.RuneCountInString(v) }
+
+func placeholder(v string) string {
+	return marked(fmt.Sprintf("<redacted, %d chars>", chars(v)))
+}
+
+func tokenPlaceholder(v string) string {
+	return marked(fmt.Sprintf("redacted-%d-chars", chars(v)))
+}
+
 // asCaptured delimits text that came from the wire. ⚠ IT DOES NOT ESCAPE:
 // escaping belongs on the RAW bytes, before redaction inserts its own marks --
 // doing it here escaped those too, so the guard read its own placeholders as
@@ -932,7 +952,7 @@ func assertNoLeak(text string) error {
 				return fmt.Errorf(
 					"a supplied value of %d characters survived redaction in some "+
 						"encoding; the record is NOT publishable and was not printed",
-					len(v))
+					chars(v))
 			}
 		}
 	}
@@ -1043,7 +1063,7 @@ func undoUnicodeEscapes(text string) string {
 // message unparsable in exactly the case it handles
 // (shardpilot/shardpilot-go#73 review). This is letters, digits and hyphens.
 func nameSafe(v string) string {
-	return marked(fmt.Sprintf("redacted-%d-chars", utf8.RuneCountInString(v)))
+	return tokenPlaceholder(v)
 }
 
 func scrubHeaderName(name string) string {
@@ -1126,7 +1146,7 @@ func replaceValueWith(text, v string, isWord func(byte) bool) string {
 	// identifier was reported longer than it is -- the same defect the query
 	// placeholder had, in the other function (shardpilot/shardpilot-go#73 review).
 	return replaceTokenWith(text, v,
-		marked(fmt.Sprintf("<redacted, %d chars>", utf8.RuneCountInString(v))), isWord)
+		placeholder(v), isWord)
 }
 
 func replaceTokenWith(text, v, red string, isWord func(byte) bool) string {
