@@ -825,3 +825,81 @@ func TestReportDoesNotClaimTheBodyIsAsReceived(t *testing.T) {
 		t.Fatal("the report does not say the body is redacted")
 	}
 }
+
+// ---- round on 0dc23aa: six findings ----
+
+func TestEscapingSeparatesABackslashNextToAMarker(t *testing.T) {
+	adjacent := escapeMarks(`\` + capturedMark) // a backslash then a REAL marker byte
+	literal := escapeMarks(`\` + `\x00`)        // a backslash then the wire spelling
+	if adjacent == literal {
+		t.Fatalf("a backslash beside a marker collides with its literal form: %q", adjacent)
+	}
+	if bare := escapeMarks(capturedMark); bare == adjacent || bare == literal {
+		t.Fatalf("a bare marker collides with an escaped form: %q", bare)
+	}
+	// And an ordinary escape the guard's decoders rely on is untouched.
+	if got := escapeMarks(`a`); got != `a` {
+		t.Fatalf("an unrelated escape was rewritten: %q", got)
+	}
+}
+
+func TestGuardDecodesBareHexadecimal(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured(`{"k":"6162636465666768"}`)); err == nil {
+		t.Fatal("a bare hexadecimal identifier passed the guard")
+	}
+}
+
+func TestDecodeBudgetChargesEveryStage(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// ~1 MiB of filler plus an escape nested deeply enough that the rounds
+	// needed, times the FIVE decoders each round runs, exceeds the budget --
+	// while one charge per round would stay well inside it.
+	// ⚠ NESTED, NOT REPEATED. `%25%25%25…` all peels in ONE pass, because
+	// undoPercent decodes each escape independently; the nesting that costs a
+	// round each is in the encoding of the percent SIGN -- `%2525` -> `%25` -> `%`.
+	// And the payload decodes to something harmless, so only the budget can fire.
+	nested := "%" + strings.Repeat("25", 20) + "41"
+	body := nested + strings.Repeat("f", 1<<20)
+	err := assertNoLeak(asCaptured(body))
+	if err == nil || !strings.Contains(err.Error(), "work budget") {
+		t.Fatalf("the work budget did not fire: %v", err)
+	}
+}
+
+func TestRedirectPathSegmentIsMeasuredDecoded(t *testing.T) {
+	suppliedValues = nil
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(dropFraming(
+		"HTTP/1.1 302 Found\r\nLocation: https://e.example/%C3%A9\r\n\r\n"))
+	if !strings.Contains(got, "redacted-1-chars") {
+		t.Fatalf("a percent-encoded path segment was measured on the wire: %q", got)
+	}
+}
+
+func TestMintedKeyMatchStopsAtAnUnescapedQuote(t *testing.T) {
+	suppliedValues = nil
+	t.Cleanup(func() { suppliedValues = nil })
+	body := "HTTP/1.1 200 OK\r\n\r\n" + `{"subject_fact_key":"abc\"server-secret"}`
+	got := stripMarks(dropFraming(body))
+	if strings.Contains(got, "server-secret") {
+		t.Fatalf("an escaped quote ended the match early and published the rest: %q", got)
+	}
+	if strings.Count(got, `"`)%2 != 0 {
+		t.Fatalf("the recorded JSON was left unbalanced: %q", got)
+	}
+}
+
+func TestStatusLineIsNotRewrittenByTheValueScrub(t *testing.T) {
+	suppliedValues = []string{"200"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied("HTTP/1.1 200 OK\r\n\r\nbody 200 here"))
+	if !strings.HasPrefix(got, "HTTP/1.1 200 OK") {
+		t.Fatalf("the status line was rewritten into something unparsable: %q", got)
+	}
+	if strings.Contains(got, "body 200 here") {
+		t.Fatalf("the BODY occurrence was left unredacted: %q", got)
+	}
+}

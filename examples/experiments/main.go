@@ -45,6 +45,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -398,6 +399,22 @@ func redactTarget(line string) string {
 // Every segment goes, not a chosen few: picking which ones "look opaque" is the
 // entropy guess this file has already been burnt by, and a redirect path is
 // server-generated in its entirety.
+// pathDecoded is a path segment's decoded spelling when it decodes, and itself
+// otherwise. queryDecoded is the same for a query value, where `+` is a space.
+func pathDecoded(s string) string {
+	if dec, err := url.PathUnescape(s); err == nil {
+		return dec
+	}
+	return s
+}
+
+func queryDecoded(s string) string {
+	if dec, err := url.QueryUnescape(s); err == nil {
+		return dec
+	}
+	return s
+}
+
 func redactPath(line string) string {
 	head, url, ok := strings.Cut(line, ": ")
 	if !ok {
@@ -430,7 +447,11 @@ func redactPath(line string) string {
 	segs := strings.Split(url[start:], "/")
 	for i, seg := range segs {
 		if seg != "" {
-			segs[i] = tokenPlaceholder(seg)
+			// ⚠ MEASURE THE VALUE, NOT ITS WIRE SPELLING -- the same rule the query
+			// path already follows. `%C3%A9` is the single character `é` and was
+			// reported as six (shardpilot/shardpilot-go#73 review). PathUnescape,
+			// not QueryUnescape: `+` is a literal plus in a path.
+			segs[i] = tokenPlaceholder(pathDecoded(seg))
 		}
 	}
 	return head + ": " + url[:start] + strings.Join(segs, "/") + tail
@@ -481,8 +502,13 @@ func redactSetCookie(line string) string {
 // subject identifier and its privacy boundary, defined as such in
 // experiments.go -- and being server-minted, they are exactly what a scrub
 // built from supplied values cannot see (shardpilot/shardpilot-go#73 review).
+// ⚠ THE VALUE PATTERN IS JSON-AWARE. `[^"]*` stops at an ESCAPED quote, so
+// `{"subject_fact_key":"abc\"server-secret"}` matched only `abc`: most of the
+// server-generated value was published AND the recorded JSON was left
+// unbalanced (shardpilot/shardpilot-go#73 review). A JSON string ends at the
+// first UNESCAPED quote, which is what this now says.
 var mintedBodyKeys = regexp.MustCompile(
-	`"(subject_fact_key|subject_key_hash)"(\s*:\s*)"([^"]*)"`)
+	`"(subject_fact_key|subject_key_hash)"(\s*:\s*)"((?:[^"\\]|\\.)*)"`)
 
 // redactMintedBody replaces server-minted identifiers in a JSON body with a
 // length-preserving placeholder, structurally -- by FIELD NAME, the only handle
@@ -802,15 +828,10 @@ func redactPairs(rest, opaqueNameBytes string) string {
 		// three-character key, while the same key in an echoed body printed
 		// `<redacted, 3 chars>`. Two lengths for one value in one capture is
 		// evidence that contradicts itself (shardpilot/shardpilot-go#73 review).
-		raw := p[eq+1:]
-		n := utf8.RuneCountInString(raw)
-		if dec, err := url.QueryUnescape(raw); err == nil {
-			// COUNT CHARACTERS: the placeholder says "chars", and `len` says
-			// bytes -- `%C3%A9` decoded to one character reported as two
-			// (shardpilot/shardpilot-go#73 review).
-			n = utf8.RuneCountInString(dec)
-		}
-		parts[k] = p[:eq+1] + marked(fmt.Sprintf("redacted-%d-chars", n))
+		// COUNT CHARACTERS OF THE DECODED VALUE: the placeholder says "chars",
+		// and `len` says bytes -- `%C3%A9` decoded to one character reported as
+		// two (shardpilot/shardpilot-go#73 review).
+		parts[k] = p[:eq+1] + tokenPlaceholder(queryDecoded(p[eq+1:]))
 	}
 	return strings.Join(parts, "&")
 }
@@ -931,7 +952,19 @@ func addSuppliedValue(v string) {
 // `assertNoLeak` reported a survivor and every such capture exited 4 without
 // publishing (shardpilot/shardpilot-go#73 review). The marks already record
 // which text is ours; the scrub simply was not consulting them.
+// ⚠ THE STATUS LINE IS PROTOCOL SYNTAX, NOT DATA. A legal supplied identifier can
+// equal a status token -- `SP_EXPERIMENT_KEY=200` -- and the generic scrub then
+// rewrote `HTTP/1.1 200 OK` into `HTTP/1.1 <redacted, 3 chars> OK`, an unparsable
+// response the guard nonetheless approved, because the replacement carries
+// generated marks (shardpilot/shardpilot-go#73 review). There is no value a
+// scrub could legitimately find there.
 func scrubSupplied(text string) string {
+	if strings.HasPrefix(text, "HTTP/") {
+		if i := strings.IndexByte(text, '\n'); i >= 0 {
+			return text[:i+1] + overCaptured(text[i+1:], scrubSuppliedRaw)
+		}
+		return text
+	}
 	return overCaptured(text, scrubSuppliedRaw)
 }
 
@@ -1096,25 +1129,60 @@ var genSpan = regexp.MustCompile(genMark + "[^" + genMark + "]*" + genMark)
 // escapeMarks keeps captured bytes rather than deleting them: a body may legally
 // contain either marker byte, and the artifact must still hold what arrived. The
 // escape is visible and reversible; deletion was neither.
-// escapeMarks replaces the two reserved marker bytes with readable text.
+// escapeMarks replaces the two reserved marker bytes with readable text, and the
+// substitution must be REVERSIBLE, because the report claims it is.
 //
-// ⚠ IT MUST BE INJECTIVE, AND IT WAS NOT. A response containing an actual NUL
-// and a response containing the four literal bytes `\x00` both rendered as
-// `\x00`, so the artifact could not say which the SDK received -- and this
-// function's whole claim is that the substitution is reversible
-// (shardpilot/shardpilot-go#73 review). Pre-existing spellings are lengthened by
-// one backslash FIRST, so `\x00` from the wire becomes `\\x00` and only a real
-// NUL produces the single-backslash form.
+// ⚠ PRE-ESCAPING THE COMPLETE SPELLINGS WAS NOT ENOUGH. That first fix separated
+// a real NUL from the four wire bytes `\x00`, and still collided on a backslash
+// sitting NEXT to a real marker: `\` + NUL and the wire bytes `\` + `\x00` both
+// rendered as `\\x00` (shardpilot/shardpilot-go#73 review). A backslash run is
+// therefore lengthened whenever what FOLLOWS it could be read as the escape --
+// a marker byte, or the literal `x00`/`x01` -- so decoding a run of k
+// backslashes before `x00` is unambiguous: k=1 is a real NUL, k>1 is k-1
+// backslashes and the literal text.
 //
-// ⚠ ONLY THE RESERVED SPELLINGS ARE TOUCHED. Escaping every backslash would
-// rewrite `\uXXXX` and `\xNN` as well, and the guard's decoders would then fail
-// to reconstruct an identifier they currently catch -- an injective escape that
+// ⚠ AND ONLY THOSE RUNS ARE TOUCHED. Escaping every backslash would rewrite
+// `\uXXXX` and `\xNN` as well, and assertNoLeak's decoders would stop
+// reconstructing identifiers they currently catch. An injective escape that
 // blinds the leak check is a worse trade than the ambiguity it fixes.
 func escapeMarks(s string) string {
-	s = strings.ReplaceAll(s, `\x00`, `\\x00`)
-	s = strings.ReplaceAll(s, `\x01`, `\\x01`)
-	s = strings.ReplaceAll(s, capturedMark, `\x00`)
-	return strings.ReplaceAll(s, genMark, `\x01`)
+	var b strings.Builder
+	for i := 0; i < len(s); {
+		if s[i] == '\\' {
+			j := i
+			for j < len(s) && s[j] == '\\' {
+				j++
+			}
+			// ⚠ PARITY SEPARATES THE TWO FAMILIES. Adding ONE backslash was not
+			// enough: the marker's own substitution contributes a backslash too, so
+			// `\`+NUL and `\\x00` both landed on three. A run of k before a REAL
+			// marker becomes 2k (the marker then adds its own, giving 2k+1 -- odd);
+			// a run of k before the literal text becomes 2k+2 -- even. Decoding
+			// reads the parity: odd is a marker with (m-1)/2 backslashes, even is
+			// literal text with (m-2)/2 (shardpilot/shardpilot-go#73 review).
+			n := j - i
+			rest := s[j:]
+			switch {
+			case strings.HasPrefix(rest, capturedMark) || strings.HasPrefix(rest, genMark):
+				n = 2 * n
+			case strings.HasPrefix(rest, "x00") || strings.HasPrefix(rest, "x01"):
+				n = 2*n + 2
+			}
+			b.WriteString(strings.Repeat(`\`, n))
+			i = j
+			continue
+		}
+		switch s[i : i+1] {
+		case capturedMark:
+			b.WriteString(`\x00`)
+		case genMark:
+			b.WriteString(`\x01`)
+		default:
+			b.WriteByte(s[i])
+		}
+		i++
+	}
+	return b.String()
 }
 
 func stripMarks(s string) string {
@@ -1161,7 +1229,6 @@ func assertNoLeak(text string) error {
 	cur := text
 	settled := false
 	for i := 0; i <= len(text); i++ {
-		work += len(cur)
 		if work > decodeWorkMax {
 			return fmt.Errorf(
 				"decoding exceeded its work budget (%d bytes examined); the record "+
@@ -1172,7 +1239,19 @@ func assertNoLeak(text string) error {
 		// percent-decodes to the supplied `abcdefghi+j` and `undoPlus` turned it
 		// into `abcdefghi j` inside the same expression, so the one form that
 		// matched was never retained (shardpilot/shardpilot-go#73 review).
-		for _, stage := range []func(string) string{undoPercent, undoUnicodeEscapes, undoBase64, undoPlus, undoEntities} {
+		// ⚠ EVERY STAGE IS CHARGED, NOT ONE PER ROUND. The budget counted
+		// `len(cur)` once while FIVE full-text decoders ran, so a near-limit body
+		// could do hundreds of MiB of scanning -- and retain that many full-size
+		// intermediate forms -- before a nominal 64 MiB bound fired. A resource
+		// limit that undercounts by the number of stages is not fail-closed
+		// (shardpilot/shardpilot-go#73 review).
+		for _, stage := range []func(string) string{undoPercent, undoUnicodeEscapes, undoBase64, undoHex, undoPlus, undoEntities} {
+			work += len(cur)
+			if work > decodeWorkMax {
+				return fmt.Errorf(
+					"decoding exceeded its work budget (%d bytes examined); the record "+
+						"is NOT publishable and was not printed", work)
+			}
 			cur = stage(cur)
 			forms = append(forms, cur)
 		}
@@ -1181,7 +1260,7 @@ func assertNoLeak(text string) error {
 		// constant: it must name the form this round STARTED from. Adding a
 		// decoder without moving it would compare against a mid-round form and
 		// settle early.
-		if next == forms[len(forms)-6] {
+		if next == forms[len(forms)-7] {
 			settled = true
 			break
 		}
@@ -1274,6 +1353,45 @@ func undoBase64(text string) string {
 		i = j
 	}
 	return b.String()
+}
+
+// undoHex decodes bare even-length hexadecimal tokens. `\x61` is covered by the
+// escape decoder; `6162636465666768` is the same identifier with no syntax at
+// all, and nothing in the chain touched it (shardpilot/shardpilot-go#73 review).
+// Six is the floor -- three bytes, matching the shortest value undoBase64 can
+// reach -- and, like that stage, it is destructive on purpose: every earlier form
+// is retained and checked, so rewriting a token here cannot lose the plain one.
+func undoHex(text string) string {
+	const minHex = 6
+	var b strings.Builder
+	for i := 0; i < len(text); {
+		j := i
+		for j < len(text) && isHexByte(text[j]) {
+			j++
+		}
+		tok := text[i:j]
+		if len(tok) < minHex || len(tok)%2 != 0 {
+			if j == i {
+				b.WriteByte(text[i])
+				i++
+				continue
+			}
+			b.WriteString(tok)
+			i = j
+			continue
+		}
+		if raw, err := hex.DecodeString(tok); err == nil && utf8.Valid(raw) {
+			b.Write(raw)
+		} else {
+			b.WriteString(tok)
+		}
+		i = j
+	}
+	return b.String()
+}
+
+func isHexByte(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 }
 
 func isBase64Byte(c byte) bool {
