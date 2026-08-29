@@ -303,7 +303,23 @@ GATE_TMPFILES=()
 # cleanup that reads as working and frees nothing. It was written that way
 # first, and the file count is what showed it.
 gate_tmp() {
-  GATE_TMP="$(mktemp)" || return 1
+  # ⚠ IT REFUSES RATHER THAN RETURNING. Every caller writes
+  # `gate_tmp; something="$GATE_TMP"` on one line, so a failure that merely
+  # returned non-zero would leave the PREVIOUS temporary path in GATE_TMP and
+  # the new name would alias the old file -- two logical files silently
+  # becoming one, with the second overwriting what the first still needs.
+  #
+  # Errexit does not save this: the scan takes its grep statuses under
+  # "set +e", and a call landing in that window would continue past the
+  # failure. Seven call sites would each need their own check; the function
+  # having no failing return is one place instead of seven.
+  GATE_TMP="$(mktemp)" || {
+    # refusal:structural
+    echo "REFUSING: could not create a temporary file." >&2
+    echo "  Callers take this path immediately, so continuing would alias the" >&2
+    echo "  previous temporary and let one file overwrite another." >&2
+    exit 2
+  }
   GATE_TMPFILES+=("$GATE_TMP")
 }
 # ⚠ AND A RUN THAT DID NOT REACH ITS OWN END EXITS NON-ZERO, whatever the
@@ -419,7 +435,7 @@ fi
 #
 # `$PATTERNS` and `$KNOWN_INNOCENT` carry no break: measured, neither matches
 # the classes, so they are written plainly.
-GATE_DATA_NAMES='ROSTER KNOWN_INTERNAL KNOWN_INNOCENT FIXTURE_ACCENT_BODY FIXTURE_ACCENT_NAME FIXTURE_BINARY_BODY FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY FIXTURE_DIRTY_NAME FIXTURE_EMPHASIS_BODY FIXTURE_EMPHASIS_NAME FIXTURE_ESCAPE_BODY FIXTURE_ESCAPE_NAME FIXTURE_ENTITY_BODY FIXTURE_ENTITY_NAME FIXTURE_AMPPROSE_BODY FIXTURE_AMPPROSE_NAME FIXTURE_NBSPPHRASE_BODY FIXTURE_NBSPPHRASE_NAME FIXTURE_RAWHTMLENT_BODY FIXTURE_RAWHTMLENT_NAME FIXTURE_LEGACYSECT_BODY FIXTURE_LEGACYSECT_NAME FIXTURE_ENTITYLANEB_BODY FIXTURE_ENTITYLANEB_NAME FIXTURE_FLAG_BODY FIXTURE_FLAG_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY FIXTURE_NAMEHIT_NAME'
+GATE_DATA_NAMES='ROSTER KNOWN_INTERNAL KNOWN_INNOCENT FIXTURE_ACCENT_BODY FIXTURE_ACCENT_NAME FIXTURE_BINARY_BODY FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY FIXTURE_DIRTY_NAME FIXTURE_EMPHASIS_BODY FIXTURE_EMPHASIS_NAME FIXTURE_ESCAPE_BODY FIXTURE_ESCAPE_NAME FIXTURE_ENTITY_BODY FIXTURE_ENTITY_NAME FIXTURE_AMPPROSE_BODY FIXTURE_AMPPROSE_NAME FIXTURE_NBSPPHRASE_BODY FIXTURE_NBSPPHRASE_NAME FIXTURE_RAWHTMLENT_BODY FIXTURE_RAWHTMLENT_NAME FIXTURE_LEGACYSECT_BODY FIXTURE_LEGACYSECT_NAME FIXTURE_ENTITYLANEB_BODY FIXTURE_ENTITYLANEB_NAME FIXTURE_FLAG_BODY FIXTURE_FLAG_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY FIXTURE_NAMEHIT_NAME FIXTURE_SPLITID_BODY FIXTURE_SPLITID_NAME'
 
 PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not| never) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (exists?|existed|remains?|remained|runs?|ran|covers?|covered|exercises?|exercised|guards?|guarded))?( (for|of|in)|[.,;]|$)|[Tt]here (is|are)(n.{1,3}t| not) (any |no )?(harness|harnesses|coverage|tests?|suites?)|[Tt]here (is|are) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?)|(has|have|had) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Ww]ithout( (automated|manual|unit|integration|end-to-end|regression|any|meaningful))* (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Nn]obody (looks|checks|monitors)( at| on)?( [A-Za-z][A-Za-z-]*){0,3} (dashboard|dashboards|alert|alerts|log|logs|metric|metrics|queue|queues|report|reports|test|tests|coverage|monitoring)( (for|of|in)|[.,;]|$)|(is|are|was|were)(n.{1,3}t| not| never) under (test|testing|coverage|monitoring|observation)( (for|of|in)|[.,;]|$)|[Ll]acks( any| automated| an?)*( [A-Za-z][A-Za-z-]*)? (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|(has|have|had)(n.{1,3}t| not| never) been (tested|covered|scanned|audited|monitored)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 ROSTER='analytic[]s-service
@@ -508,6 +524,9 @@ FIXTURE_FLAG_NAME=flag.md
 FIXTURE_LANEB_BODY='// GAP[]-000 note
 package x'
 FIXTURE_LANEB_NAME=lane_b.go
+FIXTURE_SPLITID_BODY='// see ADR-[]000**00** and EXAMPLE_SYNTH[]ETIC_FL[]AG_ENABLED
+package x'
+FIXTURE_SPLITID_NAME=split_id.go
 FIXTURE_NAMEHIT_BODY='nothing internal in the body'
 FIXTURE_NAMEHIT_NAME='ADR-[]9999-notes.md'
 for gate_var in $GATE_DATA_NAMES; do
@@ -1601,14 +1620,46 @@ scan_tree() {
         # so an I/O error on a file that HAS matches would have produced an
         # empty result, a count of zero, and a ratchet comparing against a
         # number it never managed to compute.
+        # ⚠ COUNTED ON THE RAW TEXT, AND AMBIGUITY IS REFUSED RATHER THAN
+        # RESOLVED. Three attempts at a transformation policy died here, and the
+        # third died from three directions at once: in this pattern family the
+        # same marker character plays three incompatible roles --
+        #
+        #   _  inside the environment-flag class     a LITERAL that must survive
+        #   ** inside `n.{1,3}t`                     FILLER a wildcard consumes
+        #   *  between two adjacent flags            a BOUNDARY separating two
+        #
+        # -- so any single delete-or-keep rule is wrong about at least one of
+        # them, whichever way it is written. That is not a defect in a rule; it
+        # is a refutation of rules of that shape, and it is the fourth
+        # recurrence of the class #66 names in its own title.
+        #
+        # So counting does not normalise at all. It reads the raw text, and the
+        # spellings that would make the count ambiguous are REFUSED below --
+        # the move that closed the path class in #65: enumerate what is
+        # accepted, refuse the rest, canonicalise nothing.
+        #
+        # ⚠ AND `tr`'S STATUS IS READ. `exit "${PIPESTATUS[0]}"` carried grep's
+        # status out and dropped the rest of the pipeline: a `tr` killed after
+        # grep had produced matches handed back TRUNCATED output with a status
+        # of success, and a tally that still equalled the baseline passed on
+        # data it never fully read. The round-2 fix for the sibling defect
+        # landed on the instance; this is the class.
+        lane_b_count_pass() {  # $1 = grep flags, $2 = pattern, $3 = file
+          local lane_b_ps
+          grep "$1" -aon -- "$2" "$3" 2>/dev/null | tr -d '\000'
+          lane_b_ps=("${PIPESTATUS[@]}")
+          if [ "${lane_b_ps[1]}" -ne 0 ]; then return 2; fi
+          return "${lane_b_ps[0]}"
+        }
         set +e
-        lane_b_occ_1="$(grep -aonE -- "$PATTERNS" "$scan_src" 2>/dev/null | tr -d '\000'; exit "${PIPESTATUS[0]}")"
+        lane_b_occ_1="$(lane_b_count_pass -E "$PATTERNS" "$scan_src")"
         lane_b_st_1=$?
-        lane_b_occ_2="$(grep -aonE -- "$PATTERNS" "$strip_blob" 2>/dev/null | tr -d '\000'; exit "${PIPESTATUS[0]}")"
+        lane_b_occ_2="$(lane_b_count_pass -iE "$ROSTER_RE" "$scan_src")"
         lane_b_st_2=$?
-        lane_b_occ_3="$(grep -aoniE -- "$ROSTER_RE" "$scan_src" 2>/dev/null | tr -d '\000'; exit "${PIPESTATUS[0]}")"
+        lane_b_chk_1="$(lane_b_count_pass -E "$PATTERNS" "$strip_blob")"
         lane_b_st_3=$?
-        lane_b_occ_4="$(grep -aoniE -- "$ROSTER_RE" "$strip_blob" 2>/dev/null | tr -d '\000'; exit "${PIPESTATUS[0]}")"
+        lane_b_chk_2="$(lane_b_count_pass -iE "$ROSTER_RE" "$strip_blob")"
         lane_b_st_4=$?
         set -e
         for st in "$lane_b_st_1" "$lane_b_st_2" "$lane_b_st_3" "$lane_b_st_4"; do
@@ -1622,15 +1673,92 @@ scan_tree() {
             exit 2
           fi
         done
+        # ⚠ THE ACCEPTED SPELLINGS, AND A REFUSAL FOR THE REST. Counting on the
+        # raw text is exact exactly when the raw and marker-free readings of a
+        # line agree. Where they disagree, a marker is participating in a match
+        # -- splitting an identifier, being eaten by a wildcard, or separating
+        # two occurrences -- and there is no reading of that line the tally can
+        # defend. So the gate stops instead of picking one.
+        #
+        # This compares; it does not canonicalise. Markers are deleted from the
+        # raw matches ONLY to put the two readings in the same alphabet for the
+        # comparison, and the result is never counted -- which is the whole
+        # difference between this and the three policies that failed.
+        #
+        # Measured before choosing it: on this tree, 11 lane B files carry
+        # matches and 0 disagree, so the refusal is satisfiable today with
+        # nothing grandfathered.
+        #
+        # ⚠ ITS PRICE, STATED. A line where the two readings differ becomes
+        # unwritable in Go source -- including innocent ones, such as an
+        # environment-flag name in a doc comment, which the raw pass matches and
+        # the marker-free pass does not. Zero such lines exist today. The trade
+        # is deliberate: a refusal is visible and strict, and the alternative on
+        # offer was a tally that silently undercounts, which is the direction a
+        # ratchet must never err in.
+        # ⚠ `|| true` HERE WOULD HIDE THE FAILURE OF THE COMPARISON ITSELF, and
+        # this whole refusal is the comparison. I wrote one, to absorb `grep -v`
+        # exiting 1 when every line is filtered out -- which is "nothing
+        # matched", not an error -- and in absorbing it swallowed `tr` and
+        # `sort` as well. Measured: with a `tr` that fails, both sides come back
+        # empty, compare EQUAL, and the refusal does not fire on a file that
+        # must be refused.
+        #
+        # That is the swallowed-status class this same unit fixed two commits
+        # earlier in the counting passes, reappearing in the code written to fix
+        # it. So each stage is read separately: grep may say 1, nothing else may
+        # say anything but 0.
+        lane_b_compare() {  # $1 $2 = pass outputs -> the comparable form
+          local ps
+          printf '%s\n' "$1" "$2" | grep -v '^$' | tr -d '*_`~\\' | sort
+          ps=("${PIPESTATUS[@]}")
+          [ "${ps[0]}" -eq 0 ] || return 2
+          [ "${ps[1]}" -le 1 ] || return 2
+          [ "${ps[2]}" -eq 0 ] || return 2
+          [ "${ps[3]}" -eq 0 ] || return 2
+          return 0
+        }
+        set +e
+        lane_b_seen_raw="$(lane_b_compare "$lane_b_occ_1" "$lane_b_occ_2")"
+        lane_b_cmp_st_1=$?
+        lane_b_seen_strip="$(lane_b_compare "$lane_b_chk_1" "$lane_b_chk_2")"
+        lane_b_cmp_st_2=$?
+        set -e
+        if [ "$lane_b_cmp_st_1" -ne 0 ] || [ "$lane_b_cmp_st_2" -ne 0 ]; then
+          # refusal:structural
+          echo "REFUSING: could not compare the two readings of '$f'." >&2
+          echo "  The comparison IS the refusal below, so a comparison that did" >&2
+          echo "  not complete cannot be read as agreement -- two empty results" >&2
+          echo "  are equal, and equality here means 'nothing to refuse'." >&2
+          exit 2
+        fi
+        if [ "$lane_b_seen_raw" != "$lane_b_seen_strip" ]; then
+          # refusal:structural
+          echo "REFUSING: '$f' is spelled so that its occurrences cannot be counted." >&2
+          echo "  The raw text and the marker-free reading of it disagree about" >&2
+          echo "  what matches, which means an emphasis or quoting marker is part" >&2
+          echo "  of a match -- splitting an identifier, being consumed by a" >&2
+          echo "  wildcard, or separating two occurrences. There is no count this" >&2
+          echo "  gate could defend, so it refuses rather than choose one." >&2
+          echo "  Write the identifier without a marker inside it." >&2
+          exit 2
+        fi
         scan_lane_b_this_file="$(
-          for pass in 1 2 3 4; do
+          for pass in 1 2; do
             eval "printf '%s\n' \"\$lane_b_occ_$pass\"" | sed "s/^/$pass:/"
           done | awk -F: '
             NF > 2 {
               pass = $1; n = $2
               m = substr($0, index($0, ":") + 1)
               m = substr(m, index(m, ":") + 1)
-              gsub(/[*_`~\\]/, "", m)
+              # ⚠ NO SECOND CLEANING HERE. This used to gsub the marker set out
+              # of the captured match, which was the OTHER approximation: the
+              # text arrived from one copy and was cleaned by a different rule,
+              # and the two disagreeing is the whole defect. The text now comes
+              # from the counting normal form already, so cleaning it again
+              # would only re-introduce a disagreement -- and would strip the
+              # underscores that normal form deliberately keeps, collapsing two
+              # distinct identifiers on one line into one key.
               if (m != "") seen[pass SUBSEP n ":" m]++
             }
             END {
@@ -2339,12 +2467,49 @@ EOF
   fixture_checks=$((fixture_checks + 1))
   [ "$(printf '%s' "$scan_lane_b_counts" | awk '{n += $1} END {print n + 0}')" -eq "$scan_lane_b_lines" ] || {
     echo "SELFTEST: the per-file tally does not sum to the lane B line count" >&2; fixture_fail=1; }
+  # ⚠ THE AMBIGUOUS SPELLING IS REFUSED, AND IT NEEDS ITS OWN TREE. A refusal
+  # ends the run it happens in, so this fixture cannot sit beside the ones whose
+  # results are read afterwards -- the same reason the NUL and character-
+  # reference fixtures each get a tree of their own.
+  #
+  # It carries an emphasis-split identifier next to an underscore identifier:
+  # `ADR-[]000**00**` reads as `ADR-[]000` raw and `ADR-[]00000` marker-free,
+  # and no reading of that line is defensible. Under the counting policies this
+  # unit tried before, the same file tallied 3, then 2, and both were guesses.
+  splitid_tmp="$(mktemp -d)"
+  (
+    cd "$splitid_tmp"
+    git init -q .
+    git config user.email t@t; git config user.name t
+    printf '%s\n' "$FIXTURE_SPLITID_BODY" > "$FIXTURE_SPLITID_NAME"
+    git add -A >/dev/null 2>&1
+  )
+  splitid_status=0
+  ( GATE_TMPFILES=(); trap 'gate_rc=$?; rm -f ${GATE_TMPFILES[@]+"${GATE_TMPFILES[@]}"}; exit "$gate_rc"' EXIT
+    scan_tree "$splitid_tmp" ) >/dev/null 2>&1 || splitid_status=$?
+  fixture_checks=$((fixture_checks + 1))
+  [ "$splitid_status" -eq 2 ] || {
+    echo "SELFTEST: the ambiguous spelling was not refused (status $splitid_status)" >&2
+    fixture_fail=1; }
+  rm -rf "$splitid_tmp"
   # ⚠ A COUNT THAT MUST BE REACHED. Every assertion above is invisible when it
   # is deleted, and a run that asserts nothing prints the same closing line as
-  # a run that asserted everything. The floor moves up when assertions are
-  # added and refuses when they go.
-  [ "$fixture_checks" -ge 17 ] || {
-    echo "SELFTEST: only $fixture_checks scan assertion(s) ran, expected at least 17" >&2
+  # a run that asserted everything.
+  #
+  # ⚠ EQUALITY, NOT A FLOOR, AND THE FLOOR PROVED THE POINT ON ITS OWN. It read
+  # `-ge 17` while eighteen assertions ran: this unit added one and left the
+  # bound alone, so any single assertion -- including the one just added --
+  # could be deleted and the remaining seventeen would still satisfy it. A floor
+  # accepts a stale count by construction, which is the silently-lost-check
+  # failure this guard exists to detect, reproduced inside the detector.
+  #
+  # The control harness one file over already settled this shape for its own
+  # count, for the same reason and in the same words. Equality forces the number
+  # to move when an assertion is added, so a later removal cannot hide behind a
+  # bound nobody updated.
+  FIXTURE_CHECKS_EXPECTED=18
+  [ "$fixture_checks" -eq "$FIXTURE_CHECKS_EXPECTED" ] || {
+    echo "SELFTEST: $fixture_checks scan assertion(s) ran, expected exactly $FIXTURE_CHECKS_EXPECTED" >&2
     fixture_fail=1; }
   if [ "$fixture_fail" -ne 0 ]; then
     # refusal:structural
