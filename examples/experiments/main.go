@@ -172,8 +172,18 @@ func (e *exchange) trailerReport() string {
 			// list of values this program supplied can reach, so it was published
 			// verbatim (shardpilot/shardpilot-go#73 review). Same dispatch as the
 			// header block, same order: structural first, supplied-value second.
-			line := structuralRedact(scrubHeaderName(escapeMarks(k)) + ": " + escapeMarks(v))
-			fmt.Fprintf(&b, "    %s\n", asCaptured(scrubSupplied(line)))
+			// ⚠ DISPATCH BEFORE SCRUBBING THE NAME, which is the documented
+			// structural-first order this composition had reversed. With
+			// `cookie` supplied, scrubHeaderName turned `Set-Cookie` into
+			// `Set-redacted-6-chars` FIRST, structuralRedact no longer recognised
+			// the field, and the server-generated cookie value was published --
+			// the same bypass for a supplied `location`
+			// (shardpilot/shardpilot-go#73 review).
+			red := structuralRedact(escapeMarks(k) + ": " + escapeMarks(v))
+			if i := strings.IndexByte(red, ':'); i > 0 {
+				red = scrubHeaderName(red[:i]) + red[i:]
+			}
+			fmt.Fprintf(&b, "    %s\n", asCaptured(scrubSupplied(red)))
 		}
 	}
 	b.WriteString("\n")
@@ -507,20 +517,55 @@ func redactSetCookie(line string) string {
 // server-generated value was published AND the recorded JSON was left
 // unbalanced (shardpilot/shardpilot-go#73 review). A JSON string ends at the
 // first UNESCAPED quote, which is what this now says.
-var mintedBodyKeys = regexp.MustCompile(
-	`"(subject_fact_key|subject_key_hash)"(\s*:\s*)"((?:[^"\\]|\\.)*)"`)
+var jsonMember = regexp.MustCompile(
+	`"((?:[^"\\]|\\.)*)"(\s*:\s*)"((?:[^"\\]|\\.)*)"`)
+
+// mintedNames are the fields the SERVER mints -- the fact lane's subject and its
+// privacy boundary, defined as such in experiments.go. Being server-minted, they
+// are exactly what a scrub built from supplied values cannot see
+// (shardpilot/shardpilot-go#73 review).
+var mintedNames = map[string]bool{
+	"subject_fact_key": true,
+	"subject_key_hash": true,
+}
+
+// jsonString decodes a JSON string body -- the bytes BETWEEN the quotes -- to
+// what it denotes. `json.Unmarshal` is the same decoder that produced the
+// response, so no second spelling of the grammar can drift from it.
+func jsonString(raw string) (string, bool) {
+	var out string
+	if err := json.Unmarshal([]byte(`"`+raw+`"`), &out); err != nil {
+		return "", false
+	}
+	return out, true
+}
 
 // redactMintedBody replaces server-minted identifiers in a JSON body with a
 // length-preserving placeholder, structurally -- by FIELD NAME, the only handle
 // that exists when the value itself is unknown to this program.
 func redactMintedBody(body string) string {
-	return mintedBodyKeys.ReplaceAllStringFunc(body, func(m string) string {
-		g := mintedBodyKeys.FindStringSubmatch(m)
-		// ⚠ NO OUTER `marked`: placeholder ALREADY returns one. Wrapping it made
-		// adjacent nested provenance marks, `overCaptured` then read the
-		// placeholder itself as captured text and rewrote it, and the output was
-		// `<<redacted, 8 chars>, 21 chars>` (shardpilot/shardpilot-go#73 review).
-		return `"` + g[1] + `"` + g[2] + `"` + placeholder(g[3]) + `"`
+	// ⚠ THE MEMBER NAME IS MATCHED BY WHAT IT DENOTES, NOT BY ONE SPELLING OF IT.
+	// A response may escape any character in a name -- `"subject\u005ffact_key"`
+	// is the same field -- and a pattern requiring the literal form published the
+	// server-minted value unchanged. Only the VALUE grammar had been made
+	// escape-aware (shardpilot/shardpilot-go#73 review). Every member is decoded
+	// and compared to the set, so no spelling can hide one.
+	//
+	// ⚠ NO OUTER `marked`: placeholder ALREADY returns one. Wrapping it made
+	// adjacent nested provenance marks, `overCaptured` then read the placeholder
+	// itself as captured text and rewrote it, and the output was
+	// `<<redacted, 8 chars>, 21 chars>` (shardpilot/shardpilot-go#73 review).
+	return jsonMember.ReplaceAllStringFunc(body, func(m string) string {
+		g := jsonMember.FindStringSubmatch(m)
+		name, ok := jsonString(g[1])
+		if !ok || !mintedNames[name] {
+			return m
+		}
+		val, ok := jsonString(g[3])
+		if !ok {
+			val = g[3]
+		}
+		return `"` + g[1] + `"` + g[2] + `"` + placeholder(val) + `"`
 	})
 }
 
@@ -529,7 +574,12 @@ func redactMintedBody(body string) string {
 // test carrying its own copy of the sentence would pass while the report says
 // something else (shardpilot/shardpilot-go#73 review).
 const respSection = "## Response%s — header block re-serialised by " +
-	"`httputil.DumpResponse`\n\nThe status line is as received. The BODY is " +
+	"`httputil.DumpResponse`\n\nThe status line is a CANONICAL " +
+	"REPRESENTATION, not received bytes: `DumpResponse` calls " +
+	"`http.Response.Write`, which re-serialises the protocol, code, spacing and " +
+	"reason from parsed fields — and on HTTP/2, which is what production " +
+	"negotiates, no textual status line is received at all. It is labelled the " +
+	"same way the request line is, for the same reason. The BODY is " +
 	"the received bytes with supplied values and server-minted subject keys " +
 	"replaced by their lengths, and the two reserved marker bytes written as " +
 	"`\\x00` and `\\x01` — a pre-existing spelling of either carries one extra " +

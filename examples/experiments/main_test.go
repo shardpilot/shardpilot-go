@@ -903,3 +903,45 @@ func TestStatusLineIsNotRewrittenByTheValueScrub(t *testing.T) {
 		t.Fatalf("the BODY occurrence was left unredacted: %q", got)
 	}
 }
+
+// ---- round on 51eeaaf: three findings ----
+
+func TestMintedKeyIsFoundThroughAnEscapedMemberName(t *testing.T) {
+	suppliedValues = nil
+	t.Cleanup(func() { suppliedValues = nil })
+	// `\u005f` IS `_`: the same field, a different spelling of its NAME. The
+	// first version of this fixture wrote the plain name and therefore tested
+	// what was already passing -- the mutant survived and said so.
+	body := "HTTP/1.1 200 OK\r\n\r\n" + `{"subject\u005ffact_key":"sfk1_abababababababab"}`
+	got := stripMarks(dropFraming(body))
+	if strings.Contains(got, "sfk1_abababababababab") {
+		t.Fatalf("an escaped member name hid a minted key: %q", got)
+	}
+}
+
+func TestReportDoesNotClaimTheStatusLineIsReceived(t *testing.T) {
+	if strings.Contains(respSection, "status line is as received") {
+		t.Fatal("the status line is synthesised by Response.Write; the report claims otherwise")
+	}
+	if !strings.Contains(respSection, "CANONICAL") {
+		t.Fatal("the report does not label the status line as a representation")
+	}
+}
+
+func TestTrailerDispatchesOnTheOriginalFieldName(t *testing.T) {
+	for _, v := range []string{"cookie", "location"} {
+		suppliedValues = []string{v}
+		tee := &teeBody{trailer: http.Header{
+			"Set-Cookie": []string{"sid=server-secret"},
+			"Location":   []string{"/cb?state=server-state"},
+		}}
+		e := exchange{head: []byte("x"), captured: tee}
+		got := stripMarks(e.trailerReport())
+		for _, leak := range []string{"server-secret", "server-state"} {
+			if strings.Contains(got, leak) {
+				t.Errorf("supplied %q made the name scrub bypass structural redaction, publishing %q: %q", v, leak, got)
+			}
+		}
+		suppliedValues = nil
+	}
+}
