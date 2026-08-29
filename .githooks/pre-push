@@ -71,6 +71,21 @@ set -euo pipefail
 # See the note above: every read below must see the objects a push transfers.
 export GIT_NO_REPLACE_OBJECTS=1
 
+# ⚠ AND THE CALLER'S ALTERNATE INDEX MUST NOT LEAK IN. `git push` invoked with
+# GIT_INDEX_FILE set passes it to this hook, and every `git add` below -- plus
+# the scanner's own fixture repositories -- would then read and MUTATE that
+# index instead of the worktree's private one, which is exactly the collision
+# this design exists to avoid (shardpilot/shardpilot-go#79 review).
+unset GIT_INDEX_FILE
+
+# ⚠ NOTHING FROM THE PUSHED BRANCH MAY RUN. `git worktree add` fires
+# post-checkout, and with the documented core.hooksPath=.githooks that hook is
+# TRACKED CONTENT -- so a branch from an untrusted contributor would execute
+# arbitrary code on this machine merely by being inspected, before any scan.
+# Every git command below runs with hooks pointed at an empty directory.
+hooks_off="$(mktemp -d)"
+git_safe() { git -c core.hooksPath="$hooks_off" "$@"; }
+
 root="$(git rev-parse --show-toplevel)"
 scanner="$root/scripts/check_public_surface.sh"
 [ -x "$scanner" ] || { printf 'pre-push: %s is missing or not executable\n' "$scanner" >&2; exit 1; }
@@ -81,7 +96,12 @@ remote_name="${1:-origin}"
 dest="${2:-$remote_name}"
 
 tmpdir="$(mktemp -d)"
-cleanup() { git worktree remove --force "$tmpdir/wt" >/dev/null 2>&1 || true; rm -rf "$tmpdir"; git worktree prune >/dev/null 2>&1 || true; git update-ref -d refs/prepush-base 2>/dev/null || true; }
+cleanup() {
+  git_safe worktree remove --force "$tmpdir/wt" >/dev/null 2>&1 || true
+  rm -rf "$tmpdir" "$hooks_off"
+  git_safe worktree prune >/dev/null 2>&1 || true
+  git update-ref -d refs/prepush-base 2>/dev/null || true
+}
 trap cleanup EXIT
 
 head_sha="$(git rev-parse HEAD)"
@@ -109,19 +129,44 @@ status=0
 scan_commit() {
   wt="$tmpdir/wt"
   rm -rf "$wt"
-  if ! git worktree add --detach --quiet "$wt" "$1" 2>/dev/null; then
+  if ! git_safe worktree add --detach --quiet "$wt" "$1" 2>/dev/null; then
     printf 'REFUSING: could not create a worktree at %s to scan it.\n' "$1" >&2
     exit 2
   fi
-  if [ ! -e "$wt/scripts/check_public_surface.sh" ]; then
-    mkdir -p "$wt/scripts"
+
+  # ⚠ THE COMMIT CONTROLS THIS PATH. A commit that replaces `scripts` with a
+  # symlink would make the copy below follow it and overwrite a file OUTSIDE
+  # the worktree -- the inspected branch editing the machine that inspects it
+  # (shardpilot/shardpilot-go#79 review). Refuse anything that is not a real
+  # directory rather than repairing it: a tree shaped to escape is a finding,
+  # not a formatting problem.
+  if [ -L "$wt/scripts" ] || { [ -e "$wt/scripts" ] && [ ! -d "$wt/scripts" ]; }; then
+    printf 'REFUSING: in %s, `scripts` is not a real directory.\n' "$1" >&2
+    printf '  A commit that shapes it as a symlink or a file would redirect this\n' >&2
+    printf '  gate writes outside the worktree it is inspecting.\n' >&2
+    exit 2
+  fi
+  if [ -L "$wt/scripts/check_public_surface.sh" ]; then
+    printf 'REFUSING: in %s, the scanner path is a symlink.\n' "$1" >&2
+    exit 2
+  fi
+  mkdir -p "$wt/scripts"
+
+  # ⚠ AND THE COMMIT'S OWN SCANNER IS EVIDENCE, NOT SCAFFOLDING. Overwriting it
+  # with today's copy hid it: the scanner excludes its own path from the tree
+  # pass and self-audits the staged replacement, so material added to THAT file
+  # in THAT commit would never be examined and would publish anyway. It is moved
+  # to a plain tracked path first, where it is read like any other file.
+  if [ -e "$wt/scripts/check_public_surface.sh" ]; then
+    mv "$wt/scripts/check_public_surface.sh" "$wt/scripts/scanner-as-committed.txt"
+    ( cd "$wt" && git_safe add scripts/scanner-as-committed.txt >/dev/null 2>&1 ) || true
   fi
   cp "$scanner" "$wt/scripts/check_public_surface.sh"
   chmod +x "$wt/scripts/check_public_surface.sh"
-  ( cd "$wt" && git add scripts/check_public_surface.sh >/dev/null 2>&1 ) || true
+  ( cd "$wt" && git_safe add scripts/check_public_surface.sh >/dev/null 2>&1 ) || true
   ( cd "$wt" && PUBLIC_SURFACE_BASE_REF="$2" ./scripts/check_public_surface.sh )
   rc=$?
-  git worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
+  git_safe worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
   return $rc
 }
 
@@ -166,7 +211,18 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         printf 'REFUSING: could not fetch %s from %s to compare against.\n' "$branch" "$dest" >&2
         exit 2
       fi
-      base=refs/prepush-base
+      # ⚠ RESOLVED TO A SHA IMMEDIATELY, and the ref dropped. Two concurrent
+      # created-ref pushes from this repository would otherwise both fetch into
+      # the same `refs/prepush-base`, and one could overwrite it between the
+      # other's assignment and its scan -- comparing against another
+      # destination's baseline (shardpilot/shardpilot-go#79 review). A SHA
+      # cannot be overwritten.
+      base="$(git rev-parse --verify --quiet refs/prepush-base^{commit} || true)"
+      git update-ref -d refs/prepush-base 2>/dev/null || true
+      if [ -z "$base" ]; then
+        printf 'REFUSING: fetched %s from %s but it did not resolve.\n' "$branch" "$dest" >&2
+        exit 2
+      fi
       why="the default branch of the destination, ${branch}, because this push CREATES ${remote_ref:-the ref}"
       ;;
   esac
@@ -203,10 +259,17 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     scan_commit "$c" "$base" || status=$?
   done <<< "$commits"
   if [ -n "$skipped" ]; then
-    printf '\n⚠ NOT SCANNED, and they WILL be published by this push:%s\n' "$skipped" >&2
-    printf '  The budget is %s commits (PUBLIC_SURFACE_MAX_COMMITS). Raise it and\n' "$budget" >&2
-    printf '  push again to cover them, or push in smaller steps. This gate does\n' >&2
-    printf '  not claim they are clean -- it claims it did not look.\n' >&2
+    # ⚠ REFUSING, NOT WARNING. The first version printed this and exited 0,
+    # which is a gate passing what it did not look at -- and precisely the
+    # earlier-add/later-remove leak this hook exists to stop
+    # (shardpilot/shardpilot-go#79 review). A disclosed hole is still a hole.
+    printf '\nREFUSING: these commits were NOT scanned and this push would\n' >&2
+    printf '  publish them:%s\n' "$skipped" >&2
+    printf '  The budget is %s commits (PUBLIC_SURFACE_MAX_COMMITS), and one scan\n' "$budget" >&2
+    printf '  is a full pass over the tree. Raise the budget and push again, or\n' >&2
+    printf '  push in smaller steps. This gate does not report on what it has not\n' >&2
+    printf '  read.\n' >&2
+    exit 2
   fi
 done
 
