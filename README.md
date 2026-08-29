@@ -311,14 +311,28 @@ No Makefile — standard Go tooling.
 **Install the pre-push hook once, before your first push:**
 
 ```
-h="$(git rev-parse --git-common-dir)/hooks"
-cp .githooks/pre-push "$h/pre-push"
-cp scripts/check_public_surface.sh "$h/"
-chmod +x "$h/pre-push" "$h/check_public_surface.sh"
+h="$(cd "$(git rev-parse --git-common-dir)" && pwd)/hooks"
+cp .githooks/pre-push "$h/.pre-push.new"
+cp scripts/check_public_surface.sh "$h/.check_public_surface.sh.new"
+chmod +x "$h/.pre-push.new" "$h/.check_public_surface.sh.new"
+mv "$h/.pre-push.new" "$h/pre-push"
+mv "$h/.check_public_surface.sh.new" "$h/check_public_surface.sh"
 git config --local core.hooksPath "$h"
 ```
 
-**Both files**, `--git-common-dir` rather than `--git-dir`, and `core.hooksPath` **pinned locally** rather than unset. Everything the hook executes must come from outside tracked content — the scanner as much as the hook. `--git-dir` names the per-worktree directory in a linked worktree while git reads hooks from the common one. And an unqualified `--unset` cannot clear a *global* or *system* `core.hooksPath`: with one inherited, git keeps resolving hooks from there and the gate is never invoked. A local setting overrides an inherited one. in a linked worktree the latter names `.git/worktrees/<name>`, while git reads hooks from the common directory — an install built on it puts the hook where git never looks, so the gate is absent while appearing installed. Everything the hook executes has to come from outside tracked content — the scanner as much as the hook — or a branch you are inspecting supplies its own checker.
+**Both files**, an ABSOLUTE path, published by RENAME, and `core.hooksPath` **pinned locally** rather than unset. Everything the hook executes must come from outside tracked content — the scanner as much as the hook. `--git-dir` names the per-worktree directory in a linked worktree while git reads hooks from the common one. And an unqualified `--unset` cannot clear a *global* or *system* `core.hooksPath`: with one inherited, git keeps resolving hooks from there and the gate is never invoked. A local setting overrides an inherited one.
+
+Two more things that look like fussiness and are not. `--git-common-dir` answers
+`.git` in the main worktree, and git resolves a RELATIVE `core.hooksPath` against
+the directory the hook runs in — so storing that relative value makes a linked
+worktree look for hooks under a path where `.git` is a *file*, and the hook is
+never executed while every push reports success. `cd … && pwd` stores the
+absolute path instead. And each file is copied to a temporary name and moved into
+place: `cp` truncates its destination first, so re-copying while a push is
+running can hand git an empty hook — which is executable, exits 0, and scans
+nothing. A rename is atomic, so no partial state is ever observable. The hook
+also refuses a zero-byte scanner, because a gate should not depend on the install
+being followed. in a linked worktree the latter names `.git/worktrees/<name>`, while git reads hooks from the common directory — an install built on it puts the hook where git never looks, so the gate is absent while appearing installed. Everything the hook executes has to come from outside tracked content — the scanner as much as the hook — or a branch you are inspecting supplies its own checker.
 
 Copied rather than `core.hooksPath .githooks`: that setting names a directory, so pointing it at tracked content makes the hook that runs whatever the checked-out branch says it is — checking out someone else's branch and pushing it would execute their copy of the hook first. `.git/hooks/` is outside the worktree and no branch can write to it. Re-copy when the file changes.
 

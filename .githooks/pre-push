@@ -136,10 +136,22 @@ tracked_scanner="$root/scripts/check_public_surface.sh"
 # `git -c core.hooksPath=.githooks rev-parse --git-path hooks` prints `.githooks`,
 # while `--git-common-dir` prints the real one either way. Asking the authority
 # was right; asking the resolver the USER can relocate was not.
-hooks_dir="$(git rev-parse --git-common-dir)/hooks"
+# ⚠ ABSOLUTE. `--git-common-dir` answers `.git` in the MAIN worktree, and git
+# resolves a RELATIVE core.hooksPath against the directory the hook runs in -- so
+# a `.git/hooks` stored by the install resolves, inside a linked worktree, to a
+# path where `.git` is a FILE, and the hook is never executed
+# (shardpilot/shardpilot-go#79 review). Measured: main worktree `.git`, linked
+# worktree an absolute path; the recovery hint printed the relative one too.
+hooks_dir="$(cd "$(git rev-parse --git-common-dir)" 2>/dev/null && pwd)/hooks"
 scanner="$hooks_dir/check_public_surface.sh"
-if [ ! -x "$scanner" ]; then
-  printf 'REFUSING: no trusted scanner at %s.\n' "$scanner" >&2
+if [ ! -x "$scanner" ] || [ ! -s "$scanner" ]; then
+  # ⚠ `-s` AS WELL AS `-x`. A re-copy that lands while a push is running leaves
+  # the destination truncated for an instant, and an empty scanner is executable
+  # and exits 0 -- a gate that reports clean because there was nothing to run
+  # (shardpilot/shardpilot-go#79 review). The install now publishes each file by
+  # rename, so no truncated state is observable at all; this is the second half,
+  # here because a gate should not depend on the install being followed.
+  printf 'REFUSING: no usable trusted scanner at %s.\n' "$scanner" >&2
   printf '  Install it beside the hook, from a checkout you trust:\n' >&2
   # ⚠ THE HINT MUST NAME THE DIRECTORY THE CHECK USES. It printed `--git-dir`
   # while the lookup above searches `--git-common-dir`, so in a linked worktree
@@ -380,10 +392,20 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # push because one of its tags pointed at the first of two commits
   # (shardpilot/shardpilot-go#79 review). A tag target that HEAD contains is
   # scannable from this checkout, which is all the eligibility test is for.
+  # ⚠ THE REF SAYS WHETHER IT IS A TAG; THE OBJECT TYPE DOES NOT. Requiring
+  # `peeled != local_sha` accepted only ANNOTATED ancestor tags, because a
+  # LIGHTWEIGHT tag points straight at the commit and peels to itself -- so
+  # `git push origin tag v1` for a tag on an earlier commit was refused, though
+  # its target is exactly as scannable (shardpilot/shardpilot-go#79 review).
+  case "$local_ref" in
+    refs/tags/*) is_tag=yes ;;
+    *) is_tag=no ;;
+  esac
   eligible=no
   if [ "$peeled" = "$head_sha" ]; then
     eligible=yes
-  elif [ "$peeled" != "$local_sha" ] && git merge-base --is-ancestor "$peeled" "$head_sha" 2>/dev/null; then
+  elif { [ "$peeled" != "$local_sha" ] || [ "$is_tag" = yes ]; } &&
+       git merge-base --is-ancestor "$peeled" "$head_sha" 2>/dev/null; then
     eligible=yes
   fi
   if [ "$eligible" = no ]; then
@@ -469,7 +491,14 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # this push -- slow, and it charges one push for another's content
   # (shardpilot/shardpilot-go#79 review). Every other ref the destination
   # advertises is excluded.
-  published="$(git ls-remote --heads --tags -- "$dest" 2>/dev/null | awk '{print $1}')"
+  # ⚠ EVERY ADVERTISED REF, NOT ONLY HEADS AND TAGS. `--heads --tags` limits the
+  # query to those two namespaces, and this repository's own .gitleaksignore
+  # records that `refs/pull/*/head` is advertised public history -- so a commit
+  # published only through a pull ref was counted as newly introduced, and
+  # creating a branch at it could be refused by the commit budget or the lane-B
+  # ratchet for republishing what is already public
+  # (shardpilot/shardpilot-go#79 review).
+  published="$(git ls-remote -- "$dest" 2>/dev/null | awk '{print $1}')"
   excl=""
   for p in $published; do
     # ⚠ THE PUSHED SHA IS NOT AN EXCEPTION -- IT IS THE EVIDENCE. Creating a ref
