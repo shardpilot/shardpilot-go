@@ -171,9 +171,11 @@ func TestGuardDecodesNestedPercentEscapes(t *testing.T) {
 func TestGuardIgnoresItsOwnPlaceholders(t *testing.T) {
 	suppliedValues = []string{"redacted"}
 	t.Cleanup(func() { suppliedValues = nil })
-	// scrubSupplied writes redacted-8-chars where the value stood; the guard
-	// must not find the value inside the recorder's own placeholder.
-	report := "GET /x?experiment_key=redacted-8-chars HTTP/1.1\n\n<redacted, 8 chars>\n"
+	// Built by the REAL generators, not by hand: a placeholder is distinguished
+	// from captured text by provenance now, so a hand-written copy of one would
+	// be testing the wrong thing.
+	report := redactQuery("GET /x?experiment_key=redacted HTTP/1.1") +
+		"\n" + scrubSupplied("echoed: redacted")
 	if err := assertNoLeak(report); err != nil {
 		t.Fatalf("the guard rejected a fully redacted report: %v", err)
 	}
@@ -381,6 +383,52 @@ func TestQueryLengthIsTheValueNotItsWireSpelling(t *testing.T) {
 	got := redactQuery(`GET /x?experiment_key=a%22b HTTP/1.1`)
 	if !strings.Contains(got, "redacted-3-chars") {
 		t.Fatalf("the encoded length was reported instead of the value's: %q", got)
+	}
+}
+
+func TestAValueShapedLikeAPlaceholderStillPublishes(t *testing.T) {
+	// The mirror of the collision case: a legal key that looks like a placeholder
+	// must neither be swallowed by the mask NOR make every real placeholder read
+	// as a leak. Both directions in one fixture.
+	suppliedValues = []string{"redacted-38-chars"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak("GET /x?experiment_key=redacted-38-chars HTTP/1.1"); err == nil {
+		t.Fatal("the mask swallowed the value it was protecting")
+	}
+	clean := redactQuery("GET /x?subject_key=0123456789abcdef0123456789abcdef012345 HTTP/1.1")
+	if err := assertNoLeak(clean); err != nil {
+		t.Fatalf("a generated placeholder was read as a leak: %v", err)
+	}
+}
+
+func TestLongestSuppliedValueWins(t *testing.T) {
+	suppliedValues = []string{"abcdefgh", "abcdefghi"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := scrubSupplied("echoed abcdefghi here")
+	if strings.Contains(got, "i here") && strings.Contains(got, "8 chars") {
+		t.Fatalf("the shorter value destroyed the longer match: %q", got)
+	}
+	if !strings.Contains(got, "9 chars") {
+		t.Fatalf("the longer value was not redacted as itself: %q", got)
+	}
+}
+
+func TestFragmentCredentialsAreRedacted(t *testing.T) {
+	suppliedValues = nil
+	t.Cleanup(func() { suppliedValues = nil })
+	got := dropFraming("HTTP/1.1 302 Found\r\nLocation: https://c.example/cb#access_token=secretvalue\r\n\r\n")
+	if strings.Contains(got, "secretvalue") {
+		t.Fatalf("a fragment credential was published: %q", got)
+	}
+	if !strings.Contains(got, "access_token=") {
+		t.Fatalf("structural redaction dropped the parameter name: %q", got)
+	}
+}
+
+func TestQueryLengthCountsCharactersNotBytes(t *testing.T) {
+	got := redactQuery("GET /x?experiment_key=%C3%A9 HTTP/1.1")
+	if !strings.Contains(got, "redacted-1-chars") {
+		t.Fatalf("a one-character value was measured in bytes: %q", got)
 	}
 }
 

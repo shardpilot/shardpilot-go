@@ -56,10 +56,12 @@ import (
 	"os"
 	"regexp"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 	"unicode/utf16"
+	"unicode/utf8"
 
 	shardpilot "github.com/shardpilot/shardpilot-go"
 )
@@ -278,7 +280,26 @@ func headerNameEnd(line string) (int, bool) {
 // (shardpilot/shardpilot-go#73 review, found by mutating rather than by
 // reading). Naming it once removes the copy.
 func responseText(ex *exchange) string {
-	return scrubSupplied(dropFraming(string(ex.resp())))
+	return scrubSupplied(dropFraming(stripNUL(string(ex.resp()))))
+}
+
+// redactFragment applies the query treatment to a URL fragment: parameter names
+// kept, values replaced by their length. A fragment with no `=` is replaced
+// whole, because an opaque fragment is not a name and cannot be shown to be
+// harmless.
+func redactFragment(line string) string {
+	i := strings.IndexByte(line, '#')
+	if i < 0 {
+		return line
+	}
+	head, frag := line[:i+1], line[i+1:]
+	if frag == "" {
+		return line
+	}
+	if !strings.Contains(frag, "=") {
+		return head + marked(fmt.Sprintf("redacted-%d-chars", utf8.RuneCountInString(frag)))
+	}
+	return head + strings.TrimPrefix(redactQuery("X ?"+frag), "X ?")
 }
 
 func redactSetCookie(line string) string {
@@ -296,7 +317,7 @@ func redactSetCookie(line string) string {
 	if !hasValue {
 		return line
 	}
-	out := head + ": " + name + "=" + fmt.Sprintf("<redacted, %d chars>", len(value))
+	out := head + ": " + name + "=" + marked(fmt.Sprintf("<redacted, %d chars>", len(value)))
 	if hasAttrs {
 		out += ";" + attrs
 	}
@@ -330,7 +351,11 @@ func dropFraming(dump string) string {
 		// Set-Cookie (shardpilot/shardpilot-go#73 review). Redacted structurally,
 		// by the same function the request line uses: names kept, values lengthed.
 		if strings.HasPrefix(low, "location:") {
-			out = append(out, redactQuery(strings.TrimSuffix(l, "\r"))+cr)
+			// ⚠ AND THE FRAGMENT, NOT ONLY THE QUERY. An OAuth-style redirect
+			// carries its credential after `#` -- `#access_token=…` never reaches
+			// the server and is exactly the value a capture must not publish, and
+			// `redactQuery` saw only `?` (shardpilot/shardpilot-go#73 review).
+			out = append(out, redactFragment(redactQuery(strings.TrimSuffix(l, "\r")))+cr)
 			continue
 		}
 		// ⚠ AND A HEADER NAME CAN CARRY THE IDENTIFIER. `X-<key>: v` published it
@@ -406,7 +431,7 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 	}
 	if dump, err := httputil.DumpRequestOut(req, true); err == nil {
-		ex.req = redact(dump)
+		ex.req = redact([]byte(stripNUL(string(dump))))
 	}
 
 	resp, err := r.inner.RoundTrip(req)
@@ -553,11 +578,14 @@ func redactQuery(line string) string {
 		// `<redacted, 3 chars>`. Two lengths for one value in one capture is
 		// evidence that contradicts itself (shardpilot/shardpilot-go#73 review).
 		raw := p[eq+1:]
-		n := len(raw)
+		n := utf8.RuneCountInString(raw)
 		if dec, err := url.QueryUnescape(raw); err == nil {
-			n = len(dec)
+			// COUNT CHARACTERS: the placeholder says "chars", and `len` says
+			// bytes -- `%C3%A9` decoded to one character reported as two
+			// (shardpilot/shardpilot-go#73 review).
+			n = utf8.RuneCountInString(dec)
 		}
-		parts[k] = p[:eq+1] + fmt.Sprintf("redacted-%d-chars", n)
+		parts[k] = p[:eq+1] + marked(fmt.Sprintf("redacted-%d-chars", n))
 	}
 	return head + strings.Join(parts, "&") + tail
 }
@@ -653,6 +681,12 @@ func env(name string) string { return strings.TrimSpace(os.Getenv(name)) }
 // request line, error text, and now response body.
 var suppliedValues []string
 
+func longestFirst(vs []string) []string {
+	out := append([]string(nil), vs...)
+	sort.SliceStable(out, func(i, j int) bool { return len(out[i]) > len(out[j]) })
+	return out
+}
+
 func addSuppliedValue(v string) {
 	if v == "" {
 		return
@@ -664,7 +698,13 @@ func addSuppliedValue(v string) {
 }
 
 func scrubSupplied(text string) string {
-	for _, v := range suppliedValues {
+	// ⚠ LONGEST FIRST. With `abcdefgh` supplied before `abcdefghi`, the shorter
+	// value replaced its own prefix inside the longer one, leaving
+	// `<redacted, 8 chars>i` -- a published suffix AND a wrong length, and the
+	// guard no longer recognised what was left (shardpilot/shardpilot-go#73
+	// review). Order is not a detail here: a substitution that destroys a longer
+	// match is unrecoverable by any later pass.
+	for _, v := range longestFirst(suppliedValues) {
 		if v == "" {
 			continue
 		}
@@ -720,17 +760,31 @@ func encodingsOf(v string) []string {
 // \uXXXX escapes undone -- and every supplied value must be absent from every
 // decoded form. An encoding nobody anticipated does not leak; it makes this
 // program refuse to emit the record at all.
-// placeholderPattern matches the strings THIS PROGRAM writes where a value used
-// to be. They are masked before the leak check, because they are the recorder's
-// prose rather than captured data.
+// mark wraps text this program GENERATED in a byte captured data cannot carry.
 //
-// ⚠ WITHOUT THIS THE GUARD REJECTED FULLY REDACTED REPORTS. A supplied value of
-// `redacted` is replaced in the request line by `redacted-8-chars`, and the
-// long-value branch then found `redacted` inside the recorder's OWN placeholder
-// and exited 4 without publishing anything -- the same self-detection as the
-// short-key case, arriving through the other branch
-// (shardpilot/shardpilot-go#73 review).
-var placeholderPattern = regexp.MustCompile(`redacted-[0-9]+-chars|<redacted, [0-9]+ chars>`)
+// ⚠ TELLING GENERATED FROM CAPTURED IS THE WHOLE PROBLEM, and two rounds tried
+// to solve it by SHAPE. First the leak check masked everything matching a
+// placeholder pattern -- and swallowed a supplied value that legally looked like
+// one. Then masking was disabled whenever any supplied value looked like a
+// placeholder -- so every generated placeholder became a "leak" and a run with
+// `SP_EXPERIMENT_KEY=redacted-38-chars` exited 4 without publishing anything
+// (shardpilot/shardpilot-go#73 review, once in each direction).
+//
+// Shape cannot answer it: a placeholder and a value that resembles one are the
+// same string. PROVENANCE can. Every placeholder this program writes is wrapped
+// in NUL, every NUL is stripped from captured text before redaction begins, and
+// the marks are removed at the moment of printing. A NUL in the finished report
+// is therefore ours by construction, and the check ignores exactly what we wrote
+// and nothing else.
+const mark = "\x00"
+
+func marked(s string) string { return mark + s + mark }
+
+var markedSpan = regexp.MustCompile(mark + "[^" + mark + "]*" + mark)
+
+// stripNUL removes the marker byte from anything that came from outside, so a
+// crafted body cannot forge a mark and hide inside it.
+func stripNUL(s string) string { return strings.ReplaceAll(s, mark, "") }
 
 func assertNoLeak(text string) error {
 	// ⚠ MASK ONLY WHAT CANNOT BE A VALUE. Blanking every placeholder shape hid a
@@ -738,16 +792,7 @@ func assertNoLeak(text string) error {
 	// is a legal key, it is printed verbatim in the canonical request, and the
 	// mask erased it before the check (shardpilot/shardpilot-go#73 review). A
 	// mask that can swallow the thing it is protecting is worse than no mask.
-	maskable := true
-	for _, v := range suppliedValues {
-		if v != "" && placeholderPattern.MatchString(v) {
-			maskable = false
-			break
-		}
-	}
-	if maskable {
-		text = placeholderPattern.ReplaceAllString(text, "\x00")
-	}
+	text = markedSpan.ReplaceAllString(text, " ")
 	// DECODE TO A FIXED POINT. One pass left `a%2522b` -- the ordinary shape when
 	// a URL is embedded in another URL's parameter -- decoding only to `a%22b`,
 	// which matches no supplied value, so a doubly-encoded identifier walked
@@ -914,7 +959,7 @@ func scrubHeaderName(name string) string {
 	// (shardpilot/shardpilot-go#73 review). The value is matched against the
 	// COMPLETE name under a boundary rule where `-` separates -- which is what
 	// the split was reaching for and could not express.
-	for _, v := range suppliedValues {
+	for _, v := range longestFirst(suppliedValues) {
 		if v != "" {
 			name = replaceValueWith(name, v, isNameByte)
 		}
@@ -983,7 +1028,7 @@ func replaceValue(text, v string) string {
 }
 
 func replaceValueWith(text, v string, isWord func(byte) bool) string {
-	red := fmt.Sprintf("<redacted, %d chars>", len(v))
+	red := marked(fmt.Sprintf("<redacted, %d chars>", len(v)))
 	if len(v) >= 8 {
 		return strings.ReplaceAll(text, v, red)
 	}
@@ -1160,7 +1205,7 @@ func main() {
 	// A CAPTURE NOBODY RECEIVED IS NOT A CAPTURE. An ignored write error let a
 	// report truncated by a full filesystem -- or never written at all -- be
 	// followed by "SERVED" and exit 0 (shardpilot/shardpilot-go#73 review).
-	if _, werr := io.WriteString(os.Stdout, report.String()); werr != nil {
+	if _, werr := io.WriteString(os.Stdout, strings.ReplaceAll(report.String(), mark, "")); werr != nil {
 		fmt.Fprintf(os.Stderr, "REFUSING: the capture could not be written whole: %v\n", werr)
 		os.Exit(4)
 	}
