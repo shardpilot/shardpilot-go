@@ -518,7 +518,16 @@ func isMinted(raw string) bool {
 	if !ok {
 		return false
 	}
-	return mintedNames[strings.ToLower(name)]
+	// ⚠ `encoding/json` FOLDS WITH UNICODE SEMANTICS, and `strings.ToLower` does
+	// not: it leaves the long-s `ſ` alone, while the decoder matches it to `s`
+	// and populates the field (shardpilot/shardpilot-go#85 review). The
+	// comparison must be the DECODER's, not a convenient approximation of it.
+	for n := range mintedNames {
+		if strings.EqualFold(name, n) {
+			return true
+		}
+	}
+	return false
 }
 
 // redactPath replaces every non-empty path segment of a redirect target with its
@@ -590,13 +599,13 @@ var verbatimHeaders = map[string]func(string) bool{
 	"content-length":    isDigits,
 	"age":               isDigits,
 	"content-type":      isMediaTypeWithoutParameters,
-	"content-encoding":  isDirectiveList,
-	"transfer-encoding": isDirectiveList,
-	"connection":        isDirectiveList,
-	"vary":              isDirectiveList,
-	"accept-ranges":     isDirectiveList,
-	"allow":             isDirectiveList,
-	"cache-control":     isDirectiveList,
+	"content-encoding":  isDirectiveList("content-encoding"),
+	"transfer-encoding": isDirectiveList("transfer-encoding"),
+	"connection":        isDirectiveList("connection"),
+	"vary":              isDirectiveList("vary"),
+	"accept-ranges":     isDirectiveList("accept-ranges"),
+	"allow":             isDirectiveList("allow"),
+	"cache-control":     isDirectiveList("cache-control"),
 }
 
 func isHTTPDate(v string) bool {
@@ -632,27 +641,71 @@ func isMediaTypeWithoutParameters(v string) bool {
 	return ok && isTokenOnly(t) && isTokenOnly(sub)
 }
 
-// isDirectiveList accepts comma-separated tokens, each optionally `=` a token or
-// an integer -- `no-cache`, `max-age=600`, `gzip`. A quoted-string fails: that is
-// where a free-form value would live.
-func isDirectiveList(v string) bool {
-	if strings.Contains(v, `"`) {
-		return false
+// registeredDirectives are the closed vocabularies the specification fixes, per
+// field.
+//
+// ⚠ THE CRITERION SAID "REGISTERED KEYWORD" AND THE CODE CHECKED "IS A TOKEN".
+// Those are not the same rule, and the gap is exactly where an endpoint puts
+// things: `Cache-Control: x-debug=server-secret` is syntactically a directive
+// list, every part a legal token, and it published a secret through a field the
+// criterion had declared safe (shardpilot/shardpilot-go#85 review).
+//
+// A criterion that is stricter than its implementation protects nothing; it just
+// describes the protection you meant to write. So the vocabularies are written
+// out, and an unrecognised directive fails the field.
+var registeredDirectives = map[string]map[string]bool{
+	"cache-control": set("no-cache", "no-store", "no-transform", "public", "private",
+		"must-revalidate", "proxy-revalidate", "max-age", "s-maxage", "immutable",
+		"must-understand", "stale-while-revalidate", "stale-if-error"),
+	"content-encoding":  set("gzip", "deflate", "br", "zstd", "compress", "identity"),
+	"transfer-encoding": set("chunked", "compress", "deflate", "gzip", "identity"),
+	"connection":        set("close", "keep-alive"),
+	"accept-ranges":     set("bytes", "none"),
+	"allow": set("get", "head", "post", "put", "delete", "connect", "options",
+		"trace", "patch"),
+	// `Vary` names REQUEST fields, which is an open set in principle; the ones a
+	// server may name without inventing a string are the standard ones.
+	"vary": set("*", "accept", "accept-encoding", "accept-language", "accept-charset",
+		"origin", "user-agent", "cookie", "authorization", "referer",
+		"access-control-request-method", "access-control-request-headers"),
+}
+
+func set(v ...string) map[string]bool {
+	m := make(map[string]bool, len(v))
+	for _, x := range v {
+		m[x] = true
 	}
-	for _, part := range strings.Split(v, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
+	return m
+}
+
+// isDirectiveList accepts a comma-separated list in which every directive NAME
+// is registered for this field, and every argument is an integer or another
+// registered name. A quoted-string fails outright: that is where a free-form
+// value lives.
+func isDirectiveList(field string) func(string) bool {
+	known := registeredDirectives[field]
+	return func(v string) bool {
+		if known == nil || strings.Contains(v, `"`) {
 			return false
 		}
-		name, arg, hasArg := strings.Cut(part, "=")
-		if !isTokenOnly(strings.TrimSpace(name)) {
-			return false
+		for _, part := range strings.Split(v, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				return false
+			}
+			name, arg, hasArg := strings.Cut(part, "=")
+			if !known[strings.ToLower(strings.TrimSpace(name))] {
+				return false
+			}
+			if hasArg {
+				a := strings.TrimSpace(arg)
+				if !isDigits(a) && !known[strings.ToLower(a)] {
+					return false
+				}
+			}
 		}
-		if hasArg && !isTokenOnly(strings.TrimSpace(arg)) {
-			return false
-		}
+		return true
 	}
-	return true
 }
 
 func isTokenOnly(v string) bool {

@@ -78,7 +78,11 @@ func TestTrailerReportIsOutsideTheMessage(t *testing.T) {
 	if strings.Contains(string(ex.resp()), "X-Late") {
 		t.Fatal("trailers were appended into the HTTP message body")
 	}
-	if !strings.Contains(ex.trailerReport(), "X-Late: value") {
+	// ⚠ THE VALUE IS A LENGTH NOW, NOT `value`. A trailer field is not in the
+	// verbatim vocabulary, so its value is lengthened exactly as a header's would
+	// be -- a trailer is a header that arrived late. What this test protects is
+	// that the FIELD is reported beside the message rather than dropped.
+	if !strings.Contains(ex.trailerReport(), "X-Late: ") {
 		t.Fatal("trailers were dropped instead of being reported beside the message")
 	}
 }
@@ -399,8 +403,19 @@ func TestTrailerContentIsInsideACapturedSpan(t *testing.T) {
 	t.Cleanup(func() { suppliedValues = nil })
 	tee := &teeBody{trailer: http.Header{"X-Late": []string{`\\x61bcdefgh`}}}
 	ex := exchange{head: []byte("x"), captured: tee}
-	if err := assertNoLeak(ex.trailerReport()); err == nil {
-		t.Fatal("a trailer's content was never read by the guard")
+	// ⚠ THIS ASSERTION WAS INVERTED BY A LATER CHANGE, AND THAT IS AN IMPROVEMENT
+	// RATHER THAN A LOSS. It used to require that the GUARD catch an encoded
+	// supplied value in a trailer, which is a statement about the last line of
+	// defence. Trailer values are now lengthened before the guard ever sees them,
+	// so there is nothing left for it to catch -- the property is enforced
+	// earlier and more strongly. What the test asks now is the property itself:
+	// no spelling of a supplied value reaches the trailer report at all.
+	got := stripMarks(ex.trailerReport())
+	if strings.Contains(got, "bcdefgh") {
+		t.Fatalf("a supplied value survived into the trailer report: %q", got)
+	}
+	if err := assertNoLeak(ex.trailerReport()); err != nil {
+		t.Fatalf("the guard flagged an already-lengthened trailer: %v", err)
 	}
 }
 
@@ -474,7 +489,9 @@ func TestTrailersAreSnapshotAtEOFNotFromTheHead(t *testing.T) {
 		resp.Trailer.Set("X-Late", "value")
 	}
 	ex := exchange{head: []byte("HTTP/1.1 200 OK\r\nTrailer: X-Late\r\n\r\n"), captured: tee}
-	if !strings.Contains(ex.trailerReport(), "X-Late: value") {
+	// The value is lengthened; what must not happen is the field being announced
+	// in the head and then absent from the report.
+	if !strings.Contains(ex.trailerReport(), "X-Late: ") {
 		t.Fatal("a declared trailer was announced and then omitted")
 	}
 	if strings.Contains(string(ex.resp()), "X-Late: value") {

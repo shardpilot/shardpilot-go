@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 )
@@ -35,6 +36,15 @@ func TestNoUnrecognisedFormPublishesServerGeneratedText(t *testing.T) {
 		{"Server banner", "HTTP/1.1 200 OK\r\nServer: nginx/SRVGEN\r\n\r\n"},
 		{"ETag", "HTTP/1.1 200 OK\r\nETag: \"SRVGEN\"\r\n\r\n"},
 		{"an unregistered X- field", "HTTP/1.1 200 OK\r\nX-Request-Id: SRVGEN\r\n\r\n"},
+		{"an extension directive in a known field", "HTTP/1.1 200 OK\r\nCache-Control: x-debug=SRVGEN\r\n\r\n"},
+		// ⚠ REGISTERED NAME, FREE-FORM ARGUMENT. The case above has an unknown
+		// directive NAME and is caught by that check alone -- a mutant removing
+		// the ARGUMENT check survived it. This one names a real directive and
+		// puts the string in its argument, which is the only thing that check
+		// stands between.
+		{"a free-form argument to a registered directive", "HTTP/1.1 200 OK\r\nCache-Control: max-age=SRVGEN\r\n\r\n"},
+		{"an unregistered Vary field name", "HTTP/1.1 200 OK\r\nVary: X-SRVGEN\r\n\r\n"},
+		{"an unregistered content coding", "HTTP/1.1 200 OK\r\nContent-Encoding: SRVGEN\r\n\r\n"},
 		{"identifier as a query parameter NAME", "HTTP/1.1 302 Found\r\nLocation: /cb?SRVGEN=x\r\n\r\n"},
 		{"identifier as a fragment parameter NAME", "HTTP/1.1 302 Found\r\nLocation: /cb#SRVGEN=x\r\n\r\n"},
 		{"identifier as the cookie NAME", "HTTP/1.1 200 OK\r\nSet-Cookie: SRVGEN=x\r\n\r\n"},
@@ -71,5 +81,33 @@ func TestCriterionStillPublishesFixedVocabularyFields(t *testing.T) {
 		if !strings.Contains(got, c) {
 			t.Errorf("the criterion lengthened a fixed-vocabulary field: %q -> %q", c, got)
 		}
+	}
+}
+
+// The sweep, extended to trailers: a trailer is a header that arrived late, and
+// the criterion must reach it.
+func TestTrailersObeyTheSameCriterion(t *testing.T) {
+	for _, k := range []string{"X-Request-Id", "Set-Cookie", "Location", "Server"} {
+		structuralSurfaces = nil
+		suppliedValues = nil
+		tee := &teeBody{trailer: http.Header{k: []string{"SRVGEN"}}}
+		e := exchange{head: []byte("x"), captured: tee}
+		got := stripMarks(e.trailerReport())
+		if strings.Contains(got, "SRVGEN") && len(structuralSurfaces) == 0 {
+			t.Errorf("%s trailer published server-generated text: %q", k, got)
+		}
+		structuralSurfaces = nil
+	}
+}
+
+// And a minted member name spelled with a character encoding/json folds but
+// strings.ToLower does not.
+func TestMintedNamesFoldTheWayEncodingJSONDoes(t *testing.T) {
+	structuralSurfaces = nil
+	suppliedValues = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	got := stripMarks(dropFraming("HTTP/1.1 200 OK\r\n\r\n" + "{\"ſubject_fact_key\":\"SRVGEN\"}"))
+	if strings.Contains(got, "SRVGEN") && len(structuralSurfaces) == 0 {
+		t.Fatalf("a Unicode-folded minted name was published: %q", got)
 	}
 }

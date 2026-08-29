@@ -187,7 +187,13 @@ func (e *exchange) trailerReport() string {
 			// and the server-generated value was published
 			// (shardpilot/shardpilot-go#73 review). Structural first, name second,
 			// value third.
-			red := structuralRedact(escapeMarks(k) + ": " + escapeMarks(v))
+			// ⚠ AND THE CRITERION REACHES TRAILERS. `structuralRedact` returns an
+			// ordinary field unchanged, so a trailer like `X-Request-Id: <token>`
+			// fell to the supplied-value scrub alone -- the header block had been
+			// turned round and this block had not
+			// (shardpilot/shardpilot-go#85 review). A trailer is a header that
+			// arrived late, in this as in everything else.
+			red := redactUnlessVerbatim(structuralRedact(escapeMarks(k) + ": " + escapeMarks(v)))
 			if i := strings.IndexByte(red, ':'); i > 0 {
 				red = scrubHeaderName(red[:i]) + red[i:]
 			}
