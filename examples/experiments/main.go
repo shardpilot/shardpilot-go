@@ -143,7 +143,12 @@ func (e *exchange) trailerReport() string {
 		"the decoded bytes:\n\n")
 	for _, k := range slices.Sorted(maps.Keys(e.captured.trailer)) {
 		for _, v := range e.captured.trailer[k] {
-			fmt.Fprintf(&b, "    %s: %s\n", k, scrubSupplied(v))
+			// THE NAME IS PRINTED TOO, so it is scrubbed too: a trailer legally
+			// named `X-<key>` published the identifier in the name while only the
+			// value was cleaned, and the guard's short-value rule counts `-` as a
+			// word byte so the boundary check did not catch it either
+			// (shardpilot/shardpilot-go#73 review).
+			fmt.Fprintf(&b, "    %s: %s\n", scrubHeaderName(k), scrubSupplied(v))
 		}
 	}
 	b.WriteString("\n")
@@ -225,6 +230,30 @@ func fenceFor(content string) string {
 // multiline body containing a line beginning `Content-Length:` had that line
 // REPLACED by a capture note -- the recorder editing endpoint-provided evidence
 // that had nothing to do with redaction (shardpilot/shardpilot-go#73 review).
+// redactSetCookie keeps `Set-Cookie: <name>=` and every attribute after the
+// first `;`, and replaces only the value.
+func redactSetCookie(line string) string {
+	cr := ""
+	body := line
+	if strings.HasSuffix(body, "\r") {
+		cr, body = "\r", strings.TrimSuffix(body, "\r")
+	}
+	head, rest, ok := strings.Cut(body, ":")
+	if !ok {
+		return line
+	}
+	pair, attrs, hasAttrs := strings.Cut(rest, ";")
+	name, value, hasValue := strings.Cut(strings.TrimSpace(pair), "=")
+	if !hasValue {
+		return line
+	}
+	out := head + ": " + name + "=" + fmt.Sprintf("<redacted, %d chars>", len(value))
+	if hasAttrs {
+		out += ";" + attrs
+	}
+	return out + cr
+}
+
 func dropFraming(dump string) string {
 	lines := strings.Split(dump, "\n")
 	out := make([]string, 0, len(lines))
@@ -246,6 +275,16 @@ func dropFraming(dump string) string {
 		// chunked` describes framing the bytes below do not carry: no chunk sizes,
 		// no terminator. Removing Content-Length alone left this common shape
 		// unparsable (shardpilot/shardpilot-go#73 review).
+		// A COOKIE THE SERVER SET IS A CREDENTIAL THIS PROGRAM NEVER SUPPLIED,
+		// so no list of supplied values can reach it. Session, affinity and
+		// bot-management cookies were published verbatim in an artifact whose
+		// whole purpose is to be published (shardpilot/shardpilot-go#73 review).
+		// Redacted STRUCTURALLY, like the query string: the cookie's name and
+		// its attributes stay, the value becomes a length.
+		if strings.HasPrefix(low, "set-cookie:") {
+			out = append(out, redactSetCookie(l))
+			continue
+		}
 		if strings.HasPrefix(low, "transfer-encoding:") {
 			out = append(out, "X-Capture-Note: Transfer-Encoding removed — the body below is decoded")
 			continue
@@ -449,7 +488,16 @@ func redact(dump []byte) []byte {
 					scheme = parts[0] + " <redacted, " + fmt.Sprint(len(parts[1])) + " chars>"
 				}
 			}
-			line = "Authorization: " + scheme
+			// KEEP THE LINE'S OWN TERMINATOR. Splitting on "\n" leaves the
+			// "\r" on every line; rebuilding this one without it emitted a lone
+			// LF after Authorization while its neighbours stayed CRLF, so the
+			// block advertised as a canonical HTTP/1.1 request had mixed line
+			// endings (shardpilot/shardpilot-go#73 review).
+			cr := ""
+			if strings.HasSuffix(line, "\r") {
+				cr = "\r"
+			}
+			line = "Authorization: " + scheme + cr
 		}
 		out = append(out, line)
 	}
@@ -601,15 +649,30 @@ func assertNoLeak(text string) error {
 	// through both the scrub and this gate (shardpilot/shardpilot-go#73 review).
 	// Nesting has no fixed depth, so neither does the decoder: it iterates until
 	// nothing changes, with a bound so a crafted body cannot spin it.
+	// ⚠ THE BOUND IS THE STRING, NOT A MAGIC NUMBER. This capped at 16 rounds
+	// while its own comment promised a fixed point, so wrapping a value in
+	// seventeen `%25` layers walked straight through the gate
+	// (shardpilot/shardpilot-go#73 review). Each round either shrinks the text
+	// -- `%XX` becomes one byte, `\uXXXX` at most four -- or rewrites `+` as a
+	// space, which cannot be undone, so it cannot cycle and cannot run longer
+	// than the input. len(text)+1 is therefore a real bound rather than a guess,
+	// and reaching it is a defect worth failing on rather than passing quietly.
 	forms := []string{text}
 	cur := text
-	for i := 0; i < 16; i++ {
-		next := undoUnicodeEscapes(undoPercent(cur))
+	settled := false
+	for i := 0; i <= len(text); i++ {
+		next := undoPlus(undoUnicodeEscapes(undoPercent(cur)))
 		if next == cur {
+			settled = true
 			break
 		}
 		forms = append(forms, next)
 		cur = next
+	}
+	if !settled {
+		return fmt.Errorf(
+			"decoding did not settle within %d rounds; the record is NOT "+
+				"publishable and was not printed", len(text)+1)
 	}
 	for _, v := range suppliedValues {
 		if v == "" {
@@ -630,6 +693,15 @@ func assertNoLeak(text string) error {
 // undoPercent decodes percent-escapes leniently -- url.QueryUnescape refuses a
 // whole string for one malformed escape, and a partial decode is exactly what a
 // leak check wants.
+// undoPlus applies query-string semantics: inside a query, a space is spelled
+// `+`. Nesting one URL inside another's parameter turns a supplied `a b` into
+// `a%2Bb`, which percent-decoding alone reduces to `a+b` and no further, so the
+// value was never reconstructed and both the scrub and the gate missed it
+// (shardpilot/shardpilot-go#73 review).
+func undoPlus(text string) string {
+	return strings.ReplaceAll(text, "+", " ")
+}
+
 func undoPercent(text string) string {
 	var b strings.Builder
 	for i := 0; i < len(text); i++ {
@@ -684,6 +756,24 @@ func undoUnicodeEscapes(text string) string {
 		b.WriteByte(text[i])
 	}
 	return b.String()
+}
+
+// scrubHeaderName scrubs a header or trailer NAME, where `-` separates words
+// rather than belonging to one.
+//
+// ⚠ scrubSupplied ALONE DOES NOT REACH IT. The short-value rule matches only at
+// token boundaries and `isWordByte` counts `-` as a word byte -- correct for a
+// VALUE, since an experiment key may legally contain a hyphen, and wrong for a
+// NAME, where HTTP uses `-` structurally. So a trailer legally called
+// `X-<key>` published the identifier in its name and the boundary check waved
+// it through (shardpilot/shardpilot-go#73 review). The rule is not loosened for
+// values; the name is split on its own separator first.
+func scrubHeaderName(name string) string {
+	parts := strings.Split(name, "-")
+	for i, p := range parts {
+		parts[i] = scrubSupplied(p)
+	}
+	return strings.Join(parts, "-")
 }
 
 // replaceValue redacts every occurrence of v. A long value is replaced outright;

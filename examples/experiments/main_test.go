@@ -202,6 +202,76 @@ func TestEveryQueryValueTheSDKSendsIsScrubbed(t *testing.T) {
 	}
 }
 
+func TestSetCookieIsRedactedStructurally(t *testing.T) {
+	dump := "HTTP/1.1 200 OK\r\n" +
+		"Set-Cookie: sid=abc123def456; Path=/; HttpOnly\r\n" +
+		"\r\n{}"
+	got := dropFraming(dump)
+	if strings.Contains(got, "abc123def456") {
+		t.Fatalf("a server-set cookie was published verbatim: %q", got)
+	}
+	for _, keep := range []string{"sid=", "Path=/", "HttpOnly"} {
+		if !strings.Contains(got, keep) {
+			t.Fatalf("structural redaction dropped %q: %q", keep, got)
+		}
+	}
+}
+
+func TestGuardDecodesPlusAsSpace(t *testing.T) {
+	suppliedValues = []string{"a b"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// A URL nested in another URL's query: the inner `+` is itself encoded.
+	if err := assertNoLeak("Location: /r?next=%3Fexperiment_key%3Da%2Bb"); err == nil {
+		t.Fatal("a nested query-plus spelling passed the guard")
+	}
+}
+
+func TestGuardHasNoFixedDecodingDepth(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// Wrap the percent-escape in many %25 layers -- more than any fixed cap.
+	v := "%61bcdefgh"
+	for i := 0; i < 40; i++ {
+		v = strings.ReplaceAll(v, "%", "%25")
+	}
+	// ⚠ ASSERT THE REASON, NOT MERELY AN ERROR. The first version of this test
+	// checked only `err != nil`, and the mutant that restores the 16-round cap
+	// SURVIVED it: that version also errors, but with "did not settle" rather
+	// than by finding the value. Two different verdicts, one indistinguishable
+	// assertion.
+	err := assertNoLeak(v)
+	if err == nil {
+		t.Fatal("a deeply nested encoding walked through the guard")
+	}
+	if !strings.Contains(err.Error(), "survived redaction") {
+		t.Fatalf("the guard refused for the wrong reason -- it did not reach the "+
+			"value, it ran out of rounds: %v", err)
+	}
+}
+
+func TestTrailerNamesAreScrubbedToo(t *testing.T) {
+	suppliedValues = []string{"secret"}
+	t.Cleanup(func() { suppliedValues = nil })
+	tee := &teeBody{trailer: http.Header{"X-secret": []string{"v"}}}
+	got := (&exchange{head: []byte("x"), captured: tee}).trailerReport()
+	if strings.Contains(got, "secret") {
+		t.Fatalf("the identifier was published in a trailer NAME: %q", got)
+	}
+}
+
+func TestRedactedAuthorizationKeepsItsTerminator(t *testing.T) {
+	dump := []byte("GET /x HTTP/1.1\r\nAuthorization: Bearer tok\r\nHost: h\r\n\r\n")
+	got := string(redact(dump))
+	for _, line := range strings.Split(got, "\n") {
+		if line == "" {
+			continue
+		}
+		if !strings.HasSuffix(line, "\r") {
+			t.Fatalf("line lost its CR, giving mixed endings: %q in %q", line, got)
+		}
+	}
+}
+
 func TestTrailersAreSnapshotAtEOFNotFromTheHead(t *testing.T) {
 	resp := &http.Response{Trailer: http.Header{}}
 	tee := &teeBody{inner: io.NopCloser(strings.NewReader("BODY")), resp: resp}
