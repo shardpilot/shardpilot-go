@@ -308,6 +308,18 @@ func redactPath(line string) string {
 	}
 	start := 0
 	if i := strings.Index(url, "://"); i >= 0 {
+		// ⚠ THE SCHEME IS ENDPOINT-CHOSEN, AND THE HOST EXEMPTION DOES NOT COVER
+		// IT. A host is exempt deliberately -- structurally constrained, publicly
+		// resolvable. A scheme is neither: `server-secret://e.example/cb` is a
+		// valid URI and carried the identifier past everything
+		// (shardpilot/shardpilot-go#85 review). An exemption written for one
+		// component must not be read as covering whatever sits beside it.
+		switch strings.ToLower(url[:i]) {
+		case "http", "https":
+		default:
+			noteStructural("a Location header with an unapproved URI scheme")
+			return head + marked("<withheld: unapproved scheme>") + tail
+		}
 		start = i + 3
 	} else if strings.HasPrefix(url, "//") {
 		start = 2
@@ -386,6 +398,18 @@ func redactSetCookie(line string) string {
 		for i, a := range parts {
 			an, av, has := strings.Cut(a, "=")
 			if !has {
+				// ⚠ A VALUELESS ATTRIBUTE IS NOT AUTOMATICALLY A FLAG.
+				// `; server-secret` is a legal extension attribute carrying an
+				// endpoint-chosen token, and this branch walked straight past the
+				// value redaction added the round before
+				// (shardpilot/shardpilot-go#85 review). Only the standard flags
+				// have no value by specification; anything else without one is a
+				// string the origin invented.
+				switch strings.ToLower(strings.TrimSpace(an)) {
+				case "secure", "httponly", "partitioned":
+				default:
+					parts[i] = " " + stripMarks(tokenPlaceholder(strings.TrimSpace(an)))
+				}
 				continue
 			}
 			if cookieAttrVerbatim(an, strings.TrimSpace(av)) {

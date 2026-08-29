@@ -45,6 +45,8 @@ func TestNoUnrecognisedFormPublishesServerGeneratedText(t *testing.T) {
 		{"a free-form argument to a registered directive", "HTTP/1.1 200 OK\r\nCache-Control: max-age=SRVGEN\r\n\r\n"},
 		{"an unregistered Vary field name", "HTTP/1.1 200 OK\r\nVary: X-SRVGEN\r\n\r\n"},
 		{"an unregistered content coding", "HTTP/1.1 200 OK\r\nContent-Encoding: SRVGEN\r\n\r\n"},
+		{"a valueless cookie extension attribute", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; SRVGEN\r\n\r\n"},
+		{"an unapproved redirect scheme", "HTTP/1.1 302 Found\r\nLocation: SRVGEN://e.example/cb\r\n\r\n"},
 		{"identifier as a query parameter NAME", "HTTP/1.1 302 Found\r\nLocation: /cb?SRVGEN=x\r\n\r\n"},
 		{"identifier as a fragment parameter NAME", "HTTP/1.1 302 Found\r\nLocation: /cb#SRVGEN=x\r\n\r\n"},
 		{"identifier as the cookie NAME", "HTTP/1.1 200 OK\r\nSet-Cookie: SRVGEN=x\r\n\r\n"},

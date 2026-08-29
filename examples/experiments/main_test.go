@@ -820,3 +820,51 @@ type closerFunc func() error
 
 func (f closerFunc) Close() error             { return f() }
 func (f closerFunc) Read([]byte) (int, error) { return 0, io.EOF }
+
+// ---- round on 706ab2c ----
+
+func TestMimeNormalisationStaysInsideTheEncodedRun(t *testing.T) {
+	suppliedValues = []string{"abcdefghijklmnopqrstuvwxyz012345678901234567890123456789"}
+	t.Cleanup(func() { suppliedValues = nil })
+	enc := base64.StdEncoding.EncodeToString([]byte(suppliedValues[0]))
+	// A header value ending in base64 letters, then the wrapped body. Joining the
+	// whole span would merge `abc` into the token and decode the wrong thing.
+	dump := "X-Test: abc\r\n\r\n" + enc[:41] + "\r\n" + enc[41:] + "\r\n"
+	if err := assertNoLeak(asCaptured(dump)); err == nil {
+		t.Fatal("normalisation crossed the field boundary and lost the value")
+	}
+}
+
+func TestTrailerHeaderListedNamesAreScrubbed(t *testing.T) {
+	suppliedValues = []string{"Bar"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(dropFraming("HTTP/1.1 200 OK\r\nTrailer: X-Bar\r\n\r\n"))
+	if strings.Contains(got, "Bar") {
+		t.Fatalf("a name listed by the Trailer header kept a supplied value: %q", got)
+	}
+}
+
+func TestTheSDKRouteIsNotReadAsCapturedData(t *testing.T) {
+	suppliedValues = []string{"assignment"}
+	t.Cleanup(func() { suppliedValues = nil })
+	req := asCaptured("GET " + assignmentRoute + " HTTP/1.1\r\nHost: e.example\r\n")
+	if err := assertNoLeak(req); err != nil {
+		t.Fatalf("the SDK's own fixed route was reported as a leak: %v", err)
+	}
+}
+
+func TestGeneratedCaptureNotesAreMarked(t *testing.T) {
+	suppliedValues = []string{"Capture-Note"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// ⚠ THROUGH THE SCRUB, NOT dropFraming ALONE. The note is written by
+	// dropFraming and scrubbed by a LATER pass, so a fixture that stops at the
+	// first says nothing about the second -- the mutant reverting the mark
+	// survived exactly that.
+	got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")))
+	if strings.Contains(got, "<redacted") {
+		t.Fatalf("a generated capture note was scrubbed into an unparsable name: %q", got)
+	}
+	if !strings.Contains(got, "X-Capture-Note:") {
+		t.Fatalf("the generated note was destroyed: %q", got)
+	}
+}
