@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -120,21 +121,84 @@ func TestAssertNoLeakCatchesASpellingNobodyConstructed(t *testing.T) {
 	}
 }
 
-func TestBodyAtTheReadCeilingIsReportedIncomplete(t *testing.T) {
+func TestCeilingWithAConclusiveEOFIsComplete(t *testing.T) {
+	// Exactly the ceiling, delivered with io.EOF: the body IS whole, and the
+	// SDK's refusal of an oversized response is a complete refusal.
 	src := bytes.Repeat([]byte("x"), capturedBodyMax)
 	tee := &teeBody{inner: io.NopCloser(bytes.NewReader(src))}
 	if _, err := io.Copy(io.Discard, tee); err != nil {
 		t.Fatalf("copy: %v", err)
 	}
-	ex := exchange{head: []byte("HTTP/1.1 200 OK\r\n\r\n"), captured: tee}
-	if ex.truncErr() == nil {
-		t.Fatal("a body filling the shared read ceiling was reported as complete")
+	if !tee.sawEOF {
+		t.Fatal("precondition: the reader did not deliver EOF")
 	}
-	// Below the ceiling, nothing is claimed.
+	if (&exchange{head: []byte("x"), captured: tee}).truncErr() != nil {
+		t.Fatal("a ceiling-sized body confirmed by EOF was reported incomplete")
+	}
+}
+
+func TestCeilingWithoutEOFIsIndeterminate(t *testing.T) {
+	// The SDK reads through io.LimitReader, so the wrapper stops at the ceiling
+	// with more bytes behind it and never sees EOF. Nothing here can tell a
+	// whole body from a truncated one.
+	src := bytes.Repeat([]byte("x"), capturedBodyMax+512)
+	tee := &teeBody{inner: io.NopCloser(bytes.NewReader(src))}
+	if _, err := io.CopyN(io.Discard, tee, int64(capturedBodyMax)); err != nil {
+		t.Fatalf("copyN: %v", err)
+	}
+	if tee.sawEOF {
+		t.Fatal("precondition: EOF was seen, which is not this case")
+	}
+	if (&exchange{head: []byte("x"), captured: tee}).truncErr() == nil {
+		t.Fatal("a ceiling-sized body with no EOF was reported complete")
+	}
 	short := &teeBody{inner: io.NopCloser(bytes.NewReader([]byte("ok")))}
 	_, _ = io.Copy(io.Discard, short)
 	if (&exchange{head: []byte("x"), captured: short}).truncErr() != nil {
 		t.Fatal("a short body was reported incomplete")
+	}
+}
+
+func TestGuardDecodesNestedPercentEscapes(t *testing.T) {
+	suppliedValues = []string{`a"b`}
+	t.Cleanup(func() { suppliedValues = nil })
+	// A URL embedded in another URL's parameter encodes the identifier twice.
+	if err := assertNoLeak("Location: /r?next=%2Fx%3Fexperiment_key%3Da%2522b"); err == nil {
+		t.Fatal("a doubly percent-encoded identifier passed the guard")
+	}
+}
+
+func TestGuardIgnoresItsOwnPlaceholders(t *testing.T) {
+	suppliedValues = []string{"redacted"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// scrubSupplied writes redacted-8-chars where the value stood; the guard
+	// must not find the value inside the recorder's own placeholder.
+	report := "GET /x?experiment_key=redacted-8-chars HTTP/1.1\n\n<redacted, 8 chars>\n"
+	if err := assertNoLeak(report); err != nil {
+		t.Fatalf("the guard rejected a fully redacted report: %v", err)
+	}
+	if err := assertNoLeak("experiment_key=redacted&x=1"); err == nil {
+		t.Fatal("the guard missed a real occurrence outside a placeholder")
+	}
+}
+
+func TestEveryQueryValueTheSDKSendsIsScrubbed(t *testing.T) {
+	suppliedValues = nil
+	t.Cleanup(func() { suppliedValues = nil })
+	u, err := url.Parse("https://h/a?subject_key=spcid_0123456789abcdef0123456789abcdef&app_key=k")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	for _, vs := range u.Query() {
+		for _, v := range vs {
+			addSuppliedValue(v)
+		}
+	}
+	// The minted subject is not an environment value, and it is what a redirect
+	// Location echoes back.
+	got := scrubSupplied("Location: /r?subject_key=spcid_0123456789abcdef0123456789abcdef")
+	if strings.Contains(got, "spcid_0123456789abcdef0123456789abcdef") {
+		t.Fatalf("the SDK-minted subject was published verbatim: %q", got)
 	}
 }
 

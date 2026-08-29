@@ -53,6 +53,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -91,7 +92,16 @@ func (e *exchange) truncErr() error {
 	if e.captured == nil {
 		return nil
 	}
-	if e.captured.err == nil && (e.captured.overflowed || e.captured.atCeiling) {
+	// ⚠ AN EOF SEEN AT THE CEILING IS CONCLUSIVE. A fixed-Content-Length body can
+	// deliver its last bytes together with io.EOF, so a response that is exactly
+	// capturedBodyMax long is COMPLETE and the SDK's own refusal of it is a
+	// complete refusal -- exit 1, not exit 3. Treating every ceiling-sized body
+	// as indeterminate discarded the one witness that settles it
+	// (shardpilot/shardpilot-go#73 review).
+	if e.captured.err == nil && e.captured.overflowed {
+		return errOversizedForCapture
+	}
+	if e.captured.err == nil && e.captured.atCeiling && !e.captured.sawEOF {
 		return errOversizedForCapture
 	}
 	return e.captured.err
@@ -262,6 +272,21 @@ func (r *recorder) last() *exchange {
 
 func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 	ex := exchange{}
+	// EVERY QUERY VALUE THE SDK SENDS JOINS THE SCRUB SET, not only the values
+	// this program supplied from the environment.
+	//
+	// ⚠ THE SUBJECT KEY IS MINTED INSIDE THE SDK and was in neither list, so a
+	// redirect Location or a diagnostic body echoing the request URL published
+	// `subject_key=spcid_...` verbatim -- past the response scrub AND past the
+	// publication gate, both of which read the same incomplete list
+	// (shardpilot/shardpilot-go#73 review). The request redactor already treats
+	// every query value as identifying; this makes the RESPONSE side agree,
+	// which is the property, not a longer list of names.
+	for _, vs := range req.URL.Query() {
+		for _, v := range vs {
+			addSuppliedValue(v)
+		}
+	}
 	if dump, err := httputil.DumpRequestOut(req, true); err == nil {
 		ex.req = redact(dump)
 	}
@@ -489,6 +514,16 @@ func env(name string) string { return strings.TrimSpace(os.Getenv(name)) }
 // request line, error text, and now response body.
 var suppliedValues []string
 
+func addSuppliedValue(v string) {
+	if v == "" {
+		return
+	}
+	if slices.Contains(suppliedValues, v) {
+		return
+	}
+	suppliedValues = append(suppliedValues, v)
+}
+
 func scrubSupplied(text string) string {
 	for _, v := range suppliedValues {
 		if v == "" {
@@ -546,9 +581,36 @@ func encodingsOf(v string) []string {
 // \uXXXX escapes undone -- and every supplied value must be absent from every
 // decoded form. An encoding nobody anticipated does not leak; it makes this
 // program refuse to emit the record at all.
+// placeholderPattern matches the strings THIS PROGRAM writes where a value used
+// to be. They are masked before the leak check, because they are the recorder's
+// prose rather than captured data.
+//
+// ⚠ WITHOUT THIS THE GUARD REJECTED FULLY REDACTED REPORTS. A supplied value of
+// `redacted` is replaced in the request line by `redacted-8-chars`, and the
+// long-value branch then found `redacted` inside the recorder's OWN placeholder
+// and exited 4 without publishing anything -- the same self-detection as the
+// short-key case, arriving through the other branch
+// (shardpilot/shardpilot-go#73 review).
+var placeholderPattern = regexp.MustCompile(`redacted-[0-9]+-chars|<redacted, [0-9]+ chars>`)
+
 func assertNoLeak(text string) error {
-	forms := []string{text, undoPercent(text), undoUnicodeEscapes(text)}
-	forms = append(forms, undoUnicodeEscapes(undoPercent(text)))
+	text = placeholderPattern.ReplaceAllString(text, "\x00")
+	// DECODE TO A FIXED POINT. One pass left `a%2522b` -- the ordinary shape when
+	// a URL is embedded in another URL's parameter -- decoding only to `a%22b`,
+	// which matches no supplied value, so a doubly-encoded identifier walked
+	// through both the scrub and this gate (shardpilot/shardpilot-go#73 review).
+	// Nesting has no fixed depth, so neither does the decoder: it iterates until
+	// nothing changes, with a bound so a crafted body cannot spin it.
+	forms := []string{text}
+	cur := text
+	for i := 0; i < 16; i++ {
+		next := undoUnicodeEscapes(undoPercent(cur))
+		if next == cur {
+			break
+		}
+		forms = append(forms, next)
+		cur = next
+	}
 	for _, v := range suppliedValues {
 		if v == "" {
 			continue
