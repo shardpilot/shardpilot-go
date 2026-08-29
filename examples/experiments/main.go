@@ -238,8 +238,14 @@ func (e *exchange) trailerReport() string {
 			if !handled {
 				red = redactUnlessVerbatim(red)
 			}
+			// ⚠ AND THE FIELD-NAME CRITERION, not only the supplied-value scrub.
+			// `scrubHeaderName` knows values the HARNESS supplied; an unregistered
+			// trailer name like `Server-Secret` is chosen by the endpoint and was
+			// published verbatim, because the registry check lived on the header
+			// path only (shardpilot/shardpilot-go#85 review). Second site, same
+			// rule -- the fifth time in these two changes.
 			if i := strings.IndexByte(red, ':'); i > 0 {
-				red = scrubHeaderName(red[:i]) + red[i:]
+				red = redactFieldName(scrubHeaderName(red[:i])) + red[i:]
 			}
 			fmt.Fprintf(&b, "    %s\n", asCaptured(scrubSupplied(red)))
 		}
@@ -455,6 +461,31 @@ func isMinted(raw string) bool {
 	if !ok {
 		return false
 	}
+	return isMintedName(name)
+}
+
+// noteMinted records a server-minted field's presence and returns the body
+// unchanged -- the caller does not publish a body this reports on.
+// ⚠ TOP-LEVEL ONLY. `encoding/json` binds the SDK's field from the top-level
+// object; a member of the same name inside `variant_payload` is ordinary payload
+// the endpoint chose to call that, and refusing on it made a perfectly
+// publishable assignment unpublishable (shardpilot/shardpilot-go#84 review). The
+// question is "is this THE minted field", not "does this name appear".
+func topLevelMembers(body string) []string {
+	var raw map[string]json.RawMessage
+	i := strings.IndexByte(body, '{')
+	if i < 0 || json.Unmarshal([]byte(body[i:]), &raw) != nil {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for k := range raw {
+		out = append(out, k)
+	}
+	return out
+}
+
+// isMintedName is isMinted for a name already decoded.
+func isMintedName(name string) bool {
 	for n := range mintedNames {
 		if strings.EqualFold(name, n) {
 			return true
@@ -578,7 +609,13 @@ func dropFraming(dump string) string {
 			if i, ok := headerNameEnd(l); ok {
 				names := strings.Split(l[i+1:], ",")
 				for k, n := range names {
-					names[k] = scrubHeaderName(n)
+					// ⚠ THE REGISTRY CRITERION TOO, not only the supplied-value
+					// scrub -- `Trailer: Server-Secret` names a field the endpoint
+					// invented, and the value it announces is redacted later while
+					// the announcement itself was published
+					// (shardpilot/shardpilot-go#85 review). Sixth site of this same
+					// rule, and the sweep found this one before the review did.
+					names[k] = redactFieldName(scrubHeaderName(n))
 				}
 				out = append(out, scrubHeaderName(l[:i])+":"+strings.Join(names, ","))
 				continue
@@ -848,7 +885,11 @@ func redact(dump []byte) []byte {
 			scheme := "<redacted>"
 			if len(field) == 2 {
 				if parts := strings.SplitN(strings.TrimSpace(field[1]), " ", 2); len(parts) == 2 {
-					scheme = parts[0] + " " + placeholder(parts[1])
+					// ⚠ THE SCHEME IS SYNTAX TOO. Only the credential was marked, so a
+					// legal experiment key of `Bearer` was found by the guard in
+					// this program's own rebuilt line and refused every run
+					// (shardpilot/shardpilot-go#84 review).
+					scheme = marked(parts[0]+" ") + placeholder(parts[1])
 				}
 			}
 			// KEEP THE LINE'S OWN TERMINATOR. Splitting on "\n" leaves the
@@ -860,7 +901,17 @@ func redact(dump []byte) []byte {
 			if strings.HasSuffix(line, "\r") {
 				cr = "\r"
 			}
-			line = "Authorization: " + scheme + cr
+			line = marked("Authorization: ") + scheme + cr
+		}
+		// ⚠ EVERY REQUEST HEADER NAME IS SYNTAX THIS PROGRAM DID NOT CHOOSE. A
+		// legal experiment key of `Host` or `User-Agent` was reported by the guard
+		// as a surviving value, because the canonical name sat unmarked inside the
+		// captured span -- so those keys could never produce a capture
+		// (shardpilot/shardpilot-go#84 review). Marking the NAME leaves the value
+		// under the scrub, where it belongs.
+		if i, ok := headerNameEnd(strings.TrimSuffix(line, "\r")); ok &&
+			!strings.HasPrefix(line, genMark) {
+			line = marked(line[:i+1]) + line[i+1:]
 		}
 		out = append(out, line)
 	}
@@ -989,6 +1040,14 @@ func overCaptured(text string, f func(string) string) string {
 	}
 }
 
+// jsonLiterals are the three bare tokens of JSON grammar. A supplied value equal
+// to one of them cannot be distinguished from the grammar itself, and replacing
+// it turned every not-assigned body into `{"assigned":<redacted, 5 chars>}` --
+// invalid JSON that no longer states the endpoint's verdict
+// (shardpilot/shardpilot-go#84 review). The guard still reads the body; what it
+// would find there is the word `false`, which the endpoint did not learn from us.
+var jsonLiterals = map[string]bool{"true": true, "false": true, "null": true}
+
 func scrubSuppliedRaw(text string) string {
 	// ⚠ LONGEST FIRST. With `abcdefgh` supplied before `abcdefghi`, the shorter
 	// value replaced its own prefix inside the longer one, leaving
@@ -997,7 +1056,7 @@ func scrubSuppliedRaw(text string) string {
 	// review). Order is not a detail here: a substitution that destroys a longer
 	// match is unrecoverable by any later pass.
 	for _, v := range longestFirst(suppliedValues) {
-		if v == "" {
+		if v == "" || jsonLiterals[v] {
 			continue
 		}
 		text = replaceValue(text, v)
@@ -1322,8 +1381,19 @@ func assertNoLeak(text string) error {
 			// per-line candidates still could not reconstruct the value
 			// (shardpilot/shardpilot-go#84 review). Only runs of CONSECUTIVE
 			// lines that are entirely base64 alphabet are joined.
+			// ⚠ AND BACK THROUGH EVERY DECODER. base64 can carry another supported
+			// encoding -- base64 of `%61bcdefgh` -- and the decoded candidate was
+			// checked as-is, so nothing ever percent-decoded it
+			// (shardpilot/shardpilot-go#84 review). A candidate is an input to the
+			// chain, not an answer from it.
 			norm := joinBase64Runs(cur)
-			extra = append(extra, norm, undoBase64(norm))
+			dec := undoBase64(norm)
+			extra = append(extra, norm, dec)
+			for _, st := range []func(string) string{undoPercent, undoUnicodeEscapes, undoHex, undoPlus, undoEntities} {
+				work += len(dec)
+				dec = st(dec)
+				extra = append(extra, dec)
+			}
 			work += len(cur)
 			if work > decodeWorkMax {
 				return fmt.Errorf(
@@ -1711,7 +1781,13 @@ func containsValue(text, names, v string) bool {
 	// both hyphens as boundaries and the capture exited 4
 	// (shardpilot/shardpilot-go#73 review). The permissive rule exists for field
 	// NAMES, where `-` is structural, so it is asked of the field names.
-	if containsValueWith(names, v, isNameByte) {
+	// ⚠ FOLDED, LIKE THE SCRUB THAT PRODUCED THESE NAMES. `X-%53ecret` decodes to
+	// `X-Secret`, and this test was case-sensitive while `scrubHeaderName` folds
+	// -- so an encoded byte became a CASE variant only after decoding and slipped
+	// between the two rules (shardpilot/shardpilot-go#84 review). Two rules about
+	// the same names must agree about case as well as about spelling.
+	if containsValueWith(names, v, isNameByte) ||
+		containsValueWith(strings.ToLower(names), strings.ToLower(v), isNameByte) {
 		return true
 	}
 	return containsValueWith(text, v, isWordByte)

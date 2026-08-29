@@ -51,6 +51,9 @@ func TestNoUnrecognisedFormPublishesServerGeneratedText(t *testing.T) {
 		{"a cookie extension attribute NAME", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; SRVGEN=y\r\n\r\n"},
 		{"an unregistered media type", "HTTP/1.1 200 OK\r\nContent-Type: application/SRVGEN\r\n\r\n"},
 		{"an unregistered response field NAME", "HTTP/1.1 200 OK\r\nSRVGEN-Field: x\r\n\r\n"},
+		{"a custom status reason phrase", "HTTP/1.1 200 SRVGEN\r\nSet-Cookie: a=b\r\n\r\n"},
+		{"userinfo before a second at-sign", "HTTP/1.1 302 Found\r\nLocation: https://user@SRVGEN@host/cb\r\n\r\n"},
+		{"an unregistered trailer NAME", "HTTP/1.1 200 OK\r\nTrailer: SRVGEN-Late\r\n\r\n"},
 		{"identifier as a query parameter NAME", "HTTP/1.1 302 Found\r\nLocation: /cb?SRVGEN=x\r\n\r\n"},
 		{"identifier as a fragment parameter NAME", "HTTP/1.1 302 Found\r\nLocation: /cb#SRVGEN=x\r\n\r\n"},
 		{"identifier as the cookie NAME", "HTTP/1.1 200 OK\r\nSet-Cookie: SRVGEN=x\r\n\r\n"},
@@ -141,6 +144,70 @@ func TestStructureSurvivesWhereItIsVouchedFor(t *testing.T) {
 			"HTTP/1.1 302 Found\r\nLocation: /cb?custom_attribute_%C3%A9=v\r\n\r\n"))
 		if !strings.Contains(got, "custom_attribute_%C3%A9=") {
 			t.Fatalf("a harness-owned name was classified as endpoint-chosen: %q", got)
+		}
+	})
+}
+
+// More of what must NOT be lost. Every clause of the criterion that ADMITS
+// something needs a case here, or the next tightening removes it silently.
+func TestTheCriterionStillAdmitsWhatItShould(t *testing.T) {
+	for _, c := range []struct{ name, dump, keep string }{
+		{"a registered reason phrase", "HTTP/1.1 200 OK\r\n\r\n", "200 OK"},
+		{"a bracketed IPv6 authority", "HTTP/1.1 302 Found\r\nLocation: https://[2001:db8::1]/cb\r\n\r\n", "[2001:db8::1]"},
+		{"a relative path containing ://", "HTTP/1.1 302 Found\r\nLocation: /cb/http://e/x\r\n\r\n", "/"},
+		{"an interior at-sign in a path", "HTTP/1.1 302 Found\r\nLocation: /a//foo@bar/b\r\n\r\n", "/"},
+		{"a GMT HTTP-date", "HTTP/1.1 200 OK\r\nDate: Mon, 02 Jan 2006 15:04:05 GMT\r\n\r\n", "15:04:05 GMT"},
+	} {
+		suppliedValues = nil
+		structuralSurfaces = nil
+		got := stripMarks(dropFraming(c.dump))
+		if !strings.Contains(got, c.keep) {
+			t.Errorf("%s: the criterion refused what it admits: %q", c.name, got)
+		}
+		if len(structuralSurfaces) != 0 {
+			t.Errorf("%s: a valid capture was made unpublishable: %v", c.name, structuralSurfaces)
+		}
+		structuralSurfaces = nil
+	}
+}
+
+// Three clauses cannot carry the SRVGEN marker in the position that matters — a
+// date zone is three letters, a trailer NAME is checked by a different path, and
+// the attribute-name collision needs a supplied value to trigger. They get their
+// own cases rather than being left to a sweep that structurally cannot reach
+// them; a probe that cannot express the case is not covering it.
+func TestClausesTheSweepCannotExpress(t *testing.T) {
+	t.Run("an obsolete date's zone is fixed to GMT", func(t *testing.T) {
+		if isHTTPDate("Monday, 02-Jan-06 15:04:05 XYZ") {
+			t.Fatal("an arbitrary three-letter zone was accepted as an HTTP-date")
+		}
+		if !isHTTPDate("Monday, 02-Jan-06 15:04:05 GMT") {
+			t.Fatal("a legal obsolete HTTP-date was rejected")
+		}
+	})
+	t.Run("an unregistered trailer name is redacted", func(t *testing.T) {
+		suppliedValues = nil
+		structuralSurfaces = nil
+		t.Cleanup(func() { structuralSurfaces = nil })
+		tee := &teeBody{trailer: http.Header{"Server-Secret": []string{"x"}}}
+		e := exchange{head: []byte("x"), captured: tee}
+		got := stripMarks(e.trailerReport())
+		if strings.Contains(got, "Server-Secret") {
+			t.Fatalf("an endpoint-chosen trailer name was published: %q", got)
+		}
+	})
+	t.Run("a generated attribute name survives the value scrub", func(t *testing.T) {
+		suppliedValues = []string{"redacted"}
+		structuralSurfaces = nil
+		t.Cleanup(func() { suppliedValues = nil; structuralSurfaces = nil })
+		got := stripMarks(scrubSupplied(dropFraming(
+			"HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; server-secret\r\n\r\n")))
+		// ⚠ THE SHAPE, NOT THE SUBSTRING. `<redacted, 1 chars>` is the legitimate
+		// placeholder for the cookie's own value; what must not appear is the
+		// prose form spliced INTO a generated token, which is what stripping the
+		// marks produced.
+		if strings.Contains(got, "chars>-") {
+			t.Fatalf("the scrub rewrote a generated attribute name: %q", got)
 		}
 	})
 }

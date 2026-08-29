@@ -39,6 +39,7 @@ import (
 	"net/url"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -227,6 +228,23 @@ func redactFragment(line string) string {
 // there first is what the grammar says.
 // parsesAsURI reports whether a redirect target is a URI Go itself would accept,
 // which is the only thing that makes the host exemption true.
+// isSchemeName reports a URI scheme: a letter followed by letters, digits, `+`,
+// `-` or `.`, and nothing else -- which a path segment cannot be.
+func isSchemeName(v string) bool {
+	if v == "" || !((v[0] >= 'a' && v[0] <= 'z') || (v[0] >= 'A' && v[0] <= 'Z')) {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		ok := (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.'
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
 func parsesAsURI(target string) bool {
 	u, err := url.Parse(strings.TrimSpace(target))
 	if err != nil {
@@ -234,6 +252,14 @@ func parsesAsURI(target string) bool {
 	}
 	if u.Host == "" {
 		return true // a relative target has no authority to exempt
+	}
+	// ⚠ AND A BRACKETED IPv6 AUTHORITY IS ORDINARY. `[2001:db8::1]` has a Host
+	// that differs from its Hostname and no Port, so the first version of this
+	// predicate called every such redirect malformed and refused the capture
+	// (shardpilot/shardpilot-go#85 review). A test written from two accessors
+	// rather than from the grammar rejects what the grammar allows.
+	if strings.HasPrefix(u.Host, "[") {
+		return strings.Contains(u.Host, "]")
 	}
 	return u.Host == u.Hostname() || u.Port() != ""
 }
@@ -314,7 +340,11 @@ func redactPath(line string) string {
 		url, tail = url[:k], url[k:]+tail
 	}
 	start := 0
-	if i := strings.Index(url, "://"); i >= 0 {
+	// ⚠ ANCHORED. An unrestricted search read the `://` inside `/cb/http://x` as
+	// introducing a scheme called `/cb/http`, refused the capture, and exited 4 on
+	// a target Go parses as an ordinary relative path
+	// (shardpilot/shardpilot-go#85 review).
+	if i := strings.Index(url, "://"); i >= 0 && isSchemeName(url[:i]) {
 		// ⚠ THE SCHEME IS ENDPOINT-CHOSEN, AND THE HOST EXEMPTION DOES NOT COVER
 		// IT. A host is exempt deliberately -- structurally constrained, publicly
 		// resolvable. A scheme is neither: `server-secret://e.example/cb` is a
@@ -416,7 +446,7 @@ func redactSetCookie(line string) string {
 					continue
 				}
 				{
-					parts[i] = " " + stripMarks(tokenPlaceholder(strings.TrimSpace(an)))
+					parts[i] = " " + tokenPlaceholder(strings.TrimSpace(an))
 				}
 				continue
 			}
@@ -426,7 +456,12 @@ func redactSetCookie(line string) string {
 			// Standard attribute names are specification-fixed; anything else is
 			// a string the origin invented, exactly as on the cookie itself.
 			if !standardCookieAttr(an) {
-				parts[i] = " " + stripMarks(tokenPlaceholder(strings.TrimSpace(an))) +
+				// ⚠ MARKED, NOT STRIPPED -- the same defect as the parameter names one
+				// round earlier, in the branch I wrote after fixing it there. A
+				// stripped placeholder is captured text to the later scrub, which
+				// rewrote its prefix into the prose form and produced a name no
+				// cookie parser accepts (shardpilot/shardpilot-go#85 review).
+				parts[i] = " " + tokenPlaceholder(strings.TrimSpace(an)) +
 					"=" + placeholder(strings.TrimSpace(av))
 				continue
 			}
@@ -453,14 +488,32 @@ func redactUserinfo(line string) string {
 	i := strings.Index(line, "://")
 	skip := 3
 	if i < 0 {
-		if j := strings.Index(line, "//"); j >= 0 {
-			i, skip = j, 2
+		// ⚠ AT THE START OF THE TARGET. An unrestricted search read `//foo@bar`
+		// inside `/a//foo@bar/b` as an authority and redacted `foo` as userinfo,
+		// so the segment was reported at the wrong length
+		// (shardpilot/shardpilot-go#85 review).
+		// ⚠ A NETWORK-PATH REFERENCE IS AT THE START OF THE TARGET. A mutant
+		// loosening this to `Contains` survives, and that is honest: the
+		// authority bound below already stops an interior `//`, so two guards
+		// cover the case and only one of them is load-bearing today. The prefix
+		// test states the grammar, and the grammar is what the next reader needs.
+		if _, gap, url, ok := splitField(line); ok && strings.HasPrefix(url, "//") {
+			i, skip = len(line)-len(url), 2
+			_ = gap
 		} else {
 			return line
 		}
 	}
 	rest := line[i+skip:]
-	at := strings.IndexByte(rest, '@')
+	// ⚠ THE LAST `@` IN THE AUTHORITY, NOT THE FIRST. Go reads everything before
+	// the final separator as userinfo, so `//user@server-secret@host/cb` had only
+	// `user` redacted and the endpoint-generated middle was preserved as part of
+	// the authority (shardpilot/shardpilot-go#85 review).
+	authEnd := len(rest)
+	if j := strings.IndexAny(rest, "/?#"); j >= 0 {
+		authEnd = j
+	}
+	at := strings.LastIndexByte(rest[:authEnd], '@')
 	if at < 0 {
 		return line
 	}
@@ -534,11 +587,26 @@ func redactMintedBody(body string) string {
 		}
 		return false
 	}
+	// ⚠ AND THE REFUSAL IS TOP-LEVEL ONLY, as the guard half's detection is.
+	// `encoding/json` binds the SDK's field from the top-level object; a member of
+	// that name inside `variant_payload` is ordinary payload the endpoint chose to
+	// call that, and refusing on it made a publishable assignment unpublishable
+	// (shardpilot/shardpilot-go#84 review). The REDACTION above stays depth-blind
+	// on purpose -- lengthening a payload member costs a reader a label, while
+	// publishing a minted key costs the subject.
+	top := map[string]bool{}
+	for _, n := range topLevelMembers(body) {
+		top[n] = true
+	}
 	for _, loc := range jsonMemberName.FindAllStringSubmatchIndex(body, -1) {
 		if inCovered(loc[0]) {
 			continue
 		}
 		name := body[loc[2]:loc[3]]
+		dec, _ := jsonString(name)
+		if !top[dec] {
+			continue
+		}
 		if isMinted(name) {
 			// ⚠ NOTED AND WITHHELD, not noted alone. The capture is refused at
 			// publication either way, but the rule a reader has to hold is
@@ -632,12 +700,19 @@ var verbatimHeaders = map[string]func(string) bool{
 }
 
 func isHTTPDate(v string) bool {
-	for _, f := range []string{http.TimeFormat, time.RFC850, time.ANSIC} {
-		if _, err := time.Parse(f, strings.TrimSpace(v)); err == nil {
+	v = strings.TrimSpace(v)
+	// ⚠ THE ZONE IS FIXED TO `GMT`, AND Go's LAYOUT IS NOT. `MST` accepts any
+	// three-letter zone, so `Monday, 02-Jan-06 15:04:05 XYZ` parsed and the
+	// endpoint-chosen token was published through a field the criterion had
+	// declared safe (shardpilot/shardpilot-go#85 review). ANSIC carries no zone
+	// at all and is checked as itself.
+	for _, f := range []string{http.TimeFormat, time.RFC850} {
+		if _, err := time.Parse(f, v); err == nil && strings.HasSuffix(v, "GMT") {
 			return true
 		}
 	}
-	return false
+	_, err := time.Parse(time.ANSIC, v)
+	return err == nil
 }
 
 func isDigits(v string) bool {
@@ -775,7 +850,7 @@ func redactFieldName(name string) string {
 	if registeredFieldNames[strings.ToLower(strings.TrimSpace(name))] {
 		return name
 	}
-	return stripMarks(tokenPlaceholder(strings.TrimSpace(name)))
+	return tokenPlaceholder(strings.TrimSpace(name))
 }
 
 // redactUnlessVerbatim lengthens a header value unless its field passes the
@@ -815,6 +890,27 @@ func redactUnlessVerbatim(line string) string {
 	body := line
 	if strings.HasSuffix(body, "\r") {
 		cr, body = "\r", strings.TrimSuffix(body, "\r")
+	}
+	// ⚠ A STATUS LINE HAS NO COLON, AND ITS REASON IS ENDPOINT TEXT. Returning it
+	// unchanged published `HTTP/1.1 200 server-secret` -- a phrase `DumpResponse`
+	// preserves and no supplied-value scrub can see
+	// (shardpilot/shardpilot-go#85 review). Version and code are syntax; whatever
+	// follows them is not.
+	if strings.HasPrefix(body, "HTTP/") {
+		f := strings.SplitN(body, " ", 3)
+		if len(f) == 3 && f[2] != "" {
+			// ⚠ THE REGISTERED PHRASE FOR THAT CODE IS THE VOCABULARY, and Go
+			// already carries it. `OK` for 200 is specification-fixed; anything
+			// else in that position was written by the endpoint. Lengthening the
+			// registered phrase too would have made every capture unreadable and
+			// was caught by the fixture for the generated capture notes.
+			code, err := strconv.Atoi(f[1])
+			if err == nil && f[2] == http.StatusText(code) {
+				return line
+			}
+			return f[0] + " " + f[1] + " " + placeholder(f[2]) + cr
+		}
+		return line
 	}
 	name, value, ok := strings.Cut(body, ":")
 	if !ok || !isTokenOnly(strings.TrimSpace(name)) {

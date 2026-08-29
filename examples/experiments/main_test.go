@@ -82,7 +82,11 @@ func TestTrailerReportIsOutsideTheMessage(t *testing.T) {
 	// verbatim vocabulary, so its value is lengthened exactly as a header's would
 	// be -- a trailer is a header that arrived late. What this test protects is
 	// that the FIELD is reported beside the message rather than dropped.
-	if !strings.Contains(ex.trailerReport(), "X-Late: ") {
+	// ⚠ THE NAME IS LENGTHENED TOO NOW. `X-Late` is not in the field-name
+	// registry, so it is endpoint-chosen text like any other -- the criterion
+	// reaches trailer names as it reaches header names. What this protects is
+	// that the field is REPORTED beside the message rather than dropped.
+	if !strings.Contains(ex.trailerReport(), ": ") {
 		t.Fatal("trailers were dropped instead of being reported beside the message")
 	}
 }
@@ -491,7 +495,7 @@ func TestTrailersAreSnapshotAtEOFNotFromTheHead(t *testing.T) {
 	ex := exchange{head: []byte("HTTP/1.1 200 OK\r\nTrailer: X-Late\r\n\r\n"), captured: tee}
 	// The value is lengthened; what must not happen is the field being announced
 	// in the head and then absent from the report.
-	if !strings.Contains(ex.trailerReport(), "X-Late: ") {
+	if !strings.Contains(ex.trailerReport(), ": ") {
 		t.Fatal("a declared trailer was announced and then omitted")
 	}
 	if strings.Contains(string(ex.resp()), "X-Late: value") {
@@ -866,5 +870,78 @@ func TestGeneratedCaptureNotesAreMarked(t *testing.T) {
 	}
 	if !strings.Contains(got, "X-Capture-Note:") {
 		t.Fatalf("the generated note was destroyed: %q", got)
+	}
+}
+
+// ---- round on 0cdc4ee / 03cba8b ----
+
+func TestDecodedFieldNamesAreFoldedBeforeApproval(t *testing.T) {
+	suppliedValues = []string{"secret"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured("HTTP/1.1 200 OK\r\nX-%53ecret: v\r\n\r\n")); err == nil {
+		t.Fatal("an encoded name that decodes to a case variant passed the guard")
+	}
+}
+
+func TestNormalisedBase64GoesBackThroughEveryDecoder(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	inner := base64.StdEncoding.EncodeToString([]byte("%61bcdefgh"))
+	wrapped := inner[:5] + "\r\n" + inner[5:]
+	if err := assertNoLeak(asCaptured("body:\r\n" + wrapped + "\r\n")); err == nil {
+		t.Fatal("an encoding nested inside MIME-wrapped base64 passed the guard")
+	}
+}
+
+func TestProtocolTokensDoNotRefuseTheCapture(t *testing.T) {
+	// ⚠ THROUGH `redact`, NOT A HAND-BUILT DUMP. My first version composed the
+	// marked line itself and so could not see the call site at all -- the third
+	// fixture in this branch to do that. What `redact` produces is what the guard
+	// reads, so that is what the test reads.
+	for _, v := range []string{"Bearer", "Authorization", "Host", "User-Agent"} {
+		suppliedValues = []string{v}
+		raw := "GET /p HTTP/1.1\r\nHost: e.example\r\nAuthorization: Bearer abcdefgh\r\nUser-Agent: sp/1\r\n\r\n"
+		if err := assertNoLeak(asCaptured(string(redact([]byte(escapeMarks(raw)))))); err != nil {
+			t.Errorf("supplied %q: fixed request syntax was read as a leak: %v", v, err)
+		}
+		suppliedValues = nil
+	}
+}
+
+func TestAJSONLiteralIsNotRewritten(t *testing.T) {
+	suppliedValues = []string{"false"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied(`{"assigned":false}`))
+	if got != `{"assigned":false}` {
+		t.Fatalf("a JSON literal was rewritten into invalid JSON: %q", got)
+	}
+}
+
+func TestANestedMintedNameIsNotTheVerdictsField(t *testing.T) {
+	structuralSurfaces = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	dropFraming("HTTP/1.1 200 OK\r\n\r\n" + `{"assigned":true,"variant_payload":{"subject_fact_key":"label"}}`)
+	if len(structuralSurfaces) != 0 {
+		t.Fatalf("a payload member refused a publishable capture: %v", structuralSurfaces)
+	}
+	// ⚠ AND IN THIS HALF THE TOP-LEVEL ONE IS REDACTED, NOT REFUSED -- that is the
+	// whole difference between the two changes. The guard half refuses what it
+	// cannot redact; this half redacts it, so the property to assert here is that
+	// the minted value does not reach the artifact.
+	structuralSurfaces = nil
+	got := stripMarks(dropFraming("HTTP/1.1 200 OK\r\n\r\n" + `{"subject_fact_key":"sfk1_abab"}`))
+	if strings.Contains(got, "sfk1_abab") {
+		t.Fatalf("the top-level minted value was published: %q", got)
+	}
+}
+
+func TestTheWithheldQueryMarkerIsOneToken(t *testing.T) {
+	// ⚠ THROUGH THE REAL REDACTOR. The guard half withholds the query whole with
+	// a stand-in; this half redacts it structurally, so the property -- a request
+	// line is three components -- is asserted against what this half produces.
+	got := stripMarks(redactQuery("GET /v1/assign?a=b HTTP/1.1\r"))
+	line := strings.TrimSuffix(got, "\r")
+	if n := len(strings.Fields(line)); n != 3 {
+		t.Fatalf("the request line has %d components, not 3: %q", n, line)
 	}
 }
