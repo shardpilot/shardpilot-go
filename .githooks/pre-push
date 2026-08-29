@@ -37,9 +37,23 @@
 # Makefile scanned anyway and documented the gap in a comment; a comment is not
 # a gate.
 #
-# Install once:
+# ⚠ INSTALL BY COPY, NOT BY POINTING AT TRACKED CONTENT.
 #
-#     git config core.hooksPath .githooks
+#     cp .githooks/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+#
+# The earlier instruction was `git config core.hooksPath .githooks`, and it was
+# the vulnerability rather than the installation: core.hooksPath names a
+# DIRECTORY, so pointing it at a TRACKED one makes the hook that runs whatever
+# the checked-out branch says it is. Checking out an untrusted contributor's
+# branch and pushing it would execute THAT branch's copy of this file before any
+# trusted code ran -- the same class as the post-checkout execution closed one
+# round earlier, arriving through the door this file itself recommended
+# (shardpilot/shardpilot-go#79 review).
+#
+# `.git/hooks/` is outside the worktree and no branch can write to it. The cost
+# is that the copy does not update itself: re-copy when this file changes. That
+# is the trade, and it is the right way round -- a hook that updates itself from
+# the branch it is inspecting is not a gate.
 #
 # ⚠ EVERY COMMIT THE PUSH INTRODUCES IS SCANNED, not just its tip. A commit that
 # adds internal material and a later commit that removes it leave the tree clean
@@ -79,7 +93,7 @@ export GIT_NO_REPLACE_OBJECTS=1
 unset GIT_INDEX_FILE
 
 # ⚠ NOTHING FROM THE PUSHED BRANCH MAY RUN. `git worktree add` fires
-# post-checkout, and with the documented core.hooksPath=.githooks that hook is
+# post-checkout, and where core.hooksPath still points at tracked content that hook is
 # TRACKED CONTENT -- so a branch from an untrusted contributor would execute
 # arbitrary code on this machine merely by being inspected, before any scan.
 # Every git command below runs with hooks pointed at an empty directory.
@@ -186,7 +200,17 @@ scan_commit() {
       exit 2
     fi
     cp "$3" "$wt/$2"
-    ( cd "$wt" && git_safe add "$2" >/dev/null 2>&1 ) || true
+    # ⚠ FORCED, AND A FAILURE REFUSES. A commit whose .gitignore covers the
+    # evidence path made the plain `git add` fail; `|| true` swallowed it, the
+    # scanner reads only the index, and the run reported clean without ever
+    # seeing the message or the committed scanner -- a silent skip wearing a
+    # pass (shardpilot/shardpilot-go#79 review).
+    if ! ( cd "$wt" && git_safe add -f "$2" >/dev/null 2>&1 ); then
+      printf 'REFUSING: could not stage %s for scanning in %s.\n' "$2" "$1" >&2
+      printf '  Unstaged evidence is unread evidence, and this gate does not\n' >&2
+      printf '  report on what it has not read.\n' >&2
+      exit 2
+    fi
   }
 
   if [ -e "$wt/scripts/check_public_surface.sh" ]; then
@@ -195,14 +219,16 @@ scan_commit() {
     stage_evidence "$1" scripts/scanner-as-committed.txt "$tmpdir/committed-scanner"
   fi
 
-  # ⚠ A COMMIT MESSAGE IS PUBLISHED TOO. The tree is not the whole of what a
-  # push makes reachable: a clean tree with an internal identifier in its
-  # message publishes that identifier just as surely, and this hook read only
-  # trees (shardpilot/shardpilot-go#79 review). The message is staged as an
-  # ordinary file so the SAME rules read it -- no second scanner, no second
-  # pattern list to drift.
-  git log -1 --format=%B "$1" > "$tmpdir/committed-message" 2>/dev/null || : > "$tmpdir/committed-message"
-  stage_evidence "$1" scripts/commit-message-as-committed.txt "$tmpdir/committed-message"
+  # ⚠ THE WHOLE COMMIT OBJECT, NOT ONLY ITS MESSAGE. The tree is not the whole
+  # of what a push makes reachable, and neither is the message: author and
+  # committer names and addresses are published with it, and `%B` reads none of
+  # them (shardpilot/shardpilot-go#79 review, after an earlier round had already
+  # moved from tree-only to tree-plus-message). `git cat-file commit` is the
+  # object as it will be published -- headers, message, everything -- and it is
+  # staged as an ordinary file so the SAME rules read it, with no second scanner
+  # and no second pattern list to drift.
+  git cat-file commit "$1" > "$tmpdir/committed-object" 2>/dev/null || : > "$tmpdir/committed-object"
+  stage_evidence "$1" scripts/commit-object-as-committed.txt "$tmpdir/committed-object"
 
   cp "$scanner" "$wt/scripts/check_public_surface.sh"
   chmod +x "$wt/scripts/check_public_surface.sh"

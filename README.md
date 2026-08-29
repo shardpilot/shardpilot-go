@@ -311,8 +311,10 @@ No Makefile — standard Go tooling.
 **Install the pre-push hook once, before your first push:**
 
 ```
-git config core.hooksPath .githooks
+cp .githooks/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
 ```
+
+Copied rather than `core.hooksPath .githooks`: that setting names a directory, so pointing it at tracked content makes the hook that runs whatever the checked-out branch says it is — checking out someone else's branch and pushing it would execute their copy of the hook first. `.git/hooks/` is outside the worktree and no branch can write to it. Re-copy when the file changes.
 
 This repository is public, and a repository publishes its **history** along with its tree — a commit carrying internal material is published the moment it is **pushed**, not when it merges, and the remedy then is a branch rewrite rather than a fix. [`.githooks/pre-push`](.githooks/pre-push) runs [`scripts/check_public_surface.sh`](scripts/check_public_surface.sh) against the commit CI will compare yours to, which it can do because git hands a pre-push hook the actual refspec: the pre-push tip for an existing ref, the remote's default branch when the ref is being created. It refuses — rather than scanning something else — when the pushed tip is not your HEAD or the tree is dirty. `git push --no-verify` bypasses it, which is a decision to publish unscanned. CI ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) runs `go test ./...` and `go vet ./...` on **both** Go 1.25.x (the baseline) and 1.27.x, plus a release version-consistency check (`scripts/check_release_consistency.sh`; see [`docs/release.md`](docs/release.md)).
 
