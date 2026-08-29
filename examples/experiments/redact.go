@@ -392,7 +392,7 @@ func redactMintedBody(body string) string {
 			// describe does not appear in what this function returns. The body
 			// goes whole, because the shape that defeated the pattern is exactly
 			// the shape whose extent cannot be determined.
-			noteStructural("a server-minted field whose value shape is not covered")
+			noteStructural("a server-minted field in a value shape these rules do not describe")
 			return marked("<withheld: a minted field in an undescribed shape>")
 		}
 	}
