@@ -11,6 +11,49 @@
 // and what came back, which makes the result an artifact rather than a claim
 // that something worked.
 //
+// ⚠ WHAT THIS PROGRAM CLAIMS, AND WHY THE CLAIM IS NARROW ON PURPOSE.
+//
+// It does NOT claim "nothing leaks". That is an absolute statement about a
+// hostile input and has no fixed point: for every form a reader imagines, the
+// program grows a defence, and the next form is imagined next. A list of probes
+// against imagination is a list against an infinity, and a list is complete only
+// from the inside. Review rounds on this file demonstrated exactly that, each
+// finding real defects in the previous round's fixes, because there was no
+// specification to converge against.
+//
+// It claims something checkable instead:
+//
+//	NOTHING IS PRINTED THAT THIS PROGRAM CANNOT ACCOUNT FOR.
+//
+//	  a supplied value      provably absent from every form the decoders reach,
+//	                        or the record is not printed at all
+//	  a server-generated    Set-Cookie, Location, a top-level minted subject key,
+//	    surface             or a body in a coding this build cannot decode: the
+//	                        record is NOT printed, because this half can detect
+//	                        them and cannot redact them
+//	  a request query       withheld whole — a length this half cannot compute is
+//	                        not a length it may guess
+//	  protocol syntax       marked as generated, and therefore not read as
+//	                        captured data: the method, the version, the status
+//	                        line, request header names, the auth scheme, values
+//	                        `net/http` writes into the dump, the SDK's fixed
+//	                        route, and the three JSON grammar literals
+//	  everything else       printed as received
+//
+// ⚠ THE LAST CLAUSE IS THE WEAK ONE, AND SAYING SO IS THE POINT. "Everything
+// else printed as received" covers an `ETag`, a `Server` banner, an unregistered
+// field name -- values the endpoint chose and this half neither refuses nor
+// redacts. That is the clause the structural-redaction change replaces, with a
+// test each of those must pass; until it lands, this program prints them and
+// this comment says so rather than leaving a reader to discover it.
+//
+// The difference the claim makes to whoever reviews this: "nothing leaks" can
+// only be attacked by inventing a new shape. The clauses above can be CHECKED --
+// take any byte in the artifact and ask which one admitted it. A clause that
+// admits what it should not is one defect in the criterion; a place that prints
+// without asking is a defect in that place. Both questions have answers. "Did
+// you think of every encoding" does not.
+//
 // The Authorization header is redacted in the output. The key is read from the
 // environment and never from a command line, because a command line is visible
 // to every process on the host and lands in shell history.
@@ -546,6 +589,20 @@ func dropFraming(dump string) string {
 		// list of values THIS program supplied can reach them, exactly as with
 		// Set-Cookie (shardpilot/shardpilot-go#73 review). Redacted structurally,
 		// by the same function the request line uses: names kept, values lengthed.
+		// ⚠ A CODING THE TRANSPORT DID NOT UNDO LEAVES THE BODY OPAQUE. Go
+		// decompresses gzip it requested itself; anything still declared here --
+		// `deflate`, `br`, `zstd` -- means the bytes below are compressed, and
+		// neither the scrub nor the guard's decoders can see a supplied value
+		// inside them, while a reader need only apply the declared coding
+		// (shardpilot/shardpilot-go#84 review). This half cannot decode it, so it
+		// does not publish it.
+		if strings.HasPrefix(low, "content-encoding:") {
+			if v := strings.TrimSpace(strings.TrimSuffix(l[len("content-encoding:"):], "\r")); v != "" &&
+				!strings.EqualFold(v, "identity") {
+				noteStructural("a body in the content coding " + strings.ToLower(v) +
+					", which this build cannot decode")
+			}
+		}
 		if strings.HasPrefix(low, "location:") {
 			// ⚠ AND THE FRAGMENT, NOT ONLY THE QUERY. An OAuth-style redirect
 			// carries its credential after `#` -- `#access_token=…` never reaches
@@ -832,6 +889,10 @@ func (t *teeBody) Close() error {
 	return err
 }
 
+// serialiserWritten are request headers `net/http` adds while dumping, whose
+// values are as invariant as their names.
+var serialiserWritten = map[string]bool{"accept-encoding": true}
+
 func redact(dump []byte) []byte {
 	out := make([]string, 0, 32)
 	for _, line := range strings.Split(string(dump), "\n") {
@@ -872,7 +933,16 @@ func redact(dump []byte) []byte {
 		// under the scrub, where it belongs.
 		if i, ok := headerNameEnd(strings.TrimSuffix(line, "\r")); ok &&
 			!strings.HasPrefix(line, genMark) {
-			line = marked(line[:i+1]) + line[i+1:]
+			// ⚠ AND THE VALUES THE SERIALISER ITSELF WRITES. `DumpRequestOut` adds
+			// `Accept-Encoding: gzip`, which this program did not choose and the
+			// endpoint did not send -- so a legal experiment key of `gzip` was
+			// found there and refused every run, exactly as the header NAMES and
+			// the auth scheme did before it (shardpilot/shardpilot-go#84 review).
+			if serialiserWritten[strings.ToLower(strings.TrimSpace(line[:i]))] {
+				line = marked(strings.TrimSuffix(line, "\r")) + strings.TrimPrefix(line[len(strings.TrimSuffix(line, "\r")):], "")
+			} else {
+				line = marked(line[:i+1]) + line[i+1:]
+			}
 		}
 		out = append(out, line)
 	}
@@ -888,7 +958,24 @@ const captureDeadline = 30 * time.Second
 // unredacted subject_key and every targeting value -- the same leak the request
 // dump had already been fixed for, arriving by a second road
 // (shardpilot/shardpilot-go#73 review).
+// ⚠ AN ERROR FROM THE TRANSPORT CARRIES ENDPOINT BYTES. Go's parser puts the
+// offending line into the error it returns, so a malformed response can place an
+// encoded supplied value there -- and the result was written into report PROSE,
+// outside any captured span, where the guard's decoders never look
+// (shardpilot/shardpilot-go#84 review). It is marked as captured, so the same
+// fixed-point check runs over it.
+// sanitizeCaptured is for the REPORT, where the guard reads it. sanitize is for
+// stderr, which the guard never sees and where a marker byte would print as a
+// raw control character.
+func sanitizeCaptured(err error) string {
+	return asCaptured(sanitize(err))
+}
+
 func sanitize(err error) string {
+	return sanitizeRaw(err)
+}
+
+func sanitizeRaw(err error) string {
 	if err == nil {
 		return ""
 	}
@@ -1347,13 +1434,25 @@ func assertNoLeak(text string) error {
 			// checked as-is, so nothing ever percent-decoded it
 			// (shardpilot/shardpilot-go#84 review). A candidate is an input to the
 			// chain, not an answer from it.
+			// ⚠ TO A FIXED POINT, NOT ONE PASS. base64 can carry TWO layers of
+			// another encoding -- `%2561bcdefgh` -- and a single sweep of the
+			// decoders left `%61bcdefgh` undecoded, while the ordinary chain
+			// cannot reach it because it never un-wraps the base64
+			// (shardpilot/shardpilot-go#84 review). The candidate joins the same
+			// work budget, so a crafted body cannot spin it.
 			norm := joinBase64Runs(cur)
 			dec := undoBase64(norm)
 			extra = append(extra, norm, dec)
-			for _, st := range []func(string) string{undoPercent, undoUnicodeEscapes, undoHex, undoPlus, undoEntities} {
-				work += len(dec)
-				dec = st(dec)
-				extra = append(extra, dec)
+			for round := 0; round <= len(dec) && work <= decodeWorkMax; round++ {
+				before := dec
+				for _, st := range []func(string) string{undoPercent, undoUnicodeEscapes, undoBase64, undoHex, undoPlus, undoEntities} {
+					work += len(dec)
+					dec = st(dec)
+					extra = append(extra, dec)
+				}
+				if dec == before {
+					break
+				}
 			}
 			work += len(cur)
 			if work > decodeWorkMax {
@@ -1382,7 +1481,13 @@ func assertNoLeak(text string) error {
 				"publishable and was not printed", len(text)+1)
 	}
 	for _, v := range suppliedValues {
-		if v == "" {
+		// ⚠ THE SAME EXEMPTION AS THE SCRUB. `jsonLiterals` was consulted by
+		// `scrubSuppliedRaw` alone, so a key of `false` stopped corrupting the
+		// body and went on refusing every capture instead -- the fix moved the
+		// defect rather than removing it (shardpilot/shardpilot-go#84 review). An
+		// exemption honoured by one of two rules is a disagreement, not an
+		// exemption.
+		if v == "" || jsonLiterals[v] {
 			continue
 		}
 		for _, f := range append(append([]string{}, forms...), extra...) {
@@ -2038,7 +2143,7 @@ func main() {
 	fmt.Fprintf(&report, "    code:     %q\n", stripMarks(scrubSupplied(result.Code)))
 	fmt.Fprintf(&report, "    version:  %d\n", result.Version)
 	if fetchErr != nil {
-		fmt.Fprintf(&report, "    error:    %s\n", sanitize(fetchErr))
+		fmt.Fprintf(&report, "    error:    %s\n", sanitizeCaptured(fetchErr))
 	}
 
 	// THE ARTIFACT IS CHECKED BEFORE IT IS PUBLISHED, not as it is assembled.
