@@ -185,7 +185,7 @@ func TestGuardIgnoresItsOwnPlaceholders(t *testing.T) {
 func TestEveryQueryValueTheSDKSendsIsScrubbed(t *testing.T) {
 	suppliedValues = nil
 	t.Cleanup(func() { suppliedValues = nil })
-	u, err := url.Parse("https://h/a?subject_key=spcid_0123456789abcdef0123456789abcdef&app_key=k")
+	u, err := url.Parse("https://h/a?subject_key=spcid_abababababababababababababababab&app_key=k")
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -196,8 +196,8 @@ func TestEveryQueryValueTheSDKSendsIsScrubbed(t *testing.T) {
 	}
 	// The minted subject is not an environment value, and it is what a redirect
 	// Location echoes back.
-	got := scrubSupplied("Location: /r?subject_key=spcid_0123456789abcdef0123456789abcdef")
-	if strings.Contains(got, "spcid_0123456789abcdef0123456789abcdef") {
+	got := scrubSupplied("Location: /r?subject_key=spcid_abababababababababababababababab")
+	if strings.Contains(got, "spcid_abababababababababababababababab") {
 		t.Fatalf("the SDK-minted subject was published verbatim: %q", got)
 	}
 }
