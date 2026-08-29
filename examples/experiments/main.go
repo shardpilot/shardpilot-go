@@ -280,7 +280,7 @@ func headerNameEnd(line string) (int, bool) {
 // (shardpilot/shardpilot-go#73 review, found by mutating rather than by
 // reading). Naming it once removes the copy.
 func responseText(ex *exchange) string {
-	return scrubSupplied(dropFraming(stripNUL(string(ex.resp()))))
+	return asCaptured(scrubSupplied(dropFraming(escapeMarks(string(ex.resp())))))
 }
 
 // redactFragment applies the query treatment to a URL fragment: parameter names
@@ -431,7 +431,7 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 	}
 	if dump, err := httputil.DumpRequestOut(req, true); err == nil {
-		ex.req = redact([]byte(stripNUL(string(dump))))
+		ex.req = redact([]byte(escapeMarks(string(dump))))
 	}
 
 	resp, err := r.inner.RoundTrip(req)
@@ -776,15 +776,48 @@ func encodingsOf(v string) []string {
 // the marks are removed at the moment of printing. A NUL in the finished report
 // is therefore ours by construction, and the check ignores exactly what we wrote
 // and nothing else.
-const mark = "\x00"
+// TWO marks, because the report has three kinds of text and the check concerns
+// exactly one of them.
+//
+// ⚠ ONE MARK WAS NOT ENOUGH, and its two failures were both mine. Marking only
+// GENERATED PLACEHOLDERS left the recorder's own PROSE unmarked and
+// indistinguishable from captured content, so `SP_EXPERIMENT_KEY=assignment`
+// made the heading `# assignment capture` read as a leak and refused every run.
+// And reserving NUL forced me to DELETE it from captured bodies, so a response
+// legitimately containing one was published altered -- a recorder changing the
+// bytes it exists to record (shardpilot/shardpilot-go#73 review).
+//
+// So: captured text is wrapped in `capturedMark`, placeholders inside it in
+// `genMark`, and the check reads captured spans minus generated ones. Prose
+// carries no mark and is therefore outside the question by construction rather
+// than by a rule. Captured bytes are ESCAPED, not dropped.
+const capturedMark = "\x00"
+const genMark = "\x01"
 
-func marked(s string) string { return mark + s + mark }
+func marked(s string) string { return genMark + s + genMark }
 
-var markedSpan = regexp.MustCompile(mark + "[^" + mark + "]*" + mark)
+// asCaptured delimits text that came from the wire. ⚠ IT DOES NOT ESCAPE:
+// escaping belongs on the RAW bytes, before redaction inserts its own marks --
+// doing it here escaped those too, so the guard read its own placeholders as
+// captured content and refused every run. The order is the whole of it:
+// escapeMarks -> redact -> asCaptured.
+func asCaptured(s string) string { return capturedMark + s + capturedMark }
 
-// stripNUL removes the marker byte from anything that came from outside, so a
-// crafted body cannot forge a mark and hide inside it.
-func stripNUL(s string) string { return strings.ReplaceAll(s, mark, "") }
+var capturedSpan = regexp.MustCompile(capturedMark + "[^" + capturedMark + "]*" + capturedMark)
+var genSpan = regexp.MustCompile(genMark + "[^" + genMark + "]*" + genMark)
+
+// escapeMarks keeps captured bytes rather than deleting them: a body may legally
+// contain either marker byte, and the artifact must still hold what arrived. The
+// escape is visible and reversible; deletion was neither.
+func escapeMarks(s string) string {
+	s = strings.ReplaceAll(s, capturedMark, `\x00`)
+	return strings.ReplaceAll(s, genMark, `\x01`)
+}
+
+func stripMarks(s string) string {
+	s = strings.ReplaceAll(s, capturedMark, "")
+	return strings.ReplaceAll(s, genMark, "")
+}
 
 func assertNoLeak(text string) error {
 	// ⚠ MASK ONLY WHAT CANNOT BE A VALUE. Blanking every placeholder shape hid a
@@ -792,7 +825,13 @@ func assertNoLeak(text string) error {
 	// is a legal key, it is printed verbatim in the canonical request, and the
 	// mask erased it before the check (shardpilot/shardpilot-go#73 review). A
 	// mask that can swallow the thing it is protecting is worse than no mask.
-	text = markedSpan.ReplaceAllString(text, " ")
+	// Only what was CAPTURED is in question; prose and placeholders are ours.
+	var captured strings.Builder
+	for _, span := range capturedSpan.FindAllString(text, -1) {
+		captured.WriteString(genSpan.ReplaceAllString(span, " "))
+		captured.WriteString("\n")
+	}
+	text = captured.String()
 	// DECODE TO A FIXED POINT. One pass left `a%2522b` -- the ordinary shape when
 	// a URL is embedded in another URL's parameter -- decoding only to `a%22b`,
 	// which matches no supplied value, so a doubly-encoded identifier walked
@@ -825,8 +864,17 @@ func assertNoLeak(text string) error {
 				"decoding exceeded its work budget (%d bytes examined); the record "+
 					"is NOT publishable and was not printed", work)
 		}
-		next := undoEntities(undoPlus(undoUnicodeEscapes(undoPercent(cur))))
-		if next == cur {
+		// ⚠ EACH STAGE, NOT ONLY THE ROUND. Composing the four decoders meant the
+		// intermediate forms never existed to be checked: `%61bcdefghi%2Bj`
+		// percent-decodes to the supplied `abcdefghi+j` and `undoPlus` turned it
+		// into `abcdefghi j` inside the same expression, so the one form that
+		// matched was never retained (shardpilot/shardpilot-go#73 review).
+		for _, stage := range []func(string) string{undoPercent, undoUnicodeEscapes, undoPlus, undoEntities} {
+			cur = stage(cur)
+			forms = append(forms, cur)
+		}
+		next := cur
+		if next == forms[len(forms)-5] {
 			settled = true
 			break
 		}
@@ -952,6 +1000,15 @@ func undoUnicodeEscapes(text string) string {
 // `X-<key>` published the identifier in its name and the boundary check waved
 // it through (shardpilot/shardpilot-go#73 review). The rule is not loosened for
 // values; the name is split on its own separator first.
+// nameSafe is the placeholder used inside a header NAME. `<redacted, 6 chars>`
+// carries spaces, a comma and angle brackets, none of which are legal in an HTTP
+// field name -- so the scrub that exists to keep a name publishable made the
+// message unparsable in exactly the case it handles
+// (shardpilot/shardpilot-go#73 review). This is letters, digits and hyphens.
+func nameSafe(v string) string {
+	return marked(fmt.Sprintf("redacted-%d-chars", utf8.RuneCountInString(v)))
+}
+
 func scrubHeaderName(name string) string {
 	// ⚠ SPLITTING FIRST CANNOT MATCH A HYPHENATED VALUE. The previous version cut
 	// the name on `-` and scrubbed each piece, so a legal key `foo-bar` matched no
@@ -961,7 +1018,7 @@ func scrubHeaderName(name string) string {
 	// the split was reaching for and could not express.
 	for _, v := range longestFirst(suppliedValues) {
 		if v != "" {
-			name = replaceValueWith(name, v, isNameByte)
+			name = replaceTokenWith(name, v, nameSafe(v), isNameByte)
 		}
 	}
 	return name
@@ -1028,7 +1085,11 @@ func replaceValue(text, v string) string {
 }
 
 func replaceValueWith(text, v string, isWord func(byte) bool) string {
-	red := marked(fmt.Sprintf("<redacted, %d chars>", len(v)))
+	return replaceTokenWith(text, v,
+		marked(fmt.Sprintf("<redacted, %d chars>", len(v))), isWord)
+}
+
+func replaceTokenWith(text, v, red string, isWord func(byte) bool) string {
 	if len(v) >= 8 {
 		return strings.ReplaceAll(text, v, red)
 	}
@@ -1137,7 +1198,7 @@ func main() {
 		if len(rec.exchanges) > 1 {
 			label = fmt.Sprintf(" %d", i+1)
 		}
-		reqText := string(ex.req)
+		reqText := asCaptured(string(ex.req))
 		// ⚠ NOT "as the SDK sent it". DumpRequestOut serialises the request as
 		// HTTP/1.1 through a separate fake transport, BEFORE the real one
 		// negotiates a protocol. On an HTTP/2 connection the report paired a
@@ -1168,7 +1229,12 @@ func main() {
 				label, sanitize(ex.truncErr()), fencedBlock(body), ex.trailerReport())
 		default:
 			respText := responseText(&ex)
-			fmt.Fprintf(&report, "## Response%s\n\n%s\n%s\n", label,
+			fmt.Fprintf(&report, "## Response%s — header block re-serialised by "+
+				"`httputil.DumpResponse`\n\nThe status line and body are as received. The "+
+				"HEADER block is written back out by `net/http`, which can add what it "+
+				"would send rather than what arrived — `Connection: close` appears on a "+
+				"bodyless dump and is forbidden in HTTP/2, so a header here is not "+
+				"evidence that it was received.\n\n%s\n%s\n", label,
 				fencedBlock(respText), ex.trailerReport())
 		}
 	}
@@ -1205,7 +1271,7 @@ func main() {
 	// A CAPTURE NOBODY RECEIVED IS NOT A CAPTURE. An ignored write error let a
 	// report truncated by a full filesystem -- or never written at all -- be
 	// followed by "SERVED" and exit 0 (shardpilot/shardpilot-go#73 review).
-	if _, werr := io.WriteString(os.Stdout, strings.ReplaceAll(report.String(), mark, "")); werr != nil {
+	if _, werr := io.WriteString(os.Stdout, stripMarks(report.String())); werr != nil {
 		fmt.Fprintf(os.Stderr, "REFUSING: the capture could not be written whole: %v\n", werr)
 		os.Exit(4)
 	}

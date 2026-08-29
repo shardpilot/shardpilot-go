@@ -51,11 +51,11 @@ func TestGuardDoesNotRefuseALegalShortKeyInProse(t *testing.T) {
 	t.Cleanup(func() { suppliedValues = nil })
 	// The SDK accepts any non-empty experiment key. Ordinary report prose
 	// contains the letter inside words, and that is not an occurrence.
-	if err := assertNoLeak("# assignment capture — 2026-08-29\n"); err != nil {
+	if err := assertNoLeak(asCaptured("# assignment capture — 2026-08-29\n")); err != nil {
 		t.Fatalf("the guard refused a valid run over prose: %v", err)
 	}
 	// A whole-token occurrence is still a leak.
-	if err := assertNoLeak("experiment_key=a&x=1"); err == nil {
+	if err := assertNoLeak(asCaptured("experiment_key=a&x=1")); err == nil {
 		t.Fatal("the guard missed a short value standing as its own token")
 	}
 }
@@ -64,7 +64,7 @@ func TestGuardDecodesSurrogatePairs(t *testing.T) {
 	suppliedValues = []string{"a\U0001F600b"}
 	t.Cleanup(func() { suppliedValues = nil })
 	esc := `{"k":"a` + "\\ud83d\\ude00" + `b"}`
-	if err := assertNoLeak(esc); err == nil {
+	if err := assertNoLeak(asCaptured(esc)); err == nil {
 		t.Fatalf("a surrogate-pair spelling was not decoded: %q", esc)
 	}
 }
@@ -113,10 +113,10 @@ func TestAssertNoLeakCatchesASpellingNobodyConstructed(t *testing.T) {
 	if scrubSupplied(hidden) != hidden {
 		t.Fatalf("precondition failed: the scrub was expected to miss this spelling")
 	}
-	if err := assertNoLeak(hidden); err == nil {
+	if err := assertNoLeak(asCaptured(hidden)); err == nil {
 		t.Fatal("assertNoLeak passed a value it should have decoded and caught")
 	}
-	if err := assertNoLeak(`{"k":"nothing here"}`); err != nil {
+	if err := assertNoLeak(asCaptured(`{"k":"nothing here"}`)); err != nil {
 		t.Fatalf("assertNoLeak refused a clean artifact: %v", err)
 	}
 }
@@ -163,7 +163,7 @@ func TestGuardDecodesNestedPercentEscapes(t *testing.T) {
 	suppliedValues = []string{`a"b`}
 	t.Cleanup(func() { suppliedValues = nil })
 	// A URL embedded in another URL's parameter encodes the identifier twice.
-	if err := assertNoLeak("Location: /r?next=%2Fx%3Fexperiment_key%3Da%2522b"); err == nil {
+	if err := assertNoLeak(asCaptured("Location: /r?next=%2Fx%3Fexperiment_key%3Da%2522b")); err == nil {
 		t.Fatal("a doubly percent-encoded identifier passed the guard")
 	}
 }
@@ -176,10 +176,10 @@ func TestGuardIgnoresItsOwnPlaceholders(t *testing.T) {
 	// be testing the wrong thing.
 	report := redactQuery("GET /x?experiment_key=redacted HTTP/1.1") +
 		"\n" + scrubSupplied("echoed: redacted")
-	if err := assertNoLeak(report); err != nil {
+	if err := assertNoLeak(asCaptured(report)); err != nil {
 		t.Fatalf("the guard rejected a fully redacted report: %v", err)
 	}
-	if err := assertNoLeak("experiment_key=redacted&x=1"); err == nil {
+	if err := assertNoLeak(asCaptured("experiment_key=redacted&x=1")); err == nil {
 		t.Fatal("the guard missed a real occurrence outside a placeholder")
 	}
 }
@@ -223,7 +223,7 @@ func TestGuardDecodesPlusAsSpace(t *testing.T) {
 	suppliedValues = []string{"a b"}
 	t.Cleanup(func() { suppliedValues = nil })
 	// A URL nested in another URL's query: the inner `+` is itself encoded.
-	if err := assertNoLeak("Location: /r?next=%3Fexperiment_key%3Da%2Bb"); err == nil {
+	if err := assertNoLeak(asCaptured("Location: /r?next=%3Fexperiment_key%3Da%2Bb")); err == nil {
 		t.Fatal("a nested query-plus spelling passed the guard")
 	}
 }
@@ -241,7 +241,7 @@ func TestGuardHasNoFixedDecodingDepth(t *testing.T) {
 	// SURVIVED it: that version also errors, but with "did not settle" rather
 	// than by finding the value. Two different verdicts, one indistinguishable
 	// assertion.
-	err := assertNoLeak(v)
+	err := assertNoLeak(asCaptured(v))
 	if err == nil {
 		t.Fatal("a deeply nested encoding walked through the guard")
 	}
@@ -277,7 +277,7 @@ func TestRedactedAuthorizationKeepsItsTerminator(t *testing.T) {
 func TestGuardDecodesHTMLEntities(t *testing.T) {
 	suppliedValues = []string{"a&b"}
 	t.Cleanup(func() { suppliedValues = nil })
-	if err := assertNoLeak("<p>rejected key a&amp;b</p>"); err == nil {
+	if err := assertNoLeak(asCaptured("<p>rejected key a&amp;b</p>")); err == nil {
 		t.Fatal("an HTML entity spelling passed the guard")
 	}
 }
@@ -286,7 +286,7 @@ func TestGuardDoesNotMaskAValueShapedLikeAPlaceholder(t *testing.T) {
 	suppliedValues = []string{"redacted-38-chars"}
 	t.Cleanup(func() { suppliedValues = nil })
 	// A legal experiment key that happens to look like a generated placeholder.
-	if err := assertNoLeak("GET /x?experiment_key=redacted-38-chars HTTP/1.1"); err == nil {
+	if err := assertNoLeak(asCaptured("GET /x?experiment_key=redacted-38-chars HTTP/1.1")); err == nil {
 		t.Fatal("the mask swallowed the very value it was protecting")
 	}
 }
@@ -358,7 +358,7 @@ func TestHyphenatedIdentifierInAHeaderName(t *testing.T) {
 		t.Fatalf("a hyphenated identifier survived the name scrub: %q", got)
 	}
 	// And the guard must see it too, under the name convention.
-	if err := assertNoLeak("X-foo-bar: value"); err == nil {
+	if err := assertNoLeak(asCaptured("X-foo-bar: value")); err == nil {
 		t.Fatal("the guard missed a hyphenated identifier in a header name")
 	}
 }
@@ -370,7 +370,7 @@ func TestGuardDecodesHexEscapes(t *testing.T) {
 	if scrubSupplied(hidden) != hidden {
 		t.Fatal("precondition: the scrub is expected to miss this spelling")
 	}
-	err := assertNoLeak(hidden)
+	err := assertNoLeak(asCaptured(hidden))
 	if err == nil {
 		t.Fatal("a hex-escape spelling passed the guard")
 	}
@@ -392,11 +392,11 @@ func TestAValueShapedLikeAPlaceholderStillPublishes(t *testing.T) {
 	// as a leak. Both directions in one fixture.
 	suppliedValues = []string{"redacted-38-chars"}
 	t.Cleanup(func() { suppliedValues = nil })
-	if err := assertNoLeak("GET /x?experiment_key=redacted-38-chars HTTP/1.1"); err == nil {
+	if err := assertNoLeak(asCaptured("GET /x?experiment_key=redacted-38-chars HTTP/1.1")); err == nil {
 		t.Fatal("the mask swallowed the value it was protecting")
 	}
 	clean := redactQuery("GET /x?subject_key=ababababababababababababababababababab HTTP/1.1")
-	if err := assertNoLeak(clean); err != nil {
+	if err := assertNoLeak(asCaptured(clean)); err != nil {
 		t.Fatalf("a generated placeholder was read as a leak: %v", err)
 	}
 }
@@ -429,6 +429,54 @@ func TestQueryLengthCountsCharactersNotBytes(t *testing.T) {
 	got := redactQuery("GET /x?experiment_key=%C3%A9 HTTP/1.1")
 	if !strings.Contains(got, "redacted-1-chars") {
 		t.Fatalf("a one-character value was measured in bytes: %q", got)
+	}
+}
+
+func TestGeneratedProseIsNotCheckedForLeaks(t *testing.T) {
+	suppliedValues = []string{"assignment"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// The recorder's own heading contains the word; only captured spans are in
+	// question, and prose carries no mark at all.
+	if err := assertNoLeak("# assignment capture — 2026-08-29\n"); err != nil {
+		t.Fatalf("the guard read its own prose as captured content: %v", err)
+	}
+	if err := assertNoLeak(asCaptured("experiment_key=assignment&x=1")); err == nil {
+		t.Fatal("the guard missed a real occurrence inside captured text")
+	}
+}
+
+func TestCapturedNULIsEscapedNotDeleted(t *testing.T) {
+	ex := exchange{head: []byte("HTTP/1.1 200 OK\r\n\r\n"),
+		captured: &teeBody{buf: *bytes.NewBufferString("a\x00b")}}
+	got := responseText(&ex)
+	if strings.Contains(stripMarks(got), "ab") {
+		t.Fatalf("a captured NUL was deleted, joining separated bytes: %q", got)
+	}
+	if !strings.Contains(got, `\x00`) {
+		t.Fatalf("a captured NUL was not disclosed: %q", got)
+	}
+}
+
+func TestHeaderNamePlaceholderIsTokenSafe(t *testing.T) {
+	suppliedValues = []string{"secret"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubHeaderName("X-secret"))
+	for _, bad := range []string{" ", ",", "<", ">"} {
+		if strings.Contains(got, bad) {
+			t.Fatalf("a header name got a non-token placeholder %q: %q", bad, got)
+		}
+	}
+	if strings.Contains(got, "secret") {
+		t.Fatalf("the identifier survived: %q", got)
+	}
+}
+
+func TestPercentDecodedFormIsCheckedBeforePlus(t *testing.T) {
+	suppliedValues = []string{"abcdefghi+j"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// Percent-decoding reconstructs the value; undoPlus would then destroy it.
+	if err := assertNoLeak(asCaptured("k=%61bcdefghi%2Bj")); err == nil {
+		t.Fatal("the intermediate percent-decoded form was never checked")
 	}
 }
 
