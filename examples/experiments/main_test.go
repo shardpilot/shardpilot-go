@@ -492,6 +492,34 @@ func TestLocationUserinfoIsRedacted(t *testing.T) {
 	}
 }
 
+func TestSchemeRelativeUserinfoIsRedacted(t *testing.T) {
+	suppliedValues = nil
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(dropFraming("HTTP/1.1 302 Found\r\nLocation: //user:secret@e.example/cb\r\n\r\n"))
+	if strings.Contains(got, "secret") {
+		t.Fatalf("userinfo in a network-path reference was published: %q", got)
+	}
+}
+
+func TestTrailerContentIsInsideACapturedSpan(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	tee := &teeBody{trailer: http.Header{"X-Late": []string{`\\x61bcdefgh`}}}
+	ex := exchange{head: []byte("x"), captured: tee}
+	if err := assertNoLeak(ex.trailerReport()); err == nil {
+		t.Fatal("a trailer's content was never read by the guard")
+	}
+}
+
+func TestResponsePlaceholderCountsRunes(t *testing.T) {
+	suppliedValues = []string{"é"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied("echoed é here"))
+	if !strings.Contains(got, "1 chars") {
+		t.Fatalf("a one-character value was measured in bytes: %q", got)
+	}
+}
+
 func TestTrailersAreSnapshotAtEOFNotFromTheHead(t *testing.T) {
 	resp := &http.Response{Trailer: http.Header{}}
 	tee := &teeBody{inner: io.NopCloser(strings.NewReader("BODY")), resp: resp}

@@ -160,7 +160,12 @@ func (e *exchange) trailerReport() string {
 			// value was cleaned, and the guard's short-value rule counts `-` as a
 			// word byte so the boundary check did not catch it either
 			// (shardpilot/shardpilot-go#73 review).
-			fmt.Fprintf(&b, "    %s: %s\n", scrubHeaderName(k), scrubSupplied(v))
+			// ⚠ CAPTURED, SO MARKED AS SUCH. Trailer fields come off the wire, and
+			// outside a captured span the leak check does not read them at all --
+			// so an unanticipated encoding of a supplied value in a trailer was
+			// published unexamined (shardpilot/shardpilot-go#73 review).
+			fmt.Fprintf(&b, "    %s\n",
+				asCaptured(scrubHeaderName(escapeMarks(k))+": "+scrubSupplied(escapeMarks(v))))
 		}
 	}
 	b.WriteString("\n")
@@ -291,11 +296,18 @@ func responseText(ex *exchange) string {
 // (shardpilot/shardpilot-go#73 review). Kept as a marker rather than dropped,
 // so the artifact still shows that userinfo was present.
 func redactUserinfo(line string) string {
+	// A network-path reference -- `//user:secret@host/cb` -- is a legal Location
+	// and carries userinfo without a scheme (shardpilot/shardpilot-go#73 review).
 	i := strings.Index(line, "://")
+	skip := 3
 	if i < 0 {
-		return line
+		if j := strings.Index(line, "//"); j >= 0 {
+			i, skip = j, 2
+		} else {
+			return line
+		}
 	}
-	rest := line[i+3:]
+	rest := line[i+skip:]
 	at := strings.IndexByte(rest, '@')
 	if at < 0 {
 		return line
@@ -305,7 +317,7 @@ func redactUserinfo(line string) string {
 			return line
 		}
 	}
-	return line[:i+3] + marked(fmt.Sprintf("redacted-%d-chars", utf8.RuneCountInString(rest[:at]))) + rest[at:]
+	return line[:i+skip] + marked(fmt.Sprintf("redacted-%d-chars", utf8.RuneCountInString(rest[:at]))) + rest[at:]
 }
 
 // redactFragment applies the query treatment to a URL fragment: parameter names
@@ -1110,8 +1122,11 @@ func replaceValue(text, v string) string {
 }
 
 func replaceValueWith(text, v string, isWord func(byte) bool) string {
+	// COUNT CHARACTERS: this said "chars" and measured bytes, so a non-ASCII
+	// identifier was reported longer than it is -- the same defect the query
+	// placeholder had, in the other function (shardpilot/shardpilot-go#73 review).
 	return replaceTokenWith(text, v,
-		marked(fmt.Sprintf("<redacted, %d chars>", len(v))), isWord)
+		marked(fmt.Sprintf("<redacted, %d chars>", utf8.RuneCountInString(v))), isWord)
 }
 
 func replaceTokenWith(text, v, red string, isWord func(byte) bool) string {
@@ -1274,13 +1289,13 @@ func main() {
 	// identifier -- an experiment and a variant both named `control` is a valid
 	// response -- and the property is that a supplied value is never printed
 	// back WHEREVER it appears, not only in the body.
-	fmt.Fprintf(&report, "    variant:  %q\n", scrubSupplied(result.VariantKey))
-	fmt.Fprintf(&report, "    reason:   %q\n", scrubSupplied(result.Reason))
+	fmt.Fprintf(&report, "    variant:  %q\n", stripMarks(scrubSupplied(result.VariantKey)))
+	fmt.Fprintf(&report, "    reason:   %q\n", stripMarks(scrubSupplied(result.Reason)))
 	// The SDK's own classification. A 404 returns a usable result with
 	// Code "not_found", Assigned false and a NIL error, so omitting this showed
 	// only zero-valued fields and then called the run generically not-served --
 	// losing the first-class verdict this program exists to report.
-	fmt.Fprintf(&report, "    code:     %q\n", scrubSupplied(result.Code))
+	fmt.Fprintf(&report, "    code:     %q\n", stripMarks(scrubSupplied(result.Code)))
 	fmt.Fprintf(&report, "    version:  %d\n", result.Version)
 	if fetchErr != nil {
 		fmt.Fprintf(&report, "    error:    %s\n", sanitize(fetchErr))
@@ -1322,7 +1337,7 @@ func main() {
 		// SERVED (shardpilot/shardpilot-go#73 review).
 		fmt.Printf("\nCOMPLETE BUT NOT ASSIGNED (exit 1). The endpoint answered 200 "+
 			"and assigned nothing; reason %q, code %q.\n",
-			scrubSupplied(result.Reason), scrubSupplied(result.Code))
+			stripMarks(scrubSupplied(result.Reason)), stripMarks(scrubSupplied(result.Code)))
 		os.Exit(1)
 	case fetchErr != nil && errors.Is(fetchErr, context.DeadlineExceeded):
 		fmt.Printf("\nNOT captured (exit 3) — the request timed out.\n")
