@@ -426,7 +426,15 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       base="$remote_sha"
       why="the pre-push tip of ${remote_ref:-the remote ref}"
       if ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null 2>&1; then
-        if ! git fetch --quiet -- "$dest" "$base" 2>/dev/null; then
+        # ⚠ A HOOK'S FETCH MUST LEAVE NO TRACE. Without `--no-write-fetch-head`
+        # this overwrites .git/FETCH_HEAD, so a developer who fetched a commit
+        # intending `git merge FETCH_HEAD` silently merges the destination's
+        # default branch instead, because a push ran in between. Without
+        # `--no-tags` it can auto-follow tags into the fetched history and create
+        # them locally, in a clone made with --no-tags on purpose
+        # (shardpilot/shardpilot-go#79 review). A gate is not entitled to change
+        # the repository it is inspecting.
+        if ! git fetch --quiet --no-tags --no-write-fetch-head -- "$dest" "$base" 2>/dev/null; then
           printf 'REFUSING: the pre-push tip %s is not here and could not be fetched.\n' "$base" >&2
           exit 2
         fi
@@ -453,7 +461,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       # closing it (shardpilot/shardpilot-go#79 review). A name no other
       # invocation uses has no window at all.
       base_ref="refs/prepush-base-$$"
-      if ! git fetch --quiet -- "$dest" \
+      if ! git fetch --quiet --no-tags --no-write-fetch-head -- "$dest" \
            "+refs/heads/$branch:$base_ref" 2>/dev/null; then
         printf 'REFUSING: could not fetch %s from %s to compare against.\n' "$branch" "$safe_dest" >&2
         exit 2
@@ -512,7 +520,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     # refuse a legitimate push at the budget (shardpilot/shardpilot-go#79
     # review). One fetch answers it; a failure only costs the exclusion.
     git cat-file -e "$p^{commit}" 2>/dev/null \
-      || git fetch --quiet --no-tags -- "$dest" "$p" 2>/dev/null || true
+      || git fetch --quiet --no-tags --no-write-fetch-head -- "$dest" "$p" 2>/dev/null || true
     git cat-file -e "$p^{commit}" 2>/dev/null && excl="$excl ^$p"
   done
   # shellcheck disable=SC2086

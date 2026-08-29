@@ -311,12 +311,13 @@ No Makefile — standard Go tooling.
 **Install the pre-push hook once, before your first push:**
 
 ```
-h="$(cd "$(git rev-parse --git-common-dir)" && pwd)/hooks"
-cp .githooks/pre-push "$h/.pre-push.new"
-cp scripts/check_public_surface.sh "$h/.check_public_surface.sh.new"
-chmod +x "$h/.pre-push.new" "$h/.check_public_surface.sh.new"
-mv "$h/.pre-push.new" "$h/pre-push"
-mv "$h/.check_public_surface.sh.new" "$h/check_public_surface.sh"
+h="$(cd "$(git rev-parse --git-common-dir)" && pwd)/hooks" &&
+mkdir -p "$h" &&
+cp .githooks/pre-push "$h/.pre-push.new" &&
+cp scripts/check_public_surface.sh "$h/.check_public_surface.sh.new" &&
+chmod +x "$h/.pre-push.new" "$h/.check_public_surface.sh.new" &&
+mv "$h/.pre-push.new" "$h/pre-push" &&
+mv "$h/.check_public_surface.sh.new" "$h/check_public_surface.sh" &&
 git config --local core.hooksPath "$h"
 ```
 
@@ -332,7 +333,22 @@ place: `cp` truncates its destination first, so re-copying while a push is
 running can hand git an empty hook — which is executable, exits 0, and scans
 nothing. A rename is atomic, so no partial state is ever observable. The hook
 also refuses a zero-byte scanner, because a gate should not depend on the install
-being followed. in a linked worktree the latter names `.git/worktrees/<name>`, while git reads hooks from the common directory — an install built on it puts the hook where git never looks, so the gate is absent while appearing installed. Everything the hook executes has to come from outside tracked content — the scanner as much as the hook — or a branch you are inspecting supplies its own checker.
+being followed.
+
+And the whole thing is one `&&` chain that creates `$h` first. A repository
+initialised from an empty or custom template has no `hooks` directory, so every
+`cp` and `mv` failed while the final `git config` still succeeded — leaving
+`core.hooksPath` pointing at nothing, and every later push running with no gate
+at all. Chained, nothing reaches the config line unless everything before it
+worked; `mkdir -p` removes the cause.
+
+That is the fourth distinct way this gate has been silently absent — pointing at
+tracked content, an inherited setting surviving `--unset`, a relative path
+resolved elsewhere, and now a path that does not exist. They share one shape:
+the gate is configured by an instruction a human follows, and every partial
+failure of that instruction produces a repository where pushes succeed and
+nothing is checked. Each fix moves one more of those from "follow carefully" to
+"cannot half-happen". in a linked worktree the latter names `.git/worktrees/<name>`, while git reads hooks from the common directory — an install built on it puts the hook where git never looks, so the gate is absent while appearing installed. Everything the hook executes has to come from outside tracked content — the scanner as much as the hook — or a branch you are inspecting supplies its own checker.
 
 Copied rather than `core.hooksPath .githooks`: that setting names a directory, so pointing it at tracked content makes the hook that runs whatever the checked-out branch says it is — checking out someone else's branch and pushing it would execute their copy of the hook first. `.git/hooks/` is outside the worktree and no branch can write to it. Re-copy when the file changes.
 
