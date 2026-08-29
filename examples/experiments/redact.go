@@ -197,7 +197,12 @@ func redactPairs(rest, opaqueNameBytes string) string {
 		// and `len` says bytes -- `%C3%A9` decoded to one character reported as
 		// two (shardpilot/shardpilot-go#73 review).
 		name := p[:eq]
-		if !nameIsOurs(name) {
+		// ⚠ COMPARED DECODED. `req.URL.Query()` records the DECODED name, while the
+		// dump carries its percent spelling, so a harness-owned non-ASCII
+		// attribute was classified as endpoint-chosen and its structure lost
+		// (shardpilot/shardpilot-go#85 review). The lookup decodes; the OUTPUT
+		// keeps the wire spelling, since that is what was on the wire.
+		if !nameIsOurs(queryDecoded(name)) {
 			// ⚠ MARKED, NOT STRIPPED. Stripping the provenance marks to keep the
 			// name looking like a name let the supplied-value scrub reach INSIDE
 			// the placeholder it had just generated -- `<redacted, 8 chars>-5-chars`
@@ -247,6 +252,19 @@ func redactFragment(line string) string {
 // contained a generated `x=` component and no longer looked opaque
 // (shardpilot/shardpilot-go#73 review). A `#` always ends the query, so cutting
 // there first is what the grammar says.
+// parsesAsURI reports whether a redirect target is a URI Go itself would accept,
+// which is the only thing that makes the host exemption true.
+func parsesAsURI(target string) bool {
+	u, err := url.Parse(strings.TrimSpace(target))
+	if err != nil {
+		return false
+	}
+	if u.Host == "" {
+		return true // a relative target has no authority to exempt
+	}
+	return u.Host == u.Hostname() || u.Port() != ""
+}
+
 func redactTarget(line string) string {
 	// ⚠ A TARGET THAT IS NOT A URI IS NOT PARSED, IT IS WITHHELD. A raw space is
 	// illegal in a request target but transport-valid in a header, and net/http
@@ -254,6 +272,22 @@ func redactTarget(line string) string {
 	// after the space as request-line syntax and appended it unexamined
 	// (shardpilot/shardpilot-go#85 review).
 	if head, gap, url, ok := splitField(line); ok {
+		// ⚠ THE HOST EXEMPTION'S PREMISE IS NOW ENFORCED, NOT ASSUMED. It rests on
+		// "a host is structurally constrained" -- and a host is constrained only
+		// if something checks: `https://e.example\server-secret/cb` is refused by
+		// Go's parser and was preserved verbatim here, because the only test was
+		// for whitespace (shardpilot/shardpilot-go#85 review). This is the
+		// criterion being WRONG rather than unapplied: an exemption whose
+		// condition is never verified is not an exemption, it is a hole with a
+		// comment over it.
+		if !parsesAsURI(strings.TrimSuffix(url, "\r")) {
+			noteStructural("a Location header whose target is not a valid URI")
+			cr := ""
+			if strings.HasSuffix(line, "\r") {
+				cr = "\r"
+			}
+			return head + ":" + gap + marked("<withheld: malformed target>") + cr
+		}
 		if strings.ContainsAny(strings.TrimSuffix(url, "\r"), " \t") {
 			noteStructural("a Location header whose target is not a valid URI")
 			cr := ""
@@ -405,11 +439,22 @@ func redactSetCookie(line string) string {
 				// (shardpilot/shardpilot-go#85 review). Only the standard flags
 				// have no value by specification; anything else without one is a
 				// string the origin invented.
-				switch strings.ToLower(strings.TrimSpace(an)) {
-				case "secure", "httponly", "partitioned":
-				default:
+				if standardCookieAttr(an) {
+					continue
+				}
+				{
 					parts[i] = " " + stripMarks(tokenPlaceholder(strings.TrimSpace(an)))
 				}
+				continue
+			}
+			// ⚠ AND ITS NAME. `; server-secret=y` puts the identifier on the name
+			// side of an extension attribute, where the value redaction added the
+			// round before does not look (shardpilot/shardpilot-go#85 review).
+			// Standard attribute names are specification-fixed; anything else is
+			// a string the origin invented, exactly as on the cookie itself.
+			if !standardCookieAttr(an) {
+				parts[i] = " " + stripMarks(tokenPlaceholder(strings.TrimSpace(an))) +
+					"=" + placeholder(strings.TrimSpace(av))
 				continue
 			}
 			if cookieAttrVerbatim(an, strings.TrimSpace(av)) {
@@ -464,15 +509,15 @@ func redactUserinfo(line string) string {
 // rules and the trailer block did not, so the same `Set-Cookie` was redacted in
 // one position and published in the other (shardpilot/shardpilot-go#73 review).
 // A trailer is a header that arrived late; it is not a different kind of secret.
-func structuralRedact(line string) string {
+func structuralRedact(line string) (string, bool) {
 	low := strings.ToLower(line)
 	switch {
 	case strings.HasPrefix(low, "set-cookie:"):
-		return redactSetCookie(line)
+		return redactSetCookie(line), true
 	case strings.HasPrefix(low, "location:"):
-		return redactTarget(line)
+		return redactTarget(line), true
 	}
-	return line
+	return line, false
 }
 
 // redactMintedBody replaces server-minted identifiers in a JSON body with a
@@ -654,6 +699,14 @@ func isDigits(v string) bool {
 	return true
 }
 
+var registeredMediaTypes = set(
+	"application/json", "application/problem+json", "application/xml",
+	"application/octet-stream", "application/x-www-form-urlencoded",
+	"application/javascript", "application/pdf", "application/zip",
+	"text/plain", "text/html", "text/css", "text/csv", "text/xml",
+	"image/png", "image/jpeg", "image/gif", "image/svg+xml", "image/webp",
+)
+
 func isMediaTypeWithoutParameters(v string) bool {
 	// ⚠ NO SEPARATE PARAMETER CHECK. An explicit `ContainsAny(v, ";\"")` guard
 	// stood here and a mutant removing it survived -- correctly, because it was
@@ -662,7 +715,15 @@ func isMediaTypeWithoutParameters(v string) bool {
 	// load-bearing and is not teaches the next reader a rule the program does
 	// not have.
 	t, sub, ok := strings.Cut(strings.TrimSpace(v), "/")
-	return ok && isTokenOnly(t) && isTokenOnly(sub)
+	if !ok || !isTokenOnly(t) || !isTokenOnly(sub) {
+		return false
+	}
+	// ⚠ REGISTERED, NOT MERELY WELL-FORMED. The criterion says the vocabulary is
+	// fixed by the specification; this checked only that the tokens were tokens,
+	// so `application/server-secret` printed an endpoint-chosen string through a
+	// field the criterion had declared safe (shardpilot/shardpilot-go#85 review).
+	// The same gap the directive lists had, in the one place I did not close it.
+	return registeredMediaTypes[strings.ToLower(strings.TrimSpace(v))]
 }
 
 // registeredDirectives are the closed vocabularies the specification fixes, per
@@ -744,6 +805,25 @@ func isTokenOnly(v string) bool {
 	return true
 }
 
+// registeredFieldNames are response field names the specification fixes. A name
+// outside it was chosen by the endpoint.
+var registeredFieldNames = set(
+	"date", "expires", "last-modified", "content-length", "content-type",
+	"content-encoding", "content-language", "content-location", "content-range",
+	"transfer-encoding", "connection", "vary", "accept-ranges", "allow", "age",
+	"cache-control", "etag", "location", "server", "set-cookie", "trailer",
+	"retry-after", "www-authenticate", "proxy-authenticate", "upgrade", "via",
+	"warning", "pragma", "link", "refresh", "strict-transport-security",
+	"x-capture-note",
+)
+
+func redactFieldName(name string) string {
+	if registeredFieldNames[strings.ToLower(strings.TrimSpace(name))] {
+		return name
+	}
+	return stripMarks(tokenPlaceholder(strings.TrimSpace(name)))
+}
+
 // redactUnlessVerbatim lengthens a header value unless its field passes the
 // criterion above. The NAME is kept: it is what makes the artifact readable, and
 // it is scrubbed separately for supplied values.
@@ -751,6 +831,16 @@ func isTokenOnly(v string) bool {
 // if the specification fixes the vocabulary. `Max-Age` is an integer, `Expires`
 // an HTTP-date, `SameSite` three keywords. `Path` and `Domain` are strings the
 // origin invents, and are lengthened.
+// standardCookieAttr reports a cookie attribute name the specification fixes.
+func standardCookieAttr(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "secure", "httponly", "partitioned", "path", "domain", "expires",
+		"max-age", "samesite", "priority":
+		return true
+	}
+	return false
+}
+
 func cookieAttrVerbatim(name, value string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "max-age":

@@ -47,6 +47,10 @@ func TestNoUnrecognisedFormPublishesServerGeneratedText(t *testing.T) {
 		{"an unregistered content coding", "HTTP/1.1 200 OK\r\nContent-Encoding: SRVGEN\r\n\r\n"},
 		{"a valueless cookie extension attribute", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; SRVGEN\r\n\r\n"},
 		{"an unapproved redirect scheme", "HTTP/1.1 302 Found\r\nLocation: SRVGEN://e.example/cb\r\n\r\n"},
+		{"an authority Go's parser rejects", "HTTP/1.1 302 Found\r\nLocation: https://e.example\\SRVGEN/cb\r\n\r\n"},
+		{"a cookie extension attribute NAME", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; SRVGEN=y\r\n\r\n"},
+		{"an unregistered media type", "HTTP/1.1 200 OK\r\nContent-Type: application/SRVGEN\r\n\r\n"},
+		{"an unregistered response field NAME", "HTTP/1.1 200 OK\r\nSRVGEN-Field: x\r\n\r\n"},
 		{"identifier as a query parameter NAME", "HTTP/1.1 302 Found\r\nLocation: /cb?SRVGEN=x\r\n\r\n"},
 		{"identifier as a fragment parameter NAME", "HTTP/1.1 302 Found\r\nLocation: /cb#SRVGEN=x\r\n\r\n"},
 		{"identifier as the cookie NAME", "HTTP/1.1 200 OK\r\nSet-Cookie: SRVGEN=x\r\n\r\n"},
@@ -112,4 +116,31 @@ func TestMintedNamesFoldTheWayEncodingJSONDoes(t *testing.T) {
 	if strings.Contains(got, "SRVGEN") && len(structuralSurfaces) == 0 {
 		t.Fatalf("a Unicode-folded minted name was published: %q", got)
 	}
+}
+
+// The other side of the provenance split, and of the structural dispatch: what
+// must NOT be lost. Written beside the sweep because a rule that only ever
+// tightens ends as a rule nobody runs.
+func TestStructureSurvivesWhereItIsVouchedFor(t *testing.T) {
+	t.Run("a structural trailer keeps its shape", func(t *testing.T) {
+		suppliedValues = nil
+		structuralSurfaces = nil
+		t.Cleanup(func() { structuralSurfaces = nil })
+		tee := &teeBody{trailer: http.Header{"Set-Cookie": []string{"sid=abcdefgh; Path=/x"}}}
+		e := exchange{head: []byte("x"), captured: tee}
+		got := stripMarks(e.trailerReport())
+		if !strings.Contains(got, "Path=") {
+			t.Fatalf("the generic fallback flattened a structurally redacted trailer: %q", got)
+		}
+	})
+	t.Run("a name the harness sent survives its wire spelling", func(t *testing.T) {
+		suppliedValues = nil
+		noteRequestName("custom_attribute_é")
+		t.Cleanup(func() { requestNames = map[string]bool{} })
+		got := stripMarks(dropFraming(
+			"HTTP/1.1 302 Found\r\nLocation: /cb?custom_attribute_%C3%A9=v\r\n\r\n"))
+		if !strings.Contains(got, "custom_attribute_%C3%A9=") {
+			t.Fatalf("a harness-owned name was classified as endpoint-chosen: %q", got)
+		}
+	})
 }

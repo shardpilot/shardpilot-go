@@ -11,6 +11,41 @@
 // and what came back, which makes the result an artifact rather than a claim
 // that something worked.
 //
+// ⚠ WHAT THIS PROGRAM CLAIMS, AND WHY THE CLAIM IS NARROW ON PURPOSE.
+//
+// It does NOT claim "nothing leaks". That is an absolute statement about a
+// hostile input, and it has no fixed point: for every form a reader imagines,
+// this program grows a defence, and the next form is imagined next. Twenty-three
+// probes against imagination is a list against an infinity, and a list is
+// complete only from the inside. The review rounds on this file demonstrated
+// exactly that -- each one found real defects in the previous one's fixes,
+// because there was no specification to converge against.
+//
+// It claims something checkable instead:
+//
+//	NOTHING IS PRINTED AS RECEIVED UNLESS IT PASSES A STATED TEST.
+//
+//	  a header VALUE      every token is drawn from a vocabulary the
+//	                      specification fixes -- an HTTP-date, an integer, a
+//	                      registered directive, a registered media type
+//	  a field NAME        it is in the IANA field-name registry
+//	  a parameter NAME    this program itself put it on the wire
+//	  a cookie ATTRIBUTE  the specification names it
+//	  a URI authority     Go's own parser accepts it
+//	  everything else     replaced by its length, or -- where the extent of a
+//	                      value cannot be determined at all -- the capture is
+//	                      refused, exit 4
+//
+// The difference matters to whoever reviews this next. "Nothing leaks" can only
+// be attacked by inventing a new shape. The claim above can be CHECKED: take any
+// byte in the artifact and ask which clause admitted it. A clause that admits
+// something it should not is a defect in the criterion, fixed once; a place that
+// prints without asking is a defect in that place. Those two questions have
+// answers. "Did you think of every encoding" does not.
+//
+// The criterion is applied in redact.go and pinned by the sweep in
+// sweep_test.go, which fails when a form reaches the artifact through no clause.
+//
 // The Authorization header is redacted in the output. The key is read from the
 // environment and never from a command line, because a command line is visible
 // to every process on the host and lands in shell history.
@@ -193,7 +228,16 @@ func (e *exchange) trailerReport() string {
 			// turned round and this block had not
 			// (shardpilot/shardpilot-go#85 review). A trailer is a header that
 			// arrived late, in this as in everything else.
-			red := redactUnlessVerbatim(structuralRedact(escapeMarks(k) + ": " + escapeMarks(v)))
+			// ⚠ THE GENERIC FALLBACK ONLY WHERE NO STRUCTURAL RULE RAN. Applied
+			// unconditionally, it took the structured placeholders the rule had
+			// just produced and replaced the lot with one length -- reporting the
+			// size of GENERATED text and losing the cookie's shape
+			// (shardpilot/shardpilot-go#85 review). A fallback that runs after a
+			// rule has answered is not a fallback.
+			red, handled := structuralRedact(escapeMarks(k) + ": " + escapeMarks(v))
+			if !handled {
+				red = redactUnlessVerbatim(red)
+			}
 			if i := strings.IndexByte(red, ':'); i > 0 {
 				red = scrubHeaderName(red[:i]) + red[i:]
 			}
@@ -489,7 +533,14 @@ func dropFraming(dump string) string {
 		// them (shardpilot/shardpilot-go#85 review, a sweep of fourteen forms).
 		// Unknown fails closed now: see verbatimHeaders for the criterion.
 		if i, ok := headerNameEnd(l); ok {
-			out = append(out, scrubHeaderName(l[:i])+redactUnlessVerbatim(l)[i:])
+			// ⚠ AND THE FIELD NAME ITSELF. `scrubHeaderName` only knows values the
+			// HARNESS supplied, so `Server-Secret: x` had its value lengthened and
+			// its NAME published -- and the parent build refused that whole
+			// response, so this change made it publishable and then leaked through
+			// the half it had just opened (shardpilot/shardpilot-go#85 review).
+			// Field names are an IANA registry: registered ones print, the rest
+			// are strings the origin invented.
+			out = append(out, redactFieldName(scrubHeaderName(l[:i]))+redactUnlessVerbatim(l)[i:])
 			continue
 		}
 		out = append(out, scrubStructuralName(redactUnlessVerbatim(l)))
