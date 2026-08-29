@@ -480,6 +480,18 @@ func TestPercentDecodedFormIsCheckedBeforePlus(t *testing.T) {
 	}
 }
 
+func TestLocationUserinfoIsRedacted(t *testing.T) {
+	suppliedValues = nil
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(dropFraming("HTTP/1.1 302 Found\r\nLocation: https://user:secret@e.example/cb\r\n\r\n"))
+	if strings.Contains(got, "secret") || strings.Contains(got, "user:") {
+		t.Fatalf("userinfo credentials were published: %q", got)
+	}
+	if !strings.Contains(got, "e.example/cb") {
+		t.Fatalf("the redirect target itself was destroyed: %q", got)
+	}
+}
+
 func TestTrailersAreSnapshotAtEOFNotFromTheHead(t *testing.T) {
 	resp := &http.Response{Trailer: http.Header{}}
 	tee := &teeBody{inner: io.NopCloser(strings.NewReader("BODY")), resp: resp}

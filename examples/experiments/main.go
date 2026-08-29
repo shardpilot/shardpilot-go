@@ -283,6 +283,31 @@ func responseText(ex *exchange) string {
 	return asCaptured(scrubSupplied(dropFraming(escapeMarks(string(ex.resp())))))
 }
 
+// redactUserinfo removes `user:password@` from a redirect target.
+//
+// ⚠ A THIRD PLACE A URL CARRIES A CREDENTIAL, after the query and the fragment,
+// and the one that is a credential BY DEFINITION rather than by convention:
+// `Location: https://user:secret@example.com/…` is standard URI syntax
+// (shardpilot/shardpilot-go#73 review). Kept as a marker rather than dropped,
+// so the artifact still shows that userinfo was present.
+func redactUserinfo(line string) string {
+	i := strings.Index(line, "://")
+	if i < 0 {
+		return line
+	}
+	rest := line[i+3:]
+	at := strings.IndexByte(rest, '@')
+	if at < 0 {
+		return line
+	}
+	for _, c := range rest[:at] {
+		if c == '/' || c == ' ' || c == '?' || c == '#' {
+			return line
+		}
+	}
+	return line[:i+3] + marked(fmt.Sprintf("redacted-%d-chars", utf8.RuneCountInString(rest[:at]))) + rest[at:]
+}
+
 // redactFragment applies the query treatment to a URL fragment: parameter names
 // kept, values replaced by their length. A fragment with no `=` is replaced
 // whole, because an opaque fragment is not a name and cannot be shown to be
@@ -355,7 +380,7 @@ func dropFraming(dump string) string {
 			// carries its credential after `#` -- `#access_token=…` never reaches
 			// the server and is exactly the value a capture must not publish, and
 			// `redactQuery` saw only `?` (shardpilot/shardpilot-go#73 review).
-			out = append(out, redactFragment(redactQuery(strings.TrimSuffix(l, "\r")))+cr)
+			out = append(out, redactUserinfo(redactFragment(redactQuery(strings.TrimSuffix(l, "\r"))))+cr)
 			continue
 		}
 		// ⚠ AND A HEADER NAME CAN CARRY THE IDENTIFIER. `X-<key>: v` published it
