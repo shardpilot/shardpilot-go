@@ -2956,9 +2956,9 @@ func (t *traceFiringTransport) RoundTrip(req *http.Request) (*http.Response, err
 func TestOnlyAnSDKAuthoredErrorVouchesItsClassification(t *testing.T) {
 	for _, code := range []string{"unauthorized", "kill_switch", "http_503"} {
 		for _, c := range []struct {
-			name    string
-			text    string
-			vouched bool
+			name     string
+			text     string
+			sdkWrote bool
 		}{
 			{"the SDK's own error", "shardpilot experiment assignment fetch failed: " + code, true},
 			{"remote config", "shardpilot remote config fetch failed: " + code, true},
@@ -2970,8 +2970,18 @@ func TestOnlyAnSDKAuthoredErrorVouchesItsClassification(t *testing.T) {
 			suppliedValues = []string{code}
 			structuralSurfaces = nil
 			got := stripMarks(sanitizeCaptured(errors.New(c.text)))
-			if printed := strings.Contains(got, code); printed != c.vouched {
-				t.Errorf("%s / %s: printed=%v, want %v: %q", code, c.name, printed, c.vouched, got)
+			printed := strings.Contains(got, code)
+			// ⚠ THE HALF THAT HOLDS ON BOTH SIDES OF THE SEAM IS THE NEGATIVE ONE.
+			// Where the SDK did not author the message, the token must not be
+			// published -- that is the finding, and it is true in both branches. Where
+			// it did, this branch publishes and the branch above withholds the whole
+			// diagnostic, because there the text is never taken from the error at all.
+			if !c.sdkWrote && printed {
+				t.Errorf("%s / %s: a token the SDK did not author was published: %q", code, c.name, got)
+			}
+			if c.sdkWrote && !printed && len(structuralSurfaces) == 0 {
+				t.Errorf("%s / %s: the SDK's own classification was neither published nor refused: %q",
+					code, c.name, got)
 			}
 			suppliedValues = nil
 			structuralSurfaces = nil
