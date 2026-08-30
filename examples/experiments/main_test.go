@@ -3140,3 +3140,59 @@ func TestTheProducingScansAreCharged(t *testing.T) {
 			producerWork, len(body), min)
 	}
 }
+
+// Every producer re-enters, not the two I happened to name.
+//
+// ⚠ THE ROUND BEFORE FIXED AN ENUMERATION BY WRITING ANOTHER ONE. Seeds were made
+// to re-enter the PRODUCING half of the chain, and only the wrapped and
+// short-Base64 producers were enqueued — so a seed carrying a form another
+// producer handles stayed unreachable: `/zYx` decodes to `0xff61`, which `undoHex`
+// deliberately ignores as a two-byte token and only `hexCandidates` splits
+// (shardpilot/shardpilot-go#84 review).
+//
+// The rows are one input per producer that was missing, so the assertion is about
+// the SET of producers rather than about the case shown.
+func TestEveryProducerReEntersForASeed(t *testing.T) {
+	for _, c := range []struct{ sup, text, why string }{
+		{"a", "/zYx", "a hex token only hexCandidates splits"},
+		{"secret99", "/2MyVmoNCmNtVjBPVGs9", "a wrapped run inside a binary seed"},
+		// ⚠ THE VECTOR IS COMPUTED, NOT WRITTEN OUT. My first spelling of this row
+		// was `/2JhY2RlZmdo`, which decodes to `0xffbacdefgh` -- one transposed byte,
+		// and the row failed as though it had found a gap in the chain rather than in
+		// my arithmetic.
+		{"abcdefgh", "/2FiY2RlZmdo", "a plain base64 payload behind a binary byte"},
+	} {
+		suppliedValues = []string{c.sup}
+		decodeWork = 0
+		if err := assertNoLeak(asCaptured(c.text)); err == nil {
+			t.Errorf("%q with %q supplied: the guard approved text the chain reconstructs (%s)",
+				c.text, c.sup, c.why)
+		}
+		suppliedValues = nil
+		decodeWork = 0
+	}
+}
+
+// The interim section is a canonical reconstruction and must say so.
+//
+// ⚠ `Got1xxResponse` HANDS OVER A CODE AND HEADERS, NOT BYTES. The status line is
+// built here from `http.StatusText`, so a custom reason phrase the endpoint sent
+// is replaced by the registered one — and on HTTP/2 no textual status line was
+// received at all, while the section presented the synthesized bytes as a status
+// the endpoint sent (shardpilot/shardpilot-go#84 review). The final-response
+// section has carried that label since #73; this one was added without it.
+func TestTheInterimSectionIsLabelledCanonical(t *testing.T) {
+	var report strings.Builder
+	renderExchanges(&report, []exchange{{
+		infos:  []string{"HTTP/1.1 103 Early Hints\r\nLink: </s.css>\r\n\r\n"},
+		status: 200, proto: "HTTP/2.0",
+		head: []byte("HTTP/2.0 200 OK\r\n\r\n"),
+	}})
+	got := report.String()
+	if !strings.Contains(got, "CANONICAL RECONSTRUCTION") {
+		t.Errorf("the interim section presents built bytes as received: %q", got)
+	}
+	if !strings.Contains(got, "http.StatusText") {
+		t.Errorf("the section does not say where its status line came from: %q", got)
+	}
+}

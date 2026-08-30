@@ -630,10 +630,16 @@ func renderExchanges(report *strings.Builder, exchanges []exchange) {
 			// response does not contain them; a pair rendered without them is a pair
 			// that omits what it saw.
 			fmt.Fprintf(report, "## Informational%s — an interim response the "+
-				"transport consumed\n\nGo delivers these only through "+
-				"`httptrace`, so the final response below does not contain them "+
-				"and a report without this section would omit a status and headers "+
-				"the endpoint sent.\n\n%s\n", label, fencedBlock(asCaptured(scrubSupplied(dropFraming(info)))))
+				"transport consumed — CANONICAL RECONSTRUCTION\n\nGo delivers these "+
+				"only through `httptrace`, which hands over the numeric code and the "+
+				"headers and nothing else — so the status line below is BUILT here from "+
+				"`http.StatusText`, not received: a custom reason phrase the endpoint "+
+				"sent is replaced by the registered one, and on HTTP/2 no textual status "+
+				"line was received at all. The header block is likewise re-serialised "+
+				"from the parsed fields. What this section is evidence of is the CODE "+
+				"and the HEADERS; the bytes are ours, exactly as in the response section "+
+				"below. A report without it would omit a status and headers the endpoint "+
+				"did send.\n\n%s\n", label, fencedBlock(asCaptured(scrubSupplied(dropFraming(info)))))
 		}
 		switch {
 		case ex.transErr != nil:
@@ -2772,6 +2778,15 @@ func assertNoLeak(text string) error {
 				if len(seeds) >= seedMax {
 					continue
 				}
+				// ⚠ EVERY PRODUCER, NOT THE TWO I HAPPENED TO NAME. The round before
+				// made seeds re-enter the PRODUCING half and enqueued only the wrapped
+				// and short-base64 producers, so a seed carrying a form another producer
+				// handles was still unreachable: `/zYx` decodes to `0xff61`, which
+				// `undoHex` deliberately ignores as a two-byte token and only
+				// `hexCandidates` splits (shardpilot/shardpilot-go#84 review). Naming a
+				// subset of the producers is the enumeration this file keeps replacing
+				// with a product -- and here I wrote the enumeration while fixing an
+				// enumeration.
 				for _, w := range wrappedBase64Candidates(charge(1, d)) {
 					seeds = append(seeds, w)
 					if dd, ok := decodeBase64(w); ok {
@@ -2779,6 +2794,10 @@ func assertNoLeak(text string) error {
 					}
 				}
 				seeds = append(seeds, shortBase64Candidates(charge(1, d))...)
+				seeds = append(seeds, hexCandidates(charge(1, d))...)
+				seeds = append(seeds, base64SuffixCandidates(charge(1, d))...)
+				seeds = append(seeds, binaryCandidates(charge(2, d))...)
+
 				work += takeDecodeWork()
 			}
 			if len(seeds) >= seedMax {
