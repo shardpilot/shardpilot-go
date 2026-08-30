@@ -1197,6 +1197,28 @@ func anyMarked(inMark []bool, a, b int) bool {
 // (shardpilot/shardpilot-go#85 review).
 var sdkVerdictFields = map[string]bool{"reason": true}
 
+// verdictKey groups a member name the way `encoding/json` groups it.
+//
+// ⚠ THE DECODER FOLDS, AND THE COUNTING HAS TO FOLD WITH IT. `encoding/json`
+// matches `Reason` and `REASON` to the same field, so
+// `{"reason":"kill_switch","Reason":"anything"}` is classified `anything` -- while
+// exact-string counting put the two occurrences under separate keys, left the
+// first vouched, and published the supplied identifier
+// (shardpilot/shardpilot-go#85 review). The ordinal answers "which occurrence does
+// the decoder keep", so it must group members exactly as the decoder does.
+//
+// This is the one place in this file where folding is CORRECT: it models the
+// decoder's own matching. Vouching the VALUE still requires the canonical
+// spelling, because that question is about what this program wrote.
+func verdictKey(name string) string {
+	for n := range sdkVerdictFields {
+		if strings.EqualFold(name, n) {
+			return n
+		}
+	}
+	return name
+}
+
 func redactUnaccountedJSONValues(body string) string {
 	// ⚠ A PATTERN OVER MEMBER-COLON-STRING IS NOT A TRAVERSAL. The first version
 	// matched only a string immediately after a member's colon, so
@@ -1307,8 +1329,8 @@ func redactUnaccountedJSONValues(body string) string {
 				// Counted for EVERY root member, whatever its value turns out to be --
 				// including a value this traversal produces no span for, such as a
 				// number, which is still the occurrence the decoder keeps.
-				verdictSeen[name]++
-				verdictOrd = verdictSeen[name]
+				verdictSeen[verdictKey(name)]++
+				verdictOrd = verdictSeen[verdictKey(name)]
 			} else {
 				verdictField = ""
 			}
@@ -1392,7 +1414,7 @@ func redactUnaccountedJSONValues(body string) string {
 		// (shardpilot/shardpilot-go#85 review). The position was checked against the
 		// vocabulary rather than against the wire contract, which is the same mistake
 		// the top-level name registry made one round earlier.
-		if sdkTaxonomy[str] && sdkVerdictFields[verdictField] {
+		if sdkTaxonomy[str] && sdkVerdictFields[verdictKey(verdictField)] {
 			// ⚠ THE SPAN INCLUDES THE QUOTES, SO THE REPLACEMENT MUST TOO. Emitting
 			// only `marked(str)` produced `{"code":kill_switch}` after the marks are
 			// stripped -- invalid JSON, which the body rule then refused, so EVERY
@@ -1430,7 +1452,7 @@ func redactUnaccountedJSONValues(body string) string {
 	// this program can describe. The ineffective occurrence is endpoint-chosen text
 	// like any other, and it is accounted for as such.
 	for i := range spans {
-		if f := spans[i].vouchedField; f != "" && spans[i].verdictOrd != verdictSeen[f] {
+		if f := spans[i].vouchedField; f != "" && spans[i].verdictOrd != verdictSeen[verdictKey(f)] {
 			noteAccounted(formBody, "an endpoint-chosen value in a parsed response body")
 			spans[i].val = `"` + tokenPlaceholder(spans[i].raw) + `"`
 		}

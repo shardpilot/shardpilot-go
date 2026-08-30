@@ -4001,3 +4001,52 @@ func TestAWrappedRunMayBeginOnAWholeLine(t *testing.T) {
 		}
 	}
 }
+
+// The decoder folds member names, and the occurrence counting folds with it.
+//
+// ⚠ EXACT-STRING COUNTING PUT ONE MEMBER UNDER TWO KEYS. `encoding/json` matches
+// `Reason` and `REASON` to the same field, so
+// `{"reason":"kill_switch","Reason":"anything"}` is classified `anything` -- while
+// the ordinal counted the two occurrences separately, left the first vouched, and
+// published the supplied identifier (shardpilot/shardpilot-go#85 review). The
+// ordinal answers "which occurrence does the decoder keep", so it has to group
+// members exactly as the decoder groups them.
+//
+// This is the one place in this file where folding is CORRECT: it models the
+// decoder. Vouching the VALUE still requires the canonical spelling, because that
+// question is about what this program wrote.
+//
+// The rows are the product of the case variants with both orderings, and the
+// oracle is the decoder itself.
+func TestVerdictOccurrencesAreCountedAsTheDecoderGroupsThem(t *testing.T) {
+	const supplied = "kill_switch"
+	other := "anything"
+	variants := []string{"reason", "Reason", "REASON", "ReAsOn"}
+	for _, a := range variants {
+		for _, b := range variants {
+			for _, order := range [][2]string{{supplied, other}, {other, supplied}} {
+				body := `{"` + a + `":"` + order[0] + `","` + b + `":"` + order[1] + `"}`
+				var decoded struct{ Reason string }
+				if err := json.Unmarshal([]byte(body), &decoded); err != nil {
+					t.Fatalf("the oracle could not read %q: %v", body, err)
+				}
+				suppliedValues = []string{supplied}
+				structuralSurfaces, accountedSurfaces = nil, nil
+				got := scrubSupplied(redactUnaccountedBody(markBareJSONLiterals(
+					redactUnaccountedJSONValues(redactMintedBody(body)))))
+				clean := strings.NewReplacer(capturedMark, "", genMark, "").Replace(got)
+				printed := strings.Count(clean, supplied)
+				want := 0
+				if decoded.Reason == supplied {
+					want = 1 // the SDK's own classification, vouched by denotation
+				}
+				if printed != want {
+					t.Errorf("%s: printed %d times, want %d (decoder classifies %q): %q",
+						body, printed, want, decoded.Reason, clean)
+				}
+			}
+		}
+	}
+	suppliedValues = nil
+	structuralSurfaces, accountedSurfaces = nil, nil
+}
