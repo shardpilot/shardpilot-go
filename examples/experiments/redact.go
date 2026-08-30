@@ -678,6 +678,21 @@ func redactMintedBody(body string) string {
 	// redaction and would have inherited nothing -- the fourth time the seam has
 	// dropped something the half it replaced was doing
 	// (shardpilot/shardpilot-go#85 review, found by the sweep).
+	// ⚠ AND AN UNPARSABLE BODY IS ACCOUNTED FOR TOO. `topLevelMembers` returns
+	// nothing for `{"assigned":true,"subject_fact_key":"…` with no closing brace,
+	// so this loop did not run: the value WAS redacted -- the identifier never
+	// reached the artifact -- and neither ledger recorded that anything had
+	// happened. Safe and silent is still a hole in "nothing is printed that this
+	// program cannot account for" (shardpilot/shardpilot-go#84 review, ported
+	// across the stack seam: the guard half REFUSED such a body, which is the only
+	// thing it could do; this half redacts it, so what it owes is the record).
+	if topLevelMembers(body) == nil && strings.Contains(body, "{") {
+		for _, m := range jsonMemberName.FindAllStringSubmatch(body, -1) {
+			if isMinted(m[1]) {
+				noteAccounted("a server-minted subject identifier in a body that does not parse")
+			}
+		}
+	}
 	for _, n := range topLevelMembers(body) {
 		// ⚠ AND THE ORDINARY REDACTION IS ACCOUNTED FOR TOO. The guard half noted
 		// every minted field it saw; this half redacts them instead and recorded
