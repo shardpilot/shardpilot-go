@@ -88,12 +88,31 @@ unset GIT_INDEX_FILE
 # The list is what `git --help environment` names as pointing a command at a
 # repository; anything left set here is inherited by every command below, and the
 # scan worktree is entered with `cd`, which changes only the directory.
-for gv in GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
-          GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_CEILING_DIRECTORIES \
-          GIT_DISCOVERY_ACROSS_FILESYSTEM GIT_PREFIX GIT_ATTR_NOSYSTEM; do
+# ⚠ AND THE OBJECT STORES ARE NOT SELECTORS. `GIT_OBJECT_DIRECTORY` and
+# `GIT_ALTERNATE_OBJECT_DIRECTORIES` say where objects LIVE, not which repository a
+# command means -- and the commits being pushed may exist only there, so clearing
+# them made `cat-file`, `diff` and `worktree add` unable to read the very push under
+# inspection (shardpilot/shardpilot-go#79 review, reproduced).
+#
+# My previous fix listed them with the rest because they appear in the same section
+# of `git --help environment`. The rule was "clear what points a command at a
+# repository"; two members of the list I applied it to do not point at one. A claim
+# about the members is not established by deriving the membership.
+for gv in GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_NAMESPACE \
+          GIT_CEILING_DIRECTORIES GIT_DISCOVERY_ACROSS_FILESYSTEM GIT_PREFIX \
+          GIT_ATTR_NOSYSTEM; do
   unset "$gv" 2>/dev/null || true
 done
 unset gv
+
+# ⚠ A GRAFT HIDES A PUBLISHED ANCESTOR, AND `GIT_NO_REPLACE_OBJECTS` DOES NOT STOP
+# IT. With the pushed tip marked a synthetic root, `rev-list` omits the real parent
+# even with replacement objects disabled -- so if the destination still holds that
+# parent, pushing the child makes it publicly reachable again while the scan walked
+# only the child (shardpilot/shardpilot-go#79 review). The two mechanisms are
+# separate and the gate needs both off.
+GIT_GRAFT_FILE=/dev/null
+export GIT_GRAFT_FILE
 
 # ⚠ NOTHING FROM THE PUSHED BRANCH MAY RUN. `git worktree add` fires
 # post-checkout, and where core.hooksPath still points at tracked content that hook is
@@ -118,7 +137,11 @@ cleanup() {
   # temporarily disconnected mount lost its metadata, and came back as "not a
   # repository" (shardpilot/shardpilot-go#79 review). Cleanup removes what this
   # hook created and nothing else.
-  [ -n "${base_ref:-}" ] && git update-ref -d "$base_ref" 2>/dev/null || true
+  # Through `git_safe`, like the normal deletion: the stated invariant is that
+  # nothing this hook runs fires a repository hook, and an EXIT path that skips the
+  # wrapper is the invariant holding only when nothing goes wrong
+  # (shardpilot/shardpilot-go#79 review).
+  [ -n "${base_ref:-}" ] && git_safe update-ref -d "$base_ref" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -560,8 +583,14 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     eligible=yes
   elif [ "$peeled" = "$head_sha" ]; then
     eligible=yes
-  elif { [ "$peeled" != "$local_sha" ] || [ "$is_tag" = yes ]; } &&
-       git merge-base --is-ancestor "$peeled" "$head_sha" 2>/dev/null; then
+  # ⚠ THE ANCESTRY IS THE WHOLE CRITERION. The extra clause asked whether the SOURCE
+  # peeled from a tag or the DESTINATION was under refs/tags, and eligibility is
+  # about neither: it is about whether this checkout can scan the commit, which
+  # `--is-ancestor` answers on its own. `git push origin HEAD~1:refs/archive/snapshot`
+  # was refused for failing a test about namespaces, leaving `--no-verify` as the
+  # only way to make a push git accepts (shardpilot/shardpilot-go#79 review) --
+  # the second time this gate has forced its own bypass over a namespace question.
+  elif git merge-base --is-ancestor "$peeled" "$head_sha" 2>/dev/null; then
     eligible=yes
   fi
   if [ "$eligible" = no ]; then
@@ -682,6 +711,16 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       base_ref=""
       incoming="$(printf '%s\n' "$pushed_lines" \
         | awk -v r="refs/heads/$branch" '$3==r {print $2; exit}')"
+      # ⚠ ALL ZEROES IS A DELETION, AND IT IS HEX. One push may delete the
+      # destination's default branch while creating another ref, and the zero object
+      # passed the hex-only test below and became the baseline -- handed to the
+      # scanner as PUBLIC_SURFACE_BASE_REF, where it resolves to nothing
+      # (shardpilot/shardpilot-go#79 review). A validation that asks about the
+      # ALPHABET cannot see a value whose meaning is "no object".
+      case "$incoming" in
+        *[!0]*) ;;
+        *) incoming="" ;;
+      esac
       case "$incoming" in
         ""|*[!0-9a-f]*) ;;
         *) if [ "$incoming" != "$base" ]; then
