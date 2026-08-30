@@ -474,29 +474,40 @@ func isSDKTaxonomy(s string) bool {
 // depends on precisely that token (shardpilot/shardpilot-go#84 review). Same
 // vocabulary, second printer; vouching it in one place is vouching it in one
 // place.
+// sdkErrorPrefixes are the exact prefixes this SDK writes before its own
+// classification. Read off the SDK source by
+// `TestTheSDKErrorPrefixesAreTheOnesTheSDKWrites`, not recalled.
+var sdkErrorPrefixes = []string{
+	"shardpilot experiment assignment fetch failed: ",
+	"shardpilot remote config fetch failed: ",
+}
+
 func vouchTaxonomyIn(text string) string {
-	for t := range sdkTaxonomy {
-		text = replaceTokenWith(text, t, marked(t), isWordByte)
-	}
-	// ⚠ AND THE GENERATED FAMILIES, WHICH THERE IS NO SET TO RANGE OVER. The
-	// pattern says only WHERE TO LOOK; `isSDKTaxonomy` says whether this program
-	// would have written what was found. That split is the point: `http_007` is
-	// located by the pattern and refused by the equality, so a shape an endpoint
-	// echoes is not vouched merely for looking like one this SDK writes.
-	seen := map[string]bool{}
-	for _, m := range generatedTaxonomyShape.FindAllString(text, -1) {
-		if seen[m] || !isSDKTaxonomy(m) {
+	// ⚠ THE POSITION, NOT THE TOKEN, AND THIS TEXT IS NOT ALL OURS. Marking a
+	// taxonomy word WHEREVER it appears was right for the SDK's own wrapper and
+	// wrong for everything else that reaches this printer: an arbitrary `net/http`
+	// diagnostic such as `malformed HTTP response "unauthorized"` is endpoint text
+	// end to end, and with an experiment key of `unauthorized` the word was marked
+	// as generated, ignored by the guard, and published verbatim
+	// (shardpilot/shardpilot-go#84 review). The SDK makes a token its own by
+	// WRITING it at a known position; matching that token elsewhere is recognition,
+	// which is not authorship.
+	for _, prefix := range sdkErrorPrefixes {
+		i := strings.Index(text, prefix)
+		if i < 0 {
 			continue
 		}
-		seen[m] = true
-		text = replaceTokenWith(text, m, marked(m), isWordByte)
+		rest := text[i+len(prefix):]
+		j := 0
+		for j < len(rest) && isWordByte(rest[j]) {
+			j++
+		}
+		if tok := rest[:j]; tok != "" && isSDKTaxonomy(tok) {
+			text = text[:i+len(prefix)] + marked(tok) + rest[j:]
+		}
 	}
 	return text
 }
-
-// The shape is deliberately wider than the canonical spelling, so a near-miss is
-// FOUND and then refused rather than never looked at.
-var generatedTaxonomyShape = regexp.MustCompile(`(?:http|transient)_[0-9A-Za-z+-]+`)
 
 // vouchTaxonomy marks a verdict field this SDK generated.
 func vouchTaxonomy(v string) string {
@@ -1376,7 +1387,21 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Third round on this one line, and each fix was correct for the case it was
 	// shown: the protocol was an approximation to the question, the global was the
 	// wrong place to keep the answer, and this was the wrong way to ask it.
+	// ⚠ AND THE TRANSPORT CONSUMES THIS ONE. Go removes `Connection: close` from
+	// `resp.Header` and represents it as `resp.Close`, while `DumpResponse` writes
+	// the line back into the dump -- so membership said "not received" for a line
+	// the endpoint DID send, `dropFraming` marked the whole line as
+	// serializer-generated, and a supplied `close` was published because the guard
+	// skips generated spans (shardpilot/shardpilot-go#84 review). Fourth round on
+	// this line, and the previous three were each right about a different half.
+	//
+	// `resp.Close` is also true for an HTTP/1.0 response with no keep-alive, where
+	// the endpoint sent no such line -- so this errs toward CAPTURED, which is the
+	// direction that keeps the guard looking.
 	_, ex.recvConn = resp.Header["Connection"]
+	if resp.Close {
+		ex.recvConn = true
+	}
 	if d, derr := httputil.DumpResponse(resp, false); derr == nil {
 		ex.head = d
 	}
@@ -2844,8 +2869,17 @@ func wrappedBase64Candidates(text string) []string {
 		return s[i:]
 	}
 	prefix := func(s string) string {
+		// ⚠ PADDING ENDS THE ENCODING, SO THE SCAN ENDS WITH IT. Treating `=` as one
+		// more admissible byte let the scan run PAST the padding into the prose behind
+		// it -- and dropping horizontal whitespace, which is right, removed the space
+		// that used to stop it: `JDdwQA== end!` became `JDdwQA==end!` and yielded
+		// `JDdwQA==end`, which no decoder accepts (shardpilot/shardpilot-go#84
+		// review). Data bytes, then padding, then stop.
 		i := 0
-		for i < len(s) && (isBase64Byte(s[i]) || s[i] == '=') {
+		for i < len(s) && isBase64Byte(s[i]) {
+			i++
+		}
+		for i < len(s) && s[i] == '=' {
 			i++
 		}
 		return s[:i]
@@ -2856,6 +2890,16 @@ func wrappedBase64Candidates(text string) []string {
 		if head == "" || allBase64(lines[i]) {
 			// A whole-base64 line is already joined by joinBase64Runs; this producer
 			// exists for the runs that share a line with something else.
+			//
+			// ⚠ THE REVIEW NAMED THIS SKIP AND THE MEASUREMENT ACQUITTED IT. The miss
+			// it describes is real -- `USF6\r\nJDdwQA== end!` passed the guard -- but
+			// removing this line does not fix it and keeping it does not cause it: the
+			// padding rule below does both. Measured three ways: with the padding rule
+			// and this skip, every wrapped shape over three identifiers, three cut
+			// points and three endings is caught; without the padding rule, four rows
+			// go red whether this skip is here or not. Removing it only adds duplicate
+			// candidates that spend the work budget
+			// (shardpilot/shardpilot-go#84 review).
 			continue
 		}
 		// ⚠ A BUILDER, NOT `+=`. Each `+=` copies the whole prefix accumulated so far,
@@ -2889,6 +2933,13 @@ func wrappedBase64Candidates(text string) []string {
 					break
 				}
 				jb.WriteString(lines[j])
+				// Padding ends the encoding here too: whatever follows is prose, and a
+				// candidate carrying it decodes to nothing.
+				if strings.HasSuffix(lines[j], "=") {
+					out = append(out, jb.String())
+					ended = "padding"
+					break
+				}
 				continue
 			}
 			if p := prefix(lines[j]); p != "" {

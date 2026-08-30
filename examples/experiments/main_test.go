@@ -13,6 +13,7 @@ import (
 	"os"
 	"reflect"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -2445,7 +2446,7 @@ func TestGeneratedTaxonomyIsVouchedInRenderedText(t *testing.T) {
 		{"http_007", false}, {"http_+7", false}, {"http_5o3", false},
 		{"transient_-1", false}, {"HTTP_503", false},
 	} {
-		got := vouchTaxonomyIn("code=" + c.tok + " end")
+		got := vouchTaxonomyIn("shardpilot experiment assignment fetch failed: " + c.tok + " end")
 		if marked := strings.Contains(got, genMark); marked != c.vouched {
 			t.Errorf("%q vouched=%v, want %v: %q", c.tok, marked, c.vouched, got)
 		}
@@ -2555,4 +2556,144 @@ func TestAGeneratedSpanLeavesTheFieldNameParsable(t *testing.T) {
 	}
 	suppliedValues = nil
 	structuralSurfaces = nil
+}
+
+// The transport consumes `Connection: close`, and the dump writes it back.
+//
+// ⚠ MEMBERSHIP IN `resp.Header` IS NOT "THE ENDPOINT SENT IT". Go removes
+// `Connection: close` from the header map and represents it as `resp.Close`,
+// while `DumpResponse` reconstructs the line -- so this recorded "not received"
+// for a line the endpoint DID send, `dropFraming` marked the whole line as
+// serializer-generated, and a supplied `close` was published because the guard
+// skips generated spans (shardpilot/shardpilot-go#84 review).
+//
+// Fourth round on one line, and the rows are the product of the two ways the
+// signal can arrive -- in the map, or consumed into `resp.Close` -- with the case
+// where it did not arrive at all.
+func TestAConsumedCloseSignalIsStillReceived(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		header   http.Header
+		close    bool
+		received bool
+	}{
+		{"in the map", http.Header{"Connection": []string{"close"}}, false, true},
+		{"consumed by the transport", http.Header{}, true, true},
+		{"both", http.Header{"Connection": []string{"close"}}, true, true},
+		{"absent", http.Header{}, false, false},
+	} {
+		rec := &recorder{inner: &fakeTransport{resp: &http.Response{
+			StatusCode: 200, Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+			Status: "200 OK", Header: c.header, ContentLength: -1, Close: c.close,
+			Body: io.NopCloser(strings.NewReader("")),
+		}}}
+		req, err := http.NewRequest("GET", "https://e.example"+assignmentRoute, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := rec.RoundTrip(req); err != nil {
+			t.Fatal(err)
+		}
+		rec.mu.Lock()
+		got := rec.exchanges
+		rec.mu.Unlock()
+		if len(got) != 1 {
+			t.Fatalf("%s: the recorder kept %d exchanges", c.name, len(got))
+		}
+		if got[0].recvConn != c.received {
+			t.Errorf("%s: recvConn=%v, want %v -- a line the endpoint sent must not be marked generated",
+				c.name, got[0].recvConn, c.received)
+		}
+	}
+}
+
+// A taxonomy word is this SDK's only where this SDK WROTE it.
+//
+// ⚠ THIS PRINTER RECEIVES ARBITRARY `net/http` DIAGNOSTICS, NOT ONLY THE SDK'S
+// WRAPPER. Marking a taxonomy word wherever it appeared was right for
+// `shardpilot experiment assignment fetch failed: <code>` and wrong for
+// everything else: with an experiment key of `unauthorized`, `malformed HTTP
+// response "unauthorized"` had the word marked as generated, the guard ignored
+// it, and `stripMarks` published it verbatim (shardpilot/shardpilot-go#84
+// review). Recognition is not authorship, and here the position is what carries
+// the authorship.
+//
+// The rows are the product of the taxonomy words with the two contexts.
+func TestTaxonomyIsVouchedOnlyWhereTheSDKWroteIt(t *testing.T) {
+	for _, code := range []string{"unauthorized", "kill_switch", "http_503", "transient_408"} {
+		for _, c := range []struct {
+			name    string
+			text    string
+			vouched bool
+		}{
+			{"the SDK's own wrapper", "shardpilot experiment assignment fetch failed: " + code, true},
+			{"the remote-config wrapper", "shardpilot remote config fetch failed: " + code, true},
+			{"an arbitrary transport diagnostic", `malformed HTTP response "` + code + `"`, false},
+			{"prose that merely contains it", "retrying after " + code + " from upstream", false},
+		} {
+			suppliedValues = []string{code}
+			structuralSurfaces = nil
+			got := stripMarks(sanitizeCaptured(errors.New(c.text)))
+			if printed := strings.Contains(got, code); printed != c.vouched {
+				t.Errorf("%s / %s: printed=%v, want %v: %q", code, c.name, printed, c.vouched, got)
+			}
+			suppliedValues = nil
+			structuralSurfaces = nil
+		}
+	}
+}
+
+// The prefixes are the ones the SDK writes, read off its source.
+func TestTheSDKErrorPrefixesAreTheOnesTheSDKWrites(t *testing.T) {
+	found := map[string]bool{}
+	for _, f := range []string{"../../experiments.go", "../../remote_config.go"} {
+		src, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("the SDK source is the oracle and %s could not be read: %v", f, err)
+		}
+		for _, m := range regexp.MustCompile(`"(shardpilot [a-z ]+failed): %s"`).FindAllStringSubmatch(string(src), -1) {
+			found[m[1]+": "] = true
+		}
+	}
+	if len(found) == 0 {
+		t.Fatal("no wrapper was read from the SDK source: an oracle that finds nothing is not agreement")
+	}
+	for p := range found {
+		if !slices.Contains(sdkErrorPrefixes, p) {
+			t.Errorf("the SDK writes %q before its classification and this build does not vouch there", p)
+		}
+	}
+	for _, p := range sdkErrorPrefixes {
+		if !found[p] {
+			t.Errorf("%q is vouched as an SDK position and the SDK writes no such prefix", p)
+		}
+	}
+}
+
+// A wrapped run may BEGIN on a whole line and END before prose.
+//
+// ⚠ TWO PRODUCERS EACH DECLINING ON THE BELIEF THAT THE OTHER COVERS IT. The
+// shared-line producer skipped a first line that is entirely base64, deferring to
+// `joinBase64Runs`, which joins only lines that are ENTIRELY base64 -- so
+// `USF6\r\nJDdwQA== end!` was assembled by neither and the guard approved text a
+// decoder turns straight back into the identifier
+// (shardpilot/shardpilot-go#84 review).
+//
+// And the padding: with horizontal whitespace dropped, `JDdwQA== end!` became
+// `JDdwQA==end!`, and a scan that treats `=` as one more admissible byte ran PAST
+// the padding into the prose, producing a candidate no decoder accepts.
+func TestAWrappedRunMayBeginOnAWholeLine(t *testing.T) {
+	// Q!z$7p@ is USF6JDdwQA==, wrapped after four characters.
+	const head, tail = "USF6", "JDdwQA=="
+	suppliedValues = []string{"Q!z$7p@"}
+	t.Cleanup(func() { suppliedValues = nil; decodeWork = 0 })
+	for _, ending := range []string{" end!", "end!", " ", "", "\r\nmore prose"} {
+		for _, lead := range []string{"", "prefix: "} {
+			decodeWork = 0
+			text := lead + head + "\r\n" + tail + ending
+			if err := assertNoLeak(asCaptured(text)); err == nil {
+				t.Errorf("%q: the guard approved a run a decoder reconstructs", text)
+			}
+		}
+	}
 }
