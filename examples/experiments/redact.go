@@ -849,13 +849,14 @@ func redactMintedBody(body string) string {
 	for _, n := range parsed {
 		top[n] = true
 	}
+	depthAt := newDepthWalker(body)
 	for _, loc := range jsonMemberName.FindAllStringSubmatchIndex(body, -1) {
 		if inCovered(loc[0]) {
 			continue
 		}
 		name := body[loc[2]:loc[3]]
 		dec, _ := jsonString(name)
-		if !unparsable && (jsonDepthAt(body, loc[0]) != 1 || !top[dec]) {
+		if !unparsable && (depthAt(loc[0]) != 1 || !top[dec]) {
 			continue
 		}
 		if isMinted(name) {

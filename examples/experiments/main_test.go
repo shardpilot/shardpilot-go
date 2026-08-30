@@ -1445,3 +1445,44 @@ func TestCoveredSpansAreWalkedInOrder(t *testing.T) {
 		t.Fatal("a minted value after many covered spans was published")
 	}
 }
+
+// TestDepthIsWalkedForwardNotRescanned pins what the cursor must still get right.
+// The rescan it replaces was correct and quadratic; a cursor is fast and can be
+// wrong in exactly one way — running ahead of the byte being asked about — so the
+// scene puts a minted name NESTED after many members (must stay skipped) and one
+// at top level after them (must still be caught).
+//
+// ⚠ MEASURED LIMIT, recorded rather than fixtured around: a cursor that overshoots
+// by a SMALL fixed amount survives this scene. Depth changes only at braces, and
+// an overshoot alters an answer only when a brace falls between the queried byte
+// and the overshot one — which no member name in a realistic body does. What the
+// scene does kill is a cursor that never advances (depth stuck at 0, nothing
+// top-level) and one that reports a constant depth (everything top-level), both
+// verified. A defect in the narrow band between those is not covered here.
+func TestDepthIsWalkedForwardNotRescanned(t *testing.T) {
+	structuralSurfaces = nil
+	accountedSurfaces = nil
+	suppliedValues = nil
+	t.Cleanup(func() { structuralSurfaces = nil; accountedSurfaces = nil })
+
+	var b strings.Builder
+	b.WriteString(`{"variant_payload":{`)
+	for i := 0; i < 300; i++ {
+		b.WriteString(`"n` + strconv.Itoa(i) + `":` + strconv.Itoa(i) + `,`)
+	}
+	b.WriteString(`"subject_fact_key":1},"assigned":true}`)
+	if got := redactMintedBody(b.String()); strings.Contains(got, "withheld") {
+		t.Fatalf("a nested member the endpoint merely named that way refused a capture: %q", got)
+	}
+
+	var c strings.Builder
+	c.WriteString(`{"variant_payload":{`)
+	for i := 0; i < 300; i++ {
+		c.WriteString(`"n` + strconv.Itoa(i) + `":` + strconv.Itoa(i) + `,`)
+	}
+	c.WriteString(`"x":1},"subject_fact_key":1}`)
+	structuralSurfaces = nil
+	if got := redactMintedBody(c.String()); !strings.Contains(got, "withheld") {
+		t.Fatalf("a top-level minted member after many nested ones was published: %q", got)
+	}
+}

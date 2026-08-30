@@ -539,25 +539,48 @@ func isMinted(raw string) bool {
 // whole response was withheld -- while the comment two lines above the check said
 // such payload is ordinary. The code and its own comment disagreed
 // (shardpilot/shardpilot-go#85 review).
-func jsonDepthAt(body string, i int) int {
-	depth, inStr, esc := 0, false, false
-	for k := 0; k < i && k < len(body); k++ {
-		c := body[k]
-		switch {
-		case esc:
-			esc = false
-		case inStr && c == '\\':
-			esc = true
-		case c == '"':
-			inStr = !inStr
-		case inStr:
-		case c == '{':
-			depth++
-		case c == '}':
-			depth--
+// newDepthWalker answers "what JSON depth is byte i at" for a SEQUENCE of
+// ascending positions, in ONE forward pass over the body.
+//
+// ⚠ `jsonDepthAt` RESCANNED FROM BYTE ZERO PER MATCH. A valid assignment whose
+// `variant_payload` carries many non-string members puts every one of them
+// outside `covered`, so each asked its depth and each answer walked the whole
+// prefix again -- tens of billions of byte inspections on a response near the
+// capture limit, AFTER the bounded HTTP operation had finished. Endpoint-
+// controlled input that hangs the capture is not a slow path; it is the gate
+// failing open by never arriving (shardpilot/shardpilot-go#85 review).
+//
+// Second instance of this shape in one round, after the covered-span membership
+// beside it. The rule both share: when the caller consumes matches in order, a
+// per-match rescan is a cursor written the long way -- and the premise is
+// asserted, not assumed, because a cursor that silently ran ahead would answer
+// a depth question about the wrong byte.
+func newDepthWalker(body string) func(int) int {
+	k, depth, inStr, esc := 0, 0, false, false
+	last := -1
+	return func(i int) int {
+		if i < last {
+			panic("newDepthWalker called out of order: the cursor's premise does not hold")
 		}
+		last = i
+		for ; k < i && k < len(body); k++ {
+			c := body[k]
+			switch {
+			case esc:
+				esc = false
+			case inStr && c == '\\':
+				esc = true
+			case c == '"':
+				inStr = !inStr
+			case inStr:
+			case c == '{':
+				depth++
+			case c == '}':
+				depth--
+			}
+		}
+		return depth
 	}
-	return depth
 }
 
 // topLevelMembers returns the names bound from the top-level object, which is
