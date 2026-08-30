@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -2469,5 +2470,89 @@ func TestAJSONControlEscapeIsDecoded(t *testing.T) {
 	t.Cleanup(func() { suppliedValues = nil })
 	if err := assertNoLeak(asCaptured("k=%61%5Cnb")); err == nil {
 		t.Fatal("a value whose JSON spelling hides a control character passed the guard")
+	}
+}
+
+// A legal experiment key may be a NUMBER, and an assignment may be at that
+// version. The response block redacts the JSON number; this printer did not.
+func TestTheVerdictVersionGoesThroughTheScrub(t *testing.T) {
+	suppliedValues = []string{"123"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if got := verdictVersion(123); strings.Contains(got, "123") {
+		t.Fatalf("a supplied identifier was reintroduced by the verdict line: %q", got)
+	}
+	// ⚠ AND THE CALL SITE, WHICH IS OTHERWISE UNREACHABLE. The verdict block is
+	// printed inside `main()`, so no fixture can run it -- and a test that calls
+	// `verdictVersion` alone passes while the report goes on printing `%d`
+	// directly, which is exactly what the mutant showed. The same gap covers the
+	// three sibling verdict lines; this binds the one this round is about, and the
+	// rest is named rather than implied.
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("the scene cannot read its own subject: %v", err)
+	}
+	if !strings.Contains(string(src), `verdictVersion(result.Version)`) {
+		t.Fatal("the verdict block prints the version without the scrub")
+	}
+}
+
+// MIME ignores a blank line inside a run, including a run that shares its first
+// line with other text.
+func TestAWrappedRunSurvivesABlankLine(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured("prefix: YWJj\r\n\r\nZGVmZ2g=")); err == nil {
+		t.Fatal("a value reconstructable across a blank line passed the guard")
+	}
+}
+
+// Provenance marks exist for the guard; stderr gets a message, not SOH bytes.
+func TestTheStderrSanitizerStripsProvenanceMarks(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := sanitize(errors.New("dial tcp: abcdefgh refused"))
+	if strings.Contains(got, genMark) || strings.Contains(got, capturedMark) {
+		t.Fatalf("a provenance marker reached stderr: %q", got)
+	}
+	if strings.Contains(got, "abcdefgh") {
+		t.Fatalf("stripping the marks published the identifier: %q", got)
+	}
+}
+
+// A one- or two-character key travels as UNPADDED base64, below the rewrite floor.
+func TestAShortRawBase64ValueIsDecoded(t *testing.T) {
+	suppliedValues = []string{"ab"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured("k=YWI")); err == nil {
+		t.Fatal("a two-character value in unpadded base64 passed the guard")
+	}
+}
+
+// The splitter's alphabet must be as wide as the predicate's fold.
+func TestAUnicodeFoldedMintedNameIsTokenised(t *testing.T) {
+	structuralSurfaces = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	if !isMintedName("\u017fubject_fact_key") {
+		t.Skip("the fold this scene depends on is not what isMintedName does")
+	}
+	noteStructuralInText(`malformed HTTP response from "e.example": {"\u017fubject_fact_key":"sfk1_x"}`)
+	if len(structuralSurfaces) == 0 {
+		t.Fatal("a minted name behind a Unicode fold stayed publishable")
+	}
+}
+
+// The schema's member names are grammar; a supplied key equal to one must not
+// rewrite the schema -- and a NON-canonical spelling must not be vouched.
+func TestASchemaMemberNameIsGrammar(t *testing.T) {
+	suppliedValues = []string{"assigned"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"assigned\":true}")))
+	if !strings.Contains(got, `"assigned"`) {
+		t.Fatalf("the response schema was rewritten by the scrub: %q", got)
+	}
+	suppliedValues = []string{"ASSIGNED"}
+	got = stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"ASSIGNED\":true}")))
+	if strings.Contains(got, "ASSIGNED") {
+		t.Fatalf("a non-canonical spelling was vouched as grammar: %q", got)
 	}
 }
