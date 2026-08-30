@@ -678,6 +678,18 @@ func responseText(ex *exchange) string {
 	// The per-exchange fact is put where `dropFraming` reads it, for THIS exchange,
 	// immediately before it is rendered.
 	receivedConnection = ex.recvConn
+	// ⚠ THE INCOMPLETENESS TRAVELS WITH THE BODY. The SDK sets `bodyIncomplete` and
+	// refuses the verdict BEFORE decoding, and neither the exemption registry nor the
+	// `reason` vouch could see it: both asked only about SIZE, and a body that is
+	// UNDER the limit but ended short -- a declared `Content-Length` larger than what
+	// arrived -- is complete JSON to them (shardpilot/shardpilot-go#85 review). A
+	// size test answers a different question than the SDK's gate does.
+	//
+	// Package-level rather than a parameter, so the shared registry function keeps
+	// the signature the parent branch has: the seam stays a comparison.
+	prev := capturedIncomplete
+	capturedIncomplete = ex.truncErr() != nil
+	defer func() { capturedIncomplete = prev }()
 	return asCaptured(scrubSupplied(dropFraming(escapeMarks(string(ex.resp())))))
 }
 
@@ -889,7 +901,10 @@ var benignTopLevel = func() map[string]bool {
 // there is no classification (shardpilot/shardpilot-go#84 review).
 func topLevelExemptions(statusLine, body string) map[string]bool {
 	none := map[string]bool{}
-	if len(body) > sdkMaxBodyBytes {
+	// ⚠ INCOMPLETE IS THE SDK'S OTHER PRECONDITION, and it is not a length. A body
+	// under the ceiling whose read ended short is refused before decoding, so its
+	// member names are the endpoint's (shardpilot/shardpilot-go#85 review).
+	if capturedIncomplete || len(body) > sdkMaxBodyBytes {
 		return none
 	}
 	f := strings.Fields(strings.TrimSuffix(statusLine, "\r"))
@@ -1287,6 +1302,11 @@ func topLevelMembers(body string) []string {
 // "did we supply this string"; these answer "is this the value we asked for HERE",
 // which is the question `expEchoMatches` asks and the one a flat list cannot.
 var requestedAppKey, requestedEnvKey, requestedExpKey string
+
+// capturedIncomplete is true while the body of the exchange being rendered is one
+// the recorder could not show whole. Both vouching decisions read it: a body the
+// SDK would refuse before decoding carries no schema this program may vouch for.
+var capturedIncomplete bool
 
 var structuralSurfaces []string
 
@@ -1725,6 +1745,14 @@ func markFieldColon(line string) string {
 	return line[:i] + marked(":") + line[i+1:]
 }
 
+// statusLineOf returns the dump's first line, or "" when there is none.
+func statusLineOf(out []string) string {
+	if len(out) > 0 {
+		return out[0]
+	}
+	return ""
+}
+
 func dropFraming(dump string) string {
 	lines := strings.Split(dump, "\n")
 	out := make([]string, 0, len(lines))
@@ -2019,7 +2047,7 @@ func dropFraming(dump string) string {
 		exemptions = topLevelExemptions(out[0], exemptBody)
 	}
 	return strings.Join(out[:bodyStart], "\n") + "\n" +
-		redactUnaccountedBody(markBareJSONLiterals(redactUnaccountedJSONValues(redactMintedBody(strings.Join(out[bodyStart:], "\n"), exemptions), exemptions), exemptions))
+		redactUnaccountedBody(markBareJSONLiterals(redactUnaccountedJSONValues(redactMintedBody(strings.Join(out[bodyStart:], "\n"), exemptions), exemptions, statusLineOf(out)), exemptions))
 }
 
 type recorder struct {
@@ -2910,7 +2938,17 @@ func nameComponents(names string) string {
 // is left alone; an empty body has nothing to describe. What remains is endpoint
 // text in a shape this build does not cover, and the record is refused.
 func redactUnaccountedBody(body string) string {
-	if strings.TrimSpace(stripMarks(body)) == "" {
+	// ⚠ EMPTY MEANS ZERO BYTES, NOT "TRIMS TO NOTHING". A body of a single space --
+	// or of U+00A0 -- is neither empty nor a JSON document, and `jsonParses` rejects
+	// both; `TrimSpace` made each look empty here, so the structural refusal was
+	// skipped and endpoint bytes were published outside the four documented capture
+	// forms with an empty ledger (shardpilot/shardpilot-go#85 review). The whole
+	// question this function answers is what a body that describes nothing may
+	// contain, and "nothing" has a length.
+	// ⚠ LIMIT, AND IT IS THE FRAMING'S. A body of only CR/LF cannot be told apart
+	// from the framing this dump adds, so those two bytes still count as empty; a
+	// SPACE or a U+00A0 cannot come from the framing and is endpoint bytes.
+	if strings.Trim(stripMarks(body), "\r\n") == "" {
 		return body
 	}
 	if jsonParses(stripMarks(body)) {

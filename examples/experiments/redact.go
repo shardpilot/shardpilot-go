@@ -1382,7 +1382,22 @@ type sdkAssignmentWire struct {
 	Boundary       map[string]any  `json:"boundary"`
 }
 
-func redactUnaccountedJSONValues(body string, exempt map[string]bool) string {
+// statusCodeOf reads a status line's code. Extracted so the exemption registry and
+// the `reason` vouch ask it the same way; two spellings of "what status is this"
+// are how the two came to disagree.
+func statusCodeOf(statusLine string) (int, bool) {
+	f := strings.Fields(strings.TrimSuffix(statusLine, "\r"))
+	if len(f) < 2 || !strings.HasPrefix(f[0], "HTTP/") {
+		return 0, false
+	}
+	n, err := strconv.Atoi(f[1])
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+func redactUnaccountedJSONValues(body string, exempt map[string]bool, statusLine string) string {
 	// ⚠ A PATTERN OVER MEMBER-COLON-STRING IS NOT A TRAVERSAL. The first version
 	// matched only a string immediately after a member's colon, so
 	// `{"variant_payload":["server-secret-token"]}` kept its array element verbatim
@@ -1460,12 +1475,19 @@ func redactUnaccountedJSONValues(body string, exempt map[string]bool) string {
 	// limit excuses a MISS, and this one publishes a supplied identifier with an
 	// empty ledger. The three values are threaded through by name now.
 	reasonIsSDKs := false
+	// ⚠ AND THE STATUS DECIDES WHETHER THERE IS A VERDICT AT ALL. The SDK classifies
+	// a non-200 response from its STATUS and never parses an assignment body, so a
+	// `404` carrying `{"assigned":false,"reason":"kill_switch"}` has no taxonomy in it
+	// -- and this vouched it, publishing a supplied identifier with an empty ledger
+	// (shardpilot/shardpilot-go#85 review). The exemption registry was narrowed to
+	// status 200 a round earlier; this predicate never received the status at all.
+	code, haveStatus := statusCodeOf(statusLine)
 	// ⚠ AND THE SDK'S SIZE GATE COMES FIRST. `parseExperimentVerdict` refuses a body
 	// over `expMaxBodyBytes` BEFORE decoding, so a 1 MiB+1 body carrying a perfectly
 	// well-formed verdict is not this SDK's classification at all -- the decode here
 	// succeeded and vouched `reason` anyway (same review). Same gate as the exemption
 	// registry, for the same reason.
-	if len(body) <= sdkMaxBodyBytes {
+	if haveStatus && code == 200 && !capturedIncomplete && len(body) <= sdkMaxBodyBytes {
 		var shape sdkAssignmentWire
 		// Presence-aware, exactly as `expEchoMatches` states it: absent is tolerated,
 		// while a present member must be a JSON STRING and must be one this harness
@@ -2155,8 +2177,13 @@ var registeredDirectives = map[string]map[string]bool{
 	"transfer-encoding": set("chunked", "compress", "deflate", "gzip", "identity"),
 	"connection":        set("close", "keep-alive", "upgrade", "te"),
 	"accept-ranges":     set("bytes", "none"),
-	"allow": set("get", "head", "post", "put", "delete", "connect", "options",
-		"trace", "patch", "query"),
+	// ⚠ IN THE REGISTRY'S OWN SPELLING, because this field does not fold. Method
+	// names are case-sensitive, so the members are written as the registry writes
+	// them -- lowercase entries plus a folding lookup admitted `get` as `GET`
+	// (shardpilot/shardpilot-go#85 review). The set and the lookup are one decision:
+	// storing a folded spelling and then not folding loses the real methods.
+	"allow": set("GET", "HEAD", "POST", "PUT", "DELETE", "CONNECT", "OPTIONS",
+		"TRACE", "PATCH", "QUERY"),
 	"vary": set("*", "accept", "accept-encoding", "accept-language", "accept-charset",
 		"accept-datetime", "origin", "user-agent", "cookie", "authorization", "referer",
 		"access-control-request-method", "access-control-request-headers",
@@ -2173,8 +2200,22 @@ var registeredDirectives = map[string]map[string]bool{
 // Vouching says no: a number constrains the ALPHABET and says nothing about who
 // chose it, which is the distinction the collision rule below turns on. Two
 // parsers would have been two grammars.
+// directiveFolds says whether a field's registry is case-INSENSITIVE. Cache
+// directives, codings and connection options are; `Allow` carries METHOD NAMES,
+// which are case-sensitive, so `get` is not the registered `GET`
+// (shardpilot/shardpilot-go#85 review). Folding is a property of each registry,
+// not a convenience shared by the list -- and it lives in the MEMBERSHIP test,
+// which is why fixing only the canonical-spelling function changed nothing.
+func directiveFolds(field string) bool { return field != "allow" }
+
 func walkDirectives(field, v string, numericArg bool) bool {
 	known := registeredDirectives[field]
+	key := func(x string) string {
+		if directiveFolds(field) {
+			return strings.ToLower(x)
+		}
+		return x
+	}
 	if known == nil || strings.Contains(v, `"`) {
 		return false
 	}
@@ -2184,12 +2225,12 @@ func walkDirectives(field, v string, numericArg bool) bool {
 			return false
 		}
 		name, arg, hasArg := strings.Cut(part, "=")
-		if !known[strings.ToLower(ows(name))] {
+		if !known[key(ows(name))] {
 			return false
 		}
 		if hasArg {
 			a := ows(arg)
-			if known[strings.ToLower(a)] {
+			if known[key(a)] {
 				continue
 			}
 			if !numericArg || !isDigits(a) {
@@ -2532,12 +2573,19 @@ func admittedByRegistry(name string) bool {
 	return false
 }
 
+// canonicalAdmitted returns the spelling the field's REGISTRY uses for a value the
+// predicates admitted, or the value unchanged where the registry does not fold.
+//
+// ⚠ AND `Allow` DOES NOT FOLD. HTTP method names are case-sensitive, so `get` is
+// not the registered `GET` -- lowering it made an endpoint-selected token read as
+// the registry's own spelling, and with `get` also supplied it was marked generated
+// and passed both the scrub and the guard with no refusal
+// (shardpilot/shardpilot-go#85 review). Folding is a property of each registry,
+// not a convenience shared by the list.
 func canonicalAdmitted(name, v string) string {
 	switch strings.ToLower(ows(name)) {
-	case "content-type":
-		return strings.ToLower(v)
-	case "content-encoding", "transfer-encoding", "connection", "vary",
-		"accept-ranges", "allow", "cache-control":
+	case "content-type", "content-encoding", "transfer-encoding", "connection",
+		"vary", "accept-ranges", "cache-control":
 		return strings.ToLower(v)
 	}
 	return v
@@ -2653,6 +2701,23 @@ func redactUnlessVerbatim(line string) string {
 		// took that with it.
 		if raw := ows(value); raw != "" && raw != canonicalAdmitted(name, raw) &&
 			scrubSuppliedRaw(raw) != raw {
+			// ⚠ AND A NUMERIC ARGUMENT IS A SHAPE WHATEVER THE CASING. This branch fires
+			// when the spelling is NON-canonical, and `MAX-AGE=123456` is non-canonical --
+			// so a colliding number reached the token substitution and came back as
+			// `MAX-AGE=redacted-6-chars`, which is not an integer, with the ledger
+			// recording an accounted rewrite rather than a refusal
+			// (shardpilot/shardpilot-go#85 review). The canonical-spelling branch above
+			// already refuses this case; the question is about the ARGUMENT, and casing
+			// is not part of it.
+			// ⚠ AND ONLY WHERE THE FIELD HAS A DIRECTIVE REGISTRY. A media type has no
+			// numeric-argument question, and refusing there took `application/JSON` with
+			// it -- a value the token substitution handles correctly and three scenes
+			// assert. The guard was wider than the finding.
+			if registeredDirectives[strings.ToLower(ows(name))] != nil &&
+				!registryOnlyValue(name, strings.ToLower(raw)) {
+				noteStructural(formField, "an admitted header value whose colliding part has no grammar-preserving spelling")
+				return line
+			}
 			noteAccounted(formField, "an admitted header value colliding with a supplied value")
 			// ⚠ THE COLLIDING TOKEN, NOT THE WHOLE VALUE. Replacing the value outright
 			// keeps it parseable and throws away the type: an operator reading

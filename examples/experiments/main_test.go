@@ -3278,7 +3278,7 @@ func TestBodyRedactionIsLinear(t *testing.T) {
 	body := b.String()
 
 	start := time.Now()
-	got := redactUnaccountedJSONValues(body, assignmentTopLevel)
+	got := redactUnaccountedJSONValues(body, assignmentTopLevel, "HTTP/1.1 200 OK")
 	elapsed := time.Since(start)
 
 	if !strings.Contains(got, "redacted-4-chars") {
@@ -3335,7 +3335,7 @@ func TestEveryJSONRootFormIsEitherGrammarOrRefused(t *testing.T) {
 		suppliedValues = []string{supplied}
 		structuralSurfaces, accountedSurfaces = nil, nil
 		got := scrubSupplied(redactUnaccountedBody(markBareJSONLiterals(
-			redactUnaccountedJSONValues(redactMintedBody(body, assignmentTopLevel), assignmentTopLevel), assignmentTopLevel)))
+			redactUnaccountedJSONValues(redactMintedBody(body, assignmentTopLevel), assignmentTopLevel, "HTTP/1.1 200 OK"), assignmentTopLevel)))
 		clean := strings.NewReplacer(capturedMark, "", genMark, "").Replace(got)
 		var any interface{}
 		valid := json.Unmarshal([]byte(clean), &any) == nil
@@ -3383,7 +3383,7 @@ func TestOnlyTheEffectiveVerdictOccurrenceIsVouched(t *testing.T) {
 			suppliedValues = []string{supplied}
 			structuralSurfaces, accountedSurfaces = nil, nil
 			got := scrubSupplied(redactUnaccountedBody(markBareJSONLiterals(
-				redactUnaccountedJSONValues(redactMintedBody(body, assignmentTopLevel), assignmentTopLevel), assignmentTopLevel)))
+				redactUnaccountedJSONValues(redactMintedBody(body, assignmentTopLevel), assignmentTopLevel, "HTTP/1.1 200 OK"), assignmentTopLevel)))
 			clean := strings.NewReplacer(capturedMark, "", genMark, "").Replace(got)
 			printed := strings.Count(clean, supplied)
 			want := 0
@@ -3760,7 +3760,7 @@ func TestVerdictPositionsAreWireMembers(t *testing.T) {
 		suppliedValues = []string{"kill_switch"}
 		structuralSurfaces, accountedSurfaces = nil, nil
 		got := scrubSupplied(redactUnaccountedBody(markBareJSONLiterals(
-			redactUnaccountedJSONValues(redactMintedBody(body, assignmentTopLevel), assignmentTopLevel), assignmentTopLevel)))
+			redactUnaccountedJSONValues(redactMintedBody(body, assignmentTopLevel), assignmentTopLevel, "HTTP/1.1 200 OK"), assignmentTopLevel)))
 		if clean := strings.NewReplacer(capturedMark, "", genMark, "").Replace(got); strings.Contains(clean, "kill_switch") {
 			t.Errorf("%s: a supplied identifier at a non-verdict position was published: %q", body, clean)
 		}
@@ -4119,7 +4119,7 @@ func TestVerdictOccurrencesAreCountedAsTheDecoderGroupsThem(t *testing.T) {
 				suppliedValues = []string{supplied}
 				structuralSurfaces, accountedSurfaces = nil, nil
 				got := scrubSupplied(redactUnaccountedBody(markBareJSONLiterals(
-					redactUnaccountedJSONValues(redactMintedBody(body, assignmentTopLevel), assignmentTopLevel), assignmentTopLevel)))
+					redactUnaccountedJSONValues(redactMintedBody(body, assignmentTopLevel), assignmentTopLevel, "HTTP/1.1 200 OK"), assignmentTopLevel)))
 				clean := strings.NewReplacer(capturedMark, "", genMark, "").Replace(got)
 				printed := strings.Count(clean, supplied)
 				want := 0
@@ -4700,7 +4700,7 @@ func TestReasonIsVouchedOnlyWhereTheSDKReadsIt(t *testing.T) {
 		suppliedValues = []string{want}
 		structuralSurfaces, accountedSurfaces = nil, nil
 		got := scrubSupplied(redactUnaccountedBody(markBareJSONLiterals(
-			redactUnaccountedJSONValues(redactMintedBody(c.body, assignmentTopLevel), assignmentTopLevel), assignmentTopLevel)))
+			redactUnaccountedJSONValues(redactMintedBody(c.body, assignmentTopLevel), assignmentTopLevel, "HTTP/1.1 200 OK"), assignmentTopLevel)))
 		clean := strings.NewReplacer(capturedMark, "", genMark, "").Replace(got)
 		if printed := strings.Contains(clean, want); printed != c.vouched {
 			t.Errorf("%s: printed=%v, want %v: %q", c.body, printed, c.vouched, clean)
@@ -5175,7 +5175,7 @@ func TestTheNotAssignedShapeIncludesVersion(t *testing.T) {
 		suppliedValues = []string{"kill_switch"}
 		structuralSurfaces, accountedSurfaces = nil, nil
 		got := scrubSupplied(redactUnaccountedBody(markBareJSONLiterals(
-			redactUnaccountedJSONValues(redactMintedBody(c.body, assignmentTopLevel), assignmentTopLevel), assignmentTopLevel)))
+			redactUnaccountedJSONValues(redactMintedBody(c.body, assignmentTopLevel), assignmentTopLevel, "HTTP/1.1 200 OK"), assignmentTopLevel)))
 		clean := strings.NewReplacer(capturedMark, "", genMark, "").Replace(got)
 		if printed := strings.Contains(clean, "kill_switch"); printed != c.vouched {
 			t.Errorf("%s: printed=%v, want %v: %q", c.body, printed, c.vouched, clean)
@@ -5493,5 +5493,31 @@ func TestTheMirroredBodyLimitMatchesTheSDKs(t *testing.T) {
 	if capturedBodyMax != sdkMaxBodyBytes+1 {
 		t.Errorf("the recorder's ceiling is %d and the SDK's is %d; a capture AT the ceiling is only indeterminate while they differ by one",
 			capturedBodyMax, sdkMaxBodyBytes)
+	}
+}
+
+// TestAWhitespaceOnlyBodyIsNotEmpty: a body of a single space — or of U+00A0 — is
+// neither empty nor a JSON document, and `jsonParses` rejects both; `TrimSpace`
+// made each look empty, so the structural refusal was skipped and endpoint bytes
+// were published outside the four documented capture forms with an empty ledger
+// (shardpilot/shardpilot-go#85 review).
+func TestAWhitespaceOnlyBodyIsNotEmpty(t *testing.T) {
+	t.Cleanup(func() { structuralSurfaces = nil })
+	for _, c := range []struct {
+		name, body string
+		refused    bool
+	}{
+		{"a single space", " ", true},
+		{"a non-breaking space", " ", true},
+		{"genuinely empty", "", false},
+		// ⚠ CR AND LF STILL COUNT AS EMPTY: a body of only line breaks cannot be told
+		// apart from the framing this dump adds, and that limit is the framing's.
+		{"framing only", "\r\n", false},
+	} {
+		structuralSurfaces = nil
+		redactUnaccountedBody(c.body)
+		if (len(structuralSurfaces) != 0) != c.refused {
+			t.Errorf("%s: refused=%v, want %v", c.name, len(structuralSurfaces) != 0, c.refused)
+		}
 	}
 }

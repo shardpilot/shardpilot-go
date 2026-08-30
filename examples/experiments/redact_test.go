@@ -585,3 +585,73 @@ func TestAnOverLimitBodyIsNotThisSDKsVerdict(t *testing.T) {
 		t.Fatalf("a body within the SDK's ceiling lost its classification: %q", got[:160])
 	}
 }
+
+// TestVouchingCarriesEverySDKPrecondition: the SDK refuses a response before
+// decoding for THREE reasons — the status, the size, and incompleteness — and a
+// vouch claims it would have parsed. Each of the three was missing from one of the
+// two vouching decisions at some point in this round
+// (shardpilot/shardpilot-go#85 review).
+func TestVouchingCarriesEverySDKPrecondition(t *testing.T) {
+	t.Cleanup(func() { suppliedValues, structuralSurfaces = nil, nil; capturedIncomplete = false })
+	verdict := "{\"assigned\":false,\"reason\":\"kill_switch\"}"
+
+	// ⚠ THE STATUS. A non-200 is classified from its status alone; there is no
+	// assignment verdict in the body to have a taxonomy.
+	suppliedValues, capturedIncomplete = []string{"kill_switch"}, false
+	if got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 404 Not Found\r\n\r\n" + verdict))); strings.Contains(got, "kill_switch") {
+		t.Errorf("a 404 body vouched its reason: %q", got)
+	}
+	// ⚠ INCOMPLETENESS, WHICH IS NOT A LENGTH. A body under the ceiling whose read
+	// ended short is refused before decoding.
+	suppliedValues, capturedIncomplete = []string{"kill_switch"}, true
+	if got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n" + verdict))); strings.Contains(got, "kill_switch") {
+		t.Errorf("an incomplete body vouched its reason: %q", got)
+	}
+	// ...and the same fact reaches the exemption registry.
+	suppliedValues, capturedIncomplete = []string{"assigned"}, true
+	if got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false}"))); strings.Contains(got, "assigned") {
+		t.Errorf("an incomplete body kept its schema exemptions: %q", got)
+	}
+	// ⚠ AND A COMPLETE 200 STILL VOUCHES, or the preconditions have become a refusal
+	// to vouch anything at all.
+	suppliedValues, capturedIncomplete = []string{"kill_switch"}, false
+	if got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n" + verdict))); !strings.Contains(got, "kill_switch") {
+		t.Errorf("a complete 200 lost the SDK's own classification: %q", got)
+	}
+}
+
+// TestAllowIsNotFolded: HTTP method names are case-sensitive, so `get` is not the
+// registered `GET`. Folding it made an endpoint-selected token read as the
+// registry's own spelling (shardpilot/shardpilot-go#85 review).
+func TestAllowIsNotFolded(t *testing.T) {
+	t.Cleanup(func() { suppliedValues, structuralSurfaces = nil, nil })
+	suppliedValues, structuralSurfaces = []string{"get"}, nil
+	if got := stripMarks(scrubSupplied(redactUnlessVerbatim("Allow: get"))); strings.Contains(got, "Allow: get") {
+		t.Errorf("a lowercase method was vouched as the registered one: %q", got)
+	}
+	// ⚠ AND THE REGISTERED SPELLING STILL SURVIVES A COLLISION.
+	suppliedValues, structuralSurfaces = []string{"GET"}, nil
+	if got := stripMarks(scrubSupplied(redactUnlessVerbatim("Allow: GET"))); !strings.Contains(got, "Allow: GET") {
+		t.Errorf("the registered method was lost: %q", got)
+	}
+}
+
+// TestANumericArgumentIsAShapeWhateverTheCasing: this branch fires on a
+// NON-canonical spelling, and `MAX-AGE=123456` is non-canonical — so a colliding
+// number reached the token substitution and came back as `MAX-AGE=redacted-6-chars`,
+// which is not an integer, with the ledger recording an accounted rewrite rather
+// than a refusal (shardpilot/shardpilot-go#85 review).
+func TestANumericArgumentIsAShapeWhateverTheCasing(t *testing.T) {
+	t.Cleanup(func() { suppliedValues, structuralSurfaces = nil, nil })
+	suppliedValues, structuralSurfaces = []string{"123456"}, nil
+	got := stripMarks(scrubSupplied(redactUnlessVerbatim("Cache-Control: MAX-AGE=123456")))
+	if len(structuralSurfaces) == 0 {
+		t.Errorf("a directive no parser accepts was published with an empty ledger: %q", got)
+	}
+	// ⚠ AND A NON-CANONICAL SPELLING WHOSE TOKENS ARE ALL REGISTRY MEMBERS still
+	// takes the substitution rather than a refusal.
+	suppliedValues, structuralSurfaces = []string{"STORE"}, nil
+	if got := stripMarks(scrubSupplied(redactUnlessVerbatim("Cache-Control: NO-STORE"))); len(structuralSurfaces) != 0 {
+		t.Errorf("a registry token in a non-canonical spelling was refused: %q %v", got, structuralSurfaces)
+	}
+}
