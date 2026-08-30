@@ -4,14 +4,20 @@ import (
 	"bytes"
 	"encoding/base64"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"reflect"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 )
 
 // Each test below stands for one review finding on this program. They are here
@@ -2266,4 +2272,279 @@ func TestAnUnderscoreSeparatesInsideAFieldName(t *testing.T) {
 	if strings.Contains(got, "bar") {
 		t.Fatalf("a supplied identifier survived in a field name across an underscore: %q", got)
 	}
+}
+
+// An undecodable coding is about BYTES, not about content worth reading.
+//
+// ⚠ THE POPULATION IS "A BODY", AND `TrimSpace` NAMED ONLY THE NON-BLANK HALF OF
+// IT. A response with an unsupported coding and a body of ` \t` was published:
+// the trimmed body looked empty, the structural refusal was skipped, and a
+// decoder for that coding may reconstruct a supplied value from exactly those
+// bytes (shardpilot/shardpilot-go#84 review). The round before wrote the trim to
+// spare a 204 its diagnostic; a 204 has no bytes, so length answers both.
+//
+// Rows are the product of the whitespace bytes HTTP can leave in a body with the
+// empty and non-empty cases, so the rule is read as "any bytes at all" rather
+// than as the two spellings that happened to be shown.
+func TestAWhitespaceOnlyEncodedBodyIsStillABody(t *testing.T) {
+	for _, c := range []struct {
+		body    string
+		refused bool
+	}{
+		{"", false}, {" ", true}, {"\t", true}, {"\n", true}, {"\r\n", true},
+		{" \t", true}, {"\r\n\r\n", true}, {"x", true}, {" x ", true},
+	} {
+		structuralSurfaces = nil
+		dropFraming("HTTP/1.1 200 OK\r\nContent-Encoding: x-private\r\n\r\n" + c.body)
+		if got := len(structuralSurfaces) > 0; got != c.refused {
+			t.Errorf("body %q under an unsupported coding: refused=%v, want %v", c.body, got, c.refused)
+		}
+	}
+	structuralSurfaces = nil
+}
+
+// The exemption set is the wire object's members, and the wire object is in the
+// SDK source rather than in my memory of it.
+//
+// ⚠ A REGISTRY THAT DRIFTS IN BOTH DIRECTIONS. Two names were present that are
+// not top-level members -- `attributes`, and `assignment_unit`, which lives
+// inside `boundary` -- so a legal supplied value equal to either was vouched as
+// generated grammar and published; and `assignment_key` was absent, so a genuine
+// schema member was scrubbed out of an ordinary capture
+// (shardpilot/shardpilot-go#84 review). Both directions come from the same cause:
+// the list was recalled.
+//
+// The population is produced by parsing the struct, so a member added or removed
+// in the SDK turns this red without anyone remembering the registry exists.
+func TestTheTopLevelExemptionsAreExactlyTheWireMembers(t *testing.T) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "../../experiments.go", nil, 0)
+	if err != nil {
+		t.Fatalf("the SDK source is the oracle and it could not be read: %v", err)
+	}
+	wire := map[string]bool{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		ts, ok := n.(*ast.TypeSpec)
+		if !ok || ts.Name.Name != "expAssignmentWire" {
+			return true
+		}
+		st, ok := ts.Type.(*ast.StructType)
+		if !ok {
+			return false
+		}
+		for _, fld := range st.Fields.List {
+			if fld.Tag == nil {
+				continue
+			}
+			tag, err := strconv.Unquote(fld.Tag.Value)
+			if err != nil {
+				continue
+			}
+			name, _, _ := strings.Cut(reflect.StructTag(tag).Get("json"), ",")
+			if name != "" && name != "-" {
+				wire[name] = true
+			}
+		}
+		return false
+	})
+	if len(wire) == 0 {
+		t.Fatal("no members were read from expAssignmentWire: the oracle found nothing, which is not the same as finding agreement")
+	}
+	// A DIFFERENT wire shape, named here because it is not derivable from the
+	// assignment struct: a 401 body is `{"error":...}` and a failure verdict
+	// carries `code`.
+	errorBody := map[string]bool{"error": true, "code": true}
+	for name := range wire {
+		if !benignTopLevel[name] && !mintedNames[name] {
+			t.Errorf("%q is a top-level member of expAssignmentWire and is exempted nowhere: an ordinary capture loses it", name)
+		}
+	}
+	for name := range benignTopLevel {
+		if !wire[name] && !errorBody[name] {
+			t.Errorf("%q is exempted at the top level and is not a member of expAssignmentWire: a supplied value equal to it is published", name)
+		}
+	}
+}
+
+// The taxonomy is what the SDK writes, and the SDK enumerates it in its own
+// source.
+//
+// ⚠ PART OF IT IS GENERATED, SO A LIST CANNOT HOLD IT. `"http_" + Itoa(status)`
+// and `"transient_" + Itoa(status)` are unbounded families, and the registry held
+// four static entries -- so every `http_503` or `transient_408` verdict lost its
+// classification to a placeholder on an ORDINARY capture
+// (shardpilot/shardpilot-go#84 review).
+//
+// The population is parsed out of the doc comment where the SDK states the
+// taxonomy, so a code added there turns this red. A template token is exercised
+// with a concrete status rather than skipped, because the templates are exactly
+// the part a list cannot express.
+func TestTheTaxonomyCoversTheSDKsOwnEnumeration(t *testing.T) {
+	src, err := os.ReadFile("../../experiments.go")
+	if err != nil {
+		t.Fatalf("the SDK source is the oracle and it could not be read: %v", err)
+	}
+	lines := strings.Split(string(src), "\n")
+	anchor := -1
+	for i, l := range lines {
+		if strings.Contains(l, "the taxonomy code in the error text") {
+			anchor = i
+			break
+		}
+	}
+	if anchor < 0 {
+		t.Fatal("the enumeration this scene reads is gone from the SDK source: an oracle that finds nothing is not agreement")
+	}
+	lo, hi := anchor, anchor
+	for lo > 0 && strings.HasPrefix(strings.TrimSpace(lines[lo-1]), "//") {
+		lo--
+	}
+	for hi < len(lines)-1 && strings.HasPrefix(strings.TrimSpace(lines[hi+1]), "//") {
+		hi++
+	}
+	quoted := regexp.MustCompile(`"([a-z0-9_<>.]+)"`)
+	var seen int
+	for _, m := range quoted.FindAllStringSubmatch(strings.Join(lines[lo:hi+1], "\n"), -1) {
+		tok := m[1]
+		// A template stands for the generated family; exercise it with a status
+		// the SDK would actually render.
+		probe := tok
+		switch {
+		case strings.Contains(tok, "<status>"):
+			probe = strings.ReplaceAll(tok, "<status>", "503")
+		case strings.HasSuffix(tok, "..."):
+			probe = strings.TrimSuffix(tok, "...") + "503"
+		}
+		seen++
+		if !isSDKTaxonomy(probe) {
+			t.Errorf("the SDK names %q as a taxonomy code and this build does not vouch %q: an ordinary verdict loses its classification", tok, probe)
+		}
+	}
+	if seen < 5 {
+		t.Fatalf("only %d codes were read from the enumeration: the oracle is not reading what it thinks it is", seen)
+	}
+	// And the canonical spelling only: an endpoint may echo a shape the SDK never
+	// writes, and recognising a shape is not having written it.
+	for _, no := range []string{"http_007", "http_+7", "http_ 7", "http_", "http_5o3", "transient_-1", "HTTP_503"} {
+		if isSDKTaxonomy(no) {
+			t.Errorf("%q is vouched as this SDK's taxonomy and the SDK never writes it", no)
+		}
+	}
+}
+
+// The rendered-text vouch has to reach the generated families too, and it must
+// still refuse a near-miss.
+func TestGeneratedTaxonomyIsVouchedInRenderedText(t *testing.T) {
+	for _, c := range []struct {
+		tok     string
+		vouched bool
+	}{
+		{"http_503", true}, {"transient_408", true}, {"http_0", true},
+		{"kill_switch", true},
+		{"http_007", false}, {"http_+7", false}, {"http_5o3", false},
+		{"transient_-1", false}, {"HTTP_503", false},
+	} {
+		got := vouchTaxonomyIn("code=" + c.tok + " end")
+		if marked := strings.Contains(got, genMark); marked != c.vouched {
+			t.Errorf("%q vouched=%v, want %v: %q", c.tok, marked, c.vouched, got)
+		}
+	}
+}
+
+// A combining mark continues the word it is attached to.
+//
+// ⚠ THE POPULATION IS "UNICODE MARK", NOT U+0301. `IsLetter || IsDigit` put every
+// mark in the boundary class, so a supplied short value adjacent to a decomposed
+// grapheme was replaced while the mark stayed behind -- evidence altered into
+// something the endpoint never sent, and approved, because the placeholder is
+// generated (shardpilot/shardpilot-go#84 review).
+//
+// The rows are the product of the three mark categories with both sides of the
+// value, generated from `unicode.Mn/Mc/Me` rather than from the one code point
+// the review named.
+func TestACombiningMarkDoesNotDetachFromItsLetter(t *testing.T) {
+	marks := []rune{'́', 'ٔ', 'ः', '⃝'} // Mn, Mn, Mc, Me
+	for _, m := range marks {
+		if !unicode.IsMark(m) {
+			t.Fatalf("the scene's own population is wrong: %U is not a mark", m)
+		}
+		for _, side := range []string{"after", "before"} {
+			text := "a" + string(m)
+			if side == "before" {
+				text = string(m) + "a"
+			}
+			got := replaceTokenWith(text, "a", "<X>", isWordByte)
+			if got != text {
+				t.Errorf("%s %U: %q became %q -- the mark was left detached from its letter",
+					side, m, text, got)
+			}
+		}
+	}
+}
+
+// MIME ignores horizontal whitespace, so the guard must too — wherever it sits.
+//
+// ⚠ THE POPULATION IS "WHERE A SPACE CAN SIT IN A WRAPPED RUN", NOT THE ONE
+// PLACEMENT SHOWN. The whole-line producer normalised spaces and tabs and the
+// shared-line producer did not, so a run carrying whitespace produced no
+// candidate and `assertNoLeak` approved a spelling a standard decoder turns
+// straight back into the identifier (shardpilot/shardpilot-go#84 review).
+// Measured before fixing: three of the four placements broke it.
+//
+// The rows are the product of the whitespace bytes with the placements and with
+// both ways a run can end, including ending WITH THE TEXT — which produced no
+// candidate at all and was found by measuring rather than by being told.
+func TestWrappedBase64SurvivesWhitespaceWhereverItSits(t *testing.T) {
+	// "abcdefgh" is YWJjZGVmZ2g=, wrapped after four characters.
+	const head, tail = "YWJj", "ZGVmZ2g="
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil; decodeWork = 0 })
+	for _, ws := range []string{" ", "\t", "  ", " \t"} {
+		placements := map[string]string{
+			"after the head":          "prefix: " + head + ws + "\r\n" + tail,
+			"before the tail":         "prefix: " + head + "\r\n" + ws + tail,
+			"inside the tail":         "prefix: " + head + "\r\n" + tail[:4] + ws + tail[4:],
+			"inside the head":         "prefix: " + head[:2] + ws + head[2:] + "\r\n" + tail,
+			"on both sides of a fold": "prefix: " + head + ws + "\r\n" + ws + tail,
+		}
+		for where, run := range placements {
+			for _, ending := range []string{"", "\r\nend."} {
+				decodeWork = 0
+				if err := assertNoLeak(asCaptured(run + ending)); err == nil {
+					t.Errorf("%q %s, ending %q: the guard approved a run a MIME decoder reconstructs",
+						ws, where, ending)
+				}
+			}
+		}
+	}
+}
+
+// A field name is a token, and the stand-in for a generated span has to be one.
+//
+// ⚠ THE VALUE SIDE AND THE NAME SIDE WANT DIFFERENT STAND-INS. Blanking a
+// generated span stops two unrelated value fragments reading as one token, and it
+// makes a field NAME syntactically invalid -- so `headerNameEnd` failed, the
+// name-specific decoded boundary check never ran, and with `bar` and `qux`
+// supplied the capture `X-redacted-3-chars-%71ux` was approved, from which the
+// supported percent decoder reconstructs `qux` (shardpilot/shardpilot-go#84
+// review).
+//
+// The rows are the product of where the encoded value sits in the name with which
+// of its bytes are encoded, because the defect is about the name PARSING at all
+// and any of these spellings exercises it.
+func TestAGeneratedSpanLeavesTheFieldNameParsable(t *testing.T) {
+	spellings := []string{"%71ux", "q%75x", "qu%78", "%71%75%78"}
+	for _, enc := range spellings {
+		for _, name := range []string{"X-bar-" + enc, "X-" + enc + "-bar", "bar-" + enc} {
+			suppliedValues = []string{"bar", "qux"}
+			structuralSurfaces = nil
+			got := scrubSupplied(dropFraming("GET / HTTP/1.1\r\n" + name + ": v\r\n\r\n"))
+			if err := assertNoLeak(asCaptured(got)); err == nil {
+				t.Errorf("%q: the guard approved %q, which the percent decoder turns back into a supplied value",
+					name, stripMarks(got))
+			}
+		}
+	}
+	suppliedValues = nil
+	structuralSurfaces = nil
 }
