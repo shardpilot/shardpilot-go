@@ -43,6 +43,18 @@ func TestEveryComponentIsMeasuredAsReceived(t *testing.T) {
 			}
 		})
 	}
+	// ⚠ THE REASON PHRASE IS A COMPONENT TOO, and the sweep did not have a row for
+	// it — which is why the review found that one and not this table
+	// (shardpilot/shardpilot-go#85 review). A sweep's own population needs deriving
+	// as much as the thing it sweeps.
+	t.Run("reason phrase", func(t *testing.T) {
+		suppliedValues = nil
+		got := stripMarks(redactUnlessVerbatim("HTTP/1.1 599 " + escapeMarks(capturedMark)))
+		if !strings.Contains(got, "<redacted, 1 chars>") {
+			t.Fatalf("a reason phrase was measured in its escaped spelling: %q", got)
+		}
+	})
+
 	for _, c := range []struct{ what, line, want string }{
 		{"cookie name", "Set-Cookie: " + escapeMarks(capturedMark) + "=x", "redacted-1-chars"},
 		{"cookie value", "Set-Cookie: sid=" + escapeMarks(capturedMark), "<redacted, 1 chars>"},

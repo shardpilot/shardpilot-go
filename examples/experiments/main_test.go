@@ -2187,3 +2187,54 @@ func TestAnEscapedMintedNameInATransportErrorRefuses(t *testing.T) {
 		t.Fatal("an escaped minted name inside a transport error stayed publishable")
 	}
 }
+
+// ---- round on d2cd70d ----
+
+// TestACookieNameIsComparedExactly is the SECOND site of one conflation: I fixed
+// the query-name lookup and left this one, so `Set-Cookie: experiment_key =x` had
+// the trailing space trimmed for the provenance match and the whole endpoint
+// spelling was marked generated (shardpilot/shardpilot-go#85 review).
+func TestACookieNameIsComparedExactly(t *testing.T) {
+	suppliedValues = []string{"experiment_key"}
+	requestNames = map[string]bool{"experiment_key": true}
+	t.Cleanup(func() { suppliedValues = nil; requestNames = map[string]bool{} })
+	got := stripMarks(scrubSupplied(redactSetCookie("Set-Cookie: experiment_key =x")))
+	if strings.Contains(got, "experiment_key") {
+		t.Fatalf("a padded endpoint spelling was vouched for and published: %q", got)
+	}
+	// And the exact name is still vouched for.
+	got = stripMarks(scrubSupplied(redactSetCookie("Set-Cookie: experiment_key=x")))
+	if !strings.Contains(got, "experiment_key=") {
+		t.Fatalf("a cookie name the harness sent was scrubbed: %q", got)
+	}
+}
+
+// TestAnOpaqueTargetHasItsSchemeVouched: with no `://` the fallback took the FIRST
+// colon in the line — the header name's — so `Location: https:abc` never had its
+// scheme vouched (shardpilot/shardpilot-go#85 review).
+func TestAnOpaqueTargetHasItsSchemeVouched(t *testing.T) {
+	suppliedValues = []string{"https"}
+	receivedConnection = true
+	t.Cleanup(func() { suppliedValues = nil; receivedConnection = false })
+	got := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\nLocation: https:abc\r\n\r\n")))
+	if !strings.Contains(got, "https:") {
+		t.Fatalf("an approved scheme on an opaque target was scrubbed: %q", got)
+	}
+}
+
+// TestVouchingParsesAMarkFreeView: the minted replacement inserts provenance bytes
+// INSIDE a JSON string, so an ordinary body carrying a minted value stopped parsing
+// and returned no names — and a supplied `assigned` took the recognised SDK field
+// with it (shardpilot/shardpilot-go#85 review).
+func TestVouchingParsesAMarkFreeView(t *testing.T) {
+	suppliedValues = []string{"assigned"}
+	structuralSurfaces = nil
+	accountedSurfaces = nil
+	t.Cleanup(func() { suppliedValues = nil; structuralSurfaces = nil; accountedSurfaces = nil })
+	got := stripMarks(scrubSupplied(redactMintedBody(
+		`{"assigned":true,"subject_fact_key":"sfk1_xxxxxxxxxxxx"}`)))
+	if !strings.Contains(got, `"assigned":true`) {
+		t.Fatalf("a recognised SDK field was scrubbed out of an ordinary body: %q", got)
+	}
+}

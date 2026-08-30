@@ -437,12 +437,23 @@ func isIPvFutureByte(c byte) bool {
 // once; the same rule the media type and the member names each taught, arriving a
 // third time: classification runs on a document, marking runs on the result.
 func vouchScheme(line string) string {
-	i := strings.Index(line, "://")
+	// ⚠ AFTER THE FIELD DELIMITER. With no `://` the fallback took the FIRST colon
+	// in the line -- which is the header name's -- so an opaque `Location: https:abc`
+	// never had its scheme vouched, and a supplied `https` published
+	// `<redacted, 5 chars>:redacted-3-chars` (shardpilot/shardpilot-go#85 review).
+	// The target starts where `splitField` says it starts.
+	_, _, url0, ok0 := splitField(line)
+	if !ok0 {
+		return line
+	}
+	off := len(line) - len(url0)
+	i := strings.Index(url0, "://")
 	if i < 0 {
-		if i = strings.IndexByte(line, ':'); i < 0 {
+		if i = strings.IndexByte(url0, ':'); i < 0 {
 			return line
 		}
 	}
+	i += off
 	j := strings.LastIndexAny(line[:i], " 	")
 	sch := line[j+1 : i]
 	switch strings.ToLower(stripMarks(sch)) {
@@ -699,7 +710,13 @@ func redactSetCookie(line string) string {
 	// A cookie NAME is never something this program sent, so it is lengthened by
 	// the same rule -- there is nothing on the name side of a Set-Cookie whose
 	// provenance the harness can attest to.
-	if !nameIsOurs(name) {
+	// ⚠ EXACTLY HERE TOO. I fixed the QUERY name lookup and left this one: an
+	// endpoint may return the transport-valid `Set-Cookie: experiment_key =x`, and
+	// the OWS trim turned that into the harness-owned name -- so the whole endpoint
+	// spelling was marked generated and both the scrub and the guard skipped it
+	// (shardpilot/shardpilot-go#85 review). Second site of one conflation, found
+	// the round after the first.
+	if !nameIsOursExactly(name) {
 		// MEASURED AS RECEIVED. `responseText` expands a marker-like spelling on the
 		// way in, so a cookie name containing the literal `\x00` was reported three
 		// characters longer than it arrived. The cookie's VALUE and its attribute
@@ -1131,8 +1148,15 @@ func redactMintedBody(body string) string {
 	// (shardpilot/shardpilot-go#85 review). Third time a depth-blind rule has been
 	// written beside a depth-aware one in this function; the redaction is blind on
 	// purpose, and everything that VOUCHES must not be.
+	// ⚠ PARSE A MARK-FREE VIEW. The replacement above inserts provenance bytes
+	// INSIDE a JSON string, so an ordinary body carrying a minted value stopped
+	// parsing here and returned no names -- and a supplied `assigned` then took the
+	// recognised SDK field with it (shardpilot/shardpilot-go#85 review). Third site
+	// of one rule in this file: the grammar pass, the depth walk, and now this.
+	// Only the NAME SET is needed, so the stripped view is enough and no offset has
+	// to be mapped back.
 	topNames := map[string]bool{}
-	for _, n := range topLevelMembers(out) {
+	for _, n := range topLevelMembers(stripMarks(out)) {
 		topNames[n] = true
 	}
 	vouchWalk := newDepthWalker(out)
@@ -1549,7 +1573,10 @@ func redactUnlessVerbatim(line string) string {
 				// disagreement, not an exemption.
 				return f[0] + " " + f[1] + " " + vouched(f[2]) + cr
 			}
-			return f[0] + " " + f[1] + " " + placeholder(f[2]) + cr
+			// MEASURED AS RECEIVED, like the generic header, the cookie name and the
+			// cookie value: `responseText` expands a marker-like spelling on the way in
+			// (shardpilot/shardpilot-go#85 review).
+			return f[0] + " " + f[1] + " " + placeholder(unescapeMarks(f[2])) + cr
 		}
 		return line
 	}
