@@ -39,11 +39,20 @@
 #
 # ⚠ INSTALL BY COPY, AND PIN core.hooksPath TO THE PHYSICAL DIRECTORY.
 #
-#     h="$(git rev-parse --git-common-dir)/hooks"
-#     cp .githooks/pre-push "$h/pre-push"
-#     cp scripts/check_public_surface.sh "$h/"
-#     chmod +x "$h/pre-push" "$h/check_public_surface.sh"
-#     git config --local core.hooksPath "$h"
+#     Use the installer in README.md. It is the only copy, and a scene executes
+#     the text of it.
+#
+# ⚠ THIS BLOCK USED TO SPELL THE COMMANDS OUT, AND THEY WERE WRONG. In the main
+# worktree `git rev-parse --git-common-dir` returns the RELATIVE `.git`, so they
+# stored `.git/hooks` in `core.hooksPath` -- and git resolves a relative
+# `core.hooksPath` against the directory hooks run in, where a linked worktree's
+# `.git` is a FILE, so the hook was never invoked there and the gate was silently
+# absent (shardpilot/shardpilot-go#79 review). Reproduced: `--git-path hooks`
+# succeeds in the main worktree and fails with `Not a directory` in a linked one.
+#
+# The README installer computes the physical path and verifies the result in every
+# worktree. Two copies of a procedure drift, and the copy nothing executes drifts
+# first -- this one had never been run.
 #
 # Three things, each closing a way the gate was silently absent:
 #
@@ -495,11 +504,18 @@ if [ -n "$worktree_root" ]; then
   # inside the worktree, while `--separate-git-dir=$PWD/.repo` gives `.repo/hooks`
   # -- inside, with no such component, and trackable. That is the line, and it is
   # git's line rather than a list of layouts I happened to think of.
+  # ⚠ AND A ROOT OF `/` DOUBLES THE SLASH. `"$worktree_root"/*` expands to `//*`
+  # when the root IS `/`, which matches nothing -- so a worktree at the filesystem
+  # root with a separate git directory at `/repo` skipped the containment check
+  # entirely (shardpilot/shardpilot-go#79 review). The prefix is built once, with
+  # the trailing slash included rather than appended.
+  root_prefix="$worktree_root/"
+  case "$root_prefix" in //) root_prefix=/ ;; esac
   case "$hooks_dir/" in
-    "$worktree_root"/*)
+    "$root_prefix"*)
       # Trackability is decided on the path RELATIVE to the worktree: a `.git`
       # component anywhere in it puts the directory beyond any branch's reach.
-      hooks_rel="${hooks_dir#"$worktree_root"/}"
+      hooks_rel="${hooks_dir#"$root_prefix"}"
       case "/$hooks_rel/" in
         */.git/*) : ;;
         *)
@@ -580,8 +596,31 @@ esac
 # The refspec is read first, and `HEAD` is required only when at least one update
 # is not a deletion. An unborn HEAD with something to scan is still a refusal --
 # the value would be needed and is not there -- and it says so by name.
+# ⚠ AND "NOT A DELETION" IS NOT "NEEDS A COMMIT". A repository with an unborn HEAD
+# can hold a blob or a tree made with plumbing, and pushing one to a non-branch
+# namespace -- `<blob>:refs/archive/blob` -- is valid and needs no commit at all;
+# this required HEAD for it and refused (shardpilot/shardpilot-go#79 review). The
+# question is what the SCAN needs, and the scan needs a commit only when one is
+# being introduced. Asked of the object, not of the line's shape.
 head_sha=""
-if printf '%s\n' "$pushed_lines" | awk 'NF>=4 && $2 !~ /^0+$/ {found=1} END{exit !found}'; then
+needs_head=no
+while IFS=" " read -r _ lsha _ _; do
+  case "$lsha" in
+    ""|*[!0-9a-fA-F]*) continue ;;
+  esac
+  case "$lsha" in
+    *[!0]*) ;;
+    *) continue ;;
+  esac
+  otype="$(git cat-file -t "$lsha" 2>/dev/null || printf '')"
+  if [ "$otype" = commit ] || [ "$otype" = tag ]; then
+    needs_head=yes
+    break
+  fi
+done <<PUSHED_LINES
+$pushed_lines
+PUSHED_LINES
+if [ "$needs_head" = yes ]; then
   head_sha="$(git rev-parse HEAD 2>/dev/null && printf X)" || head_sha=""
   head_sha="${head_sha%X}"
   head_sha="${head_sha%$NL}"
@@ -731,10 +770,23 @@ scan_commit() {
       ;;
   esac
   scanner_row="$( cd "$wt" && git_safe ls-tree "$1" -- scripts/check_public_surface.sh 2>/dev/null )" || scanner_row=""
-  if [ "${scanner_row%% *}" = 120000 ]; then
-    printf 'REFUSING: in %s, the scanner path is a symlink.\n' "$1" >&2
-    exit 2
-  fi
+  # ⚠ WHAT IS ALLOWED, NOT WHAT IS BANNED. Naming `120000` left `160000`: a commit
+  # can make the scanner path a GITLINK whose target is absent locally, and
+  # `cat-file -e "$1:scripts/check_public_surface.sh"` then dereferences the
+  # missing target and reports the path ABSENT -- so the trusted scanner was staged
+  # over it, the scanner's own gitlink refusal never saw the row, and the
+  # unscanned repository reference was published
+  # (shardpilot/shardpilot-go#79 review). This is the third time in this file that
+  # a ban-list left the mode nobody thought of; the allowed set is two entries and
+  # does not grow.
+  case "${scanner_row%% *}" in
+    ""|100644|100755) ;;
+    *)
+      printf 'REFUSING: in %s, the scanner path is mode %s, not a regular file.\n' \
+        "$1" "${scanner_row%% *}" >&2
+      exit 2
+      ;;
+  esac
   # The directory is created rather than checked out: this gate writes evidence
   # into it, and nothing from the commit is materialised anywhere.
   mkdir -p "$wt/scripts"
@@ -1017,7 +1069,14 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     printf '  Check out %s and push again, or --no-verify and own it.\n' "${local_ref:-that ref}" >&2
     exit 2
   fi
-  if ! git diff --quiet HEAD -- || ! git diff --cached --quiet; then
+  # ⚠ AND THERE IS NOTHING TO BE INCONSISTENT WITH WHEN HEAD IS UNBORN. This
+  # compares the checkout against HEAD so that what is scanned is what is
+  # published; with no HEAD there is no checkout state in the question at all, and
+  # `git diff HEAD` aborts with `bad revision` -- refusing a non-commit push that
+  # needs no commit (shardpilot/shardpilot-go#79 review). The eligibility branch
+  # above already reaches `eligible=yes` for such an object without consulting
+  # HEAD; this line had not been given the same condition.
+  if [ -n "$head_sha" ] && { ! git diff --quiet HEAD -- || ! git diff --cached --quiet; }; then
     printf 'REFUSING: the index or working tree differs from HEAD.\n' >&2
     printf '  Commit or stash first, so what is scanned is what is published.\n' >&2
     exit 2
@@ -1543,7 +1602,29 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       if [ -s "$tmpdir/tag-target" ]; then
         tag_target="$tmpdir/tag-target"
       fi
+      # ⚠ AND AN UNBORN HEAD HAS NO TREE TO STAGE EVIDENCE INTO. Substituting an
+      # empty `head_sha` made `worktree add` run with no commit at all and refused a
+      # push git performs without reading one (shardpilot/shardpilot-go#79 review).
+      # A synthetic empty commit gives the scan a tree that carries nothing of its
+      # own, which is exactly what a repository with no history has; it is written
+      # to the private evidence object store, so the repository under inspection
+      # gains nothing.
       scan_target="$head_sha"
+      if [ -z "$scan_target" ]; then
+        empty_tree="$(git hash-object -t tree /dev/null 2>/dev/null && printf X)" || empty_tree=""
+        empty_tree="${empty_tree%X}"
+        empty_tree="${empty_tree%$NL}"
+        if [ -n "$empty_tree" ]; then
+          scan_target="$(git commit-tree "$empty_tree" -m 'synthetic scan base' 2>/dev/null && printf X)" || scan_target=""
+          scan_target="${scan_target%X}"
+          scan_target="${scan_target%$NL}"
+        fi
+        if [ -z "$scan_target" ]; then
+          printf 'REFUSING: this repository has no history and no scan base could be\n' >&2
+          printf '  synthesised, so the published object cannot be staged for scanning.\n' >&2
+          exit 2
+        fi
+      fi
     fi
     scan_ref_name "$scan_target" "$base" "$remote_ref" "$tag_object" "$tag_target" "$tag_blobs" || status=$?
     continue
