@@ -1889,3 +1889,42 @@ func TestTheProbeBudgetDoesNotCarryBetweenRecords(t *testing.T) {
 		t.Fatalf("an ordinary record was refused on the previous record's budget: %v", err)
 	}
 }
+
+// The transport error carries a QUOTED line: `net/http` doubles the backslash, so
+// one decoding pass is one layer short of the name.
+func TestAQuotedTransportEscapeIsDecodedToAFixedPoint(t *testing.T) {
+	structuralSurfaces = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	noteStructuralInText(`malformed HTTP response from "e.example": "{\\"subject_\\u0066act_key\":\"sfk1_server_secret\"}"`)
+	if len(structuralSurfaces) == 0 {
+		t.Fatal("a minted name behind Go's own quoting stayed publishable")
+	}
+}
+
+// A wrapped base64 run may begin after other text on its line.
+func TestAWrappedBase64RunSharingItsLineIsJoined(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured("prefix: YWJj\r\nZGVmZ2g=")); err == nil {
+		t.Fatal("a value a standard decoder reconstructs across the line break passed the guard")
+	}
+}
+
+// A legal short supplied value travels as bare hex below undoHex's floor.
+func TestAShortBareHexValueIsDecoded(t *testing.T) {
+	suppliedValues = []string{"ab"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured("k=6162")); err == nil {
+		t.Fatal("a two-character value spelled in bare hex passed the guard")
+	}
+}
+
+// A control character inside a supplied value has a JSON spelling, and an outer
+// encoding can hide it.
+func TestAJSONControlEscapeIsDecoded(t *testing.T) {
+	suppliedValues = []string{"a\nb"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured("k=%61%5Cnb")); err == nil {
+		t.Fatal("a value whose JSON spelling hides a control character passed the guard")
+	}
+}

@@ -1424,7 +1424,24 @@ func noteStructuralInText(text string) {
 		// because the QUOTING defeated the pattern, and then met the escaping the
 		// rest of this program already decodes everywhere else. The line is decoded
 		// first, and both spellings are scanned: a decode can also join two names.
-		for _, form := range []string{ln, undoUnicodeEscapes(ln), undoPercent(ln)} {
+		// ⚠ TO A FIXED POINT, NOT ONE PASS EACH. `net/http` QUOTES the offending line
+		// into the error it returns, so a member spelled `subject_\u0066act_key` on
+		// the wire arrives here with TWO backslashes -- one pass reduces that to
+		// `\u0066` and stops, and no scanned token equals the name
+		// (shardpilot/shardpilot-go#84 review). Quoting adds a layer; a decoder
+		// applied once removes one layer. The bound is the length, because each pass
+		// that changes anything removes at least one byte.
+		forms := []string{ln}
+		cur := ln
+		for k := 0; k <= len(ln); k++ {
+			next := undoPercent(undoUnicodeEscapes(cur))
+			if next == cur {
+				break
+			}
+			cur = next
+			forms = append(forms, cur)
+		}
+		for _, form := range forms {
 			for _, tok := range strings.FieldsFunc(form, func(r rune) bool {
 				return !(r == '_' || r == '-' ||
 					(r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'))
@@ -2142,6 +2159,16 @@ func assertNoLeak(text string) error {
 			// a candidate is an input to the chain, not an answer from it.
 			sufs := append(base64SuffixCandidates(cur), base64SuffixCandidates(norm)...)
 			sufs = append(sufs, base64SuffixCandidates(curNames)...)
+			// AND the short hex forms, and the wrapped runs that share a line with
+			// other text. Seeds like the rest: a candidate is an input to the chain.
+			sufs = append(sufs, hexCandidates(cur)...)
+			sufs = append(sufs, hexCandidates(curNames)...)
+			for _, w := range wrappedBase64Candidates(cur) {
+				sufs = append(sufs, w)
+				if d, ok := decodeBase64(w); ok {
+					sufs = append(sufs, d)
+				}
+			}
 			extra = append(extra, sufs...)
 			// The suffix scans above are the quadratic term; collect what they spent
 			// before the round's own check reads the budget.
@@ -2305,6 +2332,52 @@ func undoBase64(text string) string {
 // Six is the floor -- three bytes, matching the shortest value undoBase64 can
 // reach -- and, like that stage, it is destructive on purpose: every earlier form
 // is retained and checked, so rewriting a token here cannot lose the plain one.
+// hexCandidates retains what a bare-hex token decodes to, for tokens SHORTER than
+// undoHex's destructive floor.
+//
+// ⚠ A FLOOR CHOSEN FOR ONE STAGE IS NOT A STATEMENT ABOUT LEGAL VALUES. `undoHex`
+// rewrites in place, so its six-character floor is about how much garbage a
+// destructive rewrite may produce -- while an experiment key of `ab` is legal and
+// travels as `6162`, four characters, which that floor excluded from BOTH the
+// rewrite and the binary candidates. The ordinary matcher then saw no literal
+// `ab` and the guard approved a value a standard hex decoder reconstructs
+// directly (shardpilot/shardpilot-go#84 review).
+//
+// These are CANDIDATES, not a rewrite: nothing is replaced, so the floor that
+// protects the rewrite is left where it is and the short forms are covered anyway.
+func hexCandidates(text string) []string {
+	var out []string
+	for i := 0; i < len(text); {
+		j := i
+		for j < len(text) && isHexByte(text[j]) {
+			j++
+		}
+		if j == i {
+			i++
+			continue
+		}
+		tok := text[i:j]
+		i = j
+		if len(tok) < 2 || len(tok)%2 != 0 {
+			continue
+		}
+		raw := make([]byte, 0, len(tok)/2)
+		ok := true
+		for k := 0; k+1 < len(tok); k += 2 {
+			v, err := strconv.ParseUint(tok[k:k+2], 16, 8)
+			if err != nil {
+				ok = false
+				break
+			}
+			raw = append(raw, byte(v))
+		}
+		if ok {
+			out = append(out, string(raw))
+		}
+	}
+	return out
+}
+
 func undoHex(text string) string {
 	const minHex = 6
 	var b strings.Builder
@@ -2415,6 +2488,57 @@ func isHexByte(c byte) bool {
 // joinBase64Runs removes the wrapping from MIME base64 without touching anything
 // else: consecutive lines made entirely of base64 alphabet are joined, and every
 // other line is left where it is, separator included.
+// wrappedBase64Candidates joins a base64 run that BEGINS after other text on its
+// line, and ends before other text on the last one.
+//
+// ⚠ A WHOLE-LINE PREDICATE CANNOT SEE A RUN THAT SHARES ITS LINE. `joinBase64Runs`
+// asks whether a line is entirely base64, so `prefix: YWJj\r\nZGVmZ2g=` was two
+// separate tokens and neither decoded to the supplied value -- while a standard
+// decoder applied to the substring ignores the CRLF and reconstructs it directly
+// (shardpilot/shardpilot-go#84 review). MIME wrapping is about where a line BREAK
+// falls, not about what else is on the line.
+func wrappedBase64Candidates(text string) []string {
+	lines := strings.Split(text, "\n")
+	for i, ln := range lines {
+		lines[i] = strings.TrimSuffix(ln, "\r")
+	}
+	suffix := func(s string) string {
+		i := len(s)
+		for i > 0 && isBase64Byte(s[i-1]) {
+			i--
+		}
+		return s[i:]
+	}
+	prefix := func(s string) string {
+		i := 0
+		for i < len(s) && (isBase64Byte(s[i]) || s[i] == '=') {
+			i++
+		}
+		return s[:i]
+	}
+	var out []string
+	for i := 0; i < len(lines); i++ {
+		head := suffix(lines[i])
+		if head == "" || allBase64(lines[i]) {
+			// A whole-base64 line is already joined by joinBase64Runs; this producer
+			// exists for the runs that share a line with something else.
+			continue
+		}
+		joined := head
+		for j := i + 1; j < len(lines); j++ {
+			if allBase64(lines[j]) && lines[j] != "" {
+				joined += lines[j]
+				continue
+			}
+			if p := prefix(lines[j]); p != "" {
+				out = append(out, joined+p)
+			}
+			break
+		}
+	}
+	return out
+}
+
 func joinBase64Runs(text string) string {
 	lines := strings.Split(text, "\n")
 	var b strings.Builder
@@ -2576,9 +2700,38 @@ func undoUnicodeEscapes(text string) string {
 			}
 		}
 		if text[i] == '\\' && i+1 < len(text) {
+			// ⚠ THE WHOLE JSON ESCAPE ALPHABET, not the three that pass through
+			// unchanged. A supplied value may contain a control character -- `a\nb` is
+			// a legal identifier -- and JSON spells it `a\\nb`, which an outer encoding
+			// can hide as `%61%5Cnb`. The percent stage reconstructed the JSON
+			// spelling and this switch left it there, so no retained form held the
+			// value while a reader applying the same two decoders reconstructs it
+			// (shardpilot/shardpilot-go#84 review). Listing the escapes that are
+			// IDENTITY and omitting the ones that DENOTE is the whole defect: those
+			// are exactly the ones a decode changes.
 			switch text[i+1] {
 			case '"', '\\', '/':
 				b.WriteByte(text[i+1])
+				i++
+				continue
+			case 'n':
+				b.WriteByte('\n')
+				i++
+				continue
+			case 'r':
+				b.WriteByte('\r')
+				i++
+				continue
+			case 't':
+				b.WriteByte('\t')
+				i++
+				continue
+			case 'b':
+				b.WriteByte('\b')
+				i++
+				continue
+			case 'f':
+				b.WriteByte('\f')
 				i++
 				continue
 			}
