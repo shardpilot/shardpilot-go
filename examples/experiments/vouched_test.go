@@ -2,6 +2,7 @@ package main
 
 import (
 	"maps"
+	"net/http"
 	"slices"
 	"strings"
 	"testing"
@@ -276,7 +277,25 @@ func TestSuppliedPunctuationDoesNotAlterStructure(t *testing.T) {
 	marks := []string{"{", "}", "[", "]", "\"", ",", ":", ";", "=", "&", "?", "#", "/", "@", ".", "..", "-", "//",
 		"@e", "://", "=x", "; ", ", ", "/a", "1&", "x=", ":s"}
 
-	render := func(line string, supplied []string) string {
+	// ⚠ AND THE RENDERERS THAT ARE NOT `dropFraming`. The first version of this
+	// product drove one function, and I said so in the review reply as a boundary
+	// -- which is honest and still leaves the boundary there: the tenth site of
+	// this same rule was the late trailer renderer, found by a reviewer, in a path
+	// this sweep could not reach (shardpilot/shardpilot-go#85 review). A product
+	// whose second axis is "the paths this program renders" has to enumerate the
+	// RENDERERS, not one of them.
+	renderers := []struct {
+		what string
+		run  func(line string) string
+	}{
+		{"", dropFraming},
+		{"trailer report", func(line string) string {
+			name, value, _ := strings.Cut(strings.TrimSuffix(strings.SplitN(line, "\r\n", 2)[1], "\r\n\r\n"), ": ")
+			tee := &teeBody{trailer: http.Header{name: []string{value}}}
+			return (&exchange{head: []byte("x"), captured: tee}).trailerReport()
+		}},
+	}
+	render := func(run func(string) string, line string, supplied []string) string {
 		structuralSurfaces, accountedSurfaces = nil, nil
 		receivedConnection = true
 		suppliedValues = supplied
@@ -285,18 +304,27 @@ func TestSuppliedPunctuationDoesNotAlterStructure(t *testing.T) {
 			structuralSurfaces, accountedSurfaces = nil, nil
 			receivedConnection = false
 		}()
-		return stripMarks(scrubSupplied(dropFraming(line)))
+		return stripMarks(scrubSupplied(run(line)))
 	}
 
-	for _, p := range paths {
-		base := render(p.line, nil)
-		for _, m := range marks {
-			t.Run(p.what+"/"+m, func(t *testing.T) {
-				got := render(p.line, []string{m})
-				if got != base {
-					t.Fatalf("a supplied %q changed the structure this program emits:\n  without: %q\n  with:    %q", m, base, got)
+	for _, rr := range renderers {
+		for _, p := range paths {
+			if rr.what != "" && !strings.Contains(p.line, ": ") {
+				continue // that renderer takes one field; a body-only fixture has none
+			}
+			base := render(rr.run, p.line, nil)
+			for _, m := range marks {
+				label := p.what + "/" + m
+				if rr.what != "" {
+					label = rr.what + "/" + p.what + "/" + m
 				}
-			})
+				t.Run(label, func(t *testing.T) {
+					got := render(rr.run, p.line, []string{m})
+					if got != base {
+						t.Fatalf("a supplied %q changed the structure this program emits:\n  without: %q\n  with:    %q", m, base, got)
+					}
+				})
+			}
 		}
 	}
 }
