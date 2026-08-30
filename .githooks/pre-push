@@ -144,12 +144,34 @@ unset GIT_INDEX_FILE
 # of `git --help environment`. The rule was "clear what points a command at a
 # repository"; two members of the list I applied it to do not point at one. A claim
 # about the members is not established by deriving the membership.
+# ⚠ THE SELECTOR IS DROPPED, THE REPOSITORY IS NOT. A push launched as
+# `git --git-dir=/path/repo.git push` runs this hook from the CALLER's cwd and names
+# the repository only through `GIT_DIR` -- so clearing it made every later command
+# discover whatever repository contains that cwd, or none, and the gate looked for
+# its trusted scanner in a different repository's hooks directory
+# (shardpilot/shardpilot-go#79 review). The loop exists to drop INHERITED selectors
+# that may point elsewhere; the one that says which repository is being pushed is
+# resolved first and put back.
+# A literal newline, needed by the sentinel convention below and by this
+# selector-preserving step, so it is defined before either.
+NL='
+'
+inherited_git_dir=""
+if [ -n "${GIT_DIR:-}" ]; then
+  inherited_git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null && printf X)" || inherited_git_dir=""
+  inherited_git_dir="${inherited_git_dir%X}"
+  inherited_git_dir="${inherited_git_dir%$NL}"
+fi
 for gv in GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_NAMESPACE \
           GIT_CEILING_DIRECTORIES GIT_DISCOVERY_ACROSS_FILESYSTEM GIT_PREFIX \
           GIT_ATTR_NOSYSTEM; do
   unset "$gv" 2>/dev/null || true
 done
 unset gv
+if [ -n "$inherited_git_dir" ]; then
+  GIT_DIR="$inherited_git_dir"
+  export GIT_DIR
+fi
 
 # ⚠ AND THE OBJECT STORES ARE MADE ABSOLUTE, because the scan ENTERS A DIFFERENT
 # DIRECTORY. A relative `GIT_OBJECT_DIRECTORY=objects-alt` resolves against the
@@ -198,15 +220,19 @@ absolutize_one() {
       # and refused a push whose objects were reachable
       # (shardpilot/shardpilot-go#86 review). `pwd` adds one newline of its own;
       # the sentinel makes the two distinguishable.
-      abs_out="$( cd "$1" 2>/dev/null && pwd && printf X )" || { printf '%s' "$1"; return 0; }
+      # ⚠ `--`, BECAUSE A DIRECTORY MAY BE NAMED LIKE AN OPTION. `cd "-P"` is `cd -P`
+      # with no operand, which resolves to `$HOME` rather than `$PWD/-P` -- so a legal
+      # relative `GIT_OBJECT_DIRECTORY` or alternate named `-P` or `-L` exported the
+      # WRONG object store and the push was refused for objects that were there
+      # (shardpilot/shardpilot-go#79 review). `physdir` already had the terminator;
+      # this function was written before it and never revisited.
+      abs_out="$( cd -- "$1" 2>/dev/null && pwd && printf X )" || { printf '%s' "$1"; return 0; }
       abs_out="${abs_out%X}"
       abs_out="${abs_out%?}"
       printf '%s' "$abs_out"
       ;;
   esac
 }
-NL='
-'
 physdir() {
   # Prints the physically-resolved directory followed by a literal `X`, or
   # returns 1 and prints nothing.
@@ -368,7 +394,13 @@ checkout_root="${checkout_root%$NL}"
 #
 # What this pass cannot see is stated where it is enforced: see the second filter
 # after the enumeration below.
-other_roots=""
+# ⚠ AN ARRAY, BECAUSE THE DELIMITER WOULD BE PART OF THE DATA. The first version
+# joined these roots with a NEWLINE -- and the whole reason this list exists is that
+# a worktree path may CONTAIN one, so a root named `other<NL>root` was split into two
+# entries that match nothing and the PATH entry beneath it survived. The scene for
+# the newline case reported it immediately (shardpilot/shardpilot-go#79 review). A
+# separator drawn from the same alphabet as the values is not a separator.
+other_roots=()
 wt_common=""
 if [ -n "${GIT_DIR:-}" ]; then
   wt_common="$GIT_DIR"
@@ -390,11 +422,28 @@ case "$wt_common" in
 esac
 if [ -n "$wt_common" ]; then
   case "$wt_common" in
-    */.git) other_roots="${wt_common%/.git}$NL" ;;
+    */.git)
+      wt_main="${wt_common%/.git}"
+      if wt_phys_main="$(physdir "$wt_main")"; then
+        wt_main="${wt_phys_main%X}"
+      fi
+      other_roots+=("$wt_main")
+      ;;
   esac
   for wt_gd in "$wt_common"/worktrees/*/gitdir; do
     [ -f "$wt_gd" ] || continue
-    IFS= read -r wt_line < "$wt_gd" || continue
+    # ⚠ THE WHOLE FILE, NOT ITS FIRST LINE. A worktree path may CONTAIN a newline --
+    # `other<NL>root` is an ordinary directory name -- and `read -r` stops at it, so
+    # the root this pass compared against was a prefix and a PATH entry beneath the
+    # real one stayed: its `bin/mktemp` ran twice before the NUL-delimited enumeration
+    # later noticed and refused (shardpilot/shardpilot-go#79 review). `read -d ''`
+    # stops at NUL, of which there is none, so it reads to EOF and returns non-zero
+    # with the whole content in the variable -- which is why the status is discarded
+    # here rather than used as a failure.
+    wt_line=""
+    IFS= read -r -d "" wt_line < "$wt_gd" || true
+    [ -n "$wt_line" ] || continue
+    wt_line="${wt_line%$NL}"
     case "$wt_line" in
       ""|/*) ;;
       *) wt_line="$wt_common/$wt_line" ;;
@@ -402,7 +451,16 @@ if [ -n "$wt_common" ]; then
     case "$wt_line" in
       */.git) wt_line="${wt_line%/.git}" ;;
     esac
-    [ -n "$wt_line" ] && other_roots="$other_roots$wt_line$NL"
+    # ⚠ PHYSICALLY, LIKE THE PATH ENTRIES THEY ARE COMPARED WITH. The `gitdir` file
+    # holds the LOGICAL path git was given -- `/var/folders/...` on this platform --
+    # while an entry resolved with `physdir` comes back as `/private/var/folders/...`,
+    # so the two never matched and the root was collected and then never used
+    # (shardpilot/shardpilot-go#79 review). Two spellings of one directory compared as
+    # strings is the same defect as two spellings of one decoder.
+    if wt_phys_root="$(physdir "$wt_line")"; then
+      wt_line="${wt_phys_root%X}"
+    fi
+    [ -n "$wt_line" ] && other_roots+=("$wt_line")
   done
 fi
 inside_a_checkout() {
@@ -412,16 +470,15 @@ inside_a_checkout() {
     "$checkout_root"/*) return 0 ;;
   esac
   [ "$1" = "$checkout_root" ] && return 0
-  ir_rest="$other_roots"
-  while [ -n "$ir_rest" ]; do
-    ir_one="${ir_rest%%$NL*}"
-    ir_rest="${ir_rest#*$NL}"
-    [ -n "$ir_one" ] || continue
-    case "$1/" in
-      "$ir_one"/*) return 0 ;;
-    esac
-    [ "$1" = "$ir_one" ] && return 0
-  done
+  if [ "${#other_roots[@]}" -gt 0 ]; then
+    for ir_one in "${other_roots[@]}"; do
+      [ -n "$ir_one" ] || continue
+      case "$1/" in
+        "$ir_one"/*) return 0 ;;
+      esac
+      [ "$1" = "$ir_one" ] && return 0
+    done
+  fi
   return 1
 }
 sanitised_path=""
@@ -774,6 +831,7 @@ if [ -n "$worktree_root" ]; then
       esac
     done
   }
+  common_phys="$(physdir "$common_dir")" && common_phys="${common_phys%X}" || common_phys="$common_dir"
   check_containment "$worktree_root"
   check_path_outside "$worktree_root"
   if [ -s "$wt_list_file" ]; then
@@ -784,6 +842,27 @@ if [ -n "$worktree_root" ]; then
           wt_phys="$(physdir "$wt_other")" || continue
           wt_phys="${wt_phys%X}"
           [ "$wt_phys" = "$worktree_root" ] && continue
+          # ⚠ A GIT DIRECTORY IS NOT A CHECKOUT, AND `git worktree list` REPORTS ONE.
+          # With `--separate-git-dir`, the first record names the GIT DIRECTORY rather
+          # than the worktree -- so `<gitdir>/hooks` read as "trackable beneath a
+          # worktree" and this gate refused every push to a repository installed that
+          # way, with the directory outside any checkout
+          # (shardpilot/shardpilot-go#79 review). Nothing tracks a git directory.
+          if [ "$wt_phys" = "$common_phys" ]; then
+            wt_owner="${wt_phys%/*}"
+            # ...but the checkout that OWNS it, if any, is still a checkout, and it is
+            # found the way git links them: a `.git` FILE naming this directory.
+            # `core.worktree` is not set for a separate git dir -- measured, not assumed.
+            if [ -f "$wt_owner/.git" ]; then
+              IFS= read -r wt_link < "$wt_owner/.git" || wt_link=""
+              if [ "$wt_link" = "gitdir: $wt_phys" ] || [ "$wt_link" = "gitdir: $wt_other" ]; then
+                wt_owner_phys="$(physdir "$wt_owner")" && wt_owner_phys="${wt_owner_phys%X}" &&
+                  check_containment "$wt_owner_phys" &&
+                  check_path_outside "$wt_owner_phys"
+              fi
+            fi
+            continue
+          fi
           check_containment "$wt_phys"
           check_path_outside "$wt_phys"
           ;;
@@ -1279,10 +1358,24 @@ scan_commit() {
   # repair of the unborn case substituted a value where the answer is "there is
   # none" -- the same substitution as putting HEAD in for a tag's target, two
   # rounds ago.
-  if git cat-file -e "$2^{commit}" 2>/dev/null; then
+  # ⚠ "NO BASELINE" IS A DECISION THE CALLER MAKES, NOT A PROBE RESULT. This asked
+  # `cat-file -e` and treated a FAILURE as proof that no commit baseline exists -- so
+  # a temporarily unreadable object store, or a promisor read that did not answer,
+  # ran the trusted scanner with `PUBLIC_SURFACE_BASE_REF` unset, and it explicitly
+  # SKIPS its baseline-vs-target ratchet: the push was approved after the only
+  # comparative check had been silently removed (shardpilot/shardpilot-go#79 review).
+  #
+  # The intent is carried by the VALUE: every path that means "there is no ancestry
+  # to compare" passes the empty tree, and nothing else does. Anything else must
+  # resolve to a commit or this gate cannot speak for the comparison.
+  if [ "$2" = "$(git hash-object -t tree /dev/null)" ]; then
+    ( cd "$wt" && unset PUBLIC_SURFACE_BASE_REF && ./scripts/check_public_surface.sh )
+  elif git cat-file -e "$2^{commit}" 2>/dev/null; then
     ( cd "$wt" && PUBLIC_SURFACE_BASE_REF="$2" ./scripts/check_public_surface.sh )
   else
-    ( cd "$wt" && unset PUBLIC_SURFACE_BASE_REF && ./scripts/check_public_surface.sh )
+    printf 'REFUSING: the baseline %s could not be read, so the ratchet would run\n' "$2" >&2
+    printf '  against nothing while reporting that it ran.\n' >&2
+    exit 2
   fi
   rc=$?
   git_safe worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
@@ -1454,8 +1547,22 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       # fetch below asked for `refs/heads/refs/archive/base` and every created-ref
       # push was refused (shardpilot/shardpilot-go#79 review). Stripping a prefix
       # that may not be there produces a value that LOOKS like a branch name.
-      branch_ref="$(git ls-remote --symref -- "$dest" HEAD 2>/dev/null \
+      # ⚠ A DETACHED HEAD ADVERTISES AN OID AND NO `ref:` ROW. The parser kept only
+      # the symref, so a destination whose HEAD is detached at a commit refused every
+      # created-ref push for "no default branch" -- while the exact baseline was in the
+      # advertisement all along (shardpilot/shardpilot-go#79 review). No guess is
+      # needed when the object id is stated.
+      ls_head="$(git ls-remote --symref -- "$dest" HEAD 2>/dev/null)" || ls_head=""
+      branch_ref="$(printf '%s\n' "$ls_head" \
         | awk '$1=="ref:" && $3=="HEAD" && !seen {print $2; seen=1}')"
+      detached_head=""
+      if [ -z "$branch_ref" ]; then
+        detached_head="$(printf '%s\n' "$ls_head" \
+          | awk '$2=="HEAD" && !seen {print $1; seen=1}')"
+        case "$detached_head" in
+          ""|*[!0-9a-f]*) detached_head="" ;;
+        esac
+      fi
       branch="${branch_ref#refs/heads/}"
       unborn=no
       if [ -z "$branch" ]; then
@@ -1513,6 +1620,20 @@ while read -r local_ref local_sha remote_ref remote_sha; do
           unborn=yes
           base="$(git hash-object -t tree /dev/null)"
           why="the empty tree, because this update introduces no commit and has no ancestry to compare"
+        elif [ -n "$detached_head" ]; then
+          # ⚠ AND A STATED OBJECT ID NEEDS NO GUESS. The refusal below exists because
+          # guessing a default-branch NAME turns a fork or a rename into the wrong
+          # baseline. A detached HEAD states the commit outright, so there is no name
+          # to guess -- and the destination proving nonempty was being used to refuse
+          # a push whose baseline was in the advertisement all along
+          # (shardpilot/shardpilot-go#79 review).
+          base="$detached_head"
+          why="the commit $safe_dest advertises at its detached HEAD"
+          if ! git cat-file -e "$base^{commit}" 2>/dev/null &&
+             ! git fetch --quiet --no-tags --no-write-fetch-head -- "$dest" "$base" 2>/dev/null; then
+            printf 'REFUSING: the advertised HEAD %s is not here and could not be fetched.\n' "$base" >&2
+            exit 2
+          fi
         else
           printf 'REFUSING: %s did not advertise a default branch (HEAD symref).\n' "$safe_dest" >&2
           printf '  Guessing a name is how a fork or a rename becomes the wrong,\n' >&2

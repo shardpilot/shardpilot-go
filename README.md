@@ -314,7 +314,7 @@ No Makefile — standard Go tooling.
 p_(){ x="$(cd -- "$1" && pwd -P && printf X)" || return 1; x="${x%X}"; printf '%sX' "${x%?}"; } &&
 g="$(git rev-parse --git-common-dir && printf X)" && g="${g%X}" && g="${g%?}" &&
 t="$(git rev-parse --show-toplevel && printf X)" && t="${t%X}" && t="${t%?}" &&
-h="$(p_ "$g")" && h="${h%X}/hooks" &&
+h="$(p_ "$g")" && gr="${h%X}" && h="${h%X}/hooks" &&
 w="$(p_ "$t")" && w="${w%X}" &&
 p="$w/" && case "$p" in //) p=/ ;; esac &&
 case "$h/" in
@@ -332,7 +332,11 @@ wt="$(mktemp)" && wp="$(mktemp)" &&
 git worktree list --porcelain -z > "$wt" &&
 test -s "$wt" &&
 while IFS= read -r -d "" rec; do
-  case "$rec" in worktree\ *) printf '%s\0' "${rec#worktree }" || exit 1 ;; esac
+  case "$rec" in worktree\ *)
+    r="${rec#worktree }" && printf '%s\0' "$r" &&
+    pr="${r%/*}" &&
+    { test ! -f "$pr/.git" || { IFS= read -r gl < "$pr/.git"; case "$gl" in "gitdir: $r") printf '%s\0' "$pr" ;; esac; }; } || exit 1 ;;
+  esac
 done < "$wt" > "$wp" &&
 while IFS= read -r -d "" r; do
   rp="$(p_ "$r")" && rp="${rp%X}" &&
@@ -340,12 +344,10 @@ while IFS= read -r -d "" r; do
   case "$h/" in
     "$q"*) case "/${h#"$q"}/" in
              */.git/*) : ;;
-             *) echo "$h is inside the worktree $rp and trackable there" >&2; exit 1 ;;
+             *) test "$rp" = "$gr" ||
+                  { echo "$h is inside the worktree $rp and trackable there" >&2; exit 1; } ;;
            esac ;;
   esac
-done < "$wp" &&
-while IFS= read -r -d "" w; do
-  git -C "$w" config --worktree --unset-all core.hooksPath 2>/dev/null || true
 done < "$wp" &&
 { cp .githooks/pre-push "$h/.pre-push.new" &&
   cp scripts/check_public_surface.sh "$h/.check_public_surface.sh.new" &&
@@ -354,6 +356,9 @@ done < "$wp" &&
 mv "$h/.pre-push.new" "$h/pre-push" &&
 mv "$h/.check_public_surface.sh.new" "$h/check_public_surface.sh" &&
 git config --local core.hooksPath "$h" &&
+while IFS= read -r -d "" w; do
+  git -C "$w" config --worktree --unset-all core.hooksPath 2>/dev/null || true
+done < "$wp" &&
 while IFS= read -r -d "" w; do
   gp="$(git -C "$w" rev-parse --path-format=absolute --git-path hooks && printf X)" || exit 1
   gp="${gp%X}"; gp="${gp%?}"
