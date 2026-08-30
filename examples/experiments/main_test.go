@@ -2620,22 +2620,39 @@ func TestAGeneratedSpanLeavesTheFieldNameParsable(t *testing.T) {
 // signal can arrive -- in the map, or consumed into `resp.Close` -- with the case
 // where it did not arrive at all.
 func TestAConsumedCloseSignalIsStillReceived(t *testing.T) {
+	// ⚠ AND `resp.Close` HAS TWO CAUSES. Go sets it when the transport CONSUMED
+	// `Connection: close`, and also when an HTTP/1.1 response is close-delimited --
+	// no length, no chunked framing, body ends at EOF. `DumpResponse` synthesises
+	// the line either way, so the two are separable only by the FRAMING
+	// (shardpilot/shardpilot-go#84 review). The round before read both as received
+	// and this table had no framing column at all.
+	//
+	// The rows are the product of the header's presence with `resp.Close` and with
+	// the three framings a response can have.
 	for _, c := range []struct {
 		name     string
 		header   http.Header
 		close    bool
+		length   int64
+		chunked  bool
 		received bool
 	}{
-		{"in the map", http.Header{"Connection": []string{"close"}}, false, true},
-		{"consumed by the transport", http.Header{}, true, true},
-		{"both", http.Header{"Connection": []string{"close"}}, true, true},
-		{"absent", http.Header{}, false, false},
+		{"in the map", http.Header{"Connection": []string{"close"}}, false, -1, false, true},
+		{"consumed, explicit length", http.Header{}, true, 0, false, true},
+		{"consumed, chunked", http.Header{}, true, -1, true, true},
+		{"close-delimited, no header", http.Header{}, true, -1, false, false},
+		{"both", http.Header{"Connection": []string{"close"}}, true, -1, false, true},
+		{"absent", http.Header{}, false, -1, false, false},
 	} {
-		rec := &recorder{inner: &fakeTransport{resp: &http.Response{
+		resp := &http.Response{
 			StatusCode: 200, Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
-			Status: "200 OK", Header: c.header, ContentLength: -1, Close: c.close,
+			Status: "200 OK", Header: c.header, ContentLength: c.length, Close: c.close,
 			Body: io.NopCloser(strings.NewReader("")),
-		}}}
+		}
+		if c.chunked {
+			resp.TransferEncoding = []string{"chunked"}
+		}
+		rec := &recorder{inner: &fakeTransport{resp: resp}}
 		req, err := http.NewRequest("GET", "https://e.example"+assignmentRoute, nil)
 		if err != nil {
 			t.Fatal(err)
@@ -2650,8 +2667,7 @@ func TestAConsumedCloseSignalIsStillReceived(t *testing.T) {
 			t.Fatalf("%s: the recorder kept %d exchanges", c.name, len(got))
 		}
 		if got[0].recvConn != c.received {
-			t.Errorf("%s: recvConn=%v, want %v -- a line the endpoint sent must not be marked generated",
-				c.name, got[0].recvConn, c.received)
+			t.Errorf("%s: recvConn=%v, want %v", c.name, got[0].recvConn, c.received)
 		}
 	}
 }
@@ -3194,5 +3210,104 @@ func TestTheInterimSectionIsLabelledCanonical(t *testing.T) {
 	}
 	if !strings.Contains(got, "http.StatusText") {
 		t.Errorf("the section does not say where its status line came from: %q", got)
+	}
+}
+
+// An interim block's Connection provenance is its own.
+//
+// ⚠ THE FINAL RESPONSE'S ANSWER SAYS NOTHING ABOUT AN INTERIM ONE.
+// `Got1xxResponse` hands over the headers IT delivered, so whether an interim
+// carried a `Connection` field is a fact about that block — and inheriting the
+// final response's `recvConn=false` marked a received interim line as
+// serialiser-generated, which the guard skips and `stripMarks` publishes
+// (shardpilot/shardpilot-go#84 review). Per exchange was the fix two rounds ago;
+// per interim BLOCK is the same sentence one surface along.
+func TestInterimConnectionProvenanceIsPerBlock(t *testing.T) {
+	suppliedValues = []string{"secret"}
+	t.Cleanup(func() { suppliedValues = nil; structuralSurfaces = nil })
+	rec := &recorder{inner: &traceFiringTransport{codes: []int{103},
+		hdr: textproto.MIMEHeader{"Connection": []string{base64.StdEncoding.EncodeToString([]byte("secret"))}},
+		resp: &http.Response{
+			StatusCode: 200, Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+			Status: "200 OK", Header: http.Header{}, ContentLength: -1, Body: http.NoBody,
+		}}}
+	req, err := http.NewRequest("GET", "https://e.example"+assignmentRoute, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rec.RoundTrip(req); err != nil {
+		t.Fatal(err)
+	}
+	rec.mu.Lock()
+	got := rec.exchanges
+	rec.mu.Unlock()
+	if len(got) != 1 || len(got[0].interimConn) != 1 || !got[0].interimConn[0] {
+		t.Fatalf("the interim block's own Connection provenance was not recorded: %+v", got)
+	}
+	// ⚠ THE GUARD IS WHAT CATCHES AN ENCODED VALUE, NOT THE SCRUB. `secret` is
+	// short, so the scrub matches it only as a whole token and never inside
+	// `c2VjcmV0`; what the provenance decides is whether the guard READS the span at
+	// all. Marked generated, it is skipped.
+	//
+	// ⚠ AND THROUGH `renderExchanges`, WHICH IS WHERE THE PROVENANCE IS APPLIED. My
+	// first version set `receivedConnection` itself and called `dropFraming`, so it
+	// asserted the pipeline and never the CALL SITE -- and the mutant that restores
+	// the final response's answer survived it. A test of the composition is not a
+	// test of the call site, which this file already records about `responseText`.
+	var b strings.Builder
+	renderExchanges(&b, got)
+	span := b.String()
+	if i := strings.Index(span, "## Informational"); i >= 0 {
+		if j := strings.Index(span[i:], "## Response"); j > 0 {
+			span = span[i : i+j]
+		}
+	}
+	if err := assertNoLeak(span); err == nil {
+		t.Errorf("the guard skipped a received interim Connection value: %q", stripMarks(span))
+	}
+}
+
+// The interim capture is bounded, and says so when it drops.
+//
+// ⚠ INSTALLING `Got1xxResponse` REMOVES THE ONLY BOUND THERE WAS. `net/http`
+// resets its response-header allowance after every interim response it delivers,
+// leaving the callback responsible for limiting them — so the capture I added in a
+// previous round could grow for the whole deadline
+// (shardpilot/shardpilot-go#84 review).
+func TestTheInterimCaptureIsBounded(t *testing.T) {
+	structuralSurfaces = nil
+	t.Cleanup(func() { structuralSurfaces = nil; suppliedValues = nil })
+	codes := make([]int, maxInterimResponses+8)
+	for i := range codes {
+		codes[i] = 103
+	}
+	rec := &recorder{inner: &traceFiringTransport{codes: codes, resp: &http.Response{
+		StatusCode: 200, Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+		Status: "200 OK", Header: http.Header{}, ContentLength: -1, Body: http.NoBody,
+	}}}
+	req, err := http.NewRequest("GET", "https://e.example"+assignmentRoute, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rec.RoundTrip(req); err != nil {
+		t.Fatal(err)
+	}
+	rec.mu.Lock()
+	got := rec.exchanges
+	rec.mu.Unlock()
+	if len(got[0].infos) > maxInterimResponses {
+		t.Errorf("the capture retained %d interim responses, past its cap of %d",
+			len(got[0].infos), maxInterimResponses)
+	}
+	if !got[0].infoOverflow {
+		t.Error("interim responses were dropped without the overflow being recorded")
+	}
+	var b strings.Builder
+	renderExchanges(&b, got)
+	if !strings.Contains(b.String(), "INCOMPLETE") {
+		t.Errorf("the section is silent about the blocks it dropped: %q", b.String())
+	}
+	if len(structuralSurfaces) == 0 {
+		t.Error("a record missing interim blocks was left publishable")
 	}
 }
