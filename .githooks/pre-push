@@ -855,8 +855,15 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       # very push -- so the created ref was compared against a baseline about to
       # stop existing (shardpilot/shardpilot-go#79 review). The pushed lines are
       # the authority on what the default branch is becoming.
-      branch="$(git ls-remote --symref -- "$dest" HEAD 2>/dev/null \
-        | awk '$1=="ref:" && $3=="HEAD" {sub("refs/heads/","",$2); print $2; exit}')"
+      # ⚠ THE ADVERTISED REF IS KEPT WHOLE, and the short name is derived from it.
+      # `sub("refs/heads/","",$2)` is a no-op for a HEAD that points outside
+      # `refs/heads/*` -- `refs/archive/base` is a legal symref target -- so the
+      # fetch below asked for `refs/heads/refs/archive/base` and every created-ref
+      # push was refused (shardpilot/shardpilot-go#79 review). Stripping a prefix
+      # that may not be there produces a value that LOOKS like a branch name.
+      branch_ref="$(git ls-remote --symref -- "$dest" HEAD 2>/dev/null \
+        | awk '$1=="ref:" && $3=="HEAD" {print $2; exit}')"
+      branch="${branch_ref#refs/heads/}"
       unborn=no
       if [ -z "$branch" ]; then
         # ⚠ AN EMPTY DESTINATION HAS NO DEFAULT BRANCH, AND THAT IS NOT A REFUSAL.
@@ -934,7 +941,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       # (shardpilot/shardpilot-go#79 review). Every other git command here already
       # runs through `git_safe`; this one had been written before that existed.
       if ! git_safe fetch --quiet --no-tags --no-write-fetch-head -- "$dest" \
-           "+refs/heads/$branch:$base_ref" 2>/dev/null; then
+           "+$branch_ref:$base_ref" 2>/dev/null; then
         printf 'REFUSING: could not fetch %s from %s to compare against.\n' "$branch" "$safe_dest" >&2
         exit 2
       fi
@@ -949,7 +956,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       base_ref=""
       fi
       incoming="$(printf '%s\n' "$pushed_lines" \
-        | awk -v r="refs/heads/$branch" '$3==r {print $2; exit}')"
+        | awk -v r="$branch_ref" '$3==r {print $2; exit}')"
       # ⚠ ALL ZEROES IS A DELETION, AND IT IS HEX. One push may delete the
       # destination's default branch while creating another ref, and the zero object
       # passed the hex-only test below and became the baseline -- handed to the
@@ -960,11 +967,23 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         *[!0]*) ;;
         *) incoming="" ;;
       esac
+      # ⚠ A PUSH IS NOT ATOMIC UNLESS IT SAYS SO, AND THIS HOOK CANNOT SEE THAT IT
+      # DID. The sibling update's incoming tip was taken as the baseline because
+      # "the pushed lines are the authority on what the default branch is becoming"
+      # -- true only if that update LANDS. `--atomic` is a separate request, and an
+      # ordinary push can have the default-branch update rejected as non-fast-forward
+      # while the created ref succeeds: the two local refs then name the same tip,
+      # `base` equals the pushed commit, zero commits are introduced, and the ratchet
+      # runs against nothing (shardpilot/shardpilot-go#79 review).
+      #
+      # The advertised tip is used instead. It can only be OLDER, so the range can
+      # only be LARGER -- more commits scanned, never fewer, which is the direction
+      # this gate must fail in. What it costs: when the sibling update does land, the
+      # commits it introduces are scanned by this push as well as by their own.
       case "$incoming" in
         ""|*[!0-9a-f]*) ;;
         *) if [ "$incoming" != "$base" ]; then
-             printf 'public surface: %s is also updated by this push; using its incoming tip\n' "$branch"
-             base="$incoming"
+             printf 'public surface: %s is also updated by this push; NOT using its incoming tip, because this push is not known to be atomic\n' "$branch"
            fi ;;
       esac
       if [ -z "$base" ]; then

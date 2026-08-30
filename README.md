@@ -320,8 +320,6 @@ done &&
 cp .githooks/pre-push "$h/.pre-push.new" &&
 cp scripts/check_public_surface.sh "$h/.check_public_surface.sh.new" &&
 chmod +x "$h/.pre-push.new" "$h/.check_public_surface.sh.new" &&
-mv "$h/.pre-push.new" "$h/pre-push" &&
-mv "$h/.check_public_surface.sh.new" "$h/check_public_surface.sh" &&
 wt="$(mktemp)" && wp="$(mktemp)" &&
 git worktree list --porcelain -z > "$wt" &&
 test -s "$wt" &&
@@ -331,6 +329,8 @@ done < "$wt" > "$wp" &&
 while IFS= read -r -d "" w; do
   git -C "$w" config --worktree --unset-all core.hooksPath 2>/dev/null || true
 done < "$wp" &&
+mv "$h/.pre-push.new" "$h/pre-push" &&
+mv "$h/.check_public_surface.sh.new" "$h/check_public_surface.sh" &&
 git config --local core.hooksPath "$h" &&
 while IFS= read -r -d "" w; do
   got="$(cd "$(git -C "$w" rev-parse --path-format=absolute --git-path hooks)" && pwd -P)" || exit 1
@@ -339,6 +339,21 @@ while IFS= read -r -d "" w; do
 done < "$wp" &&
 rm -f "$wt" "$wp"
 ```
+
+**The fallible work runs BEFORE either publication step.** Published first, a
+failure in the worktree enumeration left the final names occupied while
+`core.hooksPath` had never been written: a checkout inheriting a global hooks path
+went on pushing ungated, and rerunning this snippet refused its own occupied
+destinations.
+
+The order says what each step leaves behind on failure. Everything that can fail
+for an ordinary reason — reading the worktree list, writing the path list,
+clearing an inherited worktree setting — happens while nothing is published, so a
+failure there leaves the checkout exactly as it was. Then the two renames, then
+the config write that ACTIVATES them, then a read-only verification. There is a
+window of two `mv` calls between publishing the files and activating them, and
+saying so is more use than claiming there is none: a cleanup trap would have to
+fire to close it, and a trap that has to fire is one more thing that can fail.
 
 **Both files**, an ABSOLUTE path, published by RENAME, and `core.hooksPath` **pinned locally** rather than unset. Both destinations are tested with `-e` AND `-L`. A DANGLING symlink — a managed hook whose target is on an unavailable mount — fails `-e` while still occupying the path, so `-e` alone let the install replace it and disable the existing hook. The scanner's destination is guarded the same way, and for a second reason: with a DIRECTORY at that path `mv` succeeds by placing the file INSIDE it, the installation then reports success, and the hook it installed cannot execute the scanner — blocking every push, while rerunning this snippet is prevented by the now-occupied `pre-push` destination. Everything the hook executes must come from outside tracked content — the scanner as much as the hook. `--git-dir` names the per-worktree directory in a linked worktree while git reads hooks from the common one. And an unqualified `--unset` cannot clear a *global* or *system* `core.hooksPath`: with one inherited, git keeps resolving hooks from there and the gate is never invoked. A local setting overrides an inherited one — but NOT a worktree-scoped one.
 
