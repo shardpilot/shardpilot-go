@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -3403,4 +3404,86 @@ func TestTheLedgerRecordsTheAttemptThatRaisedAReason(t *testing.T) {
 	if len(structuralAt[reason]) != 2 {
 		t.Fatalf("the second attempt's instance was lost: %v", structuralAt[reason])
 	}
+}
+
+// A scalar is a whole JSON document, and the body rule accepts it as one.
+//
+// ⚠ THE POPULATION IS "A JSON ROOT", AND THE GATE NAMED TWO OF ITS SEVEN FORMS.
+// `markBareJSONLiterals` began at the first `{` or `[`, so a body that is exactly
+// `null`, `true`, `false`, a number or a string returned unexamined -- neither
+// marked as grammar nor noted as a collision -- and the scrub downstream replaced
+// the whole document with a bare `<redacted, N chars>`, which is not JSON, while
+// the refusal ledger stayed EMPTY (shardpilot/shardpilot-go#85 review).
+//
+// The property asserted is the one that was broken, not the fix: whatever comes
+// out is either a JSON document or a refusal. Published-and-invalid is the state
+// that must not exist, and the empty ledger is what made it publishable.
+//
+// The rows are the product of the root forms with a supplied value that collides
+// with each, so a later form added to the grammar is covered by adding it here
+// rather than by remembering this scene exists.
+func TestEveryJSONRootFormIsEitherGrammarOrRefused(t *testing.T) {
+	roots := []string{`null`, `true`, `false`, `123456`, `9876543210987654`, `12.5`,
+		`"9876543210987654"`, `{"member":9876543210987654}`, `[9876543210987654]`}
+	for _, body := range roots {
+		supplied := strings.Trim(body, `"`)
+		suppliedValues = []string{supplied}
+		structuralSurfaces, accountedSurfaces = nil, nil
+		got := scrubSupplied(redactUnaccountedBody(markBareJSONLiterals(
+			redactUnaccountedJSONValues(redactMintedBody(body)))))
+		clean := strings.NewReplacer(capturedMark, "", genMark, "").Replace(got)
+		var any interface{}
+		valid := json.Unmarshal([]byte(clean), &any) == nil
+		refused := len(structuralSurfaces) > 0
+		if !valid && !refused {
+			t.Errorf("root %q was published as %q, which is not JSON, with an empty ledger", body, clean)
+		}
+	}
+	suppliedValues = nil
+	structuralSurfaces, accountedSurfaces = nil, nil
+}
+
+// Recognising a taxonomy token is not having emitted it, and the position has to
+// be the EFFECTIVE one.
+//
+// ⚠ THE ORACLE IS `encoding/json`, NOT A LIST I WROTE. JSON permits duplicate
+// members and the decoder keeps the LAST, so the SDK's classification is whatever
+// the decoder returns; the traversal vouched every recognised `code` or `reason`
+// value, which published a supplied `kill_switch` as though this program had
+// written it while the SDK actually classified `not_found`
+// (shardpilot/shardpilot-go#85 review). The scene decodes each body and asks the
+// decoder which occurrence counts, so it cannot drift from the rule it pins.
+//
+// Rows are the product of the two verdict fields with both orderings, because the
+// defect is invisible in one of them: when the supplied value happens to come
+// last it IS the effective one and vouching it is correct.
+func TestOnlyTheEffectiveVerdictOccurrenceIsVouched(t *testing.T) {
+	const supplied = "kill_switch"
+	other := "not_found"
+	for _, field := range []string{"code", "reason"} {
+		for _, order := range [][2]string{{supplied, other}, {other, supplied}} {
+			body := `{"` + field + `":"` + order[0] + `","` + field + `":"` + order[1] + `"}`
+			var decoded map[string]string
+			if err := json.Unmarshal([]byte(body), &decoded); err != nil {
+				t.Fatalf("the oracle could not read %q: %v", body, err)
+			}
+			effective := decoded[field]
+			suppliedValues = []string{supplied}
+			structuralSurfaces, accountedSurfaces = nil, nil
+			got := scrubSupplied(redactUnaccountedBody(markBareJSONLiterals(
+				redactUnaccountedJSONValues(redactMintedBody(body)))))
+			clean := strings.NewReplacer(capturedMark, "", genMark, "").Replace(got)
+			printed := strings.Count(clean, supplied)
+			want := 0
+			if effective == supplied {
+				want = 1 // the SDK's own classification, vouched by denotation
+			}
+			if printed != want {
+				t.Errorf("%s: supplied value printed %d times, want %d (decoder classifies %q): %q",
+					body, printed, want, effective, clean)
+			}
+		}
+	}
+	suppliedValues = nil
+	structuralSurfaces, accountedSurfaces = nil, nil
 }

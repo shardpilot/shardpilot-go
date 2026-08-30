@@ -2442,7 +2442,21 @@ func markBareJSONLiterals(text string) string {
 	for start < len(view) && (view[start] == ' ' || view[start] == '\t' || view[start] == '\n' || view[start] == '\r') {
 		start++
 	}
-	if start >= len(view) || (view[start] != '{' && view[start] != '[') {
+	// ⚠ AND A SCALAR IS A WHOLE JSON DOCUMENT. Beginning at `{` or `[` named two
+	// of the grammar's root forms and left the other five: a body that is exactly
+	// `null`, `true`, `false`, a number or a string returned here unexamined, so
+	// this pass neither marked it as grammar nor noted the number collision --
+	// and the scrub downstream replaced the entire document with a bare
+	// `<redacted, 4 chars>`, which is not JSON, with an EMPTY refusal ledger
+	// (shardpilot/shardpilot-go#85 review). Measured against the nested forms this
+	// file already handles: `{"assigned":true}` is marked and passes untouched,
+	// `[9876543210987654]` is refused as a colliding number -- at the root, both
+	// were published instead.
+	//
+	// The gate was a cheap pre-filter for "is this JSON at all", and the one-value
+	// check below answers that properly: a body that is not one JSON document with
+	// only whitespace around it still returns unchanged.
+	if start >= len(view) {
 		return text
 	}
 	// ⚠ ONE VALUE, NOT A STREAM. `json.Decoder` reads a SEQUENCE of top-level

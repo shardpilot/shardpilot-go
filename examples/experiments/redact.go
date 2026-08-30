@@ -1204,6 +1204,10 @@ func redactUnaccountedJSONValues(body string) string {
 	type span struct {
 		a, b int
 		val  string
+		// Set only where a value was VOUCHED as this SDK's taxonomy, so the
+		// ineffective duplicates can be demoted once the whole document is known.
+		vouchedField string
+		raw          string
 	}
 	var spans []span
 	var depth []int8 // 0 = array, 1 = object expecting KEY, 2 = object expecting VALUE
@@ -1282,7 +1286,7 @@ func redactUnaccountedJSONValues(body string) string {
 				k, end := kq, ke
 				if k >= 0 && !anyMarked(inMark, k, end) {
 					noteAccounted(formBody, "an endpoint-chosen member name in a parsed response body")
-					spans = append(spans, span{back[k], back[end-1] + 1, `"` + tokenPlaceholder(name) + `"`})
+					spans = append(spans, span{back[k], back[end-1] + 1, `"` + tokenPlaceholder(name) + `"`, "", name})
 				}
 			}
 			continue
@@ -1340,10 +1344,10 @@ func redactUnaccountedJSONValues(body string) string {
 			// ordinary verdict capture was withheld with exit 4
 			// (shardpilot/shardpilot-go#85 review). The neighbouring branch got this
 			// right and this one did not, in the same expression.
-			spans = append(spans, span{back[k], back[end-1] + 1, `"` + marked(str) + `"`})
+			spans = append(spans, span{back[k], back[end-1] + 1, `"` + marked(str) + `"`, verdictField, str})
 		} else {
 			noteAccounted(formBody, "an endpoint-chosen value in a parsed response body")
-			spans = append(spans, span{back[k], back[end-1] + 1, `"` + tokenPlaceholder(str) + `"`})
+			spans = append(spans, span{back[k], back[end-1] + 1, `"` + tokenPlaceholder(str) + `"`, "", str})
 		}
 		verdictField = ""
 	}
@@ -1355,6 +1359,33 @@ func redactUnaccountedJSONValues(body string) string {
 	// Same defect as the wrapped-candidate assembly two rounds ago, in the code I
 	// wrote after fixing that one.
 	//
+	// ⚠ ONLY THE OCCURRENCE THE DECODER USES IS THIS SDK'S CLASSIFICATION.
+	//
+	// JSON permits duplicate members and `encoding/json` keeps the LAST, so
+	// `{"code":"kill_switch","code":"not_found"}` is classified `not_found` --
+	// while this traversal vouched EVERY `code` value it recognised, marking the
+	// first as taxonomy. A marked span is skipped by both the scrub and the guard,
+	// so a supplied `kill_switch` was published as though this program had written
+	// it (shardpilot/shardpilot-go#85 review). Recognising a taxonomy token is not
+	// having emitted it, and here even the POSITION was not enough: the position
+	// has to be the EFFECTIVE one.
+	//
+	// Demoted rather than refused, which is the reviewer's other option: the SDK
+	// decodes such a body without complaint, so refusing it would reject a capture
+	// this program can describe. The ineffective occurrence is endpoint-chosen text
+	// like any other, and it is accounted for as such.
+	lastVouch := map[string]int{}
+	for i, sp := range spans {
+		if sp.vouchedField != "" {
+			lastVouch[sp.vouchedField] = i
+		}
+	}
+	for i := range spans {
+		if f := spans[i].vouchedField; f != "" && lastVouch[f] != i {
+			noteAccounted(formBody, "an endpoint-chosen value in a parsed response body")
+			spans[i].val = `"` + tokenPlaceholder(spans[i].raw) + `"`
+		}
+	}
 	// The spans are produced in ascending order by the traversal; the builder walks
 	// them once and copies each byte at most once.
 	var out strings.Builder
