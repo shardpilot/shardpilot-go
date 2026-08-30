@@ -688,10 +688,21 @@ scan_commit() {
     printf '  inside its leading comments is a valid script that exits 0.\n' >&2
     exit 2
   fi
+  # ⚠ AND THIS ONE REFUSES TOO, like its sibling forty lines above. It read
+  # `if [ -n "$sblob" ]` and ended in `|| true`, so a failure to hash or to stage
+  # the trusted scanner was silently skipped -- and the scan then ran against an
+  # index that does not contain the scanner it is executing, which is the same
+  # sentence that stands over the other call: unstaged evidence is unread evidence.
+  # Two sites, one written to refuse and one to shrug (shardpilot/shardpilot-go#79
+  # review, second site of the reported class). "Could not measure" is not "nothing
+  # to do".
   sblob="$( git_safe hash-object -w --no-filters -- "$scanner" 2>/dev/null )"
-  if [ -n "$sblob" ]; then
-    ( cd "$wt" && git_safe update-index --add \
-      --cacheinfo "100755,$sblob,scripts/check_public_surface.sh" >/dev/null 2>&1 ) || true
+  if [ -z "$sblob" ] || ! ( cd "$wt" && git_safe update-index --add \
+       --cacheinfo "100755,$sblob,scripts/check_public_surface.sh" >/dev/null 2>&1 ); then
+    printf 'REFUSING: could not stage the trusted scanner for the scan of %s.\n' "$1" >&2
+    printf '  The scan would then read an index that does not contain the scanner\n' >&2
+    printf '  it is running, and report on a tree it was not given.\n' >&2
+    exit 2
   fi
   # ⚠ NO BASE REF RATHER THAN A BASE THAT IS NOT A COMMIT. An empty destination has
   # nothing to compare against, and the scanner documents an unset variable as the
@@ -871,8 +882,14 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         # first version of this fix had it, and the probe I wrote to check the
         # statuses had it too: all three cases reported 0 until the pipe came out.
         # Measured without it: empty → 2, nonempty → 0, unreachable → 128.
-        ls_out="$(git ls-remote --exit-code -- "$dest" 2>/dev/null)"
-        ls_rc=$?
+        # ⚠ AND THE ASSIGNMENT IS IN A CONDITION, because `set -e` kills the script on
+        # an assignment from a command substitution that exits non-zero -- and the
+        # WHOLE POINT here is a non-zero exit. Written plainly, `--exit-code`'s 2 for
+        # an empty destination aborted the hook before the status could be read, and
+        # the first-push scene turned red: the fix refused the case it was written to
+        # allow. The regression suite named it on the first run after the change.
+        ls_rc=0
+        ls_out="$(git ls-remote --exit-code -- "$dest" 2>/dev/null)" || ls_rc=$?
         if [ "$ls_rc" -ne 0 ] && [ "$ls_rc" -ne 2 ]; then
           printf 'REFUSING: could not enumerate the refs of %s (git exited %s).\n' "$safe_dest" "$ls_rc" >&2
           printf '  An enumeration that failed prints nothing, and nothing reads as\n' >&2
