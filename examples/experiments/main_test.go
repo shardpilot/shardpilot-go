@@ -1182,19 +1182,31 @@ func TestTheSerialiserConnectionHeaderIsGenerated(t *testing.T) {
 
 func TestOnlySynthesisedConnectionIsGenerated(t *testing.T) {
 	suppliedValues = []string{"bar"}
-	t.Cleanup(func() { suppliedValues = nil })
-	// HTTP/1.1: the endpoint really sent it, so it is CAPTURED data and the guard
-	// must read it. The scrub cannot see a base64 spelling -- that is the guard's
-	// job -- so the assertion is about the guard, not about the scrubbed text.
+	t.Cleanup(func() { suppliedValues = nil; receivedConnection = false })
+	// ⚠ THE FIXTURE NOW STATES ITS PREMISE INSTEAD OF ENCODING IT AS A PROTOCOL.
+	// This scene always meant "the endpoint really sent it", and said so by
+	// writing HTTP/1.1 — which was the rule the code used and was WRONG: Go
+	// synthesises `Connection: close` for HTTP/1.1 too, whenever the length is
+	// unknown (shardpilot/shardpilot-go#84 review). The premise is now the flag
+	// the recorder sets from `resp.Header`, so the scene says what it assumes.
+	receivedConnection = true
 	if err := assertNoLeak(asCaptured(scrubSupplied(dropFraming(
 		"HTTP/1.1 200 OK\r\nConnection: YmFy\r\n\r\n")))); err == nil {
-		t.Fatal("an HTTP/1 Connection value was marked generated and skipped")
+		t.Fatal("a received Connection value was marked generated and skipped")
 	}
-	// HTTP/2 forbids the field, so its presence proves the serialiser wrote it.
+	// Not received: the serialiser wrote it, whatever the protocol says.
+	receivedConnection = false
 	suppliedValues = []string{"close"}
 	got := stripMarks(scrubSupplied(dropFraming("HTTP/2.0 200 OK\r\nConnection: close\r\n\r\n")))
 	if strings.Contains(got, "<redacted") {
 		t.Fatalf("the synthesised HTTP/2 Connection line was scrubbed: %q", got)
+	}
+	// ⚠ AND THE CASE THE PROTOCOL RULE COULD NOT SEE: HTTP/1.1 with a synthesised
+	// line, which is what Go writes when the length is unknown. A legal experiment
+	// key of `close` used to come back as `Connection: <redacted, 5 chars>`.
+	got = stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")))
+	if strings.Contains(got, "<redacted") {
+		t.Fatalf("a synthesised HTTP/1 Connection line was scrubbed: %q", got)
 	}
 }
 
@@ -1371,5 +1383,78 @@ func TestASeparatorArrivingMidChainIsSplit(t *testing.T) {
 	t.Cleanup(func() { suppliedValues = nil })
 	if err := assertNoLeak(asCaptured("HTTP/1.1 200 OK\r\nX%2dYmFy: v\r\n\r\n")); err == nil {
 		t.Fatal("a field name whose separator arrived mid-chain was published")
+	}
+}
+
+// ---- round on 73ae245 ----
+
+// TestLeadingTextIsNotJSON is the third side of one rule. Earlier rounds found
+// this function accepting a body that merely CONTAINS a value and a body followed
+// by more values; this one is a body PRECEDED by text (shardpilot/shardpilot-go#84
+// review). The rule is one value with only JSON whitespace around it.
+func TestLeadingTextIsNotJSON(t *testing.T) {
+	suppliedValues = []string{"false"}
+	t.Cleanup(func() { suppliedValues = nil })
+	for _, body := range []string{
+		`error: {"assigned":false}`,
+		`{"assigned":false} trailing`,
+		"\ufeff" + `{"assigned":false}`,
+	} {
+		got := stripMarks(scrubSupplied(markBareJSONLiterals(body)))
+		if strings.Contains(got, "false") {
+			t.Fatalf("a supplied value was marked as grammar in %q: %q", body, got)
+		}
+	}
+	// ⚠ AND AN ORDINARY BODY, WITH THE WHITESPACE A SERVER ACTUALLY SENDS, still
+	// has its grammar protected — otherwise the repair is a refusal to mark.
+	got := stripMarks(scrubSupplied(markBareJSONLiterals("\n  " + `{"assigned":false}` + "\n")))
+	if !strings.Contains(got, `"assigned":false`) {
+		t.Fatalf("the literal node of an ordinary verdict body was scrubbed: %q", got)
+	}
+}
+
+// TestABlankLineInsideABase64RunIsWhitespace: a standard base64 decoder ignores
+// every CR and LF, so `YWJjZ\r\n\r\nGVmZ2g=` reconstructs the identifier in one
+// step, while ending the run at the empty line left neither fragment decoding to
+// anything (shardpilot/shardpilot-go#84 review).
+func TestABlankLineInsideABase64RunIsWhitespace(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured("head\r\nYWJjZ\r\n\r\nGVmZ2g=\r\ntail\r\n")); err == nil {
+		t.Fatal("a base64 run split by a blank line published a reconstructable value")
+	}
+}
+
+// TestValidNonObjectJSONIsNotUnclassifiable: `[{"subject_fact_key":…}]` is
+// syntactically valid JSON whose structure PROVES the member is nested. Reading
+// `topLevelMembers(body) == nil` as "cannot be classified" refused it
+// (shardpilot/shardpilot-go#84 review).
+func TestValidNonObjectJSONIsNotUnclassifiable(t *testing.T) {
+	structuralSurfaces = nil
+	suppliedValues = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	noteMinted(`[{"subject_fact_key":"ordinary payload"}]`)
+	if len(structuralSurfaces) != 0 {
+		t.Fatalf("valid non-object JSON was refused as unclassifiable: %q", structuralSurfaces)
+	}
+	// ⚠ AND A BODY THAT GENUINELY DOES NOT PARSE STILL FAILS CLOSED.
+	structuralSurfaces = nil
+	noteMinted(`{"assigned":true,"subject_fact_key":"x`)
+	if len(structuralSurfaces) == 0 {
+		t.Fatal("a body that does not parse stopped failing closed")
+	}
+}
+
+// TestAnAcceptedIdentityCodingIsGrammar: the branch accepts `identity` as the
+// no-op coding, then left the token as captured text — so a legal experiment key
+// of `identity` turned it into a declaration of an unknown coding
+// (shardpilot/shardpilot-go#84 review).
+func TestAnAcceptedIdentityCodingIsGrammar(t *testing.T) {
+	suppliedValues = []string{"identity"}
+	receivedConnection = true
+	t.Cleanup(func() { suppliedValues = nil; receivedConnection = false })
+	got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\nContent-Encoding: identity\r\n\r\n")))
+	if !strings.Contains(got, "Content-Encoding: identity") {
+		t.Fatalf("an accepted no-op coding was rewritten into an invalid one: %q", got)
 	}
 }
