@@ -80,8 +80,8 @@ func TestEveryVouchedTokenSurvivesTheScrub(t *testing.T) {
 	// (shardpilot/shardpilot-go#84 review). The population is the PRODUCT of the
 	// registries with the status each describes.
 	for shape, head := range map[string]string{
-		"HTTP/1.1 200 OK":           "assignment",
-		"HTTP/1.1 401 Unauthorized": "error",
+		"HTTP/1.1 200 OK":          "assignment",
+		"HTTP/1.1 400 Bad Request": "error",
 	} {
 		reg := assignmentTopLevel
 		if head == "error" {

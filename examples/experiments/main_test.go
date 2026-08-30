@@ -5045,3 +5045,150 @@ func TestTheInterimCaptureIsBounded(t *testing.T) {
 		t.Error("a record missing interim blocks was left publishable")
 	}
 }
+
+// An open grammar admits by a property a placeholder cannot have.
+//
+// ⚠ FOURTH SITE OF ONE SHAPE, AND THE FIRST WHERE THE ANSWER IS NOT A TOKEN-SAFE
+// SPELLING. `Age: 123456` is admitted because it IS an integer, so with `123456`
+// supplied there is nothing to substitute that stays one — the prose scrub emitted
+// `Age: <redacted, 6 chars>` with an empty ledger, and a token placeholder would be
+// no better (shardpilot/shardpilot-go#85 review). The line is withheld and the
+// refusal recorded.
+//
+// A REGISTRY value is different in kind: it has a canonical spelling this program
+// can write, so it is vouched rather than withheld — which is why the rows carry
+// both, and why `TestARecognisedMediaTypeIsGrammar` still holds.
+func TestAnOpenGrammarCollisionIsRefusedRatherThanMangled(t *testing.T) {
+	for _, c := range []struct {
+		line, sup string
+		withheld  bool
+	}{
+		{"Age: 123456", "123456", true},
+		{"Age: 123456", "unrelated", false},
+		{"Content-Type: application/json", "json", false},
+		{"Cache-Control: no-store", "no-store", false},
+	} {
+		suppliedValues = []string{c.sup}
+		structuralSurfaces, accountedSurfaces = nil, nil
+		got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n" + c.line + "\r\n\r\n")))
+		if w := strings.Contains(got, "<withheld>"); w != c.withheld {
+			t.Errorf("%q with %q supplied: withheld=%v, want %v: %q", c.line, c.sup, w, c.withheld, got)
+		}
+		if c.withheld && len(structuralSurfaces) == 0 {
+			t.Errorf("%q was withheld without a refusal in the ledger", c.line)
+		}
+		if strings.Contains(got, "<redacted,") && strings.HasPrefix(c.line, "Age:") {
+			t.Errorf("%q became a non-integer Age: %q", c.line, got)
+		}
+		suppliedValues = nil
+		structuralSurfaces, accountedSurfaces = nil, nil
+	}
+}
+
+// A name we sent in a query proves nothing about a name in someone else's fragment.
+//
+// ⚠ SECOND TIME THIS REGISTRY HAS BEEN READ AS SAYING MORE THAN IT DOES. The round
+// before took it out of the COOKIE path for the same reason, and the fragment stood
+// one caller away: with an experiment key of `experiment_key`, an endpoint's
+// `Location: /cb#experiment_key=x` had that member name marked harness-authored, so
+// the scrub and the guard both skipped it (shardpilot/shardpilot-go#85 review).
+func TestFragmentNamesAreNotInferredFromTheRequestQuery(t *testing.T) {
+	restore := requestNames
+	t.Cleanup(func() { requestNames = restore; suppliedValues = nil })
+	requestNames = map[string]bool{"experiment_key": true}
+	for _, sup := range []string{"experiment_key", "unrelated"} {
+		suppliedValues = []string{sup}
+		structuralSurfaces, accountedSurfaces = nil, nil
+		got := stripMarks(scrubSupplied(dropFraming(
+			"HTTP/1.1 302 Found\r\nLocation: /cb#experiment_key=x\r\n\r\n")))
+		if strings.Contains(got, "#experiment_key=") {
+			t.Errorf("supplied %q: an endpoint's fragment name was vouched as ours: %q", sup, got)
+		}
+	}
+}
+
+// The not-assigned shape includes `version`, and trailing data is not truncation.
+//
+// ⚠ FIFTH AXIS OF ONE QUESTION. `version` is presence-aware: absent is tolerated,
+// a present one must decode to a number and be at least 1, and an explicit null is
+// PRESENT and rejected — so `{"assigned":false,"version":null,"reason":"kill_switch"}`
+// is a body the SDK refuses, and `reason` there is not its classification
+// (shardpilot/shardpilot-go#85 review).
+func TestTheNotAssignedShapeIncludesVersion(t *testing.T) {
+	for _, c := range []struct {
+		body    string
+		vouched bool
+	}{
+		{`{"assigned":false,"reason":"kill_switch"}`, true},
+		{`{"assigned":false,"version":1,"reason":"kill_switch"}`, true},
+		{`{"assigned":false,"version":null,"reason":"kill_switch"}`, false},
+		{`{"assigned":false,"version":0,"reason":"kill_switch"}`, false},
+		{`{"assigned":false,"version":-1,"reason":"kill_switch"}`, false},
+		{`{"assigned":false,"version":"1","reason":"kill_switch"}`, false},
+	} {
+		suppliedValues = []string{"kill_switch"}
+		structuralSurfaces, accountedSurfaces = nil, nil
+		got := scrubSupplied(redactUnaccountedBody(markBareJSONLiterals(
+			redactUnaccountedJSONValues(redactMintedBody(c.body, assignmentTopLevel), assignmentTopLevel), assignmentTopLevel)))
+		clean := strings.NewReplacer(capturedMark, "", genMark, "").Replace(got)
+		if printed := strings.Contains(clean, "kill_switch"); printed != c.vouched {
+			t.Errorf("%s: printed=%v, want %v: %q", c.body, printed, c.vouched, clean)
+		}
+		suppliedValues = nil
+		structuralSurfaces, accountedSurfaces = nil, nil
+	}
+}
+
+// A successful first decode proves one value, not the whole prefix.
+//
+// ⚠ TRAILING DATA VIOLATES THE SINGLE-DOCUMENT SHAPE WHETHER OR NOT ANYTHING WAS
+// TRUNCATED. `{}` in `{}server-secret-token` decodes cleanly and leaves endpoint
+// text behind, so the excuse removed a refusal the trailing bytes had earned
+// (shardpilot/shardpilot-go#85 review) — the same sentence `markBareJSONLiterals`
+// already applies to a value STREAM, one pass along.
+func TestTrailingDataIsNotExcusedByTruncation(t *testing.T) {
+	for _, c := range []struct {
+		body    string
+		excuses bool
+	}{
+		{`{"a":1}`, true},
+		{`{"a":1}   `, true},
+		{`{"a":1`, true},
+		{`{}server-secret-token`, false},
+		{`{} {"b":2}`, false},
+		{`"abc" trailing`, false},
+	} {
+		if got := truncationCausedTheFailure([]byte(c.body)); got != c.excuses {
+			t.Errorf("%q: truncation explains the failure=%v, want %v", c.body, got, c.excuses)
+		}
+	}
+}
+
+// The error envelope is read at 400 and 403, not at every 4xx.
+//
+// ⚠ FIFTH AXIS THIS REGISTRY HAS BEEN WRONG ABOUT: depth, membership, shape,
+// status, and now WHICH statuses. `applyExperimentAssignment` calls
+// `experimentBodyErrorText` only for the subject-grammar sentinel at 400 and the
+// real-subjects sentinel at 403; every other status is classified by the status
+// alone (shardpilot/shardpilot-go#85 review).
+func TestErrorExemptionsApplyOnlyWhereTheEnvelopeIsRead(t *testing.T) {
+	for _, c := range []struct {
+		head    string
+		exempts bool
+	}{
+		{"HTTP/1.1 400 Bad Request", true},
+		{"HTTP/1.1 403 Forbidden", true},
+		{"HTTP/1.1 401 Unauthorized", false},
+		{"HTTP/1.1 404 Not Found", false},
+		{"HTTP/1.1 500 Internal Server Error", false},
+	} {
+		suppliedValues = []string{"error"}
+		structuralSurfaces, accountedSurfaces = nil, nil
+		got := stripMarks(scrubSupplied(dropFraming(c.head + "\r\n\r\n" + `{"error":"anything"}`)))
+		if printed := strings.Contains(got, `"error"`); printed != c.exempts {
+			t.Errorf("%s: the member name printed=%v, want %v: %q", c.head, printed, c.exempts, got)
+		}
+		suppliedValues = nil
+		structuralSurfaces, accountedSurfaces = nil, nil
+	}
+}

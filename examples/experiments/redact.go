@@ -95,7 +95,7 @@ func redactQuery(line string) string {
 	if j := strings.IndexByte(rest, ' '); j >= 0 {
 		rest, tail = rest[:j], rest[j:]
 	}
-	return head + redactPairs(rest, "") + tail
+	return head + redactPairs(rest, "", true) + tail
 }
 
 // redactPairs redacts a form-encoded component list: names kept, values replaced
@@ -155,7 +155,18 @@ func nameIsOursExactly(n string) bool { return requestNames[n] }
 // on characters: what this program emits as STRUCTURE must be marked as structure.
 func syntax(s string) string { return marked(s) }
 
-func redactPairs(rest, opaqueNameBytes string) string {
+// ⚠ `nameProvenance` SAYS WHETHER THIS PROGRAM AUTHORED THESE NAMES. The registry
+// records the names of the OUTGOING request's query, and reusing it for a
+// fragment the ENDPOINT chose let `Location: /cb#experiment_key=x` mark that
+// member name as harness-authored -- so with an experiment key of
+// `experiment_key` the scrub and the guard both skipped it and it was published
+// (shardpilot/shardpilot-go#85 review). A name we sent in a query proves nothing
+// about a name in someone else's fragment.
+//
+// Second time this registry has been read as saying more than it does: the round
+// before took it out of the COOKIE path for the same reason, and the fragment
+// stood one caller away.
+func redactPairs(rest, opaqueNameBytes string, oursAuthored bool) string {
 	parts := strings.Split(rest, "&")
 	for k, p := range parts {
 		eq := strings.IndexByte(p, '=')
@@ -217,9 +228,9 @@ func redactPairs(rest, opaqueNameBytes string) string {
 		// The question is not "is any escaping present" but "is this OUR escaping".
 		dn := queryDecoded(name)
 		switch {
-		case nameIsOursExactly(dn) && name == url.QueryEscape(dn):
+		case oursAuthored && nameIsOursExactly(dn) && name == url.QueryEscape(dn):
 			name = marked(name)
-		case nameIsOursExactly(dn):
+		case oursAuthored && nameIsOursExactly(dn):
 			// ⚠ OURS BY WHAT IT DENOTES, SO PRINTED IN OUR SPELLING. `experiment%5Fkey`
 			// decodes to a name this program owns: vouching the raw span published a
 			// supplied `5F`, and calling it endpoint-chosen and lengthening it loses a
@@ -278,7 +289,7 @@ func redactFragment(line string) string {
 	// verbatim while reporting the fragment redacted
 	// (shardpilot/shardpilot-go#73 review). A fragment component whose name side
 	// carries a `?` is not a name/value pair; it is opaque.
-	return head + redactPairs(frag, "?") + tail
+	return head + redactPairs(frag, "?", false) + tail
 }
 
 // redactTarget redacts a header line carrying a URL.
@@ -1398,10 +1409,11 @@ func redactUnaccountedJSONValues(body string, exempt map[string]bool) string {
 	reasonIsSDKs := false
 	{
 		var shape struct {
-			Assigned *bool   `json:"assigned"`
-			AppKey   *string `json:"app_key"`
-			EnvKey   *string `json:"environment_key"`
-			ExpKey   *string `json:"experiment_key"`
+			Assigned *bool           `json:"assigned"`
+			AppKey   *string         `json:"app_key"`
+			EnvKey   *string         `json:"environment_key"`
+			ExpKey   *string         `json:"experiment_key"`
+			Version  json.RawMessage `json:"version"`
 		}
 		echoed := func(v *string) bool {
 			if v == nil {
@@ -1409,10 +1421,27 @@ func redactUnaccountedJSONValues(body string, exempt map[string]bool) string {
 			}
 			return slices.Contains(suppliedValues, *v)
 		}
+		// ⚠ AND `version` IS PRESENCE-AWARE TOO. Absent is tolerated -- the
+		// traffic-gate shape carries none -- while a PRESENT one must decode to a
+		// number and, in the not-assigned branch, be at least 1: an explicit null or a
+		// non-positive value makes the SDK reject the body, so `reason` there is not
+		// its classification (shardpilot/shardpilot-go#85 review). Fifth axis of one
+		// question, and the fifth time the answer was about something narrower than
+		// the last.
+		// ⚠ THE DECODE FIRST, THEN THE FIELDS. My first version computed `versionOK`
+		// from `shape.Version` BEFORE the unmarshal filled it, so it was always true
+		// and the check did nothing -- and the scene said so on the first run.
 		if json.Unmarshal([]byte(view), &shape) == nil &&
 			shape.Assigned != nil && !*shape.Assigned &&
 			echoed(shape.AppKey) && echoed(shape.EnvKey) && echoed(shape.ExpKey) {
-			reasonIsSDKs = true
+			versionOK := true
+			if shape.Version != nil {
+				var v *int64
+				if json.Unmarshal(shape.Version, &v) != nil || v == nil || *v < 1 {
+					versionOK = false
+				}
+			}
+			reasonIsSDKs = versionOK
 		}
 	}
 	verdictField := ""
@@ -2401,6 +2430,20 @@ func unescapeMarks(s string) string {
 // that arrived differs from it, the difference is the endpoint's choice and is not
 // vouched for — the value still prints, because the criterion admitted it, but the
 // supplied-value scrub is left able to reach it.
+// admittedByRegistry says whether this field's value is admitted because a
+// REGISTRY names it, as opposed to because its SHAPE fits. The difference decides
+// what a collision can be answered with: a registry value has a canonical spelling
+// this program can write, and an open grammar has only the endpoint's bytes
+// (shardpilot/shardpilot-go#85 review).
+func admittedByRegistry(name string) bool {
+	switch strings.ToLower(ows(name)) {
+	case "content-type", "content-encoding", "transfer-encoding", "connection",
+		"vary", "accept-ranges", "allow", "cache-control":
+		return true
+	}
+	return false
+}
+
 func canonicalAdmitted(name, v string) string {
 	switch strings.ToLower(ows(name)) {
 	case "content-type":
@@ -2518,6 +2561,20 @@ func redactUnlessVerbatim(line string) string {
 				out = tokenPlaceholder(raw)
 			}
 			return name + ":" + strings.Replace(value, raw, out, 1) + cr
+		}
+		// ⚠ AND A CANONICAL VALUE ADMITTED BY SHAPE HAS NO SAFE REPLACEMENT AT ALL.
+		// `Age: 123456` is admitted because it IS an integer, so with `123456`
+		// supplied there is nothing to substitute that stays one: the prose scrub
+		// emitted `Age: <redacted, 6 chars>` with an empty ledger, and a token
+		// placeholder would be no better (shardpilot/shardpilot-go#85 review).
+		//
+		// Fourth site of this shape, and the first where the answer is not a
+		// token-safe spelling: an OPEN grammar admits by a property the placeholder
+		// cannot have. So the line is withheld and the refusal recorded -- the trade
+		// this file states, where a lost field costs an operator a minute.
+		if raw := ows(value); raw != "" && !admittedByRegistry(name) && scrubSuppliedRaw(raw) != raw {
+			noteStructural(formField, "an admitted header value that collides with a supplied value and has no safe spelling")
+			return name + ": " + marked("<withheld>") + cr
 		}
 		return line
 	}

@@ -887,7 +887,15 @@ func topLevelExemptions(statusLine string) map[string]bool {
 			switch {
 			case n == 200:
 				return assignmentTopLevel
-			case n >= 400:
+			// ⚠ AND THE ERROR ENVELOPE IS READ AT 400 AND 403, NOT AT EVERY 4xx.
+			// `applyExperimentAssignment` calls `experimentBodyErrorText` only for those
+			// two -- the subject-grammar sentinel and the real-subjects sentinel -- and
+			// classifies every other status by the status alone. Exempting `error` at a
+			// 404 marked an endpoint-selected member name as SDK grammar and published a
+			// supplied identifier (shardpilot/shardpilot-go#85 review). Fifth axis this
+			// registry has been wrong about: depth, membership, shape, status, and now
+			// WHICH statuses.
+			case n == 400 || n == 403:
 				return errorTopLevel
 			}
 		}
@@ -1320,7 +1328,21 @@ func truncationCausedTheFailure(body []byte) bool {
 	d := json.NewDecoder(bytes.NewReader(body))
 	var v json.RawMessage
 	err := d.Decode(&v)
-	return err == nil || errors.Is(err, io.ErrUnexpectedEOF)
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	if err != nil {
+		return false
+	}
+	// ⚠ A SUCCESSFUL FIRST DECODE PROVES ONE VALUE, NOT THE WHOLE PREFIX. `{}` in
+	// `{}server-secret-token` decodes cleanly and leaves endpoint text behind, so
+	// the excuse removed a refusal the trailing bytes had earned
+	// (shardpilot/shardpilot-go#85 review). Trailing data violates the
+	// single-document shape whether or not anything was truncated -- which is the
+	// same sentence `markBareJSONLiterals` already applies to a value STREAM, one
+	// pass along.
+	rest, _ := io.ReadAll(d.Buffered())
+	return strings.TrimSpace(string(rest)) == ""
 }
 
 // unexcusedRefusals returns the ledger entries that no TRUNCATED attempt accounts
