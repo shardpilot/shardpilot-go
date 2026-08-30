@@ -116,10 +116,47 @@ unset gv
 # stored only in those alternates unreadable and refusing an otherwise supported
 # push (shardpilot/shardpilot-go#79 review). A variable whose name is plural was
 # treated as a path.
+# cquote_alt renders a path as git's C-quoted form: literal backslash doubled,
+# literal quote escaped, the whole wrapped in quotes.
+#
+# ⚠ NOT THROUGH `sed`, AND THE REASON IS THIS FILE'S OWN HISTORY. The round before
+# wrote these as sed scripts and I verified them by TYPING the expression into a
+# shell rather than reading the one in the file -- which by then carried four
+# backslashes, not two, so the pattern matched a doubled backslash that is never
+# present and the quote branch emitted two. Measured after the fact: git reads the
+# original `"…/obj\\ects"` and rejects the value this produced
+# (shardpilot/shardpilot-go#86 review). A transformation whose text passes through
+# three quoting layers cannot be checked by reading it; done byte by byte, there
+# are no layers to get wrong.
+cquote_alt() {
+  cq_rest="$1"
+  cq_out=""
+  while [ -n "$cq_rest" ]; do
+    cq_c="${cq_rest%"${cq_rest#?}"}"
+    cq_rest="${cq_rest#?}"
+    case "$cq_c" in
+      '\') cq_out="$cq_out\\\\" ;;
+      '"') cq_out="$cq_out\\\"" ;;
+      *) cq_out="$cq_out$cq_c" ;;
+    esac
+  done
+  printf '"%s"' "$cq_out"
+}
 absolutize_one() {
   case "$1" in
     /*|"") printf '%s' "$1" ;;
-    *) ( cd "$1" 2>/dev/null && pwd ) || printf '%s' "$1" ;;
+    *)
+      # ⚠ A SENTINEL, BECAUSE `$( )` EATS TRAILING NEWLINES. A directory name may
+      # end in one -- git resolves `"/tmp/objects\n"` -- and the substitution
+      # silently trimmed it, so the hook looked in a directory that does not exist
+      # and refused a push whose objects were reachable
+      # (shardpilot/shardpilot-go#86 review). `pwd` adds one newline of its own;
+      # the sentinel makes the two distinguishable.
+      abs_out="$( cd "$1" 2>/dev/null && pwd && printf X )" || { printf '%s' "$1"; return 0; }
+      abs_out="${abs_out%X}"
+      abs_out="${abs_out%?}"
+      printf '%s' "$abs_out"
+      ;;
   esac
 }
 if [ -n "${GIT_OBJECT_DIRECTORY:-}" ]; then
@@ -158,13 +195,20 @@ if [ -n "${GIT_ALTERNATE_OBJECT_DIRECTORIES:-}" ]; then
         done
         # The unquoted spelling is what `cd` needs; the escapes are undone by the
         # same rule git wrote them under.
-        alt_one="$(printf '%b' "$alt_one")"
+        alt_one="$(printf '%b' "$alt_one"; printf X)"
+        alt_one="${alt_one%X}"
         alt_rest="${alt_scan#:}"
         ;;
       *:*) alt_one="${alt_rest%%:*}"; alt_rest="${alt_rest#*:}" ;;
       *) alt_one="$alt_rest"; alt_rest="" ;;
     esac
-    alt_abs="$(absolutize_one "$alt_one")"
+    # ⚠ THE SENTINEL BELONGS AT THE CALL SITE TOO. Putting it only inside
+    # `absolutize_one` fixes nothing: THIS substitution strips the trailing newline
+    # again, and my first measurement of the fix could not see that because the rig
+    # wrapped the call in a substitution of its own -- so the instrument had the
+    # defect under test (shardpilot/shardpilot-go#86 review).
+    alt_abs="$(absolutize_one "$alt_one"; printf X)"
+    alt_abs="${alt_abs%X}"
     # ⚠ AND IT GOES BACK IN QUOTED, or the parse was for nothing. Reading a quoted
     # entry and re-emitting it BARE hands git a value it splits at the same colon
     # this loop just refused to split at -- so `"objects:shared"` was parsed
@@ -173,11 +217,7 @@ if [ -n "${GIT_ALTERNATE_OBJECT_DIRECTORIES:-}" ]; then
     # two steps, which is the sentence written thirty lines above this one about
     # this same variable (shardpilot/shardpilot-go#86 review).
     case "$alt_abs" in
-      *[:\"\\]*)
-        alt_esc="$alt_abs"
-        alt_esc="$(printf '%s' "$alt_esc" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')"
-        alt_abs="\"$alt_esc\""
-        ;;
+      *:*|*'"'*|*'\'*) alt_abs="$(cquote_alt "$alt_abs")" ;;
     esac
     if [ -z "$alt_out" ]; then
       alt_out="$alt_abs"
