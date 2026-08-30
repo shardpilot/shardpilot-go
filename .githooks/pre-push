@@ -303,13 +303,36 @@ export GIT_SHALLOW_FILE
 # are dropped rather than the whole PATH replaced, because a developer's toolchain
 # may legitimately live somewhere unusual and a gate that cannot find `git` is a
 # gate that gets uninstalled.
+# ⚠ AND AN ABSOLUTE ENTRY CAN STILL BE INSIDE THE CHECKOUT. `PATH="$PWD/bin:/usr/bin"`
+# passes a test that asks only whether a component starts with `/`, and a branch
+# supplying `bin/git` then gains execution at the first bare command
+# (shardpilot/shardpilot-go#79 review). "Absolute" was a proxy for "outside the
+# tree", and the property is the second one.
+#
+# Git runs a non-bare pre-push hook with the WORKTREE ROOT as its working
+# directory, so `pwd -P` gives that root without running anything -- which matters,
+# because this filter has to be finished before the first external command.
+# Everything here is a shell builtin for the same reason.
+checkout_root="$(pwd -P)"
 sanitised_path=""
+dropped_inside=no
 old_ifs="$IFS"
 IFS=:
 for path_entry in $PATH; do
   case "$path_entry" in
-    /*) sanitised_path="${sanitised_path:+$sanitised_path:}$path_entry" ;;
+    /*) ;;
+    *) continue ;;
   esac
+  # Resolved physically, so a symlink pointing into the checkout is caught too.
+  entry_phys="$( cd -- "$path_entry" 2>/dev/null && pwd -P )" || entry_phys="$path_entry"
+  case "$entry_phys/" in
+    "$checkout_root"/*) dropped_inside=yes; continue ;;
+  esac
+  if [ "$entry_phys" = "$checkout_root" ]; then
+    dropped_inside=yes
+    continue
+  fi
+  sanitised_path="${sanitised_path:+$sanitised_path:}$path_entry"
 done
 IFS="$old_ifs"
 if [ -z "$sanitised_path" ]; then
@@ -319,6 +342,9 @@ if [ -z "$sanitised_path" ]; then
 fi
 PATH="$sanitised_path"
 export PATH
+if [ "$dropped_inside" = yes ]; then
+  printf 'note: PATH entries inside this checkout were dropped for this hook.\n' >&2
+fi
 
 hooks_off="$(mktemp -d)"
 # ⚠ THE TRAP GOES ON AS SOON AS THERE IS SOMETHING TO CLEAN. Everything between
@@ -558,24 +584,57 @@ if [ -n "$worktree_root" ]; then
   # root with a separate git directory at `/repo` skipped the containment check
   # entirely (shardpilot/shardpilot-go#79 review). The prefix is built once, with
   # the trailing slash included rather than appended.
-  root_prefix="$worktree_root/"
-  case "$root_prefix" in //) root_prefix=/ ;; esac
-  case "$hooks_dir/" in
-    "$root_prefix"*)
-      # Trackability is decided on the path RELATIVE to the worktree: a `.git`
-      # component anywhere in it puts the directory beyond any branch's reach.
-      hooks_rel="${hooks_dir#"$root_prefix"}"
-      case "/$hooks_rel/" in
-        */.git/*) : ;;
-        *)
-          printf 'REFUSING: the hooks directory %s is inside the worktree %s\n' "$hooks_dir" "$worktree_root" >&2
-          printf '  and is trackable there (%s). A branch can supply the hook or the\n' "$hooks_rel" >&2
-          printf '  scanner, and a checkout can replace the installed bytes.\n' >&2
-          exit 2
+  # ⚠ EVERY WORKTREE, BECAUSE THE HOOKS DIRECTORY IS SHARED. `--show-toplevel`
+  # answers for the INVOKING worktree, and the trusted hooks directory belongs to
+  # the common git directory that all of them share -- so a shared git dir sitting
+  # at a trackable path beneath the MAIN worktree passed this check whenever the
+  # push came from a linked one (shardpilot/shardpilot-go#79 review). The property
+  # is "reachable as a tracked path from ANY checkout of this repository", and the
+  # invoking one is not the only checkout.
+  #
+  # `-z` because a worktree path may contain a newline, which the line-oriented
+  # form of this listing cannot carry.
+  # ⚠ TO A FILE, BECAUSE `$( )` CANNOT CARRY A NUL. `-z` is required -- a worktree
+  # path may contain a newline -- and command substitution drops NUL bytes, so the
+  # records collapsed into one and the loop below saw nothing. The check passed by
+  # enumerating an empty list, which is the failure mode this file keeps naming:
+  # a probe that cannot go positive.
+  wt_list_file="$tmpdir/worktrees"
+  git worktree list --porcelain -z > "$wt_list_file" 2>/dev/null || : > "$wt_list_file"
+  check_containment() {
+    root_prefix="$1/"
+    case "$root_prefix" in //) root_prefix=/ ;; esac
+    case "$hooks_dir/" in
+      "$root_prefix"*)
+        # Trackability is decided on the path RELATIVE to the worktree: a `.git`
+        # component anywhere in it puts the directory beyond any branch's reach.
+        hooks_rel="${hooks_dir#"$root_prefix"}"
+        case "/$hooks_rel/" in
+          */.git/*) : ;;
+          *)
+            printf 'REFUSING: the hooks directory %s is inside the worktree %s\n' "$hooks_dir" "$1" >&2
+            printf '  and is trackable there (%s). A branch can supply the hook or the\n' "$hooks_rel" >&2
+            printf '  scanner, and a checkout can replace the installed bytes.\n' >&2
+            exit 2
+            ;;
+        esac
+        ;;
+    esac
+  }
+  check_containment "$worktree_root"
+  if [ -s "$wt_list_file" ]; then
+    while IFS= read -r -d "" wt_rec; do
+      case "$wt_rec" in
+        worktree\ *)
+          wt_other="${wt_rec#worktree }"
+          wt_phys="$(physdir "$wt_other")" || continue
+          wt_phys="${wt_phys%X}"
+          [ "$wt_phys" = "$worktree_root" ] && continue
+          check_containment "$wt_phys"
           ;;
       esac
-      ;;
-  esac
+    done < "$wt_list_file"
+  fi
 fi
 for tp in "$hooks_dir" "$scanner"; do
   if [ -L "$tp" ]; then
@@ -1465,7 +1524,26 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     read_evidence "$tmpdir/tag-object" append "the annotated tag object $walk" cat-file tag "$walk"
     run_evidence "$tmpdir/tag-object" append "a tag-object separator" printf '\n' 
     tag_object="$tmpdir/tag-object"
-    nxt="$(git cat-file tag "$walk" 2>/dev/null | awk '$1=="object"{print $2; exit}')"
+    # ⚠ `exit` IN THE READER MAKES THE WRITER FAIL. `awk` stops at the `object`
+    # header while `git cat-file` is still writing the message, git takes SIGPIPE,
+    # and under `pipefail` the substitution's status is 141 -- which `set -e` turns
+    # into the hook terminating and REFUSING a valid tag. Reproduced with a 1 MiB
+    # tag message (shardpilot/shardpilot-go#79 review). The gate reads its own
+    # evidence file, which is already written above, so nothing needs to be streamed
+    # a second time and no reader has to stop early.
+    # ⚠ AND NOT FROM THE ACCUMULATED EVIDENCE FILE. `$tmpdir/tag-object` is APPENDED
+    # once per tag in the chain, so `awk … exit` returned the FIRST tag's target on
+    # every iteration -- the walk never advanced, ran to the depth bound, and refused
+    # a valid chain. My own SIGPIPE fix introduced that by reading the evidence
+    # instead of the object; the battery said so by flipping the exactly-32 scene
+    # from PASSED to REFUSED, and I first blamed the scene
+    # (shardpilot/shardpilot-go#79 review, and the regression it caused).
+    #
+    # A per-iteration file: written whole, so no reader stops early and no writer
+    # takes SIGPIPE, and it holds this tag alone.
+    : > "$tmpdir/tag-walk"
+    git cat-file tag "$walk" > "$tmpdir/tag-walk" 2>/dev/null || : > "$tmpdir/tag-walk"
+    nxt="$(awk '$1=="object"{print $2; exit}' "$tmpdir/tag-walk" 2>/dev/null || true)"
     [ -n "$nxt" ] || break
     walk="$nxt"
     depth=$((depth + 1))
