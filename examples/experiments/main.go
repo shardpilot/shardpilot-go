@@ -188,6 +188,10 @@ type exchange struct {
 	// reached. A capture that silently omits them is the failure this section was
 	// added to prevent.
 	infoOverflow bool
+	// closeAmbiguous records that `resp.Close` was set with no explicit framing and
+	// no header-map entry, so the reconstructed `Connection: close` line cannot be
+	// attributed to either side.
+	closeAmbiguous bool
 	// interimConn records, per interim block, whether IT carried a `Connection`
 	// field. The final response's provenance says nothing about an interim one.
 	interimConn []bool
@@ -628,6 +632,9 @@ func renderExchanges(report *strings.Builder, exchanges []exchange) {
 					"The connection negotiated **%s**, so this is the request's canonical form "+
 					"and its header set, not the bytes on the wire.\n\n%s\n",
 				label, wire, fencedBlock(reqText))
+		}
+		if ex.closeAmbiguous {
+			noteStructural("a reconstructed Connection line whose provenance cannot be established")
 		}
 		if ex.infoOverflow {
 			noteStructural("interim responses beyond this build's cap, which were not captured")
@@ -1698,7 +1705,20 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 				explicitFraming = true
 			}
 		}
+		// ⚠ AND WHEN IT IS AMBIGUOUS, NEITHER ANSWER IS SAFE. Without explicit
+		// framing, `Close` means either a consumed `Connection: close` OR
+		// close-delimited framing, and the same state covers both -- so calling it
+		// received lets the scrub rewrite a line net/http invented, and calling it
+		// generated lets the guard skip a line the endpoint sent and publish a
+		// supplied `close` verbatim (shardpilot/shardpilot-go#84 review). Two rounds
+		// each picked one of the two defaults; the third fact is that the provenance
+		// cannot be established here at all.
+		//
+		// So the capture REFUSES. That is the standing trade in this file: a
+		// withheld record costs an operator a minute, and either default costs the
+		// subject.
 		ex.recvConn = explicitFraming
+		ex.closeAmbiguous = !explicitFraming
 	}
 	if d, derr := httputil.DumpResponse(resp, false); derr == nil {
 		ex.head = d
@@ -1943,17 +1963,18 @@ func noteStructuralInText(text string) {
 		// (shardpilot/shardpilot-go#84 review). Quoting adds a layer; a decoder
 		// applied once removes one layer. The bound is the length, because each pass
 		// that changes anything removes at least one byte.
-		forms := []string{ln}
-		cur := ln
-		for k := 0; k <= len(ln); k++ {
-			next := undoPercent(undoUnicodeEscapes(cur))
-			if next == cur {
-				break
-			}
-			cur = next
-			forms = append(forms, cur)
-		}
-		for _, form := range forms {
+		// ⚠ SCANNED AS PRODUCED, CHARGED, AND BOUNDED. Retaining every intermediate
+		// form made this quadratic in the nesting depth: `%252525…61` removes one
+		// layer per pass and a full copy of the line was kept for each, all of it
+		// BEFORE `assertNoLeak` resets and enforces its budget -- so a malformed
+		// status line of tens of kilobytes could spend the process after the network
+		// deadline has already ended (shardpilot/shardpilot-go#84 review). Nothing
+		// downstream reads the earlier forms, so nothing needs to hold them.
+		//
+		// The budget is the SHARED one, charged before each pass, and exceeding it
+		// refuses rather than truncating: a scan that stopped early and said nothing
+		// reports a clean line it did not finish reading.
+		scanForm := func(form string) {
 			// ⚠ THE TOKENISER'S ALPHABET MUST BE AS WIDE AS THE PREDICATE'S.
 			// `isMintedName` folds the way `encoding/json` does, so it MATCHES
 			// `ſubject_fact_key` -- and this splitter, being ASCII-only, cut the name
@@ -1968,6 +1989,22 @@ func noteStructuralInText(text string) {
 				}
 			}
 		}
+		cur := ln
+		spent := 0
+		for k := 0; k <= len(ln); k++ {
+			spent += len(cur)
+			if spent > decodeWorkMax {
+				noteStructural("a transport diagnostic whose decoding exceeded this build's work budget")
+				break
+			}
+			scanForm(cur)
+			next := undoPercent(undoUnicodeEscapes(cur))
+			if next == cur {
+				break
+			}
+			cur = next
+		}
+		decodeWork += spent
 		// ⚠ THE THIRD SITE ASKING THE SAME QUESTION, and it had its own answer too.
 		// This one listed all four names while the trailer report listed two, which
 		// is how the drift stayed invisible: whichever site you read, it looked
@@ -2837,8 +2874,22 @@ func assertNoLeak(text string) error {
 			// The worklist is bounded twice over -- by the shared work budget and by a
 			// seed cap -- so a crafted body cannot spin it, and what the cap drops is
 			// named rather than silently truncated.
-			seeds := append(append([]string{dec}, bins...), sufs...)
+			// ⚠ THE CAP IS APPLIED WHILE COLLECTING, NOT AFTER. `bins` and `sufs` can
+			// already hold far more than the cap before the worklist exists -- a 900 KB
+			// body of `61 ` repeated makes roughly 300,000 hex seeds and about 234 MB of
+			// allocations -- and the loop then processed every initial entry and checked
+			// the cap only afterwards (shardpilot/shardpilot-go#84 review). A limit
+			// tested after the work it bounds is a number in a message, which is the
+			// same sentence this file just applied to the decode budget.
 			const seedMax = 4096
+			initial := append(append([]string{dec}, bins...), sufs...)
+			if len(initial) > seedMax {
+				return fmt.Errorf(
+					"the candidate producers yielded %d seeds, past the cap of %d, so the "+
+						"decoding chain did not settle; the record is NOT publishable and was "+
+						"not printed", len(initial), seedMax)
+			}
+			seeds := initial
 			for si := 0; si < len(seeds) && work <= decodeWorkMax; si++ {
 				d := seeds[si]
 				for round := 0; round <= len(d) && work <= decodeWorkMax; round++ {

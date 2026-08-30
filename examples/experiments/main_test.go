@@ -15,6 +15,7 @@ import (
 	"os"
 	"reflect"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -3316,4 +3317,111 @@ func TestTheInterimCaptureIsBounded(t *testing.T) {
 	if len(structuralSurfaces) == 0 {
 		t.Error("a record missing interim blocks was left publishable")
 	}
+}
+
+// When provenance cannot be established, the capture refuses.
+//
+// ⚠ THE AMBIGUOUS STATE COVERS BOTH ANSWERS. Without explicit framing, `resp.Close`
+// means either a CONSUMED `Connection: close` or close-delimited framing, and
+// `net/http` leaves the same evidence for each — so calling it received lets the
+// scrub rewrite a line net/http invented, and calling it generated lets the guard
+// skip a line the endpoint sent (shardpilot/shardpilot-go#84 review). Two rounds
+// each picked one default; the third fact is that neither is knowable here.
+func TestAnUndecidableConnectionProvenanceRefuses(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		header  http.Header
+		close   bool
+		length  int64
+		refuses bool
+	}{
+		{"ambiguous: close, no framing, no header", http.Header{}, true, -1, true},
+		{"consumed with a length", http.Header{}, true, 0, false},
+		{"in the map", http.Header{"Connection": []string{"close"}}, false, -1, false},
+		{"absent", http.Header{}, false, -1, false},
+	} {
+		structuralSurfaces = nil
+		rec := &recorder{inner: &fakeTransport{resp: &http.Response{
+			StatusCode: 200, Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+			Status: "200 OK", Header: c.header, ContentLength: c.length, Close: c.close,
+			Body: io.NopCloser(strings.NewReader("")),
+		}}}
+		req, err := http.NewRequest("GET", "https://e.example"+assignmentRoute, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := rec.RoundTrip(req); err != nil {
+			t.Fatal(err)
+		}
+		rec.mu.Lock()
+		got := rec.exchanges
+		rec.mu.Unlock()
+		var b strings.Builder
+		renderExchanges(&b, got)
+		if refused := len(structuralSurfaces) > 0; refused != c.refuses {
+			t.Errorf("%s: refused=%v, want %v (%v)", c.name, refused, c.refuses, structuralSurfaces)
+		}
+		structuralSurfaces = nil
+	}
+}
+
+// A limit tested after the work it bounds is a number in a message.
+//
+// ⚠ THE PRODUCERS CAN OVERSHOOT THE CAP BEFORE THE WORKLIST EXISTS. A 900 KB body
+// of `61 ` repeated yields roughly 300,000 hex seeds and about 234 MB of
+// allocations, and the loop checked the cap only after processing every initial
+// entry (shardpilot/shardpilot-go#84 review) — the same sentence this file had just
+// applied to the decode budget, one collection along.
+func TestTheSeedCapIsAppliedWhileCollecting(t *testing.T) {
+	suppliedValues = []string{"nothingmatches"}
+	t.Cleanup(func() { suppliedValues = nil; decodeWork = 0 })
+	decodeWork = 0
+	// ⚠ MEASURED IN ALLOCATIONS, WHICH IS WHAT THE FINDING IS ABOUT. Wall time does
+	// not separate the two -- 115ms against 202ms -- because the per-seed work is
+	// charged either way; what the cap changes is how much is BUILT first. Measured
+	// on this machine for a 900 KB body of `61 ` repeated: 56 MiB with the cap
+	// applied while collecting, 234 MiB without. The bound is 120 MiB, between them.
+	got := allocatedMiB(func() { _ = assertNoLeak(asCaptured(strings.Repeat("61 ", 300000))) })
+	if got > 120 {
+		t.Errorf("collecting the seeds allocated %d MiB; with the cap applied while "+
+			"collecting it is 56 and without it 234", got)
+	}
+}
+
+// The transport-error decode is charged and bounded.
+//
+// ⚠ EVERY INTERMEDIATE FORM WAS RETAINED. `%252525…61` removes one layer per pass
+// and a full copy of the line was kept for each, all of it BEFORE `assertNoLeak`
+// resets and enforces its budget — so a malformed status line of tens of kilobytes
+// could spend the process after the network deadline has already ended
+// (shardpilot/shardpilot-go#84 review).
+func TestTheTransportErrorDecodeIsBounded(t *testing.T) {
+	structuralSurfaces = nil
+	t.Cleanup(func() { structuralSurfaces = nil; suppliedValues = nil })
+	tok := "61"
+	for i := 0; i < 20000; i++ {
+		tok = "25" + tok
+	}
+	line := "malformed HTTP response %" + tok
+	// ⚠ ALLOCATIONS AGAIN, AND THE SAME REASON: wall time is 45ms either way on a
+	// small line, and the cost is the retained forms. Measured on this machine for
+	// this 40 KB line: 516 MiB charged and bounded, 3394 MiB retaining every form.
+	// The bound is 1024 MiB, between them.
+	got := allocatedMiB(func() { _ = sanitizeCaptured(errors.New(line)) })
+	if got > 1024 {
+		t.Errorf("scanning a %d-byte diagnostic allocated %d MiB; bounded it is 516 and "+
+			"unbounded 3394", len(line), got)
+	}
+}
+
+// allocatedMiB reports what f allocated, in MiB. A memory claim is measured with a
+// memory instrument; this file has twice used wall time for one and found it does
+// not separate the cases.
+func allocatedMiB(f func()) uint64 {
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	f()
+	runtime.ReadMemStats(&after)
+	return (after.TotalAlloc - before.TotalAlloc) / (1 << 20)
 }
