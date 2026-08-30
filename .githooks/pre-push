@@ -1001,8 +1001,6 @@ while read -r local_ref local_sha remote_ref remote_sha; do
           printf '  everything past the bound becomes publicly reachable unexamined.\n' >&2
           exit 2
         fi
-        run_evidence "$tmpdir/tag-target" append "the tagged tree listing" cat "$tmpdir/tag-tree-listing"
-        run_evidence "$tmpdir/tag-target" append "a tag-target separator" printf '\n' 
         # ⚠ NOT THROUGH A PIPE. `while read` on the right of `|` runs in a SUBSHELL,
         # so the refusal below would have exited that subshell and let the push
         # continue -- the same shape as the `||` context that disables `set -e`
@@ -1022,17 +1020,49 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         # (shardpilot/shardpilot-go#79 review). The listing carries the mode, which
         # is what that refusal reads, so the entry needs no blob of its own.
         #
-        # Records are NUL-terminated; fields are `<mode> SP <type> SP <oid> TAB <path>`
-        # and the path is raw, because `-z` is the machine format.
-        run_evidence "$tmpdir/tag-tree-blobs" write "the tagged tree's blob list" \
-          awk -v RS='\0' -F'\t' '{ split($1, f, " ");
-               if (f[2] == "blob") printf "%s\t%s\0", f[3], $2 }' \
-          "$tmpdir/tag-tree-listing"
+        # ⚠ CLASS: `-z` IS THE PARSER'S FORMAT AND NOBODY ELSE'S. Two failures came
+        # out of letting the NUL form travel past the thing that parses it
+        # (shardpilot/shardpilot-go#86 review), and the split below is the fix for
+        # both: this loop is the ONLY reader of the raw listing, and it emits a
+        # NUL-free rendering for everything downstream.
+        #
+        #   The producer was `awk ... printf "...\0"`. awk is not required to emit a
+        #   NUL, and the awk this gate runs under on macOS -- `awk version 20200816`,
+        #   the system default -- emits NONE: measured, zero NUL bytes out. The
+        #   `read -d ''` below then hit EOF on the first iteration, so NO blob from a
+        #   tagged tree was ever staged and none of the content or filename rules ran.
+        #   It reported clean by doing nothing, on the developer machine this hook is
+        #   written for, which is why the shape matters more than the portability:
+        #   the loop that skips ITSELF prints exactly what a clean tree prints.
+        #   The records are `<mode> SP <type> SP <oid> TAB <path>`, and bash can cut
+        #   that, so there is no producer to disagree with.
+        #
+        #   And the raw listing was ALSO appended to `tag-target`, which is staged as
+        #   `scripts/tag-target-as-committed.txt` and read as text -- but the scanner
+        #   refuses any tracked file carrying a NUL, so a tag on ANY nonempty tree was
+        #   refused whatever it held. The text rendering below terminates records with
+        #   a newline instead. Path BYTES are preserved: the evidence is scanned, not
+        #   parsed, so a path that itself contains a newline costs an extra break in
+        #   the evidence and nothing else -- the parsing above reads the raw file.
         mkdir -p "$tmpdir/tag-blobs"
         tag_blobs="$tmpdir/tag-blobs"
+        tab="$(printf '\t')"
+        run_evidence "$tmpdir/tag-tree-listing-text" write \
+          "the NUL-free rendering of the tagged tree listing" printf ''
         nb=0
-        while IFS="$(printf '\t')" read -r -d '' b path; do
-          [ -n "$b" ] || continue
+        while IFS= read -r -d '' rec || [ -n "$rec" ]; do
+          [ -n "$rec" ] || continue
+          run_evidence "$tmpdir/tag-tree-listing-text" append \
+            "an entry of the tagged tree listing" printf '%s\n' "$rec"
+          # `<mode> SP <type> SP <oid> TAB <path>`; the path is raw and may hold
+          # anything but a NUL, so it is cut at the FIRST tab and never split again.
+          meta="${rec%%"$tab"*}"
+          path="${rec#*"$tab"}"
+          otype="${meta#* }"
+          otype="${otype%% *}"
+          oid="${meta##* }"
+          [ "$otype" = blob ] || continue
+          [ -n "$oid" ] || continue
           nb=$((nb + 1))
           case "$path" in
             */*) leaf="${path##*/}" ;;
@@ -1045,8 +1075,11 @@ while read -r local_ref local_sha remote_ref remote_sha; do
           leaf="$(printf '%s' "$leaf" | tr -d '\000-\037"\\/' )"
           [ -n "$leaf" ] || leaf="blob"
           read_evidence "$tmpdir/tag-blobs/$nb-$leaf" write \
-            "a blob reached through the tagged tree ($b)" cat-file blob "$b"
-        done < "$tmpdir/tag-tree-blobs"
+            "a blob reached through the tagged tree ($oid)" cat-file blob "$oid"
+        done < "$tmpdir/tag-tree-listing"
+        run_evidence "$tmpdir/tag-target" append "the tagged tree listing" \
+          cat "$tmpdir/tag-tree-listing-text"
+        run_evidence "$tmpdir/tag-target" append "a tag-target separator" printf '\n'
       fi
       if [ -s "$tmpdir/tag-target" ]; then
         tag_target="$tmpdir/tag-target"
