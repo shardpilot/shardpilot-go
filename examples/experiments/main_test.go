@@ -1937,3 +1937,84 @@ func TestAQueryNameIsComparedExactly(t *testing.T) {
 		t.Fatalf("a name the harness sent was scrubbed: %q", got)
 	}
 }
+
+// ---- round on a2457d6 ----
+
+// TestATrailerIsNotAMessageStart: `trailerReport` wraps each trailer in its own
+// captured span, so a trailer named `X-YmFy` carrying the legal value `HTTP/1.1`
+// was handed to `dataOf` as though it were a request line — the value dropped, the
+// header name never collected, and `YmFy` decoded as one token
+// (shardpilot/shardpilot-go#84 review).
+func TestATrailerIsNotAMessageStart(t *testing.T) {
+	suppliedValues = []string{"bar"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured("X-YmFy: HTTP/1.1")); err == nil {
+		t.Fatal("a trailer line was treated as a message start and skipped")
+	}
+	// ⚠ AND A REAL MESSAGE START IS STILL EXEMPT, or the repair refuses every
+	// capture: the version and code of a status line are syntax.
+	suppliedValues = []string{"200"}
+	if err := assertNoLeak(asCaptured("HTTP/1.1 200 OK\r\nX-A: b\r\n")); err != nil {
+		t.Fatalf("a status line's own code was reported as a leak: %v", err)
+	}
+	suppliedValues = []string{"GET"}
+	if err := assertNoLeak(asCaptured("GET /cb HTTP/1.1\r\nX-A: b\r\n")); err != nil {
+		t.Fatalf("a request line's method was reported as a leak: %v", err)
+	}
+}
+
+// TestTheConfiguredHostIsOurs: with `SP_REMOTE_CONFIG_URL` of
+// `https://app.shardpilot.com` and a legal experiment key of `app`, the guard found
+// `app` inside the host this program itself configured and refused every otherwise
+// valid capture (shardpilot/shardpilot-go#84 review).
+func TestTheConfiguredHostIsOurs(t *testing.T) {
+	suppliedValues = []string{"app"}
+	configuredHost = "app.shardpilot.com"
+	t.Cleanup(func() { suppliedValues = nil; configuredHost = "" })
+	// ⚠ ASSERTED ON THE SCRUBBED OUTPUT. My first version asserted on `redact`'s
+	// own result, which does not scrub — so it passed with and without the fix, and
+	// the mutant survived. And the symptom is not the one the finding names:
+	// measured, the guard does NOT refuse, because `scrubSupplied` has already
+	// replaced the value. What is published is `Host: <redacted, 3 chars>.
+	// shardpilot.com` — an authority no parser accepts, approved because the
+	// placeholder is generated. Same class, different consequence.
+	// ⚠ THIS HALF'S `redact` TAKES THE OWNED-HEADER SET. The inherited scene called
+	// the parent's one-argument form; the fact under test is the same.
+	req, _ := http.NewRequest("GET", "https://app.shardpilot.com/x", nil)
+	got := stripMarks(scrubSupplied(string(redact(
+		[]byte("GET /x HTTP/1.1\r\nHost: app.shardpilot.com\r\n\r\n"), requestOwnedHeaders(req)))))
+	if !strings.Contains(got, "Host: app.shardpilot.com") {
+		t.Fatalf("the configured authority was rewritten: %q", got)
+	}
+	// ⚠ AND A DIFFERENT HOST IS STILL ENDPOINT TEXT, or the exemption covers
+	// whatever stands in that position.
+	suppliedValues = []string{"elsewhere"}
+	req2, _ := http.NewRequest("GET", "https://app.shardpilot.com/x", nil)
+	got = stripMarks(scrubSupplied(string(redact(
+		[]byte("GET /x HTTP/1.1\r\nHost: elsewhere.invalid\r\n\r\n"), requestOwnedHeaders(req2)))))
+	if strings.Contains(got, "Host: elsewhere.invalid") {
+		t.Fatalf("an unconfigured authority was vouched for: %q", got)
+	}
+}
+
+// TestATransportErrorGoesThroughTheStructuralQuestion: Go rejects a malformed
+// response before returning one and puts the complete bad header into the error, so
+// a server-set cookie reached the report through the error diagnostic where only
+// the supplied-value scrub ran (shardpilot/shardpilot-go#84 review).
+func TestATransportErrorGoesThroughTheStructuralQuestion(t *testing.T) {
+	structuralSurfaces = nil
+	suppliedValues = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	_ = sanitizeCaptured(errors.New(
+		"malformed HTTP response \"Set-Cookie: session=abcdefghijkl\""))
+	if len(structuralSurfaces) == 0 {
+		t.Fatal("a server-set cookie inside a transport error left the capture publishable")
+	}
+	// ⚠ AND AN ORDINARY ERROR STILL PUBLISHES, or every transport failure becomes
+	// unreportable — which is the case this artifact most needs to report.
+	structuralSurfaces = nil
+	_ = sanitizeCaptured(errors.New("dial tcp: i/o timeout"))
+	if len(structuralSurfaces) != 0 {
+		t.Fatalf("an ordinary transport error was made unpublishable: %q", structuralSurfaces)
+	}
+}
