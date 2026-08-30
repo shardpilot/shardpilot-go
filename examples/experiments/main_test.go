@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -88,7 +89,10 @@ func TestTrailerReportIsOutsideTheMessage(t *testing.T) {
 	// registry, so it is endpoint-chosen text like any other -- the criterion
 	// reaches trailer names as it reaches header names. What this protects is
 	// that the field is REPORTED beside the message rather than dropped.
-	if !strings.Contains(ex.trailerReport(), ": ") {
+	// Compared with the provenance marks STRIPPED: the delimiter is marked as
+	// syntax now, so the raw report reads `X-Late\x01:\x01 value`. The mark is
+	// invisible in the published artifact and the property here is unchanged.
+	if !strings.Contains(stripMarks(ex.trailerReport()), ": ") {
 		t.Fatal("trailers were dropped instead of being reported beside the message")
 	}
 }
@@ -497,7 +501,10 @@ func TestTrailersAreSnapshotAtEOFNotFromTheHead(t *testing.T) {
 	ex := exchange{head: []byte("HTTP/1.1 200 OK\r\nTrailer: X-Late\r\n\r\n"), captured: tee}
 	// The value is lengthened; what must not happen is the field being announced
 	// in the head and then absent from the report.
-	if !strings.Contains(ex.trailerReport(), ": ") {
+	// Compared with the provenance marks STRIPPED: the delimiter is marked as
+	// syntax now, so the raw report reads `X-Late\x01:\x01 value`. The mark is
+	// invisible in the published artifact and the property here is unchanged.
+	if !strings.Contains(stripMarks(ex.trailerReport()), ": ") {
 		t.Fatal("a declared trailer was announced and then omitted")
 	}
 	if strings.Contains(string(ex.resp()), "X-Late: value") {
@@ -1002,7 +1009,10 @@ func TestAnUndecodableContentCodingIsRefused(t *testing.T) {
 	}{{"deflate", true}, {"br", true}, {"identity", false}} {
 		structuralSurfaces = nil
 		suppliedValues = nil
-		dropFraming("HTTP/1.1 200 OK\r\nContent-Encoding: " + c.enc + "\r\n\r\nbody")
+		// The body is JSON because the SUBJECT here is the coding, not the body: a
+		// body this build cannot describe is a refusal of its own now, and a
+		// fixture that carries one would report that refusal as this rule's.
+		dropFraming("HTTP/1.1 200 OK\r\nContent-Encoding: " + c.enc + "\r\n\r\n{\"assigned\":false}")
 		if got := len(structuralSurfaces) > 0; got != c.refused {
 			t.Errorf("%s: refused=%v, want %v", c.enc, got, c.refused)
 		}
@@ -2603,5 +2613,100 @@ func TestAnUnterminatedQuotedExtentIsRefused(t *testing.T) {
 	sanitizeCaptured(errors.New(`malformed HTTP response "server-secret-token`))
 	if len(structuralSurfaces) == 0 {
 		t.Fatal("a diagnostic whose quoted extent does not close was captured anyway")
+	}
+}
+
+// The clause covers the BODY too: a shape this build does not describe is a
+// refusal, not a publication.
+func TestAnUndescribedBodyIsRefused(t *testing.T) {
+	structuralSurfaces, accountedSurfaces = nil, nil
+	t.Cleanup(func() { structuralSurfaces, accountedSurfaces = nil, nil })
+	got := dropFraming("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nserver-secret-token")
+	if len(structuralSurfaces) == 0 {
+		t.Fatalf("an endpoint body in an undescribed shape was published: %q", got)
+	}
+	// AND AN ORDINARY VERDICT IS STILL PUBLISHABLE, which is what the refusal must
+	// not cost.
+	structuralSurfaces, accountedSurfaces = nil, nil
+	if got := dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false}"); len(structuralSurfaces) != 0 {
+		t.Fatalf("an ordinary fact response became unpublishable: %q / %v", got, structuralSurfaces)
+	}
+}
+
+// A quoted diagnostic's length is the VALUE's, not its transport spelling's.
+func TestAQuotedDiagnosticIsMeasuredBeforeTheEscape(t *testing.T) {
+	structuralSurfaces, accountedSurfaces = nil, nil
+	t.Cleanup(func() { structuralSurfaces, accountedSurfaces = nil, nil })
+	// The endpoint sent ten characters, one of them a NUL, and Go QUOTED them into
+	// the message. The placeholder must report the value's length, not the length
+	// of the spelling the transport chose for it: measured 14 when the escape ran
+	// first, 12 when it was merely undone before measuring, and 10 once the escape
+	// moved to the parts OUTSIDE the quoted extent.
+	wire := "server\x00tok"
+	got := stripMarks(sanitizeCaptured(errors.New("malformed HTTP response " + strconv.Quote(wire))))
+	want := fmt.Sprintf("%d chars", len([]rune(wire)))
+	if !strings.Contains(got, want) {
+		t.Fatalf("the placeholder measured the transport spelling rather than the value: %q, want %q", got, want)
+	}
+}
+
+// The identity branch is an early return, and an early return is a promise to
+// have done everything the common path does.
+func TestTheIdentityBranchVouchesOnlyTheCanonicalSpelling(t *testing.T) {
+	suppliedValues = []string{"IDENTITY"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\nContent-Encoding: IDENTITY\r\n\r\n{\"assigned\":false}")))
+	if strings.Contains(got, "IDENTITY") {
+		t.Fatalf("a non-canonical coding spelling was vouched: %q", got)
+	}
+	// AND THE RESPONSE IS STILL A RESPONSE: the first version of this fix left the
+	// line loop instead of the branch and truncated everything after the status.
+	if !strings.Contains(got, `{"assigned":false}`) {
+		t.Fatalf("the rest of the response was dropped: %q", got)
+	}
+}
+
+func TestTheIdentityBranchAdmitsItsFieldName(t *testing.T) {
+	suppliedValues = []string{"Content-Encoding"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\nContent-Encoding: identity\r\n\r\n{\"assigned\":false}")))
+	if !strings.Contains(got, "Content-Encoding: identity") {
+		t.Fatalf("the early return skipped the generic name path: %q", got)
+	}
+}
+
+// A cookie flag is vouched only in its canonical spelling, and only if it is
+// actually a flag.
+func TestOnlyCanonicalValuelessCookieFlagsAreVouched(t *testing.T) {
+	for _, c := range []struct{ supplied, line string }{
+		{"SECURE", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; SECURE\r\n\r\n{\"assigned\":false}"},
+		{"Path", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; Path\r\n\r\n{\"assigned\":false}"},
+	} {
+		suppliedValues = []string{c.supplied}
+		got := stripMarks(scrubSupplied(dropFraming(c.line)))
+		suppliedValues = nil
+		if strings.Contains(got, c.supplied) {
+			t.Fatalf("%q was vouched as a cookie flag: %q", c.supplied, got)
+		}
+	}
+	// AND A REAL FLAG IN ITS OWN SPELLING STILL SURVIVES.
+	suppliedValues = []string{"Secure"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if got := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; Secure\r\n\r\n{\"assigned\":false}"))); !strings.Contains(got, "Secure") {
+		t.Fatalf("the canonical flag lost its vouching: %q", got)
+	}
+}
+
+// The late trailer renderer takes the same delimiter marking as a header line.
+func TestTheTrailerRendererMarksItsDelimiter(t *testing.T) {
+	suppliedValues = []string{":"}
+	t.Cleanup(func() { suppliedValues = nil })
+	tee := &teeBody{trailer: http.Header{"Date": []string{"Sun, 06 Nov 1994 08:49:37 GMT"}}}
+	got := stripMarks(scrubSupplied((&exchange{head: []byte("x"), captured: tee}).trailerReport()))
+	if !strings.Contains(got, "Date: ") {
+		t.Fatalf("the trailer delimiter was rewritten into prose: %q", got)
 	}
 }

@@ -795,7 +795,13 @@ func redactSetCookie(line string) string {
 				// (shardpilot/shardpilot-go#85 review). Only the standard flags
 				// have no value by specification; anything else without one is a
 				// string the origin invented.
-				if standardCookieAttr(an) {
+				// ⚠ CANONICAL SPELLING, AND ONLY THE FLAGS THAT ARE ACTUALLY VALUELESS.
+				// `standardCookieAttr` folds, so `SECURE` was admitted and its RECEIVED
+				// spelling vouched -- and the same check let a bare `Path`, an attribute
+				// that is supposed to CARRY a value, through as though it were a flag
+				// (shardpilot/shardpilot-go#85 review). Recognition is not authorship,
+				// and being valueless here is not being a flag.
+				if can, ok := canonicalCookieFlag(ows(an)); ok && ows(an) == can {
 					// ⚠ MARKED, NOT MERELY KEPT. Left as captured text, a flag whose
 					// name equals a supplied identifier -- `Secure` -- reached
 					// `scrubSupplied` and became `<redacted, 6 chars>`: no longer a
@@ -1568,6 +1574,19 @@ func redactFieldName(name string) string {
 // an HTTP-date, `SameSite` three keywords. `Path` and `Domain` are strings the
 // origin invents, and are lengthened.
 // standardCookieAttr reports a cookie attribute name the specification fixes.
+// canonicalCookieFlag returns the specification's spelling of a VALUELESS cookie
+// flag. `Path`, `Domain`, `Max-Age`, `Expires` and `SameSite` are not here: they
+// carry values, and a bare one is not a flag but an attribute the endpoint
+// truncated.
+func canonicalCookieFlag(name string) (string, bool) {
+	for _, c := range []string{"Secure", "HttpOnly", "Partitioned"} {
+		if strings.EqualFold(name, c) {
+			return c, true
+		}
+	}
+	return "", false
+}
+
 func standardCookieAttr(name string) bool {
 	switch strings.ToLower(ows(name)) {
 	case "secure", "httponly", "partitioned", "path", "domain", "expires",

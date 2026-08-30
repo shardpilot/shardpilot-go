@@ -305,7 +305,13 @@ func (e *exchange) trailerReport() string {
 			if i := strings.IndexByte(red, ':'); i > 0 {
 				red = admitFieldName(red[:i]) + red[i:]
 			}
-			fmt.Fprintf(&b, "    %s\n", asCaptured(scrubSupplied(red)))
+			// ⚠ AND THE DELIMITER, THROUGH THE SAME PASS THE HEADER LINES USE. The
+			// name and the admitted value are vouched here and the colon between them
+			// was left captured, so a supplied `:` turned an ordinary trailer into an
+			// unparsable line the guard approved (shardpilot/shardpilot-go#85 review).
+			// Tenth site of this rule and the second on this path; the product sweep
+			// covers `dropFraming`'s lines and did not reach this renderer.
+			fmt.Fprintf(&b, "    %s\n", asCaptured(scrubSupplied(emitField(red))))
 		}
 	}
 	b.WriteString("\n")
@@ -1204,7 +1210,18 @@ func dropFraming(dump string) string {
 				// it verbatim to stderr -- the refusal publishing what the refusal
 				// was for (shardpilot/shardpilot-go#84 review).
 				noteStructural("a body in a content coding this build cannot decode")
-			} else if strings.EqualFold(v, "identity") {
+			} else if v == "identity" {
+				// ⚠ THE CANONICAL SPELLING, EXACTLY. `EqualFold` here admitted
+				// `IDENTITY` and this branch then vouched the RECEIVED spelling, so a
+				// supplied `IDENTITY` was published (shardpilot/shardpilot-go#85
+				// review). A non-canonical spelling is not refused: it falls through to
+				// the generic path and is redacted like any other value.
+				//
+				// ⚠ AND IT IS A CONDITION, NOT A `break`. My first attempt guarded the
+				// body of this branch and broke out of the LINE LOOP on a non-canonical
+				// spelling, truncating the response after the status line -- caught by
+				// printing the output rather than by the suite, which had no scene here
+				// at all.
 				// ⚠ AN ACCEPTED CODING IS GRAMMAR, AND MUST BE MARKED AS SUCH. This
 				// branch deliberately accepts `identity` as the no-op coding that
 				// accompanies a readable body -- and then left the token as captured
@@ -1215,7 +1232,16 @@ func dropFraming(dump string) string {
 				// (shardpilot/shardpilot-go#84 review). Same rule as the cookie
 				// attributes and the query parameter names: vouching for a token and
 				// leaving it captured is not vouching.
-				out = append(out, emitField(l[:len("content-encoding:")]+
+				// ⚠ THE CANONICAL SPELLING, AND THE GENERIC NAME PATH. Two things this
+				// early return skipped. `strings.EqualFold` admitted `IDENTITY`, and
+				// marking the RECEIVED spelling published a supplied `IDENTITY` -- the
+				// case class again, at a branch that predates the canonical rule. And
+				// returning here bypassed `admitFieldName`, so a supplied
+				// `Content-Encoding` was scrubbed out of the field NAME and the capture
+				// lost the coding field entirely (shardpilot/shardpilot-go#85 review).
+				// An early return is a promise to have done everything the common path
+				// does.
+				out = append(out, emitField(admitFieldName(l[:len("content-encoding:")-1])+":"+
 					strings.Replace(l[len("content-encoding:"):], v, marked(v), 1)))
 				continue
 			}
@@ -1378,7 +1404,7 @@ func dropFraming(dump string) string {
 		return strings.Join(out, "\n")
 	}
 	return strings.Join(out[:bodyStart], "\n") + "\n" +
-		markBareJSONLiterals(redactMintedBody(strings.Join(out[bodyStart:], "\n")))
+		redactUnaccountedBody(markBareJSONLiterals(redactMintedBody(strings.Join(out[bodyStart:], "\n"))))
 }
 
 type recorder struct {
@@ -1890,7 +1916,15 @@ func sanitizeCaptured(err error) string {
 	// The quoted span is exactly the extent Go marks as the endpoint's, so it is
 	// replaced by its length and ACCOUNTED for -- a capture, not a refusal, because
 	// the extent IS determinable here. Prose outside the quotes is Go's.
-	return asCaptured(scrubSupplied(sanitizeText(redactQuotedExtents(escapeMarks(err.Error())))))
+	// ⚠ MEASURED ON THE RAW TEXT, AND ESCAPED ONLY WHERE IT IS STILL CAPTURED.
+	// Escaping first EXPANDS backslash runs, which breaks `strconv.Unquote` and
+	// makes the placeholder describe the transport spelling: a ten-character
+	// `server<NUL>tok` was reported as 14, and unescaping before measuring only
+	// moved it to 12 (shardpilot/shardpilot-go#85 review). The rule this file
+	// already states -- escape before the stages that create marks of their own --
+	// is satisfied by `overCaptured`, which applies the escape to the captured
+	// parts and leaves the generated placeholders alone.
+	return asCaptured(scrubSupplied(sanitizeText(redactQuotedExtents(err.Error()))))
 }
 
 // redactQuotedExtents replaces each double-quoted span with a placeholder for its
@@ -1900,7 +1934,16 @@ func redactQuotedExtents(text string) string {
 	var b strings.Builder
 	for i := 0; i < len(text); {
 		if text[i] != '"' {
-			b.WriteByte(text[i])
+			// ⚠ THE ESCAPE LIVES HERE NOW, AND ONLY OUTSIDE THE QUOTES. Escaping the
+			// whole message first expanded backslash runs, broke `strconv.Unquote` and
+			// made the placeholder describe the transport spelling. Escaping the whole
+			// message AFTERWARDS is worse: it cannot tell a mark this program inserted
+			// from one the ENDPOINT spelled, which is the injection the escape exists
+			// to stop -- and moving it there turned that fixture red immediately
+			// (shardpilot/shardpilot-go#85 review). Split by extent: outside the
+			// quotes the bytes are the endpoint's and are escaped; inside, nothing of
+			// the endpoint's survives to escape.
+			b.WriteString(escapeMarks(text[i : i+1]))
 			i++
 			continue
 		}
@@ -1919,7 +1962,7 @@ func redactQuotedExtents(text string) string {
 			// An unterminated quote has no determinable extent: the clause above says
 			// that case is a REFUSAL, not a capture.
 			noteStructural("a transport diagnostic whose quoted extent does not close")
-			b.WriteString(text[i:])
+			b.WriteString(escapeMarks(text[i:]))
 			return b.String()
 		}
 		raw := text[i : j+1]
@@ -1927,8 +1970,11 @@ func redactQuotedExtents(text string) string {
 		if unq, err := strconv.Unquote(raw); err == nil {
 			val = unq
 		}
+		// One value has one length wherever it is printed, and that length is the
+		// value's, not its transport spelling's. See the call site for why the
+		// escape has moved behind this.
 		if strings.TrimSpace(val) == "" {
-			b.WriteString(raw)
+			b.WriteString(escapeMarks(raw))
 		} else {
 			noteAccounted("the endpoint-controlled extent of a transport diagnostic")
 			b.WriteString(`"` + placeholder(val) + `"`)
@@ -2112,6 +2158,40 @@ func nameComponents(names string) string {
 // costs nothing to maintain: `overCaptured` already leaves generated spans alone
 // and the guard already blanks them, so both rules follow from one mark rather
 // than from two copies of a list.
+// redactUnaccountedBody replaces a body this program cannot account for with its
+// length.
+//
+// ⚠ THE CLAUSE SAYS "EVERYTHING ELSE", AND THE BODY WAS AN EXCEPTION NOBODY HAD
+// WRITTEN DOWN. Every rule above it addresses JSON: the minted-member redaction,
+// the schema names, the grammar literals. A `text/plain` body of
+// `server-secret-token` met none of them, the refusal ledger stayed empty, and
+// the guard is blind to it because the value was never supplied by this program
+// -- so the response was published verbatim
+// (shardpilot/shardpilot-go#85 review). "Everything else replaced by its length"
+// is either true of the body too or it is not the claim.
+//
+// A body that PARSES as one JSON value has already been through those rules and
+// is left alone; an empty body has nothing to describe. What remains is endpoint
+// text in a shape this build does not cover, and the record is refused.
+func redactUnaccountedBody(body string) string {
+	if strings.TrimSpace(stripMarks(body)) == "" {
+		return body
+	}
+	if jsonParses(stripMarks(body)) {
+		return body
+	}
+	// ⚠ REFUSED, NOT REWRITTEN, and the choice is between the reviewer's own two
+	// options. Replacing the body with a length collides with two properties this
+	// file pins deliberately: that the recorder does not rewrite body lines, and
+	// that a captured NUL is DISCLOSED rather than hidden. Both would have had to
+	// be relaxed to make the rewrite fit -- which is the shape of a fix that works
+	// by masking. Refusal costs an operator a capture and keeps every disclosure
+	// intact, which is the trade this file already states about unfamiliar
+	// identifiers.
+	noteStructural("a response body in a shape this build cannot describe")
+	return body
+}
+
 func markBareJSONLiterals(text string) string {
 	// ⚠ PARSED, NOT GUESSED. The first version tested the bytes around the token,
 	// which marks `{"message":"saw false value"}` and `error: false` as grammar --

@@ -52,11 +52,24 @@ func TestEveryVouchedTokenSurvivesTheScrub(t *testing.T) {
 	for _, name := range slices.Sorted(maps.Keys(registeredFieldNames)) {
 		probes = append(probes, pv("registered field name", "HTTP/1.1 200 OK\r\n"+name+": 1\r\n\r\n", name))
 	}
-	for _, a := range []string{"Secure", "Path", "Max-Age", "SameSite", "HttpOnly"} {
-		if !standardCookieAttr(a) {
-			t.Fatalf("the probe list drifted from standardCookieAttr: %q", a)
+	// ⚠ VALUELESS ONLY WHERE VALUELESS IS LEGAL. These rows rendered every
+	// standard attribute BARE -- including `Path`, `Max-Age` and `SameSite`, which
+	// carry values by specification -- and so asserted that a truncated attribute
+	// is vouched, which is the very shape a later finding named as a bypass
+	// (shardpilot/shardpilot-go#85 review). A sweep row is an assertion about what
+	// SHOULD hold; this one held the defect in place.
+	for _, a := range []string{"Secure", "HttpOnly"} {
+		if _, ok := canonicalCookieFlag(a); !ok {
+			t.Fatalf("the probe list drifted from canonicalCookieFlag: %q", a)
 		}
-		probes = append(probes, pv("cookie attribute", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; "+a+"\r\n\r\n", a))
+		probes = append(probes, pv("cookie flag", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; "+a+"\r\n\r\n", a))
+	}
+	for _, av := range [][2]string{{"Path", "/"}, {"Max-Age", "10"}, {"SameSite", "Lax"}} {
+		if !standardCookieAttr(av[0]) {
+			t.Fatalf("the probe list drifted from standardCookieAttr: %q", av[0])
+		}
+		probes = append(probes, pv("cookie attribute",
+			"HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; "+av[0]+"="+av[1]+"\r\n\r\n", av[0]))
 	}
 	probes = append(probes, pv("no-op content coding",
 		"HTTP/1.1 200 OK\r\nContent-Encoding: identity\r\n\r\n", "identity"))
