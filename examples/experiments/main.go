@@ -14,9 +14,6 @@
 // ⚠ WHAT THIS PROGRAM CLAIMS, AND WHY THE CLAIM IS NARROW ON PURPOSE.
 //
 // It does NOT claim "nothing leaks". That is an absolute statement about a
-// ⚠ WHAT THIS PROGRAM CLAIMS, AND WHY THE CLAIM IS NARROW ON PURPOSE.
-//
-// It does NOT claim "nothing leaks". That is an absolute statement about a
 // hostile input and has no fixed point: for every form a reader imagines, the
 // program grows a defence, and the next form is imagined next. A list of probes
 // against imagination is a list against an infinity, and a list is complete only
@@ -588,6 +585,31 @@ func topLevelMembers(body string) []string {
 // merge that brought the two together defined it twice
 // (shardpilot/shardpilot-go#85, stack seam).
 var structuralSurfaces []string
+
+// accountedSurfaces records what structural redaction REWROTE and can describe.
+// It is deliberately NOT structuralSurfaces: that one is the REFUSAL ledger, and
+// every other writer to it records a shape the rules could not describe -- an
+// unparseable Set-Cookie, an unapproved scheme, a body in a coding this build
+// cannot decode. Recording an ordinary successful redaction there made
+// `len(structuralSurfaces) > 0` true for EVERY fact response, so the program
+// exited 4 on exactly the captures this change exists to publish
+// (shardpilot/shardpilot-go#85, stack seam).
+//
+// The two answer different questions. "What did this program rewrite" is
+// accounting. "What defeated it" is a refusal. One name for both turns the first
+// into the second, and no test saw it because the publish/refuse decision had no
+// scene -- see TestAnOrdinaryFactResponseStaysPublishable, which exists now.
+var accountedSurfaces []string
+
+func noteAccounted(what string) {
+	if !slices.Contains(accountedSurfaces, what) {
+		accountedSurfaces = append(accountedSurfaces, what)
+	}
+}
+
+// refusalLedger is what main consults to decide whether the capture may be
+// printed. It exists so a test can ask that question without running main.
+func refusalLedger() []string { return structuralSurfaces }
 
 func noteStructural(what string) {
 	if !slices.Contains(structuralSurfaces, what) {
@@ -2526,7 +2548,7 @@ func main() {
 	// ⚠ AND A SURFACE THE STRUCTURAL RULES COULD NOT DESCRIBE IS THE SAME FACT AS
 	// A SURVIVING LEAK: the program cannot show the bytes are safe. Redact what
 	// you recognise, refuse what you do not.
-	if len(structuralSurfaces) > 0 {
+	if len(refusalLedger()) > 0 {
 		fmt.Fprintf(os.Stderr,
 			"REFUSING TO PRINT: the response carries %d server-generated surface(s) "+
 				"in a shape the structural rules do not describe, so the capture is "+

@@ -692,7 +692,7 @@ func redactMintedBody(body string) string {
 		// publishable capture -- the note inherited the redaction's blindness
 		// instead of the guard's question.
 		if isMintedName(n) {
-			noteStructural("a server-minted subject identifier")
+			noteAccounted("a server-minted subject identifier")
 		}
 		if !isMintedName(n) && !isBenignName(n) {
 			noteStructural("a top-level member this program has not judged")

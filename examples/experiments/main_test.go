@@ -1141,11 +1141,18 @@ func TestRefusalLabelsCarryNoEndpointText(t *testing.T) {
 	structuralSurfaces = nil
 	suppliedValues = nil
 	t.Cleanup(func() { structuralSurfaces = nil })
+	accountedSurfaces = nil
+	t.Cleanup(func() { accountedSurfaces = nil })
 	dropFraming("HTTP/1.1 200 OK\r\n\r\n" + "{\"ſubject_fact_key\":\"x\"}")
-	if len(structuralSurfaces) == 0 {
+	// ⚠ THE ACCOUNTING LEDGER, NOT THE REFUSAL ONE. The guard half refused such a
+	// capture, so detection and refusal were the same list. This half redacts and
+	// PUBLISHES it, so asserting on the refusal ledger would demand the program
+	// refuse every fact response (shardpilot/shardpilot-go#85, stack seam).
+	if len(accountedSurfaces) == 0 {
 		t.Fatal("a folded minted name stopped being detected")
 	}
-	for _, w := range structuralSurfaces {
+	// The label rule holds for BOTH ledgers: every one of them is printed.
+	for _, w := range append(append([]string{}, structuralSurfaces...), accountedSurfaces...) {
 		if strings.Contains(w, "ſ") {
 			t.Fatalf("the refusal label carries the endpoint's own spelling: %q", w)
 		}
@@ -1179,5 +1186,43 @@ func TestBinaryBase64DecodesAreChecked(t *testing.T) {
 	tok := base64.StdEncoding.EncodeToString(append([]byte{0xff}, []byte("abcdefgh")...))
 	if err := assertNoLeak(asCaptured(`{"k":"` + tok + `"}`)); err == nil {
 		t.Fatal("a decode whose bytes are not valid UTF-8 was discarded")
+	}
+}
+
+// TestAnOrdinaryFactResponseStaysPublishable is the scene the promise sweep found
+// missing: the doc claims a value whose EXTENT cannot be determined is refused
+// with exit 4, and nothing exercised the publish/refuse decision at all. Under
+// that gap I recorded an ordinary successful redaction in the REFUSAL ledger, and
+// every fact response — the captures this change exists to publish — would have
+// exited 4 with the whole suite green.
+func TestAnOrdinaryFactResponseStaysPublishable(t *testing.T) {
+	structuralSurfaces = nil
+	accountedSurfaces = nil
+	suppliedValues = nil
+	t.Cleanup(func() { structuralSurfaces = nil; accountedSurfaces = nil })
+	dropFraming("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" +
+		`{"subject_fact_key":"sfk1_aaaaaaaaaaaaaaaa","assigned":true}`)
+	if got := refusalLedger(); len(got) != 0 {
+		t.Fatalf("an ordinary fact response was made unpublishable: %q", got)
+	}
+	if len(accountedSurfaces) == 0 {
+		t.Fatal("the minted field was rewritten and not accounted for")
+	}
+}
+
+// TestASurfaceTheRulesCannotDescribeRefuses is the other half of the promise the
+// sweep found uncovered. The scene above asserts the refusal ledger is EMPTY for
+// an ordinary response; nothing asserted it FILLS for a shape the rules cannot
+// describe, so `refusalLedger` could have returned nil unconditionally with the
+// whole suite green — a negative-only assertion is satisfied by a gate that never
+// fires (shardpilot/shardpilot-go#85, promise sweep).
+func TestASurfaceTheRulesCannotDescribeRefuses(t *testing.T) {
+	structuralSurfaces = nil
+	accountedSurfaces = nil
+	suppliedValues = nil
+	t.Cleanup(func() { structuralSurfaces = nil; accountedSurfaces = nil })
+	dropFraming("HTTP/1.1 200 OK\r\nSet-Cookie: \r\n\r\n{}")
+	if len(refusalLedger()) == 0 {
+		t.Fatal("a Set-Cookie with no name=value pair left the capture publishable")
 	}
 }
