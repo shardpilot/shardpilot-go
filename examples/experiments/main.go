@@ -2441,7 +2441,20 @@ func markBareJSONLiterals(text string) string {
 			// kind of token in the same grammar.
 			end := int(dec.InputOffset())
 			lit := string(tok.(json.Number))
-			if end-len(lit) >= 0 && view[start+end-len(lit):start+end] == lit {
+			// ⚠ THE LEXEME IS NOT THE SYNTAX. Marking every number vouched the
+			// ENDPOINT'S choice of value: with `123456` supplied, `{"version":123456}`
+			// published the exact identifier because a marked span is skipped by both
+			// the scrub and the guard (shardpilot/shardpilot-go#85 review). Numeric
+			// syntax constrains the representation and says nothing about who chose it
+			// -- the same sentence the header values and the cookie attributes carry.
+			//
+			// A colliding number is REFUSED rather than replaced. A numeric sentinel
+			// would keep the document parsing and say `"version":0`, which a reader
+			// takes for the endpoint's answer: a redaction that corrupts is worse than
+			// one that refuses, and this file states that trade elsewhere.
+			if scrubSuppliedRaw(lit) != lit {
+				noteStructural("a JSON number that collides with a supplied value")
+			} else if end-len(lit) >= 0 && view[start+end-len(lit):start+end] == lit {
 				spans = append(spans, span{back[start+end-len(lit)], back[start+end-1] + 1})
 			}
 		case bool, nil:
@@ -4149,11 +4162,18 @@ func main() {
 	// arrive whole" (shardpilot/shardpilot-go#85 review). Two true statements, and
 	// the more specific one is the answer: the fragment is undescribable BECAUSE it
 	// is incomplete, and a consumer of these codes reads them apart.
-	if last != nil && last.truncErr() != nil {
-		fmt.Printf("\nNOT captured (exit 3) — the response body did not arrive whole.\n")
-		os.Exit(3)
-	}
-	if len(refusalLedger()) > 0 {
+	// ⚠ A KNOWN TRUNCATION SUPPRESSES THE STRUCTURAL REFUSAL, IT DOES NOT REPLACE
+	// THE REPORT. My first version of this exited here -- BEFORE the only
+	// `io.WriteString` -- so every truncated response discarded the request and the
+	// incomplete response the loop had just assembled, and the documented exit-3
+	// branch below became unreachable (shardpilot/shardpilot-go#85 review). Two
+	// facts, and I let the more specific one swallow the artifact as well as the
+	// wrong exit code.
+	//
+	// The refusal is skipped because a fragment is undescribable BECAUSE it is
+	// incomplete, which is the truncation, not a shape the rules failed on. The
+	// report is written and the classification below returns exit 3.
+	if (last == nil || last.truncErr() == nil) && len(refusalLedger()) > 0 {
 		fmt.Fprintf(os.Stderr,
 			"REFUSING TO PRINT: the response carries %d server-generated surface(s) "+
 				"in a shape the structural rules do not describe, so the capture is "+

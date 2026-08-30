@@ -817,32 +817,22 @@ func redactSetCookie(line string) string {
 	if len(measured) >= 2 && measured[0] == '"' && measured[len(measured)-1] == '"' {
 		measured = measured[1 : len(measured)-1]
 	}
-	// A cookie NAME is never something this program sent, so it is lengthened by
-	// the same rule -- there is nothing on the name side of a Set-Cookie whose
-	// provenance the harness can attest to.
-	// ⚠ EXACTLY HERE TOO. I fixed the QUERY name lookup and left this one: an
-	// endpoint may return the transport-valid `Set-Cookie: experiment_key =x`, and
-	// the OWS trim turned that into the harness-owned name -- so the whole endpoint
-	// spelling was marked generated and both the scrub and the guard skipped it
-	// (shardpilot/shardpilot-go#85 review). Second site of one conflation, found
-	// the round after the first.
-	if !nameIsOursExactly(name) {
-		// MEASURED AS RECEIVED. `responseText` expands a marker-like spelling on the
-		// way in, so a cookie name containing the literal `\x00` was reported three
-		// characters longer than it arrived. The cookie's VALUE and its attribute
-		// values already undid the escape; the name did not
-		// (shardpilot/shardpilot-go#85 review).
-		name = tokenPlaceholder(unescapeMarks(name))
-	} else {
-		// ⚠ VOUCHED FOR IS NOT THE SAME AS CAPTURED. When a supplied identifier
-		// equals a request parameter name -- the experiment key spelled
-		// `experiment_key` -- and the endpoint sets a cookie of that name, this
-		// branch left it as captured text and `scrubSupplied` rewrote it to
-		// `<redacted, 14 chars>`: not a cookie name, and approved
-		// (shardpilot/shardpilot-go#85 review). The query-name path already marks
-		// its vouched-for names; this one did not.
-		name = marked(name)
-	}
+	// ⚠ A COOKIE NAME IS ALWAYS LENGTHENED, and the query-name registry says nothing
+	// about it. This used to vouch a cookie name that appears in `requestNames` -- so
+	// with `experiment_key` both supplied and set as a cookie by the endpoint, the
+	// name was marked generated and skipped by the scrub and the guard
+	// (shardpilot/shardpilot-go#85 review). A name we sent in a QUERY is not a name
+	// we authored in a `Set-Cookie` the ENDPOINT wrote: membership in one namespace
+	// is not provenance in another.
+	//
+	// MEASURED AS RECEIVED. `responseText` expands a marker-like spelling on the way
+	// in, so a cookie name containing the literal `\x00` was reported three
+	// characters longer than it arrived.
+	//
+	// The placeholder is GENERATED, which also keeps the earlier defect closed: the
+	// supplied-value scrub cannot rewrite it into prose the way it rewrote a name
+	// left captured.
+	name = tokenPlaceholder(unescapeMarks(name))
 	// Measured before `escapeMarks` lengthened it, exactly as redactUnlessVerbatim
 	// does -- the structural path had kept the older behaviour
 	// (shardpilot/shardpilot-go#85 review).
@@ -941,7 +931,17 @@ func redactSetCookie(line string) string {
 			// spelling published a supplied `LAX` (see canonicalSpelling). A
 			// non-canonical spelling is not refused, it is simply left CAPTURED, which
 			// is what the value is.
-			if verbatim && canKnown && canonicalSpelling(ows(av), canAttr) {
+			// ⚠ THE COLLISION CHECK IS FOR THE NON-ENUMERATED ATTRIBUTES ONLY. `Max-Age`
+			// is an integer and `Expires` an HTTP-date: admitted by SHAPE, and shape
+			// says nothing about who chose the value, so `Max-Age=123456` vouched a
+			// supplied numeric key exactly as the header path did
+			// (shardpilot/shardpilot-go#85 review). `SameSite=Lax` is different in kind
+			// -- the specification ENUMERATES its values, so `Lax` is the grammar's own
+			// token whoever else also chose that string, and three sweep rows say it
+			// must survive.
+			_, enumerated := cookieAttrCanonicalEnumerated(canAttr)
+			if verbatim && canKnown && canonicalSpelling(ows(av), canAttr) &&
+				(enumerated || scrubSuppliedRaw(ows(av)) == ows(av)) {
 				// The VALUE is vouched for by the same criterion that admitted it; see
 				// redactUnlessVerbatim for why admitting without marking is not admitting.
 				parts[i] = an + syntax("=") + strings.Replace(av, ows(av), vouched(ows(av)), 1)
@@ -1135,6 +1135,33 @@ func structuralRedact(line string) (string, bool) {
 // What is accounted for: a value this SDK itself produces (the verdict taxonomy),
 // and the grammar's own literals, which are not strings. Everything else is
 // endpoint text and becomes a length -- which is what the clause says.
+// keySpan finds the span of the string token that ends at `end` in `view`.
+func keySpan(view string, end int) (int, int) {
+	k := end - 2
+	for k >= 0 {
+		if view[k] == '"' {
+			bs := 0
+			for m := k - 1; m >= 0 && view[m] == '\\'; m-- {
+				bs++
+			}
+			if bs%2 == 0 {
+				return k, end
+			}
+		}
+		k--
+	}
+	return -1, end
+}
+
+func anyMarked(inMark []bool, a, b int) bool {
+	for m := a; m < b && m < len(inMark); m++ {
+		if inMark[m] {
+			return true
+		}
+	}
+	return false
+}
+
 func redactUnaccountedJSONValues(body string) string {
 	// ⚠ A PATTERN OVER MEMBER-COLON-STRING IS NOT A TRAVERSAL. The first version
 	// matched only a string immediately after a member's colon, so
@@ -1195,6 +1222,15 @@ func redactUnaccountedJSONValues(body string) string {
 		atRoot := false
 		if d, ok := tok.(json.Delim); ok {
 			switch d {
+			case '{', '[':
+				// ⚠ A CONTAINER IN VALUE POSITION ENDS THE VERDICT POSITION. Leaving
+				// `verdictField` set across `[` marked the first element of
+				// `{"code":["kill_switch"]}` as this SDK's taxonomy
+				// (shardpilot/shardpilot-go#85 review). The SDK classifies a SCALAR
+				// there; anything else in that position is the endpoint's shape.
+				verdictField = ""
+			}
+			switch d {
 			case '{':
 				advance()
 				depth = append(depth, 1)
@@ -1215,10 +1251,25 @@ func redactUnaccountedJSONValues(body string) string {
 			advance()
 		}
 		if isKey {
-			if name, ok := tok.(string); ok && atRoot {
+			name, isStr := tok.(string)
+			if isStr && atRoot {
 				verdictField = name
 			} else {
 				verdictField = ""
+			}
+			// ⚠ AND A KEY OUTSIDE THE SCHEMA IS ENDPOINT TEXT LIKE ANY VALUE. This
+			// traversal skipped every key, and only canonical TOP-LEVEL names are
+			// accounted for elsewhere -- so `{"variant_payload":{"server-secret-token":1}}`
+			// published the nested member NAME verbatim: the top-level check accepts
+			// `variant_payload`, the number is grammar, and nothing knows the token
+			// (shardpilot/shardpilot-go#85 review). A name the endpoint chose is a
+			// string the endpoint chose.
+			if isStr && !(atRoot && (benignTopLevel[name] || mintedNames[name])) {
+				k, end := keySpan(view, int(dec.InputOffset()))
+				if k >= 0 && !anyMarked(inMark, k, end) {
+					noteAccounted("an endpoint-chosen member name in a parsed response body")
+					spans = append(spans, span{back[k], back[end-1] + 1, `"` + tokenPlaceholder(name) + `"`})
+				}
 			}
 			continue
 		}
@@ -1242,7 +1293,24 @@ func redactUnaccountedJSONValues(body string) string {
 			}
 			k--
 		}
-		if k < 0 || end > len(view) || inMark[k] {
+		// ⚠ ANY BYTE OF THE SPAN, NOT ONLY ITS OPENING QUOTE. `redactMintedBody` marks
+		// the placeholder's CONTENTS and leaves the JSON quotes around them unmarked,
+		// so testing `inMark[k]` at the quote read a generated placeholder as endpoint
+		// data and replaced it again -- reporting the placeholder's length instead of
+		// the identifier's (shardpilot/shardpilot-go#85 review). A span that contains
+		// generated bytes is not endpoint text.
+		if k < 0 || end > len(view) {
+			verdictField = ""
+			continue
+		}
+		already := false
+		for m := k; m < end; m++ {
+			if inMark[m] {
+				already = true
+				break
+			}
+		}
+		if already {
 			verdictField = ""
 			continue
 		}
@@ -1839,6 +1907,18 @@ func canonicalCookieFlag(name string) (string, bool) {
 
 // canonicalCookieAttr returns the specification's spelling of a cookie attribute
 // name, valued or not.
+// cookieAttrCanonicalEnumerated reports whether an admitted attribute VALUE comes
+// from a vocabulary the specification enumerates, as `SameSite` does -- as opposed
+// to one admitted by SHAPE, like an integer `Max-Age` or an HTTP-date `Expires`.
+func cookieAttrCanonicalEnumerated(canonicalValue string) (string, bool) {
+	for _, v := range []string{"Lax", "Strict", "None"} {
+		if canonicalValue == v {
+			return v, true
+		}
+	}
+	return "", false
+}
+
 func canonicalCookieAttr(name string) (string, bool) {
 	for _, c := range []string{"Secure", "HttpOnly", "Partitioned", "Path", "Domain",
 		"Expires", "Max-Age", "SameSite", "Priority"} {

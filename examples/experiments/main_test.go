@@ -1442,9 +1442,25 @@ func TestAVouchedCookieNameIsMarked(t *testing.T) {
 	// registry it had left empty, and measured the branch it was not aiming at.
 	requestNames = map[string]bool{"experiment_key": true}
 	t.Cleanup(func() { suppliedValues = nil; requestNames = map[string]bool{} })
+	// ⚠ THE PROPERTY CHANGED, AND THIS ASSERTION CHANGED WITH IT. A later finding
+	// showed that vouching a cookie name because it appears in `requestNames`
+	// publishes a supplied identifier: a name we sent in a QUERY is not a name we
+	// authored in a `Set-Cookie` the ENDPOINT wrote
+	// (shardpilot/shardpilot-go#85 review). Cookie names are always lengthened now.
+	// What this scene still holds is the reason it was written: the name must not
+	// reach the generic scrub, which would rewrite it into PROSE and produce
+	// something no cookie parser accepts. The placeholder is token-safe and
+	// generated, so it survives the scrub intact.
 	got := stripMarks(scrubSupplied(redactSetCookie("Set-Cookie: experiment_key=x")))
-	if !strings.Contains(got, "experiment_key=") {
-		t.Fatalf("a cookie name this program vouched for was scrubbed: %q", got)
+	if strings.Contains(got, "experiment_key") {
+		t.Fatalf("a cookie name was vouched from the query-name registry: %q", got)
+	}
+	// The NAME is what follows `Set-Cookie: `, not the whole prefix -- the first
+	// version of this check included the field name and its space and failed on a
+	// correct program.
+	nm := strings.SplitN(strings.TrimPrefix(got, "Set-Cookie: "), "=", 2)[0]
+	if strings.ContainsAny(nm, " <>,") {
+		t.Fatalf("the cookie name was rewritten into prose: %q", got)
 	}
 }
 
@@ -2235,10 +2251,13 @@ func TestACookieNameIsComparedExactly(t *testing.T) {
 	if strings.Contains(got, "experiment_key") {
 		t.Fatalf("a padded endpoint spelling was vouched for and published: %q", got)
 	}
-	// And the exact name is still vouched for.
+	// The exact name is lengthened too, and for the same reason: see
+	// TestAVouchedCookieNameIsMarked. What this scene is about is that the PADDED
+	// spelling is not treated as the harness's -- and that holds whether or not the
+	// exact one is vouched.
 	got = stripMarks(scrubSupplied(redactSetCookie("Set-Cookie: experiment_key=x")))
-	if !strings.Contains(got, "experiment_key=") {
-		t.Fatalf("a cookie name the harness sent was scrubbed: %q", got)
+	if strings.Contains(got, "experiment_key") {
+		t.Fatalf("a cookie name was vouched from the query-name registry: %q", got)
 	}
 }
 
@@ -3047,11 +3066,17 @@ func TestAnAdmittedNumericValueIsNotVouchedWhenSupplied(t *testing.T) {
 
 // A number is grammar like the literals beside it.
 func TestJSONNumbersAreGrammar(t *testing.T) {
-	suppliedValues = []string{"1"}
+	// ⚠ THE SUPPLIED VALUE IS NOT THE NUMBER IN THE BODY. The first version supplied
+	// `1` against `{"version":1}` -- which is the COLLISION a later finding names as
+	// a leak, so this scene was asserting the wrong half of the rule
+	// (shardpilot/shardpilot-go#85 review). What this one holds is that an ordinary
+	// number is grammar and survives a scrub aimed at something else; the collision
+	// is TestACollidingJSONNumberIsRefused.
+	suppliedValues = []string{"zzz"}
 	t.Cleanup(func() { suppliedValues = nil })
 	got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"version\":1}")))
 	if !strings.Contains(got, `"version":1`) {
-		t.Fatalf("a supplied digit rewrote the grammar's own number: %q", got)
+		t.Fatalf("the grammar's own number was rewritten: %q", got)
 	}
 }
 
@@ -3076,24 +3101,101 @@ func TestOnlyOurOwnQueryEscapingIsVouched(t *testing.T) {
 	}
 }
 
-// A known truncation is classified before the structural refusal, because both
-// are true of the same capture and the more specific one is the answer.
+// A known truncation SUPPRESSES the structural refusal; it does not replace the
+// report.
 //
 // ⚠ BOUND BY READING THE SOURCE, because the exit path lives in `main()` and no
-// fixture can run it -- the same gap the verdict lines have. What is checkable is
-// the ORDER, and the order is the whole of this fix.
-func TestTruncationIsClassifiedBeforeTheStructuralRefusal(t *testing.T) {
+// fixture can run it. Two orderings are checkable there and both matter: the
+// refusal must be conditioned on the truncation, and the truncation's own exit
+// must come after the report is written -- my first version exited before the
+// only `io.WriteString`, discarding the incomplete capture the loop had just
+// assembled.
+func TestTruncationSuppressesTheRefusalWithoutDiscardingTheReport(t *testing.T) {
 	src, err := os.ReadFile("main.go")
 	if err != nil {
 		t.Fatalf("the scene cannot read its own subject: %v", err)
 	}
 	text := string(src)
-	trunc := strings.Index(text, "last.truncErr() != nil {")
-	ledger := strings.Index(text, "if len(refusalLedger()) > 0 {")
-	if trunc < 0 || ledger < 0 {
-		t.Fatalf("one of the two checks was not found (trunc=%d ledger=%d), so this scene measures nothing", trunc, ledger)
+	guarded := strings.Index(text, "if (last == nil || last.truncErr() == nil) && len(refusalLedger()) > 0 {")
+	if guarded < 0 {
+		t.Fatal("the structural refusal is not conditioned on the truncation, so a truncated body exits 4")
 	}
-	if trunc > ledger {
-		t.Fatal("the structural refusal runs first, so a truncated body exits 4 instead of 3")
+	write := strings.Index(text, "io.WriteString(os.Stdout, stripMarks(report.String()))")
+	exit3 := strings.Index(text, "case last.truncErr() != nil:")
+	if write < 0 || exit3 < 0 {
+		t.Fatalf("one of the two anchors was not found (write=%d exit3=%d), so this scene measures nothing", write, exit3)
+	}
+	if exit3 < write {
+		t.Fatal("the truncation exit runs before the report is written, so the capture is discarded")
+	}
+	if guarded > write {
+		t.Fatal("the refusal runs after the write, which is not where it can suppress anything")
+	}
+}
+
+// Numeric syntax constrains the representation, not the author.
+func TestACollidingJSONNumberIsRefused(t *testing.T) {
+	suppliedValues = []string{"123456"}
+	structuralSurfaces, accountedSurfaces = nil, nil
+	t.Cleanup(func() {
+		suppliedValues = nil
+		structuralSurfaces, accountedSurfaces = nil, nil
+	})
+	dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"version\":123456}")
+	if len(structuralSurfaces) == 0 {
+		t.Fatal("a number equal to a supplied identifier was vouched as grammar")
+	}
+	// AND AN ORDINARY NUMBER IS STILL GRAMMAR.
+	suppliedValues = []string{"1"}
+	structuralSurfaces, accountedSurfaces = nil, nil
+	if got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"version\":7}"))); !strings.Contains(got, `"version":7`) {
+		t.Fatalf("an ordinary number stopped being grammar: %q", got)
+	}
+}
+
+// A container in verdict position is not a scalar the SDK classified.
+func TestTaxonomyIsNotVouchedInsideAContainer(t *testing.T) {
+	suppliedValues = []string{"kill_switch"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\n\r\n{\"code\":[\"kill_switch\"]}")))
+	if strings.Contains(got, "kill_switch") {
+		t.Fatalf("an array element in verdict position was vouched as SDK taxonomy: %q", got)
+	}
+}
+
+// An endpoint-chosen member NAME is a string the endpoint chose.
+func TestNonSchemaMemberNamesAreLengthened(t *testing.T) {
+	structuralSurfaces, accountedSurfaces = nil, nil
+	t.Cleanup(func() { structuralSurfaces, accountedSurfaces = nil, nil })
+	got := stripMarks(dropFraming(
+		"HTTP/1.1 200 OK\r\n\r\n{\"variant_payload\":{\"server-secret-token\":1}}"))
+	if strings.Contains(got, "server-secret-token") {
+		t.Fatalf("a nested endpoint-chosen member name was published: %q", got)
+	}
+	if !strings.Contains(got, `"variant_payload"`) {
+		t.Fatalf("the schema's own member name was lengthened too: %q", got)
+	}
+}
+
+// A minted-field placeholder is generated text; a later pass must not remeasure it.
+func TestAMintedPlaceholderSurvivesTheValuePass(t *testing.T) {
+	structuralSurfaces, accountedSurfaces = nil, nil
+	t.Cleanup(func() { structuralSurfaces, accountedSurfaces = nil, nil })
+	got := stripMarks(dropFraming(
+		"HTTP/1.1 200 OK\r\n\r\n{\"subject_fact_key\":\"sfk1_abcdefghij\"}"))
+	if !strings.Contains(got, "15 chars") && !strings.Contains(got, "redacted-15-chars") {
+		t.Fatalf("the minted identifier's length was replaced by the placeholder's: %q", got)
+	}
+}
+
+// A cookie attribute admitted by SHAPE is not vouched over a supplied value.
+func TestACollidingCookieAttributeValueIsNotVouched(t *testing.T) {
+	suppliedValues = []string{"123456"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; Max-Age=123456\r\n\r\n{\"assigned\":false}")))
+	if strings.Contains(got, "123456") {
+		t.Fatalf("a supplied identifier was vouched as a cookie attribute value: %q", got)
 	}
 }

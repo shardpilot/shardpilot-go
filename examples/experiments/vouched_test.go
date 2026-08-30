@@ -102,7 +102,12 @@ func TestEveryVouchedTokenSurvivesTheScrub(t *testing.T) {
 		// TestAnAdmittedNumericValueIsNotVouchedWhenSupplied, which asserts both
 		// halves: unsupplied it is published, supplied it is not.
 		pv("admitted cookie attribute value", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; SameSite=Lax\r\n\r\n", "Lax"),
-		pv("admitted cookie attribute value", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; Max-Age=10\r\n\r\n", "10"),
+		// ⚠ THE `Max-Age` ROW IS GONE for the reason the `Age` row went: it supplied
+		// `10` and asserted `Max-Age=10` survives, which is the collision a later
+		// finding names as a leak. `Max-Age` is admitted by SHAPE -- an integer -- and
+		// shape says nothing about who chose the value (shardpilot/shardpilot-go#85
+		// review). The `SameSite` rows stay: that vocabulary is ENUMERATED, so its
+		// tokens are the grammar's whoever else also chose them.
 		pv("approved URI scheme", "HTTP/1.1 200 OK\r\nLocation: https://e.example/cb\r\n\r\n", "https"),
 		pv("structural field name", "HTTP/1.1 200 OK\r\nLocation: /cb\r\n\r\n", "Location"),
 		pv("structural field name", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x\r\n\r\n", "Set-Cookie"),
