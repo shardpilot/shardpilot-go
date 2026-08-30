@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1336,5 +1337,111 @@ func TestASanitizerCreatedMarkIsNotEscaped(t *testing.T) {
 		if strings.Contains(got, lit) {
 			t.Fatalf("a mark this program itself generated was escaped as endpoint bytes: %q", got)
 		}
+	}
+}
+
+// ---- round on b7d4c7a ----
+
+// TestIPvFutureNeedsItsWholeGrammar asks `isIPvFuture` directly, NOT through
+// `parsesAsURI`.
+//
+// ⚠ THE FINDING'S PREMISE DOES NOT HOLD ON THIS GO VERSION, measured: `url.Parse`
+// refuses EVERY bracketed IPvFuture form, the well-formed `[v7.abc]` included
+// ("invalid host: ParseAddr: unexpected character"), so the exemption the finding
+// describes is unreachable behind a parse that already failed. This file has
+// recorded the same thing once before, about the bracket check beside it.
+//
+// The grammar stays and is stated here rather than inherited, for the reason the
+// rest of this file stopped borrowing predicates: a future net/url that starts
+// accepting IPvFuture must not silently widen what this program publishes. So the
+// scene exercises the predicate, which is the thing that would then be
+// load-bearing (shardpilot/shardpilot-go#85 review).
+func TestIPvFutureNeedsItsWholeGrammar(t *testing.T) {
+	for _, bad := range []string{"vSERVER-SECRET", "v", "v.abc", "vg7.abc", "v7.", "v7abc"} {
+		if isIPvFuture(bad) {
+			t.Fatalf("a bracketed authority was exempted on its first letter alone: %q", bad)
+		}
+	}
+	// And a well-formed one is still admitted, or the repair is just a refusal.
+	for _, ok := range []string{"v7.abc", "V1f.host:name", "v0.a"} {
+		if !isIPvFuture(ok) {
+			t.Fatalf("a well-formed IPvFuture literal was refused: %q", ok)
+		}
+	}
+}
+
+func TestAScopedIPv6AuthorityIsAccepted(t *testing.T) {
+	if !parsesAsURI("https://[fe80::1%25eth0]/cb") {
+		t.Fatal("a scoped IPv6 redirect Go itself accepts forced a refusal")
+	}
+	if parsesAsURI("https://[fe80::1%25]/cb") {
+		t.Fatal("an empty zone was accepted")
+	}
+}
+
+func TestAValuelessStandardAttributeIsMarked(t *testing.T) {
+	suppliedValues = []string{"Secure"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied(redactSetCookie("Set-Cookie: sid=x; Secure")))
+	if !strings.Contains(got, "Secure") {
+		t.Fatalf("a standard cookie flag was scrubbed into something no parser accepts: %q", got)
+	}
+}
+
+func TestStandardAttributeValuesKeepTheirVocabulary(t *testing.T) {
+	suppliedValues = nil
+	got := stripMarks(redactSetCookie("Set-Cookie: sid=x; SameSite=Lax; Max-Age=10"))
+	for _, want := range []string{"SameSite=Lax", "Max-Age=10"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("a fixed-vocabulary attribute value the criterion admits was lengthened: %q", got)
+		}
+	}
+}
+
+func TestAVouchedCookieNameIsMarked(t *testing.T) {
+	suppliedValues = []string{"experiment_key"}
+	// `nameIsOurs` reads the names the harness actually put on the wire, so the
+	// scene has to put one there: the first version of this test asserted about a
+	// registry it had left empty, and measured the branch it was not aiming at.
+	requestNames = map[string]bool{"experiment_key": true}
+	t.Cleanup(func() { suppliedValues = nil; requestNames = map[string]bool{} })
+	got := stripMarks(scrubSupplied(redactSetCookie("Set-Cookie: experiment_key=x")))
+	if !strings.Contains(got, "experiment_key=") {
+		t.Fatalf("a cookie name this program vouched for was scrubbed: %q", got)
+	}
+}
+
+func TestAnUnparsableBodyRefusesAnUnfamiliarMember(t *testing.T) {
+	structuralSurfaces = nil
+	accountedSurfaces = nil
+	suppliedValues = nil
+	t.Cleanup(func() { structuralSurfaces = nil; accountedSurfaces = nil })
+	redactMintedBody(`{"server_secret_identifier":"x`)
+	if len(refusalLedger()) == 0 {
+		t.Fatal("an unfamiliar member in a body that does not parse stayed publishable")
+	}
+	// ⚠ AND A COMPLETE, ORDINARY BODY STILL PUBLISHES. Failing closed on a parse
+	// failure is one line away from failing closed on everything.
+	structuralSurfaces = nil
+	redactMintedBody(`{"assigned":true,"variant_key":"blue"}`)
+	if len(refusalLedger()) != 0 {
+		t.Fatalf("an ordinary complete body was refused: %q", refusalLedger())
+	}
+}
+
+func TestCoveredSpansAreWalkedInOrder(t *testing.T) {
+	structuralSurfaces = nil
+	suppliedValues = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	// A minted member AFTER many covered ones: a cursor that ran past it would
+	// report the body clean, which is exactly how this optimisation can go wrong.
+	var b strings.Builder
+	b.WriteString(`{`)
+	for i := 0; i < 200; i++ {
+		b.WriteString(`"filler_` + strconv.Itoa(i) + `":"v",`)
+	}
+	b.WriteString(`"subject_fact_key":"sfk1_xxxxxxxxxxxx"}`)
+	if got := redactMintedBody(b.String()); strings.Contains(got, "sfk1_xxxxxxxxxxxx") {
+		t.Fatal("a minted value after many covered spans was published")
 	}
 }

@@ -290,11 +290,67 @@ func parsesAsURI(target string) bool {
 		}
 		lit := host[1 : len(host)-1]
 		if strings.HasPrefix(lit, "v") || strings.HasPrefix(lit, "V") {
-			return true // IPvFuture, whose body this program does not judge
+			// ⚠ THE PREFIX IS NOT THE GRAMMAR. `v` alone admitted
+			// `https://[vSERVER-SECRET]/cb`: Go parses it, the prefix check said
+			// IPvFuture, and the authority was exempted and preserved VERBATIM, so
+			// endpoint-chosen text reached the capture with no structural refusal
+			// (shardpilot/shardpilot-go#85 review). `whose body this program does
+			// not judge` was true of the body and became an excuse for not judging
+			// the shape either. IPvFuture is `v 1*HEXDIG . 1*(unreserved /
+			// sub-delims / :)`, and that is now what is checked.
+			return isIPvFuture(lit)
 		}
-		return net.ParseIP(lit) != nil && strings.Contains(lit, ":")
+		// ⚠ AND A ZONE IS PART OF A VALID IPv6 AUTHORITY. `[fe80::1%25eth0]` is
+		// what RFC 6874 puts on the wire; `url.Parse` accepts it and hands back the
+		// host with `%25` decoded, and `net.ParseIP` then refused the zone suffix --
+		// so a redirect Go itself accepts forced exit 4
+		// (shardpilot/shardpilot-go#85 review). Address and zone are validated
+		// separately, which is the only way either can be judged at all.
+		addr, zone, hasZone := strings.Cut(lit, "%")
+		if hasZone && zone == "" {
+			return false
+		}
+		return net.ParseIP(addr) != nil && strings.Contains(addr, ":")
 	}
 	return true
+}
+
+// isIPvFuture is the grammar RFC 3986 gives for the bracketed authority form
+// this program does not otherwise judge: "v" 1*HEXDIG "." 1*( unreserved /
+// sub-delims / ":" ). Written out because a prefix test admitted anything
+// beginning with the letter.
+func isIPvFuture(lit string) bool {
+	if len(lit) < 4 || (lit[0] != 'v' && lit[0] != 'V') {
+		return false
+	}
+	i := 1
+	for i < len(lit) && isHexDigit(lit[i]) {
+		i++
+	}
+	if i == 1 || i >= len(lit) || lit[i] != '.' {
+		return false
+	}
+	body := lit[i+1:]
+	if body == "" {
+		return false
+	}
+	for j := 0; j < len(body); j++ {
+		if !isIPvFutureByte(body[j]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isHexDigit(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+func isIPvFutureByte(c byte) bool {
+	if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+		return true
+	}
+	return strings.IndexByte("-._~!$&'()*+,;=:", c) >= 0
 }
 
 func redactTarget(line string) string {
@@ -469,6 +525,15 @@ func redactSetCookie(line string) string {
 	// provenance the harness can attest to.
 	if !nameIsOurs(name) {
 		name = tokenPlaceholder(name)
+	} else {
+		// ⚠ VOUCHED FOR IS NOT THE SAME AS CAPTURED. When a supplied identifier
+		// equals a request parameter name -- the experiment key spelled
+		// `experiment_key` -- and the endpoint sets a cookie of that name, this
+		// branch left it as captured text and `scrubSupplied` rewrote it to
+		// `<redacted, 14 chars>`: not a cookie name, and approved
+		// (shardpilot/shardpilot-go#85 review). The query-name path already marks
+		// its vouched-for names; this one did not.
+		name = marked(name)
 	}
 	// Measured before `escapeMarks` lengthened it, exactly as redactUnlessVerbatim
 	// does -- the structural path had kept the older behaviour
@@ -499,6 +564,12 @@ func redactSetCookie(line string) string {
 				// have no value by specification; anything else without one is a
 				// string the origin invented.
 				if standardCookieAttr(an) {
+					// ⚠ MARKED, NOT MERELY KEPT. Left as captured text, a flag whose
+					// name equals a supplied identifier -- `Secure` -- reached
+					// `scrubSupplied` and became `<redacted, 6 chars>`: no longer a
+					// cookie flag, and approved because a placeholder is generated
+					// (shardpilot/shardpilot-go#85 review).
+					parts[i] = markAttrName(an)
 					continue
 				}
 				{
@@ -521,14 +592,25 @@ func redactSetCookie(line string) string {
 					"=" + placeholder(ows(av))
 				continue
 			}
+			// ⚠ CLASSIFY THE ORIGINAL NAME, THEN MARK IT. Run the other way round,
+			// `an` was already wrapped in provenance marks when the predicate saw it,
+			// so `cookieAttrVerbatim` could never recognise `Max-Age`, `Expires` or
+			// `SameSite` -- and ordinary values the documented fixed-vocabulary
+			// criterion admits, `SameSite=Lax` and `Max-Age=10`, were ALWAYS replaced
+			// by a length (shardpilot/shardpilot-go#85 review). The registry asks about
+			// the RECEIVED name; the marking is about who vouches for it. Third time
+			// this file has had to learn that order, after the field-name registry and
+			// the query parameter names.
+			verbatim := cookieAttrVerbatim(an, ows(av))
 			if standardCookieAttr(an) {
 				// Marked for the same reason a vouched-for parameter name is: the
 				// value scrub would otherwise rewrite `Path` into a prose
 				// placeholder and produce an attribute no cookie parser accepts
 				// (shardpilot/shardpilot-go#85 review).
-				an = marked(an)
+				an = markAttrName(an)
 			}
-			if cookieAttrVerbatim(an, ows(av)) {
+			if verbatim {
+				parts[i] = an + "=" + av
 				continue
 			}
 			parts[i] = an + "=" + placeholder(ows(av))
@@ -536,6 +618,25 @@ func redactSetCookie(line string) string {
 		out += ";" + strings.Join(parts, ";")
 	}
 	return out + cr
+}
+
+// markAttrName marks a cookie attribute NAME as generated while keeping the
+// whitespace around it: the surrounding OWS is captured layout, and the name is
+// what this program vouches for.
+//
+// ⚠ VOUCHING FOR A NAME AND LEAVING IT AS CAPTURED TEXT IS ONE DEFECT IN THREE
+// PLACES, and the review found all three in one round: a valueless standard
+// flag, a standard attribute marked on only one branch, and the cookie's own
+// name when `nameIsOurs` vouched for it. Each survived to `scrubSupplied`, which
+// rewrote it into a prose placeholder and produced a cookie no parser accepts --
+// while the guard approved the line, because a placeholder is generated
+// (shardpilot/shardpilot-go#85 review).
+func markAttrName(an string) string {
+	name := ows(an)
+	if name == "" {
+		return an
+	}
+	return strings.Replace(an, name, marked(name), 1)
 }
 
 // redactUserinfo removes `user:password@` from a redirect target.
@@ -652,13 +753,24 @@ func redactMintedBody(body string) string {
 	// scan runs on the ORIGINAL body and skips the spans the value pattern
 	// covered, so it reports only shapes that pattern could not describe.
 	covered := jsonMemberValue.FindAllStringIndex(body, -1)
+	// ⚠ ONE CURSOR, NOT A RESCAN PER MATCH. Both lists come from
+	// `FindAllStringIndex` and are therefore ASCENDING, and this walked `covered`
+	// from the beginning for every member name -- quadratic on a body with many
+	// members even when no minted field exists, so a valid response near the
+	// capture limit spent many seconds here AFTER the bounded HTTP operation had
+	// finished (shardpilot/shardpilot-go#85 review). The callers below consume
+	// their matches in order, which is what makes a cursor correct rather than
+	// merely faster; it is asserted rather than assumed.
+	cur, last := 0, -1
 	inCovered := func(i int) bool {
-		for _, c := range covered {
-			if i >= c[0] && i < c[1] {
-				return true
-			}
+		if i < last {
+			panic("inCovered called out of order: the cursor's premise does not hold")
 		}
-		return false
+		last = i
+		for cur < len(covered) && covered[cur][1] <= i {
+			cur++
+		}
+		return cur < len(covered) && i >= covered[cur][0] && i < covered[cur][1]
 	}
 	// ⚠ AND THE REFUSAL IS TOP-LEVEL ONLY, as the guard half's detection is.
 	// `encoding/json` binds the SDK's field from the top-level object; a member of
@@ -687,9 +799,27 @@ func redactMintedBody(body string) string {
 	// across the stack seam: the guard half REFUSED such a body, which is the only
 	// thing it could do; this half redacts it, so what it owes is the record).
 	if topLevelMembers(body) == nil && strings.Contains(body, "{") {
+		// ⚠ INDETERMINATE FOR EVERY MEMBER, NOT ONLY THE MINTED ONE. The round
+		// before, this branch covered minted names and left the unfamiliar-member
+		// guard above it silent: for `{"server_secret_identifier":"x` the parse
+		// fails, that range does not run, and the endpoint-chosen name AND its
+		// value were published -- while the SAME member in complete JSON is
+		// refused (shardpilot/shardpilot-go#85 review). A fix that covers one
+		// branch of a question answers the question for one branch.
+		//
+		// Fail closed BEFORE the benign-name allowance, because that allowance
+		// rests on knowing the member is top-level, which is exactly what a failed
+		// parse cannot tell us.
 		for _, m := range jsonMemberName.FindAllStringSubmatch(body, -1) {
-			if isMinted(m[1]) {
+			dec, ok := jsonString(m[1])
+			if !ok {
+				dec = m[1]
+			}
+			switch {
+			case isMinted(m[1]):
 				noteAccounted("a server-minted subject identifier in a body that does not parse")
+			case !isBenignName(dec):
+				noteStructural("a member of a body that does not parse, in a shape this program has not judged")
 			}
 		}
 	}
