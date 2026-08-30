@@ -1097,7 +1097,17 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 	// a connection-option, and never received (shardpilot/shardpilot-go#84
 	// review). The earlier fix distinguished the two PROTOCOLS, which was the
 	// right distinction for the case it was shown and not the question.
-	ex.recvConn = resp.Header.Get("Connection") != ""
+	// ⚠ PRESENCE, NOT THE FIRST VALUE. `Header.Get` returns the FIRST value, so a
+	// response sending `Connection:` and then `Connection: YmFy` reported the
+	// field as absent -- both lines were marked serialiser-generated and the guard
+	// skipped a directly decodable identifier (shardpilot/shardpilot-go#84
+	// review). Map membership answers the question that was asked; `Get` answers a
+	// question about a value.
+	//
+	// Third round on this one line, and each fix was correct for the case it was
+	// shown: the protocol was an approximation to the question, the global was the
+	// wrong place to keep the answer, and this was the wrong way to ask it.
+	_, ex.recvConn = resp.Header["Connection"]
 	if d, derr := httputil.DumpResponse(resp, false); derr == nil {
 		ex.head = d
 	}
