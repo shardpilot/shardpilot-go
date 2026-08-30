@@ -2214,3 +2214,56 @@ func TestTheIdentityBranchAdmitsItsFieldNameAndSpelling(t *testing.T) {
 		t.Fatalf("a supplied identifier survived in the field name: %q", got)
 	}
 }
+
+// A media type is recognised by folding and vouched by spelling.
+func TestOnlyACanonicalMediaTypeSpellingIsVouched(t *testing.T) {
+	suppliedValues = []string{"APPLICATION"}
+	got := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\nContent-Type: APPLICATION/JSON\r\n\r\n{\"assigned\":false}")))
+	suppliedValues = nil
+	if strings.Contains(got, "APPLICATION") {
+		t.Fatalf("a non-canonical media-type spelling was vouched: %q", got)
+	}
+	suppliedValues = []string{"application/json"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if v := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"assigned\":false}"))); !strings.Contains(v, "application/json") {
+		t.Fatalf("the canonical spelling lost its vouching: %q", v)
+	}
+}
+
+// One notion, one threshold: the scrub and the guard must agree about "short".
+func TestTheGuardsThresholdMatchesTheScrubs(t *testing.T) {
+	suppliedValues = []string{"éééé"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured("αééééβ")); err != nil {
+		t.Fatalf("the guard refused text the scrub deliberately left alone: %v", err)
+	}
+}
+
+// The undecodable-coding refusal is about what a body could hide.
+func TestACodingWithNoBodyIsNotRefused(t *testing.T) {
+	structuralSurfaces = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	dropFraming("HTTP/1.1 204 No Content\r\nContent-Encoding: br\r\n\r\n")
+	if len(structuralSurfaces) != 0 {
+		t.Fatalf("a coding on an empty body was refused: %v", structuralSurfaces)
+	}
+	// AND A CODING WITH A BODY STILL IS.
+	structuralSurfaces = nil
+	dropFraming("HTTP/1.1 200 OK\r\nContent-Encoding: br\r\n\r\n\x1f\x8b\x08")
+	if len(structuralSurfaces) == 0 {
+		t.Fatal("an undecodable coding over a real body stopped being refused")
+	}
+}
+
+// Inside a field NAME, every token punctuation separates -- including `_`.
+func TestAnUnderscoreSeparatesInsideAFieldName(t *testing.T) {
+	suppliedValues = []string{"bar"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\nX_bar: v\r\n\r\n{\"assigned\":false}")))
+	if strings.Contains(got, "bar") {
+		t.Fatalf("a supplied identifier survived in a field name across an underscore: %q", got)
+	}
+}
