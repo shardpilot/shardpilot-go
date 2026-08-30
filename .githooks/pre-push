@@ -855,7 +855,32 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         # repository (shardpilot/shardpilot-go#79 review). Nothing is published
         # there, so there is no baseline to be wrong about: every introduced commit
         # is new, and the empty tree says exactly that.
-        if [ -z "$(git ls-remote -- "$dest" 2>/dev/null | head -1)" ]; then
+        # ⚠ EMPTY OUTPUT FROM A FAILED COMMAND IS NOT AN EMPTY DESTINATION. The
+        # status and stderr were discarded, so a transient failure of THIS
+        # enumeration read as "advertises no refs at all" -- and the hook then
+        # exited 0 with the base ref unset, bypassing the ratchet, on a destination
+        # that has refs (shardpilot/shardpilot-go#79 review). Reproduced with a bare
+        # remote holding `refs/heads/main` and a dangling HEAD.
+        #
+        # The status is captured, and `--exit-code` makes the two answers
+        # distinguishable: 0 with rows, 2 for "no matching refs", anything else is a
+        # failure. Only 2 means empty; a failure refuses.
+        # ⚠ NO PIPELINE HERE: `$?` AFTER `git … | head -1` IS `head`'S STATUS, and
+        # `head` succeeds on empty input, so the capture would report success for
+        # every outcome -- the same defect this finding is about, one layer along. My
+        # first version of this fix had it, and the probe I wrote to check the
+        # statuses had it too: all three cases reported 0 until the pipe came out.
+        # Measured without it: empty → 2, nonempty → 0, unreachable → 128.
+        ls_out="$(git ls-remote --exit-code -- "$dest" 2>/dev/null)"
+        ls_rc=$?
+        if [ "$ls_rc" -ne 0 ] && [ "$ls_rc" -ne 2 ]; then
+          printf 'REFUSING: could not enumerate the refs of %s (git exited %s).\n' "$safe_dest" "$ls_rc" >&2
+          printf '  An enumeration that failed prints nothing, and nothing reads as\n' >&2
+          printf '  "this destination is empty" -- which unsets the baseline and lets\n' >&2
+          printf '  the ratchet through on a repository that has refs.\n' >&2
+          exit 2
+        fi
+        if [ "$ls_rc" -eq 2 ]; then
           unborn=yes
           base="$(git hash-object -t tree /dev/null)"
           why="the empty tree, because $safe_dest advertises no refs at all"
