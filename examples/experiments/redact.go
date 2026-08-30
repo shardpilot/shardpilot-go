@@ -502,6 +502,20 @@ func vouchScheme(line string) string {
 	switch strings.ToLower(bare) {
 	case "http", "https":
 		if !canonicalSpelling(bare, strings.ToLower(bare)) {
+			// ⚠ DECLINING TO VOUCH IS NOT THE SAME AS LEAVING IT TO THE PROSE SCRUB.
+			// A non-canonical spelling that also equals a supplied identifier reached
+			// `scrubSupplied` and became `<redacted, 5 chars>://e.example/...` -- spaces,
+			// a comma and angle brackets, which no URI grammar admits -- while the guard
+			// approved it because a placeholder is generated
+			// (shardpilot/shardpilot-go#85 review). The valueless-cookie-flag branch in
+			// this file already answers this, and the answer was applied where it was
+			// shown rather than to the shape.
+			//
+			// Only where it COLLIDES: a non-canonical scheme that is nobody's identifier
+			// is endpoint text and is published as received.
+			if scrubSuppliedRaw(bare) != bare {
+				return line[:j+1] + tokenPlaceholder(bare) + line[i:]
+			}
 			return line
 		}
 		return line[:j+1] + vouched(sch) + line[i:]
@@ -930,6 +944,15 @@ func redactSetCookie(line string) string {
 				// placeholder and produce an attribute no cookie parser accepts
 				// (shardpilot/shardpilot-go#85 review).
 				an = markAttrName(an)
+			} else if scrubSuppliedRaw(ows(an)) != ows(an) {
+				// ⚠ AND THE NON-CANONICAL SPELLING NEEDS THE SAME PROTECTION. Restricting
+				// the vouch to the canonical case was right and left `PATH=/` with a
+				// supplied `PATH` for the prose scrub, which produced
+				// `<redacted, 4 chars>=` -- spaces, a comma and angle brackets are not
+				// cookie attribute-name bytes, so the structure-preserving capture was
+				// malformed and approved (shardpilot/shardpilot-go#85 review). Declining
+				// to vouch is not the same as declining to keep the syntax.
+				an = strings.Replace(an, ows(an), tokenPlaceholder(ows(an)), 1)
 			}
 			// ⚠ AND ONLY IF THE ARRIVED SPELLING IS THE CANONICAL ONE. The predicate
 			// folds -- `SameSite=LAX` is a legal cookie -- so vouching the received
@@ -1167,6 +1190,13 @@ func anyMarked(inMark []bool, a, b int) bool {
 	return false
 }
 
+// sdkVerdictFields are the TOP-LEVEL members whose value this SDK writes as its
+// own classification. Named once, so a scene cannot assert a position the code
+// does not vouch at -- four fixtures asserted `code` was one and pinned the wrong
+// half of the rule until the wire contract was read
+// (shardpilot/shardpilot-go#85 review).
+var sdkVerdictFields = map[string]bool{"reason": true}
+
 func redactUnaccountedJSONValues(body string) string {
 	// ⚠ A PATTERN OVER MEMBER-COLON-STRING IS NOT A TRAVERSAL. The first version
 	// matched only a string immediately after a member's colon, so
@@ -1208,10 +1238,21 @@ func redactUnaccountedJSONValues(body string) string {
 		// ineffective duplicates can be demoted once the whole document is known.
 		vouchedField string
 		raw          string
+		// ⚠ AND THE OCCURRENCE'S ORDINAL, COUNTED OVER EVERY VALUE AT THAT MEMBER.
+		// The first version of the demotion recorded only VOUCHED spans, so a final
+		// duplicate whose value is not taxonomy never entered the map and the earlier
+		// vouch survived as the last one it knew about:
+		// `{"code":"kill_switch","code":"anything"}` published the identifier while
+		// the decoder classifies `anything` (shardpilot/shardpilot-go#85 review). What
+		// decides is WHICH occurrence the decoder uses, and that is a fact about the
+		// document, not about the values this program happens to recognise.
+		verdictOrd int
 	}
 	var spans []span
 	var depth []int8 // 0 = array, 1 = object expecting KEY, 2 = object expecting VALUE
 	verdictField := ""
+	verdictSeen := map[string]int{}
+	verdictOrd := 0
 	for {
 		off := int(dec.InputOffset())
 		_ = off
@@ -1263,6 +1304,11 @@ func redactUnaccountedJSONValues(body string) string {
 			name, isStr := tok.(string)
 			if isStr && atRoot {
 				verdictField = name
+				// Counted for EVERY root member, whatever its value turns out to be --
+				// including a value this traversal produces no span for, such as a
+				// number, which is still the occurrence the decoder keeps.
+				verdictSeen[name]++
+				verdictOrd = verdictSeen[name]
 			} else {
 				verdictField = ""
 			}
@@ -1286,7 +1332,7 @@ func redactUnaccountedJSONValues(body string) string {
 				k, end := kq, ke
 				if k >= 0 && !anyMarked(inMark, k, end) {
 					noteAccounted(formBody, "an endpoint-chosen member name in a parsed response body")
-					spans = append(spans, span{back[k], back[end-1] + 1, `"` + tokenPlaceholder(name) + `"`, "", name})
+					spans = append(spans, span{back[k], back[end-1] + 1, `"` + tokenPlaceholder(name) + `"`, "", name, 0})
 				}
 			}
 			continue
@@ -1337,17 +1383,26 @@ func redactUnaccountedJSONValues(body string) string {
 		// classification -- `"variant_payload":{"note":"kill_switch"}` with that key
 		// supplied (shardpilot/shardpilot-go#85 review). A value is not evidence of
 		// its author; the POSITION is.
-		if sdkTaxonomy[str] && (verdictField == "code" || verdictField == "reason") {
+		// ⚠ AND `code` IS NOT A POSITION THIS SDK WRITES AT. It is not a member of
+		// `expAssignmentWire` at all, and the ingest error envelope spells it
+		// `error.code` -- NESTED, which this root-only rule never reaches. The SDK
+		// synthesizes `ExperimentAssignmentResult.Code` from the HTTP outcome instead,
+		// so a root `code` in a body is endpoint-chosen text end to end, and vouching
+		// it published a supplied `kill_switch` from `{"assigned":false,"code":...}`
+		// (shardpilot/shardpilot-go#85 review). The position was checked against the
+		// vocabulary rather than against the wire contract, which is the same mistake
+		// the top-level name registry made one round earlier.
+		if sdkTaxonomy[str] && sdkVerdictFields[verdictField] {
 			// ⚠ THE SPAN INCLUDES THE QUOTES, SO THE REPLACEMENT MUST TOO. Emitting
 			// only `marked(str)` produced `{"code":kill_switch}` after the marks are
 			// stripped -- invalid JSON, which the body rule then refused, so EVERY
 			// ordinary verdict capture was withheld with exit 4
 			// (shardpilot/shardpilot-go#85 review). The neighbouring branch got this
 			// right and this one did not, in the same expression.
-			spans = append(spans, span{back[k], back[end-1] + 1, `"` + marked(str) + `"`, verdictField, str})
+			spans = append(spans, span{back[k], back[end-1] + 1, `"` + marked(str) + `"`, verdictField, str, verdictOrd})
 		} else {
 			noteAccounted(formBody, "an endpoint-chosen value in a parsed response body")
-			spans = append(spans, span{back[k], back[end-1] + 1, `"` + tokenPlaceholder(str) + `"`, "", str})
+			spans = append(spans, span{back[k], back[end-1] + 1, `"` + tokenPlaceholder(str) + `"`, "", str, verdictOrd})
 		}
 		verdictField = ""
 	}
@@ -1374,14 +1429,8 @@ func redactUnaccountedJSONValues(body string) string {
 	// decodes such a body without complaint, so refusing it would reject a capture
 	// this program can describe. The ineffective occurrence is endpoint-chosen text
 	// like any other, and it is accounted for as such.
-	lastVouch := map[string]int{}
-	for i, sp := range spans {
-		if sp.vouchedField != "" {
-			lastVouch[sp.vouchedField] = i
-		}
-	}
 	for i := range spans {
-		if f := spans[i].vouchedField; f != "" && lastVouch[f] != i {
+		if f := spans[i].vouchedField; f != "" && spans[i].verdictOrd != verdictSeen[f] {
 			noteAccounted(formBody, "an endpoint-chosen value in a parsed response body")
 			spans[i].val = `"` + tokenPlaceholder(spans[i].raw) + `"`
 		}

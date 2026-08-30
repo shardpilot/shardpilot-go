@@ -157,6 +157,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -165,6 +167,7 @@ import (
 	"html"
 	"io"
 	"maps"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -175,6 +178,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode"
 	"unicode/utf16"
@@ -700,7 +704,12 @@ var benignTopLevel = map[string]bool{
 	// `{"error":"unauthorized"}` and a failure verdict carries `code`. These two
 	// belong to a DIFFERENT wire shape than the assignment, which is why the
 	// scene names them explicitly rather than deriving them.
-	"error": true, "code": true, "app_key": true, "environment_key": true,
+	// ⚠ `code` IS NOT AMONG THEM, THOUGH IT WAS. It is a member of no top-level
+	// shape: the ingest error envelope spells it `error.code`, nested, and the
+	// assignment struct has no such member -- the SDK synthesizes its `Code` from
+	// the HTTP outcome (shardpilot/shardpilot-go#85 review). Exempting it marked
+	// an endpoint-controlled member name as generated grammar.
+	"error": true, "app_key": true, "environment_key": true,
 }
 
 // receivedConnection records whether the ENDPOINT sent a `Connection` field, as
@@ -2058,93 +2067,6 @@ func redact(dump []byte, ours http.Header) []byte {
 // alike, so a run cannot end on a limit none of them was given.
 const captureDeadline = 30 * time.Second
 
-// noteStructuralInText applies the response path's REFUSAL question to text that
-// never became a response.
-//
-// ⚠ A TRANSPORT ERROR CARRIES THE OFFENDING LINE. Go rejects a malformed response
-// before returning one, and puts the complete bad header into the error — so
-// `Set-Cookie: session=<server value>` reached the report through the error
-// diagnostic, where only the supplied-value scrub ran: `dropFraming` never saw it,
-// nothing was added to structuralSurfaces, and the guard has no supplied value to
-// match a server-minted cookie against (shardpilot/shardpilot-go#84 review).
-//
-// The fields are the ones the response path already treats as server-generated.
-// This half REFUSES them; the change stacked on it redacts them, and inherits this
-// question rather than restating it.
-func noteStructuralInText(text string) {
-	for _, ln := range strings.Split(text, "\n") {
-		low := strings.ToLower(strings.TrimSpace(stripMarks(ln)))
-		// ⚠ CONTAINS, NOT HasPrefix. Go wraps the offending line in prose and quotes
-		// -- `malformed HTTP response "Set-Cookie: …"` -- so a prefix test never
-		// matched the shape the finding is about. Over-refusing an error diagnostic
-		// that merely mentions one of these fields is the safe direction, and the
-		// scene guards the other: an ordinary transport failure must stay reportable.
-		// ⚠ AND THE MINTED-FIELD QUESTION. An endpoint can make its malformed first
-		// line a JSON object carrying the subject key, and Go puts that whole line in
-		// the error -- so the value reached the report through the diagnostic, where
-		// no supplied value can match it and no body scan runs
-		// (shardpilot/shardpilot-go#84 review). The question is about TEXT, not about
-		// a body: asking it only where a body exists is asking it about the parse.
-		// ⚠ THE NAMES ARE ESCAPED HERE. Go quotes the offending line, so the member
-		// names arrive as `\"subject_fact_key\"` and the JSON member pattern -- which
-		// expects a bare quote -- matched nothing. The check runs over identifier
-		// tokens instead, which is the shape that survives any quoting.
-		// ⚠ THE ESCAPES SURVIVE GO'S QUOTING AND NOT THIS SCAN. A malformed first
-		// line may spell the member as `subject_\u0066act_key`, and splitting on
-		// non-identifier bytes cuts that into `subject_` and `u0066act_key` --
-		// neither of which is the name (shardpilot/shardpilot-go#84 review). My
-		// previous fix here moved from the JSON pattern to identifier tokens
-		// because the QUOTING defeated the pattern, and then met the escaping the
-		// rest of this program already decodes everywhere else. The line is decoded
-		// first, and both spellings are scanned: a decode can also join two names.
-		// ⚠ TO A FIXED POINT, NOT ONE PASS EACH. `net/http` QUOTES the offending line
-		// into the error it returns, so a member spelled `subject_\u0066act_key` on
-		// the wire arrives here with TWO backslashes -- one pass reduces that to
-		// `\u0066` and stops, and no scanned token equals the name
-		// (shardpilot/shardpilot-go#84 review). Quoting adds a layer; a decoder
-		// applied once removes one layer. The bound is the length, because each pass
-		// that changes anything removes at least one byte.
-		forms := []string{ln}
-		cur := ln
-		for k := 0; k <= len(ln); k++ {
-			next := undoPercent(undoUnicodeEscapes(cur))
-			if next == cur {
-				break
-			}
-			cur = next
-			forms = append(forms, cur)
-		}
-		for _, form := range forms {
-			// ⚠ THE TOKENISER'S ALPHABET MUST BE AS WIDE AS THE PREDICATE'S.
-			// `isMintedName` folds the way `encoding/json` does, so it MATCHES
-			// `ſubject_fact_key` -- and this splitter, being ASCII-only, cut the name
-			// at `ſ` and never handed it that token (shardpilot/shardpilot-go#84
-			// review). A candidate the predicate would accept but the splitter cannot
-			// produce is a predicate that is never asked.
-			for _, tok := range strings.FieldsFunc(form, func(r rune) bool {
-				return !(r == '_' || r == '-' || isWordRune(r))
-			}) {
-				if isMintedName(tok) {
-					noteStructural(formDiagnostic, "a server-minted field inside a transport error")
-				}
-			}
-		}
-		// ⚠ THE THIRD SITE ASKING THE SAME QUESTION, and it had its own answer too.
-		// This one listed all four names while the trailer report listed two, which
-		// is how the drift stayed invisible: whichever site you read, it looked
-		// complete (shardpilot/shardpilot-go#84 review). All three read
-		// `serverMintedFields` now. Sorted, so a line naming two fields notes them
-		// in a fixed order rather than in map order.
-		// A `switch` would stop at the first match; an error line is free-form text
-		// and can carry more than one field, so every match is noted.
-		for _, name := range slices.Sorted(maps.Keys(serverMintedFields)) {
-			if strings.Contains(low, name+":") {
-				noteStructural(formField, serverMintedFields[name]+" inside a transport error")
-			}
-		}
-	}
-}
-
 // sanitize redacts any request URL an error carries. `url.Error` wraps the FULL
 // url, so printing a deadline or transport failure verbatim republished the
 // unredacted subject_key and every targeting value -- the same leak the request
@@ -2159,6 +2081,135 @@ func noteStructuralInText(text string) {
 // sanitizeCaptured is for the REPORT, where the guard reads it. sanitize is for
 // stderr, which the guard never sees and where a marker byte would print as a
 // raw control character.
+// stdErrToken admits a token the STANDARD LIBRARY chose, and refuses anything
+// else. `Op`, `Net` and `Syscall` are set by Go from fixed strings, and this says
+// so as a check rather than as a belief: if one of them ever carries something
+// else, the describer refuses instead of publishing it.
+func stdErrToken(s string) (string, bool) {
+	if s == "" || len(s) > 32 {
+		return "", false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') &&
+			!(c >= '0' && c <= '9') && c != '-' && c != '_' {
+			return "", false
+		}
+	}
+	return s, true
+}
+
+// describeTransportError renders a transport failure from the error VALUE, never
+// from its rendered text.
+//
+// ⚠ `err.Error()` IS WHERE ENDPOINT DATA IS FUSED INTO PROSE, AND THE VALUE DOES
+// NOT FUSE IT. The redaction this replaces asked which EXTENTS of a rendered
+// message to remove, and that is an enumeration maintained by hand against a
+// moving surface: `x509: certificate is valid for server-secret-token.internal,
+// not configured.example` carries certificate-controlled names with no quotes
+// around them, so a rule about quoted extents left them standing and the ledger
+// was empty (shardpilot/shardpilot-go#85 review).
+//
+// The decisive fact is that `x509.HostnameError` HAS NO FIELD holding that list:
+// `Error()` builds it from `Certificate.DNSNames`. Working from the value, the
+// names are not redacted -- they are never taken. What is published is their
+// COUNT and whether the configured host is among them, which is what an operator
+// needs and is ours by construction.
+//
+// The set of types is not closed either, and that is stated rather than hidden:
+// `OpError.Err` is an `error` and may be anything. So an unrecognised type is a
+// REFUSAL naming the type, and no branch of this function can reach `Error()`.
+// The difference from a rule about quotes is that the refusal now fires on an
+// unknown TYPE, which is a property of this program's coverage, instead of on the
+// absence of a punctuation mark, which is a property of someone else's prose.
+func describeTransportError(err error, depth int) (string, bool) {
+	if err == nil || depth > 8 {
+		return "", false
+	}
+	switch e := err.(type) {
+	case *url.Error:
+		op, ok := stdErrToken(e.Op)
+		inner, innerOK := describeTransportError(e.Err, depth+1)
+		if !ok || !innerOK {
+			return "", false
+		}
+		return "op=" + op + " " + inner, true
+	case *net.OpError:
+		op, ok := stdErrToken(e.Op)
+		if !ok {
+			return "", false
+		}
+		out := "op=" + op
+		if e.Net != "" {
+			n, ok := stdErrToken(e.Net)
+			if !ok {
+				return "", false
+			}
+			out += " net=" + n
+		}
+		// ⚠ NEITHER `Addr` NOR `Source` IS PUBLISHED. The destination is already in
+		// the report as the CONFIGURED target; the address in the error is what
+		// resolution produced, which is infrastructure this program was not asked to
+		// disclose.
+		inner, innerOK := describeTransportError(e.Err, depth+1)
+		if !innerOK {
+			return "", false
+		}
+		return out + " " + inner, true
+	case *os.SyscallError:
+		call, ok := stdErrToken(e.Syscall)
+		inner, innerOK := describeTransportError(e.Err, depth+1)
+		if !ok || !innerOK {
+			return "", false
+		}
+		return "syscall=" + call + " " + inner, true
+	case syscall.Errno:
+		return "errno=" + strconv.Itoa(int(e)), true
+	case *net.DNSError:
+		// ⚠ THE BOOLEANS, NOT `Err`, `Name` OR `Server`. `Err` is a message string,
+		// `Name` is the host this program configured and already publishes as the
+		// target, and `Server` is the resolver -- infrastructure nobody asked this
+		// program to disclose. What an operator needs is which KIND of lookup failure
+		// it was, and the three flags say exactly that.
+		return "dns=lookup not-found=" + strconv.FormatBool(e.IsNotFound) +
+			" timeout=" + strconv.FormatBool(e.IsTimeout) +
+			" temporary=" + strconv.FormatBool(e.IsTemporary), true
+	case *tls.CertificateVerificationError:
+		inner, ok := describeTransportError(e.Err, depth+1)
+		if !ok {
+			return "", false
+		}
+		return "tls=verification " + inner, true
+	case *x509.HostnameError:
+		names, listed := 0, false
+		if e.Certificate != nil {
+			names = len(e.Certificate.DNSNames)
+			for _, d := range e.Certificate.DNSNames {
+				if d == e.Host {
+					listed = true
+				}
+			}
+		}
+		return "x509=hostname-mismatch names=" + strconv.Itoa(names) +
+			" configured-host-listed=" + strconv.FormatBool(listed), true
+	case x509.UnknownAuthorityError:
+		return "x509=unknown-authority", true
+	case x509.CertificateInvalidError:
+		return "x509=certificate-invalid reason=" + strconv.Itoa(int(e.Reason)), true
+	}
+	switch {
+	case errors.Is(err, io.EOF):
+		return "eof", true
+	case errors.Is(err, io.ErrUnexpectedEOF):
+		return "unexpected-eof", true
+	case errors.Is(err, context.DeadlineExceeded):
+		return "deadline-exceeded", true
+	case errors.Is(err, context.Canceled):
+		return "canceled", true
+	}
+	return "", false
+}
+
 func sanitizeCaptured(err error) string {
 	// ⚠ ESCAPE FIRST. Go puts the offending line into the error verbatim, so an
 	// endpoint can put the guard's own reserved bytes there -- and an
@@ -2178,92 +2229,17 @@ func sanitizeCaptured(err error) string {
 	if err == nil {
 		return asCaptured("")
 	}
-	noteStructuralInText(err.Error())
-	// ⚠ AND THE QUOTED EXTENT IS ENDPOINT TEXT, WHOLESALE. The clause above says
-	// "everything else replaced by its length", and this path did not honour it:
-	// `sanitizeText` redacts queries and `scrubSupplied` redacts what THIS program
-	// supplied, while `noteStructuralInText` refuses only names it RECOGNISES. Go
-	// puts the offending line into the message verbatim -- `malformed HTTP
-	// response "server-secret-token"` -- so an endpoint-minted credential that is
-	// neither a query, nor supplied, nor a known name was published, the refusal
-	// ledger stayed empty, and the report went out
-	// (shardpilot/shardpilot-go#85 review). Recognition cannot be the criterion for
-	// a value nobody has seen before.
-	//
-	// The quoted span is exactly the extent Go marks as the endpoint's, so it is
-	// replaced by its length and ACCOUNTED for -- a capture, not a refusal, because
-	// the extent IS determinable here. Prose outside the quotes is Go's.
-	// ⚠ MEASURED ON THE RAW TEXT, AND ESCAPED ONLY WHERE IT IS STILL CAPTURED.
-	// Escaping first EXPANDS backslash runs, which breaks `strconv.Unquote` and
-	// makes the placeholder describe the transport spelling: a ten-character
-	// `server<NUL>tok` was reported as 14, and unescaping before measuring only
-	// moved it to 12 (shardpilot/shardpilot-go#85 review). The rule this file
-	// already states -- escape before the stages that create marks of their own --
-	// is satisfied by `overCaptured`, which applies the escape to the captured
-	// parts and leaves the generated placeholders alone.
-	// ⚠ AND THE SDK'S OWN CLASSIFICATION IS VOUCHED BEFORE THE SCRUB. The taxonomy
-	// reaches this printer too, and applied to the RESULT the classification is
-	// already a placeholder by the time the marking runs -- structural first, scrub
-	// second, as everywhere else (shardpilot/shardpilot-go#84 review, carried across
-	// the seam onto this branch's own extent redaction).
-	return asCaptured(scrubSupplied(sanitizeText(vouchTaxonomyIn(redactQuotedExtents(err.Error())))))
-}
-
-// redactQuotedExtents replaces each double-quoted span with a placeholder for its
-// length. Go quotes the endpoint-controlled part of a transport diagnostic, and
-// that is the only part of the message this program did not write.
-func redactQuotedExtents(text string) string {
-	var b strings.Builder
-	for i := 0; i < len(text); {
-		if text[i] != '"' {
-			// ⚠ THE ESCAPE LIVES HERE NOW, AND ONLY OUTSIDE THE QUOTES. Escaping the
-			// whole message first expanded backslash runs, broke `strconv.Unquote` and
-			// made the placeholder describe the transport spelling. Escaping the whole
-			// message AFTERWARDS is worse: it cannot tell a mark this program inserted
-			// from one the ENDPOINT spelled, which is the injection the escape exists
-			// to stop -- and moving it there turned that fixture red immediately
-			// (shardpilot/shardpilot-go#85 review). Split by extent: outside the
-			// quotes the bytes are the endpoint's and are escaped; inside, nothing of
-			// the endpoint's survives to escape.
-			b.WriteString(escapeMarks(text[i : i+1]))
-			i++
-			continue
-		}
-		j := i + 1
-		for j < len(text) {
-			if text[j] == '\\' && j+1 < len(text) {
-				j += 2
-				continue
-			}
-			if text[j] == '"' {
-				break
-			}
-			j++
-		}
-		if j >= len(text) {
-			// An unterminated quote has no determinable extent: the clause above says
-			// that case is a REFUSAL, not a capture.
-			noteStructural(formDiagnostic, "a transport diagnostic whose quoted extent does not close")
-			b.WriteString(escapeMarks(text[i:]))
-			return b.String()
-		}
-		raw := text[i : j+1]
-		val := raw[1 : len(raw)-1]
-		if unq, err := strconv.Unquote(raw); err == nil {
-			val = unq
-		}
-		// One value has one length wherever it is printed, and that length is the
-		// value's, not its transport spelling's. See the call site for why the
-		// escape has moved behind this.
-		if strings.TrimSpace(val) == "" {
-			b.WriteString(escapeMarks(raw))
-		} else {
-			noteAccounted(formDiagnostic, "the endpoint-controlled extent of a transport diagnostic")
-			b.WriteString(`"` + placeholder(val) + `"`)
-		}
-		i = j + 1
+	if d, ok := describeTransportError(err, 0); ok {
+		// Every byte of this was written by this program, so it is generated, and the
+		// fixed-point check over the captured span still runs.
+		return asCaptured(marked(d))
 	}
-	return b.String()
+	// ⚠ THE REFUSAL NAMES THE TYPE, AND NOTHING ELSE FROM THE ERROR. The set of
+	// error types is not closed -- `OpError.Err` is an `error` -- so this is where
+	// the coverage of the describer above ends, said out loud. A type name is
+	// compiled into this program; the message is not.
+	noteStructural(formDiagnostic, "a transport failure of a type this build cannot describe: "+fmt.Sprintf("%T", err))
+	return asCaptured(marked("<transport failure withheld: unrecognised error type>"))
 }
 
 // sanitize renders an error for STDERR. The marks are stripped: they exist so the
@@ -2279,7 +2255,15 @@ func sanitizeRaw(err error) string {
 	if err == nil {
 		return ""
 	}
-	return scrubSupplied(sanitizeText(err.Error()))
+	// ⚠ STDERR IS A PUBLICATION TOO. The guard never reads this line, which is why
+	// it kept rendering `err.Error()` after the report stopped -- and an operator
+	// reading it, or a CI log keeping it, sees exactly what the report refused to
+	// print. The same describer answers both, so there is one place where endpoint
+	// text could enter and it takes nothing from the message.
+	if d, ok := describeTransportError(err, 0); ok {
+		return d
+	}
+	return "transport failure withheld: unrecognised error type " + fmt.Sprintf("%T", err)
 }
 
 // sanitizeText redacts every query string in a piece of text, scanning FORWARD

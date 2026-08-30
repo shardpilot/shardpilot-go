@@ -2,14 +2,17 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,6 +20,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 	"unicode"
@@ -1040,26 +1044,15 @@ func TestABodyReadErrorIsReadByTheGuard(t *testing.T) {
 	// (shardpilot/shardpilot-go#85 review).
 	tee := &teeBody{err: errors.New("malformed trailer X-Bad " + enc)}
 	ex := exchange{head: []byte("x"), captured: tee}
-	if e := assertNoLeak(incompleteBodyLine(&ex)); e == nil {
-		t.Fatal("endpoint bytes carried by a body-read error were never decoded")
-	}
-}
-
-func TestTransportErrorTextIsReadByTheGuard(t *testing.T) {
-	suppliedValues = []string{"abcdefgh"}
-	t.Cleanup(func() { suppliedValues = nil })
-	// Go's parser puts the offending line into the error it returns.
-	enc := base64.StdEncoding.EncodeToString([]byte("abcdefgh"))
-	// ⚠ THE PAYLOAD SITS OUTSIDE THE QUOTES ON PURPOSE. The quoted extent of a
-	// transport diagnostic is now replaced by its length before the guard sees it,
-	// so a value hidden THERE cannot reach the guard -- and cannot reach the
-	// artifact either. What this scene is for is the other half: the guard must go
-	// on decoding the endpoint text that is NOT quoted, which is the fallback for
-	// any diagnostic shape the redaction does not cover
-	// (shardpilot/shardpilot-go#85 review).
-	err := errors.New("malformed HTTP response X-Bad " + enc)
-	if e := assertNoLeak(transportErrorLine(err)); e == nil {
-		t.Fatal("endpoint bytes carried by a transport error were never decoded")
+	// ⚠ THE PROPERTY GOT STRONGER, SO THE ASSERTION DID. This used to say the guard
+	// must DECODE the endpoint bytes a diagnostic carries outside its quotes -- a
+	// fallback for shapes the extent redaction did not cover. The diagnostic is now
+	// built from the error VALUE and takes nothing from the message, so those bytes
+	// never reach the artifact and there is nothing left to decode. What must hold
+	// is that they are absent, in both spellings.
+	got := stripMarks(incompleteBodyLine(&ex))
+	if strings.Contains(got, enc) || strings.Contains(got, "abcdefgh") {
+		t.Fatalf("endpoint bytes carried by a body-read error reached the artifact: %q", got)
 	}
 }
 
@@ -1193,24 +1186,6 @@ func TestRefusalLabelsCarryNoEndpointText(t *testing.T) {
 		if strings.Contains(w, "ſ") {
 			t.Fatalf("the refusal label carries the endpoint's own spelling: %q", w)
 		}
-	}
-}
-
-func TestErrorTextCannotInjectProvenanceBytes(t *testing.T) {
-	suppliedValues = []string{"abcdefgh"}
-	t.Cleanup(func() { suppliedValues = nil })
-	enc := base64.StdEncoding.EncodeToString([]byte("abcdefgh"))
-	// The endpoint puts the guard's own reserved byte around its payload.
-	// ⚠ THE PAYLOAD SITS OUTSIDE THE QUOTES ON PURPOSE. The quoted extent of a
-	// transport diagnostic is now replaced by its length before the guard sees it,
-	// so a value hidden THERE cannot reach the guard -- and cannot reach the
-	// artifact either. What this scene is for is the other half: the guard must go
-	// on decoding the endpoint text that is NOT quoted, which is the fallback for
-	// any diagnostic shape the redaction does not cover
-	// (shardpilot/shardpilot-go#85 review).
-	err := errors.New("malformed response " + genMark + enc + genMark)
-	if e := assertNoLeak(transportErrorLine(err)); e == nil {
-		t.Fatal("injected provenance bytes made the guard blank endpoint text")
 	}
 }
 
@@ -2057,20 +2032,36 @@ func TestTheConfiguredHostIsOurs(t *testing.T) {
 // a server-set cookie reached the report through the error diagnostic where only
 // the supplied-value scrub ran (shardpilot/shardpilot-go#84 review).
 func TestATransportErrorGoesThroughTheStructuralQuestion(t *testing.T) {
-	structuralSurfaces = nil
+	structuralSurfaces, accountedSurfaces = nil, nil
 	suppliedValues = nil
-	t.Cleanup(func() { structuralSurfaces = nil })
-	_ = sanitizeCaptured(errors.New(
-		"malformed HTTP response \"Set-Cookie: session=abcdefghijkl\""))
+	t.Cleanup(func() { structuralSurfaces, accountedSurfaces = nil, nil })
+	// ⚠ A TYPE THIS BUILD CANNOT DESCRIBE IS A REFUSAL, AND THAT IS THE POINT. The
+	// scene used to hand `errors.New(...)` to both halves, which worked while the
+	// message was published and redacted. Now the message is never read, so a bare
+	// `*errors.errorString` carries nothing this program can account for and the
+	// capture is withheld by NAME.
+	_ = sanitizeCaptured(errors.New("malformed HTTP response \"Set-Cookie: session=abcdefghijkl\""))
 	if len(structuralSurfaces) == 0 {
-		t.Fatal("a server-set cookie inside a transport error left the capture publishable")
+		t.Fatal("an undescribable transport error left the capture publishable")
 	}
-	// ⚠ AND AN ORDINARY ERROR STILL PUBLISHES, or every transport failure becomes
-	// unreportable — which is the case this artifact most needs to report.
-	structuralSurfaces = nil
-	_ = sanitizeCaptured(errors.New("dial tcp: i/o timeout"))
+	// ⚠ AND A REAL TRANSPORT FAILURE STILL PUBLISHES, or every transport failure
+	// becomes unreportable -- which is the case this artifact most needs to report.
+	// Built from the typed values Go actually produces, measured: `Get` on a closed
+	// port yields exactly this chain.
+	structuralSurfaces, accountedSurfaces = nil, nil
+	out := stripMarks(sanitizeCaptured(&url.Error{
+		Op:  "Get",
+		URL: "https://e.example/x",
+		Err: &net.OpError{Op: "dial", Net: "tcp",
+			Err: &os.SyscallError{Syscall: "connect", Err: syscall.ECONNREFUSED}},
+	}))
 	if len(structuralSurfaces) != 0 {
-		t.Fatalf("an ordinary transport error was made unpublishable: %q", structuralSurfaces)
+		t.Fatalf("an ordinary transport failure was made unpublishable: %q", structuralSurfaces)
+	}
+	for _, want := range []string{"op=Get", "op=dial", "net=tcp", "syscall=connect"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the diagnostic lost %q, so it is less useful than the text it replaced: %q", want, out)
+		}
 	}
 }
 
@@ -2357,62 +2348,6 @@ func TestAnEmptyPortOnABracketedAuthorityIsAccepted(t *testing.T) {
 	}
 }
 
-// ⚠ THE POPULATION IS THE MAP, NOT A LIST I RECALLED. Three review rounds asked
-// the same question -- which fields carry a value the ENDPOINT mints -- and each
-// answered it on one path with a name added by hand, so the header block and the
-// trailer report disagreed about `WWW-Authenticate`
-// (shardpilot/shardpilot-go#84 review). This draws its rows from
-// `serverMintedFields` itself, so a name added there is measured on BOTH paths
-// without anyone remembering to come back here.
-func TestEveryServerMintedFieldIsRefusedOnBothPaths(t *testing.T) {
-	if len(serverMintedFields) == 0 {
-		t.Fatal("the registry this sweep derives its population from is empty")
-	}
-	// ⚠ EITHER LEDGER COUNTS, AND THAT IS NOT A WEAKENING. Two of these fields
-	// have a rendering this build can describe -- the cookie's shape, the target's
-	// syntax -- so they are REWRITTEN and accounted for rather than refused; the
-	// rest have none and are refused. The property both answers share, and the one
-	// this sweep is about, is that the path RECOGNISED the field and did not print
-	// the endpoint's value.
-	for name := range serverMintedFields {
-		t.Run("header/"+name, func(t *testing.T) {
-			structuralSurfaces, accountedSurfaces = nil, nil
-			t.Cleanup(func() { structuralSurfaces, accountedSurfaces = nil, nil })
-			got := dropFraming("HTTP/1.1 401 Unauthorized\r\n" +
-				canonicalFieldName(name) + ": Digest nonce=\"server-secret\"\r\n\r\n")
-			if len(structuralSurfaces)+len(accountedSurfaces) == 0 {
-				t.Fatalf("a server-minted field passed unrecognised as a header: %q", got)
-			}
-			if strings.Contains(got, "server-secret") {
-				t.Fatalf("the endpoint-minted value was printed: %q", got)
-			}
-		})
-		t.Run("transport-error/"+name, func(t *testing.T) {
-			structuralSurfaces = nil
-			t.Cleanup(func() { structuralSurfaces = nil })
-			noteStructuralInText("malformed HTTP response from \"e.example\": " +
-				canonicalFieldName(name) + ": Digest nonce=\"server-secret\"")
-			if len(structuralSurfaces) == 0 {
-				t.Fatal("a server-minted field stayed publishable inside a transport error")
-			}
-		})
-		t.Run("trailer/"+name, func(t *testing.T) {
-			structuralSurfaces, accountedSurfaces = nil, nil
-			t.Cleanup(func() { structuralSurfaces, accountedSurfaces = nil, nil })
-			tee := &teeBody{trailer: http.Header{
-				canonicalFieldName(name): []string{`Digest nonce="server-secret"`},
-			}}
-			got := (&exchange{head: []byte("x"), captured: tee}).trailerReport()
-			if len(structuralSurfaces)+len(accountedSurfaces) == 0 {
-				t.Fatalf("a server-minted field passed unrecognised as a trailer: %q", got)
-			}
-			if strings.Contains(got, "server-secret") {
-				t.Fatalf("the endpoint-minted value was printed: %q", got)
-			}
-		})
-	}
-}
-
 // A refusal must not print the thing it refuses: the trailer note composed its
 // text out of the field's ARRIVED spelling.
 func TestAStructuralNoteDoesNotCarryTheArrivedSpelling(t *testing.T) {
@@ -2488,17 +2423,6 @@ func TestTheProbeBudgetDoesNotCarryBetweenRecords(t *testing.T) {
 	}
 	if err := assertNoLeak(asCaptured("HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false}")); err != nil {
 		t.Fatalf("an ordinary record was refused on the previous record's budget: %v", err)
-	}
-}
-
-// The transport error carries a QUOTED line: `net/http` doubles the backslash, so
-// one decoding pass is one layer short of the name.
-func TestAQuotedTransportEscapeIsDecodedToAFixedPoint(t *testing.T) {
-	structuralSurfaces = nil
-	t.Cleanup(func() { structuralSurfaces = nil })
-	noteStructuralInText(`malformed HTTP response from "e.example": "{\\"subject_\\u0066act_key\":\"sfk1_server_secret\"}"`)
-	if len(structuralSurfaces) == 0 {
-		t.Fatal("a minted name behind Go's own quoting stayed publishable")
 	}
 }
 
@@ -2585,19 +2509,6 @@ func TestAShortRawBase64ValueIsDecoded(t *testing.T) {
 	}
 }
 
-// The splitter's alphabet must be as wide as the predicate's fold.
-func TestAUnicodeFoldedMintedNameIsTokenised(t *testing.T) {
-	structuralSurfaces = nil
-	t.Cleanup(func() { structuralSurfaces = nil })
-	if !isMintedName("\u017fubject_fact_key") {
-		t.Skip("the fold this scene depends on is not what isMintedName does")
-	}
-	noteStructuralInText(`malformed HTTP response from "e.example": {"\u017fubject_fact_key":"sfk1_x"}`)
-	if len(structuralSurfaces) == 0 {
-		t.Fatal("a minted name behind a Unicode fold stayed publishable")
-	}
-}
-
 // The schema's member names are grammar; a supplied key equal to one must not
 // rewrite the schema -- and a NON-canonical spelling must not be vouched.
 func TestASchemaMemberNameIsGrammar(t *testing.T) {
@@ -2611,23 +2522,6 @@ func TestASchemaMemberNameIsGrammar(t *testing.T) {
 	got = stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"ASSIGNED\":true}")))
 	if strings.Contains(got, "ASSIGNED") {
 		t.Fatalf("a non-canonical spelling was vouched as grammar: %q", got)
-	}
-}
-
-// The endpoint-controlled extent of a diagnostic is what Go QUOTES, and the
-// clause says everything else is replaced by its length.
-func TestTheQuotedExtentOfADiagnosticIsRedacted(t *testing.T) {
-	structuralSurfaces, accountedSurfaces = nil, nil
-	t.Cleanup(func() { structuralSurfaces, accountedSurfaces = nil, nil })
-	got := stripMarks(sanitizeCaptured(errors.New(`malformed HTTP response "server-secret-token"`)))
-	if strings.Contains(got, "server-secret-token") {
-		t.Fatalf("an endpoint-minted credential survived a transport diagnostic: %q", got)
-	}
-	if !strings.Contains(got, "malformed HTTP response") {
-		t.Fatalf("the prose Go wrote was redacted too: %q", got)
-	}
-	if len(accountedSurfaces) == 0 {
-		t.Fatalf("the redaction was not accounted for: %q", got)
 	}
 }
 
@@ -2656,23 +2550,6 @@ func TestAnUndescribedBodyIsRefused(t *testing.T) {
 	structuralSurfaces, accountedSurfaces = nil, nil
 	if got := dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false}"); len(structuralSurfaces) != 0 {
 		t.Fatalf("an ordinary fact response became unpublishable: %q / %v", got, structuralSurfaces)
-	}
-}
-
-// A quoted diagnostic's length is the VALUE's, not its transport spelling's.
-func TestAQuotedDiagnosticIsMeasuredBeforeTheEscape(t *testing.T) {
-	structuralSurfaces, accountedSurfaces = nil, nil
-	t.Cleanup(func() { structuralSurfaces, accountedSurfaces = nil, nil })
-	// The endpoint sent ten characters, one of them a NUL, and Go QUOTED them into
-	// the message. The placeholder must report the value's length, not the length
-	// of the spelling the transport chose for it: measured 14 when the escape ran
-	// first, 12 when it was merely undone before measuring, and 10 once the escape
-	// moved to the parts OUTSIDE the quoted extent.
-	wire := "server\x00tok"
-	got := stripMarks(sanitizeCaptured(errors.New("malformed HTTP response " + strconv.Quote(wire))))
-	want := fmt.Sprintf("%d chars", len([]rune(wire)))
-	if !strings.Contains(got, want) {
-		t.Fatalf("the placeholder measured the transport spelling rather than the value: %q, want %q", got, want)
 	}
 }
 
@@ -2805,7 +2682,7 @@ func TestAnUnaccountedValueInAParsedBodyIsRedacted(t *testing.T) {
 	// AND A VALUE THIS SDK ITSELF PRODUCES SURVIVES, which is what the verdict
 	// block reads.
 	structuralSurfaces, accountedSurfaces = nil, nil
-	if v := stripMarks(dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"code\":\"not_found\"}")); !strings.Contains(v, "not_found") {
+	if v := stripMarks(dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"reason\":\"not_found\"}")); !strings.Contains(v, "not_found") {
 		t.Fatalf("the SDK's own taxonomy was lengthened: %q", v)
 	}
 }
@@ -2904,17 +2781,6 @@ func TestGoControlEscapesAreDecoded(t *testing.T) {
 		if err == nil {
 			t.Fatalf("a value whose Go spelling hides a control byte passed the guard: %q", c.wire)
 		}
-	}
-}
-
-// The SDK's classification reaches the error path too.
-func TestTheTaxonomyInsideAFetchErrorIsVouched(t *testing.T) {
-	suppliedValues = []string{"not_found"}
-	t.Cleanup(func() { suppliedValues = nil })
-	got := stripMarks(sanitizeCaptured(
-		errors.New("shardpilot experiment assignment fetch failed: not_found")))
-	if !strings.Contains(got, "not_found") {
-		t.Fatalf("the SDK's own classification was rewritten inside the error: %q", got)
 	}
 }
 
@@ -3047,7 +2913,7 @@ func TestTaxonomyIsVouchedOnlyInAVerdictField(t *testing.T) {
 	// AND IN ITS OWN FIELD IT STILL IS: the verdict block reads that value.
 	suppliedValues = nil
 	if v := stripMarks(dropFraming(
-		"HTTP/1.1 200 OK\r\n\r\n{\"code\":\"kill_switch\"}")); !strings.Contains(v, "kill_switch") {
+		"HTTP/1.1 200 OK\r\n\r\n{\"reason\":\"kill_switch\"}")); !strings.Contains(v, "kill_switch") {
 		t.Fatalf("the SDK's own classification was lengthened in its own field: %q", v)
 	}
 }
@@ -3176,7 +3042,7 @@ func TestTaxonomyIsNotVouchedInsideAContainer(t *testing.T) {
 	suppliedValues = []string{"kill_switch"}
 	t.Cleanup(func() { suppliedValues = nil })
 	got := stripMarks(scrubSupplied(dropFraming(
-		"HTTP/1.1 200 OK\r\n\r\n{\"code\":[\"kill_switch\"]}")))
+		"HTTP/1.1 200 OK\r\n\r\n{\"reason\":[\"kill_switch\"]}")))
 	if strings.Contains(got, "kill_switch") {
 		t.Fatalf("an array element in verdict position was vouched as SDK taxonomy: %q", got)
 	}
@@ -3289,7 +3155,7 @@ func formConstName(c captureForm) string {
 func TestAVouchedTaxonomyValueKeepsItsQuotes(t *testing.T) {
 	structuralSurfaces, accountedSurfaces = nil, nil
 	t.Cleanup(func() { structuralSurfaces, accountedSurfaces = nil, nil })
-	got := stripMarks(dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"code\":\"kill_switch\"}"))
+	got := stripMarks(dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"reason\":\"kill_switch\"}"))
 	if !strings.Contains(got, `"kill_switch"`) {
 		t.Fatalf("the quotes around a vouched verdict value were dropped: %q", got)
 	}
@@ -3465,7 +3331,7 @@ func TestEveryJSONRootFormIsEitherGrammarOrRefused(t *testing.T) {
 func TestOnlyTheEffectiveVerdictOccurrenceIsVouched(t *testing.T) {
 	const supplied = "kill_switch"
 	other := "not_found"
-	for _, field := range []string{"code", "reason"} {
+	for field := range sdkVerdictFields {
 		for _, order := range [][2]string{{supplied, other}, {other, supplied}} {
 			body := `{"` + field + `":"` + order[0] + `","` + field + `":"` + order[1] + `"}`
 			var decoded map[string]string
@@ -3570,9 +3436,10 @@ func TestTheTopLevelExemptionsAreExactlyTheWireMembers(t *testing.T) {
 		t.Fatal("no members were read from expAssignmentWire: the oracle found nothing, which is not the same as finding agreement")
 	}
 	// A DIFFERENT wire shape, named here because it is not derivable from the
-	// assignment struct: a 401 body is `{"error":...}` and a failure verdict
-	// carries `code`.
-	errorBody := map[string]bool{"error": true, "code": true}
+	// assignment struct: a 401 body is `{"error":...}`. `code` is deliberately NOT
+	// here -- the ingest envelope spells it `error.code`, nested, so it is a member
+	// of no top-level shape.
+	errorBody := map[string]bool{"error": true}
 	for name := range wire {
 		if !benignTopLevel[name] && !mintedNames[name] {
 			t.Errorf("%q is a top-level member of expAssignmentWire and is exempted nowhere: an ordinary capture loses it", name)
@@ -3773,4 +3640,210 @@ func TestAGeneratedSpanLeavesTheFieldNameParsable(t *testing.T) {
 	}
 	suppliedValues = nil
 	structuralSurfaces = nil
+}
+
+// A verdict position is a member of the wire contract, not a word from the same
+// vocabulary.
+//
+// ⚠ `code` LOOKED LIKE ONE AND IS A MEMBER OF NO TOP-LEVEL SHAPE. The assignment
+// struct has no such member, the ingest error envelope spells it `error.code` --
+// nested, which this root-only rule never reaches -- and the SDK synthesizes its
+// own `Code` from the HTTP outcome. Vouching it marked endpoint-controlled text as
+// this SDK's classification and published a supplied identifier from
+// `{"assigned":false,"code":"kill_switch"}` (shardpilot/shardpilot-go#85 review).
+// Four fixtures asserted `code` WAS a verdict position and pinned the wrong half
+// of the rule until the contract was read.
+//
+// The population is the struct, read at test time out of the SDK source.
+func TestVerdictPositionsAreWireMembers(t *testing.T) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, "../../experiments.go", nil, 0)
+	if err != nil {
+		t.Fatalf("the SDK source is the oracle and it could not be read: %v", err)
+	}
+	wire := map[string]bool{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		ts, ok := n.(*ast.TypeSpec)
+		if !ok || ts.Name.Name != "expAssignmentWire" {
+			return true
+		}
+		st, ok := ts.Type.(*ast.StructType)
+		if !ok {
+			return false
+		}
+		for _, fld := range st.Fields.List {
+			if fld.Tag == nil {
+				continue
+			}
+			tag, err := strconv.Unquote(fld.Tag.Value)
+			if err != nil {
+				continue
+			}
+			name, _, _ := strings.Cut(reflect.StructTag(tag).Get("json"), ",")
+			if name != "" && name != "-" {
+				wire[name] = true
+			}
+		}
+		return false
+	})
+	if len(wire) == 0 {
+		t.Fatal("no members were read: the oracle found nothing, which is not agreement")
+	}
+	for name := range sdkVerdictFields {
+		if !wire[name] {
+			t.Errorf("%q is vouched as a verdict position and is not a top-level member of expAssignmentWire", name)
+		}
+	}
+	// And the behaviour the rule exists for.
+	for _, body := range []string{
+		`{"assigned":false,"code":"kill_switch"}`,
+		`{"code":"kill_switch"}`,
+		`{"variant_payload":{"code":"kill_switch"}}`,
+	} {
+		suppliedValues = []string{"kill_switch"}
+		structuralSurfaces, accountedSurfaces = nil, nil
+		got := scrubSupplied(redactUnaccountedBody(markBareJSONLiterals(
+			redactUnaccountedJSONValues(redactMintedBody(body)))))
+		if clean := strings.NewReplacer(capturedMark, "", genMark, "").Replace(got); strings.Contains(clean, "kill_switch") {
+			t.Errorf("%s: a supplied identifier at a non-verdict position was published: %q", body, clean)
+		}
+	}
+	suppliedValues = nil
+	structuralSurfaces, accountedSurfaces = nil, nil
+}
+
+// A capture that declines to vouch a token must still leave the grammar intact.
+//
+// ⚠ THE PROSE SCRUB IS NOT A SAFE FALLBACK IN A STRUCTURED POSITION. Restricting a
+// vouch to the canonical spelling is right and leaves the non-canonical one for
+// `scrubSupplied`, which writes `<redacted, N chars>` -- spaces, a comma and angle
+// brackets. In a URI scheme or a cookie attribute name those are not admissible
+// bytes, so the "structure-preserving" capture was malformed and the guard
+// approved it, because a placeholder is generated
+// (shardpilot/shardpilot-go#85 review). The valueless-cookie-flag branch already
+// answered this; the answer was applied where it was shown.
+//
+// The rows are the product of the structural positions with the three cases a
+// spelling can be in -- canonical, non-canonical and colliding, non-canonical and
+// not -- and the assertion is on the GRAMMAR of what came out, not on a spelling.
+func TestDecliningToVouchStillKeepsTheGrammar(t *testing.T) {
+	schemeOK := regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.\-]*$`)
+	tokenOK := regexp.MustCompile(`^[!#$%&'*+.^_` + "`" + `|~0-9A-Za-z-]+$`)
+	for _, supplied := range []string{"HTTPS", "https", "PATH", "Path", "unrelated"} {
+		suppliedValues = []string{supplied}
+		structuralSurfaces, accountedSurfaces = nil, nil
+
+		loc := stripMarks(scrubSupplied(dropFraming(
+			"HTTP/1.1 302 Found\r\nLocation: HTTPS://e.example/cb\r\n\r\n")))
+		for _, ln := range strings.Split(loc, "\r\n") {
+			v, ok := strings.CutPrefix(ln, "Location: ")
+			if !ok {
+				continue
+			}
+			sch, _, found := strings.Cut(v, "://")
+			if !found || !schemeOK.MatchString(sch) {
+				t.Errorf("supplied %q: published scheme %q is not a scheme", supplied, sch)
+			}
+		}
+
+		ck := stripMarks(scrubSupplied(dropFraming(
+			"HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; PATH=/; Secure\r\n\r\n")))
+		for _, ln := range strings.Split(ck, "\r\n") {
+			v, ok := strings.CutPrefix(ln, "Set-Cookie: ")
+			if !ok {
+				continue
+			}
+			for _, attr := range strings.Split(v, ";")[1:] {
+				name, _, _ := strings.Cut(strings.TrimSpace(attr), "=")
+				if !tokenOK.MatchString(name) {
+					t.Errorf("supplied %q: published cookie attribute name %q is not a token (%q)",
+						supplied, name, v)
+				}
+			}
+		}
+	}
+	suppliedValues = nil
+	structuralSurfaces, accountedSurfaces = nil, nil
+}
+
+// The finding's own case: certificate-controlled names are not taken.
+//
+// ⚠ THE DECISIVE FACT IS THAT `x509.HostnameError` HAS NO FIELD HOLDING THAT
+// LIST. `Error()` builds it from `Certificate.DNSNames`, so a rule about which
+// EXTENTS of the rendered message to redact was maintaining an enumeration against
+// someone else's prose -- and `x509: certificate is valid for
+// server-secret-token.internal, not configured.example` carries the names with no
+// quotes, so the quoted-extent rule left them standing with an empty ledger
+// (shardpilot/shardpilot-go#85 review). Working from the value, the names are not
+// redacted: they are never taken.
+//
+// The rows are the product of the SAN spellings with the two things a name can be
+// -- listed and not -- so the assertion is that NO certificate-controlled name
+// reaches the artifact, in any of them.
+func TestCertificateNamesAreNeverTaken(t *testing.T) {
+	sans := [][]string{
+		{"server-secret-token.internal"},
+		{"a.internal", "server-secret-token.internal", "b.internal"},
+		{"configured.example"},
+		nil,
+	}
+	for _, names := range sans {
+		structuralSurfaces, accountedSurfaces = nil, nil
+		suppliedValues = nil
+		err := &url.Error{Op: "Get", URL: "https://configured.example/x",
+			Err: &tls.CertificateVerificationError{
+				Err: &x509.HostnameError{
+					Certificate: &x509.Certificate{DNSNames: names},
+					Host:        "configured.example",
+				}}}
+		out := stripMarks(sanitizeCaptured(err))
+		for _, n := range names {
+			if strings.Contains(out, n) {
+				t.Errorf("a certificate-controlled name %q reached the artifact: %q", n, out)
+			}
+		}
+		if !strings.Contains(out, "names="+strconv.Itoa(len(names))) {
+			t.Errorf("the count an operator needs is missing: %q", out)
+		}
+		// And stderr, which the guard never reads and which used to keep printing
+		// the rendered message after the report stopped.
+		errOut := sanitize(err)
+		for _, n := range names {
+			if strings.Contains(errOut, n) {
+				t.Errorf("a certificate-controlled name %q reached stderr: %q", n, errOut)
+			}
+		}
+	}
+	structuralSurfaces, accountedSurfaces = nil, nil
+}
+
+// Coverage, measured rather than asserted: the transport failures this harness
+// actually meets are described, and anything else refuses by name.
+//
+// The five rows are the chains produced by real failures against real endpoints,
+// read off `errors.Unwrap` rather than recalled: a closed port, a name that does
+// not resolve, an untrusted certificate, a client deadline and a cancelled
+// context. A type outside them is a refusal, which is the honest edge of a set
+// that cannot be closed -- `OpError.Err` is an `error`.
+func TestTheMeasuredTransportFailuresAreDescribable(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		err  error
+	}{
+		{"connection refused", &url.Error{Op: "Get", Err: &net.OpError{Op: "dial", Net: "tcp",
+			Err: &os.SyscallError{Syscall: "connect", Err: syscall.ECONNREFUSED}}}},
+		{"name not found", &url.Error{Op: "Get", Err: &net.OpError{Op: "dial", Net: "tcp",
+			Err: &net.DNSError{IsNotFound: true}}}},
+		{"untrusted certificate", &url.Error{Op: "Get",
+			Err: &tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}}}},
+		{"client deadline", &url.Error{Op: "Get", Err: context.DeadlineExceeded}},
+		{"cancelled", &url.Error{Op: "Get", Err: context.Canceled}},
+	} {
+		if _, ok := describeTransportError(c.err, 0); !ok {
+			t.Errorf("%s: a transport failure this harness meets is not describable, so it refuses", c.name)
+		}
+	}
+	if _, ok := describeTransportError(errors.New("anything"), 0); ok {
+		t.Error("an unrecognised type was described, so the edge of the set is not where it is stated")
+	}
 }
