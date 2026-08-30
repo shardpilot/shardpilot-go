@@ -777,8 +777,9 @@ func renderExchanges(report *strings.Builder, exchanges []exchange) []exchangeRe
 		// ledger by (exchange, reason), which is a larger change than this finding
 		// asked for.
 		perExchange = append(perExchange, exchangeRefusals{
-			truncated: ex.truncErr() != nil,
-			added:     append([]string{}, structuralSurfaces[beforeRender:]...),
+			truncated:     ex.truncErr() != nil,
+			jsonTruncated: truncationCausedTheFailure(ex.body()),
+			added:         append([]string{}, structuralSurfaces[beforeRender:]...),
 		})
 	}
 	return perExchange
@@ -845,17 +846,30 @@ var benignTopLevel = func() map[string]bool {
 
 // topLevelExemptions picks the registry a body of this status is described by.
 //
-// An unparsable status line takes the ASSIGNMENT set: this harness fetches
-// assignments, and a head this program cannot read is not a licence to exempt the
-// error shape's names.
+// ⚠ 200 EXACTLY, NOT "BELOW 400". `applyExperimentAssignment` parses
+// `expAssignmentWire` for status 200 and for nothing else, so on a `201` the SDK
+// never decodes that shape -- and exempting its member names there marked
+// endpoint-chosen text as generated grammar: with a supplied `assigned` and a body
+// of `{"assigned":false}`, the identifier was published out of a body shape
+// nothing reads (shardpilot/shardpilot-go#85 review). "Not an error" is not "the
+// assignment shape"; the SDK's own condition is equality with 200.
+//
+// A status this program cannot read, and any other sub-400, take NO schema
+// exemptions. That direction costs a label on an unusual response and cannot
+// publish: an unexempted name is scrubbed, and over-exempting is what published.
 func topLevelExemptions(statusLine string) map[string]bool {
 	f := strings.Fields(strings.TrimSuffix(statusLine, "\r"))
 	if len(f) >= 2 && strings.HasPrefix(f[0], "HTTP/") {
-		if n, err := strconv.Atoi(f[1]); err == nil && n >= 400 {
-			return errorTopLevel
+		if n, err := strconv.Atoi(f[1]); err == nil {
+			switch {
+			case n == 200:
+				return assignmentTopLevel
+			case n >= 400:
+				return errorTopLevel
+			}
 		}
 	}
-	return assignmentTopLevel
+	return map[string]bool{}
 }
 
 // receivedConnection records whether the ENDPOINT sent a `Connection` field, as
@@ -1255,7 +1269,26 @@ func refusalLedger() []string { return structuralSurfaces }
 // and whether that exchange was incomplete.
 type exchangeRefusals struct {
 	truncated bool
-	added     []string
+	// jsonTruncated is whether the received prefix would have PARSED had it
+	// arrived whole. Being incomplete is not by itself a reason a body failed to
+	// parse: a `text/plain` payload that was also cut short is an unsupported
+	// shape either way (shardpilot/shardpilot-go#85 review).
+	jsonTruncated bool
+	added         []string
+}
+
+// truncationCausedTheFailure answers whether incompleteness ITSELF prevented an
+// otherwise supported JSON document from parsing.
+//
+// ⚠ ASKED OF THE DECODER, BY SENTINEL. `Decode` returns `io.ErrUnexpectedEOF` for
+// a JSON prefix and a syntax error for something that is not JSON at all, so the
+// two are distinguishable without reading an error's text -- which is what this
+// file requires of every other error it classifies.
+func truncationCausedTheFailure(body []byte) bool {
+	d := json.NewDecoder(bytes.NewReader(body))
+	var v json.RawMessage
+	err := d.Decode(&v)
+	return err == nil || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 // unexcusedRefusals returns the ledger entries that no TRUNCATED attempt accounts
@@ -1284,7 +1317,12 @@ var truncationExcusable = map[string]bool{
 func unexcusedRefusals(ledger []string, per []exchangeRefusals) []string {
 	truncated := map[int]bool{}
 	for i, e := range per {
-		if e.truncated {
+		// ⚠ AND THE TRUNCATION MUST BE THE REASON. Excusing on incompleteness alone
+		// printed a partial `text/plain` body carrying endpoint text: the reason was
+		// raised because the shape is unsupported, not because bytes were missing,
+		// and the guard cannot see a value this harness never supplied
+		// (shardpilot/shardpilot-go#85 review).
+		if e.truncated && e.jsonTruncated {
 			truncated[i] = true
 		}
 	}

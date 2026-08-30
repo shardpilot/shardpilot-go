@@ -3213,9 +3213,13 @@ func TestTruncationExcusesOnlyItsOwnBodyRefusals(t *testing.T) {
 	restore := structuralAt
 	t.Cleanup(func() { structuralAt = restore })
 
+	// ⚠ AND ONLY WHERE TRUNCATION EXPLAINS IT. The rows carry `jsonTruncated`
+	// because being incomplete is not by itself a reason a body failed to parse
+	// (shardpilot/shardpilot-go#85 review).
+	//
 	// A truncated attempt's OWN body refusal is excused.
 	structuralAt = map[string][]int{bodyShape: {0}}
-	if got := unexcusedRefusals([]string{bodyShape}, []exchangeRefusals{{truncated: true}}); len(got) != 0 {
+	if got := unexcusedRefusals([]string{bodyShape}, []exchangeRefusals{{truncated: true, jsonTruncated: true}}); len(got) != 0 {
 		t.Fatalf("a truncated attempt's own body refusal was not excused: %v", got)
 	}
 
@@ -3223,14 +3227,14 @@ func TestTruncationExcusesOnlyItsOwnBodyRefusals(t *testing.T) {
 	// used to be by reason alone, so the complete attempt never recorded its own
 	// entry and the sole one read as the truncated attempt's.
 	structuralAt = map[string][]int{bodyShape: {0, 1}}
-	if got := unexcusedRefusals([]string{bodyShape}, []exchangeRefusals{{truncated: false}, {truncated: true}}); len(got) != 1 {
+	if got := unexcusedRefusals([]string{bodyShape}, []exchangeRefusals{{truncated: false}, {truncated: true, jsonTruncated: true}}); len(got) != 1 {
 		t.Fatalf("a complete attempt's body refusal was excused by a truncated one: %v", got)
 	}
 
 	// ⚠ AND A REASON THE TRUNCATION DOES NOT EXPLAIN IS NEVER EXCUSED. An
 	// undecodable coding on a truncated response still hides whatever arrived.
 	structuralAt = map[string][]int{coding: {0}, cookie: {0}}
-	got := unexcusedRefusals([]string{coding, cookie}, []exchangeRefusals{{truncated: true}})
+	got := unexcusedRefusals([]string{coding, cookie}, []exchangeRefusals{{truncated: true, jsonTruncated: true}})
 	if len(got) != 2 {
 		t.Fatalf("refusals unrelated to the truncation were excused by it: %v", got)
 	}
@@ -4726,6 +4730,75 @@ func TestTheAuthorityIsReplacedAtItsOffset(t *testing.T) {
 			if rest == "" || strings.HasPrefix(rest, "/") {
 				t.Errorf("%q with %q supplied published %q, which has no authority", c.target, c.sup, v)
 			}
+		}
+		suppliedValues = nil
+		structuralSurfaces, accountedSurfaces = nil, nil
+	}
+}
+
+// Incompleteness is not by itself a reason a body failed to parse.
+//
+// ⚠ A `text/plain` PAYLOAD THAT WAS ALSO CUT SHORT IS AN UNSUPPORTED SHAPE EITHER
+// WAY. The excuse fired on truncation alone, so a partial body carrying
+// endpoint-chosen text was printed with its refusal removed — and the guard cannot
+// see a value this harness never supplied (shardpilot/shardpilot-go#85 review).
+//
+// The classification is asked of the DECODER by sentinel: `Decode` returns
+// `io.ErrUnexpectedEOF` for a JSON prefix and a syntax error for something that is
+// not JSON, so the two are distinguishable without reading an error's text.
+func TestTruncationExcusesOnlyWhatTruncationExplains(t *testing.T) {
+	for _, c := range []struct {
+		body    string
+		excuses bool
+	}{
+		{`{"assigned":false`, true},
+		{`{"a":`, true},
+		{`[1,2`, true},
+		{`"abc`, true},
+		{`{"assigned":false}`, true},
+		{"server-secret-token", false},
+		{"<html><body>oops", false},
+		{"", false},
+	} {
+		if got := truncationCausedTheFailure([]byte(c.body)); got != c.excuses {
+			t.Errorf("%q: truncation explains the failure=%v, want %v", c.body, got, c.excuses)
+		}
+	}
+	// And the excuse follows it.
+	restore := structuralAt
+	t.Cleanup(func() { structuralAt = restore })
+	shape := "a response body in a shape this build cannot describe"
+	structuralAt = map[string][]int{shape: {0}}
+	if got := unexcusedRefusals([]string{shape},
+		[]exchangeRefusals{{truncated: true, jsonTruncated: false}}); len(got) != 1 {
+		t.Errorf("a truncated NON-JSON body had its refusal excused: %v", got)
+	}
+}
+
+// The assignment shape is exempt at 200 and nowhere else.
+//
+// ⚠ "NOT AN ERROR" IS NOT "THE ASSIGNMENT SHAPE".
+// `applyExperimentAssignment` parses `expAssignmentWire` for status 200 and for
+// nothing else, so on a `201` the SDK never decodes that shape — and exempting its
+// member names there marked endpoint-chosen text as generated grammar
+// (shardpilot/shardpilot-go#85 review). The registry has now been wrong about its
+// depth, its membership, its shape, and its STATUS.
+func TestAssignmentExemptionsApplyAtTwoHundredOnly(t *testing.T) {
+	for _, c := range []struct {
+		head    string
+		exempts bool
+	}{
+		{"HTTP/1.1 200 OK", true},
+		{"HTTP/1.1 201 Created", false},
+		{"HTTP/1.1 204 No Content", false},
+		{"HTTP/1.1 302 Found", false},
+		{"not a status line", false},
+	} {
+		suppliedValues = []string{"assigned"}
+		structuralSurfaces, accountedSurfaces = nil, nil
+		got := stripMarks(scrubSupplied(dropFraming(c.head + "\r\n\r\n" + `{"assigned":false}`)))
+		if printed := strings.Contains(got, `"assigned"`); printed != c.exempts {
+			t.Errorf("%s: the member name printed=%v, want %v: %q", c.head, printed, c.exempts, got)
 		}
 		suppliedValues = nil
 		structuralSurfaces, accountedSurfaces = nil, nil
