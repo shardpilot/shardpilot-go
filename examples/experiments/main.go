@@ -232,8 +232,15 @@ type exchange struct {
 	// while silently dropping a status and headers the endpoint had sent
 	// (shardpilot/shardpilot-go#84 review). This harness records rather than
 	// summarises; what it cannot show it must at least not omit in silence.
-	infos    []string
-	captured *teeBody
+	infos []string
+	// infoOverflow records that interim responses were DROPPED because the cap was
+	// reached. A capture that silently omits them is the failure this section was
+	// added to prevent.
+	infoOverflow bool
+	// interimConn records, per interim block, whether IT carried a `Connection`
+	// field. The final response's provenance says nothing about an interim one.
+	interimConn []bool
+	captured    *teeBody
 }
 
 // body is what the SDK actually read, and truncErr is the SDK's own read
@@ -730,10 +737,20 @@ func renderExchanges(report *strings.Builder, exchanges []exchange) []exchangeRe
 					"and its header set, not the bytes on the wire.\n\n%s\n",
 				label, wire, fencedBlock(reqText))
 		}
-		for _, info := range ex.infos {
-			// The per-exchange fact goes where `dropFraming` reads it, as for the
-			// final response.
-			receivedConnection = ex.recvConn
+		if ex.infoOverflow {
+			noteStructural(formDiagnostic, "interim responses beyond this build's cap, which were not captured")
+			fmt.Fprintf(report, "## Informational%s — INCOMPLETE\n\nThe endpoint sent "+
+				"more interim responses than this build retains (%d blocks or %d bytes), "+
+				"so what follows is a prefix and the record is not publishable.\n\n",
+				label, maxInterimResponses, maxInterimBytes)
+		}
+		for infoNo, info := range ex.infos {
+			// ⚠ THIS BLOCK'S OWN PROVENANCE. The final response's answer says nothing
+			// about an interim one.
+			receivedConnection = false
+			if infoNo < len(ex.interimConn) {
+				receivedConnection = ex.interimConn[infoNo]
+			}
 			// ⚠ PRINTED, NOT SUMMARISED. These arrived from the endpoint and the final
 			// response does not contain them; a pair rendered without them is a pair
 			// that omits what it saw.
@@ -911,6 +928,15 @@ var receivedConnection bool
 // producing scans were entirely uncounted until a review did the arithmetic by
 // hand (shardpilot/shardpilot-go#84 review).
 var producerWork int
+
+// maxInterimResponses and maxInterimBytes bound what one exchange retains from
+// `Got1xxResponse`. Installing that callback makes `net/http` reset its
+// response-header allowance after every delivered interim response, so the
+// per-response ceiling stops bounding the aggregate.
+const (
+	maxInterimResponses = 32
+	maxInterimBytes     = 1 << 20
+)
 
 const decodeWorkMax = 64 << 20
 
@@ -2003,6 +2029,9 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 	// firing.
 	var infoMu sync.Mutex
 	var infos []string
+	var interimConn []bool
+	infoBytes := 0
+	infoOverflow := false
 	traced := req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
 		Got1xxResponse: func(code int, h textproto.MIMEHeader) error {
 			var b strings.Builder
@@ -2028,7 +2057,32 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 			// (shardpilot/shardpilot-go#84 review). An interim response is a
 			// response; handing it to the request's redactor is the same category
 			// error as reading a trailer with the header path's rules.
-			infos = append(infos, escapeMarks(b.String()))
+			// ⚠ AND BOUNDED, BECAUSE INSTALLING THIS CALLBACK REMOVES THE ONLY BOUND
+			// THERE WAS. `net/http` resets its response-header allowance after every
+			// interim response it delivers, explicitly leaving the callback responsible
+			// for limiting them -- so a fast endpoint could stream 1xx blocks for the
+			// whole deadline and this append would grow without limit, long before the
+			// decode budget gets a chance to refuse anything
+			// (shardpilot/shardpilot-go#84 review). The capture I added removed a
+			// ceiling and did not replace it. The overflow is RECORDED rather than
+			// silently truncated.
+			//
+			// ⚠ AND THE `Connection` PROVENANCE IS THIS BLOCK'S. `Got1xxResponse` hands
+			// over the headers IT delivered, so whether the interim carried a
+			// `Connection` field is a fact about the interim -- inheriting the final
+			// response's answer marked a received interim line as serialiser-generated
+			// and published it (same review). Per exchange was the fix two rounds ago;
+			// per interim BLOCK is the same sentence one surface along.
+			line := escapeMarks(b.String())
+			_, hadConn := h["Connection"]
+			if len(infos) >= maxInterimResponses || infoBytes+len(line) > maxInterimBytes {
+				infoOverflow = true
+				infoMu.Unlock()
+				return nil
+			}
+			infoBytes += len(line)
+			infos = append(infos, line)
+			interimConn = append(interimConn, hadConn)
 			infoMu.Unlock()
 			return nil
 		},
@@ -2042,6 +2096,8 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 		ex.transErr = err
 		infoMu.Lock()
 		ex.infos = infos
+		ex.interimConn = interimConn
+		ex.infoOverflow = infoOverflow
 		infoMu.Unlock()
 		r.mu.Lock()
 		r.exchanges = append(r.exchanges, ex)
@@ -2092,14 +2148,36 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 	// the endpoint sent no such line -- so this errs toward CAPTURED, which is the
 	// direction that keeps the guard looking.
 	_, ex.recvConn = resp.Header["Connection"]
-	if resp.Close {
-		ex.recvConn = true
+	// ⚠ AND `resp.Close` HAS TWO CAUSES, ONLY ONE OF WHICH IS A RECEIVED FIELD. Go
+	// sets it when the transport CONSUMED `Connection: close`, and also when an
+	// HTTP/1.1 response is close-delimited -- no length and no chunked framing, so
+	// the body ends at EOF. `DumpResponse` synthesises the line in both cases, and
+	// the round before read both as "received": with a supplied `close`, the scrub
+	// then rewrote a line net/http had invented into `Connection: <redacted, 5
+	// chars>` while the section called the result canonical
+	// (shardpilot/shardpilot-go#84 review).
+	//
+	// The two are separable by the FRAMING. A response with an explicit length or a
+	// chunked encoding does not need `Close` for delimitation, so `Close` there came
+	// from the field; without either, it is ambiguous and the line keeps its
+	// serialiser provenance -- which is the direction that does not rewrite bytes
+	// this program invented.
+	if resp.Close && !ex.recvConn {
+		explicitFraming := resp.ContentLength >= 0
+		for _, te := range resp.TransferEncoding {
+			if strings.EqualFold(te, "chunked") {
+				explicitFraming = true
+			}
+		}
+		ex.recvConn = explicitFraming
 	}
 	if d, derr := httputil.DumpResponse(resp, false); derr == nil {
 		ex.head = d
 	}
 	infoMu.Lock()
 	ex.infos = infos
+	ex.interimConn = interimConn
+	ex.infoOverflow = infoOverflow
 	infoMu.Unlock()
 	ex.uncompressed = resp.Uncompressed
 	ex.captured = captured
