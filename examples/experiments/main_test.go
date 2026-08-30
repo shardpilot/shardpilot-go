@@ -2351,9 +2351,10 @@ func TestTheTopLevelExemptionsAreExactlyTheWireMembers(t *testing.T) {
 		t.Fatal("no members were read from expAssignmentWire: the oracle found nothing, which is not the same as finding agreement")
 	}
 	// A DIFFERENT wire shape, named here because it is not derivable from the
-	// assignment struct: a 401 body is `{"error":...}` and a failure verdict
-	// carries `code`.
-	errorBody := map[string]bool{"error": true, "code": true}
+	// assignment struct: a 401 body is `{"error":...}`. `code` is deliberately NOT
+	// here -- the ingest envelope spells it `error.code`, nested, so it is a member
+	// of no top-level shape.
+	errorBody := map[string]bool{"error": true}
 	for name := range wire {
 		if !benignTopLevel[name] && !mintedNames[name] {
 			t.Errorf("%q is a top-level member of expAssignmentWire and is exempted nowhere: an ordinary capture loses it", name)

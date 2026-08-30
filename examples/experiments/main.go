@@ -739,7 +739,13 @@ var benignTopLevel = map[string]bool{
 	// `{"error":"unauthorized"}` and a failure verdict carries `code`. These two
 	// belong to a DIFFERENT wire shape than the assignment, which is why the
 	// scene names them explicitly rather than deriving them.
-	"error": true, "code": true, "app_key": true, "environment_key": true,
+	// ⚠ `code` IS NOT AMONG THEM, THOUGH IT WAS. It is a member of no top-level
+	// shape: the ingest error envelope spells it `error.code`, nested, and the
+	// assignment struct has no such member -- the SDK synthesizes its `Code` from
+	// the HTTP outcome (shardpilot/shardpilot-go#85 review, and the same defect
+	// stands here). Exempting it marked an endpoint-controlled member name as
+	// generated grammar, which is the `attributes` finding one name along.
+	"error": true, "app_key": true, "environment_key": true,
 }
 
 var mintedNames = map[string]bool{
