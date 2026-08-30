@@ -87,9 +87,13 @@
 //	   a truncated body, or a deadline. Distinct from 1 on purpose: 1 says the
 //	   endpoint answered and the answer is in the record, and an incomplete run
 //	   reported as 1 would be read as a refusal that was never observed.
-//	4  THE RECORD WAS NOT PUBLISHED. Either a supplied value survived redaction
-//	   in some encoding and the report was withheld, or the report could not be
-//	   written whole. Nothing is claimed about the exchange: it may have been a
+//	4  THE RECORD IS NOT A CAPTURE. Either a supplied value survived redaction in
+//	   some encoding and the report was withheld — nothing at all was written —
+//	   or the write failed partway, in which case a PREFIX may already be on
+//	   stdout and the byte count is printed on stderr. A stream cannot promise
+//	   all-or-nothing, and the earlier wording ("was not published") claimed it
+//	   did (shardpilot/shardpilot-go#84 review). Nothing is claimed about the
+//	   exchange: it may have been a
 //	   perfect 200. This is a failure OF THE RECORDER, kept distinct from 3 --
 //	   which is a failure of the exchange -- because the remedies differ and a
 //	   consumer reads these codes rather than the prose. Added when the leak
@@ -470,6 +474,10 @@ var benignTopLevel = map[string]bool{
 	"error": true, "app_key": true, "environment_key": true,
 }
 
+// receivedConnection records whether the ENDPOINT sent a `Connection` field, as
+// opposed to the serialiser adding one. See where it is set.
+var receivedConnection bool
+
 // ── the minted-field test, shared with the half this change builds on ────────
 //
 // ⚠ ONE PLACE ANSWERS "IS THIS A MINTED FIELD". The guard half REFUSES a capture
@@ -581,6 +589,25 @@ func newDepthWalker(body string) func(int) int {
 		}
 		return depth
 	}
+}
+
+// jsonParses reports whether the body is exactly one JSON value with nothing but
+// JSON whitespace around it.
+//
+// ⚠ IT IS A DIFFERENT QUESTION FROM `topLevelMembers(body) == nil`, and reading
+// one as the other made a valid response unpublishable: `[{"subject_fact_key":…}]`
+// is syntactically valid JSON whose structure PROVES that member is nested, and
+// the nil return -- which also means "parsed, but not an object" -- was read as
+// "cannot be classified", so the capture was refused
+// (shardpilot/shardpilot-go#84 review). One name answering two questions turns
+// the first into the second; this is the second time in this stack.
+func jsonParses(body string) bool {
+	d := json.NewDecoder(strings.NewReader(body))
+	var v json.RawMessage
+	if err := d.Decode(&v); err != nil {
+		return false
+	}
+	return strings.TrimSpace(body[int(d.InputOffset()):]) == ""
 }
 
 // topLevelMembers returns the names bound from the top-level object, which is
@@ -714,7 +741,6 @@ func scrubStructuralName(line string) string {
 
 func dropFraming(dump string) string {
 	lines := strings.Split(dump, "\n")
-	proto2 := strings.HasPrefix(dump, "HTTP/2")
 	out := make([]string, 0, len(lines))
 	inHeaders := true
 	bodyStart := -1
@@ -754,7 +780,9 @@ func dropFraming(dump string) string {
 		// let a value base64-decoding to the key through both the scrub and the
 		// guard (shardpilot/shardpilot-go#84 review). The exemption was written
 		// for one protocol and applied to both.
-		if strings.HasPrefix(low, "connection:") && proto2 {
+		// ⚠ THE PROTOCOL IS NOT THE QUESTION; whether it was RECEIVED is. See
+		// receivedConnection.
+		if strings.HasPrefix(low, "connection:") && !receivedConnection {
 			out = append(out, marked(strings.TrimSuffix(l, "\r"))+cr)
 			continue
 		}
@@ -782,6 +810,20 @@ func dropFraming(dump string) string {
 				// it verbatim to stderr -- the refusal publishing what the refusal
 				// was for (shardpilot/shardpilot-go#84 review).
 				noteStructural("a body in a content coding this build cannot decode")
+			} else if strings.EqualFold(v, "identity") {
+				// ⚠ AN ACCEPTED CODING IS GRAMMAR, AND MUST BE MARKED AS SUCH. This
+				// branch deliberately accepts `identity` as the no-op coding that
+				// accompanies a readable body -- and then left the token as captured
+				// text, so with a legal experiment key of `identity` the generic scrub
+				// rewrote it to `Content-Encoding: <redacted, 8 chars>`: a declaration
+				// of an unknown, syntactically invalid coding, approved by the guard
+				// because the placeholder is generated
+				// (shardpilot/shardpilot-go#84 review). Same rule as the cookie
+				// attributes and the query parameter names: vouching for a token and
+				// leaving it captured is not vouching.
+				out = append(out, l[:len("content-encoding:")]+
+					strings.Replace(l[len("content-encoding:"):], v, marked(v), 1))
+				continue
 			}
 		}
 		if strings.HasPrefix(low, "location:") {
@@ -1016,6 +1058,15 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp.Body = captured
 	ex.status = resp.StatusCode
 	ex.proto = resp.Proto
+	// ⚠ WHETHER THE RESPONSE CARRIED `Connection` IS A FACT ABOUT THE RESPONSE,
+	// and only here is it knowable. `DumpResponse` SYNTHESISES `Connection: close`
+	// for HTTP/1.1 whenever the length is unknown, so the dump cannot be asked --
+	// and the rule "HTTP/1 means the endpoint sent it" published
+	// `Connection: <redacted, 5 chars>` for a legal experiment key of `close`: not
+	// a connection-option, and never received (shardpilot/shardpilot-go#84
+	// review). The earlier fix distinguished the two PROTOCOLS, which was the
+	// right distinction for the case it was shown and not the question.
+	receivedConnection = resp.Header.Get("Connection") != ""
 	if d, derr := httputil.DumpResponse(resp, false); derr == nil {
 		ex.head = d
 	}
@@ -1440,8 +1491,19 @@ func markBareJSONLiterals(text string) string {
 	//
 	// A body that does not parse is left alone: there is no JSON grammar in it to
 	// protect, so the ordinary scrub applies and the value is redacted.
-	start := strings.IndexAny(text, "{[")
-	if start < 0 {
+	// ⚠ THE WHOLE BODY MODULO WHITESPACE, ON BOTH SIDES. Three rounds have now
+	// found this function accepting something that is not one JSON document: a
+	// body that merely CONTAINS a value, a body followed by more values, and now
+	// a body PRECEDED by text -- `error: {"assigned":false}` was read as JSON
+	// because the scan began at the first brace (shardpilot/shardpilot-go#84
+	// review). Each round fixed the side it was shown. The rule is one value with
+	// nothing but JSON whitespace around it, stated once, so there is no third
+	// side left to be shown.
+	start := 0
+	for start < len(text) && (text[start] == ' ' || text[start] == '\t' || text[start] == '\n' || text[start] == '\r') {
+		start++
+	}
+	if start >= len(text) || (text[start] != '{' && text[start] != '[') {
 		return text
 	}
 	// ⚠ ONE VALUE, NOT A STREAM. `json.Decoder` reads a SEQUENCE of top-level
@@ -2125,7 +2187,17 @@ func joinBase64Runs(text string) string {
 			}
 			return r
 		}, bare)
+		// ⚠ AND A BLANK LINE INSIDE A RUN IS WHITESPACE, NOT A BOUNDARY. A standard
+		// base64 decoder ignores every CR and LF, so `YWJjZ\r\n\r\nGVmZ2g=`
+		// reconstructs the identifier in one step -- while this ended the run at the
+		// empty line and neither fragment decoded to anything
+		// (shardpilot/shardpilot-go#84 review). Second time this function has been
+		// told that MIME ignores whitespace the line-based reading treats as
+		// structure; the first was horizontal space INSIDE a line.
 		isRun := bare != "" && allBase64(bare)
+		if run && bare == "" {
+			continue
+		}
 		if isRun {
 			b.WriteString(bare)
 			run = true
@@ -2599,6 +2671,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, "no request made: %v\n", err)
 		os.Exit(2)
 	}
+	// Kept for the ordinary return path. It does NOT settle the worker before the
+	// counter is read -- `os.Exit` runs no defers -- which is why the close is
+	// also performed explicitly below.
 	defer func() {
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer closeCancel()
@@ -2609,6 +2684,20 @@ func main() {
 	defer cancel()
 
 	result, fetchErr := client.FetchExperimentAssignment(ctx, env("SP_EXPERIMENT_KEY"), nil)
+
+	// ⚠ STOP THE TRAFFIC BEFORE COUNTING IT. An armed automatic exposure can have
+	// its worker issue an ingest request AFTER the fetch returns, so the snapshot
+	// below recorded zero while the recorder went on absorbing and counting that
+	// request as the report was assembled -- and the printed claim, already
+	// copied, said zero (shardpilot/shardpilot-go#84 review). The deferred Close
+	// cannot settle it either: every path below calls `os.Exit`, which runs no
+	// defers at all. A count that is a claim about the RUN cannot be taken at an
+	// instant in the middle of it.
+	func() {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer closeCancel()
+		_ = client.Close(closeCtx)
+	}()
 
 	rec.mu.Lock()
 	exchanges := append([]exchange{}, rec.exchanges...)
@@ -2725,8 +2814,20 @@ func main() {
 	// A CAPTURE NOBODY RECEIVED IS NOT A CAPTURE. An ignored write error let a
 	// report truncated by a full filesystem -- or never written at all -- be
 	// followed by "SERVED" and exit 0 (shardpilot/shardpilot-go#73 review).
-	if _, werr := io.WriteString(os.Stdout, stripMarks(report.String())); werr != nil {
-		fmt.Fprintf(os.Stderr, "REFUSING: the capture could not be written whole: %v\n", werr)
+	// ⚠ A STREAM CANNOT PROMISE ALL-OR-NOTHING, so the claim says what is true.
+	// `io.WriteString` may return a positive count WITH an error, so a prefix of
+	// the report can already be on the pipe before this refusal runs -- and the
+	// documented exit-4 clause said a report that could not be written whole was
+	// not published (shardpilot/shardpilot-go#84 review). It cannot be unwritten.
+	// What this program CAN do is say how many bytes escaped, so a consumer that
+	// captured them independently of the exit status knows the artifact is a
+	// fragment rather than a capture.
+	if wn, werr := io.WriteString(os.Stdout, stripMarks(report.String())); werr != nil {
+		fmt.Fprintf(os.Stderr,
+			"REFUSING: the capture could not be written whole: %v\n"+
+				"  %d byte(s) of it reached stdout before the failure and CANNOT be\n"+
+				"  recalled; treat anything captured from this run as a fragment, not a\n"+
+				"  capture.\n", werr, wn)
 		os.Exit(4)
 	}
 

@@ -798,7 +798,12 @@ func redactMintedBody(body string) string {
 	// program cannot account for" (shardpilot/shardpilot-go#84 review, ported
 	// across the stack seam: the guard half REFUSED such a body, which is the only
 	// thing it could do; this half redacts it, so what it owes is the record).
-	if topLevelMembers(body) == nil && strings.Contains(body, "{") {
+	// ⚠ `!jsonParses`, NOT `topLevelMembers == nil` -- the same conflation the
+	// guard half was shown, living here too: the nil return ALSO means "parsed,
+	// but not an object", so `[{"subject_fact_key":…}]` was treated as
+	// unclassifiable although its structure proves the member is nested
+	// (shardpilot/shardpilot-go#84 review, ported across the stack seam).
+	if !jsonParses(body) && strings.Contains(body, "{") {
 		// ⚠ INDETERMINATE FOR EVERY MEMBER, NOT ONLY THE MINTED ONE. The round
 		// before, this branch covered minted names and left the unfamiliar-member
 		// guard above it silent: for `{"server_secret_identifier":"x` the parse
