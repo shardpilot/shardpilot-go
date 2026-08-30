@@ -2622,9 +2622,9 @@ func TestAConsumedCloseSignalIsStillReceived(t *testing.T) {
 func TestTaxonomyIsVouchedOnlyWhereTheSDKWroteIt(t *testing.T) {
 	for _, code := range []string{"unauthorized", "kill_switch", "http_503", "transient_408"} {
 		for _, c := range []struct {
-			name    string
-			text    string
-			vouched bool
+			name     string
+			text     string
+			sdkWrote bool
 		}{
 			{"the SDK's own wrapper", "shardpilot experiment assignment fetch failed: " + code, true},
 			{"the remote-config wrapper", "shardpilot remote config fetch failed: " + code, true},
@@ -2634,8 +2634,21 @@ func TestTaxonomyIsVouchedOnlyWhereTheSDKWroteIt(t *testing.T) {
 			suppliedValues = []string{code}
 			structuralSurfaces = nil
 			got := stripMarks(sanitizeCaptured(errors.New(c.text)))
-			if printed := strings.Contains(got, code); printed != c.vouched {
-				t.Errorf("%s / %s: printed=%v, want %v: %q", code, c.name, printed, c.vouched, got)
+			printed := strings.Contains(got, code)
+			// ⚠ THE HALF THAT HOLDS ON BOTH SIDES OF THE SEAM IS THE NEGATIVE ONE.
+			// Where the SDK did NOT write the token, it must not be published --
+			// that is the finding, and it is true in both branches. Where the SDK
+			// DID, this branch publishes it and the branch stacked above withholds
+			// the whole diagnostic, because there the text is never taken from the
+			// error at all; so the positive half is "published, or refused", which
+			// is exactly what each branch does (shardpilot/shardpilot-go#84 review).
+			if !c.sdkWrote && printed {
+				t.Errorf("%s / %s: a taxonomy word this SDK did not write was published: %q",
+					code, c.name, got)
+			}
+			if c.sdkWrote && !printed && len(structuralSurfaces) == 0 {
+				t.Errorf("%s / %s: the SDK's own classification was neither published nor refused: %q",
+					code, c.name, got)
 			}
 			suppliedValues = nil
 			structuralSurfaces = nil
