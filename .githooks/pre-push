@@ -159,6 +159,23 @@ absolutize_one() {
       ;;
   esac
 }
+NL='
+'
+physdir() {
+  # Prints the physically-resolved directory followed by a literal `X`, or
+  # returns 1 and prints nothing.
+  #
+  # ⚠ TWO SUBSTITUTIONS EAT THE SAME BYTE, SO BOTH ARE SENTINELLED. A directory
+  # name may end in a newline -- `mkdir "$PWD/w<NL>"` is an ordinary directory --
+  # and `$( )` strips EVERY trailing newline, not one. The inner sentinel
+  # separates the name's last byte from the one `pwd` appends; the `X` this
+  # function prints does the same for the CALLER's assignment, which would
+  # otherwise eat it a second time (shardpilot/shardpilot-go#79 review).
+  pd_out="$( cd -- "$1" 2>/dev/null && pwd -P && printf X )" || return 1
+  pd_out="${pd_out%X}"
+  pd_out="${pd_out%$NL}"
+  printf '%sX' "$pd_out"
+}
 if [ -n "${GIT_OBJECT_DIRECTORY:-}" ]; then
   # ⚠ THE SAME SENTINEL AS THE LIST BELOW. The round before put it on the
   # alternates call site and not on this one -- fixed where I was shown -- so an
@@ -281,6 +298,37 @@ tmpdir="$( cd "$tmpdir" && pwd -P )" || {
   printf 'REFUSING: the temporary directory could not be resolved.\n' >&2
   exit 2
 }
+# ⚠ SYNTHETIC EVIDENCE WAS BEING WRITTEN INTO THE REPOSITORY UNDER INSPECTION.
+#
+# `hash-object -w` puts the staged evidence in whatever object store the caller
+# is using, so every push left unreachable blobs behind in the user's repository
+# -- measured: four per push on a one-file repository, and they persist until a
+# `gc`. It also makes a WRITABLE object store a precondition for pushing, which
+# an ordinary push does not need: a clone reading a shared store mounted
+# read-only can transfer every object it must and was refused here
+# (shardpilot/shardpilot-go#79 review).
+#
+# A private store under the temporary directory takes the writes; the caller's
+# store is reached as an ALTERNATE, and git follows alternates transitively, so
+# everything readable before is readable still. The path is captured BEFORE the
+# override, because `--git-path objects` answers with the variable being replaced.
+evidence_objects="$tmpdir/objects"
+real_objects="$(git rev-parse --path-format=absolute --git-path objects 2>/dev/null && printf X)" || real_objects=""
+real_objects="${real_objects%X}"
+real_objects="${real_objects%$NL}"
+if [ -z "$real_objects" ] || ! mkdir -p "$evidence_objects/info"; then
+  printf 'REFUSING: could not prepare a private object store for evidence.\n' >&2
+  printf '  Writing it into the repository under inspection is what this avoids.\n' >&2
+  exit 2
+fi
+# The alternates file is newline-separated, so a store whose path contains one
+# has to be C-quoted -- the same reason the environment list is quoted above.
+{ cquote_alt "$real_objects"; printf '\n'; } > "$evidence_objects/info/alternates" || {
+  printf 'REFUSING: could not point the evidence store at %s.\n' "$real_objects" >&2
+  exit 2
+}
+GIT_OBJECT_DIRECTORY="$evidence_objects"
+export GIT_OBJECT_DIRECTORY
 base_ref=""
 cleanup() {
   git_safe worktree remove --force "$tmpdir/wt" >/dev/null 2>&1 || true
@@ -307,7 +355,14 @@ trap cleanup EXIT
 # before this line is reading with the gate's own input at stake.
 pushed_lines="$(cat)"
 
-root="$(git rev-parse --show-toplevel)"
+# ⚠ THE SAME EATEN BYTE, AND HERE IT FAILS OPEN TOO. `$tracked_scanner` is built
+# from this value and tested with `-r` below: a root short of its last byte names
+# a path that does not exist, the test is false, and the comparison against the
+# tracked scanner -- the check that catches a branch shipping its own scanner --
+# is skipped without a word (shardpilot/shardpilot-go#79, derived population).
+root="$(git rev-parse --show-toplevel && printf X)"
+root="${root%X}"
+root="${root%$NL}"
 tracked_scanner="$root/scripts/check_public_surface.sh"
 
 # ⚠ THE SCANNER MUST BE TRUSTED TOO, AND THE TRACKED ONE IS NOT.
@@ -362,7 +417,18 @@ if [ -z "$common_dir" ]; then
 ' >&2
   exit 2
 fi
-hooks_dir="$(cd "$common_dir" 2>/dev/null && pwd)/hooks"
+# ⚠ THE OTHER SIDE OF THE CONTAINMENT COMPARISON. The review named the worktree
+# root; this is the value it is compared AGAINST, built the same way and losing
+# the same byte. A comparison is not repaired by fixing one operand
+# (shardpilot/shardpilot-go#79, derived population). `pwd -P` also replaces the
+# logical `pwd` that was here: comparing a logical path to a physical one answers
+# a question neither operand asked.
+if hooks_root="$(physdir "$common_dir")"; then
+  hooks_root="${hooks_root%X}"
+else
+  hooks_root=""
+fi
+hooks_dir="$hooks_root/hooks"
 if [ "$hooks_dir" = "/hooks" ] || [ -z "${hooks_dir%/hooks}" ]; then
   printf 'REFUSING: the common git directory %s could not be resolved.
 ' "$common_dir" >&2
@@ -387,14 +453,62 @@ scanner="$hooks_dir/check_public_surface.sh"
 # provide, and `git reset --hard <branch>` overwrites the installed bytes before the
 # next push (shardpilot/shardpilot-go#79 review). The property is CONTAINMENT, and
 # the symlink test was a proxy for it that holds only in the usual layout.
-worktree_root="$( cd "$(git rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null && pwd -P )" || worktree_root=""
+# ⚠ AND THE NAME ITSELF MAY END IN A NEWLINE, WHICH BOTH SUBSTITUTIONS ATE.
+# `git rev-parse --show-toplevel` prints the path and a terminator, so a worktree
+# named `w<NL>` arrived here as `w`, `cd` failed on a directory that does not
+# exist, and this assignment became EMPTY -- skipping the containment check
+# entirely and admitting the very layout it was added to refuse
+# (shardpilot/shardpilot-go#79 review).
+wt_top="$(git rev-parse --show-toplevel 2>/dev/null && printf X)" || wt_top=""
+wt_top="${wt_top%X}"
+wt_top="${wt_top%$NL}"
+worktree_root=""
+if [ -n "$wt_top" ] && worktree_root="$(physdir "$wt_top")"; then
+  worktree_root="${worktree_root%X}"
+else
+  worktree_root=""
+  # ⚠ AN UNRESOLVED ROOT MUST NOT MEAN "NOTHING TO CHECK". Empty was the value
+  # the defect above produced, and the check read it as "no worktree" and passed.
+  # A bare repository legitimately has none; anything else is a resolution that
+  # FAILED, and this gate does not pass on a measurement it could not take.
+  if [ "$(git rev-parse --is-bare-repository 2>/dev/null || printf false)" != true ]; then
+    printf 'REFUSING: this repository has a worktree, but its root could not be\n' >&2
+    printf '  resolved, so the hooks directory cannot be shown to lie outside it.\n' >&2
+    exit 2
+  fi
+fi
 if [ -n "$worktree_root" ]; then
+  # ⚠ INSIDE THE WORKTREE IS NOT THE PROPERTY -- TRACKABLE IS.
+  #
+  # The predicate this replaces refused every ORDINARY repository: `.git/hooks`
+  # is physically inside the worktree, so the case matched and a push from a
+  # normal clone was refused. It went unnoticed because the two operands were
+  # built differently -- a LOGICAL `pwd` here against a PHYSICAL one there -- and
+  # on macOS `/var` resolves to `/private/var`, so the prefixes never matched and
+  # the check never fired at all. Making both physical, which the comparison
+  # needs, exposed it: measured on a symlink-free path, the operands agree and
+  # every ordinary repository is refused (that is CI, and every Linux checkout).
+  #
+  # What the finding was about is content a BRANCH can supply, and git decides
+  # that by its own rule: it refuses to track any path with a `.git` component.
+  # So `<root>/.git/hooks` is unreachable from a branch however deeply it sits
+  # inside the worktree, while `--separate-git-dir=$PWD/.repo` gives `.repo/hooks`
+  # -- inside, with no such component, and trackable. That is the line, and it is
+  # git's line rather than a list of layouts I happened to think of.
   case "$hooks_dir/" in
     "$worktree_root"/*)
-      printf 'REFUSING: the hooks directory %s is inside the worktree %s.\n' "$hooks_dir" "$worktree_root" >&2
-      printf '  Everything under it is trackable, so a branch can supply the hook or\n' >&2
-      printf '  the scanner and a checkout can replace the installed bytes.\n' >&2
-      exit 2
+      # Trackability is decided on the path RELATIVE to the worktree: a `.git`
+      # component anywhere in it puts the directory beyond any branch's reach.
+      hooks_rel="${hooks_dir#"$worktree_root"/}"
+      case "/$hooks_rel/" in
+        */.git/*) : ;;
+        *)
+          printf 'REFUSING: the hooks directory %s is inside the worktree %s\n' "$hooks_dir" "$worktree_root" >&2
+          printf '  and is trackable there (%s). A branch can supply the hook or the\n' "$hooks_rel" >&2
+          printf '  scanner, and a checkout can replace the installed bytes.\n' >&2
+          exit 2
+          ;;
+      esac
       ;;
   esac
 fi
@@ -1348,6 +1462,27 @@ while read -r local_ref local_sha remote_ref remote_sha; do
           # out preserves it.
           leaf="$(printf '%s' "$leaf" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_' )"
           [ -n "$leaf" ] || leaf="blob"
+          # ⚠ AND THE COMPONENT HAS A LENGTH LIMIT, WHICH A TREE ENTRY DOES NOT.
+          # Git accepts and pushes a tree whose leaf is 256 bytes; this destination
+          # then exceeded the filesystem's per-component limit, the redirection
+          # failed with `ENAMETOOLONG`, and the gate refused a VALID push
+          # (shardpilot/shardpilot-go#79 review). A declared limit excuses missing
+          # something, never rejecting something correct.
+          #
+          # The limit is ASKED FOR, not assumed: `NAME_MAX` is 255 on ext4 and APFS
+          # and smaller on others, and a guessed bound is the same defect one size
+          # along. The tail is what survives, because the SUFFIX is what the scanner
+          # classifies by; the complete path is still published verbatim in the
+          # listing evidence, so nothing is lost from the record. `tr` above left
+          # only ASCII, so `${#leaf}` counts bytes here.
+          name_max="$(getconf NAME_MAX "$tmpdir" 2>/dev/null || printf 255)"
+          case "$name_max" in ''|*[!0-9]*) name_max=255 ;; esac
+          [ "$name_max" -ge 32 ] || name_max=255
+          leaf_max=$(( name_max - ${#nb} - 6 ))
+          [ "$leaf_max" -ge 8 ] || leaf_max=8
+          if [ "${#leaf}" -gt "$leaf_max" ]; then
+            leaf="$(printf '%s' "$leaf" | tail -c "$leaf_max")"
+          fi
           read_evidence "$tmpdir/tag-blobs/$nb-$leaf" write \
             "a blob reached through the tagged tree ($oid)" cat-file blob "$oid"
           run_evidence "$tmpdir/tag-blobs/$nb-$leaf.mode" write \

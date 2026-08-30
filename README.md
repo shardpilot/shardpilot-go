@@ -311,9 +311,17 @@ No Makefile — standard Go tooling.
 **Install the pre-push hook once, before your first push:**
 
 ```
-h="$(cd "$(git rev-parse --git-common-dir)" && pwd -P)/hooks" &&
-w="$(cd "$(git rev-parse --show-toplevel)" && pwd -P)" &&
-case "$h/" in "$w"/*) echo "$h is inside the worktree $w" >&2; exit 1 ;; esac &&
+p_(){ x="$(cd -- "$1" && pwd -P && printf X)" || return 1; x="${x%X}"; printf '%sX' "${x%?}"; } &&
+g="$(git rev-parse --git-common-dir && printf X)" && g="${g%X}" && g="${g%?}" &&
+t="$(git rev-parse --show-toplevel && printf X)" && t="${t%X}" && t="${t%?}" &&
+h="$(p_ "$g")" && h="${h%X}/hooks" &&
+w="$(p_ "$t")" && w="${w%X}" &&
+case "$h/" in
+  "$w"/*) case "/${h#"$w"/}/" in
+            */.git/*) : ;;
+            *) echo "$h is inside the worktree $w and trackable there" >&2; exit 1 ;;
+          esac ;;
+esac &&
 test ! -L "$h" &&
 mkdir -p "$h" &&
 for f in pre-push check_public_surface.sh .pre-push.new .check_public_surface.sh.new; do
@@ -336,15 +344,26 @@ mv "$h/.pre-push.new" "$h/pre-push" &&
 mv "$h/.check_public_surface.sh.new" "$h/check_public_surface.sh" &&
 git config --local core.hooksPath "$h" &&
 while IFS= read -r -d "" w; do
-  got="$(cd "$(git -C "$w" rev-parse --path-format=absolute --git-path hooks)" && pwd -P)" || exit 1
+  gp="$(git -C "$w" rev-parse --path-format=absolute --git-path hooks && printf X)" || exit 1
+  gp="${gp%X}"; gp="${gp%?}"
+  got="$(p_ "$gp")" || exit 1
+  got="${got%X}"
   test "$got" = "$h" ||
     { echo "hooks still resolve elsewhere in $w: $got" >&2; exit 1; }
 done < "$wp" &&
 rm -f "$wt" "$wp"
 ```
 
-**The hooks directory must be OUTSIDE the worktree, and that is checked rather
-than inferred from `-L`.** A repository initialised with
+**The hooks directory must not be TRACKABLE from the worktree, and that is
+checked rather than inferred from `-L`.** Inside the worktree is not the same
+question: `<root>/.git/hooks` is inside it and no branch can reach it, because git
+refuses to track any path with a `.git` component. Testing containment alone
+refused the ordinary layout and this installer could not run at all; the `.git`
+component is git's own line, and it is the one drawn here.
+
+**Every path here is read with a sentinel**, because `$( )` strips trailing
+newlines and a directory name may end in one — twice over, since the value passes
+through a command substitution in the helper and again in the caller's assignment. A repository initialised with
 `--separate-git-dir="$PWD/.repo"` has an ordinary common git directory beneath its
 own checkout: `$h` is no symlink, so the link test passes, while everything under
 it is trackable and `git reset --hard <branch>` can replace the installed hook or
