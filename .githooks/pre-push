@@ -158,9 +158,19 @@ NL='
 '
 inherited_git_dir=""
 if [ -n "${GIT_DIR:-}" ]; then
-  inherited_git_dir="$(git rev-parse --absolute-git-dir 2>/dev/null && printf X)" || inherited_git_dir=""
-  inherited_git_dir="${inherited_git_dir%X}"
-  inherited_git_dir="${inherited_git_dir%$NL}"
+  # ⚠ WITH BUILTINS. This step runs BEFORE the PATH filter -- it has to, since the
+  # filter needs the repository -- and my first version called `git` here: a
+  # checkout-controlled directory leading PATH would have executed a tracked `bin/git`
+  # ahead of every protection in this file, including the one that drops it
+  # (shardpilot/shardpilot-go#79 review). A fix that introduces an external command
+  # ahead of the sanitiser is worse than the defect it repaired.
+  #
+  # Absolute is all this needs: the point is to keep naming the SAME repository after
+  # the selectors are cleared, not to canonicalise it.
+  case "$GIT_DIR" in
+    /*) inherited_git_dir="$GIT_DIR" ;;
+    *) inherited_git_dir="$PWD/$GIT_DIR" ;;
+  esac
 fi
 for gv in GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_NAMESPACE \
           GIT_CEILING_DIRECTORIES GIT_DISCOVERY_ACROSS_FILESYSTEM GIT_PREFIX \
@@ -832,6 +842,21 @@ if [ -n "$worktree_root" ]; then
     done
   }
   common_phys="$(physdir "$common_dir")" && common_phys="${common_phys%X}" || common_phys="$common_dir"
+  # Does the checkout this hook was invoked from own that git directory? If so, its
+  # root is already in the filter and the unfindable-owner case below is not a gap.
+  invoking_owns_common=no
+  if [ -d "$worktree_root/.git" ]; then
+    iv_phys="$(physdir "$worktree_root/.git")" && iv_phys="${iv_phys%X}" || iv_phys=""
+    [ -n "$iv_phys" ] && [ "$iv_phys" = "$common_phys" ] && invoking_owns_common=yes
+  elif [ -f "$worktree_root/.git" ]; then
+    IFS= read -r iv_link < "$worktree_root/.git" || iv_link=""
+    case "$iv_link" in
+      "gitdir: "*)
+        iv_phys="$(physdir "${iv_link#gitdir: }")" && iv_phys="${iv_phys%X}" || iv_phys=""
+        [ -n "$iv_phys" ] && [ "$iv_phys" = "$common_phys" ] && invoking_owns_common=yes
+        ;;
+    esac
+  fi
   check_containment "$worktree_root"
   check_path_outside "$worktree_root"
   if [ -s "$wt_list_file" ]; then
@@ -853,13 +878,34 @@ if [ -n "$worktree_root" ]; then
             # ...but the checkout that OWNS it, if any, is still a checkout, and it is
             # found the way git links them: a `.git` FILE naming this directory.
             # `core.worktree` is not set for a separate git dir -- measured, not assumed.
+            wt_owner_found=no
             if [ -f "$wt_owner/.git" ]; then
               IFS= read -r wt_link < "$wt_owner/.git" || wt_link=""
               if [ "$wt_link" = "gitdir: $wt_phys" ] || [ "$wt_link" = "gitdir: $wt_other" ]; then
+                wt_owner_found=yes
                 wt_owner_phys="$(physdir "$wt_owner")" && wt_owner_phys="${wt_owner_phys%X}" &&
                   check_containment "$wt_owner_phys" &&
                   check_path_outside "$wt_owner_phys"
               fi
+            fi
+            # ⚠ AN EXTERNAL GIT DIRECTORY HAS NO BACK-POINTER, so its checkout cannot
+            # be found at all -- measured: `--separate-git-dir` writes `gitdir:` into
+            # the CHECKOUT and nothing into the directory, and `core.worktree` is not
+            # set. The parent assumption above covers `<main>/.repo`; for
+            # `/tmp/store/repo.git` owning `/tmp/main` there is nothing to follow, so a
+            # PATH entry under `/tmp/main/bin` is inside a checkout this gate cannot
+            # enumerate and a branch there supplies the next `git` or `mktemp`
+            # (shardpilot/shardpilot-go#79 review).
+            #
+            # It is only a gap when the INVOKING checkout is not that owner -- when it
+            # is, its root is already filtered. So this refuses exactly the layout it
+            # cannot speak for, and says which two things make it go away.
+            if [ "$wt_owner_found" = no ] && [ "$invoking_owns_common" = no ]; then
+              printf 'REFUSING: %s is a git directory whose checkout this gate cannot find.\n' "$wt_phys" >&2
+              printf '  A separate git directory records no path back to its worktree, so a\n' >&2
+              printf '  PATH entry inside that checkout cannot be ruled out. Push from the\n' >&2
+              printf '  main checkout, or keep the git directory inside it.\n' >&2
+              exit 2
             fi
             continue
           fi
@@ -1238,6 +1284,19 @@ scan_commit() {
   # own public-surface gate refused the push that added it -- correctly. A review
   # thread is not published; a comment in tracked content is. Describe the shape,
   # never the instance.
+  # ⚠ AND `scanner_row` ALREADY SAID WHETHER THE ENTRY EXISTS. This probe was asked
+  # on its own and a FAILURE read as "the commit carries no scanner file" -- so a
+  # transient object-store or promisor failure let the trusted scanner replace an
+  # entry that IS there, and that path is excluded from content scanning, so the
+  # commit's own scanner bytes were published without ever becoming evidence
+  # (shardpilot/shardpilot-go#79 review). The row above is the authority on
+  # existence; this probe may only confirm it, never contradict it.
+  if [ -n "$scanner_row" ] && ! git_safe cat-file -e "$1:scripts/check_public_surface.sh" 2>/dev/null; then
+    printf 'REFUSING: %s lists a scanner at scripts/check_public_surface.sh whose blob\n' "$1" >&2
+    printf '  could not be read, so this gate cannot stage it as evidence and would\n' >&2
+    printf '  replace it with its own copy unseen.\n' >&2
+    exit 2
+  fi
   if git_safe cat-file -e "$1:scripts/check_public_surface.sh" 2>/dev/null; then
     if ! git_safe cat-file blob "$1:scripts/check_public_surface.sh" \
          > "$tmpdir/committed-scanner" 2>/dev/null; then
