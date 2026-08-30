@@ -2928,13 +2928,17 @@ func TestAnInterimResponseIsRecordedAndPrinted(t *testing.T) {
 // returning the final response.
 type traceFiringTransport struct {
 	codes []int
+	hdr   textproto.MIMEHeader
 	resp  *http.Response
 }
 
 func (t *traceFiringTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if tr := httptrace.ContextClientTrace(req.Context()); tr != nil && tr.Got1xxResponse != nil {
 		for _, c := range t.codes {
-			h := textproto.MIMEHeader{"Link": []string{"</s.css>; rel=preload"}}
+			h := t.hdr
+			if h == nil {
+				h = textproto.MIMEHeader{"Link": []string{"</s.css>; rel=preload"}}
+			}
 			if err := tr.Got1xxResponse(c, h); err != nil {
 				return nil, err
 			}
@@ -3023,5 +3027,112 @@ func TestTheCandidateChainReachesWrappedAndReWrappedValues(t *testing.T) {
 		}
 		suppliedValues = nil
 		decodeWork = 0
+	}
+}
+
+// An interim response is a response.
+//
+// ⚠ THE REQUEST REDACTOR ASKS A QUESTION ABOUT THE REQUEST. `redact` consults
+// `serialiserWritten` — whether net/http wrote a field for the OUTGOING request —
+// so every endpoint field of an interim response was marked generated, the guard
+// skipped the span, and `stripMarks` published it verbatim
+// (shardpilot/shardpilot-go#84 review). My own capture from the previous round
+// introduced this: handing a response to the request's redactor is the same
+// category error as reading a trailer with the header path's rules, which this
+// file has now made five times.
+//
+// The rows are the shapes an interim response carries: an endpoint-only field, a
+// field the request also has, and a server-minted surface.
+func TestAnInterimResponseGoesThroughTheResponsePipeline(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		hdr    textproto.MIMEHeader
+		refuse bool
+	}{
+		{"an endpoint-only field", textproto.MIMEHeader{"Link": []string{"</reset/kill_switch>"}}, false},
+		{"a field the request also has", textproto.MIMEHeader{"User-Agent": []string{"kill_switch"}}, false},
+		{"a server-minted surface", textproto.MIMEHeader{"Set-Cookie": []string{"sid=kill_switch"}}, true},
+	} {
+		suppliedValues = []string{"kill_switch"}
+		structuralSurfaces = nil
+		rec := &recorder{inner: &traceFiringTransport{codes: []int{103}, hdr: c.hdr, resp: &http.Response{
+			StatusCode: 200, Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+			Status: "200 OK", Header: http.Header{}, ContentLength: -1, Body: http.NoBody,
+		}}}
+		req, err := http.NewRequest("GET", "https://e.example"+assignmentRoute, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := rec.RoundTrip(req); err != nil {
+			t.Fatal(err)
+		}
+		rec.mu.Lock()
+		got := rec.exchanges
+		rec.mu.Unlock()
+		var b strings.Builder
+		renderExchanges(&b, got)
+		out := stripMarks(b.String())
+		if strings.Contains(out, "kill_switch") {
+			t.Errorf("%s: a supplied identifier in an interim response was published: %q", c.name, out)
+		}
+		if refused := len(structuralSurfaces) > 0; refused != c.refuse {
+			t.Errorf("%s: refused=%v, want %v", c.name, refused, c.refuse)
+		}
+		suppliedValues = nil
+		structuralSurfaces = nil
+	}
+}
+
+// A refusal about the REQUEST does not withdraw the response.
+//
+// ⚠ `continue` MADE THE SECTION'S OWN SENTENCE FALSE. The NOT CAPTURED block says
+// the transport's outcome is reported below, and then skipped the informational
+// blocks, the response, and the recorded transport error
+// (shardpilot/shardpilot-go#84 review). The missing evidence is the request;
+// everything else was recorded and is still owed.
+func TestASerialiserRefusalStillRendersTheResponse(t *testing.T) {
+	structuralSurfaces = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	var report strings.Builder
+	renderExchanges(&report, []exchange{{
+		reqDumpErr: errors.New("net/http: invalid header field value"),
+		transErr:   errors.New("dial tcp: connection refused"),
+		proto:      "HTTP/1.1",
+	}})
+	got := report.String()
+	if !strings.Contains(got, "NOT CAPTURED") {
+		t.Errorf("the request section is silent about the missing evidence: %q", got)
+	}
+	if !strings.Contains(got, "## Response") {
+		t.Errorf("the section promised the transport outcome below and printed none: %q", got)
+	}
+}
+
+// A budget that does not count the work it bounds is a number in a message.
+//
+// ⚠ THE CANDIDATE PRODUCERS SCANNED `cur`, `norm` AND THE NAME STREAM ONCE PER
+// DECODER STAGE AND PER ROUND, AND NONE OF IT WAS CHARGED. The `len(cur)` charge
+// after the block accounted for one pass and `takeDecodeWork` covered only the
+// suffix tails, so post-processing could examine far more than the advertised
+// ceiling (shardpilot/shardpilot-go#84 review).
+//
+// I could not find an input that flips the budget's VERDICT: on every shape I
+// built, the other charges dominate and the refusal arrives either way. So this
+// asserts the accounting itself, which is the thing that was wrong — the same
+// seam `decodeWork` already provides for the suffix probes. The lower bound is
+// arithmetic rather than a guess: one round charges `joinBase64Runs` once over
+// `cur` and `binaryCandidates` twice, so at least three passes.
+func TestTheProducingScansAreCharged(t *testing.T) {
+	suppliedValues = []string{"nothingmatches"}
+	t.Cleanup(func() { suppliedValues = nil; decodeWork = 0; producerWork = 0 })
+	body := strings.Repeat("YWJjZGVm", 500) // 4000 bytes, no supplied value in it
+	decodeWork, producerWork = 0, 0
+	_ = assertNoLeak(asCaptured(body))
+	if producerWork == 0 {
+		t.Fatal("the candidate producers were charged nothing, so the ceiling does not bound them")
+	}
+	if min := 3 * len(body); producerWork < min {
+		t.Errorf("the producers were charged %d bytes for a %d-byte record; one round alone scans it at least %d",
+			producerWork, len(body), min)
 	}
 }

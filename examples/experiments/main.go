@@ -175,14 +175,15 @@ type exchange struct {
 	// so `teeBody` wraps the DECODED payload -- and the section's prose called
 	// those "the received bytes" (shardpilot/shardpilot-go#84 review).
 	uncompressed bool
-	// infos are the INFORMATIONAL responses, redacted like any captured bytes. Go's
+	// infos are the INFORMATIONAL responses, kept RAW and redacted by the RESPONSE
+	// path at render time. Go's
 	// transport consumes a `103 Early Hints` and exposes it only through
 	// `httptrace.ClientTrace.Got1xxResponse`, so a bare `RoundTrip` returns the
 	// final response alone -- and the report then claimed a complete captured pair
 	// while silently dropping a status and headers the endpoint had sent
 	// (shardpilot/shardpilot-go#84 review). This harness records rather than
 	// summarises; what it cannot show it must at least not omit in silence.
-	infos    [][]byte
+	infos    []string
 	captured *teeBody
 }
 
@@ -584,7 +585,8 @@ func renderExchanges(report *strings.Builder, exchanges []exchange) {
 			label = fmt.Sprintf(" %d", i+1)
 		}
 		if ex.reqDumpErr != nil {
-			// ⚠ NAMED, NOT BLANK. The serialiser refused, so there is no request
+			// ⚠ NAMED, NOT BLANK, AND THE REST OF THE SECTION STILL RENDERS. The
+			// serialiser refused, so there is no request
 			// evidence -- and a section that prints an empty block under a heading
 			// saying the request was formed is the artifact asserting what it does not
 			// have (shardpilot/shardpilot-go#84 review).
@@ -594,28 +596,36 @@ func renderExchanges(report *strings.Builder, exchanges []exchange) {
 				"serialisation exists to publish. The transport's own outcome is "+
 				"reported below; this section carries no evidence and does not "+
 				"pretend to.\n\n", label)
-			continue
+			// ⚠ AND `continue` MADE THAT SENTENCE FALSE. Skipping the rest of the
+			// iteration dropped the informational blocks, the response, and the
+			// recorded transport error -- so the artifact promised the outcome below
+			// and printed nothing (shardpilot/shardpilot-go#84 review). The missing
+			// evidence is the REQUEST; everything else was recorded and is still owed.
+		} else {
+			reqText := asCaptured(string(ex.req))
+			// ⚠ NOT "as the SDK sent it". DumpRequestOut serialises the request as
+			// HTTP/1.1 through a separate fake transport, BEFORE the real one
+			// negotiates a protocol. On an HTTP/2 connection the report paired a
+			// fabricated `HTTP/1.1` request line with a genuine `HTTP/2.0` status
+			// line and called the two a single wire exchange
+			// (shardpilot/shardpilot-go#73 review). The negotiated protocol is
+			// reported beside it, from the response, which is measured rather than
+			// serialised.
+			wire := ex.proto
+			if wire == "" {
+				wire = "not established — no response arrived"
+			}
+			fmt.Fprintf(report,
+				"## Request%s — canonical HTTP/1.1 representation\n\n"+
+					"Serialised by `httputil.DumpRequestOut`, which always writes HTTP/1.1. "+
+					"The connection negotiated **%s**, so this is the request's canonical form "+
+					"and its header set, not the bytes on the wire.\n\n%s\n",
+				label, wire, fencedBlock(reqText))
 		}
-		reqText := asCaptured(string(ex.req))
-		// ⚠ NOT "as the SDK sent it". DumpRequestOut serialises the request as
-		// HTTP/1.1 through a separate fake transport, BEFORE the real one
-		// negotiates a protocol. On an HTTP/2 connection the report paired a
-		// fabricated `HTTP/1.1` request line with a genuine `HTTP/2.0` status
-		// line and called the two a single wire exchange
-		// (shardpilot/shardpilot-go#73 review). The negotiated protocol is
-		// reported beside it, from the response, which is measured rather than
-		// serialised.
-		wire := ex.proto
-		if wire == "" {
-			wire = "not established — no response arrived"
-		}
-		fmt.Fprintf(report,
-			"## Request%s — canonical HTTP/1.1 representation\n\n"+
-				"Serialised by `httputil.DumpRequestOut`, which always writes HTTP/1.1. "+
-				"The connection negotiated **%s**, so this is the request's canonical form "+
-				"and its header set, not the bytes on the wire.\n\n%s\n",
-			label, wire, fencedBlock(reqText))
 		for _, info := range ex.infos {
+			// The per-exchange fact goes where `dropFraming` reads it, as for the
+			// final response.
+			receivedConnection = ex.recvConn
 			// ⚠ PRINTED, NOT SUMMARISED. These arrived from the endpoint and the final
 			// response does not contain them; a pair rendered without them is a pair
 			// that omits what it saw.
@@ -623,7 +633,7 @@ func renderExchanges(report *strings.Builder, exchanges []exchange) {
 				"transport consumed\n\nGo delivers these only through "+
 				"`httptrace`, so the final response below does not contain them "+
 				"and a report without this section would omit a status and headers "+
-				"the endpoint sent.\n\n%s\n", label, fencedBlock(asCaptured(string(info))))
+				"the endpoint sent.\n\n%s\n", label, fencedBlock(asCaptured(scrubSupplied(dropFraming(info)))))
 		}
 		switch {
 		case ex.transErr != nil:
@@ -719,6 +729,13 @@ func noteStructural(what string) {
 // decodeWorkMax bounds the bytes the decoding chain may examine for one record.
 // The budget counts bytes examined and fails CLOSED: past it the record is not
 // publishable and is not printed.
+// producerWork is what the CANDIDATE PRODUCERS have been charged since the caller
+// last reset it. It exists for the same reason `decodeWork` does: a budget that
+// cannot be read cannot be shown to count what it claims to bound, and the
+// producing scans were entirely uncounted until a review did the arithmetic by
+// hand (shardpilot/shardpilot-go#84 review).
+var producerWork int
+
 const decodeWorkMax = 64 << 20
 
 // decodeWork is what the suffix probes below have spent since the caller last
@@ -1508,7 +1525,7 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 	// trace is COMPOSED with rather than replaced, so a caller's own hooks keep
 	// firing.
 	var infoMu sync.Mutex
-	var infos [][]byte
+	var infos []string
 	traced := req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
 		Got1xxResponse: func(code int, h textproto.MIMEHeader) error {
 			var b strings.Builder
@@ -1525,7 +1542,16 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 			}
 			b.WriteString("\r\n")
 			infoMu.Lock()
-			infos = append(infos, redact([]byte(escapeMarks(b.String()))))
+			// ⚠ RAW HERE, REDACTED BY THE RESPONSE PATH AT RENDER TIME. My first
+			// version ran this through `redact`, which is the REQUEST redactor: it
+			// asks `serialiserWritten` whether net/http wrote the field for the
+			// OUTGOING request, so every endpoint field of an interim RESPONSE --
+			// `Link`, `Set-Cookie`, an echoed `User-Agent` -- was marked generated,
+			// the guard skipped the span, and `stripMarks` published it verbatim
+			// (shardpilot/shardpilot-go#84 review). An interim response is a
+			// response; handing it to the request's redactor is the same category
+			// error as reading a trailer with the header path's rules.
+			infos = append(infos, escapeMarks(b.String()))
 			infoMu.Unlock()
 			return nil
 		},
@@ -2644,8 +2670,24 @@ func assertNoLeak(text string) error {
 			// cannot reach it because it never un-wraps the base64
 			// (shardpilot/shardpilot-go#84 review). The candidate joins the same
 			// work budget, so a crafted body cannot spin it.
-			norm := joinBase64Runs(cur)
-			dec := undoBase64(norm)
+			// ⚠ EVERY PRODUCING SCAN IS CHARGED BEFORE IT RUNS. The block below scans
+			// `cur`, `norm` and the name stream once per DECODER STAGE and per ROUND,
+			// and none of those linear passes was added to `work`: the `len(cur)`
+			// charge after it accounts for one pass and `takeDecodeWork` covers only
+			// the suffix tails, so a crafted response could make post-processing
+			// examine hundreds of MiB under an advertised 64 MiB ceiling
+			// (shardpilot/shardpilot-go#84 review). A budget that does not count the
+			// work it is meant to bound is a number in a message.
+			//
+			// The pass count is per producer and stated at the call: `binaryCandidates`
+			// tokenises twice, the rest walk their input once.
+			charge := func(passes int, x string) string {
+				work += passes * len(x)
+				producerWork += passes * len(x)
+				return x
+			}
+			norm := joinBase64Runs(charge(1, cur))
+			dec := undoBase64(charge(1, norm))
 			extra = append(extra, norm, dec)
 			// ⚠ AND EVERY BINARY CANDIDATE RE-ENTERS THE CHAIN. These were appended
 			// as-is and never decoded again, so `/yU2MWJjZGVmZ2g=` -- base64 of
@@ -2661,15 +2703,15 @@ func assertNoLeak(text string) error {
 			// and no candidate ever held `bar` (shardpilot/shardpilot-go#84 review). The
 			// names decode in lockstep with the text everywhere else; the binary path was
 			// added later and inherited none of that.
-			bins := append(binaryCandidates(cur), binaryCandidates(norm)...)
-			bins = append(bins, binaryCandidates(curNames)...)
+			bins := append(binaryCandidates(charge(2, cur)), binaryCandidates(charge(2, norm))...)
+			bins = append(bins, binaryCandidates(charge(2, curNames))...)
 			extra = append(extra, bins...)
 			// ⚠ AND THE SUFFIX DECODES, AS CANDIDATES IN THEIR OWN RIGHT. See
 			// base64SuffixCandidates: spliced back behind their separator they are
 			// unreachable to the short-value matcher. They are SEEDS like the rest --
 			// a candidate is an input to the chain, not an answer from it.
-			sufs := append(base64SuffixCandidates(cur), base64SuffixCandidates(norm)...)
-			sufs = append(sufs, base64SuffixCandidates(curNames)...)
+			sufs := append(base64SuffixCandidates(charge(1, cur)), base64SuffixCandidates(charge(1, norm))...)
+			sufs = append(sufs, base64SuffixCandidates(charge(1, curNames))...)
 			// AND the short hex forms, and the wrapped runs that share a line with
 			// other text. Seeds like the rest: a candidate is an input to the chain.
 			// ⚠ THE REVIEW ASKED FOR `norm` HERE AND THE MEASUREMENT SAYS IT IS
@@ -2680,9 +2722,9 @@ func assertNoLeak(text string) error {
 			// the shared work budget, and a change no mutant kills is a change this
 			// file does not carry (shardpilot/shardpilot-go#84 review, measured).
 			for _, view := range []string{cur, curNames} {
-				sufs = append(sufs, hexCandidates(view)...)
-				sufs = append(sufs, shortBase64Candidates(view)...)
-				for _, w := range wrappedBase64Candidates(view) {
+				sufs = append(sufs, hexCandidates(charge(1, view))...)
+				sufs = append(sufs, shortBase64Candidates(charge(1, view))...)
+				for _, w := range wrappedBase64Candidates(charge(1, view)) {
 					sufs = append(sufs, w)
 					if d, ok := decodeBase64(w); ok {
 						sufs = append(sufs, d)
@@ -2730,13 +2772,13 @@ func assertNoLeak(text string) error {
 				if len(seeds) >= seedMax {
 					continue
 				}
-				for _, w := range wrappedBase64Candidates(d) {
+				for _, w := range wrappedBase64Candidates(charge(1, d)) {
 					seeds = append(seeds, w)
 					if dd, ok := decodeBase64(w); ok {
 						seeds = append(seeds, dd)
 					}
 				}
-				seeds = append(seeds, shortBase64Candidates(d)...)
+				seeds = append(seeds, shortBase64Candidates(charge(1, d))...)
 				work += takeDecodeWork()
 			}
 			if len(seeds) >= seedMax {
