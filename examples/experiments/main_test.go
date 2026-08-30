@@ -2692,7 +2692,11 @@ func TestAnUnaccountedValueInAParsedBodyIsRedacted(t *testing.T) {
 	// AND A VALUE THIS SDK ITSELF PRODUCES SURVIVES, which is what the verdict
 	// block reads.
 	structuralSurfaces, accountedSurfaces = nil, nil
-	if v := stripMarks(dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"reason\":\"not_found\"}")); !strings.Contains(v, "not_found") {
+	// ⚠ A VALUE THE SDK ACCEPTS **AT `reason`**, which is narrower than the taxonomy:
+	// the not-assigned branch takes only `{absent, kill_switch,
+	// targeting_unmatched}` (shardpilot/shardpilot-go#85 review). This scene used
+	// `not_found`, which the SDK writes as a Code and refuses at this member.
+	if v := stripMarks(dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"reason\":\"targeting_unmatched\"}")); !strings.Contains(v, "targeting_unmatched") {
 		t.Fatalf("the SDK's own taxonomy was lengthened: %q", v)
 	}
 }
@@ -4263,7 +4267,11 @@ func TestAnInterimResponseIsRecordedAndPrinted(t *testing.T) {
 	}
 	var report strings.Builder
 	renderExchanges(&report, got)
-	out := report.String()
+	// ⚠ WITHOUT THE MARKS. The response pipeline marks the reason phrase and the
+	// field name as generated, so `103 Early Hints` and `Link` are split by
+	// provenance bytes in the raw builder output. A scene that reads the marked
+	// text is reading a spelling, not the content.
+	out := stripMarks(report.String())
 	for _, want := range []string{"Informational", "103 Early Hints", "Link"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("the report omits %q from an interim response: %q", want, out)
@@ -4275,13 +4283,17 @@ func TestAnInterimResponseIsRecordedAndPrinted(t *testing.T) {
 // returning the final response.
 type traceFiringTransport struct {
 	codes []int
+	hdr   textproto.MIMEHeader
 	resp  *http.Response
 }
 
 func (t *traceFiringTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if tr := httptrace.ContextClientTrace(req.Context()); tr != nil && tr.Got1xxResponse != nil {
 		for _, c := range t.codes {
-			h := textproto.MIMEHeader{"Link": []string{"</s.css>; rel=preload"}}
+			h := t.hdr
+			if h == nil {
+				h = textproto.MIMEHeader{"Link": []string{"</s.css>; rel=preload"}}
+			}
 			if err := tr.Got1xxResponse(c, h); err != nil {
 				return nil, err
 			}
@@ -4471,5 +4483,251 @@ func TestTheCandidateChainReachesWrappedAndReWrappedValues(t *testing.T) {
 		}
 		suppliedValues = nil
 		decodeWork = 0
+	}
+}
+
+// An interim response is a response.
+//
+// ⚠ THE REQUEST REDACTOR ASKS A QUESTION ABOUT THE REQUEST. `redact` consults
+// `serialiserWritten` — whether net/http wrote a field for the OUTGOING request —
+// so every endpoint field of an interim response was marked generated, the guard
+// skipped the span, and `stripMarks` published it verbatim
+// (shardpilot/shardpilot-go#84 review). My own capture from the previous round
+// introduced this: handing a response to the request's redactor is the same
+// category error as reading a trailer with the header path's rules, which this
+// file has now made five times.
+//
+// The rows are the shapes an interim response carries: an endpoint-only field, a
+// field the request also has, and a server-minted surface.
+func TestAnInterimResponseGoesThroughTheResponsePipeline(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		hdr  textproto.MIMEHeader
+	}{
+		{"an endpoint-only field", textproto.MIMEHeader{"Link": []string{"</reset/kill_switch>"}}},
+		{"a field the request also has", textproto.MIMEHeader{"User-Agent": []string{"kill_switch"}}},
+		{"a server-minted surface", textproto.MIMEHeader{"Set-Cookie": []string{"sid=kill_switch"}}},
+	} {
+		suppliedValues = []string{"kill_switch"}
+		structuralSurfaces = nil
+		rec := &recorder{inner: &traceFiringTransport{codes: []int{103}, hdr: c.hdr, resp: &http.Response{
+			StatusCode: 200, Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+			Status: "200 OK", Header: http.Header{}, ContentLength: -1, Body: http.NoBody,
+		}}}
+		req, err := http.NewRequest("GET", "https://e.example"+assignmentRoute, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := rec.RoundTrip(req); err != nil {
+			t.Fatal(err)
+		}
+		rec.mu.Lock()
+		got := rec.exchanges
+		rec.mu.Unlock()
+		var b strings.Builder
+		renderExchanges(&b, got)
+		// ⚠ THE PROPERTY, NOT THIS BRANCH'S ANSWER TO IT. Whether a server-minted
+		// surface in an interim response is REFUSED or structurally REDACTED differs
+		// across the stack seam -- refusing is this branch's parent's answer and
+		// redacting is this one's -- so asserting a refusal holds on one side only.
+		// What both owe is that the identifier is not published.
+		if out := stripMarks(b.String()); strings.Contains(out, "kill_switch") {
+			t.Errorf("%s: a supplied identifier in an interim response was published: %q", c.name, out)
+		}
+		suppliedValues = nil
+		structuralSurfaces = nil
+	}
+}
+
+// A refusal about the REQUEST does not withdraw the response.
+//
+// ⚠ `continue` MADE THE SECTION'S OWN SENTENCE FALSE. The NOT CAPTURED block says
+// the transport's outcome is reported below, and then skipped the informational
+// blocks, the response, and the recorded transport error
+// (shardpilot/shardpilot-go#84 review). The missing evidence is the request;
+// everything else was recorded and is still owed.
+func TestASerialiserRefusalStillRendersTheResponse(t *testing.T) {
+	structuralSurfaces = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	var report strings.Builder
+	renderExchanges(&report, []exchange{{
+		reqDumpErr: errors.New("net/http: invalid header field value"),
+		transErr:   errors.New("dial tcp: connection refused"),
+		proto:      "HTTP/1.1",
+	}})
+	got := report.String()
+	if !strings.Contains(got, "NOT CAPTURED") {
+		t.Errorf("the request section is silent about the missing evidence: %q", got)
+	}
+	if !strings.Contains(got, "## Response") {
+		t.Errorf("the section promised the transport outcome below and printed none: %q", got)
+	}
+}
+
+// A budget that does not count the work it bounds is a number in a message.
+//
+// ⚠ THE CANDIDATE PRODUCERS SCANNED `cur`, `norm` AND THE NAME STREAM ONCE PER
+// DECODER STAGE AND PER ROUND, AND NONE OF IT WAS CHARGED. The `len(cur)` charge
+// after the block accounted for one pass and `takeDecodeWork` covered only the
+// suffix tails, so post-processing could examine far more than the advertised
+// ceiling (shardpilot/shardpilot-go#84 review).
+//
+// I could not find an input that flips the budget's VERDICT: on every shape I
+// built, the other charges dominate and the refusal arrives either way. So this
+// asserts the accounting itself, which is the thing that was wrong — the same
+// seam `decodeWork` already provides for the suffix probes. The lower bound is
+// arithmetic rather than a guess: one round charges `joinBase64Runs` once over
+// `cur` and `binaryCandidates` twice, so at least three passes.
+func TestTheProducingScansAreCharged(t *testing.T) {
+	suppliedValues = []string{"nothingmatches"}
+	t.Cleanup(func() { suppliedValues = nil; decodeWork = 0; producerWork = 0 })
+	body := strings.Repeat("YWJjZGVm", 500) // 4000 bytes, no supplied value in it
+	decodeWork, producerWork = 0, 0
+	_ = assertNoLeak(asCaptured(body))
+	if producerWork == 0 {
+		t.Fatal("the candidate producers were charged nothing, so the ceiling does not bound them")
+	}
+	if min := 3 * len(body); producerWork < min {
+		t.Errorf("the producers were charged %d bytes for a %d-byte record; one round alone scans it at least %d",
+			producerWork, len(body), min)
+	}
+}
+
+// A position is the SDK's only where the SDK reads it.
+//
+// ⚠ AND READING IT IS CONDITIONAL ON THE REST OF THE DOCUMENT. The assigned branch
+// RETURNS before `reason` is read, so in a valid assigned response the member is
+// endpoint-chosen text the SDK never looks at — and vouching it published a
+// supplied identifier out of an ordinary success (shardpilot/shardpilot-go#85
+// review). The rounds before moved this question from the TOKEN to the POSITION
+// and then to the EFFECTIVE position; this is the third axis, and it is about the
+// document rather than about the member.
+//
+// The allowlist narrows with it: the not-assigned branch takes `{absent,
+// kill_switch, targeting_unmatched}` and refuses the body for anything else, so
+// the wider taxonomy would vouch a value the SDK itself rejects.
+func TestReasonIsVouchedOnlyWhereTheSDKReadsIt(t *testing.T) {
+	for _, c := range []struct {
+		body    string
+		vouched bool
+	}{
+		{`{"assigned":true,"assignment_key":"a","variant_key":"v","version":1,"reason":"kill_switch"}`, false},
+		{`{"assigned":false,"reason":"kill_switch"}`, true},
+		{`{"reason":"kill_switch"}`, true},
+		{`{"assigned":false,"reason":"targeting_unmatched"}`, true},
+		{`{"assigned":false,"reason":"not_found"}`, false},
+		{`{"assigned":false,"reason":"http_503"}`, false},
+	} {
+		want := "kill_switch"
+		if strings.Contains(c.body, "targeting_unmatched") {
+			want = "targeting_unmatched"
+		} else if strings.Contains(c.body, "not_found") {
+			want = "not_found"
+		} else if strings.Contains(c.body, "http_503") {
+			want = "http_503"
+		}
+		suppliedValues = []string{want}
+		structuralSurfaces, accountedSurfaces = nil, nil
+		got := scrubSupplied(redactUnaccountedBody(markBareJSONLiterals(
+			redactUnaccountedJSONValues(redactMintedBody(c.body, assignmentTopLevel), assignmentTopLevel), assignmentTopLevel)))
+		clean := strings.NewReplacer(capturedMark, "", genMark, "").Replace(got)
+		if printed := strings.Contains(clean, want); printed != c.vouched {
+			t.Errorf("%s: printed=%v, want %v: %q", c.body, printed, c.vouched, clean)
+		}
+		suppliedValues = nil
+		structuralSurfaces, accountedSurfaces = nil, nil
+	}
+}
+
+// The values accepted at `reason` are the SDK's own, read from its source.
+func TestTheReasonValuesAreTheSDKsOwn(t *testing.T) {
+	src, err := os.ReadFile("../../experiments.go")
+	if err != nil {
+		t.Fatalf("the SDK source is the oracle and it could not be read: %v", err)
+	}
+	found := map[string]bool{}
+	for _, m := range regexp.MustCompile(`experimentReason\w+\s*=\s*"([a-z_]+)"`).FindAllStringSubmatch(string(src), -1) {
+		found[m[1]] = true
+	}
+	if len(found) == 0 {
+		t.Fatal("no reason constants were read: an oracle that finds nothing is not agreement")
+	}
+	for v := range found {
+		if !sdkReasonValues[v] {
+			t.Errorf("the SDK accepts %q at `reason` and this build does not vouch it", v)
+		}
+	}
+	for v := range sdkReasonValues {
+		if !found[v] {
+			t.Errorf("%q is vouched at `reason` and the SDK has no such constant", v)
+		}
+	}
+}
+
+// Marking the vouched names is one pass, not one rebuild per name.
+//
+// ⚠ THE SECOND HALF OF A FIX APPLIED TO THE HALF IT WAS SHOWN. Two rounds ago the
+// VALUE-span assembly was rewritten from a right-to-left splice into a builder;
+// the NAME-span pass standing beside it kept the splice, and a valid object may
+// hold many vouched names (shardpilot/shardpilot-go#85 review).
+//
+// Measured on this machine at 30,000 duplicate canonical members in a ~510 KB
+// body — inside the accepted ~1 MB response limit, and after the network deadline
+// has stopped bounding anything: 2.694s splicing, 137ms with the builder. The
+// bound below is 500ms, which is a measurement with room rather than a guess.
+func TestVouchedNamesAreMarkedInOnePass(t *testing.T) {
+	suppliedValues = nil
+	t.Cleanup(func() { suppliedValues = nil })
+	const n = 30000
+	body := "{" + strings.TrimSuffix(strings.Repeat(`"assigned":false,`, n), ",") + "}"
+	start := time.Now()
+	got := redactMintedBody(body, assignmentTopLevel)
+	if d := time.Since(start); d > 500*time.Millisecond {
+		t.Errorf("marking %d vouched names took %v; the splice it replaced took 2.694s and the builder 137ms", n, d)
+	}
+	if strings.Count(got, genMark) < 2*n {
+		t.Errorf("the names were not all marked: %d mark bytes for %d names", strings.Count(got, genMark), n)
+	}
+}
+
+// A component is a POSITION in a grammar, not a spelling that occurs somewhere.
+//
+// ⚠ `strings.Replace` EDITED THE FIRST OCCURRENCE, WHICH IS NOT THE AUTHORITY.
+// With a supplied `http`, `http://http/cb` had its SCHEME replaced, and the
+// remaining passes emitted `redacted-19-chars//redacted-4-chars/...` — a malformed
+// target with no structural refusal recorded (shardpilot/shardpilot-go#85 review).
+//
+// The rows are the product of the components a supplied value can collide with by
+// spelling — the scheme, the host, a path segment — and the assertion is on the
+// GRAMMAR of what came out: a scheme, `://`, and an authority.
+func TestTheAuthorityIsReplacedAtItsOffset(t *testing.T) {
+	schemeOK := regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.\-]*$`)
+	for _, c := range []struct{ sup, target string }{
+		{"http", "http://http/cb"},
+		{"https", "https://https/cb"},
+		{"cb", "https://cb/cb"},
+		{"example", "https://e.example/cb"},
+		{"e", "https://e/e"},
+	} {
+		suppliedValues = []string{c.sup}
+		structuralSurfaces, accountedSurfaces = nil, nil
+		got := stripMarks(scrubSupplied(dropFraming(
+			"HTTP/1.1 302 Found\r\nLocation: " + c.target + "\r\n\r\n")))
+		for _, ln := range strings.Split(got, "\r\n") {
+			v, ok := strings.CutPrefix(ln, "Location: ")
+			if !ok {
+				continue
+			}
+			sch, rest, found := strings.Cut(v, "://")
+			if !found || !schemeOK.MatchString(sch) {
+				t.Errorf("%q with %q supplied published %q, which has no scheme", c.target, c.sup, v)
+				continue
+			}
+			if rest == "" || strings.HasPrefix(rest, "/") {
+				t.Errorf("%q with %q supplied published %q, which has no authority", c.target, c.sup, v)
+			}
+		}
+		suppliedValues = nil
+		structuralSurfaces, accountedSurfaces = nil, nil
 	}
 }

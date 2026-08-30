@@ -647,8 +647,10 @@ func redactTarget(line string) string {
 					noteAccounted(formField, "a redirect authority colliding with a supplied value")
 					// `url` carries its own terminator, so rebuilding the line from it
 					// keeps the CR without a separate branch.
-					line = head + ":" + gap + strings.Replace(url, a, tokenPlaceholder(a), 1)
-					url = strings.Replace(url, a, tokenPlaceholder(a), 1)
+					if lo, hi, ok := authorityRange(strings.TrimSuffix(url, "\r")); ok {
+						url = url[:lo] + tokenPlaceholder(a) + url[hi:]
+						line = head + ":" + gap + url
+					}
 				}
 			}
 		}
@@ -786,18 +788,36 @@ func redactPath(line string) string {
 
 // authorityOf returns the authority of a URI reference, or "" if it has none.
 func authorityOf(url string) string {
+	a, b, ok := authorityRange(url)
+	if !ok {
+		return ""
+	}
+	return url[a:b]
+}
+
+// authorityRange returns the authority's byte range in the target.
+//
+// ⚠ THE OFFSET, BECAUSE THE TEXT REPEATS. Replacing the authority by its first
+// textual occurrence edited the wrong component whenever the same text appears
+// earlier: with a supplied `http`, `http://http/cb` had its SCHEME replaced, and
+// the remaining passes then emitted `redacted-19-chars//redacted-4-chars/...` --
+// a malformed target, with no structural refusal recorded
+// (shardpilot/shardpilot-go#85 review). A component is a POSITION in a grammar;
+// finding its spelling somewhere is not finding it.
+func authorityRange(url string) (int, int, bool) {
 	i := strings.Index(url, "//")
 	if i < 0 {
-		return ""
+		return 0, 0, false
 	}
 	if i > 0 && !isSchemeName(strings.TrimSuffix(url[:i], ":")) {
-		return ""
+		return 0, 0, false
 	}
-	rest := url[i+2:]
-	if j := strings.IndexAny(rest, "/?#"); j >= 0 {
-		rest = rest[:j]
+	a := i + 2
+	b := len(url)
+	if j := strings.IndexAny(url[a:], "/?#"); j >= 0 {
+		b = a + j
 	}
-	return rest
+	return a, b, true
 }
 
 func redactSetCookie(line string) string {
@@ -1260,6 +1280,19 @@ func anyMarked(inMark []bool, a, b int) bool {
 // (shardpilot/shardpilot-go#85 review).
 var sdkVerdictFields = map[string]bool{"reason": true}
 
+// sdkReasonValues are the classifications the SDK accepts AT the `reason` member.
+//
+// ⚠ NARROWER THAN THE TAXONOMY, BECAUSE THE POSITION IS NARROWER. `sdkTaxonomy`
+// is every string this SDK writes as a classification anywhere; the not-assigned
+// branch allows only `{absent, kill_switch, targeting_unmatched}` and refuses the
+// body outright for anything else. Vouching the whole taxonomy here says the SDK
+// wrote a value it would have rejected (shardpilot/shardpilot-go#85 review).
+// `TestTheReasonValuesAreTheSDKsOwn` reads the constants out of the SDK source.
+var sdkReasonValues = map[string]bool{
+	"kill_switch":         true,
+	"targeting_unmatched": true,
+}
+
 // verdictKey groups a member name the way `encoding/json` groups it.
 //
 // ⚠ THE DECODER FOLDS, AND THE COUNTING HAS TO FOLD WITH IT. `encoding/json`
@@ -1335,6 +1368,17 @@ func redactUnaccountedJSONValues(body string, exempt map[string]bool) string {
 	}
 	var spans []span
 	var depth []int8 // 0 = array, 1 = object expecting KEY, 2 = object expecting VALUE
+	// Whether the SDK's assigned branch would return before reading `reason`,
+	// decided by the SDK's own decoder over the mark-free view.
+	assignedTrue := false
+	{
+		var shape struct {
+			Assigned *bool `json:"assigned"`
+		}
+		if json.Unmarshal([]byte(view), &shape) == nil && shape.Assigned != nil {
+			assignedTrue = *shape.Assigned
+		}
+	}
 	verdictField := ""
 	verdictSeen := map[string]int{}
 	verdictOrd := 0
@@ -1477,7 +1521,17 @@ func redactUnaccountedJSONValues(body string, exempt map[string]bool) string {
 		// (shardpilot/shardpilot-go#85 review). The position was checked against the
 		// vocabulary rather than against the wire contract, which is the same mistake
 		// the top-level name registry made one round earlier.
-		if sdkTaxonomy[str] && sdkVerdictFields[verdictKey(verdictField)] {
+		// ⚠ AND ONLY WHERE THE SDK ACTUALLY CLASSIFIES BY IT. The assigned branch
+		// RETURNS before `reason` is read, so in `{"assigned":true,…,"reason":"x"}`
+		// the member is endpoint-chosen text the SDK never looks at -- and vouching it
+		// published a supplied identifier out of a perfectly valid assigned response
+		// (shardpilot/shardpilot-go#85 review). A position is the SDK's only where the
+		// SDK reads it, and reading it is conditional on the rest of the document.
+		//
+		// The allowlist is the narrower one too: the not-assigned branch takes
+		// `{absent, kill_switch, targeting_unmatched}` and refuses the body for
+		// anything else, so the wider taxonomy would vouch a value the SDK rejects.
+		if sdkReasonValues[str] && sdkVerdictFields[verdictKey(verdictField)] && !assignedTrue {
 			// ⚠ THE SPAN INCLUDES THE QUOTES, SO THE REPLACEMENT MUST TOO. Emitting
 			// only `marked(str)` produced `{"code":kill_switch}` after the marks are
 			// stripped -- invalid JSON, which the body rule then refused, so EVERY
@@ -1764,11 +1818,33 @@ func redactMintedBody(body string, exempt map[string]bool) string {
 			vouchAt = append(vouchAt, [2]int{loc[2], loc[3]})
 		}
 	}
-	for k := len(vouchAt) - 1; k >= 0; k-- {
-		a, b := vouchAt[k][0], vouchAt[k][1]
-		out = out[:a] + vouched(out[a:b]) + out[b:]
+	// ⚠ ONE PASS, NOT ONE REBUILD PER SPAN. Splicing right-to-left copies almost the
+	// whole document for every vouched name, and a valid object may hold many:
+	// measured, a ~500 KB body with 30,000 duplicate canonical members drove about
+	// 16 GB of cumulative allocations and seconds of work, inside the accepted ~1 MB
+	// response limit and after the network deadline has stopped bounding anything
+	// (shardpilot/shardpilot-go#85 review). Same defect as the value-span assembly
+	// two rounds ago, in the pass written beside it -- the second half of a fix that
+	// was applied to the half it was shown.
+	//
+	// The spans are produced in ascending order by the scan; the builder walks them
+	// once and copies each byte at most once.
+	if len(vouchAt) == 0 {
+		return out
 	}
-	return out
+	var b strings.Builder
+	b.Grow(len(out))
+	prev := 0
+	for _, sp := range vouchAt {
+		if sp[0] < prev || sp[1] > len(out) {
+			continue
+		}
+		b.WriteString(out[prev:sp[0]])
+		b.WriteString(vouched(out[sp[0]:sp[1]]))
+		prev = sp[1]
+	}
+	b.WriteString(out[prev:])
+	return b.String()
 }
 
 // redactPath replaces every non-empty path segment of a redirect target with its
