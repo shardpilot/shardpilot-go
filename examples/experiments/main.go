@@ -909,7 +909,22 @@ func markMediaType(line string) string {
 	mt, params, _ := strings.Cut(rest, ";")
 	lead := mt[:len(mt)-len(strings.TrimLeft(mt, " \t"))]
 	bare := strings.TrimSpace(mt)
-	if !registeredMediaTypes[strings.ToLower(bare)] {
+	// ⚠ THE REGISTRY LOOKUP FOLDS CASE; VOUCHING MUST NOT. `application/JSON` is
+	// the same media type to the registry and a different string on the wire, and
+	// marking the raw span vouched for a spelling the registry never saw -- so a
+	// supplied `JSON` was skipped by both the scrub and the guard
+	// (shardpilot/shardpilot-go#85 review). Recognition is about what a value
+	// DENOTES; vouching is about the bytes.
+	// ⚠ NOT IF THE CRITERION HAS ALREADY VOUCHED. In the half that carries
+	// `verbatimHeaders`, an admitted media type is marked before this runs, and
+	// marking it again produced NESTED marks -- which read as captured text, so the
+	// value was scrubbed after all. The guard half has no such criterion, which is
+	// why this function still exists; here it must stand down.
+	if strings.Contains(bare, genMark) {
+		return line
+	}
+	plainBare := stripMarks(bare)
+	if !registeredMediaTypes[strings.ToLower(plainBare)] || plainBare != strings.ToLower(plainBare) {
 		return line
 	}
 	out := line[:i+1] + lead + marked(bare)
@@ -934,6 +949,21 @@ func scrubStructuralName(line string) string {
 		return admitFieldName(line[:i]) + line[i:]
 	}
 	return line
+}
+
+// markFieldColon marks the delimiter between a field name and its value.
+//
+// ⚠ APPLIED LAST, like the media type and the target delimiters: the passes before
+// it re-split the line, and a mark inserted earlier does not survive them.
+func markFieldColon(line string) string {
+	i := strings.IndexByte(line, ':')
+	if i <= 0 {
+		return line
+	}
+	if i+1 < len(line) && string(line[i+1]) == genMark {
+		return line
+	}
+	return line[:i] + marked(":") + line[i+1:]
 }
 
 func dropFraming(dump string) string {
@@ -1136,7 +1166,12 @@ func dropFraming(dump string) string {
 			// recognise the field and the whole value was replaced by a length -- three
 			// scenes said so at once. Same rule as the grammar pass and the member names:
 			// classification runs on a document, marking runs on the result.
-			out = append(out, markMediaType(admitFieldName(l[:i])+redactUnlessVerbatim(l)[i:]))
+			// ⚠ AND THE FIELD DELIMITER. Any non-empty experiment key is accepted, so a
+			// supplied `:` rewrote an ordinary `Date: Mon, …` to `Date<redacted, 1 chars>
+			// Mon, …` -- and the guard approved it, because the placeholder is generated
+			// (shardpilot/shardpilot-go#85 review). The colon between a field name and
+			// its value is the message's own punctuation.
+			out = append(out, markFieldColon(markMediaType(admitFieldName(l[:i])+redactUnlessVerbatim(l)[i:])))
 			continue
 		}
 		out = append(out, scrubStructuralName(redactUnlessVerbatim(l)))
@@ -1826,12 +1861,21 @@ func markBareJSONLiterals(text string) string {
 	// mapped back to the text that is actually edited.
 	plain := make([]byte, 0, len(text))
 	back := make([]int, 0, len(text))
+	// ⚠ AND WHETHER EACH BYTE WAS ALREADY INSIDE A MARK. Marking a quote that
+	// bounds an existing placeholder produced NESTED marks, which read as captured
+	// text -- the fixture for exactly that said so on the first run. Containment is
+	// tracked while the view is built, because after it is built the information is
+	// gone.
+	inMark := make([]bool, 0, len(text))
+	depth := 0
 	for i := 0; i < len(text); i++ {
 		if text[i] == capturedMark[0] || text[i] == genMark[0] {
+			depth++
 			continue
 		}
 		plain = append(plain, text[i])
 		back = append(back, i)
+		inMark = append(inMark, depth%2 == 1)
 	}
 	view := string(plain)
 	back = append(back, len(text))
@@ -1903,11 +1947,95 @@ func markBareJSONLiterals(text string) string {
 			}
 		}
 	}
-	for k := len(spans) - 1; k >= 0; k-- {
-		sp := spans[k]
-		text = text[:sp.a] + marked(text[sp.a:sp.b]) + text[sp.b:]
+	// ⚠ `json.Delim` REPORTS BRACES AND BRACKETS ONLY. Commas, colons and the
+	// quotes that bound strings are grammar too, and a supplied identifier may
+	// legally BE one: with `,` the ordinary `{"assigned":false,"code":1}` was
+	// published as invalid JSON (shardpilot/shardpilot-go#85 review). The
+	// population is the punctuation of the grammar, not the subset one API
+	// happens to name.
+	//
+	// Walked over the same mark-free view, tracking string state, so a `,` INSIDE
+	// a string stays captured text -- which is the whole reason this cannot be a
+	// byte scan.
+	{
+		inStr, esc := false, false
+		for k := start; k < len(view); k++ {
+			c := view[k]
+			switch {
+			case esc:
+				esc = false
+			case inStr && c == '\\':
+				esc = true
+			case c == '"':
+				inStr = !inStr
+				if !inMark[k] {
+					spans = append(spans, span{back[k], back[k] + 1})
+				}
+			case inStr:
+			case c == ',' || c == ':':
+				if !inMark[k] {
+					spans = append(spans, span{back[k], back[k] + 1})
+				}
+			}
+		}
+		sort.Slice(spans, func(a, b int) bool { return spans[a].a < spans[b].a })
+		// ⚠ ADJACENT SPANS ARE MERGED. Marking each punctuation byte on its own put
+		// `\x01{\x01\x01"\x01` in the output -- two marked spans touching, which reads
+		// as a nested pair and is exactly what the double-mark fixture forbids. One
+		// run of grammar is one span.
+		merged := spans[:0]
+		for _, sp := range spans {
+			if n := len(merged); n > 0 && sp.a <= merged[n-1].b {
+				if sp.b > merged[n-1].b {
+					merged[n-1].b = sp.b
+				}
+			} else {
+				merged = append(merged, sp)
+			}
+		}
+		spans = merged
 	}
-	return text
+	// ⚠ APPLIED AS ONE REGION MAP, NOT SPAN BY SPAN. Inserting a mark pair per span
+	// put two marked regions side by side wherever a grammar byte abuts a value the
+	// earlier passes had already marked -- and two touching pairs read as a nested
+	// one, which the double-mark fixture forbids and the guard mis-parses. The
+	// generated bytes are collected into a boolean map, the old markers are dropped,
+	// and markers are re-emitted only at the boundaries of the merged regions.
+	gen := make([]bool, len(text))
+	{
+		d := 0
+		for i := 0; i < len(text); i++ {
+			if text[i] == genMark[0] {
+				d++
+				continue
+			}
+			gen[i] = d%2 == 1
+		}
+	}
+	for _, sp := range spans {
+		for i := sp.a; i < sp.b && i < len(text); i++ {
+			gen[i] = true
+		}
+	}
+	var out strings.Builder
+	open := false
+	for i := 0; i < len(text); i++ {
+		if text[i] == genMark[0] {
+			continue
+		}
+		if gen[i] && !open {
+			out.WriteString(genMark)
+			open = true
+		} else if !gen[i] && open {
+			out.WriteString(genMark)
+			open = false
+		}
+		out.WriteByte(text[i])
+	}
+	if open {
+		out.WriteString(genMark)
+	}
+	return out.String()
 }
 
 // jsonLiterals are the three bare tokens of JSON grammar. A supplied value equal

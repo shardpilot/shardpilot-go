@@ -2238,3 +2238,63 @@ func TestVouchingParsesAMarkFreeView(t *testing.T) {
 		t.Fatalf("a recognised SDK field was scrubbed out of an ordinary body: %q", got)
 	}
 }
+
+// ---- round on a212a1c ----
+
+// TestVouchingRequiresTheRecognisedSpelling: the predicates normalise case, so
+// `Content-Type: application/JSON` is admitted — and marking the RAW span vouched
+// for a spelling the registry never saw (shardpilot/shardpilot-go#85 review).
+func TestVouchingRequiresTheRecognisedSpelling(t *testing.T) {
+	suppliedValues = []string{"JSON"}
+	receivedConnection = true
+	t.Cleanup(func() { suppliedValues = nil; receivedConnection = false })
+	got := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\nContent-Type: application/JSON\r\n\r\n")))
+	if strings.Contains(got, "application/JSON") {
+		t.Fatalf("a non-canonical spelling was vouched for: %q", got)
+	}
+	// And the canonical one still prints.
+	suppliedValues = []string{"json"}
+	got = stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n")))
+	if !strings.Contains(got, "application/json") {
+		t.Fatalf("the canonical spelling was scrubbed: %q", got)
+	}
+}
+
+// TestAnEscapedMemberNameIsNotVouched: recognition here is SEMANTIC —
+// `{"assigned":false}` decodes to a name this program knows — and marking the raw
+// span vouched for the endpoint's escape (shardpilot/shardpilot-go#85 review).
+func TestAnEscapedMemberNameIsNotVouched(t *testing.T) {
+	suppliedValues = []string{"bound"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// ⚠ OBSERVED THROUGH THE GUARD, AND ON A VALUE THE GUARD CAN SEE. Two earlier
+	// versions of this scene could not tell the fix from its absence: the first
+	// asserted the scrub removed the supplied value, the second asserted the guard
+	// refused -- but both supplied a value sitting MID-WORD inside the escape, and
+	// both the scrub and the guard require a word boundary, so neither would have
+	// acted whether or not the span was vouched. `bound` here is bounded by `"` and
+	// `\`, so the only thing standing between it and a refusal is the vouching.
+	body := redactMintedBody(`{"bound\u0061ry":1}`)
+	if err := assertNoLeak(asCaptured(body)); err == nil {
+		t.Fatalf("an endpoint escape spelling was vouched for, so the guard passed it: %q", body)
+	}
+	// AND THE RECOGNISED SPELLING IS STILL VOUCHED: the rule must forbid the
+	// arrived spelling without forbidding the one this program writes.
+	if plain := redactMintedBody(`{"boundary":1}`); !strings.Contains(plain, genMark) {
+		t.Fatalf("the recognised spelling lost its vouching: %q", plain)
+	}
+}
+
+// TestAnEmptyPortOnABracketedAuthorityIsAccepted: `https://[::1]:/cb` leaves the
+// trailing colon in `host`, so the bracket test refused an authority Go accepts —
+// while the registered-name form with an empty port is admitted
+// (shardpilot/shardpilot-go#85 review).
+func TestAnEmptyPortOnABracketedAuthorityIsAccepted(t *testing.T) {
+	if !parsesAsURI("https://[::1]:/cb") {
+		t.Fatal("a bracketed authority with an empty port was refused")
+	}
+	if !parsesAsURI("https://e.example:/cb") {
+		t.Fatal("the registered-name form stopped being accepted")
+	}
+}

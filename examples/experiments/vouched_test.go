@@ -25,27 +25,35 @@ func TestEveryVouchedTokenSurvivesTheScrub(t *testing.T) {
 	type probe struct {
 		what string
 		line string
+		// tok is SUPPLIED; want is what must still be there afterwards. They are
+		// the same string for a token, and different for punctuation: a lone `:`
+		// survives inside a field name's own marked span whatever this program
+		// does with the delimiter, so a probe that supplies `:` and looks for `:`
+		// cannot fail. The delimiter is only observable in its context -- `Age:`
+		// (shardpilot/shardpilot-go#85 review).
 		tok  string
+		want string
 	}
+	pv := func(what, line, tok string) probe { return probe{what, line, tok, tok} }
 	var probes []probe
 
 	for name := range registeredFieldNames {
-		probes = append(probes, probe{"registered field name", "HTTP/1.1 200 OK\r\n" + name + ": 1\r\n\r\n", name})
+		probes = append(probes, pv("registered field name", "HTTP/1.1 200 OK\r\n"+name+": 1\r\n\r\n", name))
 		break
 	}
 	for _, a := range []string{"Secure", "Path", "Max-Age", "SameSite", "HttpOnly"} {
 		if !standardCookieAttr(a) {
 			t.Fatalf("the probe list drifted from standardCookieAttr: %q", a)
 		}
-		probes = append(probes, probe{"cookie attribute", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; " + a + "\r\n\r\n", a})
+		probes = append(probes, pv("cookie attribute", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; "+a+"\r\n\r\n", a))
 	}
-	probes = append(probes, probe{"no-op content coding",
-		"HTTP/1.1 200 OK\r\nContent-Encoding: identity\r\n\r\n", "identity"})
+	probes = append(probes, pv("no-op content coding",
+		"HTTP/1.1 200 OK\r\nContent-Encoding: identity\r\n\r\n", "identity"))
 	for name := range benignTopLevel {
-		probes = append(probes, probe{"benign JSON member",
-			"HTTP/1.1 200 OK\r\n\r\n{\"" + name + "\":1}", name})
+		probes = append(probes, pv("benign JSON member",
+			"HTTP/1.1 200 OK\r\n\r\n{\""+name+"\":1}", name))
 	}
-	probes = append(probes, probe{"HTTP/1 reason phrase", "HTTP/1.1 200 OK\r\n\r\n", "OK"})
+	probes = append(probes, pv("HTTP/1 reason phrase", "HTTP/1.1 200 OK\r\n\r\n", "OK"))
 
 	// ⚠ AND THE PREDICATES THAT ADMIT VALUES, not only the registries of NAMES.
 	// The first version of this sweep drew from name registries alone, so four more
@@ -55,17 +63,17 @@ func TestEveryVouchedTokenSurvivesTheScrub(t *testing.T) {
 	// is "everything this program admits BECAUSE it recognises it", and half of that
 	// is values (shardpilot/shardpilot-go#85 review).
 	probes = append(probes,
-		probe{"admitted header value", "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n", "application/json"},
+		pv("admitted header value", "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n", "application/json"),
 		// ⚠ NOT `Content-Length`: `dropFraming` REMOVES that field and puts a capture
 		// note in its place, so the probe never reached the criterion it was aiming
 		// at — it measured a header that does not survive to be measured. `Age` is
 		// admitted by the same numeric predicate and does survive.
-		probe{"admitted header value", "HTTP/1.1 200 OK\r\nAge: 12\r\n\r\n", "12"},
-		probe{"admitted cookie attribute value", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; SameSite=Lax\r\n\r\n", "Lax"},
-		probe{"admitted cookie attribute value", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; Max-Age=10\r\n\r\n", "10"},
-		probe{"approved URI scheme", "HTTP/1.1 200 OK\r\nLocation: https://e.example/cb\r\n\r\n", "https"},
-		probe{"structural field name", "HTTP/1.1 200 OK\r\nLocation: /cb\r\n\r\n", "Location"},
-		probe{"structural field name", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x\r\n\r\n", "Set-Cookie"},
+		pv("admitted header value", "HTTP/1.1 200 OK\r\nAge: 12\r\n\r\n", "12"),
+		pv("admitted cookie attribute value", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; SameSite=Lax\r\n\r\n", "Lax"),
+		pv("admitted cookie attribute value", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; Max-Age=10\r\n\r\n", "10"),
+		pv("approved URI scheme", "HTTP/1.1 200 OK\r\nLocation: https://e.example/cb\r\n\r\n", "https"),
+		pv("structural field name", "HTTP/1.1 200 OK\r\nLocation: /cb\r\n\r\n", "Location"),
+		pv("structural field name", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x\r\n\r\n", "Set-Cookie"),
 	)
 
 	// ⚠ AND THE PUNCTUATION THIS PROGRAM PRESERVES AS SYNTAX. A supplied identifier
@@ -79,13 +87,28 @@ func TestEveryVouchedTokenSurvivesTheScrub(t *testing.T) {
 	// Same rule as every row above, arriving on characters instead of tokens: what
 	// this program emits as STRUCTURE must be marked as structure.
 	probes = append(probes,
-		probe{"JSON structure", "HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false}", "{"},
-		probe{"JSON structure", "HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false}", "}"},
-		probe{"JSON structure", "HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false,\"code\":1}", ","},
-		probe{"cookie separator", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; Secure\r\n\r\n", ";"},
-		probe{"URI dot segment", "HTTP/1.1 200 OK\r\nLocation: ../cb\r\n\r\n", ".."},
-		probe{"URI separators", "HTTP/1.1 200 OK\r\nLocation: /a/b?x=1&y=2\r\n\r\n", "?"},
-		probe{"URI separators", "HTTP/1.1 200 OK\r\nLocation: /a/b?x=1&y=2\r\n\r\n", "&"},
+		pv("JSON structure", "HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false}", "{"),
+		pv("JSON structure", "HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false}", "}"),
+		pv("JSON structure", "HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false,\"code\":1}", ","),
+		pv("cookie separator", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; Secure\r\n\r\n", ";"),
+		pv("URI dot segment", "HTTP/1.1 200 OK\r\nLocation: ../cb\r\n\r\n", ".."),
+		pv("URI separators", "HTTP/1.1 200 OK\r\nLocation: /a/b?x=1&y=2\r\n\r\n", "?"),
+		pv("URI separators", "HTTP/1.1 200 OK\r\nLocation: /a/b?x=1&y=2\r\n\r\n", "&"),
+		// ⚠ THE COLONS, WHICH THE FIRST VERSION OF THIS ROW SET DID NOT NAME. A
+		// syntax set's population is the grammar's punctuation, and I had listed the
+		// characters I happened to think of (shardpilot/shardpilot-go#85 review).
+		pv("JSON structure", "HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false,\"code\":1}", ","),
+		pv("JSON structure", "HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false}", ":"),
+		pv("JSON structure", "HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false}", "\""),
+		// ⚠ SUPPLIES `:` AND LOOKS FOR `Age:`. Two earlier versions of this row could
+		// not fail. The first supplied `":"` and looked for `":"`, and an HTTP-date
+		// is full of colons the value's own mark protects. The second looked for
+		// `"Date:"` -- but the field NAME is marked, so that string is split across a
+		// marked span and the scrub never matched it whether the delimiter was
+		// vouched or not. Only the pair "supply the character, look for the framing"
+		// reaches the delimiter.
+		probe{"field delimiter", "HTTP/1.1 200 OK\r\nAge: 12\r\n\r\n", ":", "Age:"},
+		pv("scheme delimiter", "HTTP/1.1 200 OK\r\nLocation: https://e.example/cb\r\n\r\n", ":"),
 	)
 
 	for _, p := range probes {
@@ -102,8 +125,8 @@ func TestEveryVouchedTokenSurvivesTheScrub(t *testing.T) {
 			})
 			red := scrubSupplied(dropFraming(p.line))
 			got := stripMarks(red)
-			if !strings.Contains(got, p.tok) {
-				t.Fatalf("a token this program vouched for was rewritten: %q became %q", p.tok, got)
+			if !strings.Contains(got, p.want) {
+				t.Fatalf("a token this program vouched for was rewritten: %q became %q", p.want, got)
 			}
 			// ⚠ AND THE GUARD MUST AGREE. Surviving the scrub is half the property:
 			// a token the scrub deliberately skips can still be reported by

@@ -313,6 +313,12 @@ func parsesAsURI(target string) bool {
 	// relies on instead of inheriting whatever a future net/url accepts — which
 	// is the same reason the rest of this file stopped borrowing predicates.
 	if strings.HasPrefix(host, "[") {
+		// ⚠ AN EMPTY PORT IS LEGAL AND `Port()` REPORTS NOTHING. `https://[::1]:/cb`
+		// leaves the trailing colon in `host`, so this refused an authority Go
+		// accepts -- while the registered-name form with an empty port is admitted a
+		// few lines above (shardpilot/shardpilot-go#85 review). Two spellings of one
+		// thing, treated differently because only one was in front of me.
+		host = strings.TrimSuffix(host, ":")
 		if !strings.HasSuffix(host, "]") {
 			return false
 		}
@@ -510,7 +516,12 @@ func vouchTargetSyntax(line string) string {
 		case url[i] == ']':
 			inAuthority = false
 			b.WriteByte(url[i])
-		case !inAuthority && strings.IndexByte("?&=/#", url[i]) >= 0:
+		// ⚠ AND THE SCHEME DELIMITER. The set named the slashes and not the colon
+		// between them, so a supplied `:` published `https<redacted, 1 chars>//…`
+		// (shardpilot/shardpilot-go#85 review). The population of a syntax set is the
+		// grammar's punctuation, and I listed the characters I happened to think of --
+		// the same shape as `json.Delim` naming only braces.
+		case !inAuthority && strings.IndexByte("?&=/#:", url[i]) >= 0:
 			b.WriteString(syntax(string(url[i])))
 		default:
 			b.WriteByte(url[i])
@@ -1169,7 +1180,13 @@ func redactMintedBody(body string) string {
 		if vouchWalk(loc[0]) != 1 || !topNames[dec] {
 			continue
 		}
-		if isBenignName(dec) || isMintedName(dec) {
+		// ⚠ ONLY IF THE WIRE SPELLING IS THE NAME. Recognition here is SEMANTIC --
+		// `{"ass\u0069gned":false}` decodes to a name this program knows -- and marking
+		// the raw span then vouched for `ass\u0069gned`, so a supplied `u0069` was
+		// skipped by both the scrub and the guard
+		// (shardpilot/shardpilot-go#85 review). Knowing what a spelling MEANS is not
+		// knowing that this program wrote it.
+		if (isBenignName(dec) || isMintedName(dec)) && raw == dec {
 			vouchAt = append(vouchAt, [2]int{loc[2], loc[3]})
 		}
 	}
@@ -1542,6 +1559,21 @@ func unescapeMarks(s string) string {
 	return b.String()
 }
 
+// canonicalAdmitted is the spelling a field's own vocabulary uses. When the value
+// that arrived differs from it, the difference is the endpoint's choice and is not
+// vouched for — the value still prints, because the criterion admitted it, but the
+// supplied-value scrub is left able to reach it.
+func canonicalAdmitted(name, v string) string {
+	switch strings.ToLower(ows(name)) {
+	case "content-type":
+		return strings.ToLower(v)
+	case "content-encoding", "transfer-encoding", "connection", "vary",
+		"accept-ranges", "allow", "cache-control":
+		return strings.ToLower(v)
+	}
+	return v
+}
+
 func redactUnlessVerbatim(line string) string {
 	cr := ""
 	body := line
@@ -1592,7 +1624,17 @@ func redactUnlessVerbatim(line string) string {
 		// placeholder in a field whose grammar does not allow one, approved because
 		// the placeholder is generated (shardpilot/shardpilot-go#85 review). The
 		// criterion says WHY it prints; marking says who vouches for it.
-		return name + ":" + strings.Replace(value, ows(value), vouched(ows(value)), 1) + cr
+		// ⚠ VOUCH THE RECOGNISED FORM, NOT THE ARRIVED ONE. The predicates normalise
+		// case, so `Content-Type: application/JSON` is admitted -- and marking the RAW
+		// span then vouched for a spelling the registry never saw: with a supplied
+		// `JSON` both the scrub and the guard skipped the exact identifier and
+		// published it (shardpilot/shardpilot-go#85 review). Recognition is about what
+		// the value DENOTES; vouching is about the bytes, and the two are only the
+		// same when the spelling is canonical.
+		if raw := ows(value); raw == canonicalAdmitted(name, raw) {
+			return name + ":" + strings.Replace(value, raw, vouched(raw), 1) + cr
+		}
+		return line
 	}
 	// ⚠ MEASURED BEFORE OUR OWN ESCAPE. `escapeMarks` lengthens a backslash run
 	// on the way in, so a header carrying the literal `\x00` was reported four
