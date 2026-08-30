@@ -236,10 +236,17 @@ func (e *exchange) trailerReport() string {
 			// the field, and the server-generated cookie value was published --
 			// the same bypass for a supplied `location`
 			// (shardpilot/shardpilot-go#73 review).
+			// ⚠ THE SAME TABLE THE HEADER BLOCK READS. This list said `set-cookie`
+			// and `location`, and a `WWW-Authenticate` arriving as a trailer -- legal,
+			// and net/http accepts it into `Response.Trailer` -- was published
+			// (shardpilot/shardpilot-go#84 review). See serverMintedFields.
+			// ⚠ AND THE NOTE IS A CONSTANT. It read `"a " + k + " trailer"`, carrying
+			// the endpoint's own spelling of the field name to stderr -- a refusal
+			// printing the thing it refuses, which this file records twice already.
 			low := strings.ToLower(k)
-			if low == "set-cookie" || low == "location" {
-				noteStructural("a " + k + " trailer")
-				fmt.Fprintf(&b, "    %s\n", scrubHeaderName(escapeMarks(k))+": "+marked("<withheld>"))
+			if note, minted := serverMintedFields[low]; minted {
+				noteStructural(note)
+				fmt.Fprintf(&b, "    %s\n", canonicalFieldName(low)+": "+marked("<withheld>"))
 				continue
 			}
 			fmt.Fprintf(&b, "    %s\n",
@@ -472,6 +479,134 @@ func noteStructural(what string) {
 
 // mintedNames are the fields the SERVER mints -- the fact lane's subject and its
 // privacy boundary, defined as such in experiments.go.
+// serverMintedFields names the response fields whose VALUE the ENDPOINT mints.
+// No list of values THIS program supplied can reach such a value, and the
+// decoders behind the guard cannot either, so the value is withheld and the
+// record is not publishable.
+//
+// It is a map and not two conditions because the question was being asked in two
+// places with two answers. The note is stored WITH the name so no caller composes
+// one out of the field's arrived spelling.
+// decodeWorkMax bounds the bytes the decoding chain may examine for one record.
+// The budget counts bytes examined and fails CLOSED: past it the record is not
+// publishable and is not printed.
+const decodeWorkMax = 64 << 20
+
+// decodeWork is what the suffix probes below have spent since the caller last
+// collected it. The chain's budget lived entirely in the caller, charging
+// `len(cur)` per stage -- and the suffix scans inside `undoBase64` and
+// `binaryCandidates` are QUADRATIC in the length of a maximal run, so a body of
+// thousands of separator bytes did work the budget never saw: 20,000 `/` bytes
+// alone cost about 2.5 seconds against an accepted body ceiling near 1 MiB, so
+// an endpoint could hold post-processing far past the capture deadline
+// (shardpilot/shardpilot-go#84 review). A resource limit that does not count the
+// dominant term is not a limit.
+//
+// ⚠ AND STOPPING EARLY IS ONLY SAFE BECAUSE THE CALLER REFUSES. These scans give
+// up once the accumulator passes the ceiling, which examines LESS -- that would
+// be fail-open on its own. It is fail-closed here because the caller collects
+// this and refuses to publish the record at all; a short scan must never be able
+// to become a clean verdict.
+var decodeWork int
+
+// takeDecodeWork returns what the suffix probes have spent and resets it.
+func takeDecodeWork() int {
+	n := decodeWork
+	decodeWork = 0
+	return n
+}
+
+// separatorStarts names each offset in tok that follows a plausible separator
+// and leaves at least minLen bytes -- the starts a standard decoder would
+// reconstruct a value from, given that this tokeniser is MAXIMAL and `/`, `+`,
+// `-`, `_` and `.` all appear inside legal runs. The tails it names are charged
+// to decodeWork before they are handed to any decoder.
+func separatorStarts(tok string, minLen int) []int {
+	var out []int
+	for k := 0; k < len(tok); k++ {
+		if strings.IndexByte("/+-_.", tok[k]) < 0 || len(tok)-k-1 < minLen {
+			continue
+		}
+		decodeWork += len(tok) - k - 1
+		if decodeWork > decodeWorkMax {
+			return out
+		}
+		out = append(out, k+1)
+	}
+	return out
+}
+
+// base64SuffixCandidates retains each successfully decoded suffix as its OWN
+// candidate.
+//
+// ⚠ SPLICED BACK IN, THE DECODE IS UNREACHABLE. `undoBase64` writes the prefix
+// INCLUDING the separator and then the decoded bytes, so a legal short value
+// `bar` arriving as `-YmFy` became `-bar` -- and the short-value matcher counts
+// `-` and `_` as word bytes, so it read the occurrence as embedded and rejected
+// it, and the guard approved a directly reconstructable value
+// (shardpilot/shardpilot-go#84 review). The splice answers "what does this text
+// say"; the candidate answers "what can be reconstructed from it", and only the
+// second question has a boundary the matcher can see.
+func base64SuffixCandidates(text string) []string {
+	const minToken = 4
+	var out []string
+	for i := 0; i < len(text); {
+		j := i
+		for j < len(text) && isBase64Byte(text[j]) {
+			j++
+		}
+		if j == i {
+			i++
+			continue
+		}
+		tok := text[i:j]
+		i = j
+		if len(tok) < minToken {
+			continue
+		}
+		for _, st := range separatorStarts(tok, minToken) {
+			if dec, ok := decodeBase64(tok[st:]); ok {
+				out = append(out, dec)
+			}
+		}
+	}
+	return out
+}
+
+var serverMintedFields = map[string]string{
+	"set-cookie":         "a Set-Cookie field",
+	"location":           "a Location field",
+	"www-authenticate":   "an authentication challenge this build cannot describe",
+	"proxy-authenticate": "an authentication challenge this build cannot describe",
+}
+
+// canonicalFieldName renders a field name from THIS program's spelling, never
+// the one that arrived: printing the arrived spelling is how a refusal publishes
+// what it refused.
+func canonicalFieldName(low string) string {
+	parts := strings.Split(low, "-")
+	for i, p := range parts {
+		if p == "" {
+			continue
+		}
+		if strings.EqualFold(p, "www") {
+			parts[i] = "WWW"
+			continue
+		}
+		parts[i] = strings.ToUpper(p[:1]) + p[1:]
+	}
+	return strings.Join(parts, "-")
+}
+
+// fieldNameOf returns the lower-cased field name of a `name: value` line.
+func fieldNameOf(low string) (string, bool) {
+	i, ok := headerNameEnd(low)
+	if !ok {
+		return "", false
+	}
+	return low[:i], true
+}
+
 var mintedNames = map[string]bool{
 	"subject_fact_key": true,
 	"subject_key_hash": true,
@@ -615,12 +750,19 @@ func noteMinted(body string) string {
 	// in suppliedValues (shardpilot/shardpilot-go#84 review). The SDK calls such a
 	// response malformed; the harness printed it anyway.
 	//
-	// Fail closed, and only here: when the body carries `{` yet does not parse,
-	// nothing can show a minted name is nested, so it is treated as top-level. A
-	// body that parses keeps the depth rule exactly as it was -- a payload member
-	// the endpoint merely named that way must still not refuse a good capture.
+	// Fail closed, and only here: when the body does not parse, nothing can show a
+	// minted name is nested, so it is treated as top-level. A body that parses
+	// keeps the depth rule exactly as it was -- a payload member the endpoint
+	// merely named that way must still not refuse a good capture.
 	// ⚠ `!jsonParses`, NOT `topLevelMembers == nil`: see jsonParses.
-	if strings.ContainsRune(body, '{') && !jsonParses(body) {
+	// ⚠ AND NO `{` PREREQUISITE. A CLOSE-DELIMITED body -- `"subject_fact_key":
+	// "sfk1_…"` with no object around it at all -- is malformed to the SDK and
+	// carries no brace, so the scan was skipped on exactly the shape it exists
+	// for, and the value went out (shardpilot/shardpilot-go#84 review). The brace
+	// was a guess about how a malformed body looks, standing in front of a rule
+	// about what it CONTAINS; the scan below already answers that itself, and on a
+	// body with no minted member it finds nothing and costs nothing.
+	if !jsonParses(body) {
 		for _, m := range jsonMemberName.FindAllStringSubmatch(body, -1) {
 			if isMinted(m[1]) {
 				noteStructural("a server-minted subject identifier in a body that does not parse")
@@ -817,15 +959,22 @@ func dropFraming(dump string) string {
 		// inside them, while a reader need only apply the declared coding
 		// (shardpilot/shardpilot-go#84 review). This half cannot decode it, so it
 		// does not publish it.
-		// ⚠ THE SAME QUESTION ON THE SUCCESS PATH. The transport-error path classifies
-		// `WWW-Authenticate` and `Proxy-Authenticate` as unpublishable challenges, and
-		// that check ran only when PARSING FAILED -- so an ordinary 401 published the
-		// endpoint-minted challenge value, which no supplied value can reach
-		// (shardpilot/shardpilot-go#84 review). I added the check to the path I was
-		// shown; its twin is where responses normally arrive.
-		if strings.HasPrefix(low, "www-authenticate:") ||
-			strings.HasPrefix(low, "proxy-authenticate:") {
-			noteStructural("an authentication challenge this build cannot describe")
+		// ⚠ ONE QUESTION, ONE SITE, AND BOTH PATHS ASK IT. This chain and the
+		// trailer report each decided for themselves which fields carry a value the
+		// ENDPOINT mints, and the trailer's answer named two of them -- so a chunked
+		// response declaring `Trailer: WWW-Authenticate` published the challenge
+		// while `structuralSurfaces` stayed empty (shardpilot/shardpilot-go#84
+		// review). That is the third time the same question was answered on one
+		// path and not its twin, and each time the repair was another NAME. The
+		// population lives in `serverMintedFields` now, and adding a name to it
+		// reaches every path that asks; the sweep over that map is what makes the
+		// two paths' agreement a measured thing rather than a habit.
+		if name, ok := fieldNameOf(low); ok {
+			if note, minted := serverMintedFields[name]; minted {
+				noteStructural(note)
+				out = append(out, canonicalFieldName(name)+": "+marked("<withheld>")+cr)
+				continue
+			}
 		}
 		if strings.HasPrefix(low, "content-encoding:") {
 			if v := strings.TrimSpace(strings.TrimSuffix(l[len("content-encoding:"):], "\r")); v != "" &&
@@ -851,15 +1000,6 @@ func dropFraming(dump string) string {
 				continue
 			}
 		}
-		if strings.HasPrefix(low, "location:") {
-			// ⚠ AND THE FRAGMENT, NOT ONLY THE QUERY. An OAuth-style redirect
-			// carries its credential after `#` -- `#access_token=…` never reaches
-			// the server and is exactly the value a capture must not publish, and
-			// `redactQuery` saw only `?` (shardpilot/shardpilot-go#73 review).
-			noteStructural("a Location header")
-			out = append(out, "Location: "+marked("<withheld>")+cr)
-			continue
-		}
 		// ⚠ AND A HEADER NAME CAN CARRY THE IDENTIFIER. `X-<key>: v` published it
 		// in the name, and the guard's short-value rule counts `-` as a word byte
 		// so the boundary check waved it through. The trailer path already did
@@ -875,11 +1015,6 @@ func dropFraming(dump string) string {
 		// whole purpose is to be published (shardpilot/shardpilot-go#73 review).
 		// Redacted STRUCTURALLY, like the query string: the cookie's name and
 		// its attributes stay, the value becomes a length.
-		if strings.HasPrefix(low, "set-cookie:") {
-			noteStructural("a Set-Cookie header")
-			out = append(out, "Set-Cookie: "+marked("<withheld>")+cr)
-			continue
-		}
 		if strings.HasPrefix(low, "transfer-encoding:") {
 			out = append(out, marked("X-Capture-Note: Transfer-Encoding removed — the body below is decoded")+cr)
 			continue
@@ -1299,13 +1434,18 @@ func noteStructuralInText(text string) {
 				}
 			}
 		}
-		switch {
-		case strings.Contains(low, "set-cookie:"):
-			noteStructural("a server-set cookie inside a transport error")
-		case strings.Contains(low, "location:"):
-			noteStructural("a redirect target inside a transport error")
-		case strings.Contains(low, "www-authenticate:"), strings.Contains(low, "proxy-authenticate:"):
-			noteStructural("an authentication challenge inside a transport error")
+		// ⚠ THE THIRD SITE ASKING THE SAME QUESTION, and it had its own answer too.
+		// This one listed all four names while the trailer report listed two, which
+		// is how the drift stayed invisible: whichever site you read, it looked
+		// complete (shardpilot/shardpilot-go#84 review). All three read
+		// `serverMintedFields` now. Sorted, so a line naming two fields notes them
+		// in a fixed order rather than in map order.
+		// A `switch` would stop at the first match; an error line is free-form text
+		// and can carry more than one field, so every match is noted.
+		for _, name := range slices.Sorted(maps.Keys(serverMintedFields)) {
+			if strings.Contains(low, name+":") {
+				noteStructural(serverMintedFields[name] + " inside a transport error")
+			}
 		}
 	}
 }
@@ -1906,8 +2046,13 @@ func assertNoLeak(text string) error {
 	// report, which is quadratic and lets a crafted response hang this program
 	// instead of being refused by it (shardpilot/shardpilot-go#73 review). The
 	// budget counts bytes examined and fails CLOSED.
-	const decodeWorkMax = 64 << 20
 	work := 0
+	// ⚠ THE PROBE ACCUMULATOR IS RESET HERE, because the budget is PER RECORD.
+	// Today it happens to reach zero on its own -- the collection points below are
+	// exhaustive -- but "the four places that drain it are all of them" is a claim
+	// that quietly stops being true when a fifth caller appears, and what it would
+	// then cost is one record's probes making the NEXT record unpublishable.
+	decodeWork = 0
 	forms := []string{text}
 	cur := text
 	settled := false
@@ -1991,13 +2136,29 @@ func assertNoLeak(text string) error {
 			bins := append(binaryCandidates(cur), binaryCandidates(norm)...)
 			bins = append(bins, binaryCandidates(curNames)...)
 			extra = append(extra, bins...)
-			for _, seed := range append([]string{dec}, bins...) {
+			// ⚠ AND THE SUFFIX DECODES, AS CANDIDATES IN THEIR OWN RIGHT. See
+			// base64SuffixCandidates: spliced back behind their separator they are
+			// unreachable to the short-value matcher. They are SEEDS like the rest --
+			// a candidate is an input to the chain, not an answer from it.
+			sufs := append(base64SuffixCandidates(cur), base64SuffixCandidates(norm)...)
+			sufs = append(sufs, base64SuffixCandidates(curNames)...)
+			extra = append(extra, sufs...)
+			// The suffix scans above are the quadratic term; collect what they spent
+			// before the round's own check reads the budget.
+			work += takeDecodeWork()
+			if work > decodeWorkMax {
+				return fmt.Errorf(
+					"decoding exceeded its work budget (%d bytes examined); the record "+
+						"is NOT publishable and was not printed", work)
+			}
+			for _, seed := range append(append([]string{dec}, bins...), sufs...) {
 				d := seed
 				for round := 0; round <= len(d) && work <= decodeWorkMax; round++ {
 					before := d
 					for _, st := range []func(string) string{undoPercent, undoUnicodeEscapes, undoBase64, undoHex, undoPlus, undoEntities} {
 						work += len(d)
 						d = st(d)
+						work += takeDecodeWork()
 						extra = append(extra, d)
 					}
 					if d == before {
@@ -2005,13 +2166,14 @@ func assertNoLeak(text string) error {
 					}
 				}
 			}
-			work += len(cur)
+			work += len(cur) + takeDecodeWork()
 			if work > decodeWorkMax {
 				return fmt.Errorf(
 					"decoding exceeded its work budget (%d bytes examined); the record "+
 						"is NOT publishable and was not printed", work)
 			}
 			cur = stage(cur)
+			work += takeDecodeWork()
 			forms = append(forms, cur)
 		}
 		next := cur
@@ -2120,12 +2282,9 @@ func undoBase64(text string) string {
 			b.WriteString(dec)
 		} else {
 			wrote := false
-			for k := 0; k < len(tok); k++ {
-				if strings.IndexByte("/+-_.", tok[k]) < 0 || len(tok)-k-1 < minToken {
-					continue
-				}
-				if dec, ok := decodeBase64(tok[k+1:]); ok {
-					b.WriteString(tok[:k+1])
+			for _, st := range separatorStarts(tok, minToken) {
+				if dec, ok := decodeBase64(tok[st:]); ok {
+					b.WriteString(tok[:st])
 					b.WriteString(dec)
 					wrote = true
 					break
@@ -2228,10 +2387,8 @@ func binaryCandidates(text string) []string {
 			// would accept.
 			if tok := text[i:j]; len(tok) >= d.minLen {
 				cands := []string{tok}
-				for k := 0; k < len(tok); k++ {
-					if strings.IndexByte("/+-_.", tok[k]) >= 0 && len(tok)-k-1 >= d.minLen {
-						cands = append(cands, tok[k+1:])
-					}
+				for _, st := range separatorStarts(tok, d.minLen) {
+					cands = append(cands, tok[st:])
 				}
 				for _, c := range cands {
 					for _, raw := range d.decode(c) {
