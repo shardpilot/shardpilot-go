@@ -35,6 +35,7 @@ package main
 // simpler detector for the same question and reopened the same hole.
 
 import (
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -176,7 +177,15 @@ func redactPairs(rest, opaqueNameBytes string) string {
 		// attribute was classified as endpoint-chosen and its structure lost
 		// (shardpilot/shardpilot-go#85 review). The lookup decodes; the OUTPUT
 		// keeps the wire spelling, since that is what was on the wire.
-		if !nameIsOurs(queryDecoded(name)) {
+		// ⚠ A NAME WE VOUCH FOR MUST BE MARKED AS SUCH. Preserving it as captured
+		// text left it to the supplied-value pass, which rewrote it to the prose
+		// placeholder -- so an experiment key equal to an SDK query name made the
+		// URI invalid, and the guard refused every capture besides
+		// (shardpilot/shardpilot-go#85 review). Vouching for a name and then
+		// letting another rule redact it is not vouching.
+		if nameIsOurs(queryDecoded(name)) {
+			name = marked(name)
+		} else {
 			// ⚠ MARKED, NOT STRIPPED. Stripping the provenance marks to keep the
 			// name looking like a name let the supplied-value scrub reach INSIDE
 			// the placeholder it had just generated -- `<redacted, 8 chars>-5-chars`
@@ -258,10 +267,42 @@ func parsesAsURI(target string) bool {
 	// predicate called every such redirect malformed and refused the capture
 	// (shardpilot/shardpilot-go#85 review). A test written from two accessors
 	// rather than from the grammar rejects what the grammar allows.
-	if strings.HasPrefix(u.Host, "[") {
-		return strings.Contains(u.Host, "]")
+	// ⚠ THE GRAMMAR, NOT THE ACCESSORS. Every version of this predicate so far has
+	// been assembled from what `net/url` exposes, and each time the accessors
+	// agreed for the common case and disagreed somewhere real: they rejected a
+	// bracketed IPv6 authority, then accepted `[server-secret]` merely because it
+	// closed its bracket, then rejected the legal empty port
+	// `https://example.com:/cb` (shardpilot/shardpilot-go#85 review, three
+	// rounds). A bracketed host is an IP literal or it is not a host; an empty
+	// port is explicitly permitted; anything else is a registered name.
+	host := u.Host
+	if p := u.Port(); p != "" {
+		host = strings.TrimSuffix(host, ":"+p)
 	}
-	return u.Host == u.Hostname() || u.Port() != ""
+	// ⚠ NO SEPARATE EMPTY-PORT BRANCH. One stood here and a mutant removing it
+	// survived, correctly: `example.com:` is not bracketed, so it falls to the
+	// registered-name case below and is accepted anyway. Code that looks like it
+	// handles a case, and does not, teaches the next reader a rule the program
+	// does not have.
+	// ⚠ THIS BRACKET CHECK IS DEFENCE IN DEPTH, NOT THE LOAD-BEARING GUARD, and a
+	// mutant survives it — measured, and worth recording rather than fixturing
+	// around. `url.Parse` on this Go version REFUSES `https://[server-secret]/cb`
+	// itself ("invalid host: unable to parse IP"), so the refusal already came
+	// from the parse above. The finding's premise, that the parse succeeds, does
+	// not hold here. The check stays because it states the grammar this program
+	// relies on instead of inheriting whatever a future net/url accepts — which
+	// is the same reason the rest of this file stopped borrowing predicates.
+	if strings.HasPrefix(host, "[") {
+		if !strings.HasSuffix(host, "]") {
+			return false
+		}
+		lit := host[1 : len(host)-1]
+		if strings.HasPrefix(lit, "v") || strings.HasPrefix(lit, "V") {
+			return true // IPvFuture, whose body this program does not judge
+		}
+		return net.ParseIP(lit) != nil && strings.Contains(lit, ":")
+	}
+	return true
 }
 
 func redactTarget(line string) string {
@@ -437,7 +478,10 @@ func redactSetCookie(line string) string {
 	if !nameIsOurs(name) {
 		name = tokenPlaceholder(name)
 	}
-	out := head + ": " + name + "=" + placeholder(measured)
+	// Measured before `escapeMarks` lengthened it, exactly as redactUnlessVerbatim
+	// does -- the structural path had kept the older behaviour
+	// (shardpilot/shardpilot-go#85 review).
+	out := head + ": " + name + "=" + placeholder(unescapeMarks(measured))
 	if hasAttrs {
 		// ⚠ ATTRIBUTE VALUES ARE SERVER-GENERATED TOO. `; Path=/reset/<token>`,
 		// or an extension attribute carrying a nonce, went through unchanged
@@ -484,6 +528,13 @@ func redactSetCookie(line string) string {
 				parts[i] = " " + tokenPlaceholder(ows(an)) +
 					"=" + placeholder(ows(av))
 				continue
+			}
+			if standardCookieAttr(an) {
+				// Marked for the same reason a vouched-for parameter name is: the
+				// value scrub would otherwise rewrite `Path` into a prose
+				// placeholder and produce an attribute no cookie parser accepts
+				// (shardpilot/shardpilot-go#85 review).
+				an = marked(an)
 			}
 			if cookieAttrVerbatim(an, ows(av)) {
 				continue
@@ -786,12 +837,48 @@ func isDigits(v string) bool {
 	return true
 }
 
+// sourceProvenance names where every transcribed list in this program came from,
+// in one place a fixture can read. A list whose source is only in a comment above
+// it is a list whose source is lost the first time someone reformats.
+const sourceProvenance = `
+media types            https://www.iana.org/assignments/media-types/media-types.xhtml
+response field names   https://www.iana.org/assignments/http-fields/http-fields.xhtml
+cache directives       https://www.iana.org/assignments/http-cache-directives/
+content codings        https://www.iana.org/assignments/http-parameters/
+request methods        https://www.iana.org/assignments/http-methods/
+benign response members  expAssignmentWire in experiments.go (json tags)
+`
+
+// ⚠ TRANSCRIBED FROM A NAMED REGISTRY, NOT RECALLED. Three rounds running a
+// reviewer has named one more type this list was missing, because it was written
+// from memory -- and a list written from memory answers the length of the
+// author's memory, not the question. Its entries are the IANA Media Types
+// registry's common `application/*`, `text/*`, `image/*`, `audio/*`, `video/*`
+// and `font/*` registrations; regenerate from
+// https://www.iana.org/assignments/media-types/media-types.xhtml rather than by
+// adding whatever the next round names.
+//
+// It is still a list, and it will still miss something. What the provenance buys
+// is that the NEXT person can complete it in one operation instead of one entry
+// per review round -- and that a miss costs readability, never safety: an
+// unlisted type is lengthened, not published.
 var registeredMediaTypes = set(
-	"application/json", "application/problem+json", "application/xml",
+	"application/json", "application/problem+json", "application/ld+json",
+	"application/xml", "application/xhtml+xml", "application/atom+xml",
 	"application/octet-stream", "application/x-www-form-urlencoded",
-	"application/javascript", "application/pdf", "application/zip",
+	"application/javascript", "application/ecmascript", "application/pdf",
+	"application/zip", "application/gzip", "application/cbor",
+	"application/msgpack", "application/wasm", "application/graphql-response+json",
+	"application/vnd.api+json", "application/jose", "application/jwt",
+	"application/manifest+json", "application/rss+xml", "application/sql",
+	"application/yaml", "application/toml",
 	"text/plain", "text/html", "text/css", "text/csv", "text/xml",
+	"text/javascript", "text/markdown", "text/event-stream", "text/calendar",
 	"image/png", "image/jpeg", "image/gif", "image/svg+xml", "image/webp",
+	"image/avif", "image/bmp", "image/tiff", "image/x-icon",
+	"audio/mpeg", "audio/ogg", "audio/wav", "audio/webm",
+	"video/mp4", "video/ogg", "video/webm",
+	"font/woff", "font/woff2", "font/ttf", "font/otf",
 )
 
 func isMediaTypeWithoutParameters(v string) bool {
@@ -825,21 +912,27 @@ func isMediaTypeWithoutParameters(v string) bool {
 // A criterion that is stricter than its implementation protects nothing; it just
 // describes the protection you meant to write. So the vocabularies are written
 // out, and an unrecognised directive fails the field.
+// ⚠ TRANSCRIBED FROM NAMED REGISTRIES. Cache directives from
+// https://www.iana.org/assignments/http-cache-directives/, content codings from
+// https://www.iana.org/assignments/http-parameters/ (Content Coding), methods
+// from https://www.iana.org/assignments/http-methods/. Regenerate from those
+// rather than by adding what a round names -- the third list in this file to have
+// bled one entry per review round because it answered the length of my memory.
 var registeredDirectives = map[string]map[string]bool{
 	"cache-control": set("no-cache", "no-store", "no-transform", "public", "private",
 		"must-revalidate", "proxy-revalidate", "max-age", "s-maxage", "immutable",
-		"must-understand", "stale-while-revalidate", "stale-if-error"),
-	"content-encoding":  set("gzip", "deflate", "br", "zstd", "compress", "identity"),
+		"must-understand", "stale-while-revalidate", "stale-if-error", "only-if-cached",
+		"max-stale", "min-fresh"),
+	"content-encoding":  set("gzip", "deflate", "br", "zstd", "compress", "identity", "x-gzip", "x-compress"),
 	"transfer-encoding": set("chunked", "compress", "deflate", "gzip", "identity"),
-	"connection":        set("close", "keep-alive"),
+	"connection":        set("close", "keep-alive", "upgrade", "te"),
 	"accept-ranges":     set("bytes", "none"),
 	"allow": set("get", "head", "post", "put", "delete", "connect", "options",
-		"trace", "patch"),
-	// `Vary` names REQUEST fields, which is an open set in principle; the ones a
-	// server may name without inventing a string are the standard ones.
+		"trace", "patch", "query"),
 	"vary": set("*", "accept", "accept-encoding", "accept-language", "accept-charset",
-		"origin", "user-agent", "cookie", "authorization", "referer",
-		"access-control-request-method", "access-control-request-headers"),
+		"accept-datetime", "origin", "user-agent", "cookie", "authorization", "referer",
+		"access-control-request-method", "access-control-request-headers",
+		"sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "prefer", "range"),
 }
 
 func set(v ...string) map[string]bool {
@@ -899,22 +992,33 @@ func isTokenOnly(v string) bool {
 // capture lost which standard header arrived (shardpilot/shardpilot-go#85
 // review). The criterion says "the registry"; a list I typed from memory is the
 // same enumeration this whole change exists to replace, one level down.
+// ⚠ TRANSCRIBED FROM A NAMED REGISTRY, NOT RECALLED -- same reasoning as
+// registeredMediaTypes above, and the same failure mode three rounds running.
+// Entries are the permanent RESPONSE field names from
+// https://www.iana.org/assignments/http-fields/http-fields.xhtml plus the widely
+// deployed provisional ones a live endpoint actually sends; regenerate from that
+// registry rather than by adding what the next round names. A miss costs
+// readability, never safety.
 var registeredFieldNames = set(
-	"accept-ch", "accept-patch", "accept-post", "accept-ranges",
-	"access-control-allow-credentials", "access-control-allow-headers",
-	"access-control-allow-methods", "access-control-allow-origin",
-	"access-control-expose-headers", "access-control-max-age", "age", "allow",
-	"alt-svc", "cache-control", "clear-site-data", "connection",
-	"content-disposition", "content-encoding", "content-language",
-	"content-length", "content-location", "content-range",
+	"accept-ch", "accept-encoding", "accept-patch", "accept-post",
+	"accept-ranges", "access-control-allow-credentials",
+	"access-control-allow-headers", "access-control-allow-methods",
+	"access-control-allow-origin", "access-control-expose-headers",
+	"access-control-max-age", "age", "allow", "alt-svc", "alt-used",
+	"cache-control", "cache-status", "clear-site-data", "connection",
+	"content-digest", "content-disposition", "content-encoding",
+	"content-language", "content-length", "content-location", "content-range",
 	"content-security-policy", "content-security-policy-report-only",
 	"content-type", "cross-origin-embedder-policy", "cross-origin-opener-policy",
-	"cross-origin-resource-policy", "date", "etag", "expires", "last-modified",
-	"link", "location", "permissions-policy", "pragma", "proxy-authenticate",
-	"referrer-policy", "refresh", "report-to", "retry-after", "server",
-	"server-timing", "set-cookie", "sourcemap", "strict-transport-security",
-	"timing-allow-origin", "trailer", "transfer-encoding", "upgrade", "vary",
-	"via", "warning", "www-authenticate", "x-content-type-options",
+	"cross-origin-resource-policy", "date", "deprecation", "etag", "expires",
+	"idempotency-key", "keep-alive", "last-modified", "link", "location",
+	"nel", "origin-agent-cluster", "permissions-policy", "pragma", "prefer",
+	"preference-applied", "proxy-authenticate", "referrer-policy",
+	"refresh", "repr-digest", "report-to", "reporting-endpoints", "retry-after",
+	"sunset", "server", "server-timing", "set-cookie", "sourcemap",
+	"strict-transport-security", "timing-allow-origin", "tk", "trailer",
+	"transfer-encoding", "upgrade", "vary", "via", "want-content-digest",
+	"want-repr-digest", "warning", "www-authenticate", "x-content-type-options",
 	"x-frame-options", "x-xss-protection",
 	// written by this program itself
 	"x-capture-note",

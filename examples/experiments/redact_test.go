@@ -88,7 +88,10 @@ func TestSetCookieIsRedactedStructurally(t *testing.T) {
 	dump := "HTTP/1.1 200 OK\r\n" +
 		"Set-Cookie: sid=abc123def456; Path=/; HttpOnly\r\n" +
 		"\r\n{}"
-	got := dropFraming(dump)
+	// ⚠ COMPARED STRIPPED, because that is what the report prints. Names this
+	// program vouches for are MARKED now, so a raw comparison sees `Path\x01=`
+	// and reports a loss that the artifact does not have.
+	got := stripMarks(dropFraming(dump))
 	if strings.Contains(got, "abc123def456") {
 		t.Fatalf("a server-set cookie was published verbatim: %q", got)
 	}
@@ -111,7 +114,7 @@ func TestLocationQueryValuesAreRedacted(t *testing.T) {
 	noteRequestName("state")
 	noteRequestName("token")
 	t.Cleanup(func() { requestNames = map[string]bool{} })
-	got := dropFraming("HTTP/1.1 302 Found\r\nLocation: /cb?state=abc123&token=zzz\r\n\r\n")
+	got := stripMarks(dropFraming("HTTP/1.1 302 Found\r\nLocation: /cb?state=abc123&token=zzz\r\n\r\n"))
 	for _, leaked := range []string{"abc123", "zzz"} {
 		if strings.Contains(got, leaked) {
 			t.Fatalf("a server-generated redirect value was published: %q", got)

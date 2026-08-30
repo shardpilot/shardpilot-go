@@ -433,6 +433,14 @@ const respSection = "## Response%s — header block re-serialised by " +
 	"bodyless dump and is forbidden in HTTP/2, so a header here is not " +
 	"evidence that it was received.\n\n%s\n%s\n"
 
+// ⚠ ITS SOURCE IS `expAssignmentWire` IN experiments.go, and regenerating means
+// reading that struct's json tags -- not adding whatever a review round names.
+// Three other lists in these two files bled one entry per round because they
+// answered the length of my memory rather than the question; this one is the
+// fourth, driven in the same movement. It cannot be reflected over from here (the
+// type is unexported and in another package), so the source is NAMED instead, and
+// the failure side stays "refuse loudly".
+//
 // benignTopLevel are the assignment response's members this program has judged
 // non-identifying. A top-level member in neither this set nor mintedNames
 // refuses the capture.

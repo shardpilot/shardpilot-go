@@ -160,6 +160,11 @@ func TestTheCriterionStillAdmitsWhatItShould(t *testing.T) {
 		{"a relative path containing ://", "HTTP/1.1 302 Found\r\nLocation: /cb/http://e/x\r\n\r\n", "/"},
 		{"an interior at-sign in a path", "HTTP/1.1 302 Found\r\nLocation: /a//foo@bar/b\r\n\r\n", "/"},
 		{"a GMT HTTP-date", "HTTP/1.1 200 OK\r\nDate: Mon, 02 Jan 2006 15:04:05 GMT\r\n\r\n", "15:04:05 GMT"},
+		// One entry from each transcribed registry, so a truncated list fails
+		// here rather than in a review round.
+		{"a registered media type", "HTTP/1.1 200 OK\r\nContent-Type: application/cbor\r\n\r\n", "application/cbor"},
+		{"a registered response field", "HTTP/1.1 200 OK\r\nContent-Digest: sha-256=:x:\r\n\r\n", "Content-Digest"},
+		{"a registered cache directive", "HTTP/1.1 200 OK\r\nCache-Control: stale-if-error=60\r\n\r\n", "stale-if-error=60"},
 	} {
 		suppliedValues = nil
 		structuralSurfaces = nil
@@ -393,5 +398,79 @@ func TestTheRequestAuthorityStaysInsideTheGuard(t *testing.T) {
 	}
 	if strings.Contains(stripMarks(scrubSupplied(got)), "Host: control") {
 		t.Fatalf("a supplied value equal to the authority was published: %q", stripMarks(scrubSupplied(got)))
+	}
+}
+
+// ---- round on 9625b3d ----
+
+func TestBracketedAuthoritiesAreIPLiterals(t *testing.T) {
+	for _, c := range []struct {
+		target  string
+		refused bool
+	}{
+		{"https://[2001:db8::1]/cb", false},
+		{"https://[server-secret]/cb", true},
+		{"https://example.com:/cb", false},
+		{"https://example.com:8443/cb", false},
+	} {
+		structuralSurfaces = nil
+		suppliedValues = nil
+		got := stripMarks(dropFraming("HTTP/1.1 302 Found\r\nLocation: " + c.target + "\r\n\r\n"))
+		if refused := len(structuralSurfaces) > 0; refused != c.refused {
+			t.Errorf("%s: refused=%v want %v: %q", c.target, refused, c.refused, got)
+		}
+		if c.refused && strings.Contains(got, "server-secret") {
+			t.Errorf("%s: an invented authority was published: %q", c.target, got)
+		}
+		structuralSurfaces = nil
+	}
+}
+
+func TestVouchedForNamesSurviveTheValueScrub(t *testing.T) {
+	suppliedValues = []string{"experiment_key"}
+	noteRequestName("experiment_key")
+	t.Cleanup(func() { suppliedValues = nil; requestNames = map[string]bool{} })
+	got := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 302 Found\r\nLocation: /cb?experiment_key=v\r\n\r\n")))
+	if strings.Contains(got, "<redacted") {
+		t.Fatalf("a name this program vouched for was rewritten by the value scrub: %q", got)
+	}
+	if !strings.Contains(got, "experiment_key=") {
+		t.Fatalf("the vouched-for name was lost: %q", got)
+	}
+}
+
+func TestFixedCookieAttributeNamesSurviveTheScrub(t *testing.T) {
+	suppliedValues = []string{"Path"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; Path=/cb\r\n\r\n")))
+	if strings.Contains(got, "<redacted, 4 chars>") {
+		t.Fatalf("a specification-fixed attribute name was rewritten: %q", got)
+	}
+}
+
+func TestCookieValuesAreMeasuredBeforeOurEscape(t *testing.T) {
+	suppliedValues = nil
+	got := stripMarks(dropFraming("HTTP/1.1 200 OK\r\nSet-Cookie: sid=" + escapeMarks(`\x00`) + "\r\n\r\n"))
+	if !strings.Contains(got, "4 chars") {
+		t.Fatalf("the cookie length described the recorder's escape: %q", got)
+	}
+}
+
+func TestTheRegistriesNameTheirSource(t *testing.T) {
+	// ⚠ NOT A STYLE CHECK. Three of these lists bled one entry per review round
+	// because they answered the length of the author's memory. A named source is
+	// what lets the NEXT person complete one in a single operation, so the
+	// provenance is pinned the way any other load-bearing fact is.
+	for _, want := range []string{
+		"iana.org/assignments/media-types",
+		"iana.org/assignments/http-fields",
+		"iana.org/assignments/http-cache-directives",
+		"expAssignmentWire",
+	} {
+		if !strings.Contains(sourceProvenance, want) {
+			t.Errorf("no source recorded for %q", want)
+		}
 	}
 }
