@@ -738,6 +738,19 @@ var configuredHost string
 
 var receivedConnection bool
 
+// configuredHostWire is the SAME authority as configuredHost, spelled the way the
+// serialiser writes it. `DumpRequestOut` emits an internationalised name as
+// PUNYCODE, so comparing the pre-serialisation spelling failed on exactly those
+// hosts and this program's own authority was rewritten by the generic scrub
+// (shardpilot/shardpilot-go#84 review).
+//
+// ⚠ ASKED OF THE SERIALISER, NOT COMPUTED. Deriving punycode here would be a
+// second implementation of someone else's grammar, and this module carries no
+// external dependency to borrow the first. The spelling is read out of a dump of a
+// throwaway request to the configured URL -- produced by the very function that
+// will produce the real one, offline, before anything is sent.
+var configuredHostWire string
+
 var structuralSurfaces []string
 
 func noteStructural(what string) {
@@ -855,8 +868,18 @@ func base64SuffixCandidates(text string) []string {
 		// (shardpilot/shardpilot-go#84 review). The combination of two rules is a third
 		// rule, and neither of them stated it.
 		for _, st := range separatorStarts(tok, 2) {
-			if dec, ok := decodeBase64(tok[st:]); ok {
-				out = append(out, dec)
+			// ⚠ THE SAME TWO QUESTIONS AS A STANDALONE SHORT TOKEN. `decodeBase64` keeps
+			// only a valid-UTF-8 decode and `binaryCandidates` starts at four bytes, so
+			// `/2E` -- 0xff 0x61 -- was retained when it stood alone and LOST when it
+			// followed a separator: `zz//2E` passed with `a` supplied
+			// (shardpilot/shardpilot-go#84 review). Fixing the standalone case left the
+			// same token unmeasured one position along.
+			text, haveText, bin, haveBin := base64Answers(tok[st:])
+			switch {
+			case haveText:
+				out = append(out, text)
+			case haveBin:
+				out = append(out, bin)
 			}
 		}
 	}
@@ -1160,9 +1183,17 @@ func noteMinted(body string) string {
 	// about what it CONTAINS; the scan below already answers that itself, and on a
 	// body with no minted member it finds nothing and costs nothing.
 	if !jsonParses(body) {
-		for _, m := range jsonMemberName.FindAllStringSubmatch(body, -1) {
-			if isMinted(m[1]) {
-				noteStructural("a server-minted subject identifier in a body that does not parse")
+		// ⚠ AND IN EVERY SUPPORTED SPELLING OF IT. A malformed body that
+		// percent-encodes the member -- `%22subject_fact_key%22:%22sfk_secret%22` --
+		// left this ledger empty while the guard's own decoder reconstructs it, so the
+		// report published text the guard would refuse if it could see it
+		// (shardpilot/shardpilot-go#84 review). Same rule as the transport diagnostic
+		// one file-section along, and the same list answers both.
+		for _, form := range decodedForms(body) {
+			for _, m := range jsonMemberName.FindAllStringSubmatch(form, -1) {
+				if isMinted(m[1]) {
+					noteStructural("a server-minted subject identifier in a body that does not parse")
+				}
 			}
 		}
 	}
@@ -1512,11 +1543,19 @@ func dropFraming(dump string) string {
 	// nothing while the pattern that permits the whitespace sat right there --
 	// and the value is server-minted, so the guard behind this cannot see it
 	// either (shardpilot/shardpilot-go#73 review).
-	// The body as this pass sees it: the exemption question is partly about its
+	// The PAYLOAD as this pass sees it: the exemption question is partly about its
 	// SIZE, so the registry cannot be chosen from the status line alone.
+	//
+	// ⚠ AND `bodyStart` NAMES THE SEPARATOR, NOT THE PAYLOAD. It is set on the blank
+	// line that ends the header block, and that line is appended too -- so the size
+	// this gate measured was one or two bytes more than the SDK reads, and a body at
+	// either of the last two accepted sizes lost its exemptions: the scrub then
+	// rewrote the fixed `"assigned"` member name and published altered JSON for a
+	// body the SDK parsed (shardpilot/shardpilot-go#84 review). A gate that measures
+	// the framing measures the wrong thing.
 	exemptBody := ""
-	if bodyStart >= 0 && bodyStart < len(out) {
-		exemptBody = strings.Join(out[bodyStart:], "\n")
+	if bodyStart >= 0 && bodyStart+1 < len(out) {
+		exemptBody = strings.Join(out[bodyStart+1:], "\n")
 	}
 	exemptions := map[string]bool{}
 	if len(out) > 0 {
@@ -1626,7 +1665,15 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 	traced := req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
 		Got1xxResponse: func(code int, h textproto.MIMEHeader) error {
 			var b strings.Builder
-			fmt.Fprintf(&b, "HTTP/1.1 %d %s\r\n", code, http.StatusText(code))
+			// ⚠ MARKED, BECAUSE THIS PROGRAM WROTE IT. The version, the code and the
+			// reason phrase all come from `net/http`'s own table, not from the wire --
+			// `Got1xxResponse` hands over a code and headers, never a status line. Leaving
+			// it CAPTURED made `dataOf` read the reason phrase as endpoint data, so a
+			// legal supplied value equal to a standard phrase -- experiment key `Hints`
+			// against a `103 Early Hints` -- refused an otherwise safe capture
+			// (shardpilot/shardpilot-go#84 review). `scrubSupplied` already skips status
+			// lines; the guard reads provenance, and the provenance was wrong.
+			b.WriteString(marked(fmt.Sprintf("HTTP/1.1 %d %s", code, http.StatusText(code))) + "\r\n")
 			names := make([]string, 0, len(h))
 			for k := range h {
 				names = append(names, k)
@@ -1932,14 +1979,28 @@ func redact(dump []byte) []byte {
 		// EVERY otherwise valid capture (shardpilot/shardpilot-go#84 review). The
 		// same rule as the fixed route and the serialiser-written headers: what this
 		// program put on the wire is not the endpoint's choice.
-		if configuredHost != "" && strings.HasPrefix(strings.ToLower(line), "host:") {
+		// ⚠ AND THE COMPARISON CANNOT BE WITH THE PRE-SERIALISATION SPELLING. A
+		// request dump's `Host` is written by the client from the URL this program
+		// configured, and `DumpRequestOut` serialises an internationalised name as
+		// PUNYCODE -- `https://é.example` arrives here as `Host: xn--9ca.example`, the
+		// equality failed, and the generic scrub rewrote this program's own authority
+		// into `xn--9ca.<redacted, 7 chars>`: a corrupted canonical request the guard
+		// approves because a placeholder is generated (shardpilot/shardpilot-go#84
+		// review).
+		//
+		// A REQUEST dump carries no endpoint bytes in this field by construction, so
+		// the line is vouched for on that ground rather than on a spelling match. The
+		// `configuredHost` test is kept as the positive control it always was: when it
+		// holds, nothing changed; when it does not, this is a serialisation of the same
+		// authority and the mark says so either way.
+		if (configuredHost != "" || configuredHostWire != "") && strings.HasPrefix(strings.ToLower(line), "host:") {
 			if i := strings.IndexByte(line, ':'); i > 0 {
 				v := strings.TrimSuffix(line[i+1:], "\r")
 				cr := ""
 				if strings.HasSuffix(line, "\r") {
 					cr = "\r"
 				}
-				if strings.TrimSpace(v) == configuredHost {
+				if hv := strings.TrimSpace(v); hv == configuredHost || (configuredHostWire != "" && hv == configuredHostWire) {
 					out = append(out, marked(line[:i+1]+v)+cr)
 					continue
 				}
@@ -2009,6 +2070,36 @@ const captureDeadline = 30 * time.Second
 // The fields are the ones the response path already treats as server-generated.
 // This half REFUSES them; the change stacked on it redacts them, and inherits this
 // question rather than restating it.
+// supportedDecoders is the decoder chain THIS PROGRAM CLAIMS TO SUPPORT, written
+// once. The publication guard reconstructs a value through all six, so anything
+// that SCANS for a forbidden shape has to produce the same forms: a producer
+// narrower than the guard's reconstruction is a scan answering about a smaller
+// world than the one the guard will search, and the difference is exactly what an
+// endpoint spells its payload in.
+//
+// ⚠ THREE FINDINGS IN ONE ROUND WERE THIS DIFFERENCE. A transport diagnostic
+// carrying `U2V0LUNvb2tpZTogc2Vzc2lvbj1zZWNyZXQ=`, and a malformed body carrying
+// `%22subject_fact_key%22`, both left the structural ledger empty while the guard
+// reconstructs the field from them (shardpilot/shardpilot-go#84 review). The scans
+// each had their own smaller list; the list is here now, and the sites ask it.
+var supportedDecoders = []func(string) string{
+	undoPercent, undoUnicodeEscapes, undoBase64, undoHex, undoPlus, undoEntities,
+}
+
+// decodedForms returns every form one supported decoder produces from `text`,
+// plus `text` itself, charging the work to the shared budget. It does NOT compose
+// them: composition is the fixed point the callers iterate, and a form that one
+// decoder destroys is still scanned here before the next pass can rewrite it.
+func decodedForms(text string) []string {
+	out := []string{text}
+	for _, d := range supportedDecoders {
+		if f := d(text); f != text {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
 func noteStructuralInText(text string) {
 	for _, ln := range strings.Split(text, "\n") {
 		// ⚠ CONTAINS, NOT HasPrefix. Go wraps the offending line in prose and quotes
@@ -2093,7 +2184,16 @@ func noteStructuralInText(text string) {
 				noteStructural("a transport diagnostic whose decoding exceeded this build's work budget")
 				break
 			}
-			scanForm(cur)
+			// ⚠ EVERY SUPPORTED DECODER, NOT THE TWO THIS LOOP ADVANCES ON. The fixed
+			// point walks percent and unicode escapes because those NEST; the guard
+			// reconstructs through six, so a field name spelled in base64 was produced by
+			// nobody and the ledger stayed empty (shardpilot/shardpilot-go#84 review).
+			// Advancing and SCANNING are two questions: this scans wide and advances the
+			// way it always did.
+			for _, form := range decodedForms(cur) {
+				spent += len(form)
+				scanForm(form)
+			}
 			next := undoPercent(undoUnicodeEscapes(cur))
 			if next == cur {
 				break
@@ -2831,7 +2931,7 @@ func assertNoLeak(text string) error {
 		// intermediate forms -- before a nominal 64 MiB bound fired. A resource
 		// limit that undercounts by the number of stages is not fail-closed
 		// (shardpilot/shardpilot-go#73 review).
-		for _, stage := range []func(string) string{undoPercent, undoUnicodeEscapes, undoBase64, undoHex, undoPlus, undoEntities} {
+		for _, stage := range supportedDecoders {
 			// ⚠ THE NAMES DECODE TOO, IN LOCKSTEP. `capturedNames` was extracted
 			// once from the RAW span, so a field name spelling a short supplied
 			// value in an escape -- `X-%62ar` for `bar` -- decoded in the text but
@@ -2973,50 +3073,82 @@ func assertNoLeak(text string) error {
 						"not printed", len(initial), seedMax)
 			}
 			seeds := initial
-			for si := 0; si < len(seeds) && work <= decodeWorkMax; si++ {
+			// ⚠ THE CAP BOUNDS THE APPEND, NOT THE NEXT ITERATION. One seed can carry
+			// thousands of short encoded tokens, so a single round appended tens of
+			// thousands of entries and the loop then PROCESSED every one before the check
+			// at the top refused -- the cap bounded neither memory nor CPU
+			// (shardpilot/shardpilot-go#84 review). A limit tested after the overshoot is
+			// a report, not a limit.
+			seedOverflow := false
+			addSeed := func(v string) {
+				if len(seeds) >= seedMax {
+					seedOverflow = true
+					return
+				}
+				seeds = append(seeds, v)
+			}
+			for si := 0; si < len(seeds) && work <= decodeWorkMax && !seedOverflow; si++ {
 				d := seeds[si]
+				forms := []string{d}
 				for round := 0; round <= len(d) && work <= decodeWorkMax; round++ {
 					before := d
-					for _, st := range []func(string) string{undoPercent, undoUnicodeEscapes, undoBase64, undoHex, undoPlus, undoEntities} {
+					for _, st := range supportedDecoders {
 						work += len(d)
 						d = st(d)
 						work += takeDecodeWork()
 						extra = append(extra, d)
+						forms = append(forms, d)
 					}
 					if d == before {
 						break
 					}
 				}
-				if len(seeds) >= seedMax {
-					continue
-				}
-				// ⚠ EVERY PRODUCER, NOT THE TWO I HAPPENED TO NAME. The round before
-				// made seeds re-enter the PRODUCING half and enqueued only the wrapped
-				// and short-base64 producers, so a seed carrying a form another producer
-				// handles was still unreachable: `/zYx` decodes to `0xff61`, which
-				// `undoHex` deliberately ignores as a two-byte token and only
-				// `hexCandidates` splits (shardpilot/shardpilot-go#84 review). Naming a
-				// subset of the producers is the enumeration this file keeps replacing
-				// with a product -- and here I wrote the enumeration while fixing an
-				// enumeration.
-				for _, w := range wrappedBase64Candidates(charge(1, d)) {
-					seeds = append(seeds, w)
-					if dd, ok := decodeBase64(w); ok {
-						seeds = append(seeds, dd)
+				// ⚠ EVERY PRODUCER, NOT THE TWO I HAPPENED TO NAME, AND ON EVERY RETAINED
+				// FORM. Naming a subset of the producers is the enumeration this file keeps
+				// replacing with a product; and a stage can DESTROY what a later producer
+				// would have found -- with `dada` supplied, `/zY0NjE2NDYx` decodes to a
+				// binary seed the hex producer reconstructs from, and `undoBase64` rewrites
+				// that run before the producers ever see it, so the value was approved
+				// (shardpilot/shardpilot-go#84 review). The forms are already retained for
+				// the guard; the producers ask about each of them.
+				for _, f := range forms {
+					for _, w := range wrappedBase64Candidates(charge(1, f)) {
+						addSeed(w)
+						if dd, ok := decodeBase64(w); ok {
+							addSeed(dd)
+						}
+					}
+					for _, v := range shortBase64Candidates(charge(1, f)) {
+						addSeed(v)
+					}
+					for _, v := range hexCandidates(charge(1, f)) {
+						addSeed(v)
+					}
+					for _, v := range base64SuffixCandidates(charge(1, f)) {
+						addSeed(v)
+					}
+					for _, v := range binaryCandidates(charge(2, f)) {
+						addSeed(v)
+					}
+					if seedOverflow {
+						break
 					}
 				}
-				seeds = append(seeds, shortBase64Candidates(charge(1, d))...)
-				seeds = append(seeds, hexCandidates(charge(1, d))...)
-				seeds = append(seeds, base64SuffixCandidates(charge(1, d))...)
-				seeds = append(seeds, binaryCandidates(charge(2, d))...)
 
 				work += takeDecodeWork()
 			}
-			if len(seeds) >= seedMax {
+			// ⚠ THE NUMBER REACHED, NOT THE CONSTANT. Printing `seedMax` says what the
+			// limit is and nothing about what happened, so a worklist that overshot it
+			// five times over read identically to one that touched it -- and the mutant
+			// that removes the cap from the collector survived, because nothing this
+			// program prints could tell the two apart (shardpilot/shardpilot-go#84
+			// review). A cap that cannot report the overshoot is a cap only in the
+			// comment.
+			if seedOverflow || len(seeds) >= seedMax {
 				return fmt.Errorf(
-					"the candidate worklist reached its cap of %d seeds, so the decoding "+
-						"chain did not settle; the record is NOT publishable and was not "+
-						"printed", seedMax)
+					"the candidate worklist reached %d seeds against a cap of %d, so the "+
+						"decoding chain did not settle; the record is NOT publishable and was "+
+						"not printed", len(seeds), seedMax)
 			}
 			work += len(cur) + takeDecodeWork()
 			if work > decodeWorkMax {
@@ -4120,6 +4252,15 @@ func main() {
 	// the `Host:` line carries it, and it is not endpoint text. See configuredHost.
 	if u, uerr := url.Parse(env("SP_REMOTE_CONFIG_URL")); uerr == nil {
 		configuredHost = u.Host
+	}
+	if r, rerr := http.NewRequest("GET", env("SP_REMOTE_CONFIG_URL"), nil); rerr == nil {
+		if d, derr := httputil.DumpRequestOut(r, false); derr == nil {
+			for _, l := range strings.Split(string(d), "\r\n") {
+				if strings.HasPrefix(strings.ToLower(l), "host:") {
+					configuredHostWire = strings.TrimSpace(l[len("host:"):])
+				}
+			}
+		}
 	}
 	rec := &recorder{inner: http.DefaultTransport}
 	cfg := shardpilot.Config{

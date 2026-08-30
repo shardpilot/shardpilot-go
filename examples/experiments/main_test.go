@@ -1645,7 +1645,7 @@ func TestATrailerIsNotAMessageStart(t *testing.T) {
 func TestTheConfiguredHostIsOurs(t *testing.T) {
 	suppliedValues = []string{"app"}
 	configuredHost = "app.shardpilot.com"
-	t.Cleanup(func() { suppliedValues = nil; configuredHost = "" })
+	t.Cleanup(func() { suppliedValues = nil; configuredHost, configuredHostWire = "", "" })
 	// ⚠ ASSERTED ON THE SCRUBBED OUTPUT. My first version asserted on `redact`'s
 	// own result, which does not scrub — so it passed with and without the fix, and
 	// the mutant survived. And the symptom is not the one the finding names:
@@ -1658,6 +1658,19 @@ func TestTheConfiguredHostIsOurs(t *testing.T) {
 	if !strings.Contains(got, "Host: app.shardpilot.com") {
 		t.Fatalf("the configured authority was rewritten: %q", got)
 	}
+	// ⚠ AND THE SERIALISED SPELLING OF THE SAME AUTHORITY. `DumpRequestOut` writes
+	// an internationalised name as PUNYCODE, so the pre-serialisation spelling never
+	// matched and this program's own authority was rewritten into
+	// `xn--9ca.<redacted, 7 chars>` -- an authority no parser accepts, approved
+	// because the placeholder is generated (shardpilot/shardpilot-go#84 review).
+	suppliedValues = []string{"example"}
+	configuredHost, configuredHostWire = "é.example", "xn--9ca.example"
+	got = stripMarks(scrubSupplied(string(redact(
+		[]byte("GET /x HTTP/1.1\r\nHost: xn--9ca.example\r\n\r\n")))))
+	if !strings.Contains(got, "Host: xn--9ca.example") {
+		t.Fatalf("the serialised form of the configured authority was rewritten: %q", got)
+	}
+	configuredHost, configuredHostWire = "app.shardpilot.com", ""
 	// ⚠ AND A DIFFERENT HOST IS STILL ENDPOINT TEXT, or the exemption covers
 	// whatever stands in that position.
 	suppliedValues = []string{"elsewhere"}
@@ -2041,10 +2054,19 @@ func TestTheClaimNamesExactlyTheDecodersThatRun(t *testing.T) {
 	}
 	text := string(src)
 
-	stage := regexp.MustCompile(`range \[\]func\(string\) string\{([^}]*)\}`)
+	// ⚠ THE LIST IS DECLARED ONCE NOW, so this scene reads the declaration rather
+	// than each `range` over an inline literal. It kept refusing when the literals
+	// were replaced by a name -- which is the behaviour a derivation should have, and
+	// is how this scene reported the refactor instead of passing through it.
+	stage := regexp.MustCompile(`supportedDecoders = \[\]func\(string\) string\{([^}]*)\}`)
 	ms := stage.FindAllStringSubmatch(text, -1)
 	if len(ms) == 0 {
 		t.Fatal("the decoding chain's stage list was not found, so this scene measures nothing")
+	}
+	// ⚠ AND NO SITE MAY STILL CARRY ITS OWN COPY, or the single list is one list
+	// beside several others.
+	if regexp.MustCompile(`range \[\]func\(string\) string\{`).MatchString(text) {
+		t.Errorf("a decoder chain is still written inline somewhere; the declaration is not the only one")
 	}
 	inCode := map[string]bool{}
 	for _, m := range ms {
@@ -3611,6 +3633,15 @@ func TestExemptionsFollowTheSDKsOwnGates(t *testing.T) {
 	if got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n" + over))); strings.Contains(got, "assigned") {
 		t.Errorf("an over-limit body kept the assignment exemptions: %q", got[:120])
 	}
+	// ⚠ AND THE LAST ACCEPTED SIZE IS STILL EXEMPT. The separator line is framing,
+	// not payload, and measuring it made the two largest legal bodies lose their
+	// exemptions (shardpilot/shardpilot-go#84 review).
+	suppliedValues = []string{"assigned"}
+	head := `{"assigned":false}`
+	exact := head + strings.Repeat(" ", sdkMaxBodyBytes-len(head))
+	if got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n" + exact))); !strings.Contains(got, "assigned") {
+		t.Errorf("a body at exactly the SDK's ceiling lost its exemptions: %q", got[:120])
+	}
 	// ⚠ AND A BODY THE SDK *WOULD* PARSE IS STILL EXEMPT, or the gate has become a
 	// refusal to exempt anything with a body worth reading.
 	under := `{"assigned":false}` + strings.Repeat(" ", 4096)
@@ -3684,5 +3715,146 @@ func TestTheMirroredBodyLimitMatchesTheSDKs(t *testing.T) {
 	if capturedBodyMax != sdkMaxBodyBytes+1 {
 		t.Errorf("the recorder's ceiling is %d and the SDK's is %d; a capture AT the ceiling is only indeterminate while they differ by one",
 			capturedBodyMax, sdkMaxBodyBytes)
+	}
+}
+
+// TestAScanProducesEverySpellingTheGuardReconstructs is one scene for one class:
+// a scan that looks for a forbidden shape has to produce the forms the publication
+// guard will reconstruct, or it answers about a smaller world than the guard
+// searches — and the difference is exactly what an endpoint spells its payload in.
+// The transport diagnostic ran two decoders while the guard runs six, and the
+// malformed-body member scan ran none (shardpilot/shardpilot-go#84 review).
+func TestAScanProducesEverySpellingTheGuardReconstructs(t *testing.T) {
+	t.Cleanup(func() { structuralSurfaces = nil })
+	for _, c := range []struct{ name, text string }{
+		{"arrived", `malformed HTTP response "Set-Cookie: session=secret"`},
+		{"percent", `malformed HTTP response "%53et-Cookie: session=secret"`},
+		{"base64", `malformed HTTP response "U2V0LUNvb2tpZTogc2Vzc2lvbj1zZWNyZXQ="`},
+	} {
+		structuralSurfaces = nil
+		noteStructuralInText(c.text)
+		if len(structuralSurfaces) == 0 {
+			t.Errorf("a server-minted field spelled in %s was not refused", c.name)
+		}
+	}
+	// ⚠ AND AN ORDINARY DIAGNOSTIC IS STILL NOT REFUSED, or scanning wider has
+	// become refusing everything.
+	structuralSurfaces = nil
+	noteStructuralInText(`malformed HTTP response "X-Trace: 1"`)
+	if len(structuralSurfaces) != 0 {
+		t.Errorf("a diagnostic naming no minted field was refused: %v", structuralSurfaces)
+	}
+
+	// The same rule on the body path: a malformed body that percent-encodes the
+	// member. The guard's own decoder reconstructs it, so this scan must produce it.
+	structuralSurfaces = nil
+	noteMinted(`%22subject_fact_key%22:%22sfk_secret%22`)
+	if len(structuralSurfaces) == 0 {
+		t.Errorf("a percent-encoded minted member in an unparsable body was not refused")
+	}
+	structuralSurfaces = nil
+	noteMinted(`{"ordinary":"value"}`)
+	if len(structuralSurfaces) != 0 {
+		t.Errorf("an ordinary body was refused: %v", structuralSurfaces)
+	}
+}
+
+// TestASynthesisedInterimStatusLineIsOurs: `Got1xxResponse` hands this program a
+// code and headers, never a status line — the version, the code and the reason
+// phrase are all read out of `net/http`'s own table. Leaving that line CAPTURED
+// made `dataOf` treat the reason phrase as endpoint data, so a legal supplied
+// value equal to a standard phrase — experiment key `Hints` against a
+// `103 Early Hints` — refused an otherwise safe capture
+// (shardpilot/shardpilot-go#84 review).
+func TestASynthesisedInterimStatusLineIsOurs(t *testing.T) {
+	suppliedValues = []string{"Hints"}
+	t.Cleanup(func() { suppliedValues = nil })
+	inner := &traceFiringTransport{codes: []int{103}, resp: &http.Response{
+		StatusCode: 200, Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+		Status: "200 OK", Header: http.Header{}, ContentLength: -1,
+		Body: io.NopCloser(strings.NewReader("")),
+	}}
+	rec := &recorder{inner: inner}
+	req, err := http.NewRequest("GET", "https://e.example"+assignmentRoute, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rec.RoundTrip(req); err != nil {
+		t.Fatal(err)
+	}
+	rec.mu.Lock()
+	got := rec.exchanges
+	rec.mu.Unlock()
+	var report strings.Builder
+	renderExchanges(&report, got)
+	if err := assertNoLeak(report.String()); err != nil {
+		t.Fatalf("a reason phrase this program wrote was read as endpoint data: %v", err)
+	}
+	// ⚠ AND THE CODE IS STILL PRINTED, or the repair is a line nobody can read.
+	// The PHRASE is separately replaced by the supplied-value scrub, which runs on
+	// `ex.infos` before this line is marked -- a different consequence of the same
+	// confusion, and not one this scene claims to have fixed.
+	if !strings.Contains(stripMarks(report.String()), "103 Early") {
+		t.Fatalf("the interim status line was lost: %q", stripMarks(report.String()))
+	}
+}
+
+// TestAShortBinarySuffixIsRetained: fixing the standalone short token left the
+// same token unmeasured one position along. `decodeBase64` keeps only a valid-UTF-8
+// decode and `binaryCandidates` starts at four bytes, so `/2E` — 0xff 0x61 — was
+// retained when it stood alone and lost when it followed a separator
+// (shardpilot/shardpilot-go#84 review).
+func TestAShortBinarySuffixIsRetained(t *testing.T) {
+	suppliedValues = []string{"a"}
+	t.Cleanup(func() { suppliedValues = nil; decodeWork = 0 })
+	decodeWork = 0
+	if err := assertNoLeak(asCaptured("zz//2E")); err == nil {
+		t.Fatalf("a supplied value reachable through a short base64 SUFFIX was approved")
+	}
+	// ⚠ AND ORDINARY PROSE IS STILL APPROVED, or the producer has become a refusal.
+	decodeWork = 0
+	suppliedValues = []string{"nothingmatchesthis"}
+	if err := assertNoLeak(asCaptured("zz//2E")); err != nil {
+		t.Fatalf("an unrelated capture was refused: %v", err)
+	}
+}
+
+// TestAProducerRunsBeforeAStageDestroysTheForm: a destructive stage can remove what
+// a later producer would have found. With `dada` supplied, `/zY0NjE2NDYx` decodes
+// to a binary seed the hex producer reconstructs from — and `undoBase64` rewrites
+// that run before the producers ever see it, so the value was approved
+// (shardpilot/shardpilot-go#84 review).
+func TestAProducerRunsBeforeAStageDestroysTheForm(t *testing.T) {
+	suppliedValues = []string{"dada"}
+	t.Cleanup(func() { suppliedValues = nil; decodeWork = 0 })
+	decodeWork = 0
+	if err := assertNoLeak(asCaptured("/zY0NjE2NDYx")); err == nil {
+		t.Fatalf("a value reachable only from an intermediate form was approved")
+	}
+}
+
+// TestTheSeedCapBoundsTheAppend: one seed can carry thousands of short encoded
+// tokens, so a single round appended tens of thousands of entries and the loop
+// processed every one before the check at the top refused — a limit tested after
+// the overshoot is a report, not a limit (shardpilot/shardpilot-go#84 review).
+func TestTheSeedCapBoundsTheAppend(t *testing.T) {
+	suppliedValues = []string{"nothingmatches"}
+	t.Cleanup(func() { suppliedValues = nil; decodeWork = 0 })
+	decodeWork = 0
+	// ⚠ ASSERTED ON THE NUMBER THE REFUSAL REPORTS. Allocations do not discriminate
+	// here -- the work budget bounds the same population from the other side, and the
+	// mutant that removes the cap from the collector survived an allocation bound.
+	// What differs is how far past the cap the worklist ran.
+	// ⚠ THE EXPANSION, NOT THE INITIAL LIST. A capture that already carries 40000
+	// short tokens is refused by the check BEFORE the loop -- a different guard, and
+	// one that was never in question. The finding is about ONE seed that DECODES into
+	// thousands, so the tokens are hidden inside a single base64 run.
+	wide := base64.StdEncoding.EncodeToString([]byte(strings.Repeat("61 ", 20000)))
+	err := assertNoLeak(asCaptured(wide))
+	if err == nil {
+		t.Fatalf("a worklist that cannot settle was approved")
+	}
+	if !strings.Contains(err.Error(), "reached 4096 seeds") {
+		t.Errorf("the worklist ran past its cap before refusing: %v", err)
 	}
 }
