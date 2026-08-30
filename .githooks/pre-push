@@ -232,7 +232,7 @@ scan_ref_name() {
   # content at all (shardpilot/shardpilot-go#79 review). Lane A is absolute and
   # still reads every byte, the ref name and tag object included; only the
   # comparative check is pointed at something it can meaningfully answer about.
-  scan_commit "$1" "$1" "$3" "$4"
+  scan_commit "$1" "$1" "$3" "$4" "$5"
 }
 
 # scan_commit <commit> <base> <published-ref-name> [tag-object-file]
@@ -385,15 +385,34 @@ scan_commit() {
   if [ -n "${4:-}" ] && [ -s "$4" ]; then
     stage_evidence "$1" scripts/tag-object-as-committed.txt "$4"
   fi
+  if [ -n "${5:-}" ] && [ -s "$5" ]; then
+    stage_evidence "$1" scripts/tag-target-as-committed.txt "$5"
+  fi
 
   # ⚠ AND `git add` IS A CLEAN FILTER TOO. Staging the trusted scanner with it
   # would run whatever driver the branch's attributes name, on the way in
   # (shardpilot/shardpilot-go#79 review). The file is written to disk because the
   # shell must execute it -- these are OUR bytes, not the branch's -- and staged
   # by object id, past the filters entirely.
-  mkdir -p "$wt/scripts"
-  cp "$scanner" "$wt/scripts/check_public_surface.sh"
-  chmod +x "$wt/scripts/check_public_surface.sh"
+  # ⚠ CHECKED EXPLICITLY, because `set -e` DOES NOT APPLY HERE. Every call to
+  # this function is the left side of `||`, and bash disables errexit throughout
+  # such a body -- so a truncated copy continued, `chmod` made the partial file
+  # executable, and a truncation landing inside the leading comment block yields a
+  # valid shell script that exits 0 before installing the fail-closed trap: an
+  # unscanned push reported as clean (shardpilot/shardpilot-go#79 review).
+  #
+  # And the comparison, not just the exit codes: what runs must be what was
+  # trusted. A copy that "succeeded" and differs is the same failure wearing a
+  # zero.
+  mkdir -p "$wt/scripts" || { printf 'REFUSING: could not create %s.\n' "$wt/scripts" >&2; exit 2; }
+  if ! cp "$scanner" "$wt/scripts/check_public_surface.sh" ||
+     ! chmod +x "$wt/scripts/check_public_surface.sh" ||
+     ! cmp -s "$scanner" "$wt/scripts/check_public_surface.sh"; then
+    printf 'REFUSING: the trusted scanner could not be placed for the scan.\n' >&2
+    printf '  A partial copy that is executable is worse than none: a truncation\n' >&2
+    printf '  inside its leading comments is a valid script that exits 0.\n' >&2
+    exit 2
+  fi
   sblob="$( git_safe hash-object -w --no-filters -- "$scanner" 2>/dev/null )"
   if [ -n "$sblob" ]; then
     ( cd "$wt" && git_safe update-index --add \
@@ -555,6 +574,20 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # ratchet for republishing what is already public
   # (shardpilot/shardpilot-go#79 review).
   published="$(git ls-remote -- "$dest" 2>/dev/null | awk '{print $1}')"
+  # ⚠ ONE ROUND TRIP, NOT ONE PER TIP. A repository advertising hundreds of refs
+  # made this a serial fetch per missing tip -- minutes of gate for a push that
+  # takes seconds, which is how a gate gets uninstalled
+  # (shardpilot/shardpilot-go#79 review). The batch is attempted first; a batch
+  # dies entirely if any ONE of its tips is unfetchable, so the per-tip loop
+  # below stays as the fallback and still answers for whatever remains missing.
+  missing=""
+  for p in $published; do
+    git cat-file -e "$p^{commit}" 2>/dev/null || missing="$missing $p"
+  done
+  if [ -n "$missing" ]; then
+    # shellcheck disable=SC2086
+    git fetch --quiet --no-tags --no-write-fetch-head -- "$dest" $missing 2>/dev/null || true
+  fi
   excl=""
   for p in $published; do
     # ⚠ THE PUSHED SHA IS NOT AN EXCEPTION -- IT IS THE EVIDENCE. Creating a ref
@@ -582,6 +615,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # saw the outer one and stopped (shardpilot/shardpilot-go#79 review). Every
   # object on the way down is staged.
   tag_object=""
+  tag_target=""
   : > "$tmpdir/tag-object"
   walk="$local_sha"
   depth=0
@@ -620,9 +654,37 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     # own HEAD, which is already published and is its own base.
     scan_target="$peeled"
     if [ "$target_kind" != commit ]; then
+      # ⚠ AND THE TARGET OBJECT ITSELF. Substituting HEAD gave the scanner a tree
+      # to walk and a ref name to read, and quietly dropped the one thing the
+      # push actually publishes -- a blob tagged this way could carry anything
+      # (shardpilot/shardpilot-go#79 review). My previous fix made the push
+      # possible and left it unscanned, which is the worse half of the two.
+      # ⚠ `target_kind` IS `tag` HERE, NEVER `blob`. `peeled` is the result of a
+      # `^{commit}` that FAILED, so it is the tag's own id and its type is `tag`
+      # -- the branches below, keyed on it, could not fire once. The rig published
+      # a blob carrying a prohibited shape with the fix in place, which is how the
+      # substitution was found a second time: a repair keyed on the wrong name
+      # looks exactly like the defect it replaced.
+      deref="$( git rev-parse --verify --quiet "${local_sha}^{}" 2>/dev/null || printf '%s' "$peeled" )"
+      deref_kind="$( git cat-file -t "$deref" 2>/dev/null || printf 'unknown' )"
+      : > "$tmpdir/tag-target"
+      if [ "$deref_kind" = blob ]; then
+        git cat-file blob "$deref" >> "$tmpdir/tag-target" 2>/dev/null || true
+      elif [ "$deref_kind" = tree ]; then
+        # Bounded: a tree tag is unusual, and an unbounded walk is a way to make
+        # the gate hang rather than refuse.
+        git ls-tree -r "$deref" 2>/dev/null | awk '$2=="blob"{print $3}' | head -256 |
+          while read -r b; do
+            git cat-file blob "$b" >> "$tmpdir/tag-target" 2>/dev/null || true
+            printf '\n' >> "$tmpdir/tag-target"
+          done
+      fi
+      if [ -s "$tmpdir/tag-target" ]; then
+        tag_target="$tmpdir/tag-target"
+      fi
       scan_target="$head_sha"
     fi
-    scan_ref_name "$scan_target" "$base" "$remote_ref" "$tag_object" || status=$?
+    scan_ref_name "$scan_target" "$base" "$remote_ref" "$tag_object" "$tag_target" || status=$?
     continue
   fi
 
