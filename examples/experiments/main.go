@@ -26,8 +26,13 @@
 //
 //	NOTHING IS PRINTED THAT THIS PROGRAM CANNOT ACCOUNT FOR
 //
-//	  a supplied value      provably absent from every form the decoders reach,
-//	                        or the record is not printed at all
+//	  a supplied value      absent from every form THE DECODERS BELOW produce, or
+//	                        the record is not printed at all. The decoders are a
+//	                        CLOSED LIST and the claim is relative to it:
+//	                        undoPercent, undoUnicodeEscapes, undoBase64, undoHex,
+//	                        undoPlus, undoEntities -- run to a fixed point, over
+//	                        the text AND the field names, and over the candidates
+//	                        the base64, binary and hex producers add.
 //	  a header VALUE        every token drawn from a vocabulary the specification
 //	                        fixes -- an HTTP-date in GMT, an integer, a registered
 //	                        directive, a registered media type, the registered
@@ -54,6 +59,24 @@
 // refused becomes a capture, and a value that used to be printed becomes a
 // length. Refusal survives, narrowed: it is what happens when a shape defeats
 // every rule here.
+//
+// ⚠ AND THE FIRST CLAUSE IS NARROWED ON PURPOSE. It used to read "provably absent
+// from every form the decoders reach", which is the absolute statement this
+// comment opens by refusing: "the forms the decoders reach" is not a set anyone
+// can enumerate, so the clause invited exactly the question the paragraph above
+// says has no answer -- did you think of every encoding. Fourteen review rounds
+// answered it fourteen times, and the last four found 4, 4, 6 and 9 defects, more
+// than half of them in the previous round's fixes. The weak-clause paragraph that
+// used to follow this one is gone from this branch: the clause it warned about is
+// the one this change replaces.
+//
+// Naming the decoders makes the clause checkable in the way the others are: the
+// claim speaks about what THOSE decoders reconstruct, and an encoding outside the
+// list is outside the claim. Extending it is a decoder, a line in the list above,
+// and a scene -- a bounded change with a visible cost, instead of a promise that
+// quietly grows.
+// TestTheClaimNamesExactlyTheDecodersThatRun holds the list and the code
+// together, so the sentence cannot drift from the chain it describes.
 //
 // The difference the claim makes to whoever reviews this: "nothing leaks" can
 // only be attacked by inventing a new shape. The clauses above can be CHECKED --
