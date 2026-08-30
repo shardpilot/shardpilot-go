@@ -53,10 +53,11 @@
 // answered it fourteen times, and the last four found 4, 4, 6 and 9 defects, more
 // than half of them in the previous round's fixes.
 //
-// Naming the decoders makes the clause checkable in the way the others are: an
-// encoding NOT on that list is not covered, and saying so is the honest state.
-// Adding one is a decoder, a line in the list above, and a scene -- a bounded
-// change with a visible cost, instead of a promise that quietly grows.
+// Naming the decoders makes the clause checkable in the way the others are: the
+// claim speaks about what THOSE decoders reconstruct, and an encoding outside the
+// list is outside the claim. Extending it is a decoder, a line in the list above,
+// and a scene -- a bounded change with a visible cost, instead of a promise that
+// quietly grows.
 // TestTheClaimNamesExactlyTheDecodersThatRun holds the list and the code
 // together, so the sentence cannot drift from the chain it describes.
 //
