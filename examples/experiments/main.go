@@ -1034,9 +1034,14 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 			addSuppliedValue(v)
 		}
 	}
-	if req.URL.Host != "" {
-		noteRequestName(req.URL.Host)
-	}
+	// ⚠ THE AUTHORITY IS NOT A PARAMETER NAME. It was registered here, so
+	// `nameIsOurs` vouched for it wherever a NAME is expected -- and with host and
+	// experiment key both `control`, a `Location: /cb?control=x` or a cookie of
+	// that name was marked harness-generated, which both the scrub and the guard
+	// then skipped: the supplied identifier published
+	// (shardpilot/shardpilot-go#85 review). The `Host:` LINE is vouched for by
+	// `requestOwnedHeaders`, which is the mechanism written for it; removing this
+	// registration fails no test, measured.
 	if dump, err := httputil.DumpRequestOut(req, true); err == nil {
 		// ⚠ THE AUTHORITY IS OURS AND IS NOT IN `req.Header`. Go stores it in
 		// `Request.Host`/`URL.Host`, so a derivation asking only the header map

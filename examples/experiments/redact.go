@@ -307,10 +307,41 @@ func parsesAsURI(target string) bool {
 		// (shardpilot/shardpilot-go#85 review). Address and zone are validated
 		// separately, which is the only way either can be judged at all.
 		addr, zone, hasZone := strings.Cut(lit, "%")
-		if hasZone && zone == "" {
+		// ⚠ A ZONE IS NOT STRUCTURALLY CONSTRAINED. The host exemption rests on
+		// `publicly resolvable and constrained by its grammar`; a zone identifier is
+		// an arbitrary LOCAL string, so `[fe80::1%25SERVER_SECRET]` carried endpoint
+		// text straight into the capture while this checked only that it was
+		// non-empty (shardpilot/shardpilot-go#85 review). An exemption whose stated
+		// premise does not hold of a component does not cover that component -- the
+		// third time on this branch that a host exemption has been read as covering
+		// what stands beside the host.
+		//
+		// The grammar is checked here -- a zone outside it is not an authority Go
+		// would have produced -- but grammar is NOT the property: `SERVER_SECRET` is
+		// a perfectly valid zone-id, which is why the zone is REDACTED in the emitted
+		// target rather than merely admitted here. See redactZone.
+		if hasZone && !isZoneID(zone) {
 			return false
 		}
 		return net.ParseIP(addr) != nil && strings.Contains(addr, ":")
+	}
+	return true
+}
+
+// isZoneID accepts an RFC 6874 zone identifier: unreserved characters only, which
+// is what an interface name is. Anything else is a string the endpoint chose.
+func isZoneID(z string) bool {
+	if z == "" {
+		return false
+	}
+	for i := 0; i < len(z); i++ {
+		c := z[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case c == '-' || c == '.' || c == '_' || c == '~':
+		default:
+			return false
+		}
 	}
 	return true
 }
@@ -386,9 +417,9 @@ func redactTarget(line string) string {
 		}
 	}
 	if i := strings.IndexByte(line, '#'); i >= 0 {
-		return redactPath(redactUserinfo(redactQuery(line[:i]))) + redactFragment(line[i:])
+		return redactZone(redactPath(redactUserinfo(redactQuery(line[:i])))) + redactFragment(line[i:])
 	}
-	return redactPath(redactUserinfo(redactQuery(line)))
+	return redactZone(redactPath(redactUserinfo(redactQuery(line))))
 }
 
 // splitField cuts a header line into its name, the whitespace after the colon,
@@ -652,6 +683,42 @@ func markAttrName(an string) string {
 		return an
 	}
 	return strings.Replace(an, name, marked(name), 1)
+}
+
+// redactZone replaces an IPv6 zone identifier with its length, keeping the
+// address and the separator.
+//
+// ⚠ THE ZONE IS ENDPOINT TEXT INSIDE AN EXEMPT COMPONENT. The host exemption
+// rests on "publicly resolvable and constrained by its grammar"; a zone is an
+// arbitrary LOCAL string, so `[fe80::1%25SERVER_SECRET]` rode into the capture
+// verbatim (shardpilot/shardpilot-go#85 review). Strictly ACCEPTING it does not
+// help -- that spelling satisfies RFC 6874 exactly -- which is the difference
+// between checking a grammar and checking a property. Third time on this branch
+// that a host exemption has been read as covering what stands beside the host.
+func redactZone(line string) string {
+	b := strings.IndexByte(line, '[')
+	if b < 0 {
+		return line
+	}
+	e := strings.IndexByte(line[b:], ']')
+	if e < 0 {
+		return line
+	}
+	e += b
+	lit := line[b+1 : e]
+	z := strings.Index(lit, "%25")
+	sep := 3
+	if z < 0 {
+		if z = strings.IndexByte(lit, '%'); z < 0 {
+			return line
+		}
+		sep = 1
+	}
+	zone := lit[z+sep:]
+	if zone == "" {
+		return line
+	}
+	return line[:b+1] + lit[:z+sep] + tokenPlaceholder(zone) + line[e:]
 }
 
 // redactUserinfo removes `user:password@` from a redirect target.

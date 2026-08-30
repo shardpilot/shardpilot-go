@@ -1658,3 +1658,53 @@ func TestACookieAttributeIsMeasuredAsReceived(t *testing.T) {
 		t.Fatalf("an attribute value was measured in its escaped spelling: %q", got)
 	}
 }
+
+// ---- round on ac5f3a0 ----
+
+// TestTheAuthorityIsNotAParameterName: registering the URL authority in
+// `requestNames` made `nameIsOurs` vouch for it wherever a NAME is expected, so
+// with host and experiment key both `control` the identifier was marked
+// harness-generated and both the scrub and the guard skipped it
+// (shardpilot/shardpilot-go#85 review).
+func TestTheAuthorityIsNotAParameterName(t *testing.T) {
+	suppliedValues = []string{"control"}
+	requestNames = map[string]bool{}
+	t.Cleanup(func() { suppliedValues = nil; requestNames = map[string]bool{} })
+	got := stripMarks(scrubSupplied(redactTarget("Location: /cb?control=x")))
+	if strings.Contains(got, "control") {
+		t.Fatalf("a supplied identifier equal to the authority was published: %q", got)
+	}
+	// ⚠ AND A NAME THE HARNESS REALLY SENT IS STILL VOUCHED FOR.
+	requestNames = map[string]bool{"control": true}
+	got = stripMarks(scrubSupplied(redactTarget("Location: /cb?control=x")))
+	if !strings.Contains(got, "control=") {
+		t.Fatalf("a parameter name the harness sent was scrubbed: %q", got)
+	}
+}
+
+// TestAnIPv6ZoneIsNotExempt: the host exemption rests on "publicly resolvable and
+// constrained by its grammar", and a zone identifier is an arbitrary local string
+// (shardpilot/shardpilot-go#85 review).
+func TestAnIPv6ZoneIsNotExempt(t *testing.T) {
+	// ⚠ THE PROPERTY IS ABOUT THE OUTPUT, NOT THE PREDICATE. My first version
+	// asserted `parsesAsURI` refuses it — and `SERVER_SECRET` satisfies RFC 6874
+	// exactly, so the scene failed on the fix and was right to: a grammar check
+	// cannot express "this is endpoint text". The zone is redacted instead.
+	suppliedValues = nil
+	got := stripMarks(redactTarget("Location: https://[fe80::1%25SERVER_SECRET]/cb"))
+	if strings.Contains(got, "SERVER_SECRET") {
+		t.Fatalf("an arbitrary IPv6 zone reached the capture verbatim: %q", got)
+	}
+	if !strings.Contains(got, "fe80::1") {
+		t.Fatalf("the address itself was lost with the zone: %q", got)
+	}
+	// A real scoped address still is one, or the earlier fix is undone.
+	if !parsesAsURI("https://[fe80::1%25eth0]/cb") {
+		t.Fatal("a legitimate scoped IPv6 authority was refused")
+	}
+	for _, bad := range []string{"", "a b", "a/b", "a%b"} {
+		if isZoneID(bad) {
+			t.Fatalf("a zone identifier outside the grammar was accepted: %q", bad)
+		}
+	}
+}
