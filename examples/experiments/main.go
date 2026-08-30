@@ -1364,6 +1364,20 @@ func dropFraming(dump string) string {
 		// two paths' agreement a measured thing rather than a habit.
 		if name, ok := fieldNameOf(low); ok {
 			if note, minted := serverMintedFields[name]; minted {
+				// ⚠ AND ONLY WHERE THERE ARE VALUE BYTES TO CONCEAL. A legal empty
+				// field -- `Location:`, or one whose value is nothing but OWS -- was
+				// refused on the strength of its NAME, so a capture with no
+				// endpoint-minted bytes in it at all cost an operator the record and
+				// exit 4 (shardpilot/shardpilot-go#84 review). The refusal is about what
+				// the value could hide, exactly as the unsupported-coding check is about
+				// what an undecodable body could hide.
+				//
+				// The name printed is still THIS program's spelling, so the empty field
+				// is vouched for rather than echoed.
+				if _, v, _ := strings.Cut(strings.TrimSuffix(l, "\r"), ":"); strings.Trim(v, " \t") == "" {
+					out = append(out, marked(canonicalFieldName(name)+":")+cr)
+					continue
+				}
 				noteStructural(note)
 				out = append(out, canonicalFieldName(name)+": "+marked("<withheld>")+cr)
 				continue
@@ -1705,6 +1719,19 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 				explicitFraming = true
 			}
 		}
+		// ⚠ AND FRAMING SEPARATES THE TWO ONLY ABOVE HTTP/1.0. Below it, closure is
+		// the PROTOCOL DEFAULT: net/http sets `Close` on a 1.0 response carrying an
+		// explicit `Content-Length` and no `Connection` field at all -- measured,
+		// `HTTP/1.0 200 OK\r\nContent-Length: 2` gives `Close=true` while the same
+		// response as 1.1 gives false. So the framing test answered "the field was
+		// received" about a field that was never sent, and with a supplied `close`
+		// the scrub rewrote the synthesised line into `Connection: <redacted, 5
+		// chars>` and called the result canonical (shardpilot/shardpilot-go#84
+		// review). `ProtoAtLeast` is the standard library's own spelling of the
+		// question; arithmetic on the version numbers would be a second grammar.
+		if !resp.ProtoAtLeast(1, 1) {
+			explicitFraming = false
+		}
 		// ⚠ AND WHEN IT IS AMBIGUOUS, NEITHER ANSWER IS SAFE. Without explicit
 		// framing, `Close` means either a consumed `Connection: close` OR
 		// close-delimited framing, and the same state covers both -- so calling it
@@ -1932,7 +1959,6 @@ const captureDeadline = 30 * time.Second
 // question rather than restating it.
 func noteStructuralInText(text string) {
 	for _, ln := range strings.Split(text, "\n") {
-		low := strings.ToLower(strings.TrimSpace(stripMarks(ln)))
 		// ⚠ CONTAINS, NOT HasPrefix. Go wraps the offending line in prose and quotes
 		// -- `malformed HTTP response "Set-Cookie: …"` -- so a prefix test never
 		// matched the shape the finding is about. Over-refusing an error diagnostic
@@ -1988,6 +2014,24 @@ func noteStructuralInText(text string) {
 					noteStructural("a server-minted field inside a transport error")
 				}
 			}
+			// ⚠ AND THE FIELD NAMES ON EVERY FORM, NOT ONLY THE ARRIVED ONE. This scan
+			// decodes to a fixed point precisely because a name can be spelled to defeat
+			// a reader, and then the `serverMintedFields` sweep ran ONCE, over the
+			// undecoded line: `%53et-Cookie: session=secret` was decoded here, handed to
+			// `isMintedName` -- which answers about minted IDENTIFIERS, not field names
+			// -- and nothing was recorded, so the diagnostic was published and the
+			// supported percent decoder reconstructs the cookie from it
+			// (shardpilot/shardpilot-go#84 review). One scan asked about every form and
+			// its twin asked about one; the forms are the population for both.
+			// Normalised exactly as the single pass it replaces was: marks stripped and
+			// the line trimmed, so the first form answers identically and every later
+			// one is asked the same question.
+			lowForm := strings.ToLower(strings.TrimSpace(stripMarks(form)))
+			for _, name := range slices.Sorted(maps.Keys(serverMintedFields)) {
+				if strings.Contains(lowForm, name+":") {
+					noteStructural(serverMintedFields[name] + " inside a transport error")
+				}
+			}
 		}
 		cur := ln
 		spent := 0
@@ -2005,19 +2049,6 @@ func noteStructuralInText(text string) {
 			cur = next
 		}
 		decodeWork += spent
-		// ⚠ THE THIRD SITE ASKING THE SAME QUESTION, and it had its own answer too.
-		// This one listed all four names while the trailer report listed two, which
-		// is how the drift stayed invisible: whichever site you read, it looked
-		// complete (shardpilot/shardpilot-go#84 review). All three read
-		// `serverMintedFields` now. Sorted, so a line naming two fields notes them
-		// in a fixed order rather than in map order.
-		// A `switch` would stop at the first match; an error line is free-form text
-		// and can carry more than one field, so every match is noted.
-		for _, name := range slices.Sorted(maps.Keys(serverMintedFields)) {
-			if strings.Contains(low, name+":") {
-				noteStructural(serverMintedFields[name] + " inside a transport error")
-			}
-		}
 	}
 }
 
@@ -3039,8 +3070,36 @@ func shortBase64Candidates(text string) []string {
 		if len(tok) < 2 || len(tok) > 3 {
 			continue
 		}
-		if dec, ok := decodeBase64(tok); ok {
-			out = append(out, dec)
+		// ⚠ ONE DECODE, TWO QUESTIONS. The text answer retained only a VALID-UTF-8
+		// decode and the binary producer's floor is four bytes, so `/2E` -- which
+		// raw-decodes to 0xff 0x61 -- fell BETWEEN the two producers and a
+		// one-character supplied value was approved even though the configured decoder
+		// reconstructs it directly (shardpilot/shardpilot-go#84 review).
+		//
+		// Asked here rather than by lowering the binary floor: these tokens are
+		// already walked, so nothing new is enumerated. Both alternatives were
+		// MEASURED against the seed-cap scene, which bounds this collection in
+		// allocations: against a 56 MiB baseline, lowering the floor cost 295 MiB
+		// (every long token then yielding suffixes), asking a SECOND decode after the
+		// first cost 156 MiB, and asking one decode two questions costs what the
+		// single question cost.
+		decs := base64Decodes(tok)
+		kept := false
+		for _, raw := range decs {
+			if utf8.Valid(raw) {
+				out = append(out, string(raw))
+				kept = true
+				break
+			}
+		}
+		if kept {
+			continue
+		}
+		for _, raw := range decs {
+			if !utf8.Valid(raw) {
+				out = append(out, string(raw))
+				break
+			}
 		}
 	}
 	return out
@@ -3181,24 +3240,30 @@ func undoHex(text string) string {
 	return b.String()
 }
 
+// base64Decodes is every raw byte string the four encodings this program accepts
+// read out of one token. Both the binary producer and the short producer ask it,
+// so the alphabet is stated once: a second spelling of a decoder is a second
+// grammar, and the two would answer differently the day one of them is widened.
+func base64Decodes(tok string) [][]byte {
+	var out [][]byte
+	for _, enc := range []*base64.Encoding{
+		base64.StdEncoding, base64.RawStdEncoding,
+		base64.URLEncoding, base64.RawURLEncoding,
+	} {
+		if raw, err := enc.DecodeString(tok); err == nil {
+			out = append(out, raw)
+		}
+	}
+	return out
+}
+
 var binaryDecoders = []struct {
 	isByte func(byte) bool
 	pad    byte
 	minLen int
 	decode func(string) [][]byte
 }{
-	{isBase64Byte, '=', 4, func(tok string) [][]byte {
-		var out [][]byte
-		for _, enc := range []*base64.Encoding{
-			base64.StdEncoding, base64.RawStdEncoding,
-			base64.URLEncoding, base64.RawURLEncoding,
-		} {
-			if raw, err := enc.DecodeString(tok); err == nil {
-				out = append(out, raw)
-			}
-		}
-		return out
-	}},
+	{isBase64Byte, '=', 4, base64Decodes},
 	{isHexByte, 0, 6, func(tok string) [][]byte {
 		if len(tok)%2 != 0 {
 			return nil
@@ -3272,7 +3337,16 @@ func isHexByte(c byte) bool {
 // (shardpilot/shardpilot-go#84 review). MIME wrapping is about where a line BREAK
 // falls, not about what else is on the line.
 func wrappedBase64Candidates(text string) []string {
-	lines := strings.Split(text, "\n")
+	// ⚠ AND A LONE CR IS A FOLD TOO. `encoding/base64` ignores CR and LF alike, so
+	// `YWJj\rZGVmZ2g=` reconstructs the value -- while splitting only on LF left the
+	// CR INSIDE one line, `allBase64` rejected the run, and the ordinary token
+	// decoder saw two independent fragments that reconstruct nothing, so the guard
+	// approved a spelling a standard decoder reads straight through
+	// (shardpilot/shardpilot-go#84 review). All three spellings of a fold are one
+	// separator here, normalised before the split rather than trimmed after it.
+	norm := strings.ReplaceAll(text, "\r\n", "\n")
+	norm = strings.ReplaceAll(norm, "\r", "\n")
+	lines := strings.Split(norm, "\n")
 	for i, ln := range lines {
 		// ⚠ NORMALISED THE SAME WAY THE WHOLE-LINE PRODUCER NORMALISES. Judging
 		// unnormalised lines here made a space anywhere in the run terminate it:
@@ -3462,11 +3536,8 @@ func isBase64Byte(c byte) bool {
 // reports failure rather than a partial decode: half a token tells the guard
 // nothing and would only add noise to every later round.
 func decodeBase64(tok string) (string, bool) {
-	for _, enc := range []*base64.Encoding{
-		base64.StdEncoding, base64.RawStdEncoding,
-		base64.URLEncoding, base64.RawURLEncoding,
-	} {
-		if raw, err := enc.DecodeString(tok); err == nil && utf8.Valid(raw) {
+	for _, raw := range base64Decodes(tok) {
+		if utf8.Valid(raw) {
 			return string(raw), true
 		}
 	}

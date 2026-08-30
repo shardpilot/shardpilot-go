@@ -2630,23 +2630,40 @@ func TestAConsumedCloseSignalIsStillReceived(t *testing.T) {
 	//
 	// The rows are the product of the header's presence with `resp.Close` and with
 	// the three framings a response can have.
+	// ⚠ AND THE PROTOCOL IS A THIRD AXIS, because BELOW HTTP/1.1 closure is the
+	// default: `net/http` sets `Close` on a 1.0 response carrying an explicit
+	// `Content-Length` and no `Connection` field at all -- measured with
+	// `http.ReadResponse`, which gives `Close=true` there and false for the same
+	// response as 1.1. So framing separated the two provenances only above 1.0, and
+	// the row that proves it was missing rather than wrong
+	// (shardpilot/shardpilot-go#84 review). The expectation carries `ambiguous` too:
+	// a scene that reads only `recvConn` cannot tell "the endpoint did not send it"
+	// from "we cannot tell", and those are the two answers this branch chooses
+	// between.
 	for _, c := range []struct {
-		name     string
-		header   http.Header
-		close    bool
-		length   int64
-		chunked  bool
-		received bool
+		name      string
+		minor     int
+		header    http.Header
+		close     bool
+		length    int64
+		chunked   bool
+		received  bool
+		ambiguous bool
 	}{
-		{"in the map", http.Header{"Connection": []string{"close"}}, false, -1, false, true},
-		{"consumed, explicit length", http.Header{}, true, 0, false, true},
-		{"consumed, chunked", http.Header{}, true, -1, true, true},
-		{"close-delimited, no header", http.Header{}, true, -1, false, false},
-		{"both", http.Header{"Connection": []string{"close"}}, true, -1, false, true},
-		{"absent", http.Header{}, false, -1, false, false},
+		{"in the map", 1, http.Header{"Connection": []string{"close"}}, false, -1, false, true, false},
+		{"consumed, explicit length", 1, http.Header{}, true, 0, false, true, false},
+		{"consumed, chunked", 1, http.Header{}, true, -1, true, true, false},
+		{"close-delimited, no header", 1, http.Header{}, true, -1, false, false, true},
+		{"both", 1, http.Header{"Connection": []string{"close"}}, true, -1, false, true, false},
+		{"absent", 1, http.Header{}, false, -1, false, false, false},
+		{"1.0, explicit length", 0, http.Header{}, true, 0, false, false, true},
+		{"1.0, chunked", 0, http.Header{}, true, -1, true, false, true},
+		{"1.0, close-delimited", 0, http.Header{}, true, -1, false, false, true},
+		{"1.0, in the map", 0, http.Header{"Connection": []string{"close"}}, false, -1, false, true, false},
 	} {
 		resp := &http.Response{
-			StatusCode: 200, Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+			StatusCode: 200, Proto: "HTTP/1." + strconv.Itoa(c.minor),
+			ProtoMajor: 1, ProtoMinor: c.minor,
 			Status: "200 OK", Header: c.header, ContentLength: c.length, Close: c.close,
 			Body: io.NopCloser(strings.NewReader("")),
 		}
@@ -2669,6 +2686,9 @@ func TestAConsumedCloseSignalIsStillReceived(t *testing.T) {
 		}
 		if got[0].recvConn != c.received {
 			t.Errorf("%s: recvConn=%v, want %v", c.name, got[0].recvConn, c.received)
+		}
+		if got[0].closeAmbiguous != c.ambiguous {
+			t.Errorf("%s: closeAmbiguous=%v, want %v", c.name, got[0].closeAmbiguous, c.ambiguous)
 		}
 	}
 }
@@ -3424,4 +3444,117 @@ func allocatedMiB(f func()) uint64 {
 	f()
 	runtime.ReadMemStats(&after)
 	return (after.TotalAlloc - before.TotalAlloc) / (1 << 20)
+}
+
+// TestALegalEmptyFieldIsNotRefused: the refusal is about what a value could
+// hide, so a field with no value bytes has nothing for it to be about. A legal
+// empty `Location:` was refused on the strength of its NAME and the capture cost
+// an operator the record and exit 4 (shardpilot/shardpilot-go#84 review) — the
+// same shape as the unsupported-coding check, which already asks whether there is
+// a body to decode.
+func TestALegalEmptyFieldIsNotRefused(t *testing.T) {
+	t.Cleanup(func() { structuralSurfaces = nil })
+	for _, dump := range []string{
+		"HTTP/1.1 302 Found\r\nLocation:\r\n\r\n",
+		"HTTP/1.1 302 Found\r\nLocation: \t\r\n\r\n",
+	} {
+		structuralSurfaces = nil
+		got := stripMarks(dropFraming(dump))
+		if len(structuralSurfaces) != 0 {
+			t.Errorf("a field with no value bytes cost the capture: %v (%q)", structuralSurfaces, got)
+		}
+		if !strings.Contains(got, "Location:") {
+			t.Errorf("the empty field was not printed in this program's spelling: %q", got)
+		}
+	}
+	// ⚠ AND A FIELD THAT CARRIES VALUE BYTES IS STILL REFUSED, or the repair has
+	// traded a withheld capture for a published redirect target.
+	structuralSurfaces = nil
+	got := stripMarks(dropFraming("HTTP/1.1 302 Found\r\nLocation: /cb?state=x\r\n\r\n"))
+	if len(structuralSurfaces) == 0 {
+		t.Fatalf("a Location carrying endpoint-minted bytes was not refused: %q", got)
+	}
+}
+
+// TestAnEncodedFieldNameIsRefusedOnEveryForm: this scan decodes to a fixed point
+// precisely because a name can be spelled to defeat a reader — and then the
+// field-name sweep ran once, over the UNDECODED line. `%53et-Cookie:` was decoded,
+// handed to `isMintedName` (which answers about minted identifiers, not field
+// names) and nothing was recorded, so the diagnostic was published and the
+// supported percent decoder reconstructs the cookie from it
+// (shardpilot/shardpilot-go#84 review).
+func TestAnEncodedFieldNameIsRefusedOnEveryForm(t *testing.T) {
+	t.Cleanup(func() { structuralSurfaces = nil })
+	for _, spelling := range []string{
+		`%53et-Cookie: session=secret`,
+		`%2553et-Cookie: session=secret`,
+		`Set-%43ookie: session=secret`,
+		`Set-Cookie: session=secret`,
+	} {
+		structuralSurfaces = nil
+		noteStructuralInText(`malformed HTTP response "` + spelling + `"`)
+		if len(structuralSurfaces) == 0 {
+			t.Errorf("a server-minted field spelled %q was not refused", spelling)
+		}
+	}
+	// ⚠ AND AN ORDINARY DIAGNOSTIC IS NOT REFUSED, or the sweep has become a
+	// refusal of every transport error.
+	structuralSurfaces = nil
+	noteStructuralInText(`malformed HTTP response "X-Trace: 1"`)
+	if len(structuralSurfaces) != 0 {
+		t.Fatalf("a diagnostic naming no minted field was refused: %v", structuralSurfaces)
+	}
+}
+
+// TestALoneCRFoldsBase64LikeLF: `encoding/base64` ignores CR and LF alike, so a
+// run folded with a lone CR reconstructs the value — while splitting only on LF
+// left the CR inside one line, `allBase64` rejected the run, and the ordinary
+// token decoder saw two fragments that reconstruct nothing
+// (shardpilot/shardpilot-go#84 review).
+func TestALoneCRFoldsBase64LikeLF(t *testing.T) {
+	// ⚠ THE BUDGET IS SHARED AND THIS SCENE IS NOT FIRST. Assembly stops charging
+	// against `decodeWork`, so a scene that does not reset it passes alone and fails
+	// in the suite -- which is what the first draft of this one did, for all three
+	// folds including the LF that has always worked.
+	decodeWork = 0
+	t.Cleanup(func() { decodeWork = 0 })
+	for _, fold := range []string{"\n", "\r\n", "\r"} {
+		var found bool
+		for _, c := range wrappedBase64Candidates("prefix: YWJj" + fold + "ZGVmZ2g=") {
+			if strings.Contains(c, "YWJjZGVmZ2g=") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("a run folded with %q produced no assembled candidate", fold)
+		}
+	}
+}
+
+// TestAShortBinaryBase64DecodeIsRetained: the text answer retained only a
+// valid-UTF-8 decode and the binary producer's floor is four bytes, so `/2E` —
+// which raw-decodes to 0xff 0x61 — fell between the two producers and a
+// one-character supplied value was approved, even though the configured decoder
+// reconstructs it directly (shardpilot/shardpilot-go#84 review).
+func TestAShortBinaryBase64DecodeIsRetained(t *testing.T) {
+	var found bool
+	for _, c := range shortBase64Candidates("/2E") {
+		if strings.Contains(c, "a") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the binary decode of a short token was discarded: %q", shortBase64Candidates("/2E"))
+	}
+	// ⚠ AND THE TEXT ANSWER IS UNCHANGED, or one decode answering two questions has
+	// taken the first one with it.
+	found = false
+	for _, c := range shortBase64Candidates("YWI") {
+		if c == "ab" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("the textual decode of a short token was lost: %q", shortBase64Candidates("YWI"))
+	}
 }
