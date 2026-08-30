@@ -1002,6 +1002,56 @@ var benignTopLevel = func() map[string]bool {
 	return m
 }()
 
+// sdkAssignmentWire MIRRORS `expAssignmentWire` in experiments.go MEMBER FOR
+// MEMBER -- every tag, and every Go type. The vouch below asks whether the SDK
+// would accept a body as an assignment verdict, and the SDK asks that with
+// `json.Unmarshal` into that struct: THE TYPING IS THE GRAMMAR. A reduced copy
+// carrying only the members this pass reads answers a weaker question, and
+// `{"assigned":false,"variant_payload":1,"reason":"kill_switch"}` is the
+// difference -- the SDK rejects that body because `variant_payload` is not a map,
+// while the reduced copy decoded it and vouched `reason`, so a supplied
+// `kill_switch` was skipped by BOTH the scrub and the guard and published with an
+// empty refusal ledger (shardpilot/shardpilot-go#85 review).
+//
+// ⚠ A MIRROR OF SOMEONE ELSE'S GRAMMAR HAS AS MANY EDGES AS THAT GRAMMAR HAS
+// VERSIONS. Five rounds have now narrowed this predicate one member at a time, so
+// the drift is not left to be noticed: TestTheMirroredWireShapeMatchesTheSDKs
+// reads BOTH structs out of the source and fails the day they differ. Calling the
+// SDK's own decode would need that type exported -- a change to the subject this
+// example exists to observe, which is not this program's to make.
+type sdkAssignmentWire struct {
+	AppKey         json.RawMessage `json:"app_key"`
+	EnvironmentKey json.RawMessage `json:"environment_key"`
+	ExperimentKey  json.RawMessage `json:"experiment_key"`
+	Version        json.RawMessage `json:"version"`
+	Assigned       *bool           `json:"assigned"`
+	AssignmentKey  string          `json:"assignment_key"`
+	VariantKey     string          `json:"variant_key"`
+	VariantPayload map[string]any  `json:"variant_payload"`
+	Reason         json.RawMessage `json:"reason"`
+	SubjectFactKey string          `json:"subject_fact_key"`
+	Boundary       map[string]any  `json:"boundary"`
+}
+
+// sdkWouldParseAssignment reports whether a body decodes into the SDK's assignment
+// wire shape at all. A complete, under-limit 200 may still be valid JSON that is
+// NOT an assignment -- `{"assigned":"x"}` is rejected by the typed decode as
+// `malformed_response` -- and exempting its member names marked a supplied
+// identifier as generated (shardpilot/shardpilot-go#84 review). Status and size say
+// whether the SDK would LOOK; this says whether it would find a verdict.
+//
+// ⚠ LIMIT: the text this pass holds has been through `escapeMarks`, so a body
+// carrying literal backslash spellings may fail to decode here though the SDK
+// accepted the captured bytes. That fails CLOSED -- no exemptions -- which is the
+// direction this file refuses in.
+func sdkWouldParseAssignment(body string) bool {
+	var wire sdkAssignmentWire
+	if json.Unmarshal([]byte(body), &wire) != nil {
+		return false
+	}
+	return wire.Assigned != nil
+}
+
 // topLevelExemptions picks the registry a body of this status is described by.
 //
 // ⚠ THE SDK'S OWN PRECONDITIONS COME FIRST. Both SDK paths refuse a body before
@@ -1030,7 +1080,7 @@ var benignTopLevel = func() map[string]bool {
 // (shardpilot/shardpilot-go#84 review). The SDK's gate is about the bytes IT read,
 // so the recorder hands that number over rather than letting this pass measure its
 // own expansion.
-func topLevelExemptions(statusLine string, bodyLen int) map[string]bool {
+func topLevelExemptions(statusLine string, bodyLen int, shapeOK bool) map[string]bool {
 	none := map[string]bool{}
 	// ⚠ INCOMPLETE IS THE SDK'S OTHER PRECONDITION, and it is not a length. A 200
 	// whose body is a syntactically complete JSON prefix but whose READ failed --
@@ -1051,6 +1101,9 @@ func topLevelExemptions(statusLine string, bodyLen int) map[string]bool {
 	}
 	switch {
 	case n == 200:
+		if !shapeOK {
+			return none
+		}
 		return assignmentTopLevel
 	// ⚠ AND THE ERROR ENVELOPE IS READ AT 400 AND 403, NOT AT EVERY 4xx.
 	// `applyExperimentAssignment` calls `experimentBodyErrorText` only for those
@@ -1428,14 +1481,28 @@ func dropFraming(dump string) string {
 	// (shardpilot/shardpilot-go#84 review). My own repair, one round old: the question
 	// is about what `http.ReadResponse` wrote into the HEADER SET, and nothing below
 	// the separator is that.
-	pragmaNoCache, cacheNoCache := false, false
+	// ⚠ THE PARSER'S EXACT CONDITION, NOT A SUBSTRING. `fixPragmaCacheControl`
+	// synthesises the directive only when the FIRST parsed `Pragma` value is exactly
+	// `no-cache`, lowercase -- so `Pragma: x-no-cache` alongside a genuine
+	// `Cache-Control: no-cache`, an uppercase spelling, or a later `no-cache` in the
+	// list produced a false refusal from my check (shardpilot/shardpilot-go#84
+	// review). A guard mirroring another program's behaviour is only right where it
+	// mirrors the CONDITION, not the vocabulary.
+	pragmaNoCache, cacheNoCache, sawPragma := false, false, false
 	for _, l := range lines {
 		if strings.TrimSuffix(l, "\r") == "" {
 			break
 		}
 		low := strings.ToLower(strings.TrimSuffix(l, "\r"))
-		if strings.HasPrefix(low, "pragma:") && strings.Contains(low, "no-cache") {
-			pragmaNoCache = true
+		if !sawPragma && strings.HasPrefix(low, "pragma:") {
+			sawPragma = true
+			first := strings.TrimSuffix(l, "\r")[len("Pragma:"):]
+			if k := strings.IndexByte(first, ','); k >= 0 {
+				first = first[:k]
+			}
+			if strings.Trim(first, " \t") == "no-cache" {
+				pragmaNoCache = true
+			}
 		}
 		if strings.HasPrefix(low, "cache-control:") &&
 			strings.TrimSpace(strings.TrimPrefix(low, "cache-control:")) == "no-cache" {
@@ -1682,7 +1749,7 @@ func dropFraming(dump string) string {
 		if capturedBodyBytes >= 0 {
 			exemptBodyLen = capturedBodyBytes
 		}
-		exemptions = topLevelExemptions(out[0], exemptBodyLen)
+		exemptions = topLevelExemptions(out[0], exemptBodyLen, sdkWouldParseAssignment(exemptBody))
 	}
 	if bodyStart < 0 {
 		return strings.Join(out, "\n")
@@ -1796,7 +1863,13 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 			// against a `103 Early Hints` -- refused an otherwise safe capture
 			// (shardpilot/shardpilot-go#84 review). `scrubSupplied` already skips status
 			// lines; the guard reads provenance, and the provenance was wrong.
-			b.WriteString(marked(fmt.Sprintf("HTTP/1.1 %d %s", code, http.StatusText(code))) + "\r\n")
+			// ⚠ THE CAPTURED BYTES ARE ESCAPED FIRST, THEN THE GENERATED LINE IS ADDED.
+			// Escaping AFTER the marks turns the provenance bytes themselves into literal
+			// `\x01` text: the line stops being recognised as generated -- or as a status
+			// line at all -- the scrub rewrites a reason phrase this program wrote, and
+			// the report calls the result canonical (shardpilot/shardpilot-go#84 review).
+			// `escapeMarks` exists to make ARRIVED bytes unambiguous; running it over our
+			// own marks is asking it about the wrong text.
 			names := make([]string, 0, len(h))
 			for k := range h {
 				names = append(names, k)
@@ -1834,7 +1907,8 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 			// response's answer marked a received interim line as serialiser-generated
 			// and published it (same review). Per exchange was the fix two rounds ago;
 			// per interim BLOCK is the same sentence one surface along.
-			line := escapeMarks(b.String())
+			line := marked(fmt.Sprintf("HTTP/1.1 %d %s", code, http.StatusText(code))) +
+				"\r\n" + escapeMarks(b.String())
 			_, hadConn := h["Connection"]
 			if len(infos) >= maxInterimResponses || infoBytes+len(line) > maxInterimBytes {
 				infoOverflow = true
@@ -3425,6 +3499,14 @@ func assertNoLeak(text string) error {
 			"decoding did not settle within %d rounds; the record is NOT "+
 				"publishable and was not printed", len(text)+1)
 	}
+	// ⚠ JOINED ONCE, NOT PER CANDIDATE PER VALUE. This rebuilt the whole name-forms
+	// string inside two nested loops and outside the decode-work accounting: measured,
+	// a 100 KB field name with ten short base64 tokens and the six supplied values
+	// cost about 31 GiB of cumulative allocations and 4.7 seconds AFTER the network
+	// deadline, under a budget advertised as 64 MiB (shardpilot/shardpilot-go#84
+	// review). The value does not change inside the loops, so building it there was
+	// never anything but cost.
+	joinedNameForms := strings.Join(nameForms, "\n")
 	for _, v := range suppliedValues {
 		// ⚠ THE SAME EXEMPTION AS THE SCRUB. `jsonLiterals` was consulted by
 		// `scrubSuppliedRaw` alone, so a key of `false` stopped corrupting the
@@ -3436,7 +3518,7 @@ func assertNoLeak(text string) error {
 			continue
 		}
 		for _, f := range append(append([]string{}, forms...), extra...) {
-			if containsValue(f, strings.Join(nameForms, "\n"), v) {
+			if containsValue(f, joinedNameForms, v) {
 				return fmt.Errorf(
 					"a supplied value of %d characters survived redaction in some "+
 						"encoding; the record is NOT publishable and was not printed",

@@ -2115,7 +2115,10 @@ func TestTheMemberAfterAContainerValueIsStillAKey(t *testing.T) {
 	suppliedValues = []string{"version"}
 	t.Cleanup(func() { suppliedValues = nil })
 	got := stripMarks(scrubSupplied(dropFraming(
-		"HTTP/1.1 200 OK\r\n\r\n{\"variant_payload\":{},\"version\":1}")))
+		// ⚠ THE BODY CARRIES `assigned`, because a body without it is not a verdict at
+		// all and takes no schema exemptions -- this scene is about KEY DETECTION after a
+		// container value, not about eligibility (shardpilot/shardpilot-go#84 review).
+		"HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false,\"variant_payload\":{},\"version\":1}")))
 	if !strings.Contains(got, `"version"`) {
 		t.Fatalf("a fixed schema member after a container value was rewritten: %q", got)
 	}
@@ -4089,5 +4092,93 @@ func TestTheCacheProvenanceCheckStopsAtTheHeaderBlock(t *testing.T) {
 	dropFraming("HTTP/1.1 200 OK\r\nPragma: no-cache\r\nCache-Control: no-cache\r\n\r\n")
 	if len(structuralSurfaces) == 0 {
 		t.Fatalf("the ambiguous header pair was no longer refused")
+	}
+}
+
+// TestExemptionsNeedTheAssignmentSHAPE: status and size say whether the SDK would
+// LOOK at a body; the typed decode says whether it finds a verdict. A complete,
+// under-limit 200 may be valid JSON that is not an assignment — `{"assigned":"x"}`
+// is rejected as `malformed_response` — and exempting its member names marked a
+// supplied identifier as generated (shardpilot/shardpilot-go#84 review).
+func TestExemptionsNeedTheAssignmentSHAPE(t *testing.T) {
+	t.Cleanup(func() { suppliedValues = nil })
+	for _, c := range []struct {
+		name, body string
+		exempt     bool
+	}{
+		{"a verdict", `{"assigned":false}`, true},
+		{"assigned of the wrong type", `{"assigned":"x"}`, false},
+		{"no assigned member at all", `{"version":1}`, false},
+		{"not an object", `["assigned"]`, false},
+		{"a typed member the SDK validates", `{"assigned":false,"variant_payload":1}`, false},
+	} {
+		suppliedValues = []string{"assigned"}
+		got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n" + c.body)))
+		if strings.Contains(got, "assigned") != c.exempt {
+			t.Errorf("%s: exempt=%v, want %v: %q", c.name, !c.exempt, c.exempt, got)
+		}
+	}
+}
+
+// TestTheInterimLineKeepsItsMarks: escaping AFTER the marks turns the provenance
+// bytes into literal `\x01` text — the line stops being recognised as generated, or
+// as a status line at all (shardpilot/shardpilot-go#84 review).
+func TestTheInterimLineKeepsItsMarks(t *testing.T) {
+	suppliedValues = []string{"Hints"}
+	t.Cleanup(func() { suppliedValues = nil })
+	inner := &traceFiringTransport{codes: []int{103}, resp: &http.Response{
+		StatusCode: 200, Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+		Status: "200 OK", Header: http.Header{}, ContentLength: -1,
+		Body: io.NopCloser(strings.NewReader("")),
+	}}
+	rec := &recorder{inner: inner}
+	req, err := http.NewRequest("GET", "https://e.example"+assignmentRoute, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rec.RoundTrip(req); err != nil {
+		t.Fatal(err)
+	}
+	rec.mu.Lock()
+	got := rec.exchanges
+	rec.mu.Unlock()
+	var report strings.Builder
+	renderExchanges(&report, got)
+	out := report.String()
+	if strings.Contains(out, `\x01HTTP/1.1 103`) {
+		t.Fatalf("the provenance marks were escaped into literal text: %q", stripMarks(out))
+	}
+	if !strings.Contains(stripMarks(out), "103 Early Hints") {
+		t.Fatalf("the reason phrase this program wrote was rewritten: %q", stripMarks(out))
+	}
+}
+
+// TestTheCacheProvenanceMirrorsTheParsersCondition: `fixPragmaCacheControl`
+// synthesises the directive only when the FIRST parsed `Pragma` value is exactly
+// `no-cache`, lowercase. My substring test refused genuine pairs
+// (shardpilot/shardpilot-go#84 review).
+func TestTheCacheProvenanceMirrorsTheParsersCondition(t *testing.T) {
+	t.Cleanup(func() { structuralSurfaces = nil })
+	for _, c := range []struct {
+		name, head string
+		refused    bool
+	}{
+		{"the parser's own condition", "Pragma: no-cache\r\nCache-Control: no-cache", true},
+		{"a different pragma value", "Pragma: x-no-cache\r\nCache-Control: no-cache", false},
+		{"no-cache not first", "Pragma: foo, no-cache\r\nCache-Control: no-cache", false},
+		{"uppercase spelling", "Pragma: NO-CACHE\r\nCache-Control: no-cache", false},
+		{"a real directive", "Pragma: no-cache\r\nCache-Control: max-age=0", false},
+	} {
+		structuralSurfaces = nil
+		dropFraming("HTTP/1.1 200 OK\r\n" + c.head + "\r\n\r\n")
+		var saw bool
+		for _, r := range structuralSurfaces {
+			if strings.Contains(r, "provenance this build cannot establish") {
+				saw = true
+			}
+		}
+		if saw != c.refused {
+			t.Errorf("%s: refused=%v, want %v", c.name, saw, c.refused)
+		}
 	}
 }
