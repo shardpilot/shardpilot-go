@@ -1189,12 +1189,16 @@ func noteMinted(body string) string {
 		// report published text the guard would refuse if it could see it
 		// (shardpilot/shardpilot-go#84 review). Same rule as the transport diagnostic
 		// one file-section along, and the same list answers both.
-		for _, form := range decodedForms(body) {
+		forms, whole := decodedForms(body)
+		for _, form := range forms {
 			for _, m := range jsonMemberName.FindAllStringSubmatch(form, -1) {
 				if isMinted(m[1]) {
 					noteStructural("a server-minted subject identifier in a body that does not parse")
 				}
 			}
+		}
+		if !whole {
+			noteStructural("an unparsable body whose decoded forms could not be enumerated")
 		}
 	}
 	for _, name := range topLevelMembers(body) {
@@ -2086,18 +2090,56 @@ var supportedDecoders = []func(string) string{
 	undoPercent, undoUnicodeEscapes, undoBase64, undoHex, undoPlus, undoEntities,
 }
 
-// decodedForms returns every form one supported decoder produces from `text`,
-// plus `text` itself, charging the work to the shared budget. It does NOT compose
-// them: composition is the fixed point the callers iterate, and a form that one
-// decoder destroys is still scanned here before the next pass can rewrite it.
-func decodedForms(text string) []string {
+// decodedForms returns every form reachable from `text` by applying the supported
+// decoders REPEATEDLY, to a fixed point, plus `text` itself. The second return says
+// whether the walk finished; a caller that scans for a forbidden shape must refuse
+// when it did not, because a truncated form list is a scan that stopped early and
+// reported clean.
+//
+// ⚠ ONE HOP IS NOT THE CHAIN. The first version applied each decoder ONCE, so a
+// value behind two already-supported stages -- `%2522subject_fact_key%2522`, or
+// base64-of-base64 around a `Set-Cookie:` -- reached only its middle spelling and
+// neither structural scan recorded anything, while `assertNoLeak` reconstructs the
+// content downstream and checks only SUPPLIED values, so the endpoint-minted secret
+// was published (shardpilot/shardpilot-go#84 review). The guard reconstructs to a
+// fixed point; a producer that stops at one hop answers about a smaller world by
+// exactly the number of stages an endpoint chooses to use.
+//
+// The walk is bounded twice -- by the form count and by its OWN byte budget -- and
+// says so rather than truncating silently.
+//
+// ⚠ ITS OWN, NOT THE SHARED ONE. Charging this enumeration to `decodeWork` made
+// the RESULT depend on what had already been decoded elsewhere in the run: two
+// scenes passed alone and failed in the suite, and in production the first large
+// response would have turned every later scan into a refusal. A bound whose
+// answer depends on call order is not a bound on this call.
+const (
+	decodedFormsMax  = 64
+	decodedFormsWork = 1 << 20
+)
+
+func decodedForms(text string) ([]string, bool) {
+	seen := map[string]bool{text: true}
 	out := []string{text}
-	for _, d := range supportedDecoders {
-		if f := d(text); f != text {
+	spent := 0
+	for i := 0; i < len(out); i++ {
+		for _, d := range supportedDecoders {
+			spent += len(out[i])
+			if spent > decodedFormsWork {
+				return out, false
+			}
+			f := d(out[i])
+			if f == out[i] || seen[f] {
+				continue
+			}
+			if len(out) >= decodedFormsMax {
+				return out, false
+			}
+			seen[f] = true
 			out = append(out, f)
 		}
 	}
-	return out
+	return out, true
 }
 
 func noteStructuralInText(text string) {
@@ -2176,29 +2218,24 @@ func noteStructuralInText(text string) {
 				}
 			}
 		}
-		cur := ln
+		// ⚠ ONE WALK, NOT A WALK PER HOP. This loop used to advance `cur` through the
+		// nesting itself and scan each step; now that `decodedForms` iterates to a fixed
+		// point, calling it once per step made the scan QUADRATIC in the nesting -- 1119
+		// MiB against a 1024 MiB bound on a 40 KB diagnostic, which the budget scene
+		// reported immediately. The advancing and the enumeration were two spellings of
+		// the same fixed point; one of them had to go.
 		spent := 0
-		for k := 0; k <= len(ln); k++ {
-			spent += len(cur)
+		forms, whole := decodedForms(ln)
+		for _, form := range forms {
+			spent += len(form)
+			scanForm(form)
 			if spent > decodeWorkMax {
 				noteStructural("a transport diagnostic whose decoding exceeded this build's work budget")
 				break
 			}
-			// ⚠ EVERY SUPPORTED DECODER, NOT THE TWO THIS LOOP ADVANCES ON. The fixed
-			// point walks percent and unicode escapes because those NEST; the guard
-			// reconstructs through six, so a field name spelled in base64 was produced by
-			// nobody and the ledger stayed empty (shardpilot/shardpilot-go#84 review).
-			// Advancing and SCANNING are two questions: this scans wide and advances the
-			// way it always did.
-			for _, form := range decodedForms(cur) {
-				spent += len(form)
-				scanForm(form)
-			}
-			next := undoPercent(undoUnicodeEscapes(cur))
-			if next == cur {
-				break
-			}
-			cur = next
+		}
+		if !whole {
+			noteStructural("a transport diagnostic whose decoded forms could not be enumerated")
 		}
 		decodeWork += spent
 	}

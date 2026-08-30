@@ -3730,12 +3730,36 @@ func TestAScanProducesEverySpellingTheGuardReconstructs(t *testing.T) {
 		{"arrived", `malformed HTTP response "Set-Cookie: session=secret"`},
 		{"percent", `malformed HTTP response "%53et-Cookie: session=secret"`},
 		{"base64", `malformed HTTP response "U2V0LUNvb2tpZTogc2Vzc2lvbj1zZWNyZXQ="`},
+		// ⚠ AND TWO HOPS, because an endpoint chooses how many stages to use. The first
+		// version of the producer applied each decoder ONCE, so a value behind two
+		// already-supported stages reached only its middle spelling and neither scan
+		// recorded anything (shardpilot/shardpilot-go#84 review).
+		{"base64 of base64", `malformed HTTP response "VTJWMExVTnZiMnRwWlRvZ2MyVnpjMmx2YmoxelpXTnlaWFE9"`},
+		{"double percent", `malformed HTTP response "%2553et-Cookie: session=secret"`},
 	} {
 		structuralSurfaces = nil
 		noteStructuralInText(c.text)
 		if len(structuralSurfaces) == 0 {
 			t.Errorf("a server-minted field spelled in %s was not refused", c.name)
 		}
+	}
+	// ⚠ AND A FORM LIST THAT COULD NOT BE FINISHED IS A REFUSAL, not a clean scan.
+	// A truncated enumeration is a scan that stopped early and reported nothing, which
+	// is the failure mode this file keeps naming.
+	//
+	// ⚠ ASSERTED ON THE REASON, NOT ON "SOMETHING WAS RECORDED". The work budget
+	// refuses the same input from the other side, so a scene that only counts the
+	// ledger passes with this refusal removed -- the mutant said so.
+	structuralSurfaces = nil
+	noteStructuralInText(`malformed HTTP response "` + strings.Repeat("%41", 90000) + `"`)
+	var sawEnumeration bool
+	for _, r := range structuralSurfaces {
+		if strings.Contains(r, "decoded forms could not be enumerated") {
+			sawEnumeration = true
+		}
+	}
+	if !sawEnumeration {
+		t.Errorf("a diagnostic whose forms could not be enumerated was not refused for that: %v", structuralSurfaces)
 	}
 	// ⚠ AND AN ORDINARY DIAGNOSTIC IS STILL NOT REFUSED, or scanning wider has
 	// become refusing everything.
@@ -3747,10 +3771,15 @@ func TestAScanProducesEverySpellingTheGuardReconstructs(t *testing.T) {
 
 	// The same rule on the body path: a malformed body that percent-encodes the
 	// member. The guard's own decoder reconstructs it, so this scan must produce it.
-	structuralSurfaces = nil
-	noteMinted(`%22subject_fact_key%22:%22sfk_secret%22`)
-	if len(structuralSurfaces) == 0 {
-		t.Errorf("a percent-encoded minted member in an unparsable body was not refused")
+	for _, spelling := range []string{
+		`%22subject_fact_key%22:%22sfk_secret%22`,
+		`%2522subject_fact_key%2522:%2522sfk_secret%2522`,
+	} {
+		structuralSurfaces = nil
+		noteMinted(spelling)
+		if len(structuralSurfaces) == 0 {
+			t.Errorf("an encoded minted member in an unparsable body was not refused: %s", spelling)
+		}
 	}
 	structuralSurfaces = nil
 	noteMinted(`{"ordinary":"value"}`)
