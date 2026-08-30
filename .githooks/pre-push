@@ -111,14 +111,45 @@ unset gv
 # `cd "$wt"` -- so keeping the variable, which the previous round correctly
 # restored, then refused every such push (shardpilot/shardpilot-go#79 review).
 # Preserving a value and preserving its MEANING are two steps.
-for gv in GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES; do
-  eval "gvv=\${$gv:-}"
-  case "$gvv" in
-    ""|/*) ;;
-    *) eval "$gv=\"\$(cd \"\$gvv\" 2>/dev/null && pwd)\"" && export "$gv" ;;
+# ⚠ AND `GIT_ALTERNATE_OBJECT_DIRECTORIES` IS A LIST. It is colon-separated, so
+# passing the whole value to one `cd` failed and assigned empty -- making commits
+# stored only in those alternates unreadable and refusing an otherwise supported
+# push (shardpilot/shardpilot-go#79 review). A variable whose name is plural was
+# treated as a path.
+absolutize_one() {
+  case "$1" in
+    /*|"") printf '%s' "$1" ;;
+    *) ( cd "$1" 2>/dev/null && pwd ) || printf '%s' "$1" ;;
   esac
-done
-unset gv gvv
+}
+if [ -n "${GIT_OBJECT_DIRECTORY:-}" ]; then
+  GIT_OBJECT_DIRECTORY="$(absolutize_one "$GIT_OBJECT_DIRECTORY")"
+  export GIT_OBJECT_DIRECTORY
+fi
+# ⚠ AND `GIT_ALTERNATE_OBJECT_DIRECTORIES` IS A LIST. It is colon-separated, so
+# passing the whole value to one `cd` failed and assigned empty -- making commits
+# stored only in those alternates unreadable and refusing an otherwise supported
+# push (shardpilot/shardpilot-go#79 review). A variable whose name is plural was
+# treated as a path.
+if [ -n "${GIT_ALTERNATE_OBJECT_DIRECTORIES:-}" ]; then
+  alt_out=""
+  alt_rest="$GIT_ALTERNATE_OBJECT_DIRECTORIES"
+  while [ -n "$alt_rest" ]; do
+    case "$alt_rest" in
+      *:*) alt_one="${alt_rest%%:*}"; alt_rest="${alt_rest#*:}" ;;
+      *) alt_one="$alt_rest"; alt_rest="" ;;
+    esac
+    alt_abs="$(absolutize_one "$alt_one")"
+    if [ -z "$alt_out" ]; then
+      alt_out="$alt_abs"
+    else
+      alt_out="$alt_out:$alt_abs"
+    fi
+  done
+  GIT_ALTERNATE_OBJECT_DIRECTORIES="$alt_out"
+  export GIT_ALTERNATE_OBJECT_DIRECTORIES
+  unset alt_out alt_rest alt_one alt_abs
+fi
 
 # ⚠ A GRAFT HIDES A PUBLISHED ANCESTOR, AND `GIT_NO_REPLACE_OBJECTS` DOES NOT STOP
 # IT. With the pushed tip marked a synthetic root, `rev-list` omits the real parent
@@ -214,6 +245,26 @@ tracked_scanner="$root/scripts/check_public_surface.sh"
 # worktree an absolute path; the recovery hint printed the relative one too.
 hooks_dir="$(cd "$(git rev-parse --git-common-dir)" 2>/dev/null && pwd)/hooks"
 scanner="$hooks_dir/check_public_surface.sh"
+# ⚠ CLASS: A PATH THIS GATE TRUSTS MAY BE A SYMLINK, AND EVERY TEST BELOW FOLLOWS
+# ONE. `-x` and `-s` answer about the TARGET, so an intuitive link from the
+# installed scanner back to the tracked `scripts/check_public_surface.sh` made the
+# hook execute the checked-out branch's bytes -- the exact thing installing outside
+# the worktree exists to prevent (shardpilot/shardpilot-go#79 review). The hooks
+# DIRECTORY has the same problem: linked into the checkout, everything beneath it is
+# branch-controlled while each file looks like a regular executable.
+#
+# Three rounds fixed this by name -- final names, then temporary names, now the
+# directory and the target. The class is "a path whose NATURE was not checked", and
+# it is checked here for both.
+for tp in "$hooks_dir" "$scanner"; do
+  if [ -L "$tp" ]; then
+    printf 'REFUSING: %s is a symbolic link.\n' "$tp" >&2
+    printf '  Every test below follows it, so what this gate trusts would be\n' >&2
+    printf '  whatever the link points at -- including tracked content.\n' >&2
+    exit 2
+  fi
+done
+unset tp
 if [ ! -x "$scanner" ] || [ ! -s "$scanner" ]; then
   # ⚠ `-s` AS WELL AS `-x`. A re-copy that lands while a push is running leaves
   # the destination truncated for an instant, and an empty scanner is executable
@@ -932,8 +983,18 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         # material produced an empty listing and no evidence at all
         # (shardpilot/shardpilot-go#79 review). `-t` is documented as "show trees
         # when recursing", which is exactly the entry the recursion was hiding.
-        read_evidence "$tmpdir/tag-tree-listing" write "the tagged tree listing of $deref" ls-tree -rt "$deref"
-        entries="$( wc -l < "$tmpdir/tag-tree-listing" | tr -d ' ' )"
+        # ⚠ CLASS: WHAT GIT PRINTS FOR HUMANS IS NOT A RECORD FORMAT. A filename needing
+        # C-quoting comes back as `"…\nicon.xpm"` -- quotes included -- and that
+        # spelling became the staged FILENAME, so an XPM stopped being `.xpm` and the
+        # scanner's image refusal never ran (shardpilot/shardpilot-go#79 review).
+        # `-z` emits the path raw and NUL-terminated, which is the machine form the
+        # parser below already expects.
+        read_evidence "$tmpdir/tag-tree-listing" write "the tagged tree listing of $deref" ls-tree -rtz "$deref"
+        # ⚠ RECORDS, NOT LINES. `-z` made the listing NUL-terminated, so `wc -l`
+        # answered 0 and the 256 bound stopped firing -- the regression suite caught
+        # it on the first run after the format changed. A count is about the unit the
+        # format uses, and the format had just changed under it.
+        entries="$( tr -dc '\000' < "$tmpdir/tag-tree-listing" | wc -c | tr -d ' ' )"
         if [ "${entries:-0}" -gt 256 ]; then
           printf 'REFUSING: the tagged tree has %s entries, past this gate'"'"'s bound of 256.\n' "$entries" >&2
           printf '  Scanning a prefix of it and reporting clean is worse than refusing:\n' >&2
@@ -955,19 +1016,33 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         # beginning with the XPM header, so the image refusal never ran
         # (shardpilot/shardpilot-go#79 review). A concatenation is a NEW document,
         # and the rules are about the documents that were published.
+        # ⚠ AND A GITLINK IS NOT A BLOB, BUT IT IS PUBLISHED. `ls-tree` reports a
+        # `160000` entry with type `commit`, so a blob-only filter dropped it and the
+        # scanner's own gitlink refusal never saw it
+        # (shardpilot/shardpilot-go#79 review). The listing carries the mode, which
+        # is what that refusal reads, so the entry needs no blob of its own.
+        #
+        # Records are NUL-terminated; fields are `<mode> SP <type> SP <oid> TAB <path>`
+        # and the path is raw, because `-z` is the machine format.
         run_evidence "$tmpdir/tag-tree-blobs" write "the tagged tree's blob list" \
-          awk '$2=="blob"{ oid=$3; $1=""; $2=""; $3=""; sub(/^[ \t]+/,""); print oid"\t"$0 }' \
+          awk -v RS='\0' -F'\t' '{ split($1, f, " ");
+               if (f[2] == "blob") printf "%s\t%s\0", f[3], $2 }' \
           "$tmpdir/tag-tree-listing"
         mkdir -p "$tmpdir/tag-blobs"
         tag_blobs="$tmpdir/tag-blobs"
         nb=0
-        while IFS="$(printf '\t')" read -r b path; do
+        while IFS="$(printf '\t')" read -r -d '' b path; do
           [ -n "$b" ] || continue
           nb=$((nb + 1))
           case "$path" in
             */*) leaf="${path##*/}" ;;
             *) leaf="$path" ;;
           esac
+          # ⚠ THE STAGED NAME MUST BE USABLE AND MUST KEEP THE EXTENSION. A path may
+          # carry newlines or quotes; the scanner classifies by suffix and by leading
+          # bytes, so control characters are dropped and the suffix is preserved
+          # rather than the whole spelling being trusted as a filename.
+          leaf="$(printf '%s' "$leaf" | tr -d '\000-\037"\\/' )"
           [ -n "$leaf" ] || leaf="blob"
           read_evidence "$tmpdir/tag-blobs/$nb-$leaf" write \
             "a blob reached through the tagged tree ($b)" cat-file blob "$b"
