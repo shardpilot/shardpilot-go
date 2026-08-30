@@ -1490,3 +1490,49 @@ func TestConnectionProvenanceIsPerExchange(t *testing.T) {
 		t.Fatalf("a synthesised Connection line was reported as a leak: %v", err)
 	}
 }
+
+// fakeTransport returns one canned response, so a scene can exercise the RECORDER
+// rather than restating what `net/http` does.
+type fakeTransport struct{ resp *http.Response }
+
+func (f *fakeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	f.resp.Request = req
+	return f.resp, nil
+}
+
+// TestConnectionPresenceIsNotItsFirstValue exercises the recorder, not `http.Header`.
+//
+// ⚠ MY FIRST VERSION ASSERTED THE STDLIB'S SEMANTICS — that `Get` returns the
+// first value and map membership does not — and the mutant restoring `Get` at the
+// call site SURVIVED it, because the scene never reached that call site. This
+// file already records the same defect about `responseText`: a test of the
+// composition is not a test of the call site (shardpilot/shardpilot-go#84 review).
+func TestConnectionPresenceIsNotItsFirstValue(t *testing.T) {
+	h := http.Header{}
+	h.Add("Connection", "")
+	h.Add("Connection", "YmFy")
+	if h.Get("Connection") != "" {
+		t.Fatal("the probe's premise no longer holds: Get returned a non-empty first value")
+	}
+	rec := &recorder{inner: &fakeTransport{resp: &http.Response{
+		StatusCode: 200, Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+		Status: "200 OK", Header: h, ContentLength: -1,
+		Body: io.NopCloser(strings.NewReader("")),
+	}}}
+	req, err := http.NewRequest("GET", "https://e.example"+assignmentRoute, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rec.RoundTrip(req); err != nil {
+		t.Fatal(err)
+	}
+	rec.mu.Lock()
+	got := rec.exchanges
+	rec.mu.Unlock()
+	if len(got) != 1 {
+		t.Fatalf("the recorder kept %d exchanges", len(got))
+	}
+	if !got[0].recvConn {
+		t.Fatal("a Connection field whose FIRST value is empty was recorded as absent")
+	}
+}
