@@ -956,17 +956,52 @@ var benignTopLevel = func() map[string]bool {
 
 // topLevelExemptions picks the registry a body of this status is described by.
 //
-// An unparsable status line takes the ASSIGNMENT set: this harness fetches
-// assignments, and a head this program cannot read is not a licence to exempt the
-// error shape's names.
-func topLevelExemptions(statusLine string) map[string]bool {
-	f := strings.Fields(strings.TrimSuffix(statusLine, "\r"))
-	if len(f) >= 2 && strings.HasPrefix(f[0], "HTTP/") {
-		if n, err := strconv.Atoi(f[1]); err == nil && n >= 400 {
-			return errorTopLevel
-		}
+// ⚠ THE SDK'S OWN PRECONDITIONS COME FIRST. Both SDK paths refuse a body before
+// its schema means anything: `parseExperimentVerdict` and `experimentBodyErrorText`
+// each return early when the body is incomplete or longer than `expMaxBodyBytes`.
+// A status-200 body one byte over that limit is therefore never parsed as an
+// assignment -- and exempting its member names marked an endpoint-controlled name
+// as generated, so a supplied `assigned` was published with an empty refusal
+// ledger (shardpilot/shardpilot-go#85 review).
+//
+// Size is the whole test, because this recorder's ceiling sits exactly one byte
+// ABOVE the SDK's: a capture at the ceiling is indeterminate -- it may be whole or
+// truncated -- and already fails this comparison. That is what `capturedBodyMax`
+// is written for, and why incompleteness needs no separate signal here.
+//
+// ⚠ AND A STATUS THIS PROGRAM CANNOT READ EXEMPTS NOTHING. An earlier round took
+// the ASSIGNMENT set for an unparsable head, arguing that a head we cannot read is
+// no licence to exempt the error shape's names. True -- and no licence to exempt
+// the assignment shape's either. The SDK classifies by status; with no status
+// there is no classification (shardpilot/shardpilot-go#84 review).
+func topLevelExemptions(statusLine, body string) map[string]bool {
+	none := map[string]bool{}
+	if len(body) > sdkMaxBodyBytes {
+		return none
 	}
-	return assignmentTopLevel
+	f := strings.Fields(strings.TrimSuffix(statusLine, "\r"))
+	if len(f) < 2 || !strings.HasPrefix(f[0], "HTTP/") {
+		return none
+	}
+	n, err := strconv.Atoi(f[1])
+	if err != nil {
+		return none
+	}
+	switch {
+	case n == 200:
+		return assignmentTopLevel
+	// ⚠ AND THE ERROR ENVELOPE IS READ AT 400 AND 403, NOT AT EVERY 4xx.
+	// `applyExperimentAssignment` calls `experimentBodyErrorText` only for those
+	// two -- the subject-grammar sentinel and the real-subjects sentinel -- and
+	// classifies every other status by the status alone. Exempting `error` at a
+	// 404 marked an endpoint-selected member name as SDK grammar and published a
+	// supplied identifier (shardpilot/shardpilot-go#85 review). Fifth axis this
+	// registry has been wrong about: depth, membership, shape, status, and now
+	// WHICH statuses.
+	case n == 400 || n == 403:
+		return errorTopLevel
+	}
+	return none
 }
 
 var mintedNames = map[string]bool{
@@ -1477,9 +1512,15 @@ func dropFraming(dump string) string {
 	// nothing while the pattern that permits the whitespace sat right there --
 	// and the value is server-minted, so the guard behind this cannot see it
 	// either (shardpilot/shardpilot-go#73 review).
-	exemptions := assignmentTopLevel
+	// The body as this pass sees it: the exemption question is partly about its
+	// SIZE, so the registry cannot be chosen from the status line alone.
+	exemptBody := ""
+	if bodyStart >= 0 && bodyStart < len(out) {
+		exemptBody = strings.Join(out[bodyStart:], "\n")
+	}
+	exemptions := map[string]bool{}
 	if len(out) > 0 {
-		exemptions = topLevelExemptions(out[0])
+		exemptions = topLevelExemptions(out[0], exemptBody)
 	}
 	if bodyStart < 0 {
 		return strings.Join(out, "\n")
@@ -1794,6 +1835,17 @@ type teeBody struct {
 // Both are reported as an incomplete capture, because a record cannot tell them
 // apart and guessing is the defect.
 const capturedBodyMax = (1 << 20) + 1
+
+// sdkMaxBodyBytes mirrors `expMaxBodyBytes`, which aliases `rcMaxBodyBytes` --
+// the size past which BOTH SDK read paths refuse a body before its schema means
+// anything.
+//
+// ⚠ ONE LITERAL, AND THE RELATION STATED. Writing `1 << 20` again would be a
+// second place for the same number to drift from; the ceiling above is defined as
+// one byte more than this on purpose, so the two move together by construction.
+// TestTheMirroredBodyLimitMatchesTheSDKs reads the SDK's own constant out of the
+// source and fails if either relation stops holding.
+const sdkMaxBodyBytes = capturedBodyMax - 1
 
 // snapTrailers copies the trailer block as it stands now.
 //

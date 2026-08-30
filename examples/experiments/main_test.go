@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"go/ast"
+	"go/constant"
 	"go/parser"
 	"go/token"
 	"io"
@@ -3556,5 +3557,119 @@ func TestAShortBinaryBase64DecodeIsRetained(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("the textual decode of a short token was lost: %q", shortBase64Candidates("YWI"))
+	}
+}
+
+// TestExemptionsFollowTheSDKsOwnGates: the exemption registry says "these member
+// names are the SCHEMA's, not the endpoint's" — a claim that is only true when the
+// SDK would actually parse the body under that schema. It asks by STATUS and by
+// SIZE, and this selection asked by neither exactly: every status below 400 took
+// the assignment set, so `201 Created` with `{"assigned":"x"}` marked an
+// endpoint-controlled name as generated and a supplied `assigned` was published;
+// and an over-limit body took it too, though `parseExperimentVerdict` refuses
+// before decoding (shardpilot/shardpilot-go#84 and #85 reviews).
+func TestExemptionsFollowTheSDKsOwnGates(t *testing.T) {
+	t.Cleanup(func() { suppliedValues = nil })
+	for _, c := range []struct {
+		name, dump string
+		exempt     bool
+	}{
+		{"200 is the assignment shape", "HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false}", true},
+		{"201 is not", "HTTP/1.1 201 Created\r\n\r\n{\"assigned\":\"x\"}", false},
+		{"304 is not", "HTTP/1.1 304 Not Modified\r\n\r\n{\"assigned\":\"x\"}", false},
+		{"an unreadable code is not", "HTTP/1.1 wat\r\n\r\n{\"assigned\":\"x\"}", false},
+		// ⚠ AND A FIRST LINE THAT IS NOT A STATUS LINE AT ALL reaches a DIFFERENT
+		// branch: the first version of this table had only the row above, and the
+		// mutant that made an unparsable head take the assignment set survived it.
+		{"a head with no version is not", "garbage\r\n\r\n{\"assigned\":\"x\"}", false},
+		{"an empty head is not", "\r\n\r\n{\"assigned\":\"x\"}", false},
+	} {
+		suppliedValues = []string{"assigned"}
+		got := stripMarks(scrubSupplied(dropFraming(c.dump)))
+		if strings.Contains(got, "assigned") != c.exempt {
+			t.Errorf("%s: exempt=%v, want %v: %q", c.name, !c.exempt, c.exempt, got)
+		}
+	}
+	// ⚠ AND THE SIZE GATE, WHICH THE STATUS CANNOT SEE. A body one byte past the
+	// SDK's ceiling is never parsed as an assignment, so its member names are the
+	// endpoint's whatever the status says.
+	suppliedValues = []string{"assigned"}
+	over := `{"assigned":false}` + strings.Repeat(" ", sdkMaxBodyBytes)
+	if got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n" + over))); strings.Contains(got, "assigned") {
+		t.Errorf("an over-limit body kept the assignment exemptions: %q", got[:120])
+	}
+	// ⚠ AND A BODY THE SDK *WOULD* PARSE IS STILL EXEMPT, or the gate has become a
+	// refusal to exempt anything with a body worth reading.
+	under := `{"assigned":false}` + strings.Repeat(" ", 4096)
+	if got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n" + under))); !strings.Contains(got, "assigned") {
+		t.Errorf("a body well within the SDK's ceiling lost its exemptions: %q", got[:120])
+	}
+}
+
+// TestTheMirroredBodyLimitMatchesTheSDKs is the drift guard for the one number
+// this file mirrors. The SDK's constant is read out of the source and evaluated by
+// `go/constant`, and the relation between the two ceilings — the recorder's is one
+// byte above the SDK's, deliberately — is asserted rather than remembered.
+func TestTheMirroredBodyLimitMatchesTheSDKs(t *testing.T) {
+	fset := token.NewFileSet()
+	var eval func(ast.Expr) (int64, bool)
+	eval = func(e ast.Expr) (int64, bool) {
+		switch v := e.(type) {
+		case *ast.BasicLit:
+			n, ok := constant.Int64Val(constant.MakeFromLiteral(v.Value, v.Kind, 0))
+			return n, ok
+		case *ast.ParenExpr:
+			return eval(v.X)
+		case *ast.BinaryExpr:
+			x, okx := eval(v.X)
+			y, oky := eval(v.Y)
+			if !okx || !oky {
+				return 0, false
+			}
+			switch v.Op {
+			case token.SHL:
+				return x << uint(y), true
+			case token.ADD:
+				return x + y, true
+			case token.SUB:
+				return x - y, true
+			case token.MUL:
+				return x * y, true
+			}
+		}
+		return 0, false
+	}
+	spec := func(path, name string) ast.Expr {
+		f, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatalf("the SDK source is the oracle and %s could not be read: %v", path, err)
+		}
+		var out ast.Expr
+		ast.Inspect(f, func(n ast.Node) bool {
+			vs, ok := n.(*ast.ValueSpec)
+			if !ok || len(vs.Names) != 1 || vs.Names[0].Name != name || len(vs.Values) != 1 {
+				return true
+			}
+			out = vs.Values[0]
+			return false
+		})
+		if out == nil {
+			t.Fatalf("%s is not declared in %s -- the derivation, not the value, is what broke", name, path)
+		}
+		return out
+	}
+	rc, ok := eval(spec("../../remote_config.go", "rcMaxBodyBytes"))
+	if !ok {
+		t.Fatalf("rcMaxBodyBytes is no longer an expression this scene can evaluate; it must not pass by default")
+	}
+	if rc != sdkMaxBodyBytes {
+		t.Errorf("the SDK reads at most %d bytes and this file mirrors %d", rc, sdkMaxBodyBytes)
+	}
+	if id, isIdent := spec("../../experiments.go", "expMaxBodyBytes").(*ast.Ident); !isIdent || id.Name != "rcMaxBodyBytes" {
+		t.Errorf("expMaxBodyBytes no longer aliases rcMaxBodyBytes, so the mirrored number answers for the wrong gate")
+	}
+	if capturedBodyMax != sdkMaxBodyBytes+1 {
+		t.Errorf("the recorder's ceiling is %d and the SDK's is %d; a capture AT the ceiling is only indeterminate while they differ by one",
+			capturedBodyMax, sdkMaxBodyBytes)
 	}
 }
