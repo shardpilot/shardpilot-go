@@ -1708,3 +1708,45 @@ func TestAnIPv6ZoneIsNotExempt(t *testing.T) {
 		}
 	}
 }
+
+// ---- round on f258c43 ----
+
+// TestConnectionProvenanceIsPerExchange: the SDK retries, and every attempt is
+// rendered. A single global held the LAST attempt's answer, so a first response
+// that really sent the field had it marked serialiser-generated when the final
+// response carried none (shardpilot/shardpilot-go#84 review).
+func TestConnectionProvenanceIsPerExchange(t *testing.T) {
+	suppliedValues = []string{"bar"}
+	t.Cleanup(func() { suppliedValues = nil; receivedConnection = false })
+	first := &exchange{proto: "HTTP/1.1", recvConn: true,
+		head: []byte("HTTP/1.1 200 OK\r\nConnection: YmFy\r\n\r\n")}
+	last := &exchange{proto: "HTTP/1.1", recvConn: false,
+		head: []byte("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")}
+	// Render the LAST one first, as a run that retried would, then the first: the
+	// global must not carry the last attempt's answer into the earlier one.
+	_ = responseText(last)
+	// ⚠ THE ASSERTION IS ABOUT THE GUARD, because in this half a RECEIVED value is
+	// kept verbatim on purpose — captured data the guard must read. Marking it
+	// serialiser-generated is what makes the guard skip it, so that is what the
+	// scene detects. My first version asserted the value was absent from the text,
+	// which is true only of the half that redacts structurally.
+	// ⚠ THE PROPERTY, NOT THE GUARD-ERRORS MECHANISM. The guard half keeps a
+	// RECEIVED value verbatim and relies on `assertNoLeak` to catch it; this half
+	// redacts it structurally, so nothing reaches the guard and a nil error is the
+	// stricter answer. What both halves must satisfy is that the first attempt's
+	// received value is not treated as serialiser syntax — which shows as the
+	// value surviving into the text (shardpilot/shardpilot-go#84, #85 review).
+	got := stripMarks(responseText(first))
+	if strings.Contains(got, "YmFy") {
+		t.Fatalf("a received Connection value was published as serialiser syntax: %q", got)
+	}
+	if !strings.Contains(got, "<redacted") {
+		t.Fatalf("a received Connection value was neither published nor accounted for: %q", got)
+	}
+	// And the synthesised one is still exempt, or the repair refuses every capture.
+	receivedConnection = false
+	suppliedValues = []string{"close"}
+	if got := stripMarks(responseText(last)); strings.Contains(got, "<redacted") {
+		t.Fatalf("a synthesised Connection line was redacted: %q", got)
+	}
+}

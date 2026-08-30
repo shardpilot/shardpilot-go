@@ -138,11 +138,19 @@ import (
 // one reports a multi-attempt sequence as a single request that never happened
 // that way.
 type exchange struct {
-	req      []byte
-	head     []byte
-	status   int
-	proto    string // the protocol actually negotiated, which the request dump is not
-	transErr error  // set when no response arrived at all
+	req    []byte
+	head   []byte
+	status int
+	proto  string // the protocol actually negotiated, which the request dump is not
+	// recvConn records whether THIS response carried a `Connection` field, as
+	// opposed to the serialiser adding one. Per exchange, because the SDK retries:
+	// a grammar-remint attempt renders every attempt, and a single global held the
+	// LAST one -- so a first response that really sent `Connection: <value>` had it
+	// marked serialiser-generated when the final response carried none, and the
+	// guard then ignored and published it (shardpilot/shardpilot-go#84 review).
+	// A fact about a response stored once per RUN is a fact about the last response.
+	recvConn bool
+	transErr error // set when no response arrived at all
 	captured *teeBody
 }
 
@@ -425,6 +433,9 @@ func headerNameEnd(line string) (int, bool) {
 // (shardpilot/shardpilot-go#73 review, found by mutating rather than by
 // reading). Naming it once removes the copy.
 func responseText(ex *exchange) string {
+	// The per-exchange fact is put where `dropFraming` reads it, for THIS exchange,
+	// immediately before it is rendered.
+	receivedConnection = ex.recvConn
 	return asCaptured(scrubSupplied(dropFraming(escapeMarks(string(ex.resp())))))
 }
 
@@ -1086,7 +1097,7 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 	// a connection-option, and never received (shardpilot/shardpilot-go#84
 	// review). The earlier fix distinguished the two PROTOCOLS, which was the
 	// right distinction for the case it was shown and not the question.
-	receivedConnection = resp.Header.Get("Connection") != ""
+	ex.recvConn = resp.Header.Get("Connection") != ""
 	if d, derr := httputil.DumpResponse(resp, false); derr == nil {
 		ex.head = d
 	}
@@ -2738,10 +2749,23 @@ func main() {
 	// cannot settle it either: every path below calls `os.Exit`, which runs no
 	// defers at all. A count that is a claim about the RUN cannot be taken at an
 	// instant in the middle of it.
+	// ⚠ AND THE CLOSE HAS TO SUCCEED, NOT MERELY BE CALLED. Discarding its error
+	// left the same race one step further along: when the five-second context
+	// expires, `Close` returns before the worker lanes are done, so background
+	// requests still reach the recorder after the snapshot and the report prints
+	// an off-route count that was already stale, or pairs the copied exchanges
+	// with a later verdict (shardpilot/shardpilot-go#84 review). A capture whose
+	// own accounting cannot be trusted is not a capture, so it refuses.
 	func() {
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer closeCancel()
-		_ = client.Close(closeCtx)
+		if cerr := client.Close(closeCtx); cerr != nil {
+			fmt.Fprintf(os.Stderr,
+				"REFUSING TO PRINT: the client could not be stopped before the counters "+
+					"were read (%v), so background traffic may have arrived after them and "+
+					"the report would state a count it cannot stand behind.\n", sanitize(cerr))
+			os.Exit(4)
+		}
 	}()
 
 	rec.mu.Lock()
