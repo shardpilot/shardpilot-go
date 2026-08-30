@@ -3947,11 +3947,22 @@ func TestTheOffRouteClaimIsVerdictDependent(t *testing.T) {
 	// ⚠ THE CONDITION, NOT THE WORDS. A first version checked that `result.Assigned`
 	// appears in the file at all -- it appears in the verdict switch too, so replacing
 	// the condition here with `false` left the scene green.
-	if !strings.Contains(text, "offRouteExpected := \"zero\"\n\tif result.Assigned {") {
-		t.Errorf("the expected off-route count is no longer conditioned on the verdict")
+	// ⚠ RETARGETED, BECAUSE THE CLAIM THIS PINNED WAS ALSO WRONG. I replaced "zero is
+	// always expected" with "the served path expects one" -- and the exposure never
+	// reaches the transport at all, because this harness sets no `AnonymousID`. Two
+	// false claims in a row, in opposite directions, both written without measuring
+	// the path (shardpilot/shardpilot-go#84 review). What the line must carry now is
+	// the REASON, so an operator can check it rather than trust it.
+	if strings.Contains(text, "if result.Assigned {\n\t\toffRouteExpected") {
+		t.Errorf("the expected count is still conditioned on the verdict")
 	}
-	if !strings.Contains(text, "experiment_exposure") {
-		t.Errorf("the claim does not say WHY the served path expects one, so an operator cannot check it")
+	// The COMPARISON must be unconditional too, not only the wording: a mutant that
+	// re-conditions it on the verdict leaves both strings in place.
+	if !strings.Contains(text, "offRouteAgrees := \"matches\"\n\tif offRoute != 0 {") {
+		t.Errorf("the off-route comparison is conditioned on the verdict again")
+	}
+	if !strings.Contains(text, "exposure is skipped before it reaches the transport") {
+		t.Errorf("the claim does not say WHY zero is expected, so an operator cannot check it")
 	}
 }
 
@@ -4247,6 +4258,64 @@ func TestTheInterimSectionSaysWhatItCannotShow(t *testing.T) {
 	for _, want := range []string{"PARSER CONSUMED", "headers THE CALLBACK WAS GIVEN"} {
 		if !strings.Contains(string(src), want) {
 			t.Errorf("the interim section does not qualify its claim: %q missing", want)
+		}
+	}
+}
+
+// TestTheLastRoundOfExemptionGatesAndSpans covers the four narrow findings of this
+// round together, each with the negative half (shardpilot/shardpilot-go#84 review).
+func TestTheLastRoundOfExemptionGatesAndSpans(t *testing.T) {
+	t.Cleanup(func() {
+		suppliedValues = nil
+		requestedAppKey, requestedEnvKey, requestedExpKey = "", "", ""
+		structuralSurfaces = nil
+	})
+	// ⚠ AN ECHO IS COMPARED WITH THE REQUEST'S OWN VALUE. A mismatch, or an explicit
+	// null, unmarshals fine into a bare string and passed before.
+	requestedExpKey = "exp1"
+	for _, c := range []struct {
+		name, body string
+		exempt     bool
+	}{
+		{"the echo this request sent", `{"assigned":false,"experiment_key":"exp1"}`, true},
+		{"a mismatched echo", `{"assigned":false,"experiment_key":"other"}`, false},
+		{"an explicit null echo", `{"assigned":false,"experiment_key":null}`, false},
+		{"an absent echo", `{"assigned":false}`, true},
+	} {
+		suppliedValues = []string{"assigned"}
+		got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n" + c.body)))
+		if strings.Contains(got, "assigned") != c.exempt {
+			t.Errorf("%s: exempt=%v, want %v", c.name, !c.exempt, c.exempt)
+		}
+	}
+	// ⚠ AND THE ERROR ENVELOPE IS TYPED TOO.
+	for _, c := range []struct {
+		name, body string
+		exempt     bool
+	}{
+		{"a typed envelope", `{"error":"nope"}`, true},
+		{"a boolean where the string goes", `{"error":false}`, false},
+	} {
+		suppliedValues = []string{"error"}
+		got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 400 Bad Request\r\n\r\n" + c.body)))
+		if strings.Contains(got, "error") != c.exempt {
+			t.Errorf("%s: exempt=%v, want %v: %q", c.name, !c.exempt, c.exempt, got)
+		}
+	}
+	// ⚠ A QUESTION MARK OUTSIDE A URL IS NOT A QUERY.
+	suppliedValues = nil
+	if got := sanitizeText(`malformed HTTP response "BOGUS?detail"`); strings.Contains(got, "query-withheld") {
+		t.Errorf("a question mark outside a URL was rewritten: %q", got)
+	}
+	if got := sanitizeText(`Get "https://e.example/x?k=v": timeout`); !strings.Contains(got, "query-withheld") {
+		t.Errorf("a real URL query survived: %q", got)
+	}
+	// ⚠ AND THE FIRST Pragma VALUE IS NOT SPLIT ON COMMAS.
+	structuralSurfaces = nil
+	dropFraming("HTTP/1.1 200 OK\r\nPragma: no-cache, extension\r\nCache-Control: no-cache\r\n\r\n")
+	for _, r := range structuralSurfaces {
+		if strings.Contains(r, "provenance this build cannot establish") {
+			t.Errorf("a Pragma value the parser would not match forced a refusal")
 		}
 	}
 }

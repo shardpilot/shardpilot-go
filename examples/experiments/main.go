@@ -779,6 +779,12 @@ var capturedIncomplete bool
 // `dropFraming` runs the text has been through `escapeMarks`.
 var capturedBodyBytes = -1
 
+// The identifiers this harness ASKED FOR, kept per slot: `expEchoMatches` compares
+// each echoed member with the value THIS request put in that slot, and a flat list
+// of supplied values cannot say which belongs where. Carried from the stacked child,
+// which took the same finding a round earlier.
+var requestedAppKey, requestedEnvKey, requestedExpKey string
+
 var structuralSurfaces []string
 
 func noteStructural(what string) {
@@ -1047,6 +1053,15 @@ type sdkAssignmentWire struct {
 // carrying literal backslash spellings may fail to decode here though the SDK
 // accepted the captured bytes. That fails CLOSED -- no exemptions -- which is the
 // direction this file refuses in.
+// sdkWouldReadErrorText mirrors `experimentBodyErrorText`: the envelope's `error`
+// member decodes into a STRING or the SDK reads nothing from it.
+func sdkWouldReadErrorText(body string) bool {
+	var wire struct {
+		Error string `json:"error"`
+	}
+	return json.Unmarshal([]byte(body), &wire) == nil
+}
+
 func sdkWouldParseAssignment(body string) bool {
 	var wire sdkAssignmentWire
 	if json.Unmarshal([]byte(body), &wire) != nil || wire.Assigned == nil {
@@ -1063,14 +1078,25 @@ func sdkWouldParseAssignment(body string) bool {
 	// Mirrored from `parseExperimentVerdict`, and the drift guard for the SHAPE is
 	// TestTheMirroredWireShapeMatchesTheSDKs; these gates are prose in that function
 	// and have no such derivation, which is stated here rather than implied.
-	echoed := func(raw json.RawMessage) bool {
+	// ⚠ EQUAL TO THE REQUEST'S VALUE, NOT MERELY A STRING. `expEchoMatches` tolerates
+	// an ABSENT member and requires a PRESENT one to be a non-null string EQUAL to
+	// what this request carried in that slot -- so a mismatched echo, or an explicit
+	// `null` which unmarshals fine into a bare string, passed here while the SDK
+	// rejects the body (shardpilot/shardpilot-go#84 review).
+	echoed := func(raw json.RawMessage, want string) bool {
 		if raw == nil {
 			return true
 		}
-		var v string
-		return json.Unmarshal(raw, &v) == nil
+		var v *string
+		if json.Unmarshal(raw, &v) != nil || v == nil {
+			return false
+		}
+		// An unrecorded request value cannot confirm an echo.
+		return want != "" && *v == want
 	}
-	if !echoed(wire.AppKey) || !echoed(wire.EnvironmentKey) || !echoed(wire.ExperimentKey) {
+	if !echoed(wire.AppKey, requestedAppKey) ||
+		!echoed(wire.EnvironmentKey, requestedEnvKey) ||
+		!echoed(wire.ExperimentKey, requestedExpKey) {
 		return false
 	}
 	var version *int64
@@ -1142,7 +1168,7 @@ func sdkWouldParseAssignment(body string) bool {
 // (shardpilot/shardpilot-go#84 review). The SDK's gate is about the bytes IT read,
 // so the recorder hands that number over rather than letting this pass measure its
 // own expansion.
-func topLevelExemptions(statusLine string, bodyLen int, shapeOK bool) map[string]bool {
+func topLevelExemptions(statusLine string, bodyLen int, shapeOK, envelopeOK bool) map[string]bool {
 	none := map[string]bool{}
 	// ⚠ INCOMPLETE IS THE SDK'S OTHER PRECONDITION, and it is not a length. A 200
 	// whose body is a syntactically complete JSON prefix but whose READ failed --
@@ -1176,6 +1202,15 @@ func topLevelExemptions(statusLine string, bodyLen int, shapeOK bool) map[string
 	// registry has been wrong about: depth, membership, shape, status, and now
 	// WHICH statuses.
 	case n == 400 || n == 403:
+		// ⚠ AND THE ERROR ENVELOPE IS TYPED TOO. `experimentBodyErrorText` unmarshals
+		// `error` into a STRING, so `{"error":false}` is valid JSON that the SDK does
+		// not recognise as an envelope -- and exempting its member marked a supplied
+		// `error` as generated (shardpilot/shardpilot-go#84 review). The assignment
+		// branch had already learned this; the error branch was left asking only the
+		// status, which is the same defect one case along.
+		if !envelopeOK {
+			return none
+		}
 		return errorTopLevel
 	}
 	return none
@@ -1543,6 +1578,21 @@ func dropFraming(dump string) string {
 	// (shardpilot/shardpilot-go#84 review). My own repair, one round old: the question
 	// is about what `http.ReadResponse` wrote into the HEADER SET, and nothing below
 	// the separator is that.
+	// ⚠ FOUR ROUNDS HAVE NARROWED THIS GUARD, EACH TIME TO THE EXAMPLE SHOWN: read
+	// the header block not the whole dump; mirror the condition not the vocabulary;
+	// admit that a second directive proves receipt; do not split the first value. By
+	// this file's own rule that is the signature of a WRONG SUBJECT, not of bad luck:
+	// the question asked here is who WROTE the field, and the question that decides
+	// the outcome is whether its NAME is grammar -- a registered field name is
+	// grammar whoever else also chose that string, and then no provenance needs
+	// establishing at all.
+	//
+	// That repair is a restructure of `scrubHeaderName` and the marking around it,
+	// not another clause here. It is NOT attempted in this round: measured, it breaks
+	// five existing scenes, and landing a half-finished rewrite of the marking
+	// pipeline is worse than a guard that is narrow and honest about being narrow.
+	// Recorded so the next round starts from the diagnosis rather than the symptom.
+	//
 	// ⚠ THE PARSER'S EXACT CONDITION, NOT A SUBSTRING. `fixPragmaCacheControl`
 	// synthesises the directive only when the FIRST parsed `Pragma` value is exactly
 	// `no-cache`, lowercase -- so `Pragma: x-no-cache` alongside a genuine
@@ -1565,10 +1615,13 @@ func dropFraming(dump string) string {
 		low := strings.ToLower(strings.TrimSuffix(l, "\r"))
 		if !sawPragma && strings.HasPrefix(low, "pragma:") {
 			sawPragma = true
+			// ⚠ THE COMPLETE FIRST VALUE, NOT ITS FIRST COMMA-PIECE. `fixPragmaCacheControl`
+			// compares `Header["Pragma"][0]` with the exact string `no-cache` and does not
+			// split it -- so `Pragma: no-cache, extension` is NOT the parser's condition,
+			// and truncating here classified a genuine `Cache-Control` as possibly
+			// synthesised (shardpilot/shardpilot-go#84 review). Fourth narrowing of this
+			// guard in as many rounds; see the note above the block about what that means.
 			first := strings.TrimSuffix(l, "\r")[len("Pragma:"):]
-			if k := strings.IndexByte(first, ','); k >= 0 {
-				first = first[:k]
-			}
 			if strings.Trim(first, " \t") == "no-cache" {
 				pragmaNoCache = true
 			}
@@ -1820,7 +1873,8 @@ func dropFraming(dump string) string {
 		if capturedBodyBytes >= 0 {
 			exemptBodyLen = capturedBodyBytes
 		}
-		exemptions = topLevelExemptions(out[0], exemptBodyLen, sdkWouldParseAssignment(exemptBody))
+		exemptions = topLevelExemptions(out[0], exemptBodyLen,
+			sdkWouldParseAssignment(exemptBody), sdkWouldReadErrorText(exemptBody))
 	}
 	if bodyStart < 0 {
 		return strings.Join(out, "\n")
@@ -2664,22 +2718,31 @@ func sanitizeRaw(err error) string {
 // was shorter each time while the string grew. On the very case this exists for,
 // a url.Error carrying a query, it never terminated
 // (shardpilot/shardpilot-go#73 review).
+// sanitizeText removes the query from every URL a transport diagnostic carries.
+//
+// ⚠ A QUESTION MARK IS NOT A QUERY UNLESS IT IS IN A URL. This scanned for `?`
+// anywhere and rewrote the rest of the token, so Go's own
+// `malformed HTTP response "BOGUS?detail"` came out as `BOGUS?query-withheld` --
+// the report altering the very line it exists to preserve as evidence of the
+// failure (shardpilot/shardpilot-go#84 review). The span is found by the scheme
+// separator now, and only inside it does a `?` mean anything.
 func sanitizeText(out string) string {
 	var b strings.Builder
+	rest := out
 	for {
-		i := strings.Index(out, "?")
+		i := strings.Index(rest, "://")
 		if i < 0 {
-			b.WriteString(out)
+			b.WriteString(rest)
 			return b.String()
 		}
-		seg := out[i:]
+		start := strings.LastIndexAny(rest[:i], " \"") + 1
+		seg := rest[start:]
 		if end := strings.IndexAny(seg, " \""); end >= 0 {
 			seg = seg[:end]
 		}
-		red := dropQuery(seg)
-		b.WriteString(out[:i])
-		b.WriteString(red)
-		out = out[i+len(seg):]
+		b.WriteString(rest[:start])
+		b.WriteString(dropQuery(seg))
+		rest = rest[start+len(seg):]
 	}
 }
 
@@ -4659,6 +4722,9 @@ func main() {
 		env("SP_API_KEY"), env("SP_WORKSPACE_ID"), env("SP_APP_ID"),
 		env("SP_ENVIRONMENT_ID"), env("SP_EXPERIMENT_KEY"),
 	}
+	requestedAppKey = env("SP_APP_ID")
+	requestedEnvKey = env("SP_ENVIRONMENT_ID")
+	requestedExpKey = env("SP_EXPERIMENT_KEY")
 
 	// The authority this program was pointed at, recorded before anything is sent:
 	// the `Host:` line carries it, and it is not endpoint text. See configuredHost.
@@ -4767,13 +4833,17 @@ func main() {
 	// request is not a surprise, it is the SDK working (shardpilot/shardpilot-go#84
 	// review). A claim that is false on the normal path teaches an operator to
 	// ignore the line.
-	offRouteExpected := "zero"
-	if result.Assigned {
-		offRouteExpected = "at least one, because applying an assignment arms an " +
-			"`experiment_exposure` that `Close` flushes through this same transport"
-	}
+	// ⚠ AND THE EXPOSURE NEVER LEAVES, BECAUSE THIS HARNESS SETS NO `AnonymousID`.
+	// `buildExperimentFactEvent` skips the armed event terminally with
+	// `exposure_no_anonymous_id` before anything reaches the transport, so zero is the
+	// expected answer on EVERY verdict -- and my previous round's repair, which said
+	// the served path expects one, made every successful assignment look anomalous
+	// (shardpilot/shardpilot-go#84 review). I corrected a false claim with another
+	// false claim, in the opposite direction, without measuring the path.
+	offRouteExpected := "zero on every verdict: this harness sets no `AnonymousID`, " +
+		"so an armed exposure is skipped before it reaches the transport"
 	offRouteAgrees := "matches"
-	if (result.Assigned && offRoute < 1) || (!result.Assigned && offRoute != 0) {
+	if offRoute != 0 {
 		offRouteAgrees = "does NOT match"
 	}
 	fmt.Fprintf(&report, "Requests seen on other routes and NOT recorded: **%d**. "+
