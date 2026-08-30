@@ -39,7 +39,6 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -63,13 +62,6 @@ import (
 // So the refusal survives, narrowed to exactly what it should always have meant:
 // redact what you recognise, refuse what you do not. The capture is unpublishable
 // whenever a structural surface reached a shape these rules cannot describe.
-var structuralSurfaces []string
-
-func noteStructural(what string) {
-	if !slices.Contains(structuralSurfaces, what) {
-		structuralSurfaces = append(structuralSurfaces, what)
-	}
-}
 
 var jsonMemberValue = regexp.MustCompile(
 	`"((?:[^"\\]|\\.)*)"(\s*:\s*)"((?:[^"\\]|\\.)*)"`)
@@ -687,6 +679,21 @@ func redactMintedBody(body string) string {
 	// dropped something the half it replaced was doing
 	// (shardpilot/shardpilot-go#85 review, found by the sweep).
 	for _, n := range topLevelMembers(body) {
+		// ⚠ AND THE ORDINARY REDACTION IS ACCOUNTED FOR TOO. The guard half noted
+		// every minted field it saw; this half redacts them instead and recorded
+		// only the shapes it could NOT describe -- so the common case, the one on
+		// every fact response, was rewritten and never recorded. "Nothing is
+		// printed that this program cannot account for" is a claim about what the
+		// program DID, not only about what defeated it (shardpilot/shardpilot-go#85,
+		// stack seam).
+		// ⚠ TOP-LEVEL, LIKE THE DETECTION IT RESTORES. Written inside the
+		// replacement, which is depth-blind ON PURPOSE, this fired for a
+		// `variant_payload` member the endpoint merely named that way and refused a
+		// publishable capture -- the note inherited the redaction's blindness
+		// instead of the guard's question.
+		if isMintedName(n) {
+			noteStructural("a server-minted subject identifier")
+		}
 		if !isMintedName(n) && !isBenignName(n) {
 			noteStructural("a top-level member this program has not judged")
 		}

@@ -582,6 +582,19 @@ func topLevelMembers(body string) []string {
 	return out
 }
 
+// structuralSurfaces records what structural redaction rewrote, so the run can
+// account for every surface it touched. It lives here, beside the guard, and NOT
+// in redact.go: the guard half must build without the redaction half, and the
+// merge that brought the two together defined it twice
+// (shardpilot/shardpilot-go#85, stack seam).
+var structuralSurfaces []string
+
+func noteStructural(what string) {
+	if !slices.Contains(structuralSurfaces, what) {
+		structuralSurfaces = append(structuralSurfaces, what)
+	}
+}
+
 // isBenignName is benignTopLevel under the SAME folding `encoding/json` applies,
 // which is what `isMintedName` already used. `{"aſſigned":true}` populates the
 // SDK's field and must not be reported as unfamiliar
@@ -593,6 +606,20 @@ func isBenignName(name string) bool {
 		}
 	}
 	return false
+}
+
+func noteMinted(body string) string {
+	for _, name := range topLevelMembers(body) {
+		if isMintedName(name) {
+			// ⚠ A CONSTANT, NOT THE NAME. Third site of this defect in one session: with a
+			// Unicode-folded spelling the endpoint chose, `isMintedName` accepts it and
+			// the label carried that spelling to stderr -- refusing to print the
+			// response while printing the identifier (shardpilot/shardpilot-go#84
+			// review). Every message a guard prints is an output channel.
+			noteStructural("a server-minted subject identifier")
+		}
+	}
+	return body
 }
 
 // isMintedName is isMinted for a name already decoded.
@@ -624,6 +651,17 @@ func isMintedName(name string) bool {
 // time in this branch (shardpilot/shardpilot-go#84 review). Go's parser puts the
 // offending response line into the error, so this is a CHANNEL from the endpoint
 // into report prose, and everything on it is captured input.
+// incompleteBodyLine renders the read failure that ended a body, for the report.
+//
+// ⚠ NAMED FOR THE FIFTH TIME IN THESE TWO CHANGES, and for the fifth time for
+// the same reason: a fixture that composes the call cannot see the call site, so
+// reverting the site survives. Errors raised AFTER the response head arrive on
+// this path rather than the transport one, and they carry endpoint text just the
+// same (shardpilot/shardpilot-go#84 review).
+func incompleteBodyLine(ex *exchange) string {
+	return transportErrorLine(ex.truncErr())
+}
+
 func transportErrorLine(err error) string {
 	return sanitizeCaptured(err)
 }
@@ -644,6 +682,7 @@ func scrubStructuralName(line string) string {
 
 func dropFraming(dump string) string {
 	lines := strings.Split(dump, "\n")
+	proto2 := strings.HasPrefix(dump, "HTTP/2")
 	out := make([]string, 0, len(lines))
 	inHeaders := true
 	bodyStart := -1
@@ -677,7 +716,13 @@ func dropFraming(dump string) string {
 		// guard then approved because the placeholder is generated
 		// (shardpilot/shardpilot-go#84 review). Same treatment as the framing
 		// headers directly below.
-		if strings.HasPrefix(low, "connection:") {
+		// ⚠ ONLY THE SYNTHESISED ONE. HTTP/2 forbids `Connection`, so its presence
+		// in an HTTP/2 dump is proof the serialiser wrote it -- but on HTTP/1 the
+		// transport keeps what the endpoint sent, and marking that line generated
+		// let a value base64-decoding to the key through both the scrub and the
+		// guard (shardpilot/shardpilot-go#84 review). The exemption was written
+		// for one protocol and applied to both.
+		if strings.HasPrefix(low, "connection:") && proto2 {
 			out = append(out, marked(strings.TrimSuffix(l, "\r"))+cr)
 			continue
 		}
@@ -1162,7 +1207,14 @@ const captureDeadline = 30 * time.Second
 // stderr, which the guard never sees and where a marker byte would print as a
 // raw control character.
 func sanitizeCaptured(err error) string {
-	return asCaptured(sanitize(err))
+	// ⚠ ESCAPE FIRST. Go puts the offending line into the error verbatim, so an
+	// endpoint can put the guard's own reserved bytes there -- and an
+	// attacker-controlled `\x01…\x01` pair reads as a GENERATED span, which the
+	// guard blanks and `stripMarks` then publishes
+	// (shardpilot/shardpilot-go#84 review). Provenance marks in captured text are
+	// escaped everywhere else in this program; this path had been added without
+	// them.
+	return asCaptured(scrubSupplied(escapeMarks(sanitize(err))))
 }
 
 func sanitize(err error) string {
@@ -1711,6 +1763,8 @@ func assertNoLeak(text string) error {
 			norm := joinBase64Runs(cur)
 			dec := undoBase64(norm)
 			extra = append(extra, norm, dec)
+			extra = append(extra, binaryBase64Candidates(cur)...)
+			extra = append(extra, binaryBase64Candidates(norm)...)
 			for round := 0; round <= len(dec) && work <= decodeWorkMax; round++ {
 				before := dec
 				for _, st := range []func(string) string{undoPercent, undoUnicodeEscapes, undoBase64, undoHex, undoPlus, undoEntities} {
@@ -1872,6 +1926,46 @@ func undoHex(text string) string {
 	return b.String()
 }
 
+// binaryBase64Candidates returns the raw decode of every base64-looking token,
+// UTF-8 or not.
+//
+// ⚠ SEPARATE FROM `undoBase64`, DELIBERATELY. `/2FiY2RlZmdo` decodes to 0xff
+// followed by a supplied value, and an ordinary base64 tool reconstructs it in
+// one step -- so the guard must see those bytes
+// (shardpilot/shardpilot-go#84 review). But SUBSTITUTING them in place destroys
+// the surrounding text: three existing decoder fixtures failed at once when I
+// tried it, because a binary blob replaced the very forms that carried the value
+// through the chain. Substitution stays textual; the binary decode is an extra
+// CANDIDATE, checked and never fed back.
+func binaryBase64Candidates(text string) []string {
+	var out []string
+	for i := 0; i < len(text); {
+		j := i
+		for j < len(text) && isBase64Byte(text[j]) {
+			j++
+		}
+		for j < len(text) && text[j] == '=' {
+			j++
+		}
+		if tok := text[i:j]; len(tok) >= 4 {
+			for _, enc := range []*base64.Encoding{
+				base64.StdEncoding, base64.RawStdEncoding,
+				base64.URLEncoding, base64.RawURLEncoding,
+			} {
+				if raw, err := enc.DecodeString(tok); err == nil && !utf8.Valid(raw) {
+					out = append(out, string(raw))
+				}
+			}
+		}
+		if j == i {
+			i++
+		} else {
+			i = j
+		}
+	}
+	return out
+}
+
 func isHexByte(c byte) bool {
 	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
 }
@@ -1885,6 +1979,17 @@ func joinBase64Runs(text string) string {
 	run := false
 	for i, ln := range lines {
 		bare := strings.TrimSuffix(ln, "\r")
+		// ⚠ MIME IGNORES WHITESPACE INSIDE AN ENCODED LINE TOO, not only the CRLF
+		// between them. A line ending in a space was rejected as a run, so
+		// `YWJjZ \r\nGVmZ2g=` never rejoined while a MIME decoder reconstructs it
+		// directly (shardpilot/shardpilot-go#84 review). Horizontal whitespace is
+		// dropped before the line is judged and before it is joined.
+		bare = strings.Map(func(r rune) rune {
+			if r == ' ' || r == '\t' {
+				return -1
+			}
+			return r
+		}, bare)
 		isRun := bare != "" && allBase64(bare)
 		if isRun {
 			b.WriteString(bare)
@@ -2391,7 +2496,7 @@ func main() {
 			fmt.Fprintf(&report, "## Response%s — INCOMPLETE, and the SDK was told so\n\n"+
 				"The body is not established as whole (%v). What arrived is below; it "+
 				"is NOT a complete response.\n\n%s\n%s\n",
-				label, sanitize(ex.truncErr()), fencedBlock(body), ex.trailerReport())
+				label, incompleteBodyLine(&ex), fencedBlock(body), ex.trailerReport())
 		default:
 			respText := responseText(&ex)
 			fmt.Fprintf(&report, respSection, label,

@@ -1008,6 +1008,17 @@ func TestAnUndecodableContentCodingIsRefused(t *testing.T) {
 	}
 }
 
+func TestABodyReadErrorIsReadByTheGuard(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	enc := base64.StdEncoding.EncodeToString([]byte("abcdefgh"))
+	tee := &teeBody{err: errors.New("malformed trailer \"X-Bad " + enc + "\"")}
+	ex := exchange{head: []byte("x"), captured: tee}
+	if e := assertNoLeak(incompleteBodyLine(&ex)); e == nil {
+		t.Fatal("endpoint bytes carried by a body-read error were never decoded")
+	}
+}
+
 func TestTransportErrorTextIsReadByTheGuard(t *testing.T) {
 	suppliedValues = []string{"abcdefgh"}
 	t.Cleanup(func() { suppliedValues = nil })
@@ -1091,5 +1102,82 @@ func TestTheSerialiserConnectionHeaderIsGenerated(t *testing.T) {
 	got := stripMarks(scrubSupplied(dropFraming("HTTP/2.0 200 OK\r\nConnection: close\r\n\r\n")))
 	if strings.Contains(got, "<redacted") {
 		t.Fatalf("a serialiser-added Connection header was scrubbed into an invalid response: %q", got)
+	}
+}
+
+// ---- round on d9a8bb1 ----
+
+func TestOnlySynthesisedConnectionIsGenerated(t *testing.T) {
+	suppliedValues = []string{"bar"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// HTTP/1.1: the endpoint really sent it, so it is CAPTURED data that must not
+	// be exempted as generated.
+	//
+	// ⚠ THE PROPERTY, NOT THE MECHANISM THAT PROVED IT. The guard half proved this
+	// by `assertNoLeak` erroring on a base64 spelling that reached it. The
+	// redaction half removes the value structurally, so nothing reaches the guard
+	// and a nil error is the STRICTER answer -- this assertion, written against
+	// the mechanism, failed on a tree that leaks less (shardpilot/shardpilot-go#85,
+	// stack seam). What the defect did was mark an HTTP/1 line generated, and a
+	// generated line is passed through whole: the value survives. That is what is
+	// asserted.
+	got1 := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\nConnection: YmFy\r\n\r\n")))
+	if strings.Contains(got1, "YmFy") {
+		t.Fatalf("an HTTP/1 Connection value was exempted as generated and published: %q", got1)
+	}
+	if !strings.Contains(got1, "<redacted") {
+		t.Fatalf("the HTTP/1 Connection value was neither published nor accounted for: %q", got1)
+	}
+	// HTTP/2 forbids the field, so its presence proves the serialiser wrote it.
+	suppliedValues = []string{"close"}
+	got := stripMarks(scrubSupplied(dropFraming("HTTP/2.0 200 OK\r\nConnection: close\r\n\r\n")))
+	if strings.Contains(got, "<redacted") {
+		t.Fatalf("the synthesised HTTP/2 Connection line was scrubbed: %q", got)
+	}
+}
+
+func TestRefusalLabelsCarryNoEndpointText(t *testing.T) {
+	structuralSurfaces = nil
+	suppliedValues = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	dropFraming("HTTP/1.1 200 OK\r\n\r\n" + "{\"ſubject_fact_key\":\"x\"}")
+	if len(structuralSurfaces) == 0 {
+		t.Fatal("a folded minted name stopped being detected")
+	}
+	for _, w := range structuralSurfaces {
+		if strings.Contains(w, "ſ") {
+			t.Fatalf("the refusal label carries the endpoint's own spelling: %q", w)
+		}
+	}
+}
+
+func TestErrorTextCannotInjectProvenanceBytes(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	enc := base64.StdEncoding.EncodeToString([]byte("abcdefgh"))
+	// The endpoint puts the guard's own reserved byte around its payload.
+	err := errors.New("malformed response \"" + genMark + enc + genMark + "\"")
+	if e := assertNoLeak(transportErrorLine(err)); e == nil {
+		t.Fatal("injected provenance bytes made the guard blank endpoint text")
+	}
+}
+
+func TestMimeWhitespaceInsideARunIsIgnored(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	enc := base64.StdEncoding.EncodeToString([]byte("abcdefgh"))
+	wrapped := enc[:5] + " \r\n" + enc[5:]
+	if err := assertNoLeak(asCaptured("body:\r\n" + wrapped + "\r\n")); err == nil {
+		t.Fatal("horizontal whitespace inside a MIME run defeated the guard")
+	}
+}
+
+func TestBinaryBase64DecodesAreChecked(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	tok := base64.StdEncoding.EncodeToString(append([]byte{0xff}, []byte("abcdefgh")...))
+	if err := assertNoLeak(asCaptured(`{"k":"` + tok + `"}`)); err == nil {
+		t.Fatal("a decode whose bytes are not valid UTF-8 was discarded")
 	}
 }
