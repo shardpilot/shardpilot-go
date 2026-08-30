@@ -1008,6 +1008,41 @@ func noteAccounted(form captureForm, what string) {
 // printed. It exists so a test can ask that question without running main.
 func refusalLedger() []string { return structuralSurfaces }
 
+// exchangeRefusals records what one rendered exchange added to the refusal ledger
+// and whether that exchange was incomplete.
+type exchangeRefusals struct {
+	truncated bool
+	added     []string
+}
+
+// unexcusedRefusals returns the ledger entries that no TRUNCATED attempt accounts
+// for.
+//
+// ⚠ IT IS A FUNCTION SO A FIXTURE CAN REACH IT. The attribution lived inline in
+// `main()`, where nothing can run it -- and the mutant that suppressed the whole
+// ledger passed, because the only scene there read the SOURCE. The rule this
+// encodes: "this capture is incomplete" excuses the shapes THAT attempt produced
+// and nothing else, so a later truncated retry cannot excuse a complete earlier
+// attempt's refusal (shardpilot/shardpilot-go#85 review).
+func unexcusedRefusals(ledger []string, per []exchangeRefusals) []string {
+	excused := map[string]bool{}
+	for _, e := range per {
+		if !e.truncated {
+			continue
+		}
+		for _, w := range e.added {
+			excused[w] = true
+		}
+	}
+	out := []string{}
+	for _, w := range ledger {
+		if !excused[w] {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
 func noteStructural(form captureForm, what string) {
 	_ = form
 	if !slices.Contains(structuralSurfaces, what) {
@@ -4123,7 +4158,16 @@ func main() {
 		fmt.Fprintf(&report, "The SDK made **%d attempts**. All are below; the verdict is the "+
 			"last, because that is the one it acted on.\n\n", len(exchanges))
 	}
+	// ⚠ REFUSALS ARE ATTRIBUTED TO THE EXCHANGE THAT RAISED THEM. The ledger is
+	// global and the truncation suppression asked only about the LAST attempt, so a
+	// COMPLETE earlier attempt carrying an undescribed body had its refusal
+	// suppressed by a later truncated retry -- and the guard cannot see a value the
+	// harness never supplied, so the unsafe earlier response was published
+	// (shardpilot/shardpilot-go#85 review). "This capture is incomplete" excuses the
+	// shapes THAT attempt produced and nothing else.
+	var perExchange []exchangeRefusals
 	for i, ex := range exchanges {
+		beforeRender := len(structuralSurfaces)
 		label := ""
 		if len(exchanges) > 1 {
 			label = fmt.Sprintf(" %d", i+1)
@@ -4162,6 +4206,20 @@ func main() {
 			fmt.Fprintf(&report, respSection, label,
 				fencedBlock(respText), ex.trailerReport())
 		}
+		// Everything this attempt added to the ledger, and only it. See the comment
+		// above the loop: the excuse belongs to the attempt that earned it.
+		//
+		// ⚠ RESIDUAL, NAMED: `noteStructural` de-duplicates by reason, so if a
+		// truncated attempt raises a reason FIRST and a complete attempt would have
+		// raised the same one, the complete attempt's instance is never recorded and
+		// the reason is excused. The direction is towards publishing, so it is a
+		// real limit rather than a conservative one; closing it means keying the
+		// ledger by (exchange, reason), which is a larger change than this finding
+		// asked for.
+		perExchange = append(perExchange, exchangeRefusals{
+			truncated: ex.truncErr() != nil,
+			added:     append([]string{}, structuralSurfaces[beforeRender:]...),
+		})
 	}
 
 	last := rec.last()
@@ -4225,12 +4283,13 @@ func main() {
 	// The refusal is skipped because a fragment is undescribable BECAUSE it is
 	// incomplete, which is the truncation, not a shape the rules failed on. The
 	// report is written and the classification below returns exit 3.
-	if (last == nil || last.truncErr() == nil) && len(refusalLedger()) > 0 {
+	unexcused := unexcusedRefusals(refusalLedger(), perExchange)
+	if len(unexcused) > 0 {
 		fmt.Fprintf(os.Stderr,
 			"REFUSING TO PRINT: the response carries %d server-generated surface(s) "+
 				"in a shape the structural rules do not describe, so the capture is "+
-				"NOT publishable:\n", len(structuralSurfaces))
-		for _, w := range structuralSurfaces {
+				"NOT publishable:\n", len(unexcused))
+		for _, w := range unexcused {
 			fmt.Fprintf(os.Stderr, "  - %s\n", w)
 		}
 		os.Exit(4)

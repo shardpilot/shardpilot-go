@@ -1264,8 +1264,17 @@ func redactUnaccountedJSONValues(body string) string {
 			// `variant_payload`, the number is grammar, and nothing knows the token
 			// (shardpilot/shardpilot-go#85 review). A name the endpoint chose is a
 			// string the endpoint chose.
-			if isStr && !(atRoot && (benignTopLevel[name] || mintedNames[name])) {
-				k, end := keySpan(view, int(dec.InputOffset()))
+			// ⚠ EXEMPTED BY THE RAW SPELLING, NOT BY WHAT IT DECODES TO. `name` here is
+			// the DECODER's output, so `{"\u0061ssigned":false}` exempted the key as a
+			// schema name -- while the vouching pass correctly declined to mark it, and
+			// the scrub and guard then failed to match a supplied `0061` inside
+			// `u0061ssigned` (shardpilot/shardpilot-go#85 review). Two passes asking
+			// the same question, one about the spelling and one about the meaning, and
+			// a token can satisfy neither's answer to the other.
+			kq, ke := keySpan(view, int(dec.InputOffset()))
+			canonicalKey := kq >= 0 && view[kq:ke] == `"`+name+`"`
+			if isStr && !(atRoot && canonicalKey && (benignTopLevel[name] || mintedNames[name])) {
+				k, end := kq, ke
 				if k >= 0 && !anyMarked(inMark, k, end) {
 					noteAccounted(formBody, "an endpoint-chosen member name in a parsed response body")
 					spans = append(spans, span{back[k], back[end-1] + 1, `"` + tokenPlaceholder(name) + `"`})
@@ -1320,7 +1329,13 @@ func redactUnaccountedJSONValues(body string) string {
 		// supplied (shardpilot/shardpilot-go#85 review). A value is not evidence of
 		// its author; the POSITION is.
 		if sdkTaxonomy[str] && (verdictField == "code" || verdictField == "reason") {
-			spans = append(spans, span{back[k], back[end-1] + 1, marked(str)})
+			// ⚠ THE SPAN INCLUDES THE QUOTES, SO THE REPLACEMENT MUST TOO. Emitting
+			// only `marked(str)` produced `{"code":kill_switch}` after the marks are
+			// stripped -- invalid JSON, which the body rule then refused, so EVERY
+			// ordinary verdict capture was withheld with exit 4
+			// (shardpilot/shardpilot-go#85 review). The neighbouring branch got this
+			// right and this one did not, in the same expression.
+			spans = append(spans, span{back[k], back[end-1] + 1, `"` + marked(str) + `"`})
 		} else {
 			noteAccounted(formBody, "an endpoint-chosen value in a parsed response body")
 			spans = append(spans, span{back[k], back[end-1] + 1, `"` + tokenPlaceholder(str) + `"`})
@@ -1872,6 +1887,15 @@ func admitFieldName(name string) string {
 	// (HTTP/2's requirement); `ACCEPT-CH` is neither, and is the endpoint choosing.
 	n := ows(name)
 	if n != textproto.CanonicalMIMEHeaderKey(n) && n != strings.ToLower(n) {
+		// ⚠ AND IF THE GENERIC SCRUB WOULD REACH IT, REPLACE IT SAFELY HERE. Left
+		// captured, a non-canonical spelling that equals a supplied identifier was
+		// rewritten by the prose scrub into `<redacted, 4 chars>` -- spaces and angle
+		// brackets, which a field name may not contain, approved by the guard because
+		// the placeholder is generated (shardpilot/shardpilot-go#85 review). Not
+		// vouching it was right; leaving it where a prose rule could reach it was not.
+		if scrubSuppliedRaw(n) != n {
+			return tokenPlaceholder(n)
+		}
 		return name
 	}
 	return vouched(name)

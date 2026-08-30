@@ -3116,9 +3116,21 @@ func TestTruncationSuppressesTheRefusalWithoutDiscardingTheReport(t *testing.T) 
 		t.Fatalf("the scene cannot read its own subject: %v", err)
 	}
 	text := string(src)
-	guarded := strings.Index(text, "if (last == nil || last.truncErr() == nil) && len(refusalLedger()) > 0 {")
+	// ⚠ THE CONDITION MOVED FROM "the last attempt" TO "attributed to a truncated
+	// attempt", because the ledger is global and the old form let a later truncated
+	// retry excuse a COMPLETE earlier attempt's refusal
+	// (shardpilot/shardpilot-go#85 review). What is checkable is that the refusal
+	// reads the ATTRIBUTED set rather than the whole ledger.
+	guarded := strings.Index(text, "if len(unexcused) > 0 {")
 	if guarded < 0 {
-		t.Fatal("the structural refusal is not conditioned on the truncation, so a truncated body exits 4")
+		t.Fatal("the refusal reads the whole ledger rather than the refusals it may excuse")
+	}
+	// The attribution itself is a FUNCTION now and is measured directly by
+	// TestATruncatedRetryDoesNotExcuseAnEarlierCompleteAttempt; what remains
+	// checkable only from the source is that `main` uses it rather than the raw
+	// ledger.
+	if !strings.Contains(text, "unexcusedRefusals(refusalLedger(), perExchange)") {
+		t.Fatal("main does not attribute refusals to the attempt that raised them")
 	}
 	write := strings.Index(text, "io.WriteString(os.Stdout, stripMarks(report.String()))")
 	exit3 := strings.Index(text, "case last.truncErr() != nil:")
@@ -3264,4 +3276,61 @@ func formConstName(c captureForm) string {
 		return "formDiagnostic"
 	}
 	return ""
+}
+
+// The verdict taxonomy keeps its JSON quotes: without them the body no longer
+// parses, and the body rule then refuses every ordinary verdict.
+func TestAVouchedTaxonomyValueKeepsItsQuotes(t *testing.T) {
+	structuralSurfaces, accountedSurfaces = nil, nil
+	t.Cleanup(func() { structuralSurfaces, accountedSurfaces = nil, nil })
+	got := stripMarks(dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"code\":\"kill_switch\"}"))
+	if !strings.Contains(got, `"kill_switch"`) {
+		t.Fatalf("the quotes around a vouched verdict value were dropped: %q", got)
+	}
+	if len(structuralSurfaces) != 0 {
+		t.Fatalf("an ordinary verdict capture was refused: %v", structuralSurfaces)
+	}
+}
+
+// A schema key is exempt by its SPELLING, not by what it decodes to.
+func TestAnEscapedSchemaKeyIsNotExempt(t *testing.T) {
+	suppliedValues = []string{"0061"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\n\r\n{\"\\u0061ssigned\":false}")))
+	if strings.Contains(got, "0061") {
+		t.Fatalf("an escape spelling of a schema key carried a supplied value out: %q", got)
+	}
+}
+
+// A non-canonical field name that collides is replaced token-safely, not by prose.
+func TestANonCanonicalFieldNameStaysAName(t *testing.T) {
+	suppliedValues = []string{"DATE"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\nDATE: Sun, 06 Nov 1994 08:49:37 GMT\r\n\r\n{\"assigned\":false}")))
+	nm := strings.SplitN(strings.SplitN(got, "\r\n", 2)[1], ":", 2)[0]
+	if strings.ContainsAny(nm, " <>,") || nm == "" {
+		t.Fatalf("a field name became prose: %q", got)
+	}
+	if strings.Contains(nm, "DATE") {
+		t.Fatalf("the supplied identifier survived in the field name: %q", got)
+	}
+}
+
+// "This capture is incomplete" excuses the shapes THAT attempt produced.
+func TestATruncatedRetryDoesNotExcuseAnEarlierCompleteAttempt(t *testing.T) {
+	ledger := []string{"a response body in a shape this build cannot describe", "a Set-Cookie header with no name=value pair"}
+	per := []exchangeRefusals{
+		{truncated: false, added: []string{"a response body in a shape this build cannot describe"}},
+		{truncated: true, added: []string{"a Set-Cookie header with no name=value pair"}},
+	}
+	got := unexcusedRefusals(ledger, per)
+	if len(got) != 1 || got[0] != "a response body in a shape this build cannot describe" {
+		t.Fatalf("a complete attempt's refusal was excused by a later truncated retry: %v", got)
+	}
+	// AND A TRUNCATED ATTEMPT'S OWN REFUSAL IS STILL EXCUSED.
+	if len(unexcusedRefusals([]string{"a Set-Cookie header with no name=value pair"}, per[1:])) != 0 {
+		t.Fatal("the truncated attempt's own refusal was not excused")
+	}
 }
