@@ -4391,3 +4391,85 @@ func TestATrailerCodingOnAnEmptyBodyDoesNotRefuse(t *testing.T) {
 	}
 	structuralSurfaces, accountedSurfaces = nil, nil
 }
+
+// Provenance is being written by the SDK, not containing what it writes.
+//
+// ⚠ `strings.Index` FOUND THE WRAPPER ANYWHERE. An endpoint that puts the wrapper
+// text INSIDE its own diagnostic got its own bytes vouched as this SDK's
+// classification (shardpilot/shardpilot-go#84 review). `fmt.Errorf("shardpilot …
+// failed: %s", code)` puts the wrapper at the START of the message and nowhere
+// else, so that is the only position that establishes provenance — finding a
+// prefix is not being written by the thing that writes it, one level up from the
+// token.
+func TestOnlyAnSDKAuthoredErrorVouchesItsClassification(t *testing.T) {
+	for _, code := range []string{"unauthorized", "kill_switch", "http_503"} {
+		for _, c := range []struct {
+			name     string
+			text     string
+			sdkWrote bool
+		}{
+			{"the SDK's own error", "shardpilot experiment assignment fetch failed: " + code, true},
+			{"remote config", "shardpilot remote config fetch failed: " + code, true},
+			{"the wrapper quoted inside a diagnostic",
+				`malformed HTTP response "shardpilot experiment assignment fetch failed: ` + code + `"`, false},
+			{"the wrapper after other prose",
+				"retrying: shardpilot remote config fetch failed: " + code, false},
+		} {
+			suppliedValues = []string{code}
+			structuralSurfaces = nil
+			got := stripMarks(sanitizeCaptured(errors.New(c.text)))
+			printed := strings.Contains(got, code)
+			// ⚠ THE HALF THAT HOLDS ON BOTH SIDES OF THE SEAM IS THE NEGATIVE ONE.
+			// Where the SDK did not author the message, the token must not be
+			// published -- that is the finding, and it is true in both branches. Where
+			// it did, this branch publishes and the branch above withholds the whole
+			// diagnostic, because there the text is never taken from the error at all.
+			if !c.sdkWrote && printed {
+				t.Errorf("%s / %s: a token the SDK did not author was published: %q", code, c.name, got)
+			}
+			if c.sdkWrote && !printed && len(structuralSurfaces) == 0 {
+				t.Errorf("%s / %s: the SDK's own classification was neither published nor refused: %q",
+					code, c.name, got)
+			}
+			suppliedValues = nil
+			structuralSurfaces = nil
+		}
+	}
+}
+
+// Every producer over every view, and a seed re-enters the producing half too.
+//
+// ⚠ TWO OF SIX PRODUCER/VIEW PAIRS WERE MISSING, AND THE CHAIN RERAN ONLY ITS
+// DESTRUCTIVE HALF. `binaryCandidates` and `base64SuffixCandidates` were given the
+// NORMALISED form and the hex, short-base64 and wrapped producers were not, so a
+// one-character value emitted as wrapped unpadded base64 — `a` as `Y\r\nQ` — was
+// approved: the fragments are each too short to decode and nothing scanned the
+// joined form. And a binary candidate carrying another wrapped run could not be
+// reached at all, because the rounds rerun the six decoders and no producer
+// (shardpilot/shardpilot-go#84 review).
+//
+// The rows are the review's two cases plus the shapes around them, and the fix is
+// stated as a product rather than as pairs listed by hand — which is how two of
+// six went missing.
+func TestTheCandidateChainReachesWrappedAndReWrappedValues(t *testing.T) {
+	// ⚠ A LIMIT, NAMED WHERE A READER SEES IT. A wrapped run whose continuation is
+	// ADJACENT to base64-shaped prose cannot be delimited: in `prefix: Y\r\nQ end`
+	// the bytes `Qend` are a legal continuation and a legal word, and separating
+	// them means trying every prefix of the run -- the quadratic scan the work
+	// budget exists to prevent. That case is a MISS, and a declared limit excuses a
+	// miss; it does not excuse a false refusal, so nothing here refuses on it.
+	for _, c := range []struct{ sup, text string }{
+		{"a", "Y\r\nQ"},
+		{"ab", "Y\r\nWI"},
+		{"secret99", "/2MyVmoNCmNtVjBPVGs9"},
+		{"secret99", "x /2MyVmoNCmNtVjBPVGs9 y"},
+	} {
+		suppliedValues = []string{c.sup}
+		decodeWork = 0
+		if err := assertNoLeak(asCaptured(c.text)); err == nil {
+			t.Errorf("%q with %q supplied: the guard approved text the chain reconstructs", c.text, c.sup)
+		}
+		suppliedValues = nil
+		decodeWork = 0
+	}
+}

@@ -621,11 +621,22 @@ func vouchTaxonomyIn(text string) string {
 	// WRITING it at a known position; matching that token elsewhere is recognition,
 	// which is not authorship.
 	for _, prefix := range sdkErrorPrefixes {
-		i := strings.Index(text, prefix)
-		if i < 0 {
+		// ⚠ THE ERROR IS THE WRAPPER, NOT AN ERROR CONTAINING IT. `strings.Index`
+		// found the prefix anywhere, so an endpoint that puts the wrapper text INSIDE
+		// its own diagnostic -- `malformed HTTP response "shardpilot experiment
+		// assignment fetch failed: unauthorized"` -- got its own bytes vouched as this
+		// SDK's classification (shardpilot/shardpilot-go#84 review). Finding a prefix
+		// is not being written by the thing that writes it, which is the same
+		// recognition-is-not-authorship mistake one level up from the token.
+		//
+		// `fmt.Errorf("shardpilot ... failed: %s", code)` puts the wrapper at the
+		// START of the message and nowhere else, so that is the only position that
+		// establishes provenance.
+		if !strings.HasPrefix(text, prefix) {
 			continue
 		}
-		rest := text[i+len(prefix):]
+		i := 0
+		rest := text[len(prefix):]
 		j := 0
 		for j < len(rest) && isWordByte(rest[j]) {
 			j++
@@ -3398,14 +3409,21 @@ func assertNoLeak(text string) error {
 			sufs = append(sufs, base64SuffixCandidates(curNames)...)
 			// AND the short hex forms, and the wrapped runs that share a line with
 			// other text. Seeds like the rest: a candidate is an input to the chain.
-			sufs = append(sufs, hexCandidates(cur)...)
-			sufs = append(sufs, hexCandidates(curNames)...)
-			sufs = append(sufs, shortBase64Candidates(cur)...)
-			sufs = append(sufs, shortBase64Candidates(curNames)...)
-			for _, w := range wrappedBase64Candidates(cur) {
-				sufs = append(sufs, w)
-				if d, ok := decodeBase64(w); ok {
-					sufs = append(sufs, d)
+			// ⚠ THE REVIEW ASKED FOR `norm` HERE AND THE MEASUREMENT SAYS IT IS
+			// ALREADY COVERED. Its case -- `a` emitted as `Y\r\nQ` -- is REFUSED on the
+			// tree the review read, and stays refused with the seed re-entry below
+			// removed as well, so no scene distinguishes adding this view. It is left
+			// out: an extra view multiplies the producers over every round and spends
+			// the shared work budget, and a change no mutant kills is a change this
+			// file does not carry (shardpilot/shardpilot-go#84 review, measured).
+			for _, view := range []string{cur, curNames} {
+				sufs = append(sufs, hexCandidates(view)...)
+				sufs = append(sufs, shortBase64Candidates(view)...)
+				for _, w := range wrappedBase64Candidates(view) {
+					sufs = append(sufs, w)
+					if d, ok := decodeBase64(w); ok {
+						sufs = append(sufs, d)
+					}
 				}
 			}
 			extra = append(extra, sufs...)
@@ -3417,8 +3435,23 @@ func assertNoLeak(text string) error {
 					"decoding exceeded its work budget (%d bytes examined); the record "+
 						"is NOT publishable and was not printed", work)
 			}
-			for _, seed := range append(append([]string{dec}, bins...), sufs...) {
-				d := seed
+			// ⚠ AND A SEED RE-ENTERS THE PRODUCING HALF OF THE CHAIN, NOT ONLY THE
+			// DESTRUCTIVE ONE. The rounds below rerun the six decoders and none of the
+			// candidate producers, so a binary candidate carrying ANOTHER wrapped run
+			// could not be reached: `/2MyVmoNCmNtVjBPVGs9` decodes to `0xff` followed
+			// by `c2Vj\r\ncmV0OTk=`, whose wrapped suffix decodes to `secret99`, and
+			// the wrap needs a producer rather than a decoder to undo
+			// (shardpilot/shardpilot-go#84 review). The round before made binary
+			// candidates re-enter the decoders; this is the half of the chain that was
+			// left out.
+			//
+			// The worklist is bounded twice over -- by the shared work budget and by a
+			// seed cap -- so a crafted body cannot spin it, and what the cap drops is
+			// named rather than silently truncated.
+			seeds := append(append([]string{dec}, bins...), sufs...)
+			const seedMax = 4096
+			for si := 0; si < len(seeds) && work <= decodeWorkMax; si++ {
+				d := seeds[si]
 				for round := 0; round <= len(d) && work <= decodeWorkMax; round++ {
 					before := d
 					for _, st := range []func(string) string{undoPercent, undoUnicodeEscapes, undoBase64, undoHex, undoPlus, undoEntities} {
@@ -3431,6 +3464,23 @@ func assertNoLeak(text string) error {
 						break
 					}
 				}
+				if len(seeds) >= seedMax {
+					continue
+				}
+				for _, w := range wrappedBase64Candidates(d) {
+					seeds = append(seeds, w)
+					if dd, ok := decodeBase64(w); ok {
+						seeds = append(seeds, dd)
+					}
+				}
+				seeds = append(seeds, shortBase64Candidates(d)...)
+				work += takeDecodeWork()
+			}
+			if len(seeds) >= seedMax {
+				return fmt.Errorf(
+					"the candidate worklist reached its cap of %d seeds, so the decoding "+
+						"chain did not settle; the record is NOT publishable and was not "+
+						"printed", seedMax)
 			}
 			work += len(cur) + takeDecodeWork()
 			if work > decodeWorkMax {
