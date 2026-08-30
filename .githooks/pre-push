@@ -246,20 +246,35 @@ scan_ref_name() {
 # every check above it honestly reports on what it was given
 # (shardpilot/shardpilot-go#79 review). Written once so a sixth site is a call
 # rather than a fourth instance of this finding.
-read_evidence() {
+# ⚠ THE CLASS INCLUDES EVERY WRITE, NOT ONLY THE GIT READS. Having unified the
+# `git` sites one round earlier I went on believing the class was closed, and the
+# review found a `printf` into the same directory that no one had checked -- while
+# a derived pass over EVERY write into the evidence directory shows four:
+# the ref name, two truncations, and the concatenation that builds the tag target
+# (shardpilot/shardpilot-go#79 review). A grep for one command name is not a
+# population; the population is "what becomes evidence".
+run_evidence() {
   ev_dest="$1"
   ev_mode="$2"
   ev_what="$3"
   shift 3
   if [ "$ev_mode" = write ]; then
-    git "$@" > "$ev_dest" 2>/dev/null && return 0
+    "$@" > "$ev_dest" 2>/dev/null && return 0
   else
-    git "$@" >> "$ev_dest" 2>/dev/null && return 0
+    "$@" >> "$ev_dest" 2>/dev/null && return 0
   fi
-  printf 'REFUSING: %s could not be read whole.\n' "$ev_what" >&2
-  printf '  Scanning what was written and calling it the object would report on a\n' >&2
-  printf '  prefix while git publishes the whole of it.\n' >&2
+  printf 'REFUSING: %s could not be written whole.\n' "$ev_what" >&2
+  printf '  Evidence that stops partway scans clean, and everything downstream\n' >&2
+  printf '  reads it as the answer.\n' >&2
   exit 2
+}
+
+read_evidence() {
+  ev_dest="$1"
+  ev_mode="$2"
+  ev_what="$3"
+  shift 3
+  run_evidence "$ev_dest" "$ev_mode" "$ev_what" git "$@"
 }
 
 # scan_commit <commit> <base> <published-ref-name> [tag-object-file]
@@ -428,7 +443,7 @@ scan_commit() {
   # repository -- the third widening of "what does a push make reachable", after
   # trees and then commit objects (shardpilot/shardpilot-go#79 review). It is
   # staged like the rest so the same rules read it.
-  printf '%s\n' "$3" > "$tmpdir/pushed-ref-name"
+  run_evidence "$tmpdir/pushed-ref-name" write "the pushed ref name" printf '%s\n' "$3"
   stage_evidence "$1" scripts/pushed-ref-as-committed.txt "$tmpdir/pushed-ref-name"
 
   if [ -n "${4:-}" ] && [ -s "$4" ]; then
@@ -537,6 +552,25 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     exit 2
   fi
 
+  # ⚠ A BASELINE MUST BE A COMMIT, AND THE PREVIOUS TARGET NEED NOT BE ONE. Force-
+  # updating a tag that currently points at a blob or a tree TO a commit makes
+  # `remote_sha` a non-commit, and every introduced commit was then scanned with
+  # that value in PUBLIC_SURFACE_BASE_REF -- where `^{commit}` does not resolve, so
+  # the scanner refused unconditionally and a legitimate push could not be made at
+  # all (shardpilot/shardpilot-go#79 review). The fetch below exists for a tip that
+  # is ABSENT; this one is present and simply is not a commit, which no fetch
+  # changes.
+  #
+  # It is handed to the branch that already knows how to find a baseline when there
+  # is no previous commit, rather than copied: my first attempt duplicated that
+  # logic here and referred to a variable that branch had not yet set. The rig said
+  # `base_ref: unbound variable` on the first run.
+  if git cat-file -e "$remote_sha" 2>/dev/null &&
+     ! git rev-parse --verify --quiet "$remote_sha^{commit}" >/dev/null 2>&1; then
+    printf 'public surface: %s previously held a non-commit object; comparing against the default branch\n' \
+      "${remote_ref:-the remote ref}"
+    remote_sha=0000000000000000000000000000000000000000
+  fi
   case "$remote_sha" in
     *[!0]*)
       base="$remote_sha"
@@ -665,7 +699,8 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # object on the way down is staged.
   tag_object=""
   tag_target=""
-  : > "$tmpdir/tag-object"
+  run_evidence "$tmpdir/tag-object" write "the tag-object evidence file" printf ''
+
   walk="$local_sha"
   depth=0
   # ⚠ WALK WHILE THE OBJECT IS A TAG, not until it equals the peeled id. For a
@@ -676,7 +711,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # (shardpilot/shardpilot-go#79 review).
   while [ "$(git cat-file -t "$walk" 2>/dev/null)" = tag ] && [ "$depth" -lt 32 ]; do
     read_evidence "$tmpdir/tag-object" append "the annotated tag object $walk" cat-file tag "$walk"
-    printf '\n' >> "$tmpdir/tag-object"
+    run_evidence "$tmpdir/tag-object" append "a tag-object separator" printf '\n' 
     tag_object="$tmpdir/tag-object"
     nxt="$(git cat-file tag "$walk" 2>/dev/null | awk '$1=="object"{print $2; exit}')"
     [ -n "$nxt" ] || break
@@ -721,7 +756,8 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       # looks exactly like the defect it replaced.
       deref="$( git rev-parse --verify --quiet "${local_sha}^{}" 2>/dev/null || printf '%s' "$peeled" )"
       deref_kind="$( git cat-file -t "$deref" 2>/dev/null || printf 'unknown' )"
-      : > "$tmpdir/tag-target"
+      run_evidence "$tmpdir/tag-target" write "the tag-target evidence file" printf ''
+
       if [ "$deref_kind" = blob ]; then
         read_evidence "$tmpdir/tag-target" append "the tagged blob $deref" cat-file blob "$deref"
       elif [ "$deref_kind" = tree ]; then
@@ -748,18 +784,21 @@ while read -r local_ref local_sha remote_ref remote_sha; do
           printf '  everything past the bound becomes publicly reachable unexamined.\n' >&2
           exit 2
         fi
-        cat "$tmpdir/tag-tree-listing" >> "$tmpdir/tag-target"
-        printf '\n' >> "$tmpdir/tag-target"
+        run_evidence "$tmpdir/tag-target" append "the tagged tree listing" cat "$tmpdir/tag-tree-listing"
+        run_evidence "$tmpdir/tag-target" append "a tag-target separator" printf '\n' 
         # ⚠ NOT THROUGH A PIPE. `while read` on the right of `|` runs in a SUBSHELL,
         # so the refusal below would have exited that subshell and let the push
         # continue -- the same shape as the `||` context that disables `set -e`
         # elsewhere in this file. The list goes to a file and the loop redirects
         # from it, which keeps the refusal in the shell that can act on it.
-        awk '$2=="blob"{print $3}' "$tmpdir/tag-tree-listing" > "$tmpdir/tag-tree-blobs"
+        # Not evidence itself, but a truncated list means fewer blobs scanned,
+        # which fails in the same direction as truncated evidence.
+        run_evidence "$tmpdir/tag-tree-blobs" write "the tagged tree's blob list" \
+          awk '$2=="blob"{print $3}' "$tmpdir/tag-tree-listing"
         while read -r b; do
           [ -n "$b" ] || continue
           read_evidence "$tmpdir/tag-target" append "a blob reached through the tagged tree ($b)" cat-file blob "$b"
-          printf '\n' >> "$tmpdir/tag-target"
+          run_evidence "$tmpdir/tag-target" append "a tag-target separator" printf '\n' 
         done < "$tmpdir/tag-tree-blobs"
       fi
       if [ -s "$tmpdir/tag-target" ]; then

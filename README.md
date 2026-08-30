@@ -313,7 +313,7 @@ No Makefile — standard Go tooling.
 ```
 h="$(cd "$(git rev-parse --git-common-dir)" && pwd)/hooks" &&
 mkdir -p "$h" &&
-test ! -e "$h/pre-push" &&
+test ! -e "$h/pre-push" && test ! -L "$h/pre-push" &&
 cp .githooks/pre-push "$h/.pre-push.new" &&
 cp scripts/check_public_surface.sh "$h/.check_public_surface.sh.new" &&
 chmod +x "$h/.pre-push.new" "$h/.check_public_surface.sh.new" &&
@@ -331,7 +331,7 @@ git worktree list --porcelain | awk '/^worktree /{print substr($0,10)}' |
   done
 ```
 
-**Both files**, an ABSOLUTE path, published by RENAME, and `core.hooksPath` **pinned locally** rather than unset. Everything the hook executes must come from outside tracked content — the scanner as much as the hook. `--git-dir` names the per-worktree directory in a linked worktree while git reads hooks from the common one. And an unqualified `--unset` cannot clear a *global* or *system* `core.hooksPath`: with one inherited, git keeps resolving hooks from there and the gate is never invoked. A local setting overrides an inherited one — but NOT a worktree-scoped one.
+**Both files**, an ABSOLUTE path, published by RENAME, and `core.hooksPath` **pinned locally** rather than unset. The destination is tested with `-e` AND `-L`: a DANGLING symlink — a managed hook whose target is on an unavailable mount — fails `-e` while still occupying the path, so `-e` alone let the install replace it and disable the existing hook. Everything the hook executes must come from outside tracked content — the scanner as much as the hook. `--git-dir` names the per-worktree directory in a linked worktree while git reads hooks from the common one. And an unqualified `--unset` cannot clear a *global* or *system* `core.hooksPath`: with one inherited, git keeps resolving hooks from there and the gate is never invoked. A local setting overrides an inherited one — but NOT a worktree-scoped one.
 
 With `extensions.worktreeConfig` enabled, a `core.hooksPath` written at worktree
 scope outranks `--local`, so the install could report success while pushes went
