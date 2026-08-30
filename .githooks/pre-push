@@ -565,6 +565,18 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # is no previous commit, rather than copied: my first attempt duplicated that
   # logic here and referred to a variable that branch had not yet set. The rig said
   # `base_ref: unbound variable` on the first run.
+  # ⚠ FETCH FIRST, THEN ASK. The object may be ABSENT in a `--no-tags` clone, and
+  # the test below then skipped -- while the fetch further down brought it in and
+  # nothing asked again, leaving a non-commit in `$base` and refusing every
+  # introduced commit (shardpilot/shardpilot-go#79 review). My previous fix put the
+  # question in one place; it had to be placed after the answer could exist.
+  case "$remote_sha" in
+    *[!0]*)
+      if ! git cat-file -e "$remote_sha" 2>/dev/null; then
+        git fetch --quiet --no-tags --no-write-fetch-head -- "$dest" "$remote_sha" 2>/dev/null || true
+      fi
+      ;;
+  esac
   if git cat-file -e "$remote_sha" 2>/dev/null &&
      ! git rev-parse --verify --quiet "$remote_sha^{commit}" >/dev/null 2>&1; then
     printf 'public surface: %s previously held a non-commit object; comparing against the default branch\n' \

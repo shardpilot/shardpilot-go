@@ -311,7 +311,7 @@ No Makefile — standard Go tooling.
 **Install the pre-push hook once, before your first push:**
 
 ```
-h="$(cd "$(git rev-parse --git-common-dir)" && pwd)/hooks" &&
+h="$(cd "$(git rev-parse --git-common-dir)" && pwd -P)/hooks" &&
 mkdir -p "$h" &&
 test ! -e "$h/pre-push" && test ! -L "$h/pre-push" &&
 cp .githooks/pre-push "$h/.pre-push.new" &&
@@ -319,16 +319,17 @@ cp scripts/check_public_surface.sh "$h/.check_public_surface.sh.new" &&
 chmod +x "$h/.pre-push.new" "$h/.check_public_surface.sh.new" &&
 mv "$h/.pre-push.new" "$h/pre-push" &&
 mv "$h/.check_public_surface.sh.new" "$h/check_public_surface.sh" &&
-git worktree list --porcelain | awk '/^worktree /{print substr($0,10)}' |
-  while read -r w; do
-    git -C "$w" config --worktree --unset-all core.hooksPath 2>/dev/null || true
-  done &&
+ws="$(git worktree list --porcelain | awk '/^worktree /{print substr($0,10)}')" &&
+test -n "$ws" &&
+printf '%s\n' "$ws" | while read -r w; do
+  git -C "$w" config --worktree --unset-all core.hooksPath 2>/dev/null || true
+done &&
 git config --local core.hooksPath "$h" &&
-git worktree list --porcelain | awk '/^worktree /{print substr($0,10)}' |
-  while read -r w; do
-    test "$(git -C "$w" rev-parse --path-format=absolute --git-path hooks)" = "$h" ||
-      { echo "hooks still resolve elsewhere in $w" >&2; exit 1; }
-  done
+printf '%s\n' "$ws" | while read -r w; do
+  got="$(cd "$(git -C "$w" rev-parse --path-format=absolute --git-path hooks)" && pwd -P)" || exit 1
+  test "$got" = "$h" ||
+    { echo "hooks still resolve elsewhere in $w: $got" >&2; exit 1; }
+done
 ```
 
 **Both files**, an ABSOLUTE path, published by RENAME, and `core.hooksPath` **pinned locally** rather than unset. The destination is tested with `-e` AND `-L`: a DANGLING symlink — a managed hook whose target is on an unavailable mount — fails `-e` while still occupying the path, so `-e` alone let the install replace it and disable the existing hook. Everything the hook executes must come from outside tracked content — the scanner as much as the hook. `--git-dir` names the per-worktree directory in a linked worktree while git reads hooks from the common one. And an unqualified `--unset` cannot clear a *global* or *system* `core.hooksPath`: with one inherited, git keeps resolving hooks from there and the gate is never invoked. A local setting overrides an inherited one — but NOT a worktree-scoped one.
@@ -346,6 +347,17 @@ worktree resolving its old path — and a check that asks only about the current
 worktree reports success while a push from the next one over runs no gate at all.
 Both the clearing and the verification walk `git worktree list`, and the
 verification fails loudly with the path that disagreed.
+
+**The enumeration is captured and checked NON-EMPTY before either loop.** Without
+`pipefail`, a failing `git worktree list` or a missing `awk` reports only the empty
+loop's success — so the install would clear nothing, verify nothing, and report that
+it worked, leaving a higher-precedence worktree value in place and every push from
+that worktree ungated.
+
+**Both sides of the comparison are resolved with `pwd -P`.** Through a symlinked
+checkout, `pwd` keeps the logical path while `git rev-parse --path-format=absolute`
+returns the physical one, so the two name the same directory and the test fails
+AFTER everything has already been installed.
 
 ⚠ TWO THINGS IN THAT CHAIN ARE EASY TO READ PAST.
 
