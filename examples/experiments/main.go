@@ -260,6 +260,21 @@ func (e *exchange) trailerReport() string {
 			// size of GENERATED text and losing the cookie's shape
 			// (shardpilot/shardpilot-go#85 review). A fallback that runs after a
 			// rule has answered is not a fallback.
+			// ⚠ A CONTENT CODING ANNOUNCED IN A TRAILER IS THE SAME FACT AS ONE IN THE
+			// HEADER. For a chunked HTTP/1 response that declares `Trailer:
+			// Content-Encoding`, Go leaves the initial field empty and hands the coding
+			// over here -- with the raw compressed bytes in the body. The header path
+			// refuses that; this one accepted the registered value and published a body
+			// no decoder in this program can read, so a supplied or server-minted value
+			// inside it is reconstructable by anyone who decompresses
+			// (shardpilot/shardpilot-go#85 review). A trailer is a header that arrived
+			// late, in this as in everything else -- the fourth time that sentence has
+			// had to be applied to a rule written on the header path alone.
+			if strings.EqualFold(strings.TrimSpace(k), "content-encoding") {
+				if cv := strings.TrimSpace(v); cv != "" && !strings.EqualFold(cv, "identity") {
+					noteStructural("a body in a content coding this build cannot decode")
+				}
+			}
 			red, handled := structuralRedact(escapeMarks(k) + ": " + escapeMarks(v))
 			if !handled {
 				red = redactUnlessVerbatim(red)
@@ -1499,11 +1514,35 @@ func markBareJSONLiterals(text string) string {
 	// review). Each round fixed the side it was shown. The rule is one value with
 	// nothing but JSON whitespace around it, stated once, so there is no third
 	// side left to be shown.
+	// ⚠ PARSE A MARK-FREE VIEW, EDIT THE ORIGINAL. Provenance marks are inserted
+	// by the redaction that runs before this, INSIDE JSON strings -- so the
+	// document handed here does not parse, this returned without marking anything,
+	// and with a supplied identifier of `true`, `false` or `null` the scrub rewrote
+	// `"assigned":true` into a placeholder and published a body that is no longer
+	// JSON (shardpilot/shardpilot-go#85 review).
+	//
+	// Swapping the two passes does not fix it: BOTH need a parsable document and
+	// BOTH insert marks, so whichever runs second is handed the other's bytes --
+	// measured, 18 tests said so. The dependency is removed rather than reordered:
+	// the parse runs over a view with the marks taken out, and every offset is
+	// mapped back to the text that is actually edited.
+	plain := make([]byte, 0, len(text))
+	back := make([]int, 0, len(text))
+	for i := 0; i < len(text); i++ {
+		if text[i] == capturedMark[0] || text[i] == genMark[0] {
+			continue
+		}
+		plain = append(plain, text[i])
+		back = append(back, i)
+	}
+	view := string(plain)
+	back = append(back, len(text))
+
 	start := 0
-	for start < len(text) && (text[start] == ' ' || text[start] == '\t' || text[start] == '\n' || text[start] == '\r') {
+	for start < len(view) && (view[start] == ' ' || view[start] == '\t' || view[start] == '\n' || view[start] == '\r') {
 		start++
 	}
-	if start >= len(text) || (text[start] != '{' && text[start] != '[') {
+	if start >= len(view) || (view[start] != '{' && view[start] != '[') {
 		return text
 	}
 	// ⚠ ONE VALUE, NOT A STREAM. `json.Decoder` reads a SEQUENCE of top-level
@@ -1514,16 +1553,16 @@ func markBareJSONLiterals(text string) string {
 	// review). The comment above already said this function protects a GRAMMAR;
 	// a stream of values is not the grammar this program's responses have.
 	{
-		v := json.NewDecoder(strings.NewReader(text[start:]))
+		v := json.NewDecoder(strings.NewReader(view[start:]))
 		var one json.RawMessage
 		if err := v.Decode(&one); err != nil {
 			return text
 		}
-		if strings.TrimSpace(text[start+int(v.InputOffset()):]) != "" {
+		if strings.TrimSpace(view[start+int(v.InputOffset()):]) != "" {
 			return text
 		}
 	}
-	dec := json.NewDecoder(strings.NewReader(text[start:]))
+	dec := json.NewDecoder(strings.NewReader(view[start:]))
 	type span struct{ a, b int }
 	var spans []span
 	for {
@@ -1548,8 +1587,9 @@ func markBareJSONLiterals(text string) string {
 				}
 			}
 			if end-len(lit) >= 0 &&
-				text[start+end-len(lit):start+end] == lit {
-				spans = append(spans, span{start + end - len(lit), start + end})
+				view[start+end-len(lit):start+end] == lit {
+				// Offsets are mapped back to the text that is actually edited.
+				spans = append(spans, span{back[start+end-len(lit)], back[start+end-1] + 1})
 			}
 		}
 	}

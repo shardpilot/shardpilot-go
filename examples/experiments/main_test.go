@@ -1600,3 +1600,61 @@ func TestAnAcceptedIdentityCodingIsGrammar(t *testing.T) {
 		t.Fatalf("an accepted no-op coding was rewritten into an invalid one: %q", got)
 	}
 }
+
+// ---- round on c72e65d ----
+
+// TestAnOpaqueURIPayloadIsRedacted: `https:SERVER_SECRET` is a valid absolute URI
+// whose remainder has no slash, so the segment-based path redaction left it
+// untouched and the endpoint's text reached the artifact verbatim
+// (shardpilot/shardpilot-go#85 review).
+func TestAnOpaqueURIPayloadIsRedacted(t *testing.T) {
+	suppliedValues = nil
+	got := stripMarks(redactTarget("Location: https:SERVER_SECRET"))
+	if strings.Contains(got, "SERVER_SECRET") {
+		t.Fatalf("an opaque URI payload was published: %q", got)
+	}
+	// ⚠ AND THE SHAPES THAT MUST STILL WORK, or the repair is a refusal: a scheme
+	// with an absolute path, and an ordinary authority target.
+	if got := stripMarks(redactTarget("Location: https:/cb")); !strings.Contains(got, "https:/") {
+		t.Fatalf("a scheme with an absolute path was mangled: %q", got)
+	}
+	if got := stripMarks(redactTarget("Location: https://e.example/cb")); !strings.Contains(got, "e.example") {
+		t.Fatalf("an ordinary authority target was mangled: %q", got)
+	}
+}
+
+// TestACodingAnnouncedInATrailerRefuses: for a chunked HTTP/1 response declaring
+// `Trailer: Content-Encoding`, Go leaves the initial field empty and the coding
+// arrives late, with the raw compressed bytes in the body. The header path refuses
+// that; this one accepted it (shardpilot/shardpilot-go#85 review).
+func TestACodingAnnouncedInATrailerRefuses(t *testing.T) {
+	structuralSurfaces = nil
+	suppliedValues = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	e := &exchange{captured: &teeBody{trailer: map[string][]string{"Content-Encoding": {"gzip"}}}}
+	e.trailerReport()
+	if len(structuralSurfaces) == 0 {
+		t.Fatal("a content coding announced in a trailer left the capture publishable")
+	}
+	// A no-op coding in a trailer is still a no-op.
+	structuralSurfaces = nil
+	e2 := &exchange{captured: &teeBody{trailer: map[string][]string{"Content-Encoding": {"identity"}}}}
+	e2.trailerReport()
+	if len(structuralSurfaces) != 0 {
+		t.Fatalf("an identity coding in a trailer refused a publishable capture: %q", structuralSurfaces)
+	}
+}
+
+// TestACookieAttributeIsMeasuredAsReceived: `responseText` expands a marker-like
+// spelling before the attribute is measured, so a four-character value was
+// reported as seven (shardpilot/shardpilot-go#85 review).
+func TestACookieAttributeIsMeasuredAsReceived(t *testing.T) {
+	suppliedValues = nil
+	got := stripMarks(redactSetCookie("Set-Cookie: sid=x; Path=" + escapeMarks(capturedMark)))
+	// ⚠ ANCHORED TO THE ATTRIBUTE. The first version asserted `"1 chars"` anywhere
+	// in the line — and the cookie's OWN value is one character, so the assertion
+	// matched something other than its subject and the mutant survived.
+	if !strings.Contains(got, "Path=<redacted, 1 chars>") {
+		t.Fatalf("an attribute value was measured in its escaped spelling: %q", got)
+	}
+}

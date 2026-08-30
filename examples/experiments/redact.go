@@ -437,6 +437,16 @@ func redactPath(line string) string {
 		!strings.HasPrefix(url[c:], "://") {
 		switch strings.ToLower(url[:c]) {
 		case "http", "https":
+			// ⚠ AN OPAQUE URI HAS NO AUTHORITY, SO NOTHING HERE IS EXEMPT.
+			// `https:SERVER_SECRET` is a valid absolute URI whose remainder contains
+			// no slash, so the path redaction below -- which works on segments --
+			// left it untouched and the endpoint's text reached the artifact verbatim
+			// (shardpilot/shardpilot-go#85 review). The host exemption is written for
+			// a component that is not present in this shape, and an exemption cannot
+			// be inherited by whatever stands where its subject would have been.
+			if rest := url[c+1:]; rest != "" && !strings.ContainsAny(rest, "/") {
+				return head + gap + url[:c+1] + tokenPlaceholder(rest) + tail
+			}
 			start = c + 1
 		default:
 			noteStructural("a Location header with an unapproved URI scheme")
@@ -589,7 +599,7 @@ func redactSetCookie(line string) string {
 				// rewrote its prefix into the prose form and produced a name no
 				// cookie parser accepts (shardpilot/shardpilot-go#85 review).
 				parts[i] = " " + tokenPlaceholder(ows(an)) +
-					"=" + placeholder(ows(av))
+					"=" + placeholder(unescapeMarks(ows(av)))
 				continue
 			}
 			// ⚠ CLASSIFY THE ORIGINAL NAME, THEN MARK IT. Run the other way round,
@@ -613,7 +623,12 @@ func redactSetCookie(line string) string {
 				parts[i] = an + "=" + av
 				continue
 			}
-			parts[i] = an + "=" + placeholder(ows(av))
+			// ⚠ MEASURED AS RECEIVED, NOT AS ESCAPED. `responseText` expands a
+			// marker-like spelling before this runs, so `Path=\x00` -- four characters
+			// on the wire -- was reported as seven. The cookie's own value already
+			// unescaped before measuring; the attributes did not
+			// (shardpilot/shardpilot-go#85 review).
+			parts[i] = an + "=" + placeholder(unescapeMarks(ows(av)))
 		}
 		out += ";" + strings.Join(parts, ";")
 	}
@@ -875,6 +890,31 @@ func redactMintedBody(body string) string {
 			return marked("<withheld: a minted field in an undescribed shape>")
 		}
 	}
+	// ⚠ LAST, AFTER EVERY PARSE. Placed at the top, this inserted provenance marks
+	// inside JSON strings before this function's own `jsonParses`, `topLevelMembers`
+	// and depth walk read the body -- eighteen tests said so at once. The rule is
+	// the same one the grammar pass had to learn: analysis runs on a document,
+	// marking runs on the result.
+	//
+	// ⚠ AND THE ADMITTED MEMBER NAMES. A supplied identifier equal to a name this
+	// program recognises -- an experiment key of `assigned` against
+	// `{"assigned":false}` -- had that name rewritten to `<redacted, 8 chars>`,
+	// so the capture lost the SDK's wire contract even though the name was
+	// accepted precisely BECAUSE the program recognises it
+	// (shardpilot/shardpilot-go#85 review). Arbitrary payload names stay captured;
+	// only the ones a registry vouches for are marked. All thirteen benign members
+	// were affected, not the one the review named.
+	out = jsonMemberName.ReplaceAllStringFunc(out, func(m string) string {
+		g := jsonMemberName.FindStringSubmatch(m)
+		dec, ok := jsonString(g[1])
+		if !ok {
+			dec = g[1]
+		}
+		if isBenignName(dec) || isMintedName(dec) {
+			return strings.Replace(m, g[1], vouched(g[1]), 1)
+		}
+		return m
+	})
 	return out
 }
 
@@ -1185,11 +1225,25 @@ var registeredFieldNames = set(
 // admitFieldName decides on the RECEIVED name and only then scrubs it. The two
 // steps answer different questions and must not be composed the other way round:
 // the registry asks what the endpoint sent, the scrub asks what we supplied.
+// ⚠ VOUCHING FOR A TOKEN AND LEAVING IT CAPTURED IS NOT VOUCHING. Six rounds
+// across this stack have produced one defect wearing five faces: the program
+// admits a token because it RECOGNISES it -- a registered field name, a standard
+// cookie attribute, the no-op content coding, a benign JSON member, a registered
+// reason phrase -- and hands it on as captured text, so the supplied-value scrub
+// rewrites it into a placeholder and publishes a response no parser accepts,
+// which the guard approves because a placeholder is generated. Each round fixed
+// the site it was shown, and the LIST OF SITES was the thing that kept being
+// incomplete: the registry-driven sweep in vouched_test.go found fourteen where
+// the review had named two.
+//
+// `vouched` is that rule with a name. Every admit site calls it.
+func vouched(tok string) string { return marked(tok) }
+
 func admitFieldName(name string) string {
 	if !registeredFieldNames[strings.ToLower(ows(name))] {
 		return tokenPlaceholder(ows(name))
 	}
-	return scrubHeaderName(name)
+	return vouched(name)
 }
 
 func redactFieldName(name string) string {
@@ -1287,7 +1341,15 @@ func redactUnlessVerbatim(line string) string {
 			// was caught by the fixture for the generated capture notes.
 			code, err := strconv.Atoi(f[1])
 			if err == nil && f[2] == http.StatusText(code) {
-				return line
+				// ⚠ VOUCHED, NOT MERELY RETURNED. The scrub deliberately skips the
+				// status line, but `assertNoLeak` reads an HTTP/1 reason phrase as
+				// captured data -- so with a legal experiment key of `OK` an ordinary
+				// `HTTP/1.1 200 OK` could NEVER be captured: the guard reported the
+				// phrase as a survivor and every run exited 4
+				// (shardpilot/shardpilot-go#85 review). HTTP/2 already exempts its
+				// synthesised phrase; an exemption honoured by one of two rules is a
+				// disagreement, not an exemption.
+				return f[0] + " " + f[1] + " " + vouched(f[2]) + cr
 			}
 			return f[0] + " " + f[1] + " " + placeholder(f[2]) + cr
 		}
