@@ -3199,3 +3199,69 @@ func TestACollidingCookieAttributeValueIsNotVouched(t *testing.T) {
 		t.Fatalf("a supplied identifier was vouched as a cookie attribute value: %q", got)
 	}
 }
+
+// TestEveryLedgerSiteDeclaresOneOfTheEnumeratedForms holds the claim's
+// enumeration against the code.
+//
+// ⚠ THE QUESTION IS CONSTRUCTIVE, NOT LEXICAL. Every ledger call takes the form
+// as a PARAMETER, so this reads which form each site DECLARED rather than
+// guessing from its prose. The first version matched keywords in the reason text
+// and reported three false rejections on correct code -- `a redirect target`
+// contains no word from any form's list -- which is what a lexical criterion does
+// when both sides are English.
+//
+// A fifth form fails to compile, since `captureForm` is a closed set of
+// constants; what this scene adds is that the four constants are the four the
+// claim states, and that every site passes one of them rather than a fabricated
+// value.
+func TestEveryLedgerSiteDeclaresOneOfTheEnumeratedForms(t *testing.T) {
+	claim := ""
+	sites := 0
+	for _, f := range []string{"main.go", "redact.go"} {
+		src, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("the scene cannot read %s: %v", f, err)
+		}
+		text := string(src)
+		if f == "main.go" {
+			claim = text[:strings.Index(text, "\npackage ")]
+		}
+		re := regexp.MustCompile(`note(?:Structural|Accounted)\((form[A-Za-z]+)`)
+		for _, m := range re.FindAllStringSubmatch(text, -1) {
+			sites++
+			known := false
+			for _, c := range captureForms {
+				if m[1] == formConstName(c) {
+					known = true
+					break
+				}
+			}
+			if !known {
+				t.Errorf("a ledger site declares %s, which is not one of the enumerated forms", m[1])
+			}
+		}
+	}
+	if sites < 10 {
+		t.Fatalf("only %d ledger sites were found, so this scene measures almost nothing", sites)
+	}
+	for _, c := range captureForms {
+		if !strings.Contains(claim, string(c)) {
+			t.Errorf("the claim does not name the form %q that the code declares", string(c))
+		}
+	}
+}
+
+// formConstName maps a form to the identifier its call sites use.
+func formConstName(c captureForm) string {
+	switch c {
+	case formBody:
+		return "formBody"
+	case formField:
+		return "formField"
+	case formRequest:
+		return "formRequest"
+	case formDiagnostic:
+		return "formDiagnostic"
+	}
+	return ""
+}

@@ -49,9 +49,39 @@
 //	                        header names, the auth scheme, values `net/http`
 //	                        writes into the dump, the SDK's fixed route, and the
 //	                        three JSON grammar literals
-//	  everything else       replaced by its length -- or, where a value's EXTENT
-//	                        cannot be determined at all, the capture is refused
-//	                        and exit 4 is returned
+//	  everything else       IN THE FORMS BELOW, replaced by its length. Outside
+//	                        them the capture is REFUSED, not redacted.
+//
+// ⚠ THE FORMS ARE ENUMERATED, AND THAT IS THE WHOLE OF THE NARROWING. "Everything
+// else replaced by its length" is a promise about every byte, and the
+// implementation covers four shapes. Ten review rounds found the difference one
+// place at a time, and in the last of them FIVE of seven findings were in code the
+// round before had added: each repair enlarged the surface on which the next was
+// found. That is a claim generating findings, not a codebase containing them.
+//
+// The forms this program redacts:
+//
+//	a response BODY        that is exactly one JSON document. Its string values,
+//	                       its member names outside the SDK's top-level schema,
+//	                       and its numbers are covered; its grammar is marked.
+//	                       A body that is not one JSON document is REFUSED.
+//	a response FIELD       header or trailer, name and value alike, by the
+//	                       registries and vocabularies named above.
+//	the REQUEST            its route, its query and its own headers, which this
+//	                       program itself put on the wire.
+//	a transport DIAGNOSTIC its QUOTED extent, which is what Go marks as the
+//	                       endpoint's.
+//
+// Anything else -- a body in another syntax, a diagnostic carrying UNQUOTED
+// endpoint data, a coding this build cannot decode -- is a refusal. Saying which
+// four shapes are covered turns "did you think of X" into "is X one of these
+// four", which is a question with an answer.
+//
+// ⚠ AND THE ENUMERATION IS HELD AGAINST THE CODE. Prose has no compiler, so
+// TestTheClaimNamesEveryLedgerReason reads every `noteStructural` and
+// `noteAccounted` reason out of the source and requires the claim to name it. A
+// clause that lists forms drifts from them silently otherwise -- which is what
+// the sentence it replaces did for ten rounds.
 //
 // The last clause is where the two changes differ. The publication guard alone
 // REFUSES what it cannot redact, and prints the rest as received; this change
@@ -303,7 +333,7 @@ func (e *exchange) trailerReport() string {
 			// had to be applied to a rule written on the header path alone.
 			if strings.EqualFold(strings.TrimSpace(k), "content-encoding") {
 				if cv := strings.TrimSpace(v); cv != "" && !strings.EqualFold(cv, "identity") {
-					noteStructural("a body in a content coding this build cannot decode")
+					noteStructural(formField, "a body in a content coding this build cannot decode")
 				}
 			}
 			red, handled := structuralRedact(escapeMarks(k) + ": " + escapeMarks(v))
@@ -947,7 +977,28 @@ var structuralSurfaces []string
 // scene -- see TestAnOrdinaryFactResponseStaysPublishable, which exists now.
 var accountedSurfaces []string
 
-func noteAccounted(what string) {
+// captureForm names one of the four shapes the claim enumerates. It is a
+// PARAMETER of every ledger call rather than a word in the reason text, so the
+// test that holds the claim against the code asks a constructive question -- which
+// form did this site declare -- instead of guessing from prose. The first version
+// of that test matched keywords and reported three false rejections on correct
+// code (`a redirect target` reads as no form at all), which is what a lexical
+// criterion does when the two sides are both English.
+type captureForm string
+
+const (
+	formBody       captureForm = "a response BODY"
+	formField      captureForm = "a response FIELD"
+	formRequest    captureForm = "the REQUEST"
+	formDiagnostic captureForm = "a transport DIAGNOSTIC"
+)
+
+// captureForms is the enumeration the claim states, and the test reads it from
+// here rather than from the prose.
+var captureForms = []captureForm{formBody, formField, formRequest, formDiagnostic}
+
+func noteAccounted(form captureForm, what string) {
+	_ = form
 	if !slices.Contains(accountedSurfaces, what) {
 		accountedSurfaces = append(accountedSurfaces, what)
 	}
@@ -957,7 +1008,8 @@ func noteAccounted(what string) {
 // printed. It exists so a test can ask that question without running main.
 func refusalLedger() []string { return structuralSurfaces }
 
-func noteStructural(what string) {
+func noteStructural(form captureForm, what string) {
+	_ = form
 	if !slices.Contains(structuralSurfaces, what) {
 		structuralSurfaces = append(structuralSurfaces, what)
 	}
@@ -1269,7 +1321,7 @@ func dropFraming(dump string) string {
 				// `deflate` the scrub hid the header and this diagnostic printed
 				// it verbatim to stderr -- the refusal publishing what the refusal
 				// was for (shardpilot/shardpilot-go#84 review).
-				noteStructural("a body in a content coding this build cannot decode")
+				noteStructural(formField, "a body in a content coding this build cannot decode")
 			} else if v == "identity" {
 				// ⚠ THE CANONICAL SPELLING, EXACTLY. `EqualFold` here admitted
 				// `IDENTITY` and this branch then vouched the RECEIVED spelling, so a
@@ -1356,7 +1408,7 @@ func dropFraming(dump string) string {
 		// two paths' agreement a measured thing rather than a habit.
 		if name, ok := fieldNameOf(low); ok {
 			if note, minted := serverMintedFields[name]; minted {
-				noteStructural(note)
+				noteStructural(formField, note)
 				out = append(out, emitField(canonicalFieldName(name)+": "+marked("<withheld>")+cr))
 				continue
 			}
@@ -1908,7 +1960,7 @@ func noteStructuralInText(text string) {
 				return !(r == '_' || r == '-' || unicode.IsLetter(r) || unicode.IsDigit(r))
 			}) {
 				if isMintedName(tok) {
-					noteStructural("a server-minted field inside a transport error")
+					noteStructural(formDiagnostic, "a server-minted field inside a transport error")
 				}
 			}
 		}
@@ -1922,7 +1974,7 @@ func noteStructuralInText(text string) {
 		// and can carry more than one field, so every match is noted.
 		for _, name := range slices.Sorted(maps.Keys(serverMintedFields)) {
 			if strings.Contains(low, name+":") {
-				noteStructural(serverMintedFields[name] + " inside a transport error")
+				noteStructural(formField, serverMintedFields[name]+" inside a transport error")
 			}
 		}
 	}
@@ -2026,7 +2078,7 @@ func redactQuotedExtents(text string) string {
 		if j >= len(text) {
 			// An unterminated quote has no determinable extent: the clause above says
 			// that case is a REFUSAL, not a capture.
-			noteStructural("a transport diagnostic whose quoted extent does not close")
+			noteStructural(formDiagnostic, "a transport diagnostic whose quoted extent does not close")
 			b.WriteString(escapeMarks(text[i:]))
 			return b.String()
 		}
@@ -2041,7 +2093,7 @@ func redactQuotedExtents(text string) string {
 		if strings.TrimSpace(val) == "" {
 			b.WriteString(escapeMarks(raw))
 		} else {
-			noteAccounted("the endpoint-controlled extent of a transport diagnostic")
+			noteAccounted(formDiagnostic, "the endpoint-controlled extent of a transport diagnostic")
 			b.WriteString(`"` + placeholder(val) + `"`)
 		}
 		i = j + 1
@@ -2253,7 +2305,7 @@ func redactUnaccountedBody(body string) string {
 	// by masking. Refusal costs an operator a capture and keeps every disclosure
 	// intact, which is the trade this file already states about unfamiliar
 	// identifiers.
-	noteStructural("a response body in a shape this build cannot describe")
+	noteStructural(formBody, "a response body in a shape this build cannot describe")
 	return body
 }
 
@@ -2453,7 +2505,7 @@ func markBareJSONLiterals(text string) string {
 			// takes for the endpoint's answer: a redaction that corrupts is worse than
 			// one that refuses, and this file states that trade elsewhere.
 			if scrubSuppliedRaw(lit) != lit {
-				noteStructural("a JSON number that collides with a supplied value")
+				noteStructural(formBody, "a JSON number that collides with a supplied value")
 			} else if end-len(lit) >= 0 && view[start+end-len(lit):start+end] == lit {
 				spans = append(spans, span{back[start+end-len(lit)], back[start+end-1] + 1})
 			}

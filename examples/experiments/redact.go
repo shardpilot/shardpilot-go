@@ -583,7 +583,7 @@ func redactTarget(line string) string {
 	// the JSON body, in its second instance. "Nothing is printed that this program
 	// cannot account for" is a claim about what it DID, so the accounting lives
 	// where the doing is.
-	noteAccounted("a redirect target")
+	noteAccounted(formField, "a redirect target")
 	// ⚠ A TARGET THAT IS NOT A URI IS NOT PARSED, IT IS WITHHELD. A raw space is
 	// illegal in a request target but transport-valid in a header, and net/http
 	// keeps the whole opaque value -- so the redactors below treated everything
@@ -599,7 +599,7 @@ func redactTarget(line string) string {
 		// condition is never verified is not an exemption, it is a hole with a
 		// comment over it.
 		if !parsesAsURI(strings.TrimSuffix(url, "\r")) {
-			noteStructural("a Location header whose target is not a valid URI")
+			noteStructural(formField, "a Location header whose target is not a valid URI")
 			cr := ""
 			if strings.HasSuffix(line, "\r") {
 				cr = "\r"
@@ -624,7 +624,7 @@ func redactTarget(line string) string {
 		if a := authorityOf(strings.TrimSuffix(url, "\r")); a != "" {
 			{
 				if scrubSuppliedRaw(a) != a {
-					noteAccounted("a redirect authority colliding with a supplied value")
+					noteAccounted(formField, "a redirect authority colliding with a supplied value")
 					cr := ""
 					if strings.HasSuffix(line, "\r") {
 						cr = "\r"
@@ -634,7 +634,7 @@ func redactTarget(line string) string {
 			}
 		}
 		if strings.ContainsAny(strings.TrimSuffix(url, "\r"), " \t") {
-			noteStructural("a Location header whose target is not a valid URI")
+			noteStructural(formField, "a Location header whose target is not a valid URI")
 			cr := ""
 			if strings.HasSuffix(line, "\r") {
 				cr = "\r"
@@ -707,7 +707,7 @@ func redactPath(line string) string {
 			}
 			start = c + 1
 		default:
-			noteStructural("a Location header with an unapproved URI scheme")
+			noteStructural(formField, "a Location header with an unapproved URI scheme")
 			return head + marked("<withheld: unapproved scheme>") + tail
 		}
 	}
@@ -725,7 +725,7 @@ func redactPath(line string) string {
 		switch strings.ToLower(url[:i]) {
 		case "http", "https":
 		default:
-			noteStructural("a Location header with an unapproved URI scheme")
+			noteStructural(formField, "a Location header with an unapproved URI scheme")
 			return head + marked("<withheld: unapproved scheme>") + tail
 		}
 		start = i + 3
@@ -789,7 +789,7 @@ func redactSetCookie(line string) string {
 	// the JSON body, in its second instance. "Nothing is printed that this program
 	// cannot account for" is a claim about what it DID, so the accounting lives
 	// where the doing is.
-	noteAccounted("a Set-Cookie value")
+	noteAccounted(formField, "a Set-Cookie value")
 	cr := ""
 	body := line
 	if strings.HasSuffix(body, "\r") {
@@ -797,7 +797,7 @@ func redactSetCookie(line string) string {
 	}
 	head, rest, ok := strings.Cut(body, ":")
 	if !ok {
-		noteStructural("an unparseable Set-Cookie header")
+		noteStructural(formField, "an unparseable Set-Cookie header")
 		return marked("<withheld: unparseable Set-Cookie>")
 	}
 	pair, attrs, hasAttrs := strings.Cut(rest, ";")
@@ -806,7 +806,7 @@ func redactSetCookie(line string) string {
 		// `Set-Cookie: server-secret` is transport-valid and net/http keeps it.
 		// Returning it unchanged published a server-generated value the guard
 		// cannot see (shardpilot/shardpilot-go#85 review).
-		noteStructural("a Set-Cookie header with no name=value pair")
+		noteStructural(formField, "a Set-Cookie header with no name=value pair")
 		return head + ": " + marked("<withheld>") + cr
 	}
 	// ⚠ THE QUOTES ARE DELIMITERS, NOT VALUE. A quoted cookie `sid="abc"` was
@@ -1112,7 +1112,7 @@ func structuralRedact(line string) (string, bool) {
 	// rendering means no account, so it is withheld and the record is refused.
 	if name, ok := fieldNameOf(low); ok {
 		if note, minted := serverMintedFields[name]; minted {
-			noteStructural(note)
+			noteStructural(formField, note)
 			return canonicalFieldName(name) + ": " + marked("<withheld>"), true
 		}
 	}
@@ -1267,7 +1267,7 @@ func redactUnaccountedJSONValues(body string) string {
 			if isStr && !(atRoot && (benignTopLevel[name] || mintedNames[name])) {
 				k, end := keySpan(view, int(dec.InputOffset()))
 				if k >= 0 && !anyMarked(inMark, k, end) {
-					noteAccounted("an endpoint-chosen member name in a parsed response body")
+					noteAccounted(formBody, "an endpoint-chosen member name in a parsed response body")
 					spans = append(spans, span{back[k], back[end-1] + 1, `"` + tokenPlaceholder(name) + `"`})
 				}
 			}
@@ -1322,7 +1322,7 @@ func redactUnaccountedJSONValues(body string) string {
 		if sdkTaxonomy[str] && (verdictField == "code" || verdictField == "reason") {
 			spans = append(spans, span{back[k], back[end-1] + 1, marked(str)})
 		} else {
-			noteAccounted("an endpoint-chosen value in a parsed response body")
+			noteAccounted(formBody, "an endpoint-chosen value in a parsed response body")
 			spans = append(spans, span{back[k], back[end-1] + 1, `"` + tokenPlaceholder(str) + `"`})
 		}
 		verdictField = ""
@@ -1439,9 +1439,9 @@ func redactMintedBody(body string) string {
 			}
 			switch {
 			case isMinted(m[1]):
-				noteAccounted("a server-minted subject identifier in a body that does not parse")
+				noteAccounted(formBody, "a server-minted subject identifier in a body that does not parse")
 			case !isBenignName(dec):
-				noteStructural("a member of a body that does not parse, in a shape this program has not judged")
+				noteStructural(formBody, "a member of a body that does not parse, in a shape this program has not judged")
 			}
 		}
 	}
@@ -1459,10 +1459,10 @@ func redactMintedBody(body string) string {
 		// publishable capture -- the note inherited the redaction's blindness
 		// instead of the guard's question.
 		if isMintedName(n) {
-			noteAccounted("a server-minted subject identifier")
+			noteAccounted(formBody, "a server-minted subject identifier")
 		}
 		if !isMintedName(n) && !isBenignName(n) {
-			noteStructural("a top-level member this program has not judged")
+			noteStructural(formBody, "a top-level member this program has not judged")
 		}
 	}
 	parsed := topLevelMembers(body)
@@ -1494,7 +1494,7 @@ func redactMintedBody(body string) string {
 			// describe does not appear in what this function returns. The body
 			// goes whole, because the shape that defeated the pattern is exactly
 			// the shape whose extent cannot be determined.
-			noteStructural("a server-minted field in a value shape these rules do not describe")
+			noteStructural(formBody, "a server-minted field in a value shape these rules do not describe")
 			return marked("<withheld: a minted field in an undescribed shape>")
 		}
 	}
