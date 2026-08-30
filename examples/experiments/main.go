@@ -1180,6 +1180,47 @@ func overCaptured(text string, f func(string) string) string {
 	}
 }
 
+// nameComponents emits each field name AND each of its `-`-separated components
+// on its own line, so a decoder stage can see a component boundary the wire
+// spelling hid.
+//
+// ⚠ SPLITTING ONCE, BEFORE THE DECODERS, IS SPLITTING THE WRONG STRING. A legal
+// field name may percent-encode the separator -- `X%2dYmFy` -- so the one-time
+// split saw no hyphen, and when the percent stage later produced `X-YmFy` the
+// name went on being treated as ONE url-base64 token: `YmFy` was never decoded,
+// and the guard published a name from which the identifier is reconstructed by
+// two supported decoders (shardpilot/shardpilot-go#84 review). The round before
+// taught that base64's alphabet swallows the boundary; this one adds that the
+// boundary can ARRIVE mid-chain.
+func nameComponents(names string) string {
+	var b strings.Builder
+	// ⚠ DEDUPED, because this form FEEDS the next stage rather than only being
+	// recorded -- and re-emitting every line plus its components each round grows
+	// the text the decoders walk, which is charged to the same work budget.
+	seen := map[string]bool{}
+	emit := func(v string) {
+		if v == "" || seen[v] {
+			return
+		}
+		seen[v] = true
+		b.WriteString(v)
+		b.WriteByte('\n')
+	}
+	for _, ln := range strings.Split(names, "\n") {
+		if ln == "" {
+			continue
+		}
+		emit(ln)
+		if strings.IndexByte(ln, '-') < 0 {
+			continue
+		}
+		for _, part := range strings.Split(ln, "-") {
+			emit(part)
+		}
+	}
+	return b.String()
+}
+
 // markBareJSONLiterals wraps `true`, `false` and `null` in generated-provenance
 // marks WHERE THEY STAND AS GRAMMAR -- after `:` `,` `[` and before `,` `}` `]`
 // or the end.
@@ -1205,6 +1246,23 @@ func markBareJSONLiterals(text string) string {
 	start := strings.IndexAny(text, "{[")
 	if start < 0 {
 		return text
+	}
+	// ⚠ ONE VALUE, NOT A STREAM. `json.Decoder` reads a SEQUENCE of top-level
+	// values, so `{"x":1} false` walked as valid and the trailing literal was
+	// marked as grammar -- and a marked span is skipped by BOTH the scrub and the
+	// guard, so a supplied value of `false` was published, while `json.Unmarshal`
+	// rejects that body as a verdict outright (shardpilot/shardpilot-go#84
+	// review). The comment above already said this function protects a GRAMMAR;
+	// a stream of values is not the grammar this program's responses have.
+	{
+		v := json.NewDecoder(strings.NewReader(text[start:]))
+		var one json.RawMessage
+		if err := v.Decode(&one); err != nil {
+			return text
+		}
+		if strings.TrimSpace(text[start+int(v.InputOffset()):]) != "" {
+			return text
+		}
 	}
 	dec := json.NewDecoder(strings.NewReader(text[start:]))
 	type span struct{ a, b int }
@@ -1503,19 +1561,16 @@ func assertNoLeak(text string) error {
 			captured.WriteString("\n")
 			if inHead {
 				if i, ok := headerNameEnd(bare); ok {
-					names.WriteString(bare[:i])
-					names.WriteByte('\n')
-					// ⚠ AND EACH COMPONENT ON ITS OWN LINE. base64's alphabet
-					// includes `-`, so decoding a whole field name in lockstep
-					// treats `X-YmFy` as one token and never produces `bar` --
-					// the encoding defeats the very component boundary
-					// `isNameByte` uses (shardpilot/shardpilot-go#84 review).
-					for _, part := range strings.Split(bare[:i], "-") {
-						if part != "" {
-							names.WriteString(part)
-							names.WriteByte('\n')
-						}
-					}
+					// One splitter for both sites: the extraction and every decode stage ask
+					// the same question, and two copies of it drifted apart once already.
+					// ⚠ REDUNDANT HERE, AND A MUTANT SURVIVES IT -- measured, and recorded
+					// rather than fixtured around, like the bracket check elsewhere in this
+					// program. Once the split feeds the decode stream, the first round splits
+					// whatever this would have split, so removing this call fails nothing. It
+					// stays because `nameForms[0]` is the pre-stage form a reader will assume
+					// is complete, and because the redundancy costs one pass over a header
+					// block.
+					names.WriteString(nameComponents(bare[:i]))
 				}
 			}
 		}
@@ -1573,7 +1628,11 @@ func assertNoLeak(text string) error {
 			// value in an escape -- `X-%62ar` for `bar` -- decoded in the text but
 			// never in the names, and the name-boundary rule that exists for
 			// exactly that case never saw it (shardpilot/shardpilot-go#84 review).
-			curNames = stage(curNames)
+			// ⚠ RE-SPLIT INTO THE STREAM, not beside it. Recording the split form and
+			// decoding the unsplit one leaves the new component undecoded by every
+			// later stage -- which is the defect, one indirection along: the form that
+			// can reconstruct the value has to be the form the chain continues from.
+			curNames = nameComponents(stage(curNames))
 			nameForms = append(nameForms, curNames)
 			// ⚠ THE EXTRA CANDIDATE GOES IN ITS OWN SLICE. base64 is MIME-WRAPPED at
 			// column 76 and the scanner reads each line as its own token, so every
