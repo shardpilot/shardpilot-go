@@ -1143,38 +1143,6 @@ request methods        https://www.iana.org/assignments/http-methods/
 benign response members  expAssignmentWire in experiments.go (json tags)
 `
 
-// ⚠ TRANSCRIBED FROM A NAMED REGISTRY, NOT RECALLED. Three rounds running a
-// reviewer has named one more type this list was missing, because it was written
-// from memory -- and a list written from memory answers the length of the
-// author's memory, not the question. Its entries are the IANA Media Types
-// registry's common `application/*`, `text/*`, `image/*`, `audio/*`, `video/*`
-// and `font/*` registrations; regenerate from
-// https://www.iana.org/assignments/media-types/media-types.xhtml rather than by
-// adding whatever the next round names.
-//
-// It is still a list, and it will still miss something. What the provenance buys
-// is that the NEXT person can complete it in one operation instead of one entry
-// per review round -- and that a miss costs readability, never safety: an
-// unlisted type is lengthened, not published.
-var registeredMediaTypes = set(
-	"application/json", "application/problem+json", "application/ld+json",
-	"application/xml", "application/xhtml+xml", "application/atom+xml",
-	"application/octet-stream", "application/x-www-form-urlencoded",
-	"application/javascript", "application/ecmascript", "application/pdf",
-	"application/zip", "application/gzip", "application/cbor",
-	"application/msgpack", "application/wasm", "application/graphql-response+json",
-	"application/vnd.api+json", "application/jose", "application/jwt",
-	"application/manifest+json", "application/rss+xml", "application/sql",
-	"application/yaml", "application/toml",
-	"text/plain", "text/html", "text/css", "text/csv", "text/xml",
-	"text/javascript", "text/markdown", "text/event-stream", "text/calendar",
-	"image/png", "image/jpeg", "image/gif", "image/svg+xml", "image/webp",
-	"image/avif", "image/bmp", "image/tiff", "image/x-icon",
-	"audio/mpeg", "audio/ogg", "audio/wav", "audio/webm",
-	"video/mp4", "video/ogg", "video/webm",
-	"font/woff", "font/woff2", "font/ttf", "font/otf",
-)
-
 func isMediaTypeWithoutParameters(v string) bool {
 	// ⚠ NO SEPARATE PARAMETER CHECK. An explicit `ContainsAny(v, ";\"")` guard
 	// stood here and a mutant removing it survived -- correctly, because it was
@@ -1227,14 +1195,6 @@ var registeredDirectives = map[string]map[string]bool{
 		"accept-datetime", "origin", "user-agent", "cookie", "authorization", "referer",
 		"access-control-request-method", "access-control-request-headers",
 		"sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site", "prefer", "range"),
-}
-
-func set(v ...string) map[string]bool {
-	m := make(map[string]bool, len(v))
-	for _, x := range v {
-		m[x] = true
-	}
-	return m
 }
 
 // isDirectiveList accepts a comma-separated list in which every directive NAME

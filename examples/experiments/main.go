@@ -755,6 +755,86 @@ func verdictValue(v string) string {
 	return stripMarks(scrubSupplied(escapeMarks(v)))
 }
 
+// set builds a membership map from a list, so a registry reads as a registry.
+func set(v ...string) map[string]bool {
+	m := make(map[string]bool, len(v))
+	for _, x := range v {
+		m[x] = true
+	}
+	return m
+}
+
+// ⚠ TRANSCRIBED FROM A NAMED REGISTRY, NOT RECALLED. Three rounds running a
+// reviewer has named one more type this list was missing, because it was written
+// from memory -- and a list written from memory answers the length of the
+// author's memory, not the question. Its entries are the IANA Media Types
+// registry's common `application/*`, `text/*`, `image/*`, `audio/*`, `video/*`
+// and `font/*` registrations; regenerate from
+// https://www.iana.org/assignments/media-types/media-types.xhtml rather than by
+// adding whatever the next round names.
+//
+// It is still a list, and it will still miss something. What the provenance buys
+// is that the NEXT person can complete it in one operation instead of one entry
+// per review round -- and that a miss costs readability, never safety: an
+// unlisted type is lengthened, not published.
+var registeredMediaTypes = set(
+	"application/json", "application/problem+json", "application/ld+json",
+	"application/xml", "application/xhtml+xml", "application/atom+xml",
+	"application/octet-stream", "application/x-www-form-urlencoded",
+	"application/javascript", "application/ecmascript", "application/pdf",
+	"application/zip", "application/gzip", "application/cbor",
+	"application/msgpack", "application/wasm", "application/graphql-response+json",
+	"application/vnd.api+json", "application/jose", "application/jwt",
+	"application/manifest+json", "application/rss+xml", "application/sql",
+	"application/yaml", "application/toml",
+	"text/plain", "text/html", "text/css", "text/csv", "text/xml",
+	"text/javascript", "text/markdown", "text/event-stream", "text/calendar",
+	"image/png", "image/jpeg", "image/gif", "image/svg+xml", "image/webp",
+	"image/avif", "image/bmp", "image/tiff", "image/x-icon",
+	"audio/mpeg", "audio/ogg", "audio/wav", "audio/webm",
+	"video/mp4", "video/ogg", "video/webm",
+	"font/woff", "font/woff2", "font/ttf", "font/otf",
+)
+
+// ⚠ A RECOGNISED MEDIA TYPE IS GRAMMAR, AND MUST BE MARKED AS SUCH. With a legal
+// experiment key of `json`, the ordinary `Content-Type: application/json` came back
+// as `Content-Type: application/<redacted, 4 chars>`: the recorded response no
+// longer declares its own media type, and the guard approved it because the
+// placeholder is generated (shardpilot/shardpilot-go#84 review). Ninth site of one
+// rule in this stack -- vouching for a token and leaving it captured is not
+// vouching -- and the registry lives HERE, in the shared machinery, so the half
+// stacked on this one drops its copy rather than keeping a second.
+//
+// The PARAMETERS are not vouched for: `boundary=` and `charset=` values are the
+// endpoint's, and only the type/subtype is fixed by the registry.
+func markMediaType(line string) string {
+	// ⚠ MARK-BLIND ON PURPOSE, AND IT SPLITS ON THE COLON ITSELF. In the stacked
+	// half this runs AFTER the field-name registry and the value criterion have
+	// marked what they vouch for, so `headerNameEnd` did not recognise
+	// `\x01Content-Type\x01` as a field name at all and this returned at its first
+	// line. A field name cannot contain a colon, so the colon is the split.
+	i := strings.IndexByte(line, ':')
+	if i <= 0 || !strings.EqualFold(stripMarks(strings.TrimSpace(line[:i])), "content-type") {
+		return line
+	}
+	rest := line[i+1:]
+	cr := ""
+	if strings.HasSuffix(rest, "\r") {
+		cr, rest = "\r", strings.TrimSuffix(rest, "\r")
+	}
+	mt, params, _ := strings.Cut(rest, ";")
+	lead := mt[:len(mt)-len(strings.TrimLeft(mt, " \t"))]
+	bare := strings.TrimSpace(mt)
+	if !registeredMediaTypes[strings.ToLower(bare)] {
+		return line
+	}
+	out := line[:i+1] + lead + marked(bare)
+	if params != "" {
+		out += ";" + params
+	}
+	return out + cr
+}
+
 // scrubStructuralName applies the token-safe name scrub to a line the structural
 // redactors produced, so a supplied value equal to a field NAME cannot reach the
 // generic prose placeholder and make the field unparsable.
@@ -932,6 +1012,10 @@ func dropFraming(dump string) string {
 		// them (shardpilot/shardpilot-go#85 review, a sweep of fourteen forms).
 		// Unknown fails closed now: see verbatimHeaders for the criterion.
 		if i, ok := headerNameEnd(l); ok {
+			// ⚠ THE PARENT'S GENERIC APPEND IS GONE, NOT KEPT BESIDE THIS ONE. The merge
+			// offered both, and both append -- the line was emitted twice, with the
+			// second copy redacted, which two scenes caught immediately. This half's
+			// composition replaces it; what came across is the media-type marking above.
 			// ⚠ AND THE FIELD NAME ITSELF. `scrubHeaderName` only knows values the
 			// HARNESS supplied, so `Server-Secret: x` had its value lengthened and
 			// its NAME published -- and the parent build refused that whole
@@ -946,7 +1030,12 @@ func dropFraming(dump string) string {
 			// fact that a Content-Type arrived at all, and reported the length of
 			// generated text (shardpilot/shardpilot-go#85 review). The registry
 			// asks about the RECEIVED name; the scrub is about what we supplied.
-			out = append(out, admitFieldName(l[:i])+redactUnlessVerbatim(l)[i:])
+			// ⚠ THE MEDIA-TYPE MARKING RUNS LAST HERE. Placed before the criterion, as it
+			// sits in the half this builds on, its marks made `verbatimHeaders` fail to
+			// recognise the field and the whole value was replaced by a length -- three
+			// scenes said so at once. Same rule as the grammar pass and the member names:
+			// classification runs on a document, marking runs on the result.
+			out = append(out, markMediaType(admitFieldName(l[:i])+redactUnlessVerbatim(l)[i:]))
 			continue
 		}
 		out = append(out, scrubStructuralName(redactUnlessVerbatim(l)))

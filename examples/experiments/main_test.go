@@ -1854,3 +1854,32 @@ func TestAZoneIsMeasuredDecoded(t *testing.T) {
 		t.Fatalf("a zone was measured in its wire spelling: %q", got)
 	}
 }
+
+// TestARecognisedMediaTypeIsGrammar: with a legal experiment key of `json`, the
+// ordinary `Content-Type: application/json` came back as
+// `application/<redacted, 4 chars>` — the recorded response no longer declaring
+// its own media type, approved because the placeholder is generated
+// (shardpilot/shardpilot-go#84 review).
+func TestARecognisedMediaTypeIsGrammar(t *testing.T) {
+	suppliedValues = []string{"json"}
+	receivedConnection = true
+	t.Cleanup(func() { suppliedValues = nil; receivedConnection = false })
+	got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n")))
+	if !strings.Contains(got, "Content-Type: application/json") {
+		t.Fatalf("a registered media type was scrubbed into an undeclarable one: %q", got)
+	}
+	// ⚠ THE PARAMETERS ARE STILL THE ENDPOINT'S. Only the type/subtype is fixed by
+	// the registry; a boundary or charset value is a string the origin chose.
+	suppliedValues = []string{"utf-8"}
+	got = stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=utf-8\r\n\r\n")))
+	if strings.Contains(got, "charset=utf-8") {
+		t.Fatalf("a media-type PARAMETER was vouched for: %q", got)
+	}
+	// ⚠ AND AN UNREGISTERED TYPE IS NOT VOUCHED FOR, or the fix publishes whatever
+	// the endpoint puts in that position.
+	suppliedValues = []string{"server-secret"}
+	got = stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\nContent-Type: application/server-secret\r\n\r\n")))
+	if strings.Contains(got, "server-secret") {
+		t.Fatalf("an unregistered media type was published: %q", got)
+	}
+}
