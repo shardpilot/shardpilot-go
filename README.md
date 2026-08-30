@@ -334,6 +334,16 @@ test -s "$wt" &&
 while IFS= read -r -d "" rec; do
   case "$rec" in worktree\ *) printf '%s\0' "${rec#worktree }" || exit 1 ;; esac
 done < "$wt" > "$wp" &&
+while IFS= read -r -d "" r; do
+  rp="$(p_ "$r")" && rp="${rp%X}" &&
+  q="$rp/" && case "$q" in //) q=/ ;; esac &&
+  case "$h/" in
+    "$q"*) case "/${h#"$q"}/" in
+             */.git/*) : ;;
+             *) echo "$h is inside the worktree $rp and trackable there" >&2; exit 1 ;;
+           esac ;;
+  esac
+done < "$wp" &&
 while IFS= read -r -d "" w; do
   git -C "$w" config --worktree --unset-all core.hooksPath 2>/dev/null || true
 done < "$wp" &&

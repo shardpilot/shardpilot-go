@@ -1,4 +1,25 @@
-#!/bin/bash
+#!/bin/bash -p
+#
+# ⚠ AND `-p`, BECAUSE BASH RUNS FILES BEFORE LINE 1. A non-interactive bash SOURCES
+# `$BASH_ENV` before executing the script, so an environment naming a tracked path
+# there ran branch-supplied code first -- `exit 0` in it approves the push without
+# reaching the PATH filter or the scanner. Measured both ways: with a plain
+# `#!/bin/bash` shebang the startup file runs and prints before the body; with `-p`
+# it does not (shardpilot/shardpilot-go#79 review). Privileged mode also refuses
+# shell functions inherited from the environment, which is the same attack by a
+# second road -- a `git` function would otherwise shadow every call in this file.
+#
+# ⚠ AND `-p` PROTECTS THIS PROCESS, NOT THE CHAIN. The rig said so on the first
+# run: with `-p` the hook itself ignores the startup file, and the SCANNER it
+# invokes is another bash, which sourced it and took the `exit 0` -- so the gate
+# approved the push with its trusted scanner reporting clean. Protecting the shell
+# you were shown leaves every shell it starts.
+#
+# Unset rather than sanitise: `ENV` is the same vector for a `sh`-mode child.
+unset BASH_ENV ENV
+#
+# The PATH filter below is about what a bare command RESOLVES to; this is about
+# what runs before any command of ours at all.
 #
 # ⚠ A FIXED INTERPRETER, NOT `env`. Git runs a non-bare pre-push hook with the
 # WORKTREE ROOT as its working directory, so a `PATH` carrying `.` or an empty
@@ -313,7 +334,17 @@ export GIT_SHALLOW_FILE
 # directory, so `pwd -P` gives that root without running anything -- which matters,
 # because this filter has to be finished before the first external command.
 # Everything here is a shell builtin for the same reason.
-checkout_root="$(pwd -P)"
+# ⚠ SENTINELLED, LIKE `physdir`. A directory name may END IN A NEWLINE, and `$( )`
+# strips every trailing one -- so a checkout at `/tmp/w<NL>` gave a root of
+# `/tmp/w` while a PATH entry of `/tmp/w<NL>/bin` kept its newline (it is not
+# trailing there), the containment match missed, and a branch-supplied `bin/git`
+# stayed on PATH to be executed before the trusted scanner
+# (shardpilot/shardpilot-go#79 review). The technique was already in this file;
+# this site was written before it and never revisited. `pwd` and `printf` are
+# builtins, so the filter is still finished before the first external command.
+checkout_root="$(pwd -P && printf X)"
+checkout_root="${checkout_root%X}"
+checkout_root="${checkout_root%$NL}"
 sanitised_path=""
 dropped_inside=no
 old_ifs="$IFS"
@@ -324,7 +355,11 @@ for path_entry in $PATH; do
     *) continue ;;
   esac
   # Resolved physically, so a symlink pointing into the checkout is caught too.
-  entry_phys="$( cd -- "$path_entry" 2>/dev/null && pwd -P )" || entry_phys="$path_entry"
+  if entry_phys="$(physdir "$path_entry")"; then
+    entry_phys="${entry_phys%X}"
+  else
+    entry_phys="$path_entry"
+  fi
   case "$entry_phys/" in
     "$checkout_root"/*) dropped_inside=yes; continue ;;
   esac
@@ -600,7 +635,18 @@ if [ -n "$worktree_root" ]; then
   # enumerating an empty list, which is the failure mode this file keeps naming:
   # a probe that cannot go positive.
   wt_list_file="$tmpdir/worktrees"
-  git worktree list --porcelain -z > "$wt_list_file" 2>/dev/null || : > "$wt_list_file"
+  # ⚠ AND A FAILED ENUMERATION IS NOT AN EMPTY ONE. Truncating on failure left the
+  # containment test running against the INVOKING checkout alone, so a shared git
+  # directory trackable from another linked worktree would not be seen -- which is
+  # the very finding this listing was added for, reintroduced by its own fallback
+  # (shardpilot/shardpilot-go#79 review). The comment directly above already names
+  # the class: a probe that cannot go positive.
+  if ! git worktree list --porcelain -z > "$wt_list_file" 2>/dev/null; then
+    printf 'REFUSING: this repository'"'"'s worktrees could not be enumerated, so the\n' >&2
+    printf '  containment check can only speak for the invoking checkout. A shared git\n' >&2
+    printf '  directory trackable from another worktree would not be seen.\n' >&2
+    exit 2
+  fi
   check_containment() {
     root_prefix="$1/"
     case "$root_prefix" in //) root_prefix=/ ;; esac
@@ -1388,6 +1434,21 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       # destination's baseline (shardpilot/shardpilot-go#79 review). A SHA
       # cannot be overwritten.
       base="$(git rev-parse --verify --quiet "$base_ref^{commit}" || true)"
+      # ⚠ AND THE DESTINATION'"'"'S OWN HEAD MAY NOT BE A COMMIT. The branch above asks
+      # whether the PUSHED target is one; this asks the mirror question, and the two
+      # are independent -- a commit pushed to a ref whose destination advertises a
+      # blob or a tree fetches fine, peels to nothing, and was refused as "did not
+      # resolve" though its scan needs no commit baseline
+      # (shardpilot/shardpilot-go#79 review). Fourth place in this file where "not a
+      # commit" had to be carried.
+      #
+      # A FAILED PROBE IS NOT A NON-COMMIT: if the type cannot be read, `base` stays
+      # empty and the refusal below stands, which is the safe direction.
+      if [ -z "$base" ] && base_kind="$(git cat-file -t "$base_ref" 2>/dev/null)" \
+         && [ -n "$base_kind" ] && [ "$base_kind" != commit ]; then
+        base="$(git hash-object -t tree /dev/null)"
+        base_noncommit="$base_kind"
+      fi
       git_safe update-ref -d "$base_ref" 2>/dev/null || true
       base_ref=""
       fi
@@ -1427,6 +1488,9 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         exit 2
       fi
       why="the default branch of the destination, ${branch}, because this push CREATES ${remote_ref:-the ref}"
+      if [ -n "${base_noncommit:-}" ]; then
+        why="the empty tree, because the destination's advertised HEAD is a ${base_noncommit} and offers no commit baseline"
+      fi
       ;;
   esac
 
@@ -1520,7 +1584,20 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # thing such a push publishes -- was never collected. The rig found it: the
   # clean case passed and so did one whose message carried material
   # (shardpilot/shardpilot-go#79 review).
-  while [ "$(git cat-file -t "$walk" 2>/dev/null)" = tag ] && [ "$depth" -lt 32 ]; do
+  # ⚠ AND AN UNREADABLE OBJECT IS NOT A NON-TAG. Both probes substituted the type
+  # and compared the STRING, so a transient failure read as "not a tag": the walk
+  # skipped the whole tag-object collection, and the probe after the loop skipped
+  # the depth refusal -- a push approved without its annotation or signer metadata
+  # ever being scanned (shardpilot/shardpilot-go#79 review). Empty output has two
+  # meanings; the status separates them, exactly as the commit listing below already
+  # does.
+  while [ "$depth" -lt 32 ]; do
+    if ! walk_kind="$(git cat-file -t "$walk" 2>/dev/null)"; then
+      printf 'REFUSING: the type of %s could not be read, so this gate cannot tell an\n' "$walk" >&2
+      printf '  unreadable object from one that is not a tag.\n' >&2
+      exit 2
+    fi
+    [ "$walk_kind" = tag ] || break
     read_evidence "$tmpdir/tag-object" append "the annotated tag object $walk" cat-file tag "$walk"
     run_evidence "$tmpdir/tag-object" append "a tag-object separator" printf '\n' 
     tag_object="$tmpdir/tag-object"
@@ -1553,7 +1630,12 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # already scanned -- and this refused it for being "deeper than 32"
   # (shardpilot/shardpilot-go#79 review). The counter answers "how far did I
   # walk"; the refusal needs "is there more I did not walk".
-  if [ "$(git cat-file -t "$walk" 2>/dev/null)" = tag ]; then
+  if ! walk_kind="$(git cat-file -t "$walk" 2>/dev/null)"; then
+    printf 'REFUSING: the type of %s could not be read, so this gate cannot tell an\n' "$walk" >&2
+    printf '  unreadable object from one that is not a tag.\n' >&2
+    exit 2
+  fi
+  if [ "$walk_kind" = tag ]; then
     printf 'REFUSING: tag chain deeper than 32 at %s; not scanning further.\n' "$local_sha" >&2
     exit 2
   fi
