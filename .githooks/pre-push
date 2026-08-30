@@ -849,10 +849,10 @@ scan_commit() {
   if [ -n "${6:-}" ] && [ -d "$6" ]; then
     for tb in "$6"/*; do
       [ -f "$tb" ] || continue
-      case "$tb" in *.mode) continue ;; esac
+      # No suffix test: every file here is a blob, because the modes are elsewhere.
       tbmode=100644
-      if [ -f "$tb.mode" ]; then
-        tbmode="$(cat "$tb.mode")"
+      if [ -f "$6.modes/${tb##*/}" ]; then
+        tbmode="$(cat "$6.modes/${tb##*/}")"
       fi
       case "$tbmode" in 100644|100755|120000) ;; *) tbmode=100644 ;; esac
       stage_evidence "$1" "scripts/tag-tree-${tb##*/}" "$tb" "$tbmode"
@@ -1135,8 +1135,17 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       # an internal ref that is deleted moments later
       # (shardpilot/shardpilot-go#79 review). Every other git command here already
       # runs through `git_safe`; this one had been written before that existed.
+      # ⚠ FETCH WHAT WAS ADVERTISED, NOT WHAT IT POINTS AT. `$branch_ref` is HEAD's
+      # symref TARGET, and a destination may advertise the symref while HIDING the
+      # target -- `uploadpack.hideRefs=refs/heads/main` with `HEAD -> refs/heads/main`
+      # advertises both the symref row and HEAD's object id, and a fetch of
+      # `refs/heads/main` then fails while a fetch of `HEAD` succeeds. Every
+      # created-ref push to such a destination was refused
+      # (shardpilot/shardpilot-go#79 review). The name is still carried for the
+      # message below, because a refusal that cannot say WHICH branch is a refusal an
+      # operator cannot act on.
       if ! git_safe fetch --quiet --no-tags --no-write-fetch-head -- "$dest" \
-           "+$branch_ref:$base_ref" 2>/dev/null; then
+           "+HEAD:$base_ref" 2>/dev/null; then
         printf 'REFUSING: could not fetch %s from %s to compare against.\n' "$branch" "$safe_dest" >&2
         exit 2
       fi
@@ -1392,7 +1401,14 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         #   a newline instead. Path BYTES are preserved: the evidence is scanned, not
         #   parsed, so a path that itself contains a newline costs an extra break in
         #   the evidence and nothing else -- the parsing above reads the raw file.
-        mkdir -p "$tmpdir/tag-blobs"
+        # ⚠ THE SIDECAR LIVES BESIDE THE SET, NOT INSIDE IT. Naming a blob's mode
+        # `<blob>.mode` made the suffix carry the distinction, and a tree entry may
+        # BE named `credentials.mode` -- so its evidence and its own
+        # `credentials.mode.mode` were both taken for sidecars, skipped, and the
+        # blob went unscanned while the push was approved
+        # (shardpilot/shardpilot-go#79 review). A separate directory is a position,
+        # and a position cannot be spelled by the branch.
+        mkdir -p "$tmpdir/tag-blobs" "$tmpdir/tag-blobs.modes"
         tag_blobs="$tmpdir/tag-blobs"
         tab="$(printf '\t')"
         run_evidence "$tmpdir/tag-tree-listing-text" write \
@@ -1478,6 +1494,8 @@ while read -r local_ref local_sha remote_ref remote_sha; do
           name_max="$(getconf NAME_MAX "$tmpdir" 2>/dev/null || printf 255)"
           case "$name_max" in ''|*[!0-9]*) name_max=255 ;; esac
           [ "$name_max" -ge 32 ] || name_max=255
+          # `- 6` is a margin, not an exact accounting: nothing is appended to the
+          # leaf any more, and a margin costs a few bytes of a name nobody reads.
           leaf_max=$(( name_max - ${#nb} - 6 ))
           [ "$leaf_max" -ge 8 ] || leaf_max=8
           if [ "${#leaf}" -gt "$leaf_max" ]; then
@@ -1485,7 +1503,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
           fi
           read_evidence "$tmpdir/tag-blobs/$nb-$leaf" write \
             "a blob reached through the tagged tree ($oid)" cat-file blob "$oid"
-          run_evidence "$tmpdir/tag-blobs/$nb-$leaf.mode" write \
+          run_evidence "$tmpdir/tag-blobs.modes/$nb-$leaf" write \
             "the mode of a blob reached through the tagged tree" printf '%s' "$omode"
         done < "$tmpdir/tag-tree-listing"
         run_evidence "$tmpdir/tag-target" append "the tagged tree listing" \
