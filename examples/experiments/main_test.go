@@ -2028,7 +2028,7 @@ func TestAUnicodeFoldedMintedNameIsTokenised(t *testing.T) {
 func TestASchemaMemberNameIsGrammar(t *testing.T) {
 	suppliedValues = []string{"assigned"}
 	t.Cleanup(func() { suppliedValues = nil })
-	got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"assigned\":true}")))
+	got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"assigned\":true,\"version\":1,\"assignment_key\":\"a\",\"variant_key\":\"v\",\"boundary\":{\"assignment_unit\":\"client_id\"}}")))
 	if !strings.Contains(got, `"assigned"`) {
 		t.Fatalf("the response schema was rewritten by the scrub: %q", got)
 	}
@@ -2104,7 +2104,7 @@ func TestASchemaNameIsGrammarOnlyAtTheRoot(t *testing.T) {
 	suppliedValues = []string{"assigned"}
 	t.Cleanup(func() { suppliedValues = nil })
 	got := stripMarks(scrubSupplied(dropFraming(
-		"HTTP/1.1 200 OK\r\n\r\n{\"assigned\":true,\"variant_payload\":{\"assigned\":\"x\"}}")))
+		"HTTP/1.1 200 OK\r\n\r\n{\"assigned\":true,\"version\":1,\"assignment_key\":\"a\",\"variant_key\":\"v\",\"boundary\":{\"assignment_unit\":\"client_id\"},\"variant_payload\":{\"assigned\":\"x\"}}")))
 	if strings.Count(got, "assigned") != 1 {
 		t.Fatalf("the nested endpoint-controlled name was exempted too: %q", got)
 	}
@@ -4111,6 +4111,31 @@ func TestExemptionsNeedTheAssignmentSHAPE(t *testing.T) {
 		{"no assigned member at all", `{"version":1}`, false},
 		{"not an object", `["assigned"]`, false},
 		{"a typed member the SDK validates", `{"assigned":false,"variant_payload":1}`, false},
+		// ⚠ AND THE SEMANTIC GATES AFTER THE DECODE. `parseExperimentVerdict` keeps
+		// validating: on the assigned branch a version of at least 1, non-empty
+		// assignment and variant keys, and an assignment unit from a closed set; on the
+		// unassigned branch a reason from a closed set
+		// (shardpilot/shardpilot-go#84 review).
+		{"assigned with nothing else", `{"assigned":true}`, false},
+		// Each gate gets a row that isolates IT: a table where one row trips several
+		// gates cannot tell which one is load-bearing, and the mutant for the version
+		// check survived until this row existed.
+		{"assigned without a version",
+			`{"assigned":true,"assignment_key":"a","variant_key":"v","boundary":{"assignment_unit":"client_id"}}`, false},
+		{"assigned with version 0",
+			`{"assigned":true,"version":0,"assignment_key":"a","variant_key":"v","boundary":{"assignment_unit":"client_id"}}`, false},
+		{"assigned without a variant key",
+			`{"assigned":true,"version":1,"assignment_key":"a","boundary":{"assignment_unit":"client_id"}}`, false},
+		{"assigned without an assignment unit",
+			`{"assigned":true,"version":1,"assignment_key":"a","variant_key":"v"}`, false},
+		{"assigned with an unknown unit",
+			`{"assigned":true,"version":1,"assignment_key":"a","variant_key":"v","boundary":{"assignment_unit":"made_up"}}`, false},
+		{"a complete assigned verdict",
+			`{"assigned":true,"version":1,"assignment_key":"a","variant_key":"v","boundary":{"assignment_unit":"client_id"}}`, true},
+		{"an unassigned reason outside the set",
+			`{"assigned":false,"reason":"because"}`, false},
+		{"an unassigned reason inside it",
+			`{"assigned":false,"reason":"kill_switch"}`, true},
 	} {
 		suppliedValues = []string{"assigned"}
 		got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n" + c.body)))
@@ -4179,6 +4204,49 @@ func TestTheCacheProvenanceMirrorsTheParsersCondition(t *testing.T) {
 		}
 		if saw != c.refused {
 			t.Errorf("%s: refused=%v, want %v", c.name, saw, c.refused)
+		}
+	}
+}
+
+// TestTheAmbiguityNeedsTheAbsenceOfOtherDirectives: Go synthesises the cache
+// directive only when the `Cache-Control` map key is ENTIRELY absent, so any other
+// `Cache-Control` field in the block proves the parser wrote none of them
+// (shardpilot/shardpilot-go#84 review).
+func TestTheAmbiguityNeedsTheAbsenceOfOtherDirectives(t *testing.T) {
+	t.Cleanup(func() { structuralSurfaces = nil })
+	for _, c := range []struct {
+		name, head string
+		refused    bool
+	}{
+		{"one directive, the parser's shape", "Pragma: no-cache\r\nCache-Control: no-cache", true},
+		{"a second directive proves receipt", "Pragma: no-cache\r\nCache-Control: max-age=0\r\nCache-Control: no-cache", false},
+	} {
+		structuralSurfaces = nil
+		dropFraming("HTTP/1.1 200 OK\r\n" + c.head + "\r\n\r\n")
+		var saw bool
+		for _, r := range structuralSurfaces {
+			if strings.Contains(r, "provenance this build cannot establish") {
+				saw = true
+			}
+		}
+		if saw != c.refused {
+			t.Errorf("%s: refused=%v, want %v", c.name, saw, c.refused)
+		}
+	}
+}
+
+// TestTheInterimSectionSaysWhatItCannotShow: `net/http` deletes `Connection` from
+// an interim's headers before the callback, so the reconstruction omits a field the
+// endpoint sent — the section's own prose has to say so rather than present the
+// block as the interim's headers (shardpilot/shardpilot-go#84 review).
+func TestTheInterimSectionSaysWhatItCannotShow(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("the scene cannot read its own subject: %v", err)
+	}
+	for _, want := range []string{"PARSER CONSUMED", "headers THE CALLBACK WAS GIVEN"} {
+		if !strings.Contains(string(src), want) {
+			t.Errorf("the interim section does not qualify its claim: %q missing", want)
 		}
 	}
 }

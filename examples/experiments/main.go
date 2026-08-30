@@ -675,8 +675,11 @@ func renderExchanges(report *strings.Builder, exchanges []exchange) {
 				"`http.StatusText`, not received: a custom reason phrase the endpoint "+
 				"sent is replaced by the registered one, and on HTTP/2 no textual status "+
 				"line was received at all. The header block is likewise re-serialised "+
-				"from the parsed fields. What this section is evidence of is the CODE "+
-				"and the HEADERS; the bytes are ours, exactly as in the response section "+
+				"from the parsed fields, and a field the PARSER CONSUMED is not among them: "+
+				"transfer processing runs before this callback and removes `Connection`, "+
+				"so an interim that carried it is reconstructed without it. What this "+
+				"section is evidence of is the CODE and the headers THE CALLBACK WAS GIVEN "+
+				"; the bytes are ours, exactly as in the response section "+
 				"below. A report without it would omit a status and headers the endpoint "+
 				"did send.\n\n%s\n", label, fencedBlock(asCaptured(scrubSupplied(dropFraming(info)))))
 		}
@@ -1046,10 +1049,69 @@ type sdkAssignmentWire struct {
 // direction this file refuses in.
 func sdkWouldParseAssignment(body string) bool {
 	var wire sdkAssignmentWire
-	if json.Unmarshal([]byte(body), &wire) != nil {
+	if json.Unmarshal([]byte(body), &wire) != nil || wire.Assigned == nil {
 		return false
 	}
-	return wire.Assigned != nil
+	// ⚠ AND EVERY SEMANTIC GATE AFTER THE UNMARSHAL, not just the typed decode. The
+	// SDK keeps validating: echoed identity, a version that decodes to a number, and
+	// on the assigned branch a version of at least 1, non-empty assignment and variant
+	// keys, an assignment unit from a closed set, and a subject-fact key matching its
+	// pattern; on the unassigned branch a reason from a closed set. `{"assigned":true}`
+	// alone is type-correct and is NOT a verdict -- exempting its members marked a
+	// supplied `assigned` as generated (shardpilot/shardpilot-go#84 review).
+	//
+	// Mirrored from `parseExperimentVerdict`, and the drift guard for the SHAPE is
+	// TestTheMirroredWireShapeMatchesTheSDKs; these gates are prose in that function
+	// and have no such derivation, which is stated here rather than implied.
+	echoed := func(raw json.RawMessage) bool {
+		if raw == nil {
+			return true
+		}
+		var v string
+		return json.Unmarshal(raw, &v) == nil
+	}
+	if !echoed(wire.AppKey) || !echoed(wire.EnvironmentKey) || !echoed(wire.ExperimentKey) {
+		return false
+	}
+	var version *int64
+	if wire.Version != nil {
+		if json.Unmarshal(wire.Version, &version) != nil || version == nil {
+			return false
+		}
+	}
+	if *wire.Assigned {
+		if version == nil || *version < 1 {
+			return false
+		}
+		if strings.TrimSpace(wire.AssignmentKey) == "" || strings.TrimSpace(wire.VariantKey) == "" {
+			return false
+		}
+		unit, _ := wire.Boundary["assignment_unit"].(string)
+		switch unit {
+		case "synthetic_subject_key", "client_id":
+		default:
+			return false
+		}
+		if sfk := strings.TrimSpace(wire.SubjectFactKey); sfk != "" &&
+			!regexp.MustCompile(`^sfk1_[0-9a-f]{64}$`).MatchString(sfk) {
+			return false
+		}
+		return true
+	}
+	reason := ""
+	if wire.Reason != nil {
+		var decoded *string
+		if json.Unmarshal(wire.Reason, &decoded) != nil || decoded == nil {
+			return false
+		}
+		reason = *decoded
+	}
+	switch reason {
+	case "", "kill_switch", "targeting_unmatched":
+	default:
+		return false
+	}
+	return version == nil || *version >= 1
 }
 
 // topLevelExemptions picks the registry a body of this status is described by.
@@ -1488,7 +1550,14 @@ func dropFraming(dump string) string {
 	// list produced a false refusal from my check (shardpilot/shardpilot-go#84
 	// review). A guard mirroring another program's behaviour is only right where it
 	// mirrors the CONDITION, not the vocabulary.
+	// ⚠ A SECOND Cache-Control FIELD PROVES THE FIRST WAS RECEIVED. Go synthesises
+	// the directive only when the map key is ENTIRELY ABSENT, so any other
+	// `Cache-Control` in the block means the parser wrote none of them -- and my check
+	// withheld captures where the endpoint had legitimately sent several
+	// (shardpilot/shardpilot-go#84 review). Ambiguity is about what CANNOT be
+	// established, and here something establishes it.
 	pragmaNoCache, cacheNoCache, sawPragma := false, false, false
+	cacheCount := 0
 	for _, l := range lines {
 		if strings.TrimSuffix(l, "\r") == "" {
 			break
@@ -1504,12 +1573,14 @@ func dropFraming(dump string) string {
 				pragmaNoCache = true
 			}
 		}
-		if strings.HasPrefix(low, "cache-control:") &&
-			strings.TrimSpace(strings.TrimPrefix(low, "cache-control:")) == "no-cache" {
-			cacheNoCache = true
+		if strings.HasPrefix(low, "cache-control:") {
+			cacheCount++
+			if strings.TrimSpace(strings.TrimPrefix(low, "cache-control:")) == "no-cache" {
+				cacheNoCache = true
+			}
 		}
 	}
-	if pragmaNoCache && cacheNoCache {
+	if pragmaNoCache && cacheNoCache && cacheCount == 1 {
 		noteStructural("a Cache-Control field whose provenance this build cannot establish")
 	}
 	out := make([]string, 0, len(lines))
@@ -1909,6 +1980,17 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 			// per interim BLOCK is the same sentence one surface along.
 			line := marked(fmt.Sprintf("HTTP/1.1 %d %s", code, http.StatusText(code))) +
 				"\r\n" + escapeMarks(b.String())
+			// ⚠ `net/http` DELETES `Connection` FROM AN INTERIM'S HEADERS BEFORE THIS
+			// CALLBACK. Transfer processing runs first, so a 1xx that carried
+			// `Connection: close` reaches here without it: this lookup says false and the
+			// reconstructed block silently omits a field the endpoint sent, while the
+			// report presents the block as evidence of the interim headers
+			// (shardpilot/shardpilot-go#84 review).
+			//
+			// The field cannot be recovered from here, so the block is QUALIFIED rather
+			// than claimed complete: a note is emitted with it, and the section's prose
+			// says the same. Refusing every interim instead would cost the record for a
+			// field that is usually absent.
 			_, hadConn := h["Connection"]
 			if len(infos) >= maxInterimResponses || infoBytes+len(line) > maxInterimBytes {
 				infoOverflow = true
