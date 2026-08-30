@@ -10,6 +10,7 @@ import (
 	"errors"
 	"go/ast"
 	"go/parser"
+	"go/printer"
 	"go/token"
 	"io"
 	"mime"
@@ -1717,11 +1718,13 @@ func TestTheAuthorityIsNotAParameterName(t *testing.T) {
 	if strings.Contains(got, "control") {
 		t.Fatalf("a supplied identifier equal to the authority was published: %q", got)
 	}
-	// ⚠ AND A NAME THE HARNESS REALLY SENT IS STILL VOUCHED FOR.
+	// ⚠ AND A NAME THE HARNESS REALLY SENT IS STILL VOUCHED FOR **IN ITS OWN
+	// REQUEST**. The registry answers for what we sent, so it does not reach a
+	// `Location` (shardpilot/shardpilot-go#85 review).
 	requestNames = map[string]bool{"control": true}
-	got = stripMarks(scrubSupplied(redactTarget("Location: /cb?control=x")))
+	got = stripMarks(scrubSupplied(redactQuery("GET /cb?control=x HTTP/1.1")))
 	if !strings.Contains(got, "control=") {
-		t.Fatalf("a parameter name the harness sent was scrubbed: %q", got)
+		t.Fatalf("a parameter name the harness sent was scrubbed from its own request: %q", got)
 	}
 }
 
@@ -1971,11 +1974,19 @@ func TestAQueryNameIsComparedExactly(t *testing.T) {
 	if strings.Contains(got, "experiment_key") {
 		t.Fatalf("a padded endpoint spelling was vouched for and published: %q", got)
 	}
-	// ⚠ AND THE EXACT NAME IS STILL VOUCHED FOR, or the repair scrubs the SDK's
-	// own wire contract.
-	got = stripMarks(scrubSupplied(redactTarget("Location: /cb?experiment_key=x")))
+	// ⚠ AND THE EXACT NAME IS STILL VOUCHED FOR **IN OUR OWN REQUEST**, or the
+	// repair scrubs the SDK's wire contract. The registry records the names the
+	// harness SENT, so it answers for the request line and not for a `Location` the
+	// endpoint chose -- this half used to be asserted on the endpoint's URL, which
+	// is the defect the sibling thread names (shardpilot/shardpilot-go#85 review).
+	got = stripMarks(scrubSupplied(redactQuery("GET /cb?experiment_key=x HTTP/1.1")))
 	if !strings.Contains(got, "experiment_key") {
-		t.Fatalf("a name the harness sent was scrubbed: %q", got)
+		t.Fatalf("a name the harness sent was scrubbed from its own request: %q", got)
+	}
+	// And the same name in the ENDPOINT's target is not ours.
+	got = stripMarks(scrubSupplied(redactTarget("Location: /cb?experiment_key=x")))
+	if strings.Contains(got, "?experiment_key=") {
+		t.Fatalf("an endpoint's query name was vouched as ours: %q", got)
 	}
 }
 
@@ -2978,8 +2989,11 @@ func TestOnlyOurOwnQueryEscapingIsVouched(t *testing.T) {
 		suppliedValues = nil
 		requestNames = map[string]bool{}
 	})
-	got := stripMarks(scrubSupplied(dropFraming(
-		"HTTP/1.1 302 Found\r\nLocation: https://e.example/cb?experiment%5Fkey=x\r\n\r\n")))
+	// ⚠ ON OUR OWN REQUEST LINE. The registry answers for what the harness SENT, so
+	// the "printed in our spelling" half belongs to the request dump; asserting it on
+	// a `Location` was the provenance confusion the sibling thread names
+	// (shardpilot/shardpilot-go#85 review).
+	got := stripMarks(scrubSupplied(redactQuery("GET /cb?experiment%5Fkey=x HTTP/1.1")))
 	if !strings.Contains(got, "experiment_key") {
 		t.Fatalf("a name this program owns was lost instead of being printed in our spelling: %q", got)
 	}
@@ -3829,30 +3843,44 @@ func TestCertificateNamesAreNeverTaken(t *testing.T) {
 		{"configured.example"},
 		nil,
 	}
+	// ⚠ BOTH SHAPES, AND THE VALUE IS THE ONE THAT OCCURS. This scene built only
+	// `&x509.HostnameError{…}`; `crypto/x509` returns the error BY VALUE, so every
+	// row here exercised a shape the verifier never produces and the branch that
+	// handles the real one was unreachable and unmeasured -- deleting it broke no
+	// scene (shardpilot/shardpilot-go#85 review). A fixture that constructs the
+	// subject itself can construct one that does not occur.
 	for _, names := range sans {
-		structuralSurfaces, accountedSurfaces = nil, nil
-		suppliedValues = nil
-		err := &url.Error{Op: "Get", URL: "https://configured.example/x",
-			Err: &tls.CertificateVerificationError{
-				Err: &x509.HostnameError{
+		for _, byValue := range []bool{false, true} {
+			structuralSurfaces, accountedSurfaces = nil, nil
+			suppliedValues = nil
+			var inner error = &x509.HostnameError{
+				Certificate: &x509.Certificate{DNSNames: names},
+				Host:        "configured.example",
+			}
+			if byValue {
+				inner = x509.HostnameError{
 					Certificate: &x509.Certificate{DNSNames: names},
 					Host:        "configured.example",
-				}}}
-		out := stripMarks(sanitizeCaptured(err))
-		for _, n := range names {
-			if strings.Contains(out, n) {
-				t.Errorf("a certificate-controlled name %q reached the artifact: %q", n, out)
+				}
 			}
-		}
-		if !strings.Contains(out, "names="+strconv.Itoa(len(names))) {
-			t.Errorf("the count an operator needs is missing: %q", out)
-		}
-		// And stderr, which the guard never reads and which used to keep printing
-		// the rendered message after the report stopped.
-		errOut := sanitize(err)
-		for _, n := range names {
-			if strings.Contains(errOut, n) {
-				t.Errorf("a certificate-controlled name %q reached stderr: %q", n, errOut)
+			err := &url.Error{Op: "Get", URL: "https://configured.example/x",
+				Err: &tls.CertificateVerificationError{Err: inner}}
+			out := stripMarks(sanitizeCaptured(err))
+			for _, n := range names {
+				if strings.Contains(out, n) {
+					t.Errorf("a certificate-controlled name %q reached the artifact (byValue=%v): %q", n, byValue, out)
+				}
+			}
+			if !strings.Contains(out, "names="+strconv.Itoa(len(names))) {
+				t.Errorf("the count an operator needs is missing (byValue=%v): %q", byValue, out)
+			}
+			// And stderr, which the guard never reads and which used to keep printing
+			// the rendered message after the report stopped.
+			errOut := sanitize(err)
+			for _, n := range names {
+				if strings.Contains(errOut, n) {
+					t.Errorf("a certificate-controlled name %q reached stderr (byValue=%v): %q", n, byValue, errOut)
+				}
 			}
 		}
 	}
@@ -5190,5 +5218,148 @@ func TestErrorExemptionsApplyOnlyWhereTheEnvelopeIsRead(t *testing.T) {
 		}
 		suppliedValues = nil
 		structuralSurfaces, accountedSurfaces = nil, nil
+	}
+}
+
+// TestUnicodeSpaceIsNotJSONWhitespaceAtTheRoot is the THIRD site of the question
+// the other two fixes in this round answer, and the only one no reviewer pointed
+// at: `markBareJSONLiterals` still asks it with `strings.TrimSpace`, which eats
+// Unicode's whole space class. MEASURED, NOT ASSUMED, AND THE MEASUREMENT SAID NO:
+// deleting that early refusal republishes the STREAM case (`{"x":1} false` -- and
+// TestATrailingJSONValueIsNotGrammar kills that mutant) while U+00A0 stays
+// redacted, because the refusal for it is `encoding/json`'s own and not this
+// program's. So the production spelling is left alone -- there is no defect here
+// to fix -- and this scene exists to keep it that way: it fails the day a tolerant
+// pre-filter becomes the answer at the root (shardpilot/shardpilot-go#85 review).
+func TestUnicodeSpaceIsNotJSONWhitespaceAtTheRoot(t *testing.T) {
+	suppliedValues = []string{"false"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied(markBareJSONLiterals(`{"assigned":false}`+"\u00a0", assignmentTopLevel)))
+	if strings.Contains(got, ":false") {
+		t.Fatalf("a body encoding/json rejects was published as grammar: %q", got)
+	}
+	// ⚠ AND JSON'S OWN FOUR BYTES ARE STILL ADMITTED, or the rule has become a
+	// refusal to mark anything with trailing space at all.
+	got = stripMarks(scrubSupplied(markBareJSONLiterals(`{"assigned":false}`+" \t\r\n", assignmentTopLevel)))
+	if !strings.Contains(got, `"assigned":false`) {
+		t.Fatalf("a document followed by JSON whitespace was refused: %q", got)
+	}
+}
+
+// TestAUnicodeSpaceDoesNotMakeABodyParse is the other half of the whitespace
+// substitution, and the half that had no scene: `jsonParses` gates
+// `redactUnaccountedBody`, which passes an endpoint body through UNREFUSED when it
+// believes the body is one JSON document. With `TrimSpace` there, `{"x":1}`
+// followed by U+00A0 was believed -- so endpoint text in a shape this build does
+// not cover was carried into the artifact with an EMPTY refusal ledger, while
+// `encoding/json` rejects that body (shardpilot/shardpilot-go#85 review).
+//
+// ⚠ THE OBSERVABLE IS THE LEDGER, NOT THE STRING. This function refuses without
+// rewriting -- both paths return the body unchanged -- so a scene that compares
+// the returned text cannot tell the two apart, and the first draft of this one
+// could not.
+func TestAUnicodeSpaceDoesNotMakeABodyParse(t *testing.T) {
+	t.Cleanup(func() { structuralSurfaces = nil })
+
+	structuralSurfaces = nil
+	redactUnaccountedBody(`{"x":1}` + "\u00a0")
+	if len(structuralSurfaces) == 0 {
+		t.Fatalf("a body encoding/json rejects was accepted as a document, ledger empty")
+	}
+	// ⚠ AND JSON'S OWN FOUR BYTES STILL MAKE A DOCUMENT, or the rule has become a
+	// refusal of every body with trailing space.
+	structuralSurfaces = nil
+	redactUnaccountedBody(`{"x":1}` + " \t\r\n")
+	if len(structuralSurfaces) != 0 {
+		t.Fatalf("a document followed by JSON whitespace was refused: %v", structuralSurfaces)
+	}
+}
+
+// TestAVouchNeedsTheWholeWireShape: the vouch claims the SDK would call this body
+// its own verdict, and the SDK makes that claim with `json.Unmarshal` into
+// `expAssignmentWire` -- whose TYPED members are part of the answer.
+// `variant_payload` must be an object, so `{"assigned":false,"variant_payload":1,
+// "reason":"kill_switch"}` is rejected outright; the reduced mirror carrying only
+// the members this pass reads decoded it happily and vouched `reason`, and a
+// supplied `kill_switch` was skipped by both the scrub and the guard and published
+// with an empty ledger (shardpilot/shardpilot-go#85 review).
+func TestAVouchNeedsTheWholeWireShape(t *testing.T) {
+	suppliedValues = []string{"kill_switch"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false,\"variant_payload\":1,\"reason\":\"kill_switch\"}")))
+	if strings.Contains(got, "kill_switch") {
+		t.Fatalf("a body the SDK rejects vouched its `reason`: %q", got)
+	}
+	// ⚠ AND A BODY THE SDK ACCEPTS STILL VOUCHES, or the repair is a refusal to
+	// vouch anything that carries a payload at all.
+	got = stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false,\"variant_payload\":{\"a\":1},\"reason\":\"kill_switch\"}")))
+	if !strings.Contains(got, "kill_switch") {
+		t.Fatalf("the SDK's own classification was lengthened in a body it accepts: %q", got)
+	}
+}
+
+// TestTheMirroredWireShapeMatchesTheSDKs is the drift guard the mirror needs. A
+// copy of someone else's grammar has as many edges as that grammar has versions,
+// and five rounds have narrowed this predicate one member at a time. Both structs
+// are read out of the source: the day the SDK gains a member, or retypes one, this
+// fails instead of the vouch quietly answering a weaker question
+// (shardpilot/shardpilot-go#85 review).
+func TestTheMirroredWireShapeMatchesTheSDKs(t *testing.T) {
+	fset := token.NewFileSet()
+	members := func(path, name string) map[string]string {
+		f, err := parser.ParseFile(fset, path, nil, 0)
+		if err != nil {
+			t.Fatalf("the source is the oracle and %s could not be read: %v", path, err)
+		}
+		out, found := map[string]string{}, false
+		ast.Inspect(f, func(n ast.Node) bool {
+			ts, ok := n.(*ast.TypeSpec)
+			if !ok || ts.Name.Name != name {
+				return true
+			}
+			st, ok := ts.Type.(*ast.StructType)
+			if !ok {
+				return true
+			}
+			found = true
+			for _, fld := range st.Fields.List {
+				if fld.Tag == nil {
+					continue
+				}
+				tag := reflect.StructTag(strings.Trim(fld.Tag.Value, "`")).Get("json")
+				var b strings.Builder
+				if err := printer.Fprint(&b, fset, fld.Type); err != nil {
+					t.Fatalf("the member type of %q could not be rendered: %v", tag, err)
+				}
+				out[tag] = b.String()
+			}
+			return false
+		})
+		if !found {
+			t.Fatalf("the type %s is not in %s -- the derivation, not the shape, is what broke", name, path)
+		}
+		return out
+	}
+	sdk := members("../../experiments.go", "expAssignmentWire")
+	mine := members("redact.go", "sdkAssignmentWire")
+	if len(sdk) == 0 {
+		t.Fatalf("the oracle came back empty, so agreeing with it proves nothing")
+	}
+	for tag, typ := range sdk {
+		got, ok := mine[tag]
+		if !ok {
+			t.Errorf("the SDK member %q is absent from the mirror: the vouch answers a weaker question than the SDK asks", tag)
+			continue
+		}
+		if got != typ {
+			t.Errorf("member %q is %s in the SDK and %s in the mirror; the typing IS the grammar", tag, typ, got)
+		}
+	}
+	for tag := range mine {
+		if _, ok := sdk[tag]; !ok {
+			t.Errorf("the mirror carries %q, which the SDK shape does not: it would refuse bodies the SDK accepts", tag)
+		}
 	}
 }

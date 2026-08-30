@@ -143,8 +143,10 @@ func TestStructureSurvivesWhereItIsVouchedFor(t *testing.T) {
 		suppliedValues = nil
 		noteRequestName("custom_attribute_é")
 		t.Cleanup(func() { requestNames = map[string]bool{} })
-		got := stripMarks(dropFraming(
-			"HTTP/1.1 302 Found\r\nLocation: /cb?custom_attribute_%C3%A9=v\r\n\r\n"))
+		// ⚠ ON OUR OWN REQUEST LINE. The registry answers for what the harness
+		// SENT; a redirect target is the endpoint's URL and its names are its own
+		// (shardpilot/shardpilot-go#85 review).
+		got := stripMarks(redactQuery("GET /cb?custom_attribute_%C3%A9=v HTTP/1.1"))
 		if !strings.Contains(got, "custom_attribute_%C3%A9=") {
 			t.Fatalf("a harness-owned name was classified as endpoint-chosen: %q", got)
 		}
@@ -430,8 +432,7 @@ func TestVouchedForNamesSurviveTheValueScrub(t *testing.T) {
 	suppliedValues = []string{"experiment_key"}
 	noteRequestName("experiment_key")
 	t.Cleanup(func() { suppliedValues = nil; requestNames = map[string]bool{} })
-	got := stripMarks(scrubSupplied(dropFraming(
-		"HTTP/1.1 302 Found\r\nLocation: /cb?experiment_key=v\r\n\r\n")))
+	got := stripMarks(scrubSupplied(redactQuery("GET /cb?experiment_key=v HTTP/1.1")))
 	if strings.Contains(got, "<redacted") {
 		t.Fatalf("a name this program vouched for was rewritten by the value scrub: %q", got)
 	}

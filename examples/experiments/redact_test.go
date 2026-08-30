@@ -106,13 +106,37 @@ func TestSetCookieIsRedactedStructurally(t *testing.T) {
 	}
 }
 
+// The registry answers for the query WE sent. A `Location` is the endpoint's own
+// URL, so a name there matching one we sent proves nothing about who chose it --
+// and an endpoint is exactly who would choose our name to carry a value past the
+// scrub. Both halves in one scene: the same spelling, vouched for on our request
+// line and lengthened in the response target.
+func TestARequestNameDoesNotVouchForARedirectTarget(t *testing.T) {
+	noteRequestName("state")
+	t.Cleanup(func() { requestNames = map[string]bool{} })
+
+	ours := stripMarks(redactQuery("GET /cb?state=abc123 HTTP/1.1"))
+	if !strings.Contains(ours, "state=") {
+		t.Fatalf("the name we sent was not vouched for on our own request line: %q", ours)
+	}
+	theirs := stripMarks(dropFraming("HTTP/1.1 302 Found\r\nLocation: /cb?state=abc123\r\n\r\n"))
+	if strings.Contains(theirs, "state=") {
+		t.Fatalf("a request name vouched for an endpoint-chosen name in a target: %q", theirs)
+	}
+	if strings.Contains(theirs, "abc123") {
+		t.Fatalf("the value in the redirect target was published: %q", theirs)
+	}
+}
+
 func TestLocationQueryValuesAreRedacted(t *testing.T) {
 	suppliedValues = nil
 	t.Cleanup(func() { suppliedValues = nil })
-	// The harness sent both names, so both are printed; a name it did NOT send is
-	// lengthened, which the sweep fixture pins separately.
-	noteRequestName("state")
-	noteRequestName("token")
+	// ⚠ THE NAMES IN A `Location` ARE THE ENDPOINT'S, WHATEVER WE SENT. This scene
+	// registered both as request names and asserted they were printed -- which is
+	// the provenance confusion the sibling thread names: the registry answers for
+	// the OUTGOING request, and a redirect target is someone else's URL
+	// (shardpilot/shardpilot-go#85 review). Both names are lengthened now, and what
+	// this scene is really about -- the VALUES not being published -- is unchanged.
 	t.Cleanup(func() { requestNames = map[string]bool{} })
 	got := stripMarks(dropFraming("HTTP/1.1 302 Found\r\nLocation: /cb?state=abc123&token=zzz\r\n\r\n"))
 	for _, leaked := range []string{"abc123", "zzz"} {
@@ -120,8 +144,8 @@ func TestLocationQueryValuesAreRedacted(t *testing.T) {
 			t.Fatalf("a server-generated redirect value was published: %q", got)
 		}
 	}
-	if !strings.Contains(got, "state=") || !strings.Contains(got, "token=") {
-		t.Fatalf("structural redaction dropped the parameter names: %q", got)
+	if strings.Contains(got, "state=") || strings.Contains(got, "token=") {
+		t.Fatalf("an endpoint-chosen query name was published verbatim: %q", got)
 	}
 }
 
@@ -258,7 +282,10 @@ func TestQueryAndFragmentAreMeasuredSeparately(t *testing.T) {
 	t.Cleanup(func() { requestNames = map[string]bool{} })
 	got := stripMarks(dropFraming(
 		"HTTP/1.1 302 Found\r\nLocation: /cb?a=b#frag-only\r\n\r\n"))
-	if !strings.Contains(got, "a=redacted-1-chars") {
+	// The NAME is the endpoint's here and is lengthened with the value; what this
+	// scene pins is that the query value and the fragment are measured SEPARATELY,
+	// which the two placeholders still show.
+	if !strings.Contains(got, "redacted-1-chars=redacted-1-chars") {
 		t.Errorf("the query value was not measured on its own: %q", got)
 	}
 	if !strings.Contains(got, "#redacted-9-chars") {
@@ -449,5 +476,64 @@ func TestTheTargetPipelineContinuesAfterTheAuthorityIsReplaced(t *testing.T) {
 	}
 	if strings.Contains(got, "example") {
 		t.Fatalf("the supplied value survived in the authority: %q", got)
+	}
+}
+
+// TestARegistryTokenSurvivesACollision: recognition is about what a value
+// DENOTES, and a directive list denotes members of a closed registry. A supplied
+// value that happens to equal one does not make the endpoint the author of it --
+// the registered media type already had this ruling, and the directive lists did
+// not: `Cache-Control: no-store` came back as `<redacted, 8 chars>`, which is not
+// a cache-directive token, with an EMPTY refusal ledger
+// (shardpilot/shardpilot-go#85 review).
+func TestARegistryTokenSurvivesACollision(t *testing.T) {
+	t.Cleanup(func() { suppliedValues, structuralSurfaces = nil, nil })
+
+	suppliedValues, structuralSurfaces = []string{"no-store"}, nil
+	got := stripMarks(scrubSupplied(redactUnlessVerbatim("Cache-Control: no-store")))
+	if !strings.Contains(got, "no-store") {
+		t.Fatalf("a registry token was lost to a collision with a supplied value: %q", got)
+	}
+	if len(structuralSurfaces) != 0 {
+		t.Fatalf("a registry token was refused rather than vouched: %v", structuralSurfaces)
+	}
+	// ⚠ AND A NUMBER IS NOT A REGISTRY TOKEN. `max-age` admits DIGITS, so the
+	// alphabet says nothing about who chose them and no placeholder is a legal
+	// argument -- the capture is refused rather than published malformed.
+	suppliedValues, structuralSurfaces = []string{"123456"}, nil
+	got = stripMarks(scrubSupplied(redactUnlessVerbatim("Cache-Control: max-age=123456")))
+	if strings.Contains(got, "max-age=123456") {
+		t.Fatalf("a supplied number was vouched by the shape that admitted it: %q", got)
+	}
+	if len(structuralSurfaces) == 0 {
+		t.Fatalf("a value no parser accepts was published with an empty ledger: %q", got)
+	}
+}
+
+// TestAShapeAdmittedCookieAttributeIsRefusedOnCollision is the cookie half of the
+// same rule. `Max-Age` is an integer and `Expires` an HTTP-date: admitted by
+// SHAPE, and a shape says nothing about who chose the value. With a supplied
+// `123456` the fallback answered `Max-Age=redacted-6-chars`, which is not an
+// integer, and recorded nothing -- so the guard approved a cookie no parser
+// accepts (shardpilot/shardpilot-go#85 review).
+func TestAShapeAdmittedCookieAttributeIsRefusedOnCollision(t *testing.T) {
+	t.Cleanup(func() { suppliedValues, structuralSurfaces = nil, nil })
+
+	suppliedValues, structuralSurfaces = []string{"123456"}, nil
+	got := stripMarks(scrubSupplied(redactSetCookie("Set-Cookie: sid=x; Max-Age=123456")))
+	if len(structuralSurfaces) == 0 {
+		t.Fatalf("a cookie attribute no parser accepts was published with an empty ledger: %q", got)
+	}
+	// ⚠ AND AN ENUMERATED ATTRIBUTE IS DIFFERENT IN KIND. The specification LISTS
+	// `SameSite`'s values, so `Lax` is the grammar's own token whoever else also
+	// chose that string -- refusing it too would be the guard forbidding what it
+	// should allow, and three sweep rows say so.
+	suppliedValues, structuralSurfaces = []string{"Lax"}, nil
+	got = stripMarks(scrubSupplied(redactSetCookie("Set-Cookie: sid=x; SameSite=Lax")))
+	if !strings.Contains(got, "SameSite=Lax") {
+		t.Fatalf("an enumerated attribute value was lost to a collision: %q", got)
+	}
+	if len(structuralSurfaces) != 0 {
+		t.Fatalf("an enumerated attribute value was refused: %v", structuralSurfaces)
 	}
 }

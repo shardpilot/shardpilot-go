@@ -1223,13 +1223,25 @@ func newDepthWalker(body string) func(int) int {
 // "cannot be classified", so the capture was refused
 // (shardpilot/shardpilot-go#84 review). One name answering two questions turns
 // the first into the second; this is the second time in this stack.
+// ⚠ JSON'S WHITESPACE, NOT UNICODE'S. See truncationCausedTheFailure: the four
+// bytes the grammar names are the only ones a trailing-data check may skip.
+func jsonWhitespaceOnly(s string) bool {
+	return strings.Trim(s, " \t\r\n") == ""
+}
+
 func jsonParses(body string) bool {
 	d := json.NewDecoder(strings.NewReader(body))
 	var v json.RawMessage
 	if err := d.Decode(&v); err != nil {
 		return false
 	}
-	return strings.TrimSpace(body[int(d.InputOffset()):]) == ""
+	// ⚠ JSON'S FOUR WHITESPACE BYTES, NOT UNICODE'S SPACE CLASS. `TrimSpace` also
+	// eats U+00A0, which `encoding/json` rejects -- so `{}` followed by a
+	// non-breaking space read as one document while the decoder says it is not, and
+	// the body was published unchanged with no refusal
+	// (shardpilot/shardpilot-go#85 review). Second site of that substitution in this
+	// file, and both were mine.
+	return jsonWhitespaceOnly(body[int(d.InputOffset()):])
 }
 
 // topLevelMembers returns the names bound from the top-level object, which is
@@ -1341,8 +1353,17 @@ func truncationCausedTheFailure(body []byte) bool {
 	// single-document shape whether or not anything was truncated -- which is the
 	// same sentence `markBareJSONLiterals` already applies to a value STREAM, one
 	// pass along.
-	rest, _ := io.ReadAll(d.Buffered())
-	return strings.TrimSpace(string(rest)) == ""
+	// ⚠ `Buffered()` IS THE READ-AHEAD, NOT THE REMAINDER. It exposes only what the
+	// decoder happened to pull past the value, so `{}` followed by 510 spaces and
+	// then endpoint text read as "nothing but whitespace left"
+	// (shardpilot/shardpilot-go#85 review). `InputOffset` says where the value
+	// ended, and the input is right here -- the remainder is the rest of the slice.
+	//
+	// ⚠ AND JSON'S WHITESPACE IS FOUR BYTES. `strings.TrimSpace` also eats U+00A0
+	// and the rest of Unicode's space class, which `encoding/json` rejects -- so a
+	// body followed by a non-breaking space read as one document when the decoder
+	// says it is not (same review).
+	return strings.Trim(string(body[d.InputOffset():]), " \t\r\n") == ""
 }
 
 // unexcusedRefusals returns the ledger entries that no TRUNCATED attempt accounts
@@ -2482,6 +2503,23 @@ func stdErrToken(s string) (string, bool) {
 // The difference from a rule about quotes is that the refusal now fires on an
 // unknown TYPE, which is a property of this program's coverage, instead of on the
 // absence of a punctuation mark, which is a property of someone else's prose.
+// describeHostnameError renders a hostname mismatch from the value's fields. The
+// SAN list is NOT a field: `Error()` builds it from `Certificate.DNSNames`, so
+// working from the value means the names are never taken.
+func describeHostnameError(e x509.HostnameError) string {
+	names, listed := 0, false
+	if e.Certificate != nil {
+		names = len(e.Certificate.DNSNames)
+		for _, d := range e.Certificate.DNSNames {
+			if d == e.Host {
+				listed = true
+			}
+		}
+	}
+	return "x509=hostname-mismatch names=" + strconv.Itoa(names) +
+		" configured-host-listed=" + strconv.FormatBool(listed)
+}
+
 func describeTransportError(err error, depth int) (string, bool) {
 	if err == nil || depth > 8 {
 		return "", false
@@ -2540,18 +2578,20 @@ func describeTransportError(err error, depth int) (string, bool) {
 			return "", false
 		}
 		return "tls=verification " + inner, true
+	case x509.HostnameError:
+		// ⚠ THE VERIFIER RETURNS THIS BY VALUE. `crypto/x509` constructs
+		// `HostnameError{…}` and `tls.CertificateVerificationError` carries it as
+		// such, so a case naming only the POINTER never matched -- the ordinary
+		// hostname mismatch fell through to "unrecognised type", the whole capture
+		// refused with exit 4, and the summary this branch exists to emit was
+		// unreachable (shardpilot/shardpilot-go#85 review).
+		//
+		// My scene for the SAN redaction built `&x509.HostnameError{…}`, so it
+		// exercised a shape the verifier never produces. A fixture that constructs
+		// the subject itself can construct one that does not occur.
+		return describeHostnameError(e), true
 	case *x509.HostnameError:
-		names, listed := 0, false
-		if e.Certificate != nil {
-			names = len(e.Certificate.DNSNames)
-			for _, d := range e.Certificate.DNSNames {
-				if d == e.Host {
-					listed = true
-				}
-			}
-		}
-		return "x509=hostname-mismatch names=" + strconv.Itoa(names) +
-			" configured-host-listed=" + strconv.FormatBool(listed), true
+		return describeHostnameError(*e), true
 	case x509.UnknownAuthorityError:
 		return "x509=unknown-authority", true
 	case x509.CertificateInvalidError:

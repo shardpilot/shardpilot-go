@@ -85,7 +85,20 @@ var jsonMemberValue = regexp.MustCompile(
 // by its length. Names and lengths survive, because what this capture proves is
 // that the SDK built the right route with the right parameters -- never what any
 // particular subject was.
-func redactQuery(line string) string {
+// redactResponseQuery is redactQuery for a target the ENDPOINT chose.
+//
+// ⚠ THE REQUEST-NAME REGISTRY DOES NOT REACH HERE EITHER. It records the names of
+// the OUTGOING request's query, and a `Location` is the endpoint's -- so with an
+// experiment key of `experiment_key`, `Location: /cb?experiment_key=x` had that
+// endpoint-chosen name marked harness-authored and published
+// (shardpilot/shardpilot-go#85 review). Third caller of this registry to be read as
+// saying more than it does: the cookie path, then the fragment, now the response
+// query. Each was removed at the site I was shown.
+func redactResponseQuery(line string) string { return redactQueryWith(line, false) }
+
+func redactQuery(line string) string { return redactQueryWith(line, true) }
+
+func redactQueryWith(line string, oursAuthored bool) string {
 	i := strings.IndexByte(line, '?')
 	if i < 0 {
 		return line
@@ -95,7 +108,7 @@ func redactQuery(line string) string {
 	if j := strings.IndexByte(rest, ' '); j >= 0 {
 		rest, tail = rest[:j], rest[j:]
 	}
-	return head + redactPairs(rest, "", true) + tail
+	return head + redactPairs(rest, "", oursAuthored) + tail
 }
 
 // redactPairs redacts a form-encoded component list: names kept, values replaced
@@ -676,9 +689,9 @@ func redactTarget(line string) string {
 		}
 	}
 	if i := strings.IndexByte(line, '#'); i >= 0 {
-		return redactIPvFutureBody(redactZone(redactPath(redactUserinfo(redactQuery(line[:i]))))) + redactFragment(line[i:])
+		return redactIPvFutureBody(redactZone(redactPath(redactUserinfo(redactResponseQuery(line[:i]))))) + redactFragment(line[i:])
 	}
-	return redactIPvFutureBody(redactZone(redactPath(redactUserinfo(redactQuery(line)))))
+	return redactIPvFutureBody(redactZone(redactPath(redactUserinfo(redactResponseQuery(line)))))
 }
 
 // splitField cuts a header line into its name, the whitespace after the colon,
@@ -1029,6 +1042,18 @@ func redactSetCookie(line string) string {
 			// on the wire -- was reported as seven. The cookie's own value already
 			// unescaped before measuring; the attributes did not
 			// (shardpilot/shardpilot-go#85 review).
+			// ⚠ SHAPE-ADMITTED AND COLLIDING MEANS NO SPELLING IS LEFT. `Max-Age` is
+			// an integer and `Expires` an HTTP-date, so with a supplied `123456`,
+			// `Max-Age=123456` reached this fallback and was answered with a token
+			// placeholder that is not an integer -- and nothing was recorded, so the
+			// guard approved a cookie no parser accepts
+			// (shardpilot/shardpilot-go#85 review). Same rule as the admitted header
+			// value: a registry token survives a collision, a shape does not, and where
+			// no grammar-preserving replacement exists the capture is refused.
+			if verbatim && canKnown && !enumerated && canonicalSpelling(ows(av), canAttr) &&
+				scrubSuppliedRaw(ows(av)) != ows(av) {
+				noteStructural(formField, "a shape-admitted cookie attribute whose colliding value has no grammar-preserving spelling")
+			}
 			parts[i] = an + syntax("=") + tokenPlaceholder(unescapeMarks(ows(av)))
 		}
 		out += syntax(";") + strings.Join(parts, syntax(";"))
@@ -1327,6 +1352,37 @@ func verdictKey(name string) string {
 	return name
 }
 
+// sdkAssignmentWire MIRRORS `expAssignmentWire` in experiments.go MEMBER FOR
+// MEMBER -- every tag, and every Go type. The vouch below asks whether the SDK
+// would accept a body as an assignment verdict, and the SDK asks that with
+// `json.Unmarshal` into that struct: THE TYPING IS THE GRAMMAR. A reduced copy
+// carrying only the members this pass reads answers a weaker question, and
+// `{"assigned":false,"variant_payload":1,"reason":"kill_switch"}` is the
+// difference -- the SDK rejects that body because `variant_payload` is not a map,
+// while the reduced copy decoded it and vouched `reason`, so a supplied
+// `kill_switch` was skipped by BOTH the scrub and the guard and published with an
+// empty refusal ledger (shardpilot/shardpilot-go#85 review).
+//
+// ⚠ A MIRROR OF SOMEONE ELSE'S GRAMMAR HAS AS MANY EDGES AS THAT GRAMMAR HAS
+// VERSIONS. Five rounds have now narrowed this predicate one member at a time, so
+// the drift is not left to be noticed: TestTheMirroredWireShapeMatchesTheSDKs
+// reads BOTH structs out of the source and fails the day they differ. Calling the
+// SDK's own decode would need that type exported -- a change to the subject this
+// example exists to observe, which is not this program's to make.
+type sdkAssignmentWire struct {
+	AppKey         json.RawMessage `json:"app_key"`
+	EnvironmentKey json.RawMessage `json:"environment_key"`
+	ExperimentKey  json.RawMessage `json:"experiment_key"`
+	Version        json.RawMessage `json:"version"`
+	Assigned       *bool           `json:"assigned"`
+	AssignmentKey  string          `json:"assignment_key"`
+	VariantKey     string          `json:"variant_key"`
+	VariantPayload map[string]any  `json:"variant_payload"`
+	Reason         json.RawMessage `json:"reason"`
+	SubjectFactKey string          `json:"subject_fact_key"`
+	Boundary       map[string]any  `json:"boundary"`
+}
+
 func redactUnaccountedJSONValues(body string, exempt map[string]bool) string {
 	// ⚠ A PATTERN OVER MEMBER-COLON-STRING IS NOT A TRAVERSAL. The first version
 	// matched only a string immediately after a member's colon, so
@@ -1408,18 +1464,20 @@ func redactUnaccountedJSONValues(body string, exempt map[string]bool) string {
 	// is the harness's configuration plumbing rather than this pass.
 	reasonIsSDKs := false
 	{
-		var shape struct {
-			Assigned *bool           `json:"assigned"`
-			AppKey   *string         `json:"app_key"`
-			EnvKey   *string         `json:"environment_key"`
-			ExpKey   *string         `json:"experiment_key"`
-			Version  json.RawMessage `json:"version"`
-		}
-		echoed := func(v *string) bool {
-			if v == nil {
+		var shape sdkAssignmentWire
+		// Presence-aware, exactly as `expEchoMatches` states it: absent is tolerated,
+		// while a present member must be a JSON STRING and must be one this harness
+		// sent. A present non-string -- an explicit null included -- is not this
+		// contract's shape.
+		echoed := func(raw json.RawMessage) bool {
+			if raw == nil {
 				return true
 			}
-			return slices.Contains(suppliedValues, *v)
+			var v string
+			if json.Unmarshal(raw, &v) != nil {
+				return false
+			}
+			return slices.Contains(suppliedValues, v)
 		}
 		// ⚠ AND `version` IS PRESENCE-AWARE TOO. Absent is tolerated -- the
 		// traffic-gate shape carries none -- while a PRESENT one must decode to a
@@ -1433,7 +1491,7 @@ func redactUnaccountedJSONValues(body string, exempt map[string]bool) string {
 		// and the check did nothing -- and the scene said so on the first run.
 		if json.Unmarshal([]byte(view), &shape) == nil &&
 			shape.Assigned != nil && !*shape.Assigned &&
-			echoed(shape.AppKey) && echoed(shape.EnvKey) && echoed(shape.ExpKey) {
+			echoed(shape.AppKey) && echoed(shape.EnvironmentKey) && echoed(shape.ExperimentKey) {
 			versionOK := true
 			if shape.Version != nil {
 				var v *int64
@@ -2099,30 +2157,50 @@ var registeredDirectives = map[string]map[string]bool{
 // is registered for this field, and every argument is an integer or another
 // registered name. A quoted-string fails outright: that is where a free-form
 // value lives.
-func isDirectiveList(field string) func(string) bool {
+// walkDirectives answers two questions with one parser, because they are the same
+// walk with one clause different: `numericArg` decides whether a NUMBER is an
+// acceptable argument. Admission says yes -- `max-age=0` is a valid directive.
+// Vouching says no: a number constrains the ALPHABET and says nothing about who
+// chose it, which is the distinction the collision rule below turns on. Two
+// parsers would have been two grammars.
+func walkDirectives(field, v string, numericArg bool) bool {
 	known := registeredDirectives[field]
-	return func(v string) bool {
-		if known == nil || strings.Contains(v, `"`) {
+	if known == nil || strings.Contains(v, `"`) {
+		return false
+	}
+	for _, part := range strings.Split(v, ",") {
+		part = ows(part)
+		if part == "" {
 			return false
 		}
-		for _, part := range strings.Split(v, ",") {
-			part = ows(part)
-			if part == "" {
-				return false
+		name, arg, hasArg := strings.Cut(part, "=")
+		if !known[strings.ToLower(ows(name))] {
+			return false
+		}
+		if hasArg {
+			a := ows(arg)
+			if known[strings.ToLower(a)] {
+				continue
 			}
-			name, arg, hasArg := strings.Cut(part, "=")
-			if !known[strings.ToLower(ows(name))] {
+			if !numericArg || !isDigits(a) {
 				return false
-			}
-			if hasArg {
-				a := ows(arg)
-				if !isDigits(a) && !known[strings.ToLower(a)] {
-					return false
-				}
 			}
 		}
-		return true
 	}
+	return true
+}
+
+func isDirectiveList(field string) func(string) bool {
+	return func(v string) bool { return walkDirectives(field, v, true) }
+}
+
+// registryOnlyValue reports whether every token in an admitted value is a member
+// of that field's REGISTRY -- nothing in it is a free number or endpoint text.
+// Such a value is the grammar's own spelling whoever else also chose that string,
+// exactly as a registered media type is, so a collision with a supplied value does
+// not make it the endpoint's.
+func registryOnlyValue(name, v string) bool {
+	return walkDirectives(strings.ToLower(ows(name)), v, false)
 }
 
 func isTokenOnly(v string) bool {
@@ -2523,8 +2601,28 @@ func redactUnlessVerbatim(line string) string {
 		// and dropping the whole class to close a collision would have cost that. The
 		// exemption stands; what it never licensed is publishing a supplied
 		// identifier, exactly as with the redirect authority.
-		if raw := ows(value); raw == canonicalAdmitted(name, raw) && scrubSuppliedRaw(raw) == raw {
+		// ⚠ AND A REGISTRY TOKEN IS NOT MADE THE ENDPOINT'S BY A COLLISION. The
+		// clause above read "canonical AND uncollided", so a supplied `no-store`
+		// against `Cache-Control: no-store` fell through to the prose scrub and
+		// printed `Cache-Control: <redacted, 8 chars>` -- not a cache-directive
+		// token, with an EMPTY refusal ledger, and the guard approves it because a
+		// placeholder is generated (shardpilot/shardpilot-go#85 review). The
+		// registered media type already had this ruling; the directive lists did
+		// not.
+		if raw := ows(value); raw == canonicalAdmitted(name, raw) &&
+			(scrubSuppliedRaw(raw) == raw || registryOnlyValue(name, raw)) {
 			return name + ":" + strings.Replace(value, raw, vouched(raw), 1) + cr
+		}
+		// ⚠ AND WHERE THE COLLISION FALLS ON A SHAPE, THERE IS NOTHING TO PRINT.
+		// `Cache-Control: max-age=123456` against a supplied `123456` is canonical, so
+		// the substitution branch below does not fire, and no placeholder is a legal
+		// argument for `max-age`: the field's grammar admits DIGITS. That is the
+		// analogous header case to the cookie one, and the answer is the file's own --
+		// refuse the capture rather than publish a value no parser accepts with an
+		// empty ledger.
+		if raw := ows(value); raw != "" && raw == canonicalAdmitted(name, raw) &&
+			scrubSuppliedRaw(raw) != raw {
+			noteStructural(formField, "an admitted header value whose colliding part has no grammar-preserving spelling")
 		}
 		// ⚠ DECLINING TO VOUCH IS NOT DECLINING TO KEEP THE GRAMMAR. A valid
 		// NON-CANONICAL spelling that also collides fell through to the prose scrub:

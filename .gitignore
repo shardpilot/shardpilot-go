@@ -42,3 +42,8 @@ go.work.sum
 
 # the harness binary, built in place by `go build ./examples/experiments/`
 /experiments
+# ...and the same binary when the build runs FROM that directory, which is where
+# `go build ./...` puts it. The anchored rule above covers only the repo root, so
+# `git add -A` staged a NUL-carrying binary and the public-surface gate refused the
+# tree rather than scanning it.
+/examples/experiments/experiments
