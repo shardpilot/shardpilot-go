@@ -121,7 +121,9 @@ import (
 	"io"
 	"maps"
 	"net/http"
+	"net/http/httptrace"
 	"net/http/httputil"
+	"net/textproto"
 	"net/url"
 	"os"
 	"regexp"
@@ -159,6 +161,28 @@ type exchange struct {
 	// A fact about a response stored once per RUN is a fact about the last response.
 	recvConn bool
 	transErr error // set when no response arrived at all
+	// reqDumpErr is the SERIALISER's failure, which is not the transport's.
+	// `DumpRequestOut` rejects a request an operator can build -- an API key with
+	// an embedded newline makes an invalid `Authorization` value -- and the error
+	// was discarded, leaving `req` empty while the report went on to render an
+	// empty canonical request block and say the request was formed
+	// (shardpilot/shardpilot-go#84 review). A record that omits the very evidence
+	// it exists to carry must say so rather than print a blank.
+	reqDumpErr error
+	// uncompressed records that the TRANSPORT decoded the body. With
+	// `http.DefaultTransport` adding `Accept-Encoding: gzip`, a gzip response is
+	// decompressed before `RoundTrip` returns and the coding headers are removed,
+	// so `teeBody` wraps the DECODED payload -- and the section's prose called
+	// those "the received bytes" (shardpilot/shardpilot-go#84 review).
+	uncompressed bool
+	// infos are the INFORMATIONAL responses, redacted like any captured bytes. Go's
+	// transport consumes a `103 Early Hints` and exposes it only through
+	// `httptrace.ClientTrace.Got1xxResponse`, so a bare `RoundTrip` returns the
+	// final response alone -- and the report then claimed a complete captured pair
+	// while silently dropping a status and headers the endpoint had sent
+	// (shardpilot/shardpilot-go#84 review). This harness records rather than
+	// summarises; what it cannot show it must at least not omit in silence.
+	infos    [][]byte
 	captured *teeBody
 }
 
@@ -534,6 +558,90 @@ func responseText(ex *exchange) string {
 	return asCaptured(scrubSupplied(dropFraming(escapeMarks(string(ex.resp())))))
 }
 
+// renderExchanges writes the per-exchange sections.
+//
+// ⚠ EXTRACTED SO THE PROSE CAN BE READ BY A SCENE. Two findings in one round
+// were about what these sections SAY -- an empty request block under a heading
+// claiming the request was formed, and "the received bytes" for a body the
+// transport had already decoded -- and both lived where no test could reach
+// them, because this loop was inline in `main` (shardpilot/shardpilot-go#84
+// review). A claim nothing can read is a claim nothing checks.
+func renderExchanges(report *strings.Builder, exchanges []exchange) {
+	for i, ex := range exchanges {
+		label := ""
+		if len(exchanges) > 1 {
+			label = fmt.Sprintf(" %d", i+1)
+		}
+		if ex.reqDumpErr != nil {
+			// ⚠ NAMED, NOT BLANK. The serialiser refused, so there is no request
+			// evidence -- and a section that prints an empty block under a heading
+			// saying the request was formed is the artifact asserting what it does not
+			// have (shardpilot/shardpilot-go#84 review).
+			noteStructural("a request this build could not serialise for the record")
+			fmt.Fprintf(report, "## Request%s — NOT CAPTURED\n\n"+
+				"`httputil.DumpRequestOut` refused this request, so no canonical "+
+				"serialisation exists to publish. The transport's own outcome is "+
+				"reported below; this section carries no evidence and does not "+
+				"pretend to.\n\n", label)
+			continue
+		}
+		reqText := asCaptured(string(ex.req))
+		// ⚠ NOT "as the SDK sent it". DumpRequestOut serialises the request as
+		// HTTP/1.1 through a separate fake transport, BEFORE the real one
+		// negotiates a protocol. On an HTTP/2 connection the report paired a
+		// fabricated `HTTP/1.1` request line with a genuine `HTTP/2.0` status
+		// line and called the two a single wire exchange
+		// (shardpilot/shardpilot-go#73 review). The negotiated protocol is
+		// reported beside it, from the response, which is measured rather than
+		// serialised.
+		wire := ex.proto
+		if wire == "" {
+			wire = "not established — no response arrived"
+		}
+		fmt.Fprintf(report,
+			"## Request%s — canonical HTTP/1.1 representation\n\n"+
+				"Serialised by `httputil.DumpRequestOut`, which always writes HTTP/1.1. "+
+				"The connection negotiated **%s**, so this is the request's canonical form "+
+				"and its header set, not the bytes on the wire.\n\n%s\n",
+			label, wire, fencedBlock(reqText))
+		for _, info := range ex.infos {
+			// ⚠ PRINTED, NOT SUMMARISED. These arrived from the endpoint and the final
+			// response does not contain them; a pair rendered without them is a pair
+			// that omits what it saw.
+			fmt.Fprintf(report, "## Informational%s — an interim response the "+
+				"transport consumed\n\nGo delivers these only through "+
+				"`httptrace`, so the final response below does not contain them "+
+				"and a report without this section would omit a status and headers "+
+				"the endpoint sent.\n\n%s\n", label, fencedBlock(asCaptured(string(info))))
+		}
+		switch {
+		case ex.transErr != nil:
+			fmt.Fprintf(report, "## Response%s\n\nNONE — the request was formed and no "+
+				"response arrived: %s\n\n", label, transportErrorLine(ex.transErr))
+		case ex.truncErr() != nil:
+			body := responseText(&ex)
+			fmt.Fprintf(report, "## Response%s — INCOMPLETE, and the SDK was told so\n\n"+
+				"The body is not established as whole (%v). What arrived is below; it "+
+				"is NOT a complete response.\n\n%s\n%s\n",
+				label, incompleteBodyLine(&ex), fencedBlock(body), ex.trailerReport())
+		default:
+			respText := responseText(&ex)
+			coding := ""
+			if ex.uncompressed {
+				// ⚠ THE TRANSPORT DECODED IT, SO THE PROSE MUST NOT SAY OTHERWISE.
+				coding = "\n\n**The body below was DECODED BY THE TRANSPORT.** " +
+					"`http.Transport` added `Accept-Encoding: gzip` on its own, " +
+					"decompressed the response and removed the coding headers before " +
+					"this recorder saw it, so what follows is the payload delivered to " +
+					"the SDK, not the bytes on the wire, and the header block is missing " +
+					"a `Content-Encoding` the endpoint did send."
+			}
+			fmt.Fprintf(report, respSection+"%s\n", label,
+				fencedBlock(respText), ex.trailerReport(), coding)
+		}
+	}
+}
+
 // respSection is the response section's prose, named rather than inlined so the
 // fixture that checks what it CLAIMS reads the same bytes the report prints. A
 // test carrying its own copy of the sentence would pass while the report says
@@ -742,21 +850,56 @@ func fieldNameOf(low string) (string, bool) {
 // SDK source and compares both directions, so this cannot drift again without a
 // scene going red -- the registry is a literal because the type is unexported and
 // out of this package's reach, but it is no longer an unchecked one.
-var benignTopLevel = map[string]bool{
+// assignmentTopLevel are the members of the SDK's ASSIGNMENT response, and
+// errorTopLevel those of its error response. They are separate because a name is
+// fixed in ONE shape: `error` is grammar in a 401 body and endpoint-chosen text in
+// a 200 assignment, and marking every known name in every object published a
+// supplied `error` out of `{"assigned":false,"error":"x"}`
+// (shardpilot/shardpilot-go#84 review). A registry's SHAPE is part of what it
+// says, exactly as its depth was two rounds ago.
+var assignmentTopLevel = map[string]bool{
 	"assigned": true, "variant_key": true, "variant_payload": true,
 	"version": true, "reason": true, "boundary": true,
 	"experiment_key": true, "assignment_key": true,
-	// AND THE ONES THE SDK ITSELF ACCEPTS: a `401` body is
-	// `{"error":"unauthorized"}` and a failure verdict carries `code`. These two
-	// belong to a DIFFERENT wire shape than the assignment, which is why the
-	// scene names them explicitly rather than deriving them.
-	// ⚠ `code` IS NOT AMONG THEM, THOUGH IT WAS. It is a member of no top-level
-	// shape: the ingest error envelope spells it `error.code`, nested, and the
-	// assignment struct has no such member -- the SDK synthesizes its `Code` from
-	// the HTTP outcome (shardpilot/shardpilot-go#85 review, and the same defect
-	// stands here). Exempting it marked an endpoint-controlled member name as
-	// generated grammar, which is the `attributes` finding one name along.
-	"error": true, "app_key": true, "environment_key": true,
+	"app_key": true, "environment_key": true,
+}
+
+// ⚠ `code` IS NOT AMONG THEM. It is a member of no top-level shape: the ingest
+// error envelope spells it `error.code`, nested, and the assignment struct has no
+// such member -- the SDK synthesizes its `Code` from the HTTP outcome
+// (shardpilot/shardpilot-go#85 review).
+var errorTopLevel = map[string]bool{"error": true}
+
+// benignTopLevel answers a DIFFERENT question: is this member name one this build
+// knows at all. That question is asked to REFUSE an unfamiliar member, so its
+// answer must be the union -- narrowing it there would refuse a legitimate name
+// from the other shape. Marking asks whether the name is grammar HERE, and takes
+// the shape-specific set. One name for two questions is how the first became the
+// second.
+var benignTopLevel = func() map[string]bool {
+	m := map[string]bool{}
+	for k := range assignmentTopLevel {
+		m[k] = true
+	}
+	for k := range errorTopLevel {
+		m[k] = true
+	}
+	return m
+}()
+
+// topLevelExemptions picks the registry a body of this status is described by.
+//
+// An unparsable status line takes the ASSIGNMENT set: this harness fetches
+// assignments, and a head this program cannot read is not a licence to exempt the
+// error shape's names.
+func topLevelExemptions(statusLine string) map[string]bool {
+	f := strings.Fields(strings.TrimSuffix(statusLine, "\r"))
+	if len(f) >= 2 && strings.HasPrefix(f[0], "HTTP/") {
+		if n, err := strconv.Atoi(f[1]); err == nil && n >= 400 {
+			return errorTopLevel
+		}
+	}
+	return assignmentTopLevel
 }
 
 var mintedNames = map[string]bool{
@@ -1253,11 +1396,15 @@ func dropFraming(dump string) string {
 	// nothing while the pattern that permits the whitespace sat right there --
 	// and the value is server-minted, so the guard behind this cannot see it
 	// either (shardpilot/shardpilot-go#73 review).
+	exemptions := assignmentTopLevel
+	if len(out) > 0 {
+		exemptions = topLevelExemptions(out[0])
+	}
 	if bodyStart < 0 {
 		return strings.Join(out, "\n")
 	}
 	return strings.Join(out[:bodyStart], "\n") + "\n" +
-		markBareJSONLiterals(noteMinted(strings.Join(out[bodyStart:], "\n")))
+		markBareJSONLiterals(noteMinted(strings.Join(out[bodyStart:], "\n")), exemptions)
 }
 
 type recorder struct {
@@ -1341,15 +1488,47 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	if dump, err := httputil.DumpRequestOut(req, true); err == nil {
 		ex.req = redact([]byte(escapeMarks(string(dump))))
+	} else {
+		ex.reqDumpErr = err
 	}
 
-	resp, err := r.inner.RoundTrip(req)
+	// ⚠ A COPY, AND ONLY FOR THE INNER CALL. A RoundTripper must not modify the
+	// request it is given; `WithContext` yields a shallow copy, and an existing
+	// trace is COMPOSED with rather than replaced, so a caller's own hooks keep
+	// firing.
+	var infoMu sync.Mutex
+	var infos [][]byte
+	traced := req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		Got1xxResponse: func(code int, h textproto.MIMEHeader) error {
+			var b strings.Builder
+			fmt.Fprintf(&b, "HTTP/1.1 %d %s\r\n", code, http.StatusText(code))
+			names := make([]string, 0, len(h))
+			for k := range h {
+				names = append(names, k)
+			}
+			sort.Strings(names)
+			for _, k := range names {
+				for _, v := range h[k] {
+					fmt.Fprintf(&b, "%s: %s\r\n", k, v)
+				}
+			}
+			b.WriteString("\r\n")
+			infoMu.Lock()
+			infos = append(infos, redact([]byte(escapeMarks(b.String()))))
+			infoMu.Unlock()
+			return nil
+		},
+	}))
+	resp, err := r.inner.RoundTrip(traced)
 	if err != nil {
 		// DNS, TLS, connection setup: the request was formed but nothing came
 		// back. Recorded as an attempt WITH NO RESPONSE rather than dropped,
 		// because a recorder that keeps the request and loses the failure lets
 		// the program print a pair whose second half never existed.
 		ex.transErr = err
+		infoMu.Lock()
+		ex.infos = infos
+		infoMu.Unlock()
 		r.mu.Lock()
 		r.exchanges = append(r.exchanges, ex)
 		r.mu.Unlock()
@@ -1405,6 +1584,10 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 	if d, derr := httputil.DumpResponse(resp, false); derr == nil {
 		ex.head = d
 	}
+	infoMu.Lock()
+	ex.infos = infos
+	infoMu.Unlock()
+	ex.uncompressed = resp.Uncompressed
 	ex.captured = captured
 	r.mu.Lock()
 	r.exchanges = append(r.exchanges, ex)
@@ -1895,7 +2078,7 @@ func nameComponents(names string) string {
 // costs nothing to maintain: `overCaptured` already leaves generated spans alone
 // and the guard already blanks them, so both rules follow from one mark rather
 // than from two copies of a list.
-func markBareJSONLiterals(text string) string {
+func markBareJSONLiterals(text string, exempt map[string]bool) string {
 	// ⚠ PARSED, NOT GUESSED. The first version tested the bytes around the token,
 	// which marks `{"message":"saw false value"}` and `error: false` as grammar --
 	// and a marked span is skipped by BOTH the scrub and the guard, so the
@@ -2010,7 +2193,7 @@ func markBareJSONLiterals(text string) string {
 		// (shardpilot/shardpilot-go#84 review). A registry's scope is part of what it
 		// says.
 		if name, ok := tok.(string); ok && isKey && atRoot {
-			if benignTopLevel[name] || mintedNames[name] {
+			if exempt[name] || mintedNames[name] {
 				end := start + int(dec.InputOffset())
 				quoted := `"` + name + `"`
 				if end-len(quoted) >= 0 && text[end-len(quoted):end] == quoted {
@@ -3650,46 +3833,7 @@ func main() {
 		fmt.Fprintf(&report, "The SDK made **%d attempts**. All are below; the verdict is the "+
 			"last, because that is the one it acted on.\n\n", len(exchanges))
 	}
-	for i, ex := range exchanges {
-		label := ""
-		if len(exchanges) > 1 {
-			label = fmt.Sprintf(" %d", i+1)
-		}
-		reqText := asCaptured(string(ex.req))
-		// ⚠ NOT "as the SDK sent it". DumpRequestOut serialises the request as
-		// HTTP/1.1 through a separate fake transport, BEFORE the real one
-		// negotiates a protocol. On an HTTP/2 connection the report paired a
-		// fabricated `HTTP/1.1` request line with a genuine `HTTP/2.0` status
-		// line and called the two a single wire exchange
-		// (shardpilot/shardpilot-go#73 review). The negotiated protocol is
-		// reported beside it, from the response, which is measured rather than
-		// serialised.
-		wire := ex.proto
-		if wire == "" {
-			wire = "not established — no response arrived"
-		}
-		fmt.Fprintf(&report,
-			"## Request%s — canonical HTTP/1.1 representation\n\n"+
-				"Serialised by `httputil.DumpRequestOut`, which always writes HTTP/1.1. "+
-				"The connection negotiated **%s**, so this is the request's canonical form "+
-				"and its header set, not the bytes on the wire.\n\n%s\n",
-			label, wire, fencedBlock(reqText))
-		switch {
-		case ex.transErr != nil:
-			fmt.Fprintf(&report, "## Response%s\n\nNONE — the request was formed and no "+
-				"response arrived: %s\n\n", label, transportErrorLine(ex.transErr))
-		case ex.truncErr() != nil:
-			body := responseText(&ex)
-			fmt.Fprintf(&report, "## Response%s — INCOMPLETE, and the SDK was told so\n\n"+
-				"The body is not established as whole (%v). What arrived is below; it "+
-				"is NOT a complete response.\n\n%s\n%s\n",
-				label, incompleteBodyLine(&ex), fencedBlock(body), ex.trailerReport())
-		default:
-			respText := responseText(&ex)
-			fmt.Fprintf(&report, respSection, label,
-				fencedBlock(respText), ex.trailerReport())
-		}
-	}
+	renderExchanges(&report, exchanges)
 
 	last := rec.last()
 	fmt.Fprintf(&report, "## SDK verdict\n\n")

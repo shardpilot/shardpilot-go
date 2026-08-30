@@ -9,6 +9,8 @@ import (
 	"go/token"
 	"io"
 	"net/http"
+	"net/http/httptrace"
+	"net/textproto"
 	"net/url"
 	"os"
 	"reflect"
@@ -1370,13 +1372,13 @@ func TestASanitizerCreatedMarkIsNotEscaped(t *testing.T) {
 func TestATrailingJSONValueIsNotGrammar(t *testing.T) {
 	suppliedValues = []string{"false"}
 	t.Cleanup(func() { suppliedValues = nil })
-	got := stripMarks(scrubSupplied(markBareJSONLiterals(`{"x":1} false`)))
+	got := stripMarks(scrubSupplied(markBareJSONLiterals(`{"x":1} false`, assignmentTopLevel)))
 	if strings.Contains(got, "false") {
 		t.Fatalf("a supplied value was marked as grammar in a multi-value body: %q", got)
 	}
 	// ⚠ AND A REAL VERDICT BODY STILL HAS ITS GRAMMAR PROTECTED, or the repair is
 	// just a refusal to mark anything.
-	got = stripMarks(scrubSupplied(markBareJSONLiterals(`{"assigned":false}`)))
+	got = stripMarks(scrubSupplied(markBareJSONLiterals(`{"assigned":false}`, assignmentTopLevel)))
 	if !strings.Contains(got, `"assigned":false`) {
 		t.Fatalf("the literal node of an ordinary verdict body was scrubbed: %q", got)
 	}
@@ -1409,14 +1411,14 @@ func TestLeadingTextIsNotJSON(t *testing.T) {
 		`{"assigned":false} trailing`,
 		"\ufeff" + `{"assigned":false}`,
 	} {
-		got := stripMarks(scrubSupplied(markBareJSONLiterals(body)))
+		got := stripMarks(scrubSupplied(markBareJSONLiterals(body, assignmentTopLevel)))
 		if strings.Contains(got, "false") {
 			t.Fatalf("a supplied value was marked as grammar in %q: %q", body, got)
 		}
 	}
 	// ⚠ AND AN ORDINARY BODY, WITH THE WHITESPACE A SERVER ACTUALLY SENDS, still
 	// has its grammar protected — otherwise the repair is a refusal to mark.
-	got := stripMarks(scrubSupplied(markBareJSONLiterals("\n  " + `{"assigned":false}` + "\n")))
+	got := stripMarks(scrubSupplied(markBareJSONLiterals("\n  "+`{"assigned":false}`+"\n", assignmentTopLevel)))
 	if !strings.Contains(got, `"assigned":false`) {
 		t.Fatalf("the literal node of an ordinary verdict body was scrubbed: %q", got)
 	}
@@ -2304,35 +2306,24 @@ func TestAWhitespaceOnlyEncodedBodyIsStillABody(t *testing.T) {
 	structuralSurfaces = nil
 }
 
-// The exemption set is the wire object's members, and the wire object is in the
-// SDK source rather than in my memory of it.
+// The exemption sets are the wire shapes' members, read out of the SDK source.
 //
-// ⚠ A REGISTRY THAT DRIFTS IN BOTH DIRECTIONS. Two names were present that are
-// not top-level members -- `attributes`, and `assignment_unit`, which lives
-// inside `boundary` -- so a legal supplied value equal to either was vouched as
-// generated grammar and published; and `assignment_key` was absent, so a genuine
-// schema member was scrubbed out of an ordinary capture
-// (shardpilot/shardpilot-go#84 review). Both directions come from the same cause:
-// the list was recalled.
-//
-// The population is produced by parsing the struct, so a member added or removed
-// in the SDK turns this red without anyone remembering the registry exists.
+// ⚠ AND THERE IS NO ALLOWLIST BESIDE THE DERIVATION. The first version of this
+// scene derived the assignment members with `go/ast` and then wrote
+// `errorBody := {"error","code"}` by hand as "a different wire shape" -- and
+// `code` is a member of no top-level shape at all, so the derivation was right and
+// missed exactly the name that had been lifted out of it
+// (shardpilot/shardpilot-go#85 review). A list beside a derived check is where the
+// assumption the check just closed goes to live. Both shapes are read from the
+// source now.
 func TestTheTopLevelExemptionsAreExactlyTheWireMembers(t *testing.T) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "../../experiments.go", nil, 0)
 	if err != nil {
 		t.Fatalf("the SDK source is the oracle and it could not be read: %v", err)
 	}
-	wire := map[string]bool{}
-	ast.Inspect(f, func(n ast.Node) bool {
-		ts, ok := n.(*ast.TypeSpec)
-		if !ok || ts.Name.Name != "expAssignmentWire" {
-			return true
-		}
-		st, ok := ts.Type.(*ast.StructType)
-		if !ok {
-			return false
-		}
+	tags := func(st *ast.StructType) map[string]bool {
+		out := map[string]bool{}
 		for _, fld := range st.Fields.List {
 			if fld.Tag == nil {
 				continue
@@ -2341,29 +2332,87 @@ func TestTheTopLevelExemptionsAreExactlyTheWireMembers(t *testing.T) {
 			if err != nil {
 				continue
 			}
-			name, _, _ := strings.Cut(reflect.StructTag(tag).Get("json"), ",")
-			if name != "" && name != "-" {
-				wire[name] = true
+			if name, _, _ := strings.Cut(reflect.StructTag(tag).Get("json"), ","); name != "" && name != "-" {
+				out[name] = true
 			}
 		}
-		return false
-	})
-	if len(wire) == 0 {
-		t.Fatal("no members were read from expAssignmentWire: the oracle found nothing, which is not the same as finding agreement")
+		return out
 	}
-	// A DIFFERENT wire shape, named here because it is not derivable from the
-	// assignment struct: a 401 body is `{"error":...}`. `code` is deliberately NOT
-	// here -- the ingest envelope spells it `error.code`, nested, so it is a member
-	// of no top-level shape.
-	errorBody := map[string]bool{"error": true}
+	wire, errWire := map[string]bool{}, map[string]bool{}
+	ast.Inspect(f, func(n ast.Node) bool {
+		if ts, ok := n.(*ast.TypeSpec); ok && ts.Name.Name == "expAssignmentWire" {
+			if st, ok := ts.Type.(*ast.StructType); ok {
+				wire = tags(st)
+			}
+			return false
+		}
+		// The error body is an anonymous struct inside `experimentBodyErrorText`.
+		if fd, ok := n.(*ast.FuncDecl); ok && fd.Name.Name == "experimentBodyErrorText" {
+			ast.Inspect(fd, func(m ast.Node) bool {
+				if st, ok := m.(*ast.StructType); ok {
+					for k := range tags(st) {
+						errWire[k] = true
+					}
+				}
+				return true
+			})
+			return false
+		}
+		return true
+	})
+	if len(wire) == 0 || len(errWire) == 0 {
+		t.Fatalf("the oracle read %d assignment members and %d error members: finding nothing is not agreement",
+			len(wire), len(errWire))
+	}
 	for name := range wire {
-		if !benignTopLevel[name] && !mintedNames[name] {
-			t.Errorf("%q is a top-level member of expAssignmentWire and is exempted nowhere: an ordinary capture loses it", name)
+		if !assignmentTopLevel[name] && !mintedNames[name] {
+			t.Errorf("%q is a member of expAssignmentWire and is exempted nowhere: an ordinary capture loses it", name)
 		}
 	}
-	for name := range benignTopLevel {
-		if !wire[name] && !errorBody[name] {
-			t.Errorf("%q is exempted at the top level and is not a member of expAssignmentWire: a supplied value equal to it is published", name)
+	for name := range assignmentTopLevel {
+		if !wire[name] {
+			t.Errorf("%q is exempted in an assignment body and is not a member of expAssignmentWire", name)
+		}
+	}
+	for name := range errWire {
+		if !errorTopLevel[name] {
+			t.Errorf("%q is a member of the error body and is exempted nowhere", name)
+		}
+	}
+	for name := range errorTopLevel {
+		if !errWire[name] {
+			t.Errorf("%q is exempted in an error body and the SDK's error shape has no such member", name)
+		}
+	}
+}
+
+// A name fixed in one shape is endpoint text in the other.
+func TestExemptionsFollowTheResponseShape(t *testing.T) {
+	for _, c := range []struct{ supplied, head, body string }{
+		{"error", "HTTP/1.1 200 OK", `{"assigned":false,"error":"x"}`},
+		{"assigned", "HTTP/1.1 401 Unauthorized", `{"error":"unauthorized","assigned":"x"}`},
+		{"variant_key", "HTTP/1.1 500 Internal Server Error", `{"error":"boom","variant_key":"x"}`},
+	} {
+		suppliedValues = []string{c.supplied}
+		structuralSurfaces = nil
+		got := stripMarks(scrubSupplied(dropFraming(c.head + "\r\n\r\n" + c.body)))
+		if strings.Contains(got, `"`+c.supplied+`"`) {
+			t.Errorf("%s with %q supplied: the name was marked as grammar and published: %q",
+				c.head, c.supplied, got)
+		}
+		suppliedValues = nil
+		structuralSurfaces = nil
+	}
+	// And the shape's OWN names still pass, or every ordinary capture loses them.
+	for _, c := range []struct{ head, body, keep string }{
+		{"HTTP/1.1 200 OK", `{"assigned":false,"variant_key":"v"}`, "variant_key"},
+		{"HTTP/1.1 401 Unauthorized", `{"error":"unauthorized"}`, "error"},
+	} {
+		suppliedValues = nil
+		structuralSurfaces = nil
+		got := stripMarks(scrubSupplied(dropFraming(c.head + "\r\n\r\n" + c.body)))
+		if !strings.Contains(got, `"`+c.keep+`"`) {
+			t.Errorf("%s: the shape's own member %q was rewritten: %q", c.head, c.keep, got)
 		}
 	}
 }
@@ -2709,4 +2758,188 @@ func TestAWrappedRunMayBeginOnAWholeLine(t *testing.T) {
 			}
 		}
 	}
+}
+
+// The section must not claim a request it does not have.
+//
+// ⚠ `DumpRequestOut` REFUSES REQUESTS AN OPERATOR CAN BUILD. An API key with an
+// embedded newline passes the nonempty and config-normalisation checks and makes
+// an invalid `Authorization` value; the serialiser's error was discarded, `req`
+// stayed empty, and the report rendered an empty canonical block under a heading
+// saying the request was formed (shardpilot/shardpilot-go#84 review). The
+// artifact exists to carry that evidence, so its absence is the one thing it must
+// not be silent about.
+func TestASectionDoesNotClaimARequestItDoesNotHave(t *testing.T) {
+	structuralSurfaces = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	var report strings.Builder
+	renderExchanges(&report, []exchange{{
+		reqDumpErr: errors.New("net/http: invalid header field value"),
+		status:     200, proto: "HTTP/1.1",
+	}})
+	got := report.String()
+	if strings.Contains(got, "the request's canonical form") {
+		t.Errorf("the report claimed a canonical request it does not have: %q", got)
+	}
+	if !strings.Contains(got, "NOT CAPTURED") {
+		t.Errorf("the report is silent about the missing request evidence: %q", got)
+	}
+	if len(structuralSurfaces) == 0 {
+		t.Error("a record with no request evidence was left publishable")
+	}
+}
+
+// The section must not call a decoded payload the received bytes.
+//
+// ⚠ `http.Transport` ADDS `Accept-Encoding: gzip` ON ITS OWN. A gzip response is
+// decompressed before `RoundTrip` returns and the coding headers are removed, so
+// `teeBody` wraps the DECODED payload -- while the section's prose called it "the
+// received bytes" and the header block is missing a `Content-Encoding` the
+// endpoint did send (shardpilot/shardpilot-go#84 review). A capture that
+// misdescribes its own provenance is worse than one that captures less.
+func TestADecodedBodyIsNotDescribedAsReceived(t *testing.T) {
+	for _, uncompressed := range []bool{true, false} {
+		var report strings.Builder
+		renderExchanges(&report, []exchange{{
+			head: []byte("HTTP/1.1 200 OK\r\n\r\n"), status: 200, proto: "HTTP/1.1",
+			uncompressed: uncompressed,
+		}})
+		got := report.String()
+		said := strings.Contains(got, "DECODED BY THE TRANSPORT")
+		if said != uncompressed {
+			t.Errorf("uncompressed=%v: the report says decoded=%v", uncompressed, said)
+		}
+	}
+}
+
+// And the recorder carries the serialiser's refusal off the request it built.
+//
+// The rows are the shapes `DumpRequestOut` rejects -- an invalid value byte and an
+// invalid name byte -- because an operator reaches them through configuration: an
+// `SP_API_KEY` with an embedded newline passes the nonempty and normalisation
+// checks and lands in `Authorization`.
+func TestTheRecorderKeepsTheSerialisersRefusal(t *testing.T) {
+	for _, c := range []struct{ name, k, v string }{
+		{"newline in a value", "Authorization", "Bearer a\nb"},
+		{"carriage return in a value", "Authorization", "Bearer a\rb"},
+		{"NUL in a value", "Authorization", "Bearer a\x00b"},
+		{"newline in a name", "Auth\norization", "x"},
+		{"a request it accepts", "Authorization", "Bearer ok"},
+	} {
+		rec := &recorder{inner: &fakeTransport{resp: &http.Response{
+			StatusCode: 200, Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+			Status: "200 OK", Header: http.Header{}, ContentLength: -1,
+			Body: io.NopCloser(strings.NewReader("")),
+		}}}
+		req, err := http.NewRequest("GET", "https://e.example"+assignmentRoute, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header[c.k] = []string{c.v}
+		if _, err := rec.RoundTrip(req); err != nil {
+			t.Fatal(err)
+		}
+		rec.mu.Lock()
+		got := rec.exchanges
+		rec.mu.Unlock()
+		if len(got) != 1 {
+			t.Fatalf("%s: the recorder kept %d exchanges", c.name, len(got))
+		}
+		refused := c.name != "a request it accepts"
+		if (got[0].reqDumpErr != nil) != refused {
+			t.Errorf("%s: reqDumpErr=%v, want refused=%v -- a discarded serialiser error leaves the section claiming a request it does not have",
+				c.name, got[0].reqDumpErr, refused)
+		}
+		if refused && len(got[0].req) != 0 {
+			t.Errorf("%s: a refused serialisation left %d bytes of request evidence", c.name, len(got[0].req))
+		}
+	}
+}
+
+// And the recorder carries both facts off the response it observed.
+func TestTheRecorderCarriesSerialiserAndCodingFacts(t *testing.T) {
+	for _, uncompressed := range []bool{true, false} {
+		rec := &recorder{inner: &fakeTransport{resp: &http.Response{
+			StatusCode: 200, Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+			Status: "200 OK", Header: http.Header{}, ContentLength: -1,
+			Uncompressed: uncompressed,
+			Body:         io.NopCloser(strings.NewReader("")),
+		}}}
+		req, err := http.NewRequest("GET", "https://e.example"+assignmentRoute, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := rec.RoundTrip(req); err != nil {
+			t.Fatal(err)
+		}
+		rec.mu.Lock()
+		got := rec.exchanges
+		rec.mu.Unlock()
+		if len(got) != 1 || got[0].uncompressed != uncompressed {
+			t.Errorf("uncompressed=%v was not carried off the response", uncompressed)
+		}
+	}
+}
+
+// An interim response the transport consumed is still something the endpoint sent.
+//
+// ⚠ GO DELIVERS 1xx ONLY THROUGH `httptrace`. A bare `RoundTrip` returns the final
+// response alone, so a `103 Early Hints` — its status and its headers — vanished
+// from a report that went on to present a complete captured pair
+// (shardpilot/shardpilot-go#84 review). This harness records rather than
+// summarises, and an omission it does not mention is the one kind it cannot make.
+//
+// The fake transport fires the trace the way the real one does, so the scene
+// exercises the installation and not a hand-built field.
+func TestAnInterimResponseIsRecordedAndPrinted(t *testing.T) {
+	inner := &traceFiringTransport{codes: []int{103, 100}, resp: &http.Response{
+		StatusCode: 200, Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1,
+		Status: "200 OK", Header: http.Header{}, ContentLength: -1,
+		Body: io.NopCloser(strings.NewReader("")),
+	}}
+	rec := &recorder{inner: inner}
+	req, err := http.NewRequest("GET", "https://e.example"+assignmentRoute, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rec.RoundTrip(req); err != nil {
+		t.Fatal(err)
+	}
+	rec.mu.Lock()
+	got := rec.exchanges
+	rec.mu.Unlock()
+	if len(got) != 1 {
+		t.Fatalf("the recorder kept %d exchanges", len(got))
+	}
+	if len(got[0].infos) != 2 {
+		t.Fatalf("the recorder kept %d interim responses, want 2 -- a status the endpoint sent was dropped", len(got[0].infos))
+	}
+	var report strings.Builder
+	renderExchanges(&report, got)
+	out := report.String()
+	for _, want := range []string{"Informational", "103 Early Hints", "Link"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the report omits %q from an interim response: %q", want, out)
+		}
+	}
+}
+
+// traceFiringTransport calls Got1xxResponse the way net/http does before
+// returning the final response.
+type traceFiringTransport struct {
+	codes []int
+	resp  *http.Response
+}
+
+func (t *traceFiringTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if tr := httptrace.ContextClientTrace(req.Context()); tr != nil && tr.Got1xxResponse != nil {
+		for _, c := range t.codes {
+			h := textproto.MIMEHeader{"Link": []string{"</s.css>; rel=preload"}}
+			if err := tr.Got1xxResponse(c, h); err != nil {
+				return nil, err
+			}
+		}
+	}
+	r := *t.resp
+	return &r, nil
 }
