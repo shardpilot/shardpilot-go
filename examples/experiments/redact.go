@@ -127,6 +127,30 @@ func noteRequestName(n string) { requestNames[ows(n)] = true }
 
 func nameIsOurs(n string) bool { return requestNames[ows(n)] }
 
+// nameIsOursExactly is nameIsOurs WITHOUT the HTTP-whitespace trim, for positions
+// where a space is data rather than layout.
+//
+// ⚠ OWS IS A HEADER RULE, AND A QUERY NAME IS NOT A HEADER. `%20experiment_key%20`
+// decodes to ` experiment_key `, which `ows` trimmed to the harness-owned name --
+// so the ENTIRE endpoint spelling was marked generated, and with a supplied
+// experiment key of `experiment_key` both the scrub and the guard skipped it and
+// published a reconstructable identifier (shardpilot/shardpilot-go#85 review).
+// Borrowing a normalisation from the wrong grammar is how a vouching rule vouches
+// for something nobody sent.
+func nameIsOursExactly(n string) bool { return requestNames[n] }
+
+// syntax marks a delimiter THIS PROGRAM emitted while reconstructing a redacted
+// line, so the supplied-value scrub cannot replace it.
+//
+// ⚠ A SUPPLIED IDENTIFIER MAY LEGALLY BE A DELIMITER. An experiment key of `;`,
+// `?`, `&` or `..` is a string like any other, and the redactors deliberately keep
+// those bytes — then handed them to the generic scrub, which turned them into
+// prose placeholders the guard approves: JSON that no longer parses, a cookie
+// whose attribute is no longer separated, a Location no longer parent-relative
+// (shardpilot/shardpilot-go#85 review). Same rule as every admitted token, arriving
+// on characters: what this program emits as STRUCTURE must be marked as structure.
+func syntax(s string) string { return marked(s) }
+
 func redactPairs(rest, opaqueNameBytes string) string {
 	parts := strings.Split(rest, "&")
 	for k, p := range parts {
@@ -175,7 +199,7 @@ func redactPairs(rest, opaqueNameBytes string) string {
 		// URI invalid, and the guard refused every capture besides
 		// (shardpilot/shardpilot-go#85 review). Vouching for a name and then
 		// letting another rule redact it is not vouching.
-		if nameIsOurs(queryDecoded(name)) {
+		if nameIsOursExactly(queryDecoded(name)) {
 			name = marked(name)
 		} else {
 			// ⚠ MARKED, NOT STRIPPED. Stripping the provenance marks to keep the
@@ -185,7 +209,7 @@ func redactPairs(rest, opaqueNameBytes string) string {
 			// is generated text wherever it sits.
 			name = tokenPlaceholder(queryDecoded(name))
 		}
-		parts[k] = name + "=" + tokenPlaceholder(queryDecoded(p[eq+1:]))
+		parts[k] = name + syntax("=") + tokenPlaceholder(queryDecoded(p[eq+1:]))
 	}
 	return strings.Join(parts, "&")
 }
@@ -424,6 +448,32 @@ func vouchScheme(line string) string {
 	return line
 }
 
+// vouchTargetSyntax marks the delimiters left in a FINISHED target line.
+//
+// ⚠ APPLIED LAST, FOR THE THIRD TIME IN THIS FILE. Marking `?`, `&` and `/` where
+// they are emitted does not survive: the later stages re-split the line, and the
+// path pass replaced whole segments including the marks. Once redaction has run,
+// every delimiter still present is one this program chose to keep — every captured
+// value around them is already a placeholder — so the safe moment to say so is
+// after, not during. Same rule the media type and the scheme each taught:
+// classification runs on a document, marking runs on the result.
+func vouchTargetSyntax(line string) string {
+	head, gap, url, ok := splitField(line)
+	if !ok {
+		return line
+	}
+	var b strings.Builder
+	for i := 0; i < len(url); i++ {
+		switch url[i] {
+		case '?', '&', '=', '/', '#':
+			b.WriteString(syntax(string(url[i])))
+		default:
+			b.WriteByte(url[i])
+		}
+	}
+	return head + gap + b.String()
+}
+
 func redactTarget(line string) string {
 	// ⚠ A TARGET THAT IS NOT A URI IS NOT PARSED, IT IS WITHHELD. A raw space is
 	// illegal in a request target but transport-valid in a header, and net/http
@@ -561,6 +611,11 @@ func redactPath(line string) string {
 		// parent -- which is exactly the structure this capture exists to show
 		// (shardpilot/shardpilot-go#85 review).
 		if seg == "." || seg == ".." {
+			// Navigation segments are URI syntax this function preserves on purpose, so
+			// they are marked as such: with a supplied `..`, `../cb` became
+			// `<redacted, 2 chars>/…` -- no longer parent-relative, and approved
+			// (shardpilot/shardpilot-go#85 review).
+			segs[i] = syntax(seg)
 			continue
 		}
 		if seg != "" {
@@ -625,7 +680,7 @@ func redactSetCookie(line string) string {
 	// Measured before `escapeMarks` lengthened it, exactly as redactUnlessVerbatim
 	// does -- the structural path had kept the older behaviour
 	// (shardpilot/shardpilot-go#85 review).
-	out := head + ": " + name + "=" + placeholder(unescapeMarks(measured))
+	out := head + ": " + name + syntax("=") + placeholder(unescapeMarks(measured))
 	if hasAttrs {
 		// ⚠ ATTRIBUTE VALUES ARE SERVER-GENERATED TOO. `; Path=/reset/<token>`,
 		// or an extension attribute carrying a nonce, went through unchanged
@@ -676,7 +731,7 @@ func redactSetCookie(line string) string {
 				// rewrote its prefix into the prose form and produced a name no
 				// cookie parser accepts (shardpilot/shardpilot-go#85 review).
 				parts[i] = " " + tokenPlaceholder(ows(an)) +
-					"=" + placeholder(unescapeMarks(ows(av)))
+					syntax("=") + placeholder(unescapeMarks(ows(av)))
 				continue
 			}
 			// ⚠ CLASSIFY THE ORIGINAL NAME, THEN MARK IT. Run the other way round,
@@ -699,7 +754,7 @@ func redactSetCookie(line string) string {
 			if verbatim {
 				// The VALUE is vouched for by the same criterion that admitted it; see
 				// redactUnlessVerbatim for why admitting without marking is not admitting.
-				parts[i] = an + "=" + strings.Replace(av, ows(av), vouched(ows(av)), 1)
+				parts[i] = an + syntax("=") + strings.Replace(av, ows(av), vouched(ows(av)), 1)
 				continue
 			}
 			// ⚠ MEASURED AS RECEIVED, NOT AS ESCAPED. `responseText` expands a
@@ -707,9 +762,9 @@ func redactSetCookie(line string) string {
 			// on the wire -- was reported as seven. The cookie's own value already
 			// unescaped before measuring; the attributes did not
 			// (shardpilot/shardpilot-go#85 review).
-			parts[i] = an + "=" + placeholder(unescapeMarks(ows(av)))
+			parts[i] = an + syntax("=") + placeholder(unescapeMarks(ows(av)))
 		}
-		out += ";" + strings.Join(parts, ";")
+		out += syntax(";") + strings.Join(parts, syntax(";"))
 	}
 	return out + cr
 }

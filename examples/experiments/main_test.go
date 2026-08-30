@@ -1917,3 +1917,23 @@ func TestBinaryCandidatesSeeTheNameForms(t *testing.T) {
 		t.Fatal("a binary decode of a header-name component was never examined")
 	}
 }
+
+// TestAQueryNameIsComparedExactly: `%20experiment_key%20` decodes to
+// ` experiment_key `, which the HTTP-whitespace trim turned into the harness-owned
+// name — so the entire endpoint spelling was marked generated and both the scrub
+// and the guard skipped it (shardpilot/shardpilot-go#85 review).
+func TestAQueryNameIsComparedExactly(t *testing.T) {
+	suppliedValues = []string{"experiment_key"}
+	requestNames = map[string]bool{"experiment_key": true}
+	t.Cleanup(func() { suppliedValues = nil; requestNames = map[string]bool{} })
+	got := stripMarks(scrubSupplied(redactTarget("Location: /cb?%20experiment_key%20=x")))
+	if strings.Contains(got, "experiment_key") {
+		t.Fatalf("a padded endpoint spelling was vouched for and published: %q", got)
+	}
+	// ⚠ AND THE EXACT NAME IS STILL VOUCHED FOR, or the repair scrubs the SDK's
+	// own wire contract.
+	got = stripMarks(scrubSupplied(redactTarget("Location: /cb?experiment_key=x")))
+	if !strings.Contains(got, "experiment_key") {
+		t.Fatalf("a name the harness sent was scrubbed: %q", got)
+	}
+}

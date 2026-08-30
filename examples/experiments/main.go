@@ -989,7 +989,7 @@ func dropFraming(dump string) string {
 			// to the generic scrub and became `<redacted, 8 chars>` -- spaces and
 			// angle brackets inside a field name, an unparsable response. The
 			// trailer path already did this (shardpilot/shardpilot-go#85 review).
-			out = append(out, vouchScheme(scrubStructuralName(redactTarget(strings.TrimSuffix(l, "\r"))))+cr)
+			out = append(out, vouchTargetSyntax(vouchScheme(scrubStructuralName(redactTarget(strings.TrimSuffix(l, "\r")))))+cr)
 			continue
 		}
 		// ⚠ AND A HEADER NAME CAN CARRY THE IDENTIFIER. `X-<key>: v` published it
@@ -1739,6 +1739,18 @@ func markBareJSONLiterals(text string) string {
 		}
 		_ = off
 		switch tok.(type) {
+		case json.Delim:
+			// ⚠ THE DELIMITERS ARE GRAMMAR TOO, and the parser is what identifies them.
+			// A supplied identifier may legally BE `{`: with that experiment key an
+			// ordinary body came back as `<redacted, 1 chars>"assigned":false}`, which
+			// the guard approved because the placeholder is generated -- published JSON
+			// that no longer parses (shardpilot/shardpilot-go#85 review). Same walk that
+			// finds the bare literals; a delimiter is one byte at the offset the decoder
+			// has just passed.
+			end := int(dec.InputOffset())
+			if end-1 >= 0 && end-1 < len(view) {
+				spans = append(spans, span{back[start+end-1], back[start+end-1] + 1})
+			}
 		case bool, nil:
 			end := int(dec.InputOffset())
 			lit := "null"

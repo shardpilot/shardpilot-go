@@ -68,6 +68,26 @@ func TestEveryVouchedTokenSurvivesTheScrub(t *testing.T) {
 		probe{"structural field name", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x\r\n\r\n", "Set-Cookie"},
 	)
 
+	// ⚠ AND THE PUNCTUATION THIS PROGRAM PRESERVES AS SYNTAX. A supplied identifier
+	// may legally BE a structural character: an experiment key of `{`, `;` or `..`
+	// is a string like any other, and the redactors deliberately keep those bytes —
+	// then handed them to the generic scrub, which replaced them with prose
+	// placeholders the guard approves, publishing JSON that no longer parses, a
+	// cookie whose attribute is no longer separated, and a Location that is no
+	// longer parent-relative (shardpilot/shardpilot-go#85 review).
+	//
+	// Same rule as every row above, arriving on characters instead of tokens: what
+	// this program emits as STRUCTURE must be marked as structure.
+	probes = append(probes,
+		probe{"JSON structure", "HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false}", "{"},
+		probe{"JSON structure", "HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false}", "}"},
+		probe{"JSON structure", "HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false,\"code\":1}", ","},
+		probe{"cookie separator", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; Secure\r\n\r\n", ";"},
+		probe{"URI dot segment", "HTTP/1.1 200 OK\r\nLocation: ../cb\r\n\r\n", ".."},
+		probe{"URI separators", "HTTP/1.1 200 OK\r\nLocation: /a/b?x=1&y=2\r\n\r\n", "?"},
+		probe{"URI separators", "HTTP/1.1 200 OK\r\nLocation: /a/b?x=1&y=2\r\n\r\n", "&"},
+	)
+
 	for _, p := range probes {
 		t.Run(p.what+"/"+p.tok, func(t *testing.T) {
 			structuralSurfaces = nil
