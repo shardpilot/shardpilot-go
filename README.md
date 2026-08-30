@@ -319,9 +319,16 @@ cp scripts/check_public_surface.sh "$h/.check_public_surface.sh.new" &&
 chmod +x "$h/.pre-push.new" "$h/.check_public_surface.sh.new" &&
 mv "$h/.pre-push.new" "$h/pre-push" &&
 mv "$h/.check_public_surface.sh.new" "$h/check_public_surface.sh" &&
-{ git config --worktree --unset-all core.hooksPath 2>/dev/null || true; } &&
+git worktree list --porcelain | awk '/^worktree /{print substr($0,10)}' |
+  while read -r w; do
+    git -C "$w" config --worktree --unset-all core.hooksPath 2>/dev/null || true
+  done &&
 git config --local core.hooksPath "$h" &&
-test "$(git rev-parse --path-format=absolute --git-path hooks)" = "$h"
+git worktree list --porcelain | awk '/^worktree /{print substr($0,10)}' |
+  while read -r w; do
+    test "$(git -C "$w" rev-parse --path-format=absolute --git-path hooks)" = "$h" ||
+      { echo "hooks still resolve elsewhere in $w" >&2; exit 1; }
+  done
 ```
 
 **Both files**, an ABSOLUTE path, published by RENAME, and `core.hooksPath` **pinned locally** rather than unset. Everything the hook executes must come from outside tracked content — the scanner as much as the hook. `--git-dir` names the per-worktree directory in a linked worktree while git reads hooks from the common one. And an unqualified `--unset` cannot clear a *global* or *system* `core.hooksPath`: with one inherited, git keeps resolving hooks from there and the gate is never invoked. A local setting overrides an inherited one — but NOT a worktree-scoped one.
@@ -332,6 +339,13 @@ on running the previous hook directory, or none. The worktree value is cleared
 first, and the last line VERIFIES the effective path rather than trusting the
 write: an installation that cannot show git resolving hooks where it put them has
 not installed anything.
+
+**In EVERY linked worktree, not only the one you run this in.** A worktree-scoped
+value belongs to its own worktree, so clearing the invoking one left any other
+worktree resolving its old path — and a check that asks only about the current
+worktree reports success while a push from the next one over runs no gate at all.
+Both the clearing and the verification walk `git worktree list`, and the
+verification fails loudly with the path that disagreed.
 
 ⚠ TWO THINGS IN THAT CHAIN ARE EASY TO READ PAST.
 

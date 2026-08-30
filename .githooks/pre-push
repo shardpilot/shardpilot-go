@@ -371,7 +371,20 @@ scan_commit() {
   # object as it will be published -- headers, message, everything -- and it is
   # staged as an ordinary file so the SAME rules read it, with no second scanner
   # and no second pattern list to drift.
-  git cat-file commit "$1" > "$tmpdir/committed-object" 2>/dev/null || : > "$tmpdir/committed-object"
+  # ⚠ A FAILED WRITE IS A REFUSAL, NOT AN EMPTY FILE. This fallback replaced
+  # partial evidence with nothing and carried on scanning, so a commit whose
+  # object exceeds a limit the hook inherits -- a large benign message prefix with
+  # prohibited metadata after the cut -- passed, while git still transferred the
+  # WHOLE object through the push pipe (shardpilot/shardpilot-go#79 review). Same
+  # shape as the scanner copy fixed one round earlier: a failure that produces a
+  # readable artifact is the dangerous kind, because everything downstream reads
+  # it as an answer.
+  if ! git cat-file commit "$1" > "$tmpdir/committed-object" 2>/dev/null; then
+    printf 'REFUSING: the commit object for %s could not be read whole.\n' "$1" >&2
+    printf '  Scanning what was written and calling it the object would report on\n' >&2
+    printf '  a prefix while git publishes the whole of it.\n' >&2
+    exit 2
+  fi
   stage_evidence "$1" scripts/commit-object-as-committed.txt "$tmpdir/committed-object"
 
   # ⚠ AND THE REF NAME IS PUBLISHED. A clean tree, a clean object, and a branch
@@ -671,9 +684,28 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       if [ "$deref_kind" = blob ]; then
         git cat-file blob "$deref" >> "$tmpdir/tag-target" 2>/dev/null || true
       elif [ "$deref_kind" = tree ]; then
-        # Bounded: a tree tag is unusual, and an unbounded walk is a way to make
-        # the gate hang rather than refuse.
-        git ls-tree -r "$deref" 2>/dev/null | awk '$2=="blob"{print $3}' | head -256 |
+        # ⚠ THE COMMENT PROMISED A REFUSAL AND THE CODE TRUNCATED. `head -256`
+        # dropped everything past the bound in silence, so a 257-entry tree with
+        # prohibited material in the tail passed a gate that had scanned the
+        # prefix (shardpilot/shardpilot-go#79 review). A bound that is not
+        # enforced is a bound that is documented.
+        # ⚠ AND A TREE PUBLISHES ITS PATH NAMES. The pipeline kept blob ids and
+        # discarded every path, so a tag on a tree whose prohibited identifier is
+        # an ENTRY NAME, with clean blob contents, was never shown to the scanner
+        # -- the object publishes the names, and the evidence held only the bytes
+        # (same review). The listing itself is staged; the same rules read it.
+        git ls-tree -r "$deref" > "$tmpdir/tag-tree-listing" 2>/dev/null ||
+          : > "$tmpdir/tag-tree-listing"
+        entries="$( wc -l < "$tmpdir/tag-tree-listing" | tr -d ' ' )"
+        if [ "${entries:-0}" -gt 256 ]; then
+          printf 'REFUSING: the tagged tree has %s entries, past this gate'"'"'s bound of 256.\n' "$entries" >&2
+          printf '  Scanning a prefix of it and reporting clean is worse than refusing:\n' >&2
+          printf '  everything past the bound becomes publicly reachable unexamined.\n' >&2
+          exit 2
+        fi
+        cat "$tmpdir/tag-tree-listing" >> "$tmpdir/tag-target"
+        printf '\n' >> "$tmpdir/tag-target"
+        awk '$2=="blob"{print $3}' "$tmpdir/tag-tree-listing" |
           while read -r b; do
             git cat-file blob "$b" >> "$tmpdir/tag-target" 2>/dev/null || true
             printf '\n' >> "$tmpdir/tag-target"
