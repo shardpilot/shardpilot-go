@@ -612,8 +612,13 @@ while IFS=" " read -r _ lsha _ _; do
     *[!0]*) ;;
     *) continue ;;
   esac
-  otype="$(git cat-file -t "$lsha" 2>/dev/null || printf '')"
-  if [ "$otype" = commit ] || [ "$otype" = tag ]; then
+  # ⚠ AND A TAG IS A WRAPPER, SO ASK WHAT IT WRAPS. `cat-file -t` reports `tag`
+  # for an annotated tag whatever it points at, so a tag around a BLOB set
+  # `needs_head` and refused a push that introduces no commit -- the same object
+  # the branch above already handles, wrapped (shardpilot/shardpilot-go#79
+  # review). `^{commit}` peels through the wrapper and fails on a tag that does
+  # not reach one, which is the question being asked.
+  if git rev-parse --verify --quiet "$lsha^{commit}" >/dev/null 2>&1; then
     needs_head=yes
     break
   fi
@@ -1192,6 +1197,18 @@ while read -r local_ref local_sha remote_ref remote_sha; do
           unborn=yes
           base="$(git hash-object -t tree /dev/null)"
           why="the empty tree, because $safe_dest advertises no refs at all"
+        elif [ "$target_kind" != commit ]; then
+          # ⚠ AND A PUSH THAT INTRODUCES NO COMMIT ASKS NO BASELINE QUESTION. The
+          # refusal above is about GUESSING a branch name, which matters because a
+          # wrong guess yields a wrong, higher ratchet baseline. A blob or a tree has
+          # no ancestry to compare, and the eligibility branch above already reaches
+          # `eligible=yes` for one without consulting a baseline at all -- so
+          # refusing here withheld a push whose baseline is not consulted
+          # (shardpilot/shardpilot-go#79 review). The empty tree is what the
+          # no-refs-at-all branch uses for the same reason.
+          unborn=yes
+          base="$(git hash-object -t tree /dev/null)"
+          why="the empty tree, because this update introduces no commit and has no ancestry to compare"
         else
           printf 'REFUSING: %s did not advertise a default branch (HEAD symref).\n' "$safe_dest" >&2
           printf '  Guessing a name is how a fork or a rename becomes the wrong,\n' >&2
