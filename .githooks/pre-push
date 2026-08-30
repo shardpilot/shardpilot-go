@@ -523,7 +523,18 @@ scan_commit() {
     ( cd "$wt" && git_safe update-index --add \
       --cacheinfo "100755,$sblob,scripts/check_public_surface.sh" >/dev/null 2>&1 ) || true
   fi
-  ( cd "$wt" && PUBLIC_SURFACE_BASE_REF="$2" ./scripts/check_public_surface.sh )
+  # ⚠ NO BASE REF RATHER THAN A BASE THAT IS NOT A COMMIT. An empty destination has
+  # nothing to compare against, and the scanner documents an unset variable as the
+  # legal skip for exactly that; handing it the empty TREE made `^{commit}` fail and
+  # it refused every first push (shardpilot/shardpilot-go#79 review). My first
+  # repair of the unborn case substituted a value where the answer is "there is
+  # none" -- the same substitution as putting HEAD in for a tag's target, two
+  # rounds ago.
+  if git cat-file -e "$2^{commit}" 2>/dev/null; then
+    ( cd "$wt" && PUBLIC_SURFACE_BASE_REF="$2" ./scripts/check_public_surface.sh )
+  else
+    ( cd "$wt" && unset PUBLIC_SURFACE_BASE_REF && ./scripts/check_public_surface.sh )
+  fi
   rc=$?
   git_safe worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
   return $rc
@@ -665,11 +676,25 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       # the authority on what the default branch is becoming.
       branch="$(git ls-remote --symref -- "$dest" HEAD 2>/dev/null \
         | awk '$1=="ref:" && $3=="HEAD" {sub("refs/heads/","",$2); print $2; exit}')"
+      unborn=no
       if [ -z "$branch" ]; then
-        printf 'REFUSING: %s did not advertise a default branch (HEAD symref).\n' "$safe_dest" >&2
-        printf '  Guessing a name is how a fork or a rename becomes the wrong,\n' >&2
-        printf '  higher baseline.\n' >&2
-        exit 2
+        # ⚠ AN EMPTY DESTINATION HAS NO DEFAULT BRANCH, AND THAT IS NOT A REFUSAL.
+        # A bare repository just initialised advertises NOTHING -- its HEAD names an
+        # unborn branch, so `ls-remote --symref` returns no rows -- and the first
+        # push to it was refused, leaving `--no-verify` as the only way to start a
+        # repository (shardpilot/shardpilot-go#79 review). Nothing is published
+        # there, so there is no baseline to be wrong about: every introduced commit
+        # is new, and the empty tree says exactly that.
+        if [ -z "$(git ls-remote -- "$dest" 2>/dev/null | head -1)" ]; then
+          unborn=yes
+          base="$(git hash-object -t tree /dev/null)"
+          why="the empty tree, because $safe_dest advertises no refs at all"
+        else
+          printf 'REFUSING: %s did not advertise a default branch (HEAD symref).\n' "$safe_dest" >&2
+          printf '  Guessing a name is how a fork or a rename becomes the wrong,\n' >&2
+          printf '  higher baseline.\n' >&2
+          exit 2
+        fi
       fi
       # ⚠ A UNIQUE REF PER INVOCATION. Resolving a shared ref "immediately"
       # after fetching it is still two commands, and a concurrent push can land
@@ -683,6 +708,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       # (shardpilot/shardpilot-go#79 review). The name carries the tmpdir's random
       # component, which mktemp guarantees is unused, and cleanup removes the ref
       # only after this hook has actually created it.
+      if [ "$unborn" = no ]; then
       base_ref="refs/prepush-base-$$-${tmpdir##*/}"
       if git rev-parse --verify --quiet "$base_ref" >/dev/null 2>&1; then
         printf 'REFUSING: %s already exists; refusing to overwrite a ref this hook did not create.\n' \
@@ -709,6 +735,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       base="$(git rev-parse --verify --quiet "$base_ref^{commit}" || true)"
       git_safe update-ref -d "$base_ref" 2>/dev/null || true
       base_ref=""
+      fi
       incoming="$(printf '%s\n' "$pushed_lines" \
         | awk -v r="refs/heads/$branch" '$3==r {print $2; exit}')"
       # ⚠ ALL ZEROES IS A DELETION, AND IT IS HEX. One push may delete the
