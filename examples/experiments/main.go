@@ -2334,6 +2334,7 @@ func markBareJSONLiterals(text string) string {
 		}
 	}
 	dec := json.NewDecoder(strings.NewReader(view[start:]))
+	dec.UseNumber()
 	type span struct{ a, b int }
 	var spans []span
 	// ⚠ THE SCHEMA'S MEMBER NAMES ARE GRAMMAR TOO, not only its literals. A legal
@@ -2429,6 +2430,19 @@ func markBareJSONLiterals(text string) string {
 			end := int(dec.InputOffset())
 			if end-1 >= 0 && end-1 < len(view) {
 				spans = append(spans, span{back[start+end-1], back[start+end-1] + 1})
+			}
+		case json.Number:
+			// ⚠ A NUMBER IS GRAMMAR TOO. A supplied identifier may legally BE `1`, and
+			// an ordinary `{"version":1}` was scrubbed into
+			// `{"version":<redacted, 1 chars>}` -- published JSON that no longer parses,
+			// approved because the placeholder is generated
+			// (shardpilot/shardpilot-go#85 review). The literals, the delimiters and the
+			// punctuation were each given this rule in turn; the numbers are the fourth
+			// kind of token in the same grammar.
+			end := int(dec.InputOffset())
+			lit := string(tok.(json.Number))
+			if end-len(lit) >= 0 && view[start+end-len(lit):start+end] == lit {
+				spans = append(spans, span{back[start+end-len(lit)], back[start+end-1] + 1})
 			}
 		case bool, nil:
 			end := int(dec.InputOffset())
@@ -4128,6 +4142,17 @@ func main() {
 	// ⚠ AND A SURFACE THE STRUCTURAL RULES COULD NOT DESCRIBE IS THE SAME FACT AS
 	// A SURVIVING LEAK: the program cannot show the bytes are safe. Redact what
 	// you recognise, refuse what you do not.
+	// ⚠ A KNOWN TRUNCATION IS CLASSIFIED FIRST. A body read that fails after partial
+	// JSON leaves a fragment that does not parse, so the body rule records a
+	// structural refusal -- and this check then exits 4, "the redaction could not
+	// describe it", for a capture whose actual fact is exit 3, "the body did not
+	// arrive whole" (shardpilot/shardpilot-go#85 review). Two true statements, and
+	// the more specific one is the answer: the fragment is undescribable BECAUSE it
+	// is incomplete, and a consumer of these codes reads them apart.
+	if last != nil && last.truncErr() != nil {
+		fmt.Printf("\nNOT captured (exit 3) — the response body did not arrive whole.\n")
+		os.Exit(3)
+	}
 	if len(refusalLedger()) > 0 {
 		fmt.Fprintf(os.Stderr,
 			"REFUSING TO PRINT: the response carries %d server-generated surface(s) "+

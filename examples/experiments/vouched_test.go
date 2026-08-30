@@ -93,7 +93,14 @@ func TestEveryVouchedTokenSurvivesTheScrub(t *testing.T) {
 		// note in its place, so the probe never reached the criterion it was aiming
 		// at — it measured a header that does not survive to be measured. `Age` is
 		// admitted by the same numeric predicate and does survive.
-		pv("admitted header value", "HTTP/1.1 200 OK\r\nAge: 12\r\n\r\n", "12"),
+		// ⚠ THE NUMERIC ROW IS GONE FROM THIS SWEEP, and its subject moved to a scene
+		// of its own. This row supplied `12` and asserted `Age: 12` survives -- which
+		// is exactly the collision a later finding named as a leak: integer syntax
+		// constrains the alphabet and says nothing about who chose the number
+		// (shardpilot/shardpilot-go#85 review). A row that pins "a supplied numeric
+		// value is vouched" pins the defect. See
+		// TestAnAdmittedNumericValueIsNotVouchedWhenSupplied, which asserts both
+		// halves: unsupplied it is published, supplied it is not.
 		pv("admitted cookie attribute value", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; SameSite=Lax\r\n\r\n", "Lax"),
 		pv("admitted cookie attribute value", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; Max-Age=10\r\n\r\n", "10"),
 		pv("approved URI scheme", "HTTP/1.1 200 OK\r\nLocation: https://e.example/cb\r\n\r\n", "https"),
@@ -219,6 +226,25 @@ func TestNoAdmissionVouchesANonCanonicalSpelling(t *testing.T) {
 	for _, sc := range []string{"http", "https"} {
 		u := strings.ToUpper(sc)
 		addAt("URI scheme", "HTTP/1.1 302 Found\r\nLocation: "+u+"://e.example/cb\r\n\r\n", u, u+"://")
+	}
+	// ⚠ AND THE REGISTRIES THIS SWEEP DID NOT DRAW FROM. Three more vouching sites
+	// reached review with the same defect -- a registered FIELD NAME, a cookie
+	// ATTRIBUTE NAME, and a query parameter name -- because the population here was
+	// the registries I had already thought to include
+	// (shardpilot/shardpilot-go#85 review). Every predicate that folds belongs in it.
+	for _, n := range slices.Sorted(maps.Keys(registeredFieldNames)) {
+		u := strings.ToUpper(n)
+		if u == n {
+			continue
+		}
+		add("registered field name", "HTTP/1.1 200 OK\r\n"+u+": 1\r\n\r\n", u)
+	}
+	for _, a := range []string{"Path", "Max-Age", "SameSite", "Secure", "HttpOnly"} {
+		if !standardCookieAttr(a) {
+			t.Fatalf("the probe list drifted from standardCookieAttr: %q", a)
+		}
+		u := strings.ToUpper(a)
+		add("cookie attribute name", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; "+u+"=/\r\n\r\n", u)
 	}
 
 	for _, r := range rows {

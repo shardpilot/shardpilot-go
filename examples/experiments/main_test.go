@@ -2993,3 +2993,107 @@ func TestAnUnderscoreSeparatesInsideAFieldName(t *testing.T) {
 		t.Fatalf("a supplied identifier survived in a field name across an underscore: %q", got)
 	}
 }
+
+// A pattern over member-colon-string is not a traversal.
+func TestValuesNestedInArraysAreRedacted(t *testing.T) {
+	structuralSurfaces, accountedSurfaces = nil, nil
+	t.Cleanup(func() { structuralSurfaces, accountedSurfaces = nil, nil })
+	for _, body := range []string{
+		`{"variant_payload":["server-secret-token"]}`,
+		`{"variant_payload":{"note":"server-secret-token"}}`,
+		`{"variant_payload":[{"deep":["server-secret-token"]}]}`,
+	} {
+		got := stripMarks(dropFraming("HTTP/1.1 200 OK\r\n\r\n" + body))
+		if strings.Contains(got, "server-secret-token") {
+			t.Fatalf("an endpoint value survived at depth: %q", got)
+		}
+	}
+}
+
+// A value is not evidence of its author; the POSITION is.
+func TestTaxonomyIsVouchedOnlyInAVerdictField(t *testing.T) {
+	suppliedValues = []string{"kill_switch"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\n\r\n{\"variant_payload\":{\"note\":\"kill_switch\"}}")))
+	if strings.Contains(got, "kill_switch") {
+		t.Fatalf("a taxonomy-shaped payload value was vouched as this SDK's: %q", got)
+	}
+	// AND IN ITS OWN FIELD IT STILL IS: the verdict block reads that value.
+	suppliedValues = nil
+	if v := stripMarks(dropFraming(
+		"HTTP/1.1 200 OK\r\n\r\n{\"code\":\"kill_switch\"}")); !strings.Contains(v, "kill_switch") {
+		t.Fatalf("the SDK's own classification was lengthened in its own field: %q", v)
+	}
+}
+
+// Integer syntax constrains the alphabet, not the author.
+func TestAnAdmittedNumericValueIsNotVouchedWhenSupplied(t *testing.T) {
+	suppliedValues = nil
+	if got := stripMarks(dropFraming("HTTP/1.1 200 OK\r\nAge: 42\r\n\r\n{\"assigned\":false}")); !strings.Contains(got, "Age: 42") {
+		t.Fatalf("an admitted numeric field stopped being published: %q", got)
+	}
+	suppliedValues = []string{"123456"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\nAge: 123456\r\n\r\n{\"assigned\":false}")))
+	if strings.Contains(got, "123456") {
+		t.Fatalf("a supplied identifier was vouched because it looked like a number: %q", got)
+	}
+	if !strings.Contains(got, "Age: ") {
+		t.Fatalf("the field framing was lost along with the value: %q", got)
+	}
+}
+
+// A number is grammar like the literals beside it.
+func TestJSONNumbersAreGrammar(t *testing.T) {
+	suppliedValues = []string{"1"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"version\":1}")))
+	if !strings.Contains(got, `"version":1`) {
+		t.Fatalf("a supplied digit rewrote the grammar's own number: %q", got)
+	}
+}
+
+// The escape spelling must be the one this program would have sent.
+func TestOnlyOurOwnQueryEscapingIsVouched(t *testing.T) {
+	// ⚠ THE REGISTRY HAS TO CONTAIN THE NAME, or the branch under test never runs
+	// and the scene passes on a program that does not have the fix. The first
+	// version omitted this and its mutant survived.
+	noteRequestName("experiment_key")
+	suppliedValues = []string{"5F"}
+	t.Cleanup(func() {
+		suppliedValues = nil
+		requestNames = map[string]bool{}
+	})
+	got := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 302 Found\r\nLocation: https://e.example/cb?experiment%5Fkey=x\r\n\r\n")))
+	if !strings.Contains(got, "experiment_key") {
+		t.Fatalf("a name this program owns was lost instead of being printed in our spelling: %q", got)
+	}
+	if strings.Contains(got, "5F") {
+		t.Fatalf("an escape spelling this program never writes was vouched: %q", got)
+	}
+}
+
+// A known truncation is classified before the structural refusal, because both
+// are true of the same capture and the more specific one is the answer.
+//
+// ⚠ BOUND BY READING THE SOURCE, because the exit path lives in `main()` and no
+// fixture can run it -- the same gap the verdict lines have. What is checkable is
+// the ORDER, and the order is the whole of this fix.
+func TestTruncationIsClassifiedBeforeTheStructuralRefusal(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("the scene cannot read its own subject: %v", err)
+	}
+	text := string(src)
+	trunc := strings.Index(text, "last.truncErr() != nil {")
+	ledger := strings.Index(text, "if len(refusalLedger()) > 0 {")
+	if trunc < 0 || ledger < 0 {
+		t.Fatalf("one of the two checks was not found (trunc=%d ledger=%d), so this scene measures nothing", trunc, ledger)
+	}
+	if trunc > ledger {
+		t.Fatal("the structural refusal runs first, so a truncated body exits 4 instead of 3")
+	}
+}

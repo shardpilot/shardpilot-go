@@ -35,8 +35,11 @@ package main
 // simpler detector for the same question and reopened the same hole.
 
 import (
+	"encoding/json"
+	"io"
 	"net"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -199,9 +202,39 @@ func redactPairs(rest, opaqueNameBytes string) string {
 		// URI invalid, and the guard refused every capture besides
 		// (shardpilot/shardpilot-go#85 review). Vouching for a name and then
 		// letting another rule redact it is not vouching.
-		if nameIsOursExactly(queryDecoded(name)) {
+		// ⚠ AND THE SPELLING THAT ARRIVED MUST BE THE ONE WE SEND. The lookup DECODES,
+		// so `experiment%5Fkey` denotes a name this program owns -- and marking the
+		// raw span vouched an escape spelling this program never writes, so a supplied
+		// `5F` was skipped by both the scrub and the guard
+		// (shardpilot/shardpilot-go#85 review). Knowing what a spelling means is not
+		// knowing that we wrote it; the same rule the JSON member names carry.
+		// ⚠ COMPARED WITH THE SPELLING THIS PROGRAM WOULD HAVE PRODUCED, not with the
+		// decoded name. `%C3%A9` is the REQUIRED encoding of `é` in a name the harness
+		// sent, and refusing it would classify our own parameter as endpoint-chosen --
+		// the scene for that exists. `%5F` is an escape of `_`, which needs none, and
+		// vouching it published a supplied `5F` (shardpilot/shardpilot-go#85 review).
+		// The question is not "is any escaping present" but "is this OUR escaping".
+		dn := queryDecoded(name)
+		switch {
+		case nameIsOursExactly(dn) && name == url.QueryEscape(dn):
 			name = marked(name)
-		} else {
+		case nameIsOursExactly(dn):
+			// ⚠ OURS BY WHAT IT DENOTES, SO PRINTED IN OUR SPELLING. `experiment%5Fkey`
+			// decodes to a name this program owns: vouching the raw span published a
+			// supplied `5F`, and calling it endpoint-chosen and lengthening it loses a
+			// name we sent (shardpilot/shardpilot-go#85 review).
+			//
+			// Leaving it captured does not work either, and that is worth recording
+			// because it was my second attempt: `5F` sits between `%` and `k`, so the
+			// scrub's boundary rule declines it and the guard's does the same -- the
+			// value is published by a rule that never looks at it.
+			//
+			// What is printed is the spelling this program WOULD have sent, marked as
+			// generated, which is exactly what it then is. The artifact says which
+			// parameter it was; it no longer says which escape the endpoint chose, and
+			// that spelling is the one thing here nobody can account for.
+			name = marked(url.QueryEscape(dn))
+		default:
 			// ⚠ MARKED, NOT STRIPPED. Stripping the provenance marks to keep the
 			// name looking like a name let the supplied-value scrub reach INSIDE
 			// the placeholder it had just generated -- `<redacted, 8 chars>-5-chars`
@@ -892,7 +925,11 @@ func redactSetCookie(line string) string {
 			// above: `an` is about to be MARKED, and a lookup on the marked spelling
 			// answers about a name no registry contains.
 			canAttr, canKnown := cookieAttrCanonical(an, ows(av))
-			if standardCookieAttr(an) {
+			// ⚠ AND THE CANONICAL SPELLING FOR A VALUED ATTRIBUTE TOO. The
+			// valueless-flag branch was given this rule a round ago and this one was
+			// not, so `standardCookieAttr` folding admitted an endpoint's `PATH` and
+			// the raw name was vouched (shardpilot/shardpilot-go#85 review).
+			if can, ok := canonicalCookieAttr(ows(an)); ok && ows(an) == can {
 				// Marked for the same reason a vouched-for parameter name is: the
 				// value scrub would otherwise rewrite `Path` into a prose
 				// placeholder and produce an attribute no cookie parser accepts
@@ -1099,23 +1136,134 @@ func structuralRedact(line string) (string, bool) {
 // and the grammar's own literals, which are not strings. Everything else is
 // endpoint text and becomes a length -- which is what the clause says.
 func redactUnaccountedJSONValues(body string) string {
-	return jsonMemberValue.ReplaceAllStringFunc(body, func(m string) string {
-		g := jsonMemberValue.FindStringSubmatch(m)
-		// ⚠ THE THIRD GROUP IS THE CONTENT, NOT THE QUOTED SPELLING. My first version
-		// tested it for a leading quote to skip non-strings -- and this pattern only
-		// matches strings, with the quotes OUTSIDE the group, so that test was false
-		// for every match and the whole pass was a no-op. The suite stayed green
-		// because a pass that changes nothing breaks nothing.
-		val, ok := jsonString(g[3])
+	// ⚠ A PATTERN OVER MEMBER-COLON-STRING IS NOT A TRAVERSAL. The first version
+	// matched only a string immediately after a member's colon, so
+	// `{"variant_payload":["server-secret-token"]}` kept its array element verbatim
+	// -- the body parses, so the body rule accepts it, and the guard is blind
+	// because the value was never supplied by this program
+	// (shardpilot/shardpilot-go#85 review). Array elements, nested members and a
+	// top-level string are values too.
+	//
+	// The decoder's token stream is the traversal, and it reports where each token
+	// ENDS, so a string VALUE's span is recovered by walking back to its opening
+	// quote. Keys are skipped by the same key/value turn tracking the marking pass
+	// uses.
+	// ⚠ TRAVERSED OVER A MARK-FREE VIEW. Earlier passes have already inserted
+	// provenance marks, so the body handed here is not valid JSON and the decoder
+	// stops on the first one -- my first version returned unchanged for every real
+	// input and the scene said so. The view carries an index map back to the text
+	// that is actually edited, and spans inside an existing mark are left alone.
+	plain := make([]byte, 0, len(body))
+	back := make([]int, 0, len(body))
+	inMark := make([]bool, 0, len(body))
+	md := 0
+	for i := 0; i < len(body); i++ {
+		if body[i] == capturedMark[0] || body[i] == genMark[0] {
+			md++
+			continue
+		}
+		plain = append(plain, body[i])
+		back = append(back, i)
+		inMark = append(inMark, md%2 == 1)
+	}
+	view := string(plain)
+	dec := json.NewDecoder(strings.NewReader(view))
+	dec.UseNumber()
+	type span struct {
+		a, b int
+		val  string
+	}
+	var spans []span
+	var depth []int8 // 0 = array, 1 = object expecting KEY, 2 = object expecting VALUE
+	verdictField := ""
+	for {
+		off := int(dec.InputOffset())
+		_ = off
+		tok, err := dec.Token()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return body // not a shape this pass can traverse; the body rule answers
+		}
+		advance := func() {
+			if n := len(depth); n > 0 && depth[n-1] == 2 {
+				depth[n-1] = 1
+			}
+		}
+		isKey := false
+		atRoot := false
+		if d, ok := tok.(json.Delim); ok {
+			switch d {
+			case '{':
+				advance()
+				depth = append(depth, 1)
+			case '[':
+				advance()
+				depth = append(depth, 0)
+			case '}', ']':
+				if len(depth) > 0 {
+					depth = depth[:len(depth)-1]
+				}
+			}
+			continue
+		}
+		if n := len(depth); n > 0 && depth[n-1] == 1 {
+			isKey, atRoot = true, n == 1
+			depth[n-1] = 2
+		} else {
+			advance()
+		}
+		if isKey {
+			if name, ok := tok.(string); ok && atRoot {
+				verdictField = name
+			} else {
+				verdictField = ""
+			}
+			continue
+		}
+		str, ok := tok.(string)
 		if !ok {
-			val = g[3]
+			verdictField = ""
+			continue
 		}
-		if sdkTaxonomy[val] {
-			return `"` + g[1] + `"` + g[2] + `"` + marked(val) + `"`
+		end := int(dec.InputOffset())
+		// Walk back to the opening quote of this string, skipping escaped quotes.
+		k := end - 2
+		for k >= 0 {
+			if view[k] == '"' {
+				bs := 0
+				for m := k - 1; m >= 0 && view[m] == '\\'; m-- {
+					bs++
+				}
+				if bs%2 == 0 {
+					break
+				}
+			}
+			k--
 		}
-		noteAccounted("an endpoint-chosen value in a parsed response body")
-		return `"` + g[1] + `"` + g[2] + `"` + tokenPlaceholder(val) + `"`
-	})
+		if k < 0 || end > len(view) || inMark[k] {
+			verdictField = ""
+			continue
+		}
+		// ⚠ TAXONOMY ONLY WHERE THE SDK CLASSIFIES. Vouching a taxonomy-shaped string
+		// wherever it appears marked an endpoint's own payload value as this SDK's
+		// classification -- `"variant_payload":{"note":"kill_switch"}` with that key
+		// supplied (shardpilot/shardpilot-go#85 review). A value is not evidence of
+		// its author; the POSITION is.
+		if sdkTaxonomy[str] && (verdictField == "code" || verdictField == "reason") {
+			spans = append(spans, span{back[k], back[end-1] + 1, marked(str)})
+		} else {
+			noteAccounted("an endpoint-chosen value in a parsed response body")
+			spans = append(spans, span{back[k], back[end-1] + 1, `"` + tokenPlaceholder(str) + `"`})
+		}
+		verdictField = ""
+	}
+	for x := len(spans) - 1; x >= 0; x-- {
+		sp := spans[x]
+		body = body[:sp.a] + sp.val + body[sp.b:]
+	}
+	return body
 }
 
 func redactMintedBody(body string) string {
@@ -1637,6 +1785,27 @@ func admitFieldName(name string) string {
 	if !registeredFieldNames[strings.ToLower(ows(name))] {
 		return tokenPlaceholder(ows(name))
 	}
+	// ⚠ THE CANONICAL SPELLING, AND HERE IT IS GO'S. HTTP field names are
+	// case-insensitive, so the registry folds -- and vouching the RECEIVED spelling
+	// marked an endpoint's `DATE` as this program's own syntax, which both the scrub
+	// and the guard then skipped (shardpilot/shardpilot-go#85 review). The sweep
+	// named 76 rows of this at once, which is the whole registry: the defect was in
+	// the predicate, not at any of the sites.
+	//
+	// `textproto.CanonicalMIMEHeaderKey` is the spelling `net/http` itself writes,
+	// so it is the one this program would have produced. A non-canonical spelling is
+	// NOT refused and NOT lengthened -- it is left exactly as it arrived, captured,
+	// and the supplied-value checks then apply to it normally.
+	// ⚠ TWO SPELLINGS ARE PROTOCOL-FIXED, NOT ONE. My first version admitted only
+	// Go's canonical form -- and HTTP/2 REQUIRES field names to be lowercase, so
+	// that rule lengthened every field name of every HTTP/2 response. The other
+	// sweep said so immediately, with 76 rows of its own. What the grammar fixes is
+	// `Accept-CH` (HTTP/1's convention, and what `net/http` writes) and `accept-ch`
+	// (HTTP/2's requirement); `ACCEPT-CH` is neither, and is the endpoint choosing.
+	n := ows(name)
+	if n != textproto.CanonicalMIMEHeaderKey(n) && n != strings.ToLower(n) {
+		return name
+	}
 	return vouched(name)
 }
 
@@ -1661,6 +1830,18 @@ func redactFieldName(name string) string {
 // truncated.
 func canonicalCookieFlag(name string) (string, bool) {
 	for _, c := range []string{"Secure", "HttpOnly", "Partitioned"} {
+		if strings.EqualFold(name, c) {
+			return c, true
+		}
+	}
+	return "", false
+}
+
+// canonicalCookieAttr returns the specification's spelling of a cookie attribute
+// name, valued or not.
+func canonicalCookieAttr(name string) (string, bool) {
+	for _, c := range []string{"Secure", "HttpOnly", "Partitioned", "Path", "Domain",
+		"Expires", "Max-Age", "SameSite", "Priority"} {
 		if strings.EqualFold(name, c) {
 			return c, true
 		}
@@ -1870,7 +2051,18 @@ func redactUnlessVerbatim(line string) string {
 		// published it (shardpilot/shardpilot-go#85 review). Recognition is about what
 		// the value DENOTES; vouching is about the bytes, and the two are only the
 		// same when the spelling is canonical.
-		if raw := ows(value); raw == canonicalAdmitted(name, raw) {
+		// ⚠ AND NOT WHEN THE VALUE COLLIDES WITH A SUPPLIED ONE. Integer syntax
+		// constrains the ALPHABET and says nothing about who chose the number, so
+		// `Age: 123456` vouched a supplied numeric experiment key and both the scrub
+		// and the guard skipped it (shardpilot/shardpilot-go#85 review).
+		//
+		// The reviewer's remedy was to stop admitting numeric fields at all. I took a
+		// narrower one, and say so because it differs: three scenes here assert that
+		// `Age: 42` is PUBLISHED, which is a documented property of this criterion,
+		// and dropping the whole class to close a collision would have cost that. The
+		// exemption stands; what it never licensed is publishing a supplied
+		// identifier, exactly as with the redirect authority.
+		if raw := ows(value); raw == canonicalAdmitted(name, raw) && scrubSuppliedRaw(raw) == raw {
 			return name + ":" + strings.Replace(value, raw, vouched(raw), 1) + cr
 		}
 		return line
