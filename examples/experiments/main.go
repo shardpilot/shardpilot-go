@@ -169,7 +169,9 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/http/httputil"
+	"net/textproto"
 	"net/url"
 	"os"
 	"regexp"
@@ -208,6 +210,28 @@ type exchange struct {
 	// A fact about a response stored once per RUN is a fact about the last response.
 	recvConn bool
 	transErr error // set when no response arrived at all
+	// reqDumpErr is the SERIALISER's failure, which is not the transport's.
+	// `DumpRequestOut` rejects a request an operator can build -- an API key with
+	// an embedded newline makes an invalid `Authorization` value -- and the error
+	// was discarded, leaving `req` empty while the report went on to render an
+	// empty canonical request block and say the request was formed
+	// (shardpilot/shardpilot-go#84 review). A record that omits the very evidence
+	// it exists to carry must say so rather than print a blank.
+	reqDumpErr error
+	// uncompressed records that the TRANSPORT decoded the body. With
+	// `http.DefaultTransport` adding `Accept-Encoding: gzip`, a gzip response is
+	// decompressed before `RoundTrip` returns and the coding headers are removed,
+	// so `teeBody` wraps the DECODED payload -- and the section's prose called
+	// those "the received bytes" (shardpilot/shardpilot-go#84 review).
+	uncompressed bool
+	// infos are the INFORMATIONAL responses, redacted like any captured bytes. Go's
+	// transport consumes a `103 Early Hints` and exposes it only through
+	// `httptrace.ClientTrace.Got1xxResponse`, so a bare `RoundTrip` returns the
+	// final response alone -- and the report then claimed a complete captured pair
+	// while silently dropping a status and headers the endpoint had sent
+	// (shardpilot/shardpilot-go#84 review). This harness records rather than
+	// summarises; what it cannot show it must at least not omit in silence.
+	infos    [][]byte
 	captured *teeBody
 }
 
@@ -631,6 +655,111 @@ func responseText(ex *exchange) string {
 	return asCaptured(scrubSupplied(dropFraming(escapeMarks(string(ex.resp())))))
 }
 
+// renderExchanges writes the per-exchange sections.
+//
+// ⚠ EXTRACTED SO THE PROSE CAN BE READ BY A SCENE. Findings about what these
+// sections SAY -- an empty request block under a heading claiming the request
+// was formed, a decoded payload called "the received bytes" -- lived where no
+// test could reach them (shardpilot/shardpilot-go#84 review). A claim nothing
+// can read is a claim nothing checks.
+// It also returns the per-exchange refusal record, because the ledger is keyed by
+// what each section actually rendered.
+func renderExchanges(report *strings.Builder, exchanges []exchange) []exchangeRefusals {
+	var perExchange []exchangeRefusals
+	for i, ex := range exchanges {
+		currentExchange = i
+		beforeRender := len(structuralSurfaces)
+		label := ""
+		if len(exchanges) > 1 {
+			label = fmt.Sprintf(" %d", i+1)
+		}
+		if ex.reqDumpErr != nil {
+			// ⚠ NAMED, NOT BLANK. The serialiser refused, so there is no request
+			// evidence -- and a section that prints an empty block under a heading
+			// saying the request was formed is the artifact asserting what it does not
+			// have (shardpilot/shardpilot-go#84 review).
+			noteStructural(formRequest, "a request this build could not serialise for the record")
+			fmt.Fprintf(report, "## Request%s — NOT CAPTURED\n\n"+
+				"`httputil.DumpRequestOut` refused this request, so no canonical "+
+				"serialisation exists to publish. The transport's own outcome is "+
+				"reported below; this section carries no evidence and does not "+
+				"pretend to.\n\n", label)
+			perExchange = append(perExchange, exchangeRefusals{
+				truncated: ex.truncErr() != nil,
+				added:     append([]string{}, structuralSurfaces[beforeRender:]...),
+			})
+			continue
+		}
+		for _, info := range ex.infos {
+			// ⚠ PRINTED, NOT SUMMARISED. These arrived from the endpoint and the final
+			// response does not contain them; a pair rendered without them omits what
+			// it saw.
+			fmt.Fprintf(report, "## Informational%s — an interim response the "+
+				"transport consumed\n\nGo delivers these only through `httptrace`, "+
+				"so the final response below does not contain them and a report "+
+				"without this section would omit a status and headers the endpoint "+
+				"sent.\n\n%s\n", label, fencedBlock(asCaptured(string(info))))
+		}
+		reqText := asCaptured(string(ex.req))
+		// ⚠ NOT "as the SDK sent it". DumpRequestOut serialises the request as
+		// HTTP/1.1 through a separate fake transport, BEFORE the real one
+		// negotiates a protocol. On an HTTP/2 connection the report paired a
+		// fabricated `HTTP/1.1` request line with a genuine `HTTP/2.0` status
+		// line and called the two a single wire exchange
+		// (shardpilot/shardpilot-go#73 review). The negotiated protocol is
+		// reported beside it, from the response, which is measured rather than
+		// serialised.
+		wire := ex.proto
+		if wire == "" {
+			wire = "not established — no response arrived"
+		}
+		fmt.Fprintf(report,
+			"## Request%s — canonical HTTP/1.1 representation\n\n"+
+				"Serialised by `httputil.DumpRequestOut`, which always writes HTTP/1.1. "+
+				"The connection negotiated **%s**, so this is the request's canonical form "+
+				"and its header set, not the bytes on the wire.\n\n%s\n",
+			label, wire, fencedBlock(reqText))
+		switch {
+		case ex.transErr != nil:
+			fmt.Fprintf(report, "## Response%s\n\nNONE — the request was formed and no "+
+				"response arrived: %s\n\n", label, transportErrorLine(ex.transErr))
+		case ex.truncErr() != nil:
+			body := responseText(&ex)
+			fmt.Fprintf(report, "## Response%s — INCOMPLETE, and the SDK was told so\n\n"+
+				"The body is not established as whole (%v). What arrived is below; it "+
+				"is NOT a complete response.\n\n%s\n%s\n",
+				label, incompleteBodyLine(&ex), fencedBlock(body), ex.trailerReport())
+		default:
+			respText := responseText(&ex)
+			if ex.uncompressed {
+				// ⚠ THE TRANSPORT DECODED IT, SO THE PROSE MUST NOT SAY OTHERWISE.
+				fmt.Fprintf(report, "\n**The body below was DECODED BY THE TRANSPORT.** "+
+					"`http.Transport` added `Accept-Encoding: gzip` on its own, "+
+					"decompressed the response and removed the coding headers before this "+
+					"recorder saw it, so what follows is the payload delivered to the SDK, "+
+					"not the bytes on the wire.\n")
+			}
+			fmt.Fprintf(report, respSection, label,
+				fencedBlock(respText), ex.trailerReport())
+		}
+		// Everything this attempt added to the ledger, and only it. See the comment
+		// above the loop: the excuse belongs to the attempt that earned it.
+		//
+		// ⚠ RESIDUAL, NAMED: `noteStructural` de-duplicates by reason, so if a
+		// truncated attempt raises a reason FIRST and a complete attempt would have
+		// raised the same one, the complete attempt's instance is never recorded and
+		// the reason is excused. The direction is towards publishing, so it is a
+		// real limit rather than a conservative one; closing it means keying the
+		// ledger by (exchange, reason), which is a larger change than this finding
+		// asked for.
+		perExchange = append(perExchange, exchangeRefusals{
+			truncated: ex.truncErr() != nil,
+			added:     append([]string{}, structuralSurfaces[beforeRender:]...),
+		})
+	}
+	return perExchange
+}
+
 // respSection is the response section's prose, named rather than inlined so the
 // fixture that checks what it CLAIMS reads the same bytes the report prints. A
 // test carrying its own copy of the sentence would pass while the report says
@@ -653,74 +782,56 @@ const respSection = "## Response%s — header block re-serialised by " +
 	"bodyless dump and is forbidden in HTTP/2, so a header here is not " +
 	"evidence that it was received.\n\n%s\n%s\n"
 
-// ⚠ ITS SOURCE IS `expAssignmentWire` IN experiments.go, and regenerating means
-// reading that struct's json tags -- not adding whatever a review round names.
-// Three other lists in these two files bled one entry per round because they
-// answered the length of my memory rather than the question; this one is the
-// fourth, driven in the same movement. It cannot be reflected over from here (the
-// type is unexported and in another package), so the source is NAMED instead, and
-// the failure side stays "refuse loudly".
-//
-// benignTopLevel are the assignment response's members this program has judged
-// non-identifying. A top-level member in neither this set nor mintedNames
-// refuses the capture.
-//
-// ⚠ THIS INVERTS WHERE A MISTAKE IN THE LIST LANDS. `mintedNames` is a JUDGEMENT
-// about which fields carry a subject, not a vocabulary, and it cannot be derived
-// here: the wire struct is unexported and the public result type does not carry
-// those members. So it is a list typed from memory -- and a list typed from
-// memory falls behind. `assignment_key` was missing until a reviewer named it,
-// and until then the harness PUBLISHED it (shardpilot/shardpilot-go#85 review).
-//
-// Asking the question the other way round does not make the list right; it makes
-// being wrong LOUD. A member neither list knows now refuses the capture and names
-// itself, so the fix is one line and the failure shows on the first run. The
-// trade is deliberate: a privacy tool that refuses an unfamiliar identifier costs
-// an operator a minute; one that publishes it costs the subject.
-// ⚠ AND IT IS THE ONE DECLARATION ACROSS THE STACK SEAM. The parent branch needed
-// this same registry for its member-name marking and declared it with the same
-// name and contents deliberately, so the merge collides HERE, visibly, instead of
-// producing two registries that answer one question and drift -- which is what
-// this file records happening to `isMinted` three rounds running
-// (shardpilot/shardpilot-go#84 review, resolved at the seam).
-//
-// ⚠ AND IT IS THE WIRE STRUCT'S MEMBERS, NOT NAMES FROM THE SAME VOCABULARY.
-// `attributes` and `assignment_unit` were in here and are not top-level members
-// of `expAssignmentWire` at all -- `assignment_unit` lives inside `boundary` --
-// so a legal supplied value of `attributes` was marked as generated grammar in a
-// 200 response and published (shardpilot/shardpilot-go#84 review). Belonging to
-// the same protocol is not being a member of this object, and `assignment_key`
-// was missing for the same reason the other two were present: the list was
-// recalled rather than read off the struct.
-//
-// ⚠ AND THE CLAIM THAT SAT HERE -- "deriving this from the wire contract is not
-// reachable, the struct is unexported and in another package" -- WAS WRONG. The
-// struct cannot be reached at RUN time; it can be read at TEST time.
-// `TestTheTopLevelExemptionsAreExactlyTheWireMembers` parses it out of the SDK
-// source and compares both containments, so the registry stays a literal and
-// stops being an unchecked one. An unreachable-by-one-route conclusion stated as
-// unreachable is how a list keeps its exemption from being derived.
-var benignTopLevel = map[string]bool{
+// assignmentTopLevel are the members of the SDK's ASSIGNMENT response, and
+// errorTopLevel those of its error response. They are separate because a name is
+// fixed in ONE shape: `error` is grammar in a 401 body and endpoint-chosen text in
+// a 200 assignment, and marking every known name in every object published a
+// supplied `error` out of `{"assigned":false,"error":"x"}`
+// (shardpilot/shardpilot-go#84 review). A registry's SHAPE is part of what it
+// says, exactly as its depth was two rounds ago.
+var assignmentTopLevel = map[string]bool{
 	"assigned": true, "variant_key": true, "variant_payload": true,
 	"version": true, "reason": true, "boundary": true,
-	"experiment_key": true,
-	// ⚠ AND `assignment_key` IS NOT EXEMPT HERE, THOUGH IT IS A WIRE MEMBER. This
-	// branch treats it as a server-MINTED identifier and withholds it, so listing
-	// it as benign grammar makes two rules disagree about one name -- the vouched-
-	// token sweep says so directly. The parent branch has no minted registry and
-	// needs it here; the derived scene asks for `benignTopLevel OR mintedNames`,
-	// which is satisfied on both sides of the seam without either lying
-	// (shardpilot/shardpilot-go#84 review, resolved at the seam).
-	// AND THE ONES THE SDK ITSELF ACCEPTS: a `401` body is
-	// `{"error":"unauthorized"}` and a failure verdict carries `code`. These two
-	// belong to a DIFFERENT wire shape than the assignment, which is why the
-	// scene names them explicitly rather than deriving them.
-	// ⚠ `code` IS NOT AMONG THEM, THOUGH IT WAS. It is a member of no top-level
-	// shape: the ingest error envelope spells it `error.code`, nested, and the
-	// assignment struct has no such member -- the SDK synthesizes its `Code` from
-	// the HTTP outcome (shardpilot/shardpilot-go#85 review). Exempting it marked
-	// an endpoint-controlled member name as generated grammar.
-	"error": true, "app_key": true, "environment_key": true,
+	"experiment_key": true, "assignment_key": true,
+	"app_key": true, "environment_key": true,
+}
+
+// ⚠ `code` IS NOT AMONG THEM. It is a member of no top-level shape: the ingest
+// error envelope spells it `error.code`, nested, and the assignment struct has no
+// such member -- the SDK synthesizes its `Code` from the HTTP outcome
+// (shardpilot/shardpilot-go#85 review).
+var errorTopLevel = map[string]bool{"error": true}
+
+// benignTopLevel answers a DIFFERENT question: is this member name one this build
+// knows at all. That question is asked to REFUSE an unfamiliar member, so its
+// answer must be the union -- narrowing it there would refuse a legitimate name
+// from the other shape. Marking asks whether the name is grammar HERE, and takes
+// the shape-specific set. One name for two questions is how the first became the
+// second.
+var benignTopLevel = func() map[string]bool {
+	m := map[string]bool{}
+	for k := range assignmentTopLevel {
+		m[k] = true
+	}
+	for k := range errorTopLevel {
+		m[k] = true
+	}
+	return m
+}()
+
+// topLevelExemptions picks the registry a body of this status is described by.
+//
+// An unparsable status line takes the ASSIGNMENT set: this harness fetches
+// assignments, and a head this program cannot read is not a licence to exempt the
+// error shape's names.
+func topLevelExemptions(statusLine string) map[string]bool {
+	f := strings.Fields(strings.TrimSuffix(statusLine, "\r"))
+	if len(f) >= 2 && strings.HasPrefix(f[0], "HTTP/") {
+		if n, err := strconv.Atoi(f[1]); err == nil && n >= 400 {
+			return errorTopLevel
+		}
+	}
+	return assignmentTopLevel
 }
 
 // receivedConnection records whether the ENDPOINT sent a `Connection` field, as
@@ -1700,8 +1811,12 @@ func dropFraming(dump string) string {
 	if bodyStart < 0 {
 		return strings.Join(out, "\n")
 	}
+	exemptions := assignmentTopLevel
+	if len(out) > 0 {
+		exemptions = topLevelExemptions(out[0])
+	}
 	return strings.Join(out[:bodyStart], "\n") + "\n" +
-		redactUnaccountedBody(markBareJSONLiterals(redactUnaccountedJSONValues(redactMintedBody(strings.Join(out[bodyStart:], "\n")))))
+		redactUnaccountedBody(markBareJSONLiterals(redactUnaccountedJSONValues(redactMintedBody(strings.Join(out[bodyStart:], "\n"), exemptions), exemptions), exemptions))
 }
 
 type recorder struct {
@@ -1803,15 +1918,47 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 		// guard, and printed (shardpilot/shardpilot-go#85 review). Deriving from
 		// one of two places the data lives in is not deriving.
 		ex.req = redact([]byte(escapeMarks(string(dump))), requestOwnedHeaders(req))
+	} else {
+		ex.reqDumpErr = err
 	}
 
-	resp, err := r.inner.RoundTrip(req)
+	// ⚠ A COPY, AND ONLY FOR THE INNER CALL. A RoundTripper must not modify the
+	// request it is given; `WithContext` yields a shallow copy, and an existing
+	// trace is COMPOSED with rather than replaced, so a caller's own hooks keep
+	// firing.
+	var infoMu sync.Mutex
+	var infos [][]byte
+	traced := req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		Got1xxResponse: func(code int, h textproto.MIMEHeader) error {
+			var b strings.Builder
+			fmt.Fprintf(&b, "HTTP/1.1 %d %s\r\n", code, http.StatusText(code))
+			names := make([]string, 0, len(h))
+			for k := range h {
+				names = append(names, k)
+			}
+			sort.Strings(names)
+			for _, k := range names {
+				for _, v := range h[k] {
+					fmt.Fprintf(&b, "%s: %s\r\n", k, v)
+				}
+			}
+			b.WriteString("\r\n")
+			infoMu.Lock()
+			infos = append(infos, redact([]byte(escapeMarks(b.String())), requestOwnedHeaders(req)))
+			infoMu.Unlock()
+			return nil
+		},
+	}))
+	resp, err := r.inner.RoundTrip(traced)
 	if err != nil {
 		// DNS, TLS, connection setup: the request was formed but nothing came
 		// back. Recorded as an attempt WITH NO RESPONSE rather than dropped,
 		// because a recorder that keeps the request and loses the failure lets
 		// the program print a pair whose second half never existed.
 		ex.transErr = err
+		infoMu.Lock()
+		ex.infos = infos
+		infoMu.Unlock()
 		r.mu.Lock()
 		r.exchanges = append(r.exchanges, ex)
 		r.mu.Unlock()
@@ -1867,6 +2014,10 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 	if d, derr := httputil.DumpResponse(resp, false); derr == nil {
 		ex.head = d
 	}
+	infoMu.Lock()
+	ex.infos = infos
+	infoMu.Unlock()
+	ex.uncompressed = resp.Uncompressed
 	ex.captured = captured
 	r.mu.Lock()
 	r.exchanges = append(r.exchanges, ex)
@@ -2483,7 +2634,7 @@ func redactUnaccountedBody(body string) string {
 	return body
 }
 
-func markBareJSONLiterals(text string) string {
+func markBareJSONLiterals(text string, exempt map[string]bool) string {
 	// ⚠ PARSED, NOT GUESSED. The first version tested the bytes around the token,
 	// which marks `{"message":"saw false value"}` and `error: false` as grammar --
 	// and a marked span is skipped by BOTH the scrub and the guard, so the
@@ -2648,7 +2799,7 @@ func markBareJSONLiterals(text string) string {
 		// exempts an endpoint-controlled nested member of the same name; and the
 		// predicates fold, so vouching on recognition publishes a supplied `ASSIGNED`.
 		if name, ok := tok.(string); ok && isKey && atRoot {
-			if benignTopLevel[name] || mintedNames[name] {
+			if exempt[name] || mintedNames[name] {
 				end := int(dec.InputOffset())
 				quoted := `"` + name + `"`
 				if start+end-len(quoted) >= 0 && start+end <= len(view) &&
@@ -4419,63 +4570,7 @@ func main() {
 	// harness never supplied, so the unsafe earlier response was published
 	// (shardpilot/shardpilot-go#85 review). "This capture is incomplete" excuses the
 	// shapes THAT attempt produced and nothing else.
-	var perExchange []exchangeRefusals
-	for i, ex := range exchanges {
-		currentExchange = i
-		beforeRender := len(structuralSurfaces)
-		label := ""
-		if len(exchanges) > 1 {
-			label = fmt.Sprintf(" %d", i+1)
-		}
-		reqText := asCaptured(string(ex.req))
-		// ⚠ NOT "as the SDK sent it". DumpRequestOut serialises the request as
-		// HTTP/1.1 through a separate fake transport, BEFORE the real one
-		// negotiates a protocol. On an HTTP/2 connection the report paired a
-		// fabricated `HTTP/1.1` request line with a genuine `HTTP/2.0` status
-		// line and called the two a single wire exchange
-		// (shardpilot/shardpilot-go#73 review). The negotiated protocol is
-		// reported beside it, from the response, which is measured rather than
-		// serialised.
-		wire := ex.proto
-		if wire == "" {
-			wire = "not established — no response arrived"
-		}
-		fmt.Fprintf(&report,
-			"## Request%s — canonical HTTP/1.1 representation\n\n"+
-				"Serialised by `httputil.DumpRequestOut`, which always writes HTTP/1.1. "+
-				"The connection negotiated **%s**, so this is the request's canonical form "+
-				"and its header set, not the bytes on the wire.\n\n%s\n",
-			label, wire, fencedBlock(reqText))
-		switch {
-		case ex.transErr != nil:
-			fmt.Fprintf(&report, "## Response%s\n\nNONE — the request was formed and no "+
-				"response arrived: %s\n\n", label, transportErrorLine(ex.transErr))
-		case ex.truncErr() != nil:
-			body := responseText(&ex)
-			fmt.Fprintf(&report, "## Response%s — INCOMPLETE, and the SDK was told so\n\n"+
-				"The body is not established as whole (%v). What arrived is below; it "+
-				"is NOT a complete response.\n\n%s\n%s\n",
-				label, incompleteBodyLine(&ex), fencedBlock(body), ex.trailerReport())
-		default:
-			respText := responseText(&ex)
-			fmt.Fprintf(&report, respSection, label,
-				fencedBlock(respText), ex.trailerReport())
-		}
-		// Everything this attempt added to the ledger, and only it. See the comment
-		// above the loop: the excuse belongs to the attempt that earned it.
-		//
-		// ⚠ RESIDUAL, NAMED: `noteStructural` de-duplicates by reason, so if a
-		// truncated attempt raises a reason FIRST and a complete attempt would have
-		// raised the same one, the complete attempt's instance is never recorded and
-		// the reason is excused. The direction is towards publishing, so it is a
-		// real limit rather than a conservative one; closing it means keying the
-		// ledger by (exchange, reason), which is a larger change than this finding
-		// asked for.
-		perExchange = append(perExchange, exchangeRefusals{
-			truncated: ex.truncErr() != nil,
-			added:     append([]string{}, structuralSurfaces[beforeRender:]...),
-		})
-	}
+	perExchange := renderExchanges(&report, exchanges)
 
 	last := rec.last()
 	fmt.Fprintf(&report, "## SDK verdict\n\n")

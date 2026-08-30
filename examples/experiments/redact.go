@@ -1219,7 +1219,7 @@ func verdictKey(name string) string {
 	return name
 }
 
-func redactUnaccountedJSONValues(body string) string {
+func redactUnaccountedJSONValues(body string, exempt map[string]bool) string {
 	// ⚠ A PATTERN OVER MEMBER-COLON-STRING IS NOT A TRAVERSAL. The first version
 	// matched only a string immediately after a member's colon, so
 	// `{"variant_payload":["server-secret-token"]}` kept its array element verbatim
@@ -1474,7 +1474,7 @@ func redactUnaccountedJSONValues(body string) string {
 	return out.String()
 }
 
-func redactMintedBody(body string) string {
+func redactMintedBody(body string, exempt map[string]bool) string {
 	// ⚠ MEMBER NAMES ARE MATCHED BY WHAT THEY DENOTE, NOT BY ONE SPELLING, and
 	// ASCII case does not distinguish them: `encoding/json` matches a field
 	// case-insensitively, so `SUBJECT_FACT_KEY` is the same field to the SDK and
@@ -1693,7 +1693,7 @@ func redactMintedBody(body string) string {
 		// -- so `{"ASSIGNED":false}` with a supplied `ASSIGNED` was vouched
 		// (shardpilot/shardpilot-go#85 review). The question was never about escapes;
 		// it is whether THIS program would have written that spelling.
-		can, known := benignCanonical(dec)
+		can, known := benignCanonicalIn(exempt, dec)
 		if !known {
 			can, known = mintedCanonical(dec)
 		}
@@ -2107,6 +2107,20 @@ func canonicalSpelling(arrived, canonical string) bool { return arrived == canon
 
 // benignCanonical and mintedCanonical return the registry's OWN spelling of a
 // name, which is the one this program writes.
+// ⚠ THE SHAPE'S OWN MEMBERS, NOT EVERY KNOWN NAME. `error` is grammar in a 401
+// body and endpoint-chosen text in a 200 assignment, so vouching every known
+// top-level name in every object published a supplied `error` out of
+// `{"assigned":false,"error":"x"}` (shardpilot/shardpilot-go#84 review, carried
+// across the seam). The caller passes the set its status selected.
+func benignCanonicalIn(exempt map[string]bool, name string) (string, bool) {
+	for n := range exempt {
+		if strings.EqualFold(name, n) {
+			return n, true
+		}
+	}
+	return "", false
+}
+
 func benignCanonical(name string) (string, bool) {
 	for n := range benignTopLevel {
 		if strings.EqualFold(name, n) {

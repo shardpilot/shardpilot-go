@@ -74,9 +74,26 @@ func TestEveryVouchedTokenSurvivesTheScrub(t *testing.T) {
 	}
 	probes = append(probes, pv("no-op content coding",
 		"HTTP/1.1 200 OK\r\nContent-Encoding: identity\r\n\r\n", "identity"))
-	for name := range benignTopLevel {
-		probes = append(probes, pv("benign JSON member",
-			"HTTP/1.1 200 OK\r\n\r\n{\""+name+"\":1}", name))
+	// ⚠ EACH NAME IN ITS OWN SHAPE. The registry is split by response shape now, so
+	// probing every name against a 200 asserts that `error` is grammar in an
+	// assignment -- which is the defect the split closed
+	// (shardpilot/shardpilot-go#84 review). The population is the PRODUCT of the
+	// registries with the status each describes.
+	for shape, head := range map[string]string{
+		"HTTP/1.1 200 OK":           "assignment",
+		"HTTP/1.1 401 Unauthorized": "error",
+	} {
+		reg := assignmentTopLevel
+		if head == "error" {
+			reg = errorTopLevel
+		}
+		for name := range reg {
+			if mintedNames[name] {
+				continue
+			}
+			probes = append(probes, pv("benign JSON member",
+				shape+"\r\n\r\n{\""+name+"\":1}", name))
+		}
 	}
 	probes = append(probes, pv("HTTP/1 reason phrase", "HTTP/1.1 200 OK\r\n\r\n", "OK"))
 
