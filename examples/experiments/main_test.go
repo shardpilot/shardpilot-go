@@ -2916,7 +2916,11 @@ func TestAnInterimResponseIsRecordedAndPrinted(t *testing.T) {
 	}
 	var report strings.Builder
 	renderExchanges(&report, got)
-	out := report.String()
+	// ⚠ WITHOUT THE MARKS. The response pipeline marks the reason phrase and the
+	// field name as generated, so `103 Early Hints` and `Link` are split by
+	// provenance bytes in the raw builder output. A scene that reads the marked
+	// text is reading a spelling, not the content.
+	out := stripMarks(report.String())
 	for _, want := range []string{"Informational", "103 Early Hints", "Link"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("the report omits %q from an interim response: %q", want, out)
@@ -3045,13 +3049,12 @@ func TestTheCandidateChainReachesWrappedAndReWrappedValues(t *testing.T) {
 // field the request also has, and a server-minted surface.
 func TestAnInterimResponseGoesThroughTheResponsePipeline(t *testing.T) {
 	for _, c := range []struct {
-		name   string
-		hdr    textproto.MIMEHeader
-		refuse bool
+		name string
+		hdr  textproto.MIMEHeader
 	}{
-		{"an endpoint-only field", textproto.MIMEHeader{"Link": []string{"</reset/kill_switch>"}}, false},
-		{"a field the request also has", textproto.MIMEHeader{"User-Agent": []string{"kill_switch"}}, false},
-		{"a server-minted surface", textproto.MIMEHeader{"Set-Cookie": []string{"sid=kill_switch"}}, true},
+		{"an endpoint-only field", textproto.MIMEHeader{"Link": []string{"</reset/kill_switch>"}}},
+		{"a field the request also has", textproto.MIMEHeader{"User-Agent": []string{"kill_switch"}}},
+		{"a server-minted surface", textproto.MIMEHeader{"Set-Cookie": []string{"sid=kill_switch"}}},
 	} {
 		suppliedValues = []string{"kill_switch"}
 		structuralSurfaces = nil
@@ -3071,12 +3074,13 @@ func TestAnInterimResponseGoesThroughTheResponsePipeline(t *testing.T) {
 		rec.mu.Unlock()
 		var b strings.Builder
 		renderExchanges(&b, got)
-		out := stripMarks(b.String())
-		if strings.Contains(out, "kill_switch") {
+		// ⚠ THE PROPERTY, NOT THIS BRANCH'S ANSWER TO IT. Whether a server-minted
+		// surface in an interim response is REFUSED or structurally REDACTED differs
+		// across the stack seam -- refusing is this branch's parent's answer and
+		// redacting is this one's -- so asserting a refusal holds on one side only.
+		// What both owe is that the identifier is not published.
+		if out := stripMarks(b.String()); strings.Contains(out, "kill_switch") {
 			t.Errorf("%s: a supplied identifier in an interim response was published: %q", c.name, out)
-		}
-		if refused := len(structuralSurfaces) > 0; refused != c.refuse {
-			t.Errorf("%s: refused=%v, want %v", c.name, refused, c.refuse)
 		}
 		suppliedValues = nil
 		structuralSurfaces = nil
