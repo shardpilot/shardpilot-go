@@ -25,8 +25,13 @@
 //
 //	NOTHING IS PRINTED THAT THIS PROGRAM CANNOT ACCOUNT FOR.
 //
-//	  a supplied value      provably absent from every form the decoders reach,
-//	                        or the record is not printed at all
+//	  a supplied value      absent from every form THE DECODERS BELOW produce, or
+//	                        the record is not printed at all. The decoders are a
+//	                        CLOSED LIST and the claim is relative to it:
+//	                        undoPercent, undoUnicodeEscapes, undoBase64, undoHex,
+//	                        undoPlus, undoEntities -- run to a fixed point, over
+//	                        the text AND the field names, and over the candidates
+//	                        the base64, binary and hex producers add.
 //	  a server-generated    Set-Cookie, Location, a top-level minted subject key,
 //	    surface             or a body in a coding this build cannot decode: the
 //	                        record is NOT printed, because this half can detect
@@ -39,6 +44,21 @@
 //	                        `net/http` writes into the dump, the SDK's fixed
 //	                        route, and the three JSON grammar literals
 //	  everything else       printed as received
+//
+// ⚠ AND THE FIRST CLAUSE IS NARROWED ON PURPOSE. It used to read "provably absent
+// from every form the decoders reach", which is the absolute statement this
+// comment opens by refusing: "the forms the decoders reach" is not a set anyone
+// can enumerate, so the clause invited exactly the question the paragraph above
+// says has no answer -- did you think of every encoding. Fourteen review rounds
+// answered it fourteen times, and the last four found 4, 4, 6 and 9 defects, more
+// than half of them in the previous round's fixes.
+//
+// Naming the decoders makes the clause checkable in the way the others are: an
+// encoding NOT on that list is not covered, and saying so is the honest state.
+// Adding one is a decoder, a line in the list above, and a scene -- a bounded
+// change with a visible cost, instead of a promise that quietly grows.
+// TestTheClaimNamesExactlyTheDecodersThatRun holds the list and the code
+// together, so the sentence cannot drift from the chain it describes.
 //
 // ⚠ THE LAST CLAUSE IS THE WEAK ONE, AND SAYING SO IS THE POINT. "Everything
 // else printed as received" covers an `ETag`, a `Server` banner, an unregistered

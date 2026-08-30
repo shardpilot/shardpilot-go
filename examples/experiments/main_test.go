@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -2011,5 +2012,55 @@ func TestASchemaMemberNameIsGrammar(t *testing.T) {
 	got = stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"ASSIGNED\":true}")))
 	if strings.Contains(got, "ASSIGNED") {
 		t.Fatalf("a non-canonical spelling was vouched as grammar: %q", got)
+	}
+}
+
+// TestTheClaimNamesExactlyTheDecodersThatRun holds the claim's enumeration and
+// the decoding chain together.
+//
+// ⚠ A CLAIM THAT NAMES A LIST CAN DRIFT FROM IT SILENTLY, and prose has no
+// compiler. The first clause of this program's claim was narrowed from "every
+// form the decoders reach" -- an unenumerable set -- to the decoders themselves,
+// which is only an improvement while the two agree. This reads both out of the
+// source: the documented names, and the stage list the chain actually runs.
+func TestTheClaimNamesExactlyTheDecodersThatRun(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("the scene cannot read its own subject: %v", err)
+	}
+	text := string(src)
+
+	stage := regexp.MustCompile(`range \[\]func\(string\) string\{([^}]*)\}`)
+	ms := stage.FindAllStringSubmatch(text, -1)
+	if len(ms) == 0 {
+		t.Fatal("the decoding chain's stage list was not found, so this scene measures nothing")
+	}
+	inCode := map[string]bool{}
+	for _, m := range ms {
+		for _, n := range strings.Split(m[1], ",") {
+			if n = strings.TrimSpace(n); n != "" {
+				inCode[n] = true
+			}
+		}
+	}
+
+	claim := text[:strings.Index(text, "\npackage ")]
+	for n := range inCode {
+		if !strings.Contains(claim, n) {
+			t.Errorf("the chain runs %s and the claim does not name it", n)
+		}
+	}
+	// ⚠ THE PATTERN NEEDS AN UPPERCASE LETTER AND MUST NOT STOP AT A DIGIT. The
+	// first version was `undo[A-Za-z]+`, which reported the claim as naming
+	// `undoBase` (cut before the 64) and `undocumented` (a word in the prose) --
+	// two failures on a correct claim, from the instrument rather than the subject.
+	named := regexp.MustCompile(`\bundo[A-Z][A-Za-z0-9]*\b`).FindAllString(claim, -1)
+	for _, n := range named {
+		if !inCode[n] {
+			t.Errorf("the claim names %s and the chain does not run it", n)
+		}
+	}
+	if len(named) == 0 {
+		t.Fatal("the claim names no decoder, so this scene cannot discriminate")
 	}
 }
