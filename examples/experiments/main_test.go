@@ -3951,3 +3951,122 @@ func TestTheOffRouteClaimIsVerdictDependent(t *testing.T) {
 		t.Errorf("the claim does not say WHY the served path expects one, so an operator cannot check it")
 	}
 }
+
+// TestTheSecondRoundOfSchemaGates covers the three preconditions the exemption
+// registry has to carry, each of which arrived as its own finding: the body length
+// must be the one the SDK READ (not the one this program's `escapeMarks` produced),
+// and an incomplete read disqualifies a body whatever its length
+// (shardpilot/shardpilot-go#84 review).
+func TestTheSecondRoundOfSchemaGates(t *testing.T) {
+	t.Cleanup(func() {
+		suppliedValues = nil
+		capturedIncomplete, capturedBodyBytes = false, -1
+	})
+	body := `{"assigned":false}`
+
+	// ⚠ THE LENGTH THE SDK READ. `escapeMarks` expands a literal `\x00` spelling, so
+	// a body at the ceiling arrives here longer than the SDK ever saw.
+	suppliedValues, capturedIncomplete = []string{"assigned"}, false
+	capturedBodyBytes = sdkMaxBodyBytes
+	// The text this pass sees is LONGER than the ceiling; the captured length is not.
+	// It stays one JSON document, so only the gate's choice of number decides.
+	inflated := `{"assigned":false,"pad":"` + strings.Repeat("a", sdkMaxBodyBytes/2) + `"}`
+	if got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n" + inflated))); !strings.Contains(got, "assigned") {
+		t.Errorf("a body the SDK accepted lost its exemptions to this program's own expansion")
+	}
+	// ...and a body the SDK really did refuse still loses them.
+	capturedBodyBytes = sdkMaxBodyBytes + 1
+	if got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n" + body))); strings.Contains(got, "assigned") {
+		t.Errorf("an over-limit body kept its exemptions: %q", got)
+	}
+	// ⚠ AND INCOMPLETENESS, WHICH IS NOT A LENGTH.
+	capturedBodyBytes, capturedIncomplete = len(body), true
+	if got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n" + body))); strings.Contains(got, "assigned") {
+		t.Errorf("an incomplete body kept its exemptions: %q", got)
+	}
+	// ⚠ AND A BODY THE SDK WOULD PARSE STILL KEEPS THEM.
+	capturedIncomplete = false
+	if got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n" + body))); !strings.Contains(got, "assigned") {
+		t.Errorf("a complete, in-limit body lost its exemptions: %q", got)
+	}
+}
+
+// TestASynthesisedCacheControlIsAmbiguous: `http.ReadResponse` ADDS
+// `Cache-Control: no-cache` when the response carries `Pragma: no-cache` and no
+// cache directive of its own — measured — so with both present the field's
+// provenance cannot be established (shardpilot/shardpilot-go#84 review).
+func TestASynthesisedCacheControlIsAmbiguous(t *testing.T) {
+	t.Cleanup(func() { structuralSurfaces = nil })
+	structuralSurfaces = nil
+	dropFraming("HTTP/1.1 200 OK\r\nPragma: no-cache\r\nCache-Control: no-cache\r\n\r\n")
+	if len(structuralSurfaces) == 0 {
+		t.Errorf("a field that may be the parser's was treated as the endpoint's")
+	}
+	// ⚠ AND EITHER ALONE IS UNAMBIGUOUS, or the refusal covers ordinary responses.
+	for _, dump := range []string{
+		"HTTP/1.1 200 OK\r\nCache-Control: no-cache\r\n\r\n",
+		"HTTP/1.1 200 OK\r\nPragma: no-cache\r\n\r\n",
+		"HTTP/1.1 200 OK\r\nPragma: no-cache\r\nCache-Control: max-age=0\r\n\r\n",
+	} {
+		structuralSurfaces = nil
+		dropFraming(dump)
+		for _, r := range structuralSurfaces {
+			if strings.Contains(r, "provenance this build cannot establish") {
+				t.Errorf("an unambiguous response was refused: %q", dump)
+			}
+		}
+	}
+}
+
+// TestAWholeLineFoldIsInEveryWalk: `wrappedBase64Candidates` deliberately SKIPS a
+// line that is entirely base64, because `joinBase64Runs` is supposed to have joined
+// it — and that normalisation ran on the outer text only. So a member wrapped across
+// whole base64 lines was in no form either walk produced, though three ordinary
+// decodes that ignore CR/LF reconstruct it (shardpilot/shardpilot-go#84 review).
+// A producer that assumes another pass ran first is only correct where that pass runs.
+func TestAWholeLineFoldIsInEveryWalk(t *testing.T) {
+	t.Cleanup(func() { structuralSurfaces = nil; suppliedValues = nil; decodeWork = 0 })
+	structuralSurfaces, decodeWork = nil, 0
+	noteMinted("InN1\r\nYmplY3RfZmFjdF9rZXkiOiJzZmtfc2VjcmV0Ig==")
+	if len(structuralSurfaces) == 0 {
+		t.Errorf("a minted member wrapped across whole base64 lines was not refused")
+	}
+	// ...and the same fold inside a decoded SEED, which is the other walk.
+	suppliedValues, decodeWork = []string{"secret99"}, 0
+	if err := assertNoLeak(asCaptured("WXpK\r\nV2FnMEtZMjFXTUU5VWF6MD0=")); err == nil {
+		t.Errorf("a supplied value behind a folded seed was approved")
+	}
+}
+
+// TestTheStructuralWalkIsBoundedByWhatItWalks: a budget consulted after the
+// expensive call is a report, not a limit. Measured: a 108 KB run costs about 240
+// MiB across this walk — six decoders and a tokenising scan per form, sixty-four
+// forms — and charging each producer's pass count afterwards changed that by 2 MiB
+// (shardpilot/shardpilot-go#84 review). The bound is on what is WALKED, and an
+// unfinished form list is a refusal rather than a silent clean scan.
+func TestTheStructuralWalkIsBoundedByWhatItWalks(t *testing.T) {
+	t.Cleanup(func() { structuralSurfaces = nil; decodeWork = 0 })
+	structuralSurfaces, decodeWork = nil, 0
+	big := strings.Repeat("YWJjZGVm/", 12000)
+	got := allocatedMiB(func() { noteStructuralInText(big) })
+	if got > 32 {
+		t.Errorf("scanning a %d-byte run allocated %d MiB; bounded it is about 1 and "+
+			"unbounded about 240", len(big), got)
+	}
+	var sawEnumeration bool
+	for _, r := range structuralSurfaces {
+		if strings.Contains(r, "decoded forms could not be enumerated") {
+			sawEnumeration = true
+		}
+	}
+	if !sawEnumeration {
+		t.Errorf("a run too large to enumerate was scanned as clean: %v", structuralSurfaces)
+	}
+	// ⚠ AND AN ORDINARY DIAGNOSTIC IS STILL WALKED, or the bound has become a refusal
+	// of everything: the two-hop base64 spelling must still be found.
+	structuralSurfaces, decodeWork = nil, 0
+	noteStructuralInText(`malformed HTTP response "VTJWMExVTnZiMnRwWlRvZ2MyVnpjMmx2YmoxelpXTnlaWFE9"`)
+	if len(structuralSurfaces) == 0 {
+		t.Errorf("a diagnostic within the bound was no longer scanned")
+	}
+}

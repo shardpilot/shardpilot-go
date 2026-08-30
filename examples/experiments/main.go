@@ -578,6 +578,21 @@ func responseText(ex *exchange) string {
 	// The per-exchange fact is put where `dropFraming` reads it, for THIS exchange,
 	// immediately before it is rendered.
 	receivedConnection = ex.recvConn
+	// ⚠ THE INCOMPLETENESS TRAVELS WITH THE BODY. The SDK sets `bodyIncomplete` and
+	// refuses the verdict BEFORE decoding, and neither the exemption registry nor the
+	// `reason` vouch could see it: both asked only about SIZE, and a body that is
+	// UNDER the limit but ended short -- a declared `Content-Length` larger than what
+	// arrived -- is complete JSON to them (shardpilot/shardpilot-go#85 review). A
+	// size test answers a different question than the SDK's gate does.
+	//
+	// Package-level rather than a parameter, so the shared registry function keeps
+	// the signature the parent branch has: the seam stays a comparison.
+	prev := capturedIncomplete
+	capturedIncomplete = ex.truncErr() != nil
+	defer func() { capturedIncomplete = prev }()
+	prevLen := capturedBodyBytes
+	capturedBodyBytes = len(ex.body())
+	defer func() { capturedBodyBytes = prevLen }()
 	return asCaptured(scrubSupplied(dropFraming(escapeMarks(string(ex.resp())))))
 }
 
@@ -750,6 +765,16 @@ var receivedConnection bool
 // throwaway request to the configured URL -- produced by the very function that
 // will produce the real one, offline, before anything is sent.
 var configuredHostWire string
+
+// capturedIncomplete is true while the body of the exchange being rendered is one
+// the recorder could not show whole. Both vouching decisions read it: a body the
+// SDK would refuse before decoding carries no schema this program may vouch for.
+var capturedIncomplete bool
+
+// capturedBodyBytes is the length of the body AS THE SDK READ IT, or -1 when this
+// pass is run directly by a scene. The report path sets it, because by the time
+// `dropFraming` runs the text has been through `escapeMarks`.
+var capturedBodyBytes = -1
 
 var structuralSurfaces []string
 
@@ -997,9 +1022,23 @@ var benignTopLevel = func() map[string]bool {
 // no licence to exempt the error shape's names. True -- and no licence to exempt
 // the assignment shape's either. The SDK classifies by status; with no status
 // there is no classification (shardpilot/shardpilot-go#84 review).
-func topLevelExemptions(statusLine, body string) map[string]bool {
+// ⚠ A LENGTH, NOT A STRING, AND IT IS THE CAPTURED ONE. `escapeMarks` expands a
+// literal `\x00` spelling before `dropFraming` sees the body, so a valid payload the
+// SDK accepted at 1048575 bytes reached this gate as about 1.89 MiB and lost every
+// schema exemption -- the fixed `"assigned"` member was then rewritten and the
+// generated marks made the guard approve altered, invalid JSON
+// (shardpilot/shardpilot-go#84 review). The SDK's gate is about the bytes IT read,
+// so the recorder hands that number over rather than letting this pass measure its
+// own expansion.
+func topLevelExemptions(statusLine string, bodyLen int) map[string]bool {
 	none := map[string]bool{}
-	if len(body) > sdkMaxBodyBytes {
+	// ⚠ INCOMPLETE IS THE SDK'S OTHER PRECONDITION, and it is not a length. A 200
+	// whose body is a syntactically complete JSON prefix but whose READ failed --
+	// `Content-Length: 100` followed by `{"assigned":false}` -- is refused before the
+	// schema is applied, so its member names are the endpoint's and marking them as
+	// generated published a supplied identifier (shardpilot/shardpilot-go#84 review).
+	// Carried from the stacked child, which took the same finding a round earlier.
+	if capturedIncomplete || bodyLen > sdkMaxBodyBytes {
 		return none
 	}
 	f := strings.Fields(strings.TrimSuffix(statusLine, "\r"))
@@ -1371,6 +1410,32 @@ func allIdentityCodings(v string, fold bool) bool {
 
 func dropFraming(dump string) string {
 	lines := strings.Split(dump, "\n")
+	// ⚠ `Cache-Control: no-cache` MAY BE THE PARSER'S, NOT THE ENDPOINT'S.
+	// `http.ReadResponse` ADDS it when the response carries `Pragma: no-cache` and no
+	// cache directive of its own -- measured. So with both present its provenance
+	// cannot be established: the endpoint may have sent it, or net/http may have
+	// written it. Treated as captured, a supplied `Cache-Control` made the generic
+	// scrub rewrite the field NAME to `redacted-13-chars`, and the generated
+	// placeholder made the guard approve a canonical response carrying a header that
+	// never arrived (shardpilot/shardpilot-go#84 review).
+	//
+	// Refused rather than guessed, exactly as the `Connection` provenance is: calling
+	// it received lets the scrub rewrite what the parser wrote, and calling it
+	// generated lets the guard skip what the endpoint sent.
+	pragmaNoCache, cacheNoCache := false, false
+	for _, l := range lines {
+		low := strings.ToLower(strings.TrimSuffix(l, "\r"))
+		if strings.HasPrefix(low, "pragma:") && strings.Contains(low, "no-cache") {
+			pragmaNoCache = true
+		}
+		if strings.HasPrefix(low, "cache-control:") &&
+			strings.TrimSpace(strings.TrimPrefix(low, "cache-control:")) == "no-cache" {
+			cacheNoCache = true
+		}
+	}
+	if pragmaNoCache && cacheNoCache {
+		noteStructural("a Cache-Control field whose provenance this build cannot establish")
+	}
 	out := make([]string, 0, len(lines))
 	inHeaders := true
 	bodyStart := -1
@@ -1592,11 +1657,23 @@ func dropFraming(dump string) string {
 	// the framing measures the wrong thing.
 	exemptBody := ""
 	if bodyStart >= 0 && bodyStart+1 < len(out) {
+		// ⚠ MEASURED ON THE CAPTURED BYTES, NOT THE ESCAPED ONES. `escapeMarks` expands
+		// a literal `\x00` spelling before this pass sees it, so a valid body the SDK
+		// accepted at 1048575 bytes reached here as about 1.89 MiB and lost every schema
+		// exemption -- the fixed `"assigned"` member was then rewritten and the generated
+		// marks made the guard approve altered, invalid JSON
+		// (shardpilot/shardpilot-go#84 review). The SDK's gate is about the bytes it
+		// read; a length taken after this program's own expansion answers a different
+		// question.
 		exemptBody = strings.Join(out[bodyStart+1:], "\n")
 	}
 	exemptions := map[string]bool{}
 	if len(out) > 0 {
-		exemptions = topLevelExemptions(out[0], exemptBody)
+		exemptBodyLen := len(exemptBody)
+		if capturedBodyBytes >= 0 {
+			exemptBodyLen = capturedBodyBytes
+		}
+		exemptions = topLevelExemptions(out[0], exemptBodyLen)
 	}
 	if bodyStart < 0 {
 		return strings.Join(out, "\n")
@@ -2149,9 +2226,24 @@ var supportedDecoders = []func(string) string{
 const (
 	decodedFormsMax  = 64
 	decodedFormsWork = 1 << 20
+	// The largest form the candidate producers are given. Above it the walk refuses
+	// rather than spending superlinear work on one string.
+	decodedFormsFormMax = 8 << 10
 )
 
 func decodedForms(text string) ([]string, bool) {
+	// ⚠ THE BOUND HAS TO BE ON WHAT IS WALKED, NOT ON WHAT IS CHARGED AFTERWARDS.
+	// Measured: a 108 KB run costs about 240 MiB across this walk -- six decoders and a
+	// tokenising scan per form, sixty-four forms -- and charging each producer's pass
+	// count afterwards changed that by 2 MiB. A budget consulted after the expensive
+	// call is a report, not a limit (shardpilot/shardpilot-go#84 review).
+	//
+	// Refused rather than truncated: the caller treats an unfinished form list as a
+	// structural refusal, so a diagnostic too large to enumerate costs a capture
+	// instead of a silent clean scan.
+	if len(text) > decodedFormsFormMax {
+		return []string{text}, false
+	}
 	seen := map[string]bool{text: true}
 	out := []string{text}
 	spent := 0
@@ -2190,14 +2282,52 @@ func decodedForms(text string) ([]string, bool) {
 		if spent > decodedFormsWork {
 			return out, false
 		}
-		for _, prod := range []func(string) []string{
-			binaryCandidates, shortBase64Candidates, hexCandidates,
-			base64SuffixCandidates, wrappedBase64Candidates,
+		// ⚠ AND THE WHOLE-LINE FOLD, WHICH NO PRODUCER COVERS. `wrappedBase64Candidates`
+		// deliberately SKIPS a line that is entirely base64, because `joinBase64Runs`
+		// is supposed to have joined it -- and that normalisation ran on the outer text
+		// only. So `InN1\r\nYmplY3RfZmFjdF9rZXkiOiJzZmtfc2VjcmV0Ig==` was in no form this
+		// walk produced, though three ordinary decodes that ignore CR/LF reconstruct the
+		// member (shardpilot/shardpilot-go#84 review). A producer that assumes another
+		// pass ran first is only correct where that pass runs.
+		//
+		// ⚠ AND EACH PRODUCER IS CHARGED FOR ITSELF. One `len(out[i])` before five of
+		// them said nothing about what they cost: `binaryCandidates` makes two full
+		// scans and the suffix producers decode many overlapping tails, so a 100 KB run
+		// full of separators could retain tens of MiB before the form cap was reached,
+		// under a ceiling advertised as 1 MiB (same review). The pass count is per
+		// producer and stated at the call, as it is in the seed loop.
+		if j := joinBase64Runs(out[i]); j != out[i] {
+			spent += len(out[i])
+			if !add(j) {
+				return out, false
+			}
+		}
+		// ⚠ AND A CHARGE AFTER THE CALL CANNOT BOUND THE CALL. Measured: a 108 KB run
+		// full of separators costs 242 MiB inside `binaryCandidates` alone, and charging
+		// its pass count afterwards changes that by nothing -- the suffix enumeration is
+		// superlinear in the run, so the only bound that binds is on what the producers
+		// are HANDED (shardpilot/shardpilot-go#84 review). Skipping them silently would
+		// be a scan that stopped early and reported clean, so the walk reports itself
+		// incomplete and the callers refuse.
+		for _, prod := range []struct {
+			passes int
+			fn     func(string) []string
+		}{
+			{2, binaryCandidates}, {1, shortBase64Candidates}, {1, hexCandidates},
+			{1, base64SuffixCandidates}, {1, wrappedBase64Candidates},
 		} {
-			for _, f := range prod(out[i]) {
+			spent += prod.passes * len(out[i])
+			if spent > decodedFormsWork {
+				return out, false
+			}
+			for _, f := range prod.fn(out[i]) {
 				if !add(f) {
 					return out, false
 				}
+			}
+			spent += takeDecodeWork()
+			if spent > decodedFormsWork {
+				return out, false
 			}
 		}
 	}
@@ -3188,6 +3318,16 @@ func assertNoLeak(text string) error {
 			}
 			for si := 0; si < len(seeds) && work <= decodeWorkMax && !seedOverflow; si++ {
 				d := seeds[si]
+				// ⚠ NORMALISED PER FORM, NOT ONCE ON THE OUTER TEXT. `joinBase64Runs` ran on
+				// `cur` only, and `wrappedBase64Candidates` skips a whole-base64 line because
+				// it assumes that join already happened -- so a decoded seed carrying a MIME
+				// fold reached neither: `WXpK\r\nV2FnMEtZMjFXTUU5VWF6MD0=` passed with
+				// `secret99` supplied, though three ordinary decodes reconstruct it
+				// (shardpilot/shardpilot-go#84 review). An assumption about what ran before
+				// travels only as far as the place that made it.
+				if jd := joinBase64Runs(charge(1, d)); jd != d {
+					addSeed(jd)
+				}
 				forms := []string{d}
 				for round := 0; round <= len(d) && work <= decodeWorkMax; round++ {
 					before := d
