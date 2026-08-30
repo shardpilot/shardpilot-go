@@ -462,8 +462,15 @@ func vouchScheme(line string) string {
 	i += off
 	j := strings.LastIndexAny(line[:i], " 	")
 	sch := line[j+1 : i]
-	switch strings.ToLower(stripMarks(sch)) {
+	// ⚠ THE CANONICAL SPELLING, NOT THE RECEIVED ONE. Recognition folds because the
+	// grammar does; vouching must not. `HTTPS` is an approved scheme AND a legal
+	// supplied identifier, and marking it published it (see canonicalSpelling).
+	bare := stripMarks(sch)
+	switch strings.ToLower(bare) {
 	case "http", "https":
+		if !canonicalSpelling(bare, strings.ToLower(bare)) {
+			return line
+		}
 		return line[:j+1] + vouched(sch) + line[i:]
 	}
 	return line
@@ -827,6 +834,10 @@ func redactSetCookie(line string) string {
 			// this file has had to learn that order, after the field-name registry and
 			// the query parameter names.
 			verbatim := cookieAttrVerbatim(an, ows(av))
+			// ⚠ COMPUTED HERE, BESIDE THE PREDICATE, for the reason written directly
+			// above: `an` is about to be MARKED, and a lookup on the marked spelling
+			// answers about a name no registry contains.
+			canAttr, canKnown := cookieAttrCanonical(an, ows(av))
 			if standardCookieAttr(an) {
 				// Marked for the same reason a vouched-for parameter name is: the
 				// value scrub would otherwise rewrite `Path` into a prose
@@ -834,7 +845,12 @@ func redactSetCookie(line string) string {
 				// (shardpilot/shardpilot-go#85 review).
 				an = markAttrName(an)
 			}
-			if verbatim {
+			// ⚠ AND ONLY IF THE ARRIVED SPELLING IS THE CANONICAL ONE. The predicate
+			// folds -- `SameSite=LAX` is a legal cookie -- so vouching the received
+			// spelling published a supplied `LAX` (see canonicalSpelling). A
+			// non-canonical spelling is not refused, it is simply left CAPTURED, which
+			// is what the value is.
+			if verbatim && canKnown && canonicalSpelling(ows(av), canAttr) {
 				// The VALUE is vouched for by the same criterion that admitted it; see
 				// redactUnlessVerbatim for why admitting without marking is not admitting.
 				parts[i] = an + syntax("=") + strings.Replace(av, ows(av), vouched(ows(av)), 1)
@@ -1222,7 +1238,16 @@ func redactMintedBody(body string) string {
 		// skipped by both the scrub and the guard
 		// (shardpilot/shardpilot-go#85 review). Knowing what a spelling MEANS is not
 		// knowing that this program wrote it.
-		if (isBenignName(dec) || isMintedName(dec)) && raw == dec {
+		// ⚠ AND THE CANONICAL CASE, not only the unescaped spelling. `raw == dec`
+		// catches an escape and says nothing about case, while both predicates fold
+		// -- so `{"ASSIGNED":false}` with a supplied `ASSIGNED` was vouched
+		// (shardpilot/shardpilot-go#85 review). The question was never about escapes;
+		// it is whether THIS program would have written that spelling.
+		can, known := benignCanonical(dec)
+		if !known {
+			can, known = mintedCanonical(dec)
+		}
+		if known && raw == dec && canonicalSpelling(dec, can) {
 			vouchAt = append(vouchAt, [2]int{loc[2], loc[3]})
 		}
 	}
@@ -1543,6 +1568,77 @@ func standardCookieAttr(name string) bool {
 		return true
 	}
 	return false
+}
+
+// canonicalSpelling answers, for a token some predicate RECOGNISED under folding,
+// what spelling this program itself would have written for it -- and reports
+// whether the arrived one IS that spelling.
+//
+// ⚠ THE CLASS, FOR THE THIRD ROUND RUNNING. Every admission predicate in this
+// file folds case, because the protocols do; every vouching site then marked the
+// spelling that ARRIVED. So a supplied identifier that differs from an admitted
+// token only in case -- `LAX`, `HTTPS`, `ASSIGNED` -- was marked as this
+// program's own syntax and skipped by BOTH the scrub and the guard
+// (shardpilot/shardpilot-go#85 review). Two of the five sites were repaired last
+// round by comparing raw against DECODED, which catches an escape and says
+// nothing about case; the question was never about escapes.
+//
+// Recognising a token and having written it are different facts. A predicate that
+// folds answers the first. Only equality with the canonical spelling answers the
+// second.
+func canonicalSpelling(arrived, canonical string) bool { return arrived == canonical }
+
+// benignCanonical and mintedCanonical return the registry's OWN spelling of a
+// name, which is the one this program writes.
+func benignCanonical(name string) (string, bool) {
+	for n := range benignTopLevel {
+		if strings.EqualFold(name, n) {
+			return n, true
+		}
+	}
+	return "", false
+}
+
+func mintedCanonical(name string) (string, bool) {
+	for n := range mintedNames {
+		if strings.EqualFold(name, n) {
+			return n, true
+		}
+	}
+	return "", false
+}
+
+// cookieAttrCanonical returns the canonical spelling of an admitted attribute
+// VALUE. A numeric or date value is its own canonical form -- there is no
+// registry spelling to compare against -- and the enumerated ones are lower-case.
+func cookieAttrCanonical(name, value string) (string, bool) {
+	switch strings.ToLower(ows(name)) {
+	case "max-age":
+		if isDigits(value) {
+			return value, true
+		}
+	case "expires":
+		if isHTTPDate(value) {
+			return value, true
+		}
+	case "samesite":
+		// ⚠ THE SPELLING THE SPECIFICATION WRITES, not the fold target. My first
+		// version returned `strings.ToLower(value)` and so declared `lax` canonical --
+		// which lengthened the ORDINARY `SameSite=Lax`, the exact capture this
+		// vouching exists to keep readable, and two fixtures said so at once. The
+		// canonical form is a fact about the grammar; folding is only how a predicate
+		// recognises it.
+		//
+		// A legal but non-canonical spelling is not refused: it is left CAPTURED and
+		// redacted like any other value, which is the safe direction and the true
+		// statement about who wrote it.
+		for _, c := range []string{"Lax", "Strict", "None"} {
+			if strings.EqualFold(value, c) {
+				return c, true
+			}
+		}
+	}
+	return "", false
 }
 
 func cookieAttrVerbatim(name, value string) bool {

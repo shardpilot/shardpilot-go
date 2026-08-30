@@ -155,3 +155,76 @@ func TestEveryVouchedTokenSurvivesTheScrub(t *testing.T) {
 		})
 	}
 }
+
+// TestNoAdmissionVouchesANonCanonicalSpelling is the sweep the CASE half of this
+// class earned.
+//
+// ⚠ THREE ROUNDS, FIVE SITES, ONE QUESTION. Every admission predicate in this
+// program folds case, because the protocols do. Every vouching site then marked
+// the spelling that ARRIVED — so a supplied identifier differing from an admitted
+// token only in case (`LAX`, `HTTPS`, `ASSIGNED`) was marked as this program's own
+// syntax and skipped by BOTH the scrub and the guard. The round before repaired
+// two sites by comparing raw against DECODED, which catches an escape and says
+// nothing about case: the question was never about escapes
+// (shardpilot/shardpilot-go#85 review).
+//
+// The population is drawn from the registries themselves, so a name added to any
+// of them is measured here without anyone remembering to come back.
+func TestNoAdmissionVouchesANonCanonicalSpelling(t *testing.T) {
+	// `look` is what must be ABSENT afterwards, and it is not always `tok`: with
+	// `HTTP` supplied, the status line `HTTP/1.1 302 Found` contains that token as
+	// protocol syntax this program deliberately vouches, so a bare `Contains(tok)`
+	// matched something other than its subject and the row failed on a correct
+	// program. The scheme rows look for the token IN SCHEME POSITION.
+	type row struct{ what, line, tok, look string }
+	var rows []row
+	add := func(what, line, tok string) { rows = append(rows, row{what, line, tok, tok}) }
+	addAt := func(what, line, tok, look string) { rows = append(rows, row{what, line, tok, look}) }
+
+	for _, n := range slices.Sorted(maps.Keys(benignTopLevel)) {
+		u := strings.ToUpper(n)
+		if u == n {
+			continue
+		}
+		add("benign JSON member", "HTTP/1.1 200 OK\r\n\r\n{\""+u+"\":1}", u)
+	}
+	for _, n := range slices.Sorted(maps.Keys(mintedNames)) {
+		u := strings.ToUpper(n)
+		if u == n {
+			continue
+		}
+		add("minted JSON member", "HTTP/1.1 200 OK\r\n\r\n{\""+u+"\":\"v\"}", u)
+	}
+	for _, c := range []string{"Lax", "Strict", "None"} {
+		if !cookieAttrVerbatim("SameSite", c) {
+			t.Fatalf("the probe list drifted from cookieAttrVerbatim: %q", c)
+		}
+		u := strings.ToUpper(c)
+		add("cookie attribute value", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; SameSite="+u+"\r\n\r\n", u)
+	}
+	for _, sc := range []string{"http", "https"} {
+		u := strings.ToUpper(sc)
+		addAt("URI scheme", "HTTP/1.1 302 Found\r\nLocation: "+u+"://e.example/cb\r\n\r\n", u, u+"://")
+	}
+
+	for _, r := range rows {
+		t.Run(r.what+"/"+r.tok, func(t *testing.T) {
+			structuralSurfaces, accountedSurfaces = nil, nil
+			receivedConnection = true
+			suppliedValues = []string{r.tok}
+			t.Cleanup(func() {
+				suppliedValues = nil
+				structuralSurfaces, accountedSurfaces = nil, nil
+				receivedConnection = false
+			})
+			red := scrubSupplied(dropFraming(r.line))
+			if got := stripMarks(red); strings.Contains(got, r.look) {
+				t.Fatalf("a non-canonical spelling was vouched, so the supplied value survived: %q", got)
+			}
+			// AND THE GUARD AGREES: whatever the scrub left must not be a survivor.
+			if err := assertNoLeak(asCaptured(red)); err != nil {
+				t.Fatalf("the guard still found it: %v", err)
+			}
+		})
+	}
+}
