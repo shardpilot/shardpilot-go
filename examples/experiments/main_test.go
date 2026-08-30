@@ -1458,3 +1458,35 @@ func TestAnAcceptedIdentityCodingIsGrammar(t *testing.T) {
 		t.Fatalf("an accepted no-op coding was rewritten into an invalid one: %q", got)
 	}
 }
+
+// ---- round on f258c43 ----
+
+// TestConnectionProvenanceIsPerExchange: the SDK retries, and every attempt is
+// rendered. A single global held the LAST attempt's answer, so a first response
+// that really sent the field had it marked serialiser-generated when the final
+// response carried none (shardpilot/shardpilot-go#84 review).
+func TestConnectionProvenanceIsPerExchange(t *testing.T) {
+	suppliedValues = []string{"bar"}
+	t.Cleanup(func() { suppliedValues = nil; receivedConnection = false })
+	first := &exchange{proto: "HTTP/1.1", recvConn: true,
+		head: []byte("HTTP/1.1 200 OK\r\nConnection: YmFy\r\n\r\n")}
+	last := &exchange{proto: "HTTP/1.1", recvConn: false,
+		head: []byte("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")}
+	// Render the LAST one first, as a run that retried would, then the first: the
+	// global must not carry the last attempt's answer into the earlier one.
+	_ = responseText(last)
+	// ⚠ THE ASSERTION IS ABOUT THE GUARD, because in this half a RECEIVED value is
+	// kept verbatim on purpose — captured data the guard must read. Marking it
+	// serialiser-generated is what makes the guard skip it, so that is what the
+	// scene detects. My first version asserted the value was absent from the text,
+	// which is true only of the half that redacts structurally.
+	if err := assertNoLeak(responseText(first)); err == nil {
+		t.Fatal("a received Connection value was treated as serialiser syntax and skipped")
+	}
+	// And the synthesised one is still exempt, or the repair refuses every capture.
+	receivedConnection = false
+	suppliedValues = []string{"close"}
+	if err := assertNoLeak(responseText(last)); err != nil {
+		t.Fatalf("a synthesised Connection line was reported as a leak: %v", err)
+	}
+}
