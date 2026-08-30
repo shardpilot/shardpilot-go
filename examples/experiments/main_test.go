@@ -2539,9 +2539,16 @@ func TestAGeneratedSpanLeavesTheFieldNameParsable(t *testing.T) {
 			suppliedValues = []string{"bar", "qux"}
 			structuralSurfaces = nil
 			got := scrubSupplied(dropFraming("GET / HTTP/1.1\r\n" + name + ": v\r\n\r\n"))
-			if err := assertNoLeak(asCaptured(got)); err == nil {
-				t.Errorf("%q: the guard approved %q, which the percent decoder turns back into a supplied value",
-					name, stripMarks(got))
+			// ⚠ THE PROPERTY IS THE DISJUNCTION, AND IT HAS TO BE, BECAUSE THE TWO
+			// BRANCHES OF THE STACK PUBLISH DIFFERENT THINGS. This branch replaces the
+			// whole field name, so the encoded spelling never reaches the output and
+			// there is nothing to refuse; the parent leaves `X-<gen>-%71ux` standing and
+			// must refuse it. Asserting "the guard refuses" holds on one side only, and
+			// a scene that holds on one side of a seam is a scene that will be edited
+			// at the merge rather than read.
+			if strings.Contains(stripMarks(got), enc) && assertNoLeak(asCaptured(got)) == nil {
+				t.Errorf("%q: the guard approved %q, which still carries %q and the percent decoder turns that back into a supplied value",
+					name, stripMarks(got), enc)
 			}
 		}
 	}
