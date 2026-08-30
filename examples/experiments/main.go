@@ -472,7 +472,12 @@ func dropQuery(line string) string {
 	if j := strings.IndexByte(line[cut:], ' '); j >= 0 {
 		tail = line[cut+j:]
 	}
-	return line[:cut] + marked("query-withheld") + tail
+	// ⚠ THE SEPARATOR IS SYNTAX AND MUST SURVIVE. Concatenating the marker onto
+	// the path published `/api/…/assignmentquery-withheld` -- a route the SDK never
+	// requested, on EVERY successful report, since every assignment request carries
+	// a query (shardpilot/shardpilot-go#84 review). The primary evidence of this
+	// artifact is which route was called, and the redaction was rewriting it.
+	return line[:cut] + string(line[cut]) + marked("query-withheld") + tail
 }
 
 // noteMinted records a server-minted field's presence and returns the body
@@ -1840,7 +1845,14 @@ func assertNoLeak(text string) error {
 			// input to the chain, not an answer from it -- which this file already
 			// said about the base64 decode, and then did not do for the binary one
 			// standing beside it. Same budget, so a crafted body cannot spin it.
+			// ⚠ AND THE NAME FORMS. These looked only at the captured TEXT, so a field
+			// name whose component decodes to invalid UTF-8 -- `X-_2Jhcg`, where
+			// `_2Jhcg` is url-base64 for `0xffbar` -- was examined as one unsplit token
+			// and no candidate ever held `bar` (shardpilot/shardpilot-go#84 review). The
+			// names decode in lockstep with the text everywhere else; the binary path was
+			// added later and inherited none of that.
 			bins := append(binaryCandidates(cur), binaryCandidates(norm)...)
+			bins = append(bins, binaryCandidates(curNames)...)
 			extra = append(extra, bins...)
 			for _, seed := range append([]string{dec}, bins...) {
 				d := seed

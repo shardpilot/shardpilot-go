@@ -1565,3 +1565,37 @@ func TestARecognisedMediaTypeIsGrammar(t *testing.T) {
 		t.Fatalf("an unregistered media type was published: %q", got)
 	}
 }
+
+// ---- round on b86853d ----
+
+// TestTheQuerySeparatorSurvives: concatenating the marker onto the path published
+// `/api/…/assignmentquery-withheld` — a route the SDK never requested, on every
+// successful report, since every assignment request carries a query
+// (shardpilot/shardpilot-go#84 review).
+func TestTheQuerySeparatorSurvives(t *testing.T) {
+	suppliedValues = nil
+	got := stripMarks(dropQuery("GET /api/v1/runtime/experiments/assignment?a=1 HTTP/1.1\r"))
+	if !strings.Contains(got, "assignment?") {
+		t.Fatalf("the query separator was consumed with the query: %q", got)
+	}
+	if !strings.Contains(got, "HTTP/1.1") {
+		t.Fatalf("the request line lost its version: %q", got)
+	}
+	// A fragment separator is syntax in the same way.
+	got = stripMarks(dropQuery("Location: /cb#tok"))
+	if !strings.Contains(got, "/cb#") {
+		t.Fatalf("the fragment separator was consumed: %q", got)
+	}
+}
+
+// TestBinaryCandidatesSeeTheNameForms: a field name whose component decodes to
+// invalid UTF-8 — `X-_2Jhcg`, where `_2Jhcg` is url-base64 for `0xffbar` — was
+// examined as one unsplit token and no candidate ever held the value
+// (shardpilot/shardpilot-go#84 review).
+func TestBinaryCandidatesSeeTheNameForms(t *testing.T) {
+	suppliedValues = []string{"bar"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured("HTTP/1.1 200 OK\r\nX-_2Jhcg: v\r\n\r\n")); err == nil {
+		t.Fatal("a binary decode of a header-name component was never examined")
+	}
+}
