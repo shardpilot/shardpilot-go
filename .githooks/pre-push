@@ -570,7 +570,27 @@ case "$safe_dest" in
   *://*@*) safe_dest="$(printf '%s' "$safe_dest" | sed -E 's#(://)[^/@]*@#\1<redacted>@#')" ;;
 esac
 
-head_sha="$(git rev-parse HEAD)"
+# ⚠ RESOLVED ONLY IF SOMETHING WILL BE SCANNED. A deletion-only push carries an
+# all-zero local SHA and needs no local objects at all, so it is valid from a
+# repository whose `HEAD` is UNBORN -- and this unconditional resolution aborted
+# before the loop could recognise the deletion, refusing a push git performs
+# without reading a single object (shardpilot/shardpilot-go#79 review). Measured:
+# `fatal: ambiguous argument 'HEAD'`, and the remote ref still standing.
+#
+# The refspec is read first, and `HEAD` is required only when at least one update
+# is not a deletion. An unborn HEAD with something to scan is still a refusal --
+# the value would be needed and is not there -- and it says so by name.
+head_sha=""
+if printf '%s\n' "$pushed_lines" | awk 'NF>=4 && $2 !~ /^0+$/ {found=1} END{exit !found}'; then
+  head_sha="$(git rev-parse HEAD 2>/dev/null && printf X)" || head_sha=""
+  head_sha="${head_sha%X}"
+  head_sha="${head_sha%$NL}"
+  if [ -z "$head_sha" ]; then
+    printf 'REFUSING: this push introduces commits, and HEAD could not be resolved\n' >&2
+    printf '  to place them. A scan that cannot locate the pushed history is not a scan.\n' >&2
+    exit 2
+  fi
+fi
 status=0
 
 # scan_commit <commit> <base> -- scans that commit's tree, with TODAY'S scanner.
@@ -677,36 +697,46 @@ scan_commit() {
     exit 2
   fi
 
-  # ⚠ SPARSITY OFF FIRST, THEN VALIDATE. Checking before expanding validated an
-  # ABSENCE: sparse rules can omit `scripts/`, the symlink tests saw nothing,
-  # and `sparse-checkout disable` then materialised the commit's symlink for the
-  # copy to follow -- into an external file, or into `/dev/zero`
-  # (shardpilot/shardpilot-go#79 review). A check that runs before the thing it
-  # checks exists is not a check.
-  ( cd "$wt" && git_safe sparse-checkout disable >/dev/null 2>&1 ) || true
-
-  # ⚠ THE COMMIT CONTROLS THIS PATH. A commit that replaces `scripts` with a
-  # symlink would make the copy below follow it and overwrite a file OUTSIDE
-  # the worktree -- the inspected branch editing the machine that inspects it
-  # (shardpilot/shardpilot-go#79 review). Refuse anything that is not a real
-  # directory rather than repairing it: a tree shaped to escape is a finding,
-  # not a formatting problem.
-  if [ -L "$wt/scripts" ] || { [ -e "$wt/scripts" ] && [ ! -d "$wt/scripts" ]; }; then
-    printf 'REFUSING: in %s, `scripts` is not a real directory.\n' "$1" >&2
-    printf '  A commit that shapes it as a symlink or a file would redirect this\n' >&2
-    printf '  gate writes outside the worktree it is inspecting.\n' >&2
-    exit 2
-  fi
-  if [ -L "$wt/scripts/check_public_surface.sh" ]; then
+  # ⚠ ASK THE TREE. THE WORKING DIRECTORY IS EMPTY AND ALWAYS WAS.
+  #
+  # These two checks tested the FILESYSTEM under a `--no-checkout` worktree, where
+  # nothing is materialised -- so `[ -L "$wt/scripts" ]` was false for a commit
+  # whose `scripts` IS a symlink, and the guard against a tree shaped to redirect
+  # this gate's writes never fired once. Measured: `ls -A` on that worktree lists
+  # nothing, while `git ls-tree` reports `120000`.
+  #
+  # The round before added `sparse-checkout disable` to make them non-vacuous,
+  # believing it would populate the worktree. On git 2.50.1 it does not: it
+  # returns 0, sets `core.sparseCheckout=false`, and materialises nothing, in cone
+  # and non-cone alike. So the repair did not repair, and the checks stayed empty.
+  #
+  # And `disable` is DOCUMENTED as restoring the working directory to include all
+  # files, which is why it has to go rather than be relied on for not doing it: a
+  # populate here would run the commit's own smudge filters -- arbitrary programs
+  # from the tree under inspection, before the trusted scanner
+  # (shardpilot/shardpilot-go#79 review). That the hazard does not fire on this
+  # version is not a reason to keep the call; it is the reason the call was never
+  # doing anything.
+  #
+  # Asking the tree removes both: no populate, and an answer that does not depend
+  # on sparsity, on the checkout, or on the git version's idea of `disable`.
+  scripts_row="$( cd "$wt" && git_safe ls-tree "$1" -- scripts 2>/dev/null )" || scripts_row=""
+  case "${scripts_row%% *}" in
+    ""|040000) ;;
+    *)
+      printf 'REFUSING: in %s, `scripts` is not a real directory (mode %s).\n' "$1" "${scripts_row%% *}" >&2
+      printf '  A commit that shapes it as a symlink or a file would redirect this\n' >&2
+      printf '  gate writes outside the worktree it is inspecting.\n' >&2
+      exit 2
+      ;;
+  esac
+  scanner_row="$( cd "$wt" && git_safe ls-tree "$1" -- scripts/check_public_surface.sh 2>/dev/null )" || scanner_row=""
+  if [ "${scanner_row%% *}" = 120000 ]; then
     printf 'REFUSING: in %s, the scanner path is a symlink.\n' "$1" >&2
     exit 2
   fi
-  # ⚠ SPARSE CHECKOUT CAN OMIT THE CONE THIS WRITES INTO. `git worktree add`
-  # inherits the rules, so `scripts/` may be absent from the filesystem while
-  # present in the index, and a copy into it would land outside any cone git
-  # tracks (shardpilot/shardpilot-go#79 review). Disabling sparsity for the
-  # temporary worktree costs nothing -- it exists only to be scanned, and a scan
-  # of a partial tree is the failure this whole hook is about.
+  # The directory is created rather than checked out: this gate writes evidence
+  # into it, and nothing from the commit is materialised anywhere.
   mkdir -p "$wt/scripts"
 
   # ⚠ AND THE COMMIT'S OWN SCANNER IS EVIDENCE, NOT SCAFFOLDING. Overwriting it
