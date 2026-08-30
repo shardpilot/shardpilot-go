@@ -4070,3 +4070,24 @@ func TestTheStructuralWalkIsBoundedByWhatItWalks(t *testing.T) {
 		t.Errorf("a diagnostic within the bound was no longer scanned")
 	}
 }
+
+// ⚠ AND A BODY THAT MENTIONS THOSE FIELDS IS NOT A HEADER BLOCK. My own repair
+// scanned the whole dump, so an error page quoting `Pragma: no-cache` refused an
+// otherwise fine capture (shardpilot/shardpilot-go#84 review).
+func TestTheCacheProvenanceCheckStopsAtTheHeaderBlock(t *testing.T) {
+	t.Cleanup(func() { structuralSurfaces = nil })
+	structuralSurfaces = nil
+	dropFraming("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n" +
+		"Pragma: no-cache\nCache-Control: no-cache\n")
+	for _, r := range structuralSurfaces {
+		if strings.Contains(r, "provenance this build cannot establish") {
+			t.Fatalf("body prose was read as a header block: %v", structuralSurfaces)
+		}
+	}
+	// ...and the real header pair is still refused.
+	structuralSurfaces = nil
+	dropFraming("HTTP/1.1 200 OK\r\nPragma: no-cache\r\nCache-Control: no-cache\r\n\r\n")
+	if len(structuralSurfaces) == 0 {
+		t.Fatalf("the ambiguous header pair was no longer refused")
+	}
+}

@@ -1422,8 +1422,17 @@ func dropFraming(dump string) string {
 	// Refused rather than guessed, exactly as the `Connection` provenance is: calling
 	// it received lets the scrub rewrite what the parser wrote, and calling it
 	// generated lets the guard skip what the endpoint sent.
+	// ⚠ THE HEADER BLOCK, NOT THE WHOLE DUMP. A plain-text BODY may contain lines
+	// that read like these fields -- an error page quoting them, a log excerpt -- and
+	// scanning past the blank line let endpoint prose refuse an otherwise fine capture
+	// (shardpilot/shardpilot-go#84 review). My own repair, one round old: the question
+	// is about what `http.ReadResponse` wrote into the HEADER SET, and nothing below
+	// the separator is that.
 	pragmaNoCache, cacheNoCache := false, false
 	for _, l := range lines {
+		if strings.TrimSuffix(l, "\r") == "" {
+			break
+		}
 		low := strings.ToLower(strings.TrimSuffix(l, "\r"))
 		if strings.HasPrefix(low, "pragma:") && strings.Contains(low, "no-cache") {
 			pragmaNoCache = true
