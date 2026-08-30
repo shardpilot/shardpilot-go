@@ -359,7 +359,14 @@ func (e *exchange) trailerReport() string {
 			// (shardpilot/shardpilot-go#85 review). A trailer is a header that arrived
 			// late, in this as in everything else -- the fourth time that sentence has
 			// had to be applied to a rule written on the header path alone.
-			if strings.EqualFold(strings.TrimSpace(k), "content-encoding") {
+			// ⚠ AND ONLY IF THERE ARE BYTES TO DECODE, WHICH THE HEADER PATH ASKS AND
+			// THIS ONE DID NOT. A zero-length response announcing `Content-Encoding: br`
+			// in its trailer had an otherwise publishable capture withheld with exit 4
+			// over bytes that do not exist (shardpilot/shardpilot-go#85 review). The
+			// refusal is about what an undecodable body could HIDE; an absent body is
+			// not its subject, and that sentence was already written on the header
+			// path -- the fifth time a rule stated there had to be carried here.
+			if strings.EqualFold(strings.TrimSpace(k), "content-encoding") && len(e.body()) > 0 {
 				if cv := strings.TrimSpace(v); cv != "" && !strings.EqualFold(cv, "identity") {
 					noteStructural(formField, "a body in a content coding this build cannot decode")
 				}

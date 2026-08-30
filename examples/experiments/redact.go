@@ -662,9 +662,9 @@ func redactTarget(line string) string {
 		}
 	}
 	if i := strings.IndexByte(line, '#'); i >= 0 {
-		return redactZone(redactPath(redactUserinfo(redactQuery(line[:i])))) + redactFragment(line[i:])
+		return redactIPvFutureBody(redactZone(redactPath(redactUserinfo(redactQuery(line[:i]))))) + redactFragment(line[i:])
 	}
-	return redactZone(redactPath(redactUserinfo(redactQuery(line))))
+	return redactIPvFutureBody(redactZone(redactPath(redactUserinfo(redactQuery(line)))))
 }
 
 // splitField cuts a header line into its name, the whitespace after the colon,
@@ -821,6 +821,23 @@ func redactSetCookie(line string) string {
 	}
 	pair, attrs, hasAttrs := strings.Cut(rest, ";")
 	name, value, hasValue := strings.Cut(ows(pair), "=")
+	// ⚠ AND A NAME THAT IS PRESENT IS NOT A NAME THAT EXISTS. `Set-Cookie: =secret`
+	// makes `strings.Cut` report `hasValue=true` with an EMPTY name, and
+	// `tokenPlaceholder("")` then rendered `redacted-0-chars=redacted-6-chars` with
+	// no refusal -- an invalid cookie presented as a syntactically valid one this
+	// recorder invented, hiding the very response defect the artifact exists to
+	// preserve (shardpilot/shardpilot-go#85 review).
+	// ⚠ NARROWED TO EMPTY, WHICH IS WHAT THE FINDING IS. The review asked for a
+	// non-empty cookie TOKEN, and that is wider than the defect: a name of one NUL
+	// byte is not a token either, and this file deliberately MEASURES such a name
+	// rather than withholding it -- `TestEveryComponentIsMeasuredAsReceived` says
+	// so, and it went red on the wider predicate. An empty name is different in
+	// kind: there is no length to report and nothing to measure, so the placeholder
+	// invents a syntactically valid cookie out of an invalid one.
+	if hasValue && ows(name) == "" {
+		noteStructural(formField, "a Set-Cookie header with an empty cookie name")
+		return head + ": " + marked("<withheld>") + cr
+	}
 	if !hasValue {
 		// `Set-Cookie: server-secret` is transport-valid and net/http keeps it.
 		// Returning it unchanged published a server-generated value the guard
@@ -1016,6 +1033,52 @@ func markAttrName(an string) string {
 // help -- that spelling satisfies RFC 6874 exactly -- which is the difference
 // between checking a grammar and checking a property. Third time on this branch
 // that a host exemption has been read as covering what stands beside the host.
+// redactIPvFutureBody replaces the data portion of an IPvFuture authority with
+// its length, keeping the `v<hex>.` that makes it that grammar.
+//
+// ⚠ VALIDATING A GRAMMAR IS NOT ESTABLISHING A PROVENANCE. RFC 3986 gives
+// IPvFuture as `v 1*HEXDIG "." 1*(unreserved / sub-delims / ":")`, and the part
+// after the dot is ARBITRARY: `https://[v1.server-secret-token]/cb` satisfies the
+// grammar exactly, and the host exemption then carried it into the capture
+// verbatim -- with no structural refusal, and invisible to the guard because an
+// endpoint-generated value is absent from `suppliedValues`
+// (shardpilot/shardpilot-go#85 review).
+//
+// This is the zone identifier one grammar along, and the fourth time on this
+// branch that the host exemption has been read as covering what stands beside the
+// host. The exemption rests on "publicly resolvable and constrained by its
+// grammar", and this body is constrained by a grammar that constrains nothing.
+//
+// ⚠ AND ON THIS GO VERSION THE EXEMPTION IS UNREACHABLE, WHICH IS SAID HERE
+// RATHER THAN ASSUMED EITHER WAY. Measured: `url.Parse` rejects every IPvFuture
+// authority -- `ParseAddr("v1.abc"): unexpected character` -- so `isIPvFuture`
+// cannot return true for a target this program parsed, and no path publishes such
+// a body today. This pass is INSURANCE, not a repair: it costs one scan of an
+// already-bracketed literal, and it closes the hole on the day `net/url` starts
+// accepting the grammar RFC 3986 defines. The scene for it calls this function
+// directly, because nothing reaches it end to end; that is stated in the scene so
+// no reader mistakes it for a path-level guarantee.
+func redactIPvFutureBody(line string) string {
+	b := strings.IndexByte(line, '[')
+	if b < 0 {
+		return line
+	}
+	e := strings.IndexByte(line[b:], ']')
+	if e < 0 {
+		return line
+	}
+	e += b
+	lit := line[b+1 : e]
+	if !isIPvFuture(lit) {
+		return line
+	}
+	dot := strings.IndexByte(lit, '.')
+	if dot < 0 || dot+1 >= len(lit) {
+		return line
+	}
+	return line[:b+1] + lit[:dot+1] + tokenPlaceholder(lit[dot+1:]) + line[e:]
+}
+
 func redactZone(line string) string {
 	b := strings.IndexByte(line, '[')
 	if b < 0 {

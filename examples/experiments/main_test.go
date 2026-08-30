@@ -1666,14 +1666,21 @@ func TestACodingAnnouncedInATrailerRefuses(t *testing.T) {
 	structuralSurfaces = nil
 	suppliedValues = nil
 	t.Cleanup(func() { structuralSurfaces = nil })
-	e := &exchange{captured: &teeBody{trailer: map[string][]string{"Content-Encoding": {"gzip"}}}}
+	// ⚠ WITH A BODY. The refusal is about what an undecodable body could HIDE, so a
+	// trailer coding on a zero-length response has no subject -- the header path
+	// already asks that and this scene had not (shardpilot/shardpilot-go#85 review).
+	tee := &teeBody{trailer: map[string][]string{"Content-Encoding": {"gzip"}}}
+	tee.buf.WriteString("x")
+	e := &exchange{captured: tee}
 	e.trailerReport()
 	if len(structuralSurfaces) == 0 {
 		t.Fatal("a content coding announced in a trailer left the capture publishable")
 	}
 	// A no-op coding in a trailer is still a no-op.
 	structuralSurfaces = nil
-	e2 := &exchange{captured: &teeBody{trailer: map[string][]string{"Content-Encoding": {"identity"}}}}
+	tee2 := &teeBody{trailer: map[string][]string{"Content-Encoding": {"identity"}}}
+	tee2.buf.WriteString("x")
+	e2 := &exchange{captured: tee2}
 	e2.trailerReport()
 	if len(structuralSurfaces) != 0 {
 		t.Fatalf("an identity coding in a trailer refused a publishable capture: %q", structuralSurfaces)
@@ -4282,4 +4289,105 @@ func (t *traceFiringTransport) RoundTrip(req *http.Request) (*http.Response, err
 	}
 	r := *t.resp
 	return &r, nil
+}
+
+// The IPvFuture body is endpoint text inside an exempt component.
+//
+// ⚠ THIS SCENE IS UNIT-LEVEL ON PURPOSE, AND SAYS SO. Measured on this Go
+// version, `url.Parse` rejects every IPvFuture authority — `ParseAddr("v1.abc"):
+// unexpected character` — so the host exemption cannot be reached with one and no
+// end-to-end input publishes such a body. The redaction is insurance against
+// `net/url` accepting the grammar RFC 3986 defines, so the only honest scene calls
+// the pass directly (shardpilot/shardpilot-go#85 review, premise measured).
+//
+// The rows are the product of the shapes the grammar admits: a hex version of one
+// and several digits, and a body carrying unreserved, sub-delim and colon bytes.
+func TestTheIPvFutureBodyIsRedacted(t *testing.T) {
+	for _, ver := range []string{"v1", "vA", "v1f"} {
+		for _, body := range []string{"server-secret-token", "a.b:c", "x~y!z", "s"} {
+			line := "Location: https://[" + ver + "." + body + "]/cb"
+			got := stripMarks(redactIPvFutureBody(line))
+			if strings.Contains(got, body) && len(body) > 1 {
+				t.Errorf("%q: the IPvFuture body survived: %q", line, got)
+			}
+			if !strings.Contains(got, "["+ver+".") {
+				t.Errorf("%q: the grammar that makes it an authority was lost: %q", line, got)
+			}
+		}
+	}
+	// And an authority that is NOT IPvFuture is untouched by this pass.
+	for _, line := range []string{
+		"Location: https://[fe80::1]/cb",
+		"Location: https://e.example/cb",
+		"Location: https://[v1]/cb",
+	} {
+		if got := redactIPvFutureBody(line); got != line {
+			t.Errorf("%q was rewritten by the IPvFuture pass: %q", line, got)
+		}
+	}
+}
+
+// An empty cookie name has no length to report.
+//
+// ⚠ `strings.Cut` REPORTS A PAIR FOR `=secret`. The name is empty, `hasValue` is
+// true, and `tokenPlaceholder("")` rendered `redacted-0-chars=redacted-6-chars` --
+// an invalid cookie presented as a syntactically valid one this recorder invented,
+// hiding the very response defect the artifact exists to preserve
+// (shardpilot/shardpilot-go#85 review).
+//
+// Narrowed to EMPTY rather than to "not a cookie token", which the review asked
+// for: a name of one NUL byte is not a token either, and this file deliberately
+// MEASURES that one — the wider predicate turned
+// `TestEveryComponentIsMeasuredAsReceived` red.
+func TestAnEmptyCookieNameIsWithheld(t *testing.T) {
+	for _, c := range []struct {
+		line     string
+		withheld bool
+	}{
+		{"Set-Cookie: =secret", true},
+		{"Set-Cookie:  =secret", true},
+		{"Set-Cookie: =", true},
+		{"Set-Cookie: sid=x", false},
+		{"Set-Cookie: " + escapeMarks(capturedMark) + "=x", false},
+	} {
+		suppliedValues = nil
+		structuralSurfaces, accountedSurfaces = nil, nil
+		got := stripMarks(redactSetCookie(c.line))
+		if w := strings.Contains(got, "<withheld>"); w != c.withheld {
+			t.Errorf("%q: withheld=%v, want %v: %q", c.line, w, c.withheld, got)
+		}
+		if c.withheld && len(structuralSurfaces) == 0 {
+			t.Errorf("%q was withheld without a refusal in the ledger", c.line)
+		}
+		if strings.Contains(got, "redacted-0-chars") {
+			t.Errorf("%q produced a zero-length placeholder, which is a cookie this recorder invented: %q", c.line, got)
+		}
+	}
+	structuralSurfaces, accountedSurfaces = nil, nil
+}
+
+// A trailer coding refusal is about bytes, and an empty body has none.
+//
+// ⚠ THE HEADER PATH ASKS `hasBody` AND THE TRAILER PATH DID NOT. A zero-length
+// response announcing `Content-Encoding: br` in its trailer had an otherwise
+// publishable capture withheld with exit 4 over bytes that do not exist
+// (shardpilot/shardpilot-go#85 review) — the fifth time a rule written on the
+// header path had to be carried to the trailer path.
+func TestATrailerCodingOnAnEmptyBodyDoesNotRefuse(t *testing.T) {
+	for _, c := range []struct {
+		body    string
+		refused bool
+	}{
+		{"", false}, {" ", true}, {"x", true},
+	} {
+		structuralSurfaces, accountedSurfaces = nil, nil
+		suppliedValues = nil
+		tee := &teeBody{trailer: map[string][]string{"Content-Encoding": {"br"}}}
+		tee.buf.WriteString(c.body)
+		(&exchange{captured: tee}).trailerReport()
+		if got := len(structuralSurfaces) > 0; got != c.refused {
+			t.Errorf("body %q: refused=%v, want %v", c.body, got, c.refused)
+		}
+	}
+	structuralSurfaces, accountedSurfaces = nil, nil
 }
