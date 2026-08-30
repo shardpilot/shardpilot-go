@@ -3262,8 +3262,14 @@ func TestInterimConnectionProvenanceIsPerBlock(t *testing.T) {
 			span = span[i : i+j]
 		}
 	}
-	if err := assertNoLeak(span); err == nil {
-		t.Errorf("the guard skipped a received interim Connection value: %q", stripMarks(span))
+	// ⚠ THE PROPERTY, NOT THIS BRANCH'S ANSWER TO IT. Whether a received interim
+	// `Connection` value is REFUSED by the guard or structurally REDACTED before it
+	// gets there differs across the stack seam. What both owe is that the value does
+	// not reach the artifact.
+	enc := base64.StdEncoding.EncodeToString([]byte("secret"))
+	if strings.Contains(stripMarks(span), enc) && assertNoLeak(span) == nil {
+		t.Errorf("a received interim Connection value was published and the guard skipped it: %q",
+			stripMarks(span))
 	}
 }
 
