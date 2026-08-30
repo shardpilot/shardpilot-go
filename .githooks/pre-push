@@ -329,7 +329,34 @@ tracked_scanner="$root/scripts/check_public_surface.sh"
 # path where `.git` is a FILE, and the hook is never executed
 # (shardpilot/shardpilot-go#79 review). Measured: main worktree `.git`, linked
 # worktree an absolute path; the recovery hint printed the relative one too.
-hooks_dir="$(cd "$(git rev-parse --git-common-dir)" 2>/dev/null && pwd)/hooks"
+# ⚠ AND THE STATUS IS CHECKED, because the failure of this substitution is not an
+# empty value -- it is a WRONG one. If `git rev-parse --git-common-dir` fails, the
+# inner `$( )` is empty, `cd ""` fails, `pwd` never runs, and the whole expression
+# becomes `/hooks`; with the `cd` succeeding into the current directory instead it
+# becomes `$PWD/hooks`. Either way the symlink check below then tests a path that
+# does not exist and PASSES vacuously, and `scanner` points somewhere inside the
+# checkout -- the branch-controlled content this gate installs outside the worktree
+# to avoid.
+#
+# Found by enumerating every status-discarding substitution in this file rather
+# than by a review: 12 of them, 11 of which fail only by absence and are handled.
+# This is the twelfth (shardpilot/shardpilot-go#79, derived population).
+common_dir="$(git rev-parse --git-common-dir 2>/dev/null)" || common_dir=""
+if [ -z "$common_dir" ]; then
+  printf 'REFUSING: could not locate the common git directory.
+' >&2
+  printf '  Every path this gate trusts is derived from it, and a failure here
+' >&2
+  printf '  yields a path inside the checkout rather than no path at all.
+' >&2
+  exit 2
+fi
+hooks_dir="$(cd "$common_dir" 2>/dev/null && pwd)/hooks"
+if [ "$hooks_dir" = "/hooks" ] || [ -z "${hooks_dir%/hooks}" ]; then
+  printf 'REFUSING: the common git directory %s could not be resolved.
+' "$common_dir" >&2
+  exit 2
+fi
 scanner="$hooks_dir/check_public_surface.sh"
 # ⚠ CLASS: A PATH THIS GATE TRUSTS MAY BE A SYMLINK, AND EVERY TEST BELOW FOLLOWS
 # ONE. `-x` and `-s` answer about the TARGET, so an intuitive link from the
