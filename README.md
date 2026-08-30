@@ -312,6 +312,8 @@ No Makefile — standard Go tooling.
 
 ```
 h="$(cd "$(git rev-parse --git-common-dir)" && pwd -P)/hooks" &&
+w="$(cd "$(git rev-parse --show-toplevel)" && pwd -P)" &&
+case "$h/" in "$w"/*) echo "$h is inside the worktree $w" >&2; exit 1 ;; esac &&
 test ! -L "$h" &&
 mkdir -p "$h" &&
 for f in pre-push check_public_surface.sh .pre-push.new .check_public_surface.sh.new; do
@@ -326,9 +328,10 @@ done < "$wt" > "$wp" &&
 while IFS= read -r -d "" w; do
   git -C "$w" config --worktree --unset-all core.hooksPath 2>/dev/null || true
 done < "$wp" &&
-cp .githooks/pre-push "$h/.pre-push.new" &&
-cp scripts/check_public_surface.sh "$h/.check_public_surface.sh.new" &&
-chmod +x "$h/.pre-push.new" "$h/.check_public_surface.sh.new" &&
+{ cp .githooks/pre-push "$h/.pre-push.new" &&
+  cp scripts/check_public_surface.sh "$h/.check_public_surface.sh.new" &&
+  chmod +x "$h/.pre-push.new" "$h/.check_public_surface.sh.new"; } ||
+  { rm -f "$h/.pre-push.new" "$h/.check_public_surface.sh.new"; exit 1; } &&
 mv "$h/.pre-push.new" "$h/pre-push" &&
 mv "$h/.check_public_surface.sh.new" "$h/check_public_surface.sh" &&
 git config --local core.hooksPath "$h" &&
@@ -339,6 +342,21 @@ while IFS= read -r -d "" w; do
 done < "$wp" &&
 rm -f "$wt" "$wp"
 ```
+
+**The hooks directory must be OUTSIDE the worktree, and that is checked rather
+than inferred from `-L`.** A repository initialised with
+`--separate-git-dir="$PWD/.repo"` has an ordinary common git directory beneath its
+own checkout: `$h` is no symlink, so the link test passes, while everything under
+it is trackable and `git reset --hard <branch>` can replace the installed hook or
+the scanner before the next push. The symlink test was a proxy for containment
+that holds only in the usual layout; containment is now asked directly, here and
+at the hook's own startup.
+
+**The two copies are made and removed together.** The first can succeed and the
+second fail -- an unreadable scanner, a full filesystem -- leaving `.pre-push.new`
+behind to be refused by the occupied-path guard on the next run. They are one
+group whose failure removes exactly this invocation's files, which is not a trap:
+it runs on the failure of the copies themselves, not at an arbitrary later point.
 
 **Nothing is written into the hooks directory until the fallible work is done.**
 The previous version copied the `.new` files first and only moved the renames

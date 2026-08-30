@@ -269,7 +269,18 @@ git_safe() { git -c core.hooksPath="$hooks_off" "$@"; }
 # one there is) left an empty directory behind for good
 # (shardpilot/shardpilot-go#79 review). A cleanup that begins after the first
 # thing that can exit is not cleanup.
+# ⚠ ABSOLUTE AND PHYSICAL, IMMEDIATELY. With a relative `TMPDIR` -- `TMPDIR=tmp`
+# is legal -- `mktemp -d` returns a relative pathname, and this file runs dozens of
+# `( cd "$wt" && … )` in which that name then means something else: staging looked
+# for `tmp/tmp.X/committed-object` under the temporary worktree and refused every
+# otherwise valid push (shardpilot/shardpilot-go#79 review). A relative path is a
+# value whose meaning depends on where it is read, and this program reads it from
+# several places.
 tmpdir="$(mktemp -d)"
+tmpdir="$( cd "$tmpdir" && pwd -P )" || {
+  printf 'REFUSING: the temporary directory could not be resolved.\n' >&2
+  exit 2
+}
 base_ref=""
 cleanup() {
   git_safe worktree remove --force "$tmpdir/wt" >/dev/null 2>&1 || true
@@ -369,6 +380,24 @@ scanner="$hooks_dir/check_public_surface.sh"
 # Three rounds fixed this by name -- final names, then temporary names, now the
 # directory and the target. The class is "a path whose NATURE was not checked", and
 # it is checked here for both.
+# ⚠ AND OUTSIDE THE WORKTREE, WHICH `-L` DOES NOT ASK. A repository initialised
+# with `--separate-git-dir="$PWD/.repo"` has an ordinary common git directory
+# BENEATH its own checkout, so `$h` is no symlink and the test below passes -- while
+# `.repo/hooks/pre-push` and the trusted scanner are trackable paths a branch can
+# provide, and `git reset --hard <branch>` overwrites the installed bytes before the
+# next push (shardpilot/shardpilot-go#79 review). The property is CONTAINMENT, and
+# the symlink test was a proxy for it that holds only in the usual layout.
+worktree_root="$( cd "$(git rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null && pwd -P )" || worktree_root=""
+if [ -n "$worktree_root" ]; then
+  case "$hooks_dir/" in
+    "$worktree_root"/*)
+      printf 'REFUSING: the hooks directory %s is inside the worktree %s.\n' "$hooks_dir" "$worktree_root" >&2
+      printf '  Everything under it is trackable, so a branch can supply the hook or\n' >&2
+      printf '  the scanner and a checkout can replace the installed bytes.\n' >&2
+      exit 2
+      ;;
+  esac
+fi
 for tp in "$hooks_dir" "$scanner"; do
   if [ -L "$tp" ]; then
     printf 'REFUSING: %s is a symbolic link.\n' "$tp" >&2
@@ -613,8 +642,15 @@ scan_commit() {
     # as they are. A failure refuses: unstaged evidence is unread evidence, and
     # this gate does not report on what it has not read.
     blob="$( cd "$wt" && git_safe hash-object -w --no-filters -- "$3" 2>/dev/null )"
+    # ⚠ THE MODE IS PART OF WHAT THE SCANNER CLASSIFIES BY. Everything was staged
+    # `100644`, so a tagged tree's SYMLINK -- `logo.png -> assets/logo` -- reached
+    # the scanner as a regular file whose leaf ends in `.png`, and its image rule
+    # refused a push the same symlink in an ordinary commit passes
+    # (shardpilot/shardpilot-go#79 review). The scanner has a `120000` branch; it
+    # was never reachable through this path.
+    mode="${4:-100644}"
     if [ -z "$blob" ] || ! ( cd "$wt" && git_safe update-index --add \
-         --cacheinfo "100644,$blob,$2" 2>/dev/null ); then
+         --cacheinfo "$mode,$blob,$2" 2>/dev/null ); then
       printf 'REFUSING: could not stage %s for scanning in %s.\n' "$2" "$1" >&2
       exit 2
     fi
@@ -699,7 +735,13 @@ scan_commit() {
   if [ -n "${6:-}" ] && [ -d "$6" ]; then
     for tb in "$6"/*; do
       [ -f "$tb" ] || continue
-      stage_evidence "$1" "scripts/tag-tree-${tb##*/}" "$tb"
+      case "$tb" in *.mode) continue ;; esac
+      tbmode=100644
+      if [ -f "$tb.mode" ]; then
+        tbmode="$(cat "$tb.mode")"
+      fi
+      case "$tbmode" in 100644|100755|120000) ;; *) tbmode=100644 ;; esac
+      stage_evidence "$1" "scripts/tag-tree-${tb##*/}" "$tb" "$tbmode"
     done
   fi
 
@@ -1272,6 +1314,11 @@ while read -r local_ref local_sha remote_ref remote_sha; do
             exit 2
           fi
           [ "$otype" = blob ] || continue
+          # The MODE travels with the blob: `120000` is a symlink and the scanner
+          # classifies it differently from a regular file. Recorded beside the
+          # staged bytes rather than inferred later, because the listing is the only
+          # place that knows it.
+          omode="${meta%% *}"
           [ -n "$oid" ] || continue
           nb=$((nb + 1))
           case "$path" in
@@ -1303,6 +1350,8 @@ while read -r local_ref local_sha remote_ref remote_sha; do
           [ -n "$leaf" ] || leaf="blob"
           read_evidence "$tmpdir/tag-blobs/$nb-$leaf" write \
             "a blob reached through the tagged tree ($oid)" cat-file blob "$oid"
+          run_evidence "$tmpdir/tag-blobs/$nb-$leaf.mode" write \
+            "the mode of a blob reached through the tagged tree" printf '%s' "$omode"
         done < "$tmpdir/tag-tree-listing"
         run_evidence "$tmpdir/tag-target" append "the tagged tree listing" \
           cat "$tmpdir/tag-tree-listing-text"
