@@ -288,6 +288,28 @@ export GIT_SHALLOW_FILE
 # arbitrary code on this machine merely by being inspected, before any scan.
 # Every git command below runs with hooks pointed at an empty directory.
 hooks_off="$(mktemp -d)"
+# ⚠ THE TRAP GOES ON AS SOON AS THERE IS SOMETHING TO CLEAN. Everything between
+# this line and the `trap` below can exit -- the second `mktemp`, resolving it,
+# preparing the private object store -- and each of those paths left the first
+# directory behind, on every retry, under the comment that states the cleanup
+# invariant (shardpilot/shardpilot-go#79 review). The handler names variables that
+# may not exist yet, so it reads them with defaults; a cleanup that assumes the
+# state it is cleaning up is a cleanup for the successful path only.
+cleanup() {
+  git_safe worktree remove --force "${tmpdir:-}/wt" >/dev/null 2>&1 || true
+  rm -rf "${tmpdir:-}" "${hooks_off:-}"
+  # ⚠ NO GLOBAL PRUNE. `git worktree prune` removes the administrative record of
+  # EVERY missing worktree, not only this one -- so an unrelated worktree on a
+  # temporarily disconnected mount lost its metadata, and came back as "not a
+  # repository" (shardpilot/shardpilot-go#79 review). Cleanup removes what this
+  # hook created and nothing else.
+  # Through `git_safe`, like the normal deletion: the stated invariant is that
+  # nothing this hook runs fires a repository hook, and an EXIT path that skips
+  # the wrapper is the invariant holding only when nothing goes wrong
+  # (shardpilot/shardpilot-go#79 review).
+  [ -n "${base_ref:-}" ] && git_safe update-ref -d "$base_ref" 2>/dev/null || true
+}
+trap cleanup EXIT
 git_safe() { git -c core.hooksPath="$hooks_off" "$@"; }
 # ⚠ THE TEMPORARIES AND THEIR TRAP ARE ONE STEP. Both directories were created
 # here and at line ~170, with the trap installed only after the second -- so
@@ -339,21 +361,6 @@ fi
 GIT_OBJECT_DIRECTORY="$evidence_objects"
 export GIT_OBJECT_DIRECTORY
 base_ref=""
-cleanup() {
-  git_safe worktree remove --force "$tmpdir/wt" >/dev/null 2>&1 || true
-  rm -rf "$tmpdir" "$hooks_off"
-  # ⚠ NO GLOBAL PRUNE. `git worktree prune` removes the administrative record of
-  # EVERY missing worktree, not only this one -- so an unrelated worktree on a
-  # temporarily disconnected mount lost its metadata, and came back as "not a
-  # repository" (shardpilot/shardpilot-go#79 review). Cleanup removes what this
-  # hook created and nothing else.
-  # Through `git_safe`, like the normal deletion: the stated invariant is that
-  # nothing this hook runs fires a repository hook, and an EXIT path that skips the
-  # wrapper is the invariant holding only when nothing goes wrong
-  # (shardpilot/shardpilot-go#79 review).
-  [ -n "${base_ref:-}" ] && git_safe update-ref -d "$base_ref" 2>/dev/null || true
-}
-trap cleanup EXIT
 
 # ⚠ THE REFSPEC IS BUFFERED BEFORE ANYTHING TOUCHES A COMMIT-CONTROLLED PATH.
 # A commit replacing the tracked scanner with a symlink to `/dev/stdin` made the
@@ -625,10 +632,15 @@ while IFS=" " read -r _ lsha _ _; do
 done <<PUSHED_LINES
 $pushed_lines
 PUSHED_LINES
+# ⚠ RESOLVED ALWAYS, REQUIRED CONDITIONALLY. The condition is about whether a
+# MISSING HEAD is a refusal, and my first version made it about whether to LOOK --
+# so every non-commit push from a repository that HAS history lost its scan base
+# and fell into the synthetic branch, and five scenes that had published for rounds
+# went red at once. The battery said so before the push did.
+head_sha="$(git rev-parse HEAD 2>/dev/null && printf X)" || head_sha=""
+head_sha="${head_sha%X}"
+head_sha="${head_sha%$NL}"
 if [ "$needs_head" = yes ]; then
-  head_sha="$(git rev-parse HEAD 2>/dev/null && printf X)" || head_sha=""
-  head_sha="${head_sha%X}"
-  head_sha="${head_sha%$NL}"
   if [ -z "$head_sha" ]; then
     printf 'REFUSING: this push introduces commits, and HEAD could not be resolved\n' >&2
     printf '  to place them. A scan that cannot locate the pushed history is not a scan.\n' >&2
@@ -1319,7 +1331,28 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # creating a branch at it could be refused by the commit budget or the lane-B
   # ratchet for republishing what is already public
   # (shardpilot/shardpilot-go#79 review).
-  published="$(git ls-remote -- "$dest" 2>/dev/null | awk '{print $1}')"
+  # ⚠ AND THE STATUS, BECAUSE EMPTY OUTPUT HAS TWO MEANINGS. A transient failure
+  # here prints nothing, and nothing reads as "the destination publishes no refs"
+  # -- so commits already reachable from another advertised ref were counted as
+  # newly introduced and the push could be refused by the commit budget or the
+  # ratchet for republishing what is already public
+  # (shardpilot/shardpilot-go#79 review). This is the twelfth status-discarding
+  # substitution in this file, found the same way as the eleventh, and it is the
+  # one that fails towards a false REFUSAL rather than a false pass.
+  #
+  # `--exit-code` distinguishes them: 2 is "no matching refs", which is a real
+  # empty set, and anything else nonzero is the transport failing.
+  pub_rc=0
+  published_raw="$(git ls-remote --exit-code -- "$dest" 2>/dev/null)" || pub_rc=$?
+  if [ "$pub_rc" -ne 0 ] && [ "$pub_rc" -ne 2 ]; then
+    printf 'REFUSING: could not enumerate the published refs of %s (git exited %s).\n' \
+      "$safe_dest" "$pub_rc" >&2
+    printf '  An enumeration that failed prints nothing, and nothing reads as "this\n' >&2
+    printf '  destination publishes nothing" -- which charges the push for commits it\n' >&2
+    printf '  is not introducing.\n' >&2
+    exit 2
+  fi
+  published="$(printf '%s\n' "$published_raw" | awk 'NF{print $1}')"
   # ⚠ ONE ROUND TRIP, NOT ONE PER TIP. A repository advertising hundreds of refs
   # made this a serial fetch per missing tip -- minutes of gate for a push that
   # takes seconds, which is how a gate gets uninstalled
@@ -1628,19 +1661,34 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       # gains nothing.
       scan_target="$head_sha"
       if [ -z "$scan_target" ]; then
-        empty_tree="$(git hash-object -t tree /dev/null 2>/dev/null && printf X)" || empty_tree=""
-        empty_tree="${empty_tree%X}"
-        empty_tree="${empty_tree%$NL}"
-        if [ -n "$empty_tree" ]; then
-          scan_target="$(git commit-tree "$empty_tree" -m 'synthetic scan base' 2>/dev/null && printf X)" || scan_target=""
-          scan_target="${scan_target%X}"
-          scan_target="${scan_target%$NL}"
-        fi
-        if [ -z "$scan_target" ]; then
-          printf 'REFUSING: this repository has no history and no scan base could be\n' >&2
-          printf '  synthesised, so the published object cannot be staged for scanning.\n' >&2
-          exit 2
-        fi
+        # ⚠ AND A SYNTHETIC BASE CANNOT SATISFY THE SCANNER'S SELF-AUDIT.
+        #
+        # The trusted scanner refuses when a roster literal in its own file appears
+        # nowhere ELSE in the tree it is scanning -- a real protection, because every
+        # release archive carries that file. A base synthesised for a repository with
+        # no history holds the published object and the scanner and nothing else, so
+        # the audit fires by construction. Measured with the real scanner:
+        # `4 literal(s) in this file exist nowhere else in this tree`
+        # (shardpilot/shardpilot-go#79 review); the previous round's fix made the
+        # push reach the scan and the scan could not pass.
+        #
+        # The repair the review asks for -- separating that self-validation from the
+        # scan of a synthetic evidence tree -- belongs in
+        # `scripts/check_public_surface.sh`, which another lane owns. Satisfying the
+        # audit from HERE would mean writing a decoy second copy of the scanner into
+        # the tree, which passes the check by defeating it. So this refuses, and says
+        # which of the two it is: a limit of the gate, not a finding about the push.
+        #
+        # ⚠ AND ONLY HERE. My first version put this refusal after the whole block, so
+        # it fired for EVERY non-commit push -- five scenes that had published for
+        # rounds went red at once, which is what a batteryged before pushing is for.
+        printf 'REFUSING: %s introduces no commit and this repository has no history,\n' "${local_ref:-that ref}" >&2
+        printf '  so the only scan base would be synthetic -- and the trusted scanner\n' >&2
+        printf '  audits its own literals against the tree it scans, which a two-file\n' >&2
+        printf '  synthetic tree cannot satisfy. This is a limit of the gate, not a\n' >&2
+        printf '  finding about what you are pushing: make one commit first, or\n' >&2
+        printf '  --no-verify and own it.\n' >&2
+        exit 2
       fi
     fi
     scan_ref_name "$scan_target" "$base" "$remote_ref" "$tag_object" "$tag_target" "$tag_blobs" || status=$?

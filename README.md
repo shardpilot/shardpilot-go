@@ -316,8 +316,9 @@ g="$(git rev-parse --git-common-dir && printf X)" && g="${g%X}" && g="${g%?}" &&
 t="$(git rev-parse --show-toplevel && printf X)" && t="${t%X}" && t="${t%?}" &&
 h="$(p_ "$g")" && h="${h%X}/hooks" &&
 w="$(p_ "$t")" && w="${w%X}" &&
+p="$w/" && case "$p" in //) p=/ ;; esac &&
 case "$h/" in
-  "$w"/*) case "/${h#"$w"/}/" in
+  "$p"*) case "/${h#"$p"}/" in
             */.git/*) : ;;
             *) echo "$h is inside the worktree $w and trackable there" >&2; exit 1 ;;
           esac ;;
@@ -360,6 +361,12 @@ question: `<root>/.git/hooks` is inside it and no branch can reach it, because g
 refuses to track any path with a `.git` component. Testing containment alone
 refused the ordinary layout and this installer could not run at all; the `.git`
 component is git's own line, and it is the one drawn here.
+
+**And the root is normalised before the prefix match.** With a worktree at `/`,
+`"$w"/*` expands to `//*` and matches nothing, so a separate git directory at
+`/repo` passed a containment check that never ran. The runtime check was fixed and
+this one was not — two copies of a rule, and only the copy the reviewer pointed at
+moved.
 
 **Every path here is read with a sentinel**, because `$( )` strips trailing
 newlines and a directory name may end in one — twice over, since the value passes
