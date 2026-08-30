@@ -586,7 +586,19 @@ scan_commit() {
     # checkout rules, so a path can be present in the index and absent from the
     # filesystem -- and `[ -e ]` then reports a reserved evidence path free while
     # the commit owns it (shardpilot/shardpilot-go#79 review).
-    if git cat-file -e "$1:$2" 2>/dev/null || [ -e "$wt/$2" ] || [ -L "$wt/$2" ]; then
+    # ⚠ AND ASK ABOUT THE ENTRY, NOT ABOUT ITS TARGET. `cat-file -e "$1:$2"`
+    # DEREFERENCES: a `160000` gitlink whose target commit is absent locally --
+    # which git permits, since a gitlink's target need not be transferred -- makes
+    # it exit non-zero although the tree entry exists. The no-checkout worktree has
+    # no filesystem leaf either, so the path read as free, `update-index` replaced
+    # the gitlink with synthetic evidence, and the scanner's own gitlink refusal
+    # never saw it (shardpilot/shardpilot-go#79 review).
+    #
+    # `ls-tree` answers about the ENTRY. Same shape as the tagged-tree finding two
+    # rounds ago: a probe that resolves an object cannot report on an object it
+    # cannot resolve.
+    if [ -n "$(git ls-tree --name-only "$1" -- "$2" 2>/dev/null)" ] ||
+       git cat-file -e "$1:$2" 2>/dev/null || [ -e "$wt/$2" ] || [ -L "$wt/$2" ]; then
       printf 'REFUSING: %s already tracks %s, which this gate needs as an\n' "$1" "$2" >&2
       printf '  evidence path. A commit that owns it can hide content from the\n' >&2
       printf '  scan or redirect this write outside the worktree.\n' >&2

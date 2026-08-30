@@ -317,9 +317,6 @@ mkdir -p "$h" &&
 for f in pre-push check_public_surface.sh .pre-push.new .check_public_surface.sh.new; do
   test ! -e "$h/$f" && test ! -L "$h/$f" || { echo "$h/$f is occupied" >&2; exit 1; }
 done &&
-cp .githooks/pre-push "$h/.pre-push.new" &&
-cp scripts/check_public_surface.sh "$h/.check_public_surface.sh.new" &&
-chmod +x "$h/.pre-push.new" "$h/.check_public_surface.sh.new" &&
 wt="$(mktemp)" && wp="$(mktemp)" &&
 git worktree list --porcelain -z > "$wt" &&
 test -s "$wt" &&
@@ -329,6 +326,9 @@ done < "$wt" > "$wp" &&
 while IFS= read -r -d "" w; do
   git -C "$w" config --worktree --unset-all core.hooksPath 2>/dev/null || true
 done < "$wp" &&
+cp .githooks/pre-push "$h/.pre-push.new" &&
+cp scripts/check_public_surface.sh "$h/.check_public_surface.sh.new" &&
+chmod +x "$h/.pre-push.new" "$h/.check_public_surface.sh.new" &&
 mv "$h/.pre-push.new" "$h/pre-push" &&
 mv "$h/.check_public_surface.sh.new" "$h/check_public_surface.sh" &&
 git config --local core.hooksPath "$h" &&
@@ -339,6 +339,13 @@ while IFS= read -r -d "" w; do
 done < "$wp" &&
 rm -f "$wt" "$wp"
 ```
+
+**Nothing is written into the hooks directory until the fallible work is done.**
+The previous version copied the `.new` files first and only moved the renames
+later -- so a failure in the enumeration left those copies behind, and the next
+run refused them as occupied at the guard above. Recovery then needed manual
+cleanup that no line here documents. The copies are made after the enumeration
+now, so a failure leaves the directory exactly as it was found.
 
 **The fallible work runs BEFORE either publication step.** Published first, a
 failure in the worktree enumeration left the final names occupied while
