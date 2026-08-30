@@ -869,38 +869,52 @@ var benignTopLevel = func() map[string]bool {
 
 // topLevelExemptions picks the registry a body of this status is described by.
 //
-// ⚠ 200 EXACTLY, NOT "BELOW 400". `applyExperimentAssignment` parses
-// `expAssignmentWire` for status 200 and for nothing else, so on a `201` the SDK
-// never decodes that shape -- and exempting its member names there marked
-// endpoint-chosen text as generated grammar: with a supplied `assigned` and a body
-// of `{"assigned":false}`, the identifier was published out of a body shape
-// nothing reads (shardpilot/shardpilot-go#85 review). "Not an error" is not "the
-// assignment shape"; the SDK's own condition is equality with 200.
+// ⚠ THE SDK'S OWN PRECONDITIONS COME FIRST. Both SDK paths refuse a body before
+// its schema means anything: `parseExperimentVerdict` and `experimentBodyErrorText`
+// each return early when the body is incomplete or longer than `expMaxBodyBytes`.
+// A status-200 body one byte over that limit is therefore never parsed as an
+// assignment -- and exempting its member names marked an endpoint-controlled name
+// as generated, so a supplied `assigned` was published with an empty refusal
+// ledger (shardpilot/shardpilot-go#85 review).
 //
-// A status this program cannot read, and any other sub-400, take NO schema
-// exemptions. That direction costs a label on an unusual response and cannot
-// publish: an unexempted name is scrubbed, and over-exempting is what published.
-func topLevelExemptions(statusLine string) map[string]bool {
-	f := strings.Fields(strings.TrimSuffix(statusLine, "\r"))
-	if len(f) >= 2 && strings.HasPrefix(f[0], "HTTP/") {
-		if n, err := strconv.Atoi(f[1]); err == nil {
-			switch {
-			case n == 200:
-				return assignmentTopLevel
-			// ⚠ AND THE ERROR ENVELOPE IS READ AT 400 AND 403, NOT AT EVERY 4xx.
-			// `applyExperimentAssignment` calls `experimentBodyErrorText` only for those
-			// two -- the subject-grammar sentinel and the real-subjects sentinel -- and
-			// classifies every other status by the status alone. Exempting `error` at a
-			// 404 marked an endpoint-selected member name as SDK grammar and published a
-			// supplied identifier (shardpilot/shardpilot-go#85 review). Fifth axis this
-			// registry has been wrong about: depth, membership, shape, status, and now
-			// WHICH statuses.
-			case n == 400 || n == 403:
-				return errorTopLevel
-			}
-		}
+// Size is the whole test, because this recorder's ceiling sits exactly one byte
+// ABOVE the SDK's: a capture at the ceiling is indeterminate -- it may be whole or
+// truncated -- and already fails this comparison. That is what `capturedBodyMax`
+// is written for, and why incompleteness needs no separate signal here.
+//
+// ⚠ AND A STATUS THIS PROGRAM CANNOT READ EXEMPTS NOTHING. An earlier round took
+// the ASSIGNMENT set for an unparsable head, arguing that a head we cannot read is
+// no licence to exempt the error shape's names. True -- and no licence to exempt
+// the assignment shape's either. The SDK classifies by status; with no status
+// there is no classification (shardpilot/shardpilot-go#84 review).
+func topLevelExemptions(statusLine, body string) map[string]bool {
+	none := map[string]bool{}
+	if len(body) > sdkMaxBodyBytes {
+		return none
 	}
-	return map[string]bool{}
+	f := strings.Fields(strings.TrimSuffix(statusLine, "\r"))
+	if len(f) < 2 || !strings.HasPrefix(f[0], "HTTP/") {
+		return none
+	}
+	n, err := strconv.Atoi(f[1])
+	if err != nil {
+		return none
+	}
+	switch {
+	case n == 200:
+		return assignmentTopLevel
+	// ⚠ AND THE ERROR ENVELOPE IS READ AT 400 AND 403, NOT AT EVERY 4xx.
+	// `applyExperimentAssignment` calls `experimentBodyErrorText` only for those
+	// two -- the subject-grammar sentinel and the real-subjects sentinel -- and
+	// classifies every other status by the status alone. Exempting `error` at a
+	// 404 marked an endpoint-selected member name as SDK grammar and published a
+	// supplied identifier (shardpilot/shardpilot-go#85 review). Fifth axis this
+	// registry has been wrong about: depth, membership, shape, status, and now
+	// WHICH statuses.
+	case n == 400 || n == 403:
+		return errorTopLevel
+	}
+	return none
 }
 
 // receivedConnection records whether the ENDPOINT sent a `Connection` field, as
@@ -1269,6 +1283,11 @@ func topLevelMembers(body string) []string {
 // in redact.go: the guard half must build without the redaction half, and the
 // merge that brought the two together defined it twice
 // (shardpilot/shardpilot-go#85, stack seam).
+// The identifiers this harness ASKED FOR, kept per slot. `suppliedValues` answers
+// "did we supply this string"; these answer "is this the value we asked for HERE",
+// which is the question `expEchoMatches` asks and the one a flat list cannot.
+var requestedAppKey, requestedEnvKey, requestedExpKey string
+
 var structuralSurfaces []string
 
 // accountedSurfaces records what structural redaction REWROTE and can describe.
@@ -1336,12 +1355,49 @@ type exchangeRefusals struct {
 // a JSON prefix and a syntax error for something that is not JSON at all, so the
 // two are distinguishable without reading an error's text -- which is what this
 // file requires of every other error it classifies.
+// jsonTailIsStructuralOnly reports whether bytes the decoder did not consume are
+// nothing but JSON whitespace and structure, so a cut there left no partial value
+// behind.
+//
+// ⚠ THE ALPHABET, NOT A PARSE. This is not a second JSON reader: it asks whether a
+// tail could contain the beginning of a VALUE, and every value in this grammar
+// starts with a byte outside this set. Over-refusing here costs a capture; the
+// direction it refuses in is the one that publishes.
+func jsonTailIsStructuralOnly(tail string) bool {
+	for i := 0; i < len(tail); i++ {
+		switch tail[i] {
+		case ' ', '\t', '\r', '\n', ',', ':', '{', '}', '[', ']':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func truncationCausedTheFailure(body []byte) bool {
 	d := json.NewDecoder(bytes.NewReader(body))
 	var v json.RawMessage
 	err := d.Decode(&v)
 	if errors.Is(err, io.ErrUnexpectedEOF) {
-		return true
+		// ⚠ AND A PREFIX MAY BE CUT *INSIDE* A VALUE. `{"assigned":false,
+		// "variant_payload":{"token":"server-secret-tok` is a JSON prefix by this
+		// sentinel, and neither body redactor can traverse a malformed document -- so
+		// both returned the token unchanged, this excuse removed every refusal, and the
+		// exit-3 report published it (shardpilot/shardpilot-go#85 review). The
+		// supplied-value scrub cannot see it either: the token is the endpoint's.
+		//
+		// The decoder is asked HOW FAR IT GOT, and the excuse holds only when what it
+		// did not consume is structure -- whitespace and punctuation. A tail carrying
+		// the start of a value is a value extent nothing measured.
+		w := json.NewDecoder(bytes.NewReader(body))
+		off := int64(0)
+		for {
+			if _, terr := w.Token(); terr != nil {
+				break
+			}
+			off = w.InputOffset()
+		}
+		return jsonTailIsStructuralOnly(string(body[off:]))
 	}
 	if err != nil {
 		return false
@@ -1955,9 +2011,12 @@ func dropFraming(dump string) string {
 	if bodyStart < 0 {
 		return strings.Join(out, "\n")
 	}
-	exemptions := assignmentTopLevel
+	// The body as this pass sees it: the exemption question is partly about its
+	// SIZE, so the registry cannot be chosen from the status line alone.
+	exemptBody := strings.Join(out[bodyStart:], "\n")
+	exemptions := map[string]bool{}
 	if len(out) > 0 {
-		exemptions = topLevelExemptions(out[0])
+		exemptions = topLevelExemptions(out[0], exemptBody)
 	}
 	return strings.Join(out[:bodyStart], "\n") + "\n" +
 		redactUnaccountedBody(markBareJSONLiterals(redactUnaccountedJSONValues(redactMintedBody(strings.Join(out[bodyStart:], "\n"), exemptions), exemptions), exemptions))
@@ -2261,6 +2320,17 @@ type teeBody struct {
 // Both are reported as an incomplete capture, because a record cannot tell them
 // apart and guessing is the defect.
 const capturedBodyMax = (1 << 20) + 1
+
+// sdkMaxBodyBytes mirrors `expMaxBodyBytes`, which aliases `rcMaxBodyBytes` --
+// the size past which BOTH SDK read paths refuse a body before its schema means
+// anything.
+//
+// ⚠ ONE LITERAL, AND THE RELATION STATED. Writing `1 << 20` again would be a
+// second place for the same number to drift from; the ceiling above is defined as
+// one byte more than this on purpose, so the two move together by construction.
+// TestTheMirroredBodyLimitMatchesTheSDKs reads the SDK's own constant out of the
+// source and fails if either relation stops holding.
+const sdkMaxBodyBytes = capturedBodyMax - 1
 
 // snapTrailers copies the trailer block as it stands now.
 //
@@ -4756,6 +4826,12 @@ func main() {
 		env("SP_API_KEY"), env("SP_WORKSPACE_ID"), env("SP_APP_ID"),
 		env("SP_ENVIRONMENT_ID"), env("SP_EXPERIMENT_KEY"),
 	}
+	// ...and BY NAME as well, because one question needs the mapping the flat list
+	// throws away: whether an echoed member carries the value THIS request put in
+	// that slot. See the echo check in redactUnaccountedJSONValues.
+	requestedAppKey = env("SP_APP_ID")
+	requestedEnvKey = env("SP_ENVIRONMENT_ID")
+	requestedExpKey = env("SP_EXPERIMENT_KEY")
 
 	// The authority this program was pointed at, recorded before anything is sent:
 	// the `Host:` line carries it, and it is not endpoint text. See configuredHost.

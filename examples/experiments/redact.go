@@ -42,7 +42,6 @@ import (
 	"net/textproto"
 	"net/url"
 	"regexp"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -1449,35 +1448,44 @@ func redactUnaccountedJSONValues(body string, exempt map[string]bool) string {
 	// `{"reason":"kill_switch"}` published a supplied identifier with an empty
 	// ledger.
 	//
-	// ⚠ AND THE ECHO IS CHECKED AS FAR AS IT CAN BE. `expEchoMatches` tolerates an
-	// ABSENT member and requires a PRESENT one to be a string equal to the request's
-	// own value; equality needs the app, environment and experiment keys BY NAME,
-	// and `suppliedValues` is a flat list that does not say which value is which.
+	// ⚠ EACH ECHO AGAINST ITS OWN REQUEST VALUE. `expEchoMatches` requires a present
+	// member to equal the value THIS request carried in that slot, and a flat list of
+	// supplied values cannot say which value belongs in which member -- so an
+	// endpoint returning the app key in `experiment_key` passed a membership test
+	// that the SDK rejects, and `reason` was vouched for a body the SDK never
+	// classifies (shardpilot/shardpilot-go#85 review).
 	//
-	// What is sound without the mapping: a correctly echoed member is a value this
-	// harness supplied, so it is IN that list. An endpoint echoing something else
-	// fails the test and the vouch stops -- which is the direction that matters,
-	// since the SDK would reject that body and the value would not be its
-	// classification at all. The residual is a CROSS-SLOT echo: an endpoint that
-	// returns the app key in the experiment-key member passes this and is rejected
-	// by the SDK. Closing it means threading the three values through by name, which
-	// is the harness's configuration plumbing rather than this pass.
+	// The round before named this exact residual and priced it as configuration
+	// plumbing rather than this pass's work. That was the wrong price: a declared
+	// limit excuses a MISS, and this one publishes a supplied identifier with an
+	// empty ledger. The three values are threaded through by name now.
 	reasonIsSDKs := false
-	{
+	// ⚠ AND THE SDK'S SIZE GATE COMES FIRST. `parseExperimentVerdict` refuses a body
+	// over `expMaxBodyBytes` BEFORE decoding, so a 1 MiB+1 body carrying a perfectly
+	// well-formed verdict is not this SDK's classification at all -- the decode here
+	// succeeded and vouched `reason` anyway (same review). Same gate as the exemption
+	// registry, for the same reason.
+	if len(body) <= sdkMaxBodyBytes {
 		var shape sdkAssignmentWire
 		// Presence-aware, exactly as `expEchoMatches` states it: absent is tolerated,
 		// while a present member must be a JSON STRING and must be one this harness
 		// sent. A present non-string -- an explicit null included -- is not this
 		// contract's shape.
-		echoed := func(raw json.RawMessage) bool {
+		echoed := func(raw json.RawMessage, want string) bool {
 			if raw == nil {
 				return true
+			}
+			// ⚠ AN UNRECORDED REQUEST VALUE CANNOT CONFIRM AN ECHO. If this harness did
+			// not record what it asked for in that slot, a present member cannot be shown
+			// to be this request's -- and an unconfirmable echo is not a vouch.
+			if want == "" {
+				return false
 			}
 			var v string
 			if json.Unmarshal(raw, &v) != nil {
 				return false
 			}
-			return slices.Contains(suppliedValues, v)
+			return v == want
 		}
 		// ⚠ AND `version` IS PRESENCE-AWARE TOO. Absent is tolerated -- the
 		// traffic-gate shape carries none -- while a PRESENT one must decode to a
@@ -1491,7 +1499,9 @@ func redactUnaccountedJSONValues(body string, exempt map[string]bool) string {
 		// and the check did nothing -- and the scene said so on the first run.
 		if json.Unmarshal([]byte(view), &shape) == nil &&
 			shape.Assigned != nil && !*shape.Assigned &&
-			echoed(shape.AppKey) && echoed(shape.EnvironmentKey) && echoed(shape.ExperimentKey) {
+			echoed(shape.AppKey, requestedAppKey) &&
+			echoed(shape.EnvironmentKey, requestedEnvKey) &&
+			echoed(shape.ExperimentKey, requestedExpKey) {
 			versionOK := true
 			if shape.Version != nil {
 				var v *int64

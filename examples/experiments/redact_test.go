@@ -537,3 +537,51 @@ func TestAShapeAdmittedCookieAttributeIsRefusedOnCollision(t *testing.T) {
 		t.Fatalf("an enumerated attribute value was refused: %v", structuralSurfaces)
 	}
 }
+
+// TestAnEchoIsComparedWithItsOwnRequestValue: `expEchoMatches` asks whether a
+// present echoed member carries the value THIS request put in that slot. A flat
+// membership test cannot ask that, so an endpoint returning the app key in
+// `experiment_key` passed it — a body the SDK rejects — and `reason` was vouched
+// as this SDK's taxonomy, publishing a supplied identifier with an empty ledger
+// (shardpilot/shardpilot-go#85 review).
+func TestAnEchoIsComparedWithItsOwnRequestValue(t *testing.T) {
+	t.Cleanup(func() {
+		suppliedValues = nil
+		requestedAppKey, requestedEnvKey, requestedExpKey = "", "", ""
+	})
+	requestedAppKey, requestedExpKey = "app", "kill_switch"
+	suppliedValues = []string{"app", "kill_switch"}
+
+	got := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false,\"experiment_key\":\"app\",\"reason\":\"kill_switch\"}")))
+	if strings.Contains(got, "kill_switch") {
+		t.Fatalf("a cross-slot echo vouched a body the SDK rejects: %q", got)
+	}
+	// ⚠ AND THE RIGHT VALUE IN THE RIGHT SLOT STILL VOUCHES, or the repair is a
+	// refusal to vouch any body that echoes anything.
+	got = stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false,\"experiment_key\":\"kill_switch\",\"reason\":\"kill_switch\"}")))
+	if !strings.Contains(got, "kill_switch") {
+		t.Fatalf("a correctly echoed member lost the SDK's own classification: %q", got)
+	}
+}
+
+// TestAnOverLimitBodyIsNotThisSDKsVerdict: `parseExperimentVerdict` refuses a body
+// over `expMaxBodyBytes` BEFORE decoding, so a well-formed verdict past the ceiling
+// is not this SDK's classification at all — while the decode here succeeded and
+// vouched `reason` (shardpilot/shardpilot-go#85 review).
+func TestAnOverLimitBodyIsNotThisSDKsVerdict(t *testing.T) {
+	t.Cleanup(func() { suppliedValues = nil })
+	suppliedValues = []string{"kill_switch"}
+	verdict := `{"assigned":false,"reason":"kill_switch"}`
+
+	over := verdict + strings.Repeat(" ", sdkMaxBodyBytes)
+	if got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n" + over))); strings.Contains(got, "kill_switch") {
+		t.Fatalf("an over-limit body vouched its reason: %q", got[:160])
+	}
+	// ⚠ AND A BODY THE SDK WOULD READ STILL VOUCHES.
+	under := verdict + strings.Repeat(" ", 4096)
+	if got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n" + under))); !strings.Contains(got, "kill_switch") {
+		t.Fatalf("a body within the SDK's ceiling lost its classification: %q", got[:160])
+	}
+}
