@@ -425,6 +425,10 @@ const respSection = "## Response%s — header block re-serialised by " +
 // with a note attached would not be.
 // receivedConnection records whether the ENDPOINT sent a `Connection` field, as
 // opposed to the serialiser adding one. See where it is set.
+// configuredHost is the authority THIS PROGRAM was pointed at. The `Host:` line
+// carries it, and it is not endpoint text.
+var configuredHost string
+
 var receivedConnection bool
 
 var structuralSurfaces []string
@@ -1134,6 +1138,26 @@ func redact(dump []byte) []byte {
 		// The header's PRESENCE is kept -- an absent Authorization header is
 		// itself a client-profile defect this capture exists to detect, so
 		// replacing the line entirely would hide the failure it is meant to show.
+		// ⚠ THE CONFIGURED AUTHORITY IS OURS, VALUE AND ALL. The generic branch below
+		// marks only the field NAME, so with `SP_REMOTE_CONFIG_URL` of
+		// `https://app.shardpilot.com` and a legal experiment key of `app`, the guard
+		// found `app` inside the host this program itself configured and refused
+		// EVERY otherwise valid capture (shardpilot/shardpilot-go#84 review). The
+		// same rule as the fixed route and the serialiser-written headers: what this
+		// program put on the wire is not the endpoint's choice.
+		if configuredHost != "" && strings.HasPrefix(strings.ToLower(line), "host:") {
+			if i := strings.IndexByte(line, ':'); i > 0 {
+				v := strings.TrimSuffix(line[i+1:], "\r")
+				cr := ""
+				if strings.HasSuffix(line, "\r") {
+					cr = "\r"
+				}
+				if strings.TrimSpace(v) == configuredHost {
+					out = append(out, marked(line[:i+1]+v)+cr)
+					continue
+				}
+			}
+		}
 		if strings.HasPrefix(strings.ToLower(line), "authorization:") {
 			field := strings.SplitN(line, " ", 2)
 			scheme := "<redacted>"
@@ -1185,6 +1209,38 @@ func redact(dump []byte) []byte {
 // alike, so a run cannot end on a limit none of them was given.
 const captureDeadline = 30 * time.Second
 
+// noteStructuralInText applies the response path's REFUSAL question to text that
+// never became a response.
+//
+// ⚠ A TRANSPORT ERROR CARRIES THE OFFENDING LINE. Go rejects a malformed response
+// before returning one, and puts the complete bad header into the error — so
+// `Set-Cookie: session=<server value>` reached the report through the error
+// diagnostic, where only the supplied-value scrub ran: `dropFraming` never saw it,
+// nothing was added to structuralSurfaces, and the guard has no supplied value to
+// match a server-minted cookie against (shardpilot/shardpilot-go#84 review).
+//
+// The fields are the ones the response path already treats as server-generated.
+// This half REFUSES them; the change stacked on it redacts them, and inherits this
+// question rather than restating it.
+func noteStructuralInText(text string) {
+	for _, ln := range strings.Split(text, "\n") {
+		low := strings.ToLower(strings.TrimSpace(stripMarks(ln)))
+		// ⚠ CONTAINS, NOT HasPrefix. Go wraps the offending line in prose and quotes
+		// -- `malformed HTTP response "Set-Cookie: …"` -- so a prefix test never
+		// matched the shape the finding is about. Over-refusing an error diagnostic
+		// that merely mentions one of these fields is the safe direction, and the
+		// scene guards the other: an ordinary transport failure must stay reportable.
+		switch {
+		case strings.Contains(low, "set-cookie:"):
+			noteStructural("a server-set cookie inside a transport error")
+		case strings.Contains(low, "location:"):
+			noteStructural("a redirect target inside a transport error")
+		case strings.Contains(low, "www-authenticate:"), strings.Contains(low, "proxy-authenticate:"):
+			noteStructural("an authentication challenge inside a transport error")
+		}
+	}
+}
+
 // sanitize redacts any request URL an error carries. `url.Error` wraps the FULL
 // url, so printing a deadline or transport failure verbatim republished the
 // unredacted subject_key and every targeting value -- the same leak the request
@@ -1218,6 +1274,7 @@ func sanitizeCaptured(err error) string {
 	if err == nil {
 		return asCaptured("")
 	}
+	noteStructuralInText(err.Error())
 	return asCaptured(scrubSupplied(sanitizeText(escapeMarks(err.Error()))))
 }
 
@@ -1713,9 +1770,20 @@ func assertNoLeak(text string) error {
 			// supplied value inside it was never checked and was published
 			// (shardpilot/shardpilot-go#84 review). Only the message's own first
 			// line is protocol syntax.
+			// ⚠ AND THE SPAN MUST BE AN HTTP MESSAGE, not merely have a first line. The
+			// trailer report wraps EACH trailer in its own captured span, so a trailer
+			// named `X-YmFy` carrying the legal value `HTTP/1.1` was handed to `dataOf`
+			// as though it were a request line: the value was dropped, the header name
+			// was never collected, and `YmFy` was decoded as one url-base64 token
+			// instead of splitting out `bar` (shardpilot/shardpilot-go#84 review).
+			// Positional was the right correction one round ago and it was not the
+			// whole one: a position inside something that is not a message means
+			// nothing.
 			keep, ok := bare, true
 			if first {
-				keep, ok = dataOf(bare)
+				if isMessageStart(bare) {
+					keep, ok = dataOf(bare)
+				}
 				first = false
 			}
 			if !ok {
@@ -2450,6 +2518,32 @@ func replaceTokenFold(text, v, red string, isWord func(byte) bool) string {
 	}
 }
 
+// isMessageStart reports whether a line can BEGIN an HTTP message: a status line,
+// or a request line ending in a version token. A trailer, a body line or a report
+// fragment can look like either in its middle and never at its start.
+func isMessageStart(bare string) bool {
+	if strings.HasPrefix(bare, "HTTP/") {
+		return true
+	}
+	i := strings.LastIndex(bare, " HTTP/")
+	if i <= 0 {
+		return false
+	}
+	// A request line is `<method> <target> HTTP/x.y`, and a method is a token with
+	// no colon — which is what separates it from `X-Name: HTTP/1.1`.
+	m, rest, ok := strings.Cut(bare[:i], " ")
+	if !ok || m == "" || rest == "" {
+		return false
+	}
+	for k := 0; k < len(m); k++ {
+		c := m[k]
+		if !(c >= 'A' && c <= 'Z') && !(c >= 'a' && c <= 'z') && c != '-' && c != '_' {
+			return false
+		}
+	}
+	return true
+}
+
 // dataOf returns the part of a line the guard must read, dropping canonical
 // protocol SYNTAX this program re-serialises.
 //
@@ -2561,6 +2655,11 @@ func main() {
 		env("SP_ENVIRONMENT_ID"), env("SP_EXPERIMENT_KEY"),
 	}
 
+	// The authority this program was pointed at, recorded before anything is sent:
+	// the `Host:` line carries it, and it is not endpoint text. See configuredHost.
+	if u, uerr := url.Parse(env("SP_REMOTE_CONFIG_URL")); uerr == nil {
+		configuredHost = u.Host
+	}
 	rec := &recorder{inner: http.DefaultTransport}
 	cfg := shardpilot.Config{
 		// The ingest leg is required by the constructor and is NOT exercised
