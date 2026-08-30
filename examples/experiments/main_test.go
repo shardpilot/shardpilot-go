@@ -1486,3 +1486,38 @@ func TestDepthIsWalkedForwardNotRescanned(t *testing.T) {
 		t.Fatalf("a top-level minted member after many nested ones was published: %q", got)
 	}
 }
+
+// ---- round on 9721c2d ----
+
+// TestATrailingJSONValueIsNotGrammar is the reviewer's own example. `json.Decoder`
+// reads a SEQUENCE of top-level values, so `{"x":1} false` walked as valid JSON
+// and the trailing literal was marked as grammar — and a marked span is skipped by
+// both the scrub and the guard, while `json.Unmarshal` rejects that body as a
+// verdict outright (shardpilot/shardpilot-go#84 review).
+func TestATrailingJSONValueIsNotGrammar(t *testing.T) {
+	suppliedValues = []string{"false"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied(markBareJSONLiterals(`{"x":1} false`)))
+	if strings.Contains(got, "false") {
+		t.Fatalf("a supplied value was marked as grammar in a multi-value body: %q", got)
+	}
+	// ⚠ AND A REAL VERDICT BODY STILL HAS ITS GRAMMAR PROTECTED, or the repair is
+	// just a refusal to mark anything.
+	got = stripMarks(scrubSupplied(markBareJSONLiterals(`{"assigned":false}`)))
+	if !strings.Contains(got, `"assigned":false`) {
+		t.Fatalf("the literal node of an ordinary verdict body was scrubbed: %q", got)
+	}
+}
+
+// TestASeparatorArrivingMidChainIsSplit is the other reviewer example: a legal
+// field name percent-encoding the separator before a base64 component. The
+// one-time split saw no hyphen, and when the percent stage produced `X-YmFy` the
+// name went on being one url-base64 token, so `bar` was never reconstructed
+// (shardpilot/shardpilot-go#84 review).
+func TestASeparatorArrivingMidChainIsSplit(t *testing.T) {
+	suppliedValues = []string{"bar"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured("HTTP/1.1 200 OK\r\nX%2dYmFy: v\r\n\r\n")); err == nil {
+		t.Fatal("a field name whose separator arrived mid-chain was published")
+	}
+}
