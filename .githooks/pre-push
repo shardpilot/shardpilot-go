@@ -77,6 +77,23 @@ export GIT_NO_REPLACE_OBJECTS=1
 # index instead of the worktree's private one, which is exactly the collision
 # this design exists to avoid (shardpilot/shardpilot-go#79 review).
 unset GIT_INDEX_FILE
+# ⚠ AND EVERY OTHER REPOSITORY SELECTOR, because clearing one of them is not
+# isolation. `GIT_DIR=/repo/.git GIT_WORK_TREE=/repo git push` passes both to this
+# hook, so `cd "$wt"` changed the directory and changed nothing else: `read-tree`
+# and the `update-index` calls below then wrote the CALLER'S index -- replacing a
+# developer's staged work with a historical tree plus synthetic evidence entries
+# (shardpilot/shardpilot-go#79 review). That is the only defect in this gate whose
+# damage lands outside the push it refuses.
+#
+# The list is what `git --help environment` names as pointing a command at a
+# repository; anything left set here is inherited by every command below, and the
+# scan worktree is entered with `cd`, which changes only the directory.
+for gv in GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
+          GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_CEILING_DIRECTORIES \
+          GIT_DISCOVERY_ACROSS_FILESYSTEM GIT_PREFIX GIT_ATTR_NOSYSTEM; do
+  unset "$gv" 2>/dev/null || true
+done
+unset gv
 
 # ⚠ NOTHING FROM THE PUSHED BRANCH MAY RUN. `git worktree add` fires
 # post-checkout, and where core.hooksPath still points at tracked content that hook is
@@ -92,6 +109,7 @@ git_safe() { git -c core.hooksPath="$hooks_off" "$@"; }
 # (shardpilot/shardpilot-go#79 review). A cleanup that begins after the first
 # thing that can exit is not cleanup.
 tmpdir="$(mktemp -d)"
+base_ref=""
 cleanup() {
   git_safe worktree remove --force "$tmpdir/wt" >/dev/null 2>&1 || true
   rm -rf "$tmpdir" "$hooks_off"
@@ -100,7 +118,7 @@ cleanup() {
   # temporarily disconnected mount lost its metadata, and came back as "not a
   # repository" (shardpilot/shardpilot-go#79 review). Cleanup removes what this
   # hook created and nothing else.
-  git update-ref -d "refs/prepush-base-$$" 2>/dev/null || true
+  [ -n "${base_ref:-}" ] && git update-ref -d "$base_ref" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -529,7 +547,14 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     *) is_tag=no ;;
   esac
   eligible=no
-  if [ "$is_tag" = yes ] && [ "$target_kind" != commit ]; then
+  # ⚠ NOT ONLY UNDER `refs/tags/`. Git restricts `refs/heads/*` to commits and
+  # allows a blob or tree anywhere else -- `<blob>:refs/archive/snapshot` is a
+  # valid push -- and keying eligibility on the TAG namespace left those updates
+  # ineligible, so the only way to make one was `--no-verify`: a gate that forces
+  # its own bypass (shardpilot/shardpilot-go#79 review). The evidence path below
+  # does not depend on the namespace; it stages the published object and the ref
+  # name, both of which exist here too.
+  if [ "$target_kind" != commit ]; then
     # No commit means no tree and no ratchet baseline to compare against; the
     # object being published is the tag itself, which scan_ref_name collects.
     eligible=yes
@@ -622,8 +647,26 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       # between them -- so the previous fix narrowed the window instead of
       # closing it (shardpilot/shardpilot-go#79 review). A name no other
       # invocation uses has no window at all.
-      base_ref="refs/prepush-base-$$"
-      if ! git fetch --quiet --no-tags --no-write-fetch-head -- "$dest" \
+      # ⚠ A PID IS NOT UNIQUE, AND `+` OVERWRITES. A pid is reused after wraparound
+      # and a user may simply own `refs/prepush-base-<n>`, so the force refspec
+      # would overwrite someone's ref and the cleanup would then DELETE it -- even
+      # when the fetch failed before creating anything
+      # (shardpilot/shardpilot-go#79 review). The name carries the tmpdir's random
+      # component, which mktemp guarantees is unused, and cleanup removes the ref
+      # only after this hook has actually created it.
+      base_ref="refs/prepush-base-$$-${tmpdir##*/}"
+      if git rev-parse --verify --quiet "$base_ref" >/dev/null 2>&1; then
+        printf 'REFUSING: %s already exists; refusing to overwrite a ref this hook did not create.\n' \
+          "$base_ref" >&2
+        exit 2
+      fi
+      # ⚠ HOOKS OFF FOR THIS FETCH TOO. It updates a ref, so a `reference-transaction`
+      # hook runs for it -- one that rejects unfamiliar namespaces aborts the fetch
+      # and makes this gate refuse a valid push, and one with side effects fires for
+      # an internal ref that is deleted moments later
+      # (shardpilot/shardpilot-go#79 review). Every other git command here already
+      # runs through `git_safe`; this one had been written before that existed.
+      if ! git_safe fetch --quiet --no-tags --no-write-fetch-head -- "$dest" \
            "+refs/heads/$branch:$base_ref" 2>/dev/null; then
         printf 'REFUSING: could not fetch %s from %s to compare against.\n' "$branch" "$safe_dest" >&2
         exit 2
@@ -635,7 +678,8 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       # destination's baseline (shardpilot/shardpilot-go#79 review). A SHA
       # cannot be overwritten.
       base="$(git rev-parse --verify --quiet "$base_ref^{commit}" || true)"
-      git update-ref -d "$base_ref" 2>/dev/null || true
+      git_safe update-ref -d "$base_ref" 2>/dev/null || true
+      base_ref=""
       incoming="$(printf '%s\n' "$pushed_lines" \
         | awk -v r="refs/heads/$branch" '$3==r {print $2; exit}')"
       case "$incoming" in
