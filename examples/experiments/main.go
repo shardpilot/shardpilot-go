@@ -1189,6 +1189,16 @@ func dropFraming(dump string) string {
 	out := make([]string, 0, len(lines))
 	inHeaders := true
 	bodyStart := -1
+	// Whether there are bytes after the header separator at all. Computed here
+	// because the header rules run before the body is reached, and one of them
+	// asks about it: an undecodable coding matters only if something is encoded.
+	hasBody := false
+	for _, sep := range []string{"\r\n\r\n", "\n\n"} {
+		if k := strings.Index(dump, sep); k >= 0 {
+			hasBody = strings.TrimSpace(dump[k+len(sep):]) != ""
+			break
+		}
+	}
 	for _, l := range lines {
 		if inHeaders && strings.TrimRight(l, "\r") == "" {
 			inHeaders = false
@@ -1248,8 +1258,13 @@ func dropFraming(dump string) string {
 		// (shardpilot/shardpilot-go#84 review). This half cannot decode it, so it
 		// does not publish it.
 		if strings.HasPrefix(low, "content-encoding:") {
+			// ⚠ AND ONLY IF THERE IS A BODY TO DECODE. A 204, or any zero-length
+			// response, may still declare a coding -- and refusing there withholds a
+			// diagnostic over bytes that do not exist (shardpilot/shardpilot-go#84
+			// review). The refusal is about what an undecodable body could HIDE, so an
+			// absent body is not its subject.
 			if v := strings.TrimSpace(strings.TrimSuffix(l[len("content-encoding:"):], "\r")); v != "" &&
-				!strings.EqualFold(v, "identity") {
+				!strings.EqualFold(v, "identity") && hasBody {
 				// ⚠ A CLASSIFICATION, NOT THE VALUE. With a supplied key of
 				// `deflate` the scrub hid the header and this diagnostic printed
 				// it verbatim to stderr -- the refusal publishing what the refusal
@@ -3629,7 +3644,13 @@ func scrubHeaderName(name string) string {
 // isNameByte: inside a field NAME, every token punctuation separates words --
 // `-` was only the one I had met.
 func isNameByte(c byte) bool {
-	return isTokenByte(c) && (c == '_' || (c >= '0' && c <= '9') ||
+	// ⚠ `_` SEPARATES HERE TOO. The comment above says every token punctuation
+	// separates words inside a NAME and then listed `_` as a word byte, so a legal
+	// `X_bar: v` kept a supplied `bar` -- and the guard applies the same rule to
+	// collected names, so it approved the capture as well
+	// (shardpilot/shardpilot-go#84 review). A sentence that states the rule and an
+	// expression that contradicts it is the expression's defect, not the sentence's.
+	return isTokenByte(c) && ((c >= '0' && c <= '9') ||
 		(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'))
 }
 
@@ -3655,7 +3676,13 @@ func containsValue(text, names, v string) bool {
 	if v == "" {
 		return false
 	}
-	if len(v) >= 8 {
+	// ⚠ CHARACTERS, THE SAME THRESHOLD THE SCRUB USES. Moving the scrub's threshold
+	// to characters left this one counting bytes, so a four-character non-ASCII
+	// value was SHORT to the scrub and LONG to the guard: the scrub correctly left
+	// `αééééβ` alone and the guard then refused the capture for containing it
+	// (shardpilot/shardpilot-go#84 review). One notion, two thresholds, and fixing
+	// one of them is what made the disagreement reachable.
+	if chars(v) >= 8 {
 		return strings.Contains(text, v)
 	}
 	// ⚠ EITHER BOUNDARY CONVENTION COUNTS. A hyphenated value inside a header
