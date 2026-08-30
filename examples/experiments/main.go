@@ -369,6 +369,37 @@ func headerNameEnd(line string) (int, bool) {
 	return i, true
 }
 
+// sdkTaxonomy are the classification strings THIS SDK produces for a verdict.
+//
+// ⚠ TRANSCRIBED FROM experiments.go, NOT RECALLED, and the constants are
+// unexported so this cannot be derived in-process: `experimentReasonKillSwitch`,
+// `experimentReasonTargeting` and the `Code: "not_found"` return are the source.
+// A value here is not endpoint data — the SDK writes it — so leaving it captured
+// let a legal experiment key of `not_found` rewrite the verdict to
+// `<redacted, 9 chars>`, and the capture lost the first-class classification the
+// report exists to record (shardpilot/shardpilot-go#84 review). Eleventh site of
+// one rule: what this program put there is not the endpoint's choice.
+//
+// The failure direction of a MISSING entry is safe: an unrecognised value is
+// scrubbed, which costs a label rather than publishing endpoint text. That is why
+// this list may be a list, unlike the ones whose gaps publish.
+var sdkTaxonomy = set(
+	"kill_switch",
+	"targeting_unmatched",
+	"not_found",
+	// Named as a Code in the same doc comment as `not_found`, found by grepping
+	// the SDK source rather than by remembering the taxonomy.
+	"superseded",
+)
+
+// vouchTaxonomy marks a verdict field this SDK generated.
+func vouchTaxonomy(v string) string {
+	if sdkTaxonomy[v] {
+		return marked(v)
+	}
+	return v
+}
+
 // responseText is the ONE place the response pipeline is composed, and the
 // order inside it is load-bearing: structural redaction first, supplied-value
 // substitution second. See redactSetCookie for why.
@@ -1250,12 +1281,22 @@ func noteStructuralInText(text string) {
 		// names arrive as `\"subject_fact_key\"` and the JSON member pattern -- which
 		// expects a bare quote -- matched nothing. The check runs over identifier
 		// tokens instead, which is the shape that survives any quoting.
-		for _, tok := range strings.FieldsFunc(ln, func(r rune) bool {
-			return !(r == '_' || r == '-' ||
-				(r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'))
-		}) {
-			if isMintedName(tok) {
-				noteStructural("a server-minted field inside a transport error")
+		// ⚠ THE ESCAPES SURVIVE GO'S QUOTING AND NOT THIS SCAN. A malformed first
+		// line may spell the member as `subject_\u0066act_key`, and splitting on
+		// non-identifier bytes cuts that into `subject_` and `u0066act_key` --
+		// neither of which is the name (shardpilot/shardpilot-go#84 review). My
+		// previous fix here moved from the JSON pattern to identifier tokens
+		// because the QUOTING defeated the pattern, and then met the escaping the
+		// rest of this program already decodes everywhere else. The line is decoded
+		// first, and both spellings are scanned: a decode can also join two names.
+		for _, form := range []string{ln, undoUnicodeEscapes(ln), undoPercent(ln)} {
+			for _, tok := range strings.FieldsFunc(form, func(r rune) bool {
+				return !(r == '_' || r == '-' ||
+					(r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'))
+			}) {
+				if isMintedName(tok) {
+					noteStructural("a server-minted field inside a transport error")
+				}
 			}
 		}
 		switch {
@@ -2871,12 +2912,12 @@ func main() {
 	// response block, which escapes before stripping, kept it. The artifact then
 	// misstated the assignment the SDK served (shardpilot/shardpilot-go#84 review).
 	fmt.Fprintf(&report, "    variant:  %q\n", verdictValue(result.VariantKey))
-	fmt.Fprintf(&report, "    reason:   %q\n", stripMarks(scrubSupplied(result.Reason)))
+	fmt.Fprintf(&report, "    reason:   %q\n", stripMarks(scrubSupplied(vouchTaxonomy(result.Reason))))
 	// The SDK's own classification. A 404 returns a usable result with
 	// Code "not_found", Assigned false and a NIL error, so omitting this showed
 	// only zero-valued fields and then called the run generically not-served --
 	// losing the first-class verdict this program exists to report.
-	fmt.Fprintf(&report, "    code:     %q\n", stripMarks(scrubSupplied(result.Code)))
+	fmt.Fprintf(&report, "    code:     %q\n", stripMarks(scrubSupplied(vouchTaxonomy(result.Code))))
 	fmt.Fprintf(&report, "    version:  %d\n", result.Version)
 	if fetchErr != nil {
 		fmt.Fprintf(&report, "    error:    %s\n", sanitizeCaptured(fetchErr))
@@ -2949,7 +2990,7 @@ func main() {
 		// SERVED (shardpilot/shardpilot-go#73 review).
 		fmt.Printf("\nCOMPLETE BUT NOT ASSIGNED (exit 1). The endpoint answered 200 "+
 			"and assigned nothing; reason %q, code %q.\n",
-			stripMarks(scrubSupplied(result.Reason)), stripMarks(scrubSupplied(result.Code)))
+			stripMarks(scrubSupplied(vouchTaxonomy(result.Reason))), stripMarks(scrubSupplied(vouchTaxonomy(result.Code))))
 		os.Exit(1)
 	case fetchErr != nil && errors.Is(fetchErr, context.DeadlineExceeded):
 		fmt.Printf("\nNOT captured (exit 3) — the request timed out.\n")
