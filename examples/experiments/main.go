@@ -786,6 +786,16 @@ func dropFraming(dump string) string {
 		// inside them, while a reader need only apply the declared coding
 		// (shardpilot/shardpilot-go#84 review). This half cannot decode it, so it
 		// does not publish it.
+		// ⚠ THE SAME QUESTION ON THE SUCCESS PATH. The transport-error path classifies
+		// `WWW-Authenticate` and `Proxy-Authenticate` as unpublishable challenges, and
+		// that check ran only when PARSING FAILED -- so an ordinary 401 published the
+		// endpoint-minted challenge value, which no supplied value can reach
+		// (shardpilot/shardpilot-go#84 review). I added the check to the path I was
+		// shown; its twin is where responses normally arrive.
+		if strings.HasPrefix(low, "www-authenticate:") ||
+			strings.HasPrefix(low, "proxy-authenticate:") {
+			noteStructural("an authentication challenge this build cannot describe")
+		}
 		if strings.HasPrefix(low, "content-encoding:") {
 			if v := strings.TrimSpace(strings.TrimSuffix(l[len("content-encoding:"):], "\r")); v != "" &&
 				!strings.EqualFold(v, "identity") {
@@ -1230,6 +1240,24 @@ func noteStructuralInText(text string) {
 		// matched the shape the finding is about. Over-refusing an error diagnostic
 		// that merely mentions one of these fields is the safe direction, and the
 		// scene guards the other: an ordinary transport failure must stay reportable.
+		// ⚠ AND THE MINTED-FIELD QUESTION. An endpoint can make its malformed first
+		// line a JSON object carrying the subject key, and Go puts that whole line in
+		// the error -- so the value reached the report through the diagnostic, where
+		// no supplied value can match it and no body scan runs
+		// (shardpilot/shardpilot-go#84 review). The question is about TEXT, not about
+		// a body: asking it only where a body exists is asking it about the parse.
+		// ⚠ THE NAMES ARE ESCAPED HERE. Go quotes the offending line, so the member
+		// names arrive as `\"subject_fact_key\"` and the JSON member pattern -- which
+		// expects a bare quote -- matched nothing. The check runs over identifier
+		// tokens instead, which is the shape that survives any quoting.
+		for _, tok := range strings.FieldsFunc(ln, func(r rune) bool {
+			return !(r == '_' || r == '-' ||
+				(r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'))
+		}) {
+			if isMintedName(tok) {
+				noteStructural("a server-minted field inside a transport error")
+			}
+		}
 		switch {
 		case strings.Contains(low, "set-cookie:"):
 			noteStructural("a server-set cookie inside a transport error")
@@ -2041,10 +2069,30 @@ func undoBase64(text string) string {
 			i = j
 			continue
 		}
+		// ⚠ AND ITS SUFFIXES, because this tokeniser is MAXIMAL and `/` is in the
+		// standard alphabet: `prefix/YWJjZGVmZ2g=` is ONE token that does not
+		// decode, so the final path component -- which a standard decoder
+		// reconstructs directly -- was never tried
+		// (shardpilot/shardpilot-go#84 review). The binary-candidate path needed the
+		// same correction; this one is where a decode that is valid UTF-8 lands.
 		if dec, ok := decodeBase64(tok); ok {
 			b.WriteString(dec)
 		} else {
-			b.WriteString(tok)
+			wrote := false
+			for k := 0; k < len(tok); k++ {
+				if strings.IndexByte("/+-_.", tok[k]) < 0 || len(tok)-k-1 < minToken {
+					continue
+				}
+				if dec, ok := decodeBase64(tok[k+1:]); ok {
+					b.WriteString(tok[:k+1])
+					b.WriteString(dec)
+					wrote = true
+					break
+				}
+			}
+			if !wrote {
+				b.WriteString(tok)
+			}
 		}
 		i = j
 	}
@@ -2131,10 +2179,24 @@ func binaryCandidates(text string) []string {
 					j++
 				}
 			}
+			// ⚠ AND ITS SUFFIXES AT PLAUSIBLE SEPARATORS. This scan is MAXIMAL, so
+			// `prefix/YWJjZGVmZ2g=` is one token that does not decode, and the final
+			// path component -- which a standard decoder reconstructs directly -- was
+			// never tried (shardpilot/shardpilot-go#84 review). A maximal tokeniser
+			// answers about the longest run; the question is about every run a decoder
+			// would accept.
 			if tok := text[i:j]; len(tok) >= d.minLen {
-				for _, raw := range d.decode(tok) {
-					if !utf8.Valid(raw) {
-						out = append(out, string(raw))
+				cands := []string{tok}
+				for k := 0; k < len(tok); k++ {
+					if strings.IndexByte("/+-_.", tok[k]) >= 0 && len(tok)-k-1 >= d.minLen {
+						cands = append(cands, tok[k+1:])
+					}
+				}
+				for _, c := range cands {
+					for _, raw := range d.decode(c) {
+						if !utf8.Valid(raw) {
+							out = append(out, string(raw))
+						}
 					}
 				}
 			}

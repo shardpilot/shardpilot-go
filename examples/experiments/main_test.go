@@ -1676,3 +1676,53 @@ func TestATransportErrorGoesThroughTheStructuralQuestion(t *testing.T) {
 		t.Fatalf("an ordinary transport error was made unpublishable: %q", structuralSurfaces)
 	}
 }
+
+// ---- round on 967f7c1 ----
+
+// TestAnEmbeddedBase64SuffixIsTried: the token scan is MAXIMAL, so
+// `prefix/YWJjZGVmZ2g=` is one token that does not decode, and the final path
+// component — which a standard decoder reconstructs directly — was never tried
+// (shardpilot/shardpilot-go#84 review).
+func TestAnEmbeddedBase64SuffixIsTried(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured("path prefix/YWJjZGVmZ2g= end")); err == nil {
+		t.Fatal("an embedded base64 component was never decoded")
+	}
+}
+
+// TestAMintedFieldInATransportErrorRefuses: an endpoint can make its malformed
+// first line a JSON object carrying the subject key, and Go puts that whole line in
+// the error — where no supplied value can match it and no body scan runs
+// (shardpilot/shardpilot-go#84 review).
+func TestAMintedFieldInATransportErrorRefuses(t *testing.T) {
+	structuralSurfaces = nil
+	suppliedValues = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	_ = sanitizeCaptured(errors.New(
+		`malformed HTTP response "{\"subject_fact_key\":\"sfk1_xxxxxxxxxxxx\"}"`))
+	if len(structuralSurfaces) == 0 {
+		t.Fatal("a minted field inside a transport error left the capture publishable")
+	}
+}
+
+// TestAnAuthChallengeRefusesOnTheSuccessPathToo: the transport-error path
+// classifies these as unpublishable, and that check ran only when PARSING FAILED —
+// so an ordinary 401 published the endpoint-minted challenge
+// (shardpilot/shardpilot-go#84 review).
+func TestAnAuthChallengeRefusesOnTheSuccessPathToo(t *testing.T) {
+	structuralSurfaces = nil
+	suppliedValues = nil
+	receivedConnection = true
+	t.Cleanup(func() { structuralSurfaces = nil; receivedConnection = false })
+	dropFraming("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Digest nonce=\"abcdefgh\"\r\n\r\n")
+	if len(structuralSurfaces) == 0 {
+		t.Fatal("an authentication challenge on a valid response stayed publishable")
+	}
+	// ⚠ AND AN ORDINARY RESPONSE STILL PUBLISHES.
+	structuralSurfaces = nil
+	dropFraming("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{}")
+	if len(structuralSurfaces) != 0 {
+		t.Fatalf("an ordinary response was made unpublishable: %q", structuralSurfaces)
+	}
+}
