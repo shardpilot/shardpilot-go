@@ -1822,6 +1822,14 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       # ⚠ AND MAPPING FAILURE TO `unknown` SKIPS BOTH EVIDENCE BRANCHES, so the push
       # was approved on the ref name and the tag annotation alone, with the published
       # target object never staged (shardpilot/shardpilot-go#79 review).
+      #
+      # ⚠ CORRECTION, AND THE ERROR WAS THE INSTRUMENT'"'"'S. I first reported this branch
+      # as reached ZERO times across the whole rig battery and said it might be dead.
+      # It was not: the marker printed to STDERR and the rigs print only lines matching
+      # their own filter, so the probe could not go positive. Re-measured with the
+      # marker written to a FILE: 19 hits across the battery. A scene discriminates it
+      # now -- three probes ask about the object before this one, measured rather than
+      # guessed, so the rig fails the FOURTH.
       if ! deref_kind="$( git cat-file -t "$deref" 2>/dev/null )"; then
         printf 'REFUSING: the type of the tag target %s could not be read, so the object\n' "$deref" >&2
         printf '  this push publishes cannot be staged as evidence.\n' >&2
