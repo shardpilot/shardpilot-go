@@ -3135,23 +3135,12 @@ func shortBase64Candidates(text string) []string {
 		// (every long token then yielding suffixes), asking a SECOND decode after the
 		// first cost 156 MiB, and asking one decode two questions costs what the
 		// single question cost.
-		decs := base64Decodes(tok)
-		kept := false
-		for _, raw := range decs {
-			if utf8.Valid(raw) {
-				out = append(out, string(raw))
-				kept = true
-				break
-			}
-		}
-		if kept {
-			continue
-		}
-		for _, raw := range decs {
-			if !utf8.Valid(raw) {
-				out = append(out, string(raw))
-				break
-			}
+		text, haveText, bin, haveBin := base64Answers(tok)
+		switch {
+		case haveText:
+			out = append(out, text)
+		case haveBin:
+			out = append(out, bin)
 		}
 	}
 	return out
@@ -3292,21 +3281,54 @@ func undoHex(text string) string {
 	return b.String()
 }
 
-// base64Decodes is every raw byte string the four encodings this program accepts
-// read out of one token. Both the binary producer and the short producer ask it,
-// so the alphabet is stated once: a second spelling of a decoder is a second
-// grammar, and the two would answer differently the day one of them is widened.
+// base64Encodings is the alphabet this program accepts, written once: a second
+// spelling of a decoder is a second grammar, and the two would answer differently
+// the day one of them is widened.
+var base64Encodings = []*base64.Encoding{
+	base64.StdEncoding, base64.RawStdEncoding,
+	base64.URLEncoding, base64.RawURLEncoding,
+}
+
+// base64Decodes is every raw byte string those encodings read out of one token.
 func base64Decodes(tok string) [][]byte {
 	var out [][]byte
-	for _, enc := range []*base64.Encoding{
-		base64.StdEncoding, base64.RawStdEncoding,
-		base64.URLEncoding, base64.RawURLEncoding,
-	} {
+	for _, enc := range base64Encodings {
 		if raw, err := enc.DecodeString(tok); err == nil {
 			out = append(out, raw)
 		}
 	}
 	return out
+}
+
+// base64Answers walks that alphabet ONCE and keeps the first decode of each kind.
+//
+// ⚠ RETAINING EVERY DECODE IS WHAT COSTS. Asking `base64Decodes` for a slice and
+// then reading it twice materialises up to four byte slices plus the slice header
+// for EVERY short token in a body -- 124 MiB on Go 1.25 against a 120 MiB bound
+// that a 1.27 toolchain squeaked under locally, so the branch was green here and
+// red in CI (shardpilot/shardpilot-go#84 CI). A bound that one toolchain passes is
+// not a statement about the toolchains this repository builds on.
+//
+// Nothing downstream needs the later decodes, so nothing holds them, and the walk
+// stops as soon as both questions are answered.
+func base64Answers(tok string) (text string, haveText bool, bin string, haveBin bool) {
+	for _, enc := range base64Encodings {
+		raw, err := enc.DecodeString(tok)
+		if err != nil {
+			continue
+		}
+		if utf8.Valid(raw) {
+			if !haveText {
+				text, haveText = string(raw), true
+			}
+		} else if !haveBin {
+			bin, haveBin = string(raw), true
+		}
+		if haveText && haveBin {
+			break
+		}
+	}
+	return text, haveText, bin, haveBin
 }
 
 var binaryDecoders = []struct {
@@ -3588,12 +3610,8 @@ func isBase64Byte(c byte) bool {
 // reports failure rather than a partial decode: half a token tells the guard
 // nothing and would only add noise to every later round.
 func decodeBase64(tok string) (string, bool) {
-	for _, raw := range base64Decodes(tok) {
-		if utf8.Valid(raw) {
-			return string(raw), true
-		}
-	}
-	return "", false
+	text, haveText, _, _ := base64Answers(tok)
+	return text, haveText
 }
 
 func undoEntities(text string) string {

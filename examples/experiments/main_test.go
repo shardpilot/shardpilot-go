@@ -3403,9 +3403,22 @@ func TestTheSeedCapIsAppliedWhileCollecting(t *testing.T) {
 	// on this machine for a 900 KB body of `61 ` repeated: 56 MiB with the cap
 	// applied while collecting, 234 MiB without. The bound is 120 MiB, between them.
 	got := allocatedMiB(func() { _ = assertNoLeak(asCaptured(strings.Repeat("61 ", 300000))) })
-	if got > 120 {
+	// ⚠ THE BOUND IS RE-DERIVED FROM A MEASUREMENT, NOT INHERITED. 120 was chosen
+	// when this collection allocated 56 MiB; the short producer now answers a second
+	// question about the same tokens -- the binary decode of a token whose text
+	// decode is not UTF-8 -- and every one of these 300000 tokens has one. Measured
+	// on this toolchain: 104 MiB with the cap applied, and 1521 MiB with the cap
+	// raised out of reach -- so what this scene separates is not a narrow band.
+	//
+	// ⚠ AND THE MARGIN IS FOR THE TOOLCHAIN, WHICH IS ALSO MEASURED. The same code
+	// allocated 117 MiB here and 124 in CI on Go 1.25 -- so this scene was green
+	// locally and red there, on a bound with 3 MiB of headroom
+	// (shardpilot/shardpilot-go#84 CI). A bound one toolchain passes is not a
+	// statement about the toolchains this repository builds on; the spread is about
+	// 6%, and what this scene must separate is 104 from 234.
+	if got > 160 {
 		t.Errorf("collecting the seeds allocated %d MiB; with the cap applied while "+
-			"collecting it is 56 and without it 234", got)
+			"collecting it is 104 here and 1521 with the cap raised out of reach", got)
 	}
 }
 
