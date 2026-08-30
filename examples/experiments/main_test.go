@@ -2146,3 +2146,44 @@ func TestAnAuthChallengeRefusesOnTheSuccessPathToo(t *testing.T) {
 		t.Fatalf("an ordinary response was made unpublishable: %q", structuralSurfaces)
 	}
 }
+
+// ---- round on f639447 ----
+
+// TestTheSDKTaxonomyIsVouchedFor: with a legal experiment key of `not_found` and a
+// 404, the SDK deliberately produces `Code == "not_found"` and the generic scrub
+// rewrote the verdict to `<redacted, 9 chars>` — the capture losing the
+// first-class classification the report exists to record
+// (shardpilot/shardpilot-go#84 review).
+func TestTheSDKTaxonomyIsVouchedFor(t *testing.T) {
+	for _, v := range []string{"not_found", "targeting_unmatched", "kill_switch", "superseded"} {
+		suppliedValues = []string{v}
+		got := stripMarks(scrubSupplied(vouchTaxonomy(v)))
+		suppliedValues = nil
+		if got != v {
+			t.Fatalf("an SDK classification was rewritten: %q became %q", v, got)
+		}
+	}
+	// ⚠ AND A VALUE THIS SDK DOES NOT PRODUCE IS STILL ENDPOINT TEXT.
+	suppliedValues = []string{"server_secret"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if got := stripMarks(scrubSupplied(vouchTaxonomy("server_secret"))); got == "server_secret" {
+		t.Fatalf("an unrecognised classification was vouched for: %q", got)
+	}
+}
+
+// TestAnEscapedMintedNameInATransportErrorRefuses: a malformed first line may
+// spell the member as `subject_fact_key`; splitting on non-identifier bytes
+// cuts that into `subject_` and `u0066act_key`, neither of which is the name
+// (shardpilot/shardpilot-go#84 review).
+func TestAnEscapedMintedNameInATransportErrorRefuses(t *testing.T) {
+	structuralSurfaces = nil
+	suppliedValues = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	// ⚠ THE ESCAPED SPELLING, which is the whole point: the plain one was already
+	// caught by the previous round's fix, so a scene using it measures nothing new.
+	_ = sanitizeCaptured(errors.New(
+		`malformed HTTP response "{\"subject_\u0066act_key\":\"sfk1_xxxxxxxxxxxx\"}"`))
+	if len(structuralSurfaces) == 0 {
+		t.Fatal("an escaped minted name inside a transport error stayed publishable")
+	}
+}
