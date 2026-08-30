@@ -135,11 +135,50 @@ if [ -n "${GIT_ALTERNATE_OBJECT_DIRECTORIES:-}" ]; then
   alt_out=""
   alt_rest="$GIT_ALTERNATE_OBJECT_DIRECTORIES"
   while [ -n "$alt_rest" ]; do
+    # ⚠ A QUOTED ENTRY OWNS ITS COLONS. git documents that an entry beginning with
+    # a double quote is a C-quoted path, so `"objects:shared"` is ONE directory --
+    # and splitting on every colon cut it into two entries that name nothing, so
+    # neither half was absolutized, the reconstructed relative value changed meaning
+    # inside the temporary worktree, and objects reachable only through that legal
+    # alternate became unreadable (shardpilot/shardpilot-go#86 review). The
+    # separator is found by walking, not by `%%:*`, because where it IS depends on
+    # the quoting.
     case "$alt_rest" in
+      '"'*)
+        alt_one=""
+        alt_scan="${alt_rest#\"}"
+        while [ -n "$alt_scan" ]; do
+          alt_c="${alt_scan%"${alt_scan#?}"}"
+          alt_scan="${alt_scan#?}"
+          case "$alt_c" in
+            '\') alt_one="$alt_one$alt_c${alt_scan%"${alt_scan#?}"}"; alt_scan="${alt_scan#?}" ;;
+            '"') break ;;
+            *) alt_one="$alt_one$alt_c" ;;
+          esac
+        done
+        # The unquoted spelling is what `cd` needs; the escapes are undone by the
+        # same rule git wrote them under.
+        alt_one="$(printf '%b' "$alt_one")"
+        alt_rest="${alt_scan#:}"
+        ;;
       *:*) alt_one="${alt_rest%%:*}"; alt_rest="${alt_rest#*:}" ;;
       *) alt_one="$alt_rest"; alt_rest="" ;;
     esac
     alt_abs="$(absolutize_one "$alt_one")"
+    # ⚠ AND IT GOES BACK IN QUOTED, or the parse was for nothing. Reading a quoted
+    # entry and re-emitting it BARE hands git a value it splits at the same colon
+    # this loop just refused to split at -- so `"objects:shared"` was parsed
+    # correctly, absolutized correctly, and then published as two directories
+    # neither of which exists. Preserving a value and preserving its MEANING are
+    # two steps, which is the sentence written thirty lines above this one about
+    # this same variable (shardpilot/shardpilot-go#86 review).
+    case "$alt_abs" in
+      *[:\"\\]*)
+        alt_esc="$alt_abs"
+        alt_esc="$(printf '%s' "$alt_esc" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')"
+        alt_abs="\"$alt_esc\""
+        ;;
+    esac
     if [ -z "$alt_out" ]; then
       alt_out="$alt_abs"
     else
@@ -994,7 +1033,13 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         # answered 0 and the 256 bound stopped firing -- the regression suite caught
         # it on the first run after the format changed. A count is about the unit the
         # format uses, and the format had just changed under it.
-        entries="$( tr -dc '\000' < "$tmpdir/tag-tree-listing" | wc -c | tr -d ' ' )"
+        # ⚠ IN THE C LOCALE, BECAUSE THIS COUNTS BYTES. Under a UTF-8 locale BSD `tr`
+        # stops with `Illegal byte sequence` on a filename holding non-UTF-8 bytes --
+        # which git permits in a path -- so this count produced nothing and the push
+        # was refused before the tree was ever scanned (shardpilot/shardpilot-go#86
+        # review). Measured here: 0 under `en_US.UTF-8`, 2 under `C`, same input. The
+        # scanner already runs its own NUL count this way; this one did not.
+        entries="$( LC_ALL=C tr -dc '\000' < "$tmpdir/tag-tree-listing" | LC_ALL=C wc -c | tr -d ' ' )"
         if [ "${entries:-0}" -gt 256 ]; then
           printf 'REFUSING: the tagged tree has %s entries, past this gate'"'"'s bound of 256.\n' "$entries" >&2
           printf '  Scanning a prefix of it and reporting clean is worse than refusing:\n' >&2
@@ -1061,6 +1106,24 @@ while read -r local_ref local_sha remote_ref remote_sha; do
           otype="${meta#* }"
           otype="${otype%% *}"
           oid="${meta##* }"
+          # ⚠ A GITLINK IS REFUSED HERE, not left to the scanner. The round before
+          # said the listing carries the mode "which is what that refusal reads" --
+          # it is not: the scanner asks `git ls-files -s` for the mode of the STAGED
+          # file, so a `160000` spelled in a text evidence file cannot reach it, and
+          # a clean tagged tree containing a gitlink was published with the linked
+          # repository never scanned (shardpilot/shardpilot-go#86 review). A
+          # by-construction argument is worth exactly what the named construction is
+          # worth, and this one named a check that reads something else.
+          #
+          # It cannot be staged AS a gitlink either: the commit it points at need not
+          # exist here. Nothing this gate can do makes those contents scannable, so
+          # the answer is the same one the scanner gives for a gitlink it does see.
+          if [ "$otype" = commit ]; then
+            printf 'REFUSING: the tagged tree contains a gitlink (%s).\n' "$oid" >&2
+            printf '  Its contents are another repository, which this gate cannot scan,\n' >&2
+            printf '  and publishing a tree that names it makes them reachable unexamined.\n' >&2
+            exit 2
+          fi
           [ "$otype" = blob ] || continue
           [ -n "$oid" ] || continue
           nb=$((nb + 1))
@@ -1072,7 +1135,24 @@ while read -r local_ref local_sha remote_ref remote_sha; do
           # carry newlines or quotes; the scanner classifies by suffix and by leading
           # bytes, so control characters are dropped and the suffix is preserved
           # rather than the whole spelling being trusted as a filename.
-          leaf="$(printf '%s' "$leaf" | tr -d '\000-\037"\\/' )"
+          # ⚠ REPLACED, NOT DELETED. Deleting a byte JOINS its neighbours, so a clean
+          # blob named `asset.xp<newline>m` was staged as `asset.xpm` and refused by
+          # the scanner's image rule for an extension the published path does not
+          # have (shardpilot/shardpilot-go#86 review). Sanitising must not be able to
+          # change what a name MEANS; one byte in, one byte out.
+          # A KEPT SET, NOT A BANNED ONE, and the reason is the filesystem rather
+          # than the scanner: git permits any non-NUL byte in a path, macOS permits
+          # only valid UTF-8 in a filename, so staging `café.txt` spelled with a raw
+          # `0xe9` failed the redirection itself -- `Illegal byte sequence` -- and the
+          # push was refused over a name git considers ordinary
+          # (shardpilot/shardpilot-go#86 review). Banning the bytes I had met left
+          # every byte I had not.
+          #
+          # The identifier in a NAME is still shown to the scanner: the listing
+          # evidence carries the path verbatim. What this spelling has to preserve is
+          # what the scanner CLASSIFIES by -- the suffix -- and one byte in, one byte
+          # out preserves it.
+          leaf="$(printf '%s' "$leaf" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_' )"
           [ -n "$leaf" ] || leaf="blob"
           read_evidence "$tmpdir/tag-blobs/$nb-$leaf" write \
             "a blob reached through the tagged tree ($oid)" cat-file blob "$oid"
