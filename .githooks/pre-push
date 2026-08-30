@@ -1,4 +1,14 @@
-#!/usr/bin/env bash
+#!/bin/bash
+#
+# ⚠ A FIXED INTERPRETER, NOT `env`. Git runs a non-bare pre-push hook with the
+# WORKTREE ROOT as its working directory, so a `PATH` carrying `.` or an empty
+# component makes the checked-out branch a search location -- and `/usr/bin/env
+# bash` then runs a tracked `./bash` instead of this script, before a single line
+# of it has executed (shardpilot/shardpilot-go#79 review). Reproduced. Every
+# protection in this file is downstream of which program is running.
+#
+# The same `PATH` reaches the bare `git` and `mktemp` calls below, which is why
+# `sanitise_path` runs before any of them.
 #
 # RUN THE PUBLIC-SURFACE GATE AGAINST WHAT IS ACTUALLY BEING PUSHED.
 #
@@ -287,6 +297,29 @@ export GIT_SHALLOW_FILE
 # TRACKED CONTENT -- so a branch from an untrusted contributor would execute
 # arbitrary code on this machine merely by being inspected, before any scan.
 # Every git command below runs with hooks pointed at an empty directory.
+# ⚠ AND THE SEARCH PATH IS SANITISED BEFORE THE FIRST BARE COMMAND. `.` and an
+# empty component both mean "the current directory", which git has just set to the
+# worktree root; a relative entry means whatever the checkout says it means. They
+# are dropped rather than the whole PATH replaced, because a developer's toolchain
+# may legitimately live somewhere unusual and a gate that cannot find `git` is a
+# gate that gets uninstalled.
+sanitised_path=""
+old_ifs="$IFS"
+IFS=:
+for path_entry in $PATH; do
+  case "$path_entry" in
+    /*) sanitised_path="${sanitised_path:+$sanitised_path:}$path_entry" ;;
+  esac
+done
+IFS="$old_ifs"
+if [ -z "$sanitised_path" ]; then
+  printf 'REFUSING: PATH contains no absolute directory, so no utility this gate\n' >&2
+  printf '  runs can be resolved from outside the checkout.\n' >&2
+  exit 2
+fi
+PATH="$sanitised_path"
+export PATH
+
 hooks_off="$(mktemp -d)"
 # ⚠ THE TRAP GOES ON AS SOON AS THERE IS SOMETHING TO CLEAN. Everything between
 # this line and the `trap` below can exit -- the second `mktemp`, resolving it,
@@ -296,8 +329,17 @@ hooks_off="$(mktemp -d)"
 # may not exist yet, so it reads them with defaults; a cleanup that assumes the
 # state it is cleaning up is a cleanup for the successful path only.
 cleanup() {
-  git_safe worktree remove --force "${tmpdir:-}/wt" >/dev/null 2>&1 || true
-  rm -rf "${tmpdir:-}" "${hooks_off:-}"
+  # ⚠ A DEFAULT THAT YIELDS A VALID ABSOLUTE PATH IS NOT A TOLERANT DEFAULT.
+  # `${tmpdir:-}/wt` expands to `/wt` before the second `mktemp` has run, and
+  # `worktree remove --force` deletes a linked worktree there -- untracked files
+  # included -- so the handler written to survive an unbuilt state could destroy an
+  # unrelated one (shardpilot/shardpilot-go#79 review). The guard is on the
+  # VARIABLE, not on the string it composes.
+  if [ -n "${tmpdir:-}" ]; then
+    git_safe worktree remove --force "$tmpdir/wt" >/dev/null 2>&1 || true
+  fi
+  [ -n "${tmpdir:-}" ] && rm -rf "$tmpdir"
+  [ -n "${hooks_off:-}" ] && rm -rf "$hooks_off"
   # ⚠ NO GLOBAL PRUNE. `git worktree prune` removes the administrative record of
   # EVERY missing worktree, not only this one -- so an unrelated worktree on a
   # temporarily disconnected mount lost its metadata, and came back as "not a
@@ -1240,6 +1282,19 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       # (shardpilot/shardpilot-go#79 review). The name carries the tmpdir's random
       # component, which mktemp guarantees is unused, and cleanup removes the ref
       # only after this hook has actually created it.
+      # ⚠ AND A NON-COMMIT PUSH ASKS NO BASELINE QUESTION HERE EITHER. The
+      # advertised `HEAD` may itself point at a blob or a tree, so the fetch
+      # succeeds and `^{commit}` yields nothing -- and the empty-base check below
+      # then refused a push whose scan never needs a commit baseline
+      # (shardpilot/shardpilot-go#79 review). The no-symref branch already takes the
+      # empty tree for exactly this case; this one had the condition and not the
+      # reason. Third place in this file where "not a commit" had to be carried
+      # after the first two were fixed.
+      if [ "$target_kind" != commit ]; then
+        unborn=yes
+        base="$(git hash-object -t tree /dev/null)"
+        why="the empty tree, because this update introduces no commit and has no ancestry to compare"
+      fi
       if [ "$unborn" = no ]; then
       base_ref="refs/prepush-base-$$-${tmpdir##*/}"
       if git rev-parse --verify --quiet "$base_ref" >/dev/null 2>&1; then
