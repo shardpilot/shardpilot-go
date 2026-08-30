@@ -453,7 +453,7 @@ func TestFixedCookieAttributeNamesSurviveTheScrub(t *testing.T) {
 func TestCookieValuesAreMeasuredBeforeOurEscape(t *testing.T) {
 	suppliedValues = nil
 	got := stripMarks(dropFraming("HTTP/1.1 200 OK\r\nSet-Cookie: sid=" + escapeMarks(`\x00`) + "\r\n\r\n"))
-	if !strings.Contains(got, "4 chars") {
+	if !strings.Contains(got, "redacted-4-chars") {
 		t.Fatalf("the cookie length described the recorder's escape: %q", got)
 	}
 }

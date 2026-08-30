@@ -1427,7 +1427,7 @@ func dropFraming(dump string) string {
 		return strings.Join(out, "\n")
 	}
 	return strings.Join(out[:bodyStart], "\n") + "\n" +
-		redactUnaccountedBody(markBareJSONLiterals(redactMintedBody(strings.Join(out[bodyStart:], "\n"))))
+		redactUnaccountedBody(markBareJSONLiterals(redactUnaccountedJSONValues(redactMintedBody(strings.Join(out[bodyStart:], "\n")))))
 }
 
 type recorder struct {

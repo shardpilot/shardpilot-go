@@ -57,8 +57,8 @@ func TestEveryComponentIsMeasuredAsReceived(t *testing.T) {
 
 	for _, c := range []struct{ what, line, want string }{
 		{"cookie name", "Set-Cookie: " + escapeMarks(capturedMark) + "=x", "redacted-1-chars"},
-		{"cookie value", "Set-Cookie: sid=" + escapeMarks(capturedMark), "<redacted, 1 chars>"},
-		{"attribute value", "Set-Cookie: sid=x; Path=" + escapeMarks(capturedMark), "Path=<redacted, 1 chars>"},
+		{"cookie value", "Set-Cookie: sid=" + escapeMarks(capturedMark), "redacted-1-chars"},
+		{"attribute value", "Set-Cookie: sid=x; Path=" + escapeMarks(capturedMark), "Path=redacted-1-chars"},
 	} {
 		t.Run(c.what, func(t *testing.T) {
 			suppliedValues = nil

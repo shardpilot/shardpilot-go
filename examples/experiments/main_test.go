@@ -1689,7 +1689,7 @@ func TestACookieAttributeIsMeasuredAsReceived(t *testing.T) {
 	// ⚠ ANCHORED TO THE ATTRIBUTE. The first version asserted `"1 chars"` anywhere
 	// in the line — and the cookie's OWN value is one character, so the assertion
 	// matched something other than its subject and the mutant survived.
-	if !strings.Contains(got, "Path=<redacted, 1 chars>") {
+	if !strings.Contains(got, "Path=redacted-1-chars") {
 		t.Fatalf("an attribute value was measured in its escaped spelling: %q", got)
 	}
 }
@@ -2759,5 +2759,28 @@ func TestTheClaimNamesExactlyTheDecodersThatRun(t *testing.T) {
 	}
 	if len(named) == 0 {
 		t.Fatal("the claim names no decoder, so this scene cannot discriminate")
+	}
+}
+
+// Parsing is not accounting: an admitted member NAME says nothing about its
+// endpoint-chosen VALUE.
+func TestAnUnaccountedValueInAParsedBodyIsRedacted(t *testing.T) {
+	structuralSurfaces, accountedSurfaces = nil, nil
+	t.Cleanup(func() { structuralSurfaces, accountedSurfaces = nil, nil })
+	got := stripMarks(dropFraming("HTTP/1.1 401 Unauthorized\r\n\r\n{\"error\":\"server-secret-token\"}"))
+	if strings.Contains(got, "server-secret-token") {
+		t.Fatalf("an endpoint-minted value in a parsed body was published: %q", got)
+	}
+	if !strings.Contains(got, `"error"`) {
+		t.Fatalf("the member name was redacted along with its value: %q", got)
+	}
+	if len(accountedSurfaces) == 0 {
+		t.Fatalf("the redaction was not accounted for: %q", got)
+	}
+	// AND A VALUE THIS SDK ITSELF PRODUCES SURVIVES, which is what the verdict
+	// block reads.
+	structuralSurfaces, accountedSurfaces = nil, nil
+	if v := stripMarks(dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"code\":\"not_found\"}")); !strings.Contains(v, "not_found") {
+		t.Fatalf("the SDK's own taxonomy was lengthened: %q", v)
 	}
 }

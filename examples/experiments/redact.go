@@ -573,6 +573,33 @@ func redactTarget(line string) string {
 			}
 			return head + ":" + gap + marked("<withheld: malformed target>") + cr
 		}
+		// ⚠ AND A SUPPLIED VALUE MAY COLLIDE WITH THE EXEMPT AUTHORITY. The host is
+		// left as captured text because it is structurally constrained -- and the
+		// generic scrub then rewrote `e.example` into `e.<redacted, 7 chars>` for a
+		// supplied `example`: spaces and prose inside an authority, approved by the
+		// guard because the placeholder is generated
+		// (shardpilot/shardpilot-go#85 review). The exemption says the host need not
+		// be REDACTED; it never said the scrub may corrupt it. A collision replaces
+		// the authority with the URI-safe spelling instead.
+		// ⚠ THE TEST IS "WOULD THE SCRUB CHANGE IT", NOT "DOES IT CONTAIN". My first
+		// version fired on any supplied value merely PRESENT in the authority, so a
+		// supplied `.` -- which the scrub leaves alone, being no word token --
+		// replaced `e.example` with a placeholder and changed a rendering that was
+		// correct. The punctuation product caught it on the first run. An exemption
+		// repaired into an over-redaction is still a rendering this program got
+		// wrong.
+		if a := authorityOf(strings.TrimSuffix(url, "\r")); a != "" {
+			{
+				if scrubSuppliedRaw(a) != a {
+					noteAccounted("a redirect authority colliding with a supplied value")
+					cr := ""
+					if strings.HasSuffix(line, "\r") {
+						cr = "\r"
+					}
+					return head + ":" + gap + strings.Replace(url, a, tokenPlaceholder(a), 1) + cr
+				}
+			}
+		}
 		if strings.ContainsAny(strings.TrimSuffix(url, "\r"), " \t") {
 			noteStructural("a Location header whose target is not a valid URI")
 			cr := ""
@@ -705,6 +732,22 @@ func redactPath(line string) string {
 	return head + url[:start] + strings.Join(segs, "/") + tail
 }
 
+// authorityOf returns the authority of a URI reference, or "" if it has none.
+func authorityOf(url string) string {
+	i := strings.Index(url, "//")
+	if i < 0 {
+		return ""
+	}
+	if i > 0 && !isSchemeName(strings.TrimSuffix(url[:i], ":")) {
+		return ""
+	}
+	rest := url[i+2:]
+	if j := strings.IndexAny(rest, "/?#"); j >= 0 {
+		rest = rest[:j]
+	}
+	return rest
+}
+
 func redactSetCookie(line string) string {
 	// ⚠ THE ACCOUNT IS ATTACHED TO THE ACT. A rewrite recorded by its CALLERS is
 	// recorded by however many of them remember to: `redactSetCookie` rewrote this on the
@@ -770,7 +813,12 @@ func redactSetCookie(line string) string {
 	// Measured before `escapeMarks` lengthened it, exactly as redactUnlessVerbatim
 	// does -- the structural path had kept the older behaviour
 	// (shardpilot/shardpilot-go#85 review).
-	out := head + ": " + name + syntax("=") + placeholder(unescapeMarks(measured))
+	// ⚠ A COOKIE-SAFE PLACEHOLDER. `<redacted, N chars>` carries a space and a
+	// comma, and neither is a `cookie-octet`: a strict RFC 6265 consumer rejects or
+	// re-reads the line this change promises to keep structural
+	// (shardpilot/shardpilot-go#85 review). `tokenPlaceholder` is the spelling the
+	// cookie NAME and the URI components already use, and it is safe in all three.
+	out := head + ": " + name + syntax("=") + tokenPlaceholder(unescapeMarks(measured))
 	if hasAttrs {
 		// ⚠ ATTRIBUTE VALUES ARE SERVER-GENERATED TOO. `; Path=/reset/<token>`,
 		// or an extension attribute carrying a nonce, went through unchanged
@@ -827,7 +875,7 @@ func redactSetCookie(line string) string {
 				// rewrote its prefix into the prose form and produced a name no
 				// cookie parser accepts (shardpilot/shardpilot-go#85 review).
 				parts[i] = " " + tokenPlaceholder(ows(an)) +
-					syntax("=") + placeholder(unescapeMarks(ows(av)))
+					syntax("=") + tokenPlaceholder(unescapeMarks(ows(av)))
 				continue
 			}
 			// ⚠ CLASSIFY THE ORIGINAL NAME, THEN MARK IT. Run the other way round,
@@ -867,7 +915,7 @@ func redactSetCookie(line string) string {
 			// on the wire -- was reported as seven. The cookie's own value already
 			// unescaped before measuring; the attributes did not
 			// (shardpilot/shardpilot-go#85 review).
-			parts[i] = an + syntax("=") + placeholder(unescapeMarks(ows(av)))
+			parts[i] = an + syntax("=") + tokenPlaceholder(unescapeMarks(ows(av)))
 		}
 		out += syntax(";") + strings.Join(parts, syntax(";"))
 	}
@@ -1037,6 +1085,39 @@ func structuralRedact(line string) (string, bool) {
 // redactMintedBody replaces server-minted identifiers in a JSON body with a
 // length-preserving placeholder, structurally -- by FIELD NAME, the only handle
 // that exists when the value itself is unknown to this program.
+// redactUnaccountedJSONValues replaces every string VALUE in a parsed body that
+// this program cannot account for with its length.
+//
+// ⚠ PARSING IS NOT ACCOUNTING. The body rule refused a body that does not parse
+// and let a parsed one through whole -- so `{"error":"server-secret-token"}` was
+// published verbatim: `error` is an admitted MEMBER, its value is endpoint-minted,
+// and the guard is blind because the value was never supplied by this program
+// (shardpilot/shardpilot-go#85 review). The admitted list says which member NAMES
+// this program recognises. It says nothing about their values.
+//
+// What is accounted for: a value this SDK itself produces (the verdict taxonomy),
+// and the grammar's own literals, which are not strings. Everything else is
+// endpoint text and becomes a length -- which is what the clause says.
+func redactUnaccountedJSONValues(body string) string {
+	return jsonMemberValue.ReplaceAllStringFunc(body, func(m string) string {
+		g := jsonMemberValue.FindStringSubmatch(m)
+		// ⚠ THE THIRD GROUP IS THE CONTENT, NOT THE QUOTED SPELLING. My first version
+		// tested it for a leading quote to skip non-strings -- and this pattern only
+		// matches strings, with the quotes OUTSIDE the group, so that test was false
+		// for every match and the whole pass was a no-op. The suite stayed green
+		// because a pass that changes nothing breaks nothing.
+		val, ok := jsonString(g[3])
+		if !ok {
+			val = g[3]
+		}
+		if sdkTaxonomy[val] {
+			return `"` + g[1] + `"` + g[2] + `"` + marked(val) + `"`
+		}
+		noteAccounted("an endpoint-chosen value in a parsed response body")
+		return `"` + g[1] + `"` + g[2] + `"` + tokenPlaceholder(val) + `"`
+	})
+}
+
 func redactMintedBody(body string) string {
 	// ⚠ MEMBER NAMES ARE MATCHED BY WHAT THEY DENOTE, NOT BY ONE SPELLING, and
 	// ASCII case does not distinguish them: `encoding/json` matches a field

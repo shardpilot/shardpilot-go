@@ -132,7 +132,7 @@ func TestCookieLengthIsTheCookiesNotThePlaceholders(t *testing.T) {
 	// see the cookie, not a substitution made before it.
 	ex := exchange{head: []byte("HTTP/1.1 200 OK\r\nSet-Cookie: sid=abc12345; Path=/\r\n\r\n")}
 	got := responseText(&ex)
-	if !strings.Contains(got, "<redacted, 8 chars>") {
+	if !strings.Contains(got, "redacted-8-chars") {
 		t.Fatalf("the cookie's own length was not reported: %q", got)
 	}
 }
@@ -402,7 +402,7 @@ func TestQuotedCookieValueIsMeasuredWithoutItsDelimiters(t *testing.T) {
 	structuralSurfaces = nil
 	t.Cleanup(func() { structuralSurfaces = nil })
 	got := stripMarks(dropFraming("HTTP/1.1 200 OK\r\nSet-Cookie: sid=\"abc\"\r\n\r\n"))
-	if !strings.Contains(got, "3 chars") {
+	if !strings.Contains(got, "redacted-3-chars") {
 		t.Fatalf("the quotes were counted as value: %q", got)
 	}
 }
@@ -414,5 +414,26 @@ func TestOpaqueQueryComponentIsMeasuredDecoded(t *testing.T) {
 	got := stripMarks(dropFraming("HTTP/1.1 302 Found\r\nLocation: /cb?%C3%A9\r\n\r\n"))
 	if !strings.Contains(got, "redacted-1-chars") {
 		t.Fatalf("an opaque component was measured on its wire spelling: %q", got)
+	}
+}
+
+// The host is exempt from REDACTION; that never meant the generic scrub may
+// corrupt it.
+func TestASuppliedValueDoesNotCorruptTheExemptAuthority(t *testing.T) {
+	suppliedValues = []string{"example"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 302 Found\r\nLocation: https://e.example/cb\r\n\r\n{\"assigned\":false}")))
+	if strings.Contains(got, "example") {
+		t.Fatalf("the supplied value survived in the authority: %q", got)
+	}
+	if strings.ContainsAny(strings.SplitN(strings.SplitN(got, "Location: ", 2)[1], "\r", 2)[0], " <>,") {
+		t.Fatalf("the authority was rewritten into prose: %q", got)
+	}
+	// AND AN AUTHORITY THAT COLLIDES WITH NOTHING IS UNTOUCHED.
+	suppliedValues = nil
+	if plain := stripMarks(dropFraming(
+		"HTTP/1.1 302 Found\r\nLocation: https://e.example/cb\r\n\r\n{\"assigned\":false}")); !strings.Contains(plain, "e.example") {
+		t.Fatalf("an ordinary authority was replaced: %q", plain)
 	}
 }
