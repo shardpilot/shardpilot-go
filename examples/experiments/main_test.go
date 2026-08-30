@@ -2143,3 +2143,74 @@ func TestWrappedCandidateAssemblyIsLinear(t *testing.T) {
 		t.Fatal("the assembly charged nothing to the decode budget")
 	}
 }
+
+// Go's quoting alphabet is not JSON's, and `encodingsOf` emits both.
+func TestGoControlEscapesAreDecoded(t *testing.T) {
+	// BOTH escapes Go writes and JSON does not: a scene covering one of them leaves
+	// the other unmeasured, and the mutant that removed `\a` survived the first
+	// version of this.
+	for _, c := range []struct{ val, wire string }{
+		{"a\vb", "k=%61%5Cvb"},
+		{"a\ab", "k=%61%5Cab"},
+	} {
+		suppliedValues = []string{c.val}
+		err := assertNoLeak(asCaptured(c.wire))
+		suppliedValues = nil
+		if err == nil {
+			t.Fatalf("a value whose Go spelling hides a control byte passed the guard: %q", c.wire)
+		}
+	}
+}
+
+// The SDK's classification reaches the error path too.
+func TestTheTaxonomyInsideAFetchErrorIsVouched(t *testing.T) {
+	suppliedValues = []string{"not_found"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(sanitizeCaptured(
+		errors.New("shardpilot experiment assignment fetch failed: not_found")))
+	if !strings.Contains(got, "not_found") {
+		t.Fatalf("the SDK's own classification was rewritten inside the error: %q", got)
+	}
+}
+
+// "Short" means characters everywhere else; this threshold counted bytes.
+func TestTheShortValueThresholdCountsCharacters(t *testing.T) {
+	suppliedValues = []string{"éééé"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// ⚠ THE TEXT MUST BE UNCHANGED, not merely still bracketed by its neighbours.
+	// The first version asserted `α` and `β` survive -- they survive the
+	// unconditional replacement too, so it matched something other than its subject.
+	// `éééé` here is EMBEDDED, and the boundary rule that applies to short values is
+	// exactly what the byte-length threshold was skipping.
+	if got := stripMarks(scrubSupplied(asCaptured("αééééβ"))); !strings.Contains(got, "αééééβ") {
+		t.Fatalf("an embedded short value was replaced past its boundary rule: %q", got)
+	}
+}
+
+// The identity branch is an early return, and owes what the common path does.
+func TestTheIdentityBranchAdmitsItsFieldNameAndSpelling(t *testing.T) {
+	suppliedValues = []string{"IDENTITY"}
+	got := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\nContent-Encoding: IDENTITY\r\n\r\n{\"assigned\":false}")))
+	suppliedValues = nil
+	if strings.Contains(got, "IDENTITY") {
+		t.Fatalf("a non-canonical coding spelling was vouched: %q", got)
+	}
+	suppliedValues = []string{"Content-Encoding"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got = stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\nContent-Encoding: identity\r\n\r\n{\"assigned\":false}")))
+	// ⚠ THE FIELD NAME IS THE SUBJECT, AND THE PROPERTY IS THAT IT IS STILL A FIELD
+	// NAME. Two earlier versions of this assertion were wrong: the first checked
+	// that `identity` survives, which it does either way since the branch marks the
+	// value; the second checked the name survives VERBATIM, which it must not -- the
+	// name equals a supplied identifier and is redacted. What the early return
+	// skipped is the TOKEN-SAFE spelling, so the header stayed parsable.
+	name := strings.SplitN(strings.SplitN(got, "\r\n", 2)[1], ":", 2)[0]
+	if strings.ContainsAny(name, " <>,") || name == "" {
+		t.Fatalf("the early return left a field name no parser accepts: %q", got)
+	}
+	if strings.Contains(name, "Content-Encoding") {
+		t.Fatalf("a supplied identifier survived in the field name: %q", got)
+	}
+}

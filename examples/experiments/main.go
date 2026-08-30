@@ -420,6 +420,23 @@ var sdkTaxonomy = set(
 	"superseded",
 )
 
+// vouchTaxonomyIn marks this SDK's own classification wherever it appears inside
+// a rendered error.
+//
+// ⚠ THE TAXONOMY REACHES THE ERROR PATH TOO. `result.Code` and `result.Reason`
+// are vouched, and the SDK also puts the same classification INSIDE the error it
+// returns -- `…fetch failed: http_0`. With that string as a legal experiment key
+// the generic scrub rewrote it to a placeholder, and the report's exit status
+// depends on precisely that token (shardpilot/shardpilot-go#84 review). Same
+// vocabulary, second printer; vouching it in one place is vouching it in one
+// place.
+func vouchTaxonomyIn(text string) string {
+	for t := range sdkTaxonomy {
+		text = replaceTokenWith(text, t, marked(t), isWordByte)
+	}
+	return text
+}
+
 // vouchTaxonomy marks a verdict field this SDK generated.
 func vouchTaxonomy(v string) string {
 	if sdkTaxonomy[v] {
@@ -1035,7 +1052,13 @@ func dropFraming(dump string) string {
 				// it verbatim to stderr -- the refusal publishing what the refusal
 				// was for (shardpilot/shardpilot-go#84 review).
 				noteStructural("a body in a content coding this build cannot decode")
-			} else if strings.EqualFold(v, "identity") {
+			} else if v == "identity" {
+				// ⚠ THE CANONICAL SPELLING, AND THE GENERIC NAME PATH. Two things this
+				// early return skipped: `EqualFold` admitted `IDENTITY` and the branch
+				// vouched the RECEIVED spelling, and returning here bypassed the header
+				// name handling, so a supplied `Content-Encoding` was scrubbed out of the
+				// field NAME (shardpilot/shardpilot-go#84 review). An early return is a
+				// promise to have done everything the common path does.
 				// ⚠ AN ACCEPTED CODING IS GRAMMAR, AND MUST BE MARKED AS SUCH. This
 				// branch deliberately accepts `identity` as the no-op coding that
 				// accompanies a readable body -- and then left the token as captured
@@ -1046,7 +1069,7 @@ func dropFraming(dump string) string {
 				// (shardpilot/shardpilot-go#84 review). Same rule as the cookie
 				// attributes and the query parameter names: vouching for a token and
 				// leaving it captured is not vouching.
-				out = append(out, l[:len("content-encoding:")]+
+				out = append(out, scrubHeaderName(l[:len("content-encoding:")-1])+":"+
 					strings.Replace(l[len("content-encoding:"):], v, marked(v), 1))
 				continue
 			}
@@ -1557,7 +1580,11 @@ func sanitizeCaptured(err error) string {
 		return asCaptured("")
 	}
 	noteStructuralInText(err.Error())
-	return asCaptured(scrubSupplied(sanitizeText(escapeMarks(err.Error()))))
+	// ⚠ VOUCHED BEFORE THE SCRUB, which is the documented structural-first order.
+	// Applied to the RESULT instead, the classification is already a placeholder by
+	// the time the marking runs -- my first version did exactly that and the scene
+	// said so immediately.
+	return asCaptured(scrubSupplied(sanitizeText(vouchTaxonomyIn(escapeMarks(err.Error())))))
 }
 
 // sanitize renders an error for STDERR. The marks are stripped: they exist so the
@@ -2922,6 +2949,21 @@ func undoUnicodeEscapes(text string) string {
 				b.WriteByte('\f')
 				i++
 				continue
+			case 'a':
+				// ⚠ GO'S OWN QUOTING ALPHABET TOO, not only JSON's. `encodingsOf`
+				// explicitly produces `strconv.Quote` spellings, and that quoting
+				// writes `\a` and `\v` where JSON does not -- so a supplied value
+				// containing a bell or a vertical tab had a spelling no retained form
+				// reconstructed (shardpilot/shardpilot-go#84 review). A decoder that
+				// covers one of two alphabets its own producer emits is covering half
+				// of what it was written for.
+				b.WriteByte(7)
+				i++
+				continue
+			case 'v':
+				b.WriteByte(11)
+				i++
+				continue
 			}
 		}
 		b.WriteByte(text[i])
@@ -3204,7 +3246,14 @@ func isASCII(s string) bool {
 }
 
 func replaceTokenWith(text, v, red string, isWord func(byte) bool) string {
-	if len(v) >= 8 {
+	// ⚠ CHARACTERS, LIKE EVERY OTHER PLACE THAT SAYS "SHORT". `len` is bytes, so a
+	// four-character non-ASCII key such as `éééé` is eight bytes and took the
+	// unconditional branch -- rewriting ordinary endpoint text `αééééβ` into
+	// `α<redacted, 4 chars>β`, evidence the guard then approved because the
+	// placeholder is generated (shardpilot/shardpilot-go#84 review). The
+	// placeholder counts characters and so does the notion of a short identifier;
+	// only this threshold counted bytes.
+	if chars(v) >= 8 {
 		return strings.ReplaceAll(text, v, red)
 	}
 	var b strings.Builder
