@@ -718,7 +718,10 @@ func redactZone(line string) string {
 	if zone == "" {
 		return line
 	}
-	return line[:b+1] + lit[:z+sep] + tokenPlaceholder(zone) + line[e:]
+	// MEASURED DECODED, like every other component here: `eth%30` is `eth0`, four
+	// characters, and measuring the wire spelling put two lengths for one value in
+	// one capture (shardpilot/shardpilot-go#85 review).
+	return line[:b+1] + lit[:z+sep] + tokenPlaceholder(queryDecoded(zone)) + line[e:]
 }
 
 // redactUserinfo removes `user:password@` from a redirect target.
@@ -931,7 +934,13 @@ func redactMintedBody(body string) string {
 		}
 	}
 	parsed := topLevelMembers(body)
-	unparsable := parsed == nil && strings.Contains(body, "{")
+	// ⚠ SECOND SITE OF ONE CONFLATION. I fixed `topLevelMembers == nil` being read
+	// as "did not parse" in the branch above and left this one, so a complete
+	// valid `[{"subject_fact_key":1}]` was still labelled unparsable, its nested
+	// member treated as possibly top-level, and the body withheld with exit 4 --
+	// while its depth is fully determined (shardpilot/shardpilot-go#85 review).
+	// Fixing the site I was shown is what this file keeps having to stop doing.
+	unparsable := !jsonParses(body) && strings.Contains(body, "{")
 	top := map[string]bool{}
 	for _, n := range parsed {
 		top[n] = true
@@ -971,17 +980,37 @@ func redactMintedBody(body string) string {
 	// (shardpilot/shardpilot-go#85 review). Arbitrary payload names stay captured;
 	// only the ones a registry vouches for are marked. All thirteen benign members
 	// were affected, not the one the review named.
-	out = jsonMemberName.ReplaceAllStringFunc(out, func(m string) string {
-		g := jsonMemberName.FindStringSubmatch(m)
-		dec, ok := jsonString(g[1])
+	var vouchAt [][2]int
+	// ⚠ TOP LEVEL ONLY, like every other membership question in this file. A key
+	// inside `variant_payload` is endpoint-controlled payload, not SDK wire
+	// syntax, so vouching for it at every depth let a supplied identifier of
+	// `assigned` ride out inside `{"assigned":true,"variant_payload":{"assigned":
+	// "x"}}` -- skipped by the scrub AND the guard
+	// (shardpilot/shardpilot-go#85 review). Third time a depth-blind rule has been
+	// written beside a depth-aware one in this function; the redaction is blind on
+	// purpose, and everything that VOUCHES must not be.
+	topNames := map[string]bool{}
+	for _, n := range topLevelMembers(out) {
+		topNames[n] = true
+	}
+	vouchWalk := newDepthWalker(out)
+	for _, loc := range jsonMemberName.FindAllStringSubmatchIndex(out, -1) {
+		raw := out[loc[2]:loc[3]]
+		dec, ok := jsonString(raw)
 		if !ok {
-			dec = g[1]
+			dec = raw
+		}
+		if vouchWalk(loc[0]) != 1 || !topNames[dec] {
+			continue
 		}
 		if isBenignName(dec) || isMintedName(dec) {
-			return strings.Replace(m, g[1], vouched(g[1]), 1)
+			vouchAt = append(vouchAt, [2]int{loc[2], loc[3]})
 		}
-		return m
-	})
+	}
+	for k := len(vouchAt) - 1; k >= 0; k-- {
+		a, b := vouchAt[k][0], vouchAt[k][1]
+		out = out[:a] + vouched(out[a:b]) + out[b:]
+	}
 	return out
 }
 

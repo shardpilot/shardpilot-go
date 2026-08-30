@@ -1796,3 +1796,59 @@ func TestConnectionPresenceIsNotItsFirstValue(t *testing.T) {
 		t.Fatal("a Connection field whose FIRST value is empty was recorded as absent")
 	}
 }
+
+// ---- round on 819d04c ----
+
+// TestVouchingIsTopLevelOnly: a key inside `variant_payload` is endpoint-controlled
+// payload, not SDK wire syntax, so vouching at every depth let a supplied
+// identifier of `assigned` ride out inside the nested object — skipped by the
+// scrub AND the guard (shardpilot/shardpilot-go#85 review).
+func TestVouchingIsTopLevelOnly(t *testing.T) {
+	suppliedValues = []string{"assigned"}
+	structuralSurfaces = nil
+	accountedSurfaces = nil
+	t.Cleanup(func() { suppliedValues = nil; structuralSurfaces = nil; accountedSurfaces = nil })
+	body := `{"assigned":true,"variant_payload":{"assigned":"x"}}`
+	got := stripMarks(scrubSupplied(redactMintedBody(body)))
+	// The top-level one is vouched for and survives; the nested one does not.
+	if strings.Count(got, "assigned") != 1 {
+		t.Fatalf("vouching did not stop at the top level: %q", got)
+	}
+	if !strings.Contains(got, `"assigned":true`) {
+		t.Fatalf("the top-level member the SDK binds was scrubbed: %q", got)
+	}
+}
+
+// TestValidNonObjectJSONIsNotWithheld is the second site of one conflation: a
+// complete `[{"subject_fact_key":1}]` was labelled unparsable, its nested member
+// treated as possibly top-level, and the body withheld with exit 4 — while its
+// depth is fully determined (shardpilot/shardpilot-go#85 review).
+func TestValidNonObjectJSONIsNotWithheld(t *testing.T) {
+	structuralSurfaces = nil
+	suppliedValues = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	got := redactMintedBody(`[{"subject_fact_key":1}]`)
+	if strings.Contains(got, "withheld") {
+		t.Fatalf("a complete valid body was withheld: %q", stripMarks(got))
+	}
+	if len(refusalLedger()) != 0 {
+		t.Fatalf("a complete valid body was made unpublishable: %q", refusalLedger())
+	}
+	// A body that genuinely does not parse is still withheld.
+	structuralSurfaces = nil
+	if got := redactMintedBody(`{"subject_fact_key":`); !strings.Contains(got, "withheld") &&
+		len(refusalLedger()) == 0 {
+		t.Fatalf("a body that does not parse stayed publishable: %q", stripMarks(got))
+	}
+}
+
+// TestAZoneIsMeasuredDecoded: `eth%30` is `eth0`, four characters, and measuring
+// the wire spelling put two lengths for one value in one capture
+// (shardpilot/shardpilot-go#85 review).
+func TestAZoneIsMeasuredDecoded(t *testing.T) {
+	suppliedValues = nil
+	got := stripMarks(redactTarget("Location: https://[fe80::1%25eth%30]/cb"))
+	if !strings.Contains(got, "redacted-4-chars") {
+		t.Fatalf("a zone was measured in its wire spelling: %q", got)
+	}
+}
