@@ -607,6 +607,22 @@ func fieldNameOf(low string) (string, bool) {
 	return low[:i], true
 }
 
+// benignTopLevel names the members of the SDK's own response schema.
+//
+// ⚠ THE SAME NAME AND THE SAME CONTENTS AS THE STRUCTURAL-REDACTION BRANCH USES.
+// Two registries answering one question drift -- this file records that happening
+// three rounds running to `isMinted` -- so the branch stacked on this one finds
+// the identical declaration and the two cannot diverge across the seam.
+var benignTopLevel = map[string]bool{
+	"assigned": true, "variant_key": true, "variant_payload": true,
+	"version": true, "reason": true, "boundary": true, "code": true,
+	"assignment_unit": true, "attributes": true, "experiment_key": true,
+	// AND THE ONES THE SDK ITSELF ACCEPTS: a `401` body is
+	// `{"error":"unauthorized"}` and an echoed assignment carries `app_key` and
+	// `environment_key`.
+	"error": true, "app_key": true, "environment_key": true,
+}
+
 var mintedNames = map[string]bool{
 	"subject_fact_key": true,
 	"subject_key_hash": true,
@@ -780,6 +796,15 @@ func noteMinted(body string) string {
 		}
 	}
 	return body
+}
+
+// verdictVersion renders the assignment version for the verdict block.
+//
+// ⚠ IT IS A FUNCTION SO THE FIXTURE READS THE CALL SITE, for the reason written
+// on verdictValue directly below: a test that re-assembles the same calls in its
+// own body passes while the report does something else.
+func verdictVersion(v int64) string {
+	return stripMarks(scrubSupplied(fmt.Sprintf("%d", v)))
 }
 
 // verdictValue renders a value the SDK decoded, for the verdict block.
@@ -1442,9 +1467,14 @@ func noteStructuralInText(text string) {
 			forms = append(forms, cur)
 		}
 		for _, form := range forms {
+			// ⚠ THE TOKENISER'S ALPHABET MUST BE AS WIDE AS THE PREDICATE'S.
+			// `isMintedName` folds the way `encoding/json` does, so it MATCHES
+			// `ſubject_fact_key` -- and this splitter, being ASCII-only, cut the name
+			// at `ſ` and never handed it that token (shardpilot/shardpilot-go#84
+			// review). A candidate the predicate would accept but the splitter cannot
+			// produce is a predicate that is never asked.
 			for _, tok := range strings.FieldsFunc(form, func(r rune) bool {
-				return !(r == '_' || r == '-' ||
-					(r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'))
+				return !(r == '_' || r == '-' || unicode.IsLetter(r) || unicode.IsDigit(r))
 			}) {
 				if isMintedName(tok) {
 					noteStructural("a server-minted field inside a transport error")
@@ -1504,8 +1534,13 @@ func sanitizeCaptured(err error) string {
 	return asCaptured(scrubSupplied(sanitizeText(escapeMarks(err.Error()))))
 }
 
+// sanitize renders an error for STDERR. The marks are stripped: they exist so the
+// publication guard can tell captured bytes from generated ones, and a terminal
+// gets raw SOH control bytes instead of a message
+// (shardpilot/shardpilot-go#84 review). `sanitizeCaptured` keeps them, because
+// that output is what the guard reads.
 func sanitize(err error) string {
-	return sanitizeRaw(err)
+	return stripMarks(sanitizeRaw(err))
 }
 
 func sanitizeRaw(err error) string {
@@ -1719,8 +1754,24 @@ func markBareJSONLiterals(text string) string {
 	dec := json.NewDecoder(strings.NewReader(text[start:]))
 	type span struct{ a, b int }
 	var spans []span
+	// ⚠ THE SCHEMA'S MEMBER NAMES ARE GRAMMAR TOO, not only its literals. A legal
+	// supplied key may equal a response member -- `assigned`, `experiment_key` --
+	// and the generic scrub rewrote the NAME, so a successful report no longer
+	// carried the verdict schema the endpoint sent, while the generated
+	// provenance made the guard approve it (shardpilot/shardpilot-go#84 review).
+	// The literals were marked here for exactly this reason and the names beside
+	// them were not.
+	//
+	// ⚠ AND ONLY THE CANONICAL SPELLING. `isBenignName` folds, so vouching on
+	// recognition would publish a supplied `ASSIGNED`; the registry's own spelling
+	// is what this program writes, and the fold is only how it recognises. That is
+	// the class the child branch spent three rounds on -- carried here rather than
+	// repeated (shardpilot/shardpilot-go#85 review).
+	//
+	// Depth and turn are tracked because `Token()` returns a string for a key and
+	// for a value alike: only position tells them apart.
+	var objDepth []bool // true while the next string in this object is a KEY
 	for {
-		off := dec.InputOffset()
 		tok, err := dec.Token()
 		if err != nil {
 			if err == io.EOF {
@@ -1728,7 +1779,35 @@ func markBareJSONLiterals(text string) string {
 			}
 			return text // malformed: no grammar to protect
 		}
-		_ = off
+		if d, ok := tok.(json.Delim); ok {
+			switch d {
+			case '{':
+				objDepth = append(objDepth, true)
+			case '[':
+				objDepth = append(objDepth, false)
+			case '}', ']':
+				if len(objDepth) > 0 {
+					objDepth = objDepth[:len(objDepth)-1]
+				}
+			}
+			continue
+		}
+		isKey := len(objDepth) > 0 && objDepth[len(objDepth)-1]
+		if isKey {
+			objDepth[len(objDepth)-1] = false
+		} else if len(objDepth) > 0 {
+			objDepth[len(objDepth)-1] = true
+		}
+		if name, ok := tok.(string); ok && isKey {
+			if benignTopLevel[name] || mintedNames[name] {
+				end := start + int(dec.InputOffset())
+				quoted := `"` + name + `"`
+				if end-len(quoted) >= 0 && text[end-len(quoted):end] == quoted {
+					spans = append(spans, span{end - len(quoted), end})
+				}
+			}
+			continue
+		}
 		switch tok.(type) {
 		case bool, nil:
 			end := int(dec.InputOffset())
@@ -2163,6 +2242,8 @@ func assertNoLeak(text string) error {
 			// other text. Seeds like the rest: a candidate is an input to the chain.
 			sufs = append(sufs, hexCandidates(cur)...)
 			sufs = append(sufs, hexCandidates(curNames)...)
+			sufs = append(sufs, shortBase64Candidates(cur)...)
+			sufs = append(sufs, shortBase64Candidates(curNames)...)
 			for _, w := range wrappedBase64Candidates(cur) {
 				sufs = append(sufs, w)
 				if d, ok := decodeBase64(w); ok {
@@ -2272,6 +2353,38 @@ func assertNoLeak(text string) error {
 // stage still carries the plain text, so nothing is lost by rewriting it here.
 // Garbage produced from a non-base64 run can only ever ADD a match, which fails
 // closed.
+// shortBase64Candidates retains what a SHORT unpadded base64 token decodes to.
+//
+// ⚠ THE REWRITE'S FLOOR IS NOT A STATEMENT ABOUT LEGAL VALUES -- the second time
+// today, after the bare-hex floor. `undoBase64` rewrites in place, so its
+// four-byte floor bounds the garbage a destructive pass may produce; but
+// `decodeBase64` accepts `RawStdEncoding`, a one-character key travels as `YQ`
+// and a two-character one as `YWI`, and no binary or suffix path took tokens
+// below that floor either (shardpilot/shardpilot-go#84 review). Nothing is
+// rewritten here, so the floor keeps protecting what it was chosen for.
+func shortBase64Candidates(text string) []string {
+	var out []string
+	for i := 0; i < len(text); {
+		j := i
+		for j < len(text) && isBase64Byte(text[j]) {
+			j++
+		}
+		if j == i {
+			i++
+			continue
+		}
+		tok := text[i:j]
+		i = j
+		if len(tok) < 2 || len(tok) > 3 {
+			continue
+		}
+		if dec, ok := decodeBase64(tok); ok {
+			out = append(out, dec)
+		}
+	}
+	return out
+}
+
 func undoBase64(text string) string {
 	// ⚠ FOUR, NOT EIGHT. A three-character key is legal and `bar` travels as the
 	// four-byte `YmFy`, which an eight-byte floor skipped entirely -- the guard
@@ -2526,7 +2639,17 @@ func wrappedBase64Candidates(text string) []string {
 		}
 		joined := head
 		for j := i + 1; j < len(lines); j++ {
-			if allBase64(lines[j]) && lines[j] != "" {
+			// ⚠ A BLANK LINE IS WHITESPACE, NOT A BOUNDARY -- the same sentence this
+			// file has now had to apply three times: to horizontal space inside a
+			// line, to a blank line inside a whole-line run, and now to a blank line
+			// inside a run that SHARES its first line. A standard decoder ignores
+			// every CR and LF, so `prefix: YWJj\r\n\r\nZGVmZ2g=` reconstructs the
+			// identifier in one step (shardpilot/shardpilot-go#84 review). Each time
+			// the producer was new and the rule was not.
+			if lines[j] == "" {
+				continue
+			}
+			if allBase64(lines[j]) {
 				joined += lines[j]
 				continue
 			}
@@ -3228,7 +3351,14 @@ func main() {
 	// only zero-valued fields and then called the run generically not-served --
 	// losing the first-class verdict this program exists to report.
 	fmt.Fprintf(&report, "    code:     %q\n", stripMarks(scrubSupplied(vouchTaxonomy(result.Code))))
-	fmt.Fprintf(&report, "    version:  %d\n", result.Version)
+	// ⚠ THROUGH THE SCRUB, LIKE EVERY OTHER VERDICT FIELD. A legal experiment key
+	// is `123`, an assignment can be at version 123, and this line reintroduced it
+	// verbatim AFTER the response block had redacted the matching JSON number --
+	// and the verdict lines carry no captured provenance, so `assertNoLeak` does
+	// not read them (shardpilot/shardpilot-go#84 review). "Wherever it appears" is
+	// a claim about every printer, and this one had been left out because a number
+	// did not look like text.
+	fmt.Fprintf(&report, "    version:  %s\n", verdictVersion(result.Version))
 	if fetchErr != nil {
 		fmt.Fprintf(&report, "    error:    %s\n", sanitizeCaptured(fetchErr))
 	}
