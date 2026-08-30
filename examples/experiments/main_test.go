@@ -3774,6 +3774,12 @@ func TestAScanProducesEverySpellingTheGuardReconstructs(t *testing.T) {
 	for _, spelling := range []string{
 		`%22subject_fact_key%22:%22sfk_secret%22`,
 		`%2522subject_fact_key%2522:%2522sfk_secret%2522`,
+		// ⚠ AND A FORM ONLY A PRODUCER REACHES. `undoBase64` leaves a token whose
+		// decode is not valid UTF-8 exactly as it found it, so this spelling was in no
+		// form the walk produced while `assertNoLeak` builds that very candidate
+		// downstream and checks it only against SUPPLIED values
+		// (shardpilot/shardpilot-go#84 review).
+		`/yJzdWJqZWN0X2ZhY3Rfa2V5Ijoic2ZrX3NlY3JldCI=`,
 	} {
 		structuralSurfaces = nil
 		noteMinted(spelling)
@@ -3885,5 +3891,63 @@ func TestTheSeedCapBoundsTheAppend(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "reached 4096 seeds") {
 		t.Errorf("the worklist ran past its cap before refusing: %v", err)
+	}
+}
+
+// TestAContentCodingIsAList: `Content-Encoding: identity, identity` is the same
+// response as two separate `identity` lines, which this loop already accepts — so
+// the classification depended only on how an intermediary chose to combine the
+// fields, and the combined spelling withheld a readable capture with exit 4
+// (shardpilot/shardpilot-go#84 review).
+func TestAContentCodingIsAList(t *testing.T) {
+	t.Cleanup(func() { structuralSurfaces = nil })
+	for _, c := range []struct {
+		name, value string
+		refused     bool
+	}{
+		{"one identity", "identity", false},
+		{"a list of identity", "identity, identity", false},
+		{"folded case is still nothing applied", "IDENTITY, identity", false},
+		{"a real coding in the list", "identity, gzip", true},
+		{"an empty element is malformed", "identity, ", true},
+		{"a real coding alone", "gzip", true},
+	} {
+		structuralSurfaces = nil
+		dropFraming("HTTP/1.1 200 OK\r\nContent-Encoding: " + c.value + "\r\n\r\n{\"assigned\":false}")
+		if (len(structuralSurfaces) != 0) != c.refused {
+			t.Errorf("%s: refused=%v, want %v (%v)", c.name, len(structuralSurfaces) != 0, c.refused, structuralSurfaces)
+		}
+	}
+}
+
+// TestTheOffRouteClaimIsVerdictDependent reads the SOURCE, because the sentence is
+// assembled in `main()` where no fixture can run it. What it pins is that the claim
+// is no longer unconditional: applying an assignment ARMS an `experiment_exposure`
+// that `Close` flushes through this same transport, so on the served path at least
+// one off-route request is the SDK working — and a line that calls that unexpected
+// teaches an operator to ignore it (shardpilot/shardpilot-go#84 review).
+//
+// ⚠ A SOURCE-READING SCENE IS WEAKER THAN A RUN, and this one says so. It cannot
+// see what the report prints; it can only see that the claim is conditioned on the
+// verdict at all. The alternative — extracting the whole report assembly — is a
+// larger change than this finding asked for, and the limit is recorded here rather
+// than left to look like coverage.
+func TestTheOffRouteClaimIsVerdictDependent(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("the scene cannot read its own subject: %v", err)
+	}
+	text := string(src)
+	if strings.Contains(text, `"The ingest leg shares this transport; zero is the expected answer`) {
+		t.Errorf("the off-route claim is still unconditional")
+	}
+	// ⚠ THE CONDITION, NOT THE WORDS. A first version checked that `result.Assigned`
+	// appears in the file at all -- it appears in the verdict switch too, so replacing
+	// the condition here with `false` left the scene green.
+	if !strings.Contains(text, "offRouteExpected := \"zero\"\n\tif result.Assigned {") {
+		t.Errorf("the expected off-route count is no longer conditioned on the verdict")
+	}
+	if !strings.Contains(text, "experiment_exposure") {
+		t.Errorf("the claim does not say WHY the served path expects one, so an operator cannot check it")
 	}
 }

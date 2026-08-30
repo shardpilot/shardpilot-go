@@ -1342,6 +1342,33 @@ func markMediaType(line string) string {
 	return out + cr
 }
 
+// allIdentityCodings reports whether every coding in a `Content-Encoding` value is
+// `identity` -- the only one this build treats as "nothing was applied". An empty
+// element is not a coding and makes the list malformed rather than transparent.
+// ⚠ TWO COMPARISONS, DELIBERATELY. The REFUSAL folds case -- `IDENTITY` is still
+// "nothing was applied", so refusing it would withhold a readable capture. The VOUCH
+// does not: it marks the received bytes as this program's grammar, and that is only
+// true of the canonical spelling. A scene pins both, and collapsing them into one
+// fold vouched `IDENTITY` immediately.
+func allIdentityCodings(v string, fold bool) bool {
+	if strings.TrimSpace(v) == "" {
+		return false
+	}
+	for _, part := range strings.Split(v, ",") {
+		p := strings.TrimSpace(part)
+		if fold {
+			if !strings.EqualFold(p, "identity") {
+				return false
+			}
+			continue
+		}
+		if p != "identity" {
+			return false
+		}
+	}
+	return true
+}
+
 func dropFraming(dump string) string {
 	lines := strings.Split(dump, "\n")
 	out := make([]string, 0, len(lines))
@@ -1459,14 +1486,20 @@ func dropFraming(dump string) string {
 			// diagnostic over bytes that do not exist (shardpilot/shardpilot-go#84
 			// review). The refusal is about what an undecodable body could HIDE, so an
 			// absent body is not its subject.
+			// ⚠ A CONTENT CODING IS A LIST. `Content-Encoding: identity, identity` is the
+			// same response as two separate `identity` lines, which this loop already
+			// accepts -- so the classification depended only on how an intermediary chose
+			// to combine the fields, and the combined spelling withheld a readable capture
+			// with exit 4 (shardpilot/shardpilot-go#84 review). A whole field value
+			// compared against a single token is a list read as a scalar.
 			if v := strings.TrimSpace(strings.TrimSuffix(l[len("content-encoding:"):], "\r")); v != "" &&
-				!strings.EqualFold(v, "identity") && hasBody {
+				!allIdentityCodings(v, true) && hasBody {
 				// ⚠ A CLASSIFICATION, NOT THE VALUE. With a supplied key of
 				// `deflate` the scrub hid the header and this diagnostic printed
 				// it verbatim to stderr -- the refusal publishing what the refusal
 				// was for (shardpilot/shardpilot-go#84 review).
 				noteStructural("a body in a content coding this build cannot decode")
-			} else if v == "identity" {
+			} else if allIdentityCodings(v, false) {
 				// ⚠ THE CANONICAL SPELLING, AND THE GENERIC NAME PATH. Two things this
 				// early return skipped: `EqualFold` admitted `IDENTITY` and the branch
 				// vouched the RECEIVED spelling, and returning here bypassed the header
@@ -2122,21 +2155,50 @@ func decodedForms(text string) ([]string, bool) {
 	seen := map[string]bool{text: true}
 	out := []string{text}
 	spent := 0
+	add := func(f string) bool {
+		if f == "" || seen[f] {
+			return true
+		}
+		if len(out) >= decodedFormsMax {
+			return false
+		}
+		seen[f] = true
+		out = append(out, f)
+		return true
+	}
 	for i := 0; i < len(out); i++ {
 		for _, d := range supportedDecoders {
 			spent += len(out[i])
 			if spent > decodedFormsWork {
 				return out, false
 			}
-			f := d(out[i])
-			if f == out[i] || seen[f] {
-				continue
+			if f := d(out[i]); f != out[i] {
+				if !add(f) {
+					return out, false
+				}
 			}
-			if len(out) >= decodedFormsMax {
-				return out, false
+		}
+		// ⚠ AND THE CANDIDATE PRODUCERS, NOT ONLY THE REWRITING DECODERS. `undoBase64`
+		// leaves a token whose decode is not valid UTF-8 exactly as it found it -- so a
+		// minted field inside `/yJzdWJqZWN0X2ZhY3Rfa2V5Ijoic2ZrX3NlY3JldCI=` was in no
+		// form this walk produced, `noteMinted` recorded nothing, and `assertNoLeak`
+		// later built that very candidate and checked it only against SUPPLIED values
+		// (shardpilot/shardpilot-go#84 review). The guard's reconstruction includes the
+		// producers; a scan that omits them is narrower than the guard by exactly the
+		// encodings a decoder cannot rewrite in place.
+		spent += len(out[i])
+		if spent > decodedFormsWork {
+			return out, false
+		}
+		for _, prod := range []func(string) []string{
+			binaryCandidates, shortBase64Candidates, hexCandidates,
+			base64SuffixCandidates, wrappedBase64Candidates,
+		} {
+			for _, f := range prod(out[i]) {
+				if !add(f) {
+					return out, false
+				}
 			}
-			seen[f] = true
-			out = append(out, f)
 		}
 	}
 	return out, true
@@ -4385,9 +4447,26 @@ func main() {
 	// value means the SDK's exposure worker used the same transport while the
 	// capture was being taken (shardpilot/shardpilot-go#84 review). A counter
 	// nothing reads would be worse than no counter.
+	// ⚠ THE EXPECTED COUNT DEPENDS ON THE VERDICT, and saying otherwise made the
+	// SDK's own documented behaviour look like an anomalous capture. Applying an
+	// assignment ARMS an `experiment_exposure`, and the `Close` above flushes it
+	// through this same transport -- so on the served path at least one off-route
+	// request is not a surprise, it is the SDK working (shardpilot/shardpilot-go#84
+	// review). A claim that is false on the normal path teaches an operator to
+	// ignore the line.
+	offRouteExpected := "zero"
+	if result.Assigned {
+		offRouteExpected = "at least one, because applying an assignment arms an " +
+			"`experiment_exposure` that `Close` flushes through this same transport"
+	}
+	offRouteAgrees := "matches"
+	if (result.Assigned && offRoute < 1) || (!result.Assigned && offRoute != 0) {
+		offRouteAgrees = "does NOT match"
+	}
 	fmt.Fprintf(&report, "Requests seen on other routes and NOT recorded: **%d**. "+
-		"The ingest leg shares this transport; zero is the expected answer and the "+
-		"reason it is printed rather than assumed.\n\n", offRoute)
+		"The ingest leg shares this transport; for this verdict the expected answer is "+
+		"%s, and the count %s it. It is printed rather than assumed.\n\n",
+		offRoute, offRouteExpected, offRouteAgrees)
 	if len(exchanges) > 1 {
 		fmt.Fprintf(&report, "The SDK made **%d attempts**. All are below; the verdict is the "+
 			"last, because that is the one it acted on.\n\n", len(exchanges))
