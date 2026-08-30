@@ -1098,12 +1098,36 @@ func scrubStructuralName(line string) string {
 //
 // ⚠ APPLIED LAST, like the media type and the target delimiters: the passes before
 // it re-split the line, and a mark inserted earlier does not survive them.
+// emitField is the ONE exit every header line takes, so the finishing passes
+// cannot be forgotten on a branch that returns early.
+//
+// ⚠ NINE SITES OVER FOUR ROUNDS SAY THIS HAS TO BE STRUCTURAL. `markFieldColon`
+// was applied where the generic tail happened to run, and every specialised
+// branch above it -- the target, the network-path target, `Set-Cookie`, the
+// announced trailer list -- appended and `continue`d without it, so with a
+// supplied `:` those four published a header whose delimiter had become a prose
+// placeholder (shardpilot/shardpilot-go#85 review). A rule applied at the site
+// you were shown is applied at one site.
+func emitField(line string) string { return markFieldColon(line) }
+
 func markFieldColon(line string) string {
 	i := strings.IndexByte(line, ':')
 	if i <= 0 {
 		return line
 	}
-	if i+1 < len(line) && string(line[i+1]) == genMark {
+	// ⚠ THE QUESTION IS WHETHER THIS BYTE IS INSIDE A MARK, NOT WHAT FOLLOWS IT.
+	// The idempotence guard tested `line[i+1]`, so on a line whose field NAME is
+	// vouched -- `\x01Trailer\x01:` -- the byte after the colon opens the NEXT
+	// marked span and the guard read that as "already marked", leaving the
+	// delimiter captured on exactly the paths that admit their names
+	// (shardpilot/shardpilot-go#85 review). Adjacency is not containment; parity is.
+	inMark := false
+	for k := 0; k < i; k++ {
+		if string(line[k]) == genMark {
+			inMark = !inMark
+		}
+	}
+	if inMark {
 		return line
 	}
 	return line[:i] + marked(":") + line[i+1:]
@@ -1153,11 +1177,11 @@ func dropFraming(dump string) string {
 		// ⚠ THE PROTOCOL IS NOT THE QUESTION; whether it was RECEIVED is. See
 		// receivedConnection.
 		if strings.HasPrefix(low, "connection:") && !receivedConnection {
-			out = append(out, marked(strings.TrimSuffix(l, "\r"))+cr)
+			out = append(out, emitField(marked(strings.TrimSuffix(l, "\r"))+cr))
 			continue
 		}
 		if strings.HasPrefix(low, "content-length:") {
-			out = append(out, marked("X-Capture-Note: Content-Length removed — the body below is redacted")+cr)
+			out = append(out, emitField(marked("X-Capture-Note: Content-Length removed — the body below is redacted")+cr))
 			continue
 		}
 		// ⚠ A REDIRECT TARGET IS A CREDENTIAL SURFACE. `Location` query values are
@@ -1191,8 +1215,8 @@ func dropFraming(dump string) string {
 				// (shardpilot/shardpilot-go#84 review). Same rule as the cookie
 				// attributes and the query parameter names: vouching for a token and
 				// leaving it captured is not vouching.
-				out = append(out, l[:len("content-encoding:")]+
-					strings.Replace(l[len("content-encoding:"):], v, marked(v), 1))
+				out = append(out, emitField(l[:len("content-encoding:")]+
+					strings.Replace(l[len("content-encoding:"):], v, marked(v), 1)))
 				continue
 			}
 		}
@@ -1206,7 +1230,7 @@ func dropFraming(dump string) string {
 			// to the generic scrub and became `<redacted, 8 chars>` -- spaces and
 			// angle brackets inside a field name, an unparsable response. The
 			// trailer path already did this (shardpilot/shardpilot-go#85 review).
-			out = append(out, vouchTargetSyntax(vouchScheme(scrubStructuralName(redactTarget(strings.TrimSuffix(l, "\r")))))+cr)
+			out = append(out, emitField(vouchTargetSyntax(vouchScheme(scrubStructuralName(redactTarget(strings.TrimSuffix(l, "\r")))))+cr))
 			continue
 		}
 		// ⚠ AND A HEADER NAME CAN CARRY THE IDENTIFIER. `X-<key>: v` published it
@@ -1225,7 +1249,7 @@ func dropFraming(dump string) string {
 		// Redacted STRUCTURALLY, like the query string: the cookie's name and
 		// its attributes stay, the value becomes a length.
 		if strings.HasPrefix(low, "set-cookie:") {
-			out = append(out, scrubStructuralName(redactSetCookie(l)))
+			out = append(out, emitField(scrubStructuralName(redactSetCookie(l))))
 			continue
 		}
 		// ⚠ AFTER THE BRANCHES THAT HAVE A RENDERING, NOT BEFORE THEM. Placed where
@@ -1247,12 +1271,12 @@ func dropFraming(dump string) string {
 		if name, ok := fieldNameOf(low); ok {
 			if note, minted := serverMintedFields[name]; minted {
 				noteStructural(note)
-				out = append(out, canonicalFieldName(name)+": "+marked("<withheld>")+cr)
+				out = append(out, emitField(canonicalFieldName(name)+": "+marked("<withheld>")+cr))
 				continue
 			}
 		}
 		if strings.HasPrefix(low, "transfer-encoding:") {
-			out = append(out, marked("X-Capture-Note: Transfer-Encoding removed — the body below is decoded")+cr)
+			out = append(out, emitField(marked("X-Capture-Note: Transfer-Encoding removed — the body below is decoded")+cr))
 			continue
 		}
 		// ⚠ AND A HEADER NAME CAN CARRY THE IDENTIFIER, so this comes LAST: the
@@ -1294,7 +1318,12 @@ func dropFraming(dump string) string {
 				// registered name on this path is admitted and vouched. Seventh site
 				// of the same rule, and the sweep found it the moment it stopped
 				// drawing ONE arbitrary registered name and drew them all.
-				out = append(out, admitFieldName(l[:i])+":"+strings.Join(names, ",")+cr)
+				// ⚠ AND THE SEPARATOR THIS JOIN INSERTS. The announced names are admitted and
+				// vouched, and the comma BETWEEN them was left captured -- so a supplied
+				// `,` turned a legal `Trailer: Date, ETag` into a prose placeholder
+				// between two vouched names (shardpilot/shardpilot-go#85 review). A
+				// character this program writes as a separator is syntax like any other.
+				out = append(out, emitField(admitFieldName(l[:i])+":"+strings.Join(names, marked(","))+cr))
 				continue
 			}
 		}
@@ -1847,7 +1876,66 @@ func sanitizeCaptured(err error) string {
 		return asCaptured("")
 	}
 	noteStructuralInText(err.Error())
-	return asCaptured(scrubSupplied(sanitizeText(escapeMarks(err.Error()))))
+	// ⚠ AND THE QUOTED EXTENT IS ENDPOINT TEXT, WHOLESALE. The clause above says
+	// "everything else replaced by its length", and this path did not honour it:
+	// `sanitizeText` redacts queries and `scrubSupplied` redacts what THIS program
+	// supplied, while `noteStructuralInText` refuses only names it RECOGNISES. Go
+	// puts the offending line into the message verbatim -- `malformed HTTP
+	// response "server-secret-token"` -- so an endpoint-minted credential that is
+	// neither a query, nor supplied, nor a known name was published, the refusal
+	// ledger stayed empty, and the report went out
+	// (shardpilot/shardpilot-go#85 review). Recognition cannot be the criterion for
+	// a value nobody has seen before.
+	//
+	// The quoted span is exactly the extent Go marks as the endpoint's, so it is
+	// replaced by its length and ACCOUNTED for -- a capture, not a refusal, because
+	// the extent IS determinable here. Prose outside the quotes is Go's.
+	return asCaptured(scrubSupplied(sanitizeText(redactQuotedExtents(escapeMarks(err.Error())))))
+}
+
+// redactQuotedExtents replaces each double-quoted span with a placeholder for its
+// length. Go quotes the endpoint-controlled part of a transport diagnostic, and
+// that is the only part of the message this program did not write.
+func redactQuotedExtents(text string) string {
+	var b strings.Builder
+	for i := 0; i < len(text); {
+		if text[i] != '"' {
+			b.WriteByte(text[i])
+			i++
+			continue
+		}
+		j := i + 1
+		for j < len(text) {
+			if text[j] == '\\' && j+1 < len(text) {
+				j += 2
+				continue
+			}
+			if text[j] == '"' {
+				break
+			}
+			j++
+		}
+		if j >= len(text) {
+			// An unterminated quote has no determinable extent: the clause above says
+			// that case is a REFUSAL, not a capture.
+			noteStructural("a transport diagnostic whose quoted extent does not close")
+			b.WriteString(text[i:])
+			return b.String()
+		}
+		raw := text[i : j+1]
+		val := raw[1 : len(raw)-1]
+		if unq, err := strconv.Unquote(raw); err == nil {
+			val = unq
+		}
+		if strings.TrimSpace(val) == "" {
+			b.WriteString(raw)
+		} else {
+			noteAccounted("the endpoint-controlled extent of a transport diagnostic")
+			b.WriteString(`"` + placeholder(val) + `"`)
+		}
+		i = j + 1
+	}
+	return b.String()
 }
 
 // sanitize renders an error for STDERR. The marks are stripped: they exist so the

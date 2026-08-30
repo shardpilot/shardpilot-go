@@ -228,3 +228,62 @@ func TestNoAdmissionVouchesANonCanonicalSpelling(t *testing.T) {
 		})
 	}
 }
+
+// TestSuppliedPunctuationDoesNotAlterStructure is the sweep the PUNCTUATION half
+// of this class earned, and it is a PRODUCT rather than a list.
+//
+// ⚠ NINE SITES OVER FOUR ROUNDS, EACH FOUND BY A REVIEWER AND EACH FIXED ALONE.
+// The rule has been stated since the first: what this program emits as STRUCTURE
+// must be marked as structure, or the supplied-value scrub rewrites it into prose
+// the guard approves. Every previous sweep drew its rows from a list of probes I
+// wrote, so it could only ever find the sites I had thought of -- the `@` a
+// userinfo redaction reconstructs, the colon on `Set-Cookie`'s own early return,
+// the comma joining an announced trailer list were all missed the same way
+// (shardpilot/shardpilot-go#85 review).
+//
+// The population here is a PRODUCT: the grammar's punctuation, crossed with the
+// structural paths this program renders. The invariant needs no per-row
+// expectation and cannot be written too narrowly -- supplying a character must
+// not change the rendering AT ALL.
+func TestSuppliedPunctuationDoesNotAlterStructure(t *testing.T) {
+	paths := []struct{ what, line string }{
+		{"target", "HTTP/1.1 302 Found\r\nLocation: https://u@e.example/a/b?x=1&y=2#f\r\n\r\n"},
+		{"network-path target", "HTTP/1.1 302 Found\r\nLocation: //u@e.example/a/../b\r\n\r\n"},
+		{"cookie", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; Path=/; Secure; SameSite=Lax\r\n\r\n"},
+		{"trailer list", "HTTP/1.1 200 OK\r\nTrailer: Date, ETag\r\n\r\n"},
+		{"json body", "HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false,\"code\":1}"},
+		{"media type", "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n"},
+		{"status line", "HTTP/1.1 404 Not Found\r\n\r\n"},
+	}
+	// ⚠ AND TOKENS THAT SPAN A BOUNDARY, not only single characters. A supplied
+	// identifier need not BE the punctuation: `@e` straddles the userinfo
+	// separator this program RECONSTRUCTS, and a row of single characters cannot
+	// express that (shardpilot/shardpilot-go#85 review). The scrub matches on
+	// spellings, so the population is spellings that cross a mark boundary.
+	marks := []string{"{", "}", "[", "]", "\"", ",", ":", ";", "=", "&", "?", "#", "/", "@", ".", "..", "-", "//",
+		"@e", "://", "=x", "; ", ", ", "/a", "1&", "x=", ":s"}
+
+	render := func(line string, supplied []string) string {
+		structuralSurfaces, accountedSurfaces = nil, nil
+		receivedConnection = true
+		suppliedValues = supplied
+		defer func() {
+			suppliedValues = nil
+			structuralSurfaces, accountedSurfaces = nil, nil
+			receivedConnection = false
+		}()
+		return stripMarks(scrubSupplied(dropFraming(line)))
+	}
+
+	for _, p := range paths {
+		base := render(p.line, nil)
+		for _, m := range marks {
+			t.Run(p.what+"/"+m, func(t *testing.T) {
+				got := render(p.line, []string{m})
+				if got != base {
+					t.Fatalf("a supplied %q changed the structure this program emits:\n  without: %q\n  with:    %q", m, base, got)
+				}
+			})
+		}
+	}
+}

@@ -985,7 +985,14 @@ func redactUserinfo(line string) string {
 	}
 	// MEASURED DECODED, like every other component here: `us%C3%A9r:p` is six
 	// characters, not eleven (shardpilot/shardpilot-go#85 review).
-	return line[:i+skip] + tokenPlaceholder(queryDecoded(rest[:at])) + rest[at:]
+	// ⚠ AND THE SEPARATOR THIS RECONSTRUCTS IS SYNTAX. The userinfo becomes a
+	// placeholder and the `@` was handed on as captured text, so a supplied
+	// identifier SPANNING the boundary -- `@e` in `https://u@e.example/cb` -- was
+	// replaced across it and the authority stopped being an authority
+	// (shardpilot/shardpilot-go#85 review). A supplied value need not BE the
+	// punctuation to cross it, which is why the sweep behind this asks about
+	// spellings and not characters.
+	return line[:i+skip] + tokenPlaceholder(queryDecoded(rest[:at])) + syntax("@") + rest[at+1:]
 }
 
 // structuralRedact applies the rules a field NAME selects, for fields whose

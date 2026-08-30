@@ -1014,7 +1014,14 @@ func TestABodyReadErrorIsReadByTheGuard(t *testing.T) {
 	suppliedValues = []string{"abcdefgh"}
 	t.Cleanup(func() { suppliedValues = nil })
 	enc := base64.StdEncoding.EncodeToString([]byte("abcdefgh"))
-	tee := &teeBody{err: errors.New("malformed trailer \"X-Bad " + enc + "\"")}
+	// ⚠ THE PAYLOAD SITS OUTSIDE THE QUOTES ON PURPOSE. The quoted extent of a
+	// transport diagnostic is now replaced by its length before the guard sees it,
+	// so a value hidden THERE cannot reach the guard -- and cannot reach the
+	// artifact either. What this scene is for is the other half: the guard must go
+	// on decoding the endpoint text that is NOT quoted, which is the fallback for
+	// any diagnostic shape the redaction does not cover
+	// (shardpilot/shardpilot-go#85 review).
+	tee := &teeBody{err: errors.New("malformed trailer X-Bad " + enc)}
 	ex := exchange{head: []byte("x"), captured: tee}
 	if e := assertNoLeak(incompleteBodyLine(&ex)); e == nil {
 		t.Fatal("endpoint bytes carried by a body-read error were never decoded")
@@ -1026,7 +1033,14 @@ func TestTransportErrorTextIsReadByTheGuard(t *testing.T) {
 	t.Cleanup(func() { suppliedValues = nil })
 	// Go's parser puts the offending line into the error it returns.
 	enc := base64.StdEncoding.EncodeToString([]byte("abcdefgh"))
-	err := errors.New("malformed HTTP response \"X-Bad " + enc + "\"")
+	// ⚠ THE PAYLOAD SITS OUTSIDE THE QUOTES ON PURPOSE. The quoted extent of a
+	// transport diagnostic is now replaced by its length before the guard sees it,
+	// so a value hidden THERE cannot reach the guard -- and cannot reach the
+	// artifact either. What this scene is for is the other half: the guard must go
+	// on decoding the endpoint text that is NOT quoted, which is the fallback for
+	// any diagnostic shape the redaction does not cover
+	// (shardpilot/shardpilot-go#85 review).
+	err := errors.New("malformed HTTP response X-Bad " + enc)
 	if e := assertNoLeak(transportErrorLine(err)); e == nil {
 		t.Fatal("endpoint bytes carried by a transport error were never decoded")
 	}
@@ -1170,7 +1184,14 @@ func TestErrorTextCannotInjectProvenanceBytes(t *testing.T) {
 	t.Cleanup(func() { suppliedValues = nil })
 	enc := base64.StdEncoding.EncodeToString([]byte("abcdefgh"))
 	// The endpoint puts the guard's own reserved byte around its payload.
-	err := errors.New("malformed response \"" + genMark + enc + genMark + "\"")
+	// ⚠ THE PAYLOAD SITS OUTSIDE THE QUOTES ON PURPOSE. The quoted extent of a
+	// transport diagnostic is now replaced by its length before the guard sees it,
+	// so a value hidden THERE cannot reach the guard -- and cannot reach the
+	// artifact either. What this scene is for is the other half: the guard must go
+	// on decoding the endpoint text that is NOT quoted, which is the fallback for
+	// any diagnostic shape the redaction does not cover
+	// (shardpilot/shardpilot-go#85 review).
+	err := errors.New("malformed response " + genMark + enc + genMark)
 	if e := assertNoLeak(transportErrorLine(err)); e == nil {
 		t.Fatal("injected provenance bytes made the guard blank endpoint text")
 	}
@@ -2554,5 +2575,33 @@ func TestASchemaMemberNameIsGrammar(t *testing.T) {
 	got = stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"ASSIGNED\":true}")))
 	if strings.Contains(got, "ASSIGNED") {
 		t.Fatalf("a non-canonical spelling was vouched as grammar: %q", got)
+	}
+}
+
+// The endpoint-controlled extent of a diagnostic is what Go QUOTES, and the
+// clause says everything else is replaced by its length.
+func TestTheQuotedExtentOfADiagnosticIsRedacted(t *testing.T) {
+	structuralSurfaces, accountedSurfaces = nil, nil
+	t.Cleanup(func() { structuralSurfaces, accountedSurfaces = nil, nil })
+	got := stripMarks(sanitizeCaptured(errors.New(`malformed HTTP response "server-secret-token"`)))
+	if strings.Contains(got, "server-secret-token") {
+		t.Fatalf("an endpoint-minted credential survived a transport diagnostic: %q", got)
+	}
+	if !strings.Contains(got, "malformed HTTP response") {
+		t.Fatalf("the prose Go wrote was redacted too: %q", got)
+	}
+	if len(accountedSurfaces) == 0 {
+		t.Fatalf("the redaction was not accounted for: %q", got)
+	}
+}
+
+// An extent that does not close cannot be measured, and the clause says that
+// case is a refusal rather than a capture.
+func TestAnUnterminatedQuotedExtentIsRefused(t *testing.T) {
+	structuralSurfaces, accountedSurfaces = nil, nil
+	t.Cleanup(func() { structuralSurfaces, accountedSurfaces = nil, nil })
+	sanitizeCaptured(errors.New(`malformed HTTP response "server-secret-token`))
+	if len(structuralSurfaces) == 0 {
+		t.Fatal("a diagnostic whose quoted extent does not close was captured anyway")
 	}
 }
