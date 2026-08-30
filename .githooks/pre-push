@@ -235,6 +235,33 @@ scan_ref_name() {
   scan_commit "$1" "$1" "$3" "$4" "$5"
 }
 
+# read_evidence runs a git read whose OUTPUT BECOMES EVIDENCE and refuses if it
+# does not complete. There is no useful partial answer here: everything
+# downstream reads the file as the object.
+#
+# ⚠ FIVE SITES SWALLOWED THE FAILURE, and the review found three of them in one
+# round after the commit-object site was fixed in the previous one -- `|| true`,
+# `|| break`, `|| : > file`. Each converts an unreadable published object into
+# clean evidence, which is the dangerous direction: a short read scans clean and
+# every check above it honestly reports on what it was given
+# (shardpilot/shardpilot-go#79 review). Written once so a sixth site is a call
+# rather than a fourth instance of this finding.
+read_evidence() {
+  ev_dest="$1"
+  ev_mode="$2"
+  ev_what="$3"
+  shift 3
+  if [ "$ev_mode" = write ]; then
+    git "$@" > "$ev_dest" 2>/dev/null && return 0
+  else
+    git "$@" >> "$ev_dest" 2>/dev/null && return 0
+  fi
+  printf 'REFUSING: %s could not be read whole.\n' "$ev_what" >&2
+  printf '  Scanning what was written and calling it the object would report on a\n' >&2
+  printf '  prefix while git publishes the whole of it.\n' >&2
+  exit 2
+}
+
 # scan_commit <commit> <base> <published-ref-name> [tag-object-file]
 scan_commit() {
   wt="$tmpdir/wt"
@@ -379,13 +406,22 @@ scan_commit() {
   # shape as the scanner copy fixed one round earlier: a failure that produces a
   # readable artifact is the dangerous kind, because everything downstream reads
   # it as an answer.
-  if ! git cat-file commit "$1" > "$tmpdir/committed-object" 2>/dev/null; then
-    printf 'REFUSING: the commit object for %s could not be read whole.\n' "$1" >&2
-    printf '  Scanning what was written and calling it the object would report on\n' >&2
-    printf '  a prefix while git publishes the whole of it.\n' >&2
-    exit 2
-  fi
+  read_evidence "$tmpdir/committed-object" write "the commit object for $1" cat-file commit "$1"
   stage_evidence "$1" scripts/commit-object-as-committed.txt "$tmpdir/committed-object"
+
+  # ⚠ AND THE TREE'"'"'S PATH NAMES, INCLUDING EMPTY SUBTREES. The scan worktree'"'"'s
+  # index cannot carry an empty directory: `read-tree` writes no entry for one,
+  # staging the synthetic evidence files invalidates the cached tree, and the
+  # scanner'"'"'s `write-tree` rebuild silently drops it -- so a commit containing an
+  # explicitly constructed empty subtree whose DIRECTORY NAME carries prohibited
+  # material published that name with nothing in the index or the commit object
+  # exposing it (shardpilot/shardpilot-go#79 review). The commit object records
+  # only the root tree id, so it cannot answer this either.
+  #
+  # `-rt` shows trees when recursing, which is precisely the entry `-r` alone
+  # hides; the listing is staged like the rest so the same rules read it.
+  read_evidence "$tmpdir/committed-tree" write "the tree listing of $1" ls-tree -rt "$1"
+  stage_evidence "$1" scripts/commit-tree-as-committed.txt "$tmpdir/committed-tree"
 
   # ⚠ AND THE REF NAME IS PUBLISHED. A clean tree, a clean object, and a branch
   # called after an internal identifier still puts that identifier in the public
@@ -639,7 +675,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # clean case passed and so did one whose message carried material
   # (shardpilot/shardpilot-go#79 review).
   while [ "$(git cat-file -t "$walk" 2>/dev/null)" = tag ] && [ "$depth" -lt 32 ]; do
-    git cat-file tag "$walk" >> "$tmpdir/tag-object" 2>/dev/null || break
+    read_evidence "$tmpdir/tag-object" append "the annotated tag object $walk" cat-file tag "$walk"
     printf '\n' >> "$tmpdir/tag-object"
     tag_object="$tmpdir/tag-object"
     nxt="$(git cat-file tag "$walk" 2>/dev/null | awk '$1=="object"{print $2; exit}')"
@@ -647,7 +683,12 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     walk="$nxt"
     depth=$((depth + 1))
   done
-  if [ "$depth" -ge 32 ]; then
+  # ⚠ ASK WHETHER IT IS STILL A TAG, NOT WHETHER THE COUNTER REACHED THE BOUND. A
+  # valid chain of exactly 32 tags ends on a COMMIT with `depth` at 32, every tag
+  # already scanned -- and this refused it for being "deeper than 32"
+  # (shardpilot/shardpilot-go#79 review). The counter answers "how far did I
+  # walk"; the refusal needs "is there more I did not walk".
+  if [ "$(git cat-file -t "$walk" 2>/dev/null)" = tag ]; then
     printf 'REFUSING: tag chain deeper than 32 at %s; not scanning further.\n' "$local_sha" >&2
     exit 2
   fi
@@ -682,7 +723,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       deref_kind="$( git cat-file -t "$deref" 2>/dev/null || printf 'unknown' )"
       : > "$tmpdir/tag-target"
       if [ "$deref_kind" = blob ]; then
-        git cat-file blob "$deref" >> "$tmpdir/tag-target" 2>/dev/null || true
+        read_evidence "$tmpdir/tag-target" append "the tagged blob $deref" cat-file blob "$deref"
       elif [ "$deref_kind" = tree ]; then
         # ⚠ THE COMMENT PROMISED A REFUSAL AND THE CODE TRUNCATED. `head -256`
         # dropped everything past the bound in silence, so a 257-entry tree with
@@ -694,8 +735,12 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         # an ENTRY NAME, with clean blob contents, was never shown to the scanner
         # -- the object publishes the names, and the evidence held only the bytes
         # (same review). The listing itself is staged; the same rules read it.
-        git ls-tree -r "$deref" > "$tmpdir/tag-tree-listing" 2>/dev/null ||
-          : > "$tmpdir/tag-tree-listing"
+        # ⚠ `-rt`, NOT `-r`. Plain `-r` emits NOTHING for an empty subtree, so a
+        # tagged tree holding only a directory whose NAME carries prohibited
+        # material produced an empty listing and no evidence at all
+        # (shardpilot/shardpilot-go#79 review). `-t` is documented as "show trees
+        # when recursing", which is exactly the entry the recursion was hiding.
+        read_evidence "$tmpdir/tag-tree-listing" write "the tagged tree listing of $deref" ls-tree -rt "$deref"
         entries="$( wc -l < "$tmpdir/tag-tree-listing" | tr -d ' ' )"
         if [ "${entries:-0}" -gt 256 ]; then
           printf 'REFUSING: the tagged tree has %s entries, past this gate'"'"'s bound of 256.\n' "$entries" >&2
@@ -705,11 +750,17 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         fi
         cat "$tmpdir/tag-tree-listing" >> "$tmpdir/tag-target"
         printf '\n' >> "$tmpdir/tag-target"
-        awk '$2=="blob"{print $3}' "$tmpdir/tag-tree-listing" |
-          while read -r b; do
-            git cat-file blob "$b" >> "$tmpdir/tag-target" 2>/dev/null || true
-            printf '\n' >> "$tmpdir/tag-target"
-          done
+        # ⚠ NOT THROUGH A PIPE. `while read` on the right of `|` runs in a SUBSHELL,
+        # so the refusal below would have exited that subshell and let the push
+        # continue -- the same shape as the `||` context that disables `set -e`
+        # elsewhere in this file. The list goes to a file and the loop redirects
+        # from it, which keeps the refusal in the shell that can act on it.
+        awk '$2=="blob"{print $3}' "$tmpdir/tag-tree-listing" > "$tmpdir/tag-tree-blobs"
+        while read -r b; do
+          [ -n "$b" ] || continue
+          read_evidence "$tmpdir/tag-target" append "a blob reached through the tagged tree ($b)" cat-file blob "$b"
+          printf '\n' >> "$tmpdir/tag-target"
+        done < "$tmpdir/tag-tree-blobs"
       fi
       if [ -s "$tmpdir/tag-target" ]; then
         tag_target="$tmpdir/tag-target"
