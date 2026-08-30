@@ -313,24 +313,29 @@ No Makefile — standard Go tooling.
 ```
 h="$(cd "$(git rev-parse --git-common-dir)" && pwd -P)/hooks" &&
 mkdir -p "$h" &&
-test ! -e "$h/pre-push" && test ! -L "$h/pre-push" &&
-test ! -e "$h/check_public_surface.sh" && test ! -L "$h/check_public_surface.sh" &&
+for f in pre-push check_public_surface.sh .pre-push.new .check_public_surface.sh.new; do
+  test ! -e "$h/$f" && test ! -L "$h/$f" || { echo "$h/$f is occupied" >&2; exit 1; }
+done &&
 cp .githooks/pre-push "$h/.pre-push.new" &&
 cp scripts/check_public_surface.sh "$h/.check_public_surface.sh.new" &&
 chmod +x "$h/.pre-push.new" "$h/.check_public_surface.sh.new" &&
 mv "$h/.pre-push.new" "$h/pre-push" &&
 mv "$h/.check_public_surface.sh.new" "$h/check_public_surface.sh" &&
-ws="$(git worktree list --porcelain | awk '/^worktree /{print substr($0,10)}')" &&
-test -n "$ws" &&
-printf '%s\n' "$ws" | while read -r w; do
+git worktree list --porcelain -z > "$h/.worktrees" &&
+test -s "$h/.worktrees" &&
+while IFS= read -r -d "" rec; do
+  case "$rec" in worktree\ *) printf '%s\0' "${rec#worktree }" ;; esac
+done < "$h/.worktrees" > "$h/.wpaths" &&
+while IFS= read -r -d "" w; do
   git -C "$w" config --worktree --unset-all core.hooksPath 2>/dev/null || true
-done &&
+done < "$h/.wpaths" &&
 git config --local core.hooksPath "$h" &&
-printf '%s\n' "$ws" | while read -r w; do
+while IFS= read -r -d "" w; do
   got="$(cd "$(git -C "$w" rev-parse --path-format=absolute --git-path hooks)" && pwd -P)" || exit 1
   test "$got" = "$h" ||
     { echo "hooks still resolve elsewhere in $w: $got" >&2; exit 1; }
-done
+done < "$h/.wpaths" &&
+rm -f "$h/.worktrees" "$h/.wpaths"
 ```
 
 **Both files**, an ABSOLUTE path, published by RENAME, and `core.hooksPath` **pinned locally** rather than unset. Both destinations are tested with `-e` AND `-L`. A DANGLING symlink — a managed hook whose target is on an unavailable mount — fails `-e` while still occupying the path, so `-e` alone let the install replace it and disable the existing hook. The scanner's destination is guarded the same way, and for a second reason: with a DIRECTORY at that path `mv` succeeds by placing the file INSIDE it, the installation then reports success, and the hook it installed cannot execute the scanner — blocking every push, while rerunning this snippet is prevented by the now-occupied `pre-push` destination. Everything the hook executes must come from outside tracked content — the scanner as much as the hook. `--git-dir` names the per-worktree directory in a linked worktree while git reads hooks from the common one. And an unqualified `--unset` cannot clear a *global* or *system* `core.hooksPath`: with one inherited, git keeps resolving hooks from there and the gate is never invoked. A local setting overrides an inherited one — but NOT a worktree-scoped one.
@@ -349,7 +354,21 @@ worktree reports success while a push from the next one over runs no gate at all
 Both the clearing and the verification walk `git worktree list`, and the
 verification fails loudly with the path that disagreed.
 
-**The enumeration is captured and checked NON-EMPTY before either loop.** Without
+**The enumeration is NUL-delimited and captured before either loop.** A linked
+worktree pathname may contain a newline; line-oriented porcelain splits such a path
+across records, and if its prefix is itself another valid worktree BOTH loops
+operate on that other one while the newline-named worktree keeps its
+higher-precedence `core.hooksPath` — the install reports success and pushes there
+stay ungated. `-z` and `read -d ""` are why this snippet wants bash or zsh, which is
+what a developer pastes into; it is not POSIX `sh`.
+
+**Every destination is checked, including the TEMPORARY names.** With
+`$h/.pre-push.new` already a symlink, `cp` follows it and overwrites its target,
+`chmod` follows it again, and `mv` installs the SYMLINK as `pre-push` — a hook
+pointing back into a branch-controlled or externally managed location, executing
+different bytes later, while the installation reported success.
+
+**The enumeration is also checked NON-EMPTY before either loop.** Without
 `pipefail`, a failing `git worktree list` or a missing `awk` reports only the empty
 loop's success — so the install would clear nothing, verify nothing, and report that
 it worked, leaving a higher-precedence worktree value in place and every push from
