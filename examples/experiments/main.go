@@ -838,9 +838,16 @@ func markMediaType(line string) string {
 // scrubStructuralName applies the token-safe name scrub to a line the structural
 // redactors produced, so a supplied value equal to a field NAME cannot reach the
 // generic prose placeholder and make the field unparsable.
+// ⚠ IT ADMITS THROUGH THE REGISTRY, LIKE EVERY OTHER NAME POSITION. `scrubHeaderName`
+// knows only values the HARNESS supplied, so with a legal experiment key of
+// `Location` an ordinary redirect was published as `redacted-8-chars: /…`: the
+// capture lost which standard field arrived, and the generated token passed the
+// guard (shardpilot/shardpilot-go#85 review). The trailer path already used
+// `admitFieldName`; the three structural paths here did not, which is the same
+// shape as every other "one site was shown and the others were not" in this file.
 func scrubStructuralName(line string) string {
 	if i := strings.IndexByte(line, ':'); i > 0 {
-		return scrubHeaderName(line[:i]) + line[i:]
+		return admitFieldName(line[:i]) + line[i:]
 	}
 	return line
 }
@@ -942,7 +949,7 @@ func dropFraming(dump string) string {
 			// to the generic scrub and became `<redacted, 8 chars>` -- spaces and
 			// angle brackets inside a field name, an unparsable response. The
 			// trailer path already did this (shardpilot/shardpilot-go#85 review).
-			out = append(out, scrubStructuralName(redactTarget(strings.TrimSuffix(l, "\r")))+cr)
+			out = append(out, vouchScheme(scrubStructuralName(redactTarget(strings.TrimSuffix(l, "\r"))))+cr)
 			continue
 		}
 		// ⚠ AND A HEADER NAME CAN CARRY THE IDENTIFIER. `X-<key>: v` published it

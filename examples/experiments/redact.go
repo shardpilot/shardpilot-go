@@ -334,11 +334,26 @@ func isZoneID(z string) bool {
 	if z == "" {
 		return false
 	}
+	// ⚠ `pct-encoded` IS PART OF THE GRAMMAR. RFC 6874 gives the zone-id as
+	// `1*( unreserved / pct-encoded )`, and the first version of this accepted only
+	// unreserved, so a percent escape was called malformed and the whole target
+	// withheld. The measurement sweep found that, not a reviewer.
+	//
+	// Measured while fixing it: `url.Parse` refuses some escapes inside a bracketed
+	// host on its own — `%C3` comes back as "invalid URL escape" — so this branch
+	// is reached for fewer spellings than the grammar admits. It states the
+	// grammar anyway, for the same reason the rest of this file stopped borrowing
+	// predicates from whatever net/url happens to accept today.
 	for i := 0; i < len(z); i++ {
 		c := z[i]
 		switch {
 		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
 		case c == '-' || c == '.' || c == '_' || c == '~':
+		case c == '%':
+			if i+2 >= len(z) || !isHexDigit(z[i+1]) || !isHexDigit(z[i+2]) {
+				return false
+			}
+			i += 2
 		default:
 			return false
 		}
@@ -382,6 +397,31 @@ func isIPvFutureByte(c byte) bool {
 		return true
 	}
 	return strings.IndexByte("-._~!$&'()*+,;=:", c) >= 0
+}
+
+// vouchScheme marks an approved URI scheme in a finished target line.
+//
+// ⚠ APPLIED LAST, NOT MID-COMPUTATION. The scheme is approved BECAUSE this program
+// recognises it, so leaving it captured let a supplied `https` turn an ordinary
+// redirect into `<redacted, 5 chars>://…` — no longer a URI, and approved by the
+// guard (shardpilot/shardpilot-go#85 review). Marking it inside `redactTarget`
+// shifted every offset that function computes afterwards and broke six scenes at
+// once; the same rule the media type and the member names each taught, arriving a
+// third time: classification runs on a document, marking runs on the result.
+func vouchScheme(line string) string {
+	i := strings.Index(line, "://")
+	if i < 0 {
+		if i = strings.IndexByte(line, ':'); i < 0 {
+			return line
+		}
+	}
+	j := strings.LastIndexAny(line[:i], " 	")
+	sch := line[j+1 : i]
+	switch strings.ToLower(stripMarks(sch)) {
+	case "http", "https":
+		return line[:j+1] + vouched(sch) + line[i:]
+	}
+	return line
 }
 
 func redactTarget(line string) string {
@@ -476,7 +516,8 @@ func redactPath(line string) string {
 			// a component that is not present in this shape, and an exemption cannot
 			// be inherited by whatever stands where its subject would have been.
 			if rest := url[c+1:]; rest != "" && !strings.ContainsAny(rest, "/") {
-				return head + gap + url[:c+1] + tokenPlaceholder(rest) + tail
+				// MEASURED DECODED, like every other component here.
+				return head + gap + url[:c+1] + tokenPlaceholder(queryDecoded(rest)) + tail
 			}
 			start = c + 1
 		default:
@@ -565,7 +606,12 @@ func redactSetCookie(line string) string {
 	// the same rule -- there is nothing on the name side of a Set-Cookie whose
 	// provenance the harness can attest to.
 	if !nameIsOurs(name) {
-		name = tokenPlaceholder(name)
+		// MEASURED AS RECEIVED. `responseText` expands a marker-like spelling on the
+		// way in, so a cookie name containing the literal `\x00` was reported three
+		// characters longer than it arrived. The cookie's VALUE and its attribute
+		// values already undid the escape; the name did not
+		// (shardpilot/shardpilot-go#85 review).
+		name = tokenPlaceholder(unescapeMarks(name))
 	} else {
 		// ⚠ VOUCHED FOR IS NOT THE SAME AS CAPTURED. When a supplied identifier
 		// equals a request parameter name -- the experiment key spelled
@@ -651,7 +697,9 @@ func redactSetCookie(line string) string {
 				an = markAttrName(an)
 			}
 			if verbatim {
-				parts[i] = an + "=" + av
+				// The VALUE is vouched for by the same criterion that admitted it; see
+				// redactUnlessVerbatim for why admitting without marking is not admitting.
+				parts[i] = an + "=" + strings.Replace(av, ows(av), vouched(ows(av)), 1)
 				continue
 			}
 			// ⚠ MEASURED AS RECEIVED, NOT AS ESCAPED. `responseText` expands a
@@ -1417,7 +1465,13 @@ func redactUnlessVerbatim(line string) string {
 	}
 	check, known := verbatimHeaders[strings.ToLower(ows(name))]
 	if known && check(ows(value)) {
-		return line
+		// ⚠ ADMITTED IS VOUCHED FOR. Returning the line unmarked left the value to
+		// `scrubSupplied`, so an experiment key equal to an admitted value --
+		// `application/json`, or a `Content-Length` of `12` -- came back as a prose
+		// placeholder in a field whose grammar does not allow one, approved because
+		// the placeholder is generated (shardpilot/shardpilot-go#85 review). The
+		// criterion says WHY it prints; marking says who vouches for it.
+		return name + ":" + strings.Replace(value, ows(value), vouched(ows(value)), 1) + cr
 	}
 	// ⚠ MEASURED BEFORE OUR OWN ESCAPE. `escapeMarks` lengthens a backslash run
 	// on the way in, so a header carrying the literal `\x00` was reported four

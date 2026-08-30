@@ -47,6 +47,27 @@ func TestEveryVouchedTokenSurvivesTheScrub(t *testing.T) {
 	}
 	probes = append(probes, probe{"HTTP/1 reason phrase", "HTTP/1.1 200 OK\r\n\r\n", "OK"})
 
+	// ⚠ AND THE PREDICATES THAT ADMIT VALUES, not only the registries of NAMES.
+	// The first version of this sweep drew from name registries alone, so four more
+	// sites of the same rule reached the review: a header value `verbatimHeaders`
+	// admits, a cookie attribute value `cookieAttrVerbatim` admits, an approved URI
+	// scheme, and the field names the structural paths dispatch on. The population
+	// is "everything this program admits BECAUSE it recognises it", and half of that
+	// is values (shardpilot/shardpilot-go#85 review).
+	probes = append(probes,
+		probe{"admitted header value", "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n", "application/json"},
+		// ⚠ NOT `Content-Length`: `dropFraming` REMOVES that field and puts a capture
+		// note in its place, so the probe never reached the criterion it was aiming
+		// at — it measured a header that does not survive to be measured. `Age` is
+		// admitted by the same numeric predicate and does survive.
+		probe{"admitted header value", "HTTP/1.1 200 OK\r\nAge: 12\r\n\r\n", "12"},
+		probe{"admitted cookie attribute value", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; SameSite=Lax\r\n\r\n", "Lax"},
+		probe{"admitted cookie attribute value", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; Max-Age=10\r\n\r\n", "10"},
+		probe{"approved URI scheme", "HTTP/1.1 200 OK\r\nLocation: https://e.example/cb\r\n\r\n", "https"},
+		probe{"structural field name", "HTTP/1.1 200 OK\r\nLocation: /cb\r\n\r\n", "Location"},
+		probe{"structural field name", "HTTP/1.1 200 OK\r\nSet-Cookie: sid=x\r\n\r\n", "Set-Cookie"},
+	)
+
 	for _, p := range probes {
 		t.Run(p.what+"/"+p.tok, func(t *testing.T) {
 			structuralSurfaces = nil
