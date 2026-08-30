@@ -1051,8 +1051,9 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 	// that name was marked harness-generated, which both the scrub and the guard
 	// then skipped: the supplied identifier published
 	// (shardpilot/shardpilot-go#85 review). The `Host:` LINE is vouched for by
-	// `requestOwnedHeaders`, which is the mechanism written for it; removing this
-	// registration fails no test, measured.
+	// `requestOwnedHeaders`, which is the mechanism written for it. The suite was
+	// run with this line removed before removing it, and stayed green: the
+	// registration was measured to be unnecessary rather than judged so.
 	if dump, err := httputil.DumpRequestOut(req, true); err == nil {
 		// ⚠ THE AUTHORITY IS OURS AND IS NOT IN `req.Header`. Go stores it in
 		// `Request.Host`/`URL.Host`, so a derivation asking only the header map

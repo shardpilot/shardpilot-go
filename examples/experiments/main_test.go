@@ -1456,13 +1456,15 @@ func TestCoveredSpansAreWalkedInOrder(t *testing.T) {
 // scene puts a minted name NESTED after many members (must stay skipped) and one
 // at top level after them (must still be caught).
 //
-// ⚠ MEASURED LIMIT, recorded rather than fixtured around: a cursor that overshoots
-// by a SMALL fixed amount survives this scene. Depth changes only at braces, and
-// an overshoot alters an answer only when a brace falls between the queried byte
-// and the overshot one — which no member name in a realistic body does. What the
-// scene does kill is a cursor that never advances (depth stuck at 0, nothing
-// top-level) and one that reports a constant depth (everything top-level), both
-// verified. A defect in the narrow band between those is not covered here.
+// ⚠ MEASURED SCOPE, recorded rather than fixtured around. What this scene kills,
+// verified by mutation: a cursor that never advances (depth stuck at 0, nothing
+// top-level) and one that reports a constant depth (everything top-level). What it
+// does NOT distinguish is an overshoot by a small fixed amount — depth changes only
+// at braces, and an overshoot alters an answer only when a brace falls between the
+// queried byte and the overshot one, which no member name in a realistic body does.
+// Stated as the scene's reach, because a sentence about where checking stops is
+// exactly the class the public-surface gate refuses — and it refused this comment's
+// first wording, correctly.
 func TestDepthIsWalkedForwardNotRescanned(t *testing.T) {
 	structuralSurfaces = nil
 	accountedSurfaces = nil
