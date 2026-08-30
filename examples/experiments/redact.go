@@ -42,6 +42,7 @@ import (
 	"net/textproto"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -1368,15 +1369,50 @@ func redactUnaccountedJSONValues(body string, exempt map[string]bool) string {
 	}
 	var spans []span
 	var depth []int8 // 0 = array, 1 = object expecting KEY, 2 = object expecting VALUE
-	// Whether the SDK's assigned branch would return before reading `reason`,
-	// decided by the SDK's own decoder over the mark-free view.
-	assignedTrue := false
+	// ⚠ WHETHER THE SDK READS `reason` AT ALL, WHICH IS A FACT ABOUT THE WHOLE BODY.
+	//
+	// `parseExperimentVerdict` rejects the body outright when `assigned` is ABSENT,
+	// returns from the assigned branch before touching `reason` when it is TRUE, and
+	// rejects again when a PRESENT echoed member is not a string or does not equal
+	// the request's own value. Only after all of that is `reason` this SDK's
+	// classification (shardpilot/shardpilot-go#85 review).
+	//
+	// The first version of this asked only "is assigned true", so an absent
+	// `assigned` -- a body the SDK refuses entirely -- still vouched, and
+	// `{"reason":"kill_switch"}` published a supplied identifier with an empty
+	// ledger.
+	//
+	// ⚠ AND THE ECHO IS CHECKED AS FAR AS IT CAN BE. `expEchoMatches` tolerates an
+	// ABSENT member and requires a PRESENT one to be a string equal to the request's
+	// own value; equality needs the app, environment and experiment keys BY NAME,
+	// and `suppliedValues` is a flat list that does not say which value is which.
+	//
+	// What is sound without the mapping: a correctly echoed member is a value this
+	// harness supplied, so it is IN that list. An endpoint echoing something else
+	// fails the test and the vouch stops -- which is the direction that matters,
+	// since the SDK would reject that body and the value would not be its
+	// classification at all. The residual is a CROSS-SLOT echo: an endpoint that
+	// returns the app key in the experiment-key member passes this and is rejected
+	// by the SDK. Closing it means threading the three values through by name, which
+	// is the harness's configuration plumbing rather than this pass.
+	reasonIsSDKs := false
 	{
 		var shape struct {
-			Assigned *bool `json:"assigned"`
+			Assigned *bool   `json:"assigned"`
+			AppKey   *string `json:"app_key"`
+			EnvKey   *string `json:"environment_key"`
+			ExpKey   *string `json:"experiment_key"`
 		}
-		if json.Unmarshal([]byte(view), &shape) == nil && shape.Assigned != nil {
-			assignedTrue = *shape.Assigned
+		echoed := func(v *string) bool {
+			if v == nil {
+				return true
+			}
+			return slices.Contains(suppliedValues, *v)
+		}
+		if json.Unmarshal([]byte(view), &shape) == nil &&
+			shape.Assigned != nil && !*shape.Assigned &&
+			echoed(shape.AppKey) && echoed(shape.EnvKey) && echoed(shape.ExpKey) {
+			reasonIsSDKs = true
 		}
 	}
 	verdictField := ""
@@ -1531,7 +1567,7 @@ func redactUnaccountedJSONValues(body string, exempt map[string]bool) string {
 		// The allowlist is the narrower one too: the not-assigned branch takes
 		// `{absent, kill_switch, targeting_unmatched}` and refuses the body for
 		// anything else, so the wider taxonomy would vouch a value the SDK rejects.
-		if sdkReasonValues[str] && sdkVerdictFields[verdictKey(verdictField)] && !assignedTrue {
+		if sdkReasonValues[str] && sdkVerdictFields[verdictKey(verdictField)] && reasonIsSDKs {
 			// ⚠ THE SPAN INCLUDES THE QUOTES, SO THE REPLACEMENT MUST TOO. Emitting
 			// only `marked(str)` produced `{"code":kill_switch}` after the marks are
 			// stripped -- invalid JSON, which the body rule then refused, so EVERY
@@ -2446,6 +2482,42 @@ func redactUnlessVerbatim(line string) string {
 		// identifier, exactly as with the redirect authority.
 		if raw := ows(value); raw == canonicalAdmitted(name, raw) && scrubSuppliedRaw(raw) == raw {
 			return name + ":" + strings.Replace(value, raw, vouched(raw), 1) + cr
+		}
+		// ⚠ DECLINING TO VOUCH IS NOT DECLINING TO KEEP THE GRAMMAR. A valid
+		// NON-CANONICAL spelling that also collides fell through to the prose scrub:
+		// with a supplied `JSON`, `Content-Type: application/JSON` became
+		// `application/<redacted, 4 chars>`, which `mime.ParseMediaType` rejects
+		// even though what arrived was a valid media type -- an empty ledger and a
+		// capture the guard approves (shardpilot/shardpilot-go#85 review).
+		//
+		// Third site of this shape on this branch: the redirect scheme, the cookie
+		// attribute name, and now an admitted header value. Each time the vouch was
+		// correctly narrowed to the canonical spelling and the non-canonical one was
+		// left to a scrub that does not know the field's grammar. The token-safe
+		// spelling is the same answer all three times.
+		// ⚠ AND ONLY FOR THE NON-CANONICAL SPELLING. A REGISTERED media type is
+		// grammar whoever else also chose that string, and a later pass vouches it --
+		// `TestARecognisedMediaTypeIsGrammar` asserts `application/json` survives a
+		// supplied `json`. My first version of this branch fired on any collision and
+		// took that with it.
+		if raw := ows(value); raw != "" && raw != canonicalAdmitted(name, raw) &&
+			scrubSuppliedRaw(raw) != raw {
+			noteAccounted(formField, "an admitted header value colliding with a supplied value")
+			// ⚠ THE COLLIDING TOKEN, NOT THE WHOLE VALUE. Replacing the value outright
+			// keeps it parseable and throws away the type: an operator reading
+			// `redacted-16-chars` cannot tell a media type from a cache directive.
+			// Each token is replaced where it stands, so `application/JSON` becomes
+			// `application/redacted-4-chars` -- still a media type, and the part the
+			// endpoint did not choose survives.
+			out := raw
+			for _, v := range suppliedValues {
+				out = replaceTokenWith(out, v, tokenPlaceholder(v), isWordByte)
+			}
+			if out == raw {
+				// A long value the token rule does not reach: the whole thing goes.
+				out = tokenPlaceholder(raw)
+			}
+			return name + ":" + strings.Replace(value, raw, out, 1) + cr
 		}
 		return line
 	}

@@ -12,6 +12,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/http/httptrace"
@@ -2696,7 +2697,7 @@ func TestAnUnaccountedValueInAParsedBodyIsRedacted(t *testing.T) {
 	// the not-assigned branch takes only `{absent, kill_switch,
 	// targeting_unmatched}` (shardpilot/shardpilot-go#85 review). This scene used
 	// `not_found`, which the SDK writes as a Code and refuses at this member.
-	if v := stripMarks(dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"reason\":\"targeting_unmatched\"}")); !strings.Contains(v, "targeting_unmatched") {
+	if v := stripMarks(dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false,\"reason\":\"targeting_unmatched\"}")); !strings.Contains(v, "targeting_unmatched") {
 		t.Fatalf("the SDK's own taxonomy was lengthened: %q", v)
 	}
 }
@@ -2927,7 +2928,7 @@ func TestTaxonomyIsVouchedOnlyInAVerdictField(t *testing.T) {
 	// AND IN ITS OWN FIELD IT STILL IS: the verdict block reads that value.
 	suppliedValues = nil
 	if v := stripMarks(dropFraming(
-		"HTTP/1.1 200 OK\r\n\r\n{\"reason\":\"kill_switch\"}")); !strings.Contains(v, "kill_switch") {
+		"HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false,\"reason\":\"kill_switch\"}")); !strings.Contains(v, "kill_switch") {
 		t.Fatalf("the SDK's own classification was lengthened in its own field: %q", v)
 	}
 }
@@ -3056,7 +3057,7 @@ func TestTaxonomyIsNotVouchedInsideAContainer(t *testing.T) {
 	suppliedValues = []string{"kill_switch"}
 	t.Cleanup(func() { suppliedValues = nil })
 	got := stripMarks(scrubSupplied(dropFraming(
-		"HTTP/1.1 200 OK\r\n\r\n{\"reason\":[\"kill_switch\"]}")))
+		"HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false,\"reason\":[\"kill_switch\"]}")))
 	if strings.Contains(got, "kill_switch") {
 		t.Fatalf("an array element in verdict position was vouched as SDK taxonomy: %q", got)
 	}
@@ -3169,7 +3170,7 @@ func formConstName(c captureForm) string {
 func TestAVouchedTaxonomyValueKeepsItsQuotes(t *testing.T) {
 	structuralSurfaces, accountedSurfaces = nil, nil
 	t.Cleanup(func() { structuralSurfaces, accountedSurfaces = nil, nil })
-	got := stripMarks(dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"reason\":\"kill_switch\"}"))
+	got := stripMarks(dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false,\"reason\":\"kill_switch\"}"))
 	if !strings.Contains(got, `"kill_switch"`) {
 		t.Fatalf("the quotes around a vouched verdict value were dropped: %q", got)
 	}
@@ -3351,12 +3352,19 @@ func TestOnlyTheEffectiveVerdictOccurrenceIsVouched(t *testing.T) {
 	other := "not_found"
 	for field := range sdkVerdictFields {
 		for _, order := range [][2]string{{supplied, other}, {other, supplied}} {
-			body := `{"` + field + `":"` + order[0] + `","` + field + `":"` + order[1] + `"}`
-			var decoded map[string]string
+			// ⚠ A COMPLETE NOT-ASSIGNED SHAPE. The SDK rejects a body with no `assigned`
+			// member before it reads `reason` at all, so a duplicate-member scene built
+			// without it exercises a body whose `reason` is never the SDK's
+			// (shardpilot/shardpilot-go#85 review).
+			body := `{"assigned":false,"` + field + `":"` + order[0] + `","` + field + `":"` + order[1] + `"}`
+			// The oracle decodes only the member under test; `assigned` is a bool and
+			// a `map[string]string` cannot hold it.
+			var decoded map[string]json.RawMessage
 			if err := json.Unmarshal([]byte(body), &decoded); err != nil {
 				t.Fatalf("the oracle could not read %q: %v", body, err)
 			}
-			effective := decoded[field]
+			var effective string
+			_ = json.Unmarshal(decoded[field], &effective)
 			suppliedValues = []string{supplied}
 			structuralSurfaces, accountedSurfaces = nil, nil
 			got := scrubSupplied(redactUnaccountedBody(markBareJSONLiterals(
@@ -4058,7 +4066,7 @@ func TestVerdictOccurrencesAreCountedAsTheDecoderGroupsThem(t *testing.T) {
 	for _, a := range variants {
 		for _, b := range variants {
 			for _, order := range [][2]string{{supplied, other}, {other, supplied}} {
-				body := `{"` + a + `":"` + order[0] + `","` + b + `":"` + order[1] + `"}`
+				body := `{"assigned":false,"` + a + `":"` + order[0] + `","` + b + `":"` + order[1] + `"}`
 				var decoded struct{ Reason string }
 				if err := json.Unmarshal([]byte(body), &decoded); err != nil {
 					t.Fatalf("the oracle could not read %q: %v", body, err)
@@ -4617,13 +4625,27 @@ func TestReasonIsVouchedOnlyWhereTheSDKReadsIt(t *testing.T) {
 	}{
 		{`{"assigned":true,"assignment_key":"a","variant_key":"v","version":1,"reason":"kill_switch"}`, false},
 		{`{"assigned":false,"reason":"kill_switch"}`, true},
-		{`{"reason":"kill_switch"}`, true},
+		// ⚠ NO `assigned` MEMBER: the SDK rejects the body at `wire.Assigned == nil`
+		// before it reads `reason` at all, so the value is never its classification
+		// (shardpilot/shardpilot-go#85 review). This row asserted the opposite while
+		// the condition was only "is assigned true".
+		{`{"reason":"kill_switch"}`, false},
 		{`{"assigned":false,"reason":"targeting_unmatched"}`, true},
 		{`{"assigned":false,"reason":"not_found"}`, false},
+		// ⚠ AND THE ECHO. `expEchoMatches` requires a PRESENT echoed member to equal
+		// the request's own value, which this pass can only check as "is it a value
+		// this harness supplied" -- so an echo carrying something else stops the
+		// vouch, because the SDK would reject that body and the value would not be
+		// its classification (shardpilot/shardpilot-go#85 review).
+		{`{"assigned":false,"reason":"kill_switch","app_key":"ak"}`, false},
+		{`{"assigned":false,"reason":"kill_switch","experiment_key":"ek"}`, false},
+
 		{`{"assigned":false,"reason":"http_503"}`, false},
 	} {
 		want := "kill_switch"
-		if strings.Contains(c.body, "targeting_unmatched") {
+		if strings.Contains(c.body, `"app_key"`) || strings.Contains(c.body, `"experiment_key"`) {
+			want = "kill_switch"
+		} else if strings.Contains(c.body, "targeting_unmatched") {
 			want = "targeting_unmatched"
 		} else if strings.Contains(c.body, "not_found") {
 			want = "not_found"
@@ -4858,5 +4880,47 @@ func TestTheInterimSectionIsLabelledCanonical(t *testing.T) {
 	}
 	if !strings.Contains(got, "http.StatusText") {
 		t.Errorf("the section does not say where its status line came from: %q", got)
+	}
+}
+
+// An admitted value that collides keeps its field's grammar.
+//
+// ⚠ THIRD SITE OF ONE SHAPE ON THIS BRANCH. The redirect scheme, the cookie
+// attribute name, and now an admitted header value: each time the vouch was
+// correctly narrowed to the canonical spelling, and each time the non-canonical
+// one was left to a prose scrub that does not know the field's grammar. With a
+// supplied `JSON`, `Content-Type: application/JSON` became
+// `application/<redacted, 4 chars>` — which `mime.ParseMediaType` rejects even
+// though what arrived was a valid media type, with an empty ledger
+// (shardpilot/shardpilot-go#85 review).
+//
+// The assertion is on the GRAMMAR of what came out, over the product of the
+// spellings with a colliding and a non-colliding supplied value.
+func TestAnAdmittedValueKeepsItsGrammarWhenItCollides(t *testing.T) {
+	for _, arrived := range []string{"application/JSON", "application/json", "text/PLAIN"} {
+		for _, sup := range []string{"JSON", "json", "PLAIN", "unrelated"} {
+			suppliedValues = []string{sup}
+			structuralSurfaces, accountedSurfaces = nil, nil
+			got := stripMarks(scrubSupplied(dropFraming(
+				"HTTP/1.1 200 OK\r\nContent-Type: " + arrived + "\r\n\r\n{}")))
+			v := ""
+			for _, ln := range strings.Split(got, "\r\n") {
+				if x, ok := strings.CutPrefix(ln, "Content-Type: "); ok {
+					v = x
+				}
+			}
+			if v == "" {
+				continue
+			}
+			if _, _, err := mime.ParseMediaType(v); err != nil {
+				t.Errorf("%q with %q supplied published %q, which is not a media type: %v",
+					arrived, sup, v, err)
+			}
+			if strings.Contains(v, "/") == false {
+				t.Errorf("%q with %q supplied published %q, which lost its type", arrived, sup, v)
+			}
+			suppliedValues = nil
+			structuralSurfaces, accountedSurfaces = nil, nil
+		}
 	}
 }
