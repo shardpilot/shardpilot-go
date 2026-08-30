@@ -160,7 +160,14 @@ absolutize_one() {
   esac
 }
 if [ -n "${GIT_OBJECT_DIRECTORY:-}" ]; then
-  GIT_OBJECT_DIRECTORY="$(absolutize_one "$GIT_OBJECT_DIRECTORY")"
+  # ⚠ THE SAME SENTINEL AS THE LIST BELOW. The round before put it on the
+  # alternates call site and not on this one -- fixed where I was shown -- so an
+  # object directory whose name ends in a newline was silently trimmed here and
+  # the hook pointed git at a directory that does not exist
+  # (shardpilot/shardpilot-go#86 review). The sibling of a site you just repaired
+  # is the first place to look, and it is cheaper to look than to be told.
+  GIT_OBJECT_DIRECTORY="$(absolutize_one "$GIT_OBJECT_DIRECTORY"; printf X)"
+  GIT_OBJECT_DIRECTORY="${GIT_OBJECT_DIRECTORY%X}"
   export GIT_OBJECT_DIRECTORY
 fi
 # ⚠ AND `GIT_ALTERNATE_OBJECT_DIRECTORIES` IS A LIST. It is colon-separated, so
