@@ -357,7 +357,8 @@ mv "$h/.pre-push.new" "$h/pre-push" &&
 mv "$h/.check_public_surface.sh.new" "$h/check_public_surface.sh" &&
 git config --local core.hooksPath "$h" &&
 while IFS= read -r -d "" w; do
-  git -C "$w" config --worktree --unset-all core.hooksPath 2>/dev/null || true
+  test "$(git -C "$w" config --bool extensions.worktreeConfig 2>/dev/null || echo false)" = true &&
+    { git -C "$w" config --worktree --unset-all core.hooksPath 2>/dev/null || true; } || true
 done < "$wp" &&
 while IFS= read -r -d "" w; do
   gp="$(git -C "$w" rev-parse --path-format=absolute --git-path hooks && printf X)" || exit 1

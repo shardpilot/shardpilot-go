@@ -473,6 +473,39 @@ if [ -n "$wt_common" ]; then
     [ -n "$wt_line" ] && other_roots+=("$wt_line")
   done
 fi
+# ⚠ REFUSED HERE, BEFORE THE FIRST EXTERNAL COMMAND. The same refusal used to sit
+# after the enumeration -- which is after `mktemp` and several bare `git` calls have
+# already resolved through PATH, so a tracked `<main>/bin/mktemp` executed and only
+# then was the push refused: the branch got its code run and the refusal was a
+# consolation (shardpilot/shardpilot-go#79 review). A guard against execution has to
+# precede execution; everything it needs is above and all of it is builtin.
+if [ -n "$wt_common" ]; then
+  wt_common_is_dotgit=no
+  case "$wt_common" in */.git) wt_common_is_dotgit=yes ;; esac
+  if [ "$wt_common_is_dotgit" = no ]; then
+    # A separate git directory. Its checkout is discoverable only from the CHECKOUT
+    # side, so unless this one owns it, there is a checkout on this machine whose
+    # root cannot be named -- and a PATH entry inside it cannot be ruled out.
+    wt_owns=no
+    if [ -d "$checkout_root/.git" ]; then
+      [ "$checkout_root/.git" = "$wt_common" ] && wt_owns=yes
+    elif [ -f "$checkout_root/.git" ]; then
+      wt_own_line=""
+      IFS= read -r -d "" wt_own_line < "$checkout_root/.git" || true
+      wt_own_line="${wt_own_line%$NL}"
+      [ "$wt_own_line" = "gitdir: $wt_common" ] && wt_owns=yes
+    fi
+    if [ "$wt_owns" = no ]; then
+      printf 'REFUSING: %s is a git directory whose checkout this gate cannot name.\n' "$wt_common" >&2
+      printf '  A separate git directory records no path back to its worktree, so a\n' >&2
+      printf '  PATH entry inside that checkout cannot be ruled out -- and this is\n' >&2
+      printf '  decided before any command is run, so nothing from it has executed.\n' >&2
+      printf '  Push from the main checkout, or keep the git directory inside it.\n' >&2
+      exit 2
+    fi
+  fi
+fi
+
 inside_a_checkout() {
   # $1 is a physically-resolved directory. True when it lies in the invoking
   # checkout or in any other checkout this pass could name.
@@ -2221,7 +2254,33 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       # own, which is exactly what a repository with no history has; it is written
       # to the private evidence object store, so the repository under inspection
       # gains nothing.
-      scan_target="$head_sha"
+      # ⚠ THE SCAFFOLD IS ALREADY-PUBLISHED CONTENT, NOT LOCAL `HEAD`. A refspec that
+      # pushes a blob or a tree updates the destination with THAT object and nothing
+      # else -- git's own documentation says the `<src>` side determines it -- so
+      # scanning the local HEAD tree let Lane A refuse over unpublished material this
+      # push does not transfer (shardpilot/shardpilot-go#79 review). The destination's
+      # baseline is public by definition, so a refusal from it is a pre-existing
+      # condition rather than something this push introduces, and the object actually
+      # published is staged as evidence either way.
+      scan_target=""
+      if git cat-file -e "$base^{commit}" 2>/dev/null; then
+        scan_target="$base"
+      elif [ -n "${branch:-}" ] &&
+           scan_target="$(git rev-parse --verify --quiet "refs/remotes/origin/$branch^{commit}" 2>/dev/null)" &&
+           [ -n "$scan_target" ]; then
+        # The remote-tracking tip of the destination's default branch: published
+        # content, already here, no network. Used only as the SCAFFOLD -- the ratchet
+        # baseline stays the empty tree, because a non-commit push introduces no
+        # ancestry and those are two different questions.
+        :
+      else
+        # ⚠ LIMIT, NAMED: with no published commit available -- an empty destination,
+        # or no remote-tracking ref for its default branch -- the local HEAD is the
+        # only scaffold this gate has, and Lane A can still refuse over material the
+        # push does not transfer. Fetching one purely to scaffold a scan is network
+        # work this round did not take on.
+        scan_target="$head_sha"
+      fi
       if [ -z "$scan_target" ]; then
         # ⚠ AND A SYNTHETIC BASE CANNOT SATISFY THE SCANNER'S SELF-AUDIT.
         #
