@@ -2784,3 +2784,159 @@ func TestAnUnaccountedValueInAParsedBodyIsRedacted(t *testing.T) {
 		t.Fatalf("the SDK's own taxonomy was lengthened: %q", v)
 	}
 }
+
+// A registry's SCOPE is part of what it says: `benignTopLevel` describes the
+// top-level schema, and a nested member of the same name is the endpoint's.
+func TestASchemaNameIsGrammarOnlyAtTheRoot(t *testing.T) {
+	suppliedValues = []string{"assigned"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\n\r\n{\"assigned\":true,\"variant_payload\":{\"assigned\":\"x\"}}")))
+	if strings.Count(got, "assigned") != 1 {
+		t.Fatalf("the nested endpoint-controlled name was exempted too: %q", got)
+	}
+}
+
+// A container VALUE consumes its parent's turn; the member after it is a key.
+func TestTheMemberAfterAContainerValueIsStillAKey(t *testing.T) {
+	suppliedValues = []string{"version"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\n\r\n{\"variant_payload\":{},\"version\":1}")))
+	if !strings.Contains(got, `"version"`) {
+		t.Fatalf("a fixed schema member after a container value was rewritten: %q", got)
+	}
+}
+
+// Two rules that each cover half of a case do not cover the case.
+func TestAShortBase64SuffixAfterASeparatorIsDecoded(t *testing.T) {
+	suppliedValues = []string{"a"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured("prefix/YQ")); err == nil {
+		t.Fatal("a one-character value after path punctuation passed the guard")
+	}
+}
+
+// MIME ignores the whitespace a line-based reading treats as structure.
+func TestAWrappedRunSurvivesAHorizontalWhitespaceLine(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured("prefix: YWJj\r\n \t\r\nZGVmZ2g=")); err == nil {
+		t.Fatal("a value reconstructable across a whitespace-only line passed the guard")
+	}
+}
+
+// Candidate assembly is LINEAR, which is a claim about cost and therefore about
+// time.
+//
+// ⚠ THE FIRST VERSION OF THIS SCENE ASSERTED THE BUDGET FIRED, and it does not
+// have to: once the assembly uses a builder the work IS linear -- 160 KB for this
+// input -- so the ceiling is never reached and the scene failed on the fixed code.
+// The subject is the quadratic, and the only honest instrument for "not
+// quadratic" here is elapsed time. The bound is set FROM A MEASUREMENT of both
+// forms rather than guessed: on this input the builder takes 0.00s and the `+=`
+// form takes 1.55s, so the first bound I wrote -- two seconds -- did not separate
+// them and the mutant passed. 500ms sits three times above the linear form and
+// three times below the quadratic one.
+func TestWrappedCandidateAssemblyIsLinear(t *testing.T) {
+	decodeWork = 0
+	t.Cleanup(func() { decodeWork = 0 })
+	var b strings.Builder
+	b.WriteString("prefix: YWJj\r\n")
+	for i := 0; i < 40000; i++ {
+		b.WriteString("YWJj\r\n")
+	}
+	b.WriteString("x ZGVmZ2g=")
+	in := b.String()
+
+	start := time.Now()
+	got := wrappedBase64Candidates(in)
+	elapsed := time.Since(start)
+
+	if len(got) == 0 {
+		t.Fatal("no candidate was assembled, so the scene measured an empty loop")
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("assembling one candidate over %d lines took %v: that is the quadratic copy", 40000, elapsed)
+	}
+	if decodeWork == 0 {
+		t.Fatal("the assembly charged nothing to the decode budget")
+	}
+}
+
+// Go's quoting alphabet is not JSON's, and `encodingsOf` emits both.
+func TestGoControlEscapesAreDecoded(t *testing.T) {
+	// BOTH escapes Go writes and JSON does not: a scene covering one of them leaves
+	// the other unmeasured, and the mutant that removed `\a` survived the first
+	// version of this.
+	for _, c := range []struct{ val, wire string }{
+		{"a\vb", "k=%61%5Cvb"},
+		{"a\ab", "k=%61%5Cab"},
+	} {
+		suppliedValues = []string{c.val}
+		err := assertNoLeak(asCaptured(c.wire))
+		suppliedValues = nil
+		if err == nil {
+			t.Fatalf("a value whose Go spelling hides a control byte passed the guard: %q", c.wire)
+		}
+	}
+}
+
+// The SDK's classification reaches the error path too.
+func TestTheTaxonomyInsideAFetchErrorIsVouched(t *testing.T) {
+	suppliedValues = []string{"not_found"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(sanitizeCaptured(
+		errors.New("shardpilot experiment assignment fetch failed: not_found")))
+	if !strings.Contains(got, "not_found") {
+		t.Fatalf("the SDK's own classification was rewritten inside the error: %q", got)
+	}
+}
+
+// "Short" means characters everywhere else; this threshold counted bytes.
+func TestTheShortValueThresholdCountsCharacters(t *testing.T) {
+	suppliedValues = []string{"éééé"}
+	t.Cleanup(func() { suppliedValues = nil })
+	// ⚠ THE TEXT MUST BE UNCHANGED, not merely still bracketed by its neighbours.
+	// The first version asserted `α` and `β` survive -- they survive the
+	// unconditional replacement too, so it matched something other than its subject.
+	// `éééé` here is EMBEDDED, and the boundary rule that applies to short values is
+	// exactly what the byte-length threshold was skipping.
+	if got := stripMarks(scrubSupplied(asCaptured("αééééβ"))); !strings.Contains(got, "αééééβ") {
+		t.Fatalf("an embedded short value was replaced past its boundary rule: %q", got)
+	}
+}
+
+// The identity branch is an early return, and owes what the common path does.
+func TestTheIdentityBranchAdmitsItsFieldNameAndSpelling(t *testing.T) {
+	suppliedValues = []string{"IDENTITY"}
+	got := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\nContent-Encoding: IDENTITY\r\n\r\n{\"assigned\":false}")))
+	suppliedValues = nil
+	if strings.Contains(got, "IDENTITY") {
+		t.Fatalf("a non-canonical coding spelling was vouched: %q", got)
+	}
+	suppliedValues = []string{"Content-Encoding"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got = stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\nContent-Encoding: identity\r\n\r\n{\"assigned\":false}")))
+	// ⚠ THE FIELD NAME IS THE SUBJECT, AND THE PROPERTY IS THAT IT IS STILL A FIELD
+	// NAME. Two earlier versions of this assertion were wrong: the first checked
+	// that `identity` survives, which it does either way since the branch marks the
+	// value; the second checked the name survives VERBATIM, which it must not -- the
+	// name equals a supplied identifier and is redacted. What the early return
+	// skipped is the TOKEN-SAFE spelling, so the header stayed parsable.
+	name := strings.SplitN(strings.SplitN(got, "\r\n", 2)[1], ":", 2)[0]
+	if strings.ContainsAny(name, " <>,") || name == "" {
+		t.Fatalf("the early return left a field name no parser accepts: %q", got)
+	}
+	// ⚠ THIS HALF IS GONE ON THIS BRANCH, AND THE REASON IS A REAL DIFFERENCE, not a
+	// relaxation. On the parent the name goes through `scrubHeaderName`, which knows
+	// only what the harness supplied, so a supplied `Content-Encoding` is redacted
+	// and the assertion held. Here it goes through `admitFieldName`, which VOUCHES a
+	// registered name in its canonical spelling -- and this branch's own sweep
+	// requires exactly that of every registered name. Keeping the parent's half
+	// would assert the opposite of `TestEveryVouchedTokenSurvivesTheScrub`, and one
+	// of the two would have to be wrong. The property that survives the seam is the
+	// one above: whatever stands there is still a legal field name.
+}

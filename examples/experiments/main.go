@@ -483,6 +483,23 @@ var sdkTaxonomy = set(
 	"superseded",
 )
 
+// vouchTaxonomyIn marks this SDK's own classification wherever it appears inside
+// a rendered error.
+//
+// ⚠ THE TAXONOMY REACHES THE ERROR PATH TOO. `result.Code` and `result.Reason`
+// are vouched, and the SDK also puts the same classification INSIDE the error it
+// returns -- `…fetch failed: http_0`. With that string as a legal experiment key
+// the generic scrub rewrote it to a placeholder, and the report's exit status
+// depends on precisely that token (shardpilot/shardpilot-go#84 review). Same
+// vocabulary, second printer; vouching it in one place is vouching it in one
+// place.
+func vouchTaxonomyIn(text string) string {
+	for t := range sdkTaxonomy {
+		text = replaceTokenWith(text, t, marked(t), isWordByte)
+	}
+	return text
+}
+
 // vouchTaxonomy marks a verdict field this SDK generated.
 func vouchTaxonomy(v string) string {
 	if sdkTaxonomy[v] {
@@ -676,7 +693,12 @@ func base64SuffixCandidates(text string) []string {
 		if len(tok) < minToken {
 			continue
 		}
-		for _, st := range separatorStarts(tok, minToken) {
+		// ⚠ AND THE SHORT SUFFIXES. The suffix scan required four bytes and the short
+		// scan required a whole token, so `prefix/YQ` -- a one-character key after path
+		// punctuation -- fell between two fixes that each covered half of it
+		// (shardpilot/shardpilot-go#84 review). The combination of two rules is a third
+		// rule, and neither of them stated it.
+		for _, st := range separatorStarts(tok, 2) {
 			if dec, ok := decodeBase64(tok[st:]); ok {
 				out = append(out, dec)
 			}
@@ -1947,7 +1969,12 @@ func sanitizeCaptured(err error) string {
 	// already states -- escape before the stages that create marks of their own --
 	// is satisfied by `overCaptured`, which applies the escape to the captured
 	// parts and leaves the generated placeholders alone.
-	return asCaptured(scrubSupplied(sanitizeText(redactQuotedExtents(err.Error()))))
+	// ⚠ AND THE SDK'S OWN CLASSIFICATION IS VOUCHED BEFORE THE SCRUB. The taxonomy
+	// reaches this printer too, and applied to the RESULT the classification is
+	// already a placeholder by the time the marking runs -- structural first, scrub
+	// second, as everywhere else (shardpilot/shardpilot-go#84 review, carried across
+	// the seam onto this branch's own extent redaction).
+	return asCaptured(scrubSupplied(sanitizeText(vouchTaxonomyIn(redactQuotedExtents(err.Error())))))
 }
 
 // redactQuotedExtents replaces each double-quoted span with a placeholder for its
@@ -2310,7 +2337,16 @@ func markBareJSONLiterals(text string) string {
 	//
 	// Depth and turn are tracked because `Token()` returns a string for a key and
 	// for a value alike: only position tells them apart.
-	var objDepth []bool // true while the next string in this object is a KEY
+	// 0 = array, 1 = object expecting a KEY, 2 = object expecting a VALUE.
+	//
+	// ⚠ TWO DEFECTS CAME OUT OF THE `[]bool` THIS REPLACES, both mine from the round
+	// before. A bare "expecting a key" flag cannot say "this is an array", so the
+	// toggle ran on array elements too; and closing a container popped the child
+	// without advancing the PARENT's turn, so the member after a `{}` value was not
+	// seen as a key -- `{"variant_payload":{},"version":1}` left `version`
+	// unrecognised, and a supplied `version` rewrote a fixed schema member
+	// (shardpilot/shardpilot-go#84 review).
+	var objDepth []int8
 	for {
 		tok, err := dec.Token()
 		if err != nil {
@@ -2319,33 +2355,43 @@ func markBareJSONLiterals(text string) string {
 			}
 			return text // malformed: no grammar to protect
 		}
-		// ⚠ THE DEPTH BOOKKEEPING MUST NOT SWALLOW THE MARKING. Brought across the
-		// stack seam, this block ended with `continue` -- and the delimiter marking
-		// lives in the switch BELOW it, so `{` and `}` stopped being grammar and two
-		// sweep rows went red on the first run after the merge
-		// (shardpilot/shardpilot-go#84 review, resolved at the seam). Tracking where
-		// a token sits is not a reason to stop processing it.
-		isKey := false
+		advance := func() {
+			// A container or a scalar in VALUE position consumes the parent's turn.
+			if n := len(objDepth); n > 0 && objDepth[n-1] == 2 {
+				objDepth[n-1] = 1
+			}
+		}
+		// ⚠ THE DEPTH BOOKKEEPING MUST NOT SWALLOW THE MARKING. The parent's version
+		// of this block ends in `continue`, because that branch has nothing after it
+		// there; here the delimiter MARKING lives in the switch below, so a `continue`
+		// stops `{` and `}` being grammar and two sweep rows go red. Both sides are
+		// needed: the three-state turn tracking, and no early exit
+		// (shardpilot/shardpilot-go#84 review, resolved at the seam).
+		isKey, atRoot := false, false
 		if d, ok := tok.(json.Delim); ok {
 			switch d {
 			case '{':
-				objDepth = append(objDepth, true)
+				advance()
+				objDepth = append(objDepth, 1)
 			case '[':
-				objDepth = append(objDepth, false)
+				advance()
+				objDepth = append(objDepth, 0)
 			case '}', ']':
 				if len(objDepth) > 0 {
 					objDepth = objDepth[:len(objDepth)-1]
 				}
 			}
+		} else if n := len(objDepth); n > 0 && objDepth[n-1] == 1 {
+			isKey, atRoot = true, n == 1
+			objDepth[n-1] = 2
 		} else {
-			isKey = len(objDepth) > 0 && objDepth[len(objDepth)-1]
-			if len(objDepth) > 0 {
-				objDepth[len(objDepth)-1] = !isKey
-			}
+			advance()
 		}
-		if name, ok := tok.(string); ok && isKey {
-			// Only the CANONICAL spelling: the predicates fold, and vouching on
-			// recognition publishes a supplied `ASSIGNED`.
+		// ⚠ AT THE ROOT ONLY, and only the CANONICAL spelling. `benignTopLevel`
+		// describes the SDK's TOP-LEVEL schema, so marking those names at every depth
+		// exempts an endpoint-controlled nested member of the same name; and the
+		// predicates fold, so vouching on recognition publishes a supplied `ASSIGNED`.
+		if name, ok := tok.(string); ok && isKey && atRoot {
 			if benignTopLevel[name] || mintedNames[name] {
 				end := int(dec.InputOffset())
 				quoted := `"` + name + `"`
@@ -3282,7 +3328,12 @@ func wrappedBase64Candidates(text string) []string {
 			// exists for the runs that share a line with something else.
 			continue
 		}
-		joined := head
+		// ⚠ A BUILDER, NOT `+=`. Each `+=` copies the whole prefix accumulated so far,
+		// so assembling a candidate over many short base64 lines is quadratic -- and it
+		// happens BEFORE the decode budget charges anything, which is the same gap the
+		// suffix probes had (shardpilot/shardpilot-go#84 review).
+		var jb strings.Builder
+		jb.WriteString(head)
 		for j := i + 1; j < len(lines); j++ {
 			// ⚠ A BLANK LINE IS WHITESPACE, NOT A BOUNDARY -- the same sentence this
 			// file has now had to apply three times: to horizontal space inside a
@@ -3291,15 +3342,25 @@ func wrappedBase64Candidates(text string) []string {
 			// every CR and LF, so `prefix: YWJj\r\n\r\nZGVmZ2g=` reconstructs the
 			// identifier in one step (shardpilot/shardpilot-go#84 review). Each time
 			// the producer was new and the rule was not.
-			if lines[j] == "" {
+			if strings.TrimLeft(lines[j], " \t") == "" {
+				// ⚠ HORIZONTAL-WHITESPACE-ONLY COUNTS AS BLANK HERE TOO. `joinBase64Runs`
+				// normalises spaces and tabs before judging a line; this producer
+				// recognised only the empty string, so a run crossing ` \t` terminated
+				// early (shardpilot/shardpilot-go#84 review). Fourth time this file has
+				// been told MIME ignores whitespace a line-based reading treats as
+				// structure, and the third producer told separately.
 				continue
 			}
 			if allBase64(lines[j]) {
-				joined += lines[j]
+				decodeWork += len(lines[j])
+				if decodeWork > decodeWorkMax {
+					break
+				}
+				jb.WriteString(lines[j])
 				continue
 			}
 			if p := prefix(lines[j]); p != "" {
-				out = append(out, joined+p)
+				out = append(out, jb.String()+p)
 			}
 			break
 		}
@@ -3500,6 +3561,21 @@ func undoUnicodeEscapes(text string) string {
 				continue
 			case 'f':
 				b.WriteByte('\f')
+				i++
+				continue
+			case 'a':
+				// ⚠ GO'S OWN QUOTING ALPHABET TOO, not only JSON's. `encodingsOf`
+				// explicitly produces `strconv.Quote` spellings, and that quoting
+				// writes `\a` and `\v` where JSON does not -- so a supplied value
+				// containing a bell or a vertical tab had a spelling no retained form
+				// reconstructed (shardpilot/shardpilot-go#84 review). A decoder that
+				// covers one of two alphabets its own producer emits is covering half
+				// of what it was written for.
+				b.WriteByte(7)
+				i++
+				continue
+			case 'v':
+				b.WriteByte(11)
 				i++
 				continue
 			}
@@ -3784,7 +3860,14 @@ func isASCII(s string) bool {
 }
 
 func replaceTokenWith(text, v, red string, isWord func(byte) bool) string {
-	if len(v) >= 8 {
+	// ⚠ CHARACTERS, LIKE EVERY OTHER PLACE THAT SAYS "SHORT". `len` is bytes, so a
+	// four-character non-ASCII key such as `éééé` is eight bytes and took the
+	// unconditional branch -- rewriting ordinary endpoint text `αééééβ` into
+	// `α<redacted, 4 chars>β`, evidence the guard then approved because the
+	// placeholder is generated (shardpilot/shardpilot-go#84 review). The
+	// placeholder counts characters and so does the notion of a short identifier;
+	// only this threshold counted bytes.
+	if chars(v) >= 8 {
 		return strings.ReplaceAll(text, v, red)
 	}
 	var b strings.Builder
