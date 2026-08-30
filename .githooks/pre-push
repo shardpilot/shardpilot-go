@@ -16,7 +16,13 @@
 # you were shown leaves every shell it starts.
 #
 # Unset rather than sanitise: `ENV` is the same vector for a `sh`-mode child.
-unset BASH_ENV ENV
+# ⚠ AND `CDPATH`, BECAUSE `cd` PRINTS. With `CDPATH` exported, a successful `cd`
+# writes the directory it chose to stdout -- so `physdir`, which captures `cd ... &&
+# pwd -P`, took TWO lines and built a hooks path containing a newline; the installed
+# scanner then read as missing and every push was refused
+# (shardpilot/shardpilot-go#79 review). Reproduced with `CDPATH=.:..`. It also picks
+# a DIFFERENT directory than the argument names, which is worse than the noise.
+unset BASH_ENV ENV CDPATH
 #
 # The PATH filter below is about what a bare command RESOLVES to; this is about
 # what runs before any command of ours at all.
@@ -345,6 +351,79 @@ export GIT_SHALLOW_FILE
 checkout_root="$(pwd -P && printf X)"
 checkout_root="${checkout_root%X}"
 checkout_root="${checkout_root%$NL}"
+
+# ⚠ AND THE OTHER CHECKOUTS TOO. An absolute PATH entry inside ANOTHER linked
+# worktree -- the main checkout's `bin` while pushing from a feature worktree -- is
+# branch-controlled exactly as this one is, and dropping only the invoking
+# checkout's entries left it to supply `bin/mktemp` or `bin/git` for the first
+# external command this hook runs (shardpilot/shardpilot-go#79 review). Executable
+# search paths are the same question as the shared hooks directory, one round later.
+#
+# ⚠ WITH BUILTINS, BECAUSE `git worktree list` IS ITSELF AN EXTERNAL COMMAND. Asking
+# git which checkouts exist would run the binary this filter is meant to choose. So
+# the roots are read the way git records them: for a linked worktree `GIT_DIR` names
+# `<common>/worktrees/<name>`, and every checkout has a `gitdir` file there naming
+# its own root. Measured: git leaves `GIT_DIR` unset for a hook in the MAIN
+# worktree and sets it in a linked one, and the cwd is the invoking root in both.
+#
+# What this pass cannot see is stated where it is enforced: see the second filter
+# after the enumeration below.
+other_roots=""
+wt_common=""
+if [ -n "${GIT_DIR:-}" ]; then
+  wt_common="$GIT_DIR"
+elif [ -f "$checkout_root/.git" ]; then
+  # `.git` is a FILE here: one line, `gitdir: <path>`.
+  IFS= read -r wt_gitline < "$checkout_root/.git" || wt_gitline=""
+  case "$wt_gitline" in
+    "gitdir: "*) wt_common="${wt_gitline#gitdir: }" ;;
+  esac
+elif [ -d "$checkout_root/.git" ]; then
+  wt_common="$checkout_root/.git"
+fi
+case "$wt_common" in
+  ""|/*) ;;
+  *) wt_common="$checkout_root/$wt_common" ;;
+esac
+case "$wt_common" in
+  */worktrees/*) wt_common="${wt_common%/worktrees/*}" ;;
+esac
+if [ -n "$wt_common" ]; then
+  case "$wt_common" in
+    */.git) other_roots="${wt_common%/.git}$NL" ;;
+  esac
+  for wt_gd in "$wt_common"/worktrees/*/gitdir; do
+    [ -f "$wt_gd" ] || continue
+    IFS= read -r wt_line < "$wt_gd" || continue
+    case "$wt_line" in
+      ""|/*) ;;
+      *) wt_line="$wt_common/$wt_line" ;;
+    esac
+    case "$wt_line" in
+      */.git) wt_line="${wt_line%/.git}" ;;
+    esac
+    [ -n "$wt_line" ] && other_roots="$other_roots$wt_line$NL"
+  done
+fi
+inside_a_checkout() {
+  # $1 is a physically-resolved directory. True when it lies in the invoking
+  # checkout or in any other checkout this pass could name.
+  case "$1/" in
+    "$checkout_root"/*) return 0 ;;
+  esac
+  [ "$1" = "$checkout_root" ] && return 0
+  ir_rest="$other_roots"
+  while [ -n "$ir_rest" ]; do
+    ir_one="${ir_rest%%$NL*}"
+    ir_rest="${ir_rest#*$NL}"
+    [ -n "$ir_one" ] || continue
+    case "$1/" in
+      "$ir_one"/*) return 0 ;;
+    esac
+    [ "$1" = "$ir_one" ] && return 0
+  done
+  return 1
+}
 sanitised_path=""
 dropped_inside=no
 old_ifs="$IFS"
@@ -360,10 +439,7 @@ for path_entry in $PATH; do
   else
     entry_phys="$path_entry"
   fi
-  case "$entry_phys/" in
-    "$checkout_root"/*) dropped_inside=yes; continue ;;
-  esac
-  if [ "$entry_phys" = "$checkout_root" ]; then
+  if inside_a_checkout "$entry_phys"; then
     dropped_inside=yes
     continue
   fi
@@ -667,7 +743,39 @@ if [ -n "$worktree_root" ]; then
         ;;
     esac
   }
+  # ⚠ THE SECOND PATH FILTER, AND IT REFUSES RATHER THAN DROPS. The builtin pass
+  # above named every checkout it could reach without running anything; this one has
+  # git's own answer, and by now external commands HAVE run. A survivor found here
+  # was on PATH while `mktemp` and `git` were resolved, so there is nothing left to
+  # drop -- the honest answer is that this gate cannot speak for the run
+  # (shardpilot/shardpilot-go#79 review). It is also the only place the builtin
+  # pass's limits become visible instead of silent.
+  check_path_outside() {
+    cpo_rest="$PATH"
+    while [ -n "$cpo_rest" ]; do
+      cpo_one="${cpo_rest%%:*}"
+      case "$cpo_rest" in *:*) cpo_rest="${cpo_rest#*:}" ;; *) cpo_rest="" ;; esac
+      [ -n "$cpo_one" ] || continue
+      case "$cpo_one" in /*) ;; *) continue ;; esac
+      if cpo_phys="$(physdir "$cpo_one")"; then
+        cpo_phys="${cpo_phys%X}"
+      else
+        cpo_phys="$cpo_one"
+      fi
+      cpo_prefix="$1/"
+      case "$cpo_prefix" in //) cpo_prefix=/ ;; esac
+      case "$cpo_phys/" in
+        "$cpo_prefix"*)
+          printf 'REFUSING: the PATH entry %s lies inside the worktree %s, where a\n' "$cpo_one" "$1" >&2
+          printf '  branch can supply it -- and this gate has already resolved external\n' >&2
+          printf '  commands, so dropping it now would not undo what it may have run.\n' >&2
+          exit 2
+          ;;
+      esac
+    done
+  }
   check_containment "$worktree_root"
+  check_path_outside "$worktree_root"
   if [ -s "$wt_list_file" ]; then
     while IFS= read -r -d "" wt_rec; do
       case "$wt_rec" in
@@ -677,6 +785,7 @@ if [ -n "$worktree_root" ]; then
           wt_phys="${wt_phys%X}"
           [ "$wt_phys" = "$worktree_root" ] && continue
           check_containment "$wt_phys"
+          check_path_outside "$wt_phys"
           ;;
       esac
     done < "$wt_list_file"
@@ -923,7 +1032,17 @@ scan_commit() {
   #
   # Asking the tree removes both: no populate, and an answer that does not depend
   # on sparsity, on the checkout, or on the git version's idea of `disable`.
-  scripts_row="$( cd "$wt" && git_safe ls-tree "$1" -- scripts 2>/dev/null )" || scripts_row=""
+  # ⚠ AN UNREADABLE ENTRY IS NOT AN ABSENT ONE. `ls-tree` reports success with
+  # EMPTY output for a path a commit does not carry, so a non-zero status means the
+  # probe failed -- and mapping that to "" let a mode allow-list consume a
+  # measurement that was never taken (shardpilot/shardpilot-go#79 review). Fourth
+  # site of this shape in this file; the population was produced by grepping every
+  # substitution that swallows a status, not by listing the ones I was shown.
+  if ! scripts_row="$( cd "$wt" && git_safe ls-tree "$1" -- scripts 2>/dev/null )"; then
+    printf 'REFUSING: the entry for `scripts` in %s could not be read, so this gate\n' "$1" >&2
+    printf '  cannot tell an unreadable entry from an absent one.\n' >&2
+    exit 2
+  fi
   case "${scripts_row%% *}" in
     ""|040000) ;;
     *)
@@ -933,7 +1052,11 @@ scan_commit() {
       exit 2
       ;;
   esac
-  scanner_row="$( cd "$wt" && git_safe ls-tree "$1" -- scripts/check_public_surface.sh 2>/dev/null )" || scanner_row=""
+  if ! scanner_row="$( cd "$wt" && git_safe ls-tree "$1" -- scripts/check_public_surface.sh 2>/dev/null )"; then
+    printf 'REFUSING: the entry for the scanner path in %s could not be read, so its\n' "$1" >&2
+    printf '  mode cannot be checked and a gitlink there would go unscanned.\n' >&2
+    exit 2
+  fi
   # ⚠ WHAT IS ALLOWED, NOT WHAT IS BANNED. Naming `120000` left `160000`: a commit
   # can make the scanner path a GITLINK whose target is absent locally, and
   # `cat-file -e "$1:scripts/check_public_surface.sh"` then dereferences the
@@ -986,7 +1109,11 @@ scan_commit() {
     # `ls-tree` answers about the ENTRY. Same shape as the tagged-tree finding two
     # rounds ago: a probe that resolves an object cannot report on an object it
     # cannot resolve.
-    if [ -n "$(git ls-tree --name-only "$1" -- "$2" 2>/dev/null)" ] ||
+    if ! tracked_name="$(git ls-tree --name-only "$1" -- "$2" 2>/dev/null)"; then
+      printf 'REFUSING: could not read whether %s tracks the evidence path %s.\n' "$1" "$2" >&2
+      exit 2
+    fi
+    if [ -n "$tracked_name" ] ||
        git cat-file -e "$1:$2" 2>/dev/null || [ -e "$wt/$2" ] || [ -L "$wt/$2" ]; then
       printf 'REFUSING: %s already tracks %s, which this gate needs as an\n' "$1" "$2" >&2
       printf '  evidence path. A commit that owns it can hide content from the\n' >&2
@@ -1181,7 +1308,13 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # (shardpilot/shardpilot-go#79 review). Such a tag has no tree to scan; what it
   # publishes is the tag OBJECT, and that is collected either way.
   peeled="$(git rev-parse --verify --quiet "$local_sha^{commit}" 2>/dev/null || printf '%s' "$local_sha")"
-  target_kind="$(git cat-file -t "$peeled" 2>/dev/null || printf 'unknown')"
+  # `peeled` above falls back deliberately: `rev-parse --verify` FAILING is the
+  # answer "not a commit". A type probe failing is not an answer at all.
+  if ! target_kind="$(git cat-file -t "$peeled" 2>/dev/null)"; then
+    printf 'REFUSING: the type of %s could not be read, so this gate cannot tell an\n' "$peeled" >&2
+    printf '  unreadable object from one it knows how to scan.\n' >&2
+    exit 2
+  fi
   # ⚠ AN ANCESTOR IS ELIGIBLE FOR A TAG. `--follow-tags` publishes missing
   # annotated tags reachable from the refs being pushed, not only tags whose
   # target IS HEAD -- so requiring equality refused an otherwise standard branch
@@ -1267,7 +1400,26 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   case "$remote_sha" in
     *[!0]*)
       if ! git cat-file -e "$remote_sha" 2>/dev/null; then
-        git fetch --quiet --no-tags --no-write-fetch-head -- "$dest" "$remote_sha" 2>/dev/null || true
+        # ⚠ A HOOK'S FETCH MUST LEAVE NO TRACE. Without `--no-write-fetch-head` this
+        # overwrites .git/FETCH_HEAD, so a developer who fetched a commit intending
+        # `git merge FETCH_HEAD` silently merges the destination's default branch
+        # instead, because a push ran in between. Without `--no-tags` it can
+        # auto-follow tags into the fetched history and create them locally, in a
+        # clone made with --no-tags on purpose (shardpilot/shardpilot-go#79 review).
+        #
+        # ⚠ AND THIS IS THE ONLY PLACE THE OBJECT IS OBTAINED, so the type question
+        # below sees the result. The retry used to sit AFTER that question: a first
+        # fetch failing transiently and a retry succeeding left a blob or a tree as
+        # `base`, `scan_commit` saw no PUBLIC_SURFACE_BASE_REF, and the lane-B
+        # baseline ratchet was skipped SILENTLY (same review). A question asked
+        # before its answer can still change is asked of the wrong state.
+        # ⚠ TWICE, BECAUSE THE OLD SHAPE RETRIED AND HOISTING IT MUST NOT COST
+        # THAT. Collapsing the two attempts into one made a transient first failure
+        # fatal for a push the previous code recovered -- a repair that fixes the
+        # ordering by removing the tolerance is a second defect
+        # (found by the rig for shardpilot/shardpilot-go#79 review).
+        git fetch --quiet --no-tags --no-write-fetch-head -- "$dest" "$remote_sha" 2>/dev/null ||
+          git fetch --quiet --no-tags --no-write-fetch-head -- "$dest" "$remote_sha" 2>/dev/null || true
       fi
       ;;
   esac
@@ -1281,19 +1433,12 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     *[!0]*)
       base="$remote_sha"
       why="the pre-push tip of ${remote_ref:-the remote ref}"
+      # Reaching here means the object is ABSENT: it was fetched above if it was
+      # obtainable, and a present non-commit zeroed `remote_sha` and took the
+      # default-branch branch below. A gate is not entitled to fetch twice.
       if ! git rev-parse --verify --quiet "$base^{commit}" >/dev/null 2>&1; then
-        # ⚠ A HOOK'S FETCH MUST LEAVE NO TRACE. Without `--no-write-fetch-head`
-        # this overwrites .git/FETCH_HEAD, so a developer who fetched a commit
-        # intending `git merge FETCH_HEAD` silently merges the destination's
-        # default branch instead, because a push ran in between. Without
-        # `--no-tags` it can auto-follow tags into the fetched history and create
-        # them locally, in a clone made with --no-tags on purpose
-        # (shardpilot/shardpilot-go#79 review). A gate is not entitled to change
-        # the repository it is inspecting.
-        if ! git fetch --quiet --no-tags --no-write-fetch-head -- "$dest" "$base" 2>/dev/null; then
-          printf 'REFUSING: the pre-push tip %s is not here and could not be fetched.\n' "$base" >&2
-          exit 2
-        fi
+        printf 'REFUSING: the pre-push tip %s is not here and could not be fetched.\n' "$base" >&2
+        exit 2
       fi
       ;;
     *)
@@ -1310,7 +1455,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       # push was refused (shardpilot/shardpilot-go#79 review). Stripping a prefix
       # that may not be there produces a value that LOOKS like a branch name.
       branch_ref="$(git ls-remote --symref -- "$dest" HEAD 2>/dev/null \
-        | awk '$1=="ref:" && $3=="HEAD" {print $2; exit}')"
+        | awk '$1=="ref:" && $3=="HEAD" && !seen {print $2; seen=1}')"
       branch="${branch_ref#refs/heads/}"
       unborn=no
       if [ -z "$branch" ]; then
@@ -1452,8 +1597,15 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       git_safe update-ref -d "$base_ref" 2>/dev/null || true
       base_ref=""
       fi
+      # ⚠ A READER THAT EXITS EARLY KILLS ITS WRITER. `awk … exit` closes the pipe
+      # while `printf` is still writing, `printf` takes SIGPIPE, and under `pipefail`
+      # the substitution's status is 141 -- which `set -e` turns into this gate
+      # REFUSING a valid push. Reproduced with a combined push whose refspec exceeds
+      # the pipe buffer (shardpilot/shardpilot-go#79 review). Third instance of this
+      # shape here, so the population was greped rather than recalled; the sibling
+      # symref reader above took the same repair. The match is still the FIRST one.
       incoming="$(printf '%s\n' "$pushed_lines" \
-        | awk -v r="$branch_ref" '$3==r {print $2; exit}')"
+        | awk -v r="$branch_ref" '$3==r && !seen {print $2; seen=1}')"
       # ⚠ ALL ZEROES IS A DELETION, AND IT IS HEX. One push may delete the
       # destination's default branch while creating another ref, and the zero object
       # passed the hex-only test below and became the baseline -- handed to the
@@ -1667,7 +1819,14 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       # substitution was found a second time: a repair keyed on the wrong name
       # looks exactly like the defect it replaced.
       deref="$( git rev-parse --verify --quiet "${local_sha}^{}" 2>/dev/null || printf '%s' "$peeled" )"
-      deref_kind="$( git cat-file -t "$deref" 2>/dev/null || printf 'unknown' )"
+      # ⚠ AND MAPPING FAILURE TO `unknown` SKIPS BOTH EVIDENCE BRANCHES, so the push
+      # was approved on the ref name and the tag annotation alone, with the published
+      # target object never staged (shardpilot/shardpilot-go#79 review).
+      if ! deref_kind="$( git cat-file -t "$deref" 2>/dev/null )"; then
+        printf 'REFUSING: the type of the tag target %s could not be read, so the object\n' "$deref" >&2
+        printf '  this push publishes cannot be staged as evidence.\n' >&2
+        exit 2
+      fi
       run_evidence "$tmpdir/tag-target" write "the tag-target evidence file" printf ''
 
       if [ "$deref_kind" = blob ]; then
