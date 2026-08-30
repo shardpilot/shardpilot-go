@@ -624,12 +624,17 @@ func redactTarget(line string) string {
 		if a := authorityOf(strings.TrimSuffix(url, "\r")); a != "" {
 			{
 				if scrubSuppliedRaw(a) != a {
+					// ⚠ REPLACED AND THEN CARRIED ON. Returning here skipped the path,
+					// query, fragment and userinfo redactors, so
+					// `https://e.example/cb?state=<token>` kept an endpoint token the
+					// guard cannot see (shardpilot/shardpilot-go#85 review). Fixing the
+					// authority is not finishing the target: this branch answered one
+					// question and left the pipeline that answers the rest.
 					noteAccounted(formField, "a redirect authority colliding with a supplied value")
-					cr := ""
-					if strings.HasSuffix(line, "\r") {
-						cr = "\r"
-					}
-					return head + ":" + gap + strings.Replace(url, a, tokenPlaceholder(a), 1) + cr
+					// `url` carries its own terminator, so rebuilding the line from it
+					// keeps the CR without a separate branch.
+					line = head + ":" + gap + strings.Replace(url, a, tokenPlaceholder(a), 1)
+					url = strings.Replace(url, a, tokenPlaceholder(a), 1)
 				}
 			}
 		}
@@ -1342,11 +1347,29 @@ func redactUnaccountedJSONValues(body string) string {
 		}
 		verdictField = ""
 	}
-	for x := len(spans) - 1; x >= 0; x-- {
-		sp := spans[x]
-		body = body[:sp.a] + sp.val + body[sp.b:]
+	// ⚠ ONE PASS, NOT ONE REBUILD PER SPAN. Splicing right-to-left copies almost the
+	// whole body on every iteration, so redaction was quadratic in the number of
+	// strings: a 120 KB array of 30,000 short values took seconds here, and the
+	// accepted body ceiling is around a megabyte -- minutes of post-processing after
+	// the capture deadline has already passed (shardpilot/shardpilot-go#85 review).
+	// Same defect as the wrapped-candidate assembly two rounds ago, in the code I
+	// wrote after fixing that one.
+	//
+	// The spans are produced in ascending order by the traversal; the builder walks
+	// them once and copies each byte at most once.
+	var out strings.Builder
+	out.Grow(len(body))
+	prev := 0
+	for _, sp := range spans {
+		if sp.a < prev || sp.b > len(body) {
+			continue
+		}
+		out.WriteString(body[prev:sp.a])
+		out.WriteString(sp.val)
+		prev = sp.b
 	}
-	return body
+	out.WriteString(body[prev:])
+	return out.String()
 }
 
 func redactMintedBody(body string) string {

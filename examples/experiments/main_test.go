@@ -3318,19 +3318,89 @@ func TestANonCanonicalFieldNameStaysAName(t *testing.T) {
 	}
 }
 
-// "This capture is incomplete" excuses the shapes THAT attempt produced.
-func TestATruncatedRetryDoesNotExcuseAnEarlierCompleteAttempt(t *testing.T) {
-	ledger := []string{"a response body in a shape this build cannot describe", "a Set-Cookie header with no name=value pair"}
-	per := []exchangeRefusals{
-		{truncated: false, added: []string{"a response body in a shape this build cannot describe"}},
-		{truncated: true, added: []string{"a Set-Cookie header with no name=value pair"}},
+// "This capture is incomplete" excuses what an incomplete BODY produces, from the
+// attempts that were incomplete -- and nothing else.
+func TestTruncationExcusesOnlyItsOwnBodyRefusals(t *testing.T) {
+	bodyShape := "a response body in a shape this build cannot describe"
+	coding := "a body in a content coding this build cannot decode"
+	cookie := "a Set-Cookie header with no name=value pair"
+	restore := structuralAt
+	t.Cleanup(func() { structuralAt = restore })
+
+	// A truncated attempt's OWN body refusal is excused.
+	structuralAt = map[string][]int{bodyShape: {0}}
+	if got := unexcusedRefusals([]string{bodyShape}, []exchangeRefusals{{truncated: true}}); len(got) != 0 {
+		t.Fatalf("a truncated attempt's own body refusal was not excused: %v", got)
 	}
-	got := unexcusedRefusals(ledger, per)
-	if len(got) != 1 || got[0] != "a response body in a shape this build cannot describe" {
-		t.Fatalf("a complete attempt's refusal was excused by a later truncated retry: %v", got)
+
+	// ⚠ A COMPLETE ATTEMPT RAISING THE SAME REASON KEEPS IT. The de-duplication
+	// used to be by reason alone, so the complete attempt never recorded its own
+	// entry and the sole one read as the truncated attempt's.
+	structuralAt = map[string][]int{bodyShape: {0, 1}}
+	if got := unexcusedRefusals([]string{bodyShape}, []exchangeRefusals{{truncated: false}, {truncated: true}}); len(got) != 1 {
+		t.Fatalf("a complete attempt's body refusal was excused by a truncated one: %v", got)
 	}
-	// AND A TRUNCATED ATTEMPT'S OWN REFUSAL IS STILL EXCUSED.
-	if len(unexcusedRefusals([]string{"a Set-Cookie header with no name=value pair"}, per[1:])) != 0 {
-		t.Fatal("the truncated attempt's own refusal was not excused")
+
+	// ⚠ AND A REASON THE TRUNCATION DOES NOT EXPLAIN IS NEVER EXCUSED. An
+	// undecodable coding on a truncated response still hides whatever arrived.
+	structuralAt = map[string][]int{coding: {0}, cookie: {0}}
+	got := unexcusedRefusals([]string{coding, cookie}, []exchangeRefusals{{truncated: true}})
+	if len(got) != 2 {
+		t.Fatalf("refusals unrelated to the truncation were excused by it: %v", got)
+	}
+}
+
+// Body redaction is linear in the number of values.
+//
+// ⚠ MEASURED, AND THE BOUND COMES FROM THE MEASUREMENT -- after the first bound
+// failed to. Splicing per span takes 2.04s on this input and the single pass takes
+// 0.01s, so a 2s bound sat ON the boundary and the mutant passed once and failed
+// once. 500ms is fifty times the linear form and four times under the quadratic
+// one; both numbers are here so the choice can be audited rather than trusted.
+func TestBodyRedactionIsLinear(t *testing.T) {
+	structuralSurfaces, accountedSurfaces = nil, nil
+	t.Cleanup(func() { structuralSurfaces, accountedSurfaces = nil, nil })
+	var b strings.Builder
+	b.WriteString(`{"variant_payload":[`)
+	for i := 0; i < 30000; i++ {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString(`"abcd"`)
+	}
+	b.WriteString("]}")
+	body := b.String()
+
+	start := time.Now()
+	got := redactUnaccountedJSONValues(body)
+	elapsed := time.Since(start)
+
+	if !strings.Contains(got, "redacted-4-chars") {
+		t.Fatalf("nothing was redacted, so the scene measured an empty walk: %.60q", got)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("redacting %d values took %v: that is the per-span rebuild", 30000, elapsed)
+	}
+}
+
+// The ledger records WHICH attempt raised each reason, so a later attempt is not
+// de-duplicated away by an earlier one.
+func TestTheLedgerRecordsTheAttemptThatRaisedAReason(t *testing.T) {
+	structuralSurfaces, structuralAt = nil, map[string][]int{}
+	saved := currentExchange
+	t.Cleanup(func() {
+		structuralSurfaces, structuralAt = nil, map[string][]int{}
+		currentExchange = saved
+	})
+	reason := "a response body in a shape this build cannot describe"
+	currentExchange = 0
+	noteStructural(formBody, reason)
+	currentExchange = 1
+	noteStructural(formBody, reason)
+	if len(structuralSurfaces) != 1 {
+		t.Fatalf("the reason was recorded twice in the ledger: %v", structuralSurfaces)
+	}
+	if len(structuralAt[reason]) != 2 {
+		t.Fatalf("the second attempt's instance was lost: %v", structuralAt[reason])
 	}
 }

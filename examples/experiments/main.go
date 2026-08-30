@@ -1024,29 +1024,71 @@ type exchangeRefusals struct {
 // encodes: "this capture is incomplete" excuses the shapes THAT attempt produced
 // and nothing else, so a later truncated retry cannot excuse a complete earlier
 // attempt's refusal (shardpilot/shardpilot-go#85 review).
+// truncationExcusable names the reasons an INCOMPLETE body itself produces.
+//
+// ⚠ NOT EVERY REASON A TRUNCATED ATTEMPT RAISES. The first version excused all of
+// them, so a truncated response declaring `Content-Encoding: br` had its
+// undecodable-coding refusal removed and the opaque partial bytes published --
+// a reader with a Brotli decoder recovers whatever arrived before the truncation
+// (shardpilot/shardpilot-go#85 review). The excuse is "this body did not arrive
+// whole", which explains a body that does not parse and explains nothing about
+// the coding it was sent in.
+var truncationExcusable = map[string]bool{
+	"a response body in a shape this build cannot describe":                          true,
+	"a member of a body that does not parse, in a shape this program has not judged": true,
+}
+
 func unexcusedRefusals(ledger []string, per []exchangeRefusals) []string {
-	excused := map[string]bool{}
-	for _, e := range per {
-		if !e.truncated {
-			continue
-		}
-		for _, w := range e.added {
-			excused[w] = true
+	truncated := map[int]bool{}
+	for i, e := range per {
+		if e.truncated {
+			truncated[i] = true
 		}
 	}
 	out := []string{}
 	for _, w := range ledger {
-		if !excused[w] {
+		if !truncationExcusable[w] {
+			out = append(out, w)
+			continue
+		}
+		// Excused only if EVERY attempt that raised it was incomplete. One complete
+		// attempt raising the same reason is enough to keep it.
+		raisers := structuralAt[w]
+		allTruncated := len(raisers) > 0
+		for _, r := range raisers {
+			if !truncated[r] {
+				allTruncated = false
+				break
+			}
+		}
+		if !allTruncated {
 			out = append(out, w)
 		}
 	}
 	return out
 }
 
+// currentExchange identifies the attempt being rendered, so a reason raised by one
+// attempt is not de-duplicated away by another's.
+//
+// ⚠ THE DE-DUPLICATION KEY WAS THE REASON ALONE, AND THAT LOSES THE ATTEMPT. A
+// truncated attempt raising a reason FIRST kept a later COMPLETE attempt from
+// recording its own, so the sole entry looked like the truncated one's and was
+// excused -- publishing the complete response's endpoint content
+// (shardpilot/shardpilot-go#85 review). I named this residual in the code when I
+// added the attribution and shipped it anyway; it is a defect, not a limit.
+var currentExchange = -1
+
+// structuralAt records which attempts raised each reason.
+var structuralAt = map[string][]int{}
+
 func noteStructural(form captureForm, what string) {
 	_ = form
 	if !slices.Contains(structuralSurfaces, what) {
 		structuralSurfaces = append(structuralSurfaces, what)
+	}
+	if !slices.Contains(structuralAt[what], currentExchange) {
+		structuralAt[what] = append(structuralAt[what], currentExchange)
 	}
 }
 
@@ -4167,6 +4209,7 @@ func main() {
 	// shapes THAT attempt produced and nothing else.
 	var perExchange []exchangeRefusals
 	for i, ex := range exchanges {
+		currentExchange = i
 		beforeRender := len(structuralSurfaces)
 		label := ""
 		if len(exchanges) > 1 {

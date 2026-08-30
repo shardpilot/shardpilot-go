@@ -437,3 +437,17 @@ func TestASuppliedValueDoesNotCorruptTheExemptAuthority(t *testing.T) {
 		t.Fatalf("an ordinary authority was replaced: %q", plain)
 	}
 }
+
+// Replacing the authority is not finishing the target.
+func TestTheTargetPipelineContinuesAfterTheAuthorityIsReplaced(t *testing.T) {
+	suppliedValues = []string{"example"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 302 Found\r\nLocation: https://e.example/cb?state=server-secret-token\r\n\r\n{\"assigned\":false}")))
+	if strings.Contains(got, "server-secret-token") {
+		t.Fatalf("the query was left unredacted after the authority was replaced: %q", got)
+	}
+	if strings.Contains(got, "example") {
+		t.Fatalf("the supplied value survived in the authority: %q", got)
+	}
+}
