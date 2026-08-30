@@ -284,6 +284,15 @@ func (e *exchange) trailerReport() string {
 				}
 			}
 			red, handled := structuralRedact(escapeMarks(k) + ": " + escapeMarks(v))
+			// ⚠ AND THE FINISHING PASSES, which the response-header path applies and this
+			// one did not: a `Location` arriving as a trailer was rendered
+			// `<redacted, 5 chars>://…` for a supplied `https`
+			// (shardpilot/shardpilot-go#85 review). A trailer is a header that arrived
+			// late — fifth time that sentence has had to be applied to something written
+			// on the header path alone.
+			if handled {
+				red = vouchTargetSyntax(vouchScheme(red))
+			}
 			if !handled {
 				red = redactUnlessVerbatim(red)
 			}

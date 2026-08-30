@@ -211,7 +211,11 @@ func redactPairs(rest, opaqueNameBytes string) string {
 		}
 		parts[k] = name + syntax("=") + tokenPlaceholder(queryDecoded(p[eq+1:]))
 	}
-	return strings.Join(parts, "&")
+	// The separator is syntax like the `=` above; the request dump is not scrubbed
+	// afterwards, so an unmarked `&` was reported by the guard as a surviving
+	// supplied value and every such run exited 4 (shardpilot/shardpilot-go#85
+	// review).
+	return strings.Join(parts, syntax("&"))
 }
 
 // redactFragment applies the query treatment to a URL fragment: parameter names
@@ -462,16 +466,51 @@ func vouchTargetSyntax(line string) string {
 	if !ok {
 		return line
 	}
+	// ⚠ NOT INSIDE A BRACKETED AUTHORITY. "Everything left is structure by
+	// construction" was my argument for this pass, and it is false of the one
+	// component whose body has its own grammar: `[v1.=]` is a valid IPvFuture
+	// authority whose `=` is DATA (shardpilot/shardpilot-go#85 review). A
+	// by-construction argument is only as good as the construction it names.
+	//
+	// ⚠ AND IT IS UNREACHABLE ON THIS GO VERSION, measured: `url.Parse` refuses
+	// `https://[v1.=]/cb` outright, so the target is withheld before this pass
+	// runs, and a mutant removing this guard survives the suite. It stays for the
+	// same reason as the bracket check and `isIPvFuture` beside it: the grammar is
+	// stated here rather than inherited from whatever net/url accepts today.
 	var b strings.Builder
+	inAuthority := false
+	// ⚠ TRACKED, NOT INFERRED FROM NEIGHBOURS. `redactPairs` marks the separators
+	// it emits -- the REQUEST dump is never post-processed -- and marking them
+	// again here produced adjacent NESTED marks, which read as captured text and
+	// the scrub replaced the byte anyway. My first repair asked whether the
+	// neighbours were marks, and a `?` sitting between two placeholders has marks
+	// on both sides while being outside either: adjacency is not containment.
+	inMark := false
 	for i := 0; i < len(url); i++ {
-		switch url[i] {
-		case '?', '&', '=', '/', '#':
+		switch {
+		case string(url[i]) == genMark:
+			inMark = !inMark
+			b.WriteByte(url[i])
+		case inMark:
+			b.WriteByte(url[i])
+		case url[i] == '[':
+			inAuthority = true
+			b.WriteByte(url[i])
+		case url[i] == ']':
+			inAuthority = false
+			b.WriteByte(url[i])
+		case !inAuthority && strings.IndexByte("?&=/#", url[i]) >= 0:
 			b.WriteString(syntax(string(url[i])))
 		default:
 			b.WriteByte(url[i])
 		}
 	}
-	return head + gap + b.String()
+	// ⚠ AND THE COLON. `splitField` returns it in NEITHER piece, so concatenating
+	// head and gap dropped it from EVERY Location line this pass touched --
+	// `Location /cb`, which is not an HTTP header at all
+	// (shardpilot/shardpilot-go#85 review). My scenes called `redactTarget`
+	// directly and never went through the header path, so nothing saw it.
+	return head + ":" + gap + b.String()
 }
 
 func redactTarget(line string) string {

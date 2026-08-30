@@ -2018,3 +2018,81 @@ func TestATransportErrorGoesThroughTheStructuralQuestion(t *testing.T) {
 		t.Fatalf("an ordinary transport error was made unpublishable: %q", structuralSurfaces)
 	}
 }
+
+// ---- round on 0d5d3c4 ----
+
+// TestALocationLineKeepsItsColon: `splitField` returns the colon in NEITHER piece,
+// so the finishing pass dropped it from every Location line it touched —
+// `Location /cb`, which is not an HTTP header at all
+// (shardpilot/shardpilot-go#85 review). My scenes called `redactTarget` directly
+// and never went through the header path, so nothing saw it.
+func TestALocationLineKeepsItsColon(t *testing.T) {
+	suppliedValues = nil
+	receivedConnection = true
+	t.Cleanup(func() { receivedConnection = false })
+	got := stripMarks(dropFraming("HTTP/1.1 200 OK\r\nLocation: /cb?x=y\r\n\r\n"))
+	if !strings.Contains(got, "Location: ") {
+		t.Fatalf("a Location line lost its colon: %q", got)
+	}
+}
+
+// TestAuthorityBodyIsNotSyntax: `[v1.=]` is a valid IPvFuture authority whose `=`
+// is DATA, and the finishing pass marked it — so a supplied `=` rode out past both
+// the scrub and the guard (shardpilot/shardpilot-go#85 review). "Everything left is
+// structure by construction" was my argument for that pass, and it is false of the
+// one component whose body has its own grammar.
+func TestAuthorityBodyIsNotSyntax(t *testing.T) {
+	suppliedValues = []string{"="}
+	receivedConnection = true
+	t.Cleanup(func() { suppliedValues = nil; receivedConnection = false })
+	// ⚠ MEASURED UNREACHABLE, AND SAID SO RATHER THAN ASSERTED AROUND. `url.Parse`
+	// refuses `https://[v1.=]/cb` on this Go version, so the target is withheld
+	// before the finishing pass runs — which is why this line asserts the WITHHOLDING
+	// and not the marking, and why a mutant removing the in-authority guard survives
+	// the suite. The guard stays as a statement of the grammar; the scene says what
+	// it can see.
+	got := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\nLocation: https://[v1.=]/cb\r\n\r\n")))
+	if strings.Contains(got, "[v1.=]") {
+		t.Fatalf("a malformed authority reached the capture: %q", got)
+	}
+	// ⚠ AND A REAL SEPARATOR OUTSIDE ONE IS STILL SYNTAX.
+	got = stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\nLocation: /a?x=1\r\n\r\n")))
+	if !strings.Contains(got, "?") || !strings.Contains(got, "=") {
+		t.Fatalf("a query separator outside an authority was scrubbed: %q", got)
+	}
+}
+
+// TestALocationTrailerGetsTheFinishingPasses: a `Location` arriving as a trailer
+// was rendered `<redacted, 5 chars>://…` for a supplied `https`, because the
+// trailer path never applied the passes the response-header path does
+// (shardpilot/shardpilot-go#85 review).
+func TestALocationTrailerGetsTheFinishingPasses(t *testing.T) {
+	suppliedValues = []string{"https"}
+	t.Cleanup(func() { suppliedValues = nil })
+	e := &exchange{captured: &teeBody{trailer: map[string][]string{
+		"Location": {"https://e.example/cb"},
+	}}}
+	got := stripMarks(e.trailerReport())
+	if !strings.Contains(got, "https://") {
+		t.Fatalf("an admitted scheme in a trailer was scrubbed: %q", got)
+	}
+}
+
+// TestTheRequestQuerySeparatorIsSyntax: the request dump is NOT passed through
+// `scrubSupplied` afterwards, so an unmarked `&` was reported by the guard as a
+// surviving supplied value and every such run exited 4
+// (shardpilot/shardpilot-go#85 review). The sweep probes the response Location and
+// could not see this: one function, two callers, and only one of them post-scrubs.
+func TestTheRequestQuerySeparatorIsSyntax(t *testing.T) {
+	suppliedValues = []string{"&"}
+	requestNames = map[string]bool{"a": true, "b": true}
+	t.Cleanup(func() { suppliedValues = nil; requestNames = map[string]bool{} })
+	req, _ := http.NewRequest("GET", "https://e.example/x?a=1&b=2", nil)
+	got := redact([]byte("GET /x?a=1&b=2 HTTP/1.1\r\nHost: e.example\r\n\r\n"),
+		requestOwnedHeaders(req))
+	if err := assertNoLeak(asCaptured(string(got))); err != nil {
+		t.Fatalf("the request query separator was reported as a leak: %v", err)
+	}
+}
