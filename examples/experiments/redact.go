@@ -536,6 +536,14 @@ func vouchTargetSyntax(line string) string {
 }
 
 func redactTarget(line string) string {
+	// ⚠ THE ACCOUNT IS ATTACHED TO THE ACT. A rewrite recorded by its CALLERS is
+	// recorded by however many of them remember to: `redactTarget` rewrote this on the
+	// header path and on the trailer path and neither noted it, so a field this
+	// program had redacted appeared in neither ledger -- the same gap #85 closed for
+	// the JSON body, in its second instance. "Nothing is printed that this program
+	// cannot account for" is a claim about what it DID, so the accounting lives
+	// where the doing is.
+	noteAccounted("a redirect target")
 	// ⚠ A TARGET THAT IS NOT A URI IS NOT PARSED, IT IS WITHHELD. A raw space is
 	// illegal in a request target but transport-valid in a header, and net/http
 	// keeps the whole opaque value -- so the redactors below treated everything
@@ -691,6 +699,14 @@ func redactPath(line string) string {
 }
 
 func redactSetCookie(line string) string {
+	// ⚠ THE ACCOUNT IS ATTACHED TO THE ACT. A rewrite recorded by its CALLERS is
+	// recorded by however many of them remember to: `redactSetCookie` rewrote this on the
+	// header path and on the trailer path and neither noted it, so a field this
+	// program had redacted appeared in neither ledger -- the same gap #85 closed for
+	// the JSON body, in its second instance. "Nothing is printed that this program
+	// cannot account for" is a claim about what it DID, so the accounting lives
+	// where the doing is.
+	noteAccounted("a Set-Cookie value")
 	cr := ""
 	body := line
 	if strings.HasSuffix(body, "\r") {
@@ -972,6 +988,20 @@ func structuralRedact(line string) (string, bool) {
 	case strings.HasPrefix(low, "location:"):
 		return redactTarget(line), true
 	}
+	// ⚠ AND EVERY OTHER FIELD WHOSE VALUE THE ENDPOINT MINTS. The two cases above
+	// are the ones this build can DESCRIBE -- it renders the cookie's shape and the
+	// target's syntax and accounts for them. Membership in `serverMintedFields` is a
+	// different question from having a rendering, and answering only the first two
+	// left a `WWW-Authenticate` arriving as a trailer published, because the trailer
+	// path asks its structural question here and nowhere else
+	// (shardpilot/shardpilot-go#84 review, ported across the stack seam). No
+	// rendering means no account, so it is withheld and the record is refused.
+	if name, ok := fieldNameOf(low); ok {
+		if note, minted := serverMintedFields[name]; minted {
+			noteStructural(note)
+			return canonicalFieldName(name) + ": " + marked("<withheld>"), true
+		}
+	}
 	return line, false
 }
 
@@ -1058,7 +1088,13 @@ func redactMintedBody(body string) string {
 	// but not an object", so `[{"subject_fact_key":…}]` was treated as
 	// unclassifiable although its structure proves the member is nested
 	// (shardpilot/shardpilot-go#84 review, ported across the stack seam).
-	if !jsonParses(body) && strings.Contains(body, "{") {
+	// ⚠ AND NO `{` PREREQUISITE. A CLOSE-DELIMITED body -- `"subject_fact_key":
+	// "sfk1_…"` with no object around it at all -- is malformed to the SDK and
+	// carries no brace, so the scan was skipped on exactly the shape it exists for
+	// (shardpilot/shardpilot-go#84 review, ported across the stack seam). The brace
+	// was a guess about how a malformed body LOOKS, standing in front of a rule
+	// about what one CONTAINS.
+	if !jsonParses(body) {
 		// ⚠ INDETERMINATE FOR EVERY MEMBER, NOT ONLY THE MINTED ONE. The round
 		// before, this branch covered minted names and left the unfamiliar-member
 		// guard above it silent: for `{"server_secret_identifier":"x` the parse

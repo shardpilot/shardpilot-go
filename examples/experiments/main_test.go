@@ -2298,3 +2298,137 @@ func TestAnEmptyPortOnABracketedAuthorityIsAccepted(t *testing.T) {
 		t.Fatal("the registered-name form stopped being accepted")
 	}
 }
+
+// ⚠ THE POPULATION IS THE MAP, NOT A LIST I RECALLED. Three review rounds asked
+// the same question -- which fields carry a value the ENDPOINT mints -- and each
+// answered it on one path with a name added by hand, so the header block and the
+// trailer report disagreed about `WWW-Authenticate`
+// (shardpilot/shardpilot-go#84 review). This draws its rows from
+// `serverMintedFields` itself, so a name added there is measured on BOTH paths
+// without anyone remembering to come back here.
+func TestEveryServerMintedFieldIsRefusedOnBothPaths(t *testing.T) {
+	if len(serverMintedFields) == 0 {
+		t.Fatal("the registry this sweep derives its population from is empty")
+	}
+	// ⚠ EITHER LEDGER COUNTS, AND THAT IS NOT A WEAKENING. Two of these fields
+	// have a rendering this build can describe -- the cookie's shape, the target's
+	// syntax -- so they are REWRITTEN and accounted for rather than refused; the
+	// rest have none and are refused. The property both answers share, and the one
+	// this sweep is about, is that the path RECOGNISED the field and did not print
+	// the endpoint's value.
+	for name := range serverMintedFields {
+		t.Run("header/"+name, func(t *testing.T) {
+			structuralSurfaces, accountedSurfaces = nil, nil
+			t.Cleanup(func() { structuralSurfaces, accountedSurfaces = nil, nil })
+			got := dropFraming("HTTP/1.1 401 Unauthorized\r\n" +
+				canonicalFieldName(name) + ": Digest nonce=\"server-secret\"\r\n\r\n")
+			if len(structuralSurfaces)+len(accountedSurfaces) == 0 {
+				t.Fatalf("a server-minted field passed unrecognised as a header: %q", got)
+			}
+			if strings.Contains(got, "server-secret") {
+				t.Fatalf("the endpoint-minted value was printed: %q", got)
+			}
+		})
+		t.Run("transport-error/"+name, func(t *testing.T) {
+			structuralSurfaces = nil
+			t.Cleanup(func() { structuralSurfaces = nil })
+			noteStructuralInText("malformed HTTP response from \"e.example\": " +
+				canonicalFieldName(name) + ": Digest nonce=\"server-secret\"")
+			if len(structuralSurfaces) == 0 {
+				t.Fatal("a server-minted field stayed publishable inside a transport error")
+			}
+		})
+		t.Run("trailer/"+name, func(t *testing.T) {
+			structuralSurfaces, accountedSurfaces = nil, nil
+			t.Cleanup(func() { structuralSurfaces, accountedSurfaces = nil, nil })
+			tee := &teeBody{trailer: http.Header{
+				canonicalFieldName(name): []string{`Digest nonce="server-secret"`},
+			}}
+			got := (&exchange{head: []byte("x"), captured: tee}).trailerReport()
+			if len(structuralSurfaces)+len(accountedSurfaces) == 0 {
+				t.Fatalf("a server-minted field passed unrecognised as a trailer: %q", got)
+			}
+			if strings.Contains(got, "server-secret") {
+				t.Fatalf("the endpoint-minted value was printed: %q", got)
+			}
+		})
+	}
+}
+
+// A refusal must not print the thing it refuses: the trailer note composed its
+// text out of the field's ARRIVED spelling.
+func TestAStructuralNoteDoesNotCarryTheArrivedSpelling(t *testing.T) {
+	structuralSurfaces = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	tee := &teeBody{trailer: http.Header{"WWW-AuThEnTiCaTe": []string{"Digest x"}}}
+	(&exchange{head: []byte("x"), captured: tee}).trailerReport()
+	for _, s := range structuralSurfaces {
+		if strings.Contains(s, "AuThEnTiCaTe") {
+			t.Fatalf("the refusal carried the endpoint's spelling: %q", s)
+		}
+	}
+}
+
+// A close-delimited body carries no brace and does not parse; the minted-field
+// scan exists for exactly that shape and was skipped on it.
+func TestAMintedFieldIsFoundInABodyWithNoBrace(t *testing.T) {
+	// ⚠ THE CALL SITE MOVED ACROSS THE STACK SEAM. The guard half's `noteMinted`
+	// is gone in this branch; the same scan lives in `redactMintedBody`, and the
+	// brace prerequisite had been carried over with it.
+	structuralSurfaces, accountedSurfaces = nil, nil
+	t.Cleanup(func() { structuralSurfaces, accountedSurfaces = nil, nil })
+	got := redactMintedBody(`"subject_fact_key":"sfk1_server_secret"`)
+	if len(structuralSurfaces)+len(accountedSurfaces) == 0 {
+		t.Fatal("a minted field in a brace-less malformed body passed unrecognised")
+	}
+	if strings.Contains(got, "sfk1_server_secret") {
+		t.Fatalf("the minted value was printed: %q", got)
+	}
+}
+
+// A decoded suffix must be reachable as its own candidate: spliced back behind
+// its separator, the short-value matcher reads it as embedded.
+func TestADecodedBase64SuffixIsItsOwnCandidate(t *testing.T) {
+	suppliedValues = []string{"bar"}
+	t.Cleanup(func() { suppliedValues = nil })
+	for _, sep := range []string{"-", "_"} {
+		if err := assertNoLeak(asCaptured("x" + sep + "YmFy")); err == nil {
+			t.Fatalf("a value reconstructable from a %q-separated suffix passed the guard", sep)
+		}
+	}
+}
+
+// The suffix probes are the quadratic term, and the budget did not count them.
+//
+// ⚠ MEASURED ON THE PROBES, NOT ON THE VERDICT. The first version of this scene
+// fed a 20,000-byte run of separators to `assertNoLeak` and asserted a work-budget
+// refusal -- which arrives either way, in 0.08s, because the candidates those
+// probes produce blow the budget in the seed loop regardless of whether the
+// probing itself was ever charged. It survived both mutants. What the fix changes
+// is how much work happens BEFORE anything is counted, so that is what this reads.
+func TestSeparatorProbesStopAtTheBudget(t *testing.T) {
+	decodeWork = 0
+	t.Cleanup(func() { decodeWork = 0 })
+	const n = 20000
+	tok := strings.Repeat("/", n)
+	starts := separatorStarts(tok, 4)
+	if len(starts) >= n-8 {
+		t.Fatalf("every tail was named: %d probes over a %d-byte run, which is the quadratic scan", len(starts), n)
+	}
+	if decodeWork <= decodeWorkMax {
+		t.Fatalf("the probes stopped for some reason other than the budget: %d bytes charged", decodeWork)
+	}
+}
+
+// The decode budget is per record: an expensive one must not spend the next
+// one's allowance.
+func TestTheProbeBudgetDoesNotCarryBetweenRecords(t *testing.T) {
+	suppliedValues = []string{"bar"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured(strings.Repeat("/", 20000))); err == nil {
+		t.Fatal("the expensive record this scene needs was not refused, so it measures nothing")
+	}
+	if err := assertNoLeak(asCaptured("HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false}")); err != nil {
+		t.Fatalf("an ordinary record was refused on the previous record's budget: %v", err)
+	}
+}

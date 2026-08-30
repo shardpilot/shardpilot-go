@@ -1,6 +1,8 @@
 package main
 
 import (
+	"maps"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -37,9 +39,18 @@ func TestEveryVouchedTokenSurvivesTheScrub(t *testing.T) {
 	pv := func(what, line, tok string) probe { return probe{what, line, tok, tok} }
 	var probes []probe
 
-	for name := range registeredFieldNames {
+	// ⚠ ALL OF THEM, IN A FIXED ORDER, AND NOT ONE ARBITRARY ELEMENT. This drew a
+	// single name and `break`, so WHICH name it measured depended on Go's map
+	// iteration order -- a population of one, chosen freshly each run. It went
+	// unnoticed until the order handed it `proxy-authenticate`, a registered name
+	// this program also WITHHOLDS, and the row failed on a run that differed from
+	// the last only by chance (shardpilot/shardpilot-go#84/#85, stack seam).
+	//
+	// A withheld field keeps its NAME -- that is the vouching this row is about --
+	// but rendered in THIS program's spelling rather than the arrived one, so the
+	// name rows compare case-insensitively. The value rows do not.
+	for _, name := range slices.Sorted(maps.Keys(registeredFieldNames)) {
 		probes = append(probes, pv("registered field name", "HTTP/1.1 200 OK\r\n"+name+": 1\r\n\r\n", name))
-		break
 	}
 	for _, a := range []string{"Secure", "Path", "Max-Age", "SameSite", "HttpOnly"} {
 		if !standardCookieAttr(a) {
@@ -125,7 +136,11 @@ func TestEveryVouchedTokenSurvivesTheScrub(t *testing.T) {
 			})
 			red := scrubSupplied(dropFraming(p.line))
 			got := stripMarks(red)
-			if !strings.Contains(got, p.want) {
+			hay, needle := got, p.want
+			if p.what == "registered field name" {
+				hay, needle = strings.ToLower(got), strings.ToLower(p.want)
+			}
+			if !strings.Contains(hay, needle) {
 				t.Fatalf("a token this program vouched for was rewritten: %q became %q", p.want, got)
 			}
 			// ⚠ AND THE GUARD MUST AGREE. Surviving the scrub is half the property:
