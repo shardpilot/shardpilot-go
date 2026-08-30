@@ -585,7 +585,12 @@ func base64SuffixCandidates(text string) []string {
 		if len(tok) < minToken {
 			continue
 		}
-		for _, st := range separatorStarts(tok, minToken) {
+		// ⚠ AND THE SHORT SUFFIXES. The suffix scan required four bytes and the short
+		// scan required a whole token, so `prefix/YQ` -- a one-character key after path
+		// punctuation -- fell between two fixes that each covered half of it
+		// (shardpilot/shardpilot-go#84 review). The combination of two rules is a third
+		// rule, and neither of them stated it.
+		for _, st := range separatorStarts(tok, 2) {
 			if dec, ok := decodeBase64(tok[st:]); ok {
 				out = append(out, dec)
 			}
@@ -1791,7 +1796,16 @@ func markBareJSONLiterals(text string) string {
 	//
 	// Depth and turn are tracked because `Token()` returns a string for a key and
 	// for a value alike: only position tells them apart.
-	var objDepth []bool // true while the next string in this object is a KEY
+	// 0 = array, 1 = object expecting a KEY, 2 = object expecting a VALUE.
+	//
+	// ⚠ TWO DEFECTS CAME OUT OF THE `[]bool` THIS REPLACES, both mine from the round
+	// before. A bare "expecting a key" flag cannot say "this is an array", so the
+	// toggle ran on array elements too; and closing a container popped the child
+	// without advancing the PARENT's turn, so the member after a `{}` value was not
+	// seen as a key -- `{"variant_payload":{},"version":1}` left `version`
+	// unrecognised, and a supplied `version` rewrote a fixed schema member
+	// (shardpilot/shardpilot-go#84 review).
+	var objDepth []int8
 	for {
 		tok, err := dec.Token()
 		if err != nil {
@@ -1800,12 +1814,20 @@ func markBareJSONLiterals(text string) string {
 			}
 			return text // malformed: no grammar to protect
 		}
+		advance := func() {
+			// A container or a scalar in VALUE position consumes the parent's turn.
+			if n := len(objDepth); n > 0 && objDepth[n-1] == 2 {
+				objDepth[n-1] = 1
+			}
+		}
 		if d, ok := tok.(json.Delim); ok {
 			switch d {
 			case '{':
-				objDepth = append(objDepth, true)
+				advance()
+				objDepth = append(objDepth, 1)
 			case '[':
-				objDepth = append(objDepth, false)
+				advance()
+				objDepth = append(objDepth, 0)
 			case '}', ']':
 				if len(objDepth) > 0 {
 					objDepth = objDepth[:len(objDepth)-1]
@@ -1813,13 +1835,20 @@ func markBareJSONLiterals(text string) string {
 			}
 			continue
 		}
-		isKey := len(objDepth) > 0 && objDepth[len(objDepth)-1]
-		if isKey {
-			objDepth[len(objDepth)-1] = false
-		} else if len(objDepth) > 0 {
-			objDepth[len(objDepth)-1] = true
+		isKey, atRoot := false, false
+		if n := len(objDepth); n > 0 && objDepth[n-1] == 1 {
+			isKey, atRoot = true, n == 1
+			objDepth[n-1] = 2
+		} else {
+			advance()
 		}
-		if name, ok := tok.(string); ok && isKey {
+		// ⚠ AT THE ROOT ONLY. `benignTopLevel` describes the SDK's TOP-LEVEL schema,
+		// and marking those names at every depth exempted an endpoint-controlled
+		// nested member of the same name -- `variant_payload` may carry
+		// `{"assigned":"x"}`, whose `assigned` the endpoint chose
+		// (shardpilot/shardpilot-go#84 review). A registry's scope is part of what it
+		// says.
+		if name, ok := tok.(string); ok && isKey && atRoot {
 			if benignTopLevel[name] || mintedNames[name] {
 				end := start + int(dec.InputOffset())
 				quoted := `"` + name + `"`
@@ -2658,7 +2687,12 @@ func wrappedBase64Candidates(text string) []string {
 			// exists for the runs that share a line with something else.
 			continue
 		}
-		joined := head
+		// ⚠ A BUILDER, NOT `+=`. Each `+=` copies the whole prefix accumulated so far,
+		// so assembling a candidate over many short base64 lines is quadratic -- and it
+		// happens BEFORE the decode budget charges anything, which is the same gap the
+		// suffix probes had (shardpilot/shardpilot-go#84 review).
+		var jb strings.Builder
+		jb.WriteString(head)
 		for j := i + 1; j < len(lines); j++ {
 			// ⚠ A BLANK LINE IS WHITESPACE, NOT A BOUNDARY -- the same sentence this
 			// file has now had to apply three times: to horizontal space inside a
@@ -2667,15 +2701,25 @@ func wrappedBase64Candidates(text string) []string {
 			// every CR and LF, so `prefix: YWJj\r\n\r\nZGVmZ2g=` reconstructs the
 			// identifier in one step (shardpilot/shardpilot-go#84 review). Each time
 			// the producer was new and the rule was not.
-			if lines[j] == "" {
+			if strings.TrimLeft(lines[j], " \t") == "" {
+				// ⚠ HORIZONTAL-WHITESPACE-ONLY COUNTS AS BLANK HERE TOO. `joinBase64Runs`
+				// normalises spaces and tabs before judging a line; this producer
+				// recognised only the empty string, so a run crossing ` \t` terminated
+				// early (shardpilot/shardpilot-go#84 review). Fourth time this file has
+				// been told MIME ignores whitespace a line-based reading treats as
+				// structure, and the third producer told separately.
 				continue
 			}
 			if allBase64(lines[j]) {
-				joined += lines[j]
+				decodeWork += len(lines[j])
+				if decodeWork > decodeWorkMax {
+					break
+				}
+				jb.WriteString(lines[j])
 				continue
 			}
 			if p := prefix(lines[j]); p != "" {
-				out = append(out, joined+p)
+				out = append(out, jb.String()+p)
 			}
 			break
 		}

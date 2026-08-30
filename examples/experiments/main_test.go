@@ -2064,3 +2064,82 @@ func TestTheClaimNamesExactlyTheDecodersThatRun(t *testing.T) {
 		t.Fatal("the claim names no decoder, so this scene cannot discriminate")
 	}
 }
+
+// A registry's SCOPE is part of what it says: `benignTopLevel` describes the
+// top-level schema, and a nested member of the same name is the endpoint's.
+func TestASchemaNameIsGrammarOnlyAtTheRoot(t *testing.T) {
+	suppliedValues = []string{"assigned"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\n\r\n{\"assigned\":true,\"variant_payload\":{\"assigned\":\"x\"}}")))
+	if strings.Count(got, "assigned") != 1 {
+		t.Fatalf("the nested endpoint-controlled name was exempted too: %q", got)
+	}
+}
+
+// A container VALUE consumes its parent's turn; the member after it is a key.
+func TestTheMemberAfterAContainerValueIsStillAKey(t *testing.T) {
+	suppliedValues = []string{"version"}
+	t.Cleanup(func() { suppliedValues = nil })
+	got := stripMarks(scrubSupplied(dropFraming(
+		"HTTP/1.1 200 OK\r\n\r\n{\"variant_payload\":{},\"version\":1}")))
+	if !strings.Contains(got, `"version"`) {
+		t.Fatalf("a fixed schema member after a container value was rewritten: %q", got)
+	}
+}
+
+// Two rules that each cover half of a case do not cover the case.
+func TestAShortBase64SuffixAfterASeparatorIsDecoded(t *testing.T) {
+	suppliedValues = []string{"a"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured("prefix/YQ")); err == nil {
+		t.Fatal("a one-character value after path punctuation passed the guard")
+	}
+}
+
+// MIME ignores the whitespace a line-based reading treats as structure.
+func TestAWrappedRunSurvivesAHorizontalWhitespaceLine(t *testing.T) {
+	suppliedValues = []string{"abcdefgh"}
+	t.Cleanup(func() { suppliedValues = nil })
+	if err := assertNoLeak(asCaptured("prefix: YWJj\r\n \t\r\nZGVmZ2g=")); err == nil {
+		t.Fatal("a value reconstructable across a whitespace-only line passed the guard")
+	}
+}
+
+// Candidate assembly is LINEAR, which is a claim about cost and therefore about
+// time.
+//
+// ⚠ THE FIRST VERSION OF THIS SCENE ASSERTED THE BUDGET FIRED, and it does not
+// have to: once the assembly uses a builder the work IS linear -- 160 KB for this
+// input -- so the ceiling is never reached and the scene failed on the fixed code.
+// The subject is the quadratic, and the only honest instrument for "not
+// quadratic" here is elapsed time. The bound is set FROM A MEASUREMENT of both
+// forms rather than guessed: on this input the builder takes 0.00s and the `+=`
+// form takes 1.55s, so the first bound I wrote -- two seconds -- did not separate
+// them and the mutant passed. 500ms sits three times above the linear form and
+// three times below the quadratic one.
+func TestWrappedCandidateAssemblyIsLinear(t *testing.T) {
+	decodeWork = 0
+	t.Cleanup(func() { decodeWork = 0 })
+	var b strings.Builder
+	b.WriteString("prefix: YWJj\r\n")
+	for i := 0; i < 40000; i++ {
+		b.WriteString("YWJj\r\n")
+	}
+	b.WriteString("x ZGVmZ2g=")
+	in := b.String()
+
+	start := time.Now()
+	got := wrappedBase64Candidates(in)
+	elapsed := time.Since(start)
+
+	if len(got) == 0 {
+		t.Fatal("no candidate was assembled, so the scene measured an empty loop")
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("assembling one candidate over %d lines took %v: that is the quadratic copy", 40000, elapsed)
+	}
+	if decodeWork == 0 {
+		t.Fatal("the assembly charged nothing to the decode budget")
+	}
+}
