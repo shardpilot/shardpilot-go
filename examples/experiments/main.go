@@ -523,6 +523,46 @@ var mintedNames = map[string]bool{
 	"assignment_key": true,
 }
 
+// ⚠ THE MARKER IS SPACE-FREE. `<query withheld>` carries a space, and after the
+// provenance marks are stripped that space becomes an extra component of the
+// request line -- so every published request block was rejected by a strict
+// parser while the report called it a canonical HTTP/1.1 representation
+// (shardpilot/shardpilot-go#84 review). A request target is one token.
+//
+// dropQuery removes a URL's query and fragment entirely, keeping the path. This
+// half cannot say how long each value was without the structural redactor, and a
+// length it cannot compute is not a length it may guess.
+func dropQuery(line string) string {
+	cut := len(line)
+	for _, c := range []byte{'?', '#'} {
+		if i := strings.IndexByte(line, c); i >= 0 && i < cut {
+			cut = i
+		}
+	}
+	if cut == len(line) {
+		return line
+	}
+	// ⚠ ONLY THE REQUEST-TARGET, NOT THE REST OF THE LINE. A request line is
+	// space-delimited -- `GET /p?x=y HTTP/1.1\r` -- and every assignment URL this
+	// program builds carries a query, so cutting from `?` to end of string
+	// removed the HTTP version and the terminator from EVERY published request
+	// block, while the report went on calling it a canonical HTTP/1.1
+	// representation (shardpilot/shardpilot-go#84 review). A bare URL has no
+	// space and keeps the old behaviour.
+	tail := ""
+	if j := strings.IndexByte(line[cut:], ' '); j >= 0 {
+		tail = line[cut+j:]
+	}
+	// ⚠ THE SEPARATOR IS SYNTAX AND MUST SURVIVE. Concatenating the marker onto
+	// the path published `/api/…/assignmentquery-withheld` -- a route the SDK never
+	// requested, on EVERY successful report, since every assignment request carries
+	// a query (shardpilot/shardpilot-go#84 review). The primary evidence of this
+	// artifact is which route was called, and the redaction was rewriting it.
+	return line[:cut] + string(line[cut]) + marked("query-withheld") + tail
+}
+
+// noteMinted records a server-minted field's presence and returns the body
+// unchanged -- the caller does not publish a body this reports on.
 // jsonString decodes a JSON string literal, so a member is matched by what it
 // DENOTES rather than by one spelling of it.
 // ⚠ MEMBER NAMES ARE DECODED, NOT MATCHED LITERALLY. `"subject_\u0066act_key"`
@@ -2098,7 +2138,14 @@ func assertNoLeak(text string) error {
 			// input to the chain, not an answer from it -- which this file already
 			// said about the base64 decode, and then did not do for the binary one
 			// standing beside it. Same budget, so a crafted body cannot spin it.
+			// ⚠ AND THE NAME FORMS. These looked only at the captured TEXT, so a field
+			// name whose component decodes to invalid UTF-8 -- `X-_2Jhcg`, where
+			// `_2Jhcg` is url-base64 for `0xffbar` -- was examined as one unsplit token
+			// and no candidate ever held `bar` (shardpilot/shardpilot-go#84 review). The
+			// names decode in lockstep with the text everywhere else; the binary path was
+			// added later and inherited none of that.
 			bins := append(binaryCandidates(cur), binaryCandidates(norm)...)
+			bins = append(bins, binaryCandidates(curNames)...)
 			extra = append(extra, bins...)
 			for _, seed := range append([]string{dec}, bins...) {
 				d := seed
