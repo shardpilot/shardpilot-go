@@ -504,14 +504,58 @@ func headerNameEnd(line string) (int, bool) {
 // The failure direction of a MISSING entry is safe: an unrecognised value is
 // scrubbed, which costs a label rather than publishing endpoint text. That is why
 // this list may be a list, unlike the ones whose gaps publish.
+//
+// ⚠ AND PART OF THE TAXONOMY IS GENERATED, WHICH NO LIST CAN HOLD. The SDK builds
+// `"http_" + strconv.Itoa(status)` and `"transient_" + strconv.Itoa(status)`, so
+// the families are unbounded and the four entries here covered none of them --
+// every `http_503` verdict lost its classification to a placeholder
+// (shardpilot/shardpilot-go#84 review). The fixed codes below are read off the
+// SDK's own enumeration; `isSDKTaxonomy` covers the generated ones.
+//
+// The failure direction of a MISSING entry is safe: an unrecognised value is
+// scrubbed, which costs a label rather than publishing endpoint text. That is why
+// this may be a list at all -- but a label lost on every transient failure is a
+// cost paid on ordinary captures, not on strange ones.
 var sdkTaxonomy = set(
 	"kill_switch",
 	"targeting_unmatched",
 	"not_found",
-	// Named as a Code in the same doc comment as `not_found`, found by grepping
-	// the SDK source rather than by remembering the taxonomy.
+	// The rest are read off the doc comment that enumerates the taxonomy in the
+	// SDK source, not remembered; `TestTheTaxonomyCoversTheSDKsOwnEnumeration`
+	// parses that comment and compares.
 	"superseded",
+	"unauthorized",
+	"bad_request",
+	"malformed_response",
+	"stale_subject",
+	"experiment_key_required",
+	"subject_unavailable",
 )
+
+// isSDKTaxonomy answers whether a string is one this SDK writes as a
+// classification.
+//
+// ⚠ BY EQUALITY WITH THE CANONICAL SPELLING, INCLUDING FOR THE GENERATED FAMILIES.
+// A prefix test would admit `http_007` and `http_+7`, which this SDK never writes
+// and an endpoint may well echo -- so the suffix is parsed and RE-RENDERED, and
+// only an exact match vouches. Recognising a token is not having written it; the
+// canonical spelling is what this program would have produced.
+func isSDKTaxonomy(s string) bool {
+	if sdkTaxonomy[s] {
+		return true
+	}
+	for _, prefix := range []string{"http_", "transient_"} {
+		rest, ok := strings.CutPrefix(s, prefix)
+		if !ok {
+			continue
+		}
+		n, err := strconv.Atoi(rest)
+		if err == nil && n >= 0 && prefix+strconv.Itoa(n) == s {
+			return true
+		}
+	}
+	return false
+}
 
 // vouchTaxonomyIn marks this SDK's own classification wherever it appears inside
 // a rendered error.
@@ -527,12 +571,29 @@ func vouchTaxonomyIn(text string) string {
 	for t := range sdkTaxonomy {
 		text = replaceTokenWith(text, t, marked(t), isWordByte)
 	}
+	// ⚠ AND THE GENERATED FAMILIES, WHICH THERE IS NO SET TO RANGE OVER. The
+	// pattern says only WHERE TO LOOK; `isSDKTaxonomy` says whether this program
+	// would have written what was found. That split is the point: `http_007` is
+	// located by the pattern and refused by the equality, so a shape an endpoint
+	// echoes is not vouched merely for looking like one this SDK writes.
+	seen := map[string]bool{}
+	for _, m := range generatedTaxonomyShape.FindAllString(text, -1) {
+		if seen[m] || !isSDKTaxonomy(m) {
+			continue
+		}
+		seen[m] = true
+		text = replaceTokenWith(text, m, marked(m), isWordByte)
+	}
 	return text
 }
 
+// The shape is deliberately wider than the canonical spelling, so a near-miss is
+// FOUND and then refused rather than never looked at.
+var generatedTaxonomyShape = regexp.MustCompile(`(?:http|transient)_[0-9A-Za-z+-]+`)
+
 // vouchTaxonomy marks a verdict field this SDK generated.
 func vouchTaxonomy(v string) string {
-	if sdkTaxonomy[v] {
+	if isSDKTaxonomy(v) {
 		return marked(v)
 	}
 	return v
@@ -607,19 +668,39 @@ const respSection = "## Response%s — header block re-serialised by " +
 // producing two registries that answer one question and drift -- which is what
 // this file records happening to `isMinted` three rounds running
 // (shardpilot/shardpilot-go#84 review, resolved at the seam).
+//
+// ⚠ AND IT IS THE WIRE STRUCT'S MEMBERS, NOT NAMES FROM THE SAME VOCABULARY.
+// `attributes` and `assignment_unit` were in here and are not top-level members
+// of `expAssignmentWire` at all -- `assignment_unit` lives inside `boundary` --
+// so a legal supplied value of `attributes` was marked as generated grammar in a
+// 200 response and published (shardpilot/shardpilot-go#84 review). Belonging to
+// the same protocol is not being a member of this object, and `assignment_key`
+// was missing for the same reason the other two were present: the list was
+// recalled rather than read off the struct.
+//
+// ⚠ AND THE CLAIM THAT SAT HERE -- "deriving this from the wire contract is not
+// reachable, the struct is unexported and in another package" -- WAS WRONG. The
+// struct cannot be reached at RUN time; it can be read at TEST time.
+// `TestTheTopLevelExemptionsAreExactlyTheWireMembers` parses it out of the SDK
+// source and compares both containments, so the registry stays a literal and
+// stops being an unchecked one. An unreachable-by-one-route conclusion stated as
+// unreachable is how a list keeps its exemption from being derived.
 var benignTopLevel = map[string]bool{
 	"assigned": true, "variant_key": true, "variant_payload": true,
-	"version": true, "reason": true, "boundary": true, "code": true,
-	"assignment_unit": true, "attributes": true, "experiment_key": true,
-	// ⚠ AND THE ONES THE SDK ITSELF ACCEPTS. A `401` body is
-	// `{"error":"unauthorized"}` and an echoed assignment carries `app_key` and
-	// `environment_key`; omitting them refused documented, ordinary responses
-	// (shardpilot/shardpilot-go#85 review). The reviewer's better suggestion --
-	// derive this from the wire contract -- is not reachable from here: that
-	// struct is unexported and in another package, and the public result type
-	// does not carry these members. So the list stays a list, and its failure
-	// side stays "refuse loudly" rather than "publish quietly".
-	"error": true, "app_key": true, "environment_key": true,
+	"version": true, "reason": true, "boundary": true,
+	"experiment_key": true,
+	// ⚠ AND `assignment_key` IS NOT EXEMPT HERE, THOUGH IT IS A WIRE MEMBER. This
+	// branch treats it as a server-MINTED identifier and withholds it, so listing
+	// it as benign grammar makes two rules disagree about one name -- the vouched-
+	// token sweep says so directly. The parent branch has no minted registry and
+	// needs it here; the derived scene asks for `benignTopLevel OR mintedNames`,
+	// which is satisfied on both sides of the seam without either lying
+	// (shardpilot/shardpilot-go#84 review, resolved at the seam).
+	// AND THE ONES THE SDK ITSELF ACCEPTS: a `401` body is
+	// `{"error":"unauthorized"}` and a failure verdict carries `code`. These two
+	// belong to a DIFFERENT wire shape than the assignment, which is why the
+	// scene names them explicitly rather than deriving them.
+	"error": true, "code": true, "app_key": true, "environment_key": true,
 }
 
 // receivedConnection records whether the ENDPOINT sent a `Connection` field, as
@@ -1324,7 +1405,14 @@ func dropFraming(dump string) string {
 	hasBody := false
 	for _, sep := range []string{"\r\n\r\n", "\n\n"} {
 		if k := strings.Index(dump, sep); k >= 0 {
-			hasBody = strings.TrimSpace(dump[k+len(sep):]) != ""
+			// ⚠ BYTES, NOT CONTENT. `TrimSpace` answers "is there anything worth
+			// reading", and the question here is "is there anything ENCODED": a body
+			// of ` \t` under an unsupported coding is two opaque bytes a decoder for
+			// that coding may turn into something, and they were published because the
+			// trimmed body looked empty (shardpilot/shardpilot-go#84 review). The round
+			// before wrote this to spare a 204 its diagnostic, and a 204 has no bytes
+			// at all, so length answers that question too.
+			hasBody = len(dump[k+len(sep):]) > 0
 			break
 		}
 	}
@@ -2034,7 +2122,7 @@ func noteStructuralInText(text string) {
 			// review). A candidate the predicate would accept but the splitter cannot
 			// produce is a predicate that is never asked.
 			for _, tok := range strings.FieldsFunc(form, func(r rune) bool {
-				return !(r == '_' || r == '-' || unicode.IsLetter(r) || unicode.IsDigit(r))
+				return !(r == '_' || r == '-' || isWordRune(r))
 			}) {
 				if isMintedName(tok) {
 					noteStructural(formDiagnostic, "a server-minted field inside a transport error")
@@ -2936,11 +3024,32 @@ func assertNoLeak(text string) error {
 	// explanation` is prose, and reading it as a field name refused a completely
 	// safe capture (same review).
 	var captured, names strings.Builder
-	for _, span := range capturedSpan.FindAllString(text, -1) {
-		span = genSpan.ReplaceAllString(span, " ")
+	for _, rawSpan := range capturedSpan.FindAllString(text, -1) {
+		span := genSpan.ReplaceAllString(rawSpan, " ")
+		// ⚠ A SPACE IS NOT A TOKEN BYTE, AND A FIELD NAME IS A TOKEN. Blanking a
+		// generated span keeps generated text from being read as endpoint text, which
+		// is right for the VALUE side -- and it makes the NAME syntactically invalid,
+		// so `headerNameEnd` fails and the name-specific decoded boundary check never
+		// runs. With `bar` and `qux` supplied, `X-bar-%71ux: v` was published as
+		// `X-redacted-3-chars-%71ux`, the generic value rule read the surrounding
+		// hyphen as a word byte, and the guard approved a name the supported percent
+		// decoder turns back into `qux` (shardpilot/shardpilot-go#84 review).
+		//
+		// The name view REMOVES the generated span instead of blanking it: `X-` and
+		// `-%71ux` rejoin as `X--%71ux`, which is a token, so the name parses and its
+		// components are decoded. Keeping the placeholder text instead was tried and
+		// is wrong in the other direction -- a fully generated name such as a scrubbed
+		// `Host` then entered the collected names and the guard refused a capture with
+		// `Host` supplied, which `TestProtocolTokensDoNotRefuseTheCapture` says
+		// directly. Removal keeps the syntax and contributes no generated text.
+		//
+		// The value side is untouched: blanking there is what stops two unrelated
+		// fragments reading as one token.
+		spanLines := strings.Split(span, "\n")
+		nameLines := strings.Split(stripMarks(genSpan.ReplaceAllString(rawSpan, "")), "\n")
 		inHead := true
 		first := true
-		for _, ln := range strings.Split(span, "\n") {
+		for lineNo, ln := range spanLines {
 			bare := strings.TrimSuffix(strings.TrimSpace(stripMarks(ln)), "\r")
 			if inHead && bare == "" {
 				inHead = false
@@ -2978,7 +3087,13 @@ func assertNoLeak(text string) error {
 			captured.WriteString(ln)
 			captured.WriteString("\n")
 			if inHead {
-				if i, ok := headerNameEnd(bare); ok {
+				// A generated span may in principle carry a newline, which would put the
+				// two views out of step; the parallel line is used only when they agree.
+				nameSrc := bare
+				if len(nameLines) == len(spanLines) {
+					nameSrc = strings.TrimSuffix(strings.TrimSpace(nameLines[lineNo]), "\r")
+				}
+				if i, ok := headerNameEnd(nameSrc); ok {
 					// One splitter for both sites: the extraction and every decode stage ask
 					// the same question, and two copies of it drifted apart once already.
 					// ⚠ REDUNDANT HERE, AND A MUTANT SURVIVES IT -- measured, and recorded
@@ -2988,7 +3103,7 @@ func assertNoLeak(text string) error {
 					// stays because `nameForms[0]` is the pre-stage form a reader will assume
 					// is complete, and because the redundancy costs one pass over a header
 					// block.
-					names.WriteString(nameComponents(bare[:i]))
+					names.WriteString(nameComponents(nameSrc[:i]))
 				}
 			}
 		}
@@ -3489,7 +3604,15 @@ func isHexByte(c byte) bool {
 func wrappedBase64Candidates(text string) []string {
 	lines := strings.Split(text, "\n")
 	for i, ln := range lines {
-		lines[i] = strings.TrimSuffix(ln, "\r")
+		// ⚠ NORMALISED THE SAME WAY THE WHOLE-LINE PRODUCER NORMALISES. Judging
+		// unnormalised lines here made a space anywhere in the run terminate it:
+		// `prefix: YWJj \r\nZGVmZ2g=` produced no candidate at all, while a standard
+		// decoder reconstructs the identifier from that substring directly, and the
+		// guard therefore approved a spelling it should have refused
+		// (shardpilot/shardpilot-go#84 review). Measured: three of the four places a
+		// space can sit in such a run broke it -- after the head, before the
+		// continuation, and inside the final fragment.
+		lines[i] = dropHorizontalWhitespace(strings.TrimSuffix(ln, "\r"))
 	}
 	suffix := func(s string) string {
 		i := len(s)
@@ -3519,6 +3642,7 @@ func wrappedBase64Candidates(text string) []string {
 		// suffix probes had (shardpilot/shardpilot-go#84 review).
 		var jb strings.Builder
 		jb.WriteString(head)
+		ended := ""
 		for j := i + 1; j < len(lines); j++ {
 			// ⚠ A BLANK LINE IS WHITESPACE, NOT A BOUNDARY -- the same sentence this
 			// file has now had to apply three times: to horizontal space inside a
@@ -3539,6 +3663,7 @@ func wrappedBase64Candidates(text string) []string {
 			if allBase64(lines[j]) {
 				decodeWork += len(lines[j])
 				if decodeWork > decodeWorkMax {
+					ended = "budget"
 					break
 				}
 				jb.WriteString(lines[j])
@@ -3547,10 +3672,40 @@ func wrappedBase64Candidates(text string) []string {
 			if p := prefix(lines[j]); p != "" {
 				out = append(out, jb.String()+p)
 			}
+			ended = "text"
 			break
+		}
+		// ⚠ AND A RUN THAT ENDS WITH THE TEXT IS STILL A RUN. Emitting only where a
+		// following line TERMINATED the run was survivable while lines were judged
+		// unnormalised; once whitespace is dropped, a final fragment like `ZGVm Z2g=`
+		// becomes a whole-base64 line, the run reaches the end of the text, and the
+		// candidate was never emitted -- `TestWrappedCandidateAssemblyIsLinear` says
+		// so directly. The two halves are one fix (shardpilot/shardpilot-go#84
+		// review). A run cut short by the WORK BUDGET is still not emitted: a
+		// truncated candidate is a spelling nothing decodes.
+		if ended == "" && jb.Len() > len(head) {
+			out = append(out, jb.String())
 		}
 	}
 	return out
+}
+
+// dropHorizontalWhitespace removes the bytes a MIME decoder ignores inside an
+// encoded line.
+//
+// ⚠ ONE COPY, BECAUSE TWO PRODUCERS ANSWERING THE SAME QUESTION DRIFT. This file
+// has now been told four times that MIME ignores whitespace a line-based reading
+// treats as structure, and the fourth was the SHARED-LINE producer still judging
+// unnormalised lines while the whole-line producer normalised
+// (shardpilot/shardpilot-go#84 review). The sentence was right each time; it was
+// applied at one site each time.
+func dropHorizontalWhitespace(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r == ' ' || r == '\t' {
+			return -1
+		}
+		return r
+	}, s)
 }
 
 func joinBase64Runs(text string) string {
@@ -3564,12 +3719,7 @@ func joinBase64Runs(text string) string {
 		// `YWJjZ \r\nGVmZ2g=` never rejoined while a MIME decoder reconstructs it
 		// directly (shardpilot/shardpilot-go#84 review). Horizontal whitespace is
 		// dropped before the line is judged and before it is joined.
-		bare = strings.Map(func(r rune) rune {
-			if r == ' ' || r == '\t' {
-				return -1
-			}
-			return r
-		}, bare)
+		bare = dropHorizontalWhitespace(bare)
 		// ⚠ AND A BLANK LINE INSIDE A RUN IS WHITESPACE, NOT A BOUNDARY. A standard
 		// base64 decoder ignores every CR and LF, so `YWJjZ\r\n\r\nGVmZ2g=`
 		// reconstructs the identifier in one step -- while this ended the run at the
@@ -3893,6 +4043,19 @@ func containsValue(text, names, v string) bool {
 // survive. So the rune is decoded and classified: letters and digits are word
 // characters, everything else is a boundary, and ASCII keeps exactly the
 // behaviour its own predicate gives it, hyphen rules included.
+//
+// ⚠ AND A COMBINING MARK CONTINUES THE WORD IT IS ATTACHED TO. `IsLetter ||
+// IsDigit` puts U+0301 in the boundary class, so a decomposed `a` + U+0301 --
+// which renders as `\u00e1` and is one grapheme to every reader -- let a supplied
+// `a` be replaced while the accent stayed behind, and the guard approved the
+// altered evidence because the placeholder is generated
+// (shardpilot/shardpilot-go#84 review). The classification lived in three places
+// with three copies of the same expression; it lives in one now, because the
+// round before found the same drift between a predicate and its tokeniser.
+func isWordRune(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r) || unicode.IsMark(r)
+}
+
 func wordBefore(text string, i int, isWord func(byte) bool) bool {
 	if i <= 0 {
 		return false
@@ -3901,7 +4064,7 @@ func wordBefore(text string, i int, isWord func(byte) bool) bool {
 	if r < utf8.RuneSelf {
 		return isWord(byte(r))
 	}
-	return unicode.IsLetter(r) || unicode.IsDigit(r)
+	return isWordRune(r)
 }
 
 func wordAt(text string, i int, isWord func(byte) bool) bool {
@@ -3912,7 +4075,7 @@ func wordAt(text string, i int, isWord func(byte) bool) bool {
 	if r < utf8.RuneSelf {
 		return isWord(byte(r))
 	}
-	return unicode.IsLetter(r) || unicode.IsDigit(r)
+	return isWordRune(r)
 }
 
 func containsValueWith(text, v string, isWord func(byte) bool) bool {
