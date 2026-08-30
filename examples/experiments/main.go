@@ -491,8 +491,8 @@ var mintedNames = map[string]bool{
 	"assignment_key": true,
 }
 
-// noteMinted records a server-minted field's presence and returns the body
-// unchanged -- the caller does not publish a body this reports on.
+// jsonString decodes a JSON string literal, so a member is matched by what it
+// DENOTES rather than by one spelling of it.
 // ⚠ MEMBER NAMES ARE DECODED, NOT MATCHED LITERALLY. `"subject_\u0066act_key"`
 // is the same field to `encoding/json` and to the endpoint, and a substring
 // check on the raw spelling did not see it -- so the capture was PUBLISHED with
@@ -562,8 +562,8 @@ func jsonDepthAt(body string, i int) int {
 	return depth
 }
 
-// noteMinted records a server-minted field's presence and returns the body
-// unchanged -- the caller does not publish a body this reports on.
+// topLevelMembers returns the names bound from the top-level object, which is
+// the only depth at which `encoding/json` binds the SDK's fields.
 // ⚠ TOP-LEVEL ONLY. `encoding/json` binds the SDK's field from the top-level
 // object; a member of the same name inside `variant_payload` is ordinary payload
 // the endpoint chose to call that, and refusing on it made a perfectly
@@ -606,20 +606,6 @@ func isBenignName(name string) bool {
 		}
 	}
 	return false
-}
-
-func noteMinted(body string) string {
-	for _, name := range topLevelMembers(body) {
-		if isMintedName(name) {
-			// ⚠ A CONSTANT, NOT THE NAME. Third site of this defect in one session: with a
-			// Unicode-folded spelling the endpoint chose, `isMintedName` accepts it and
-			// the label carried that spelling to stderr -- refusing to print the
-			// response while printing the identifier (shardpilot/shardpilot-go#84
-			// review). Every message a guard prints is an output channel.
-			noteStructural("a server-minted subject identifier")
-		}
-	}
-	return body
 }
 
 // isMintedName is isMinted for a name already decoded.
