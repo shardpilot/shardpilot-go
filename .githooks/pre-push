@@ -221,13 +221,45 @@ if [ -n "${GIT_DIR:-}" ]; then
   # ownerless separate git directory (shardpilot/shardpilot-go#79 review). Those tests
   # are lexical, so what they read has to be a normal form; preserving the inherited
   # value was necessary and not sufficient.
+  #
+  # ⚠ AND A `.` COMPONENT IS PART OF THE NORMAL FORM TOO. `git --git-dir=.git/.
+  # push` is an ordinary invocation -- measured: git hands the hook the literal
+  # `.git/.` -- and this loop removed only trailing SLASHES, so the `*/.git`
+  # ownership test below saw `.../.git/.`, failed to match, and classified an
+  # ordinary checkout as an ownerless separate git directory: every push refused
+  # (shardpilot/shardpilot-go#79 review).
+  #
+  # ⚠ `.` IS COLLAPSED AND `..` IS DELIBERATELY NOT. A `.` component is a no-op in
+  # a pathname whatever the filesystem holds, so removing it preserves meaning
+  # unconditionally. `..` does not: `a/../b` is not `b` when `a` is a symlink, so
+  # collapsing it lexically could make a path read as INSIDE the checkout when it
+  # physically is not -- a false acceptance, which is the direction that costs
+  # something here. A `..` spelling already matches the `*/.git` test on its own,
+  # so nothing is lost by leaving it.
+  #
+  # Only builtins: this decides whether the first external command may run at all.
+  # >>> GIT_DIR NORMAL FORM. scripts/test_prepush_bare_exemption.sh lifts the lines
+  # between these markers and runs them against the spellings git actually hands a
+  # hook. Moving or renaming the markers makes that test refuse.
   while :; do
     case "$inherited_git_dir" in
       /) break ;;
       */) inherited_git_dir="${inherited_git_dir%/}" ;;
+      */.)
+        # ⚠ `/.` IS THE ROOT DIRECTORY, NOT NOTHING. Stripping the component leaves
+        # an empty string, and both "break here" and "accept the empty value" are
+        # wrong -- the normal form of `/.` is `/`. Caught by the rig, not by reading.
+        gd_head="${inherited_git_dir%/.}"
+        [ -n "$gd_head" ] || gd_head="/"
+        inherited_git_dir="$gd_head"
+        ;;
+      */./*) inherited_git_dir="${inherited_git_dir%%/./*}/${inherited_git_dir#*/./}" ;;
+      ./*) inherited_git_dir="${inherited_git_dir#./}" ;;
       *) break ;;
     esac
   done
+  # <<< GIT_DIR NORMAL FORM
+  unset gd_head
 fi
 for gv in GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_NAMESPACE \
           GIT_CEILING_DIRECTORIES GIT_DISCOVERY_ACROSS_FILESYSTEM GIT_PREFIX \
@@ -483,8 +515,19 @@ wt_common=""
 if [ -n "${GIT_DIR:-}" ]; then
   wt_common="$GIT_DIR"
 elif [ -f "$checkout_root/.git" ]; then
-  # `.git` is a FILE here: one line, `gitdir: <path>`.
-  IFS= read -r wt_gitline < "$checkout_root/.git" || wt_gitline=""
+  # `.git` is a FILE here, holding `gitdir: <path>`.
+  #
+  # ⚠ NOT ONE LINE. A pathname may contain a newline, and a line-oriented read
+  # keeps only its prefix -- so the gate resolves the wrong common directory from
+  # the very file that names it (shardpilot/shardpilot-go#79 review). Read to EOF,
+  # like the two sites below that already carry this fix.
+  #
+  # ⚠ AND `|| true`, NOT `|| var=""`. `read -d ""` returns NON-ZERO at EOF with the
+  # content already in the variable, so the old failure branch would have wiped a
+  # successful read.
+  wt_gitline=""
+  IFS= read -r -d "" wt_gitline < "$checkout_root/.git" || true
+  wt_gitline="${wt_gitline%$NL}"
   case "$wt_gitline" in
     "gitdir: "*) wt_common="${wt_gitline#gitdir: }" ;;
   esac
@@ -1169,7 +1212,13 @@ if [ -n "$worktree_root" ]; then
     iv_phys="$(physdir "$worktree_root/.git")" && iv_phys="${iv_phys%X}" || iv_phys=""
     [ -n "$iv_phys" ] && [ "$iv_phys" = "$common_phys" ] && invoking_owns_common=yes
   elif [ -f "$worktree_root/.git" ]; then
-    IFS= read -r iv_link < "$worktree_root/.git" || iv_link=""
+    # Read to EOF: a common directory whose pathname contains a newline was
+    # truncated here, so `invoking_owns_common` stayed false and the owner guard
+    # refused a push made from the OWNING main checkout
+    # (shardpilot/shardpilot-go#79 review).
+    iv_link=""
+    IFS= read -r -d "" iv_link < "$worktree_root/.git" || true
+    iv_link="${iv_link%$NL}"
     case "$iv_link" in
       "gitdir: "*)
         iv_phys="$(physdir "${iv_link#gitdir: }")" && iv_phys="${iv_phys%X}" || iv_phys=""
@@ -1200,7 +1249,12 @@ if [ -n "$worktree_root" ]; then
             # `core.worktree` is not set for a separate git dir -- measured, not assumed.
             wt_owner_found=no
             if [ -f "$wt_owner/.git" ]; then
-              IFS= read -r wt_link < "$wt_owner/.git" || wt_link=""
+              # Read to EOF, for the same reason as the two sites above: a
+              # truncated back-pointer never matches, so an owned checkout reads
+              # as ownerless. Third instance of one defect; the review named one.
+              wt_link=""
+              IFS= read -r -d "" wt_link < "$wt_owner/.git" || true
+              wt_link="${wt_link%$NL}"
               if [ "$wt_link" = "gitdir: $wt_phys" ] || [ "$wt_link" = "gitdir: $wt_other" ]; then
                 wt_owner_found=yes
                 wt_owner_phys="$(physdir "$wt_owner")" && wt_owner_phys="${wt_owner_phys%X}" &&

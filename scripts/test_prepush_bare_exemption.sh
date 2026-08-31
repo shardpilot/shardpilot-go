@@ -175,5 +175,97 @@ if [ "$answered" -ne "$total" ]; then
   exit 2
 fi
 
-printf '\n%d case(s) judged, %d failure(s).\n' "$total" "$failures"
-[ "$failures" -eq 0 ] || exit 1
+# ---- the GIT_DIR normal form ------------------------------------------------
+#
+# The ownership tests further down the hook are LEXICAL, so what they read has to
+# be a normal form. The loop that produces it removed only trailing slashes, and
+# `git --git-dir=.git/. push` -- an ordinary invocation -- hands the hook the
+# literal `.git/.`, which then failed the `*/.git` test and refused every push
+# (shardpilot/shardpilot-go#79 review).
+#
+# Lifted from the hook for the same reason as the parse above: a copy passes while
+# the site does something else.
+nstart="$(grep -n '# >>> GIT_DIR NORMAL FORM' "$hook" | head -1 | cut -d: -f1)"
+nend="$(grep -n '# <<< GIT_DIR NORMAL FORM' "$hook" | head -1 | cut -d: -f1)"
+if [ -z "$nstart" ] || [ -z "$nend" ] || [ "$nend" -le "$nstart" ]; then
+  echo "REFUSING: the GIT_DIR NORMAL FORM markers are missing or out of order." >&2
+  exit 2
+fi
+norm="$work/norm.sh"
+{
+  echo '#!/usr/bin/env bash'
+  echo 'inherited_git_dir="$1"'
+  sed -n "$((nstart + 1)),$((nend - 1))p" "$hook" | sed 's/^  //'
+  echo 'printf "%s\n" "$inherited_git_dir"'
+} > "$norm"
+chmod +x "$norm"
+bash -n "$norm" 2>/dev/null || { echo "REFUSING: the lifted normal-form block does not parse." >&2; exit 2; }
+
+# `want` is what the LEXICAL tests downstream need to see. `..` is deliberately NOT
+# collapsed: it is not a no-op under symlinks, and it already matches `*/.git`.
+nfail=0
+ntotal=0
+printf '\n%-24s %-24s %s\n' 'GIT_DIR AS GIVEN' 'NORMALISED' VERDICT
+while IFS='|' read -r given want; do
+  [ -n "$given" ] || continue
+  ntotal=$((ntotal + 1))
+  got="$("$norm" "$given")"
+  v=ok
+  if [ "$got" != "$want" ]; then v="FAIL: wanted [$want]"; nfail=$((nfail + 1)); fi
+  printf '%-24s %-24s %s\n' "[$given]" "[$got]" "$v"
+done <<'SPELLINGS'
+/r/.git|/r/.git
+/r/.git/|/r/.git
+/r/.git/.|/r/.git
+/r/.git/./|/r/.git
+/r/.git/././|/r/.git
+/r/./.git|/r/.git
+/r/./././.git|/r/.git
+./.git|.git
+/|/
+/.|/
+/r/../.git|/r/../.git
+SPELLINGS
+if [ "$ntotal" -eq 0 ]; then
+  echo "REFUSING: no normal-form spelling was judged." >&2
+  exit 2
+fi
+
+# ---- every gitfile is read whole -------------------------------------------
+#
+# A `.git` FILE holds `gitdir: <path>`, and a pathname may contain a newline, so a
+# line-oriented `read -r` keeps only its prefix: the gate then resolves the wrong
+# common directory from the very file that names it, and an owned checkout reads as
+# ownerless (shardpilot/shardpilot-go#79 review).
+#
+# ⚠ THIS IS A CLASS ASSERTION, NOT AN INSTANCE ONE, BECAUSE THE DEFECT WAS A CLASS.
+# Two sites already carried the whole-file read and three did not; the review named
+# ONE of the three. Checking that one would have left the other two, and would not
+# stop a fourth being added. So the question asked is "does any read of a gitfile
+# still stop at a newline", which has no favourite instance.
+gitfile_reads="$(grep -n 'read -r[^<]*< *"[^"]*/\.git"' "$hook" || true)"
+gf_bad=0
+gf_total=0
+while IFS= read -r gf_line; do
+  [ -n "$gf_line" ] || continue
+  gf_total=$((gf_total + 1))
+  case "$gf_line" in
+    *'read -r -d ""'*) ;;
+    *) echo "FAIL: a gitfile is read line-oriented, so a newline in its path truncates it:" >&2
+       echo "  $gf_line" >&2
+       gf_bad=$((gf_bad + 1)) ;;
+  esac
+done <<GITFILEREADS
+$gitfile_reads
+GITFILEREADS
+if [ "$gf_total" -eq 0 ]; then
+  echo "REFUSING: no gitfile read was found at all, so this check measured nothing." >&2
+  echo "  The hook reads a .git file in at least three places; the pattern here has" >&2
+  echo "  stopped matching them." >&2
+  exit 2
+fi
+
+printf '\n%d gitfile read(s) found, %d still line-oriented.\n' "$gf_total" "$gf_bad"
+printf '%d case(s) judged, %d failure(s); %d normal-form case(s), %d failure(s).\n' \
+  "$total" "$failures" "$ntotal" "$nfail"
+[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] || exit 1
