@@ -314,24 +314,29 @@ No Makefile — standard Go tooling.
 p_(){ x="$(cd -- "$1" && pwd -P && printf X)" || return 1; x="${x%X}"; printf '%sX' "${x%?}"; } &&
 NL="$(printf '\nX')" && NL="${NL%X}" &&
 g="$(git rev-parse --git-common-dir && printf X)" && g="${g%X}" && g="${g%?}" &&
-t="$(git rev-parse --show-toplevel && printf X)" && t="${t%X}" && t="${t%?}" &&
+b="$(git rev-parse --is-bare-repository)" &&
+{ test "$b" = true ||
+  { t="$(git rev-parse --show-toplevel && printf X)" && t="${t%X}" && t="${t%?}"; }; } &&
 h="$(p_ "$g")" && gr="${h%X}" && h="${h%X}/hooks" &&
-w="$(p_ "$t")" && w="${w%X}" &&
-p="$w/" && case "$p" in //) p=/ ;; esac &&
-case "$h/" in
-  "$p"*) case "/${h#"$p"}/" in
-            */.git/*) : ;;
-            *) echo "$h is inside the worktree $w and trackable there" >&2; exit 1 ;;
-          esac ;;
-esac &&
+{ test "$b" = true || { w="$(p_ "$t")" && w="${w%X}"; }; } &&
+{ test "$b" = true || {
+    p="$w/" && case "$p" in //) p=/ ;; esac
+    case "$h/" in
+      "$p"*) case "/${h#"$p"}/" in
+                */.git/*) : ;;
+                *) echo "$h is inside the worktree $w and trackable there" >&2; exit 1 ;;
+              esac ;;
+    esac
+  }; } &&
 test ! -L "$h" &&
 mkdir -p "$h" &&
 for f in pre-push check_public_surface.sh .pre-push.new .check_public_surface.sh.new; do
   test ! -e "$h/$f" && test ! -L "$h/$f" || { echo "$h/$f is occupied" >&2; exit 1; }
 done &&
 wt="$(mktemp)" && wp="$(mktemp)" &&
-git worktree list --porcelain -z > "$wt" &&
-test -s "$wt" &&
+{ test "$b" = true && : > "$wt" ||
+  git worktree list --porcelain -z > "$wt"; } &&
+{ test "$b" = true || test -s "$wt"; } &&
 while IFS= read -r -d "" rec; do
   case "$rec" in worktree\ *)
     r="${rec#worktree }" && printf '%s\0' "$r" &&
@@ -356,13 +361,18 @@ while IFS= read -r -d "" r; do
            esac ;;
   esac
 done < "$wp" &&
-{ cp .githooks/pre-push "$h/.pre-push.new" &&
-  cp scripts/check_public_surface.sh "$h/.check_public_surface.sh.new" &&
-  chmod +x "$h/.pre-push.new" "$h/.check_public_surface.sh.new"; } ||
+{ { test "$b" = true &&
+      { git show HEAD:.githooks/pre-push > "$h/.pre-push.new" &&
+        git show HEAD:scripts/check_public_surface.sh > "$h/.check_public_surface.sh.new"; }; } ||
+  { cp .githooks/pre-push "$h/.pre-push.new" &&
+    cp scripts/check_public_surface.sh "$h/.check_public_surface.sh.new"; }; } &&
+chmod +x "$h/.pre-push.new" "$h/.check_public_surface.sh.new" ||
   { rm -f "$h/.pre-push.new" "$h/.check_public_surface.sh.new"; exit 1; } &&
 mv "$h/.pre-push.new" "$h/pre-push" &&
 mv "$h/.check_public_surface.sh.new" "$h/check_public_surface.sh" &&
-git config --local core.hooksPath "$h" &&
+{ git config --local core.hooksPath "$h" ||
+  { rm -f "$h/pre-push" "$h/check_public_surface.sh"
+    echo "activation failed; the published hooks were rolled back" >&2; exit 1; }; } &&
 while IFS= read -r -d "" w; do
   test "$(git -C "$w" config --bool extensions.worktreeConfig 2>/dev/null || echo false)" = true &&
     { git -C "$w" config --worktree --unset-all core.hooksPath 2>/dev/null || true; } || true

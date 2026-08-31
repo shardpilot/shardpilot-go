@@ -199,6 +199,16 @@ NL='
 '
 TAB="$(printf '\tX')"; TAB="${TAB%X}"
 CR="$(printf '\rX')"; CR="${CR%X}"
+# The caller's explicit work tree, captured beside the git dir and made absolute the
+# same way: both are dropped by the loop below and only what is resolved here goes
+# back. See the restore, and `in_worktree` for where they are dropped again.
+inherited_work_tree=""
+if [ -n "${GIT_WORK_TREE:-}" ]; then
+  case "$GIT_WORK_TREE" in
+    /*) inherited_work_tree="$GIT_WORK_TREE" ;;
+    *) inherited_work_tree="$PWD/$GIT_WORK_TREE" ;;
+  esac
+fi
 inherited_git_dir=""
 if [ -n "${GIT_DIR:-}" ]; then
   # ⚠ WITH BUILTINS. This step runs BEFORE the PATH filter -- it has to, since the
@@ -288,17 +298,43 @@ unset gv
 #
 # Recorded BEFORE clearing, because the bare exemption further down may not be taken
 # from a file that git was not reading alone.
+# ⚠ DETECTED, NOT CLEARED -- AND THE ROUND BEFORE CLEARED THEM, WHICH BROKE
+# AUTHENTICATED PUSHES. `git -c http.extraHeader='"'"'Authorization: …'"'"' push` travels here
+# in `GIT_CONFIG_PARAMETERS`, and removing it left this hook's own `ls-remote` and
+# `fetch` without the header, so a push that had already authenticated was refused
+# by its own gate (shardpilot/shardpilot-go#79 review). Clearing `GIT_CONFIG_GLOBAL`
+# dropped credentials supplied through an explicitly selected global file the same
+# way. A wide "does not work" strips the working half too.
+#
+# The dangerous half does not need the variables gone. A command-line `-c` OUTRANKS
+# `GIT_CONFIG_PARAMETERS` -- measured -- so the neutralisation moves onto every git
+# invocation instead, where it wins without taking the caller's transport
+# configuration with it. And `git config --list` REPORTS env-injected keys, also
+# measured, so the derivation below already covers what arrives this way.
+#
+# The presence is still recorded, because the bare exemption further down may not be
+# taken from a file that git was not reading alone.
 sp_cfg_env=no
 for gv in GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_CONFIG GIT_CONFIG_GLOBAL \
           GIT_CONFIG_SYSTEM; do
   eval "gv_val=\${$gv:-}"
   [ -n "$gv_val" ] && sp_cfg_env=yes
-  unset "$gv" 2>/dev/null || true
 done
 unset gv gv_val
 if [ -n "$inherited_git_dir" ]; then
   GIT_DIR="$inherited_git_dir"
   export GIT_DIR
+fi
+# ⚠ AND THE WORK TREE IS A SEPARATE SELECTOR, NOT A CONSEQUENCE OF THE GIT DIR.
+# `git --git-dir=/r/.git --work-tree=/r push` from another directory passes BOTH,
+# and this restored only the first -- so the hook treated its invocation directory
+# as the worktree and refused a clean push with "the index or working tree differs
+# from HEAD" (shardpilot/shardpilot-go#79 review, reproduced). `git -h` lists them
+# as independent globals; keeping one and dropping the other is not preserving the
+# invocation. It is cleared again inside the scan worktree, by `in_worktree`.
+if [ -n "$inherited_work_tree" ]; then
+  GIT_WORK_TREE="$inherited_work_tree"
+  export GIT_WORK_TREE
 fi
 
 # ⚠ AND THE OBJECT STORES ARE MADE ABSOLUTE, because the scan ENTERS A DIFFERENT
@@ -985,16 +1021,21 @@ sp_seen=""
 set -f
 # `core.fsmonitor` is emptied whether or not it is currently set, so a value added
 # between this read and the commands below cannot arrive unanswered.
+#
+# ⚠ AS `-c` ARGUMENTS, NOT AS `GIT_CONFIG_COUNT`. The environment form outranks the
+# config file but is itself outranked by `GIT_CONFIG_PARAMETERS`, which is how
+# `git -c k=v push` reaches a hook -- so `git -c core.fsmonitor=./fsmon push`
+# defeated the whole neutralisation. A command-line `-c` outranks that in turn,
+# measured, and it does not require removing the caller's environment, which is what
+# broke authenticated pushes.
+sp_cfg_args=()
 for sp_k in core.fsmonitor $sp_cfg_keys; do
   case " $sp_seen " in *" $sp_k "*) continue ;; esac
   sp_seen="$sp_seen $sp_k"
-  eval "export GIT_CONFIG_KEY_$sp_cfg_n=\"\$sp_k\""
-  eval "export GIT_CONFIG_VALUE_$sp_cfg_n=''"
+  sp_cfg_args+=(-c "$sp_k=")
   sp_cfg_n=$((sp_cfg_n + 1))
 done
 set +f
-GIT_CONFIG_COUNT="$sp_cfg_n"
-export GIT_CONFIG_COUNT
 unset sp_cfg_keys sp_k sp_seen
 
 hooks_off="$(mktemp -d)"
@@ -1029,7 +1070,10 @@ cleanup() {
   [ -n "${base_ref:-}" ] && git_safe update-ref -d "$base_ref" 2>/dev/null || true
 }
 trap cleanup EXIT
-git_safe() { git -c core.hooksPath="$hooks_off" "$@"; }
+# ⚠ THE NEUTRALISATION RIDES HERE, SO IT CANNOT BE BYPASSED BY ADDING A CALL SITE.
+# `-c` outranks every other source, including the `GIT_CONFIG_PARAMETERS` that
+# carries the caller's own `git -c`.
+git_safe() { git -c core.hooksPath="$hooks_off" "${sp_cfg_args[@]}" "$@"; }
 
 # in_worktree runs a git command INSIDE the scan worktree.
 #
@@ -2125,7 +2169,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # is empty exactly when the earlier block established the repository is bare, so it
   # is the discriminator already computed rather than a second question.
   if [ -n "$head_sha" ] && [ -n "$worktree_root" ] &&
-     { ! git diff --quiet HEAD -- || ! git diff --cached --quiet; }; then
+     { ! git_safe diff --quiet HEAD -- || ! git_safe diff --cached --quiet; }; then
     printf 'REFUSING: the index or working tree differs from HEAD.\n' >&2
     printf '  Commit or stash first, so what is scanned is what is published.\n' >&2
     exit 2

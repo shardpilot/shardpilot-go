@@ -549,8 +549,70 @@ case "$idx_after" in
   *) printf 'this hook: the invoking index is untouched [%s].\n' "$idx_after" ;;
 esac
 
+# ---- the caller's invocation survives ----------------------------------------
+#
+# ⚠ BOTH OF THESE ARE REGRESSIONS A PREVIOUS ROUND OF MINE INTRODUCED, so they are
+# held here rather than trusted. A wide "does not work" strips the working half too.
+#
+#   1. `--work-tree` is a selector independent of `--git-dir`; restoring only the
+#      latter made the hook treat its invocation directory as the worktree and
+#      refuse a clean push (shardpilot/shardpilot-go#79 review, reproduced).
+#   2. Clearing `GIT_CONFIG_PARAMETERS` to stop `git -c` overrides also removed the
+#      caller's command-scoped transport configuration, so the hook's own
+#      `ls-remote` and `fetch` lost credentials a push had already authenticated
+#      with.
+inv_fail=0
+inv_repo="$work/inv"; git init -q "$inv_repo"
+mkdir -p "$inv_repo/scripts" "$inv_repo/.git/hooks"
+printf '#!/bin/sh\nexit 0\n' > "$inv_repo/scripts/check_public_surface.sh"
+printf '#!/bin/sh\nexit 0\n' > "$inv_repo/.git/hooks/check_public_surface.sh"
+chmod +x "$inv_repo/scripts/check_public_surface.sh" "$inv_repo/.git/hooks/check_public_surface.sh"
+( cd "$inv_repo"
+  printf 'a\n' > f
+  git add -A >/dev/null 2>&1
+  git -c user.email=t@t -c user.name=t commit -q -m c1 >/dev/null 2>&1
+  git remote add origin "$probe_remote" >/dev/null 2>&1 ) || true
+cp "$hook" "$inv_repo/.git/hooks/pre-push"; chmod +x "$inv_repo/.git/hooks/pre-push"
+
+# 1. Both selectors given explicitly, from a directory that is neither.
+( cd "$work" && git --git-dir="$inv_repo/.git" --work-tree="$inv_repo" \
+    push -q origin HEAD:refs/heads/invprobe >"$work/inv.out" 2>&1 ) || true
+if grep -q 'index or working tree differs' "$work/inv.out" 2>/dev/null; then
+  echo "FAIL: an explicit --work-tree was dropped, so a clean push was refused." >&2
+  sed -n '1,3p' "$work/inv.out" >&2
+  inv_fail=1
+else
+  printf '\nthis hook: an explicit --git-dir/--work-tree push is not refused.\n'
+fi
+git -C "$probe_remote" update-ref -d refs/heads/invprobe >/dev/null 2>&1 || true
+
+# 2. The caller's command-scoped configuration is still visible to the hook. A
+#    harmless key stands in for the transport headers: what is asserted is that the
+#    channel survives, not what travels on it.
+( cd "$inv_repo" && git -c user.agent=sp-probe-agent \
+    push -q origin HEAD:refs/heads/invprobe2 >/dev/null 2>&1 ) || true
+git -C "$probe_remote" update-ref -d refs/heads/invprobe2 >/dev/null 2>&1 || true
+# The block that DETECTS the config-injecting environment must not also clear it.
+# Extracted precisely, because the hook has a second, legitimate `unset` loop for
+# the repository selectors and a loose grep matches that one instead — it did, and
+# reported a failure that was not there.
+cfg_blk_start="$(grep -n '^sp_cfg_env=no$' "$hook" | head -1 | cut -d: -f1)"
+cfg_blk_end="$(grep -n '^unset gv gv_val$' "$hook" | head -1 | cut -d: -f1)"
+if [ -z "$cfg_blk_start" ] || [ -z "$cfg_blk_end" ] || [ "$cfg_blk_end" -le "$cfg_blk_start" ]; then
+  echo "REFUSING: the config-environment detection block was not found, so whether" >&2
+  echo "  it clears the caller's configuration could not be checked." >&2
+  exit 2
+fi
+if sed -n "${cfg_blk_start},${cfg_blk_end}p" "$hook" | grep -q 'unset "\$gv"'; then
+  echo "FAIL: the config-injecting environment is cleared again, which takes the" >&2
+  echo "  caller's transport configuration with it." >&2
+  inv_fail=1
+else
+  printf 'this hook: the caller command-scoped configuration is left in place.\n'
+fi
+
 printf '\n%d gitfile read(s) found, %d still line-oriented.\n' "$gf_total" "$gf_bad"
 printf '%d checkout-root case(s), %d failure(s).\n' "$itotal" "$ifail"
 printf '%d case(s) judged, %d failure(s); %d normal-form case(s), %d failure(s).\n' \
   "$total" "$failures" "$ntotal" "$nfail"
-[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] && [ "$idx_fail" -eq 0 ] || exit 1
+[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] && [ "$idx_fail" -eq 0 ] && [ "$inv_fail" -eq 0 ] || exit 1
