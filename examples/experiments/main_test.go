@@ -4455,3 +4455,68 @@ func TestTheWalkIsBoundedByCostNotLength(t *testing.T) {
 		}
 	}
 }
+
+// TestTheFourthRoundOfNamesAndSpans covers this round's four findings, three of
+// which are consequences of repairs from the two rounds before it
+// (shardpilot/shardpilot-go#84 review).
+func TestTheFourthRoundOfNamesAndSpans(t *testing.T) {
+	t.Cleanup(func() { suppliedValues, structuralSurfaces = nil, nil })
+
+	// ⚠ ALLOWING AN EMPTY VALUE SAID NOTHING ABOUT THE NAME. Marking the line
+	// generated is right about the bytes and wrong when a supplied value equals that
+	// spelling: a generated span is skipped by both the scrub and the guard.
+	suppliedValues, structuralSurfaces = []string{"Location"}, nil
+	got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 302 Found\r\nLocation:\r\n\r\n")))
+	if strings.Contains(got, "Location:") || len(structuralSurfaces) == 0 {
+		t.Errorf("a supplied value equal to a protected field name was published: %q %v", got, structuralSurfaces)
+	}
+	// ...and an empty protected field that collides with nothing is still not refused.
+	suppliedValues, structuralSurfaces = []string{"unrelated"}, nil
+	if got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 302 Found\r\nLocation:\r\n\r\n"))); len(structuralSurfaces) != 0 {
+		t.Errorf("an ordinary empty protected field was refused: %q %v", got, structuralSurfaces)
+	}
+
+	// ⚠ A MINTED NAME IS ONLY GRAMMAR WHERE THE SDK READS ONE.
+	suppliedValues, structuralSurfaces = []string{"subject_fact_key"}, nil
+	if got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 404 Not Found\r\n\r\n{\"subject_fact_key\":\"\"}"))); strings.Contains(got, "subject_fact_key") {
+		t.Errorf("a minted member name was exempted on a non-assignment response: %q", got)
+	}
+	// ...and on a body the SDK accepts it is still grammar.
+	suppliedValues = []string{"subject_fact_key"}
+	if got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false,\"subject_fact_key\":\"\"}"))); !strings.Contains(got, "subject_fact_key") {
+		t.Errorf("a minted member name lost its exemption on an accepted verdict: %q", got)
+	}
+
+	// ⚠ A URL ENDS BEFORE THE PUNCTUATION THAT ENCLOSES IT.
+	suppliedValues = nil
+	if got := sanitizeText(`failed (https://e/p?q=s): detail`); !strings.Contains(got, "): detail") {
+		t.Errorf("punctuation after a URL was swallowed into the query: %q", got)
+	}
+	if got := sanitizeText(`failed (https://e/p?q=s): detail`); strings.Contains(got, "q=s") {
+		t.Errorf("the query itself survived: %q", got)
+	}
+}
+
+// TestATrailerCodingIsStillACoding: `Trailer: Content-Encoding` with a final
+// `Content-Encoding: gzip` is accepted by Go and leaves the body encoded, and the
+// head-only check never sees it -- a gzip-compressed supplied value passed
+// `assertNoLeak`, which has no gzip decoder, while this report carried the coding
+// needed to rebuild it (shardpilot/shardpilot-go#84 review).
+func TestATrailerCodingIsStillACoding(t *testing.T) {
+	t.Cleanup(func() { structuralSurfaces = nil })
+	for _, c := range []struct {
+		name, value string
+		refused     bool
+	}{
+		{"an unsupported coding in a trailer", "gzip", true},
+		{"identity in a trailer", "identity", false},
+		{"a list of identity", "identity, identity", false},
+	} {
+		structuralSurfaces = nil
+		ex := &exchange{captured: &teeBody{trailer: http.Header{"Content-Encoding": []string{c.value}}}}
+		_ = ex.trailerReport()
+		if (len(structuralSurfaces) != 0) != c.refused {
+			t.Errorf("%s: refused=%v, want %v", c.name, len(structuralSurfaces) != 0, c.refused)
+		}
+	}
+}

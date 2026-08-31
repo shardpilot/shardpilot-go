@@ -310,6 +310,17 @@ func (e *exchange) trailerReport() string {
 				fmt.Fprintf(&b, "    %s\n", canonicalFieldName(low)+": "+marked("<withheld>"))
 				continue
 			}
+			// ⚠ A CODING CAN ARRIVE AS A TRAILER, AND THE HEAD-ONLY CHECK NEVER SEES IT.
+			// `Trailer: Content-Encoding` with a final `Content-Encoding: gzip` is accepted
+			// by Go and leaves the body encoded -- so a gzip-compressed supplied value
+			// passed `assertNoLeak`, which has no gzip decoder, and was published as
+			// opaque bytes while this very report carried the coding needed to rebuild it
+			// (shardpilot/shardpilot-go#84 review). The refusal is about what an
+			// undecodable body could HIDE, and where the coding was declared does not
+			// change what it hides.
+			if low == "content-encoding" && !allIdentityCodings(v, true) {
+				noteStructural("a body in a content coding this build cannot decode")
+			}
 			fmt.Fprintf(&b, "    %s\n",
 				asCaptured(scrubHeaderName(escapeMarks(k))+": "+scrubSupplied(escapeMarks(v))))
 		}
@@ -1775,6 +1786,25 @@ func dropFraming(dump string) string {
 				// The name printed is still THIS program's spelling, so the empty field
 				// is vouched for rather than echoed.
 				if _, v, _ := strings.Cut(strings.TrimSuffix(l, "\r"), ":"); strings.Trim(v, " \t") == "" {
+					// ⚠ THE NAME STILL HAS TO SURVIVE THE COLLISION TEST. Marking the whole
+					// line generated is right about the BYTES -- they are this program's
+					// canonical spelling -- and wrong when a supplied value equals that
+					// spelling: `SP_EXPERIMENT_KEY=Location` against a legal empty
+					// `Location:` published the identifier, because a generated span is
+					// skipped by both the scrub and the guard
+					// (shardpilot/shardpilot-go#84 review). Allowing the empty VALUE was
+					// correct; it said nothing about the NAME.
+					collides := false
+					for _, sv := range suppliedValues {
+						if sv != "" && strings.EqualFold(sv, canonicalFieldName(name)) {
+							collides = true
+						}
+					}
+					if collides {
+						noteStructural("a supplied value equal to a protected field name")
+						out = append(out, canonicalFieldName(name)+":"+cr)
+						continue
+					}
 					out = append(out, marked(canonicalFieldName(name)+":")+cr)
 					continue
 				}
@@ -2826,6 +2856,19 @@ func sanitizeText(out string) string {
 		if end := strings.IndexAny(seg, " \""); end >= 0 {
 			seg = seg[:end]
 		}
+		// ⚠ AND A URL ENDS BEFORE THE PUNCTUATION THAT ENCLOSES IT. Go writes
+		// `failed (https://e/p?q=s): detail`, and taking the token up to the next space
+		// swallowed `):` into the query -- so `dropQuery` discarded those bytes with it
+		// and the published diagnostic became malformed prose, altering the very
+		// evidence this section exists to preserve (shardpilot/shardpilot-go#84
+		// review). My own repair from one round ago, which fixed WHERE the span starts
+		// and said nothing about where it ends.
+		seg = strings.TrimRight(seg, ")]}>,;:.'")
+		if seg == "" {
+			b.WriteString(rest[:start])
+			rest = rest[start:]
+			continue
+		}
 		b.WriteString(rest[:start])
 		b.WriteString(dropQuery(seg))
 		rest = rest[start+len(seg):]
@@ -3077,7 +3120,14 @@ func markBareJSONLiterals(text string, exempt map[string]bool) string {
 		// (shardpilot/shardpilot-go#84 review). A registry's scope is part of what it
 		// says.
 		if name, ok := tok.(string); ok && isKey && atRoot {
-			if exempt[name] || mintedNames[name] {
+			// ⚠ AND A MINTED NAME IS ONLY GRAMMAR WHERE THE SDK READS ONE. This map was
+			// consulted unconditionally, so on a 404 carrying `{"subject_fact_key":""}` the
+			// endpoint-chosen member name was marked generated -- and with that name
+			// supplied, both the scrub and the guard skipped it and published the
+			// identifier (shardpilot/shardpilot-go#84 review). The other registry was gated
+			// on the response shape three rounds ago; this one was not, and an exemption
+			// honoured by one of two rules is a disagreement rather than an exemption.
+			if exempt[name] || (mintedNames[name] && len(exempt) > 0) {
 				end := start + int(dec.InputOffset())
 				quoted := `"` + name + `"`
 				if end-len(quoted) >= 0 && text[end-len(quoted):end] == quoted {
