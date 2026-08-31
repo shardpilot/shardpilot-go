@@ -197,6 +197,8 @@ unset GIT_INDEX_FILE
 # selector-preserving step, so it is defined before either.
 NL='
 '
+TAB="$(printf '\tX')"; TAB="${TAB%X}"
+CR="$(printf '\rX')"; CR="${CR%X}"
 inherited_git_dir=""
 if [ -n "${GIT_DIR:-}" ]; then
   # ⚠ WITH BUILTINS. This step runs BEFORE the PATH filter -- it has to, since the
@@ -256,6 +258,17 @@ cquote_alt() {
     case "$cq_c" in
       '\') cq_out="$cq_out\\\\" ;;
       '"') cq_out="$cq_out\\\"" ;;
+      # ⚠ AND THE CONTROL BYTES GIT ITSELF ESCAPES. The default branch emitted the
+      # byte literally, and this value is written into `objects/info/alternates`,
+      # which is LINE ORIENTED -- so a newline in the path split it into two
+      # malformed records, the private object store could not reach the real one,
+      # the pushed commits became unreadable and a valid push was refused
+      # (shardpilot/shardpilot-go#79 review). A separator drawn from the alphabet
+      # of the values it separates is not a separator, which this file has already
+      # written down about a different value.
+      "$NL") cq_out="$cq_out\\n" ;;
+      "$TAB") cq_out="$cq_out\\t" ;;
+      "$CR") cq_out="$cq_out\\r" ;;
       *) cq_out="$cq_out$cq_c" ;;
     esac
   done
@@ -562,9 +575,15 @@ if [ -n "$wt_common" ]; then
         wt_ct="${wt_cl#"${wt_cl%%[![:space:]]*}"}"
         case "$wt_ct" in
           "["*) wt_sect="$wt_ct" ;;
-          bare*=*)
+          [Bb][Aa][Rr][Ee]*=*)
+            # ⚠ SECTION AND VARIABLE NAMES FOLD, and this compared them literally --
+            # so a bare repository written `[Core]`, which git reads exactly as
+            # `[core]`, left `wt_is_bare=no` and an ordinarily named `/tmp/repo.git`
+            # was refused by the checkout-owner guard (shardpilot/shardpilot-go#79
+            # review). The PATTERNS fold here rather than the strings, because folding
+            # a string needs a command and this runs before the PATH filter.
             case "$wt_sect" in
-              "[core]"*)
+              "["[Cc][Oo][Rr][Ee]"]"*)
                 wt_cv="${wt_ct#*=}"
                 wt_cv="${wt_cv#"${wt_cv%%[![:space:]]*}"}"
                 case "$wt_cv" in
@@ -614,6 +633,14 @@ sanitised_path=""
 dropped_inside=no
 old_ifs="$IFS"
 IFS=:
+# ⚠ AND PATHNAME GENERATION IS OFF WHILE SPLITTING. `$PATH` unquoted is split AND
+# globbed, while executable lookup treats those bytes literally -- so a literal
+# component `/opt/tool[12]/bin` was rewritten into every matching `/opt/tool1/bin`
+# and `/opt/tool2/bin`, and this gate judged directories that were never on the
+# caller's PATH while missing the one that was (shardpilot/shardpilot-go#79 review).
+# The separator is what splitting is for; the glob is a second grammar nobody asked
+# for here.
+set -f
 for path_entry in $PATH; do
   case "$path_entry" in
     /*) ;;
@@ -631,6 +658,7 @@ for path_entry in $PATH; do
   fi
   sanitised_path="${sanitised_path:+$sanitised_path:}$path_entry"
 done
+set +f
 IFS="$old_ifs"
 if [ -z "$sanitised_path" ]; then
   printf 'REFUSING: PATH contains no absolute directory, so no utility this gate\n' >&2
@@ -676,6 +704,39 @@ cleanup() {
 }
 trap cleanup EXIT
 git_safe() { git -c core.hooksPath="$hooks_off" "$@"; }
+
+# git_probe runs a git command whose OUTPUT is the answer, and refuses when the
+# command FAILED. It sets `PROBE_OUT`; it does not return a value, because a helper
+# that exits from inside `$( … )` exits the SUBSHELL and the gate reads the empty
+# result as an answer -- which is the very defect this exists to stop.
+#
+# ⚠ A PROBE'S STATUS IS NOT ITS ANSWER, and this file has now been shown five
+# instances of the same sentence: `! git diff --quiet` in a bare repository, where
+# the FATAL error read as "the working tree differs"; the HEAD advertisement, whose
+# failure read as "no default branch"; and the three below. Each was repaired where
+# it was shown, which is repairing instances. The predicate lives here now, so a
+# site that means to treat a failure AS an answer has to say so by not calling this.
+#
+# ⚠ WHAT THE POPULATION ACTUALLY IS, greped rather than recalled: ten sites in this
+# file convert a git status into a value. FIVE of them fail CLOSED -- the empty
+# value reaches a refusal (`real_objects`, `head_sha`, `--is-bare-repository`, the
+# baseline pair at the fetch, and the scan-target scaffold, whose absence is a
+# legitimate answer). TWO already refuse on failure and are the pattern this copies.
+# The remaining three are below, and they are the ones a reader should check first
+# when adding a fourth.
+git_probe() { # git_probe <what> <git command...>
+  gp_what="$1"; shift
+  gp_rc=0
+  PROBE_OUT="$( "$@" 2>/dev/null && printf X )" || gp_rc=$?
+  PROBE_OUT="${PROBE_OUT%X}"
+  PROBE_OUT="${PROBE_OUT%$NL}"
+  if [ "$gp_rc" -ne 0 ]; then
+    printf 'REFUSING: %s could not be read (git exited %s).\n' "$gp_what" "$gp_rc" >&2
+    printf '  A probe that FAILED prints nothing, and nothing would be read here as\n' >&2
+    printf '  an answer -- so this gate cannot speak for what it was asked.\n' >&2
+    exit 2
+  fi
+}
 # ⚠ THE TEMPORARIES AND THEIR TRAP ARE ONE STEP. Both directories were created
 # here and at line ~170, with the trap installed only after the second -- so
 # every refusal in between (a missing or non-executable scanner, the commonest
@@ -799,7 +860,15 @@ fi
 # Found by enumerating every status-discarding substitution in this file rather
 # than by a review: 12 of them, 11 of which fail only by absence and are handled.
 # This is the twelfth (shardpilot/shardpilot-go#79, derived population).
-common_dir="$(git rev-parse --git-common-dir 2>/dev/null)" || common_dir=""
+# ⚠ AND THE SENTINEL, because a command substitution eats EVERY trailing newline --
+# git's own terminator AND the pathname's final byte when the common directory's name
+# ends in one. `physdir` then resolved a different or nonexistent directory and the
+# hook refused before it could locate its trusted scanner
+# (shardpilot/shardpilot-go#79 review). The convention is already applied to
+# `--show-toplevel` and the object-store paths; this call was written without it.
+common_dir="$(git rev-parse --git-common-dir 2>/dev/null && printf X)" || common_dir=""
+common_dir="${common_dir%X}"
+common_dir="${common_dir%$NL}"
 if [ -z "$common_dir" ]; then
   printf 'REFUSING: could not locate the common git directory.
 ' >&2
@@ -1713,8 +1782,19 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       fi
       ;;
   esac
-  if git cat-file -e "$remote_sha" 2>/dev/null &&
-     ! git rev-parse --verify --quiet "$remote_sha^{commit}" >/dev/null 2>&1; then
+  # ⚠ AND THE TYPE IS ASKED, NOT INFERRED FROM A SECOND PROBE'S FAILURE. Existence
+  # was just established, so a non-zero `rev-parse --verify` here meant "not a
+  # commit" -- and means exactly the same thing when the probe fails transiently, at
+  # which point the pre-push tip is replaced by zero and the comparison silently
+  # moves to the destination's default branch (shardpilot/shardpilot-go#79 review).
+  # A more permissive baseline there passes a regression against the ref actually
+  # being updated. `cat-file -t` states the type, and its failure is a refusal.
+  remote_is_commit=yes
+  if git cat-file -e "$remote_sha" 2>/dev/null; then
+    git_probe "the type of $remote_sha" git cat-file -t "$remote_sha"
+    [ "$PROBE_OUT" = commit ] || remote_is_commit=no
+  fi
+  if [ "$remote_is_commit" = no ]; then
     printf 'public surface: %s previously held a non-commit object; comparing against the default branch\n' \
       "${remote_ref:-the remote ref}"
     remote_sha=0000000000000000000000000000000000000000
@@ -2104,7 +2184,16 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     # A per-iteration file: written whole, so no reader stops early and no writer
     # takes SIGPIPE, and it holds this tag alone.
     : > "$tmpdir/tag-walk"
-    git cat-file tag "$walk" > "$tmpdir/tag-walk" 2>/dev/null || : > "$tmpdir/tag-walk"
+    # ⚠ AND A FAILED RE-READ IS NOT AN EMPTY TAG. Truncating on failure left `nxt`
+    # empty, `walk` still a tag, and the post-loop check then reported a chain deeper
+    # than 32 and rejected a valid tag push (shardpilot/shardpilot-go#79 review) --
+    # a refusal manufactured by the instrument. The validated read above already
+    # succeeded on this object, so a failure here is a fault, not a shape.
+    if ! git cat-file tag "$walk" > "$tmpdir/tag-walk" 2>/dev/null; then
+      printf 'REFUSING: the tag object %s could not be re-read while walking the\n' "$walk" >&2
+      printf '  tag chain, and a truncated walk reads as a chain too deep.\n' >&2
+      exit 2
+    fi
     nxt="$(awk '$1=="object"{print $2; exit}' "$tmpdir/tag-walk" 2>/dev/null || true)"
     [ -n "$nxt" ] || break
     walk="$nxt"
@@ -2151,7 +2240,19 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       # a blob carrying a prohibited shape with the fix in place, which is how the
       # substitution was found a second time: a repair keyed on the wrong name
       # looks exactly like the defect it replaced.
-      deref="$( git rev-parse --verify --quiet "${local_sha}^{}" 2>/dev/null || printf '%s' "$peeled" )"
+      # ⚠ AND A FAILED PEEL IS NOT "IT PEELS TO ITSELF". Mapping failure back to the
+      # outer tag made the type probe below answer `tag`, so neither the blob nor the
+      # tree evidence branch ran and the push could be approved having scanned the
+      # annotation and the ref name while omitting the published target bytes
+      # (shardpilot/shardpilot-go#79 review). `^{}` resolves for every existing
+      # object, so a non-zero status here is a fault and not a shape.
+      git_probe "the target of the tag $local_sha" git rev-parse --verify --quiet "${local_sha}^{}"
+      deref="$PROBE_OUT"
+      if [ -z "$deref" ]; then
+        printf 'REFUSING: peeling %s produced no object id, so the published target\n' "$local_sha" >&2
+        printf '  cannot be named and its bytes cannot be staged as evidence.\n' >&2
+        exit 2
+      fi
       # ⚠ AND MAPPING FAILURE TO `unknown` SKIPS BOTH EVIDENCE BRANCHES, so the push
       # was approved on the ref name and the tag annotation alone, with the published
       # target object never staged (shardpilot/shardpilot-go#79 review).
