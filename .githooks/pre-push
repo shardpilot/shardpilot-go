@@ -271,9 +271,17 @@ if [ -n "${GIT_DIR:-}" ]; then
   # <<< GIT_DIR NORMAL FORM
   unset gd_head
 fi
+# ⚠ AND `GIT_TEMPLATE_DIR`, WHICH IS A HOOK DELIVERY MECHANISM. The scanner runs
+# `git init` in its own fixture repositories and then `git add` in them, and git
+# COPIES the template's hooks into every one -- so a checkout-controlled template
+# directory put `templates/hooks/post-index-change` into each fixture and the
+# branch's program ran sixteen times during one push, inside the trusted scanner
+# (shardpilot/shardpilot-go#79 review). Redirecting `core.hooksPath` does not reach
+# a hook that is COPIED in at init time; this is the third separate delivery route
+# after the config drivers and `core.fsmonitor`.
 for gv in GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_NAMESPACE \
           GIT_CEILING_DIRECTORIES GIT_DISCOVERY_ACROSS_FILESYSTEM GIT_PREFIX \
-          GIT_ATTR_NOSYSTEM; do
+          GIT_ATTR_NOSYSTEM GIT_TEMPLATE_DIR; do
   unset "$gv" 2>/dev/null || true
 done
 unset gv
@@ -1063,7 +1071,7 @@ if ! sp_cfg_all="$(git config --list --name-only 2>/dev/null)"; then
 fi
 sp_cfg_keys=""
 sp_cfg_keys="$(printf '%s\n' "$sp_cfg_all" |
-  grep -E '^(core\.fsmonitor|core\.alternaterefscommand|core\.gitproxy|(diff|filter|merge)\..*\..+)$')" || {
+  grep -E '^(core\.fsmonitor|core\.alternaterefscommand|core\.gitproxy|init\.templatedir|(diff|filter|merge)\..*\..+)$')" || {
   sp_cfg_rc=$?
   if [ "$sp_cfg_rc" -ne 1 ]; then
     printf 'REFUSING: the executable-key scan failed (grep exited %s), so this gate\n' "$sp_cfg_rc" >&2
@@ -1124,7 +1132,18 @@ for sp_k in core.fsmonitor $sp_cfg_keys; do
   # the first two attempts at spelling it inline produced a string git still
   # rejected, and one of them looked right.
   sp_k_esc="${sp_k//$sp_q/$sp_qrep}"
-  sp_cfg_params="$sp_cfg_params '$sp_k_esc'=''"
+  # ⚠ NO LEADING SEPARATOR. Built as `$sp_cfg_params ...` from an empty string, the
+  # first iteration puts a SPACE at the front, and git rejects a value that begins
+  # that way -- so on an ordinary push, which carries no `GIT_CONFIG_PARAMETERS` of
+  # its own, every later git failed with "bogus format" and this gate refused the
+  # push it exists to check (shardpilot/shardpilot-go#79 review). Only a push that
+  # already carried command-scoped configuration happened to supply a token before
+  # the separator, which is why it survived the runs that did.
+  if [ -n "$sp_cfg_params" ]; then
+    sp_cfg_params="$sp_cfg_params '$sp_k_esc'=''"
+  else
+    sp_cfg_params="'$sp_k_esc'=''"
+  fi
   sp_cfg_n=$((sp_cfg_n + 1))
 done
 set +f
@@ -1143,7 +1162,11 @@ set +f
 # configuration -- which sits in the earlier entries -- where it was. That is the
 # finding from the round before, kept fixed.
 if [ -n "$sp_cfg_params" ]; then
-  GIT_CONFIG_PARAMETERS="${GIT_CONFIG_PARAMETERS:-}$sp_cfg_params"
+  if [ -n "${GIT_CONFIG_PARAMETERS:-}" ]; then
+    GIT_CONFIG_PARAMETERS="$GIT_CONFIG_PARAMETERS $sp_cfg_params"
+  else
+    GIT_CONFIG_PARAMETERS="$sp_cfg_params"
+  fi
   export GIT_CONFIG_PARAMETERS
 fi
 unset sp_cfg_keys sp_k sp_k_esc sp_seen sp_cfg_params sp_q sp_bs sp_qrep
@@ -2519,10 +2542,15 @@ while read -r local_ref local_sha remote_ref remote_sha; do
         why="the empty tree, because this update introduces no commit and has no ancestry to compare"
       fi
       if [ "$unborn" = no ]; then
-      base_ref="refs/prepush-base-$$-${tmpdir##*/}"
-      if git rev-parse --verify --quiet "$base_ref" >/dev/null 2>&1; then
+      # ⚠ THE CLEANUP IS ARMED BY THE VARIABLE, SO THE VARIABLE IS SET LAST. Assigned
+      # here, the EXIT trap saw it on the collision path below and DELETED the very
+      # ref this branch refuses to overwrite -- a guard whose refusal did the damage
+      # it was refusing to do (shardpilot/shardpilot-go#79 review). The name is held
+      # in a second variable until the fetch has actually created it.
+      base_ref_name="refs/prepush-base-$$-${tmpdir##*/}"
+      if git rev-parse --verify --quiet "$base_ref_name" >/dev/null 2>&1; then
         printf 'REFUSING: %s already exists; refusing to overwrite a ref this hook did not create.\n' \
-          "$base_ref" >&2
+          "$base_ref_name" >&2
         exit 2
       fi
       # ⚠ HOOKS OFF FOR THIS FETCH TOO. It updates a ref, so a `reference-transaction`
@@ -2541,10 +2569,12 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       # message below, because a refusal that cannot say WHICH branch is a refusal an
       # operator cannot act on.
       if ! git_safe fetch --quiet --no-tags --no-write-fetch-head -- "$dest" \
-           "+HEAD:$base_ref" 2>/dev/null; then
+           "+HEAD:$base_ref_name" 2>/dev/null; then
         printf 'REFUSING: could not fetch %s from %s to compare against.\n' "$branch" "$safe_dest" >&2
         exit 2
       fi
+      # Created by this invocation, so now the cleanup may know about it.
+      base_ref="$base_ref_name"
       # ⚠ RESOLVED TO A SHA IMMEDIATELY, and the ref dropped. Two concurrent
       # created-ref pushes from this repository would otherwise both fetch into
       # the same `refs/prepush-base`, and one could overwrite it between the

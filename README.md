@@ -369,14 +369,16 @@ done < "$wp" &&
 chmod +x "$h/.pre-push.new" "$h/.check_public_surface.sh.new" ||
   { rm -f "$h/.pre-push.new" "$h/.check_public_surface.sh.new"; exit 1; } &&
 pv="$(mktemp)" &&
-prev_local="$(git config --local --get core.hooksPath 2>/dev/null || true)" &&
+{ prev_local="$(git config --local --get core.hooksPath 2>/dev/null)" && had_local=yes ||
+  { prev_local=""; had_local=no; }; } &&
 { test "$b" != true || printf '%s\0' "$gr" >> "$wp"; } &&
-sp_rollback(){ rm -f "$h/pre-push" "$h/check_public_surface.sh"
-  if test -n "$prev_local"
+sp_rollback(){ rm -f "$h/pre-push" "$h/check_public_surface.sh" \
+    "$h/.pre-push.new" "$h/.check_public_surface.sh.new"
+  if test "$had_local" = yes
   then git config --local core.hooksPath "$prev_local" 2>/dev/null || true
   else git config --local --unset core.hooksPath 2>/dev/null || true
   fi
-  while IFS="$(printf '\t')" read -r rw rv; do
+  while IFS= read -r -d "" rw && IFS= read -r -d "" rv; do
     test -n "$rw" || continue
     git -C "$rw" config --worktree core.hooksPath "$rv" 2>/dev/null || true
   done < "$pv"
@@ -388,7 +390,7 @@ mv "$h/.check_public_surface.sh.new" "$h/check_public_surface.sh" || sp_rollback
 while IFS= read -r -d "" w; do
   test "$(git -C "$w" config --bool extensions.worktreeConfig 2>/dev/null || echo false)" = true || continue
   if wv="$(git -C "$w" config --worktree --get core.hooksPath 2>/dev/null)"
-  then printf '%s\t%s\n' "$w" "$wv" >> "$pv"
+  then printf '%s\0%s\0' "$w" "$wv" >> "$pv"
   fi
   git -C "$w" config --worktree --unset-all core.hooksPath 2>/dev/null || true
 done < "$wp" &&

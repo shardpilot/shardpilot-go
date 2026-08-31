@@ -552,6 +552,40 @@ case "$(idx_detect "$idx_after")" in
   *) printf 'this hook: the invoking index is untouched [%s].\n' "$idx_after" ;;
 esac
 
+# ---- an ordinary push still succeeds ------------------------------------------
+#
+# ⚠ THE SECTIONS BELOW ASK WHAT EXECUTED, AND NEVER ASKED WHETHER THE PUSH WORKED.
+# `run_push_probe` swallows the exit status, so "nothing from the branch ran" was
+# reported identically whether the neutralisation worked or the hook DIED at its
+# first git call. It died: a leading separator in `GIT_CONFIG_PARAMETERS` made every
+# later git fail with "bogus format", and this gate refused every ordinary push for
+# two commits while these arms stayed green (shardpilot/shardpilot-go#79 review).
+#
+# So the first thing asserted is the thing a hook is for: a clean repository, with
+# nothing configured to run, must PUSH. Without this the arms below cannot tell a
+# working neutralisation from a broken hook.
+ord_fail=0
+ord_repo="$work/ord"; git init -q "$ord_repo"
+mkdir -p "$ord_repo/scripts" "$ord_repo/.git/hooks"
+printf '#!/bin/sh\nexit 0\n' > "$ord_repo/scripts/check_public_surface.sh"
+printf '#!/bin/sh\nexit 0\n' > "$ord_repo/.git/hooks/check_public_surface.sh"
+chmod +x "$ord_repo/scripts/check_public_surface.sh" "$ord_repo/.git/hooks/check_public_surface.sh"
+( cd "$ord_repo"
+  printf 'a\n' > f; git add -A >/dev/null 2>&1
+  git -c user.email=t@t -c user.name=t commit -q -m c1 >/dev/null 2>&1
+  git remote add origin "$probe_remote" >/dev/null 2>&1 ) || true
+cp "$hook" "$ord_repo/.git/hooks/pre-push"; chmod +x "$ord_repo/.git/hooks/pre-push"
+ord_rc=0
+( cd "$ord_repo" && git push -q origin HEAD:refs/heads/ordprobe >"$work/ord.out" 2>&1 ) || ord_rc=$?
+git -C "$probe_remote" update-ref -d refs/heads/ordprobe >/dev/null 2>&1 || true
+if [ "$ord_rc" -ne 0 ]; then
+  echo "FAIL: this hook refuses an ORDINARY push of a clean repository (rc=$ord_rc)." >&2
+  sed -n '1,4p' "$work/ord.out" >&2
+  ord_fail=1
+else
+  printf '\nthis hook: an ordinary push of a clean repository succeeds.\n'
+fi
+
 # ---- the executable-key enumeration covers the names git allows ---------------
 #
 # The enumeration derives which config keys to neutralise from `git config --list`,
@@ -764,4 +798,4 @@ printf '\n%d gitfile read(s) found, %d still line-oriented.\n' "$gf_total" "$gf_
 printf '%d checkout-root case(s), %d failure(s).\n' "$itotal" "$ifail"
 printf '%d case(s) judged, %d failure(s); %d normal-form case(s), %d failure(s).\n' \
   "$total" "$failures" "$ntotal" "$nfail"
-[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] && [ "$idx_fail" -eq 0 ] && [ "$inv_fail" -eq 0 ] && [ "$chl_fail" -eq 0 ] && [ "$bp_fail" -eq 0 ] && [ "$kre_fail" -eq 0 ] && [ "$esc_fail" -eq 0 ] || exit 1
+[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] && [ "$idx_fail" -eq 0 ] && [ "$inv_fail" -eq 0 ] && [ "$chl_fail" -eq 0 ] && [ "$bp_fail" -eq 0 ] && [ "$kre_fail" -eq 0 ] && [ "$esc_fail" -eq 0 ] && [ "$ord_fail" -eq 0 ] || exit 1
