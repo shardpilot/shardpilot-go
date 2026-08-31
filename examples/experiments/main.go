@@ -1080,9 +1080,9 @@ func base64SuffixCandidates(text string) []string {
 			text, haveText, bin, haveBin := base64Answers(tok[st:])
 			switch {
 			case haveText:
-				out = append(out, text)
+				out = capSeeds(out, text)
 			case haveBin:
-				out = append(out, bin)
+				out = capSeeds(out, bin)
 			}
 		}
 	}
@@ -4824,7 +4824,6 @@ func assertNoLeak(text string) error {
 			// the cap only afterwards (shardpilot/shardpilot-go#84 review). A limit
 			// tested after the work it bounds is a number in a message, which is the
 			// same sentence this file just applied to the decode budget.
-			const seedMax = 4096
 			initial := append(append([]string{dec}, bins...), sufs...)
 			if len(initial) > seedMax {
 				return fmt.Errorf(
@@ -5048,9 +5047,9 @@ func shortBase64Candidates(text string) []string {
 		text, haveText, bin, haveBin := base64Answers(tok)
 		switch {
 		case haveText:
-			out = append(out, text)
+			out = capSeeds(out, text)
 		case haveBin:
-			out = append(out, bin)
+			out = capSeeds(out, bin)
 		}
 	}
 	return out
@@ -5129,6 +5128,33 @@ func undoBase64(text string) string {
 //
 // These are CANDIDATES, not a rewrite: nothing is replaced, so the floor that
 // protects the rewrite is left where it is and the short forms are covered anyway.
+// seedMax bounds the candidate SET handed to the decoding chain.
+//
+// ⚠ AND IT IS ENFORCED WHERE CANDIDATES ARE PRODUCED. It stood as a check on the
+// assembled `initial` slice, which is a number in a message rather than a bound: a
+// 900 KiB body of `61 ` repeated makes roughly 300,000 hex seeds, and every one was
+// materialised -- about 104 MiB -- before the line claiming to cap them could
+// refuse (shardpilot/shardpilot-go#85 review). The comment above that check already
+// said "the cap is applied while collecting, not after"; it described the round
+// that had fixed the WORKLIST, and the producers were never given the same rule.
+//
+// Truncating a producer cannot weaken the leak scan, and that is by construction
+// rather than by care: any producer that reaches the cap makes the assembled set
+// exceed it, so the run refuses and `extra` is never read.
+const seedMax = 4096
+
+// capSeeds appends while there is room under the cap, so nothing past it is ever
+// materialised.
+func capSeeds(out []string, v ...string) []string {
+	for _, s := range v {
+		if len(out) >= seedMax {
+			return out
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
 func hexCandidates(text string) []string {
 	var out []string
 	for i := 0; i < len(text); {
@@ -5156,7 +5182,7 @@ func hexCandidates(text string) []string {
 			raw = append(raw, byte(v))
 		}
 		if ok {
-			out = append(out, string(raw))
+			out = capSeeds(out, string(raw))
 		}
 	}
 	return out
@@ -5289,7 +5315,7 @@ func binaryCandidates(text string) []string {
 				for _, c := range cands {
 					for _, raw := range d.decode(c) {
 						if !utf8.Valid(raw) {
-							out = append(out, string(raw))
+							out = capSeeds(out, string(raw))
 						}
 					}
 				}
@@ -5417,14 +5443,14 @@ func wrappedBase64Candidates(text string) []string {
 				// Padding ends the encoding here too: whatever follows is prose, and a
 				// candidate carrying it decodes to nothing.
 				if strings.HasSuffix(lines[j], "=") {
-					out = append(out, jb.String())
+					out = capSeeds(out, jb.String())
 					ended = "padding"
 					break
 				}
 				continue
 			}
 			if p := prefix(lines[j]); p != "" {
-				out = append(out, jb.String()+p)
+				out = capSeeds(out, jb.String()+p)
 			}
 			ended = "text"
 			break
@@ -5438,7 +5464,7 @@ func wrappedBase64Candidates(text string) []string {
 		// review). A run cut short by the WORK BUDGET is still not emitted: a
 		// truncated candidate is a spelling nothing decodes.
 		if ended == "" && jb.Len() > len(head) {
-			out = append(out, jb.String())
+			out = capSeeds(out, jb.String())
 		}
 	}
 	return out

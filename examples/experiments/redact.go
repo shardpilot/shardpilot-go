@@ -984,6 +984,18 @@ func redactSetCookie(line string) string {
 		return head + ": " + marked("<withheld>") + cr
 	}
 	if !hasValue {
+		// ⚠ AN EMPTY FIELD HAS NO VALUE BYTES TO CONCEAL. `Set-Cookie:` is preserved
+		// and serialised by net/http, and it went through the refusal written for
+		// `Set-Cookie: server-secret` -- a field carrying an endpoint token. There is
+		// no token here, so the refusal is about something that is not present, and an
+		// otherwise safe capture exited 4 (shardpilot/shardpilot-go#85 review).
+		//
+		// Measured across every protected and structural field before fixing it: this
+		// was the LAST one still refusing an empty value, the others having been
+		// answered the round before. For once the review named the whole class.
+		if ows(rest) == "" {
+			return head + ":" + rest + cr
+		}
 		// `Set-Cookie: server-secret` is transport-valid and net/http keeps it.
 		// Returning it unchanged published a server-generated value the guard
 		// cannot see (shardpilot/shardpilot-go#85 review).
@@ -1118,6 +1130,12 @@ func redactSetCookie(line string) string {
 			// above: `an` is about to be MARKED, and a lookup on the marked spelling
 			// answers about a name no registry contains.
 			canAttr, canKnown := cookieAttrCanonical(an, ows(av))
+			// ⚠ AND HERE FOR THE SAME REASON, WHICH THE SUITE HAD TO TELL ME. Asked
+			// after `an` is marked, the lookup answers about a name no registry
+			// contains, `enumerated` goes false, and the ORDINARY `SameSite=Lax` is
+			// lengthened -- two scenes went red on exactly that. The comment above was
+			// already written; I moved the question and not the reason for its place.
+			enumerated := cookieAttrEnumerates(ows(an))
 			// ⚠ AND THE CANONICAL SPELLING FOR A VALUED ATTRIBUTE TOO. The
 			// valueless-flag branch was given this rule a round ago and this one was
 			// not, so `standardCookieAttr` folding admitted an endpoint's `PATH` and
@@ -1156,7 +1174,6 @@ func redactSetCookie(line string) string {
 			// -- the specification ENUMERATES its values, so `Lax` is the grammar's own
 			// token whoever else also chose that string, and three sweep rows say it
 			// must survive.
-			_, enumerated := cookieAttrCanonicalEnumerated(canAttr)
 			if verbatim && canKnown && canonicalSpelling(ows(av), canAttr) &&
 				(enumerated || scrubSuppliedRaw(ows(av)) == ows(av)) {
 				// The VALUE is vouched for by the same criterion that admitted it; see
@@ -2640,11 +2657,57 @@ func redactFieldName(name string) string {
 // flag. `Path`, `Domain`, `Max-Age`, `Expires` and `SameSite` are not here: they
 // carry values, and a bare one is not a flag but an attribute the endpoint
 // truncated.
+// cookieAttr is everything this program knows about ONE cookie attribute, in one
+// row.
+//
+// ⚠ SIX HAND-WRITTEN LISTS ANSWERED FIVE QUESTIONS ABOUT NINE ATTRIBUTES, AND THEY
+// COULD DISAGREE. `Priority` was in the NAME list and in `standardCookieAttr`, and
+// in neither value list -- so an ordinary `Set-Cookie: sid=x; Priority=High` was
+// published as `Priority=redacted-4-chars` with an empty ledger, erasing the
+// cookie's priority while the analogous `SameSite` vocabulary was kept
+// (shardpilot/shardpilot-go#85 review).
+//
+// `cookieAttrCanonical`'s own comment already said it: "the review named one site,
+// and the count of sites is the thing that keeps being wrong in this file". The
+// header fields were given one row each for this reason a round ago; this is the
+// same repair on the same disease, and `TestEveryCookieAttributeHasExactlyOneRule`
+// asserts the property a sixth list cannot.
+type cookieAttr struct {
+	// canonical is the specification's spelling of the NAME.
+	canonical string
+	// flag: the attribute carries no value at all.
+	flag bool
+	// shape admits a value by its FORM -- an integer, an HTTP-date. A shape says
+	// nothing about who chose the content, which is why a collision on one cannot
+	// be answered with a canonical spelling.
+	shape func(string) bool
+	// values is the vocabulary the specification ENUMERATES, in its own spelling.
+	values []string
+	// free: the value is opaque by design and this program has no rule for it.
+	// Stated rather than left as an absence, so "no rule" cannot be a typo.
+	free bool
+}
+
+var cookieAttrs = map[string]cookieAttr{
+	"secure":      {canonical: "Secure", flag: true},
+	"httponly":    {canonical: "HttpOnly", flag: true},
+	"partitioned": {canonical: "Partitioned", flag: true},
+	"path":        {canonical: "Path", free: true},
+	"domain":      {canonical: "Domain", free: true},
+	"expires":     {canonical: "Expires", shape: isHTTPDate},
+	"max-age":     {canonical: "Max-Age", shape: maxAgeReadByTheParser},
+	"samesite":    {canonical: "SameSite", values: []string{"Lax", "Strict", "None"}},
+	"priority":    {canonical: "Priority", values: []string{"Low", "Medium", "High"}},
+}
+
+func cookieAttrRow(name string) (cookieAttr, bool) {
+	a, ok := cookieAttrs[strings.ToLower(ows(name))]
+	return a, ok
+}
+
 func canonicalCookieFlag(name string) (string, bool) {
-	for _, c := range []string{"Secure", "HttpOnly", "Partitioned"} {
-		if strings.EqualFold(name, c) {
-			return c, true
-		}
+	if a, ok := cookieAttrRow(name); ok && a.flag {
+		return a.canonical, true
 	}
 	return "", false
 }
@@ -2654,32 +2717,21 @@ func canonicalCookieFlag(name string) (string, bool) {
 // cookieAttrCanonicalEnumerated reports whether an admitted attribute VALUE comes
 // from a vocabulary the specification enumerates, as `SameSite` does -- as opposed
 // to one admitted by SHAPE, like an integer `Max-Age` or an HTTP-date `Expires`.
-func cookieAttrCanonicalEnumerated(canonicalValue string) (string, bool) {
-	for _, v := range []string{"Lax", "Strict", "None"} {
-		if canonicalValue == v {
-			return v, true
-		}
-	}
-	return "", false
+func cookieAttrEnumerates(name string) bool {
+	a, ok := cookieAttrRow(name)
+	return ok && len(a.values) > 0
 }
 
 func canonicalCookieAttr(name string) (string, bool) {
-	for _, c := range []string{"Secure", "HttpOnly", "Partitioned", "Path", "Domain",
-		"Expires", "Max-Age", "SameSite", "Priority"} {
-		if strings.EqualFold(name, c) {
-			return c, true
-		}
+	if a, ok := cookieAttrRow(name); ok {
+		return a.canonical, true
 	}
 	return "", false
 }
 
 func standardCookieAttr(name string) bool {
-	switch strings.ToLower(ows(name)) {
-	case "secure", "httponly", "partitioned", "path", "domain", "expires",
-		"max-age", "samesite", "priority":
-		return true
-	}
-	return false
+	_, ok := cookieAttrRow(name)
+	return ok
 }
 
 // canonicalSpelling answers, for a token some predicate RECOGNISED under folding,
@@ -2767,35 +2819,35 @@ func mintedCanonical(name string) (string, bool) {
 // VALUE. A numeric or date value is its own canonical form -- there is no
 // registry spelling to compare against -- and the enumerated ones are lower-case.
 func cookieAttrCanonical(name, value string) (string, bool) {
-	switch strings.ToLower(ows(name)) {
-	case "max-age":
-		// ⚠ THE SAME QUESTION AS `cookieAttrVerbatim`, AND IT WAS ASKED TWICE. Both
-		// sites spelled it `isDigits`, so repairing one left `-1` refused by the other
-		// and the attribute was still published as a length. One predicate answers it
-		// now; the review named one site, and the count of sites is the thing that
-		// keeps being wrong in this file.
-		if maxAgeReadByTheParser(value) {
+	// ⚠ THE SAME QUESTION AS `cookieAttrVerbatim`, AND IT WAS ASKED TWICE. Both
+	// sites spelled the Max-Age rule themselves, so repairing one left `-1` refused
+	// by the other and the attribute was still published as a length. One row
+	// answers both now; the review named one site, and the count of sites is the
+	// thing that kept being wrong in this file.
+	a, ok := cookieAttrRow(name)
+	if !ok || a.flag || a.free {
+		return "", false
+	}
+	// A SHAPE has no canonical spelling: its value is the endpoint's, admitted for
+	// its form, and returning it says only that the form was accepted.
+	if a.shape != nil {
+		if a.shape(value) {
 			return value, true
 		}
-	case "expires":
-		if isHTTPDate(value) {
-			return value, true
-		}
-	case "samesite":
-		// ⚠ THE SPELLING THE SPECIFICATION WRITES, not the fold target. My first
-		// version returned `strings.ToLower(value)` and so declared `lax` canonical --
-		// which lengthened the ORDINARY `SameSite=Lax`, the exact capture this
-		// vouching exists to keep readable, and two fixtures said so at once. The
-		// canonical form is a fact about the grammar; folding is only how a predicate
-		// recognises it.
-		//
-		// A legal but non-canonical spelling is not refused: it is left CAPTURED and
-		// redacted like any other value, which is the safe direction and the true
-		// statement about who wrote it.
-		for _, c := range []string{"Lax", "Strict", "None"} {
-			if strings.EqualFold(value, c) {
-				return c, true
-			}
+		return "", false
+	}
+	// ⚠ THE SPELLING THE SPECIFICATION WRITES, not the fold target. An earlier
+	// version returned `strings.ToLower(value)` and so declared `lax` canonical --
+	// which lengthened the ORDINARY `SameSite=Lax`, the exact capture this vouching
+	// exists to keep readable, and two fixtures said so at once. The canonical form
+	// is a fact about the grammar; folding is only how a predicate recognises it.
+	//
+	// A legal but non-canonical spelling is not refused: it is left CAPTURED and
+	// redacted like any other value, which is the safe direction and the true
+	// statement about who wrote it.
+	for _, c := range a.values {
+		if strings.EqualFold(value, c) {
+			return c, true
 		}
 	}
 	return "", false
@@ -2839,14 +2891,15 @@ func maxAgeReadByTheParser(value string) bool {
 }
 
 func cookieAttrVerbatim(name, value string) bool {
-	switch strings.ToLower(ows(name)) {
-	case "max-age":
-		return maxAgeReadByTheParser(value)
-	case "expires":
-		return isHTTPDate(value)
-	case "samesite":
-		switch strings.ToLower(value) {
-		case "lax", "strict", "none":
+	a, ok := cookieAttrRow(name)
+	if !ok || a.flag || a.free {
+		return false
+	}
+	if a.shape != nil {
+		return a.shape(value)
+	}
+	for _, v := range a.values {
+		if strings.EqualFold(value, v) {
 			return true
 		}
 	}

@@ -1248,9 +1248,18 @@ func TestASurfaceTheRulesCannotDescribeRefuses(t *testing.T) {
 	accountedSurfaces = nil
 	suppliedValues = nil
 	t.Cleanup(func() { structuralSurfaces = nil; accountedSurfaces = nil })
-	dropFraming("HTTP/1.1 200 OK\r\nSet-Cookie: \r\n\r\n{}")
+	// ⚠ THE EXAMPLE MOVED, THE SCENE DID NOT. This used `Set-Cookie: ` — an
+	// OWS-only value — which is a shape the rules CAN describe: there are no value
+	// bytes to conceal, so it is now published as it arrived and refusing it cost a
+	// safe capture exit 4 (shardpilot/shardpilot-go#85 review). The scene's job is
+	// unchanged and still needed: it is the positive control proving `refusalLedger`
+	// can FILL, without which it could return nil unconditionally and the whole
+	// suite stay green. So it is pointed at a surface that is still undescribable —
+	// a field with no `name=value` pair carrying an endpoint token — rather than
+	// weakened to match the new behaviour.
+	dropFraming("HTTP/1.1 200 OK\r\nSet-Cookie: server-secret\r\n\r\n{}")
 	if len(refusalLedger()) == 0 {
-		t.Fatal("a Set-Cookie with no name=value pair left the capture publishable")
+		t.Fatal("a Set-Cookie carrying an endpoint token with no name=value pair left the capture publishable")
 	}
 }
 
@@ -5505,10 +5514,23 @@ func TestTheSeedCapIsAppliedWhileCollecting(t *testing.T) {
 	t.Cleanup(func() { suppliedValues = nil; decodeWork = 0 })
 	decodeWork = 0
 	// ⚠ MEASURED IN ALLOCATIONS, WHICH IS WHAT THE FINDING IS ABOUT. Wall time does
-	// not separate the two -- 115ms against 202ms -- because the per-seed work is
-	// charged either way; what the cap changes is how much is BUILT first. Measured
-	// on this machine for a 900 KB body of `61 ` repeated: 56 MiB with the cap
-	// applied while collecting, 234 MiB without. The bound is 120 MiB, between them.
+	// not separate the two — the per-seed work is charged either way; what the cap
+	// changes is how much is BUILT first.
+	//
+	// ⚠ AND THE BOUND OUTLIVED ITS SUBJECT, FOR THE SECOND TIME IN THIS FILE. It was
+	// derived from the WORKLIST cap — 56 MiB against 234 MiB — and this scene
+	// carries the name of the property, not of that collection. The PRODUCERS were
+	// never capped, and they allocate 103 MiB on this very input: under the bound, so
+	// this test passed for four rounds while the thing it is named for was false
+	// (shardpilot/shardpilot-go#85 review). ⚠ The comment here also said the bound
+	// was 120 while the code said 160, so the two disagreed as well. A threshold is a
+	// fact about the
+	// measurement it came from, and this one had been left pointing at a different
+	// one.
+	//
+	// Re-derived on the same input, 900 KB of `61 ` repeated: 15 MiB with the
+	// producers capped, 103 MiB without. The bound is 32 MiB — between them, and
+	// close enough to the real number that the next drift cannot hide under it.
 	got := allocatedMiB(func() { _ = assertNoLeak(asCaptured(strings.Repeat("61 ", 300000))) })
 	// ⚠ THE BOUND IS RE-DERIVED FROM A MEASUREMENT, NOT INHERITED. 120 was chosen
 	// when this collection allocated 56 MiB; the short producer now answers a second
@@ -5522,10 +5544,10 @@ func TestTheSeedCapIsAppliedWhileCollecting(t *testing.T) {
 	// locally and red there, on a bound with 3 MiB of headroom
 	// (shardpilot/shardpilot-go#84 CI). A bound one toolchain passes is not a
 	// statement about the toolchains this repository builds on; the spread is about
-	// 6%, and what this scene must separate is 104 from 234.
-	if got > 160 {
-		t.Errorf("collecting the seeds allocated %d MiB; with the cap applied while "+
-			"collecting it is 104 here and 1521 with the cap raised out of reach", got)
+	// 6%, and what this scene must now separate is 15 from 103.
+	if got > 32 {
+		t.Errorf("collecting the seeds allocated %d MiB; with the producers capped it "+
+			"is 15 on this input and 103 without", got)
 	}
 }
 
@@ -5545,13 +5567,25 @@ func TestTheTransportErrorDecodeIsBounded(t *testing.T) {
 	}
 	line := "malformed HTTP response %" + tok
 	// ⚠ ALLOCATIONS AGAIN, AND THE SAME REASON: wall time is 45ms either way on a
-	// small line, and the cost is the retained forms. Measured on this machine for
-	// this 40 KB line: 516 MiB charged and bounded, 3394 MiB retaining every form.
-	// The bound is 1024 MiB, between them.
+	// small line, and the cost is the retained forms. When this was written the
+	// measurement was 516 MiB charged and bounded against 3394 MiB retaining every
+	// form, and the bound was set at 1024, between them.
+	//
+	// ⚠ AND THE SUBJECT MOVED UNDER IT. Re-measured here: this now allocates 0 MiB,
+	// so a 1024 MiB bound is three orders of magnitude above its own subject and
+	// could not detect the regression it exists for. Found by asking the same
+	// question of every allocation bound in this file after the seed cap's had
+	// outlived its subject — no review named this one.
+	//
+	// Re-derived only on the side that was re-measured: the bounded number is 0–1
+	// MiB now, so 64 sits far above it and still two orders below the 3394 the
+	// unbounded path cost when it was last measured. That unbounded figure is
+	// HISTORICAL and was not re-taken; a tighter bound than this should wait until
+	// it is.
 	got := allocatedMiB(func() { _ = sanitizeCaptured(errors.New(line)) })
-	if got > 1024 {
-		t.Errorf("scanning a %d-byte diagnostic allocated %d MiB; bounded it is 516 and "+
-			"unbounded 3394", len(line), got)
+	if got > 64 {
+		t.Errorf("scanning a %d-byte diagnostic allocated %d MiB; bounded it is 0-1 now "+
+			"and the unbounded path cost 3394 when last measured", len(line), got)
 	}
 }
 
@@ -7496,5 +7530,104 @@ func TestACanonicalSpellingIsStillPublished(t *testing.T) {
 		"HTTP/1.1 200 OK\r\nSet-Cookie: a=b; SameSite=Lax\r\n\r\n"))))
 	if !strings.Contains(ck, "SameSite=Lax") {
 		t.Errorf("an ordinary SameSite stopped being published as itself: %q", ck)
+	}
+}
+
+// ---- round on d1f00c1 ----
+
+// TestEveryCookieAttributeHasExactlyOneRule is the invariant six hand-written
+// lists could not hold. `Priority` was in the NAME list and in
+// `standardCookieAttr`, and in neither value list — so `Set-Cookie: sid=x;
+// Priority=High` was published as `Priority=redacted-4-chars`, erasing the cookie's
+// priority while the analogous `SameSite` vocabulary was kept.
+//
+// The rows carry `free` explicitly rather than leaving "no rule" as an absence,
+// because an absence is what a typo looks like.
+func TestEveryCookieAttributeHasExactlyOneRule(t *testing.T) {
+	for name, a := range cookieAttrs {
+		rules := 0
+		if a.flag {
+			rules++
+		}
+		if a.shape != nil {
+			rules++
+		}
+		if len(a.values) > 0 {
+			rules++
+		}
+		if a.free {
+			rules++
+		}
+		if rules != 1 {
+			t.Errorf("%q carries %d rules; a row must be exactly one of flag, shape, "+
+				"enumerated values, or explicitly free", name, rules)
+		}
+		if a.canonical == "" || !strings.EqualFold(a.canonical, name) {
+			t.Errorf("%q has canonical %q, which is not the same name folded", name, a.canonical)
+		}
+	}
+	// And the row set is the population every classifier reads, so a name known to
+	// one is known to all.
+	for _, n := range []string{"SameSite", "Priority", "Max-Age", "Secure", "Path"} {
+		if !standardCookieAttr(n) {
+			t.Errorf("%q is not a standard attribute according to the table", n)
+		}
+		if _, ok := canonicalCookieAttr(n); !ok {
+			t.Errorf("%q has no canonical spelling", n)
+		}
+	}
+}
+
+// TestARegisteredCookieVocabularyIsPreserved is the finding. `Priority` has a fixed
+// vocabulary exactly as `SameSite` does, and its values must survive for the same
+// reason: they are the grammar's own tokens, not the endpoint's choice.
+func TestARegisteredCookieVocabularyIsPreserved(t *testing.T) {
+	t.Cleanup(func() { suppliedValues, structuralSurfaces, accountedSurfaces = nil, nil, nil })
+	for _, c := range []struct{ raw, want string }{
+		{"Set-Cookie: sid=x; Priority=High", "Priority=High"},
+		{"Set-Cookie: sid=x; Priority=Low", "Priority=Low"},
+		{"Set-Cookie: sid=x; Priority=Medium", "Priority=Medium"},
+		{"Set-Cookie: sid=x; SameSite=Lax", "SameSite=Lax"},
+	} {
+		structuralSurfaces, accountedSurfaces, suppliedValues = nil, nil, nil
+		got := stripMarks(scrubSupplied(dropFraming(escapeMarks(
+			"HTTP/1.1 200 OK\r\n" + c.raw + "\r\n\r\n"))))
+		if !strings.Contains(got, c.want) {
+			t.Errorf("a registered vocabulary was lost: wanted %q in %q", c.want, got)
+		}
+	}
+	// And a value OUTSIDE the vocabulary is still the endpoint's, so this is not
+	// "publish whatever Priority carries".
+	structuralSurfaces, accountedSurfaces, suppliedValues = nil, nil, nil
+	got := stripMarks(scrubSupplied(dropFraming(escapeMarks(
+		"HTTP/1.1 200 OK\r\nSet-Cookie: sid=x; Priority=server-secret\r\n\r\n"))))
+	if strings.Contains(got, "server-secret") {
+		t.Errorf("an endpoint-chosen Priority value was published: %q", got)
+	}
+}
+
+// TestAnEmptySetCookieIsNotRefused: `Set-Cookie:` is preserved and serialised by
+// net/http, and it went through the refusal written for `Set-Cookie:
+// server-secret` — a field carrying an endpoint token. There is no token in the
+// empty case, so the refusal was about something not present and an otherwise safe
+// capture exited 4.
+func TestAnEmptySetCookieIsNotRefused(t *testing.T) {
+	t.Cleanup(func() { suppliedValues, structuralSurfaces, accountedSurfaces = nil, nil, nil })
+	for _, raw := range []string{"Set-Cookie:", "Set-Cookie: ", "Set-Cookie:\t"} {
+		structuralSurfaces, accountedSurfaces, suppliedValues = nil, nil, nil
+		got := stripMarks(dropFraming(escapeMarks("HTTP/1.1 200 OK\r\n" + raw + "\r\n\r\n{}")))
+		if len(refusalLedger()) != 0 {
+			t.Errorf("%q was refused though it carries no value bytes: %q", raw, refusalLedger())
+		}
+		if strings.Contains(got, "withheld") {
+			t.Errorf("%q was withheld though there is nothing to conceal: %q", raw, got)
+		}
+	}
+	// The refusal still fires for a field that DOES carry an endpoint token with no
+	// name=value pair, which is what it was written for.
+	structuralSurfaces, accountedSurfaces, suppliedValues = nil, nil, nil
+	dropFraming(escapeMarks("HTTP/1.1 200 OK\r\nSet-Cookie: server-secret\r\n\r\n{}"))
+	if len(refusalLedger()) == 0 {
+		t.Fatal("a Set-Cookie carrying an endpoint token was left publishable")
 	}
 }
