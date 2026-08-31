@@ -538,6 +538,21 @@ func vouchScheme(line string) string {
 			// Only where it COLLIDES: a non-canonical scheme that is nobody's identifier
 			// is endpoint text and is published as received.
 			if scrubSuppliedRaw(bare) != bare {
+				// ⚠ AND A TOKEN PLACEHOLDER IS NOT A SCHEME EITHER. `HTTPS` colliding
+				// produced `redacted-5-chars://e.example/...` with an EMPTY ledger --
+				// structurally shaped, and naming a transport no client has
+				// (shardpilot/shardpilot-go#85 review). Declining to vouch was fixed
+				// here; declining to keep the MEANING was not, and the two are the same
+				// sentence one step apart.
+				//
+				// Schemes fold, so the canonical spelling means what the received one
+				// meant and is THIS program's text -- the same answer the admitted
+				// header value already gives. Refused only where that spelling is
+				// supplied too, because then nothing semantics-preserving is left.
+				if can := strings.ToLower(bare); scrubSuppliedRaw(can) == can {
+					return line[:j+1] + vouched(can) + line[i:]
+				}
+				noteStructural(formField, "a redirect scheme whose colliding spelling has no grammar-preserving replacement")
 				return line[:j+1] + tokenPlaceholder(bare) + line[i:]
 			}
 			return line
@@ -1154,6 +1169,22 @@ func redactSetCookie(line string) string {
 			if verbatim && canKnown && !enumerated && canonicalSpelling(ows(av), canAttr) &&
 				scrubSuppliedRaw(ows(av)) != ows(av) {
 				noteStructural(formField, "a shape-admitted cookie attribute whose colliding value has no grammar-preserving spelling")
+			}
+			// ⚠ THE ENUMERATED ATTRIBUTE HAS THE SAME GAP AS THE REDIRECT SCHEME, and
+			// no review named it -- found by asking the population when the scheme was
+			// shown. `SameSite=LAX` with a supplied `LAX` is non-canonical, so the
+			// vouch above declines and the refusal beside it is for SHAPE-admitted
+			// attributes only; the value then reached the placeholder and produced
+			// `SameSite=redacted-3-chars`, which is not one of `Strict|Lax|None`, with
+			// an empty ledger. The enumeration folds, so its canonical spelling means
+			// what arrived and is this program's text.
+			if verbatim && canKnown && enumerated && !canonicalSpelling(ows(av), canAttr) &&
+				scrubSuppliedRaw(ows(av)) != ows(av) {
+				if scrubSuppliedRaw(canAttr) == canAttr {
+					parts[i] = an + syntax("=") + strings.Replace(av, ows(av), vouched(canAttr), 1)
+					continue
+				}
+				noteStructural(formField, "an enumerated cookie attribute whose colliding spelling has no grammar-preserving replacement")
 			}
 			parts[i] = an + syntax("=") + tokenPlaceholder(unescapeMarks(ows(av)))
 		}

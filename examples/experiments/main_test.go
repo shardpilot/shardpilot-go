@@ -7326,3 +7326,80 @@ func TestAnOpaqueTargetKeepsTheReceivedFieldLayout(t *testing.T) {
 		t.Errorf("a header with no OWS gained some: %q", tight)
 	}
 }
+
+// TestANonCanonicalCollisionKeepsItsGrammar is this round's finding and the
+// sibling no review named. Declining to VOUCH a non-canonical spelling was right;
+// leaving it to a scrub that does not know the field's grammar was not, and the
+// two are the same sentence one step apart.
+//
+// Both tokens fold, so the canonical spelling means what arrived and is this
+// program's own text — the answer the admitted header value already gives.
+func TestANonCanonicalCollisionKeepsItsGrammar(t *testing.T) {
+	t.Cleanup(func() { suppliedValues, structuralSurfaces, accountedSurfaces = nil, nil, nil })
+	for _, c := range []struct{ name, supplied, raw, want, reject string }{
+		{"the redirect scheme", "HTTPS",
+			"HTTP/1.1 302 Found\r\nLocation: HTTPS://e.example/cb\r\n\r\n",
+			"Location: https://", "redacted-5-chars://"},
+		{"an enumerated cookie attribute", "LAX",
+			"HTTP/1.1 200 OK\r\nSet-Cookie: a=b; SameSite=LAX\r\n\r\n",
+			"SameSite=Lax", "SameSite=redacted-3-chars"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			suppliedValues, structuralSurfaces, accountedSurfaces = []string{c.supplied}, nil, nil
+			got := stripMarks(scrubSupplied(dropFraming(escapeMarks(c.raw))))
+			if strings.Contains(got, c.reject) {
+				t.Errorf("a placeholder its own grammar rejects was published: %q", got)
+			}
+			if !strings.Contains(got, c.want) {
+				t.Errorf("the canonical spelling was not substituted: %q", got)
+			}
+			if len(refusalLedger()) != 0 {
+				t.Errorf("a repairable collision was refused: %q", refusalLedger())
+			}
+		})
+	}
+}
+
+// TestACollisionWithNoSafeSpellingRefuses is the other edge, and the reason the
+// repair above is not just "always lower-case it". When the canonical spelling is
+// ITSELF supplied, nothing semantics-preserving is left — and a placeholder with an
+// empty ledger is exactly the shape this whole change exists to stop.
+func TestACollisionWithNoSafeSpellingRefuses(t *testing.T) {
+	t.Cleanup(func() { suppliedValues, structuralSurfaces, accountedSurfaces = nil, nil, nil })
+	for _, c := range []struct {
+		name, raw string
+		supplied  []string
+	}{
+		{"the redirect scheme", "HTTP/1.1 302 Found\r\nLocation: HTTPS://e.example/cb\r\n\r\n",
+			[]string{"HTTPS", "https"}},
+		{"an enumerated cookie attribute", "HTTP/1.1 200 OK\r\nSet-Cookie: a=b; SameSite=LAX\r\n\r\n",
+			[]string{"LAX", "Lax"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			suppliedValues, structuralSurfaces, accountedSurfaces = c.supplied, nil, nil
+			dropFraming(escapeMarks(c.raw))
+			if len(refusalLedger()) == 0 {
+				t.Fatal("no spelling was left and the capture was published anyway")
+			}
+		})
+	}
+}
+
+// TestACanonicalSpellingIsStillPublished is the third edge: an ordinary value that
+// collides with nothing must be untouched, or the repair has been achieved by
+// redacting everything.
+func TestACanonicalSpellingIsStillPublished(t *testing.T) {
+	t.Cleanup(func() { suppliedValues, structuralSurfaces, accountedSurfaces = nil, nil, nil })
+	suppliedValues, structuralSurfaces, accountedSurfaces = nil, nil, nil
+	got := stripMarks(scrubSupplied(dropFraming(escapeMarks(
+		"HTTP/1.1 302 Found\r\nLocation: https://e.example/cb\r\n\r\n"))))
+	if !strings.Contains(got, "Location: https://e.example/") {
+		t.Errorf("an ordinary redirect stopped being published as itself: %q", got)
+	}
+	structuralSurfaces, accountedSurfaces = nil, nil
+	ck := stripMarks(scrubSupplied(dropFraming(escapeMarks(
+		"HTTP/1.1 200 OK\r\nSet-Cookie: a=b; SameSite=Lax\r\n\r\n"))))
+	if !strings.Contains(ck, "SameSite=Lax") {
+		t.Errorf("an ordinary SameSite stopped being published as itself: %q", ck)
+	}
+}
