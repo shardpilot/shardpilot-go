@@ -6693,3 +6693,66 @@ func TestASignedMaxAgeKeepsItsGrammar(t *testing.T) {
 		}
 	}
 }
+
+// TestANonBracketedAuthorityIsMeasuredAgainstTheHostGrammar: the host exemption
+// rests on "publicly resolvable and constrained by its grammar", and the predicate
+// that decides it validated the BRACKETED authority thoroughly and then returned
+// true for everything else.
+//
+// ⚠ `url.Parse` IS PERMISSIVE ABOUT REGISTERED NAMES. It accepts `se_cret`, `a;b`,
+// `host$tok` and `..`, all of which rode into the capture VERBATIM with nothing
+// recorded (shardpilot/shardpilot-go#85 review). RFC 3986 `reg-name` is not the
+// test either -- it admits the sub-delims `!$&'()*+,;=`, so it would accept exactly
+// the spellings that carried the text through. What the exemption is about is LDH.
+func TestANonBracketedAuthorityIsMeasuredAgainstTheHostGrammar(t *testing.T) {
+	t.Cleanup(func() { structuralSurfaces, accountedSurfaces = nil, nil })
+	for _, c := range []struct {
+		authority string
+		isHost    bool
+	}{
+		// ⚠ THE ALLOWED HALF IS THE POINT OF THIS SCENE. A guard that replaced these
+		// would cost every capture its redirect target.
+		{"ok.example", true}, {"ok.example.", true}, {"a.b.c:8443", true},
+		{"xn--9ca.example", true}, {"127.0.0.1", true}, {"[2001:db8::1]", true},
+		{"localhost", true}, {"user:pass@ok.example", true},
+		{"se_cret", false}, {"a;b", false}, {"host$tok", false}, {"..", false},
+		{"-lead", false}, {"trail-", false}, {"sec.ret:99999999", false},
+	} {
+		structuralSurfaces, accountedSurfaces = nil, nil
+		got := stripMarks(dropFraming("HTTP/1.1 302 Found\r\nLocation: https://" + c.authority + "/cb\r\n\r\n"))
+		host := c.authority
+		if i := strings.LastIndexByte(host, '@'); i >= 0 {
+			host = host[i+1:]
+		}
+		if kept := strings.Contains(got, "://"+c.authority+"/") ||
+			strings.Contains(got, "@"+host+"/"); kept != c.isHost {
+			t.Errorf("authority %q kept=%v, want %v (%q)", c.authority, kept, c.isHost, got)
+		}
+		if !c.isHost && !slices.Contains(accountedSurfaces, "a redirect authority that is not a host") {
+			t.Errorf("authority %q was replaced without reaching a ledger: %v", c.authority, accountedSurfaces)
+		}
+	}
+}
+
+// TestAnEmptyCookieAttributeNameIsRefused: `sid=x; =secret` is transport-valid and
+// its extension has no name. The placeholder path rendered it
+// `redacted-0-chars=redacted-6-chars` -- INVENTING a syntactically valid attribute
+// where the endpoint sent a malformed one, and recording nothing, so the capture
+// concealed the response defect (shardpilot/shardpilot-go#85 review). The PRIMARY
+// cookie name asks exactly this question a hundred lines up and withholds.
+func TestAnEmptyCookieAttributeNameIsRefused(t *testing.T) {
+	t.Cleanup(func() { structuralSurfaces = nil })
+	structuralSurfaces = nil
+	got := stripMarks(redactSetCookie("Set-Cookie: sid=x; =secret"))
+	if !strings.Contains(got, "<withheld>") || len(structuralSurfaces) == 0 {
+		t.Errorf("an attribute with an empty name was rendered as one: %q %v", got, structuralSurfaces)
+	}
+	// ⚠ AND ORDINARY ATTRIBUTES AND FLAGS ARE UNTOUCHED, or the check has turned
+	// every cookie into a withheld one.
+	for _, ck := range []string{"sid=x; Path=/", "sid=x; Secure", "sid=x; Max-Age=-1"} {
+		structuralSurfaces = nil
+		if got := stripMarks(redactSetCookie("Set-Cookie: " + ck)); strings.Contains(got, "<withheld>") {
+			t.Errorf("%q was withheld: %q %v", ck, got, structuralSurfaces)
+		}
+	}
+}

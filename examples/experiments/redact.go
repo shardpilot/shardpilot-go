@@ -661,7 +661,27 @@ func redactTarget(line string) string {
 		// wrong.
 		if a := authorityOf(strings.TrimSuffix(url, "\r")); a != "" {
 			{
-				if scrubSuppliedRaw(a) != a {
+				if !authorityIsHostShaped(a) {
+					// ⚠ THE EXEMPTION'S PREMISE IS `publicly resolvable and constrained by
+					// its grammar`, and a non-bracketed authority was never measured against
+					// it -- `parsesAsURI` validates the BRACKETED form thoroughly and then
+					// returns true for everything else. `url.Parse` accepts `se_cret`,
+					// `a;b`, `host$tok` and `..`, all of which rode into the capture
+					// VERBATIM with nothing recorded (shardpilot/shardpilot-go#85 review).
+					//
+					// ⚠ AND THE AUTHORITY IS REPLACED, NOT THE TARGET WITHHELD. Failing
+					// `parsesAsURI` costs the whole redirect target; the defect is one
+					// component, so it is answered where the colliding-value branch beside
+					// it is answered -- the target stays readable and the endpoint's token
+					// does not ride through. The named limit: an underscore host, which
+					// exists in service records and is not a publicly resolvable name, is
+					// replaced here rather than kept.
+					noteAccounted(formField, "a redirect authority that is not a host")
+					if lo, hi, ok := authorityRange(strings.TrimSuffix(url, "\r")); ok {
+						url = url[:lo] + tokenPlaceholder(a) + url[hi:]
+						line = head + ":" + gap + url
+					}
+				} else if scrubSuppliedRaw(a) != a {
 					// ⚠ REPLACED AND THEN CARRIED ON. Returning here skipped the path,
 					// query, fragment and userinfo redactors, so
 					// `https://e.example/cb?state=<token>` kept an endpoint token the
@@ -971,6 +991,18 @@ func redactSetCookie(line string) string {
 			// round before does not look (shardpilot/shardpilot-go#85 review).
 			// Standard attribute names are specification-fixed; anything else is
 			// a string the origin invented, exactly as on the cookie itself.
+			// ⚠ AND AN ATTRIBUTE NAME CAN BE EMPTY TOO. `sid=x; =secret` is
+			// transport-valid and its extension has no name; the placeholder path below
+			// rendered it `redacted-0-chars=redacted-6-chars` -- INVENTING a
+			// syntactically valid attribute where the endpoint sent a malformed one,
+			// and recording nothing, so the response defect was hidden by the capture
+			// (shardpilot/shardpilot-go#85 review). The PRIMARY cookie name a hundred
+			// lines up asks exactly this question and withholds; the rule was stated
+			// for the name and not for the attributes standing beside it.
+			if ows(an) == "" {
+				noteStructural(formField, "a Set-Cookie attribute with an empty name")
+				return head + ": " + marked("<withheld>") + cr
+			}
 			if !standardCookieAttr(an) {
 				// ⚠ MARKED, NOT STRIPPED -- the same defect as the parameter names one
 				// round earlier, in the branch I wrote after fixing it there. A
@@ -2823,4 +2855,66 @@ func redactUnlessVerbatim(line string) string {
 	// reversible escape rather than the endpoint's bytes
 	// (shardpilot/shardpilot-go#85 review).
 	return name + ": " + placeholder(unescapeMarks(ows(value))) + cr
+}
+
+// authorityIsHostShaped reports whether an authority is the kind of name the host
+// exemption's premise is about: one that is publicly resolvable and constrained by
+// its grammar. A bracketed literal has already been judged by `parsesAsURI`, which
+// checks the IPv6, IPvFuture and zone grammars; this is the non-bracketed form,
+// which that predicate accepted unconditionally.
+//
+// ⚠ RFC 3986 `reg-name` IS NOT THE TEST, though it is the obvious one to reach for.
+// It admits the sub-delims `!$&'()*+,;=`, so `host$tok` and `a;b` are legal
+// reg-names -- and they are exactly the spellings that carried endpoint text
+// through. The exemption does not rest on "is this a legal reg-name"; it rests on
+// "is this a name the world resolves", which is LDH: letters, digits and hyphens in
+// dot-separated labels, no label beginning or ending in a hyphen. An
+// internationalised host reaches this program as punycode, which is LDH.
+func authorityIsHostShaped(a string) bool {
+	// ⚠ USERINFO IS NOT THE HOST, and it has its own redaction one pass along. The
+	// first version of this asked the whole authority, so `user:pass@host.example`
+	// failed on the `@` and the HOST was replaced with it -- destroying the redirect
+	// target the capture exists to show. Two scenes said so on the first run, which
+	// is the answer to "what does this guard forbid that should be allowed".
+	if i := strings.LastIndexByte(a, '@'); i >= 0 {
+		a = a[i+1:]
+	}
+	host := a
+	if i := strings.LastIndexByte(a, ':'); i >= 0 && !strings.Contains(a, "]") {
+		port := a[i+1:]
+		host = a[:i]
+		if port == "" || !isDigits(port) {
+			return false
+		}
+		// ⚠ AND THE PORT IS A NUMBER IN RANGE, not merely digits: `:99999999` is not a
+		// port any stack will dial, and digits alone admitted it.
+		n := 0
+		for j := 0; j < len(port); j++ {
+			n = n*10 + int(port[j]-'0')
+			if n > 65535 {
+				return false
+			}
+		}
+	}
+	if strings.HasPrefix(host, "[") {
+		return true // the bracketed grammars are parsesAsURI's subject
+	}
+	// A single trailing dot is a root-anchored FQDN and legal.
+	host = strings.TrimSuffix(host, ".")
+	if host == "" {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if label == "" || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+				(c >= '0' && c <= '9') || c == '-') {
+				return false
+			}
+		}
+	}
+	return true
 }
