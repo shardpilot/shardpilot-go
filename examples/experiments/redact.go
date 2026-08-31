@@ -1966,7 +1966,15 @@ func redactMintedBody(body string, exempt map[string]bool) string {
 		// (shardpilot/shardpilot-go#85 review). The question was never about escapes;
 		// it is whether THIS program would have written that spelling.
 		can, known := benignCanonicalIn(exempt, dec)
-		if !known {
+		// ⚠ AND A MINTED NAME IS ONLY GRAMMAR WHERE THE SDK READS ONE. The benign
+		// half asks `exempt`; this fallback asked the minted registry
+		// unconditionally, so on a 404 carrying `{"subject_fact_key":""}` the
+		// endpoint-chosen member name was vouched -- and with that name supplied,
+		// both the scrub and the guard skipped it and published the identifier
+		// (shardpilot/shardpilot-go#84 review). The parent found this in
+		// `markBareJSONLiterals` and gated it there; this is the same consultation
+		// in the pass THIS half added, which the parent's chain never reaches.
+		if !known && len(exempt) > 0 {
 			can, known = mintedCanonical(dec)
 		}
 		if known && raw == dec && canonicalSpelling(dec, can) {

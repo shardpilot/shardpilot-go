@@ -92,7 +92,7 @@ func TestEveryVouchedTokenSurvivesTheScrub(t *testing.T) {
 				continue
 			}
 			probes = append(probes, pv("benign JSON member",
-				shape+"\r\n\r\n{\""+name+"\":1}", name))
+				shape+"\r\n\r\n"+benignMemberDocument(name), name))
 		}
 	}
 	probes = append(probes, pv("HTTP/1 reason phrase", "HTTP/1.1 200 OK\r\n\r\n", "OK"))
@@ -171,11 +171,16 @@ func TestEveryVouchedTokenSurvivesTheScrub(t *testing.T) {
 			accountedSurfaces = nil
 			receivedConnection = true
 			suppliedValues = []string{p.tok}
+			// ⚠ AND THE ECHOED KEYS, because the shape gate reads them. The SDK
+			// accepts an echo only where it matches what THIS request asked for, so
+			// a document carrying `app_key` parses only with the slot filled.
+			requestedAppKey, requestedEnvKey, requestedExpKey = "a", "e", "x"
 			t.Cleanup(func() {
 				suppliedValues = nil
 				structuralSurfaces = nil
 				accountedSurfaces = nil
 				receivedConnection = false
+				requestedAppKey, requestedEnvKey, requestedExpKey = "", "", ""
 			})
 			red := scrubSupplied(dropFraming(p.line))
 			got := stripMarks(red)
@@ -375,4 +380,33 @@ func TestSuppliedPunctuationDoesNotAlterStructure(t *testing.T) {
 			}
 		}
 	}
+}
+
+// benignMemberDocument renders a body the SDK ACCEPTS that carries `name` as a
+// top-level member.
+//
+// ⚠ THE EXEMPTION IS SHAPE-GATED, SO THE CONTEXT IS PART OF THE PROBE. A member
+// name is this program's grammar only where the SDK reads the shape; `{"x":1}` is
+// a document the SDK REJECTS, so in it this program vouches nothing -- and
+// asserting that the name survives the scrub asserted a promise it does not make
+// (shardpilot/shardpilot-go#84 review, which added the gate). The values are per
+// member because `1` is the wrong type for every field that is not a raw message,
+// and a member with no value here falls back to `1` so the sweep fails loudly
+// rather than quietly probing a document the SDK will not read.
+func benignMemberDocument(name string) string {
+	switch name {
+	case "error":
+		return `{"error":"x"}`
+	case "assigned":
+		return `{"assigned":false}`
+	}
+	v := map[string]string{
+		"version": `1`, "reason": `"kill_switch"`,
+		"app_key": `"a"`, "environment_key": `"e"`, "experiment_key": `"x"`,
+		"variant_key": `"v"`, "variant_payload": `{}`, "boundary": `{}`,
+	}[name]
+	if v == "" {
+		v = `1`
+	}
+	return `{"assigned":false,"` + name + `":` + v + `}`
 }
