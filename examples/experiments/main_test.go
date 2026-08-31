@@ -7116,6 +7116,68 @@ func TestARedirectLegPublishesNoEndpointTarget(t *testing.T) {
 	}
 }
 
+// TestACrossHostRedirectPublishesNoEndpointAuthority is this round's P1, and it is
+// the case I ARGUED OUT of the previous round's population. I wrote that a redirect
+// leg's `Host` is not a leak because the response side exempts a host as
+// structurally constrained -- reasoning about the exemption's RULE and not its
+// PREMISE. The premise is "publicly resolvable and constrained by its grammar", and
+// `redactTarget` enforces it: measured, the response side prints
+// `http://redacted-13-chars/redacted-2-chars` for `http://server_secret/cb` while
+// the request leg published `Host: server_secret` with an EMPTY ledger.
+//
+// The dial fails -- that host does not resolve -- but `DumpRequestOut` runs inside
+// `RoundTrip`, so the leg is recorded and published either way.
+func TestACrossHostRedirectPublishesNoEndpointAuthority(t *testing.T) {
+	t.Cleanup(func() { suppliedValues, structuralSurfaces, accountedSurfaces = nil, nil, nil })
+	suppliedValues, structuralSurfaces, accountedSurfaces = nil, nil, nil
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "http://server_secret/cb", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	rec := &recorder{inner: http.DefaultTransport}
+	req, _ := http.NewRequest("GET", srv.URL+assignmentRoute, nil)
+	if resp, err := (&http.Client{Transport: rec}).Do(req); err == nil {
+		_ = resp.Body.Close()
+	}
+	if len(rec.exchanges) != 2 {
+		t.Fatalf("expected the assignment and the followed leg, got %d", len(rec.exchanges))
+	}
+	for i := range rec.exchanges {
+		got := stripMarks(scrubSupplied(string(rec.exchanges[i].req)))
+		if strings.Contains(got, "server_secret") {
+			t.Errorf("leg %d published the endpoint's own authority:\n%s", i, got)
+		}
+	}
+	// And the response side's answer for the same authority, so the two halves are
+	// pinned as AGREEING rather than each being right on its own.
+	structuralSurfaces, accountedSurfaces = nil, nil
+	if resp := stripMarks(redactTarget("Location: http://server_secret/cb")); strings.Contains(resp, "server_secret") {
+		t.Errorf("the response side stopped enforcing the exemption's premise: %q", resp)
+	}
+}
+
+// TestARedirectLegMarksItsFieldNames is the second half of the same repair. The
+// first version of the `Referer` branch returned `redactTarget`'s line as it
+// stands, leaving the field NAME bare inside the captured span -- so a legal
+// experiment key of `Referer` or `Host` would be reported by the guard as a
+// survivor and refuse every run, which is what `Host` and `User-Agent` already cost
+// this file once.
+func TestARedirectLegMarksItsFieldNames(t *testing.T) {
+	t.Cleanup(func() { suppliedValues, structuralSurfaces, accountedSurfaces = nil, nil, nil })
+	for _, key := range []string{"Referer", "Host"} {
+		t.Run(key, func(t *testing.T) {
+			suppliedValues, structuralSurfaces, accountedSurfaces = []string{key}, nil, nil
+			dump := []byte(escapeMarks("GET /cb HTTP/1.1\r\nHost: other.example\r\n" +
+				"Referer: http://e.example/prev\r\n\r\n"))
+			got := string(redact(dump, http.Header{"Host": nil, "Referer": nil}, true))
+			if err := assertNoLeak(asCaptured(got)); err != nil {
+				t.Fatalf("the %s field name was reported as a surviving supplied value: %v", key, err)
+			}
+		})
+	}
+}
+
 // TestAHarnessOriginatedRequestIsUnchanged is the other edge. The repair above
 // hands two lines of a request dump to the RESPONSE side's redactor, and applying
 // that to the leg this program itself composed would lengthen the parameter names

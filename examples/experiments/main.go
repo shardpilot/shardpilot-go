@@ -3108,6 +3108,16 @@ func redact(dump []byte, ours http.Header, fromRedirect bool) []byte {
 			if strings.HasSuffix(body, "\r") {
 				cr, body = "\r", strings.TrimSuffix(body, "\r")
 			}
+			// ⚠ AND THE NAME IS MARKED, like every other request header name. The
+			// first version returned `redactTarget`'s line as it stands, leaving
+			// `Referer` bare inside the captured span -- so a legal experiment key of
+			// `Referer` would be reported by the guard as a survivor and refuse every
+			// run, exactly as `Host` and `User-Agent` did before them.
+			if name, gap, _, ok := splitField(body); ok {
+				out = append(out, marked(name+":")+gap+
+					strings.TrimPrefix(redactTarget(body), name+":"+gap)+cr)
+				continue
+			}
 			out = append(out, redactTarget(body)+cr)
 			continue
 		}
@@ -3146,6 +3156,23 @@ func redact(dump []byte, ours http.Header, fromRedirect bool) []byte {
 					out = append(out, marked(line[:i+1]+v)+cr)
 					continue
 				}
+			}
+		}
+		// ⚠ A CROSS-HOST REDIRECT PUTS THE ENDPOINT'S AUTHORITY HERE. The branch
+		// above vouches `Host` only when it IS the configured one; anything else on a
+		// followed leg was chosen by the endpoint, and the generic branch below marks
+		// the NAME and leaves the value to a scrub that cannot see it. See
+		// endpointChosenAuthority for why "a host is exempt" does not cover this.
+		if fromRedirect && strings.HasPrefix(strings.ToLower(line), "host:") &&
+			!strings.HasPrefix(line, genMark) {
+			cr := ""
+			body := line
+			if strings.HasSuffix(body, "\r") {
+				cr, body = "\r", strings.TrimSuffix(body, "\r")
+			}
+			if name, gap, value, ok := splitField(body); ok && value != "" {
+				out = append(out, marked(name+":")+gap+endpointChosenAuthority(value)+cr)
+				continue
 			}
 		}
 		if strings.HasPrefix(strings.ToLower(line), "authorization:") {

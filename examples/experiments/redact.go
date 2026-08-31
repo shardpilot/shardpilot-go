@@ -716,6 +716,28 @@ func redactTarget(line string) string {
 	return redactIPvFutureBody(redactZone(redactPath(redactUserinfo(redactResponseQuery(line)))))
 }
 
+// endpointChosenAuthority redacts a bare authority the ENDPOINT chose, through the
+// same target pipeline, by giving it the network-path spelling the pipeline reads.
+//
+// ⚠ THE HOST EXEMPTION IS A PREMISE, NOT A BLANKET. I ruled `Host` out of the
+// redirect-leg population by arguing that the response side exempts a host as
+// structurally constrained, so publishing one here is the same ruling. It is not,
+// and the counter-example is the one this file already learned about: the
+// exemption's premise is "publicly resolvable and constrained by its grammar", and
+// `redactTarget` ENFORCES that premise rather than assuming it. After
+// `Location: http://server_secret/cb` the response side prints
+// `http://redacted-13-chars/redacted-2-chars` -- and the request leg published
+// `Host: server_secret` with an EMPTY refusal ledger, because a value the harness
+// never supplied is invisible to `assertNoLeak` (shardpilot/shardpilot-go#85
+// review). Measured, both halves, before believing either.
+//
+// I quoted the exemption and forgot it has an owner. An exemption reasoned about
+// by its RULE and not by its PREMISE is how the hole gets argued for.
+func endpointChosenAuthority(value string) string {
+	const synth = "X-Redirect-Authority"
+	return strings.TrimPrefix(redactTarget(synth+": //"+value), synth+": //")
+}
+
 // redirectRequestLine redacts the target of a request line the endpoint chose.
 // The line is `METHOD SP target SP HTTP/1.1`; only the middle field is data.
 func redirectRequestLine(line string) string {
