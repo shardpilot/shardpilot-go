@@ -824,7 +824,7 @@ ins_fail=0
 ins_src="$here/README.md"
 ins="$work/installer.sh"
 if [ ! -r "$ins_src" ]; then
-  echo "REFUSING: cannot read $ins_src, so the published installer was not tested." >&2
+  echo "REFUSING: cannot read $ins_src, so the section below had nothing to run." >&2
   exit 2
 fi
 awk 'index($0,"p_(){ x=\"$(cd -- \"$1\"")==1{f=1} f&&/^```$/{exit} f{print}' "$ins_src" > "$ins"
