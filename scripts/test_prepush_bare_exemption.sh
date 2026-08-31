@@ -587,6 +587,42 @@ for k in $must_miss; do
 done
 [ "$kre_fail" -eq 0 ] && printf '\nthis hook: the executable-key pattern covers dotted, globbed and ordinary names.\n'
 
+# ---- a config key carrying a quote does not poison every later git -------------
+#
+# `filter.x'y.clean` is a valid key, and interpolated raw into
+# `GIT_CONFIG_PARAMETERS` it produced malformed syntax after which EVERY subsequent
+# git exited with "bogus format" (shardpilot/shardpilot-go#79 review). The escaper is
+# lifted from the hook and handed to a real git, so this asserts what git accepts
+# rather than what the sequence looks like.
+esc_fail=0
+eval "$(grep -E '^sp_q=|^sp_bs=|^sp_qrep=' "$hook")" 2>/dev/null || true
+if [ -z "${sp_qrep:-}" ]; then
+  echo "REFUSING: the quote-escaping characters were not found in the hook, so the" >&2
+  echo "  escaping could not be checked." >&2
+  exit 2
+fi
+esc_repo="$work/esc"; git init -q "$esc_repo"
+( cd "$esc_repo"; printf 'a\n' > f; git add -A >/dev/null 2>&1
+  git -c user.email=t@t -c user.name=t commit -q -m x >/dev/null 2>&1 ) || true
+esc_k="filter.x${sp_q}y.clean"
+# The control: the UNESCAPED form must be rejected, or this proves nothing.
+gcp_raw="$sp_q$esc_k$sp_q=$sp_q$sp_q"
+if ( cd "$esc_repo" && env GIT_CONFIG_PARAMETERS="$gcp_raw" git rev-parse HEAD >/dev/null 2>&1 ); then
+  echo "REFUSING: git accepted the unescaped key, so this check cannot tell escaping" >&2
+  echo "  from the absence of it." >&2
+  exit 2
+fi
+esc_e="${esc_k//$sp_q/$sp_qrep}"
+gcp_esc="$sp_q$esc_e$sp_q=$sp_q$sp_q"
+if ( cd "$esc_repo" && env GIT_CONFIG_PARAMETERS="$gcp_esc" git rev-parse HEAD >/dev/null 2>&1 ); then
+  printf '\npositive control: git rejects the raw key and accepts the escaped one.\n'
+  printf 'this hook: a quote-bearing config key is escaped for GIT_CONFIG_PARAMETERS.\n'
+else
+  echo "FAIL: the hook's escaping still produces a GIT_CONFIG_PARAMETERS git rejects," >&2
+  echo "  which makes every later git in this hook fail." >&2
+  esc_fail=1
+fi
+
 # ---- the scanner child is neutralised too ------------------------------------
 #
 # ⚠ `-c` REACHES ONLY THE COMMANDS THIS FILE LAUNCHES. The scanner is a separate
@@ -728,4 +764,4 @@ printf '\n%d gitfile read(s) found, %d still line-oriented.\n' "$gf_total" "$gf_
 printf '%d checkout-root case(s), %d failure(s).\n' "$itotal" "$ifail"
 printf '%d case(s) judged, %d failure(s); %d normal-form case(s), %d failure(s).\n' \
   "$total" "$failures" "$ntotal" "$nfail"
-[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] && [ "$idx_fail" -eq 0 ] && [ "$inv_fail" -eq 0 ] && [ "$chl_fail" -eq 0 ] && [ "$bp_fail" -eq 0 ] && [ "$kre_fail" -eq 0 ] || exit 1
+[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] && [ "$idx_fail" -eq 0 ] && [ "$inv_fail" -eq 0 ] && [ "$chl_fail" -eq 0 ] && [ "$bp_fail" -eq 0 ] && [ "$kre_fail" -eq 0 ] && [ "$esc_fail" -eq 0 ] || exit 1

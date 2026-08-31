@@ -1036,9 +1036,41 @@ fi
 # `git config --list` was measured not to run any of these itself, which is what
 # makes reading the list a safe first step.
 unset GIT_CONFIG_COUNT 2>/dev/null || true
-sp_cfg_keys="$(git config --list --name-only 2>/dev/null |
-  grep -E '^(core\.fsmonitor|core\.alternaterefscommand|core\.gitproxy|(diff|filter|merge)\..*\..+)$' |
-  sort -u || true)"
+# ⚠ `|| true` ON THE WHOLE PIPELINE TURNED EVERY FAILURE INTO AN EMPTY LIST, and an
+# empty list is indistinguishable from "no executable keys are configured" -- so a
+# failing `grep` left the drivers un-neutralised and the branch's program ran before
+# the hook refused for an unrelated reason (shardpilot/shardpilot-go#79 review,
+# reproduced). EIGHTH instance in this file of one sentence, and the first inside
+# the neutralisation written for the seventh.
+#
+# The stages are separated, because only one of them has a status that means
+# something other than failure: `grep` exits 1 for NO MATCH, which is the answer
+# "nothing is configured". Everything else refuses, before any further git runs.
+sp_cfg_all=""
+if ! sp_cfg_all="$(git config --list --name-only 2>/dev/null)"; then
+  printf 'REFUSING: the repository configuration could not be listed, so the settings\n' >&2
+  printf '  that make git run a program cannot be neutralised and a pushed branch\n' >&2
+  printf '  could supply one. Nothing has been run from it.\n' >&2
+  exit 2
+fi
+sp_cfg_keys=""
+sp_cfg_keys="$(printf '%s\n' "$sp_cfg_all" |
+  grep -E '^(core\.fsmonitor|core\.alternaterefscommand|core\.gitproxy|(diff|filter|merge)\..*\..+)$')" || {
+  sp_cfg_rc=$?
+  if [ "$sp_cfg_rc" -ne 1 ]; then
+    printf 'REFUSING: the executable-key scan failed (grep exited %s), so this gate\n' "$sp_cfg_rc" >&2
+    printf '  cannot say which settings run a program.\n' >&2
+    exit 2
+  fi
+  sp_cfg_keys=""
+}
+if [ -n "$sp_cfg_keys" ]; then
+  sp_cfg_keys="$(printf '%s\n' "$sp_cfg_keys" | sort -u)" || {
+    printf 'REFUSING: the executable-key list could not be sorted.\n' >&2
+    exit 2
+  }
+fi
+unset sp_cfg_all
 sp_cfg_n=0
 sp_seen=""
 # ⚠ AND PATHNAME GENERATION IS OFF WHILE SPLITTING, FOR THE SECOND TIME IN THIS
@@ -1061,13 +1093,30 @@ set -f
 # defeated the whole neutralisation. A command-line `-c` outranks that in turn,
 # measured, and it does not require removing the caller's environment, which is what
 # broke authenticated pushes.
+# The three characters git's quoting needs, named so the substitution below cannot be
+# mis-spelled: a quote, and the four-character sequence that stands for one inside a
+# single-quoted string.
+sp_q="'"
+sp_bs="\\"
+sp_qrep="$sp_q$sp_bs$sp_q$sp_q"
 sp_cfg_args=()
 sp_cfg_params=""
 for sp_k in core.fsmonitor $sp_cfg_keys; do
   case " $sp_seen " in *" $sp_k "*) continue ;; esac
   sp_seen="$sp_seen $sp_k"
   sp_cfg_args+=(-c "$sp_k=")
-  sp_cfg_params="$sp_cfg_params '$sp_k'=''"
+  # ⚠ A KEY MAY CONTAIN AN APOSTROPHE. `filter.x'y.clean` is valid, and interpolated
+  # raw it produced malformed `GIT_CONFIG_PARAMETERS`, after which EVERY subsequent
+  # git exited with "bogus format" -- a push refused while preparing the private
+  # object store (shardpilot/shardpilot-go#79 review). Git's own escaping inside that
+  # variable is a single-quoted string with each quote written as backslash-quote
+  # between quotes.
+  #
+  # The replacement is built from named characters rather than written as a literal:
+  # the first two attempts at spelling it inline produced a string git still
+  # rejected, and one of them looked right.
+  sp_k_esc="${sp_k//$sp_q/$sp_qrep}"
+  sp_cfg_params="$sp_cfg_params '$sp_k_esc'=''"
   sp_cfg_n=$((sp_cfg_n + 1))
 done
 set +f
@@ -1089,7 +1138,7 @@ if [ -n "$sp_cfg_params" ]; then
   GIT_CONFIG_PARAMETERS="${GIT_CONFIG_PARAMETERS:-}$sp_cfg_params"
   export GIT_CONFIG_PARAMETERS
 fi
-unset sp_cfg_keys sp_k sp_seen sp_cfg_params
+unset sp_cfg_keys sp_k sp_k_esc sp_seen sp_cfg_params sp_q sp_bs sp_qrep
 
 hooks_off="$(mktemp -d)"
 # ⚠ THE TRAP GOES ON AS SOON AS THERE IS SOMETHING TO CLEAN. Everything between
