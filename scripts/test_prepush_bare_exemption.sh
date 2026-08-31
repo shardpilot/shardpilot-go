@@ -840,18 +840,36 @@ fi
 
 # A `mktemp` and an `mv` that fail on demand, so a failure can be placed at a
 # chosen step instead of being waited for.
+# ⚠ THE REAL BINARIES ARE RESOLVED BEFORE THE SHIM DIRECTORY EXISTS, and each shim
+# execs the absolute path. A shim that ends `exec mv "$@"` re-execs ITSELF, because
+# it is what the shim directory put first on PATH: one logical `mv` then consumed
+# two shim calls, `SP_MV_FAIL_AT=2` failed the FIRST move rather than the second,
+# nothing was ever published, and the assertion that the published hook is
+# withdrawn passed over a run in which there was nothing to withdraw.
+ins_real_mktemp="$(command -v mktemp)"
+ins_real_mv="$(command -v mv)"
+if [ -z "$ins_real_mktemp" ] || [ -z "$ins_real_mv" ]; then
+  echo "REFUSING: mktemp or mv could not be resolved, so the injected failures" >&2
+  echo "  below would re-enter the shim instead of the real program." >&2
+  exit 2
+fi
 mkdir -p "$work/shim"
-cat > "$work/shim/mktemp" <<'INSSHIM'
+cat > "$work/shim/mktemp" <<INSSHIM
 #!/usr/bin/env bash
-n=$(( $(cat "$SP_N" 2>/dev/null || echo 0) + 1 )); printf '%s' "$n" > "$SP_N"
-[ "${SP_FAIL_AT:-}" = "$n" ] && { echo "mktemp: injected failure" >&2; exit 1; }
-exec /usr/bin/mktemp "$@"
+n=\$(( \$(cat "\$SP_N" 2>/dev/null || echo 0) + 1 )); printf '%s' "\$n" > "\$SP_N"
+[ "\${SP_FAIL_AT:-}" = "\$n" ] && { echo "mktemp: injected failure" >&2; exit 1; }
+exec $ins_real_mktemp "\$@"
 INSSHIM
-cat > "$work/shim/mv" <<'INSSHIM'
+cat > "$work/shim/mv" <<INSSHIM
 #!/usr/bin/env bash
-n=$(( $(cat "$SP_MVN" 2>/dev/null || echo 0) + 1 )); printf '%s' "$n" > "$SP_MVN"
-[ "${SP_MV_FAIL_AT:-}" = "$n" ] && { echo "mv: injected failure" >&2; exit 1; }
-exec mv "$@"
+n=\$(( \$(cat "\$SP_MVN" 2>/dev/null || echo 0) + 1 )); printf '%s' "\$n" > "\$SP_MVN"
+if [ "\${SP_MV_FAIL_AT:-}" = "\$n" ]; then
+  # record what had already been published when the failure was injected, so the
+  # withdrawal asserted below cannot pass over a run that published nothing
+  ls "\$(dirname "\$2")" > "\$SP_MVSTATE" 2>/dev/null
+  echo "mv: injected failure" >&2; exit 1
+fi
+exec $ins_real_mv "\$@"
 INSSHIM
 chmod +x "$work/shim/mktemp" "$work/shim/mv"
 
@@ -923,9 +941,13 @@ ins_say "$?" "an early failure exits with a real status, not 127"
 insE="$work/insE"; ins_fixture "$insE"
 git -C "$insE" config --local core.hooksPath /nonexistent/prior
 : > "$work/mvn"
-( cd "$insE" && SP_MVN="$work/mvn" SP_MV_FAIL_AT=2 PATH="$work/shim:$PATH" bash "$ins" ) \
-  >"$work/insE.out" 2>&1
+( cd "$insE" && SP_MVN="$work/mvn" SP_MVSTATE="$work/mvstate" SP_MV_FAIL_AT=2 \
+    PATH="$work/shim:$PATH" bash "$ins" ) >"$work/insE.out" 2>&1
 [ "$?" -ne 0 ]; ins_say "$?" "a failure after publication fails the install"
+# the failure must have landed AFTER the first move, or the withdrawal below is
+# asserted over a directory that never held the hook
+grep -q '^pre-push$' "$work/mvstate" 2>/dev/null
+ins_say "$?" "the hook was published before the injected failure"
 grep -q "rolled back" "$work/insE.out"; ins_say "$?" "the rollback says so"
 [ ! -e "$insE/.git/hooks/pre-push" ]; ins_say "$?" "the published hook is withdrawn"
 [ "$(git -C "$insE" config --local --get core.hooksPath)" = /nonexistent/prior ]
