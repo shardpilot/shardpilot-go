@@ -2806,21 +2806,22 @@ func TestAWrappedRunSurvivesAHorizontalWhitespaceLine(t *testing.T) {
 func TestWrappedCandidateAssemblyIsLinear(t *testing.T) {
 	decodeWork = 0
 	t.Cleanup(func() { decodeWork = 0 })
-	var b strings.Builder
-	b.WriteString("prefix: YWJj\r\n")
-	for i := 0; i < 40000; i++ {
-		b.WriteString("YWJj\r\n")
+	linesOf := func(k int) string {
+		var b strings.Builder
+		b.WriteString("prefix: YWJj\r\n")
+		for i := 0; i < k; i++ {
+			b.WriteString("YWJj\r\n")
+		}
+		b.WriteString("x ZGVmZ2g=")
+		return b.String()
 	}
-	b.WriteString("x ZGVmZ2g=")
-	in := b.String()
 
-	// ⚠ ALLOCATION, NOT WALL CLOCK -- see TestVouchedNamesAreMarkedInOnePass. The
-	// defect is a quadratic COPY, so bytes allocated is what it is made of, and that
-	// number does not change with the speed of the runner. Measured at 1 MiB here;
-	// the bound is 32.
+	// ⚠ THE GROWTH, NOT A CEILING -- see allocationGrowth. A ceiling here measured
+	// the test build, exactly as the wall clock it replaced measured the machine.
 	var got []string
-	if mib := allocatedMiB(func() { got = wrappedBase64Candidates(in) }); mib > 32 {
-		t.Fatalf("assembling one candidate over %d lines allocated %d MiB: that is the quadratic copy", 40000, mib)
+	g := allocationGrowth(func(k int) { got = wrappedBase64Candidates(linesOf(k)) }, 20000)
+	if g > linearGrowth {
+		t.Fatalf("doubling the lines multiplied the allocation by %.2f: that is the quadratic copy", g)
 	}
 
 	if len(got) == 0 {
@@ -3304,25 +3305,28 @@ func TestTruncationExcusesOnlyItsOwnBodyRefusals(t *testing.T) {
 func TestBodyRedactionIsLinear(t *testing.T) {
 	structuralSurfaces, accountedSurfaces = nil, nil
 	t.Cleanup(func() { structuralSurfaces, accountedSurfaces = nil, nil })
-	var b strings.Builder
-	b.WriteString(`{"variant_payload":[`)
-	for i := 0; i < 30000; i++ {
-		if i > 0 {
-			b.WriteString(",")
+	valuesOf := func(k int) string {
+		var v strings.Builder
+		v.WriteString(`{"variant_payload":[`)
+		for i := 0; i < k; i++ {
+			if i > 0 {
+				v.WriteString(",")
+			}
+			v.WriteString(`"abcd"`)
 		}
-		b.WriteString(`"abcd"`)
+		v.WriteString("]}")
+		return v.String()
 	}
-	b.WriteString("]}")
-	body := b.String()
 
-	// ⚠ ALLOCATION, NOT WALL CLOCK -- the per-span rebuild copies the whole body per
-	// value, and bytes allocated counts exactly that without asking how fast the
-	// machine is. Measured at 20 MiB here; the bound is 64.
+	// ⚠ THE GROWTH, NOT A CEILING -- see allocationGrowth. The per-span rebuild
+	// copies the whole body per value, which is a RATIO, and a ratio survives the
+	// instrumentation an absolute ceiling does not.
 	var got string
-	if mib := allocatedMiB(func() {
-		got = redactUnaccountedJSONValues(body, assignmentTopLevel, "HTTP/1.1 200 OK")
-	}); mib > 64 {
-		t.Fatalf("redacting %d values allocated %d MiB: that is the per-span rebuild", 30000, mib)
+	g := allocationGrowth(func(k int) {
+		got = redactUnaccountedJSONValues(valuesOf(k), assignmentTopLevel, "HTTP/1.1 200 OK")
+	}, 15000)
+	if g > linearGrowth {
+		t.Fatalf("doubling the values multiplied the allocation by %.2f: that is the per-span rebuild", g)
 	}
 
 	if !strings.Contains(got, "redacted-4-chars") {
@@ -4824,14 +4828,20 @@ func TestVouchedNamesAreMarkedInOnePass(t *testing.T) {
 	suppliedValues = nil
 	t.Cleanup(func() { suppliedValues = nil })
 	const n = 30000
-	body := "{" + strings.TrimSuffix(strings.Repeat(`"assigned":false,`, n), ",") + "}"
-	var got string
-	if mib := allocatedMiB(func() { got = redactMintedBody(body, assignmentTopLevel) }); mib > 64 {
-		t.Errorf("marking %d vouched names allocated %d MiB; a splice per member copies the whole "+
-			"body each time and a single pass does not", n, mib)
+	bodyOf := func(k int) string {
+		return "{" + strings.TrimSuffix(strings.Repeat(`"assigned":false,`, k), ",") + "}"
 	}
-	if strings.Count(got, genMark) < 2*n {
-		t.Errorf("the names were not all marked: %d mark bytes for %d names", strings.Count(got, genMark), n)
+	marks, members := 0, 0
+	g := allocationGrowth(func(k int) {
+		out := redactMintedBody(bodyOf(k), assignmentTopLevel)
+		marks, members = strings.Count(out, genMark), k
+	}, n/2)
+	if g > linearGrowth {
+		t.Errorf("doubling the members multiplied the allocation by %.2f; a single pass is "+
+			"about 2 and a splice per member about 3.8", g)
+	}
+	if marks < 2*members {
+		t.Errorf("the names were not all marked: %d mark bytes for %d names", marks, members)
 	}
 }
 
@@ -5592,6 +5602,50 @@ func TestTheTransportErrorDecodeIsBounded(t *testing.T) {
 // allocatedMiB reports what f allocated, in MiB. A memory claim is measured with a
 // memory instrument; this file has twice used wall time for one and found it does
 // not separate the cases.
+// allocatedBytes is allocatedMiB without the quantisation, so a growth RATIO can be
+// taken over numbers a MiB rounding would flatten.
+func allocatedBytes(f func()) uint64 {
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	f()
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc
+}
+
+// allocationGrowth reports how f's allocation grows when its input DOUBLES.
+//
+// ⚠ THE RATIO, NOT A CEILING, BECAUSE A CEILING MEASURES THE BUILD. These scenes
+// carried a wall-clock bound, which measured the MACHINE and failed 4 of 5 runs on
+// a slower runner. It was replaced with an absolute allocation ceiling, which
+// measures the TEST BUILD: under `-race` the one-pass implementation allocates 232
+// MiB against a 64 MiB ceiling and the suite fails on correct code
+// (shardpilot/shardpilot-go#85 review). Two substitutions, one sentence -- the
+// number moved for a reason that is not the tree.
+//
+// The property these scenes exist for IS a ratio: linear against quadratic. Any
+// per-allocation instrumentation multiplier cancels out of one. Measured on both
+// sides and in both builds, on this machine:
+//
+//	                 plain   -race
+//	one pass          2.06    2.00
+//	splice per span   3.78    3.78
+//
+// so `linearGrowth` separates them with margin in either build, and the quadratic
+// figure did not move between builds at all.
+func allocationGrowth(f func(n int), n int) float64 {
+	one := allocatedBytes(func() { f(n) })
+	two := allocatedBytes(func() { f(2 * n) })
+	if one == 0 {
+		return 0
+	}
+	return float64(two) / float64(one)
+}
+
+// linearGrowth is the ceiling on that ratio: above it, the work is growing faster
+// than its input and the per-span rebuild is back.
+const linearGrowth = 3.0
+
 func allocatedMiB(f func()) uint64 {
 	runtime.GC()
 	var before, after runtime.MemStats
@@ -7630,4 +7684,41 @@ func TestAnEmptySetCookieIsNotRefused(t *testing.T) {
 	if len(refusalLedger()) == 0 {
 		t.Fatal("a Set-Cookie carrying an endpoint token was left publishable")
 	}
+}
+
+// TestAllocationGrowthSeparatesLinearFromQuadratic is the positive control for the
+// instrument the three complexity scenes now depend on. A ratio that cannot report
+// a quadratic would pass those scenes whatever the code did — the same hole as a
+// refusal-ledger assertion that only ever checks for emptiness.
+//
+// Both shapes are built here rather than measured once and written into a comment,
+// so the threshold is re-derived on whatever machine and build runs the suite.
+func TestAllocationGrowthSeparatesLinearFromQuadratic(t *testing.T) {
+	// One pass: a builder, allocation linear in n.
+	linear := allocationGrowth(func(n int) {
+		var b strings.Builder
+		for i := 0; i < n; i++ {
+			b.WriteString("assigned")
+		}
+		_ = b.String()
+	}, 20000)
+	if linear > linearGrowth {
+		t.Errorf("a single-pass builder reported growth %.2f, above the ceiling of %.1f: "+
+			"the instrument calls linear work quadratic", linear, linearGrowth)
+	}
+
+	// A splice per item: the defect. Whole-body copy each iteration.
+	quadratic := allocationGrowth(func(n int) {
+		s := strings.Repeat("assigned", n)
+		for i := 0; i < n; i++ {
+			s = s[:1] + s[1:]
+		}
+		_ = s
+	}, 4000)
+	if quadratic <= linearGrowth {
+		t.Errorf("a splice per item reported growth %.2f, at or below the ceiling of %.1f: "+
+			"the instrument cannot report the very defect those scenes exist for",
+			quadratic, linearGrowth)
+	}
+	t.Logf("growth: linear %.2f, quadratic %.2f, ceiling %.1f", linear, quadratic, linearGrowth)
 }
