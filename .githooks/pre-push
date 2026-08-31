@@ -24,6 +24,47 @@
 # a DIFFERENT directory than the argument names, which is worse than the noise.
 unset BASH_ENV ENV CDPATH
 #
+# ⚠ AND THE EXPORTED FUNCTIONS, WHICH `unset` CANNOT NAME. `-p` stops THIS shell
+# from importing an inherited function and leaves the environment ENTRY in place:
+# measured, `BASH_FUNC_git%%` is still in `env` after a `bash -p` has started, and
+# the scanner -- another bash, through its own `#!/usr/bin/env bash` -- imports it
+# and runs it in place of `git` (shardpilot/shardpilot-go#79 review). That is the
+# sentence twelve lines up, one road along: protecting the shell you were shown
+# leaves every shell it starts.
+#
+# The line above cannot reach these. The entry's name is not an identifier, and
+# bash refuses it to every builtin that could clear it -- `unset` and `export -n`
+# both measured saying so. `env -u` accepts such a name; nothing built in does.
+#
+# ⚠ ENUMERATED WITH A BUILTIN, BECAUSE THE PATH FILTER HAS NOT RUN YET. `env | sed`
+# here would be two branch-resolvable commands running AHEAD of the guard that
+# exists to stop them -- the defect this file already recorded once, when a repair
+# called `git rev-parse` before the sanitiser. `compgen -e` is a builtin, and
+# `/usr/bin/env` is reached by absolute path, exactly like `/bin/bash` above. Every
+# name passed to it begins with `BASH_FUNC` by construction of the match, so a
+# hostile function BODY cannot steer this into stripping something else.
+#
+# ⚠ AND THE MARKER IS NOT THE TEST. A pushing environment can set it, so it decides
+# only whether we have ALREADY tried: entries still present after one pass are
+# REFUSED rather than re-exec'd, which closes that bypass and bounds this to one
+# exec. Nothing has read stdin yet, so the ref list survives it.
+sp_strip=()
+while IFS= read -r sp_name; do
+  case "$sp_name" in
+    BASH_FUNC_*) sp_strip+=(-u "$sp_name") ;;
+  esac
+done < <(compgen -e 2>/dev/null || true)
+if [ "${#sp_strip[@]}" -gt 0 ]; then
+  if [ -n "${SP_PREPUSH_FUNCS_STRIPPED:-}" ] || [ ! -x /usr/bin/env ]; then
+    printf 'REFUSING: this environment exports shell functions. A child shell\n' >&2
+    printf '  imports them even though this hook ignores them, and they could not\n' >&2
+    printf '  be removed before the scanner runs.\n' >&2
+    exit 2
+  fi
+  exec /usr/bin/env "${sp_strip[@]}" SP_PREPUSH_FUNCS_STRIPPED=1 "$0" "$@"
+fi
+unset sp_strip sp_name
+#
 # The PATH filter below is about what a bare command RESOLVES to; this is about
 # what runs before any command of ours at all.
 #
@@ -495,6 +536,51 @@ if [ -n "$wt_common" ]; then
       wt_own_line="${wt_own_line%$NL}"
       [ "$wt_own_line" = "gitdir: $wt_common" ] && wt_owns=yes
     fi
+    # ⚠ AND A BARE REPOSITORY HAS NO CHECKOUT TO NAME, so this guard's own premise
+    # does not hold for it. `git --git-dir=/tmp/local.git push` was refused with
+    # "whose checkout this gate cannot name" -- reproduced -- even though there is
+    # no worktree there whose contents could be on PATH
+    # (shardpilot/shardpilot-go#79 review). The refusal is about ruling out a PATH
+    # entry INSIDE a checkout; with no checkout there is nothing to rule out.
+    #
+    # ⚠ READ, NOT ASKED. The later `--is-bare-repository` check runs `git`, and this
+    # gate is the one that decides "before any command is run" -- calling git here
+    # would put the question ahead of the filter that makes its answer trustworthy,
+    # which is the defect this file recorded when a repair called `git rev-parse`
+    # before the sanitiser. So the config file is PARSED with builtins.
+    #
+    # ⚠ AND THE CONFIG IS NOT BRANCH-SUPPLIED. `config` is never a tracked file, so
+    # it is under the same control as PATH itself and is not the thing this hook
+    # defends against; the branch being pushed cannot reach it. Measured as the only
+    # structural difference: a bare repository writes `bare = true`, and a
+    # `--separate-git-dir` one writes `bare = false` and no `core.worktree` at all,
+    # so the two are otherwise identical from inside the git directory.
+    wt_is_bare=no
+    if [ -r "$wt_common/config" ]; then
+      wt_sect=""
+      while IFS= read -r wt_cl || [ -n "$wt_cl" ]; do
+        wt_ct="${wt_cl#"${wt_cl%%[![:space:]]*}"}"
+        case "$wt_ct" in
+          "["*) wt_sect="$wt_ct" ;;
+          bare*=*)
+            case "$wt_sect" in
+              "[core]"*)
+                wt_cv="${wt_ct#*=}"
+                wt_cv="${wt_cv#"${wt_cv%%[![:space:]]*}"}"
+                case "$wt_cv" in
+                  true*|yes*|on*|1*) wt_is_bare=yes ;;
+                  *) wt_is_bare=no ;;
+                esac
+                ;;
+            esac
+            ;;
+        esac
+      done < "$wt_common/config"
+      unset wt_sect wt_cl wt_ct wt_cv
+    fi
+    if [ "$wt_owns" = no ] && [ "$wt_is_bare" = yes ]; then
+      wt_owns=yes
+    fi
     if [ "$wt_owns" = no ]; then
       printf 'REFUSING: %s is a git directory whose checkout this gate cannot name.\n' "$wt_common" >&2
       printf '  A separate git directory records no path back to its worktree, so a\n' >&2
@@ -655,10 +741,21 @@ pushed_lines="$(cat)"
 # a path that does not exist, the test is false, and the comparison against the
 # tracked scanner -- the check that catches a branch shipping its own scanner --
 # is skipped without a word (shardpilot/shardpilot-go#79, derived population).
-root="$(git rev-parse --show-toplevel && printf X)"
+# ⚠ AND IT TOLERATES HAVING NO WORKTREE, exactly as the same call twelve sites down
+# already does. In a BARE repository `--show-toplevel` is fatal, and under `set -e`
+# this line ended the hook with git's own `fatal: this operation must be run in a
+# work tree` and status 128 -- an opaque abort where the gate should either run or
+# refuse in its own words. Found while exempting bare repositories from the
+# checkout-owner guard (shardpilot/shardpilot-go#79 review): removing the wrong
+# refusal exposed the next site that assumed a checkout, which is the same sentence
+# this file keeps writing -- a rule stated at one site and not at its twin.
+root="$(git rev-parse --show-toplevel 2>/dev/null && printf X)" || root=""
 root="${root%X}"
 root="${root%$NL}"
-tracked_scanner="$root/scripts/check_public_surface.sh"
+tracked_scanner=""
+if [ -n "$root" ]; then
+  tracked_scanner="$root/scripts/check_public_surface.sh"
+fi
 
 # ⚠ THE SCANNER MUST BE TRUSTED TOO, AND THE TRACKED ONE IS NOT.
 #
@@ -1558,7 +1655,15 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # needs no commit (shardpilot/shardpilot-go#79 review). The eligibility branch
   # above already reaches `eligible=yes` for such an object without consulting
   # HEAD; this line had not been given the same condition.
-  if [ -n "$head_sha" ] && { ! git diff --quiet HEAD -- || ! git diff --cached --quiet; }; then
+  # ⚠ AND ONLY WHERE THERE IS A WORKING TREE TO DIFFER. In a bare repository both
+  # `git diff` calls are fatal, and `! git diff` reads a FAILED probe as the answer
+  # "it differs" -- so the gate refused a bare push saying the working tree differs
+  # from HEAD, about a repository that has neither working tree nor index. That is
+  # this file's own recurring class: a probe that cannot answer "no". `worktree_root`
+  # is empty exactly when the earlier block established the repository is bare, so it
+  # is the discriminator already computed rather than a second question.
+  if [ -n "$head_sha" ] && [ -n "$worktree_root" ] &&
+     { ! git diff --quiet HEAD -- || ! git diff --cached --quiet; }; then
     printf 'REFUSING: the index or working tree differs from HEAD.\n' >&2
     printf '  Commit or stash first, so what is scanned is what is published.\n' >&2
     exit 2
