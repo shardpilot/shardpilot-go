@@ -391,6 +391,48 @@ else
   printf 'this hook: nothing from the pushed branch ran.\n'
 fi
 
+# ⚠ THE LONG-RUNNING FILTER FORM. `filter.<name>.process` is standard and fired
+# straight through a rule that read `clean|smudge`, with `core.fsmonitor` already
+# neutralised (shardpilot/shardpilot-go#79 review).
+( cd "$probe_repo" && git config filter.fx.process ./prog ) || true
+after_proc="$(run_push_probe "$hook")"
+if [ -n "$after_proc" ]; then
+  echo "FAIL: a long-running filter process ran under this hook: [$after_proc]" >&2
+  exec_fail=1
+else
+  printf 'this hook: filter.<driver>.process did not run either.\n'
+fi
+
+# ⚠ AND THE ENVIRONMENT OUTRANKS THE FILE. `git -c k=v push` reaches a hook as
+# GIT_CONFIG_PARAMETERS -- measured on git 2.50.1, where GIT_CONFIG_COUNT is not set
+# at all -- and it beats the GIT_CONFIG_COUNT overrides the hook installs. So the
+# neutralisation was bypassable by the very flag the sibling finding was about, and
+# no review named this one.
+run_push_probe_c() {
+  rm -f "$fired"
+  cp "$1" "$probe_repo/.git/hooks/pre-push"
+  chmod +x "$probe_repo/.git/hooks/pre-push"
+  ( cd "$probe_repo" && git -c core.fsmonitor=./fsmon push -q origin HEAD:refs/heads/probe >/dev/null 2>&1 ) || true
+  ( cd "$probe_repo" && git -C "$probe_remote" update-ref -d refs/heads/probe >/dev/null 2>&1 ) || true
+  sort -u "$fired" 2>/dev/null | tr '\n' ' '
+}
+if [ -n "${parent_hook:-}" ] && [ -s "${parent_hook:-/nonexistent}" ]; then
+  before_c="$(run_push_probe_c "$parent_hook")"
+  case "$before_c" in
+    *fsmonitor*) printf 'positive control: `git -c` let [%s] run on the parent hook.\n' "$before_c" ;;
+    *) echo "REFUSING: the -c bypass did not land on the parent hook ([$before_c])," >&2
+       echo "  so this check cannot tell a fix from a rig that never reproduced it." >&2
+       exit 2 ;;
+  esac
+fi
+after_c="$(run_push_probe_c "$hook")"
+if [ -n "$after_c" ]; then
+  echo "FAIL: 'git -c core.fsmonitor=...' re-enabled a branch program: [$after_c]" >&2
+  exec_fail=1
+else
+  printf 'this hook: a git -c override did not re-enable it.\n'
+fi
+
 printf '\n%d gitfile read(s) found, %d still line-oriented.\n' "$gf_total" "$gf_bad"
 printf '%d checkout-root case(s), %d failure(s).\n' "$itotal" "$ifail"
 printf '%d case(s) judged, %d failure(s); %d normal-form case(s), %d failure(s).\n' \

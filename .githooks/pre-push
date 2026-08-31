@@ -267,6 +267,35 @@ for gv in GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_NAMESPACE \
   unset "$gv" 2>/dev/null || true
 done
 unset gv
+
+# ⚠ AND THE CONFIG-INJECTING ONES, WHICH THIS LIST HAD NEVER HELD. `git -c k=v push`
+# reaches a hook as `GIT_CONFIG_PARAMETERS`, and it OUTRANKS the `GIT_CONFIG_COUNT`
+# overrides this file sets further down: `git -c core.fsmonitor=./fsmon push`
+# re-enabled the branch-supplied program that the driver neutralisation exists to
+# stop -- measured, and named by no review (shardpilot/shardpilot-go#79 review found
+# the sibling in `core.bare`).
+#
+# ⚠ THE REVIEW SAID `GIT_CONFIG_COUNT`; ON THIS GIT IT IS `GIT_CONFIG_PARAMETERS`.
+# Measured on 2.50.1: a hook under `git -c core.bare=false push` sees
+# `GIT_CONFIG_PARAMETERS='core.bare'='false'` and no COUNT at all. A repair aimed at
+# the mechanism as named would not have closed it, so both are cleared and the
+# question is asked of both.
+#
+# ⚠ AND MY EARLIER "MEASURED AS IRRELEVANT" WAS OF THE WRONG MECHANISM. The
+# bare-exemption comment below said external config layering cannot flip bareness;
+# that test was of `GIT_CONFIG_GLOBAL`, which indeed cannot, and I generalised it to
+# an environment that can. A reading proves less than the claim built from it.
+#
+# Recorded BEFORE clearing, because the bare exemption further down may not be taken
+# from a file that git was not reading alone.
+sp_cfg_env=no
+for gv in GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_CONFIG GIT_CONFIG_GLOBAL \
+          GIT_CONFIG_SYSTEM; do
+  eval "gv_val=\${$gv:-}"
+  [ -n "$gv_val" ] && sp_cfg_env=yes
+  unset "$gv" 2>/dev/null || true
+done
+unset gv gv_val
 if [ -n "$inherited_git_dir" ]; then
   GIT_DIR="$inherited_git_dir"
   export GIT_DIR
@@ -755,7 +784,16 @@ if [ -n "$wt_common" ]; then
     # ⚠ AND THE EXEMPTION IS THE PARSE'S TO GIVE ONLY WHEN THE PARSE WAS COMPLETE.
     # `wt_is_bare=yes` from a file carrying a construct this loop skipped is a
     # guess, and this is the guard that decides before any command runs.
-    if [ "$wt_owns" = no ] && [ "$wt_is_bare" = yes ] && [ "$wt_cfg_modelled" = yes ]; then
+    # ⚠ AND THE FILE WAS NOT THE ONLY SOURCE. `git -c core.bare=false push` makes git
+    # operate on a non-bare worktree while this parser reads `true` from the file, so
+    # the exemption skipped the unresolved-checkout guard and left a tracked
+    # `<main>/bin` on PATH for the first external command
+    # (shardpilot/shardpilot-go#79 review, reproduced). Parsing that environment would
+    # be a second grammar to reimplement -- its quoting differs by git version -- and
+    # the exemption only ever WIDENS, so the honest answer is that the parse cannot
+    # claim completeness and the exemption is not taken.
+    if [ "$wt_owns" = no ] && [ "$wt_is_bare" = yes ] && [ "$wt_cfg_modelled" = yes ] &&
+       [ "$sp_cfg_env" = no ]; then
       wt_owns=yes
     fi
     if [ "$wt_owns" = no ]; then
@@ -764,7 +802,12 @@ if [ -n "$wt_common" ]; then
       printf '  PATH entry inside that checkout cannot be ruled out -- and this is\n' >&2
       printf '  decided before any command is run, so nothing from it has executed.\n' >&2
       printf '  Push from the main checkout, or keep the git directory inside it.\n' >&2
-      if [ "$wt_is_bare" = yes ] && [ "$wt_cfg_modelled" = no ]; then
+      if [ "$wt_is_bare" = yes ] && [ "$sp_cfg_env" = yes ]; then
+        printf '  This config says bare, but the push carries configuration in its\n' >&2
+        printf '  environment -- a `git -c ...`, or GIT_CONFIG_* -- which outranks the\n' >&2
+        printf '  file and can make git disagree with what is read here. Push without\n' >&2
+        printf '  it, or from the main checkout.\n' >&2
+      elif [ "$wt_is_bare" = yes ] && [ "$wt_cfg_modelled" = no ]; then
         printf '  This config says bare, but it also carries a construct this gate\n' >&2
         printf '  does not read -- an include, a continued line, or a setting beside\n' >&2
         printf '  a section header -- so what git makes of it is not knowable here,\n' >&2
@@ -878,11 +921,22 @@ fi
 # bare `git diff` that carries this defect is not one of them. An override every
 # invocation inherits cannot be bypassed by adding a call site.
 #
+# ⚠ AND THE SUFFIX LIST WENT THE SAME WAY AS THE DRIVER NAMES. It read
+# `clean|smudge`, and `filter.<name>.process` -- the standard long-running form --
+# fired straight through it with `core.fsmonitor` already neutralised, measured
+# (shardpilot/shardpilot-go#79 review). Adding `process` would be the same
+# enumeration one level down, in the half of the key I had left enumerated.
+#
+# A DRIVER SECTION EXISTS TO CONFIGURE A PROGRAM, so every key in one is cleared and
+# there is no suffix to keep current. `filter.<n>.required` is emptied with the rest,
+# which is harmless: the driver it guards is emptied too. Single-component keys like
+# `diff.algorithm` need two dots to match and are untouched.
+#
 # `git config --list` was measured not to run any of these itself, which is what
 # makes reading the list a safe first step.
 unset GIT_CONFIG_COUNT 2>/dev/null || true
 sp_cfg_keys="$(git config --list --name-only 2>/dev/null |
-  grep -E '^(core\.fsmonitor|core\.alternaterefscommand|core\.gitproxy|diff\.[^.]+\.(textconv|command)|filter\.[^.]+\.(clean|smudge))$' |
+  grep -E '^(core\.fsmonitor|core\.alternaterefscommand|core\.gitproxy|(diff|filter|merge)\.[^.]+\..+)$' |
   sort -u || true)"
 sp_cfg_n=0
 sp_seen=""
