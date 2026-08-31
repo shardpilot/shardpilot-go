@@ -622,6 +622,38 @@ fi
 if [ -n "$wt_common" ]; then
   wt_common_is_dotgit=no
   case "$wt_common" in */.git) wt_common_is_dotgit=yes ;; esac
+  # ⚠ UNSOUND, AND NOT REPAIRED HERE. AN OPEN FINDING, STATED RATHER THAN CLOSED.
+  #
+  # An external git directory may legally be named `.git` -- main checkout
+  # `/tmp/main`, common directory `/tmp/store/.git` -- and this suffix test then
+  # calls it an ordinary layout and skips the owner guard entirely, so a PATH entry
+  # under `/tmp/main/bin` survives to supply the first `git` or `mktemp`
+  # (shardpilot/shardpilot-go#79 review).
+  #
+  # The review's remedy is "determine ownership from the resolved layout rather than
+  # the basename". I could not: MEASURED, the two layouts are indistinguishable from
+  # inside the git directory. Their `config` files are byte-identical,
+  # `core.worktree` is unset in both -- there is no back-pointer, which this file
+  # already records one guard down -- and `git worktree list` reports `/tmp/store`,
+  # the git directory's PARENT, rather than the checkout `/tmp/main`, so the later
+  # enumeration does not name it either.
+  #
+  # The two sound remedies both cost something this file has already refused to pay,
+  # so the choice is the reviewer's rather than mine:
+  #
+  #   1. Refuse every `/.git`-suffixed common directory the INVOKING checkout does
+  #      not own directly. Sound, and it refuses an ordinary push from a LINKED
+  #      worktree -- which is how every lane in this workspace works, and B and C
+  #      are indistinguishable from the invoking side too.
+  #   2. Move the decision after the PATH filter, where `git worktree list` can be
+  #      consulted. This file's own rule says a guard that runs after the thing it
+  #      guards is a consolation, and the first `mktemp` has already resolved by
+  #      then.
+  #
+  # Narrowing what IS provable, without the false refusal of (1): the exemption is
+  # unchanged where the invoking checkout owns the directory outright, and the
+  # gap above is the linked-worktree case in both layouts. It is written here so
+  # the next reader does not have to rediscover that the basename was load-bearing.
   if [ "$wt_common_is_dotgit" = no ]; then
     # A separate git directory. Its checkout is discoverable only from the CHECKOUT
     # side, so unless this one owns it, there is a checkout on this machine whose
@@ -940,6 +972,17 @@ sp_cfg_keys="$(git config --list --name-only 2>/dev/null |
   sort -u || true)"
 sp_cfg_n=0
 sp_seen=""
+# ⚠ AND PATHNAME GENERATION IS OFF WHILE SPLITTING, FOR THE SECOND TIME IN THIS
+# FILE. The PATH loop above learned this and turns it off at line ~870; `set +f`
+# restores it eighteen lines later, and this enumeration -- written afterwards --
+# splits an unquoted list with globbing live. A driver name may contain a pattern
+# character: `filter.x*.clean` is a legal key, and a TRACKED file named
+# `filter.xZ.clean` makes this loop export an override for the file's name while
+# leaving the real key active, so the `git diff` below runs the branch's program
+# (shardpilot/shardpilot-go#79 review). The separator is what splitting is for; the
+# glob is a second grammar nobody asked for here, and the branch controls the
+# directory this expands in.
+set -f
 # `core.fsmonitor` is emptied whether or not it is currently set, so a value added
 # between this read and the commands below cannot arrive unanswered.
 for sp_k in core.fsmonitor $sp_cfg_keys; do
@@ -949,6 +992,7 @@ for sp_k in core.fsmonitor $sp_cfg_keys; do
   eval "export GIT_CONFIG_VALUE_$sp_cfg_n=''"
   sp_cfg_n=$((sp_cfg_n + 1))
 done
+set +f
 GIT_CONFIG_COUNT="$sp_cfg_n"
 export GIT_CONFIG_COUNT
 unset sp_cfg_keys sp_k sp_seen
@@ -986,6 +1030,29 @@ cleanup() {
 }
 trap cleanup EXIT
 git_safe() { git -c core.hooksPath="$hooks_off" "$@"; }
+
+# in_worktree runs a git command INSIDE the scan worktree.
+#
+# ⚠ `cd` CHANGES THE DIRECTORY AND NOTHING ELSE, AND THE SELECTOR OUTRANKS IT. This
+# hook clears every INHERITED repository selector and then resolves and re-exports
+# `GIT_DIR` for the repository being pushed -- correctly, because the outer commands
+# have to know which repository that is. Nobody asked what it means after `cd "$wt"`:
+# it means `read-tree` writes the INVOKING repository's index, and the `update-index`
+# calls and scanner fixtures after it keep targeting that repository -- replacing a
+# developer's staged work with a historical tree plus synthetic evidence
+# (shardpilot/shardpilot-go#79 review). That is the second time in this file that a
+# selector's damage lands OUTSIDE the push it refuses, and the first was the
+# inherited half of the same variable.
+#
+# The object stores stay: they say where objects LIVE, not which repository a command
+# means, and the commits under inspection may exist only there. They were made
+# absolute two hundred lines up for exactly this crossing.
+#
+# One wrapper, six call sites. The count of sites is the thing that keeps being
+# wrong in this file, so the sites do not get to spell this themselves.
+in_worktree() {
+	( cd "$wt" && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE && git_safe "$@" )
+}
 
 # git_probe runs a git command whose OUTPUT is the answer, and refuses when the
 # command FAILED. It sets `PROBE_OUT`; it does not return a value, because a helper
@@ -1621,7 +1688,7 @@ scan_commit() {
   # it never looked at -- which is the worst outcome this hook has, and the first
   # rig probe caught it immediately (the scanner's own roster self-check failed,
   # because nothing existed to find the names in).
-  if ! ( cd "$wt" && git_safe read-tree "$1" ) 2>/dev/null; then
+  if ! in_worktree read-tree "$1" 2>/dev/null; then
     printf 'REFUSING: could not read the tree of %s into an index to scan it.\n' "$1" >&2
     exit 2
   fi
@@ -1655,7 +1722,7 @@ scan_commit() {
   # measurement that was never taken (shardpilot/shardpilot-go#79 review). Fourth
   # site of this shape in this file; the population was produced by grepping every
   # substitution that swallows a status, not by listing the ones I was shown.
-  if ! scripts_row="$( cd "$wt" && git_safe ls-tree "$1" -- scripts 2>/dev/null )"; then
+  if ! scripts_row="$( in_worktree ls-tree "$1" -- scripts 2>/dev/null )"; then
     printf 'REFUSING: the entry for `scripts` in %s could not be read, so this gate\n' "$1" >&2
     printf '  cannot tell an unreadable entry from an absent one.\n' >&2
     exit 2
@@ -1669,7 +1736,7 @@ scan_commit() {
       exit 2
       ;;
   esac
-  if ! scanner_row="$( cd "$wt" && git_safe ls-tree "$1" -- scripts/check_public_surface.sh 2>/dev/null )"; then
+  if ! scanner_row="$( in_worktree ls-tree "$1" -- scripts/check_public_surface.sh 2>/dev/null )"; then
     printf 'REFUSING: the entry for the scanner path in %s could not be read, so its\n' "$1" >&2
     printf '  mode cannot be checked and a gitlink there would go unscanned.\n' >&2
     exit 2
@@ -1745,7 +1812,7 @@ scan_commit() {
     # review). `hash-object -w` plus `update-index --cacheinfo` writes the bytes
     # as they are. A failure refuses: unstaged evidence is unread evidence, and
     # this gate does not report on what it has not read.
-    blob="$( cd "$wt" && git_safe hash-object -w --no-filters -- "$3" 2>/dev/null )"
+    blob="$( in_worktree hash-object -w --no-filters -- "$3" 2>/dev/null )"
     # ⚠ THE MODE IS PART OF WHAT THE SCANNER CLASSIFIES BY. Everything was staged
     # `100644`, so a tagged tree's SYMLINK -- `logo.png -> assets/logo` -- reached
     # the scanner as a regular file whose leaf ends in `.png`, and its image rule
@@ -1753,8 +1820,8 @@ scan_commit() {
     # (shardpilot/shardpilot-go#79 review). The scanner has a `120000` branch; it
     # was never reachable through this path.
     mode="${4:-100644}"
-    if [ -z "$blob" ] || ! ( cd "$wt" && git_safe update-index --add \
-         --cacheinfo "$mode,$blob,$2" 2>/dev/null ); then
+    if [ -z "$blob" ] || ! in_worktree update-index --add \
+         --cacheinfo "$mode,$blob,$2" 2>/dev/null; then
       printf 'REFUSING: could not stage %s for scanning in %s.\n' "$2" "$1" >&2
       exit 2
     fi
@@ -1895,8 +1962,8 @@ scan_commit() {
   # review, second site of the reported class). "Could not measure" is not "nothing
   # to do".
   sblob="$( git_safe hash-object -w --no-filters -- "$scanner" 2>/dev/null )"
-  if [ -z "$sblob" ] || ! ( cd "$wt" && git_safe update-index --add \
-       --cacheinfo "100755,$sblob,scripts/check_public_surface.sh" >/dev/null 2>&1 ); then
+  if [ -z "$sblob" ] || ! in_worktree update-index --add \
+       --cacheinfo "100755,$sblob,scripts/check_public_surface.sh" >/dev/null 2>&1; then
     printf 'REFUSING: could not stage the trusted scanner for the scan of %s.\n' "$1" >&2
     printf '  The scan would then read an index that does not contain the scanner\n' >&2
     printf '  it is running, and report on a tree it was not given.\n' >&2
@@ -1920,9 +1987,11 @@ scan_commit() {
   # to compare" passes the empty tree, and nothing else does. Anything else must
   # resolve to a commit or this gate cannot speak for the comparison.
   if [ "$2" = "$(git hash-object -t tree /dev/null)" ]; then
-    ( cd "$wt" && unset PUBLIC_SURFACE_BASE_REF && ./scripts/check_public_surface.sh )
+    ( cd "$wt" && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE PUBLIC_SURFACE_BASE_REF &&
+      ./scripts/check_public_surface.sh )
   elif git cat-file -e "$2^{commit}" 2>/dev/null; then
-    ( cd "$wt" && PUBLIC_SURFACE_BASE_REF="$2" ./scripts/check_public_surface.sh )
+    ( cd "$wt" && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE &&
+      PUBLIC_SURFACE_BASE_REF="$2" ./scripts/check_public_surface.sh )
   else
     printf 'REFUSING: the baseline %s could not be read, so the ratchet would run\n' "$2" >&2
     printf '  against nothing while reporting that it ran.\n' >&2

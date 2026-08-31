@@ -368,20 +368,37 @@ chmod +x "$probe_repo/.git/hooks/check_public_surface.sh"
   git config filter.fx.clean ./clean ) || true
 
 exec_fail=0
-# The positive control: the hook as committed at this branch's parent must let the
-# programs run. If it does not, this section is measuring nothing.
-parent_hook="$work/parent-pre-push"
-if git show "HEAD~1:.githooks/pre-push" > "$parent_hook" 2>/dev/null; then
-  before="$(run_push_probe "$parent_hook")"
-  case "$before" in
-    *fsmonitor*) printf '\npositive control: the parent hook let [%s] run, as expected.\n' "$before" ;;
-    *) echo "REFUSING: the attack did not land on the parent hook ([$before]), so this" >&2
-       echo "  section cannot tell a fix from a rig that never reproduced the defect." >&2
-       exit 2 ;;
-  esac
-else
-  echo "note: no parent revision available; the positive control was skipped." >&2
-fi
+# ⚠ THE POSITIVE CONTROL IS A FIXTURE, NOT A REVISION. It read
+# `git show HEAD~1:.githooks/pre-push` -- which is the ALREADY FIXED hook on every
+# descendant commit, so the control would find no marker and this section would
+# refuse on ordinary commits (shardpilot/shardpilot-go#79 review).
+#
+# ⚠ AND IN CI IT WAS WORSE: `actions/checkout` clones at depth 1, so `HEAD~1` does
+# not exist, the `else` branch fired, and the control was SKIPPED -- the whole
+# execution section ran green with no evidence, in 5 seconds, for as long as it has
+# existed. A check that skips is a silent failure that looks like success.
+#
+# So the vulnerable behaviour is BUILT here. It is two lines: consult the working
+# tree the way the real hook must, with nothing neutralised. Stable under any
+# history, any clone depth, and any later commit -- verified in a depth-1 clone.
+vuln_hook="$work/vulnerable-pre-push"
+cat > "$vuln_hook" <<'VULNEOF'
+#!/bin/bash
+# A stand-in for this hook WITHOUT its config neutralisation: it consults the
+# working tree, which is what makes git run the configured drivers. Its only job is
+# to prove the attack lands.
+git diff --quiet HEAD -- >/dev/null 2>&1
+exit 0
+VULNEOF
+chmod +x "$vuln_hook"
+before="$(run_push_probe "$vuln_hook")"
+case "$before" in
+  *fsmonitor*) printf '\npositive control: the unneutralised stand-in let [%s] run, as expected.\n' "$before" ;;
+  *) echo "REFUSING: the attack did not land on the unneutralised stand-in ([$before])," >&2
+     echo "  so this section cannot tell a fix from a rig that never reproduced the" >&2
+     echo "  defect. The fixture, not the hook, is what has stopped working." >&2
+     exit 2 ;;
+esac
 
 after="$(run_push_probe "$hook")"
 if [ -n "$after" ]; then
@@ -416,15 +433,50 @@ run_push_probe_c() {
   ( cd "$probe_repo" && git -C "$probe_remote" update-ref -d refs/heads/probe >/dev/null 2>&1 ) || true
   sort -u "$fired" 2>/dev/null | tr '\n' ' '
 }
-if [ -n "${parent_hook:-}" ] && [ -s "${parent_hook:-/nonexistent}" ]; then
-  before_c="$(run_push_probe_c "$parent_hook")"
+if [ -s "$vuln_hook" ]; then
+  before_c="$(run_push_probe_c "$vuln_hook")"
   case "$before_c" in
-    *fsmonitor*) printf 'positive control: `git -c` let [%s] run on the parent hook.\n' "$before_c" ;;
-    *) echo "REFUSING: the -c bypass did not land on the parent hook ([$before_c])," >&2
+    *fsmonitor*) printf 'positive control: `git -c` let [%s] run on the stand-in.\n' "$before_c" ;;
+    *) echo "REFUSING: the -c bypass did not land on the stand-in ([$before_c])," >&2
        echo "  so this check cannot tell a fix from a rig that never reproduced it." >&2
        exit 2 ;;
   esac
 fi
+# ⚠ THE GLOB CASE IS ASSERTED STRUCTURALLY, AND THE REASON IS WORTH THE LINE. A
+# driver name may contain a pattern character -- `filter.x*.clean` is a legal key --
+# and the enumeration that neutralises the drivers splits an unquoted list in a
+# directory the pushed branch owns, so a TRACKED file named `filter.xZ.clean` makes
+# the loop export an override for the FILE's name and leave the real key active
+# (shardpilot/shardpilot-go#79 review).
+#
+# It was MEASURED directly -- without `set -f` the loop iterates `filter.xZ.clean`,
+# with it `filter.x*.clean` -- and an end-to-end version of that through a real push
+# would not reproduce here. A case that cannot go positive is worse than none, so
+# what is asserted is the property that fixes it: the enumeration is bracketed by
+# `set -f`. If the brackets move, this refuses rather than reporting green.
+enum_start="$(grep -n 'for sp_k in core.fsmonitor' "$hook" | head -1 | cut -d: -f1)"
+if [ -z "$enum_start" ]; then
+  echo "REFUSING: the config-key enumeration was not found, so its globbing could" >&2
+  echo "  not be checked. The pattern here has stopped matching it." >&2
+  exit 2
+fi
+glob_off=no
+i=$((enum_start - 1))
+while [ "$i" -gt 0 ] && [ "$i" -gt $((enum_start - 25)) ]; do
+  case "$(sed -n "${i}p" "$hook")" in
+    "set -f") glob_off=yes; break ;;
+    "set +f") break ;;
+  esac
+  i=$((i - 1))
+done
+if [ "$glob_off" != yes ]; then
+  echo "FAIL: the config-key enumeration splits an unquoted list with pathname" >&2
+  echo "  generation live, in a directory the pushed branch owns." >&2
+  exec_fail=1
+else
+  printf 'this hook: the key enumeration runs with globbing off.\n'
+fi
+
 after_c="$(run_push_probe_c "$hook")"
 if [ -n "$after_c" ]; then
   echo "FAIL: 'git -c core.fsmonitor=...' re-enabled a branch program: [$after_c]" >&2
@@ -433,8 +485,72 @@ else
   printf 'this hook: a git -c override did not re-enable it.\n'
 fi
 
+# ---- the developer's index survives the scan --------------------------------
+#
+# ⚠ THE ONLY DEFECT IN THIS GATE WHOSE DAMAGE LANDS OUTSIDE THE PUSH IT REFUSES.
+# The hook clears every INHERITED repository selector and then resolves and
+# re-exports `GIT_DIR` for the repository being pushed -- correctly, because the
+# outer commands need it. But `cd "$wt"` changes the directory and nothing else, so
+# `read-tree` wrote the INVOKING repository's index and the `update-index` calls and
+# scanner fixtures after it kept targeting that repository, replacing staged work
+# with a historical tree plus synthetic evidence (shardpilot/shardpilot-go#79
+# review).
+#
+# Asserted on the artefact a developer would lose: a distinctive staged path, still
+# staged and alone, after a real push.
+idx_repo="$work/idx"
+git init -q "$idx_repo"
+printf 'a\n' > "$idx_repo/f"
+mkdir -p "$idx_repo/.git/hooks" "$idx_repo/scripts"
+printf '#!/bin/sh\nexit 0\n' > "$idx_repo/.git/hooks/check_public_surface.sh"
+chmod +x "$idx_repo/.git/hooks/check_public_surface.sh"
+mkdir -p "$idx_repo/scripts"
+printf '#!/bin/sh\nexit 0\n' > "$idx_repo/scripts/check_public_surface.sh"
+chmod +x "$idx_repo/scripts/check_public_surface.sh"
+( cd "$idx_repo"
+  git add -A >/dev/null 2>&1
+  git -c user.email=t@t -c user.name=t commit -q -m c1 >/dev/null 2>&1
+  printf 'b\n' > f
+  git add -A >/dev/null 2>&1
+  git -c user.email=t@t -c user.name=t commit -q -m c2 >/dev/null 2>&1
+  git remote add origin "$probe_remote" >/dev/null 2>&1 ) || true
+idx_probe() { # idx_probe <hook file> ; echoes the invoking repo's index afterwards
+  cp "$1" "$idx_repo/.git/hooks/pre-push"; chmod +x "$idx_repo/.git/hooks/pre-push"
+  # ⚠ WITH AN EXPLICIT `--git-dir`, which is the condition. An ordinary `git push`
+  # passes no GIT_DIR to its hook, so the exported selector this is about does not
+  # exist and the damage cannot land -- I ran three configurations that reported
+  # clean before finding the one that reaches it.
+  ( cd "$idx_repo" && git --git-dir="$idx_repo/.git" --work-tree="$idx_repo" \
+      push -q origin HEAD:refs/heads/idxprobe >/dev/null 2>&1 ) || true
+  git -C "$probe_remote" update-ref -d refs/heads/idxprobe >/dev/null 2>&1 || true
+  ( cd "$idx_repo" && git ls-files | sort | tr '\n' ' ' )
+}
+idx_fail=0
+# The positive control: the unfixed crossing must stage the hook's own evidence
+# files into the invoking index, or this section is measuring nothing.
+idx_vuln="$work/idx-vulnerable-hook"
+sed 's|( cd "$wt" \&\& unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE \&\& git_safe "$@" )|( cd "$wt" \&\& git_safe "$@" )|' "$hook" > "$idx_vuln"
+chmod +x "$idx_vuln"
+idx_before="$(idx_probe "$idx_vuln")"
+case "$idx_before" in
+  *as-committed.txt*) printf '\npositive control: the unfixed crossing staged [%s] into the invoking index.\n' "$idx_before" ;;
+  *) echo "REFUSING: the unfixed crossing did not reach the invoking index" >&2
+     echo "  ([$idx_before]), so this check cannot tell a fix from a rig that never" >&2
+     echo "  reproduced the damage." >&2
+     exit 2 ;;
+esac
+( cd "$idx_repo" && git reset -q --hard HEAD >/dev/null 2>&1 ) || true
+idx_after="$(idx_probe "$hook")"
+case "$idx_after" in
+  *as-committed.txt*)
+    echo "FAIL: the scan staged its own evidence into the invoking repository's" >&2
+    echo "  index: [$idx_after]" >&2
+    idx_fail=1 ;;
+  *) printf 'this hook: the invoking index is untouched [%s].\n' "$idx_after" ;;
+esac
+
 printf '\n%d gitfile read(s) found, %d still line-oriented.\n' "$gf_total" "$gf_bad"
 printf '%d checkout-root case(s), %d failure(s).\n' "$itotal" "$ifail"
 printf '%d case(s) judged, %d failure(s); %d normal-form case(s), %d failure(s).\n' \
   "$total" "$failures" "$ntotal" "$nfail"
-[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] || exit 1
+[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] && [ "$idx_fail" -eq 0 ] || exit 1
