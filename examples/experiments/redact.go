@@ -1487,7 +1487,23 @@ func redactUnaccountedJSONValues(body string, exempt map[string]bool, statusLine
 	// well-formed verdict is not this SDK's classification at all -- the decode here
 	// succeeded and vouched `reason` anyway (same review). Same gate as the exemption
 	// registry, for the same reason.
-	if haveStatus && code == 200 && !capturedIncomplete && len(body) <= sdkMaxBodyBytes {
+	// ⚠ AND MEASURED ON THE CAPTURED BYTES, NOT ON WHAT THIS PASS WAS HANDED. This
+	// runs AFTER `redactMintedBody`, which shortens minted strings -- so a 1 MiB+1
+	// response whose bulk is a minted `assignment_key` arrives here under the limit,
+	// the gate the SDK applies BEFORE decoding reads as satisfied, and a supplied
+	// `kill_switch` was vouched through both the scrub and the guard with an empty
+	// refusal ledger (shardpilot/shardpilot-go#85 review). The comment above says
+	// "same gate as the exemption registry": that registry was moved onto
+	// `capturedBodyBytes` and the raw body a round earlier, and this site was left
+	// asking the same question of different bytes.
+	sdkLen, sdkView := len(body), view
+	if capturedBodyBytes >= 0 {
+		sdkLen = capturedBodyBytes
+	}
+	if capturedBodyRaw != "" {
+		sdkView = capturedBodyRaw
+	}
+	if haveStatus && code == 200 && !capturedIncomplete && sdkLen <= sdkMaxBodyBytes {
 		var shape sdkAssignmentWire
 		// Presence-aware, exactly as `expEchoMatches` states it: absent is tolerated,
 		// while a present member must be a JSON STRING and must be one this harness
@@ -1519,7 +1535,7 @@ func redactUnaccountedJSONValues(body string, exempt map[string]bool, statusLine
 		// ⚠ THE DECODE FIRST, THEN THE FIELDS. My first version computed `versionOK`
 		// from `shape.Version` BEFORE the unmarshal filled it, so it was always true
 		// and the check did nothing -- and the scene said so on the first run.
-		if json.Unmarshal([]byte(view), &shape) == nil &&
+		if json.Unmarshal([]byte(sdkView), &shape) == nil &&
 			shape.Assigned != nil && !*shape.Assigned &&
 			echoed(shape.AppKey, requestedAppKey) &&
 			echoed(shape.EnvironmentKey, requestedEnvKey) &&
@@ -2486,7 +2502,12 @@ func mintedCanonical(name string) (string, bool) {
 func cookieAttrCanonical(name, value string) (string, bool) {
 	switch strings.ToLower(ows(name)) {
 	case "max-age":
-		if isDigits(value) {
+		// ⚠ THE SAME QUESTION AS `cookieAttrVerbatim`, AND IT WAS ASKED TWICE. Both
+		// sites spelled it `isDigits`, so repairing one left `-1` refused by the other
+		// and the attribute was still published as a length. One predicate answers it
+		// now; the review named one site, and the count of sites is the thing that
+		// keeps being wrong in this file.
+		if maxAgeReadByTheParser(value) {
 			return value, true
 		}
 	case "expires":
@@ -2513,10 +2534,47 @@ func cookieAttrCanonical(name, value string) (string, bool) {
 	return "", false
 }
 
+// maxAgeReadByTheParser reports whether `net/http` reads `value` AS a Max-Age.
+//
+// ⚠ ASKED, NOT COMPUTED -- the rule `configuredHostWire` states one module along.
+// `isDigits` was both too NARROW and too WIDE, measured on this toolchain: it
+// rejected `-1`, which net/http accepts as MaxAge=-1 and which is how a deletion
+// cookie is spelled, so a legal attribute lost its grammar and was published as
+// `Max-Age=redacted-2-chars` (shardpilot/shardpilot-go#85 review); and it accepted
+// `007`, which net/http leaves in `Unparsed` and does NOT read as a Max-Age, so
+// this program vouched endpoint-chosen bytes as grammar the specification fixes.
+// The second half is the same defect as the first and was not in the finding.
+//
+// `+1`, `-0` and `0` are accepted by the parser too, and `007`, ` 1`, `1x` and
+// `--1` are not; writing that rule out here would be a second implementation of
+// someone else's grammar, and the edges belong to whoever owns it.
+//
+// ⚠ AND THE VALUE IS FENCED FIRST. It comes from the endpoint, and a `;` in it
+// would end the attribute in the probe string -- `1; HttpOnly` would parse as a
+// clean Max-Age plus a flag, and this would vouch bytes the real header never had
+// in that slot. The caller has already split on `;`, so this only refuses what
+// cannot legally be here.
+func maxAgeReadByTheParser(value string) bool {
+	if value == "" || strings.ContainsAny(value, ";,\r\n\t \"") {
+		return false
+	}
+	resp := http.Response{Header: http.Header{"Set-Cookie": []string{"sp=x; Max-Age=" + value}}}
+	cookies := resp.Cookies()
+	if len(cookies) != 1 {
+		return false
+	}
+	for _, u := range cookies[0].Unparsed {
+		if strings.HasPrefix(strings.ToLower(u), "max-age=") {
+			return false
+		}
+	}
+	return true
+}
+
 func cookieAttrVerbatim(name, value string) bool {
 	switch strings.ToLower(ows(name)) {
 	case "max-age":
-		return isDigits(value)
+		return maxAgeReadByTheParser(value)
 	case "expires":
 		return isHTTPDate(value)
 	case "samesite":

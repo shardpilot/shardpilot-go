@@ -6631,3 +6631,65 @@ func TestATrailerCodingIsStillACoding(t *testing.T) {
 		}
 	}
 }
+
+// TestTheSDKGateIsMeasuredOnTheCapturedBytes: the SDK refuses a body over
+// `expMaxBodyBytes` BEFORE decoding it, so a reason phrase in an oversized body is
+// the endpoint's word and not this program's grammar.
+//
+// ⚠ THE PASS THAT ASKS RUNS AFTER THE PASS THAT SHORTENS. `redactMintedBody`
+// replaces a minted string with a placeholder, so a 1 MiB+1 response whose bulk is
+// a minted `assignment_key` reached the gate under the limit, the gate read as
+// satisfied, and a supplied `kill_switch` was vouched -- through both the scrub and
+// the guard, with an empty refusal ledger (shardpilot/shardpilot-go#85 review).
+// `capturedBodyBytes` and `capturedBodyRaw` are what the SDK read; the exemption
+// registry was moved onto them a round earlier and this site was not.
+func TestTheSDKGateIsMeasuredOnTheCapturedBytes(t *testing.T) {
+	t.Cleanup(func() {
+		suppliedValues, structuralSurfaces = nil, nil
+		capturedBodyBytes, capturedBodyRaw = -1, ""
+	})
+	oversized := `{"assigned":false,"assignment_key":"` +
+		strings.Repeat("k", sdkMaxBodyBytes) + `","reason":"kill_switch"}`
+	suppliedValues = []string{"kill_switch"}
+	capturedBodyBytes, capturedBodyRaw = len(oversized), oversized
+	got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n" + oversized)))
+	if strings.Contains(got, "kill_switch") {
+		t.Errorf("a reason phrase in a body the SDK refuses before decoding was vouched: %q",
+			got[len(got)-70:])
+	}
+	// ⚠ AND A BODY THE SDK DOES READ STILL VOUCHES ITS REASON, or the gate has
+	// stopped answering about the SIZE and started refusing every verdict.
+	small := `{"assigned":false,"reason":"kill_switch"}`
+	capturedBodyBytes, capturedBodyRaw = len(small), small
+	got = stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n" + small)))
+	if !strings.Contains(got, "kill_switch") {
+		t.Errorf("a reason phrase the SDK reads lost its exemption: %q", got)
+	}
+}
+
+// TestASignedMaxAgeKeepsItsGrammar: `Max-Age=-1` is how a deletion cookie is
+// spelled and `net/http` reads it as `MaxAge == -1`, so replacing it with a length
+// costs the capture the attribute's meaning.
+//
+// ⚠ AND THE PREDICATE WAS WRONG IN BOTH DIRECTIONS. `isDigits` refused `-1`, which
+// the parser accepts (shardpilot/shardpilot-go#85 review), and admitted `007`,
+// which the parser leaves in `Unparsed` and does NOT read as a Max-Age -- so this
+// program vouched endpoint-chosen bytes as grammar the specification fixes. The
+// second half was not in the finding and is the same defect. Both sites that asked
+// it now call the parser instead of restating its grammar.
+func TestASignedMaxAgeKeepsItsGrammar(t *testing.T) {
+	t.Cleanup(func() { structuralSurfaces, accountedSurfaces = nil, nil })
+	for _, c := range []struct {
+		value string
+		kept  bool
+	}{
+		{"-1", true}, {"0", true}, {"60", true}, {"+1", true},
+		{"007", false}, {"1x", false}, {"", false},
+	} {
+		structuralSurfaces, accountedSurfaces = nil, nil
+		got := stripMarks(redactSetCookie("Set-Cookie: sid=x; Max-Age=" + c.value))
+		if kept := strings.Contains(got, "Max-Age="+c.value) && c.value != ""; kept != c.kept {
+			t.Errorf("Max-Age=%q kept=%v, want %v (%q)", c.value, kept, c.kept, got)
+		}
+	}
+}
