@@ -361,13 +361,6 @@ while IFS= read -r -d "" r; do
            esac ;;
   esac
 done < "$wp" &&
-{ { test "$b" = true &&
-      { git show HEAD:.githooks/pre-push > "$h/.pre-push.new" &&
-        git show HEAD:scripts/check_public_surface.sh > "$h/.check_public_surface.sh.new"; }; } ||
-  { cp "$t/.githooks/pre-push" "$h/.pre-push.new" &&
-    cp "$t/scripts/check_public_surface.sh" "$h/.check_public_surface.sh.new"; }; } &&
-chmod +x "$h/.pre-push.new" "$h/.check_public_surface.sh.new" ||
-  { rm -f "$h/.pre-push.new" "$h/.check_public_surface.sh.new"; exit 1; } &&
 pv="$(mktemp)" &&
 { prev_local="$(git config --local --get core.hooksPath 2>/dev/null)" && had_local=yes ||
   { prev_local=""; had_local=no; }; } &&
@@ -384,8 +377,14 @@ sp_rollback(){ rm -f "$h/pre-push" "$h/check_public_surface.sh" \
   done < "$pv"
   rm -f "$wt" "$wp" "$pv"
   echo "installation failed; the published hooks were rolled back" >&2; exit 1; } &&
-mv "$h/.pre-push.new" "$h/pre-push" || sp_rollback &&
-mv "$h/.check_public_surface.sh.new" "$h/check_public_surface.sh" || sp_rollback &&
+{ { { test "$b" = true &&
+        { git show HEAD:.githooks/pre-push > "$h/.pre-push.new" &&
+          git show HEAD:scripts/check_public_surface.sh > "$h/.check_public_surface.sh.new"; }; } ||
+    { cp "$t/.githooks/pre-push" "$h/.pre-push.new" &&
+      cp "$t/scripts/check_public_surface.sh" "$h/.check_public_surface.sh.new"; }; } || sp_rollback; } &&
+{ chmod +x "$h/.pre-push.new" "$h/.check_public_surface.sh.new" || sp_rollback; } &&
+{ mv "$h/.pre-push.new" "$h/pre-push" || sp_rollback; } &&
+{ mv "$h/.check_public_surface.sh.new" "$h/check_public_surface.sh" || sp_rollback; } &&
 { git config --local core.hooksPath "$h" || sp_rollback; } &&
 while IFS= read -r -d "" w; do
   test "$(git -C "$w" config --bool extensions.worktreeConfig 2>/dev/null || echo false)" = true || continue
@@ -404,6 +403,16 @@ while IFS= read -r -d "" w; do
 done < "$wp" &&
 rm -f "$wt" "$wp" "$pv"
 ```
+
+**Nothing is created before the handler that withdraws it exists, and each
+handler is bracketed to its own command.** `&&` and `||` associate left to right
+with equal precedence, so an unbracketed `|| sp_rollback` is the handler for the
+entire chain that precedes it rather than for the command it follows: a failure
+ten lines earlier reached it, and reached it before the function was defined.
+The staging copies are made after the definition, and every `|| sp_rollback` is
+wrapped in `{ ... ; }`. `scripts/test_prepush_bare_exemption.sh` lifts this block
+out of this file and runs it, including the failure paths, so a change that
+breaks either property is refused rather than published.
 
 **The hooks directory must not be TRACKABLE from the worktree, and that is
 checked rather than inferred from `-L`.** Inside the worktree is not the same

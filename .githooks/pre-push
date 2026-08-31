@@ -600,7 +600,14 @@ elif [ -f "$checkout_root/.git" ]; then
   # successful read.
   wt_gitline=""
   IFS= read -r -d "" wt_gitline < "$checkout_root/.git" || true
+  # ⚠ CR TOO, AT ALL FIVE OF THESE. Git reads a CRLF `gitdir` file and enumerates
+  # the worktree normally, so a back-pointer that was read successfully and is not
+  # empty can still carry a terminator this strip missed -- and the path it then
+  # names does not exist (shardpilot/shardpilot-go#79 review). The review named ONE
+  # of the five sites that strip a terminator from a back-pointer; a `grep` for the
+  # others cost one command.
   wt_gitline="${wt_gitline%$NL}"
+  wt_gitline="${wt_gitline%$CR}"
   case "$wt_gitline" in
     "gitdir: "*) wt_common="${wt_gitline#gitdir: }" ;;
   esac
@@ -611,8 +618,20 @@ case "$wt_common" in
   ""|/*) ;;
   *) wt_common="$checkout_root/$wt_common" ;;
 esac
+# ⚠ `/worktrees/` IS GIT METADATA ONLY WHERE GIT PUT IT. A user may name a
+# directory that -- `git init --separate-git-dir=/store/worktrees/foo /checkout` is
+# valid -- and this lexical rewrite truncated the common directory to `/store`, after
+# which the owner check could not match the checkout's back-pointer and every clean
+# push was refused as coming from an unnameable checkout
+# (shardpilot/shardpilot-go#79 review). A linked worktree's administrative directory
+# holds a `gitdir` file naming the checkout; an ordinary directory does not, so the
+# suffix is stripped only where that evidence is present.
 case "$wt_common" in
-  */worktrees/*) wt_common="${wt_common%/worktrees/*}" ;;
+  */worktrees/*)
+    if [ -f "$wt_common/gitdir" ] && [ -f "${wt_common%/worktrees/*}/HEAD" ]; then
+      wt_common="${wt_common%/worktrees/*}"
+    fi
+    ;;
 esac
 if [ -n "$wt_common" ]; then
   case "$wt_common" in
@@ -657,7 +676,14 @@ if [ -n "$wt_common" ]; then
       printf '  registers cannot be named.\n' >&2
       exit 2
     fi
+    # ⚠ AND CR IS A TERMINATOR GIT ACCEPTS HERE. A CRLF `gitdir` file is read and
+    # enumerated normally by git, and stripping only the LF left the CR on the end --
+    # so the suffix test failed, `other_roots` recorded a path that does not exist,
+    # and a PATH entry beneath that checkout survived the pre-command filter
+    # (shardpilot/shardpilot-go#79 review). A successfully read, non-empty
+    # back-pointer can still name the wrong root.
     wt_line="${wt_line%$NL}"
+    wt_line="${wt_line%$CR}"
     case "$wt_line" in
       ""|/*) ;;
       *) wt_line="$wt_common/$wt_line" ;;
@@ -729,6 +755,7 @@ if [ -n "$wt_common" ]; then
       wt_own_line=""
       IFS= read -r -d "" wt_own_line < "$checkout_root/.git" || true
       wt_own_line="${wt_own_line%$NL}"
+      wt_own_line="${wt_own_line%$CR}"
       [ "$wt_own_line" = "gitdir: $wt_common" ] && wt_owns=yes
     fi
     # ⚠ AND A BARE REPOSITORY HAS NO CHECKOUT TO NAME, so this guard's own premise
@@ -1071,7 +1098,7 @@ if ! sp_cfg_all="$(git config --list --name-only 2>/dev/null)"; then
 fi
 sp_cfg_keys=""
 sp_cfg_keys="$(printf '%s\n' "$sp_cfg_all" |
-  grep -E '^(core\.fsmonitor|core\.alternaterefscommand|core\.gitproxy|init\.templatedir|(diff|filter|merge)\..*\..+)$')" || {
+  grep -E '^(core\.fsmonitor|core\.alternaterefscommand|core\.gitproxy|(diff|filter|merge)\..*\..+)$')" || {
   sp_cfg_rc=$?
   if [ "$sp_cfg_rc" -ne 1 ]; then
     printf 'REFUSING: the executable-key scan failed (grep exited %s), so this gate\n' "$sp_cfg_rc" >&2
@@ -1117,7 +1144,18 @@ sp_bs="\\"
 sp_qrep="$sp_q$sp_bs$sp_q$sp_q"
 sp_cfg_args=()
 sp_cfg_params=""
-for sp_k in core.fsmonitor $sp_cfg_keys; do
+# ⚠ AND A KEY THE DERIVATION CANNOT SEE MUST NOT DEPEND ON IT. An
+# `includeIf "gitdir:/tmp/**"` activates `init.templateDir` only once git is INSIDE
+# the scanner's fixture repositories -- after this list was derived from the outer
+# config -- so deriving it was never going to reach that route
+# (shardpilot/shardpilot-go#79 review). Measured: a global `init.templateDir` copies
+# a checkout-controlled hook into every `git init` fixture and it runs on the next
+# `git add`; setting the key empty stops the copy.
+#
+# So both members of the seed list are emptied whether or not they are currently
+# set. That is the property: a key whose danger does not depend on being visible
+# here must not be neutralised only when it is.
+for sp_k in core.fsmonitor init.templatedir $sp_cfg_keys; do
   case " $sp_seen " in *" $sp_k "*) continue ;; esac
   sp_seen="$sp_seen $sp_k"
   sp_cfg_args+=(-c "$sp_k=")
@@ -1581,6 +1619,7 @@ if [ -n "$worktree_root" ]; then
     iv_link=""
     IFS= read -r -d "" iv_link < "$worktree_root/.git" || true
     iv_link="${iv_link%$NL}"
+    iv_link="${iv_link%$CR}"
     case "$iv_link" in
       "gitdir: "*)
         iv_phys="$(physdir "${iv_link#gitdir: }")" && iv_phys="${iv_phys%X}" || iv_phys=""
@@ -1617,6 +1656,7 @@ if [ -n "$worktree_root" ]; then
               wt_link=""
               IFS= read -r -d "" wt_link < "$wt_owner/.git" || true
               wt_link="${wt_link%$NL}"
+              wt_link="${wt_link%$CR}"
               if [ "$wt_link" = "gitdir: $wt_phys" ] || [ "$wt_link" = "gitdir: $wt_other" ]; then
                 wt_owner_found=yes
                 wt_owner_phys="$(physdir "$wt_owner")" && wt_owner_phys="${wt_owner_phys%X}" &&

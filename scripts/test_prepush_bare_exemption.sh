@@ -243,7 +243,11 @@ fi
 # ONE of the three. Checking that one would have left the other two, and would not
 # stop a fourth being added. So the question asked is "does any read of a gitfile
 # still stop at a newline", which has no favourite instance.
-gitfile_reads="$(grep -n 'read -r[^<]*< *"[^"]*/\.git"' "$hook" || true)"
+# The pattern matches ANY read redirected from a named file, not only paths spelled
+# `.../.git`: the back-pointer inside `worktrees/<n>/gitdir` is the same class and
+# the narrower pattern could not see it, so a line-oriented read there would have
+# been reported green by a check whose stated subject is the class.
+gitfile_reads="$(grep -n 'read -r[^<]*< *"' "$hook" || true)"
 gf_bad=0
 gf_total=0
 while IFS= read -r gf_line; do
@@ -461,8 +465,13 @@ if [ -z "$enum_start" ]; then
   exit 2
 fi
 glob_off=no
+# The question is CONTAINMENT -- is the nearest bracket above the enumeration a
+# `set -f` and not a `set +f` -- so the scan runs to the top of the file. A fixed
+# lookback answered a different question, "is `set -f` within N lines", and a
+# comment added above the loop pushed the bracket out of the window and reported a
+# defect that was not in the hook.
 i=$((enum_start - 1))
-while [ "$i" -gt 0 ] && [ "$i" -gt $((enum_start - 25)) ]; do
+while [ "$i" -gt 0 ]; do
   case "$(sed -n "${i}p" "$hook")" in
     "set -f") glob_off=yes; break ;;
     "set +f") break ;;
@@ -794,8 +803,136 @@ else
   printf 'this hook: the caller command-scoped configuration is left in place.\n'
 fi
 
+
+# ---- the README installer, run rather than read -------------------------------
+#
+# The installer published in README.md is 91 lines of shell that every adopter
+# pastes once, and until now nothing executed it. Over this PR's rounds the
+# reviewer raised 43 findings against that file against 163 against the hook --
+# three times its share of the diff -- and each was repaired by READING, because
+# there was nothing to run. A defect survived all of it: on any failure before the
+# `sp_rollback` definition, `&&` and `||` associate left-to-right, so the bare
+# `|| sp_rollback` operators fired for a failure ten lines earlier and called a
+# function that did not exist yet, four times, exiting 127 with no rollback and no
+# usable message. Reading did not find that in nine rounds; running it found it in
+# one.
+#
+# ⚠ IT LIFTS THE PUBLISHED TEXT, exactly as the parse block above does. A copy
+# here would drift from the README and pass while adopters ran something else.
+# If the anchor stops matching, this REFUSES rather than reporting green.
+ins_fail=0
+ins_src="$here/README.md"
+ins="$work/installer.sh"
+if [ ! -r "$ins_src" ]; then
+  echo "REFUSING: cannot read $ins_src, so the published installer was not tested." >&2
+  exit 2
+fi
+awk 'index($0,"p_(){ x=\"$(cd -- \"$1\"")==1{f=1} f&&/^```$/{exit} f{print}' "$ins_src" > "$ins"
+if [ ! -s "$ins" ]; then
+  echo "REFUSING: the installer block was not found in README.md. The anchor here has" >&2
+  echo "  stopped matching it, and this section would otherwise test nothing." >&2
+  exit 2
+fi
+if ! bash -n "$ins" 2>/dev/null; then
+  echo "FAIL: the installer published in README.md does not parse." >&2
+  ins_fail=1
+fi
+
+# A `mktemp` and an `mv` that fail on demand, so a failure can be placed at a
+# chosen step instead of being waited for.
+mkdir -p "$work/shim"
+cat > "$work/shim/mktemp" <<'INSSHIM'
+#!/usr/bin/env bash
+n=$(( $(cat "$SP_N" 2>/dev/null || echo 0) + 1 )); printf '%s' "$n" > "$SP_N"
+[ "${SP_FAIL_AT:-}" = "$n" ] && { echo "mktemp: injected failure" >&2; exit 1; }
+exec /usr/bin/mktemp "$@"
+INSSHIM
+cat > "$work/shim/mv" <<'INSSHIM'
+#!/usr/bin/env bash
+n=$(( $(cat "$SP_MVN" 2>/dev/null || echo 0) + 1 )); printf '%s' "$n" > "$SP_MVN"
+[ "${SP_MV_FAIL_AT:-}" = "$n" ] && { echo "mv: injected failure" >&2; exit 1; }
+exec mv "$@"
+INSSHIM
+chmod +x "$work/shim/mktemp" "$work/shim/mv"
+
+ins_fixture(){ # $1 = directory
+  rm -rf "$1"; mkdir -p "$1/.githooks" "$1/scripts"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$1/.githooks/pre-push"
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$1/scripts/check_public_surface.sh"
+  chmod +x "$1/.githooks/pre-push" "$1/scripts/check_public_surface.sh"
+  git -C "$1" init -q . >/dev/null 2>&1
+  git -C "$1" config user.email t@example.invalid
+  git -C "$1" config user.name t
+  git -C "$1" add -A >/dev/null 2>&1
+  git -C "$1" commit -qm init >/dev/null 2>&1
+}
+ins_say(){ if [ "$1" = 0 ]; then printf 'this installer: %s\n' "$2"
+           else echo "FAIL: installer -- $2" >&2; ins_fail=1; fi; }
+
+# an ordinary checkout installs, and leaves no staging name behind
+insA="$work/insA"; ins_fixture "$insA"
+( cd "$insA" && bash "$ins" ) >"$work/insA.out" 2>&1
+ins_say "$?" "an ordinary checkout installs"
+[ -x "$insA/.git/hooks/pre-push" ]; ins_say "$?" "the hook is published and executable"
+[ -x "$insA/.git/hooks/check_public_surface.sh" ]; ins_say "$?" "the scanner is published"
+# compared against the RESOLVED root: the installer resolves symlinks with `pwd -P`
+# and a temporary directory commonly sits under one, so the unresolved name would
+# differ from a correct answer.
+insA_real="$(cd "$insA" && pwd -P)"
+[ "$(git -C "$insA" config --local --get core.hooksPath)" = "$insA_real/.git/hooks" ]
+ins_say "$?" "core.hooksPath names the published directory"
+
+# a bare repository installs from HEAD: rather than from a worktree it has not got
+insB="$work/insB"; ins_fixture "$work/insBsrc"
+git clone -q --bare "$work/insBsrc" "$insB" >/dev/null 2>&1
+( cd "$insB" && bash "$ins" ) >"$work/insB.out" 2>&1
+ins_say "$?" "a bare repository installs from HEAD:"
+[ -x "$insB/hooks/pre-push" ]; ins_say "$?" "the bare arm publishes the hook"
+
+# ---- the failure paths, which are the ones nobody runs by hand ----------------
+#
+# A staging name left behind is not a cosmetic leak: the installer's own
+# occupied-path guard refuses every later attempt until it is removed by hand, so
+# one failed install bricks the documented instructions for that checkout.
+insC="$work/insC"; ins_fixture "$insC"
+: > "$work/n"
+( cd "$insC" && SP_N="$work/n" SP_FAIL_AT=3 PATH="$work/shim:$PATH" bash "$ins" ) \
+  >"$work/insC.out" 2>&1
+[ "$?" -ne 0 ]; ins_say "$?" "a failed temporary file fails the install"
+! ls -A "$insC/.git/hooks" 2>/dev/null | grep -q '^\.\(pre-push\|check_public_surface\)'
+ins_say "$?" "no staging name is left behind"
+( cd "$insC" && bash "$ins" ) >"$work/insCr.out" 2>&1
+ins_say "$?" "a retry after that failure still installs"
+
+# A failure BEFORE the handler is defined must not reach for it. This is the
+# left-to-right association of `&&` and `||`: every unbracketed `|| sp_rollback`
+# is the handler for the whole chain that precedes it, not for the command it
+# follows, so the handler must be bracketed to its own command.
+insD="$work/insD"; ins_fixture "$insD"
+: > "$work/n"
+( cd "$insD" && SP_N="$work/n" SP_FAIL_AT=3 PATH="$work/shim:$PATH" bash "$ins" ) \
+  >"$work/insD.out" 2>&1
+ins_d_rc=$?
+! grep -q "command not found" "$work/insD.out"
+ins_say "$?" "an early failure does not call a handler that does not exist yet"
+[ "$ins_d_rc" -ne 0 ] && [ "$ins_d_rc" -ne 127 ]
+ins_say "$?" "an early failure exits with a real status, not 127"
+
+# and a failure AFTER publication must undo what was published, including the
+# configuration value it replaced
+insE="$work/insE"; ins_fixture "$insE"
+git -C "$insE" config --local core.hooksPath /nonexistent/prior
+: > "$work/mvn"
+( cd "$insE" && SP_MVN="$work/mvn" SP_MV_FAIL_AT=2 PATH="$work/shim:$PATH" bash "$ins" ) \
+  >"$work/insE.out" 2>&1
+[ "$?" -ne 0 ]; ins_say "$?" "a failure after publication fails the install"
+grep -q "rolled back" "$work/insE.out"; ins_say "$?" "the rollback says so"
+[ ! -e "$insE/.git/hooks/pre-push" ]; ins_say "$?" "the published hook is withdrawn"
+[ "$(git -C "$insE" config --local --get core.hooksPath)" = /nonexistent/prior ]
+ins_say "$?" "the prior core.hooksPath is restored"
+
 printf '\n%d gitfile read(s) found, %d still line-oriented.\n' "$gf_total" "$gf_bad"
 printf '%d checkout-root case(s), %d failure(s).\n' "$itotal" "$ifail"
 printf '%d case(s) judged, %d failure(s); %d normal-form case(s), %d failure(s).\n' \
   "$total" "$failures" "$ntotal" "$nfail"
-[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] && [ "$idx_fail" -eq 0 ] && [ "$inv_fail" -eq 0 ] && [ "$chl_fail" -eq 0 ] && [ "$bp_fail" -eq 0 ] && [ "$kre_fail" -eq 0 ] && [ "$esc_fail" -eq 0 ] && [ "$ord_fail" -eq 0 ] || exit 1
+[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] && [ "$idx_fail" -eq 0 ] && [ "$inv_fail" -eq 0 ] && [ "$chl_fail" -eq 0 ] && [ "$bp_fail" -eq 0 ] && [ "$kre_fail" -eq 0 ] && [ "$esc_fail" -eq 0 ] && [ "$ord_fail" -eq 0 ] && [ "$ins_fail" -eq 0 ] || exit 1
