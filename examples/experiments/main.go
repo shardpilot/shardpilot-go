@@ -2530,6 +2530,25 @@ func decodedForms(text string) ([]string, bool) {
 	if len(text) > decodedFormsFormMax {
 		return []string{text}, false
 	}
+	// ⚠ AND LENGTH IS NOT THE COST. The suffix producers enumerate one candidate per
+	// SEPARATOR POSITION and decode each, so the work is about (separators x length),
+	// not length -- measured, 8192 bytes of `/` costs 251 MiB while 4096 costs nothing
+	// worth printing (shardpilot/shardpilot-go#84 review). A byte bound picked without
+	// measuring the worst case AT the bound is the same mistake as a threshold that
+	// outlived its subject, and it was mine one round ago.
+	//
+	// Preflighted from the cost model rather than materialised and then regretted:
+	// counting the separator bytes is one linear pass and needs no allocation.
+	seps := 0
+	for i := 0; i < len(text); i++ {
+		switch text[i] {
+		case '/', '+', '-', '_', '=', '.', ':':
+			seps++
+		}
+	}
+	if seps*len(text) > decodedFormsWork {
+		return []string{text}, false
+	}
 	seen := map[string]bool{text: true}
 	out := []string{text}
 	spent := 0

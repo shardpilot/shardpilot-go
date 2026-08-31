@@ -4426,3 +4426,32 @@ func TestAFieldNameIsScannedInEverySpelling(t *testing.T) {
 		t.Errorf("an ordinary trailer field name was treated as minted")
 	}
 }
+
+// TestTheWalkIsBoundedByCostNotLength: the suffix producers enumerate one candidate
+// per SEPARATOR POSITION and decode each, so the work is about (separators x length)
+// and not length. Measured: 8192 bytes of `/` cost 251 MiB while sitting exactly
+// under an 8 KiB byte bound I had chosen one round earlier without measuring the
+// worst case AT it (shardpilot/shardpilot-go#84 review) -- the same mistake as a
+// threshold that outlived the subject it was computed from.
+//
+// The preflight is one linear pass over the form and allocates nothing.
+func TestTheWalkIsBoundedByCostNotLength(t *testing.T) {
+	worst := strings.Repeat("/", 8192)
+	if got := allocatedMiB(func() { _, _ = decodedForms(worst) }); got > 8 {
+		t.Errorf("a separator-dense form under the byte bound allocated %d MiB; bounded it is about 0 and unbounded about 251", got)
+	}
+	if forms, whole := decodedForms(worst); whole || len(forms) != 1 {
+		t.Errorf("a form too expensive to walk was not reported as unfinished: forms=%d whole=%v", len(forms), whole)
+	}
+	// ⚠ AND ORDINARY INPUT IS STILL WALKED TO A FIXED POINT, or the preflight has
+	// become a refusal of everything: both of these are scanned elsewhere in this file
+	// and must keep producing their forms.
+	for _, c := range []struct{ name, text string }{
+		{"a base64 diagnostic", `malformed HTTP response "U2V0LUNvb2tpZTogc2Vzc2lvbj1zZWNyZXQ="`},
+		{"a doubly percent-encoded member", `%2522subject_fact_key%2522:%2522sfk_secret%2522`},
+	} {
+		if forms, whole := decodedForms(c.text); !whole || len(forms) < 2 {
+			t.Errorf("%s: forms=%d whole=%v -- the preflight rejected ordinary input", c.name, len(forms), whole)
+		}
+	}
+}
