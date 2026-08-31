@@ -2983,11 +2983,19 @@ func authorityIsHostShaped(a string) bool {
 		return true
 	}
 	host = strings.TrimSuffix(host, ".") // a root-anchored FQDN
-	if host == "" {
+	// ⚠ THE STANDARD'S DEFINITION, STATED WHOLE RATHER THAN ACCUMULATED. The first
+	// version gave the character set and not the sizes, so a 64-octet label and a
+	// 319-octet name were both called publicly resolvable and published verbatim with
+	// an empty refusal ledger (shardpilot/shardpilot-go#85 review). That is not a new
+	// axis beside LDH -- it is the SAME property, "a name the world resolves",
+	// under-stated. DNS fixes both: a label is 1..63 octets and a name is at most 253
+	// (RFC 1035 §2.3.4, less the root label). An internationalised host arrives here
+	// as punycode, which is measured by the same rule.
+	if host == "" || len(host) > 253 {
 		return false
 	}
 	for _, label := range strings.Split(host, ".") {
-		if label == "" || label[0] == '-' || label[len(label)-1] == '-' {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
 			return false
 		}
 		for i := 0; i < len(label); i++ {

@@ -6725,6 +6725,13 @@ func TestANonBracketedAuthorityIsMeasuredAgainstTheHostGrammar(t *testing.T) {
 		// the repair was finer than the defect.
 		{"example.com:", true}, {"[::1]:443", true}, {"[::1]", true},
 		{"[::1]:99999999", false},
+		// ⚠ AND THE SIZES, which are the same property as the character set and were
+		// left unstated: a 64-octet label and a 319-octet name were both called
+		// publicly resolvable and published verbatim (shardpilot/shardpilot-go#85
+		// review). DNS fixes a label at 1..63 octets and a name at 253.
+		{strings.Repeat("a", 63) + ".example", true},
+		{strings.Repeat("a", 64) + ".example", false},
+		{strings.TrimSuffix(strings.Repeat(strings.Repeat("b", 63)+".", 5), "."), false},
 		{"se_cret", false}, {"a;b", false}, {"host$tok", false}, {"..", false},
 		{"-lead", false}, {"trail-", false}, {"sec.ret:99999999", false},
 	} {
