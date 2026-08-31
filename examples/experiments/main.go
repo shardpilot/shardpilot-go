@@ -209,7 +209,14 @@ type exchange struct {
 	// guard then ignored and published it (shardpilot/shardpilot-go#84 review).
 	// A fact about a response stored once per RUN is a fact about the last response.
 	recvConn bool
-	transErr error // set when no response arrived at all
+	// redirectLeg records that this exchange is a REDIRECT FOLLOW-UP rather than
+	// an attempt of the SDK's own. Both are recorded and both are printed, but
+	// they are different facts: retries say the SDK asked again, redirect legs say
+	// the endpoint sent it elsewhere. Counting them together would report "2
+	// attempts" for a single assignment that happened to be redirected once
+	// (shardpilot/shardpilot-go#85 review).
+	redirectLeg bool
+	transErr    error // set when no response arrived at all
 	// reqDumpErr is the SERIALISER's failure, which is not the transport's.
 	// `DumpRequestOut` rejects a request an operator can build -- an API key with
 	// an embedded newline makes an invalid `Authorization` value -- and the error
@@ -284,14 +291,34 @@ func (e *exchange) truncErr() error {
 	return e.captured.err
 }
 
+// recorderDiag is a diagnostic THIS PROGRAM wrote, travelling on the same
+// `error` as the transport's own failures.
+//
+// ⚠ IT IS A TYPE, NOT A SENTINEL, BECAUSE THE QUESTION IS A PROPERTY. The
+// describer below covers the transport's error types and refuses what it does not
+// recognise -- correctly, because an endpoint's message is captured text. But
+// `errOversizedForCapture` is an `*errors.errorString` this program constructed,
+// so it fell through that refusal and `sanitizeCaptured` recorded an unexcused
+// structural refusal: a large but perfectly valid JSON body exited 4 and withheld
+// the report instead of publishing the documented incomplete capture at exit 3
+// (shardpilot/shardpilot-go#85 review).
+//
+// Written as `errors.Is(err, errOversizedForCapture)` this would be the same
+// enumeration one floor down, and the next program-owned diagnostic would
+// reintroduce the defect. The property is "this program wrote every byte of it",
+// and a type states it once for all of them.
+type recorderDiag struct{ msg string }
+
+func (e recorderDiag) Error() string { return e.msg }
+
 // errOversizedForCapture is not the SDK's failure -- it is THIS RECORD's. The
 // SDK may have handled the oversized body perfectly; what is incomplete is the
 // copy, and the run is reported as an incomplete capture rather than as a
 // complete one that happens to be short.
-var errOversizedForCapture = errors.New(
+var errOversizedForCapture error = recorderDiag{
 	"the body reached the read ceiling this record shares with the SDK, so whether " +
 		"more followed is not knowable from here; the capture is reported incomplete " +
-		"rather than guessed, and the SDK's own verdict above is unaffected")
+		"rather than guessed, and the SDK's own verdict above is unaffected"}
 
 func (e *exchange) resp() []byte {
 	if e.head == nil {
@@ -2594,8 +2621,36 @@ func (r *recorder) last() *exchange {
 // claim is checked on every run instead of asserted once in a comment.
 const assignmentRoute = "/api/v1/runtime/experiments/assignment"
 
+// observedConversation reports whether this request belongs to the exchange the
+// harness exists to observe, as opposed to background traffic it must not emit.
+//
+// ⚠ THE SUBJECT IS THE CONVERSATION, NOT THE PATH. Stated as a path suffix, this
+// absorbed the SDK's REDIRECT FOLLOW-UPS: `http.Client` sends a 302's follow-up
+// through this same RoundTripper, `/cb` is not the assignment route, and the
+// synthetic 204 below was returned without the target ever being contacted -- so
+// the SDK acted on a response no server sent and the report paired its verdict
+// with an exchange it did not act on (shardpilot/shardpilot-go#85 review). A
+// recorder that answers on the endpoint's behalf is not observing the experiment,
+// it is conducting a different one.
+//
+// `Request.Response` is net/http's OWN answer to "is this a redirect follow-up" --
+// the field is populated only during a client redirect follow. Asking the client
+// beats reconstructing redirect chains here, for the same reason the pre-push hook
+// reads the push's refspec instead of modelling git's ref resolution.
+//
+// One bit is enough because it can only be set on a response THIS recorder
+// forwarded: the absorbed leg returns 204, and no client follows a 204. So a
+// non-nil Response means the previous leg was a real redirect from a real
+// assignment-conversation request, and its follow-up belongs to that conversation.
+func observedConversation(req *http.Request) bool {
+	if req.URL == nil {
+		return false
+	}
+	return strings.HasSuffix(req.URL.Path, assignmentRoute) || req.Response != nil
+}
+
 func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.URL == nil || !strings.HasSuffix(req.URL.Path, assignmentRoute) {
+	if !observedConversation(req) {
 		r.mu.Lock()
 		r.offRoute++
 		r.mu.Unlock()
@@ -2615,7 +2670,7 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 			ContentLength: 0, Request: req,
 		}, nil
 	}
-	ex := exchange{}
+	ex := exchange{redirectLeg: req.Response != nil}
 	// EVERY QUERY VALUE THE SDK SENDS JOINS THE SCRUB SET, not only the values
 	// this program supplied from the environment.
 	//
@@ -3496,6 +3551,12 @@ func describeTransportError(err error, depth int) (string, bool) {
 		return "", false
 	}
 	switch e := err.(type) {
+	case recorderDiag:
+		// This program's own words, so there is nothing here to withhold. It is
+		// described rather than refused for exactly the reason the refusal below
+		// exists: that one guards against publishing an ENDPOINT's message, and this
+		// error never carried one.
+		return e.msg, true
 	case *url.Error:
 		op, ok := stdErrToken(e.Op)
 		inner, innerOK := describeTransportError(e.Err, depth+1)
@@ -6019,9 +6080,27 @@ func main() {
 		"The ingest leg shares this transport; for this verdict the expected answer is "+
 		"%s, and the count %s it. It is printed rather than assumed.\n\n",
 		offRoute, offRouteExpected, offRouteAgrees)
+	// ⚠ A REDIRECT LEG IS NOT AN ATTEMPT. Every recorded exchange used to be
+	// counted as one, so a single assignment the endpoint redirected once was
+	// reported as two attempts by the SDK -- a claim about the SDK's behaviour made
+	// out of the endpoint's (shardpilot/shardpilot-go#85 review). Both are printed;
+	// only the count is separated, because only the count is a claim.
+	attempts, legs := 0, 0
+	for i := range exchanges {
+		if exchanges[i].redirectLeg {
+			legs++
+		} else {
+			attempts++
+		}
+	}
+	if legs > 0 {
+		fmt.Fprintf(&report, "The endpoint redirected **%d time(s)**; those legs were "+
+			"followed and recorded, not answered here.\n\n", legs)
+	}
 	if len(exchanges) > 1 {
-		fmt.Fprintf(&report, "The SDK made **%d attempts**. All are below; the verdict is the "+
-			"last, because that is the one it acted on.\n\n", len(exchanges))
+		fmt.Fprintf(&report, "The SDK made **%d attempts** over %d exchange(s). All are "+
+			"below; the verdict is the last, because that is the one it acted on.\n\n",
+			attempts, len(exchanges))
 	}
 	// ⚠ REFUSALS ARE ATTRIBUTED TO THE EXCHANGE THAT RAISED THEM. The ledger is
 	// global and the truncation suppression asked only about the LAST attempt, so a
@@ -6034,7 +6113,7 @@ func main() {
 
 	last := rec.last()
 	fmt.Fprintf(&report, "## SDK verdict\n\n")
-	fmt.Fprintf(&report, "    attempts: %d\n", len(exchanges))
+	fmt.Fprintf(&report, "    attempts: %d\n", attempts)
 	fmt.Fprintf(&report, "    status:   %d\n", last.status)
 	fmt.Fprintf(&report, "    assigned: %t\n", result.Assigned)
 	fmt.Fprintf(&report, "    protocol: %q\n", last.proto)

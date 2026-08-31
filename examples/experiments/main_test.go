@@ -6837,3 +6837,220 @@ func TestANonCanonicalCodingKeepsItsMeaning(t *testing.T) {
 		t.Errorf("the supplied canonical spelling was published: %q", stripMarks(scrubSupplied(raw)))
 	}
 }
+
+// ---- round on 50d9a50 ----
+
+// TestARedirectFollowUpIsForwardedNotAbsorbed is the P1 of this round. The
+// recorder classified by PATH, so the follow-up `http.Client` sends after a 302
+// -- which is not the assignment route -- was answered with the synthetic 204
+// meant for the SDK's background ingest leg. The target was never contacted, the
+// SDK acted on a response no server sent, and the report paired its verdict with
+// an exchange it had not acted on.
+//
+// The scene fails on the old code with "the redirect target was never
+// contacted": `sent` stays false and `offRoute` reaches 1.
+func TestARedirectFollowUpIsForwardedNotAbsorbed(t *testing.T) {
+	sent := false
+	r := &recorder{inner: rtFunc(func(req *http.Request) (*http.Response, error) {
+		sent = true
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader("{}")),
+			Header: http.Header{}, Proto: "HTTP/1.1", Request: req}, nil
+	})}
+	req, _ := http.NewRequest("GET", "https://e.example/cb", nil)
+	// What net/http itself sets on a redirect follow-up, and the only thing that
+	// distinguishes one from background ingest traffic at this layer.
+	req.Response = &http.Response{StatusCode: 302}
+	resp, err := r.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("the redirect follow-up errored: %v", err)
+	}
+	if !sent {
+		t.Fatal("the redirect target was never contacted — the recorder answered for it")
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("the SDK was handed an invented response: %d", resp.StatusCode)
+	}
+	if r.offRoute != 0 {
+		t.Fatalf("a redirect leg was counted as off-route traffic: %d", r.offRoute)
+	}
+	if len(r.exchanges) != 1 || !r.exchanges[0].redirectLeg {
+		t.Fatalf("the redirect leg was not recorded as one: %+v", r.exchanges)
+	}
+}
+
+// TestBackgroundIngestIsStillAbsorbed is the other edge of the same predicate,
+// written in the same movement. Widening "what may pass through" is exactly how a
+// guard stops guarding, and the side effect this harness must not have -- an
+// automatic exposure delivered from a run whose only purpose is to observe -- is
+// held out by nothing else.
+func TestBackgroundIngestIsStillAbsorbed(t *testing.T) {
+	sent := false
+	r := &recorder{inner: rtFunc(func(*http.Request) (*http.Response, error) {
+		sent = true
+		return &http.Response{StatusCode: 204, Body: io.NopCloser(strings.NewReader("")),
+			Header: http.Header{}, Proto: "HTTP/1.1"}, nil
+	})}
+	req, _ := http.NewRequest("POST", "https://e.example/api/v1/ingest", strings.NewReader("{}"))
+	if _, err := r.RoundTrip(req); err != nil {
+		t.Fatalf("ingest request errored instead of being absorbed: %v", err)
+	}
+	if sent {
+		t.Fatal("ingest traffic was FORWARDED — the harness emitted analytics")
+	}
+	if r.offRoute != 1 {
+		t.Fatalf("absorbed ingest traffic was not counted: %d", r.offRoute)
+	}
+}
+
+// TestTheCeilingSentinelIsDescribedNotRefused: `errOversizedForCapture` is this
+// program's own text, but it reached the generic describer as an
+// `*errors.errorString` with no matching case, so `sanitizeCaptured` recorded an
+// unexcused structural refusal and a large-but-valid body exited 4 instead of
+// producing the documented incomplete capture at exit 3.
+//
+// The scene fails on the old code with a non-empty refusal ledger.
+func TestTheCeilingSentinelIsDescribedNotRefused(t *testing.T) {
+	structuralSurfaces = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	got := stripMarks(sanitizeCaptured(errOversizedForCapture))
+	if len(refusalLedger()) != 0 {
+		t.Fatalf("the recorder's own diagnostic was refused as an endpoint error: %q", refusalLedger())
+	}
+	if !strings.Contains(got, "read ceiling") {
+		t.Fatalf("the sentinel was withheld rather than described: %q", got)
+	}
+}
+
+// TestAnUnknownErrorTypeIsStillRefused is this predicate's other edge. The case
+// added above is a hole in a refusal that exists to keep an ENDPOINT's message
+// out of the report, and a type switch that answers "described" too readily is
+// how that refusal stops firing.
+func TestAnUnknownErrorTypeIsStillRefused(t *testing.T) {
+	structuralSurfaces = nil
+	t.Cleanup(func() { structuralSurfaces = nil })
+	got := stripMarks(sanitizeCaptured(errors.New("server-secret-token")))
+	if len(refusalLedger()) == 0 {
+		t.Fatal("an undescribable transport error left the capture publishable")
+	}
+	if strings.Contains(got, "server-secret-token") {
+		t.Fatalf("an endpoint message was published: %q", got)
+	}
+}
+
+// TestARegisteredMediaTypeCollisionStaysPublishable is the finding this round's
+// structural change answers. `registryOnlyValue` walked the DIRECTIVE registries
+// only, so `Content-Type` -- a registry field in the other three classifiers --
+// could not satisfy it: an ordinary `application/json` against a supplied `json`
+// fell past the vouch, took a structural refusal, and exited 4, while
+// `markMediaType` vouched the same bytes one pass later and the stale refusal was
+// never withdrawn.
+//
+// The scene fails on the old code with a non-empty refusal ledger.
+func TestARegisteredMediaTypeCollisionStaysPublishable(t *testing.T) {
+	t.Cleanup(func() { suppliedValues, structuralSurfaces, accountedSurfaces = nil, nil, nil })
+	suppliedValues, structuralSurfaces, accountedSurfaces = []string{"json"}, nil, nil
+	got := dropFraming("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{}")
+	if len(refusalLedger()) != 0 {
+		t.Fatalf("an ordinary media type colliding with a supplied value was refused: %q", refusalLedger())
+	}
+	if !strings.Contains(stripMarks(scrubSupplied(got)), "Content-Type: application/json") {
+		t.Fatalf("a registered media type was not published as itself: %q", stripMarks(scrubSupplied(got)))
+	}
+}
+
+// TestAShapeCollisionStillRefuses is the other edge, and the reason the fix is a
+// per-field ROW rather than "registryOnlyValue also asks about media types".
+// Integer syntax constrains the alphabet and says nothing about who chose the
+// number, so a supplied identifier colliding with `Age` must NOT be waved through
+// by the same widening -- `redacted-6-chars` is not an integer, and no placeholder
+// is a legal argument here.
+func TestAShapeCollisionStillRefuses(t *testing.T) {
+	t.Cleanup(func() { suppliedValues, structuralSurfaces, accountedSurfaces = nil, nil, nil })
+	suppliedValues, structuralSurfaces, accountedSurfaces = []string{"123456"}, nil, nil
+	dropFraming("HTTP/1.1 200 OK\r\nAge: 123456\r\n\r\n{}")
+	if len(refusalLedger()) == 0 {
+		t.Fatal("a supplied identifier colliding with a shape-admitted field was published")
+	}
+}
+
+// TestEveryRegistryFieldCanAnswerBothRegistryQuestions is the property the four
+// hand-written classifiers could not hold. A field admitted BECAUSE A REGISTRY
+// NAMES IT must also be able to say which of its values are registry words end to
+// end -- that pair is what makes a collision answerable. `content-type` satisfied
+// the first and not the second for four rounds, and no scene could see it because
+// the two answers lived in different functions.
+//
+// This is the invariant, not an instance: a field added later cannot land in
+// three of the four answers, because there is now one row and this reads it.
+func TestEveryRegistryFieldCanAnswerBothRegistryQuestions(t *testing.T) {
+	for name, adm := range verbatimHeaders {
+		if adm.vocabulary && adm.registryOnly == nil {
+			t.Errorf("%q is admitted by a registry but has no registry-only rule, "+
+				"so a collision on it can only be refused", name)
+		}
+		if !adm.vocabulary && adm.registryOnly != nil {
+			t.Errorf("%q is admitted by a SHAPE but claims registry-only values, "+
+				"so an endpoint-chosen value could be vouched", name)
+		}
+		if !adm.vocabulary && adm.folds {
+			t.Errorf("%q has no registry, so it has no canonical spelling to fold to", name)
+		}
+	}
+}
+
+// TestAJSONStringIsMeasuredAsItArrived is the finding at the body traversal.
+// `responseText` runs `escapeMarks` over the whole response before redaction, and
+// that escape LENGTHENS a backslash run standing before the literal `x00`/`x01`.
+// The traversal then decoded and measured the expanded spelling, so the wire's
+// four characters were published as `redacted-6-chars` -- while a header carrying
+// the same value reported four, because every measured site outside this
+// traversal unescapes first.
+//
+// Both halves are asserted: the member NAME and the member VALUE, because the
+// finding names both and one site was fixed once before while its neighbour was
+// not.
+//
+// The scene fails on the old code with `redacted-6-chars`.
+func TestAJSONStringIsMeasuredAsItArrived(t *testing.T) {
+	t.Cleanup(func() { suppliedValues, structuralSurfaces, accountedSurfaces = nil, nil, nil })
+	suppliedValues, structuralSurfaces, accountedSurfaces = nil, nil, nil
+	raw := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" + `{"message":"\\x00"}`
+	got := stripMarks(dropFraming(escapeMarks(raw)))
+	if strings.Contains(got, "redacted-6-chars") {
+		t.Fatalf("the value was measured after the recorder expanded it: %q", got)
+	}
+	if !strings.Contains(got, "redacted-4-chars") {
+		t.Fatalf("the four characters the endpoint sent were not measured as four: %q", got)
+	}
+
+	// The same value in the member NAME position, which the finding names as the
+	// second site.
+	structuralSurfaces, accountedSurfaces = nil, nil
+	rawKey := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" + `{"\\x00":"v"}`
+	gotKey := stripMarks(dropFraming(escapeMarks(rawKey)))
+	if strings.Contains(gotKey, "redacted-6-chars") {
+		t.Fatalf("the member name was measured after the recorder expanded it: %q", gotKey)
+	}
+	if !strings.Contains(gotKey, "redacted-4-chars") {
+		t.Fatalf("the member name was not measured as it arrived: %q", gotKey)
+	}
+}
+
+// TestAnOrdinaryJSONValueIsStillMeasuredWhole is the other edge: undoing the
+// escape must not shorten a value that never carried the escape's trigger. A
+// backslash run before anything else, and a plain value, are measured as
+// themselves.
+func TestAnOrdinaryJSONValueIsStillMeasuredWhole(t *testing.T) {
+	t.Cleanup(func() { suppliedValues, structuralSurfaces, accountedSurfaces = nil, nil, nil })
+	suppliedValues, structuralSurfaces, accountedSurfaces = nil, nil, nil
+	raw := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" + `{"m":"abcde"}`
+	if got := stripMarks(dropFraming(escapeMarks(raw))); !strings.Contains(got, "redacted-5-chars") {
+		t.Fatalf("a plain five-character value was not measured as five: %q", got)
+	}
+	structuralSurfaces, accountedSurfaces = nil, nil
+	// `\\` decodes to one backslash and is not followed by the escape's trigger.
+	raw2 := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" + `{"m":"\\y00"}`
+	if got := stripMarks(dropFraming(escapeMarks(raw2))); !strings.Contains(got, "redacted-4-chars") {
+		t.Fatalf("a backslash run not before the escape's trigger was mismeasured: %q", got)
+	}
+}

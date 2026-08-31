@@ -22,10 +22,10 @@ func TestEveryAdmissionPredicateCanRefuse(t *testing.T) {
 	// Strings no field's fixed vocabulary admits: an endpoint-chosen token, a
 	// token with punctuation, and one with a space.
 	refusable := []string{"server-secret-token", "x_secret!value", "two words"}
-	for name, check := range verbatimHeaders {
+	for name, adm := range verbatimHeaders {
 		t.Run(name, func(t *testing.T) {
 			for _, v := range refusable {
-				if check(v) {
+				if adm.ok(v) {
 					t.Fatalf("the predicate for %q admits %q, so it is not a criterion", name, v)
 				}
 			}
@@ -49,7 +49,7 @@ func TestEveryAdmissionPredicateCanRefuse(t *testing.T) {
 		{"age", "12"},
 		{"content-length", "0"},
 	} {
-		if check, known := verbatimHeaders[ok.name]; !known || !check(ok.value) {
+		if adm, known := verbatimHeaders[ok.name]; !known || !adm.ok(ok.value) {
 			t.Fatalf("the predicate for %q no longer admits %q", ok.name, ok.value)
 		}
 	}

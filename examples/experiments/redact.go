@@ -681,20 +681,23 @@ func redactTarget(line string) string {
 						url = url[:lo] + tokenPlaceholder(a) + url[hi:]
 						line = head + ":" + gap + url
 					}
-				} else if scrubSuppliedRaw(a) != a {
+				} else if lo, hi, ok := hostPortRange(strings.TrimSuffix(url, "\r")); ok &&
+					scrubSuppliedRaw(url[lo:hi]) != url[lo:hi] {
 					// ⚠ REPLACED AND THEN CARRIED ON. Returning here skipped the path,
 					// query, fragment and userinfo redactors, so
 					// `https://e.example/cb?state=<token>` kept an endpoint token the
 					// guard cannot see (shardpilot/shardpilot-go#85 review). Fixing the
 					// authority is not finishing the target: this branch answered one
 					// question and left the pipeline that answers the rest.
+					//
+					// ⚠ AND THE HOST/PORT, NOT THE WHOLE AUTHORITY -- see hostPortRange.
+					// Userinfo colliding is answered by `redactUserinfo` further down the
+					// same pipeline, which keeps the host this exemption exists to keep.
 					noteAccounted(formField, "a redirect authority colliding with a supplied value")
 					// `url` carries its own terminator, so rebuilding the line from it
 					// keeps the CR without a separate branch.
-					if lo, hi, ok := authorityRange(strings.TrimSuffix(url, "\r")); ok {
-						url = url[:lo] + tokenPlaceholder(a) + url[hi:]
-						line = head + ":" + gap + url
-					}
+					url = url[:lo] + tokenPlaceholder(url[lo:hi]) + url[hi:]
+					line = head + ":" + gap + url
 				}
 			}
 		}
@@ -1664,7 +1667,8 @@ func redactUnaccountedJSONValues(body string, exempt map[string]bool, statusLine
 				k, end := kq, ke
 				if k >= 0 && !anyMarked(inMark, k, end) {
 					noteAccounted(formBody, "an endpoint-chosen member name in a parsed response body")
-					spans = append(spans, span{back[k], back[end-1] + 1, `"` + tokenPlaceholder(name) + `"`, "", name, 0})
+					spans = append(spans, span{back[k], back[end-1] + 1,
+						`"` + tokenPlaceholder(asArrived(view[k:end], name)) + `"`, "", name, 0})
 				}
 			}
 			continue
@@ -1744,7 +1748,8 @@ func redactUnaccountedJSONValues(body string, exempt map[string]bool, statusLine
 			spans = append(spans, span{back[k], back[end-1] + 1, `"` + marked(str) + `"`, verdictField, str, verdictOrd})
 		} else {
 			noteAccounted(formBody, "an endpoint-chosen value in a parsed response body")
-			spans = append(spans, span{back[k], back[end-1] + 1, `"` + tokenPlaceholder(str) + `"`, "", str, verdictOrd})
+			spans = append(spans, span{back[k], back[end-1] + 1,
+				`"` + tokenPlaceholder(asArrived(view[k:end], str)) + `"`, "", str, verdictOrd})
 		}
 		verdictField = ""
 	}
@@ -2120,20 +2125,92 @@ func queryDecoded(s string) string {
 // length is enough to show the shape of the exchange, and refusing every capture
 // carrying a `Server:` banner would make the harness useless. Refusal is
 // reserved for the surfaces above, where a value's EXTENT cannot be determined.
-var verbatimHeaders = map[string]func(string) bool{
-	"date":              isHTTPDate,
-	"expires":           isHTTPDate,
-	"last-modified":     isHTTPDate,
-	"content-length":    isDigits,
-	"age":               isDigits,
-	"content-type":      isMediaTypeWithoutParameters,
-	"content-encoding":  isDirectiveList("content-encoding"),
-	"transfer-encoding": isDirectiveList("transfer-encoding"),
-	"connection":        isDirectiveList("connection"),
-	"vary":              isDirectiveList("vary"),
-	"accept-ranges":     isDirectiveList("accept-ranges"),
-	"allow":             isDirectiveList("allow"),
-	"cache-control":     isDirectiveList("cache-control"),
+//
+// The criterion above is the SECTION's; the rows that apply it are below.
+
+// admission is everything this program knows about one response field's value,
+// in one row.
+//
+// ⚠ FOUR ANSWERS TO ONE QUESTION, AND ANY TWO COULD DISAGREE. "Is this field's
+// value the specification's word or the endpoint's?" was answered in four places
+// by hand -- this map, `admittedByRegistry`'s switch, `canonicalAdmitted`'s
+// switch, and `registryOnlyValue` walking the DIRECTIVE registries. Three of them
+// named `content-type`; the fourth could not, because media types are not
+// directives. So an ordinary `Content-Type: application/json` against a supplied
+// `json` took a structural refusal and exited 4 -- while `markMediaType` vouched
+// that very value one pass later and the refusal was never withdrawn
+// (shardpilot/shardpilot-go#85 review).
+//
+// Adding media types to that fourth answer is the same enumeration one floor
+// down, which is the failure this file has now paid for four times. These are
+// facts about a FIELD, so they are stated per field, once: a row cannot disagree
+// with itself, and a field added later cannot be added to three lists out of
+// four.
+type admission struct {
+	// ok admits a value as well-formed for this field.
+	ok func(string) bool
+	// vocabulary says `ok` is a REGISTRY -- the specification fixed the word --
+	// rather than a SHAPE, which constrains the alphabet and says nothing about who
+	// chose the content. Only a registry value has a canonical spelling this
+	// program can write in place of the endpoint's bytes.
+	vocabulary bool
+	// registryOnly admits a value EVERY part of which is a registry word: no free
+	// number, no endpoint text. Such a value is the grammar's own spelling whoever
+	// else also chose that string, so colliding with a supplied value does not make
+	// it the endpoint's. It is a SEPARATE rule from `ok`, not a synonym:
+	// `Cache-Control: max-age=123456` is admitted and its argument is free, which
+	// is why the walk behind it forbids arguments where `ok`'s allows them.
+	registryOnly func(string) bool
+	// folds says the registry is case-INSENSITIVE, so lowering a value yields the
+	// registry's own spelling. HTTP method names are case-sensitive, so `allow`
+	// does not fold -- and that fact is read from `directiveFolds` rather than
+	// re-typed here, for the reason this whole type exists.
+	folds bool
+}
+
+// directiveAdmission builds the row for a field whose value is a comma list of
+// registered directives.
+//
+// ⚠ AND THE ARGUMENT RULE IS THE FIELD'S, NOT THE REGISTRY'S. Every registered
+// field was once given `numericArg`, so `Allow: GET=123456`, `Content-Encoding:
+// gzip=123456` and `Vary: accept=123456` all passed and the whole value was vouched
+// -- publishing endpoint-selected numeric text, which both the scrub and the guard
+// then skip if it is a supplied identifier (shardpilot/shardpilot-go#85 review).
+// Those three grammars have no arguments at all; `Cache-Control` is the one here
+// that does (`max-age=60`), so it is the one that gets them, in `directiveArgs`.
+func directiveAdmission(field string) admission {
+	return admission{
+		ok:           func(v string) bool { return walkDirectives(field, v, true) },
+		vocabulary:   true,
+		registryOnly: func(v string) bool { return walkDirectives(field, v, false) },
+		folds:        directiveFolds(field),
+	}
+}
+
+var verbatimHeaders = map[string]admission{
+	// Shapes: the alphabet is fixed and the content is the endpoint's, so there is
+	// no registry spelling to fall back on and a collision cannot be waved through.
+	"date":           {ok: isHTTPDate},
+	"expires":        {ok: isHTTPDate},
+	"last-modified":  {ok: isHTTPDate},
+	"content-length": {ok: isDigits},
+	"age":            {ok: isDigits},
+	// A registered media type carries no free part -- `isMediaTypeWithoutParameters`
+	// rejects parameters -- so the rule that admits it is also the rule that says
+	// every part of it is the registry's.
+	"content-type": {
+		ok:           isMediaTypeWithoutParameters,
+		vocabulary:   true,
+		registryOnly: isMediaTypeWithoutParameters,
+		folds:        true,
+	},
+	"content-encoding":  directiveAdmission("content-encoding"),
+	"transfer-encoding": directiveAdmission("transfer-encoding"),
+	"connection":        directiveAdmission("connection"),
+	"vary":              directiveAdmission("vary"),
+	"accept-ranges":     directiveAdmission("accept-ranges"),
+	"allow":             directiveAdmission("allow"),
+	"cache-control":     directiveAdmission("cache-control"),
 }
 
 // ows trims exactly what HTTP calls optional whitespace: space and tab.
@@ -2309,26 +2386,14 @@ func walkDirectives(field, v string, allowArgs bool) bool {
 	return true
 }
 
-// isDirectiveList builds the predicate for a field whose value is a comma list.
-//
-// ⚠ AND THE ARGUMENT RULE IS THE FIELD'S, NOT THE REGISTRY'S. Every registered
-// field was given `numericArg`, so `Allow: GET=123456`, `Content-Encoding:
-// gzip=123456` and `Vary: accept=123456` all passed and the whole value was vouched
-// -- publishing endpoint-selected numeric text, which both the scrub and the guard
-// then skip if it is a supplied identifier (shardpilot/shardpilot-go#85 review).
-// Those three grammars have no arguments at all; `Cache-Control` is the one here
-// that does (`max-age=60`), so it is the one that gets them.
-func isDirectiveList(field string) func(string) bool {
-	return func(v string) bool { return walkDirectives(field, v, true) }
-}
-
 // registryOnlyValue reports whether every token in an admitted value is a member
 // of that field's REGISTRY -- nothing in it is a free number or endpoint text.
 // Such a value is the grammar's own spelling whoever else also chose that string,
 // exactly as a registered media type is, so a collision with a supplied value does
 // not make it the endpoint's.
 func registryOnlyValue(name, v string) bool {
-	return walkDirectives(strings.ToLower(ows(name)), v, false)
+	a := verbatimHeaders[strings.ToLower(ows(name))]
+	return a.registryOnly != nil && a.registryOnly(v)
 }
 
 func isTokenOnly(v string) bool {
@@ -2674,6 +2739,38 @@ func unescapeMarks(s string) string {
 	return b.String()
 }
 
+// asArrived returns a JSON string literal's value as it arrived ON THE WIRE,
+// undoing the recorder's own mark escape first.
+//
+// ⚠ THE BODY IS MEASURED AFTER `escapeMarks` HAS EXPANDED IT. `responseText`
+// escapes the whole response before any redaction, and that escape LENGTHENS a
+// backslash run standing before the literal text `x00`/`x01` -- so the traversal
+// decoded `{"message":"\\x00"}` to a six-character value and published
+// `redacted-6-chars` for the four characters the endpoint actually sent. Every
+// other measured site -- the header value, the status phrase, the cookie name and
+// value -- calls `unescapeMarks` first, so the same value was reported at two
+// different lengths depending on where it appeared
+// (shardpilot/shardpilot-go#85 review).
+//
+// ⚠ AND THE ESCAPE IS UNDONE ON THE SOURCE, NOT ON THE DECODED VALUE. JSON
+// decoding has already halved the run by the time the value exists, and the
+// parity `unescapeMarks` reads is a property of the SOURCE: on the decoded text
+// it reads an even run as odd and reconstructs a marker byte that was never
+// there. The expanded spelling is still what the span offsets and the emitted
+// text are built from; only the LENGTH is a claim about the wire.
+//
+// A literal that does not decode after unescaping is measured as it was decoded.
+// The escaped document parsed, and unescaping only shortens backslash runs, so
+// this is unreachable for anything the traversal reaches -- it is here because a
+// silent wrong number is worse than a conservative one.
+func asArrived(literal, decoded string) string {
+	var s string
+	if err := json.Unmarshal([]byte(unescapeMarks(literal)), &s); err != nil {
+		return decoded
+	}
+	return s
+}
+
 // canonicalAdmitted is the spelling a field's own vocabulary uses. When the value
 // that arrived differs from it, the difference is the endpoint's choice and is not
 // vouched for — the value still prints, because the criterion admitted it, but the
@@ -2684,12 +2781,7 @@ func unescapeMarks(s string) string {
 // this program can write, and an open grammar has only the endpoint's bytes
 // (shardpilot/shardpilot-go#85 review).
 func admittedByRegistry(name string) bool {
-	switch strings.ToLower(ows(name)) {
-	case "content-type", "content-encoding", "transfer-encoding", "connection",
-		"vary", "accept-ranges", "allow", "cache-control":
-		return true
-	}
-	return false
+	return verbatimHeaders[strings.ToLower(ows(name))].vocabulary
 }
 
 // canonicalAdmitted returns the spelling the field's REGISTRY uses for a value the
@@ -2702,9 +2794,7 @@ func admittedByRegistry(name string) bool {
 // (shardpilot/shardpilot-go#85 review). Folding is a property of each registry,
 // not a convenience shared by the list.
 func canonicalAdmitted(name, v string) string {
-	switch strings.ToLower(ows(name)) {
-	case "content-type", "content-encoding", "transfer-encoding", "connection",
-		"vary", "accept-ranges", "cache-control":
+	if verbatimHeaders[strings.ToLower(ows(name))].folds {
 		return strings.ToLower(v)
 	}
 	return v
@@ -2752,8 +2842,8 @@ func redactUnlessVerbatim(line string) string {
 	if !ok || !isTokenOnly(ows(name)) {
 		return line
 	}
-	check, known := verbatimHeaders[strings.ToLower(ows(name))]
-	if known && check(ows(value)) {
+	adm, known := verbatimHeaders[strings.ToLower(ows(name))]
+	if known && adm.ok(ows(value)) {
 		// ⚠ ADMITTED IS VOUCHED FOR. Returning the line unmarked left the value to
 		// `scrubSupplied`, so an experiment key equal to an admitted value --
 		// `application/json`, or a `Content-Length` of `12` -- came back as a prose
@@ -2969,10 +3059,40 @@ func portIsDialable(port string) bool {
 // ⚠ USERINFO IS NOT THE HOST, and it has its own redaction one pass along. Asking
 // the whole authority failed `user:pass@host.example` on the `@` and replaced the
 // HOST with it, destroying the target; two scenes said so on the first run.
-func authorityIsHostShaped(a string) bool {
+// afterUserinfo returns the offset in an authority at which the host begins.
+//
+// The LAST `@` separates userinfo from the host, which is what Go's parser does
+// and what `redactUserinfo` already follows -- `//user@server-secret@host/cb`
+// is userinfo `user@server-secret` and host `host`. Stated once here because
+// three places ask it, and two of them disagreeing is what produced the finding
+// below.
+func afterUserinfo(a string) int {
 	if i := strings.LastIndexByte(a, '@'); i >= 0 {
-		a = a[i+1:]
+		return i + 1
 	}
+	return 0
+}
+
+// hostPortRange narrows an authority's byte range to the host and port.
+//
+// ⚠ THE EXEMPTION IS THE HOST'S, SO THE COLLISION TEST IS THE HOST'S. Asked of
+// the whole authority, a supplied value matching only the USERINFO replaced the
+// host along with it: with `user` supplied, `Location: https://user@example.com/cb`
+// became `https://redacted-16-chars/redacted-2-chars`, losing the deliberately
+// exempt `example.com` AND the fact that userinfo was present at all
+// (shardpilot/shardpilot-go#85 review). Userinfo has its own redactor, which
+// produces a placeholder while keeping the host; this range is what the
+// authority-level rules may speak about.
+func hostPortRange(url string) (int, int, bool) {
+	lo, hi, ok := authorityRange(url)
+	if !ok {
+		return 0, 0, false
+	}
+	return lo + afterUserinfo(url[lo:hi]), hi, true
+}
+
+func authorityIsHostShaped(a string) bool {
+	a = a[afterUserinfo(a):]
 	host, port, hasPort := splitAuthority(a)
 	if hasPort && !portIsDialable(port) {
 		return false
