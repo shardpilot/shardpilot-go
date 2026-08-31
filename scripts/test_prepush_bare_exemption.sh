@@ -265,7 +265,134 @@ if [ "$gf_total" -eq 0 ]; then
   exit 2
 fi
 
+# ---- a checkout at the filesystem root ---------------------------------------
+#
+# `inside_a_checkout` decides which PATH entries are checkout-controlled, and it
+# runs BEFORE the PATH filter -- so what it misses is executed, not merely allowed.
+# With the invoking checkout at `/`, the prefix `"$checkout_root"/` is `//` and
+# matched no absolute path at all (shardpilot/shardpilot-go#79 review).
+istart="$(grep -n '# >>> INSIDE-A-CHECKOUT' "$hook" | head -1 | cut -d: -f1)"
+iend="$(grep -n '# <<< INSIDE-A-CHECKOUT' "$hook" | head -1 | cut -d: -f1)"
+if [ -z "$istart" ] || [ -z "$iend" ] || [ "$iend" -le "$istart" ]; then
+  echo "REFUSING: the INSIDE-A-CHECKOUT markers are missing or out of order." >&2
+  exit 2
+fi
+inside="$work/inside.sh"
+{
+  echo '#!/usr/bin/env bash'
+  echo 'checkout_root="$1"'
+  echo 'shift'
+  echo 'other_roots=()'
+  echo 'for r in ${OTHER_ROOTS:-}; do other_roots+=("$r"); done'
+  sed -n "$((istart + 1)),$((iend - 1))p" "$hook"
+  echo 'if inside_a_checkout "$1"; then echo inside; else echo outside; fi'
+} > "$inside"
+chmod +x "$inside"
+bash -n "$inside" 2>/dev/null || { echo "REFUSING: the lifted inside_a_checkout does not parse." >&2; exit 2; }
+
+ifail=0
+itotal=0
+printf '\n%-14s %-22s %s\n' 'CHECKOUT ROOT' 'CANDIDATE' VERDICT
+while IFS='|' read -r root cand want; do
+  [ -n "$root" ] || continue
+  itotal=$((itotal + 1))
+  got="$("$inside" "$root" "$cand")"
+  v=ok
+  if [ "$got" != "$want" ]; then v="FAIL: wanted $want, got $got"; ifail=$((ifail + 1)); fi
+  printf '%-14s %-22s %s\n' "$root" "$cand" "$v"
+done <<'ROOTS'
+/|/workspace/bin|inside
+/|/|inside
+/r|/r/bin|inside
+/r|/other/bin|outside
+/r|/r|inside
+/r|/rr/bin|outside
+ROOTS
+# The same question for a LINKED worktree root, which has the identical shape and
+# which the review did not name.
+if [ "$(OTHER_ROOTS=/ "$inside" /r /workspace/bin)" != inside ]; then
+  echo "FAIL: an other_roots entry at / did not match an absolute path either" >&2
+  ifail=$((ifail + 1))
+fi
+itotal=$((itotal + 1))
+if [ "$itotal" -eq 0 ]; then
+  echo "REFUSING: no checkout-root case was judged." >&2
+  exit 2
+fi
+
+# ---- nothing from the pushed branch runs ------------------------------------
+#
+# The hook redirects `core.hooksPath`, which covers repository HOOKS and nothing
+# else. `core.fsmonitor` is documented as a hook command and `git diff --quiet HEAD
+# --` invokes it, so a tracked program ran before the trusted scanner
+# (shardpilot/shardpilot-go#79 review). Measured on the same command with
+# `core.fsmonitor` already neutralised, a `diff.<name>.textconv` and a
+# `filter.<name>.clean` fired too -- the review named one of three.
+#
+# ⚠ DRIVEN THROUGH A REAL `git push`, not by calling the hook. The question is what
+# GIT does when it runs this file, and a rig that invokes the hook directly answers
+# a different one. The positive control below is the point of the section: it runs
+# the hook AS COMMITTED AT ITS PARENT and requires the programs to fire, because a
+# section where the attack never lands would pass whatever the hook did.
+run_push_probe() { # run_push_probe <hook file> ; echoes what executed
+  rm -f "$fired"
+  cp "$1" "$probe_repo/.git/hooks/pre-push"
+  chmod +x "$probe_repo/.git/hooks/pre-push"
+  ( cd "$probe_repo" && git push -q origin HEAD:refs/heads/probe >/dev/null 2>&1 ) || true
+  ( cd "$probe_repo" && git -C "$probe_remote" update-ref -d refs/heads/probe >/dev/null 2>&1 ) || true
+  sort -u "$fired" 2>/dev/null | tr '\n' ' '
+}
+
+probe_remote="$work/remote.git"
+probe_repo="$work/repo"
+fired="$work/fired.txt"
+git init -q --bare "$probe_remote"
+git init -q "$probe_repo"
+for prog in prog clean; do
+  printf '#!/bin/sh\necho "%s" >> "%s"\ncat\n' "$prog" "$fired" > "$probe_repo/$prog"
+  chmod +x "$probe_repo/$prog"
+done
+printf '#!/bin/sh\necho fsmonitor >> "%s"\nprintf "/\\0"\n' "$fired" > "$probe_repo/fsmon"
+chmod +x "$probe_repo/fsmon"
+printf '* diff=dx filter=fx\n' > "$probe_repo/.gitattributes"
+printf 'x\n' > "$probe_repo/f"
+mkdir -p "$probe_repo/.git/hooks"
+printf '#!/bin/sh\nexit 0\n' > "$probe_repo/.git/hooks/check_public_surface.sh"
+chmod +x "$probe_repo/.git/hooks/check_public_surface.sh"
+( cd "$probe_repo"
+  git add -A >/dev/null 2>&1
+  git -c user.email=t@t -c user.name=t commit -q -m x >/dev/null 2>&1
+  git remote add origin "$probe_remote" >/dev/null 2>&1
+  git config core.fsmonitor ./fsmon
+  git config diff.dx.textconv ./prog
+  git config filter.fx.clean ./clean ) || true
+
+exec_fail=0
+# The positive control: the hook as committed at this branch's parent must let the
+# programs run. If it does not, this section is measuring nothing.
+parent_hook="$work/parent-pre-push"
+if git show "HEAD~1:.githooks/pre-push" > "$parent_hook" 2>/dev/null; then
+  before="$(run_push_probe "$parent_hook")"
+  case "$before" in
+    *fsmonitor*) printf '\npositive control: the parent hook let [%s] run, as expected.\n' "$before" ;;
+    *) echo "REFUSING: the attack did not land on the parent hook ([$before]), so this" >&2
+       echo "  section cannot tell a fix from a rig that never reproduced the defect." >&2
+       exit 2 ;;
+  esac
+else
+  echo "note: no parent revision available; the positive control was skipped." >&2
+fi
+
+after="$(run_push_probe "$hook")"
+if [ -n "$after" ]; then
+  echo "FAIL: the pushed branch's own programs ran under this hook: [$after]" >&2
+  exec_fail=1
+else
+  printf 'this hook: nothing from the pushed branch ran.\n'
+fi
+
 printf '\n%d gitfile read(s) found, %d still line-oriented.\n' "$gf_total" "$gf_bad"
+printf '%d checkout-root case(s), %d failure(s).\n' "$itotal" "$ifail"
 printf '%d case(s) judged, %d failure(s); %d normal-form case(s), %d failure(s).\n' \
   "$total" "$failures" "$ntotal" "$nfail"
-[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] || exit 1
+[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] || exit 1

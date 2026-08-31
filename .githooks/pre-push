@@ -775,24 +775,44 @@ if [ -n "$wt_common" ]; then
   fi
 fi
 
+# >>> INSIDE-A-CHECKOUT. scripts/test_prepush_bare_exemption.sh lifts the lines
+# between these markers. Moving or renaming the markers makes that test refuse.
 inside_a_checkout() {
   # $1 is a physically-resolved directory. True when it lies in the invoking
   # checkout or in any other checkout this pass could name.
+  #
+  # ⚠ THE ROOT IS A CHECKOUT TOO, AND `"$root"/` IS `//` THERE. With the invoking
+  # checkout at `/`, this prefix became `//` and matched no absolute path at all --
+  # so a tracked `/workspace/bin` on PATH was not seen as checkout-controlled and
+  # was left there for the first `mktemp` or `git`. The later enumeration does
+  # normalise `/` and refuses, but only AFTER that program has run
+  # (shardpilot/shardpilot-go#79 review), which is this file's own recorded lesson:
+  # a guard that runs after the thing it guards is a consolation.
+  #
+  # `check_path_outside` already carried the normalisation. Both prefixes here are
+  # built the same way now -- the review named the first, and `other_roots` has the
+  # identical shape, so fixing only the named one would leave the same hole for a
+  # linked worktree rooted at `/`.
+  ir_prefix="$checkout_root/"
+  case "$ir_prefix" in //) ir_prefix=/ ;; esac
   case "$1/" in
-    "$checkout_root"/*) return 0 ;;
+    "$ir_prefix"*) return 0 ;;
   esac
   [ "$1" = "$checkout_root" ] && return 0
   if [ "${#other_roots[@]}" -gt 0 ]; then
     for ir_one in "${other_roots[@]}"; do
       [ -n "$ir_one" ] || continue
+      ir_prefix="$ir_one/"
+      case "$ir_prefix" in //) ir_prefix=/ ;; esac
       case "$1/" in
-        "$ir_one"/*) return 0 ;;
+        "$ir_prefix"*) return 0 ;;
       esac
       [ "$1" = "$ir_one" ] && return 0
     done
   fi
   return 1
 }
+# <<< INSIDE-A-CHECKOUT
 sanitised_path=""
 dropped_inside=no
 old_ifs="$IFS"
@@ -834,6 +854,50 @@ export PATH
 if [ "$dropped_inside" = yes ]; then
   printf 'note: PATH entries inside this checkout were dropped for this hook.\n' >&2
 fi
+
+# ⚠ REDIRECTING `core.hooksPath` DOES NOT DISABLE THE OTHER FACILITIES THAT RUN A
+# PROGRAM. `core.fsmonitor` is documented as a hook command, and `git diff --quiet
+# HEAD --` invokes it: reproduced, a tracked `./fsmon` executed before the trusted
+# scanner ran, so a branch gained local code execution merely by being PUSHED
+# (shardpilot/shardpilot-go#79 review). `git worktree add --no-checkout` closes the
+# filter-driver route; this is the same class through a different door.
+#
+# ⚠ AND THE REVIEW NAMED ONE KEY OF SEVERAL. Measured on the same command, with
+# `core.fsmonitor` already neutralised: a `diff.<name>.textconv` fired, and so did a
+# `filter.<name>.clean`. `core.attributesFile=/dev/null` does NOT stop them -- the
+# driver is selected by the IN-TREE `.gitattributes`, which the pushed branch owns.
+#
+# So the key names cannot be typed here: `<name>` is arbitrary. But they are BOUNDED
+# BY THE CONFIG, and the config is not branch-supplied -- this file already relies
+# on that, one guard up: "`config` is never a tracked file, so it is under the same
+# control as PATH itself". What the branch owns is the SELECTION and the program the
+# value points at. So the set is DERIVED from the config rather than enumerated from
+# memory, and every configured key whose value git executes is emptied.
+#
+# In the ENVIRONMENT, not on a wrapper: `git_safe` covers sixteen call sites and the
+# bare `git diff` that carries this defect is not one of them. An override every
+# invocation inherits cannot be bypassed by adding a call site.
+#
+# `git config --list` was measured not to run any of these itself, which is what
+# makes reading the list a safe first step.
+unset GIT_CONFIG_COUNT 2>/dev/null || true
+sp_cfg_keys="$(git config --list --name-only 2>/dev/null |
+  grep -E '^(core\.fsmonitor|core\.alternaterefscommand|core\.gitproxy|diff\.[^.]+\.(textconv|command)|filter\.[^.]+\.(clean|smudge))$' |
+  sort -u || true)"
+sp_cfg_n=0
+sp_seen=""
+# `core.fsmonitor` is emptied whether or not it is currently set, so a value added
+# between this read and the commands below cannot arrive unanswered.
+for sp_k in core.fsmonitor $sp_cfg_keys; do
+  case " $sp_seen " in *" $sp_k "*) continue ;; esac
+  sp_seen="$sp_seen $sp_k"
+  eval "export GIT_CONFIG_KEY_$sp_cfg_n=\"\$sp_k\""
+  eval "export GIT_CONFIG_VALUE_$sp_cfg_n=''"
+  sp_cfg_n=$((sp_cfg_n + 1))
+done
+GIT_CONFIG_COUNT="$sp_cfg_n"
+export GIT_CONFIG_COUNT
+unset sp_cfg_keys sp_k sp_seen
 
 hooks_off="$(mktemp -d)"
 # ⚠ THE TRAP GOES ON AS SOON AS THERE IS SOMETHING TO CLEAN. Everything between
@@ -1833,13 +1897,44 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # ancestor of it, so a valid tag push was refused before it was scanned
   # (shardpilot/shardpilot-go#79 review). Such a tag has no tree to scan; what it
   # publishes is the tag OBJECT, and that is collected either way.
-  peeled="$(git rev-parse --verify --quiet "$local_sha^{commit}" 2>/dev/null || printf '%s' "$local_sha")"
-  # `peeled` above falls back deliberately: `rev-parse --verify` FAILING is the
-  # answer "not a commit". A type probe failing is not an answer at all.
-  if ! target_kind="$(git cat-file -t "$peeled" 2>/dev/null)"; then
-    printf 'REFUSING: the type of %s could not be read, so this gate cannot tell an\n' "$peeled" >&2
-    printf '  unreadable object from one it knows how to scan.\n' >&2
-    exit 2
+  # ⚠ A FAILING PEEL IS TWO DIFFERENT ANSWERS, AND THE FALLBACK GAVE BOTH THE SAME
+  # ONE. The line here read `rev-parse --verify --quiet` FAILING as "not a commit"
+  # -- true for a tag on a tree or a blob, and equally true when the read simply
+  # did not succeed. In the second case `peeled` became the tag's own id,
+  # `target_kind` became `tag`, and the created-ref path then selects the EMPTY-TREE
+  # baseline: the commit content is still scanned, but the lane B comparative
+  # ratchet is skipped and a regression is approved with a green tick
+  # (shardpilot/shardpilot-go#79 review).
+  #
+  # This is the sixth instance of one sentence in this file: a probe's STATUS is
+  # not its answer. The others were repaired by routing through `git_probe`, and
+  # this one had been argued into an exception because the failure looked
+  # informative. It is informative only if the question has exactly two outcomes,
+  # and this one has three.
+  #
+  # So the source's type is asked FIRST, and a tag is peeled through `^{}` -- whose
+  # failure is a failure. The fallback survives only where the target is VERIFIED
+  # not to be a commit, which is the legal case it was written for: `git tag`
+  # accepts `[<commit> | <object>]`, such a tag has no tree to scan, and what it
+  # publishes is the tag OBJECT, collected either way.
+  git_probe "the type of $local_sha" git cat-file -t "$local_sha"
+  src_kind="$PROBE_OUT"
+  if [ "$src_kind" = tag ]; then
+    git_probe "the target type of the tag $local_sha" git cat-file -t "$local_sha^{}"
+    if [ "$PROBE_OUT" = commit ]; then
+      git_probe "the commit the tag $local_sha points at" \
+        git rev-parse --verify --quiet "$local_sha^{commit}"
+      peeled="$PROBE_OUT"
+      target_kind=commit
+    else
+      # A verified non-commit target: the tag object is the whole of what is
+      # published, exactly as before.
+      peeled="$local_sha"
+      target_kind=tag
+    fi
+  else
+    peeled="$local_sha"
+    target_kind="$src_kind"
   fi
   # ⚠ AN ANCESTOR IS ELIGIBLE FOR A TAG. `--follow-tags` publishes missing
   # annotated tags reachable from the refs being pushed, not only tags whose

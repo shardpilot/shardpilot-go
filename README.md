@@ -336,7 +336,13 @@ while IFS= read -r -d "" rec; do
   case "$rec" in worktree\ *)
     r="${rec#worktree }" && printf '%s\0' "$r" &&
     pr="${r%/*}" &&
-    { test ! -f "$pr/.git" || { gl=""; IFS= read -r -d "" gl < "$pr/.git" || true; gl="${gl%$NL}"; case "$gl" in "gitdir: $r") printf '%s\0' "$pr" ;; esac; }; } || exit 1 ;;
+    { test -e "$r/.git" ||
+      { gl=""; test ! -f "$pr/.git" ||
+          { IFS= read -r -d "" gl < "$pr/.git" || true; gl="${gl%$NL}"; };
+        case "$gl" in
+          "gitdir: $r") printf '%s\0' "$pr" ;;
+          *) echo "$r is a git directory whose checkout cannot be named -- install from the main checkout" >&2; exit 1 ;;
+        esac; }; } || exit 1 ;;
   esac
 done < "$wt" > "$wp" &&
 while IFS= read -r -d "" r; do
