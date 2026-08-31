@@ -626,9 +626,29 @@ if [ -n "$wt_common" ]; then
     # stops at NUL, of which there is none, so it reads to EOF and returns non-zero
     # with the whole content in the variable -- which is why the status is discarded
     # here rather than used as a failure.
+    # ⚠ AND AN UNREADABLE BACK-POINTER IS NOT AN EMPTY ONE. `read -d ''` returns
+    # non-zero at EOF with the content in hand, so its status cannot be used -- which
+    # left "the file could not be read" and "the file is empty" as the same outcome,
+    # and a registered worktree was silently dropped from `other_roots`. An absolute
+    # PATH entry beneath that checkout then survived the only PRE-COMMAND filter
+    # (shardpilot/shardpilot-go#79 review). Seventh instance in this file of one
+    # sentence: a probe's status is not its answer, and where the status is unusable
+    # the question has to be asked another way.
+    #
+    # Readability is that other way, and it is a builtin.
+    if [ ! -r "$wt_gd" ]; then
+      printf 'REFUSING: the worktree back-pointer %s could not be read, so a checkout\n' "$wt_gd" >&2
+      printf '  on this machine cannot be named and a PATH entry inside it cannot be\n' >&2
+      printf '  ruled out. This is decided before any command runs.\n' >&2
+      exit 2
+    fi
     wt_line=""
     IFS= read -r -d "" wt_line < "$wt_gd" || true
-    [ -n "$wt_line" ] || continue
+    if [ -z "$wt_line" ]; then
+      printf 'REFUSING: the worktree back-pointer %s is empty, so the checkout it\n' "$wt_gd" >&2
+      printf '  registers cannot be named.\n' >&2
+      exit 2
+    fi
     wt_line="${wt_line%$NL}"
     case "$wt_line" in
       ""|/*) ;;
@@ -1029,14 +1049,34 @@ set -f
 # measured, and it does not require removing the caller's environment, which is what
 # broke authenticated pushes.
 sp_cfg_args=()
+sp_cfg_params=""
 for sp_k in core.fsmonitor $sp_cfg_keys; do
   case " $sp_seen " in *" $sp_k "*) continue ;; esac
   sp_seen="$sp_seen $sp_k"
   sp_cfg_args+=(-c "$sp_k=")
+  sp_cfg_params="$sp_cfg_params '$sp_k'=''"
   sp_cfg_n=$((sp_cfg_n + 1))
 done
 set +f
-unset sp_cfg_keys sp_k sp_seen
+# ⚠ AND THE SCANNER IS A CHILD, WHICH `-c` DOES NOT REACH. The round before moved
+# the neutralisation onto `git_safe`'s `-c` arguments -- which beat everything for
+# commands THIS FILE launches, and are inherited by nothing. The scanner is a
+# separate script running its own bare `git ls-files` and `git write-tree`, and with
+# an absolute `core.fsmonitor` those executed the branch's program hundreds of times
+# during a scan (shardpilot/shardpilot-go#79 review). Fixing the `git -c` bypass
+# with `-c` traded away the child coverage the environment form had.
+#
+# So both, and the environment half is APPENDED rather than set: MEASURED, a later
+# entry in `GIT_CONFIG_PARAMETERS` overrides an earlier one, and the whole variable
+# is inherited by children. Appending therefore neutralises the drivers for the
+# scanner AND for the caller's own `git -c`, while leaving the caller's transport
+# configuration -- which sits in the earlier entries -- where it was. That is the
+# finding from the round before, kept fixed.
+if [ -n "$sp_cfg_params" ]; then
+  GIT_CONFIG_PARAMETERS="${GIT_CONFIG_PARAMETERS:-}$sp_cfg_params"
+  export GIT_CONFIG_PARAMETERS
+fi
+unset sp_cfg_keys sp_k sp_seen sp_cfg_params
 
 hooks_off="$(mktemp -d)"
 # ⚠ THE TRAP GOES ON AS SOON AS THERE IS SOMETHING TO CLEAN. Everything between
@@ -2663,7 +2703,27 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     printf 'REFUSING: tag chain deeper than 32 at %s; not scanning further.\n' "$local_sha" >&2
     exit 2
   fi
-  n="$(printf '%s\n' "$commits" | grep -c . || true)"
+  # ⚠ `grep -c` HAS THREE STATUSES AND `|| true` FLATTENS TWO OF THEM. Status 1 is
+  # "no match", and it prints `0`, which is the answer. Status 2 and above is a
+  # FAILURE, which prints nothing -- and `n` was then EMPTY, so `[ "$n" = 0 ]` was
+  # false, the ref-name-only scan was skipped, and the empty commit loop approved the
+  # push (shardpilot/shardpilot-go#79 review, reproduced: a new ref whose name
+  # matches a prohibited identifier published with exit 0).
+  n=""
+  n="$(printf '%s\n' "$commits" | grep -c .)" || {
+    n_rc=$?
+    if [ "$n_rc" -ne 1 ]; then
+      printf 'REFUSING: the commit count could not be taken (grep exited %s), so this\n' "$n_rc" >&2
+      printf '  gate cannot tell an empty push from one it failed to measure.\n' >&2
+      exit 2
+    fi
+    n=0
+  }
+  case "$n" in
+    ""|*[!0-9]*)
+      printf 'REFUSING: the commit count came back as %s, which is not a number.\n' "${n:-<empty>}" >&2
+      exit 2 ;;
+  esac
   printf 'public surface: comparing against %s (%s); %s commit(s) introduced\n' "$base" "$why" "$n"
   # ⚠ A REF WITH NO NEW COMMITS STILL PUBLISHES ITS NAME. Pointing a new branch
   # at a commit already reachable from the default branch introduces nothing --

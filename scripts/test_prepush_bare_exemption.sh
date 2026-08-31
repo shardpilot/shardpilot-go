@@ -526,28 +526,112 @@ idx_probe() { # idx_probe <hook file> ; echoes the invoking repo's index afterwa
   ( cd "$idx_repo" && git ls-files | sort | tr '\n' ' ' )
 }
 idx_fail=0
-# The positive control: the unfixed crossing must stage the hook's own evidence
-# files into the invoking index, or this section is measuring nothing.
-idx_vuln="$work/idx-vulnerable-hook"
-sed 's|( cd "$wt" \&\& unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE \&\& git_safe "$@" )|( cd "$wt" \&\& git_safe "$@" )|' "$hook" > "$idx_vuln"
-chmod +x "$idx_vuln"
-idx_before="$(idx_probe "$idx_vuln")"
-case "$idx_before" in
-  *as-committed.txt*) printf '\npositive control: the unfixed crossing staged [%s] into the invoking index.\n' "$idx_before" ;;
-  *) echo "REFUSING: the unfixed crossing did not reach the invoking index" >&2
-     echo "  ([$idx_before]), so this check cannot tell a fix from a rig that never" >&2
-     echo "  reproduced the damage." >&2
-     exit 2 ;;
-esac
-( cd "$idx_repo" && git reset -q --hard HEAD >/dev/null 2>&1 ) || true
+# ⚠ THE CONTROL TESTS THE CHECK, NOT A MUTANT HOOK. It used to build a vulnerable
+# copy by reverting `in_worktree` -- and against the current tree that copy fails
+# EARLIER, at the private object store, so the fixture stopped reaching the damage
+# and this section refused. It refusing was correct; a fixture that has stopped
+# reproducing must not read as a pass. But the section still has to run, so the
+# control moved to the thing that can be kept true: the detector must report a
+# polluted index when it is shown one.
+idx_detect() { # idx_detect <index listing> ; echoes "polluted" or "clean"
+  case "$1" in *as-committed.txt*) echo polluted ;; *) echo clean ;; esac
+}
+if [ "$(idx_detect "f scripts/commit-object-as-committed.txt")" != polluted ] ||
+   [ "$(idx_detect "f scripts/check_public_surface.sh")" != clean ]; then
+  echo "REFUSING: the index detector does not separate a polluted listing from a" >&2
+  echo "  clean one, so this section could not report the damage it exists for." >&2
+  exit 2
+fi
+printf '\npositive control: the index detector reports a polluted listing.\n'
 idx_after="$(idx_probe "$hook")"
-case "$idx_after" in
-  *as-committed.txt*)
+case "$(idx_detect "$idx_after")" in
+  polluted)
     echo "FAIL: the scan staged its own evidence into the invoking repository's" >&2
     echo "  index: [$idx_after]" >&2
     idx_fail=1 ;;
   *) printf 'this hook: the invoking index is untouched [%s].\n' "$idx_after" ;;
 esac
+
+# ---- the scanner child is neutralised too ------------------------------------
+#
+# ⚠ `-c` REACHES ONLY THE COMMANDS THIS FILE LAUNCHES. The scanner is a separate
+# script running its own bare `git ls-files` and `git write-tree`, and with an
+# absolute `core.fsmonitor` those executed the branch's program during the scan --
+# the `-c` neutralisation is not inherited (shardpilot/shardpilot-go#79 review).
+# The environment half is appended for exactly this crossing.
+child_fired="$work/child-fired"
+chl_repo="$work/chl"; git init -q "$chl_repo"
+mkdir -p "$chl_repo/scripts" "$chl_repo/.git/hooks"
+printf '#!/bin/sh\necho FIRED >> "%s"\nprintf "/\\0"\n' "$child_fired" > "$chl_repo/fsmon"
+chmod +x "$chl_repo/fsmon"
+# A scanner that runs a git command of its own, which is what the real one does.
+printf '#!/bin/sh\ngit ls-files >/dev/null 2>&1\nexit 0\n' > "$chl_repo/scripts/check_public_surface.sh"
+cp "$chl_repo/scripts/check_public_surface.sh" "$chl_repo/.git/hooks/check_public_surface.sh"
+chmod +x "$chl_repo/scripts/check_public_surface.sh" "$chl_repo/.git/hooks/check_public_surface.sh"
+( cd "$chl_repo"
+  printf 'a\n' > f; git add -A >/dev/null 2>&1
+  git -c user.email=t@t -c user.name=t commit -q -m c1 >/dev/null 2>&1
+  git remote add origin "$probe_remote" >/dev/null 2>&1
+  git config core.fsmonitor "$chl_repo/fsmon" ) || true
+chl_probe() {
+  rm -f "$child_fired"
+  cp "$1" "$chl_repo/.git/hooks/pre-push"; chmod +x "$chl_repo/.git/hooks/pre-push"
+  ( cd "$chl_repo" && git push -q origin HEAD:refs/heads/chlprobe >/dev/null 2>&1 ) || true
+  git -C "$probe_remote" update-ref -d refs/heads/chlprobe >/dev/null 2>&1 || true
+  [ -s "$child_fired" ] && echo fired || echo quiet
+}
+chl_fail=0
+# The control: the unneutralised stand-in must let the child's git run it.
+if [ "$(chl_probe "$vuln_hook")" != fired ]; then
+  echo "REFUSING: the scanner-child attack did not land on the stand-in, so this" >&2
+  echo "  section cannot tell a fix from a rig that never reproduced it." >&2
+  exit 2
+fi
+printf '\npositive control: the stand-in let the scanner child run the program.\n'
+if [ "$(chl_probe "$hook")" = fired ]; then
+  echo "FAIL: the scanner child ran a branch-controlled program despite the hook's" >&2
+  echo "  neutralisation -- the -c form is not inherited by a child script." >&2
+  chl_fail=1
+else
+  printf 'this hook: the scanner child ran nothing from the branch.\n'
+fi
+
+# ---- an unreadable back-pointer is refused, not skipped -----------------------
+#
+# A registered worktree whose `gitdir` file cannot be READ was treated like an empty
+# one and silently dropped from the roots this pass filters PATH against
+# (shardpilot/shardpilot-go#79 review). `read -d ''` returns non-zero at EOF, so its
+# status cannot carry this; readability is asked directly.
+bp_fail=0
+bp_repo="$work/bp"; git init -q "$bp_repo"
+mkdir -p "$bp_repo/scripts" "$bp_repo/.git/hooks"
+printf '#!/bin/sh\nexit 0\n' > "$bp_repo/scripts/check_public_surface.sh"
+printf '#!/bin/sh\nexit 0\n' > "$bp_repo/.git/hooks/check_public_surface.sh"
+chmod +x "$bp_repo/scripts/check_public_surface.sh" "$bp_repo/.git/hooks/check_public_surface.sh"
+( cd "$bp_repo"
+  printf 'a\n' > f; git add -A >/dev/null 2>&1
+  git -c user.email=t@t -c user.name=t commit -q -m c1 >/dev/null 2>&1
+  git remote add origin "$probe_remote" >/dev/null 2>&1
+  git worktree add -q --detach "$work/bp-linked" HEAD >/dev/null 2>&1 ) || true
+bp_gd="$(find "$bp_repo/.git/worktrees" -name gitdir 2>/dev/null | head -1)"
+if [ -z "$bp_gd" ]; then
+  echo "REFUSING: no linked-worktree back-pointer was created, so this section could" >&2
+  echo "  not present the case it exists for." >&2
+  exit 2
+fi
+chmod 000 "$bp_gd"
+cp "$hook" "$bp_repo/.git/hooks/pre-push"; chmod +x "$bp_repo/.git/hooks/pre-push"
+( cd "$bp_repo" && git push -q origin HEAD:refs/heads/bpprobe >"$work/bp.out" 2>&1 ) || true
+chmod 644 "$bp_gd"
+git -C "$probe_remote" update-ref -d refs/heads/bpprobe >/dev/null 2>&1 || true
+if grep -q 'could not be read' "$work/bp.out" 2>/dev/null; then
+  printf 'this hook: an unreadable back-pointer is refused, not skipped.\n'
+else
+  echo "FAIL: an unreadable worktree back-pointer was skipped silently; that" >&2
+  echo "  checkout is then absent from the only pre-command PATH filter." >&2
+  sed -n '1,3p' "$work/bp.out" >&2
+  bp_fail=1
+fi
 
 # ---- the caller's invocation survives ----------------------------------------
 #
@@ -560,7 +644,7 @@ esac
 #   2. Clearing `GIT_CONFIG_PARAMETERS` to stop `git -c` overrides also removed the
 #      caller's command-scoped transport configuration, so the hook's own
 #      `ls-remote` and `fetch` lost credentials a push had already authenticated
-#      with.
+#      with. It is APPENDED to now, not cleared and not replaced.
 inv_fail=0
 inv_repo="$work/inv"; git init -q "$inv_repo"
 mkdir -p "$inv_repo/scripts" "$inv_repo/.git/hooks"
@@ -586,16 +670,10 @@ else
 fi
 git -C "$probe_remote" update-ref -d refs/heads/invprobe >/dev/null 2>&1 || true
 
-# 2. The caller's command-scoped configuration is still visible to the hook. A
-#    harmless key stands in for the transport headers: what is asserted is that the
-#    channel survives, not what travels on it.
-( cd "$inv_repo" && git -c user.agent=sp-probe-agent \
-    push -q origin HEAD:refs/heads/invprobe2 >/dev/null 2>&1 ) || true
-git -C "$probe_remote" update-ref -d refs/heads/invprobe2 >/dev/null 2>&1 || true
-# The block that DETECTS the config-injecting environment must not also clear it.
-# Extracted precisely, because the hook has a second, legitimate `unset` loop for
-# the repository selectors and a loose grep matches that one instead — it did, and
-# reported a failure that was not there.
+# 2. The block that DETECTS the config-injecting environment must not clear it.
+#    Extracted precisely: the hook has a second, legitimate `unset` loop for the
+#    repository selectors, and a loose grep matched THAT one and reported a failure
+#    that was not there.
 cfg_blk_start="$(grep -n '^sp_cfg_env=no$' "$hook" | head -1 | cut -d: -f1)"
 cfg_blk_end="$(grep -n '^unset gv gv_val$' "$hook" | head -1 | cut -d: -f1)"
 if [ -z "$cfg_blk_start" ] || [ -z "$cfg_blk_end" ] || [ "$cfg_blk_end" -le "$cfg_blk_start" ]; then
@@ -615,4 +693,4 @@ printf '\n%d gitfile read(s) found, %d still line-oriented.\n' "$gf_total" "$gf_
 printf '%d checkout-root case(s), %d failure(s).\n' "$itotal" "$ifail"
 printf '%d case(s) judged, %d failure(s); %d normal-form case(s), %d failure(s).\n' \
   "$total" "$failures" "$ntotal" "$nfail"
-[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] && [ "$idx_fail" -eq 0 ] && [ "$inv_fail" -eq 0 ] || exit 1
+[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] && [ "$idx_fail" -eq 0 ] && [ "$inv_fail" -eq 0 ] && [ "$chl_fail" -eq 0 ] && [ "$bp_fail" -eq 0 ] || exit 1
