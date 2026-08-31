@@ -2989,7 +2989,12 @@ func authorityIsHostShaped(a string) bool {
 	// an empty refusal ledger (shardpilot/shardpilot-go#85 review). That is not a new
 	// axis beside LDH -- it is the SAME property, "a name the world resolves",
 	// under-stated. DNS fixes both: a label is 1..63 octets and a name is at most 253
-	// (RFC 1035 §2.3.4, less the root label). An internationalised host arrives here
+	// (RFC 1035 section 2.3.4, less the root label) -- spelled out because the
+	// section sign followed by a digit is one of the shapes the public-surface
+	// scanner reads as an INTERNAL document reference, and it cannot tell a public
+	// RFC citation from an internal one. ⚠ The first attempt at this note QUOTED the
+	// internal shape in order to explain it, and matched itself. The citation is what
+	// matters here, not the glyph. An internationalised host arrives here
 	// as punycode, which is measured by the same rule.
 	if host == "" || len(host) > 253 {
 		return false
