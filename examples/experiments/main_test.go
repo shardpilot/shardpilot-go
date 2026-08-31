@@ -4389,3 +4389,40 @@ func TestTheFinalSectionSaysWhatItCannotShow(t *testing.T) {
 		}
 	}
 }
+
+// TestAFieldNameIsScannedInEverySpelling: `%` is legal in an HTTP field name, so
+// `%53et-Cookie:` passed a raw lookup while the publication guard's own percent
+// decoder rebuilds `Set-Cookie:` from it -- and `assertNoLeak` checks only SUPPLIED
+// values, so the endpoint-minted credential was published
+// (shardpilot/shardpilot-go#84 review).
+//
+// ⚠ THIS IS THE THIRD SITE OF ONE DEFECT, and the population was greped this time:
+// the transport diagnostic and the unparsable body were fixed in earlier rounds, the
+// response header path is the one reported, and the TRAILER block had it too and was
+// not reported. Both remaining sites are covered here.
+func TestAFieldNameIsScannedInEverySpelling(t *testing.T) {
+	t.Cleanup(func() { structuralSurfaces = nil })
+	for _, c := range []struct {
+		name, dump string
+		refused    bool
+	}{
+		{"the arrived spelling", "HTTP/1.1 200 OK\r\nSet-Cookie: session=secret\r\n\r\n", true},
+		{"percent-encoded", "HTTP/1.1 200 OK\r\n%53et-Cookie: session=secret\r\n\r\n", true},
+		{"doubly encoded", "HTTP/1.1 200 OK\r\n%2553et-Cookie: session=secret\r\n\r\n", true},
+		{"an ordinary field", "HTTP/1.1 200 OK\r\nX-Trace: 1\r\n\r\n", false},
+	} {
+		structuralSurfaces = nil
+		dropFraming(c.dump)
+		if (len(structuralSurfaces) != 0) != c.refused {
+			t.Errorf("%s: refused=%v, want %v", c.name, len(structuralSurfaces) != 0, c.refused)
+		}
+	}
+	// ⚠ AND THE TRAILER BLOCK, which had the same raw lookup and was not reported.
+	structuralSurfaces = nil
+	if note, minted, _ := mintedFieldIn("%53et-Cookie"); !minted || note == "" {
+		t.Errorf("an encoded trailer field name was not recognised")
+	}
+	if _, minted, _ := mintedFieldIn("X-Trace"); minted {
+		t.Errorf("an ordinary trailer field name was treated as minted")
+	}
+}

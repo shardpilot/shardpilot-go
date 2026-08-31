@@ -301,7 +301,11 @@ func (e *exchange) trailerReport() string {
 			// the endpoint's own spelling of the field name to stderr -- a refusal
 			// printing the thing it refuses, which this file records twice already.
 			low := strings.ToLower(k)
-			if note, minted := serverMintedFields[low]; minted {
+			if note, minted, whole := mintedFieldIn(k); minted || !whole {
+				if !minted {
+					noteStructural("a trailer field name whose decoded forms could not be enumerated")
+					continue
+				}
 				noteStructural(note)
 				fmt.Fprintf(&b, "    %s\n", canonicalFieldName(low)+": "+marked("<withheld>"))
 				continue
@@ -1757,7 +1761,9 @@ func dropFraming(dump string) string {
 		// reaches every path that asks; the sweep over that map is what makes the
 		// two paths' agreement a measured thing rather than a habit.
 		if name, ok := fieldNameOf(low); ok {
-			if note, minted := serverMintedFields[name]; minted {
+			if note, minted, whole := mintedFieldIn(name); !whole && !minted {
+				noteStructural("a response field name whose decoded forms could not be enumerated")
+			} else if minted {
 				// ⚠ AND ONLY WHERE THERE ARE VALUE BYTES TO CONCEAL. A legal empty
 				// field -- `Location:`, or one whose value is nothing but OWS -- was
 				// refused on the strength of its NAME, so a capture with no
@@ -2486,6 +2492,30 @@ const (
 	// rather than spending superlinear work on one string.
 	decodedFormsFormMax = 8 << 10
 )
+
+// mintedFieldIn reports the note for a protected field name found in ANY supported
+// decoding of `name`, and whether the form list could be finished.
+//
+// ⚠ THE NAME IS SCANNED IN EVERY SPELLING THE GUARD RECONSTRUCTS. `%` is legal in an
+// HTTP field name, so `%53et-Cookie: session=secret` passed a raw lookup while the
+// publication guard's own percent decoder rebuilds `Set-Cookie:` from it -- and
+// `assertNoLeak` checks only SUPPLIED values, so an endpoint-minted credential was
+// published (shardpilot/shardpilot-go#84 review).
+//
+// ⚠ AND THIS IS THE THIRD SITE OF ONE DEFECT. The transport diagnostic and the
+// unparsable body were fixed in earlier rounds; the ordinary header path kept its
+// raw lookup, and a fourth site -- the trailer block -- had it too. The population
+// was produced by grepping every `serverMintedFields` and `isMintedName` lookup this
+// time rather than fixing the one that was shown; both remaining sites call this.
+func mintedFieldIn(name string) (string, bool, bool) {
+	forms, whole := decodedForms(name)
+	for _, f := range forms {
+		if note, ok := serverMintedFields[strings.ToLower(strings.TrimSpace(f))]; ok {
+			return note, true, whole
+		}
+	}
+	return "", false, whole
+}
 
 func decodedForms(text string) ([]string, bool) {
 	// ⚠ THE BOUND HAS TO BE ON WHAT IS WALKED, NOT ON WHAT IS CHARGED AFTERWARDS.
