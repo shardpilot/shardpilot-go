@@ -50,6 +50,14 @@
 fa107e25a30f2e0345fecacbc600ba7735b66ed2:examples/experiments/main_test.go:generic-api-key:398
 
 #
+# ⚠ THIRD ENTRY, SAME FILE, SAME RULE, SAME AUTHOR, SAME DAY. The prevention two
+# entries up is correct -- a repeating low-entropy value of the same length
+# measures clean on gitleaks 8.30.1, checked before this line was written -- and
+# it did not fire, because it lives HERE and this file is only ever read AFTER a
+# failure. The reminder now also sits at the fixture, which is where the author
+# of the next one is looking. Pinned by finding, as always: this dies with the
+# commit rather than forgiving the shape anywhere.
+#
 # ⚠ NOT THIS BRANCH'S FINDING, AND THAT IS THE POINT. `ci.yml` fetches
 # `+refs/pull/*/head` before scanning history, so a fixture on ANY open pull
 # request reddens EVERY open pull request. This pin is for a commit on
