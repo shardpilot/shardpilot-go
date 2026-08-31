@@ -17,6 +17,7 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/http/httptrace"
 	"net/textproto"
 	"net/url"
@@ -267,7 +268,7 @@ func TestTrailerNamesAreScrubbedToo(t *testing.T) {
 
 func TestRedactedAuthorizationKeepsItsTerminator(t *testing.T) {
 	dump := []byte("GET /x HTTP/1.1\r\nAuthorization: Bearer tok\r\nHost: h\r\n\r\n")
-	got := string(redact(dump, http.Header{"Host": nil}))
+	got := string(redact(dump, http.Header{"Host": nil}, false))
 	for _, line := range strings.Split(got, "\n") {
 		if line == "" {
 			continue
@@ -928,7 +929,7 @@ func TestProtocolTokensDoNotRefuseTheCapture(t *testing.T) {
 	for _, v := range []string{"Bearer", "Authorization", "Host", "User-Agent"} {
 		suppliedValues = []string{v}
 		raw := "GET /p HTTP/1.1\r\nHost: e.example\r\nAuthorization: Bearer abcdefgh\r\nUser-Agent: sp/1\r\n\r\n"
-		if err := assertNoLeak(asCaptured(string(redact([]byte(escapeMarks(raw)), http.Header{"Host": nil})))); err != nil {
+		if err := assertNoLeak(asCaptured(string(redact([]byte(escapeMarks(raw)), http.Header{"Host": nil}, false)))); err != nil {
 			t.Errorf("supplied %q: fixed request syntax was read as a leak: %v", v, err)
 		}
 		suppliedValues = nil
@@ -1015,7 +1016,7 @@ func TestSerialiserWrittenHeaderValuesAreGenerated(t *testing.T) {
 	suppliedValues = []string{"gzip"}
 	t.Cleanup(func() { suppliedValues = nil })
 	raw := "GET /p HTTP/1.1\r\nHost: e.example\r\nAccept-Encoding: gzip\r\n\r\n"
-	if err := assertNoLeak(asCaptured(string(redact([]byte(escapeMarks(raw)), http.Header{"Host": nil})))); err != nil {
+	if err := assertNoLeak(asCaptured(string(redact([]byte(escapeMarks(raw)), http.Header{"Host": nil}, false)))); err != nil {
 		t.Fatalf("a value net/http wrote itself was read as a leak: %v", err)
 	}
 }
@@ -1082,7 +1083,7 @@ func TestTheSerialiserUserAgentIsGenerated(t *testing.T) {
 	suppliedValues = []string{"Go-http-client/1.1"}
 	t.Cleanup(func() { suppliedValues = nil })
 	raw := "GET /p HTTP/1.1\r\nHost: e.example\r\nUser-Agent: Go-http-client/1.1\r\n\r\n"
-	if err := assertNoLeak(asCaptured(string(redact([]byte(escapeMarks(raw)), http.Header{"Host": nil})))); err != nil {
+	if err := assertNoLeak(asCaptured(string(redact([]byte(escapeMarks(raw)), http.Header{"Host": nil}, false)))); err != nil {
 		t.Fatalf("the serialiser's own User-Agent was read as a leak: %v", err)
 	}
 }
@@ -2036,7 +2037,7 @@ func TestTheConfiguredHostIsOurs(t *testing.T) {
 	// the parent's one-argument form; the fact under test is the same.
 	req, _ := http.NewRequest("GET", "https://app.shardpilot.com/x", nil)
 	got := stripMarks(scrubSupplied(string(redact(
-		[]byte("GET /x HTTP/1.1\r\nHost: app.shardpilot.com\r\n\r\n"), requestOwnedHeaders(req)))))
+		[]byte("GET /x HTTP/1.1\r\nHost: app.shardpilot.com\r\n\r\n"), requestOwnedHeaders(req), false))))
 	if !strings.Contains(got, "Host: app.shardpilot.com") {
 		t.Fatalf("the configured authority was rewritten: %q", got)
 	}
@@ -2048,7 +2049,7 @@ func TestTheConfiguredHostIsOurs(t *testing.T) {
 	suppliedValues = []string{"example"}
 	configuredHost, configuredHostWire = "é.example", "xn--9ca.example"
 	got = stripMarks(scrubSupplied(string(redact(
-		[]byte("GET /x HTTP/1.1\r\nHost: xn--9ca.example\r\n\r\n"), requestOwnedHeaders(req)))))
+		[]byte("GET /x HTTP/1.1\r\nHost: xn--9ca.example\r\n\r\n"), requestOwnedHeaders(req), false))))
 	if !strings.Contains(got, "Host: xn--9ca.example") {
 		t.Fatalf("the serialised form of the configured authority was rewritten: %q", got)
 	}
@@ -2058,7 +2059,7 @@ func TestTheConfiguredHostIsOurs(t *testing.T) {
 	suppliedValues = []string{"elsewhere"}
 	req2, _ := http.NewRequest("GET", "https://app.shardpilot.com/x", nil)
 	got = stripMarks(scrubSupplied(string(redact(
-		[]byte("GET /x HTTP/1.1\r\nHost: elsewhere.invalid\r\n\r\n"), requestOwnedHeaders(req2)))))
+		[]byte("GET /x HTTP/1.1\r\nHost: elsewhere.invalid\r\n\r\n"), requestOwnedHeaders(req2), false))))
 	if strings.Contains(got, "Host: elsewhere.invalid") {
 		t.Fatalf("an unconfigured authority was vouched for: %q", got)
 	}
@@ -2174,7 +2175,7 @@ func TestTheRequestQuerySeparatorIsSyntax(t *testing.T) {
 	t.Cleanup(func() { suppliedValues = nil; requestNames = map[string]bool{} })
 	req, _ := http.NewRequest("GET", "https://e.example/x?a=1&b=2", nil)
 	got := redact([]byte("GET /x?a=1&b=2 HTTP/1.1\r\nHost: e.example\r\n\r\n"),
-		requestOwnedHeaders(req))
+		requestOwnedHeaders(req), false)
 	if err := assertNoLeak(asCaptured(string(got))); err != nil {
 		t.Fatalf("the request query separator was reported as a leak: %v", err)
 	}
@@ -7052,5 +7053,214 @@ func TestAnOrdinaryJSONValueIsStillMeasuredWhole(t *testing.T) {
 	raw2 := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" + `{"m":"\\y00"}`
 	if got := stripMarks(dropFraming(escapeMarks(raw2))); !strings.Contains(got, "redacted-4-chars") {
 		t.Fatalf("a backslash run not before the escape's trigger was mismeasured: %q", got)
+	}
+}
+
+// ---- round on adbb037 ----
+
+// TestARedirectLegPublishesNoEndpointTarget is the P1 of this round, and it is a
+// consequence of the previous one. Forwarding redirect follow-ups was right; what
+// it broke is an assumption the REQUEST redactor had been able to make while they
+// were absorbed — that every byte of a request dump is this program's. It is not:
+// on a redirect leg the SDK issues a target the endpoint chose, and `http.Client`
+// generates a `Referer` from the previous endpoint-selected URL.
+//
+// Driven as a real two-redirect chain rather than a composed dump, because the
+// finding is about what net/http DOES, and a fixture that composes the headers
+// would assert my belief about that instead of the fact.
+//
+// On the pre-fix code this fails on the request line first: `GET
+// /server-secret-token?x=y` is published whole.
+func TestARedirectLegPublishesNoEndpointTarget(t *testing.T) {
+	t.Cleanup(func() { suppliedValues, structuralSurfaces, accountedSurfaces = nil, nil, nil })
+	suppliedValues, structuralSurfaces, accountedSurfaces = nil, nil, nil
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, assignmentRoute):
+			http.Redirect(w, r, "/server-secret-token?x=y", http.StatusFound)
+		case r.URL.Path == "/server-secret-token":
+			http.Redirect(w, r, "/second-endpoint-choice", http.StatusFound)
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"assigned":false,"reason":"absent"}`))
+		}
+	}))
+	defer srv.Close()
+
+	rec := &recorder{inner: http.DefaultTransport}
+	req, _ := http.NewRequest("GET", srv.URL+assignmentRoute, nil)
+	resp, err := (&http.Client{Transport: rec}).Do(req)
+	if err != nil {
+		t.Fatalf("the redirect chain failed: %v", err)
+	}
+	_ = resp.Body.Close()
+
+	if len(rec.exchanges) != 3 {
+		t.Fatalf("expected the assignment and two followed legs, got %d", len(rec.exchanges))
+	}
+	// Every byte the endpoint chose, in every recorded request.
+	for i := range rec.exchanges {
+		got := stripMarks(scrubSupplied(string(rec.exchanges[i].req)))
+		for _, endpointChosen := range []string{"server-secret-token", "second-endpoint-choice"} {
+			if strings.Contains(got, endpointChosen) {
+				t.Errorf("leg %d published the endpoint's own %q:\n%s", i, endpointChosen, got)
+			}
+		}
+	}
+	// And the Referer's QUERY, which no request-side rule read before: nothing on
+	// the request side treated a header value as a URI at all.
+	last := stripMarks(scrubSupplied(string(rec.exchanges[2].req)))
+	if strings.Contains(last, "x=y") {
+		t.Errorf("the generated Referer published its query verbatim:\n%s", last)
+	}
+}
+
+// TestAHarnessOriginatedRequestIsUnchanged is the other edge. The repair above
+// hands two lines of a request dump to the RESPONSE side's redactor, and applying
+// that to the leg this program itself composed would lengthen the parameter names
+// it authored — the readable-artifact property three scenes pin.
+func TestAHarnessOriginatedRequestIsUnchanged(t *testing.T) {
+	t.Cleanup(func() {
+		suppliedValues, structuralSurfaces, accountedSurfaces = nil, nil, nil
+		requestNames = map[string]bool{}
+	})
+	suppliedValues, structuralSurfaces, accountedSurfaces = nil, nil, nil
+	// The names this program put on the wire, which is what makes them ours.
+	requestNames = map[string]bool{"a": true, "b": true}
+	dump := []byte("GET /x?a=1&b=2 HTTP/1.1\r\nHost: e.example\r\nReferer: http://e.example/prev\r\n\r\n")
+	got := stripMarks(string(redact(dump, http.Header{"Host": nil, "Referer": nil}, false)))
+	if !strings.Contains(got, "a=") || !strings.Contains(got, "b=") {
+		t.Errorf("a harness-authored parameter name was lengthened: %q", got)
+	}
+	if !strings.Contains(got, "GET /x?") {
+		t.Errorf("a harness-authored request path was redacted: %q", got)
+	}
+	if !strings.Contains(got, "Referer: http://e.example/prev") {
+		t.Errorf("a harness-authored Referer was rewritten: %q", got)
+	}
+}
+
+// TestAMalformedCodingIsNotReadAsTheNoOpOne is the round's coding finding.
+// `strings.TrimSpace` removes Unicode whitespace — U+00A0 among it — which
+// net/http preserves in a field value. So `Content-Encoding: identity\u00a0` was
+// trimmed to the well-known token, the undecodable-coding refusal was skipped, and
+// the non-token byte was published while the body was called readable. `ows` —
+// space and tab, what HTTP calls optional whitespace — already existed in this
+// file with a comment naming this exact defect.
+//
+// ⚠ WHAT THIS SCENE DOES AND DOES NOT COVER, because the change is wider than it.
+// The same `TrimSpace` stood at seven other endpoint-facing trims (the field name,
+// the media type, the cache directive, the minted-field lookup), and all of them
+// moved to `ows` — that is the file's own stated rule and leaving them would leave
+// the trap. But three of those were MEASURED before and after and produce the same
+// bytes: a later rule already redacts those values, so they are defence in depth,
+// not fixed leaks. Only this one is demonstrated, and a scene per site would have
+// been three that cannot fail.
+func TestAMalformedCodingIsNotReadAsTheNoOpOne(t *testing.T) {
+	t.Cleanup(func() { suppliedValues, structuralSurfaces, accountedSurfaces = nil, nil, nil })
+	// U+00A0, written as an escape so the byte survives an edit that reflows this file.
+	const nbsp = "\u00a0"
+	structuralSurfaces, accountedSurfaces, suppliedValues = nil, nil, nil
+	got := stripMarks(dropFraming(escapeMarks(
+		"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: identity" +
+			nbsp + "\r\n\r\n{\"a\":1}")))
+	if strings.Contains(got, "identity"+nbsp) {
+		t.Errorf("a coding carrying non-HTTP whitespace was published as recognised: %q", got)
+	}
+	found := false
+	for _, r := range refusalLedger() {
+		if strings.Contains(r, "content coding this build cannot decode") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("a malformed coding was classified as the no-op one: %q", refusalLedger())
+	}
+}
+
+// TestAnOrdinaryIdentityCodingStillPublishes is the other edge. Narrowing the trim
+// to OWS must not stop the well-formed value being recognised — a classifier
+// repaired into refusing everything protects nothing and gets switched off.
+func TestAnOrdinaryIdentityCodingStillPublishes(t *testing.T) {
+	t.Cleanup(func() { suppliedValues, structuralSurfaces, accountedSurfaces = nil, nil, nil })
+	structuralSurfaces, accountedSurfaces, suppliedValues = nil, nil, nil
+	got := stripMarks(dropFraming(escapeMarks(
+		"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: identity\r\n\r\n{\"a\":1}")))
+	if !strings.Contains(got, "Content-Encoding: identity") {
+		t.Errorf("an ordinary no-op coding stopped being recognised: %q", got)
+	}
+	if !strings.Contains(got, "Content-Type: application/json") {
+		t.Errorf("an ordinary media type stopped being recognised: %q", got)
+	}
+	for _, r := range refusalLedger() {
+		if strings.Contains(r, "content coding this build cannot decode") {
+			t.Errorf("an ordinary identity coding was refused: %q", refusalLedger())
+		}
+	}
+}
+
+// TestTheSANCountNamesItsOwnFamily: crypto/x509 builds a hostname-mismatch
+// diagnostic from `IPAddresses` when the host is an IP literal and from `DNSNames`
+// otherwise. This counted DNS names always, so an IP endpoint whose certificate
+// carries DNS SANs and no IP SAN reported a count of an unrelated population —
+// misleading precisely where an operator is diagnosing an IP.
+//
+// The family is asserted as well as the count, because a count whose population is
+// not named is not a measurement.
+func TestTheSANCountNamesItsOwnFamily(t *testing.T) {
+	ipCert := &x509.Certificate{
+		DNSNames:    []string{"a.example", "b.example"},
+		IPAddresses: nil,
+	}
+	out := stripMarks(sanitizeCaptured(&tls.CertificateVerificationError{
+		Err: x509.HostnameError{Certificate: ipCert, Host: "203.0.113.7"}}))
+	if !strings.Contains(out, "san=ip") {
+		t.Errorf("an IP host was answered from the DNS population: %q", out)
+	}
+	if strings.Contains(out, "names=2") {
+		t.Errorf("the count came from the two DNS SANs, which cannot match an IP host: %q", out)
+	}
+	if !strings.Contains(out, "names=0 configured-host-listed=false") {
+		t.Errorf("the applicable population is not reported as empty: %q", out)
+	}
+
+	// The DNS side keeps working, and reports its own family.
+	dnsOut := stripMarks(sanitizeCaptured(&tls.CertificateVerificationError{
+		Err: x509.HostnameError{Certificate: ipCert, Host: "a.example"}}))
+	if !strings.Contains(dnsOut, "san=dns") || !strings.Contains(dnsOut, "names=2") ||
+		!strings.Contains(dnsOut, "configured-host-listed=true") {
+		t.Errorf("the DNS answer changed: %q", dnsOut)
+	}
+	// And no SAN is taken, on either path.
+	for _, n := range []string{"a.example", "b.example"} {
+		if strings.Contains(out, n) {
+			t.Errorf("a certificate-controlled name %q reached the artifact: %q", n, out)
+		}
+	}
+}
+
+// TestAnOpaqueTargetKeepsTheReceivedFieldLayout: `head` already carries the colon
+// and the OWS, and this return appended the gap a second time — so an ordinary
+// one-space header came back with two, and the evidence stopped preserving the
+// layout it received while only the endpoint's value was meant to change.
+func TestAnOpaqueTargetKeepsTheReceivedFieldLayout(t *testing.T) {
+	t.Cleanup(func() { suppliedValues, structuralSurfaces, accountedSurfaces = nil, nil, nil })
+	structuralSurfaces, accountedSurfaces, suppliedValues = nil, nil, nil
+	got := stripMarks(redactTarget("Location: https:secret"))
+	if strings.Contains(got, "Location:  ") {
+		t.Errorf("the received field layout gained a space: %q", got)
+	}
+	if !strings.HasPrefix(got, "Location: https:") {
+		t.Errorf("the scheme or the layout was lost: %q", got)
+	}
+	if strings.Contains(got, "secret") {
+		t.Errorf("the opaque endpoint value survived: %q", got)
+	}
+	// A header written with NO space after the colon keeps having none.
+	structuralSurfaces, accountedSurfaces = nil, nil
+	tight := stripMarks(redactTarget("Location:https:secret"))
+	if !strings.HasPrefix(tight, "Location:https:") {
+		t.Errorf("a header with no OWS gained some: %q", tight)
 	}
 }

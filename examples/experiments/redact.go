@@ -716,6 +716,45 @@ func redactTarget(line string) string {
 	return redactIPvFutureBody(redactZone(redactPath(redactUserinfo(redactResponseQuery(line)))))
 }
 
+// redirectRequestLine redacts the target of a request line the endpoint chose.
+// The line is `METHOD SP target SP HTTP/1.1`; only the middle field is data.
+func redirectRequestLine(line string) string {
+	cr := ""
+	body := line
+	if strings.HasSuffix(body, "\r") {
+		cr, body = "\r", strings.TrimSuffix(body, "\r")
+	}
+	method, rest, ok := strings.Cut(body, " ")
+	if !ok {
+		return line
+	}
+	target, tail := rest, ""
+	if j := strings.IndexByte(rest, ' '); j >= 0 {
+		target, tail = rest[:j], rest[j:]
+	}
+	return method + " " + endpointChosenTarget(target) + tail + cr
+}
+
+// endpointChosenTarget redacts a bare URI the ENDPOINT chose, through the
+// RESPONSE side's own target pipeline rather than a second copy of it.
+//
+// ⚠ A REDIRECT LEG'S REQUEST IS NOT THIS PROGRAM'S TEXT. The request redactor
+// treats every byte of a dump as harness-authored -- true only while the recorder
+// ABSORBED redirect follow-ups. Forwarding them (shardpilot/shardpilot-go#85
+// review) made the SDK issue requests whose target and `Referer` the endpoint
+// chose, and both were published verbatim: measured on a two-redirect chain,
+// `GET /server-secret-token?x=y` and `Referer: http://host/server-secret-token?x=y`,
+// the latter with its query value untouched because no request-side rule reads it.
+//
+// The pipeline is written against a `name: value` line, so a bare target is given
+// one and it is taken off again. Calling it beats restating it: the path, query,
+// fragment, userinfo, zone and IPvFuture rules are one grammar, and a second
+// spelling of a grammar has as many edges as it has versions.
+func endpointChosenTarget(target string) string {
+	const synth = "X-Redirect-Target"
+	return strings.TrimPrefix(redactTarget(synth+": "+target), synth+": ")
+}
+
 // splitField cuts a header line into its name, the whitespace after the colon,
 // and its value.
 //
@@ -771,7 +810,13 @@ func redactPath(line string) string {
 			// be inherited by whatever stands where its subject would have been.
 			if rest := url[c+1:]; rest != "" && !strings.ContainsAny(rest, "/") {
 				// MEASURED DECODED, like every other component here.
-				return head + gap + url[:c+1] + tokenPlaceholder(queryDecoded(rest)) + tail
+				// ⚠ AND `head` ALREADY CARRIES THE COLON AND THE OWS. Appending `gap`
+				// again turned an ordinary one-space header into
+				// `Location:  https:redacted-6-chars`, so the evidence stopped
+				// preserving the field layout it received while only the endpoint's
+				// value was meant to change (shardpilot/shardpilot-go#85 review). The
+				// refusal branch below this one had it right; this return did not.
+				return head + url[:c+1] + tokenPlaceholder(queryDecoded(rest)) + tail
 			}
 			start = c + 1
 		default:

@@ -315,7 +315,7 @@ func TestListsAndBorrowedPredicates(t *testing.T) {
 		t.Cleanup(func() { suppliedValues = nil })
 		raw := "GET /p HTTP/1.1\r\nHost: e.example\r\nAccept-Encoding: gzip\r\nX-Ours: gzip\r\n\r\n"
 		ours := http.Header{"Host": nil, "X-Ours": nil}
-		got := string(redact([]byte(escapeMarks(raw)), ours))
+		got := string(redact([]byte(escapeMarks(raw)), ours, false))
 		// The one WE set stays captured, so the scrub still reaches it; the one
 		// net/http wrote is generated. Neither is a name anyone typed into a list.
 		// A serialiser-written field is marked WHOLE; one we set has only its
@@ -394,7 +394,7 @@ func TestTheRequestAuthorityStaysInsideTheGuard(t *testing.T) {
 	raw := "GET /p HTTP/1.1\r\nHost: control\r\nAccept-Encoding: gzip\r\n\r\n"
 	req, _ := http.NewRequest("GET", "https://control/p", nil)
 	req.Header.Set("Accept-Encoding", "gzip")
-	got := string(redact([]byte(escapeMarks(raw)), requestOwnedHeaders(req)))
+	got := string(redact([]byte(escapeMarks(raw)), requestOwnedHeaders(req), false))
 	if err := assertNoLeak(asCaptured(scrubSupplied(got))); err != nil {
 		t.Logf("scrubbed: %q", stripMarks(scrubSupplied(got)))
 	}

@@ -71,7 +71,7 @@ func TestEveryPlaceholderCountsCharacters(t *testing.T) {
 		"cookie":        stripMarks(redactSetCookie("Set-Cookie: s=éé; Path=/")),
 		"userinfo":      stripMarks(redactUserinfo("Location: https://éé@h/cb")),
 		"fragment":      stripMarks(redactFragment("Location: /cb#éé")),
-		"authorization": stripMarks(string(redact([]byte("GET / HTTP/1.1\r\nAuthorization: Bearer éé\r\n\r\n"), nil))),
+		"authorization": stripMarks(string(redact([]byte("GET / HTTP/1.1\r\nAuthorization: Bearer éé\r\n\r\n"), nil, false))),
 	} {
 		// Two placeholder shapes, one measure: `<redacted, N chars>` and
 		// `redacted-N-chars`. The property is the NUMBER, not the spelling.
