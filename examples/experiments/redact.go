@@ -2127,13 +2127,13 @@ var verbatimHeaders = map[string]func(string) bool{
 	"content-length":    isDigits,
 	"age":               isDigits,
 	"content-type":      isMediaTypeWithoutParameters,
-	"content-encoding":  isDirectiveList("content-encoding"),
-	"transfer-encoding": isDirectiveList("transfer-encoding"),
-	"connection":        isDirectiveList("connection"),
-	"vary":              isDirectiveList("vary"),
-	"accept-ranges":     isDirectiveList("accept-ranges"),
-	"allow":             isDirectiveList("allow"),
-	"cache-control":     isDirectiveList("cache-control"),
+	"content-encoding":  isDirectiveList("content-encoding", false),
+	"transfer-encoding": isDirectiveList("transfer-encoding", false),
+	"connection":        isDirectiveList("connection", false),
+	"vary":              isDirectiveList("vary", false),
+	"accept-ranges":     isDirectiveList("accept-ranges", false),
+	"allow":             isDirectiveList("allow", false),
+	"cache-control":     isDirectiveList("cache-control", true),
 }
 
 // ows trims exactly what HTTP calls optional whitespace: space and tab.
@@ -2297,8 +2297,17 @@ func walkDirectives(field, v string, numericArg bool) bool {
 	return true
 }
 
-func isDirectiveList(field string) func(string) bool {
-	return func(v string) bool { return walkDirectives(field, v, true) }
+// isDirectiveList builds the predicate for a field whose value is a comma list.
+//
+// ⚠ AND THE ARGUMENT RULE IS THE FIELD'S, NOT THE REGISTRY'S. Every registered
+// field was given `numericArg`, so `Allow: GET=123456`, `Content-Encoding:
+// gzip=123456` and `Vary: accept=123456` all passed and the whole value was vouched
+// -- publishing endpoint-selected numeric text, which both the scrub and the guard
+// then skip if it is a supplied identifier (shardpilot/shardpilot-go#85 review).
+// Those three grammars have no arguments at all; `Cache-Control` is the one here
+// that does (`max-age=60`), so it is the one that gets them.
+func isDirectiveList(field string, numericArg bool) func(string) bool {
+	return func(v string) bool { return walkDirectives(field, v, numericArg) }
 }
 
 // registryOnlyValue reports whether every token in an admitted value is a member
@@ -2870,37 +2879,82 @@ func redactUnlessVerbatim(line string) string {
 // "is this a name the world resolves", which is LDH: letters, digits and hyphens in
 // dot-separated labels, no label beginning or ending in a hyphen. An
 // internationalised host reaches this program as punycode, which is LDH.
+// splitAuthority separates an authority into its host and its port, for BOTH the
+// bracketed and the non-bracketed form.
+//
+// ⚠ IT IS ONE FUNCTION BECAUSE IT IS ONE QUESTION. The first version asked it twice
+// and differently: the non-bracketed branch validated the port, and the bracketed
+// branch skipped port validation entirely merely because the authority contained a
+// `]` -- so `[::1]:99999999` kept an unusable port verbatim while the identical
+// `example.com:99999999` was replaced (shardpilot/shardpilot-go#85 review). Two
+// findings landed on ADJACENT lines of that function in one round, which is the
+// signal that the repair was finer than the defect: the paragraph is rewritten from
+// its decomposition rather than patched twice more.
+func splitAuthority(a string) (string, string, bool) {
+	if i := strings.LastIndexByte(a, ']'); i >= 0 {
+		if i+1 < len(a) && a[i+1] == ':' {
+			return a[:i+1], a[i+2:], true
+		}
+		return a, "", false
+	}
+	if i := strings.LastIndexByte(a, ':'); i >= 0 {
+		return a[:i], a[i+1:], true
+	}
+	return a, "", false
+}
+
+// portIsDialable reports whether a port suffix is one a stack could use.
+//
+// ⚠ AN EMPTY PORT IS LEGAL. RFC 3986 gives `port = *DIGIT`, and `example.com:/cb`
+// is a target `net/url` accepts and `parsesAsURI` already calls valid -- rejecting
+// it here replaced the whole authority with a length and cost the capture the host
+// AND the explicit empty port (shardpilot/shardpilot-go#85 review).
+func portIsDialable(port string) bool {
+	if port == "" {
+		return true
+	}
+	if !isDigits(port) {
+		return false
+	}
+	n := 0
+	for i := 0; i < len(port); i++ {
+		n = n*10 + int(port[i]-'0')
+		if n > 65535 {
+			return false
+		}
+	}
+	return true
+}
+
+// authorityIsHostShaped reports whether an authority is the kind of name the host
+// exemption's premise is about: one that is publicly resolvable and constrained by
+// its grammar.
+//
+// ⚠ RFC 3986 `reg-name` IS NOT THE TEST, though it is the obvious one to reach for.
+// It admits the sub-delims `!$&'()*+,;=`, so `host$tok` and `a;b` are legal
+// reg-names -- and they are exactly the spellings that carried endpoint text
+// through. The exemption does not rest on "is this a legal reg-name"; it rests on
+// "is this a name the world resolves", which is LDH: letters, digits and hyphens in
+// dot-separated labels, no label beginning or ending in a hyphen. An
+// internationalised host reaches this program as punycode, which is LDH.
+//
+// ⚠ USERINFO IS NOT THE HOST, and it has its own redaction one pass along. Asking
+// the whole authority failed `user:pass@host.example` on the `@` and replaced the
+// HOST with it, destroying the target; two scenes said so on the first run.
 func authorityIsHostShaped(a string) bool {
-	// ⚠ USERINFO IS NOT THE HOST, and it has its own redaction one pass along. The
-	// first version of this asked the whole authority, so `user:pass@host.example`
-	// failed on the `@` and the HOST was replaced with it -- destroying the redirect
-	// target the capture exists to show. Two scenes said so on the first run, which
-	// is the answer to "what does this guard forbid that should be allowed".
 	if i := strings.LastIndexByte(a, '@'); i >= 0 {
 		a = a[i+1:]
 	}
-	host := a
-	if i := strings.LastIndexByte(a, ':'); i >= 0 && !strings.Contains(a, "]") {
-		port := a[i+1:]
-		host = a[:i]
-		if port == "" || !isDigits(port) {
-			return false
-		}
-		// ⚠ AND THE PORT IS A NUMBER IN RANGE, not merely digits: `:99999999` is not a
-		// port any stack will dial, and digits alone admitted it.
-		n := 0
-		for j := 0; j < len(port); j++ {
-			n = n*10 + int(port[j]-'0')
-			if n > 65535 {
-				return false
-			}
-		}
+	host, port, hasPort := splitAuthority(a)
+	if hasPort && !portIsDialable(port) {
+		return false
 	}
+	// The bracketed grammars -- IPv6, IPvFuture and the zone -- are parsesAsURI's
+	// subject and are judged there; only the port needed asking here.
 	if strings.HasPrefix(host, "[") {
-		return true // the bracketed grammars are parsesAsURI's subject
+		return true
 	}
-	// A single trailing dot is a root-anchored FQDN and legal.
-	host = strings.TrimSuffix(host, ".")
+	host = strings.TrimSuffix(host, ".") // a root-anchored FQDN
 	if host == "" {
 		return false
 	}

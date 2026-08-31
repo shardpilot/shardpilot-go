@@ -6715,6 +6715,16 @@ func TestANonBracketedAuthorityIsMeasuredAgainstTheHostGrammar(t *testing.T) {
 		{"ok.example", true}, {"ok.example.", true}, {"a.b.c:8443", true},
 		{"xn--9ca.example", true}, {"127.0.0.1", true}, {"[2001:db8::1]", true},
 		{"localhost", true}, {"user:pass@ok.example", true},
+		// ⚠ THE PORT IS ONE QUESTION FOR BOTH FORMS. Asked twice, the bracketed
+		// branch skipped port validation entirely because the authority held a `]`,
+		// so `[::1]:99999999` kept an unusable port while the identical
+		// `example.com:99999999` was replaced; and an EMPTY port, which RFC 3986
+		// allows as `port = *DIGIT` and `parsesAsURI` already accepts, was refused
+		// and cost the capture its host (shardpilot/shardpilot-go#85 review). Two
+		// findings on ADJACENT lines of one function in one round is the signal that
+		// the repair was finer than the defect.
+		{"example.com:", true}, {"[::1]:443", true}, {"[::1]", true},
+		{"[::1]:99999999", false},
 		{"se_cret", false}, {"a;b", false}, {"host$tok", false}, {"..", false},
 		{"-lead", false}, {"trail-", false}, {"sec.ret:99999999", false},
 	} {
@@ -6753,6 +6763,34 @@ func TestAnEmptyCookieAttributeNameIsRefused(t *testing.T) {
 		structuralSurfaces = nil
 		if got := stripMarks(redactSetCookie("Set-Cookie: " + ck)); strings.Contains(got, "<withheld>") {
 			t.Errorf("%q was withheld: %q %v", ck, got, structuralSurfaces)
+		}
+	}
+}
+
+// TestADirectiveArgumentBelongsToItsField: `walkDirectives` admits `name=<digits>`
+// when a field's grammar has arguments, and every registered field was given that
+// permission -- so `Allow: GET=123456`, `Content-Encoding: gzip=123456` and
+// `Vary: accept=123456` all passed and the whole value was vouched, publishing
+// endpoint-selected numeric text that both the scrub and the guard then skip if it
+// is a supplied identifier (shardpilot/shardpilot-go#85 review). Those three
+// grammars have no arguments at all.
+func TestADirectiveArgumentBelongsToItsField(t *testing.T) {
+	for _, c := range []struct {
+		line string
+		kept bool
+	}{
+		{"Allow: GET=123456", false},
+		{"Content-Encoding: gzip=123456", false},
+		{"Vary: accept=123456", false},
+		// ⚠ AND THE FIELD THAT DOES HAVE ARGUMENTS KEEPS THEM, or the repair has
+		// traded a published identifier for a capture that cannot show a max-age.
+		{"Cache-Control: max-age=60", true},
+		{"Allow: GET, POST", true},
+		{"Content-Encoding: gzip", true},
+		{"Vary: accept", true},
+	} {
+		if got := stripMarks(redactUnlessVerbatim(c.line)); (got == c.line) != c.kept {
+			t.Errorf("%q kept=%v, want %v (%q)", c.line, got == c.line, c.kept, got)
 		}
 	}
 }
