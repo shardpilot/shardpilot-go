@@ -300,6 +300,27 @@ jobs:
       - name: Every lane B refusal still fires
         run: ./scripts/test_lane_b_ratchet.sh
 
+  prepush-bare-exemption:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # The pre-push hook is not otherwise exercised by CI, and its one exemption
+      # from the checkout-owner guard is decided by a config parser that had been
+      # corrected three times by the shape of whichever case arrived. This builds
+      # real repositories and compares that parser's verdict with git's own
+      # `--is-bare-repository`, so the question asked is "is it ever more
+      # permissive than git", not "does it handle the last example".
+      #
+      # It lifts the hook's own lines rather than copying them, and refuses if the
+      # markers it slices between have moved -- a scene that silently tests
+      # nothing is the failure the lane B ratchet exists for, one file over.
+      - name: The bare-repository exemption is never wider than git's answer
+        run: ./scripts/test_prepush_bare_exemption.sh
+
   public-surface:
     runs-on: ubuntu-latest
     timeout-minutes: 5

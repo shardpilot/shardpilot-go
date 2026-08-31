@@ -582,13 +582,87 @@ if [ -n "$wt_common" ]; then
     # structural difference: a bare repository writes `bare = true`, and a
     # `--separate-git-dir` one writes `bare = false` and no `core.worktree` at all,
     # so the two are otherwise identical from inside the git directory.
+    #
+    # ⚠ AND THE THIRD CORRECTION TO THIS PARSER IS THE SIGNAL, NOT THE THIRD
+    # EXAMPLE. Two rounds narrowed it by the shape of the case that had arrived --
+    # first folding the names, then matching them WHOLE instead of by prefix -- and
+    # a third arrived: an `[include]` file overriding `core.bare` to false, which
+    # git honours and this read straight past, taking the exemption on a repository
+    # git calls non-bare (shardpilot/shardpilot-go#79 review). Adding an
+    # `[include]` case would be the third narrowing of one predicate, and this file
+    # already records what that means.
+    #
+    # The subject is not "which spellings must I skip". It is: THIS EXEMPTION MAY
+    # BE TAKEN ONLY FROM A FILE THIS PARSER ACCOUNTED FOR IN FULL. The exemption
+    # WIDENS what is allowed, so being more permissive than git is a hole and being
+    # stricter is only an inconvenience. So the parse now reports whether every
+    # line it passed was one whose effect it reproduces, and the exemption is
+    # declined otherwise -- which cannot be outrun by a git version that grows
+    # another construct.
+    #
+    # ⚠ MEASURED AGAINST GIT, NOT AGAINST MY EXPECTATIONS, over fifteen configs
+    # built and then handed to `git rev-parse --is-bare-repository`. The reviewer
+    # named ONE escape; the run found THREE: `[include]`, `[includeIf]`, and a
+    # same-line `[core] bare = false`, which git honours and the old loop skipped
+    # because it read any line starting with `[` as a section header and nothing
+    # else. All three are now declined, and the ordinary bare repositories --
+    # plain, `[Core]`-folded, comment-carrying, `[remote "origin"]`-carrying,
+    # CRLF, and `[core "sub"]`-carrying -- still take the exemption.
+    #
+    # Two things this deliberately does NOT do. It does not fold the VALUE, so
+    # `bare = "true"` and `bare = TRUE` decline where git accepts; that is the safe
+    # direction and widening it is a separate decision. And external config layering
+    # is not read -- measured as irrelevant here: a global `core.bare` neither makes
+    # a non-bare repository bare nor a bare one non-bare.
+    # >>> BARE-EXEMPTION PARSE. scripts/test_prepush_bare_exemption.sh lifts the
+    # lines between these two markers and runs them against real repositories,
+    # comparing the verdict with git's own `--is-bare-repository`. It tests THIS
+    # text, not a copy of it: a fixture that re-assembles the logic in its own body
+    # passes while the site does something else, which this repository has paid for
+    # five times. Moving or renaming the markers makes that test refuse.
     wt_is_bare=no
+    wt_cfg_modelled=yes
     if [ -r "$wt_common/config" ]; then
       wt_sect=""
       while IFS= read -r wt_cl || [ -n "$wt_cl" ]; do
         wt_ct="${wt_cl#"${wt_cl%%[![:space:]]*}"}"
+        # Trailing whitespace off as well, so "a section header ALONE on its line"
+        # is decidable -- and CR with it, because a config written on another
+        # platform is still git's to read.
+        while :; do
+          case "$wt_ct" in
+            *" "|*"$TAB"|*"$CR") wt_ct="${wt_ct%?}" ;;
+            *) break ;;
+          esac
+        done
         case "$wt_ct" in
-          "["*) wt_sect="$wt_ct" ;;
+          ""|"#"*|";"*) continue ;;
+        esac
+        # A value continued onto the next line makes the NEXT line part of this
+        # one, which this loop does not follow.
+        case "$wt_ct" in
+          *\\) wt_cfg_modelled=no; continue ;;
+        esac
+        case "$wt_ct" in
+          "["*"]") wt_sect="$wt_ct"
+            # The one construct in git's grammar whose effect is ANOTHER WHOLE
+            # CONFIG. Not a spelling to skip: a file this parser has not read
+            # cannot be a file it accounted for. The names are matched exactly,
+            # so an ordinary `[includes]` section is still modelled.
+            case "$wt_sect" in
+              # `include` WHOLE, so an ordinary `[includes]` is still modelled --
+              # the lesson two rounds up. `includeif` by PREFIX, because it always
+              # carries a subsection and the two spellings of that subsection are
+              # not the subject: over-matching here only DECLINES an exemption,
+              # which is the direction that costs nothing.
+              "["[Ii][Nn][Cc][Ll][Uu][Dd][Ee]"]"|"["[Ii][Nn][Cc][Ll][Uu][Dd][Ee][Ii][Ff]*)
+                wt_cfg_modelled=no ;;
+            esac
+            ;;
+          # A header with a value after the closing bracket -- `[core] bare = false`,
+          # which git reads as both. The old loop consumed the whole line as a
+          # section name and never saw the assignment.
+          "["*) wt_cfg_modelled=no ;;
           # ⚠ AN EXACT NAME, NOT A PREFIX. Git config names fold but they are NAMES:
           # `bareRepository = true` standing after the ordinary `bare = false` was
           # read as `core.bare` by this pattern, and the repository was marked bare --
@@ -617,7 +691,7 @@ if [ -n "$wt_common" ]; then
               *) continue ;;
             esac
             case "$wt_sect" in
-              "["[Cc][Oo][Rr][Ee]"]"*)
+              "["[Cc][Oo][Rr][Ee]"]")
                 wt_cv="${wt_ct#*=}"
                 wt_cv="${wt_cv#"${wt_cv%%[![:space:]]*}"}"
                 case "$wt_cv" in
@@ -627,11 +701,18 @@ if [ -n "$wt_common" ]; then
                 ;;
             esac
             ;;
+          # Neither a header nor an assignment. Git may or may not accept it; what
+          # matters here is that this loop did not reproduce its effect.
+          *) wt_cfg_modelled=no ;;
         esac
       done < "$wt_common/config"
-      unset wt_sect wt_cl wt_ct wt_cv
+      unset wt_sect wt_cl wt_ct wt_cv wt_cn
     fi
-    if [ "$wt_owns" = no ] && [ "$wt_is_bare" = yes ]; then
+    # <<< BARE-EXEMPTION PARSE
+    # ⚠ AND THE EXEMPTION IS THE PARSE'S TO GIVE ONLY WHEN THE PARSE WAS COMPLETE.
+    # `wt_is_bare=yes` from a file carrying a construct this loop skipped is a
+    # guess, and this is the guard that decides before any command runs.
+    if [ "$wt_owns" = no ] && [ "$wt_is_bare" = yes ] && [ "$wt_cfg_modelled" = yes ]; then
       wt_owns=yes
     fi
     if [ "$wt_owns" = no ]; then
@@ -640,6 +721,12 @@ if [ -n "$wt_common" ]; then
       printf '  PATH entry inside that checkout cannot be ruled out -- and this is\n' >&2
       printf '  decided before any command is run, so nothing from it has executed.\n' >&2
       printf '  Push from the main checkout, or keep the git directory inside it.\n' >&2
+      if [ "$wt_is_bare" = yes ] && [ "$wt_cfg_modelled" = no ]; then
+        printf '  This config says bare, but it also carries a construct this gate\n' >&2
+        printf '  does not read -- an include, a continued line, or a setting beside\n' >&2
+        printf '  a section header -- so what git makes of it is not knowable here,\n' >&2
+        printf '  and the bare-repository exemption is not taken on a guess.\n' >&2
+      fi
       exit 2
     fi
   fi
