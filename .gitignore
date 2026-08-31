@@ -39,3 +39,6 @@ go.work.sum
 # a future `internal/bench/` or `pkg/bench/` package would be silently
 # untracked — files missing from commits with no error anywhere.
 /bench/
+
+# the harness binary, built in place by `go build ./examples/experiments/`
+/experiments
