@@ -552,6 +552,41 @@ case "$(idx_detect "$idx_after")" in
   *) printf 'this hook: the invoking index is untouched [%s].\n' "$idx_after" ;;
 esac
 
+# ---- the executable-key enumeration covers the names git allows ---------------
+#
+# The enumeration derives which config keys to neutralise from `git config --list`,
+# and its pattern has now been wrong about the NAME three times: the suffix list,
+# then a glob character, then a leading dot. `filter..x.clean` is a legal key --
+# `.gitattributes` saying `filter=.x` selects it, and git runs it -- and `[^.]+`
+# cannot match an empty first component (shardpilot/shardpilot-go#79 review).
+#
+# ⚠ ASSERTED ON THE PATTERN, NOT THROUGH A PUSH. I could not reproduce this one end
+# to end: the hook refuses a dirty tree before reaching its diff, and on a clean
+# tree the clean driver is not invoked. What IS measured is that the pattern omitted
+# the key and now includes it, which is the thing that was wrong. Said here rather
+# than implied by a green push that proves something else.
+keyre="$(grep -o '\^(core\\.fsmonitor[^'"'"']*' "$hook" | head -1)"
+if [ -z "$keyre" ]; then
+  echo "REFUSING: the executable-key pattern was not found in the hook, so what it" >&2
+  echo "  matches could not be checked." >&2
+  exit 2
+fi
+kre_fail=0
+must_match='filter..x.clean filter.lfs.clean filter.x*.clean diff.dx.textconv merge.m.driver core.fsmonitor'
+must_miss='diff.algorithm diff.colorMoved filter.x core.editor'
+for k in $must_match; do
+  printf '%s\n' "$k" | grep -Eq "$keyre" || {
+    echo "FAIL: the executable-key pattern does not match $k, so that driver is left live" >&2
+    kre_fail=1; }
+done
+for k in $must_miss; do
+  if printf '%s\n' "$k" | grep -Eq "$keyre"; then
+    echo "FAIL: the executable-key pattern matches $k, which configures no program" >&2
+    kre_fail=1
+  fi
+done
+[ "$kre_fail" -eq 0 ] && printf '\nthis hook: the executable-key pattern covers dotted, globbed and ordinary names.\n'
+
 # ---- the scanner child is neutralised too ------------------------------------
 #
 # ⚠ `-c` REACHES ONLY THE COMMANDS THIS FILE LAUNCHES. The scanner is a separate
@@ -693,4 +728,4 @@ printf '\n%d gitfile read(s) found, %d still line-oriented.\n' "$gf_total" "$gf_
 printf '%d checkout-root case(s), %d failure(s).\n' "$itotal" "$ifail"
 printf '%d case(s) judged, %d failure(s); %d normal-form case(s), %d failure(s).\n' \
   "$total" "$failures" "$ntotal" "$nfail"
-[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] && [ "$idx_fail" -eq 0 ] && [ "$inv_fail" -eq 0 ] && [ "$chl_fail" -eq 0 ] && [ "$bp_fail" -eq 0 ] || exit 1
+[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] && [ "$idx_fail" -eq 0 ] && [ "$inv_fail" -eq 0 ] && [ "$chl_fail" -eq 0 ] && [ "$bp_fail" -eq 0 ] && [ "$kre_fail" -eq 0 ] || exit 1

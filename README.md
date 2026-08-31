@@ -364,26 +364,27 @@ done < "$wp" &&
 { { test "$b" = true &&
       { git show HEAD:.githooks/pre-push > "$h/.pre-push.new" &&
         git show HEAD:scripts/check_public_surface.sh > "$h/.check_public_surface.sh.new"; }; } ||
-  { cp .githooks/pre-push "$h/.pre-push.new" &&
-    cp scripts/check_public_surface.sh "$h/.check_public_surface.sh.new"; }; } &&
+  { cp "$t/.githooks/pre-push" "$h/.pre-push.new" &&
+    cp "$t/scripts/check_public_surface.sh" "$h/.check_public_surface.sh.new"; }; } &&
 chmod +x "$h/.pre-push.new" "$h/.check_public_surface.sh.new" ||
   { rm -f "$h/.pre-push.new" "$h/.check_public_surface.sh.new"; exit 1; } &&
 mv "$h/.pre-push.new" "$h/pre-push" &&
 mv "$h/.check_public_surface.sh.new" "$h/check_public_surface.sh" &&
-{ git config --local core.hooksPath "$h" ||
-  { rm -f "$h/pre-push" "$h/check_public_surface.sh"
-    echo "activation failed; the published hooks were rolled back" >&2; exit 1; }; } &&
+sp_rollback(){ rm -f "$h/pre-push" "$h/check_public_surface.sh"
+  git config --local --unset core.hooksPath 2>/dev/null || true
+  echo "installation failed; the published hooks were rolled back" >&2; exit 1; } &&
+{ git config --local core.hooksPath "$h" || sp_rollback; } &&
 while IFS= read -r -d "" w; do
   test "$(git -C "$w" config --bool extensions.worktreeConfig 2>/dev/null || echo false)" = true &&
     { git -C "$w" config --worktree --unset-all core.hooksPath 2>/dev/null || true; } || true
 done < "$wp" &&
 while IFS= read -r -d "" w; do
-  gp="$(git -C "$w" rev-parse --path-format=absolute --git-path hooks && printf X)" || exit 1
+  gp="$(git -C "$w" rev-parse --path-format=absolute --git-path hooks && printf X)" || sp_rollback
   gp="${gp%X}"; gp="${gp%?}"
-  got="$(p_ "$gp")" || exit 1
+  got="$(p_ "$gp")" || sp_rollback
   got="${got%X}"
   test "$got" = "$h" ||
-    { echo "hooks still resolve elsewhere in $w: $got" >&2; exit 1; }
+    { echo "hooks still resolve elsewhere in $w: $got" >&2; sp_rollback; }
 done < "$wp" &&
 rm -f "$wt" "$wp"
 ```

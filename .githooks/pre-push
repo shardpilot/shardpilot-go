@@ -1009,6 +1009,19 @@ fi
 # bare `git diff` that carries this defect is not one of them. An override every
 # invocation inherits cannot be bypassed by adding a call site.
 #
+# ⚠ AND `[^.]+` WAS ITSELF AN ASSUMPTION ABOUT THE NAME. A subsection may begin
+# with a dot -- `filter..x.clean` is a legal key, selected by `.gitattributes` saying
+# `filter=.x` -- and `[^.]+` cannot match an empty first component, so the key was
+# omitted and the branch's program ran (shardpilot/shardpilot-go#79 review). Third
+# time in this enumeration that a shape I assumed about the NAME turned out to be
+# mine rather than git's: first the suffix list, then the glob character, now the
+# leading dot.
+#
+# `.*\..+` asks the only thing that actually matters -- the key has a subsection AND
+# a variable under it -- and says nothing about what the subsection looks like.
+# Single-component keys like `diff.algorithm` still need two dots to match and stay
+# untouched.
+#
 # ⚠ AND THE SUFFIX LIST WENT THE SAME WAY AS THE DRIVER NAMES. It read
 # `clean|smudge`, and `filter.<name>.process` -- the standard long-running form --
 # fired straight through it with `core.fsmonitor` already neutralised, measured
@@ -1024,7 +1037,7 @@ fi
 # makes reading the list a safe first step.
 unset GIT_CONFIG_COUNT 2>/dev/null || true
 sp_cfg_keys="$(git config --list --name-only 2>/dev/null |
-  grep -E '^(core\.fsmonitor|core\.alternaterefscommand|core\.gitproxy|(diff|filter|merge)\.[^.]+\..+)$' |
+  grep -E '^(core\.fsmonitor|core\.alternaterefscommand|core\.gitproxy|(diff|filter|merge)\..*\..+)$' |
   sort -u || true)"
 sp_cfg_n=0
 sp_seen=""
