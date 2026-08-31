@@ -1035,7 +1035,15 @@ fi
 #
 # `git config --list` was measured not to run any of these itself, which is what
 # makes reading the list a safe first step.
-unset GIT_CONFIG_COUNT 2>/dev/null || true
+# ⚠ AND NOTHING IS UNSET HERE ANY MORE. This line cleared `GIT_CONFIG_COUNT`, left
+# from when the neutralisation used that interface -- and a caller supplying an
+# authorization header, a credential helper or a URL rewrite through
+# `GIT_CONFIG_COUNT`/`KEY`/`VALUE` lost all of it, so a push that had authenticated
+# was refused by this gate's own `ls-remote` (shardpilot/shardpilot-go#79 review).
+# The same finding as `GIT_CONFIG_PARAMETERS` one round earlier, at the sibling
+# interface I had already stopped using. The overrides ride on `-c` and on an
+# APPENDED `GIT_CONFIG_PARAMETERS`, both of which outrank a counted entry, so
+# removing anything was never needed.
 # ⚠ `|| true` ON THE WHOLE PIPELINE TURNED EVERY FAILURE INTO AN EMPTY LIST, and an
 # empty list is indistinguishable from "no executable keys are configured" -- so a
 # failing `grep` left the drivers un-neutralised and the branch's program ran before
@@ -2552,12 +2560,34 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       # (shardpilot/shardpilot-go#79 review). Fourth place in this file where "not a
       # commit" had to be carried.
       #
-      # A FAILED PROBE IS NOT A NON-COMMIT: if the type cannot be read, `base` stays
-      # empty and the refusal below stands, which is the safe direction.
-      if [ -z "$base" ] && base_kind="$(git cat-file -t "$base_ref" 2>/dev/null)" \
-         && [ -n "$base_kind" ] && [ "$base_kind" != commit ]; then
-        base="$(git hash-object -t tree /dev/null)"
-        base_noncommit="$base_kind"
+      # ⚠ AND `cat-file -t` ON AN ANNOTATED TAG ANSWERS `tag`, WHICH IS NOT THE
+      # QUESTION. A transient failure of the peel above leaves `base` empty; the type
+      # probe then reports the OUTER object, so a tag whose target is a perfectly good
+      # commit was classified non-commit and the EMPTY TREE was substituted -- running
+      # the scan with the lane B comparative check disabled while a real baseline
+      # existed (shardpilot/shardpilot-go#79 review). The pushed-tip path was given
+      # this exact repair two rounds ago and its mirror here was not; ninth instance
+      # in this file, and the second at a site adjacent to my own fix.
+      #
+      # So the type is asked of an object whose existence is proven, a tag is peeled
+      # through `^{}`, and a FAILURE of either refuses rather than being read as an
+      # answer. If it does peel to a commit, the earlier `rev-parse` failed for a
+      # reason that is not "not a commit", and that refuses too.
+      if [ -z "$base" ]; then
+        git_probe "the type of the fetched baseline $base_ref" git cat-file -t "$base_ref"
+        base_kind="$PROBE_OUT"
+        if [ "$base_kind" = tag ]; then
+          git_probe "the target type of the fetched baseline tag" git cat-file -t "$base_ref^{}"
+          base_kind="$PROBE_OUT"
+        fi
+        if [ "$base_kind" = commit ]; then
+          git_probe "the commit the fetched baseline resolves to" \
+            git rev-parse --verify --quiet "$base_ref^{commit}"
+          base="$PROBE_OUT"
+        else
+          base="$(git hash-object -t tree /dev/null)"
+          base_noncommit="$base_kind"
+        fi
       fi
       git_safe update-ref -d "$base_ref" 2>/dev/null || true
       base_ref=""
