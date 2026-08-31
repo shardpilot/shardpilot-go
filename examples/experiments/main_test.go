@@ -4319,3 +4319,73 @@ func TestTheLastRoundOfExemptionGatesAndSpans(t *testing.T) {
 		}
 	}
 }
+
+// TestTheShapeIsCheckedOnCapturedBytes: `escapeMarks` runs before `dropFraming`, so
+// an echo carrying a literal marker spelling reached the shape check with extra
+// backslashes and the equality failed -- the exemptions were disabled and the scrub
+// rewrote the schema member, producing altered JSON the marks make the guard
+// approve. I had named that as a limit that "fails closed"; it does not
+// (shardpilot/shardpilot-go#84 review).
+func TestTheShapeIsCheckedOnCapturedBytes(t *testing.T) {
+	t.Cleanup(func() {
+		suppliedValues, capturedBodyRaw = nil, ""
+		capturedBodyBytes = -1
+		requestedAppKey = ""
+	})
+	// The LITERAL four-character spelling, which is what `escapeMarks` expands -- a
+	// raw NUL is not legal inside a JSON string and would fail the decode for an
+	// unrelated reason.
+	mark := `\x00`
+	body := `{"assigned":false,"app_key":"\\x00"}`
+	requestedAppKey = mark
+	suppliedValues = []string{"assigned"}
+	capturedBodyRaw, capturedBodyBytes = body, len(body)
+	if got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n" + escapeMarks(body)))); !strings.Contains(got, "assigned") {
+		t.Errorf("the schema member was rewritten because the check saw escaped bytes: %q", got)
+	}
+	// ⚠ AND A BODY THE SDK REJECTS STILL LOSES THEM, or the fix has become "always
+	// exempt": the captured bytes are checked, not skipped.
+	bad := `{"assigned":"x"}`
+	capturedBodyRaw, capturedBodyBytes = bad, len(bad)
+	if got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\n\r\n" + bad))); strings.Contains(got, "assigned") {
+		t.Errorf("a body the SDK rejects kept its exemptions: %q", got)
+	}
+}
+
+// TestAnEmptyMintedMemberIsNotConcealment: an explicitly empty
+// `"subject_fact_key":""` is accepted by the SDK and conceals nothing -- the same
+// defect as the empty `Location:` header one surface along
+// (shardpilot/shardpilot-go#84 review).
+func TestAnEmptyMintedMemberIsNotConcealment(t *testing.T) {
+	t.Cleanup(func() { structuralSurfaces = nil })
+	for _, c := range []struct {
+		name, body string
+		refused    bool
+	}{
+		{"an empty minted member", `{"assigned":false,"subject_fact_key":""}`, false},
+		{"one with bytes", `{"assigned":false,"subject_fact_key":"sfk1_x"}`, true},
+		{"a null one", `{"assigned":false,"subject_fact_key":null}`, true},
+	} {
+		structuralSurfaces = nil
+		noteMinted(c.body)
+		if (len(structuralSurfaces) != 0) != c.refused {
+			t.Errorf("%s: refused=%v, want %v", c.name, len(structuralSurfaces) != 0, c.refused)
+		}
+	}
+}
+
+// TestTheFinalSectionSaysWhatItCannotShow: a `Connection` option naming another
+// header makes net/http remove BOTH, so the reconstruction omits a field the
+// endpoint sent and the section's prose has to say so
+// (shardpilot/shardpilot-go#84 review).
+func TestTheFinalSectionSaysWhatItCannotShow(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatalf("the scene cannot read its own subject: %v", err)
+	}
+	for _, want := range []string{"A FIELD THE PARSER CONSUMED IS NOT HERE", "header set THIS PROGRAM WAS GIVEN"} {
+		if !strings.Contains(string(src), want) {
+			t.Errorf("the response section does not qualify its claim: %q missing", want)
+		}
+	}
+}

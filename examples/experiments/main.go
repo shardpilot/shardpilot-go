@@ -590,9 +590,18 @@ func responseText(ex *exchange) string {
 	prev := capturedIncomplete
 	capturedIncomplete = ex.truncErr() != nil
 	defer func() { capturedIncomplete = prev }()
-	prevLen := capturedBodyBytes
+	prevLen, prevRaw := capturedBodyBytes, capturedBodyRaw
 	capturedBodyBytes = len(ex.body())
-	defer func() { capturedBodyBytes = prevLen }()
+	// ⚠ AND THE BYTES THEMSELVES, NOT ONLY THEIR COUNT. `escapeMarks` runs before
+	// `dropFraming`, so an echo carrying a literal `\x00` spelling reaches the shape
+	// check with extra backslashes and the equality fails -- the exemptions are
+	// disabled and the scrub rewrites `"assigned"` into a placeholder, producing
+	// altered JSON the marks make the guard approve
+	// (shardpilot/shardpilot-go#84 review). I had named this as a limit that "fails
+	// closed"; it does not -- losing exemptions CORRUPTS the body rather than merely
+	// withholding something.
+	capturedBodyRaw = string(ex.body())
+	defer func() { capturedBodyBytes, capturedBodyRaw = prevLen, prevRaw }()
 	return asCaptured(scrubSupplied(dropFraming(escapeMarks(string(ex.resp())))))
 }
 
@@ -731,7 +740,11 @@ const respSection = "## Response%s — header block re-serialised by " +
 	"HEADER block is written back out by `net/http`, which can add what it " +
 	"would send rather than what arrived — `Connection: close` appears on a " +
 	"bodyless dump and is forbidden in HTTP/2, so a header here is not " +
-	"evidence that it was received.\n\n%s\n%s\n"
+	"evidence that it was received. AND A FIELD THE PARSER CONSUMED IS NOT HERE " +
+	"AT ALL: a `Connection` option naming another header makes net/http remove " +
+	"BOTH before this recorder sees them, so a response that sent " +
+	"`Connection: close, X-Secret` is reconstructed without `X-Secret`. This " +
+	"block is the header set THIS PROGRAM WAS GIVEN.\n\n%s\n%s\n"
 
 // ── what this half cannot publish ────────────────────────────────────────────
 //
@@ -778,6 +791,10 @@ var capturedIncomplete bool
 // pass is run directly by a scene. The report path sets it, because by the time
 // `dropFraming` runs the text has been through `escapeMarks`.
 var capturedBodyBytes = -1
+
+// capturedBodyRaw is the body AS THE SDK READ IT, before this program's own mark
+// escaping. The schema checks decode it rather than the escaped text.
+var capturedBodyRaw string
 
 // The identifiers this harness ASKED FOR, kept per slot: `expEchoMatches` compares
 // each echoed member with the value THIS request put in that slot, and a flat list
@@ -1390,15 +1407,30 @@ func noteMinted(body string) string {
 			noteStructural("an unparsable body whose decoded forms could not be enumerated")
 		}
 	}
+	// ⚠ AND ONLY WHERE THE MEMBER HAS VALUE BYTES. An explicitly empty
+	// `"subject_fact_key":""` is accepted by the SDK and conceals nothing, yet a
+	// name-only check refused the capture and forced exit 4 -- the same defect as the
+	// empty `Location:` header one surface along, and the same repair
+	// (shardpilot/shardpilot-go#84 review). The refusal is about what a VALUE could
+	// hide.
+	var top map[string]json.RawMessage
+	decoded := json.Unmarshal([]byte(body), &top) == nil
 	for _, name := range topLevelMembers(body) {
-		if isMintedName(name) {
-			// ⚠ A CONSTANT, NOT THE NAME. Third site of this defect in one session: with a
-			// Unicode-folded spelling the endpoint chose, `isMintedName` accepts it and
-			// the label carried that spelling to stderr -- refusing to print the
-			// response while printing the identifier (shardpilot/shardpilot-go#84
-			// review). Every message a guard prints is an output channel.
-			noteStructural("a server-minted subject identifier")
+		if !isMintedName(name) {
+			continue
 		}
+		if decoded {
+			var v *string
+			if raw, ok := top[name]; ok && json.Unmarshal(raw, &v) == nil && v != nil && *v == "" {
+				continue
+			}
+		}
+		// ⚠ A CONSTANT, NOT THE NAME. With a Unicode-folded spelling the endpoint
+		// chose, `isMintedName` accepts it and the label would carry that spelling to
+		// stderr -- refusing to print the response while printing the identifier
+		// (shardpilot/shardpilot-go#84 review). Every message a guard prints is an
+		// output channel.
+		noteStructural("a server-minted subject identifier")
 	}
 	return body
 }
@@ -1873,8 +1905,13 @@ func dropFraming(dump string) string {
 		if capturedBodyBytes >= 0 {
 			exemptBodyLen = capturedBodyBytes
 		}
+		// The SDK decoded the captured bytes; so does this.
+		shapeBody := exemptBody
+		if capturedBodyRaw != "" {
+			shapeBody = capturedBodyRaw
+		}
 		exemptions = topLevelExemptions(out[0], exemptBodyLen,
-			sdkWouldParseAssignment(exemptBody), sdkWouldReadErrorText(exemptBody))
+			sdkWouldParseAssignment(shapeBody), sdkWouldReadErrorText(shapeBody))
 	}
 	if bodyStart < 0 {
 		return strings.Join(out, "\n")
