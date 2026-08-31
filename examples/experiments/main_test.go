@@ -6782,6 +6782,15 @@ func TestADirectiveArgumentBelongsToItsField(t *testing.T) {
 		{"Allow: GET=123456", false},
 		{"Content-Encoding: gzip=123456", false},
 		{"Vary: accept=123456", false},
+		// ⚠ AND A REGISTERED TOKEN IS NOT A LICENCE EITHER. Disabling NUMERIC
+		// arguments described the kind of the example that had arrived; the next one
+		// was `Allow: GET=POST`, admitted by the branch that accepted any registered
+		// token as an argument, so a supplied `POST` was published with an empty
+		// refusal ledger (shardpilot/shardpilot-go#85 review). A third condition
+		// would have described the third example. The rule is the DIRECTIVE's.
+		{"Allow: GET=POST", false},
+		{"Cache-Control: no-cache=POST", false},
+		{"Cache-Control: max-age=abc", false},
 		// ⚠ AND THE FIELD THAT DOES HAVE ARGUMENTS KEEPS THEM, or the repair has
 		// traded a published identifier for a capture that cannot show a max-age.
 		{"Cache-Control: max-age=60", true},
@@ -6792,5 +6801,32 @@ func TestADirectiveArgumentBelongsToItsField(t *testing.T) {
 		if got := stripMarks(redactUnlessVerbatim(c.line)); (got == c.line) != c.kept {
 			t.Errorf("%q kept=%v, want %v (%q)", c.line, got == c.line, c.kept, got)
 		}
+	}
+}
+
+// TestANonCanonicalCodingKeepsItsMeaning: with a supplied `IDENTITY`,
+// `Content-Encoding: IDENTITY` -- which this path accepts as readable -- was
+// rewritten to `Content-Encoding: redacted-8-chars` while the captured body stayed
+// plain, so the published field declared a coding no consumer can apply and the
+// capture contradicted itself (shardpilot/shardpilot-go#85 review). The canonical
+// spelling is THIS program's text and means what the arrived spelling meant.
+func TestANonCanonicalCodingKeepsItsMeaning(t *testing.T) {
+	t.Cleanup(func() { suppliedValues, structuralSurfaces = nil, nil })
+	suppliedValues, structuralSurfaces = []string{"IDENTITY"}, nil
+	got := stripMarks(scrubSupplied(dropFraming("HTTP/1.1 200 OK\r\nContent-Encoding: IDENTITY\r\n\r\nbody")))
+	if !strings.Contains(got, "Content-Encoding: identity") {
+		t.Errorf("a no-op coding lost its meaning: %q", got)
+	}
+	// ⚠ AND NOT WHERE THE CANONICAL SPELLING IS ITSELF SUPPLIED. Measured: with
+	// `identity` supplied the guard reports it as a survivor and nothing is
+	// publishable, so substituting it would trade a misleading capture for no
+	// capture at all. That spelling stays CAPTURED rather than vouched.
+	suppliedValues, structuralSurfaces = []string{"identity"}, nil
+	raw := dropFraming("HTTP/1.1 200 OK\r\nContent-Encoding: IDENTITY\r\n\r\nbody")
+	if err := assertNoLeak(asCaptured(raw)); err != nil {
+		t.Errorf("the capture became unpublishable: %v", err)
+	}
+	if strings.Contains(stripMarks(scrubSupplied(raw)), "Content-Encoding: identity") {
+		t.Errorf("the supplied canonical spelling was published: %q", stripMarks(scrubSupplied(raw)))
 	}
 }

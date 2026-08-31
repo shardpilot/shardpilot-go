@@ -2127,13 +2127,13 @@ var verbatimHeaders = map[string]func(string) bool{
 	"content-length":    isDigits,
 	"age":               isDigits,
 	"content-type":      isMediaTypeWithoutParameters,
-	"content-encoding":  isDirectiveList("content-encoding", false),
-	"transfer-encoding": isDirectiveList("transfer-encoding", false),
-	"connection":        isDirectiveList("connection", false),
-	"vary":              isDirectiveList("vary", false),
-	"accept-ranges":     isDirectiveList("accept-ranges", false),
-	"allow":             isDirectiveList("allow", false),
-	"cache-control":     isDirectiveList("cache-control", true),
+	"content-encoding":  isDirectiveList("content-encoding"),
+	"transfer-encoding": isDirectiveList("transfer-encoding"),
+	"connection":        isDirectiveList("connection"),
+	"vary":              isDirectiveList("vary"),
+	"accept-ranges":     isDirectiveList("accept-ranges"),
+	"allow":             isDirectiveList("allow"),
+	"cache-control":     isDirectiveList("cache-control"),
 }
 
 // ows trims exactly what HTTP calls optional whitespace: space and tab.
@@ -2264,7 +2264,7 @@ var registeredDirectives = map[string]map[string]bool{
 // which is why fixing only the canonical-spelling function changed nothing.
 func directiveFolds(field string) bool { return field != "allow" }
 
-func walkDirectives(field, v string, numericArg bool) bool {
+func walkDirectives(field, v string, allowArgs bool) bool {
 	known := registeredDirectives[field]
 	key := func(x string) string {
 		if directiveFolds(field) {
@@ -2285,11 +2285,23 @@ func walkDirectives(field, v string, numericArg bool) bool {
 			return false
 		}
 		if hasArg {
-			a := ows(arg)
-			if known[key(a)] {
-				continue
+			// ⚠ WHOSE PROPERTY IS THIS. Two rounds narrowed this branch by the KIND of
+			// the example that arrived: first it admitted any argument, then any
+			// NUMERIC one was disabled for these fields, and the next example was
+			// `Allow: GET=POST` -- a registered token, admitted by the unconditional
+			// line that used to stand here, so a supplied `POST` was published with an
+			// empty refusal ledger (shardpilot/shardpilot-go#85 review). A third
+			// condition would have described the third example.
+			//
+			// A field whose grammar has no arguments accepts NONE, and a directive
+			// that defines no argument accepts none either. That is a property of the
+			// grammar, so it is stated once, per directive, in `directiveArgs` -- not
+			// as a list of argument kinds to forbid one at a time.
+			if !allowArgs {
+				return false
 			}
-			if !numericArg || !isDigits(a) {
+			rule := directiveArgs[field][key(ows(name))]
+			if rule == nil || !rule(ows(arg)) {
 				return false
 			}
 		}
@@ -2306,8 +2318,8 @@ func walkDirectives(field, v string, numericArg bool) bool {
 // then skip if it is a supplied identifier (shardpilot/shardpilot-go#85 review).
 // Those three grammars have no arguments at all; `Cache-Control` is the one here
 // that does (`max-age=60`), so it is the one that gets them.
-func isDirectiveList(field string, numericArg bool) func(string) bool {
-	return func(v string) bool { return walkDirectives(field, v, numericArg) }
+func isDirectiveList(field string) func(string) bool {
+	return func(v string) bool { return walkDirectives(field, v, true) }
 }
 
 // registryOnlyValue reports whether every token in an admitted value is a member
@@ -2832,6 +2844,22 @@ func redactUnlessVerbatim(line string) string {
 			// Each token is replaced where it stands, so `application/JSON` becomes
 			// `application/redacted-4-chars` -- still a media type, and the part the
 			// endpoint did not choose survives.
+			// ⚠ AND AN ADMITTED VALUE HAS A SEMANTICS-PRESERVING REPLACEMENT; A LENGTH
+			// IS NOT IT. With a supplied `IDENTITY`, `Content-Encoding: IDENTITY` --
+			// which this path accepts as readable -- became
+			// `Content-Encoding: redacted-8-chars` while the captured body stayed
+			// plain, so the published field declared a coding no consumer can apply
+			// and the capture contradicted itself (shardpilot/shardpilot-go#85
+			// review). The canonical spelling is THIS program's text, not the
+			// endpoint's, and it means what the arrived spelling meant.
+			//
+			// ⚠ UNLESS THE CANONICAL SPELLING IS ITSELF SUPPLIED. Measured: with
+			// `IDENTITY` supplied the guard passes `identity`, and with `identity`
+			// supplied it reports a survivor and nothing is publishable -- so the
+			// substitution is taken only where the scrub would leave it standing.
+			if can := canonicalAdmitted(name, raw); can != raw && scrubSuppliedRaw(can) == can {
+				return name + ":" + strings.Replace(value, raw, marked(can), 1) + cr
+			}
 			out := raw
 			for _, v := range suppliedValues {
 				out = replaceTokenWith(out, v, tokenPlaceholder(v), isWordByte)
@@ -2971,4 +2999,25 @@ func authorityIsHostShaped(a string) bool {
 		}
 	}
 	return true
+}
+
+// directiveArgs states, per field, which of ITS directives take an argument and what
+// the argument must be. A field absent from this map has an argument-free grammar,
+// and a directive absent from its field's entry takes no argument.
+//
+// ⚠ THIS IS THE SUBJECT, AND THE PREVIOUS TWO ANSWERS WERE NOT. "Numeric arguments
+// are off for these fields" describes a KIND of argument; the grammar's rule is
+// about the DIRECTIVE. `Cache-Control` is the only field among those admitted here
+// whose directives take arguments, and only these take them, each a delta-seconds
+// (RFC 9111). `no-cache` and `private` take a quoted field list, which never reaches
+// this walk -- a value containing `"` is rejected above.
+var directiveArgs = map[string]map[string]func(string) bool{
+	"cache-control": {
+		"max-age":                isDigits,
+		"s-maxage":               isDigits,
+		"stale-while-revalidate": isDigits,
+		"stale-if-error":         isDigits,
+		"min-fresh":              isDigits,
+		"max-stale":              isDigits,
+	},
 }
