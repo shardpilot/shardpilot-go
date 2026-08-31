@@ -1749,7 +1749,22 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       # created-ref push for "no default branch" -- while the exact baseline was in the
       # advertisement all along (shardpilot/shardpilot-go#79 review). No guess is
       # needed when the object id is stated.
-      ls_head="$(git ls-remote --symref -- "$dest" HEAD 2>/dev/null)" || ls_head=""
+      # ⚠ AND A FAILED PROBE IS NOT AN ANSWER, which the enumeration forty lines down
+      # already knows about itself. `|| ls_head=""` turned a transient failure into an
+      # empty advertisement, and empty reads as "this destination advertises no default
+      # branch" -- so every created-ref push was refused for a fact the probe never
+      # established (shardpilot/shardpilot-go#79 review). The later non-symref
+      # enumeration cannot recover it: `--symref` is the option that shows the
+      # underlying ref. Same pattern as `ls_rc`, at the probe written before it.
+      ls_head_rc=0
+      ls_head="$(git ls-remote --symref -- "$dest" HEAD 2>/dev/null)" || ls_head_rc=$?
+      if [ "$ls_head_rc" -ne 0 ]; then
+        printf 'REFUSING: could not read the HEAD advertisement of %s (git exited %s).\n' "$safe_dest" "$ls_head_rc" >&2
+        printf '  A probe that failed prints nothing, and nothing here reads as "this\n' >&2
+        printf '  destination advertises no default branch" -- which would refuse the\n' >&2
+        printf '  push for a fact that was never established.\n' >&2
+        exit 2
+      fi
       branch_ref="$(printf '%s\n' "$ls_head" \
         | awk '$1=="ref:" && $3=="HEAD" && !seen {print $2; seen=1}')"
       detached_head=""
@@ -2371,7 +2386,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
       if git cat-file -e "$base^{commit}" 2>/dev/null; then
         scan_target="$base"
       elif [ -n "${branch:-}" ] &&
-           scan_target="$(git rev-parse --verify --quiet "refs/remotes/origin/$branch^{commit}" 2>/dev/null)" &&
+           scan_target="$(git rev-parse --verify --quiet "refs/remotes/$remote_name/$branch^{commit}" 2>/dev/null)" &&
            [ -n "$scan_target" ]; then
         # The remote-tracking tip of the destination's default branch: published
         # content, already here, no network. Used only as the SCAFFOLD -- the ratchet

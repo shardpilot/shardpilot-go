@@ -312,6 +312,7 @@ No Makefile — standard Go tooling.
 
 ```
 p_(){ x="$(cd -- "$1" && pwd -P && printf X)" || return 1; x="${x%X}"; printf '%sX' "${x%?}"; } &&
+NL="$(printf '\nX')" && NL="${NL%X}" &&
 g="$(git rev-parse --git-common-dir && printf X)" && g="${g%X}" && g="${g%?}" &&
 t="$(git rev-parse --show-toplevel && printf X)" && t="${t%X}" && t="${t%?}" &&
 h="$(p_ "$g")" && gr="${h%X}" && h="${h%X}/hooks" &&
@@ -335,7 +336,7 @@ while IFS= read -r -d "" rec; do
   case "$rec" in worktree\ *)
     r="${rec#worktree }" && printf '%s\0' "$r" &&
     pr="${r%/*}" &&
-    { test ! -f "$pr/.git" || { IFS= read -r gl < "$pr/.git"; case "$gl" in "gitdir: $r") printf '%s\0' "$pr" ;; esac; }; } || exit 1 ;;
+    { test ! -f "$pr/.git" || { gl=""; IFS= read -r -d "" gl < "$pr/.git" || true; gl="${gl%$NL}"; case "$gl" in "gitdir: $r") printf '%s\0' "$pr" ;; esac; }; } || exit 1 ;;
   esac
 done < "$wt" > "$wp" &&
 while IFS= read -r -d "" r; do
