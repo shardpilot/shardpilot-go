@@ -2805,15 +2805,17 @@ func TestWrappedCandidateAssemblyIsLinear(t *testing.T) {
 	b.WriteString("x ZGVmZ2g=")
 	in := b.String()
 
-	start := time.Now()
-	got := wrappedBase64Candidates(in)
-	elapsed := time.Since(start)
+	// ⚠ ALLOCATION, NOT WALL CLOCK -- see TestVouchedNamesAreMarkedInOnePass. The
+	// defect is a quadratic COPY, so bytes allocated is what it is made of, and that
+	// number does not change with the speed of the runner. Measured at 1 MiB here;
+	// the bound is 32.
+	var got []string
+	if mib := allocatedMiB(func() { got = wrappedBase64Candidates(in) }); mib > 32 {
+		t.Fatalf("assembling one candidate over %d lines allocated %d MiB: that is the quadratic copy", 40000, mib)
+	}
 
 	if len(got) == 0 {
 		t.Fatal("no candidate was assembled, so the scene measured an empty loop")
-	}
-	if elapsed > 500*time.Millisecond {
-		t.Fatalf("assembling one candidate over %d lines took %v: that is the quadratic copy", 40000, elapsed)
 	}
 	if decodeWork == 0 {
 		t.Fatal("the assembly charged nothing to the decode budget")
@@ -3304,15 +3306,18 @@ func TestBodyRedactionIsLinear(t *testing.T) {
 	b.WriteString("]}")
 	body := b.String()
 
-	start := time.Now()
-	got := redactUnaccountedJSONValues(body, assignmentTopLevel, "HTTP/1.1 200 OK")
-	elapsed := time.Since(start)
+	// ⚠ ALLOCATION, NOT WALL CLOCK -- the per-span rebuild copies the whole body per
+	// value, and bytes allocated counts exactly that without asking how fast the
+	// machine is. Measured at 20 MiB here; the bound is 64.
+	var got string
+	if mib := allocatedMiB(func() {
+		got = redactUnaccountedJSONValues(body, assignmentTopLevel, "HTTP/1.1 200 OK")
+	}); mib > 64 {
+		t.Fatalf("redacting %d values allocated %d MiB: that is the per-span rebuild", 30000, mib)
+	}
 
 	if !strings.Contains(got, "redacted-4-chars") {
 		t.Fatalf("nothing was redacted, so the scene measured an empty walk: %.60q", got)
-	}
-	if elapsed > 500*time.Millisecond {
-		t.Fatalf("redacting %d values took %v: that is the per-span rebuild", 30000, elapsed)
 	}
 }
 
@@ -4791,17 +4796,30 @@ func TestTheReasonValuesAreTheSDKsOwn(t *testing.T) {
 //
 // Measured on this machine at 30,000 duplicate canonical members in a ~510 KB
 // body — inside the accepted ~1 MB response limit, and after the network deadline
-// has stopped bounding anything: 2.694s splicing, 137ms with the builder. The
-// bound below is 500ms, which is a measurement with room rather than a guess.
+// has stopped bounding anything: 2.694s splicing, 137ms with the builder.
+//
+// ⚠ AND THE BOUND IS ALLOCATION, NOT WALL CLOCK. It was 500 ms, "a measurement
+// with room rather than a guess" — and it was still a measurement of THIS machine.
+// On a slower or shared runner the same correct code failed 4 of 5 runs at
+// 524–582 ms, which makes `go test ./examples/experiments/...` report a defect that
+// is not in the tree (shardpilot/shardpilot-go#85 review). A threshold whose
+// verdict depends on who runs it is not a scene, however carefully it was derived.
+//
+// The property is ONE PASS, and the defect was a rebuild per span: quadratic in
+// BYTES COPIED, which is what a splice per member costs and what a builder does
+// not. Allocation counts those bytes and does not care how fast the machine is —
+// the splice allocates on the order of n × len(body) (tens of gigabytes here), the
+// builder a few multiples of the body. 64 MiB sits four orders of magnitude below
+// the defect and comfortably above the repair.
 func TestVouchedNamesAreMarkedInOnePass(t *testing.T) {
 	suppliedValues = nil
 	t.Cleanup(func() { suppliedValues = nil })
 	const n = 30000
 	body := "{" + strings.TrimSuffix(strings.Repeat(`"assigned":false,`, n), ",") + "}"
-	start := time.Now()
-	got := redactMintedBody(body, assignmentTopLevel)
-	if d := time.Since(start); d > 500*time.Millisecond {
-		t.Errorf("marking %d vouched names took %v; the splice it replaced took 2.694s and the builder 137ms", n, d)
+	var got string
+	if mib := allocatedMiB(func() { got = redactMintedBody(body, assignmentTopLevel) }); mib > 64 {
+		t.Errorf("marking %d vouched names allocated %d MiB; a splice per member copies the whole "+
+			"body each time and a single pass does not", n, mib)
 	}
 	if strings.Count(got, genMark) < 2*n {
 		t.Errorf("the names were not all marked: %d mark bytes for %d names", strings.Count(got, genMark), n)
@@ -7357,6 +7375,83 @@ func TestANonCanonicalCollisionKeepsItsGrammar(t *testing.T) {
 				t.Errorf("a repairable collision was refused: %q", refusalLedger())
 			}
 		})
+	}
+}
+
+// TestEveryFoldedTokenKeepsItsGrammar is the containing unit this shape finally
+// got. Four rounds running, one sentence: declining to vouch a spelling is not
+// declining to keep its grammar. It was repaired at the redirect scheme, the cookie
+// attribute name, the admitted header value and the media type — each where it was
+// shown — and each round brought another member. The rule is one function now, and
+// this table is the population rather than the last example.
+//
+// The last two rows were not named by any review. They were found by asking which
+// other tokens in this file fold, once the flag was shown.
+func TestEveryFoldedTokenKeepsItsGrammar(t *testing.T) {
+	t.Cleanup(func() { suppliedValues, structuralSurfaces, accountedSurfaces = nil, nil, nil })
+	for _, c := range []struct{ name, supplied, raw, want, reject string }{
+		{"the response field name", "CONTENT-TYPE",
+			"HTTP/1.1 200 OK\r\nCONTENT-TYPE: application/json\r\n\r\n{}",
+			"Content-Type: application/json", "redacted-12-chars:"},
+		{"a valueless cookie flag", "SECURE",
+			"HTTP/1.1 200 OK\r\nSet-Cookie: a=b; SECURE\r\n\r\n",
+			"; Secure", "; redacted-6-chars"},
+		{"another valueless flag", "HTTPONLY",
+			"HTTP/1.1 200 OK\r\nSet-Cookie: a=b; HTTPONLY\r\n\r\n",
+			"; HttpOnly", "; redacted-8-chars"},
+		{"a cookie attribute name", "PATH",
+			"HTTP/1.1 200 OK\r\nSet-Cookie: a=b; PATH=/x\r\n\r\n",
+			"; Path=", "; redacted-4-chars="},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			suppliedValues, structuralSurfaces, accountedSurfaces = []string{c.supplied}, nil, nil
+			got := stripMarks(scrubSupplied(dropFraming(escapeMarks(c.raw))))
+			if strings.Contains(got, c.reject) {
+				t.Errorf("a placeholder its own grammar rejects was published: %q", got)
+			}
+			if !strings.Contains(got, c.want) {
+				t.Errorf("the canonical spelling was not substituted: %q", got)
+			}
+			if len(refusalLedger()) != 0 {
+				t.Errorf("a repairable collision was refused: %q", refusalLedger())
+			}
+		})
+	}
+
+	// And the edge, on the site the review named: when the canonical spelling is
+	// itself supplied there is nothing semantics-preserving left, and the capture
+	// must be refused rather than published with an empty ledger.
+	suppliedValues, structuralSurfaces, accountedSurfaces =
+		[]string{"CONTENT-TYPE", "Content-Type"}, nil, nil
+	dropFraming(escapeMarks("HTTP/1.1 200 OK\r\nCONTENT-TYPE: application/json\r\n\r\n{}"))
+	if len(refusalLedger()) == 0 {
+		t.Fatal("no spelling was left and the field name was published anyway")
+	}
+}
+
+// TestAnEmptyRegisteredValueStaysEmpty: redaction exists to replace ENDPOINT bytes,
+// and an empty value has none. Routed through the generic prose rule,
+// `Content-Encoding:` was published as `Content-Encoding: <redacted, 0 chars>` with
+// an empty ledger — an artifact declaring a coding no consumer can apply, about a
+// response that declared none.
+func TestAnEmptyRegisteredValueStaysEmpty(t *testing.T) {
+	t.Cleanup(func() { suppliedValues, structuralSurfaces, accountedSurfaces = nil, nil, nil })
+	suppliedValues, structuralSurfaces, accountedSurfaces = nil, nil, nil
+	got := stripMarks(dropFraming(escapeMarks(
+		"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding:\r\n\r\n{\"a\":1}")))
+	if strings.Contains(got, "redacted, 0 chars") {
+		t.Errorf("a value with no bytes was replaced by a placeholder: %q", got)
+	}
+	if !strings.Contains(got, "Content-Encoding:\r\n") {
+		t.Errorf("the empty value the endpoint sent was not preserved: %q", got)
+	}
+	// A NON-empty value on the same field still goes through redaction, so this is
+	// not "stop redacting this header".
+	structuralSurfaces, accountedSurfaces = nil, nil
+	full := stripMarks(dropFraming(escapeMarks(
+		"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Thing: server-secret\r\n\r\n{\"a\":1}")))
+	if strings.Contains(full, "server-secret") {
+		t.Errorf("a non-empty endpoint value stopped being redacted: %q", full)
 	}
 }
 

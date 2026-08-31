@@ -549,11 +549,7 @@ func vouchScheme(line string) string {
 				// meant and is THIS program's text -- the same answer the admitted
 				// header value already gives. Refused only where that spelling is
 				// supplied too, because then nothing semantics-preserving is left.
-				if can := strings.ToLower(bare); scrubSuppliedRaw(can) == can {
-					return line[:j+1] + vouched(can) + line[i:]
-				}
-				noteStructural(formField, "a redirect scheme whose colliding spelling has no grammar-preserving replacement")
-				return line[:j+1] + tokenPlaceholder(bare) + line[i:]
+				return line[:j+1] + foldedReplacement(bare, strings.ToLower(bare), "redirect scheme") + line[i:]
 			}
 			return line
 		}
@@ -1066,9 +1062,19 @@ func redactSetCookie(line string) string {
 					parts[i] = markAttrName(an)
 					continue
 				}
-				{
-					parts[i] = " " + tokenPlaceholder(ows(an))
+				// ⚠ AND A FLAG REPLACED BY ITS LENGTH IS NO LONGER THAT FLAG. Supplied
+				// `SECURE` against `; SECURE` became `; redacted-6-chars` with an empty
+				// ledger, so the published cookie is not Secure -- the capture stating
+				// something about the response that the response did not say
+				// (shardpilot/shardpilot-go#85 review). `HttpOnly` and `Partitioned`
+				// behave the same way. Flag names fold, so the canonical spelling is the
+				// same flag.
+				if canFlag, okFlag := canonicalCookieFlag(ows(an)); okFlag &&
+					scrubSuppliedRaw(ows(an)) != ows(an) {
+					parts[i] = " " + foldedReplacement(ows(an), canFlag, "cookie flag")
+					continue
 				}
+				parts[i] = " " + tokenPlaceholder(ows(an))
 				continue
 			}
 			// ⚠ AND ITS NAME. `; server-secret=y` puts the identifier on the name
@@ -1122,6 +1128,11 @@ func redactSetCookie(line string) string {
 				// placeholder and produce an attribute no cookie parser accepts
 				// (shardpilot/shardpilot-go#85 review).
 				an = markAttrName(an)
+			} else if can, ok := canonicalCookieAttr(ows(an)); ok && scrubSuppliedRaw(ows(an)) != ows(an) {
+				// The same rule as the flag beside it, and the same reason: an attribute
+				// name replaced by its length is a different attribute. Found by asking
+				// the population when the flag was shown, not by being told.
+				an = strings.Replace(an, ows(an), foldedReplacement(ows(an), can, "cookie attribute name"), 1)
 			} else if scrubSuppliedRaw(ows(an)) != ows(an) {
 				// ⚠ AND THE NON-CANONICAL SPELLING NEEDS THE SAME PROTECTION. Restricting
 				// the vouch to the canonical case was right and left `PATH=/` with a
@@ -1180,11 +1191,9 @@ func redactSetCookie(line string) string {
 			// what arrived and is this program's text.
 			if verbatim && canKnown && enumerated && !canonicalSpelling(ows(av), canAttr) &&
 				scrubSuppliedRaw(ows(av)) != ows(av) {
-				if scrubSuppliedRaw(canAttr) == canAttr {
-					parts[i] = an + syntax("=") + strings.Replace(av, ows(av), vouched(canAttr), 1)
-					continue
-				}
-				noteStructural(formField, "an enumerated cookie attribute whose colliding spelling has no grammar-preserving replacement")
+				rep := foldedReplacement(ows(av), canAttr, "cookie attribute value")
+				parts[i] = an + syntax("=") + strings.Replace(av, ows(av), rep, 1)
+				continue
 			}
 			parts[i] = an + syntax("=") + tokenPlaceholder(unescapeMarks(ows(av)))
 		}
@@ -2592,6 +2601,19 @@ func admitFieldName(name string) string {
 		// the placeholder is generated (shardpilot/shardpilot-go#85 review). Not
 		// vouching it was right; leaving it where a prose rule could reach it was not.
 		if scrubSuppliedRaw(n) != n {
+			// ⚠ AND THE PLACEHOLDER CHANGES THE FIELD'S IDENTITY. `CONTENT-TYPE`
+			// colliding was published as `redacted-12-chars:`, so a consumer can no
+			// longer see which standard header arrived -- token-safe, and a different
+			// field (shardpilot/shardpilot-go#85 review). Field names fold, so the
+			// canonical spelling is the same field.
+			//
+			// Only where a REGISTRY fixes the name. For one the endpoint invented there
+			// is no identity to preserve and `CanonicalMIMEHeaderKey` would vouch a
+			// spelling no registry has; the token placeholder is already grammar-safe
+			// there, which is what the round before this established.
+			if registeredFieldNames[strings.ToLower(n)] {
+				return foldedReplacement(n, textproto.CanonicalMIMEHeaderKey(n), "response field name")
+			}
 			return tokenPlaceholder(n)
 		}
 		return name
@@ -2676,6 +2698,35 @@ func standardCookieAttr(name string) bool {
 // Recognising a token and having written it are different facts. A predicate that
 // folds answers the first. Only equality with the canonical spelling answers the
 // second.
+// foldedReplacement answers ONE question for every token in this file whose
+// grammar folds: the arrived spelling collides with a supplied value, so what is
+// emitted in its place?
+//
+// ⚠ THIS IS THE CONTAINING UNIT, AND IT IS HERE BECAUSE FIXING THE SITES DID NOT
+// CONVERGE. The same sentence -- declining to vouch is not declining to keep the
+// grammar -- has now been shown at the redirect scheme, the cookie attribute name,
+// the admitted header value, the registered media type, the enumerated cookie
+// attribute value, the response field NAME and the valueless cookie FLAG. Each was
+// repaired where it was shown, and the next round brought another member
+// (shardpilot/shardpilot-go#85 review, four rounds running).
+//
+// The answer never varied: a length placeholder is not a member of any of these
+// grammars, and the canonical spelling is -- it means what arrived, because the
+// grammar folds, and it is THIS program's text rather than the endpoint's. So it is
+// substituted where it does not itself collide, and where it does, nothing
+// semantics-preserving is left and the capture is refused rather than published
+// with an empty ledger.
+//
+// `what` names the token in the refusal, so the ledger still says which grammar
+// could not be preserved.
+func foldedReplacement(arrived, canonical, what string) string {
+	if scrubSuppliedRaw(canonical) == canonical {
+		return vouched(canonical)
+	}
+	noteStructural(formField, "a "+what+" whose colliding spelling has no grammar-preserving replacement")
+	return tokenPlaceholder(arrived)
+}
+
 func canonicalSpelling(arrived, canonical string) bool { return arrived == canonical }
 
 // benignCanonical and mintedCanonical return the registry's OWN spelling of a
@@ -3073,6 +3124,17 @@ func redactUnlessVerbatim(line string) string {
 			return name + ": " + marked("<withheld>") + cr
 		}
 		return line
+	}
+	// ⚠ AN EMPTY VALUE HAS NOTHING TO REDACT, AND A PLACEHOLDER INVENTS ONE.
+	// `Content-Encoding:` is transport-valid and declares no coding token; routed
+	// through the generic prose rule it was published as
+	// `Content-Encoding: <redacted, 0 chars>` with an empty ledger -- an artifact
+	// declaring a coding no consumer can apply, about a response that declared none,
+	// while the captured body was plain JSON (shardpilot/shardpilot-go#85 review).
+	// Redaction exists to replace endpoint bytes; where there are none, the honest
+	// rendering is the one that arrived.
+	if ows(value) == "" {
+		return name + ":" + value + cr
 	}
 	// ⚠ MEASURED BEFORE OUR OWN ESCAPE. `escapeMarks` lengthens a backslash run
 	// on the way in, so a header carrying the literal `\x00` was reported four
