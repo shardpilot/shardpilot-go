@@ -214,6 +214,20 @@ if [ -n "${GIT_DIR:-}" ]; then
     /*) inherited_git_dir="$GIT_DIR" ;;
     *) inherited_git_dir="$PWD/$GIT_DIR" ;;
   esac
+  # ⚠ AND THE SPELLING IS NORMALISED BEFORE ANY LAYOUT TEST. `git --git-dir=.git/ push`
+  # is valid and git passes the trailing slash through, so this captured
+  # `<checkout>/.git/` -- which neither the later `*/.git` pattern nor the equality
+  # against `$checkout_root/.git` recognises, and an ORDINARY push was refused as an
+  # ownerless separate git directory (shardpilot/shardpilot-go#79 review). Those tests
+  # are lexical, so what they read has to be a normal form; preserving the inherited
+  # value was necessary and not sufficient.
+  while :; do
+    case "$inherited_git_dir" in
+      /) break ;;
+      */) inherited_git_dir="${inherited_git_dir%/}" ;;
+      *) break ;;
+    esac
+  done
 fi
 for gv in GIT_DIR GIT_WORK_TREE GIT_COMMON_DIR GIT_NAMESPACE \
           GIT_CEILING_DIRECTORIES GIT_DISCOVERY_ACROSS_FILESYSTEM GIT_PREFIX \
@@ -575,13 +589,33 @@ if [ -n "$wt_common" ]; then
         wt_ct="${wt_cl#"${wt_cl%%[![:space:]]*}"}"
         case "$wt_ct" in
           "["*) wt_sect="$wt_ct" ;;
-          [Bb][Aa][Rr][Ee]*=*)
+          # ⚠ AN EXACT NAME, NOT A PREFIX. Git config names fold but they are NAMES:
+          # `bareRepository = true` standing after the ordinary `bare = false` was
+          # read as `core.bare` by this pattern, and the repository was marked bare --
+          # bypassing the unresolved-checkout guard so a PATH entry inside an
+          # externally owned main checkout could supply the next `git` or `mktemp`
+          # (shardpilot/shardpilot-go#79 review). The previous round made this fold
+          # and left it a prefix: two narrowings of one predicate, each describing the
+          # kind of the example that had arrived. The name is extracted and compared
+          # WHOLE now, which is the property.
+          *=*)
             # ⚠ SECTION AND VARIABLE NAMES FOLD, and this compared them literally --
             # so a bare repository written `[Core]`, which git reads exactly as
             # `[core]`, left `wt_is_bare=no` and an ordinarily named `/tmp/repo.git`
             # was refused by the checkout-owner guard (shardpilot/shardpilot-go#79
             # review). The PATTERNS fold here rather than the strings, because folding
             # a string needs a command and this runs before the PATH filter.
+            wt_cn="${wt_ct%%=*}"
+            while :; do
+              case "$wt_cn" in
+                *" "|*"$TAB") wt_cn="${wt_cn%?}" ;;
+                *) break ;;
+              esac
+            done
+            case "$wt_cn" in
+              [Bb][Aa][Rr][Ee]) ;;
+              *) continue ;;
+            esac
             case "$wt_sect" in
               "["[Cc][Oo][Rr][Ee]"]"*)
                 wt_cv="${wt_ct#*=}"
@@ -1789,10 +1823,23 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # moves to the destination's default branch (shardpilot/shardpilot-go#79 review).
   # A more permissive baseline there passes a regression against the ref actually
   # being updated. `cat-file -t` states the type, and its failure is a refusal.
+  # ⚠ AND THE QUESTION IS WHETHER IT PEELS TO A COMMIT, not what the outer object
+  # is. `cat-file -t` on an annotated tag whose target is a commit answers `tag`, so
+  # the previous round's repair discarded a perfectly good commit baseline and moved
+  # the comparison to the destination's default branch -- where a more permissive
+  # Lane-B baseline passes a regression against the ref actually being updated
+  # (shardpilot/shardpilot-go#79 review). That repair removed an ambiguous FAILURE
+  # and introduced a wrong SUBJECT.
+  #
+  # The peel answers it, and the failure channel stays separate: `^{commit}` resolving
+  # is the yes; it not resolving is ambiguous on its own, so the type is then asked of
+  # an object whose existence is already proven, and a failure of THAT is a refusal.
   remote_is_commit=yes
   if git cat-file -e "$remote_sha" 2>/dev/null; then
-    git_probe "the type of $remote_sha" git cat-file -t "$remote_sha"
-    [ "$PROBE_OUT" = commit ] || remote_is_commit=no
+    if ! git rev-parse --verify --quiet "$remote_sha^{commit}" >/dev/null 2>&1; then
+      git_probe "the type of $remote_sha" git cat-file -t "$remote_sha"
+      [ "$PROBE_OUT" = commit ] || remote_is_commit=no
+    fi
   fi
   if [ "$remote_is_commit" = no ]; then
     printf 'public surface: %s previously held a non-commit object; comparing against the default branch\n' \
