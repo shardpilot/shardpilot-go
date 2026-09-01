@@ -311,6 +311,11 @@ No Makefile — standard Go tooling.
 **Install the pre-push hook once, before your first push:**
 
 ```
+# Run as a SUBSHELL. Every refusal below is an `exit`, and pasted into an
+# interactive shell an `exit` closes THAT shell -- an occupied destination or a
+# failed rollback would take the terminal and its jobs with it. The parentheses
+# keep the failure inside, and the exit status still reaches you.
+(
 p_(){ x="$(cd -- "$1" && pwd -P && printf X)" || return 1; x="${x%X}"; printf '%sX' "${x%?}"; } &&
 NL="$(printf '\nX')" && NL="${NL%X}" &&
 CR="$(printf '\rX')" && CR="${CR%X}" &&
@@ -421,6 +426,7 @@ while IFS= read -r -d "" w; do
     { echo "hooks still resolve elsewhere in $w: $got" >&2; sp_rollback; }
 done < "$wp" &&
 rm -f "$wt" "$wp" "$pv"
+)
 ```
 
 **Nothing is created before the handler that withdraws it exists, and each

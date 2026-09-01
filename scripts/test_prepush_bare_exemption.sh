@@ -1276,7 +1276,21 @@ if [ ! -r "$ins_src" ]; then
   echo "REFUSING: cannot read $ins_src, so the section below had nothing to run." >&2
   exit 2
 fi
-awk 'index($0,"p_(){ x=\"$(cd -- \"$1\"")==1{f=1} f&&/^```$/{exit} f{print}' "$ins_src" > "$ins"
+# The whole FENCED BLOCK is lifted, located by the anchor it contains rather than
+# starting at it: the block is wrapped in a subshell, so its first line is no
+# longer the anchor, and an extraction that began at the anchor would drop the
+# opening parenthesis and lift something that does not parse.
+awk '
+  /^```/ {
+    if (inb) { if (found) { printf "%s", buf; exit } ; inb=0; buf=""; found=0 }
+    else { inb=1; buf=""; found=0 }
+    next
+  }
+  inb {
+    buf = buf $0 "\n"
+    if (index($0, "p_(){ x=\"$(cd -- \"$1\"") == 1) found=1
+  }
+' "$ins_src" > "$ins"
 if [ ! -s "$ins" ]; then
   echo "REFUSING: the installer block was not found in README.md. The anchor here has" >&2
   echo "  stopped matching it, and this section would otherwise test nothing." >&2
@@ -1515,6 +1529,38 @@ if [ "$(ins2_rb "$ins" f)" = kept ] && grep -q "INCOMPLETE" "$work/ins2rb.out"; 
 else
   echo "FAIL: the rollback withdrew the published hook while core.hooksPath still" >&2
   echo "  named it, leaving no pre-push hook running, and did not say so." >&2
+  ins2_fail=1
+fi
+
+# ---- a refusal must not close the shell that pasted the block -----------------
+#
+# The README tells a developer to paste this block. Every refusal in it is an
+# `exit`, and in an interactive shell `exit` closes THAT shell -- so an occupied
+# destination, or any later validation failure, took the terminal and its jobs
+# with it (shardpilot/shardpilot-go#79 review). The block is a subshell now.
+ins3_d="$work/ins3"; ins_fixture "$ins3_d"
+printf 'occupied\n' > "$ins3_d/.git/hooks/pre-push"
+ins3_vuln="$work/ins3-vuln.sh"
+sed -e '/^($/d' -e '/^)$/d' "$ins" > "$ins3_vuln"
+if cmp -s "$ins3_vuln" "$ins"; then
+  echo "REFUSING: the installer block carries no subshell parentheses to remove," >&2
+  echo "  so the control below cannot reproduce the closed shell." >&2
+  exit 2
+fi
+ins3_paste() { # $1 = block; prints whether the pasting shell lived
+  ( cd "$ins3_d" && bash -c '. "$1"; echo LIVED' _ "$1" ) 2>/dev/null | grep -q LIVED &&
+    echo lived || echo closed
+}
+if [ "$(ins3_paste "$ins3_vuln")" != closed ]; then
+  echo "REFUSING: the unwrapped block did not close its caller, so this section" >&2
+  echo "  cannot tell a fix from a rig that never reproduced it." >&2
+  exit 2
+fi
+printf '\npositive control: unwrapped, a refusal closes the shell that pasted it.\n'
+if [ "$(ins3_paste "$ins")" = lived ]; then
+  printf 'this installer: a refusal leaves the pasting shell alive.\n'
+else
+  echo "FAIL: a refusal closed the shell that pasted the block." >&2
   ins2_fail=1
 fi
 
