@@ -806,6 +806,90 @@ fi
 
 
 
+
+# ---- a PATH directory may serve a command from inside a checkout ---------------
+#
+# The PATH filter drops an entry whose DIRECTORY resolves into a checkout. An
+# ordinary directory outside every checkout that contains `mktemp` as a symlink to
+# a tracked script passes it untouched, and the branch owns the target -- measured
+# running twice before the hook read stdin (shardpilot/shardpilot-go#79 review).
+# The comment there said "resolved physically, so a symlink pointing into the
+# checkout is caught too", which is true of the directory and reads wider.
+pcr_fail=0
+pcr_s="$(grep -n '^# >>> PATH-COMMAND-RESOLUTION' "$hook" | head -1 | cut -d: -f1)"
+pcr_e="$(grep -n '^# <<< PATH-COMMAND-RESOLUTION' "$hook" | head -1 | cut -d: -f1)"
+if [ -z "$pcr_s" ] || [ -z "$pcr_e" ] || [ "$pcr_e" -le "$pcr_s" ]; then
+  echo "REFUSING: the PATH-COMMAND-RESOLUTION markers are missing or out of order," >&2
+  echo "  so the stand-in below cannot be built and this section would test nothing." >&2
+  exit 2
+fi
+pcr_vuln="$work/pcr-vuln-hook"
+sed "${pcr_s},${pcr_e}d" "$hook" > "$pcr_vuln"
+chmod +x "$pcr_vuln"
+if ! bash -n "$pcr_vuln" 2>/dev/null; then
+  echo "FAIL: removing the PATH-COMMAND-RESOLUTION block leaves a hook that does" >&2
+  echo "  not parse, so the block is entangled with the code around it." >&2
+  pcr_fail=1
+fi
+
+pcr_root="$work/pcr"; rm -rf "$pcr_root"; mkdir -p "$pcr_root/safe"
+git init -q "$pcr_root/co" >/dev/null 2>&1
+git init -q --bare "$pcr_root/remote.git" >/dev/null 2>&1
+pcr_mark="$work/pcr-fired"
+( cd "$pcr_root/co"
+  git config user.email t@example.invalid; git config user.name t
+  printf '#!/bin/sh\necho FIRED >> "%s"\nexec /usr/bin/mktemp "$@"\n' "$pcr_mark" > tracked.sh
+  chmod +x tracked.sh
+  git add -A >/dev/null 2>&1
+  git commit -qm c1 >/dev/null 2>&1
+  git remote add origin "$pcr_root/remote.git" >/dev/null 2>&1 ) >/dev/null 2>&1
+mkdir -p "$pcr_root/co/.git/hooks"
+printf '#!/bin/sh\nexit 0\n' > "$pcr_root/co/.git/hooks/check_public_surface.sh"
+chmod +x "$pcr_root/co/.git/hooks/check_public_surface.sh"
+# the directory is OUTSIDE the checkout; only the command it serves is inside
+ln -sf "$pcr_root/co/tracked.sh" "$pcr_root/safe/mktemp"
+
+pcr_probe() { # $1 = hook
+  rm -f "$pcr_mark"
+  cp "$1" "$pcr_root/co/.git/hooks/pre-push"; chmod +x "$pcr_root/co/.git/hooks/pre-push"
+  ( cd "$pcr_root/co" && PATH="$pcr_root/safe:$PATH" \
+      git push origin HEAD:refs/heads/pcrp >/dev/null 2>&1 )
+  # to a FILE, not a variable: this function is called inside `$( )` and an
+  # assignment here dies with the subshell -- the same slip this file already
+  # carries one fix for, made again three sections later
+  printf '%s' "$?" > "$work/pcr-rc"
+  git -C "$pcr_root/remote.git" update-ref -d refs/heads/pcrp >/dev/null 2>&1 || true
+  [ -s "$pcr_mark" ] && echo fired || echo quiet
+}
+
+# the control: without the block the tracked program MUST run, or this section
+# cannot tell a fix from a rig that never reproduced the execution
+if [ "$(pcr_probe "$pcr_vuln")" != fired ]; then
+  echo "REFUSING: the tracked program did not run even with the resolution block" >&2
+  echo "  removed, so this section cannot tell a fix from a rig that never" >&2
+  echo "  reproduced it." >&2
+  exit 2
+fi
+printf '\npositive control: without the block, a PATH symlink ran the branch program.\n'
+if [ "$(pcr_probe "$hook")" = fired ]; then
+  echo "FAIL: a PATH directory outside every checkout served a command from inside" >&2
+  echo "  one, and the branch-controlled program ran." >&2
+  pcr_fail=1
+else
+  printf 'this hook: a PATH entry serving a command from a checkout is refused.\n'
+fi
+
+# and an ordinary PATH must still be accepted -- a gate that refuses every push
+# also passes the check above
+rm -f "$pcr_root/safe/mktemp"
+if [ "$(pcr_probe "$hook")" = quiet ] && [ "$(cat "$work/pcr-rc" 2>/dev/null || echo 1)" -eq 0 ]; then
+  printf 'this hook: an ordinary PATH is still accepted.\n'
+else
+  echo "FAIL: an ordinary push was refused, so the check above passes" >&2
+  echo "  by refusing everything rather than by resolving commands." >&2
+  pcr_fail=1
+fi
+
 # ---- a relative back-pointer names its checkout --------------------------------
 #
 # `gitdir: .repo` and `gitdir: ../meta` are valid, and git resolves them against
@@ -1165,4 +1249,4 @@ printf '\n%d gitfile read(s) found, %d still line-oriented.\n' "$gf_total" "$gf_
 printf '%d checkout-root case(s), %d failure(s).\n' "$itotal" "$ifail"
 printf '%d case(s) judged, %d failure(s); %d normal-form case(s), %d failure(s).\n' \
   "$total" "$failures" "$ntotal" "$nfail"
-[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] && [ "$idx_fail" -eq 0 ] && [ "$inv_fail" -eq 0 ] && [ "$chl_fail" -eq 0 ] && [ "$bp_fail" -eq 0 ] && [ "$kre_fail" -eq 0 ] && [ "$esc_fail" -eq 0 ] && [ "$ord_fail" -eq 0 ] && [ "$ins_fail" -eq 0 ] && [ "$cfg_fail" -eq 0 ] && [ "$rel_fail" -eq 0 ] || exit 1
+[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] && [ "$idx_fail" -eq 0 ] && [ "$inv_fail" -eq 0 ] && [ "$chl_fail" -eq 0 ] && [ "$bp_fail" -eq 0 ] && [ "$kre_fail" -eq 0 ] && [ "$esc_fail" -eq 0 ] && [ "$ord_fail" -eq 0 ] && [ "$ins_fail" -eq 0 ] && [ "$cfg_fail" -eq 0 ] && [ "$rel_fail" -eq 0 ] && [ "$pcr_fail" -eq 0 ] || exit 1

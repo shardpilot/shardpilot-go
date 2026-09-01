@@ -1042,6 +1042,98 @@ if [ -z "$sanitised_path" ]; then
   printf '  runs can be resolved from outside the checkout.\n' >&2
   exit 2
 fi
+# >>> PATH-COMMAND-RESOLUTION. scripts/test_prepush_bare_exemption.sh removes the
+# lines between these markers to build its stand-in. Moving or renaming them
+# makes that test refuse.
+# ⚠ AND A DIRECTORY OUTSIDE EVERY CHECKOUT MAY STILL SERVE A COMMAND FROM INSIDE
+# ONE. The filter above resolves each PATH ENTRY and drops it when the DIRECTORY
+# lies in a checkout -- "resolved physically, so a symlink pointing into the
+# checkout is caught too" was written of the directory, and reads wider than it
+# is. An ordinary directory outside every checkout containing `mktemp` as a
+# symlink to a tracked script passed that filter untouched, and the branch owns
+# the target: reproduced running twice before this hook read stdin
+# (shardpilot/shardpilot-go#79 review).
+#
+# So what is checked here is where the COMMANDS resolve, not where their parents
+# sit. No list of command names is kept: a name this file does not happen to
+# mention today would not be covered by one, and the previous two repairs on this
+# subject were both lists that the next case walked around. Every symlink in every
+# surviving entry is resolved instead.
+#
+# ⚠ THE RESOLVER IS BOOTSTRAPPED, because resolving is what we have no trusted
+# tool for yet. It is taken from a standard directory that this gate has already
+# judged to be outside every checkout, and it must not itself be a symlink -- that
+# is the one case that cannot be checked without the tool being established.
+sp_rl=""
+for sp_d in /usr/bin /bin /usr/sbin /sbin; do
+  sp_dp="$(physdir "$sp_d")" || continue
+  sp_dp="${sp_dp%X}"
+  inside_a_checkout "$sp_dp" && continue
+  [ -x "$sp_d/readlink" ] && [ ! -L "$sp_d/readlink" ] || continue
+  # `-f` reports the END of a chain; without it an intermediate target reads as
+  # outside while the file that actually runs is inside.
+  [ "$("$sp_d/readlink" -f / 2>/dev/null)" = "/" ] || continue
+  sp_rl="$sp_d/readlink"
+  break
+done
+if [ -z "$sp_rl" ]; then
+  printf 'REFUSING: no resolver was found outside every checkout, so where the
+' >&2
+  printf '  commands on PATH resolve could not be checked. A check that cannot run
+' >&2
+  printf '  is reported here rather than passed over.
+' >&2
+  exit 2
+fi
+sp_bad_dir=""
+sp_bad_cmd=""
+old_ifs="$IFS"
+IFS=:
+set -f
+for path_entry in $sanitised_path; do
+  set +f
+  [ -d "$path_entry" ] || { set -f; continue; }
+  sp_links=()
+  for sp_f in "$path_entry"/*; do
+    [ -L "$sp_f" ] && sp_links+=("$sp_f")
+  done
+  set -f
+  [ "${#sp_links[@]}" -gt 0 ] || continue
+  # One resolution per DIRECTORY rather than per link: the per-link form cost
+  # 2.1s of every push on this machine and the batched one 173ms, measured.
+  while IFS= read -r sp_t; do
+    [ -n "$sp_t" ] || continue
+    case "$sp_t" in /*) ;; *) continue ;; esac
+    if inside_a_checkout "${sp_t%/*}"; then
+      sp_bad_dir="$path_entry"
+      break
+    fi
+  done <<SPLINKS
+$("$sp_rl" -f "${sp_links[@]}" 2>/dev/null)
+SPLINKS
+  [ -n "$sp_bad_dir" ] && break
+done
+set +f
+IFS="$old_ifs"
+if [ -n "$sp_bad_dir" ]; then
+  # named only now, so the common case pays one resolution per directory
+  for sp_f in "$sp_bad_dir"/*; do
+    [ -L "$sp_f" ] || continue
+    sp_t="$("$sp_rl" -f "$sp_f" 2>/dev/null)" || continue
+    case "$sp_t" in /*) ;; *) continue ;; esac
+    if inside_a_checkout "${sp_t%/*}"; then sp_bad_cmd="${sp_f##*/}"; break; fi
+  done
+  printf 'REFUSING: %s is outside every checkout but serves a command from inside
+' "$sp_bad_dir" >&2
+  printf '  one: %s resolves into a checkout, whose contents the pushed branch
+' "${sp_bad_cmd:-a command}" >&2
+  printf '  controls. Remove that link, or take the directory off PATH.
+' >&2
+  exit 2
+fi
+unset sp_d sp_dp sp_f sp_t sp_links sp_bad_dir sp_bad_cmd
+# <<< PATH-COMMAND-RESOLUTION
+
 PATH="$sanitised_path"
 export PATH
 if [ "$dropped_inside" = yes ]; then
