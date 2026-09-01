@@ -534,6 +534,37 @@ for gate_var in $GATE_DATA_NAMES; do
 done
 unset gate_var
 
+# ── FIXTURE REPOSITORIES READ NO USER CONFIGURATION AT ALL ──────────────────
+#
+# The self-test builds throwaway repositories under `mktemp -d` and runs `git
+# init` and `git add` in them. Those commands honour the invoking user's
+# configuration, and a CONDITIONAL include activates precisely there: an
+# `includeIf "gitdir:/tmp/**"` supplying `core.attributesFile` and a
+# `filter.<n>.clean` runs a checkout-controlled program during `git add`
+# (shardpilot/shardpilot-go#79 review). Reproduced here before this was written:
+# with the include reachable the filter ran once per fixture; with the isolation
+# below it ran zero times on the same path, and the fixture still staged its file.
+#
+# ⚠ THIS IS NOT ANOTHER KEY NAME. The hook's enumeration neutralises keys it can
+# SEE, and a conditional include is by construction invisible to it -- so naming
+# `init.templatedir`, or `filter.evil.clean`, or the next one, cannot converge.
+# What closes the class is that these repositories read no user configuration at
+# all, whatever it might have contained.
+#
+# ⚠ AND IT IS SCOPED TO THE FIXTURES, because the wide version of this repair has
+# already been made and reverted once: clearing the config environment for every
+# git invocation took the caller's `http.extraHeader` with it and refused pushes
+# that had already authenticated. These repositories are local scratch that set
+# their own identity below; they need no credentials and no transport
+# configuration, so there is no working half to strip here.
+sp_fixture_isolation() {
+  GIT_CONFIG_GLOBAL=/dev/null
+  GIT_CONFIG_SYSTEM=/dev/null
+  GIT_CONFIG_NOSYSTEM=1
+  export GIT_CONFIG_GLOBAL GIT_CONFIG_SYSTEM GIT_CONFIG_NOSYSTEM
+  unset GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT GIT_CONFIG GIT_TEMPLATE_DIR
+}
+
 # ⚠ EVERY ASSIGNMENT IN THE BLOCK MUST BE ENUMERATED. The audits downstream
 # read the DECODED values, and they reach them through the name list — so an
 # assignment added to the block and forgotten in the list is decoded by nothing
@@ -2325,6 +2356,7 @@ EOF
   trap 'rm -rf "$tmp"' RETURN
   (
     cd "$tmp"
+    sp_fixture_isolation
     git init -q .
     git config user.email t@t; git config user.name t
     printf '%s\n' "$FIXTURE_CLEAN_BODY"   > "$FIXTURE_CLEAN_NAME"
@@ -2387,6 +2419,7 @@ EOF
   nul_tmp="$(mktemp -d)"
   (
     cd "$nul_tmp"
+    sp_fixture_isolation
     git init -q .
     git config user.email t@t; git config user.name t
     printf 'x\000%s\n' "$FIXTURE_BINARY_BODY" > "$FIXTURE_BINARY_NAME"
@@ -2431,7 +2464,8 @@ EOF
     entity_tmp="$(mktemp -d)"
     (
       cd "$entity_tmp"
-      git init -q .
+      sp_fixture_isolation
+    git init -q .
       git config user.email t@t; git config user.name t
       printf '%s\n' "$entity_body" > "$entity_name"
       git add -A >/dev/null 2>&1
@@ -2479,6 +2513,7 @@ EOF
   splitid_tmp="$(mktemp -d)"
   (
     cd "$splitid_tmp"
+    sp_fixture_isolation
     git init -q .
     git config user.email t@t; git config user.name t
     printf '%s\n' "$FIXTURE_SPLITID_BODY" > "$FIXTURE_SPLITID_NAME"

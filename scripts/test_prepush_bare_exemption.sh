@@ -804,6 +804,123 @@ else
 fi
 
 
+
+# ---- the scanner's fixtures read no user configuration ------------------------
+#
+# The hook neutralises dangerous config keys by ENUMERATING them, and a
+# conditional include is invisible to that enumeration by construction: an
+# `includeIf "gitdir:**"` supplying `core.attributesFile` and `filter.<n>.clean`
+# activates only once git is inside the scanner's `mktemp -d` fixtures, which is
+# after the list was derived (shardpilot/shardpilot-go#79 review). Naming the key
+# cannot converge -- the previous round added `init.templatedir` to the seed list
+# and the next conditional key walked through the same gap.
+#
+# What closes it is that those repositories read NO user configuration. That is
+# checked in two parts, because either alone would report green over a live hole:
+# the mechanism works, and it is applied at every fixture.
+cfg_fail=0
+cfg_scanner="$here/scripts/check_public_surface.sh"
+if [ ! -r "$cfg_scanner" ]; then
+  echo "REFUSING: cannot read $cfg_scanner, so its fixtures were not checked." >&2
+  exit 2
+fi
+
+# part 1 -- APPLIED AT EVERY FIXTURE. Structural, so a fixture added later without
+# the call is caught rather than inherited silently.
+gi_total=0; gi_bad=0
+while IFS= read -r gi_n; do
+  [ -n "$gi_n" ] || continue
+  gi_total=$((gi_total + 1))
+  gi_prev="$(awk -v n="$gi_n" 'NR<n && NF {last=$0} END{print last}' "$cfg_scanner")"
+  case "$gi_prev" in
+    *sp_fixture_isolation*) ;;
+    *) echo "FAIL: a fixture repository is initialised without config isolation at" >&2
+       echo "  $cfg_scanner:$gi_n -- a conditional include activates there." >&2
+       gi_bad=$((gi_bad + 1)) ;;
+  esac
+done <<CFGINIT
+$(grep -n '^[[:space:]]*git init -q \.$' "$cfg_scanner" | cut -d: -f1)
+CFGINIT
+if [ "$gi_total" -eq 0 ]; then
+  echo "REFUSING: no fixture initialisation was found in the scanner at all, so" >&2
+  echo "  whether they isolate configuration could not be checked." >&2
+  exit 2
+fi
+[ "$gi_bad" -eq 0 ] || cfg_fail=1
+
+# part 2 -- THE MECHANISM WORKS. The function is lifted from the scanner rather
+# than restated here, so a change that hollows it out is caught.
+cfg_s="$(grep -n '^sp_fixture_isolation() {$' "$cfg_scanner" | head -1 | cut -d: -f1)"
+cfg_e=""
+if [ -n "$cfg_s" ]; then
+  cfg_e="$(awk -v s="$cfg_s" 'NR>s && /^}$/ {print NR; exit}' "$cfg_scanner")"
+fi
+if [ -z "$cfg_s" ] || [ -z "$cfg_e" ]; then
+  echo "REFUSING: sp_fixture_isolation was not found in the scanner, so the" >&2
+  echo "  mechanism behind the check above could not be exercised." >&2
+  exit 2
+fi
+sed -n "${cfg_s},${cfg_e}p" "$cfg_scanner" > "$work/isolation.sh"
+if ! bash -n "$work/isolation.sh" 2>/dev/null; then
+  echo "FAIL: the lifted sp_fixture_isolation does not parse." >&2
+  cfg_fail=1
+fi
+
+# a global configuration whose include activates inside ANY repository, so the
+# rig does not depend on where mktemp puts the fixture
+cfg_home="$work/poison-home"; mkdir -p "$cfg_home"
+cfg_mark="$work/cfg-fired"
+printf '#!/bin/sh\necho FIRED >> "%s"\ncat\n' "$cfg_mark" > "$cfg_home/evil.sh"
+chmod +x "$cfg_home/evil.sh"
+printf '[includeIf "gitdir:**"]\n\tpath = %s/cond\n' "$cfg_home" > "$cfg_home/.gitconfig"
+printf '[core]\n\tattributesFile = %s/attrs\n[filter "evil"]\n\tclean = %s/evil.sh\n' \
+  "$cfg_home" "$cfg_home" > "$cfg_home/cond"
+printf '* filter=evil\n' > "$cfg_home/attrs"
+
+cfg_probe() { # $1 = yes to apply the isolation
+  rm -f "$cfg_mark"
+  cfg_rep="$work/cfgfix.$$"; rm -rf "$cfg_rep"; mkdir -p "$cfg_rep"
+  ( cd "$cfg_rep"
+    export HOME="$cfg_home" XDG_CONFIG_HOME="$cfg_home"
+    if [ "$1" = yes ]; then . "$work/isolation.sh"; sp_fixture_isolation; fi
+    git init -q .
+    git config user.email t@example.invalid; git config user.name t
+    printf 'hello\n' > f.txt
+    git add -A >/dev/null 2>&1 ) >/dev/null 2>&1
+  # recorded to a FILE, not a variable: this function is called inside `$( )`,
+  # so an assignment here dies with the subshell and the caller read an empty
+  # value as zero -- the assertion below then reported a fixture that had in
+  # fact staged its file
+  git -C "$cfg_rep" ls-files | wc -l | tr -d ' ' > "$work/cfg-staged"
+  rm -rf "$cfg_rep"
+  [ -s "$cfg_mark" ] && echo fired || echo quiet
+}
+
+# the control: without the isolation the conditional filter MUST run here, or the
+# check below cannot tell a fix from a rig that never reproduced the attack
+if [ "$(cfg_probe no)" != fired ]; then
+  echo "REFUSING: the conditional-include filter did not run even without the" >&2
+  echo "  isolation, so this section cannot tell a fix from a rig that never" >&2
+  echo "  reproduced it. git may no longer honour includeIf gitdir:** here." >&2
+  exit 2
+fi
+printf '\npositive control: a conditional include runs a filter in an unisolated fixture.\n'
+if [ "$(cfg_probe yes)" = fired ]; then
+  echo "FAIL: a conditional include still executed a program in an isolated" >&2
+  echo "  fixture -- the isolation does not stop what the enumeration cannot see." >&2
+  cfg_fail=1
+else
+  printf 'this scanner: an isolated fixture ran nothing from the configuration.\n'
+fi
+# and the isolation must not cost the fixture its own work
+if [ "$(cat "$work/cfg-staged" 2>/dev/null || echo 0)" -lt 1 ]; then
+  echo "FAIL: the isolated fixture staged nothing, so the check above passed" >&2
+  echo "  because the fixture stopped working, not because nothing ran." >&2
+  cfg_fail=1
+else
+  printf 'this scanner: the isolated fixture still stages its file.\n'
+fi
+
 # ---- the README installer, run rather than read -------------------------------
 #
 # The installer published in README.md is 91 lines of shell that every adopter
@@ -957,4 +1074,4 @@ printf '\n%d gitfile read(s) found, %d still line-oriented.\n' "$gf_total" "$gf_
 printf '%d checkout-root case(s), %d failure(s).\n' "$itotal" "$ifail"
 printf '%d case(s) judged, %d failure(s); %d normal-form case(s), %d failure(s).\n' \
   "$total" "$failures" "$ntotal" "$nfail"
-[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] && [ "$idx_fail" -eq 0 ] && [ "$inv_fail" -eq 0 ] && [ "$chl_fail" -eq 0 ] && [ "$bp_fail" -eq 0 ] && [ "$kre_fail" -eq 0 ] && [ "$esc_fail" -eq 0 ] && [ "$ord_fail" -eq 0 ] && [ "$ins_fail" -eq 0 ] || exit 1
+[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] && [ "$idx_fail" -eq 0 ] && [ "$inv_fail" -eq 0 ] && [ "$chl_fail" -eq 0 ] && [ "$bp_fail" -eq 0 ] && [ "$kre_fail" -eq 0 ] && [ "$esc_fail" -eq 0 ] && [ "$ord_fail" -eq 0 ] && [ "$ins_fail" -eq 0 ] && [ "$cfg_fail" -eq 0 ] || exit 1
