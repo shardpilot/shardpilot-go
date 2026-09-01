@@ -581,9 +581,39 @@ export GIT_SHALLOW_FILE
 # (shardpilot/shardpilot-go#79 review). The technique was already in this file;
 # this site was written before it and never revisited. `pwd` and `printf` are
 # builtins, so the filter is still finished before the first external command.
-checkout_root="$(pwd -P && printf X)"
-checkout_root="${checkout_root%X}"
-checkout_root="${checkout_root%$NL}"
+#
+# ⚠ AND `pwd` IS NOT THE WORK TREE WHEN THE WORK TREE WAS NAMED EXPLICITLY.
+# `git --git-dir=/repo/.git --work-tree=/checkout push`, run from a third
+# directory, leaves this hook in the CALLER'S directory: measured, cwd is the
+# caller, `GIT_WORK_TREE` is `/checkout`, and `GIT_DIR` is set. The root derived
+# from `pwd` was then the caller's directory, so `/checkout/bin` survived this
+# filter and a tracked `grep` there ran at the executable-key scan, before the
+# worktree enumeration further down noticed and refused
+# (shardpilot/shardpilot-go#79 review). A guard that runs after the thing it
+# guards is a consolation, which is this file's own recorded lesson.
+#
+# The explicit value wins where it exists, and where it exists but cannot be
+# resolved this REFUSES rather than falling back to a `pwd` already known to be
+# the wrong answer. Measured: `GIT_WORK_TREE` is unset for both an ordinary push
+# and a push from a linked worktree, and in both cwd IS the root, so this changes
+# nothing for either.
+checkout_root=""
+if [ -n "$inherited_work_tree" ]; then
+  if checkout_root="$(physdir "$inherited_work_tree")"; then
+    checkout_root="${checkout_root%X}"
+  else
+    printf 'REFUSING: the work tree named by GIT_WORK_TREE (%s) could not be\n' \
+      "$inherited_work_tree" >&2
+    printf '  resolved, so which directories a branch controls cannot be decided\n' >&2
+    printf '  before this gate runs its first command.\n' >&2
+    exit 2
+  fi
+fi
+if [ -z "$checkout_root" ]; then
+  checkout_root="$(pwd -P && printf X)"
+  checkout_root="${checkout_root%X}"
+  checkout_root="${checkout_root%$NL}"
+fi
 
 # ⚠ AND THE OTHER CHECKOUTS TOO. An absolute PATH entry inside ANOTHER linked
 # worktree -- the main checkout's `bin` while pushing from a feature worktree -- is
@@ -1388,6 +1418,25 @@ cleanup() {
   # included -- so the handler written to survive an unbuilt state could destroy an
   # unrelated one (shardpilot/shardpilot-go#79 review). The guard is on the
   # VARIABLE, not on the string it composes.
+  # ⚠ THE ARMED REF GOES FIRST, WHILE ITS OBJECT STORE STILL EXISTS.
+  # `GIT_OBJECT_DIRECTORY` names `$tmpdir/objects`, so removing `$tmpdir` before
+  # the deletion left `update-ref` with no repository to open -- measured, git
+  # answers "not a git repository" -- and the `|| true` below hid it, leaving
+  # `refs/prepush-base-*` behind to retain objects and to be picked up by a later
+  # mirror push (shardpilot/shardpilot-go#79 review). This ran on every exit that
+  # reached the trap after the ref was armed, which is every failure path.
+  #
+  # And the failure is reported rather than swallowed: a ref left behind is state
+  # this hook created and could not remove, which is exactly what the operator
+  # needs told.
+  if [ -n "${base_ref:-}" ]; then
+    if git_safe update-ref -d "$base_ref" 2>/dev/null; then
+      base_ref=""
+    else
+      printf 'note: the temporary ref %s could not be removed. It retains objects;\n' "$base_ref" >&2
+      printf '  delete it with: git update-ref -d %s\n' "$base_ref" >&2
+    fi
+  fi
   if [ -n "${tmpdir:-}" ]; then
     git_safe worktree remove --force "$tmpdir/wt" >/dev/null 2>&1 || true
   fi
@@ -1402,7 +1451,7 @@ cleanup() {
   # nothing this hook runs fires a repository hook, and an EXIT path that skips
   # the wrapper is the invariant holding only when nothing goes wrong
   # (shardpilot/shardpilot-go#79 review).
-  [ -n "${base_ref:-}" ] && git_safe update-ref -d "$base_ref" 2>/dev/null || true
+  :
 }
 trap cleanup EXIT
 # ⚠ THE NEUTRALISATION RIDES HERE, SO IT CANNOT BE BYPASSED BY ADDING A CALL SITE.
@@ -2312,8 +2361,29 @@ scan_commit() {
   if [ -n "${4:-}" ] && [ -s "$4" ]; then
     stage_evidence "$1" scripts/tag-object-as-committed.txt "$4"
   fi
+  # ⚠ AND THE PUBLISHED REF'S SUFFIX IS THE ONLY FORMAT SIGNAL A DIRECT BLOB HAS.
+  # A blob pushed straight at `refs/archive/logo.xbm` has no tree entry and no
+  # filename except the ref's own last component, and staging it under a
+  # hard-coded `.txt` threw that away before the scanner classified it -- so an XBM
+  # was approved and published while the scanner explicitly refuses `*.xbm`,
+  # whose rendered pixels are not searchable prose
+  # (shardpilot/shardpilot-go#79 review). The tagged-TREE blobs below already keep
+  # their own names for exactly this reason; this path was the one without a name
+  # to keep, and the ref supplies it.
+  #
+  # Sanitised by the same rule as those leaves -- a KEPT set, replaced byte for
+  # byte -- because deleting a byte joins its neighbours and can change which
+  # format the name claims. A ref with no suffix keeps `.txt`, which is what it
+  # had.
   if [ -n "${5:-}" ] && [ -s "$5" ]; then
-    stage_evidence "$1" scripts/tag-target-as-committed.txt "$5"
+    tt_leaf="${3##*/}"
+    tt_leaf="$(printf '%s' "$tt_leaf" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
+    case "$tt_leaf" in
+      ?*.?*) tt_sfx="${tt_leaf##*.}" ;;
+      *) tt_sfx="txt" ;;
+    esac
+    [ "${#tt_sfx}" -le 16 ] || tt_sfx="txt"
+    stage_evidence "$1" "scripts/tag-target-as-committed.$tt_sfx" "$5"
   fi
   # Each tagged-tree blob keeps its own name, so the scanner classifies it the way
   # it would classify the published file.

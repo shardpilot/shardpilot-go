@@ -317,6 +317,10 @@ No Makefile — standard Go tooling.
 # keep the failure inside, and the exit status still reaches you.
 (
 p_(){ x="$(cd -- "$1" && pwd -P && printf X)" || return 1; x="${x%X}"; printf '%sX' "${x%?}"; } &&
+gt_(){ y="$1"; case "$y" in "gitdir: "*) y="${y#gitdir: }" ;; *) return 1 ;; esac
+  test -n "$y" || return 1
+  case "$y" in /*) ;; *) y="$2/$y" ;; esac
+  p_ "$y"; } &&
 NL="$(printf '\nX')" && NL="${NL%X}" &&
 CR="$(printf '\rX')" && CR="${CR%X}" &&
 g="$(git rev-parse --git-common-dir && printf X)" && g="${g%X}" && g="${g%?}" &&
@@ -352,13 +356,15 @@ while IFS= read -r -d "" rec; do
           { IFS= read -r -d "" gl < "$pr/.git" || true; gl="${gl%$NL}"; gl="${gl%$CR}"; };
         gi=""; test "$b" = true || test ! -f "$t/.git" ||
           { IFS= read -r -d "" gi < "$t/.git" || true; gi="${gi%$NL}"; gi="${gi%$CR}"; };
-        case "$gl" in
-          "gitdir: $r") printf '%s\0' "$pr" ;;
-          *) case "$gi" in
-               "gitdir: $r") printf '%s\0' "$t" ;;
-               *) echo "$r is a git directory whose checkout cannot be named -- install from the main checkout" >&2; exit 1 ;;
-             esac ;;
-        esac; }; } || exit 1 ;;
+        rr="$(p_ "$r")" && rr="${rr%X}" || rr=""
+        gl_t="$(gt_ "$gl" "$pr")" && gl_t="${gl_t%X}" || gl_t=""
+        gi_t="$(gt_ "$gi" "$t")" && gi_t="${gi_t%X}" || gi_t=""
+        if test -n "$rr" && test -n "$gl_t" && test "$gl_t" = "$rr"
+        then printf '%s\0' "$pr"
+        elif test -n "$rr" && test -n "$gi_t" && test "$gi_t" = "$rr"
+        then printf '%s\0' "$t"
+        else echo "$r is a git directory whose checkout cannot be named -- install from the main checkout" >&2; exit 1
+        fi; }; } || exit 1 ;;
   esac
 done < "$wt" > "$wp" &&
 while IFS= read -r -d "" r; do

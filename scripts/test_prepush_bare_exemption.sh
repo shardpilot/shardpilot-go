@@ -964,6 +964,183 @@ else
   git -C "$cse_e/remote.git" update-ref -d refs/heads/csep >/dev/null 2>&1 || true
 fi
 
+
+# ---- the work tree named explicitly is the root, not the caller's cwd ----------
+#
+# `git --git-dir=D --work-tree=W push`, run from a third directory, leaves this
+# hook in the CALLER'S directory. The root taken from `pwd` was that directory, so
+# `W/bin` survived the PATH filter and a tracked `grep` there ran at the
+# executable-key scan before the worktree enumeration refused the push
+# (shardpilot/shardpilot-go#79 review).
+#
+# ⚠ THE RIG NEEDS W TO BE UNNAMEABLE BY THE OTHER MECHANISM. With an ordinary
+# layout the enumeration derives the main checkout from `<common>/.git` and drops
+# `W/bin` anyway -- two rigs reported clean here before this one reproduced
+# anything. W is a THIRD directory, which nothing else can name.
+wtr_fail=0
+wtr="$work/wtr"; rm -rf "$wtr"; mkdir -p "$wtr/elsewhere" "$wtr/alt/bin"
+git init -q "$wtr/co" >/dev/null 2>&1
+git init -q --bare "$wtr/remote.git" >/dev/null 2>&1
+wtr_mark="$work/wtr-fired"
+( cd "$wtr/co"
+  git config user.email t@example.invalid; git config user.name t
+  mkdir -p bin
+  printf '#!/bin/sh\necho FIRED >> "%s"\nexec /usr/bin/grep "$@"\n' "$wtr_mark" > bin/grep
+  chmod +x bin/grep
+  printf 'a\n' > f.txt
+  git add -A >/dev/null 2>&1; git commit -qm c1 >/dev/null 2>&1
+  git remote add origin "$wtr/remote.git" >/dev/null 2>&1 ) >/dev/null 2>&1
+cp -R "$wtr/co/bin" "$wtr/alt/" 2>/dev/null
+printf '#!/bin/sh\nexit 0\n' > "$wtr/co/.git/hooks/check_public_surface.sh"
+chmod +x "$wtr/co/.git/hooks/check_public_surface.sh"
+# the stand-in takes the root from `pwd` whatever the work tree says
+wtr_vuln="$work/wtr-vuln-hook"
+sed 's|^if \[ -n "\$inherited_work_tree" \]; then$|if false; then|' "$hook" > "$wtr_vuln"
+chmod +x "$wtr_vuln"
+if cmp -s "$wtr_vuln" "$hook" || ! bash -n "$wtr_vuln" 2>/dev/null; then
+  echo "REFUSING: the stand-in for the explicit work tree is identical to the hook" >&2
+  echo "  or does not parse, so the control below reproduces nothing." >&2
+  exit 2
+fi
+wtr_probe() { # $1 = hook
+  rm -f "$wtr_mark"
+  cp "$1" "$wtr/co/.git/hooks/pre-push"; chmod +x "$wtr/co/.git/hooks/pre-push"
+  ( cd "$wtr/elsewhere" && PATH="$wtr/alt/bin:$PATH" \
+      git --git-dir="$wtr/co/.git" --work-tree="$wtr/alt" \
+          push origin HEAD:refs/heads/wtrp >/dev/null 2>&1 )
+  printf '%s' "$?" > "$work/wtr-rc"
+  git -C "$wtr/remote.git" update-ref -d refs/heads/wtrp >/dev/null 2>&1 || true
+  [ -s "$wtr_mark" ] && echo fired || echo quiet
+}
+if [ "$(wtr_probe "$wtr_vuln")" != fired ]; then
+  echo "REFUSING: the tracked program did not run even with the root taken from" >&2
+  echo "  pwd, so this section cannot tell a fix from a rig that never" >&2
+  echo "  reproduced the execution." >&2
+  exit 2
+fi
+printf '\npositive control: with the root taken from pwd, the branch program ran.\n'
+if [ "$(wtr_probe "$hook")" = fired ]; then
+  echo "FAIL: a directory named by --work-tree supplied a command to this hook." >&2
+  wtr_fail=1
+else
+  printf 'this hook: the explicitly named work tree is treated as the root.\n'
+fi
+# ⚠ NO "AND THE PUSH SUCCEEDS" ASSERTION HERE, DELIBERATELY. The declared work
+# tree in this rig is a COPY of the checkout, so git's own comparison refuses it
+# with "the index or working tree differs from HEAD" -- a refusal that belongs to
+# the fixture, not to this repair. A first draft asserted success and passed only
+# because the previous probe had refreshed the index, which is a rig artefact
+# rather than a property. That the ordinary push path still works is asserted at
+# the top of this file, where the fixture can hold it.
+
+# ---- the armed ref is removed before its object store --------------------------
+#
+# `GIT_OBJECT_DIRECTORY` names `$tmpdir/objects`, so removing `$tmpdir` first left
+# `update-ref -d` with no repository to open and `|| true` hid it, leaving
+# `refs/prepush-base-*` behind (shardpilot/shardpilot-go#79 review). Asserted as
+# ORDER in the cleanup function, plus the mechanism that makes the order matter.
+ref_fail=0
+cl_s="$(grep -n '^cleanup() {$' "$hook" | head -1 | cut -d: -f1)"
+if [ -z "$cl_s" ]; then
+  echo "REFUSING: the cleanup function was not found, so the order of its" >&2
+  echo "  removals could not be checked." >&2
+  exit 2
+fi
+cl_e="$(awk -v s="$cl_s" 'NR>s && /^}$/ {print NR; exit}' "$hook")"
+cl_ref="$(awk -v a="$cl_s" -v b="$cl_e" 'NR>=a && NR<=b && /update-ref -d "\$base_ref"/ {print NR; exit}' "$hook")"
+cl_rm="$(awk -v a="$cl_s" -v b="$cl_e" 'NR>=a && NR<=b && /rm -rf "\$tmpdir"/ {print NR; exit}' "$hook")"
+if [ -z "$cl_ref" ] || [ -z "$cl_rm" ]; then
+  echo "REFUSING: the cleanup no longer both deletes the armed ref and removes the" >&2
+  echo "  temporary directory, so their order could not be checked." >&2
+  exit 2
+else
+  if [ "$cl_ref" -lt "$cl_rm" ]; then
+    printf 'this hook: the armed ref is deleted before its object store is removed.\n'
+  else
+    echo "FAIL: the temporary directory is removed before the armed ref is deleted," >&2
+    echo "  so update-ref runs with no repository and the ref is left behind." >&2
+    ref_fail=1
+  fi
+fi
+# the mechanism, so the order above is not an arbitrary preference
+ref_r="$work/refm"; rm -rf "$ref_r"; mkdir -p "$ref_r/tmp/objects"
+git init -q "$ref_r/repo" >/dev/null 2>&1
+( cd "$ref_r/repo"; git config user.email t@example.invalid; git config user.name t
+  printf 'a\n' > f; git add -A >/dev/null 2>&1; git commit -qm c1 >/dev/null 2>&1
+  git update-ref refs/prepush-base-test HEAD ) >/dev/null 2>&1
+rm -rf "$ref_r/tmp"
+( cd "$ref_r/repo" && GIT_OBJECT_DIRECTORY="$ref_r/tmp/objects" \
+    git update-ref -d refs/prepush-base-test ) >/dev/null 2>&1
+if git -C "$ref_r/repo" rev-parse --verify --quiet refs/prepush-base-test >/dev/null 2>&1; then
+  printf 'positive control: deleting the store first does leave the ref behind.\n'
+else
+  echo "REFUSING: deleting the object store first did NOT strand the ref here, so" >&2
+  echo "  the order asserted above guards nothing on this git." >&2
+  exit 2
+fi
+
+
+# ---- a direct blob keeps the format its ref names ------------------------------
+#
+# A blob pushed straight at `refs/archive/logo.xbm` has no tree entry and no
+# filename but the ref's last component. Staged under a hard-coded `.txt`, the
+# only format signal was gone before the scanner classified it, and an XBM was
+# approved though the scanner refuses `*.xbm` (shardpilot/shardpilot-go#79
+# review). Asserted on the NAME the evidence is staged under, because that is the
+# thing the defect destroys -- a verdict would also depend on the fixture
+# satisfying every other rule the scanner has.
+blb_fail=0
+blb="$work/blb"; rm -rf "$blb"
+git init -q "$blb/co" >/dev/null 2>&1
+git init -q --bare "$blb/remote.git" >/dev/null 2>&1
+blb_seen="$work/blb-staged"
+( cd "$blb/co"
+  git config user.email t@example.invalid; git config user.name t
+  mkdir -p scripts
+  printf '#!/bin/sh\nls scripts/ >> "%s" 2>/dev/null\nexit 0\n' "$blb_seen" > scripts/check_public_surface.sh
+  chmod +x scripts/check_public_surface.sh
+  printf 'a\n' > f.txt
+  git add -A >/dev/null 2>&1; git commit -qm c1 >/dev/null 2>&1
+  git remote add origin "$blb/remote.git" >/dev/null 2>&1 ) >/dev/null 2>&1
+mkdir -p "$blb/co/.git/hooks"
+cp "$blb/co/scripts/check_public_surface.sh" "$blb/co/.git/hooks/"
+printf '#define logo_width 8\nstatic char logo_bits[] = { 0x00 };\n' > "$blb/logo.xbm"
+blb_oid="$(git -C "$blb/co" hash-object -w "$blb/logo.xbm")"
+git -C "$blb/co" update-ref refs/archive/logo.xbm "$blb_oid" >/dev/null 2>&1
+if [ "$(git -C "$blb/co" cat-file -t refs/archive/logo.xbm 2>/dev/null)" != blob ]; then
+  echo "REFUSING: a ref pointing directly at a blob could not be built, so this" >&2
+  echo "  section is not exercising the path it describes." >&2
+  exit 2
+fi
+blb_vuln="$work/blb-vuln-hook"
+sed 's|"scripts/tag-target-as-committed.\$tt_sfx"|scripts/tag-target-as-committed.txt|' "$hook" > "$blb_vuln"
+chmod +x "$blb_vuln"
+if cmp -s "$blb_vuln" "$hook" || ! bash -n "$blb_vuln" 2>/dev/null; then
+  echo "REFUSING: the stand-in for the staged blob name is identical to the hook or" >&2
+  echo "  does not parse, so the control below reproduces nothing." >&2
+  exit 2
+fi
+blb_probe() { # $1 = hook; prints the suffix the tag target was staged under
+  : > "$blb_seen"
+  cp "$1" "$blb/co/.git/hooks/pre-push"; chmod +x "$blb/co/.git/hooks/pre-push"
+  ( cd "$blb/co" && git push origin refs/archive/logo.xbm:refs/archive/logo.xbm ) >/dev/null 2>&1
+  git -C "$blb/remote.git" update-ref -d refs/archive/logo.xbm >/dev/null 2>&1 || true
+  grep -o 'tag-target-as-committed\.[A-Za-z0-9_]*' "$blb_seen" 2>/dev/null | head -1
+}
+if [ "$(blb_probe "$blb_vuln")" != "tag-target-as-committed.txt" ]; then
+  echo "REFUSING: the stand-in did not stage the tag target under .txt, so this" >&2
+  echo "  section cannot tell a fix from a rig that staged nothing at all." >&2
+  exit 2
+fi
+printf '\npositive control: the hard-coded name stages an XBM as .txt.\n'
+if [ "$(blb_probe "$hook")" = "tag-target-as-committed.xbm" ]; then
+  printf 'this hook: a blob pushed at a ref keeps the format the ref names.\n'
+else
+  echo "FAIL: the published ref's suffix was discarded before the scanner could" >&2
+  echo "  classify the blob." >&2
+  blb_fail=1
+fi
+
 # ---- a PATH directory may serve a command from inside a checkout ---------------
 #
 # The PATH filter drops an entry whose DIRECTORY resolves into a checkout. An
@@ -1446,7 +1623,9 @@ chmod +x "$ins2_x/co/.githooks/pre-push" "$ins2_x/co/scripts/check_public_surfac
 
 # the stand-in drops the branch that consults the invoking checkout
 ins2_vuln="$work/ins2-vuln.sh"
-sed '/"gitdir: \$r") printf .%s.0. "\$t" ;;/d' "$ins" > "$ins2_vuln"
+# the stand-in disables the branch that consults the invoking checkout; the
+# comparison is an `elif` now, not a `case` arm, so the pattern follows it
+sed 's|^        elif test -n "\$rr" && test -n "\$gi_t" && test "\$gi_t" = "\$rr"$|        elif false|' "$ins" > "$ins2_vuln"
 if cmp -s "$ins2_vuln" "$ins"; then
   echo "REFUSING: the stand-in for the external git directory is identical to the" >&2
   echo "  published installer, so the control below reproduces nothing." >&2
@@ -1568,4 +1747,4 @@ printf '\n%d gitfile read(s) found, %d still line-oriented.\n' "$gf_total" "$gf_
 printf '%d checkout-root case(s), %d failure(s).\n' "$itotal" "$ifail"
 printf '%d case(s) judged, %d failure(s); %d normal-form case(s), %d failure(s).\n' \
   "$total" "$failures" "$ntotal" "$nfail"
-[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] && [ "$idx_fail" -eq 0 ] && [ "$inv_fail" -eq 0 ] && [ "$chl_fail" -eq 0 ] && [ "$bp_fail" -eq 0 ] && [ "$kre_fail" -eq 0 ] && [ "$esc_fail" -eq 0 ] && [ "$ord_fail" -eq 0 ] && [ "$ins_fail" -eq 0 ] && [ "$cfg_fail" -eq 0 ] && [ "$rel_fail" -eq 0 ] && [ "$pcr_fail" -eq 0 ] && [ "$nlc_fail" -eq 0 ] && [ "$cse_fail" -eq 0 ] && [ "$ins2_fail" -eq 0 ] || exit 1
+[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] && [ "$idx_fail" -eq 0 ] && [ "$inv_fail" -eq 0 ] && [ "$chl_fail" -eq 0 ] && [ "$bp_fail" -eq 0 ] && [ "$kre_fail" -eq 0 ] && [ "$esc_fail" -eq 0 ] && [ "$ord_fail" -eq 0 ] && [ "$ins_fail" -eq 0 ] && [ "$cfg_fail" -eq 0 ] && [ "$rel_fail" -eq 0 ] && [ "$pcr_fail" -eq 0 ] && [ "$nlc_fail" -eq 0 ] && [ "$cse_fail" -eq 0 ] && [ "$ins2_fail" -eq 0 ] && [ "$wtr_fail" -eq 0 ] && [ "$ref_fail" -eq 0 ] && [ "$blb_fail" -eq 0 ] || exit 1
