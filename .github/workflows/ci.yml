@@ -226,12 +226,22 @@ jobs:
   #
   # WHAT IS JUDGED: every tracked path under scripts/ -- the gate scripts, the Go
   # helpers they `go run`, the benchmark manifest and the lane B baseline are all
-  # inputs to a decision -- plus any gate this workflow invokes from elsewhere.
-  # Both are read at the MERGE BASE as well as at the head. The first version
-  # read the roster from the change's own copy of this file, which is the change
-  # supplying its judge's roster: a gate moved out of scripts/, weakened, with
-  # its invocation edited to match, left the roster and passed. Measured, not
-  # reasoned, before this was rewritten.
+  # inputs to a decision -- plus every shell script this workflow invokes by path
+  # (a slash and `.sh`), wherever it lives. Both are read at the change's BASE as
+  # well as at its head. The first version read the roster from the change's own
+  # copy of this file, which is the change supplying its judge's roster: a gate
+  # moved out of scripts/, weakened, with its invocation edited to match, left
+  # the roster and passed. Measured, not reasoned, before this was rewritten.
+  #
+  # AGAINST WHAT: the change's own base, chosen by event -- the pull request's
+  # base commit, the pre-push tip, or for a brand-new ref the merge base with the
+  # default branch. The first version took that merge base for every event, and
+  # round 1 found it wrong twice. A push to the default branch has merge base
+  # HEAD, so the change was diffed against itself and passed -- and measured
+  # 2026-09-01, 113 of the 184 commits on main carry no pull-request number, 26
+  # of those touched scripts/: that is the path gate changes took here. And a
+  # pull request into a non-default branch reached back to main, so the target
+  # branch's own gate change was charged to every pull request into it.
   #
   # ⚠ THIS JOB DOES NOT CLOSE THE WHOLE CLASS, AND THAT IS SAID HERE RATHER THAN
   # FURTHER DOWN. GitHub runs the CHANGE'S copy of this file on both triggers --
@@ -266,14 +276,22 @@ jobs:
 
     steps:
       - name: Checkout
-        # Full history: the comparison needs a merge base with the default branch.
+        # Full history: the comparison needs the change's base commit, and for a
+        # new ref its merge base with the default branch.
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: A change may not alter the gate that judges it
+        # Plain variables rather than `${{ }}` inside the script, so the block can
+        # be extracted from this file and driven through every event shape by a
+        # fixture that sets these four names. That is how the rows in the pull
+        # request were produced.
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
         run: |
           # `-e` is spelled out because the runner adds it anyway (`bash -e {0}`).
           # The first version said `set -uo pipefail`, its controls were run under
@@ -281,34 +299,70 @@ jobs:
           # unreachable: the failing pipeline exited 1 with no message.
           set -euo pipefail
           wf=.github/workflows/ci.yml
+          zero=0000000000000000000000000000000000000000
 
-          if ! git fetch --no-tags --quiet origin "$DEFAULT_BRANCH"; then
-            echo "REFUSING: origin/$DEFAULT_BRANCH could not be fetched, so there is" >&2
-            echo "  nothing to compare against. A comparison that cannot run is" >&2
-            echo "  reported here rather than passed over." >&2
-            exit 2
-          fi
-
-          # ⚠ THE MERGE BASE, NOT THE TIP. Comparing against the tip reports a gate
-          # that the default branch changed AFTER this branch forked -- a difference
-          # this change did not make. The question is "did THIS branch alter a
-          # gate", and only the merge base answers it.
-          base="$(git merge-base HEAD FETCH_HEAD)" || base=""
+          # ⚠ THE CHANGE'S OWN BASE, BY EVENT. `git merge-base HEAD <default tip>`
+          # is right for a brand-new ref and wrong for the two events that matter
+          # most: on a push to the default branch it IS HEAD, so a direct push
+          # altering a gate was diffed against itself and passed; on a pull
+          # request into a non-default branch it reaches back to main, so the
+          # target branch's own gate change was charged to every pull request
+          # into it. Both found by round 1 on shardpilot/shardpilot-go#101.
+          case "$EVENT_NAME" in
+            pull_request)
+              base="$PR_BASE_SHA"; what="the pull request's base commit"
+              if [ -z "$base" ]; then
+                echo "REFUSING: a pull_request event without a base sha; nothing to" >&2
+                echo "  compare against, and this job will not guess one." >&2
+                exit 2
+              fi ;;
+            push)
+              if [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != "$zero" ]; then
+                base="$PUSH_BEFORE"; what="the pre-push tip"
+              else
+                base=""; what="the merge base with origin/$DEFAULT_BRANCH"
+              fi ;;
+            *)
+              echo "REFUSING: event '$EVENT_NAME' -- this job knows the change's base" >&2
+              echo "  only for push and pull_request, and will not guess one." >&2
+              exit 2 ;;
+          esac
           if [ -z "$base" ]; then
-            echo "REFUSING: no merge base with origin/$DEFAULT_BRANCH, so which side" >&2
-            echo "  changed a gate could not be decided." >&2
-            exit 2
+            if ! git fetch --no-tags --quiet origin "$DEFAULT_BRANCH"; then
+              echo "REFUSING: origin/$DEFAULT_BRANCH could not be fetched, so there is" >&2
+              echo "  nothing to compare against. A comparison that cannot run is" >&2
+              echo "  reported here rather than passed over." >&2
+              exit 2
+            fi
+            base="$(git merge-base HEAD FETCH_HEAD)" || base=""
+            if [ -z "$base" ]; then
+              echo "REFUSING: no merge base with origin/$DEFAULT_BRANCH, so which side" >&2
+              echo "  changed a gate could not be decided." >&2
+              exit 2
+            fi
+          elif ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            # A force-push leaves the old tip reachable from no ref. Fetching it by
+            # sha works while GitHub still holds the object; when it does not, the
+            # refusal costs a re-run, where a pass would cost a miss.
+            if ! git fetch --no-tags --quiet origin "$base" 2>/dev/null \
+               || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+              echo "REFUSING: $what ($base) is not available here, so there is" >&2
+              echo "  nothing to compare against." >&2
+              exit 2
+            fi
           fi
 
-          # The roster is DERIVED from this workflow, not listed -- a gate added
-          # later is covered the moment CI runs it -- and it is read from the
-          # merge base's copy as well as the head's, so the change cannot edit a
-          # gate out of it. The grep is guarded: under -e a miss would otherwise
-          # end the script before the refusal below could name it.
-          derive() { { grep -oE '(\./)?scripts/[A-Za-z0-9_.-]+\.sh' || :; } | sed 's|^\./||'; }
+          # The roster is DERIVED from this workflow, not listed: every shell
+          # script it invokes by path -- a slash and `.sh`, in any directory --
+          # read from the base's copy as well as the head's, so the change cannot
+          # edit a gate out of it. The grep is guarded: under -e a miss would
+          # otherwise end the script before the refusal below could name it.
+          # ⚠ Outside the roster, stated: a gate that is not a `.sh` path (a
+          # `go run` target, an inline step) and does not live under scripts/.
+          derive() { { grep -oE '(\./)?[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)+\.sh' || :; } | sed 's|^\./||' | sort -u; }
           if ! git cat-file -e "$base:$wf" 2>/dev/null; then
-            echo "REFUSING: $wf does not exist at the merge base $base, so the" >&2
-            echo "  roster this job judges against could not be read." >&2
+            echo "REFUSING: $wf does not exist at the base $base, so the roster" >&2
+            echo "  this job judges against could not be read." >&2
             exit 2
           fi
           from_base="$(git show "$base:$wf" | derive)"
@@ -316,7 +370,7 @@ jobs:
           if [ -f "$wf" ]; then from_head="$(derive < "$wf")"; fi
           if [ -z "$from_base" ] || [ -z "$from_head" ]; then
             echo "REFUSING: no gate script invocation was found in $wf" >&2
-            echo "  (merge base: ${from_base:-none}; head: ${from_head:-none}), so this" >&2
+            echo "  (base: ${from_base:-none}; head: ${from_head:-none}), so this" >&2
             echo "  check would compare nothing and report success. The pattern" >&2
             echo "  here has stopped matching how the workflow runs its gates." >&2
             exit 2
@@ -338,11 +392,11 @@ jobs:
           EOF
 
           if [ -z "$changed" ]; then
-            printf 'this change does not alter any of the %d gate file(s) that judge it.\n' "$n"
+            printf 'this change does not alter any of the %d gate file(s) that judge it (base: %s).\n' "$n" "$what"
             exit 0
           fi
 
-          echo "REFUSING: this change alters the gate that judges it." >&2
+          echo "REFUSING: this change alters the gate that judges it (base: $what)." >&2
           echo >&2
           printf '%s' "$changed" >&2
           echo >&2
