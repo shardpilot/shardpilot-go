@@ -313,6 +313,7 @@ No Makefile — standard Go tooling.
 ```
 p_(){ x="$(cd -- "$1" && pwd -P && printf X)" || return 1; x="${x%X}"; printf '%sX' "${x%?}"; } &&
 NL="$(printf '\nX')" && NL="${NL%X}" &&
+CR="$(printf '\rX')" && CR="${CR%X}" &&
 g="$(git rev-parse --git-common-dir && printf X)" && g="${g%X}" && g="${g%?}" &&
 b="$(git rev-parse --is-bare-repository)" &&
 { test "$b" = true ||
@@ -343,10 +344,15 @@ while IFS= read -r -d "" rec; do
     pr="${r%/*}" &&
     { test -e "$r/.git" ||
       { gl=""; test ! -f "$pr/.git" ||
-          { IFS= read -r -d "" gl < "$pr/.git" || true; gl="${gl%$NL}"; };
+          { IFS= read -r -d "" gl < "$pr/.git" || true; gl="${gl%$NL}"; gl="${gl%$CR}"; };
+        gi=""; test "$b" = true || test ! -f "$t/.git" ||
+          { IFS= read -r -d "" gi < "$t/.git" || true; gi="${gi%$NL}"; gi="${gi%$CR}"; };
         case "$gl" in
           "gitdir: $r") printf '%s\0' "$pr" ;;
-          *) echo "$r is a git directory whose checkout cannot be named -- install from the main checkout" >&2; exit 1 ;;
+          *) case "$gi" in
+               "gitdir: $r") printf '%s\0' "$t" ;;
+               *) echo "$r is a git directory whose checkout cannot be named -- install from the main checkout" >&2; exit 1 ;;
+             esac ;;
         esac; }; } || exit 1 ;;
   esac
 done < "$wt" > "$wp" &&
@@ -365,18 +371,31 @@ pv="$(mktemp)" &&
 { prev_local="$(git config --local --get core.hooksPath 2>/dev/null)" && had_local=yes ||
   { prev_local=""; had_local=no; }; } &&
 { test "$b" != true || printf '%s\0' "$gr" >> "$wp"; } &&
-sp_rollback(){ rm -f "$h/pre-push" "$h/check_public_surface.sh" \
-    "$h/.pre-push.new" "$h/.check_public_surface.sh.new"
-  if test "$had_local" = yes
-  then git config --local core.hooksPath "$prev_local" 2>/dev/null || true
-  else git config --local --unset core.hooksPath 2>/dev/null || true
+sp_set=no &&
+sp_rollback(){ sp_done=yes
+  if test "$sp_set" = yes
+  then
+    if test "$had_local" = yes
+    then git config --local core.hooksPath "$prev_local" 2>/dev/null || sp_done=no
+    else git config --local --unset core.hooksPath 2>/dev/null || sp_done=no
+    fi
   fi
   while IFS= read -r -d "" rw && IFS= read -r -d "" rv; do
     test -n "$rw" || continue
-    git -C "$rw" config --worktree core.hooksPath "$rv" 2>/dev/null || true
+    git -C "$rw" config --worktree core.hooksPath "$rv" 2>/dev/null || sp_done=no
   done < "$pv"
-  rm -f "$wt" "$wp" "$pv"
-  echo "installation failed; the published hooks were rolled back" >&2; exit 1; } &&
+  rm -f "$h/.pre-push.new" "$h/.check_public_surface.sh.new" "$wt" "$wp" "$pv"
+  if test "$sp_done" = yes
+  then rm -f "$h/pre-push" "$h/check_public_surface.sh"
+    echo "installation failed; the published hooks were rolled back" >&2
+  else
+    echo "installation failed AND THE ROLLBACK IS INCOMPLETE: core.hooksPath could" >&2
+    echo "  not be restored, so it still names $h. The published hooks were LEFT" >&2
+    echo "  THERE so that pushes are still checked -- removing them would have left" >&2
+    echo "  no pre-push hook running at all. Fix the cause, then remove" >&2
+    echo "  $h/pre-push and $h/check_public_surface.sh and restore core.hooksPath." >&2
+  fi
+  exit 1; } &&
 { { { test "$b" = true &&
         { git show HEAD:.githooks/pre-push > "$h/.pre-push.new" &&
           git show HEAD:scripts/check_public_surface.sh > "$h/.check_public_surface.sh.new"; }; } ||
@@ -385,7 +404,7 @@ sp_rollback(){ rm -f "$h/pre-push" "$h/check_public_surface.sh" \
 { chmod +x "$h/.pre-push.new" "$h/.check_public_surface.sh.new" || sp_rollback; } &&
 { mv "$h/.pre-push.new" "$h/pre-push" || sp_rollback; } &&
 { mv "$h/.check_public_surface.sh.new" "$h/check_public_surface.sh" || sp_rollback; } &&
-{ git config --local core.hooksPath "$h" || sp_rollback; } &&
+{ git config --local core.hooksPath "$h" && sp_set=yes || sp_rollback; } &&
 while IFS= read -r -d "" w; do
   test "$(git -C "$w" config --bool extensions.worktreeConfig 2>/dev/null || echo false)" = true || continue
   if wv="$(git -C "$w" config --worktree --get core.hooksPath 2>/dev/null)"

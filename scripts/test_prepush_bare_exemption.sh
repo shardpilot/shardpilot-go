@@ -1402,8 +1402,124 @@ grep -q "rolled back" "$work/insE.out"; ins_say "$?" "the rollback says so"
 [ "$(git -C "$insE" config --local --get core.hooksPath)" = /nonexistent/prior ]
 ins_say "$?" "the prior core.hooksPath is restored"
 
+# ---- the installer on an external git directory, and an honest rollback --------
+#
+# Two findings against the published installer
+# (shardpilot/shardpilot-go#79 review), both reproduced before they were repaired.
+#
+# `git worktree list` reports the GIT DIRECTORY rather than the checkout for a
+# repository made with `--separate-git-dir`, so the ownership test looked beside
+# that directory for a back-pointer, did not find one, and refused with "install
+# from the main checkout" while running in the main checkout. The back-pointer it
+# needed was in the invoking checkout, which the installer had already resolved.
+#
+# And `sp_rollback` withdrew the published hooks BEFORE restoring
+# `core.hooksPath`, then ignored a restore failure and reported success. The
+# result is the worst available state: the configuration still names the hooks
+# directory, the hooks are gone, and no pre-push hook runs at all while the
+# installer says the prior setup was restored.
+ins2_fail=0
+
+# ---- an external `--separate-git-dir` checkout can install --------------------
+ins2_x="$work/ins2x"; rm -rf "$ins2_x"; mkdir -p "$ins2_x/store"
+git init -q --separate-git-dir="$ins2_x/store/meta" "$ins2_x/co" >/dev/null 2>&1
+mkdir -p "$ins2_x/co/.githooks" "$ins2_x/co/scripts"
+printf '#!/bin/sh\nexit 0\n' > "$ins2_x/co/.githooks/pre-push"
+printf '#!/bin/sh\nexit 0\n' > "$ins2_x/co/scripts/check_public_surface.sh"
+chmod +x "$ins2_x/co/.githooks/pre-push" "$ins2_x/co/scripts/check_public_surface.sh"
+( cd "$ins2_x/co"; git config user.email t@example.invalid; git config user.name t
+  git add -A >/dev/null 2>&1; git commit -qm i >/dev/null 2>&1 ) >/dev/null 2>&1
+
+# the stand-in drops the branch that consults the invoking checkout
+ins2_vuln="$work/ins2-vuln.sh"
+sed '/"gitdir: \$r") printf .%s.0. "\$t" ;;/d' "$ins" > "$ins2_vuln"
+if cmp -s "$ins2_vuln" "$ins"; then
+  echo "REFUSING: the stand-in for the external git directory is identical to the" >&2
+  echo "  published installer, so the control below reproduces nothing." >&2
+  exit 2
+fi
+ins2_run() { # $1 = installer
+  rm -f "$ins2_x/store/meta/hooks/pre-push" "$ins2_x/store/meta/hooks/check_public_surface.sh"
+  git -C "$ins2_x/co" config --local --unset core.hooksPath >/dev/null 2>&1 || true
+  ( cd "$ins2_x/co" && bash "$1" ) >"$work/ins2.out" 2>&1
+  printf '%s' "$?" > "$work/ins2-rc"
+}
+ins2_run "$ins2_vuln"
+if [ "$(cat "$work/ins2-rc")" -eq 0 ]; then
+  echo "REFUSING: the stand-in installed into an external git directory, so this" >&2
+  echo "  section cannot tell a fix from a rig that never reproduced the refusal." >&2
+  exit 2
+fi
+printf '\npositive control: without the invoking-checkout branch the install is refused.\n'
+ins2_run "$ins"
+if [ "$(cat "$work/ins2-rc")" -eq 0 ] && [ -x "$ins2_x/store/meta/hooks/pre-push" ]; then
+  printf 'this installer: an external `--separate-git-dir` checkout installs.\n'
+else
+  echo "FAIL: the installer refused a repository whose git directory is external," >&2
+  echo "  which is the layout its own documentation describes." >&2
+  sed 's/^/      /' "$work/ins2.out" >&2
+  ins2_fail=1
+fi
+
+# ---- a rollback that cannot restore the configuration says so ----------------
+#
+# The shim fails the post-publication verification, then refuses every local
+# config write -- which is what a full filesystem does to the same sequence.
+# ⚠ THE REAL `git` IS RESOLVED BEFORE THE SHIM DIRECTORY EXISTS. A shim named
+# `git` that ends `exec git "$@"` re-execs ITSELF, because the shim directory is
+# what put it first on PATH -- the same slip this file already carries one fix
+# for, in the `mv` shim above, made again here.
+ins2_real_git="$(command -v git)"
+if [ -z "$ins2_real_git" ]; then
+  echo "REFUSING: git could not be resolved, so the shim below would re-enter" >&2
+  echo "  itself instead of running the real program." >&2
+  exit 2
+fi
+mkdir -p "$work/ins2shim"
+cat > "$work/ins2shim/git" <<INS2SHIM
+#!/usr/bin/env bash
+if [ "\$1" = "-C" ] && [ "\$3" = "rev-parse" ]; then
+  : > "\$SP_PHASE"; echo "git: injected verification failure" >&2; exit 1
+fi
+if [ -f "\$SP_PHASE" ]; then
+  for a in "\$@"; do [ "\$a" = "--local" ] && { echo "git: could not write config" >&2; exit 1; }; done
+fi
+exec $ins2_real_git "\$@"
+INS2SHIM
+chmod +x "$work/ins2shim/git"
+# the stand-in swallows the restore failure, which is what the defect was
+ins2_rbv="$work/ins2-rb-vuln.sh"
+sed 's|2>/dev/null \|\| sp_done=no|2>/dev/null \|\| true|g' "$ins" > "$ins2_rbv"
+if cmp -s "$ins2_rbv" "$ins"; then
+  echo "REFUSING: the stand-in for the rollback is identical to the published" >&2
+  echo "  installer, so the control below reproduces nothing." >&2
+  exit 2
+fi
+ins2_rb() { # $1 = installer, $2 = tag
+  ins2_d="$work/ins2rb$2"; ins_fixture "$ins2_d"
+  git -C "$ins2_d" config --local core.hooksPath /prior/path >/dev/null 2>&1
+  rm -f "$work/ins2-phase"
+  ( cd "$ins2_d" && SP_PHASE="$work/ins2-phase" PATH="$work/ins2shim:$PATH" bash "$1" ) \
+    >"$work/ins2rb.out" 2>&1
+  [ -e "$ins2_d/.git/hooks/pre-push" ] && echo kept || echo gone
+}
+if [ "$(ins2_rb "$ins2_rbv" v)" != gone ]; then
+  echo "REFUSING: the swallowing stand-in did not withdraw the hook, so this" >&2
+  echo "  section cannot tell a fix from a rig that never reproduced the state." >&2
+  exit 2
+fi
+printf 'positive control: swallowing the restore failure withdraws the only hook.\n'
+if [ "$(ins2_rb "$ins" f)" = kept ] && grep -q "INCOMPLETE" "$work/ins2rb.out"; then
+  printf 'this installer: a rollback that cannot restore the configuration says so,\n'
+  printf '  and leaves a hook that still runs.\n'
+else
+  echo "FAIL: the rollback withdrew the published hook while core.hooksPath still" >&2
+  echo "  named it, leaving no pre-push hook running, and did not say so." >&2
+  ins2_fail=1
+fi
+
 printf '\n%d gitfile read(s) found, %d still line-oriented.\n' "$gf_total" "$gf_bad"
 printf '%d checkout-root case(s), %d failure(s).\n' "$itotal" "$ifail"
 printf '%d case(s) judged, %d failure(s); %d normal-form case(s), %d failure(s).\n' \
   "$total" "$failures" "$ntotal" "$nfail"
-[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] && [ "$idx_fail" -eq 0 ] && [ "$inv_fail" -eq 0 ] && [ "$chl_fail" -eq 0 ] && [ "$bp_fail" -eq 0 ] && [ "$kre_fail" -eq 0 ] && [ "$esc_fail" -eq 0 ] && [ "$ord_fail" -eq 0 ] && [ "$ins_fail" -eq 0 ] && [ "$cfg_fail" -eq 0 ] && [ "$rel_fail" -eq 0 ] && [ "$pcr_fail" -eq 0 ] && [ "$nlc_fail" -eq 0 ] && [ "$cse_fail" -eq 0 ] || exit 1
+[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] && [ "$idx_fail" -eq 0 ] && [ "$inv_fail" -eq 0 ] && [ "$chl_fail" -eq 0 ] && [ "$bp_fail" -eq 0 ] && [ "$kre_fail" -eq 0 ] && [ "$esc_fail" -eq 0 ] && [ "$ord_fail" -eq 0 ] && [ "$ins_fail" -eq 0 ] && [ "$cfg_fail" -eq 0 ] && [ "$rel_fail" -eq 0 ] && [ "$pcr_fail" -eq 0 ] && [ "$nlc_fail" -eq 0 ] && [ "$cse_fail" -eq 0 ] && [ "$ins2_fail" -eq 0 ] || exit 1
