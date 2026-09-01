@@ -224,13 +224,32 @@ jobs:
   # asserting the same thing is advisory, because `--no-verify` removes it
   # (shardpilot/shardpilot-go#97).
   #
+  # WHAT IS JUDGED: every tracked path under scripts/ -- the gate scripts, the Go
+  # helpers they `go run`, the benchmark manifest and the lane B baseline are all
+  # inputs to a decision -- plus any gate this workflow invokes from elsewhere.
+  # Both are read at the MERGE BASE as well as at the head. The first version
+  # read the roster from the change's own copy of this file, which is the change
+  # supplying its judge's roster: a gate moved out of scripts/, weakened, with
+  # its invocation edited to match, left the roster and passed. Measured, not
+  # reasoned, before this was rewritten.
+  #
   # ⚠ THIS JOB DOES NOT CLOSE THE WHOLE CLASS, AND THAT IS SAID HERE RATHER THAN
-  # FURTHER DOWN. On the `push` trigger GitHub runs the branch's OWN copy of this
-  # file, so a branch can DELETE this job instead of failing it. Only branch
-  # protection with required status checks closes that, and it is a repository
-  # setting rather than anything a file can assert. A reader who implements this
-  # and stops has closed three routes and left the fourth silent, which is the
-  # mistake #97 documents.
+  # FURTHER DOWN. GitHub runs the CHANGE'S copy of this file on both triggers --
+  # the branch's on `push`, the merge commit's on `pull_request` -- so a change
+  # can delete this job, or keep its name and hollow it out. A required status
+  # check closes the deletion (a missing check blocks the merge) and not the
+  # hollowing; only a job run from a workflow the change cannot edit closes both
+  # -- `pull_request_target` in its own workflow file, or a ruleset requiring a
+  # workflow pinned to the default branch. Every one of those is a repository
+  # setting rather than anything a file can assert. A reader who implements
+  # this and stops has closed the script routes and left the workflow route
+  # silent, which is the mistake #97 documents.
+  #
+  # ⚠ A GATE CHANGE IS RED HERE BY DESIGN. Measured 2026-09-01: 35 of the 184
+  # commits then on main touched a gate script, and each would have failed this
+  # job -- each was a change to a judge, and the refusal asks a human to read it
+  # as one. With this job a required check, such a change merges only through
+  # the bypass list; that is the review, not a way around it.
   #
   # ⚠ VERIFY, NOT SUBSTITUTE, AND THE REASON WAS MEASURED. Running the gate from a
   # trusted checkout looks stronger and is worse: `check_public_surface.sh` does
@@ -256,20 +275,12 @@ jobs:
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          set -uo pipefail
-
-          # The population is DERIVED from this workflow, not listed. A gate added
-          # later is covered the moment CI runs it; a hand-list would cover the
-          # ones that existed the day this was written, which is the shape of
-          # defect this job exists to answer.
+          # `-e` is spelled out because the runner adds it anyway (`bash -e {0}`).
+          # The first version said `set -uo pipefail`, its controls were run under
+          # plain bash, and in CI the branch refusing an empty roster was
+          # unreachable: the failing pipeline exited 1 with no message.
+          set -euo pipefail
           wf=.github/workflows/ci.yml
-          gates="$(grep -oE '(\./)?scripts/[A-Za-z0-9_.-]+\.sh' "$wf" | sed 's|^\./||' | sort -u)"
-          if [ -z "$gates" ]; then
-            echo "REFUSING: no gate script invocation was found in $wf, so this" >&2
-            echo "  check would compare nothing and report success. The pattern" >&2
-            echo "  here has stopped matching how the workflow runs its gates." >&2
-            exit 2
-          fi
 
           if ! git fetch --no-tags --quiet origin "$DEFAULT_BRANCH"; then
             echo "REFUSING: origin/$DEFAULT_BRANCH could not be fetched, so there is" >&2
@@ -289,42 +300,66 @@ jobs:
             exit 2
           fi
 
+          # The roster is DERIVED from this workflow, not listed -- a gate added
+          # later is covered the moment CI runs it -- and it is read from the
+          # merge base's copy as well as the head's, so the change cannot edit a
+          # gate out of it. The grep is guarded: under -e a miss would otherwise
+          # end the script before the refusal below could name it.
+          derive() { { grep -oE '(\./)?scripts/[A-Za-z0-9_.-]+\.sh' || :; } | sed 's|^\./||'; }
+          if ! git cat-file -e "$base:$wf" 2>/dev/null; then
+            echo "REFUSING: $wf does not exist at the merge base $base, so the" >&2
+            echo "  roster this job judges against could not be read." >&2
+            exit 2
+          fi
+          from_base="$(git show "$base:$wf" | derive)"
+          from_head=""
+          if [ -f "$wf" ]; then from_head="$(derive < "$wf")"; fi
+          if [ -z "$from_base" ] || [ -z "$from_head" ]; then
+            echo "REFUSING: no gate script invocation was found in $wf" >&2
+            echo "  (merge base: ${from_base:-none}; head: ${from_head:-none}), so this" >&2
+            echo "  check would compare nothing and report success. The pattern" >&2
+            echo "  here has stopped matching how the workflow runs its gates." >&2
+            exit 2
+          fi
+          tree_base="$(git ls-tree -r --name-only "$base" -- scripts/)"
+          tree_head="$(git ls-files -- scripts/)"
+          judges="$(printf '%s\n%s\n%s\n%s\n' "$from_base" "$from_head" "$tree_base" "$tree_head" | sed '/^$/d' | sort -u)"
+
           changed=""
           n=0
           while IFS= read -r g; do
             [ -n "$g" ] || continue
             n=$((n + 1))
             if ! git diff --quiet "$base" -- "$g"; then
-              changed="$changed$g
-          "
+              changed="$changed    $g"$'\n'
             fi
           done <<EOF
-          $gates
+          $judges
           EOF
 
           if [ -z "$changed" ]; then
-            printf 'this change does not alter any of the %d gate(s) that judge it.\n' "$n"
+            printf 'this change does not alter any of the %d gate file(s) that judge it.\n' "$n"
             exit 0
           fi
 
           echo "REFUSING: this change alters the gate that judges it." >&2
           echo >&2
-          printf '%s' "$changed" | sed 's/^/    /' >&2
+          printf '%s' "$changed" >&2
           echo >&2
           echo '  A change may not supply its own judge. CI is the authoritative' >&2
           echo '  place to hold that: a pre-push hook asserting it is advisory,' >&2
           echo '  because `--no-verify` removes it.' >&2
           echo >&2
-          echo '  This is EXPECTED for a deliberate gate improvement, and it is not' >&2
-          echo '  automatically bypassable on purpose: a gate that can be weakened' >&2
-          echo '  without review is not a gate. Land such a change on its own terms,' >&2
-          echo '  reviewed AS a change to the gate rather than carried alongside the' >&2
-          echo '  work it would judge.' >&2
+          echo '  This is EXPECTED for a deliberate gate change, and it is red on' >&2
+          echo '  purpose: a gate that can be weakened without review is not a gate.' >&2
+          echo '  Land such a change on its own terms, reviewed AS a change to the' >&2
+          echo '  gate rather than carried alongside the work it would judge. If this' >&2
+          echo '  job is a required check, that review is the bypass list.' >&2
           echo >&2
-          echo '  ⚠ AND THIS DOES NOT CLOSE THE WHOLE CLASS: on `push` GitHub runs' >&2
-          echo "  the branch's own copy of this workflow, so a branch can remove this" >&2
-          echo '  job rather than fail it. Only branch protection with required status' >&2
-          echo '  checks closes that. See shardpilot/shardpilot-go#97.' >&2
+          echo "  ⚠ AND THIS DOES NOT CLOSE THE WHOLE CLASS: GitHub runs the change's" >&2
+          echo '  own copy of this workflow on both triggers, so a change can delete' >&2
+          echo '  or hollow out this job rather than fail it. Only a repository' >&2
+          echo '  setting closes that. See shardpilot/shardpilot-go#97.' >&2
           exit 1
 
   release-consistency:
