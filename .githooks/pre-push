@@ -1,5 +1,35 @@
 #!/bin/bash -p
 #
+# ============================================================================
+# THE PROPERTY THIS GATE ENFORCES, STATED ONCE:
+#
+#   NOTHING THE PUSH INTRODUCES MAY INFLUENCE THE DECISION ABOUT WHETHER THE
+#   PUSH IS ALLOWED.
+#
+# That sentence is the whole of this file. It is long because the property has
+# many routes to close, not because it holds several policies: every refusal
+# below is that one sentence applied to a route, and of the 66 refusals here 39
+# refuse because a fact could not be ESTABLISHED rather than because a rule was
+# broken. Where this file is uncertain, it declines.
+#
+# It reads in three phases, and they are stages of one argument rather than
+# three gates sharing a trigger:
+#
+#   A. the branch's content cannot EXECUTE            environment, PATH, config
+#   B. the branch's content cannot REPLACE THE JUDGE  scanner identity, hooks dir
+#   C. the branch's content is read as DATA           refspec, trees, tags
+#
+# None of them stands alone. C without A and B executes the branch's code while
+# judging it, which is the defect this file was opened for. A and B without C
+# protect a scan that would not exist.
+#
+# ⚠ AND THE COMMENTS ARE 60% OF IT, DELIBERATELY. Repeatedly here a repair's own
+# stated reasoning was the thing that later proved wrong -- the reasoning is
+# recorded beside the code that carries it so the next reader can check the
+# argument rather than only the behaviour. Every "⚠" below marks something that
+# was MEASURED after being got wrong.
+# ============================================================================
+#
 # ⚠ AND `-p`, BECAUSE BASH RUNS FILES BEFORE LINE 1. A non-interactive bash SOURCES
 # `$BASH_ENV` before executing the script, so an environment naming a tracked path
 # there ran branch-supplied code first -- `exit 0` in it approves the push without
@@ -1123,10 +1153,55 @@ set -f
 for path_entry in $sanitised_path; do
   set +f
   [ -d "$path_entry" ] || { set -f; continue; }
+  # ⚠ AND A REGULAR FILE REACHES INTO A CHECKOUT THROUGH ITS SHEBANG. This loop
+  # collected only symlinks, so an ordinary executable script in an accepted
+  # external directory, whose `#!` names an interpreter inside the checkout, was
+  # not looked at -- and the branch owns the interpreter: reproduced running four
+  # times during a push before the scan refused it
+  # (shardpilot/shardpilot-go#79 review). Third route to the same place after the
+  # DIRECTORY and the SYMLINK, which is the shape of a repair aimed at instances.
+  #
+  # The interpreter is read with a BOUNDED builtin read -- no fork, and no
+  # unbounded first "line" from a binary -- and its directory is judged by the
+  # same containment question as everything else here. A shebang path that is not
+  # absolute cannot name a checkout, and the kernel would not run it either.
   sp_links=()
   for sp_f in "$path_entry"/*; do
-    [ -L "$sp_f" ] && sp_links+=("$sp_f")
+    if [ -L "$sp_f" ]; then
+      sp_links+=("$sp_f")
+      continue
+    fi
+    [ -f "$sp_f" ] && [ -x "$sp_f" ] || continue
+    sp_head=""
+    IFS= LC_ALL=C read -r -n 256 sp_head < "$sp_f" 2>/dev/null || true
+    case "$sp_head" in
+      '#!'*) ;;
+      *) continue ;;
+    esac
+    sp_int="${sp_head#\#!}"
+    while :; do
+      case "$sp_int" in
+        " "*|"	"*) sp_int="${sp_int#?}" ;;
+        *) break ;;
+      esac
+    done
+    sp_int="${sp_int%%[ 	]*}"
+    case "$sp_int" in
+      /*) ;;
+      *) continue ;;
+    esac
+    # resolved before it is judged: `inside_a_checkout` compares physical paths,
+    # and a shebang carries whatever spelling was written -- `/var/...` against a
+    # root of `/private/var/...` matched nothing and the wrapper passed. `physdir`
+    # is `cd -P`, a builtin, so this stays ahead of the first external command.
+    sp_intd="$(physdir "${sp_int%/*}")" && sp_intd="${sp_intd%X}" || sp_intd="${sp_int%/*}"
+    if inside_a_checkout "$sp_intd"; then
+      sp_bad_dir="$path_entry"
+      sp_bad_cmd="${sp_f##*/}"
+      break
+    fi
   done
+  [ -n "$sp_bad_dir" ] && break
   set -f
   [ "${#sp_links[@]}" -gt 0 ] || continue
   # One resolution per DIRECTORY rather than per link: the per-link form cost
@@ -1189,6 +1264,7 @@ IFS="$old_ifs"
 if [ -n "$sp_bad_dir" ]; then
   # named only now, so the common case pays one resolution per directory
   for sp_f in "$sp_bad_dir"/*; do
+    [ -n "$sp_bad_cmd" ] && break
     [ -L "$sp_f" ] || continue
     # sentinelled like every other path read here: `$( )` strips trailing
     # newlines and a pathname may end in one
@@ -1206,7 +1282,7 @@ if [ -n "$sp_bad_dir" ]; then
 ' >&2
   exit 2
 fi
-unset sp_d sp_dp sp_f sp_t sp_links sp_bad_dir sp_bad_cmd sp_batch sp_nlines sp_rest
+unset sp_d sp_dp sp_f sp_t sp_links sp_bad_dir sp_bad_cmd sp_batch sp_nlines sp_rest sp_head sp_int sp_intd
 # <<< PATH-COMMAND-RESOLUTION
 
 PATH="$sanitised_path"

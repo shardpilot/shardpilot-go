@@ -247,7 +247,13 @@ fi
 # `.../.git`: the back-pointer inside `worktrees/<n>/gitdir` is the same class and
 # the narrower pattern could not see it, so a line-oriented read there would have
 # been reported green by a check whose stated subject is the class.
-gitfile_reads="$(grep -n 'read -r[^<]*< *"' "$hook" || true)"
+# ⚠ EXCEPT A BOUNDED PREFIX READ, which is a different question. `read -r -n N`
+# deliberately takes the first N bytes of a file rather than its whole value --
+# the shebang scan reads 256 bytes of an executable to find its interpreter -- and
+# requiring `-d ""` there would demand it swallow a binary whole. The property
+# this check defends is "a read whose result IS the value must not stop at a
+# newline"; a read that is explicitly a prefix is not one of those.
+gitfile_reads="$(grep -n 'read -r[^<]*< *"' "$hook" | grep -v 'read -r -n ' || true)"
 gf_bad=0
 gf_total=0
 while IFS= read -r gf_line; do
@@ -807,6 +813,78 @@ fi
 
 
 
+
+
+# ---- a shebang reaches into a checkout from an external directory --------------
+#
+# The scan above collected only SYMLINKS, so an ordinary executable script in an
+# accepted external directory, whose `#!` names an interpreter inside the
+# checkout, was never looked at -- and the branch owns the interpreter
+# (shardpilot/shardpilot-go#79 review). Third route to the same place after the
+# directory and the symlink.
+#
+# ⚠ WHAT IS ASSERTED IS THE REFUSAL, NOT AN EXECUTION. I could not reproduce the
+# interpreter running: on this rig the unfixed hook refuses earlier, for an
+# unrelated reason, before it resolves a command through PATH. So the control
+# below shows that the unfixed form does NOT produce this refusal and the fixed
+# one does, which is the property -- and it is stated rather than implied,
+# because a section that cannot reproduce the execution should say so.
+shb_fail=0
+shb="$work/shb"; rm -rf "$shb"; mkdir -p "$shb/safe"
+git init -q "$shb/co" >/dev/null 2>&1
+git init -q --bare "$shb/remote.git" >/dev/null 2>&1
+( cd "$shb/co"
+  git config user.email t@example.invalid; git config user.name t
+  printf '#!/bin/sh\nshift\nexec /usr/bin/grep "$@"\n' > interp.sh
+  chmod +x interp.sh
+  printf 'a\n' > f.txt
+  git add -A >/dev/null 2>&1; git commit -qm c1 >/dev/null 2>&1
+  git remote add origin "$shb/remote.git" >/dev/null 2>&1 ) >/dev/null 2>&1
+printf '#!/bin/sh\nexit 0\n' > "$shb/co/.git/hooks/check_public_surface.sh"
+chmod +x "$shb/co/.git/hooks/check_public_surface.sh"
+# the stand-in looks at symlinks only, which is what the defect was
+shb_vuln="$work/shb-vuln-hook"
+sed 's|^    \[ -f "\$sp_f" \] && \[ -x "\$sp_f" \] || continue$|    continue|' "$hook" > "$shb_vuln"
+chmod +x "$shb_vuln"
+if cmp -s "$shb_vuln" "$hook" || ! bash -n "$shb_vuln" 2>/dev/null; then
+  echo "REFUSING: the stand-in for the shebang scan is identical to the hook or" >&2
+  echo "  does not parse, so the control below reproduces nothing." >&2
+  exit 2
+fi
+shb_probe() { # $1 = hook; prints whether THIS refusal fired
+  cp "$1" "$shb/co/.git/hooks/pre-push"; chmod +x "$shb/co/.git/hooks/pre-push"
+  shb_out="$( cd "$shb/co" && PATH="$shb/safe:$PATH" \
+      git push origin HEAD:refs/heads/shbp 2>&1 )"
+  printf '%s' "$?" > "$work/shb-rc"
+  git -C "$shb/remote.git" update-ref -d refs/heads/shbp >/dev/null 2>&1 || true
+  case "$shb_out" in
+    *"serves a command from inside"*) echo caught ;;
+    *) echo missed ;;
+  esac
+}
+printf '#!%s\n' "$shb/co/interp.sh" > "$shb/safe/grep"
+chmod +x "$shb/safe/grep"
+if [ "$(shb_probe "$shb_vuln")" != missed ]; then
+  echo "REFUSING: the symlink-only stand-in already produced this refusal, so the" >&2
+  echo "  check below cannot tell a fix from a rig that never needed one." >&2
+  exit 2
+fi
+printf '\npositive control: inspecting symlinks alone does not see a shebang wrapper.\n'
+if [ "$(shb_probe "$hook")" = caught ]; then
+  printf 'this hook: an interpreter named by a shebang is judged like any other command.\n'
+else
+  echo "FAIL: an external directory served a script whose interpreter is inside the" >&2
+  echo "  checkout, and the gate accepted it." >&2
+  shb_fail=1
+fi
+rm -f "$shb/safe/grep"
+if [ "$(shb_probe "$hook")" = missed ] && [ "$(cat "$work/shb-rc" 2>/dev/null || echo 1)" -eq 0 ]; then
+  printf 'this hook: an ordinary external directory is still accepted.\n'
+else
+  echo "FAIL: an ordinary PATH was refused, so the check above passes by refusing" >&2
+  echo "  every directory rather than by reading interpreters." >&2
+  shb_fail=1
+fi
 
 # ---- a resolved command path may contain a newline -----------------------------
 #
@@ -1747,4 +1825,4 @@ printf '\n%d gitfile read(s) found, %d still line-oriented.\n' "$gf_total" "$gf_
 printf '%d checkout-root case(s), %d failure(s).\n' "$itotal" "$ifail"
 printf '%d case(s) judged, %d failure(s); %d normal-form case(s), %d failure(s).\n' \
   "$total" "$failures" "$ntotal" "$nfail"
-[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] && [ "$idx_fail" -eq 0 ] && [ "$inv_fail" -eq 0 ] && [ "$chl_fail" -eq 0 ] && [ "$bp_fail" -eq 0 ] && [ "$kre_fail" -eq 0 ] && [ "$esc_fail" -eq 0 ] && [ "$ord_fail" -eq 0 ] && [ "$ins_fail" -eq 0 ] && [ "$cfg_fail" -eq 0 ] && [ "$rel_fail" -eq 0 ] && [ "$pcr_fail" -eq 0 ] && [ "$nlc_fail" -eq 0 ] && [ "$cse_fail" -eq 0 ] && [ "$ins2_fail" -eq 0 ] && [ "$wtr_fail" -eq 0 ] && [ "$ref_fail" -eq 0 ] && [ "$blb_fail" -eq 0 ] || exit 1
+[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] && [ "$idx_fail" -eq 0 ] && [ "$inv_fail" -eq 0 ] && [ "$chl_fail" -eq 0 ] && [ "$bp_fail" -eq 0 ] && [ "$kre_fail" -eq 0 ] && [ "$esc_fail" -eq 0 ] && [ "$ord_fail" -eq 0 ] && [ "$ins_fail" -eq 0 ] && [ "$cfg_fail" -eq 0 ] && [ "$rel_fail" -eq 0 ] && [ "$pcr_fail" -eq 0 ] && [ "$nlc_fail" -eq 0 ] && [ "$cse_fail" -eq 0 ] && [ "$ins2_fail" -eq 0 ] && [ "$wtr_fail" -eq 0 ] && [ "$ref_fail" -eq 0 ] && [ "$blb_fail" -eq 0 ] && [ "$shb_fail" -eq 0 ] || exit 1
