@@ -416,6 +416,30 @@ absolutize_one() {
       ;;
   esac
 }
+gitdir_target() {
+  # $1 is a back-pointer line, $2 the directory that HOLDS the `.git` file.
+  # Prints that file's target physically resolved, with a sentinel, or returns 1.
+  #
+  # ⚠ A RELATIVE TARGET IS RELATIVE TO THE FILE, NOT TO `$PWD`. `gitdir: .repo` and
+  # `gitdir: ../meta` are both valid and git resolves them against the directory
+  # holding the `.git` file. Three sites here compared the RAW line against a value
+  # that had already been made absolute, so the match could never succeed and every
+  # push from such a checkout was refused as coming from an unnameable separate git
+  # directory -- while the documented installer reported success
+  # (shardpilot/shardpilot-go#79 review). The review named one site; the other two
+  # differ only in which directory the file sits in, so the rule lives here once
+  # and the base is passed in.
+  case "$1" in
+    "gitdir: "*) gt_target="${1#gitdir: }" ;;
+    *) return 1 ;;
+  esac
+  [ -n "$gt_target" ] || return 1
+  case "$gt_target" in
+    /*) ;;
+    *) gt_target="$2/$gt_target" ;;
+  esac
+  physdir "$gt_target"
+}
 physdir() {
   # Prints the physically-resolved directory followed by a literal `X`, or
   # returns 1 and prints nothing.
@@ -756,7 +780,10 @@ if [ -n "$wt_common" ]; then
       IFS= read -r -d "" wt_own_line < "$checkout_root/.git" || true
       wt_own_line="${wt_own_line%$NL}"
       wt_own_line="${wt_own_line%$CR}"
-      [ "$wt_own_line" = "gitdir: $wt_common" ] && wt_owns=yes
+      wt_own_t="$(gitdir_target "$wt_own_line" "$checkout_root")" &&
+        wt_own_t="${wt_own_t%X}" || wt_own_t=""
+      wt_common_t="$(physdir "$wt_common")" && wt_common_t="${wt_common_t%X}" || wt_common_t=""
+      [ -n "$wt_own_t" ] && [ "$wt_own_t" = "$wt_common_t" ] && wt_owns=yes
     fi
     # ⚠ AND A BARE REPOSITORY HAS NO CHECKOUT TO NAME, so this guard's own premise
     # does not hold for it. `git --git-dir=/tmp/local.git push` was refused with
@@ -1622,7 +1649,8 @@ if [ -n "$worktree_root" ]; then
     iv_link="${iv_link%$CR}"
     case "$iv_link" in
       "gitdir: "*)
-        iv_phys="$(physdir "${iv_link#gitdir: }")" && iv_phys="${iv_phys%X}" || iv_phys=""
+        iv_phys="$(gitdir_target "$iv_link" "$worktree_root")" &&
+          iv_phys="${iv_phys%X}" || iv_phys=""
         [ -n "$iv_phys" ] && [ "$iv_phys" = "$common_phys" ] && invoking_owns_common=yes
         ;;
     esac
@@ -1657,7 +1685,9 @@ if [ -n "$worktree_root" ]; then
               IFS= read -r -d "" wt_link < "$wt_owner/.git" || true
               wt_link="${wt_link%$NL}"
               wt_link="${wt_link%$CR}"
-              if [ "$wt_link" = "gitdir: $wt_phys" ] || [ "$wt_link" = "gitdir: $wt_other" ]; then
+              wt_link_t="$(gitdir_target "$wt_link" "$wt_owner")" &&
+                wt_link_t="${wt_link_t%X}" || wt_link_t=""
+              if [ -n "$wt_link_t" ] && [ "$wt_link_t" = "$wt_phys" ]; then
                 wt_owner_found=yes
                 wt_owner_phys="$(physdir "$wt_owner")" && wt_owner_phys="${wt_owner_phys%X}" &&
                   check_containment "$wt_owner_phys" &&

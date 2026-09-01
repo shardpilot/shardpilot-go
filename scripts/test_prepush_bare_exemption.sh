@@ -805,6 +805,97 @@ fi
 
 
 
+
+# ---- a relative back-pointer names its checkout --------------------------------
+#
+# `gitdir: .repo` and `gitdir: ../meta` are valid, and git resolves them against
+# the directory holding the `.git` file. Three sites here compared that RAW line
+# against a value already made absolute, so the match could never succeed and the
+# push was refused as coming from a git directory whose checkout cannot be named
+# -- while the documented installer reported success
+# (shardpilot/shardpilot-go#79 review).
+#
+# Asserted end to end, because the defect is in what the hook CONCLUDES, not in
+# how a line is spelled: a structural check would have passed on all three sites
+# while every such push was refused.
+rel_fail=0
+rel_root="$work/rel"; rm -rf "$rel_root"; mkdir -p "$rel_root"
+git init -q --separate-git-dir="$rel_root/meta" "$rel_root/co" >/dev/null 2>&1
+git init -q --bare "$rel_root/remote.git" >/dev/null 2>&1
+printf '#!/bin/sh\nexit 0\n' > "$rel_root/meta/hooks/check_public_surface.sh"
+chmod +x "$rel_root/meta/hooks/check_public_surface.sh"
+( cd "$rel_root/co"
+  git config user.email t@example.invalid; git config user.name t
+  printf 'a\n' > f.txt
+  git add -A >/dev/null 2>&1
+  git commit -qm c1 >/dev/null 2>&1
+  git remote add origin "$rel_root/remote.git" >/dev/null 2>&1 ) >/dev/null 2>&1
+
+# The stand-in restores the defect exactly: `gitdir_target` hands back the RAW
+# target, so the comparison is raw text against a resolved value. Disabling only
+# the absolutisation was NOT enough -- `physdir` then resolves a relative target
+# against the hook's own working directory and lands on the right answer by
+# accident, and the control passed while reproducing nothing.
+rel_vuln="$work/rel-vuln-hook"
+awk '
+  /^gitdir_target\(\) \{$/ { skip = 1
+    print "gitdir_target() {"
+    print "  case \"$1\" in \"gitdir: \"*) printf \"%sX\" \"${1#gitdir: }\" ;; *) return 1 ;; esac"
+    print "}"
+    next }
+  skip && /^\}$/ { skip = 0; next }
+  skip { next }
+  { print }
+' "$hook" > "$rel_vuln"
+chmod +x "$rel_vuln"
+if cmp -s "$rel_vuln" "$hook" || ! bash -n "$rel_vuln" 2>/dev/null; then
+  echo "REFUSING: the stand-in for the relative back-pointer is identical to the" >&2
+  echo "  hook or does not parse, so the control below cannot reproduce the" >&2
+  echo "  defect. gitdir_target has moved or been rewritten." >&2
+  exit 2
+fi
+
+rel_probe() { # $1 = hook to install, $2 = the `.git` file's contents
+  printf '%s\n' "$2" > "$rel_root/co/.git"
+  cp "$1" "$rel_root/meta/hooks/pre-push"; chmod +x "$rel_root/meta/hooks/pre-push"
+  ( cd "$rel_root/co" && git push origin HEAD:refs/heads/relp >/dev/null 2>&1 )
+  rel_rc=$?
+  git -C "$rel_root/remote.git" update-ref -d refs/heads/relp >/dev/null 2>&1 || true
+  return $rel_rc
+}
+
+# git itself must accept the construction, or the arms below prove nothing
+printf 'gitdir: ../meta\n' > "$rel_root/co/.git"
+if [ "$(cd "$rel_root/co" && git rev-parse --git-common-dir 2>/dev/null)" = "" ]; then
+  echo "REFUSING: git did not resolve a relative back-pointer here, so this" >&2
+  echo "  section is testing a repository git itself rejects." >&2
+  exit 2
+fi
+
+if rel_probe "$rel_vuln" 'gitdir: ../meta'; then
+  echo "REFUSING: the stand-in accepted a relative back-pointer, so this section" >&2
+  echo "  cannot tell a fix from a rig that never reproduced the refusal." >&2
+  exit 2
+fi
+printf '\npositive control: the stand-in refuses a checkout with a relative back-pointer.\n'
+
+if rel_probe "$hook" 'gitdir: ../meta'; then
+  printf 'this hook: a relative back-pointer names its checkout.\n'
+else
+  echo "FAIL: a push from a checkout whose .git holds a relative target was" >&2
+  echo "  refused -- the raw line is being compared against an absolute value." >&2
+  rel_fail=1
+fi
+
+# and the absolute form, which already worked, must go on working
+if rel_probe "$hook" "gitdir: $rel_root/meta"; then
+  printf 'this hook: an absolute back-pointer still names its checkout.\n'
+else
+  echo "FAIL: the absolute back-pointer stopped working, so the repair for the" >&2
+  echo "  relative one moved the defect rather than removing it." >&2
+  rel_fail=1
+fi
+
 # ---- the scanner's fixtures read no user configuration ------------------------
 #
 # The hook neutralises dangerous config keys by ENUMERATING them, and a
@@ -1074,4 +1165,4 @@ printf '\n%d gitfile read(s) found, %d still line-oriented.\n' "$gf_total" "$gf_
 printf '%d checkout-root case(s), %d failure(s).\n' "$itotal" "$ifail"
 printf '%d case(s) judged, %d failure(s); %d normal-form case(s), %d failure(s).\n' \
   "$total" "$failures" "$ntotal" "$nfail"
-[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] && [ "$idx_fail" -eq 0 ] && [ "$inv_fail" -eq 0 ] && [ "$chl_fail" -eq 0 ] && [ "$bp_fail" -eq 0 ] && [ "$kre_fail" -eq 0 ] && [ "$esc_fail" -eq 0 ] && [ "$ord_fail" -eq 0 ] && [ "$ins_fail" -eq 0 ] && [ "$cfg_fail" -eq 0 ] || exit 1
+[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] && [ "$idx_fail" -eq 0 ] && [ "$inv_fail" -eq 0 ] && [ "$chl_fail" -eq 0 ] && [ "$bp_fail" -eq 0 ] && [ "$kre_fail" -eq 0 ] && [ "$esc_fail" -eq 0 ] && [ "$ord_fail" -eq 0 ] && [ "$ins_fail" -eq 0 ] && [ "$cfg_fail" -eq 0 ] && [ "$rel_fail" -eq 0 ] || exit 1
