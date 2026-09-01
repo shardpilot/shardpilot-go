@@ -1101,16 +1101,57 @@ for path_entry in $sanitised_path; do
   [ "${#sp_links[@]}" -gt 0 ] || continue
   # One resolution per DIRECTORY rather than per link: the per-link form cost
   # 2.1s of every push on this machine and the batched one 173ms, measured.
-  while IFS= read -r sp_t; do
-    [ -n "$sp_t" ] || continue
-    case "$sp_t" in /*) ;; *) continue ;; esac
-    if inside_a_checkout "${sp_t%/*}"; then
-      sp_bad_dir="$path_entry"
-      break
-    fi
-  done <<SPLINKS
-$("$sp_rl" -f "${sp_links[@]}" 2>/dev/null)
+  #
+  # ⚠ AND THE BATCH IS ONLY READABLE WHEN IT IS UNAMBIGUOUS. `readlink` has no
+  # NUL-delimited form here -- BSD accepts `-fn` and nothing else -- so the batched
+  # output is newline-delimited while a resolved pathname may itself contain a
+  # newline. Reading it line by line split `/tmp/co<NL>root/tracked.sh` into
+  # `/tmp/co` and `root/tracked.sh`, neither of which is inside the checkout, and
+  # the branch-controlled program ran (shardpilot/shardpilot-go#79 review) -- in a
+  # file where every other path read carries a sentinel for exactly this reason.
+  #
+  # The count decides it. Each of the N links contributes exactly one record
+  # terminated by a newline, so the output holds N newlines if and only if no
+  # resolved pathname contains one: any embedded newline makes it more, and a link
+  # that failed to resolve makes it fewer. So `= N` is sound to parse by line, and
+  # anything else falls back to one resolution per link, sentinelled. Newlines in
+  # these pathnames are rare, so the fallback is rare; the attack that needs one
+  # takes it every time.
+  sp_batch="$("$sp_rl" -f "${sp_links[@]}" 2>/dev/null && printf X)" || sp_batch=""
+  sp_batch="${sp_batch%X}"
+  sp_nlines=0
+  if [ -n "$sp_batch" ]; then
+    sp_rest="$sp_batch"
+    while [ -n "$sp_rest" ]; do
+      case "$sp_rest" in
+        *"$NL"*) sp_nlines=$((sp_nlines + 1)); sp_rest="${sp_rest#*"$NL"}" ;;
+        *) break ;;
+      esac
+    done
+  fi
+  if [ "$sp_nlines" -eq "${#sp_links[@]}" ]; then
+    while IFS= read -r sp_t; do
+      [ -n "$sp_t" ] || continue
+      case "$sp_t" in /*) ;; *) continue ;; esac
+      if inside_a_checkout "${sp_t%/*}"; then
+        sp_bad_dir="$path_entry"
+        break
+      fi
+    done <<SPLINKS
+$sp_batch
 SPLINKS
+  else
+    for sp_f in "${sp_links[@]}"; do
+      sp_t="$("$sp_rl" -f "$sp_f" 2>/dev/null && printf X)" || continue
+      sp_t="${sp_t%X}"
+      sp_t="${sp_t%$NL}"
+      case "$sp_t" in /*) ;; *) continue ;; esac
+      if inside_a_checkout "${sp_t%/*}"; then
+        sp_bad_dir="$path_entry"
+        break
+      fi
+    done
+  fi
   [ -n "$sp_bad_dir" ] && break
 done
 set +f
@@ -1119,7 +1160,11 @@ if [ -n "$sp_bad_dir" ]; then
   # named only now, so the common case pays one resolution per directory
   for sp_f in "$sp_bad_dir"/*; do
     [ -L "$sp_f" ] || continue
-    sp_t="$("$sp_rl" -f "$sp_f" 2>/dev/null)" || continue
+    # sentinelled like every other path read here: `$( )` strips trailing
+    # newlines and a pathname may end in one
+    sp_t="$("$sp_rl" -f "$sp_f" 2>/dev/null && printf X)" || continue
+    sp_t="${sp_t%X}"
+    sp_t="${sp_t%$NL}"
     case "$sp_t" in /*) ;; *) continue ;; esac
     if inside_a_checkout "${sp_t%/*}"; then sp_bad_cmd="${sp_f##*/}"; break; fi
   done
@@ -1131,7 +1176,7 @@ if [ -n "$sp_bad_dir" ]; then
 ' >&2
   exit 2
 fi
-unset sp_d sp_dp sp_f sp_t sp_links sp_bad_dir sp_bad_cmd
+unset sp_d sp_dp sp_f sp_t sp_links sp_bad_dir sp_bad_cmd sp_batch sp_nlines sp_rest
 # <<< PATH-COMMAND-RESOLUTION
 
 PATH="$sanitised_path"
@@ -1680,8 +1725,25 @@ if [ -n "$worktree_root" ]; then
         # Trackability is decided on the path RELATIVE to the worktree: a `.git`
         # component anywhere in it puts the directory beyond any branch's reach.
         hooks_rel="${hooks_dir#"$root_prefix"}"
+        # ⚠ FOLDED, BECAUSE GIT'S INDEX RULE IS FOLDED. Git refuses to track a path
+        # with a `.git` component in ANY spelling -- measured: `.GIT`, `.Git`,
+        # `.gIt` and `.GiT` all stage nothing -- so `<root>/.GIT/hooks` is as
+        # unreachable from a branch as the lowercase form. Matching only lowercase
+        # classified it as trackable and refused every push from a repository
+        # initialised with `--separate-git-dir=<root>/.GIT`
+        # (shardpilot/shardpilot-go#79 review). The installer already folded here;
+        # this runtime copy did not, which is this file's recurring shape -- two
+        # copies of one rule and only the one the reviewer pointed at moved.
+        #
+        # ⚠ AND THE SUFFIX STRIPS ABOVE ARE NOT FOLDED, DELIBERATELY. They derive a
+        # main checkout from a common directory ending `/.git`, which is git's
+        # LAYOUT rule, and that one is not case-insensitive: a directory named
+        # `.GIT` is not discovered as the ordinary layout, it is reached through a
+        # `.git` FILE pointing at it. Folding them would strip a suffix that never
+        # meant what the strip assumes. The index rule folds; the layout rule does
+        # not, and they are different questions about the same four letters.
         case "/$hooks_rel/" in
-          */.git/*) : ;;
+          */.[Gg][Ii][Tt]/*) : ;;
           *)
             printf 'REFUSING: the hooks directory %s is inside the worktree %s\n' "$hooks_dir" "$1" >&2
             printf '  and is trackable there (%s). A branch can supply the hook or the\n' "$hooks_rel" >&2

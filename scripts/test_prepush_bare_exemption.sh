@@ -807,6 +807,163 @@ fi
 
 
 
+
+# ---- a resolved command path may contain a newline -----------------------------
+#
+# The batched `readlink -f` above is newline-delimited, and `readlink` has no
+# NUL-delimited form on every platform this runs on -- BSD accepts `-fn` and
+# nothing else. Read line by line, a checkout named `/tmp/co<NL>root` split into
+# `/tmp/co` and `root/tracked.sh`; neither is inside the checkout, so the
+# branch-controlled program ran and the push succeeded
+# (shardpilot/shardpilot-go#79 review). The repair reads the batch only when the
+# newline count equals the link count -- which holds exactly when no resolved path
+# contains one -- and resolves per link, sentinelled, otherwise.
+nlc_fail=0
+nlc_root="$work/nlc"; rm -rf "$nlc_root"
+nlc_co="$nlc_root/co
+root"
+mkdir -p "$nlc_co" "$nlc_root/safe"
+git init -q "$nlc_co" >/dev/null 2>&1
+git init -q --bare "$nlc_root/remote.git" >/dev/null 2>&1
+nlc_mark="$work/nlc-fired"
+( cd "$nlc_co"
+  git config user.email t@example.invalid; git config user.name t
+  printf '#!/bin/sh\necho FIRED >> "%s"\nexec /usr/bin/mktemp "$@"\n' "$nlc_mark" > tracked.sh
+  chmod +x tracked.sh
+  git add -A >/dev/null 2>&1
+  git commit -qm c1 >/dev/null 2>&1
+  git remote add origin "$nlc_root/remote.git" >/dev/null 2>&1 ) >/dev/null 2>&1
+mkdir -p "$nlc_co/.git/hooks"
+printf '#!/bin/sh\nexit 0\n' > "$nlc_co/.git/hooks/check_public_surface.sh"
+chmod +x "$nlc_co/.git/hooks/check_public_surface.sh"
+ln -sf "$nlc_co/tracked.sh" "$nlc_root/safe/mktemp"
+
+# the stand-in reads the batch unconditionally, which is what the defect was
+nlc_vuln="$work/nlc-vuln-hook"
+sed 's|^  if \[ "\$sp_nlines" -eq "\${#sp_links\[@\]}" \]; then$|  if true; then|' "$hook" > "$nlc_vuln"
+chmod +x "$nlc_vuln"
+if cmp -s "$nlc_vuln" "$hook" || ! bash -n "$nlc_vuln" 2>/dev/null; then
+  echo "REFUSING: the stand-in for the newline-delimited batch is identical to the" >&2
+  echo "  hook or does not parse, so the control below cannot reproduce it." >&2
+  exit 2
+fi
+
+nlc_probe() { # $1 = hook
+  rm -f "$nlc_mark"
+  cp "$1" "$nlc_co/.git/hooks/pre-push"; chmod +x "$nlc_co/.git/hooks/pre-push"
+  ( cd "$nlc_co" && PATH="$nlc_root/safe:$PATH" \
+      git push origin HEAD:refs/heads/nlcp >/dev/null 2>&1 )
+  printf '%s' "$?" > "$work/nlc-rc"
+  git -C "$nlc_root/remote.git" update-ref -d refs/heads/nlcp >/dev/null 2>&1 || true
+  [ -s "$nlc_mark" ] && echo fired || echo quiet
+}
+
+if [ "$(nlc_probe "$nlc_vuln")" != fired ]; then
+  echo "REFUSING: the tracked program did not run even with the batch read" >&2
+  echo "  unconditionally, so this section cannot tell a fix from a rig that" >&2
+  echo "  never reproduced the split." >&2
+  exit 2
+fi
+printf '\npositive control: reading the batch by line ran the branch program.\n'
+if [ "$(nlc_probe "$hook")" = fired ]; then
+  echo "FAIL: a resolved command path containing a newline was split, and the" >&2
+  echo "  branch-controlled program ran." >&2
+  nlc_fail=1
+else
+  printf 'this hook: a resolved command path containing a newline is not split.\n'
+fi
+rm -f "$nlc_root/safe/mktemp"
+if [ "$(nlc_probe "$hook")" = quiet ] && [ "$(cat "$work/nlc-rc" 2>/dev/null || echo 1)" -eq 0 ]; then
+  printf 'this hook: an ordinary PATH is still accepted from such a checkout.\n'
+else
+  echo "FAIL: an ordinary push was refused, so the check above passes by refusing" >&2
+  echo "  everything rather than by resolving pathnames whole." >&2
+  nlc_fail=1
+fi
+
+
+# ---- `.GIT` is as unreachable from a branch as `.git` --------------------------
+#
+# Git refuses to track a path with a `.git` component in ANY spelling -- measured
+# below rather than assumed -- so `<root>/.GIT/hooks` is beyond a branch's reach.
+# The runtime containment check matched only lowercase and classified it as
+# trackable, refusing every push from a repository initialised with
+# `--separate-git-dir=<root>/.GIT` (shardpilot/shardpilot-go#79 review). The
+# installer already folded; this copy did not.
+cse_fail=0
+
+# part 1 -- git's rule, asked of git rather than recalled. Runs everywhere.
+cse_r="$work/cse-idx"; rm -rf "$cse_r"; mkdir -p "$cse_r"
+( cd "$cse_r" && git init -q . && git config user.email t@example.invalid &&
+  git config user.name t ) >/dev/null 2>&1
+cse_staged=0
+for cse_sp in .git .GIT .Git .gIt; do
+  mkdir -p "$cse_r/$cse_sp" 2>/dev/null || continue
+  printf 'x\n' > "$cse_r/$cse_sp/f" 2>/dev/null || continue
+  git -C "$cse_r" add "$cse_sp/f" >/dev/null 2>&1
+done
+cse_staged="$(git -C "$cse_r" ls-files | wc -l | tr -d ' ')"
+if [ "$cse_staged" -eq 0 ]; then
+  printf '\nthis git: refuses every spelling of a `.git` path component.\n'
+else
+  echo "FAIL: git staged $cse_staged path(s) with a .git component, so the folding" >&2
+  echo "  below rests on a rule this git does not have." >&2
+  cse_fail=1
+fi
+
+# part 2 -- the hook's pattern, lifted from the hook so a change cannot drift past
+# this. Runs everywhere: it asks about the RULE, not about a filesystem.
+cse_pat="$(grep -o '\*/\.\[Gg\]\[Ii\]\[Tt\]/\*' "$hook" | head -1)"
+if [ -z "$cse_pat" ]; then
+  echo "FAIL: the runtime containment check no longer carries a case-folded .git" >&2
+  echo "  component pattern, so a .GIT layout is refused as trackable again." >&2
+  cse_fail=1
+else
+  cse_hit=no
+  for cse_rel in '/.git/hooks/' '/.GIT/hooks/' '/.Git/hooks/' '/deep/.GIT/hooks/'; do
+    case "$cse_rel" in
+      */.[Gg][Ii][Tt]/*) ;;
+      *) echo "FAIL: the folded pattern does not match $cse_rel" >&2; cse_hit=yes ;;
+    esac
+  done
+  # and it must still REFUSE what has no such component, or it exempts everything
+  case '/.repo/hooks/' in
+    */.[Gg][Ii][Tt]/*) echo "FAIL: the folded pattern matches /.repo/hooks/, which is trackable" >&2; cse_hit=yes ;;
+  esac
+  [ "$cse_hit" = yes ] && cse_fail=1
+  [ "$cse_hit" = yes ] || printf 'this hook: every spelling of a `.git` component is exempt, and only those.\n'
+fi
+
+# part 3 -- end to end, only where the filesystem can hold `.git` and `.GIT` apart.
+# Reported rather than skipped silently: a case-insensitive volume cannot host this.
+cse_fs="$work/cse-fs"; rm -rf "$cse_fs"; mkdir -p "$cse_fs"
+: > "$cse_fs/aa"; : > "$cse_fs/AA" 2>/dev/null
+if [ "$(ls -A "$cse_fs" | wc -l | tr -d ' ')" -lt 2 ]; then
+  printf 'note: this filesystem folds case, so the end-to-end .GIT push was NOT run\n'
+  printf '  here. The rule and the pattern above were, and CI runs on a\n'
+  printf '  case-sensitive filesystem where this arm does execute.\n'
+else
+  cse_e="$work/cse-e2e"; rm -rf "$cse_e"; mkdir -p "$cse_e"
+  git init -q --separate-git-dir="$cse_e/co/.GIT" "$cse_e/co" >/dev/null 2>&1
+  git init -q --bare "$cse_e/remote.git" >/dev/null 2>&1
+  ( cd "$cse_e/co"
+    git config user.email t@example.invalid; git config user.name t
+    printf 'a\n' > f.txt
+    git add f.txt >/dev/null 2>&1
+    git commit -qm c1 >/dev/null 2>&1
+    git remote add origin "$cse_e/remote.git" >/dev/null 2>&1 ) >/dev/null 2>&1
+  printf '#!/bin/sh\nexit 0\n' > "$cse_e/co/.GIT/hooks/check_public_surface.sh"
+  chmod +x "$cse_e/co/.GIT/hooks/check_public_surface.sh"
+  cp "$hook" "$cse_e/co/.GIT/hooks/pre-push"; chmod +x "$cse_e/co/.GIT/hooks/pre-push"
+  if ( cd "$cse_e/co" && git push origin HEAD:refs/heads/csep >/dev/null 2>&1 ); then
+    printf 'this hook: a push from a `--separate-git-dir=<root>/.GIT` checkout succeeds.\n'
+  else
+    echo "FAIL: a push from a .GIT separate-git-dir checkout was refused." >&2
+    cse_fail=1
+  fi
+  git -C "$cse_e/remote.git" update-ref -d refs/heads/csep >/dev/null 2>&1 || true
+fi
+
 # ---- a PATH directory may serve a command from inside a checkout ---------------
 #
 # The PATH filter drops an entry whose DIRECTORY resolves into a checkout. An
@@ -1249,4 +1406,4 @@ printf '\n%d gitfile read(s) found, %d still line-oriented.\n' "$gf_total" "$gf_
 printf '%d checkout-root case(s), %d failure(s).\n' "$itotal" "$ifail"
 printf '%d case(s) judged, %d failure(s); %d normal-form case(s), %d failure(s).\n' \
   "$total" "$failures" "$ntotal" "$nfail"
-[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] && [ "$idx_fail" -eq 0 ] && [ "$inv_fail" -eq 0 ] && [ "$chl_fail" -eq 0 ] && [ "$bp_fail" -eq 0 ] && [ "$kre_fail" -eq 0 ] && [ "$esc_fail" -eq 0 ] && [ "$ord_fail" -eq 0 ] && [ "$ins_fail" -eq 0 ] && [ "$cfg_fail" -eq 0 ] && [ "$rel_fail" -eq 0 ] && [ "$pcr_fail" -eq 0 ] || exit 1
+[ "$failures" -eq 0 ] && [ "$nfail" -eq 0 ] && [ "$gf_bad" -eq 0 ] && [ "$exec_fail" -eq 0 ] && [ "$ifail" -eq 0 ] && [ "$idx_fail" -eq 0 ] && [ "$inv_fail" -eq 0 ] && [ "$chl_fail" -eq 0 ] && [ "$bp_fail" -eq 0 ] && [ "$kre_fail" -eq 0 ] && [ "$esc_fail" -eq 0 ] && [ "$ord_fail" -eq 0 ] && [ "$ins_fail" -eq 0 ] && [ "$cfg_fail" -eq 0 ] && [ "$rel_fail" -eq 0 ] && [ "$pcr_fail" -eq 0 ] && [ "$nlc_fail" -eq 0 ] && [ "$cse_fail" -eq 0 ] || exit 1
