@@ -30,6 +30,15 @@ type Purchase struct {
 	UserID      string
 	AnonymousID string
 
+	// EventID is the event's idempotency key, forwarded to Event.ID; empty
+	// means a fresh id per call, exactly as for Event.ID. The fact layer
+	// collapses rows that share an event_id and nothing else, so a receipt
+	// or webhook handler that can run twice for one purchase — a
+	// redelivery, a retry after an ambiguous timeout, a restart — must
+	// supply the same EventID on every attempt, or each attempt is counted
+	// as a purchase of its own.
+	EventID string
+
 	// Product identifies what was bought (required).
 	Product string
 	// Amount is what was paid, denominated in Currency (required; must be
@@ -38,8 +47,12 @@ type Purchase struct {
 	// as a negative purchase reaches the wire and the schema admits it.
 	Amount float64
 	// Currency denominates Amount (required). The pipeline expects an ISO
-	// 4217 code; this verb checks presence only, and the ingest validates
-	// the event against the schema.
+	// 4217 code and the fact layer groups revenue by the exact string, so
+	// the verb upper-cases the value to the code's canonical form: a
+	// provider-native "usd" and a "USD" land in one currency group. The
+	// SDK carries no currency table, so a string that is not an ISO code
+	// is carried as given (upper-cased) and left to the ingest's schema
+	// validation.
 	Currency string
 
 	// SKU is the store-specific stock-keeping unit (optional).
@@ -73,7 +86,7 @@ func (c *Client) buildPurchaseEvent(purchase Purchase) (Event, error) {
 	if product == "" {
 		return Event{}, fmt.Errorf("%w: product is required", ErrInvalidPurchase)
 	}
-	currency := strings.TrimSpace(purchase.Currency)
+	currency := strings.ToUpper(strings.TrimSpace(purchase.Currency))
 	if currency == "" {
 		return Event{}, fmt.Errorf("%w: currency is required", ErrInvalidPurchase)
 	}
@@ -96,6 +109,7 @@ func (c *Client) buildPurchaseEvent(purchase Purchase) (Event, error) {
 	}
 
 	return Event{
+		ID:          purchase.EventID,
 		Name:        purchaseEventName,
 		UserID:      purchase.UserID,
 		AnonymousID: purchase.AnonymousID,

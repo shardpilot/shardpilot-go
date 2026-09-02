@@ -62,17 +62,22 @@ defer client.Close(context.Background())
 // verb builds it for you and refuses a purchase that is missing a required
 // field, or a client whose Source is not backend.
 err = client.TrackPurchase(context.Background(), shardpilot.Purchase{
+    EventID:  "receipt-7f3a2c", // idempotency key: a retry of the same purchase reuses it
     UserID:   "user-1042",
     Product:  "starter_pack",
     Amount:   9.99,
     Currency: "USD",
     Quantity: 1,
 })
+```
 
-// The same event as a raw Track call, for events that have no typed verb
-// yet: the canonical schema requires props.amount, props.currency, and
-// props.product.
+The same event in raw form, for events that have no typed verb yet. It is an alternative to the typed call, not a second call: every `Track` is an event of its own with its own `event_id`, and the facts layer counts each one.
+
+```go
+// The canonical schema requires props.amount, props.currency and
+// props.product; ID is the same idempotency key.
 err = client.Track(context.Background(), shardpilot.Event{
+    ID:     "receipt-7f3a2c",
     Name:   "purchase",
     UserID: "user-1042",
     Props: map[string]any{

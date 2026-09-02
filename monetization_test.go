@@ -229,3 +229,59 @@ func TestEnqueuePurchaseIsDeliveredOnFlush(t *testing.T) {
 		t.Fatalf("flushed envelope = %v, want the queued purchase with quantity 2", envelope)
 	}
 }
+
+// TestTrackPurchaseCarriesTheCallerSuppliedEventID: the fact layer collapses
+// rows that share an event_id, so a handler that runs twice for one purchase
+// must be able to repeat the id — and, as the precondition shows, cannot
+// without the field.
+func TestTrackPurchaseCarriesTheCallerSuppliedEventID(t *testing.T) {
+	server, envelopes, _ := newPurchaseCaptureServer(t)
+	client := newTestClient(t, server.URL)
+
+	purchase := Purchase{UserID: "user-1042", Product: "starter_pack", Amount: 9.99, Currency: "USD"}
+
+	// Precondition, and the double count the key exists to prevent: two
+	// calls for the same purchase without an EventID are two events.
+	for i := 0; i < 2; i++ {
+		if err := client.TrackPurchase(context.Background(), purchase); err != nil {
+			t.Fatalf("TrackPurchase without EventID: %v", err)
+		}
+	}
+	first := receiveEnvelope(t, envelopes)["event_id"]
+	second := receiveEnvelope(t, envelopes)["event_id"]
+	if first == "" || second == "" || first == second {
+		t.Fatalf("two calls without EventID produced event_ids %v and %v; want two distinct generated ids", first, second)
+	}
+
+	// With the key, a redelivery repeats the id the fact layer collapses on.
+	purchase.EventID = "receipt-7f3a2c"
+	for i := 0; i < 2; i++ {
+		if err := client.TrackPurchase(context.Background(), purchase); err != nil {
+			t.Fatalf("TrackPurchase with EventID: %v", err)
+		}
+		if got := receiveEnvelope(t, envelopes)["event_id"]; got != "receipt-7f3a2c" {
+			t.Fatalf("event_id = %v, want the caller-supplied receipt-7f3a2c", got)
+		}
+	}
+}
+
+// TestTrackPurchaseUpperCasesTheCurrency: a provider-native lowercase code
+// lands in the same currency group as its canonical form.
+func TestTrackPurchaseUpperCasesTheCurrency(t *testing.T) {
+	server, envelopes, _ := newPurchaseCaptureServer(t)
+	client := newTestClient(t, server.URL)
+
+	err := client.TrackPurchase(context.Background(), Purchase{
+		UserID:   "user-1042",
+		Product:  "starter_pack",
+		Amount:   9.99,
+		Currency: " usd ",
+	})
+	if err != nil {
+		t.Fatalf("TrackPurchase: %v", err)
+	}
+	props := receiveEnvelope(t, envelopes)["props"].(map[string]any)
+	if got := props["currency"]; got != "USD" {
+		t.Fatalf("props.currency = %v, want the provider-native usd upper-cased to USD", got)
+	}
+}

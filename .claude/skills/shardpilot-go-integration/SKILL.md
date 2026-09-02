@@ -299,14 +299,22 @@ while consent is unknown. This server-side SDK does the inverse:
 // refuses on a client whose Source is not backend. EnqueuePurchase is the
 // queued form.
 err = client.TrackPurchase(ctx, shardpilot.Purchase{
+    EventID:  receiptID, // idempotency key: reuse it on a redelivery or retry
     UserID:   userID,
     Product:  "starter_pack",
     Amount:   9.99,
     Currency: "USD",
 })
+```
 
+The raw form is an alternative to the typed call, not a second call: each
+`Track` is an event of its own with its own `event_id`, and the facts layer
+counts each one.
+
+```go
 // Synchronous raw form: publishes now, returns the transport error.
 err = client.Track(ctx, shardpilot.Event{
+    ID:     receiptID,
     Name:   "purchase", // must be legal for your configured Source
     UserID: userID,
     Props: map[string]any{

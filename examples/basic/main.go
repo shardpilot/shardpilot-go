@@ -36,6 +36,7 @@ func main() {
 	// props.currency, props.product) and refuses a client whose Source is
 	// not backend, so revenue can only ever be asserted from a backend.
 	if err := client.TrackPurchase(ctx, shardpilot.Purchase{
+		EventID:  "receipt-7f3a2c", // idempotency key: a retry of the same purchase reuses it
 		UserID:   "user-1042",
 		Product:  "starter_pack",
 		Amount:   9.99,

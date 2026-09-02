@@ -11,7 +11,10 @@
   `backend` (`ErrBackendSourceRequired`) rather than rewriting the event's
   source: the schema pins `purchase` to the backend lane, and this SDK keeps
   that pin. Everything else — consent, queueing, delivery — is `Track`'s and
-  `Enqueue`'s, unchanged. The quickstart and `examples/basic` use it.
+  `Enqueue`'s, unchanged. `Purchase.EventID` is the idempotency key,
+  forwarded to `Event.ID`, so a redelivered receipt repeats the id the fact
+  layer collapses on; `Currency` is upper-cased to the ISO 4217 canonical
+  form. The quickstart and `examples/basic` use it.
 
 - **Documentation-only: internal ShardPilot material removed from the published tree.**
   No API, wire format or behaviour changes.
