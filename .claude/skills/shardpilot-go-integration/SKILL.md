@@ -324,7 +324,15 @@ err = client.Track(ctx, shardpilot.Event{
     },
 })
 
-// Asynchronous: bounded in-memory queue, background flush worker.
+// Typed verb for the backend-lane economy_tx event (direction, currency_type,
+// reason, positive integer amount; match_id when the reason is match-scoped).
+err = client.EnqueueEconomyTx(shardpilot.EconomyTx{
+    EventID: ledgerEntryID, // idempotency key, as for Purchase.EventID
+    UserID: userID, Direction: shardpilot.EconomySink, CurrencyType: "gems",
+    Reason: "shop_purchase", Amount: 120,
+})
+
+// Asynchronous raw form: bounded in-memory queue, background flush worker.
 err = client.Enqueue(shardpilot.Event{Name: "economy_tx", UserID: userID, Props: props})
 // err is ErrQueueFull when the buffer (BufferSize) is full — the event was dropped.
 

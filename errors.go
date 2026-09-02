@@ -78,11 +78,18 @@ var (
 	// carrying a non-finite amount. Nothing reaches the queue or the wire.
 	ErrInvalidPurchase = errors.New("invalid shardpilot purchase")
 
+	// ErrInvalidEconomyTx is returned by TrackEconomyTx and EnqueueEconomyTx
+	// for an EconomyTx whose direction is not source or sink, whose
+	// currency_type or reason is empty, or whose amount is not a positive
+	// integer. Nothing reaches the queue or the wire.
+	ErrInvalidEconomyTx = errors.New("invalid shardpilot economy transaction")
+
 	// ErrBackendSourceRequired is returned by the typed backend-lane verbs
-	// (TrackPurchase, EnqueuePurchase) when Config.Source is not
-	// SourceBackend. The canonical purchase schema pins source to
-	// "backend"; the verb refuses rather than rewriting the event's source,
-	// so a client-tier credential can never assert revenue.
+	// (TrackPurchase, EnqueuePurchase, TrackEconomyTx, EnqueueEconomyTx)
+	// when Config.Source is not SourceBackend. The canonical purchase and
+	// economy_tx schemas pin source to "backend"; the verbs refuse rather
+	// than rewriting the event's source, so a client-tier credential can
+	// never assert revenue or the economy.
 	ErrBackendSourceRequired = errors.New("shardpilot event requires Source backend")
 
 	// ErrExperimentsNotConfigured is returned by the experiment surface

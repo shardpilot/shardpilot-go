@@ -69,9 +69,21 @@ err = client.TrackPurchase(context.Background(), shardpilot.Purchase{
     Currency: "USD",
     Quantity: 1,
 })
+
+// economy_tx is the other backend-lane event: one in-game currency ledger
+// transaction, reported by the backend that keeps the ledger. EventID is
+// the same kind of idempotency key.
+err = client.EnqueueEconomyTx(shardpilot.EconomyTx{
+    EventID:      "ledger-5c19e2",
+    UserID:       "user-1042",
+    Direction:    shardpilot.EconomySink,
+    CurrencyType: "gems",
+    Reason:       "shop_purchase",
+    Amount:       120,
+})
 ```
 
-The same event in raw form, for events that have no typed verb yet. It is an alternative to the typed call, not a second call: every `Track` is an event of its own with its own `event_id`, and the facts layer counts each one.
+The purchase again in raw form, for events that have no typed verb yet. It is an alternative to the typed call, not a second call: every `Track` is an event of its own with its own `event_id`, and the facts layer counts each one.
 
 ```go
 // The canonical schema requires props.amount, props.currency and

@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Typed resource verb: `TrackEconomyTx` / `EnqueueEconomyTx`.** An `EconomyTx`
+  value builds the canonical `economy_tx` event — `direction` (`EconomySource` or
+  `EconomySink`), `currency_type`, `reason` and a strictly positive integer
+  `amount` required; `match_id` carried when supplied, omitted when empty;
+  further properties carried through with the typed fields winning. The verb
+  refuses an invalid transaction (`ErrInvalidEconomyTx`) and refuses outright on a
+  client whose `Source` is not `backend` (`ErrBackendSourceRequired`), keeping the
+  schema's backend pin. The schema's match-scoped rule is enforced before publishing:
+  `match_reward` and `tower_upgrade` require `MatchID`, every other reason
+  refuses one (`ErrInvalidEconomyTx`).OnBatchResult`.
+  `EconomyTx.EventID` is the idempotency key, forwarded to `Event.ID`, so a
+  redelivered ledger entry repeats the id the fact layer collapses on.
+
 - **Typed monetization verb: `TrackPurchase` / `EnqueuePurchase`.** A `Purchase`
   value builds the canonical `purchase` event — `props.amount`, `props.currency`
   and `props.product` required, `sku` and `quantity` optional, further
