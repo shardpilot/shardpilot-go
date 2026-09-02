@@ -11,6 +11,23 @@ import (
 // emits (analytics.economy_tx.v1).
 const economyTxEventName = "economy_tx"
 
+// matchScopedReasons are the reason codes for which the canonical schema
+// (analytics.economy_tx.v1) requires props.match_id, and the only ones for
+// which it allows it. The list is the schema's, embedded here against the
+// revision this SDK is built for: a transaction the schema would reject is
+// refused before it is published instead of being dropped by the ingest
+// inside an accepted batch.
+var matchScopedReasons = []string{"match_reward", "tower_upgrade"}
+
+func isMatchScopedReason(reason string) bool {
+	for _, candidate := range matchScopedReasons {
+		if candidate == reason {
+			return true
+		}
+	}
+	return false
+}
+
 // EconomyDirection is the side of the ledger an EconomyTx moves currency on.
 type EconomyDirection string
 
@@ -60,14 +77,10 @@ type EconomyTx struct {
 	// Direction carries the sign. Required; zero or negative is refused.
 	Amount int64
 
-	// MatchID links a match-scoped ledger entry to its match. The schema
-	// REQUIRES it, non-empty, when Reason is a match-scoped code (today
-	// match_reward and tower_upgrade) and FORBIDS it for every other
-	// reason. This verb does not encode that list — the reason codes are
-	// the game's, the rule is the schema's, and the ingest enforces it —
-	// so a MatchID left empty is omitted from the wire and one supplied is
-	// carried as given. A mismatch with the rule is rejected by the ingest
-	// per event, inside an accepted batch: watch Config.OnBatchResult.
+	// MatchID scopes the transaction to a match. The schema requires it for
+	// the match-scoped reasons (match_reward, tower_upgrade) and forbids it
+	// for every other reason; the verb enforces both sides and refuses a
+	// mismatch with ErrInvalidEconomyTx before anything is published.
 	MatchID string
 
 	// Timestamp is the event time; zero means the client clock at the call,
@@ -107,6 +120,15 @@ func (c *Client) buildEconomyTxEvent(tx EconomyTx) (Event, error) {
 	if tx.Amount < 1 {
 		return Event{}, fmt.Errorf("%w: amount must be a positive integer, got %d", ErrInvalidEconomyTx, tx.Amount)
 	}
+	matchID := strings.TrimSpace(tx.MatchID)
+	if isMatchScopedReason(reason) {
+		if matchID == "" {
+			return Event{}, fmt.Errorf("%w: match_id is required for reason %q", ErrInvalidEconomyTx, reason)
+		}
+	} else if matchID != "" {
+		return Event{}, fmt.Errorf("%w: match_id is only allowed for a match-scoped reason (%s), got reason %q",
+			ErrInvalidEconomyTx, strings.Join(matchScopedReasons, ", "), reason)
+	}
 
 	props := make(map[string]any, len(tx.Props)+5)
 	for key, value := range tx.Props {
@@ -116,7 +138,7 @@ func (c *Client) buildEconomyTxEvent(tx EconomyTx) (Event, error) {
 	props["currency_type"] = currencyType
 	props["reason"] = reason
 	props["amount"] = tx.Amount
-	if matchID := strings.TrimSpace(tx.MatchID); matchID != "" {
+	if matchID != "" {
 		props["match_id"] = matchID
 	}
 

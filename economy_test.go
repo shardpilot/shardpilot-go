@@ -167,3 +167,48 @@ func TestTrackEconomyTxCarriesTheCallerSuppliedEventID(t *testing.T) {
 		}
 	}
 }
+
+// TestTrackEconomyTxEnforcesTheMatchScopedRule: the schema requires match_id
+// for match_reward and tower_upgrade and forbids it for every other reason;
+// either mismatch is refused before publishing, and both legal shapes reach
+// the wire.
+func TestTrackEconomyTxEnforcesTheMatchScopedRule(t *testing.T) {
+	server, envelopes, requests := newPurchaseCaptureServer(t)
+	client := newTestClient(t, server.URL)
+
+	for _, reason := range []string{"match_reward", "tower_upgrade"} {
+		tx := validEconomyTx()
+		tx.Reason = reason
+		tx.MatchID = "   "
+		if err := client.TrackEconomyTx(context.Background(), tx); !errors.Is(err, ErrInvalidEconomyTx) {
+			t.Fatalf("%s without match_id: err = %v, want ErrInvalidEconomyTx", reason, err)
+		}
+	}
+	tx := validEconomyTx()
+	tx.Reason = "shop_purchase"
+	tx.MatchID = "match-1"
+	if err := client.TrackEconomyTx(context.Background(), tx); !errors.Is(err, ErrInvalidEconomyTx) {
+		t.Fatalf("shop_purchase with match_id: err = %v, want ErrInvalidEconomyTx", err)
+	}
+	assertNothingReachedTheWire(t, client, requests)
+
+	tx = validEconomyTx()
+	tx.Reason = "tower_upgrade"
+	tx.MatchID = " match-1 "
+	if err := client.TrackEconomyTx(context.Background(), tx); err != nil {
+		t.Fatalf("tower_upgrade with match_id: %v", err)
+	}
+	if got := receiveEnvelope(t, envelopes)["props"].(map[string]any)["match_id"]; got != "match-1" {
+		t.Fatalf("props.match_id = %v, want match-1", got)
+	}
+
+	tx = validEconomyTx()
+	tx.Reason = "shop_purchase"
+	tx.MatchID = ""
+	if err := client.TrackEconomyTx(context.Background(), tx); err != nil {
+		t.Fatalf("shop_purchase without match_id: %v", err)
+	}
+	if _, present := receiveEnvelope(t, envelopes)["props"].(map[string]any)["match_id"]; present {
+		t.Fatal("props.match_id present on a non-match reason")
+	}
+}

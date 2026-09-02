@@ -9,9 +9,9 @@
   further properties carried through with the typed fields winning. The verb
   refuses an invalid transaction (`ErrInvalidEconomyTx`) and refuses outright on a
   client whose `Source` is not `backend` (`ErrBackendSourceRequired`), keeping the
-  schema's backend pin. The schema's match-scoped rule for `match_id` is the
-  ingest's to enforce, per event, inside an accepted batch — watch
-  `Config.OnBatchResult`.
+  schema's backend pin. The schema's match-scoped rule is enforced before publishing:
+  `match_reward` and `tower_upgrade` require `MatchID`, every other reason
+  refuses one (`ErrInvalidEconomyTx`).OnBatchResult`.
   `EconomyTx.EventID` is the idempotency key, forwarded to `Event.ID`, so a
   redelivered ledger entry repeats the id the fact layer collapses on.
 
