@@ -73,6 +73,18 @@ var (
 	// when the floor is off.
 	ErrEventsDiscarded = errors.New("shardpilot events were discarded at close (no durable spool)")
 
+	// ErrInvalidPurchase is returned by TrackPurchase and EnqueuePurchase
+	// for a Purchase missing a required field (product, currency) or
+	// carrying a non-finite amount. Nothing reaches the queue or the wire.
+	ErrInvalidPurchase = errors.New("invalid shardpilot purchase")
+
+	// ErrBackendSourceRequired is returned by the typed backend-lane verbs
+	// (TrackPurchase, EnqueuePurchase) when Config.Source is not
+	// SourceBackend. The canonical purchase schema pins source to
+	// "backend"; the verb refuses rather than rewriting the event's source,
+	// so a client-tier credential can never assert revenue.
+	ErrBackendSourceRequired = errors.New("shardpilot event requires Source backend")
+
 	// ErrExperimentsNotConfigured is returned by the experiment surface
 	// when the consumer is not opted in (Config.ExperimentsEnabled false —
 	// the default): no assignment plane is configured, nothing is fetched,
