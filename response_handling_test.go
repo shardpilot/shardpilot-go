@@ -1319,3 +1319,80 @@ func TestRetryPacingIsIndependentOfTheFlushInterval(t *testing.T) {
 		t.Fatalf("the retry came back in %v, under the %v backoff floor", gap, publishBackoffBase)
 	}
 }
+
+// TestRetainedBatchRetryDoesNotStarveTheQueue is the second clause of A6's
+// Go retry-decoupling gate, beside the sibling above that pins the first:
+// while a retained FULL batch waits out a hint-less failure on the retry
+// clock, the bounded queue keeps absorbing a sustained enqueue rate and drains
+// at the retry — no ErrQueueFull. It is taken at the SHIPPED FlushInterval
+// default for the same reason: with the retry handed back to the ticker, the
+// worker stops reading the queue (queueEvents is nil at BatchSize) for the
+// whole interval, and a queue of BufferSize fills at any rate above
+// BufferSize per interval. Here the queue is twenty deep and thirty events
+// arrive over three seconds — the fifteen-second tick would overflow it in
+// the second second; the one-second retry clock never lets it pass ten.
+//
+// The two clauses are distinct, and this scene exists because the sibling
+// cannot see this one: a first wait of three seconds passes the sibling's
+// timing bound and still refuses ten of these events.
+func TestRetainedBatchRetryDoesNotStarveTheQueue(t *testing.T) {
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			// Retryable, and NO Retry-After: the wait is the client's own.
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":{"code":"internal_error","message":"broker unavailable"}}`))
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"accepted":1,"rejected":0,"duplicates":0}`))
+	}))
+	defer server.Close()
+
+	const queueDepth = 20
+	client, err := NewClient(Config{
+		IngestURL:     server.URL,
+		Token:         "token-value",
+		WorkspaceID:   "workspace-test",
+		AppID:         "app-test",
+		EnvironmentID: "develop",
+		Source:        SourceBackend,
+		BatchSize:     1,
+		BufferSize:    queueDepth,
+		// FlushInterval DELIBERATELY unset: the shipped default is the subject.
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close(context.Background())
+
+	// One event fills the batch, fails once, and is retained: from here the
+	// worker reads nothing from the queue until the retry lands.
+	if err := client.Enqueue(Event{Name: "retained"}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	waitFor(t, 3*time.Second, "the first attempt", func() bool { return calls.Load() >= 1 })
+
+	// A sustained rate for three seconds: 1.5x the queue's depth in total,
+	// so the outcome is decided by when the worker resumes reading.
+	const sustained = 30
+	refused := 0
+	for i := 0; i < sustained; i++ {
+		switch err := client.Enqueue(Event{Name: "sustained"}); {
+		case errors.Is(err, ErrQueueFull):
+			refused++
+		case err != nil:
+			t.Fatalf("enqueue %d: %v", i, err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if refused > 0 {
+		t.Fatalf("%d of %d enqueues were refused with ErrQueueFull: the retained batch held the queue closed on the flush cadence instead of retrying on the backoff clock", refused, sustained)
+	}
+
+	// And nothing was lost on the way out: every event reached the server,
+	// the retained one twice.
+	waitFor(t, defaultFlushInterval+10*time.Second, "delivery of the sustained events", func() bool {
+		return calls.Load() >= int64(1+1+sustained)
+	})
+}
