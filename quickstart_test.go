@@ -9,6 +9,62 @@ import (
 	"time"
 )
 
+// TestQuickstartTypedPurchaseMatchesTheRawShape sends the README quickstart's
+// typed call and asserts it produces exactly the props the raw Track form
+// below it documents, so the two examples cannot drift apart.
+func TestQuickstartTypedPurchaseMatchesTheRawShape(t *testing.T) {
+	envelopes := make(chan map[string]any, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var raw struct {
+			Events []map[string]any `json:"events"`
+		}
+		if err := json.NewDecoder(ingestRequestBody(t, r)).Decode(&raw); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		if len(raw.Events) == 1 {
+			envelopes <- raw.Events[0]
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"accepted":1,"rejected":0,"duplicates":0}`))
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL)
+	defer client.Close(context.Background())
+
+	// Keep this call in sync with the README quickstart and examples/basic.
+	err := client.TrackPurchase(context.Background(), Purchase{
+		UserID:   "user-1042",
+		Product:  "starter_pack",
+		Amount:   9.99,
+		Currency: "USD",
+		Quantity: 1,
+	})
+	if err != nil {
+		t.Fatalf("TrackPurchase quickstart returned error: %v", err)
+	}
+	var envelope map[string]any
+	select {
+	case envelope = <-envelopes:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the typed quickstart event")
+	}
+	if envelope["event_name"] != "purchase" || envelope["source"] != "backend" || envelope["user_id"] != "user-1042" {
+		t.Fatalf("typed quickstart envelope = %v", envelope)
+	}
+	props := envelope["props"].(map[string]any)
+	want := map[string]any{"amount": 9.99, "currency": "USD", "product": "starter_pack", "quantity": float64(1)}
+	if len(props) != len(want) {
+		t.Fatalf("typed quickstart props = %v, want exactly %v", props, want)
+	}
+	for key, value := range want {
+		if props[key] != value {
+			t.Fatalf("typed quickstart props.%s = %v, want %v", key, props[key], value)
+		}
+	}
+}
+
 // TestQuickstartPurchaseEventIsBackendLegal sends the exact event the README
 // quickstart demonstrates and asserts the produced wire envelope satisfies
 // the canonical analytics.purchase.v1 contract: event_name const "purchase",

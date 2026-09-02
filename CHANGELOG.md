@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- **Typed monetization verb: `TrackPurchase` / `EnqueuePurchase`.** A `Purchase`
+  value builds the canonical `purchase` event — `props.amount`, `props.currency`
+  and `props.product` required, `sku` and `quantity` optional, further
+  properties carried through with the typed fields winning. The verb refuses a
+  purchase missing a required field or carrying a non-finite amount
+  (`ErrInvalidPurchase`), and refuses outright on a client whose `Source` is not
+  `backend` (`ErrBackendSourceRequired`) rather than rewriting the event's
+  source: the schema pins `purchase` to the backend lane, and this SDK keeps
+  that pin. Everything else — consent, queueing, delivery — is `Track`'s and
+  `Enqueue`'s, unchanged. The quickstart and `examples/basic` use it.
+
 - **Documentation-only: internal ShardPilot material removed from the published tree.**
   No API, wire format or behaviour changes.
 

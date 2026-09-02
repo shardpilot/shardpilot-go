@@ -58,8 +58,20 @@ if err != nil {
 defer client.Close(context.Background())
 
 // purchase is a backend-source canonical event: the server-validated,
-// real-money purchase reported after receipt/store validation. The
-// canonical schema requires props.amount, props.currency, and props.product.
+// real-money purchase reported after receipt/store validation. The typed
+// verb builds it for you and refuses a purchase that is missing a required
+// field, or a client whose Source is not backend.
+err = client.TrackPurchase(context.Background(), shardpilot.Purchase{
+    UserID:   "user-1042",
+    Product:  "starter_pack",
+    Amount:   9.99,
+    Currency: "USD",
+    Quantity: 1,
+})
+
+// The same event as a raw Track call, for events that have no typed verb
+// yet: the canonical schema requires props.amount, props.currency, and
+// props.product.
 err = client.Track(context.Background(), shardpilot.Event{
     Name:   "purchase",
     UserID: "user-1042",

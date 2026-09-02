@@ -294,7 +294,18 @@ while consent is unknown. This server-side SDK does the inverse:
 ## Sending analytics events
 
 ```go
-// Synchronous: publishes now, returns the transport error.
+// Typed verb for the backend-lane purchase event: builds the canonical
+// event (amount / currency / product required; sku, quantity optional) and
+// refuses on a client whose Source is not backend. EnqueuePurchase is the
+// queued form.
+err = client.TrackPurchase(ctx, shardpilot.Purchase{
+    UserID:   userID,
+    Product:  "starter_pack",
+    Amount:   9.99,
+    Currency: "USD",
+})
+
+// Synchronous raw form: publishes now, returns the transport error.
 err = client.Track(ctx, shardpilot.Event{
     Name:   "purchase", // must be legal for your configured Source
     UserID: userID,
