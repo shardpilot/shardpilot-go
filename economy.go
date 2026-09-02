@@ -80,7 +80,9 @@ type EconomyTx struct {
 	// MatchID scopes the transaction to a match. The schema requires it for
 	// the match-scoped reasons (match_reward, tower_upgrade) and forbids it
 	// for every other reason; the verb enforces both sides and refuses a
-	// mismatch with ErrInvalidEconomyTx before anything is published.
+	// mismatch with ErrInvalidEconomyTx before anything is published. A
+	// match_id supplied through Props while MatchID is empty is judged by
+	// the same rule, as the value that reaches the wire.
 	MatchID string
 
 	// Timestamp is the event time; zero means the client clock at the call,
@@ -120,7 +122,20 @@ func (c *Client) buildEconomyTxEvent(tx EconomyTx) (Event, error) {
 	if tx.Amount < 1 {
 		return Event{}, fmt.Errorf("%w: amount must be a positive integer, got %d", ErrInvalidEconomyTx, tx.Amount)
 	}
+	// The effective match id: the typed field, or — when it is empty — a
+	// match_id supplied through Props (an optional field left empty keeps
+	// the Props value), so the rule below judges the value that would
+	// actually reach the wire.
 	matchID := strings.TrimSpace(tx.MatchID)
+	if matchID == "" {
+		if raw, present := tx.Props["match_id"]; present {
+			supplied, ok := raw.(string)
+			if !ok {
+				return Event{}, fmt.Errorf("%w: props match_id must be a string, got %T", ErrInvalidEconomyTx, raw)
+			}
+			matchID = strings.TrimSpace(supplied)
+		}
+	}
 	if isMatchScopedReason(reason) {
 		if matchID == "" {
 			return Event{}, fmt.Errorf("%w: match_id is required for reason %q", ErrInvalidEconomyTx, reason)
@@ -140,6 +155,8 @@ func (c *Client) buildEconomyTxEvent(tx EconomyTx) (Event, error) {
 	props["amount"] = tx.Amount
 	if matchID != "" {
 		props["match_id"] = matchID
+	} else {
+		delete(props, "match_id")
 	}
 
 	return Event{

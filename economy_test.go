@@ -212,3 +212,36 @@ func TestTrackEconomyTxEnforcesTheMatchScopedRule(t *testing.T) {
 		t.Fatal("props.match_id present on a non-match reason")
 	}
 }
+
+// TestTrackEconomyTxJudgesAMatchIDSuppliedThroughProps: the rule judges the
+// value that reaches the wire, so a match_id carried in Props while MatchID
+// is empty is refused for a non-match reason, refused when it is not a
+// string, and delivered (trimmed) for a match-scoped reason.
+func TestTrackEconomyTxJudgesAMatchIDSuppliedThroughProps(t *testing.T) {
+	server, envelopes, requests := newPurchaseCaptureServer(t)
+	client := newTestClient(t, server.URL)
+
+	tx := validEconomyTx()
+	tx.Reason = "shop_purchase"
+	tx.Props = map[string]any{"match_id": "match-1"}
+	if err := client.TrackEconomyTx(context.Background(), tx); !errors.Is(err, ErrInvalidEconomyTx) {
+		t.Fatalf("shop_purchase with a props match_id: err = %v, want ErrInvalidEconomyTx", err)
+	}
+	tx = validEconomyTx()
+	tx.Reason = "match_reward"
+	tx.Props = map[string]any{"match_id": 42}
+	if err := client.TrackEconomyTx(context.Background(), tx); !errors.Is(err, ErrInvalidEconomyTx) {
+		t.Fatalf("match_reward with a non-string props match_id: err = %v, want ErrInvalidEconomyTx", err)
+	}
+	assertNothingReachedTheWire(t, client, requests)
+
+	tx = validEconomyTx()
+	tx.Reason = "match_reward"
+	tx.Props = map[string]any{"match_id": " match-1 "}
+	if err := client.TrackEconomyTx(context.Background(), tx); err != nil {
+		t.Fatalf("match_reward with the match id in Props: %v", err)
+	}
+	if got := receiveEnvelope(t, envelopes)["props"].(map[string]any)["match_id"]; got != "match-1" {
+		t.Fatalf("props.match_id = %v, want match-1 (trimmed, from Props)", got)
+	}
+}
