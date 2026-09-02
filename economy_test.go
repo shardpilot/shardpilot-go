@@ -136,3 +136,34 @@ func TestEnqueueEconomyTxIsDeliveredOnFlush(t *testing.T) {
 		t.Fatalf("flushed envelope = %v, want the queued economy_tx with amount 120", envelope)
 	}
 }
+
+// TestTrackEconomyTxCarriesTheCallerSuppliedEventID: the fact layer collapses
+// rows that share an event_id, so a ledger that can report one transaction
+// twice must be able to repeat the id — and, as the precondition shows,
+// cannot without the field.
+func TestTrackEconomyTxCarriesTheCallerSuppliedEventID(t *testing.T) {
+	server, envelopes, _ := newPurchaseCaptureServer(t)
+	client := newTestClient(t, server.URL)
+
+	tx := validEconomyTx()
+	for i := 0; i < 2; i++ {
+		if err := client.TrackEconomyTx(context.Background(), tx); err != nil {
+			t.Fatalf("TrackEconomyTx without EventID: %v", err)
+		}
+	}
+	first := receiveEnvelope(t, envelopes)["event_id"]
+	second := receiveEnvelope(t, envelopes)["event_id"]
+	if first == "" || second == "" || first == second {
+		t.Fatalf("two calls without EventID produced event_ids %v and %v; want two distinct generated ids", first, second)
+	}
+
+	tx.EventID = "ledger-5c19e2"
+	for i := 0; i < 2; i++ {
+		if err := client.TrackEconomyTx(context.Background(), tx); err != nil {
+			t.Fatalf("TrackEconomyTx with EventID: %v", err)
+		}
+		if got := receiveEnvelope(t, envelopes)["event_id"]; got != "ledger-5c19e2" {
+			t.Fatalf("event_id = %v, want the caller-supplied ledger-5c19e2", got)
+		}
+	}
+}

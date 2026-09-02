@@ -327,6 +327,7 @@ err = client.Track(ctx, shardpilot.Event{
 // Typed verb for the backend-lane economy_tx event (direction, currency_type,
 // reason, positive integer amount; match_id when the reason is match-scoped).
 err = client.EnqueueEconomyTx(shardpilot.EconomyTx{
+    EventID: ledgerEntryID, // idempotency key, as for Purchase.EventID
     UserID: userID, Direction: shardpilot.EconomySink, CurrencyType: "gems",
     Reason: "shop_purchase", Amount: 120,
 })

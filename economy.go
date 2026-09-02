@@ -38,6 +38,14 @@ type EconomyTx struct {
 	UserID      string
 	AnonymousID string
 
+	// EventID is the event's idempotency key, forwarded to Event.ID; empty
+	// means a fresh id per call, exactly as for Event.ID. The fact layer
+	// collapses rows that share an event_id and nothing else, so a ledger
+	// that can report one transaction twice — a redelivery, a retry after an
+	// ambiguous timeout, a restart — must supply the same EventID on every
+	// attempt, or each attempt is counted as a transaction of its own.
+	EventID string
+
 	// Direction is EconomySource (currency granted) or EconomySink
 	// (currency spent). Required; any other value is refused.
 	Direction EconomyDirection
@@ -113,6 +121,7 @@ func (c *Client) buildEconomyTxEvent(tx EconomyTx) (Event, error) {
 	}
 
 	return Event{
+		ID:          tx.EventID,
 		Name:        economyTxEventName,
 		UserID:      tx.UserID,
 		AnonymousID: tx.AnonymousID,

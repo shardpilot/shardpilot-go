@@ -12,6 +12,8 @@
   schema's backend pin. The schema's match-scoped rule for `match_id` is the
   ingest's to enforce, per event, inside an accepted batch — watch
   `Config.OnBatchResult`.
+  `EconomyTx.EventID` is the idempotency key, forwarded to `Event.ID`, so a
+  redelivered ledger entry repeats the id the fact layer collapses on.
 
 - **Typed monetization verb: `TrackPurchase` / `EnqueuePurchase`.** A `Purchase`
   value builds the canonical `purchase` event — `props.amount`, `props.currency`
