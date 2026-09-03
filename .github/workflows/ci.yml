@@ -55,6 +55,18 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          # actions/checkout defaults persist-credentials to TRUE, which writes
+          # the job's token into .git/config — and the two gitleaks steps below
+          # are container actions, so GitHub mounts this directory into a
+          # third-party image at /github/workspace. Mounting a directory into a
+          # container makes its contents readable there, .git/config included.
+          #
+          # Neither scan needs that credential: they read files and local
+          # objects. The ref-fetch step below does reach origin, and keeps
+          # working without it because this repository is PUBLIC — an anonymous
+          # fetch succeeds. That qualifier is load-bearing: in a private
+          # repository this same change would break that step.
+          persist-credentials: false
 
       - name: Fetch pull-request refs for the history scan
         run: git fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*'
