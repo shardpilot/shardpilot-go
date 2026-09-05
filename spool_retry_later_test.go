@@ -2,8 +2,10 @@ package shardpilot
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"testing"
+	"time"
 )
 
 // The ingest batch answers `retry_later` for an event whose event_id is held
@@ -146,6 +148,49 @@ func TestSpoolResendsAnEventAnsweredRetryLaterOnTheNextPass(t *testing.T) {
 	}
 	if dead := recorder.count(); dead != 0 {
 		t.Fatalf("nothing may be dead-lettered on this path, got %d", dead)
+	}
+	_ = client.Close(context.Background())
+}
+
+// TestSpoolResendKeepsADeferredMemberAndCountsNoResend covers the OTHER settle
+// path — a startup-loaded chunk re-published from the resend queue — with a
+// mixed answer: one event stored, one deferred. The stored one settles and
+// counts as resent; the deferred one stays spooled, dead-letters nothing, and
+// is NOT counted as resent, because the server stored nothing for it and
+// SpoolResent is a delivery count.
+func TestSpoolResendKeepsADeferredMemberAndCountsNoResend(t *testing.T) {
+	state, server := newSpoolTestServer(t)
+	defer server.Close()
+
+	dir := t.TempDir()
+	now := time.Now()
+	writeConsentRecordFile(t, dir, "granted")
+	writeSpoolRecordFile(t, dir, 0,
+		spoolTestEnvelope(t, "evt-resend-ok-1", now),
+		spoolTestEnvelope(t, "evt-resend-defer-1", now),
+	)
+	state.setAcceptedBody(`{"accepted":1,"rejected":0,"duplicates":0,"suppressed":0,"retry_later":1,"events":[` +
+		`{"event_id":"evt-resend-ok-1","status":"accepted"},` +
+		`{"event_id":"evt-resend-defer-1","status":"retry_later","code":"reservation_in_flight"}]}`)
+
+	recorder := &spoolDeadLetterRecorder{}
+	client := newSpoolTestClient(t, server.URL, dir, recorder, nil)
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	record := readSpoolRecordFile(t, dir)
+	if len(record.Events) != 1 {
+		t.Fatalf("exactly the deferred event must remain spooled, got %s", mustJSON(t, record.Events))
+	}
+	if !containsEventID(t, []json.RawMessage{record.Events[0].Raw}, "evt-resend-defer-1") {
+		t.Fatalf("the remaining record must be the deferred event, got %s", mustJSON(t, record.Events))
+	}
+	if recorder.count() != 0 {
+		t.Fatalf("neither a delivery nor a deferral dead-letters, got %d letter(s)", recorder.count())
+	}
+	if stats := client.Snapshot(); stats.SpoolResent != 1 {
+		t.Fatalf("SpoolResent must count the delivered member only, got %+v", stats)
 	}
 	_ = client.Close(context.Background())
 }
