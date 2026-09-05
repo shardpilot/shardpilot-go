@@ -36,6 +36,15 @@ const (
 	// EventStatusRejected means the event was rejected (e.g. failed
 	// validation); Code/Message carry the reason.
 	EventStatusRejected EventStatus = "rejected"
+	// EventStatusRetryLater means the event was NEITHER stored NOR settled:
+	// another delivery of the same event_id held a reservation that had not
+	// reached the broker, so nothing proves the event was stored (Code is
+	// typically "reservation_in_flight"). It is the one per-event outcome
+	// that is not final — the event must be sent again, and a client that
+	// treats it like a duplicate can lose it outright, because the
+	// reservation it collided with may belong to a producer that died before
+	// publishing.
+	EventStatusRetryLater EventStatus = "retry_later"
 )
 
 // BatchEventStatus is the ingest outcome for one event in a published batch.
@@ -59,6 +68,11 @@ type BatchResult struct {
 	Accepted   int
 	Rejected   int
 	Duplicates int
+	// RetryLater counts the events the server neither stored nor settled
+	// (per-event status retry_later). They are still owed: this client
+	// re-publishes the spooled ones, and their absence from Accepted is not
+	// a drop.
+	RetryLater int
 	Events     []BatchEventStatus
 }
 
@@ -70,6 +84,7 @@ func (r batchResult) toPublic() BatchResult {
 		Accepted:   r.Accepted,
 		Rejected:   r.Rejected,
 		Duplicates: r.Duplicates,
+		RetryLater: r.RetryLater,
 	}
 	if len(r.Events) > 0 {
 		result.Events = make([]BatchEventStatus, len(r.Events))

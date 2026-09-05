@@ -60,6 +60,7 @@ type batchResult struct {
 	Accepted   int                    `json:"accepted"`
 	Rejected   int                    `json:"rejected"`
 	Duplicates int                    `json:"duplicates"`
+	RetryLater int                    `json:"retry_later"`
 	Events     []batchEventStatusWire `json:"events"`
 }
 

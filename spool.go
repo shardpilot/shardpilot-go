@@ -2323,7 +2323,16 @@ func (c *Client) spoolAckWithVerdicts(request batchRequest, result batchResult) 
 	for _, event := range result.Events {
 		verdicts[event.EventID] = EventStatus(event.Status)
 	}
-	removed, persistFailed := s.ack(spoolEntryIDs(entries))
+	// retry_later is not a settlement: the server stored nothing and asked for
+	// the event again, so its spooled copy is the only one left. Acking it
+	// here would erase the event and fire no dead-letter either — a loss
+	// nothing anywhere reports. Kept in the mirror and put back on the resend
+	// queue for the next pass.
+	settleIDs, deferred := partitionRetryLater(entries, verdicts)
+	removed, persistFailed := s.ack(settleIDs)
+	if len(deferred) > 0 {
+		s.requeueResend(deferred)
+	}
 	var terminal, consentDropped []spoolEntry
 	for _, entry := range removed {
 		reason, dropped := spoolVerdictDropReason(verdicts[entry.id])
@@ -2401,13 +2410,24 @@ func spoolVerdictDropReason(status EventStatus) (SpoolDropReason, bool) {
 // delivered — inventing a drop for an unrecognized status would false-alarm
 // the dead-letter contract (mirroring Stats.ByStatus's carry-through
 // posture).
-func (c *Client) settleResentChunk(chunk []spoolEntry, result batchResult) {
+// settleResentChunk reports whether any member was DEFERRED rather than
+// settled — answered retry_later, so it stays spooled and queued for another
+// pass. The caller ends this resend pass on a deferral instead of pulling the
+// requeued entries straight back: the reservation they collided with lives
+// for the ingest pending TTL, and re-sending inside the same loop would spin
+// against the server for as long as it holds.
+func (c *Client) settleResentChunk(chunk []spoolEntry, result batchResult) bool {
 	verdicts := make(map[string]EventStatus, len(result.Events))
 	for _, event := range result.Events {
 		verdicts[event.EventID] = EventStatus(event.Status)
 	}
+	settleIDs, deferred := partitionRetryLater(chunk, verdicts)
 	resent := 0
 	for _, entry := range chunk {
+		if verdicts[entry.id] == EventStatusRetryLater {
+			// Not delivered: the server stored nothing for it.
+			continue
+		}
 		if _, dropped := spoolVerdictDropReason(verdicts[entry.id]); !dropped {
 			resent++
 		}
@@ -2415,7 +2435,10 @@ func (c *Client) settleResentChunk(chunk []spoolEntry, result batchResult) {
 	if resent > 0 {
 		c.stats.spoolResent.Add(uint64(resent))
 	}
-	removed, persistFailed := c.spool.ack(spoolEntryIDs(chunk))
+	removed, persistFailed := c.spool.ack(settleIDs)
+	if len(deferred) > 0 {
+		c.spool.requeueResend(deferred)
+	}
 	var terminal, consentDropped []spoolEntry
 	for _, entry := range removed {
 		reason, dropped := spoolVerdictDropReason(verdicts[entry.id])
@@ -2434,6 +2457,28 @@ func (c *Client) settleResentChunk(chunk []spoolEntry, result batchResult) {
 		c.recordSpoolPersistFailure()
 	}
 	c.drainSpoolCapacityDrops()
+
+	return len(deferred) > 0
+}
+
+// partitionRetryLater splits a settled batch's entries into the ids to ack and
+// the entries to keep. An entry the server answered retry_later is owed, not
+// delivered: nothing stored it, so it stays. Every other verdict — including
+// one this build does not recognise, and one the list does not mention at all
+// — settles, which keeps the carry-through posture the rest of this file has:
+// inventing a deferral for an unknown status would hold events forever.
+func partitionRetryLater(entries []spoolEntry, verdicts map[string]EventStatus) (settleIDs []string, deferred []spoolEntry) {
+	settleIDs = make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if verdicts[entry.id] == EventStatusRetryLater {
+			deferred = append(deferred, entry)
+
+			continue
+		}
+		settleIDs = append(settleIDs, entry.id)
+	}
+
+	return settleIDs, deferred
 }
 
 // spoolHasResendWork reports pending spool resend work for the worker's
@@ -2483,8 +2528,15 @@ func (c *Client) resendSpooledChunks(deferUntil *time.Time, backoffAttempt *int)
 		if err == nil {
 			// Settle the delivered chunk off the spool BEFORE the callback:
 			// a callback-driven consent flip must purge the remainder only.
-			c.settleResentChunk(chunk, result)
+			deferred := c.settleResentChunk(chunk, result)
 			c.notifyBatchResult(result.toPublic())
+			if deferred {
+				// Some members are owed again and are back on the queue.
+				// Nothing failed — the endpoint answered — so the fresh
+				// batch is not held back; this pass simply stops rather
+				// than re-pulling what it just put back.
+				return true
+			}
 			continue
 		}
 		if errors.Is(err, ErrConsentDenied) {
@@ -2566,9 +2618,15 @@ func (c *Client) flushSpooledChunks(ctx context.Context, backoffAttempt *int) er
 		if err == nil {
 			// Settle the delivered chunk off the spool BEFORE the callback:
 			// a callback-driven consent flip must purge the remainder only.
-			c.settleResentChunk(chunk, result)
+			deferred := c.settleResentChunk(chunk, result)
 			c.notifyBatchResult(result.toPublic())
 			*backoffAttempt = 0
+			if deferred {
+				// Owed again and back on the queue: this flush stops
+				// draining rather than re-publishing what it just
+				// requeued, for the same reason the automatic pass does.
+				return firstErr
+			}
 			continue
 		}
 		if errors.Is(err, ErrConsentDenied) {
