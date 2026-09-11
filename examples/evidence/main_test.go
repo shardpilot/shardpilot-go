@@ -175,3 +175,19 @@ func (w rejectPanicWriter) Write(p []byte) (int, error) {
 	}
 	return w.Writer.Write(p)
 }
+
+func TestOversizeRecordingFailureCannotReopenAttempt(t *testing.T) {
+	w := &witness{done: make(chan struct{}), base: transportFunc(func(*http.Request) (*http.Response, error) {
+		t.Fatal("unrecordable request reached network")
+		return nil, nil
+	})}
+	for i := 0; i < 2; i++ {
+		req, err := http.NewRequest(http.MethodPost, "https://collector.invalid/v1/events:batch", strings.NewReader(strings.Repeat("x", bodyLimit+1)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := w.RoundTrip(req); err == nil {
+			t.Fatal("unrecordable request accepted")
+		}
+	}
+}

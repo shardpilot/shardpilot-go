@@ -50,6 +50,7 @@ type witness struct {
 	redact          *strings.Replacer
 	name            string
 	unauthenticated bool
+	attempted       bool
 	records         []exchange
 	done            chan struct{}
 }
@@ -70,9 +71,10 @@ type exchange struct {
 func (w *witness) RoundTrip(req *http.Request) (*http.Response, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if len(w.records) != 0 {
+	if w.attempted {
 		return nil, fmt.Errorf("case request budget exhausted; no retry sent")
 	}
+	w.attempted = true
 	defer close(w.done)
 	body, err := io.ReadAll(io.LimitReader(req.Body, bodyLimit+1))
 	if err != nil || len(body) > bodyLimit {
