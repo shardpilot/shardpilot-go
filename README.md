@@ -40,6 +40,11 @@ For analytics only, `v0.1.2` is available. **`v0.1.0` is retracted** in the modu
 
 ## Quick start (analytics)
 
+For a bounded analytics-and-crash evidence run, set the environment variables in
+[`examples/evidence`](examples/evidence/README.md), then run
+`go build -trimpath -o /tmp/shardpilot-go-evidence ./examples/evidence` followed by
+`/tmp/shardpilot-go-evidence` without a pipe.
+
 A runnable backend example lives in [`examples/basic`](examples/basic). The minimal flow:
 
 ```go
