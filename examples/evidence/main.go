@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -58,6 +59,72 @@ type witness struct {
 
 type credentialRedactor struct{ patterns []string }
 
+type sourceSpan struct{ start, end int }
+type comparisonView struct {
+	text  string
+	spans []sourceSpan
+}
+
+func (v *comparisonView) appendBytes(decoded string, span sourceSpan, text *strings.Builder) {
+	text.WriteString(decoded)
+	for range len(decoded) {
+		v.spans = append(v.spans, span)
+	}
+}
+
+func (v comparisonView) percentDecoded(query bool) comparisonView {
+	result := comparisonView{spans: make([]sourceSpan, 0, len(v.text))}
+	var text strings.Builder
+	text.Grow(len(v.text))
+	for i := 0; i < len(v.text); {
+		ch, width := v.text[i], 1
+		if ch == '%' && i+2 < len(v.text) {
+			if value, err := hex.DecodeString(v.text[i+1 : i+3]); err == nil {
+				ch, width = value[0], 3
+			}
+		} else if query && ch == '+' {
+			ch = ' '
+		}
+		result.appendBytes(string([]byte{ch}), sourceSpan{v.spans[i].start, v.spans[i+width-1].end}, &text)
+		i += width
+	}
+	result.text = text.String()
+	return result
+}
+
+func (v comparisonView) jsonUnescaped() comparisonView {
+	result := comparisonView{spans: make([]sourceSpan, 0, len(v.text))}
+	var text strings.Builder
+	text.Grow(len(v.text))
+	for i := 0; i < len(v.text); {
+		decoded, width := v.text[i:i+1], 1
+		if v.text[i] == '\\' && i+1 < len(v.text) {
+			n := 2
+			if v.text[i+1] == 'u' {
+				n = 6
+				// A surrogate pair is one code point and one original span.
+				if i+12 <= len(v.text) && v.text[i+6:i+8] == `\u` {
+					high, highErr := strconv.ParseUint(v.text[i+2:i+6], 16, 16)
+					low, lowErr := strconv.ParseUint(v.text[i+8:i+12], 16, 16)
+					if highErr == nil && lowErr == nil && high >= 0xd800 && high <= 0xdbff && low >= 0xdc00 && low <= 0xdfff {
+						n = 12
+					}
+				}
+			}
+			if i+n <= len(v.text) {
+				var value string
+				if json.Unmarshal([]byte(`"`+v.text[i:i+n]+`"`), &value) == nil {
+					decoded, width = value, n
+				}
+			}
+		}
+		result.appendBytes(decoded, sourceSpan{v.spans[i].start, v.spans[i+width-1].end}, &text)
+		i += width
+	}
+	result.text = text.String()
+	return result
+}
+
 func newCredentialRedactor(keys ...string) *credentialRedactor {
 	r := &credentialRedactor{}
 	for _, key := range keys {
@@ -67,44 +134,41 @@ func newCredentialRedactor(keys ...string) *credentialRedactor {
 	return r
 }
 
-// Compare raw and one-level percent-decoded views, accepting both query '+'
-// spaces and literal plus signs. Map matches back to the original bytes so
-// unrelated wire evidence is preserved, including its original encoding.
+// Compare raw, JSON-unescaped and percent-decoded views. At most one JSON and
+// one percent pass are composed, in either order; this is not a general decoder
+// for arbitrary encodings such as base64. Matches map back to original spans.
 func (r *credentialRedactor) Replace(text string) string {
 	masked := make([]bool, len(text))
-	for mode := 0; mode < 3; mode++ {
-		decoded := make([]byte, 0, len(text))
-		positions := make([]int, 0, len(text)+1)
-		for i := 0; i < len(text); {
-			positions = append(positions, i)
-			ch, width := text[i], 1
-			if mode > 0 && ch == '%' && i+2 < len(text) {
-				if value, err := hex.DecodeString(text[i+1 : i+3]); err == nil {
-					ch, width = value[0], 3
-				}
-			} else if mode == 2 && ch == '+' {
-				ch = ' '
-			}
-			decoded = append(decoded, ch)
-			i += width
-		}
-		positions = append(positions, len(text))
-		view := string(decoded)
+	plain := comparisonView{text: text, spans: make([]sourceSpan, len(text))}
+	for i := range len(text) {
+		plain.spans[i] = sourceSpan{i, i + 1}
+	}
+	mark := func(view comparisonView) {
 		for _, pattern := range r.patterns {
 			if pattern == "" {
 				continue
 			}
-			for offset := 0; offset < len(view); {
-				at := strings.Index(view[offset:], pattern)
+			for offset := 0; offset < len(view.text); {
+				at := strings.Index(view.text[offset:], pattern)
 				if at < 0 {
 					break
 				}
 				start := offset + at
 				end := start + len(pattern)
-				for i := positions[start]; i < positions[end]; i++ {
+				for i := view.spans[start].start; i < view.spans[end-1].end; i++ {
 					masked[i] = true
 				}
 				offset = end
+			}
+		}
+	}
+	for baseIndex, base := range []comparisonView{plain, plain.jsonUnescaped()} {
+		mark(base)
+		for _, query := range []bool{false, true} {
+			percent := base.percentDecoded(query)
+			mark(percent)
+			if baseIndex == 0 {
+				mark(percent.jsonUnescaped())
 			}
 		}
 	}
@@ -221,7 +285,7 @@ func (w *witness) outcome(kind string) error {
 			Fingerprint string `json:"fingerprint"`
 			Suppressed  bool   `json:"suppressed"`
 		}
-		if json.Unmarshal([]byte(e.RequestBody), &sent) != nil || json.Unmarshal([]byte(e.ResponseBody), &got) != nil || sent.ID == "" || got.ID != sent.ID || got.Fingerprint == "" || got.Suppressed {
+		if json.Unmarshal([]byte(e.RequestBody), &sent) != nil || json.Unmarshal([]byte(e.ResponseBody), &got) != nil || sent.ID == "" || got.ID != sent.ID || strings.TrimSpace(got.Fingerprint) == "" || got.Suppressed {
 			return fmt.Errorf("crash acknowledgement missing, mismatched or suppressed")
 		}
 		if w.expectedActor == "" || sent.AnonymousID != w.expectedActor {

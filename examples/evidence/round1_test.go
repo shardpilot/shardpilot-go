@@ -123,3 +123,70 @@ func TestRedactionPreservesLiteralEncodingsAndUnicode(t *testing.T) {
 		}
 	}
 }
+
+func TestCredentialJSONEscapes(t *testing.T) {
+	for _, tc := range []struct{ name, key, echo string }{
+		{"unicode", "secret", `\u0073\u0065\u0063\u0072\u0065\u0074`},
+		{"mixed-unicode", "secret", `sec\u0072et`},
+		{"escaped-slash", "synthetic/slash", `synthetic\/slash`},
+		{"standard-escapes", "synthetic\"quoted\\key", `synthetic\"quoted\\key`},
+		{"surrogate-pair", "synthetic-\U0001f600", `synthetic-\uD83d\uDe00`},
+		{"json-then-percent", "secret", `\u002573%65cret`},
+		{"percent-then-json", "secret", `%5Cu0073ecret`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `{"echo":"` + tc.echo + `","other":"unchanged\u002f+evidence"}`
+			if !json.Valid([]byte(body)) {
+				t.Fatal("invalid JSON echo fixture")
+			}
+			get := func(name string) string {
+				if name == "SHARDPILOT_TOKEN" {
+					return tc.key
+				}
+				return environment(name)
+			}
+			var output bytes.Buffer
+			code := run(get, &output, transportFunc(func(req *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: 400, Header: http.Header{"X-Request-Id": {tc.echo}},
+					Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+			}))
+			if code != 1 {
+				t.Fatalf("invalid acknowledgements returned exit %d", code)
+			}
+			seen := 0
+			for _, line := range strings.Split(output.String(), "\n") {
+				if !strings.HasPrefix(line, "{") {
+					continue
+				}
+				var e exchange
+				var payload map[string]string
+				if json.Unmarshal([]byte(line), &e) != nil || json.Unmarshal([]byte(e.ResponseBody), &payload) != nil {
+					t.Fatal("printed exchange/response is not valid JSON")
+				}
+				if payload["echo"] != "[REDACTED]" || e.RequestID != "[REDACTED]" {
+					t.Fatal("JSON-escaped credential survived in printed evidence")
+				}
+				if !strings.Contains(e.ResponseBody, `"other":"unchanged\u002f+evidence"`) {
+					t.Fatal("unrelated JSON encoding was changed")
+				}
+				seen++
+			}
+			if seen != 7 {
+				t.Fatalf("observed %d printed exchanges, want seven", seen)
+			}
+		})
+	}
+}
+
+func TestCrashFingerprintMustContainNonWhitespace(t *testing.T) {
+	for _, fingerprint := range []string{"", "   ", "\t\r\n", " synthetic-group "} {
+		response, _ := json.Marshal(map[string]string{"crash_id": "synthetic-crash", "fingerprint": fingerprint})
+		w := witness{expectedActor: "synthetic-actor", records: []exchange{{Status: 202,
+			RequestBody:  `{"crash_id":"synthetic-crash","anonymous_id":"synthetic-actor"}`,
+			ResponseBody: string(response)}}}
+		err := w.outcome("crash")
+		if (err == nil) != (strings.TrimSpace(fingerprint) != "") {
+			t.Fatalf("blank/nonblank crash fingerprint expectation failed: error=%v", err)
+		}
+	}
+}

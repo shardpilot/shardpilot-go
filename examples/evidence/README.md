@@ -64,9 +64,14 @@ symbolication, symbol upload or object-storage reachability.
 Every attempted exchange prints a JSON line with case, method, route, synthetic
 request body/bytes, status, response body, request id (empty when absent), and
 latency including the bounded body read. Configured credentials, including their
-Go JSON-escaped and one-level URL-escaped forms, are redacted; URL comparisons
-accept mixed hex case, literal/escaped bytes and `+`/`%20` spaces while preserving
-unrelated evidence bytes. Authorization is never printed.
+Go JSON-canonical, percent-encoded and JSON-Unicode forms, are redacted. JSON
+comparisons decode Unicode (including surrogate pairs) and standard escapes;
+percent comparisons accept mixed hex case, literal/escaped bytes and `+`/`%20`
+spaces. Matches map back to original spans, preserving unrelated evidence bytes.
+At most one JSON pass and one percent pass are composed, in either order. The
+equivalence set is raw, JSON-canonical, percent and JSON-Unicode; arbitrary further
+nesting or other encodings such as base64 are outside the sender's claim.
+Authorization is never printed.
 Response bodies are capped at 64 KiB; truncation/read failures fail the case.
 The terminal case line includes SDK and expectation errors. The final line
 summarizes all cases. Keep the run id and per-event/crash ids for later readback.
@@ -80,7 +85,7 @@ summarizes all cases. Keep the run id and per-event/crash ids for later readback
 An HTTP 202 alone is insufficient: every analytics event must have exactly one
 matching verdict. Observed-only, duplicate, suppressed, unknown and missing
 verdicts fail the normal admission cases. Crash replies must echo the sent id,
-carry a fingerprint and not be suppressed. A successful run still requires
+carry a fingerprint with non-whitespace content and not be suppressed. A successful run still requires
 separate Console/backend readback to establish storage, projection and visible
 product behavior. It does not prove any endpoint that it did not call.
 An oversized normal fixture still requires acceptance; `event_too_large` is a
