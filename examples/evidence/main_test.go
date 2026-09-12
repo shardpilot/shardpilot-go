@@ -53,16 +53,24 @@ func TestSenderEvidence(t *testing.T) {
 					large, small := 0, 0
 					for _, raw := range batch.Events {
 						var event struct {
-							ID      string `json:"event_id"`
-							Name    string `json:"event_name"`
-							Source  string `json:"source"`
-							Session string `json:"session_id"`
+							ID       string `json:"event_id"`
+							Name     string `json:"event_name"`
+							Source   string `json:"source"`
+							Session  string `json:"session_id"`
+							Sequence int64  `json:"session_sequence"`
 						}
 						if err := json.Unmarshal(raw, &event); err != nil {
 							t.Fatal(err)
 						}
 						if event.ID == "" || event.Session == "" || event.Source != "client" || !strings.HasPrefix(event.Name, "app.session_") {
 							t.Fatalf("invalid fixture envelope: %s", raw)
+						}
+						wantSequence := int64(1)
+						if event.Name == "app.session_ended" {
+							wantSequence = 2
+						}
+						if event.Sequence != wantSequence {
+							t.Errorf("wire session sequence = %d, want %d for %s", event.Sequence, wantSequence, event.Name)
 						}
 						v := map[string]string{"event_id": event.ID, "status": "accepted"}
 						if len(raw) > 2048 {

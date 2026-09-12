@@ -47,12 +47,80 @@ type witness struct {
 	mu              sync.Mutex
 	base            http.RoundTripper
 	out             io.Writer
-	redact          *strings.Replacer
+	redact          *credentialRedactor
+	expectedActor   string
 	name            string
 	unauthenticated bool
 	attempted       bool
 	records         []exchange
 	done            chan struct{}
+}
+
+type credentialRedactor struct{ patterns []string }
+
+func newCredentialRedactor(keys ...string) *credentialRedactor {
+	r := &credentialRedactor{}
+	for _, key := range keys {
+		encoded, _ := json.Marshal(key)
+		r.patterns = append(r.patterns, key, string(encoded[1:len(encoded)-1]))
+	}
+	return r
+}
+
+// Compare raw and one-level percent-decoded views, accepting both query '+'
+// spaces and literal plus signs. Map matches back to the original bytes so
+// unrelated wire evidence is preserved, including its original encoding.
+func (r *credentialRedactor) Replace(text string) string {
+	masked := make([]bool, len(text))
+	for mode := 0; mode < 3; mode++ {
+		decoded := make([]byte, 0, len(text))
+		positions := make([]int, 0, len(text)+1)
+		for i := 0; i < len(text); {
+			positions = append(positions, i)
+			ch, width := text[i], 1
+			if mode > 0 && ch == '%' && i+2 < len(text) {
+				if value, err := hex.DecodeString(text[i+1 : i+3]); err == nil {
+					ch, width = value[0], 3
+				}
+			} else if mode == 2 && ch == '+' {
+				ch = ' '
+			}
+			decoded = append(decoded, ch)
+			i += width
+		}
+		positions = append(positions, len(text))
+		view := string(decoded)
+		for _, pattern := range r.patterns {
+			if pattern == "" {
+				continue
+			}
+			for offset := 0; offset < len(view); {
+				at := strings.Index(view[offset:], pattern)
+				if at < 0 {
+					break
+				}
+				start := offset + at
+				end := start + len(pattern)
+				for i := positions[start]; i < positions[end]; i++ {
+					masked[i] = true
+				}
+				offset = end
+			}
+		}
+	}
+	var out strings.Builder
+	for i := 0; i < len(text); {
+		if !masked[i] {
+			out.WriteByte(text[i])
+			i++
+			continue
+		}
+		out.WriteString("[REDACTED]")
+		for i < len(text) && masked[i] {
+			i++
+		}
+	}
+	return out.String()
 }
 
 type exchange struct {
@@ -145,7 +213,8 @@ func (w *witness) outcome(kind string) error {
 	}
 	if kind == "crash" {
 		var sent struct {
-			ID string `json:"crash_id"`
+			ID          string `json:"crash_id"`
+			AnonymousID string `json:"anonymous_id"`
 		}
 		var got struct {
 			ID          string `json:"crash_id"`
@@ -154,6 +223,9 @@ func (w *witness) outcome(kind string) error {
 		}
 		if json.Unmarshal([]byte(e.RequestBody), &sent) != nil || json.Unmarshal([]byte(e.ResponseBody), &got) != nil || sent.ID == "" || got.ID != sent.ID || got.Fingerprint == "" || got.Suppressed {
 			return fmt.Errorf("crash acknowledgement missing, mismatched or suppressed")
+		}
+		if w.expectedActor == "" || sent.AnonymousID != w.expectedActor {
+			return fmt.Errorf("crash request lost or changed the configured actor")
 		}
 		return nil
 	}
@@ -207,12 +279,12 @@ func (w *witness) outcome(kind string) error {
 			return fmt.Errorf("unknown or repeated response event id")
 		}
 		delete(expected, event.ID)
-		if oversize {
+		if oversize && kind == "mixed" {
 			if event.Status != "rejected" || event.Code != "event_too_large" {
 				return fmt.Errorf("oversize event lacks event_too_large rejection")
 			}
 		} else if event.Status != "accepted" {
-			return fmt.Errorf("small event not accepted (status=%s)", event.Status)
+			return fmt.Errorf("event not accepted (status=%s)", event.Status)
 		}
 	}
 	return nil
@@ -242,12 +314,12 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 			return 2
 		}
 	}
-	var substitutions []string
-	for _, key := range []string{values["SHARDPILOT_TOKEN"], values["SHARDPILOT_API_KEY"]} {
-		encoded, _ := json.Marshal(key)
-		substitutions = append(substitutions, key, "[REDACTED]", string(encoded[1:len(encoded)-1]), "[REDACTED]", url.QueryEscape(key), "[REDACTED]")
+	actor, err := crash.SanitizeEvent(crash.Event{AnonymousID: values["SHARDPILOT_ANONYMOUS_ID"]})
+	if err != nil || actor.AnonymousID != values["SHARDPILOT_ANONYMOUS_ID"] {
+		fmt.Fprintln(out, "configuration: SHARDPILOT_ANONYMOUS_ID must survive the crash SDK actor sanitizer unchanged; exit2")
+		return 2
 	}
-	redact := strings.NewReplacer(substitutions...)
+	redact := newCredentialRedactor(values["SHARDPILOT_TOKEN"], values["SHARDPILOT_API_KEY"])
 	var random [12]byte
 	if _, err := rand.Read(random[:]); err != nil {
 		fmt.Fprintln(out, "cannot generate synthetic run id; exit2")
@@ -257,7 +329,7 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 	fmt.Fprintf(out, "run_id=%s; synthetic telemetry only; HTTP acceptance does not prove downstream visibility\n", runID)
 	failed := false
 	caseRun := func(name, kind string, action func(*http.Client) error) {
-		w := &witness{base: transport, out: out, redact: redact, name: name, unauthenticated: kind == "unauthenticated", done: make(chan struct{})}
+		w := &witness{base: transport, out: out, redact: redact, expectedActor: values["SHARDPILOT_ANONYMOUS_ID"], name: name, unauthenticated: kind == "unauthenticated", done: make(chan struct{})}
 		hc := &http.Client{Transport: w, Timeout: 15 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 		err := action(hc)
 		check := w.outcome(kind)
@@ -269,8 +341,8 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 		}
 		fmt.Fprintf(out, "case=%s sdk_error=%s expectation_error=%s\n", name, redact.Replace(fmt.Sprint(err)), redact.Replace(fmt.Sprint(check)))
 	}
-	event := func(id, name, session string, props map[string]any) shardpilot.Event {
-		return shardpilot.Event{ID: runID + "-" + id, Name: name, SessionID: runID + "-" + session, Props: props}
+	event := func(id, name, session string, sequence int64, props map[string]any) shardpilot.Event {
+		return shardpilot.Event{ID: runID + "-" + id, Name: name, SessionID: runID + "-" + session, SessionSequence: sequence, Props: props}
 	}
 	analytics := func(name, kind string, events []shardpilot.Event, synchronous bool) {
 		caseRun(name, kind, func(hc *http.Client) error {
@@ -303,15 +375,15 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 			return closeErr
 		})
 	}
-	analytics("single", "accepted", []shardpilot.Event{event("single", "app.session_started", "single", nil)}, true)
+	analytics("single", "accepted", []shardpilot.Event{event("single", "app.session_started", "single", 1, nil)}, true)
 	analytics("realistic-batch", "accepted", []shardpilot.Event{
-		event("batch-start-a", "app.session_started", "batch-a", map[string]any{"entry_point": "menu"}),
-		event("batch-end-a", "app.session_ended", "batch-a", map[string]any{"duration_ms": 12000, "reason": "completed"}),
-		event("batch-start-b", "app.session_started", "batch-b", map[string]any{"entry_point": "resume"}),
-		event("batch-end-b", "app.session_ended", "batch-b", map[string]any{"duration_ms": 8000, "reason": "background"}),
+		event("batch-start-a", "app.session_started", "batch-a", 1, map[string]any{"entry_point": "menu"}),
+		event("batch-end-a", "app.session_ended", "batch-a", 2, map[string]any{"duration_ms": 12000, "reason": "completed"}),
+		event("batch-start-b", "app.session_started", "batch-b", 1, map[string]any{"entry_point": "resume"}),
+		event("batch-end-b", "app.session_ended", "batch-b", 2, map[string]any{"duration_ms": 8000, "reason": "background"}),
 	}, false)
-	analytics("mixed-size", "mixed", []shardpilot.Event{event("large", "app.session_started", "large", map[string]any{"synthetic_padding": strings.Repeat("x", 3072)}), event("small", "app.session_started", "small", nil)}, false)
-	analytics("unauthenticated", "unauthenticated", []shardpilot.Event{event("unauth", "app.session_started", "unauth", nil)}, true)
+	analytics("mixed-size", "mixed", []shardpilot.Event{event("large", "app.session_started", "large", 1, map[string]any{"synthetic_padding": strings.Repeat("x", 3072)}), event("small", "app.session_started", "small", 1, nil)}, false)
+	analytics("unauthenticated", "unauthenticated", []shardpilot.Event{event("unauth", "app.session_started", "unauth", 1, nil)}, true)
 	for _, kind := range []string{"go-panic", "native-json", "raw-text"} {
 		caseRun(kind, "crash", func(hc *http.Client) error {
 			c, err := crash.NewClient(crash.ClientOptions{IngestURL: values["SHARDPILOT_CRASH_INGEST_URL"], APIKey: values["SHARDPILOT_API_KEY"], App: crash.AppInfo{ID: values["SHARDPILOT_APP_ID"], Version: "synthetic", BuildID: "sdk-evidence"}, Source: "sdk-evidence", AnonymousID: values["SHARDPILOT_ANONYMOUS_ID"], SessionID: runID, HTTPClient: hc, MaxAttempts: 1})
