@@ -48,6 +48,10 @@ type Config struct {
 	Logger                      Logger
 	AllowInsecurePrivateNetwork bool
 
+	// RejectionCapacity bounds the in-memory per-event rejection history.
+	// Non-positive values use 64 entries; the oldest entry is evicted first.
+	RejectionCapacity int
+
 	// HTTPClient, when set, is the *http.Client every request this SDK makes
 	// goes through — event-batch publishes, consent posts, and remote-config
 	// fetches — so an integrator can supply a pooled transport, a proxy, mTLS,
@@ -261,11 +265,12 @@ type Config struct {
 	// OnBatchResult, when set, is called after each successful batch publish
 	// (HTTP 202) with the ingest outcome: the accepted/rejected/duplicate
 	// aggregate plus the per-event status list the endpoint reports. It is the
-	// only way to learn which individual events the server rejected, folded as
-	// duplicates, observed (event_name not registered), or suppressed for
+	// complete way to learn which individual events the server rejected, folded
+	// as duplicates, observed (event_name not registered), or suppressed for
 	// withheld consent — for suppressed events the 202 is not delivery
 	// confirmation. The same per-event statuses are also folded into the
 	// Snapshot().ByStatus aggregate.
+	// Rejected outcomes are also retained by Client.Rejections without a hook.
 	//
 	// It runs synchronously on the SDK's publish path and may be called
 	// concurrently: the background flush worker and synchronous Track publishes
@@ -425,6 +430,9 @@ func normalizeConfig(cfg Config) (Config, error) {
 	}
 	if cfg.BufferSize <= 0 {
 		cfg.BufferSize = defaultBufferSize
+	}
+	if cfg.RejectionCapacity <= 0 {
+		cfg.RejectionCapacity = 64
 	}
 	if cfg.FlushInterval <= 0 {
 		cfg.FlushInterval = defaultFlushInterval

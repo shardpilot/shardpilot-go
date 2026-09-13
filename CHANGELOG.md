@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Retain per-event batch rejections in a configurable in-memory ring (default
+  64 entries) exposed through concurrent-safe `Client.Rejections()` copies.
+  Parsed `202` responses keep the existing nil `Track`/`Flush` error contract;
+  rejection history, cumulative counters and `Snapshot().LastError` make
+  partial rejection inspectable. A configured observer or logger handles
+  diagnostics; otherwise bounded standard warnings are emitted. Terminal
+  events leave the retry spool once. See [Batch verdicts](README.md#batch-verdicts).
+
 - **Typed resource verb: `TrackEconomyTx` / `EnqueueEconomyTx`.** An `EconomyTx`
   value builds the canonical `economy_tx` event — `direction` (`EconomySource` or
   `EconomySink`), `currency_type`, `reason` and a strictly positive integer
