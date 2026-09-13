@@ -52,9 +52,9 @@ type BatchEventStatus struct {
 // BatchResult is the outcome of a published event batch, surfaced to the
 // OnBatchResult callback. Accepted/Rejected/Duplicates are the server's
 // top-level aggregate counts; Events carries the per-event status list, which
-// is the only place a caller can learn which individual events were rejected,
-// suppressed for withheld consent, observed (not registered), or folded as
-// duplicates. Events is nil when the response carried no per-event list.
+// identifies rejected, consent-suppressed, observed (not registered), and
+// duplicate events. Client.Rejections also retains rejected outcomes without
+// this callback. Events is nil when the response carried no per-event list.
 type BatchResult struct {
 	Accepted   int
 	Rejected   int
@@ -74,13 +74,17 @@ func (r batchResult) toPublic() BatchResult {
 	if len(r.Events) > 0 {
 		result.Events = make([]BatchEventStatus, len(r.Events))
 		for i, event := range r.Events {
-			result.Events[i] = BatchEventStatus{
-				EventID: event.EventID,
-				Status:  EventStatus(event.Status),
-				Code:    event.Code,
-				Message: event.Message,
-			}
+			result.Events[i] = event.toPublic()
 		}
 	}
 	return result
+}
+
+func (e batchEventStatusWire) toPublic() BatchEventStatus {
+	return BatchEventStatus{
+		EventID: e.EventID,
+		Status:  EventStatus(e.Status),
+		Code:    e.Code,
+		Message: e.Message,
+	}
 }

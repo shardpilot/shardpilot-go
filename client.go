@@ -13,11 +13,12 @@ import (
 )
 
 type Client struct {
-	cfg       Config
-	clock     Clock
-	queue     *boundedQueue
-	transport transport
-	stats     statsCollector
+	cfg        Config
+	clock      Clock
+	queue      *boundedQueue
+	transport  transport
+	stats      statsCollector
+	rejections rejectionHistory
 
 	// startupResendWakeAt is the absolute deadline for the next look at
 	// spool work that carries no deadline of its own (see nextPacingWake).
@@ -506,6 +507,8 @@ func (c *Client) Enqueue(event Event) error {
 	return nil
 }
 
+// Flush drains queued work. Parsed 202 responses return nil even when individual
+// events were rejected; inspect Rejections and Snapshot for those outcomes.
 func (c *Client) Flush(ctx context.Context) error {
 	reply := make(chan error, 1)
 	request := flushRequest{ctx: ctx, reply: reply}
@@ -1801,6 +1804,7 @@ func (c *Client) publishRequestResult(ctx context.Context, request batchRequest,
 		return batchResult{}, err
 	}
 	c.stats.recordBatch(result, size)
+	c.retainRejections(result)
 	if c.spool != nil {
 		// ANY successful publish proves the server's backpressure window
 		// over: a persisted Retry-After deadline surviving it would defer the
@@ -1823,10 +1827,10 @@ func (c *Client) publishRequestResult(ctx context.Context, request batchRequest,
 	return result, nil
 }
 
-// notifyBatchResult invokes the optional OnBatchResult callback with the
-// publish outcome, guarding against a panic in user code so a buggy callback
-// cannot take down the background flush worker.
+// notifyBatchResult emits diagnostics after spool settlement. Rejections were
+// already retained before settlement could invoke a user dead-letter hook.
 func (c *Client) notifyBatchResult(result BatchResult) {
+	c.warnRejections(result)
 	if c.cfg.OnBatchResult == nil {
 		return
 	}

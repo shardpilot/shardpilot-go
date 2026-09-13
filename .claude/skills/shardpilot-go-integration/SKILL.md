@@ -186,7 +186,8 @@ makes no requests at any value. A full `BatchSize` publishes immediately,
 deadline, a deadline armed by a concurrent `Track`, and spool entries reloaded
 at startup all wait for the flush tick)*),
 `HTTPTimeout` (default 2s), `Logger`, `UserID`/`AnonymousID`
-(default actor identity), `OnBatchResult` (see verification), the
+(default actor identity), `OnBatchResult` (see verification),
+`RejectionCapacity` (unreleased; non-positive values use 64 entries), the
 remote-config fields (`RemoteConfigURL` + `APIKey` +
 `RemoteConfigCachePath`; see "Remote config"), the disk-spool fields
 (`SpoolDir`, `SpoolMaxEvents`, `SpoolMaxBytes`, `OnSpoolDeadLetter`; see
@@ -550,6 +551,18 @@ loss window. If at-least-once delivery matters end to end, keep your own
 durable record upstream of the SDK.
 
 ## Verify your integration
+
+On unreleased main, `client.Rejections()` exposes copied per-event rejection
+history without a hook; `Snapshot().Rejected` remains cumulative and
+`Snapshot().LastError` identifies the latest recorded failure or rejection.
+Parsed `202` responses still return nil from `Track` and `Flush`. The ring
+survives `Close` for inspection but is not persisted; a new client starts empty.
+A configured `OnBatchResult` owns diagnostics, otherwise `Logger` receives
+each rejection, otherwise the standard logger emits bounded warnings. Rejections
+and counters are available inside `OnSpoolDeadLetter`; rejection warnings and
+`OnBatchResult` run after spool settlement finishes. The
+pinned release still uses the callback and counters. See
+[Batch verdicts](https://github.com/shardpilot/shardpilot-go#batch-verdicts).
 
 Run against your dev/staging deployment credentials, then check each item:
 

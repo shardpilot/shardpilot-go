@@ -22,7 +22,9 @@ type Stats struct {
 	// EventStatusSuppressedAdRevenueConsent). It is forward-compatible with
 	// statuses the server adds later. Each Snapshot returns a fresh copy; it
 	// is nil until a batch response carrying a per-event list is recorded.
-	ByStatus  map[EventStatus]uint64
+	ByStatus map[EventStatus]uint64
+	// LastError is the latest recorded operational failure or per-event rejection.
+	// A rejection does not increment FailedBatches or change the Flush error.
 	LastError string
 
 	// Disk-spool counters (always zero when Config.SpoolDir is unset).
@@ -173,7 +175,8 @@ func (s *statsCollector) recordFailure(err error) {
 }
 
 // setLastError surfaces a non-batch operational failure (a failed remote-
-// config cache or spool/consent record write) in Stats.LastError without
+// config cache, spool/consent record write, or per-event rejection) without
+// changing the parsed-202 Flush error contract. It updates Stats.LastError without
 // counting a failed batch — no batch failed.
 func (s *statsCollector) setLastError(message string) {
 	s.mu.Lock()
