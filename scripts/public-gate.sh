@@ -55,7 +55,7 @@ with tempfile.TemporaryDirectory(prefix='public-gate-scenes-') as directory:
     subject = 'scan_tree "$PWD"'
     if original.count(subject) != 1: raise RuntimeError('actual scan invocation moved')
     total = 0
-    for name in ['clean-zero-comparison', 'completed-finding', 'stopped-after-finding', 'dropped-tree-read', 'killed-reader', 'short-tree-walk', 'stale-startup', 'helper-mismatch', 'channel-write-failure', 'baseline-write']:
+    for name in ['clean-zero-comparison', 'completed-finding', 'stopped-after-finding', 'dropped-tree-read', 'killed-reader', 'short-tree-walk', 'stale-startup', 'helper-mismatch', 'channel-write-failure', 'baseline-write', 'stdout-closes-after-json', 'channel-closes-after-json']:
         if selected and name not in selected: continue
         gate.write_text(original)
         helper.write_text(original_helper)
@@ -70,6 +70,23 @@ with tempfile.TemporaryDirectory(prefix='public-gate-scenes-') as directory:
             point = '    scan_files=$((scan_files + 1))'
             assert original.count(point) == 1
             gate.write_text(original.replace(point, point + '\n    if [ "${2:-}" = receipt ]; then echo "synthetic short tree"; break; fi', 1))
+        if name in ['stdout-closes-after-json', 'channel-closes-after-json']:
+            # The actual successful stdout JSON is the synchronization point.
+            # A pipe identifies stdout; the channel append redirects to a file.
+            action = 'exec 1>&-' if name == 'stdout-closes-after-json' else 'chmod a-w "$NIGHTLY_COMPLETION_FILE"'
+            helper.write_text(original_helper + r'''
+printf() {
+  builtin printf "$@" || return $?
+  if [ "$#" -eq 2 ] && [ -p /dev/fd/1 ]; then
+    case "$2" in
+      'RECEIPT scripts/check_public_surface.sh: '*\"aborted\":false*)
+        : > "$NIGHTLY_COMPLETION_FILE.fault-fired"
+        @ACTION@
+        ;;
+    esac
+  fi
+}
+'''.replace('@ACTION@', action))
         call(['git', 'add', '-A'], repo)
         call(['bash', '-n', str(gate)], repo)
         channel = root / (name + '.declared')
@@ -86,6 +103,10 @@ with tempfile.TemporaryDirectory(prefix='public-gate-scenes-') as directory:
         args = ['bash', str(gate)] + (['--write-baseline'] if name == 'baseline-write' else [])
         run = subprocess.run(args, cwd=repo, env=env, capture_output=True, text=True, timeout=600)
         r = receipt(channel)
+        if name in ['stdout-closes-after-json', 'channel-closes-after-json']:
+            assert pathlib.Path(str(channel) + '.fault-fired').is_file(), ('finalization fault did not fire', name, run.stderr)
+            assert run.returncode == 2, (name, run.returncode, run.stderr)
+            if name == 'channel-closes-after-json': assert 'Permission denied' in run.stderr, run.stderr
         if name in ['clean-zero-comparison', 'completed-finding', 'baseline-write']:
             assert complete(r), (name, run.returncode, r, run.stdout[-1000:], run.stderr[-1000:])
             assert run.returncode == (1 if name == 'completed-finding' else 0), (name, run.returncode)
@@ -177,9 +198,7 @@ public_gate_emit() {
       "$public_gate_read" "$public_gate_expected" "$public_gate_findings" "$1"
     if [ "$1" = true ]; then printf '["reading-stopped"]'; else printf '[]'; fi
     printf '}')" || return 2
-  if [ -n "${NIGHTLY_COMPLETION_FILE:-}" ]; then
-    printf '%s\n' "$line" >> "$NIGHTLY_COMPLETION_FILE" || return 2
-  fi
+  local receipt_line="$line"
   if [ "$2" = yes ]; then
     printf '%s\n' "$line" || return 2
     declaration=COMPLETE
@@ -189,6 +208,11 @@ public_gate_emit() {
     if [ -n "${NIGHTLY_COMPLETION_FILE:-}" ]; then
       printf '%s\n' "$line" >> "$NIGHTLY_COMPLETION_FILE" || return 2
     fi
+  fi
+  # Commit the channel receipt only after every other required write succeeds.
+  # A later output failure must leave the initial aborted record authoritative.
+  if [ -n "${NIGHTLY_COMPLETION_FILE:-}" ]; then
+    printf '%s\n' "$receipt_line" >> "$NIGHTLY_COMPLETION_FILE" || return 2
   fi
 }
 
