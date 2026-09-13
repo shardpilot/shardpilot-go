@@ -28,23 +28,22 @@ func (c *Client) Rejections() []BatchEventStatus {
 	return out
 }
 
-// All publish paths arrive after spool settlement. Retain the entire batch
-// before invoking user diagnostics, which may mutate results, panic or reenter.
-func (c *Client) recordRejections(result BatchResult) {
+// Retain the entire batch before spool settlement can invoke user hooks.
+// This phase calls no user code, so a blocked hook cannot prevent retention.
+func (c *Client) retainRejections(result batchResult) {
 	h := &c.rejections
 	capacity := c.cfg.RejectionCapacity
 	if capacity <= 0 {
 		capacity = 64
 	}
-	defaultChannel := c.cfg.OnBatchResult == nil && c.cfg.Logger == nil
-	var warnings []BatchEventStatus
 	var last BatchEventStatus
 	haveRejection := false
 	h.mu.Lock()
-	for _, entry := range result.Events {
-		if entry.Status != EventStatusRejected {
+	for _, event := range result.Events {
+		if EventStatus(event.Status) != EventStatusRejected {
 			continue
 		}
+		entry := event.toPublic()
 		if len(h.entries) < capacity {
 			h.entries = append(h.entries, entry)
 		} else {
@@ -52,7 +51,24 @@ func (c *Client) recordRejections(result BatchResult) {
 			h.next = (h.next + 1) % capacity
 		}
 		last, haveRejection = entry, true
-		if c.cfg.OnBatchResult != nil {
+	}
+	if haveRejection {
+		c.stats.setLastError(c.rejectionDiagnostic(last))
+	}
+	h.mu.Unlock()
+}
+
+// Reserve warning budget and invoke diagnostics only after spool settlement.
+func (c *Client) warnRejections(result BatchResult) {
+	if c.cfg.OnBatchResult != nil {
+		return
+	}
+	h := &c.rejections
+	defaultChannel := c.cfg.Logger == nil
+	var warnings []BatchEventStatus
+	h.mu.Lock()
+	for _, entry := range result.Events {
+		if entry.Status != EventStatusRejected {
 			continue
 		}
 		emit := !defaultChannel || h.warningCount < 10
@@ -69,9 +85,6 @@ func (c *Client) recordRejections(result BatchResult) {
 				h.warningCount++
 			}
 		}
-	}
-	if haveRejection {
-		c.stats.setLastError(c.rejectionDiagnostic(last))
 	}
 	h.mu.Unlock()
 	for _, entry := range warnings {

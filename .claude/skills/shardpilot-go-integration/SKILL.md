@@ -558,7 +558,9 @@ history without a hook; `Snapshot().Rejected` remains cumulative and
 Parsed `202` responses still return nil from `Track` and `Flush`. The ring
 survives `Close` for inspection but is not persisted; a new client starts empty.
 A configured `OnBatchResult` owns diagnostics, otherwise `Logger` receives
-each rejection, otherwise the standard logger emits bounded warnings. The
+each rejection, otherwise the standard logger emits bounded warnings. Rejections
+and counters are available inside `OnSpoolDeadLetter`; rejection warnings and
+`OnBatchResult` run after spool settlement finishes. The
 pinned release still uses the callback and counters. See
 [Batch verdicts](https://github.com/shardpilot/shardpilot-go#batch-verdicts).
 

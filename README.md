@@ -281,7 +281,10 @@ per-event entries to `OnBatchResult`; Go does not add a flush-result object.
 
 A configured `OnBatchResult` owns diagnostics. Otherwise, a configured
 `Logger` receives every rejection; when both are unset, the standard Go logger
-emits bounded warnings. The complete batch is retained before user code runs.
+emits bounded warnings. Rejections and counters are recorded before spool
+settlement can call `OnSpoolDeadLetter`, so that hook can read the current
+batch even if it blocks or panics. Rejection warnings and `OnBatchResult`
+run after settlement finishes.
 Diagnostic messages redact configured `Token` and `APIKey` values while the
 ring preserves the server's original fields. Logger and observer panics do
 not turn a settled response into a failed publish. `OnSpoolDeadLetter` remains

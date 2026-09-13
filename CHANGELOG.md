@@ -8,7 +8,9 @@
   rejection history, cumulative counters and `Snapshot().LastError` make
   partial rejection inspectable. A configured observer or logger handles
   diagnostics; otherwise bounded standard warnings are emitted. Terminal
-  events leave the retry spool once. See [Batch verdicts](README.md#batch-verdicts).
+  events leave the retry spool once. Rejections and counters are recorded before
+  spool dead-letter hooks; warnings and batch observers follow settlement.
+  See [Batch verdicts](README.md#batch-verdicts).
 
 - **Typed resource verb: `TrackEconomyTx` / `EnqueueEconomyTx`.** An `EconomyTx`
   value builds the canonical `economy_tx` event — `direction` (`EconomySource` or

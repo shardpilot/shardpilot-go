@@ -1804,6 +1804,7 @@ func (c *Client) publishRequestResult(ctx context.Context, request batchRequest,
 		return batchResult{}, err
 	}
 	c.stats.recordBatch(result, size)
+	c.retainRejections(result)
 	if c.spool != nil {
 		// ANY successful publish proves the server's backpressure window
 		// over: a persisted Retry-After deadline surviving it would defer the
@@ -1826,10 +1827,10 @@ func (c *Client) publishRequestResult(ctx context.Context, request batchRequest,
 	return result, nil
 }
 
-// notifyBatchResult retains rejections and then invokes the optional callback,
-// guarding against a panic so user code cannot take down the flush worker.
+// notifyBatchResult emits diagnostics after spool settlement. Rejections were
+// already retained before settlement could invoke a user dead-letter hook.
 func (c *Client) notifyBatchResult(result BatchResult) {
-	c.recordRejections(result)
+	c.warnRejections(result)
 	if c.cfg.OnBatchResult == nil {
 		return
 	}

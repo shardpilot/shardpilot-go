@@ -259,7 +259,9 @@ type Config struct {
 	// batches refused disk under a non-grant (or owed-wipe) state. It runs on
 	// the SDK's worker/consent paths; keep it fast and non-blocking. A panic
 	// inside it is recovered, like OnBatchResult. Never called when SpoolDir
-	// is empty.
+	// is empty. After a parsed batch response, Rejections and its counters
+	// are updated before any settlement hook runs; rejection warnings and
+	// OnBatchResult run after settlement finishes.
 	OnSpoolDeadLetter func(SpoolDeadLetter)
 
 	// OnBatchResult, when set, is called after each successful batch publish

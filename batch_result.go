@@ -74,13 +74,17 @@ func (r batchResult) toPublic() BatchResult {
 	if len(r.Events) > 0 {
 		result.Events = make([]BatchEventStatus, len(r.Events))
 		for i, event := range r.Events {
-			result.Events[i] = BatchEventStatus{
-				EventID: event.EventID,
-				Status:  EventStatus(event.Status),
-				Code:    event.Code,
-				Message: event.Message,
-			}
+			result.Events[i] = event.toPublic()
 		}
 	}
 	return result
+}
+
+func (e batchEventStatusWire) toPublic() BatchEventStatus {
+	return BatchEventStatus{
+		EventID: e.EventID,
+		Status:  EventStatus(e.Status),
+		Code:    e.Code,
+		Message: e.Message,
+	}
 }

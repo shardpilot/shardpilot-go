@@ -543,3 +543,154 @@ func TestRejectionConcurrentPublishAndRead(t *testing.T) {
 		seen[entry.EventID] = true
 	}
 }
+
+func TestRejectionDeadLetterOrdering(t *testing.T) {
+	for _, path := range []string{"live", "resend"} {
+		for _, mode := range []string{"read", "block", "panic"} {
+			for _, channel := range []string{"default", "logger", "observer"} {
+				t.Run(path+"/"+mode+"/"+channel, func(t *testing.T) {
+					sink := captureRejectionLog(t)
+					directory := t.TempDir()
+					if path == "resend" {
+						writeConsentRecordFile(t, directory, "granted")
+						writeSpoolRecordFile(t, directory, 0, spoolTestEnvelope(t, "rejected-id-0", time.Now()), spoolTestEnvelope(t, "accepted-sibling", time.Now()))
+					}
+					type observation struct {
+						entries             []BatchEventStatus
+						stats               Stats
+						warnings, observers int
+						reason              SpoolDropReason
+					}
+					observed := make(chan observation, 1)
+					ready := make(chan struct{})
+					release := make(chan struct{})
+					var releaseOnce sync.Once
+					unblock := func() { releaseOnce.Do(func() { close(release) }) }
+					var client *Client
+					var customWarnings, observers atomic.Int32
+					client, fake := rejectionClient(t, func(cfg *Config) {
+						cfg.SpoolDir = directory
+						cfg.AnonymousID = "anon-spool-1"
+						cfg.HTTPClient.Transport.(*rejectionHTTP).setTransform(func(result *batchResult) {
+							result.Accepted, result.Rejected = 0, 0
+							for i := range result.Events {
+								entry := &result.Events[i]
+								if entry.EventID == "rejected-id-0" {
+									entry.Status, entry.Code, entry.Message = "rejected", "event_too_large", "configured size limit exceeded"
+									result.Rejected++
+								} else {
+									result.Accepted++
+								}
+							}
+						})
+						if channel == "logger" {
+							cfg.Logger = rejectionLoggerFunc(func(format string, args ...any) {
+								if strings.Contains(fmt.Sprintf(format, args...), "shardpilot event rejected") {
+									customWarnings.Add(1)
+								}
+							})
+						}
+						if channel == "observer" {
+							cfg.OnBatchResult = func(BatchResult) { observers.Add(1) }
+						}
+						cfg.OnSpoolDeadLetter = func(letter SpoolDeadLetter) {
+							select {
+							case <-ready:
+							case <-time.After(time.Second):
+								observed <- observation{}
+								return
+							}
+							observed <- observation{client.Rejections(), client.Snapshot(), int(customWarnings.Load()) + strings.Count(sink.text(), "shardpilot event rejected"), int(observers.Load()), letter.Reason}
+							if mode == "block" {
+								<-release
+							}
+							if mode == "panic" {
+								panic("fixture dead-letter panic")
+							}
+						}
+					})
+					close(ready)
+					t.Cleanup(unblock)
+					if path == "live" {
+						client.SetConsent(true)
+						fake.mu.Lock()
+						fake.failNext = true
+						fake.mu.Unlock()
+						enqueueRejections(t, client, 1)
+						if err := client.Flush(rejectionContext(t)); err == nil {
+							t.Fatal("live fixture did not fail before retry")
+						}
+						if got := len(readSpoolRecordFile(t, directory).Events); got != 2 {
+							t.Fatalf("persisted fixture has %d events, want 2", got)
+						}
+					}
+					finished := make(chan error, 1)
+					ctx := rejectionContext(t)
+					go func() { finished <- client.Flush(ctx) }()
+					var atHook observation
+					select {
+					case atHook = <-observed:
+					case <-ctx.Done():
+						t.Fatal("terminal dead-letter hook was not reached")
+					}
+					if atHook.reason != SpoolDropTerminal {
+						t.Error("fixture did not reach a terminal settlement")
+					}
+					if len(atHook.entries) != 1 || atHook.entries[0].EventID != "rejected-id-0" {
+						t.Errorf("dead-letter hook saw stale history: %#v", atHook.entries)
+					}
+					if atHook.stats.Rejected != 1 || atHook.stats.Accepted != 1 {
+						t.Errorf("dead-letter hook saw stale counters: %+v", atHook.stats)
+					}
+					if atHook.warnings != 0 || atHook.observers != 0 {
+						t.Error("logger or observer ran before dead-letter settlement finished")
+					}
+					if mode == "block" {
+						if entries := client.Rejections(); len(entries) != 1 {
+							t.Errorf("blocked hook prevented retention: %#v", entries)
+						}
+						if observers.Load() != 0 || customWarnings.Load() != 0 || strings.Contains(sink.text(), "shardpilot event rejected") {
+							t.Error("diagnostics ran through a blocked settlement")
+						}
+						select {
+						case <-finished:
+							t.Error("Flush completed while the dead-letter hook was blocked")
+						default:
+						}
+					}
+					unblock()
+					select {
+					case err := <-finished:
+						if err != nil {
+							t.Fatal(err)
+						}
+					case <-ctx.Done():
+						t.Fatal("Flush did not finish after releasing the hook")
+					}
+					entries := client.Rejections()
+					if len(entries) != 1 || client.Snapshot().Rejected != 1 {
+						t.Fatal("settlement lost or duplicated retention")
+					}
+					expectedWarnings, expectedObservers := 1, 0
+					if channel == "observer" {
+						expectedWarnings, expectedObservers = 0, 1
+					}
+					warnings := int(customWarnings.Load()) + strings.Count(sink.text(), "shardpilot event rejected")
+					if warnings != expectedWarnings || int(observers.Load()) != expectedObservers {
+						t.Errorf("post-settlement diagnostics warnings=%d observers=%d", warnings, observers.Load())
+					}
+					if got := len(readSpoolRecordFile(t, directory).Events); got != 0 {
+						t.Errorf("settlement left %d spooled events", got)
+					}
+					expectedResent := uint64(0)
+					if path == "resend" {
+						expectedResent = 1
+					}
+					if client.Snapshot().SpoolResent != expectedResent {
+						t.Error("fixture did not exercise its named live/resend path")
+					}
+				})
+			}
+		}
+	}
+}
