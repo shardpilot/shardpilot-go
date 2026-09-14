@@ -202,6 +202,11 @@
 
 set -euo pipefail
 
+# Invalidate an earlier invocation even when startup fails before the helper loads.
+if [ -n "${NIGHTLY_COMPLETION_FILE:-}" ]; then
+  printf 'RECEIPT scripts/check_public_surface.sh: null\n' >> "$NIGHTLY_COMPLETION_FILE" || exit 2
+fi
+
 SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 if [ ! -f "$SELF" ]; then
   # refusal:structural
@@ -348,6 +353,9 @@ trap 'gate_rc=$?; rm -f ${GATE_TMPFILES[@]+"${GATE_TMPFILES[@]}"};
         echo "  error above this line, not the absence of findings." >&2
         gate_rc=3
       fi
+      if [ "${public_gate_ready:-no}" = yes ]; then
+        public_gate_finish "$gate_rc" || gate_rc=2
+      fi
       exit "$gate_rc"' EXIT
 
 SELF_REL="scripts/$(basename "$SELF")"
@@ -376,6 +384,17 @@ if ! cmp -s "$SELF" "$SELF_BLOB"; then
   echo "  Stage this file, then run again." >&2
   exit 2
 fi
+
+# Read the helper from the same index as the subject, and refuse a different
+# working copy. A newly written helper must be staged before this gate runs.
+gate_tmp; public_gate_blob="$GATE_TMP"
+if ! git cat-file blob :scripts/public-gate.sh > "$public_gate_blob" \
+   || ! cmp -s scripts/public-gate.sh "$public_gate_blob"; then
+  echo 'REFUSING: receipt helper differs from the index or is unreadable.' >&2
+  exit 2
+fi
+. "$public_gate_blob"
+public_gate_init
 
 # ⚠ AND NO ANSI-C QUOTED FRAGMENT ANYWHERE IN IT. `$'\400'` is a NUL, and bash
 # truncates a value there — everything after it stays in the published file and
@@ -904,7 +923,7 @@ scan_lane_b_counts=""
 scan_files=0
 
 scan_tree() {
-  local root="$1" f hits status line list
+  local root="$1" f hits status line list expected_files=0 observed_files=0
   scan_lane_a=""; scan_lane_b_files=0; scan_lane_b_lines=0; scan_files=0
   scan_lane_b_counts=""
 
@@ -942,6 +961,11 @@ scan_tree() {
     echo "  gate must not report one clean." >&2
     exit 2
   fi
+
+  # The full manifest supplies the denominator before any file is inspected.
+  while IFS= read -r -d '' f; do
+    expected_files=$((expected_files + 1))
+  done < "$list"
 
   while IFS= read -r -d '' f; do
     # NO PATH IS EXEMPT FROM THIS LOOP, including this script. The
@@ -1040,6 +1064,7 @@ scan_tree() {
          || printf '%s\n' "$link_stripped" | grep -qiE -- "$ROSTER_RE"; then
         scan_lane_a="${scan_lane_a}${f}:link:${link}"$'\n'
       fi
+      observed_files=$((observed_files + 1))
       continue
     fi
     # ⚠ A COMPRESSED TRACKED FILE IS NOT SCANNED BY ANYTHING HERE, and `-a`
@@ -1575,6 +1600,7 @@ scan_tree() {
       fi
     done
     if [ "$status" -ne 0 ] && [ "$roster_status" -ne 0 ]; then
+      observed_files=$((observed_files + 1))
       continue
     fi
     # One corpus from here down, so the lane split below cannot see a
@@ -1804,7 +1830,12 @@ scan_tree() {
         done <<< "$hits"
         ;;
     esac
+    observed_files=$((observed_files + 1))
   done < "$list"
+  if [ "${2:-}" = receipt ] && [ "$expected_files" -gt 0 ] \
+     && [ "$observed_files" -eq "$expected_files" ]; then
+    public_gate_observe tree
+  fi
   rm -f "$list"
 }
 
@@ -2207,6 +2238,7 @@ EOF
     exit 2
   fi
   echo "roster rule: OK — all $(printf '%s\n' "$ROSTER" | grep -c .) literal(s) still present elsewhere in this tree"
+  public_gate_observe roster
 }
 
 selftest() {
@@ -2517,15 +2549,17 @@ EOF
     exit 2
   fi
   echo "self-test: OK — $tested known-internal string(s) matched, $innocent innocent string(s) passed, $fixture_checks scan assertion(s)"
+  public_gate_observe self-test
 }
 
+public_gate_observe audit
 roster_is_present_in_the_tree
 selftest
 
 # ---------------------------------------------------------------------------
 # THE REAL SCAN
 # ---------------------------------------------------------------------------
-scan_tree "$PWD"
+scan_tree "$PWD" receipt
 
 # An empty file list is the shape of every fail-open above, and it is the ONE
 # symptom they all share — so it is checked directly rather than only through
@@ -2562,7 +2596,9 @@ echo
 if [ -n "$scan_lane_a" ]; then
   echo "FAIL — internal material in the published non-source surface:" >&2
   printf '%s' "$scan_lane_a" >&2
-  exit 1
+  public_gate_finding
+  # A write still refuses here. A reading continues through its remaining checks.
+  if [ "${1:-}" = --write-baseline ]; then exit 1; fi
 fi
 
 # ── LANE B RATCHET ────────────────────────────────────────────────────────────
@@ -2722,6 +2758,8 @@ lane_b_now="$(printf '%s' "$scan_lane_b_counts" | { grep -v '^$' || [ $? -eq 1 ]
 
 lane_b_root="$(cd -P "$(git rev-parse --show-toplevel)" && pwd -P)"
 if [ "${1:-}" = "--write-baseline" ]; then
+  public_gate_exclude baseline-check
+  public_gate_exclude target-check
   # ⚠ THE PARENT IS HELD, NOT NAMED. A constant leaf does not fix its parent:
   # another process can rename `scripts/` and put a symlink there, and a relative
   # temporary path is then re-resolved through the replacement -- so both the
@@ -2902,6 +2940,7 @@ if [ "${1:-}" = "--write-baseline" ]; then
     }
   ) || exit $?
   echo "WROTE $LANE_B_BASELINE"
+  public_gate_observe baseline-write
   # The EXIT trap treats rc=0 without this as a run that died mid-flight, which
   # is exactly right for every other early return here. Writing the baseline is
   # the one legitimate short path, so it says so rather than tripping the
@@ -2918,6 +2957,7 @@ fi
 # baseline edit unstaged compared a staged tree against an unstaged baseline and
 # passed -- while the commit being built still carried the stale one. Two sides,
 # two universes, and the gate reported on neither.
+public_gate_exclude baseline-write
 gate_tmp; lane_b_base_blob="$GATE_TMP"
 if ! git cat-file blob ":$LANE_B_BASELINE" > "$lane_b_base_blob" 2>/dev/null; then
   # refusal:structural — fail closed. An absent baseline is indistinguishable
@@ -2970,8 +3010,9 @@ if [ "$lane_b_now" != "$lane_b_base" ]; then
   echo "  in a public SDK: remove the reference. Do not re-baseline it." >&2
   echo "  A count that FELL is debt you paid: rerun with --write-baseline and" >&2
   echo "  commit the smaller file in this same change." >&2
-  exit 1
+  public_gate_finding
 fi
+public_gate_observe baseline-check
 
 # The anti-cheat. Without this, the two rules above are satisfiable by editing
 # the baseline upward in the same commit that adds the occurrence.
@@ -3071,23 +3112,30 @@ if [ -n "${PUBLIC_SURFACE_BASE_REF:-}" ]; then
         echo "FAIL — $path carries $count lane B occurrence(s) and is absent from" >&2
         echo "  the target's baseline. A file with no entry there had none: this is" >&2
         echo "  new internal material in a public SDK, however the baseline reads." >&2
-        exit 1
+        public_gate_finding
+        continue
       fi
       if [ "$count" -gt "$was" ]; then
         echo "FAIL — the baseline was raised for $path ($was -> $count)." >&2
         echo "  Editing this file upward is not a way to introduce internal material." >&2
-        exit 1
+        public_gate_finding
       fi
     done <<< "$lane_b_base"
+    public_gate_observe target-check
   else
+    public_gate_exclude target-check
     # Named, not swallowed: the target may predate the baseline.
     echo "  (baseline-vs-target check skipped: ${PUBLIC_SURFACE_BASE_REF} carries no $LANE_B_BASELINE)"
   fi
 else
+  public_gate_exclude target-check
   echo "  (baseline-vs-target check skipped: PUBLIC_SURFACE_BASE_REF unset — CI sets it)"
 fi
 
-echo "LANE B RATCHET — held at $(printf '%s' "$lane_b_now" | grep -c . ) file(s), $(printf '%s' "$lane_b_now" | awk '{n += $1} END {print n + 0}') occurrence(s). The number may fall and may not rise."
+if [ "$public_gate_status" -eq 0 ]; then
+  echo "LANE B RATCHET — held at $(printf '%s' "$lane_b_now" | grep -c . ) file(s), $(printf '%s' "$lane_b_now" | awk '{n += $1} END {print n + 0}') occurrence(s). The number may fall and may not rise."
 
+  echo "LANE A (GATED) — clean. ${scan_files} tracked file(s) were read; a run that scanned none refuses above rather than reporting this line."
+fi
 gate_finished=yes
-echo "LANE A (GATED) — clean. ${scan_files} tracked file(s) were read; a run that scanned none refuses above rather than reporting this line."
+exit "$public_gate_status"
