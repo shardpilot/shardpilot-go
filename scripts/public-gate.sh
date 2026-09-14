@@ -7,7 +7,8 @@ if [ "${1:-}" = --test ]; then
 import json, os, pathlib, subprocess, sys, tempfile
 source = pathlib.Path(sys.argv[1]).resolve().parent.parent
 compact = '--compact' in sys.argv[2:]
-selected = set(sys.argv[2:]) - {'--compact'}
+permission_bypass = '--permission-bypass' in sys.argv[2:]
+selected = set(sys.argv[2:]) - {'--compact', '--permission-bypass'}
 
 def call(args, cwd, **kw):
     return subprocess.run(args, cwd=cwd, check=True, **kw)
@@ -73,20 +74,33 @@ with tempfile.TemporaryDirectory(prefix='public-gate-scenes-') as directory:
         if name in ['stdout-closes-after-json', 'channel-closes-after-json']:
             # The actual successful stdout JSON is the synchronization point.
             # A pipe identifies stdout; the channel append redirects to a file.
-            action = 'exec 1>&-' if name == 'stdout-closes-after-json' else 'chmod a-w "$NIGHTLY_COMPLETION_FILE"'
+            action = 'exec 1>&-'
+            if name == 'channel-closes-after-json':
+                # A regular-file parent makes the append fail with ENOTDIR,
+                # independently of permission bits. Preserve the original log.
+                action = r''': > "$NIGHTLY_COMPLETION_FILE.blocked"
+        NIGHTLY_COMPLETION_FILE="$NIGHTLY_COMPLETION_FILE.blocked/receipt"
+        if { builtin printf 'synthetic append probe\n' >> "$NIGHTLY_COMPLETION_FILE"; } 2>/dev/null; then
+          builtin printf '0\n' > "$public_gate_scene_fault_marker"
+        else
+          builtin printf '%s\n' "$?" > "$public_gate_scene_fault_marker"
+        fi'''
+            # Model ignored permission changes without claiming UID 0 execution.
+            permission_model = '\nchmod() { :; }\n' if permission_bypass else ''
             helper.write_text(original_helper + r'''
 printf() {
   builtin printf "$@" || return $?
   if [ "$#" -eq 2 ] && [ -p /dev/fd/1 ]; then
     case "$2" in
       'RECEIPT scripts/check_public_surface.sh: '*\"aborted\":false*)
-        : > "$NIGHTLY_COMPLETION_FILE.fault-fired"
+        public_gate_scene_fault_marker="$NIGHTLY_COMPLETION_FILE.fault-fired"
+        : > "$public_gate_scene_fault_marker"
         @ACTION@
         ;;
     esac
   fi
 }
-'''.replace('@ACTION@', action))
+'''.replace('@ACTION@', action) + permission_model)
         call(['git', 'add', '-A'], repo)
         call(['bash', '-n', str(gate)], repo)
         channel = root / (name + '.declared')
@@ -104,9 +118,13 @@ printf() {
         run = subprocess.run(args, cwd=repo, env=env, capture_output=True, text=True, timeout=600)
         r = receipt(channel)
         if name in ['stdout-closes-after-json', 'channel-closes-after-json']:
-            assert pathlib.Path(str(channel) + '.fault-fired').is_file(), ('finalization fault did not fire', name, run.stderr)
+            fault_marker = pathlib.Path(str(channel) + '.fault-fired')
+            assert fault_marker.is_file(), ('finalization fault did not fire', name, run.stderr)
+            if name == 'channel-closes-after-json':
+                append_status = int(fault_marker.read_text().strip())
+                assert append_status != 0, ('channel append fault did not fire', name, run.returncode)
+                print('Observed channel append failure:', append_status, flush=True)
             assert run.returncode == 2, (name, run.returncode, run.stderr)
-            if name == 'channel-closes-after-json': assert 'Permission denied' in run.stderr, run.stderr
         if name in ['clean-zero-comparison', 'completed-finding', 'baseline-write']:
             assert complete(r), (name, run.returncode, r, run.stdout[-1000:], run.stderr[-1000:])
             assert run.returncode == (1 if name == 'completed-finding' else 0), (name, run.returncode)
