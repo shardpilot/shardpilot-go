@@ -54,20 +54,39 @@ each negative twin the manifest promises **that the SDK can express**. Each send
 gets one HTTP attempt: a per-case request budget refuses an SDK retry, so a
 rehearsal probe cannot become a second crash under a new id.
 
-Two of the four twins are **NOT EXERCISED**, and the sender proves it rather
-than asserting it: it builds each one and calls `EmitFatal`, which refuses the
-event before any request.
+A row must be whole. A row with **no** module identity is the artefact-less row
+and is printed as not exercised; a row carrying *some* of it — a name without a
+debug id, a base without an address — fails the run naming it, because its
+crash can be neither sent nor honestly skipped. A row that claims a resolved
+frame must name a **complete** one (function, file and line): an empty
+`expected_frame` is a promise with nothing in it, and there would be nothing to
+compare on run day. A row that does not claim one never gets `resolved` as its
+expected status.
+
+The twin whose frame resolves against no declared module range **is** sent, and
+the spelling matters: the SDK requires a frame carrying an address to name its
+module with a NONEMPTY selector, not with one that resolves. So the twin
+declares two modules with disjoint ranges, neither containing the address, and
+names a module id none of them has. The server's module match then finds
+nothing by id, falls through to range containment, finds nothing there either,
+and has no lone module to fall back to — which is the `module_missing` the
+manifest predicts. Clearing the selector instead (the spelling the rehearsal's
+own handler test uses, since it posts the body directly) is refused by the SDK
+before any request; a scene asserts exactly that.
+
+**One** twin is NOT EXERCISED, and the sender proves it rather than asserting
+it: it builds the event and calls `EmitFatal`, which refuses it before any
+request.
 
 | Twin | Why there is no send |
 |---|---|
 | the module declares no `load_address` and no `base_address` | `pkg/crash/event.go` requires one of them on every module. |
-| the frame's address falls in no declared module's range | `pkg/crash/event.go` requires a frame carrying an address to name its module once more than one is declared — and naming one would make the module match by id and stop being this twin. |
 
-Both refusals are the SDK failing closed on inputs the ingest also rejects, so
-**a client built on this SDK cannot produce those two shapes at all**; the
-ingest contracts for them (`400 rejected`, `module_missing`) stay exercised by
-crash-symbolicator's own handler test against the real route. The row with no
-produced artefact (the PDB leg) is printed the same way.
+That refusal is the SDK failing closed on an input the ingest also rejects, so
+**a client built on this SDK cannot produce that shape at all**; the ingest
+contract for it (`400 rejected`) stays exercised by the symbolicator's own
+handler test against the real route. The row with no produced artefact (the PDB
+leg) is printed the same way.
 
 ## What it prints
 
@@ -78,8 +97,14 @@ Newline-delimited JSON, one line per attempted exchange with `case`, `crash_id`,
 against the product is mechanical; a `not-exercised` line per absent row or
 refused twin, with the SDK site and its refusal error; and a final `summary`.
 The configured credential is redacted from every printed body, header and error
-in its raw, JSON-escaped and percent-encoded forms; `Authorization` is never
-printed.
+— including an SDK or transport error that quotes what it was handed — in its
+raw, JSON-escaped and percent-encoded forms; `Authorization` is never printed.
+
+The evidence stream is checked as it is written, not at the end. If the banner
+cannot be written, **nothing is sent**: a mutation with no receipt is the one
+outcome this sender must never produce. If it breaks mid-run, the sends stop
+there — the crashes already sent have receipts, the rest would not — and the
+run exits 1.
 
 An acknowledgement is read exactly as the protocol witness reads one: one
 observed exchange, the expected status, the submitted crash id echoed back, a

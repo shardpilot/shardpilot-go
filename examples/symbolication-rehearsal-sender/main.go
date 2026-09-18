@@ -79,10 +79,37 @@ type manifestEntry struct {
 	NegativeTwins      []negativeTwin `json:"negative_twins"`
 }
 
-// identified reports whether the row describes a crash this sender can send:
-// a produced artefact's module identity, base and instruction address.
+// identity is the four fields a crash needs from a row: the module's name and
+// debug id, its base, and the instruction address that must resolve inside it.
+func (e manifestEntry) identity() []string {
+	return []string{e.ModuleName, e.DebugID, e.LoadAddress, e.InstructionAddress}
+}
+
+// identified is a row this sender can send; blank is a row with NO artefact at
+// all. Anything between the two is a partly described crash, and sending or
+// skipping it would both be guesses — see the caller.
 func (e manifestEntry) identified() bool {
-	return e.ModuleName != "" && e.DebugID != "" && e.LoadAddress != "" && e.InstructionAddress != ""
+	for _, value := range e.identity() {
+		if strings.TrimSpace(value) == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func (e manifestEntry) blank() bool {
+	for _, value := range e.identity() {
+		if strings.TrimSpace(value) != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// frameComplete reports whether an expected frame can actually be compared on
+// run day: a function, a file and a line, not an empty object.
+func (f *expectedFrame) frameComplete() bool {
+	return f != nil && strings.TrimSpace(f.Function) != "" && strings.TrimSpace(f.File) != "" && f.Line > 0
 }
 
 type manifest struct {
@@ -121,16 +148,22 @@ var twinsByChange = map[string]twin{
 		event.Modules[0].LoadAddress = ""
 		event.Modules[0].BaseAddress = ""
 	}, refusal: "pkg/crash/event.go:211-213 requires a load_address or a base_address on every module"},
+	// Two declared ranges, neither containing the address, and a frame naming a
+	// module id that is not among them. The SDK requires that selector to be
+	// NONEMPTY, not to resolve (pkg/crash/event.go validateEvent), and an
+	// unknown id falls through the server's module match to range containment,
+	// which finds nothing and does not fall back to a lone module — so the
+	// twin's own status stands.
 	twinNoModuleRange: {slug: "no-module-range", mutate: func(event *crash.Event) {
-		event.Modules[0].EndAddress = "0x500000"
 		event.Modules[0].LoadAddress = "0x400000"
+		event.Modules[0].EndAddress = "0x500000"
 		event.Modules = append(event.Modules, crash.Module{
 			ID: "other", Name: "libother.so", Platform: event.Platform,
 			DebugID: "0123456789ABCDEF0123456789ABCDEF0", LoadAddress: "0x600000", EndAddress: "0x700000",
 		})
-		event.Threads[0].Frames[0].ModuleID = ""
+		event.Threads[0].Frames[0].ModuleID = "missing"
 		event.Threads[0].Frames[0].InstructionAddress = "0x900000"
-	}, refusal: "pkg/crash/event.go:239-241 requires a frame with an address to name its module once more than one is declared, and naming one would make the module match by id and stop being this twin"},
+	}},
 }
 
 // controlledCrash is the crash the rehearsal describes: the row's module identity and
@@ -389,6 +422,11 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 		strings.Trim(string(escaped), `"`), "[REDACTED]",
 		url.QueryEscape(key), "[REDACTED]")
 	fmt.Fprintf(out, "producer=%s rows=%d; synthetic crashes only; %s\n", produced.Producer, len(produced.Entries), residual)
+	if log.err != nil {
+		// The banner did not land, so no crash is sent: a mutation with no
+		// receipt is the one outcome this sender must never produce.
+		return 1
+	}
 
 	failed := false
 	sent, absent := 0, 0
@@ -397,10 +435,12 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 			failed = true
 		}
 	}
+	// An SDK or transport error can quote what it was handed, so it is redacted
+	// exactly like a response body before it is printed.
 	fail := func(subject, platform, reason, site, sdkErr string) {
 		failed = true
-		note(verdict{Case: "failed", Subject: subject, Platform: platform, Reason: reason,
-			SDKSite: site, SDKError: sdkErr})
+		note(verdict{Case: "failed", Subject: subject, Platform: platform,
+			Reason: redact.Replace(reason), SDKSite: site, SDKError: redact.Replace(sdkErr)})
 	}
 	// One case: its own client, its own one-request budget.
 	emit := func(name string, event crash.Event) (*witness, error) {
@@ -440,26 +480,48 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 	}
 
 	for _, entry := range produced.Entries {
+		if log.err != nil {
+			// The evidence stream broke mid-run. Stop sending: the crashes
+			// already sent have receipts, the rest would not.
+			failed = true
+			break
+		}
 		if !entry.identified() {
-			// A row with no artefact — the PDB leg — is printed, never skipped:
-			// the owner must read NOT EXERCISED rather than read nothing.
-			absent++
-			reason := entry.Note
-			if strings.TrimSpace(reason) == "" {
-				reason = "the producer wrote no artefact for this row, so there is no module identity to send"
+			if !entry.blank() {
+				// PARTLY described: a name without a debug id, a base without
+				// an address. This is not the artefact-less row — it is a row
+				// whose crash cannot be built and whose absence cannot be
+				// explained, so it is neither sent nor quietly skipped.
+				fail(entry.Platform, entry.Platform,
+					"the row carries some of the module identity and not all of it, so its crash can be neither sent nor honestly skipped", "", "")
+				continue
 			}
-			note(verdict{Case: "not-exercised", Subject: entry.Platform, Platform: entry.Platform, Reason: reason})
+			// No artefact at all — the PDB leg. Printed, never skipped: the
+			// owner must read NOT EXERCISED rather than read nothing.
+			absent++
+			note(verdict{Case: "not-exercised", Subject: entry.Platform, Platform: entry.Platform,
+				Reason: firstText(entry.Note, "the producer wrote no artefact for this row, so there is no module identity to send")})
 			if len(entry.NegativeTwins) > 0 {
 				fail(entry.Platform, entry.Platform, "the row has no artefact yet promises negative twins", "", "")
 			}
 			continue
 		}
-		if entry.Symbolicated && entry.Expected == nil {
-			fail(entry.Platform, entry.Platform, "the row claims a resolved frame but names no expected frame to compare", "", "")
+		// A claimed frame must be comparable: an empty expected_frame is a
+		// promise with nothing in it.
+		if entry.Symbolicated && !entry.Expected.frameComplete() {
+			fail(entry.Platform, entry.Platform,
+				"the row claims a resolved frame but names no complete expected frame (function, file and line) to compare", "", "")
 			continue
 		}
+		// The positive expectation is the ROW's: a row that does not exercise
+		// symbolication never promises a resolved frame.
+		expectWord, expectWhy := "resolved", ""
+		if !entry.Symbolicated {
+			expectWord = "not-exercised"
+			expectWhy = firstText(entry.Note, "this row proves an accepted upload, not a resolved frame")
+		}
 		send(entry.Platform+"-positive", entry, controlledCrash(entry, nil), http.StatusAccepted,
-			entry.Symbolicated, "resolved", "", entry.Expected)
+			entry.Symbolicated, expectWord, expectWhy, entry.Expected)
 		for _, promised := range entry.NegativeTwins {
 			known, ok := twinsByChange[promised.Change]
 			if !ok {
@@ -507,6 +569,15 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 		return 1
 	}
 	return code
+}
+
+func firstText(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func errText(err error) string {
