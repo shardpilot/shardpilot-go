@@ -245,7 +245,8 @@ func TestEveryIdentifiedRowSendsItsPositiveAndExpressibleTwins(t *testing.T) {
 	}
 	// The summary counts, and the residual travels with them.
 	summary := records[len(records)-1]
-	if summary["case"] != "summary" || summary["sent"].(float64) != 7 || summary["not_exercised"].(float64) != 3 ||
+	if summary["case"] != "summary" || summary["attempted"].(float64) != 7 ||
+		summary["acknowledged"].(float64) != 7 || summary["not_exercised"].(float64) != 3 ||
 		summary["contract_match"] != true || summary["exit_code"].(float64) != 0 {
 		t.Fatalf("unexpected summary: %v", summary)
 	}
@@ -586,6 +587,112 @@ func TestARowThatDoesNotExerciseSymbolicationNeverExpectsAResolvedFrame(t *testi
 		return
 	}
 	t.Fatal("no readback row for linux-positive")
+}
+
+func TestAFrameNobodyWillCompareFailsTheRun(t *testing.T) {
+	// The other side of the incomplete-frame defect: this row says it measures
+	// no symbolication, so a frame on it would ride into the readback as an
+	// expectation of something the row itself disclaims.
+	manifest := strings.Replace(manifestFixture, `"symbolication_exercised": true,`,
+		`"symbolication_exercised": false,`, 1)
+	code, out, transport := sendWith(t, "", manifest, nil)
+	if code != 1 || !strings.Contains(out, "names an expected frame while symbolication_exercised is false") {
+		t.Fatalf("a frame nobody would compare was accepted: %d\n%s", code, out)
+	}
+	for _, record := range lines(t, out) {
+		if record["case"] == "readback" && record["sent_case"] == "linux-positive" {
+			t.Fatalf("the row was sent with a frame it disclaims: %v", record)
+		}
+	}
+	for _, body := range transport.bodies {
+		if body["platform"] == "linux" {
+			t.Fatal("the malformed row was sent anyway")
+		}
+	}
+}
+
+func TestAnArtefactLessRowMayNotClaimWhatItCannotHave(t *testing.T) {
+	for _, claim := range []string{
+		`"platform": "windows-pdb", "format": "pdb", "symbolication_exercised": true,`,
+		`"platform": "windows-pdb", "format": "pdb", "symbolication_exercised": false,
+     "expected_frame": {"function": "f", "file": "f.c", "line": 1},`,
+	} {
+		manifest := strings.Replace(manifestFixture,
+			`"platform": "windows-pdb", "format": "pdb", "symbolication_exercised": false,`, claim, 1)
+		code, out, _ := sendWith(t, "", manifest, nil)
+		if code != 1 ||
+			!strings.Contains(out, "no module identity yet claims symbolication_exercised or names an expected frame") {
+			t.Fatalf("an artefact-less row claiming a resolved frame passed: %d\n%s", code, out)
+		}
+		// And it is NOT counted as a deliberate absence.
+		for _, record := range lines(t, out) {
+			if record["case"] == "not-exercised" && record["subject"] == "windows-pdb" {
+				t.Fatalf("the claim was printed as a decision: %v", record)
+			}
+		}
+	}
+}
+
+func TestTheRefusedTwinIsAccountedOnlyAgainstTheRejectionContract(t *testing.T) {
+	// This twin never reaches the door, so its NOT EXERCISED line describes an
+	// ingest contract this sender cannot measure. If the producer starts
+	// promising something else for it, the two have drifted and the line would
+	// describe the wrong refusal.
+	const promise = `{"change": "the module declares no load_address and no base_address", "status": "rejected", "http_status": 400, "symbolicated": false, "why": "a module with no base is a rejected input"}`
+	for _, drift := range []string{
+		strings.Replace(promise, `"status": "rejected"`, `"status": "unresolved"`, 1),
+		strings.Replace(promise, `"http_status": 400`, `"http_status": 422`, 1),
+		strings.Replace(promise, `"http_status": 400`, `"http_status": 0`, 1),
+		strings.Replace(promise, `"symbolicated": false`, `"symbolicated": true`, 1),
+	} {
+		manifest := strings.Replace(manifestFixture, promise, drift, 1)
+		if manifest == manifestFixture {
+			t.Fatalf("the drift fixture did not replace the promise: %s", drift)
+		}
+		code, out, _ := sendWith(t, "", manifest, nil)
+		if code != 1 || !strings.Contains(out, "the manifest must promise the ingest's rejection contract") {
+			t.Fatalf("producer drift on the refused twin passed: %d\n%s", code, out)
+		}
+		for _, record := range lines(t, out) {
+			if record["case"] == "not-exercised" && record["subject"] == "linux-no-base-at-all" {
+				t.Fatalf("the drifted promise was printed as a measured refusal: %v", record)
+			}
+		}
+	}
+}
+
+func TestTheSummarySeparatesAttemptedFromAcknowledged(t *testing.T) {
+	// Every reply echoes some other id: the requests DID reach the service, so
+	// the receipt must not read like a run that never left the building.
+	code, out, transport := sendWith(t, "wrong_id", manifestFixture, nil)
+	if code != 1 {
+		t.Fatalf("expected exit 1, got %d\n%s", code, out)
+	}
+	if len(transport.bodies) != 7 {
+		t.Fatalf("expected seven attempts at the door, got %d", len(transport.bodies))
+	}
+	records := lines(t, out)
+	summary := records[len(records)-1]
+	if summary["attempted"].(float64) != 7 || summary["acknowledged"].(float64) != 0 {
+		t.Fatalf("the summary does not separate attempted from acknowledged: %v", summary)
+	}
+	if !strings.Contains(out, "7 attempted, 0 acknowledged; the service may have stored them — do not rerun blindly") {
+		t.Fatalf("the run does not warn against a blind rerun:\n%s", out)
+	}
+	if strings.Contains(out, "no crash was sent") {
+		t.Fatalf("a run whose requests arrived claimed nothing was sent:\n%s", out)
+	}
+	// And the other zero, which means the opposite: nothing reached the door,
+	// so repeating the run adds nothing.
+	onlyAbsent := `{"producer": "cmd/symbolication-rehearsal", "entries": [
+	  {"platform": "windows-pdb", "format": "pdb", "symbolication_exercised": false, "note": "NOT EXERCISED"}]}`
+	code, out, transport = sendWith(t, "", onlyAbsent, nil)
+	if code != 1 || len(transport.bodies) != 0 {
+		t.Fatalf("a manifest with nothing to send: exit %d, %d bodies\n%s", code, len(transport.bodies), out)
+	}
+	if !strings.Contains(out, "no crash was sent") || strings.Contains(out, "do not rerun blindly") {
+		t.Fatalf("the two zeros were not told apart:\n%s", out)
+	}
 }
 
 func TestAnEchoedCredentialIsRedactedInEverySpelling(t *testing.T) {

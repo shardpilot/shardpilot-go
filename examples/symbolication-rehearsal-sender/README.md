@@ -63,9 +63,16 @@ crash can be neither sent nor honestly skipped. A row that claims a resolved
 frame must name a **complete** one (function, file and line): an empty
 `expected_frame` is a promise with nothing in it, and there would be nothing to
 compare on run day. A row that does not claim one never gets `resolved` as its
-expected status, and a twin that names no status to read back fails the run
-rather than printing `expect_status: ""` — a readback row with nothing to
-compare is the same silence this sender exists to remove.
+expected status, and a row that names a frame while claiming to exercise no
+symbolication fails too: nothing would compare it. An artefact-less row may not
+claim `symbolication_exercised` or name a frame at all. A twin that names no
+status to read back fails the run rather than printing `expect_status: ""` — a
+readback row with nothing to compare is the same silence this sender exists to
+remove — and the twin the SDK refuses is only accounted for when the manifest
+promises the ingest's rejection contract for it (`rejected`, `400`, not
+symbolicated); any other promise means the producer and this sender have
+drifted, which fails the run instead of printing a refusal that describes the
+wrong thing.
 
 The twin whose frame resolves against no declared module range **is** sent, and
 the spelling matters: the SDK requires a frame carrying an address to name its
@@ -121,11 +128,29 @@ observed exchange, the expected status, the submitted crash id echoed back, a
 fingerprint with non-whitespace content, and no suppression. A `202` proves
 none of storage, symbolication or product visibility.
 
+The summary separates what **reached** the service from what it
+**acknowledged**, because the two zeros mean opposite things to whoever runs
+this next: `attempted: 0` can be repeated, while requests that arrived and
+failed the acknowledgement may already have stored crashes, and the run says so
+in those words rather than reporting that nothing was sent.
+
 | Exit code | Meaning |
 |---|---|
 | `0` | Every send was acknowledged as expected and every unsendable row was printed. |
 | `1` | A failed expectation, an unrecognised twin, a row that cannot be compared, or an evidence write failure. |
 | `2` | Missing or malformed configuration, or a manifest that cannot be read. |
+
+## What this sender does not model
+
+- **A twin whose manifest promises an HTTP rejection and which the SDK can
+  otherwise express.** The SDK reports such a refusal as a typed
+  `*crash.HTTPStatusError` from `EmitFatal` rather than as an acknowledged
+  exchange, and this sender treats every expressible twin's send as one that
+  must be acknowledged. Today's manifest contains no such twin — the only
+  HTTP-rejected twin (`no load_address and no base_address`) is refused by the
+  SDK before any request, and is printed as not exercised — so the gap is a
+  limit of the sender, not of the current rehearsal. A future twin promising,
+  say, a `413` would need this sender taught to expect the typed error.
 
 ## Offline proof
 

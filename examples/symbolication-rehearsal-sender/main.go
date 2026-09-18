@@ -353,8 +353,12 @@ type verdict struct {
 }
 
 type summary struct {
-	Case         string `json:"case"`
-	Sent         int    `json:"sent"`
+	Case string `json:"case"`
+	// Attempted is what reached the service; Acknowledged is what it took and
+	// acknowledged as this sender requires. They are not the same number and a
+	// receipt that printed only one of them would hide the gap.
+	Attempted    int    `json:"attempted"`
+	Acknowledged int    `json:"acknowledged"`
 	NotExercised int    `json:"not_exercised"`
 	Rows         int    `json:"manifest_rows"`
 	Contract     bool   `json:"contract_match"`
@@ -427,7 +431,10 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 	}
 
 	failed := false
-	sent, absent := 0, 0
+	// acknowledged counts crashes the service took AND acknowledged as this
+	// sender requires; attempted counts requests that reached it at all. The
+	// difference matters to an operator deciding whether to run this again.
+	acknowledged, attempted, absent := 0, 0, 0
 	note := func(record any) {
 		if err := json.NewEncoder(out).Encode(record); err != nil {
 			failed = true
@@ -462,6 +469,9 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 	// A crash this sender expects the door to take, with its readback row.
 	send := func(name string, entry manifestEntry, event crash.Event, expectStatus int, expectSymbolicated bool, expectStatusWord, why string, frame *expectedFrame) {
 		w, emitErr := emit(name, event)
+		if w.requested() {
+			attempted++
+		}
 		crashID, checkErr := w.acknowledged(expectStatus)
 		if emitErr != nil || checkErr != nil {
 			reason := errText(checkErr)
@@ -471,7 +481,7 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 			fail(name, entry.Platform, reason, "", errText(emitErr))
 			return
 		}
-		sent++
+		acknowledged++
 		note(readback{Case: "readback", SentCase: name, Platform: entry.Platform, Format: entry.Format,
 			CrashID: crashID, ExpectSymbolicated: expectSymbolicated, ExpectStatus: expectStatusWord,
 			ExpectFrame: frame, Why: why})
@@ -503,6 +513,14 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 					"a row with no module identity is intentional only when it names its platform and its format", "", "")
 				continue
 			}
+			// It may not claim what it cannot have, either: a row with no
+			// artefact that says it exercised symbolication, or names a frame
+			// to compare, is a producer defect wearing the PDB leg's clothes.
+			if entry.Symbolicated || entry.Expected != nil {
+				fail(entry.Platform, entry.Platform,
+					"the row has no module identity yet claims symbolication_exercised or names an expected frame", "", "")
+				continue
+			}
 			// Printed, never skipped: the owner must read NOT EXERCISED rather
 			// than read nothing.
 			absent++
@@ -518,6 +536,15 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 		if entry.Symbolicated && !entry.Expected.frameComplete() {
 			fail(entry.Platform, entry.Platform,
 				"the row claims a resolved frame but names no complete expected frame (function, file and line) to compare", "", "")
+			continue
+		}
+		// And a frame nobody will compare is the same defect from the other
+		// side: this row exercises no symbolication, so a frame on it would
+		// ride into the readback as an expectation of something the row says
+		// it does not measure.
+		if !entry.Symbolicated && entry.Expected != nil {
+			fail(entry.Platform, entry.Platform,
+				"the row names an expected frame while symbolication_exercised is false, so nothing would compare it", "", "")
 			continue
 		}
 		// The positive expectation is the ROW's: a row that does not exercise
@@ -552,8 +579,22 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 				continue
 			}
 			if known.refusal != "" {
+				// The manifest's promise for a CLIENT-REFUSED twin is the
+				// ingest contract this sender cannot reach: if the producer
+				// starts promising something else for it, the two have drifted
+				// and this row's NOT EXERCISED line would describe the wrong
+				// refusal.
+				if promised.Status != "rejected" || promised.HTTPStatus != http.StatusBadRequest || promised.Symbolicated {
+					fail(name, entry.Platform,
+						fmt.Sprintf("this twin is refused by the SDK before any request, so the manifest must promise the ingest's rejection contract (rejected / 400 / not symbolicated); it promises %q / %d / %t",
+							promised.Status, promised.HTTPStatus, promised.Symbolicated), known.refusal, "")
+					continue
+				}
 				// Attempted, so the refusal is measured rather than asserted.
 				w, emitErr := emit(name, controlledCrash(entry, known.mutate))
+				if w.requested() {
+					attempted++
+				}
 				if emitErr == nil || !errors.Is(emitErr, crash.ErrInvalidEvent) || w.requested() {
 					fail(name, entry.Platform, "the SDK no longer refuses this shape before sending it",
 						known.refusal, errText(emitErr))
@@ -573,8 +614,16 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 				promised.Symbolicated, promised.Status, promised.Why, nil)
 		}
 	}
-	if sent == 0 {
-		fail("run", "", "no crash was sent", "", "")
+	if acknowledged == 0 {
+		// The two zeros mean different things to whoever reads this next. A run
+		// that never reached the service can be repeated; a run whose requests
+		// arrived and failed the acknowledgement may already have stored
+		// crashes, and repeating it would add more under new ids.
+		if attempted > 0 {
+			fail("run", "", fmt.Sprintf("%d attempted, 0 acknowledged; the service may have stored them — do not rerun blindly", attempted), "", "")
+		} else {
+			fail("run", "", "no crash was sent", "", "")
+		}
 	}
 	if log.err != nil {
 		return 1
@@ -583,7 +632,8 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 	if failed {
 		code = 1
 	}
-	note(summary{Case: "summary", Sent: sent, NotExercised: absent, Rows: len(produced.Entries),
+	note(summary{Case: "summary", Attempted: attempted, Acknowledged: acknowledged,
+		NotExercised: absent, Rows: len(produced.Entries),
 		Contract: !failed, ExitCode: code, Residual: residual})
 	if log.err != nil {
 		return 1
