@@ -55,13 +55,17 @@ gets one HTTP attempt: a per-case request budget refuses an SDK retry, so a
 rehearsal probe cannot become a second crash under a new id.
 
 A row must be whole. A row with **no** module identity is the artefact-less row
-and is printed as not exercised; a row carrying *some* of it — a name without a
+and is printed as not exercised — but only when it still names the platform and
+format it stands for, since a row naming neither is a hole in the manifest and
+printing it as "not exercised" would present the hole as a decision; a row carrying *some* of it — a name without a
 debug id, a base without an address — fails the run naming it, because its
 crash can be neither sent nor honestly skipped. A row that claims a resolved
 frame must name a **complete** one (function, file and line): an empty
 `expected_frame` is a promise with nothing in it, and there would be nothing to
 compare on run day. A row that does not claim one never gets `resolved` as its
-expected status.
+expected status, and a twin that names no status to read back fails the run
+rather than printing `expect_status: ""` — a readback row with nothing to
+compare is the same silence this sender exists to remove.
 
 The twin whose frame resolves against no declared module range **is** sent, and
 the spelling matters: the SDK requires a frame carrying an address to name its
@@ -97,14 +101,20 @@ Newline-delimited JSON, one line per attempted exchange with `case`, `crash_id`,
 against the product is mechanical; a `not-exercised` line per absent row or
 refused twin, with the SDK site and its refusal error; and a final `summary`.
 The configured credential is redacted from every printed body, header and error
-— including an SDK or transport error that quotes what it was handed — in its
-raw, JSON-escaped and percent-encoded forms; `Authorization` is never printed.
+— including an SDK or transport error that quotes what it was handed — through
+the same redactor the protocol witness uses (`internal/redact`), which compares
+the credential against the **decoded** views of what is printed: JSON escapes
+(`\u002f`), percent-encoding in either hex case (`%2f`, `%2F`) and `+` for a
+space in a query. There is one implementation of that equivalence set, not one
+per sender. `Authorization` is never printed.
 
 The evidence stream is checked as it is written, not at the end. If the banner
 cannot be written, **nothing is sent**: a mutation with no receipt is the one
 outcome this sender must never produce. If it breaks mid-run, the sends stop
 there — the crashes already sent have receipts, the rest would not — and the
-run exits 1.
+run exits 1. That includes a failed **readback** write: the crash it describes
+has already happened, so the row's remaining twins are not sent on top of an
+incomplete receipt.
 
 An acknowledgement is read exactly as the protocol witness reads one: one
 observed exchange, the expected status, the submitted crash id echoed back, a

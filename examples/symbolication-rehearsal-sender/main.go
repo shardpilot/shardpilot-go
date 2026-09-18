@@ -24,6 +24,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/shardpilot/shardpilot-go/internal/redact"
 	"github.com/shardpilot/shardpilot-go/pkg/crash"
 )
 
@@ -228,7 +229,7 @@ type witness struct {
 	mu        sync.Mutex
 	base      http.RoundTripper
 	out       io.Writer
-	redact    *strings.Replacer
+	redact    *redact.Redactor
 	name      string
 	attempted bool
 	records   []exchange
@@ -414,13 +415,10 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 		fmt.Fprintf(out, "configuration: SHARDPILOT_REHEARSAL_MANIFEST is not a manifest this sender can read (%v); exit 2\n", err)
 		return 2
 	}
-	// The credential in the three forms a reply can echo it back in: raw, as a
-	// JSON string body would escape it, and percent-encoded.
-	key := values["SHARDPILOT_API_KEY"]
-	escaped, _ := json.Marshal(key)
-	redact := strings.NewReplacer(key, "[REDACTED]",
-		strings.Trim(string(escaped), `"`), "[REDACTED]",
-		url.QueryEscape(key), "[REDACTED]")
+	// The SAME redactor the protocol witness uses, not a second implementation:
+	// it compares the raw credential against the JSON-unescaped and
+	// percent-decoded views of whatever is printed, in either hex case.
+	redactor := redact.New(values["SHARDPILOT_API_KEY"])
 	fmt.Fprintf(out, "producer=%s rows=%d; synthetic crashes only; %s\n", produced.Producer, len(produced.Entries), residual)
 	if log.err != nil {
 		// The banner did not land, so no crash is sent: a mutation with no
@@ -440,11 +438,11 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 	fail := func(subject, platform, reason, site, sdkErr string) {
 		failed = true
 		note(verdict{Case: "failed", Subject: subject, Platform: platform,
-			Reason: redact.Replace(reason), SDKSite: site, SDKError: redact.Replace(sdkErr)})
+			Reason: redactor.Replace(reason), SDKSite: site, SDKError: redactor.Replace(sdkErr)})
 	}
 	// One case: its own client, its own one-request budget.
 	emit := func(name string, event crash.Event) (*witness, error) {
-		w := &witness{base: transport, out: out, redact: redact, name: name}
+		w := &witness{base: transport, out: out, redact: redactor, name: name}
 		client, err := crash.NewClient(crash.ClientOptions{
 			IngestURL:   values["SHARDPILOT_CRASH_INGEST_URL"],
 			APIKey:      values["SHARDPILOT_API_KEY"],
@@ -496,8 +494,17 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 					"the row carries some of the module identity and not all of it, so its crash can be neither sent nor honestly skipped", "", "")
 				continue
 			}
-			// No artefact at all — the PDB leg. Printed, never skipped: the
-			// owner must read NOT EXERCISED rather than read nothing.
+			// No artefact at all — the PDB leg. That is intentional only when
+			// the row still says WHICH platform and format it stands for; a
+			// row that names neither is a hole in the manifest, and printing
+			// it as "not exercised" would present the hole as a decision.
+			if strings.TrimSpace(entry.Platform) == "" || strings.TrimSpace(entry.Format) == "" {
+				fail(firstText(entry.Platform, entry.Format, "(a row naming no platform)"), entry.Platform,
+					"a row with no module identity is intentional only when it names its platform and its format", "", "")
+				continue
+			}
+			// Printed, never skipped: the owner must read NOT EXERCISED rather
+			// than read nothing.
 			absent++
 			note(verdict{Case: "not-exercised", Subject: entry.Platform, Platform: entry.Platform,
 				Reason: firstText(entry.Note, "the producer wrote no artefact for this row, so there is no module identity to send")})
@@ -523,6 +530,13 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 		send(entry.Platform+"-positive", entry, controlledCrash(entry, nil), http.StatusAccepted,
 			entry.Symbolicated, expectWord, expectWhy, entry.Expected)
 		for _, promised := range entry.NegativeTwins {
+			if log.err != nil {
+				// The previous send's own receipt did not land. Every twin
+				// after it would be a mutation with no evidence, so the row
+				// stops here and the outer loop stops on its next turn.
+				failed = true
+				break
+			}
 			known, ok := twinsByChange[promised.Change]
 			if !ok {
 				// A break this sender cannot spell is a failure naming it, not
@@ -531,6 +545,12 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 				continue
 			}
 			name := entry.Platform + "-" + known.slug
+			if strings.TrimSpace(promised.Status) == "" {
+				// expect_status: "" is a readback row with nothing to compare.
+				fail(name, entry.Platform,
+					"the twin names no status to read back: "+promised.Change, "", "")
+				continue
+			}
 			if known.refusal != "" {
 				// Attempted, so the refusal is measured rather than asserted.
 				w, emitErr := emit(name, controlledCrash(entry, known.mutate))

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -54,8 +55,11 @@ const manifestFixture = `{
   ]
 }`
 
+// jsonEscapedSlash is how a JSON body spells the credential's metacharacter.
+var jsonEscapedSlash = string(rune(92)) + "u002f"
+
 const (
-	fixtureKey   = "crash-write-key-test"
+	fixtureKey   = "crash/write-key-test"
 	fixtureActor = "rehearsal-actor-0001"
 )
 
@@ -98,6 +102,13 @@ func (f *fake) RoundTrip(req *http.Request) (*http.Response, error) {
 		// A transport error that quotes what it was handed. The sender must
 		// redact it like any other echoed text.
 		return nil, fmt.Errorf("dial tcp: refused while sending with %s", fixtureKey)
+	case "error_with_encoded_key":
+		return nil, fmt.Errorf("dial tcp: refused while sending with %s", url.QueryEscape(fixtureKey))
+	case "echo_key_percent":
+		reply["echo"] = url.QueryEscape(fixtureKey)
+	case "echo_key_percent_lower":
+		reply["echo"] = strings.ReplaceAll(fixtureKey, "/", "%2f")
+
 	case "refused":
 		status, reply = http.StatusBadRequest, map[string]any{"code": "invalid_request"}
 	}
@@ -105,6 +116,16 @@ func (f *fake) RoundTrip(req *http.Request) (*http.Response, error) {
 	encoded, err := json.Marshal(reply)
 	if err != nil {
 		return nil, err
+	}
+	if f.mode == "echo_key_json_unicode" {
+		// Hand-built, because the escape has to be the JSON STRING's — a Go
+		// string holding a backslash would be escaped again by Marshal and the
+		// value on the wire would be literal text, not the credential.
+		encoded = []byte(fmt.Sprintf(`{"crash_id":%q,"fingerprint":%q,"suppressed":false,"echo":"%s"}`,
+			id, "fp-"+id, strings.ReplaceAll(fixtureKey, "/", jsonEscapedSlash)))
+		if !json.Valid(encoded) {
+			return nil, fmt.Errorf("the escaped echo fixture is not valid JSON: %s", encoded)
+		}
 	}
 	return &http.Response{StatusCode: status, Body: io.NopCloser(bytes.NewReader(encoded)),
 		Header: http.Header{"Content-Type": {"application/json"}, "X-Request-Id": {"fixture"}}}, nil
@@ -133,8 +154,14 @@ func sendWith(t *testing.T, mode, manifestBody string, overrides map[string]stri
 	transport := &fake{mode: mode}
 	out := &bytes.Buffer{}
 	code := run(func(name string) string { return env[name] }, out, transport)
-	if strings.Contains(out.String(), fixtureKey) {
-		t.Fatalf("the configured credential reached the evidence stream")
+	// The credential in every spelling this sender claims to mask: a scene that
+	// only checked the raw form would pass while an encoded echo leaked.
+	for _, form := range []string{fixtureKey, url.QueryEscape(fixtureKey),
+		strings.ReplaceAll(fixtureKey, "/", "%2f"),
+		strings.ReplaceAll(fixtureKey, "/", jsonEscapedSlash)} {
+		if strings.Contains(out.String(), form) {
+			t.Fatalf("the configured credential reached the evidence stream as %q", form)
+		}
 	}
 	return code, out.String(), transport
 }
@@ -561,12 +588,91 @@ func TestARowThatDoesNotExerciseSymbolicationNeverExpectsAResolvedFrame(t *testi
 	t.Fatal("no readback row for linux-positive")
 }
 
-func TestAnEchoedCredentialIsRedacted(t *testing.T) {
-	code, out, _ := sendWith(t, "echo_key", manifestFixture, nil)
-	if code != 0 {
-		t.Fatalf("expected exit 0, got %d\n%s", code, out)
+func TestAnEchoedCredentialIsRedactedInEverySpelling(t *testing.T) {
+	// The helper already fails on the raw and the encoded forms anywhere in the
+	// stream; this asserts the mask actually landed rather than the echo simply
+	// not arriving.
+	for _, mode := range []string{"echo_key", "echo_key_percent", "echo_key_percent_lower",
+		"echo_key_json_unicode"} {
+		t.Run(mode, func(t *testing.T) {
+			code, out, transport := sendWith(t, mode, manifestFixture, nil)
+			if code != 0 {
+				t.Fatalf("expected exit 0, got %d\n%s", code, out)
+			}
+			if len(transport.bodies) != 7 {
+				t.Fatalf("the echo mode changed the run: %d bodies", len(transport.bodies))
+			}
+			if strings.Count(out, "[REDACTED]") < 7 {
+				t.Fatalf("the echoed credential was not masked in every reply:\n%s", out)
+			}
+		})
 	}
-	if !strings.Contains(out, "[REDACTED]") {
-		t.Fatalf("an echoed credential was not redacted:\n%s", out)
+	// And the same for an error that quotes what it was handed.
+	for _, mode := range []string{"error_with_key", "error_with_encoded_key"} {
+		t.Run(mode, func(t *testing.T) {
+			code, out, _ := sendWith(t, mode, manifestFixture, nil)
+			if code != 1 {
+				t.Fatalf("expected exit 1, got %d\n%s", code, out)
+			}
+			if !strings.Contains(out, "[REDACTED]") {
+				t.Fatalf("the propagated error was not redacted:\n%s", out)
+			}
+		})
+	}
+}
+
+func TestAFailedReadbackWriteStopsTheRowsRemainingSends(t *testing.T) {
+	// Writes: the banner, the first exchange, then its readback. Breaking the
+	// third means the positive's own receipt is incomplete, so no twin for that
+	// row may follow it.
+	code, transport := runWithSink(t, &brokenSink{after: 2}, 2)
+	if code != 1 {
+		t.Fatalf("a failed readback write did not exit 1, got %d", code)
+	}
+	if len(transport.bodies) != 1 {
+		t.Fatalf("sends continued past a failed readback: %d bodies", len(transport.bodies))
+	}
+}
+
+func TestATwinWithNoStatusFailsTheRunNamingIt(t *testing.T) {
+	for _, status := range []string{`""`, `"   "`} {
+		manifest := strings.Replace(manifestFixture, `"status": "unresolved"`, `"status": `+status, 1)
+		code, out, transport := sendWith(t, "", manifest, nil)
+		if code != 1 {
+			t.Fatalf("a twin with status %s did not fail the run: %d\n%s", status, code, out)
+		}
+		if !strings.Contains(out, "the twin names no status to read back: the crash body declares the wrong load_address") {
+			t.Fatalf("the run did not name the twin missing its status:\n%s", out)
+		}
+		for _, record := range lines(t, out) {
+			if record["case"] == "linux-wrong-base" {
+				t.Fatalf("the twin was sent without a status to read back: %v", record)
+			}
+		}
+		// The rest of the run still happens: one twin's defect is not a reason
+		// to stop measuring the others.
+		if len(transport.bodies) != 6 {
+			t.Fatalf("expected the other six sends, got %d", len(transport.bodies))
+		}
+	}
+}
+
+func TestAnIdentityFreeRowMustSayWhatItStandsFor(t *testing.T) {
+	manifest := strings.Replace(manifestFixture, `{"platform": "windows-pdb", "format": "pdb", "symbolication_exercised": false,
+     "note": "NOT EXERCISED: no PDB artefact is produced.",
+     "upload_command": "shardpilot symbols upload --platform windows './MyGame.pdb'"}`, `{}`, 1)
+	code, out, _ := sendWith(t, "", manifest, nil)
+	if code != 1 {
+		t.Fatalf("an empty row did not fail the run: %d\n%s", code, out)
+	}
+	if !strings.Contains(out, "intentional only when it names its platform and its format") {
+		t.Fatalf("the run did not name the hole in the manifest:\n%s", out)
+	}
+	// A row that names its platform but not its format is the same hole.
+	manifest = strings.Replace(manifestFixture, `"platform": "windows-pdb", "format": "pdb",`,
+		`"platform": "windows-pdb",`, 1)
+	if code, out, _ := sendWith(t, "", manifest, nil); code != 1 ||
+		!strings.Contains(out, "intentional only when it names its platform and its format") {
+		t.Fatalf("a row with no format did not fail the run: %d\n%s", code, out)
 	}
 }
