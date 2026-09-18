@@ -9,9 +9,9 @@ import (
 )
 
 // ⚠ RULE (a): PER ACTOR, NEVER PER PROCESS. A verdict cached across calls would
-// authorize a different player than the events carry — and ADR §5 names the
-// shared-client case explicitly, so this is the realistic arrangement rather
-// than a contrived one.
+// authorize a different player than the events carry — and the contract names
+// the shared-client case explicitly, so this is the realistic arrangement
+// rather than a contrived one.
 func TestAVerdictIsNeverReusedForAnotherActor(t *testing.T) {
 	first := Prepare(context.Background(), VerifiedPlayerPolicy{
 		Plan: validPlan(nil), Scope: callerScope(), Now: fixedClock(),
@@ -38,11 +38,11 @@ func TestAVerdictIsNeverReusedForAnotherActor(t *testing.T) {
 	}
 }
 
-// ⚠ RULE (b): A PLAN IS NOT A GRANT. ADR §4.3: a SOFT non-objection needs a
-// new, distinct admission-basis representation — "do not call today's
-// SetConsent(true) or set an analytics consent boolean to pretend the player
-// opted in". So this package must expose no route from a verdict to a consent
-// state, and must not reach into the telemetry client at all.
+// ⚠ RULE (b): A PLAN IS NOT A GRANT. A notice-and-objection outcome needs its
+// own distinct admission-basis representation; setting an analytics consent
+// boolean to stand in for one would record a grant nobody gave. So this package
+// must expose no route from a verdict to a consent state, and must not reach
+// into the telemetry client at all.
 func TestTheDecisionCannotBecomeAConsentGrant(t *testing.T) {
 	// The package's own source is the evidence: it imports nothing from the
 	// telemetry root package, so there is no SetConsent to call.
@@ -120,7 +120,8 @@ func TestAnUnverifiableSignatureIsStrict(t *testing.T) {
 }
 
 // The crash lane does not inherit the analytics answer in either direction —
-// ADR §2.1 gives it its own rule, and ODR-0008 D1 makes it off by default.
+// the crash profile has its own rule, and the platform decision makes it off
+// by default.
 func TestTheCrashLaneIsItsOwnDecision(t *testing.T) {
 	strictWithCrashOn := Prepare(context.Background(), VerifiedPlayerPolicy{
 		Plan:  validPlan(func(m map[string]any) { m["crash_profile"] = string(CrashMinimal) }),
@@ -144,7 +145,7 @@ func TestTheCrashLaneIsItsOwnDecision(t *testing.T) {
 	}
 }
 
-// ODR-0008 D2: the objection route is manual and there is no in-game toggle, so
+// The objection route is manual and there is no in-game toggle, so
 // the SDK reports a basis and a requirement and can neither record nor satisfy
 // it. A fallback is DENIED with the requirement standing.
 func TestServerAnalyticsIsABasisNotAToggle(t *testing.T) {

@@ -31,9 +31,9 @@ func (r Regime) known() bool {
 }
 
 // CrashProfile is the crash lane's own decision. It never inherits an analytics
-// permission: ODR-0008 D1 sets crash_reports_for_minors = off, and an
-// under-threshold or provisional client does not initialise the crash reporter
-// at all — so this is read BEFORE a crash client is created, not after.
+// permission. The platform decision is that crash reports for minors are off
+// and that an under-threshold or provisional client does not initialise the
+// crash reporter at all — so this is read BEFORE a crash client is created.
 type CrashProfile string
 
 const (
@@ -44,9 +44,9 @@ const (
 func (p CrashProfile) known() bool { return p == CrashOff || p == CrashMinimal }
 
 // ServerAnalyticsState is the backend lane's separate state. It is a BASIS plus
-// an objection requirement, never an in-game toggle: ODR-0008 D2 withdrew the
-// settings.privacy.server_analytics.* rows and made the objection route manual
-// (rights page or privacy address), answered within one month.
+// an objection requirement, never an in-game toggle: the platform decision
+// withdrew the in-game privacy rows for it and made the objection route manual
+// — the rights page or the privacy address — answered within one month.
 type ServerAnalyticsState string
 
 const (
@@ -61,7 +61,7 @@ func (s ServerAnalyticsState) known() bool {
 // SignalReason is the per-signal availability vocabulary. It is NOT the
 // top-level error vocabulary, and conflating the two was a real mistake in an
 // earlier draft of this work: source_not_permitted describes one signal inside
-// signals_used (ADR §4.3), not a failed request.
+// signals_used, not a failed request.
 type SignalReason string
 
 const (
@@ -133,8 +133,8 @@ type Plan struct {
 	Signature string `json:"signature,omitempty"`
 }
 
-// The bounds are the control plane's, mirrored here so a malformed plan is
-// refused before it can reach a verdict rather than passed through.
+// The bounds are the resolver's, mirrored here so a malformed plan is refused
+// before it can reach a verdict rather than passed through.
 const (
 	maxVersionBytes  = 64
 	maxLanguageBytes = 35

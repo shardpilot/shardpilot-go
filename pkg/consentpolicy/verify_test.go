@@ -8,8 +8,8 @@ import (
 	"time"
 )
 
-// A plan fixture built from the control plane's schema shape. Values are
-// synthetic; nothing here is a real scope, version or credential.
+// A plan fixture built from the published schema shape. Values are synthetic;
+// nothing here is a real scope, version or credential.
 func validPlan(mutate func(map[string]any)) []byte {
 	plan := map[string]any{
 		"regime":                              string(StrictOptIn),
