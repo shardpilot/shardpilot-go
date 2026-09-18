@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.6.3-alpha — 2026-09-18 — consent-regime plan verifier (release 1), unsigned plans never used
+
+- `v0.6.2-alpha` was tagged on 2026-09-18 without a release entry; this section covers both tags, including the SDK evidence sender, controlled-crash rehearsal (#114), typed purchase/economy events, rejection history, compression, retry/flush pacing and consent/spool repairs since `v0.6.1-alpha`.
+- Add `pkg/consentpolicy` (#115) with a fail-closed release-1 posture: no plan is authenticated or used, including an unsigned plan; `PlanUsed()` is false, every lane is closed, every purpose is prohibited and every operation is blocked. Plan-text validation still checks raw UTF-8, exact-case unique keys, EOF and required-scalar presence before reporting the refusal.
+- Recorded validation limits: JSON escape-level unpaired surrogates are replaced by `encoding/json`, and out-of-range RFC 3339 zone offsets are normalized by `time.Parse`. Neither changes a decision while no plan is used; rejecting both is required of the release-2 verifier before it can use authenticated plans.
+
 - Retain per-event batch rejections in a configurable in-memory ring (default
   64 entries) exposed through concurrent-safe `Client.Rejections()` copies.
   Parsed `202` responses keep the existing nil `Track`/`Flush` error contract;
@@ -206,7 +212,7 @@
   telemetry spool still means "start over", and a corrupt record still never
   crashes into the host.
 - **Module `go` directive moves to 1.25 (was 1.24).** The source-compatibility
-  baseline for SDK consumers rises with it: the next release requires
+  baseline for SDK consumers rises with it: these releases require
   **Go 1.25+**. Already-published tags are unaffected — every tag from `v0.1.2`
   onward declares `go 1.24` in its own immutable `go.mod` and keeps requiring
   Go 1.24+, as it always did. CI's matrix moves to `1.25.x` (the baseline) and

@@ -5,24 +5,8 @@ description: Use when integrating the ShardPilot Go SDK (shardpilot-go) into a G
 
 # Integrating the ShardPilot Go SDK
 
-This skill is written against `main`, which is AHEAD of it.
-The pinned release tag `v0.6.1-alpha` is what an install actually gets. That tag is `v0.6.0-alpha` with two internal
-agent skills deleted and no Go source difference between them, so behavioural
-claims verified against `v0.6.0-alpha`'s source hold at the pin — **except for
-the behaviours listed here, marked *(unreleased)* where they appear below**:
-`Config.DisableRequestCompression`, which does not exist at the tag; the
-15-second `FlushInterval` default, which is 1 second there; the goroutine-label
-fix, without which a `runtime/pprof` label containing `]` can reach
-`Thread.Name` in a crash payload on Go 1.27+; and the independent
-pacing of the FIRST retry — at the tag `backoffCeiling(1)` returns 0, so a first
-failure without a `Retry-After` hint waits for the next flush tick rather than
-its own jittered delay — and the rest of the retry-clock work with it: the tag
-has no `nextPacingWake`, so a consent-retry deadline that elapsed while the
-worker was busy, a deadline armed by a concurrent synchronous `Track` after the
-worker had parked, and spool entries reloaded at startup all wait for the flush
-tick there rather than their own clock. Everything else describes the pinned release. Where the SDK does not have a capability, this
-skill says so — do not invent config fields, endpoints, or behaviors beyond
-what is documented here.
+The pinned release tag `v0.6.3-alpha` matches this guide; the owner creates it after the release PR merges, so wait if the install pin is still pending.
+The release includes compression, the 15-second flush default, independent retry pacing, goroutine-label sanitization and rejection history. Where the SDK does not have a capability, this skill says so.
 
 **SCOPE: the DEFAULT configuration.** `v0.6.0-alpha` added three opt-ins that
 change behaviour this guide states categorically, and it does not describe
@@ -71,14 +55,15 @@ other calls, no automatic actions.
 ## Install
 
 ```bash
-go get github.com/shardpilot/shardpilot-go@v0.6.1-alpha
+go get github.com/shardpilot/shardpilot-go@v0.6.3-alpha
 ```
 
-- Requires **Go 1.24+** at the pinned tag. *(unreleased — `main` declares `go 1.25.0`, so a checkout of `main` needs **Go 1.25+**; the pin above is what 1.24 buys you.)*
-- Two import paths:
+- Requires **Go 1.25+** at the pinned tag.
+- Three import paths:
   - `github.com/shardpilot/shardpilot-go` — analytics (package `shardpilot`);
   - `github.com/shardpilot/shardpilot-go/pkg/crash` — crash reporting
-    (package `crash`).
+    (package `crash`);
+  - `github.com/shardpilot/shardpilot-go/pkg/consentpolicy` — fail-closed plan validation (no plan is used in this release).
 - **`v0.1.0` is retracted** in `go.mod`; never pin it. **Do not reach back to an
   earlier tag at all**, and do not offer one as a fallback. `v0.5.0-alpha` and
   `v0.6.0-alpha` distribute eight internal agent-skill files through `go get`;
@@ -177,27 +162,19 @@ and non-HTTPS URLs outside localhost/loopback (plain HTTP to a private
 RFC1918 **IP literal** only, via `AllowInsecurePrivateNetwork` — hostnames
 are never resolved). Optional tuning: `BatchSize` (default 25, max
 100), `BufferSize` (async queue capacity, default 1000), `FlushInterval`
-(default 15s *(unreleased — 1s at `v0.6.1-alpha`)* — the longest a PARTIAL batch waits before it is published, not
+(default 15s — the longest a PARTIAL batch waits before it is published, not
 a heartbeat: an empty batch publishes nothing, so an otherwise-silent process
 makes no requests at any value. A full `BatchSize` publishes immediately,
-`Flush()` publishes on demand, and retry pacing runs on its own clock
-*(partly unreleased — at `v0.6.1-alpha` `backoffCeiling(1)` is 0 and
-`nextPacingWake` does not exist, so the FIRST failure, an elapsed consent-retry
-deadline, a deadline armed by a concurrent `Track`, and spool entries reloaded
-at startup all wait for the flush tick)*),
+`Flush()` publishes on demand, and retry pacing runs on its own clock),
 `HTTPTimeout` (default 2s), `Logger`, `UserID`/`AnonymousID`
 (default actor identity), `OnBatchResult` (see verification),
-`RejectionCapacity` (unreleased; non-positive values use 64 entries), the
+`RejectionCapacity` (non-positive values use 64 entries), the
 remote-config fields (`RemoteConfigURL` + `APIKey` +
 `RemoteConfigCachePath`; see "Remote config"), the disk-spool fields
 (`SpoolDir`, `SpoolMaxEvents`, `SpoolMaxBytes`, `OnSpoolDeadLetter`; see
 "Offline behavior / spool"), `SchemaRevision` /
 `DisableSchemaRevision` (see the facts list below), and
 `DisableRequestCompression`. The SDK itself reads no environment variables.
-
-*(This whole subsection is unreleased: `v0.6.1-alpha` has no gzip path at all —
-zero `gzip` references in `client.go` at the tag — so at the pin every body is
-sent uncompressed.)*
 
 **Request bodies over 1 KiB are gzip-compressed by default** — batch
 publishes and consent writes both. A batch body is the same envelope keys
@@ -222,8 +199,7 @@ Two things follow that matter when you integrate:
   `unsupported_content_encoding`, and the client latches compression off for
   the rest of the process and re-sends the same batch uncompressed. The cost
   of pointing a new SDK at an older server is one round-trip, not lost data.
-  Set `DisableRequestCompression: true` to skip even that. *(unreleased — this
-  field does not exist at `v0.6.1-alpha`.)*
+  Set `DisableRequestCompression: true` to skip even that.
 
 ## Consent model — READ THIS FIRST, IT IS INVERTED
 
@@ -360,7 +336,7 @@ Facts that keep integrations correct:
   a batch that failed retryably (429/5xx or transport error) and retries it,
   honoring the server's `Retry-After` hint; a retryable failure **without** a
   hint paces itself with full-jitter exponential backoff on its OWN clock,
-  independent of `FlushInterval` (every failure — the first included *(partly unreleased — at `v0.6.1-alpha` `backoffCeiling(1)` is 0 and there is no `nextPacingWake`, so the first hintless failure, an elapsed consent-retry deadline, a deadline armed by a concurrent `Track`, and startup-reloaded spool entries all wait for the flush tick instead)* — waits
+  independent of `FlushInterval` (every failure — the first included — waits
   at least 1s, with the ceiling doubling from the third consecutive failure
   up to 60s, reset on success). With
   `SpoolDir` set such batches also spool to disk as crash insurance (see
@@ -490,9 +466,7 @@ crashClient, err := crash.NewClient(crash.ClientOptions{
     `NewClient`; on a non-ELF platform, an unreadable binary or one with no
     usable id the fill is skipped and capture proceeds unchanged (reported
     through `ClientOptions.Logger` when one is configured).
-  - `ClientOptions.AllGoroutineCaptureEnabled` *(the goroutine-label fix is
-    unreleased — at `v0.6.1-alpha` a `runtime/pprof` label containing `]` can
-    reach `Thread.Name`)* snapshots every goroutine at
+  - `ClientOptions.AllGoroutineCaptureEnabled` snapshots every goroutine at
     panic time as additional pre-symbolicated `threads[]`, each named by
     goroutine id with its scheduler state. Bounded: 64 threads, 256 total
     frames, at most 16 frames per non-crashing goroutine.
@@ -552,7 +526,7 @@ durable record upstream of the SDK.
 
 ## Verify your integration
 
-On unreleased main, `client.Rejections()` exposes copied per-event rejection
+`client.Rejections()` exposes copied per-event rejection
 history without a hook; `Snapshot().Rejected` remains cumulative and
 `Snapshot().LastError` identifies the latest recorded failure or rejection.
 Parsed `202` responses still return nil from `Track` and `Flush`. The ring
@@ -560,8 +534,7 @@ survives `Close` for inspection but is not persisted; a new client starts empty.
 A configured `OnBatchResult` owns diagnostics, otherwise `Logger` receives
 each rejection, otherwise the standard logger emits bounded warnings. Rejections
 and counters are available inside `OnSpoolDeadLetter`; rejection warnings and
-`OnBatchResult` run after spool settlement finishes. The
-pinned release still uses the callback and counters. See
+`OnBatchResult` run after spool settlement finishes. See
 [Batch verdicts](https://github.com/shardpilot/shardpilot-go#batch-verdicts).
 
 Run against your dev/staging deployment credentials, then check each item:
@@ -614,57 +587,66 @@ Run against your dev/staging deployment credentials, then check each item:
    shutdown, and that `Close` returns `nil` (pending events + consent
    receipts flushed within the deadline).
 
-## Known limitations (verified 2026-08-03 for `v0.6.0-alpha`)
+## Known limitations (verified 2026-09-18 for `v0.6.3-alpha`)
 
 **Same scope as the consent section: these describe the DEFAULT posture,
 with `Config.ConsentFloor` nil.** Several of the consent-related bullets
 below do not hold with the floor enabled — its contract is the
 `Config.ConsentFloor` godoc, not this list.
 
-Re-verified against this tag's source: the experiment/remote-config bullet
-below (which `v0.6.0-alpha` made partly false), and the crash-consent bullet
-(`Config.ConsentFloor` is new in this tag but gates the ANALYTICS pipeline —
-it does not appear in `pkg/crash`, so the crash bullet still holds). The rest
-are carried forward from the 2026-07-19 verification against `v0.5.0-alpha`.
-Note that this release is NOT purely additive — it carries default-on
-behavioural fixes as well as the opt-ins — so a bullet that is not called
-out above was checked for the change it could plausibly interact with, not
-re-derived from scratch.
+All nine bullets were re-verified against SDK source at `5cdad923`, the
+runtime source for this release. `Config.ConsentFloor` was introduced in
+`v0.6.0-alpha` and applies to the analytics client, not `pkg/crash`.
+Server permission requirements and deployment enablement are qualified
+below: this source review does not establish the deployed server's state.
 
 Stated plainly so integrations are designed around them, not surprised by
 them:
 
-- **Durable delivery is opt-in and partial.** The queue is in-memory by
-  default; the `SpoolDir` spool covers only retryably failed queued batches
-  and only under a persisted consent grant. Process death still loses the
-  live queue and buffer, and crash reports have no offline replay.
+- **Durable delivery is opt-in and partial.** The queue is in-memory.
+  `SpoolDir` can persist retryably failed worker batches, caller-abandoned
+  flushes, and the shutdown remnant left by `Close`, subject to its consent,
+  actor, retention, capacity and successful-write gates. Appending requires
+  a live grant and its persisted record. Abrupt process death loses events
+  that have not reached disk; crash reports have no offline replay.
 - **The live consent state does not survive restarts** (never restored at
   startup, even though `SpoolDir` persists the decision record to gate disk
   participation; re-apply on startup yourself).
 - **Consent receipts have no delivery guarantee**: fire-and-forget, 16-entry
   pending buffer with oldest-dropped overflow, failures only logged, no
   per-receipt success signal, and no ordering guarantee relative to event
-  batches (`SetConsent(true)` does not gate or synchronize admission).
-- **Mode-A publishable keys cannot record grants** — denials only; grants
-  need a separate consent-write-capable service credential.
+  batches (`SetConsent(true)` does not wait for server acknowledgement
+  before allowing events).
+- **Grant permissions are a server contract.** The `SetConsent` godoc
+  requires a consent-write-capable service credential for grants and limits
+  Mode-A publishable keys to denials. The SDK posts using `Config.Token`;
+  server enforcement is not verified by this SDK source review. Confirm
+  that contract for your deployment before relying on receipt acceptance.
 - **The forced-minor state is not reachable through `SetConsent`** — it takes
   a plain bool. Since `v0.6.0-alpha` `denied_forced_minor` does exist here,
   recorded through `SetConsentDecision`, and gates like a denial.
-- **Remote config is explicit-fetch-only** — no background refresh, and every
-  fetch requires `Config.AnonymousID` (the `client_id`). Rule evaluation still
-  happens server-side only. Since `v0.6.0-alpha` there IS an experiment-assignment
-  consumer (`Config.ExperimentsEnabled`) and an attribute pass-through
-  (`Config.RemoteConfigAttributesEnabled`), but both are DARK: default `false`,
-  and until server-side enablement is done for your workspace an enabled
-  consumer receives 403 on every fetch — that applies to the
-  EXPERIMENT lane; `RemoteConfigAttributesEnabled` alone still uses the ordinary
-  remote-config fetch and is not affected. Do not design an integration around
-  the experiment surface yet.
-- **Whole-batch loss on a permanent 4xx** — one invalid event drops its
-  entire batch (partial-batch recovery is a known TODO).
+- **Ordinary remote config is explicit-fetch-only** — no background refresh,
+  and every fetch requires `Config.AnonymousID` (the `client_id`). The SDK
+  consumes the returned values rather than evaluating delivery rules.
+  Since `v0.6.0-alpha`, `Config.ExperimentsEnabled` and
+  `Config.RemoteConfigAttributesEnabled` are available and default `false`.
+  The experiment consumer has a separate background revalidation loop;
+  the attribute flag alone uses the ordinary remote-config route.
+  Experiment deployment enablement is not verified here: the SDK handles
+  401/403 as authorization failures, but source inspection cannot establish
+  which response your workspace will return. Confirm server enablement and
+  credential scopes before enabling the experiment consumer.
+- **Whole-batch loss on a permanent HTTP 4xx** — when the endpoint rejects
+  the batch with such a status, the worker drops it without recovering valid
+  members. This does not describe a successful 202 response's per-event
+  rejections, which are retained in `Rejections()` and exposed through
+  `OnBatchResult`, or a locally unserializable event, which is isolated from
+  its batchmates. HTTP 429 remains retryable.
 - **Non-fatal crash sampling defaults to 1-in-10 per client**, and a
-  sampled-out `Emit` is indistinguishable from a sent one except via
-  `OnResult`; clients emitting fewer than 10 non-fatals report none unless
-  a custom `Sampler` is set.
-- **No client-side crash consent gate** — suppression happens server-side
-  only (`Result.Suppressed`).
+  sampled-out `Emit` returns `nil` without calling `OnResult`. Successful
+  ingest also returns `nil` but calls `OnResult` when configured. Fewer than
+  10 valid non-fatal calls send none unless a custom `Sampler` is set;
+  `EmitFatal` bypasses sampling.
+- **No built-in client-side crash consent gate** — `pkg/crash` does not use
+  the analytics consent state. `Result.Suppressed` reports the server's
+  response; the server's actual suppression policy is not verified here.
