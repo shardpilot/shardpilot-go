@@ -138,7 +138,10 @@ type Plan struct {
 	SignalsUsed        []Signal `json:"signals_used,omitempty"`
 	AgeBand            *AgeBand `json:"age_band,omitempty"`
 	ExpiresAt          string   `json:"expires_at"`
-	MaxAgeSeconds      int      `json:"max_age_seconds"`
+	// A POINTER FOR THE THIRD TIME, and the last required scalar in the
+	// schema. Absent decoded to 0, which passed the negative-only check and
+	// was indistinguishable from an explicit 0 the resolver had chosen.
+	MaxAgeSeconds *int `json:"max_age_seconds"`
 	// Signature is RESERVED and empty in the resolver's initial release, and it
 	// becomes required in the same release that makes SOFT reachable.
 	//
@@ -441,7 +444,14 @@ func (p Plan) validate() error {
 			}
 		}
 	}
-	if p.MaxAgeSeconds < 0 {
+	// ⚠ 0 IS A LEGAL VALUE HERE AND MEANS SOMETHING ELSEWHERE: it is the
+	// client SDKs' "do not reuse this" for their private caches. This package
+	// holds no cache — one plan, one operation, no memo — so nothing acts on
+	// it; it is carried and bounded, and an ABSENT one is unreadable.
+	if p.MaxAgeSeconds == nil {
+		return errors.New("consentpolicy: the plan does not state max_age_seconds")
+	}
+	if *p.MaxAgeSeconds < 0 {
 		return errors.New("consentpolicy: max_age_seconds is negative")
 	}
 	if _, err := p.expiry(); err != nil {

@@ -472,6 +472,37 @@ func TestInvalidUTF8IsUnreadable(t *testing.T) {
 	verifiedVerdict(t, raw)
 }
 
+// ⚠ AND max_age_seconds IS THE THIRD REQUIRED SCALAR THAT ABSENCE COULD FAKE.
+// It decoded to 0 and passed the negative-only check, so "the resolver did not
+// say" and "the resolver said zero" were the same plan.
+func TestAnAbsentMaxAgeFailsClosed(t *testing.T) {
+	for _, mutate := range []func(map[string]any){
+		func(m map[string]any) { delete(m, "max_age_seconds") },
+		func(m map[string]any) { m["max_age_seconds"] = nil },
+	} {
+		decision := Prepare(context.Background(), VerifiedPlayerPolicy{
+			Plan: validPlan(mutate), Scope: callerScope(), Now: fixedClock(),
+		})
+		if decision.PlanUsed() || decision.Reason != ReasonPlanUnreadable {
+			t.Fatalf("%+v detail=%q", decision, decision.Detail)
+		}
+	}
+	// An explicit 0 is a legal value and stays distinguishable. It means "do
+	// not reuse this" to the client SDKs' private caches; this package holds no
+	// cache, so nothing here acts on it — it parses and is carried.
+	zero := verifiedVerdict(t, validPlan(func(m map[string]any) { m["max_age_seconds"] = 0 }))
+	plan, ok := zero.Plan()
+	if !ok || plan.MaxAgeSeconds == nil || *plan.MaxAgeSeconds != 0 {
+		t.Fatalf("an explicit 0 must parse and be carried: %+v", plan)
+	}
+	// And it is copied out, like every other pointer in the plan: a new
+	// pointer field is a new way to reach back into the verdict.
+	*plan.MaxAgeSeconds = 999
+	if again, _ := zero.Plan(); *again.MaxAgeSeconds != 0 {
+		t.Fatal("a caller mutated the verdict through max_age_seconds")
+	}
+}
+
 // ⚠ THE ZERO DECISION IS CLOSED ON EVERY LANE. An uninitialised struct, a map
 // miss, a decoded nothing — all of them used to report analytics as OPEN.
 func TestTheZeroDecisionIsClosedEverywhere(t *testing.T) {

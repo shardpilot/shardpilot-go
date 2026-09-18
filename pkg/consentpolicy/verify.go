@@ -159,6 +159,10 @@ func clonePlan(p Plan) Plan {
 		required := *p.ObjectionRequired
 		out.ObjectionRequired = &required
 	}
+	if p.MaxAgeSeconds != nil {
+		seconds := *p.MaxAgeSeconds
+		out.MaxAgeSeconds = &seconds
+	}
 	return out
 }
 
