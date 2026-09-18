@@ -8,7 +8,18 @@ package consentpolicy
 // AnalyticsClosed reports whether optional device/client analytics is closed by
 // this verdict. It is the same question OptionalProcessingClosed answers, named
 // for the purpose so a caller reading one lane does not have to know that.
-func (d Decision) AnalyticsClosed() bool { return d.OptionalProcessingClosed }
+// ⚠ AND IT FAILS CLOSED ON A ZERO VALUE, which the first cut did not. A
+// `var d Decision` — a caller's uninitialised struct, a map miss, a decoded
+// nothing — has OptionalProcessingClosed false, so this reported analytics as
+// OPEN for a decision nobody ever made. The crash and server-analytics helpers
+// already keyed off PlanUsed; this one did not, and the one that did not was
+// the analytics lane.
+func (d Decision) AnalyticsClosed() bool {
+	if !d.PlanUsed {
+		return true
+	}
+	return d.OptionalProcessingClosed
+}
 
 // CrashClosed reports whether the crash lane is closed.
 //
@@ -23,7 +34,7 @@ func (d Decision) CrashClosed() bool {
 	if !d.PlanUsed {
 		return true
 	}
-	return d.Plan.CrashProfile != CrashMinimal
+	return d.plan.CrashProfile != CrashMinimal
 }
 
 // ServerAnalyticsBasis reports the backend lane's state and whether an
@@ -38,10 +49,10 @@ func (d Decision) CrashClosed() bool {
 // A fallback is DENIED with the requirement standing: missing lookup evidence
 // is not a non-consent authorization.
 func (d Decision) ServerAnalyticsBasis() (ServerAnalyticsState, bool) {
-	if !d.PlanUsed {
+	if !d.PlanUsed || d.plan.ObjectionRequired == nil {
 		return ServerAnalyticsDenied, true
 	}
-	return d.Plan.ServerAnalytics, d.Plan.ObjectionRequired
+	return d.plan.ServerAnalytics, *d.plan.ObjectionRequired
 }
 
 // ProhibitedPurposes returns the union the plan carries. A fallback returns
@@ -52,7 +63,7 @@ func (d Decision) ProhibitedPurposes() []string {
 	if !d.PlanUsed {
 		return nil
 	}
-	return append([]string(nil), d.Plan.ProhibitedPurposes...)
+	return append([]string(nil), d.plan.ProhibitedPurposes...)
 }
 
 // OperationBlocks returns the restrictions that are independent of analytics
@@ -63,5 +74,5 @@ func (d Decision) OperationBlocks() []string {
 	if !d.PlanUsed {
 		return nil
 	}
-	return append([]string(nil), d.Plan.OperationBlocks...)
+	return append([]string(nil), d.plan.OperationBlocks...)
 }

@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"reflect"
 	"regexp"
 	"strings"
 	"time"
@@ -111,25 +113,33 @@ type AgeBand struct {
 
 // Plan is the resolver's response, as the SDK reads it.
 type Plan struct {
-	Regime             Regime               `json:"regime"`
-	CrashProfile       CrashProfile         `json:"crash_profile"`
-	ServerAnalytics    ServerAnalyticsState `json:"server_analytics"`
-	ObjectionRequired  bool                 `json:"server_analytics_objection_required"`
-	ProhibitedPurposes []string             `json:"prohibited_purposes,omitempty"`
-	OperationBlocks    []string             `json:"operation_blocks,omitempty"`
-	PolicyVersion      string               `json:"policy_version"`
-	ConsentTextVersion string               `json:"consent_text_version"`
-	PresentedLanguage  string               `json:"presented_language"`
-	Scope              Scope                `json:"scope"`
-	SignalsUsed        []Signal             `json:"signals_used,omitempty"`
-	AgeBand            *AgeBand             `json:"age_band,omitempty"`
-	ExpiresAt          string               `json:"expires_at"`
-	MaxAgeSeconds      int                  `json:"max_age_seconds"`
-	// Signature is RESERVED and empty in the resolver's initial release: a
-	// forged STRICT plan can only tighten, so a signature protects nothing
-	// while SOFT is unreachable. It becomes required in the same release that
-	// makes SOFT reachable — and this SDK's posture does not change either
-	// way, because an unverifiable signature resolves to strict.
+	Regime          Regime               `json:"regime"`
+	CrashProfile    CrashProfile         `json:"crash_profile"`
+	ServerAnalytics ServerAnalyticsState `json:"server_analytics"`
+	// A POINTER BECAUSE ABSENCE IS NOT false. Decoded into a bool, a plan that
+	// simply omits this key reads as "no objection is required" — the
+	// permissive answer, produced by a field the server never sent. Presence is
+	// tracked so an absent one fails closed.
+	ObjectionRequired  *bool    `json:"server_analytics_objection_required"`
+	ProhibitedPurposes []string `json:"prohibited_purposes,omitempty"`
+	OperationBlocks    []string `json:"operation_blocks,omitempty"`
+	PolicyVersion      string   `json:"policy_version"`
+	ConsentTextVersion string   `json:"consent_text_version"`
+	PresentedLanguage  string   `json:"presented_language"`
+	Scope              Scope    `json:"scope"`
+	SignalsUsed        []Signal `json:"signals_used,omitempty"`
+	AgeBand            *AgeBand `json:"age_band,omitempty"`
+	ExpiresAt          string   `json:"expires_at"`
+	MaxAgeSeconds      int      `json:"max_age_seconds"`
+	// Signature is RESERVED and empty in the resolver's initial release, and it
+	// becomes required in the same release that makes SOFT reachable.
+	//
+	// ⚠ THE SAFETY ARGUMENT FOR SHIPPING WITHOUT ONE IS NOT "a forged plan can
+	// only tighten" ON ITS OWN — that is true of a forged STRICT plan and says
+	// nothing about a forged PERMISSIVE one. It is true only because an
+	// unsigned plan carrying a permissive field is never honoured at all (see
+	// unsignedPlanIsPermissive): the conservative tuple is the only thing this
+	// release accepts unsigned, so forging one buys an attacker nothing.
 	Signature string `json:"signature,omitempty"`
 }
 
@@ -166,18 +176,84 @@ func ParsePlan(raw []byte) (Plan, error) {
 	if len(raw) > maxPlanBytes {
 		return Plan{}, fmt.Errorf("consentpolicy: plan is %d bytes, over the %d-byte bound", len(raw), maxPlanBytes)
 	}
+	// ⚠ THE KEYS ARE CHECKED BEFORE THE DECODE, because encoding/json is
+	// case-INSENSITIVE and lets a later duplicate win. A plan carrying
+	// "regime" and "REGIME" decodes to whichever came last: the schema name
+	// never appeared twice, so DisallowUnknownFields sees nothing wrong, and a
+	// permissive spelling silently wins. Exact case, no duplicates, or the
+	// plan is unreadable.
+	if err := checkObjectKeys(raw); err != nil {
+		return Plan{}, err
+	}
 	decoder := json.NewDecoder(strings.NewReader(string(raw)))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&plan); err != nil {
 		return Plan{}, fmt.Errorf("consentpolicy: unreadable plan: %w", err)
 	}
-	if decoder.More() {
+	// ⚠ AND More() IS NOT A TRAILING-CONTENT CHECK. It reports whether another
+	// element follows INSIDE the current array or object, so it answers false
+	// at a stray "]" or "}" and garbage after a complete plan went unnoticed.
+	// Decoding once more and requiring io.EOF is the question that was meant.
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return Plan{}, errors.New("consentpolicy: trailing content after the plan")
 	}
 	if err := plan.validate(); err != nil {
 		return Plan{}, err
 	}
 	return plan, nil
+}
+
+// schemaKeys is the exact set of top-level names a plan may carry, spelled as
+// the schema spells them. It is DERIVED from the struct tags rather than
+// retyped, so a field added above cannot be forgotten here.
+var schemaKeys = func() map[string]bool {
+	keys := make(map[string]bool)
+	planType := reflect.TypeOf(Plan{})
+	for i := 0; i < planType.NumField(); i++ {
+		tag := planType.Field(i).Tag.Get("json")
+		if name := strings.Split(tag, ",")[0]; name != "" && name != "-" {
+			keys[name] = true
+		}
+	}
+	return keys
+}()
+
+// checkObjectKeys walks the document's top-level keys with the token API and
+// refuses any name that is not the exact schema spelling, and any duplicate.
+func checkObjectKeys(raw []byte) error {
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	token, err := decoder.Token()
+	if err != nil {
+		return fmt.Errorf("consentpolicy: unreadable plan: %w", err)
+	}
+	if delim, ok := token.(json.Delim); !ok || delim != '{' {
+		return errors.New("consentpolicy: the plan is not a JSON object")
+	}
+	seen := make(map[string]bool)
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return fmt.Errorf("consentpolicy: unreadable plan: %w", err)
+		}
+		key, ok := token.(string)
+		if !ok {
+			return errors.New("consentpolicy: a plan key is not a string")
+		}
+		if !schemaKeys[key] {
+			return fmt.Errorf("consentpolicy: the plan carries the key %q, which is not a schema name "+
+				"in its exact spelling", key)
+		}
+		if seen[key] {
+			return fmt.Errorf("consentpolicy: the plan carries the key %q twice", key)
+		}
+		seen[key] = true
+		var skip json.RawMessage
+		if err := decoder.Decode(&skip); err != nil {
+			return fmt.Errorf("consentpolicy: unreadable plan: %w", err)
+		}
+	}
+	return nil
 }
 
 func (p Plan) validate() error {
@@ -192,6 +268,10 @@ func (p Plan) validate() error {
 	}
 	if !p.Scope.complete() {
 		return errors.New("consentpolicy: the plan names no complete scope tuple")
+	}
+	// The objection requirement is a REQUIRED scalar: absent is not false.
+	if p.ObjectionRequired == nil {
+		return errors.New("consentpolicy: the plan does not state server_analytics_objection_required")
 	}
 	for _, field := range []struct {
 		name  string

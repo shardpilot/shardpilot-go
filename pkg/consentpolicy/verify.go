@@ -43,7 +43,11 @@ const (
 	ReasonPlanExpired         Reason = "plan_expired"
 	ReasonNoTrustedClock      Reason = "no_trusted_clock"
 	ReasonSignatureUnverified Reason = "signature_unverified"
-	ReasonCallerCancelled     Reason = "caller_cancelled"
+	// ReasonUnsignedPermissive: the plan is unsigned AND carries a permissive
+	// field. Distinct from signature_unverified, which is a plan that carries a
+	// signature this build cannot check.
+	ReasonUnsignedPermissive Reason = "unsigned_permissive"
+	ReasonCallerCancelled    Reason = "caller_cancelled"
 )
 
 // Decision is the verdict for one actor's operation.
@@ -71,12 +75,64 @@ type Decision struct {
 	// Detail carries the parser's own message when there is one. It is for an
 	// operator reading a log, never for branching.
 	Detail string
-	// Plan is the verified plan when one was used; the zero value otherwise.
-	Plan Plan
+	// ⚠ THE PLAN IS UNEXPORTED, AND THE SLICES ARE COPIED IN. An exported Plan
+	// hands the caller the same backing arrays the accessors read from, so a
+	// COPY of a Decision could mutate what the original's getters return —
+	// values are copied, the arrays behind them are not. A verdict another
+	// holder can edit is not a verdict. Read it through Plan() and the purpose
+	// helpers, which copy on the way out.
+	plan Plan
 	// PlanUsed says whether Plan is meaningful. A caller that branches on the
 	// regime alone cannot tell a verified STRICT from a fallback STRICT, and
 	// the difference matters in a receipt.
 	PlanUsed bool
+}
+
+// Plan returns a COPY of the verified plan, or the zero value when none was
+// used. Every slice in it is copied too, so a caller cannot reach back into
+// the verdict through one.
+func (d Decision) Plan() (Plan, bool) {
+	if !d.PlanUsed {
+		return Plan{}, false
+	}
+	return clonePlan(d.plan), true
+}
+
+// clonePlan deep-copies the parts a caller could otherwise mutate: the two
+// string slices, the optional band and the optional required-scalar pointer.
+func clonePlan(p Plan) Plan {
+	out := p
+	out.ProhibitedPurposes = append([]string(nil), p.ProhibitedPurposes...)
+	out.OperationBlocks = append([]string(nil), p.OperationBlocks...)
+	out.SignalsUsed = append([]Signal(nil), p.SignalsUsed...)
+	if p.AgeBand != nil {
+		band := *p.AgeBand
+		out.AgeBand = &band
+	}
+	if p.ObjectionRequired != nil {
+		required := *p.ObjectionRequired
+		out.ObjectionRequired = &required
+	}
+	return out
+}
+
+// unsignedPlanIsPermissive names the first permissive field an unsigned plan
+// carries, or "" when the plan is the conservative tuple this release accepts
+// without a signature: a strict-or-unknown regime, a crash profile that is not
+// minimal-permitted, and a server-analytics basis that is not eligible.
+func unsignedPlanIsPermissive(plan Plan) string {
+	switch {
+	case plan.Regime != StrictOptIn && plan.Regime != Unknown:
+		return "an unsigned plan carries regime " + string(plan.Regime) +
+			"; only STRICT_OPT_IN or UNKNOWN is honoured without a verified signature"
+	case plan.CrashProfile != CrashOff:
+		return "an unsigned plan carries crash_profile " + string(plan.CrashProfile) +
+			"; only OFF is honoured without a verified signature"
+	case plan.ServerAnalytics != ServerAnalyticsDenied:
+		return "an unsigned plan carries server_analytics " + string(plan.ServerAnalytics) +
+			"; only DENIED is honoured without a verified signature"
+	}
+	return ""
 }
 
 // strictFallback is the one place a fallback verdict is built, so no path can
@@ -132,6 +188,23 @@ func Prepare(ctx context.Context, policy VerifiedPlayerPolicy) Decision {
 		return strictFallback(ReasonSignatureUnverified,
 			"the plan carries a signature this build cannot verify")
 	}
+	// ⚠ AN UNSIGNED PLAN IS NOT EVIDENCE OF A PERMISSION, AND THE FIRST CUT'S
+	// SAFETY ARGUMENT WAS WRONG. It said a forged plan "can only tighten" —
+	// true of a forged STRICT plan, and irrelevant, because nothing stopped a
+	// forged plan from being PERMISSIVE. Every field was trusted individually:
+	// an attacker who could put bytes in front of this verifier could hand it
+	// SOFT_OPT_OUT, a minimal-permitted crash profile or an eligible
+	// server-analytics basis, and each was honoured on its own.
+	//
+	// Until signature verification exists, an unsigned plan may therefore carry
+	// ONLY the fully conservative tuple. Any permissive field in one takes the
+	// same path as an unreadable plan — not used, everything closed — so the
+	// argument becomes true rather than merely comforting: a forged unsigned
+	// plan can only tighten, BECAUSE a permissive unsigned field is never
+	// honoured.
+	if why := unsignedPlanIsPermissive(plan); why != "" {
+		return strictFallback(ReasonUnsignedPermissive, why)
+	}
 	if policy.Now == nil {
 		return strictFallback(ReasonNoTrustedClock, "the caller supplied no trusted clock")
 	}
@@ -147,7 +220,7 @@ func Prepare(ctx context.Context, policy VerifiedPlayerPolicy) Decision {
 	decision := Decision{
 		Regime:   plan.Regime,
 		Reason:   ReasonNone,
-		Plan:     plan,
+		plan:     clonePlan(plan),
 		PlanUsed: true,
 	}
 	// STRICT waits for an explicit grant and UNKNOWN was never classified, so
