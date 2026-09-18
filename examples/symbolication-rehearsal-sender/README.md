@@ -167,6 +167,31 @@ in those words rather than reporting that nothing was sent.
   the same one condition refuses it today, so the limit holds by construction
   rather than by memory.
 
+- **An identified row whose `format` is empty or blank.** The format is read
+  back into the evidence but is not required of a row that has its module
+  identity, so such a row is sent and its `readback` line carries
+  `"format": ""`. Nothing downstream reads that field, and the crash itself is
+  complete, but an operator comparing rows by format would find one with no
+  name.
+- **A twin mutation that happens to equal the row's real value.** The
+  replacements are fixed — the debug id `0123456789ABCDEF0123456789ABCDEF0`
+  and the base `0x800000` — and are not compared against what the row already
+  carries. A row whose own debug id or base equalled one of them would have its
+  twin sent as a byte-identical copy of the positive under a negative case
+  name, and the readback would expect a failure the service has no reason to
+  produce.
+- **An artefact-less row that also promises twins.** The row is counted as an
+  absence and printed as `not-exercised` before the run fails on the
+  contradiction, so the summary's `not_exercised` count includes a row that is
+  also the reason the run exited 1. The failure is reported either way; only
+  the count is generous.
+
+None of the three is reachable from the rehearsal's own producer: every row
+`cmd/symbolication-rehearsal` writes carries a format, its debug ids and bases
+are read back from the artefacts it just wrote, and the row it emits without an
+artefact promises no twins. These limits therefore describe a **hand-edited
+manifest**, which is also the only way to reach them.
+
 ## Offline proof
 
 ```sh
