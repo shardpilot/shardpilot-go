@@ -589,6 +589,78 @@ func TestARowThatDoesNotExerciseSymbolicationNeverExpectsAResolvedFrame(t *testi
 	t.Fatal("no readback row for linux-positive")
 }
 
+func TestAManifestCannotForgeALineOfTheEvidence(t *testing.T) {
+	// The manifest is input, and its producer string is the one manifest value
+	// that used to be PRINTED rather than encoded. A newline and a brace were
+	// enough to add a line that reads like this sender's own record.
+	forged := `{"case":"linux-positive","crash_id":"forged","status":202,"response_body":"{}"}`
+	quoted, err := json.Marshal("cmd/symbolication-rehearsal" + string(rune(10)) + forged)
+	if err != nil {
+		t.Fatalf("build the forged producer: %v", err)
+	}
+	manifest := strings.Replace(manifestFixture, `"producer": "cmd/symbolication-rehearsal",`,
+		`"producer": `+string(quoted)+`,`, 1)
+	if !json.Valid([]byte(manifest)) {
+		t.Fatal("the forged manifest fixture is not valid JSON, so it would fail for the wrong reason")
+	}
+	code, out, _ := sendWith(t, "", manifest, nil)
+	// Refused before anything runs: a control character in a printed manifest
+	// string has no legitimate spelling.
+	if code != 2 || !strings.Contains(out, "carries a control character at byte") {
+		t.Fatalf("a producer carrying a newline was not refused: %d\n%s", code, out)
+	}
+	if strings.Contains(out, `"crash_id":"forged"`) {
+		t.Fatalf("the forged line reached the evidence stream:\n%s", out)
+	}
+	// And the banner is an ENCODED record even for an ordinary producer, so a
+	// value that survives validation still cannot break the line format.
+	_, out, _ = sendWith(t, "", manifestFixture, nil)
+	first := lines(t, out)[0]
+	if first["case"] != "banner" || first["producer"] != "cmd/symbolication-rehearsal" {
+		t.Fatalf("the run's first record is not an encoded banner: %v", first)
+	}
+	if !strings.Contains(first["residual"].(string), "not a resolved frame") {
+		t.Fatalf("the banner lost its residual: %v", first)
+	}
+	// Every line of the stream parses as JSON: the mutant for this repair is a
+	// raw print, which this assertion catches whatever it prints.
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if !json.Valid([]byte(line)) {
+			t.Fatalf("a line of the evidence is not an encoded record: %q", line)
+		}
+	}
+}
+
+func TestAnUnsupportedPromisedStatusFailsTheRun(t *testing.T) {
+	// The two limits this sender records — a 2xx other than 202, and an HTTP
+	// rejection that arrives as a typed SDK error — are kept from being crossed
+	// in silence by one condition, so both spellings are measured here.
+	for _, status := range []string{"200", "204", "413"} {
+		manifest := strings.Replace(manifestFixture,
+			`{"change": "the crash body declares the wrong load_address", "status": "unresolved", "symbolicated": false`,
+			`{"change": "the crash body declares the wrong load_address", "status": "unresolved", "http_status": `+status+`, "symbolicated": false`, 1)
+		if manifest == manifestFixture {
+			t.Fatal("the status fixture did not replace the promise")
+		}
+		code, out, _ := sendWith(t, "", manifest, nil)
+		if code != 1 || !strings.Contains(out, "unsupported promised status "+status) {
+			t.Fatalf("a promised %s was not refused: %d\n%s", status, code, out)
+		}
+		for _, record := range lines(t, out) {
+			if record["case"] == "linux-wrong-base" && record["latency_ms"] != nil {
+				t.Fatalf("the unsupported promise was sent anyway: %v", record)
+			}
+		}
+	}
+	// 202 and an absent http_status are the two supported spellings.
+	explicit := strings.Replace(manifestFixture,
+		`{"change": "the crash body declares the wrong load_address", "status": "unresolved", "symbolicated": false`,
+		`{"change": "the crash body declares the wrong load_address", "status": "unresolved", "http_status": 202, "symbolicated": false`, 1)
+	if code, out, _ := sendWith(t, "", explicit, nil); code != 0 {
+		t.Fatalf("an explicit 202 was refused: %d\n%s", code, out)
+	}
+}
+
 func TestAFrameNobodyWillCompareFailsTheRun(t *testing.T) {
 	// The other side of the incomplete-frame defect: this row says it measures
 	// no symbolication, so a frame on it would ride into the readback as an

@@ -101,7 +101,14 @@ leg) is printed the same way.
 
 ## What it prints
 
-Newline-delimited JSON, one line per attempted exchange with `case`, `crash_id`,
+Newline-delimited JSON, and **every line is an encoded record** — including the
+opening banner, because the manifest is INPUT and a manifest-sourced string
+printed raw could add a line that reads like this sender's own evidence. A
+control character in the manifest's `producer` is refused before anything runs
+(exit 2); every other manifest string is only ever printed inside an encoded
+record, where the encoder escapes it.
+
+One line per attempted exchange with `case`, `crash_id`,
 `method`, `route`, `status`, `response_body`, `request_id` and latency; then a
 `readback` line per crash id carrying `platform`, `expect_symbolicated`,
 `expect_status` and — for a positive — `expect_frame`, so the run-day comparison
@@ -142,6 +149,12 @@ in those words rather than reporting that nothing was sent.
 
 ## What this sender does not model
 
+- **A promised acknowledgement status other than `202`.** An acknowledged send
+  is modelled as HTTP 202 and no other 2xx is read, so a twin promising `200`
+  or `204` would skip the acknowledgement reading entirely. Rather than leaving
+  that as a paragraph, the sender refuses it: any `http_status` on an
+  expressible twin other than an absent one or `202` fails the run naming the
+  row and the status, so this limit cannot be crossed in silence.
 - **A twin whose manifest promises an HTTP rejection and which the SDK can
   otherwise express.** The SDK reports such a refusal as a typed
   `*crash.HTTPStatusError` from `EmitFatal` rather than as an acknowledged
@@ -150,7 +163,9 @@ in those words rather than reporting that nothing was sent.
   HTTP-rejected twin (`no load_address and no base_address`) is refused by the
   SDK before any request, and is printed as not exercised — so the gap is a
   limit of the sender, not of the current rehearsal. A future twin promising,
-  say, a `413` would need this sender taught to expect the typed error.
+  say, a `413` would need this sender taught to expect the typed error — and
+  the same one condition refuses it today, so the limit holds by construction
+  rather than by memory.
 
 ## Offline proof
 

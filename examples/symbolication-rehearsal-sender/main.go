@@ -352,6 +352,17 @@ type verdict struct {
 	SDKError string `json:"sdk_error,omitempty"`
 }
 
+// banner is the run's first record. It carries a manifest-sourced string, so it
+// is ENCODED like every other line rather than printed: a producer containing a
+// newline and a brace would otherwise inject a line of this sender's own
+// evidence into its own log.
+type banner struct {
+	Case     string `json:"case"`
+	Producer string `json:"producer"`
+	Rows     int    `json:"manifest_rows"`
+	Residual string `json:"residual"`
+}
+
 type summary struct {
 	Case string `json:"case"`
 	// Attempted is what reached the service; Acknowledged is what it took and
@@ -419,11 +430,21 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 		fmt.Fprintf(out, "configuration: SHARDPILOT_REHEARSAL_MANIFEST is not a manifest this sender can read (%v); exit 2\n", err)
 		return 2
 	}
+	// The manifest is INPUT. A control character in a string this sender
+	// prints has no legitimate spelling and every use of one is an attempt to
+	// forge a line of the evidence, so it is refused before anything runs.
+	if i := strings.IndexFunc(produced.Producer, func(r rune) bool { return r < 0x20 || r == 0x7f }); i >= 0 {
+		fmt.Fprintf(out, "configuration: the manifest's producer carries a control character at byte %d; exit 2\n", i)
+		return 2
+	}
 	// The SAME redactor the protocol witness uses, not a second implementation:
 	// it compares the raw credential against the JSON-unescaped and
 	// percent-decoded views of whatever is printed, in either hex case.
 	redactor := redact.New(values["SHARDPILOT_API_KEY"])
-	fmt.Fprintf(out, "producer=%s rows=%d; synthetic crashes only; %s\n", produced.Producer, len(produced.Entries), residual)
+	if err := json.NewEncoder(out).Encode(banner{Case: "banner", Producer: produced.Producer,
+		Rows: len(produced.Entries), Residual: residual}); err != nil && log.err == nil {
+		return 1
+	}
 	if log.err != nil {
 		// The banner did not land, so no crash is sent: a mutation with no
 		// receipt is the one outcome this sender must never produce.
@@ -606,10 +627,19 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 					SDKSite: known.refusal, SDKError: emitErr.Error()})
 				continue
 			}
-			expect := promised.HTTPStatus
-			if expect == 0 {
-				expect = http.StatusAccepted
+			// An expressible twin's promise must be the one status this sender
+			// models. A 2xx other than 202 would skip the acknowledgement
+			// reading entirely, and a NON-2xx arrives from the SDK as a typed
+			// *crash.HTTPStatusError rather than as an exchange to read — both
+			// are recorded limits in the README, and this is the condition that
+			// keeps them from being crossed in silence.
+			if promised.HTTPStatus != 0 && promised.HTTPStatus != http.StatusAccepted {
+				fail(name, entry.Platform,
+					fmt.Sprintf("unsupported promised status %d: this sender models an acknowledged send as HTTP 202, and reads no other status for an expressible twin",
+						promised.HTTPStatus), "", "")
+				continue
 			}
+			expect := http.StatusAccepted
 			send(name, entry, controlledCrash(entry, known.mutate), expect,
 				promised.Symbolicated, promised.Status, promised.Why, nil)
 		}
