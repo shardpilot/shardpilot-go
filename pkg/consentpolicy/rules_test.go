@@ -1,6 +1,7 @@
 package consentpolicy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"os"
@@ -27,10 +28,10 @@ func TestAVerdictIsNeverReusedForAnotherActor(t *testing.T) {
 	// The SECOND actor in the same process hands in NO plan. If anything were
 	// memoised, this would inherit the first actor's verdict and its reason.
 	second := Prepare(context.Background(), VerifiedPlayerPolicy{Scope: callerScope(), Now: fixedClock()})
-	if second.PlanUsed || second.Reason != ReasonPlanAbsent {
+	if second.PlanUsed() || second.Reason != ReasonPlanAbsent {
 		t.Fatalf("a second actor inherited a verdict: %+v", second)
 	}
-	if !second.OptionalProcessingClosed {
+	if !second.OptionalProcessingClosed() {
 		t.Fatal("the second actor must be closed, whatever the first one got")
 	}
 	// And the reverse order, so the scene cannot pass because the cache only
@@ -83,14 +84,14 @@ func TestTheDecisionCannotBecomeAConsentGrant(t *testing.T) {
 	refused := Prepare(context.Background(), VerifiedPlayerPolicy{
 		Plan: validPlan(func(m map[string]any) { m["regime"] = string(SoftOptOut) }), Scope: callerScope(), Now: fixedClock(),
 	})
-	if refused.PlanUsed || refused.Reason != ReasonPlanUnsigned {
+	if refused.PlanUsed() || refused.Reason != ReasonPlanUnsigned {
 		t.Fatalf("an unsigned SOFT plan must not be used: %+v", refused)
 	}
 	// The contract that "false is not permission" is asked of the TYPE, since
 	// the verifier no longer produces such a verdict without a signature. A
 	// decision built with a SOFT plan still reports only a regime, and its
 	// analytics helper still keys off the plan being used.
-	soft := Decision{Regime: SoftOptOut, OptionalProcessingClosed: false, PlanUsed: true,
+	soft := Decision{regime: SoftOptOut, optionalProcessingClosed: false, planUsed: true,
 		plan: Plan{Regime: SoftOptOut}}
 	if soft.AnalyticsClosed() {
 		t.Fatal("with a used SOFT plan the regime is not what closes the door")
@@ -106,10 +107,10 @@ func TestTheDecisionCannotBecomeAConsentGrant(t *testing.T) {
 // expired has not verified it.
 func TestNoTrustedClockIsStrict(t *testing.T) {
 	decision := Prepare(context.Background(), VerifiedPlayerPolicy{Plan: validPlan(nil), Scope: callerScope()})
-	if decision.Reason != ReasonNoTrustedClock || decision.Regime != StrictOptIn {
+	if decision.Reason != ReasonNoTrustedClock || decision.Regime() != StrictOptIn {
 		t.Fatalf("%+v", decision)
 	}
-	if decision.PlanUsed {
+	if decision.PlanUsed() {
 		t.Fatal("a plan whose freshness could not be checked was reported as used")
 	}
 }
@@ -122,7 +123,7 @@ func TestAnUnverifiableSignatureIsStrict(t *testing.T) {
 		Plan:  validPlan(func(m map[string]any) { m["signature"] = "ed25519:synthetic" }),
 		Scope: callerScope(), Now: fixedClock(),
 	})
-	if decision.Reason != ReasonSignatureUnverified || decision.Regime != StrictOptIn {
+	if decision.Reason != ReasonSignatureUnverified || decision.Regime() != StrictOptIn {
 		t.Fatalf("%+v", decision)
 	}
 	// The control: the same plan WITHOUT a signature is refused for a
@@ -147,7 +148,7 @@ func TestTheCrashLaneIsItsOwnDecision(t *testing.T) {
 		Plan:  validPlan(func(m map[string]any) { m["crash_profile"] = string(CrashMinimal) }),
 		Scope: callerScope(), Now: fixedClock(),
 	})
-	if refused.PlanUsed || refused.Reason != ReasonPlanUnsigned {
+	if refused.PlanUsed() || refused.Reason != ReasonPlanUnsigned {
 		t.Fatalf("an unsigned crash-minimal plan must not be used: %+v", refused)
 	}
 	if !refused.CrashClosed() || !refused.AnalyticsClosed() {
@@ -158,7 +159,7 @@ func TestTheCrashLaneIsItsOwnDecision(t *testing.T) {
 	// asked of them directly — it becomes reachable end to end in the release
 	// that verifies signatures, and this is where a regression would show
 	// before then.
-	strictWithCrashOn := Decision{Regime: StrictOptIn, OptionalProcessingClosed: true, PlanUsed: true,
+	strictWithCrashOn := Decision{regime: StrictOptIn, optionalProcessingClosed: true, planUsed: true,
 		plan: Plan{Regime: StrictOptIn, CrashProfile: CrashMinimal}}
 	if !strictWithCrashOn.AnalyticsClosed() {
 		t.Fatal("analytics is still closed under STRICT")
@@ -166,7 +167,7 @@ func TestTheCrashLaneIsItsOwnDecision(t *testing.T) {
 	if strictWithCrashOn.CrashClosed() {
 		t.Fatal("a permitted crash profile is not closed by analytics being off")
 	}
-	softWithCrashOff := Decision{Regime: SoftOptOut, OptionalProcessingClosed: false, PlanUsed: true,
+	softWithCrashOff := Decision{regime: SoftOptOut, optionalProcessingClosed: false, planUsed: true,
 		plan: Plan{Regime: SoftOptOut, CrashProfile: CrashOff}}
 	if !softWithCrashOff.CrashClosed() {
 		t.Fatal("an OFF crash profile is not opened by the analytics regime")
@@ -184,14 +185,14 @@ func TestServerAnalyticsIsABasisNotAToggle(t *testing.T) {
 		}),
 		Scope: callerScope(), Now: fixedClock(),
 	})
-	if refused.PlanUsed || refused.Reason != ReasonPlanUnsigned {
+	if refused.PlanUsed() || refused.Reason != ReasonPlanUnsigned {
 		t.Fatalf("an unsigned eligible plan must not be used: %+v", refused)
 	}
 
 	// The basis/requirement SHAPE, asked of the helper: there is no toggle, and
 	// a fallback is DENIED with the requirement standing.
 	required := true
-	eligible := Decision{PlanUsed: true, plan: Plan{
+	eligible := Decision{planUsed: true, plan: Plan{
 		ServerAnalytics: ServerAnalyticsEligible, ObjectionRequired: &required}}
 	state, objection := eligible.ServerAnalyticsBasis()
 	if state != ServerAnalyticsEligible || !objection {
@@ -203,7 +204,7 @@ func TestServerAnalyticsIsABasisNotAToggle(t *testing.T) {
 	}
 	// An absent requirement is not a false one: a plan that never stated it
 	// does not reach a verdict at all, and the helper is closed regardless.
-	unstated := Decision{PlanUsed: true, plan: Plan{ServerAnalytics: ServerAnalyticsEligible}}
+	unstated := Decision{planUsed: true, plan: Plan{ServerAnalytics: ServerAnalyticsEligible}}
 	if _, objection := unstated.ServerAnalyticsBasis(); !objection {
 		t.Fatal("an unstated objection requirement must read as required")
 	}
@@ -376,11 +377,11 @@ func TestAnUnsignedPlanIsNeverUsedHoweverItIsForged(t *testing.T) {
 			decision := Prepare(context.Background(), VerifiedPlayerPolicy{
 				Plan: validPlan(one.mutate), Scope: callerScope(), Now: fixedClock(),
 			})
-			if decision.PlanUsed {
+			if decision.PlanUsed() {
 				t.Fatalf("an unauthenticated plan (%s) was used: %+v", one.name, decision)
 			}
-			if decision.Reason != ReasonPlanUnsigned || decision.Regime != StrictOptIn {
-				t.Fatalf("reason=%q regime=%q", decision.Reason, decision.Regime)
+			if decision.Reason != ReasonPlanUnsigned || decision.Regime() != StrictOptIn {
+				t.Fatalf("reason=%q regime=%q", decision.Reason, decision.Regime())
 			}
 			assertClosedOnEveryAxis(t, decision)
 		})
@@ -395,7 +396,7 @@ func TestAnAbsentRequiredScalarFailsClosed(t *testing.T) {
 		Plan:  validPlan(func(m map[string]any) { delete(m, "server_analytics_objection_required") }),
 		Scope: callerScope(), Now: fixedClock(),
 	})
-	if decision.PlanUsed {
+	if decision.PlanUsed() {
 		t.Fatalf("a plan missing the required scalar was used: %+v", decision)
 	}
 	if decision.Reason != ReasonPlanUnreadable {
@@ -407,12 +408,68 @@ func TestAnAbsentRequiredScalarFailsClosed(t *testing.T) {
 	explicit := verifiedVerdict(t, validPlan(func(m map[string]any) {
 		m["server_analytics_objection_required"] = false
 	}))
-	if !explicit.PlanUsed {
+	if !explicit.PlanUsed() {
 		t.Fatalf("an explicit false must parse: %+v", explicit)
 	}
 	if _, objection := explicit.ServerAnalyticsBasis(); objection {
 		t.Fatal("an explicit false must read as false")
 	}
+}
+
+// ⚠ THE VALIDITY MARKER CANNOT BE SET FROM OUTSIDE. As an exported field it
+// was the one piece of a verdict a caller could forge — and a JSON round-trip
+// forged it without anyone meaning to, because encoding/json cannot see the
+// unexported plan, so it dropped the plan and kept the flag.
+func TestTheValidityMarkerCannotBeForged(t *testing.T) {
+	// The written-by-hand forgery: the old field shape, straight from JSON.
+	var forged Decision
+	if err := json.Unmarshal([]byte(`{"Regime":"SOFT_OPT_OUT","OptionalProcessingClosed":false,"PlanUsed":true}`),
+		&forged); err != nil {
+		t.Fatalf("the fixture must decode: %v", err)
+	}
+	if forged.PlanUsed() {
+		t.Fatal("a Decision decoded from JSON reported a verified plan")
+	}
+	assertClosedOnEveryAxis(t, forged)
+
+	// And the accidental one: a REAL verified verdict, logged and read back.
+	encoded, err := json.Marshal(verifiedVerdict(t, validPlan(func(m map[string]any) {
+		m["regime"] = string(SoftOptOut)
+		m["operation_blocks"] = []any{"transfer_review"}
+	})))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var restored Decision
+	if err := json.Unmarshal(encoded, &restored); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if restored.PlanUsed() {
+		t.Fatal("a round-tripped verdict came back claiming a plan it no longer carries")
+	}
+	assertClosedOnEveryAxis(t, restored)
+}
+
+// ⚠ encoding/json SUBSTITUTES U+FFFD FOR INVALID UTF-8 rather than refusing
+// it, so a stray byte inside a string decodes to a DIFFERENT, well-formed
+// string which is then compared, bounded and returned as though the resolver
+// had sent it. A replacement character is a repair, and this parser refuses
+// rather than repairs.
+func TestInvalidUTF8IsUnreadable(t *testing.T) {
+	raw := validPlan(func(m map[string]any) { m["operation_blocks"] = []any{"transfer_review"} })
+	forged := bytes.Replace(raw, []byte("transfer_review"), []byte("transfer\x80review"), 1)
+	if bytes.Equal(forged, raw) {
+		t.Fatal("the fixture does not carry the entry this scene rewrites")
+	}
+	decision := Prepare(context.Background(), VerifiedPlayerPolicy{
+		Plan: forged, Scope: callerScope(), Now: fixedClock(),
+	})
+	if decision.PlanUsed() || decision.Reason != ReasonPlanUnreadable {
+		t.Fatalf("%+v detail=%q", decision, decision.Detail)
+	}
+	// The control: the same plan with the byte removed still parses, so the
+	// rule is about the byte rather than about the entry.
+	verifiedVerdict(t, raw)
 }
 
 // ⚠ THE ZERO DECISION IS CLOSED ON EVERY LANE. An uninitialised struct, a map
@@ -466,7 +523,7 @@ func TestTrailingContentIsRefused(t *testing.T) {
 			}
 			continue
 		}
-		if decision.PlanUsed || decision.Reason != ReasonPlanUnreadable {
+		if decision.PlanUsed() || decision.Reason != ReasonPlanUnreadable {
 			t.Errorf("a plan followed by %q: %+v", suffix, decision)
 		}
 	}
@@ -487,7 +544,7 @@ func TestKeysMustBeExactAndUnique(t *testing.T) {
 		decision := Prepare(context.Background(), VerifiedPlayerPolicy{
 			Plan: []byte(raw), Scope: callerScope(), Now: fixedClock(),
 		})
-		if decision.PlanUsed {
+		if decision.PlanUsed() {
 			t.Errorf("%s: the plan was used", name)
 		}
 		if decision.Reason != ReasonPlanUnreadable {
@@ -560,7 +617,7 @@ func TestNestedObjectKeysMustBeExactAndUnique(t *testing.T) {
 			decision := Prepare(context.Background(), VerifiedPlayerPolicy{
 				Plan: []byte(forged), Scope: callerScope(), Now: fixedClock(),
 			})
-			if decision.PlanUsed || decision.Reason != ReasonPlanUnreadable {
+			if decision.PlanUsed() || decision.Reason != ReasonPlanUnreadable {
 				t.Fatalf("%+v detail=%q", decision, decision.Detail)
 			}
 		})
@@ -586,7 +643,7 @@ func TestASignalMustStateItsAvailability(t *testing.T) {
 				Plan:  validPlan(func(m map[string]any) { m["signals_used"] = []any{signal} }),
 				Scope: callerScope(), Now: fixedClock(),
 			})
-			if decision.PlanUsed || decision.Reason != ReasonPlanUnreadable {
+			if decision.PlanUsed() || decision.Reason != ReasonPlanUnreadable {
 				t.Fatalf("%+v detail=%q", decision, decision.Detail)
 			}
 			if !strings.Contains(decision.Detail, "does not state whether it was available") {
@@ -610,7 +667,7 @@ func TestACopiedDecisionCannotMutateTheOriginal(t *testing.T) {
 		m["operation_blocks"] = []any{"transfer_review"}
 		m["prohibited_purposes"] = []any{"advertising"}
 	}))
-	if !original.PlanUsed {
+	if !original.PlanUsed() {
 		t.Fatalf("the fixture must be used: %+v", original)
 	}
 	copied := original

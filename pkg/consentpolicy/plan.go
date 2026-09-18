@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Regime is the effective consent class a plan carries.
@@ -187,6 +188,15 @@ func ParsePlan(raw []byte) (Plan, error) {
 	}
 	if len(raw) > maxPlanBytes {
 		return Plan{}, fmt.Errorf("consentpolicy: plan is %d bytes, over the %d-byte bound", len(raw), maxPlanBytes)
+	}
+	// ⚠ AND THE BYTES ARE CHECKED BEFORE THE KEYS. encoding/json does not
+	// refuse invalid UTF-8 inside a string, it SUBSTITUTES U+FFFD for each bad
+	// byte — so a plan whose operation_blocks entry carries a stray 0x80
+	// decodes to a different, well-formed string and is then compared,
+	// bounded and returned as though the resolver had sent it. A replacement
+	// character is a repair, and this parser refuses rather than repairs.
+	if !utf8.Valid(raw) {
+		return Plan{}, errors.New("consentpolicy: the plan is not valid UTF-8")
 	}
 	// ⚠ THE KEYS ARE CHECKED BEFORE THE DECODE, because encoding/json is
 	// case-INSENSITIVE and lets a later duplicate win. A plan carrying

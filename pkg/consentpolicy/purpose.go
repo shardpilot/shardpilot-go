@@ -15,10 +15,10 @@ package consentpolicy
 // already keyed off PlanUsed; this one did not, and the one that did not was
 // the analytics lane.
 func (d Decision) AnalyticsClosed() bool {
-	if !d.PlanUsed {
+	if !d.planUsed {
 		return true
 	}
-	return d.OptionalProcessingClosed
+	return d.optionalProcessingClosed
 }
 
 // CrashClosed reports whether the crash lane is closed.
@@ -31,7 +31,7 @@ func (d Decision) AnalyticsClosed() bool {
 // being off does not by itself close a permitted crash lane, and analytics
 // being open does not open this one.
 func (d Decision) CrashClosed() bool {
-	if !d.PlanUsed {
+	if !d.planUsed {
 		return true
 	}
 	return d.plan.CrashProfile != CrashMinimal
@@ -49,7 +49,7 @@ func (d Decision) CrashClosed() bool {
 // A fallback is DENIED with the requirement standing: missing lookup evidence
 // is not a non-consent authorization.
 func (d Decision) ServerAnalyticsBasis() (ServerAnalyticsState, bool) {
-	if !d.PlanUsed || d.plan.ObjectionRequired == nil {
+	if !d.planUsed || d.plan.ObjectionRequired == nil {
 		return ServerAnalyticsDenied, true
 	}
 	return d.plan.ServerAnalytics, *d.plan.ObjectionRequired
@@ -73,7 +73,7 @@ func (d Decision) ServerAnalyticsBasis() (ServerAnalyticsState, bool) {
 // ProhibitedPurposes returns the union the verified plan carries, and whether
 // that list is knowledge at all.
 func (d Decision) ProhibitedPurposes() (purposes []string, known bool) {
-	if !d.PlanUsed {
+	if !d.planUsed {
 		return nil, false
 	}
 	return append([]string(nil), d.plan.ProhibitedPurposes...), true
@@ -84,7 +84,7 @@ func (d Decision) ProhibitedPurposes() (purposes []string, known bool) {
 // requirements — and whether that list is knowledge at all. A consent toggle
 // cannot remove one of these, and neither can a later grant.
 func (d Decision) OperationBlocks() (blocks []string, known bool) {
-	if !d.PlanUsed {
+	if !d.planUsed {
 		return nil, false
 	}
 	return append([]string(nil), d.plan.OperationBlocks...), true
@@ -97,7 +97,7 @@ func (d Decision) OperationBlocks() (blocks []string, known bool) {
 // restrictions; it is one that established none, and the conservative reading
 // of "I do not know whether this purpose is prohibited" is that it is.
 func (d Decision) PurposeProhibited(purpose string) bool {
-	if !d.PlanUsed {
+	if !d.planUsed {
 		return true
 	}
 	return contains(d.plan.ProhibitedPurposes, purpose)
@@ -112,7 +112,7 @@ func (d Decision) PurposeProhibited(purpose string) bool {
 // would otherwise have read as "nothing is blocked" — which is precisely the
 // forgery this package now refuses to act on at all.
 func (d Decision) OperationBlocked(operation string) bool {
-	if !d.PlanUsed {
+	if !d.planUsed {
 		return true
 	}
 	return contains(d.plan.OperationBlocks, operation)

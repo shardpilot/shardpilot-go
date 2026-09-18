@@ -87,7 +87,7 @@ func TestNoPlanIsUsedWhileThereIsNoVerificationKey(t *testing.T) {
 			decision := Prepare(context.Background(), VerifiedPlayerPolicy{
 				Plan: testCase.plan, Scope: testCase.scope, Now: fixedClock(),
 			})
-			if decision.PlanUsed {
+			if decision.PlanUsed() {
 				t.Fatalf("an unauthenticated plan was used: %+v", decision)
 			}
 			if decision.Reason != ReasonPlanUnsigned {
@@ -102,10 +102,10 @@ func TestNoPlanIsUsedWhileThereIsNoVerificationKey(t *testing.T) {
 // three enums, every axis a caller can ask about.
 func assertClosedOnEveryAxis(t *testing.T, decision Decision) {
 	t.Helper()
-	if decision.Regime != StrictOptIn {
-		t.Fatalf("regime=%q, an unused verdict is STRICT_OPT_IN", decision.Regime)
+	if decision.Regime() != StrictOptIn {
+		t.Fatalf("regime=%q, an unused verdict is STRICT_OPT_IN", decision.Regime())
 	}
-	if !decision.OptionalProcessingClosed || !decision.AnalyticsClosed() || !decision.CrashClosed() {
+	if !decision.OptionalProcessingClosed() || !decision.AnalyticsClosed() || !decision.CrashClosed() {
 		t.Fatal("optional processing, analytics and the crash lane must all be closed")
 	}
 	state, objection := decision.ServerAnalyticsBasis()
@@ -144,12 +144,12 @@ func TestTheVerifiedMappingIsTheReleaseTwoPath(t *testing.T) {
 		t.Fatalf("the fixture must parse: %v", err)
 	}
 	decision := decisionFromPlan(plan)
-	if !decision.PlanUsed || decision.Regime != StrictOptIn || decision.Reason != ReasonNone {
+	if !decision.PlanUsed() || decision.Regime() != StrictOptIn || decision.Reason != ReasonNone {
 		t.Fatalf("%+v", decision)
 	}
 	// STRICT closes optional processing on the plan alone: the grant is a
 	// separate authority.
-	if !decision.OptionalProcessingClosed || !decision.AnalyticsClosed() {
+	if !decision.OptionalProcessingClosed() || !decision.AnalyticsClosed() {
 		t.Fatal("STRICT_OPT_IN must close optional processing on this verdict alone")
 	}
 }
@@ -210,7 +210,7 @@ func TestEveryFailureFallsBackStrict(t *testing.T) {
 				// The oversize case is bounded by entry count rather than
 				// refused outright; what matters is only that it did not open
 				// anything, which the shared assertions below cover.
-				if decision.Regime == SoftOptOut {
+				if decision.Regime() == SoftOptOut {
 					t.Fatal("no input may yield SOFT")
 				}
 				return
@@ -218,13 +218,13 @@ func TestEveryFailureFallsBackStrict(t *testing.T) {
 			if decision.Reason != testCase.want {
 				t.Fatalf("reason=%q detail=%q, want %q", decision.Reason, decision.Detail, testCase.want)
 			}
-			if decision.Regime != StrictOptIn {
-				t.Fatalf("regime=%q, every fallback is STRICT_OPT_IN", decision.Regime)
+			if decision.Regime() != StrictOptIn {
+				t.Fatalf("regime=%q, every fallback is STRICT_OPT_IN", decision.Regime())
 			}
-			if !decision.OptionalProcessingClosed || !decision.AnalyticsClosed() || !decision.CrashClosed() {
+			if !decision.OptionalProcessingClosed() || !decision.AnalyticsClosed() || !decision.CrashClosed() {
 				t.Fatal("a fallback must close optional processing and the crash lane")
 			}
-			if decision.PlanUsed {
+			if decision.PlanUsed() {
 				t.Fatal("a fallback must not report a used plan")
 			}
 			state, objection := decision.ServerAnalyticsBasis()
@@ -242,7 +242,7 @@ func TestEveryFailureFallsBackStrict(t *testing.T) {
 func TestNoInputYieldsSoftFromAFallback(t *testing.T) {
 	for _, plan := range [][]byte{nil, []byte("{"), validPlan(func(m map[string]any) { m["regime"] = "SOFT_OPT_OUT"; m["expires_at"] = "nonsense" })} {
 		decision := Prepare(context.Background(), VerifiedPlayerPolicy{Plan: plan, Scope: callerScope(), Now: fixedClock()})
-		if decision.Regime == SoftOptOut {
+		if decision.Regime() == SoftOptOut {
 			t.Fatal("a fallback produced SOFT_OPT_OUT")
 		}
 	}
@@ -256,10 +256,10 @@ func TestUnknownRegimeClosesOptionalProcessing(t *testing.T) {
 		t.Fatalf("the fixture must parse: %v", err)
 	}
 	decision := decisionFromPlan(plan)
-	if !decision.PlanUsed || decision.Regime != Unknown {
+	if !decision.PlanUsed() || decision.Regime() != Unknown {
 		t.Fatalf("the plan should have been used: %+v", decision)
 	}
-	if !decision.OptionalProcessingClosed {
+	if !decision.OptionalProcessingClosed() {
 		t.Fatal("UNKNOWN must close optional processing")
 	}
 }

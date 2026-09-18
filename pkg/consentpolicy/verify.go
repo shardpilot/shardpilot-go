@@ -57,20 +57,18 @@ const (
 // exposes nothing that would do it: a plan is policy selection, and processing
 // admission is a different question with a different authority.
 type Decision struct {
-	// Regime is the effective class AFTER the fallback. A fallback never
-	// yields SOFT_OPT_OUT.
-	Regime Regime
-	// OptionalProcessingClosed says the REGIME ITSELF closes optional
-	// processing. True for every fallback, for STRICT_OPT_IN (which waits for
-	// a valid purpose-specific explicit grant) and for UNKNOWN (the resolver
-	// could not classify, which is not permission).
+	// ⚠ EVERY FIELD A CALLER COULD BRANCH ON IS UNEXPORTED, not only the
+	// validity marker. Unexporting planUsed alone would have left the two
+	// fields the contract actually talks about — the regime and whether the
+	// door is closed — settable on a struct anyone can build, and readable
+	// straight off a JSON round-trip that had already dropped the plan. That
+	// is the same defect one field over.
 	//
-	// ⚠ FALSE IS NOT PERMISSION. It means only that the regime is not what
-	// closed the door. SOFT still waits for the final notice barrier and for
-	// successful backend admission bound to the scoped player session, purpose,
-	// version and lease — none of which this package knows about. A caller that
-	// treats false as "admit" has skipped the authority that actually decides.
-	OptionalProcessingClosed bool
+	// regime is the effective class AFTER the fallback. A fallback never
+	// yields SOFT_OPT_OUT. Read it through Regime().
+	regime Regime
+	// optionalProcessingClosed: see OptionalProcessingClosed().
+	optionalProcessingClosed bool
 	// Reason names why a fallback happened; empty when the plan was used.
 	Reason Reason
 	// Detail carries the parser's own message when there is one. It is for an
@@ -83,17 +81,52 @@ type Decision struct {
 	// holder can edit is not a verdict. Read it through Plan() and the purpose
 	// helpers, which copy on the way out.
 	plan Plan
-	// PlanUsed says whether Plan is meaningful. A caller that branches on the
-	// regime alone cannot tell a verified STRICT from a fallback STRICT, and
-	// the difference matters in a receipt.
-	PlanUsed bool
+	// ⚠ THE VALIDITY MARKER IS UNEXPORTED, AND THAT IS THE POINT. As an
+	// exported field it was the one piece of the verdict a caller could FORGE:
+	// Decision{PlanUsed: true} reads as "a plan was verified" while plan stays
+	// the zero value, so every helper below read that empty plan as permitting
+	// everything. A JSON round-trip did it without anyone meaning to —
+	// encoding/json cannot see the unexported plan, so it drops it and keeps
+	// the flag, turning a logged verdict back into a permissive one.
+	//
+	// Only Prepare sets it. Read it through PlanUsed().
+	planUsed bool
+}
+
+// PlanUsed reports whether a plan was verified and used. A caller that
+// branches on the regime alone cannot tell a verified STRICT from a fallback
+// STRICT, and the difference matters in a receipt.
+func (d Decision) PlanUsed() bool { return d.planUsed }
+
+// Regime reports the effective class. The zero Decision reports STRICT_OPT_IN,
+// because a verdict nobody made is not a permissive one.
+func (d Decision) Regime() Regime {
+	if d.regime == "" {
+		return StrictOptIn
+	}
+	return d.regime
+}
+
+// OptionalProcessingClosed reports whether the REGIME ITSELF closes optional
+// processing, and it is true for every fallback and for the zero Decision.
+//
+// ⚠ FALSE IS NOT PERMISSION. It means only that the regime is not what closed
+// the door. SOFT still waits for the final notice barrier and for successful
+// backend admission bound to the scoped player session, purpose, version and
+// lease — none of which this package knows about. A caller that treats false
+// as "admit" has skipped the authority that actually decides.
+func (d Decision) OptionalProcessingClosed() bool {
+	if !d.planUsed {
+		return true
+	}
+	return d.optionalProcessingClosed
 }
 
 // Plan returns a COPY of the verified plan, or the zero value when none was
 // used. Every slice in it is copied too, so a caller cannot reach back into
 // the verdict through one.
 func (d Decision) Plan() (Plan, bool) {
-	if !d.PlanUsed {
+	if !d.planUsed {
 		return Plan{}, false
 	}
 	return clonePlan(d.plan), true
@@ -147,8 +180,8 @@ const verificationKeyAvailable = false
 // invent a partial permissive one.
 func strictFallback(reason Reason, detail string) Decision {
 	return Decision{
-		Regime:                   StrictOptIn,
-		OptionalProcessingClosed: true,
+		regime:                   StrictOptIn,
+		optionalProcessingClosed: true,
 		Reason:                   reason,
 		Detail:                   detail,
 	}
@@ -243,14 +276,14 @@ func Prepare(ctx context.Context, policy VerifiedPlayerPolicy) Decision {
 // in order to look end-to-end would be testing itself.
 func decisionFromPlan(plan Plan) Decision {
 	decision := Decision{
-		Regime:   plan.Regime,
+		regime:   plan.Regime,
 		Reason:   ReasonNone,
 		plan:     clonePlan(plan),
-		PlanUsed: true,
+		planUsed: true,
 	}
 	// STRICT waits for an explicit grant and UNKNOWN was never classified, so
 	// both close it here. SOFT leaves it open in the REGIME's sense only — see
 	// the field's contract; it is not an admission.
-	decision.OptionalProcessingClosed = plan.Regime != SoftOptOut
+	decision.optionalProcessingClosed = plan.Regime != SoftOptOut
 	return decision
 }
