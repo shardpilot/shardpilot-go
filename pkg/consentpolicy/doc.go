@@ -29,6 +29,32 @@
 // anything outside its bounded vocabulary resolves to STRICT with optional
 // processing closed — never to a partial permissive result.
 //
+// ⚠ IN THIS RELEASE THAT RULE HAS NO EXCEPTION, AND THE CONSEQUENCE IS WORTH
+// STATING PLAINLY RATHER THAN LEAVING A CALLER TO DISCOVER IT: Prepare returns
+// a closed decision for EVERY input, including a perfectly well-formed plan.
+// This build has no key to authenticate a plan with, an unauthenticated plan
+// is not evidence, and so no plan is used. Decision.PlanUsed is false, every
+// lane is closed, every purpose reports prohibited and every operation reports
+// blocked.
+//
+// That is a posture, not a stub. Two weaker positions were tried here first.
+// "A forged plan can only tighten" is true of a forged STRICT plan and says
+// nothing about a forged permissive one. "Honour an unsigned plan only when
+// its regime, crash profile and server-analytics basis are all conservative"
+// then failed on an axis those three enums do not cover: prohibited_purposes
+// and operation_blocks were carried through unauthenticated, so an attacker
+// who could not make a plan permissive could STRIP its restrictions instead —
+// and those govern transfer, age/capacity, localisation and safety, which no
+// consent choice lifts. A restriction removed is permissive however strict the
+// enums look.
+//
+// The parser, the bounds, the scope comparison and the expiry check all still
+// run, and they run first, so a malformed or out-of-scope handoff is still
+// named precisely for an operator. They are validation, not authentication,
+// and the two are not substitutes. When a verification key is provisioned, the
+// gate opens and the mapping from a verified plan to a verdict — which is
+// present, tested and unreachable today — is what runs.
+//
 // The wire schema has exactly one copy, published with the resolver's own API
 // contract; the route is POST /api/cp/v1/consent/policy.
 //

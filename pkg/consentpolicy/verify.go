@@ -43,11 +43,12 @@ const (
 	ReasonPlanExpired         Reason = "plan_expired"
 	ReasonNoTrustedClock      Reason = "no_trusted_clock"
 	ReasonSignatureUnverified Reason = "signature_unverified"
-	// ReasonUnsignedPermissive: the plan is unsigned AND carries a permissive
-	// field. Distinct from signature_unverified, which is a plan that carries a
-	// signature this build cannot check.
-	ReasonUnsignedPermissive Reason = "unsigned_permissive"
-	ReasonCallerCancelled    Reason = "caller_cancelled"
+	// ReasonPlanUnsigned: the plan carries no signature, and this build has no
+	// key to have verified one with. Distinct from signature_unverified, which
+	// is a plan that DOES carry a signature this build cannot check — the two
+	// say different things to an operator reading a log, and both refuse.
+	ReasonPlanUnsigned    Reason = "plan_unsigned"
+	ReasonCallerCancelled Reason = "caller_cancelled"
 )
 
 // Decision is the verdict for one actor's operation.
@@ -99,12 +100,24 @@ func (d Decision) Plan() (Plan, bool) {
 }
 
 // clonePlan deep-copies the parts a caller could otherwise mutate: the two
-// string slices, the optional band and the optional required-scalar pointer.
+// string slices, the signal entries AND THE POINTER INSIDE EACH ONE, the
+// optional band and the optional required-scalar pointer.
+//
+// ⚠ COPYING A []Signal COPIES THE STRUCTS, NOT WHAT THEIR POINTERS POINT AT.
+// append() gives a fresh backing array whose entries still address the same
+// bool, so a caller writing through Signal.Available would reach into the
+// verdict. Every pointer in the plan is copied by value, not by address.
 func clonePlan(p Plan) Plan {
 	out := p
 	out.ProhibitedPurposes = append([]string(nil), p.ProhibitedPurposes...)
 	out.OperationBlocks = append([]string(nil), p.OperationBlocks...)
 	out.SignalsUsed = append([]Signal(nil), p.SignalsUsed...)
+	for i := range out.SignalsUsed {
+		if out.SignalsUsed[i].Available != nil {
+			available := *out.SignalsUsed[i].Available
+			out.SignalsUsed[i].Available = &available
+		}
+	}
 	if p.AgeBand != nil {
 		band := *p.AgeBand
 		out.AgeBand = &band
@@ -116,24 +129,19 @@ func clonePlan(p Plan) Plan {
 	return out
 }
 
-// unsignedPlanIsPermissive names the first permissive field an unsigned plan
-// carries, or "" when the plan is the conservative tuple this release accepts
-// without a signature: a strict-or-unknown regime, a crash profile that is not
-// minimal-permitted, and a server-analytics basis that is not eligible.
-func unsignedPlanIsPermissive(plan Plan) string {
-	switch {
-	case plan.Regime != StrictOptIn && plan.Regime != Unknown:
-		return "an unsigned plan carries regime " + string(plan.Regime) +
-			"; only STRICT_OPT_IN or UNKNOWN is honoured without a verified signature"
-	case plan.CrashProfile != CrashOff:
-		return "an unsigned plan carries crash_profile " + string(plan.CrashProfile) +
-			"; only OFF is honoured without a verified signature"
-	case plan.ServerAnalytics != ServerAnalyticsDenied:
-		return "an unsigned plan carries server_analytics " + string(plan.ServerAnalytics) +
-			"; only DENIED is honoured without a verified signature"
-	}
-	return ""
-}
+// verificationKeyAvailable reports whether this build can AUTHENTICATE a plan.
+//
+// ⚠ IT IS false, AND NOTHING OUTSIDE THIS PACKAGE CAN MAKE IT true: no
+// configuration field, no environment variable, no build tag, no exported
+// setter. A verifier that can be talked into trusting an unauthenticated plan
+// is not a verifier, and the talking is the whole attack.
+//
+// While it is false, Prepare NEVER USES A PLAN — for any input, including a
+// perfectly well-formed one. That is this release's posture, not a stub: the
+// resolver's initial release emits unsigned plans, so there is nothing to
+// authenticate them against, and the honest answer to "is this plan genuine"
+// is no rather than probably.
+const verificationKeyAvailable = false
 
 // strictFallback is the one place a fallback verdict is built, so no path can
 // invent a partial permissive one.
@@ -188,23 +196,6 @@ func Prepare(ctx context.Context, policy VerifiedPlayerPolicy) Decision {
 		return strictFallback(ReasonSignatureUnverified,
 			"the plan carries a signature this build cannot verify")
 	}
-	// ⚠ AN UNSIGNED PLAN IS NOT EVIDENCE OF A PERMISSION, AND THE FIRST CUT'S
-	// SAFETY ARGUMENT WAS WRONG. It said a forged plan "can only tighten" —
-	// true of a forged STRICT plan, and irrelevant, because nothing stopped a
-	// forged plan from being PERMISSIVE. Every field was trusted individually:
-	// an attacker who could put bytes in front of this verifier could hand it
-	// SOFT_OPT_OUT, a minimal-permitted crash profile or an eligible
-	// server-analytics basis, and each was honoured on its own.
-	//
-	// Until signature verification exists, an unsigned plan may therefore carry
-	// ONLY the fully conservative tuple. Any permissive field in one takes the
-	// same path as an unreadable plan — not used, everything closed — so the
-	// argument becomes true rather than merely comforting: a forged unsigned
-	// plan can only tighten, BECAUSE a permissive unsigned field is never
-	// honoured.
-	if why := unsignedPlanIsPermissive(plan); why != "" {
-		return strictFallback(ReasonUnsignedPermissive, why)
-	}
 	if policy.Now == nil {
 		return strictFallback(ReasonNoTrustedClock, "the caller supplied no trusted clock")
 	}
@@ -217,6 +208,40 @@ func Prepare(ctx context.Context, policy VerifiedPlayerPolicy) Decision {
 			fmt.Sprintf("the plan expired at %s", expiry.Format(time.RFC3339)))
 	}
 
+	// ⚠ THE AUTHENTICATION GATE, AND IN THIS RELEASE IT IS THE LAST WORD.
+	//
+	// The checks above still run, and they run FIRST, because "your handoff is
+	// malformed" and "your handoff is for another app" are worth telling an
+	// operator precisely. But none of them authenticates anything. The second
+	// cut of this file accepted an unsigned plan whose regime, crash profile
+	// and server-analytics basis were all conservative, and that was wrong on
+	// an axis those three enums do not cover: prohibited_purposes and
+	// operation_blocks were never checked at all, so an attacker who could not
+	// make the plan permissive could STRIP its restrictions instead. Those
+	// blocks govern transfer, age/capacity, localisation and safety
+	// independently of any analytics choice — no consent setting lifts one, so
+	// removing one is permissive however strict the enums look.
+	//
+	// There is no field-by-field repair for that. An unsigned plan is not
+	// evidence, so this release uses none, and the fallback below closes EVERY
+	// axis rather than the three that happen to be enums: see the purpose
+	// helpers, where an unused plan reports every operation blocked and every
+	// purpose prohibited.
+	if !verificationKeyAvailable {
+		return strictFallback(ReasonPlanUnsigned,
+			"this build has no key to verify a plan with; an unauthenticated plan is not used")
+	}
+
+	// The release-2 path, unreachable while the gate above is closed.
+	return decisionFromPlan(plan)
+}
+
+// decisionFromPlan is the mapping from a VERIFIED plan to a verdict. It is the
+// one thing release 2 turns on, and it is a named function rather than a block
+// inside Prepare so that it is exercised for what it is: no end-to-end test can
+// reach it while the gate is shut, and a test that re-implemented the mapping
+// in order to look end-to-end would be testing itself.
+func decisionFromPlan(plan Plan) Decision {
 	decision := Decision{
 		Regime:   plan.Regime,
 		Reason:   ReasonNone,

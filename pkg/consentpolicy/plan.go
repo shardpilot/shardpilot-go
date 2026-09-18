@@ -99,8 +99,15 @@ func (s Scope) complete() bool {
 // geolocation, so every signal arrives unavailable with a reason — a plan
 // carrying no country is VALID and must not be treated as an error.
 type Signal struct {
-	Name      string       `json:"name"`
-	Available bool         `json:"available"`
+	Name string `json:"name"`
+	// A POINTER FOR THE SAME REASON server_analytics_objection_required IS ONE:
+	// absence is not false. Decoded into a plain bool, a signal that never
+	// states `available` reads as UNAVAILABLE — an answer the resolver did not
+	// give, invented by the decoder's zero value. It happens to be the
+	// conservative side of that one field, which is exactly why it went
+	// unnoticed: the provenance record then says the source was unavailable
+	// when what is true is that the plan never said.
+	Available *bool        `json:"available"`
 	Reason    SignalReason `json:"reason,omitempty"`
 }
 
@@ -134,12 +141,17 @@ type Plan struct {
 	// Signature is RESERVED and empty in the resolver's initial release, and it
 	// becomes required in the same release that makes SOFT reachable.
 	//
-	// ⚠ THE SAFETY ARGUMENT FOR SHIPPING WITHOUT ONE IS NOT "a forged plan can
-	// only tighten" ON ITS OWN — that is true of a forged STRICT plan and says
-	// nothing about a forged PERMISSIVE one. It is true only because an
-	// unsigned plan carrying a permissive field is never honoured at all (see
-	// unsignedPlanIsPermissive): the conservative tuple is the only thing this
-	// release accepts unsigned, so forging one buys an attacker nothing.
+	// ⚠ THERE IS NO SAFETY ARGUMENT FOR HONOURING AN UNSIGNED PLAN, AND TWO
+	// WERE TRIED HERE BEFORE THIS ONE. "A forged plan can only tighten" is
+	// true of a forged STRICT plan and says nothing about a forged PERMISSIVE
+	// one. "Accept only the conservative tuple unsigned" then failed on a
+	// different axis: it authenticated three enums and left prohibited_purposes
+	// and operation_blocks unauthenticated, so an attacker who could not make
+	// the plan permissive could still STRIP its restrictions — and those govern
+	// transfer, age/capacity, localisation and safety, which no consent setting
+	// can lift. What is left is the only thing that was ever true: until a
+	// verification key exists, an unsigned plan is not evidence, and this
+	// package uses none. See verificationKeyAvailable.
 	Signature string `json:"signature,omitempty"`
 }
 
@@ -204,23 +216,51 @@ func ParsePlan(raw []byte) (Plan, error) {
 	return plan, nil
 }
 
-// schemaKeys is the exact set of top-level names a plan may carry, spelled as
-// the schema spells them. It is DERIVED from the struct tags rather than
-// retyped, so a field added above cannot be forgotten here.
-var schemaKeys = func() map[string]bool {
-	keys := make(map[string]bool)
-	planType := reflect.TypeOf(Plan{})
-	for i := 0; i < planType.NumField(); i++ {
-		tag := planType.Field(i).Tag.Get("json")
-		if name := strings.Split(tag, ",")[0]; name != "" && name != "-" {
-			keys[name] = true
+// schemaKeys maps every struct type reachable from Plan to that type's exact
+// schema spellings, and to the Go type behind each name so the walk below
+// knows what the value is meant to be. It is DERIVED from the struct tags
+// rather than retyped, so a field added above cannot be forgotten here — and
+// a NESTED object added above cannot silently stop being checked.
+var schemaKeys = buildSchemaKeys(reflect.TypeOf(Plan{}))
+
+func buildSchemaKeys(root reflect.Type) map[reflect.Type]map[string]reflect.Type {
+	out := make(map[reflect.Type]map[string]reflect.Type)
+	var walk func(reflect.Type)
+	walk = func(t reflect.Type) {
+		for t.Kind() == reflect.Pointer || t.Kind() == reflect.Slice || t.Kind() == reflect.Array {
+			t = t.Elem()
+		}
+		// Recording the type BEFORE descending is what makes a self-referential
+		// schema terminate rather than recurse forever.
+		if t.Kind() != reflect.Struct || out[t] != nil {
+			return
+		}
+		keys := make(map[string]reflect.Type)
+		out[t] = keys
+		for i := 0; i < t.NumField(); i++ {
+			field := t.Field(i)
+			name := strings.Split(field.Tag.Get("json"), ",")[0]
+			if name == "" || name == "-" {
+				continue
+			}
+			keys[name] = field.Type
+			walk(field.Type)
 		}
 	}
-	return keys
-}()
+	walk(root)
+	return out
+}
 
-// checkObjectKeys walks the document's top-level keys with the token API and
-// refuses any name that is not the exact schema spelling, and any duplicate.
+// checkObjectKeys refuses any name that is not the exact schema spelling, and
+// any duplicate — AT EVERY DEPTH, not only at the top.
+//
+// ⚠ THE TOP-LEVEL-ONLY WALK WAS NOT A SMALLER VERSION OF THIS, IT WAS A HOLE.
+// It decoded each value wholesale as json.RawMessage, so encoding/json got the
+// nested ambiguity untouched and its case-insensitive, last-one-wins matching
+// decided it: {"scope":{"workspace_id":"other","WORKSPACE_ID":"expected"}}
+// decoded to the EXPECTED workspace and then passed the scope comparison —
+// a plan issued for another app admitting here, which is the one thing the
+// scope comparison exists to stop.
 func checkObjectKeys(raw []byte) error {
 	decoder := json.NewDecoder(strings.NewReader(string(raw)))
 	token, err := decoder.Token()
@@ -230,6 +270,15 @@ func checkObjectKeys(raw []byte) error {
 	if delim, ok := token.(json.Delim); !ok || delim != '{' {
 		return errors.New("consentpolicy: the plan is not a JSON object")
 	}
+	return checkObjectBody(decoder, reflect.TypeOf(Plan{}), "the plan")
+}
+
+// checkObjectBody walks one object's keys, the opening brace already consumed.
+func checkObjectBody(decoder *json.Decoder, t reflect.Type, where string) error {
+	var keys map[string]reflect.Type
+	if t != nil {
+		keys = schemaKeys[t]
+	}
 	seen := make(map[string]bool)
 	for decoder.More() {
 		token, err := decoder.Token()
@@ -238,20 +287,60 @@ func checkObjectKeys(raw []byte) error {
 		}
 		key, ok := token.(string)
 		if !ok {
-			return errors.New("consentpolicy: a plan key is not a string")
+			return fmt.Errorf("consentpolicy: a key of %s is not a string", where)
 		}
-		if !schemaKeys[key] {
-			return fmt.Errorf("consentpolicy: the plan carries the key %q, which is not a schema name "+
-				"in its exact spelling", key)
+		if keys != nil {
+			if _, allowed := keys[key]; !allowed {
+				return fmt.Errorf("consentpolicy: %s carries the key %q, which is not a schema name "+
+					"in its exact spelling", where, key)
+			}
 		}
 		if seen[key] {
-			return fmt.Errorf("consentpolicy: the plan carries the key %q twice", key)
+			return fmt.Errorf("consentpolicy: %s carries the key %q twice", where, key)
 		}
 		seen[key] = true
-		var skip json.RawMessage
-		if err := decoder.Decode(&skip); err != nil {
+		if err := checkValueKeys(decoder, keys[key], where+"'s "+key); err != nil {
+			return err
+		}
+	}
+	if _, err := decoder.Token(); err != nil { // the closing brace
+		return fmt.Errorf("consentpolicy: unreadable plan: %w", err)
+	}
+	return nil
+}
+
+// checkValueKeys walks ONE value of the schema type t, which may be nil when
+// the schema does not describe it. A scalar carries no keys to confuse, so it
+// is consumed and left to the strict decode to judge.
+func checkValueKeys(decoder *json.Decoder, t reflect.Type, where string) error {
+	for t != nil && t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	token, err := decoder.Token()
+	if err != nil {
+		return fmt.Errorf("consentpolicy: unreadable plan: %w", err)
+	}
+	delim, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		return checkObjectBody(decoder, t, where)
+	case '[':
+		var elem reflect.Type
+		if t != nil && (t.Kind() == reflect.Slice || t.Kind() == reflect.Array) {
+			elem = t.Elem()
+		}
+		for decoder.More() {
+			if err := checkValueKeys(decoder, elem, "an entry of "+where); err != nil {
+				return err
+			}
+		}
+		if _, err := decoder.Token(); err != nil { // the closing bracket
 			return fmt.Errorf("consentpolicy: unreadable plan: %w", err)
 		}
+		return nil
 	}
 	return nil
 }
@@ -310,12 +399,18 @@ func (p Plan) validate() error {
 		if signal.Name == "" || len(signal.Name) > maxEntryBytes {
 			return errors.New("consentpolicy: a signal name is empty or over its bound")
 		}
+		// A signal that never STATES its availability is unreadable, not
+		// unavailable. Inventing the answer here would put a fact in the
+		// provenance record that the resolver never asserted.
+		if signal.Available == nil {
+			return fmt.Errorf("consentpolicy: signal %q does not state whether it was available", signal.Name)
+		}
 		// An UNAVAILABLE signal must say WHY, from the closed vocabulary. A
 		// bare "not available" is the shape that hides a prohibited source.
-		if !signal.Available && !signal.Reason.known() {
+		if !*signal.Available && !signal.Reason.known() {
 			return fmt.Errorf("consentpolicy: signal %q is unavailable with no known reason", signal.Name)
 		}
-		if signal.Available && signal.Reason != "" {
+		if *signal.Available && signal.Reason != "" {
 			return fmt.Errorf("consentpolicy: signal %q is available and carries a reason", signal.Name)
 		}
 	}

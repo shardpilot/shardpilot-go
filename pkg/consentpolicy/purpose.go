@@ -55,24 +55,74 @@ func (d Decision) ServerAnalyticsBasis() (ServerAnalyticsState, bool) {
 	return d.plan.ServerAnalytics, *d.plan.ObjectionRequired
 }
 
-// ProhibitedPurposes returns the union the plan carries. A fallback returns
-// none — not because nothing is prohibited, but because a fallback knows
-// nothing; the closed lanes above are what protect that case, and a caller must
-// not read an empty list as "everything is permitted".
-func (d Decision) ProhibitedPurposes() []string {
+// ⚠ THE TWO LIST GETTERS RETURN A SECOND VALUE, AND THAT IS THE WHOLE POINT.
+//
+// They used to return a bare []string, nil on a fallback, with a comment
+// asking the caller not to read an empty list as "nothing is prohibited". A
+// comment is not a type. `len(d.ProhibitedPurposes()) == 0` compiled, read
+// naturally, and meant the opposite of the truth: a verdict that knows nothing
+// restricts EVERYTHING, not nothing. The second value does not compile away —
+// a caller cannot call len() on a two-value expression — so the case has to be
+// handled rather than remembered.
+//
+// known == false means: this verdict used no plan, so the list is empty
+// BECAUSE NOTHING IS KNOWN, and every purpose is prohibited and every
+// operation blocked. Use PurposeProhibited and OperationBlocked for the
+// question a caller actually has; these two exist for a receipt or a log.
+
+// ProhibitedPurposes returns the union the verified plan carries, and whether
+// that list is knowledge at all.
+func (d Decision) ProhibitedPurposes() (purposes []string, known bool) {
 	if !d.PlanUsed {
-		return nil
+		return nil, false
 	}
-	return append([]string(nil), d.plan.ProhibitedPurposes...)
+	return append([]string(nil), d.plan.ProhibitedPurposes...), true
 }
 
 // OperationBlocks returns the restrictions that are independent of analytics
 // consent — unresolved localisation, transfer, age/capacity and safety
-// requirements. A consent toggle cannot remove one, and neither can a later
-// grant.
-func (d Decision) OperationBlocks() []string {
+// requirements — and whether that list is knowledge at all. A consent toggle
+// cannot remove one of these, and neither can a later grant.
+func (d Decision) OperationBlocks() (blocks []string, known bool) {
 	if !d.PlanUsed {
-		return nil
+		return nil, false
 	}
-	return append([]string(nil), d.plan.OperationBlocks...)
+	return append([]string(nil), d.plan.OperationBlocks...), true
+}
+
+// PurposeProhibited reports whether this verdict prohibits one named purpose.
+//
+// ⚠ ON A FALLBACK IT IS TRUE FOR EVERY PURPOSE, including one nobody has
+// heard of. A verdict that used no plan is not a verdict that found no
+// restrictions; it is one that established none, and the conservative reading
+// of "I do not know whether this purpose is prohibited" is that it is.
+func (d Decision) PurposeProhibited(purpose string) bool {
+	if !d.PlanUsed {
+		return true
+	}
+	return contains(d.plan.ProhibitedPurposes, purpose)
+}
+
+// OperationBlocked reports whether this verdict blocks one named operation.
+//
+// ⚠ ON A FALLBACK IT IS TRUE FOR EVERY OPERATION, for the same reason, and it
+// matters more here than anywhere else in this file: these blocks carry the
+// transfer, age/capacity, localisation and safety restrictions that no consent
+// choice can lift. An unauthenticated plan with its operation_blocks stripped
+// would otherwise have read as "nothing is blocked" — which is precisely the
+// forgery this package now refuses to act on at all.
+func (d Decision) OperationBlocked(operation string) bool {
+	if !d.PlanUsed {
+		return true
+	}
+	return contains(d.plan.OperationBlocks, operation)
+}
+
+func contains(entries []string, want string) bool {
+	for _, entry := range entries {
+		if entry == want {
+			return true
+		}
+	}
+	return false
 }

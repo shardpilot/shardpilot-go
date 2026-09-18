@@ -52,17 +52,100 @@ func fixedClock() func() time.Time {
 	return func() time.Time { return time.Now().UTC() }
 }
 
-// TestPrepareUsesAValidPlan is the control: without it every refusal below
-// would be satisfied by a verifier that refuses everything.
-func TestPrepareUsesAValidPlan(t *testing.T) {
-	decision := Prepare(context.Background(), VerifiedPlayerPolicy{
-		Plan: validPlan(nil), Scope: callerScope(), Now: fixedClock(),
-	})
-	if !decision.PlanUsed {
-		t.Fatalf("a valid plan was not used: reason=%q detail=%q", decision.Reason, decision.Detail)
+// ⚠ IN THIS RELEASE, NOTHING IS EVER USED — INCLUDING A PERFECT PLAN. This
+// replaces the old "a valid plan is used" control, which could no longer be
+// true: with no verification key, an unauthenticated plan is not evidence, so
+// Prepare refuses every input. Asked over a table rather than one fixture, so
+// that a future edit cannot re-open a single path quietly.
+func TestNoPlanIsUsedWhileThereIsNoVerificationKey(t *testing.T) {
+	cases := []struct {
+		name  string
+		plan  []byte
+		scope Scope
+	}{
+		{"the perfect plan", validPlan(nil), callerScope()},
+		{"an UNKNOWN plan", validPlan(func(m map[string]any) { m["regime"] = string(Unknown) }), callerScope()},
+		{"a SOFT plan", validPlan(func(m map[string]any) { m["regime"] = string(SoftOptOut) }), callerScope()},
+		{"a minimal-permitted crash profile", validPlan(func(m map[string]any) { m["crash_profile"] = string(CrashMinimal) }), callerScope()},
+		{"an eligible server-analytics basis", validPlan(func(m map[string]any) {
+			m["server_analytics"] = string(ServerAnalyticsEligible)
+		}), callerScope()},
+		// ⚠ THE CASE THE PREVIOUS CUT LET THROUGH. Every enum is conservative
+		// and the restriction lists have been STRIPPED. It used to be accepted
+		// and reported as carrying no operation blocks at all.
+		{"conservative enums with the restrictions removed", validPlan(func(m map[string]any) {
+			delete(m, "operation_blocks")
+			delete(m, "prohibited_purposes")
+		}), callerScope()},
+		{"conservative enums with the restrictions emptied", validPlan(func(m map[string]any) {
+			m["operation_blocks"] = []any{}
+			m["prohibited_purposes"] = []any{}
+		}), callerScope()},
 	}
-	if decision.Regime != StrictOptIn || decision.Reason != ReasonNone {
-		t.Fatalf("regime=%q reason=%q, want STRICT_OPT_IN with no fallback reason", decision.Regime, decision.Reason)
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			decision := Prepare(context.Background(), VerifiedPlayerPolicy{
+				Plan: testCase.plan, Scope: testCase.scope, Now: fixedClock(),
+			})
+			if decision.PlanUsed {
+				t.Fatalf("an unauthenticated plan was used: %+v", decision)
+			}
+			if decision.Reason != ReasonPlanUnsigned {
+				t.Fatalf("reason=%q detail=%q, want %q", decision.Reason, decision.Detail, ReasonPlanUnsigned)
+			}
+			assertClosedOnEveryAxis(t, decision)
+		})
+	}
+}
+
+// assertClosedOnEveryAxis is the "fail closed" contract in one place: not the
+// three enums, every axis a caller can ask about.
+func assertClosedOnEveryAxis(t *testing.T, decision Decision) {
+	t.Helper()
+	if decision.Regime != StrictOptIn {
+		t.Fatalf("regime=%q, an unused verdict is STRICT_OPT_IN", decision.Regime)
+	}
+	if !decision.OptionalProcessingClosed || !decision.AnalyticsClosed() || !decision.CrashClosed() {
+		t.Fatal("optional processing, analytics and the crash lane must all be closed")
+	}
+	state, objection := decision.ServerAnalyticsBasis()
+	if state != ServerAnalyticsDenied || !objection {
+		t.Fatalf("server analytics must be DENIED with the objection standing, got %q/%v", state, objection)
+	}
+	// ⚠ AND EVERY OPERATION BLOCKED, EVERY PURPOSE PROHIBITED. A verdict that
+	// established no restrictions is not a verdict that found none. Asked with
+	// names nothing could have enumerated, because "any operation" is the
+	// claim.
+	for _, name := range []string{"transfer_review", "age_capacity", "localisation", "safety", "", "a-name-nobody-registered"} {
+		if !decision.OperationBlocked(name) {
+			t.Fatalf("operation %q was not blocked by an unused verdict", name)
+		}
+		if !decision.PurposeProhibited(name) {
+			t.Fatalf("purpose %q was not prohibited by an unused verdict", name)
+		}
+	}
+	if blocks, known := decision.OperationBlocks(); known || blocks != nil {
+		t.Fatalf("an unused verdict must report its block list as not known, got %v/%v", blocks, known)
+	}
+	if purposes, known := decision.ProhibitedPurposes(); known || purposes != nil {
+		t.Fatalf("an unused verdict must report its purpose list as not known, got %v/%v", purposes, known)
+	}
+	if _, ok := decision.Plan(); ok {
+		t.Fatal("an unused verdict must hand out no plan")
+	}
+}
+
+// The release-2 mapping, exercised for what it is. The gate is a compile-time
+// constant, so no test can open it; decisionFromPlan is the function Prepare
+// calls once it is open, called here directly rather than re-implemented.
+func TestTheVerifiedMappingIsTheReleaseTwoPath(t *testing.T) {
+	plan, err := ParsePlan(validPlan(nil))
+	if err != nil {
+		t.Fatalf("the fixture must parse: %v", err)
+	}
+	decision := decisionFromPlan(plan)
+	if !decision.PlanUsed || decision.Regime != StrictOptIn || decision.Reason != ReasonNone {
+		t.Fatalf("%+v", decision)
 	}
 	// STRICT closes optional processing on the plan alone: the grant is a
 	// separate authority.
@@ -168,9 +251,11 @@ func TestNoInputYieldsSoftFromAFallback(t *testing.T) {
 // UNKNOWN is a VERIFIED plan that still closes optional processing: the
 // resolver said it could not classify, and that is not permission.
 func TestUnknownRegimeClosesOptionalProcessing(t *testing.T) {
-	decision := Prepare(context.Background(), VerifiedPlayerPolicy{
-		Plan: validPlan(func(m map[string]any) { m["regime"] = string(Unknown) }), Scope: callerScope(), Now: fixedClock(),
-	})
+	plan, err := ParsePlan(validPlan(func(m map[string]any) { m["regime"] = string(Unknown) }))
+	if err != nil {
+		t.Fatalf("the fixture must parse: %v", err)
+	}
+	decision := decisionFromPlan(plan)
 	if !decision.PlanUsed || decision.Regime != Unknown {
 		t.Fatalf("the plan should have been used: %+v", decision)
 	}
