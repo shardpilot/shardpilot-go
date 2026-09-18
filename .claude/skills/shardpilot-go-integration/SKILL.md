@@ -587,57 +587,66 @@ Run against your dev/staging deployment credentials, then check each item:
    shutdown, and that `Close` returns `nil` (pending events + consent
    receipts flushed within the deadline).
 
-## Known limitations (verified 2026-08-03 for `v0.6.0-alpha`)
+## Known limitations (verified 2026-09-18 for `v0.6.3-alpha`)
 
 **Same scope as the consent section: these describe the DEFAULT posture,
 with `Config.ConsentFloor` nil.** Several of the consent-related bullets
 below do not hold with the floor enabled — its contract is the
 `Config.ConsentFloor` godoc, not this list.
 
-Re-verified against this tag's source: the experiment/remote-config bullet
-below (which `v0.6.0-alpha` made partly false), and the crash-consent bullet
-(`Config.ConsentFloor` is new in this tag but gates the ANALYTICS pipeline —
-it does not appear in `pkg/crash`, so the crash bullet still holds). The rest
-are carried forward from the 2026-07-19 verification against `v0.5.0-alpha`.
-Note that this release is NOT purely additive — it carries default-on
-behavioural fixes as well as the opt-ins — so a bullet that is not called
-out above was checked for the change it could plausibly interact with, not
-re-derived from scratch.
+All nine bullets were re-verified against SDK source at `5cdad923`, the
+runtime source for this release. `Config.ConsentFloor` was introduced in
+`v0.6.0-alpha` and applies to the analytics client, not `pkg/crash`.
+Server permission requirements and deployment enablement are qualified
+below: this source review does not establish the deployed server's state.
 
 Stated plainly so integrations are designed around them, not surprised by
 them:
 
-- **Durable delivery is opt-in and partial.** The queue is in-memory by
-  default; the `SpoolDir` spool covers only retryably failed queued batches
-  and only under a persisted consent grant. Process death still loses the
-  live queue and buffer, and crash reports have no offline replay.
+- **Durable delivery is opt-in and partial.** The queue is in-memory.
+  `SpoolDir` can persist retryably failed worker batches, caller-abandoned
+  flushes, and the shutdown remnant left by `Close`, subject to its consent,
+  actor, retention, capacity and successful-write gates. Appending requires
+  a live grant and its persisted record. Abrupt process death loses events
+  that have not reached disk; crash reports have no offline replay.
 - **The live consent state does not survive restarts** (never restored at
   startup, even though `SpoolDir` persists the decision record to gate disk
   participation; re-apply on startup yourself).
 - **Consent receipts have no delivery guarantee**: fire-and-forget, 16-entry
   pending buffer with oldest-dropped overflow, failures only logged, no
   per-receipt success signal, and no ordering guarantee relative to event
-  batches (`SetConsent(true)` does not gate or synchronize admission).
-- **Mode-A publishable keys cannot record grants** — denials only; grants
-  need a separate consent-write-capable service credential.
+  batches (`SetConsent(true)` does not wait for server acknowledgement
+  before allowing events).
+- **Grant permissions are a server contract.** The `SetConsent` godoc
+  requires a consent-write-capable service credential for grants and limits
+  Mode-A publishable keys to denials. The SDK posts using `Config.Token`;
+  server enforcement is not verified by this SDK source review. Confirm
+  that contract for your deployment before relying on receipt acceptance.
 - **The forced-minor state is not reachable through `SetConsent`** — it takes
   a plain bool. Since `v0.6.0-alpha` `denied_forced_minor` does exist here,
   recorded through `SetConsentDecision`, and gates like a denial.
-- **Remote config is explicit-fetch-only** — no background refresh, and every
-  fetch requires `Config.AnonymousID` (the `client_id`). Rule evaluation still
-  happens server-side only. Since `v0.6.0-alpha` there IS an experiment-assignment
-  consumer (`Config.ExperimentsEnabled`) and an attribute pass-through
-  (`Config.RemoteConfigAttributesEnabled`), but both are DARK: default `false`,
-  and until server-side enablement is done for your workspace an enabled
-  consumer receives 403 on every fetch — that applies to the
-  EXPERIMENT lane; `RemoteConfigAttributesEnabled` alone still uses the ordinary
-  remote-config fetch and is not affected. Do not design an integration around
-  the experiment surface yet.
-- **Whole-batch loss on a permanent 4xx** — one invalid event drops its
-  entire batch (partial-batch recovery is a known TODO).
+- **Ordinary remote config is explicit-fetch-only** — no background refresh,
+  and every fetch requires `Config.AnonymousID` (the `client_id`). The SDK
+  consumes the returned values rather than evaluating delivery rules.
+  Since `v0.6.0-alpha`, `Config.ExperimentsEnabled` and
+  `Config.RemoteConfigAttributesEnabled` are available and default `false`.
+  The experiment consumer has a separate background revalidation loop;
+  the attribute flag alone uses the ordinary remote-config route.
+  Experiment deployment enablement is not verified here: the SDK handles
+  401/403 as authorization failures, but source inspection cannot establish
+  which response your workspace will return. Confirm server enablement and
+  credential scopes before enabling the experiment consumer.
+- **Whole-batch loss on a permanent HTTP 4xx** — when the endpoint rejects
+  the batch with such a status, the worker drops it without recovering valid
+  members. This does not describe a successful 202 response's per-event
+  rejections, which are retained in `Rejections()` and exposed through
+  `OnBatchResult`, or a locally unserializable event, which is isolated from
+  its batchmates. HTTP 429 remains retryable.
 - **Non-fatal crash sampling defaults to 1-in-10 per client**, and a
-  sampled-out `Emit` is indistinguishable from a sent one except via
-  `OnResult`; clients emitting fewer than 10 non-fatals report none unless
-  a custom `Sampler` is set.
-- **No client-side crash consent gate** — suppression happens server-side
-  only (`Result.Suppressed`).
+  sampled-out `Emit` returns `nil` without calling `OnResult`. Successful
+  ingest also returns `nil` but calls `OnResult` when configured. Fewer than
+  10 valid non-fatal calls send none unless a custom `Sampler` is set;
+  `EmitFatal` bypasses sampling.
+- **No built-in client-side crash consent gate** — `pkg/crash` does not use
+  the analytics consent state. `Result.Suppressed` reports the server's
+  response; the server's actual suppression policy is not verified here.

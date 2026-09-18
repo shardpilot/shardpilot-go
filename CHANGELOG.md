@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-## v0.6.3-alpha - 2026-09-18
+## v0.6.3-alpha — 2026-09-18 — consent-regime plan verifier (release 1), unsigned plans never used
 
 - `v0.6.2-alpha` was tagged on 2026-09-18 without a release entry; this section covers both tags, including the SDK evidence sender, controlled-crash rehearsal (#114), typed purchase/economy events, rejection history, compression, retry/flush pacing and consent/spool repairs since `v0.6.1-alpha`.
 - Add `pkg/consentpolicy` (#115) with a fail-closed release-1 posture: no plan is authenticated or used, including an unsigned plan; `PlanUsed()` is false, every lane is closed, every purpose is prohibited and every operation is blocked. Plan-text validation still checks raw UTF-8, exact-case unique keys, EOF and required-scalar presence before reporting the refusal.
