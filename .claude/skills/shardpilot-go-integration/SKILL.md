@@ -5,24 +5,8 @@ description: Use when integrating the ShardPilot Go SDK (shardpilot-go) into a G
 
 # Integrating the ShardPilot Go SDK
 
-This skill is written against `main`, which is AHEAD of it.
-The pinned release tag `v0.6.1-alpha` is what an install actually gets. That tag is `v0.6.0-alpha` with two internal
-agent skills deleted and no Go source difference between them, so behavioural
-claims verified against `v0.6.0-alpha`'s source hold at the pin — **except for
-the behaviours listed here, marked *(unreleased)* where they appear below**:
-`Config.DisableRequestCompression`, which does not exist at the tag; the
-15-second `FlushInterval` default, which is 1 second there; the goroutine-label
-fix, without which a `runtime/pprof` label containing `]` can reach
-`Thread.Name` in a crash payload on Go 1.27+; and the independent
-pacing of the FIRST retry — at the tag `backoffCeiling(1)` returns 0, so a first
-failure without a `Retry-After` hint waits for the next flush tick rather than
-its own jittered delay — and the rest of the retry-clock work with it: the tag
-has no `nextPacingWake`, so a consent-retry deadline that elapsed while the
-worker was busy, a deadline armed by a concurrent synchronous `Track` after the
-worker had parked, and spool entries reloaded at startup all wait for the flush
-tick there rather than their own clock. Everything else describes the pinned release. Where the SDK does not have a capability, this
-skill says so — do not invent config fields, endpoints, or behaviors beyond
-what is documented here.
+The pinned release tag `v0.6.3-alpha` matches this guide; the owner creates it after the release PR merges, so wait if the install pin is still pending.
+The release includes compression, the 15-second flush default, independent retry pacing, goroutine-label sanitization and rejection history. Where the SDK does not have a capability, this skill says so.
 
 **SCOPE: the DEFAULT configuration.** `v0.6.0-alpha` added three opt-ins that
 change behaviour this guide states categorically, and it does not describe
@@ -71,14 +55,15 @@ other calls, no automatic actions.
 ## Install
 
 ```bash
-go get github.com/shardpilot/shardpilot-go@v0.6.1-alpha
+go get github.com/shardpilot/shardpilot-go@v0.6.3-alpha
 ```
 
-- Requires **Go 1.24+** at the pinned tag. *(unreleased — `main` declares `go 1.25.0`, so a checkout of `main` needs **Go 1.25+**; the pin above is what 1.24 buys you.)*
-- Two import paths:
+- Requires **Go 1.25+** at the pinned tag.
+- Three import paths:
   - `github.com/shardpilot/shardpilot-go` — analytics (package `shardpilot`);
   - `github.com/shardpilot/shardpilot-go/pkg/crash` — crash reporting
-    (package `crash`).
+    (package `crash`);
+  - `github.com/shardpilot/shardpilot-go/pkg/consentpolicy` — fail-closed plan validation (no plan is used in this release).
 - **`v0.1.0` is retracted** in `go.mod`; never pin it. **Do not reach back to an
   earlier tag at all**, and do not offer one as a fallback. `v0.5.0-alpha` and
   `v0.6.0-alpha` distribute eight internal agent-skill files through `go get`;
@@ -177,27 +162,19 @@ and non-HTTPS URLs outside localhost/loopback (plain HTTP to a private
 RFC1918 **IP literal** only, via `AllowInsecurePrivateNetwork` — hostnames
 are never resolved). Optional tuning: `BatchSize` (default 25, max
 100), `BufferSize` (async queue capacity, default 1000), `FlushInterval`
-(default 15s *(unreleased — 1s at `v0.6.1-alpha`)* — the longest a PARTIAL batch waits before it is published, not
+(default 15s — the longest a PARTIAL batch waits before it is published, not
 a heartbeat: an empty batch publishes nothing, so an otherwise-silent process
 makes no requests at any value. A full `BatchSize` publishes immediately,
-`Flush()` publishes on demand, and retry pacing runs on its own clock
-*(partly unreleased — at `v0.6.1-alpha` `backoffCeiling(1)` is 0 and
-`nextPacingWake` does not exist, so the FIRST failure, an elapsed consent-retry
-deadline, a deadline armed by a concurrent `Track`, and spool entries reloaded
-at startup all wait for the flush tick)*),
+`Flush()` publishes on demand, and retry pacing runs on its own clock),
 `HTTPTimeout` (default 2s), `Logger`, `UserID`/`AnonymousID`
 (default actor identity), `OnBatchResult` (see verification),
-`RejectionCapacity` (unreleased; non-positive values use 64 entries), the
+`RejectionCapacity` (non-positive values use 64 entries), the
 remote-config fields (`RemoteConfigURL` + `APIKey` +
 `RemoteConfigCachePath`; see "Remote config"), the disk-spool fields
 (`SpoolDir`, `SpoolMaxEvents`, `SpoolMaxBytes`, `OnSpoolDeadLetter`; see
 "Offline behavior / spool"), `SchemaRevision` /
 `DisableSchemaRevision` (see the facts list below), and
 `DisableRequestCompression`. The SDK itself reads no environment variables.
-
-*(This whole subsection is unreleased: `v0.6.1-alpha` has no gzip path at all —
-zero `gzip` references in `client.go` at the tag — so at the pin every body is
-sent uncompressed.)*
 
 **Request bodies over 1 KiB are gzip-compressed by default** — batch
 publishes and consent writes both. A batch body is the same envelope keys
@@ -222,8 +199,7 @@ Two things follow that matter when you integrate:
   `unsupported_content_encoding`, and the client latches compression off for
   the rest of the process and re-sends the same batch uncompressed. The cost
   of pointing a new SDK at an older server is one round-trip, not lost data.
-  Set `DisableRequestCompression: true` to skip even that. *(unreleased — this
-  field does not exist at `v0.6.1-alpha`.)*
+  Set `DisableRequestCompression: true` to skip even that.
 
 ## Consent model — READ THIS FIRST, IT IS INVERTED
 
@@ -360,7 +336,7 @@ Facts that keep integrations correct:
   a batch that failed retryably (429/5xx or transport error) and retries it,
   honoring the server's `Retry-After` hint; a retryable failure **without** a
   hint paces itself with full-jitter exponential backoff on its OWN clock,
-  independent of `FlushInterval` (every failure — the first included *(partly unreleased — at `v0.6.1-alpha` `backoffCeiling(1)` is 0 and there is no `nextPacingWake`, so the first hintless failure, an elapsed consent-retry deadline, a deadline armed by a concurrent `Track`, and startup-reloaded spool entries all wait for the flush tick instead)* — waits
+  independent of `FlushInterval` (every failure — the first included — waits
   at least 1s, with the ceiling doubling from the third consecutive failure
   up to 60s, reset on success). With
   `SpoolDir` set such batches also spool to disk as crash insurance (see
@@ -490,9 +466,7 @@ crashClient, err := crash.NewClient(crash.ClientOptions{
     `NewClient`; on a non-ELF platform, an unreadable binary or one with no
     usable id the fill is skipped and capture proceeds unchanged (reported
     through `ClientOptions.Logger` when one is configured).
-  - `ClientOptions.AllGoroutineCaptureEnabled` *(the goroutine-label fix is
-    unreleased — at `v0.6.1-alpha` a `runtime/pprof` label containing `]` can
-    reach `Thread.Name`)* snapshots every goroutine at
+  - `ClientOptions.AllGoroutineCaptureEnabled` snapshots every goroutine at
     panic time as additional pre-symbolicated `threads[]`, each named by
     goroutine id with its scheduler state. Bounded: 64 threads, 256 total
     frames, at most 16 frames per non-crashing goroutine.
@@ -552,7 +526,7 @@ durable record upstream of the SDK.
 
 ## Verify your integration
 
-On unreleased main, `client.Rejections()` exposes copied per-event rejection
+`client.Rejections()` exposes copied per-event rejection
 history without a hook; `Snapshot().Rejected` remains cumulative and
 `Snapshot().LastError` identifies the latest recorded failure or rejection.
 Parsed `202` responses still return nil from `Track` and `Flush`. The ring
@@ -560,8 +534,7 @@ survives `Close` for inspection but is not persisted; a new client starts empty.
 A configured `OnBatchResult` owns diagnostics, otherwise `Logger` receives
 each rejection, otherwise the standard logger emits bounded warnings. Rejections
 and counters are available inside `OnSpoolDeadLetter`; rejection warnings and
-`OnBatchResult` run after spool settlement finishes. The
-pinned release still uses the callback and counters. See
+`OnBatchResult` run after spool settlement finishes. See
 [Batch verdicts](https://github.com/shardpilot/shardpilot-go#batch-verdicts).
 
 Run against your dev/staging deployment credentials, then check each item:
