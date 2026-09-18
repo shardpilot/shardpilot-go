@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/shardpilot/shardpilot-go/internal/redact"
 )
 
 func TestCredentialPercentEncodings(t *testing.T) {
@@ -114,7 +116,7 @@ func TestCrashActorMustMatch(t *testing.T) {
 
 func TestRedactionPreservesLiteralEncodingsAndUnicode(t *testing.T) {
 	for _, key := range []string{"literal%2Fkey", "synthetic-é+suffix", `synthetic"quoted\key`} {
-		r := newCredentialRedactor(key)
+		r := redact.New(key)
 		encoded, _ := json.Marshal(key)
 		for _, form := range []string{key, url.QueryEscape(key), string(encoded[1 : len(encoded)-1])} {
 			if got := r.Replace("before %zz " + form + " after"); got != "before %zz [REDACTED] after" {
