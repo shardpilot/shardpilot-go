@@ -678,9 +678,10 @@ func TestNestedObjectKeysMustBeExactAndUnique(t *testing.T) {
 // plan never said.
 func TestASignalMustStateItsAvailability(t *testing.T) {
 	// ⚠ OMITTED AND NULL ARE REFUSED BY DIFFERENT CHECKS, AND EACH IS ASKED
-	// FOR ITS OWN MESSAGE. An omitted key never reaches validate() — the
-	// required-key walk names it first — while a null one is present and is
-	// refused for saying nothing. Asserting one shared sentence across both
+	// FOR ITS OWN MESSAGE — which is the whole reason this field is a pointer.
+	// Both decode to the same nil, so only the RAW document can tell them
+	// apart: the required-key walk names an absent key, and the null-class
+	// walk names a present-null one. Asserting one shared sentence across both
 	// would have let either check disappear silently.
 	for _, testCase := range []struct {
 		name   string
@@ -690,7 +691,7 @@ func TestASignalMustStateItsAvailability(t *testing.T) {
 		{"available omitted", map[string]any{"name": "server_country", "reason": string(NotEnabledInRelease)},
 			`omits the required key "signals_used[0].available"`},
 		{"available null", map[string]any{"name": "server_country", "available": nil, "reason": string(NotEnabledInRelease)},
-			"does not state whether it was available"},
+			`sends null for "signals_used[0].available"`},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			decision := Prepare(context.Background(), VerifiedPlayerPolicy{

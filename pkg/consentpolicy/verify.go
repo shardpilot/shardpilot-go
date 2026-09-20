@@ -132,8 +132,16 @@ func (d Decision) Plan() (Plan, bool) {
 // verdict. Every pointer in the plan is copied by value, not by address.
 func clonePlan(p Plan) Plan {
 	out := p
-	out.Flags.OperationBlocks = append([]string(nil), p.Flags.OperationBlocks...)
-	out.SignalsUsed = append([]Signal(nil), p.SignalsUsed...)
+	// ⚠ ALLOCATED BY LENGTH, NOT append()-ED ONTO nil. Appending zero elements
+	// to a nil slice returns NIL, so the resolver's own `operation_blocks: []`
+	// came back from a clone as nil — and a cloned plan then marshals `null`
+	// where the contract says `[]`, which is the very shape this module now
+	// refuses on the way in. A round trip through this package must not
+	// produce a body this package would reject.
+	out.Flags.OperationBlocks = make([]string, len(p.Flags.OperationBlocks))
+	copy(out.Flags.OperationBlocks, p.Flags.OperationBlocks)
+	out.SignalsUsed = make([]Signal, len(p.SignalsUsed))
+	copy(out.SignalsUsed, p.SignalsUsed)
 	for i := range out.SignalsUsed {
 		if out.SignalsUsed[i].Available != nil {
 			available := *out.SignalsUsed[i].Available
@@ -147,6 +155,10 @@ func clonePlan(p Plan) Plan {
 	if p.Signature != nil {
 		signature := *p.Signature
 		out.Signature = &signature
+	}
+	if p.Reason != nil {
+		reason := *p.Reason
+		out.Reason = &reason
 	}
 	return out
 }
@@ -219,8 +231,11 @@ func Prepare(ctx context.Context, policy VerifiedPlayerPolicy) Decision {
 	// thing that separates a refusal from a plan. A refusal is the strict
 	// fallback with the reason surfaced; it is never usable as a permissive
 	// plan, and nothing below this line reads one.
-	if plan.Reason != "" {
-		return strictFallback(ReasonResolverRefused, "the resolver refused: "+plan.Reason)
+	// The value concatenated here has already been checked against the closed
+	// vocabulary in validate(), so what reaches this log line is one of five
+	// known constants and never an arbitrary string from the body.
+	if plan.Reason != nil {
+		return strictFallback(ReasonResolverRefused, "the resolver refused: "+string(*plan.Reason))
 	}
 	if !plan.Scope.equal(policy.Scope) {
 		// Said without echoing the plan's scope: a mismatch is an operator

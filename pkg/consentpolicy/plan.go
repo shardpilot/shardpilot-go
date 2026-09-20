@@ -1,6 +1,7 @@
 package consentpolicy
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -69,6 +70,35 @@ const ChildRulesMinimised ChildRules = "minimised"
 
 func (c ChildRules) known() bool { return c == ChildRulesMinimised }
 
+// RefusalReason is the CLOSED vocabulary of why the resolver said no. It is
+// separate from Reason in verify.go, which says why this SDK fell back, and
+// from SignalReason, which describes one signal inside a valid plan.
+//
+// ⚠ IT IS CLOSED BECAUSE THIS VALUE REACHES AN OPERATOR'S LOG. It used to be
+// accepted as any string and concatenated into Decision.Detail, which is
+// documented as text for a human reading a log — so a body carrying
+// "bad\nforged: everything is fine" passed as a genuine refusal and wrote a
+// second line into the log that nothing had authorised. Refusing anything
+// outside this set means nothing from an unvalidated body reaches a log field.
+type RefusalReason string
+
+const (
+	RefusalInvalidRequest         RefusalReason = "invalid_request"
+	RefusalInvalidScope           RefusalReason = "invalid_scope"
+	RefusalStoreRegionNotAccepted RefusalReason = "store_region_not_accepted"
+	RefusalUnsupportedAppVersion  RefusalReason = "unsupported_app_version"
+	RefusalPolicyUnavailable      RefusalReason = "policy_unavailable"
+)
+
+func (r RefusalReason) known() bool {
+	switch r {
+	case RefusalInvalidRequest, RefusalInvalidScope, RefusalStoreRegionNotAccepted,
+		RefusalUnsupportedAppVersion, RefusalPolicyUnavailable:
+		return true
+	}
+	return false
+}
+
 // BasisCharacter says what KIND of answer a plan is.
 type BasisCharacter string
 
@@ -132,8 +162,8 @@ func (s Scope) complete() bool {
 // carrying no country is VALID and must not be treated as an error.
 type Signal struct {
 	Name string `json:"name"`
-	// A POINTER FOR THE SAME REASON server_analytics_objection_required IS ONE:
-	// absence is not false. Decoded into a plain bool, a signal that never
+	// A POINTER BECAUSE ABSENCE IS NOT false — the same reason max_age_seconds
+	// and reason are pointers. Decoded into a plain bool, a signal that never
 	// states `available` reads as UNAVAILABLE — an answer the resolver did not
 	// give, invented by the decoder's zero value. It happens to be the
 	// conservative side of that one field, which is exactly why it went
@@ -202,7 +232,13 @@ type Plan struct {
 	// body carrying a reason is the strict fallback with the reason surfaced:
 	// its scope is three empty strings and must not be compared, and it is
 	// never usable as a permissive plan.
-	Reason string `json:"reason,omitempty"`
+	// ⚠ A POINTER, FOR THE REASON EVERY OTHER POINTER IN THIS STRUCT IS ONE:
+	// absence is not a value. As a plain string, a body carrying
+	// `"reason": ""` decoded to exactly what an ABSENT reason decodes to, so a
+	// refusal with an empty reason was read as a PLAN — the permissive
+	// reading, from a malformed body. Nil means the key was not sent; a
+	// non-nil empty string is a refusal this package will not honour.
+	Reason *RefusalReason `json:"reason,omitempty"`
 }
 
 // The bounds are the resolver's, mirrored here so a malformed plan is refused
@@ -454,7 +490,14 @@ func (p Plan) validate() error {
 	// when the truth is "the answer was a refusal, and here is why". The KEYS
 	// are still required on both: the required-key walk runs before this and
 	// does not care what the values are.
-	if p.Reason == "" && !p.Scope.complete() {
+	// The refusal vocabulary is closed, and an EMPTY reason is refused with
+	// the rest: the resolver either refused for one of five named causes or it
+	// did not refuse. "It refused and would not say why" is not a state this
+	// contract has.
+	if p.Reason != nil && !p.Reason.known() {
+		return fmt.Errorf("consentpolicy: unknown reason %q", string(*p.Reason))
+	}
+	if p.Reason == nil && !p.Scope.complete() {
 		return errors.New("consentpolicy: the plan names no complete scope tuple")
 	}
 	for _, field := range []struct {
@@ -560,6 +603,27 @@ func (p Plan) expiry() (time.Time, error) {
 // and is the only optional entry. So a field added to Plan is required by
 // default, which is the direction that fails closed, and making one optional
 // takes a deliberate tag rather than a forgotten line in a list.
+// ⚠ EXACTLY ONE KEY IN THIS CONTRACT IS NULLABLE, and it is spelled out here
+// rather than inferred from the Go types. Three fields are pointers —
+// max_age_seconds, a signal's available, and signature — but only signature is
+// nullable ON THE WIRE. The other two are pointers so that ABSENT can be told
+// from a value, and for them `null` is exactly the malformed case the pointer
+// exists to catch.
+//
+// Keyed by the full dotted path, so a future nested member that happens to be
+// called "signature" is not exempt by accident.
+var nullableKeys = map[string]struct{}{
+	"signature": {},
+}
+
+// isJSONNull reports whether a raw member is the literal null. The bytes are
+// trimmed because a member's raw form carries whatever whitespace the encoder
+// put around it, and this module reads pretty-printed bodies as well as
+// compact ones.
+func isJSONNull(raw json.RawMessage) bool {
+	return string(bytes.TrimSpace(raw)) == "null"
+}
+
 var requiredKeys = buildRequiredKeys(reflect.TypeOf(Plan{}))
 
 func buildRequiredKeys(root reflect.Type) map[reflect.Type]map[string]struct{} {
@@ -640,10 +704,27 @@ func requiredKeysIn(raw []byte, t reflect.Type, where string) error {
 			continue
 		}
 		value, present := object[tag]
-		if !present || string(value) == "null" {
+		if !present {
 			continue
 		}
-		if err := requiredKeysIn(value, field.Type, strings.TrimPrefix(where+"."+tag, ".")); err != nil {
+		path := strings.TrimPrefix(where+"."+tag, ".")
+		// ⚠ PRESENT-AND-NULL IS A REFUSAL FOR EVERY KEY BUT ONE, and it has to
+		// be asked HERE, on the raw bytes, because encoding/json gives the
+		// same zero value for `null` and for absent: a nil slice, an empty
+		// string, a nil pointer. `"operation_blocks": null` decoded to a nil
+		// slice, validate() asked only for its length, and a STRIPPED
+		// restriction list read as "nothing is blocked" — the permissive
+		// answer, from a key the resolver never sends that way.
+		//
+		// Written as the CLASS rather than as a check on the one container
+		// that was caught: every key, every depth, container or scalar.
+		if isJSONNull(value) {
+			if _, nullable := nullableKeys[path]; !nullable {
+				return fmt.Errorf("consentpolicy: the plan sends null for %q, which is not a nullable key", path)
+			}
+			continue
+		}
+		if err := requiredKeysIn(value, field.Type, path); err != nil {
 			return err
 		}
 	}

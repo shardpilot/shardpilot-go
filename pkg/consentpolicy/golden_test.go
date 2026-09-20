@@ -149,8 +149,13 @@ func TestTheRecordedResponsesParse(t *testing.T) {
 			if plan.Signature != nil {
 				t.Fatalf("%s: signature must decode as present-null, got %q", name, *plan.Signature)
 			}
-			if (plan.Reason != "") != pair.refusal {
-				t.Fatalf("%s: reason=%q but refusal=%v", name, plan.Reason, pair.refusal)
+			if (plan.Reason != nil) != pair.refusal {
+				t.Fatalf("%s: reason=%v but refusal=%v", name, plan.Reason, pair.refusal)
+			}
+			// The refusal's reason is the one the resolver actually sent, from
+			// the closed vocabulary — not merely "some reason is present".
+			if pair.refusal && *plan.Reason != RefusalInvalidScope {
+				t.Fatalf("%s: reason=%q, want %q", name, *plan.Reason, RefusalInvalidScope)
 			}
 		}
 	}
@@ -429,5 +434,243 @@ func TestTheRequiredSetMatchesTheRecordedTopLevelKeys(t *testing.T) {
 		if _, present := body[key]; !present {
 			t.Errorf("%q is required and the resolver does not send it", key)
 		}
+	}
+}
+
+// ⚠ NO KEY IN THIS CONTRACT IS NULLABLE EXCEPT `signature`, AND THAT IS ASKED
+// OF EVERY KEY THE RESOLVER SENDS RATHER THAN OF THE ONE THAT WAS CAUGHT.
+//
+// `"operation_blocks": null` decoded to a nil slice, validate() asked only for
+// its length, and a STRIPPED restriction list read as "nothing is blocked" —
+// the permissive answer, from a shape the resolver never sends. The same hole
+// was open on every other container and scalar: encoding/json gives the same
+// zero value for `null` and for absent, so neither the decoded struct nor any
+// check over it can tell them apart. Only the raw document can.
+//
+// Driven from the golden bytes for the same reason the omission table is: a
+// key added to the contract is covered the moment the golden is re-recorded.
+func TestOnlyTheSignatureKeyMayBeNull(t *testing.T) {
+	raw := goldenWire(t, "consent-policy-resolved")
+	var body map[string]any
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatal(err)
+	}
+	paths := goldenKeyPaths(body, "")
+	sort.Strings(paths)
+	if len(paths) < 20 {
+		t.Fatalf("only %d keys enumerated: %v", len(paths), paths)
+	}
+
+	for _, path := range paths {
+		if path == "signature" {
+			continue
+		}
+		t.Run(path, func(t *testing.T) {
+			var mutated map[string]any
+			if err := json.Unmarshal(raw, &mutated); err != nil {
+				t.Fatal(err)
+			}
+			mutated["expires_at"] = time.Now().UTC().Add(5 * time.Minute).Format(time.RFC3339)
+			if !setAtPath(mutated, path, nil) {
+				t.Fatalf("could not set %q to null", path)
+			}
+			encoded, err := json.Marshal(mutated)
+			if err != nil {
+				t.Fatal(err)
+			}
+			decision := Prepare(context.Background(), VerifiedPlayerPolicy{
+				Plan: encoded, Scope: callerScope(), Now: fixedClock(),
+			})
+			if decision.Reason != ReasonPlanUnreadable {
+				t.Fatalf("null for %q gave reason=%q detail=%q, want %q",
+					path, decision.Reason, decision.Detail, ReasonPlanUnreadable)
+			}
+			if decision.PlanUsed() {
+				t.Fatalf("a plan with null at %q was used", path)
+			}
+			// ⚠ THE REFUSAL NAMES THE KEY. A generic "malformed plan" would
+			// pass this table while telling an operator nothing, and the key
+			// is what turns a refusal into something actionable.
+			if !strings.Contains(decision.Detail, path) {
+				t.Fatalf("the refusal for %q must name it: %q", path, decision.Detail)
+			}
+		})
+	}
+
+	// ⚠ THE CONTROL, AND IT IS THE WHOLE POINT OF THE EXCEPTION. `signature`
+	// is null on every response the resolver sends, so a rule that refused
+	// every null would refuse every real body — the opposite defect, and one
+	// that would have shipped looking like rigour.
+	t.Run("signature null is accepted", func(t *testing.T) {
+		decision := Prepare(context.Background(), VerifiedPlayerPolicy{
+			Plan: validPlan(func(m map[string]any) { m["signature"] = nil }), Scope: callerScope(), Now: fixedClock(),
+		})
+		if decision.Reason != ReasonPlanUnsigned {
+			t.Fatalf("a null signature must reach the gate: reason=%q detail=%q", decision.Reason, decision.Detail)
+		}
+	})
+}
+
+// setAtPath replaces one key's value, navigating array indices on the way.
+func setAtPath(body map[string]any, path string, value any) bool {
+	segments := splitPath(path)
+	var cursor any = body
+	for _, segment := range segments[:len(segments)-1] {
+		name, indices := parseSegment(segment)
+		container, ok := cursor.(map[string]any)
+		if !ok {
+			return false
+		}
+		cursor, ok = container[name]
+		if !ok {
+			return false
+		}
+		for _, index := range indices {
+			list, ok := cursor.([]any)
+			if !ok || index >= len(list) {
+				return false
+			}
+			cursor = list[index]
+		}
+	}
+	name, _ := parseSegment(segments[len(segments)-1])
+	container, ok := cursor.(map[string]any)
+	if !ok {
+		return false
+	}
+	if _, present := container[name]; !present {
+		return false
+	}
+	container[name] = value
+	return true
+}
+
+// ⚠ THE REFUSAL VOCABULARY IS CLOSED, AND IT IS CLOSED BECAUSE THIS VALUE
+// REACHES AN OPERATOR'S LOG. It used to be any string, concatenated straight
+// into Decision.Detail — so a body could write a second line into a log that
+// nothing had authorised, and an empty reason was indistinguishable from no
+// reason at all, which read as a PLAN rather than as a refusal.
+func TestTheRefusalVocabularyIsClosed(t *testing.T) {
+	// Every member of the vocabulary is honoured, and each reaches the detail
+	// as itself. Enumerated so that a value dropped from the set fails here.
+	for _, reason := range []RefusalReason{
+		RefusalInvalidRequest, RefusalInvalidScope, RefusalStoreRegionNotAccepted,
+		RefusalUnsupportedAppVersion, RefusalPolicyUnavailable,
+	} {
+		t.Run(string(reason), func(t *testing.T) {
+			decision := Prepare(context.Background(), VerifiedPlayerPolicy{
+				Plan:  validPlan(func(m map[string]any) { m["reason"] = string(reason) }),
+				Scope: callerScope(), Now: fixedClock(),
+			})
+			if decision.Reason != ReasonResolverRefused {
+				t.Fatalf("reason=%q detail=%q, want %q", decision.Reason, decision.Detail, ReasonResolverRefused)
+			}
+			if !strings.Contains(decision.Detail, string(reason)) {
+				t.Fatalf("the detail must name the resolver's own reason: %q", decision.Detail)
+			}
+			assertClosedOnEveryAxis(t, decision)
+		})
+	}
+
+	// And everything else is unreadable — including the two shapes that used
+	// to pass: an empty string, and a string carrying a control character.
+	for _, testCase := range []struct{ name, value string }{
+		{"an unknown member", "teapot"},
+		{"empty", ""},
+		// ⚠ THE INJECTION. Decision.Detail is documented as text for a human
+		// reading a log; a newline here wrote a second line into it.
+		{"a newline", "bad\nforged: everything is fine"},
+		{"a carriage return", "bad\rforged"},
+		{"a NUL", "bad\x00forged"},
+		{"an ANSI escape", "bad\x1b[2Kforged"},
+		// Case is not the vocabulary either.
+		{"the right member in the wrong case", "INVALID_SCOPE"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			decision := Prepare(context.Background(), VerifiedPlayerPolicy{
+				Plan:  validPlan(func(m map[string]any) { m["reason"] = testCase.value }),
+				Scope: callerScope(), Now: fixedClock(),
+			})
+			if decision.Reason != ReasonPlanUnreadable {
+				t.Fatalf("reason=%q detail=%q, want %q", decision.Reason, decision.Detail, ReasonPlanUnreadable)
+			}
+			// ⚠ AND NOTHING FROM THE UNVALIDATED BODY REACHED THE LOG FIELD.
+			// The refusal names the offending value, but a refusal is not the
+			// "the resolver refused: X" line that a caller reads as a genuine
+			// verdict — and the raw bytes must not appear verbatim.
+			if strings.Contains(decision.Detail, "the resolver refused") {
+				t.Fatalf("an invalid reason was logged as a genuine refusal: %q", decision.Detail)
+			}
+			for _, forbidden := range []string{"\n", "\r", "\x00", "\x1b"} {
+				if strings.Contains(decision.Detail, forbidden) {
+					t.Fatalf("a control character from the body reached the log field: %q", decision.Detail)
+				}
+			}
+			assertClosedOnEveryAxis(t, decision)
+		})
+	}
+
+	// The control: a body with NO reason key is a plan, not a refusal.
+	if got := Prepare(context.Background(), VerifiedPlayerPolicy{
+		Plan: validPlan(nil), Scope: callerScope(), Now: fixedClock(),
+	}); got.Reason == ReasonResolverRefused {
+		t.Fatal("a body carrying no reason must not be read as a refusal")
+	}
+}
+
+// ⚠ A CLONED PLAN MUST MARSHAL BACK TO WHAT THE RESOLVER SENT. clonePlan
+// append()-ed onto a nil slice, and appending zero elements to nil returns
+// NIL — so the resolver's own `operation_blocks: []` came back from a clone as
+// `null`. A round trip through this package produced a body this package now
+// REFUSES on the way in, which is the contradiction this scene exists to
+// prevent.
+func TestACloneMarshalsBackToTheContract(t *testing.T) {
+	plan, err := ParsePlan(goldenWire(t, "consent-policy-resolved"))
+	if err != nil {
+		t.Fatalf("the golden must parse: %v", err)
+	}
+	encoded, err := json.Marshal(clonePlan(plan))
+	if err != nil {
+		t.Fatalf("marshal the clone: %v", err)
+	}
+	var round map[string]json.RawMessage
+	if err := json.Unmarshal(encoded, &round); err != nil {
+		t.Fatal(err)
+	}
+	// The two members whose empty form the bug rewrote, compared as BYTES
+	// against the contract's spelling rather than through a decode — `null`
+	// and `[]` decode to the same nil, which is exactly what hid this.
+	var flags map[string]json.RawMessage
+	if err := json.Unmarshal(round["flags"], &flags); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(flags["operation_blocks"]); got != "[]" {
+		t.Fatalf("a cloned plan marshals operation_blocks as %s, the contract says []", got)
+	}
+
+	// And the same question of an EMPTY signals_used, which the golden does
+	// not carry — so it is built here rather than left untested.
+	empty := clonePlan(Plan{})
+	if empty.Flags.OperationBlocks == nil || empty.SignalsUsed == nil {
+		t.Fatalf("a clone must not produce nil containers: blocks=%v signals=%v",
+			empty.Flags.OperationBlocks, empty.SignalsUsed)
+	}
+
+	// ⚠ AND THE ROUND TRIP IS FED BACK IN. The strongest form of this claim is
+	// not "the bytes look right" but "this package accepts what it produced".
+	var reparsed map[string]any
+	if err := json.Unmarshal(encoded, &reparsed); err != nil {
+		t.Fatal(err)
+	}
+	reparsed["expires_at"] = time.Now().UTC().Add(5 * time.Minute).Format(time.RFC3339)
+	again, err := json.Marshal(reparsed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision := Prepare(context.Background(), VerifiedPlayerPolicy{
+		Plan: again, Scope: callerScope(), Now: fixedClock(),
+	}); decision.Reason != ReasonPlanUnsigned {
+		t.Fatalf("this package refused a body it produced itself: reason=%q detail=%q",
+			decision.Reason, decision.Detail)
 	}
 }
