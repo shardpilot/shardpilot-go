@@ -40,11 +40,13 @@ func (r Regime) known() bool {
 type CrashProfile string
 
 const (
-	CrashOff     CrashProfile = "OFF"
-	CrashMinimal CrashProfile = "MINIMAL"
+	CrashOff                         CrashProfile = "off"
+	CrashMinimalDiagnosticsForMinors CrashProfile = "minimal_diagnostics_for_minors"
 )
 
-func (p CrashProfile) known() bool { return p == CrashOff || p == CrashMinimal }
+func (p CrashProfile) known() bool {
+	return p == CrashOff || p == CrashMinimalDiagnosticsForMinors
+}
 
 // ServerAnalyticsState is the backend lane's separate state. It is a BASIS plus
 // an objection requirement, never an in-game toggle: the platform decision
@@ -53,12 +55,41 @@ func (p CrashProfile) known() bool { return p == CrashOff || p == CrashMinimal }
 type ServerAnalyticsState string
 
 const (
-	ServerAnalyticsDenied   ServerAnalyticsState = "DENIED"
-	ServerAnalyticsEligible ServerAnalyticsState = "ELIGIBLE"
+	// ONE VALUE, and the schema says one value: no path in the resolver
+	// assigns another while SOFT is unreachable. A second member here would
+	// be this package inventing a state the wire cannot carry.
+	ServerAnalyticsDenied ServerAnalyticsState = "denied"
 )
 
+// ChildRules is the minimised-handling flag.
+type ChildRules string
+
+// One value, for the same reason as ServerAnalyticsDenied.
+const ChildRulesMinimised ChildRules = "minimised"
+
+func (c ChildRules) known() bool { return c == ChildRulesMinimised }
+
+// BasisCharacter says what KIND of answer a plan is.
+type BasisCharacter string
+
+const BasisInformationalReference BasisCharacter = "informational_reference"
+
+func (b BasisCharacter) known() bool { return b == BasisInformationalReference }
+
+// TableProvenance says where the jurisdiction reading behind a plan came from.
+type TableProvenance string
+
+const (
+	ProvenanceAIDraft       TableProvenance = "ai_draft"
+	ProvenanceOwnerAccepted TableProvenance = "owner_accepted"
+)
+
+func (t TableProvenance) known() bool {
+	return t == ProvenanceAIDraft || t == ProvenanceOwnerAccepted
+}
+
 func (s ServerAnalyticsState) known() bool {
-	return s == ServerAnalyticsDenied || s == ServerAnalyticsEligible
+	return s == ServerAnalyticsDenied
 }
 
 // SignalReason is the per-signal availability vocabulary. It is NOT the
@@ -112,51 +143,66 @@ type Signal struct {
 	Reason    SignalReason `json:"reason,omitempty"`
 }
 
-// AgeBand is the versioned coarse band. A band is the only age shape that
-// travels: never a date of birth, never a month or year.
-type AgeBand struct {
-	Vocabulary string `json:"vocabulary"`
-	Band       string `json:"band"`
-}
-
 // Plan is the resolver's response, as the SDK reads it.
-type Plan struct {
-	Regime          Regime               `json:"regime"`
+// Flags are the plan's orthogonal restrictions.
+//
+// ⚠ NESTED, AND THAT IS NOT A DETAIL. This package read crash_profile and
+// server_analytics at the TOP LEVEL, in upper case, beside fields the resolver
+// has never sent. It could not read one real response — and it was harmless
+// only because this release refuses every unsigned plan anyway, which is
+// exactly how the same defect hid in the sibling SDK for fifteen rounds. The
+// schema is the contract; this is the schema.
+type Flags struct {
 	CrashProfile    CrashProfile         `json:"crash_profile"`
 	ServerAnalytics ServerAnalyticsState `json:"server_analytics"`
-	// A POINTER BECAUSE ABSENCE IS NOT false. Decoded into a bool, a plan that
-	// simply omits this key reads as "no objection is required" — the
-	// permissive answer, produced by a field the server never sent. Presence is
-	// tracked so an absent one fails closed.
-	ObjectionRequired  *bool    `json:"server_analytics_objection_required"`
-	ProhibitedPurposes []string `json:"prohibited_purposes,omitempty"`
-	OperationBlocks    []string `json:"operation_blocks,omitempty"`
-	PolicyVersion      string   `json:"policy_version"`
-	ConsentTextVersion string   `json:"consent_text_version"`
-	PresentedLanguage  string   `json:"presented_language"`
-	Scope              Scope    `json:"scope"`
-	SignalsUsed        []Signal `json:"signals_used,omitempty"`
-	AgeBand            *AgeBand `json:"age_band,omitempty"`
-	ExpiresAt          string   `json:"expires_at"`
-	// A POINTER FOR THE THIRD TIME, and the last required scalar in the
-	// schema. Absent decoded to 0, which passed the negative-only check and
-	// was indistinguishable from an explicit 0 the resolver had chosen.
+	ChildRules      ChildRules           `json:"child_rules"`
+	// Always present and never null: `[]` when there is nothing to block.
+	OperationBlocks []string `json:"operation_blocks"`
+}
+
+// Basis says what kind of answer the plan is, and carries the notice every
+// carrier must show.
+type Basis struct {
+	Character       BasisCharacter  `json:"character"`
+	TableProvenance TableProvenance `json:"table_provenance"`
+	Notice          string          `json:"notice"`
+}
+
+// Plan is the resolver's response, exactly as it is sent.
+//
+// EVERY FIELD BELOW IS PRESENT ON EVERY RESPONSE, refusals included, except
+// `reason` — which is present ONLY on a refusal and is the discriminator.
+type Plan struct {
+	Regime                Regime   `json:"regime"`
+	Flags                 Flags    `json:"flags"`
+	PolicyVersion         string   `json:"policy_version"`
+	ConsentTextVersion    string   `json:"consent_text_version"`
+	PresentedLanguage     string   `json:"presented_language"`
+	Scope                 Scope    `json:"scope"`
+	SignalsUsed           []Signal `json:"signals_used"`
+	BandVocabulary        string   `json:"band_vocabulary"`
+	BandVocabularyVersion string   `json:"band_vocabulary_version"`
+	ExpiresAt             string   `json:"expires_at"`
+	// A POINTER BECAUSE ABSENCE IS NOT ZERO. Decoded into an int, a plan that
+	// omits this key reads as 0 — indistinguishable from a resolver that chose
+	// 0, and the presence check below is what makes an omission a refusal.
 	MaxAgeSeconds *int `json:"max_age_seconds"`
-	// Signature is RESERVED and empty in the resolver's initial release, and it
-	// becomes required in the same release that makes SOFT reachable.
-	//
-	// ⚠ THERE IS NO SAFETY ARGUMENT FOR HONOURING AN UNSIGNED PLAN, AND TWO
-	// WERE TRIED HERE BEFORE THIS ONE. "A forged plan can only tighten" is
-	// true of a forged STRICT plan and says nothing about a forged PERMISSIVE
-	// one. "Accept only the conservative tuple unsigned" then failed on a
-	// different axis: it authenticated three enums and left prohibited_purposes
-	// and operation_blocks unauthenticated, so an attacker who could not make
-	// the plan permissive could still STRIP its restrictions — and those govern
-	// transfer, age/capacity, localisation and safety, which no consent setting
-	// can lift. What is left is the only thing that was ever true: until a
-	// verification key exists, an unsigned plan is not evidence, and this
-	// package uses none. See verificationKeyAvailable.
-	Signature string `json:"signature,omitempty"`
+	// ⚠ THE ONE NULLABLE KEY, AND PRESENT-NULL IS THE ONLY ADMISSIBLE STATE IN
+	// THIS RELEASE. The key is on every response; its value is null while no
+	// signature exists. A pointer distinguishes null from a value; the
+	// required-key walk distinguishes null from ABSENT, which a pointer alone
+	// cannot. A non-null signature is refused here rather than honoured,
+	// because this package holds no verification key — see
+	// verificationKeyAvailable, and the paragraph there about the two safety
+	// arguments that were tried and failed.
+	Signature *string `json:"signature"`
+	Basis     Basis   `json:"basis"`
+	// ⚠ PRESENT ONLY ON A REFUSAL, AND IT IS THE DISCRIMINATOR — not the HTTP
+	// status, which is 400 for four reasons and 200 for policy_unavailable. A
+	// body carrying a reason is the strict fallback with the reason surfaced:
+	// its scope is three empty strings and must not be compared, and it is
+	// never usable as a permissive plan.
+	Reason string `json:"reason,omitempty"`
 }
 
 // The bounds are the resolver's, mirrored here so a malformed plan is refused
@@ -168,10 +214,21 @@ const (
 	maxListEntries   = 64
 	maxEntryBytes    = 64
 	maxSignals       = 16
+	maxNoticeBytes   = 2048
 	maxPlanBytes     = 16 << 10
 )
 
-var versionPattern = regexp.MustCompile(`^[A-Za-z0-9._+-]+$`)
+// ⚠ THE SOLIDUS IS IN THE SET BECAUSE THE RESOLVER SENDS IT. Every version
+// on a real response is `strict-fallback/1`, and this pattern — invented here
+// from the prose rather than read off a response — refused it. The SDK would
+// have rejected every strict-fallback plan the resolver has ever issued as
+// "characters outside the permitted set", which is the whole defect this
+// change exists for, in one regular expression.
+//
+// It stays a closed set rather than becoming permissive: these values are
+// echoed into logs and provenance records, so whitespace, quotes and control
+// characters remain out.
+var versionPattern = regexp.MustCompile(`^[A-Za-z0-9._+/-]+$`)
 
 // ErrPlanAbsent is returned when there is no plan at all to verify. It is
 // separated from a malformed one because the caller's remedy differs: one is a
@@ -208,6 +265,16 @@ func ParsePlan(raw []byte) (Plan, error) {
 	// permissive spelling silently wins. Exact case, no duplicates, or the
 	// plan is unreadable.
 	if err := checkObjectKeys(raw); err != nil {
+		return Plan{}, err
+	}
+	// ⚠ AND EVERY REQUIRED KEY MUST BE PRESENT, which the decode cannot ask.
+	// A missing key decodes to a zero value, and a zero value is a permissive
+	// answer the resolver never sent: an absent `signature` is indistinguishable
+	// from the null one this release requires, an absent `max_age_seconds` is
+	// 0, an absent `flags` is every flag at its zero string. The contract says
+	// every field below is on every response, so an omission is a refusal that
+	// NAMES the key rather than a plan with a hole in it.
+	if err := checkRequiredKeys(raw); err != nil {
 		return Plan{}, err
 	}
 	decoder := json.NewDecoder(strings.NewReader(string(raw)))
@@ -362,18 +429,33 @@ func (p Plan) validate() error {
 	if !p.Regime.known() {
 		return fmt.Errorf("consentpolicy: unknown regime %q", string(p.Regime))
 	}
-	if !p.CrashProfile.known() {
-		return fmt.Errorf("consentpolicy: unknown crash_profile %q", string(p.CrashProfile))
+	if !p.Flags.CrashProfile.known() {
+		return fmt.Errorf("consentpolicy: unknown flags.crash_profile %q", string(p.Flags.CrashProfile))
 	}
-	if !p.ServerAnalytics.known() {
-		return fmt.Errorf("consentpolicy: unknown server_analytics %q", string(p.ServerAnalytics))
+	if !p.Flags.ServerAnalytics.known() {
+		return fmt.Errorf("consentpolicy: unknown flags.server_analytics %q", string(p.Flags.ServerAnalytics))
 	}
-	if !p.Scope.complete() {
+	if !p.Flags.ChildRules.known() {
+		return fmt.Errorf("consentpolicy: unknown flags.child_rules %q", string(p.Flags.ChildRules))
+	}
+	if !p.Basis.Character.known() {
+		return fmt.Errorf("consentpolicy: unknown basis.character %q", string(p.Basis.Character))
+	}
+	if !p.Basis.TableProvenance.known() {
+		return fmt.Errorf("consentpolicy: unknown basis.table_provenance %q", string(p.Basis.TableProvenance))
+	}
+	if p.Basis.Notice == "" || len(p.Basis.Notice) > maxNoticeBytes {
+		return fmt.Errorf("consentpolicy: basis.notice is empty or over the %d-byte bound", maxNoticeBytes)
+	}
+	// ⚠ A REFUSAL CARRIES THREE EMPTY SCOPE STRINGS BY CONTRACT, so
+	// completeness is asked only of a body that is not one. Requiring it
+	// unconditionally made every refusal the resolver sends unparseable —
+	// reported as `plan_unreadable`, which says "I could not read the answer"
+	// when the truth is "the answer was a refusal, and here is why". The KEYS
+	// are still required on both: the required-key walk runs before this and
+	// does not care what the values are.
+	if p.Reason == "" && !p.Scope.complete() {
 		return errors.New("consentpolicy: the plan names no complete scope tuple")
-	}
-	// The objection requirement is a REQUIRED scalar: absent is not false.
-	if p.ObjectionRequired == nil {
-		return errors.New("consentpolicy: the plan does not state server_analytics_objection_required")
 	}
 	for _, field := range []struct {
 		name  string
@@ -382,6 +464,8 @@ func (p Plan) validate() error {
 	}{
 		{"policy_version", p.PolicyVersion, maxVersionBytes},
 		{"consent_text_version", p.ConsentTextVersion, maxVersionBytes},
+		{"band_vocabulary", p.BandVocabulary, maxBandBytes},
+		{"band_vocabulary_version", p.BandVocabularyVersion, maxBandBytes},
 	} {
 		if field.value == "" {
 			return fmt.Errorf("consentpolicy: %s is empty", field.name)
@@ -398,12 +482,6 @@ func (p Plan) validate() error {
 	// of the requested locale, so it is bounded but not pattern-matched to one.
 	if p.PresentedLanguage == "" || len(p.PresentedLanguage) > maxLanguageBytes {
 		return fmt.Errorf("consentpolicy: presented_language is empty or over the %d-byte bound", maxLanguageBytes)
-	}
-	if p.AgeBand != nil {
-		if p.AgeBand.Vocabulary == "" || len(p.AgeBand.Vocabulary) > maxBandBytes ||
-			p.AgeBand.Band == "" || len(p.AgeBand.Band) > maxBandBytes {
-			return errors.New("consentpolicy: the age band is empty or over its bound")
-		}
 	}
 	if len(p.SignalsUsed) > maxSignals {
 		return fmt.Errorf("consentpolicy: %d signals, over the %d bound", len(p.SignalsUsed), maxSignals)
@@ -431,8 +509,7 @@ func (p Plan) validate() error {
 		name    string
 		entries []string
 	}{
-		{"prohibited_purposes", p.ProhibitedPurposes},
-		{"operation_blocks", p.OperationBlocks},
+		{"flags.operation_blocks", p.Flags.OperationBlocks},
 	} {
 		if len(list.entries) > maxListEntries {
 			return fmt.Errorf("consentpolicy: %s has %d entries, over the %d bound",
@@ -472,4 +549,103 @@ func (p Plan) expiry() (time.Time, error) {
 		return time.Time{}, fmt.Errorf("consentpolicy: expires_at is not an RFC 3339 instant: %w", err)
 	}
 	return parsed.UTC(), nil
+}
+
+// requiredKeys maps every struct type reachable from Plan to the schema
+// spellings that must be PRESENT on the wire.
+//
+// ⚠ DERIVED FROM THE TAGS, AND `omitempty` IS THE MARKER. Every field the
+// resolver sends on every response is required; the one field that is present
+// only sometimes — `reason`, the refusal discriminator — carries `omitempty`
+// and is the only optional entry. So a field added to Plan is required by
+// default, which is the direction that fails closed, and making one optional
+// takes a deliberate tag rather than a forgotten line in a list.
+var requiredKeys = buildRequiredKeys(reflect.TypeOf(Plan{}))
+
+func buildRequiredKeys(root reflect.Type) map[reflect.Type]map[string]struct{} {
+	out := make(map[reflect.Type]map[string]struct{})
+	var walk func(t reflect.Type)
+	walk = func(t reflect.Type) {
+		for t.Kind() == reflect.Pointer || t.Kind() == reflect.Slice {
+			t = t.Elem()
+		}
+		if t.Kind() != reflect.Struct {
+			return
+		}
+		if _, done := out[t]; done {
+			return
+		}
+		names := make(map[string]struct{})
+		out[t] = names
+		for i := 0; i < t.NumField(); i++ {
+			field := t.Field(i)
+			tag := field.Tag.Get("json")
+			if tag == "" || tag == "-" {
+				continue
+			}
+			parts := strings.Split(tag, ",")
+			optional := false
+			for _, opt := range parts[1:] {
+				if opt == "omitempty" {
+					optional = true
+				}
+			}
+			if !optional {
+				names[parts[0]] = struct{}{}
+			}
+			walk(field.Type)
+		}
+	}
+	walk(root)
+	return out
+}
+
+// checkRequiredKeys refuses a body that omits any required key, naming it.
+func checkRequiredKeys(raw []byte) error {
+	return requiredKeysIn(raw, reflect.TypeOf(Plan{}), "")
+}
+
+func requiredKeysIn(raw []byte, t reflect.Type, where string) error {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t.Kind() == reflect.Slice {
+		var elements []json.RawMessage
+		if err := json.Unmarshal(raw, &elements); err != nil {
+			return nil // shape errors are the decode's to report
+		}
+		for i, element := range elements {
+			if err := requiredKeysIn(element, t.Elem(), fmt.Sprintf("%s[%d]", where, i)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if t.Kind() != reflect.Struct {
+		return nil
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		return nil
+	}
+	for name := range requiredKeys[t] {
+		if _, present := object[name]; !present {
+			return fmt.Errorf("consentpolicy: the plan omits the required key %q", strings.TrimPrefix(where+"."+name, "."))
+		}
+	}
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		tag := strings.Split(field.Tag.Get("json"), ",")[0]
+		if tag == "" || tag == "-" {
+			continue
+		}
+		value, present := object[tag]
+		if !present || string(value) == "null" {
+			continue
+		}
+		if err := requiredKeysIn(value, field.Type, strings.TrimPrefix(where+"."+tag, ".")); err != nil {
+			return err
+		}
+	}
+	return nil
 }

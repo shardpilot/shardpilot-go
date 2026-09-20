@@ -49,6 +49,13 @@ const (
 	// say different things to an operator reading a log, and both refuse.
 	ReasonPlanUnsigned    Reason = "plan_unsigned"
 	ReasonCallerCancelled Reason = "caller_cancelled"
+	// ReasonResolverRefused: the body IS a refusal — it carries the resolver's
+	// own `reason`, which is the discriminator the wire uses. It is kept
+	// separate from plan_unreadable because the body was perfectly readable:
+	// the resolver answered, and what it answered was no. A caller reading a
+	// log needs to tell "I could not parse the answer" from "the answer was a
+	// refusal, and here is why".
+	ReasonResolverRefused Reason = "resolver_refused"
 )
 
 // Decision is the verdict for one actor's operation.
@@ -67,8 +74,6 @@ type Decision struct {
 	// regime is the effective class AFTER the fallback. A fallback never
 	// yields SOFT_OPT_OUT. Read it through Regime().
 	regime Regime
-	// optionalProcessingClosed: see OptionalProcessingClosed().
-	optionalProcessingClosed bool
 	// Reason names why a fallback happened; empty when the plan was used.
 	Reason Reason
 	// Detail carries the parser's own message when there is one. It is for an
@@ -107,21 +112,6 @@ func (d Decision) Regime() Regime {
 	return d.regime
 }
 
-// OptionalProcessingClosed reports whether the REGIME ITSELF closes optional
-// processing, and it is true for every fallback and for the zero Decision.
-//
-// ⚠ FALSE IS NOT PERMISSION. It means only that the regime is not what closed
-// the door. SOFT still waits for the final notice barrier and for successful
-// backend admission bound to the scoped player session, purpose, version and
-// lease — none of which this package knows about. A caller that treats false
-// as "admit" has skipped the authority that actually decides.
-func (d Decision) OptionalProcessingClosed() bool {
-	if !d.planUsed {
-		return true
-	}
-	return d.optionalProcessingClosed
-}
-
 // Plan returns a COPY of the verified plan, or the zero value when none was
 // used. Every slice in it is copied too, so a caller cannot reach back into
 // the verdict through one.
@@ -142,8 +132,7 @@ func (d Decision) Plan() (Plan, bool) {
 // verdict. Every pointer in the plan is copied by value, not by address.
 func clonePlan(p Plan) Plan {
 	out := p
-	out.ProhibitedPurposes = append([]string(nil), p.ProhibitedPurposes...)
-	out.OperationBlocks = append([]string(nil), p.OperationBlocks...)
+	out.Flags.OperationBlocks = append([]string(nil), p.Flags.OperationBlocks...)
 	out.SignalsUsed = append([]Signal(nil), p.SignalsUsed...)
 	for i := range out.SignalsUsed {
 		if out.SignalsUsed[i].Available != nil {
@@ -151,17 +140,13 @@ func clonePlan(p Plan) Plan {
 			out.SignalsUsed[i].Available = &available
 		}
 	}
-	if p.AgeBand != nil {
-		band := *p.AgeBand
-		out.AgeBand = &band
-	}
-	if p.ObjectionRequired != nil {
-		required := *p.ObjectionRequired
-		out.ObjectionRequired = &required
-	}
 	if p.MaxAgeSeconds != nil {
 		seconds := *p.MaxAgeSeconds
 		out.MaxAgeSeconds = &seconds
+	}
+	if p.Signature != nil {
+		signature := *p.Signature
+		out.Signature = &signature
 	}
 	return out
 }
@@ -184,10 +169,9 @@ const verificationKeyAvailable = false
 // invent a partial permissive one.
 func strictFallback(reason Reason, detail string) Decision {
 	return Decision{
-		regime:                   StrictOptIn,
-		optionalProcessingClosed: true,
-		Reason:                   reason,
-		Detail:                   detail,
+		regime: StrictOptIn,
+		Reason: reason,
+		Detail: detail,
 	}
 }
 
@@ -219,6 +203,25 @@ func Prepare(ctx context.Context, policy VerifiedPlayerPolicy) Decision {
 		}
 		return strictFallback(ReasonPlanUnreadable, err.Error())
 	}
+	// ⚠ A BODY CARRYING A REASON IS A REFUSAL, AND IT IS ANSWERED BEFORE THE
+	// SCOPE COMPARISON — which is the ordering bug this line was written to
+	// fix rather than describe. A refusal's scope is THREE EMPTY STRINGS, so
+	// comparing it against the caller's real tuple always mismatches: every
+	// refusal came back `scope_mismatch`, and `resolver_refused` was a reason
+	// the package could never actually produce. The verdict was right by
+	// accident — both close — but the operator was told the wrong thing, and a
+	// "the plan is scoped to another app" line while the resolver was in fact
+	// answering `invalid_scope` sends whoever reads it hunting a tenant bug
+	// that does not exist.
+	//
+	// STATUS IS NOT THE DISCRIMINATOR — four reasons answer 400 and
+	// policy_unavailable answers 200, so the presence of this key is the only
+	// thing that separates a refusal from a plan. A refusal is the strict
+	// fallback with the reason surfaced; it is never usable as a permissive
+	// plan, and nothing below this line reads one.
+	if plan.Reason != "" {
+		return strictFallback(ReasonResolverRefused, "the resolver refused: "+plan.Reason)
+	}
 	if !plan.Scope.equal(policy.Scope) {
 		// Said without echoing the plan's scope: a mismatch is an operator
 		// fact, and reflecting another tenant's ids into this caller's log is
@@ -229,7 +232,14 @@ func Prepare(ctx context.Context, policy VerifiedPlayerPolicy) Decision {
 	// one is PRESENT, this SDK cannot verify it yet — and an unverifiable
 	// signature is exactly the case that must not admit. Silently ignoring it
 	// would make the field's arrival a downgrade.
-	if plan.Signature != "" {
+	// ⚠ PRESENT-NULL IS THE ONLY ADMISSIBLE STATE, and the pointer is how the
+	// two cases are told apart. The key is on every response; its value is null
+	// while no signature exists. A NON-NULL signature is one this build cannot
+	// verify, and an unverifiable signature is exactly the case that must not
+	// admit — ignoring it would make the field's arrival a downgrade. An ABSENT
+	// key never reaches here: the required-key walk in ParsePlan refuses it,
+	// which a pointer alone could not distinguish from null.
+	if plan.Signature != nil {
 		return strictFallback(ReasonSignatureUnverified,
 			"the plan carries a signature this build cannot verify")
 	}
@@ -288,6 +298,5 @@ func decisionFromPlan(plan Plan) Decision {
 	// STRICT waits for an explicit grant and UNKNOWN was never classified, so
 	// both close it here. SOFT leaves it open in the REGIME's sense only — see
 	// the field's contract; it is not an admission.
-	decision.optionalProcessingClosed = plan.Regime != SoftOptOut
 	return decision
 }
