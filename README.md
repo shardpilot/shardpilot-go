@@ -27,10 +27,12 @@ Real, tested, working code — **early alpha**. The API is pre-v1 and may change
 Install the latest tagged release:
 
 ```bash
-go get github.com/shardpilot/shardpilot-go@v0.6.3-alpha
+go get github.com/shardpilot/shardpilot-go@v0.6.4-alpha
 ```
 
-`v0.6.3-alpha` is the latest tag. The owner creates it after the release PR merges; until then this pin is pending, so wait if it does not resolve.
+`v0.6.4-alpha` is the latest tag. The owner creates it after the release PR merges; until then this pin is pending, so wait if it does not resolve.
+
+**Breaking change for `pkg/consentpolicy` callers:** this release reads the resolver's nested wire contract and withdraws the old closed-choice and purpose APIs. Follow the [three-step migration](CHANGELOG.md#migration-from-v063-alpha) before upgrading from `v0.6.3-alpha`. Strict fallback still means asking with the choice defaulted off; an explicit grant under it remains valid, subject to the host's admission rules.
 
 This release includes the changes summarized in [CHANGELOG.md](CHANGELOG.md), including the previously unrecorded `v0.6.2-alpha` release. `v0.6.0-alpha` shipped the optional pseudonymous actor key on crash reports — `Event.AnonymousID`, the ONLY field the service keys the actor on, with `Event.SessionID` alongside it as session linkage that is never used as the actor key (both `omitempty`, so a client that does not opt in keeps a byte-identical wire shape) — the dark opt-in experiment-assignment consumer with consent-gated exposure/outcome producers, the dark opt-in remote-config targeting-attribute pass-through, the phase-D crash capture opt-ins (self-module debug-id fill and all-goroutine threads), and the opt-in client-side consent floor (`Config.ConsentFloor`), on top of the v0.5.0-alpha remote config client, disk spool, schema-revision declaration and full-jitter retry backoff documented in this README. **Do not pin an earlier tag.** Two tags — `v0.5.0-alpha` and `v0.6.0-alpha` — distribute eight internal agent-skill files through `go get`; `v0.6.1-alpha` is the deletion-only patch that removes them. Tags at `v0.4.0-alpha` and below predate those files and do not carry them, but they also predate most of what this README documents. If you need a release without the features listed above, wait for one cut from the cleaned tree rather than reaching back.
 

@@ -5,7 +5,7 @@ description: Use when integrating the ShardPilot Go SDK (shardpilot-go) into a G
 
 # Integrating the ShardPilot Go SDK
 
-The pinned release tag `v0.6.3-alpha` matches this guide; the owner creates it after the release PR merges, so wait if the install pin is still pending.
+The pinned release tag `v0.6.4-alpha` matches this guide; the owner creates it after the release PR merges, so wait if the install pin is still pending.
 The release includes compression, the 15-second flush default, independent retry pacing, goroutine-label sanitization and rejection history. Where the SDK does not have a capability, this skill says so.
 
 **SCOPE: the DEFAULT configuration.** `v0.6.0-alpha` added three opt-ins that
@@ -55,7 +55,7 @@ other calls, no automatic actions.
 ## Install
 
 ```bash
-go get github.com/shardpilot/shardpilot-go@v0.6.3-alpha
+go get github.com/shardpilot/shardpilot-go@v0.6.4-alpha
 ```
 
 - Requires **Go 1.25+** at the pinned tag.
@@ -86,6 +86,22 @@ go get github.com/shardpilot/shardpilot-go@v0.6.3-alpha
   still bounded by the SOONER of `HTTPTimeout` and your context deadline, and
   remote-config fetches still refuse to follow redirects (the SDK derives that
   client from yours with `CheckRedirect` pinned, sharing Transport and Jar).
+
+## Consent-policy handoff
+
+`v0.6.4-alpha` breaks the `pkg/consentpolicy` API introduced in `v0.6.3-alpha`.
+Follow the [migration note](../../../CHANGELOG.md#migration-from-v063-alpha):
+flags are nested, the old closed-choice and purpose getters are withdrawn,
+and the resolver's complete body is required, including `signature: null`.
+Use `AnalyticsChoiceDefault()` and `ExplicitGrantRequired()` for the choice:
+strict fallback means ask with the choice defaulted off, and an explicit grant
+under that fallback remains valid. The host still owns admission; this package
+does not fetch a plan, grant consent or authorize ingestion.
+
+No signature verification is available, so `Prepare` uses no plan and
+`PlanUsed()` is always false. Its operation checks therefore report blocked;
+asking for consent does not override them. `SOFT_OPT_OUT` and non-empty
+`operation_blocks` are unreachable with the resolver's first release.
 
 ## Credentials
 
@@ -587,15 +603,17 @@ Run against your dev/staging deployment credentials, then check each item:
    shutdown, and that `Close` returns `nil` (pending events + consent
    receipts flushed within the deadline).
 
-## Known limitations (verified 2026-09-18 for `v0.6.3-alpha`)
+## Known limitations (verified 2026-09-21 for `v0.6.4-alpha`)
 
 **Same scope as the consent section: these describe the DEFAULT posture,
 with `Config.ConsentFloor` nil.** Several of the consent-related bullets
 below do not hold with the floor enabled — its contract is the
 `Config.ConsentFloor` godoc, not this list.
 
-All nine bullets were re-verified against SDK source at `5cdad923`, the
-runtime source for this release. `Config.ConsentFloor` was introduced in
+All nine bullets were verified against SDK source at `5cdad923` on
+2026-09-18; the analytics and crash source behind them is unchanged at this
+release's runtime commit `04e0b0a0`. The consent-policy changes and limits are
+documented separately above. `Config.ConsentFloor` was introduced in
 `v0.6.0-alpha` and applies to the analytics client, not `pkg/crash`.
 Server permission requirements and deployment enablement are qualified
 below: this source review does not establish the deployed server's state.

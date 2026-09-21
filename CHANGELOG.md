@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+## v0.6.4-alpha — 2026-09-21 — BREAKING: consent-policy wire contract and caller API
+
+- Release the `pkg/consentpolicy` changes in [#117](https://github.com/shardpilot/shardpilot-go/pull/117), merged as `04e0b0a065ba8c3e0057ee906656dbbb898f6430`. Callers of the withdrawn API from `v0.6.3-alpha` must migrate before upgrading.
+- Read the resolver's nested `flags` and lower-case flag values (`off`, `denied`, `minimised`); `regime` remains upper case. All required contract keys must be present at every depth; the top-level `reason` appears only on a refusal. Only `signature` may be null: the initial contract sends `signature: null`, including on refusals. `operation_blocks` is a required array inside `flags`, with `[]` for no entries. Version strings now accept the contract's `strict-fallback/1` spelling.
+  Separately, `signals_used[].reason` is required whenever a signal is unavailable, even in a resolved plan, and uses the closed vocabulary `source_not_permitted`, `source_unavailable`, or `not_enabled_in_release`.
+- Recognize a refusal by the top-level `reason`, before comparing its empty scope tuple with the caller's scope; return `ReasonResolverRefused` instead of misreporting it as a scope mismatch. HTTP status alone is not the discriminator. Known empty operation lists retain a non-nil empty slice; an unused plan still returns `(nil, false)` from `OperationBlocks()` and blocks every operation through `OperationBlocked()`.
+- **STRICT means ask**, with the optional-analytics choice defaulted off and an explicit grant required. A grant under a fallback remains valid. The policy decision is not an ingest authorization: the host still combines it with the scoped actor's choices, retained floors, age evidence and its admission rules. The package does not fetch a plan or change analytics consent.
+- Vendor the resolver's golden bodies in wire and indented review forms. `TestTheReviewFormsCompactToTheWireBytes` removes only insignificant whitespace outside strings and requires byte equality; omission and whitespace scenes exercise the recorded nested keys and both representations.
+
+### Migration from `v0.6.3-alpha`
+
+1. Replace flat plan flags with `Plan.Flags`, use the lower-case constants, and pass the complete resolver body, including `signature: null` and `flags.operation_blocks: []`; stop supplying the withdrawn `age_band`, `prohibited_purposes` and `server_analytics_objection_required` fields.
+2. Replace `OptionalProcessingClosed()` / `AnalyticsClosed()` with `AnalyticsChoiceDefault()` and `ExplicitGrantRequired()` when presenting the choice; replace `CrashClosed()` with `CrashProfileOffered()` and read `ServerAnalytics()` instead of `ServerAnalyticsBasis()`.
+3. Remove calls to `ProhibitedPurposes()` / `PurposeProhibited()` and the old objection requirement; these have no replacement in this contract. Keep host admission checks, and use `OperationBlocked()` or the `known` result of `OperationBlocks()` for operation restrictions; a fallback never supplies a known empty restriction list.
+
+### Known limits
+
+- `SOFT_OPT_OUT` and non-empty `operation_blocks` are unreachable with the resolver's first release. Parser support is not evidence that either can be issued by that release.
+- There is no signature verification yet. `Prepare` uses no plan, including a well-formed unsigned plan: `PlanUsed()` stays false, the analytics choice defaults off with an explicit grant required, no crash profile is offered, server analytics is denied, child rules apply and every operation reports blocked. Asking for a choice does not override an operation block or independently authorize ingestion.
+- JSON escape-level unpaired surrogates and out-of-range RFC 3339 zone offsets retain the validation limits recorded in `v0.6.3-alpha`; rejecting them remains required before a later verifier can use authenticated plans.
+
 ## v0.6.3-alpha — 2026-09-18 — consent-regime plan verifier (release 1), unsigned plans never used
 
 - `v0.6.2-alpha` was tagged on 2026-09-18 without a release entry; this section covers both tags, including the SDK evidence sender, controlled-crash rehearsal (#114), typed purchase/economy events, rejection history, compression, retry/flush pacing and consent/spool repairs since `v0.6.1-alpha`.
