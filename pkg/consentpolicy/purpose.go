@@ -5,124 +5,136 @@ package consentpolicy
 // a single winner would let one lane's permission speak for another's, which is
 // precisely what the orthogonal flags exist to prevent.
 
-// AnalyticsClosed reports whether optional device/client analytics is closed by
-// this verdict. It is the same question OptionalProcessingClosed answers, named
-// for the purpose so a caller reading one lane does not have to know that.
-// ⚠ AND IT FAILS CLOSED ON A ZERO VALUE, which the first cut did not. A
-// `var d Decision` — a caller's uninitialised struct, a map miss, a decoded
-// nothing — has OptionalProcessingClosed false, so this reported analytics as
-// OPEN for a decision nobody ever made. The crash and server-analytics helpers
-// already keyed off PlanUsed; this one did not, and the one that did not was
-// the analytics lane.
-func (d Decision) AnalyticsClosed() bool {
+// ChoiceDefault is which way the optional-analytics choice is pre-set when the
+// host asks. It is not whether the host asks.
+type ChoiceDefault string
+
+const (
+	ChoiceDefaultOff ChoiceDefault = "off"
+	ChoiceDefaultOn  ChoiceDefault = "on"
+)
+
+// ⚠ WHAT THE REGIME DECIDES IS THE DEFAULT OF THE CHOICE, NOT WHETHER A CHOICE
+// EXISTS — and this package said the opposite.
+//
+// It reported `OptionalProcessingClosed`, and `AnalyticsClosed` beside it, with
+// documentation telling a host that a closed lane meant nothing was asked. The
+// resolver answers STRICT_OPT_IN to every request in this release, so a host
+// following that reading would never ask anyone and never start analytics, for
+// every customer in every country. That is not the strict regime; it is no
+// product. Both methods are gone rather than renamed, because a caller who kept
+// compiling against the old name would keep the old meaning.
+//
+// STRICT means: ASK, with the choice defaulted OFF, and start the optional lane
+// only on an explicit grant. SOFT means a prominent purpose notice, the choice
+// defaulted ON, and one-tap off on the same screen. The difference is the
+// default and the basis it is recorded under — and a grant given under a
+// fallback is a valid grant, not a void one.
+
+// AnalyticsChoiceDefault reports how the optional device/client analytics
+// choice is pre-set. A verdict that used no plan defaults OFF, like STRICT.
+func (d Decision) AnalyticsChoiceDefault() ChoiceDefault {
+	if !d.planUsed || d.plan.Regime != SoftOptOut {
+		return ChoiceDefaultOff
+	}
+	return ChoiceDefaultOn
+}
+
+// ExplicitGrantRequired reports whether the optional lane may start only on an
+// explicit grant. True for every fallback and for the zero Decision.
+//
+// ⚠ FALSE IS NOT PERMISSION. It means only that the regime does not itself
+// require the grant. The final notice barrier and backend admission bound to
+// the scoped session, purpose, version and lease all still apply, and this
+// package knows about none of them.
+func (d Decision) ExplicitGrantRequired() bool {
 	if !d.planUsed {
 		return true
 	}
-	return d.optionalProcessingClosed
+	return d.plan.Regime != SoftOptOut
 }
 
-// CrashClosed reports whether the crash lane is closed.
+// CrashProfileOffered reports which crash profile, if any, the plan approves.
 //
-// ⚠ IT DOES NOT INHERIT THE ANALYTICS ANSWER, IN EITHER DIRECTION. The crash
-// profile has its own initial on/off rule; the platform decision is that crash
-// reports for minors are off, with under-threshold clients not initialising the
-// crash reporter at all — so this is read BEFORE a crash client exists.
-// A fallback closes it; so does an absent or OFF profile. Device analytics
-// being off does not by itself close a permitted crash lane, and analytics
-// being open does not open this one.
-func (d Decision) CrashClosed() bool {
+// ⚠ `off` MEANS NO APPROVED CRASH PROFILE IS OFFERED. It does not amend a
+// host's separately reviewed crash gate: a host whose own review permits crash
+// reporting is not overridden by this, and a host without one does not acquire
+// permission from it. A fallback offers nothing.
+func (d Decision) CrashProfileOffered() (CrashProfile, bool) {
+	if !d.planUsed {
+		return CrashOff, false
+	}
+	return d.plan.Flags.CrashProfile, true
+}
+
+// ServerAnalytics reports the backend lane's state. A fallback is denied.
+//
+// The objection requirement that used to ride beside this value is gone with
+// the field it read: `server_analytics_objection_required` is not on the wire
+// in this release, and a getter for a field the server never sends is a
+// promise this package cannot keep. It returns with the field.
+func (d Decision) ServerAnalytics() ServerAnalyticsState {
+	if !d.planUsed {
+		return ServerAnalyticsDenied
+	}
+	return d.plan.Flags.ServerAnalytics
+}
+
+// ChildRulesApplied reports whether minimised child handling applies.
+// A fallback applies it.
+func (d Decision) ChildRulesApplied() bool {
 	if !d.planUsed {
 		return true
 	}
-	return d.plan.CrashProfile != CrashMinimal
+	return d.plan.Flags.ChildRules == ChildRulesMinimised
 }
 
-// ServerAnalyticsBasis reports the backend lane's state and whether an
-// objection requirement applies.
+// ⚠ THE LIST GETTER RETURNS A SECOND VALUE, AND THAT IS THE WHOLE POINT.
 //
-// ⚠ THERE IS NO TOGGLE HERE, AND THAT IS AN OWNER DECISION, NOT AN OMISSION.
-// The in-game privacy rows for it were withdrawn: the objection route is manual
-// — the rights page form or the privacy address — answered and executed within
-// one month. So a caller honours the requirement out of band; nothing in this
-// SDK can record or satisfy it.
-//
-// A fallback is DENIED with the requirement standing: missing lookup evidence
-// is not a non-consent authorization.
-func (d Decision) ServerAnalyticsBasis() (ServerAnalyticsState, bool) {
-	if !d.planUsed || d.plan.ObjectionRequired == nil {
-		return ServerAnalyticsDenied, true
-	}
-	return d.plan.ServerAnalytics, *d.plan.ObjectionRequired
-}
-
-// ⚠ THE TWO LIST GETTERS RETURN A SECOND VALUE, AND THAT IS THE WHOLE POINT.
-//
-// They used to return a bare []string, nil on a fallback, with a comment
-// asking the caller not to read an empty list as "nothing is prohibited". A
-// comment is not a type. `len(d.ProhibitedPurposes()) == 0` compiled, read
-// naturally, and meant the opposite of the truth: a verdict that knows nothing
-// restricts EVERYTHING, not nothing. The second value does not compile away —
-// a caller cannot call len() on a two-value expression — so the case has to be
-// handled rather than remembered.
+// It used to return a bare []string, nil on a fallback, with a comment asking
+// the caller not to read an empty list as "nothing is blocked". A comment is
+// not a type. `len(d.OperationBlocks()) == 0` compiled, read naturally, and
+// meant the opposite of the truth: a verdict that knows nothing blocks
+// EVERYTHING, not nothing. The second value does not compile away — a caller
+// cannot call len() on a two-value expression — so the case has to be handled
+// rather than remembered.
 //
 // known == false means: this verdict used no plan, so the list is empty
-// BECAUSE NOTHING IS KNOWN, and every purpose is prohibited and every
-// operation blocked. Use PurposeProhibited and OperationBlocked for the
-// question a caller actually has; these two exist for a receipt or a log.
-
-// ProhibitedPurposes returns the union the verified plan carries, and whether
-// that list is knowledge at all.
-func (d Decision) ProhibitedPurposes() (purposes []string, known bool) {
-	if !d.planUsed {
-		return nil, false
-	}
-	return append([]string(nil), d.plan.ProhibitedPurposes...), true
-}
-
-// OperationBlocks returns the restrictions that are independent of analytics
-// consent — unresolved localisation, transfer, age/capacity and safety
-// requirements — and whether that list is knowledge at all. A consent toggle
-// cannot remove one of these, and neither can a later grant.
+// BECAUSE NOTHING IS KNOWN, and every operation is blocked. Use
+// OperationBlocked for the per-operation question, which answers that
+// correctly without the caller having to.
 func (d Decision) OperationBlocks() (blocks []string, known bool) {
 	if !d.planUsed {
 		return nil, false
 	}
-	return append([]string(nil), d.plan.OperationBlocks...), true
+	// ⚠ A KNOWN LIST IS NEVER nil, EVEN WHEN IT IS EMPTY, and
+	// append([]string(nil)) returns nil for an empty source — so the resolver's
+	// `[]` came back as the same nil this method returns for "nothing is
+	// known". The second value still told them apart, but a caller who checked
+	// `blocks == nil` instead of reading it got the two opposite meanings
+	// collapsed into one. The distinction belongs in the value as well as in
+	// the flag.
+	out := make([]string, len(d.plan.Flags.OperationBlocks))
+	copy(out, d.plan.Flags.OperationBlocks)
+	return out, true
 }
 
-// PurposeProhibited reports whether this verdict prohibits one named purpose.
-//
-// ⚠ ON A FALLBACK IT IS TRUE FOR EVERY PURPOSE, including one nobody has
-// heard of. A verdict that used no plan is not a verdict that found no
-// restrictions; it is one that established none, and the conservative reading
-// of "I do not know whether this purpose is prohibited" is that it is.
-func (d Decision) PurposeProhibited(purpose string) bool {
-	if !d.planUsed {
-		return true
-	}
-	return contains(d.plan.ProhibitedPurposes, purpose)
-}
-
-// OperationBlocked reports whether this verdict blocks one named operation.
-//
-// ⚠ ON A FALLBACK IT IS TRUE FOR EVERY OPERATION, for the same reason, and it
-// matters more here than anywhere else in this file: these blocks carry the
-// transfer, age/capacity, localisation and safety restrictions that no consent
-// choice can lift. An unauthenticated plan with its operation_blocks stripped
-// would otherwise have read as "nothing is blocked" — which is precisely the
-// forgery this package now refuses to act on at all.
+// OperationBlocked answers the per-operation question, and answers it closed
+// when nothing is known.
 func (d Decision) OperationBlocked(operation string) bool {
 	if !d.planUsed {
 		return true
 	}
-	return contains(d.plan.OperationBlocks, operation)
-}
-
-func contains(entries []string, want string) bool {
-	for _, entry := range entries {
-		if entry == want {
+	for _, blocked := range d.plan.Flags.OperationBlocks {
+		if blocked == operation {
 			return true
 		}
 	}
 	return false
 }
+
+// ProhibitedPurposes and PurposeProhibited are GONE, with the field they read.
+// `prohibited_purposes` is not on the wire in this release; a getter over it
+// answered from a field the resolver never sends, which is worse than not
+// answering. They return in the release that adds the field to the contract,
+// in the server and both SDKs at once.

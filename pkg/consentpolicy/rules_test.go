@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 // ⚠ RULE (a): PER ACTOR, NEVER PER PROCESS. A verdict cached across calls would
@@ -31,8 +30,8 @@ func TestAVerdictIsNeverReusedForAnotherActor(t *testing.T) {
 	if second.PlanUsed() || second.Reason != ReasonPlanAbsent {
 		t.Fatalf("a second actor inherited a verdict: %+v", second)
 	}
-	if !second.OptionalProcessingClosed() {
-		t.Fatal("the second actor must be closed, whatever the first one got")
+	if !second.ExplicitGrantRequired() {
+		t.Fatal("the second actor must require an explicit grant, whatever the first one got")
 	}
 	// And the reverse order, so the scene cannot pass because the cache only
 	// fills on the second call. A third actor with a DIFFERENT malformation
@@ -87,18 +86,25 @@ func TestTheDecisionCannotBecomeAConsentGrant(t *testing.T) {
 	if refused.PlanUsed() || refused.Reason != ReasonPlanUnsigned {
 		t.Fatalf("an unsigned SOFT plan must not be used: %+v", refused)
 	}
-	// The contract that "false is not permission" is asked of the TYPE, since
+	// The contract that "a default is not a grant" is asked of the TYPE, since
 	// the verifier no longer produces such a verdict without a signature. A
-	// decision built with a SOFT plan still reports only a regime, and its
-	// analytics helper still keys off the plan being used.
-	soft := Decision{regime: SoftOptOut, optionalProcessingClosed: false, planUsed: true,
-		plan: Plan{Regime: SoftOptOut}}
-	if soft.AnalyticsClosed() {
-		t.Fatal("with a used SOFT plan the regime is not what closes the door")
+	// SOFT plan pre-sets the choice ON and does not itself require the explicit
+	// grant — and that is still not permission: the notice barrier and the
+	// backend admission bound to the scoped session both stand, and this
+	// package knows about neither.
+	soft := Decision{regime: SoftOptOut, planUsed: true, plan: Plan{Regime: SoftOptOut}}
+	if soft.AnalyticsChoiceDefault() != ChoiceDefaultOn {
+		t.Fatal("a used SOFT plan pre-sets the optional choice ON")
+	}
+	if soft.ExplicitGrantRequired() {
+		t.Fatal("SOFT does not itself require the explicit grant")
 	}
 	zero := Decision{}
-	if !zero.AnalyticsClosed() || !zero.CrashClosed() {
-		t.Fatal("a zero Decision must be closed on every lane")
+	if zero.AnalyticsChoiceDefault() != ChoiceDefaultOff || !zero.ExplicitGrantRequired() {
+		t.Fatal("a zero Decision defaults OFF and requires an explicit grant")
+	}
+	if _, known := zero.CrashProfileOffered(); known {
+		t.Fatal("a zero Decision offers no crash profile")
 	}
 }
 
@@ -116,7 +122,7 @@ func TestNoTrustedClockIsStrict(t *testing.T) {
 }
 
 // ⚠ RULE (d): AN UNVERIFIABLE SIGNATURE IS STRICT. The resolver's initial
-// release reserves the field and sends none; when one arrives, a build that
+// release reserves the field and sends null; when a value arrives, a build that
 // cannot check it must not treat its arrival as a downgrade by ignoring it.
 func TestAnUnverifiableSignatureIsStrict(t *testing.T) {
 	decision := Prepare(context.Background(), VerifiedPlayerPolicy{
@@ -126,7 +132,7 @@ func TestAnUnverifiableSignatureIsStrict(t *testing.T) {
 	if decision.Reason != ReasonSignatureUnverified || decision.Regime() != StrictOptIn {
 		t.Fatalf("%+v", decision)
 	}
-	// The control: the same plan WITHOUT a signature is refused for a
+	// The control: the same plan with the key PRESENT AND NULL is refused for a
 	// DIFFERENT, named reason. Neither is used in this release, so "was it
 	// used" cannot tell them apart — but the two reasons say different things
 	// to an operator ("someone sent us a signature we cannot check" is not
@@ -134,7 +140,7 @@ func TestAnUnverifiableSignatureIsStrict(t *testing.T) {
 	if got := Prepare(context.Background(), VerifiedPlayerPolicy{
 		Plan: validPlan(nil), Scope: callerScope(), Now: fixedClock(),
 	}); got.Reason != ReasonPlanUnsigned {
-		t.Fatalf("the unsigned control must be refused as unsigned, not as unverifiable: %+v", got)
+		t.Fatalf("the null-signature control must be refused as unsigned, not as unverifiable: %+v", got)
 	}
 }
 
@@ -145,77 +151,92 @@ func TestTheCrashLaneIsItsOwnDecision(t *testing.T) {
 	// ⚠ AN UNSIGNED PLAN MAY NOT PERMIT THE CRASH LANE AT ALL in this release,
 	// so the end-to-end question is now "is it refused?" — and it is.
 	refused := Prepare(context.Background(), VerifiedPlayerPolicy{
-		Plan:  validPlan(func(m map[string]any) { m["crash_profile"] = string(CrashMinimal) }),
+		Plan:  validPlan(withFlag("crash_profile", string(CrashMinimalDiagnosticsForMinors))),
 		Scope: callerScope(), Now: fixedClock(),
 	})
 	if refused.PlanUsed() || refused.Reason != ReasonPlanUnsigned {
 		t.Fatalf("an unsigned crash-minimal plan must not be used: %+v", refused)
 	}
-	if !refused.CrashClosed() || !refused.AnalyticsClosed() {
-		t.Fatal("a refused plan closes both lanes")
+	if profile, known := refused.CrashProfileOffered(); known || profile != CrashOff {
+		t.Fatalf("a refused plan offers no crash profile, got %q/%v", profile, known)
+	}
+	if refused.AnalyticsChoiceDefault() != ChoiceDefaultOff {
+		t.Fatal("a refused plan defaults the analytics choice OFF")
 	}
 
 	// The INDEPENDENCE of the two lanes is a property of the helpers, and it is
 	// asked of them directly — it becomes reachable end to end in the release
 	// that verifies signatures, and this is where a regression would show
 	// before then.
-	strictWithCrashOn := Decision{regime: StrictOptIn, optionalProcessingClosed: true, planUsed: true,
-		plan: Plan{Regime: StrictOptIn, CrashProfile: CrashMinimal}}
-	if !strictWithCrashOn.AnalyticsClosed() {
-		t.Fatal("analytics is still closed under STRICT")
+	strictWithCrashOn := Decision{regime: StrictOptIn, planUsed: true, plan: Plan{
+		Regime: StrictOptIn, Flags: Flags{CrashProfile: CrashMinimalDiagnosticsForMinors}}}
+	if strictWithCrashOn.AnalyticsChoiceDefault() != ChoiceDefaultOff {
+		t.Fatal("the analytics choice still defaults OFF under STRICT")
 	}
-	if strictWithCrashOn.CrashClosed() {
-		t.Fatal("a permitted crash profile is not closed by analytics being off")
+	if profile, known := strictWithCrashOn.CrashProfileOffered(); !known || profile != CrashMinimalDiagnosticsForMinors {
+		t.Fatalf("a permitted crash profile is not withdrawn by the analytics default, got %q/%v", profile, known)
 	}
-	softWithCrashOff := Decision{regime: SoftOptOut, optionalProcessingClosed: false, planUsed: true,
-		plan: Plan{Regime: SoftOptOut, CrashProfile: CrashOff}}
-	if !softWithCrashOff.CrashClosed() {
-		t.Fatal("an OFF crash profile is not opened by the analytics regime")
+	softWithCrashOff := Decision{regime: SoftOptOut, planUsed: true, plan: Plan{
+		Regime: SoftOptOut, Flags: Flags{CrashProfile: CrashOff}}}
+	if profile, known := softWithCrashOff.CrashProfileOffered(); !known || profile != CrashOff {
+		t.Fatalf("an off crash profile is not opened by the analytics regime, got %q/%v", profile, known)
 	}
 }
 
-// The objection route is manual and there is no in-game toggle, so
-// the SDK reports a basis and a requirement and can neither record nor satisfy
-// it. A fallback is DENIED with the requirement standing.
-func TestServerAnalyticsIsABasisNotAToggle(t *testing.T) {
-	// Eligible is permissive, so an UNSIGNED plan carrying it is refused.
-	refused := Prepare(context.Background(), VerifiedPlayerPolicy{
-		Plan: validPlan(func(m map[string]any) {
-			m["server_analytics"] = string(ServerAnalyticsEligible)
-		}),
+// ⚠ THE BACKEND LANE IS A STATE, NOT A TOGGLE, AND THE OBJECTION REQUIREMENT
+// THAT USED TO RIDE BESIDE IT IS GONE WITH ITS FIELD.
+//
+// `server_analytics_objection_required` is not on the wire in this release —
+// it was read at the top level, from a key the resolver has never sent, so the
+// getter answered from a decoded zero value. A getter over a field the server
+// does not send is a promise this package cannot keep, so it returns with the
+// field rather than being renamed.
+func TestServerAnalyticsIsAStateNotAToggle(t *testing.T) {
+	// `denied` is the only value in this release's vocabulary, so a plan
+	// carrying anything else does not parse — which is itself the guard
+	// against a permissive value being invented locally.
+	unreadable := Prepare(context.Background(), VerifiedPlayerPolicy{
+		Plan:  validPlan(withFlag("server_analytics", "eligible")),
 		Scope: callerScope(), Now: fixedClock(),
 	})
-	if refused.PlanUsed() || refused.Reason != ReasonPlanUnsigned {
-		t.Fatalf("an unsigned eligible plan must not be used: %+v", refused)
+	if unreadable.Reason != ReasonPlanUnreadable {
+		t.Fatalf("a value outside the vocabulary must not parse: %+v", unreadable)
 	}
+	// A fallback is denied.
+	if state := Prepare(context.Background(), VerifiedPlayerPolicy{
+		Scope: callerScope(), Now: fixedClock(),
+	}).ServerAnalytics(); state != ServerAnalyticsDenied {
+		t.Fatalf("a fallback must be denied, got %q", state)
+	}
+	// And a USED plan reports the state from the nested flags rather than from
+	// a top-level field that no longer exists.
+	used := verifiedVerdict(t, validPlan(nil))
+	if state := used.ServerAnalytics(); state != ServerAnalyticsDenied {
+		t.Fatalf("the plan's own flags.server_analytics must reach the verdict, got %q", state)
+	}
+	// The withdrawn getters are gone from the surface, not renamed: a caller
+	// who kept compiling against the old name would keep the old meaning.
+	assertNoSuchMethods(t, "OptionalProcessingClosed", "AnalyticsClosed", "CrashClosed",
+		"ServerAnalyticsBasis", "ProhibitedPurposes", "PurposeProhibited")
+}
 
-	// The basis/requirement SHAPE, asked of the helper: there is no toggle, and
-	// a fallback is DENIED with the requirement standing.
-	required := true
-	eligible := Decision{planUsed: true, plan: Plan{
-		ServerAnalytics: ServerAnalyticsEligible, ObjectionRequired: &required}}
-	state, objection := eligible.ServerAnalyticsBasis()
-	if state != ServerAnalyticsEligible || !objection {
-		t.Fatalf("state=%q objection=%v", state, objection)
-	}
-	state, objection = Prepare(context.Background(), VerifiedPlayerPolicy{Scope: callerScope(), Now: fixedClock()}).ServerAnalyticsBasis()
-	if state != ServerAnalyticsDenied || !objection {
-		t.Fatalf("a fallback must be DENIED with the requirement standing, got %q/%v", state, objection)
-	}
-	// An absent requirement is not a false one: a plan that never stated it
-	// does not reach a verdict at all, and the helper is closed regardless.
-	unstated := Decision{planUsed: true, plan: Plan{ServerAnalytics: ServerAnalyticsEligible}}
-	if _, objection := unstated.ServerAnalyticsBasis(); !objection {
-		t.Fatal("an unstated objection requirement must read as required")
+// assertNoSuchMethods reads the package's own source for method names that
+// must not come back. A withdrawn getter returning under its old name is the
+// one change that would break a caller silently rather than loudly.
+func assertNoSuchMethods(t *testing.T, names ...string) {
+	t.Helper()
+	for _, file := range packageSources(t) {
+		for _, name := range names {
+			if strings.Contains(file.body, "func (d Decision) "+name+"(") {
+				t.Errorf("%s declares Decision.%s, which was withdrawn with the field it read", file.name, name)
+			}
+		}
 	}
 }
 
 // The lists are copied out, so a caller cannot mutate the verdict it was given.
 func TestTheVerdictsListsAreCopies(t *testing.T) {
-	decision := verifiedVerdict(t, validPlan(func(m map[string]any) {
-		m["operation_blocks"] = []any{"transfer_review"}
-		m["prohibited_purposes"] = []any{"advertising"}
-	}))
+	decision := verifiedVerdict(t, validPlan(withFlag("operation_blocks", []any{"transfer_review"})))
 	blocks, known := decision.OperationBlocks()
 	if !known || len(blocks) != 1 {
 		t.Fatalf("blocks=%v known=%v", blocks, known)
@@ -325,10 +346,6 @@ func TestParsedFieldsReachTheVerdict(t *testing.T) {
 		m["presented_language"] = "en-GB"
 		m["consent_text_version"] = "ff-v1.4"
 	})
-	var asMap map[string]any
-	if err := json.Unmarshal(raw, &asMap); err != nil {
-		t.Fatal(err)
-	}
 	plan, err := ParsePlan(raw)
 	if err != nil {
 		t.Fatalf("the fixture must parse: %v", err)
@@ -342,16 +359,26 @@ func TestParsedFieldsReachTheVerdict(t *testing.T) {
 	if plan.ExpiresAt == "" || !strings.Contains(plan.ExpiresAt, "T") {
 		t.Fatalf("expires_at=%q", plan.ExpiresAt)
 	}
-	_ = time.Now
+	// ⚠ AND THE FIELDS THAT USED TO BE READ FROM THE WRONG DEPTH. A top-level
+	// read leaves all four at their zero value, which is an empty string and a
+	// nil slice — and a nil slice is the "nothing is blocked" reading.
+	if plan.Flags.CrashProfile != CrashOff || plan.Flags.ServerAnalytics != ServerAnalyticsDenied ||
+		plan.Flags.ChildRules != ChildRulesMinimised || plan.Flags.OperationBlocks == nil {
+		t.Fatalf("the nested flags did not reach the plan: %+v", plan.Flags)
+	}
+	if plan.Basis.Character != BasisInformationalReference || plan.Basis.TableProvenance != ProvenanceAIDraft ||
+		plan.Basis.Notice == "" {
+		t.Fatalf("the nested basis did not reach the plan: %+v", plan.Basis)
+	}
 }
 
 // ⚠ THE PREVIOUS CUT OF THIS RULE WAS "AN UNSIGNED PLAN MAY CARRY ONLY THE
 // CONSERVATIVE TUPLE", AND IT WAS A HOLE IN THE SHAPE OF AN ANSWER. It
-// authenticated three enums and nothing else. prohibited_purposes and
-// operation_blocks rode along unauthenticated — and those govern transfer,
-// age/capacity, localisation and safety, which no consent choice lifts. So an
-// attacker who could not make the plan permissive could STRIP its restrictions
-// instead and be told, by a verdict marked USED, that nothing was blocked.
+// authenticated three enums and nothing else. operation_blocks rode along
+// unauthenticated — and those govern transfer, age/capacity, localisation and
+// safety, which no consent choice lifts. So an attacker who could not make the
+// plan permissive could STRIP its restrictions instead and be told, by a
+// verdict marked USED, that nothing was blocked.
 //
 // This scene is what replaces it: forge whatever you like, it is not used.
 func TestAnUnsignedPlanIsNeverUsedHoweverItIsForged(t *testing.T) {
@@ -360,16 +387,11 @@ func TestAnUnsignedPlanIsNeverUsedHoweverItIsForged(t *testing.T) {
 		mutate func(map[string]any)
 	}{
 		{"a permissive regime", func(m map[string]any) { m["regime"] = string(SoftOptOut) }},
-		{"a permitted crash profile", func(m map[string]any) { m["crash_profile"] = string(CrashMinimal) }},
-		{"an eligible server-analytics basis", func(m map[string]any) {
-			m["server_analytics"] = string(ServerAnalyticsEligible)
-		}},
-		// ⚠ THE FOUR THE OLD PREDICATE WAVED THROUGH. Every enum conservative,
+		{"a permitted crash profile", withFlag("crash_profile", string(CrashMinimalDiagnosticsForMinors))},
+		// ⚠ THE TWO THE OLD PREDICATE WAVED THROUGH. Every enum conservative,
 		// the restrictions gone.
-		{"operation_blocks removed", func(m map[string]any) { delete(m, "operation_blocks") }},
-		{"operation_blocks emptied", func(m map[string]any) { m["operation_blocks"] = []any{} }},
-		{"prohibited_purposes removed", func(m map[string]any) { delete(m, "prohibited_purposes") }},
-		{"prohibited_purposes emptied", func(m map[string]any) { m["prohibited_purposes"] = []any{} }},
+		{"operation_blocks removed", func(m map[string]any) { delete(m["flags"].(map[string]any), "operation_blocks") }},
+		{"operation_blocks emptied", withFlag("operation_blocks", []any{})},
 		{"nothing at all — the resolver's own honest output", nil},
 	}
 	for _, one := range forgeries {
@@ -380,39 +402,18 @@ func TestAnUnsignedPlanIsNeverUsedHoweverItIsForged(t *testing.T) {
 			if decision.PlanUsed() {
 				t.Fatalf("an unauthenticated plan (%s) was used: %+v", one.name, decision)
 			}
-			if decision.Reason != ReasonPlanUnsigned || decision.Regime() != StrictOptIn {
-				t.Fatalf("reason=%q regime=%q", decision.Reason, decision.Regime())
+			if decision.Regime() != StrictOptIn {
+				t.Fatalf("regime=%q", decision.Regime())
+			}
+			// The two stripped cases are refused EARLIER, as unreadable,
+			// because a required key is missing — which is a stronger refusal
+			// than the gate's, not a weaker one. Both are closed, and that is
+			// what the shared assertion checks.
+			if decision.Reason != ReasonPlanUnsigned && decision.Reason != ReasonPlanUnreadable {
+				t.Fatalf("reason=%q detail=%q", decision.Reason, decision.Detail)
 			}
 			assertClosedOnEveryAxis(t, decision)
 		})
-	}
-}
-
-// ⚠ ABSENCE IS NOT false FOR A REQUIRED SCALAR. Decoded into a bool, a plan
-// that simply omits the objection requirement read as "none required" — the
-// permissive answer, from a field the server never sent.
-func TestAnAbsentRequiredScalarFailsClosed(t *testing.T) {
-	decision := Prepare(context.Background(), VerifiedPlayerPolicy{
-		Plan:  validPlan(func(m map[string]any) { delete(m, "server_analytics_objection_required") }),
-		Scope: callerScope(), Now: fixedClock(),
-	})
-	if decision.PlanUsed() {
-		t.Fatalf("a plan missing the required scalar was used: %+v", decision)
-	}
-	if decision.Reason != ReasonPlanUnreadable {
-		t.Fatalf("reason=%q detail=%q", decision.Reason, decision.Detail)
-	}
-	// And an explicit false still parses — the rule is about ABSENCE, not about
-	// the value. Asked of the parser and the mapping, since Prepare refuses
-	// every plan in this release and so cannot tell the two cases apart.
-	explicit := verifiedVerdict(t, validPlan(func(m map[string]any) {
-		m["server_analytics_objection_required"] = false
-	}))
-	if !explicit.PlanUsed() {
-		t.Fatalf("an explicit false must parse: %+v", explicit)
-	}
-	if _, objection := explicit.ServerAnalyticsBasis(); objection {
-		t.Fatal("an explicit false must read as false")
 	}
 }
 
@@ -435,7 +436,7 @@ func TestTheValidityMarkerCannotBeForged(t *testing.T) {
 	// And the accidental one: a REAL verified verdict, logged and read back.
 	encoded, err := json.Marshal(verifiedVerdict(t, validPlan(func(m map[string]any) {
 		m["regime"] = string(SoftOptOut)
-		m["operation_blocks"] = []any{"transfer_review"}
+		m["flags"].(map[string]any)["operation_blocks"] = []any{"transfer_review"}
 	})))
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -456,7 +457,7 @@ func TestTheValidityMarkerCannotBeForged(t *testing.T) {
 // had sent it. A replacement character is a repair, and this parser refuses
 // rather than repairs.
 func TestInvalidUTF8IsUnreadable(t *testing.T) {
-	raw := validPlan(func(m map[string]any) { m["operation_blocks"] = []any{"transfer_review"} })
+	raw := validPlan(withFlag("operation_blocks", []any{"transfer_review"}))
 	forged := bytes.Replace(raw, []byte("transfer_review"), []byte("transfer\x80review"), 1)
 	if bytes.Equal(forged, raw) {
 		t.Fatal("the fixture does not carry the entry this scene rewrites")
@@ -472,8 +473,8 @@ func TestInvalidUTF8IsUnreadable(t *testing.T) {
 	verifiedVerdict(t, raw)
 }
 
-// ⚠ AND max_age_seconds IS THE THIRD REQUIRED SCALAR THAT ABSENCE COULD FAKE.
-// It decoded to 0 and passed the negative-only check, so "the resolver did not
+// ⚠ AND max_age_seconds IS A REQUIRED SCALAR THAT ABSENCE COULD FAKE. It
+// decoded to 0 and passed the negative-only check, so "the resolver did not
 // say" and "the resolver said zero" were the same plan.
 func TestAnAbsentMaxAgeFailsClosed(t *testing.T) {
 	for _, mutate := range []func(map[string]any){
@@ -507,26 +508,29 @@ func TestAnAbsentMaxAgeFailsClosed(t *testing.T) {
 // miss, a decoded nothing — all of them used to report analytics as OPEN.
 func TestTheZeroDecisionIsClosedEverywhere(t *testing.T) {
 	var d Decision
-	if !d.AnalyticsClosed() {
-		t.Error("analytics must be closed on a zero Decision")
+	if d.AnalyticsChoiceDefault() != ChoiceDefaultOff {
+		t.Error("the analytics choice must default OFF on a zero Decision")
 	}
-	if !d.CrashClosed() {
-		t.Error("the crash lane must be closed on a zero Decision")
+	if !d.ExplicitGrantRequired() {
+		t.Error("a zero Decision must require an explicit grant")
 	}
-	if state, objection := d.ServerAnalyticsBasis(); state != ServerAnalyticsDenied || !objection {
-		t.Errorf("state=%q objection=%v", state, objection)
+	if profile, known := d.CrashProfileOffered(); known || profile != CrashOff {
+		t.Errorf("a zero Decision offers no crash profile, got %q/%v", profile, known)
 	}
-	if purposes, known := d.ProhibitedPurposes(); known || purposes != nil {
-		t.Error("a zero Decision must report its purpose list as not known")
+	if state := d.ServerAnalytics(); state != ServerAnalyticsDenied {
+		t.Errorf("state=%q", state)
+	}
+	if !d.ChildRulesApplied() {
+		t.Error("a zero Decision applies child rules")
 	}
 	if blocks, known := d.OperationBlocks(); known || blocks != nil {
 		t.Error("a zero Decision must report its block list as not known")
 	}
-	// ⚠ AND "NOT KNOWN" MEANS RESTRICTED, NOT PERMITTED. The lists being empty
-	// is the reading that used to be available to a caller; the predicates are
+	// ⚠ AND "NOT KNOWN" MEANS RESTRICTED, NOT PERMITTED. The list being empty
+	// is the reading that used to be available to a caller; the predicate is
 	// the reading that is true.
-	if !d.OperationBlocked("transfer_review") || !d.PurposeProhibited("advertising") {
-		t.Error("a zero Decision must block every operation and prohibit every purpose")
+	if !d.OperationBlocked("transfer_review") {
+		t.Error("a zero Decision must block every operation")
 	}
 	if _, ok := d.Plan(); ok {
 		t.Error("a zero Decision must report no plan")
@@ -548,7 +552,8 @@ func TestTrailingContentIsRefused(t *testing.T) {
 		// gate and is refused there.
 		if suffix == " \t" {
 			// Trailing WHITESPACE is not content; refusing it would reject a
-			// pretty-printed body.
+			// pretty-printed body — and this package now reads one, so this is
+			// no longer a hypothetical.
 			if decision.Reason != ReasonPlanUnsigned {
 				t.Errorf("trailing whitespace must be accepted: %+v", decision)
 			}
@@ -597,41 +602,48 @@ func TestKeysMustBeExactAndUnique(t *testing.T) {
 // matching decided the nested field. A scope carrying "workspace_id" and
 // "WORKSPACE_ID" decoded to the expected workspace and then PASSED the scope
 // comparison — a plan issued for another app admitting here.
+//
+// ⚠ AND THE CONTRACT NOW HAS TWO MORE NESTED OBJECTS THAN IT DID. `flags` and
+// `basis` arrived with this change, so they are in this table from the start
+// rather than after the next incident.
 func TestNestedObjectKeysMustBeExactAndUnique(t *testing.T) {
-	withBand := func(m map[string]any) {
-		m["age_band"] = map[string]any{"vocabulary": "coarse.v1", "band": "adult"}
-	}
 	cases := []struct {
-		name           string
-		mutate         func(map[string]any)
-		old, forged    string
-		alreadyRefused bool
+		name        string
+		old, forged string
 	}{
 		// ⚠ THE ONE THAT MATTERS. The plan is issued for another tenant and
 		// the case-variant spelling is what the decoder picks, so the scope
 		// comparison compares the FORGERY against itself and passes.
-		{"a case-variant key inside scope", nil,
-			`"workspace_id":"ws-synthetic"`,
-			`"workspace_id":"ws-OTHER-TENANT","WORKSPACE_ID":"ws-synthetic"`, false},
-		{"a duplicate key inside scope", nil,
-			`"app_id":"app-synthetic"`,
-			`"app_id":"app-synthetic","app_id":"app-synthetic"`, false},
-		{"a case-variant key inside age_band", withBand,
-			`"band":"adult"`,
-			`"BAND":"minor","band":"adult"`, false},
-		{"a case-variant key inside a signal", nil,
+		{"a case-variant key inside scope",
+			`"workspace_id":"ws_1"`,
+			`"workspace_id":"ws-OTHER-TENANT","WORKSPACE_ID":"ws_1"`},
+		{"a duplicate key inside scope",
+			`"app_id":"app_1"`,
+			`"app_id":"app_1","app_id":"app_1"`},
+		// ⚠ THE SAME ATTACK ON A FLAG. A permissive spelling wins the field
+		// and the conservative one is what a reader of the body sees.
+		{"a case-variant key inside flags",
+			`"crash_profile":"off"`,
+			`"CRASH_PROFILE":"minimal_diagnostics_for_minors","crash_profile":"off"`},
+		{"a duplicate key inside flags",
+			`"child_rules":"minimised"`,
+			`"child_rules":"minimised","child_rules":"minimised"`},
+		{"a case-variant key inside basis",
+			`"table_provenance":"ai_draft"`,
+			`"TABLE_PROVENANCE":"owner_accepted","table_provenance":"ai_draft"`},
+		{"a case-variant key inside a signal",
 			`"available":false`,
-			`"AVAILABLE":true,"available":false`, false},
-		{"a duplicate key inside a signal", nil,
+			`"AVAILABLE":true,"available":false`},
+		{"a duplicate key inside a signal",
 			`"name":"server_country"`,
-			`"name":"server_country","name":"server_country"`, false},
+			`"name":"server_country","name":"server_country"`},
 		// Stated for completeness, and honestly: DisallowUnknownFields already
 		// applies at every depth, so an unknown NAME inside a nested object was
 		// never the hole. The hole was the ambiguity between two spellings of a
 		// name the schema does have, which DisallowUnknownFields cannot see.
-		{"an unknown key inside scope", nil,
-			`"environment_id":"env-synthetic"`,
-			`"environment_id":"env-synthetic","tenant":"x"`, true},
+		{"an unknown key inside scope",
+			`"environment_id":"env_1"`,
+			`"environment_id":"env_1","tenant":"x"`},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -640,7 +652,7 @@ func TestNestedObjectKeysMustBeExactAndUnique(t *testing.T) {
 			// "scope" would be caught by the top-level walk that already
 			// existed, and the scene would pass for the wrong reason — which
 			// is exactly what the first draft of this test did.
-			raw := string(validPlan(testCase.mutate))
+			raw := string(validPlan(nil))
 			if !strings.Contains(raw, testCase.old) {
 				t.Fatalf("the fixture does not contain %q", testCase.old)
 			}
@@ -655,7 +667,7 @@ func TestNestedObjectKeysMustBeExactAndUnique(t *testing.T) {
 	}
 	// The control: the same nested objects spelled correctly still parse, or
 	// the rule would be refusing every plan that has a nested object at all.
-	verifiedVerdict(t, validPlan(withBand))
+	verifiedVerdict(t, validPlan(nil))
 }
 
 // ⚠ A SIGNAL THAT NEVER STATES ITS AVAILABILITY IS UNREADABLE, NOT
@@ -665,26 +677,38 @@ func TestNestedObjectKeysMustBeExactAndUnique(t *testing.T) {
 // record then says the source was unavailable when what is true is that the
 // plan never said.
 func TestASignalMustStateItsAvailability(t *testing.T) {
-	for name, signal := range map[string]any{
-		"available omitted": map[string]any{"name": "server_country", "reason": string(NotEnabledInRelease)},
-		"available null":    map[string]any{"name": "server_country", "available": nil, "reason": string(NotEnabledInRelease)},
+	// ⚠ OMITTED AND NULL ARE REFUSED BY DIFFERENT CHECKS, AND EACH IS ASKED
+	// FOR ITS OWN MESSAGE — which is the whole reason this field is a pointer.
+	// Both decode to the same nil, so only the RAW document can tell them
+	// apart: the required-key walk names an absent key, and the null-class
+	// walk names a present-null one. Asserting one shared sentence across both
+	// would have let either check disappear silently.
+	for _, testCase := range []struct {
+		name   string
+		signal any
+		detail string
+	}{
+		{"available omitted", map[string]any{"name": "server_country", "reason": string(NotEnabledInRelease)},
+			`omits the required key "signals_used[0].available"`},
+		{"available null", map[string]any{"name": "server_country", "available": nil, "reason": string(NotEnabledInRelease)},
+			`sends null for "signals_used[0].available"`},
 	} {
-		t.Run(name, func(t *testing.T) {
+		t.Run(testCase.name, func(t *testing.T) {
 			decision := Prepare(context.Background(), VerifiedPlayerPolicy{
-				Plan:  validPlan(func(m map[string]any) { m["signals_used"] = []any{signal} }),
+				Plan:  validPlan(func(m map[string]any) { m["signals_used"] = []any{testCase.signal} }),
 				Scope: callerScope(), Now: fixedClock(),
 			})
 			if decision.PlanUsed() || decision.Reason != ReasonPlanUnreadable {
 				t.Fatalf("%+v detail=%q", decision, decision.Detail)
 			}
-			if !strings.Contains(decision.Detail, "does not state whether it was available") {
+			if !strings.Contains(decision.Detail, testCase.detail) {
 				t.Fatalf("the refusal must name what was missing: %q", decision.Detail)
 			}
 		})
 	}
-	// The controls: a STATED false with a reason, and a STATED true without
-	// one, both parse. Without them this rule would be satisfied by a parser
-	// that refuses every signal.
+	// The controls: the recorded body's three STATED-false signals with their
+	// reasons, and a STATED true without one, both parse. Without them this
+	// rule would be satisfied by a parser that refuses every signal.
 	verifiedVerdict(t, validPlan(nil))
 	verifiedVerdict(t, validPlan(func(m map[string]any) {
 		m["signals_used"] = []any{map[string]any{"name": "server_country", "available": true}}
@@ -694,10 +718,7 @@ func TestASignalMustStateItsAvailability(t *testing.T) {
 // ⚠ A COPIED DECISION MUST NOT BE ABLE TO EDIT THE ORIGINAL'S ANSWER. Values
 // copy; the arrays behind them do not.
 func TestACopiedDecisionCannotMutateTheOriginal(t *testing.T) {
-	original := verifiedVerdict(t, validPlan(func(m map[string]any) {
-		m["operation_blocks"] = []any{"transfer_review"}
-		m["prohibited_purposes"] = []any{"advertising"}
-	}))
+	original := verifiedVerdict(t, validPlan(withFlag("operation_blocks", []any{"transfer_review"})))
 	if !original.PlanUsed() {
 		t.Fatalf("the fixture must be used: %+v", original)
 	}
@@ -706,22 +727,15 @@ func TestACopiedDecisionCannotMutateTheOriginal(t *testing.T) {
 	if !ok {
 		t.Fatal("the copy must report its plan")
 	}
-	plan.OperationBlocks[0] = "removed"
-	plan.ProhibitedPurposes[0] = "removed"
-	if plan.AgeBand != nil {
-		plan.AgeBand.Band = "removed"
-	}
+	plan.Flags.OperationBlocks[0] = "removed"
 	if got, known := original.OperationBlocks(); !known || len(got) != 1 || got[0] != "transfer_review" {
 		t.Fatalf("the original's blocks were mutated through a copy: %v", got)
-	}
-	if got, known := original.ProhibitedPurposes(); !known || len(got) != 1 || got[0] != "advertising" {
-		t.Fatalf("the original's purposes were mutated through a copy: %v", got)
 	}
 	// And two reads of the same verdict do not share an array either.
 	first, _ := original.Plan()
 	second, _ := original.Plan()
-	first.OperationBlocks[0] = "removed"
-	if second.OperationBlocks[0] != "transfer_review" {
+	first.Flags.OperationBlocks[0] = "removed"
+	if second.Flags.OperationBlocks[0] != "transfer_review" {
 		t.Fatal("two reads of one verdict share a backing array")
 	}
 }

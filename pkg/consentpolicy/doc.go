@@ -26,24 +26,35 @@
 //
 // The conservative rule, which is the whole point of the package: a plan that
 // is missing, unparseable, out of scope, expired, unverifiable, or carrying
-// anything outside its bounded vocabulary resolves to STRICT with optional
-// processing closed — never to a partial permissive result.
+// anything outside its bounded vocabulary resolves to STRICT — never to a
+// partial permissive result.
+//
+// ⚠ STRICT MEANS ASK, WITH THE CHOICE DEFAULTED OFF. It does NOT mean nothing
+// is asked, and this package used to say it did: OptionalProcessingClosed and
+// AnalyticsClosed reported that a strict regime closed the door. The resolver
+// answers STRICT to every request in this release, so a host reading those
+// methods would never ask anyone and never start optional analytics, for every
+// customer in every country. That is not the strict regime; it is no product.
+// Both are gone rather than renamed — see AnalyticsChoiceDefault and
+// ExplicitGrantRequired — and a grant given under a fallback is a VALID grant,
+// not a void one.
 //
 // ⚠ IN THIS RELEASE THAT RULE HAS NO EXCEPTION, AND THE CONSEQUENCE IS WORTH
 // STATING PLAINLY RATHER THAN LEAVING A CALLER TO DISCOVER IT: Prepare returns
 // a closed decision for EVERY input, including a perfectly well-formed plan.
 // This build has no key to authenticate a plan with, an unauthenticated plan
-// is not evidence, and so no plan is used. Decision.PlanUsed is false, every
-// lane is closed, every purpose reports prohibited and every operation reports
-// blocked.
+// is not evidence, and so no plan is used. Decision.PlanUsed is false, the
+// optional-analytics choice defaults OFF with an explicit grant required, no
+// crash profile is offered, server analytics is denied, child rules apply, and
+// every operation reports blocked.
 //
 // That is a posture, not a stub. Two weaker positions were tried here first.
 // "A forged plan can only tighten" is true of a forged STRICT plan and says
 // nothing about a forged permissive one. "Honour an unsigned plan only when
 // its regime, crash profile and server-analytics basis are all conservative"
-// then failed on an axis those three enums do not cover: prohibited_purposes
-// and operation_blocks were carried through unauthenticated, so an attacker
-// who could not make a plan permissive could STRIP its restrictions instead —
+// then failed on an axis those enums do not cover: the plan's RESTRICTION
+// LISTS rode along unauthenticated, so an attacker who could not make a plan
+// permissive could STRIP its restrictions instead —
 // and those govern transfer, age/capacity, localisation and safety, which no
 // consent choice lifts. A restriction removed is permissive however strict the
 // enums look.
