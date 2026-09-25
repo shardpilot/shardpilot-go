@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -809,6 +811,95 @@ func TestSourceCompatibilityBaselineAndCIMatrix(t *testing.T) {
 	if !newerCovered {
 		t.Errorf("CI matrix has no leg newer than the %s baseline, so nothing checks the SDK against a current toolchain; legs = %v",
 			majorMinor, legs)
+	}
+}
+
+// Exercise the actual workflow script with a local git double. This is a scene
+// for this step, not a YAML linter or a claim about all workflow expressions.
+func TestCIComparisonBaseTreatsContextAsData(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("workflow scene requires bash")
+	}
+	git, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("workflow scene requires git for branch-name validation")
+	}
+	workflow, err := os.ReadFile(".github/workflows/ci.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, step, ok := strings.Cut(string(workflow), "      - name: Fetch the comparison base for the lane B ratchet\n")
+	if !ok {
+		t.Fatal("comparison-base step was not found")
+	}
+	step, _, _ = strings.Cut(step, "\n      - name:")
+	header, body, ok := strings.Cut(step, "        run: |\n")
+	if !ok {
+		t.Fatal("scene expects this step's literal run block")
+	}
+	var script strings.Builder
+	for _, line := range strings.Split(body, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		line, ok = strings.CutPrefix(line, "          ")
+		if !ok {
+			t.Fatal("unexpected run-block indentation")
+		}
+		script.WriteString(line + "\n")
+	}
+	type scene struct{ name, branch, base, before, want string }
+	cases := []scene{}
+	for i, branch := range []string{"main", "x$(printf${IFS}SCENE_EXECUTED)", "x`printf${IFS}SCENE_EXECUTED`", `a"b`, "a'b", "y;z", "p(q)"} {
+		cases = append(cases, scene{fmt.Sprint("new-ref-", i), branch, "", strings.Repeat("0", 40), branch})
+	}
+	cases = append(cases,
+		scene{"pull-request", "main", strings.Repeat("a", 40), strings.Repeat("0", 40), strings.Repeat("a", 40)},
+		scene{"existing-push", "main", "", strings.Repeat("b", 40), strings.Repeat("b", 40)})
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if out, err := exec.Command(git, "check-ref-format", "--branch", tc.branch).CombinedOutput(); err != nil {
+				t.Fatalf("fixture is not an accepted Git branch: %v: %s", err, out)
+			}
+			// Model only expression substitution, then let the real shell parse
+			// and execute the workflow's script. No network or credentials.
+			render := strings.NewReplacer(
+				"${{ github.event.pull_request.base.sha }}", tc.base,
+				"${{ github.event.before }}", tc.before,
+				"${{ github.event.repository.default_branch }}", tc.branch)
+			dir := t.TempDir()
+			argsFile, envFile := filepath.Join(dir, "args"), filepath.Join(dir, "env")
+			if err := os.WriteFile(filepath.Join(dir, "git"), []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$WORKFLOW_ARGS\"\n"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command(bash, "-e", "-c", render.Replace(script.String()))
+			cmd.Env = []string{"PATH=" + dir + ":/usr/bin:/bin", "GITHUB_ENV=" + envFile, "WORKFLOW_ARGS=" + argsFile}
+			for _, line := range strings.Split(header, "\n") {
+				if strings.TrimSpace(line) == "" || strings.TrimSpace(line) == "env:" {
+					continue
+				}
+				name, value, ok := strings.Cut(strings.TrimSpace(line), ":")
+				if !ok {
+					t.Fatal("scene expects simple env entries before the run block")
+				}
+				cmd.Env = append(cmd.Env, name+"="+render.Replace(strings.TrimSpace(value)))
+			}
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("workflow script failed for valid branch %q: %v: %s", tc.branch, err, out)
+			}
+			args, err := os.ReadFile(argsFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := "fetch\n--depth=1\norigin\n" + tc.want + "\n"; string(args) != want {
+				t.Fatalf("context became shell code: git args %q, want %q", args, want)
+			}
+			output, err := os.ReadFile(envFile)
+			if err != nil || string(output) != "SP_LANE_B_BASE=FETCH_HEAD\n" {
+				t.Fatalf("comparison ref was not exported: %q, %v", output, err)
+			}
+		})
 	}
 }
 
