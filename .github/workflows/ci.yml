@@ -566,10 +566,14 @@ jobs:
       #   is the cheaper error: the alternative was publishing unreviewed material
       #   with a green tick.
       - name: Fetch the comparison base for the lane B ratchet
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          base_sha='${{ github.event.pull_request.base.sha }}'
-          before='${{ github.event.before }}'
+          base_sha="$BASE_SHA"
+          before="$PUSH_BEFORE"
           zero='0000000000000000000000000000000000000000'
           if [ -n "$base_sha" ]; then
             git fetch --depth=1 origin "$base_sha"
@@ -578,7 +582,7 @@ jobs:
             git fetch --depth=1 origin "$before"
             echo "SP_LANE_B_BASE=FETCH_HEAD" >> "$GITHUB_ENV"
           else
-            git fetch --depth=1 origin "${{ github.event.repository.default_branch }}"
+            git fetch --depth=1 origin "$DEFAULT_BRANCH"
             echo "SP_LANE_B_BASE=FETCH_HEAD" >> "$GITHUB_ENV"
           fi
 
