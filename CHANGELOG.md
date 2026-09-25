@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Crash reports carry an SDK-owned `fatal` flag and, for non-fatal reports admitted by the built-in sampler, `non_fatal_sample_one_in`. Custom sampler rates remain unknown and are omitted. The public `crash.Event` is unchanged; each admitted wire body is encoded once and retried byte-for-byte. Default non-fatal sampling remains 1-in-10.
+
 ## v0.6.4-alpha — 2026-09-21 — BREAKING: consent-policy wire contract and caller API
 
 - Release the `pkg/consentpolicy` changes in [#117](https://github.com/shardpilot/shardpilot-go/pull/117), merged as `04e0b0a065ba8c3e0057ee906656dbbb898f6430`. Callers of the withdrawn API from `v0.6.3-alpha` must migrate before upgrading.
