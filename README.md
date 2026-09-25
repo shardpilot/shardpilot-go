@@ -112,6 +112,13 @@ Pick events whose canonical schema allows your configured `Source`. Session/scre
 
 ## Quick start (crash reporting)
 
+**Unreleased on main:** emitted crash bodies carry `fatal: true` for `EmitFatal`
+and `fatal: false` for `Emit`; non-fatal reports admitted by the built-in sampler
+also carry `non_fatal_sample_one_in` (10 by default). Custom sampler rates remain
+unknown and are omitted. The SDK stamps these fields rather than reading them
+from caller data, and encodes the admitted body once for byte-identical retries.
+The public `crash.Event` and the default 1-in-10 sampling policy are unchanged.
+
 A runnable example lives in [`examples/crash`](examples/crash). It demonstrates the client API surface with a synthetic stub event; it does not install a panic handler or capture a real crash.
 
 ```go

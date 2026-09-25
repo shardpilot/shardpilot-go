@@ -258,7 +258,22 @@ func (c *Client) emit(ctx context.Context, event Event, fatal, trustedFrameFunct
 	if !fatal && c.sampler != nil && !c.sampler.ShouldEmit(prepared) {
 		return nil
 	}
-	result, err := c.post(ctx, prepared)
+	// These are admission facts owned by the SDK, not caller Event fields.
+	wire := struct {
+		Event
+		Fatal               bool   `json:"fatal"`
+		NonFatalSampleOneIn uint64 `json:"non_fatal_sample_one_in,omitempty"`
+	}{Event: prepared, Fatal: fatal}
+	if sampler, ok := c.sampler.(*rateSampler); !fatal && ok && sampler != nil && sampler.every >= 1 && sampler.every <= 1000000 {
+		wire.NonFatalSampleOneIn = sampler.every
+	}
+	// Freeze the admitted report before retrying: even a custom sampler can
+	// retain the Event's maps, but cannot restamp or reencode this body later.
+	payload, err := json.Marshal(wire)
+	if err != nil {
+		return fmt.Errorf("encode shardpilot crash event: %w", err)
+	}
+	result, err := c.post(ctx, payload)
 	if err != nil {
 		return err
 	}
@@ -316,10 +331,10 @@ func (c *Client) prepareEvent(event Event, trustedFrameFunctions bool) (Event, e
 	return sanitized, nil
 }
 
-func (c *Client) post(ctx context.Context, event Event) (Result, error) {
+func (c *Client) post(ctx context.Context, payload []byte) (Result, error) {
 	var lastErr error
 	for attempt := 1; attempt <= c.maxAttempts; attempt++ {
-		result, err := c.postOnce(ctx, event)
+		result, err := c.postOnce(ctx, payload)
 		if err == nil {
 			return result, nil
 		}
@@ -341,18 +356,13 @@ func (c *Client) post(ctx context.Context, event Event) (Result, error) {
 	return Result{}, lastErr
 }
 
-func (c *Client) postOnce(ctx context.Context, event Event) (Result, error) {
+func (c *Client) postOnce(ctx context.Context, payload []byte) (Result, error) {
 	if err := c.validateReady(); err != nil {
 		return Result{}, err
 	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	payload, err := json.Marshal(event)
-	if err != nil {
-		return Result{}, fmt.Errorf("encode shardpilot crash event: %w", err)
-	}
-
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, c.ingestURL, bytes.NewReader(payload))
 	if err != nil {
 		return Result{}, fmt.Errorf("create shardpilot crash ingest request: %w", err)
