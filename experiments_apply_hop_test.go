@@ -873,3 +873,108 @@ func TestADueRevalidationRunsBeforeTheExposureSweep(t *testing.T) {
 		t.Fatalf("the revalidation must precede the apply request: fetches seen at the apply request=%d, before the cycle=%d", got, fetches)
 	}
 }
+
+// ── round 2 ─────────────────────────────────────────────────────────────────
+
+// The apply endpoint's real-subjects sentinel is the assignment route's: the
+// cached assignments stop serving and the facts already in the pipeline are
+// withdrawn, not only the owed applications.
+func TestAnApplySentinelWithdrawsLikeTheAssignmentRoute(t *testing.T) {
+	setup := func(t *testing.T, second int, secondBody string) *expHopRig {
+		rig := newExpHopRig(t, nil, expAssignedServedBody(expServedTrio), expServedBodyForKey(expSecondKey))
+		rig.script.apply.push(200, expApplyEcho)
+		rig.script.apply.push(second, secondBody)
+		fetchAssignment(t, rig.client, expTestScopeKey)
+		fetchAssignment(t, rig.client, expSecondKey)
+		rig.client.ApplyExperimentVariant(expTestScopeKey)
+		rig.client.ApplyExperimentVariant(expSecondKey)
+		// exp-checkout sorts first: its fact is sealed and queued before
+		// exp-second's request gets the second answer.
+		rig.cycle()
+		if got := len(rig.script.apply.requestsSoFar()); got != 2 {
+			t.Fatalf("control: both applications reach the endpoint, got %d request(s)", got)
+		}
+		return rig
+	}
+	t.Run("control: without the sentinel both facts are published", func(t *testing.T) {
+		rig := setup(t, 200, expApplyEcho)
+		flushOrFail(t, rig.client)
+		if got := len(rig.capture.exposures()); got != 2 {
+			t.Fatalf("control: two facts are published, got %d", got)
+		}
+	})
+	t.Run("the sentinel withdraws the queued fact and the assignments", func(t *testing.T) {
+		rig := setup(t, 403, `{"error":"`+expSentinelRealSubjectsDisabled+`"}`)
+		flushOrFail(t, rig.client)
+		if got := len(rig.capture.exposures()); got != 0 {
+			t.Fatalf("a fact queued before the sentinel must not be published after it, got %d", got)
+		}
+		if variant := rig.client.ExperimentVariant(expTestScopeKey); variant != "" {
+			t.Fatalf("a withdrawn assignment must not be served, got %q", variant)
+		}
+		if n := rig.drops("real_subjects_disabled"); n != 1 {
+			t.Fatalf("the owed application the sentinel withdrew is counted, got %d", n)
+		}
+	})
+}
+
+// A consent denial landing between the emission's check and the wire sends
+// no apply request: the request carries the subject and the attributes.
+func TestADenialBeforeTheWireSendsNoApplyRequest(t *testing.T) {
+	rig := newExpHopRig(t, nil)
+	fetchAssignment(t, rig.client, expTestScopeKey)
+	rig.client.ApplyExperimentVariant(expTestScopeKey)
+	fired := false
+	rig.client.exp.mu.Lock()
+	rig.client.exp.consentRaceSeam = func(stage string) {
+		if stage == "apply_wire" && !fired {
+			fired = true
+			rig.client.SetConsent(false)
+		}
+	}
+	rig.client.exp.mu.Unlock()
+	rig.cycle()
+	if !fired {
+		t.Fatal("control: the seam must have fired")
+	}
+	if got := len(rig.script.apply.requestsSoFar()); got != 0 {
+		t.Fatalf("no apply request may leave after a denial, got %d", got)
+	}
+}
+
+// A consent denial while an apply request is in flight aborts it: the lane
+// does not wait for the endpoint.
+func TestADenialMidFlightAbortsTheApplyRequest(t *testing.T) {
+	rig := newExpHopRig(t, func(cfg *Config) { cfg.HTTPTimeout = 10 * time.Second })
+	release := make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+	arrived := make(chan struct{}, 1)
+	rig.script.apply.onRequest = func() {
+		select {
+		case arrived <- struct{}{}:
+		default:
+		}
+		<-release
+	}
+	fetchAssignment(t, rig.client, expTestScopeKey)
+	rig.client.ApplyExperimentVariant(expTestScopeKey)
+	done := make(chan struct{})
+	go func() {
+		rig.cycle()
+		close(done)
+	}()
+	select {
+	case <-arrived:
+	case <-time.After(5 * time.Second):
+		t.Fatal("control: the apply request must reach the endpoint")
+	}
+	rig.client.SetConsent(false)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		once.Do(func() { close(release) })
+		<-done
+		t.Fatal("a denial must abort the in-flight apply request")
+	}
+}

@@ -355,6 +355,8 @@ func (c *Client) sealExperimentApplication(ctx context.Context, experimentKey st
 // assignment host, with the same publishable key as the fetch. Redirects are
 // not followed.
 func (c *Client) postExposureApplication(ctx context.Context, experimentKey string, owed expOwedCopy) (remoteConfigResponse, error) {
+	// Seam: the window between the emission's consent check and the wire.
+	c.exp.fireConsentRaceSeam("apply_wire")
 	e := c.exp
 	attributes := make(map[string]string, len(owed.entry.Attributes))
 	for _, attribute := range owed.entry.Attributes {
