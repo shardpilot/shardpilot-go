@@ -52,49 +52,27 @@ func TestApplyExperimentVariantRecordsOncePerSession(t *testing.T) {
 	capture := &expWireCapture{}
 	server := newExperimentServer(t, script, capture)
 	defer server.Close()
-	dir := t.TempDir()
-	first := newExperimentClient(t, server.URL, func(cfg *Config) { cfg.SpoolDir = dir })
+	client := newExperimentClient(t, server.URL, nil)
+	defer client.Close(context.Background())
 
-	fetchAssignment(t, first, expTestScopeKey)
-	if got := first.ApplyExperimentVariant(expTestScopeKey); got != "treatment" {
+	fetchAssignment(t, client, expTestScopeKey)
+	if got := client.ApplyExperimentVariant(expTestScopeKey); got != "treatment" {
 		t.Fatalf("ApplyExperimentVariant must return the served variant, got %q", got)
 	}
-	flushOrFail(t, first)
-	facts := capture.exposures()
-	if len(facts) != 1 {
-		t.Fatalf("the application must record one exposure, got %d", len(facts))
+	flushOrFail(t, client)
+	if got := len(capture.exposures()); got != 1 {
+		t.Fatalf("the application must record one exposure, got %d", got)
 	}
 	// Applying again, refetching and applying once more is the same
-	// application in the same session.
-	first.ApplyExperimentVariant(expTestScopeKey)
-	fetchAssignment(t, first, expTestScopeKey)
-	first.ApplyExperimentVariant(expTestScopeKey)
-	first.experimentCycle(context.Background())
-	flushOrFail(t, first)
+	// application in the same session. (A new session, and a restored
+	// assignment, are TestRestoreFromDiskServesAndRecordsOnlyWhenApplied.)
+	client.ApplyExperimentVariant(expTestScopeKey)
+	fetchAssignment(t, client, expTestScopeKey)
+	client.ApplyExperimentVariant(expTestScopeKey)
+	client.experimentCycle(context.Background())
+	flushOrFail(t, client)
 	if got := len(capture.exposures()); got != 1 {
 		t.Fatalf("once per (experiment, version, subject, session): got %d", got)
-	}
-	if err := first.Close(context.Background()); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-
-	// A new instance is a new session: its restored assignment records
-	// nothing until the host applies it, and then records its own exposure.
-	second := newExperimentClient(t, server.URL, func(cfg *Config) { cfg.SpoolDir = dir })
-	defer second.Close(context.Background())
-	if second.ExperimentVariant(expTestScopeKey) != "treatment" {
-		t.Fatal("control: the restored assignment must serve")
-	}
-	second.experimentCycle(context.Background())
-	flushOrFail(t, second)
-	if got := len(capture.exposures()); got != 1 {
-		t.Fatalf("a restored assignment must record nothing before it is applied, got %d", got)
-	}
-	second.ApplyExperimentVariant(expTestScopeKey)
-	flushOrFail(t, second)
-	facts = capture.exposures()
-	if len(facts) != 2 || facts[1]["event_id"] == facts[0]["event_id"] {
-		t.Fatalf("the new session's application must record its own exposure, got %d fact(s)", len(facts))
 	}
 }
 
@@ -166,4 +144,13 @@ func TestConsentPurgeReArmsOnlyAppliedAssignments(t *testing.T) {
 			t.Fatalf("an experiment that was never applied was recorded: %v", props)
 		}
 	}
+}
+
+// fetchAndApply is the host's fetch followed by its application of the
+// variant — what a fetch alone recorded before ApplyExperimentVariant.
+func fetchAndApply(t *testing.T, c *Client, key string) ExperimentAssignmentResult {
+	t.Helper()
+	result := fetchAssignment(t, c, key)
+	c.ApplyExperimentVariant(key)
+	return result
 }

@@ -402,7 +402,7 @@ func TestExplicitExposureArmSurvivesRacedPurge(t *testing.T) {
 	client := newExperimentClient(t, server.URL, nil)
 	defer func() { _ = client.Close(context.Background()) }()
 	client.SetConsent(true)
-	if result := fetchAssignment(t, client, expTestScopeKey); result.Version != 1 {
+	if result := fetchAndApply(t, client, expTestScopeKey); result.Version != 1 {
 		t.Fatalf("setup fetch: %+v", result)
 	}
 	client.exp.mu.Lock()

@@ -276,14 +276,14 @@ func TestSentinelClearsExposureDedupe(t *testing.T) {
 		t.Fatalf("filler: %v", err)
 	}
 	waitFor(t, 5*time.Second, "the worker parks on the failing ingest", func() bool { return capture.hitCount() >= 1 })
-	fetchAssignment(t, client, expTestScopeKey) // exposure fact -> queue; tuple marked
+	fetchAndApply(t, client, expTestScopeKey) // exposure fact -> queue; tuple marked
 
 	// The sentinel lands: the queued fact purges undelivered.
 	if _, err := client.FetchExperimentAssignment(context.Background(), expTestScopeKey, nil); err == nil {
 		t.Fatalf("the sentinel fetch must fail closed")
 	}
 	// A later authorized fetch reinstalls the same assignment this session.
-	result := fetchAssignment(t, client, expTestScopeKey)
+	result := fetchAndApply(t, client, expTestScopeKey)
 	if !result.Assigned {
 		t.Fatalf("the authorized re-fetch must serve, got %+v", result)
 	}
@@ -331,7 +331,7 @@ func TestDroppedEntryOwedExposureSurvivesProcessDeath(t *testing.T) {
 	})
 	client1.SetConsent(true)
 	parkWorkerWithFullQueue(t, client1, capture)
-	fetchAssignment(t, client1, expTestScopeKey) // owed exposure (queue full)
+	fetchAndApply(t, client1, expTestScopeKey) // owed exposure (queue full)
 	result, err := client1.FetchExperimentAssignment(context.Background(), expTestScopeKey, nil)
 	if err != nil || result.Assigned || result.Code != "not_found" {
 		t.Fatalf("the kill fetch must land not_found, got %+v err=%v", result, err)

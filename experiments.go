@@ -121,15 +121,16 @@ import (
 //
 // Exposure lane (analytics plane): `experiment_exposure` facts ride the
 // normal event pipeline (queue → batch → spool → consent gates) with the
-// strict server-side props allowlist. Emission timing is the ratified SDK
-// convention: at most once per (experiment_key, experiment_version, subject)
-// per session — this SDK has no session lifecycle, so its session is the
-// client instance — emitted when the assigned variant is first applied (a
-// fresh fetch resolution, or the first sweep serving a cache-restored
-// assignment), with a DETERMINISTIC event id so at-least-once retries and
-// same-session re-emissions collapse server-side as duplicates.
-// TrackExperimentExposure is the explicit re-arm escape hatch (a re-arm
-// mints a distinct deterministic id). The assignment_key prop carries the
+// strict server-side props allowlist. An exposure is recorded by the host's
+// explicit application of the variant, ApplyExperimentVariant, and by
+// nothing else: a fetch, a revalidation, a cache restore and the getters
+// record nothing, because a read is not an application and recording on it
+// counts subjects who were never treated. At most once per (experiment_key,
+// experiment_version, subject) per session — this SDK has no session
+// lifecycle, so its session is the client instance — with a DETERMINISTIC
+// event id so at-least-once retries and same-session re-emissions collapse
+// server-side as duplicates. TrackExperimentExposure is the explicit re-arm
+// escape hatch (a re-arm mints a distinct deterministic id). The assignment_key prop carries the
 // server-minted subject-fact key VERBATIM (the raw subject id is
 // structurally rejected there); an assignment without one emits NO fact.
 // NOTE: the analytics service currently rejects these event names from
@@ -1260,12 +1261,12 @@ func (e *experimentsState) preload() (privacyRefused bool) {
 		// The record is condemned: nothing serves from it.
 		return
 	}
+	// A restored assignment serves and records nothing: an exposure is the
+	// host's application of the variant (ApplyExperimentVariant), and this
+	// session has applied nothing yet.
 	for key, stored := range record.Entries {
 		entry := stored
 		e.entries[key] = &entry
-		e.pendingExposure[key] = []*expOwedExposure{
-			{entry: &entry, session: e.sessionMarker},
-		}
 	}
 	return false
 }
@@ -2086,8 +2087,8 @@ func (e *experimentsState) applySentinelWithdrawalLocked(scope string, resolvedA
 	// keys outright: owed exposure snapshots carry those keys and
 	// go with them. The AUTO dedupe slate resets with them — a purged
 	// queued-undelivered automatic exposure must not leave its tuple
-	// marked emitted, or a later authorized re-fetch in this session
-	// would arm a replacement and suppress it as already-sent
+	// marked emitted, or a later application in this session after an
+	// authorized re-fetch would be suppressed as already-sent
 	// (under-counting real treatment). The blanket auto reset is safe
 	// on both sides of the delivery ambiguity: a fact that HAD
 	// delivered re-derives the SAME deterministic id and collapses
@@ -2312,14 +2313,9 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 		e.demoteOwedClearLocked()
 		persisted := e.syncDurableEntryLocked(scope, experimentKey, entry.FetchedAtMS, false)
 		e.armRevalidationLocked(resolvedAtMS)
-		// The variant takes effect at this resolution (a variant change on
-		// republish applies here too): the application point. The snapshot
-		// is ARMED behind any still-owed earlier applications (the queue
-		// preserves them — a full analytics queue must not cost the
-		// previous treatment its fact) and the caller's off-lock sweep
-		// drains in order; a locally failed emit is retried by the cycle
-		// sweep instead of being lost.
-		e.armExposureLocked(experimentKey, entry)
+		// Installing an assignment is not an application of it and arms no
+		// exposure (ApplyExperimentVariant does). The caller's off-lock sweep
+		// still drains whatever earlier applications are owed.
 		return true, !persisted, false
 	}
 	return false, false, false
@@ -2380,11 +2376,11 @@ func (e *experimentsState) owedTupleArmedLocked(experimentKey, tuple string) boo
 	return false
 }
 
-// onAnalyticsPurge re-arms this session's emissions after a consent denial
-// purged queued-but-unpublished analytics facts — exposure facts included.
-// Those facts never reached the server, so a later re-grant of the retained
-// assignment emits the exposure again instead of silently under-counting
-// real treatment. Facts that HAD already published — or were mid-flight,
+// onAnalyticsPurge re-arms this session's APPLIED emissions after a consent
+// denial purged queued-but-unpublished analytics facts — exposure facts
+// included. Those facts never reached the server, so a later re-grant of a
+// retained assignment the host applied emits the exposure again instead of
+// silently under-counting real treatment. Facts that HAD already published — or were mid-flight,
 // wire-ambiguous, when the denial landed — simply collapse server-side as
 // duplicates of their deterministic event ids (the re-emission derives the
 // SAME id for the same session, tuple, and arm), so the blanket re-arm is
@@ -2400,6 +2396,23 @@ func (e *experimentsState) onAnalyticsPurge() {
 	// blanket-re-arm rule). The deterministic id domain is unchanged: a
 	// re-armed live tuple derives the same id its purged fact carried, so
 	// a wire-ambiguous survivor still collapses server-side.
+	// Only what this session APPLIED re-arms: a tuple whose automatic
+	// exposure was emitted, or whose application was still owed when the
+	// purge landed. An assignment the host never applied has no exposure
+	// to restore.
+	applied := make(map[string]bool)
+	for tuple, exposed := range e.exposed {
+		if exposed.auto {
+			applied[tuple] = true
+		}
+	}
+	for key, list := range e.pendingExposure {
+		for _, owed := range list {
+			if owed.session == e.sessionMarker {
+				applied[exposureTupleKey(key, owed.entry)] = true
+			}
+		}
+	}
 	e.pendingExposure = make(map[string][]*expOwedExposure)
 	// The purge kills FACTS, never the session's id-domain bookkeeping:
 	// each tuple's highest handed-out arm survives the reset (only the
@@ -2410,7 +2423,9 @@ func (e *experimentsState) onAnalyticsPurge() {
 	// undercount a real new re-exposure.
 	e.resetExposedKeepArmsLocked()
 	for key, entry := range e.entries {
-		e.armExposureLocked(key, entry)
+		if applied[exposureTupleKey(key, entry)] {
+			e.armExposureLocked(key, entry)
+		}
 	}
 	// Latch-cleared serving state is RETAINED, not dropped: an ordinary
 	// 401/403 latch emptied e.entries while the durable record kept the
@@ -2423,8 +2438,8 @@ func (e *experimentsState) onAnalyticsPurge() {
 	// that HAD published collapses server-side, and the arm high-water
 	// preserved above keeps explicit re-arms distinct.
 	for key, entry := range e.latchRetained {
-		if e.entries[key] != nil {
-			continue // the live entry already re-armed above
+		if e.entries[key] != nil || !applied[exposureTupleKey(key, entry)] {
+			continue // the live entry already re-armed above, or never applied
 		}
 		e.armExposureLocked(key, entry)
 	}
@@ -2435,7 +2450,7 @@ func (e *experimentsState) onAnalyticsPurge() {
 // bookkeeping. The arm counter is the session's deterministic-id domain —
 // arms already handed out stay spent forever (their facts may have
 // published), while auto=false makes the next automatic emission (the
-// purge's re-arm, a restore, a fresh install of the same tuple) emit again
+// purge's re-arm, or the host applying the same tuple again) emit again
 // with its unchanged arm-0 id, collapsing server-side if a survivor already
 // carried it.
 func (e *experimentsState) resetExposedKeepArmsLocked() {
@@ -3150,9 +3165,9 @@ func (c *Client) experimentJitter() func() float64 {
 // goroutine (and directly by tests): owed durable writes retry FIRST and
 // regardless of consent (local disk housekeeping — a kill drop decided
 // under grant must land durably even if consent flipped meanwhile); then,
-// while consent admits, the owed-exposure sweep (cache-restored
-// applications, locally failed emissions, and applications whose facts a
-// consent purge re-armed all drain here); then the revalidation cadence —
+// while consent admits, the owed-exposure sweep (locally failed emissions
+// and applications whose facts a consent purge re-armed drain here); then
+// the revalidation cadence —
 // while not auth latched, at least one assignment is cached, and no
 // Retry-After deadline parks it, every cached key re-fetches once per
 // armed interval. A parked revalidation never blocks anything: there is no
@@ -3309,10 +3324,43 @@ func (c *Client) ExperimentVariant(experimentKey string) string {
 	return ""
 }
 
-// ApplyExperimentVariant is not implemented yet: it serves the variant and
-// records nothing of its own.
+// ApplyExperimentVariant returns the cached assigned variant for an
+// experiment under exactly ExperimentVariant's serving rules, and records
+// the host's application of it. Call it at the point the host acts on the
+// variant: the exposure is recorded once per (experiment, version,
+// subject, session) — the SDK instance is the session — and by nothing
+// else. A fetch, a revalidation, a cache restore and the getters record
+// nothing. The SDK cannot verify that the host acted on the variant; this
+// call is the host's statement that it did. It never touches the network:
+// the exposure fact joins the analytics queue like any other event, and a
+// queue that cannot take it now keeps it owed for the lane's next sweep.
 func (c *Client) ApplyExperimentVariant(experimentKey string) string {
-	return c.ExperimentVariant(experimentKey)
+	e := c.exp
+	experimentKey = strings.TrimSpace(experimentKey)
+	if e == nil || experimentKey == "" {
+		return ""
+	}
+	if c.experimentConsentRefusal() != nil {
+		return ""
+	}
+	e.mu.Lock()
+	if e.tornDown {
+		e.mu.Unlock()
+		return ""
+	}
+	entry := e.entries[experimentKey]
+	if entry == nil {
+		e.mu.Unlock()
+		return ""
+	}
+	// Once per session needs no check here: arming refreshes a same-tuple
+	// snapshot still owed in place, and the emitter skips a tuple whose
+	// exposure this session already emitted.
+	e.armExposureLocked(experimentKey, entry)
+	variant := entry.VariantKey
+	e.mu.Unlock()
+	c.sweepExperimentExposures(experimentKey)
+	return variant
 }
 
 // ExperimentVariantPayload returns a copy of the cached assigned variant's

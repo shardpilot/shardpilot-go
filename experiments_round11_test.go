@@ -508,7 +508,7 @@ func TestExplicitArmSurvivesConsentPurge(t *testing.T) {
 
 	// The automatic arm-0 fact, then an explicit re-arm (arm 1) — both
 	// published.
-	fetchAssignment(t, client, expTestScopeKey)
+	fetchAndApply(t, client, expTestScopeKey)
 	if err := client.TrackExperimentExposure(expTestScopeKey); err != nil {
 		t.Fatalf("explicit re-arm: %v", err)
 	}
@@ -575,7 +575,7 @@ func TestExplicitArmSurvivesSentinelSlateReset(t *testing.T) {
 	defer client.Close(context.Background())
 	client.SetConsent(true)
 
-	fetchAssignment(t, client, expTestScopeKey)
+	fetchAndApply(t, client, expTestScopeKey)
 	if err := client.TrackExperimentExposure(expTestScopeKey); err != nil {
 		t.Fatalf("explicit re-arm: %v", err)
 	}
@@ -594,7 +594,7 @@ func TestExplicitArmSurvivesSentinelSlateReset(t *testing.T) {
 	if _, err := client.FetchExperimentAssignment(context.Background(), expTestScopeKey, nil); err == nil {
 		t.Fatalf("the sentinel fetch must fail closed")
 	}
-	if result := fetchAssignment(t, client, expTestScopeKey); !result.Assigned {
+	if result := fetchAndApply(t, client, expTestScopeKey); !result.Assigned {
 		t.Fatalf("the re-enabled fetch must assign, got %+v", result)
 	}
 	if err := client.TrackExperimentExposure(expTestScopeKey); err != nil {

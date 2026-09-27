@@ -37,7 +37,7 @@ func TestCaptureGateHoldsUntilDurable(t *testing.T) {
 	}()
 	client.SetConsent(true)
 	parkWorkerWithFullQueue(t, client, capture)
-	fetchAssignment(t, client, expTestScopeKey) // owed exposure (queue full)
+	fetchAndApply(t, client, expTestScopeKey) // owed exposure (queue full)
 
 	// The spool's record rewrite fails: the capture cannot land.
 	client.spool.mu.Lock()
@@ -115,7 +115,7 @@ func TestCloseRemnantFiltersWithdrawnFacts(t *testing.T) {
 	client.SetConsent(true)
 
 	capture.setStatus(http.StatusInternalServerError)
-	fetchAssignment(t, client, expTestScopeKey) // fact -> queue -> worker batch
+	fetchAndApply(t, client, expTestScopeKey) // fact -> queue -> worker batch
 	waitFor(t, 5*time.Second, "the worker parks holding the fact", func() bool { return capture.hitCount() >= 1 })
 	if err := client.Enqueue(Event{Name: "host_close_survivor"}); err != nil {
 		t.Fatalf("host event: %v", err)

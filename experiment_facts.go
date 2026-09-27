@@ -33,12 +33,14 @@ import (
 //     assignment without a subject-fact key (a synthetic-unit answer
 //     included) emits NO fact.
 //
-// Emission timing (exposures): at most once per (experiment, version,
-// subject) per session — this SDK's session is the client instance — with a
+// Emission timing (exposures): on the host's ApplyExperimentVariant, at most
+// once per (experiment, version, subject) per session — this SDK's session
+// is the client instance; the "automatic" arm-0 slot below is that
+// application's own exposure, as distinct from explicit re-arms — with a
 // DETERMINISTIC event id (experimentExposureEventID) so at-least-once
 // retries and same-session re-emissions collapse server-side as duplicates.
-// Owed emissions (a full queue, a consent-closed window, a cache-restored
-// application) stay armed as snapshots and drain on the lane's sweep in
+// Owed emissions (a full queue, a consent-closed window, a consent purge's
+// re-arm of an applied tuple) stay armed as snapshots and drain on the lane's sweep in
 // FIFO order per experiment. TrackExperimentExposure is the explicit
 // re-arm: it buys an EXTRA fact with a bumped arm counter — while the
 // automatic arm-0 emission is still owed in the queue, the re-arm takes arm
@@ -380,9 +382,9 @@ func (c *Client) sweepAllExperimentExposuresMode(atClose bool) {
 
 // TrackExperimentExposure emits one EXTRA exposure fact for the cached
 // assignment (a distinct deterministic id per re-arm), for hosts that want
-// re-exposure semantics on top of the automatic once-per-session emission —
-// the automatic fact emits at the assignment's application (fetch
-// resolution or cache restore) without any host call. Requires the
+// re-exposure semantics on top of ApplyExperimentVariant's once-per-session
+// exposure; called before any application, it records that application.
+// Requires the
 // experiments opt-in (ErrExperimentsNotConfigured), an assignment currently
 // served (ErrExperimentNoAssignment), the plane's consent admission
 // (ErrConsentDenied/ErrConsentUnknown), and a server-minted subject-fact

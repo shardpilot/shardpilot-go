@@ -308,7 +308,7 @@ func TestExperimentFactsCountInStats(t *testing.T) {
 	defer client.Close(context.Background())
 
 	before := client.Snapshot().Enqueued
-	fetchAssignment(t, client, expTestScopeKey) // auto exposure
+	fetchAndApply(t, client, expTestScopeKey) // auto exposure
 	if err := client.TrackExperimentOutcome(expTestScopeKey, "score", 1); err != nil {
 		t.Fatalf("outcome: %v", err)
 	}
@@ -517,7 +517,7 @@ func TestPurgeDiscardsDeadOwedAndReArmsLiveOnly(t *testing.T) {
 	// OWED, then the kill drops the live entry — the owed snapshot is now
 	// DEAD (its entry is gone).
 	parkWorkerWithFullQueue(t, client, capture)
-	fetchAssignment(t, client, expTestScopeKey)
+	fetchAndApply(t, client, expTestScopeKey)
 	if result, err := client.FetchExperimentAssignment(context.Background(), expTestScopeKey, nil); err != nil || result.Assigned {
 		t.Fatalf("kill: %+v / %v", result, err)
 	}

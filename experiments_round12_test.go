@@ -38,7 +38,7 @@ func TestOwedExposureSurvivesAuthLatchedConsentPurge(t *testing.T) {
 	// The assignment installs while the analytics queue is FULL: the
 	// exposure fact cannot enqueue and stays owed as a pending snapshot.
 	parkWorkerWithFullQueue(t, client, capture)
-	if result := fetchAssignment(t, client, expTestScopeKey); result.Version != 1 {
+	if result := fetchAndApply(t, client, expTestScopeKey); result.Version != 1 {
 		t.Fatalf("setup fetch: %+v", result)
 	}
 	client.exp.mu.Lock()

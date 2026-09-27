@@ -308,7 +308,7 @@ func TestReinstallPreservesUnlandedCaptureDebt(t *testing.T) {
 	}()
 	client.SetConsent(true)
 	parkWorkerWithFullQueue(t, client, capture)
-	fetchAssignment(t, client, expTestScopeKey) // owed exposure (queue full)
+	fetchAndApply(t, client, expTestScopeKey) // owed exposure (queue full)
 
 	// The spool cannot persist: the kill's capture freezes in the pair.
 	client.spool.mu.Lock()

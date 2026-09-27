@@ -49,7 +49,7 @@ func TestBuiltBatchHandoffRechecksPurge(t *testing.T) {
 		}
 		// The fetch applies the assignment and enqueues its automatic
 		// exposure fact; the armed seam catches the batch that carries it.
-		if result := fetchAssignment(t, client, expTestScopeKey); result.VariantKey != "treatment" {
+		if result := fetchAndApply(t, client, expTestScopeKey); result.VariantKey != "treatment" {
 			t.Fatalf("setup fetch: %+v", result)
 		}
 		drive(t, client, capture)
@@ -171,7 +171,7 @@ func TestFactStampRidesEntrySnapshot(t *testing.T) {
 		client := newExperimentClient(t, server.URL, nil)
 		defer func() { _ = client.Close(context.Background()) }()
 		client.SetConsent(true)
-		if result := fetchAssignment(t, client, expTestScopeKey); result.VariantKey != "treatment" {
+		if result := fetchAndApply(t, client, expTestScopeKey); result.VariantKey != "treatment" {
 			t.Fatalf("setup fetch: %+v", result)
 		}
 		// Deliver the automatic exposure so the raced emission below is the
