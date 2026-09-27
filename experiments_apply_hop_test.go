@@ -561,3 +561,103 @@ func TestAFirstTrackedApplicationAfterASentinelSurvivesADenial(t *testing.T) {
 		t.Fatalf("the tracked application's only exposure was lost to the denial (delivered %d)", seen)
 	}
 }
+
+// ── every owed application the plane gives up on is counted ─────────────────
+
+// A consent withdrawal re-arms only this session's applications of live
+// assignments. The owed applications it does NOT re-arm — an extra one, or
+// one whose assignment has since been dropped — are counted
+// consent_withdrawn, and the re-armed one is not.
+func TestAConsentPurgeCountsTheApplicationsItDiscards(t *testing.T) {
+	t.Run("an extra application", func(t *testing.T) {
+		rig := newExpHopRig(t, nil)
+		fetchAssignment(t, rig.client, expTestScopeKey)
+		rig.client.ApplyExperimentVariant(expTestScopeKey)
+		if err := rig.client.TrackExperimentExposure(expTestScopeKey); err != nil {
+			t.Fatalf("TrackExperimentExposure: %v", err)
+		}
+		if rig.owed() != 2 {
+			t.Fatalf("control: two owed applications before the purge, got %d", rig.owed())
+		}
+		rig.client.SetConsent(false)
+		rig.client.SetConsent(true)
+		if rig.owed() != 1 || rig.drops("consent_withdrawn") != 1 {
+			t.Fatalf("the purge re-arms the applied tuple and counts the discarded extra once: owed=%d drops=%v",
+				rig.owed(), rig.client.Snapshot().ExperimentExposureDrops)
+		}
+		rig.cycle()
+		flushOrFail(t, rig.client)
+		if got := len(rig.capture.exposures()); got != 1 {
+			t.Fatalf("the re-armed application is still delivered, got %d fact(s)", got)
+		}
+	})
+	t.Run("an application of a dropped assignment", func(t *testing.T) {
+		rig := newExpHopRig(t, nil, expAssignedServedBody(expServedTrio), `{"assigned":false}`)
+		rig.script.apply.push(503, ``)
+		fetchAssignment(t, rig.client, expTestScopeKey)
+		rig.client.ApplyExperimentVariant(expTestScopeKey)
+		rig.cycle()
+		if result := fetchAssignment(t, rig.client, expTestScopeKey); result.Assigned {
+			t.Fatal("control: the second fetch must drop the assignment")
+		}
+		if rig.owed() != 1 {
+			t.Fatalf("control: the transient refusal keeps the application owed, got %d", rig.owed())
+		}
+		rig.client.SetConsent(false)
+		rig.client.SetConsent(true)
+		if rig.owed() != 0 || rig.drops("consent_withdrawn") != 1 {
+			t.Fatalf("the purge does not re-arm a dropped assignment and counts its application: owed=%d drops=%v",
+				rig.owed(), rig.client.Snapshot().ExperimentExposureDrops)
+		}
+	})
+}
+
+// A sealed application Close could not hand to the queue is counted
+// undelivered_at_close beside the unsealed one's unsealed_at_close: the drop
+// map accounts for every application the close remnant loses, the same
+// total Stats.Dropped carries.
+func TestCloseCountsASealedApplicationItCouldNotDeliver(t *testing.T) {
+	script := &expScript{}
+	script.push(200, expAssignedBody("1"))
+	script.push(200, strings.Replace(expAssignedBody("1"), `"version":1`, `"version":2`, 1))
+	capture := &expWireCapture{}
+	server := newExperimentServer(t, script, capture)
+	defer server.Close()
+	client := newExperimentClient(t, server.URL, func(cfg *Config) {
+		cfg.BatchSize = 1
+		cfg.BufferSize = 1
+	})
+	parkWorkerWithFullQueue(t, client, capture)
+	fetchAndApply(t, client, expTestScopeKey)
+	fetchAndApply(t, client, expTestScopeKey)
+	client.exp.mu.Lock()
+	sealed, unsealed := 0, 0
+	for _, owed := range client.exp.pendingExposure[expTestScopeKey] {
+		if owed.sealed != nil {
+			sealed++
+		} else {
+			unsealed++
+		}
+	}
+	client.exp.mu.Unlock()
+	if sealed == 0 {
+		t.Fatalf("control: at least one owed application must already be sealed (sealed=%d unsealed=%d)", sealed, unsealed)
+	}
+	before := client.Snapshot().Dropped
+	closeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_ = client.Close(closeCtx)
+	snapshot := client.Snapshot()
+	if snapshot.ExperimentExposureDrops["undelivered_at_close"] != uint64(sealed) ||
+		snapshot.ExperimentExposureDrops["unsealed_at_close"] != uint64(unsealed) {
+		t.Fatalf("each application lost at close is counted by why: sealed=%d unsealed=%d drops=%v",
+			sealed, unsealed, snapshot.ExperimentExposureDrops)
+	}
+	var counted uint64
+	for _, n := range snapshot.ExperimentExposureDrops {
+		counted += n
+	}
+	if lost := snapshot.Dropped - before; counted != lost {
+		t.Fatalf("the drop map must account for every application Stats.Dropped counts at close: map=%d dropped=%d", counted, lost)
+	}
+}
