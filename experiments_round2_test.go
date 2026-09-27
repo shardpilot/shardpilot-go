@@ -184,7 +184,7 @@ func TestCloseDrainsAllOwedExposures(t *testing.T) {
 	// Three distinct applications, all owed (parked worker + full queue).
 	parkWorkerWithFullQueue(t, client, capture)
 	for i := 0; i < 3; i++ {
-		fetchAssignment(t, client, expTestScopeKey)
+		fetchAndApply(t, client, expTestScopeKey)
 	}
 	client.exp.mu.Lock()
 	owed := len(client.exp.pendingExposure[expTestScopeKey])
@@ -322,7 +322,7 @@ func TestRetryableSweepRefusalsDoNotCountDropped(t *testing.T) {
 	client := newExperimentClient(t, server.URL, nil)
 	defer client.Close(context.Background())
 
-	fetchAssignment(t, client, expTestScopeKey)
+	fetchAndApply(t, client, expTestScopeKey)
 	// Deny: the purge re-arms the exposure; repeated consent-closed sweep
 	// attempts are retryable and must not inflate Dropped.
 	client.SetConsent(false)
@@ -477,8 +477,8 @@ func TestCloseCountsDiscardedOwedExposures(t *testing.T) {
 
 	// Two owed applications against a jammed pipeline that NEVER recovers.
 	parkWorkerWithFullQueue(t, client, capture)
-	fetchAssignment(t, client, expTestScopeKey)
-	fetchAssignment(t, client, expTestScopeKey)
+	fetchAndApply(t, client, expTestScopeKey)
+	fetchAndApply(t, client, expTestScopeKey)
 	client.exp.mu.Lock()
 	owed := len(client.exp.pendingExposure[expTestScopeKey])
 	client.exp.mu.Unlock()

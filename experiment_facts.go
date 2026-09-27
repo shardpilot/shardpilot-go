@@ -33,12 +33,14 @@ import (
 //     assignment without a subject-fact key (a synthetic-unit answer
 //     included) emits NO fact.
 //
-// Emission timing (exposures): at most once per (experiment, version,
-// subject) per session — this SDK's session is the client instance — with a
+// Emission timing (exposures): on the host's ApplyExperimentVariant, at most
+// once per (experiment, version, subject) per session — this SDK's session
+// is the client instance; the "automatic" arm-0 slot below is that
+// application's own exposure, as distinct from explicit re-arms — with a
 // DETERMINISTIC event id (experimentExposureEventID) so at-least-once
 // retries and same-session re-emissions collapse server-side as duplicates.
-// Owed emissions (a full queue, a consent-closed window, a cache-restored
-// application) stay armed as snapshots and drain on the lane's sweep in
+// Owed emissions (a full queue, a consent-closed window, a consent purge's
+// re-arm of an applied tuple) stay armed as snapshots and drain on the lane's sweep in
 // FIFO order per experiment. TrackExperimentExposure is the explicit
 // re-arm: it buys an EXTRA fact with a bumped arm counter — while the
 // automatic arm-0 emission is still owed in the queue, the re-arm takes arm
@@ -295,6 +297,17 @@ func (c *Client) emitEntryExposure(experimentKey string, entry *expEntry, rearm 
 			if (havePrior && prior.arm < arm) || (!havePrior && arm > 0) {
 				e.exposed[tuple] = expExposed{arm: arm, auto: havePrior && prior.auto}
 			}
+			// A first application emitted directly (TrackExperimentExposure
+			// before any ApplyExperimentVariant) had no owed snapshot and no
+			// exposed entry for the purge to see, so the purge could not
+			// re-arm it and its fact may have been drained. Re-arm it here
+			// while its assignment is still live: the re-emission derives the
+			// same id, so a fact that survived collapses server-side.
+			if next.auto && !havePrior {
+				if live := e.entries[experimentKey]; live != nil && exposureTupleKey(experimentKey, live) == tuple {
+					e.armExposureLocked(experimentKey, live)
+				}
+			}
 		}
 		e.mu.Unlock()
 	}
@@ -380,9 +393,9 @@ func (c *Client) sweepAllExperimentExposuresMode(atClose bool) {
 
 // TrackExperimentExposure emits one EXTRA exposure fact for the cached
 // assignment (a distinct deterministic id per re-arm), for hosts that want
-// re-exposure semantics on top of the automatic once-per-session emission —
-// the automatic fact emits at the assignment's application (fetch
-// resolution or cache restore) without any host call. Requires the
+// re-exposure semantics on top of ApplyExperimentVariant's once-per-session
+// exposure; called before any application, it records that application.
+// Requires the
 // experiments opt-in (ErrExperimentsNotConfigured), an assignment currently
 // served (ErrExperimentNoAssignment), the plane's consent admission
 // (ErrConsentDenied/ErrConsentUnknown), and a server-minted subject-fact

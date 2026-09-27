@@ -2608,9 +2608,10 @@ func (r *recorder) last() *exchange {
 
 // assignmentRoute is the ONLY path this recorder records.
 //
-// ⚠ THE SDK HAS A SECOND LEG, AND IT SHARES THIS TRANSPORT. Applying an
-// assignment enqueues an automatic `experiment_exposure`, and the ingest worker
-// flushes on its own timer through the same `HTTPClient` -- so on a run that
+// ⚠ THE SDK HAS A SECOND LEG, AND IT SHARES THIS TRANSPORT. Applying a
+// variant (`ApplyExperimentVariant`, which this harness never calls; before it
+// existed, the fetch itself) enqueues an `experiment_exposure`, and the ingest
+// worker flushes on its own timer through the same `HTTPClient` -- so on a run that
 // settles near the tick, an ingest POST was recorded as another supposed
 // assignment attempt, could change which exchange `last()` returns, and raced
 // the report's own reads of `exchanges`. The configuration comment claiming
@@ -2657,7 +2658,7 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 		r.mu.Unlock()
 		// ⚠ ABSORBED, NOT FORWARDED. Filtering it out of the RECORD while still
 		// sending it left the side effect this harness must not have: an
-		// automatic exposure delivered to the ingest endpoint from a run whose
+		// exposure delivered to the ingest endpoint from a run whose
 		// only purpose is to observe one assignment
 		// (shardpilot/shardpilot-go#84 review). A capture tool that emits
 		// analytics is not observing, it is participating.
@@ -6114,7 +6115,8 @@ func main() {
 
 	result, fetchErr := client.FetchExperimentAssignment(ctx, env("SP_EXPERIMENT_KEY"), nil)
 
-	// ⚠ STOP THE TRAFFIC BEFORE COUNTING IT. An armed automatic exposure can have
+	// ⚠ STOP THE TRAFFIC BEFORE COUNTING IT. An armed exposure (a fetch armed one
+	// before ApplyExperimentVariant existed) can have
 	// its worker issue an ingest request AFTER the fetch returns, so the snapshot
 	// below recorded zero while the recorder went on absorbing and counting that
 	// request as the report was assembled -- and the printed claim, already

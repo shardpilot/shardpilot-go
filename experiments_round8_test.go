@@ -152,7 +152,7 @@ func TestExperimentFactsCarrySessionIdentity(t *testing.T) {
 	client := newExperimentClient(t, server.URL, nil)
 	defer client.Close(context.Background())
 
-	fetchAssignment(t, client, expTestScopeKey)
+	fetchAndApply(t, client, expTestScopeKey)
 	if err := client.TrackExperimentOutcome(expTestScopeKey, "score", 1); err != nil {
 		t.Fatalf("outcome: %v", err)
 	}

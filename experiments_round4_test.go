@@ -201,7 +201,7 @@ func TestSentinelPurgesQueuedExperimentFacts(t *testing.T) {
 	}
 	waitFor(t, 5*time.Second, "the worker parks on the failing ingest", func() bool { return capture.hitCount() >= 1 })
 
-	fetchAssignment(t, client, expTestScopeKey) // auto exposure fact -> queue
+	fetchAndApply(t, client, expTestScopeKey) // auto exposure fact -> queue
 	if err := client.Enqueue(Event{Name: "host_survivor"}); err != nil {
 		t.Fatalf("host survivor: %v", err)
 	}
@@ -249,7 +249,7 @@ func TestSentinelPurgesWorkerBatchFacts(t *testing.T) {
 	defer client.Close(context.Background())
 
 	capture.setStatus(http.StatusInternalServerError)
-	fetchAssignment(t, client, expTestScopeKey) // exposure fact -> queue -> worker batch
+	fetchAndApply(t, client, expTestScopeKey) // exposure fact -> queue -> worker batch
 	waitFor(t, 5*time.Second, "the worker parks holding the fact", func() bool { return capture.hitCount() >= 1 })
 
 	if _, err := client.FetchExperimentAssignment(context.Background(), expTestScopeKey, nil); err == nil {
@@ -300,7 +300,7 @@ func TestSentinelRemovesSpooledExperimentFacts(t *testing.T) {
 	capture.setStatus(http.StatusInternalServerError)
 	client1 := newExperimentClient(t, server.URL, func(cfg *Config) { cfg.SpoolDir = spoolDir })
 	client1.SetConsent(true)
-	fetchAssignment(t, client1, expTestScopeKey)
+	fetchAndApply(t, client1, expTestScopeKey)
 	if err := client1.Enqueue(Event{Name: "host_spooled"}); err != nil {
 		t.Fatalf("host event: %v", err)
 	}

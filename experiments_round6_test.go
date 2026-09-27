@@ -124,7 +124,7 @@ func TestCaptureFailureKeepsCacheUntilPairLands(t *testing.T) {
 	}()
 	client.SetConsent(true)
 	parkWorkerWithFullQueue(t, client, capture)
-	fetchAssignment(t, client, expTestScopeKey) // owed exposure (queue full)
+	fetchAndApply(t, client, expTestScopeKey) // owed exposure (queue full)
 
 	// The SPOOL's record rewrite starts failing: the capture cannot land.
 	client.spool.mu.Lock()

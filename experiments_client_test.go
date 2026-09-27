@@ -682,12 +682,13 @@ func TestGrammar400RemintsOncePreservingAttributesAndOwedExposures(t *testing.T)
 	client := newExperimentClient(t, server.URL, nil)
 	defer client.Close(context.Background())
 
-	// First fetch with attributes: assigned (version 1). A consent
-	// denial/re-grant purges its queued exposure fact and re-arms it as an
-	// OWED snapshot of the version-1 treatment.
+	// First fetch with attributes: assigned (version 1), and applied. A
+	// consent denial/re-grant purges its queued exposure fact and re-arms
+	// it as an OWED snapshot of the version-1 treatment.
 	if _, err := client.FetchExperimentAssignment(context.Background(), expTestScopeKey, map[string]string{"geo": "DE"}); err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
+	client.ApplyExperimentVariant(expTestScopeKey)
 	subjectBefore := script.request(0).URL.Query().Get("subject_key")
 	client.SetConsent(false)
 	client.SetConsent(true)
@@ -716,10 +717,11 @@ func TestGrammar400RemintsOncePreservingAttributesAndOwedExposures(t *testing.T)
 	if subjectRetry == subjectBefore || !validExperimentSubjectID(subjectRetry) {
 		t.Fatalf("the retry must ride a freshly minted subject, got %q", subjectRetry)
 	}
+	client.ApplyExperimentVariant(expTestScopeKey)
 
 	// The owed exposure of the PAST (version-1) treatment survived the
-	// re-mint: the resolution sweep emitted it alongside the fresh
-	// version-2 application's fact.
+	// re-mint: the sweep emitted it alongside the fresh version-2
+	// application's fact.
 	if err := client.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
@@ -809,6 +811,7 @@ func TestRevalidationCycleReusesAttributesAndDropsOnKill(t *testing.T) {
 	if _, err := client.FetchExperimentAssignment(context.Background(), expTestScopeKey, map[string]string{"geo": "DE"}); err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
+	client.ApplyExperimentVariant(expTestScopeKey)
 	if err := client.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
@@ -1114,7 +1117,7 @@ func TestExposureAutoEmitsOnceWithDeterministicID(t *testing.T) {
 	client := newExperimentClient(t, server.URL, nil)
 	defer client.Close(context.Background())
 
-	fetchAssignment(t, client, expTestScopeKey)
+	fetchAndApply(t, client, expTestScopeKey)
 	if err := client.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
@@ -1169,7 +1172,7 @@ func TestConsentPurgeReArmsExposureWithSameID(t *testing.T) {
 	client := newExperimentClient(t, server.URL, nil)
 	defer client.Close(context.Background())
 
-	fetchAssignment(t, client, expTestScopeKey)
+	fetchAndApply(t, client, expTestScopeKey)
 	if err := client.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
@@ -1216,7 +1219,7 @@ func TestExplicitReArmWhileAutoOwedEmitsBothDistinctIDs(t *testing.T) {
 	// Park the worker and fill the queue: the automatic arm-0 emission at
 	// fetch resolution fails ErrQueueFull and stays OWED.
 	parkWorkerWithFullQueue(t, client, capture)
-	fetchAssignment(t, client, expTestScopeKey)
+	fetchAndApply(t, client, expTestScopeKey)
 	client.exp.mu.Lock()
 	owed := len(client.exp.pendingExposure[expTestScopeKey])
 	client.exp.mu.Unlock()
@@ -1302,7 +1305,7 @@ func TestOwedExposureFIFOBounded(t *testing.T) {
 	// snapshots into the bounded FIFO of eight.
 	parkWorkerWithFullQueue(t, client, capture)
 	for i := 0; i < expMaxOwedExposures+2; i++ {
-		fetchAssignment(t, client, expTestScopeKey)
+		fetchAndApply(t, client, expTestScopeKey)
 	}
 	client.exp.mu.Lock()
 	list := client.exp.pendingExposure[expTestScopeKey]
@@ -1321,7 +1324,7 @@ func TestOwedExposureFIFOBounded(t *testing.T) {
 	capture.setStatus(http.StatusAccepted)
 }
 
-func TestRestoreFromDiskServesAndReArmsExposure(t *testing.T) {
+func TestRestoreFromDiskServesAndRecordsOnlyWhenApplied(t *testing.T) {
 	script := &expScript{}
 	script.push(200, expAssignedBody("1"))
 	capture := &expWireCapture{}
@@ -1330,7 +1333,7 @@ func TestRestoreFromDiskServesAndReArmsExposure(t *testing.T) {
 	spoolDir := t.TempDir()
 
 	client1 := newExperimentClient(t, server.URL, func(cfg *Config) { cfg.SpoolDir = spoolDir })
-	fetchAssignment(t, client1, expTestScopeKey)
+	fetchAndApply(t, client1, expTestScopeKey)
 	if err := client1.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
@@ -1351,16 +1354,23 @@ func TestRestoreFromDiskServesAndReArmsExposure(t *testing.T) {
 	if script.requestCount() != 1 {
 		t.Fatalf("the restore must not fetch")
 	}
-	// ...and its exposure re-arms for the NEW session (a fresh instance is
-	// a fresh session): the sweep emits one fact with the new session's
-	// deterministic id.
+	// ...and records nothing: a fresh instance is a fresh session that has
+	// applied nothing yet.
 	client2.experimentCycle(context.Background())
+	if err := client2.Flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if got := len(capture.exposures()); got != 1 {
+		t.Fatalf("a restored assignment must record nothing before it is applied, got %d facts", got)
+	}
+	// Applied, it records the new session's own exposure.
+	client2.ApplyExperimentVariant(expTestScopeKey)
 	if err := client2.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
 	facts2 := capture.exposures()
 	if len(facts2) != 2 {
-		t.Fatalf("expected the restored application's fact, got %d total", len(facts2))
+		t.Fatalf("expected the new session's application fact, got %d total", len(facts2))
 	}
 	if facts2[1]["event_id"] == facts1[0]["event_id"] {
 		t.Fatalf("a new session derives its own deterministic id")
@@ -1403,7 +1413,7 @@ func TestExperimentFactWireEnvelope(t *testing.T) {
 	})
 	defer client.Close(context.Background())
 
-	fetchAssignment(t, client, expTestScopeKey)
+	fetchAndApply(t, client, expTestScopeKey)
 	if err := client.TrackExperimentOutcome(expTestScopeKey, "score", 3.5); err != nil {
 		t.Fatalf("outcome: %v", err)
 	}
@@ -1528,7 +1538,7 @@ func TestExperimentFactsGateOnAnonymousActorUnderFloor(t *testing.T) {
 		t.Fatalf("grant: %v", err)
 	}
 
-	fetchAssignment(t, client, expTestScopeKey) // the PLANE is unaffected
+	fetchAndApply(t, client, expTestScopeKey) // the PLANE is unaffected
 	if err := client.TrackExperimentOutcome(expTestScopeKey, "score", 1); !errors.Is(err, ErrConsentActorMismatch) {
 		t.Fatalf("a user-scoped floor must refuse the anonymous-actor fact, got %v", err)
 	}
@@ -1564,7 +1574,7 @@ func TestExperimentFactsGateOnAnonymousActorUnderFloor(t *testing.T) {
 	if err := client2.SetConsentDecision(ConsentDecisionGranted); err != nil {
 		t.Fatalf("grant: %v", err)
 	}
-	fetchAssignment(t, client2, expTestScopeKey)
+	fetchAndApply(t, client2, expTestScopeKey)
 	if err := client2.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
@@ -1592,7 +1602,7 @@ func TestCloseSweepsOwedExposureAndRetriesOwedDurableSync(t *testing.T) {
 	// Park the worker and fill the queue: the application's exposure stays
 	// OWED through the fetch.
 	parkWorkerWithFullQueue(t, client, capture)
-	fetchAssignment(t, client, expTestScopeKey)
+	fetchAndApply(t, client, expTestScopeKey)
 	client.exp.mu.Lock()
 	owed := len(client.exp.pendingExposure[expTestScopeKey])
 	client.exp.mu.Unlock()
