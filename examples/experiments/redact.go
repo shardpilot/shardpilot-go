@@ -1539,6 +1539,9 @@ type sdkAssignmentWire struct {
 	Reason         json.RawMessage `json:"reason"`
 	SubjectFactKey string          `json:"subject_fact_key"`
 	Boundary       map[string]any  `json:"boundary"`
+	ServedRevision json.RawMessage `json:"served_revision"`
+	ServedKillGate json.RawMessage `json:"served_kill_gate"`
+	ServedAt       json.RawMessage `json:"served_at"`
 }
 
 // statusCodeOf reads a status line's code. Extracted so the exemption registry and
