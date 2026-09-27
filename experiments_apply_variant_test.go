@@ -56,7 +56,7 @@ func TestApplyExperimentVariantRecordsOncePerSession(t *testing.T) {
 	defer client.Close(context.Background())
 
 	fetchAssignment(t, client, expTestScopeKey)
-	if got := client.ApplyExperimentVariant(expTestScopeKey); got != "treatment" {
+	if got, _ := client.ApplyExperimentVariant(expTestScopeKey); got != "treatment" {
 		t.Fatalf("ApplyExperimentVariant must return the served variant, got %q", got)
 	}
 	flushOrFail(t, client)
@@ -87,15 +87,15 @@ func TestApplyExperimentVariantServesWhatTheGetterServes(t *testing.T) {
 	client := newExperimentClient(t, server.URL, nil)
 	defer client.Close(context.Background())
 
-	if got := client.ApplyExperimentVariant(expTestScopeKey); got != "" {
+	if got, _ := client.ApplyExperimentVariant(expTestScopeKey); got != "" {
 		t.Fatalf("nothing cached: want \"\", got %q", got)
 	}
 	fetchAssignment(t, client, expTestScopeKey)
-	if got := client.ApplyExperimentVariant("  "); got != "" {
+	if got, _ := client.ApplyExperimentVariant("  "); got != "" {
 		t.Fatalf("an empty key: want \"\", got %q", got)
 	}
 	client.SetConsent(false)
-	if got := client.ApplyExperimentVariant(expTestScopeKey); got != "" || client.ExperimentVariant(expTestScopeKey) != "" {
+	if got, _ := client.ApplyExperimentVariant(expTestScopeKey); got != "" || client.ExperimentVariant(expTestScopeKey) != "" {
 		t.Fatalf("a refused plane serves nothing and records nothing, got %q", got)
 	}
 	client.SetConsent(true)
@@ -107,7 +107,7 @@ func TestApplyExperimentVariantServesWhatTheGetterServes(t *testing.T) {
 
 	dark := newExperimentClient(t, server.URL, func(cfg *Config) { cfg.ExperimentsEnabled = false })
 	defer dark.Close(context.Background())
-	if got := dark.ApplyExperimentVariant(expTestScopeKey); got != "" {
+	if got, _ := dark.ApplyExperimentVariant(expTestScopeKey); got != "" {
 		t.Fatalf("experiments not configured: want \"\", got %q", got)
 	}
 }
@@ -153,4 +153,127 @@ func fetchAndApply(t *testing.T, c *Client, key string) ExperimentAssignmentResu
 	result := fetchAssignment(t, c, key)
 	c.ApplyExperimentVariant(key)
 	return result
+}
+
+// Review round 1 of #125.
+
+// F1: a denial landing between ApplyExperimentVariant's consent check and
+// its lock must not see the variant served or an exposure armed — the same
+// commit-point re-check the fetch makes.
+func TestADenialRacingApplyServesAndRecordsNothing(t *testing.T) {
+	script := &expScript{}
+	script.push(200, expAssignedBody("1"))
+	capture := &expWireCapture{}
+	server := newExperimentServer(t, script, capture)
+	defer server.Close()
+	client := newExperimentClient(t, server.URL, nil)
+	defer client.Close(context.Background())
+	client.SetConsent(true)
+	fetchAssignment(t, client, expTestScopeKey)
+
+	raced := false
+	client.exp.mu.Lock()
+	client.exp.consentRaceSeam = func(stage string) {
+		if stage == "apply_serve" && !raced {
+			raced = true
+			client.SetConsent(false)
+		}
+	}
+	client.exp.mu.Unlock()
+	if got, _ := client.ApplyExperimentVariant(expTestScopeKey); got != "" {
+		t.Fatalf("a denial that landed before the lock must see nothing served, got %q", got)
+	}
+	if !raced {
+		t.Fatal("control: the seam must have fired")
+	}
+	client.SetConsent(true)
+	client.experimentCycle(context.Background())
+	flushOrFail(t, client)
+	if got := len(capture.exposures()); got != 0 {
+		t.Fatalf("an application refused by consent must record nothing after the re-grant, got %d", got)
+	}
+}
+
+// F2: the payload comes from the same entry the exposure is recorded for,
+// and is the host's own copy.
+func TestApplyReturnsThePayloadOfTheRecordedAssignment(t *testing.T) {
+	script := &expScript{}
+	script.push(200, expAssignedBody("1"))
+	script.push(200, strings.Replace(expAssignedBody("2"), `{"speed":2}`, `{"speed":3}`, 1))
+	capture := &expWireCapture{}
+	server := newExperimentServer(t, script, capture)
+	defer server.Close()
+	client := newExperimentClient(t, server.URL, nil)
+	defer client.Close(context.Background())
+
+	fetchAssignment(t, client, expTestScopeKey)
+	variant, payload := client.ApplyExperimentVariant(expTestScopeKey)
+	if variant != "treatment" || payload["speed"] != float64(2) {
+		t.Fatalf("version 1: got %q %v", variant, payload)
+	}
+	payload["speed"] = 99
+	if cached := client.ExperimentVariantPayload(expTestScopeKey); cached["speed"] != float64(2) {
+		t.Fatalf("the returned payload must be the host's copy, the cache now reads %v", cached)
+	}
+	fetchAssignment(t, client, expTestScopeKey)
+	variant, payload = client.ApplyExperimentVariant(expTestScopeKey)
+	if variant != "treatment" || payload["speed"] != float64(3) {
+		t.Fatalf("version 2: got %q %v", variant, payload)
+	}
+	flushOrFail(t, client)
+	versions := map[float64]bool{}
+	for _, fact := range capture.exposures() {
+		versions[fact["props"].(map[string]any)["experiment_version"].(float64)] = true
+	}
+	if len(versions) != 2 || !versions[1] || !versions[2] {
+		t.Fatalf("each returned payload's version must be the one recorded, got versions %v", versions)
+	}
+}
+
+// F4: a first application made through TrackExperimentExposure, whose fact
+// a denial drains between its enqueue and its bookkeeping, re-emits after
+// the re-grant: the purge could not see it, so the emission re-arms it.
+func TestAFirstExplicitApplicationSurvivesARacedPurge(t *testing.T) {
+	script := &expScript{}
+	script.push(200, expAssignedBody("1"))
+	capture := &expWireCapture{}
+	server := newExperimentServer(t, script, capture)
+	defer server.Close()
+	client := newExperimentClient(t, server.URL, nil)
+	defer client.Close(context.Background())
+	client.SetConsent(true)
+	fetchAssignment(t, client, expTestScopeKey)
+	client.exp.mu.Lock()
+	subject := client.exp.currentSubjectIDLocked()
+	marker := client.exp.sessionMarker
+	client.exp.mu.Unlock()
+
+	raced := false
+	client.exp.mu.Lock()
+	client.exp.consentRaceSeam = func(stage string) {
+		if stage == "exposure_enqueued" && !raced {
+			raced = true
+			client.SetConsent(false)
+			client.SetConsent(true)
+		}
+	}
+	client.exp.mu.Unlock()
+	if err := client.TrackExperimentExposure(expTestScopeKey); err != nil {
+		t.Fatalf("TrackExperimentExposure: %v", err)
+	}
+	if !raced {
+		t.Fatal("control: the seam must have fired")
+	}
+	client.experimentCycle(context.Background())
+	flushOrFail(t, client)
+	want := experimentExposureEventID(marker, subject, expTestScopeKey, 1, 0)
+	seen := 0
+	for _, fact := range capture.exposures() {
+		if fact["event_id"] == want {
+			seen++
+		}
+	}
+	if seen != 1 {
+		t.Fatalf("the application's only exposure was lost to the raced purge (delivered %d with its id, %d facts in all)", seen, len(capture.exposures()))
+	}
 }

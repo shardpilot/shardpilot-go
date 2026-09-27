@@ -3334,24 +3334,25 @@ func (c *Client) ExperimentVariant(experimentKey string) string {
 // call is the host's statement that it did. It never touches the network:
 // the exposure fact joins the analytics queue like any other event, and a
 // queue that cannot take it now keeps it owed for the lane's next sweep.
-func (c *Client) ApplyExperimentVariant(experimentKey string) string {
+func (c *Client) ApplyExperimentVariant(experimentKey string) (string, map[string]any) {
 	e := c.exp
 	experimentKey = strings.TrimSpace(experimentKey)
 	if e == nil || experimentKey == "" {
-		return ""
+		return "", nil
 	}
 	if c.experimentConsentRefusal() != nil {
-		return ""
+		return "", nil
 	}
+	e.fireConsentRaceSeam("apply_serve")
 	e.mu.Lock()
 	if e.tornDown {
 		e.mu.Unlock()
-		return ""
+		return "", nil
 	}
 	entry := e.entries[experimentKey]
 	if entry == nil {
 		e.mu.Unlock()
-		return ""
+		return "", nil
 	}
 	// Once per session needs no check here: arming refreshes a same-tuple
 	// snapshot still owed in place, and the emitter skips a tuple whose
@@ -3360,7 +3361,7 @@ func (c *Client) ApplyExperimentVariant(experimentKey string) string {
 	variant := entry.VariantKey
 	e.mu.Unlock()
 	c.sweepExperimentExposures(experimentKey)
-	return variant
+	return variant, nil
 }
 
 // ExperimentVariantPayload returns a copy of the cached assigned variant's
