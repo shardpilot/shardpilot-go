@@ -80,6 +80,10 @@ type Stats struct {
 	ConsentOutboxPersistFailed uint64
 	ConsentOutboxUnreadable    uint64
 	LastConsentError           string
+
+	// ExperimentExposureDrops counts experiment applications that were not
+	// recorded, keyed by reason code. Nil until the first one.
+	ExperimentExposureDrops map[string]uint64
 }
 
 type statsCollector struct {
