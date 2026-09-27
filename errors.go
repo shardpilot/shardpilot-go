@@ -117,4 +117,9 @@ var (
 	// key, or a non-finite outcome value. The fact is refused whole;
 	// nothing is queued.
 	ErrInvalidExperimentFact = errors.New("invalid shardpilot experiment fact")
+
+	// ErrExperimentNotApplied is returned by TrackExperimentOutcome when the
+	// assignment is served but this session has not applied it: an outcome
+	// follows an application, so call ApplyExperimentVariant first.
+	ErrExperimentNotApplied = errors.New("shardpilot experiment has not been applied in this session")
 )

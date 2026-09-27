@@ -148,6 +148,10 @@ const expAssignmentRoute = "/api/v1/runtime/experiments/assignment"
 // which seals an application for the analytics lane.
 const expExposureApplyRoute = "/api/v1/runtime/experiments/exposures"
 
+// expOutcomeApplyRoute is the outcome apply endpoint on the assignment host:
+// an outcome and the application it follows, sealed like an exposure.
+const expOutcomeApplyRoute = "/api/v1/runtime/experiments/outcomes"
+
 // Revalidation cadence (the SDK's contribution to the kill-switch reach):
 // re-issue the assignment GET for every cached entry, batched per cycle,
 // every 300 seconds with ±10% uniform jitter. The endpoint has no

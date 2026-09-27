@@ -27,6 +27,8 @@ type expScript struct {
 	// apply is the stub exposure apply route (experiments_apply_hop_test.go),
 	// mounted beside the assignment route.
 	apply expApplyStub
+	// outcome is the stub outcome apply route, mounted beside it.
+	outcome expApplyStub
 }
 
 type expScriptResponse struct {
@@ -200,6 +202,8 @@ func newExperimentServer(t *testing.T, script *expScript, capture *expWireCaptur
 	mux := http.NewServeMux()
 	mux.HandleFunc(expAssignmentRoute, script.handler(t))
 	mux.HandleFunc(expExposureApplyRoute, script.apply.handler(t))
+	script.outcome.outcome = true
+	mux.HandleFunc(expOutcomeApplyRoute, script.outcome.handler(t))
 	mux.HandleFunc("/v1/consent", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
@@ -1405,6 +1409,8 @@ func TestExperimentFactWireEnvelope(t *testing.T) {
 	script.push(200, expAssignedBody("1"))
 	mux.HandleFunc(expAssignmentRoute, script.handler(t))
 	mux.HandleFunc(expExposureApplyRoute, script.apply.handler(t))
+	script.outcome.outcome = true
+	mux.HandleFunc(expOutcomeApplyRoute, script.outcome.handler(t))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		var batch captured
 		_ = json.NewDecoder(ingestRequestBody(t, r)).Decode(&batch)
@@ -1526,6 +1532,8 @@ func TestExperimentFactsGateOnAnonymousActorUnderFloor(t *testing.T) {
 	script.push(200, expAssignedBody("1"))
 	mux.HandleFunc(expAssignmentRoute, script.handler(t))
 	mux.HandleFunc(expExposureApplyRoute, script.apply.handler(t))
+	script.outcome.outcome = true
+	mux.HandleFunc(expOutcomeApplyRoute, script.outcome.handler(t))
 	mux.HandleFunc("/v1/consent", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusAccepted)
 		_, _ = w.Write([]byte(`{}`))

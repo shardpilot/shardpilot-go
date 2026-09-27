@@ -97,6 +97,11 @@ type Stats struct {
 	// the re-grant: an extra application, or one whose assignment is no
 	// longer served). Each Snapshot returns a fresh copy.
 	ExperimentExposureDrops map[string]uint64
+
+	// ExperimentOutcomeDrops counts experiment outcomes that were not
+	// recorded, keyed by the same reason codes as ExperimentExposureDrops;
+	// nil until the first one. Each Snapshot returns a fresh copy.
+	ExperimentOutcomeDrops map[string]uint64
 }
 
 type statsCollector struct {
