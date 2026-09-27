@@ -1161,15 +1161,16 @@ func (c *Client) closeExperimentPreFlush() {
 // here), then the consumer tears down: an assignment response still in
 // flight must not install, persist, or pace from now on. Best-effort by
 // design and never silent: whatever cannot be delivered is counted by the
-// close path's accounting, and the durable record re-arms live assignments
-// at the next launch.
+// close path's accounting. The durable record restores live assignments at
+// the next launch; the host's next application there records again.
 // closeExperimentPostFlush drains close-time owed exposures in a LOOP —
 // sweep, then flush what entered the queue, until nothing is owed or a full
 // pass makes no progress (a bounded-capacity queue can admit as little as
 // one fact per pass, and one sweep+flush would silently lose the rest).
 // Whatever a stuck pass leaves is surfaced (logged and counted by the close
-// path's delivery accounting; live assignments re-arm from the durable
-// record at the next launch), then the consumer tears down.
+// path's delivery accounting; the durable record restores live
+// assignments at the next launch, where the host's next application records
+// again), then the consumer tears down.
 func (c *Client) closeExperimentPostFlush(ctx context.Context) {
 	e := c.exp
 	if e == nil {
@@ -1177,7 +1178,8 @@ func (c *Client) closeExperimentPostFlush(ctx context.Context) {
 	}
 	if c.experimentConsentRefusal() == nil {
 		// The FIRST pass may use the network, bounded by Close's context:
-		// every still-unsealed application gets its one attempt there. Later
+		// it seals what it can and stops at the first refusal that keeps an
+		// application owed (the plane's pacing then defers the rest). Later
 		// passes only hand already-sealed facts to the queue as room frees.
 		network := true
 		for {

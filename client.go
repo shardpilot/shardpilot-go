@@ -674,8 +674,8 @@ func (c *Client) finishClose(ctx context.Context) error {
 	// as little as one fact per pass, and a single pass would silently
 	// lose the rest. Best-effort by design and never silent: whatever
 	// enters the queue is delivered or counted by the close path's
-	// accounting, and the durable record re-arms live assignments at the
-	// next launch.
+	// accounting. The durable record restores live assignments at the next
+	// launch, where the host's next application records again.
 	c.closeExperimentPostFlush(ctx)
 	c.stopOnce.Do(func() {
 		close(c.stop)

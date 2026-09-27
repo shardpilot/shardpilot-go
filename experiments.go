@@ -3441,8 +3441,9 @@ func (c *Client) ExperimentVariant(experimentKey string) string {
 // Recording is not synchronous. This call never touches the network: it
 // keeps the application owed, and the background lane — within about a
 // second — has the platform seal it and hands the sealed fact to the
-// analytics queue. An application still unsealed at Close gets one bounded
-// attempt there. An assignment that cannot be recorded (one cached without
+// analytics queue. Close makes one pass, bounded by its context, over what
+// is still unsealed; the pass stops at the first refusal that keeps an
+// application owed, and what remains is counted unsealed_at_close. An assignment that cannot be recorded (one cached without
 // the serving state its fetch returned, a non-client_id unit, or a client
 // with no AnonymousID to post the fact under) is still served, and counted
 // in Stats.ExperimentExposureDrops as not_recordable; the first application
