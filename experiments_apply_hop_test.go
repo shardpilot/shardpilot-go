@@ -1,6 +1,7 @@
 package shardpilot
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -79,8 +81,12 @@ func expStubFactID(exposureID string) string {
 func (s *expApplyStub) handler(t *testing.T) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
+		// Numbers stay exact (json.Number), so a sealed version above 2^53
+		// echoes back as sent.
 		var body map[string]any
-		_ = json.Unmarshal(raw, &body)
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.UseNumber()
+		_ = decoder.Decode(&body)
 		s.mu.Lock()
 		s.requests = append(s.requests, expApplyRequest{header: r.Header.Clone(), body: body})
 		response := expScriptResponse{status: 200, body: expApplyEcho}
@@ -220,8 +226,8 @@ func TestAnApplicationIsSealedByTheApplyHopAndDeliveredVerbatim(t *testing.T) {
 	exposureID, _ := body["exposure_id"].(string)
 	appliedAt, _ := body["applied_at"].(string)
 	if body["app_key"] != "app-test" || body["environment_key"] != "develop" || body["experiment_key"] != expTestScopeKey ||
-		body["experiment_version"] != float64(3) || body["variant_key"] != "treatment" || !strings.HasPrefix(subject, "spcid_") ||
-		!expExposureIDPattern.MatchString(exposureID) || body["served_revision"] != float64(7) || body["served_kill_gate"] != true ||
+		body["experiment_version"] != json.Number("3") || body["variant_key"] != "treatment" || !strings.HasPrefix(subject, "spcid_") ||
+		!expExposureIDPattern.MatchString(exposureID) || body["served_revision"] != json.Number("7") || body["served_kill_gate"] != true ||
 		body["served_at"] != "2026-09-27T01:00:00.123456789Z" {
 		t.Fatalf("the request must carry the pinned application: %v", body)
 	}
@@ -769,5 +775,101 @@ func TestCloseDoesNotWaitOutTheLanesInFlightApply(t *testing.T) {
 	}
 	if n := rig.client.Snapshot().ExperimentExposureDrops["unsealed_at_close"]; n != 1 {
 		t.Fatalf("the application Close could not seal is counted unsealed_at_close, got %d", n)
+	}
+}
+
+// A host that applies the variant on every frame before the lane runs makes
+// one application, not a queue of duplicates the bound would then drop and
+// count.
+func TestRepeatedApplicationsBeforeTheSweepAreOneApplication(t *testing.T) {
+	rig := newExpHopRig(t, nil)
+	fetchAssignment(t, rig.client, expTestScopeKey)
+	for i := 0; i < 2*expMaxOwedExposures; i++ {
+		rig.client.ApplyExperimentVariant(expTestScopeKey)
+	}
+	if rig.owed() != 1 || len(rig.client.Snapshot().ExperimentExposureDrops) != 0 {
+		t.Fatalf("repeated applications of one owed tuple are one application: owed=%d drops=%v",
+			rig.owed(), rig.client.Snapshot().ExperimentExposureDrops)
+	}
+	rig.cycle()
+	flushOrFail(t, rig.client)
+	if got := len(rig.script.apply.requestsSoFar()); got != 1 {
+		t.Fatalf("one application is one apply request, got %d", got)
+	}
+}
+
+// A version above 2^53 is posted exactly as the platform sealed it: the
+// sealed props are not routed through float64 on the way to the envelope.
+func TestASealedVersionAboveTwoToThe53IsPostedExactly(t *testing.T) {
+	const version = "9007199254740993" // 2^53+1; the nearest float64 is 9007199254740992
+	rig := newExpHopRig(t, nil, strings.Replace(expAssignedServedBody(expServedTrio), `"version":3`, `"version":`+version, 1))
+	fetchAssignment(t, rig.client, expTestScopeKey)
+	rig.client.ApplyExperimentVariant(expTestScopeKey)
+	rig.cycle()
+	flushOrFail(t, rig.client)
+	requests := rig.script.apply.requestsSoFar()
+	if len(requests) != 1 || requests[0].body["experiment_version"] != json.Number(version) {
+		t.Fatalf("control: the application carries the version exactly, got %d request(s)", len(requests))
+	}
+	posted := false
+	for _, batch := range rig.capture.rawBatches() {
+		if bytes.Contains(batch, []byte(`"experiment_version":`+version)) {
+			posted = true
+		}
+	}
+	if !posted {
+		t.Fatalf("the posted props must carry the sealed version %s exactly", version)
+	}
+}
+
+// One cycle makes at most expMaxOwedExposures apply requests; the rest wait
+// for the next cycle, so the lane's cycle stays bounded however many
+// applications are owed.
+func TestOneCycleMakesAtMostEightApplyRequests(t *testing.T) {
+	rig := newExpHopRig(t, nil, expServedBodyForKey("exp-a"), expServedBodyForKey("exp-b"))
+	for _, key := range []string{"exp-a", "exp-b"} {
+		fetchAssignment(t, rig.client, key)
+		rig.client.ApplyExperimentVariant(key)
+		for i := 0; i < 5; i++ {
+			if err := rig.client.TrackExperimentExposure(key); err != nil {
+				t.Fatalf("TrackExperimentExposure(%s): %v", key, err)
+			}
+		}
+	}
+	if rig.owed() != 12 {
+		t.Fatalf("control: twelve owed applications, got %d", rig.owed())
+	}
+	rig.cycle()
+	if got := len(rig.script.apply.requestsSoFar()); got != expMaxOwedExposures {
+		t.Fatalf("one cycle makes at most %d apply requests, got %d", expMaxOwedExposures, got)
+	}
+	rig.cycle()
+	flushOrFail(t, rig.client)
+	if got, facts := len(rig.script.apply.requestsSoFar()), len(rig.capture.exposures()); got != 12 || facts != 12 || rig.owed() != 0 {
+		t.Fatalf("the next cycle sends the rest: requests=%d facts=%d owed=%d", got, facts, rig.owed())
+	}
+}
+
+// A revalidation due at the start of a cycle runs before the cycle's apply
+// requests: a kill switch does not wait behind the exposure backlog.
+func TestADueRevalidationRunsBeforeTheExposureSweep(t *testing.T) {
+	rig := newExpHopRig(t, nil)
+	fetchAssignment(t, rig.client, expTestScopeKey)
+	rig.client.ApplyExperimentVariant(expTestScopeKey)
+	fetches := rig.script.requestCount()
+	var fetchesAtApply atomic.Int64
+	fetchesAtApply.Store(-1)
+	rig.script.apply.onRequest = func() {
+		fetchesAtApply.CompareAndSwap(-1, int64(rig.script.requestCount()))
+	}
+	rig.client.exp.mu.Lock()
+	rig.client.exp.revalidateAtMS = 1
+	rig.client.exp.mu.Unlock()
+	rig.cycle()
+	if rig.script.requestCount() != fetches+1 {
+		t.Fatalf("control: the due revalidation fetches once, got %d fetch(es) after %d", rig.script.requestCount(), fetches)
+	}
+	if got := fetchesAtApply.Load(); got != int64(fetches+1) {
+		t.Fatalf("the revalidation must precede the apply request: fetches seen at the apply request=%d, before the cycle=%d", got, fetches)
 	}
 }

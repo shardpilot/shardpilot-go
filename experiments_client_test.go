@@ -127,6 +127,8 @@ type expWireCapture struct {
 	status    int
 	hits      int
 	envelopes []map[string]any
+	// raw keeps each accepted batch's request body as sent.
+	raw [][]byte
 }
 
 func (w *expWireCapture) handler(t *testing.T) http.HandlerFunc {
@@ -136,7 +138,8 @@ func (w *expWireCapture) handler(t *testing.T) http.HandlerFunc {
 		var batch struct {
 			Events []map[string]any `json:"events"`
 		}
-		_ = json.NewDecoder(ingestRequestBody(t, r)).Decode(&batch)
+		wire := ingestRequestBytes(t, r)
+		_ = json.Unmarshal(wire, &batch)
 		w.mu.Lock()
 		w.hits++
 		status := w.status
@@ -145,6 +148,7 @@ func (w *expWireCapture) handler(t *testing.T) http.HandlerFunc {
 		}
 		if status == http.StatusAccepted {
 			w.envelopes = append(w.envelopes, batch.Events...)
+			w.raw = append(w.raw, wire)
 		}
 		count := len(batch.Events)
 		w.mu.Unlock()
@@ -154,6 +158,13 @@ func (w *expWireCapture) handler(t *testing.T) http.HandlerFunc {
 			_, _ = rw.Write([]byte(fmt.Sprintf(`{"accepted":%d,"rejected":0,"duplicates":0}`, count)))
 		}
 	}
+}
+
+// rawBatches returns the accepted batches' request bodies as sent.
+func (w *expWireCapture) rawBatches() [][]byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([][]byte(nil), w.raw...)
 }
 
 func (w *expWireCapture) setStatus(status int) {
