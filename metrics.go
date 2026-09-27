@@ -91,8 +91,11 @@ type Stats struct {
 	// real_subjects_disabled (the platform's real-subjects sentinel withdrew
 	// every owed application); foreign_scope (the sealed fact names another
 	// workspace, app or environment than this client's); unsealed_at_close
-	// (still unsealed after Close's one bounded attempt). Each Snapshot
-	// returns a fresh copy.
+	// (still unsealed after Close's one bounded attempt); undelivered_at_close
+	// (sealed, but Close could not hand the fact to the queue);
+	// consent_withdrawn (owed when consent was withdrawn and not re-armed on
+	// the re-grant: an extra application, or one whose assignment is no
+	// longer served). Each Snapshot returns a fresh copy.
 	ExperimentExposureDrops map[string]uint64
 }
 

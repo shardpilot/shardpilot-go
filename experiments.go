@@ -2441,6 +2441,8 @@ const (
 	expDropRealSubjectsDisabled = "real_subjects_disabled"
 	expDropForeignScope         = "foreign_scope"
 	expDropUnsealedAtClose      = "unsealed_at_close"
+	expDropUndeliveredAtClose   = "undelivered_at_close"
+	expDropConsentWithdrawn     = "consent_withdrawn"
 )
 
 // countDropLocked reports n applications not recorded for reason.
@@ -2496,25 +2498,37 @@ func (e *experimentsState) onAnalyticsPurge() {
 	// owed when the purge landed. Owed snapshots are then DISCARDED — extra
 	// applications with them — and after the purge the session's slate is
 	// exactly its still-live applied treatments: a snapshot for a
-	// since-dropped entry does not re-arm into the re-granted session.
+	// since-dropped entry does not re-arm into the re-granted session. Each
+	// owed application that does not come back as a re-arm is counted
+	// consent_withdrawn.
 	applied := make(map[string]expApplication)
 	for tuple, exposed := range e.exposed {
 		if exposed.auto {
 			applied[tuple] = exposed.app
 		}
 	}
+	owedTotal := 0
+	owedTuples := make(map[string]bool)
 	for key, list := range e.pendingExposure {
+		owedTotal += len(list)
 		for _, owed := range list {
 			if !owed.extra && owed.session == e.sessionMarker {
-				applied[exposureTupleKey(key, owed.entry)] = owed.app
+				tuple := exposureTupleKey(key, owed.entry)
+				applied[tuple] = owed.app
+				owedTuples[tuple] = true
 			}
 		}
 	}
 	e.pendingExposure = make(map[string][]*expOwedExposure)
 	e.resetExposedAutoLocked()
+	rearmedOwed := 0
 	for key, entry := range e.entries {
-		if app, ok := applied[exposureTupleKey(key, entry)]; ok {
+		tuple := exposureTupleKey(key, entry)
+		if app, ok := applied[tuple]; ok {
 			e.armExposureLocked(key, entry, app, false)
+			if owedTuples[tuple] {
+				rearmedOwed++
+			}
 		}
 	}
 	// Latch-cleared serving state is RETAINED, not dropped: an ordinary
@@ -2527,10 +2541,15 @@ func (e *experimentsState) onAnalyticsPurge() {
 		if e.entries[key] != nil {
 			continue // the live entry already re-armed above
 		}
-		if app, ok := applied[exposureTupleKey(key, entry)]; ok {
+		tuple := exposureTupleKey(key, entry)
+		if app, ok := applied[tuple]; ok {
 			e.armExposureLocked(key, entry, app, false)
+			if owedTuples[tuple] {
+				rearmedOwed++
+			}
 		}
 	}
+	e.countDropLocked(expDropConsentWithdrawn, owedTotal-rearmedOwed)
 }
 
 // resetExposedAutoLocked clears every tuple's delivered mark while keeping

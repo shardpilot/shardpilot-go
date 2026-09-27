@@ -1202,8 +1202,10 @@ func (c *Client) closeExperimentPostFlush(ctx context.Context) {
 		}
 	}
 	// Applications STILL owed at teardown are lost with the process: COUNT
-	// them as dropped with a distinct diagnostic — never a silent loss. The
-	// ones never sealed are counted unsealed_at_close as well.
+	// them as dropped with a distinct diagnostic — never a silent loss. Each
+	// is counted by why as well: unsealed_at_close if it was never sealed,
+	// undelivered_at_close if its sealed fact could not be handed to the
+	// queue.
 	e.mu.Lock()
 	remaining, unsealed := 0, 0
 	for _, list := range e.pendingExposure {
@@ -1215,11 +1217,12 @@ func (c *Client) closeExperimentPostFlush(ctx context.Context) {
 		}
 	}
 	e.countDropLocked(expDropUnsealedAtClose, unsealed)
+	e.countDropLocked(expDropUndeliveredAtClose, remaining-unsealed)
 	e.mu.Unlock()
 	if remaining > 0 {
 		c.stats.dropped.Add(uint64(remaining))
 		c.stats.setLastError("experiment_exposures_discarded_at_close")
-		c.logf("shardpilot experiments: %d owed exposure fact(s) discarded at close (counted in Stats.Dropped; %d never sealed, counted unsealed_at_close)", remaining, unsealed)
+		c.logf("shardpilot experiments: %d owed exposure fact(s) discarded at close (counted in Stats.Dropped; %d never sealed, counted unsealed_at_close; %d sealed and not enqueued, counted undelivered_at_close)", remaining, unsealed, remaining-unsealed)
 	}
 }
 
