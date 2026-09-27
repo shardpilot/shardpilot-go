@@ -5584,17 +5584,12 @@ func TestConsentRetryDispatchesWhenItsDeadlineAlreadyElapsed(t *testing.T) {
 // the race is precisely that the worker is ALREADY blocked, which a test
 // cannot schedule reliably.
 func TestArmingConsentDeferralWakesTheWorker(t *testing.T) {
-	_, server := newFloorTestServer(t)
-	defer server.Close()
-
-	client := newFloorTestClient(t, server.URL, t.TempDir(), nil)
-	defer func() { _ = client.Close(context.Background()) }()
-
-	// Drain any nudge the client's own start-up left pending, so what the
-	// assertion below sees can only have come from arming.
-	select {
-	case <-client.consentWake:
-	default:
+	// This unit test observes the pending nudge. A live worker would be a
+	// competing receiver and could consume it before the assertion.
+	client := &Client{
+		clock:         realClock{},
+		consentOutbox: &consentOutbox{},
+		consentWake:   make(chan struct{}, 1),
 	}
 
 	client.armConsentDeferral(&HTTPStatusError{StatusCode: http.StatusServiceUnavailable})
