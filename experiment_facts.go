@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
@@ -306,6 +307,9 @@ func (c *Client) emitOwedExposure(ctx context.Context, experimentKey string, rec
 func (c *Client) sealExperimentApplication(ctx context.Context, experimentKey string, owed expOwedCopy) (sealed *expSealedFact, dropped string, keep bool) {
 	e := c.exp
 	resp, err := c.postExposureApplication(ctx, experimentKey, owed)
+	if errors.Is(err, errExperimentApplyConsentRefused) {
+		return nil, "", true // a denial refused or aborted it: kept, unpaced; the denial's purge settles it
+	}
 	if err != nil && resp.status == 0 {
 		if ctx != nil && ctx.Err() != nil {
 			return nil, "", true // the lane is stopping or Close ran out: kept, unpaced
@@ -325,10 +329,21 @@ func (c *Client) sealExperimentApplication(ctx context.Context, experimentKey st
 		e.mu.Lock()
 		defer e.mu.Unlock()
 		if resp.status == 403 && experimentBodyErrorText(resp.body, resp.bodyIncomplete) == expSentinelRealSubjectsDisabled {
-			for _, list := range e.pendingExposure {
-				e.countDropLocked(expDropRealSubjectsDisabled, len(list))
+			// The assignment route's sentinel, from the apply route: the
+			// same withdrawal (the latch, the cached and durable
+			// assignments, the fact purge epoch, the owed applications,
+			// each counted real_subjects_disabled). The caller withdraws
+			// the pipeline's facts once it releases emitMu.
+			if scope := e.scopeForLocked(e.currentSubjectIDLocked()); scope != "" {
+				if persistFailed, _ := e.applySentinelWithdrawalLocked(scope, nowMS); persistFailed {
+					c.stats.setLastError("experiment_cache_persist_failed")
+				}
+			} else {
+				for _, list := range e.pendingExposure {
+					e.countDropLocked(expDropRealSubjectsDisabled, len(list))
+				}
+				e.pendingExposure = make(map[string][]*expOwedExposure)
 			}
-			e.pendingExposure = make(map[string][]*expOwedExposure)
 			return nil, expDropRealSubjectsDisabled, false
 		}
 		e.applyBlocked = true
@@ -383,13 +398,37 @@ func (c *Client) postExposureApplication(ctx context.Context, experimentKey stri
 	// must not let a silent endpoint hold the emission lock.
 	ctx, cancel := contextWithDefaultTimeout(ctx, c.cfg.HTTPTimeout)
 	defer cancel()
-	return c.transport.FetchRemoteConfig(ctx, remoteConfigRequest{
+	// Gated like an assignment fetch, and for the same promise — no
+	// experiment traffic past a completed revocation (the request carries
+	// the subject and the attributes). The gate is loaded BEFORE the
+	// pre-wire re-check: a denial completing after the load cancels the
+	// request mid-flight; one completing before it is refused here.
+	gate := c.consentGate.Load()
+	if gate != nil {
+		var cancelOnDenial context.CancelFunc
+		ctx, cancelOnDenial = context.WithCancel(ctx)
+		defer cancelOnDenial()
+		stop := context.AfterFunc(gate.ctx, cancelOnDenial)
+		defer stop()
+	}
+	if c.experimentConsentRefusal() != nil {
+		return remoteConfigResponse{}, errExperimentApplyConsentRefused
+	}
+	resp, err := c.transport.FetchRemoteConfig(ctx, remoteConfigRequest{
 		url:    e.baseURL + expExposureApplyRoute,
 		bearer: c.cfg.APIKey,
 		method: "POST",
 		body:   body,
 	})
+	if err != nil && gate != nil && gate.ctx.Err() != nil && errors.Is(err, context.Canceled) {
+		return remoteConfigResponse{}, errExperimentApplyConsentRefused
+	}
+	return resp, err
 }
+
+// errExperimentApplyConsentRefused is an apply request the consent gate
+// refused before the wire or aborted on the wire.
+var errExperimentApplyConsentRefused = errors.New("shardpilot experiments: apply request refused by a consent denial")
 
 // parseSealedExposure reads the apply endpoint's 200 body: {"fact":{...},
 // "seal":"..."}, the fact an experiment_exposure with an id, an event time,
@@ -488,6 +527,19 @@ func (c *Client) sweepExperimentExposuresMode(ctx context.Context, experimentKey
 // head met with the budget spent waits, unsent, for a later sweep. nil is
 // unbounded.
 func (c *Client) sweepExperimentExposuresBudget(ctx context.Context, experimentKey string, atClose, network bool, budget *int) {
+	if c.sweepExperimentExposuresUnderEmit(ctx, experimentKey, atClose, network, budget) {
+		// The apply endpoint answered with the real-subjects sentinel and
+		// the withdrawal landed under e.mu; the PIPELINE-resident facts —
+		// queue, worker batch, spool — are withdrawn here, off emitMu,
+		// exactly as after the assignment route's sentinel.
+		c.purgeWithdrawnExperimentFacts()
+		c.logf("shardpilot experiments: the platform disabled real-subject assignment; dropped the cached assignments and their subject fact keys")
+	}
+}
+
+// sweepExperimentExposuresUnderEmit is the sweep's body, under emitMu. It
+// reports whether the real-subjects sentinel landed.
+func (c *Client) sweepExperimentExposuresUnderEmit(ctx context.Context, experimentKey string, atClose, network bool, budget *int) (sentinel bool) {
 	e := c.exp
 	e.emitMu.Lock()
 	defer e.emitMu.Unlock()
@@ -497,7 +549,7 @@ func (c *Client) sweepExperimentExposuresBudget(ctx context.Context, experimentK
 		if len(list) == 0 {
 			delete(e.pendingExposure, experimentKey)
 			e.mu.Unlock()
-			return
+			return sentinel
 		}
 		head := list[0]
 		// Copy the record's fields UNDER the lock, with the purge epoch in
@@ -514,9 +566,12 @@ func (c *Client) sweepExperimentExposuresBudget(ctx context.Context, experimentK
 				*budget--
 			}
 		}
-		ok, _, terminal := c.emitOwedExposure(ctx, experimentKey, head, owed, headNetwork, atClose, headEpoch)
+		ok, reason, terminal := c.emitOwedExposure(ctx, experimentKey, head, owed, headNetwork, atClose, headEpoch)
+		if reason == expDropRealSubjectsDisabled {
+			return true
+		}
 		if !ok && !terminal {
-			return
+			return sentinel
 		}
 		e.mu.Lock()
 		// Remove the settled head — by identity, not position: an arm
