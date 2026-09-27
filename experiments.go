@@ -3309,6 +3309,12 @@ func (c *Client) ExperimentVariant(experimentKey string) string {
 	return ""
 }
 
+// ApplyExperimentVariant is not implemented yet: it serves the variant and
+// records nothing of its own.
+func (c *Client) ApplyExperimentVariant(experimentKey string) string {
+	return c.ExperimentVariant(experimentKey)
+}
+
 // ExperimentVariantPayload returns a copy of the cached assigned variant's
 // payload for an experiment, or nil — under exactly ExperimentVariant's
 // serving rules.
