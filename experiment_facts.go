@@ -327,27 +327,35 @@ func (c *Client) sealExperimentApplication(ctx context.Context, experimentKey st
 		}
 	case resp.status == 401 || resp.status == 403:
 		e.mu.Lock()
-		defer e.mu.Unlock()
-		if resp.status == 403 && experimentBodyErrorText(resp.body, resp.bodyIncomplete) == expSentinelRealSubjectsDisabled {
-			// The assignment route's sentinel, from the apply route: the
-			// same withdrawal (the latch, the cached and durable
-			// assignments, the fact purge epoch, the owed applications,
-			// each counted real_subjects_disabled). The caller withdraws
-			// the pipeline's facts once it releases emitMu.
-			if scope := e.scopeForLocked(e.currentSubjectIDLocked()); scope != "" {
-				if persistFailed, _ := e.applySentinelWithdrawalLocked(scope, nowMS); persistFailed {
-					c.stats.setLastError("experiment_cache_persist_failed")
-				}
-			} else {
-				for _, list := range e.pendingExposure {
-					e.countDropLocked(expDropRealSubjectsDisabled, len(list))
-				}
-				e.pendingExposure = make(map[string][]*expOwedExposure)
-			}
-			return nil, expDropRealSubjectsDisabled, false
+		if resp.status != 403 || experimentBodyErrorText(resp.body, resp.bodyIncomplete) != expSentinelRealSubjectsDisabled {
+			e.applyBlocked = true
+			e.mu.Unlock()
+			return nil, "", true
 		}
-		e.applyBlocked = true
-		return nil, "", true
+		// The assignment route's sentinel, from the apply route: the same
+		// withdrawal — the latch, the cached and durable assignments, the
+		// owed applications (each counted real_subjects_disabled), and the
+		// pipeline's facts. The last need nothing more here: the fact purge
+		// epoch the withdrawal bumps fences the queue and the worker's
+		// batch at every consumer, and it sweeps the spool under e.mu. (The
+		// assignment route's off-lock purge finds nothing new either; if
+		// the spool sweep ever leaves the withdrawal, this route needs that
+		// purge too.)
+		persistFailed := false
+		if scope := e.scopeForLocked(e.currentSubjectIDLocked()); scope != "" {
+			persistFailed, _ = e.applySentinelWithdrawalLocked(scope, nowMS)
+		} else {
+			for _, list := range e.pendingExposure {
+				e.countDropLocked(expDropRealSubjectsDisabled, len(list))
+			}
+			e.pendingExposure = make(map[string][]*expOwedExposure)
+		}
+		e.mu.Unlock()
+		if persistFailed {
+			c.stats.setLastError("experiment_cache_persist_failed")
+		}
+		c.logf("shardpilot experiments: the platform disabled real-subject assignment (apply endpoint); dropped the cached assignments, the owed applications and their subject fact keys")
+		return nil, expDropRealSubjectsDisabled, false
 	case resp.status >= 400 && resp.status < 500 && resp.status != 408 && resp.status != 429:
 		e.mu.Lock()
 		e.countDropLocked(expDropApplyRefused, 1)
@@ -527,19 +535,6 @@ func (c *Client) sweepExperimentExposuresMode(ctx context.Context, experimentKey
 // head met with the budget spent waits, unsent, for a later sweep. nil is
 // unbounded.
 func (c *Client) sweepExperimentExposuresBudget(ctx context.Context, experimentKey string, atClose, network bool, budget *int) {
-	if c.sweepExperimentExposuresUnderEmit(ctx, experimentKey, atClose, network, budget) {
-		// The apply endpoint answered with the real-subjects sentinel and
-		// the withdrawal landed under e.mu; the PIPELINE-resident facts —
-		// queue, worker batch, spool — are withdrawn here, off emitMu,
-		// exactly as after the assignment route's sentinel.
-		c.purgeWithdrawnExperimentFacts()
-		c.logf("shardpilot experiments: the platform disabled real-subject assignment; dropped the cached assignments and their subject fact keys")
-	}
-}
-
-// sweepExperimentExposuresUnderEmit is the sweep's body, under emitMu. It
-// reports whether the real-subjects sentinel landed.
-func (c *Client) sweepExperimentExposuresUnderEmit(ctx context.Context, experimentKey string, atClose, network bool, budget *int) (sentinel bool) {
 	e := c.exp
 	e.emitMu.Lock()
 	defer e.emitMu.Unlock()
@@ -549,7 +544,7 @@ func (c *Client) sweepExperimentExposuresUnderEmit(ctx context.Context, experime
 		if len(list) == 0 {
 			delete(e.pendingExposure, experimentKey)
 			e.mu.Unlock()
-			return sentinel
+			return
 		}
 		head := list[0]
 		// Copy the record's fields UNDER the lock, with the purge epoch in
@@ -566,12 +561,9 @@ func (c *Client) sweepExperimentExposuresUnderEmit(ctx context.Context, experime
 				*budget--
 			}
 		}
-		ok, reason, terminal := c.emitOwedExposure(ctx, experimentKey, head, owed, headNetwork, atClose, headEpoch)
-		if reason == expDropRealSubjectsDisabled {
-			return true
-		}
+		ok, _, terminal := c.emitOwedExposure(ctx, experimentKey, head, owed, headNetwork, atClose, headEpoch)
 		if !ok && !terminal {
-			return sentinel
+			return
 		}
 		e.mu.Lock()
 		// Remove the settled head — by identity, not position: an arm
