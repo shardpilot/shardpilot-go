@@ -941,10 +941,10 @@ func TestADenialBeforeTheWireSendsNoApplyRequest(t *testing.T) {
 		t.Fatalf("no apply request may leave after a denial, got %d", got)
 	}
 	rig.client.exp.mu.Lock()
-	paced := rig.client.exp.retryAfterMS
+	deadline, streak := rig.client.exp.retryAfterMS, rig.client.exp.backoffAttempt
 	rig.client.exp.mu.Unlock()
-	if paced != 0 {
-		t.Fatalf("a request a denial refused is not a transient failure: nothing may be paced, got a deadline %d", paced)
+	if deadline != 0 || streak != 0 {
+		t.Fatalf("a request a denial refused is not a transient failure: nothing may be paced, got deadline=%d backoff streak=%d", deadline, streak)
 	}
 }
 
