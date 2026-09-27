@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -18,7 +20,7 @@ import (
 // flush worker, the spool, and the consent gates — so they inherit exactly
 // the consent posture the integrator configured. No consent bypass.
 //
-// Exposures take one hop first. An application (ApplyExperimentVariant, or
+// Both take one hop first. An application (ApplyExperimentVariant, or
 // an extra one from TrackExperimentExposure) is kept as an owed record — the
 // application as it was: the assignment's version, variant, serving state,
 // subject and attributes, a random exposure_id and applied_at. The
@@ -30,7 +32,10 @@ import (
 // sealed, the seal beside them — under this client's own envelope identity
 // and the application's session. The subject never enters an analytics
 // event; the envelope identity and the session never reach the apply
-// endpoint.
+// endpoint. An outcome (TrackExperimentOutcome) is an owed record of the
+// same shape — the application it follows, with no exposure_id — plus its
+// own outcome_id, occurred_at, key and value, sent to the outcome apply
+// endpoint and delivered the same way.
 //
 // Wire contract (analytics ingest, strict):
 //   - names `experiment_exposure` / `experiment_outcome`;
@@ -41,10 +46,8 @@ import (
 //     GDPR erasure cascade reach the fact. A client with no configured
 //     AnonymousID cannot post an in-contract fact: its applications are not
 //     recordable (counted);
-//   - an exposure's props are the sealed props; an outcome's are the exact
-//     allowlist (experiment_key, experiment_version, assignment_key,
-//     variant_key, assignment_unit, outcome_key, outcome_value), with the
-//     SERVER-MINTED subject-fact key VERBATIM as assignment_key.
+//   - the props are the sealed props, the server-minted subject-fact key
+//     among them as assignment_key.
 //
 // Delivery timing (exposures): the session's own application of a tuple —
 // the "automatic" slot below — goes out once per (experiment, version,
@@ -125,68 +128,6 @@ func (c *Client) enqueueExperimentFact(event Event, atClose bool) error {
 	return nil
 }
 
-// buildExperimentFactEvent assembles one strict-allowlist experiment fact
-// from a cached entry. The subject-fact key is the fact's assignment_key —
-// enforced here so the raw spcid subject id can never leave the SDK in
-// experiment props. eventID, when non-empty, presets the deterministic
-// exposure id; empty lets the pipeline mint a fresh one (outcomes).
-// factEpoch is the pipeline purge epoch the CALLER observed UNDER e.mu
-// atomically with the entry snapshot — never loaded here: this builder runs
-// after the snapshot left the lock, and a real-subjects sentinel landing in
-// that gap would stamp a pre-sentinel entry with the post-sentinel epoch,
-// so the purge (blocked on emitMu until the emission completes) would treat
-// the withdrawn fact as fresh and leave its subject-fact key in the
-// queue/spool.
-func (c *Client) buildExperimentFactEvent(name, experimentKey string, entry *expEntry, eventID, sessionID string, factEpoch uint64) (Event, string) {
-	factKey := strings.TrimSpace(entry.SubjectFactKey)
-	if !expSubjectFactKeyPattern.MatchString(factKey) {
-		// The privacy boundary of the fact lane: ONLY a grammar-valid
-		// server-minted sfk1_ key may ride assignment_key. Absent AND
-		// malformed values (a raw spcid_ echo included) alike mean this
-		// assignment produces no fact.
-		return Event{}, "exposure_no_subject_fact_key"
-	}
-	if c.cfg.AnonymousID == "" {
-		// The ingest contract requires the SDK client identity as
-		// anonymous_id on experiment facts (erasure reachability): with
-		// none configured the fact cannot be built in-contract.
-		return Event{}, "exposure_no_anonymous_id"
-	}
-	props := map[string]any{
-		"experiment_key":     experimentKey,
-		"experiment_version": entry.Version,
-		"assignment_key":     factKey,
-		"variant_key":        entry.VariantKey,
-		"assignment_unit":    entry.AssignmentUnit,
-	}
-	return Event{
-		ID:          eventID,
-		Name:        name,
-		AnonymousID: c.cfg.AnonymousID,
-		// The arm-time session identity. The source override below makes
-		// these facts publish as "client" whatever tier the configuration
-		// is, and the ingest contract requires session_id on every
-		// non-backend event — an unstamped fact would be REJECTED once the
-		// producer lane accepts these names. This SDK's session is the
-		// client instance (one marker per construction); an owed snapshot
-		// passes the marker of the session its application belonged to.
-		// Host events under a backend-source configuration are untouched:
-		// they keep publishing as "backend" with the contract's session_id
-		// carve-out.
-		SessionID: sessionID,
-		Props:     props,
-		// Envelope contract for experiment facts: source "client" and no
-		// user_id, whatever the client configuration would default.
-		omitUserID:     true,
-		sourceOverride: SourceClient,
-		// The purge generation this fact belongs to: a later sentinel
-		// withdraws only facts built BEFORE it. The stamp is the caller's
-		// snapshot-time observation (see the function comment), one atomic
-		// (entry, epoch) pair.
-		expFactEpoch: factEpoch,
-	}, ""
-}
-
 // ── exposure delivery: the apply hop, then the analytics lane ───────────────
 
 // expOwedCopy is an owed record's fields, copied under e.mu.
@@ -196,10 +137,37 @@ type expOwedCopy struct {
 	app     expApplication
 	extra   bool
 	sealed  *expSealedFact
+	outcome *expOutcomeRecord
 }
 
 func copyOwed(owed *expOwedExposure) expOwedCopy {
-	return expOwedCopy{entry: owed.entry, session: owed.session, app: owed.app, extra: owed.extra, sealed: owed.sealed}
+	return expOwedCopy{entry: owed.entry, session: owed.session, app: owed.app, extra: owed.extra, sealed: owed.sealed, outcome: owed.outcome}
+}
+
+// eventName is the fact the record is sealed as.
+func (owed expOwedCopy) eventName() string {
+	if owed.outcome != nil {
+		return experimentOutcomeName
+	}
+	return experimentExposureName
+}
+
+// kind names the record for diagnostics.
+func (owed expOwedCopy) kind() string {
+	if owed.outcome != nil {
+		return "outcome"
+	}
+	return "exposure"
+}
+
+// countDrop reports this record not recorded, in its kind's map. Callers
+// hold e.mu.
+func (owed expOwedCopy) countDrop(e *experimentsState, reason string) {
+	if owed.outcome != nil {
+		e.countOutcomeDropLocked(reason, 1)
+		return
+	}
+	e.countDropLocked(reason, 1)
 }
 
 // emitOwedExposure delivers one owed application. An application not sealed
@@ -216,7 +184,7 @@ func copyOwed(owed *expOwedExposure) expOwedCopy {
 //     that could not take the fact.
 //
 // factEpoch is the pipeline purge epoch the caller observed UNDER e.mu
-// atomically with its snapshot of the record (see buildExperimentFactEvent).
+// atomically with its snapshot of the record (see sealedExposureEvent).
 func (c *Client) emitOwedExposure(ctx context.Context, experimentKey string, record *expOwedExposure, owed expOwedCopy, network, atClose bool, factEpoch uint64) (ok bool, code string, terminal bool) {
 	if err := c.experimentConsentRefusal(); err != nil {
 		return false, consentRefusalCode(err), false
@@ -267,9 +235,9 @@ func (c *Client) emitOwedExposure(ctx context.Context, experimentKey string, rec
 	event, scoped := c.sealedExposureEvent(owed.session, sealed, factEpoch)
 	if !scoped {
 		e.mu.Lock()
-		e.countDropLocked(expDropForeignScope, 1)
+		owed.countDrop(e, expDropForeignScope)
 		e.mu.Unlock()
-		c.logf("shardpilot experiments: a sealed exposure for experiment %q names another workspace, app or environment than this client's; dropped (foreign_scope)", experimentKey)
+		c.logf("shardpilot experiments: a sealed %s for experiment %q names another workspace, app or environment than this client's; dropped (foreign_scope)", owed.kind(), experimentKey)
 		return false, expDropForeignScope, true
 	}
 	// Seam: the window between this emission's own consent check (above)
@@ -319,7 +287,7 @@ func (c *Client) sealExperimentApplication(ctx context.Context, experimentKey st
 	nowMS := c.clock.Now().UnixMilli()
 	switch {
 	case resp.status == 200 && !resp.bodyIncomplete:
-		if parsed := parseSealedExposure(resp.body); parsed != nil {
+		if parsed := parseSealedExposure(resp.body, owed.eventName()); parsed != nil {
 			e.mu.Lock()
 			e.backoffAttempt = 0
 			e.mu.Unlock()
@@ -346,7 +314,7 @@ func (c *Client) sealExperimentApplication(ctx context.Context, experimentKey st
 			persistFailed, _ = e.applySentinelWithdrawalLocked(scope, nowMS)
 		} else {
 			for _, list := range e.pendingExposure {
-				e.countDropLocked(expDropRealSubjectsDisabled, len(list))
+				e.countOwedDropsLocked(expDropRealSubjectsDisabled, list)
 			}
 			e.pendingExposure = make(map[string][]*expOwedExposure)
 		}
@@ -358,9 +326,9 @@ func (c *Client) sealExperimentApplication(ctx context.Context, experimentKey st
 		return nil, expDropRealSubjectsDisabled, false
 	case resp.status >= 400 && resp.status < 500 && resp.status != 408 && resp.status != 429:
 		e.mu.Lock()
-		e.countDropLocked(expDropApplyRefused, 1)
+		owed.countDrop(e, expDropApplyRefused)
 		e.mu.Unlock()
-		c.logf("shardpilot experiments: the platform refused an exposure for experiment %q (HTTP %d); dropped (apply_refused)", experimentKey, resp.status)
+		c.logf("shardpilot experiments: the platform refused an %s for experiment %q (HTTP %d); dropped (apply_refused)", owed.kind(), experimentKey, resp.status)
 		return nil, expDropApplyRefused, false
 	}
 	seconds, present := 0, false
@@ -385,20 +353,32 @@ func (c *Client) postExposureApplication(ctx context.Context, experimentKey stri
 	for _, attribute := range owed.entry.Attributes {
 		attributes[attribute.Name] = attribute.Value
 	}
-	body, err := json.Marshal(map[string]any{
+	members := map[string]any{
 		"app_key":            e.appKey,
 		"environment_key":    e.envKey,
 		"experiment_key":     experimentKey,
 		"experiment_version": owed.entry.Version,
 		"subject_key":        owed.entry.SubjectKey,
 		"variant_key":        owed.entry.VariantKey,
-		"exposure_id":        owed.app.exposureID,
 		"served_revision":    owed.entry.Served.Revision,
 		"served_kill_gate":   owed.entry.Served.KillGate,
 		"served_at":          owed.entry.Served.At,
 		"applied_at":         owed.app.appliedAt,
 		"attributes":         attributes,
-	})
+	}
+	route := expExposureApplyRoute
+	if outcome := owed.outcome; outcome != nil {
+		// The outcome request is the application it follows, without its
+		// exposure_id, and the outcome's own members.
+		route = expOutcomeApplyRoute
+		members["outcome_id"] = outcome.outcomeID
+		members["occurred_at"] = outcome.occurredAt
+		members["outcome_key"] = outcome.key
+		members["outcome_value"] = outcome.value
+	} else {
+		members["exposure_id"] = owed.app.exposureID
+	}
+	body, err := json.Marshal(members)
 	if err != nil {
 		return remoteConfigResponse{}, err
 	}
@@ -423,7 +403,7 @@ func (c *Client) postExposureApplication(ctx context.Context, experimentKey stri
 		return remoteConfigResponse{}, errExperimentApplyConsentRefused
 	}
 	resp, err := c.transport.FetchRemoteConfig(ctx, remoteConfigRequest{
-		url:    e.baseURL + expExposureApplyRoute,
+		url:    e.baseURL + route,
 		bearer: c.cfg.APIKey,
 		method: "POST",
 		body:   body,
@@ -441,7 +421,7 @@ var errExperimentApplyConsentRefused = errors.New("shardpilot experiments: apply
 // parseSealedExposure reads the apply endpoint's 200 body: {"fact":{...},
 // "seal":"..."}, the fact an experiment_exposure with an id, an event time,
 // a scope and props. Anything else is no answer (nil).
-func parseSealedExposure(body []byte) *expSealedFact {
+func parseSealedExposure(body []byte, eventName string) *expSealedFact {
 	var answer struct {
 		Fact json.RawMessage `json:"fact"`
 		Seal string          `json:"seal"`
@@ -455,7 +435,7 @@ func parseSealedExposure(body []byte) *expSealedFact {
 		EventTS   string          `json:"event_ts"`
 		Props     json.RawMessage `json:"props"`
 	}
-	if json.Unmarshal(answer.Fact, &fact) != nil || fact.EventID == "" || fact.EventName != experimentExposureName ||
+	if json.Unmarshal(answer.Fact, &fact) != nil || fact.EventID == "" || fact.EventName != eventName ||
 		fact.EventTS == "" || len(fact.Props) == 0 || fact.Props[0] != '{' {
 		return nil
 	}
@@ -666,16 +646,44 @@ func (c *Client) TrackExperimentExposure(experimentKey string) error {
 	}
 	tuple := exposureTupleKey(experimentKey, entry)
 	extra := e.exposed[tuple].auto || e.owedTupleArmedLocked(experimentKey, tuple)
-	e.armExposureLocked(experimentKey, entry, app, extra)
+	if e.armExposureLocked(experimentKey, entry, app, extra) {
+		e.lastApplied[experimentKey] = expLastApplication{entry: entry, app: app}
+	}
 	return nil
 }
 
-// TrackExperimentOutcome emits one experiment_outcome fact — the measured
-// outcome for the cached assignment — through the analytics pipeline.
-// outcomeValue must be a finite number. Each admitted call is a distinct
-// fact (a fresh event id); outcomes are never deduplicated. The refusal
-// surface matches TrackExperimentExposure, plus ErrInvalidExperimentFact
-// for an empty outcome key or a non-finite value.
+// TrackExperimentOutcome records one measured outcome of an experiment:
+// outcomeKey names what was measured and outcomeValue its value. Like an
+// exposure it never touches the network: the outcome is kept owed, and the
+// background lane — within about a second — has the platform seal it
+// through the outcome apply endpoint and hands the sealed fact to the
+// analytics queue. Each accepted call is a distinct outcome, with its own
+// random outcome_id; a retried outcome re-sends its id and collapses
+// server-side.
+//
+// An outcome follows the application the host made last in this session
+// for the experiment — the most recent ApplyExperimentVariant, or
+// TrackExperimentExposure, that recorded. After a revalidation installs a
+// newer version, an outcome still follows the older application until the
+// host applies the newer one; after the assignment is dropped (a kill
+// switch, a not-assigned verdict) it still follows the last application.
+// The platform judges each outcome as of the state that application was
+// served from.
+//
+// The value must be an integer of magnitude at most 2^53 — a fractional,
+// larger or non-finite value is refused — and is sent as a JSON integer.
+// The key must be 1–128 of A–Z, a–z, 0–9, '.', '_', ':' and '-', and not an
+// IP address. Both are refused with ErrInvalidExperimentFact, as is an
+// outcome earlier than its application (a clock stepped back), so nothing
+// is queued only to be refused later.
+//
+// Requires the experiments opt-in (ErrExperimentsNotConfigured) and the
+// plane's consent admission (ErrConsentDenied/ErrConsentUnknown; under a
+// user-scoped consent floor, ErrConsentActorMismatch). With no application
+// in this session it reports ErrExperimentNoAssignment when nothing is
+// served, ErrExperimentFactUnavailable when the served assignment cannot be
+// recorded (counted not_recordable in Stats.ExperimentOutcomeDrops), and
+// ErrExperimentNotApplied otherwise: call ApplyExperimentVariant first.
 func (c *Client) TrackExperimentOutcome(experimentKey, outcomeKey string, outcomeValue float64) error {
 	if c.closed.Load() {
 		return ErrClosed
@@ -689,50 +697,77 @@ func (c *Client) TrackExperimentOutcome(experimentKey, outcomeKey string, outcom
 	if experimentKey == "" {
 		return fmt.Errorf("%w: experiment key is required", ErrInvalidExperimentFact)
 	}
-	if outcomeKey == "" {
-		return fmt.Errorf("%w: outcome key is required", ErrInvalidExperimentFact)
+	if !validExperimentOutcomeKey(outcomeKey) {
+		return fmt.Errorf("%w: outcome key must be 1-128 of A-Z a-z 0-9 . _ : - and not an IP address", ErrInvalidExperimentFact)
 	}
-	if math.IsNaN(outcomeValue) || math.IsInf(outcomeValue, 0) {
-		return fmt.Errorf("%w: outcome value must be a finite number", ErrInvalidExperimentFact)
+	value, ok := experimentOutcomeInteger(outcomeValue)
+	if !ok {
+		return fmt.Errorf("%w: outcome value must be an integer of magnitude at most 2^53", ErrInvalidExperimentFact)
 	}
 	if err := c.experimentConsentRefusal(); err != nil {
 		return err
 	}
-	// The emit lock serializes the outcome with a real-subjects sentinel
-	// purge exactly like exposures: without it this path could read a live
-	// entry, lose the race to purgeWithdrawnExperimentFacts, and enqueue a
-	// withdrawn subject-fact key AFTER the queue filter ran. Under the
-	// lock the outcome either enqueues before the filter (and is caught)
-	// or reads the already-cleared cache after it (and refuses).
-	e.emitMu.Lock()
-	defer e.emitMu.Unlock()
-	e.mu.Lock()
-	if e.tornDown {
-		e.mu.Unlock()
-		return ErrClosed
+	if c.consentFloorEnabled() && c.cfg.UserID != "" {
+		// As TrackExperimentExposure: the fact would ride the anonymous
+		// identity alone, which a user-scoped floor's grant does not cover.
+		return ErrConsentActorMismatch
 	}
-	entry := e.entries[experimentKey]
-	// An outcome is measured in THIS session by definition (it has no owed
-	// cross-session machinery): the current marker is its session identity.
-	// The purge epoch joins the same lock hold — one atomic (entry, epoch)
-	// snapshot for the fact stamp.
-	marker := e.sessionMarker
-	factEpoch := c.expFactPurgeEpoch.Load()
-	e.mu.Unlock()
-	if entry == nil {
-		return ErrExperimentNoAssignment
-	}
-	// Seam: the window between the snapshot above leaving e.mu and the fact
-	// build — a sentinel landing here is exactly the race the snapshot-time
-	// factEpoch stamp closes.
-	e.fireConsentRaceSeam("outcome_build")
-	event, skipCode := c.buildExperimentFactEvent(experimentOutcomeName, experimentKey, entry, "", marker, factEpoch)
-	if skipCode != "" {
+	outcomeID, err := newExperimentApplicationID()
+	if err != nil {
 		return ErrExperimentFactUnavailable
 	}
-	event.Props["outcome_key"] = outcomeKey
-	event.Props["outcome_value"] = outcomeValue
-	return c.enqueueExperimentFact(event, false)
+	now := c.clock.Now()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.tornDown {
+		return ErrClosed
+	}
+	if err := c.experimentConsentRefusal(); err != nil {
+		return err
+	}
+	applied, ok := e.lastApplied[experimentKey]
+	if !ok {
+		entry := e.entries[experimentKey]
+		switch {
+		case entry == nil:
+			return ErrExperimentNoAssignment
+		case !c.experimentEntryRecordable(entry):
+			e.countOutcomeDropLocked(expDropNotRecordable, 1)
+			return ErrExperimentFactUnavailable
+		default:
+			return ErrExperimentNotApplied
+		}
+	}
+	if appliedAt, err := time.Parse(time.RFC3339Nano, applied.app.appliedAt); err != nil || now.Before(appliedAt) {
+		return fmt.Errorf("%w: the outcome is earlier than the application it follows", ErrInvalidExperimentFact)
+	}
+	e.armOutcomeLocked(experimentKey, applied, &expOutcomeRecord{
+		outcomeID:  outcomeID,
+		occurredAt: now.UTC().Format(time.RFC3339Nano),
+		key:        outcomeKey,
+		value:      value,
+	})
+	return nil
+}
+
+// expOutcomeKeyPattern is the platform's outcome_key grammar.
+var expOutcomeKeyPattern = regexp.MustCompile(`^[A-Za-z0-9._:-]{1,128}$`)
+
+// validExperimentOutcomeKey reports whether the platform seals the key: in
+// its grammar and not an IP address.
+func validExperimentOutcomeKey(key string) bool {
+	return expOutcomeKeyPattern.MatchString(key) && net.ParseIP(key) == nil
+}
+
+// experimentOutcomeInteger returns the value as the integer the platform
+// seals: finite, integral, of magnitude at most 2^53 (so every such
+// float64 is exact); -0 is 0.
+func experimentOutcomeInteger(value float64) (int64, bool) {
+	const bound = 1 << 53
+	if math.IsNaN(value) || math.IsInf(value, 0) || value != math.Trunc(value) || value > bound || value < -bound {
+		return 0, false
+	}
+	return int64(value), true
 }
 
 // isExperimentFactClassEvent recognizes one of this SDK's own experiment
@@ -1296,16 +1331,17 @@ func (c *Client) closeExperimentPostFlush(ctx context.Context) {
 		for _, owed := range list {
 			if owed.sealed == nil {
 				unsealed++
+				e.countOwedDropLocked(expDropUnsealedAtClose, owed)
+			} else {
+				e.countOwedDropLocked(expDropUndeliveredAtClose, owed)
 			}
 		}
 	}
-	e.countDropLocked(expDropUnsealedAtClose, unsealed)
-	e.countDropLocked(expDropUndeliveredAtClose, remaining-unsealed)
 	e.mu.Unlock()
 	if remaining > 0 {
 		c.stats.dropped.Add(uint64(remaining))
 		c.stats.setLastError("experiment_exposures_discarded_at_close")
-		c.logf("shardpilot experiments: %d owed exposure fact(s) discarded at close (counted in Stats.Dropped; %d never sealed, counted unsealed_at_close; %d sealed and not enqueued, counted undelivered_at_close)", remaining, unsealed, remaining-unsealed)
+		c.logf("shardpilot experiments: %d owed experiment fact(s) discarded at close (counted in Stats.Dropped; %d never sealed, counted unsealed_at_close; %d sealed and not enqueued, counted undelivered_at_close)", remaining, unsealed, remaining-unsealed)
 	}
 }
 

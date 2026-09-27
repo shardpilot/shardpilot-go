@@ -1298,8 +1298,10 @@ func TestExposureRequiresSubjectFactKey(t *testing.T) {
 	if err := client.TrackExperimentExposure(expTestScopeKey); err != nil {
 		t.Fatalf("an exposure does not need the fetch's fact key, got %v", err)
 	}
-	if err := client.TrackExperimentOutcome(expTestScopeKey, "score", 2); !errors.Is(err, ErrExperimentFactUnavailable) {
-		t.Fatalf("expected ErrExperimentFactUnavailable, got %v", err)
+	// So is an outcome: it follows that application and is sealed the same
+	// way.
+	if err := client.TrackExperimentOutcome(expTestScopeKey, "score", 2); err != nil {
+		t.Fatalf("an outcome does not need the fetch's fact key either, got %v", err)
 	}
 }
 
@@ -1436,9 +1438,10 @@ func TestExperimentFactWireEnvelope(t *testing.T) {
 	defer client.Close(context.Background())
 
 	fetchAndApply(t, client, expTestScopeKey)
-	if err := client.TrackExperimentOutcome(expTestScopeKey, "score", 3.5); err != nil {
+	if err := client.TrackExperimentOutcome(expTestScopeKey, "score", 3); err != nil {
 		t.Fatalf("outcome: %v", err)
 	}
+	client.experimentCycle(context.Background()) // the lane seals the outcome
 	if err := client.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
@@ -1467,11 +1470,13 @@ func TestExperimentFactWireEnvelope(t *testing.T) {
 			t.Fatalf("%v: assignment_key must be the sfk1 fact key, got %v", name, props["assignment_key"])
 		}
 		if name == experimentOutcomeName {
-			if props["outcome_key"] != "score" || props["outcome_value"] != 3.5 {
+			if props["outcome_key"] != "score" || props["outcome_value"] != float64(3) {
 				t.Fatalf("outcome pair mismatch: %v", props)
 			}
-			if len(props) != 7 {
-				t.Fatalf("outcome props are exactly seven keys, got %v", props)
+			// Sealed like an exposure: its six keys plus the outcome pair,
+			// with the seal beside them.
+			if len(props) != 8 || props["attestation"] != "client_attested" || envelope["attestation_seal"] != expStubSeal {
+				t.Fatalf("outcome props are the eight sealed keys with the seal, got %v (seal %v)", props, envelope["attestation_seal"])
 			}
 		} else if len(props) != 6 || props["attestation"] != "client_attested" || envelope["attestation_seal"] != expStubSeal {
 			// An exposure carries the props exactly as sealed (the five, plus

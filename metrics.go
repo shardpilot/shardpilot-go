@@ -128,6 +128,7 @@ type statsCollector struct {
 
 	mu               sync.Mutex
 	expDrops         map[string]uint64
+	outcomeDrops     map[string]uint64
 	lastError        string
 	lastConsentError string
 	byStatus         map[EventStatus]uint64
@@ -151,6 +152,13 @@ func (s *statsCollector) snapshot() Stats {
 			expDrops[reason] = count
 		}
 	}
+	var outcomeDrops map[string]uint64
+	if len(s.outcomeDrops) > 0 {
+		outcomeDrops = make(map[string]uint64, len(s.outcomeDrops))
+		for reason, count := range s.outcomeDrops {
+			outcomeDrops[reason] = count
+		}
+	}
 	s.mu.Unlock()
 
 	return Stats{
@@ -163,6 +171,7 @@ func (s *statsCollector) snapshot() Stats {
 		Duplicates:                 s.duplicates.Load(),
 		ByStatus:                   byStatus,
 		ExperimentExposureDrops:    expDrops,
+		ExperimentOutcomeDrops:     outcomeDrops,
 		LastError:                  lastError,
 		Spooled:                    s.spooled.Load(),
 		SpoolResent:                s.spoolResent.Load(),
@@ -188,6 +197,17 @@ func (s *statsCollector) recordExperimentExposureDrop(reason string, n int) {
 		s.expDrops = make(map[string]uint64)
 	}
 	s.expDrops[reason] += uint64(n)
+	s.mu.Unlock()
+}
+
+// recordExperimentOutcomeDrop counts n experiment outcomes not recorded for
+// reason, under the same leaf lock.
+func (s *statsCollector) recordExperimentOutcomeDrop(reason string, n int) {
+	s.mu.Lock()
+	if s.outcomeDrops == nil {
+		s.outcomeDrops = make(map[string]uint64)
+	}
+	s.outcomeDrops[reason] += uint64(n)
 	s.mu.Unlock()
 }
 

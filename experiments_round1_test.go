@@ -80,10 +80,22 @@ func TestSubjectFactKeyGrammarGuardsTheFactLane(t *testing.T) {
 			t.Fatalf("the raw subject id egressed as assignment_key: %v", key)
 		}
 	}
-	// The outcome is still SDK-built from the stored key: a malformed one
-	// refuses it.
-	if err := client2.TrackExperimentOutcome(expTestScopeKey, "score", 1); !errors.Is(err, ErrExperimentFactUnavailable) {
-		t.Fatalf("a malformed stored fact key must refuse the outcome, got %v", err)
+	// So is an outcome, which follows that application: accepted whatever
+	// the stored fact key, and nothing it egresses carries the raw subject
+	// id as assignment_key.
+	if err := client2.TrackExperimentOutcome(expTestScopeKey, "score", 1); err != nil {
+		t.Fatalf("an outcome is sealed by the platform, whatever the stored fact key: %v", err)
+	}
+	client2.experimentCycle(context.Background())
+	if err := client2.Flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	outcomes := capture.byName(experimentOutcomeName)
+	if len(outcomes) != 1 {
+		t.Fatalf("the sealed outcome is delivered, got %d", len(outcomes))
+	}
+	if key, _ := outcomes[0]["props"].(map[string]any)["assignment_key"].(string); strings.HasPrefix(key, "spcid_") {
+		t.Fatalf("the raw subject id egressed as the outcome's assignment_key: %v", key)
 	}
 }
 
@@ -324,6 +336,7 @@ func TestExperimentFactsCountInStats(t *testing.T) {
 	if err := client.TrackExperimentOutcome(expTestScopeKey, "score", 1); err != nil {
 		t.Fatalf("outcome: %v", err)
 	}
+	client.experimentCycle(context.Background()) // the outcome, sealed by the lane
 	if got := client.Snapshot().Enqueued - before; got != 2 {
 		t.Fatalf("expected both facts counted in Stats.Enqueued, got %d", got)
 	}

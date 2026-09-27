@@ -207,10 +207,13 @@ func TestFactStampRidesEntrySnapshot(t *testing.T) {
 		}
 	}
 	t.Run("outcome_build", func(t *testing.T) {
-		stage(t, "outcome_build", func(t *testing.T, c *Client) {
-			if err := c.TrackExperimentOutcome(expTestScopeKey, "score", 1.5); err != nil {
+		// An outcome is built from its sealed fact at the same point as an
+		// exposure: the lane seals it, then builds it.
+		stage(t, "exposure_build", func(t *testing.T, c *Client) {
+			if err := c.TrackExperimentOutcome(expTestScopeKey, "score", 1); err != nil {
 				t.Fatalf("outcome: %v", err)
 			}
+			c.experimentCycle(context.Background())
 		}, func(capture *expWireCapture) int {
 			capture.mu.Lock()
 			defer capture.mu.Unlock()
