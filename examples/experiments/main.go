@@ -1155,6 +1155,7 @@ var assignmentTopLevel = map[string]bool{
 	"version": true, "reason": true, "boundary": true,
 	"experiment_key": true, "assignment_key": true,
 	"app_key": true, "environment_key": true,
+	"served_revision": true, "served_kill_gate": true, "served_at": true,
 }
 
 // ⚠ `code` IS NOT AMONG THEM. It is a member of no top-level shape: the ingest
