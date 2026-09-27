@@ -3,6 +3,7 @@ package shardpilot
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -860,32 +861,6 @@ func deepCopyJSONValue(value any, depth int) any {
 	}
 }
 
-// ── deterministic exposure event id ─────────────────────────────────────────
-
-// experimentExposureEventID derives the deterministic exposure event id: a
-// stable digest of (session marker, subject, experiment, version, arm) —
-// exactly the de-dupe tuple plus the session marker and the re-arm counter,
-// so the id-uniqueness domain and the de-dupe domain coincide. The same
-// tuple always derives the same id, so an accidental double emission inside
-// one session collapses server-side as a duplicate; an explicit re-arm
-// bumps the counter, and a rotated subject or another client instance
-// derives a distinct id. UUID-shaped so it rides the envelope like any
-// other event id.
-func experimentExposureEventID(sessionMarker, subjectKey, experimentKey string, version, arm int64) string {
-	digest := sha256.Sum256([]byte(strings.Join([]string{
-		"exposure",
-		sessionMarker,
-		subjectKey,
-		experimentKey,
-		strconv.FormatInt(version, 10),
-		strconv.FormatInt(arm, 10),
-	}, "\x1f")))
-	b := digest[:16]
-	b[6] = (b[6] & 0x0f) | 0x40
-	b[8] = (b[8] & 0x3f) | 0x80
-	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
-}
-
 // experimentAttributesEqual reports whether two normalized attribute sets
 // are identical (both are sorted by the normalizer, so pairwise equality is
 // set equality). A cached verdict was computed FOR its attribute set: a
@@ -1067,6 +1042,16 @@ type experimentsState struct {
 	authBlocked bool
 	authEpoch   uint64
 
+	// applyBlocked: the apply endpoint answered 401/403. Owed applications
+	// are kept and the lane stops sending them until an authoritative,
+	// authorized fetch (the same point that lifts authBlocked).
+	applyBlocked bool
+
+	// dropFn, wired at construction, counts applications not recorded, by
+	// reason (Stats.ExperimentExposureDrops). Called under e.mu; it takes
+	// only the stats collector's leaf lock.
+	dropFn func(reason string, n int)
+
 	// Revalidation cadence state (unix ms; 0 = unarmed).
 	revalidateAtMS int64
 	retryAfterMS   int64
@@ -1201,6 +1186,41 @@ func (e *experimentsState) syncDirLocked(dir string) error {
 type expOwedExposure struct {
 	entry   *expEntry
 	session string
+	// app is the application this record owes: its exposure_id and
+	// applied_at, fixed when the host applied the variant and re-sent
+	// unchanged on every retry and re-arm.
+	app expApplication
+	// extra marks an application beyond the session's own for its tuple
+	// (TrackExperimentExposure); it is never de-duplicated against it.
+	extra bool
+	// sealed is the fact the apply endpoint sealed for this application,
+	// once it answered; until then the record is the application alone.
+	sealed *expSealedFact
+}
+
+// expApplication identifies one application of a variant. The exposure_id
+// is random and never derived from a session or an identity; the platform
+// derives the fact id from it, so the same application always yields the
+// same fact id and a re-sent one collapses as a duplicate.
+type expApplication struct {
+	exposureID string
+	appliedAt  string // RFC 3339, UTC
+}
+
+// newExperimentApplication mints an application at now.
+func newExperimentApplication(now time.Time) (expApplication, error) {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return expApplication{}, err
+	}
+	return expApplication{exposureID: hex.EncodeToString(id[:]), appliedAt: now.UTC().Format(time.RFC3339Nano)}, nil
+}
+
+// expSealedFact is a fact the apply endpoint sealed: its bytes as answered
+// and the seal over them.
+type expSealedFact struct {
+	fact json.RawMessage
+	seal string
 }
 
 // expOwedSync is one owed durable intent, KEYED BY (scope, experiment) —
@@ -1234,8 +1254,12 @@ func scopedIntentKey(scope, experimentKey string) string {
 }
 
 type expExposed struct {
-	arm  int64
+	// auto: the session's own application of the tuple has been delivered
+	// to the analytics queue.
 	auto bool
+	// app is that application, kept so a consent purge can re-arm it with
+	// the same identity.
+	app expApplication
 }
 
 func newExperimentsState(cfg Config) *experimentsState {
@@ -2154,19 +2178,16 @@ func (e *experimentsState) applySentinelWithdrawalLocked(scope string, resolvedA
 	// marked emitted, or a later application in this session after an
 	// authorized re-fetch would be suppressed as already-sent
 	// (under-counting real treatment). The blanket auto reset is safe
-	// on both sides of the delivery ambiguity: a fact that HAD
-	// delivered re-derives the SAME deterministic id and collapses
-	// server-side. The purge kills FACTS, never the session's
-	// id-domain bookkeeping: the highest arm each tuple handed out
-	// stays claimed (resetExposedKeepArmsLocked), so a post-re-enable
-	// explicit re-arm continues from high-water+1 with a DISTINCT
-	// deterministic id instead of reusing an arm a delivered
-	// pre-sentinel fact already spent (which the server would dedupe,
-	// undercounting a real re-exposure). The purge epoch bump fences
-	// emissions already in flight past their gates, exactly like the
-	// consent purge.
-	e.resetExposedKeepArmsLocked()
+	// on both sides of the delivery ambiguity: re-sending a kept
+	// application yields the same fact id, so a fact that HAD delivered
+	// collapses server-side. The purge epoch bump fences emissions already in
+	// flight past their gates, exactly like the consent purge. Each
+	// withdrawn owed application is counted real_subjects_disabled.
+	e.resetExposedAutoLocked()
 	e.purgeEpoch++
+	for _, list := range e.pendingExposure {
+		e.countDropLocked(expDropRealSubjectsDisabled, len(list))
+	}
 	e.pendingExposure = make(map[string][]*expOwedExposure)
 	if e.factPurgeEpochBumpFn != nil {
 		// The PIPELINE-fact purge epoch bumps here, under e.mu, atomically
@@ -2346,6 +2367,7 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 			e.latchRetained = make(map[string]*expEntry)
 		}
 		e.authBlocked = false
+		e.applyBlocked = false
 	}
 	if outcome.transient {
 		return false, false, false
@@ -2387,28 +2409,45 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 
 // ── exposure arming (state side; emission lives in experiment_facts.go) ─────
 
-// armExposureLocked arms one application snapshot for emission. A
-// same-(session, tuple) snapshot already armed at the tail is refreshed in
-// place (purges re-arm the same application; the de-dupe collapses
-// same-tuple emissions anyway), so the queue only grows across genuinely
-// distinct applications. The FIFO is bounded; overflowing drops the OLDEST
-// with a diagnostic, so a new application displacing the slot cannot
-// silently lose the previous application's still-unemitted fact.
-func (e *experimentsState) armExposureLocked(experimentKey string, entry *expEntry) (overflowed bool) {
+// armExposureLocked arms one application for delivery. The session's own
+// application of a tuple already owed at the tail is not armed twice (the
+// emitter also skips a tuple already delivered this session); an extra
+// application always is. The FIFO is bounded; overflowing drops the OLDEST,
+// counted as owed_bound_exceeded, so a new application displacing the slot
+// is never a silent loss of the previous one.
+func (e *experimentsState) armExposureLocked(experimentKey string, entry *expEntry, app expApplication, extra bool) (overflowed bool) {
 	list := e.pendingExposure[experimentKey]
-	if tail := lastOwedExposure(list); tail != nil && tail.session == e.sessionMarker &&
+	if tail := lastOwedExposure(list); !extra && tail != nil && !tail.extra && tail.session == e.sessionMarker &&
 		exposureTupleKey(experimentKey, tail.entry) == exposureTupleKey(experimentKey, entry) {
-		tail.entry = entry
 		return false
 	}
-	list = append(list, &expOwedExposure{entry: entry, session: e.sessionMarker})
+	list = append(list, &expOwedExposure{entry: entry, session: e.sessionMarker, app: app, extra: extra})
 	if len(list) > expMaxOwedExposures {
 		list = list[1:]
 		e.owedExposureOverflow++
+		e.countDropLocked(expDropOwedBoundExceeded, 1)
 		overflowed = true
 	}
 	e.pendingExposure[experimentKey] = list
 	return overflowed
+}
+
+// The reasons an application is not recorded, as counted in
+// Stats.ExperimentExposureDrops.
+const (
+	expDropNotRecordable        = "not_recordable"
+	expDropOwedBoundExceeded    = "owed_bound_exceeded"
+	expDropApplyRefused         = "apply_refused"
+	expDropRealSubjectsDisabled = "real_subjects_disabled"
+	expDropForeignScope         = "foreign_scope"
+	expDropUnsealedAtClose      = "unsealed_at_close"
+)
+
+// countDropLocked reports n applications not recorded for reason.
+func (e *experimentsState) countDropLocked(reason string, n int) {
+	if e.dropFn != nil && n > 0 {
+		e.dropFn(reason, n)
+	}
 }
 
 // drainOwedExposureOverflowLocked reports and resets the FIFO-overflow
@@ -2433,7 +2472,7 @@ func lastOwedExposure(list []*expOwedExposure) *expOwedExposure {
 // accounting.
 func (e *experimentsState) owedTupleArmedLocked(experimentKey, tuple string) bool {
 	for _, owed := range e.pendingExposure[experimentKey] {
-		if owed.session == e.sessionMarker && exposureTupleKey(experimentKey, owed.entry) == tuple {
+		if !owed.extra && owed.session == e.sessionMarker && exposureTupleKey(experimentKey, owed.entry) == tuple {
 			return true
 		}
 	}
@@ -2443,83 +2482,65 @@ func (e *experimentsState) owedTupleArmedLocked(experimentKey, tuple string) boo
 // onAnalyticsPurge re-arms this session's APPLIED emissions after a consent
 // denial purged queued-but-unpublished analytics facts — exposure facts
 // included. Those facts never reached the server, so a later re-grant of a
-// retained assignment the host applied emits the exposure again instead of
-// silently under-counting real treatment. Facts that HAD already published — or were mid-flight,
-// wire-ambiguous, when the denial landed — simply collapse server-side as
-// duplicates of their deterministic event ids (the re-emission derives the
-// SAME id for the same session, tuple, and arm), so the blanket re-arm is
-// safe on both sides of the ambiguity.
+// retained assignment the host applied delivers the exposure again instead
+// of silently under-counting real treatment. The re-arm re-sends the SAME
+// application (exposure_id and applied_at), so the platform derives the same
+// fact id and a fact that HAD published — or was mid-flight when the denial
+// landed — collapses server-side as a duplicate.
 func (e *experimentsState) onAnalyticsPurge() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.purgeEpoch++
-	// Owed snapshots are DISCARDED first, then every live entry re-arms:
-	// after a purge the session's emission slate is exactly its still-live
-	// treatments — a snapshot for a since-dropped entry must not re-emit
-	// into the re-granted session (the ratified reconciliation of the
-	// blanket-re-arm rule). The deterministic id domain is unchanged: a
-	// re-armed live tuple derives the same id its purged fact carried, so
-	// a wire-ambiguous survivor still collapses server-side.
-	// Only what this session APPLIED re-arms: a tuple whose automatic
-	// exposure was emitted, or whose application was still owed when the
-	// purge landed. An assignment the host never applied has no exposure
-	// to restore.
-	applied := make(map[string]bool)
+	// Only what this session APPLIED re-arms, with its own identity: a
+	// tuple whose application was delivered, or whose application was still
+	// owed when the purge landed. Owed snapshots are then DISCARDED — extra
+	// applications with them — and after the purge the session's slate is
+	// exactly its still-live applied treatments: a snapshot for a
+	// since-dropped entry does not re-arm into the re-granted session.
+	applied := make(map[string]expApplication)
 	for tuple, exposed := range e.exposed {
 		if exposed.auto {
-			applied[tuple] = true
+			applied[tuple] = exposed.app
 		}
 	}
 	for key, list := range e.pendingExposure {
 		for _, owed := range list {
-			if owed.session == e.sessionMarker {
-				applied[exposureTupleKey(key, owed.entry)] = true
+			if !owed.extra && owed.session == e.sessionMarker {
+				applied[exposureTupleKey(key, owed.entry)] = owed.app
 			}
 		}
 	}
 	e.pendingExposure = make(map[string][]*expOwedExposure)
-	// The purge kills FACTS, never the session's id-domain bookkeeping:
-	// each tuple's highest handed-out arm survives the reset (only the
-	// auto slate re-arms), so a post-re-grant TrackExperimentExposure
-	// continues from high-water+1 with a DISTINCT deterministic id — a
-	// reset-to-zero counter would hand out arm 1 again, colliding with the
-	// pre-denial explicit fact's id, and the server's de-dupe would
-	// undercount a real new re-exposure.
-	e.resetExposedKeepArmsLocked()
+	e.resetExposedAutoLocked()
 	for key, entry := range e.entries {
-		if applied[exposureTupleKey(key, entry)] {
-			e.armExposureLocked(key, entry)
+		if app, ok := applied[exposureTupleKey(key, entry)]; ok {
+			e.armExposureLocked(key, entry, app, false)
 		}
 	}
 	// Latch-cleared serving state is RETAINED, not dropped: an ordinary
 	// 401/403 latch emptied e.entries while the durable record kept the
 	// assignments (and the re-arm-from-entries pass above cannot see
 	// them), so without this pass a denial landing under a latch would
-	// silently lose a retained treatment's owed exposure — nothing left to
-	// sweep after the re-grant. Re-arm the retained set exactly like live
-	// entries (grant-moment intents for retained assignments): the auto
-	// snapshot re-derives the same deterministic arm-0 id, so anything
-	// that HAD published collapses server-side, and the arm high-water
-	// preserved above keeps explicit re-arms distinct.
+	// silently lose a retained treatment's owed exposure. Re-arm the
+	// retained applied set exactly like live entries.
 	for key, entry := range e.latchRetained {
-		if e.entries[key] != nil || !applied[exposureTupleKey(key, entry)] {
-			continue // the live entry already re-armed above, or never applied
+		if e.entries[key] != nil {
+			continue // the live entry already re-armed above
 		}
-		e.armExposureLocked(key, entry)
+		if app, ok := applied[exposureTupleKey(key, entry)]; ok {
+			e.armExposureLocked(key, entry, app, false)
+		}
 	}
 }
 
-// resetExposedKeepArmsLocked re-arms every tuple's AUTOMATIC emission slot
-// while preserving its arm high-water: purge semantics for the dedup
-// bookkeeping. The arm counter is the session's deterministic-id domain —
-// arms already handed out stay spent forever (their facts may have
-// published), while auto=false makes the next automatic emission (the
-// purge's re-arm, or the host applying the same tuple again) emit again
-// with its unchanged arm-0 id, collapsing server-side if a survivor already
-// carried it.
-func (e *experimentsState) resetExposedKeepArmsLocked() {
+// resetExposedAutoLocked clears every tuple's delivered mark while keeping
+// its application: purge semantics for the de-duplication bookkeeping. The
+// next delivery of the tuple (the purge's re-arm, or the host applying it
+// again) goes out again, and re-sending the kept application yields the
+// same fact id, so a survivor collapses server-side.
+func (e *experimentsState) resetExposedAutoLocked() {
 	for tuple, prior := range e.exposed {
-		e.exposed[tuple] = expExposed{arm: prior.arm, auto: false}
+		e.exposed[tuple] = expExposed{auto: false, app: prior.app}
 	}
 }
 
@@ -3262,7 +3283,7 @@ func (c *Client) experimentCycle(ctx context.Context) {
 	if c.experimentConsentRefusal() != nil {
 		return
 	}
-	c.sweepAllExperimentExposures()
+	c.sweepAllExperimentExposures(ctx)
 	nowMS := c.clock.Now().UnixMilli()
 	var keys []string
 	e.mu.Lock()
@@ -3399,9 +3420,17 @@ func (c *Client) ExperimentVariant(experimentKey string) string {
 // subject, session) — the SDK instance is the session — and by nothing
 // else. A fetch, a revalidation, a cache restore and the getters record
 // nothing. The SDK cannot verify that the host acted on the variant; this
-// call is the host's statement that it did. It never touches the network:
-// the exposure fact joins the analytics queue like any other event, and a
-// queue that cannot take it now keeps it owed for the lane's next sweep.
+// call is the host's statement that it did.
+//
+// Recording is not synchronous. This call never touches the network: it
+// keeps the application owed, and the background lane — within about a
+// second — has the platform seal it and hands the sealed fact to the
+// analytics queue. An application still unsealed at Close gets one bounded
+// attempt there. An assignment that cannot be recorded (one cached without
+// the serving state its fetch returned, a non-client_id unit, or a client
+// with no AnonymousID to post the fact under) is still served, and counted
+// in Stats.ExperimentExposureDrops as not_recordable; the first application
+// after a fetch re-serves it with that state records.
 func (c *Client) ApplyExperimentVariant(experimentKey string) (string, map[string]any) {
 	e := c.exp
 	experimentKey = strings.TrimSpace(experimentKey)
@@ -3412,31 +3441,44 @@ func (c *Client) ApplyExperimentVariant(experimentKey string) (string, map[strin
 		return "", nil
 	}
 	e.fireConsentRaceSeam("apply_serve")
+	now := c.clock.Now()
 	e.mu.Lock()
+	defer e.mu.Unlock()
 	// The commit-point re-check, as the fetch makes it: a denial whose flip
 	// landed after the check above serves nothing and arms nothing. A flip
 	// after THIS read linearizes the application before the denial, whose
 	// purge (queued behind this lock) then treats it as applied.
 	if e.tornDown || c.experimentConsentRefusal() != nil {
-		e.mu.Unlock()
 		return "", nil
 	}
 	entry := e.entries[experimentKey]
 	if entry == nil {
-		e.mu.Unlock()
 		return "", nil
 	}
-	// Once per session needs no check here: arming refreshes a same-tuple
-	// snapshot still owed in place, and the emitter skips a tuple whose
-	// exposure this session already emitted.
-	e.armExposureLocked(experimentKey, entry)
-	// The variant and payload come from the entry just armed, under the same
-	// lock: what the host acts on is what is recorded, even if a
-	// revalidation replaces the entry a moment later.
+	// The variant and payload come from the entry armed below, under the
+	// same lock: what the host acts on is what is recorded.
 	variant, payload := entry.VariantKey, deepCopyJSONMap(entry.VariantPayload, 0)
-	e.mu.Unlock()
-	c.sweepExperimentExposures(experimentKey)
+	if !c.experimentEntryRecordable(entry) {
+		e.countDropLocked(expDropNotRecordable, 1)
+		return variant, payload
+	}
+	// Once per session needs no check here: the session's own application
+	// already owed at the tail is not armed twice, and the emitter skips a
+	// tuple already delivered this session.
+	if app, err := newExperimentApplication(now); err == nil {
+		e.armExposureLocked(experimentKey, entry, app, false)
+	} else {
+		e.countDropLocked(expDropNotRecordable, 1)
+	}
 	return variant, payload
+}
+
+// experimentEntryRecordable reports whether an application of entry can be
+// sealed and posted: a client_id assignment carrying its serving state and
+// subject, on a client with an identity to post the fact under.
+func (c *Client) experimentEntryRecordable(entry *expEntry) bool {
+	return entry.AssignmentUnit == experimentAssignmentUnitClientID && entry.Served != nil &&
+		entry.SubjectKey != "" && c.cfg.AnonymousID != ""
 }
 
 // ExperimentVariantPayload returns a copy of the cached assigned variant's

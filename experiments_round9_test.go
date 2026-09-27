@@ -24,6 +24,7 @@ package shardpilot
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -60,7 +61,14 @@ func TestCaptureRefusesAnonymousOnlyFactUnderUserScopedFloor(t *testing.T) {
 		SubjectFactKey: "sfk1_" + strings.Repeat("a", 64),
 		SubjectKey:     "spcid_" + strings.Repeat("b", 32),
 	}
-	owed := []*expOwedExposure{{entry: entry, session: client.exp.sessionMarker}}
+	// A SEALED record: only a sealed application has a capturable form, so
+	// the capture reaches the spool policy this scene is about.
+	fact := `{"event_id":"` + expStubFactID(strings.Repeat("c", 32)) + `","event_name":"experiment_exposure",` +
+		`"event_ts":"2026-09-27T00:00:00Z","workspace_id":"workspace-test","app_id":"app-test","environment_id":"develop",` +
+		`"props":{"experiment_key":"exp-cap","experiment_version":1,"assignment_key":"sfk1_` + strings.Repeat("a", 64) + `",` +
+		`"variant_key":"treatment","assignment_unit":"client_id","attestation":"client_attested"}}`
+	owed := []*expOwedExposure{{entry: entry, session: client.exp.sessionMarker,
+		sealed: &expSealedFact{fact: json.RawMessage(fact), seal: expStubSeal}}}
 	ok, frozen := client.captureOwedExposuresForDrop("exp-cap", owed)
 	if !ok || frozen != nil {
 		t.Fatalf("a policy-refused capture is moot (the drop proceeds without it), got ok=%v frozen=%d", ok, len(frozen))

@@ -27,6 +27,11 @@ type remoteConfigRequest struct {
 	url         string
 	bearer      string
 	ifNoneMatch string
+	// method and body: empty method is the GET every remote-config and
+	// assignment fetch uses; the experiment exposure apply hop POSTs a JSON
+	// body to the same host through the same no-redirect client.
+	method string
+	body   []byte
 }
 
 // remoteConfigResponse is the raw remote-config outcome the decision core
@@ -280,11 +285,22 @@ func (t *httpTransport) PublishConsent(ctx context.Context, request consentReque
 // request authenticates with the publishable API key only, and never carries
 // the schema-revision header (a batch-route contract).
 func (t *httpTransport) FetchRemoteConfig(ctx context.Context, request remoteConfigRequest) (remoteConfigResponse, error) {
-	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, request.url, nil)
+	method := request.method
+	if method == "" {
+		method = http.MethodGet
+	}
+	var requestBody io.Reader
+	if request.body != nil {
+		requestBody = bytes.NewReader(request.body)
+	}
+	httpRequest, err := http.NewRequestWithContext(ctx, method, request.url, requestBody)
 	if err != nil {
 		return remoteConfigResponse{}, fmt.Errorf("create shardpilot remote config request: %w", err)
 	}
 	httpRequest.Header.Set("Authorization", "Bearer "+request.bearer)
+	if request.body != nil {
+		httpRequest.Header.Set("Content-Type", "application/json")
+	}
 	if request.ifNoneMatch != "" {
 		httpRequest.Header.Set("If-None-Match", request.ifNoneMatch)
 	}

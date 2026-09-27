@@ -375,6 +375,7 @@ func NewClient(cfg Config) (*Client, error) {
 		// the ±10% window instead of herding at exactly 300s.
 		client.exp.jitterFn = client.jitterValue
 		client.exp.captureOwedDropFn = client.captureOwedExposuresForDrop
+		client.exp.dropFn = client.stats.recordExperimentExposureDrop
 		client.exp.captureRetryFn = client.appendCaptureEntries
 		// The sentinel bumps the pipeline-fact purge epoch UNDER e.mu,
 		// atomically with its decisive state change, so no post-sentinel

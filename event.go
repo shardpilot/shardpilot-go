@@ -47,4 +47,11 @@ type Event struct {
 	// steals from the drain is recognized (stale stamp) and dropped at
 	// admission instead of riding — or condemning — a later epoch's batch.
 	intakeConsentEpoch uint64
+
+	// rawEventTS and attestationSeal carry a SEALED experiment fact
+	// (unexported: only the SDK's apply hop sets them). The envelope then
+	// writes rawEventTS as event_ts verbatim — the seal covers that exact
+	// string — and attestationSeal as attestation_seal.
+	rawEventTS      string
+	attestationSeal string
 }

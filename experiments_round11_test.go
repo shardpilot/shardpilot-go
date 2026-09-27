@@ -506,63 +506,38 @@ func TestExplicitArmSurvivesConsentPurge(t *testing.T) {
 	defer client.Close(context.Background())
 	client.SetConsent(true)
 
-	// The automatic arm-0 fact, then an explicit re-arm (arm 1) — both
-	// published.
+	// The session's own application, then an extra one — both delivered.
 	fetchAndApply(t, client, expTestScopeKey)
 	if err := client.TrackExperimentExposure(expTestScopeKey); err != nil {
-		t.Fatalf("explicit re-arm: %v", err)
+		t.Fatalf("extra application: %v", err)
 	}
+	client.experimentCycle(context.Background())
 	if err := client.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
 
-	client.exp.mu.Lock()
-	marker := client.exp.sessionMarker
-	subject := client.exp.entries[expTestScopeKey].SubjectKey
-	client.exp.mu.Unlock()
-	arm1ID := experimentExposureEventID(marker, subject, expTestScopeKey, 1, 1)
-	arm2ID := experimentExposureEventID(marker, subject, expTestScopeKey, 1, 2)
-
-	// The denial purges queued facts and re-arms the session's emissions;
-	// the re-grant restores the plane.
+	// The denial purges queued facts and re-arms the session's own
+	// application; the re-grant restores the plane, and the re-arm re-sends
+	// that application (same fact id: the delivered survivor collapses).
 	client.SetConsent(false)
 	client.SetConsent(true)
-	// The automatic re-emission drains (same deterministic arm-0 id: the
-	// published survivor collapses server-side).
-	client.sweepAllExperimentExposures()
+	client.experimentCycle(context.Background())
 
-	// The session already handed out arm 1: the next explicit re-arm is a
-	// REAL new re-exposure and must take arm 2 — a purge that reset the
-	// counter would reuse arm 1, derive the same event id, and the
-	// server's de-dupe would undercount it.
+	// The next extra application is a REAL new re-exposure: it must not
+	// reuse any id already spent, or the server's de-duplication would
+	// undercount it.
 	if err := client.TrackExperimentExposure(expTestScopeKey); err != nil {
-		t.Fatalf("post-re-grant explicit re-arm: %v", err)
+		t.Fatalf("post-re-grant extra application: %v", err)
 	}
+	client.experimentCycle(context.Background())
 	if err := client.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
-
-	var ids []string
-	for _, exposure := range capture.exposures() {
-		if id, ok := exposure["event_id"].(string); ok {
-			ids = append(ids, id)
-		}
-	}
-	if len(ids) == 0 {
-		t.Fatalf("no exposures delivered")
-	}
-	lastID := ids[len(ids)-1]
-	if lastID == arm1ID {
-		t.Fatalf("the post-re-grant explicit re-arm reused arm 1 — the same deterministic id as the pre-denial explicit fact, which the server de-dupes, undercounting a real re-exposure (ids: %v)", ids)
-	}
-	if lastID != arm2ID {
-		t.Fatalf("the post-re-grant explicit re-arm must continue from the session high-water (arm 2 id %s), got %s (ids: %v)", arm2ID, lastID, ids)
-	}
+	assertLastApplicationIsNew(t, script, capture)
 }
 
-// The sentinel's slate reset follows the same id-domain rule: the arm
-// high-water survives, so a post-re-enable explicit re-arm never collides
-// with a delivered pre-sentinel fact.
+// The sentinel's slate reset follows the same rule: a post-re-enable extra
+// application never collides with a delivered pre-sentinel fact.
 func TestExplicitArmSurvivesSentinelSlateReset(t *testing.T) {
 	script := &expScript{}
 	script.push(200, expAssignedBody("1"))
@@ -577,17 +552,12 @@ func TestExplicitArmSurvivesSentinelSlateReset(t *testing.T) {
 
 	fetchAndApply(t, client, expTestScopeKey)
 	if err := client.TrackExperimentExposure(expTestScopeKey); err != nil {
-		t.Fatalf("explicit re-arm: %v", err)
+		t.Fatalf("extra application: %v", err)
 	}
+	client.experimentCycle(context.Background())
 	if err := client.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
-	client.exp.mu.Lock()
-	marker := client.exp.sessionMarker
-	subject := client.exp.entries[expTestScopeKey].SubjectKey
-	client.exp.mu.Unlock()
-	arm1ID := experimentExposureEventID(marker, subject, expTestScopeKey, 1, 1)
-	arm2ID := experimentExposureEventID(marker, subject, expTestScopeKey, 1, 2)
 
 	// The sentinel withdraws the plane; the platform then re-enables and
 	// the SAME tuple (experiment, version, subject) is re-fetched.
@@ -598,28 +568,13 @@ func TestExplicitArmSurvivesSentinelSlateReset(t *testing.T) {
 		t.Fatalf("the re-enabled fetch must assign, got %+v", result)
 	}
 	if err := client.TrackExperimentExposure(expTestScopeKey); err != nil {
-		t.Fatalf("post-re-enable explicit re-arm: %v", err)
+		t.Fatalf("post-re-enable extra application: %v", err)
 	}
+	client.experimentCycle(context.Background())
 	if err := client.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
-
-	var ids []string
-	for _, exposure := range capture.exposures() {
-		if id, ok := exposure["event_id"].(string); ok {
-			ids = append(ids, id)
-		}
-	}
-	if len(ids) == 0 {
-		t.Fatalf("no exposures delivered")
-	}
-	lastID := ids[len(ids)-1]
-	if lastID == arm1ID {
-		t.Fatalf("the post-re-enable explicit re-arm reused arm 1 — colliding with the delivered pre-sentinel fact's id (ids: %v)", ids)
-	}
-	if lastID != arm2ID {
-		t.Fatalf("the post-re-enable explicit re-arm must continue from the session high-water (arm 2 id %s), got %s (ids: %v)", arm2ID, lastID, ids)
-	}
+	assertLastApplicationIsNew(t, script, capture)
 }
 
 // ── GF-P2 (defold R23 parity): an explicit null version is present, not
@@ -664,5 +619,42 @@ func TestNullVersionIsMalformedNotAbsent(t *testing.T) {
 	client.exp.mu.Unlock()
 	if entry == nil || entry.Version != 1 {
 		t.Fatalf("the cached assignment must survive the null-version verdict, got %+v", entry)
+	}
+}
+
+// expSealedIDs returns the sealed fact id of every application the stub
+// has sealed so far, in order.
+func expSealedIDs(script *expScript) []string {
+	var ids []string
+	for _, request := range script.apply.requestsSoFar() {
+		exposureID, _ := request.body["exposure_id"].(string)
+		ids = append(ids, expStubFactID(exposureID))
+	}
+	return ids
+}
+
+// assertLastApplicationIsNew requires the latest application's fact id to
+// differ from every earlier one: a new application never reuses a spent id,
+// which the server's de-duplication would collapse.
+func assertLastApplicationIsNew(t *testing.T, script *expScript, capture *expWireCapture) {
+	t.Helper()
+	ids := expSealedIDs(script)
+	if len(ids) < 2 {
+		t.Fatalf("expected at least two applications, got %d", len(ids))
+	}
+	last := ids[len(ids)-1]
+	for _, earlier := range ids[:len(ids)-1] {
+		if earlier == last {
+			t.Fatalf("the new application reused a spent fact id %s (ids: %v)", last, ids)
+		}
+	}
+	delivered := false
+	for _, exposure := range capture.exposures() {
+		if exposure["event_id"] == last {
+			delivered = true
+		}
+	}
+	if !delivered {
+		t.Fatalf("the new application's fact %s was not delivered", last)
 	}
 }

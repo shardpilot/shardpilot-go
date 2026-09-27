@@ -328,10 +328,10 @@ func TestWithdrawnMatchingIsTypedNotSubstring(t *testing.T) {
 }
 
 // Spool retention decides on the envelope's event_ts, never on timestamp
-// bits inside event ids — the deterministic (hash-derived) exposure ids
-// carry no honest time and must not order eviction or aging.
+// bits inside event ids — a sealed exposure's id (a digest the platform
+// derives) carries no honest time and must not order eviction or aging.
 func TestSpoolAgingUsesEventTSNotID(t *testing.T) {
-	deterministicID := experimentExposureEventID("marker", "spcid_"+strings.Repeat("b", 32), "exp", 1, 0)
+	deterministicID := expStubFactID(strings.Repeat("b", 32))
 	old := spoolEntry{id: deterministicID, ts: time.Now().Add(-8 * 24 * time.Hour).UTC().Format(time.RFC3339Nano), raw: []byte(`{}`)}
 	fresh := spoolEntry{id: deterministicID, ts: time.Now().UTC().Format(time.RFC3339Nano), raw: []byte(`{}`)}
 	if !spoolEntryExpired(old, time.Now()) {

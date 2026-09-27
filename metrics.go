@@ -82,7 +82,17 @@ type Stats struct {
 	LastConsentError           string
 
 	// ExperimentExposureDrops counts experiment applications that were not
-	// recorded, keyed by reason code. Nil until the first one.
+	// recorded, keyed by reason code; nil until the first one. The codes:
+	// not_recordable (the assignment carries no serving state, is not a
+	// client_id assignment, or the client has no AnonymousID to post the fact
+	// under — the variant is still served); owed_bound_exceeded (the bounded
+	// owed queue dropped its oldest application); apply_refused (the apply
+	// endpoint refused the application with a permanent 4xx);
+	// real_subjects_disabled (the platform's real-subjects sentinel withdrew
+	// every owed application); foreign_scope (the sealed fact names another
+	// workspace, app or environment than this client's); unsealed_at_close
+	// (still unsealed after Close's one bounded attempt). Each Snapshot
+	// returns a fresh copy.
 	ExperimentExposureDrops map[string]uint64
 }
 
@@ -109,6 +119,7 @@ type statsCollector struct {
 	consentOutboxUnreadable    atomic.Uint64
 
 	mu               sync.Mutex
+	expDrops         map[string]uint64
 	lastError        string
 	lastConsentError string
 	byStatus         map[EventStatus]uint64
@@ -125,6 +136,13 @@ func (s *statsCollector) snapshot() Stats {
 			byStatus[status] = count
 		}
 	}
+	var expDrops map[string]uint64
+	if len(s.expDrops) > 0 {
+		expDrops = make(map[string]uint64, len(s.expDrops))
+		for reason, count := range s.expDrops {
+			expDrops[reason] = count
+		}
+	}
 	s.mu.Unlock()
 
 	return Stats{
@@ -136,6 +154,7 @@ func (s *statsCollector) snapshot() Stats {
 		Rejected:                   s.rejected.Load(),
 		Duplicates:                 s.duplicates.Load(),
 		ByStatus:                   byStatus,
+		ExperimentExposureDrops:    expDrops,
 		LastError:                  lastError,
 		Spooled:                    s.spooled.Load(),
 		SpoolResent:                s.spoolResent.Load(),
@@ -150,6 +169,18 @@ func (s *statsCollector) snapshot() Stats {
 		ConsentOutboxUnreadable:    s.consentOutboxUnreadable.Load(),
 		LastConsentError:           lastConsentError,
 	}
+}
+
+// recordExperimentExposureDrop counts n experiment applications not recorded
+// for reason. It takes only this collector's lock (a leaf), so it may run
+// under the experiment state's lock.
+func (s *statsCollector) recordExperimentExposureDrop(reason string, n int) {
+	s.mu.Lock()
+	if s.expDrops == nil {
+		s.expDrops = make(map[string]uint64)
+	}
+	s.expDrops[reason] += uint64(n)
+	s.mu.Unlock()
 }
 
 func (s *statsCollector) recordBatch(result batchResult, size int) {

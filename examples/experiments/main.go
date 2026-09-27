@@ -2608,10 +2608,11 @@ func (r *recorder) last() *exchange {
 
 // assignmentRoute is the ONLY path this recorder records.
 //
-// ⚠ THE SDK HAS A SECOND LEG, AND IT SHARES THIS TRANSPORT. Applying a
-// variant (`ApplyExperimentVariant`, which this harness never calls; before it
-// existed, the fetch itself) enqueues an `experiment_exposure`, and the ingest
-// worker flushes on its own timer through the same `HTTPClient` -- so on a run that
+// ⚠ THE SDK HAS OTHER LEGS, AND THEY SHARE THIS TRANSPORT. Applying a variant
+// (`ApplyExperimentVariant`, which this harness never calls; before it existed,
+// the fetch itself) has the lane POST the application to the exposure apply
+// route and enqueue the sealed `experiment_exposure`, and the ingest worker
+// flushes on its own timer through the same `HTTPClient` -- so on a run that
 // settles near the tick, an ingest POST was recorded as another supposed
 // assignment attempt, could change which exchange `last()` returns, and raced
 // the report's own reads of `exchanges`. The configuration comment claiming

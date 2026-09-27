@@ -174,11 +174,20 @@ func expTestRequestScope() expRequestScope {
 	return expRequestScope{appKey: "app-test", envKey: "develop", experimentKey: expTestScopeKey}
 }
 
-func expAssignedBody(version string) string {
+// expAssignedBodyUnserved is an assigned body without the serving state —
+// what a server that predates it answers.
+func expAssignedBodyUnserved(version string) string {
 	return `{"app_key":"app-test","environment_key":"develop","experiment_key":"` + expTestScopeKey + `",` +
 		`"version":` + version + `,"assigned":true,"assignment_key":"asgn_abc","variant_key":"treatment",` +
 		`"variant_payload":{"speed":2},"subject_fact_key":"sfk1_` + strings.Repeat("a", 64) + `",` +
 		`"boundary":{"assignment_unit":"client_id"}}`
+}
+
+// expAssignedBody is an assigned body as the platform answers it, the
+// serving state included.
+func expAssignedBody(version string) string {
+	return strings.Replace(expAssignedBodyUnserved(version), `"assigned":true,`,
+		`"assigned":true,"served_revision":1,"served_kill_gate":false,"served_at":"2026-09-27T00:00:00Z",`, 1)
 }
 
 func TestParseExperimentVerdictShapes(t *testing.T) {
@@ -442,28 +451,6 @@ func itoa(v int) string {
 		v /= 10
 	}
 	return digits
-}
-
-func TestExperimentExposureEventIDDeterminism(t *testing.T) {
-	base := experimentExposureEventID("marker", "spcid_a", "exp", 3, 0)
-	if base != experimentExposureEventID("marker", "spcid_a", "exp", 3, 0) {
-		t.Fatalf("same tuple must derive the same id")
-	}
-	if len(base) != 36 || base[8] != '-' || base[13] != '-' || base[14] != '4' {
-		t.Fatalf("expected uuid-shaped deterministic id, got %q", base)
-	}
-	variants := []string{
-		experimentExposureEventID("marker2", "spcid_a", "exp", 3, 0),
-		experimentExposureEventID("marker", "spcid_b", "exp", 3, 0),
-		experimentExposureEventID("marker", "spcid_a", "exp2", 3, 0),
-		experimentExposureEventID("marker", "spcid_a", "exp", 4, 0),
-		experimentExposureEventID("marker", "spcid_a", "exp", 3, 1),
-	}
-	for i, variant := range variants {
-		if variant == base {
-			t.Fatalf("dimension %d must change the id", i)
-		}
-	}
 }
 
 func TestDeepCopyJSONMapIsolatesAndBounds(t *testing.T) {

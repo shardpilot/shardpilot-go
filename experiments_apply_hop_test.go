@@ -21,7 +21,9 @@ import (
 
 // expApplyStub is the stub exposure apply endpoint. By default it seals by
 // echoing the request: the fact id is derived from exposure_id, the event
-// time is applied_at as sent, the scope is the configured test scope. Pushed
+// time is applied_at in an equivalent but non-canonical spelling ("+00:00"
+// for "Z", so a client that re-formats the time instead of carrying it
+// verbatim is caught), the scope is the configured test scope. Pushed
 // responses are served in order, the last repeating.
 type expApplyStub struct {
 	mu        sync.Mutex
@@ -29,6 +31,9 @@ type expApplyStub struct {
 	requests  []expApplyRequest
 	facts     []map[string]any
 	workspace string // the sealed fact's workspace_id; "" means the test client's
+	// onRequest, when set, runs while a request is being answered (outside
+	// the stub's lock): the window in which the SDK's hop is in flight.
+	onRequest func()
 }
 
 type expApplyRequest struct {
@@ -93,10 +98,11 @@ func (s *expApplyStub) handler(t *testing.T) http.HandlerFunc {
 				workspace = "workspace-test"
 			}
 			exposureID, _ := body["exposure_id"].(string)
+			appliedAt, _ := body["applied_at"].(string)
 			fact := map[string]any{
 				"event_id":       expStubFactID(exposureID),
 				"event_name":     experimentExposureName,
-				"event_ts":       body["applied_at"],
+				"event_ts":       strings.Replace(appliedAt, "Z", "+00:00", 1),
 				"workspace_id":   workspace,
 				"app_id":         body["app_key"],
 				"environment_id": body["environment_key"],
@@ -113,7 +119,11 @@ func (s *expApplyStub) handler(t *testing.T) http.HandlerFunc {
 			encoded, _ := json.Marshal(map[string]any{"fact": fact, "seal": expStubSeal})
 			payload = string(encoded)
 		}
+		hook := s.onRequest
 		s.mu.Unlock()
+		if hook != nil {
+			hook()
+		}
 		if response.retryAfter != "" {
 			w.Header().Set("Retry-After", response.retryAfter)
 		}
@@ -174,6 +184,12 @@ func TestAnApplicationIsSealedByTheApplyHopAndDeliveredVerbatim(t *testing.T) {
 	}
 	if got := len(rig.script.apply.requestsSoFar()); got != 0 {
 		t.Fatalf("the application must not reach the network inside the host call, got %d apply request(s)", got)
+	}
+	// Nor inside another host call: a fetch that settles while the
+	// application is owed does not send it either.
+	fetchAssignment(t, rig.client, expTestScopeKey)
+	if got := len(rig.script.apply.requestsSoFar()); got != 0 {
+		t.Fatalf("a host fetch must not send an owed application, got %d apply request(s)", got)
 	}
 	rig.cycle()
 	requests := rig.script.apply.requestsSoFar()
@@ -449,7 +465,7 @@ func TestAnApplicationOfADroppedAssignmentIsStillSealed(t *testing.T) {
 // fact under — is served and not recordable; a fetch that re-serves it with
 // the pin makes the next application record.
 func TestAnAssignmentThatCannotBeRecordedIsServedAndCounted(t *testing.T) {
-	rig := newExpHopRig(t, nil, expAssignedBody("3"), expAssignedServedBody(expServedTrio))
+	rig := newExpHopRig(t, nil, expAssignedBodyUnserved("3"), expAssignedServedBody(expServedTrio))
 	fetchAssignment(t, rig.client, expTestScopeKey)
 	if variant, _ := rig.client.ApplyExperimentVariant(expTestScopeKey); variant != "treatment" {
 		t.Fatalf("an unpinned assignment still serves, got %q", variant)
@@ -474,5 +490,74 @@ func TestAnAssignmentThatCannotBeRecordedIsServedAndCounted(t *testing.T) {
 	if anonymous.drops("not_recordable") != 1 || len(anonymous.script.apply.requestsSoFar()) != 0 {
 		t.Fatalf("with no identity to post under, the application is not recordable: drops=%d requests=%d",
 			anonymous.drops("not_recordable"), len(anonymous.script.apply.requestsSoFar()))
+	}
+}
+
+// A consent purge that lands while the hop is in flight discards the record
+// the hop was sealing and re-arms its application; the answer is dropped and
+// the re-armed application is delivered exactly once.
+func TestAPurgeDuringTheHopDeliversTheApplicationOnce(t *testing.T) {
+	rig := newExpHopRig(t, nil)
+	fetchAssignment(t, rig.client, expTestScopeKey)
+	rig.client.ApplyExperimentVariant(expTestScopeKey)
+	raced := false
+	rig.script.apply.mu.Lock()
+	rig.script.apply.onRequest = func() {
+		if !raced {
+			raced = true
+			rig.client.SetConsent(false)
+			rig.client.SetConsent(true)
+		}
+	}
+	rig.script.apply.mu.Unlock()
+	rig.cycle()
+	if !raced {
+		t.Fatal("control: the purge must land during the hop")
+	}
+	rig.cycle()
+	flushOrFail(t, rig.client)
+	requests := rig.script.apply.requestsSoFar()
+	if len(requests) != 2 || requests[0].body["exposure_id"] != requests[1].body["exposure_id"] {
+		t.Fatalf("the re-armed application must be re-sent with its identity, got %d request(s)", len(requests))
+	}
+	if got := len(rig.capture.exposures()); got != 1 {
+		t.Fatalf("the application must be delivered exactly once, got %d", got)
+	}
+}
+
+// After a real-subjects sentinel and a re-enable, an application made first
+// by TrackExperimentExposure is the session's own: a denial that drains it
+// before delivery re-arms it, and the re-grant delivers it.
+func TestAFirstTrackedApplicationAfterASentinelSurvivesADenial(t *testing.T) {
+	rig := newExpHopRig(t, nil, expAssignedServedBody(expServedTrio), `{"error":"`+expSentinelRealSubjectsDisabled+`"}`, expAssignedServedBody(expServedTrio))
+	rig.script.responses[1].status = 403
+	fetchAssignment(t, rig.client, expTestScopeKey)
+	rig.client.ApplyExperimentVariant(expTestScopeKey)
+	rig.cycle()
+	flushOrFail(t, rig.client)
+	if _, err := rig.client.FetchExperimentAssignment(context.Background(), expTestScopeKey, nil); err == nil {
+		t.Fatal("control: the sentinel fetch must fail closed")
+	}
+	fetchAssignment(t, rig.client, expTestScopeKey)
+	if err := rig.client.TrackExperimentExposure(expTestScopeKey); err != nil {
+		t.Fatalf("TrackExperimentExposure after the re-enable: %v", err)
+	}
+	rig.client.SetConsent(false)
+	rig.client.SetConsent(true)
+	rig.cycle()
+	flushOrFail(t, rig.client)
+	requests := rig.script.apply.requestsSoFar()
+	if len(requests) != 2 || requests[0].body["exposure_id"] == requests[1].body["exposure_id"] {
+		t.Fatalf("the post-sentinel application is a new one, sent once after the re-grant: %d request(s)", len(requests))
+	}
+	tracked, _ := requests[1].body["exposure_id"].(string)
+	seen := 0
+	for _, fact := range rig.capture.exposures() {
+		if fact["event_id"] == expStubFactID(tracked) {
+			seen++
+		}
+	}
+	if seen != 1 {
+		t.Fatalf("the tracked application's only exposure was lost to the denial (delivered %d)", seen)
 	}
 }
