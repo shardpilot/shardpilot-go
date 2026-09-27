@@ -2410,16 +2410,23 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 // ── exposure arming (state side; emission lives in experiment_facts.go) ─────
 
 // armExposureLocked arms one application for delivery. The session's own
-// application of a tuple already owed at the tail is not armed twice (the
-// emitter also skips a tuple already delivered this session); an extra
-// application always is. The FIFO is bounded; overflowing drops the OLDEST,
+// application of a tuple already delivered or already owed is not armed
+// again (the emitter also skips a tuple already delivered this session); an
+// extra application always is. The FIFO is bounded; overflowing drops the OLDEST,
 // counted as owed_bound_exceeded, so a new application displacing the slot
 // is never a silent loss of the previous one.
 func (e *experimentsState) armExposureLocked(experimentKey string, entry *expEntry, app expApplication, extra bool) (overflowed bool) {
 	list := e.pendingExposure[experimentKey]
-	if tail := lastOwedExposure(list); !extra && tail != nil && !tail.extra && tail.session == e.sessionMarker &&
-		exposureTupleKey(experimentKey, tail.entry) == exposureTupleKey(experimentKey, entry) {
-		return false
+	if !extra {
+		// Once per (experiment, version, subject, session): a tuple whose
+		// application was delivered, or is already owed anywhere in the
+		// queue, records nothing more. A second id minted here would be
+		// taken over the delivered one by a consent purge's re-arm, and the
+		// platform would record the treatment twice.
+		tuple := exposureTupleKey(experimentKey, entry)
+		if e.exposed[tuple].auto || e.owedTupleArmedLocked(experimentKey, tuple) {
+			return false
+		}
 	}
 	list = append(list, &expOwedExposure{entry: entry, session: e.sessionMarker, app: app, extra: extra})
 	if len(list) > expMaxOwedExposures {
@@ -2458,13 +2465,6 @@ func (e *experimentsState) drainOwedExposureOverflowLocked() int {
 	count := e.owedExposureOverflow
 	e.owedExposureOverflow = 0
 	return count
-}
-
-func lastOwedExposure(list []*expOwedExposure) *expOwedExposure {
-	if len(list) == 0 {
-		return nil
-	}
-	return list[len(list)-1]
 }
 
 // owedTupleArmedLocked reports whether the queue still holds an armed
@@ -3374,15 +3374,12 @@ func (c *Client) experimentCycle(ctx context.Context) {
 // when network work happens.
 func (c *Client) runExperimentsLane() {
 	defer close(c.expLaneDone)
-	// The lane's fetches run under a stop-cancelled context: Close cancels
-	// any in-flight revalidation GET instead of waiting it out (the lane
+	// The lane's network work runs under expLaneCtx, which Close cancels
+	// before anything else it does in the plane: an in-flight revalidation
+	// GET or apply request is abandoned instead of waited out (the lane
 	// never blocks Close).
-	laneCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() {
-		<-c.stop
-		cancel()
-	}()
+	laneCtx := c.expLaneCtx
+	defer c.expLaneCancel()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {

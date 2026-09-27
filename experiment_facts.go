@@ -376,9 +376,10 @@ func (c *Client) postExposureApplication(ctx context.Context, experimentKey stri
 	if err != nil {
 		return remoteConfigResponse{}, err
 	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
+	// Bounded like an assignment fetch: an HTTPClient without a Timeout
+	// must not let a silent endpoint hold the emission lock.
+	ctx, cancel := contextWithDefaultTimeout(ctx, c.cfg.HTTPTimeout)
+	defer cancel()
 	return c.transport.FetchRemoteConfig(ctx, remoteConfigRequest{
 		url:    e.baseURL + expExposureApplyRoute,
 		bearer: c.cfg.APIKey,
