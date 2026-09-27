@@ -390,6 +390,17 @@ type expEntry struct {
 	SubjectKey     string         `json:"subject_key,omitempty"`
 	Attributes     []expAttribute `json:"attributes,omitempty"`
 	FetchedAtMS    int64          `json:"fetched_at_ms"`
+	// Served is the serving state the assignment was served from; nil when
+	// it is not pinned.
+	Served *expServedState `json:"served,omitempty"`
+}
+
+// expServedState is the serving state an assignment was served from: the
+// fetch's served_revision, served_kill_gate and served_at.
+type expServedState struct {
+	Revision int64  `json:"revision"`
+	KillGate bool   `json:"kill_gate"`
+	At       string `json:"at"`
 }
 
 // expOutcome directs the stateful install after the pure classification.
