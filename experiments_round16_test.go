@@ -226,11 +226,13 @@ func TestFactStampRidesEntrySnapshot(t *testing.T) {
 	t.Run("exposure_build", func(t *testing.T) {
 		stage(t, "exposure_build", func(t *testing.T, c *Client) {
 			if err := c.TrackExperimentExposure(expTestScopeKey); err != nil {
-				t.Fatalf("explicit exposure: %v", err)
+				t.Fatalf("extra exposure: %v", err)
 			}
+			// The lane seals and builds it; the sentinel lands in between.
+			c.experimentCycle(context.Background())
 		}, func(capture *expWireCapture) int {
-			// The automatic arm-0 exposure delivered in the setup; anything
-			// beyond it is the raced explicit re-arm.
+			// The session's own exposure delivered in the setup; anything
+			// beyond it is the raced extra one.
 			return len(capture.exposures()) - 1
 		})
 	})

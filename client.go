@@ -175,6 +175,12 @@ type Client struct {
 	// exits; nil when the consumer is not enabled. Close waits on it
 	// (bounded by its context) like workerDone.
 	expLaneDone chan struct{}
+	// expLaneCtx bounds the lane's network work; expLaneCancel ends it. Close
+	// cancels it before its own experiment sweeps, which take the emission
+	// lock an in-flight apply request holds, so Close never waits out the
+	// lane's request.
+	expLaneCtx    context.Context
+	expLaneCancel context.CancelFunc
 
 	// spool is the opt-in bounded disk spool; nil when Config.SpoolDir is
 	// unset (today's memory-only behavior, unchanged).
@@ -375,6 +381,7 @@ func NewClient(cfg Config) (*Client, error) {
 		// the ±10% window instead of herding at exactly 300s.
 		client.exp.jitterFn = client.jitterValue
 		client.exp.captureOwedDropFn = client.captureOwedExposuresForDrop
+		client.exp.dropFn = client.stats.recordExperimentExposureDrop
 		client.exp.captureRetryFn = client.appendCaptureEntries
 		// The sentinel bumps the pipeline-fact purge epoch UNDER e.mu,
 		// atomically with its decisive state change, so no post-sentinel
@@ -391,6 +398,7 @@ func NewClient(cfg Config) (*Client, error) {
 			client.logf("shardpilot experiments: the state directory could not be made private (0700); persisted experiment state is not loaded and nothing serves from it")
 		}
 		client.expLaneDone = make(chan struct{})
+		client.expLaneCtx, client.expLaneCancel = context.WithCancel(context.Background())
 	}
 
 	go client.run()
@@ -655,6 +663,9 @@ func (c *Client) finishClose(ctx context.Context) error {
 	// owed durable syncs land and owed exposure facts enter the queue in
 	// time to ride it (a treatment applied under a FULL queue gets its
 	// fact the room the flush frees — see the second sweep below).
+	if c.expLaneCancel != nil {
+		c.expLaneCancel()
+	}
 	c.closeExperimentPreFlush()
 	err := c.Flush(ctx)
 	// The flush freed queue room: owed exposure facts drain in a
@@ -663,8 +674,8 @@ func (c *Client) finishClose(ctx context.Context) error {
 	// as little as one fact per pass, and a single pass would silently
 	// lose the rest. Best-effort by design and never silent: whatever
 	// enters the queue is delivered or counted by the close path's
-	// accounting, and the durable record re-arms live assignments at the
-	// next launch.
+	// accounting. The durable record restores live assignments at the next
+	// launch, where the host's next application records again.
 	c.closeExperimentPostFlush(ctx)
 	c.stopOnce.Do(func() {
 		close(c.stop)

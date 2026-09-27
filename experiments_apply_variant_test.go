@@ -59,6 +59,7 @@ func TestApplyExperimentVariantRecordsOncePerSession(t *testing.T) {
 	if got, _ := client.ApplyExperimentVariant(expTestScopeKey); got != "treatment" {
 		t.Fatalf("ApplyExperimentVariant must return the served variant, got %q", got)
 	}
+	client.experimentCycle(context.Background())
 	flushOrFail(t, client)
 	if got := len(capture.exposures()); got != 1 {
 		t.Fatalf("the application must record one exposure, got %d", got)
@@ -127,6 +128,7 @@ func TestConsentPurgeReArmsOnlyAppliedAssignments(t *testing.T) {
 	fetchAssignment(t, client, expTestScopeKey)
 	fetchAssignment(t, client, expSecondKey)
 	client.ApplyExperimentVariant(expTestScopeKey)
+	client.experimentCycle(context.Background())
 	flushOrFail(t, client)
 	if got := len(capture.exposures()); got != 1 {
 		t.Fatalf("precondition: only the applied experiment records, got %d", got)
@@ -147,11 +149,13 @@ func TestConsentPurgeReArmsOnlyAppliedAssignments(t *testing.T) {
 }
 
 // fetchAndApply is the host's fetch followed by its application of the
-// variant — what a fetch alone recorded before ApplyExperimentVariant.
+// variant and one cycle of the background lane, which seals the application
+// and hands the fact to the queue — what a fetch alone once recorded.
 func fetchAndApply(t *testing.T, c *Client, key string) ExperimentAssignmentResult {
 	t.Helper()
 	result := fetchAssignment(t, c, key)
 	c.ApplyExperimentVariant(key)
+	c.experimentCycle(context.Background())
 	return result
 }
 
@@ -208,6 +212,7 @@ func TestApplyReturnsThePayloadOfTheRecordedAssignment(t *testing.T) {
 
 	fetchAssignment(t, client, expTestScopeKey)
 	variant, payload := client.ApplyExperimentVariant(expTestScopeKey)
+	client.experimentCycle(context.Background())
 	if variant != "treatment" || payload["speed"] != float64(2) {
 		t.Fatalf("version 1: got %q %v", variant, payload)
 	}
@@ -220,6 +225,7 @@ func TestApplyReturnsThePayloadOfTheRecordedAssignment(t *testing.T) {
 	if variant != "treatment" || payload["speed"] != float64(3) {
 		t.Fatalf("version 2: got %q %v", variant, payload)
 	}
+	client.experimentCycle(context.Background())
 	flushOrFail(t, client)
 	versions := map[float64]bool{}
 	for _, fact := range capture.exposures() {
@@ -231,8 +237,9 @@ func TestApplyReturnsThePayloadOfTheRecordedAssignment(t *testing.T) {
 }
 
 // F4: a first application made through TrackExperimentExposure, whose fact
-// a denial drains between its enqueue and its bookkeeping, re-emits after
-// the re-grant: the purge could not see it, so the emission re-arms it.
+// a denial drains between its enqueue and its bookkeeping, is delivered again
+// after the re-grant: the purge saw it still owed and re-armed it, with the
+// same application identity.
 func TestAFirstExplicitApplicationSurvivesARacedPurge(t *testing.T) {
 	script := &expScript{}
 	script.push(200, expAssignedBody("1"))
@@ -243,10 +250,6 @@ func TestAFirstExplicitApplicationSurvivesARacedPurge(t *testing.T) {
 	defer client.Close(context.Background())
 	client.SetConsent(true)
 	fetchAssignment(t, client, expTestScopeKey)
-	client.exp.mu.Lock()
-	subject := client.exp.currentSubjectIDLocked()
-	marker := client.exp.sessionMarker
-	client.exp.mu.Unlock()
 
 	raced := false
 	client.exp.mu.Lock()
@@ -261,15 +264,19 @@ func TestAFirstExplicitApplicationSurvivesARacedPurge(t *testing.T) {
 	if err := client.TrackExperimentExposure(expTestScopeKey); err != nil {
 		t.Fatalf("TrackExperimentExposure: %v", err)
 	}
+	client.experimentCycle(context.Background())
 	if !raced {
 		t.Fatal("control: the seam must have fired")
 	}
 	client.experimentCycle(context.Background())
 	flushOrFail(t, client)
-	want := experimentExposureEventID(marker, subject, expTestScopeKey, 1, 0)
+	ids := expSealedIDs(script)
+	if len(ids) < 2 || ids[1] != ids[0] {
+		t.Fatalf("the re-armed application must be re-sent with the same identity, got %v", ids)
+	}
 	seen := 0
 	for _, fact := range capture.exposures() {
-		if fact["event_id"] == want {
+		if fact["event_id"] == ids[0] {
 			seen++
 		}
 	}

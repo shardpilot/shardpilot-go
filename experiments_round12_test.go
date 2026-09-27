@@ -43,8 +43,6 @@ func TestOwedExposureSurvivesAuthLatchedConsentPurge(t *testing.T) {
 	}
 	client.exp.mu.Lock()
 	pendingBefore := len(client.exp.pendingExposure[expTestScopeKey])
-	subject := client.exp.currentSubjectIDLocked()
-	marker := client.exp.sessionMarker
 	client.exp.mu.Unlock()
 	if pendingBefore == 0 {
 		t.Fatalf("test shape: the exposure must be owed (queue full), pendingExposure empty")
@@ -62,14 +60,21 @@ func TestOwedExposureSurvivesAuthLatchedConsentPurge(t *testing.T) {
 	client.SetConsent(false)
 	client.SetConsent(true)
 	capture.setStatus(http.StatusAccepted)
+	// Re-armed from the latch-retained record, the owed application is not
+	// a discard: nothing is counted consent_withdrawn.
+	if n := client.Snapshot().ExperimentExposureDrops["consent_withdrawn"]; n != 0 {
+		t.Fatalf("a latch-retained application the purge re-armed must not count as withdrawn, got %d", n)
+	}
 
 	// The retained treatment's exposure must have re-armed at the purge:
 	// the sweep emits it and the flush delivers it.
-	client.sweepAllExperimentExposures()
+	client.experimentCycle(context.Background())
 	if err := client.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
-	wantID := experimentExposureEventID(marker, subject, expTestScopeKey, 1, 0)
+	// The re-armed application is the original one: its fact id is the one
+	// the platform derived for the first apply request.
+	wantID := expSealedIDs(script)[0]
 	delivered := false
 	for _, exposure := range capture.exposures() {
 		if id, _ := exposure["event_id"].(string); id == wantID {

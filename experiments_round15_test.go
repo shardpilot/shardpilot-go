@@ -217,25 +217,44 @@ func TestRacedConsentRefusalMapsToConsentError(t *testing.T) {
 			if result := fetchAssignment(t, client, expTestScopeKey); result.VariantKey != "treatment" {
 				t.Fatalf("setup fetch: %+v", result)
 			}
-			// The flip lands INSIDE the emission: after its own consent
-			// pre-check admitted, before the fact intake's gate re-check —
-			// the raced-refusal window the seam pins open.
+			// The flip lands INSIDE the lane's delivery: after its own
+			// consent pre-check admitted, before the fact intake's gate
+			// re-check — the raced-refusal window the seam pins open.
 			flipped := false
+			client.exp.mu.Lock()
 			client.exp.consentRaceSeam = func(stage string) {
 				if stage == "exposure_enqueue" && !flipped {
 					flipped = true
 					client.consent.Store(tc.state)
 				}
 			}
-			err := client.TrackExperimentExposure(expTestScopeKey)
+			client.exp.mu.Unlock()
+			if err := client.TrackExperimentExposure(expTestScopeKey); err != nil {
+				t.Fatalf("the application must be accepted before the flip: %v", err)
+			}
+			client.experimentCycle(context.Background())
 			if !flipped {
 				t.Fatalf("test shape: the enqueue seam never fired")
 			}
-			if !errors.Is(err, tc.want) {
-				t.Fatalf("a consent flip racing into the fact intake must surface the documented consent refusal %v, got %v", tc.want, err)
+			// The raced refusal is retryable: the application stays owed,
+			// nothing is dropped or counted, and the intake reported the
+			// documented consent refusal rather than an invalid fact.
+			if got := client.owedExperimentExposureCount(); got != 1 {
+				t.Fatalf("a consent flip racing into the fact intake must keep the application owed, got %d owed", got)
 			}
-			if errors.Is(err, ErrInvalidExperimentFact) {
-				t.Fatalf("the raced refusal must not read as an invalid fact: %v", err)
+			if drops := client.Snapshot().ExperimentExposureDrops; len(drops) != 0 {
+				t.Fatalf("a raced consent refusal drops nothing, got %v", drops)
+			}
+			if err := client.enqueueExperimentFact(Event{Name: experimentExposureName, omitUserID: true}, false); !errors.Is(err, tc.want) {
+				t.Fatalf("the intake must answer the documented consent refusal %v, got %v", tc.want, err)
+			}
+			client.consent.Store(consentStateGranted)
+			client.experimentCycle(context.Background())
+			if err := client.Flush(context.Background()); err != nil {
+				t.Fatalf("flush: %v", err)
+			}
+			if got := len(capture.exposures()); got != 1 {
+				t.Fatalf("once consent returns, the kept application is delivered, got %d", got)
 			}
 		})
 	}
@@ -405,50 +424,51 @@ func TestExplicitExposureArmSurvivesRacedPurge(t *testing.T) {
 	if result := fetchAndApply(t, client, expTestScopeKey); result.Version != 1 {
 		t.Fatalf("setup fetch: %+v", result)
 	}
-	client.exp.mu.Lock()
-	subject := client.exp.currentSubjectIDLocked()
-	marker := client.exp.sessionMarker
-	client.exp.mu.Unlock()
 
-	// Arm 1: a clean explicit re-arm on top of the automatic arm 0.
+	// Extra 1: a clean extra application on top of the session's own.
 	if err := client.TrackExperimentExposure(expTestScopeKey); err != nil {
-		t.Fatalf("explicit exposure 1: %v", err)
+		t.Fatalf("extra application 1: %v", err)
 	}
-	// Arm 2: the enqueue SUCCEEDS — the fact is in the pipeline, its arm
-	// is spent — and a consent purge lands before the post-enqueue
-	// high-water update (the seam models SetConsent(false) racing the
-	// call at exactly that point).
+	client.experimentCycle(context.Background())
+	// Extra 2: its enqueue SUCCEEDS — the fact is in the pipeline — and a
+	// consent purge lands before the post-enqueue bookkeeping (the seam
+	// models SetConsent(false) racing the delivery at exactly that point).
 	armed := false
+	client.exp.mu.Lock()
 	client.exp.consentRaceSeam = func(stage string) {
 		if stage == "exposure_enqueued" && armed {
 			armed = false
 			client.exp.onAnalyticsPurge()
 		}
 	}
+	client.exp.mu.Unlock()
 	armed = true
 	if err := client.TrackExperimentExposure(expTestScopeKey); err != nil {
-		t.Fatalf("explicit exposure 2 (raced): %v", err)
+		t.Fatalf("extra application 2 (raced): %v", err)
 	}
-	// Arm 3: the next explicit re-arm must take a FRESH arm — a distinct
-	// deterministic id — never re-derive the raced arm 2's.
+	client.experimentCycle(context.Background())
+	extra2 := expSealedIDs(script)[2]
+	// Extra 3: a later extra application is a REAL new re-exposure and must
+	// carry its own id, never extra 2's.
 	if err := client.TrackExperimentExposure(expTestScopeKey); err != nil {
-		t.Fatalf("explicit exposure 3: %v", err)
+		t.Fatalf("extra application 3: %v", err)
 	}
+	client.experimentCycle(context.Background())
 	if err := client.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
-	idArm2 := experimentExposureEventID(marker, subject, expTestScopeKey, 1, 2)
-	idArm3 := experimentExposureEventID(marker, subject, expTestScopeKey, 1, 3)
-	arm2Seen, arm3Seen := 0, 0
+	ids := expSealedIDs(script)
+	extra3 := ids[len(ids)-1]
+	extra2Seen, extra3Seen := 0, 0
 	for _, exposure := range capture.exposures() {
 		switch exposure["event_id"] {
-		case idArm2:
-			arm2Seen++
-		case idArm3:
-			arm3Seen++
+		case extra2:
+			extra2Seen++
+		case extra3:
+			extra3Seen++
 		}
 	}
-	if arm3Seen != 1 || arm2Seen != 1 {
-		t.Fatalf("the explicit re-arm after the raced purge reused a spent arm: the skipped high-water update forgot an arm already handed to the pipeline, the next exposure re-derived the SAME deterministic id, and the server's de-dupe would collapse a real re-exposure (arm2 facts=%d, arm3 facts=%d)", arm2Seen, arm3Seen)
+	if extra2 == extra3 || extra2Seen != 1 || extra3Seen != 1 {
+		t.Fatalf("each extra application must be delivered once under its own id across the raced purge (extra2=%s seen %d, extra3=%s seen %d)", extra2, extra2Seen, extra3, extra3Seen)
 	}
 }

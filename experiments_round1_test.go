@@ -64,14 +64,26 @@ func TestSubjectFactKeyGrammarGuardsTheFactLane(t *testing.T) {
 	if err := client2.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
+	// An exposure does not read the stored fact key at all: the platform
+	// seals it and mints the key itself. Recorded here, it must still carry
+	// no raw subject id anywhere.
+	if err := client2.TrackExperimentExposure(expTestScopeKey); err != nil {
+		t.Fatalf("an exposure is sealed by the platform, whatever the stored fact key: %v", err)
+	}
+	client2.experimentCycle(context.Background())
+	if err := client2.Flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
 	for _, fact := range capture.exposures() {
 		key := fact["props"].(map[string]any)["assignment_key"]
 		if s, _ := key.(string); strings.HasPrefix(s, "spcid_") {
 			t.Fatalf("the raw subject id egressed as assignment_key: %v", key)
 		}
 	}
-	if err := client2.TrackExperimentExposure(expTestScopeKey); !errors.Is(err, ErrExperimentFactUnavailable) {
-		t.Fatalf("a malformed stored fact key must refuse facts, got %v", err)
+	// The outcome is still SDK-built from the stored key: a malformed one
+	// refuses it.
+	if err := client2.TrackExperimentOutcome(expTestScopeKey, "score", 1); !errors.Is(err, ErrExperimentFactUnavailable) {
+		t.Fatalf("a malformed stored fact key must refuse the outcome, got %v", err)
 	}
 }
 
@@ -302,13 +314,13 @@ func TestOversizedSubjectFileIsAMiss(t *testing.T) {
 func TestExperimentFactsCountInStats(t *testing.T) {
 	script := &expScript{}
 	script.push(200, expAssignedBody("1"))
-	server := httptest.NewServer(script.handler(t))
+	server := newExperimentServer(t, script, &expWireCapture{})
 	defer server.Close()
 	client := newExperimentClient(t, server.URL, nil)
 	defer client.Close(context.Background())
 
 	before := client.Snapshot().Enqueued
-	fetchAndApply(t, client, expTestScopeKey) // auto exposure
+	fetchAndApply(t, client, expTestScopeKey) // the application, sealed by the lane
 	if err := client.TrackExperimentOutcome(expTestScopeKey, "score", 1); err != nil {
 		t.Fatalf("outcome: %v", err)
 	}

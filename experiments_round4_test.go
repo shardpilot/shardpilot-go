@@ -167,7 +167,8 @@ func TestOwedSweepAndArmRefreshDoNotRace(t *testing.T) {
 	}()
 	for time.Now().Before(deadline) {
 		e.mu.Lock()
-		e.armExposureLocked(expTestScopeKey, entry) // same tuple: in-place refresh
+		// Same tuple: after the first, the owed application is not armed twice.
+		e.armExposureLocked(expTestScopeKey, entry, expApplication{exposureID: strings.Repeat("0", 32), appliedAt: "2026-09-27T00:00:00Z"}, false)
 		e.mu.Unlock()
 		runtime.Gosched()
 	}

@@ -16,7 +16,7 @@ import (
 const expServedTrio = `"served_revision":7,"served_kill_gate":true,"served_at":"2026-09-27T03:00:00.123456789+02:00",`
 
 func expAssignedServedBody(trio string) string {
-	return strings.Replace(expAssignedBody("3"), `"assigned":true,`, `"assigned":true,`+trio, 1)
+	return strings.Replace(expAssignedBodyUnserved("3"), `"assigned":true,`, `"assigned":true,`+trio, 1)
 }
 
 func TestParseExperimentVerdictPinsTheServedState(t *testing.T) {

@@ -68,6 +68,7 @@ type eventEnvelope struct {
 	AppBuild        string         `json:"app_build,omitempty"`
 	Context         map[string]any `json:"context,omitempty"`
 	Props           map[string]any `json:"props,omitempty"`
+	AttestationSeal string         `json:"attestation_seal,omitempty"`
 
 	// internalIdentityFact marks an envelope the SDK built for one of its
 	// OWN experiment facts: user_id omitted BY WIRE CONTRACT (never an
@@ -132,12 +133,17 @@ func (c *Client) buildEnvelope(event Event) (eventEnvelope, error) {
 		source = event.sourceOverride
 	}
 
+	eventTS := timestamp.UTC().Format(time.RFC3339Nano)
+	if event.rawEventTS != "" {
+		// A sealed fact's event time, exactly as sealed.
+		eventTS = event.rawEventTS
+	}
 	return eventEnvelope{
 		EventID:         id,
 		SchemaVersion:   1,
 		EventName:       name,
 		Source:          source,
-		EventTS:         timestamp.UTC().Format(time.RFC3339Nano),
+		EventTS:         eventTS,
 		WorkspaceID:     c.cfg.WorkspaceID,
 		AppID:           c.cfg.AppID,
 		EnvironmentID:   c.cfg.EnvironmentID,
@@ -150,6 +156,7 @@ func (c *Client) buildEnvelope(event Event) (eventEnvelope, error) {
 		AppBuild:        appBuild,
 		Context:         cloneMap(event.Context),
 		Props:           props,
+		AttestationSeal: event.attestationSeal,
 
 		internalIdentityFact: event.omitUserID,
 	}, nil

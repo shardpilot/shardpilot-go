@@ -24,6 +24,9 @@ type expScript struct {
 	requests  []*http.Request
 	gate      chan struct{}         // when non-nil, each handler run waits on it
 	gates     map[int]chan struct{} // per-arrival-index gates (override gate)
+	// apply is the stub exposure apply route (experiments_apply_hop_test.go),
+	// mounted beside the assignment route.
+	apply expApplyStub
 }
 
 type expScriptResponse struct {
@@ -124,6 +127,8 @@ type expWireCapture struct {
 	status    int
 	hits      int
 	envelopes []map[string]any
+	// raw keeps each accepted batch's request body as sent.
+	raw [][]byte
 }
 
 func (w *expWireCapture) handler(t *testing.T) http.HandlerFunc {
@@ -133,7 +138,8 @@ func (w *expWireCapture) handler(t *testing.T) http.HandlerFunc {
 		var batch struct {
 			Events []map[string]any `json:"events"`
 		}
-		_ = json.NewDecoder(ingestRequestBody(t, r)).Decode(&batch)
+		wire := ingestRequestBytes(t, r)
+		_ = json.Unmarshal(wire, &batch)
 		w.mu.Lock()
 		w.hits++
 		status := w.status
@@ -142,6 +148,7 @@ func (w *expWireCapture) handler(t *testing.T) http.HandlerFunc {
 		}
 		if status == http.StatusAccepted {
 			w.envelopes = append(w.envelopes, batch.Events...)
+			w.raw = append(w.raw, wire)
 		}
 		count := len(batch.Events)
 		w.mu.Unlock()
@@ -151,6 +158,13 @@ func (w *expWireCapture) handler(t *testing.T) http.HandlerFunc {
 			_, _ = rw.Write([]byte(fmt.Sprintf(`{"accepted":%d,"rejected":0,"duplicates":0}`, count)))
 		}
 	}
+}
+
+// rawBatches returns the accepted batches' request bodies as sent.
+func (w *expWireCapture) rawBatches() [][]byte {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([][]byte(nil), w.raw...)
 }
 
 func (w *expWireCapture) setStatus(status int) {
@@ -185,6 +199,7 @@ func newExperimentServer(t *testing.T, script *expScript, capture *expWireCaptur
 	t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc(expAssignmentRoute, script.handler(t))
+	mux.HandleFunc(expExposureApplyRoute, script.apply.handler(t))
 	mux.HandleFunc("/v1/consent", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
@@ -718,9 +733,10 @@ func TestGrammar400RemintsOncePreservingAttributesAndOwedExposures(t *testing.T)
 		t.Fatalf("the retry must ride a freshly minted subject, got %q", subjectRetry)
 	}
 	client.ApplyExperimentVariant(expTestScopeKey)
+	client.experimentCycle(context.Background())
 
 	// The owed exposure of the PAST (version-1) treatment survived the
-	// re-mint: the sweep emitted it alongside the fresh version-2
+	// re-mint: the lane delivered it alongside the fresh version-2
 	// application's fact.
 	if err := client.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
@@ -812,6 +828,7 @@ func TestRevalidationCycleReusesAttributesAndDropsOnKill(t *testing.T) {
 		t.Fatalf("fetch: %v", err)
 	}
 	client.ApplyExperimentVariant(expTestScopeKey)
+	client.experimentCycle(context.Background())
 	if err := client.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
@@ -1107,7 +1124,7 @@ func queuedExposures(events []Event) []Event {
 	return out
 }
 
-func TestExposureAutoEmitsOnceWithDeterministicID(t *testing.T) {
+func TestExposureDeliversOncePerSessionWithTheSealedID(t *testing.T) {
 	script := &expScript{}
 	script.push(200, expAssignedBody("1"))
 	script.push(503, ``)
@@ -1126,24 +1143,18 @@ func TestExposureAutoEmitsOnceWithDeterministicID(t *testing.T) {
 		t.Fatalf("expected exactly one exposure fact, got %d", len(facts))
 	}
 	fact := facts[0]
-	client.exp.mu.Lock()
-	marker := client.exp.sessionMarker
-	subject := client.exp.entries[expTestScopeKey].SubjectKey
-	client.exp.mu.Unlock()
-	wantID := experimentExposureEventID(marker, subject, expTestScopeKey, 1, 0)
-	if fact["event_id"] != wantID {
-		t.Fatalf("expected the deterministic id %q, got %v", wantID, fact["event_id"])
+	requests := script.apply.requestsSoFar()
+	if len(requests) != 1 {
+		t.Fatalf("one application, one apply request: got %d", len(requests))
+	}
+	exposureID, _ := requests[0].body["exposure_id"].(string)
+	if wantID := expStubFactID(exposureID); fact["event_id"] != wantID {
+		t.Fatalf("expected the sealed fact's id %q, got %v", wantID, fact["event_id"])
 	}
 	props := fact["props"].(map[string]any)
-	if props["assignment_key"] != "sfk1_"+strings.Repeat("a", 64) {
-		t.Fatalf("the fact must carry the server-minted subject-fact key verbatim, got %v", props["assignment_key"])
-	}
-	if props["experiment_version"] != float64(1) || props["variant_key"] != "treatment" ||
-		props["assignment_unit"] != "client_id" || props["experiment_key"] != expTestScopeKey {
-		t.Fatalf("props mismatch: %v", props)
-	}
-	if len(props) != 5 {
-		t.Fatalf("the props allowlist is exactly five keys, got %v", props)
+	if props["assignment_key"] != "sfk1_"+strings.Repeat("a", 64) || props["experiment_version"] != float64(1) ||
+		props["variant_key"] != "treatment" || props["experiment_key"] != expTestScopeKey {
+		t.Fatalf("the fact must carry the sealed props: %v", props)
 	}
 	for _, value := range props {
 		if s, ok := value.(string); ok && strings.HasPrefix(s, "spcid_") {
@@ -1151,10 +1162,13 @@ func TestExposureAutoEmitsOnceWithDeterministicID(t *testing.T) {
 		}
 	}
 
-	// A cache-served refetch does not re-emit within the session.
+	// A cache-served refetch and another application do not re-deliver
+	// within the session.
 	if _, err := client.FetchExperimentAssignment(context.Background(), expTestScopeKey, nil); err != nil {
 		t.Fatalf("refetch: %v", err)
 	}
+	client.ApplyExperimentVariant(expTestScopeKey)
+	client.experimentCycle(context.Background())
 	if err := client.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
@@ -1216,8 +1230,8 @@ func TestExplicitReArmWhileAutoOwedEmitsBothDistinctIDs(t *testing.T) {
 	})
 	defer client.Close(context.Background())
 
-	// Park the worker and fill the queue: the automatic arm-0 emission at
-	// fetch resolution fails ErrQueueFull and stays OWED.
+	// Park the worker and fill the queue: the application's sealed fact
+	// cannot enqueue and stays OWED.
 	parkWorkerWithFullQueue(t, client, capture)
 	fetchAndApply(t, client, expTestScopeKey)
 	client.exp.mu.Lock()
@@ -1227,39 +1241,36 @@ func TestExplicitReArmWhileAutoOwedEmitsBothDistinctIDs(t *testing.T) {
 		t.Fatalf("precondition: the auto emission is owed, got %d", owed)
 	}
 	// Free the queue (the worker stays parked on its retained batch), then
-	// explicitly re-arm while arm 0 is still owed: the re-arm buys the
-	// EXTRA fact (arm 1), never the owed one's slot.
+	// add an extra application while the session's own is still owed: it is
+	// its own application, never the owed one's slot.
 	client.queue.drainAll()
 	if err := client.TrackExperimentExposure(expTestScopeKey); err != nil {
 		t.Fatalf("TrackExperimentExposure: %v", err)
 	}
 	// The parked worker is not pulling (its batch is retained at
 	// BatchSize), so the BufferSize=1 queue is a stable observation point:
-	// drain the explicit fact, sweep the owed arm 0, drain it too.
+	// each lane cycle hands one fact to it, drained after each cycle.
 	var facts []Event
-	for _, event := range client.queue.drainInto(nil, 16) {
-		if event.Name == experimentExposureName {
-			facts = append(facts, event)
-		}
-	}
-	client.experimentCycle(context.Background()) // sweeps the owed arm 0
-	for _, event := range client.queue.drainInto(nil, 16) {
-		if event.Name == experimentExposureName {
-			facts = append(facts, event)
+	for i := 0; i < 3; i++ {
+		client.experimentCycle(context.Background())
+		for _, event := range client.queue.drainInto(nil, 16) {
+			if event.Name == experimentExposureName {
+				facts = append(facts, event)
+			}
 		}
 	}
 	if len(facts) != 2 {
-		t.Fatalf("expected BOTH facts (explicit arm 1 + owed arm 0), got %d", len(facts))
+		t.Fatalf("expected BOTH facts (the owed application + the extra one), got %d", len(facts))
 	}
-	client.exp.mu.Lock()
-	marker := client.exp.sessionMarker
-	subject := client.exp.entries[expTestScopeKey].SubjectKey
-	client.exp.mu.Unlock()
-	wantArm0 := experimentExposureEventID(marker, subject, expTestScopeKey, 1, 0)
-	wantArm1 := experimentExposureEventID(marker, subject, expTestScopeKey, 1, 1)
+	requests := script.apply.requestsSoFar()
+	if len(requests) != 2 {
+		t.Fatalf("two applications, two apply requests: got %d", len(requests))
+	}
+	first, _ := requests[0].body["exposure_id"].(string)
+	second, _ := requests[1].body["exposure_id"].(string)
 	got := map[string]bool{facts[0].ID: true, facts[1].ID: true}
-	if !got[wantArm0] || !got[wantArm1] {
-		t.Fatalf("expected arm 0 and arm 1 ids, got %v (want %q, %q)", got, wantArm0, wantArm1)
+	if first == second || !got[expStubFactID(first)] || !got[expStubFactID(second)] {
+		t.Fatalf("expected two distinct sealed ids, one per application, got %v", got)
 	}
 	capture.setStatus(http.StatusAccepted)
 }
@@ -1276,10 +1287,12 @@ func TestExposureRequiresSubjectFactKey(t *testing.T) {
 
 	fetchAssignment(t, client, expTestScopeKey)
 	if facts := queuedExposures(drainQueuedEvents(client)); len(facts) != 0 {
-		t.Fatalf("no subject-fact key ⇒ no fact (the raw subject never egresses), got %d", len(facts))
+		t.Fatalf("a fetch records nothing, got %d", len(facts))
 	}
-	if err := client.TrackExperimentExposure(expTestScopeKey); !errors.Is(err, ErrExperimentFactUnavailable) {
-		t.Fatalf("expected ErrExperimentFactUnavailable, got %v", err)
+	// An exposure is sealed by the platform, which mints the fact key; the
+	// fetch's own key is not read. Accepted here, delivered by the lane.
+	if err := client.TrackExperimentExposure(expTestScopeKey); err != nil {
+		t.Fatalf("an exposure does not need the fetch's fact key, got %v", err)
 	}
 	if err := client.TrackExperimentOutcome(expTestScopeKey, "score", 2); !errors.Is(err, ErrExperimentFactUnavailable) {
 		t.Fatalf("expected ErrExperimentFactUnavailable, got %v", err)
@@ -1363,8 +1376,10 @@ func TestRestoreFromDiskServesAndRecordsOnlyWhenApplied(t *testing.T) {
 	if got := len(capture.exposures()); got != 1 {
 		t.Fatalf("a restored assignment must record nothing before it is applied, got %d facts", got)
 	}
-	// Applied, it records the new session's own exposure.
+	// Applied, it records the new session's own exposure (the lane seals
+	// and delivers it).
 	client2.ApplyExperimentVariant(expTestScopeKey)
+	client2.experimentCycle(context.Background())
 	if err := client2.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
@@ -1389,6 +1404,7 @@ func TestExperimentFactWireEnvelope(t *testing.T) {
 	script := &expScript{}
 	script.push(200, expAssignedBody("1"))
 	mux.HandleFunc(expAssignmentRoute, script.handler(t))
+	mux.HandleFunc(expExposureApplyRoute, script.apply.handler(t))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		var batch captured
 		_ = json.NewDecoder(ingestRequestBody(t, r)).Decode(&batch)
@@ -1451,8 +1467,10 @@ func TestExperimentFactWireEnvelope(t *testing.T) {
 			if len(props) != 7 {
 				t.Fatalf("outcome props are exactly seven keys, got %v", props)
 			}
-		} else if len(props) != 5 {
-			t.Fatalf("exposure props are exactly five keys, got %v", props)
+		} else if len(props) != 6 || props["attestation"] != "client_attested" || envelope["attestation_seal"] != expStubSeal {
+			// An exposure carries the props exactly as sealed (the five, plus
+			// the attestation the platform stamped) and the seal beside them.
+			t.Fatalf("exposure props are the six sealed keys with the seal, got %v (seal %v)", props, envelope["attestation_seal"])
 		}
 	}
 }
@@ -1507,6 +1525,7 @@ func TestExperimentFactsGateOnAnonymousActorUnderFloor(t *testing.T) {
 	script := &expScript{}
 	script.push(200, expAssignedBody("1"))
 	mux.HandleFunc(expAssignmentRoute, script.handler(t))
+	mux.HandleFunc(expExposureApplyRoute, script.apply.handler(t))
 	mux.HandleFunc("/v1/consent", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusAccepted)
 		_, _ = w.Write([]byte(`{}`))
