@@ -672,7 +672,8 @@ func (c *Client) TrackExperimentExposure(experimentKey string) error {
 //
 // The value must be an integer of magnitude at most 2^53 — a fractional,
 // larger or non-finite value is refused — and is sent as a JSON integer.
-// The key must be 1–128 of A–Z, a–z, 0–9, '.', '_', ':' and '-', and not an
+// The key, trimmed of surrounding whitespace first as the experiment key is,
+// must be 1–128 of A–Z, a–z, 0–9, '.', '_', ':' and '-', and not an
 // IP address. Both are refused with ErrInvalidExperimentFact, as is an
 // outcome earlier than its application (a clock stepped back), so nothing
 // is queued only to be refused later.

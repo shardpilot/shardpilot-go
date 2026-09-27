@@ -103,9 +103,9 @@ import (
 // load (the FULL grammar, so an id from another SDK build stays sticky), and
 // re-minted only on storage loss/corruption or the server's grammar
 // sentinel. It is NOT the anonymous id, and it egresses ONLY as the
-// subject_key of the assignment fetch and of the exposure apply request —
-// both to the assignment host, both consent-gated — never in analytics
-// events, in any props, or as an envelope identity.
+// subject_key of the assignment fetch and of the exposure and outcome apply
+// requests — all to the assignment host, all consent-gated — never in
+// analytics events, in any props, or as an envelope identity.
 //
 // Consent posture (assignment plane): the plane consumes the SAME effective
 // consent state the analytics path uses — nothing separate is computed.
@@ -1059,8 +1059,8 @@ type experimentsState struct {
 	// authorized fetch (the same point that lifts authBlocked).
 	applyBlocked bool
 
-	// dropFn, wired at construction, counts applications not recorded, by
-	// reason (Stats.ExperimentExposureDrops). Called under e.mu; it takes
+	// dropFn, wired at construction, counts applications dropped before the
+	// analytics queue, by reason (Stats.ExperimentExposureDrops). Called under e.mu; it takes
 	// only the stats collector's leaf lock.
 	dropFn func(reason string, n int)
 	// outcomeDropFn is dropFn for outcomes (Stats.ExperimentOutcomeDrops).

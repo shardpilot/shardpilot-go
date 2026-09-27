@@ -81,8 +81,10 @@ type Stats struct {
 	ConsentOutboxUnreadable    uint64
 	LastConsentError           string
 
-	// ExperimentExposureDrops counts experiment applications that were not
-	// recorded, keyed by reason code; nil until the first one. The codes:
+	// ExperimentExposureDrops counts experiment applications the SDK dropped
+	// before handing them to the analytics queue, keyed by reason code; nil
+	// until the first one. Once queued, a fact a consent denial clears is
+	// counted in Dropped, like any queued event. The codes:
 	// not_recordable (the assignment carries no serving state, is not a
 	// client_id assignment, or the client has no AnonymousID to post the fact
 	// under — the variant is still served); owed_bound_exceeded (the bounded
@@ -98,9 +100,10 @@ type Stats struct {
 	// longer served). Each Snapshot returns a fresh copy.
 	ExperimentExposureDrops map[string]uint64
 
-	// ExperimentOutcomeDrops counts experiment outcomes that were not
-	// recorded, keyed by the same reason codes as ExperimentExposureDrops;
-	// nil until the first one. Each Snapshot returns a fresh copy.
+	// ExperimentOutcomeDrops counts experiment outcomes the SDK dropped
+	// before handing them to the analytics queue, keyed by the same reason
+	// codes as ExperimentExposureDrops; nil until the first one. Each
+	// Snapshot returns a fresh copy.
 	ExperimentOutcomeDrops map[string]uint64
 }
 
