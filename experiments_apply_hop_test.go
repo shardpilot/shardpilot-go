@@ -661,3 +661,113 @@ func TestCloseCountsASealedApplicationItCouldNotDeliver(t *testing.T) {
 		t.Fatalf("the drop map must account for every application Stats.Dropped counts at close: map=%d dropped=%d", counted, lost)
 	}
 }
+
+// ── round 1 ─────────────────────────────────────────────────────────────────
+
+// Once the tuple's application is delivered, a repeat ApplyExperimentVariant
+// records nothing: the exposure is recorded once per (experiment, version,
+// subject, session). A consent purge then re-sends the DELIVERED
+// application's exposure_id — never a second id the repeat call minted, which
+// the platform would record as a second treatment.
+func TestARepeatApplicationAfterDeliveryRecordsNothing(t *testing.T) {
+	rig := newExpHopRig(t, nil)
+	fetchAssignment(t, rig.client, expTestScopeKey)
+	rig.client.ApplyExperimentVariant(expTestScopeKey)
+	rig.cycle()
+	flushOrFail(t, rig.client)
+	first, _ := rig.script.apply.requestsSoFar()[0].body["exposure_id"].(string)
+	if first == "" {
+		t.Fatal("control: the first application must have been sent")
+	}
+	rig.client.ApplyExperimentVariant(expTestScopeKey)
+	if rig.owed() != 0 {
+		t.Fatalf("a repeat application of a delivered tuple must not be owed, got %d", rig.owed())
+	}
+	// With an extra application at the tail, the repeat call still records
+	// nothing, and the purge re-arms the delivered application.
+	if err := rig.client.TrackExperimentExposure(expTestScopeKey); err != nil {
+		t.Fatalf("TrackExperimentExposure: %v", err)
+	}
+	rig.client.ApplyExperimentVariant(expTestScopeKey)
+	if rig.owed() != 1 {
+		t.Fatalf("only the extra application is owed, got %d", rig.owed())
+	}
+	rig.client.SetConsent(false)
+	rig.client.SetConsent(true)
+	rig.cycle()
+	flushOrFail(t, rig.client)
+	requests := rig.script.apply.requestsSoFar()
+	if len(requests) != 2 {
+		t.Fatalf("the purge re-sends the delivered application only, got %d request(s)", len(requests))
+	}
+	if again, _ := requests[1].body["exposure_id"].(string); again != first {
+		t.Fatalf("the re-armed application must carry the delivered exposure_id %q, got %q", first, again)
+	}
+}
+
+// The apply request is bounded by Config.HTTPTimeout even when the
+// integrator's HTTPClient has no Timeout: a silent endpoint keeps the
+// application owed instead of holding the lane.
+func TestAnApplyRequestIsBoundedByHTTPTimeout(t *testing.T) {
+	rig := newExpHopRig(t, func(cfg *Config) {
+		cfg.HTTPClient = &http.Client{}
+		cfg.HTTPTimeout = 200 * time.Millisecond
+	})
+	release := make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+	rig.script.apply.onRequest = func() { <-release }
+	fetchAssignment(t, rig.client, expTestScopeKey)
+	rig.client.ApplyExperimentVariant(expTestScopeKey)
+	done := make(chan struct{})
+	go func() {
+		rig.cycle()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		once.Do(func() { close(release) })
+		<-done
+		t.Fatal("the lane cycle waited past HTTPTimeout on a silent apply endpoint")
+	}
+	if rig.owed() != 1 {
+		t.Fatalf("the timed-out application stays owed, got %d", rig.owed())
+	}
+}
+
+// Close is not held by the lane's in-flight apply request: it cancels the
+// lane's work first, so its own context bounds it.
+func TestCloseDoesNotWaitOutTheLanesInFlightApply(t *testing.T) {
+	rig := newExpHopRig(t, func(cfg *Config) { cfg.HTTPTimeout = 10 * time.Second })
+	release := make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { once.Do(func() { close(release) }) })
+	rig.script.apply.onRequest = func() { <-release }
+	fetchAssignment(t, rig.client, expTestScopeKey)
+	rig.client.ApplyExperimentVariant(expTestScopeKey)
+	rig.client.exp.mu.Lock()
+	rig.client.exp.laneParkedForTests = false
+	rig.client.exp.mu.Unlock()
+	waitFor(t, 5*time.Second, "the lane's apply request is in flight", func() bool {
+		return len(rig.script.apply.requestsSoFar()) >= 1
+	})
+	closeCtx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	closed := make(chan struct{})
+	go func() {
+		_ = rig.client.Close(closeCtx)
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(3 * time.Second):
+		once.Do(func() { close(release) })
+		<-closed
+		t.Fatalf("Close waited %s on the lane's in-flight apply request", time.Since(started).Round(time.Millisecond))
+	}
+	if n := rig.client.Snapshot().ExperimentExposureDrops["unsealed_at_close"]; n != 1 {
+		t.Fatalf("the application Close could not seal is counted unsealed_at_close, got %d", n)
+	}
+}
