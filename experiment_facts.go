@@ -1,6 +1,7 @@
 package shardpilot
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -435,10 +436,13 @@ func (c *Client) sealedExposureEvent(sessionID string, sealed *expSealedFact, fa
 		return Event{}, false
 	}
 	// The props travel as decoded values: analytics re-canonicalizes the
-	// props it receives before verifying the seal, and every number the
-	// platform seals is an integer a float64 holds exactly.
+	// props it receives before verifying the seal. Numbers decode as
+	// json.Number and marshal back as sealed: the platform seals the
+	// application's int64 version, which a float64 rounds above 2^53.
 	var props map[string]any
-	if json.Unmarshal(fact.Props, &props) != nil {
+	decoder := json.NewDecoder(bytes.NewReader(fact.Props))
+	decoder.UseNumber()
+	if decoder.Decode(&props) != nil {
 		return Event{}, false
 	}
 	return Event{
@@ -474,6 +478,14 @@ func (c *Client) sweepExperimentExposures(experimentKey string) {
 // drain and keeps the remainder owed, so an older application is never
 // leapfrogged or lost. network allows the apply hop for unsealed records.
 func (c *Client) sweepExperimentExposuresMode(ctx context.Context, experimentKey string, atClose, network bool) {
+	c.sweepExperimentExposuresBudget(ctx, experimentKey, atClose, network, nil)
+}
+
+// sweepExperimentExposuresBudget is the sweep with an optional budget of
+// apply requests: each unsealed head sent to the endpoint spends one, and a
+// head met with the budget spent waits, unsent, for a later sweep. nil is
+// unbounded.
+func (c *Client) sweepExperimentExposuresBudget(ctx context.Context, experimentKey string, atClose, network bool, budget *int) {
 	e := c.exp
 	e.emitMu.Lock()
 	defer e.emitMu.Unlock()
@@ -492,7 +504,15 @@ func (c *Client) sweepExperimentExposuresMode(ctx context.Context, experimentKey
 		owed := copyOwed(head)
 		headEpoch := c.expFactPurgeEpoch.Load()
 		e.mu.Unlock()
-		ok, _, terminal := c.emitOwedExposure(ctx, experimentKey, head, owed, network, atClose, headEpoch)
+		headNetwork := network
+		if network && budget != nil && owed.sealed == nil {
+			if *budget == 0 {
+				headNetwork = false
+			} else {
+				*budget--
+			}
+		}
+		ok, _, terminal := c.emitOwedExposure(ctx, experimentKey, head, owed, headNetwork, atClose, headEpoch)
 		if !ok && !terminal {
 			return
 		}
@@ -507,13 +527,24 @@ func (c *Client) sweepExperimentExposuresMode(ctx context.Context, experimentKey
 	}
 }
 
+// expMaxApplyRequestsPerCycle bounds the lane's apply requests per cycle,
+// so one cycle's exposure sweep stays short however many applications are
+// owed; the rest wait for the next cycle.
+const expMaxApplyRequestsPerCycle = expMaxOwedExposures
+
 // sweepAllExperimentExposures drains every experiment's owed applications,
-// the apply hop allowed: the background lane's sweep.
+// the apply hop allowed within the cycle's budget: the background lane's
+// sweep.
 func (c *Client) sweepAllExperimentExposures(ctx context.Context) {
-	c.sweepAllExperimentExposuresMode(ctx, false, true)
+	budget := expMaxApplyRequestsPerCycle
+	c.sweepAllExperimentExposuresBudget(ctx, false, true, &budget)
 }
 
 func (c *Client) sweepAllExperimentExposuresMode(ctx context.Context, atClose, network bool) {
+	c.sweepAllExperimentExposuresBudget(ctx, atClose, network, nil)
+}
+
+func (c *Client) sweepAllExperimentExposuresBudget(ctx context.Context, atClose, network bool, budget *int) {
 	e := c.exp
 	e.mu.Lock()
 	keys := make([]string, 0, len(e.pendingExposure))
@@ -523,7 +554,7 @@ func (c *Client) sweepAllExperimentExposuresMode(ctx context.Context, atClose, n
 	e.mu.Unlock()
 	sort.Strings(keys)
 	for _, key := range keys {
-		c.sweepExperimentExposuresMode(ctx, key, atClose, network)
+		c.sweepExperimentExposuresBudget(ctx, key, atClose, network, budget)
 	}
 }
 

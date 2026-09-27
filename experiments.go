@@ -3302,7 +3302,19 @@ func (c *Client) experimentCycle(ctx context.Context) {
 	if c.experimentConsentRefusal() != nil {
 		return
 	}
+	// Revalidation first: a kill switch or a republished assignment due
+	// this cycle does not wait behind the exposure backlog's apply requests.
+	c.revalidateDueExperiments(ctx)
+	if ctx.Err() != nil || c.experimentConsentRefusal() != nil {
+		return
+	}
 	c.sweepAllExperimentExposures(ctx)
+}
+
+// revalidateDueExperiments is the cycle's revalidation: when the cadence is
+// due, one GET per cached entry, under the plane's gates.
+func (c *Client) revalidateDueExperiments(ctx context.Context) {
+	e := c.exp
 	nowMS := c.clock.Now().UnixMilli()
 	var keys []string
 	e.mu.Lock()
