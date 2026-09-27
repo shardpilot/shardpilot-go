@@ -36,6 +36,10 @@ type expApplyStub struct {
 	// onRequest, when set, runs while a request is being answered (outside
 	// the stub's lock): the window in which the SDK's hop is in flight.
 	onRequest func()
+	// outcome makes the stub the outcome route: it seals an
+	// experiment_outcome keyed by outcome_id and occurred_at, carrying the
+	// outcome's key and value.
+	outcome bool
 }
 
 type expApplyRequest struct {
@@ -103,12 +107,18 @@ func (s *expApplyStub) handler(t *testing.T) http.HandlerFunc {
 			if workspace == "" {
 				workspace = "workspace-test"
 			}
-			exposureID, _ := body["exposure_id"].(string)
-			appliedAt, _ := body["applied_at"].(string)
+			applicationID, _ := body["exposure_id"].(string)
+			eventTime, _ := body["applied_at"].(string)
+			eventName := experimentExposureName
+			if s.outcome {
+				applicationID, _ = body["outcome_id"].(string)
+				eventTime, _ = body["occurred_at"].(string)
+				eventName = experimentOutcomeName
+			}
 			fact := map[string]any{
-				"event_id":       expStubFactID(exposureID),
-				"event_name":     experimentExposureName,
-				"event_ts":       strings.Replace(appliedAt, "Z", "+00:00", 1),
+				"event_id":       expStubFactID(applicationID),
+				"event_name":     eventName,
+				"event_ts":       strings.Replace(eventTime, "Z", "+00:00", 1),
 				"workspace_id":   workspace,
 				"app_id":         body["app_key"],
 				"environment_id": body["environment_key"],
@@ -120,6 +130,11 @@ func (s *expApplyStub) handler(t *testing.T) http.HandlerFunc {
 					"assignment_unit":    "client_id",
 					"attestation":        "client_attested",
 				},
+			}
+			if s.outcome {
+				props := fact["props"].(map[string]any)
+				props["outcome_key"] = body["outcome_key"]
+				props["outcome_value"] = body["outcome_value"]
 			}
 			s.facts = append(s.facts, fact)
 			encoded, _ := json.Marshal(map[string]any{"fact": fact, "seal": expStubSeal})

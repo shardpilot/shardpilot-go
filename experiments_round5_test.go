@@ -94,11 +94,11 @@ func TestWithdrawnSpoolRemovalSurvivesFailedSave(t *testing.T) {
 	}
 }
 
-// Finding 2 (P1): outcome emission serializes with the sentinel purge —
-// under the emit lock an outcome either enqueues before the purge's filter
-// (and is caught) or reads the already-cleared cache after it (and
-// refuses). Pre-fix, TrackExperimentOutcome completed while the purge lock
-// was held.
+// Finding 2 (P1): an outcome serializes with the sentinel's withdrawal.
+// The host call no longer enqueues — it arms an owed record under the plane
+// lock, the lock the withdrawal holds — so an outcome armed before the
+// withdrawal is withdrawn with the owed list (counted), and one attempted
+// after it has no application left to follow.
 func TestOutcomeFactsSerializeWithSentinelPurge(t *testing.T) {
 	script := &expScript{}
 	capture := &expWireCapture{}
@@ -107,20 +107,27 @@ func TestOutcomeFactsSerializeWithSentinelPurge(t *testing.T) {
 	client := newExperimentClient(t, server.URL, nil)
 	defer client.Close(context.Background())
 	fetchAssignment(t, client, expTestScopeKey)
-
-	e := client.exp
-	e.emitMu.Lock()
-	done := make(chan error, 1)
-	go func() { done <- client.TrackExperimentOutcome(expTestScopeKey, "score", 1) }()
-	select {
-	case err := <-done:
-		e.emitMu.Unlock()
-		t.Fatalf("the outcome must serialize with the purge lock, returned early: %v", err)
-	case <-time.After(150 * time.Millisecond):
+	client.ApplyExperimentVariant(expTestScopeKey)
+	if err := client.TrackExperimentOutcome(expTestScopeKey, "score", 1); err != nil {
+		t.Fatalf("an outcome before the withdrawal is accepted: %v", err)
 	}
-	e.emitMu.Unlock()
-	if err := <-done; err != nil {
-		t.Fatalf("the outcome must complete once the lock releases: %v", err)
+
+	client.exp.mu.Lock()
+	client.exp.applySentinelWithdrawalLocked(client.exp.scopeForLocked(client.exp.currentSubjectIDLocked()), time.Now().UnixMilli())
+	client.exp.mu.Unlock()
+
+	if n := client.Snapshot().ExperimentOutcomeDrops["real_subjects_disabled"]; n != 1 {
+		t.Fatalf("the outcome armed before the withdrawal is withdrawn and counted, got %d", n)
+	}
+	if err := client.TrackExperimentOutcome(expTestScopeKey, "score", 1); !errors.Is(err, ErrExperimentNoAssignment) {
+		t.Fatalf("after the withdrawal there is no application to follow: ErrExperimentNoAssignment, got %v", err)
+	}
+	client.experimentCycle(context.Background())
+	if err := client.Flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if got := len(capture.byName(experimentOutcomeName)); got != 0 {
+		t.Fatalf("no outcome of the withdrawn subject egresses, got %d", got)
 	}
 }
 

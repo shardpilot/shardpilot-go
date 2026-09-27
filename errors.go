@@ -113,8 +113,15 @@ var (
 	ErrExperimentFactUnavailable = errors.New("shardpilot experiment assignment cannot produce an analytics fact")
 
 	// ErrInvalidExperimentFact is returned by the experiment fact
-	// producers for out-of-contract inputs: an empty experiment or outcome
-	// key, or a non-finite outcome value. The fact is refused whole;
-	// nothing is queued.
+	// producers for out-of-contract inputs: an empty experiment key; an
+	// outcome key outside the platform's grammar or naming an IP address; an
+	// outcome value that is not an integer of magnitude at most 2^53; an
+	// outcome earlier than the application it follows. The fact is refused
+	// whole; nothing is queued.
 	ErrInvalidExperimentFact = errors.New("invalid shardpilot experiment fact")
+
+	// ErrExperimentNotApplied is returned by TrackExperimentOutcome when the
+	// assignment is served but this session has not applied it: an outcome
+	// follows an application, so call ApplyExperimentVariant first.
+	ErrExperimentNotApplied = errors.New("shardpilot experiment has not been applied in this session")
 )

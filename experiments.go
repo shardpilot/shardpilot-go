@@ -103,9 +103,9 @@ import (
 // load (the FULL grammar, so an id from another SDK build stays sticky), and
 // re-minted only on storage loss/corruption or the server's grammar
 // sentinel. It is NOT the anonymous id, and it egresses ONLY as the
-// subject_key of the assignment fetch and of the exposure apply request —
-// both to the assignment host, both consent-gated — never in analytics
-// events, in any props, or as an envelope identity.
+// subject_key of the assignment fetch and of the exposure and outcome apply
+// requests — all to the assignment host, all consent-gated — never in
+// analytics events, in any props, or as an envelope identity.
 //
 // Consent posture (assignment plane): the plane consumes the SAME effective
 // consent state the analytics path uses — nothing separate is computed.
@@ -147,6 +147,10 @@ const expAssignmentRoute = "/api/v1/runtime/experiments/assignment"
 // expExposureApplyRoute is the exposure apply endpoint on the same host,
 // which seals an application for the analytics lane.
 const expExposureApplyRoute = "/api/v1/runtime/experiments/exposures"
+
+// expOutcomeApplyRoute is the outcome apply endpoint on the assignment host:
+// an outcome and the application it follows, sealed like an exposure.
+const expOutcomeApplyRoute = "/api/v1/runtime/experiments/outcomes"
 
 // Revalidation cadence (the SDK's contribution to the kill-switch reach):
 // re-issue the assignment GET for every cached entry, batched per cycle,
@@ -1010,12 +1014,19 @@ type experimentsState struct {
 	// must not install, persist, pace, or surface anything.
 	tornDown bool
 
-	// exposed is the session-scoped exposure dedup: tuple key → {arm,
-	// auto}. arm is the highest arm handed out for the tuple; auto records
-	// whether the AUTOMATIC arm-0 fact has emitted — an explicit re-arm may
-	// run while that emission is still owed in the queue, and must not
-	// consume its slot.
+	// exposed is the session-scoped exposure dedup: tuple key → {auto,
+	// app}. auto records whether the session's own application of the tuple
+	// has been delivered; app is that application, kept so a consent purge
+	// re-sends it with its own exposure_id.
 	exposed map[string]expExposed
+
+	// lastApplied is each experiment's most recent application in this
+	// session, whatever its tuple: the application an outcome follows. It
+	// survives a consent purge and an assignment drop or replacement (the
+	// platform judges an application as of the state it was served from),
+	// and is cleared with exposed by a subject rotation and by the
+	// real-subjects sentinel.
+	lastApplied map[string]expLastApplication
 
 	// sessionMarker is one marker per constructed consumer (= per SDK
 	// session; this SDK has no session lifecycle, so its session is the
@@ -1048,10 +1059,12 @@ type experimentsState struct {
 	// authorized fetch (the same point that lifts authBlocked).
 	applyBlocked bool
 
-	// dropFn, wired at construction, counts applications not recorded, by
-	// reason (Stats.ExperimentExposureDrops). Called under e.mu; it takes
+	// dropFn, wired at construction, counts applications dropped before the
+	// analytics queue, by reason (Stats.ExperimentExposureDrops). Called under e.mu; it takes
 	// only the stats collector's leaf lock.
 	dropFn func(reason string, n int)
+	// outcomeDropFn is dropFn for outcomes (Stats.ExperimentOutcomeDrops).
+	outcomeDropFn func(reason string, n int)
 
 	// Revalidation cadence state (unix ms; 0 = unarmed).
 	revalidateAtMS int64
@@ -1197,6 +1210,28 @@ type expOwedExposure struct {
 	// sealed is the fact the apply endpoint sealed for this application,
 	// once it answered; until then the record is the application alone.
 	sealed *expSealedFact
+	// outcome, when set, makes the record an outcome that follows app, not
+	// an exposure: it goes to the outcome apply endpoint and is counted in
+	// Stats.ExperimentOutcomeDrops. An outcome is always extra: it is never
+	// de-duplicated and never re-armed.
+	outcome *expOutcomeRecord
+}
+
+// expOutcomeRecord is one outcome: its random id (the platform derives the
+// fact id from it, so a retried outcome collapses as a duplicate), the time
+// it occurred, and its key and value.
+type expOutcomeRecord struct {
+	outcomeID  string
+	occurredAt string // RFC 3339, UTC
+	key        string
+	value      int64
+}
+
+// expLastApplication is an application an outcome can follow: the entry it
+// applied and the application itself.
+type expLastApplication struct {
+	entry *expEntry
+	app   expApplication
 }
 
 // expApplication identifies one application of a variant. The exposure_id
@@ -1210,11 +1245,21 @@ type expApplication struct {
 
 // newExperimentApplication mints an application at now.
 func newExperimentApplication(now time.Time) (expApplication, error) {
-	var id [16]byte
-	if _, err := rand.Read(id[:]); err != nil {
+	id, err := newExperimentApplicationID()
+	if err != nil {
 		return expApplication{}, err
 	}
-	return expApplication{exposureID: hex.EncodeToString(id[:]), appliedAt: now.UTC().Format(time.RFC3339Nano)}, nil
+	return expApplication{exposureID: id, appliedAt: now.UTC().Format(time.RFC3339Nano)}, nil
+}
+
+// newExperimentApplicationID mints an exposure_id or an outcome_id: 128
+// random bits, lowercase hex.
+func newExperimentApplicationID() (string, error) {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(id[:]), nil
 }
 
 // expSealedFact is a fact the apply endpoint sealed: its bytes as answered
@@ -1287,6 +1332,7 @@ func newExperimentsState(cfg Config) *experimentsState {
 		pendingExposure: make(map[string][]*expOwedExposure),
 		durablePending:  make(map[string]expOwedSync),
 		exposed:         make(map[string]expExposed),
+		lastApplied:     make(map[string]expLastApplication),
 		sessionMarker:   marker,
 		settled:         make(map[string]uint64),
 		chmodFn:         chmod,
@@ -1447,6 +1493,7 @@ func (e *experimentsState) adoptMintedSubjectIDLocked() (subject string, persist
 	// subject.
 	e.latchRetained = make(map[string]*expEntry)
 	e.exposed = make(map[string]expExposed)
+	e.lastApplied = make(map[string]expLastApplication)
 	// The rotation retires the previous scope: owed WRITES lose their
 	// in-memory source and cancel; owed DROPS were authoritative server
 	// decisions against the retired record and stay aimed at it (the
@@ -2185,9 +2232,10 @@ func (e *experimentsState) applySentinelWithdrawalLocked(scope string, resolvedA
 	// flight past their gates, exactly like the consent purge. Each
 	// withdrawn owed application is counted real_subjects_disabled.
 	e.resetExposedAutoLocked()
+	e.lastApplied = make(map[string]expLastApplication)
 	e.purgeEpoch++
 	for _, list := range e.pendingExposure {
-		e.countDropLocked(expDropRealSubjectsDisabled, len(list))
+		e.countOwedDropsLocked(expDropRealSubjectsDisabled, list)
 	}
 	e.pendingExposure = make(map[string][]*expOwedExposure)
 	if e.factPurgeEpochBumpFn != nil {
@@ -2410,14 +2458,11 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 
 // ── exposure arming (state side; emission lives in experiment_facts.go) ─────
 
-// armExposureLocked arms one application for delivery. The session's own
-// application of a tuple already delivered or already owed is not armed
-// again (the emitter also skips a tuple already delivered this session); an
-// extra application always is. The FIFO is bounded; overflowing drops the OLDEST,
-// counted as owed_bound_exceeded, so a new application displacing the slot
-// is never a silent loss of the previous one.
-func (e *experimentsState) armExposureLocked(experimentKey string, entry *expEntry, app expApplication, extra bool) (overflowed bool) {
-	list := e.pendingExposure[experimentKey]
+// armExposureLocked arms one application for delivery and reports whether
+// it did. The session's own application of a tuple already delivered or
+// already owed is not armed again (the emitter also skips a tuple already
+// delivered this session); an extra application always is.
+func (e *experimentsState) armExposureLocked(experimentKey string, entry *expEntry, app expApplication, extra bool) (armed bool) {
 	if !extra {
 		// Once per (experiment, version, subject, session): a tuple whose
 		// application was delivered, or is already owed anywhere in the
@@ -2429,15 +2474,27 @@ func (e *experimentsState) armExposureLocked(experimentKey string, entry *expEnt
 			return false
 		}
 	}
-	list = append(list, &expOwedExposure{entry: entry, session: e.sessionMarker, app: app, extra: extra})
+	e.appendOwedLocked(experimentKey, &expOwedExposure{entry: entry, session: e.sessionMarker, app: app, extra: extra})
+	return true
+}
+
+// armOutcomeLocked arms one outcome, following the application it names.
+func (e *experimentsState) armOutcomeLocked(experimentKey string, applied expLastApplication, outcome *expOutcomeRecord) {
+	e.appendOwedLocked(experimentKey, &expOwedExposure{entry: applied.entry, session: e.sessionMarker, app: applied.app, extra: true, outcome: outcome})
+}
+
+// appendOwedLocked appends one record to the experiment's owed FIFO, shared
+// by its exposures and outcomes. The FIFO is bounded; overflowing drops the
+// OLDEST, counted as owed_bound_exceeded in its own kind's map, so a new
+// record displacing the slot is never a silent loss of the previous one.
+func (e *experimentsState) appendOwedLocked(experimentKey string, record *expOwedExposure) {
+	list := append(e.pendingExposure[experimentKey], record)
 	if len(list) > expMaxOwedExposures {
+		e.countOwedDropLocked(expDropOwedBoundExceeded, list[0])
 		list = list[1:]
 		e.owedExposureOverflow++
-		e.countDropLocked(expDropOwedBoundExceeded, 1)
-		overflowed = true
 	}
 	e.pendingExposure[experimentKey] = list
-	return overflowed
 }
 
 // The reasons an application is not recorded, as counted in
@@ -2457,6 +2514,31 @@ const (
 func (e *experimentsState) countDropLocked(reason string, n int) {
 	if e.dropFn != nil && n > 0 {
 		e.dropFn(reason, n)
+	}
+}
+
+// countOutcomeDropLocked reports n outcomes not recorded for reason.
+func (e *experimentsState) countOutcomeDropLocked(reason string, n int) {
+	if e.outcomeDropFn != nil && n > 0 {
+		e.outcomeDropFn(reason, n)
+	}
+}
+
+// countOwedDropLocked reports one owed record not recorded, in its kind's
+// map.
+func (e *experimentsState) countOwedDropLocked(reason string, record *expOwedExposure) {
+	if record.outcome != nil {
+		e.countOutcomeDropLocked(reason, 1)
+		return
+	}
+	e.countDropLocked(reason, 1)
+}
+
+// countOwedDropsLocked reports every record of an owed list not recorded,
+// each in its kind's map.
+func (e *experimentsState) countOwedDropsLocked(reason string, list []*expOwedExposure) {
+	for _, record := range list {
+		e.countOwedDropLocked(reason, record)
 	}
 }
 
@@ -2508,11 +2590,17 @@ func (e *experimentsState) onAnalyticsPurge() {
 			applied[tuple] = exposed.app
 		}
 	}
-	owedTotal := 0
+	owedTotal, owedOutcomes := 0, 0
 	owedTuples := make(map[string]bool)
 	for key, list := range e.pendingExposure {
-		owedTotal += len(list)
 		for _, owed := range list {
+			if owed.outcome != nil {
+				// An outcome is a point event of the withdrawn period: it
+				// is discarded, never re-armed.
+				owedOutcomes++
+				continue
+			}
+			owedTotal++
 			if !owed.extra && owed.session == e.sessionMarker {
 				tuple := exposureTupleKey(key, owed.entry)
 				applied[tuple] = owed.app
@@ -2551,6 +2639,7 @@ func (e *experimentsState) onAnalyticsPurge() {
 		}
 	}
 	e.countDropLocked(expDropConsentWithdrawn, owedTotal-rearmedOwed)
+	e.countOutcomeDropLocked(expDropConsentWithdrawn, owedOutcomes)
 }
 
 // resetExposedAutoLocked clears every tuple's delivered mark while keeping
@@ -3073,6 +3162,7 @@ func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string
 				priorEntries := e.entries
 				priorLatchRetained := e.latchRetained
 				priorExposed := e.exposed
+				priorLastApplied := e.lastApplied
 				priorPending := make(map[string]expOwedSync, len(e.durablePending))
 				for key, pending := range e.durablePending {
 					priorPending[key] = pending
@@ -3101,6 +3191,7 @@ func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string
 					e.entries = priorEntries
 					e.latchRetained = priorLatchRetained
 					e.exposed = priorExposed
+					e.lastApplied = priorLastApplied
 					e.durablePending = priorPending
 					e.reminted = false
 					if removeFailed {
@@ -3492,11 +3583,13 @@ func (c *Client) ApplyExperimentVariant(experimentKey string) (string, map[strin
 		e.countDropLocked(expDropNotRecordable, 1)
 		return variant, payload
 	}
-	// Once per session needs no check here: the session's own application
-	// already owed at the tail is not armed twice, and the emitter skips a
-	// tuple already delivered this session.
+	// Once per session needs no check here: the arm skips a tuple already
+	// delivered or owed this session. Only an application that arms becomes
+	// the one an outcome follows.
 	if app, err := newExperimentApplication(now); err == nil {
-		e.armExposureLocked(experimentKey, entry, app, false)
+		if e.armExposureLocked(experimentKey, entry, app, false) {
+			e.lastApplied[experimentKey] = expLastApplication{entry: entry, app: app}
+		}
 	} else {
 		e.countDropLocked(expDropNotRecordable, 1)
 	}

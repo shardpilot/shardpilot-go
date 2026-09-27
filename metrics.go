@@ -81,8 +81,10 @@ type Stats struct {
 	ConsentOutboxUnreadable    uint64
 	LastConsentError           string
 
-	// ExperimentExposureDrops counts experiment applications that were not
-	// recorded, keyed by reason code; nil until the first one. The codes:
+	// ExperimentExposureDrops counts experiment applications the SDK dropped
+	// before handing them to the analytics queue, keyed by reason code; nil
+	// until the first one. Once queued, a fact a consent denial clears is
+	// counted in Dropped, like any queued event. The codes:
 	// not_recordable (the assignment carries no serving state, is not a
 	// client_id assignment, or the client has no AnonymousID to post the fact
 	// under — the variant is still served); owed_bound_exceeded (the bounded
@@ -97,6 +99,12 @@ type Stats struct {
 	// the re-grant: an extra application, or one whose assignment is no
 	// longer served). Each Snapshot returns a fresh copy.
 	ExperimentExposureDrops map[string]uint64
+
+	// ExperimentOutcomeDrops counts experiment outcomes the SDK dropped
+	// before handing them to the analytics queue, keyed by the same reason
+	// codes as ExperimentExposureDrops; nil until the first one. Each
+	// Snapshot returns a fresh copy.
+	ExperimentOutcomeDrops map[string]uint64
 }
 
 type statsCollector struct {
@@ -123,6 +131,7 @@ type statsCollector struct {
 
 	mu               sync.Mutex
 	expDrops         map[string]uint64
+	outcomeDrops     map[string]uint64
 	lastError        string
 	lastConsentError string
 	byStatus         map[EventStatus]uint64
@@ -146,6 +155,13 @@ func (s *statsCollector) snapshot() Stats {
 			expDrops[reason] = count
 		}
 	}
+	var outcomeDrops map[string]uint64
+	if len(s.outcomeDrops) > 0 {
+		outcomeDrops = make(map[string]uint64, len(s.outcomeDrops))
+		for reason, count := range s.outcomeDrops {
+			outcomeDrops[reason] = count
+		}
+	}
 	s.mu.Unlock()
 
 	return Stats{
@@ -158,6 +174,7 @@ func (s *statsCollector) snapshot() Stats {
 		Duplicates:                 s.duplicates.Load(),
 		ByStatus:                   byStatus,
 		ExperimentExposureDrops:    expDrops,
+		ExperimentOutcomeDrops:     outcomeDrops,
 		LastError:                  lastError,
 		Spooled:                    s.spooled.Load(),
 		SpoolResent:                s.spoolResent.Load(),
@@ -183,6 +200,17 @@ func (s *statsCollector) recordExperimentExposureDrop(reason string, n int) {
 		s.expDrops = make(map[string]uint64)
 	}
 	s.expDrops[reason] += uint64(n)
+	s.mu.Unlock()
+}
+
+// recordExperimentOutcomeDrop counts n experiment outcomes not recorded for
+// reason, under the same leaf lock.
+func (s *statsCollector) recordExperimentOutcomeDrop(reason string, n int) {
+	s.mu.Lock()
+	if s.outcomeDrops == nil {
+		s.outcomeDrops = make(map[string]uint64)
+	}
+	s.outcomeDrops[reason] += uint64(n)
 	s.mu.Unlock()
 }
 

@@ -156,6 +156,7 @@ func TestExperimentFactsCarrySessionIdentity(t *testing.T) {
 	if err := client.TrackExperimentOutcome(expTestScopeKey, "score", 1); err != nil {
 		t.Fatalf("outcome: %v", err)
 	}
+	client.experimentCycle(context.Background()) // the lane seals the outcome
 	if err := client.Enqueue(Event{Name: "host_backend_event"}); err != nil {
 		t.Fatalf("host event: %v", err)
 	}

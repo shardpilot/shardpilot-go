@@ -32,8 +32,8 @@ type Event struct {
 	sourceOverride Source
 
 	// expFactEpoch is the real-subjects purge generation this experiment
-	// fact was BUILT under (stamped by buildExperimentFactEvent, zero for
-	// everything else). The sentinel's batch filter withdraws only facts
+	// fact was BUILT under (stamped when a sealed fact becomes an event,
+	// zero for everything else). The sentinel's batch filter withdraws only facts
 	// whose stamp predates the current purge epoch — a FRESH post-purge
 	// fact (a new authorized assignment after re-enable) must never be
 	// dropped for a worker's epoch lag.
