@@ -368,3 +368,72 @@ func TestOutcomesShareTheOwedBound(t *testing.T) {
 		t.Fatalf("the oldest outcome is the one dropped: the first sent has value %v", first)
 	}
 }
+
+// A repeat ApplyExperimentVariant of a delivered tuple records nothing, so
+// it does not move the application an outcome follows either.
+func TestARepeatApplicationDoesNotMoveTheOutcomesApplication(t *testing.T) {
+	rig := newExpHopRig(t, nil)
+	clock := &expFakeClock{now: time.Now()}
+	rig.client.clock = clock
+	fetchAssignment(t, rig.client, expTestScopeKey)
+	rig.client.ApplyExperimentVariant(expTestScopeKey)
+	rig.cycle()
+	flushOrFail(t, rig.client)
+	clock.advance(2 * time.Second)
+	rig.client.ApplyExperimentVariant(expTestScopeKey) // delivered tuple: records nothing
+	if err := rig.client.TrackExperimentOutcome(expTestScopeKey, "purchase", 1); err != nil {
+		t.Fatalf("TrackExperimentOutcome: %v", err)
+	}
+	rig.cycle()
+	applications, outcomes := rig.script.apply.requestsSoFar(), rig.outcomeRequests()
+	if len(applications) != 1 || len(outcomes) != 1 {
+		t.Fatalf("control: one application and one outcome sent, got %d and %d", len(applications), len(outcomes))
+	}
+	if got, want := outcomes[0].body["applied_at"], applications[0].body["applied_at"]; got != want {
+		t.Fatalf("the outcome follows the recorded application (applied_at %v), got %v", want, got)
+	}
+}
+
+// A subject re-mint (the platform refused the subject id's grammar) leaves
+// no application to follow: an outcome of the rejected subject would be
+// refused anyway.
+func TestASubjectRemintLeavesNoApplicationToFollow(t *testing.T) {
+	rig := newExpHopRig(t, nil, expAssignedBody("1"))
+	rig.script.push(400, `{"error":"experiment metadata must use synthetic local-safe identifiers only"}`)
+	rig.script.push(200, expAssignedBody("2"))
+	fetchAssignment(t, rig.client, expTestScopeKey)
+	rig.client.ApplyExperimentVariant(expTestScopeKey)
+	if err := rig.client.TrackExperimentOutcome(expTestScopeKey, "purchase", 1); err != nil {
+		t.Fatalf("control: an outcome of the applied subject is accepted, got %v", err)
+	}
+	if result := fetchAssignment(t, rig.client, expTestScopeKey); !result.Assigned || result.Version != 2 {
+		t.Fatalf("control: the re-minted retry installs version 2, got %+v", result)
+	}
+	if err := rig.client.TrackExperimentOutcome(expTestScopeKey, "purchase", 1); !errors.Is(err, ErrExperimentNotApplied) {
+		t.Fatalf("after a re-mint the new subject has applied nothing: ErrExperimentNotApplied, got %v", err)
+	}
+}
+
+// A 200 from the outcome route that seals anything but an experiment_outcome
+// is not a usable fact: the outcome stays owed, nothing is delivered.
+func TestAnOutcomeSealedAsAnotherEventIsNotDelivered(t *testing.T) {
+	rig := newAppliedOutcomeRig(t, nil)
+	fact, _ := json.Marshal(map[string]any{
+		"fact": map[string]any{
+			"event_id": expStubFactID("wrong-kind"), "event_name": experimentExposureName,
+			"event_ts": "2026-09-27T00:00:00+00:00", "workspace_id": "workspace-test", "app_id": "app-test",
+			"environment_id": "develop", "props": map[string]any{"experiment_key": expTestScopeKey},
+		},
+		"seal": expStubSeal,
+	})
+	rig.script.outcome.push(200, string(fact))
+	if err := rig.client.TrackExperimentOutcome(expTestScopeKey, "purchase", 1); err != nil {
+		t.Fatalf("TrackExperimentOutcome: %v", err)
+	}
+	rig.cycle()
+	flushOrFail(t, rig.client)
+	if rig.owed() != 1 || len(rig.capture.exposures()) != 1 || len(rig.capture.byName(experimentOutcomeName)) != 0 {
+		t.Fatalf("a fact sealed as another event is kept, not delivered: owed=%d exposures=%d outcomes=%d",
+			rig.owed(), len(rig.capture.exposures()), len(rig.capture.byName(experimentOutcomeName)))
+	}
+}
