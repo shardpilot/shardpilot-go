@@ -3325,8 +3325,12 @@ func (c *Client) ExperimentVariant(experimentKey string) string {
 }
 
 // ApplyExperimentVariant returns the cached assigned variant for an
-// experiment under exactly ExperimentVariant's serving rules, and records
-// the host's application of it. Call it at the point the host acts on the
+// experiment and a copy of its payload, under exactly ExperimentVariant's
+// serving rules, and records the host's application of it. Both come from
+// the entry the exposure is recorded for, so a host acting on the payload
+// acts on the recorded version even if a revalidation replaces the entry a
+// moment later; read the payload from here, not from
+// ExperimentVariantPayload. Call it at the point the host acts on the
 // variant: the exposure is recorded once per (experiment, version,
 // subject, session) — the SDK instance is the session — and by nothing
 // else. A fetch, a revalidation, a cache restore and the getters record
@@ -3345,7 +3349,11 @@ func (c *Client) ApplyExperimentVariant(experimentKey string) (string, map[strin
 	}
 	e.fireConsentRaceSeam("apply_serve")
 	e.mu.Lock()
-	if e.tornDown {
+	// The commit-point re-check, as the fetch makes it: a denial whose flip
+	// landed after the check above serves nothing and arms nothing. A flip
+	// after THIS read linearizes the application before the denial, whose
+	// purge (queued behind this lock) then treats it as applied.
+	if e.tornDown || c.experimentConsentRefusal() != nil {
 		e.mu.Unlock()
 		return "", nil
 	}
@@ -3358,10 +3366,13 @@ func (c *Client) ApplyExperimentVariant(experimentKey string) (string, map[strin
 	// snapshot still owed in place, and the emitter skips a tuple whose
 	// exposure this session already emitted.
 	e.armExposureLocked(experimentKey, entry)
-	variant := entry.VariantKey
+	// The variant and payload come from the entry just armed, under the same
+	// lock: what the host acts on is what is recorded, even if a
+	// revalidation replaces the entry a moment later.
+	variant, payload := entry.VariantKey, deepCopyJSONMap(entry.VariantPayload, 0)
 	e.mu.Unlock()
 	c.sweepExperimentExposures(experimentKey)
-	return variant, nil
+	return variant, payload
 }
 
 // ExperimentVariantPayload returns a copy of the cached assigned variant's

@@ -297,6 +297,17 @@ func (c *Client) emitEntryExposure(experimentKey string, entry *expEntry, rearm 
 			if (havePrior && prior.arm < arm) || (!havePrior && arm > 0) {
 				e.exposed[tuple] = expExposed{arm: arm, auto: havePrior && prior.auto}
 			}
+			// A first application emitted directly (TrackExperimentExposure
+			// before any ApplyExperimentVariant) had no owed snapshot and no
+			// exposed entry for the purge to see, so the purge could not
+			// re-arm it and its fact may have been drained. Re-arm it here
+			// while its assignment is still live: the re-emission derives the
+			// same id, so a fact that survived collapses server-side.
+			if next.auto && !havePrior {
+				if live := e.entries[experimentKey]; live != nil && exposureTupleKey(experimentKey, live) == tuple {
+					e.armExposureLocked(experimentKey, live)
+				}
+			}
 		}
 		e.mu.Unlock()
 	}
