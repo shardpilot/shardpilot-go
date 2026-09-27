@@ -60,6 +60,11 @@ func TestOwedExposureSurvivesAuthLatchedConsentPurge(t *testing.T) {
 	client.SetConsent(false)
 	client.SetConsent(true)
 	capture.setStatus(http.StatusAccepted)
+	// Re-armed from the latch-retained record, the owed application is not
+	// a discard: nothing is counted consent_withdrawn.
+	if n := client.Snapshot().ExperimentExposureDrops["consent_withdrawn"]; n != 0 {
+		t.Fatalf("a latch-retained application the purge re-armed must not count as withdrawn, got %d", n)
+	}
 
 	// The retained treatment's exposure must have re-armed at the purge:
 	// the sweep emits it and the flush delivers it.
