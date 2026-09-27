@@ -390,6 +390,55 @@ type expEntry struct {
 	SubjectKey     string         `json:"subject_key,omitempty"`
 	Attributes     []expAttribute `json:"attributes,omitempty"`
 	FetchedAtMS    int64          `json:"fetched_at_ms"`
+	// Served is the serving state the assignment was served from, pinned
+	// so an application of it can be recorded as of that state; nil when
+	// the fetch did not carry a complete one.
+	Served *expServedState `json:"served,omitempty"`
+}
+
+// expServedState is the serving state an assignment was served from: the
+// fetch's served_revision, served_kill_gate and served_at (At normalized to
+// UTC RFC 3339). It is echoed only to the host that served it. It keys no
+// serving decision, so an absent or ill-typed state leaves the assignment
+// served and unpinned — the same degradation as a stored fact key outside
+// its grammar — rather than refusing a verdict over a member serving never
+// reads.
+type expServedState struct {
+	Revision int64  `json:"revision"`
+	KillGate bool   `json:"kill_gate"`
+	At       string `json:"at"`
+}
+
+// parseExperimentServedState reads the served state from its three wire
+// members: all present, served_revision a non-negative JSON integer,
+// served_kill_gate a JSON boolean and served_at an RFC 3339 string.
+// Anything else is no pin (nil).
+func parseExperimentServedState(revision, killGate, at json.RawMessage) *expServedState {
+	// An absent member is nil raw, which Unmarshal refuses like a wrong
+	// type; a JSON null decodes to a nil pointer and is refused below.
+	var rev *int64
+	var gate *bool
+	var stamp *string
+	if json.Unmarshal(revision, &rev) != nil || rev == nil ||
+		json.Unmarshal(killGate, &gate) != nil || gate == nil ||
+		json.Unmarshal(at, &stamp) != nil || stamp == nil {
+		return nil
+	}
+	return validExperimentServedState(expServedState{Revision: *rev, KillGate: *gate, At: *stamp})
+}
+
+// validExperimentServedState returns the state with At normalized to UTC,
+// or nil when the revision is negative or At is not RFC 3339.
+func validExperimentServedState(state expServedState) *expServedState {
+	if state.Revision < 0 {
+		return nil
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, state.At)
+	if err != nil {
+		return nil
+	}
+	state.At = parsed.UTC().Format(time.RFC3339Nano)
+	return &state
 }
 
 // expOutcome directs the stateful install after the pure classification.
@@ -445,6 +494,11 @@ type expAssignmentWire struct {
 	Reason         json.RawMessage `json:"reason"`
 	SubjectFactKey string          `json:"subject_fact_key"`
 	Boundary       map[string]any  `json:"boundary"`
+	// The served state decodes raw so a wrong type degrades to no pin
+	// instead of failing the whole verdict (see expServedState).
+	ServedRevision json.RawMessage `json:"served_revision"`
+	ServedKillGate json.RawMessage `json:"served_kill_gate"`
+	ServedAt       json.RawMessage `json:"served_at"`
 }
 
 // expEchoMatches validates one presence-aware echoed member: absent is
@@ -704,6 +758,7 @@ func parseExperimentVerdict(resp remoteConfigResponse, scope expRequestScope, no
 			AssignmentUnit: assignmentUnit,
 			SubjectFactKey: subjectFactKey,
 			FetchedAtMS:    nowMS,
+			Served:         parseExperimentServedState(wire.ServedRevision, wire.ServedKillGate, wire.ServedAt),
 		}
 		return ExperimentAssignmentResult{
 			Assigned:       true,
@@ -902,6 +957,11 @@ func sanitizeExperimentEntries(entries map[string]expEntry) map[string]expEntry 
 				restored[attribute.Name] = attribute.Value
 			}
 			entry.Attributes, _ = normalizeExperimentAttributes(restored)
+		}
+		if entry.Served != nil {
+			// A stored pin re-validates like every other stored field; a
+			// corrupt one is dropped and the assignment serves unpinned.
+			entry.Served = validExperimentServedState(*entry.Served)
 		}
 		entry.VariantPayload = deepCopyJSONMap(entry.VariantPayload, 0)
 		out[key] = entry

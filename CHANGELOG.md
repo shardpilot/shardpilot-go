@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- An experiment assignment now keeps the serving state its fetch returned (`served_revision`, `served_kill_gate`, `served_at`) with the cached assignment, in memory and in the durable cache under `SpoolDir`, so a later release can record an application of the variant as of the state it was served from. Nothing is sent with it yet, and serving is unchanged: a response without the three members, or with any of them ill-typed, keeps serving the assignment without the pin. `served_at` is stored in UTC.
 - Crash reports carry an SDK-owned `fatal` flag and, for non-fatal reports admitted by the built-in sampler, `non_fatal_sample_one_in`. Custom sampler rates remain unknown and are omitted. The public `crash.Event` is unchanged; each admitted wire body is encoded once and retried byte-for-byte. Default non-fatal sampling remains 1-in-10.
 
 ## v0.6.4-alpha — 2026-09-21 — BREAKING: consent-policy wire contract and caller API
