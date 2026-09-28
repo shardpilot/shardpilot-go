@@ -2,6 +2,7 @@ package shardpilot
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -12,6 +13,25 @@ import (
 )
 
 const ageGoldenExperiment = "exposure-banner"
+
+// Directory-scan fingerprints name a file, rule and line, not its bytes. Keep
+// the fixture hashes independent of the contract prose so changing a captured
+// identifier requires reviewing both these pins and the scanner exceptions.
+func TestExperimentAgeGoldenHashes(t *testing.T) {
+	for name, want := range map[string]string{
+		"adult":           "84669986d3c1ead97db9fc23587c41324928cfa66d3670923960e7aa81c94052",
+		"undeclared":      "d870fcfacf2bee1cd17dc1a501cbcd0edf90a01e9f0823c067b5171a7aa5e2e8",
+		"under_threshold": "b5dd88dc6b4bea663e5612b5ca95a874c29995439eb85ce6b8381a0b67192761",
+		"unknown":         "d870fcfacf2bee1cd17dc1a501cbcd0edf90a01e9f0823c067b5171a7aa5e2e8",
+	} {
+		t.Run(name, func(t *testing.T) {
+			got := fmt.Sprintf("%x", sha256.Sum256([]byte(ageGolden(t, name))))
+			if got != want {
+				t.Fatalf("golden SHA-256 changed: got %s, want %s; gitleaks directory pins must be re-reviewed along with the new bytes", got, want)
+			}
+		})
+	}
+}
 
 func ageGolden(t *testing.T, name string) string {
 	t.Helper()
