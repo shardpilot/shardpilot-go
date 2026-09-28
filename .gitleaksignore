@@ -58,3 +58,20 @@ fa107e25a30f2e0345fecacbc600ba7735b66ed2:examples/experiments/main_test.go:gener
 # of the next one is looking. Pinned by finding, as always: this dies with the
 # commit rather than forgiving the shape anywhere.
 4a63dd612905af4d4702d70e39d22b93806ed7ab:examples/experiments/main_test.go:generic-api-key:697
+
+# Synthetic sfk1_ subject-fact and assignment keys derived from test subjects in the server golden capture (experiment_age_eligibility_routes_test.go:36; experiment_fact_apply_routes_test.go:219).
+ac6ab1439adc5e7a85cf594bde47e8f3358cd47e:testdata/experiment-age/adult.json:generic-api-key:1
+ac6ab1439adc5e7a85cf594bde47e8f3358cd47e:testdata/experiment-age/undeclared.json:generic-api-key:1
+ac6ab1439adc5e7a85cf594bde47e8f3358cd47e:testdata/experiment-age/under_threshold.json:generic-api-key:1
+ac6ab1439adc5e7a85cf594bde47e8f3358cd47e:testdata/experiment-age/unknown.json:generic-api-key:1
+
+# These directory fingerprints are line-bound, not byte-bound; TestExperimentAgeGoldenHashes binds the projected bytes and requires re-review if they change.
+# The relative paths serve local scans; /github/workspace is the CI directory-scan root. Each fingerprint covers two synthetic findings on the same line.
+testdata/experiment-age/adult.json:generic-api-key:1
+testdata/experiment-age/undeclared.json:generic-api-key:1
+testdata/experiment-age/under_threshold.json:generic-api-key:1
+testdata/experiment-age/unknown.json:generic-api-key:1
+/github/workspace/testdata/experiment-age/adult.json:generic-api-key:1
+/github/workspace/testdata/experiment-age/undeclared.json:generic-api-key:1
+/github/workspace/testdata/experiment-age/under_threshold.json:generic-api-key:1
+/github/workspace/testdata/experiment-age/unknown.json:generic-api-key:1

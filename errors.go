@@ -98,6 +98,10 @@ var (
 	// served, or emitted.
 	ErrExperimentsNotConfigured = errors.New("shardpilot experiments are not configured")
 
+	// ErrInvalidExperimentAgeBand refuses an unsupported or conflicting age
+	// declaration before an experiment assignment request is sent.
+	ErrInvalidExperimentAgeBand = errors.New("invalid shardpilot experiment age band")
+
 	// ErrExperimentNoAssignment is returned by the experiment fact
 	// producers when no assignment is currently served for the experiment
 	// (nothing fetched, a not-assigned verdict, a kill, or the plane's

@@ -61,11 +61,12 @@ import (
 //     Assignment stickiness is entirely the server's deterministic hash; the
 //     cache is a latency/offline device, never an assignment authority, and
 //     this client never re-buckets locally.
-//   - 200 not-assigned — three shapes distinguished only by `reason`: absent
+//   - 200 not-assigned — four shapes distinguished only by `reason`: absent
 //     (deterministic traffic-gate miss), "targeting_unmatched" (may change
-//     when attributes change), "kill_switch" (operator kill). Any OTHER
+//     when attributes change), "kill_switch" (operator kill), or
+//     "age_ineligible" (no eligible adult declaration). Any OTHER
 //     reason is not a verdict this SDK can represent and classifies as
-//     malformed. All three shapes drop the cached assignment; a kill in
+//     malformed. All four shapes drop the cached assignment; a kill in
 //     particular must stop applying at the next safe point and emits no
 //     exposure.
 //   - 401/403 — fail CLOSED: the result never serves a cached assignment,
@@ -210,6 +211,7 @@ const (
 	experimentOutcomeName      = "experiment_outcome"
 	experimentReasonKillSwitch = "kill_switch"
 	experimentReasonTargeting  = "targeting_unmatched"
+	experimentReasonAge        = "age_ineligible"
 
 	experimentAssignmentUnitSynthetic = "synthetic_subject_key"
 	experimentAssignmentUnitClientID  = "client_id"
@@ -355,6 +357,34 @@ func validExperimentAttributeName(name string) bool {
 	return false
 }
 
+// Age declarations are admission inputs, not optional targeting. Keep both
+// spellings even at the attribute cap, and never trim a refusal into "adult"
+// or drop it in favor of an adult alias. Oversized declarations become unknown.
+// The shared targeting normalizer remains unchanged for remote configuration.
+func normalizeExperimentAssignmentAttributes(attributes map[string]string) ([]expAttribute, int) {
+	other := make(map[string]string, len(attributes))
+	var age []expAttribute
+	for name, value := range attributes {
+		switch name {
+		case "age_band", "custom_attribute_age_band":
+			if len(value) > expMaxAttributeValueBytes {
+				value = "unknown"
+			}
+			age = append(age, expAttribute{Name: name, Value: value})
+		default:
+			other[name] = value
+		}
+	}
+	pairs, dropped := normalizeExperimentAttributes(other)
+	if limit := expMaxAttributes - len(age); len(pairs) > limit {
+		dropped += len(pairs) - limit
+		pairs = pairs[:limit]
+	}
+	pairs = append(pairs, age...)
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].Name < pairs[j].Name })
+	return pairs, dropped
+}
+
 // ── verdict parsing and classification ──────────────────────────────────────
 
 // ExperimentAssignmentResult is one fetch's usable outcome. A cache-served
@@ -363,7 +393,8 @@ func validExperimentAttributeName(name string) bool {
 type ExperimentAssignmentResult struct {
 	// Assigned is the verdict. False for a traffic-gate miss (Reason
 	// empty), an operator kill (Reason "kill_switch"), a targeting miss
-	// (Reason "targeting_unmatched"), or an unknown experiment (Code
+	// (Reason "targeting_unmatched"), an age refusal (Reason
+	// "age_ineligible"), or an unknown experiment (Code
 	// "not_found").
 	Assigned bool
 	// VariantKey and VariantPayload are present only when Assigned.
@@ -372,7 +403,7 @@ type ExperimentAssignmentResult struct {
 	// Version is the published experiment version the verdict was computed
 	// against (0 when the server omitted it on a not-assigned shape).
 	Version int64
-	// Reason distinguishes the three not-assigned shapes; empty for the
+	// Reason distinguishes the four not-assigned shapes; empty for the
 	// legacy traffic-gate miss and for an assigned verdict.
 	Reason string
 	// Boundary is the server's machine-readable boundary block, served
@@ -701,7 +732,7 @@ func failureOrEmpty(result ExperimentAssignmentResult, failure string) string {
 //     1), non-empty assignment_key and variant_key, and a non-empty
 //     boundary.assignment_unit;
 //   - not assigned: a KNOWN reason — absent (traffic gate), kill_switch, or
-//     targeting_unmatched. An unknown reason is not a shape this SDK knows.
+//     targeting_unmatched, or age_ineligible. Unknown reasons are malformed.
 func parseExperimentVerdict(resp remoteConfigResponse, scope expRequestScope, nowMS int64) (ExperimentAssignmentResult, expOutcome, bool) {
 	if resp.bodyIncomplete || len(resp.body) > expMaxBodyBytes {
 		return ExperimentAssignmentResult{}, expOutcome{}, false
@@ -794,10 +825,10 @@ func parseExperimentVerdict(resp remoteConfigResponse, scope expRequestScope, no
 		reason = *decoded
 	}
 	switch reason {
-	case "", experimentReasonKillSwitch, experimentReasonTargeting:
+	case "", experimentReasonKillSwitch, experimentReasonTargeting, experimentReasonAge:
 	default:
 		// Not a verdict this SDK can represent: the allowlist is {absent,
-		// kill_switch, targeting_unmatched}.
+		// kill_switch, targeting_unmatched, age_ineligible}.
 		return ExperimentAssignmentResult{}, expOutcome{}, false
 	}
 	notAssignedVersion := int64(0)
@@ -941,7 +972,7 @@ func sanitizeExperimentEntries(entries map[string]expEntry) map[string]expEntry 
 			for _, attribute := range entry.Attributes {
 				restored[attribute.Name] = attribute.Value
 			}
-			entry.Attributes, _ = normalizeExperimentAttributes(restored)
+			entry.Attributes, _ = normalizeExperimentAssignmentAttributes(restored)
 		}
 		if entry.Served != nil {
 			// A stored pin re-validates like every other stored field; a
@@ -2817,6 +2848,38 @@ func (c *Client) FetchExperimentAssignment(ctx context.Context, experimentKey st
 	return c.fetchExperimentAssignment(ctx, experimentKey, attributes, false, nil)
 }
 
+// ExperimentAgeBand is the game's age declaration, not age verification.
+// The zero value is invalid; use ExperimentAgeBandUnknown when undecided.
+type ExperimentAgeBand string
+
+const (
+	ExperimentAgeBandUnknown        ExperimentAgeBand = "unknown"
+	ExperimentAgeBandUnderThreshold ExperimentAgeBand = "under_threshold"
+	ExperimentAgeBandAdult          ExperimentAgeBand = "adult"
+)
+
+// FetchExperimentAssignmentWithAgeBand declares age_band for this fetch and
+// its revalidations. Only adult can qualify for client-id assignment; consent
+// and all other server gates still apply. The caller's attributes are copied.
+// A conflicting age_band returns ErrInvalidExperimentAgeBand. A non-adult
+// custom_attribute_age_band remains a refusal even alongside an adult band.
+func (c *Client) FetchExperimentAssignmentWithAgeBand(ctx context.Context, experimentKey string, band ExperimentAgeBand, attributes map[string]string) (ExperimentAssignmentResult, error) {
+	switch band {
+	case ExperimentAgeBandUnknown, ExperimentAgeBandUnderThreshold, ExperimentAgeBandAdult:
+	default:
+		return ExperimentAssignmentResult{}, ErrInvalidExperimentAgeBand
+	}
+	if existing, ok := attributes["age_band"]; ok && existing != string(band) {
+		return ExperimentAssignmentResult{}, ErrInvalidExperimentAgeBand
+	}
+	declared := make(map[string]string, len(attributes)+1)
+	for name, value := range attributes {
+		declared[name] = value
+	}
+	declared["age_band"] = string(band)
+	return c.FetchExperimentAssignment(ctx, experimentKey, declared)
+}
+
 func (c *Client) fetchExperimentAssignment(ctx context.Context, experimentKey string, attributes map[string]string, isRevalidation bool, presetAttributes []expAttribute) (ExperimentAssignmentResult, error) {
 	// The same lifecycle fence as Track and FetchRemoteConfig for HOST
 	// fetches: Close either sees this fetch (and waits for it) or completed
@@ -2948,7 +3011,7 @@ func (c *Client) fetchExperimentAssignment(ctx context.Context, experimentKey st
 		// same input set, not un-targeted.
 		normalizedAttributes = presetAttributes
 	case attributes != nil:
-		normalizedAttributes, dropped = normalizeExperimentAttributes(attributes)
+		normalizedAttributes, dropped = normalizeExperimentAssignmentAttributes(attributes)
 	case isRevalidation:
 		// A revalidation re-sends the attributes of the last host-supplied
 		// fetch for this experiment (one targeting vocabulary, one value
