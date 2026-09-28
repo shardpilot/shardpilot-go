@@ -4741,6 +4741,8 @@ func TestReasonIsVouchedOnlyWhereTheSDKReadsIt(t *testing.T) {
 		// the condition was only "is assigned true".
 		{`{"reason":"kill_switch"}`, false},
 		{`{"assigned":false,"reason":"targeting_unmatched"}`, true},
+		{`{"assigned":false,"reason":"age_ineligible"}`, true},
+		{`{"reason":"age_ineligible"}`, false},
 		{`{"assigned":false,"reason":"not_found"}`, false},
 		// ⚠ AND THE ECHO. `expEchoMatches` requires a PRESENT echoed member to equal
 		// the request's own value, which this pass can only check as "is it a value
@@ -4757,6 +4759,8 @@ func TestReasonIsVouchedOnlyWhereTheSDKReadsIt(t *testing.T) {
 			want = "kill_switch"
 		} else if strings.Contains(c.body, "targeting_unmatched") {
 			want = "targeting_unmatched"
+		} else if strings.Contains(c.body, "age_ineligible") {
+			want = "age_ineligible"
 		} else if strings.Contains(c.body, "not_found") {
 			want = "not_found"
 		} else if strings.Contains(c.body, "http_503") {

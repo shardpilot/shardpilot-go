@@ -624,6 +624,7 @@ func headerNameEnd(line string) (int, bool) {
 var sdkTaxonomy = set(
 	"kill_switch",
 	"targeting_unmatched",
+	"age_ineligible",
 	"not_found",
 	// The rest are read off the doc comment that enumerates the taxonomy in the
 	// SDK source, not remembered; `TestTheTaxonomyCoversTheSDKsOwnEnumeration`
@@ -1272,7 +1273,7 @@ func sdkWouldParseAssignment(body string) bool {
 		reason = *decoded
 	}
 	switch reason {
-	case "", "kill_switch", "targeting_unmatched":
+	case "", "kill_switch", "targeting_unmatched", "age_ineligible":
 	default:
 		return false
 	}

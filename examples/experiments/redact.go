@@ -1479,13 +1479,14 @@ var sdkVerdictFields = map[string]bool{"reason": true}
 //
 // ⚠ NARROWER THAN THE TAXONOMY, BECAUSE THE POSITION IS NARROWER. `sdkTaxonomy`
 // is every string this SDK writes as a classification anywhere; the not-assigned
-// branch allows only `{absent, kill_switch, targeting_unmatched}` and refuses the
+// branch allows only `{absent, kill_switch, targeting_unmatched, age_ineligible}` and refuses the
 // body outright for anything else. Vouching the whole taxonomy here says the SDK
 // wrote a value it would have rejected (shardpilot/shardpilot-go#85 review).
 // `TestTheReasonValuesAreTheSDKsOwn` reads the constants out of the SDK source.
 var sdkReasonValues = map[string]bool{
 	"kill_switch":         true,
 	"targeting_unmatched": true,
+	"age_ineligible":      true,
 }
 
 // verdictKey groups a member name the way `encoding/json` groups it.
@@ -1863,7 +1864,7 @@ func redactUnaccountedJSONValues(body string, exempt map[string]bool, statusLine
 		// SDK reads it, and reading it is conditional on the rest of the document.
 		//
 		// The allowlist is the narrower one too: the not-assigned branch takes
-		// `{absent, kill_switch, targeting_unmatched}` and refuses the body for
+		// `{absent, kill_switch, targeting_unmatched, age_ineligible}` and refuses the body for
 		// anything else, so the wider taxonomy would vouch a value the SDK rejects.
 		if sdkReasonValues[str] && sdkVerdictFields[verdictKey(verdictField)] && reasonIsSDKs {
 			// ⚠ THE SPAN INCLUDES THE QUOTES, SO THE REPLACEMENT MUST TOO. Emitting
