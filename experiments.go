@@ -497,6 +497,13 @@ type expOutcome struct {
 	// record (the real-subjects kill sentinel).
 	dropEntry bool
 	dropAll   bool
+	// ageRefusal marks a dropEntry that is an age_ineligible refusal: the
+	// install withdraws the subject's owed applications of the experiment
+	// with the entry (applyAgeWithdrawalLocked) instead of keeping them.
+	// refusalFactKey is the refusal's subject_fact_key when it carried a
+	// well-formed one.
+	ageRefusal     bool
+	refusalFactKey string
 	// authBlocked — 401/403: stop serving, halt revalidation, fail closed.
 	authBlocked bool
 	// remint — the subject-grammar 400 sentinel: the caller may re-mint the
@@ -852,13 +859,22 @@ func parseExperimentVerdict(resp remoteConfigResponse, scope expRequestScope, no
 	}
 	// Every not-assigned shape drops the cached assignment: the server just
 	// said this subject has no variant NOW, and a kill in particular must
-	// stop applying at the next safe point and emit no exposure.
+	// stop applying at the next safe point and emit no exposure. An age
+	// refusal also withdraws the subject's owed applications; its
+	// subject_fact_key, when well-formed, names the subject's facts.
+	outcome := expOutcome{authoritative: true, dropEntry: true}
+	if reason == experimentReasonAge {
+		outcome.ageRefusal = true
+		if factKey := strings.TrimSpace(wire.SubjectFactKey); expSubjectFactKeyPattern.MatchString(factKey) {
+			outcome.refusalFactKey = factKey
+		}
+	}
 	return ExperimentAssignmentResult{
 		Assigned: false,
 		Reason:   reason,
 		Version:  notAssignedVersion,
 		Boundary: deepCopyJSONMap(wire.Boundary, 0),
-	}, expOutcome{authoritative: true, dropEntry: true}, true
+	}, outcome, true
 }
 
 // deepCopyJSONMap deep-copies a decoded JSON object so a map handed to host
@@ -1027,7 +1043,8 @@ type experimentsState struct {
 	// later drop of the live entry, an ordinary auth latch, and a subject
 	// re-mint (exposure facts are facts about the PAST; only the
 	// real-subjects sentinel — whose fact keys must not outlive it —
-	// discards them).
+	// discards them, and an age_ineligible refusal withdraws its
+	// subject's records of the refused experiment).
 	pendingExposure map[string][]*expOwedExposure
 
 	// durablePending is the durable-write convergence intent: experiment
@@ -1056,7 +1073,8 @@ type experimentsState struct {
 	// survives a consent purge and an assignment drop or replacement (the
 	// platform judges an application as of the state it was served from),
 	// and is cleared with exposed by a subject rotation and by the
-	// real-subjects sentinel.
+	// real-subjects sentinel — and, for the refused experiment, by an
+	// age_ineligible refusal.
 	lastApplied map[string]expLastApplication
 
 	// sessionMarker is one marker per constructed consumer (= per SDK
@@ -1211,6 +1229,15 @@ type experimentsState struct {
 	// no-op inside).
 	sentinelSpoolPurgeFn func()
 
+	// ageWithdrawFactsFn, wired at construction, withdraws ONE experiment's
+	// facts for a refused subject from the analytics pipeline
+	// (Client.withdrawExperimentKeyFactsUnderLock): the queue and the
+	// worker's batches by the build stamp, the disk spool at once. Called
+	// UNDER e.mu by the age refusal, before its durable record delete. Same
+	// locking contract as sentinelSpoolPurgeFn. nil only in bare test
+	// states.
+	ageWithdrawFactsFn func(experimentKey string, factKeys []string)
+
 	// chmodFn is the chmod used when preload establishes the state
 	// directory's privacy (nil never occurs in a constructed state:
 	// newExperimentsState defaults it to os.Chmod, tests inject a failing
@@ -1246,6 +1273,10 @@ type expOwedExposure struct {
 	// Stats.ExperimentOutcomeDrops. An outcome is always extra: it is never
 	// de-duplicated and never re-armed.
 	outcome *expOutcomeRecord
+	// withdrawn is set (under e.mu) when an age refusal withdrew the record
+	// from the owed queue: an emission already holding it must not send it,
+	// seal it, or mark its tuple delivered.
+	withdrawn bool
 }
 
 // expOutcomeRecord is one outcome: its random id (the platform derives the
@@ -2363,6 +2394,139 @@ func (e *experimentsState) applySentinelWithdrawalLocked(scope string, resolvedA
 	return false, true
 }
 
+// applyAgeWithdrawalLocked is the age_ineligible refusal's package: the
+// entry leaves memory (and the latch-retained set) and its durable delete
+// converges, exactly as for any not-assigned drop — but with no drop-time
+// capture, and with every application the refused subject still owes for
+// the experiment withdrawn first (withdrawOwedApplicationsLocked), so the
+// record delete never outruns the withdrawal of the facts it covers.
+// Shared by the current-epoch install and the epoch-stale destructive
+// carve-out; every other not-assigned reason keeps applyEntryDropLocked,
+// whose owed applications survive the drop.
+func (e *experimentsState) applyAgeWithdrawalLocked(scope, subject, experimentKey, refusalFactKey string, resolvedAtMS int64) (persistFailed bool) {
+	dropped := e.entries[experimentKey]
+	retained := e.latchRetained[experimentKey]
+	delete(e.entries, experimentKey)
+	delete(e.latchRetained, experimentKey)
+	factKeys := []string{refusalFactKey}
+	for _, entry := range []*expEntry{dropped, retained} {
+		if entry != nil {
+			factKeys = append(factKeys, entry.SubjectFactKey)
+		}
+	}
+	e.withdrawOwedApplicationsLocked(scope, subject, experimentKey, factKeys)
+	// The drop's effective stamp is raised above the entry it resolves,
+	// as applyEntryDropLocked raises it.
+	asOf := resolvedAtMS
+	if dropped != nil && dropped.FetchedAtMS >= asOf {
+		asOf = dropped.FetchedAtMS + 1
+	}
+	return !e.syncDurableEntryLocked(scope, experimentKey, asOf, false)
+}
+
+// applyAgeRefusedApplicationLocked is an apply route's age refusal: the
+// platform refused an application of entry as age_ineligible. The
+// application's subject's owed applications of the experiment are
+// withdrawn and, when that subject is the current one, its assignment
+// stops serving and is dropped durably — the assignment route's age
+// refusal (applyAgeWithdrawalLocked).
+func (e *experimentsState) applyAgeRefusedApplicationLocked(experimentKey string, entry *expEntry, resolvedAtMS int64) (persistFailed bool) {
+	subject := entry.SubjectKey
+	scope := e.scopeForLocked(subject)
+	if current := e.currentSubjectIDLocked(); current != "" && current == subject {
+		return e.applyAgeWithdrawalLocked(scope, subject, experimentKey, entry.SubjectFactKey, resolvedAtMS)
+	}
+	e.withdrawOwedApplicationsLocked(scope, subject, experimentKey, []string{entry.SubjectFactKey})
+	return false
+}
+
+// withdrawOwedApplicationsLocked withdraws every application the subject
+// still owes for the experiment: after an age refusal nothing the subject
+// applied under the refused declaration may be sealed or delivered. The
+// scope is per (experiment, subject) — other experiments, and other
+// subjects' records of this one, are untouched:
+//   - the owed exposures and outcomes leave the owed queue, each counted
+//     age_ineligible and marked withdrawn (an emission already holding one
+//     neither sends, seals nor delivers it);
+//   - the application an outcome would follow (lastApplied) goes, so a new
+//     outcome is refused locally, and so do the session's delivery marks
+//     for the subject's tuples, so a withdrawn application never re-arms;
+//   - a frozen drop-time capture of the experiment (an earlier drop whose
+//     spool append has not landed) loses the subject's facts;
+//   - the facts already accepted into the analytics pipeline are withdrawn
+//     through ageWithdrawFactsFn: the spool at once, the queue and the
+//     worker's batches by their build stamp. A fact already handed to the
+//     transport is wire-ambiguous: it is never re-sent, and not counted.
+//
+// The subject's facts are matched by the experiment key and, when any is
+// known, by the subject fact keys: factKeys and those of the withdrawn
+// applications' assignments.
+func (e *experimentsState) withdrawOwedApplicationsLocked(scope, subject, experimentKey string, factKeys []string) {
+	known := make(map[string]bool)
+	addFactKey := func(factKey string) {
+		if factKey != "" {
+			known[factKey] = true
+		}
+	}
+	for _, factKey := range factKeys {
+		addFactKey(factKey)
+	}
+	var kept []*expOwedExposure
+	for _, record := range e.pendingExposure[experimentKey] {
+		if record.entry.SubjectKey != subject {
+			kept = append(kept, record)
+			continue
+		}
+		record.withdrawn = true
+		e.countOwedDropLocked(expDropAgeIneligible, record)
+		addFactKey(record.entry.SubjectFactKey)
+	}
+	if len(kept) == 0 {
+		delete(e.pendingExposure, experimentKey)
+	} else {
+		e.pendingExposure[experimentKey] = kept
+	}
+	if applied, ok := e.lastApplied[experimentKey]; ok && applied.entry.SubjectKey == subject {
+		addFactKey(applied.entry.SubjectFactKey)
+		delete(e.lastApplied, experimentKey)
+	}
+	// exposureTupleKey's shape: (experiment, version, subject).
+	tuplePrefix := escapeRemoteConfigSegment(experimentKey) + rcScopeSeparator
+	tupleSuffix := rcScopeSeparator + escapeRemoteConfigSegment(subject)
+	for tuple := range e.exposed {
+		if strings.HasPrefix(tuple, tuplePrefix) && strings.HasSuffix(tuple, tupleSuffix) {
+			delete(e.exposed, tuple)
+		}
+	}
+	withdrawnKeys := make([]string, 0, len(known))
+	for factKey := range known {
+		withdrawnKeys = append(withdrawnKeys, factKey)
+	}
+	sort.Strings(withdrawnKeys)
+	for intentKey, pending := range e.durablePending {
+		if !pending.captureFirst || pending.scope != scope || pending.experimentKey != experimentKey {
+			continue
+		}
+		var payload []spoolEntry
+		for _, entry := range pending.captureEntries {
+			if entry.internalFact && experimentKeyFactRawMatches(entry.raw, experimentKey, withdrawnKeys) {
+				continue
+			}
+			payload = append(payload, entry)
+		}
+		pending.captureEntries = payload
+		if len(payload) == 0 {
+			// Nothing left to capture: the pair's drop half converges
+			// like any owed drop.
+			pending.captureFirst = false
+		}
+		e.durablePending[intentKey] = pending
+	}
+	if e.ageWithdrawFactsFn != nil {
+		e.ageWithdrawFactsFn(experimentKey, withdrawnKeys)
+	}
+}
+
 func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string, outcome expOutcome, authEpoch uint64, resolvedAtMS int64) (sweepOwed, persistFailed, dropAllLanded bool) {
 	subject := e.currentSubjectIDLocked()
 	if subject == "" || e.scopeForLocked(subject) != scope {
@@ -2386,6 +2550,9 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 			if outcome.dropAll {
 				pf, landed := e.applySentinelWithdrawalLocked(scope, resolvedAtMS)
 				return false, pf, landed
+			}
+			if outcome.dropEntry && outcome.ageRefusal {
+				return false, e.applyAgeWithdrawalLocked(scope, subject, experimentKey, outcome.refusalFactKey, resolvedAtMS), false
 			}
 			if outcome.dropEntry {
 				return false, e.applyEntryDropLocked(scope, experimentKey, resolvedAtMS), false
@@ -2483,6 +2650,11 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 	// to a day; the deferral setter already keeps only the LATEST
 	// deadline).
 	e.backoffAttempt = 0
+	if outcome.dropEntry && outcome.ageRefusal {
+		// An age refusal is the one not-assigned verdict that also
+		// withdraws what the subject still owes for the experiment.
+		return false, e.applyAgeWithdrawalLocked(scope, subject, experimentKey, outcome.refusalFactKey, resolvedAtMS), false
+	}
 	if outcome.dropEntry {
 		return false, e.applyEntryDropLocked(scope, experimentKey, resolvedAtMS), false
 	}
@@ -2562,6 +2734,9 @@ const (
 	expDropUnsealedAtClose      = "unsealed_at_close"
 	expDropUndeliveredAtClose   = "undelivered_at_close"
 	expDropConsentWithdrawn     = "consent_withdrawn"
+	// expDropAgeIneligible: withdrawn by an age_ineligible refusal of the
+	// application's subject (withdrawOwedApplicationsLocked).
+	expDropAgeIneligible = "age_ineligible"
 )
 
 // countDropLocked reports n applications not recorded for reason.

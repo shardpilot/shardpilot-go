@@ -134,6 +134,20 @@ type Client struct {
 	expFactPurgeEpoch      atomic.Uint64
 	workerSeenExpFactPurge uint64
 
+	// expKeyWithdrawEpoch counts per-experiment fact withdrawals (an
+	// age_ineligible refusal withdraws ONE experiment's facts for the
+	// refused subject; see withdrawExperimentKeyFactsUnderLock), and
+	// expKeyWithdrawals records them: experiment key → subject fact key
+	// ("" = any) → the epoch of the latest withdrawal. A fact is withdrawn
+	// when its build stamp (Event.expKeyWithdrawEpoch) predates a matching
+	// withdrawal. expKeyWithdrawMu guards the map and orders the epoch's
+	// publication after it; it is a leaf lock. workerSeenKeyWithdraw is the
+	// worker-goroutine-owned seen mark, like workerSeenExpFactPurge.
+	expKeyWithdrawMu      sync.Mutex
+	expKeyWithdrawals     map[string]map[string]uint64
+	expKeyWithdrawEpoch   atomic.Uint64
+	workerSeenKeyWithdraw uint64
+
 	// deferredSpoolLetters holds dead-letters produced by spool work done
 	// under a state lock (the drop-time owed-exposure capture runs under
 	// e.mu); they dispatch at the next off-lock drain point — the
@@ -394,6 +408,10 @@ func NewClient(cfg Config) (*Client, error) {
 		// between the durable withdrawal and the off-lock pipeline purge
 		// must not let the next launch resend withdrawn facts.
 		client.exp.sentinelSpoolPurgeFn = client.sentinelSpoolPurgeUnderLock
+		// An age refusal withdraws one experiment's facts from the pipeline
+		// under e.mu, as part of its durable commit (see
+		// withdrawExperimentKeyFactsUnderLock).
+		client.exp.ageWithdrawFactsFn = client.withdrawExperimentKeyFactsUnderLock
 		if client.exp.preload() {
 			client.stats.setLastError("experiment_dir_private_failed")
 			client.logf("shardpilot experiments: the state directory could not be made private (0700); persisted experiment state is not loaded and nothing serves from it")
@@ -1372,6 +1390,13 @@ func (c *Client) admitReceivedEvent(batch []Event, event Event, seenEpoch *uint6
 		// blindly it would ride under a matching seen epoch, unfiltered,
 		// carrying a withdrawn subject-fact key onto the wire. Dropped
 		// here, counted exactly once (it escaped the purge's own count).
+		c.stats.dropped.Add(1)
+		return batch
+	}
+	if c.isKeyWithdrawnExperimentFactEvent(event) {
+		// The age-refusal twin of the check above: a fact of the refused
+		// experiment and subject built before the refusal is withdrawn from
+		// the queue here, at the consumer, counted once.
 		c.stats.dropped.Add(1)
 		return batch
 	}

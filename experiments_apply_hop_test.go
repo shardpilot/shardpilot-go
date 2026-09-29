@@ -33,6 +33,9 @@ type expApplyStub struct {
 	requests  []expApplyRequest
 	facts     []map[string]any
 	workspace string // the sealed fact's workspace_id; "" means the test client's
+	// assignmentKey is the sealed fact's assignment_key (the subject fact
+	// key); "" means the stub's fixed one.
+	assignmentKey string
 	// onRequest, when set, runs while a request is being answered (outside
 	// the stub's lock): the window in which the SDK's hop is in flight.
 	onRequest func()
@@ -107,6 +110,10 @@ func (s *expApplyStub) handler(t *testing.T) http.HandlerFunc {
 			if workspace == "" {
 				workspace = "workspace-test"
 			}
+			assignmentKey := s.assignmentKey
+			if assignmentKey == "" {
+				assignmentKey = "sfk1_" + strings.Repeat("a", 64)
+			}
 			applicationID, _ := body["exposure_id"].(string)
 			eventTime, _ := body["applied_at"].(string)
 			eventName := experimentExposureName
@@ -125,7 +132,7 @@ func (s *expApplyStub) handler(t *testing.T) http.HandlerFunc {
 				"props": map[string]any{
 					"experiment_key":     body["experiment_key"],
 					"experiment_version": body["experiment_version"],
-					"assignment_key":     "sfk1_" + strings.Repeat("a", 64),
+					"assignment_key":     assignmentKey,
 					"variant_key":        body["variant_key"],
 					"assignment_unit":    "client_id",
 					"attestation":        "client_attested",

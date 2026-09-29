@@ -193,6 +193,16 @@ func (c *Client) emitOwedExposure(ctx context.Context, experimentKey string, rec
 	nowMS := c.clock.Now().UnixMilli()
 	e.mu.Lock()
 	purgeEpoch := e.purgeEpoch
+	if record.withdrawn {
+		// An age refusal withdrew the application after the sweep took it:
+		// nothing is sent (the withdrawal counted it).
+		e.mu.Unlock()
+		return false, expDropAgeIneligible, true
+	}
+	// The fact's per-experiment withdrawal stamp, read with the record
+	// still owed under e.mu: a refusal landing after this point withdraws
+	// the fact wherever it is in the pipeline.
+	keyEpoch := c.expKeyWithdrawEpoch.Load()
 	currentSession := owed.session == e.sessionMarker
 	tuple := exposureTupleKey(experimentKey, owed.entry)
 	if !owed.extra && currentSession && e.exposed[tuple].auto {
@@ -209,7 +219,7 @@ func (c *Client) emitOwedExposure(ctx context.Context, experimentKey string, rec
 	if sealed == nil {
 		var dropped string
 		var keep bool
-		sealed, dropped, keep = c.sealExperimentApplication(ctx, experimentKey, owed)
+		sealed, dropped, keep = c.sealExperimentApplication(ctx, experimentKey, record, owed)
 		switch {
 		case dropped != "":
 			return false, dropped, true
@@ -224,6 +234,13 @@ func (c *Client) emitOwedExposure(ctx context.Context, experimentKey string, rec
 			e.mu.Unlock()
 			return false, "purged", false
 		}
+		if record.withdrawn {
+			// An age refusal withdrew the application while the hop ran:
+			// the sealed answer is discarded, never delivered.
+			e.mu.Unlock()
+			return false, expDropAgeIneligible, true
+		}
+		keyEpoch = c.expKeyWithdrawEpoch.Load()
 		record.sealed = sealed
 		e.mu.Unlock()
 	}
@@ -240,6 +257,7 @@ func (c *Client) emitOwedExposure(ctx context.Context, experimentKey string, rec
 		c.logf("shardpilot experiments: a sealed %s for experiment %q names another workspace, app or environment than this client's; dropped (foreign_scope)", owed.kind(), experimentKey)
 		return false, expDropForeignScope, true
 	}
+	event.expKeyWithdrawEpoch = keyEpoch
 	// Seam: the window between this emission's own consent check (above)
 	// and the fact intake's gate re-check — a consent flip landing here is
 	// the raced refusal the intake reports.
@@ -252,7 +270,9 @@ func (c *Client) emitOwedExposure(ctx context.Context, experimentKey string, rec
 	e.fireConsentRaceSeam("exposure_enqueued")
 	if !owed.extra && currentSession {
 		e.mu.Lock()
-		if e.purgeEpoch == purgeEpoch {
+		if e.purgeEpoch == purgeEpoch && !record.withdrawn {
+			// (A withdrawn application's fact dies in the pipeline by its
+			// stamp; its tuple is not marked delivered.)
 			e.exposed[tuple] = expExposed{auto: true, app: owed.app}
 		}
 		// A purge that raced this delivery saw the record still owed and
@@ -268,11 +288,14 @@ func (c *Client) emitOwedExposure(ctx context.Context, experimentKey string, rec
 //   - 200 with a sealed fact: sealed;
 //   - 401/403: kept, and the hop pauses until an authorized fetch — except the
 //     real-subjects sentinel, which drops every owed application;
+//   - 409 not_assigned/age_ineligible: the subject's owed applications of
+//     the experiment are withdrawn and its assignment stops serving
+//     (age_ineligible), as for an age refusal from the assignment route;
 //   - any other 4xx but 408/429: dropped (apply_refused), a poison record
 //     never retries;
 //   - 3xx, 408, 429, 5xx, no response, a 200 without a usable fact: kept,
 //     paced by the plane's shared Retry-After/backoff deadline.
-func (c *Client) sealExperimentApplication(ctx context.Context, experimentKey string, owed expOwedCopy) (sealed *expSealedFact, dropped string, keep bool) {
+func (c *Client) sealExperimentApplication(ctx context.Context, experimentKey string, record *expOwedExposure, owed expOwedCopy) (sealed *expSealedFact, dropped string, keep bool) {
 	e := c.exp
 	resp, err := c.postExposureApplication(ctx, experimentKey, owed)
 	if errors.Is(err, errExperimentApplyConsentRefused) {
@@ -324,6 +347,27 @@ func (c *Client) sealExperimentApplication(ctx context.Context, experimentKey st
 		}
 		c.logf("shardpilot experiments: the platform disabled real-subject assignment (apply endpoint); dropped the cached assignments, the owed applications and their subject fact keys")
 		return nil, expDropRealSubjectsDisabled, false
+	case resp.status == 409 && experimentApplyAgeRefusal(resp.body, resp.bodyIncomplete):
+		// The platform refused the application's pinned declaration. The
+		// age rule applies to the application's subject and experiment: its
+		// owed applications and their facts are withdrawn, and a served
+		// assignment of that subject is dropped durably. An application an
+		// earlier refusal already withdrew withdraws nothing more.
+		e.mu.Lock()
+		withdraw := !record.withdrawn
+		persistFailed := false
+		if withdraw {
+			persistFailed = e.applyAgeRefusedApplicationLocked(experimentKey, owed.entry, nowMS)
+		}
+		e.mu.Unlock()
+		c.drainDeferredSpoolLetters()
+		if persistFailed {
+			c.stats.setLastError("experiment_cache_persist_failed")
+		}
+		if withdraw {
+			c.logf("shardpilot experiments: the platform refused an %s for experiment %q (HTTP 409, age_ineligible); withdrew the subject's owed applications and facts of the experiment", owed.kind(), experimentKey)
+		}
+		return nil, expDropAgeIneligible, false
 	case resp.status >= 400 && resp.status < 500 && resp.status != 408 && resp.status != 429:
 		e.mu.Lock()
 		owed.countDrop(e, expDropApplyRefused)
@@ -417,6 +461,24 @@ func (c *Client) postExposureApplication(ctx context.Context, experimentKey stri
 // errExperimentApplyConsentRefused is an apply request the consent gate
 // refused before the wire or aborted on the wire.
 var errExperimentApplyConsentRefused = errors.New("shardpilot experiments: apply request refused by a consent denial")
+
+// experimentApplyAgeRefusal reports whether an apply route's answer body is
+// the platform's age refusal, {"error":"not_assigned","reason":
+// "age_ineligible"}. A truncated or over-limit body never is (the
+// experimentBodyErrorText bound).
+func experimentApplyAgeRefusal(body []byte, bodyIncomplete bool) bool {
+	if bodyIncomplete || len(body) > expMaxBodyBytes {
+		return false
+	}
+	var wire struct {
+		Error  string `json:"error"`
+		Reason string `json:"reason"`
+	}
+	if json.Unmarshal(body, &wire) != nil {
+		return false
+	}
+	return wire.Error == "not_assigned" && wire.Reason == experimentReasonAge
+}
 
 // parseSealedExposure reads the apply endpoint's 200 body: {"fact":{...},
 // "seal":"..."}, the fact an experiment_exposure with an id, an event time,
@@ -668,7 +730,10 @@ func (c *Client) TrackExperimentExposure(experimentKey string) error {
 // host applies the newer one; after the assignment is dropped (a kill
 // switch, a not-assigned verdict) it still follows the last application.
 // The platform judges each outcome as of the state that application was
-// served from.
+// served from. The exception is an age_ineligible refusal: it withdraws the
+// subject's applications of the experiment, so no outcome follows them:
+// the call is refused (ErrExperimentNoAssignment while nothing is served)
+// until the host applies a new assignment.
 //
 // The value must be an integer of magnitude at most 2^53 — a fractional,
 // larger or non-finite value is refused — and is sent as a JSON integer.
@@ -971,6 +1036,9 @@ func (c *Client) dropWithdrawnSpoolChunkMembers(chunk []spoolEntry) []spoolEntry
 // like the consent drain. Runs only on the worker goroutine; the seen-epoch
 // field is worker-owned state (the retainedRequest discipline).
 func (c *Client) dropWithdrawnExperimentFacts(batch []Event, backoffAttempt *int) []Event {
+	// An age refusal's per-experiment withdrawal filters at the same
+	// dispatch points (dropKeyWithdrawnExperimentFacts).
+	batch = c.dropKeyWithdrawnExperimentFacts(batch, backoffAttempt)
 	epoch := c.expFactPurgeEpoch.Load()
 	if epoch == c.workerSeenExpFactPurge {
 		return batch
@@ -1040,6 +1108,9 @@ func (c *Client) dropWithdrawnExperimentFacts(batch []Event, backoffAttempt *int
 // seen-epoch field is worker-owned state, exactly like
 // dropWithdrawnExperimentFacts).
 func (c *Client) dropWithdrawnBuiltBatch(request batchRequest, batch []Event, backoffAttempt *int) (batchRequest, []Event) {
+	// The same re-check for an age refusal landing in that window
+	// (dropKeyWithdrawnBuiltBatch).
+	request, batch = c.dropKeyWithdrawnBuiltBatch(request, batch, backoffAttempt)
 	epoch := c.expFactPurgeEpoch.Load()
 	if epoch == c.workerSeenExpFactPurge {
 		return request, batch
@@ -1111,6 +1182,309 @@ func filterWithdrawnFromBatchRequest(request batchRequest) (batchRequest, int) {
 	request.Events = envelopes
 	request.rawEvents = raws
 	return request, removed
+}
+
+// ── age refusal: one experiment's facts leave the pipeline ──────────────────
+//
+// An age_ineligible refusal withdraws the refused subject's facts of ONE
+// experiment (withdrawOwedApplicationsLocked decides which: the experiment
+// key and, when known, the subject fact keys). Unlike the real-subjects
+// sentinel it is never plane-wide, so it has its own generation counter
+// (Client.expKeyWithdrawEpoch) and a record of what each generation
+// withdrew (Client.expKeyWithdrawals); a fact is withdrawn when its build
+// stamp (Event.expKeyWithdrawEpoch) predates a withdrawal that matches it.
+// The legs mirror the sentinel's:
+//   - the disk spool is swept at once, under e.mu, before the refusal's
+//     durable record delete (withdrawExperimentKeyFactsUnderLock);
+//   - queued facts die at the consumer (admitReceivedEvent, the close
+//     remnant's per-member check);
+//   - the worker's held and retained batches are filtered at the next
+//     dispatch point, and a built batch once more before its transport
+//     handoff (dropKeyWithdrawnExperimentFacts, dropKeyWithdrawnBuiltBatch);
+//   - a pulled spool chunk is re-checked at its handoff
+//     (dropKeyWithdrawnSpoolChunkMembers), and a failed batch respools
+//     without them (spoolFailedBatch).
+//
+// A fact already handed to the transport when the refusal lands is
+// wire-ambiguous: it is not withdrawn (it may have been delivered), and if
+// that send fails it is never re-sent or respooled.
+
+// withdrawExperimentKeyFactsUnderLock records one age refusal's withdrawal
+// — the experiment and the subject fact keys ("any" when none is known) —
+// under a new generation, then removes the matching facts from the disk
+// spool, dead-lettering them (SpoolDropTerminal). Called UNDER e.mu (via
+// ageWithdrawFactsFn): everything the spool holds then was built before the
+// refusal, so the sweep needs no stamp. Lock discipline as
+// sentinelSpoolPurgeUnderLock: leaf locks only, dead-letters deferred.
+func (c *Client) withdrawExperimentKeyFactsUnderLock(experimentKey string, factKeys []string) {
+	c.expKeyWithdrawMu.Lock()
+	epoch := c.expKeyWithdrawEpoch.Load() + 1
+	if c.expKeyWithdrawals == nil {
+		c.expKeyWithdrawals = make(map[string]map[string]uint64)
+	}
+	byFactKey := c.expKeyWithdrawals[experimentKey]
+	if byFactKey == nil {
+		byFactKey = make(map[string]uint64)
+		c.expKeyWithdrawals[experimentKey] = byFactKey
+	}
+	if len(factKeys) == 0 {
+		byFactKey[""] = epoch
+	}
+	for _, factKey := range factKeys {
+		byFactKey[factKey] = epoch
+	}
+	// Published after the record: a consumer that sees the new generation
+	// finds its withdrawal.
+	c.expKeyWithdrawEpoch.Store(epoch)
+	c.expKeyWithdrawMu.Unlock()
+	if c.spool == nil {
+		return
+	}
+	removed, persistFailed := c.spool.removeMatching(func(raw json.RawMessage) bool {
+		return experimentKeyFactRawMatches(raw, experimentKey, factKeys)
+	}, 0)
+	if persistFailed {
+		c.recordSpoolPersistFailure()
+	}
+	c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropTerminal, removed))
+}
+
+// experimentKeyFactMatches is the withdrawal's shape: an exposure or outcome
+// fact of the experiment whose assignment_key is one of factKeys (any, when
+// none is given).
+func experimentKeyFactMatches(eventName, factExperimentKey, assignmentKey, experimentKey string, factKeys []string) bool {
+	if eventName != experimentExposureName && eventName != experimentOutcomeName {
+		return false
+	}
+	if factExperimentKey == "" || factExperimentKey != experimentKey {
+		return false
+	}
+	if len(factKeys) == 0 {
+		return true
+	}
+	for _, factKey := range factKeys {
+		if assignmentKey == factKey {
+			return true
+		}
+	}
+	return false
+}
+
+// experimentFactWire is the part of a fact's wire bytes a withdrawal reads.
+type experimentFactWire struct {
+	EventName string `json:"event_name"`
+	Props     struct {
+		ExperimentKey string `json:"experiment_key"`
+		AssignmentKey string `json:"assignment_key"`
+	} `json:"props"`
+}
+
+// experimentKeyFactRawMatches is experimentKeyFactMatches over an
+// envelope's wire bytes. Callers pair it with the SDK-authorship flag.
+func experimentKeyFactRawMatches(raw json.RawMessage, experimentKey string, factKeys []string) bool {
+	var wire experimentFactWire
+	if json.Unmarshal(raw, &wire) != nil {
+		return false
+	}
+	return experimentKeyFactMatches(wire.EventName, wire.Props.ExperimentKey, wire.Props.AssignmentKey, experimentKey, factKeys)
+}
+
+// experimentFactKeyWithdrawn reports whether an experiment fact built at
+// stamp is withdrawn by a later age refusal of its experiment and subject.
+func (c *Client) experimentFactKeyWithdrawn(eventName, experimentKey, assignmentKey string, stamp uint64) bool {
+	if stamp >= c.expKeyWithdrawEpoch.Load() {
+		return false
+	}
+	if eventName != experimentExposureName && eventName != experimentOutcomeName {
+		return false
+	}
+	c.expKeyWithdrawMu.Lock()
+	defer c.expKeyWithdrawMu.Unlock()
+	byFactKey := c.expKeyWithdrawals[experimentKey]
+	if epoch, ok := byFactKey[""]; ok && stamp < epoch {
+		return true
+	}
+	if assignmentKey == "" {
+		return false
+	}
+	epoch, ok := byFactKey[assignmentKey]
+	return ok && stamp < epoch
+}
+
+// isKeyWithdrawnExperimentFactEvent: the SDK's own fact (the authorship
+// marker), withdrawn by an age refusal after it was built.
+func (c *Client) isKeyWithdrawnExperimentFactEvent(event Event) bool {
+	if !event.omitUserID {
+		return false
+	}
+	experimentKey, _ := event.Props["experiment_key"].(string)
+	assignmentKey, _ := event.Props["assignment_key"].(string)
+	return c.experimentFactKeyWithdrawn(strings.TrimSpace(event.Name), experimentKey, assignmentKey, event.expKeyWithdrawEpoch)
+}
+
+// isKeyWithdrawnEnvelope is isKeyWithdrawnExperimentFactEvent for a built
+// envelope.
+func (c *Client) isKeyWithdrawnEnvelope(envelope eventEnvelope) bool {
+	if !envelope.internalIdentityFact {
+		return false
+	}
+	experimentKey, _ := envelope.Props["experiment_key"].(string)
+	assignmentKey, _ := envelope.Props["assignment_key"].(string)
+	return c.experimentFactKeyWithdrawn(envelope.EventName, experimentKey, assignmentKey, envelope.expKeyWithdrawEpoch)
+}
+
+// dropKeyWithdrawnExperimentFacts is the worker-batch leg: at every dispatch
+// point, when a refusal landed since the worker last looked, it filters the
+// held batch — counted in Stats.Dropped, as queued facts a purge clears are
+// — and the same members from the retained wire bytes, so the survivors
+// keep their exact bytes. Runs only on the worker goroutine (the seen mark
+// is worker-owned).
+func (c *Client) dropKeyWithdrawnExperimentFacts(batch []Event, backoffAttempt *int) []Event {
+	epoch := c.expKeyWithdrawEpoch.Load()
+	if epoch == c.workerSeenKeyWithdraw {
+		return batch
+	}
+	c.workerSeenKeyWithdraw = epoch
+	kept := batch[:0]
+	removedIDs := make(map[string]struct{})
+	for _, event := range batch {
+		if c.isKeyWithdrawnExperimentFactEvent(event) {
+			removedIDs[strings.TrimSpace(event.ID)] = struct{}{}
+			continue
+		}
+		kept = append(kept, event)
+	}
+	if len(removedIDs) == 0 {
+		return kept
+	}
+	c.stats.dropped.Add(uint64(len(removedIDs)))
+	c.retainedRequest = withoutEnvelopeIDs(c.retainedRequest, removedIDs)
+	if len(kept) == 0 {
+		// The whole held batch was withdrawn: its backoff streak goes with
+		// it (the consent-drop discipline).
+		*backoffAttempt = 0
+	}
+	return kept
+}
+
+// withoutEnvelopeIDs drops the members with the given event ids from a built
+// request, keeping the survivors' exact bytes and their envelope/raw
+// pairing.
+func withoutEnvelopeIDs(request batchRequest, ids map[string]struct{}) batchRequest {
+	if len(request.Events) == 0 || len(request.Events) != len(request.rawEvents) {
+		return request
+	}
+	envelopes := make([]eventEnvelope, 0, len(request.Events))
+	raws := make([]json.RawMessage, 0, len(request.rawEvents))
+	for i, envelope := range request.Events {
+		if _, removed := ids[envelope.EventID]; removed {
+			continue
+		}
+		envelopes = append(envelopes, envelope)
+		raws = append(raws, request.rawEvents[i])
+	}
+	request.Events = envelopes
+	request.rawEvents = raws
+	return request
+}
+
+// dropKeyWithdrawnBuiltBatch re-checks a BUILT batch immediately before its
+// transport or spool handoff, for a refusal that landed between the
+// dispatch-point check and the build (the dropWithdrawnBuiltBatch window).
+// The batch and the request are filtered by position, so they stay aligned;
+// a misaligned pair filters the request by its own members. Worker
+// goroutine only.
+func (c *Client) dropKeyWithdrawnBuiltBatch(request batchRequest, batch []Event, backoffAttempt *int) (batchRequest, []Event) {
+	epoch := c.expKeyWithdrawEpoch.Load()
+	if epoch == c.workerSeenKeyWithdraw {
+		return request, batch
+	}
+	c.workerSeenKeyWithdraw = epoch
+	aligned := len(request.Events) == len(batch) && len(request.rawEvents) == len(batch)
+	kept := batch[:0]
+	var envelopes []eventEnvelope
+	var raws []json.RawMessage
+	removed := 0
+	for i, event := range batch {
+		if c.isKeyWithdrawnExperimentFactEvent(event) {
+			removed++
+			continue
+		}
+		kept = append(kept, event)
+		if aligned {
+			envelopes = append(envelopes, request.Events[i])
+			raws = append(raws, request.rawEvents[i])
+		}
+	}
+	if removed == 0 {
+		return request, kept
+	}
+	c.stats.dropped.Add(uint64(removed))
+	c.logf("shardpilot experiments: withheld %d built batch member(s) at the transport handoff (withdrawn by an age refusal)", removed)
+	if aligned {
+		request.Events = envelopes
+		request.rawEvents = raws
+	} else {
+		request, _ = c.filterKeyWithdrawnFromBatchRequest(request)
+	}
+	if len(kept) == 0 {
+		*backoffAttempt = 0
+	}
+	return request, kept
+}
+
+// filterKeyWithdrawnFromBatchRequest drops the facts an age refusal
+// withdrew from a built request, by each member's own build stamp, keeping
+// the survivors' exact bytes. Returns how many it dropped.
+func (c *Client) filterKeyWithdrawnFromBatchRequest(request batchRequest) (batchRequest, int) {
+	if c.expKeyWithdrawEpoch.Load() == 0 || len(request.Events) == 0 || len(request.Events) != len(request.rawEvents) {
+		return request, 0
+	}
+	envelopes := make([]eventEnvelope, 0, len(request.Events))
+	raws := make([]json.RawMessage, 0, len(request.rawEvents))
+	removed := 0
+	for i, envelope := range request.Events {
+		if c.isKeyWithdrawnEnvelope(envelope) {
+			removed++
+			continue
+		}
+		envelopes = append(envelopes, envelope)
+		raws = append(raws, request.rawEvents[i])
+	}
+	if removed == 0 {
+		return request, 0
+	}
+	request.Events = envelopes
+	request.rawEvents = raws
+	return request, removed
+}
+
+// dropKeyWithdrawnSpoolChunkMembers re-checks a pulled spool chunk at its
+// transport handoff: every member was spooled before the pull, so a refusal
+// that landed after the pull (pulledAt, the generation read before it)
+// withdraws the members it matches. The refusal's own spool sweep has
+// removed them from the mirror (and dead-lettered them); this only keeps
+// their bytes off the wire, as dropWithdrawnSpoolChunkMembers does.
+func (c *Client) dropKeyWithdrawnSpoolChunkMembers(chunk []spoolEntry, pulledAt uint64) []spoolEntry {
+	if pulledAt == c.expKeyWithdrawEpoch.Load() {
+		return chunk
+	}
+	kept := chunk[:0]
+	withheld := 0
+	for _, entry := range chunk {
+		if entry.internalFact {
+			var wire experimentFactWire
+			if json.Unmarshal(entry.raw, &wire) == nil && c.experimentFactKeyWithdrawn(wire.EventName, wire.Props.ExperimentKey, wire.Props.AssignmentKey, pulledAt) {
+				withheld++
+				continue
+			}
+		}
+		kept = append(kept, entry)
+	}
+	if withheld > 0 {
+		c.logf("shardpilot experiments: withheld %d pulled spool member(s) at the transport handoff (withdrawn by an age refusal; its spool sweep settles them)", withheld)
+	}
+	return kept
 }
 
 // captureOwedExposuresForDrop durably captures an entry's still-owed

@@ -2239,6 +2239,16 @@ func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned b
 			c.logf("shardpilot experiments: withheld %d withdrawn experiment fact(s) from a post-sentinel respool", removed)
 		}
 	}
+	if c.exp != nil {
+		// The same for an age refusal that landed while this batch was
+		// built or in transport: the facts it withdrew are not written back
+		// (each member's own build stamp decides). Not counted here either:
+		// the worker's batch filter counts them at its next dispatch point.
+		if filtered, removed := c.filterKeyWithdrawnFromBatchRequest(request); removed > 0 {
+			request = filtered
+			c.logf("shardpilot experiments: withheld %d experiment fact(s) an age refusal withdrew from a respool", removed)
+		}
+	}
 	eligible, refusedActors := c.partitionSpoolEligible(request)
 	c.notifySpoolDeadLetter(SpoolDropConsent, refusedActors)
 	if len(eligible) == 0 {
@@ -2456,6 +2466,9 @@ func (c *Client) resendSpooledChunks(deferUntil *time.Time, backoffAttempt *int)
 		return true
 	}
 	for {
+		// The age-refusal generation before the pull: every member of the
+		// chunk was spooled before it (dropKeyWithdrawnSpoolChunkMembers).
+		pulledAt := c.expKeyWithdrawEpoch.Load()
 		chunk, expired, persistFailed := s.pullResendChunk(c.cfg.BatchSize, c.clock.Now())
 		c.recordSpoolExpired(expired)
 		if persistFailed {
@@ -2473,6 +2486,7 @@ func (c *Client) resendSpooledChunks(deferUntil *time.Time, backoffAttempt *int)
 		// pull and this point condemned members the mirror sweep cannot
 		// reach (see dropWithdrawnSpoolChunkMembers).
 		chunk = c.dropWithdrawnSpoolChunkMembers(chunk)
+		chunk = c.dropKeyWithdrawnSpoolChunkMembers(chunk, pulledAt)
 		if len(chunk) == 0 {
 			continue
 		}
@@ -2543,6 +2557,9 @@ func (c *Client) flushSpooledChunks(ctx context.Context, backoffAttempt *int) er
 	}
 	var firstErr error
 	for {
+		// The age-refusal generation before the pull: every member of the
+		// chunk was spooled before it (dropKeyWithdrawnSpoolChunkMembers).
+		pulledAt := c.expKeyWithdrawEpoch.Load()
 		chunk, expired, persistFailed := s.pullResendChunk(c.cfg.BatchSize, c.clock.Now())
 		c.recordSpoolExpired(expired)
 		if persistFailed {
@@ -2559,6 +2576,7 @@ func (c *Client) flushSpooledChunks(ctx context.Context, backoffAttempt *int) er
 		// sentinel racing the pulled chunk must not publish withdrawn
 		// facts through the explicit flush either.
 		chunk = c.dropWithdrawnSpoolChunkMembers(chunk)
+		chunk = c.dropKeyWithdrawnSpoolChunkMembers(chunk, pulledAt)
 		if len(chunk) == 0 {
 			continue
 		}
@@ -2680,6 +2698,12 @@ func (c *Client) spoolCloseRemnant(batch []Event) (gateRefused int, mirrored []s
 			continue
 		}
 		if c.isWithdrawnExperimentFactEvent(event) {
+			boundaryDropped++
+			continue
+		}
+		if c.isKeyWithdrawnExperimentFactEvent(event) {
+			// A fact an age refusal withdrew (the queue members drained
+			// above never passed the worker's admission).
 			boundaryDropped++
 			continue
 		}
