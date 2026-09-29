@@ -78,6 +78,11 @@ type eventEnvelope struct {
 	// reaches the same verdict intake did for these envelopes (see
 	// spoolActorEligible).
 	internalIdentityFact bool
+
+	// expKeyWithdrawEpoch is the event's Event.expKeyWithdrawEpoch, carried
+	// so a built or retained request can be filtered for an age refusal's
+	// withdrawn facts member by member. Unexported and never serialized.
+	expKeyWithdrawEpoch uint64
 }
 
 func (c *Client) buildEnvelope(event Event) (eventEnvelope, error) {
@@ -159,6 +164,7 @@ func (c *Client) buildEnvelope(event Event) (eventEnvelope, error) {
 		AttestationSeal: event.attestationSeal,
 
 		internalIdentityFact: event.omitUserID,
+		expKeyWithdrawEpoch:  event.expKeyWithdrawEpoch,
 	}, nil
 }
 

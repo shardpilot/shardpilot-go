@@ -39,6 +39,14 @@ type Event struct {
 	// dropped for a worker's epoch lag.
 	expFactEpoch uint64
 
+	// expKeyWithdrawEpoch is the per-experiment withdrawal generation
+	// (Client.expKeyWithdrawEpoch) this experiment fact was BUILT under,
+	// read under the experiment lock together with the owed record it came
+	// from (zero for everything else). An age refusal withdraws its
+	// experiment's facts built before it, and only those: a fact built
+	// after it is a new application and is never withdrawn by it.
+	expKeyWithdrawEpoch uint64
+
 	// intakeConsentEpoch is the consent denial generation this event was
 	// ADMITTED under, stamped at the queue boundary. The worker joins a
 	// received event to its held batch only when this stamp matches the

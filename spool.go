@@ -1523,10 +1523,22 @@ func (s *diskSpool) evictOverCapsLocked() []spoolEntry {
 // start. An append that changes nothing (everything expired or duplicate, no
 // deadline change) skips the rewrite entirely.
 func (s *diskSpool) append(batch []spoolEntry, deadlineMS int64, clearStaleDeadline bool, now time.Time, allowed func() bool) (refused bool, added, expired, evicted []spoolEntry, persistFailed bool) {
+	return s.appendExcept(batch, deadlineMS, clearStaleDeadline, now, allowed, nil)
+}
+
+// appendExcept is append with a last exclusion made under the spool lock:
+// withheld, when non-nil, runs after allowed admits the append, and the
+// entries whose ids it returns are neither inserted nor reported expired
+// (see spoolFailedBatch).
+func (s *diskSpool) appendExcept(batch []spoolEntry, deadlineMS int64, clearStaleDeadline bool, now time.Time, allowed func() bool, withheld func() map[string]struct{}) (refused bool, added, expired, evicted []spoolEntry, persistFailed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.owed || !allowed() {
 		return true, nil, nil, nil, false
+	}
+	var excluded map[string]struct{}
+	if withheld != nil {
+		excluded = withheld()
 	}
 	appended := make(map[string]struct{}, len(batch))
 	// ⚠ THE ENTRIES ACTUALLY INSERTED, NOT THE BATCH THEY CAME FROM. Rebuilding
@@ -1538,6 +1550,9 @@ func (s *diskSpool) append(batch []spoolEntry, deadlineMS int64, clearStaleDeadl
 	inserted := make([]spoolEntry, 0, len(batch))
 	for _, entry := range batch {
 		if entry.id == "" {
+			continue
+		}
+		if _, skip := excluded[entry.id]; skip {
 			continue
 		}
 		if spoolEntryExpired(entry, now) {
@@ -1733,8 +1748,18 @@ func (s *diskSpool) ack(ids []string) (removed []spoolEntry, persistFailed bool)
 // entries lands. A failed persist is reported the same way ack reports one
 // — the mirror is authoritative and the next save retries.
 func (s *diskSpool) removeMatching(matches func(raw json.RawMessage) bool, currentExpEpoch uint64) (removed []spoolEntry, persistFailed bool) {
+	return s.removeMatchingAfter(nil, matches, currentExpEpoch)
+}
+
+// removeMatchingAfter is removeMatching with first, when non-nil, run under
+// the spool lock before the scan, in the same hold: what first publishes is
+// ordered against every pull and append (withdrawExperimentKeyFactsUnderLock).
+func (s *diskSpool) removeMatchingAfter(first func(), matches func(raw json.RawMessage) bool, currentExpEpoch uint64) (removed []spoolEntry, persistFailed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if first != nil {
+		first()
+	}
 	if len(s.entries) == 0 {
 		return nil, false
 	}
@@ -2239,6 +2264,17 @@ func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned b
 			c.logf("shardpilot experiments: withheld %d withdrawn experiment fact(s) from a post-sentinel respool", removed)
 		}
 	}
+	keyEpoch := c.expKeyWithdrawEpoch.Load()
+	if c.exp != nil {
+		// The same for an age refusal that landed while this batch was
+		// built or in transport: the facts it withdrew are not written back
+		// (each member's own build stamp decides). Not counted here either:
+		// the worker's batch filter counts them at its next dispatch point.
+		if filtered, removed := c.filterKeyWithdrawnFromBatchRequest(request); removed > 0 {
+			request = filtered
+			c.logf("shardpilot experiments: withheld %d experiment fact(s) an age refusal withdrew from a respool", removed)
+		}
+	}
 	eligible, refusedActors := c.partitionSpoolEligible(request)
 	c.notifySpoolDeadLetter(SpoolDropConsent, refusedActors)
 	if len(eligible) == 0 {
@@ -2255,12 +2291,40 @@ func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned b
 	// endpoint — so the abandonment rule extends to persisted pacing state
 	// and the window survives untouched.
 	clearStale := cause != nil && deadlineMS <= 0 && !abandoned
-	refused, added, expired, evicted, persistFailed := s.append(eligible, deadlineMS, clearStale, c.clock.Now(), func() bool {
+	if c.respoolAppendSeam != nil {
+		c.respoolAppendSeam(eligible)
+	}
+	var withheldIDs map[string]struct{}
+	var withheld func() map[string]struct{}
+	if c.exp != nil {
+		// An age refusal landing after the filter above publishes its
+		// generation and sweeps the spool in one hold of the spool lock:
+		// either this re-check, run by the append under that lock, sees it
+		// and the withdrawn facts are not inserted, or the sweep runs after
+		// the append and removes them. (expKeyWithdrawMu, taken inside, is
+		// a leaf lock.) Not counted here, as above.
+		withheld = func() map[string]struct{} {
+			if c.expKeyWithdrawEpoch.Load() == keyEpoch {
+				return nil
+			}
+			withheldIDs = make(map[string]struct{})
+			for _, envelope := range request.Events {
+				if c.isKeyWithdrawnEnvelope(envelope) {
+					withheldIDs[envelope.EventID] = struct{}{}
+				}
+			}
+			return withheldIDs
+		}
+	}
+	refused, added, expired, evicted, persistFailed := s.appendExcept(eligible, deadlineMS, clearStale, c.clock.Now(), func() bool {
 		return c.consent.Load() == consentStateGranted && s.grantPersisted
-	})
+	}, withheld)
 	if refused {
 		c.notifySpoolDeadLetter(SpoolDropConsent, eligible)
 		return len(eligible), nil, 0, 0
+	}
+	if len(withheldIDs) > 0 {
+		c.logf("shardpilot experiments: withheld %d experiment fact(s) an age refusal withdrew from a respool", len(withheldIDs))
 	}
 	// An envelope already past the retry-age cap when it fails never lands
 	// on disk: the retention bound is enforced at append, not just at load.
@@ -2293,6 +2357,9 @@ func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned b
 		expiredCopies[entry.id]++
 	}
 	for _, entry := range eligible {
+		if _, skip := withheldIDs[entry.id]; skip {
+			continue
+		}
 		if expiredCopies[entry.id] > 0 {
 			expiredCopies[entry.id]--
 			continue
@@ -2456,6 +2523,9 @@ func (c *Client) resendSpooledChunks(deferUntil *time.Time, backoffAttempt *int)
 		return true
 	}
 	for {
+		// The age-refusal generation before the pull: every member of the
+		// chunk was spooled before it (dropKeyWithdrawnSpoolChunkMembers).
+		pulledAt := c.expKeyWithdrawEpoch.Load()
 		chunk, expired, persistFailed := s.pullResendChunk(c.cfg.BatchSize, c.clock.Now())
 		c.recordSpoolExpired(expired)
 		if persistFailed {
@@ -2473,6 +2543,7 @@ func (c *Client) resendSpooledChunks(deferUntil *time.Time, backoffAttempt *int)
 		// pull and this point condemned members the mirror sweep cannot
 		// reach (see dropWithdrawnSpoolChunkMembers).
 		chunk = c.dropWithdrawnSpoolChunkMembers(chunk)
+		chunk = c.dropKeyWithdrawnSpoolChunkMembers(chunk, pulledAt)
 		if len(chunk) == 0 {
 			continue
 		}
@@ -2543,6 +2614,9 @@ func (c *Client) flushSpooledChunks(ctx context.Context, backoffAttempt *int) er
 	}
 	var firstErr error
 	for {
+		// The age-refusal generation before the pull: every member of the
+		// chunk was spooled before it (dropKeyWithdrawnSpoolChunkMembers).
+		pulledAt := c.expKeyWithdrawEpoch.Load()
 		chunk, expired, persistFailed := s.pullResendChunk(c.cfg.BatchSize, c.clock.Now())
 		c.recordSpoolExpired(expired)
 		if persistFailed {
@@ -2559,6 +2633,7 @@ func (c *Client) flushSpooledChunks(ctx context.Context, backoffAttempt *int) er
 		// sentinel racing the pulled chunk must not publish withdrawn
 		// facts through the explicit flush either.
 		chunk = c.dropWithdrawnSpoolChunkMembers(chunk)
+		chunk = c.dropKeyWithdrawnSpoolChunkMembers(chunk, pulledAt)
 		if len(chunk) == 0 {
 			continue
 		}
@@ -2680,6 +2755,12 @@ func (c *Client) spoolCloseRemnant(batch []Event) (gateRefused int, mirrored []s
 			continue
 		}
 		if c.isWithdrawnExperimentFactEvent(event) {
+			boundaryDropped++
+			continue
+		}
+		if c.isKeyWithdrawnExperimentFactEvent(event) {
+			// A fact an age refusal withdrew (the queue members drained
+			// above never passed the worker's admission).
 			boundaryDropped++
 			continue
 		}
