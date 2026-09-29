@@ -5,7 +5,7 @@ description: Use when integrating the ShardPilot Go SDK (shardpilot-go) into a G
 
 # Integrating the ShardPilot Go SDK
 
-The pinned release tag `v0.7.0-alpha` matches this guide; the owner creates it after the release PR merges, so wait if the install pin is still pending.
+The pinned release tag `v0.7.1-alpha` matches this guide; the owner creates it after the release PR merges, so wait if the install pin is still pending.
 The release retains compression, the 15-second flush default, independent retry pacing, goroutine-label sanitization and rejection history. Opt-in experiment integrations must follow the [migration from v0.6.4-alpha](../../../CHANGELOG.md#migration-from-v064-alpha): apply the variant before recording outcomes, allow asynchronous platform sealing, and declare the game's age band. Read the [experiment contract](../../../README.md#experiments-dark-opt-in) before enabling it; the default remains off.
 
 **SCOPE: the DEFAULT configuration.** `v0.6.0-alpha` added three opt-ins that
@@ -55,7 +55,7 @@ other calls, no automatic actions.
 ## Install
 
 ```bash
-go get github.com/shardpilot/shardpilot-go@v0.7.0-alpha
+go get github.com/shardpilot/shardpilot-go@v0.7.1-alpha
 ```
 
 - Requires **Go 1.25+** at the pinned tag.
@@ -603,7 +603,7 @@ Run against your dev/staging deployment credentials, then check each item:
    shutdown, and that `Close` returns `nil` (pending events + consent
    receipts flushed within the deadline).
 
-## Known limitations (verified 2026-09-28 for `v0.7.0-alpha`)
+## Known limitations (verified 2026-09-29 for `v0.7.1-alpha`)
 
 **Same scope as the consent section: these describe the DEFAULT posture,
 with `Config.ConsentFloor` nil.** Several of the consent-related bullets
@@ -611,7 +611,8 @@ below do not hold with the floor enabled — its contract is the
 `Config.ConsentFloor` godoc, not this list.
 
 All nine bullets were rechecked against SDK source at `e94dcf0f` on
-2026-09-28. The new experiment application/age contract is opt-in; the crash
+2026-09-28. The only source change in `v0.7.1-alpha` is the opt-in
+experiment cache restore, which none of them describes. The new experiment application/age contract is opt-in; the crash
 wire now includes fatality and the built-in sampling rate, while its default
 sampling and consent posture below remain unchanged. The consent-policy
 changes and limits are documented separately above. `Config.ConsentFloor`
