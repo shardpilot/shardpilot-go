@@ -567,6 +567,44 @@ func TestAnAgeRefusalWithholdsAPulledSpoolChunk(t *testing.T) {
 	}
 }
 
+// A resend cannot publish a spooled fact the refusal withdraws, however it
+// interleaves with the refusal: its generation is published in the same
+// spool-lock hold as its spool sweep. The seam runs a resend the moment the
+// generation is visible, whenever the spool lock is free for its pull there;
+// when it is held, the resend runs after the sweep.
+func TestAnAgeRefusalPublishesItsGenerationWithItsSpoolSweep(t *testing.T) {
+	rig := newAgeWithdrawRig(t, t.TempDir(), nil, ageGolden(t, "adult"), ageRefusalBody(t, "age_ineligible"))
+	fetchAdultAssignment(t, rig.client, ageGoldenExperiment)
+	rig.applyAndMeasure(t, ageGoldenExperiment)
+	rig.capture.setStatus(http.StatusInternalServerError)
+	rig.client.experimentCycle(context.Background())
+	if err := rig.client.Flush(context.Background()); err == nil {
+		t.Fatalf("setup: the flush must fail against the failing ingest")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = rig.client.Close(ctx)
+	rig.capture.setStatus(http.StatusAccepted)
+	rig.client = rig.launch(t, nil)
+	var fired atomic.Bool
+	var resendErr error
+	rig.client.keyWithdrawPublishedSeam = func() {
+		if !fired.CompareAndSwap(false, true) || !rig.client.spool.mu.TryLock() {
+			return
+		}
+		rig.client.spool.mu.Unlock()
+		resendErr = rig.client.Flush(ctx)
+	}
+	rig.refuse(t, "age_ineligible")
+	if !fired.Load() || resendErr != nil {
+		t.Fatalf("setup: the seam must fire (fired=%v resend err=%v)", fired.Load(), resendErr)
+	}
+	flushOrFail(t, rig.client)
+	if delivered := deliveredExperimentFacts(rig.capture, ageGoldenExperiment); len(delivered) != 0 {
+		t.Errorf("a resend published %d spooled fact(s) of the refused experiment", len(delivered))
+	}
+}
+
 // A fact on the wire when the refusal lands is wire-ambiguous: if that send
 // fails it is neither respooled nor re-sent; if it succeeds it was
 // delivered. Either way it is not counted as a withdrawn application.

@@ -1222,30 +1222,40 @@ func filterWithdrawnFromBatchRequest(request batchRequest) (batchRequest, int) {
 // — under a new generation, then removes the matching facts from the disk
 // spool, dead-lettering them (SpoolDropTerminal). Called UNDER e.mu (via
 // ageWithdrawFactsFn): everything the spool holds then was built before the
-// refusal, so the sweep needs no stamp. Lock discipline as
-// sentinelSpoolPurgeUnderLock: leaf locks only, dead-letters deferred.
+// refusal, so the sweep needs no stamp. The generation is published in the
+// same spool-lock hold as the sweep, so a resend pull either precedes both
+// (its generation is stale: the chunk handoff withholds the entry) or
+// follows the sweep, and a respool append likewise (spoolFailedBatch).
+// Lock discipline as sentinelSpoolPurgeUnderLock: leaf locks only (spool
+// lock → expKeyWithdrawMu), dead-letters deferred.
 func (c *Client) withdrawExperimentKeyFactsUnderLock(experimentKey string, factKeys []string) {
-	c.expKeyWithdrawMu.Lock()
-	epoch := c.expKeyWithdrawEpoch.Load() + 1
-	if c.expKeyWithdrawals == nil {
-		c.expKeyWithdrawals = make(map[string]map[string]uint64)
+	publish := func() {
+		c.expKeyWithdrawMu.Lock()
+		epoch := c.expKeyWithdrawEpoch.Load() + 1
+		if c.expKeyWithdrawals == nil {
+			c.expKeyWithdrawals = make(map[string]map[string]uint64)
+		}
+		byFactKey := c.expKeyWithdrawals[experimentKey]
+		if byFactKey == nil {
+			byFactKey = make(map[string]uint64)
+			c.expKeyWithdrawals[experimentKey] = byFactKey
+		}
+		for _, factKey := range factKeys {
+			byFactKey[factKey] = epoch
+		}
+		// Published after the record: a consumer that sees the new
+		// generation finds its withdrawal.
+		c.expKeyWithdrawEpoch.Store(epoch)
+		c.expKeyWithdrawMu.Unlock()
+		if c.keyWithdrawPublishedSeam != nil {
+			c.keyWithdrawPublishedSeam()
+		}
 	}
-	byFactKey := c.expKeyWithdrawals[experimentKey]
-	if byFactKey == nil {
-		byFactKey = make(map[string]uint64)
-		c.expKeyWithdrawals[experimentKey] = byFactKey
-	}
-	for _, factKey := range factKeys {
-		byFactKey[factKey] = epoch
-	}
-	// Published after the record: a consumer that sees the new generation
-	// finds its withdrawal.
-	c.expKeyWithdrawEpoch.Store(epoch)
-	c.expKeyWithdrawMu.Unlock()
 	if c.spool == nil {
+		publish()
 		return
 	}
-	removed, persistFailed := c.spool.removeMatching(func(raw json.RawMessage) bool {
+	removed, persistFailed := c.spool.removeMatchingAfter(publish, func(raw json.RawMessage) bool {
 		return experimentKeyFactRawMatches(raw, experimentKey, factKeys)
 	}, 0)
 	if persistFailed {
@@ -1463,7 +1473,9 @@ func (c *Client) filterKeyWithdrawnFromBatchRequest(request batchRequest) (batch
 // that landed after the pull (pulledAt, the generation read before it)
 // withdraws the members it matches. The refusal's own spool sweep has
 // removed them from the mirror (and dead-lettered them); this only keeps
-// their bytes off the wire, as dropWithdrawnSpoolChunkMembers does.
+// their bytes off the wire, as dropWithdrawnSpoolChunkMembers does. A
+// refusal whose generation the pull already read had swept before the pull
+// (one spool-lock hold), so an unchanged generation needs no filter.
 func (c *Client) dropKeyWithdrawnSpoolChunkMembers(chunk []spoolEntry, pulledAt uint64) []spoolEntry {
 	if pulledAt == c.expKeyWithdrawEpoch.Load() {
 		return chunk

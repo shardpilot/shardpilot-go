@@ -317,6 +317,12 @@ type Client struct {
 	// between the two. Test seam; nil in production.
 	respoolAppendSeam func(eligible []spoolEntry)
 
+	// keyWithdrawPublishedSeam, when non-nil, is invoked right after an age
+	// refusal publishes its withdrawal generation, before its spool sweep
+	// removes anything (withdrawExperimentKeyFactsUnderLock). Test seam;
+	// nil in production.
+	keyWithdrawPublishedSeam func()
+
 	// initialDeferUntil seeds the flush worker's retry-pacing deadline from
 	// the spool's persisted retry_after_until_ms, so server backpressure
 	// captured before a restart still holds automatic publishes for the

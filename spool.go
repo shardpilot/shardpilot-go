@@ -1748,8 +1748,18 @@ func (s *diskSpool) ack(ids []string) (removed []spoolEntry, persistFailed bool)
 // entries lands. A failed persist is reported the same way ack reports one
 // — the mirror is authoritative and the next save retries.
 func (s *diskSpool) removeMatching(matches func(raw json.RawMessage) bool, currentExpEpoch uint64) (removed []spoolEntry, persistFailed bool) {
+	return s.removeMatchingAfter(nil, matches, currentExpEpoch)
+}
+
+// removeMatchingAfter is removeMatching with first, when non-nil, run under
+// the spool lock before the scan, in the same hold: what first publishes is
+// ordered against every pull and append (withdrawExperimentKeyFactsUnderLock).
+func (s *diskSpool) removeMatchingAfter(first func(), matches func(raw json.RawMessage) bool, currentExpEpoch uint64) (removed []spoolEntry, persistFailed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if first != nil {
+		first()
+	}
 	if len(s.entries) == 0 {
 		return nil, false
 	}
@@ -2288,11 +2298,11 @@ func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned b
 	var withheld func() map[string]struct{}
 	if c.exp != nil {
 		// An age refusal landing after the filter above publishes its
-		// generation before its spool sweep takes the spool lock: either
-		// this re-check, run by the append under that lock, sees it and the
-		// withdrawn facts are not inserted, or the sweep runs after the
-		// append and removes them. (expKeyWithdrawMu, taken inside, is a
-		// leaf lock.) Not counted here, as above.
+		// generation and sweeps the spool in one hold of the spool lock:
+		// either this re-check, run by the append under that lock, sees it
+		// and the withdrawn facts are not inserted, or the sweep runs after
+		// the append and removes them. (expKeyWithdrawMu, taken inside, is
+		// a leaf lock.) Not counted here, as above.
 		withheld = func() map[string]struct{} {
 			if c.expKeyWithdrawEpoch.Load() == keyEpoch {
 				return nil
