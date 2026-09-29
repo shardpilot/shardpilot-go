@@ -1352,7 +1352,9 @@ func TestRestoreFromDiskServesAndRecordsOnlyWhenApplied(t *testing.T) {
 	spoolDir := t.TempDir()
 
 	client1 := newExperimentClient(t, server.URL, func(cfg *Config) { cfg.SpoolDir = spoolDir })
-	fetchAndApply(t, client1, expTestScopeKey)
+	fetchAdultAssignment(t, client1, expTestScopeKey)
+	client1.ApplyExperimentVariant(expTestScopeKey)
+	client1.experimentCycle(context.Background())
 	if err := client1.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}

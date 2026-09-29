@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- A client-id experiment assignment cached without an age declaration is no longer restored after a restart. This includes every assignment `v0.6.x` persisted. It serves nothing, and records no exposure, until the next fetch, which carries the current declaration, decides it. Before, such an assignment was served until its first revalidation, about 300 s later, which the platform now refuses with `age_ineligible`. Assignments cached with a declaration, and synthetic-subject assignments, restore as before. ([#141](https://github.com/shardpilot/shardpilot-go/issues/141))
+
 ## v0.7.0-alpha — 2026-09-28
 
 **BREAKING:** experiment fetches and getters no longer record an exposure. Apply the variant when the application uses it, then record outcomes against that application. Exposure and outcome facts are sealed by the platform and delivered asynchronously.

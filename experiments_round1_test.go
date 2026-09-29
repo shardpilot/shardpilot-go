@@ -37,7 +37,7 @@ func TestSubjectFactKeyGrammarGuardsTheFactLane(t *testing.T) {
 	defer server.Close()
 	spoolDir := t.TempDir()
 	client1 := newExperimentClient(t, server.URL, func(cfg *Config) { cfg.SpoolDir = spoolDir })
-	fetchAssignment(t, client1, expTestScopeKey)
+	fetchAdultAssignment(t, client1, expTestScopeKey)
 	if err := client1.Close(context.Background()); err != nil {
 		t.Fatalf("close: %v", err)
 	}
@@ -256,7 +256,7 @@ func TestRestoredAttributesAreRenormalized(t *testing.T) {
 	defer server.Close()
 	spoolDir := t.TempDir()
 	client1 := newExperimentClient(t, server.URL, func(cfg *Config) { cfg.SpoolDir = spoolDir })
-	if _, err := client1.FetchExperimentAssignment(context.Background(), expTestScopeKey, map[string]string{"geo": "DE"}); err != nil {
+	if _, err := client1.FetchExperimentAssignmentWithAgeBand(context.Background(), expTestScopeKey, ExperimentAgeBandAdult, map[string]string{"geo": "DE"}); err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
 	if err := client1.Close(context.Background()); err != nil {
@@ -274,6 +274,7 @@ func TestRestoredAttributesAreRenormalized(t *testing.T) {
 	}
 	entry := record.Entries[expTestScopeKey]
 	entry.Attributes = []expAttribute{
+		{Name: "age_band", Value: "adult"},
 		{Name: "geo", Value: "DE"},
 		{Name: "not_in_vocabulary", Value: "x"},
 		{Name: "app_version", Value: strings.Repeat("v", 600)},

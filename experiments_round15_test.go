@@ -341,6 +341,7 @@ func TestPreloadEstablishesSpoolDirPrivacy(t *testing.T) {
 					AssignmentUnit: experimentAssignmentUnitClientID,
 					SubjectFactKey: "sfk1_" + strings.Repeat("a", 64),
 					SubjectKey:     subject,
+					Attributes:     []expAttribute{{Name: "age_band", Value: "adult"}},
 					FetchedAtMS:    time.Now().UnixMilli(),
 				},
 			},
