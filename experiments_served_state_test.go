@@ -102,7 +102,7 @@ func TestAFetchedServedStateSurvivesARestart(t *testing.T) {
 	defer server.Close()
 	dir := t.TempDir()
 	first := newExperimentClient(t, server.URL, func(cfg *Config) { cfg.SpoolDir = dir })
-	fetchAssignment(t, first, expTestScopeKey)
+	fetchAdultAssignment(t, first, expTestScopeKey)
 	want := expServedState{Revision: 7, KillGate: true, At: "2026-09-27T01:00:00.123456789Z"}
 	first.exp.mu.Lock()
 	pinned := first.exp.entries[expTestScopeKey]

@@ -1431,8 +1431,31 @@ func (e *experimentsState) preload() (privacyRefused bool) {
 	// host's application of the variant (ApplyExperimentVariant), and this
 	// session has applied nothing yet.
 	for key, stored := range record.Entries {
+		if stored.AssignmentUnit == experimentAssignmentUnitClientID &&
+			!hasExperimentAgeDeclaration(stored.Attributes) {
+			// A client-id assignment stored without an age declaration (a
+			// release that had none, or a fetch that declared none) is not
+			// served: client-id admission requires one. The experiment has
+			// no assignment until the next fetch, which carries the host's
+			// current declaration and replaces this durable entry.
+			// Synthetic-subject assignments have no age gate and restore.
+			continue
+		}
 		entry := stored
 		e.entries[key] = &entry
+	}
+	return false
+}
+
+// hasExperimentAgeDeclaration reports whether stored assignment attributes
+// carry an age declaration under either spelling, whatever its value: the
+// server decided admission on that declaration when it stored the entry.
+func hasExperimentAgeDeclaration(attributes []expAttribute) bool {
+	for _, attribute := range attributes {
+		switch attribute.Name {
+		case "age_band", "custom_attribute_age_band":
+			return true
+		}
 	}
 	return false
 }
