@@ -352,6 +352,87 @@ func TestAnAgeRefusalMatchesTheSubjectFactKey(t *testing.T) {
 	}
 }
 
+// ageRefusalBodyWithoutFactKey is the captured age refusal with its
+// subject_fact_key member removed.
+func ageRefusalBodyWithoutFactKey(t *testing.T) string {
+	t.Helper()
+	body := ageRefusalBody(t, "age_ineligible")
+	stripped := strings.Replace(body, `"subject_fact_key":"`+ageGoldenFactKey(t)+`",`, "", 1)
+	if strings.Contains(stripped, `"subject_fact_key":`) {
+		t.Fatalf("setup: the refusal golden must lose its subject_fact_key member")
+	}
+	return stripped
+}
+
+// A refusal that names no subject fact key, for a subject that has no local
+// record to supply one, withdraws nothing from the pipeline: there, the
+// refused subject's facts cannot be told apart from another subject's facts
+// of the same experiment. The other subject is the one before a subject
+// re-mint: its application and outcome are sealed and accepted (held by the
+// worker, or spooled by a failed publish), then the platform rejects the
+// persisted subject id's grammar, the SDK re-mints (the previous subject's
+// facts are deliberately kept) and retries, and the retry is refused as
+// age_ineligible without a subject_fact_key. The new subject has no
+// assignment, owed application or last application to take a key from.
+// The previous subject's facts stay in the pipeline and are delivered.
+func TestAnAgeRefusalWithoutAFactKeyLeavesAnotherSubjectsFacts(t *testing.T) {
+	for _, staging := range []string{"held_by_the_worker", "spooled"} {
+		t.Run(staging, func(t *testing.T) {
+			ctx := context.Background()
+			rig := newAgeWithdrawRig(t, t.TempDir(), nil, ageGolden(t, "adult"))
+			rig.script.push(http.StatusBadRequest, `{"error":"experiment metadata must use synthetic local-safe identifiers only"}`)
+			rig.script.push(http.StatusOK, ageRefusalBodyWithoutFactKey(t))
+			fetchAdultAssignment(t, rig.client, ageGoldenExperiment)
+			rig.applyAndMeasure(t, ageGoldenExperiment)
+			if staging == "spooled" {
+				rig.capture.setStatus(http.StatusInternalServerError)
+			}
+			rig.client.experimentCycle(ctx)
+			if staging == "spooled" {
+				if err := rig.client.Flush(ctx); err == nil {
+					t.Fatalf("setup: the flush must fail against the failing ingest")
+				}
+				if spooled := spooledExperimentFacts(rig.client, ageGoldenExperiment); spooled != 2 {
+					t.Fatalf("setup: %d fact(s) spooled by the failed publish, want 2", spooled)
+				}
+			} else {
+				waitFor(t, 5*time.Second, "the worker holds the sealed facts", func() bool { return len(rig.client.queue.ch) == 0 })
+			}
+			subject := func() string {
+				rig.client.exp.mu.Lock()
+				defer rig.client.exp.mu.Unlock()
+				return rig.client.exp.currentSubjectIDLocked()
+			}
+			previousSubject := subject()
+
+			result, err := rig.client.FetchExperimentAssignmentWithAgeBand(ctx, ageGoldenExperiment, ExperimentAgeBandUnderThreshold, nil)
+			if err != nil || result.Assigned || result.Reason != "age_ineligible" {
+				t.Fatalf("setup: the re-minted retry must be refused as age_ineligible, got %+v err=%v", result, err)
+			}
+			if fetches := rig.script.requestCount(); fetches != 3 || subject() == previousSubject {
+				t.Fatalf("setup: the grammar reject must re-mint the subject and retry (%d fetches)", fetches)
+			}
+
+			if staging == "spooled" {
+				if spooled := spooledExperimentFacts(rig.client, ageGoldenExperiment); spooled != 2 {
+					t.Errorf("a refusal without a subject fact key withdrew %d of the previous subject's 2 spooled fact(s)", 2-spooled)
+				}
+				rig.capture.setStatus(http.StatusAccepted)
+			}
+			flushOrFail(t, rig.client)
+			delivered := deliveredExperimentFacts(rig.capture, ageGoldenExperiment)
+			if len(delivered) != 2 {
+				t.Errorf("the previous subject's facts must still be delivered: %d of 2 delivered", len(delivered))
+			}
+			for _, envelope := range delivered {
+				if props, _ := envelope["props"].(map[string]any); props["assignment_key"] != ageGoldenFactKey(t) {
+					t.Errorf("a delivered fact is not the previous subject's: assignment_key %v", props["assignment_key"])
+				}
+			}
+		})
+	}
+}
+
 // The facts owed or queued before the refusal leave no durable copy: the
 // refusal writes none, a copy spooled before it is withdrawn from the
 // spool, and a relaunch on the same spool delivers nothing of them. Under a
@@ -564,6 +645,42 @@ func TestAnAgeRefusalNeverResendsAFactInFlight(t *testing.T) {
 	}
 }
 
+// A refusal landing after a failed batch's respool filter and before its
+// spool append is caught by the append's own re-check, under the spool
+// lock: the withdrawn facts never reach disk, and a relaunch replays none.
+func TestAnAgeRefusalBeforeTheRespoolAppendLeavesNoDurableCopy(t *testing.T) {
+	rig := newAgeWithdrawRig(t, t.TempDir(), nil, ageGolden(t, "adult"), ageRefusalBody(t, "age_ineligible"))
+	fetchAdultAssignment(t, rig.client, ageGoldenExperiment)
+	rig.applyAndMeasure(t, ageGoldenExperiment)
+	rig.client.experimentCycle(context.Background())
+	var fired atomic.Bool
+	var refusalErr error
+	rig.client.respoolAppendSeam = func(eligible []spoolEntry) {
+		if len(eligible) == 0 || !fired.CompareAndSwap(false, true) {
+			return
+		}
+		_, refusalErr = rig.client.FetchExperimentAssignmentWithAgeBand(context.Background(), ageGoldenExperiment, ExperimentAgeBandUnderThreshold, nil)
+	}
+	rig.capture.setStatus(http.StatusInternalServerError)
+	if err := rig.client.Flush(context.Background()); err == nil {
+		t.Fatalf("setup: the flush must fail against the failing ingest")
+	}
+	if !fired.Load() || refusalErr != nil {
+		t.Fatalf("setup: the refusal must land before the respool append (fired=%v err=%v)", fired.Load(), refusalErr)
+	}
+	if spooled := spooledExperimentFacts(rig.client, ageGoldenExperiment); spooled != 0 {
+		t.Errorf("the respool appended %d fact(s) the refusal withdrew", spooled)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = rig.client.Close(ctx)
+	cancel()
+	rig.capture.setStatus(http.StatusAccepted)
+	flushOrFail(t, rig.launch(t, nil))
+	if delivered := deliveredExperimentFacts(rig.capture, ageGoldenExperiment); len(delivered) != 0 {
+		t.Errorf("the relaunch replayed %d fact(s) of the refused experiment", len(delivered))
+	}
+}
+
 // Queued facts the worker has not taken yet die at its receive.
 func TestAnAgeRefusalWithdrawsQueuedFacts(t *testing.T) {
 	rig := newAgeWithdrawRig(t, "", func(cfg *Config) { cfg.BatchSize, cfg.BufferSize = 1, 8 }, ageGolden(t, "adult"), ageRefusalBody(t, "age_ineligible"))
@@ -738,6 +855,76 @@ func assertApplyRouteAgeWithdrawal(t *testing.T, rig *ageWithdrawRig, spool stri
 	}
 	if durableRecordHolds(t, spool, ageGoldenExperiment) {
 		t.Errorf("the refused assignment is still in the durable record")
+	}
+}
+
+// The apply route's refusal withdraws spooled facts while the exposure sweep
+// holds its emission lock. Their dead-letters dispatch once the sweep has
+// released that lock, in the same sweep call: an OnSpoolDeadLetter callback
+// that re-enters the SDK with a fetch, whose install sweeps the experiment
+// again, completes instead of blocking forever on the lock.
+func TestAnApplyRouteAgeRefusalDeadLettersOutsideTheSweep(t *testing.T) {
+	ctx := context.Background()
+	var client atomic.Pointer[Client]
+	var deadLettered atomic.Int64
+	var once sync.Once
+	reentered := make(chan error, 1)
+	rig := newAgeWithdrawRig(t, t.TempDir(), func(cfg *Config) {
+		cfg.OnSpoolDeadLetter = func(letter SpoolDeadLetter) {
+			if letter.Reason != SpoolDropTerminal {
+				return
+			}
+			deadLettered.Add(int64(len(letter.Envelopes)))
+			once.Do(func() {
+				// The integrator fetches the experiment again: an adult
+				// assignment installs, and the install sweeps.
+				result, err := client.Load().FetchExperimentAssignmentWithAgeBand(ctx, ageGoldenExperiment, ExperimentAgeBandAdult, nil)
+				if err == nil && !result.Assigned {
+					err = errors.New("nothing installed")
+				}
+				reentered <- err
+			})
+		}
+	}, ageGolden(t, "adult"), ageGolden(t, "adult"))
+	client.Store(rig.client)
+	fetchAdultAssignment(t, rig.client, ageGoldenExperiment)
+	rig.applyAndMeasure(t, ageGoldenExperiment)
+	// The application and the outcome are sealed, and spooled by a failed
+	// publish.
+	rig.capture.setStatus(http.StatusInternalServerError)
+	rig.client.experimentCycle(ctx)
+	if err := rig.client.Flush(ctx); err == nil {
+		t.Fatalf("setup: the flush must fail against the failing ingest")
+	}
+	if spooled := spooledExperimentFacts(rig.client, ageGoldenExperiment); spooled != 2 {
+		t.Fatalf("setup: %d fact(s) spooled by the failed publish, want 2", spooled)
+	}
+	// One more application, which the exposure apply route refuses.
+	if err := rig.client.TrackExperimentExposure(ageGoldenExperiment); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	rig.script.apply.push(http.StatusConflict, ageApplyRefusal)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		rig.client.experimentCycle(ctx)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("the lane's cycle did not return within 5s: the dead-letter callback re-entered a sweep while the refused application's sweep still held the emission lock")
+	}
+	select {
+	case err := <-reentered:
+		if err != nil {
+			t.Errorf("the re-entered fetch must install the new assignment: %v", err)
+		}
+	default:
+		t.Errorf("the withdrawn spooled facts were not dead-lettered during the sweep call")
+	}
+	if letters := deadLettered.Load(); letters != 2 {
+		t.Errorf("the refusal must dead-letter the 2 withdrawn spooled facts, got %d", letters)
 	}
 }
 

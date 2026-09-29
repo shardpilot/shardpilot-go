@@ -1523,10 +1523,22 @@ func (s *diskSpool) evictOverCapsLocked() []spoolEntry {
 // start. An append that changes nothing (everything expired or duplicate, no
 // deadline change) skips the rewrite entirely.
 func (s *diskSpool) append(batch []spoolEntry, deadlineMS int64, clearStaleDeadline bool, now time.Time, allowed func() bool) (refused bool, added, expired, evicted []spoolEntry, persistFailed bool) {
+	return s.appendExcept(batch, deadlineMS, clearStaleDeadline, now, allowed, nil)
+}
+
+// appendExcept is append with a last exclusion made under the spool lock:
+// withheld, when non-nil, runs after allowed admits the append, and the
+// entries whose ids it returns are neither inserted nor reported expired
+// (see spoolFailedBatch).
+func (s *diskSpool) appendExcept(batch []spoolEntry, deadlineMS int64, clearStaleDeadline bool, now time.Time, allowed func() bool, withheld func() map[string]struct{}) (refused bool, added, expired, evicted []spoolEntry, persistFailed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.owed || !allowed() {
 		return true, nil, nil, nil, false
+	}
+	var excluded map[string]struct{}
+	if withheld != nil {
+		excluded = withheld()
 	}
 	appended := make(map[string]struct{}, len(batch))
 	// ⚠ THE ENTRIES ACTUALLY INSERTED, NOT THE BATCH THEY CAME FROM. Rebuilding
@@ -1538,6 +1550,9 @@ func (s *diskSpool) append(batch []spoolEntry, deadlineMS int64, clearStaleDeadl
 	inserted := make([]spoolEntry, 0, len(batch))
 	for _, entry := range batch {
 		if entry.id == "" {
+			continue
+		}
+		if _, skip := excluded[entry.id]; skip {
 			continue
 		}
 		if spoolEntryExpired(entry, now) {
@@ -2239,6 +2254,7 @@ func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned b
 			c.logf("shardpilot experiments: withheld %d withdrawn experiment fact(s) from a post-sentinel respool", removed)
 		}
 	}
+	keyEpoch := c.expKeyWithdrawEpoch.Load()
 	if c.exp != nil {
 		// The same for an age refusal that landed while this batch was
 		// built or in transport: the facts it withdrew are not written back
@@ -2265,12 +2281,40 @@ func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned b
 	// endpoint — so the abandonment rule extends to persisted pacing state
 	// and the window survives untouched.
 	clearStale := cause != nil && deadlineMS <= 0 && !abandoned
-	refused, added, expired, evicted, persistFailed := s.append(eligible, deadlineMS, clearStale, c.clock.Now(), func() bool {
+	if c.respoolAppendSeam != nil {
+		c.respoolAppendSeam(eligible)
+	}
+	var withheldIDs map[string]struct{}
+	var withheld func() map[string]struct{}
+	if c.exp != nil {
+		// An age refusal landing after the filter above publishes its
+		// generation before its spool sweep takes the spool lock: either
+		// this re-check, run by the append under that lock, sees it and the
+		// withdrawn facts are not inserted, or the sweep runs after the
+		// append and removes them. (expKeyWithdrawMu, taken inside, is a
+		// leaf lock.) Not counted here, as above.
+		withheld = func() map[string]struct{} {
+			if c.expKeyWithdrawEpoch.Load() == keyEpoch {
+				return nil
+			}
+			withheldIDs = make(map[string]struct{})
+			for _, envelope := range request.Events {
+				if c.isKeyWithdrawnEnvelope(envelope) {
+					withheldIDs[envelope.EventID] = struct{}{}
+				}
+			}
+			return withheldIDs
+		}
+	}
+	refused, added, expired, evicted, persistFailed := s.appendExcept(eligible, deadlineMS, clearStale, c.clock.Now(), func() bool {
 		return c.consent.Load() == consentStateGranted && s.grantPersisted
-	})
+	}, withheld)
 	if refused {
 		c.notifySpoolDeadLetter(SpoolDropConsent, eligible)
 		return len(eligible), nil, 0, 0
+	}
+	if len(withheldIDs) > 0 {
+		c.logf("shardpilot experiments: withheld %d experiment fact(s) an age refusal withdrew from a respool", len(withheldIDs))
 	}
 	// An envelope already past the retry-age cap when it fails never lands
 	// on disk: the retention bound is enforced at append, not just at load.
@@ -2303,6 +2347,9 @@ func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned b
 		expiredCopies[entry.id]++
 	}
 	for _, entry := range eligible {
+		if _, skip := withheldIDs[entry.id]; skip {
+			continue
+		}
 		if expiredCopies[entry.id] > 0 {
 			expiredCopies[entry.id]--
 			continue

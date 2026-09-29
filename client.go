@@ -137,9 +137,9 @@ type Client struct {
 	// expKeyWithdrawEpoch counts per-experiment fact withdrawals (an
 	// age_ineligible refusal withdraws ONE experiment's facts for the
 	// refused subject; see withdrawExperimentKeyFactsUnderLock), and
-	// expKeyWithdrawals records them: experiment key → subject fact key
-	// ("" = any) → the epoch of the latest withdrawal. A fact is withdrawn
-	// when its build stamp (Event.expKeyWithdrawEpoch) predates a matching
+	// expKeyWithdrawals records them: experiment key → subject fact key →
+	// the epoch of the latest withdrawal. A fact is withdrawn when its
+	// build stamp (Event.expKeyWithdrawEpoch) predates a matching
 	// withdrawal. expKeyWithdrawMu guards the map and orders the epoch's
 	// publication after it; it is a leaf lock. workerSeenKeyWithdraw is the
 	// worker-goroutine-owned seen mark, like workerSeenExpFactPurge.
@@ -310,6 +310,12 @@ type Client struct {
 	// transport/spool handoff of the built bytes, on the dispatch and flush
 	// paths alike. Test seam; nil in production.
 	builtBatchHandoffSeam func(batch []Event)
+
+	// respoolAppendSeam, when non-nil, is invoked with a failed batch's
+	// spool-eligible entries after the respool's age-refusal filter and
+	// BEFORE the spool append — the window where an age refusal can land
+	// between the two. Test seam; nil in production.
+	respoolAppendSeam func(eligible []spoolEntry)
 
 	// initialDeferUntil seeds the flush worker's retry-pacing deadline from
 	// the spool's persisted retry_after_until_ms, so server backpressure

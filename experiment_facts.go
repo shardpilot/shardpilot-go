@@ -360,7 +360,8 @@ func (c *Client) sealExperimentApplication(ctx context.Context, experimentKey st
 			persistFailed = e.applyAgeRefusedApplicationLocked(experimentKey, owed.entry, nowMS)
 		}
 		e.mu.Unlock()
-		c.drainDeferredSpoolLetters()
+		// (Its spool sweep's dead-letters stay deferred: this runs under
+		// emitMu, and the sweep dispatches them once it is released.)
 		if persistFailed {
 			c.stats.setLastError("experiment_cache_persist_failed")
 		}
@@ -579,7 +580,13 @@ func (c *Client) sweepExperimentExposuresMode(ctx context.Context, experimentKey
 func (c *Client) sweepExperimentExposuresBudget(ctx context.Context, experimentKey string, atClose, network bool, budget *int) {
 	e := c.exp
 	e.emitMu.Lock()
-	defer e.emitMu.Unlock()
+	defer func() {
+		e.emitMu.Unlock()
+		// Dead-letters an apply route's age refusal deferred during this
+		// sweep dispatch here, with no lock held: the integrator callback
+		// may re-enter an operation that sweeps, and so takes emitMu.
+		c.drainDeferredSpoolLetters()
+	}()
 	for {
 		e.mu.Lock()
 		list := e.pendingExposure[experimentKey]
@@ -1188,11 +1195,12 @@ func filterWithdrawnFromBatchRequest(request batchRequest) (batchRequest, int) {
 //
 // An age_ineligible refusal withdraws the refused subject's facts of ONE
 // experiment (withdrawOwedApplicationsLocked decides which: the experiment
-// key and, when known, the subject fact keys). Unlike the real-subjects
-// sentinel it is never plane-wide, so it has its own generation counter
-// (Client.expKeyWithdrawEpoch) and a record of what each generation
-// withdrew (Client.expKeyWithdrawals); a fact is withdrawn when its build
-// stamp (Event.expKeyWithdrawEpoch) predates a withdrawal that matches it.
+// key and the subject fact keys; with no key known, nothing leaves the
+// pipeline). Unlike the real-subjects sentinel it is never plane-wide, so
+// it has its own generation counter (Client.expKeyWithdrawEpoch) and a
+// record of what each generation withdrew (Client.expKeyWithdrawals); a
+// fact is withdrawn when its build stamp (Event.expKeyWithdrawEpoch)
+// predates a withdrawal that matches it.
 // The legs mirror the sentinel's:
 //   - the disk spool is swept at once, under e.mu, before the refusal's
 //     durable record delete (withdrawExperimentKeyFactsUnderLock);
@@ -1210,8 +1218,8 @@ func filterWithdrawnFromBatchRequest(request batchRequest) (batchRequest, int) {
 // that send fails it is never re-sent or respooled.
 
 // withdrawExperimentKeyFactsUnderLock records one age refusal's withdrawal
-// — the experiment and the subject fact keys ("any" when none is known) —
-// under a new generation, then removes the matching facts from the disk
+// — the experiment and the subject fact keys; an empty set matches no fact
+// — under a new generation, then removes the matching facts from the disk
 // spool, dead-lettering them (SpoolDropTerminal). Called UNDER e.mu (via
 // ageWithdrawFactsFn): everything the spool holds then was built before the
 // refusal, so the sweep needs no stamp. Lock discipline as
@@ -1226,9 +1234,6 @@ func (c *Client) withdrawExperimentKeyFactsUnderLock(experimentKey string, factK
 	if byFactKey == nil {
 		byFactKey = make(map[string]uint64)
 		c.expKeyWithdrawals[experimentKey] = byFactKey
-	}
-	if len(factKeys) == 0 {
-		byFactKey[""] = epoch
 	}
 	for _, factKey := range factKeys {
 		byFactKey[factKey] = epoch
@@ -1250,17 +1255,15 @@ func (c *Client) withdrawExperimentKeyFactsUnderLock(experimentKey string, factK
 }
 
 // experimentKeyFactMatches is the withdrawal's shape: an exposure or outcome
-// fact of the experiment whose assignment_key is one of factKeys (any, when
-// none is given).
+// fact of the experiment whose assignment_key is one of factKeys. An empty
+// set matches nothing: without a subject fact key, the refused subject's
+// facts cannot be told apart from another subject's.
 func experimentKeyFactMatches(eventName, factExperimentKey, assignmentKey, experimentKey string, factKeys []string) bool {
 	if eventName != experimentExposureName && eventName != experimentOutcomeName {
 		return false
 	}
 	if factExperimentKey == "" || factExperimentKey != experimentKey {
 		return false
-	}
-	if len(factKeys) == 0 {
-		return true
 	}
 	for _, factKey := range factKeys {
 		if assignmentKey == factKey {
@@ -1300,14 +1303,10 @@ func (c *Client) experimentFactKeyWithdrawn(eventName, experimentKey, assignment
 	}
 	c.expKeyWithdrawMu.Lock()
 	defer c.expKeyWithdrawMu.Unlock()
-	byFactKey := c.expKeyWithdrawals[experimentKey]
-	if epoch, ok := byFactKey[""]; ok && stamp < epoch {
-		return true
-	}
 	if assignmentKey == "" {
 		return false
 	}
-	epoch, ok := byFactKey[assignmentKey]
+	epoch, ok := c.expKeyWithdrawals[experimentKey][assignmentKey]
 	return ok && stamp < epoch
 }
 

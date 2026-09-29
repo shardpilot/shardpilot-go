@@ -2458,9 +2458,11 @@ func (e *experimentsState) applyAgeRefusedApplicationLocked(experimentKey string
 //     worker's batches by their build stamp. A fact already handed to the
 //     transport is wire-ambiguous: it is never re-sent, and not counted.
 //
-// The subject's facts are matched by the experiment key and, when any is
-// known, by the subject fact keys: factKeys and those of the withdrawn
-// applications' assignments.
+// The frozen capture and the pipeline match the subject's facts by the
+// experiment key and the subject fact keys: factKeys and those of the
+// withdrawn applications' assignments. With no key known those two legs
+// withdraw nothing: another subject's facts of the experiment (an earlier
+// subject's, kept across a re-mint) cannot be told apart there.
 func (e *experimentsState) withdrawOwedApplicationsLocked(scope, subject, experimentKey string, factKeys []string) {
 	known := make(map[string]bool)
 	addFactKey := func(factKey string) {
@@ -2497,6 +2499,9 @@ func (e *experimentsState) withdrawOwedApplicationsLocked(scope, subject, experi
 		if strings.HasPrefix(tuple, tuplePrefix) && strings.HasSuffix(tuple, tupleSuffix) {
 			delete(e.exposed, tuple)
 		}
+	}
+	if len(known) == 0 {
+		return
 	}
 	withdrawnKeys := make([]string, 0, len(known))
 	for factKey := range known {
