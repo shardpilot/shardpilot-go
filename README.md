@@ -27,10 +27,10 @@ Real, tested, working code — **early alpha**. The API is pre-v1 and may change
 Install the latest tagged release:
 
 ```bash
-go get github.com/shardpilot/shardpilot-go@v0.7.0-alpha
+go get github.com/shardpilot/shardpilot-go@v0.7.1-alpha
 ```
 
-`v0.7.0-alpha` is the latest tag. The owner creates it after the release PR merges; until then this pin is pending, so wait if it does not resolve.
+`v0.7.1-alpha` is the latest tag. The owner creates it after the release PR merges; until then this pin is pending, so wait if it does not resolve.
 
 **Breaking changes for experiment integrations:** call `ApplyExperimentVariant` when using a variant, then record outcomes against that application. Facts are sealed and delivered asynchronously. Declare the game's age band explicitly; an omitted or non-adult band is authoritatively ineligible. Follow [Migration from v0.6.4-alpha](CHANGELOG.md#migration-from-v064-alpha).
 
