@@ -668,3 +668,48 @@ func TestTheDeclaringFetchDoesNotServeTheAssignmentItWithdraws(t *testing.T) {
 	}
 	assertExperimentWithdrawn(t, rig, spool, 2, 2)
 }
+
+// No stale re-send through a re-mint: an adult revalidation in flight when
+// the host declares under_threshold, answered with the subject-grammar
+// reject, does not retry with its remembered adult declaration while the
+// declaration is pending.
+func TestARevalidationRemintRetryDoesNotResendAdultWhileADeclarationIsPending(t *testing.T) {
+	spool := t.TempDir()
+	rig := newAgeWithdrawRig(t, spool, nil, ageGolden(t, "adult"))
+	rig.script.push(http.StatusBadRequest, `{"error":"experiment metadata must use synthetic local-safe identifiers only"}`)
+	rig.script.push(http.StatusServiceUnavailable, ageTransientBody)
+	rig.script.push(http.StatusOK, ageGolden(t, "adult"))
+	lane := make(chan struct{})
+	declarationGate := make(chan struct{})
+	rig.script.gates = map[int]chan struct{}{1: lane, 2: declarationGate}
+	clock := &expFakeClock{now: time.Now()}
+	rig.client.clock = clock
+	fetchAdultAssignment(t, rig.client, ageGoldenExperiment)
+
+	clock.advance(10 * time.Minute)
+	cycled := make(chan struct{})
+	go func() {
+		rig.client.experimentCycle(context.Background())
+		close(cycled)
+	}()
+	waitFor(t, 5*time.Second, "the adult revalidation is in flight", func() bool { return rig.script.requestCount() == 2 })
+	declared := make(chan error, 1)
+	go func() {
+		_, err := rig.client.FetchExperimentAssignmentWithAgeBand(context.Background(), ageGoldenExperiment, ExperimentAgeBandUnderThreshold, nil)
+		declared <- err
+	}()
+	waitFor(t, 5*time.Second, "the under_threshold fetch is in flight", func() bool { return rig.script.requestCount() == 3 })
+	close(lane)
+	<-cycled
+	close(declarationGate)
+	if err := <-declared; err == nil {
+		t.Fatalf("setup: the under_threshold fetch must fail across the 503")
+	}
+
+	if adult := declaresAdultAfter(rig.script, 2); len(adult) != 0 {
+		t.Errorf("no stale re-send: request(s) %v declared age_band=adult after the host declared under_threshold", adult)
+	}
+	if variant := rig.client.ExperimentVariant(ageGoldenExperiment); variant != "" {
+		t.Errorf("the experiment is served after the unanswered non-adult declaration: %q", variant)
+	}
+}

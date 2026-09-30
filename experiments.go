@@ -3347,7 +3347,7 @@ func (c *Client) fetchExperimentAssignment(ctx context.Context, experimentKey st
 			c.logf("shardpilot experiments: persisting the minted subject id failed; the id rules this process only (a restart re-buckets)")
 		}
 	}
-	if isRevalidation && presetAttributes == nil && (e.entries[experimentKey] == nil || e.declaring[experimentKey] != nil) {
+	if isRevalidation && ((presetAttributes == nil && e.entries[experimentKey] == nil) || e.declaring[experimentKey] != nil) {
 		// The pre-dispatch existence check and this section run under
 		// separate lock acquisitions: the entry can vanish in the gap (a
 		// concurrent host fetch's drop, a re-mint clearing the cache).
@@ -3359,8 +3359,9 @@ func (c *Client) fetchExperimentAssignment(ctx context.Context, experimentKey st
 		// rides just cleared the whole cache BY DESIGN, and the retry
 		// carries the rejected request's exact attribute set — aborting it
 		// here would kill the lane path's one-shot self-heal. A pending
-		// non-adult declaration stops it the same way: the entry's
-		// remembered attributes declare the earlier age.
+		// non-adult declaration stops every revalidation of the key, that
+		// retry included: the entry's remembered attributes, and the
+		// retry's preset copy of them, declare the earlier age.
 		e.mu.Unlock()
 		return ExperimentAssignmentResult{}, expFetchError("revalidation_entry_vanished")
 	}
