@@ -3196,22 +3196,24 @@ func (c *Client) endNonAdultDeclaration(experimentKey string, declaration *expNo
 		e.mu.Unlock()
 		return
 	}
-	live := e.entries[experimentKey]
-	if live == nil {
-		live = e.latchRetained[experimentKey]
-	}
-	if live != nil && !live.ageGated() {
-		// A synthetic-subject assignment has no age gate: the declaration
-		// leaves it, and what it serves, as they are.
-		e.mu.Unlock()
-		return
-	}
 	scope := e.scopeForLocked(subject)
 	fenceKey := scope + rcScopeSeparator + experimentKey
 	if e.settled[fenceKey] < declaration.fenceSeq {
 		e.settled[fenceKey] = declaration.fenceSeq
 	}
-	persistFailed := e.applyAgeWithdrawalLocked(scope, subject, experimentKey, "", nowMS)
+	live := e.entries[experimentKey]
+	if live == nil {
+		live = e.latchRetained[experimentKey]
+	}
+	persistFailed := false
+	if live != nil && !live.ageGated() {
+		// A synthetic-subject assignment has no age gate: it keeps
+		// serving. The client-id applications the subject still owes for
+		// the experiment from before it are withdrawn all the same.
+		e.withdrawOwedApplicationsLocked(scope, subject, experimentKey, nil)
+	} else {
+		persistFailed = e.applyAgeWithdrawalLocked(scope, subject, experimentKey, "", nowMS)
+	}
 	e.mu.Unlock()
 	// The withdrawal's spool sweep defers its dead-letters under e.mu.
 	c.drainDeferredSpoolLetters()

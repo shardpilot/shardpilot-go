@@ -713,3 +713,93 @@ func TestARevalidationRemintRetryDoesNotResendAdultWhileADeclarationIsPending(t 
 		t.Errorf("the experiment is served after the unanswered non-adult declaration: %q", variant)
 	}
 }
+
+// A synthetic-subject assignment is kept by an unanswered declaration, but
+// the fence still rises: an adult fetch dispatched before the declaration,
+// answered with a client-id assignment after it ended, installs nothing.
+func TestAnUnansweredDeclarationKeepingASyntheticAssignmentStillFencesEarlierFetches(t *testing.T) {
+	script := &expScript{}
+	script.push(http.StatusOK, expSyntheticAssignedBody())
+	script.push(http.StatusOK, strings.Replace(expAssignedBody("2"), `"variant_key":"treatment"`, `"variant_key":"client_id_variant"`, 1))
+	script.push(http.StatusServiceUnavailable, ageTransientBody)
+	adultGate := make(chan struct{})
+	declarationGate := make(chan struct{})
+	script.gates = map[int]chan struct{}{1: adultGate, 2: declarationGate}
+	server := newExperimentServer(t, script, &expWireCapture{})
+	defer server.Close()
+	spool := t.TempDir()
+	client := newExperimentClient(t, server.URL, func(cfg *Config) { cfg.SpoolDir = spool })
+	defer client.Close(context.Background())
+	client.SetConsent(true)
+
+	if result, err := client.FetchExperimentAssignmentWithAgeBand(context.Background(), expTestScopeKey, ExperimentAgeBandUnderThreshold, nil); err != nil || !result.Assigned {
+		t.Fatalf("setup: the synthetic-subject assignment must be assigned, got %+v err=%v", result, err)
+	}
+	adultDone := make(chan struct{})
+	go func() {
+		_, _ = client.FetchExperimentAssignmentWithAgeBand(context.Background(), expTestScopeKey, ExperimentAgeBandAdult, nil)
+		close(adultDone)
+	}()
+	waitFor(t, 5*time.Second, "the adult fetch is in flight", func() bool { return script.requestCount() == 2 })
+	declared := make(chan error, 1)
+	go func() {
+		_, err := client.FetchExperimentAssignmentWithAgeBand(context.Background(), expTestScopeKey, ExperimentAgeBandUnderThreshold, nil)
+		declared <- err
+	}()
+	waitFor(t, 5*time.Second, "the under_threshold fetch is in flight", func() bool { return script.requestCount() == 3 })
+	close(declarationGate)
+	<-declared
+	close(adultGate)
+	<-adultDone
+
+	if variant := client.ExperimentVariant(expTestScopeKey); variant == "client_id_variant" {
+		t.Errorf("the adult fetch dispatched before the unanswered non-adult declaration installed its client-id assignment")
+	}
+}
+
+// An experiment now served as a synthetic-subject assignment still owes the
+// client-id applications made before it: a pending non-adult declaration
+// records no outcome against them, and an unanswered one withdraws them
+// while it keeps the synthetic assignment.
+func TestAnUnansweredDeclarationWithdrawsClientIDApplicationsBeneathASyntheticAssignment(t *testing.T) {
+	spool := t.TempDir()
+	synthetic := strings.Replace(ageGolden(t, "adult"), `"assignment_unit":"client_id"`, `"assignment_unit":"synthetic_subject_key"`, 1)
+	if synthetic == ageGolden(t, "adult") {
+		t.Fatalf("setup: the adult golden must name its assignment unit")
+	}
+	rig := newAgeWithdrawRig(t, spool, nil, ageGolden(t, "adult"), synthetic)
+	rig.script.push(http.StatusServiceUnavailable, ageTransientBody)
+	declarationGate := make(chan struct{})
+	rig.script.gates = map[int]chan struct{}{2: declarationGate}
+	fetchAdultAssignment(t, rig.client, ageGoldenExperiment)
+	rig.applyAndMeasure(t, ageGoldenExperiment)
+	if result := fetchAdultAssignment(t, rig.client, ageGoldenExperiment); !result.Assigned {
+		t.Fatalf("setup: the synthetic-subject assignment must install, got %+v", result)
+	}
+
+	declared := make(chan error, 1)
+	go func() {
+		_, err := rig.client.FetchExperimentAssignmentWithAgeBand(context.Background(), ageGoldenExperiment, ExperimentAgeBandUnderThreshold, nil)
+		declared <- err
+	}()
+	waitFor(t, 5*time.Second, "the under_threshold fetch is in flight", func() bool { return rig.script.requestCount() == 3 })
+	outcomeErr := rig.client.TrackExperimentOutcome(ageGoldenExperiment, "score", 3)
+	close(declarationGate)
+	if err := <-declared; err == nil {
+		t.Fatalf("setup: the under_threshold fetch must fail across the 503")
+	}
+	if !errors.Is(outcomeErr, ErrExperimentNoAssignment) {
+		t.Errorf("an outcome was recorded against the client-id application while the declaration was pending: %v", outcomeErr)
+	}
+	if owed := rig.client.owedExperimentExposureCount(); owed != 0 {
+		t.Errorf("withdraw: %d owed client-id application(s) survive beneath the synthetic assignment", owed)
+	}
+	rig.client.experimentCycle(context.Background())
+	flushOrFail(t, rig.client)
+	if delivered := deliveredExperimentFacts(rig.capture, ageGoldenExperiment); len(delivered) != 0 {
+		t.Errorf("withdraw: %d client-id fact(s) delivered after the unanswered non-adult declaration", len(delivered))
+	}
+	if variant := rig.client.ExperimentVariant(ageGoldenExperiment); variant != "control" {
+		t.Errorf("the synthetic-subject assignment must keep serving, got %q", variant)
+	}
+}
