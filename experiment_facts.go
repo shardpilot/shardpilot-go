@@ -613,6 +613,14 @@ func (c *Client) sweepExperimentExposuresBudget(ctx context.Context, experimentK
 	}()
 	for {
 		e.mu.Lock()
+		if e.declaring[experimentKey] != nil {
+			// A non-adult declaration of the experiment is unanswered:
+			// its owed applications wait, unsent, for the answer — kept
+			// when it governs that they survive (kill_switch), withdrawn
+			// when it refuses or never comes.
+			e.mu.Unlock()
+			return
+		}
 		list := e.pendingExposure[experimentKey]
 		if len(list) == 0 {
 			delete(e.pendingExposure, experimentKey)
@@ -724,7 +732,7 @@ func (c *Client) TrackExperimentExposure(experimentKey string) error {
 	if err := c.experimentConsentRefusal(); err != nil {
 		return err
 	}
-	entry := e.entries[experimentKey]
+	entry := e.servedEntryLocked(experimentKey)
 	if entry == nil {
 		return ErrExperimentNoAssignment
 	}
@@ -821,6 +829,18 @@ func (c *Client) TrackExperimentOutcome(experimentKey, outcomeKey string, outcom
 	}
 	if err := c.experimentConsentRefusal(); err != nil {
 		return err
+	}
+	if e.declaring[experimentKey] != nil {
+		// A pending non-adult declaration records nothing under the
+		// earlier one: not against the served entry, nor against the
+		// client-id application an outcome follows (a synthetic-subject
+		// assignment records no outcome either way).
+		if applied, ok := e.lastApplied[experimentKey]; ok && applied.entry.ageGated() {
+			return ErrExperimentNoAssignment
+		}
+		if entry := e.entries[experimentKey]; entry == nil || entry.ageGated() {
+			return ErrExperimentNoAssignment
+		}
 	}
 	applied, ok := e.lastApplied[experimentKey]
 	if !ok {
