@@ -808,8 +808,11 @@ func (c *Client) TrackExperimentOutcome(experimentKey, outcomeKey string, outcom
 	}
 	if e.declaring[experimentKey] != nil {
 		// A pending non-adult declaration records nothing under the
-		// earlier one.
-		return ErrExperimentNoAssignment
+		// earlier one (a synthetic-subject assignment records no outcome
+		// either way).
+		if entry := e.entries[experimentKey]; entry == nil || entry.ageGated() {
+			return ErrExperimentNoAssignment
+		}
 	}
 	applied, ok := e.lastApplied[experimentKey]
 	if !ok {

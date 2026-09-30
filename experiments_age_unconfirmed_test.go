@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -589,4 +590,81 @@ func TestARevalidationInFlightLosesToALaterRefusal(t *testing.T) {
 	if variant := restarted.ExperimentVariant(ageGoldenExperiment); variant != "" {
 		t.Errorf("the in-flight revalidation persisted %q", variant)
 	}
+}
+
+// ── scope: client-id assignments only ───────────────────────────────────────
+
+// expSyntheticAssignedBody is an assigned body for a synthetic-subject
+// assignment, which has no age gate: the platform assigns it whatever age
+// the host declares.
+func expSyntheticAssignedBody() string {
+	return strings.Replace(expAssignedBody("1"), `"assignment_unit":"client_id"`, `"assignment_unit":"synthetic_subject_key"`, 1)
+}
+
+// A synthetic-subject assignment is outside the age rule: a non-adult
+// declaration neither stops it serving while its fetch is in flight nor
+// withdraws it when that fetch fails. The transient serves the cached
+// assignment, as it always has.
+func TestANonAdultDeclarationLeavesASyntheticSubjectAssignmentServing(t *testing.T) {
+	script := &expScript{}
+	script.push(http.StatusOK, expSyntheticAssignedBody())
+	script.push(http.StatusServiceUnavailable, ageTransientBody)
+	release := make(chan struct{})
+	script.gates = map[int]chan struct{}{1: release}
+	server := newExperimentServer(t, script, &expWireCapture{})
+	defer server.Close()
+	spool := t.TempDir()
+	client := newExperimentClient(t, server.URL, func(cfg *Config) { cfg.SpoolDir = spool })
+	defer client.Close(context.Background())
+	client.SetConsent(true)
+
+	if result, err := client.FetchExperimentAssignmentWithAgeBand(context.Background(), expTestScopeKey, ExperimentAgeBandUnderThreshold, nil); err != nil || !result.Assigned {
+		t.Fatalf("setup: the synthetic-subject assignment must be assigned, got %+v err=%v", result, err)
+	}
+	type answer struct {
+		result ExperimentAssignmentResult
+		err    error
+	}
+	done := make(chan answer, 1)
+	go func() {
+		result, err := client.FetchExperimentAssignmentWithAgeBand(context.Background(), expTestScopeKey, ExperimentAgeBandUnderThreshold, nil)
+		done <- answer{result, err}
+	}()
+	waitFor(t, 5*time.Second, "the second under_threshold fetch is in flight", func() bool { return script.requestCount() == 2 })
+	inFlight := client.ExperimentVariant(expTestScopeKey)
+	close(release)
+	late := <-done
+	if inFlight != "treatment" {
+		t.Errorf("a synthetic-subject assignment must keep serving while the declaration is in flight, got %q", inFlight)
+	}
+	if late.err != nil || !late.result.Assigned || !late.result.FromCache {
+		t.Errorf("the transient must serve the cached synthetic-subject assignment, got %+v err=%v", late.result, late.err)
+	}
+	if variant := client.ExperimentVariant(expTestScopeKey); variant != "treatment" {
+		t.Errorf("a synthetic-subject assignment must not be withdrawn by an unanswered declaration, got %q", variant)
+	}
+	if !durableRecordHolds(t, spool, expTestScopeKey) {
+		t.Errorf("a synthetic-subject assignment must stay in the durable record")
+	}
+}
+
+// The declaring fetch itself hands back no client-id assignment it is about
+// to withdraw: a cached assignment whose remembered attributes match the
+// non-adult request is not served from cache when the fetch fails.
+func TestTheDeclaringFetchDoesNotServeTheAssignmentItWithdraws(t *testing.T) {
+	spool := t.TempDir()
+	// The stub answers the under_threshold request with an assignment, so the
+	// cached client-id entry remembers under_threshold.
+	rig := newAgeWithdrawRig(t, spool, nil, ageGolden(t, "adult"))
+	rig.script.push(http.StatusServiceUnavailable, ageTransientBody)
+	if result, err := rig.client.FetchExperimentAssignmentWithAgeBand(context.Background(), ageGoldenExperiment, ExperimentAgeBandUnderThreshold, nil); err != nil || !result.Assigned {
+		t.Fatalf("setup: the stub's assignment must install, got %+v err=%v", result, err)
+	}
+	rig.applyAndMeasure(t, ageGoldenExperiment)
+
+	result, err := rig.client.FetchExperimentAssignmentWithAgeBand(context.Background(), ageGoldenExperiment, ExperimentAgeBandUnderThreshold, nil)
+	if err == nil || result.Assigned || result.FromCache {
+		t.Errorf("the declaring fetch served the assignment its declaration withdraws: %+v err=%v", result, err)
+	}
+	assertExperimentWithdrawn(t, rig, spool, 2, 2)
 }

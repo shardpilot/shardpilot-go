@@ -3196,6 +3196,16 @@ func (c *Client) endNonAdultDeclaration(experimentKey string, declaration *expNo
 		e.mu.Unlock()
 		return
 	}
+	live := e.entries[experimentKey]
+	if live == nil {
+		live = e.latchRetained[experimentKey]
+	}
+	if live != nil && !live.ageGated() {
+		// A synthetic-subject assignment has no age gate: the declaration
+		// leaves it, and what it serves, as they are.
+		e.mu.Unlock()
+		return
+	}
 	scope := e.scopeForLocked(subject)
 	fenceKey := scope + rcScopeSeparator + experimentKey
 	if e.settled[fenceKey] < declaration.fenceSeq {
@@ -3213,12 +3223,21 @@ func (c *Client) endNonAdultDeclaration(experimentKey string, declaration *expNo
 }
 
 // servedEntryLocked is the entry the getters serve and record against: none
-// while a non-adult declaration of the experiment is pending.
+// while a non-adult declaration of the experiment is pending, unless it is a
+// synthetic-subject assignment, which has no age gate.
 func (e *experimentsState) servedEntryLocked(experimentKey string) *expEntry {
-	if e.declaring[experimentKey] != nil {
+	entry := e.entries[experimentKey]
+	if entry != nil && e.declaring[experimentKey] != nil && entry.ageGated() {
 		return nil
 	}
-	return e.entries[experimentKey]
+	return entry
+}
+
+// ageGated reports whether the entry's assignment is subject to the age
+// rule: a client-id assignment is, a synthetic-subject assignment is not
+// (the platform assigns it whatever age the host declares).
+func (entry *expEntry) ageGated() bool {
+	return entry.AssignmentUnit != experimentAssignmentUnitSynthetic
 }
 
 func (c *Client) fetchExperimentAssignment(ctx context.Context, experimentKey string, attributes map[string]string, isRevalidation bool, presetAttributes []expAttribute) (ExperimentAssignmentResult, error) {
@@ -3742,12 +3761,20 @@ func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string
 		}
 		supersededResult, supersededFailure = serveExperimentEntryOrFail(supersededServe, "superseded")
 	}
-	// A non-adult declaration pending since this fetch left: its caller
-	// receives no variant of the experiment (the settled state is not
-	// served), whatever the answer installed.
-	declarationPending := false
-	if declaration := e.declaring[experimentKey]; declaration != nil && declaration.seq != seq {
-		declarationPending = true
+	// A pending non-adult declaration hands no caller an age-gated
+	// variant: not another fetch's, whatever its answer installed, and not
+	// the declaring fetch's own cached fallback, which its end is about to
+	// withdraw. Only the declaring fetch's applied answer is served.
+	suppressAssigned, suppressCode := false, "superseded"
+	if declaration := e.declaring[experimentKey]; declaration != nil && !(declaration.seq == seq && declaration.decided) {
+		source := serveEntry
+		if sweepOwedNow {
+			source = e.entries[experimentKey]
+		}
+		suppressAssigned = source == nil || source.ageGated()
+		if declaration.seq == seq && result.Code != "" {
+			suppressCode = result.Code
+		}
 	}
 	overflowed := e.drainOwedExposureOverflowLocked()
 	e.mu.Unlock()
@@ -3794,8 +3821,8 @@ func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string
 		return supersededResult, nil
 	case failure != "":
 		return ExperimentAssignmentResult{}, expFetchError(failure)
-	case declarationPending && result.Assigned:
-		return ExperimentAssignmentResult{}, expFetchError("superseded")
+	case suppressAssigned && result.Assigned:
+		return ExperimentAssignmentResult{}, expFetchError(suppressCode)
 	default:
 		return result, nil
 	}
