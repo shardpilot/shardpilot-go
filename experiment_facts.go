@@ -589,6 +589,14 @@ func (c *Client) sweepExperimentExposuresBudget(ctx context.Context, experimentK
 	}()
 	for {
 		e.mu.Lock()
+		if e.declaring[experimentKey] != nil {
+			// A non-adult declaration of the experiment is unanswered:
+			// its owed applications wait, unsent, for the answer — kept
+			// when it governs that they survive (kill_switch), withdrawn
+			// when it refuses or never comes.
+			e.mu.Unlock()
+			return
+		}
 		list := e.pendingExposure[experimentKey]
 		if len(list) == 0 {
 			delete(e.pendingExposure, experimentKey)

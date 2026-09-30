@@ -222,6 +222,10 @@ func TestANonAdultDeclarationStopsServingUntilTheServerAnswers(t *testing.T) {
 			variant := rig.client.ExperimentVariant(ageGoldenExperiment)
 			applied, _ := rig.client.ApplyExperimentVariant(ageGoldenExperiment)
 			outcomeErr := rig.client.TrackExperimentOutcome(ageGoldenExperiment, "score", 3)
+			// The lane ticks while the declaration is unanswered: it sends
+			// none of the experiment's owed applications.
+			rig.client.experimentCycle(context.Background())
+			exposuresInFlight, outcomesInFlight := rig.applyRequests()
 			owedInFlight := rig.client.owedExperimentExposureCount()
 			close(release)
 			if err := <-done; err != nil {
@@ -232,6 +236,9 @@ func TestANonAdultDeclarationStopsServingUntilTheServerAnswers(t *testing.T) {
 			}
 			if !errors.Is(outcomeErr, ErrExperimentNoAssignment) {
 				t.Errorf("stop serving: an outcome recorded while the under_threshold fetch was in flight: %v", outcomeErr)
+			}
+			if exposuresInFlight+outcomesInFlight != 0 {
+				t.Errorf("withdraw: the lane sent %d exposure and %d outcome apply request(s) while the under_threshold fetch was in flight", exposuresInFlight, outcomesInFlight)
 			}
 			if owedInFlight != 2 {
 				t.Errorf("%d owed application(s) while the fetch was in flight, want both waiting for the answer", owedInFlight)
