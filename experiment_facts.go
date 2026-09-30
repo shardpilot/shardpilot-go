@@ -1551,13 +1551,16 @@ func (c *Client) pruneExperimentFactKeys() {
 	defer e.mu.Unlock()
 	// Queued facts the worker is past are gone.
 	e.forgetDequeuedFactsLocked(c.expPipelineLow.Load())
-	var mirror *expFactKeyMirror
-	if subject := e.currentSubjectIDLocked(); subject != "" && e.factKeys != nil && e.factKeys.scope == e.scopeForLocked(subject) {
-		mirror = e.factKeys
-	}
+	e.retireStaleFactKeysLocked()
+	mirror := e.factKeys
 	experiments := make(map[string]bool)
 	if mirror != nil {
 		for experimentKey := range mirror.history {
+			experiments[experimentKey] = true
+		}
+	}
+	for _, history := range e.retiredFactKeys {
+		for experimentKey := range history {
 			experiments[experimentKey] = true
 		}
 	}
@@ -1588,17 +1591,24 @@ func (c *Client) pruneExperimentFactKeys() {
 		}
 	}
 	c.expKeyWithdrawMu.Unlock()
+	for scope, history := range e.retiredFactKeys {
+		for experimentKey, factKeys := range history {
+			if kept := liveFactKeys(factKeys, live[experimentKey]); len(kept) == 0 {
+				delete(history, experimentKey)
+			} else {
+				history[experimentKey] = kept
+			}
+		}
+		if len(history) == 0 {
+			delete(e.retiredFactKeys, scope)
+		}
+	}
 	if mirror == nil {
 		return
 	}
 	pruned := false
 	for experimentKey, factKeys := range mirror.history {
-		var kept []string
-		for _, factKey := range factKeys {
-			if live[experimentKey][factKey] {
-				kept = append(kept, factKey)
-			}
-		}
+		kept := liveFactKeys(factKeys, live[experimentKey])
 		if len(kept) == len(factKeys) {
 			continue
 		}
@@ -1617,13 +1627,24 @@ func (c *Client) pruneExperimentFactKeys() {
 	}
 }
 
+// liveFactKeys is the part of a key list live facts still carry.
+func liveFactKeys(factKeys []string, live map[string]bool) []string {
+	var kept []string
+	for _, factKey := range factKeys {
+		if live[factKey] {
+			kept = append(kept, factKey)
+		}
+	}
+	return kept
+}
+
 // experimentFactKeysHeld is the prune's cheap first look, run every cycle:
-// with the history and the withdrawal record both empty there is nothing to
+// with the histories and the withdrawal record all empty there is nothing to
 // prune, and the locks the prune takes are not taken.
 func (c *Client) experimentFactKeysHeld() bool {
 	e := c.exp
 	e.mu.Lock()
-	held := e.factKeys != nil && len(e.factKeys.history) > 0
+	held := (e.factKeys != nil && len(e.factKeys.history) > 0) || len(e.retiredFactKeys) > 0
 	e.mu.Unlock()
 	if held {
 		return true

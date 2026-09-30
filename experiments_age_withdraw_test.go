@@ -1187,6 +1187,14 @@ func keyWithdrawalKeys(c *Client, experimentKey string) []string {
 	return keys
 }
 
+// retiredFactKeyScopes counts the retired scopes the client still keeps fact
+// keys for.
+func retiredFactKeyScopes(c *Client) int {
+	c.exp.mu.Lock()
+	defer c.exp.mu.Unlock()
+	return len(c.exp.retiredFactKeys)
+}
+
 func holdsFactKey(keys []string, factKey string) bool {
 	for _, key := range keys {
 		if key == factKey {
@@ -1618,6 +1626,78 @@ func TestAnAgeRefusalLeavesAnotherSubjectsMintedKeyFacts(t *testing.T) {
 			flushOrFail(t, rig.client)
 			if byKey := deliveredByKey(rig.capture); byKey[minted] != 2 {
 				t.Errorf("the previous subject's facts under its minted key must be delivered: %v", byKey)
+			}
+		})
+	}
+}
+
+// A retired subject keeps its fact keys in memory while its facts live. The
+// subject's assignment carries no subject fact key; it owes an exposure and
+// an outcome when a re-mint rotates it. The exposure is sealed under a
+// minted key (before or after the re-mint) and its fact spooled; the apply
+// route then refuses the subject's outcome as age_ineligible. The minted key
+// is still known for the retired subject, so its fact is withdrawn. The new
+// subject's fact, sealed under another minted key, is delivered.
+func TestAnApplyRouteRefusalOfARetiredSubjectWithdrawsItsMintedKeyFacts(t *testing.T) {
+	mintedOld := "sfk1_" + strings.Repeat("e", 64)
+	mintedNew := "sfk1_" + strings.Repeat("f", 64)
+	for _, sealed := range []string{"before_the_remint", "after_the_remint"} {
+		t.Run("sealed_"+sealed, func(t *testing.T) {
+			ctx := context.Background()
+			rig := newAgeWithdrawRig(t, t.TempDir(), nil, adultGoldenWithoutFactKey(t))
+			rig.script.push(http.StatusBadRequest, `{"error":"experiment metadata must use synthetic local-safe identifiers only"}`)
+			rig.script.push(http.StatusOK, adultGoldenWithoutFactKey(t))
+			rig.sealWithKey(mintedOld)
+			// The outcome's first apply is answered transiently, so the
+			// exposure's fact is spooled before the outcome's refusal.
+			rig.script.outcome.push(http.StatusServiceUnavailable, `{"error":"unavailable"}`)
+			rig.script.outcome.push(http.StatusConflict, ageApplyRefusal)
+			fetchAdultAssignment(t, rig.client, ageGoldenExperiment)
+			rig.applyAndMeasure(t, ageGoldenExperiment)
+			remint := func() {
+				t.Helper()
+				result, err := rig.client.FetchExperimentAssignmentWithAgeBand(ctx, ageGoldenExperiment, ExperimentAgeBandAdult, nil)
+				if err != nil || !result.Assigned || rig.script.requestCount() != 3 {
+					t.Fatalf("setup: the grammar reject must re-mint the subject and assign it, got %+v err=%v after %d fetch(es)", result, err, rig.script.requestCount())
+				}
+			}
+			if sealed == "after_the_remint" {
+				remint()
+			}
+			rig.capture.setStatus(http.StatusInternalServerError)
+			rig.client.experimentCycle(ctx)
+			_ = rig.client.Flush(ctx)
+			if spooled := spooledExperimentFacts(rig.client, ageGoldenExperiment); spooled != 1 || rig.client.owedExperimentExposureCount() != 1 {
+				t.Fatalf("setup: the exposure's fact must be spooled (%d) and the outcome still owed (%d)", spooled, rig.client.owedExperimentExposureCount())
+			}
+			if sealed == "before_the_remint" {
+				remint()
+			}
+
+			rig.client.experimentCycle(ctx)
+			if exposures, outcomes := rig.drops("age_ineligible"); exposures != 0 || outcomes != 1 {
+				t.Fatalf("setup: the apply route must refuse the retired subject's outcome: exposure=%d outcome=%d", exposures, outcomes)
+			}
+			left := spooledExperimentFacts(rig.client, ageGoldenExperiment)
+			// Control: the new subject's application, sealed under another
+			// minted key.
+			rig.sealWithKey(mintedNew)
+			rig.client.ApplyExperimentVariant(ageGoldenExperiment)
+			rig.capture.setStatus(http.StatusAccepted)
+			rig.client.experimentCycle(ctx)
+			flushOrFail(t, rig.client)
+			byKey := deliveredByKey(rig.capture)
+			t.Logf("spooled after refusal=%d; delivered under the retired subject's minted key=%d, under the new subject's=%d", left, byKey[mintedOld], byKey[mintedNew])
+			if left != 0 || byKey[mintedOld] != 0 {
+				t.Errorf("the retired subject's fact under its minted key must be withdrawn: %d left spooled, %d delivered", left, byKey[mintedOld])
+			}
+			if byKey[mintedNew] != 1 {
+				t.Errorf("control: the new subject's fact must be delivered, got %d", byKey[mintedNew])
+			}
+			// The retired subject's facts are gone: its keys go with them.
+			rig.client.experimentCycle(ctx)
+			if retired := retiredFactKeyScopes(rig.client); retired != 0 {
+				t.Errorf("the retired subject has no live fact left, yet %d retired scope(s) keep fact keys", retired)
 			}
 		})
 	}
