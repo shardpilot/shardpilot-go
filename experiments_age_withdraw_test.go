@@ -171,7 +171,8 @@ func spooledExperimentFacts(c *Client, experimentKey string) int {
 }
 
 // durableRecordHolds reports whether the durable assignment record on disk
-// still names the experiment.
+// still holds an entry for the experiment. (Its fact-key history may name
+// the experiment without one.)
 func durableRecordHolds(t *testing.T, dir, experimentKey string) bool {
 	t.Helper()
 	data, err := os.ReadFile(filepath.Join(dir, expCacheFileName))
@@ -181,7 +182,14 @@ func durableRecordHolds(t *testing.T, dir, experimentKey string) bool {
 	if err != nil {
 		t.Fatalf("reading the durable record: %v", err)
 	}
-	return strings.Contains(string(data), `"`+experimentKey+`"`)
+	var record struct {
+		Entries map[string]json.RawMessage `json:"entries"`
+	}
+	if err := json.Unmarshal(data, &record); err != nil {
+		t.Fatalf("decoding the durable record: %v", err)
+	}
+	_, held := record.Entries[experimentKey]
+	return held
 }
 
 // ── the assignment route ────────────────────────────────────────────────────
@@ -1129,5 +1137,668 @@ func TestANewAssignmentAfterAnAgeRefusalRecordsAgain(t *testing.T) {
 	}
 	if len(delivered) != 2 || names[experimentExposureName] != 1 || names[experimentOutcomeName] != 1 {
 		t.Errorf("the new application must deliver one exposure and one outcome, got %v", names)
+	}
+}
+
+// ── the fact-key history ────────────────────────────────────────────────────
+
+// factKeyHistoryInMemory is the current scope's fact-key history for the
+// experiment, as the client holds it.
+func factKeyHistoryInMemory(c *Client, experimentKey string) []string {
+	e := c.exp
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	subject := e.currentSubjectIDLocked()
+	if subject == "" || e.factKeys == nil || e.factKeys.scope != e.scopeForLocked(subject) {
+		return nil
+	}
+	return append([]string(nil), e.factKeys.history[experimentKey]...)
+}
+
+// persistedFactKeyHistory is the experiment's fact-key history in the
+// durable record on disk.
+func persistedFactKeyHistory(t *testing.T, dir, experimentKey string) []string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, expCacheFileName))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		t.Fatalf("reading the durable record: %v", err)
+	}
+	var record struct {
+		FactKeyHistory map[string][]string `json:"fact_key_history"`
+	}
+	if err := json.Unmarshal(data, &record); err != nil {
+		t.Fatalf("decoding the durable record: %v", err)
+	}
+	return record.FactKeyHistory[experimentKey]
+}
+
+// keyWithdrawalKeys are the subject fact keys the client's record of age
+// refusals still names for the experiment.
+func keyWithdrawalKeys(c *Client, experimentKey string) []string {
+	c.expKeyWithdrawMu.Lock()
+	defer c.expKeyWithdrawMu.Unlock()
+	var keys []string
+	for factKey := range c.expKeyWithdrawals[experimentKey] {
+		keys = append(keys, factKey)
+	}
+	return keys
+}
+
+// retiredFactKeyScopes counts the retired scopes the client still keeps fact
+// keys for.
+func retiredFactKeyScopes(c *Client) int {
+	c.exp.mu.Lock()
+	defer c.exp.mu.Unlock()
+	return len(c.exp.retiredFactKeys)
+}
+
+func holdsFactKey(keys []string, factKey string) bool {
+	for _, key := range keys {
+		if key == factKey {
+			return true
+		}
+	}
+	return false
+}
+
+// republishedGolden is a golden rewritten as version 2 of the experiment,
+// under another subject fact key: what the platform answers after a
+// republish rotates the key.
+func republishedGolden(t *testing.T, name, factKey string) string {
+	t.Helper()
+	body := strings.Replace(ageGolden(t, name), `"version":1`, `"version":2`, 1)
+	return strings.Replace(body, ageGoldenFactKey(t), factKey, 1)
+}
+
+// sealWithKey makes both apply stubs seal their facts under factKey.
+func (r *ageWithdrawRig) sealWithKey(factKey string) {
+	for _, stub := range []*expApplyStub{&r.script.apply, &r.script.outcome} {
+		stub.mu.Lock()
+		stub.assignmentKey = factKey
+		stub.mu.Unlock()
+	}
+}
+
+// sealAndSpool applies and measures the served assignment, then seals the two
+// applications and spools their facts through a failing publish: the worker
+// keeps them for its retry, and the spool holds them.
+func (r *ageWithdrawRig) sealAndSpool(t *testing.T, want int) {
+	t.Helper()
+	r.applyAndMeasure(t, ageGoldenExperiment)
+	r.capture.setStatus(http.StatusInternalServerError)
+	r.client.experimentCycle(context.Background())
+	_ = r.client.Flush(context.Background())
+	if spooled := spooledExperimentFacts(r.client, ageGoldenExperiment); spooled != want {
+		t.Fatalf("setup: %d fact(s) spooled, want %d", spooled, want)
+	}
+}
+
+// relaunch closes the client and constructs another on the same spool, the
+// ingest answering status meanwhile.
+func (r *ageWithdrawRig) relaunch(t *testing.T, status int) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = r.client.Close(ctx)
+	cancel()
+	r.capture.setStatus(status)
+	r.client = r.launch(t, nil)
+	r.client.SetConsent(true)
+}
+
+// deliveredByKey counts the experiment's delivered facts by assignment_key.
+func deliveredByKey(capture *expWireCapture) map[any]int {
+	byKey := map[any]int{}
+	for _, envelope := range deliveredExperimentFacts(capture, ageGoldenExperiment) {
+		props, _ := envelope["props"].(map[string]any)
+		byKey[props["assignment_key"]]++
+	}
+	return byKey
+}
+
+// shardpilot/shardpilot-go#138 R5: facts built under version 1's key are
+// spooled; a republish installs version 2 under another key, and facts are
+// built under it; the age refusal echoes version 2's key. The history names
+// version 1's key, so the facts of both keys are withdrawn and none is
+// delivered — in the same process, and after a relaunch that restores the
+// spool. One cycle later the withdrawn keys have no live fact left and leave
+// the history.
+func TestAnAgeRefusalWithdrawsFactsUnderARetiredKey(t *testing.T) {
+	for _, relaunch := range []bool{false, true} {
+		name := "same_process"
+		if relaunch {
+			name = "after_relaunch"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			keyA := ageGoldenFactKey(t)
+			keyB := "sfk1_" + strings.Repeat("d", 64)
+			spool := t.TempDir()
+			rig := newAgeWithdrawRig(t, spool, nil, ageGolden(t, "adult"),
+				republishedGolden(t, "adult", keyB), republishedGolden(t, "under_threshold", keyB))
+			fetchAdultAssignment(t, rig.client, ageGoldenExperiment)
+			rig.sealAndSpool(t, 2)
+			if result := fetchAdultAssignment(t, rig.client, ageGoldenExperiment); result.Version != 2 {
+				t.Fatalf("setup: the republish must install version 2, got %+v", result)
+			}
+			rig.sealWithKey(keyB)
+			rig.sealAndSpool(t, 4)
+			if relaunch {
+				rig.relaunch(t, http.StatusServiceUnavailable)
+			}
+
+			rig.refuse(t, "age_ineligible")
+			left := spooledExperimentFacts(rig.client, ageGoldenExperiment)
+			rig.capture.setStatus(http.StatusAccepted)
+			flushOrFail(t, rig.client)
+			byKey := deliveredByKey(rig.capture)
+			t.Logf("spooled after refusal=%d; delivered by key: A=%d B=%d", left, byKey[keyA], byKey[keyB])
+			if left != 0 || byKey[keyA] != 0 || byKey[keyB] != 0 {
+				t.Errorf("the refusal echoing version 2's key must withdraw the facts of both keys: %d left spooled, delivered A=%d B=%d", left, byKey[keyA], byKey[keyB])
+			}
+
+			rig.client.experimentCycle(ctx)
+			if held := factKeyHistoryInMemory(rig.client, ageGoldenExperiment); len(held) != 0 {
+				t.Errorf("the withdrawn keys have no live fact left, yet the history holds %v", held)
+			}
+			if held := persistedFactKeyHistory(t, spool, ageGoldenExperiment); len(held) != 0 {
+				t.Errorf("the withdrawn keys have no live fact left, yet the persisted history holds %v", held)
+			}
+		})
+	}
+}
+
+// A retired key leaves the history once its last fact goes: version 1's
+// facts are spooled, the republish retires their key, and the history holds
+// it, in memory and in the persisted record, until the facts are delivered;
+// the next cycle prunes it from both.
+func TestARetiredKeyLeavesTheHistoryWithItsLastFact(t *testing.T) {
+	keyA := ageGoldenFactKey(t)
+	spool := t.TempDir()
+	rig := newAgeWithdrawRig(t, spool, nil, ageGolden(t, "adult"), republishedGolden(t, "adult", "sfk1_"+strings.Repeat("d", 64)))
+	fetchAdultAssignment(t, rig.client, ageGoldenExperiment)
+	rig.sealAndSpool(t, 2)
+	fetchAdultAssignment(t, rig.client, ageGoldenExperiment)
+	rig.client.experimentCycle(context.Background())
+	if !holdsFactKey(factKeyHistoryInMemory(rig.client, ageGoldenExperiment), keyA) ||
+		!holdsFactKey(persistedFactKeyHistory(t, spool, ageGoldenExperiment), keyA) {
+		t.Fatalf("setup: the republish must retire version 1's key into the history while its facts live (memory %v, disk %v)",
+			factKeyHistoryInMemory(rig.client, ageGoldenExperiment), persistedFactKeyHistory(t, spool, ageGoldenExperiment))
+	}
+
+	rig.capture.setStatus(http.StatusAccepted)
+	flushOrFail(t, rig.client)
+	if delivered := len(deliveredExperimentFacts(rig.capture, ageGoldenExperiment)); delivered != 2 {
+		t.Fatalf("setup: %d of version 1's 2 facts delivered", delivered)
+	}
+	rig.client.experimentCycle(context.Background())
+	memory, disk := factKeyHistoryInMemory(rig.client, ageGoldenExperiment), persistedFactKeyHistory(t, spool, ageGoldenExperiment)
+	t.Logf("after the last fact of the retired key was delivered: history in memory %v, persisted %v", memory, disk)
+	if holdsFactKey(memory, keyA) || holdsFactKey(disk, keyA) {
+		t.Errorf("the retired key's last fact was delivered, yet the history keeps it (memory %v, disk %v)", memory, disk)
+	}
+}
+
+// A retired key stays in the history while a fact under it is spooled: kept
+// across the republish, present in the persisted record, and still there
+// after a relaunch, whose prune runs once the spool is loaded.
+func TestARetiredKeyStaysInTheHistoryWhileItsFactsAreSpooled(t *testing.T) {
+	keyA := ageGoldenFactKey(t)
+	spool := t.TempDir()
+	rig := newAgeWithdrawRig(t, spool, nil, ageGolden(t, "adult"), republishedGolden(t, "adult", "sfk1_"+strings.Repeat("d", 64)))
+	fetchAdultAssignment(t, rig.client, ageGoldenExperiment)
+	rig.sealAndSpool(t, 2)
+	fetchAdultAssignment(t, rig.client, ageGoldenExperiment)
+	rig.client.experimentCycle(context.Background())
+	for _, stage := range []string{"after the republish", "after a relaunch"} {
+		if stage == "after a relaunch" {
+			rig.relaunch(t, http.StatusServiceUnavailable)
+			rig.client.experimentCycle(context.Background())
+			if spooled := spooledExperimentFacts(rig.client, ageGoldenExperiment); spooled != 2 {
+				t.Fatalf("setup: the relaunch restored %d of the 2 spooled facts", spooled)
+			}
+		}
+		memory, disk := factKeyHistoryInMemory(rig.client, ageGoldenExperiment), persistedFactKeyHistory(t, spool, ageGoldenExperiment)
+		t.Logf("%s: history in memory %v, persisted %v", stage, memory, disk)
+		if !holdsFactKey(memory, keyA) || !holdsFactKey(disk, keyA) {
+			t.Errorf("%s the retired key's facts are still spooled, yet the history lost it (memory %v, disk %v)", stage, memory, disk)
+		}
+	}
+}
+
+// A key whose entry never reached the disk is still retired by the drop:
+// the entry's own write fails and its facts are spooled; storage recovers,
+// and a kill switch drops the entry, which finds nothing stored to delete.
+// The drop writes the key into the persisted history, so after a relaunch a
+// refusal without a subject fact key still withdraws the spooled facts.
+func TestAKeyWhoseEntryNeverLandedIsRetiredByTheDrop(t *testing.T) {
+	keyA := ageGoldenFactKey(t)
+	spool := t.TempDir()
+	rig := newAgeWithdrawRig(t, spool, nil, ageGolden(t, "adult"), ageRefusalBody(t, "kill_switch"), ageRefusalBodyWithoutFactKey(t))
+	rig.client.exp.mu.Lock()
+	rig.client.exp.failDurableWritesForTests = true
+	rig.client.exp.mu.Unlock()
+	fetchAdultAssignment(t, rig.client, ageGoldenExperiment)
+	rig.sealAndSpool(t, 2)
+	if durableRecordHolds(t, spool, ageGoldenExperiment) {
+		t.Fatalf("setup: the entry's write must not land")
+	}
+	rig.client.exp.mu.Lock()
+	rig.client.exp.failDurableWritesForTests = false
+	rig.client.exp.mu.Unlock()
+	rig.refuse(t, "kill_switch")
+	disk := persistedFactKeyHistory(t, spool, ageGoldenExperiment)
+	t.Logf("after the kill switch dropped the entry that never landed: persisted history %v", disk)
+	if !holdsFactKey(disk, keyA) {
+		t.Errorf("the drop took the key out of the entries, yet the persisted history lacks it: %v", disk)
+	}
+
+	rig.relaunch(t, http.StatusServiceUnavailable)
+	rig.refuse(t, "age_ineligible")
+	left := spooledExperimentFacts(rig.client, ageGoldenExperiment)
+	rig.capture.setStatus(http.StatusAccepted)
+	flushOrFail(t, rig.client)
+	byKey := deliveredByKey(rig.capture)
+	t.Logf("after a relaunch and a refusal without a subject fact key: spooled=%d; delivered under the key=%d", left, byKey[keyA])
+	if left != 0 || byKey[keyA] != 0 {
+		t.Errorf("the spooled facts under the dropped entry's key must be withdrawn: %d left spooled, %d delivered", left, byKey[keyA])
+	}
+}
+
+// A restored entry's key is retired by the write that replaces it even when
+// the record reads back empty at that moment: the retirement diffs against
+// the memory copy the load seeded, not a fresh read. Version 1's facts are
+// spooled, a relaunch restores its entry, the record then reads as corrupt,
+// and a republish installs version 2; a refusal echoing version 2's key
+// still withdraws version 1's facts.
+func TestARestoredKeyIsRetiredWhenTheRecordReadsEmpty(t *testing.T) {
+	keyA := ageGoldenFactKey(t)
+	keyB := "sfk1_" + strings.Repeat("d", 64)
+	spool := t.TempDir()
+	rig := newAgeWithdrawRig(t, spool, nil, ageGolden(t, "adult"),
+		republishedGolden(t, "adult", keyB), republishedGolden(t, "under_threshold", keyB))
+	fetchAdultAssignment(t, rig.client, ageGoldenExperiment)
+	rig.sealAndSpool(t, 2)
+	rig.relaunch(t, http.StatusServiceUnavailable)
+	if variant := rig.client.ExperimentVariant(ageGoldenExperiment); variant != "control" {
+		t.Fatalf("setup: the relaunch must restore version 1's entry, got %q", variant)
+	}
+	if err := os.WriteFile(filepath.Join(spool, expCacheFileName), []byte("{"), 0o600); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	if result := fetchAdultAssignment(t, rig.client, ageGoldenExperiment); result.Version != 2 {
+		t.Fatalf("setup: the republish must install version 2, got %+v", result)
+	}
+
+	rig.refuse(t, "age_ineligible")
+	left := spooledExperimentFacts(rig.client, ageGoldenExperiment)
+	rig.capture.setStatus(http.StatusAccepted)
+	flushOrFail(t, rig.client)
+	byKey := deliveredByKey(rig.capture)
+	t.Logf("spooled after refusal=%d; delivered under the restored key=%d", left, byKey[keyA])
+	if left != 0 || byKey[keyA] != 0 {
+		t.Errorf("the refusal echoing version 2's key must withdraw the restored version 1's facts: %d left spooled, %d delivered", left, byKey[keyA])
+	}
+}
+
+// experimentRecordBeforeTheHistory is the durable record the SDK wrote at
+// 193c038 (the v0.7.1-alpha format) for the adult golden, byte for byte
+// except the placeholders: no fact_key_history member. The test fills in the
+// stub server, the golden's own keys, and a visibly synthetic subject id.
+const experimentRecordBeforeTheHistory = `{"scope":"workspace-test\u001fexposure-app\u001fdevelop\u001f{{subject}}\u001f{{server}}\u001f94f43421ce6c39f1","entries":{"exposure-banner":{"assignment_key":"{{assignment_key}}","variant_key":"control","variant_payload":{"copy":"Control"},"version":1,"assignment_unit":"client_id","subject_fact_key":"{{subject_fact_key}}","subject_key":"{{subject}}","attributes":[{"name":"age_band","value":"adult"}],"fetched_at_ms":1790726194423,"served":{"revision":1,"kill_gate":false,"at":"2026-09-28T11:32:49.479Z"}}}}
+`
+
+// A record written before the history existed loads with an empty history
+// and serves as before: the assignment is restored without a fetch, and an
+// application of it is sealed and delivered under its key.
+func TestARecordWithoutAFactKeyHistoryLoads(t *testing.T) {
+	script := &expScript{}
+	script.apply.assignmentKey = ageGoldenFactKey(t)
+	capture := &expWireCapture{}
+	server := newExperimentServer(t, script, capture)
+	t.Cleanup(server.Close)
+	spool := t.TempDir()
+	subject := "spcid_" + strings.Repeat("0a", 16)
+	if err := os.WriteFile(filepath.Join(spool, expSubjectFileName), []byte(subject+"\n"), 0o600); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	var golden struct {
+		AssignmentKey string `json:"assignment_key"`
+	}
+	if err := json.Unmarshal([]byte(ageGolden(t, "adult")), &golden); err != nil || golden.AssignmentKey == "" {
+		t.Fatalf("the adult golden must carry an assignment key: %q %v", golden.AssignmentKey, err)
+	}
+	record := strings.NewReplacer(
+		"{{server}}", server.URL,
+		"{{subject}}", subject,
+		"{{assignment_key}}", golden.AssignmentKey,
+		"{{subject_fact_key}}", ageGoldenFactKey(t),
+	).Replace(experimentRecordBeforeTheHistory)
+	if err := os.WriteFile(filepath.Join(spool, expCacheFileName), []byte(record), 0o600); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	rig := &ageWithdrawRig{script: script, capture: capture, server: server, spool: spool}
+	rig.client = rig.launch(t, nil)
+	rig.client.SetConsent(true)
+
+	if variant := rig.client.ExperimentVariant(ageGoldenExperiment); variant != "control" || script.requestCount() != 0 {
+		t.Fatalf("the record must restore its assignment without a fetch: served %q after %d fetch(es)", variant, script.requestCount())
+	}
+	if held := factKeyHistoryInMemory(rig.client, ageGoldenExperiment); len(held) != 0 {
+		t.Errorf("a record without the section must load an empty history, got %v", held)
+	}
+	rig.client.ApplyExperimentVariant(ageGoldenExperiment)
+	rig.client.experimentCycle(context.Background())
+	flushOrFail(t, rig.client)
+	byKey := deliveredByKey(capture)
+	t.Logf("restored from a record without the section: served %q; delivered by key: %v", rig.client.ExperimentVariant(ageGoldenExperiment), byKey)
+	if byKey[ageGoldenFactKey(t)] != 1 {
+		t.Errorf("the restored assignment's application must be delivered under its key, got %v", byKey)
+	}
+}
+
+// adultGoldenWithoutFactKey is the adult golden with its subject_fact_key
+// member removed: an assignment the apply endpoint mints the key for.
+func adultGoldenWithoutFactKey(t *testing.T) string {
+	t.Helper()
+	body := strings.Replace(ageGolden(t, "adult"), `"subject_fact_key":"`+ageGoldenFactKey(t)+`",`, "", 1)
+	if strings.Contains(body, `"subject_fact_key":`) {
+		t.Fatalf("setup: the adult golden must lose its subject_fact_key member")
+	}
+	return body
+}
+
+// shardpilot/shardpilot-go#145: an assignment without a subject fact key;
+// the apply endpoint mints the key its facts carry. The minted key is in the
+// persisted history once the facts are sealed, before any of them is
+// spooled, and a later refusal without a subject fact key withdraws them —
+// in the same process, and after a relaunch.
+func TestAnAgeRefusalWithdrawsFactsUnderAMintedKey(t *testing.T) {
+	minted := "sfk1_" + strings.Repeat("e", 64)
+	for _, relaunch := range []bool{false, true} {
+		name := "same_process"
+		if relaunch {
+			name = "after_relaunch"
+		}
+		t.Run(name, func(t *testing.T) {
+			spool := t.TempDir()
+			rig := newAgeWithdrawRig(t, spool, nil, adultGoldenWithoutFactKey(t), ageRefusalBodyWithoutFactKey(t))
+			rig.sealWithKey(minted)
+			fetchAdultAssignment(t, rig.client, ageGoldenExperiment)
+			rig.applyAndMeasure(t, ageGoldenExperiment)
+			rig.capture.setStatus(http.StatusInternalServerError)
+			rig.client.experimentCycle(context.Background())
+			if held := persistedFactKeyHistory(t, spool, ageGoldenExperiment); !holdsFactKey(held, minted) {
+				t.Errorf("the sealed facts carry the minted key, yet the persisted history holds %v", held)
+			}
+			_ = rig.client.Flush(context.Background())
+			if spooled := spooledExperimentFacts(rig.client, ageGoldenExperiment); spooled != 2 {
+				t.Fatalf("setup: %d fact(s) spooled, want 2", spooled)
+			}
+			if relaunch {
+				rig.relaunch(t, http.StatusServiceUnavailable)
+			}
+
+			rig.refuse(t, "age_ineligible")
+			left := spooledExperimentFacts(rig.client, ageGoldenExperiment)
+			rig.capture.setStatus(http.StatusAccepted)
+			flushOrFail(t, rig.client)
+			byKey := deliveredByKey(rig.capture)
+			t.Logf("spooled after refusal=%d; delivered under the minted key=%d", left, byKey[minted])
+			if left != 0 || byKey[minted] != 0 {
+				t.Errorf("a refusal without a subject fact key must withdraw the facts under the minted key: %d left spooled, %d delivered", left, byKey[minted])
+			}
+		})
+	}
+}
+
+// The minted key is durable before its fact exists: while the record cannot
+// be written, the sealed answer is discarded and nothing is queued or
+// spooled; once it can, the application is sealed again and delivered.
+func TestAMintedKeyIsDurableBeforeItsFact(t *testing.T) {
+	minted := "sfk1_" + strings.Repeat("e", 64)
+	spool := t.TempDir()
+	rig := newAgeWithdrawRig(t, spool, nil, adultGoldenWithoutFactKey(t))
+	rig.sealWithKey(minted)
+	fetchAdultAssignment(t, rig.client, ageGoldenExperiment)
+	rig.client.ApplyExperimentVariant(ageGoldenExperiment)
+	rig.client.exp.mu.Lock()
+	rig.client.exp.failDurableWritesForTests = true
+	rig.client.exp.mu.Unlock()
+	rig.client.experimentCycle(context.Background())
+	flushOrFail(t, rig.client)
+	owed := rig.client.owedExperimentExposureCount()
+	delivered := len(deliveredExperimentFacts(rig.capture, ageGoldenExperiment))
+	t.Logf("record unwritable: apply requests=%d, owed=%d, delivered=%d", len(rig.script.apply.requestsSoFar()), owed, delivered)
+	if owed != 1 || delivered != 0 {
+		t.Errorf("a fact under a minted key the record could not hold must not exist yet: %d owed, %d delivered", owed, delivered)
+	}
+
+	rig.client.exp.mu.Lock()
+	rig.client.exp.failDurableWritesForTests = false
+	rig.client.exp.mu.Unlock()
+	rig.client.experimentCycle(context.Background())
+	flushOrFail(t, rig.client)
+	if held := persistedFactKeyHistory(t, spool, ageGoldenExperiment); !holdsFactKey(held, minted) {
+		t.Errorf("the minted key must be persisted, got %v", held)
+	}
+	if byKey := deliveredByKey(rig.capture); byKey[minted] != 1 {
+		t.Errorf("once the record holds the key the application is sealed again and delivered, got %v", byKey)
+	}
+}
+
+// Control: another subject's facts under a minted key survive. The previous
+// subject's application and outcome are sealed under a minted key and
+// accepted (held by the worker, or spooled); a re-mint rotates the subject,
+// and the new subject's refusal carries no subject fact key. The minted key
+// is the previous subject's, not the new one's: its facts are delivered.
+func TestAnAgeRefusalLeavesAnotherSubjectsMintedKeyFacts(t *testing.T) {
+	minted := "sfk1_" + strings.Repeat("e", 64)
+	for _, staging := range []string{"held_by_the_worker", "spooled"} {
+		t.Run(staging, func(t *testing.T) {
+			ctx := context.Background()
+			rig := newAgeWithdrawRig(t, t.TempDir(), nil, adultGoldenWithoutFactKey(t))
+			rig.script.push(http.StatusBadRequest, `{"error":"experiment metadata must use synthetic local-safe identifiers only"}`)
+			rig.script.push(http.StatusOK, ageRefusalBodyWithoutFactKey(t))
+			rig.sealWithKey(minted)
+			fetchAdultAssignment(t, rig.client, ageGoldenExperiment)
+			rig.applyAndMeasure(t, ageGoldenExperiment)
+			if staging == "spooled" {
+				rig.capture.setStatus(http.StatusInternalServerError)
+			}
+			rig.client.experimentCycle(ctx)
+			if staging == "spooled" {
+				_ = rig.client.Flush(ctx)
+				if spooled := spooledExperimentFacts(rig.client, ageGoldenExperiment); spooled != 2 {
+					t.Fatalf("setup: %d fact(s) spooled, want 2", spooled)
+				}
+			} else {
+				waitFor(t, 5*time.Second, "the worker holds the sealed facts", func() bool { return len(rig.client.queue.ch) == 0 })
+			}
+
+			result, err := rig.client.FetchExperimentAssignmentWithAgeBand(ctx, ageGoldenExperiment, ExperimentAgeBandUnderThreshold, nil)
+			if err != nil || result.Reason != "age_ineligible" || rig.script.requestCount() != 3 {
+				t.Fatalf("setup: the re-minted retry must be refused as age_ineligible, got %+v err=%v after %d fetch(es)", result, err, rig.script.requestCount())
+			}
+			rig.capture.setStatus(http.StatusAccepted)
+			flushOrFail(t, rig.client)
+			if byKey := deliveredByKey(rig.capture); byKey[minted] != 2 {
+				t.Errorf("the previous subject's facts under its minted key must be delivered: %v", byKey)
+			}
+		})
+	}
+}
+
+// A retired subject keeps its fact keys in memory while its facts live. The
+// subject's assignment carries no subject fact key; it owes an exposure and
+// an outcome when a re-mint rotates it. The exposure is sealed under a
+// minted key (before or after the re-mint) and its fact spooled; the apply
+// route then refuses the subject's outcome as age_ineligible. The minted key
+// is still known for the retired subject, so its fact is withdrawn. The new
+// subject's fact, sealed under another minted key, is delivered.
+func TestAnApplyRouteRefusalOfARetiredSubjectWithdrawsItsMintedKeyFacts(t *testing.T) {
+	mintedOld := "sfk1_" + strings.Repeat("e", 64)
+	mintedNew := "sfk1_" + strings.Repeat("f", 64)
+	for _, sealed := range []string{"before_the_remint", "after_the_remint"} {
+		t.Run("sealed_"+sealed, func(t *testing.T) {
+			ctx := context.Background()
+			rig := newAgeWithdrawRig(t, t.TempDir(), nil, adultGoldenWithoutFactKey(t))
+			rig.script.push(http.StatusBadRequest, `{"error":"experiment metadata must use synthetic local-safe identifiers only"}`)
+			rig.script.push(http.StatusOK, adultGoldenWithoutFactKey(t))
+			rig.sealWithKey(mintedOld)
+			// The outcome's first apply is answered transiently, so the
+			// exposure's fact is spooled before the outcome's refusal.
+			rig.script.outcome.push(http.StatusServiceUnavailable, `{"error":"unavailable"}`)
+			rig.script.outcome.push(http.StatusConflict, ageApplyRefusal)
+			fetchAdultAssignment(t, rig.client, ageGoldenExperiment)
+			rig.applyAndMeasure(t, ageGoldenExperiment)
+			remint := func() {
+				t.Helper()
+				result, err := rig.client.FetchExperimentAssignmentWithAgeBand(ctx, ageGoldenExperiment, ExperimentAgeBandAdult, nil)
+				if err != nil || !result.Assigned || rig.script.requestCount() != 3 {
+					t.Fatalf("setup: the grammar reject must re-mint the subject and assign it, got %+v err=%v after %d fetch(es)", result, err, rig.script.requestCount())
+				}
+			}
+			if sealed == "after_the_remint" {
+				remint()
+			}
+			rig.capture.setStatus(http.StatusInternalServerError)
+			rig.client.experimentCycle(ctx)
+			_ = rig.client.Flush(ctx)
+			if spooled := spooledExperimentFacts(rig.client, ageGoldenExperiment); spooled != 1 || rig.client.owedExperimentExposureCount() != 1 {
+				t.Fatalf("setup: the exposure's fact must be spooled (%d) and the outcome still owed (%d)", spooled, rig.client.owedExperimentExposureCount())
+			}
+			if sealed == "before_the_remint" {
+				remint()
+			}
+
+			rig.client.experimentCycle(ctx)
+			if exposures, outcomes := rig.drops("age_ineligible"); exposures != 0 || outcomes != 1 {
+				t.Fatalf("setup: the apply route must refuse the retired subject's outcome: exposure=%d outcome=%d", exposures, outcomes)
+			}
+			left := spooledExperimentFacts(rig.client, ageGoldenExperiment)
+			// Control: the new subject's application, sealed under another
+			// minted key.
+			rig.sealWithKey(mintedNew)
+			rig.client.ApplyExperimentVariant(ageGoldenExperiment)
+			rig.capture.setStatus(http.StatusAccepted)
+			rig.client.experimentCycle(ctx)
+			flushOrFail(t, rig.client)
+			byKey := deliveredByKey(rig.capture)
+			t.Logf("spooled after refusal=%d; delivered under the retired subject's minted key=%d, under the new subject's=%d", left, byKey[mintedOld], byKey[mintedNew])
+			if left != 0 || byKey[mintedOld] != 0 {
+				t.Errorf("the retired subject's fact under its minted key must be withdrawn: %d left spooled, %d delivered", left, byKey[mintedOld])
+			}
+			if byKey[mintedNew] != 1 {
+				t.Errorf("control: the new subject's fact must be delivered, got %d", byKey[mintedNew])
+			}
+			// The retired subject's facts are gone: its keys go with them.
+			rig.client.experimentCycle(ctx)
+			if retired := retiredFactKeyScopes(rig.client); retired != 0 {
+				t.Errorf("the retired subject has no live fact left, yet %d retired scope(s) keep fact keys", retired)
+			}
+		})
+	}
+}
+
+// The age refusals' withdrawal record is bounded like the history: an entry
+// stays while a fact it withdraws is still held by the worker (for a retry),
+// and goes the cycle after the worker dropped the last one.
+func TestAKeyWithdrawalIsForgottenWithItsLastFact(t *testing.T) {
+	rig := newAgeWithdrawRig(t, t.TempDir(), nil, ageGolden(t, "adult"), ageRefusalBody(t, "age_ineligible"))
+	fetchAdultAssignment(t, rig.client, ageGoldenExperiment)
+	rig.sealAndSpool(t, 2)
+	rig.refuse(t, "age_ineligible")
+	rig.client.experimentCycle(context.Background())
+	if held := keyWithdrawalKeys(rig.client, ageGoldenExperiment); !holdsFactKey(held, ageGoldenFactKey(t)) {
+		t.Errorf("the worker still holds withdrawn facts, yet their withdrawal is forgotten: %v", held)
+	}
+
+	rig.capture.setStatus(http.StatusAccepted)
+	flushOrFail(t, rig.client)
+	rig.client.experimentCycle(context.Background())
+	held := keyWithdrawalKeys(rig.client, ageGoldenExperiment)
+	delivered := len(deliveredExperimentFacts(rig.capture, ageGoldenExperiment))
+	t.Logf("after the worker dropped the last withdrawn fact: withdrawal record %v; delivered %d", held, delivered)
+	if len(held) != 0 {
+		t.Errorf("no fact under the withdrawn key is left, yet the withdrawal record keeps %v", held)
+	}
+	if delivered != 0 {
+		t.Errorf("%d withdrawn fact(s) delivered", delivered)
+	}
+}
+
+// A fact in its emit window keeps the withdrawal that condemns it: the
+// refusal lands after the fact is built from its owed record (withdrawing
+// the record) and before the fact is queued. A prune started in that window
+// waits for the emission, so the queued fact still meets its withdrawal at
+// the worker and is not delivered.
+func TestAPruneWaitsOutAFactInItsEmitWindow(t *testing.T) {
+	rig := newAgeWithdrawRig(t, t.TempDir(), nil, ageGolden(t, "adult"), ageRefusalBody(t, "age_ineligible"))
+	fetchAdultAssignment(t, rig.client, ageGoldenExperiment)
+	rig.client.ApplyExperimentVariant(ageGoldenExperiment)
+	var fired atomic.Bool
+	var refusalErr error
+	pruned := make(chan struct{})
+	prunedInTheWindow := false
+	rig.client.exp.mu.Lock()
+	rig.client.exp.consentRaceSeam = func(stage string) {
+		if stage != "exposure_enqueue" || !fired.CompareAndSwap(false, true) {
+			return
+		}
+		_, refusalErr = rig.client.FetchExperimentAssignmentWithAgeBand(context.Background(), ageGoldenExperiment, ExperimentAgeBandUnderThreshold, nil)
+		go func() {
+			rig.client.pruneExperimentFactKeys()
+			close(pruned)
+		}()
+		select {
+		case <-pruned:
+			prunedInTheWindow = true
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+	rig.client.exp.mu.Unlock()
+	rig.client.experimentCycle(context.Background())
+	<-pruned
+	if !fired.Load() || refusalErr != nil {
+		t.Fatalf("setup: the refusal must land in the emit window (fired=%v err=%v)", fired.Load(), refusalErr)
+	}
+	flushOrFail(t, rig.client)
+	delivered := len(deliveredExperimentFacts(rig.capture, ageGoldenExperiment))
+	t.Logf("prune completed inside the emit window=%v; delivered %d", prunedInTheWindow, delivered)
+	if delivered != 0 {
+		t.Errorf("the fact built before the refusal was delivered: the prune took its withdrawal in the emit window")
+	}
+}
+
+// A pulled spool chunk keeps the withdrawal that condemns its members: the
+// refusal sweeps them from the mirror while the worker holds the chunk, and
+// a prune in that moment must not forget the withdrawal the chunk's handoff
+// re-check reads.
+func TestAPruneWaitsOutAPulledSpoolChunk(t *testing.T) {
+	spool := t.TempDir()
+	rig := newAgeWithdrawRig(t, spool, nil, ageGolden(t, "adult"), ageRefusalBody(t, "age_ineligible"))
+	fetchAdultAssignment(t, rig.client, ageGoldenExperiment)
+	rig.sealAndSpool(t, 2)
+	rig.relaunch(t, http.StatusAccepted)
+	var fired atomic.Bool
+	var refusalErr error
+	rig.client.spoolResendHandoffSeam = func(chunk []spoolEntry) {
+		if !fired.CompareAndSwap(false, true) {
+			return
+		}
+		_, refusalErr = rig.client.FetchExperimentAssignmentWithAgeBand(context.Background(), ageGoldenExperiment, ExperimentAgeBandUnderThreshold, nil)
+		rig.client.pruneExperimentFactKeys()
+	}
+	flushOrFail(t, rig.client)
+	if !fired.Load() || refusalErr != nil {
+		t.Fatalf("setup: the refusal must land at the chunk handoff (fired=%v err=%v)", fired.Load(), refusalErr)
+	}
+	delivered := len(deliveredExperimentFacts(rig.capture, ageGoldenExperiment))
+	t.Logf("a prune ran while the worker held the pulled chunk; delivered %d", delivered)
+	if delivered != 0 {
+		t.Errorf("the pulled chunk published %d fact(s) the refusal withdrew", delivered)
 	}
 }

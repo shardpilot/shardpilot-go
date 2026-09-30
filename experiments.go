@@ -951,6 +951,67 @@ func exposureTupleKey(experimentKey string, entry *expEntry) string {
 type expDurableRecord struct {
 	Scope   string              `json:"scope"`
 	Entries map[string]expEntry `json:"entries"`
+	// FactKeyHistory is the scope's fact-key history: experiment key → the
+	// subject fact keys, sorted, that facts still live in the pipeline may
+	// carry although no entry does any more — a key an entry carried until a
+	// republish replaced it or a drop deleted it, and a key the apply
+	// endpoint minted for an assignment that carried none. An age refusal
+	// withdraws the facts of every key here with the entry's own. It sits
+	// beside the entries, not inside one, so it outlives the entry's delete.
+	// A record written before it existed loads with an empty history; a
+	// build that predates it ignores it and drops it on its next write.
+	FactKeyHistory map[string][]string `json:"fact_key_history,omitempty"`
+}
+
+// sanitizeFactKeyHistory keeps the well-formed part of a stored history:
+// named experiments, keys in the sfk1_ grammar, each once and sorted. A
+// corrupt member is dropped (corrupt = miss), never fed into a withdrawal.
+func sanitizeFactKeyHistory(history map[string][]string) map[string][]string {
+	var out map[string][]string
+	for experimentKey, factKeys := range history {
+		if experimentKey == "" {
+			continue
+		}
+		var kept []string
+		for _, factKey := range factKeys {
+			if expSubjectFactKeyPattern.MatchString(factKey) {
+				kept = insertFactKey(kept, factKey)
+			}
+		}
+		if len(kept) == 0 {
+			continue
+		}
+		if out == nil {
+			out = make(map[string][]string)
+		}
+		out[experimentKey] = kept
+	}
+	return out
+}
+
+// insertFactKey adds factKey to a sorted key list, once.
+func insertFactKey(keys []string, factKey string) []string {
+	i := sort.SearchStrings(keys, factKey)
+	if i < len(keys) && keys[i] == factKey {
+		return keys
+	}
+	keys = append(keys, "")
+	copy(keys[i+1:], keys[i:])
+	keys[i] = factKey
+	return keys
+}
+
+// copyFactKeyHistory deep-copies a history, so a record handed to a write
+// never aliases the memory copy's lists.
+func copyFactKeyHistory(history map[string][]string) map[string][]string {
+	if len(history) == 0 {
+		return nil
+	}
+	out := make(map[string][]string, len(history))
+	for experimentKey, factKeys := range history {
+		out[experimentKey] = append([]string(nil), factKeys...)
+	}
+	return out
 }
 
 // sanitizeExperimentEntries keeps only entries that are complete,
@@ -1143,6 +1204,28 @@ type experimentsState struct {
 	// documented ephemeral.
 	memorySubjectID string
 	memoryRecord    *expDurableRecord
+
+	// factKeys is the memory copy of the current scope's durable fact keys
+	// (expFactKeyMirror), nil until that record is first loaded or written.
+	factKeys *expFactKeyMirror
+
+	// retiredFactKeys keeps, in memory only, the fact-key history of scopes a
+	// subject re-mint retired: scope → experiment key → sorted fact keys. The
+	// retired subject's owed applications survive the rotation and can still
+	// be sealed, and refused by an apply route, while its facts are queued or
+	// spooled; its durable record is replaced by the next write. Those owed
+	// applications live only in memory, so nothing of this outlives the
+	// process either. The fact-key prune drops a key once no live fact
+	// carries it, and a scope once it holds none.
+	retiredFactKeys map[string]map[string][]string
+
+	// queuedFactSeq is, per experiment and subject fact key, the pipeline
+	// sequence (Event.expFactSeq) of the newest fact of that key handed to
+	// the analytics queue. The key stays live in the queue or the worker's
+	// batches while that sequence is at or above the worker's low-water mark
+	// (Client.expPipelineLow); entries below it are forgotten
+	// (forgetDequeuedFactsLocked).
+	queuedFactSeq map[string]map[string]uint64
 
 	// jitterFn is the uniform [0, 1) source for cadence jitter, wired from
 	// the owning client at construction (the Client.jitter seam). nil
@@ -1355,6 +1438,48 @@ type expOwedSync struct {
 	captureEntries []spoolEntry
 }
 
+// expFactKeyMirror is the memory copy of one scope's durable fact keys: the
+// subject fact key each entry carried in the record's last write (or its
+// load), and the record's fact-key history. The history here is the one
+// every write of the scope's record carries, so it can run ahead of the
+// disk while writes fail; durable reports that the disk holds exactly it.
+type expFactKeyMirror struct {
+	scope     string
+	entryKeys map[string]string
+	history   map[string][]string
+	durable   bool
+}
+
+// newFactKeyMirror is the memory copy of a record as it was loaded.
+func newFactKeyMirror(record *expDurableRecord) *expFactKeyMirror {
+	mirror := &expFactKeyMirror{
+		scope:     record.Scope,
+		entryKeys: make(map[string]string, len(record.Entries)),
+		history:   copyFactKeyHistory(record.FactKeyHistory),
+		durable:   true,
+	}
+	for key, entry := range record.Entries {
+		mirror.entryKeys[key] = entry.SubjectFactKey
+	}
+	return mirror
+}
+
+// addHistoryKey adds a key to the history of an experiment, reporting
+// whether it was new.
+func (m *expFactKeyMirror) addHistoryKey(experimentKey, factKey string) bool {
+	keys := m.history[experimentKey]
+	i := sort.SearchStrings(keys, factKey)
+	if i < len(keys) && keys[i] == factKey {
+		return false
+	}
+	if m.history == nil {
+		m.history = make(map[string][]string)
+	}
+	m.history[experimentKey] = insertFactKey(keys, factKey)
+	m.durable = false
+	return true
+}
+
 // scopedIntentKey is the durablePending map key: the (scope, experiment)
 // composite, joined with the separator no escaped component contains.
 func scopedIntentKey(scope, experimentKey string) string {
@@ -1458,6 +1583,10 @@ func (e *experimentsState) preload() (privacyRefused bool) {
 		// The record is condemned: nothing serves from it.
 		return
 	}
+	// The record's fact keys, the history among them, are this scope's
+	// from here on; the client prunes the history once the spool is loaded
+	// (pruneExperimentFactKeys), never before.
+	e.factKeys = newFactKeyMirror(record)
 	// A restored assignment serves and records nothing: an exposure is the
 	// host's application of the variant (ApplyExperimentVariant), and this
 	// session has applied nothing yet.
@@ -1763,7 +1892,11 @@ func (e *experimentsState) loadDurableRecordLocked() *expDurableRecord {
 		if e.memoryRecord == nil {
 			return nil
 		}
-		copied := expDurableRecord{Scope: e.memoryRecord.Scope, Entries: sanitizeExperimentEntries(e.memoryRecord.Entries)}
+		copied := expDurableRecord{
+			Scope:          e.memoryRecord.Scope,
+			Entries:        sanitizeExperimentEntries(e.memoryRecord.Entries),
+			FactKeyHistory: sanitizeFactKeyHistory(e.memoryRecord.FactKeyHistory),
+		}
 		return &copied
 	}
 	file, err := os.Open(path)
@@ -1783,24 +1916,150 @@ func (e *experimentsState) loadDurableRecordLocked() *expDurableRecord {
 		return nil
 	}
 	record.Entries = sanitizeExperimentEntries(record.Entries)
+	record.FactKeyHistory = sanitizeFactKeyHistory(record.FactKeyHistory)
 	return &record
 }
 
 // saveDurableRecordLocked persists the record atomically (private file, no
 // JSON HTML escaping; the record clamp refuses a write that could not be
 // read back whole). Returns false when the write did not land — the
-// previously stored record stays untouched.
+// previously stored record stays untouched. The write carries the scope's
+// fact-key history, with every key it takes out of the entries retired into
+// it (retireFactKeysLocked).
 func (e *experimentsState) saveDurableRecordLocked(record *expDurableRecord) bool {
-	if e.failDurableWritesForTests {
-		return false
-	}
 	if record == nil || record.Scope == "" {
 		return false
 	}
 	stored := expDurableRecord{Scope: record.Scope, Entries: sanitizeExperimentEntries(record.Entries)}
+	stored.FactKeyHistory = e.retireFactKeysLocked(&stored, record.FactKeyHistory)
+	return e.writeDurableRecordLocked(stored)
+}
+
+// retireFactKeysLocked is the retirement at the write, and returns the
+// history the write carries. A key an entry carried in the scope's previous
+// write and does not carry in this one — the entry replaced by an install
+// under another key, or deleted by any drop, the kill switch's included —
+// joins the history in this same write, so it never leaves the record while
+// a fact under it may still be spooled, queued or owed. The previous write
+// is the memory copy's for the current scope (it names a key a failed write
+// carried too, which the disk never saw); for another scope's record — a
+// retired subject's owed drop — it is the record on disk, whose own history
+// carries over. The memory copy follows the current scope's write whether
+// or not it lands: its history is the one owed to the disk.
+func (e *experimentsState) retireFactKeysLocked(stored *expDurableRecord, loaded map[string][]string) map[string][]string {
+	retire := func(history map[string][]string, previous map[string]string) map[string][]string {
+		for key, factKey := range previous {
+			if next, kept := stored.Entries[key]; factKey == "" || (kept && next.SubjectFactKey == factKey) {
+				continue
+			}
+			if history == nil {
+				history = make(map[string][]string)
+			}
+			history[key] = insertFactKey(history[key], factKey)
+		}
+		return history
+	}
+	mirror := e.factKeyMirrorLocked(stored.Scope)
+	if mirror == nil {
+		history := copyFactKeyHistory(sanitizeFactKeyHistory(loaded))
+		if previous := e.loadDurableRecordLocked(); previous != nil && previous.Scope == stored.Scope {
+			history = retire(history, newFactKeyMirror(previous).entryKeys)
+		}
+		return history
+	}
+	mirror.history = retire(mirror.history, mirror.entryKeys)
+	mirror.entryKeys = make(map[string]string, len(stored.Entries))
+	for key, entry := range stored.Entries {
+		mirror.entryKeys[key] = entry.SubjectFactKey
+	}
+	mirror.durable = false
+	return copyFactKeyHistory(mirror.history)
+}
+
+// factKeyMirrorLocked returns the memory copy of scope's fact keys when
+// scope is the current subject's, loading it from the durable record the
+// first time; nil for any other scope (see retiredFactKeys).
+func (e *experimentsState) factKeyMirrorLocked(scope string) *expFactKeyMirror {
+	if current := e.retireStaleFactKeysLocked(); scope == "" || scope != current {
+		return nil
+	}
+	if e.factKeys == nil {
+		e.factKeys = newFactKeyMirror(e.durableRecordForLocked(scope))
+	}
+	return e.factKeys
+}
+
+// retireStaleFactKeysLocked hands a memory copy whose scope is no longer the
+// current subject's (a re-mint rotated it) over to retiredFactKeys: its
+// history, and the keys its entries carried, which left the entries with the
+// rotation. Returns the current scope ("" with no subject).
+func (e *experimentsState) retireStaleFactKeysLocked() (current string) {
+	if subject := e.currentSubjectIDLocked(); subject != "" {
+		current = e.scopeForLocked(subject)
+	}
+	stale := e.factKeys
+	if stale == nil || stale.scope == current {
+		return current
+	}
+	e.factKeys = nil
+	history := e.retiredFactKeyHistoryLocked(stale.scope)
+	for experimentKey, factKeys := range stale.history {
+		for _, factKey := range factKeys {
+			history[experimentKey] = insertFactKey(history[experimentKey], factKey)
+		}
+	}
+	for experimentKey, factKey := range stale.entryKeys {
+		if factKey != "" {
+			history[experimentKey] = insertFactKey(history[experimentKey], factKey)
+		}
+	}
+	if len(history) == 0 {
+		delete(e.retiredFactKeys, stale.scope)
+	}
+	return current
+}
+
+// retiredFactKeyHistoryLocked returns a retired scope's history, creating an
+// empty one.
+func (e *experimentsState) retiredFactKeyHistoryLocked(scope string) map[string][]string {
+	if e.retiredFactKeys == nil {
+		e.retiredFactKeys = make(map[string]map[string][]string)
+	}
+	history := e.retiredFactKeys[scope]
+	if history == nil {
+		history = make(map[string][]string)
+		e.retiredFactKeys[scope] = history
+	}
+	return history
+}
+
+// saveFactKeyHistoryLocked writes the memory copy's history into scope's
+// record and leaves the record's entries as they are on disk. Returns
+// whether the write landed.
+func (e *experimentsState) saveFactKeyHistoryLocked(scope string) bool {
+	mirror := e.factKeyMirrorLocked(scope)
+	if mirror == nil {
+		return false
+	}
+	record := e.durableRecordForLocked(scope)
+	return e.writeDurableRecordLocked(expDurableRecord{
+		Scope:          scope,
+		Entries:        sanitizeExperimentEntries(record.Entries),
+		FactKeyHistory: copyFactKeyHistory(mirror.history),
+	})
+}
+
+// writeDurableRecordLocked writes a sanitized record (see
+// saveDurableRecordLocked) and, once it landed, marks the scope's memory
+// copy durable.
+func (e *experimentsState) writeDurableRecordLocked(stored expDurableRecord) bool {
+	if e.failDurableWritesForTests {
+		return false
+	}
 	path := e.cacheFilePath()
 	if path == "" {
 		e.memoryRecord = &stored
+		e.markFactKeysDurableLocked(stored.Scope)
 		return true
 	}
 	var buf bytes.Buffer
@@ -1826,12 +2085,125 @@ func (e *experimentsState) saveDurableRecordLocked(record *expDurableRecord) boo
 	// machinery retries the idempotent pair until both are on disk,
 	// because a resurrected tombstone would condemn the fresh record at
 	// the next launch.
-	return e.clearCondemnationTombstoneLocked("")
+	if !e.clearCondemnationTombstoneLocked("") {
+		return false
+	}
+	e.markFactKeysDurableLocked(stored.Scope)
+	return true
+}
+
+// markFactKeysDurableLocked records that a write of scope's record landed
+// with the memory copy's history.
+func (e *experimentsState) markFactKeysDurableLocked(scope string) {
+	if e.factKeys != nil && e.factKeys.scope == scope {
+		e.factKeys.durable = true
+	}
+}
+
+// settleFactKeyHistoryLocked is the retirement for a drop that finds no
+// entry stored to delete: the entry's own write never landed (it failed, or
+// the record clamp refused it), while facts under its key may already be
+// spooled. The drop writes nothing, so the key it takes out of the entries
+// would live only in memory and be lost at a relaunch. When the memory copy
+// names an entry key the stored record does not carry, the record is written
+// now with that key retired into its history — a fresh record only then,
+// when there is a history to carry. Best-effort: a failed write leaves the
+// key in the memory copy's history for the next write.
+func (e *experimentsState) settleFactKeyHistoryLocked(record *expDurableRecord) {
+	mirror := e.factKeyMirrorLocked(record.Scope)
+	if mirror == nil {
+		return
+	}
+	for key, factKey := range mirror.entryKeys {
+		if next, kept := record.Entries[key]; factKey != "" && (!kept || next.SubjectFactKey != factKey) {
+			e.saveDurableRecordLocked(record)
+			return
+		}
+	}
+}
+
+// knownFactKeysLocked is what the scope's record knows of the experiment's
+// subject fact keys: the key its entry carries there and the fact-key
+// history — for a retired scope, its history kept in memory.
+func (e *experimentsState) knownFactKeysLocked(scope, experimentKey string) []string {
+	mirror := e.factKeyMirrorLocked(scope)
+	if mirror == nil {
+		return append([]string(nil), e.retiredFactKeys[scope][experimentKey]...)
+	}
+	return append([]string{mirror.entryKeys[experimentKey]}, mirror.history[experimentKey]...)
+}
+
+// recordFactKeyLocked is the history's other source, run where a fact is
+// built (its sealed answer kept): a fact whose key is not its experiment's
+// entry key in the scope's record joins the history before the fact
+// exists, and durably. That is the key the apply endpoint minted for an
+// assignment that carried none, and an older entry's key that an outcome
+// following an older application still carries. The sealed answer is kept
+// only once the record holding the key has landed, so no durable copy of
+// the fact (a spooled one, a drop-time capture) can precede it; false means
+// that write failed and the caller discards the answer. A fact of a subject
+// a re-mint retired joins that scope's history in memory (retiredFactKeys).
+func (e *experimentsState) recordFactKeyLocked(experimentKey string, entry *expEntry, sealed *expSealedFact) bool {
+	factKey := entry.SubjectFactKey
+	if factKey == "" {
+		factKey = sealedFactKey(sealed)
+	}
+	if factKey == "" || entry.SubjectKey == "" {
+		return true
+	}
+	scope := e.scopeForLocked(entry.SubjectKey)
+	mirror := e.factKeyMirrorLocked(scope)
+	if mirror == nil {
+		history := e.retiredFactKeyHistoryLocked(scope)
+		history[experimentKey] = insertFactKey(history[experimentKey], factKey)
+		return true
+	}
+	if mirror.entryKeys[experimentKey] == factKey {
+		return true
+	}
+	if !mirror.addHistoryKey(experimentKey, factKey) && mirror.durable {
+		return true
+	}
+	// The disk may hold the key already: as the entry's own while a write
+	// that replaces it has not landed, or in a history this process has not
+	// written since.
+	stored := e.durableRecordForLocked(scope)
+	if stored.Entries[experimentKey].SubjectFactKey == factKey {
+		return true
+	}
+	for _, held := range stored.FactKeyHistory[experimentKey] {
+		if held == factKey {
+			return true
+		}
+	}
+	return e.saveFactKeyHistoryLocked(scope)
+}
+
+// sealedFactKey is the subject fact key a sealed fact carries as its
+// assignment_key, or "".
+func sealedFactKey(sealed *expSealedFact) string {
+	if sealed == nil {
+		return ""
+	}
+	var fact struct {
+		Props struct {
+			AssignmentKey string `json:"assignment_key"`
+		} `json:"props"`
+	}
+	if json.Unmarshal(sealed.fact, &fact) != nil || !expSubjectFactKeyPattern.MatchString(fact.Props.AssignmentKey) {
+		return ""
+	}
+	return fact.Props.AssignmentKey
 }
 
 // clearDurableRecordLocked drops the stored record outright (loads as "no
 // cache" afterwards). Returns true when the clear landed.
 func (e *experimentsState) clearDurableRecordLocked() bool {
+	// The fact-key history goes with the record: the real-subjects sentinel
+	// withdraws the keys and every fact that carries them, the retired
+	// subjects' included.
+	e.factKeys = nil
+	e.retiredFactKeys = nil
 	if e.failDurableWritesForTests {
 		return false
 	}
@@ -1928,6 +2300,9 @@ func (e *experimentsState) syncDurableEntryLocked(scope, experimentKey string, a
 		asOf = entry.FetchedAtMS
 	} else {
 		if !hasStored {
+			// No write of the entries follows, yet the entry's key may still
+			// leave them: retire it here (settleFactKeyHistoryLocked).
+			e.settleFactKeyHistoryLocked(record)
 			if existing, ok := e.durablePending[intentKey]; ok && existing.captureFirst {
 				// Nothing stored to delete, but the pending pair's FROZEN
 				// capture payload has not landed: the capture debt is a
@@ -2459,10 +2834,12 @@ func (e *experimentsState) applyAgeRefusedApplicationLocked(experimentKey string
 //     transport is wire-ambiguous: it is never re-sent, and not counted.
 //
 // The frozen capture and the pipeline match the subject's facts by the
-// experiment key and the subject fact keys: factKeys and those of the
-// withdrawn applications' assignments. With no key known those two legs
-// withdraw nothing: another subject's facts of the experiment (an earlier
-// subject's, kept across a re-mint) cannot be told apart there.
+// experiment key and the subject fact keys: factKeys, those of the
+// withdrawn applications (their assignments' and their sealed facts'), and
+// those the subject's durable record knows (its entry's and its fact-key
+// history). With no key known those two legs withdraw nothing: another
+// subject's facts of the experiment (an earlier subject's, kept across a
+// re-mint) cannot be told apart there.
 func (e *experimentsState) withdrawOwedApplicationsLocked(scope, subject, experimentKey string, factKeys []string) {
 	known := make(map[string]bool)
 	addFactKey := func(factKey string) {
@@ -2471,6 +2848,13 @@ func (e *experimentsState) withdrawOwedApplicationsLocked(scope, subject, experi
 		}
 	}
 	for _, factKey := range factKeys {
+		addFactKey(factKey)
+	}
+	// The scope's durable record knows more of the subject's keys than the
+	// live entry does: the fact-key history holds the keys of facts built
+	// under an entry a republish replaced or a drop deleted, and keys the
+	// apply endpoint minted (retireFactKeysLocked, recordFactKeyLocked).
+	for _, factKey := range e.knownFactKeysLocked(scope, experimentKey) {
 		addFactKey(factKey)
 	}
 	var kept []*expOwedExposure
@@ -2482,6 +2866,7 @@ func (e *experimentsState) withdrawOwedApplicationsLocked(scope, subject, experi
 		record.withdrawn = true
 		e.countOwedDropLocked(expDropAgeIneligible, record)
 		addFactKey(record.entry.SubjectFactKey)
+		addFactKey(sealedFactKey(record.sealed))
 	}
 	if len(kept) == 0 {
 		delete(e.pendingExposure, experimentKey)
@@ -2707,6 +3092,44 @@ func (e *experimentsState) armExposureLocked(experimentKey string, entry *expEnt
 	}
 	e.appendOwedLocked(experimentKey, &expOwedExposure{entry: entry, session: e.sessionMarker, app: app, extra: extra})
 	return true
+}
+
+// noteQueuedFactLocked records a fact handed to the analytics queue under
+// its pipeline sequence (see queuedFactSeq). Called while the emission
+// still holds emitMu, so the fact-key prune, which takes emitMu, never sees
+// the fact between its owed record and this note.
+func (e *experimentsState) noteQueuedFactLocked(experimentKey, factKey string, seq uint64) {
+	if experimentKey == "" || factKey == "" || seq == 0 {
+		return
+	}
+	if e.queuedFactSeq == nil {
+		e.queuedFactSeq = make(map[string]map[string]uint64)
+	}
+	byFactKey := e.queuedFactSeq[experimentKey]
+	if byFactKey == nil {
+		byFactKey = make(map[string]uint64)
+		e.queuedFactSeq[experimentKey] = byFactKey
+	}
+	if seq > byFactKey[factKey] {
+		byFactKey[factKey] = seq
+	}
+}
+
+// forgetDequeuedFactsLocked drops the queuedFactSeq entries below the
+// worker's low-water mark: those facts have left the queue and the worker.
+// Run at every note, so the map holds only keys with facts possibly still
+// queued or held, and by the prune.
+func (e *experimentsState) forgetDequeuedFactsLocked(low uint64) {
+	for experimentKey, byFactKey := range e.queuedFactSeq {
+		for factKey, seq := range byFactKey {
+			if seq < low {
+				delete(byFactKey, factKey)
+			}
+		}
+		if len(byFactKey) == 0 {
+			delete(e.queuedFactSeq, experimentKey)
+		}
+	}
 }
 
 // armOutcomeLocked arms one outcome, following the application it names.
@@ -3657,6 +4080,10 @@ func (c *Client) experimentCycle(ctx context.Context) {
 	// otherwise sit until an unrelated settle or Close fires the next
 	// off-lock drain.
 	c.drainDeferredSpoolLetters()
+	// Local housekeeping too, whatever the consent state: the fact keys no
+	// live fact carries any more leave the history and the withdrawal
+	// record, one cycle after a delivery, drop or withdrawal settled.
+	c.pruneExperimentFactKeys()
 	if c.experimentConsentRefusal() != nil {
 		return
 	}

@@ -143,10 +143,35 @@ type Client struct {
 	// withdrawal. expKeyWithdrawMu guards the map and orders the epoch's
 	// publication after it; it is a leaf lock. workerSeenKeyWithdraw is the
 	// worker-goroutine-owned seen mark, like workerSeenExpFactPurge.
+	// The fact-key prune (pruneExperimentFactKeys) removes an entry once no
+	// live fact of its experiment carries its key: a withdrawal applies only
+	// to facts built before it, so once those are gone nothing reads it.
 	expKeyWithdrawMu      sync.Mutex
 	expKeyWithdrawals     map[string]map[string]uint64
 	expKeyWithdrawEpoch   atomic.Uint64
 	workerSeenKeyWithdraw uint64
+
+	// expFactSeq numbers the experiment facts handed to the analytics queue
+	// (Event.expFactSeq), under lifecycleMu with the send, so the queue holds
+	// them in sequence order. expPipelineLow is the worker's low-water mark:
+	// every experiment fact with a lower sequence has left the queue and the
+	// worker's batches (delivered, dropped, or spooled and no longer held).
+	// The worker publishes it (publishExpPipelineLow) from
+	// workerLastFactSeq, the highest sequence it has received, and the
+	// lowest one its batch still holds; a stale mark only keeps a key live
+	// longer. expChunkHeld is set while the worker holds pulled spool resend
+	// chunks: their members are out of the mirror's reach for a moment, so
+	// the prune waits.
+	expFactSeq        atomic.Uint64
+	expPipelineLow    atomic.Uint64
+	workerLastFactSeq uint64
+	expChunkHeld      atomic.Bool
+
+	// spoolLeftUnloaded reports that the spool record was left on disk
+	// unread at start (its directory could not be made private): a later
+	// run may still load its facts, so this process never prunes the
+	// fact-key history. Written once during construction.
+	spoolLeftUnloaded bool
 
 	// deferredSpoolLetters holds dead-letters produced by spool work done
 	// under a state lock (the drop-time owed-exposure capture runs under
@@ -428,6 +453,9 @@ func NewClient(cfg Config) (*Client, error) {
 			client.stats.setLastError("experiment_dir_private_failed")
 			client.logf("shardpilot experiments: the state directory could not be made private (0700); persisted experiment state is not loaded and nothing serves from it")
 		}
+		// The spool is loaded (initSpool ran above), so the restored fact-key
+		// history can be pruned to the keys the restored facts still carry.
+		client.pruneExperimentFactKeys()
 		client.expLaneDone = make(chan struct{})
 		client.expLaneCtx, client.expLaneCancel = context.WithCancel(context.Background())
 	}
@@ -823,6 +851,7 @@ func (c *Client) run() {
 		}
 	}()
 	for {
+		c.publishExpPipelineLow(batch)
 		hadBatch := len(batch) > 0
 		batch = c.dropBatchOnConsentEpoch(batch, &seenConsentEpoch, &backoffAttempt)
 		if hadBatch && len(batch) == 0 {
@@ -978,6 +1007,9 @@ func (c *Client) run() {
 		case request := <-c.flushRequests:
 			var err error
 			batch, err = c.flushAvailable(request.ctx, batch, &seenConsentEpoch, &backoffAttempt)
+			// Before the reply: what the flush delivered or dropped is off the
+			// low-water mark by the time the caller can observe the flush.
+			c.publishExpPipelineLow(batch)
 			// Caller abandonment produces ZERO pacing side-effects — the
 			// empty-batch clear included: a canceled spool-only flush comes
 			// back with an empty batch while the requeued chunk is exactly
@@ -1387,6 +1419,9 @@ func (c *Client) dropBatchOnConsentEpoch(batch []Event, seenEpoch *uint64, backo
 // once (it escaped the drain's own count), never revived into a later
 // granted period.
 func (c *Client) admitReceivedEvent(batch []Event, event Event, seenEpoch *uint64, backoffAttempt *int) []Event {
+	if event.expFactSeq > c.workerLastFactSeq {
+		c.workerLastFactSeq = event.expFactSeq
+	}
 	batch = c.dropBatchOnConsentEpoch(batch, seenEpoch, backoffAttempt)
 	if event.intakeConsentEpoch < *seenEpoch {
 		c.stats.dropped.Add(1)
@@ -1413,6 +1448,25 @@ func (c *Client) admitReceivedEvent(batch []Event, event Event, seenEpoch *uint6
 		return batch
 	}
 	return append(batch, event)
+}
+
+// publishExpPipelineLow publishes the worker's low-water mark
+// (Client.expPipelineLow): the lowest pipeline sequence of an experiment
+// fact the worker's batch holds, else one past the highest it has received.
+// The queue holds facts in sequence order and the worker takes them in that
+// order, so every fact with a lower sequence has left both. Worker
+// goroutine only; a no-op without the experiments consumer.
+func (c *Client) publishExpPipelineLow(batch []Event) {
+	if c.exp == nil {
+		return
+	}
+	low := c.workerLastFactSeq + 1
+	for i := range batch {
+		if seq := batch[i].expFactSeq; seq != 0 && seq < low {
+			low = seq
+		}
+	}
+	c.expPipelineLow.Store(low)
 }
 
 // drainQueueAdmitted is admitReceivedEvent's bulk form for the flush path.

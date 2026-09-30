@@ -81,8 +81,9 @@ func (c *Client) experimentConsentRefusal() error {
 // configured identity by construction (anonymous_id = Config.AnonymousID;
 // user_id omitted on the wire by contract, not as an actor change).
 // atClose admits the fact past the closed gate: Close's last-chance sweep
-// runs after the closed store, and its facts ride the final flush.
-func (c *Client) enqueueExperimentFact(event Event, atClose bool) error {
+// runs after the closed store, and its facts ride the final flush. Returns
+// the fact's pipeline sequence (Event.expFactSeq).
+func (c *Client) enqueueExperimentFact(event Event, atClose bool) (uint64, error) {
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
 	// The intake stamp, read under lifecycleMu — the same lock a denial's
@@ -91,7 +92,7 @@ func (c *Client) enqueueExperimentFact(event Event, atClose bool) error {
 	// drain start, and the stamp provably predates that denial.
 	intakeEpoch := c.consentEpoch.Load()
 	if !atClose && c.closed.Load() {
-		return ErrClosed
+		return 0, ErrClosed
 	}
 	// Consent refusals here are RETRYABLE for the fact lane (an exposure
 	// snapshot stays owed and re-emits; the caller sees the refusal), so
@@ -99,10 +100,10 @@ func (c *Client) enqueueExperimentFact(event Event, atClose bool) error {
 	// outcomes drop facts, and a re-armed snapshot retried across a
 	// consent-closed window must not inflate the counter per attempt.
 	if c.consentDenied() {
-		return ErrConsentDenied
+		return 0, ErrConsentDenied
 	}
 	if c.consentFloorEnabled() && c.consentUndecided() {
-		return ErrConsentUnknown
+		return 0, ErrConsentUnknown
 	}
 	if c.consentFloorEnabled() && event.omitUserID && c.cfg.UserID != "" {
 		// The floor's grant covers the configured EFFECTIVE actor — with a
@@ -114,18 +115,22 @@ func (c *Client) enqueueExperimentFact(event Event, atClose bool) error {
 		// actor rule Enqueue applies to overridden identities applies
 		// here: refused, retryably (owed snapshots stay armed for a
 		// session whose actor shape may change).
-		return ErrConsentActorMismatch
+		return 0, ErrConsentActorMismatch
 	}
 	event, err := c.prepareEvent(event)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	event.intakeConsentEpoch = intakeEpoch
+	// The pipeline sequence is taken under lifecycleMu with the send, so the
+	// queue holds experiment facts in sequence order: the worker's low-water
+	// mark (Client.expPipelineLow) relies on it.
+	event.expFactSeq = c.expFactSeq.Add(1)
 	if !c.queue.enqueue(event) {
-		return ErrQueueFull
+		return 0, ErrQueueFull
 	}
 	c.stats.enqueued.Add(1)
-	return nil
+	return event.expFactSeq, nil
 }
 
 // ── exposure delivery: the apply hop, then the analytics lane ───────────────
@@ -240,6 +245,16 @@ func (c *Client) emitOwedExposure(ctx context.Context, experimentKey string, rec
 			e.mu.Unlock()
 			return false, expDropAgeIneligible, true
 		}
+		if !e.recordFactKeyLocked(experimentKey, owed.entry, sealed) {
+			// The fact would carry a key that is not its entry's (one the
+			// apply endpoint minted) and the record could not be written
+			// with it in the history: no copy of the fact may exist before
+			// that key is durable. The answer is discarded and the
+			// application stays owed; the next sweep re-sends it with the
+			// same exposure_id, and the platform seals the same fact.
+			e.mu.Unlock()
+			return false, "fact_key_unsaved", false
+		}
 		keyEpoch = c.expKeyWithdrawEpoch.Load()
 		record.sealed = sealed
 		e.mu.Unlock()
@@ -262,9 +277,18 @@ func (c *Client) emitOwedExposure(ctx context.Context, experimentKey string, rec
 	// and the fact intake's gate re-check — a consent flip landing here is
 	// the raced refusal the intake reports.
 	e.fireConsentRaceSeam("exposure_enqueue")
-	if err := c.enqueueExperimentFact(event, atClose); err != nil {
+	seq, err := c.enqueueExperimentFact(event, atClose)
+	if err != nil {
 		return false, err.Error(), false
 	}
+	// The fact is queued: its key stays live for the fact-key prune until the
+	// worker is past it. Still under emitMu, which the prune takes.
+	experimentOfFact, _ := event.Props["experiment_key"].(string)
+	factKey, _ := event.Props["assignment_key"].(string)
+	e.mu.Lock()
+	e.forgetDequeuedFactsLocked(c.expPipelineLow.Load())
+	e.noteQueuedFactLocked(experimentOfFact, factKey, seq)
+	e.mu.Unlock()
 	// Seam: the window between the successful enqueue and the bookkeeping
 	// re-locking below — a purge landing here races it.
 	e.fireConsentRaceSeam("exposure_enqueued")
@@ -1496,6 +1520,190 @@ func (c *Client) dropKeyWithdrawnSpoolChunkMembers(chunk []spoolEntry, pulledAt 
 		c.logf("shardpilot experiments: withheld %d pulled spool member(s) at the transport handoff (withdrawn by an age refusal; its spool sweep settles them)", withheld)
 	}
 	return kept
+}
+
+// ── the fact-key history: the prune ─────────────────────────────────────────
+//
+// A key stays in the history (expDurableRecord.FactKeyHistory) and in the
+// age refusals' withdrawal record (Client.expKeyWithdrawals) while a live
+// fact of its experiment carries it: owed (an owed record, a frozen
+// drop-time capture), queued or held by the worker (in flight, retained for
+// a retry), or spooled. The prune removes the rest. It is lazy — the lane's
+// cycle runs it, so it follows a delivery, a drop or a withdrawal within a
+// cycle — and it runs at start only after the spool is loaded, never
+// before. There is no count bound: the spool's own caps bound the facts,
+// and so the keys.
+
+// pruneExperimentFactKeys is the prune. It takes emitMu first (the lock
+// order): no fact is being built or emitted while it decides, so a fact in
+// its emit window — built from an owed record a refusal then withdrew, not
+// queued yet — cannot lose the key that withdraws it. It then takes e.mu,
+// and under it the spool lock and expKeyWithdrawMu, each on its own: the
+// existing order, with no new nesting.
+func (c *Client) pruneExperimentFactKeys() {
+	e := c.exp
+	if e == nil || c.spoolLeftUnloaded || !c.experimentFactKeysHeld() {
+		return
+	}
+	e.emitMu.Lock()
+	defer e.emitMu.Unlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	// Queued facts the worker is past are gone.
+	e.forgetDequeuedFactsLocked(c.expPipelineLow.Load())
+	e.retireStaleFactKeysLocked()
+	mirror := e.factKeys
+	experiments := make(map[string]bool)
+	if mirror != nil {
+		for experimentKey := range mirror.history {
+			experiments[experimentKey] = true
+		}
+	}
+	for _, history := range e.retiredFactKeys {
+		for experimentKey := range history {
+			experiments[experimentKey] = true
+		}
+	}
+	c.expKeyWithdrawMu.Lock()
+	for experimentKey := range c.expKeyWithdrawals {
+		experiments[experimentKey] = true
+	}
+	c.expKeyWithdrawMu.Unlock()
+	if len(experiments) == 0 {
+		return
+	}
+	live, complete := c.liveExperimentFactKeysLocked(experiments)
+	if !complete {
+		return
+	}
+	c.expKeyWithdrawMu.Lock()
+	for experimentKey, byFactKey := range c.expKeyWithdrawals {
+		if !experiments[experimentKey] {
+			continue
+		}
+		for factKey := range byFactKey {
+			if !live[experimentKey][factKey] {
+				delete(byFactKey, factKey)
+			}
+		}
+		if len(byFactKey) == 0 {
+			delete(c.expKeyWithdrawals, experimentKey)
+		}
+	}
+	c.expKeyWithdrawMu.Unlock()
+	for scope, history := range e.retiredFactKeys {
+		for experimentKey, factKeys := range history {
+			if kept := liveFactKeys(factKeys, live[experimentKey]); len(kept) == 0 {
+				delete(history, experimentKey)
+			} else {
+				history[experimentKey] = kept
+			}
+		}
+		if len(history) == 0 {
+			delete(e.retiredFactKeys, scope)
+		}
+	}
+	if mirror == nil {
+		return
+	}
+	pruned := false
+	for experimentKey, factKeys := range mirror.history {
+		kept := liveFactKeys(factKeys, live[experimentKey])
+		if len(kept) == len(factKeys) {
+			continue
+		}
+		pruned = true
+		if len(kept) == 0 {
+			delete(mirror.history, experimentKey)
+		} else {
+			mirror.history[experimentKey] = kept
+		}
+	}
+	if pruned {
+		// A failed write leaves the older, larger history on disk: harmless,
+		// the next write of the record or the next start's prune drops it.
+		mirror.durable = false
+		e.saveFactKeyHistoryLocked(mirror.scope)
+	}
+}
+
+// liveFactKeys is the part of a key list live facts still carry.
+func liveFactKeys(factKeys []string, live map[string]bool) []string {
+	var kept []string
+	for _, factKey := range factKeys {
+		if live[factKey] {
+			kept = append(kept, factKey)
+		}
+	}
+	return kept
+}
+
+// experimentFactKeysHeld is the prune's cheap first look, run every cycle:
+// with the histories and the withdrawal record all empty there is nothing to
+// prune, and the locks the prune takes are not taken.
+func (c *Client) experimentFactKeysHeld() bool {
+	e := c.exp
+	e.mu.Lock()
+	held := (e.factKeys != nil && len(e.factKeys.history) > 0) || len(e.retiredFactKeys) > 0
+	e.mu.Unlock()
+	if held {
+		return true
+	}
+	c.expKeyWithdrawMu.Lock()
+	defer c.expKeyWithdrawMu.Unlock()
+	return len(c.expKeyWithdrawals) > 0
+}
+
+// liveExperimentFactKeysLocked collects, for the given experiments, the
+// subject fact keys live facts carry — whichever subject they belong to, so
+// the answer only ever keeps more. Reports false when it cannot be complete
+// (see diskSpool.scanInternalFacts). Called under emitMu and e.mu.
+func (c *Client) liveExperimentFactKeysLocked(experiments map[string]bool) (map[string]map[string]bool, bool) {
+	e := c.exp
+	live := make(map[string]map[string]bool)
+	mark := func(experimentKey, factKey string) {
+		if factKey == "" || !experiments[experimentKey] {
+			return
+		}
+		if live[experimentKey] == nil {
+			live[experimentKey] = make(map[string]bool)
+		}
+		live[experimentKey][factKey] = true
+	}
+	markRaw := func(raw json.RawMessage) {
+		var wire experimentFactWire
+		if json.Unmarshal(raw, &wire) == nil && (wire.EventName == experimentExposureName || wire.EventName == experimentOutcomeName) {
+			mark(wire.Props.ExperimentKey, wire.Props.AssignmentKey)
+		}
+	}
+	// Owed: every record still queued for its apply hop or emission (one
+	// the sweep holds stays listed until its emission returns).
+	for experimentKey, list := range e.pendingExposure {
+		for _, record := range list {
+			mark(experimentKey, record.entry.SubjectFactKey)
+			mark(experimentKey, sealedFactKey(record.sealed))
+		}
+	}
+	// A drop-time capture whose spool append has not landed yet.
+	for _, pending := range e.durablePending {
+		for _, entry := range pending.captureEntries {
+			if entry.internalFact {
+				markRaw(entry.raw)
+			}
+		}
+	}
+	// Queued, or in the worker's batch: in flight, retained for a retry.
+	for experimentKey, byFactKey := range e.queuedFactSeq {
+		for factKey := range byFactKey {
+			mark(experimentKey, factKey)
+		}
+	}
+	// Spooled, restored chunks included (they stay in the mirror until
+	// settled).
+	if c.spool != nil && !c.spool.scanInternalFacts(&c.expChunkHeld, markRaw) {
+		return nil, false
+	}
+	return live, true
 }
 
 // captureOwedExposuresForDrop durably captures an entry's still-owed
