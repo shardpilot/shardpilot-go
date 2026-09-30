@@ -47,6 +47,12 @@ type Event struct {
 	// after it is a new application and is never withdrawn by it.
 	expKeyWithdrawEpoch uint64
 
+	// expFactSeq is the pipeline sequence an experiment fact was handed to
+	// the analytics queue under (Client.expFactSeq; zero for everything
+	// else). The fact-key prune reads it against the worker's low-water
+	// mark to tell whether the fact may still be queued or held.
+	expFactSeq uint64
+
 	// intakeConsentEpoch is the consent denial generation this event was
 	// ADMITTED under, stamped at the queue boundary. The worker joins a
 	// received event to its held batch only when this stamp matches the

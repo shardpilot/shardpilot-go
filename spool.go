@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -1970,6 +1971,28 @@ func (s *diskSpool) pullResendChunk(limit int, now time.Time) (chunk, expired []
 	return chunk, expired, persistFailed
 }
 
+// scanInternalFacts calls mark with the wire bytes of every SDK-authored
+// entry the mirror holds, for the fact-key prune. It reports false instead
+// when the mirror is not the whole answer: while the worker holds a pulled
+// resend chunk (held), whose members a withdrawal can sweep from the mirror
+// before the chunk's handoff re-check withholds them, and after a failed
+// record rewrite (dirty), when the file can still carry entries the mirror
+// dropped and a restart would reload. The flag is read under the spool
+// lock, which every pull takes after setting it.
+func (s *diskSpool) scanInternalFacts(held *atomic.Bool, mark func(raw json.RawMessage)) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if held.Load() || s.dirty {
+		return false
+	}
+	for _, entry := range s.entries {
+		if entry.internalFact {
+			mark(entry.raw)
+		}
+	}
+	return true
+}
+
 // requeueResend puts a chunk back at the FRONT of the resend queue after a
 // retriable failure, preserving oldest-first order. Entries purged while the
 // chunk was in flight are dropped, not re-queued.
@@ -2522,6 +2545,11 @@ func (c *Client) resendSpooledChunks(deferUntil *time.Time, backoffAttempt *int)
 	if s == nil {
 		return true
 	}
+	// Set before the first pull (see Client.expChunkHeld).
+	if c.exp != nil {
+		c.expChunkHeld.Store(true)
+		defer c.expChunkHeld.Store(false)
+	}
 	for {
 		// The age-refusal generation before the pull: every member of the
 		// chunk was spooled before it (dropKeyWithdrawnSpoolChunkMembers).
@@ -2611,6 +2639,11 @@ func (c *Client) flushSpooledChunks(ctx context.Context, backoffAttempt *int) er
 	s := c.spool
 	if s == nil {
 		return nil
+	}
+	// Set before the first pull (see Client.expChunkHeld).
+	if c.exp != nil {
+		c.expChunkHeld.Store(true)
+		defer c.expChunkHeld.Store(false)
 	}
 	var firstErr error
 	for {
@@ -2825,6 +2858,7 @@ func (c *Client) initSpool() []SpoolDeadLetter {
 		// records are left in place for a later run with the permissions
 		// fixed.
 		if err := ensurePrivateDir(s.dir, s.chmodFn); err != nil {
+			c.spoolLeftUnloaded = true
 			c.stats.setLastError("spool_dir_private_failed")
 			c.logf("shardpilot spool: the spool directory could not be made private (0700); the persisted record is not loaded and the disk spool is disabled: %v", err)
 			return nil

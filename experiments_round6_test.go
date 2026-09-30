@@ -151,9 +151,8 @@ func TestCaptureFailureKeepsCacheUntilPairLands(t *testing.T) {
 	if v := client.ExperimentVariant(expTestScopeKey); v != "" {
 		t.Fatalf("serving must stop at the drop, got %q", v)
 	}
-	record, err := os.ReadFile(filepath.Join(spoolDir, expCacheFileName))
-	if err != nil || !strings.Contains(string(record), expTestScopeKey) {
-		t.Fatalf("the durable record must keep the entry while the capture is owed (err=%v)", err)
+	if !durableRecordHolds(t, spoolDir, expTestScopeKey) {
+		t.Fatalf("the durable record must keep the entry while the capture is owed")
 	}
 
 	// Storage heals: the retry lands the capture, then converges the record.
@@ -166,9 +165,8 @@ func TestCaptureFailureKeepsCacheUntilPairLands(t *testing.T) {
 	if err != nil || !strings.Contains(string(spool), experimentExposureName) {
 		t.Fatalf("the healed retry must land the captured fact (err=%v)", err)
 	}
-	record, err = os.ReadFile(filepath.Join(spoolDir, expCacheFileName))
-	if err != nil || strings.Contains(string(record), expTestScopeKey) {
-		t.Fatalf("the record must converge once the pair lands (err=%v)", err)
+	if durableRecordHolds(t, spoolDir, expTestScopeKey) {
+		t.Fatalf("the record must converge once the pair lands")
 	}
 }
 

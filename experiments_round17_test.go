@@ -217,7 +217,7 @@ func TestSentinelPurgePreservesQueueOrder(t *testing.T) {
 		for h := 0; h < hostsPerRound; h++ {
 			hostIDs = append(hostIDs, fmt.Sprintf("order-%03d-%02d", i, h))
 		}
-		if err := client.enqueueExperimentFact(staleFact, false); err != nil {
+		if _, err := client.enqueueExperimentFact(staleFact, false); err != nil {
 			t.Fatalf("iteration %d: fact enqueue: %v", i, err)
 		}
 		for _, id := range hostIDs {
