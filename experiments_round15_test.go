@@ -245,7 +245,7 @@ func TestRacedConsentRefusalMapsToConsentError(t *testing.T) {
 			if drops := client.Snapshot().ExperimentExposureDrops; len(drops) != 0 {
 				t.Fatalf("a raced consent refusal drops nothing, got %v", drops)
 			}
-			if err := client.enqueueExperimentFact(Event{Name: experimentExposureName, omitUserID: true}, false); !errors.Is(err, tc.want) {
+			if _, err := client.enqueueExperimentFact(Event{Name: experimentExposureName, omitUserID: true}, false); !errors.Is(err, tc.want) {
 				t.Fatalf("the intake must answer the documented consent refusal %v, got %v", tc.want, err)
 			}
 			client.consent.Store(consentStateGranted)

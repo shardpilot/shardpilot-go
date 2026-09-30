@@ -72,9 +72,8 @@ func TestCaptureGateHoldsUntilDurable(t *testing.T) {
 	// The retry with the spool still broken must NOT release the gate: the
 	// record keeps the entry.
 	client.exp.retryDurableSync()
-	record, err := os.ReadFile(filepath.Join(spoolDir, expCacheFileName))
-	if err != nil || !strings.Contains(string(record), expTestScopeKey) {
-		t.Fatalf("the record must keep the entry until the FROZEN capture is durable (err=%v)", err)
+	if !durableRecordHolds(t, spoolDir, expTestScopeKey) {
+		t.Fatalf("the record must keep the entry until the FROZEN capture is durable")
 	}
 
 	// Storage heals: the frozen payload lands (or settles as already
@@ -86,9 +85,8 @@ func TestCaptureGateHoldsUntilDurable(t *testing.T) {
 	client.spool.appendFn = appendPrivateFile
 	client.spool.mu.Unlock()
 	client.exp.retryDurableSync()
-	record, err = os.ReadFile(filepath.Join(spoolDir, expCacheFileName))
-	if err != nil || strings.Contains(string(record), expTestScopeKey) {
-		t.Fatalf("the record must converge once the pair lands (err=%v)", err)
+	if durableRecordHolds(t, spoolDir, expTestScopeKey) {
+		t.Fatalf("the record must converge once the pair lands")
 	}
 }
 
