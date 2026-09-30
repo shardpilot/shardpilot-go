@@ -700,7 +700,7 @@ func (c *Client) TrackExperimentExposure(experimentKey string) error {
 	if err := c.experimentConsentRefusal(); err != nil {
 		return err
 	}
-	entry := e.entries[experimentKey]
+	entry := e.servedEntryLocked(experimentKey)
 	if entry == nil {
 		return ErrExperimentNoAssignment
 	}
@@ -797,6 +797,11 @@ func (c *Client) TrackExperimentOutcome(experimentKey, outcomeKey string, outcom
 	}
 	if err := c.experimentConsentRefusal(); err != nil {
 		return err
+	}
+	if e.declaring[experimentKey] != nil {
+		// A pending non-adult declaration records nothing under the
+		// earlier one.
+		return ErrExperimentNoAssignment
 	}
 	applied, ok := e.lastApplied[experimentKey]
 	if !ok {
