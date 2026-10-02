@@ -5,7 +5,7 @@ description: Use when integrating the ShardPilot Go SDK (shardpilot-go) into a G
 
 # Integrating the ShardPilot Go SDK
 
-The pinned release tag `v0.7.1-alpha` matches this guide; the owner creates it after the release PR merges, so wait if the install pin is still pending.
+The pinned release tag `v0.7.2-alpha` matches this guide; the owner creates it after the release PR merges, so wait if the install pin is still pending.
 The release retains compression, the 15-second flush default, independent retry pacing, goroutine-label sanitization and rejection history. Opt-in experiment integrations must follow the [migration from v0.6.4-alpha](../../../CHANGELOG.md#migration-from-v064-alpha): apply the variant before recording outcomes, allow asynchronous platform sealing, and declare the game's age band. Read the [experiment contract](../../../README.md#experiments-dark-opt-in) before enabling it; the default remains off.
 
 **SCOPE: the DEFAULT configuration.** `v0.6.0-alpha` added three opt-ins that
@@ -55,7 +55,7 @@ other calls, no automatic actions.
 ## Install
 
 ```bash
-go get github.com/shardpilot/shardpilot-go@v0.7.1-alpha
+go get github.com/shardpilot/shardpilot-go@v0.7.2-alpha
 ```
 
 - Requires **Go 1.25+** at the pinned tag.
