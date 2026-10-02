@@ -5,7 +5,7 @@ description: Use when integrating the ShardPilot Go SDK (shardpilot-go) into a G
 
 # Integrating the ShardPilot Go SDK
 
-The pinned release tag `v0.7.1-alpha` matches this guide; the owner creates it after the release PR merges, so wait if the install pin is still pending.
+The install command uses the pinned release tag `v0.7.2-alpha`; the owner creates it after the release PR merges, so wait if the install pin is still pending. The Known limitations section below records the source review for this release preparation.
 The release retains compression, the 15-second flush default, independent retry pacing, goroutine-label sanitization and rejection history. Opt-in experiment integrations must follow the [migration from v0.6.4-alpha](../../../CHANGELOG.md#migration-from-v064-alpha): apply the variant before recording outcomes, allow asynchronous platform sealing, and declare the game's age band. Read the [experiment contract](../../../README.md#experiments-dark-opt-in) before enabling it; the default remains off.
 
 **SCOPE: the DEFAULT configuration.** `v0.6.0-alpha` added three opt-ins that
@@ -55,7 +55,7 @@ other calls, no automatic actions.
 ## Install
 
 ```bash
-go get github.com/shardpilot/shardpilot-go@v0.7.1-alpha
+go get github.com/shardpilot/shardpilot-go@v0.7.2-alpha
 ```
 
 - Requires **Go 1.25+** at the pinned tag.
@@ -603,22 +603,23 @@ Run against your dev/staging deployment credentials, then check each item:
    shutdown, and that `Close` returns `nil` (pending events + consent
    receipts flushed within the deadline).
 
-## Known limitations (verified 2026-09-29 for `v0.7.1-alpha`)
+## Known limitations (release preparation 2026-10-02 for `v0.7.2-alpha`)
 
 **Same scope as the consent section: these describe the DEFAULT posture,
 with `Config.ConsentFloor` nil.** Several of the consent-related bullets
 below do not hold with the floor enabled — its contract is the
 `Config.ConsentFloor` godoc, not this list.
 
-All nine bullets were rechecked against SDK source at `e94dcf0f` on
-2026-09-28. The only source change in `v0.7.1-alpha` is the opt-in
-experiment cache restore, which none of them describes. The new experiment application/age contract is opt-in; the crash
-wire now includes fatality and the built-in sampling rate, while its default
-sampling and consent posture below remain unchanged. The consent-policy
-changes and limits are documented separately above. `Config.ConsentFloor`
-was introduced in `v0.6.0-alpha` and applies to the analytics client, not `pkg/crash`.
-Server permission requirements and deployment enablement are qualified
-below: this source review does not establish the deployed server's state.
+Rechecked all nine existing limitations against SDK source at `44284e59`
+on 2026-10-02, including the six changed non-test Go files since
+`v0.7.1-alpha`. They still hold: `v0.7.2-alpha` adds experiment age-withdrawal,
+fact-key history and pending age-declaration handling without changing the
+default delivery, consent, remote-config or crash limits below; the final
+two bullets make the experiment storage and in-flight withdrawal boundaries
+explicit. `Config.ConsentFloor` applies to the analytics client, not
+`pkg/crash`. Server permission requirements and deployment enablement are
+qualified below: this source review does not establish the deployed server's
+state.
 
 Stated plainly so integrations are designed around them, not surprised by
 them:
@@ -670,3 +671,13 @@ them:
 - **No built-in client-side crash consent gate** — `pkg/crash` does not use
   the analytics consent state. `Result.Suppressed` reports the server's
   response; the server's actual suppression policy is not verified here.
+- **One client per `SpoolDir`, across all processes.** Experiment subjects,
+  assignments and fact-key history share files, but withdrawal and re-mint
+  coordination belongs to one client instance. A second client can retain an
+  old subject or assignment, keep facts another client withdrew, or lose
+  fact-key history its own queued facts still need. The spool's merge-on-save
+  safety net does not make a shared directory a supported topology.
+- **Age withdrawal cannot recall an experiment fact already handed to the
+  transport.** It may already have been delivered. The client removes the
+  matching subject/experiment's owed, queued and spooled facts and prevents
+  their retry or re-spooling; this is not a server-side erasure guarantee.
