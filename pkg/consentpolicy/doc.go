@@ -3,11 +3,11 @@
 //
 // ⚠ WHAT THIS PACKAGE IS NOT, because every one of these would be a defect:
 //
-//   - NOT a consent grant, and not legal advice. A plan carries the
-//     STRICT_OPT_IN regime or, for a workspace that has accepted ShardPilot's
-//     advisory estimates, an advisory, non-binding estimate, and the
-//     integrating studio decides what to do with it; it never says a player
-//     agreed to anything. A notice-and-objection outcome needs its own
+//   - NOT a consent grant, and not legal advice. A plan's regime is
+//     STRICT_OPT_IN. A workspace that has accepted ShardPilot's advisory
+//     estimates may additionally receive an advisory, non-binding estimate,
+//     and the integrating studio decides what to do with it. Neither says a
+//     player agreed to anything. A notice-and-objection outcome needs its own
 //     distinct admission-basis representation; setting an analytics consent
 //     boolean to stand in for one would record a grant nobody gave. Nothing
 //     here touches the analytics consent state.
