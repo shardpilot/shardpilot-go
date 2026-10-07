@@ -66,8 +66,8 @@ go get github.com/shardpilot/shardpilot-go@v0.7.2-alpha
   - `github.com/shardpilot/shardpilot-go/pkg/consentpolicy` — fail-closed plan validation (no plan is used in this release).
 - **`v0.1.0` is retracted** in `go.mod`; never pin it. **Do not reach back to an
   earlier tag at all**, and do not offer one as a fallback. Do not pin
-  `v0.5.0-alpha` or `v0.6.0-alpha`; `v0.6.1-alpha` supersedes them with no Go
-  source difference. `v0.4.0-alpha` and below predate most of what this skill
+  `v0.5.0-alpha` or `v0.6.0-alpha`; use `v0.6.1-alpha` or later (`v0.6.1-alpha`
+  has no Go source difference from `v0.6.0-alpha`). `v0.4.0-alpha` and below predate most of what this skill
   documents. If you need a release without the features described here, wait
   for a later one.
 - `IngestURL` is the base URL of the ShardPilot ingest deployment you were
