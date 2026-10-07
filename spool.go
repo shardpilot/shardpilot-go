@@ -181,9 +181,8 @@ type spoolEventWire struct {
 //
 // The v2 document is a single JSON object holding every envelope, so an append
 // re-reads it, re-marshals it, and rewrites it — O(spool size) per event, and
-// on this SDK O(2x) because the merge reads first. docs/SPOOL_APPEND_ONLY_DESIGN.md
-// (shipped with the Unity SDK, the reference implementation) works through why
-// splicing into the array format is unsafe and settles on a line format:
+// on this SDK O(2x) because the merge reads first. Splicing into the array
+// format is unsafe, so v3 settles on a line format:
 //
 //	{"version":3,"max_events":2000,"max_bytes":1048576,"retry_after_until_ms":0}
 //	{"raw":{...},"internal_fact":true}

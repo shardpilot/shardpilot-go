@@ -97,25 +97,7 @@
   layer collapses on; `Currency` is upper-cased to the ISO 4217 canonical
   form. The quickstart and `examples/basic` use it.
 
-- **Documentation-only: internal ShardPilot material removed from the published tree.**
-  No API, wire format or behaviour changes.
-
-  This repository is public, so every tracked byte is published. Two internal agent skills
-  under `.claude/skills/` were tracked here and described ShardPilot's own review process and
-  backend stack; they are gone, and this note does not name them because naming them here
-  would publish the same thing again. Internal decision-record ids, internal
-  service names, an internal commit sha and internal deployment state have been removed from
-  `README.md`, this changelog, `docs/release.md` and the customer integration skill — the
-  engineering content each one annotated stays, restated so a reader outside ShardPilot can
-  act on it.
-
-  Three things this deliberately does NOT claim. It does not unpublish the history: removing
-  a file at HEAD leaves every commit that carried it, and this repository has been public
-  throughout. It does not cover Go doc comments, which still carry internal citations; that
-  is owed work in another workstream and is not touched here. And it does not prevent a
-  recurrence — a check that fails on internal material in the published surface is a separate
-  change, deliberately kept out of this one so that removing what is exposed today does not
-  wait on it.
+- **Documentation cleanup.** No API, wire-format or behaviour change.
 
 - **An unreadable consent outbox no longer resurrects a superseded grant
   (privacy fix).** The durable outbox is this SDK's only cross-restart
@@ -357,26 +339,8 @@
 
 ## v0.6.1-alpha - 2026-08-20
 
-- **Removed two internal agent skills from the published artifact.** No API,
-  wire-format or behaviour change: this tag is `v0.6.0-alpha` with eight files
-  deleted and no Go source difference.
-
-  They were not merely present in this repository's history. `go get
-  github.com/shardpilot/shardpilot-go@v0.6.0-alpha` DELIVERED EIGHT OF THEIR
-  FILES — the module zip is cached by the module proxy, so following the
-  documented install command handed them out. (The `.claude/skills/` tree in
-  that zip holds nine files; the ninth is the customer-facing integration
-  skill, which stays.) One described an internal review
-  process; the other published the backend stack with versions, the
-  tenant-isolation mechanism in operational detail with a named runtime role,
-  an inventory of internal repositories with their build commands, and
-  statements about where automated coverage does not reach.
-
-  **Forward-only, and the limit is worth stating.** `v0.6.0-alpha` stays
-  reachable, its zip stays cached on the module proxy and its hash stays in the
-  checksum database, where nothing ShardPilot does can withdraw it — deleting
-  this repository would not. This stops new installs that follow the
-  documentation; it recalls nothing.
+- **Documentation-only release.** No API, wire-format or behaviour change, and
+  no Go source difference from `v0.6.0-alpha`.
 
 ## v0.6.0-alpha — 2026-08-03 — crash actor key, experiments, remote-config targeting
 

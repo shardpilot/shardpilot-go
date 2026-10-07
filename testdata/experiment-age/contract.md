@@ -24,7 +24,7 @@ It varied only the presence/value of `age_band`.
 
 The raw bodies are retained privately as capture receipts. The committed files
 remove **only** the JSON member `/boundary/analytics_fact_ownership`, including
-its preceding comma, because its value names an internal service. They are
+its preceding comma, because its value is outside the public contract. They are
 explicit projections, not byte-identical copies of the complete responses.
 All other bytes, including assignment, reason, version, subject-fact key and
 serving state, are unchanged. No scanner exception or encoded private value is

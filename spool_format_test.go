@@ -13,11 +13,11 @@ import (
 	"time"
 )
 
-// The v3 append-only format's acceptance, per docs/SPOOL_APPEND_ONLY_DESIGN.md.
+// The v3 append-only format's acceptance.
 //
 // These are assertions about BEHAVIOUR against real files, deliberately not
-// about wall-clock: the latency numbers are machine-specific and live in
-// docs/SPOOL_OVERFLOW_LATENCY_BOUND.md, where they cannot make CI flaky.
+// about wall-clock: latency numbers are machine-specific, so they are not
+// asserted here, where they could make CI flaky.
 
 func formatTestSpool(t *testing.T, dir string, maxEvents int, maxBytes int) *diskSpool {
 	t.Helper()
@@ -162,8 +162,7 @@ func TestSpoolStaysBoundedAcrossSustainedOverflow(t *testing.T) {
 //
 // ⚠ THAT IS THE ONE WINDOW THE BOUND MEASURES. It read 234x against a 2x bound,
 // while a measurement that stopped at the cap saw 0.3x and looked finished. The
-// latency itself is machine-specific and lives in
-// docs/SPOOL_OVERFLOW_LATENCY_BOUND.md, so what is asserted here is the
+// latency itself is machine-specific, so what is asserted here is the
 // mechanism underneath it: an evicting append must not replace the file.
 func TestEvictionDoesNotRewrite(t *testing.T) {
 	dir := t.TempDir()
