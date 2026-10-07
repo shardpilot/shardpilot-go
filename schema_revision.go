@@ -16,9 +16,8 @@ const schemaRevisionHeader = "X-ShardPilot-Schema-Revision"
 // DefaultSchemaRevision identifies the ingest service's embedded envelope
 // schema set this SDK release was coordinated against. It is the server's
 // own digest of that set: sha256 over the lexicographically sorted
-// schemas/apicurio/*.schema.json files embedded in the analytics-service
-// binary (each file fed length-prefixed as "{len(name)}:{name}\n{len(content)}:"
-// + content + "\n"), currently pinned to analytics-service main @ 7d118c5.
+// envelope schema files the server embeds (each file fed length-prefixed as
+// "{len(name)}:{name}\n{len(content)}:" + content + "\n").
 //
 // This is a PUBLIC schema-set fingerprint — a content hash of served schema
 // definitions, not a secret or a credential. It must be re-synced (bumped to

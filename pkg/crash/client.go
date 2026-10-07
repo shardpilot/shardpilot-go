@@ -69,9 +69,9 @@ type ClientOptions struct {
 	// Manual Emit/EmitFatal events are never touched — their modules stay
 	// caller-owned.
 	//
-	// Default false — DARK (ADR-0297 §7d): while off, zero self-read code paths
+	// Default false — DARK: while off, zero self-read code paths
 	// execute and the auto-captured wire shape stays byte-identical to the
-	// pre-fill SDK. Phase-D arming order (§12): enable only after the SDK's
+	// pre-fill SDK. Phase-D arming order: enable only after the SDK's
 	// client-side consent gate and durable spool have landed — new capture detail
 	// must not ship ahead of consent parity.
 	DebugIDFillEnabled bool
@@ -83,9 +83,9 @@ type ClientOptions struct {
 	// 256 total frames, in dump order, at most 16 frames per non-crashing
 	// goroutine.
 	//
-	// Default false — DARK (ADR-0297 §7d): while off, the dump is never taken and
+	// Default false — DARK: while off, the dump is never taken and
 	// the auto-captured wire shape stays byte-identical. Same Phase-D arming
-	// order as DebugIDFillEnabled (§12): consent gate + durable spool first.
+	// order as DebugIDFillEnabled: consent gate + durable spool first.
 	AllGoroutineCaptureEnabled bool
 	HTTPClient                 *http.Client
 	Logger                     Logger

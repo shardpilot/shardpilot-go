@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-// All-goroutine capture (ADR-0297 §7d): with
+// All-goroutine capture: with
 // ClientOptions.AllGoroutineCaptureEnabled on, auto-capture snapshots every
 // goroutine at panic time (runtime.Stack all) and ships the OTHER goroutines as
 // additional pre-symbolicated threads[] beside the precise crashed thread. The

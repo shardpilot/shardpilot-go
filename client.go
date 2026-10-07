@@ -1078,7 +1078,7 @@ func (c *Client) nextPacingWake(eventsDeferUntil time.Time) time.Duration {
 	// expires in between (a preemption is enough) leaves this returning no
 	// wake at all, the timer disarmed, and an otherwise idle client waiting
 	// out the 15-second flush tick. The window is small and the cost is a
-	// whole flush interval, on both planes (Codex on #48).
+	// whole flush interval, on both planes.
 	//
 	// Floored to a positive duration so the shared timer actually fires. The
 	// pass it wakes runs the fast paths again, which is what consumes the
@@ -1103,8 +1103,7 @@ func (c *Client) nextPacingWake(eventsDeferUntil time.Time) time.Duration {
 	// arms the timer — so a restarted process with no enqueue and no explicit
 	// Flush would leave durable retries sitting until the first flush tick,
 	// which raising the flush default just stretched from one second to
-	// fifteen. That is outstanding recovery work, not a partial idle batch
-	// (Codex on #48).
+	// fifteen. That is outstanding recovery work, not a partial idle batch.
 	//
 	// Arming a wake rather than publishing inline is deliberate: a startup
 	// Flush racing this would otherwise be doubled into two attempts at a
@@ -1179,7 +1178,7 @@ func (c *Client) nextPacingWake(eventsDeferUntil time.Time) time.Duration {
 // dispatches at the next point and the startup wake is the right nudge; a
 // PARKED one already has an authoritative wake source, because
 // nextPacingWake takes the consent plane's own remaining time as one of its
-// terms (Codex on #48).
+// terms.
 func (c *Client) consentGatedResendParked() bool {
 	if c.consentOutbox == nil || !c.consentOutbox.deferralActive(c.clock.Now()) {
 		return false

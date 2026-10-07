@@ -3587,7 +3587,7 @@ func TestSpoolReadLimitScalesWithEventCap(t *testing.T) {
 // the persisted deadline is zero, and nothing arms the worker's timer. Before
 // the fix that chunk waited for the first flush tick, which raising the flush
 // default stretched from one second to fifteen; the FlushInterval below is an
-// hour, so a regression parks it effectively forever (Codex on #48).
+// hour, so a regression parks it effectively forever.
 func TestStartupSpoolResendDoesNotWaitForTheFlushTick(t *testing.T) {
 	state, server := newSpoolTestServer(t)
 	defer server.Close()
@@ -3627,7 +3627,7 @@ func TestStartupSpoolResendDoesNotWaitForTheFlushTick(t *testing.T) {
 // against a BatchSize of 100, so the batch cannot fill for ten seconds — they
 // exist only to keep waking the worker. The three-second bound sits between
 // the two outcomes: the recovery wake lands at ~1s, while under the defect
-// nothing publishes until the batch fills at ~10s (Codex on #48).
+// nothing publishes until the batch fills at ~10s.
 func TestStartupSpoolResendSurvivesFrequentUnrelatedWakes(t *testing.T) {
 	state, server := newSpoolTestServer(t)
 	defer server.Close()
@@ -3748,7 +3748,7 @@ func TestStartupSpoolResendSurvivesAWakeThatSpansItsDeadline(t *testing.T) {
 //
 // The events deferral is the better wake source for that work regardless:
 // when it expires the deferWake case publishes, which IS the resend. So the
-// clause stands down while it is armed (Codex on #48).
+// clause stands down while it is armed.
 func TestStartupWakeStandsDownUnderAPersistedDeferral(t *testing.T) {
 	clock := &stubClock{now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
 	client := &Client{clock: clock, spool: &diskSpool{

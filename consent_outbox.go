@@ -56,7 +56,7 @@ const (
 	maxConsentOutboxEntries = 32
 
 	// maxConsentIdentifierBytes bounds host-supplied identifiers on the
-	// receipt path, in BYTES (cross-SDK contract, GAP-075): receipts persist
+	// receipt path, in BYTES (cross-SDK contract): receipts persist
 	// identifiers verbatim and the outbox has no byte budget of its own, so
 	// the identifier clamp is what keeps the 32-receipt worst case bounded.
 	// Oversized identifiers are REJECTED, never truncated — truncation could
@@ -1178,7 +1178,7 @@ func (o *consentOutbox) deferralActive(now time.Time) bool {
 // deadline, parking the receipt until the next flush tick. That is exactly the
 // cadence coupling this SDK's retry pacing was separated from; the events
 // plane has always had a fast path for its own elapsed deadline, and the
-// consent plane did not (Codex on #48).
+// consent plane did not.
 //
 // CLEARING rather than merely reporting is what makes the caller's fast path
 // safe to loop on: the parking window is over, so the deadline has done its
@@ -1192,7 +1192,7 @@ func (o *consentOutbox) deferralActive(now time.Time) bool {
 // dispatch left neither pass sending the receipt — the caller had already
 // decided to skip on a deadline that was still live when it looked — and with
 // the deadline gone nothing armed a timer, so the receipt waited for the flush
-// tick after all (Codex on #48).
+// tick after all.
 func (o *consentOutbox) consumeElapsedDeferral(now time.Time) bool {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -2270,8 +2270,8 @@ func (c *Client) armConsentDeferral(err error) {
 	// with nothing else pending it has no wake source but the flush tick.
 	// Nudge it so it re-evaluates and arms a timer for the deadline set
 	// below — otherwise a one-second consent retry waits out the whole flush
-	// interval, which is the coupling this SDK's pacing was separated from
-	// (Codex on #48). Non-blocking and idempotent; deferred so it runs after
+	// interval, which is the coupling this SDK's pacing was separated from.
+	// Non-blocking and idempotent; deferred so it runs after
 	// the deadline is actually visible.
 	defer c.wakeConsentDispatch()
 

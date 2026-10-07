@@ -59,7 +59,7 @@ import (
 // it returns the cache-served transient_429 outcome, indistinguishable from a
 // live 429. This is a deliberate delta vs the Defold/Unity reference clients
 // (which ignore Retry-After on this route) — the client half of the
-// control plane's server-side RemoteConfigFetchRateLimit.
+// server's remote-config fetch rate limit.
 
 // rcMaxBodyBytes caps how much of a remote-config response body is read: the
 // server contract caps targeted configuration at 1MB (answering 413 above
@@ -109,7 +109,7 @@ type rcCache struct {
 	ETag        string `json:"etag"`
 	Body        string `json:"body"`
 	FetchedAtMS int64  `json:"fetched_at_ms"`
-	// The ADR-0310 attribute signature of the fetch that produced this
+	// The targeting-attribute signature of the fetch that produced this
 	// record ("" = attribute-less; otherwise a SHA-256 digest of the
 	// normalized attribute query). IN-MEMORY ONLY — deliberately never
 	// serialized (json:"-"): even a digest of the small, known targeting
@@ -145,7 +145,7 @@ type remoteConfigState struct {
 	scope     string
 
 	// attributes is the developer-supplied targeting attribute set
-	// (ADR-0310, dark behind Config.RemoteConfigAttributesEnabled). Stored
+	// (dark behind Config.RemoteConfigAttributesEnabled). Stored
 	// RAW: normalization (vocabulary allowlist, bounds, sort) happens at
 	// FETCH time so it always reflects the current experiment vocabulary,
 	// and the consent gate is evaluated per fetch — a downgrade after
@@ -248,7 +248,7 @@ func buildRemoteConfigURL(baseURL, workspaceID, environmentID, clientID string) 
 		escapeRemoteConfigSegment(clientID)
 }
 
-// appendRemoteConfigAttributes appends the ADR-0310 targeting attributes as
+// appendRemoteConfigAttributes appends the targeting attributes as
 // query parameters — already normalized (allowlisted, bounded, SORTED) by
 // normalizeExperimentAttributes, escaped with the same injective escaper the
 // path segments use (the experiment assignment URL's exact discipline).
@@ -790,7 +790,8 @@ func rcFetchError(code string) error {
 // normalized attribute query — never the query itself, so the durable cache
 // record carries zero personal-data-shaped bytes (an equality comparison is
 // the signature's ONLY use). The attribute-less signature stays the empty
-// string, which every pre-ADR-0310 durable record also unmarshals to.
+// string, which every durable record written before attribute pass-through
+// also unmarshals to.
 func rcAttributeSignature(query string) string {
 	if query == "" {
 		return ""
@@ -800,7 +801,7 @@ func rcAttributeSignature(query string) string {
 }
 
 // SetRemoteConfigAttributes replaces the client's targeting attribute set
-// for the ADR-0310 remote-config attribute pass-through (nil or empty
+// for the remote-config attribute pass-through (nil or empty
 // clears). Inert while Config.RemoteConfigAttributesEnabled is false: the
 // call returns without retaining anything — the dark posture stores zero
 // bytes of the personal-data-shaped input, not just "never sends it". With
@@ -919,7 +920,7 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 	}
 	rc.mu.Unlock()
 
-	// ADR-0310 attribute pass-through: opt-in AND ConsentGranted. The URL is
+	// Attribute pass-through: opt-in AND ConsentGranted. The URL is
 	// PREPARED here but the consent gate is read at the LAST moment before
 	// dispatch (below), so a downgrade landing while the fetch is being
 	// prepared still strips the attributes; one landing after dispatch
