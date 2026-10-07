@@ -1,65 +1,37 @@
 #!/usr/bin/env bash
 # check_public_surface.sh — this repository is PUBLIC, so every tracked byte is
-# published. This gate fails when internal ShardPilot material appears in the
-# part of the tree it covers.
-#
-# WHY IT EXISTS. The org-wide publication-readiness check enumerates
-# publication CANDIDATES — repositories that are private and might be flipped.
-# This repository is not a candidate, because it is already public. Nothing
-# scanned it, and that is exactly how an internal review-process skill,
-# internal decision-record ids, an internal service name and an internal commit
-# sha came to sit in a public repository for months. A gate that runs where the
-# exposure already exists is the fix.
+# published. This gate fails when internal material appears in the part of the
+# tree it covers. It runs here because a public repository is exactly where such
+# material would already be exposed.
 #
 # ── ONE CLASS IS NOT ABOUT NAMES AT ALL ─────────────────────────────────────
-# NEGATIVE STATEMENTS ABOUT COVERAGE. A sentence naming a test tool, a
-# repository, and the fact that the one does not exist in the other. It names
-# no service, no host and no credential, and it was the single most valuable
-# line in the material this gate was built after: a published map of where our
-# testing does not reach. An outsider does not need a secret if they are told
-# where nobody is looking.
+# NEGATIVE STATEMENTS ABOUT COVERAGE: a sentence saying that some test tool or
+# kind of coverage does not exist for some part of a system. It names no
+# service, no host and no credential, yet it is a map of where testing does not
+# reach, and an outsider does not need a secret if they are told where nobody
+# is looking. Such a sentence is usually written in good faith by someone
+# documenting an honest limit. That belongs in internal notes, not in a
+# repository that publishes. Hence a class rather than a cleanup.
 #
-# The example is described rather than quoted, and that is not fastidiousness —
-# the first version of this paragraph reproduced the sentence verbatim, so the
-# file explaining why such a sentence must not be published was publishing one.
-# It went unseen while this file exempted itself from its own scan.
-#
-# Deleting the file that carried it is not enough, because the next such
-# sentence will be written in good faith by someone documenting an honest
-# limit. Honesty about limits belongs in internal docs; in a repository that
-# publishes, it is reconnaissance. Hence a class rather than a cleanup.
-#
-# ── THE OTHER PATTERNS ARE SHAPES, NOT A ROSTER ─────────────────────────────
-# A gate against internal names, written as a list of internal names, publishes
-# that list. The first draft of this file did exactly that: it introduced five
-# internal names into this repository that had never appeared in it, and then
-# exempted itself from the lane it gates. It was a leak wearing the costume of
-# a fix.
-#
-# So the patterns below match SHAPES wherever a shape works. `ADR-[0-9]+`,
-# `GAP-[0-9]{3}` and `main @ <sha>` name no record, no ticket and no branch.
-# `ADR-[0-9]+` and `GAP-[0-9]+` name no decision and no ticket. The only
-# literals that remain are ones this repository's TREE still carries elsewhere,
-# so the file adds nothing to what a clone of it already hands over.
+# ── THE PATTERNS ARE SHAPES; THE NAME ROSTER IS DIGESTS ─────────────────────
+# A gate against internal names, written as a list of those names, would
+# publish the list. So the patterns below match SHAPES wherever a shape works:
+# `ADR-[0-9]+` and `GAP-[0-9]{3}` name no record and no ticket, and
+# `main @ <sha>` names no branch. Where only a name will do, the roster holds a
+# salted SHA-256 digest of it and never the name itself (ROSTER_DIGESTS below).
 #
 # THREE SHAPES WERE TRIED AND WITHDRAWN, because a gate that cries wolf gets
 # silenced, and a silenced gate is the one that misses the real thing:
 #   `-plane`     — this SDK's own vocabulary says event plane, consent plane,
-#                  analytics plane. Narrowed to the single `-plane` name that
-#                  is a service rather than a concept; it is in ROSTER above.
-#   `-platform`  — fired on "per-platform" and "cross-platform". Dropped; the
-#                  only internal `-platform` name appears in zero commits here.
-#   `-service`   — fired on "self-service". Replaced by the two service names
-#                  this repository's tree still carries elsewhere, which is
-#                  the rule the whole list follows.
-#
-# ⚠ THE GAP THAT LEAVES, NAMED RATHER THAN IMPLIED: a service name that has
-# never appeared here would not be caught, and this repository is outside the
-# org-wide check that would catch it (it enumerates PRIVATE candidates). Until
-# that check covers already-public repositories, a NEW internal name reaching
-# this tree is caught by review or not at all.
+#                  analytics plane.
+#   `-platform`  — fired on "per-platform" and "cross-platform".
+#   `-service`   — fired on "self-service".
 #   `[0-9a-f]{40}` — fired on a legitimate pinned engine sha1 in CI. Narrowed
-#                  to `main @ <sha>`, which is the shape that actually leaked.
+#                  to `main @ <sha>`.
+# Names that no shape can separate from ordinary prose are in the roster.
+#
+# ⚠ THE GAP THAT LEAVES, NAMED RATHER THAN IMPLIED: a name that is in neither
+# the roster nor a shape is not caught here, and review is the backstop for it.
 # Each withdrawal is a real gap, and each is why the innocent half of the
 # self-test exists: re-broadening any of them fails the run instead of
 # producing noise somebody turns off. Shapes are chosen against THIS tree's
@@ -220,38 +192,23 @@ cd "$(dirname "$0")/.."
 
 # One pattern list, used by both lanes and by the self-test — two spellings is
 # how the second consumer comes to check something different from the first.
-# ── THE ROSTER HALF, AND THE RULE THAT NOW ENFORCES ITSELF ──────────────────
-# These are the only literal internal names in this file. Each is admissible
-# under one rule: **this repository's tracked tree must still carry it
-# somewhere else**, so the file adds nothing to what a clone already hands over.
+# ── THE ROSTER HALF ─────────────────────────────────────────────────────────
+# Names that no shape can tell apart from prose are held as DIGESTS. Each
+# ROSTER_DIGESTS row is `<word lengths> <sha256(ROSTER_SALT + name)>`, where
+# the name is lower-cased with its words joined by `-` and the lengths are its
+# words' lengths, comma-separated. The matcher, `roster_grep`, reads a name as
+# a substring, the way a plain `first[-_ ]+second` pattern would: it splits text
+# into letter-and-digit words at `-`, `_` and spaces, and for each run of that
+# many consecutive words it hashes the first word's last characters, the middle
+# words whole and the last word's first characters, each by the stated length.
+# Case, separators, repeated spaces and letters or digits attached on either
+# side (a plural, a version number) are therefore no evasion, and this file
+# spells none of the names it guards.
 #
-# That rule started as "published history must carry it", which is weaker in the
-# way that matters: history keeps everything, so a name stayed admissible
-# forever once it had ever appeared. Under it, SIX of eight entries here existed
-# nowhere but this file — the cleanup had removed them everywhere else, and the
-# gate had quietly become their sole carrier, shipping in every release archive
-# a set of names the cleanup existed to remove. Tree-presence closes both that
-# and the original case.
-#
-# That rule was PROSE until 2026-08-20, and prose does not hold. Measured on
-# that date by two independent methods — `git log -S` over every ref, and a
-# content grep across every commit — TWO entries in this list appeared in ZERO
-# commits of this repository. The gate written to stop internal names reaching
-# a public repository was introducing two of them, for the first time, in the
-# same commit that claimed the opposite. Both are gone, and
-# `roster_is_present_in_the_tree` below runs the check on every invocation so
-# the next one fails instead of shipping.
-#
-# ⚠ AND THEY ARE NOT NAMED IN THIS COMMENT, which took a second attempt to get
-# right. The first draft of this paragraph spelled both removed names out in
-# order to explain the removal — publishing them in the very edit that took
-# them out of the list. A finding about a disclosure is itself a disclosure;
-# the detail belongs in the internal record, and here the count is enough.
-#
-# A name is dropped from this list rather than kept and justified. The cost is
-# stated: a name removed here stops being gated at PR time, and until the
-# org-wide check covers already-public repositories it is caught by review or
-# not at all.
+# ROSTER_CANARY is a synthetic name whose digest is in the list. The self-test
+# plants it in several spellings, so a matcher that cannot fire fails here
+# instead of reporting every file clean. To add a name, append its row; never
+# write the name itself into this repository.
 # ⚠ THE EXEMPT REGION BELOW HOLDS DATA ONLY, and these comments sit OUTSIDE it
 # deliberately. An exempt region is blanked before the file is scanned, so any
 # prose inside it is prose the gate cannot read — and an ordinary ticket
@@ -263,26 +220,6 @@ cd "$(dirname "$0")/.."
 # Everything else of that shape is a real record and fails the prose check.
 
 
-# Derived, never spelled twice — the defect this whole file keeps finding is a
-# correction landing in one copy while another keeps the old value. Each
-# separator becomes a character class, so a name written with a space or an
-# underscore instead of a hyphen is caught too; matching is case-insensitive,
-# so a sentence-initial capital is not an evasion.
-# `[-_ ]+` rather than `[-_ ]`, and `/` allowed spaces either side: a name
-# written with an extra space, or broken across a line by a formatter, is the
-# same disclosure as the tidy spelling.
-# A SLASH IS A WRAP POINT TOO, and it needed its own rule: `[-_ ]+` cannot
-# describe an owner and a repository separated by a slash with a space beside
-# it, because the slash must stay literal while the space around it must be
-# optional. Text wraps either side of a slash, so both are allowed.
-#
-# ⚠ THE EXAMPLE THAT STOOD HERE WAS A LIVE INTERNAL REPOSITORY NAME. It was
-# published by this file and by nothing else in either tree, and it was
-# invisible to the audit below for exactly the reason this paragraph
-# describes — one space after the slash. It survived every round of review of
-# the change that introduced it. Illustrate the SHAPE, never an instance: an
-# example is the one place a real name gets written down without anybody
-# reading it as a disclosure.
 
 # The SHAPE half. These name no record, no ticket, no branch and no service, so
 # they are safe to publish in the file that gates against them.
@@ -454,34 +391,37 @@ fi
 #
 # `$PATTERNS` and `$KNOWN_INNOCENT` carry no break: measured, neither matches
 # the classes, so they are written plainly.
-GATE_DATA_NAMES='ROSTER KNOWN_INTERNAL KNOWN_INNOCENT FIXTURE_ACCENT_BODY FIXTURE_ACCENT_NAME FIXTURE_BINARY_BODY FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY FIXTURE_DIRTY_NAME FIXTURE_EMPHASIS_BODY FIXTURE_EMPHASIS_NAME FIXTURE_ESCAPE_BODY FIXTURE_ESCAPE_NAME FIXTURE_ENTITY_BODY FIXTURE_ENTITY_NAME FIXTURE_AMPPROSE_BODY FIXTURE_AMPPROSE_NAME FIXTURE_NBSPPHRASE_BODY FIXTURE_NBSPPHRASE_NAME FIXTURE_RAWHTMLENT_BODY FIXTURE_RAWHTMLENT_NAME FIXTURE_LEGACYSECT_BODY FIXTURE_LEGACYSECT_NAME FIXTURE_ENTITYLANEB_BODY FIXTURE_ENTITYLANEB_NAME FIXTURE_FLAG_BODY FIXTURE_FLAG_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY FIXTURE_NAMEHIT_NAME FIXTURE_SPLITID_BODY FIXTURE_SPLITID_NAME'
+GATE_DATA_NAMES='ROSTER_SALT ROSTER_DIGESTS ROSTER_CANARY KNOWN_INTERNAL KNOWN_INNOCENT FIXTURE_ACCENT_BODY FIXTURE_ACCENT_NAME FIXTURE_BINARY_BODY FIXTURE_BINARY_NAME FIXTURE_CLEAN_BODY FIXTURE_CLEAN_NAME FIXTURE_DIRTY_BODY FIXTURE_DIRTY_NAME FIXTURE_EMPHASIS_BODY FIXTURE_EMPHASIS_NAME FIXTURE_ESCAPE_BODY FIXTURE_ESCAPE_NAME FIXTURE_ENTITY_BODY FIXTURE_ENTITY_NAME FIXTURE_AMPPROSE_BODY FIXTURE_AMPPROSE_NAME FIXTURE_NBSPPHRASE_BODY FIXTURE_NBSPPHRASE_NAME FIXTURE_RAWHTMLENT_BODY FIXTURE_RAWHTMLENT_NAME FIXTURE_LEGACYSECT_BODY FIXTURE_LEGACYSECT_NAME FIXTURE_ENTITYLANEB_BODY FIXTURE_ENTITYLANEB_NAME FIXTURE_FLAG_BODY FIXTURE_FLAG_NAME FIXTURE_LANEB_BODY FIXTURE_LANEB_NAME FIXTURE_NAMEHIT_BODY FIXTURE_NAMEHIT_NAME FIXTURE_SPLITID_BODY FIXTURE_SPLITID_NAME'
 
 PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not| never) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (exists?|existed|remains?|remained|runs?|ran|covers?|covered|exercises?|exercised|guards?|guarded))?( (for|of|in)|[.,;]|$)|[Tt]here (is|are)(n.{1,3}t| not) (any |no )?(harness|harnesses|coverage|tests?|suites?)|[Tt]here (is|are) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?)|(has|have|had) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Ww]ithout( (automated|manual|unit|integration|end-to-end|regression|any|meaningful))* (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Nn]obody (looks|checks|monitors)( at| on)?( [A-Za-z][A-Za-z-]*){0,3} (dashboard|dashboards|alert|alerts|log|logs|metric|metrics|queue|queues|report|reports|test|tests|coverage|monitoring)( (for|of|in)|[.,;]|$)|(is|are|was|were)(n.{1,3}t| not| never) under (test|testing|coverage|monitoring|observation)( (for|of|in)|[.,;]|$)|[Ll]acks( any| automated| an?)*( [A-Za-z][A-Za-z-]*)? (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|(has|have|had)(n.{1,3}t| not| never) been (tested|covered|scanned|audited|monitored)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
-ROSTER='analytic[]s-service
-contro[]l-plane'
+ROSTER_SALT='shardpilot-surface-roster-v1'
+ROSTER_DIGESTS='9,7 174ead9ac7f4fc41cae883b2fdedda32bb8f4221d83b5f36bf20fc43709a5c21
+7,5 f37497f378e89c146abbf58631622024e00212d83c0c23349796be7501357e23
+7,5 5dc0f5f827086a33997cd0d97206c67e42009a9f5d191ab532650920a84bde33'
+ROSTER_CANARY='orch[]ard-relay'
 KNOWN_INTERNAL='per ADR-[]0000 §[]000
-There are no P[]laywright tests for the console.
+There are no P[]laywright tests for the sample app.
 There are no e[]nd-to-end tests for the purchase flow.
-The console has no end-to-e[]nd tests for purchase callbacks.
-The console does not have []automated tests.
-The console has no t[]ests.
+The sample app has no end-to-e[]nd tests for purchase callbacks.
+The sample app does not have []automated tests.
+The sample app has no t[]ests.
 The crash path is un[]tested.
-There is NO Pla[]ywright harness in the console repo
+There is NO Pla[]ywright harness in the sample repo
 the crash path is not []covered by automated tests
 no automated[] scanning for that class of input
 a bare §[]999c left behind when a record id was stripped
 tracked as GAP[]-000 internally
 pinned to main @ []0000000
 nobody[] looks at that dashboard
-tracked as SP-[]999 in the internal board
+tracked as SP-[]999 on the board
 filed as AC-Q[]A-999 during triage
-the console lacks auto[]mated tests
+the sample app lacks auto[]mated tests
 Codex []review
 EXAMPLE_SYNTH[]ETIC_FL[]AG_MODE=off
 The crash path isn'"'"'t []tested.
 The crash path hasn'"'"'t be[]en tested.
-The console doesn’t have a[]utomated tests.
-The console has never b[]een audited.
+The sample app doesn’t have a[]utomated tests.
+The sample app has never b[]een audited.
 The crash path was neve[]r tested.
 There are []zero tests for the payment parser.
 The payment parser has zero t[]ests.
@@ -511,7 +451,7 @@ Nobody checks out until the payment transaction succeeds.
 The property is not under testamentary restriction.
 Nobody monitors tests more closely than the CI team.
 Every test suite runs on both toolchains.'
-FIXTURE_ACCENT_BODY='internal: contro[]l-plane'
+FIXTURE_ACCENT_BODY='internal: orch[]ard-relay'
 FIXTURE_ACCENT_NAME='café.md'
 FIXTURE_BINARY_BODY='see ADR-[]9999 here'
 FIXTURE_BINARY_NAME=binary.bin
@@ -876,12 +816,88 @@ AUDIT_CLASSES="$AUDIT_CLASSES"'|(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 # published live reference the self-test calls correct.
 AUDIT_CLASSES="$AUDIT_CLASSES"'|Codex [a-z]*#[0-9]+'
 
-roster_regex() {
-  printf '%s' "$ROSTER" | sed -e 's![-_ ]![-_ ]+!g' -e 's!/! */ *!g' | paste -sd'|' -
+# roster_grep MODE FILE...  — the roster matcher, grep-compatible.
+#   MODE q: quiet, exit 0 on the first hit; n: print "LINE:TEXT" per matching
+#   line (grep -n); o: print "LINE:MATCH" per occurrence (grep -on); N: read
+#   NUL-separated paths on standard input and print, one per line, each path
+#   whose name or marker-free name holds a roster name. FILE `-` reads standard
+#   input. Exit 0 = a hit, 1 = none, 2 = an error, as grep does.
+# perl with the core Digest::SHA module is the only dependency; a missing one
+# is exit 2, which the start-up check below turns into a structural refusal.
+ROSTER_PERL='
+use strict; use warnings;
+my ($mode, $salt, $digests, @files) = @ARGV;
+eval { require Digest::SHA; 1 } or exit 2;
+my (%want, %shapes);
+for my $row (split /\n/, $digests) {
+  next if $row =~ /^\s*$/;
+  $row =~ /^\s*([1-9][0-9]?(?:,[1-9][0-9]?)*)\s+([0-9a-f]{64})\s*$/ or exit 2;
+  $want{$2} = 1; $shapes{$1} = [split /,/, $1];
 }
-ROSTER_RE="$(roster_regex)"
+%want or exit 2;
+my @shapes = values %shapes;
+my (%memo, $hit);
+sub named { my $d = $memo{$_[0]} //= Digest::SHA::sha256_hex($salt . $_[0]); return $want{$d} }
+sub found_in {
+  my $text = $_[0];
+  my @found;
+  while ($text =~ /[A-Za-z0-9]+(?:[-_ ]+[A-Za-z0-9]+)*/g) {
+    my $run = $&;
+    my (@w, @s, @e);
+    while ($run =~ /[A-Za-z0-9]+/g) { push @w, lc $&; push @s, $-[0]; push @e, $+[0] }
+    for my $sh (@shapes) {
+      my $k = @$sh;
+      for my $i (0 .. @w - $k) {
+        my $j = $i + $k - 1;
+        if ($k == 1) {
+          for my $p (0 .. length($w[$i]) - $sh->[0]) {
+            push @found, substr($run, $s[$i] + $p, $sh->[0]) if named(substr($w[$i], $p, $sh->[0]));
+          }
+          next;
+        }
+        next if length($w[$i]) < $sh->[0] || length($w[$j]) < $sh->[-1];
+        next if grep { length($w[$_]) != $sh->[$_ - $i] } $i + 1 .. $j - 1;
+        next unless named(join "-", substr($w[$i], -$sh->[0]), @w[$i + 1 .. $j - 1], substr($w[$j], 0, $sh->[-1]));
+        my $from = $e[$i] - $sh->[0];
+        push @found, substr($run, $from, $s[$j] + $sh->[-1] - $from);
+      }
+    }
+  }
+  return @found;
+}
+if ($mode eq "N") {
+  local $/ = "\0";
+  while (my $name = <STDIN>) {
+    chomp $name;
+    (my $bare = $name) =~ tr/*_`~\\//d;
+    next unless found_in($name) || found_in($bare);
+    $hit = 1;
+    print "$name\n";
+  }
+  exit($hit ? 0 : 1);
+}
+for my $file (@files) {
+  my $fh;
+  if ($file eq "-") { $fh = \*STDIN } else { open($fh, "<:raw", $file) or exit 2 }
+  my $n = 0;
+  while (my $line = <$fh>) {
+    $n++;
+    my @found = found_in($line);
+    next unless @found;
+    $hit = 1;
+    exit 0 if $mode eq "q";
+    if ($mode eq "o") { print "$n:$_\n" for @found }
+    else { my $l = $line; $l .= "\n" unless $l =~ /\n\z/; print "$n:$l" }
+  }
+  close($fh) unless $file eq "-";
+}
+exit($hit ? 0 : 1);
+'
+roster_grep() {
+  perl -e "$ROSTER_PERL" -- "$1" "$ROSTER_SALT" "$ROSTER_DIGESTS" "${@:2}"
+}
 
-for required in PATTERNS ROSTER ROSTER_RE KNOWN_INTERNAL KNOWN_INNOCENT; do
+for required in PATTERNS ROSTER_SALT ROSTER_DIGESTS ROSTER_CANARY KNOWN_INTERNAL KNOWN_INNOCENT; do
   eval "value=\${$required:-}"
   if [ -z "$value" ]; then
     # ⚠ STRUCTURAL REFUSAL. See the category note in the scope block: it says
@@ -894,6 +910,20 @@ for required in PATTERNS ROSTER ROSTER_RE KNOWN_INTERNAL KNOWN_INNOCENT; do
     exit 2
   fi
 done
+
+# ⚠ THE ROSTER MATCHER MUST RUN BEFORE ANYTHING TRUSTS IT. A matcher that
+# cannot start (no perl, no Digest::SHA, a malformed digest row) answers "no
+# hit" everywhere it is asked, which is indistinguishable from a clean tree.
+roster_start_rc=0
+printf 'a sentence mentioning %s in passing\n' "$ROSTER_CANARY" | roster_grep q - || roster_start_rc=$?
+if [ "$roster_start_rc" -ne 0 ]; then
+  # refusal:structural
+  echo "REFUSING: the roster matcher did not catch its own canary (exit $roster_start_rc)." >&2
+  echo "  It needs perl with the core Digest::SHA module and well-formed" >&2
+  echo "  ROSTER_DIGESTS rows; without them every roster check reports clean." >&2
+  exit 2
+fi
+unset roster_start_rc
 
 # ⚠ THIS FILE IS SCANNED END TO END, WITH NO EXEMPTIONS AT ALL.
 #
@@ -967,6 +997,19 @@ scan_tree() {
     expected_files=$((expected_files + 1))
   done < "$list"
 
+  # The roster over every PATH at once: one matcher start per scan instead of
+  # one per file. A path holding a newline lands on two lines of this list,
+  # which can only add a hit below, never hide one.
+  gate_tmp; roster_names="$GATE_TMP"
+  roster_names_rc=0
+  roster_grep N - < "$list" > "$roster_names" 2>/dev/null || roster_names_rc=$?
+  if [ "$roster_names_rc" -gt 1 ]; then
+    # refusal:structural
+    echo "REFUSING: the roster matcher could not read the file list (exit $roster_names_rc)." >&2
+    echo "  A path list that was not checked is an UNSCANNED one." >&2
+    exit 2
+  fi
+
   while IFS= read -r -d '' f; do
     # NO PATH IS EXEMPT FROM THIS LOOP, including this script. The
     # by-construction material is inline and broken so that it cannot match
@@ -982,9 +1025,8 @@ scan_tree() {
     # the bytes sat.
     f_stripped="$(printf '%s' "$f" | tr -d '*_`~\\')"
     if printf '%s\n' "$f" | grep -qE -- "$PATTERNS" \
-       || printf '%s\n' "$f" | grep -qiE -- "$ROSTER_RE" \
        || printf '%s\n' "$f_stripped" | grep -qE -- "$PATTERNS" \
-       || printf '%s\n' "$f_stripped" | grep -qiE -- "$ROSTER_RE"; then
+       || grep -qxF -- "$f" "$roster_names"; then
       scan_lane_a="${scan_lane_a}${f}:path:${f}"$'\n'
     fi
     # ⚠ EVERY CONTENT CHECK BELOW READS THE INDEX, NOT THE WORKING TREE.
@@ -992,8 +1034,7 @@ scan_tree() {
     # tree is a third thing that merely usually agrees with both. Staging a
     # file and editing the worktree copy left this reading bytes no commit
     # would contain; staging one and deleting the copy left it reading nothing
-    # at all, and that one is not hypothetical — a probe file skipped exactly
-    # that way reached a public branch under a clean report. Refusing the
+    # at all, under a clean report. Refusing the
     # second case was the partial answer and has been deleted with this change:
     # the blob git would commit is the only thing worth scanning.
     #
@@ -1059,9 +1100,8 @@ scan_tree() {
       # published in plain sight and reported clean.
       link_stripped="$(printf '%s' "$link" | tr -d '*_`~\\')"
       if printf '%s\n' "$link" | grep -qE -- "$PATTERNS" \
-         || printf '%s\n' "$link" | grep -qiE -- "$ROSTER_RE" \
          || printf '%s\n' "$link_stripped" | grep -qE -- "$PATTERNS" \
-         || printf '%s\n' "$link_stripped" | grep -qiE -- "$ROSTER_RE"; then
+         || printf '%s\n%s\n' "$link" "$link_stripped" | roster_grep q -; then
         scan_lane_a="${scan_lane_a}${f}:link:${link}"$'\n'
       fi
       observed_files=$((observed_files + 1))
@@ -1351,8 +1391,8 @@ scan_tree() {
     # ⚠ A NUL-BEARING FILE IS REFUSED, NOT SCANNED. UTF-16 holds its text as
     # ASCII interleaved with NULs, so a line-oriented ASCII pattern cannot
     # match it — the file reads, counts, and reports clean while carrying the
-    # identifier in plain sight of anyone who opens it. Codex demonstrated
-    # exactly that with a tracked UTF-16LE document.
+    # identifier in plain sight of anyone who opens it, as a tracked UTF-16LE
+    # document demonstrated.
     #
     # Refused rather than decoded, on the footing the container refusal already
     # stands on and for the same reason: measured today, both trees hold ZERO
@@ -1490,8 +1530,7 @@ scan_tree() {
     # the rendered string: emphasis pairing, run lengths, whitespace flanking,
     # code-span boundaries, backslash escapes. Five rounds of review, every
     # finding correct, each fix exposing the next construct — because the list
-    # of constructs is CommonMark's to close, not this file's. In the same
-    # period the pipeline caught ONE real disclosure.
+    # of constructs is CommonMark's to close, not this file's.
     #
     # The criterion moved with it. It is no longer "does the page render a
     # CONTIGUOUS identifier" but "can a reader SEE one": a record id whose
@@ -1563,17 +1602,13 @@ scan_tree() {
     # shape pass
     # would make `[Tt]here is` and the ALLCAPS flag class match prose they
     # were written to leave alone.
-    roster_hits_raw="$(grep -aniE -- "$ROSTER_RE" "$scan_src" 2>/dev/null \
+    # ONE matcher start for both forms: the raw lines, then the marker-free
+    # lines, which is the concatenation the merge below has always read. Its
+    # status is 2 when either file is unreadable and 0 when either holds a hit.
+    roster_hits_both="$(roster_grep n "$scan_src" "$strip_blob" 2>/dev/null \
       | tr -d '\000'; exit "${PIPESTATUS[0]}")"
     roster_status=$?
-    roster_hits_strip="$(grep -aniE -- "$ROSTER_RE" "$strip_blob" 2>/dev/null \
-      | tr -d '\000'; exit "${PIPESTATUS[0]}")"
-    roster_strip_status=$?
-    if [ "$roster_status" -gt 1 ] || [ "$roster_strip_status" -gt 1 ]; then roster_status=2
-    elif [ "$roster_status" -eq 0 ] || [ "$roster_strip_status" -eq 0 ]; then roster_status=0
-    else roster_status=1
-    fi
-    roster_hits="$( { printf '%s\n' "$roster_hits_raw"; printf '%s\n' "$roster_hits_strip"; } \
+    roster_hits="$(printf '%s\n' "$roster_hits_both" \
       | grep -v '^$' | awk -F: '!seen[$1]++' )"
     # ⚠ WHAT THIS DOES NOT SEE, stated because a green run gets read as more
     # than it is. The dominating form covers MARKER characters, not WHITESPACE,
@@ -1678,14 +1713,21 @@ scan_tree() {
           if [ "${lane_b_ps[1]}" -ne 0 ]; then return 2; fi
           return "${lane_b_ps[0]}"
         }
+        lane_b_roster_pass() {  # $1 = file; the roster's `grep -aon`
+          local lane_b_ps
+          roster_grep o "$1" 2>/dev/null | tr -d '\000'
+          lane_b_ps=("${PIPESTATUS[@]}")
+          if [ "${lane_b_ps[1]}" -ne 0 ]; then return 2; fi
+          return "${lane_b_ps[0]}"
+        }
         set +e
         lane_b_occ_1="$(lane_b_count_pass -E "$PATTERNS" "$scan_src")"
         lane_b_st_1=$?
-        lane_b_occ_2="$(lane_b_count_pass -iE "$ROSTER_RE" "$scan_src")"
+        lane_b_occ_2="$(lane_b_roster_pass "$scan_src")"
         lane_b_st_2=$?
         lane_b_chk_1="$(lane_b_count_pass -E "$PATTERNS" "$strip_blob")"
         lane_b_st_3=$?
-        lane_b_chk_2="$(lane_b_count_pass -iE "$ROSTER_RE" "$strip_blob")"
+        lane_b_chk_2="$(lane_b_roster_pass "$strip_blob")"
         lane_b_st_4=$?
         set -e
         for st in "$lane_b_st_1" "$lane_b_st_2" "$lane_b_st_3" "$lane_b_st_4"; do
@@ -1846,45 +1888,19 @@ scan_tree() {
 # ---------------------------------------------------------------------------
 # ⚠ EVERY IDENTIFIER BELOW IS SYNTHETIC. These fixtures exercise SHAPES, and a
 # shape is exercised just as well by a reserved synthetic id as by a real
-# decision-record number — while a real one would make this fixture block the same kind of
-# roster the ROSTER rule above exists to bound. The earlier version used a live
-# ADR id, a live feature-flag name and a live ticket number, none of which the
-# test needed.
+# decision-record number, while a real one would publish the very thing this
+# gate exists to keep out.
 
-# roster_is_present_in_the_tree — the rule from the ROSTER block, executed.
+# roster_is_usable — the rule from the ROSTER block, executed.
 #
-# Every literal in ROSTER must still appear in this repository's TRACKED TREE
-# OUTSIDE this file. Two different failures are covered by that one condition:
+# The roster holds digests, so this file publishes none of the names it guards
+# and nothing about them needs to be found elsewhere in the tree. What has to
+# hold instead is that the list is USABLE: every row is
+# `<word lengths> <sha256>`, and the synthetic canary, planted in a sentence, is
+# caught by the same matcher the scan uses.
 #
-#   a name that was never here    — the gate would be the first thing to
-#                                   publish it (found twice: two internal
-#                                   repository names with zero commits here);
-#   a name that is no longer here — the cleanup removed it everywhere else and
-#                                   the gate became its SOLE carrier, so every
-#                                   future release archive ships a name the
-#                                   cleanup existed to remove.
-#
-# The earlier version of this rule asked whether published HISTORY carried the
-# literal, which is a weaker question: history keeps everything, so a name
-# stayed admissible forever once it had ever appeared. It passed a tree in
-# which six of eight roster entries existed nowhere but here.
-#
-# ⚠ THIS FILE IS EXCLUDED FROM THE SEARCH, and without that the check is
-# self-satisfying: the roster itself would count as the occurrence.
-#
-# The cost, stated rather than implied: a name removed from ROSTER stops being
-# gated at PR time in this repository. Its coverage is the org-wide
-# publication check, which reads the class library rather than a roster and
-# therefore needs no literal in a public file.
-# ⚠ EVERY PRESENCE SEARCH ASKS THE INDEX (`--cached`), because everything else
-# here does. Asked of the working tree it answered about files a commit would
-# not contain: staging the removal of the last real occurrences of a roster
-# name while leaving the old copies on disk left the search satisfied and the
-# corpus about to become that name's sole publisher.
-#
-# Both halves of the gate, excluded from every presence search as one list.
-# The rule asks whether a literal survives ELSEWHERE in the tree; a file that
-# exists to hold those literals cannot be part of the answer.
+# This file, excluded from every presence search: it holds the fixtures, so it
+# cannot be part of the answer to whether anything else in the tree does.
 GATE_EXCLUDES=":(exclude)scripts/check_public_surface.sh"
 
 SHAPE_CANARY=zzzcanaryzzz
@@ -2014,45 +2030,23 @@ SHAPE_AWK='  function distinct(body,   j, ch, nx, set, k, cnt) {
   }'
 
 
-roster_is_present_in_the_tree() {
-  local lit novel=0 found
+roster_is_usable() {
+  local lit novel=0 found row rows=0
   gate_tmp; found="$GATE_TMP"
-  while IFS= read -r lit; do
-    [ -n "$lit" ] || continue
-    # ⚠ CASE-INSENSITIVELY, BECAUSE THE SCAN THAT USES THIS ROSTER IS. The
-    # matcher runs `grep -qiE`, so a name capitalised anywhere in the tree is
-    # still caught — but a case-SENSITIVE presence lookup would find none of
-    # those occurrences and refuse a clean tree for a literal it is scanning
-    # for perfectly well. Same defect as the repository lookup below, and it
-    # was left here once already on the argument that both halves agreed.
-    git grep --cached -l -iF -- "$lit" -- . $GATE_EXCLUDES > "$found" 2>/dev/null || :
-    # ⚠ AND A SECOND LOOK AT THE MARKER-FREE FORM, because the SCAN reads that
-    # form. Run from THIS repository, not from a scan root: this function runs
-    # before any scan and `$root` does not exist here — under `set -u` naming it
-    # would have killed the gate outright, in a branch nothing reaches on a
-    # tree where the raw lookup succeeds. An unexercised branch is where an
-    # undefined name hides. If every occurrence elsewhere in the tree is written with markers
-    # between its characters, the raw lookup finds none and a clean tree is
-    # refused for a name the matcher is catching perfectly well. Only reached
-    # when the raw lookup came back empty, which is rare enough to afford
-    # reading the tree once more.
-    if [ ! -s "$found" ]; then
-      while IFS= read -r cand; do
-        [ -n "$cand" ] || continue
-        hit="$(git cat-file blob ":$cand" 2>/dev/null \
-          | tr -d '*_`~\\' | grep -ciF -- "$lit" || true )"
-        if [ "${hit:-0}" -gt 0 ]; then printf '%s\n' "$cand" > "$found"; break; fi
-      done <<EOF
-$(git ls-files -- . $GATE_EXCLUDES)
-EOF
-    fi
-    if [ ! -s "$found" ]; then
-      printf 'ROSTER VIOLATION: %s appears nowhere in this tree except this file.\n' "$lit" >&2
+  while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    rows=$((rows + 1))
+    if ! printf '%s\n' "$row" | grep -qE '^[1-9][0-9]?(,[1-9][0-9]?)* [0-9a-f]{64}$'; then
+      printf 'ROSTER VIOLATION: a ROSTER_DIGESTS row is not "<word lengths> <sha256>".\n' >&2
       novel=$((novel + 1))
     fi
   done <<EOF
-$ROSTER
+$ROSTER_DIGESTS
 EOF
+  if ! printf 'a sentence mentioning %s in passing\n' "$ROSTER_CANARY" | roster_grep q -; then
+    printf 'ROSTER VIOLATION: the roster matcher does not catch the canary.\n' >&2
+    novel=$((novel + 1))
+  fi
 
   # ⚠ THESE TWO PASSES NOW COVER THE EXEMPT REGIONS, and only those. The main
   # The loaded values, read by every audit below. ⚠ ASSIGNED BEFORE THE FIRST
@@ -2071,8 +2065,8 @@ EOF
   # ASSERTED. A bare alternative — a name with no metacharacter in it — is a
   # roster entry hiding in the one variable no rule covered: the grammar sees a
   # well-formed assignment, and the identifier and repository audits look for
-  # their own classes, not for arbitrary words. Adding a literal internal name as an alternative made this
-  # file its sole publisher and everything stayed green.
+  # their own classes, not for arbitrary words. A literal name added as an
+  # alternative would make this file its publisher while everything stayed green.
   #
   # ⚠ AND A BRANCH WHOSE ARMS ARE THE SAME IS NOT A BRANCH. `(-|-)` put a `|`
   # in the text without letting the pattern match anything a plain hyphen could
@@ -2156,20 +2150,15 @@ EOF
 
   # scan reads this file's prose like any other file's, and the loaded VALUES
   # are read beside it, so a literal that only exists after the break is
-  # removed is covered too. Both of this gate's own past disclosures were of
-  # exactly this kind:
-  # two internal repository names in the roster, and a live decision-record id
-  # among the fixtures. A header comment naming a repository that exists
-  # nowhere else in the tree was demonstrated to pass everything else.
+  # removed is covered too: a name written into the fixtures or the header
+  # comments is caught as surely as one written into the patterns.
   while IFS= read -r lit; do
     [ -n "$lit" ] || continue
   # ⚠ WHITESPACE AROUND THE SLASH IS REMOVED FIRST. An owner and a repository
   # written with a space beside the slash are as legible to a reader as the
   # tight spelling and matched neither this audit nor the ordinary patterns, so
-  # the one file that could report such a name was its sole publisher and
-  # stayed green. Not hypothetical: the first run of this rule found one that
-  # had been standing in the header comment above, on the default branch of
-  # both repositories. Canonicalised before extraction rather than added as a
+  # the one file that could report such a name would publish it and stay
+  # green. Canonicalised before extraction rather than added as a
   # second pattern, so there is one spelling to keep correct.
   #
   # ⚠ CASE-INSENSITIVELY, BECAUSE THE EXTRACTION ABOVE IS. A repository
@@ -2231,13 +2220,12 @@ EOF
   rm -f "$found"
   if [ "$novel" -ne 0 ]; then
     # refusal:hazard
-    echo "REFUSING: $novel literal(s) in this file exist nowhere else in this tree." >&2
-    echo "  A gate against publishing internal names must not be the only thing" >&2
-    echo "  publishing them — every release archive carries this file. Remove them" >&2
-    echo "  from ROSTER and say so; the org-wide check covers what leaves here." >&2
+    echo "REFUSING: $novel problem(s) with this file's own data, listed above." >&2
+    echo "  A roster that cannot fire reports every file clean, and a live" >&2
+    echo "  identifier written here is published by the gate meant to stop it." >&2
     exit 2
   fi
-  echo "roster rule: OK — all $(printf '%s\n' "$ROSTER" | grep -c .) literal(s) still present elsewhere in this tree"
+  echo "roster rule: OK — $rows digest row(s), canary caught; no live identifier in this file"
   public_gate_observe roster
 }
 
@@ -2252,18 +2240,20 @@ selftest() {
   done <<EOF
 $KNOWN_INTERNAL
 EOF
-  # THE ROSTER HALF, with its fixtures DERIVED from ROSTER rather than written
-  # out again. A hand-written copy is a second spelling, and the failure it
-  # produces is the quiet one: drop a name from ROSTER and a stale fixture goes
-  # on passing against a pattern nothing scans with any more.
-  while IFS= read -r line; do
-    [ -z "$line" ] && continue
+  # THE ROSTER HALF, proven on the synthetic canary in the spellings the
+  # matcher promises to fold: as written, upper case with underscores, spaced,
+  # plural, with a digit attached after and with a letter attached before. A
+  # miss on any of them means the roster is not armed.
+  for line in "$ROSTER_CANARY" \
+              "$(printf '%s' "$ROSTER_CANARY" | tr 'a-z-' 'A-Z_')" \
+              "$(printf '%s' "$ROSTER_CANARY" | sed 's/-/ /g')" \
+              "${ROSTER_CANARY}s" \
+              "${ROSTER_CANARY}2" \
+              "x${ROSTER_CANARY}"; do
     tested=$((tested + 1))
-    printf 'a sentence mentioning %s in passing\n' "$line" | grep -qiE -- "$ROSTER_RE" || {
+    printf 'a sentence mentioning %s in passing\n' "$line" | roster_grep q - || {
       printf 'SELFTEST MISS (roster): %s\n' "$line" >&2; misses=$((misses + 1)); }
-  done <<EOF
-$ROSTER
-EOF
+  done
   while IFS= read -r line; do
     [ -z "$line" ] && continue
     innocent=$((innocent + 1))
@@ -2273,7 +2263,7 @@ EOF
     # ⚠ EVALUATED SEPARATELY, NOT PIPED. The previous form ran both greps into
     # a group and piped it to `grep -q .`. Under `set -o pipefail` the group's
     # status is the LAST command's — the roster grep — so an innocent line that
-    # matched $PATTERNS but not $ROSTER_RE made the pipeline non-zero and the
+    # matched $PATTERNS but not the roster made the pipeline non-zero and the
     # `if` FALSE. That is the ordinary shape of a shape-class false positive,
     # which means this half of the self-test could not detect the thing it
     # exists to detect: every innocent fixture was passing vacuously.
@@ -2282,7 +2272,7 @@ EOF
     # herestring avoids it structurally — no pipeline, so no status to invert.
     fp=0
     grep -qE  -- "$PATTERNS"  <<<"$line" && fp=1
-    grep -qiE -- "$ROSTER_RE" <<<"$line" && fp=1
+    roster_grep q - <<<"$line" && fp=1
     if [ "$fp" -eq 1 ]; then
       printf 'SELFTEST FALSE POSITIVE: %s\n' "$line" >&2; falses=$((falses + 1))
     fi
@@ -2553,7 +2543,7 @@ EOF
 }
 
 public_gate_observe audit
-roster_is_present_in_the_tree
+roster_is_usable
 selftest
 
 # ---------------------------------------------------------------------------

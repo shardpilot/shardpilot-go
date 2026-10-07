@@ -1304,7 +1304,7 @@ func TestRetryPacingIsIndependentOfTheFlushInterval(t *testing.T) {
 	// calls before storing the stamp, so a scheduler preemption between those
 	// two atomics lets a counter-only wait read stamps[1] as zero and compute
 	// a huge negative gap — failing the lower bound below while retry pacing
-	// was in fact correct (Codex on #48).
+	// was in fact correct.
 	waitFor(t, defaultFlushInterval+10*time.Second, "the retry", func() bool { return stamps[1].Load() != 0 })
 	gap := time.Duration(stamps[1].Load()-stamps[0].Load()) * time.Millisecond
 

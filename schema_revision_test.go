@@ -191,10 +191,10 @@ func TestDisableSchemaRevisionOmitsHeader(t *testing.T) {
 	}
 }
 
-// schemaRevisionMismatchBody mirrors the enforce-mode 409 envelope the ingest
-// service sends when the declared revision does not match the served one.
+// schemaRevisionMismatchBody mirrors the shape of the enforce-mode 409 envelope
+// the server sends when the declared revision does not match the served one.
 const schemaRevisionMismatchBody = `{"error":{"code":"schema_revision_mismatch",` +
-	`"message":"the declared schema revision does not match the schema revision this ingest-api serves",` +
+	`"message":"the declared schema revision does not match the schema revision this server serves",` +
 	`"details":[{"field":"X-ShardPilot-Schema-Revision","code":"schema_revision_mismatch",` +
 	`"message":"redeploy the writer against the current schema set or stop declaring a revision"}]}}`
 

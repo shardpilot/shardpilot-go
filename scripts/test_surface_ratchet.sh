@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One control per refusal in the lane B ratchet.
+# One control per refusal in the public-surface ratchet (the gate's lane B).
 #
 # ⚠ WHY THIS EXISTS. Two of the last four findings on the ratchet were checks
 # that were CORRECT two rounds earlier and were lost in a restructure: the
@@ -201,7 +201,7 @@ if [ "$lane_b_am_clone" = no ]; then
   lane_b_end_child='if [ -n "$lane_b_child" ]; then kill "$lane_b_child" 2>/dev/null || true; wait "$lane_b_child" 2>/dev/null || true; fi; rm -rf "$lane_b_tmp_root";'
   trap "$lane_b_end_child exit 130" INT
   trap "$lane_b_end_child exit 143" TERM
-  "$lane_b_tmp_root/repo/scripts/test_lane_b_ratchet.sh" &
+  "$lane_b_tmp_root/repo/scripts/test_surface_ratchet.sh" &
   lane_b_child=$!
   lane_b_child_rc=0
   wait "$lane_b_child" || lane_b_child_rc=$?
@@ -279,9 +279,28 @@ synth_target() {  # $1 = sed program applied to the baseline, or "" to delete it
   # shape of "works where it is written, not where it runs" this ratchet has
   # produced. `-c` scopes it to the invocation; nothing in the repository's
   # config is touched, and these commits are unreachable anyway.
-  git -c user.name="lane-b-ratchet-test" -c user.email="lane-b-ratchet-test@invalid" \
+  git -c user.name="surface-ratchet-test" -c user.email="surface-ratchet-test@invalid" \
     commit-tree "$tree" -p HEAD -m "synthetic lane B target"
 }
+
+# ⚠ A PAID-OFF BASELINE STILL NEEDS A ROW TO TEST AGAINST. Several controls
+# raise, lower or compare a numeric row, and a tree with no lane B material has
+# none, so they would pass or fail for the wrong reason. When the baseline holds
+# no row, one synthetic occurrence (a reserved fixture id) is planted in
+# config.go and committed HERE, in this throwaway clone, and HEAD below is that
+# commit. The repository under test is untouched.
+if ! grep -q '^[0-9]' "$BASELINE"; then
+  seed_marker="ADR-"'0000'
+  printf '\n// Synthetic ratchet seed: see %s.\n' "$seed_marker" >> config.go
+  git add config.go >/dev/null 2>&1 || true
+  if ! "$GATE" --write-baseline >/dev/null 2>&1 || ! grep -q '^[0-9]' "$BASELINE"; then
+    echo "REFUSING: could not seed a lane B row for the controls." >&2
+    exit 2
+  fi
+  git add "$BASELINE" >/dev/null 2>&1 || true
+  git -c user.name="surface-ratchet-test" -c user.email="surface-ratchet-test@invalid" \
+    commit -q -m "synthetic lane B seed"
+fi
 
 WITH_BASE="$(git rev-parse HEAD)"
 WITHOUT_BASE="$(synth_target "")"
@@ -560,13 +579,13 @@ expect_ref "a target with one compares"     "$WITH_BASE"     0 "LANE B RATCHET �
 # the two silently-lost checks this harness was built for, so leaving it
 # uncovered would be the fourth time it missed its own motive.
 #
-# The tree still carries 33 occurrences, so the correct outcome here is the
-# ordinary count disagreement -- NOT an abort, and not a refusal.
+# The tree carries at least one occurrence (seeded above when the real tree
+# has none), so the correct outcome here is the ordinary count disagreement -- NOT an abort, and not a refusal.
 grep '^#' "$SAVED" > "$BASELINE"
 expect "a comments-only baseline is parsed, not fatal" 1 "moved and the baseline did not agree"
 cp "$SAVED" "$BASELINE"
 
-marker="ADR-"'0331'
+marker="ADR-"'9999'
 printf '\n// See %s for the freeze this follows.\n' "$marker" >> config.go
 git add -A >/dev/null 2>&1 || true
 must_write_baseline "a raised baseline is caught by the target"
@@ -619,7 +638,7 @@ expect_ref "an older-format target is skipped, not misparsed" "$old_commit" 0 "t
 # Neither writes a broken object anywhere reachable, and both are unreferenced
 # after this run.
 missing_sub="$(printf '040000 tree %s\tscripts\n' 0000000000000000000000000000000000000002 | git mktree --missing)"
-no_tree_commit="$(git -c user.name="lane-b-ratchet-test" -c user.email="lane-b-ratchet-test@invalid" \
+no_tree_commit="$(git -c user.name="surface-ratchet-test" -c user.email="surface-ratchet-test@invalid" \
   commit-tree "$missing_sub" -m "synthetic unreadable tree")"
 expect_ref "an unreadable tree on the target refuses" "$no_tree_commit" 2 "could not list"
 
@@ -630,7 +649,7 @@ GIT_INDEX_FILE="$idx_missing" git update-index --add \
   --cacheinfo "100644,0000000000000000000000000000000000000001,$BASELINE"
 missing_blob_tree="$(GIT_INDEX_FILE="$idx_missing" git write-tree --missing-ok)"
 rm -f "$idx_missing"
-no_blob_commit="$(git -c user.name="lane-b-ratchet-test" -c user.email="lane-b-ratchet-test@invalid" \
+no_blob_commit="$(git -c user.name="surface-ratchet-test" -c user.email="surface-ratchet-test@invalid" \
   commit-tree "$missing_blob_tree" -p HEAD -m "synthetic unreadable blob")"
 expect_ref "an unreadable baseline blob on the target refuses" "$no_blob_commit" 2 "could not be read"
 
@@ -1037,7 +1056,7 @@ if ! command -v timeout >/dev/null 2>&1; then
 else
   lane_b_sentinel_rc=0
   lane_b_sentinel_out="$(LANE_B_HARNESS_CLONE=anything timeout 60 \
-    ./scripts/test_lane_b_ratchet.sh 2>&1)" || lane_b_sentinel_rc=$?
+    ./scripts/test_surface_ratchet.sh 2>&1)" || lane_b_sentinel_rc=$?
   judge "an exported LANE_B_HARNESS_CLONE is refused" \
     "$lane_b_sentinel_rc" 2 "is not an input" "$lane_b_sentinel_out"
 fi
@@ -1207,7 +1226,7 @@ else
   # the nested run must not reach this control; the marker rides beside the copy
   # and is propagated to its clone by the parent branch above
   : > "$lane_b_symreal/.lane-b-skip-recursion-control"
-  ( TMPDIR="$lane_b_symlink" timeout 30 "$lane_b_symreal/pristine/scripts/test_lane_b_ratchet.sh" \
+  ( TMPDIR="$lane_b_symlink" timeout 30 "$lane_b_symreal/pristine/scripts/test_surface_ratchet.sh" \
       > "$lane_b_symreal/.out" 2>&1 ) &
   lane_b_sym_bg=$!
   sleep 12
@@ -1300,7 +1319,7 @@ if [ "$checks" -ne "$EXPECTED_CHECKS" ]; then
   exit 2
 fi
 if [ "$failures" -ne 0 ]; then
-  echo "lane B ratchet: $failures of $checks control(s) FAILED" >&2
+  echo "surface ratchet: $failures of $checks control(s) FAILED" >&2
   exit 1
 fi
-echo "lane B ratchet: $checks control(s), 0 failure(s) — against ${lane_b_tested}"
+echo "surface ratchet: $checks control(s), 0 failure(s) — against ${lane_b_tested}"

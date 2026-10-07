@@ -39,9 +39,7 @@ jobs:
   #
   # ⚠ THIS REPOSITORY IS PUBLIC, which inverts the usual urgency. Everywhere
   # else a missing secret scan is a gap to close before a visibility flip; here
-  # a credential is exposed at the moment it is pushed. It was measured on
-  # 2026-08-20 that this was one of only two candidate repositories running no
-  # secret scanner at all — and the only two already public.
+  # a credential is exposed at the moment it is pushed.
   #
   # fetch-depth: 0 is required by the history pass and by nothing else in this
   # workflow.
@@ -460,8 +458,10 @@ jobs:
   #   28 controls   229s, 230s, 254s, 255s  8.2, 8.2, 9.1, 9.1
   #   29 controls   283s                    9.8
   #   33 controls   259s, 311s              7.9, 9.4
+  #   35 controls   392s, 520s              11.2, 14.9
   #
-  # -- 7.9 to 9.8 seconds per control, and the total is that times the count.
+  # -- 7.9 to 9.8 seconds per control before the name list moved to digests,
+  # 11.2 to 14.9 after, and the total is that times the count.
   #
   # ⚠ RECORDED PER CONTROL BECAUSE A TOTAL KEEPS BEING FALSIFIED BY ITS OWN
   # SUCCESS. This comment first crowned one run the slowest; the next run beat
@@ -488,16 +488,15 @@ jobs:
   # both factors move, one with the runner and one with this file.
   #
   # What the bound means in the unit that actually grows: at the slow end of the
-  # two bands recorded here (11.2s), ten minutes is reached at about FIFTY
-  # controls; at today's (7.9-9.8s), sixty to seventy-five. Fifty is the number
-  # to plan against, and this harness is at 35 controls.
+  # bands recorded here (14.9s), fifteen minutes is reached at about SIXTY
+  # controls. Plan against sixty: this harness is at 35 controls.
   # Sharing public-surface's five-minute budget would have put it past half of that
   # on day one, and the failure mode of outgrowing a timeout is a cancelled job
   # that reads like an outage rather than like a check that got too expensive.
   # Separate clock, stated size.
-  lane-b-ratchet-controls:
+  surface-ratchet-controls:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -509,26 +508,20 @@ jobs:
       # green run of the gate itself. This drives each refusal to its condition
       # and fails when one stops firing. No network, no history depth: every
       # comparison target is synthesized from HEAD.
-      - name: Every lane B refusal still fires
-        run: ./scripts/test_lane_b_ratchet.sh
+      - name: Every surface-check refusal still fires
+        run: ./scripts/test_surface_ratchet.sh
 
   public-surface:
     runs-on: ubuntu-latest
     timeout-minutes: 5
 
     steps:
-      # No fetch-depth here on purpose. The gate's roster rule now asks whether
-      # each literal still appears in the TRACKED TREE, which a one-commit clone
-      # answers perfectly well — the earlier `fetch-depth: 0` existed only for
-      # the history-based version of that rule and was pure cost once the rule
-      # changed. Verified by cloning this branch with --depth 1 and running the
-      # gate: exit 0.
+      # No fetch-depth here on purpose: the gate reads the tracked tree, which a
+      # one-commit clone holds, plus the single comparison commit fetched below.
       - name: Checkout
         uses: actions/checkout@v7
 
-      # This repository is already public, so it is NOT in the org's
-      # publication-candidate list and nothing else scans it. See the script's
-      # header for what the two lanes do and do not cover.
+      # See the script's header for what the two lanes do and do not cover.
       # One extra commit, not a full history: the lane B ratchet compares this
       # tree's baseline against an EARLIER one, so that raising a number in the
       # same change that adds the occurrence is caught.
@@ -586,7 +579,7 @@ jobs:
             echo "SP_LANE_B_BASE=FETCH_HEAD" >> "$GITHUB_ENV"
           fi
 
-      - name: No internal material in the published non-source surface
+      - name: Public surface check
         run: ./scripts/check_public_surface.sh
         env:
           PUBLIC_SURFACE_BASE_REF: ${{ env.SP_LANE_B_BASE }}

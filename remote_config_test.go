@@ -1756,11 +1756,11 @@ func TestWritePrivateFileAtomicReportsDirSyncFailure(t *testing.T) {
 	}
 }
 
-// TestRemoteConfigAttributePassThroughConsentGate pins the ADR-0310 attribute
-// leg's full truth table: attributes ride the fetch ONLY under opt-in AND
+// TestRemoteConfigAttributePassThroughConsentGate pins the attribute
+// pass-through's full truth table: attributes ride the fetch ONLY under opt-in AND
 // ConsentGranted — explicitly STRICTER than this SDK's open-under-unknown
 // event posture — and the attribute-less legs stay byte-identical to the
-// pre-ADR-0310 URL (path only, no query). The granted leg carries the
+// attribute-less URL (path only, no query). The granted leg carries the
 // experiment vocabulary normalized and sorted; a consent downgrade strips the
 // query from the very next fetch.
 func TestRemoteConfigAttributePassThroughConsentGate(t *testing.T) {
@@ -1907,7 +1907,7 @@ func TestSetRemoteConfigAttributesInertWhileDark(t *testing.T) {
 	}
 }
 
-// TestRemoteConfigAttributeSignatureKeysRevalidation pins the ADR-0310
+// TestRemoteConfigAttributeSignatureKeysRevalidation pins the
 // ETag/attribute interplay: the cached ETag revalidates ONLY a fetch
 // carrying the SAME attribute signature. A signature change (attribute-less
 // -> attributed, attributed -> different set, attributed -> downgraded)

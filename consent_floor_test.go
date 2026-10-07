@@ -5536,7 +5536,7 @@ func TestConsentReceiptRetryDoesNotLengthenWithTheFlushInterval(t *testing.T) {
 // pacing nudge — the worker loops back and re-derives its wake, and by then the
 // deadline has passed. deferRemaining reports ZERO for "already passed" and for
 // "no deadline at all" alike, so the wake arithmetic disarms the timer and the
-// receipt sits until the flush tick: here an hour (Codex on #48).
+// receipt sits until the flush tick: here an hour.
 //
 // The events plane has always had an elapsed-deadline fast path. This is the
 // consent plane's.
@@ -5663,7 +5663,7 @@ func TestConsumeElapsedConsentDeferralIsIdempotent(t *testing.T) {
 //
 // So: the check reports without consuming, and the claim holder reports on
 // release that someone was turned away, which is what the worker's wake hangs
-// off (Codex on #48).
+// off.
 func TestARefusedDispatchClaimLeavesTheDeadlineAndWakesOnRelease(t *testing.T) {
 	outbox := newConsentOutbox(t.TempDir())
 	now := time.Now()
@@ -5741,7 +5741,7 @@ func TestARefusedDispatchClaimLeavesTheDeadlineAndWakesOnRelease(t *testing.T) {
 // waits out the fifteen-second flush interval after all.
 //
 // Asserted at the moment of the send rather than by racing a real worker,
-// because the losing interleaving is one instant wide (Codex on #48).
+// because the losing interleaving is one instant wide.
 func TestAbortedConsentDispatchWakesOnlyAfterReleasingTheClaim(t *testing.T) {
 	hang := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -285,7 +285,7 @@ func TestStructureSurvivesTheNewerClauses(t *testing.T) {
 	})
 }
 
-// ── the two questions the coordinator turned into rules ──────────────────────
+// ── the two questions turned into rules ──────────────────────────────────────
 //
 // "Is this list DERIVED or RECALLED?" and "what does this library predicate
 // accept BEYOND the grammar?" — asked of every list and every borrowed predicate

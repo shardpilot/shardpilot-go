@@ -16,14 +16,4 @@
 # version moved because the numbers mean something different, not
 # because the layout changed -- reading a format-2 file with this
 # parser would understate every count that has such a line.
-7 config.go
-1 consent_outbox.go
-4 experiments.go
-1 pkg/crash/capture.go
-3 pkg/crash/capture_phase_d_test.go
-6 pkg/crash/client.go
-2 pkg/crash/goroutines.go
-2 pkg/crash/selfmodule.go
-7 remote_config.go
-3 remote_config_test.go
-3 schema_revision.go
+

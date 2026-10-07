@@ -1,4 +1,4 @@
-// External-package tests for the ADR-0297 §7d opt-ins (debug-id fill and
+// External-package tests for the phase-D capture opt-ins (debug-id fill and
 // all-goroutine capture): the panic origins must live outside pkg/crash, like
 // real application code, for the frame assertions to be meaningful.
 package crash_test
@@ -44,7 +44,7 @@ func capturePanicWith(t *testing.T, client *crash.Client) {
 }
 
 // TestRecoverPhaseDDarkDefaultsKeepWireShape pins the SHIPS-DARK posture of both
-// §7d opt-ins: with neither enabled, an auto-captured event still marshals zero
+// Phase-D opt-ins: with neither enabled, an auto-captured event still marshals zero
 // modules (no debug_id anywhere) and exactly the one precise crashed thread —
 // byte-shape-identical to the pre-Phase-D SDK.
 func TestRecoverPhaseDDarkDefaultsKeepWireShape(t *testing.T) {

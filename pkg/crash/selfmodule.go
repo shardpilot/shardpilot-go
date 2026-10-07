@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 )
 
-// Self-module identity (ADR-0297 §7d): with ClientOptions.DebugIDFillEnabled on,
+// Self-module identity: with ClientOptions.DebugIDFillEnabled on,
 // NewClient resolves the RUNNING BINARY's identity once and every auto-captured
 // event carries it as the single modules[] entry. The debug_id is read from the
 // binary itself, preferring the ELF GNU build-id note (rendered as lowercase hex —

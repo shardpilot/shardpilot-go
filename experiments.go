@@ -24,9 +24,9 @@ import (
 	"github.com/shardpilot/shardpilot-go/internal/uuidv7"
 )
 
-// Experiment-assignment consumer (ADR-0259 SDK leg): GETs the server-evaluated
+// Experiment-assignment consumer: GETs the server-evaluated
 // assignment for one (app, environment, experiment, subject) tuple from the
-// control-plane assignment endpoint and serves the assigned variant to the
+// server's assignment endpoint and serves the assigned variant to the
 // host, with a durable last-known-good cache, periodic revalidation (the
 // SDK-side kill-switch reach), and an exposure-fact lane riding the normal
 // analytics pipeline. Deliberately separate from remote_config.go (a
@@ -51,7 +51,7 @@ import (
 //	  ?app_key=&environment_key=&experiment_key=&subject_key=&<attributes>
 //	Authorization: Bearer <publishable APIKey>
 //
-// The base URL is the configured RemoteConfigURL — the control-plane host —
+// The base URL is the configured RemoteConfigURL — the remote-config host —
 // with the path swapped; no new endpoint configuration exists. The endpoint
 // requires the experiment-assignment read scope on the key, granted
 // server-side.
@@ -136,12 +136,10 @@ import (
 // escape hatch (a re-arm mints a distinct deterministic id). The assignment_key prop carries the
 // server-minted subject-fact key VERBATIM (the raw subject id is
 // structurally rejected there); an assignment without one emits NO fact.
-// NOTE: the analytics service currently rejects these event names from
-// publishable client keys by design; until the platform's producer-lane
-// decision lands, an emitted exposure is expected to come back as a
-// per-event reject. That server-side block is load-bearing and this SDK
-// deliberately relies on it staying authoritative — the lane is dark
-// end-to-end.
+// NOTE: the server may reject these event names from publishable client
+// keys; an emitted exposure then comes back as a per-event reject. That
+// server-side block is load-bearing and this SDK deliberately relies on it
+// staying authoritative.
 
 const expAssignmentRoute = "/api/v1/runtime/experiments/assignment"
 

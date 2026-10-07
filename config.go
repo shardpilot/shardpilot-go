@@ -121,7 +121,7 @@ type Config struct {
 	RemoteConfigCachePath string
 
 	// ExperimentsEnabled opts this client into the experiment-assignment
-	// consumer (ADR-0259): the assignment fetch, the cached-variant
+	// consumer: the assignment fetch, the cached-variant
 	// getters, periodic revalidation, and the exposure/outcome fact
 	// producers. Default false — DARK: while off, zero experiment code
 	// paths execute (no subject-id mint, no fetch, no revalidation
@@ -129,7 +129,7 @@ type Config struct {
 	// previously persisted ones), and the public experiment surface
 	// refuses ErrExperimentsNotConfigured.
 	//
-	// The assignment endpoint lives on the same control-plane host as the
+	// The assignment endpoint lives on the same host as the
 	// remote-config fetch and authenticates with the same publishable
 	// APIKey, so the flag requires RemoteConfigURL (which in turn requires
 	// APIKey). With SpoolDir set, the consumer persists its subject id and
@@ -137,18 +137,15 @@ type Config struct {
 	// in-memory only — a restart re-buckets the subject, documented
 	// ephemeral.
 	//
-	// Dark-phase note: the platform's experimentation flags are OFF in
-	// every environment today, so an enabled consumer receives 403 on
-	// every fetch until platform enablement — the expected fail-closed
-	// posture. Until the control-plane auth leg grants publishable keys
-	// the experiment-assignment read scope, only an explicitly scoped
-	// runtime token authenticates (401 otherwise). The exposure/outcome
-	// lane is additionally dark END-TO-END: the analytics service rejects
-	// these event names from publishable client keys until the platform's
-	// producer-lane decision lands.
+	// Where experiments are not enabled for the app, an enabled consumer
+	// receives 403 on every fetch — the expected fail-closed posture. A key
+	// without the experiment-assignment read scope is refused with 401. The
+	// server may also refuse the exposure/outcome event names from
+	// publishable client keys; those facts are then rejected like any other
+	// refused event.
 	ExperimentsEnabled bool
 
-	// RemoteConfigAttributesEnabled opts this client into the ADR-0310
+	// RemoteConfigAttributesEnabled opts this client into the targeting
 	// attribute pass-through on the remote-config fetch: the attributes set
 	// via SetRemoteConfigAttributes ride the GET /config/v1/... request as
 	// query parameters, letting server-side delivery rules target this
@@ -400,13 +397,13 @@ func normalizeConfig(cfg Config) (Config, error) {
 	}
 
 	if cfg.ExperimentsEnabled && cfg.RemoteConfigURL == "" {
-		// The assignment endpoint is the control-plane host the
+		// The assignment endpoint is on the host the
 		// remote-config fetch already points at (path-swapped), and it
 		// authenticates with the same publishable APIKey the
 		// RemoteConfigURL branch above already required: enabling
 		// experiments without that base could never produce a working
 		// fetch.
-		return Config{}, fmt.Errorf("%w: experiments require RemoteConfigURL (the assignment endpoint shares the control-plane host)", ErrInvalidConfig)
+		return Config{}, fmt.Errorf("%w: experiments require RemoteConfigURL (the assignment endpoint shares the remote-config host)", ErrInvalidConfig)
 	}
 
 	if cfg.RemoteConfigAttributesEnabled && cfg.RemoteConfigURL == "" {

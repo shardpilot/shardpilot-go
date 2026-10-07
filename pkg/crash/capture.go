@@ -78,7 +78,7 @@ func (c *Client) reportPanic(ctx context.Context, recovered any) {
 
 // panicEvent builds the crash Event for a recovered panic value. Frames are
 // PRE-SYMBOLICATED from the Go runtime (function/file/line, no native modules or
-// addresses — accepted by the crash ingest API). With the §7d opt-ins enabled the
+// addresses — accepted by the crash ingest API). With the phase-D opt-ins enabled the
 // event additionally carries the binary's self-module (DebugIDFillEnabled;
 // resolved once at NewClient, no I/O here) and the other goroutines' stacks
 // (AllGoroutineCaptureEnabled) — both dark by default, leaving this shape
