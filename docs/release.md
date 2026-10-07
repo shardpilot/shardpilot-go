@@ -35,9 +35,7 @@ v1.
    tag exists — run it at the tagged commit before publishing the Release.
 
 **A tag and a GitHub Release require explicit release authorization, and must
-not be cut without it.** The requirement is unchanged; what changed is that
-this file no longer cites the internal decision record it comes from, which
-named a repository a reader outside ShardPilot cannot open.
+not be cut without it.**
 
 The reason the requirement exists is in the next section: a tag is not
 reversible. Cutting one is the only irreversible step in this procedure.
