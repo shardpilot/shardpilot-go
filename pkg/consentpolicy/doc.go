@@ -3,11 +3,16 @@
 //
 // ⚠ WHAT THIS PACKAGE IS NOT, because every one of these would be a defect:
 //
-//   - NOT a consent grant. A plan says which regime applies; it never says a
-//     player agreed to anything. A notice-and-objection outcome needs its own
-//     distinct admission-basis representation; setting an analytics consent
-//     boolean to stand in for one would record a grant nobody gave. Nothing
-//     here touches the analytics consent state.
+//   - NOT a consent grant, and not legal advice. ShardPilot's resolver
+//     returns the STRICT_OPT_IN regime to every caller; this package still
+//     verifies every Regime value. A workspace that has accepted
+//     ShardPilot's advisory estimates may additionally receive an advisory,
+//     non-binding estimate, which this package does not carry in this
+//     release, and the integrating studio decides what to do with it. Neither
+//     says a player agreed to anything. A notice-and-objection outcome needs
+//     its own distinct admission-basis representation; setting an analytics
+//     consent boolean to stand in for one would record a grant nobody gave.
+//     Nothing here touches the analytics consent state.
 //   - NOT an ingest authorization. A valid plan is still not permission to
 //     ingest anything. The caller combines this verdict with
 //     the scoped actor's own retained floors, age evidence, choices and
