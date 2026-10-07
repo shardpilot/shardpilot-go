@@ -194,12 +194,16 @@ cd "$(dirname "$0")/.."
 # how the second consumer comes to check something different from the first.
 # ── THE ROSTER HALF ─────────────────────────────────────────────────────────
 # Names that no shape can tell apart from prose are held as DIGESTS. Each
-# ROSTER_DIGESTS row is `<word count> <sha256(ROSTER_SALT + name)>`, where the
-# name is lower-cased with its words joined by `-`. The matcher, `roster_grep`,
-# splits text into words at `-`, `_` and spaces, hashes every run of that many
-# consecutive words the same way, and reports a hit when a digest matches. Case,
-# separators, repeated spaces and a plural `s`/`es` are therefore no evasion,
-# and this file spells none of the names it guards.
+# ROSTER_DIGESTS row is `<word lengths> <sha256(ROSTER_SALT + name)>`, where
+# the name is lower-cased with its words joined by `-` and the lengths are its
+# words' lengths, comma-separated. The matcher, `roster_grep`, reads a name as
+# a substring, the way a plain `first[-_ ]+second` pattern would: it splits text
+# into letter-and-digit words at `-`, `_` and spaces, and for each run of that
+# many consecutive words it hashes the first word's last characters, the middle
+# words whole and the last word's first characters, each by the stated length.
+# Case, separators, repeated spaces and letters or digits attached on either
+# side (a plural, a version number) are therefore no evasion, and this file
+# spells none of the names it guards.
 #
 # ROSTER_CANARY is a synthetic name whose digest is in the list. The self-test
 # plants it in several spellings, so a matcher that cannot fire fails here
@@ -391,9 +395,9 @@ GATE_DATA_NAMES='ROSTER_SALT ROSTER_DIGESTS ROSTER_CANARY KNOWN_INTERNAL KNOWN_I
 
 PATTERNS='ADR-[0-9]+|§[0-9]|[Tt]here (is|are) [Nn][Oo] [A-Za-z][A-Za-z-]*( [A-Za-z-]+){0,2} (harness|harnesses|coverage|tests?|suites?)|(is|are|was|were)(n.{1,3}t| not| never) (tested|covered|scanned|audited|monitored)|(is|are|was|were|remains?) (largely |entirely |still |completely |mostly )?(untested|unmonitored|unaudited|unscanned)|[Nn]o( [A-Za-z][A-Za-z-]*){0,3} (tests?|coverage|scanning|monitoring|harness|harnesses|suites?)( (exists?|existed|remains?|remained|runs?|ran|covers?|covered|exercises?|exercised|guards?|guarded))?( (for|of|in)|[.,;]|$)|[Tt]here (is|are)(n.{1,3}t| not) (any |no )?(harness|harnesses|coverage|tests?|suites?)|[Tt]here (is|are) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?)|(has|have|had) zero( [A-Za-z][A-Za-z-]*){0,3} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Ww]ithout( (automated|manual|unit|integration|end-to-end|regression|any|meaningful))* (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|[Nn]obody (looks|checks|monitors)( at| on)?( [A-Za-z][A-Za-z-]*){0,3} (dashboard|dashboards|alert|alerts|log|logs|metric|metrics|queue|queues|report|reports|test|tests|coverage|monitoring)( (for|of|in)|[.,;]|$)|(is|are|was|were)(n.{1,3}t| not| never) under (test|testing|coverage|monitoring|observation)( (for|of|in)|[.,;]|$)|[Ll]acks( any| automated| an?)*( [A-Za-z][A-Za-z-]*)? (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|(has|have|had)(n.{1,3}t| not| never) been (tested|covered|scanned|audited|monitored)|(does|do|did)( not|n.{1,3}t) have( any| automated| an?)*( [A-Za-z][A-Za-z-]*){0,2} (harness|harnesses|coverage|tests?|suites?|monitoring)( (for|of|in)|[.,;]|$)|GAP-[0-9]{3}|\bSP-[0-9]{3}\b|\bAC-[A-Z]{2}-[0-9]+|Codex (review|#|[a-z]+#)|[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)|\b(main|master|HEAD) @ *`?[0-9a-f]{7,40}'
 ROSTER_SALT='shardpilot-surface-roster-v1'
-ROSTER_DIGESTS='2 174ead9ac7f4fc41cae883b2fdedda32bb8f4221d83b5f36bf20fc43709a5c21
-2 f37497f378e89c146abbf58631622024e00212d83c0c23349796be7501357e23
-2 5dc0f5f827086a33997cd0d97206c67e42009a9f5d191ab532650920a84bde33'
+ROSTER_DIGESTS='9,7 174ead9ac7f4fc41cae883b2fdedda32bb8f4221d83b5f36bf20fc43709a5c21
+7,5 f37497f378e89c146abbf58631622024e00212d83c0c23349796be7501357e23
+7,5 5dc0f5f827086a33997cd0d97206c67e42009a9f5d191ab532650920a84bde33'
 ROSTER_CANARY='orch[]ard-relay'
 KNOWN_INTERNAL='per ADR-[]0000 §[]000
 There are no P[]laywright tests for the sample app.
@@ -824,30 +828,38 @@ ROSTER_PERL='
 use strict; use warnings;
 my ($mode, $salt, $digests, @files) = @ARGV;
 eval { require Digest::SHA; 1 } or exit 2;
-my (%want, %sizes);
+my (%want, %shapes);
 for my $row (split /\n/, $digests) {
   next if $row =~ /^\s*$/;
-  $row =~ /^\s*([1-9])\s+([0-9a-f]{64})\s*$/ or exit 2;
-  $want{$2} = 1; $sizes{$1} = 1;
+  $row =~ /^\s*([1-9][0-9]?(?:,[1-9][0-9]?)*)\s+([0-9a-f]{64})\s*$/ or exit 2;
+  $want{$2} = 1; $shapes{$1} = [split /,/, $1];
 }
 %want or exit 2;
-my @ks = sort { $a <=> $b } keys %sizes;
+my @shapes = values %shapes;
 my (%memo, $hit);
 sub named { my $d = $memo{$_[0]} //= Digest::SHA::sha256_hex($salt . $_[0]); return $want{$d} }
 sub found_in {
+  my $text = $_[0];
   my @found;
-  for my $run ($_[0] =~ /[A-Za-z0-9]+(?:[-_ ]+[A-Za-z0-9]+)*/g) {
-    my @orig = split /[-_ ]+/, $run;
-    next if @orig < $ks[0];
-    my @w = map { lc } @orig;
-    for my $k (@ks) {
+  while ($text =~ /[A-Za-z0-9]+(?:[-_ ]+[A-Za-z0-9]+)*/g) {
+    my $run = $&;
+    my (@w, @s, @e);
+    while ($run =~ /[A-Za-z0-9]+/g) { push @w, lc $&; push @s, $-[0]; push @e, $+[0] }
+    for my $sh (@shapes) {
+      my $k = @$sh;
       for my $i (0 .. @w - $k) {
-        my $norm = join "-", @w[$i .. $i + $k - 1];
-        next unless named($norm)
-          || (substr($norm, -2) eq "es" && named(substr($norm, 0, -2)))
-          || (substr($norm, -1) eq "s" && named(substr($norm, 0, -1)));
-        my $re = join "[-_ ]+", map { quotemeta } @orig[$i .. $i + $k - 1];
-        push @found, ($run =~ /($re)/)[0];
+        my $j = $i + $k - 1;
+        if ($k == 1) {
+          for my $p (0 .. length($w[$i]) - $sh->[0]) {
+            push @found, substr($run, $s[$i] + $p, $sh->[0]) if named(substr($w[$i], $p, $sh->[0]));
+          }
+          next;
+        }
+        next if length($w[$i]) < $sh->[0] || length($w[$j]) < $sh->[-1];
+        next if grep { length($w[$_]) != $sh->[$_ - $i] } $i + 1 .. $j - 1;
+        next unless named(join "-", substr($w[$i], -$sh->[0]), @w[$i + 1 .. $j - 1], substr($w[$j], 0, $sh->[-1]));
+        my $from = $e[$i] - $sh->[0];
+        push @found, substr($run, $from, $s[$j] + $sh->[-1] - $from);
       }
     }
   }
@@ -1883,9 +1895,9 @@ scan_tree() {
 #
 # The roster holds digests, so this file publishes none of the names it guards
 # and nothing about them needs to be found elsewhere in the tree. What has to
-# hold instead is that the list is USABLE: every row is `<words> <sha256>`, and
-# the synthetic canary, planted in a sentence, is caught by the same matcher
-# the scan uses.
+# hold instead is that the list is USABLE: every row is
+# `<word lengths> <sha256>`, and the synthetic canary, planted in a sentence, is
+# caught by the same matcher the scan uses.
 #
 # This file, excluded from every presence search: it holds the fixtures, so it
 # cannot be part of the answer to whether anything else in the tree does.
@@ -2024,8 +2036,8 @@ roster_is_usable() {
   while IFS= read -r row; do
     [ -n "$row" ] || continue
     rows=$((rows + 1))
-    if ! printf '%s\n' "$row" | grep -qE '^[1-9] [0-9a-f]{64}$'; then
-      printf 'ROSTER VIOLATION: a ROSTER_DIGESTS row is not "<words> <sha256>".\n' >&2
+    if ! printf '%s\n' "$row" | grep -qE '^[1-9][0-9]?(,[1-9][0-9]?)* [0-9a-f]{64}$'; then
+      printf 'ROSTER VIOLATION: a ROSTER_DIGESTS row is not "<word lengths> <sha256>".\n' >&2
       novel=$((novel + 1))
     fi
   done <<EOF
@@ -2230,11 +2242,14 @@ $KNOWN_INTERNAL
 EOF
   # THE ROSTER HALF, proven on the synthetic canary in the spellings the
   # matcher promises to fold: as written, upper case with underscores, spaced,
-  # and plural. A miss on any of them means the roster is not armed.
+  # plural, with a digit attached after and with a letter attached before. A
+  # miss on any of them means the roster is not armed.
   for line in "$ROSTER_CANARY" \
               "$(printf '%s' "$ROSTER_CANARY" | tr 'a-z-' 'A-Z_')" \
               "$(printf '%s' "$ROSTER_CANARY" | sed 's/-/ /g')" \
-              "${ROSTER_CANARY}s"; do
+              "${ROSTER_CANARY}s" \
+              "${ROSTER_CANARY}2" \
+              "x${ROSTER_CANARY}"; do
     tested=$((tested + 1))
     printf 'a sentence mentioning %s in passing\n' "$line" | roster_grep q - || {
       printf 'SELFTEST MISS (roster): %s\n' "$line" >&2; misses=$((misses + 1)); }

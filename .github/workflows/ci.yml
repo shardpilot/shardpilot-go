@@ -458,8 +458,10 @@ jobs:
   #   28 controls   229s, 230s, 254s, 255s  8.2, 8.2, 9.1, 9.1
   #   29 controls   283s                    9.8
   #   33 controls   259s, 311s              7.9, 9.4
+  #   35 controls   392s, 520s              11.2, 14.9
   #
-  # -- 7.9 to 9.8 seconds per control, and the total is that times the count.
+  # -- 7.9 to 9.8 seconds per control before the name list moved to digests,
+  # 11.2 to 14.9 after, and the total is that times the count.
   #
   # ⚠ RECORDED PER CONTROL BECAUSE A TOTAL KEEPS BEING FALSIFIED BY ITS OWN
   # SUCCESS. This comment first crowned one run the slowest; the next run beat
@@ -486,16 +488,15 @@ jobs:
   # both factors move, one with the runner and one with this file.
   #
   # What the bound means in the unit that actually grows: at the slow end of the
-  # two bands recorded here (11.2s), ten minutes is reached at about FIFTY
-  # controls; at today's (7.9-9.8s), sixty to seventy-five. Fifty is the number
-  # to plan against, and this harness is at 35 controls.
+  # bands recorded here (14.9s), fifteen minutes is reached at about SIXTY
+  # controls. Plan against sixty: this harness is at 35 controls.
   # Sharing public-surface's five-minute budget would have put it past half of that
   # on day one, and the failure mode of outgrowing a timeout is a cancelled job
   # that reads like an outage rather than like a check that got too expensive.
   # Separate clock, stated size.
   surface-ratchet-controls:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
