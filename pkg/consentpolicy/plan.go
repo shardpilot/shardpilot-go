@@ -239,6 +239,11 @@ type Plan struct {
 	// reading, from a malformed body. Nil means the key was not sent; a
 	// non-nil empty string is a refusal this package will not honour.
 	Reason *RefusalReason `json:"reason,omitempty"`
+	// ⚠ OPTIONAL, AND NEVER A REGIME. Present only when the request opted in
+	// and the resolver admitted it; absent otherwise (never null), and never
+	// on a refusal. Nothing that decides anything in this package reads it:
+	// see Advisory.
+	Advisory *Advisory `json:"advisory,omitempty"`
 }
 
 // The bounds are the resolver's, mirrored here so a malformed plan is refused
@@ -500,6 +505,16 @@ func (p Plan) validate() error {
 	if p.Reason == nil && !p.Scope.complete() {
 		return errors.New("consentpolicy: the plan names no complete scope tuple")
 	}
+	if p.Advisory != nil {
+		// A refusal is the strict fallback with its reason, and the resolver
+		// never serves the advisory part on one.
+		if p.Reason != nil {
+			return errors.New("consentpolicy: a refusal carries an advisory part")
+		}
+		if err := p.Advisory.validate(); err != nil {
+			return err
+		}
+	}
 	for _, field := range []struct {
 		name  string
 		value string
@@ -614,6 +629,10 @@ func (p Plan) expiry() (time.Time, error) {
 // called "signature" is not exempt by accident.
 var nullableKeys = map[string]struct{}{
 	"signature": {},
+	// The advisory part's estimate is null where its row carries none, and
+	// always for OTHER. The advisory itself is NOT nullable: absent or an
+	// object.
+	"advisory.estimate": {},
 }
 
 // isJSONNull reports whether a raw member is the literal null. The bytes are

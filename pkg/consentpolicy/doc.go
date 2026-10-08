@@ -7,9 +7,11 @@
 //     returns the STRICT_OPT_IN regime to every caller; this package still
 //     verifies every Regime value. A workspace that has accepted
 //     ShardPilot's advisory estimates may additionally receive an advisory,
-//     non-binding estimate, which this package does not carry in this
-//     release, and the integrating studio decides what to do with it. Neither
-//     says a player agreed to anything. A notice-and-objection outcome needs
+//     non-binding estimate, when a client SDK asked for it (`advisory: true`;
+//     this package sends no request). ParsePlan validates it and carries it
+//     as Plan.Advisory; it never changes the regime or any other answer here,
+//     and the integrating studio decides what to do with it. Neither says a
+//     player agreed to anything. A notice-and-objection outcome needs
 //     its own distinct admission-basis representation; setting an analytics
 //     consent boolean to stand in for one would record a grant nobody gave.
 //     Nothing here touches the analytics consent state.
@@ -23,8 +25,10 @@
 //     game server's own connection where the player's belongs.
 //   - NOT a geolocator. It never reads an IP, a forwarded header or a store
 //     region, and it does not require a country to be present in a valid plan:
-//     the resolver's initial release performs no geolocation at all and
-//     reports its signals as unavailable with a reason.
+//     the plan itself reads no geolocation in this release and reports its
+//     signals as unavailable with a reason. The advisory part, when served,
+//     states its own jurisdiction and how it was reached (ResolvedBy); that
+//     is the resolver's reading, carried, not one made here.
 //   - NOT process-wide. One plan is verified for one actor's operation. A
 //     cached verdict served to a second actor would authorize a different
 //     player than the events carry.

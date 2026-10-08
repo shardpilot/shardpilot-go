@@ -160,6 +160,7 @@ func clonePlan(p Plan) Plan {
 		reason := *p.Reason
 		out.Reason = &reason
 	}
+	out.Advisory = cloneAdvisory(p.Advisory)
 	return out
 }
 
