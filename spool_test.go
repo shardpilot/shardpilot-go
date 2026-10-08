@@ -1705,7 +1705,7 @@ func TestSpoolMergeCapEvictionSettlesMirror(t *testing.T) {
 	}
 	refused, added, _, evicted, persistFailed := spoolA.append([]spoolEntry{entry("evt-mc-a3")}, 0, false, now, allowed)
 	if refused || persistFailed || len(evicted) != 0 {
-		t.Fatalf("append A2: refused=%v persistFailed=%v evicted=%d", refused, persistFailed, len(evicted))
+		t.Fatalf("second append A: refused=%v persistFailed=%v evicted=%d", refused, persistFailed, len(evicted))
 	}
 	if len(added) != 1 {
 		t.Fatalf("expected a3 accepted, got %d", len(added))
