@@ -23,7 +23,7 @@ forms, and the `.indented.json` files here are byte-for-byte copies of them.
 
 The advisory pair was recorded the same way, from the stored body
 `internal/httpserver/testdata/consent_policy_resolved_strict_with_advisory.json`
-(blob `62b6f2e370ec98ddf185f9d9d597e321c1c330fc`), which the
+(blob `e4b01af80364f9c1bb6d6161616d37d583e03c17`), which the
 `.indented.json` here copies byte for byte. It answers the same request with
 `advisory: true` added, for a workspace admitted to the advisory, from a
 connection the resolver located in GB. Its plan is the resolved plan above,

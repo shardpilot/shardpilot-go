@@ -35,8 +35,9 @@ type Advisory struct {
 	RowID     string            `json:"row_id"`
 	RowStatus AdvisoryRowStatus `json:"row_status"`
 	RowBasis  AdvisoryRowBasis  `json:"row_basis"`
-	// AdvisoryBasis is the row's basis text, verbatim (Markdown), markers such
-	// as `contested` included. It is for a human to read.
+	// AdvisoryBasis is the row's basis text (Markdown) in the matrix's own
+	// words, markers such as `contested` included, with the source's internal
+	// references removed. It is for a human to read.
 	AdvisoryBasis string             `json:"advisory_basis"`
 	Matrix        AdvisoryMatrix     `json:"matrix"`
 	ResolvedBy    AdvisoryResolvedBy `json:"resolved_by"`
