@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
+	"unicode"
 )
 
 // Advisory is the plan's optional advisory part: the region matrix's research
@@ -108,8 +110,14 @@ var (
 	jurisdictionPattern = regexp.MustCompile(`^(?:[A-Z]{2}|OTHER)$`)
 	commitPattern       = regexp.MustCompile(`^[0-9a-f]{40}$`)
 	sha256Pattern       = regexp.MustCompile(`^[0-9a-f]{64}$`)
-	controlPattern      = regexp.MustCompile(`[\x00-\x1f\x7f]`)
 )
+
+// hasControl reports whether text carries a Unicode control character
+// (general category Cc: C0, DEL and C1). An ASCII-only class let U+0085 NEXT
+// LINE through, which some log sinks and terminals read as a line break.
+func hasControl(text string) bool {
+	return strings.IndexFunc(text, unicode.IsControl) >= 0
+}
 
 func (a Advisory) validate() error {
 	if !jurisdictionPattern.MatchString(a.Jurisdiction) {
@@ -120,6 +128,13 @@ func (a Advisory) validate() error {
 	}
 	if a.Estimate != nil && !a.Estimate.known() {
 		return fmt.Errorf("consentpolicy: unknown advisory.estimate %q", string(*a.Estimate))
+	}
+	// The row is the jurisdiction's own, or OTHER for both: the contract makes
+	// the jurisdiction OTHER for a connection with no row of its own, and the
+	// resolver sets both members from one row. Checked first, so the OTHER
+	// rule below holds for the row as well as the jurisdiction.
+	if a.RowID != a.Jurisdiction {
+		return errors.New("consentpolicy: advisory.row_id is not the jurisdiction's row")
 	}
 	// The contract states both of these in its own words: OTHER never carries
 	// an estimate, and an unresolved connection is OTHER. A body that says
@@ -146,7 +161,7 @@ func (a Advisory) validate() error {
 	// it is the one free-text member a caller is likely to log or show: a
 	// newline here could write a second line into a log that nothing
 	// authorised, the reason the refusal vocabulary is closed.
-	if controlPattern.MatchString(a.AdvisoryBasis) {
+	if hasControl(a.AdvisoryBasis) {
 		return errors.New("consentpolicy: advisory.advisory_basis carries a control character")
 	}
 	if !commitPattern.MatchString(a.Matrix.DocsCommit) {

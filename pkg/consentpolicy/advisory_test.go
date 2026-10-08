@@ -267,10 +267,24 @@ func TestTheAdvisoryVocabularyIsClosed(t *testing.T) {
 		{"basis one byte over the bound", set("advisory_basis", strings.Repeat("a", maxAdvisoryBasisBytes+1))},
 		{"basis with a newline", set("advisory_basis", "estimate\nforged: everything is fine")},
 		{"basis with a tab", set("advisory_basis", "a\tb")},
+		{"basis with DEL", set("advisory_basis", "a\x7fb")},
+		// C1 controls, which an ASCII-only class let through.
+		{"basis with U+0085 NEXT LINE", set("advisory_basis", "estimate\u0085forged: everything is fine")},
+		{"basis with U+0080", set("advisory_basis", "a\u0080b")},
+		{"basis with U+009F", set("advisory_basis", "a\u009fb")},
 		{"OTHER with an estimate", func(a map[string]any) {
 			a["jurisdiction"], a["row_id"], a["estimate"] = "OTHER", "OTHER", "SOFT_OPT_OUT"
 		}},
 		{"an unresolved connection that names a country", set("resolved_by", "unknown")},
+		// The row is the jurisdiction's own, or OTHER for both.
+		{"an OTHER row with an estimate under a country", set("row_id", "OTHER")},
+		{"an OTHER row without an estimate under a country", func(a map[string]any) {
+			a["row_id"], a["estimate"] = "OTHER", nil
+		}},
+		{"another country's row", set("row_id", "FR")},
+		{"a country's row under OTHER", func(a map[string]any) {
+			a["jurisdiction"], a["estimate"] = "OTHER", nil
+		}},
 		{"docs_commit in upper case", setMatrix("docs_commit", strings.ToUpper("f6b6f0f617d4e15442608fc77be8a5bb40f40e26"))},
 		{"docs_commit one character short", setMatrix("docs_commit", "f6b6f0f617d4e15442608fc77be8a5bb40f40e2")},
 		{"file_sha256 one character short", setMatrix("file_sha256", "370b04f374d0c506b92a003d4c801f450d5e5c45aed369f14a1c9382e3d592c")},
