@@ -5803,7 +5803,7 @@ func TestAbortedConsentDispatchWakesOnlyAfterReleasingTheClaim(t *testing.T) {
 }
 
 // TestConsentOutboxUnreadableWitnessDoesNotResurrectSupersededGrant is the
-// P0 regression, and it is deliberately built in the state the PRODUCT code
+// main regression, and it is deliberately built in the state the PRODUCT code
 // produces on its own rather than a synthetic one. On the denial side
 // applySpoolConsent runs FIRST (consent.go), so a denial whose spool purge
 // fails leaves recordPersisted=false while the deny receipt has ALREADY been
@@ -6348,7 +6348,7 @@ func TestConsentUnwitnessedMarkIsHonoredEverywhereAGrantIsTrusted(t *testing.T) 
 	})
 }
 
-// TestUnprovableGrantIsHeldFromTheWireAndRecoverable covers round 6's four
+// TestUnprovableGrantIsHeldFromTheWireAndRecoverable covers four review
 // findings, which are one question asked four ways: what else still trusts a
 // grant, and what else can strip the mark that says it is unprovable.
 func TestUnprovableGrantIsHeldFromTheWireAndRecoverable(t *testing.T) {
@@ -6535,7 +6535,7 @@ func TestForeignRecordDoesNotResurrectAWithheldGrant(t *testing.T) {
 
 // TestConsentRecordUnusableClassesAreAllCovered exercises the two UNUSABLE
 // classes of the record reader that no other test reaches. Each of them fails
-// OPEN into the exact P0 this branch closes, so leaving them untested would
+// OPEN into the exact defect this branch closes, so leaving them untested would
 // mean two of four arms shipping unguarded.
 func TestConsentRecordUnusableClassesAreAllCovered(t *testing.T) {
 	for _, tc := range []struct {
@@ -6584,7 +6584,7 @@ func TestConsentRecordUnusableClassesAreAllCovered(t *testing.T) {
 	}
 }
 
-// TestBlockedGrantIsDurableWhateverTheRecordSays covers round 7, which found
+// TestBlockedGrantIsDurableWhateverTheRecordSays covers a review that found
 // the same asymmetry for the fifth and sixth time: a grant took effect through
 // a door the previous fix had not widened.
 func TestBlockedGrantIsDurableWhateverTheRecordSays(t *testing.T) {

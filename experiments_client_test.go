@@ -1524,7 +1524,7 @@ func zero() float64 { return 0 }
 // ── spool interaction ───────────────────────────────────────────────────────
 
 func TestExperimentFactsGateOnAnonymousActorUnderFloor(t *testing.T) {
-	// The fleet actor rule (review round 7): under a USER-scoped floor
+	// The fleet actor rule: under a USER-scoped floor
 	// (UserID configured) the recorded grant covers the user actor, but an
 	// experiment fact rides the ANONYMOUS identity alone on the wire — the
 	// actor whose id actually ships has no grant, so the fact REFUSES at

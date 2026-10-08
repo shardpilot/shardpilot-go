@@ -1,6 +1,6 @@
 package shardpilot
 
-// Review round 10 — regression pins. Each test fails on the pre-fix tree
+// Regression pins, part 10. Each test fails on the pre-fix tree
 // for its finding's exact reason (verified mechanically via targeted
 // temporary reverts of the fix, with the test seams retained).
 
@@ -228,7 +228,7 @@ func TestRacingDenialDiscardsInstallKeepsRetainedCache(t *testing.T) {
 	}
 }
 
-// ── finding 6, the partition's other half (fleet contract, defold R22):
+// ── finding 6, the partition's other half (fleet contract, as in Defold):
 // destructive verdicts from a request dispatched under grant still apply ────
 
 func TestRacingDenialStillAppliesServerWithdrawal(t *testing.T) {
@@ -453,7 +453,7 @@ func TestWithdrawnMarkerReadBoundScalesWithConfig(t *testing.T) {
 	t.Run("damaged_marker_fails_closed", func(t *testing.T) {
 		dir := t.TempDir()
 		// The wipe-rung escalation asserted below is the EXPERIMENTS-ENABLED
-		// posture (round 16 scoped the damaged-marker remedy by the opt-in:
+		// posture (a later fix scoped the damaged-marker remedy by the opt-in:
 		// a dark client fails closed within the experiment-fact class
 		// instead — see TestDarkClientDamagedMarkerFailsClosedWithinFactClass).
 		cfg := Config{SpoolDir: dir, SpoolMaxEvents: 100, SpoolMaxBytes: 1 << 20, ExperimentsEnabled: true}

@@ -13,9 +13,9 @@ import (
 	"time"
 )
 
-// Round-1 review regressions plus the defold R9/R10 cross-check pins.
+// Regressions, part 1, plus the pins shared with the Defold SDK.
 
-// Finding 1 + R10: the fact lane's privacy boundary — a non-sfk1_ subject
+// Finding 1: the fact lane's privacy boundary — a non-sfk1_ subject
 // fact key (a raw spcid_ echo included) must never ride assignment_key.
 func TestSubjectFactKeyGrammarGuardsTheFactLane(t *testing.T) {
 	rawSubject := "spcid_" + strings.Repeat("a", 32)
@@ -114,7 +114,7 @@ func TestUnknownAssignmentUnitIsMalformed(t *testing.T) {
 	}
 }
 
-// R9/R10: presence vs type split — an explicit-null (or non-string) reason
+// Presence vs type split — an explicit-null (or non-string) reason
 // or echo member is malformed, never coerced to the absent shape.
 func TestNullReasonAndEchoesAreMalformed(t *testing.T) {
 	scope := expTestRequestScope()
@@ -247,7 +247,7 @@ func TestLatchStopsRevalidationBatch(t *testing.T) {
 	}
 }
 
-// Finding 5 / R10: restored attributes re-validate against the live
+// Finding 5: restored attributes re-validate against the live
 // vocabulary before riding a revalidation fetch.
 func TestRestoredAttributesAreRenormalized(t *testing.T) {
 	script := &expScript{}
@@ -402,7 +402,7 @@ func TestExperimentFilesAreTightened(t *testing.T) {
 	}
 }
 
-// R9: a grammar-400 with the one-shot budget already spent drops the cached
+// A grammar-400 with the one-shot budget already spent drops the cached
 // entry durably (permanent-400 semantics), while stale rejects stay
 // discarded whole.
 func TestSpentBudgetGrammar400DropsEntry(t *testing.T) {
@@ -435,7 +435,7 @@ func TestSpentBudgetGrammar400DropsEntry(t *testing.T) {
 	}
 }
 
-// R10: durable intents carry their decision scope — a subject rotation
+// Durable intents carry their decision scope — a subject rotation
 // cancels owed WRITES, while an owed DROP lands against the RETIRED
 // record without consulting memory.
 func TestScopedOwedIntentsAcrossSubjectRotation(t *testing.T) {
@@ -487,7 +487,7 @@ func TestScopedOwedIntentsAcrossSubjectRotation(t *testing.T) {
 	}
 }
 
-// R9/R10: one working save folds owed sibling intents instead of leaving
+// One working save folds owed sibling intents instead of leaving
 // them for the retry cycle.
 func TestCombinedSaveFoldsOwedSiblings(t *testing.T) {
 	script := &expScript{}
@@ -523,7 +523,7 @@ func TestCombinedSaveFoldsOwedSiblings(t *testing.T) {
 	}
 }
 
-// R10: a consent purge discards owed snapshots first and re-arms live
+// A consent purge discards owed snapshots first and re-arms live
 // entries only — a since-dropped entry's owed fact does not re-emit into
 // the re-granted session.
 func TestPurgeDiscardsDeadOwedAndReArmsLiveOnly(t *testing.T) {

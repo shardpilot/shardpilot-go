@@ -1,8 +1,8 @@
 package shardpilot
 
-// Round-9 review regression tests:
+// Regressions, part 9:
 //
-//  1. (P1) The drop-time capture path refuses anonymous-only experiment
+//  1. The drop-time capture path refuses anonymous-only experiment
 //     facts under a user-scoped floor — the mirror of intake's actor gate;
 //     the durable drop proceeds without capture (consent-first).
 //  2. A failed withdrawal-marker spend reports as a failed save and keeps
@@ -14,7 +14,7 @@ package shardpilot
 //  5. Filtering a withdrawn fact keeps the surviving retained PREFIX bytes
 //     even when the batch had appended tail members beyond the prefix.
 //  6. A mid-cycle Retry-After: 0 pulls the pre-armed cadence deadline down
-//     (retry NOW), completing the round-8 pull-down.
+//     (retry NOW), completing the earlier pull-down.
 //  7. A refused session mints no subject state (structural pin for the
 //     pre-mint consent re-check).
 //  8. A fresh same-experiment install preserves an unlanded capture debt
@@ -35,7 +35,7 @@ import (
 	"time"
 )
 
-// ── finding 1 (P1): capture refuses anonymous-only facts under user floor ───
+// ── finding 1: capture refuses anonymous-only facts under user floor ────────
 
 func TestCaptureRefusesAnonymousOnlyFactUnderUserScopedFloor(t *testing.T) {
 	script := &expScript{}

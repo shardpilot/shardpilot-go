@@ -1,6 +1,6 @@
 package shardpilot
 
-// Round-8 review regression tests:
+// Regressions, part 8:
 //
 //  0. The worker's receive-time consent-epoch boundary: a deny →
 //     quick-re-grant round trip must not fold post-grant events into the
@@ -15,7 +15,7 @@ package shardpilot
 //     zero-traffic promise) instead of letting it run out its window with
 //     only the settle-time discard.
 //  3. The sentinel's spool sweep cannot withdraw a FRESH post-sentinel
-//     fact (re-ruled by round 11): the decisive epoch bump lands under
+//     fact (re-ruled later): the decisive epoch bump lands under
 //     e.mu before the pipeline purge, so a fact born in the gap carries
 //     the post-sentinel stamp and the sweep's epoch guard spares it.
 //  4. A transient park pulls the pre-armed revalidation deadline DOWN, so
@@ -306,7 +306,7 @@ func TestSentinelSpoolSweepSparesFreshPostPurgeFacts(t *testing.T) {
 			t.Fatalf("iteration %d: the seed fact must be spool-resident before the purge (err=%v)", i, err)
 		}
 
-		// Round 11 re-ruled the protection from mutual exclusion to STAMPS:
+		// A later fix re-ruled the protection from mutual exclusion to STAMPS:
 		// the sentinel's decisive bump happens under e.mu BEFORE the
 		// pipeline purge even starts, so a fresh fact born anywhere in the
 		// gap — after the sentinel, before (or racing) the purge's spool

@@ -1,6 +1,6 @@
 package shardpilot
 
-// Review round 15 — regression pins. Each test fails on the pre-fix tree
+// Regression pins, part 15. Each test fails on the pre-fix tree
 // for its finding's exact reason (verified mechanically via targeted
 // temporary reverts of the fix, with the test seams retained).
 
@@ -37,7 +37,7 @@ func stageSpooledResendState(t *testing.T, serverURL, spoolDir string) {
 	}
 }
 
-// ── G15-1: pulled spool chunks re-check the purge state at handoff ──────────
+// ── Pulled spool chunks re-check the purge state at handoff ─────────────────
 
 func TestSpoolResendHandoffRechecksPulledChunk(t *testing.T) {
 	run := func(t *testing.T, drive func(t *testing.T, c *Client, capture *expWireCapture)) {
@@ -147,7 +147,7 @@ func TestSpoolResendHandoffRechecksPulledChunk(t *testing.T) {
 	})
 }
 
-// ── G15-2: the sentinel's spool purge is crash-durable ──────────────────────
+// ── The sentinel's spool purge is crash-durable ─────────────────────────────
 
 func TestSentinelSpoolPurgeCrashDurable(t *testing.T) {
 	capture := &expWireCapture{}
@@ -188,7 +188,7 @@ func TestSentinelSpoolPurgeCrashDurable(t *testing.T) {
 	}
 }
 
-// ── G15-3: raced consent refusals map to the documented consent errors ──────
+// ── Raced consent refusals map to the documented consent errors ─────────────
 
 func TestRacedConsentRefusalMapsToConsentError(t *testing.T) {
 	cases := []struct {
@@ -260,7 +260,7 @@ func TestRacedConsentRefusalMapsToConsentError(t *testing.T) {
 	}
 }
 
-// ── G15-4: the retry-sync cycle drains deferred dead-letters ────────────────
+// ── The retry-sync cycle drains deferred dead-letters ───────────────────────
 
 func TestRetrySyncDrainsDeferredSpoolLetters(t *testing.T) {
 	capture := &expWireCapture{}
@@ -314,7 +314,7 @@ func TestRetrySyncDrainsDeferredSpoolLetters(t *testing.T) {
 	}
 }
 
-// ── G15-5: SpoolDir privacy is established before the experiment preload ────
+// ── SpoolDir privacy is established before the experiment preload ───────────
 
 func TestPreloadEstablishesSpoolDirPrivacy(t *testing.T) {
 	plant := func(t *testing.T, serverURL, spoolDir string) {
@@ -411,7 +411,7 @@ func TestPreloadEstablishesSpoolDirPrivacy(t *testing.T) {
 	})
 }
 
-// ── G15-6: explicit exposure arms survive a raced purge ─────────────────────
+// ── Explicit exposure arms survive a raced purge ────────────────────────────
 
 func TestExplicitExposureArmSurvivesRacedPurge(t *testing.T) {
 	script := &expScript{}

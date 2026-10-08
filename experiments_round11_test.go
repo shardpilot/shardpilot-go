@@ -1,6 +1,6 @@
 package shardpilot
 
-// Review round 11 — regression pins. Each test fails on the pre-fix tree
+// Regression pins, part 11. Each test fails on the pre-fix tree
 // for its finding's exact reason (verified mechanically via targeted
 // temporary reverts of the fix, with the test seams retained).
 
@@ -14,7 +14,7 @@ import (
 )
 
 // ── GF1: destructive verdicts process through consent flips that fully
-// precede the settle (and, GF-P1 parity, through a deny → re-grant that
+// precede the settle (and, for cross-SDK parity, through a deny → re-grant that
 // completed across the flight) ──────────────────────────────────────────────
 
 func TestDenialBeforeSettleStillLandsDestructiveVerdicts(t *testing.T) {
@@ -87,7 +87,7 @@ func TestDenialBeforeSettleStillLandsDestructiveVerdicts(t *testing.T) {
 	}
 }
 
-// ── GF-P1 (defold R23 parity): a deny → re-grant completing across the
+// ── Cross-SDK parity: a deny → re-grant completing across the
 // flight discards the CONSTRUCTIVE install even though the current state
 // admits again ──────────────────────────────────────────────────────────────
 
@@ -279,7 +279,7 @@ func TestTombstoneSpendMissingFileStillSyncs(t *testing.T) {
 	}
 
 	// Attempt 1: the unlink LANDS in the namespace, its directory sync
-	// fails — the spend must report NOT landed (round-10 discipline).
+	// fails — the spend must report NOT landed (the part-10 discipline).
 	if e.clearCondemnationTombstoneLocked("") {
 		t.Fatalf("an unlink whose directory sync failed is not a completed spend")
 	}
@@ -359,7 +359,7 @@ func TestSentinelGapFactSurvivesPipelinePurge(t *testing.T) {
 
 		client.purgeWithdrawnExperimentFacts()
 
-		// Round 17 moved the queue leg entirely to the consumer side: the
+		// A later fix moved the queue leg entirely to the consumer side: the
 		// purge drains NOTHING (a drain/re-enqueue raced the worker's
 		// receive and could reorder unrelated keepers), so both facts stay
 		// queue-resident...
@@ -577,7 +577,7 @@ func TestExplicitArmSurvivesSentinelSlateReset(t *testing.T) {
 	assertLastApplicationIsNew(t, script, capture)
 }
 
-// ── GF-P2 (defold R23 parity): an explicit null version is present, not
+// ── Cross-SDK parity: an explicit null version is present, not
 // absent — malformed on every shape ─────────────────────────────────────────
 
 func TestNullVersionIsMalformedNotAbsent(t *testing.T) {

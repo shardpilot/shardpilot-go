@@ -6951,7 +6951,7 @@ func TestANonCanonicalCodingKeepsItsMeaning(t *testing.T) {
 
 // ---- round on 50d9a50 ----
 
-// TestARedirectFollowUpIsForwardedNotAbsorbed is the P1 of this round. The
+// TestARedirectFollowUpIsForwardedNotAbsorbed covers the main finding here. The
 // recorder classified by PATH, so the follow-up `http.Client` sends after a 302
 // -- which is not the assignment route -- was answered with the synthetic 204
 // meant for the SDK's background ingest leg. The target was never contacted, the
@@ -7168,7 +7168,7 @@ func TestAnOrdinaryJSONValueIsStillMeasuredWhole(t *testing.T) {
 
 // ---- round on adbb037 ----
 
-// TestARedirectLegPublishesNoEndpointTarget is the P1 of this round, and it is a
+// TestARedirectLegPublishesNoEndpointTarget covers a second main finding, and it is a
 // consequence of the previous one. Forwarding redirect follow-ups was right; what
 // it broke is an assumption the REQUEST redactor had been able to make while they
 // were absorbed — that every byte of a request dump is this program's. It is not:
@@ -7226,7 +7226,7 @@ func TestARedirectLegPublishesNoEndpointTarget(t *testing.T) {
 	}
 }
 
-// TestACrossHostRedirectPublishesNoEndpointAuthority is this round's P1, and it is
+// TestACrossHostRedirectPublishesNoEndpointAuthority covers a third main finding, and it is
 // the case I ARGUED OUT of the previous round's population. I wrote that a redirect
 // leg's `Host` is not a leak because the response side exempts a host as
 // structurally constrained -- reasoning about the exemption's RULE and not its

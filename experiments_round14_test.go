@@ -1,6 +1,6 @@
 package shardpilot
 
-// Review round 14 — regression pin. Fails on the pre-fix tree for the
+// Regression pin, part 14. Fails on the pre-fix tree for the
 // finding's exact reason (verified mechanically via a targeted temporary
 // revert of the fix).
 
@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-// ── G14-1: the close remnant filters facts drained past the seen epoch ──────
+// ── The close remnant filters facts drained past the seen epoch ─────────────
 
 func TestCloseRemnantFiltersFactsDrainedPastSeenEpoch(t *testing.T) {
 	capture := &expWireCapture{}
