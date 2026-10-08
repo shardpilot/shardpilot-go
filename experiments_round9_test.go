@@ -2,7 +2,7 @@ package shardpilot
 
 // Regressions, part 9:
 //
-//  1. (P1) The drop-time capture path refuses anonymous-only experiment
+//  1. The drop-time capture path refuses anonymous-only experiment
 //     facts under a user-scoped floor — the mirror of intake's actor gate;
 //     the durable drop proceeds without capture (consent-first).
 //  2. A failed withdrawal-marker spend reports as a failed save and keeps
@@ -35,7 +35,7 @@ import (
 	"time"
 )
 
-// ── finding 1 (P1): capture refuses anonymous-only facts under user floor ───
+// ── finding 1: capture refuses anonymous-only facts under user floor ────────
 
 func TestCaptureRefusesAnonymousOnlyFactUnderUserScopedFloor(t *testing.T) {
 	script := &expScript{}

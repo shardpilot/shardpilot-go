@@ -2623,7 +2623,7 @@ fi
 # resolved worktree, a canonical-path derivation with an outer-repository
 # anchor, exclusions for both administrative directories, working-tree and
 # index symlink checks, a hard-link count, and a rename that could not be raced.
-# Every P1 among them -- a truncated .git/index, an escape through a symlinked
+# Every serious one among them -- a truncated .git/index, an escape through a symlinked
 # parent, a hard-linked target -- was reachable ONLY by someone who set the
 # variable. Removing the variable removes the reachability, and the guards with
 # it. What is deleted here is not coverage; it is refusals whose subject can no
@@ -2962,7 +2962,7 @@ if ! git cat-file blob ":$LANE_B_BASELINE" > "$lane_b_base_blob" 2>/dev/null; th
   exit 2
 fi
 
-# Same rule, and this is the read the P2 above is really about: `-f` passed, so
+# Same rule, and this is the read the finding above is really about: `-f` passed, so
 # the file exists; a failure here is permission or I/O, not absence.
 # ⚠ THE TARGET'S COPY IS FROM AN EARLIER COMMIT, so it can predate a change to
 # this format. Version 1 was "<path> <occurrences>"; reading one of those with

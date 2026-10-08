@@ -136,7 +136,7 @@ type consentRecordWire struct {
 	// ABSENT MEANS INFINITELY NEW, and the direction is load-bearing.
 	// Records written before this field existed carry no stamp, and reading
 	// that as infinitely OLD would let every retained receipt supersede the
-	// mark — reopening the P0 through the exact mechanism it closed, on
+	// mark — reopening the defect through the exact mechanism it closed, on
 	// every upgraded client at once. Infinitely NEW keeps those records
 	// behaving as they do today: they block, and only a fresh decision
 	// clears them. Absence does not resolve to the permissive answer; that

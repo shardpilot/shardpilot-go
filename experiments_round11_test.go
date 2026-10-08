@@ -14,7 +14,7 @@ import (
 )
 
 // ── GF1: destructive verdicts process through consent flips that fully
-// precede the settle (and, GF-P1 parity, through a deny → re-grant that
+// precede the settle (and, for cross-SDK parity, through a deny → re-grant that
 // completed across the flight) ──────────────────────────────────────────────
 
 func TestDenialBeforeSettleStillLandsDestructiveVerdicts(t *testing.T) {
@@ -87,7 +87,7 @@ func TestDenialBeforeSettleStillLandsDestructiveVerdicts(t *testing.T) {
 	}
 }
 
-// ── GF-P1 (defold R23 parity): a deny → re-grant completing across the
+// ── Cross-SDK parity: a deny → re-grant completing across the
 // flight discards the CONSTRUCTIVE install even though the current state
 // admits again ──────────────────────────────────────────────────────────────
 
@@ -577,7 +577,7 @@ func TestExplicitArmSurvivesSentinelSlateReset(t *testing.T) {
 	assertLastApplicationIsNew(t, script, capture)
 }
 
-// ── GF-P2 (defold R23 parity): an explicit null version is present, not
+// ── Cross-SDK parity: an explicit null version is present, not
 // absent — malformed on every shape ─────────────────────────────────────────
 
 func TestNullVersionIsMalformedNotAbsent(t *testing.T) {

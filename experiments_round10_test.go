@@ -228,7 +228,7 @@ func TestRacingDenialDiscardsInstallKeepsRetainedCache(t *testing.T) {
 	}
 }
 
-// ── finding 6, the partition's other half (fleet contract, defold R22):
+// ── finding 6, the partition's other half (fleet contract, as in Defold):
 // destructive verdicts from a request dispatched under grant still apply ────
 
 func TestRacingDenialStillAppliesServerWithdrawal(t *testing.T) {

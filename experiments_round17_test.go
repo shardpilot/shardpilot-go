@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// ── G17-1: the first transient pulls the cadence down to the backoff ────────
+// ── The first transient pulls the cadence down to the backoff ───────────────
 
 func TestFirstTransientPullsCadenceToBackoff(t *testing.T) {
 	script := &expScript{}
@@ -56,7 +56,7 @@ func TestFirstTransientPullsCadenceToBackoff(t *testing.T) {
 	}
 }
 
-// ── G17-2: sentinel purges withdraw only SDK-authored facts ─────────────────
+// ── Sentinel purges withdraw only SDK-authored facts ────────────────────────
 
 func TestSentinelSparesHostLookalikeEvents(t *testing.T) {
 	sfk := "sfk1_" + strings.Repeat("a", 64)
@@ -172,7 +172,7 @@ func TestSentinelSparesHostLookalikeEvents(t *testing.T) {
 	})
 }
 
-// ── G17-3: the sentinel purge never reorders the queue ──────────────────────
+// ── The sentinel purge never reorders the queue ─────────────────────────────
 
 func TestSentinelPurgePreservesQueueOrder(t *testing.T) {
 	capture := &expWireCapture{}

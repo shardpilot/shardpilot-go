@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-// ── G16-1: the BUILT batch re-checks the purge state at handoff ─────────────
+// ── The BUILT batch re-checks the purge state at handoff ────────────────────
 
 func TestBuiltBatchHandoffRechecksPurge(t *testing.T) {
 	run := func(t *testing.T, batchSize int, drive func(t *testing.T, c *Client, capture *expWireCapture)) {
@@ -99,7 +99,7 @@ func TestBuiltBatchHandoffRechecksPurge(t *testing.T) {
 	})
 }
 
-// ── G16-2: the sentinel cancels frozen capture debts ────────────────────────
+// ── The sentinel cancels frozen capture debts ───────────────────────────────
 
 func TestSentinelCancelsFrozenCaptureDebts(t *testing.T) {
 	capture := &expWireCapture{}
@@ -159,7 +159,7 @@ func TestSentinelCancelsFrozenCaptureDebts(t *testing.T) {
 	}
 }
 
-// ── G16-3: fact stamps ride the entry snapshot ──────────────────────────────
+// ── Fact stamps ride the entry snapshot ─────────────────────────────────────
 
 func TestFactStampRidesEntrySnapshot(t *testing.T) {
 	stage := func(t *testing.T, seamStage string, emit func(t *testing.T, c *Client), countRaced func(capture *expWireCapture) int) {
@@ -241,7 +241,7 @@ func TestFactStampRidesEntrySnapshot(t *testing.T) {
 	})
 }
 
-// ── G16-4: the re-mint re-checks consent at its commit point ────────────────
+// ── The re-mint re-checks consent at its commit point ───────────────────────
 
 func TestRemintAbortsOnRacedDenial(t *testing.T) {
 	script := &expScript{}
@@ -306,7 +306,7 @@ func TestRemintAbortsOnRacedDenial(t *testing.T) {
 	}
 }
 
-// ── G16-5: dark-client withdrawal-marker adjudication ───────────────────────
+// ── Dark-client withdrawal-marker adjudication ──────────────────────────────
 
 // TestDarkClientHonorsReadableWithdrawalMarker pins the adjudicated fleet
 // posture (unchanged by these fixes): a READABLE withdrawal marker is a durable

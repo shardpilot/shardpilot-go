@@ -15,7 +15,7 @@ import (
 
 // ── regressions, part 6 ─────────────────────────────────────────────────────
 
-// Finding 1 (P1), as re-ruled later: the purge epoch bumps
+// Finding 1, as re-ruled later: the purge epoch bumps
 // UNDER e.mu with the sentinel's decisive state change — BEFORE the queue
 // drain — so no post-sentinel fact can carry a pre-sentinel stamp. The
 // worker TOCTOU that the old bump-after-drain ordering guarded against (a
@@ -248,7 +248,7 @@ func TestTombstoneSpendsOnAnyScopeSave(t *testing.T) {
 	}
 }
 
-// Finding 5 (P3): a post-purge respool withholds withdrawn facts WITHOUT
+// Finding 5: a post-purge respool withholds withdrawn facts WITHOUT
 // counting them — the worker-batch filter counts the same events exactly
 // once at its next dispatch point.
 func TestRespoolDropsCountOnce(t *testing.T) {

@@ -5803,7 +5803,7 @@ func TestAbortedConsentDispatchWakesOnlyAfterReleasingTheClaim(t *testing.T) {
 }
 
 // TestConsentOutboxUnreadableWitnessDoesNotResurrectSupersededGrant is the
-// P0 regression, and it is deliberately built in the state the PRODUCT code
+// main regression, and it is deliberately built in the state the PRODUCT code
 // produces on its own rather than a synthetic one. On the denial side
 // applySpoolConsent runs FIRST (consent.go), so a denial whose spool purge
 // fails leaves recordPersisted=false while the deny receipt has ALREADY been
@@ -6535,7 +6535,7 @@ func TestForeignRecordDoesNotResurrectAWithheldGrant(t *testing.T) {
 
 // TestConsentRecordUnusableClassesAreAllCovered exercises the two UNUSABLE
 // classes of the record reader that no other test reaches. Each of them fails
-// OPEN into the exact P0 this branch closes, so leaving them untested would
+// OPEN into the exact defect this branch closes, so leaving them untested would
 // mean two of four arms shipping unguarded.
 func TestConsentRecordUnusableClassesAreAllCovered(t *testing.T) {
 	for _, tc := range []struct {

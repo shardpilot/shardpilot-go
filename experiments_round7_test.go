@@ -13,7 +13,7 @@ import (
 
 // ── regressions, part 7 ─────────────────────────────────────────────────────
 
-// Finding 1 (P1): the capture gate releases only when the FROZEN payload is
+// Finding 1: the capture gate releases only when the FROZEN payload is
 // durably spooled — the live sweep emptying the owed snapshots into the
 // volatile queue is not durability, and pre-fix the retry released the gate
 // on exactly that (len(owed)==0) and deleted the record's entry with the

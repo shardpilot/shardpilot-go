@@ -27,7 +27,7 @@ func round5HostRaw(id string) json.RawMessage {
 		id, time.Now().UTC().Format(time.RFC3339Nano)))
 }
 
-// Finding 1 (P1): a terminal withdrawal whose record rewrite fails must
+// Finding 1: a terminal withdrawal whose record rewrite fails must
 // still be durable — the withdrawn ids persist in the marker BEFORE the
 // mirror forgets them, and the next process honors the marker at load
 // instead of resending the withdrawn facts.
@@ -94,7 +94,7 @@ func TestWithdrawnSpoolRemovalSurvivesFailedSave(t *testing.T) {
 	}
 }
 
-// Finding 2 (P1): an outcome serializes with the sentinel's withdrawal.
+// Finding 2: an outcome serializes with the sentinel's withdrawal.
 // The host call no longer enqueues — it arms an owed record under the plane
 // lock, the lock the withdrawal holds — so an outcome armed before the
 // withdrawal is withdrawn with the owed list (counted), and one attempted
@@ -131,7 +131,7 @@ func TestOutcomeFactsSerializeWithSentinelPurge(t *testing.T) {
 	}
 }
 
-// Finding 3 (P1): a batch in transport when the sentinel lands can fail
+// Finding 3: a batch in transport when the sentinel lands can fail
 // retriably AFTER the purge — the respool re-filters its withdrawn facts
 // instead of writing them back into the pipeline the purge just cleaned.
 func TestPostPurgeRespoolFiltersWithdrawnFacts(t *testing.T) {

@@ -15,7 +15,7 @@ import (
 
 // Regressions, part 2, plus the classes shared with the Unity SDK.
 
-// Finding 1 (P3): getters normalize the experiment key before map use.
+// Finding 1: getters normalize the experiment key before map use.
 func TestGetterTrimsExperimentKey(t *testing.T) {
 	script := &expScript{}
 	script.push(200, expAssignedBody("1"))

@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-// ── G14-1: the close remnant filters facts drained past the seen epoch ──────
+// ── The close remnant filters facts drained past the seen epoch ─────────────
 
 func TestCloseRemnantFiltersFactsDrainedPastSeenEpoch(t *testing.T) {
 	capture := &expWireCapture{}

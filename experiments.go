@@ -2933,7 +2933,7 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 		return false, false, false
 	}
 	if authEpoch != e.authEpoch {
-		// The fleet partition (defold R22) applied to the auth-epoch gate:
+		// The fleet partition (as in the Defold SDK) applied to the auth-epoch gate:
 		// a response that raced a fail-closed latch installs nothing,
 		// unlatches nothing, settles no fence, resets no backoff — but its
 		// DESTRUCTIVE half still lands. The latch retains the durable
@@ -3023,7 +3023,7 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 			// outcome then applies on top: a fresh install replaces its
 			// key, a drop removes it. Owed exposures were never touched by
 			// the latch, so nothing re-arms here — restoring an entry is
-			// not a new application (the R12 grant-moment re-arms belong
+			// not a new application (the grant-moment re-arms belong
 			// to the consent purge alone).
 			for key, entry := range e.latchRetained {
 				if e.entries[key] == nil {
@@ -3939,7 +3939,7 @@ func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string
 	// memory/disk state or arm exposure debt for a refused (or
 	// interrupted, below) plane; after a re-grant the client would serve
 	// an assignment fetched across the revoked interval. The fleet
-	// partition (defold R22) splits the refused settle instead of
+	// partition (as in the Defold SDK) splits the refused settle instead of
 	// discarding it whole: CONSTRUCTIVE halves — the install, exposure
 	// arming, the grammar re-mint's subject adoption, pacing, a healthy
 	// caller result — are discarded, while DESTRUCTIVE server verdicts

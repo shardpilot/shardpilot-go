@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// ── G13-1: unlatching restores the retained assignments ─────────────────────
+// ── Unlatching restores the retained assignments ────────────────────────────
 
 func TestUnlatchRestoresRetainedAssignments(t *testing.T) {
 	const otherKey = "exp-latched-b"

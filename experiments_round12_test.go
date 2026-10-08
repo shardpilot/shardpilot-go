@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-// ── G12-1: owed exposures survive a consent purge under an auth latch ───────
+// ── Owed exposures survive a consent purge under an auth latch ──────────────
 
 func TestOwedExposureSurvivesAuthLatchedConsentPurge(t *testing.T) {
 	script := &expScript{}
@@ -86,7 +86,7 @@ func TestOwedExposureSurvivesAuthLatchedConsentPurge(t *testing.T) {
 	}
 }
 
-// ── G12-2: full spool purges spend the stale withdrawal marker ──────────────
+// ── Full spool purges spend the stale withdrawal marker ─────────────────────
 
 func TestPurgeSpendsStaleWithdrawalMarker(t *testing.T) {
 	writeMarker := func(t *testing.T, dir string, ids []string) {
