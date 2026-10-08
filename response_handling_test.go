@@ -1246,7 +1246,7 @@ func waitFor(t *testing.T, timeout time.Duration, what string, done func() bool)
 	}
 }
 
-// TestRetryPacingIsIndependentOfTheFlushInterval is A6's separation
+// TestRetryPacingIsIndependentOfTheFlushInterval is the flush-cadence separation
 // acceptance for this SDK, and it is deliberately taken at the SHIPPED
 // default rather than at a test-friendly interval.
 //
@@ -1320,7 +1320,7 @@ func TestRetryPacingIsIndependentOfTheFlushInterval(t *testing.T) {
 	}
 }
 
-// TestRetainedBatchRetryDoesNotStarveTheQueue is the second clause of A6's
+// TestRetainedBatchRetryDoesNotStarveTheQueue is the second clause of the
 // Go retry-decoupling gate, beside the sibling above that pins the first:
 // while a retained FULL batch waits out a hint-less failure on the retry
 // clock, the bounded queue keeps absorbing a sustained enqueue rate and drains

@@ -5484,8 +5484,8 @@ func TestConsentFloorMarkerCreateSerializedWithOwedFlag(t *testing.T) {
 	}
 }
 
-// TestConsentReceiptRetryDoesNotLengthenWithTheFlushInterval is A6's second
-// separation acceptance for this SDK.
+// TestConsentReceiptRetryDoesNotLengthenWithTheFlushInterval is the second
+// flush-cadence separation acceptance for this SDK.
 //
 // The consent plane keeps its OWN retry schedule — Retry-After when the
 // server sends one, the shared jittered backoff otherwise — but only one

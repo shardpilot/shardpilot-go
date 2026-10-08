@@ -159,7 +159,7 @@ func enqueueBatch(t *testing.T, client *Client, count int) {
 	}
 }
 
-// TestPublishCompressesBatchBodies is A6's SDK-side positive: a realistic
+// TestPublishCompressesBatchBodies is the compression SDK-side positive: a realistic
 // batch leaves the process gzipped, the server reads it, and the byte-count
 // delta is the acceptance artifact.
 func TestPublishCompressesBatchBodies(t *testing.T) {
