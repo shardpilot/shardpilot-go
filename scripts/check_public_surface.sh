@@ -1704,7 +1704,7 @@ scan_tree() {
         # status out and dropped the rest of the pipeline: a `tr` killed after
         # grep had produced matches handed back TRUNCATED output with a status
         # of success, and a tally that still equalled the baseline passed on
-        # data it never fully read. The fix for the sibling defect
+        # data it never fully read. The earlier fix for the sibling defect
         # landed on the instance; this is the class.
         lane_b_count_pass() {  # $1 = grep flags, $2 = pattern, $3 = file
           local lane_b_ps
