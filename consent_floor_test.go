@@ -6348,7 +6348,7 @@ func TestConsentUnwitnessedMarkIsHonoredEverywhereAGrantIsTrusted(t *testing.T) 
 	})
 }
 
-// TestUnprovableGrantIsHeldFromTheWireAndRecoverable covers round 6's four
+// TestUnprovableGrantIsHeldFromTheWireAndRecoverable covers four review
 // findings, which are one question asked four ways: what else still trusts a
 // grant, and what else can strip the mark that says it is unprovable.
 func TestUnprovableGrantIsHeldFromTheWireAndRecoverable(t *testing.T) {
@@ -6584,7 +6584,7 @@ func TestConsentRecordUnusableClassesAreAllCovered(t *testing.T) {
 	}
 }
 
-// TestBlockedGrantIsDurableWhateverTheRecordSays covers round 7, which found
+// TestBlockedGrantIsDurableWhateverTheRecordSays covers a review that found
 // the same asymmetry for the fifth and sixth time: a grant took effect through
 // a door the previous fix had not widened.
 func TestBlockedGrantIsDurableWhateverTheRecordSays(t *testing.T) {

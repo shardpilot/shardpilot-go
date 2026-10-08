@@ -2212,7 +2212,7 @@ func (c *Client) partitionSpoolEligible(request batchRequest) (eligible, refused
 // covers; a secondary-identifier override (say AnonymousID under a
 // configured UserID) does not change the effective actor, so an event the
 // floor ADMITTED is never refused disk retention later (accepted-then-
-// dead-lettered would contradict the round-4 override semantics). Floor
+// dead-lettered would contradict the override semantics). Floor
 // OFF keeps the released strict rule — both envelope identifiers equal to
 // the configured tuple — unchanged.
 func (c *Client) spoolActorEligible(envelope eventEnvelope) bool {

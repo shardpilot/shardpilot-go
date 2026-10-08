@@ -1,6 +1,6 @@
 package shardpilot
 
-// Review round 13 — regression pin. Fails on the pre-fix tree for the
+// Regression pin, part 13. Fails on the pre-fix tree for the
 // finding's exact reason (verified mechanically via a targeted temporary
 // revert of the fix).
 

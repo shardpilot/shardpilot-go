@@ -690,7 +690,7 @@ func TestCloseCountsASealedApplicationItCouldNotDeliver(t *testing.T) {
 	}
 }
 
-// ── round 1 ─────────────────────────────────────────────────────────────────
+// ── part 1 ──────────────────────────────────────────────────────────────────
 
 // Once the tuple's application is delivered, a repeat ApplyExperimentVariant
 // records nothing: the exposure is recorded once per (experiment, version,
@@ -896,7 +896,7 @@ func TestADueRevalidationRunsBeforeTheExposureSweep(t *testing.T) {
 	}
 }
 
-// ── round 2 ─────────────────────────────────────────────────────────────────
+// ── part 2 ──────────────────────────────────────────────────────────────────
 
 // The apply endpoint's real-subjects sentinel is the assignment route's: the
 // cached assignments stop serving and the facts already in the pipeline are

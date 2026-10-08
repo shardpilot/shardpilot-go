@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// ── review round 7 ──────────────────────────────────────────────────────────
+// ── regressions, part 7 ─────────────────────────────────────────────────────
 
 // Finding 1 (P1): the capture gate releases only when the FROZEN payload is
 // durably spooled — the live sweep emptying the owed snapshots into the

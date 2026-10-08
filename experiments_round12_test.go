@@ -1,6 +1,6 @@
 package shardpilot
 
-// Review round 12 — regression pins. Each test fails on the pre-fix tree
+// Regression pins, part 12. Each test fails on the pre-fix tree
 // for its finding's exact reason (verified mechanically via targeted
 // temporary reverts of the fix, with the test seams retained).
 

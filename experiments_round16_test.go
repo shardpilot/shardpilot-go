@@ -1,6 +1,6 @@
 package shardpilot
 
-// Review round 16 — regression pins. Each test fails on the pre-fix tree
+// Regression pins, part 16. Each test fails on the pre-fix tree
 // for its finding's exact reason (verified mechanically via targeted
 // temporary reverts of the fix, with the test seams retained).
 
@@ -309,7 +309,7 @@ func TestRemintAbortsOnRacedDenial(t *testing.T) {
 // ── G16-5: dark-client withdrawal-marker adjudication ───────────────────────
 
 // TestDarkClientHonorsReadableWithdrawalMarker pins the adjudicated fleet
-// posture (unchanged by round 16): a READABLE withdrawal marker is a durable
+// posture (unchanged by these fixes): a READABLE withdrawal marker is a durable
 // purge debt and is honored — and spent — even while experiments are dark;
 // only the named ids are filtered, and the ordinary spool loads and serves.
 func TestDarkClientHonorsReadableWithdrawalMarker(t *testing.T) {
@@ -363,7 +363,7 @@ func TestDarkClientHonorsReadableWithdrawalMarker(t *testing.T) {
 	}
 }
 
-// TestDarkClientDamagedMarkerFailsClosedWithinFactClass is the round-16
+// TestDarkClientDamagedMarkerFailsClosedWithinFactClass is the
 // remedy: a PRESENT-but-unusable marker in a DARK client fails closed within
 // the experiment-fact class alone — the class is dropped terminal (the
 // smallest knowable superset of the unreadable id set), the ordinary spool

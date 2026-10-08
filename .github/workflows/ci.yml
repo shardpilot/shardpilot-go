@@ -246,7 +246,7 @@ jobs:
   # AGAINST WHAT: the change's own base, chosen by event -- the pull request's
   # base commit, the pre-push tip, or for a brand-new ref the merge base with the
   # default branch. The first version took that merge base for every event, and
-  # round 1 found it wrong twice. A push to the default branch has merge base
+  # review found it wrong twice. A push to the default branch has merge base
   # HEAD, so the change was diffed against itself and passed -- and measured
   # 2026-09-01, 113 of the 184 commits on main carry no pull-request number, 26
   # of those touched scripts/: that is the path gate changes took here. And a
@@ -317,7 +317,7 @@ jobs:
           # altering a gate was diffed against itself and passed; on a pull
           # request into a non-default branch it reaches back to main, so the
           # target branch's own gate change was charged to every pull request
-          # into it. Both found by round 1 on shardpilot/shardpilot-go#101.
+          # into it. Both found in review of shardpilot/shardpilot-go#101.
           case "$EVENT_NAME" in
             pull_request)
               base="$PR_BASE_SHA"; what="the pull request's base commit"

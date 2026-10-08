@@ -1,6 +1,6 @@
 package shardpilot
 
-// Review round 11 — regression pins. Each test fails on the pre-fix tree
+// Regression pins, part 11. Each test fails on the pre-fix tree
 // for its finding's exact reason (verified mechanically via targeted
 // temporary reverts of the fix, with the test seams retained).
 
@@ -279,7 +279,7 @@ func TestTombstoneSpendMissingFileStillSyncs(t *testing.T) {
 	}
 
 	// Attempt 1: the unlink LANDS in the namespace, its directory sync
-	// fails — the spend must report NOT landed (round-10 discipline).
+	// fails — the spend must report NOT landed (the part-10 discipline).
 	if e.clearCondemnationTombstoneLocked("") {
 		t.Fatalf("an unlink whose directory sync failed is not a completed spend")
 	}
@@ -359,7 +359,7 @@ func TestSentinelGapFactSurvivesPipelinePurge(t *testing.T) {
 
 		client.purgeWithdrawnExperimentFacts()
 
-		// Round 17 moved the queue leg entirely to the consumer side: the
+		// A later fix moved the queue leg entirely to the consumer side: the
 		// purge drains NOTHING (a drain/re-enqueue raced the worker's
 		// receive and could reorder unrelated keepers), so both facts stay
 		// queue-resident...

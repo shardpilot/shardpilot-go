@@ -13,9 +13,9 @@ import (
 	"time"
 )
 
-// ── review round 6 ──────────────────────────────────────────────────────────
+// ── regressions, part 6 ─────────────────────────────────────────────────────
 
-// Finding 1 (P1), as re-ruled by review round 11: the purge epoch bumps
+// Finding 1 (P1), as re-ruled later: the purge epoch bumps
 // UNDER e.mu with the sentinel's decisive state change — BEFORE the queue
 // drain — so no post-sentinel fact can carry a pre-sentinel stamp. The
 // worker TOCTOU that the old bump-after-drain ordering guarded against (a
@@ -297,7 +297,7 @@ func TestRespoolDropsCountOnce(t *testing.T) {
 	}
 }
 
-// ── unreal round-4 parity pins ──────────────────────────────────────────────
+// ── Unreal parity pins ──────────────────────────────────────────────────────
 
 // The withdrawn-fact matchers decide on the TOP-LEVEL event name and the
 // typed assignment_key prop — never substring matching over serialized

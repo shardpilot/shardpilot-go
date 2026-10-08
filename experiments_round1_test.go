@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// Round-1 review regressions plus the defold R9/R10 cross-check pins.
+// Regressions, part 1, plus the pins shared with the Defold SDK.
 
 // Finding 1 + R10: the fact lane's privacy boundary — a non-sfk1_ subject
 // fact key (a raw spcid_ echo included) must never ride assignment_key.

@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// Round-2 review regressions plus the unity round-1 cross-SDK classes.
+// Regressions, part 2, plus the classes shared with the Unity SDK.
 
 // Finding 1 (P3): getters normalize the experiment key before map use.
 func TestGetterTrimsExperimentKey(t *testing.T) {
@@ -201,7 +201,7 @@ func TestCloseDrainsAllOwedExposures(t *testing.T) {
 	}
 }
 
-// Unity round-1 class (1): stale serving requires the request's attribute
+// Unity class A (1): stale serving requires the request's attribute
 // set to match the cached entry's — another cohort's variant is never
 // served over a transient.
 func TestStaleServeRequiresMatchingAttributes(t *testing.T) {
@@ -233,7 +233,7 @@ func TestStaleServeRequiresMatchingAttributes(t *testing.T) {
 	}
 }
 
-// Unity round-1 class (3): a failed sentinel clear writes a durable
+// Unity class A (3): a failed sentinel clear writes a durable
 // condemnation tombstone, and the NEXT process refuses the withdrawn
 // record and re-attempts the clear.
 func TestCondemnationTombstoneSurvivesRestart(t *testing.T) {
@@ -280,7 +280,7 @@ func TestCondemnationTombstoneSurvivesRestart(t *testing.T) {
 	}
 }
 
-// Unity round-1 class (dual-client mint): the initial mint publishes
+// Unity class A (dual-client mint): the initial mint publishes
 // create-only and converges on a racing winner's id.
 func TestInitialMintConvergesOnRacingWinner(t *testing.T) {
 	script := &expScript{}
@@ -311,7 +311,7 @@ func TestInitialMintConvergesOnRacingWinner(t *testing.T) {
 	}
 }
 
-// Unity round-2 class (3): retryable sweep refusals never count as Dropped
+// Unity class B (3): retryable sweep refusals never count as Dropped
 // — only terminal outcomes do.
 func TestRetryableSweepRefusalsDoNotCountDropped(t *testing.T) {
 	script := &expScript{}
@@ -341,7 +341,7 @@ func TestRetryableSweepRefusalsDoNotCountDropped(t *testing.T) {
 	}
 }
 
-// Unity round-2 class (4): the first subject mint is serialized — two
+// Unity class B (4): the first subject mint is serialized — two
 // concurrent first fetches use exactly one id.
 func TestConcurrentFirstFetchesShareOneMintedSubject(t *testing.T) {
 	script := &expScript{}
@@ -369,7 +369,7 @@ func TestConcurrentFirstFetchesShareOneMintedSubject(t *testing.T) {
 	}
 }
 
-// Round-3 finding 1: a revalidation whose entry vanished aborts INSIDE the
+// Follow-up finding 1: a revalidation whose entry vanished aborts INSIDE the
 // fetch lock, before any dispatch — the TOCTOU gap between the lane's
 // pre-dispatch check and the fetch cannot reinstall a dropped experiment.
 func TestRevalidationWithoutEntryDoesNotDispatch(t *testing.T) {
@@ -391,7 +391,7 @@ func TestRevalidationWithoutEntryDoesNotDispatch(t *testing.T) {
 	}
 }
 
-// Round-3 finding 2: close housekeeping tears the consumer down BEFORE the
+// Follow-up finding 2: close housekeeping tears the consumer down BEFORE the
 // last durable retry, so a lane response settling in the close window is
 // discarded outright instead of minting an owed intent the exiting process
 // can never retry.
@@ -436,7 +436,7 @@ func TestLateLaneSettleAfterCloseHousekeepingIsDiscarded(t *testing.T) {
 	}
 }
 
-// Round-3 finding 5: a deferral armed mid-batch (Retry-After or backoff)
+// Follow-up finding 5: a deferral armed mid-batch (Retry-After or backoff)
 // stops the rest of the batch.
 func TestBatchStopsWhenDeferralArms(t *testing.T) {
 	script := &expScript{}
@@ -461,7 +461,7 @@ func TestBatchStopsWhenDeferralArms(t *testing.T) {
 	}
 }
 
-// Round-3 finding 4: owed exposure snapshots still stranded at teardown are
+// Follow-up finding 4: owed exposure snapshots still stranded at teardown are
 // COUNTED (Stats.Dropped + a distinct diagnostic), never silently lost.
 func TestCloseCountsDiscardedOwedExposures(t *testing.T) {
 	script := &expScript{}
@@ -498,7 +498,7 @@ func TestCloseCountsDiscardedOwedExposures(t *testing.T) {
 	}
 }
 
-// Round-3 finding 6: the assignment plane parses Retry-After with the batch
+// Follow-up finding 6: the assignment plane parses Retry-After with the batch
 // transport's parser — HTTP-dates included (its documented contract),
 // unlike the remote-config route's digits-only parse.
 func TestAssignmentRetryAfterHTTPDateParses(t *testing.T) {

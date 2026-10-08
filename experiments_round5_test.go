@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// ── review round 5 ──────────────────────────────────────────────────────────
+// ── regressions, part 5 ─────────────────────────────────────────────────────
 
 func round5FactRaw(id string) json.RawMessage {
 	return json.RawMessage(fmt.Sprintf(

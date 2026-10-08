@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// ── review round 4 ──────────────────────────────────────────────────────────
+// ── regressions, part 4 ─────────────────────────────────────────────────────
 
 // Finding 1: an over-limit error body is a truncated VIEW and never a
 // sentinel, even when its in-limit prefix unmarshals (sentinel JSON followed
@@ -176,7 +176,7 @@ func TestOwedSweepAndArmRefreshDoNotRace(t *testing.T) {
 	capture.setStatus(http.StatusAccepted)
 }
 
-// ── unreal round-2 parity: the sentinel withdraws PIPELINE-resident facts ───
+// ── Unreal parity: the sentinel withdraws PIPELINE-resident facts ───────────
 
 // Queue-resident: an exposure fact already accepted into the shared queue
 // must not ship once the real-subjects sentinel lands; host events in the
