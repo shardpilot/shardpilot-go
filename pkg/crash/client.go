@@ -620,7 +620,7 @@ type rateSampler struct {
 }
 
 func newDefaultSampler() *rateSampler {
-	return &rateSampler{every: 10}
+	return &rateSampler{every: 1}
 }
 
 func (s *rateSampler) ShouldEmit(Event) bool {

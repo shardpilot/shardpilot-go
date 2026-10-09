@@ -220,7 +220,7 @@ func TestClientEmitRejectsPartiallyInitializedClient(t *testing.T) {
 	}
 }
 
-func TestDefaultSamplerEmitsTenPercent(t *testing.T) {
+func TestDefaultSamplerKeepsEveryReport(t *testing.T) {
 	sampler := newDefaultSampler()
 	var emitted int
 	for i := 0; i < 100; i++ {
@@ -228,8 +228,8 @@ func TestDefaultSamplerEmitsTenPercent(t *testing.T) {
 			emitted++
 		}
 	}
-	if emitted != 10 {
-		t.Fatalf("expected deterministic 10%% default sampling, got %d%%", emitted)
+	if emitted != 100 {
+		t.Fatalf("default sampler kept %d of 100 reports", emitted)
 	}
 }
 
