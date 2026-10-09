@@ -246,13 +246,21 @@ while consent is unknown. This server-side SDK does the inverse:
 - **`denied` = hard stop.** `SetConsent(false)` immediately makes `Track` /
   `Enqueue` return `ErrConsentDenied`, clears the pending queue (cleared
   events count as `Dropped`), and aborts any batch publish already in flight
-  on the network. `SetConsent(true)` re-opens the pipeline.
-- **The live consent state is in-memory only.** It is NOT restored across
-  process restarts — even with `Config.SpoolDir` set, which persists each
-  decision to disk solely to gate the spool's disk participation (see
-  "Offline behavior / spool"), never to re-apply it. If consent must survive
-  restarts, store the decision yourself and re-apply it with `SetConsent` on
-  startup, before publishing.
+  on the network. An ordinary grant re-opens only after prior purge debt clears
+  and only when no forced-minor restriction remains.
+- **Both setters return `(ConsentResult, error)`.** Nil error means local
+  application; `result.Warnings` reports unfinished consent-record, receipt or
+  purge work (`consent_persist_failed`, `consent_outbox_persist_failed`,
+  `spool_purge_failed`). Refused calls return an error without changing the
+  decision; `ErrConsentShutdown` also matches `ErrClosed`. An invalid actor
+  permits local denial with warning `consent_actor_invalid` and no receipt, but
+  its grant is refused. A successful local result is not server acceptance.
+- **Forced-minor restrictions persist with `SpoolDir` in either mode.**
+  Ordinary denial succeeds as a no-op: the getter remains
+  `denied_forced_minor`, existing durability work remains owed, and no new
+  receipt is minted. Ordinary grants remain refused after purge recovery or
+  restart. Other default-mode states are memory-only; store the decision and
+  re-apply it at startup. The opt-in consent floor restores all persisted states.
 - **Consent receipts are fire-and-forget.** A `SetConsent` call also
   transmits the decision to ShardPilot in the background — but only when an
   actor identity is configured (`Config.UserID`, else `Config.AnonymousID`);
@@ -275,12 +283,9 @@ while consent is unknown. This server-side SDK does the inverse:
   covers only the configured actor; events that override the actor per event
   (`Event.UserID` / `Event.AnonymousID`) need consent recorded for each such
   actor through that same service path.
-- **`SetConsent` cannot reach the forced-minor state.** It takes a plain
-  bool, and the states it reaches are exactly `unknown` / `granted` /
-  `denied` (read via `ConsentState()`). Since `v0.6.0-alpha` the client SDKs'
-  `denied_forced_minor` state does exist in this SDK, reachable only through
-  `SetConsentDecision(ConsentDecisionDeniedForcedMinor)`, and it gates like
-  a denial.
+- **Forced-minor denial is explicitly recorded through**
+  `SetConsentDecision(ConsentDecisionDeniedForcedMinor)`. Both setters preserve
+  that restriction once it exists; the boolean denial cannot relabel it.
 
 ## Sending analytics events
 
@@ -624,9 +629,10 @@ them:
   actor, retention, capacity and successful-write gates. Appending requires
   a live grant and its persisted record. Abrupt process death loses events
   that have not reached disk; crash reports have no offline replay.
-- **The live consent state does not survive restarts** (never restored at
-  startup, even though `SpoolDir` persists the decision record to gate disk
-  participation; re-apply on startup yourself).
+- **Default-mode restart recovery is limited to forced-minor denial.** With
+  `SpoolDir`, a scoped `denied_forced_minor` record restores that restriction.
+  Other default-mode live consent states are not restored; re-apply those on
+  startup yourself. The opt-in consent floor restores other persisted states.
 - **Consent receipts have no delivery guarantee**: fire-and-forget, 16-entry
   pending buffer with oldest-dropped overflow, failures only logged, no
   per-receipt success signal, and no ordering guarantee relative to event
@@ -637,9 +643,8 @@ them:
   Mode-A publishable keys to denials. The SDK posts using `Config.Token`;
   server enforcement is not verified by this SDK source review. Confirm
   that contract for your deployment before relying on receipt acceptance.
-- **The forced-minor state is not reachable through `SetConsent`** — it takes
-  a plain bool. Since `v0.6.0-alpha` `denied_forced_minor` does exist here,
-  recorded through `SetConsentDecision`, and gates like a denial.
+- **Forced-minor denial uses the typed setter.** Once present, either setter
+  preserves it: ordinary denial is a no-op and ordinary grant is refused.
 - **Ordinary remote config is explicit-fetch-only** — no background refresh,
   and every fetch requires `Config.AnonymousID` (the `client_id`). The SDK
   consumes the returned values rather than evaluating delivery rules.

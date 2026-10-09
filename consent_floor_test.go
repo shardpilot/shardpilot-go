@@ -495,7 +495,7 @@ func TestConsentFloorForcedMinorAC8WholeSession(t *testing.T) {
 	dir := t.TempDir()
 	client := newFloorTestClient(t, server.URL, dir, nil)
 
-	if err := client.SetConsentDecision(ConsentDecisionDeniedForcedMinor); err != nil {
+	if _, err := client.SetConsentDecision(ConsentDecisionDeniedForcedMinor); err != nil {
 		t.Fatalf("SetConsentDecision: %v", err)
 	}
 	if got := client.ConsentState(); got != ConsentDeniedForcedMinor {
@@ -555,44 +555,30 @@ func TestConsentFloorForcedMinorAC8WholeSession(t *testing.T) {
 	}
 }
 
-func TestConsentFloorForcedMinorSupersededByGrant(t *testing.T) {
+func TestConsentFloorForcedMinorRefusesGrant(t *testing.T) {
 	state, server := newFloorTestServer(t)
 	defer server.Close()
-
-	dir := t.TempDir()
-	client := newFloorTestClient(t, server.URL, dir, nil)
-	if err := client.SetConsentDecision(ConsentDecisionDeniedForcedMinor); err != nil {
-		t.Fatalf("SetConsentDecision: %v", err)
+	client := newFloorTestClient(t, server.URL, t.TempDir(), nil)
+	if _, err := client.SetConsentDecision(ConsentDecisionDeniedForcedMinor); err != nil {
+		t.Fatal(err)
 	}
-	// A later explicit decision supersedes normally; the new receipt
-	// carries NO reason.
-	if err := client.SetConsentDecision(ConsentDecisionGranted); err != nil {
-		t.Fatalf("SetConsentDecision: %v", err)
+	if _, err := client.SetConsentDecision(ConsentDecisionGranted); !errors.Is(err, ErrConsentForcedMinor) {
+		t.Fatalf("ordinary grant = %v, want forced-minor refusal", err)
 	}
-	if got := client.ConsentState(); got != ConsentGranted {
-		t.Fatalf("expected the grant to supersede, got %v", got)
+	if got := client.ConsentState(); got != ConsentDeniedForcedMinor {
+		t.Fatalf("refused grant changed state: %v", got)
 	}
-	if err := client.Enqueue(Event{ID: "evt-band-1", Name: "e1"}); err != nil {
-		t.Fatalf("Enqueue after the superseding grant: %v", err)
-	}
-	if err := client.Flush(context.Background()); err != nil {
-		t.Fatalf("Flush: %v", err)
+	if err := client.Enqueue(Event{ID: "evt-band-1", Name: "e1"}); !errors.Is(err, ErrConsentDenied) {
+		t.Fatalf("Enqueue after refusal: %v", err)
 	}
 	if err := client.Close(context.Background()); err != nil {
-		t.Fatalf("Close: %v", err)
+		t.Fatal(err)
 	}
-	waitFor(t, 3*time.Second, "both receipts delivered", func() bool {
-		return state.consentCount() >= 2
-	})
-	first, second := state.consentAt(0), state.consentAt(1)
-	if consentBoolCategory(t, first) || first["reason"] != "denied_forced_minor" {
-		t.Fatalf("expected the forced-minor receipt first, got %v", first)
+	if state.consentCount() != 1 || state.batchCount() != 0 {
+		t.Fatalf("refusal sent traffic: %v", state.snapshotOrder())
 	}
-	if !consentBoolCategory(t, second) {
-		t.Fatalf("expected the superseding grant receipt second, got %v", second)
-	}
-	if _, present := second["reason"]; present {
-		t.Fatalf("a superseding grant carries no reason, got %v", second)
+	if body := state.consentAt(0); consentBoolCategory(t, body) || body["reason"] != "denied_forced_minor" {
+		t.Fatalf("forced-minor receipt changed: %v", body)
 	}
 }
 
@@ -603,10 +589,10 @@ func TestSetConsentDecisionRejectsUnknownValues(t *testing.T) {
 	client := newFloorTestClient(t, server.URL, t.TempDir(), nil)
 	defer client.Close(context.Background())
 
-	if err := client.SetConsentDecision(ConsentDecision("denied ")); !errors.Is(err, ErrInvalidConsentDecision) {
+	if _, err := client.SetConsentDecision(ConsentDecision("denied ")); !errors.Is(err, ErrInvalidConsentDecision) {
 		t.Fatalf("expected ErrInvalidConsentDecision, got %v", err)
 	}
-	if err := client.SetConsentDecision(ConsentDecision("maybe")); !errors.Is(err, ErrInvalidConsentDecision) {
+	if _, err := client.SetConsentDecision(ConsentDecision("maybe")); !errors.Is(err, ErrInvalidConsentDecision) {
 		t.Fatalf("expected ErrInvalidConsentDecision, got %v", err)
 	}
 	// NOTHING was applied: the state is still undecided and nothing went to
@@ -627,7 +613,7 @@ func TestSetConsentDecisionForcedMinorWithoutFloor(t *testing.T) {
 	client := newFloorTestClient(t, server.URL, dir, func(cfg *Config) {
 		cfg.ConsentFloor = nil
 	})
-	if err := client.SetConsentDecision(ConsentDecisionDeniedForcedMinor); err != nil {
+	if _, err := client.SetConsentDecision(ConsentDecisionDeniedForcedMinor); err != nil {
 		t.Fatalf("SetConsentDecision: %v", err)
 	}
 	if got := client.ConsentState(); got != ConsentDeniedForcedMinor {
@@ -889,11 +875,11 @@ func TestConsentFloorRejectsOutOfContractIdentity(t *testing.T) {
 	client := newFloorTestClient(t, server.URL, t.TempDir(), func(cfg *Config) {
 		cfg.UserID = oversized
 	})
-	if err := client.SetConsentDecision(ConsentDecisionGranted); !errors.Is(err, ErrInvalidConsentIdentity) {
+	if _, err := client.SetConsentDecision(ConsentDecisionGranted); !errors.Is(err, ErrInvalidConsentIdentity) {
 		t.Fatalf("expected ErrInvalidConsentIdentity, got %v", err)
 	}
 	// NOTHING was applied — not the state, not a receipt, not a wire post —
-	// and the void SetConsent surface rejects identically.
+	// and the boolean SetConsent surface rejects identically.
 	client.SetConsent(true)
 	if got := client.ConsentState(); got != ConsentUnknown {
 		t.Fatalf("expected the rejected decision to apply nothing, got %v", got)
@@ -914,7 +900,7 @@ func TestConsentFloorRejectsOutOfContractIdentity(t *testing.T) {
 	boundaryClient := newFloorTestClient(t, server.URL, t.TempDir(), func(cfg *Config) {
 		cfg.UserID = boundary
 	})
-	if err := boundaryClient.SetConsentDecision(ConsentDecisionGranted); err != nil {
+	if _, err := boundaryClient.SetConsentDecision(ConsentDecisionGranted); err != nil {
 		t.Fatalf("SetConsentDecision at the boundary: %v", err)
 	}
 	if err := boundaryClient.Close(context.Background()); err != nil {
@@ -932,7 +918,7 @@ func TestConsentFloorRejectsOutOfContractIdentity(t *testing.T) {
 	dark := newFloorTestClient(t, server.URL, t.TempDir(), func(cfg *Config) {
 		cfg.AnonymousID = ""
 	})
-	if err := dark.SetConsentDecision(ConsentDecisionDenied); err != nil {
+	if _, err := dark.SetConsentDecision(ConsentDecisionDenied); err != nil {
 		t.Fatalf("SetConsentDecision with no identity: %v", err)
 	}
 	if got := dark.ConsentState(); got != ConsentDenied {
@@ -945,21 +931,19 @@ func TestConsentFloorRejectsOutOfContractIdentity(t *testing.T) {
 		t.Fatalf("expected no receipt for a no-identity decision, got %d", got)
 	}
 
-	// Floor OFF: no identity gate — the legacy fire-and-forget posture is
-	// unchanged (the clamp is floor-scoped; go's general event/identity
-	// path deliberately keeps today's behavior).
+	// Both modes refuse a grant for an invalid actor without minting a receipt.
 	legacy := newFloorTestClient(t, server.URL, t.TempDir(), func(cfg *Config) {
 		cfg.ConsentFloor = nil
 		cfg.UserID = oversized
 	})
-	if err := legacy.SetConsentDecision(ConsentDecisionGranted); err != nil {
-		t.Fatalf("expected no identity gate with the floor off, got %v", err)
+	if _, err := legacy.SetConsentDecision(ConsentDecisionGranted); !errors.Is(err, ErrInvalidConsentIdentity) {
+		t.Fatalf("expected invalid-actor refusal with floor off, got %v", err)
 	}
 	if err := legacy.Close(context.Background()); err != nil {
-		t.Fatalf("Close: %v", err)
+		t.Fatal(err)
 	}
-	if got := state.consentCount(); got != 2 {
-		t.Fatalf("expected the legacy post despite the oversized identity, got %d", got)
+	if got := state.consentCount(); got != 1 {
+		t.Fatalf("invalid actor minted a receipt, count=%d", got)
 	}
 }
 
@@ -1151,7 +1135,7 @@ func TestConsentFloorRefusedTightenStartsFailClosed(t *testing.T) {
 	}
 }
 
-func TestConsentFloorPostCloseDecisionAppliedLocallyOnly(t *testing.T) {
+func TestConsentFloorPostCloseDecisionRefused(t *testing.T) {
 	state, server := newFloorTestServer(t)
 	defer server.Close()
 
@@ -1161,12 +1145,12 @@ func TestConsentFloorPostCloseDecisionAppliedLocallyOnly(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// A decision recorded AFTER Close applies locally — and ONLY locally:
-	// no receipt is minted, retained, or persisted, so nothing transmits
-	// now or at the next launch.
-	client.SetConsent(true)
-	if got := client.ConsentState(); got != ConsentGranted {
-		t.Fatalf("expected the post-Close decision applied locally, got %v", got)
+	// A post-Close decision is refused without any local or durable effect.
+	if _, err := client.SetConsent(true); !errors.Is(err, ErrConsentShutdown) {
+		t.Fatalf("post-Close grant: %v", err)
+	}
+	if got := client.ConsentState(); got != ConsentUnknown {
+		t.Fatalf("post-Close decision changed state: %v", got)
 	}
 	if client.consentOutbox.pending() {
 		t.Fatalf("a post-Close decision must not retain a receipt")
@@ -1594,14 +1578,12 @@ func TestConsentFloorPostCloseDecisionLeavesNoDurableState(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// A post-Close decision under the floor is memory-only IN FULL: no
-	// receipt AND no persisted decision — the next launch must not
-	// resurrect a decision whose receipt was never sent.
-	if err := client.SetConsentDecision(ConsentDecisionDenied); err != nil {
-		t.Fatalf("SetConsentDecision: %v", err)
+	// Refusal preserves the pre-Close state in memory and on disk.
+	if _, err := client.SetConsentDecision(ConsentDecisionDenied); !errors.Is(err, ErrConsentShutdown) {
+		t.Fatalf("post-Close denial: %v", err)
 	}
-	if got := client.ConsentState(); got != ConsentDenied {
-		t.Fatalf("expected the post-Close decision applied in memory, got %v", got)
+	if got := client.ConsentState(); got != ConsentGranted {
+		t.Fatalf("post-Close refusal changed state: %v", got)
 	}
 	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentGranted {
 		t.Fatalf("expected the pre-Close granted record untouched, got (%v, %v)", recorded, ok)
@@ -1622,7 +1604,7 @@ func TestConsentFloorPostCloseDecisionLeavesNoDurableState(t *testing.T) {
 	}
 }
 
-func TestPostCloseDecisionStillPersistsRecordWithoutFloor(t *testing.T) {
+func TestPostCloseDecisionLeavesNoRecordWithoutFloor(t *testing.T) {
 	state, server := newFloorTestServer(t)
 	defer server.Close()
 
@@ -1633,12 +1615,11 @@ func TestPostCloseDecisionStillPersistsRecordWithoutFloor(t *testing.T) {
 	if err := client.Close(context.Background()); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	// Floor OFF keeps today's behavior byte-for-byte: a post-Close
-	// decision still writes the local record (it only ever gates the next
-	// launch's spool there, never the live state).
-	client.SetConsent(false)
-	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentDenied {
-		t.Fatalf("expected the post-Close record written with the floor off, got (%v, %v)", recorded, ok)
+	if _, err := client.SetConsent(false); !errors.Is(err, ErrConsentShutdown) {
+		t.Fatalf("post-Close denial: %v", err)
+	}
+	if _, ok := loadConsentRecord(dir, spoolTestActorDigest()); ok {
+		t.Fatal("post-Close refusal wrote a decision record")
 	}
 	_ = state
 }
@@ -1712,8 +1693,8 @@ func TestConsentFloorGrantNotObservableBeforeReceiptArmed(t *testing.T) {
 	client := newFloorTestClient(t, server.URL, dir, nil)
 
 	// Stall an EARLIER decision's slow half (the deny's record write), so
-	// the following grant's fast half applies — live state granted — while
-	// its receipt append queues behind the stalled ticket turn.
+	// the following grant waits for that denial's disk work to finish before
+	// becoming visible. Its receipt gate is already armed while it waits.
 	stalled := make(chan struct{})
 	release := make(chan struct{})
 	var once sync.Once
@@ -1741,15 +1722,14 @@ func TestConsentFloorGrantNotObservableBeforeReceiptArmed(t *testing.T) {
 		defer close(grantDone)
 		client.SetConsent(true)
 	}()
-	waitFor(t, 3*time.Second, "the grant observable in the live state", func() bool {
-		return client.ConsentState() == ConsentGranted
+	waitFor(t, 3*time.Second, "grant admitted behind the denial", func() bool {
+		return client.consentGrantArming.Load() == 1
 	})
-
-	// The grant is OBSERVABLE but its receipt does not exist yet: the
-	// arming window must hold the event legs — a batch shipped now would
-	// precede the grant receipt on the wire.
-	if err := client.Track(context.Background(), Event{Name: "e1"}); !errors.Is(err, ErrConsentReceiptPending) {
-		t.Fatalf("expected the event leg held while the grant receipt is mid-append, got %v", err)
+	if got := client.ConsentState(); got != ConsentDenied {
+		t.Errorf("grant became visible before the denial's purge: %s", got)
+	}
+	if err := client.Track(context.Background(), Event{Name: "e1"}); !errors.Is(err, ErrConsentDenied) {
+		t.Errorf("expected denial to hold before the grant may apply, got %v", err)
 	}
 	if got := state.batchCount(); got != 0 {
 		t.Fatalf("expected no batch before the grant receipt exists, got %d", got)

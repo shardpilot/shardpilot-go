@@ -8,11 +8,11 @@ import (
 	"github.com/shardpilot/shardpilot-go/internal/uuidv7"
 )
 
-// ConsentState is the tri-state analytics consent of the configured actor.
+// ConsentState is the analytics consent state of the configured actor.
 //
-// The state lives in client memory only; the SDK does not persist it. An
-// integrator that needs consent to survive process restarts reads ConsentState
-// after SetConsent, stores it, and re-applies it with SetConsent on startup.
+// With SpoolDir, forced-minor denial survives a restart in either mode. The
+// consent floor additionally restores other persisted decisions. Without the
+// floor, integrators store and reapply other consent states at startup.
 type ConsentState string
 
 const (
@@ -43,8 +43,8 @@ const (
 	// same denied state and Track/Enqueue refuse with the same
 	// ErrConsentDenied — but the receipt carries reason
 	// "denied_forced_minor" so the backend can tell a band-forced denial
-	// from a chosen one. Under the consent floor with SpoolDir it persists
-	// as its own state and reloads as the same state.
+	// from a chosen one. With SpoolDir it persists and reloads in either mode.
+	// Ordinary denial is a no-op; ordinary grant cannot reverse it.
 	ConsentDeniedForcedMinor ConsentState = "denied_forced_minor"
 )
 
@@ -58,6 +58,22 @@ const (
 	ConsentDecisionDenied            ConsentDecision = "denied"
 	ConsentDecisionDeniedForcedMinor ConsentDecision = "denied_forced_minor"
 )
+
+// ConsentResult describes an applied local decision. Warnings report this
+// call's unfinished persistence, receipt, or purge work; they do not certify
+// server-side acceptance. A refused decision returns an error instead.
+type ConsentResult struct {
+	Warnings []string
+}
+
+func (r *ConsentResult) warn(code string) {
+	for _, existing := range r.Warnings {
+		if existing == code {
+			return
+		}
+	}
+	r.Warnings = append(r.Warnings, code)
+}
 
 // consentDecisionReason is the only reason value a receipt ever carries,
 // riding forced-minor decisions on the stored entry and the wire body.
@@ -114,7 +130,12 @@ type consentResult struct {
 // Track/Enqueue with ErrConsentDenied, clears the pending queue (cleared
 // events count as Dropped), and aborts any event batch publish already in
 // flight on the network (the aborted events count as Dropped, never as
-// Published). Granting re-opens the pipeline.
+// Published). Grants require settled purge debt and no forced-minor restriction.
+// Nil error means the local decision applied. ConsentResult.Warnings reports
+// unfinished durability/purge work; a refused decision changes no state.
+// An invalid actor permits local denial with consent_actor_invalid and no
+// receipt, while its grant is refused. Ordinary denial after forced-minor
+// succeeds without changing ConsentDeniedForcedMinor or minting a receipt.
 //
 // Remotely it is fire-and-forget for the caller: the decision is handed to
 // a single per-client sender goroutine that posts to
@@ -126,7 +147,7 @@ type consentResult struct {
 // local state. If neither identity field is configured, the decision is
 // applied locally only. Close waits (bounded by its context) for decisions
 // recorded before it was called to finish transmitting; decisions recorded
-// after Close are applied locally but are no longer transmitted. Consent
+// after Close are refused with ErrConsentShutdown. Consent
 // never rides the event envelope.
 //
 // On a strict-consent (enforce) workspace an explicit grant is what admits
@@ -147,24 +168,18 @@ type consentResult struct {
 // are recorded server-side only through a consent-write-capable service
 // credential; a publishable Mode A client key may record denials only.
 //
-// The live state is held in memory only; see ConsentState for persistence
-// notes. When Config.SpoolDir is set, the DECISION is additionally persisted
+// See ConsentState for restart behavior. When Config.SpoolDir is set, an
+// applied decision is additionally persisted
 // (consent.json) and the disk spool follows it: denial purges the spool (a
 // failed purge owes a wipe and fails the spool closed until it succeeds),
 // and spool writes open only under a granted live state whose record was
-// successfully persisted — a strictly grant-only disk posture that leaves
-// the live pipeline's documented behavior untouched.
-func (c *Client) SetConsent(analyticsGranted bool) {
+// successfully persisted. A failed purge also refuses a subsequent live grant.
+func (c *Client) SetConsent(analyticsGranted bool) (ConsentResult, error) {
 	decision := ConsentDecisionGranted
 	if !analyticsGranted {
 		decision = ConsentDecisionDenied
 	}
-	if err := c.applyConsentDecision(decision); err != nil {
-		// Only the floor's identity gate can reject here (the decision
-		// value is always valid), and this void legacy surface has nowhere
-		// to return it: surface loudly instead of applying half a decision.
-		c.logf("shardpilot consent: decision rejected, nothing applied: %v", err)
-	}
+	return c.applyConsentDecision(decision)
 }
 
 // SetConsentDecision records an explicit consent decision in its typed
@@ -173,35 +188,53 @@ func (c *Client) SetConsent(analyticsGranted bool) {
 // is the forced-minor denial: analytics-wise identical to a denial — the
 // full denial path runs and every gate treats the state as denied — with
 // the receipt carrying reason "denied_forced_minor" so the backend can tell
-// a band-forced denial from a chosen one. Any other value is rejected with
-// ErrInvalidConsentDecision and NOTHING is applied.
+// a band-forced denial from a chosen one. On an active client, any other
+// value is rejected with ErrInvalidConsentDecision and NOTHING is applied.
 //
 // Delivery of the decision follows the client's mode: under the opt-in
 // consent floor (Config.ConsentFloor) the receipt rides the durable outbox
 // — retained, retried until acknowledged, delivered in decision order, with
-// durability failures surfaced through Stats (ConsentOutboxPersistFailed,
-// LastConsentError) and Close's ErrConsentPending backstop; without the
+// durability failures surfaced in the returned ConsentResult.Warnings as
+// well as Stats and Close's ErrConsentPending backstop; without the
 // floor it posts fire-and-forget exactly like SetConsent.
-func (c *Client) SetConsentDecision(decision ConsentDecision) error {
-	switch decision {
-	case ConsentDecisionGranted, ConsentDecisionDenied, ConsentDecisionDeniedForcedMinor:
-	default:
-		return ErrInvalidConsentDecision
-	}
+func (c *Client) SetConsentDecision(decision ConsentDecision) (ConsentResult, error) {
 	return c.applyConsentDecision(decision)
 }
 
-func (c *Client) applyConsentDecision(decision ConsentDecision) error {
-	if c.consentFloorEnabled() {
-		// The floor requires in-contract identifiers BEFORE anything
-		// applies: a configured identifier over the receipt clamp would
-		// force the receipt onto a different actor than events carry (go's
-		// event path stamps identifiers verbatim, deliberately unclamped),
-		// so the decision is rejected whole — reject, never truncate,
-		// never silently mint for a substitute actor.
-		if err := c.validateConsentFloorIdentity(); err != nil {
-			return err
-		}
+func (c *Client) applyConsentDecision(decision ConsentDecision) (ConsentResult, error) {
+	if c == nil || c.queue == nil {
+		return ConsentResult{}, ErrNotInitialized
+	}
+	// FAST HALF, under lifecycleMu: a denial takes effect on intake
+	// IMMEDIATELY — before any disk work, this call's or an earlier
+	// decision's. A denial issued while a predecessor's record write stalls
+	// on a slow SpoolDir must reject Track/Enqueue from this moment, so the
+	// in-memory flip never queues behind disk. The ticket taken here fixes
+	// this decision's place in the total decision order; the slow half below
+	// runs strictly in ticket order. Admission for the Close fence is
+	// decided here too: closed is stored under this same mutex, so "admitted
+	// before Close" is exact (see consentDecisionsWG).
+	c.lifecycleMu.Lock()
+	if c.closed.Load() {
+		c.lifecycleMu.Unlock()
+		return ConsentResult{}, ErrConsentShutdown
+	}
+	// A terminal client cannot be repaired by changing its input. Admit
+	// lifecycle state before validating either setter's decision or actor.
+	switch decision {
+	case ConsentDecisionGranted, ConsentDecisionDenied, ConsentDecisionDeniedForcedMinor:
+	default:
+		c.lifecycleMu.Unlock()
+		return ConsentResult{}, ErrInvalidConsentDecision
+	}
+	var result ConsentResult
+	invalidActor := c.validateConsentFloorIdentity() != nil
+	if invalidActor && decision == ConsentDecisionGranted {
+		c.lifecycleMu.Unlock()
+		return result, ErrInvalidConsentIdentity
+	}
+	if invalidActor {
+		result.warn("consent_actor_invalid")
 	}
 	analyticsGranted := decision == ConsentDecisionGranted
 	state := consentStateGranted
@@ -214,23 +247,24 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) error {
 
 	actor := firstNonEmpty(c.cfg.UserID, c.cfg.AnonymousID)
 
-	// FAST HALF, under lifecycleMu: the decision takes effect on intake
-	// IMMEDIATELY — before any disk work, this call's or an earlier
-	// decision's. A denial issued while a predecessor's record write stalls
-	// on a slow SpoolDir must reject Track/Enqueue from this moment, so the
-	// in-memory flip never queues behind disk. The ticket taken here fixes
-	// this decision's place in the total decision order; the slow half below
-	// runs strictly in ticket order. Admission for the Close fence is
-	// decided here too: closed is stored under this same mutex, so "admitted
-	// before Close" is exact (see consentDecisionsWG).
-	c.lifecycleMu.Lock()
+	if c.consent.Load() == consentStateDeniedForcedMinor {
+		if analyticsGranted {
+			c.lifecycleMu.Unlock()
+			return ConsentResult{}, ErrConsentForcedMinor
+		}
+		if decision == ConsentDecisionDenied {
+			// This denial is already effective. Keep its provenance and
+			// existing durability work intact; a reasonless receipt would
+			// erase the server's forced-minor reason.
+			c.lifecycleMu.Unlock()
+			return result, nil
+		}
+	}
 	ticket := c.consentTicketNext
 	c.consentTicketNext++
-	admitted := !c.closed.Load()
-	if admitted {
-		c.consentDecisionsWG.Add(1)
-	}
-	grantArming := c.consentFloorEnabled() && admitted && analyticsGranted
+	denialEpoch := c.consentEpoch.Load()
+	c.consentDecisionsWG.Add(1)
+	grantArming := c.consentFloorEnabled() && analyticsGranted
 	if grantArming {
 		// Arm the dispatch gate BEFORE the granted state becomes visible:
 		// the receipt appends in the ticket-ordered slow half, and a
@@ -239,8 +273,8 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) error {
 		// consentGrantArming).
 		c.consentGrantArming.Add(1)
 	}
-	c.consent.Store(state)
 	if !analyticsGranted {
+		c.consent.Store(state)
 		// Bump the denial epoch BEFORE draining the shared queue: events the
 		// worker already pulled into its local batch are invisible to
 		// drainAll, and the worker drops them (counting them as Dropped)
@@ -290,17 +324,62 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) error {
 	}
 	c.consentTurnMu.Unlock()
 
-	// Disk side of the decision (no-op without SpoolDir), deliberately
-	// outside lifecycleMu: it fsyncs files, and event intake must not wait
-	// out a disk stall. The spool's own append gate re-checks the already
-	// stored live state under its lock, so a batch racing this section can
-	// never re-create a record the purge below condemns. Under the FLOOR a
-	// post-Close decision is memory-only in full: with the persisted
-	// decision feeding the next launch's LIVE state, writing it here would
-	// resurrect a decision whose receipt was never sent (and never will
-	// be) — the floor's applied-locally-only means exactly the in-memory
-	// state, nothing durable. Floor-off keeps writing, unchanged: there the
-	// record only ever gates the next launch's spool, never the live state.
+	// The floor retry must not reapply an older denied record between the
+	// purge check and this decision's durable pair. Intake never takes this
+	// lock: a later denial can still close analytics immediately.
+	if c.consentFloorEnabled() {
+		c.consentRecordApplyMu.Lock()
+	}
+	finish := func() {
+		if c.consentFloorEnabled() {
+			c.consentRecordApplyMu.Unlock()
+		}
+		if grantArming {
+			c.consentGrantArming.Add(-1)
+			c.wakeConsentDispatch()
+		}
+		c.consentTurnMu.Lock()
+		c.consentTicketServing++
+		if c.consentTurnCond != nil {
+			c.consentTurnCond.Broadcast()
+		}
+		c.consentTurnMu.Unlock()
+		c.consentDecisionsWG.Done()
+	}
+	if analyticsGranted {
+		// Earlier decisions have finished their disk half. Settle their
+		// purge debt BEFORE applying this grant, minting its receipt, or
+		// replacing their denied record.
+		if c.spool != nil && !c.spool.settleOwedWipe() {
+			finish()
+			return ConsentResult{}, ErrSpoolPurgeFailed
+		}
+		c.lifecycleMu.Lock()
+		// A newer denial may already have taken effect while this ticket
+		// waited. Preserve it; its durable half follows this one in order.
+		if c.consentEpoch.Load() == denialEpoch {
+			c.consent.Store(state)
+		}
+		c.lifecycleMu.Unlock()
+	}
+	applyRecord := func(decision ConsentDecision, stamp string) ([]SpoolDeadLetter, bool) {
+		letters, persisted, purged := c.applySpoolConsent(decision, stamp)
+		if !persisted {
+			result.warn("consent_persist_failed")
+		}
+		if !purged {
+			result.warn("spool_purge_failed")
+		}
+		return letters, persisted
+	}
+	mintReceipt := func(granted bool, reason, stamp string) (consentReceipt, bool, error) {
+		if invalidActor {
+			// Denial is local even with an invalid actor. Never mint a
+			// receipt for a truncated or replacement identity.
+			return consentReceipt{}, false, nil
+		}
+		return c.mintConsentReceipt(granted, reason, stamp)
+	}
 	var deadLetters []SpoolDeadLetter
 	var keyErr error
 	if c.consentFloorEnabled() {
@@ -310,11 +389,8 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) error {
 		// nudged to dispatch promptly. Receipts are an append-only decision
 		// trail: a later decision never withdraws an earlier receipt (a
 		// grant-then-deny delivers BOTH, in order), so after a denial no
-		// stale grant is ever the server's last word. A decision recorded
-		// AFTER Close keeps the documented applied-locally-only posture:
-		// no receipt is minted, retained, or persisted — a durable
-		// post-Close receipt would transmit at the NEXT launch, which
-		// "no longer transmitted" promises not to do.
+		// stale grant is ever the server's last word. Post-Close decisions
+		// are refused before this path; invalid-actor denials stay local.
 		//
 		// DURABLE ORDERING per decision flavor (the engine SDKs' shared
 		// rule: grants receipt-first, denials record-first). A crash can
@@ -337,7 +413,7 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) error {
 		// record at reload). DENIAL: the record — and the spool purge it
 		// condemns — stays FIRST (a crash after it restores denied,
 		// fail-closed); the deny receipt appends after it.
-		if admitted {
+		{
 			reason := ""
 			if decision == ConsentDecisionDeniedForcedMinor {
 				reason = consentDecisionReason
@@ -352,11 +428,11 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) error {
 				// the owed-mint slot, the owed-record slot, and the
 				// per-receipt pair marks move together — an opportunistic
 				// retry (TryLock) can never interleave between them.
-				c.consentRecordApplyMu.Lock()
 				receiptTrailSafe := true
-				receipt, minted, mintErr := c.mintConsentReceipt(true, reason, decidedAt)
+				receipt, minted, mintErr := mintReceipt(true, reason, decidedAt)
 				switch {
 				case mintErr != nil:
+					result.warn("consent_outbox_persist_failed")
 					// The receipt could not even be minted for a CONFIGURED
 					// actor: it is OWED — retried at every dispatch point —
 					// and the trail is unsafe exactly like a failed append,
@@ -373,6 +449,7 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) error {
 					c.setConsentMintOwed(nil)
 					if c.consentOutbox.append(receipt) {
 						c.recordConsentOutboxPersistFailure()
+						result.warn("consent_outbox_persist_failed")
 						receiptTrailSafe = false
 					}
 					c.drainConsentOutboxEvictions()
@@ -385,7 +462,7 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) error {
 				}
 				if receiptTrailSafe {
 					var recordPersisted bool
-					deadLetters, recordPersisted = c.applySpoolConsent(decision, decidedAt)
+					deadLetters, recordPersisted = applyRecord(decision, decidedAt)
 					c.setConsentRecordOwed(decision, decidedAt, recordPersisted)
 					if minted && !recordPersisted {
 						// The pair-incomplete hold is PER RECEIPT (the single
@@ -399,21 +476,20 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) error {
 					// the moment the outbox write (or the owed mint) lands —
 					// an acknowledged receipt must never prune away leaving
 					// no durable grant.
+					result.warn("consent_persist_failed")
 					c.setConsentRecordOwed(decision, decidedAt, false)
 					if minted {
 						c.consentOutbox.markRecordOwed(receipt.IdempotencyKey)
 					}
 					c.logf("shardpilot consent floor: the grant receipt could not be written durably; the granted record is withheld (owed — completed when the receipt write lands; a restart meanwhile restores the prior state, or the grant from the trail tail once the owed receipt landed)")
 				}
-				c.consentRecordApplyMu.Unlock()
 			} else {
 				// The denial side holds the record-apply lock across the
 				// record write AND the receipt mint/append for the same
 				// reason as the grant side: the owed slots and the
 				// per-receipt marks must move together.
-				c.consentRecordApplyMu.Lock()
 				var recordPersisted bool
-				deadLetters, recordPersisted = c.applySpoolConsent(decision, decidedAt)
+				deadLetters, recordPersisted = applyRecord(decision, decidedAt)
 				// A failed denied-record write is OWED: retried at every
 				// dispatch point, and until it lands the denial's in-scope
 				// proof receipt is HELD from dispatch (consentDenyProofHeld
@@ -421,9 +497,10 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) error {
 				// evidence cannot prune away while the stale pre-denial
 				// record would rule a restart.
 				c.setConsentRecordOwed(decision, decidedAt, recordPersisted)
-				receipt, minted, mintErr := c.mintConsentReceipt(false, reason, decidedAt)
+				receipt, minted, mintErr := mintReceipt(false, reason, decidedAt)
 				switch {
 				case mintErr != nil:
+					result.warn("consent_outbox_persist_failed")
 					// The deny receipt is OWED to the failed mint (retried at
 					// every dispatch point; Close pends until it lands). The
 					// record was already written FIRST — fail-closed exactly
@@ -435,6 +512,7 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) error {
 					c.setConsentMintOwed(nil)
 					if c.consentOutbox.append(receipt) {
 						c.recordConsentOutboxPersistFailure()
+						result.warn("consent_outbox_persist_failed")
 					}
 					c.drainConsentOutboxEvictions()
 					if !recordPersisted {
@@ -444,37 +522,22 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) error {
 				default:
 					c.setConsentMintOwed(nil)
 				}
-				c.consentRecordApplyMu.Unlock()
 			}
 		}
-		if grantArming {
-			// The receipt now exists in the outbox, is owed to a failed
-			// mint (the owed-mint gate holds the batch legs until the
-			// retried mint appends it), or provably never will exist (no
-			// configured actor): the outbox/owed-mint predicates take over
-			// from the arming window either way, and the gate must not
-			// stay stuck for a receipt that cannot come. Re-wake the
-			// dispatcher: a pass that ran during
-			// the window HELD the grant (consentGrantPairIncomplete) and
-			// returned without arming any deferral, so without this nudge
-			// the receipt would idle until the next tick or caller op.
-			c.consentGrantArming.Add(-1)
-			c.wakeConsentDispatch()
-		}
+
 	} else {
-		// Floor-off: the record/spool side applies unconditionally — even
-		// post-Close, where the record only ever gates the NEXT launch's
-		// spool, never any live state — and the legacy fire-and-forget
-		// post follows. A failed record write stays log-only here (no owed
-		// machinery: without the floor the record never feeds live state).
+		// Floor-off: the record/spool side applies before the fire-and-forget
+		// post. Persistence failures are warnings; only the restrictive
+		// forced-minor marker restores live denial at the next launch.
 		// The record carries this decision's stamp and NO floor provenance:
 		// a later floor enablement must not promote a fire-and-forget-era
 		// grant (its POST may have failed; no receipt exists) to live state.
-		deadLetters, _ = c.applySpoolConsent(decision, c.consentDecisionStamp())
-		if actor != "" {
+		deadLetters, _ = applyRecord(decision, c.consentDecisionStamp())
+		if actor != "" && !invalidActor {
 			idempotencyKey, err := uuidv7.New()
 			if err != nil {
 				keyErr = err
+				result.warn("consent_outbox_persist_failed")
 			} else {
 				// Hand off while still holding the turn so the transmission
 				// order matches the decision order across concurrent
@@ -501,26 +564,8 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) error {
 		}
 	}
 
-	// Release the turn BEFORE the dead-letter callback runs: the callback is
-	// integrator code and may call back into the client — including
-	// SetConsent itself, which must be able to take the next ticket. The
-	// cond is read under the same mutex as the serving counter, so a waiter
-	// that materializes it concurrently is either already released by the
-	// increment (its loop re-check) or found here and woken.
-	c.consentTurnMu.Lock()
-	c.consentTicketServing++
-	turnCond := c.consentTurnCond
-	c.consentTurnMu.Unlock()
-	if turnCond != nil {
-		turnCond.Broadcast()
-	}
-	if admitted {
-		// The decision is fully settled — record written (or its failure
-		// logged), spool side applied, transmission handed off — so the
-		// Close fence may pass. The dead-letter callback below is not
-		// fenced, matching its existing after-the-locks posture.
-		c.consentDecisionsWG.Done()
-	}
+	// Release every decision lock before callbacks may re-enter a setter.
+	finish()
 
 	c.emitSpoolDeadLetters(deadLetters)
 	if !c.consentFloorEnabled() && actor == "" {
@@ -528,7 +573,7 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) error {
 	} else if keyErr != nil {
 		c.logf("shardpilot consent: generate idempotency key failed: %v", keyErr)
 	}
-	return nil
+	return result, nil
 }
 
 // consentTurnCondLocked returns the turn condition variable, materializing

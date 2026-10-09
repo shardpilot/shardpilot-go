@@ -69,7 +69,7 @@ func TestConsentGetterPublicVocabulary(t *testing.T) {
 					}
 				})
 				if state != shardpilot.ConsentUnknown {
-					if err := client.SetConsentDecision(shardpilot.ConsentDecision(state)); err != nil {
+					if _, err := client.SetConsentDecision(shardpilot.ConsentDecision(state)); err != nil {
 						t.Fatalf("real decision failed: %v", err)
 					}
 				}
