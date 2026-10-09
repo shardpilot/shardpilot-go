@@ -2,6 +2,14 @@
 
 ## v0.8.0-alpha — release preparation (not published)
 
+- The experimental `pkg/consentpolicy` package is now internal. Its parser,
+  restrictive verifier, tests and fixtures are unchanged; it no longer adds a
+  supported public plan API. Root analytics consent behavior is unchanged.
+
+  | Previous API | Migration |
+  |---|---|
+  | `github.com/shardpilot/shardpilot-go/pkg/consentpolicy` | Remove the experimental import before upgrading. There is no public replacement in this release; do not bypass retained admission restrictions or replace a refusal with permission. |
+
 - `Track` and `Enqueue` now refuse the documented reserved names before delivery,
   count each refusal once in `Stats.Dropped`, and expose `ErrReservedEventName`
   (`reserved_event_name`). Empty/ASCII-whitespace-only names expose
