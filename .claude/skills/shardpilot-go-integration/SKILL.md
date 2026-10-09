@@ -217,6 +217,17 @@ Two things follow that matter when you integrate:
 
 ## Consent model — READ THIS FIRST, IT IS INVERTED
 
+In release preparation, either consent setter accepts one optional
+`shardpilot.ConsentNotice{NoticeVersion, NoticeLocale, PolicyVersion}`. Omit it
+when unknown; all three fields are required when supplied. Version ids are
+1–64 ASCII bytes of `[A-Za-z0-9._+/-]`; locale is BCP 47 syntax within 2–35 bytes
+without registry lookup. Values are copied into each receipt for retry/reload;
+never pass notice text. Invalid metadata refuses a grant with
+`ErrInvalidConsentNotice` (`consent_notice_invalid`); a denial still applies,
+omits the whole tuple and returns that warning with other applicable warnings.
+The forced-minor-preserving no-op still creates no receipt. Existing calls
+without the extra argument keep their behavior.
+
 **SCOPE — read this before the bullets.** This section documents the
 DEFAULT posture, with `Config.ConsentFloor` nil, which is unchanged from
 `v0.5.0-alpha`. `v0.6.0-alpha` added `Config.ConsentFloor`, an opt-in that

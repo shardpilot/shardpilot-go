@@ -60,7 +60,8 @@ const (
 )
 
 // ConsentResult describes an applied local decision. Warnings report this
-// call's unfinished persistence, receipt, or purge work; they do not certify
+// call's unfinished persistence, receipt or purge work, or omitted invalid notice
+// metadata; they do not certify
 // server-side acceptance. A refused decision returns an error instead.
 type ConsentResult struct {
 	Warnings []string
@@ -107,6 +108,7 @@ func newConsentGateState() *consentGateState {
 }
 
 type consentRequest struct {
+	ConsentNotice
 	WorkspaceID     string          `json:"workspace_id"`
 	AppID           string          `json:"app_id"`
 	EnvironmentID   string          `json:"environment_id"`
@@ -136,6 +138,12 @@ type consentResult struct {
 // An invalid actor permits local denial with consent_actor_invalid and no
 // receipt, while its grant is refused. Ordinary denial after forced-minor
 // succeeds without changing ConsentDeniedForcedMinor or minting a receipt.
+//
+// An optional notice supplies all three provenance identifiers for this call.
+// Invalid or multiple notices refuse grants with ErrInvalidConsentNotice;
+// denials still apply with consent_notice_invalid and omit the whole tuple.
+// Omission preserves existing behavior. A forced-minor-preserving no-op never
+// replaces the original receipt or its notice.
 //
 // Remotely it is fire-and-forget for the caller: the decision is handed to
 // a single per-client sender goroutine that posts to
@@ -174,12 +182,12 @@ type consentResult struct {
 // failed purge owes a wipe and fails the spool closed until it succeeds),
 // and spool writes open only under a granted live state whose record was
 // successfully persisted. A failed purge also refuses a subsequent live grant.
-func (c *Client) SetConsent(analyticsGranted bool) (ConsentResult, error) {
+func (c *Client) SetConsent(analyticsGranted bool, notice ...ConsentNotice) (ConsentResult, error) {
 	decision := ConsentDecisionGranted
 	if !analyticsGranted {
 		decision = ConsentDecisionDenied
 	}
-	return c.applyConsentDecision(decision)
+	return c.applyConsentDecision(decision, notice...)
 }
 
 // SetConsentDecision records an explicit consent decision in its typed
@@ -197,11 +205,11 @@ func (c *Client) SetConsent(analyticsGranted bool) (ConsentResult, error) {
 // durability failures surfaced in the returned ConsentResult.Warnings as
 // well as Stats and Close's ErrConsentPending backstop; without the
 // floor it posts fire-and-forget exactly like SetConsent.
-func (c *Client) SetConsentDecision(decision ConsentDecision) (ConsentResult, error) {
-	return c.applyConsentDecision(decision)
+func (c *Client) SetConsentDecision(decision ConsentDecision, notice ...ConsentNotice) (ConsentResult, error) {
+	return c.applyConsentDecision(decision, notice...)
 }
 
-func (c *Client) applyConsentDecision(decision ConsentDecision) (ConsentResult, error) {
+func (c *Client) applyConsentDecision(decision ConsentDecision, notices ...ConsentNotice) (ConsentResult, error) {
 	if c == nil || c.queue == nil {
 		return ConsentResult{}, ErrNotInitialized
 	}
@@ -228,6 +236,15 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) (ConsentResult, 
 		return ConsentResult{}, ErrInvalidConsentDecision
 	}
 	var result ConsentResult
+	notice, validNotice := snapshotConsentNotice(notices)
+	if !validNotice {
+		if decision == ConsentDecisionGranted {
+			c.lifecycleMu.Unlock()
+			return result, ErrInvalidConsentNotice
+		}
+		// Optional metadata cannot block a denial. Keep every other warning.
+		result.warn("consent_notice_invalid")
+	}
 	invalidActor := c.validateConsentFloorIdentity() != nil
 	if invalidActor && decision == ConsentDecisionGranted {
 		c.lifecycleMu.Unlock()
@@ -378,7 +395,7 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) (ConsentResult, 
 			// receipt for a truncated or replacement identity.
 			return consentReceipt{}, false, nil
 		}
-		return c.mintConsentReceipt(granted, reason, stamp)
+		return c.mintConsentReceipt(granted, reason, stamp, notice)
 	}
 	var deadLetters []SpoolDeadLetter
 	var keyErr error
@@ -439,7 +456,7 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) (ConsentResult, 
 					// so the granted record is withheld below. Only the
 					// actorless local-only path may persist receipt-less.
 					receiptTrailSafe = false
-					c.setConsentMintOwed(&consentOwedMint{decision: decision, analyticsGranted: true, reason: reason, decidedAt: decidedAt})
+					c.setConsentMintOwed(&consentOwedMint{decision: decision, analyticsGranted: true, reason: reason, decidedAt: decidedAt, notice: notice})
 					c.stats.setLastConsentError("consent_receipt_mint_failed")
 					c.logf("shardpilot consent floor: minting the grant receipt's idempotency key failed; the receipt is owed (retried at every dispatch point) and the granted record is withheld until it lands: %v", mintErr)
 				case minted:
@@ -505,7 +522,7 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) (ConsentResult, 
 					// every dispatch point; Close pends until it lands). The
 					// record was already written FIRST — fail-closed exactly
 					// as a failed append would leave it.
-					c.setConsentMintOwed(&consentOwedMint{decision: decision, analyticsGranted: false, reason: reason, decidedAt: decidedAt})
+					c.setConsentMintOwed(&consentOwedMint{decision: decision, analyticsGranted: false, reason: reason, decidedAt: decidedAt, notice: notice})
 					c.stats.setLastConsentError("consent_receipt_mint_failed")
 					c.logf("shardpilot consent floor: minting the denial receipt's idempotency key failed; the receipt is owed and retried at every dispatch point (the denied record was written first): %v", mintErr)
 				case minted:
@@ -544,6 +561,7 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) (ConsentResult, 
 				// SetConsent calls (the turn is the single producer on
 				// consentSends).
 				request := consentRequest{
+					ConsentNotice:   notice,
 					WorkspaceID:     c.cfg.WorkspaceID,
 					AppID:           c.cfg.AppID,
 					EnvironmentID:   c.cfg.EnvironmentID,

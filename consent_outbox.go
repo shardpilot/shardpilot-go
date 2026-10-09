@@ -88,6 +88,7 @@ func validConsentIdentifier(identifier string) bool {
 // overwrite a previously granted actor server-side. The sanitizer drops
 // absent-category entries as malformed instead.
 type consentReceipt struct {
+	ConsentNotice
 	IdempotencyKey  string `json:"idempotency_key"`
 	WorkspaceID     string `json:"workspace_id"`
 	AppID           string `json:"app_id"`
@@ -153,6 +154,9 @@ func sanitizeConsentReceipt(entry consentReceipt) (consentReceipt, bool) {
 	if entry.AnonymousID != "" && !validConsentIdentifier(entry.AnonymousID) {
 		return consentReceipt{}, false
 	}
+	if entry.ConsentNotice != (ConsentNotice{}) && !entry.ConsentNotice.valid() {
+		return consentReceipt{}, false
+	}
 	switch entry.Reason {
 	case "":
 	case consentDecisionReason:
@@ -178,6 +182,7 @@ func sanitizeConsentReceipt(entry consentReceipt) (consentReceipt, bool) {
 		return consentReceipt{}, false
 	}
 	sanitized := consentReceipt{
+		ConsentNotice:   entry.ConsentNotice,
 		IdempotencyKey:  entry.IdempotencyKey,
 		WorkspaceID:     entry.WorkspaceID,
 		AppID:           entry.AppID,
@@ -1796,6 +1801,7 @@ func (c *Client) retryOwedConsentRecord() {
 // append-order = decision-order invariant, and the superseded decision was
 // never durable anywhere, exactly like a failed append lost to a crash.
 type consentOwedMint struct {
+	notice           ConsentNotice
 	decision         ConsentDecision
 	analyticsGranted bool
 	reason           string
@@ -1854,7 +1860,7 @@ func (c *Client) retryOwedConsentMint() {
 	if owed == nil {
 		return
 	}
-	receipt, minted, err := c.mintConsentReceipt(owed.analyticsGranted, owed.reason, owed.decidedAt)
+	receipt, minted, err := c.mintConsentReceipt(owed.analyticsGranted, owed.reason, owed.decidedAt, owed.notice)
 	if err != nil || !minted {
 		// Still failing (the configured actor cannot vanish — cfg is
 		// static); the slot stays owed for the next dispatch point.
@@ -1969,6 +1975,7 @@ func (c *Client) wakeConsentDispatch() {
 // key, same decided_at, on every attempt.
 func consentReceiptWire(receipt consentReceipt) consentRequest {
 	return consentRequest{
+		ConsentNotice:   receipt.ConsentNotice,
 		WorkspaceID:     receipt.WorkspaceID,
 		AppID:           receipt.AppID,
 		EnvironmentID:   receipt.EnvironmentID,
@@ -2344,7 +2351,7 @@ func (c *Client) drainConsentOutboxEvictions() {
 // returns the error: the receipt IS owed (the caller registers it for
 // retry; the decision must not persist as if the trail were safe). The
 // anonymous-id retention snapshot never rides the wire.
-func (c *Client) mintConsentReceipt(analyticsGranted bool, reason, decidedAt string) (consentReceipt, bool, error) {
+func (c *Client) mintConsentReceipt(analyticsGranted bool, reason, decidedAt string, notice ConsentNotice) (consentReceipt, bool, error) {
 	actor := firstNonEmpty(c.cfg.UserID, c.cfg.AnonymousID)
 	if actor == "" {
 		return consentReceipt{}, false, nil
@@ -2354,6 +2361,7 @@ func (c *Client) mintConsentReceipt(analyticsGranted bool, reason, decidedAt str
 		return consentReceipt{}, false, err
 	}
 	receipt := consentReceipt{
+		ConsentNotice:   notice,
 		IdempotencyKey:  idempotencyKey,
 		WorkspaceID:     c.cfg.WorkspaceID,
 		AppID:           c.cfg.AppID,

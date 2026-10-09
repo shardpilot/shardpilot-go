@@ -2,6 +2,15 @@
 
 ## v0.8.0-alpha — release preparation (not published)
 
+- Both consent setters accept optional per-call `ConsentNotice` provenance.
+  A valid tuple follows its receipt through retry and durable reload. Invalid
+  metadata cannot block a denial: the tuple is omitted and the result includes
+  `consent_notice_invalid` along with other warnings. Grants with invalid notice
+  metadata are refused with `ErrInvalidConsentNotice`, without state or receipt
+  changes. Omitted arguments preserve behavior; update setter method-value
+  adapters for the variadic `...ConsentNotice` parameter. Notice text is never
+  part of this carrier.
+
 - Both analytics consent setters now return `(ConsentResult, error)`. Nil error
   means the local decision applied; `Warnings` identifies unfinished record,
   receipt or purge work. Denial with an invalid actor applies locally with
