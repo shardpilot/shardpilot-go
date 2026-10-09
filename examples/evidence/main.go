@@ -309,15 +309,15 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 			return closeErr
 		})
 	}
-	analytics("single", "accepted", []shardpilot.Event{event("single", "app.session_started", "single", 1, nil)}, true)
+	analytics("single", "accepted", []shardpilot.Event{event("single", "app.screen_view", "single", 1, nil)}, true)
 	analytics("realistic-batch", "accepted", []shardpilot.Event{
-		event("batch-start-a", "app.session_started", "batch-a", 1, map[string]any{"entry_point": "menu"}),
-		event("batch-end-a", "app.session_ended", "batch-a", 2, map[string]any{"duration_ms": 12000, "reason": "completed"}),
-		event("batch-start-b", "app.session_started", "batch-b", 1, map[string]any{"entry_point": "resume"}),
-		event("batch-end-b", "app.session_ended", "batch-b", 2, map[string]any{"duration_ms": 8000, "reason": "background"}),
+		event("batch-first-a", "app.screen_view", "batch-a", 1, map[string]any{"screen": "menu"}),
+		event("batch-second-a", "app.screen_view", "batch-a", 2, map[string]any{"screen": "summary"}),
+		event("batch-first-b", "app.screen_view", "batch-b", 1, map[string]any{"screen": "menu"}),
+		event("batch-second-b", "app.screen_view", "batch-b", 2, map[string]any{"screen": "summary"}),
 	}, false)
-	analytics("mixed-size", "mixed", []shardpilot.Event{event("large", "app.session_started", "large", 1, map[string]any{"synthetic_padding": strings.Repeat("x", 3072)}), event("small", "app.session_started", "small", 1, nil)}, false)
-	analytics("unauthenticated", "unauthenticated", []shardpilot.Event{event("unauth", "app.session_started", "unauth", 1, nil)}, true)
+	analytics("mixed-size", "mixed", []shardpilot.Event{event("large", "app.screen_view", "large", 1, map[string]any{"synthetic_padding": strings.Repeat("x", 3072)}), event("small", "app.screen_view", "small", 1, nil)}, false)
+	analytics("unauthenticated", "unauthenticated", []shardpilot.Event{event("unauth", "app.screen_view", "unauth", 1, nil)}, true)
 	for _, kind := range []string{"go-panic", "native-json", "raw-text"} {
 		caseRun(kind, "crash", func(hc *http.Client) error {
 			c, err := crash.NewClient(crash.ClientOptions{IngestURL: values["SHARDPILOT_CRASH_INGEST_URL"], APIKey: values["SHARDPILOT_API_KEY"], App: crash.AppInfo{ID: values["SHARDPILOT_APP_ID"], Version: "synthetic", BuildID: "sdk-evidence"}, Source: "sdk-evidence", AnonymousID: values["SHARDPILOT_ANONYMOUS_ID"], SessionID: runID, HTTPClient: hc, MaxAttempts: 1})

@@ -1,6 +1,9 @@
 package shardpilot
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 var (
 	ErrClosed        = errors.New("shardpilot client is closed")
@@ -8,6 +11,14 @@ var (
 	ErrInvalidEvent  = errors.New("invalid shardpilot event")
 	ErrQueueFull     = errors.New("shardpilot queue is full")
 	ErrConsentDenied = errors.New("shardpilot analytics consent is denied")
+
+	// ErrReservedEventName refuses an SDK-owned or runtime-only name at
+	// Track/Enqueue intake. It also matches ErrInvalidEvent through errors.Is.
+	ErrReservedEventName = fmt.Errorf("%w: reserved_event_name", ErrInvalidEvent)
+
+	// ErrEventNameRequired refuses an empty or ASCII-whitespace-only name.
+	// It also matches ErrInvalidEvent through errors.Is.
+	ErrEventNameRequired = fmt.Errorf("%w: event_name_required", ErrInvalidEvent)
 
 	// ErrConsentUnknown is returned by Track/Enqueue under the opt-in
 	// consent floor (Config.ConsentFloor) while no explicit consent decision

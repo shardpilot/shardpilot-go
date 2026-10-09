@@ -62,11 +62,11 @@ func TestSenderEvidence(t *testing.T) {
 						if err := json.Unmarshal(raw, &event); err != nil {
 							t.Fatal(err)
 						}
-						if event.ID == "" || event.Session == "" || event.Source != "client" || !strings.HasPrefix(event.Name, "app.session_") {
+						if event.ID == "" || event.Session == "" || event.Source != "client" || event.Name != "app.screen_view" {
 							t.Fatalf("invalid fixture envelope: %s", raw)
 						}
 						wantSequence := int64(1)
-						if event.Name == "app.session_ended" {
+						if strings.Contains(event.ID, "-batch-second-") {
 							wantSequence = 2
 						}
 						if event.Sequence != wantSequence {
