@@ -150,3 +150,32 @@ func TestCrashPlatformAutoCapture(t *testing.T) {
 		t.Fatalf("capture platform/OS = %q/%q, want %q/%q", event.Platform, event.OS.Name, want, runtime.GOOS)
 	}
 }
+
+type changingPlatformSampler struct{}
+
+func (changingPlatformSampler) ShouldEmit(event Event) bool {
+	event.Modules[0].Platform = "synthetic.unmapped"
+	return true
+}
+func TestCrashPlatformSamplerMutation(t *testing.T) {
+	var received Event
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Error(err)
+		}
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer server.Close()
+	c, err := NewClient(ClientOptions{IngestURL: server.URL, APIKey: "synthetic-key", Sampler: changingPlatformSampler{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := validEvent(t)
+	e.Modules[0].Platform = "linux"
+	if err = c.Emit(context.Background(), e); err != nil {
+		t.Fatal(err)
+	}
+	if received.Modules[0].Platform != "linux" {
+		t.Fatalf("sampler changed normalized wire platform to %q", received.Modules[0].Platform)
+	}
+}

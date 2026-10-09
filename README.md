@@ -177,7 +177,8 @@ maps the Go runtime OS through this vocabulary. The crash runtime mapper accepts
 An unmapped nonempty host value produces one warning per client, through `Logger`
 or the default `slog` logger; raw platform input is neither logged nor retained.
 `SanitizeEvent` performs the same normalization without logging. Caller-owned
-reports and module slices are unchanged.
+reports and module slices are unchanged. A custom sampler receives a detached
+copy of the prepared report; modifying that copy cannot change the admitted body.
 
 ### Automatic panic capture
 

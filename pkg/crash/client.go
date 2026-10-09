@@ -265,7 +265,7 @@ func (c *Client) emit(ctx context.Context, event Event, fatal, trustedFrameFunct
 	if err != nil {
 		return err
 	}
-	if !fatal && c.sampler != nil && !c.sampler.ShouldEmit(prepared) {
+	if !fatal && c.sampler != nil && !c.sampler.ShouldEmit(cloneEvent(prepared)) {
 		return nil
 	}
 	// These are admission facts owned by the SDK, not caller Event fields.
