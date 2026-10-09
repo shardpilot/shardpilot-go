@@ -165,14 +165,14 @@ err = client.EmitFatal(ctx, crash.Event{
 
 ### Automatic panic capture
 
-For Go services you can capture panics automatically instead of building `Event`s by hand. Configure the client with the app identity (and, for a multi-component product, a `Source` slug), then defer `Recover` at each goroutine / request-handler boundary:
+For Go services you can capture panics automatically instead of building `Event`s by hand. Configure the client with the app identity (and, for a multi-component product, a `CrashComponent` slug), then defer `Recover` at each goroutine / request-handler boundary:
 
 ```go
 client, err := crash.NewClient(crash.ClientOptions{
     IngestURL: os.Getenv("SHARDPILOT_CRASH_INGEST_URL"),
     APIKey:    os.Getenv("SHARDPILOT_API_KEY"),
     App:       crash.AppInfo{ID: "fortress-fury", Version: "1.4.0"},
-    Source:    "main-server", // which component/repo this crash came from
+    CrashComponent: "main-server", // which component this crash came from
 })
 
 func handleRequest(ctx context.Context) {
@@ -183,7 +183,9 @@ func handleRequest(ctx context.Context) {
 
 `Recover` recovers a panic, reports it synchronously (so the report is sent before the process exits), and then **re-panics** so the program's normal crash behaviour is preserved. Use it once per goroutine — a panic in a bare `go func(){…}()` with no deferred `Recover` is not captured. `CapturePanic(ctx, recovered)` reports an already-recovered value **without** re-panicking, for callers that intentionally recover and keep running. A nil/unconfigured client is a safe no-op (and `Recover` still re-panics).
 
-Captured frames are **pre-symbolicated** from the Go runtime (package-qualified function, file, line — no native modules or addresses, accepted by the crash ingest API). `App` fields and `Source` are stamped onto every event that doesn't set its own; a per-event value always wins.
+Captured frames are **pre-symbolicated** from the Go runtime (package-qualified function, file, line — no native modules or addresses, accepted by the crash ingest API). `App` fields and `CrashComponent` are stamped onto every event that doesn't set its own; a per-event value always wins.
+
+Crash bodies name the component as `component`, never `source`. `ClientOptions.CrashComponent` is preferred; a non-empty deprecated `ClientOptions.Source` is still used when `CrashComponent` is blank. If both are set, `CrashComponent` wins. The retained `Event.Source` field is a per-event override and also emits `component`. The analytics trust-tier `source` is separate.
 
 Two **default-off** capture opt-ins extend automatic capture (both dark by default — while off, zero new code paths execute and the captured wire shape is byte-identical; server-side acceptance of these fields is gated on the SDK's client-side consent gate and durable crash spool landing first):
 
@@ -228,7 +230,7 @@ Two **default-off** capture opt-ins extend automatic capture (both dark by defau
 
 The example programs read these from `SHARDPILOT_*` environment variables; the SDK itself reads no environment variables.
 
-Crash client (`crash.ClientOptions`): `IngestURL` (crash ingest base URL), `APIKey` (needs `crash:write`), plus optional `App` (`AppInfo{ID,Version,BuildID}` — defaulted onto every event; **required for automatic panic capture**, and `App.ID` must equal the API key's app scope), `Source` (component slug), `AnonymousID`/`SessionID` (optional actor keys — see "Actor identity on crash reports"), `DebugIDFillEnabled` (default `false` — dark; self-module debug-id fill, see "Automatic panic capture"), `AllGoroutineCaptureEnabled` (default `false` — dark; all-goroutine threads at panic time, same section), `HTTPClient`, `Logger`, `Sampler`, `MaxAttempts` (default 2), `RetryBackoff` (default 50ms). Default HTTP timeout is 30s.
+Crash client (`crash.ClientOptions`): `IngestURL` (crash ingest base URL), `APIKey` (needs `crash:write`), plus optional `App` (`AppInfo{ID,Version,BuildID}` — defaulted onto every event; **required for automatic panic capture**, and `App.ID` must equal the API key's app scope), `CrashComponent` (component slug; deprecated `Source` remains a fallback), `AnonymousID`/`SessionID` (optional actor keys — see "Actor identity on crash reports"), `DebugIDFillEnabled` (default `false` — dark; self-module debug-id fill, see "Automatic panic capture"), `AllGoroutineCaptureEnabled` (default `false` — dark; all-goroutine threads at panic time, same section), `HTTPClient`, `Logger`, `Sampler`, `MaxAttempts` (default 2), `RetryBackoff` (default 50ms). Default HTTP timeout is 30s.
 
 ### Actor identity on crash reports
 

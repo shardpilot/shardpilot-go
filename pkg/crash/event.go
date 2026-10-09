@@ -34,8 +34,9 @@ type Event struct {
 	App        AppInfo   `json:"app"`
 	// Source is the component slug within the app: which repo/service this
 	// crash came from (e.g. main-server, game-server). Usually set once via
-	// ClientOptions.Source and stamped on every event; a per-event value wins.
-	Source                string            `json:"source,omitempty"`
+	// ClientOptions.CrashComponent and stamped on every event; a per-event value wins.
+	// The Go field name is retained for compatibility; the wire member is component.
+	Source                string            `json:"component,omitempty"`
 	Platform              string            `json:"platform"`
 	OS                    OSInfo            `json:"os"`
 	Device                map[string]string `json:"device,omitempty"`
