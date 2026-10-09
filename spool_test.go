@@ -2800,7 +2800,7 @@ func TestSetConsentDiskStallDoesNotBlockIntake(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("Enqueue blocked behind the consent decision's disk write")
 	}
-	if got := client.Consent(); got != ConsentGranted {
+	if got := client.ConsentState(); got != ConsentGranted {
 		t.Fatalf("expected the in-memory decision already applied, got %v", got)
 	}
 
@@ -2857,7 +2857,7 @@ func TestDenialAppliesToIntakeWhileEarlierDecisionDiskStalls(t *testing.T) {
 		client.SetConsent(false)
 	}()
 	waitFor(t, 3*time.Second, "the denial visible to intake while the grant's write is stalled", func() bool {
-		return client.Consent() == ConsentDenied
+		return client.ConsentState() == ConsentDenied
 	})
 	if err := client.Enqueue(Event{ID: "evt-under-denial-1", Name: "e1"}); !errors.Is(err, ErrConsentDenied) {
 		t.Fatalf("expected intake rejecting under the denial, got %v", err)

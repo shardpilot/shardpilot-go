@@ -2,6 +2,11 @@
 
 ## v0.8.0-alpha — release preparation (not published)
 
+- Rename the analytics consent getter to `Client.ConsentState()`, returning the
+  existing `ConsentState` named string. All four values and read-only behavior
+  are unchanged; a zero-value client reports `unknown`. Remove `Client.Consent()`
+  with no compatibility alias.
+
 - Keep every valid non-fatal crash report by default, including the first report
   from each client. Previously the default sent only every tenth call and
   returned `nil` for the dropped calls. Explicit custom samplers remain opt-in,
@@ -62,6 +67,7 @@
 
 | Previous API | Replacement |
 |---|---|
+| `Client.Consent()` | Call `Client.ConsentState()`; the result type and state values are unchanged. |
 | `Config.DisableSchemaRevision` | Remove it. Leave `Config.SchemaRevision` empty to send no declaration. |
 | `DefaultSchemaRevision` | Removed. A writer that opts in supplies its deployed schema's revision explicitly. |
 | Implicit schema header on every batch | Set `Config.SchemaRevision` only when the writer is released with that schema. |

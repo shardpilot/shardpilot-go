@@ -68,7 +68,7 @@ func TestTheDecisionCannotBecomeAConsentGrant(t *testing.T) {
 				t.Errorf("%s imports the telemetry client: %q — policy selection is not processing admission",
 					file.name, trimmed)
 			}
-			for _, forbidden := range []string{".SetConsent(", ".SetConsentDecision(", ".Consent()"} {
+			for _, forbidden := range []string{".SetConsent(", ".SetConsentDecision(", ".ConsentState()"} {
 				if strings.Contains(trimmed, forbidden) {
 					t.Errorf("%s calls %s: %q — a plan must never be convertible to a consent grant",
 						file.name, forbidden, trimmed)

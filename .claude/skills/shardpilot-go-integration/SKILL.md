@@ -30,7 +30,7 @@ stdlib-only with zero third-party dependencies. It:
   `POST {IngestURL}/v1/events:batch` with bearer-token auth;
 - sends crash reports (separate `pkg/crash` client) to
   `POST {base}/api/v1/crashes/ingest`, including automatic Go panic capture;
-- records explicit analytics consent decisions (`SetConsent` / `Consent`) and
+- records explicit analytics consent decisions (`SetConsent` / `ConsentState`) and
   transmits them to ShardPilot in the background;
 - mints short-lived Mode-B per-user ingest JWTs (`SignIngestJWT`) for client
   SDKs to consume — a backend-only helper;
@@ -277,7 +277,7 @@ while consent is unknown. This server-side SDK does the inverse:
   actor through that same service path.
 - **`SetConsent` cannot reach the forced-minor state.** It takes a plain
   bool, and the states it reaches are exactly `unknown` / `granted` /
-  `denied` (read via `Consent()`). Since `v0.6.0-alpha` the client SDKs'
+  `denied` (read via `ConsentState()`). Since `v0.6.0-alpha` the client SDKs'
   `denied_forced_minor` state does exist in this SDK, reachable only through
   `SetConsentDecision(ConsentDecisionDeniedForcedMinor)`, and it gates like
   a denial.
