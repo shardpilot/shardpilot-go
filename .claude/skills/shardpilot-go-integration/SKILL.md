@@ -30,7 +30,7 @@ stdlib-only with zero third-party dependencies. It:
   `POST {IngestURL}/v1/events:batch` with bearer-token auth;
 - sends crash reports (separate `pkg/crash` client) to
   `POST {base}/api/v1/crashes/ingest`, including automatic Go panic capture;
-- records explicit analytics consent decisions (`SetConsent` / `Consent`) and
+- records explicit analytics consent decisions (`SetConsent` / `ConsentState`) and
   transmits them to ShardPilot in the background;
 - mints short-lived Mode-B per-user ingest JWTs (`SignIngestJWT`) for client
   SDKs to consume — a backend-only helper;
