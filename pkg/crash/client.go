@@ -51,9 +51,14 @@ type ClientOptions struct {
 	// rejects an empty app.id and one that mismatches the API key's app scope. App.ID
 	// must equal the API key's app.
 	App AppInfo
-	// Source is the component slug stamped on every event that doesn't set
-	// its own: which repo/service in a multi-component product this crash came from
-	// (e.g. main-server, game-server). Optional.
+	// CrashComponent is the optional component slug stamped on events that do not
+	// set Event.Source. It is sent as the crash body's component member.
+	// When both options are non-empty, CrashComponent wins.
+	CrashComponent string
+	// Source is the former name of CrashComponent.
+	//
+	// Deprecated: use CrashComponent. A non-empty Source remains a fallback
+	// when CrashComponent is empty; no crash body sends a source member.
 	Source string
 	// DebugIDFillEnabled opts auto-capture (Recover/CapturePanic) into attaching
 	// the RUNNING BINARY's identity as the event's single modules[] entry: the
@@ -203,7 +208,7 @@ func NewClient(opts ClientOptions) (*Client, error) {
 			Version: strings.TrimSpace(opts.App.Version),
 			BuildID: strings.TrimSpace(opts.App.BuildID),
 		},
-		source: strings.TrimSpace(opts.Source),
+		source: firstNonEmptyString(opts.CrashComponent, opts.Source),
 		// Validated once here rather than on every event: a client-wide identity
 		// that cannot reach the wire should be inert from construction, not
 		// re-checked (and re-dropped) per crash.

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Crash reports send the component slug as `component`; the retired crash wire
+  member `source` is never emitted. Prefer `ClientOptions.CrashComponent`;
+  `ClientOptions.Source` remains a deprecated fallback, and per-event overrides
+  retain their existing precedence.
+
 - Analytics `Platform` now preserves `tvos`, `ps4`, `ps5`, `xbox`, `switch` and `other`. Empty or unmapped values are sent as `other`; previously they were omitted. Supported host aliases keep their existing mappings. Explicit unmapped values still produce bounded, once-per-value logger warnings.
 
 - `pkg/consentpolicy`: a plan may now carry the resolver's optional **advisory part**, and `ParsePlan` reads it as `Plan.Advisory` instead of refusing the whole plan as carrying an unknown key. Before, any response that included it was unreadable. The advisory is a non-binding estimate for the connection's jurisdiction. The resolver serves it only when a client SDK asked for it with `advisory: true` and the workspace accepted the advisory terms; this package sends no request. It is validated against the same closed contract as the rest of the plan:
