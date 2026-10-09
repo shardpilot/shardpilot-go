@@ -9,6 +9,15 @@
 - Describe consent-policy jurisdiction estimates in neutral terms while
   retaining restrictive defaults.
 
+- Crash reports and explicit module platforms now use the same twelve canonical
+  platform values as analytics. Aliases are normalized, including `darwin` to
+  `macos` and the crash runtime alias `js` to `web`; empty or unmapped crash
+  values become `other`. Analytics host-alias behavior is unchanged.
+  Omitted module values inherit the crash platform at ingest. Unmapped host input
+  produces one warning per crash client without logging or retaining the raw value.
+  Automatic panic capture and `SanitizeEvent` use the same normalization. Custom
+  crash platform slugs therefore become `other`; use `OS.Name` for the OS name.
+
 - Crash reports send the component slug as `component`; the retired crash wire
   member `source` is never emitted. Prefer `ClientOptions.CrashComponent`;
   `ClientOptions.Source` remains a deprecated fallback, and per-event overrides

@@ -5,6 +5,8 @@ import (
 	"net"
 	"regexp"
 	"strings"
+
+	"github.com/shardpilot/shardpilot-go/internal/platform"
 )
 
 var (
@@ -39,7 +41,7 @@ func sanitizeEvent(event Event, trustedFrameFunctions bool) (Event, error) {
 	// Source is an operator-set component slug on the wire; scrub it like the
 	// other identifiers so a misconfigured value carrying PII never leaves the process.
 	event.Source = sanitizeString(event.Source)
-	event.Platform = sanitizeString(event.Platform)
+	event.Platform = platform.NormalizeRuntime(event.Platform)
 	event.OS.Name = sanitizeString(event.OS.Name)
 	event.OS.Version = sanitizeString(event.OS.Version)
 	// exception.type stays under the FULL scrubber: it is caller-populated free text for
@@ -69,7 +71,12 @@ func sanitizeEvent(event Event, trustedFrameFunctions bool) (Event, error) {
 	for i := range event.Modules {
 		event.Modules[i].ID = sanitizeString(event.Modules[i].ID)
 		event.Modules[i].Name = sanitizeString(event.Modules[i].Name)
-		event.Modules[i].Platform = sanitizeString(event.Modules[i].Platform)
+		// An omitted module platform inherits the crash platform at ingest.
+		if strings.TrimSpace(event.Modules[i].Platform) == "" {
+			event.Modules[i].Platform = ""
+		} else {
+			event.Modules[i].Platform = platform.NormalizeRuntime(event.Modules[i].Platform)
+		}
 		event.Modules[i].DebugID = sanitizeString(event.Modules[i].DebugID)
 		event.Modules[i].BuildID = sanitizeString(event.Modules[i].BuildID)
 		event.Modules[i].LoadAddress = sanitizeString(event.Modules[i].LoadAddress)

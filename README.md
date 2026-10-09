@@ -165,6 +165,20 @@ err = client.EmitFatal(ctx, crash.Event{
 
 `EmitFatal` always sends — fatal crashes are never sampled. `Emit` (non-fatal) is subject to the client sampler, whose default is **deterministic every-10th-call per client** (each `crash.Client` gets its own counter unless you pass a shared `Sampler`: that client's calls 10, 20, 30, … transmit; the first 9 non-fatals of each client are always dropped, so a client that emits fewer than 10 non-fatals in its lifetime reports none — and two clients emitting 5 non-fatals each report none, even though the process emitted 10). A sampled-out `Emit` returns `nil` exactly like a sent one — only the `OnResult` callback (or its absence) tells them apart. Override with the public `Sampler` option (e.g. an allow-all sampler transmits every non-fatal).
 
+Crash and module platforms use the same twelve values as analytics: `windows`,
+`macos`, `linux`, `android`, `ios`, `tvos`, `web`, `ps4`, `ps5`, `xbox`, `switch`,
+and `other`. Host values are trimmed and lowercased; supported aliases such as
+`darwin` and `js` become `macos` and `web`. Empty or unmapped crash values become
+`other`. An omitted module platform stays omitted and inherits the crash platform
+at ingest; an explicit unmapped module value becomes `other`. Automatic capture
+maps the Go runtime OS through this vocabulary. The crash runtime mapper accepts
+`js` as `web`; analytics retains its existing host-alias behavior (`js` uses
+`other`). `OS.Name` remains separate.
+An unmapped nonempty host value produces one warning per client, through `Logger`
+or the default `slog` logger; raw platform input is neither logged nor retained.
+`SanitizeEvent` performs the same normalization without logging. Caller-owned
+reports and module slices are unchanged.
+
 ### Automatic panic capture
 
 For Go services you can capture panics automatically instead of building `Event`s by hand. Configure the client with the app identity (and, for a multi-component product, a `CrashComponent` slug), then defer `Recover` at each goroutine / request-handler boundary:
