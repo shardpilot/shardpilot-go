@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -14,6 +15,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/shardpilot/shardpilot-go/internal/platform"
 )
 
 const defaultHTTPTimeout = 30 * time.Second
@@ -34,6 +37,8 @@ type Client struct {
 	maxAttempts  int
 	retryBackoff time.Duration
 	onResult     func(Result)
+
+	warnedPlatform atomic.Bool
 	// selfModule is the running binary's identity, resolved ONCE at NewClient when
 	// DebugIDFillEnabled is on (nil when the flag is off OR the binary is
 	// unreadable), so the panic path does no file I/O.
@@ -260,7 +265,7 @@ func (c *Client) emit(ctx context.Context, event Event, fatal, trustedFrameFunct
 	if err != nil {
 		return err
 	}
-	if !fatal && c.sampler != nil && !c.sampler.ShouldEmit(prepared) {
+	if !fatal && c.sampler != nil && !c.sampler.ShouldEmit(cloneEvent(prepared)) {
 		return nil
 	}
 	// These are admission facts owned by the SDK, not caller Event fields.
@@ -326,6 +331,7 @@ func (c *Client) prepareEvent(event Event, trustedFrameFunctions bool) (Event, e
 	event = normalizeEventTimes(event, time.Now().UTC())
 	event = normalizeEventShape(event)
 
+	c.warnUnmappedPlatforms(event)
 	sanitized, err := sanitizeEvent(event, trustedFrameFunctions)
 	if err != nil {
 		return Event{}, err
@@ -334,6 +340,28 @@ func (c *Client) prepareEvent(event Event, trustedFrameFunctions bool) (Event, e
 		return Event{}, err
 	}
 	return sanitized, nil
+}
+
+// warnUnmappedPlatforms logs once per client, with no raw input retained or
+// printed. Set the flag before calling host code so a reentrant logger is safe.
+func (c *Client) warnUnmappedPlatforms(event Event) {
+	unmapped := func(value string) bool {
+		clean := strings.ToLower(strings.TrimSpace(value))
+		return clean != "" && clean != "other" && platform.NormalizeRuntime(value) == "other"
+	}
+	warn := unmapped(event.Platform)
+	for _, module := range event.Modules {
+		warn = warn || unmapped(module.Platform)
+	}
+	if !warn || !c.warnedPlatform.CompareAndSwap(false, true) {
+		return
+	}
+	const message = "shardpilot crash: an unmapped platform uses other; further platform warnings are suppressed for this client"
+	if c.logger != nil {
+		c.logf("%s", message)
+	} else {
+		slog.Warn(message)
+	}
 }
 
 func (c *Client) post(ctx context.Context, payload []byte) (Result, error) {

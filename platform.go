@@ -1,35 +1,6 @@
 package shardpilot
 
-import "strings"
-
-// Analytics platform values and supported host aliases.
-var envelopePlatformVocabulary = map[string]string{
-	"android":   "android",
-	"browser":   "web",
-	"darwin":    "macos",
-	"html5":     "web",
-	"ios":       "ios",
-	"ipad":      "ios",
-	"ipados":    "ios",
-	"iphone":    "ios",
-	"linux":     "linux",
-	"mac":       "macos",
-	"macos":     "macos",
-	"macosx":    "macos",
-	"osx":       "macos",
-	"other":     "other",
-	"ps4":       "ps4",
-	"ps5":       "ps5",
-	"switch":    "switch",
-	"tvos":      "tvos",
-	"steamdeck": "linux",
-	"web":       "web",
-	"win":       "windows",
-	"win32":     "windows",
-	"win64":     "windows",
-	"windows":   "windows",
-	"xbox":      "xbox",
-}
+import "github.com/shardpilot/shardpilot-go/internal/platform"
 
 // maxWarnedPlatforms caps the reported-value set. A correct caller produces a
 // handful; a caller interpolating a version or a device id into `platform`
@@ -38,10 +9,7 @@ const maxWarnedPlatforms = 32
 
 // normalizeEnvelopePlatform folds host input to a canonical analytics value.
 func normalizeEnvelopePlatform(value string) string {
-	if platform := envelopePlatformVocabulary[strings.ToLower(strings.TrimSpace(value))]; platform != "" {
-		return platform
-	}
-	return "other"
+	return platform.Normalize(value)
 }
 
 // warnUnmappedPlatform reports each configured fallback once, with bounded state.
