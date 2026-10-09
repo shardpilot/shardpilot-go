@@ -14,11 +14,10 @@ import (
 )
 
 func TestConsentPlanPackageIsInternal(t *testing.T) {
-	_, source, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("cannot locate SDK module")
+	root, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("locate SDK module: %v", err)
 	}
-	root := filepath.Dir(source)
 	for _, tc := range []struct{ name, program, refusal string }{
 		{"supported-imports", `package main
 import (
@@ -50,13 +49,11 @@ func main() {}
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
-			goBinary := "go"
-			if runtime.GOOS == "windows" {
-				goBinary += ".exe"
-			}
-			cmd := exec.CommandContext(ctx, filepath.Join(runtime.GOROOT(), "bin", goBinary), "build", "-mod=readonly", "-p=1", ".")
+			// Trimmed builds may omit runtime's filesystem paths. Let the Go
+			// launcher locate the same installed toolchain, with downloads off.
+			cmd := exec.CommandContext(ctx, "go", "build", "-mod=readonly", "-p=1", ".")
 			cmd.Dir = dir
-			cmd.Env = append(os.Environ(), "GOWORK=off", "GOPROXY=off", "GOSUMDB=off", "GOFLAGS=", "GOTOOLCHAIN=local", "GOMAXPROCS=2", "GOROOT="+runtime.GOROOT())
+			cmd.Env = append(os.Environ(), "GOWORK=off", "GOPROXY=off", "GOSUMDB=off", "GOFLAGS=", "GOTOOLCHAIN="+runtime.Version(), "GOMAXPROCS=2", "GOROOT=")
 			out, err := cmd.CombinedOutput()
 			if tc.refusal == "" {
 				if err != nil {
