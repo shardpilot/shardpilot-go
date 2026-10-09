@@ -497,6 +497,10 @@ func (c *Client) Track(ctx context.Context, event Event) error {
 		c.stats.dropped.Add(1)
 		return ErrConsentActorMismatch
 	}
+	if err := c.validateHostEventName(event.Name); err != nil {
+		c.lifecycleMu.Unlock()
+		return err
+	}
 	event, err := c.prepareEvent(event)
 	if err != nil {
 		c.stats.recordFailure(err)
@@ -555,6 +559,9 @@ func (c *Client) Enqueue(event Event) error {
 		// actor is refused at intake rather than queued for transmission.
 		c.stats.dropped.Add(1)
 		return ErrConsentActorMismatch
+	}
+	if err := c.validateHostEventName(event.Name); err != nil {
+		return err
 	}
 	event, err := c.prepareEvent(event)
 	if err != nil {
@@ -1968,8 +1975,8 @@ func cloneEvent(event Event) Event {
 // delivered-but-timed-out batch into permanent duplicates).
 func (c *Client) prepareEvent(event Event) (Event, error) {
 	event = cloneEvent(event)
-	if strings.TrimSpace(event.Name) == "" {
-		return Event{}, fmt.Errorf("%w: event name is required", ErrInvalidEvent)
+	if normalizeEventName(event.Name) == "" {
+		return Event{}, ErrEventNameRequired
 	}
 	if strings.TrimSpace(event.ID) == "" {
 		id, err := newEventID()

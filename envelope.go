@@ -86,7 +86,7 @@ type eventEnvelope struct {
 }
 
 func (c *Client) buildEnvelope(event Event) (eventEnvelope, error) {
-	name := strings.TrimSpace(event.Name)
+	name := normalizeEventName(event.Name)
 	if name == "" {
 		return eventEnvelope{}, fmt.Errorf("%w: event name is required", ErrInvalidEvent)
 	}
