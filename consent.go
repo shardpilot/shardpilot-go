@@ -188,8 +188,8 @@ func (c *Client) SetConsent(analyticsGranted bool) (ConsentResult, error) {
 // is the forced-minor denial: analytics-wise identical to a denial — the
 // full denial path runs and every gate treats the state as denied — with
 // the receipt carrying reason "denied_forced_minor" so the backend can tell
-// a band-forced denial from a chosen one. Any other value is rejected with
-// ErrInvalidConsentDecision and NOTHING is applied.
+// a band-forced denial from a chosen one. On an active client, any other
+// value is rejected with ErrInvalidConsentDecision and NOTHING is applied.
 //
 // Delivery of the decision follows the client's mode: under the opt-in
 // consent floor (Config.ConsentFloor) the receipt rides the durable outbox
@@ -198,11 +198,6 @@ func (c *Client) SetConsent(analyticsGranted bool) (ConsentResult, error) {
 // well as Stats and Close's ErrConsentPending backstop; without the
 // floor it posts fire-and-forget exactly like SetConsent.
 func (c *Client) SetConsentDecision(decision ConsentDecision) (ConsentResult, error) {
-	switch decision {
-	case ConsentDecisionGranted, ConsentDecisionDenied, ConsentDecisionDeniedForcedMinor:
-	default:
-		return ConsentResult{}, ErrInvalidConsentDecision
-	}
 	return c.applyConsentDecision(decision)
 }
 
@@ -210,9 +205,32 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) (ConsentResult, 
 	if c == nil || c.queue == nil {
 		return ConsentResult{}, ErrNotInitialized
 	}
+	// FAST HALF, under lifecycleMu: a denial takes effect on intake
+	// IMMEDIATELY — before any disk work, this call's or an earlier
+	// decision's. A denial issued while a predecessor's record write stalls
+	// on a slow SpoolDir must reject Track/Enqueue from this moment, so the
+	// in-memory flip never queues behind disk. The ticket taken here fixes
+	// this decision's place in the total decision order; the slow half below
+	// runs strictly in ticket order. Admission for the Close fence is
+	// decided here too: closed is stored under this same mutex, so "admitted
+	// before Close" is exact (see consentDecisionsWG).
+	c.lifecycleMu.Lock()
+	if c.closed.Load() {
+		c.lifecycleMu.Unlock()
+		return ConsentResult{}, ErrConsentShutdown
+	}
+	// A terminal client cannot be repaired by changing its input. Admit
+	// lifecycle state before validating either setter's decision or actor.
+	switch decision {
+	case ConsentDecisionGranted, ConsentDecisionDenied, ConsentDecisionDeniedForcedMinor:
+	default:
+		c.lifecycleMu.Unlock()
+		return ConsentResult{}, ErrInvalidConsentDecision
+	}
 	var result ConsentResult
 	invalidActor := c.validateConsentFloorIdentity() != nil
 	if invalidActor && decision == ConsentDecisionGranted {
+		c.lifecycleMu.Unlock()
 		return result, ErrInvalidConsentIdentity
 	}
 	if invalidActor {
@@ -229,20 +247,6 @@ func (c *Client) applyConsentDecision(decision ConsentDecision) (ConsentResult, 
 
 	actor := firstNonEmpty(c.cfg.UserID, c.cfg.AnonymousID)
 
-	// FAST HALF, under lifecycleMu: a denial takes effect on intake
-	// IMMEDIATELY — before any disk work, this call's or an earlier
-	// decision's. A denial issued while a predecessor's record write stalls
-	// on a slow SpoolDir must reject Track/Enqueue from this moment, so the
-	// in-memory flip never queues behind disk. The ticket taken here fixes
-	// this decision's place in the total decision order; the slow half below
-	// runs strictly in ticket order. Admission for the Close fence is
-	// decided here too: closed is stored under this same mutex, so "admitted
-	// before Close" is exact (see consentDecisionsWG).
-	c.lifecycleMu.Lock()
-	if c.closed.Load() {
-		c.lifecycleMu.Unlock()
-		return ConsentResult{}, ErrConsentShutdown
-	}
 	if c.consent.Load() == consentStateDeniedForcedMinor {
 		if analyticsGranted {
 			c.lifecycleMu.Unlock()

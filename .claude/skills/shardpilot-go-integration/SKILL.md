@@ -629,9 +629,10 @@ them:
   actor, retention, capacity and successful-write gates. Appending requires
   a live grant and its persisted record. Abrupt process death loses events
   that have not reached disk; crash reports have no offline replay.
-- **The live consent state does not survive restarts** (never restored at
-  startup, even though `SpoolDir` persists the decision record to gate disk
-  participation; re-apply on startup yourself).
+- **Default-mode restart recovery is limited to forced-minor denial.** With
+  `SpoolDir`, a scoped `denied_forced_minor` record restores that restriction.
+  Other default-mode live consent states are not restored; re-apply those on
+  startup yourself. The opt-in consent floor restores other persisted states.
 - **Consent receipts have no delivery guarantee**: fire-and-forget, 16-entry
   pending buffer with oldest-dropped overflow, failures only logged, no
   per-receipt success signal, and no ordering guarantee relative to event

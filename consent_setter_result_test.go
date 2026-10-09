@@ -157,6 +157,44 @@ func TestConsentSetterForcedMinorCannotBeReopened(t *testing.T) {
 	}
 }
 
+func TestConsentSetterShutdownPrecedesValidation(t *testing.T) {
+	for _, floor := range []bool{false, true} {
+		for _, boolean := range []bool{false, true} {
+			for _, decision := range []ConsentDecision{ConsentDecisionGranted, ConsentDecisionDenied} {
+				t.Run(fmt.Sprintf("floor-%t/bool-%t/%s", floor, boolean, decision), func(t *testing.T) {
+					client, wire := setterClient(t, floor, "", strings.Repeat("x", 513))
+					checkSetterResult(t, observeSetter(t, client, ConsentDecisionGranted, boolean), "consent_actor_invalid", "")
+					checkSetterResult(t, observeSetter(t, client, ConsentDecisionDenied, boolean), "", "consent_actor_invalid")
+					if err := client.Close(context.Background()); err != nil {
+						t.Fatal(err)
+					}
+					got := observeSetter(t, client, decision, boolean)
+					checkSetterResult(t, got, "shutdown", "")
+					if !errors.Is(got.err, ErrConsentShutdown) || !errors.Is(got.err, ErrClosed) {
+						t.Errorf("terminal client returned %v, want shutdown matching ErrClosed", got.err)
+					}
+					if client.ConsentState() != ConsentDenied || wire.consentCount() != 0 {
+						t.Errorf("closed setter changed state or emitted receipt: %s / %v", client.ConsentState(), wire.snapshotOrder())
+					}
+				})
+			}
+		}
+		t.Run(fmt.Sprintf("floor-%t/invalid-decision", floor), func(t *testing.T) {
+			client, _ := setterClient(t, floor, "", "")
+			checkSetterResult(t, observeSetter(t, client, "invalid", false), "invalid_consent", "")
+			prior := client.ConsentState()
+			if err := client.Close(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			got := observeSetter(t, client, "invalid", false)
+			checkSetterResult(t, got, "shutdown", "")
+			if !errors.Is(got.err, ErrClosed) || client.ConsentState() != prior {
+				t.Errorf("closed invalid decision returned %v or changed state", got.err)
+			}
+		})
+	}
+}
+
 func TestConsentSetterPurgeResult(t *testing.T) {
 	for _, floor := range []bool{false, true} {
 		for _, denial := range []ConsentDecision{ConsentDecisionDenied, ConsentDecisionDeniedForcedMinor} {
