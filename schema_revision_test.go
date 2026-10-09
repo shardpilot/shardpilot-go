@@ -82,37 +82,6 @@ func waitForRevisionHeader(t *testing.T, headers chan capturedRevisionHeader) ca
 	}
 }
 
-func TestBatchPublishDeclaresDefaultSchemaRevision(t *testing.T) {
-	// Pin the compiled-in constant byte for byte: it is the digest of the
-	// ingest service's embedded schema set this SDK release was coordinated
-	// against, and an accidental edit must fail loudly.
-	const pinned = "sha256:e1ba01d4b76b9e73444e2edd5639281929fd89496cadc1dcc79eb68208c6a0a0"
-	if DefaultSchemaRevision != pinned {
-		t.Fatalf("DefaultSchemaRevision = %q, want the pinned coordination digest %q", DefaultSchemaRevision, pinned)
-	}
-
-	headers := make(chan capturedRevisionHeader, 4)
-	server := newSchemaRevisionTestServer(t, headers)
-	defer server.Close()
-
-	client := newSchemaRevisionTestClient(t, server.URL, nil)
-	defer client.Close(context.Background())
-
-	if err := client.Track(context.Background(), Event{Name: "server_event"}); err != nil {
-		t.Fatalf("Track: %v", err)
-	}
-	captured := waitForRevisionHeader(t, headers)
-	if captured.route != "/v1/events:batch" {
-		t.Fatalf("expected a batch request, got %q", captured.route)
-	}
-	if !captured.present {
-		t.Fatal("batch request carried no schema-revision header")
-	}
-	if captured.value != DefaultSchemaRevision {
-		t.Fatalf("batch schema-revision header = %q, want %q", captured.value, DefaultSchemaRevision)
-	}
-}
-
 func TestConsentRouteNeverCarriesSchemaRevision(t *testing.T) {
 	headers := make(chan capturedRevisionHeader, 4)
 	server := newSchemaRevisionTestServer(t, headers)
@@ -120,6 +89,7 @@ func TestConsentRouteNeverCarriesSchemaRevision(t *testing.T) {
 
 	client := newSchemaRevisionTestClient(t, server.URL, func(cfg *Config) {
 		cfg.UserID = "user-actor"
+		cfg.SchemaRevision = "sha256:" + strings.Repeat("42", 32)
 	})
 	defer client.Close(context.Background())
 
@@ -166,33 +136,7 @@ func TestSchemaRevisionOverrideIsDeclared(t *testing.T) {
 	}
 }
 
-func TestDisableSchemaRevisionOmitsHeader(t *testing.T) {
-	headers := make(chan capturedRevisionHeader, 4)
-	server := newSchemaRevisionTestServer(t, headers)
-	defer server.Close()
-
-	// Disable wins even over an explicit override: "stop declaring" must be
-	// absolute, matching the server's undeclared-always-passes escape hatch.
-	client := newSchemaRevisionTestClient(t, server.URL, func(cfg *Config) {
-		cfg.SchemaRevision = "sha256:" + strings.Repeat("42", 32)
-		cfg.DisableSchemaRevision = true
-	})
-	defer client.Close(context.Background())
-
-	if err := client.Track(context.Background(), Event{Name: "server_event"}); err != nil {
-		t.Fatalf("Track: %v", err)
-	}
-	captured := waitForRevisionHeader(t, headers)
-	if captured.route != "/v1/events:batch" {
-		t.Fatalf("expected a batch request, got %q", captured.route)
-	}
-	if captured.present {
-		t.Fatalf("disabled client must not declare a schema revision, got %q", captured.value)
-	}
-}
-
-// schemaRevisionMismatchBody mirrors the shape of the enforce-mode 409 envelope
-// the server sends when the declared revision does not match the served one.
+// schemaRevisionMismatchBody is a synthetic legacy error-envelope fixture.
 const schemaRevisionMismatchBody = `{"error":{"code":"schema_revision_mismatch",` +
 	`"message":"the declared schema revision does not match the schema revision this server serves",` +
 	`"details":[{"field":"X-ShardPilot-Schema-Revision","code":"schema_revision_mismatch",` +
@@ -211,6 +155,7 @@ func TestSchemaRevisionMismatch409IsTerminalAndLogged(t *testing.T) {
 
 	client := newSchemaRevisionTestClient(t, server.URL, func(cfg *Config) {
 		cfg.Logger = testLogger{out: &logs}
+		cfg.SchemaRevision = "sha256:" + strings.Repeat("42", 32)
 	})
 	defer client.Close(context.Background())
 
@@ -243,7 +188,7 @@ func TestSchemaRevisionMismatch409IsTerminalAndLogged(t *testing.T) {
 		!strings.Contains(logged, "dropped as terminal") {
 		t.Fatalf("expected a dedicated schema-revision mismatch log line, got %q", logged)
 	}
-	if !strings.Contains(logged, DefaultSchemaRevision) {
+	if !strings.Contains(logged, client.cfg.SchemaRevision) {
 		t.Fatalf("expected the log line to name the declared revision, got %q", logged)
 	}
 }

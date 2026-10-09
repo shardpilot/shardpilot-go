@@ -1898,7 +1898,7 @@ func (c *Client) publishRequestResult(ctx context.Context, request batchRequest,
 			// Terminal for the batch (isPermanentPublishError routes it to
 			// the drop path, never a retry): this build's declared schema
 			// revision no longer matches what the ingest service serves.
-			c.logf("shardpilot batch publish rejected: schema revision mismatch (this build declares %q); batch dropped as terminal — rebuild against the server's current schema set, override Config.SchemaRevision, or set Config.DisableSchemaRevision to stop declaring: %v",
+			c.logf("shardpilot batch publish rejected: schema revision mismatch (this build declares %q); batch dropped as terminal — rebuild against the server's current schema set, override Config.SchemaRevision, or clear Config.SchemaRevision to stop declaring: %v",
 				effectiveSchemaRevision(c.cfg), err)
 		} else {
 			c.logf("shardpilot batch publish failed: %v", err)
@@ -2001,7 +2001,7 @@ func isPermanentPublishError(err error) bool {
 	// An enforce-mode schema-revision-mismatch 409 is terminal by contract:
 	// the server sends no Retry-After because re-sending the same batch from
 	// the same build can never succeed — only a rebuild against the current
-	// schema set (or stop declaring via Config.DisableSchemaRevision) clears
+	// schema set (or stop declaring by clearing Config.SchemaRevision) clears
 	// it. The generic non-retryable branch below already drops it today; this
 	// explicit branch pins that routing so no future 409 handling — e.g. the
 	// partial-batch/split work in the TODO above, which the two
