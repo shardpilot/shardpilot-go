@@ -24,13 +24,15 @@ Real, tested, working code — **early alpha**. The API is pre-v1 and may change
 
 ## Installation
 
-Install the latest tagged release:
+Prepared install command (use after the announced release):
 
 ```bash
-go get github.com/shardpilot/shardpilot-go@v0.7.2-alpha
+go get github.com/shardpilot/shardpilot-go@v0.8.0-alpha
 ```
 
-`v0.7.2-alpha` is the latest tag. The owner creates it after the release PR merges; until then this pin is pending, so wait if it does not resolve.
+For this release preparation, `v0.8.0-alpha` is the latest tag target. It is not published yet; wait for the announced release before using the install pin.
+
+**Schema declaration migration:** remove `DisableSchemaRevision` and leave `SchemaRevision` empty unless your writer supplies its deployed schema revision. The old default digest constant is removed. See the [migration table](CHANGELOG.md#migration-from-v072-alpha).
 
 **Breaking changes for experiment integrations:** call `ApplyExperimentVariant` when using a variant, then record outcomes against that application. Facts are sealed and delivered asynchronously. Declare the game's age band explicitly; an omitted or non-adult band is authoritatively ineligible. Follow [Migration from v0.6.4-alpha](CHANGELOG.md#migration-from-v064-alpha).
 
@@ -223,8 +225,7 @@ Two **default-off** capture opt-ins extend automatic capture (both dark by defau
 | `SpoolMaxBytes` | no | Spool byte cap over serialized envelopes, default 1 MiB (1,048,576), same oldest-first eviction. |
 | `OnSpoolDeadLetter` | no | `func(SpoolDeadLetter)` called with every event the spool drops undelivered (capacity, 7-day retry-age expiry, terminal outcome, consent purge/refusal). A capacity eviction reports only once the rewrite that removed it durably lands — an eviction a failed rewrite left in the on-disk record is not final yet (a restart would reload and resend it), so its callback defers until it is. Panic-recovered like `OnBatchResult`. |
 | `DisableRequestCompression` | no | Stops gzip-compressing request bodies. Default `false` — the client **compresses**: a batch body is the same envelope keys repeated per event, so it comes down to a few percent of its size (measured: a 100-event batch, 41.7 KB -> 2.4 KB on the wire, **17x**). Bodies under 1 KiB are sent uncompressed — gzip's 18 bytes of framing make a single-event batch bigger, not smaller — as is any body compression fails to shrink. Cost is ~36 us and 2 allocations per batch. **Where that cost lands depends on which API you call**: an `Enqueue`d batch is published by the background worker, so the caller pays nothing; a synchronous `Track` publishes on the CALLER's goroutine, so a single event whose JSON exceeds the 1 KiB threshold — a large props payload — pays the compression there. Most `Track` events are a few hundred bytes and never cross it. If the server cannot read the coding it says so with a distinct detail code and the client falls back to uncompressed **for the rest of the process** after one rejected request, re-sending the same batch, so pointing a new SDK at an older ingest deployment costs one round-trip rather than dropping data. Set this to skip even that. |
-| `SchemaRevision` | no | Overrides the ingest envelope schema-set revision declared on `events:batch` publishes via the `X-ShardPilot-Schema-Revision` request header. Default: `DefaultSchemaRevision`, the revision this SDK release was coordinated against. |
-| `DisableSchemaRevision` | no | Stops declaring a schema-set revision entirely (no header; undeclared always passes the server's handshake in every mode) — the no-rebuild escape hatch if an armed enforce-mode handshake rejects this build's revision as stale. |
+| `SchemaRevision` | no | Opt-in schema-set revision for a writer released with its schema. Empty by default: no `X-ShardPilot-Schema-Revision` header. An explicit value is sent on `events:batch` only. |
 | `RejectionCapacity` | no | Rejection-history entry cap; default 64 for non-positive values, oldest evicted first. See "Batch verdicts". |
 | `OnBatchResult` | no | `func(BatchResult)` called after each successful batch publish with the server's per-event outcomes. Runs on the publish path (may be called concurrently); keep it fast and non-blocking. A panic inside it is recovered. |
 
@@ -399,6 +400,15 @@ Defaults: issuer `shardpilot`, audience `shardpilot-ingest`, lifetime 5m (equal 
 | `pkg/crash/` | Crash SDK: `client.go`, `event.go` (typed wire schema), `capture.go` (automatic panic capture), `breadcrumbs.go`, `sanitize.go`. |
 | `examples/basic/`, `examples/crash/` | Runnable analytics and crash examples (env-var driven). |
 | `*_test.go`, `quickstart_test.go`, `client_benchmark_test.go` | Unit, quickstart, and benchmark tests. |
+
+## Capability discovery
+
+`shardpilot.Supports(key)` works before a client exists. It returns true for
+`consent_receipt_outbox`, `consent_state_denied_forced_minor`,
+`schema_revision_declaration`, `experiments_assignment` and `experiments_age_band`.
+Every other spelling, including an empty key, different case or surrounding
+whitespace, returns false. A supported opt-in feature still needs its documented
+configuration; the query does not enable it.
 
 ## Build & test
 

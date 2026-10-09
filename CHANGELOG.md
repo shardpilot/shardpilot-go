@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## v0.8.0-alpha — release preparation (not published)
+
+- Schema-revision declaration is now opt-in. Only an explicit, nonblank
+  `Config.SchemaRevision` sends the batch header; default clients send none.
+- Add `Supports(key string) bool` for the five documented capabilities. The
+  query works before initialization and rejects unknown or non-exact keys.
+- Describe consent-policy jurisdiction estimates in neutral terms while
+  retaining restrictive defaults.
 
 - Crash reports send the component slug as `component`; the retired crash wire
   member `source` is never emitted. Prefer `ClientOptions.CrashComponent`;
@@ -18,6 +25,17 @@
   - `resolved_by` is `server_country` or `unknown`, and `unknown` means `OTHER`.
 
   An advisory that is `null`, carries an unknown member, or appears on a refusal makes the plan unreadable, like any other malformed member. It **never changes the regime** or any other answer a `Decision` gives, and `Prepare` still uses no plan in this release. The estimate has its own type, `AdvisoryEstimate`, so it cannot be passed where a `Regime` is expected without an explicit conversion.
+
+### Migration from `v0.7.2-alpha`
+
+| Previous API | Replacement |
+|---|---|
+| `Config.DisableSchemaRevision` | Remove it. Leave `Config.SchemaRevision` empty to send no declaration. |
+| `DefaultSchemaRevision` | Removed. A writer that opts in supplies its deployed schema's revision explicitly. |
+| Implicit schema header on every batch | Set `Config.SchemaRevision` only when the writer is released with that schema. |
+
+No aliases are provided for the removed symbols. This version is prepared in
+source; its release tag is not published yet.
 
 ## v0.7.2-alpha — 2026-10-02
 

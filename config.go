@@ -69,13 +69,9 @@ type Config struct {
 	// is not here (see the rcClient rationale in transport.go).
 	HTTPClient *http.Client
 
-	// SchemaRevision overrides the ingest envelope schema-set revision this
-	// client declares on events:batch publishes (the
-	// X-ShardPilot-Schema-Revision request header). Empty — the default —
-	// declares DefaultSchemaRevision, the revision this SDK release was
-	// coordinated against. Set it when running against an ingest deployment
-	// whose schema set differs from that pin (the server reports its own
-	// revision in the same response header once its handshake is armed).
+	// SchemaRevision opts a writer into declaring its ingest schema-set revision
+	// on events:batch requests. Empty (the default) sends no header. Set the
+	// deployed schema's sha256 revision only when the writer is released with it.
 	SchemaRevision string
 
 	// DisableRequestCompression stops the client from gzip-compressing request
@@ -90,13 +86,6 @@ type Config struct {
 	// process on its own after one rejected request, rather than dropping
 	// batches. Set this to skip even that one round-trip.
 	DisableRequestCompression bool
-
-	// DisableSchemaRevision stops the client from declaring a schema-set
-	// revision at all: no X-ShardPilot-Schema-Revision header on any request.
-	// An undeclared revision always passes the server's handshake in every
-	// mode, so this is the no-rebuild escape hatch if an armed enforce-mode
-	// handshake starts rejecting this build's declared revision as stale.
-	DisableSchemaRevision bool
 
 	// APIKey is the publishable client ingest key (`sp_ingest_...`) that
 	// authenticates remote-config fetches: the GET carries
@@ -347,10 +336,7 @@ func normalizeConfig(cfg Config) (Config, error) {
 	cfg.EnvironmentID = strings.TrimSpace(cfg.EnvironmentID)
 	cfg.UserID = strings.TrimSpace(cfg.UserID)
 	cfg.AnonymousID = strings.TrimSpace(cfg.AnonymousID)
-	// The server trims the declared revision before comparing; trimming here
-	// keeps a whitespace-padded override equal to its trimmed form (and a
-	// whitespace-only override falls back to the default — use
-	// DisableSchemaRevision to stop declaring).
+	// A blank revision keeps declaration disabled.
 	cfg.SchemaRevision = strings.TrimSpace(cfg.SchemaRevision)
 	cfg.APIKey = strings.TrimSpace(cfg.APIKey)
 	cfg.RemoteConfigURL = strings.TrimSpace(cfg.RemoteConfigURL)

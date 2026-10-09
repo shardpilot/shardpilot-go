@@ -83,13 +83,7 @@
 // counsel confirmation, so the resolver's initial release has no code path
 // that can emit it.
 //
-// ⚠ AND THE REASON THAT MATRIX IS PENDING IS A FACT ABOUT ITS PROVENANCE, not
-// a scheduling delay. Owner statement of 2026-09-18 (rendering): the
-// jurisdiction table — which countries are opt-in and which are opt-out — has
-// NO counsel confirmation outside this repository; it was prepared as an AI
-// draft (Fable 5.1). So the table is a drafting input, not a legal
-// classification, and nothing in this package may treat a row as permission.
-// That is why the conservative rule above is the whole design rather than a
-// placeholder: STRICT is not a temporary default waiting for the table to be
-// filled in, it is what an unconfirmed table can support.
+// Jurisdiction estimates are advisory, not permission to process data. Until
+// the applicable policy is confirmed, the restrictive defaults remain in
+// force; a table entry never relaxes them.
 package consentpolicy
