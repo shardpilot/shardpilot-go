@@ -2,6 +2,21 @@
 
 ## v0.8.0-alpha — release preparation (not published)
 
+- Both analytics consent setters now return `(ConsentResult, error)`. Nil error
+  means the local decision applied; `Warnings` identifies unfinished record,
+  receipt or purge work. Denial with an invalid actor applies locally with
+  `consent_actor_invalid` and sends no receipt; an invalid-actor grant is refused.
+  Grants wait for prior purge debt to settle, and shutdown/uninitialized calls
+  are refused without applying a decision. Ordinary denial under forced-minor
+  consent succeeds as a no-op, preserving the state, record and owed work with
+  no new receipt. Ordinary grants remain refused after purge recovery and a
+  restart with `SpoolDir`; the existing persisted state spelling is unchanged.
+
+  | Previous call | Migration |
+  |---|---|
+  | `client.SetConsent(granted)` | Read `result, err := client.SetConsent(granted)`; handle refusal before inspecting `result.Warnings`. |
+  | `err := client.SetConsentDecision(decision)` | Use `result, err := client.SetConsentDecision(decision)` and inspect `result.Warnings` after a nil error. |
+
 - Rename the analytics consent getter to `Client.ConsentState()`, returning the
   existing `ConsentState` named string. All four values and read-only behavior
   are unchanged; a zero-value client reports `unknown`. Remove `Client.Consent()`

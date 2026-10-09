@@ -80,9 +80,9 @@ type Client struct {
 
 	// The consent ticket line serializes the SLOW half of SetConsent — disk
 	// persistence and the sender handoff — in the exact order the fast
-	// halves took effect, WITHOUT making intake or a later decision's
+	// halves were admitted, WITHOUT making intake or a later decision's
 	// in-memory flip wait behind an earlier decision's fsync. Tickets are
-	// assigned under lifecycleMu together with the in-memory flip (so the
+	// assigned under lifecycleMu together with each immediate denial (so the
 	// ticket order IS the decision order), and each decision waits for its
 	// ticket before touching disk: the persisted record and the transmitted
 	// sequence always agree with the in-memory order — the last decision's
@@ -102,8 +102,7 @@ type Client struct {
 	// record write, spool purge, and transmission handoff must not be
 	// abandoned by teardown (a stranded enqueue would silently never
 	// transmit; an interrupted denial could leave a stale granted record on
-	// disk). Decisions arriving after Close keep today's documented
-	// applied-locally-only behavior and are not fenced.
+	// disk). Decisions arriving after Close are refused before taking a ticket.
 	consentDecisionsWG sync.WaitGroup
 
 	trackWG       sync.WaitGroup
@@ -237,12 +236,12 @@ type Client struct {
 	consentWake chan struct{}
 
 	// consentGrantArming counts floor GRANT decisions whose receipt is not
-	// yet appended to the outbox: the fast half flips the live state to
-	// granted BEFORE the ticket-ordered slow half appends the receipt, and
+	// yet appended to the outbox: once prior purge work is settled, the slow
+	// half flips live state before appending the receipt, and
 	// in that window a concurrent Track/worker flush would see granted with
 	// an empty outbox — an unarmed gate — and ship a batch BEFORE the grant
 	// receipt exists. The counter arms the dispatch gate across the window
-	// (incremented with the state flip under lifecycleMu, decremented once
+	// (incremented at admission under lifecycleMu, decremented once
 	// the slow half has appended the receipt — or established that none
 	// will exist), so the event path reopens only once the receipt is the
 	// gate's own source of truth: receipt-armed-before-observable-grant,
@@ -392,6 +391,15 @@ func NewClient(cfg Config) (*Client, error) {
 	}
 	client.consentTurnCond = sync.NewCond(&client.consentTurnMu)
 	client.consentGate.Store(newConsentGateState())
+
+	// A stored forced-minor restriction survives either mode. This read
+	// can only close analytics; it never grants permission or changes dir
+	// permissions. Other floor-off consent states remain memory-only.
+	if normalized.ConsentFloor == nil && normalized.SpoolDir != "" {
+		if state, ok := loadConsentRecord(normalized.SpoolDir, consentActorDigest(normalized)); ok && state == ConsentDeniedForcedMinor {
+			client.consent.Store(consentStateDeniedForcedMinor)
+		}
+	}
 
 	// Consent-floor init runs FIRST when the floor is opted in: it resolves
 	// the LIVE consent truth — the outbox reload, the identity contract, the

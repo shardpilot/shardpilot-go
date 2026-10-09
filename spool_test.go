@@ -1038,27 +1038,20 @@ func TestSpoolPurgeFailureOwesWipeFailClosed(t *testing.T) {
 
 	// Grant while the wipe still fails: the wipe is retried FIRST, the
 	// persisted decision stays denied, and appends stay refused.
-	client.SetConsent(true)
+	if _, err := client.SetConsent(true); !errors.Is(err, ErrSpoolPurgeFailed) {
+		t.Fatalf("expected purge refusal, got %v", err)
+	}
 	if state2, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || state2 != ConsentDenied {
 		t.Fatalf("expected the persisted decision to stay denied while the wipe is owed, got %v %v", state2, ok)
 	}
 	if stats := client.Snapshot(); stats.LastError != "spool_purge_failed" {
 		t.Fatalf("expected spool_purge_failed surfaced on the failed re-grant, got %q", stats.LastError)
 	}
-	// Let the worker observe the denial epoch and discard its condemned held
-	// batch before fresh post-grant events are enqueued (a fresh event merged
-	// into a still-condemned held batch is dropped with it by design).
+	if err := client.Enqueue(Event{ID: "evt-owed-2", Name: "e2"}); !errors.Is(err, ErrConsentDenied) {
+		t.Fatalf("refused re-grant admitted analytics: %v", err)
+	}
 	if err := client.Flush(context.Background()); err != nil {
-		t.Fatalf("epoch-settling flush: %v", err)
-	}
-	if err := client.Enqueue(Event{ID: "evt-owed-2", Name: "e2"}); err != nil {
-		t.Fatalf("Enqueue: %v", err)
-	}
-	if err := client.Flush(context.Background()); err == nil {
-		t.Fatalf("expected the retriable failure surfaced")
-	}
-	if letters := recorder.byReason(SpoolDropConsent); len(letters) == 0 {
-		t.Fatalf("expected the owed-wipe append refusal dead-lettered as consent")
+		t.Fatalf("denied flush: %v", err)
 	}
 
 	// The failure clears: the next grant settles the wipe and re-opens.
@@ -1072,6 +1065,9 @@ func TestSpoolPurgeFailureOwesWipeFailClosed(t *testing.T) {
 	}
 	if state2, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || state2 != ConsentGranted {
 		t.Fatalf("expected the granted record written after the wipe, got %v %v", state2, ok)
+	}
+	if err := client.Enqueue(Event{ID: "evt-recovered", Name: "e2"}); err != nil {
+		t.Fatalf("recovered grant refused intake: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
 		t.Fatalf("expected the retriable failure surfaced")

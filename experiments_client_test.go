@@ -511,7 +511,7 @@ func TestGrantedOnlyGatesWithConsentFloor(t *testing.T) {
 
 	// Forced-minor: the consumer is fully OFF (AC-8) — zero experiment
 	// traffic on both planes.
-	if err := client.SetConsentDecision(ConsentDecisionDeniedForcedMinor); err != nil {
+	if _, err := client.SetConsentDecision(ConsentDecisionDeniedForcedMinor); err != nil {
 		t.Fatalf("SetConsentDecision: %v", err)
 	}
 	if _, err := client.FetchExperimentAssignment(context.Background(), expTestScopeKey, nil); !errors.Is(err, ErrConsentDenied) {
@@ -525,13 +525,20 @@ func TestGrantedOnlyGatesWithConsentFloor(t *testing.T) {
 		t.Fatalf("forced-minor must produce zero experiment traffic, saw %d", script.requestCount())
 	}
 
-	// Granted: the plane opens.
-	if err := client.SetConsentDecision(ConsentDecisionGranted); err != nil {
-		t.Fatalf("SetConsentDecision: %v", err)
+	if _, err := client.SetConsentDecision(ConsentDecisionGranted); !errors.Is(err, ErrConsentForcedMinor) {
+		t.Fatalf("ordinary grant reopened forced-minor consent: %v", err)
 	}
-	fetchAssignment(t, client, expTestScopeKey)
+	// A separate unrestricted client is the healthy grant control.
+	granted := newExperimentClient(t, server.URL, func(cfg *Config) {
+		cfg.ConsentFloor = &ConsentFloorConfig{}
+	})
+	defer granted.Close(context.Background())
+	if _, err := granted.SetConsentDecision(ConsentDecisionGranted); err != nil {
+		t.Fatal(err)
+	}
+	fetchAssignment(t, granted, expTestScopeKey)
 	if script.requestCount() != 1 {
-		t.Fatalf("expected the granted fetch to reach the server")
+		t.Fatalf("expected the unrestricted granted fetch to reach the server")
 	}
 }
 
@@ -1568,7 +1575,7 @@ func TestExperimentFactsGateOnAnonymousActorUnderFloor(t *testing.T) {
 		}
 	})
 	defer client.Close(context.Background())
-	if err := client.SetConsentDecision(ConsentDecisionGranted); err != nil {
+	if _, err := client.SetConsentDecision(ConsentDecisionGranted); err != nil {
 		t.Fatalf("grant: %v", err)
 	}
 
@@ -1605,7 +1612,7 @@ func TestExperimentFactsGateOnAnonymousActorUnderFloor(t *testing.T) {
 		cfg.ConsentFloor = &ConsentFloorConfig{}
 	})
 	defer client2.Close(context.Background())
-	if err := client2.SetConsentDecision(ConsentDecisionGranted); err != nil {
+	if _, err := client2.SetConsentDecision(ConsentDecisionGranted); err != nil {
 		t.Fatalf("grant: %v", err)
 	}
 	fetchAndApply(t, client2, expTestScopeKey)

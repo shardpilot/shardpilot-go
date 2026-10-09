@@ -1409,6 +1409,7 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 			return !consentMarkSupersededBy(record, tail.DecidedAt)
 		}
 		if tail, ok := c.consentOutbox.latestMatching(c.consentReceiptInScope); ok &&
+			state != ConsentDeniedForcedMinor &&
 			!tailBlockedByUnusableTrail(tail) &&
 			(!recordOK || consentReceiptSupersedesRecord(tail.DecidedAt, record)) {
 			tailDecision := ConsentDecisionDenied
@@ -1773,7 +1774,7 @@ func (c *Client) retryOwedConsentRecord() {
 			}
 		}
 		var persisted bool
-		deadLetters, persisted = c.applySpoolConsent(owed.decision, owed.decidedAt)
+		deadLetters, persisted, _ = c.applySpoolConsent(owed.decision, owed.decidedAt)
 		c.setConsentRecordOwed(owed.decision, owed.decidedAt, persisted)
 	}()
 	// Emit outside the lock: the callback is integrator code and may call

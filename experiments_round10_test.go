@@ -111,7 +111,13 @@ func TestRacingDenialAbortsSubjectMintCommit(t *testing.T) {
 				t.Fatalf("the racing denial's mint persisted a spcid_ subject file for a refused session (stat err=%v)", err)
 			}
 
-			// Heals: a real re-grant mints fresh and the plane serves.
+			if flavor.state == consentStateDeniedForcedMinor {
+				if _, err := client.SetConsent(true); !errors.Is(err, ErrConsentForcedMinor) {
+					t.Fatalf("forced-minor grant was not refused: %v", err)
+				}
+				return
+			}
+			// An ordinary denial heals: a real re-grant mints fresh and serves.
 			client.SetConsent(true)
 			result := fetchAssignment(t, client, expTestScopeKey)
 			if !result.Assigned {

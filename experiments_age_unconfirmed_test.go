@@ -464,7 +464,7 @@ func TestTheForcedMinorFloorStaysClosedForAnAdultDeclaration(t *testing.T) {
 		defer server.Close()
 		client := ageClient(t, server.URL, t.TempDir())
 		defer client.Close(context.Background())
-		if err := client.SetConsentDecision(ConsentDecisionDeniedForcedMinor); err != nil {
+		if _, err := client.SetConsentDecision(ConsentDecisionDeniedForcedMinor); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := client.FetchExperimentAssignmentWithAgeBand(context.Background(), ageGoldenExperiment, ExperimentAgeBandAdult, nil); !errors.Is(err, ErrConsentDenied) {
@@ -484,7 +484,7 @@ func TestTheForcedMinorFloorStaysClosedForAnAdultDeclaration(t *testing.T) {
 		if variant, _ := rig.client.ApplyExperimentVariant(ageGoldenExperiment); variant != "control" {
 			t.Fatalf("setup: apply served %q", variant)
 		}
-		if err := rig.client.SetConsentDecision(ConsentDecisionDeniedForcedMinor); err != nil {
+		if _, err := rig.client.SetConsentDecision(ConsentDecisionDeniedForcedMinor); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := rig.client.FetchExperimentAssignmentWithAgeBand(context.Background(), ageGoldenExperiment, ExperimentAgeBandAdult, nil); !errors.Is(err, ErrConsentDenied) {

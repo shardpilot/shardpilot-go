@@ -1853,7 +1853,7 @@ func TestRemoteConfigAttributePassThroughConsentGate(t *testing.T) {
 	denied.Close(context.Background())
 	minor := newAttributeClient(t, true)
 	minor.SetRemoteConfigAttributes(attributes)
-	if err := minor.SetConsentDecision(ConsentDecisionDeniedForcedMinor); err != nil {
+	if _, err := minor.SetConsentDecision(ConsentDecisionDeniedForcedMinor); err != nil {
 		t.Fatalf("SetConsentDecision: %v", err)
 	}
 	if query := fetchQuery(t, minor); query != "" {

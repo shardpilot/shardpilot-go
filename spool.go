@@ -2949,20 +2949,20 @@ func (c *Client) initSpool() []SpoolDeadLetter {
 // state was already stored before this runs, so the spool's own gates
 // (append's allowed re-check, owed-wipe) see the decided state under their
 // own lock. Returns the dead-letters for the caller to emit after releasing
-// the turn, and whether the decision RECORD is durably persisted (true with
+// the turn, whether the decision RECORD is durably persisted, and whether
+// the purge is complete. Persistence is true with
 // no spool at all — nothing to persist; under the consent floor a false
-// return owes the record write, retried at every dispatch point). Denial:
+// return owes the record write, retried at every dispatch point. Denial:
 // the spool is purged (a failed purge owes a wipe and fails closed) and the
 // denied record is written regardless. Grant: an owed wipe is retried FIRST
-// — while it still fails, the persisted decision stays denied and the live
-// in-memory grant applies per the open posture — then the granted record is
+// — the setter refuses a grant while that debt remains — then the record is
 // persisted, and only a SUCCESSFUL persist opens spool writes
 // (grantPersisted): a grant whose record could not be written keeps disk
 // closed, so a load on the next start can always trust the record it finds.
-func (c *Client) applySpoolConsent(decision ConsentDecision, decidedAt string) ([]SpoolDeadLetter, bool) {
+func (c *Client) applySpoolConsent(decision ConsentDecision, decidedAt string) ([]SpoolDeadLetter, bool, bool) {
 	s := c.spool
 	if s == nil {
-		return nil, true
+		return nil, true, true
 	}
 	floorAuthored := c.consentFloorEnabled()
 	// Read the injectable file primitives ONCE, under the lock. Every
@@ -3053,9 +3053,9 @@ func (c *Client) applySpoolConsent(decision ConsentDecision, decidedAt string) (
 					// dispatch point.
 					c.logf("shardpilot spool: the wipe-owed marker could not be created (%v); the condemned spool file was removed instead — nothing condemned can reload", markerErr)
 					if len(condemned) == 0 {
-						return nil, false
+						return nil, false, true
 					}
-					return []SpoolDeadLetter{spoolDeadLetterFrom(SpoolDropConsent, condemned)}, false
+					return []SpoolDeadLetter{spoolDeadLetterFrom(SpoolDropConsent, condemned)}, false, true
 				} else {
 					// NOTHING durable could be made — surface it. The live
 					// denial's in-memory condemnation holds for this
@@ -3068,15 +3068,15 @@ func (c *Client) applySpoolConsent(decision ConsentDecision, decidedAt string) (
 					c.stats.setLastError("spool_purge_failed")
 					c.logf("shardpilot spool: neither the denied record, the wipe-owed marker, nor the spool removal could be made durable (marker: %v; record retry: %v); the denial holds in memory and the debt re-derives at every dispatch point", markerErr, retryErr)
 					if len(condemned) == 0 {
-						return nil, false
+						return nil, false, false
 					}
-					return []SpoolDeadLetter{spoolDeadLetterFrom(SpoolDropConsent, condemned)}, false
+					return []SpoolDeadLetter{spoolDeadLetterFrom(SpoolDropConsent, condemned)}, false, false
 				}
 			} else {
 				if len(condemned) == 0 {
-					return nil, false
+					return nil, false, false
 				}
-				return []SpoolDeadLetter{spoolDeadLetterFrom(SpoolDropConsent, condemned)}, false
+				return []SpoolDeadLetter{spoolDeadLetterFrom(SpoolDropConsent, condemned)}, false, false
 			}
 		}
 		dropped, err := s.purge()
@@ -3086,14 +3086,14 @@ func (c *Client) applySpoolConsent(decision ConsentDecision, decidedAt string) (
 		}
 		condemned = append(condemned, dropped...)
 		if len(condemned) == 0 {
-			return nil, recordPersisted
+			return nil, recordPersisted, err == nil
 		}
-		return []SpoolDeadLetter{spoolDeadLetterFrom(SpoolDropConsent, condemned)}, recordPersisted
+		return []SpoolDeadLetter{spoolDeadLetterFrom(SpoolDropConsent, condemned)}, recordPersisted, err == nil
 	}
 	if !s.settleOwedWipe() {
 		c.stats.setLastError("spool_purge_failed")
 		c.logf("shardpilot spool: a spool wipe is still owed; the persisted consent decision stays denied and the disk spool stays disabled until the wipe succeeds")
-		return nil, false
+		return nil, false, false
 	}
 	if err := saveConsentRecord(s.dir, ConsentDecisionGranted, s.actorDigest, decidedAt, floorAuthored, renameFn, chmodFn); err != nil {
 		s.mu.Lock()
@@ -3101,10 +3101,10 @@ func (c *Client) applySpoolConsent(decision ConsentDecision, decidedAt string) (
 		s.mu.Unlock()
 		c.stats.setLastError("consent_record_persist_failed")
 		c.logf("shardpilot spool: persisting the granted consent record failed; the live grant applies but the disk spool stays closed until a persist succeeds: %v", err)
-		return nil, false
+		return nil, false, true
 	}
 	s.mu.Lock()
 	s.grantPersisted = true
 	s.mu.Unlock()
-	return nil, true
+	return nil, true, true
 }

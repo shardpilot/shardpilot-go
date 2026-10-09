@@ -12,6 +12,16 @@ var (
 	ErrQueueFull     = errors.New("shardpilot queue is full")
 	ErrConsentDenied = errors.New("shardpilot analytics consent is denied")
 
+	// ErrNotInitialized refuses setters on a nil or zero-value client.
+	ErrNotInitialized = errors.New("not_initialized: shardpilot client is not initialized")
+	// ErrConsentShutdown refuses a decision after Close has begun.
+	// It also matches ErrClosed through errors.Is.
+	ErrConsentShutdown = fmt.Errorf("shutdown: %w", ErrClosed)
+	// ErrConsentForcedMinor refuses an ordinary grant of restricted consent.
+	ErrConsentForcedMinor = errors.New("consent_forced_minor: ordinary grants cannot reverse forced-minor denial")
+	// ErrSpoolPurgeFailed refuses a grant until earlier purge debt is settled.
+	ErrSpoolPurgeFailed = errors.New("spool_purge_failed: retained analytics still owe a purge")
+
 	// ErrReservedEventName refuses an SDK-owned or runtime-only name at
 	// Track/Enqueue intake. It also matches ErrInvalidEvent through errors.Is.
 	ErrReservedEventName = fmt.Errorf("%w: reserved_event_name", ErrInvalidEvent)
@@ -47,17 +57,13 @@ var (
 	// ErrInvalidConsentDecision is returned by SetConsentDecision for a
 	// decision value that is not ConsentDecisionGranted,
 	// ConsentDecisionDenied, or ConsentDecisionDeniedForcedMinor.
-	ErrInvalidConsentDecision = errors.New("invalid shardpilot consent decision")
+	ErrInvalidConsentDecision = errors.New("invalid_consent: invalid shardpilot consent decision")
 
-	// ErrInvalidConsentIdentity rejects a consent decision under the opt-in
-	// consent floor when a configured identifier (Config.UserID or
-	// Config.AnonymousID) is non-empty but over the 512-byte receipt
-	// clamp: the floor requires in-contract identifiers, because events
-	// stamp the configured identifiers verbatim and a receipt minted for a
-	// substitute actor would authorize a DIFFERENT actor than the events
-	// carry. The decision is rejected whole — reject, never truncate —
-	// and NOTHING is applied. Never returned when the floor is off.
-	ErrInvalidConsentIdentity = errors.New("shardpilot consent identity exceeds the identifier clamp")
+	// ErrInvalidConsentIdentity refuses a grant when a configured actor
+	// identifier exceeds the 512-byte receipt bound. Denial still applies
+	// locally with a consent_actor_invalid warning and no receipt. Neither
+	// mode truncates, rewrites, or substitutes the actor.
+	ErrInvalidConsentIdentity = errors.New("consent_actor_invalid: shardpilot consent identity exceeds the identifier clamp")
 
 	// ErrConsentActorMismatch is returned by Track/Enqueue under the opt-in
 	// consent floor for an event whose per-event UserID/AnonymousID override
