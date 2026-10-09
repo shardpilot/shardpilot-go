@@ -3,6 +3,7 @@ package shardpilot_test
 import (
 	"context"
 	"fmt"
+	"go/version"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -50,10 +51,11 @@ func main() {}
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
 			// Trimmed builds may omit runtime's filesystem paths. Let the Go
-			// launcher locate the same installed toolchain, with downloads off.
+			// launcher select an official version, or its local toolchain for
+			// development builds, with downloads off.
 			cmd := exec.CommandContext(ctx, "go", "build", "-mod=readonly", "-p=1", ".")
 			cmd.Dir = dir
-			cmd.Env = append(os.Environ(), "GOWORK=off", "GOPROXY=off", "GOSUMDB=off", "GOFLAGS=", "GOTOOLCHAIN="+runtime.Version(), "GOMAXPROCS=2", "GOROOT=")
+			cmd.Env = append(os.Environ(), "GOWORK=off", "GOPROXY=off", "GOSUMDB=off", "GOFLAGS=", "GOTOOLCHAIN="+consumerToolchain(runtime.Version()), "GOMAXPROCS=2", "GOROOT=")
 			out, err := cmd.CombinedOutput()
 			if tc.refusal == "" {
 				if err != nil {
@@ -61,6 +63,43 @@ func main() {}
 				}
 			} else if err == nil || !strings.Contains(string(out), tc.refusal) {
 				t.Fatalf("consumer boundary: want %q, got error %v\n%s", tc.refusal, err, out)
+			}
+		})
+	}
+}
+
+func consumerToolchain(v string) string {
+	// Keep official versions exact; custom/development builds need not have
+	// an installable version name. IsValid permits custom suffixes, so exclude them.
+	if version.IsValid(v) && !strings.Contains(v, "-") {
+		return v
+	}
+	return "local"
+}
+
+func TestConsumerToolchain(t *testing.T) {
+	for _, tc := range []struct{ name, version, want string }{
+		{"baseline-release", "go1.25.0", "go1.25.0"},
+		{"current-release", "go1.27.2", "go1.27.2"},
+		{"release-candidate", "go1.28rc1", "go1.28rc1"},
+		{"development", "devel go1.28-abc", "local"},
+		{"commit-build", "abcdef 2026-10-09", "local"},
+		{"custom-build", "go1.27.2-custom", "local"},
+		{"empty", "", "local"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := consumerToolchain(tc.version)
+			if got != tc.want {
+				t.Fatalf("toolchain for %q: got %q, want %q", tc.version, got, tc.want)
+			}
+			if tc.want == "local" {
+				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				defer cancel()
+				cmd := exec.CommandContext(ctx, "go", "version")
+				cmd.Env = append(os.Environ(), "GOTOOLCHAIN="+got, "GOPROXY=off", "GOSUMDB=off", "GOROOT=")
+				if out, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("selected toolchain cannot run: %v\n%s", err, out)
+				}
 			}
 		})
 	}
