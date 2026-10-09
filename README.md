@@ -138,10 +138,10 @@ Pick events whose canonical schema allows your configured `Source`. Session/scre
 
 **Unreleased on main:** emitted crash bodies carry `fatal: true` for `EmitFatal`
 and `fatal: false` for `Emit`; non-fatal reports admitted by the built-in sampler
-also carry `non_fatal_sample_one_in` (10 by default). Custom sampler rates remain
+also carry `non_fatal_sample_one_in` (1 by default). Custom sampler rates remain
 unknown and are omitted. The SDK stamps these fields rather than reading them
 from caller data, and encodes the admitted body once for byte-identical retries.
-The public `crash.Event` and the default 1-in-10 sampling policy are unchanged.
+The public `crash.Event` is unchanged. The default now keeps every non-fatal report.
 
 A runnable example lives in [`examples/crash`](examples/crash). It demonstrates the client API surface with a synthetic stub event; it does not install a panic handler or capture a real crash.
 
@@ -183,7 +183,7 @@ err = client.EmitFatal(ctx, crash.Event{
 })
 ```
 
-`EmitFatal` always sends — fatal crashes are never sampled. `Emit` (non-fatal) is subject to the client sampler, whose default is **deterministic every-10th-call per client** (each `crash.Client` gets its own counter unless you pass a shared `Sampler`: that client's calls 10, 20, 30, … transmit; the first 9 non-fatals of each client are always dropped, so a client that emits fewer than 10 non-fatals in its lifetime reports none — and two clients emitting 5 non-fatals each report none, even though the process emitted 10). A sampled-out `Emit` returns `nil` exactly like a sent one — only the `OnResult` callback (or its absence) tells them apart. Override with the public `Sampler` option (e.g. an allow-all sampler transmits every non-fatal).
+`EmitFatal` bypasses sampling. With the default options, `Emit` also admits every valid non-fatal report, including the first report from each client. Transport failures still return errors, and `OnResult` reports the server result after a successful request. An explicit custom `Sampler` can opt into sampling; its sampled-out `Emit` returns `nil` without a request or result callback. The built-in keep-all rate is stamped as `non_fatal_sample_one_in: 1`; custom sampler rates remain unknown and omitted.
 
 Crash and module platforms use the same twelve values as analytics: `windows`,
 `macos`, `linux`, `android`, `ios`, `tvos`, `web`, `ps4`, `ps5`, `xbox`, `switch`,
