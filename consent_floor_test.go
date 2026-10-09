@@ -399,7 +399,7 @@ func TestConsentFloorReceiptRetainedAcrossRestartAndResentVerbatim(t *testing.T)
 	// before any batch, and the reloaded grant itself is the gate.
 	state.setConsentOutcome(http.StatusOK, "")
 	restarted := newFloorTestClient(t, server.URL, dir, nil)
-	if got := restarted.Consent(); got != ConsentGranted {
+	if got := restarted.ConsentState(); got != ConsentGranted {
 		t.Fatalf("expected the persisted grant as the live state, got %v", got)
 	}
 	if err := restarted.Enqueue(Event{ID: "evt-restart-1", Name: "e1"}); err != nil {
@@ -445,7 +445,7 @@ func TestConsentFloorDecisionTrailDeliversInOrder(t *testing.T) {
 	client := newFloorTestClient(t, server.URL, dir, nil)
 	client.SetConsent(true)
 	client.SetConsent(false)
-	if got := client.Consent(); got != ConsentDenied {
+	if got := client.ConsentState(); got != ConsentDenied {
 		t.Fatalf("expected the denial as the live state, got %v", got)
 	}
 	if err := client.Track(context.Background(), Event{Name: "e1"}); !errors.Is(err, ErrConsentDenied) {
@@ -498,7 +498,7 @@ func TestConsentFloorForcedMinorAC8WholeSession(t *testing.T) {
 	if err := client.SetConsentDecision(ConsentDecisionDeniedForcedMinor); err != nil {
 		t.Fatalf("SetConsentDecision: %v", err)
 	}
-	if got := client.Consent(); got != ConsentDeniedForcedMinor {
+	if got := client.ConsentState(); got != ConsentDeniedForcedMinor {
 		t.Fatalf("expected the forced-minor state, got %v", got)
 	}
 	// Gameplay-shaped usage: everything analytics refuses with the SAME
@@ -541,7 +541,7 @@ func TestConsentFloorForcedMinorAC8WholeSession(t *testing.T) {
 	// A forced-minor RELAUNCH with an empty outbox transmits nothing, and
 	// the state reloads as itself.
 	relaunched := newFloorTestClient(t, server.URL, dir, nil)
-	if got := relaunched.Consent(); got != ConsentDeniedForcedMinor {
+	if got := relaunched.ConsentState(); got != ConsentDeniedForcedMinor {
 		t.Fatalf("expected the forced-minor state reloaded, got %v", got)
 	}
 	if err := relaunched.Flush(context.Background()); err != nil {
@@ -569,7 +569,7 @@ func TestConsentFloorForcedMinorSupersededByGrant(t *testing.T) {
 	if err := client.SetConsentDecision(ConsentDecisionGranted); err != nil {
 		t.Fatalf("SetConsentDecision: %v", err)
 	}
-	if got := client.Consent(); got != ConsentGranted {
+	if got := client.ConsentState(); got != ConsentGranted {
 		t.Fatalf("expected the grant to supersede, got %v", got)
 	}
 	if err := client.Enqueue(Event{ID: "evt-band-1", Name: "e1"}); err != nil {
@@ -611,7 +611,7 @@ func TestSetConsentDecisionRejectsUnknownValues(t *testing.T) {
 	}
 	// NOTHING was applied: the state is still undecided and nothing went to
 	// the wire.
-	if got := client.Consent(); got != ConsentUnknown {
+	if got := client.ConsentState(); got != ConsentUnknown {
 		t.Fatalf("expected an invalid decision to apply nothing, got %v", got)
 	}
 	if got := state.consentCount(); got != 0 {
@@ -630,7 +630,7 @@ func TestSetConsentDecisionForcedMinorWithoutFloor(t *testing.T) {
 	if err := client.SetConsentDecision(ConsentDecisionDeniedForcedMinor); err != nil {
 		t.Fatalf("SetConsentDecision: %v", err)
 	}
-	if got := client.Consent(); got != ConsentDeniedForcedMinor {
+	if got := client.ConsentState(); got != ConsentDeniedForcedMinor {
 		t.Fatalf("expected the forced-minor state, got %v", got)
 	}
 	if err := client.Track(context.Background(), Event{Name: "e1"}); !errors.Is(err, ErrConsentDenied) {
@@ -778,7 +778,7 @@ func TestConsentOutboxGarbledRecordDoesNotCrashAndStaysUndecided(t *testing.T) {
 	client := newFloorTestClient(t, server.URL, dir, nil)
 	// Undecided, not denied: nothing was learned about the actor, so the
 	// floor may not act — and it must not have crashed getting there.
-	if got := client.Consent(); got != ConsentUnknown {
+	if got := client.ConsentState(); got != ConsentUnknown {
 		t.Fatalf("garbled outbox: floor = %v, want ConsentUnknown", got)
 	}
 	if got := client.Snapshot().ConsentOutboxUnreadable; got != 1 {
@@ -814,11 +814,11 @@ func TestConsentOutboxAbsentRecordIsHonestlyEmpty(t *testing.T) {
 	if got := client.Snapshot().ConsentOutboxUnreadable; got != 0 {
 		t.Fatalf("absent outbox counted as unreadable: got %d, want 0", got)
 	}
-	if got := client.Consent(); got != ConsentUnknown {
+	if got := client.ConsentState(); got != ConsentUnknown {
 		t.Fatalf("absent outbox: floor = %v, want ConsentUnknown", got)
 	}
 	client.SetConsent(true)
-	if got := client.Consent(); got != ConsentGranted {
+	if got := client.ConsentState(); got != ConsentGranted {
 		t.Fatalf("absent outbox: after SetConsent(true) floor = %v, want ConsentGranted", got)
 	}
 
@@ -837,7 +837,7 @@ func TestConsentOutboxAbsentRecordIsHonestlyEmpty(t *testing.T) {
 	}
 	proven := newFloorTestClient(t, server.URL, seeded, nil)
 	defer func() { _ = proven.Close(context.Background()) }()
-	if got := proven.Consent(); got != ConsentGranted {
+	if got := proven.ConsentState(); got != ConsentGranted {
 		t.Fatalf("absent outbox beside a proven grant: floor = %v, want ConsentGranted", got)
 	}
 	if got := proven.Snapshot().ConsentOutboxUnreadable; got != 0 {
@@ -895,7 +895,7 @@ func TestConsentFloorRejectsOutOfContractIdentity(t *testing.T) {
 	// NOTHING was applied — not the state, not a receipt, not a wire post —
 	// and the void SetConsent surface rejects identically.
 	client.SetConsent(true)
-	if got := client.Consent(); got != ConsentUnknown {
+	if got := client.ConsentState(); got != ConsentUnknown {
 		t.Fatalf("expected the rejected decision to apply nothing, got %v", got)
 	}
 	if client.consentOutbox.pending() {
@@ -935,7 +935,7 @@ func TestConsentFloorRejectsOutOfContractIdentity(t *testing.T) {
 	if err := dark.SetConsentDecision(ConsentDecisionDenied); err != nil {
 		t.Fatalf("SetConsentDecision with no identity: %v", err)
 	}
-	if got := dark.Consent(); got != ConsentDenied {
+	if got := dark.ConsentState(); got != ConsentDenied {
 		t.Fatalf("expected the decision applied locally, got %v", got)
 	}
 	if err := dark.Close(context.Background()); err != nil {
@@ -1132,7 +1132,7 @@ func TestConsentFloorRefusedTightenStartsFailClosed(t *testing.T) {
 	client.initConsentFloor(os.Rename, func(string, os.FileMode) error {
 		return errors.New("chmod refused")
 	})
-	if got := client.Consent(); got != ConsentUnknown {
+	if got := client.ConsentState(); got != ConsentUnknown {
 		t.Fatalf("a persisted decision from an untightenable dir must not become the live state, got %v", got)
 	}
 	if client.consentOutbox.pending() {
@@ -1165,7 +1165,7 @@ func TestConsentFloorPostCloseDecisionAppliedLocallyOnly(t *testing.T) {
 	// no receipt is minted, retained, or persisted, so nothing transmits
 	// now or at the next launch.
 	client.SetConsent(true)
-	if got := client.Consent(); got != ConsentGranted {
+	if got := client.ConsentState(); got != ConsentGranted {
 		t.Fatalf("expected the post-Close decision applied locally, got %v", got)
 	}
 	if client.consentOutbox.pending() {
@@ -1507,7 +1507,7 @@ func TestConsentFloorFlushDispatchesReceiptsUnderDenial(t *testing.T) {
 	}
 	client.SetConsent(true)
 	client.SetConsent(false)
-	if got := client.Consent(); got != ConsentDenied {
+	if got := client.ConsentState(); got != ConsentDenied {
 		t.Fatalf("expected the denied state, got %v", got)
 	}
 	if got := state.consentCount(); got != 0 {
@@ -1600,7 +1600,7 @@ func TestConsentFloorPostCloseDecisionLeavesNoDurableState(t *testing.T) {
 	if err := client.SetConsentDecision(ConsentDecisionDenied); err != nil {
 		t.Fatalf("SetConsentDecision: %v", err)
 	}
-	if got := client.Consent(); got != ConsentDenied {
+	if got := client.ConsentState(); got != ConsentDenied {
 		t.Fatalf("expected the post-Close decision applied in memory, got %v", got)
 	}
 	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentGranted {
@@ -1611,7 +1611,7 @@ func TestConsentFloorPostCloseDecisionLeavesNoDurableState(t *testing.T) {
 	// new.
 	posts := state.consentCount()
 	relaunched := newFloorTestClient(t, server.URL, dir, nil)
-	if got := relaunched.Consent(); got != ConsentGranted {
+	if got := relaunched.ConsentState(); got != ConsentGranted {
 		t.Fatalf("expected the pre-Close persisted state as the live state, got %v", got)
 	}
 	if err := relaunched.Close(context.Background()); err != nil {
@@ -1680,7 +1680,7 @@ func TestConsentFloorTrailTailOverridesStaleRecord(t *testing.T) {
 	// arms no gate). The trail tail is the newer truth: the floor starts
 	// DENIED, and the stale record heals to denied on disk.
 	relaunched := newFloorTestClient(t, server.URL, dir, nil)
-	if got := relaunched.Consent(); got != ConsentDenied {
+	if got := relaunched.ConsentState(); got != ConsentDenied {
 		t.Fatalf("expected the trail tail to override the stale granted record, got %v", got)
 	}
 	if err := relaunched.Track(context.Background(), Event{Name: "e1"}); !errors.Is(err, ErrConsentDenied) {
@@ -1742,7 +1742,7 @@ func TestConsentFloorGrantNotObservableBeforeReceiptArmed(t *testing.T) {
 		client.SetConsent(true)
 	}()
 	waitFor(t, 3*time.Second, "the grant observable in the live state", func() bool {
-		return client.Consent() == ConsentGranted
+		return client.ConsentState() == ConsentGranted
 	})
 
 	// The grant is OBSERVABLE but its receipt does not exist yet: the
@@ -1835,7 +1835,7 @@ func TestConsentFloorReloadRefusesOutOfContractIdentity(t *testing.T) {
 	// the persisted grant is NOT loaded — the floor starts undecided,
 	// distinctly diagnosed — so out-of-contract identifiers never publish
 	// past the decision-time gate via a persisted state.
-	if got := client.Consent(); got != ConsentUnknown {
+	if got := client.ConsentState(); got != ConsentUnknown {
 		t.Fatalf("expected the out-of-contract reload refused, got %v", got)
 	}
 	if got := client.Snapshot().LastError; got != "consent_identity_invalid" {
@@ -1941,7 +1941,7 @@ func TestConsentFloorStaleGrantNeverResendsSpooledEvents(t *testing.T) {
 	// resent.
 	state.setBatchOutcome(0)
 	relaunched := newFloorTestClient(t, server.URL, dir, nil)
-	if got := relaunched.Consent(); got != ConsentDenied {
+	if got := relaunched.ConsentState(); got != ConsentDenied {
 		t.Fatalf("expected the trail-tail denial resolved before the spool, got %v", got)
 	}
 	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentDenied {
@@ -2014,7 +2014,7 @@ func TestConsentFloorUnconfirmedGrantPurgesSpoolAtInit(t *testing.T) {
 	relaunched := newFloorTestClient(t, server.URL, dir, func(cfg *Config) {
 		cfg.UserID = oversized
 	})
-	if got := relaunched.Consent(); got != ConsentUnknown {
+	if got := relaunched.ConsentState(); got != ConsentUnknown {
 		t.Fatalf("expected the refused reload undecided, got %v", got)
 	}
 	if _, err := os.Stat(filepath.Join(dir, spoolFileName)); !errors.Is(err, os.ErrNotExist) {
@@ -2052,7 +2052,7 @@ func TestConsentFloorGrantRecordWithheldWhenReceiptNotDurable(t *testing.T) {
 	// record, empty outbox" (which would flow events receipt-less at the
 	// next launch).
 	client.SetConsent(true)
-	if got := client.Consent(); got != ConsentGranted {
+	if got := client.ConsentState(); got != ConsentGranted {
 		t.Fatalf("expected the live grant applied in memory, got %v", got)
 	}
 	if got := client.Snapshot().ConsentOutboxPersistFailed; got == 0 {
@@ -2070,7 +2070,7 @@ func TestConsentFloorGrantRecordWithheldWhenReceiptNotDurable(t *testing.T) {
 	// The next launch restores the PRIOR state — fail-closed undecided —
 	// not a receipt-less grant.
 	relaunched := newFloorTestClient(t, server.URL, dir, nil)
-	if got := relaunched.Consent(); got != ConsentUnknown {
+	if got := relaunched.ConsentState(); got != ConsentUnknown {
 		t.Fatalf("expected the relaunch fail-closed undecided, got %v", got)
 	}
 	if err := relaunched.Track(context.Background(), Event{Name: "e1"}); !errors.Is(err, ErrConsentUnknown) {
@@ -2098,7 +2098,7 @@ func TestConsentFloorGrantReceiptTailRestoresGrantAndHealsRecord(t *testing.T) {
 	}
 
 	client := newFloorTestClient(t, server.URL, dir, nil)
-	if got := client.Consent(); got != ConsentGranted {
+	if got := client.ConsentState(); got != ConsentGranted {
 		t.Fatalf("expected the grant restored from the trail tail, got %v", got)
 	}
 	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentGranted {
@@ -2147,7 +2147,7 @@ func TestConsentFloorCrossScopeTailNeverFlipsState(t *testing.T) {
 			}
 
 			client := newFloorTestClient(t, server.URL, dir, nil)
-			if got := client.Consent(); got != ConsentDenied {
+			if got := client.ConsentState(); got != ConsentDenied {
 				t.Fatalf("expected the correctly-scoped denial to rule, got %v", got)
 			}
 			if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentDenied {
@@ -2318,7 +2318,7 @@ func TestConsentFloorForeignTailDoesNotHideInScopeProof(t *testing.T) {
 	}
 
 	client := newFloorTestClient(t, server.URL, dir, nil)
-	if got := client.Consent(); got != ConsentDenied {
+	if got := client.ConsentState(); got != ConsentDenied {
 		t.Fatalf("expected the latest IN-SCOPE receipt to override the stale grant, got %v", got)
 	}
 	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentDenied {
@@ -2440,7 +2440,7 @@ func TestConsentFloorHeldDenyProofRestoresDenialAcrossRestart(t *testing.T) {
 	}
 
 	relaunched := newFloorTestClient(t, server.URL, dir, nil)
-	if got := relaunched.Consent(); got != ConsentDenied {
+	if got := relaunched.ConsentState(); got != ConsentDenied {
 		t.Fatalf("expected the held proof to restore the denial, got %v", got)
 	}
 	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentDenied {
@@ -2498,7 +2498,7 @@ func TestConsentFloorWithheldGrantRecordCompletesOnRetry(t *testing.T) {
 	// The relaunch restores the grant from the RECORD — the receipt is long
 	// pruned, and without the completed pair this would start unknown.
 	relaunched := newFloorTestClient(t, server.URL, dir, nil)
-	if got := relaunched.Consent(); got != ConsentGranted {
+	if got := relaunched.ConsentState(); got != ConsentGranted {
 		t.Fatalf("expected the completed record to restore the grant, got %v", got)
 	}
 	if err := relaunched.Close(context.Background()); err != nil {
@@ -2577,7 +2577,7 @@ func TestConsentFloorRecordScopedToApp(t *testing.T) {
 	}
 
 	client := newFloorTestClient(t, server.URL, dir, nil)
-	if got := client.Consent(); got != ConsentUnknown {
+	if got := client.ConsentState(); got != ConsentUnknown {
 		t.Fatalf("expected the app-foreign record refused (undecided), got %v", got)
 	}
 	if err := client.Track(context.Background(), Event{Name: "e1"}); !errors.Is(err, ErrConsentUnknown) {
@@ -2685,7 +2685,7 @@ func TestConsentFloorStaleAckedReceiptCannotOverrideNewerDenial(t *testing.T) {
 	// Relaunch: the stale acked grant receipt on disk is OLDER than the
 	// record's decision — it must NOT flip the state back to granted.
 	relaunched := newFloorTestClient(t, server.URL, dir, nil)
-	if got := relaunched.Consent(); got != ConsentDenied {
+	if got := relaunched.ConsentState(); got != ConsentDenied {
 		t.Fatalf("expected the newer denied record to rule over the stale acked receipt, got %v", got)
 	}
 	if err := relaunched.Track(context.Background(), Event{Name: "e1"}); !errors.Is(err, ErrConsentDenied) {
@@ -2720,7 +2720,7 @@ func TestConsentFloorLegacyGrantRecordUnproven(t *testing.T) {
 	// grant: the floor starts undecided (distinctly diagnosed), the spool
 	// purges under the unconfirmed grant, and the session stays dark.
 	client := newFloorTestClient(t, server.URL, dir, nil)
-	if got := client.Consent(); got != ConsentUnknown {
+	if got := client.ConsentState(); got != ConsentUnknown {
 		t.Fatalf("expected the unproven legacy grant refused, got %v", got)
 	}
 	if got := client.Snapshot().LastError; got != "consent_record_unproven" {
@@ -2750,7 +2750,7 @@ func TestConsentFloorLegacyGrantRecordUnproven(t *testing.T) {
 		t.Fatalf("write legacy denied record: %v", err)
 	}
 	deniedClient := newFloorTestClient(t, server.URL, deniedDir, nil)
-	if got := deniedClient.Consent(); got != ConsentDenied {
+	if got := deniedClient.ConsentState(); got != ConsentDenied {
 		t.Fatalf("expected the legacy denial honored, got %v", got)
 	}
 	if err := deniedClient.Close(context.Background()); err != nil {
@@ -2791,7 +2791,7 @@ func TestConsentFloorFailedHealRegistersOwedDenial(t *testing.T) {
 		return os.Rename(oldpath, newpath)
 	}, os.Chmod)
 
-	if got := client.Consent(); got != ConsentDenied {
+	if got := client.ConsentState(); got != ConsentDenied {
 		t.Fatalf("expected the trail-derived denial applied in memory, got %v", got)
 	}
 	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentGranted {
@@ -2825,7 +2825,7 @@ func TestConsentFloorRestartReopensSpoolWriteGate(t *testing.T) {
 	// gate must reopen with it: a retriable failure after restart spools
 	// durably instead of dead-lettering until a fresh SetConsent(true).
 	relaunched := newFloorTestClient(t, server.URL, dir, nil)
-	if got := relaunched.Consent(); got != ConsentGranted {
+	if got := relaunched.ConsentState(); got != ConsentGranted {
 		t.Fatalf("expected the persisted grant live after restart, got %v", got)
 	}
 	state.setBatchOutcome(http.StatusServiceUnavailable)
@@ -3123,7 +3123,7 @@ func TestConsentFloorReloadSeedsStampsPastPersistedState(t *testing.T) {
 	}
 
 	client := newFloorTestClient(t, server.URL, dir, nil)
-	if got := client.Consent(); got != ConsentGranted {
+	if got := client.ConsentState(); got != ConsentGranted {
 		t.Fatalf("expected the proven grant loaded, got %v", got)
 	}
 
@@ -3153,7 +3153,7 @@ func TestConsentFloorReloadSeedsStampsPastPersistedState(t *testing.T) {
 	// Without the seeded stamp floor the deny receipt would read OLDER
 	// than the record and the stale grant would rule the relaunch.
 	relaunched := newFloorTestClient(t, server.URL, dir, nil)
-	if got := relaunched.Consent(); got != ConsentDenied {
+	if got := relaunched.ConsentState(); got != ConsentDenied {
 		t.Fatalf("expected the seeded-stamp denial to out-order the future-stamped record, got %v", got)
 	}
 	if err := relaunched.Close(context.Background()); err != nil {
@@ -3241,7 +3241,7 @@ func TestConsentFloorProofReceiptPromotesUnprovenGrantRecord(t *testing.T) {
 	}
 
 	client := newFloorTestClient(t, server.URL, dir, nil)
-	if got := client.Consent(); got != ConsentGranted {
+	if got := client.ConsentState(); got != ConsentGranted {
 		t.Fatalf("expected the proof receipt to promote the same-state grant, got %v", got)
 	}
 	info, ok := loadConsentRecordInfo(dir, spoolTestActorDigest())
@@ -3292,7 +3292,7 @@ func TestConsentOutboxMalformedStampDroppedAndNeverReloadTruth(t *testing.T) {
 	}
 
 	client := newFloorTestClient(t, server.URL, dir, nil)
-	if got := client.Consent(); got != ConsentDenied {
+	if got := client.ConsentState(); got != ConsentDenied {
 		t.Fatalf("expected the VALID deny as reload truth (malformed grant dropped), got %v", got)
 	}
 	if err := client.Track(context.Background(), Event{Name: "e1"}); !errors.Is(err, ErrConsentDenied) {
@@ -3355,7 +3355,7 @@ func TestConsentFloorOwedGrantHoldSurvivesNewerOwedDenialOverwrite(t *testing.T)
 		t.Fatalf("expected the trail still held through Close, got %d consent posts", got)
 	}
 	relaunched := newFloorTestClient(t, server.URL, dir, nil)
-	if got := relaunched.Consent(); got != ConsentDenied {
+	if got := relaunched.ConsentState(); got != ConsentDenied {
 		t.Fatalf("expected the trail-derived denial live after relaunch, got %v", got)
 	}
 	waitFor(t, 3*time.Second, "the retained trail re-sent in order", func() bool {
@@ -3455,7 +3455,7 @@ func TestConsentFloorMintFailureWithholdsAndRetries(t *testing.T) {
 	client.consentOwedMu.Unlock()
 
 	client.SetConsent(true)
-	if got := client.Consent(); got != ConsentGranted {
+	if got := client.ConsentState(); got != ConsentGranted {
 		t.Fatalf("expected the decision applied locally, got %v", got)
 	}
 	if _, ok := loadConsentRecord(dir, spoolTestActorDigest()); ok {
@@ -3571,7 +3571,7 @@ func TestConsentFloorCorruptStampFloorRecordReadsAbsent(t *testing.T) {
 	bareDir := t.TempDir()
 	writeFloorRecord(t, bareDir, "not-a-time")
 	bare := newFloorTestClient(t, server.URL, bareDir, nil)
-	if got := bare.Consent(); got != ConsentUnknown {
+	if got := bare.ConsentState(); got != ConsentUnknown {
 		t.Fatalf("expected the corrupt-stamp record to start the floor undecided, got %v", got)
 	}
 	if err := bare.Track(context.Background(), Event{Name: "e1"}); !errors.Is(err, ErrConsentUnknown) {
@@ -3593,7 +3593,7 @@ func TestConsentFloorCorruptStampFloorRecordReadsAbsent(t *testing.T) {
 		t.Fatalf("seeding the deny receipt failed")
 	}
 	healed := newFloorTestClient(t, server.URL, healDir, nil)
-	if got := healed.Consent(); got != ConsentDenied {
+	if got := healed.ConsentState(); got != ConsentDenied {
 		t.Fatalf("expected the durable deny receipt to beat the corrupt grant record, got %v", got)
 	}
 	info, ok := loadConsentRecordInfo(healDir, spoolTestActorDigest())
@@ -3948,7 +3948,7 @@ func TestConsentFloorCorruptStampFloorDenialStaysDenied(t *testing.T) {
 		t.Fatalf("seeding the stale grant receipt failed")
 	}
 	client := newFloorTestClient(t, server.URL, dir, nil)
-	if got := client.Consent(); got != ConsentDenied {
+	if got := client.ConsentState(); got != ConsentDenied {
 		t.Fatalf("expected the corrupt-stamped denial to rule the reload, got %v", got)
 	}
 	if err := client.Track(context.Background(), Event{Name: "e1"}); !errors.Is(err, ErrConsentDenied) {
@@ -3958,7 +3958,7 @@ func TestConsentFloorCorruptStampFloorDenialStaysDenied(t *testing.T) {
 	if got := state.consentCount(); got != 0 {
 		t.Fatalf("expected the stale grant RETAINED under the denied state, got %d posts", got)
 	}
-	if got := client.Consent(); got != ConsentDenied {
+	if got := client.ConsentState(); got != ConsentDenied {
 		t.Fatalf("expected the denial to survive the pass, got %v", got)
 	}
 	if err := client.Close(context.Background()); err != nil {
@@ -3993,7 +3993,7 @@ func TestConsentFloorLegacyRecordSupersededByStampedProof(t *testing.T) {
 		t.Fatalf("seeding the deny receipt failed")
 	}
 	deniedClient := newFloorTestClient(t, server.URL, deniedDir, nil)
-	if got := deniedClient.Consent(); got != ConsentDenied {
+	if got := deniedClient.ConsentState(); got != ConsentDenied {
 		t.Fatalf("expected the stamped denial proof to supersede the legacy grant, got %v", got)
 	}
 	info, ok := loadConsentRecordInfo(deniedDir, spoolTestActorDigest())
@@ -4014,7 +4014,7 @@ func TestConsentFloorLegacyRecordSupersededByStampedProof(t *testing.T) {
 		t.Fatalf("seeding the grant receipt failed")
 	}
 	grantedClient := newFloorTestClient(t, server.URL, grantedDir, nil)
-	if got := grantedClient.Consent(); got != ConsentGranted {
+	if got := grantedClient.ConsentState(); got != ConsentGranted {
 		t.Fatalf("expected the stamped grant proof to supersede the legacy denial, got %v", got)
 	}
 	info, ok = loadConsentRecordInfo(grantedDir, spoolTestActorDigest())
@@ -4199,7 +4199,7 @@ func TestConsentFloorFailedHealPreservesResolvedGrantSpool(t *testing.T) {
 		}
 		return os.Rename(oldpath, newpath)
 	}, os.Chmod)
-	if got := client.Consent(); got != ConsentGranted {
+	if got := client.ConsentState(); got != ConsentGranted {
 		t.Fatalf("test shape: expected the proof-resolved grant, got %v", got)
 	}
 	if owed := client.consentRecordOwedSnapshot(); owed == nil || owed.decision != ConsentDecisionGranted {
@@ -4451,7 +4451,7 @@ func TestConsentFloorChangedAnonymousIDReceiptOutOfScope(t *testing.T) {
 		cfg.UserID = "user-1"
 		cfg.AnonymousID = "anon-B"
 	})
-	if got := client.Consent(); got != ConsentUnknown {
+	if got := client.ConsentState(); got != ConsentUnknown {
 		t.Fatalf("expected the old identity's receipt out of scope (undecided floor), got %v", got)
 	}
 	if err := client.Track(context.Background(), Event{Name: "e1"}); !errors.Is(err, ErrConsentUnknown) {
@@ -4491,7 +4491,7 @@ func TestConsentFloorChangedAnonymousIDReceiptOutOfScope(t *testing.T) {
 		cfg.UserID = "user-1"
 		cfg.AnonymousID = "anon-B"
 	})
-	if got := sameClient.Consent(); got != ConsentGranted {
+	if got := sameClient.ConsentState(); got != ConsentGranted {
 		t.Fatalf("expected the matching identity's proof to restore the grant, got %v", got)
 	}
 	_ = sameClient.Close(context.Background())
@@ -4877,7 +4877,7 @@ func TestConsentFloorPurgeDebtMarkerFailureRecordRetryRules(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 	relaunched := newFloorTestClient(t, server.URL, dir, nil)
-	if got := relaunched.Consent(); got != ConsentDenied {
+	if got := relaunched.ConsentState(); got != ConsentDenied {
 		t.Fatalf("expected the relaunch to restore the durable denial, got %v", got)
 	}
 	if err := relaunched.Flush(context.Background()); err != nil {
@@ -4961,7 +4961,7 @@ func TestConsentFloorPurgeDebtMarkerFailureWipesSpoolFile(t *testing.T) {
 	state.setBatchOutcome(0)
 	batchesBefore := state.batchCount()
 	relaunched := newFloorTestClient(t, server.URL, dir, actorless)
-	if got := relaunched.Consent(); got != ConsentGranted {
+	if got := relaunched.ConsentState(); got != ConsentGranted {
 		t.Fatalf("test shape: expected the stale grant promoted on the actorless relaunch (nothing overrides it), got %v", got)
 	}
 	if err := relaunched.Flush(context.Background()); err != nil {
@@ -5855,7 +5855,7 @@ func TestConsentOutboxUnreadableWitnessDoesNotResurrectSupersededGrant(t *testin
 		client := newFloorTestClient(t, server.URL, dir, nil)
 		defer func() { _ = client.Close(context.Background()) }()
 
-		if got := client.Consent(); got != ConsentDenied {
+		if got := client.ConsentState(); got != ConsentDenied {
 			t.Fatalf("readable witness: floor = %v, want ConsentDenied", got)
 		}
 		if err := client.Track(context.Background(), Event{Name: "e1"}); !errors.Is(err, ErrConsentDenied) {
@@ -5940,7 +5940,7 @@ func TestConsentOutboxUnreadableWitnessDoesNotResurrectSupersededGrant(t *testin
 
 			// NOT ConsentDenied: we learned nothing about the actor. The
 			// claim is about US — we may not act.
-			if got := client.Consent(); got != ConsentUnknown {
+			if got := client.ConsentState(); got != ConsentUnknown {
 				t.Fatalf("erased witness (%s): floor = %v, want ConsentUnknown", tc.name, got)
 			}
 			// The restrictive resolution has to bind the actual gate, not
@@ -6004,7 +6004,7 @@ func TestConsentOutboxPartialTrailStillHonorsAValidDenial(t *testing.T) {
 	client := newFloorTestClient(t, server.URL, dir, nil)
 	defer func() { _ = client.Close(context.Background()) }()
 
-	if got := client.Consent(); got != ConsentDenied {
+	if got := client.ConsentState(); got != ConsentDenied {
 		t.Fatalf("partial trail with a readable denial: floor = %v, want ConsentDenied", got)
 	}
 	// The incompleteness is still reported: the operator should learn the
@@ -6046,7 +6046,7 @@ func TestConsentOutboxUnusableTrailSurvivesMaintenanceRewrite(t *testing.T) {
 	}
 
 	first := newFloorTestClient(t, server.URL, dir, nil)
-	if got := first.Consent(); got == ConsentGranted {
+	if got := first.ConsentState(); got == ConsentGranted {
 		t.Fatalf("first start promoted an unwitnessed grant: %v", got)
 	}
 	if err := first.Close(context.Background()); err != nil {
@@ -6077,7 +6077,7 @@ func TestConsentOutboxUnusableTrailSurvivesMaintenanceRewrite(t *testing.T) {
 	}
 	second := newFloorTestClient(t, server.URL, dir, nil)
 	defer func() { _ = second.Close(context.Background()) }()
-	if got := second.Consent(); got == ConsentGranted {
+	if got := second.ConsentState(); got == ConsentGranted {
 		t.Fatalf("restart on a laundered outbox promoted the withheld grant: %v", got)
 	}
 	if got := second.Snapshot().LastConsentError; got != "consent_grant_unwitnessed" {
@@ -6086,7 +6086,7 @@ func TestConsentOutboxUnusableTrailSurvivesMaintenanceRewrite(t *testing.T) {
 
 	// And a FRESH decision for this scope is the documented way back.
 	second.SetConsent(true)
-	if got := second.Consent(); got != ConsentGranted {
+	if got := second.ConsentState(); got != ConsentGranted {
 		t.Fatalf("a fresh decision did not clear the mark: %v", got)
 	}
 	cleared, ok := loadConsentRecordInfo(dir, spoolTestActorDigest())
@@ -6126,7 +6126,7 @@ func TestConsentOutboxUnusableTrailGrantDoesNotHealPersistedDenial(t *testing.T)
 	defer func() { _ = client.Close(context.Background()) }()
 
 	// The denial stands: a grant we cannot corroborate does not lift it.
-	if got := client.Consent(); got == ConsentGranted {
+	if got := client.ConsentState(); got == ConsentGranted {
 		t.Fatalf("an unusable trail's grant lifted a persisted denial: %v", got)
 	}
 	// And it must not have been healed onto DISK, or the next start would
@@ -6177,7 +6177,7 @@ func TestConsentRecordUnreadableBlocksGrantTailAndPreservesDenial(t *testing.T) 
 			client := newFloorTestClient(t, server.URL, dir, nil)
 			defer func() { _ = client.Close(context.Background()) }()
 
-			if got := client.Consent(); got == ConsentGranted {
+			if got := client.ConsentState(); got == ConsentGranted {
 				t.Fatalf("an unreadable record let a grant receipt promote the floor: %v", got)
 			}
 			// The decisive half: the unreadable bytes must still be there.
@@ -6269,7 +6269,7 @@ func TestConsentUnwitnessedMarkIsHonoredEverywhereAGrantIsTrusted(t *testing.T) 
 
 		client := newFloorTestClient(t, server.URL, dir, nil)
 		defer func() { _ = client.Close(context.Background()) }()
-		if got := client.Consent(); got == ConsentGranted {
+		if got := client.ConsentState(); got == ConsentGranted {
 			t.Fatalf("a retained grant receipt promoted a marked record: %v", got)
 		}
 		after, ok := loadConsentRecordInfo(dir, spoolTestActorDigest())
@@ -6325,7 +6325,7 @@ func TestConsentUnwitnessedMarkIsHonoredEverywhereAGrantIsTrusted(t *testing.T) 
 			return os.Rename(oldpath, newpath)
 		}, os.Chmod)
 
-		if got := client.Consent(); got == ConsentGranted {
+		if got := client.ConsentState(); got == ConsentGranted {
 			t.Fatalf("failed mark still promoted the grant: %v", got)
 		}
 		if got := client.Snapshot().LastConsentError; got != "consent_unwitnessed_mark_failed" {
@@ -6476,7 +6476,7 @@ func TestUnprovableGrantIsHeldFromTheWireAndRecoverable(t *testing.T) {
 
 				client := newFloorTestClient(t, server.URL, dir, nil)
 				defer func() { _ = client.Close(context.Background()) }()
-				if got := client.Consent(); got == ConsentGranted {
+				if got := client.ConsentState(); got == ConsentGranted {
 					t.Fatalf("%s: a retained grant receipt promoted the floor: %v", tc.name, got)
 				}
 				after, err := os.ReadFile(consentRecordPath(dir))
@@ -6522,7 +6522,7 @@ func TestForeignRecordDoesNotResurrectAWithheldGrant(t *testing.T) {
 	client := newFloorTestClient(t, server.URL, dir, nil)
 	defer func() { _ = client.Close(context.Background()) }()
 
-	if got := client.Consent(); got == ConsentGranted {
+	if got := client.ConsentState(); got == ConsentGranted {
 		t.Fatalf("a retained grant was promoted beside a foreign record: %v", got)
 	}
 	// And it must not have been healed onto disk under THIS scope's digest,
@@ -6577,7 +6577,7 @@ func TestConsentRecordUnusableClassesAreAllCovered(t *testing.T) {
 
 			client := newFloorTestClient(t, server.URL, dir, nil)
 			defer func() { _ = client.Close(context.Background()) }()
-			if got := client.Consent(); got == ConsentGranted {
+			if got := client.ConsentState(); got == ConsentGranted {
 				t.Fatalf("%s: a retained grant receipt promoted the floor: %v", tc.name, got)
 			}
 		})
@@ -6641,7 +6641,7 @@ func TestBlockedGrantIsDurableWhateverTheRecordSays(t *testing.T) {
 		}
 
 		first := newFloorTestClient(t, server.URL, dir, nil)
-		if got := first.Consent(); got == ConsentGranted {
+		if got := first.ConsentState(); got == ConsentGranted {
 			t.Fatalf("first start promoted the grant: %v", got)
 		}
 		_ = first.Flush(context.Background())
@@ -6650,7 +6650,7 @@ func TestBlockedGrantIsDurableWhateverTheRecordSays(t *testing.T) {
 		// Whatever housekeeping did, the conclusion must have survived it.
 		second := newFloorTestClient(t, server.URL, dir, nil)
 		defer func() { _ = second.Close(context.Background()) }()
-		if got := second.Consent(); got == ConsentGranted {
+		if got := second.ConsentState(); got == ConsentGranted {
 			t.Fatalf("housekeeping lifted the denial: restart consent = %v", got)
 		}
 	})
@@ -6688,7 +6688,7 @@ func TestPostMarkDecisionRecoversAfterACrash(t *testing.T) {
 	client := newFloorTestClient(t, server.URL, dir, nil)
 	defer func() { _ = client.Close(context.Background()) }()
 
-	if got := client.Consent(); got != ConsentGranted {
+	if got := client.ConsentState(); got != ConsentGranted {
 		t.Fatalf("a durable post-mark decision was lost: floor = %v, want ConsentGranted", got)
 	}
 	after, ok := loadConsentRecordInfo(dir, spoolTestActorDigest())
@@ -6750,7 +6750,7 @@ func TestStaleMarkIsRefreshedByANewerUnusableTrail(t *testing.T) {
 	}
 
 	first := newFloorTestClient(t, server.URL, dir, nil)
-	if got := first.Consent(); got == ConsentGranted {
+	if got := first.ConsentState(); got == ConsentGranted {
 		t.Fatalf("first start promoted the grant: %v", got)
 	}
 	_ = first.Close(context.Background())
@@ -6772,7 +6772,7 @@ func TestStaleMarkIsRefreshedByANewerUnusableTrail(t *testing.T) {
 	}
 	second := newFloorTestClient(t, server.URL, dir, nil)
 	defer func() { _ = second.Close(context.Background()) }()
-	if got := second.Consent(); got == ConsentGranted {
+	if got := second.ConsentState(); got == ConsentGranted {
 		t.Fatalf("a grant covered by the refreshed mark was healed into live consent: %v", got)
 	}
 }
@@ -6921,7 +6921,7 @@ func TestForeignRecordVetoesGrantsRegardlessOfWallClock(t *testing.T) {
 	// records another one.
 	client := newFloorTestClient(t, server.URL, dir, nil)
 	defer func() { _ = client.Close(context.Background()) }()
-	if got := client.Consent(); got == ConsentGranted {
+	if got := client.ConsentState(); got == ConsentGranted {
 		t.Fatalf("a grant was promoted beside a foreign record on wall-clock ordering alone: %v", got)
 	}
 
@@ -6940,7 +6940,7 @@ func TestForeignRecordVetoesGrantsRegardlessOfWallClock(t *testing.T) {
 	}
 	second := newFloorTestClient(t, server.URL, stale, nil)
 	defer func() { _ = second.Close(context.Background()) }()
-	if got := second.Consent(); got == ConsentGranted {
+	if got := second.ConsentState(); got == ConsentGranted {
 		t.Fatalf("a pre-switch grant was promoted beside a foreign record: %v", got)
 	}
 }

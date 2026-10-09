@@ -11,7 +11,7 @@ import (
 // ConsentState is the tri-state analytics consent of the configured actor.
 //
 // The state lives in client memory only; the SDK does not persist it. An
-// integrator that needs consent to survive process restarts reads Consent
+// integrator that needs consent to survive process restarts reads ConsentState
 // after SetConsent, stores it, and re-applies it with SetConsent on startup.
 type ConsentState string
 
@@ -607,8 +607,9 @@ func (c *Client) publishConsent(request consentRequest) {
 	}
 }
 
-// Consent returns the current in-memory consent state.
-func (c *Client) Consent() ConsentState {
+// ConsentState returns the current in-memory consent state.
+// A zero-value Client reports ConsentUnknown. Reading the state has no side effects.
+func (c *Client) ConsentState() ConsentState {
 	switch c.consent.Load() {
 	case consentStateGranted:
 		return ConsentGranted

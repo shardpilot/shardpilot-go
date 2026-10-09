@@ -974,7 +974,7 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 	requestURL := fetchURL
 	usedSignature := ""
 	etag = baselineEtag
-	if attributedURL != "" && c.Consent() == ConsentGranted && !c.grantReceiptGateArmed(nil) {
+	if attributedURL != "" && c.ConsentState() == ConsentGranted && !c.grantReceiptGateArmed(nil) {
 		requestURL, usedSignature, etag = attributedURL, attributedSignature, attributedEtag
 	}
 	resp, err := c.transport.FetchRemoteConfig(ctx, remoteConfigRequest{

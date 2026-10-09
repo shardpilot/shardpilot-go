@@ -277,7 +277,7 @@ while consent is unknown. This server-side SDK does the inverse:
   actor through that same service path.
 - **`SetConsent` cannot reach the forced-minor state.** It takes a plain
   bool, and the states it reaches are exactly `unknown` / `granted` /
-  `denied` (read via `Consent()`). Since `v0.6.0-alpha` the client SDKs'
+  `denied` (read via `ConsentState()`). Since `v0.6.0-alpha` the client SDKs'
   `denied_forced_minor` state does exist in this SDK, reachable only through
   `SetConsentDecision(ConsentDecisionDeniedForcedMinor)`, and it gates like
   a denial.

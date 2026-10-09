@@ -100,7 +100,7 @@ func TestConsentTriStateGatingAndQueueClear(t *testing.T) {
 	client := newConsentTestClient(t, server.URL, "", "anon-actor")
 	defer client.Close(context.Background())
 
-	if state := client.Consent(); state != ConsentUnknown {
+	if state := client.ConsentState(); state != ConsentUnknown {
 		t.Fatalf("expected initial consent state unknown, got %q", state)
 	}
 
@@ -114,7 +114,7 @@ func TestConsentTriStateGatingAndQueueClear(t *testing.T) {
 	client.SetConsent(false)
 	waitForConsent(t, consents)
 
-	if state := client.Consent(); state != ConsentDenied {
+	if state := client.ConsentState(); state != ConsentDenied {
 		t.Fatalf("expected consent state denied, got %q", state)
 	}
 	if err := client.Enqueue(Event{Name: "purchase"}); !errors.Is(err, ErrConsentDenied) {
@@ -140,7 +140,7 @@ func TestConsentTriStateGatingAndQueueClear(t *testing.T) {
 	client.SetConsent(true)
 	waitForConsent(t, consents)
 
-	if state := client.Consent(); state != ConsentGranted {
+	if state := client.ConsentState(); state != ConsentGranted {
 		t.Fatalf("expected consent state granted, got %q", state)
 	}
 	if err := client.Enqueue(Event{Name: "purchase"}); err != nil {
@@ -235,7 +235,7 @@ func TestSetConsentFallsBackToAnonymousActorAndSkipsPostWithoutIdentity(t *testi
 	noIdentityClient := newConsentTestClient(t, server.URL, "", "")
 	defer noIdentityClient.Close(context.Background())
 	noIdentityClient.SetConsent(false)
-	if state := noIdentityClient.Consent(); state != ConsentDenied {
+	if state := noIdentityClient.ConsentState(); state != ConsentDenied {
 		t.Fatalf("expected local denial without identity, got %q", state)
 	}
 	if err := noIdentityClient.Enqueue(Event{Name: "purchase"}); !errors.Is(err, ErrConsentDenied) {
@@ -280,7 +280,7 @@ func TestSetConsentPublishFailureIsQuietAndKeepsLocalState(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for quiet consent failure log")
 	}
-	if state := client.Consent(); state != ConsentDenied {
+	if state := client.ConsentState(); state != ConsentDenied {
 		t.Fatalf("expected local state to survive publish failure, got %q", state)
 	}
 	if err := client.Enqueue(Event{Name: "purchase"}); !errors.Is(err, ErrConsentDenied) {
@@ -582,7 +582,7 @@ func TestConsentGateCancellationMapsToDeniedAfterQuickRegrant(t *testing.T) {
 	// identify the abort as a denial.
 	client.SetConsent(false)
 	client.SetConsent(true)
-	if state := client.Consent(); state != ConsentGranted {
+	if state := client.ConsentState(); state != ConsentGranted {
 		t.Fatalf("expected consent re-granted before the transport returned, got %q", state)
 	}
 	close(transport.release)
