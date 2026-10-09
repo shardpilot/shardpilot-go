@@ -28,7 +28,7 @@ func TestClientSamplingWire(t *testing.T) {
 		wantPosts int
 		wantRate  uint64
 	}{
-		{"default", nil, false, 10, 1, 10},
+		{"default", nil, false, 3, 3, 1},
 		{"fatal-default-no-rate", nil, true, 1, 1, 0},
 		{"fatal-bypasses-sampler", neverSampler{}, true, 1, 1, 0},
 		{"custom-rate-unknown", alwaysSampler{}, false, 1, 1, 0},
@@ -144,15 +144,13 @@ func TestClientSamplingRetryKeepsCaptureBytes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 10; i++ {
-		if err := client.Emit(context.Background(), validEvent(t)); err != nil {
-			t.Fatal(err)
-		}
+	if err := client.Emit(context.Background(), validEvent(t)); err != nil {
+		t.Fatal(err)
 	}
 	if len(bodies) != 2 || !bytes.Equal(bodies[0], bodies[1]) {
 		t.Fatal("retry did not preserve the captured wire bytes")
 	}
-	assertSamplingWire(t, bodies[0], false, 10)
+	assertSamplingWire(t, bodies[0], false, 1)
 }
 
 type retainingSampler struct{ event Event }

@@ -7,6 +7,12 @@
   are unchanged; a zero-value client reports `unknown`. Remove `Client.Consent()`
   with no compatibility alias.
 
+- Keep every valid non-fatal crash report by default, including the first report
+  from each client. Previously the default sent only every tenth call and
+  returned `nil` for the dropped calls. Explicit custom samplers remain opt-in,
+  fatal reports still bypass sampling, and the existing built-in wire rate is
+  now `non_fatal_sample_one_in: 1`. Review expected report volume when upgrading.
+
 - The experimental `pkg/consentpolicy` package is now internal. Its parser,
   restrictive verifier, tests and fixtures are unchanged; it no longer adds a
   supported public plan API. Root analytics consent behavior is unchanged.

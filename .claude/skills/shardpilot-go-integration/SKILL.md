@@ -435,10 +435,10 @@ crashClient, err := crash.NewClient(crash.ClientOptions{
 })
 ```
 
-- `Emit(ctx, event)` — non-fatal report. **Sampled by default: only every
-  10th non-fatal per client is transmitted** (calls 10, 20, 30, …); a
-  sampled-out `Emit` returns `nil` exactly like a sent one. Pass a custom
-  `Sampler` to change this.
+- `Emit(ctx, event)` — non-fatal report. The default keeps every valid
+  report, including the first report per client. Pass an explicit custom
+  `Sampler` to opt into sampling; a sampled-out call returns `nil` without
+  a request or `OnResult` callback.
 - `EmitFatal(ctx, event)` — fatal report, never sampled, always transmitted.
 - `defer crashClient.Recover(ctx)` at each goroutine / request-handler
   boundary — captures a panic as a fatal crash with pre-symbolicated Go
@@ -585,9 +585,8 @@ Run against your dev/staging deployment credentials, then check each item:
    confirm `Track` returns a `*shardpilot.HTTPStatusError` whose `ErrorCode`
    is `unauthorized`/`forbidden` — proves your error handling surfaces real
    causes. Restore the real token.
-5. **Crash round trip.** Use **`EmitFatal`**, not `Emit`, for the test
-   (the default sampler silently drops the first 9 non-fatal `Emit`s per
-   client). Send a synthetic fatal event and confirm the error is `nil` and
+5. **Crash round trip.** Use `Emit` with default options for a synthetic
+   non-fatal event, or `EmitFatal` for a synthetic fatal event. Confirm the error is `nil` and
    `OnResult` received a `crash.Result` with a non-empty `CrashID` and
    `Suppressed == false`. If `Suppressed` is `true`, the server accepted but
    did not store it (actor consent withheld server-side).
@@ -658,10 +657,9 @@ them:
   rejections, which are retained in `Rejections()` and exposed through
   `OnBatchResult`, or a locally unserializable event, which is isolated from
   its batchmates. HTTP 429 remains retryable.
-- **Non-fatal crash sampling defaults to 1-in-10 per client**, and a
-  sampled-out `Emit` returns `nil` without calling `OnResult`. Successful
-  ingest also returns `nil` but calls `OnResult` when configured. Fewer than
-  10 valid non-fatal calls send none unless a custom `Sampler` is set;
+- **Custom non-fatal sampling is opt-in.** The default keeps every valid
+  report. A custom sampler can drop an `Emit` with `nil` and no `OnResult`;
+  successful ingest also returns `nil` but invokes `OnResult` when configured.
   `EmitFatal` bypasses sampling.
 - **No built-in client-side crash consent gate** — `pkg/crash` does not use
   the analytics consent state. `Result.Suppressed` reports the server's
