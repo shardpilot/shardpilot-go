@@ -36,10 +36,11 @@ go build -trimpath -o /tmp/shardpilot-go-evidence ./examples/evidence
 
 The run uses seven cases, each allowing one HTTP attempt and refusing redirects:
 
-1. One minimal `app.session_started` envelope with a synthetic session id.
-2. A four-event batch: two synthetic sessions, each with a start and end, carrying
-   entry-point, duration and completion/background context. Each session uses
-   sequence 1 for its start and 2 for its end; standalone starts use sequence 1.
+1. One minimal `app.screen_view` envelope with a synthetic session id.
+2. A four-event batch: two synthetic sessions, each with menu and summary
+   `app.screen_view` events. Each session uses sequence 1 for its first view
+   and 2 for its second; standalone views use sequence 1. These are ordinary
+   host events, not reserved session-lifecycle events.
 3. One event with a 3,072-byte padding property (its encoded envelope exceeds
    2,048 bytes) beside one small event **in the same batch**. The required result
    is HTTP 202, the large event `rejected` with `event_too_large`, and the small

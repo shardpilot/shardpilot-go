@@ -44,6 +44,26 @@ For analytics only, `v0.1.2` is available. **`v0.1.0` is retracted** in the modu
 
 ## Quick start (analytics)
 
+`Track` and `Enqueue` refuse SDK-owned and runtime-only event names with
+`ErrReservedEventName` (`reserved_event_name`): `experiment_exposure`,
+`experiment_outcome`, `governed_action_result`, `app_runtime_ping`,
+`monitor_evaluation_recorded`, `llm_usage`, `support_assistant_feedback`,
+`ad_impression_revenue`, `session_started` and `session_ended`.
+Matching trims ASCII whitespace, removes exactly one leading `app.`, and compares
+case-sensitively. Empty or ASCII-whitespace-only names return
+`ErrEventNameRequired` (`event_name_required`). Both errors match
+`ErrInvalidEvent` through `errors.Is`; each refusal increments `Stats.Dropped`
+once, updates `LastError`, and reaches neither the queue nor the transport.
+Existing lifecycle and consent refusals take precedence. Name normalization
+trims only ASCII whitespace on the wire too; Unicode whitespace is preserved.
+
+Ordinary names such as `app.screen_view`, `purchase` and `economy_tx` remain
+available. Use the experiment API for sealed experiment facts. Its internal
+producer and the typed purchase/economy verbs retain their existing behavior.
+This release adds no typed session or ad-revenue producer; migrate any direct
+calls using reserved names before upgrading, without renaming them to bypass
+the restriction. Local name admission does not establish server acceptance.
+
 For a bounded analytics-and-crash evidence run, set the environment variables in
 [`examples/evidence`](examples/evidence/README.md), then run
 `go build -trimpath -o /tmp/shardpilot-go-evidence ./examples/evidence` followed by

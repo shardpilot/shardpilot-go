@@ -10,6 +10,14 @@
   |---|---|
   | `github.com/shardpilot/shardpilot-go/pkg/consentpolicy` | Remove the experimental import before upgrading. There is no public replacement in this release; do not bypass retained admission restrictions or replace a refusal with permission. |
 
+- `Track` and `Enqueue` now refuse the documented reserved names before delivery,
+  count each refusal once in `Stats.Dropped`, and expose `ErrReservedEventName`
+  (`reserved_event_name`). Empty/ASCII-whitespace-only names expose
+  `ErrEventNameRequired` (`event_name_required`); both match `ErrInvalidEvent`.
+  Name admission and wire encoding share ASCII-only whitespace trimming, so an
+  admitted Unicode-wrapped name is not rewritten into a reserved name later.
+  Existing lifecycle/consent precedence and typed experiment producers remain.
+  The evidence example now uses ordinary screen-view events.
 
 - Schema-revision declaration is now opt-in. Only an explicit, nonblank
   `Config.SchemaRevision` sends the batch header; default clients send none.
@@ -51,6 +59,8 @@
 | `Config.DisableSchemaRevision` | Remove it. Leave `Config.SchemaRevision` empty to send no declaration. |
 | `DefaultSchemaRevision` | Removed. A writer that opts in supplies its deployed schema's revision explicitly. |
 | Implicit schema header on every batch | Set `Config.SchemaRevision` only when the writer is released with that schema. |
+| Direct `Track`/`Enqueue` of reserved names | Remove those calls; use the experiment API for experiment facts. There is no new session/ad-revenue producer in this release. |
+| Unicode whitespace trimmed from event names | Only ASCII whitespace is trimmed; choose the intended ordinary event name explicitly. |
 
 No aliases are provided for the removed symbols. This version is prepared in
 source; its release tag is not published yet.

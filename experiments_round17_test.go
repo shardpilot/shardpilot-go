@@ -6,6 +6,7 @@ package shardpilot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -62,22 +63,34 @@ func TestSentinelSparesHostLookalikeEvents(t *testing.T) {
 	sfk := "sfk1_" + strings.Repeat("a", 64)
 	t.Run("queue_and_worker_legs", func(t *testing.T) {
 		script := &expScript{}
-		script.push(200, expAssignedBody("1"))
+		script.push(200, expAssignedServedBody(expServedTrio))
 		capture := &expWireCapture{}
 		server := newExperimentServer(t, script, capture)
 		defer server.Close()
 		client := newExperimentClient(t, server.URL, nil)
 		defer func() { _ = client.Close(context.Background()) }()
 		client.SetConsent(true)
-		// The genuine SDK fact: the fetch's automatic exposure, held in the
-		// pipeline (BatchSize 8, no flush yet).
+		// Apply the assignment and run the sealing hop so a genuine SDK
+		// fact is held in the pipeline (BatchSize 8, no flush yet).
 		if result := fetchAssignment(t, client, expTestScopeKey); result.VariantKey != "treatment" {
 			t.Fatalf("setup fetch: %+v", result)
 		}
-		// The HOST-authored lookalike: reserved-looking name + sfk1_-shaped
-		// assignment_key through the public intake — never an SDK fact.
-		if err := client.Enqueue(Event{ID: "host-lookalike", Name: experimentExposureName, Props: map[string]any{"assignment_key": sfk}}); err != nil {
-			t.Fatalf("host enqueue: %v", err)
+		if variant, _ := client.ApplyExperimentVariant(expTestScopeKey); variant != "treatment" {
+			t.Fatalf("setup application: %q", variant)
+		}
+		client.experimentCycle(context.Background())
+		if client.Snapshot().Enqueued != 1 || len(script.apply.sealedFacts()) != 1 {
+			t.Fatal("the sealed SDK fact must actually enter the queue before the purge")
+		}
+		// Public intake now refuses this name. Seed the legacy queue state
+		// directly: an event admitted by an older release is still not an
+		// SDK-authored fact, and the purge must preserve that distinction.
+		hostLookalike := Event{ID: "host-lookalike", Name: experimentExposureName, Props: map[string]any{"assignment_key": sfk}}
+		if err := client.Enqueue(hostLookalike); !errors.Is(err, ErrReservedEventName) {
+			t.Fatalf("public intake must refuse the reserved name: %v", err)
+		}
+		if !client.queue.enqueue(hostLookalike) {
+			t.Fatal("cannot seed the legacy host event")
 		}
 		client.exp.mu.Lock()
 		client.exp.applySentinelWithdrawalLocked("g17-2-scope", time.Now().UnixMilli())
