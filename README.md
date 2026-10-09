@@ -200,7 +200,8 @@ Two **default-off** capture opt-ins extend automatic capture (both dark by defau
 | `Token` | yes | Bearer token (Mode A `sp_ingest_` publishable key or Mode B per-tenant JWT). Held in memory; never logged. |
 | `WorkspaceID` / `AppID` / `EnvironmentID` | yes | App-first identity (`workspace → app → environment`). |
 | `Source` | yes | `SourceClient`, `SourceServer`, or `SourceBackend`. |
-| `AppVersion` / `AppBuild` / `Platform` | no | Default envelope metadata. |
+| `AppVersion` / `AppBuild` | no | Default envelope metadata. |
+| `Platform` | no | Analytics platform: `windows`, `macos`, `linux`, `android`, `ios`, `tvos`, `web`, `ps4`, `ps5`, `xbox`, `switch`, or `other`. Values are trimmed and lowercased; supported aliases such as `darwin` map to their canonical value. Empty or unmapped input becomes `other`. `Event.Platform` overrides this default when nonempty. |
 | `UserID` / `AnonymousID` | no | Default actor identity; also the consent `actor_identifier` (UserID preferred). |
 | `BatchSize` | no | Default 25, capped at 100. |
 | `BufferSize` | no | Async queue capacity, default 1000. |

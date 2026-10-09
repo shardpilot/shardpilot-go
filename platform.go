@@ -2,32 +2,7 @@ package shardpilot
 
 import "strings"
 
-// The analytics envelope's `platform` is folded to the vocabulary the ingest
-// door accepts. It was NOT folded before: `Config.Platform` reached the wire as
-// the host typed it, and the ingest vocabulary is closed -- one out-of-vocabulary
-// value fails the WHOLE batch, every event in it, not just the offending one.
-//
-// THE TABLE IS NOT AUTHORED HERE. It is one shared vocabulary, generated from
-// the ShardPilot SDKs that already fold -- shardpilot-unreal's
-// NormalizeEnvelopePlatform (compiled and executed) and shardpilot-godot's real
-// vocabulary -- so that every SDK answers a given spelling identically. Its
-// revision is 1bd5acee111988d8, and `platform_conformance_test.go` recomputes
-// that from its own copy, so this table and the shared set cannot drift apart
-// quietly.
-//
-// THE SUFFIX STRIP (Unreal's "WindowsNoEditor" -> "windows") IS DELIBERATELY
-// NOT IMPLEMENTED, and the shared set permits that. Unreal has it because
-// FPlatformProperties::PlatformName() PRODUCES those spellings -- a closed source
-// with an enumerable set. Here the value is typed by a human ("Windows 11",
-// "win-x64", "PC"), so nine suffixes would not approach completeness; they would
-// manufacture the APPEARANCE of it, and the next uncovered spelling would read as
-// a gap in the rule rather than as a property of an open input. A reader finding
-// this narrower than Unreal is seeing a decision, not an omission.
-//
-// THE CRASH PLATFORM IS NOT TOUCHED. There the value is required, may be any
-// lowercase token, and rides the group fingerprint; folding it would refingerprint
-// existing crash groups (ShardPilotCore.cpp:116-120). `pkg/crash` keeps sending
-// the honest name.
+// Analytics platform values and supported host aliases.
 var envelopePlatformVocabulary = map[string]string{
 	"android":   "android",
 	"browser":   "web",
@@ -42,12 +17,18 @@ var envelopePlatformVocabulary = map[string]string{
 	"macos":     "macos",
 	"macosx":    "macos",
 	"osx":       "macos",
+	"other":     "other",
+	"ps4":       "ps4",
+	"ps5":       "ps5",
+	"switch":    "switch",
+	"tvos":      "tvos",
 	"steamdeck": "linux",
 	"web":       "web",
 	"win":       "windows",
 	"win32":     "windows",
 	"win64":     "windows",
 	"windows":   "windows",
+	"xbox":      "xbox",
 }
 
 // maxWarnedPlatforms caps the reported-value set. A correct caller produces a
@@ -55,25 +36,15 @@ var envelopePlatformVocabulary = map[string]string{
 // produces one per event, and that must cost a bounded amount of memory.
 const maxWarnedPlatforms = 32
 
-// normalizeEnvelopePlatform folds a host-supplied platform to the accepted
-// vocabulary, or returns "" when it maps to nothing. An empty answer means the
-// key is OMITTED from the envelope -- `platform` is optional at the door, so an
-// omitted key is accepted while a wrong one fails the batch.
+// normalizeEnvelopePlatform folds host input to a canonical analytics value.
 func normalizeEnvelopePlatform(value string) string {
-	return envelopePlatformVocabulary[strings.ToLower(strings.TrimSpace(value))]
+	if platform := envelopePlatformVocabulary[strings.ToLower(strings.TrimSpace(value))]; platform != "" {
+		return platform
+	}
+	return "other"
 }
 
-// warnUnmappedPlatform reports a host-supplied platform that folded to nothing,
-// once per distinct value.
-//
-// Tier 1 of the corpus loses such a value silently: it becomes "" and the key is
-// omitted, so the host who typed something meaningful never learns it was not
-// understood. Enumerating spellings cannot close that -- the input is open, and a
-// human may type anything -- but saying "I did not understand what you set" can,
-// and always.
-//
-// Only what the host SET is reported. An unset platform is the ordinary default
-// path, and warning there would fire on every correctly-configured client.
+// warnUnmappedPlatform reports each configured fallback once, with bounded state.
 func (c *Client) warnUnmappedPlatform(raw string) {
 	// NOTHING TO SAY MEANS NOTHING TO REMEMBER. `logf` is a no-op without a
 	// logger (consent.go:641), so caching here would retain unbounded host
@@ -96,8 +67,8 @@ func (c *Client) warnUnmappedPlatform(raw string) {
 		// the exact silence this diagnostic exists to break.
 		if announce {
 			c.logf("shardpilot platform: more than %d distinct unrecognised "+
-				"platform values have been configured; each is still omitted "+
-				"from the envelope, but they will no longer be logged "+
+				"platform values have been configured; each is sent as other, "+
+				"but they will no longer be logged "+
 				"individually", maxWarnedPlatforms)
 		}
 		return
@@ -109,8 +80,6 @@ func (c *Client) warnUnmappedPlatform(raw string) {
 	c.warnedMu.Unlock()
 
 	// Logged OUTSIDE the lock: Printf is host code and may block or re-enter.
-	c.logf("shardpilot platform: configured platform %q is not one of the "+
-		"accepted values (web, ios, android, windows, macos, linux); it is "+
-		"omitted from the event envelope rather than sent, which would fail "+
-		"the whole batch", raw)
+	c.logf("shardpilot platform: configured platform %q is unrecognised; "+
+		"the event envelope uses other", raw)
 }
