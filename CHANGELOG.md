@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- `pkg/consentpolicy`: a plan may now carry the resolver's optional **advisory part**, and `ParsePlan` reads it as `Plan.Advisory` instead of refusing the whole plan as carrying an unknown key. Before, any response that included it was unreadable. The advisory is a non-binding estimate for the connection's jurisdiction. The resolver serves it only when a client SDK asked for it with `advisory: true` and the workspace accepted the advisory terms; this package sends no request. It is validated against the same closed contract as the rest of the plan:
+  - `jurisdiction` and `row_id` are a two-letter code or `OTHER`;
+  - `estimate` is `SOFT_OPT_OUT`, `STRICT_OPT_IN` or null, and always null for `OTHER`;
+  - `row_status` is `COUNSEL_PENDING` and `row_basis` is `ai_draft`;
+  - `advisory_basis` is non-empty, at most 2048 bytes and free of control characters;
+  - `matrix` carries a 40-character commit, a 64-character SHA-256 and a calendar date;
+  - `resolved_by` is `server_country` or `unknown`, and `unknown` means `OTHER`.
+
+  An advisory that is `null`, carries an unknown member, or appears on a refusal makes the plan unreadable, like any other malformed member. It **never changes the regime** or any other answer a `Decision` gives, and `Prepare` still uses no plan in this release. The estimate has its own type, `AdvisoryEstimate`, so it cannot be passed where a `Regime` is expected without an explicit conversion.
+
 ## v0.7.2-alpha — 2026-10-02
 
 - A non-adult age declaration no longer leaves the experiment served while its fetch is unanswered ([#138](https://github.com/shardpilot/shardpilot-go/issues/138)). When a host fetch declares an age other than exactly `adult` (under either spelling, `age_band` or `custom_attribute_age_band`), the experiment stops serving at once: `ExperimentVariant` and `ExperimentVariantPayload` return nothing, `ApplyExperimentVariant` and `TrackExperimentExposure` record nothing, and `TrackExperimentOutcome` returns `ErrExperimentNoAssignment`. The automatic revalidation no longer re-sends the earlier declaration for it, and an assignment answer to a fetch sent before the declaration is not handed to its caller. The server's answer to the declaration then governs, as before: `age_ineligible` withdraws the owed applications, `kill_switch` keeps them. If the fetch ends without an answer (a `5xx`, a timeout, a `401`/`403`, a consent refusal), the declaration is treated as the `age_ineligible` refusal it would receive: the cached assignment is dropped from memory and the durable cache, the owed applications and their facts are withdrawn (counted `age_ineligible`), and no answer to a fetch sent before the declaration can reinstall it. Before, the adult assignment kept being served and recorded, and the next revalidation declared `adult` again. A later `adult` declaration is decided by its own fetch, and a re-admitted assignment is a new application with a new `exposure_id`. A fetch without an age declaration changes nothing, and a synthetic-subject assignment, which has no age gate, is left serving as before.

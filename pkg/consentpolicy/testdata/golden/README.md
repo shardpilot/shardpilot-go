@@ -9,6 +9,8 @@ policy handler emits**, recorded by that handler's own golden test.
 | `consent-policy-refusal.json` | `400`, a refusal carrying `reason: "invalid_scope"` — the wire bytes |
 | `consent-policy-resolved.indented.json` | the same response in the **review form** the resolver's own repository stores |
 | `consent-policy-refusal.indented.json` | the same, for the refusal |
+| `consent-policy-resolved-advisory.json` | `200`, the same resolved STRICT plan with the optional **advisory part** — the wire bytes |
+| `consent-policy-resolved-advisory.indented.json` | the same, in the review form |
 
 ## Provenance
 
@@ -18,6 +20,14 @@ Recorded from the resolver service's own golden test, from the stored bodies
 `internal/httpserver/testdata/consent_policy_refusal_invalid_scope.json` (blob
 `b9eacf6f85079ec3a3c6db6b7f8e33b91f539c47`). Those two are the stored review
 forms, and the `.indented.json` files here are byte-for-byte copies of them.
+
+The advisory pair was recorded the same way, from the stored body
+`internal/httpserver/testdata/consent_policy_resolved_strict_with_advisory.json`
+(blob `e4b01af80364f9c1bb6d6161616d37d583e03c17`), which the
+`.indented.json` here copies byte for byte. It answers the same request with
+`advisory: true` added, for a workspace admitted to the advisory, from a
+connection the resolver located in GB. Its plan is the resolved plan above,
+unchanged; the advisory sits beside it and does not alter it.
 
 The resolved body answers the request `{workspace_id: ws_1, app_id: app_1,
 environment_id: env_1, app_version: 1.2.3, store: steam, store_region: null,

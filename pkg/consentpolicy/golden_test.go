@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// The two recorded responses, by the names they are vendored under.
+// The recorded responses, by the names they are vendored under.
 var goldenPairs = []struct {
 	name    string
 	wire    string
@@ -21,6 +21,7 @@ var goldenPairs = []struct {
 }{
 	{"a resolved plan", "consent-policy-resolved", "consent-policy-resolved.indented", false},
 	{"a refusal", "consent-policy-refusal", "consent-policy-refusal.indented", true},
+	{"a resolved plan with the advisory part", "consent-policy-resolved-advisory", "consent-policy-resolved-advisory.indented", false},
 }
 
 // ⚠ THE REVIEW FORM COMPACTS TO THE WIRE FORM, BYTE FOR BYTE, WITH NO ROUND
