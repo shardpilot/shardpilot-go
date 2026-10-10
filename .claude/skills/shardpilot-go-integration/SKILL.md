@@ -403,8 +403,9 @@ Available since `v0.5.0-alpha` — **explicit fetch only**. Configure
 `APIKey` (a publishable `sp_ingest_` client key — remote config is **never**
 authenticated with `Config.Token`; a Mode-B JWT cannot fetch config), and
 usually `RemoteConfigCachePath` (durable last-known-good cache file) plus a
-persisted `Config.AnonymousID` — the anonymous ID is the fetch's
-`client_id`, and without one every fetch fails `client_id_unavailable`.
+persisted `Config.AnonymousID` — it supplies the fetch's `client_id` only
+while consent is granted. Configuring it remains required: without one every
+fetch fails `client_id_unavailable`.
 
 ```go
 res, err := client.FetchRemoteConfig(ctx) // one GET, ETag-revalidated
@@ -419,7 +420,11 @@ speed := client.RemoteConfigNumber("scroll_speed", 1.0)
   type mismatch; `RemoteConfigValue` / `RemoteConfigVersion` are comma-ok;
   `RemoteConfigValues` snapshots the whole map. All read the in-memory
   snapshot only — never the network, never an error — and serve cached
-  values before (and without) any fetch.
+  values before (and without) any fetch when their persisted scope matches
+  startup consent. Anonymous requests use an empty client ID in the cache
+  scope; identified and anonymous requests never share records or validators.
+  Responses keep their dispatch scope across consent changes. The single
+  cache file may be replaced by a successful fetch in the other scope.
 - **Transient failures serve the cache**: offline, `408`, `429`, `5xx`, or a
   malformed/oversized body returns the cached snapshot as a success with
   `FromCache=true` and a `Reason` code (or fails with that code when no
@@ -431,10 +436,13 @@ speed := client.RemoteConfigNumber("scroll_speed", 1.0)
 - **A `429`'s `Retry-After` arms an in-memory cooldown** (floor 1s, clamp
   24h): an explicit fetch inside the window serves the cache without
   touching the network.
-- **Not consent-gated**: denied analytics consent neither blocks fetches nor
-  clears the config cache — configuration is client-public tuning, not
-  telemetry. `RemoteConfigCachePath` works without `SpoolDir` and never
-  enables consent persistence.
+- **Available in every consent state**: granted consent uses
+  `/config/v1/{workspace}/{environment}/{client_id}`. Unknown, denied, and
+  forced-minor denied use `/config/v1/{workspace}/{environment}`, without
+  client ID, host user ID, or targeting attributes. Publishable-key
+  authorization remains present. Denial leaves the getter snapshot available
+  until a later successful fetch replaces it. `RemoteConfigCachePath` works
+  without `SpoolDir` and never enables consent persistence.
 - **Targeting attributes are dark and opt-in** — and, unlike the
   fetch itself, granted-only: `RemoteConfigAttributesEnabled: true` plus
   `SetRemoteConfigAttributes(map[string]string)` makes fetches carry the
@@ -443,9 +451,9 @@ speed := client.RemoteConfigNumber("scroll_speed", 1.0)
   values, 64-attribute cap, sorted; out-of-vocabulary keys dropped, never
   sent) as query parameters for server-side delivery rules. Attributes ride
   ONLY while consent is granted — unknown or denied consent (forced-minor
-  included) fetches attribute-less and serves the untargeted defaults.
-  Default `false`: the fetch URL stays byte-identical to the attribute-less
-  path and the setter is inert.
+  included) fetches identifier-free and attribute-less and serves the
+  untargeted defaults. Default `false`: requests carry no attributes and the
+  setter is inert. The client-ID path remains consent-gated independently.
 
 ## Crash reporting (`pkg/crash`)
 
@@ -667,7 +675,8 @@ them:
 - **Forced-minor denial uses the typed setter.** Once present, either setter
   preserves it: ordinary denial is a no-op and ordinary grant is refused.
 - **Ordinary remote config is explicit-fetch-only** — no background refresh,
-  and every fetch requires `Config.AnonymousID` (the `client_id`). The SDK
+  and every fetch requires configured `Config.AnonymousID`, sent as
+  `client_id` only while granted. The SDK
   consumes the returned values rather than evaluating delivery rules.
   Since `v0.6.0-alpha`, `Config.ExperimentsEnabled` and
   `Config.RemoteConfigAttributesEnabled` are available and default `false`.

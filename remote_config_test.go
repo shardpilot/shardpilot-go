@@ -49,7 +49,7 @@ func newRemoteConfigClient(t *testing.T, serverURL, cachePath, anonymousID strin
 }
 
 func testRemoteConfigScope(serverURL string) string {
-	return buildRemoteConfigScope("workspace-test", "develop", "anon-rc-1", serverURL)
+	return buildRemoteConfigScope("workspace-test", "develop", "", serverURL)
 }
 
 func writeRemoteConfigCacheFile(t *testing.T, path string, record rcCache) {
@@ -86,6 +86,10 @@ func TestRemoteConfigRequestShape(t *testing.T) {
 	}
 	seen := make(chan seenRequest, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/config/v1/") {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
 		seen <- seenRequest{
 			method:      r.Method,
 			escapedPath: r.URL.EscapedPath(),
@@ -102,6 +106,9 @@ func TestRemoteConfigRequestShape(t *testing.T) {
 	// arrive as exactly one escaped path segment byte sequence.
 	client := newRemoteConfigClient(t, server.URL, "", "anon id/1%x")
 	defer client.Close(context.Background())
+	if _, err := client.SetConsent(true); err != nil {
+		t.Fatal(err)
+	}
 
 	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
 		t.Fatalf("FetchRemoteConfig: %v", err)
@@ -1759,8 +1766,8 @@ func TestWritePrivateFileAtomicReportsDirSyncFailure(t *testing.T) {
 // TestRemoteConfigAttributePassThroughConsentGate pins the attribute
 // pass-through's full truth table: attributes ride the fetch ONLY under opt-in AND
 // ConsentGranted — explicitly STRICTER than this SDK's open-under-unknown
-// event posture — and the attribute-less legs stay byte-identical to the
-// attribute-less URL (path only, no query). The granted leg carries the
+// event posture. Non-granted requests omit the client ID and query. The
+// granted leg carries the
 // experiment vocabulary normalized and sorted; a consent downgrade strips the
 // query from the very next fetch.
 func TestRemoteConfigAttributePassThroughConsentGate(t *testing.T) {
@@ -1818,7 +1825,11 @@ func TestRemoteConfigAttributePassThroughConsentGate(t *testing.T) {
 			t.Fatalf("FetchRemoteConfig: %v", err)
 		}
 		probe := <-seen
-		if want := "/config/v1/workspace-test/develop/anon-attr-1"; probe.path != want {
+		want := "/config/v1/workspace-test/develop"
+		if client.ConsentState() == ConsentGranted {
+			want += "/anon-attr-1"
+		}
+		if probe.path != want {
 			t.Fatalf("path mismatch: got %q want %q", probe.path, want)
 		}
 		return probe.query
