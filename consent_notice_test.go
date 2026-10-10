@@ -123,18 +123,27 @@ func TestConsentNoticeWire(t *testing.T) {
 
 func TestConsentNoticeInvalidOutcomes(t *testing.T) {
 	cases := map[string][][3]string{
-		"empty":                       {{"", "", ""}},
-		"multiple":                    {noticeExample, noticeExample},
-		"missing-version":             {{"", "en", "p"}},
-		"missing-locale":              {{"v", "", "p"}},
-		"missing-policy":              {{"v", "en", ""}},
-		"long-version":                {{strings.Repeat("v", 65), "en", "p"}},
-		"long-policy":                 {{"v", "en", strings.Repeat("p", 65)}},
-		"version-space":               {{"v 1", "en", "p"}},
-		"policy-colon":                {{"v", "en", "p:1"}},
-		"version-non-ascii":           {{"v\u00e9", "en", "p"}},
-		"locale-underscore":           {{"v", "en_US", "p"}},
-		"locale-incomplete-extension": {{"v", "en-a", "p"}},
+		"empty":                         {{"", "", ""}},
+		"multiple":                      {noticeExample, noticeExample},
+		"missing-version":               {{"", "en", "p"}},
+		"missing-locale":                {{"v", "", "p"}},
+		"missing-policy":                {{"v", "en", ""}},
+		"long-version":                  {{strings.Repeat("v", 65), "en", "p"}},
+		"long-policy":                   {{"v", "en", strings.Repeat("p", 65)}},
+		"version-space":                 {{"v 1", "en", "p"}},
+		"policy-colon":                  {{"v", "en", "p:1"}},
+		"version-non-ascii":             {{"v\u00e9", "en", "p"}},
+		"locale-underscore":             {{"v", "en_US", "p"}},
+		"locale-incomplete-extension":   {{"v", "en-a", "p"}},
+		"duplicate-variant-adjacent":    {{"v", "en-abcde-abcde", "p"}},
+		"duplicate-variant-case":        {{"v", "en-Abcde-ABCDE", "p"}},
+		"duplicate-variant-separated":   {{"v", "en-abcde-fghij-abcde", "p"}},
+		"duplicate-variant-numeric":     {{"v", "de-1901-1901", "p"}},
+		"duplicate-variant-digit-case":  {{"v", "en-1abc-1ABC", "p"}},
+		"duplicate-singleton-adjacent":  {{"v", "en-a-foo-a-bar", "p"}},
+		"duplicate-singleton-case":      {{"v", "en-A-foo-a-bar", "p"}},
+		"duplicate-singleton-separated": {{"v", "en-a-foo-b-baz-a-bar", "p"}},
+		"duplicate-singleton-digit":     {{"v", "en-0-aa-0-bb", "p"}},
 	}
 	for name, notices := range cases {
 		for _, floor := range []bool{false, true} {
@@ -173,6 +182,45 @@ func TestConsentNoticeInvalidOutcomes(t *testing.T) {
 							if consentBoolCategory(t, wire.consentAt(0)) {
 								t.Error("denial became wire grant")
 							}
+						}
+					})
+				}
+			}
+		}
+	}
+}
+
+func TestConsentNoticeRepeatedSubtagControls(t *testing.T) {
+	for _, tag := range []string{
+		"en-a-foo-foo", "en-a-abcde-b-abcde", "en-abcde-a-abcde",
+		"en-x-abcde-abcde", "x-a-a", "x-abcde-ABCDE",
+		"en-abc-abc", "abcde-abcde", "en-A-foo-B-foo-X-a-a",
+	} {
+		for _, floor := range []bool{false, true} {
+			for _, boolean := range []bool{false, true} {
+				for _, grant := range []bool{false, true} {
+					t.Run(fmt.Sprintf("%s/floor-%t/bool-%t/grant-%t", tag, floor, boolean, grant), func(t *testing.T) {
+						c, wire := setterClient(t, floor, "", "synthetic-notice-actor")
+						decision, state := ConsentDecisionDenied, ConsentDenied
+						if grant {
+							decision, state = ConsentDecisionGranted, ConsentGranted
+						}
+						notice := [3]string{"v", tag, "p"}
+						got, _ := observeNotice(t, c, decision, boolean, notice)
+						checkSetterResult(t, got, "", "")
+						if c.ConsentState() != state {
+							t.Errorf("decision state = %s, want %s", c.ConsentState(), state)
+						}
+						if err := c.Close(context.Background()); err != nil {
+							t.Fatal(err)
+						}
+						if wire.consentCount() != 1 {
+							t.Fatalf("real POST count = %d, want 1", wire.consentCount())
+						}
+						body := wire.consentAt(0)
+						checkNoticeBody(t, body, &notice)
+						if consentBoolCategory(t, body) != grant {
+							t.Errorf("wire decision = %v, want grant %t", body, grant)
 						}
 					})
 				}
@@ -428,6 +476,8 @@ func TestConsentNoticeStoredValidation(t *testing.T) {
 		for name, extra := range map[string]string{
 			"legacy": "", "valid": `,"notice_version":"v","notice_locale":"en","policy_version":"p"`,
 			"partial": `,"notice_version":"v"`, "malformed": `,"notice_version":"v","notice_locale":"en_US","policy_version":"p"`,
+			"duplicate-variant":   `,"notice_version":"v","notice_locale":"de-1901-1901","policy_version":"p"`,
+			"duplicate-singleton": `,"notice_version":"v","notice_locale":"en-a-foo-a-bar","policy_version":"p"`,
 		} {
 			t.Run(fmt.Sprintf("grant-%t/%s", grant, name), func(t *testing.T) {
 				raw := fmt.Sprintf(`{"idempotency_key":"synthetic-key","workspace_id":"w","app_id":"a","environment_id":"e","actor_identifier":"synthetic-notice-actor","categories":{"analytics":%t},"decided_at":"2026-06-10T12:00:00Z"%s}`, grant, extra)

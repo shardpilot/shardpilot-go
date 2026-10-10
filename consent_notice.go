@@ -1,6 +1,9 @@
 package shardpilot
 
-import "regexp"
+import (
+	"regexp"
+	"strings"
+)
 
 // ConsentNotice identifies the notice presented by the host for one consent
 // decision. It carries version identifiers and a locale, never notice text.
@@ -41,7 +44,40 @@ func (n ConsentNotice) valid() bool {
 	}
 	return consentNoticeVersion.MatchString(n.NoticeVersion) &&
 		consentNoticeVersion.MatchString(n.PolicyVersion) &&
-		consentNoticeLocale.MatchString(n.NoticeLocale)
+		consentNoticeLocale.MatchString(n.NoticeLocale) &&
+		uniqueConsentLocaleSubtags(n.NoticeLocale)
+}
+
+// After bounded ASCII syntax validation, enforce the case-insensitive variant
+// and extension-singleton uniqueness rules of RFC 5646 sections 2.2.5 and 2.2.6.
+// Other validity requirements remain server-side. Folding is temporary: the
+// carrier and wire retain the host's spelling, including private-use subtags.
+func uniqueConsentLocaleSubtags(locale string) bool {
+	subtags := strings.Split(strings.ToLower(locale), "-")
+	if subtags[0] == "x" {
+		return true
+	}
+	variants := make(map[string]bool)
+	var singletons [128]bool
+	inExtension := false
+	for _, subtag := range subtags[1:] {
+		if subtag == "x" {
+			break
+		}
+		if len(subtag) == 1 {
+			if singletons[subtag[0]] {
+				return false
+			}
+			singletons[subtag[0]] = true
+			inExtension = true
+		} else if !inExtension && (len(subtag) >= 5 || (len(subtag) == 4 && subtag[0] >= '0' && subtag[0] <= '9')) {
+			if variants[subtag] {
+				return false
+			}
+			variants[subtag] = true
+		}
+	}
+	return true
 }
 
 func snapshotConsentNotice(notices []ConsentNotice) (ConsentNotice, bool) {

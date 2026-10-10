@@ -9,7 +9,10 @@
   metadata are refused with `ErrInvalidConsentNotice`, without state or receipt
   changes. Omitted arguments preserve behavior; update setter method-value
   adapters for the variadic `...ConsentNotice` parameter. Notice text is never
-  part of this carrier.
+  part of this carrier. Locale validation enforces RFC 5646 syntax and
+  case-insensitive variant and extension-singleton uniqueness; extension values
+  and private-use subtags may repeat. Other locale validity remains server-side,
+  with no registry lookup or normalization of the host's spelling.
 
 - Both analytics consent setters now return `(ConsentResult, error)`. Nil error
   means the local decision applied; `Warnings` identifies unfinished record,
