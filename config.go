@@ -98,12 +98,16 @@ type Config struct {
 	// origin — never the ingest URL). Empty — the default — disables the
 	// remote-config client entirely. Validated like IngestURL: absolute,
 	// HTTPS outside loopback (or private nets with
-	// AllowInsecurePrivateNetwork), no path/query/fragment/user info.
+	// AllowInsecurePrivateNetwork), no path/query/fragment/user info. Requests
+	// include AnonymousID only while consent is granted; other states use the
+	// identifier-free workspace/environment route without targeting attributes.
 	RemoteConfigURL string
 
 	// RemoteConfigCachePath, when set, is the file the remote-config client
 	// persists its durable last-known-good cache record to, so a restart or
-	// an offline start still serves the previously fetched configuration.
+	// an offline start serves configuration matching the startup consent scope.
+	// Anonymous and identified records and validators are separate scopes in
+	// this single-record file; a successful fetch can replace the other scope.
 	// Empty keeps the cache in memory only (getters still serve the last
 	// served snapshot within the process). Independent of SpoolDir — setting
 	// it never enables consent persistence or the disk spool.
@@ -138,14 +142,15 @@ type Config struct {
 	// attribute pass-through on the remote-config fetch: the attributes set
 	// via SetRemoteConfigAttributes ride the GET /config/v1/... request as
 	// query parameters, letting server-side delivery rules target this
-	// client. Default false — DARK: while off the fetch URL is byte-identical
-	// to today's attribute-less path.
+	// client. Default false: while off requests carry no attributes. The
+	// client-ID path segment remains gated by consent independently.
 	//
 	// PRIVACY CONTRACT (non-negotiable): attributes are personal-data-shaped
 	// egress, so they ride ONLY while BOTH this opt-in is true AND the
 	// consent state is ConsentGranted. This is deliberately STRICTER than
 	// this SDK's open-under-unknown event posture: unknown consent (and both
-	// denied states) keeps the remote-config fetch attribute-less — the
+	// denied states) keeps the remote-config fetch identifier-free and
+	// attribute-less — the
 	// fetch itself still happens (config delivery stays consent-neutral) and
 	// serves whatever the server publishes for an attribute-less client,
 	// typically the default values. "Unknown = zero bytes of personal data"

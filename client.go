@@ -426,7 +426,7 @@ func NewClient(cfg Config) (*Client, error) {
 	}
 	if normalized.RemoteConfigURL != "" {
 		client.rc = newRemoteConfigState(normalized)
-		client.rc.preload()
+		client.rc.preload(client.ConsentState() == ConsentGranted)
 	}
 	if normalized.ExperimentsEnabled {
 		// The experiment-assignment consumer (dark unless opted in — while

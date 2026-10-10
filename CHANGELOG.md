@@ -2,6 +2,14 @@
 
 ## v0.8.0-alpha — release preparation (not published)
 
+- Remote config remains available without granted consent through the
+  identifier-free workspace/environment route. Only granted requests carry
+  the configured anonymous ID; non-granted requests also omit targeting
+  attributes. Anonymous and identified cache records and validators have
+  separate scopes, including startup reload and responses arriving after a
+  consent change. Existing getters retain their last served snapshot until
+  a later successful fetch replaces it.
+
 - Both consent setters accept optional per-call `ConsentNotice` provenance.
   A valid tuple follows its receipt through retry and durable reload. Invalid
   metadata cannot block a denial: the tuple is omitted and the result includes

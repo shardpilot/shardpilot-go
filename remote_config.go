@@ -27,9 +27,10 @@ import (
 // Config.Token never authenticates the remote-config endpoint. Every fetch
 // is explicit (FetchRemoteConfig); there is no automatic refresh, no
 // Cache-Control interpretation, no experiment assignment, and no client-side
-// rule evaluation. Fetching is NOT consent-gated: denied consent neither
-// blocks the fetch nor clears the cache (configuration is client-public
-// tuning, not telemetry).
+// rule evaluation. Fetching remains available in every consent state. Only
+// granted requests carry the client ID; other states use the identifier-free
+// workspace/environment route without attributes. Cache records and validators
+// belong to that request scope. Denial does not clear the getter snapshot.
 //
 // Fetch semantics (one fetch = one HTTP GET, decided by applyRemoteConfig):
 //   - 200 with a parseable JSON object body — fresh values are served and
@@ -51,15 +52,13 @@ import (
 // Permanent and fail-closed outcomes are authoritative for THE FETCH THAT
 // RECEIVED THEM — they do not latch: every fetch classifies independently,
 // so a later transient failure still serves the last-known-good cache. This
-// matches the canonical Defold/Unity behavior (ports, not redesigns).
+// lets each fetch classify independently.
 //
 // A 429 additionally arms an in-memory cooldown from its Retry-After header
 // (digits-only, floored at 1s, clamped at 24h; absent or malformed reads as
 // the floor). An explicit fetch inside the window does not touch the network:
 // it returns the cache-served transient_429 outcome, indistinguishable from a
-// live 429. This is a deliberate delta vs the Defold/Unity reference clients
-// (which ignore Retry-After on this route) — the client half of the
-// server's remote-config fetch rate limit.
+// live 429: the client half of the server's remote-config fetch rate limit.
 
 // rcMaxBodyBytes caps how much of a remote-config response body is read: the
 // server contract caps targeted configuration at 1MB (answering 413 above
@@ -138,11 +137,13 @@ type rcCache struct {
 type remoteConfigState struct {
 	mu sync.Mutex
 
-	fetchURL  string
-	apiKey    string
-	cachePath string
-	clientID  string
-	scope     string
+	fetchURL       string
+	anonymousURL   string
+	apiKey         string
+	cachePath      string
+	clientID       string
+	scope          string
+	anonymousScope string
 
 	// attributes is the developer-supplied targeting attribute set
 	// (dark behind Config.RemoteConfigAttributesEnabled). Stored
@@ -180,19 +181,20 @@ type remoteConfigState struct {
 	settled  map[string]uint64
 
 	// cooldownUntil is the in-memory 429 next-fetch-allowed deadline. ONE
-	// deadline per client instance, not per scope — acceptable conservatism
-	// (a client's scope is fixed by its config). Monotone: a new 429 can
+	// deadline shared by anonymous and identified scopes. Monotone: a new 429 can
 	// only extend it, and it is never persisted; it expires only by time.
 	cooldownUntil time.Time
 }
 
 func newRemoteConfigState(cfg Config) *remoteConfigState {
 	rc := &remoteConfigState{
-		fetchURL:  buildRemoteConfigURL(cfg.RemoteConfigURL, cfg.WorkspaceID, cfg.EnvironmentID, cfg.AnonymousID),
-		apiKey:    cfg.APIKey,
-		cachePath: cfg.RemoteConfigCachePath,
-		clientID:  cfg.AnonymousID,
-		settled:   make(map[string]uint64),
+		fetchURL:       buildRemoteConfigURL(cfg.RemoteConfigURL, cfg.WorkspaceID, cfg.EnvironmentID, cfg.AnonymousID),
+		anonymousURL:   buildRemoteConfigURL(cfg.RemoteConfigURL, cfg.WorkspaceID, cfg.EnvironmentID, ""),
+		anonymousScope: buildRemoteConfigScope(cfg.WorkspaceID, cfg.EnvironmentID, "", cfg.RemoteConfigURL),
+		apiKey:         cfg.APIKey,
+		cachePath:      cfg.RemoteConfigCachePath,
+		clientID:       cfg.AnonymousID,
+		settled:        make(map[string]uint64),
 	}
 	if rc.clientID != "" {
 		rc.scope = buildRemoteConfigScope(cfg.WorkspaceID, cfg.EnvironmentID, rc.clientID, cfg.RemoteConfigURL)
@@ -203,11 +205,15 @@ func newRemoteConfigState(cfg Config) *remoteConfigState {
 // preload serves the persisted last-known-good snapshot immediately after
 // construction: getters work before (and without) any fetch when a durable
 // record for this exact scope exists.
-func (rc *remoteConfigState) preload() {
+func (rc *remoteConfigState) preload(granted bool) {
 	if rc.clientID == "" || rc.cachePath == "" {
 		return
 	}
-	record := rc.durableRecord(rc.scope)
+	scope := rc.anonymousScope
+	if granted {
+		scope = rc.scope
+	}
+	record := rc.durableRecord(scope)
 	if record == nil {
 		return
 	}
@@ -242,10 +248,13 @@ func escapeRemoteConfigSegment(value string) string {
 }
 
 func buildRemoteConfigURL(baseURL, workspaceID, environmentID, clientID string) string {
-	return strings.TrimRight(baseURL, "/") + "/config/v1/" +
+	url := strings.TrimRight(baseURL, "/") + "/config/v1/" +
 		escapeRemoteConfigSegment(workspaceID) + "/" +
-		escapeRemoteConfigSegment(environmentID) + "/" +
-		escapeRemoteConfigSegment(clientID)
+		escapeRemoteConfigSegment(environmentID)
+	if clientID != "" {
+		url += "/" + escapeRemoteConfigSegment(clientID)
+	}
+	return url
 }
 
 // appendRemoteConfigAttributes appends the targeting attributes as
@@ -493,12 +502,12 @@ func (rc *remoteConfigState) durableRecord(scope string) *rcCache {
 // durable write) and the durable record (which another same-app process may
 // have refreshed), compared by their fetched-at stamps; the in-process
 // record wins ties, being known-good and already backing the getters.
-func (rc *remoteConfigState) loadCacheLocked() *rcCache {
+func (rc *remoteConfigState) loadCacheLocked(scope string) *rcCache {
 	var held *rcCache
-	if rc.held != nil && rc.held.Scope == rc.scope {
+	if rc.held != nil && rc.held.Scope == scope {
 		held = rc.held
 	}
-	durable := rc.durableRecord(rc.scope)
+	durable := rc.durableRecord(scope)
 	if held != nil && (durable == nil || durable.FetchedAtMS <= held.FetchedAtMS) {
 		return held
 	}
@@ -683,8 +692,7 @@ func (rc *remoteConfigState) raiseStampAboveSuperseded(record *rcCache, served, 
 // installs only by ADOPTION, when the served record is strictly fresher
 // than the held one. Returns whether the durable write failed (the caller
 // surfaces it).
-func (rc *remoteConfigState) installLocked(seq uint64, result RemoteConfigResult, ok bool, newCache *rcCache, authoritative bool, served, revalidated *rcCache) (persistFailed bool) {
-	scope := rc.scope
+func (rc *remoteConfigState) installLocked(seq uint64, scope string, result RemoteConfigResult, ok bool, newCache *rcCache, authoritative bool, served, revalidated *rcCache) (persistFailed bool) {
 	if seq <= rc.settled[scope] {
 		return false
 	}
@@ -845,8 +853,10 @@ func (c *Client) SetRemoteConfigAttributes(attributes map[string]string) {
 // stalled the response BODY preserves the received status and classifies by
 // it (a stalled 401 fails closed; only a stalled 200 stays transient). A
 // successful result also updates the getter snapshot; a failed one
-// leaves it untouched. Fetching is not consent-gated. Concurrent fetches are
-// legal; an older response never overwrites a newer settled outcome. Fetches
+// leaves it untouched. Fetching remains available without granted consent,
+// using the identifier-free route and its own cache scope. Concurrent fetches
+// are legal; an older response never overwrites a newer settled outcome in
+// the same request scope. Fetches
 // are fenced by the client lifecycle exactly like synchronous Track
 // publishes: a fetch that begins after Close is rejected with ErrClosed, and
 // Close waits (bounded by its own context) for in-flight fetches to settle,
@@ -870,16 +880,21 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 		return RemoteConfigResult{}, rcFetchError("remote_config_not_configured")
 	}
 	if rc.clientID == "" {
-		// The cache scope and the fetch route both need the client id; with
-		// none configured there is nothing coherent to fetch. Decided before
-		// any network use.
+		// Preserve the configured-identity requirement across both routes.
+		// Non-granted requests omit this ID on the wire. Refuse a missing
+		// configuration before any network use.
 		return RemoteConfigResult{}, rcFetchError("client_id_unavailable")
 	}
 
 	rc.mu.Lock()
 	rc.fetchSeq++
 	seq := rc.fetchSeq
-	cache := rc.loadCacheLocked()
+	identifiedCache := rc.loadCacheLocked(rc.scope)
+	anonymousCache := rc.loadCacheLocked(rc.anonymousScope)
+	scope, cache := rc.anonymousScope, anonymousCache
+	if c.ConsentState() == ConsentGranted {
+		scope, cache = rc.scope, identifiedCache
+	}
 	if c.clock.Now().Before(rc.cooldownUntil) {
 		// The cooldown fast path honors the caller's context FIRST, exactly
 		// like a dispatched fetch would through the transport: a caller that
@@ -896,7 +911,7 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 		// network: the outcome is the cache-served transient_429, by design
 		// indistinguishable from a live 429.
 		result, failure := serveRemoteConfigCache(cache, "transient_429")
-		rc.installLocked(seq, result, failure == "", nil, false, cache, nil)
+		rc.installLocked(seq, scope, result, failure == "", nil, false, cache, nil)
 		rc.mu.Unlock()
 		if failure != "" {
 			return RemoteConfigResult{}, rcFetchError(failure)
@@ -905,9 +920,9 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 	}
 	etag := ""
 	cacheSignature := ""
-	if cache != nil {
-		etag = cache.ETag
-		cacheSignature = cache.AttributeSignature
+	if identifiedCache != nil {
+		etag = identifiedCache.ETag
+		cacheSignature = identifiedCache.AttributeSignature
 	}
 	fetchURL := rc.fetchURL
 	apiKey := rc.apiKey
@@ -920,16 +935,10 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 	}
 	rc.mu.Unlock()
 
-	// Attribute pass-through: opt-in AND ConsentGranted. The URL is
-	// PREPARED here but the consent gate is read at the LAST moment before
-	// dispatch (below), so a downgrade landing while the fetch is being
-	// prepared still strips the attributes; one landing after dispatch
-	// cannot recall a request already on the wire — the very next fetch is
-	// attribute-less. Deliberately STRICTER than this SDK's
-	// open-under-unknown event posture: unknown consent (and both denied
-	// states) keeps the fetch byte-identical to the attribute-less URL, and
-	// the fetch itself still happens (config delivery stays
-	// consent-neutral).
+	// Prepare optional targeting attributes before the consent read at the
+	// transport handoff. A downgrade during preparation selects the route
+	// without identity or attributes. Requests already dispatched cannot be
+	// recalled; later requests select the current consent scope.
 	attributedURL := ""
 	attributedSignature := ""
 	if len(storedAttributes) > 0 {
@@ -949,33 +958,28 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 	// legs' validators are decided BEFORE the consent read below, so
 	// nothing sits between that read and the dispatch.
 	baselineEtag, attributedEtag := etag, etag
-	if cache != nil && cacheSignature != "" {
+	if identifiedCache != nil && cacheSignature != "" {
 		baselineEtag = ""
 	}
-	if cache != nil && cacheSignature != attributedSignature {
+	if identifiedCache != nil && cacheSignature != attributedSignature {
 		attributedEtag = ""
 	}
-	// The consent read at the transport handoff: this gate is the FINAL
-	// statement before the transport call — no work between the read and
-	// the dispatch for a downgrade to hide behind. The residual window (a
-	// downgrade completing between this read and the request bytes
-	// reaching the wire) is irreducible without recalling sent requests —
-	// closing it with a lock would make consent writes block on network
-	// I/O. Its response still lands signature-stamped, so the very next
-	// fetch — attribute-less after the downgrade — sees the signature
-	// mismatch, drops If-None-Match, and replaces the targeted body with a
-	// full fetch. Under the opt-in consent floor the GRANT-RECEIPT
-	// DISPATCH GATE holds this leg exactly like the event legs
-	// (grantReceiptGateArmed): while an analytics-grant receipt is
-	// retained undispatched, attributes must not overtake the grant on the
-	// wire — the fetch still goes out, attribute-less, and a later fetch
-	// attaches once the receipt has dispatched (the outbox retries at
-	// every dispatch point). Floor-off keeps the plain granted-only gate.
-	requestURL := fetchURL
+	// Prepare both cache scopes before the transport handoff, then select
+	// URL, validator and response scope together from current consent.
+	// The attribute receipt gate is independent and remains grant-only.
+	attributesAllowed := attributedURL != "" && !c.grantReceiptGateArmed(nil)
+	requestURL := rc.anonymousURL
+	scope, cache = rc.anonymousScope, anonymousCache
 	usedSignature := ""
-	etag = baselineEtag
-	if attributedURL != "" && c.ConsentState() == ConsentGranted && !c.grantReceiptGateArmed(nil) {
-		requestURL, usedSignature, etag = attributedURL, attributedSignature, attributedEtag
+	etag = ""
+	if anonymousCache != nil && anonymousCache.AttributeSignature == "" {
+		etag = anonymousCache.ETag
+	}
+	if c.ConsentState() == ConsentGranted {
+		requestURL, scope, cache, etag = fetchURL, rc.scope, identifiedCache, baselineEtag
+		if attributesAllowed {
+			requestURL, usedSignature, etag = attributedURL, attributedSignature, attributedEtag
+		}
 	}
 	resp, err := c.transport.FetchRemoteConfig(ctx, remoteConfigRequest{
 		url:         requestURL,
@@ -1028,7 +1032,7 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 	}
 
 	rc.mu.Lock()
-	if resp.status == 429 && seq > rc.settled[rc.scope] {
+	if resp.status == 429 && seq > rc.settled[scope] {
 		// The cooldown is fenced by the same per-scope sequence as installs:
 		// a stale 429 that arrives AFTER a newer fetch already settled an
 		// authoritative outcome (a fresh 200, say) is an outdated
@@ -1037,7 +1041,7 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 		// stale response's result is otherwise ignored.
 		rc.armCooldownLocked(now, resp)
 	}
-	persistFailed := rc.installLocked(seq, result, failure == "", newCache, authoritative, cache, revalidated)
+	persistFailed := rc.installLocked(seq, scope, result, failure == "", newCache, authoritative, cache, revalidated)
 	rc.mu.Unlock()
 
 	if persistFailed {
