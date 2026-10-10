@@ -75,7 +75,7 @@ func withFlag(key string, value any) func(map[string]any) {
 // real bytes would have been refused for scope before reaching what it was
 // testing.
 func callerScope() Scope {
-	return Scope{WorkspaceID: "ws_1", AppID: "app_1", EnvironmentID: "env_1"}
+	return Scope{WorkspaceKey: "ws_1", AppKey: "app_1", EnvironmentKey: "env_1"}
 }
 
 func fixedClock() func() time.Time {
@@ -243,10 +243,10 @@ func TestEveryFailureFallsBackStrict(t *testing.T) {
 		{"version outside its character set", VerifiedPlayerPolicy{Plan: validPlan(func(m map[string]any) { m["policy_version"] = "2026 09 12" }), Scope: callerScope(), Now: fixedClock()}, ReasonPlanUnreadable},
 		{"version over its bound", VerifiedPlayerPolicy{Plan: validPlan(func(m map[string]any) { m["policy_version"] = strings.Repeat("v", 65) }), Scope: callerScope(), Now: fixedClock()}, ReasonPlanUnreadable},
 		{"incomplete scope in the plan", VerifiedPlayerPolicy{Plan: validPlan(func(m map[string]any) {
-			delete(m["scope"].(map[string]any), "environment_id")
+			delete(m["scope"].(map[string]any), "environment_key")
 		}), Scope: callerScope(), Now: fixedClock()}, ReasonPlanUnreadable},
 		{"plan scoped to another app", VerifiedPlayerPolicy{Plan: validPlan(func(m map[string]any) {
-			m["scope"].(map[string]any)["app_id"] = "another-app"
+			m["scope"].(map[string]any)["app_key"] = "another-app"
 		}), Scope: callerScope(), Now: fixedClock()}, ReasonScopeMismatch},
 		{"caller names no scope", VerifiedPlayerPolicy{Plan: validPlan(nil), Now: fixedClock()}, ReasonScopeMismatch},
 		{"expired", VerifiedPlayerPolicy{Plan: validPlan(func(m map[string]any) {
@@ -338,7 +338,7 @@ func TestTheResolversRefusalIsReadAsARefusal(t *testing.T) {
 		t.Fatal(err)
 	}
 	body["regime"] = string(SoftOptOut)
-	body["scope"] = map[string]any{"workspace_id": "ws_1", "app_id": "app_1", "environment_id": "env_1"}
+	body["scope"] = map[string]any{"workspace_key": "ws_1", "app_key": "app_1", "environment_key": "env_1"}
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		t.Fatal(err)

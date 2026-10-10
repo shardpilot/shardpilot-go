@@ -296,7 +296,7 @@ func TestEveryRecordedKeyIsRequired(t *testing.T) {
 	// package already fixed once.
 	for _, needed := range []string{
 		"flags", "flags.crash_profile", "flags.operation_blocks",
-		"scope.app_id", "basis.notice", "signals_used[0].available", "signals_used[2].reason",
+		"scope.app_key", "basis.notice", "signals_used[0].available", "signals_used[2].reason",
 		"signature", "max_age_seconds",
 	} {
 		if !contains(paths, needed) {

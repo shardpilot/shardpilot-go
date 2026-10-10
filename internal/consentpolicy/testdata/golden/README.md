@@ -14,25 +14,30 @@ policy handler emits**, recorded by that handler's own golden test.
 
 ## Provenance
 
+These recordings use request contract version 3 and scope members
+`workspace_key`, `app_key` and `environment_key`. The decoder accepts only
+these names, including on refusals; retired or mixed scope names are rejected.
+
+
 Recorded from the resolver service's own golden test, from the stored bodies
 `internal/httpserver/testdata/consent_policy_resolved_strict.json` (blob
-`6a36fcc473fee009baffd9e51c3314b413e0cd12`) and
+`ba2795a09d6a591e2904b4d23f9aa81bef5b8ce3`) and
 `internal/httpserver/testdata/consent_policy_refusal_invalid_scope.json` (blob
-`b9eacf6f85079ec3a3c6db6b7f8e33b91f539c47`). Those two are the stored review
+`ec6eb6c293b1d28f1b250c4a23058570755d04a6`). Those two are the stored review
 forms, and the `.indented.json` files here are byte-for-byte copies of them.
 
 The advisory pair was recorded the same way, from the stored body
 `internal/httpserver/testdata/consent_policy_resolved_strict_with_advisory.json`
-(blob `e4b01af80364f9c1bb6d6161616d37d583e03c17`), which the
+(blob `915ea00fc4cb461f0e9b96299a3e6a91c0167c51`), which the
 `.indented.json` here copies byte for byte. It answers the same request with
 `advisory: true` added, for a workspace admitted to the advisory, from a
 connection the resolver located in GB. Its plan is the resolved plan above,
 unchanged; the advisory sits beside it and does not alter it.
 
-The resolved body answers the request `{workspace_id: ws_1, app_id: app_1,
-environment_id: env_1, app_version: 1.2.3, store: steam, store_region: null,
+The resolved body answers the request `{workspace_key: ws_1, app_key: app_1,
+environment_key: env_1, app_version: 1.2.3, store: steam, store_region: null,
 locale: en-GB, platform: windows}`; the refusal is the same request with an
-invalid `workspace_id`. The clock is fixed at `2026-09-20T12:00:00Z` — the only
+invalid `workspace_key`. The clock is fixed at `2026-09-20T12:00:00Z` — the only
 seam, and why `expires_at` is `12:05:00Z` with `max_age_seconds` `300`. The
 test fixtures refresh that one field and nothing else.
 
