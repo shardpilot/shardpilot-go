@@ -4040,9 +4040,8 @@ func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string
 				if e.consentRaceSeam != nil {
 					e.consentRaceSeam("remint_adopted")
 				}
-				// COMMIT-POINT double check, after the adopt/persist — the
-				// r11 lazy-mint idiom at the re-mint site: consent moved →
-				// the re-mint aborts whole. The undo covers the persisted
+				// Recheck consent after adoption and persistence. If consent
+				// changed, abort the entire re-mint. The undo covers the persisted
 				// key (unadoptFreshMintLocked's ownFile-responsibility
 				// unlink + parent sync — the minted id must not outlive
 				// the abort durably), the rotation (the prior subject and

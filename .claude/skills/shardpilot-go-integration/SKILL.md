@@ -493,10 +493,8 @@ crashClient, err := crash.NewClient(crash.ClientOptions{
   field, never the report.
 - **Two auto-capture opt-ins, both DARK by default** (while off the
   auto-captured wire shape is byte-identical, and manual `Emit`/`EmitFatal`
-  events are never touched by either). Both carry the same arming order:
-  enable them only after this SDK's client-side consent gate and durable
-  spool are in place — new capture detail must not ship ahead of consent
-  parity:
+  events are never touched by either). Enable them only with this SDK's
+  client-side consent gate and durable spool in place:
   - `ClientOptions.DebugIDFillEnabled` attaches the RUNNING BINARY's identity as
     the event's single `modules[]` entry — base name plus a debug id read from
     the binary (ELF GNU build-id as lowercase hex, the identity `dump_syms`

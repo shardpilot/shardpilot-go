@@ -122,16 +122,10 @@ type consentRecordWire struct {
 	// so anything STRICTLY NEWER is provably a decision the mark could not
 	// have been about, and may supersede it.
 	//
-	// Without an order the mark is a boolean, and a boolean can only be a
-	// veto over everything or over nothing. Both are wrong: vetoing
-	// everything loses a decision that was already durable (record a fresh
-	// grant, its receipt lands, the process crashes before the record write
-	// — the next start sees the old marked record beside a clean, strictly
-	// newer receipt and refuses it forever), while vetoing nothing reopens
-	// the defect the mark exists to close. Eight review rounds widened
-	// "which paths must consult the boolean"; the ninth showed the guard
-	// was too STRONG, which is the signal that the shape was wrong rather
-	// than the coverage.
+	// The stamp distinguishes a newer durable decision from the trail the
+	// mark withheld. A boolean veto would either discard a newer receipt
+	// whose record write was interrupted, or allow the older unproven grant.
+	// A strictly newer receipt can therefore supersede the marked record.
 	//
 	// ABSENT MEANS INFINITELY NEW, and the direction is load-bearing.
 	// Records written before this field existed carry no stamp, and reading

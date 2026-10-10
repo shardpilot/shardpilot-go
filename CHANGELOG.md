@@ -275,22 +275,15 @@ source; its release tag is not published yet.
   be ruled out that it replaced a mark, so a retained grant receipt is
   refused beside it. Denials are unaffected.
 
-  Whether a grant may take effect is decided ONCE at startup, from every
-  signal at, and every grant-affecting path reads that one verdict — local
-  promotion, the trail-tail heal, and the dispatch worker. The same asymmetry
-  was found six separate times, each because one site consulted a subset of
-  the signals and a grant took effect through the door that had not been
-  widened; the last of them let a marked record's grant be POSTed to the
-  server while local state correctly refused it. The verdict is persisted
-  whatever the record says — including over a DENIAL, where an earlier
-  revision wrote nothing, so a surviving deny receipt's prune could rewrite
-  the outbox clean and let the next start's grant supersede the denial. A
-  fresh explicit decision clears all of it at once.
+  Whether a grant may take effect is decided once at startup from all
+  durable signals. Local promotion, trail-tail healing and the dispatch
+  worker read that same verdict. Persist it regardless of the record's
+  decision, including a denial, so receipt pruning cannot clear the
+  withholding state. A fresh explicit decision clears it.
 
   The mark carries a STAMP — the newest decision time the trail showed when it
-  was applied — and is an ordering question rather than a veto. Eight review
-  rounds widened *which paths must consult the mark*; the ninth found the guard
-  too STRONG, which is a different signal: receipt-first means a fresh
+  was applied — and is an ordering question rather than a veto. Receipt-first
+  persistence means a fresh
   decision's receipt lands durably before the record is rewritten, so a crash
   in that window leaves a marked record beside a clean, strictly newer receipt.
   An unconditional mark refuses that receipt forever and loses a decision that
@@ -469,10 +462,10 @@ source; its release tag is not published yet.
   - A malformed value (free text, email, IP, JWT, raw `user_`/`player_`/`device_` id, or over
     512 bytes) drops the field only — never the crash report.
 
-- Dark phase-D crash-capture opt-ins in `pkg/crash` (both default `false` —
+- Crash-capture opt-ins in `pkg/crash` (both default `false` —
   while off zero new code paths execute and the auto-captured wire shape is byte-identical;
-  enabling is gated by the service-side arming order on the SDK's consent gate + durable
-  crash spool landing first):
+  enable only with the SDK's client-side consent gate and durable
+  crash spool in place):
   - `ClientOptions.DebugIDFillEnabled` — the running binary's self-module on every
     auto-captured event: executable base name + `debug_id` self-read from the binary (ELF GNU
     build-id as lowercase hex, else lowercase-hex SHA-256 of the Go build id — both scrubber-

@@ -176,12 +176,8 @@ type Signal struct {
 // Plan is the resolver's response, as the SDK reads it.
 // Flags are the plan's orthogonal restrictions.
 //
-// ⚠ NESTED, AND THAT IS NOT A DETAIL. This package read crash_profile and
-// server_analytics at the TOP LEVEL, in upper case, beside fields the resolver
-// has never sent. It could not read one real response — and it was harmless
-// only because this release refuses every unsigned plan anyway, which is
-// exactly how the same defect hid in the sibling SDK for fifteen rounds. The
-// schema is the contract; this is the schema.
+// crash_profile and server_analytics are nested, lowercase members of
+// the resolver's plan schema. Read them from that schema location.
 type Flags struct {
 	CrashProfile    CrashProfile         `json:"crash_profile"`
 	ServerAnalytics ServerAnalyticsState `json:"server_analytics"`

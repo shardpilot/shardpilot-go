@@ -79,11 +79,9 @@ type ClientOptions struct {
 	// Manual Emit/EmitFatal events are never touched — their modules stay
 	// caller-owned.
 	//
-	// Default false — DARK: while off, zero self-read code paths
-	// execute and the auto-captured wire shape stays byte-identical to the
-	// pre-fill SDK. Phase-D arming order: enable only after the SDK's
-	// client-side consent gate and durable spool have landed — new capture detail
-	// must not ship ahead of consent parity.
+	// Default false. While disabled, no binary self-read path executes and
+	// the auto-captured wire shape remains unchanged. Enable only with the
+	// client-side consent gate and durable spool in place.
 	DebugIDFillEnabled bool
 	// AllGoroutineCaptureEnabled opts auto-capture into snapshotting EVERY
 	// goroutine at panic time (runtime.Stack all): the other goroutines ship as
@@ -93,9 +91,9 @@ type ClientOptions struct {
 	// 256 total frames, in dump order, at most 16 frames per non-crashing
 	// goroutine.
 	//
-	// Default false — DARK: while off, the dump is never taken and
-	// the auto-captured wire shape stays byte-identical. Same Phase-D arming
-	// order as DebugIDFillEnabled: consent gate + durable spool first.
+	// Default false. While disabled, no all-goroutine dump is taken and the
+	// wire shape remains unchanged. As for DebugIDFillEnabled, enabling it
+	// requires the consent gate and durable spool first.
 	AllGoroutineCaptureEnabled bool
 	HTTPClient                 *http.Client
 	Logger                     Logger
