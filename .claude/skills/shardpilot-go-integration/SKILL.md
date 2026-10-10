@@ -225,8 +225,16 @@ ASCII bytes and rejects case-insensitive duplicate variants and extension
 singletons (RFC 5646 sections 2.2.5 and 2.2.6). Extension values and private-use subtags may repeat;
 other locale validity requirements remain server-side. The SDK performs no
 registry lookup or case normalization. Values are copied into each receipt for
-retry/reload;
-never pass notice text. Invalid metadata refuses a grant with
+retry/reload. For durable reload, wholly absent notice fields are legacy; present empty/null,
+partial, ill-typed or invalid tuples are malformed. Denials send without them;
+malformed grants never dispatch. Observe `consent_notice_invalid` through
+`Stats.LastConsentError` and the log, with persistence failures taking precedence.
+The existing unwitnessed/Unknown protection persists across restart; re-issue a
+valid grant explicitly. Maintenance removes the rejected grant only after durable
+rejection evidence exists, otherwise the corrupt bytes stay as evidence. No last
+server-confirmed state history is added.
+
+Never pass notice text. Invalid metadata refuses a grant with
 `ErrInvalidConsentNotice` (`consent_notice_invalid`); a denial still applies,
 omits the whole tuple and returns that warning with other applicable warnings.
 The forced-minor-preserving no-op still creates no receipt. Existing calls

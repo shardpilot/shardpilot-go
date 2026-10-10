@@ -86,9 +86,14 @@ func validConsentIdentifier(identifier string) bool {
 // value for a plain bool would silently turn "field missing" into
 // "analytics: false", and a resend of that fabricated denial could
 // overwrite a previously granted actor server-side. The sanitizer drops
-// absent-category entries as malformed instead.
+// absent-category entries as malformed instead. Optional notice presence is
+// retained independently so explicit empty/null members cannot become legacy.
 type consentReceipt struct {
 	ConsentNotice
+	// Decode-only presence distinguishes legacy absence from empty/null members.
+	noticePresent bool
+	// Records a stripped denial tuple during sanitation.
+	noticeInvalid   bool
 	IdempotencyKey  string `json:"idempotency_key"`
 	WorkspaceID     string `json:"workspace_id"`
 	AppID           string `json:"app_id"`
@@ -100,6 +105,47 @@ type consentReceipt struct {
 	DecidedAt   string `json:"decided_at"`
 	Reason      string `json:"reason,omitempty"`
 	AnonymousID string `json:"anonymous_id,omitempty"`
+}
+
+// UnmarshalJSON preserves notice-member presence independently of their string
+// values. Invalid member types are notice failures, not an unreadable denial.
+func (r *consentReceipt) UnmarshalJSON(data []byte) error {
+	type receiptFields consentReceipt
+	var decoded receiptFields
+	wire := struct {
+		*receiptFields
+		NoticeVersion json.RawMessage `json:"notice_version"`
+		NoticeLocale  json.RawMessage `json:"notice_locale"`
+		PolicyVersion json.RawMessage `json:"policy_version"`
+	}{receiptFields: &decoded}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	for i, raw := range []json.RawMessage{wire.NoticeVersion, wire.NoticeLocale, wire.PolicyVersion} {
+		if raw == nil {
+			continue
+		}
+		decoded.noticePresent = true
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil {
+			decoded.noticeInvalid = true
+		}
+		switch i {
+		case 0:
+			decoded.NoticeVersion = value
+		case 1:
+			decoded.NoticeLocale = value
+		case 2:
+			decoded.PolicyVersion = value
+		}
+	}
+	*r = consentReceipt(decoded)
+	return nil
+}
+
+func (r consentReceipt) malformedNotice() bool {
+	return r.noticeInvalid ||
+		((r.noticePresent || r.ConsentNotice != (ConsentNotice{})) && !r.ConsentNotice.valid())
 }
 
 // analyticsGranted reads the receipt's analytics category, false when the
@@ -136,10 +182,9 @@ type consentOutboxWire struct {
 // exactly the known fields. An entry survives only with every required
 // field a non-empty string, the actor identifier within the byte clamp,
 // the analytics category PRESENT (an absent category is a malformed entry,
-// never an implicit denial — see the type comment), and the optional
-// fields absent or valid; anything else — a truncated entry, a garbled
-// field, an oversized legacy identifier — is dropped fail-safe: never
-// sent, never a crash, never blocking the deliverable rest.
+// never an implicit denial — see the type comment). A malformed notice rejects
+// a grant; a denial survives with the entire optional tuple omitted. Other
+// malformed fields still drop the entry fail-safe without blocking the rest.
 func sanitizeConsentReceipt(entry consentReceipt) (consentReceipt, bool) {
 	if entry.IdempotencyKey == "" || entry.WorkspaceID == "" || entry.AppID == "" ||
 		entry.EnvironmentID == "" || entry.DecidedAt == "" {
@@ -154,8 +199,13 @@ func sanitizeConsentReceipt(entry consentReceipt) (consentReceipt, bool) {
 	if entry.AnonymousID != "" && !validConsentIdentifier(entry.AnonymousID) {
 		return consentReceipt{}, false
 	}
-	if entry.ConsentNotice != (ConsentNotice{}) && !entry.ConsentNotice.valid() {
-		return consentReceipt{}, false
+	if entry.malformedNotice() {
+		if entry.analyticsGranted() {
+			return consentReceipt{}, false
+		}
+		// Optional provenance cannot prevent a denial from reaching the server.
+		entry.ConsentNotice = ConsentNotice{}
+		entry.noticeInvalid = true
 	}
 	switch entry.Reason {
 	case "":
@@ -183,6 +233,7 @@ func sanitizeConsentReceipt(entry consentReceipt) (consentReceipt, bool) {
 	}
 	sanitized := consentReceipt{
 		ConsentNotice:   entry.ConsentNotice,
+		noticeInvalid:   entry.noticeInvalid,
 		IdempotencyKey:  entry.IdempotencyKey,
 		WorkspaceID:     entry.WorkspaceID,
 		AppID:           entry.AppID,
@@ -235,6 +286,8 @@ type consentOutbox struct {
 	// worker starts; not guarded by mu because both happen during
 	// construction, before this outbox is reachable from another goroutine.
 	lastRead consentOutboxRead
+	// Construction diagnostic; writes continue to use their specific errors.
+	noticeInvalidAtLoad bool
 
 	// dirty marks an owed durable write: the mirror is authoritative and
 	// the write retries at every dispatch point and at Close.
@@ -449,6 +502,10 @@ const (
 // from UNUSABLE (something is there and we cannot read it), and callers
 // that gate on consent resolve UNUSABLE restrictively. See initConsentFloor.
 func (o *consentOutbox) readRecordReceipts() ([]consentReceipt, consentOutboxRead) {
+	return o.readRecordReceiptsWithNotice(nil)
+}
+
+func (o *consentOutbox) readRecordReceiptsWithNotice(invalidNotice func(consentReceipt)) ([]consentReceipt, consentOutboxRead) {
 	if !o.durable() {
 		return nil, consentOutboxReadAbsent
 	}
@@ -499,6 +556,9 @@ func (o *consentOutbox) readRecordReceipts() ([]consentReceipt, consentOutboxRea
 	rejected := false
 	lastDecidedAt := make(map[string]string, len(entries))
 	for _, entry := range entries {
+		if entry.malformedNotice() && invalidNotice != nil {
+			invalidNotice(entry)
+		}
 		sanitized, ok := sanitizeConsentReceipt(entry)
 		if !ok {
 			rejected = true
@@ -558,7 +618,13 @@ func (o *consentOutbox) load(own func(consentReceipt) bool) {
 	if !o.durable() {
 		return
 	}
-	loaded, readState := o.readRecordReceipts()
+	needsNoticeRewrite := false
+	loaded, readState := o.readRecordReceiptsWithNotice(func(entry consentReceipt) {
+		needsNoticeRewrite = true
+		if own == nil || own(entry) {
+			o.noticeInvalidAtLoad = true
+		}
+	})
 	o.lastRead = readState
 	o.mu.Lock()
 	evicted := 0
@@ -580,7 +646,10 @@ func (o *consentOutbox) load(own func(consentReceipt) bool) {
 	}
 	o.receipts = loaded
 	o.evictedSinceSave += evicted
-	if evicted > 0 {
+	if evicted > 0 || needsNoticeRewrite {
+		// Notice sanitation is also only in memory. Retry its rewrite through
+		// the existing evidence hold: rejected grants never erase the last
+		// witness before an unwitnessed decision record is durable.
 		// The trim only happened in MEMORY: left there, a process that never
 		// saves before exiting leaves the over-cap file behind, and every
 		// restart re-evicts and re-counts the same entries. Marking the
@@ -1598,6 +1667,17 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 				}
 			}
 		}
+	}
+	if c.consentOutbox.noticeInvalidAtLoad {
+		c.stats.mu.Lock()
+		// Durability failures retain precedence over the metadata warning.
+		switch c.stats.lastConsentError {
+		case "consent_outbox_persist_failed", "consent_persist_failed", "consent_unwitnessed_mark_failed":
+		default:
+			c.stats.lastConsentError = "consent_notice_invalid"
+		}
+		c.stats.mu.Unlock()
+		c.logf("shardpilot consent floor: consent_notice_invalid in stored receipt; denials omit the tuple, grants are rejected and require a fresh explicit decision")
 	}
 	if c.consentOutbox.pending() {
 		// Construction is a dispatch point: reloaded receipts must re-send

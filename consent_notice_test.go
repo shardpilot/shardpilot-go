@@ -478,6 +478,14 @@ func TestConsentNoticeStoredValidation(t *testing.T) {
 			"partial": `,"notice_version":"v"`, "malformed": `,"notice_version":"v","notice_locale":"en_US","policy_version":"p"`,
 			"duplicate-variant":   `,"notice_version":"v","notice_locale":"de-1901-1901","policy_version":"p"`,
 			"duplicate-singleton": `,"notice_version":"v","notice_locale":"en-a-foo-a-bar","policy_version":"p"`,
+			"empty-version":       `,"notice_version":""`,
+			"null-version":        `,"notice_version":null`,
+			"empty-locale":        `,"notice_locale":""`,
+			"null-locale":         `,"notice_locale":null`,
+			"empty-policy":        `,"policy_version":""`,
+			"null-policy":         `,"policy_version":null`,
+			"all-empty":           `,"notice_version":"","notice_locale":"","policy_version":""`,
+			"all-null":            `,"notice_version":null,"notice_locale":null,"policy_version":null`,
 		} {
 			t.Run(fmt.Sprintf("grant-%t/%s", grant, name), func(t *testing.T) {
 				raw := fmt.Sprintf(`{"idempotency_key":"synthetic-key","workspace_id":"w","app_id":"a","environment_id":"e","actor_identifier":"synthetic-notice-actor","categories":{"analytics":%t},"decided_at":"2026-06-10T12:00:00Z"%s}`, grant, extra)
@@ -486,7 +494,7 @@ func TestConsentNoticeStoredValidation(t *testing.T) {
 					t.Fatal(err)
 				}
 				sanitized, ok := sanitizeConsentReceipt(entry)
-				want := name == "legacy" || name == "valid"
+				want := !grant || name == "legacy" || name == "valid"
 				if ok != want {
 					t.Fatalf("stored receipt accepted=%t, want %t", ok, want)
 				}
@@ -555,4 +563,187 @@ func TestConsentNoticeInvalidActorWarnings(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Exercise the actual durable reader, startup resolution, HTTP dispatch and
+// next launch. A zero-valued tuple with supplied JSON members is not legacy.
+func TestConsentNoticeStoredPresenceReload(t *testing.T) {
+	for _, grant := range []bool{false, true} {
+		for name, extra := range map[string]string{
+			"legacy":            "",
+			"valid":             `,"notice_version":"v","notice_locale":"en","policy_version":"p"`,
+			"empty-version":     `,"notice_version":""`,
+			"null-version":      `,"notice_version":null`,
+			"empty-locale":      `,"notice_locale":""`,
+			"null-locale":       `,"notice_locale":null`,
+			"empty-policy":      `,"policy_version":""`,
+			"null-policy":       `,"policy_version":null`,
+			"all-empty":         `,"notice_version":"","notice_locale":"","policy_version":""`,
+			"all-null":          `,"notice_version":null,"notice_locale":null,"policy_version":null`,
+			"partial":           `,"notice_version":"v"`,
+			"wrong-type":        `,"notice_version":false,"notice_locale":"en","policy_version":"p"`,
+			"duplicate-variant": `,"notice_version":"v","notice_locale":"de-1901-1901","policy_version":"p"`,
+		} {
+			t.Run(fmt.Sprintf("grant-%t/%s", grant, name), func(t *testing.T) {
+				malformed := name != "legacy" && name != "valid"
+				dir := t.TempDir()
+				raw := fmt.Sprintf(`{"version":1,"receipts":[{"idempotency_key":"synthetic-key","workspace_id":"workspace-test","app_id":"app-test","environment_id":"develop","actor_identifier":"synthetic-notice-actor","anonymous_id":"synthetic-notice-actor","categories":{"analytics":%t},"decided_at":"2026-06-10T12:00:00Z"%s}]}`, grant, extra)
+				if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName), []byte(raw), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				decision := ConsentDecisionDenied
+				if grant {
+					decision = ConsentDecisionGranted
+				}
+				cfg := Config{WorkspaceID: "workspace-test", AppID: "app-test", EnvironmentID: "develop", AnonymousID: "synthetic-notice-actor"}
+				if err := saveConsentRecord(dir, decision, consentActorDigest(cfg), "2026-06-10T12:00:00Z", true, os.Rename, os.Chmod); err != nil {
+					t.Fatal(err)
+				}
+				wire, server := newFloorTestServer(t)
+				defer server.Close()
+				c := newFloorTestClient(t, server.URL, dir, func(cfg *Config) { cfg.AnonymousID = "synthetic-notice-actor" })
+				if malformed && grant && c.ConsentState() == ConsentGranted {
+					t.Error("malformed persisted grant opened analytics")
+				}
+				if err := c.Close(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				wantPosts := 1
+				if malformed && grant {
+					wantPosts = 0
+				}
+				if wire.consentCount() != wantPosts {
+					t.Errorf("startup POSTs=%d, want %d", wire.consentCount(), wantPosts)
+				}
+				if malformed && c.Snapshot().LastConsentError != "consent_notice_invalid" {
+					t.Errorf("notice diagnostic=%q", c.Snapshot().LastConsentError)
+				}
+				if wantPosts == 1 && wire.consentCount() == 1 {
+					var want *[3]string
+					if name == "valid" {
+						want = &[3]string{"v", "en", "p"}
+					}
+					checkNoticeBody(t, wire.consentAt(0), want)
+					if consentBoolCategory(t, wire.consentAt(0)) != grant {
+						t.Error("category changed")
+					}
+				}
+				if malformed && grant {
+					entries, state := newConsentOutbox(dir).readRecordReceipts()
+					if len(entries) != 0 || state != consentOutboxReadParsed {
+						t.Errorf("bad grant not removed by maintenance: %d, %v", len(entries), state)
+					}
+					info, ok := loadConsentRecordInfo(dir, consentActorDigest(cfg))
+					if !ok || !info.unwitnessed {
+						t.Error("grant rejection has no durable unwitnessed mark")
+					}
+				}
+				restored := newFloorTestClient(t, server.URL, dir, func(cfg *Config) { cfg.AnonymousID = "synthetic-notice-actor" })
+				if malformed && grant && restored.ConsentState() == ConsentGranted {
+					t.Error("restart reopened malformed grant")
+				}
+				if err := restored.Close(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				if wire.consentCount() != wantPosts {
+					t.Errorf("restart POSTs=%d, want %d", wire.consentCount(), wantPosts)
+				}
+				if malformed && grant {
+					recovered := newFloorTestClient(t, server.URL, dir, func(cfg *Config) { cfg.AnonymousID = "synthetic-notice-actor" })
+					result, err := recovered.SetConsent(true, ConsentNotice{NoticeVersion: "new", NoticeLocale: "en", PolicyVersion: "new"})
+					if err != nil || len(result.Warnings) != 0 {
+						t.Fatalf("fresh grant recovery: %+v, %v", result, err)
+					}
+					if err := recovered.Close(context.Background()); err != nil {
+						t.Fatal(err)
+					}
+					if wire.consentCount() != 1 {
+						t.Fatalf("fresh grant POSTs=%d, want 1", wire.consentCount())
+					}
+					checkNoticeBody(t, wire.consentAt(0), &[3]string{"new", "en", "new"})
+				}
+			})
+		}
+	}
+}
+
+func TestConsentNoticeStoredEvidenceAndWarningPriority(t *testing.T) {
+	for _, mode := range []string{"missing-record", "mark-write-failed", "healthy-mark"} {
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			cfg := Config{WorkspaceID: "workspace-test", AppID: "app-test", EnvironmentID: "develop", AnonymousID: "anon-spool-1", SpoolDir: dir, ConsentFloor: &ConsentFloorConfig{}}
+			if mode != "missing-record" {
+				if err := saveConsentRecord(dir, ConsentDecisionGranted, consentActorDigest(cfg), "2026-06-10T12:00:00Z", true, os.Rename, os.Chmod); err != nil {
+					t.Fatal(err)
+				}
+			}
+			raw := `{"version":1,"receipts":[{"idempotency_key":"synthetic-key","workspace_id":"workspace-test","app_id":"app-test","environment_id":"develop","actor_identifier":"anon-spool-1","anonymous_id":"anon-spool-1","categories":{"analytics":true},"decided_at":"2026-06-10T12:00:00Z","notice_version":null}]}`
+			if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName), []byte(raw), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			c := &Client{cfg: cfg, clock: realClock{}}
+			c.initConsentFloor(func(old, target string) error {
+				if mode == "mark-write-failed" && target == consentRecordPath(dir) {
+					return errors.New("synthetic record write refusal")
+				}
+				return os.Rename(old, target)
+			}, os.Chmod)
+			want := "consent_notice_invalid"
+			if mode == "mark-write-failed" {
+				want = "consent_unwitnessed_mark_failed"
+			}
+			if got := c.Snapshot().LastConsentError; got != want {
+				t.Errorf("diagnostic=%q, want %q", got, want)
+			}
+			if c.ConsentState() != ConsentUnknown {
+				t.Errorf("invalid grant state=%v", c.ConsentState())
+			}
+			if len(c.consentOutbox.snapshot()) != 0 {
+				t.Error("bad grant remains in the mirror")
+			}
+			if _, ok := c.consentOutbox.nextDispatchable(c.consentReceiptInScope); ok {
+				t.Error("bad grant remains dispatchable")
+			}
+			c.consentOutbox.retryPersist()
+			after, err := os.ReadFile(filepath.Join(dir, consentOutboxFileName))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if mode != "healthy-mark" && string(after) != raw {
+				t.Error("last rejection evidence erased before durable marking")
+			}
+			if mode == "healthy-mark" {
+				entries, state := newConsentOutbox(dir).readRecordReceipts()
+				if len(entries) != 0 || state != consentOutboxReadParsed {
+					t.Error("successful maintenance kept the bad grant")
+				}
+			}
+		})
+	}
+	t.Run("denial-outbox-write-failed", func(t *testing.T) {
+		dir := t.TempDir()
+		c, wire := setterClient(t, true, dir, "synthetic-notice-actor")
+		if err := c.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		raw := `{"version":1,"receipts":[{"idempotency_key":"synthetic-key","workspace_id":"workspace-test","app_id":"app-test","environment_id":"develop","actor_identifier":"synthetic-notice-actor","anonymous_id":"synthetic-notice-actor","categories":{"analytics":false},"decided_at":"2026-06-10T12:00:00Z","notice_version":""}]}`
+		if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName), []byte(raw), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c.initConsentFloor(os.Rename, os.Chmod)
+		if got := c.Snapshot().LastConsentError; got != "consent_notice_invalid" {
+			t.Errorf("initial notice diagnostic=%q", got)
+		}
+		c.consentOutbox.renameFn = func(string, string) error { return errors.New("synthetic outbox write refusal") }
+		c.dispatchConsentReceipts(context.Background(), true)
+		if got := c.Snapshot().LastConsentError; got != "consent_outbox_persist_failed" {
+			t.Errorf("durability diagnostic=%q", got)
+		}
+		if wire.consentCount() != 1 {
+			t.Fatalf("denial POSTs=%d, want 1", wire.consentCount())
+		}
+		checkNoticeBody(t, wire.consentAt(0), nil)
+		c.consentOutbox.renameFn = os.Rename
+		c.consentOutbox.retryPersist()
+	})
 }

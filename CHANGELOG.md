@@ -14,6 +14,14 @@
   and private-use subtags may repeat. Other locale validity remains server-side,
   with no registry lookup or normalization of the host's spelling.
 
+- Durable notice decoding preserves field presence. Explicit empty/null,
+  partial, ill-typed and invalid stored tuples cannot become legacy receipts.
+  A denial sends without the tuple and diagnoses `consent_notice_invalid`;
+  a malformed grant never dispatches and is removed under the existing durable
+  rejection-evidence rules. Recorded denials remain honored; an unprovable
+  grant stays Unknown until a fresh explicit decision. Persistence diagnostics
+  take precedence. No server-confirmed consent history is introduced.
+
 - Both analytics consent setters now return `(ConsentResult, error)`. Nil error
   means the local decision applied; `Warnings` identifies unfinished record,
   receipt or purge work. Denial with an invalid actor applies locally with
