@@ -10,9 +10,9 @@
   "consent_text_version": "strict-fallback/1",
   "presented_language": "en",
   "scope": {
-    "workspace_id": "",
-    "app_id": "",
-    "environment_id": ""
+    "workspace_key": "",
+    "app_key": "",
+    "environment_key": ""
   },
   "signals_used": [
     {

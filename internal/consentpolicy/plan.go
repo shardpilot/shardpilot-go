@@ -138,22 +138,22 @@ func (s SignalReason) known() bool {
 	return s == SourceNotPermitted || s == SourceUnavailable || s == NotEnabledInRelease
 }
 
-// Scope is the canonical tuple a plan is issued for. A bare workspace cannot
+// Scope is the literal key tuple a plan is issued for. A bare workspace cannot
 // select per-app overrides, so all three are required and all three are
 // compared.
 type Scope struct {
-	WorkspaceID   string `json:"workspace_id"`
-	AppID         string `json:"app_id"`
-	EnvironmentID string `json:"environment_id"`
+	WorkspaceKey   string `json:"workspace_key"`
+	AppKey         string `json:"app_key"`
+	EnvironmentKey string `json:"environment_key"`
 }
 
 func (s Scope) equal(other Scope) bool {
-	return s.WorkspaceID == other.WorkspaceID && s.AppID == other.AppID &&
-		s.EnvironmentID == other.EnvironmentID
+	return s.WorkspaceKey == other.WorkspaceKey && s.AppKey == other.AppKey &&
+		s.EnvironmentKey == other.EnvironmentKey
 }
 
 func (s Scope) complete() bool {
-	return s.WorkspaceID != "" && s.AppID != "" && s.EnvironmentID != ""
+	return s.WorkspaceKey != "" && s.AppKey != "" && s.EnvironmentKey != ""
 }
 
 // Signal is one entry of signals_used: what the resolver was able to read, or
@@ -378,7 +378,7 @@ func buildSchemaKeys(root reflect.Type) map[reflect.Type]map[string]reflect.Type
 // ⚠ THE TOP-LEVEL-ONLY WALK WAS NOT A SMALLER VERSION OF THIS, IT WAS A HOLE.
 // It decoded each value wholesale as json.RawMessage, so encoding/json got the
 // nested ambiguity untouched and its case-insensitive, last-one-wins matching
-// decided it: {"scope":{"workspace_id":"other","WORKSPACE_ID":"expected"}}
+// decided it: {"scope":{"workspace_key":"other","WORKSPACE_KEY":"expected"}}
 // decoded to the EXPECTED workspace and then passed the scope comparison —
 // a plan issued for another app admitting here, which is the one thing the
 // scope comparison exists to stop.

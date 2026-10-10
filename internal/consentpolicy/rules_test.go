@@ -599,8 +599,8 @@ func TestKeysMustBeExactAndUnique(t *testing.T) {
 // ⚠ AND THE KEY WALK MUST REACH EVERY DEPTH. The top-level-only version was
 // not a smaller version of this rule, it was a hole: it handed each nested
 // value to encoding/json untouched, so the case-insensitive, last-one-wins
-// matching decided the nested field. A scope carrying "workspace_id" and
-// "WORKSPACE_ID" decoded to the expected workspace and then PASSED the scope
+// matching decided the nested field. A scope carrying "workspace_key" and
+// "WORKSPACE_KEY" decoded to the expected workspace and then PASSED the scope
 // comparison — a plan issued for another app admitting here.
 //
 // ⚠ AND THE CONTRACT NOW HAS TWO MORE NESTED OBJECTS THAN IT DID. `flags` and
@@ -615,11 +615,11 @@ func TestNestedObjectKeysMustBeExactAndUnique(t *testing.T) {
 		// the case-variant spelling is what the decoder picks, so the scope
 		// comparison compares the FORGERY against itself and passes.
 		{"a case-variant key inside scope",
-			`"workspace_id":"ws_1"`,
-			`"workspace_id":"ws-OTHER-TENANT","WORKSPACE_ID":"ws_1"`},
+			`"workspace_key":"ws_1"`,
+			`"workspace_key":"ws-OTHER-TENANT","WORKSPACE_KEY":"ws_1"`},
 		{"a duplicate key inside scope",
-			`"app_id":"app_1"`,
-			`"app_id":"app_1","app_id":"app_1"`},
+			`"app_key":"app_1"`,
+			`"app_key":"app_1","app_key":"app_1"`},
 		// ⚠ THE SAME ATTACK ON A FLAG. A permissive spelling wins the field
 		// and the conservative one is what a reader of the body sees.
 		{"a case-variant key inside flags",
@@ -642,8 +642,8 @@ func TestNestedObjectKeysMustBeExactAndUnique(t *testing.T) {
 		// never the hole. The hole was the ambiguity between two spellings of a
 		// name the schema does have, which DisallowUnknownFields cannot see.
 		{"an unknown key inside scope",
-			`"environment_id":"env_1"`,
-			`"environment_id":"env_1","tenant":"x"`},
+			`"environment_key":"env_1"`,
+			`"environment_key":"env_1","tenant":"x"`},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
