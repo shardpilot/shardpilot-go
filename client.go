@@ -705,16 +705,10 @@ func (c *Client) finishClose(ctx context.Context) error {
 		c.closeDone = done
 		c.closeMu.Unlock()
 		err := c.finalizeConsentOutbox(ctx)
-		// The WORKER may still be running: the earlier Close can have timed
-		// out before workerDone, with the stop path — the one that spools
-		// and counts the close remnant — not yet finished (or not even
-		// started, the worker stuck mid-operation). A nil from this retry
-		// without waiting would let the caller exit over a remnant that is
-		// neither delivered nor durable, uncounted. Wait it out bounded by
-		// THIS caller's context, folding the bound in when it cuts the wait;
-		// the discard verdict below then sees everything the finished stop
-		// path counted (and the idempotent re-fold on cached returns catches
-		// any straggler, the round-established posture).
+		// The worker may still be running after an earlier Close timed out.
+		// Wait for workerDone within this caller's context so the stop path can
+		// persist or account for its remnant. Fold a timeout into the result;
+		// cached returns also fold any later discard count.
 		select {
 		case <-c.workerDone:
 		case <-contextDone(ctx):

@@ -1219,14 +1219,9 @@ func parseSpoolDocument(data []byte) spoolDocument {
 // live is the backlog the writing run held: the append log's records applied
 // in order.
 //
-// ⚠ THIS USED TO RE-DERIVE THE WRITER'S EVICTIONS INSTEAD OF READING THEM, and
-// that was the single most expensive decision in this change. Replaying the
-// caps here made the reader a SECOND IMPLEMENTATION of eviction that had to
-// agree with the writer's in every detail — and it did not, four separate
-// times: it got the byte cap wrong by de-duplicating first, it mis-ordered
-// re-appended ids, it lost the pressure of batch members evicted on arrival,
-// and it cost O(n²) to run. Each was found, one review round apart, and each
-// fix taught the copy one more thing the original already knew.
+// Eviction depends on writer state that is absent from the log. The
+// writer therefore records the decision as a drop record naming the id;
+// the reader applies that decision instead of rerunning cap eviction.
 //
 // A reader cannot re-derive a decision that depended on state the writer had
 // and the file does not. So the writer now WRITES THE DECISION: an eviction

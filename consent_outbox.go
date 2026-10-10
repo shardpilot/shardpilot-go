@@ -412,14 +412,10 @@ func (o *consentOutbox) filePath() string {
 	return filepath.Join(o.dir, consentOutboxFileName)
 }
 
-// EIGHT INVARIANTS GOVERN THIS STATE, AND THEY WERE NOT CHECKED PAIRWISE.
+// Durable consent state and recovery invariants.
 //
-// Read this before changing anything here. The rules below accumulated one per
-// review round, and each was correct on its own; what review then began finding
-// was not new CLASSES of defect but INTERSECTIONS between rules that already
-// existed. Five consecutive rounds produced exactly three findings each — a
-// plateau, and the shape of one: eight rules make twenty-eight pairs, and a
-// review round consumes about three.
+// The following eight rules govern durable consent state and recovery.
+// Their interactions matter as well as each rule individually.
 //
 //  1. A read of durable state is THREE-VALUED — absent / unusable / parsed —
 //     in both files, because "I could not read it" and "there is nothing
@@ -433,7 +429,7 @@ func (o *consentOutbox) filePath() string {
 //     not have been about. Absence of a stamp reads as infinitely NEW.
 //  5. A withheld grant is written in a shape an OLDER build both understands
 //     and refuses to authorize on — refusing the RECORD is not refusing the
-//     AUTHORIZATION, and the two came apart three times.
+//     AUTHORIZATION.
 //  6. A record belonging to another scope is a TOMBSTONE and vetoes a grant
 //     unconditionally: no wall-clock comparison is sound across a scope
 //     switch, and here a wrong answer admits rather than sticks.
@@ -443,25 +439,15 @@ func (o *consentOutbox) filePath() string {
 //  8. The writer never produces a record its own reader would refuse, and a
 //     decision that cannot be stored is refused loudly rather than dropped.
 //
-// HOW FAR THIS IS VERIFIED. Each rule has tests, and every guard was broken and
-// seen to fail before being restored. The INTERSECTIONS were sampled, not
-// enumerated: review picked a handful of pairs per round and the ones it picked
-// were real, which says nothing about the ones it did not. Treat "these eight
-// hold together" as unproven.
+// Per-rule checks and sampled interactions support these rules;
+// they do not establish every combination of the eight rules.
 //
-// KNOWN AND DEFERRED, both restrictive in direction — they make recovery fail
-// to arrive, never authorization arrive wrongly, and that is the only reason
-// they were not blockers. They are NOT unimportant, and being deferred once is
-// not a reason to defer them again:
+// Known recovery limitations with a restrictive outcome:
 //   - a fresh receipt-bearing recovery does not replace a non-monotonic
 //     history in every path, so such a trail can stay unusable longer than it
 //     should;
 //   - an actorless (local-only) client has no receipt to carry a fresh
 //     decision, so the paths keyed on one do not release for it.
-//
-// The next change here should start by REDUCING the eight rather than testing
-// more pairs: several are consequences of others, and the pair surface falls
-// quadratically.
 
 // consentOutboxRead classifies what a read of the durable record LEARNED,
 // which is not the same question as what it returned. Absent and unusable
@@ -1539,13 +1525,9 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 				c.consentRecordApplyMu.Unlock()
 			}
 		}
-		// THE ONE VERDICT. Either witness being unreadable makes a grant
-		// unprovable, and so does a mark a PREVIOUS start persisted. It is
-		// computed here, once, and every grant-affecting decision reads it —
-		// local promotion, the trail-tail heal, and the dispatch worker. Six
-		// separate rounds found the same asymmetry, each time because one
-		// site consulted a subset of these signals and a grant took effect
-		// through the door that had not been widened.
+		// Compute one grant-entitlement verdict from both durable witnesses
+		// and any persisted withholding mark. Local promotion, trail-tail
+		// healing and the dispatch worker must all use that verdict.
 		//
 		// `record.unwitnessed` appears here as a plain boolean ON PURPOSE,
 		// and it is NOT a second ordering check. Ordering is decided once,
