@@ -59,6 +59,10 @@ var (
 	// ConsentDecisionDenied, or ConsentDecisionDeniedForcedMinor.
 	ErrInvalidConsentDecision = errors.New("invalid_consent: invalid shardpilot consent decision")
 
+	// ErrInvalidConsentNotice refuses a grant with malformed notice metadata.
+	// Denials apply with consent_notice_invalid as a warning and omit the tuple.
+	ErrInvalidConsentNotice = errors.New("consent_notice_invalid: invalid shardpilot consent notice")
+
 	// ErrInvalidConsentIdentity refuses a grant when a configured actor
 	// identifier exceeds the 512-byte receipt bound. Denial still applies
 	// locally with a consent_actor_invalid warning and no receipt. Neither

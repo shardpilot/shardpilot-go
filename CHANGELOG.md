@@ -2,6 +2,26 @@
 
 ## v0.8.0-alpha — release preparation (not published)
 
+- Both consent setters accept optional per-call `ConsentNotice` provenance.
+  A valid tuple follows its receipt through retry and durable reload. Invalid
+  metadata cannot block a denial: the tuple is omitted and the result includes
+  `consent_notice_invalid` along with other warnings. Grants with invalid notice
+  metadata are refused with `ErrInvalidConsentNotice`, without state or receipt
+  changes. Omitted arguments preserve behavior; update setter method-value
+  adapters for the variadic `...ConsentNotice` parameter. Notice text is never
+  part of this carrier. Locale validation enforces RFC 5646 syntax and
+  case-insensitive variant and extension-singleton uniqueness; extension values
+  and private-use subtags may repeat. Other locale validity remains server-side,
+  with no registry lookup or normalization of the host's spelling.
+
+- Durable notice decoding preserves field presence. Explicit empty/null,
+  partial, ill-typed and invalid stored tuples cannot become legacy receipts.
+  A denial sends without the tuple and diagnoses `consent_notice_invalid`;
+  a malformed grant never dispatches and is removed under the existing durable
+  rejection-evidence rules. Recorded denials remain honored; an unprovable
+  grant stays Unknown until a fresh explicit decision. Persistence diagnostics
+  take precedence. No server-confirmed consent history is introduced.
+
 - Both analytics consent setters now return `(ConsentResult, error)`. Nil error
   means the local decision applied; `Warnings` identifies unfinished record,
   receipt or purge work. Denial with an invalid actor applies locally with
