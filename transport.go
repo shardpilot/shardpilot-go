@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptrace"
 	"strconv"
@@ -432,13 +431,16 @@ func (t *httpTransport) postBody(ctx context.Context, endpoint string, payload [
 		httpRequest.Header.Set(schemaRevisionHeader, schemaRevision)
 	}
 
-	// The trace proves pre-connection failures on the standard transport.
-	// Unknown injected transports fail conservatively: absence of tracing
-	// alone is not evidence that no bytes were sent.
-	var connecting, connected atomic.Bool
+	// Only the actual transport's trace can establish a pre-connection
+	// failure. An injected transport can send a request and then return a
+	// DNS/dial-shaped error, so the error type is never delivery evidence.
+	var connecting, connected, wrote atomic.Bool
 	httpRequest = httpRequest.WithContext(httptrace.WithClientTrace(httpRequest.Context(), &httptrace.ClientTrace{
-		GetConn: func(string) { connecting.Store(true) },
-		GotConn: func(httptrace.GotConnInfo) { connected.Store(true) },
+		GetConn:      func(string) { connecting.Store(true) },
+		GotConn:      func(httptrace.GotConnInfo) { connected.Store(true) },
+		WroteHeaders: func() { wrote.Store(true) },
+		// Even an unsuccessful write may have transmitted part of the request.
+		WroteRequest: func(httptrace.WroteRequestInfo) { wrote.Store(true) },
 	}))
 	if err := ctx.Err(); err != nil {
 		return err
@@ -456,9 +458,7 @@ func (t *httpTransport) postBody(ctx context.Context, endpoint string, payload [
 	}
 	response, err := t.client.Do(httpRequest)
 	if err != nil {
-		var dns *net.DNSError
-		var op *net.OpError
-		definitelyNotDelivered = !connected.Load() && (connecting.Load() || errors.As(err, &dns) || (errors.As(err, &op) && op.Op == "dial"))
+		definitelyNotDelivered = connecting.Load() && !connected.Load() && !wrote.Load()
 		return fmt.Errorf("send shardpilot ingest request: %w", err)
 	}
 	defer response.Body.Close()

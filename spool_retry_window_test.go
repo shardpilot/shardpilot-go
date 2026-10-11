@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"os"
 	"path/filepath"
 	"strings"
@@ -99,6 +100,7 @@ type retryWindowHTTP struct {
 	status int
 	err    error
 	bodies [][]byte
+	trace  func(*httptrace.ClientTrace)
 }
 
 func (r *retryWindowHTTP) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -112,6 +114,9 @@ func (r *retryWindowHTTP) RoundTrip(req *http.Request) (*http.Response, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.bodies = append(r.bodies, body)
+	if r.trace != nil {
+		r.trace(httptrace.ContextClientTrace(req.Context()))
+	}
 	if r.err != nil {
 		return nil, r.err
 	}
@@ -124,16 +129,29 @@ func TestRetryWindowTransportClassification(t *testing.T) {
 		err       error
 		status    int
 		ambiguous bool
+		trace     func(*httptrace.ClientTrace)
 	}{
-		{name: "dns", err: &net.DNSError{Err: "offline", Name: "ingest.invalid"}},
-		{name: "connect_refused", err: &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}},
+		{name: "dns", err: &net.DNSError{Err: "offline", Name: "ingest.invalid"}, ambiguous: true},
+		{name: "connect_refused", err: &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}, ambiguous: true},
+		{name: "headers_written", err: io.ErrUnexpectedEOF, ambiguous: true, trace: func(trace *httptrace.ClientTrace) {
+			trace.GetConn("ingest.invalid:443")
+			if trace.WroteHeaders != nil {
+				trace.WroteHeaders()
+			}
+		}},
+		{name: "request_write_failed", err: io.ErrUnexpectedEOF, ambiguous: true, trace: func(trace *httptrace.ClientTrace) {
+			trace.GetConn("ingest.invalid:443")
+			if trace.WroteRequest != nil {
+				trace.WroteRequest(httptrace.WroteRequestInfo{Err: io.ErrUnexpectedEOF})
+			}
+		}},
 		{name: "response_lost_after_write", err: io.ErrUnexpectedEOF, ambiguous: true},
 		{name: "server_failure", status: 503, ambiguous: true},
 		{name: "backpressure", status: 429},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
-			rt := &retryWindowHTTP{status: tc.status, err: tc.err}
+			rt := &retryWindowHTTP{status: tc.status, err: tc.err, trace: tc.trace}
 			client := newSpoolTestClient(t, "https://ingest.invalid", dir, nil, func(cfg *Config) {
 				cfg.HTTPClient = &http.Client{Transport: rt}
 				cfg.DisableRequestCompression = true
@@ -180,6 +198,118 @@ func TestRetryWindowTransportClassification(t *testing.T) {
 				if len(rt.bodies) < 2 || !bytes.Equal(rt.bodies[0], rt.bodies[1]) {
 					t.Fatal("live retry did not preserve exact request bytes")
 				}
+			}
+		})
+	}
+}
+
+type retryWindowForwarder func(*http.Request) (*http.Response, error)
+
+func (f retryWindowForwarder) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestRetryWindowForwardedTypedErrorExpires(t *testing.T) {
+	for _, typedError := range []error{
+		&net.DNSError{Err: "proxy response lookup failed", Name: "proxy.invalid"},
+		&net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED},
+	} {
+		for _, traced := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%T/traced_%v", typedError, traced), func(t *testing.T) {
+				state, server := newSpoolTestServer(t)
+				defer server.Close()
+				base := http.DefaultTransport.(*http.Transport).Clone()
+				defer base.CloseIdleConnections()
+				rt := retryWindowForwarder(func(req *http.Request) (*http.Response, error) {
+					forwarded := req
+					if !traced {
+						// A supported custom transport may perform its own request
+						// without propagating the SDK's trace context.
+						ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+						defer cancel()
+						forwarded = req.Clone(ctx)
+					}
+					resp, err := base.RoundTrip(forwarded)
+					if err != nil || req.URL.Path != "/v1/events:batch" {
+						return resp, err
+					}
+					_, _ = io.Copy(io.Discard, resp.Body)
+					_ = resp.Body.Close()
+					return nil, typedError
+				})
+				dir := t.TempDir()
+				client := newSpoolTestClient(t, server.URL, dir, nil, func(cfg *Config) {
+					cfg.HTTPClient = &http.Client{Transport: rt}
+				})
+				defer client.Close(context.Background())
+				client.SetConsent(true)
+				const id = "aa5b99d4-720b-48ac-82d7-e14ce815558a"
+				if err := client.Enqueue(Event{ID: id, Name: "forwarded_then_error"}); err != nil {
+					t.Fatal(err)
+				}
+				if err := client.Flush(context.Background()); err == nil {
+					t.Fatal("expected the forwarded request's typed error")
+				}
+				arrivals := state.allArrivals()
+				if len(arrivals) != 1 || len(arrivals[0]) != 1 || arrivals[0][0] != id {
+					t.Fatalf("receiver did not observe original event: %v", arrivals)
+				}
+				record := readSpoolRecordFile(t, dir)
+				if len(record.Events) != 1 {
+					t.Fatalf("spool members=%d", len(record.Events))
+				}
+				if record.Events[0].AmbiguousUnixMS == 0 {
+					t.Error("forwarded typed error erased the ambiguous clock")
+				}
+				// Advance only the loader's time. The saved envelope and both
+				// clocks are the real attempt's unchanged durable output. Use
+				// a copy so the loader cannot modify the live client's store.
+				data, err := os.ReadFile(filepath.Join(dir, spoolFileName))
+				if err != nil {
+					t.Fatal(err)
+				}
+				restartConfig := client.cfg
+				restartConfig.SpoolDir = t.TempDir()
+				if err := os.WriteFile(filepath.Join(restartConfig.SpoolDir, spoolFileName), data, 0600); err != nil {
+					t.Fatal(err)
+				}
+				restarted := newDiskSpool(restartConfig)
+				outcome := restarted.load(time.Now().Add(16 * time.Minute))
+				if len(outcome.expired) != 1 || restarted.hasResendWork() {
+					t.Fatal("forwarded event remained retryable after sixteen minutes")
+				}
+			})
+		}
+	}
+}
+
+func TestRetryWindowStandardTransportDialFailureDoesNotStartClock(t *testing.T) {
+	for _, dialError := range []error{
+		&net.DNSError{Err: "offline", Name: "ingest.invalid"},
+		&net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED},
+	} {
+		t.Run(fmt.Sprintf("%T", dialError), func(t *testing.T) {
+			var dialCalls atomic.Int64
+			rt := &http.Transport{DialContext: func(context.Context, string, string) (net.Conn, error) {
+				dialCalls.Add(1)
+				return nil, dialError
+			}}
+			defer rt.CloseIdleConnections()
+			dir := t.TempDir()
+			client := newSpoolTestClient(t, "https://ingest.invalid", dir, nil, func(cfg *Config) {
+				cfg.HTTPClient = &http.Client{Transport: rt}
+			})
+			defer client.Close(context.Background())
+			client.SetConsent(true)
+			if err := client.Enqueue(Event{Name: "pre_connection_failure"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := client.Flush(context.Background()); err == nil {
+				t.Fatal("expected pre-connection failure")
+			}
+			record := readSpoolRecordFile(t, dir)
+			if dialCalls.Load() == 0 || len(record.Events) != 1 || record.Events[0].AmbiguousUnixMS != 0 {
+				t.Fatalf("traced dial failure started a clock: dials=%d, record=%+v", dialCalls.Load(), record)
 			}
 		})
 	}

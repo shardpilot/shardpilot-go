@@ -268,7 +268,9 @@ Two **default-off** capture opt-ins extend automatic capture (both dark by defau
 
 Analytics retention uses SDK intake time, independently of `Event.Timestamp`.
 An offline event can remain queued for up to seven days. DNS, connection and
-pre-send TLS failures do not start the retry-deduplication clock. A request
+pre-send TLS failures proven by the HTTP transport's trace do not start the
+retry-deduplication clock. An injected transport that provides no trace leaves
+delivery ambiguous, even if its returned error names DNS or dialing. A request
 that may have been accepted without a definitive response (including a lost
 response or server failure) starts a separate **15-minute** retry window.
 Within that window retries preserve the original ID and envelope bytes; once
