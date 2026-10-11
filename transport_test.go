@@ -25,7 +25,7 @@ func TestTransportDoesNotRetryClientErrors(t *testing.T) {
 
 	client, err := NewClient(Config{
 		IngestURL:     server.URL,
-		Token:         "secret-token-value",
+		ServiceToken:  "secret-token-value",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",
@@ -119,18 +119,19 @@ func TestInjectedHTTPClientCarriesAllRequests(t *testing.T) {
 
 	recorder := &recordingRoundTripper{}
 	client, err := NewClient(Config{
-		IngestURL:       server.URL,
-		Token:           "test-token",
-		WorkspaceID:     "workspace-test",
-		AppID:           "app-test",
-		EnvironmentID:   "develop",
-		Source:          SourceBackend,
-		AnonymousID:     "anon-inject-1",
-		APIKey:          "test-rc-key",
-		RemoteConfigURL: server.URL,
-		HTTPClient:      &http.Client{Transport: recorder},
-		FlushInterval:   time.Hour,
-		HTTPTimeout:     time.Second,
+		IngestURL:           server.URL,
+		ServiceToken:        "test-token",
+		WorkspaceID:         "workspace-test",
+		AppID:               "app-test",
+		EnvironmentID:       "develop",
+		Source:              SourceBackend,
+		AnonymousID:         "anon-inject-1",
+		PublishableKey:      "test-rc-key",
+		RemoteConfigEnabled: true,
+		AppURL:              server.URL,
+		HTTPClient:          &http.Client{Transport: recorder},
+		FlushInterval:       time.Hour,
+		HTTPTimeout:         time.Second,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -187,18 +188,19 @@ func TestInjectedHTTPClientRemoteConfigStillRefusesRedirects(t *testing.T) {
 	// remote-config client with the redirect refusal pinned — the 3xx is the
 	// contract's permanent http_3xx outcome, never the target's body.
 	client, err := NewClient(Config{
-		IngestURL:       server.URL,
-		Token:           "test-token",
-		WorkspaceID:     "workspace-test",
-		AppID:           "app-test",
-		EnvironmentID:   "develop",
-		Source:          SourceBackend,
-		AnonymousID:     "anon-inject-2",
-		APIKey:          "test-rc-key",
-		RemoteConfigURL: server.URL,
-		HTTPClient:      &http.Client{},
-		FlushInterval:   time.Hour,
-		HTTPTimeout:     time.Second,
+		IngestURL:           server.URL,
+		ServiceToken:        "test-token",
+		WorkspaceID:         "workspace-test",
+		AppID:               "app-test",
+		EnvironmentID:       "develop",
+		Source:              SourceBackend,
+		AnonymousID:         "anon-inject-2",
+		PublishableKey:      "test-rc-key",
+		RemoteConfigEnabled: true,
+		AppURL:              server.URL,
+		HTTPClient:          &http.Client{},
+		FlushInterval:       time.Hour,
+		HTTPTimeout:         time.Second,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -230,7 +232,7 @@ func TestInjectedClientAttemptsBoundedByHTTPTimeout(t *testing.T) {
 	// Timeout used to be the only cap, and injection must not lose it.
 	client, err := NewClient(Config{
 		IngestURL:     server.URL,
-		Token:         "test-token",
+		ServiceToken:  "test-token",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",

@@ -2,6 +2,26 @@
 
 ## v0.8.0-alpha — release preparation (not published)
 
+- Reject `RemoteConfigAttributesEnabled` unless `RemoteConfigEnabled` is also
+  enabled; attributes cannot operate without the remote-config client.
+
+### Migration from `v0.7.2-alpha`
+
+| Previous configuration | Current configuration |
+|---|---|
+| `Config.Token` | `ServiceToken` for server/backend ingest; `PublishableKey` for client ingest. Static JWT configuration is refused. |
+| `Config.APIKey` | `PublishableKey` for app requests. |
+| `Config.RemoteConfigURL` | `AppURL`, plus explicit `RemoteConfigEnabled` for configuration fetches. Experiments retain their own switch. |
+| `crash.ClientOptions.APIKey` | `CrashKey` |
+| `crash.ClientOptions.IngestURL` | `CrashURL` |
+| `crash.ClientOptions.Source` | `CrashComponent`; the former alias is removed. |
+| `crash.ClientOptions.RetryBackoff` | `RetryBaseDelay` |
+
+No compatibility aliases are provided. Example environment variables name the
+credential purpose (`SHARDPILOT_SERVICE_TOKEN`, `SHARDPILOT_PUBLISHABLE_KEY`,
+`SHARDPILOT_CRASH_KEY`) and app/crash origins (`SHARDPILOT_APP_URL`,
+`SHARDPILOT_CRASH_URL`). Scope configuration and wire names are unchanged.
+
 - Analytics retries retain events for up to seven days from SDK intake,
   independently of host timestamps. A potentially accepted request without a
   definitive response starts a durable 15-minute retry window; definite
@@ -104,9 +124,8 @@
   crash platform slugs therefore become `other`; use `OS.Name` for the OS name.
 
 - Crash reports send the component slug as `component`; the retired crash wire
-  member `source` is never emitted. Prefer `ClientOptions.CrashComponent`;
-  `ClientOptions.Source` remains a deprecated fallback, and per-event overrides
-  retain their existing precedence.
+  member `source` is never emitted. `ClientOptions.CrashComponent` supplies the
+  client-wide default; `Event.Source` overrides it for an individual event.
 
 - Analytics `Platform` now preserves `tvos`, `ps4`, `ps5`, `xbox`, `switch` and `other`. Empty or unmapped values are sent as `other`; previously they were omitted. Supported host aliases keep their existing mappings. Explicit unmapped values still produce bounded, once-per-value logger warnings.
 

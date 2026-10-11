@@ -43,9 +43,9 @@ func newPurchaseCaptureServer(t *testing.T) (*httptest.Server, chan map[string]a
 // the scene: the typed backend-lane verbs decide on Config.Source.
 func newSourceTestClient(t *testing.T, ingestURL string, source Source) *Client {
 	t.Helper()
-	client, err := NewClient(Config{
+	cfg := Config{
 		IngestURL:     ingestURL,
-		Token:         "test-token",
+		ServiceToken:  "test-token",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",
@@ -57,7 +57,12 @@ func newSourceTestClient(t *testing.T, ingestURL string, source Source) *Client 
 		BufferSize:    4,
 		FlushInterval: time.Hour,
 		HTTPTimeout:   time.Second,
-	})
+	}
+	if source == SourceClient {
+		cfg.PublishableKey = cfg.ServiceToken
+		cfg.ServiceToken = ""
+	}
+	client, err := NewClient(cfg)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}

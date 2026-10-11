@@ -9,13 +9,13 @@ Set these environment variables through your normal secret-injection mechanism:
 | Variable | Required value |
 |---|---|
 | `SHARDPILOT_INGEST_URL` | Analytics ingest origin, with no path/query/fragment. |
-| `SHARDPILOT_TOKEN` | In-memory analytics ingest credential for the test scope. |
+| `SHARDPILOT_PUBLISHABLE_KEY` | In-memory analytics ingest credential for the test scope. |
 | `SHARDPILOT_WORKSPACE_ID` | Canonical workspace key for that credential. |
 | `SHARDPILOT_APP_ID` | Canonical app key; also the app scoped by the crash key. |
 | `SHARDPILOT_ENVIRONMENT_ID` | Canonical environment key for that credential. |
 | `SHARDPILOT_ANONYMOUS_ID` | A dedicated synthetic actor identifier accepted unchanged by the crash SDK sanitizer. |
-| `SHARDPILOT_CRASH_INGEST_URL` | Crash ingest origin, with no path/query/fragment. |
-| `SHARDPILOT_API_KEY` | In-memory API key with `crash:write` for the test app. |
+| `SHARDPILOT_CRASH_URL` | Crash ingest origin, with no path/query/fragment. |
+| `SHARDPILOT_CRASH_KEY` | In-memory API key with `crash:write` for the test app. |
 
 Do not put credentials in files, source, command arguments or shell history.
 Outside loopback the SDK requires HTTPS. Both endpoints and both credentials

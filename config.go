@@ -23,8 +23,10 @@ type Logger interface {
 }
 
 type Config struct {
-	IngestURL     string
-	Token         string
+	IngestURL string
+	// ServiceToken is required for server/backend ingest and forbidden for a
+	// client source. It cannot be a publishable key or a static JWT.
+	ServiceToken  string
 	WorkspaceID   string
 	AppID         string
 	EnvironmentID string
@@ -87,21 +89,20 @@ type Config struct {
 	// batches. Set this to skip even that one round-trip.
 	DisableRequestCompression bool
 
-	// APIKey is the publishable client ingest key (`sp_ingest_...`) that
-	// authenticates remote-config fetches: the GET carries
-	// `Authorization: Bearer <APIKey>`, never Token (a Mode B ingest JWT
-	// cannot authenticate the remote-config endpoint). Required when
-	// RemoteConfigURL is set; unused otherwise. Held in memory; never logged.
-	APIKey string
+	// PublishableKey authenticates app-origin requests and, for SourceClient,
+	// ingest. SourceClient requires it and forbids ServiceToken. Server/backend
+	// sources require ServiceToken for ingest; their app features use this key.
+	// Credentials stay in memory and are redacted from diagnostics.
+	PublishableKey string
 
-	// RemoteConfigURL is the remote-config base URL (a dedicated config
-	// origin — never the ingest URL). Empty — the default — disables the
-	// remote-config client entirely. Validated like IngestURL: absolute,
-	// HTTPS outside loopback (or private nets with
-	// AllowInsecurePrivateNetwork), no path/query/fragment/user info. Requests
-	// include AnonymousID only while consent is granted; other states use the
-	// identifier-free workspace/environment route without targeting attributes.
-	RemoteConfigURL string
+	// AppURL is the app origin for configuration and experiments, separate from
+	// IngestURL. It must be an absolute origin, with HTTPS outside permitted local
+	// networks. Setting an address does not enable either feature.
+	AppURL string
+
+	// RemoteConfigEnabled enables configuration fetches. Requests include the
+	// configured AnonymousID and targeting attributes only under granted consent.
+	RemoteConfigEnabled bool
 
 	// RemoteConfigCachePath, when set, is the file the remote-config client
 	// persists its durable last-known-good cache record to, so a restart or
@@ -124,8 +125,8 @@ type Config struct {
 	//
 	// The assignment endpoint lives on the same host as the
 	// remote-config fetch and authenticates with the same publishable
-	// APIKey, so the flag requires RemoteConfigURL (which in turn requires
-	// APIKey). With SpoolDir set, the consumer persists its subject id and
+	// key, so the flag requires AppURL and PublishableKey. With SpoolDir set,
+	// the consumer persists its subject id and
 	// its assignment cache there (files 0600); without it both are
 	// in-memory only — a restart re-buckets the subject, documented
 	// ephemeral.
@@ -160,9 +161,10 @@ type Config struct {
 	// verbatim: geo, app_version, device_type, install_date, user_segment,
 	// custom_attribute_<name> (names ≤64, values ≤512 bytes, ≤64 attributes,
 	// sorted; out-of-vocabulary keys are dropped client-side). Requires
-	// RemoteConfigURL. Last-known-good caching stays scope-keyed for value
-	// SERVING — a cached body may reflect the previously sent attribute set
-	// until the next successful fetch (documented v1 limit) — but the
+	// RemoteConfigEnabled, AppURL, and PublishableKey. Last-known-good caching
+	// stays scope-keyed for value SERVING — a cached body may reflect the
+	// previously sent attribute set until the next successful fetch (documented
+	// v1 limit) — but the
 	// cached ETag revalidates ONLY a fetch carrying the SAME attribute
 	// signature: a signature change forces a full fetch, so a shared
 	// publication validator can never 304 a differently-targeted request
@@ -335,7 +337,7 @@ const (
 
 func normalizeConfig(cfg Config) (Config, error) {
 	cfg.IngestURL = strings.TrimSpace(cfg.IngestURL)
-	cfg.Token = strings.TrimSpace(cfg.Token)
+	cfg.ServiceToken = strings.TrimSpace(cfg.ServiceToken)
 	cfg.WorkspaceID = strings.TrimSpace(cfg.WorkspaceID)
 	cfg.AppID = strings.TrimSpace(cfg.AppID)
 	cfg.EnvironmentID = strings.TrimSpace(cfg.EnvironmentID)
@@ -343,16 +345,26 @@ func normalizeConfig(cfg Config) (Config, error) {
 	cfg.AnonymousID = strings.TrimSpace(cfg.AnonymousID)
 	// A blank revision keeps declaration disabled.
 	cfg.SchemaRevision = strings.TrimSpace(cfg.SchemaRevision)
-	cfg.APIKey = strings.TrimSpace(cfg.APIKey)
-	cfg.RemoteConfigURL = strings.TrimSpace(cfg.RemoteConfigURL)
+	cfg.PublishableKey = strings.TrimSpace(cfg.PublishableKey)
+	cfg.AppURL = strings.TrimSpace(cfg.AppURL)
 	cfg.RemoteConfigCachePath = strings.TrimSpace(cfg.RemoteConfigCachePath)
 	cfg.SpoolDir = strings.TrimSpace(cfg.SpoolDir)
 
 	if cfg.IngestURL == "" {
 		return Config{}, fmt.Errorf("%w: ingest URL is required", ErrInvalidConfig)
 	}
-	if cfg.Token == "" {
-		return Config{}, fmt.Errorf("%w: token is required", ErrInvalidConfig)
+	if strings.Count(cfg.PublishableKey, ".") == 2 {
+		return Config{}, fmt.Errorf("%w: PublishableKey cannot be a static JWT", ErrInvalidConfig)
+	}
+	switch cfg.Source {
+	case SourceClient:
+		if cfg.PublishableKey == "" || cfg.ServiceToken != "" {
+			return Config{}, fmt.Errorf("%w: client source requires PublishableKey and no ServiceToken", ErrInvalidConfig)
+		}
+	case SourceServer, SourceBackend:
+		if cfg.ServiceToken == "" || strings.HasPrefix(cfg.ServiceToken, "sp_ingest_") || strings.HasPrefix(cfg.ServiceToken, "sp_pub_") || strings.Count(cfg.ServiceToken, ".") == 2 {
+			return Config{}, fmt.Errorf("%w: server/backend source requires a service token, not a publishable key or static JWT", ErrInvalidConfig)
+		}
 	}
 	if cfg.WorkspaceID == "" {
 		return Config{}, fmt.Errorf("%w: workspace ID is required", ErrInvalidConfig)
@@ -373,34 +385,20 @@ func normalizeConfig(cfg Config) (Config, error) {
 	}
 	cfg.IngestURL = normalizedIngest
 
-	if cfg.RemoteConfigURL != "" {
-		// The remote-config route authenticates with the publishable API key
-		// only — a Mode B ingest JWT never does — so configuring the URL
-		// without the key could never produce a working fetch.
-		if cfg.APIKey == "" {
-			return Config{}, fmt.Errorf("%w: remote config requires APIKey", ErrInvalidConfig)
-		}
-		normalizedRC, err := normalizeBaseURL(cfg.RemoteConfigURL, "remote config URL", cfg.AllowInsecurePrivateNetwork)
+	if cfg.AppURL != "" {
+		normalized, err := normalizeBaseURL(cfg.AppURL, "app URL", cfg.AllowInsecurePrivateNetwork)
 		if err != nil {
 			return Config{}, err
 		}
-		cfg.RemoteConfigURL = normalizedRC
+		cfg.AppURL = normalized
 	}
-
-	if cfg.ExperimentsEnabled && cfg.RemoteConfigURL == "" {
-		// The assignment endpoint is on the host the
-		// remote-config fetch already points at (path-swapped), and it
-		// authenticates with the same publishable APIKey the
-		// RemoteConfigURL branch above already required: enabling
-		// experiments without that base could never produce a working
-		// fetch.
-		return Config{}, fmt.Errorf("%w: experiments require RemoteConfigURL (the assignment endpoint shares the remote-config host)", ErrInvalidConfig)
+	if cfg.RemoteConfigAttributesEnabled && !cfg.RemoteConfigEnabled {
+		return Config{}, fmt.Errorf("%w: RemoteConfigAttributesEnabled requires RemoteConfigEnabled", ErrInvalidConfig)
 	}
-
-	if cfg.RemoteConfigAttributesEnabled && cfg.RemoteConfigURL == "" {
-		// Attributes only ever ride the remote-config fetch; opting in
-		// without the fetch configured could never produce a working leg.
-		return Config{}, fmt.Errorf("%w: remote-config attributes require RemoteConfigURL", ErrInvalidConfig)
+	if cfg.RemoteConfigEnabled || cfg.ExperimentsEnabled || cfg.RemoteConfigAttributesEnabled {
+		if cfg.AppURL == "" || cfg.PublishableKey == "" {
+			return Config{}, fmt.Errorf("%w: app features require AppURL and PublishableKey", ErrInvalidConfig)
+		}
 	}
 
 	if cfg.SpoolDir != "" {

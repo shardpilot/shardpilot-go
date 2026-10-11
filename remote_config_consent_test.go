@@ -18,8 +18,8 @@ const consentConfigPath = "/config/v1/workspace-test/develop"
 func newConsentConfigClient(t *testing.T, serverURL, cachePath string, configure ...func(*Config)) *Client {
 	t.Helper()
 	cfg := Config{
-		IngestURL: serverURL, RemoteConfigURL: serverURL,
-		Token: "test-token", APIKey: "test-rc-key",
+		IngestURL: serverURL, AppURL: serverURL, RemoteConfigEnabled: true,
+		ServiceToken: "test-token", PublishableKey: "test-rc-key",
 		WorkspaceID: "workspace-test", AppID: "app-test", EnvironmentID: "develop",
 		Source: SourceBackend, AnonymousID: "config-anonymous", UserID: "config-host-user",
 		RemoteConfigCachePath: cachePath, RemoteConfigAttributesEnabled: true,

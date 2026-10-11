@@ -48,8 +48,8 @@ type Client struct {
 }
 
 type ClientOptions struct {
-	IngestURL string
-	APIKey    string
+	CrashURL string
+	CrashKey string
 	// App identifies the project this client reports for. Its fields default onto every
 	// event that leaves them empty (per-event values win). REQUIRED for auto-capture
 	// (Recover/CapturePanic), which builds events with no App of their own; the producer
@@ -58,13 +58,7 @@ type ClientOptions struct {
 	App AppInfo
 	// CrashComponent is the optional component slug stamped on events that do not
 	// set Event.Source. It is sent as the crash body's component member.
-	// When both options are non-empty, CrashComponent wins.
 	CrashComponent string
-	// Source is the former name of CrashComponent.
-	//
-	// Deprecated: use CrashComponent. A non-empty Source remains a fallback
-	// when CrashComponent is empty; no crash body sends a source member.
-	Source string
 	// DebugIDFillEnabled opts auto-capture (Recover/CapturePanic) into attaching
 	// the RUNNING BINARY's identity as the event's single modules[] entry: the
 	// executable's base name plus a debug_id read from the binary itself — the ELF
@@ -99,7 +93,7 @@ type ClientOptions struct {
 	Logger                     Logger
 	Sampler                    Sampler
 	MaxAttempts                int
-	RetryBackoff               time.Duration
+	RetryBaseDelay             time.Duration
 	// OnResult, when set, is called after each successful ingest with the server's
 	// Result (whether the crash was suppressed, plus any warnings). It runs on the
 	// calling goroutine — including the auto-capture path during a panic — so keep it
@@ -167,11 +161,11 @@ func (e *HTTPStatusError) Retryable() bool {
 }
 
 func NewClient(opts ClientOptions) (*Client, error) {
-	ingestURL, err := normalizeIngestURL(opts.IngestURL)
+	ingestURL, err := normalizeIngestURL(opts.CrashURL)
 	if err != nil {
 		return nil, err
 	}
-	apiKey := strings.TrimSpace(opts.APIKey)
+	apiKey := strings.TrimSpace(opts.CrashKey)
 	if apiKey == "" {
 		return nil, fmt.Errorf("%w: api key is required", ErrInvalidConfig)
 	}
@@ -188,7 +182,7 @@ func NewClient(opts ClientOptions) (*Client, error) {
 	if maxAttempts <= 0 {
 		maxAttempts = defaultMaxAttempts
 	}
-	retryBackoff := opts.RetryBackoff
+	retryBackoff := opts.RetryBaseDelay
 	if retryBackoff <= 0 {
 		retryBackoff = defaultRetryBackoff
 	}
@@ -211,7 +205,7 @@ func NewClient(opts ClientOptions) (*Client, error) {
 			Version: strings.TrimSpace(opts.App.Version),
 			BuildID: strings.TrimSpace(opts.App.BuildID),
 		},
-		source: firstNonEmptyString(opts.CrashComponent, opts.Source),
+		source: opts.CrashComponent,
 		// Validated once here rather than on every event: a client-wide identity
 		// that cannot reach the wire should be inert from construction, not
 		// re-checked (and re-dropped) per crash.

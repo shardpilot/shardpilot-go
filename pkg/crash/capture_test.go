@@ -43,11 +43,11 @@ func captureServer(t *testing.T, received *crash.Event) *httptest.Server {
 func newCaptureClient(t *testing.T, url, source string) *crash.Client {
 	t.Helper()
 	client, err := crash.NewClient(crash.ClientOptions{
-		IngestURL: url,
-		APIKey:    "workspace-api-key-test",
-		App:       crash.AppInfo{ID: "fortress-fury"},
-		Source:    source,
-		Logger:    testLogger{t},
+		CrashURL:       url,
+		CrashKey:       "workspace-api-key-test",
+		App:            crash.AppInfo{ID: "fortress-fury"},
+		CrashComponent: source,
+		Logger:         testLogger{t},
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)

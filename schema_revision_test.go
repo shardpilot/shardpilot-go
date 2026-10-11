@@ -51,7 +51,7 @@ func newSchemaRevisionTestClient(t *testing.T, ingestURL string, mutate func(*Co
 	t.Helper()
 	cfg := Config{
 		IngestURL:     ingestURL,
-		Token:         "test-token",
+		ServiceToken:  "test-token",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",

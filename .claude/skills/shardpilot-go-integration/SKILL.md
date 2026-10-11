@@ -104,40 +104,28 @@ asking for consent does not override them. `SOFT_OPT_OUT` and non-empty
 
 ## Credentials
 
-The analytics client has a **single `Config.Token` bearer field**. It holds
-one of:
+The analytics client selects the ingest credential by its configured source.
 
-- **Mode A — publishable ingest key** (`sp_ingest_` prefix): the standard
-  service credential for event publishing. Publishable keys are
-  deliberately limited on the consent plane: they can record consent
-  **denials only** — a grant receipt sent under a publishable key is
-  rejected by the server (the SDK logs it quietly; local state is
-  unaffected). Recording a **grant** server-side requires a
-  consent-write-capable service credential provisioned outside this SDK.
-- **Mode B — per-tenant ingest JWT**: a short-lived HS256 JWT minted
-  **backend-side** with `SignIngestJWT(key, claims, opts...)` and placed in
-  `Config.Token` (or handed to a client SDK over your own authenticated
-  channel). The per-tenant `SigningKey{KID, Secret}` is obtained out-of-band
-  from ShardPilot; the helper only signs — it never fetches, stores, or
-  rotates the secret. Defaults: issuer `shardpilot`, audience
-  `shardpilot-ingest`, lifetime 5m (server cap 15m; the server also enforces
-  a 5m issued-at freshness window regardless of `exp`). Scope is fixed to
-  `analytics:ingest`. Call `SigningKey.ZeroSecret()` to wipe a secret you no
-  longer need. A minted JWT is **per-actor, not tenant-wide**: it binds the
-  verified `Subject` (plus optional `BindAnon`) and authorizes ingest only
-  for that user within the tenant scope, so a client running on a Mode-B
-  token must publish only that actor's events. A long-lived backend client
-  that publishes for many users belongs on a Mode A key; mint Mode-B JWTs
-  primarily for individual client SDK instances to consume.
+- **Client source:** set `PublishableKey`; leave `ServiceToken` empty. The
+  publishable key authenticates both ingest and enabled app features. Publishable
+  keys can record denials, while grants require a consent-write-capable service
+  credential provisioned outside this SDK.
+- **Server/backend source:** set `ServiceToken` for ingest and a separate
+  `PublishableKey` for enabled app features. Never place a publishable key in
+  `ServiceToken`.
+- **Mode B JWT minting:** `SignIngestJWT` remains a backend helper for issuing
+  short-lived tokens to clients with a token-provider integration. This Go
+  client's static configuration does not accept those JWTs, and has no token
+  provider. It does not fetch, store, or rotate the signing secret.
 
-The crash client (`pkg/crash`) takes its own `ClientOptions.APIKey` — an API
+The crash client (`pkg/crash`) takes its own `ClientOptions.CrashKey` — an API
 key with the `crash:write` scope.
 
 Handling rules — non-negotiable:
 
 - **Never hardcode tokens, API keys, or signing secrets** in source, config
   files, or examples. Read them from environment variables or a secret
-  manager (`os.Getenv("SHARDPILOT_TOKEN")` in the samples below).
+  manager (`os.Getenv("SHARDPILOT_SERVICE_TOKEN")` in the samples below).
 - The Mode-B signing secret and minted JWTs are bearer credentials: never
   compile the secret into a shipped client binary, never log either
   (`SigningKey` redacts itself under `%v`/`%+v`, but `key.Secret` printed
@@ -150,11 +138,11 @@ import "github.com/shardpilot/shardpilot-go"
 
 client, err := shardpilot.NewClient(shardpilot.Config{
     IngestURL:     os.Getenv("SHARDPILOT_INGEST_URL"), // base URL, no path
-    Token:         os.Getenv("SHARDPILOT_TOKEN"),
+    ServiceToken:  os.Getenv("SHARDPILOT_SERVICE_TOKEN"),
     WorkspaceID:   os.Getenv("SHARDPILOT_WORKSPACE_ID"),
     AppID:         os.Getenv("SHARDPILOT_APP_ID"),
     EnvironmentID: os.Getenv("SHARDPILOT_ENVIRONMENT_ID"),
-    Source:        shardpilot.SourceBackend, // or SourceServer / SourceClient
+    Source:        shardpilot.SourceBackend, // or SourceServer
     AppVersion:    "1.0.0",
 })
 if err != nil {
@@ -170,7 +158,7 @@ defer func() {
 }()
 ```
 
-Required: `IngestURL`, `Token`, `WorkspaceID`, `AppID`, `EnvironmentID`, and a
+Required: `IngestURL`, the source-appropriate credential, `WorkspaceID`, `AppID`, `EnvironmentID`, and a
 valid `Source` (`SourceClient` / `SourceServer` / `SourceBackend`).
 `NewClient` rejects an `IngestURL` with a path, query, fragment, or userinfo,
 and non-HTTPS URLs outside localhost/loopback (plain HTTP to a private
@@ -184,7 +172,7 @@ makes no requests at any value. A full `BatchSize` publishes immediately,
 `HTTPTimeout` (default 2s), `Logger`, `UserID`/`AnonymousID`
 (default actor identity), `OnBatchResult` (see verification),
 `RejectionCapacity` (non-positive values use 64 entries), the
-remote-config fields (`RemoteConfigURL` + `APIKey` +
+remote-config fields (`RemoteConfigEnabled` + `AppURL` + `PublishableKey` +
 `RemoteConfigCachePath`; see "Remote config"), the disk-spool fields
 (`SpoolDir`, `SpoolMaxEvents`, `SpoolMaxBytes`, `OnSpoolDeadLetter`; see
 "Offline behavior / spool"), `SchemaRevision` (an explicit declaration; see below), and
@@ -398,10 +386,10 @@ Facts that keep integrations correct:
 
 ## Remote config
 
-Available since `v0.5.0-alpha` — **explicit fetch only**. Configure
-`RemoteConfigURL` (a dedicated config origin, never the ingest URL) plus
-`APIKey` (a publishable `sp_ingest_` client key — remote config is **never**
-authenticated with `Config.Token`; a Mode-B JWT cannot fetch config), and
+Available since `v0.5.0-alpha` — **explicit fetch only**. Set `RemoteConfigEnabled: true` and configure
+`AppURL` (a dedicated config origin, never the ingest URL) plus
+`PublishableKey` (a publishable `sp_ingest_` client key — remote config is **never**
+authenticated with `Config.ServiceToken`; a Mode-B JWT cannot fetch config), and
 usually `RemoteConfigCachePath` (durable last-known-good cache file) plus a
 persisted `Config.AnonymousID` — it supplies the fetch's `client_id` only
 while consent is granted. Configuring it remains required: without one every
@@ -457,16 +445,16 @@ speed := client.RemoteConfigNumber("scroll_speed", 1.0)
 
 ## Crash reporting (`pkg/crash`)
 
-Separate client, separate credential (`APIKey` with `crash:write`):
+Separate client, separate credential (`CrashKey` with `crash:write`):
 
 ```go
 import "github.com/shardpilot/shardpilot-go/pkg/crash"
 
 crashClient, err := crash.NewClient(crash.ClientOptions{
-    IngestURL: os.Getenv("SHARDPILOT_CRASH_INGEST_URL"), // base URL, no path
-    APIKey:    os.Getenv("SHARDPILOT_CRASH_API_KEY"),
+    CrashURL:  os.Getenv("SHARDPILOT_CRASH_URL"), // base URL, no path
+    CrashKey:  os.Getenv("SHARDPILOT_CRASH_KEY"),
     App:       crash.AppInfo{ID: "<YOUR-APP-ID>", Version: "1.0.0"}, // required for auto-capture
-    Source:    "<COMPONENT-SLUG>", // e.g. which service in a multi-repo product
+    CrashComponent: "<COMPONENT-SLUG>", // e.g. which service in a multi-repo product
     OnResult:  func(r crash.Result) { /* see verification */ },
 })
 ```
@@ -618,7 +606,7 @@ Run against your dev/staging deployment credentials, then check each item:
    re-test until the status is `accepted`. If the denial is real, the
    suppression is correct behavior — leave it in place; never overwrite an
    opt-out just to make a verification pass.
-4. **Failure visibility.** Point `Token` at an invalid value once and
+4. **Failure visibility.** Point `ServiceToken` at an invalid value once and
    confirm `Track` returns a `*shardpilot.HTTPStatusError` whose `ErrorCode`
    is `unauthorized`/`forbidden` — proves your error handling surfaces real
    causes. Restore the real token.
@@ -672,7 +660,7 @@ them:
   before allowing events).
 - **Grant permissions are a server contract.** The `SetConsent` godoc
   requires a consent-write-capable service credential for grants and limits
-  Mode-A publishable keys to denials. The SDK posts using `Config.Token`;
+  Mode-A publishable keys to denials. The SDK posts using the source-appropriate ingest credential;
   server enforcement is not verified by this SDK source review. Confirm
   that contract for your deployment before relying on receipt acceptance.
 - **Forced-minor denial uses the typed setter.** Once present, either setter

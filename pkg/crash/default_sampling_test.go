@@ -16,7 +16,7 @@ func TestDefaultCrashSamplerKeepsEveryReport(t *testing.T) {
 				var bodies [][]byte
 				callbacks := 0
 				client, err := NewClient(ClientOptions{
-					IngestURL: "https://crash.synthetic.invalid", APIKey: "synthetic-key",
+					CrashURL: "https://crash.synthetic.invalid", CrashKey: "synthetic-key",
 					OnResult: func(Result) { callbacks++ },
 					HTTPClient: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 						if r.Method != http.MethodPost || r.URL.Path != "/api/v1/crashes/ingest" {

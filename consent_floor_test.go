@@ -170,7 +170,7 @@ func newFloorTestClient(t *testing.T, serverURL, spoolDir string, mutate func(*C
 	t.Helper()
 	cfg := Config{
 		IngestURL:     serverURL,
-		Token:         "test-token",
+		ServiceToken:  "test-token",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",
@@ -6395,7 +6395,7 @@ func TestUnprovableGrantIsHeldFromTheWireAndRecoverable(t *testing.T) {
 		cfg := Config{
 			WorkspaceID: "workspace-test", AppID: "app-test", EnvironmentID: "develop",
 			AnonymousID: "anon-spool-1", SpoolDir: dir, ConsentFloor: &ConsentFloorConfig{},
-			IngestURL: server.URL, APIKey: "wk_test",
+			IngestURL: server.URL, PublishableKey: "wk_test",
 		}
 		client := &Client{cfg: cfg, clock: realClock{}}
 		client.initConsentFloor(func(oldpath, newpath string) error {

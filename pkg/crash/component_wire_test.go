@@ -14,19 +14,16 @@ import (
 
 func TestCrashComponentWireGolden(t *testing.T) {
 	for _, tc := range []struct {
-		name, configSource, configComponent, eventSource, component string
-		fatal                                                       bool
+		name, configComponent, eventSource, component string
+		fatal                                         bool
 	}{
-		{"legacy_default", "main-server", "", "", "main-server", false},
-		{"event_override", "main-server", "", "game-server", "game-server", false},
-		{"fatal_legacy_default", "main-server", "", "", "main-server", true},
-		{"bare_app", "", "", "", "", false},
-		{"scrubbed_component", "", "", "sample@example.invalid", "", false},
-		{"preferred_default", "", "main-server", "", "main-server", false},
-		{"preferred_wins", "old-server", "main-server", "", "main-server", false},
-		{"preferred_event_override", "old-server", "main-server", "game-server", "game-server", false},
-		{"blank_preferred_falls_back", "old-server", "  ", "", "old-server", false},
-		{"trimmed_preferred", "old-server", " main-server ", "", "main-server", false},
+		{"default", "main-server", "", "main-server", false},
+		{"event_override", "main-server", "game-server", "game-server", false},
+		{"fatal_default", "main-server", "", "main-server", true},
+		{"bare_app", "", "", "", false},
+		{"scrubbed_component", "", "sample@example.invalid", "", false},
+		{"blank_component", "  ", "", "", false},
+		{"trimmed_component", " main-server ", "", "main-server", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var body []byte
@@ -35,7 +32,7 @@ func TestCrashComponentWireGolden(t *testing.T) {
 				w.WriteHeader(http.StatusAccepted)
 			}))
 			defer server.Close()
-			client, err := NewClient(ClientOptions{IngestURL: server.URL, APIKey: "synthetic-api-key", Source: tc.configSource, CrashComponent: tc.configComponent, Sampler: alwaysSampler{}})
+			client, err := NewClient(ClientOptions{CrashURL: server.URL, CrashKey: "synthetic-api-key", CrashComponent: tc.configComponent, Sampler: alwaysSampler{}})
 			if err != nil {
 				t.Fatal(err)
 			}

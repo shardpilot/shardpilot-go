@@ -321,12 +321,13 @@ func TestPreloadEstablishesSpoolDirPrivacy(t *testing.T) {
 		t.Helper()
 		subject := "spcid_" + strings.Repeat("c", 32)
 		cfg := Config{
-			WorkspaceID:     "workspace-test",
-			AppID:           "app-test",
-			EnvironmentID:   "develop",
-			RemoteConfigURL: serverURL,
-			APIKey:          "test-exp-key",
-			SpoolDir:        spoolDir,
+			WorkspaceID:         "workspace-test",
+			AppID:               "app-test",
+			EnvironmentID:       "develop",
+			RemoteConfigEnabled: true,
+			AppURL:              serverURL,
+			PublishableKey:      "test-exp-key",
+			SpoolDir:            spoolDir,
 		}
 		es := newExperimentsState(cfg)
 		es.mu.Lock()

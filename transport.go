@@ -240,7 +240,7 @@ func newHTTPTransport(cfg Config) *httpTransport {
 	return &httpTransport{
 		endpoint:          base + "/v1/events:batch",
 		consentEndpoint:   base + "/v1/consent",
-		token:             cfg.Token,
+		token:             ingestBearer(cfg),
 		schemaRevision:    effectiveSchemaRevision(cfg),
 		client:            client,
 		rcClient:          rcClient,
@@ -592,4 +592,13 @@ func contextWithDefaultTimeout(parent context.Context, timeout time.Duration) (c
 		parent = context.Background()
 	}
 	return context.WithTimeout(parent, timeout)
+}
+
+// ingestBearer keeps service credentials on the ingest origin and chooses the
+// publishable credential for a client source.
+func ingestBearer(cfg Config) string {
+	if cfg.Source == SourceClient {
+		return cfg.PublishableKey
+	}
+	return cfg.ServiceToken
 }

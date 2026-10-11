@@ -30,7 +30,7 @@ func TestCredentialPercentEncodings(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			get := func(name string) string {
-				if name == "SHARDPILOT_TOKEN" {
+				if name == "SHARDPILOT_PUBLISHABLE_KEY" {
 					return key
 				}
 				return environment(name)
@@ -142,7 +142,7 @@ func TestCredentialJSONEscapes(t *testing.T) {
 				t.Fatal("invalid JSON echo fixture")
 			}
 			get := func(name string) string {
-				if name == "SHARDPILOT_TOKEN" {
+				if name == "SHARDPILOT_PUBLISHABLE_KEY" {
 					return tc.key
 				}
 				return environment(name)

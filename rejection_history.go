@@ -94,7 +94,7 @@ func (c *Client) warnRejections(result BatchResult) {
 
 func (c *Client) rejectionDiagnostic(entry BatchEventStatus) string {
 	clean := func(value string) string {
-		for _, secret := range []string{c.cfg.Token, c.cfg.APIKey} {
+		for _, secret := range []string{c.cfg.ServiceToken, c.cfg.PublishableKey} {
 			if secret != "" {
 				value = strings.ReplaceAll(value, secret, "[REDACTED]")
 			}

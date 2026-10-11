@@ -38,7 +38,7 @@ func TestCrashPlatformWire(t *testing.T) {
 				w.WriteHeader(http.StatusAccepted)
 			}))
 			defer server.Close()
-			client, err := NewClient(ClientOptions{IngestURL: server.URL, APIKey: "synthetic-key", Sampler: alwaysSampler{}})
+			client, err := NewClient(ClientOptions{CrashURL: server.URL, CrashKey: "synthetic-key", Sampler: alwaysSampler{}})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -79,7 +79,7 @@ func (l *platformWarningLog) Printf(format string, args ...any) {
 
 func TestCrashPlatformWarningIsOnceAndPrivate(t *testing.T) {
 	logger := &platformWarningLog{}
-	client, err := NewClient(ClientOptions{IngestURL: "https://crash.example.invalid", APIKey: "synthetic-key", Logger: logger})
+	client, err := NewClient(ClientOptions{CrashURL: "https://crash.example.invalid", CrashKey: "synthetic-key", Logger: logger})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +112,7 @@ func TestCrashPlatformDefaultWarning(t *testing.T) {
 	previous := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&output, nil)))
 	t.Cleanup(func() { slog.SetDefault(previous) })
-	client, err := NewClient(ClientOptions{IngestURL: "https://crash.example.invalid", APIKey: "synthetic-key"})
+	client, err := NewClient(ClientOptions{CrashURL: "https://crash.example.invalid", CrashKey: "synthetic-key"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +166,7 @@ func TestCrashPlatformSamplerMutation(t *testing.T) {
 		w.WriteHeader(http.StatusAccepted)
 	}))
 	defer server.Close()
-	c, err := NewClient(ClientOptions{IngestURL: server.URL, APIKey: "synthetic-key", Sampler: changingPlatformSampler{}})
+	c, err := NewClient(ClientOptions{CrashURL: server.URL, CrashKey: "synthetic-key", Sampler: changingPlatformSampler{}})
 	if err != nil {
 		t.Fatal(err)
 	}

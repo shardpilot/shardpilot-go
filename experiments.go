@@ -47,11 +47,11 @@ import (
 //
 // Wire contract (assignment fetch):
 //
-//	GET {RemoteConfigURL}/api/v1/runtime/experiments/assignment
+//	GET {AppURL}/api/v1/runtime/experiments/assignment
 //	  ?app_key=&environment_key=&experiment_key=&subject_key=&<attributes>
-//	Authorization: Bearer <publishable APIKey>
+//	Authorization: Bearer <publishable PublishableKey>
 //
-// The base URL is the configured RemoteConfigURL — the remote-config host —
+// The base URL is the configured AppURL — the remote-config host —
 // with the path swapped; no new endpoint configuration exists. The endpoint
 // requires the experiment-assignment read scope on the key, granted
 // server-side.
@@ -1516,8 +1516,8 @@ func newExperimentsState(cfg Config) *experimentsState {
 		workspaceID:     cfg.WorkspaceID,
 		appKey:          cfg.AppID,
 		envKey:          cfg.EnvironmentID,
-		baseURL:         strings.TrimRight(cfg.RemoteConfigURL, "/"),
-		keyPrint:        experimentAPIKeyFingerprint(cfg.APIKey),
+		baseURL:         strings.TrimRight(cfg.AppURL, "/"),
+		keyPrint:        experimentAPIKeyFingerprint(cfg.PublishableKey),
 		spoolDir:        cfg.SpoolDir,
 		entries:         make(map[string]*expEntry),
 		latchRetained:   make(map[string]*expEntry),
@@ -3866,7 +3866,7 @@ func (c *Client) fetchExperimentAssignment(ctx context.Context, experimentKey st
 	// no If-None-Match: the assignment endpoint has no ETag/304 contract.
 	resp, err := c.transport.FetchRemoteConfig(fetchCtx, remoteConfigRequest{
 		url:    fetchURL,
-		bearer: c.cfg.APIKey,
+		bearer: c.cfg.PublishableKey,
 	})
 	if err != nil {
 		if gate != nil && gate.ctx.Err() != nil && errors.Is(err, context.Canceled) {

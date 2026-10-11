@@ -22,10 +22,10 @@ func TestEmitSurfacesSuppressedResult(t *testing.T) {
 	var got Result
 	var calls int32
 	client, err := NewClient(ClientOptions{
-		IngestURL: server.URL,
-		APIKey:    "workspace-api-key-test",
-		Sampler:   alwaysSampler{},
-		OnResult:  func(r Result) { got = r; atomic.AddInt32(&calls, 1) },
+		CrashURL: server.URL,
+		CrashKey: "workspace-api-key-test",
+		Sampler:  alwaysSampler{},
+		OnResult: func(r Result) { got = r; atomic.AddInt32(&calls, 1) },
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -50,7 +50,7 @@ func TestEmitSurfacesCrashIDFingerprintAndWarnings(t *testing.T) {
 
 	var got Result
 	client, err := NewClient(ClientOptions{
-		IngestURL: server.URL, APIKey: "workspace-api-key-test", Sampler: alwaysSampler{},
+		CrashURL: server.URL, CrashKey: "workspace-api-key-test", Sampler: alwaysSampler{},
 		OnResult: func(r Result) { got = r },
 	})
 	if err != nil {
@@ -80,7 +80,7 @@ func TestEmitTreatsGarbageResponseBodyAsAcceptedNoError(t *testing.T) {
 
 	var called bool
 	client, err := NewClient(ClientOptions{
-		IngestURL: server.URL, APIKey: "workspace-api-key-test", Sampler: alwaysSampler{},
+		CrashURL: server.URL, CrashKey: "workspace-api-key-test", Sampler: alwaysSampler{},
 		OnResult: func(Result) { called = true },
 	})
 	if err != nil {
@@ -103,7 +103,7 @@ func TestOnResultPanicIsContained(t *testing.T) {
 	defer server.Close()
 
 	client, err := NewClient(ClientOptions{
-		IngestURL: server.URL, APIKey: "workspace-api-key-test", Sampler: alwaysSampler{},
+		CrashURL: server.URL, CrashKey: "workspace-api-key-test", Sampler: alwaysSampler{},
 		OnResult: func(Result) { panic("boom") },
 	})
 	if err != nil {
@@ -163,11 +163,11 @@ func TestRetryAfterZeroRetriesImmediately(t *testing.T) {
 	defer server.Close()
 
 	client, err := NewClient(ClientOptions{
-		IngestURL:    server.URL,
-		APIKey:       "workspace-api-key-test",
-		Sampler:      alwaysSampler{},
-		MaxAttempts:  2,
-		RetryBackoff: time.Hour, // would hang if the explicit 0 were treated as "absent"
+		CrashURL:       server.URL,
+		CrashKey:       "workspace-api-key-test",
+		Sampler:        alwaysSampler{},
+		MaxAttempts:    2,
+		RetryBaseDelay: time.Hour, // would hang if the explicit 0 were treated as "absent"
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -193,7 +193,7 @@ func TestRetryAfterCarriedOnStatusError(t *testing.T) {
 	defer server.Close()
 
 	client, err := NewClient(ClientOptions{
-		IngestURL: server.URL, APIKey: "workspace-api-key-test", Sampler: alwaysSampler{},
+		CrashURL: server.URL, CrashKey: "workspace-api-key-test", Sampler: alwaysSampler{},
 		MaxAttempts: 1,
 	})
 	if err != nil {
@@ -224,11 +224,11 @@ func TestRetryAfterHonoredOverFixedBackoff(t *testing.T) {
 	defer server.Close()
 
 	client, err := NewClient(ClientOptions{
-		IngestURL:    server.URL,
-		APIKey:       "workspace-api-key-test",
-		Sampler:      alwaysSampler{},
-		MaxAttempts:  2,
-		RetryBackoff: time.Hour, // would hang the test if used instead of Retry-After
+		CrashURL:       server.URL,
+		CrashKey:       "workspace-api-key-test",
+		Sampler:        alwaysSampler{},
+		MaxAttempts:    2,
+		RetryBaseDelay: time.Hour, // would hang the test if used instead of Retry-After
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)

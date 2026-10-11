@@ -580,11 +580,12 @@ func TestPurgeDiscardsDeadOwedAndReArmsLiveOnly(t *testing.T) {
 // to a strictly-fresher stored sibling entry.
 func TestFoldedDropYieldsToFresherStoredSibling(t *testing.T) {
 	e := newExperimentsState(Config{
-		WorkspaceID:     "ws",
-		AppID:           "app",
-		EnvironmentID:   "dev",
-		APIKey:          "k",
-		RemoteConfigURL: "https://cp.example",
+		WorkspaceID:         "ws",
+		AppID:               "app",
+		EnvironmentID:       "dev",
+		PublishableKey:      "k",
+		RemoteConfigEnabled: true,
+		AppURL:              "https://cp.example",
 	})
 	scope := "scope-a"
 	// The record holds exp-x stamped at 100; an owed drop decided at 50

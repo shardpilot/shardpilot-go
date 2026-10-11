@@ -46,7 +46,7 @@ func TestClientSamplingWire(t *testing.T) {
 				w.WriteHeader(http.StatusAccepted)
 			}))
 			defer server.Close()
-			client, err := NewClient(ClientOptions{IngestURL: server.URL, APIKey: "workspace-api-key-test", Sampler: tc.sampler})
+			client, err := NewClient(ClientOptions{CrashURL: server.URL, CrashKey: "workspace-api-key-test", Sampler: tc.sampler})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -139,8 +139,8 @@ func TestClientSamplingRetryKeepsCaptureBytes(t *testing.T) {
 		return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{}`))}, nil
 	})
 	var err error
-	client, err = NewClient(ClientOptions{IngestURL: "https://ingest.example.invalid", APIKey: "workspace-api-key-test",
-		HTTPClient: &http.Client{Transport: transport}, MaxAttempts: 2, RetryBackoff: time.Nanosecond})
+	client, err = NewClient(ClientOptions{CrashURL: "https://ingest.example.invalid", CrashKey: "workspace-api-key-test",
+		HTTPClient: &http.Client{Transport: transport}, MaxAttempts: 2, RetryBaseDelay: time.Nanosecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,8 +176,8 @@ func TestClientRetryDoesNotReencodeSamplerEvent(t *testing.T) {
 		}
 		return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{}`))}, nil
 	})
-	client, err := NewClient(ClientOptions{IngestURL: "https://ingest.example.invalid", APIKey: "workspace-api-key-test",
-		Sampler: sampler, HTTPClient: &http.Client{Transport: transport}, MaxAttempts: 2, RetryBackoff: time.Nanosecond})
+	client, err := NewClient(ClientOptions{CrashURL: "https://ingest.example.invalid", CrashKey: "workspace-api-key-test",
+		Sampler: sampler, HTTPClient: &http.Client{Transport: transport}, MaxAttempts: 2, RetryBaseDelay: time.Nanosecond})
 	if err != nil {
 		t.Fatal(err)
 	}

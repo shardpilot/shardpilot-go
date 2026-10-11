@@ -97,8 +97,9 @@
 // environment and never from a command line, because a command line is visible
 // to every process on the host and lands in shell history.
 //
-//	SP_REMOTE_CONFIG_URL=https://app.shardpilot.com \
-//	SP_API_KEY=sp_ingest_... \
+//	SHARDPILOT_INGEST_URL=https://ingest.example.invalid \
+//	SHARDPILOT_APP_URL=https://app.shardpilot.com \
+//	SHARDPILOT_PUBLISHABLE_KEY=sp_ingest_... \
 //	SP_WORKSPACE_ID=... SP_APP_ID=... SP_ENVIRONMENT_ID=... \
 //	SP_EXPERIMENT_KEY=... \
 //	go run ./examples/experiments
@@ -2697,7 +2698,7 @@ func redact(dump []byte, ours http.Header, fromRedirect bool) []byte {
 		// itself a client-profile defect this capture exists to detect, so
 		// replacing the line entirely would hide the failure it is meant to show.
 		// ⚠ THE CONFIGURED AUTHORITY IS OURS, VALUE AND ALL. The generic branch below
-		// marks only the field NAME, so with `SP_REMOTE_CONFIG_URL` of
+		// marks only the field NAME, so with `SHARDPILOT_APP_URL` of
 		// `https://app.shardpilot.com` and a legal experiment key of `app`, the guard
 		// found `app` inside the host this program itself configured and refused
 		// EVERY otherwise valid capture. The
@@ -5379,7 +5380,7 @@ func isWordByte(c byte) bool {
 
 func main() {
 	required := []string{
-		"SP_REMOTE_CONFIG_URL", "SP_API_KEY", "SP_WORKSPACE_ID",
+		"SHARDPILOT_INGEST_URL", "SHARDPILOT_APP_URL", "SHARDPILOT_PUBLISHABLE_KEY", "SP_WORKSPACE_ID",
 		"SP_APP_ID", "SP_ENVIRONMENT_ID", "SP_EXPERIMENT_KEY",
 	}
 	var missing []string
@@ -5398,7 +5399,7 @@ func main() {
 	}
 
 	suppliedValues = []string{
-		env("SP_API_KEY"), env("SP_WORKSPACE_ID"), env("SP_APP_ID"),
+		env("SHARDPILOT_PUBLISHABLE_KEY"), env("SP_WORKSPACE_ID"), env("SP_APP_ID"),
 		env("SP_ENVIRONMENT_ID"), env("SP_EXPERIMENT_KEY"),
 	}
 	// ...and BY NAME as well, because one question needs the mapping the flat list
@@ -5410,10 +5411,10 @@ func main() {
 
 	// The authority this program was pointed at, recorded before anything is sent:
 	// the `Host:` line carries it, and it is not endpoint text. See configuredHost.
-	if u, uerr := url.Parse(env("SP_REMOTE_CONFIG_URL")); uerr == nil {
+	if u, uerr := url.Parse(env("SHARDPILOT_APP_URL")); uerr == nil {
 		configuredHost = u.Host
 	}
-	if r, rerr := http.NewRequest("GET", env("SP_REMOTE_CONFIG_URL"), nil); rerr == nil {
+	if r, rerr := http.NewRequest("GET", env("SHARDPILOT_APP_URL"), nil); rerr == nil {
 		if d, derr := httputil.DumpRequestOut(r, false); derr == nil {
 			for _, l := range strings.Split(string(d), "\r\n") {
 				if strings.HasPrefix(strings.ToLower(l), "host:") {
@@ -5424,19 +5425,17 @@ func main() {
 	}
 	rec := &recorder{inner: http.DefaultTransport}
 	cfg := shardpilot.Config{
-		// The ingest leg is required by the constructor and is NOT exercised
-		// here: nothing is tracked and nothing is flushed. It points at the
-		// same origin so a misconfiguration cannot silently send events
-		// somewhere else.
-		IngestURL:          env("SP_REMOTE_CONFIG_URL"),
-		Token:              env("SP_API_KEY"),
-		WorkspaceID:        env("SP_WORKSPACE_ID"),
-		AppID:              env("SP_APP_ID"),
-		EnvironmentID:      env("SP_ENVIRONMENT_ID"),
-		Source:             shardpilot.SourceClient,
-		APIKey:             env("SP_API_KEY"),
-		RemoteConfigURL:    env("SP_REMOTE_CONFIG_URL"),
-		ExperimentsEnabled: true,
+		// Ingest remains a separately configured origin even though this example
+		// fetches assignments without publishing events.
+		IngestURL:           env("SHARDPILOT_INGEST_URL"),
+		WorkspaceID:         env("SP_WORKSPACE_ID"),
+		AppID:               env("SP_APP_ID"),
+		EnvironmentID:       env("SP_ENVIRONMENT_ID"),
+		Source:              shardpilot.SourceClient,
+		PublishableKey:      env("SHARDPILOT_PUBLISHABLE_KEY"),
+		RemoteConfigEnabled: true,
+		AppURL:              env("SHARDPILOT_APP_URL"),
+		ExperimentsEnabled:  true,
 		// Matched to the capture deadline on purpose: leaving the SDK's own
 		// timeout at its default lets the two disagree, and a run that ends
 		// on whichever fires first records a deadline nobody chose.

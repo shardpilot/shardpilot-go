@@ -198,8 +198,8 @@ type Client struct {
 	consentSenderOnce sync.Once
 	consentSenderDone chan struct{}
 
-	// rc is the remote-config machinery; nil when Config.RemoteConfigURL is
-	// unset (fetches fail remote_config_not_configured, getters serve
+	// rc is the remote-config machinery; nil when RemoteConfigEnabled is
+	// false (fetches fail remote_config_not_configured, getters serve
 	// defaults).
 	rc *remoteConfigState
 
@@ -424,7 +424,7 @@ func NewClient(cfg Config) (*Client, error) {
 		}
 		initDeadLetters = client.initSpool()
 	}
-	if normalized.RemoteConfigURL != "" {
+	if normalized.RemoteConfigEnabled {
 		client.rc = newRemoteConfigState(normalized)
 		client.rc.preload(client.ConsentState() == ConsentGranted)
 	}

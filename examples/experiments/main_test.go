@@ -2027,7 +2027,7 @@ func TestATrailerIsNotAMessageStart(t *testing.T) {
 	}
 }
 
-// TestTheConfiguredHostIsOurs: with `SP_REMOTE_CONFIG_URL` of
+// TestTheConfiguredHostIsOurs: with `SHARDPILOT_APP_URL` of
 // `https://app.shardpilot.com` and a legal experiment key of `app`, the guard found
 // `app` inside the host this program itself configured and refused every otherwise
 // valid capture (shardpilot/shardpilot-go#84 review).
@@ -4289,7 +4289,7 @@ func TestADecodedBodyIsNotDescribedAsReceived(t *testing.T) {
 //
 // The rows are the shapes `DumpRequestOut` rejects -- an invalid value byte and an
 // invalid name byte -- because an operator reaches them through configuration: an
-// `SP_API_KEY` with an embedded newline passes the nonempty and normalisation
+// `SHARDPILOT_PUBLISHABLE_KEY` with an embedded newline passes the nonempty and normalisation
 // checks and lands in `Authorization`.
 func TestTheRecorderKeepsTheSerialisersRefusal(t *testing.T) {
 	for _, c := range []struct{ name, k, v string }{
