@@ -97,7 +97,7 @@ func TestAnOutcomeIsSealedByTheOutcomeApplyHopAndDeliveredVerbatim(t *testing.T)
 	}
 	delivered, sealed := facts[0], rig.script.outcome.sealedFacts()[0]
 	if delivered["event_id"] != expStubFactID(outcomeID) || delivered["event_id"] != sealed["event_id"] ||
-		delivered["event_ts"] != sealed["event_ts"] || delivered["attestation_seal"] != expStubSeal ||
+		delivered["event_ts"] != sealed["event_ts"] || delivered["schema_version"] != float64(2) || delivered["attestation_seal"] != expStubSeal ||
 		delivered["source"] != "client" || delivered["anonymous_id"] != "anon-test" || delivered["user_id"] != nil ||
 		delivered["session_id"] == nil {
 		t.Fatalf("the envelope carries the sealed members verbatim and the SDK's own identity:\ndelivered %v\nsealed    %v", delivered, sealed)
@@ -421,8 +421,8 @@ func TestAnOutcomeSealedAsAnotherEventIsNotDelivered(t *testing.T) {
 	fact, _ := json.Marshal(map[string]any{
 		"fact": map[string]any{
 			"event_id": expStubFactID("wrong-kind"), "event_name": experimentExposureName,
-			"event_ts": "2026-09-27T00:00:00+00:00", "workspace_id": "workspace-test", "app_id": "app-test",
-			"environment_id": "develop", "props": map[string]any{"experiment_key": expTestScopeKey},
+			"event_ts": "2026-09-27T00:00:00+00:00", "workspace_key": "workspace-test", "app_key": "app-test",
+			"environment_key": "develop", "props": map[string]any{"experiment_key": expTestScopeKey},
 		},
 		"seal": expStubSeal,
 	})

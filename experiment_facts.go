@@ -537,18 +537,18 @@ func parseSealedExposure(body []byte, eventName string) *expSealedFact {
 // envelope carries: analytics would refuse it.
 func (c *Client) sealedExposureEvent(sessionID string, sealed *expSealedFact, factEpoch uint64) (Event, bool) {
 	var fact struct {
-		EventID       string          `json:"event_id"`
-		EventName     string          `json:"event_name"`
-		EventTS       string          `json:"event_ts"`
-		WorkspaceID   string          `json:"workspace_id"`
-		AppID         string          `json:"app_id"`
-		EnvironmentID string          `json:"environment_id"`
-		Props         json.RawMessage `json:"props"`
+		EventID        string          `json:"event_id"`
+		EventName      string          `json:"event_name"`
+		EventTS        string          `json:"event_ts"`
+		WorkspaceKey   string          `json:"workspace_key"`
+		AppKey         string          `json:"app_key"`
+		EnvironmentKey string          `json:"environment_key"`
+		Props          json.RawMessage `json:"props"`
 	}
 	if json.Unmarshal(sealed.fact, &fact) != nil {
 		return Event{}, false
 	}
-	if fact.WorkspaceID != c.cfg.WorkspaceID || fact.AppID != c.cfg.AppID || fact.EnvironmentID != c.cfg.EnvironmentID {
+	if fact.WorkspaceKey != c.cfg.WorkspaceID || fact.AppKey != c.cfg.AppID || fact.EnvironmentKey != c.cfg.EnvironmentID {
 		return Event{}, false
 	}
 	// The props travel as decoded values: analytics re-canonicalizes the

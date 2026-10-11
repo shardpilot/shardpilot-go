@@ -89,6 +89,25 @@ type eventEnvelope struct {
 	expKeyWithdrawEpoch uint64
 }
 
+// Experiment major 2 names the signed scope members with literal keys.
+// Keep the internal scope fields for queue bookkeeping; only this wire shape
+// changes. The explicit omitted fields shadow the ordinary envelope's names.
+func (e eventEnvelope) MarshalJSON() ([]byte, error) {
+	type plain eventEnvelope
+	if e.SchemaVersion != 2 || (e.EventName != experimentExposureName && e.EventName != experimentOutcomeName) {
+		return json.Marshal(plain(e))
+	}
+	return json.Marshal(struct {
+		plain
+		WorkspaceID    *string `json:"workspace_id,omitempty"`
+		AppID          *string `json:"app_id,omitempty"`
+		EnvironmentID  *string `json:"environment_id,omitempty"`
+		WorkspaceKey   string  `json:"workspace_key"`
+		AppKey         string  `json:"app_key"`
+		EnvironmentKey string  `json:"environment_key"`
+	}{plain: plain(e), WorkspaceKey: e.WorkspaceID, AppKey: e.AppID, EnvironmentKey: e.EnvironmentID})
+}
+
 func (c *Client) buildEnvelope(event Event) (eventEnvelope, error) {
 	if event.delivery == nil {
 		event.delivery = newEventDelivery(c.clock.Now())
@@ -142,10 +161,14 @@ func (c *Client) buildEnvelope(event Event) (eventEnvelope, error) {
 		// A sealed fact's event time, exactly as sealed.
 		eventTS = event.rawEventTS
 	}
+	schemaVersion := 1
+	if event.omitUserID && (name == experimentExposureName || name == experimentOutcomeName) {
+		schemaVersion = 2
+	}
 	return eventEnvelope{
 		delivery:        event.delivery,
 		EventID:         id,
-		SchemaVersion:   1,
+		SchemaVersion:   schemaVersion,
 		EventName:       name,
 		Source:          source,
 		EventTS:         eventTS,
