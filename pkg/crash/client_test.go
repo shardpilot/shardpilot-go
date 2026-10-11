@@ -44,9 +44,9 @@ func TestClientEmitRoundTrip(t *testing.T) {
 	defer server.Close()
 
 	client, err := NewClient(ClientOptions{
-		IngestURL: server.URL,
-		APIKey:    "workspace-api-key-test",
-		Sampler:   alwaysSampler{},
+		CrashURL: server.URL,
+		CrashKey: "workspace-api-key-test",
+		Sampler:  alwaysSampler{},
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -98,7 +98,7 @@ func TestClientEmitUsesCallerBreadcrumbs(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient(ClientOptions{IngestURL: server.URL, APIKey: "workspace-api-key-test", Sampler: alwaysSampler{}})
+	client, err := NewClient(ClientOptions{CrashURL: server.URL, CrashKey: "workspace-api-key-test", Sampler: alwaysSampler{}})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestClientEmitRejectsInvalidEventBeforePost(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient(ClientOptions{IngestURL: server.URL, APIKey: "workspace-api-key-test", Sampler: alwaysSampler{}})
+	client, err := NewClient(ClientOptions{CrashURL: server.URL, CrashKey: "workspace-api-key-test", Sampler: alwaysSampler{}})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -153,10 +153,10 @@ func TestClientRetriesRetryableStatus(t *testing.T) {
 	defer server.Close()
 
 	client, err := NewClient(ClientOptions{
-		IngestURL:    server.URL,
-		APIKey:       "workspace-api-key-test",
-		Sampler:      alwaysSampler{},
-		RetryBackoff: time.Nanosecond,
+		CrashURL:       server.URL,
+		CrashKey:       "workspace-api-key-test",
+		Sampler:        alwaysSampler{},
+		RetryBaseDelay: time.Nanosecond,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -177,7 +177,7 @@ func TestClientEmitFatalBypassesSampler(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := NewClient(ClientOptions{IngestURL: server.URL, APIKey: "workspace-api-key-test", Sampler: neverSampler{}})
+	client, err := NewClient(ClientOptions{CrashURL: server.URL, CrashKey: "workspace-api-key-test", Sampler: neverSampler{}})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -234,7 +234,7 @@ func TestDefaultSamplerKeepsEveryReport(t *testing.T) {
 }
 
 func TestNewClientDefaultHTTPTimeout(t *testing.T) {
-	client, err := NewClient(ClientOptions{IngestURL: "https://ingest.example.invalid", APIKey: "workspace-api-key-test"})
+	client, err := NewClient(ClientOptions{CrashURL: "https://ingest.example.invalid", CrashKey: "workspace-api-key-test"})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
@@ -244,7 +244,7 @@ func TestNewClientDefaultHTTPTimeout(t *testing.T) {
 }
 
 func TestNewClientRejectsNonLocalHTTP(t *testing.T) {
-	_, err := NewClient(ClientOptions{IngestURL: "http://ingest.example.invalid", APIKey: "workspace-api-key-test"})
+	_, err := NewClient(ClientOptions{CrashURL: "http://ingest.example.invalid", CrashKey: "workspace-api-key-test"})
 	if !errors.Is(err, ErrInvalidConfig) {
 		t.Fatalf("expected ErrInvalidConfig for non-local http ingest URL, got %v", err)
 	}
@@ -256,7 +256,7 @@ func TestNewClientAllowsLoopbackHTTP(t *testing.T) {
 		"http://127.0.0.1:8086",
 		"http://[::1]:8086",
 	} {
-		if _, err := NewClient(ClientOptions{IngestURL: ingestURL, APIKey: "workspace-api-key-test"}); err != nil {
+		if _, err := NewClient(ClientOptions{CrashURL: ingestURL, CrashKey: "workspace-api-key-test"}); err != nil {
 			t.Fatalf("expected loopback http ingest URL %q to be accepted: %v", ingestURL, err)
 		}
 	}
@@ -264,8 +264,8 @@ func TestNewClientAllowsLoopbackHTTP(t *testing.T) {
 
 func BenchmarkClientEmit(b *testing.B) {
 	client, err := NewClient(ClientOptions{
-		IngestURL: "https://ingest.example.invalid",
-		APIKey:    "workspace-api-key-test",
+		CrashURL: "https://ingest.example.invalid",
+		CrashKey: "workspace-api-key-test",
 		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 			_, _ = io.Copy(io.Discard, req.Body)
 			return &http.Response{
@@ -353,8 +353,8 @@ func TestClientActorKeyDefaultsAndPerEventOverride(t *testing.T) {
 	const eventAnon = "0198f2c1-4b3a-7c2d-8e9f-ffffffffffff"
 
 	client, err := NewClient(ClientOptions{
-		IngestURL:   server.URL,
-		APIKey:      "workspace-api-key-test",
+		CrashURL:    server.URL,
+		CrashKey:    "workspace-api-key-test",
 		App:         AppInfo{ID: "app-test"},
 		Sampler:     alwaysSampler{},
 		AnonymousID: clientAnon,
@@ -405,10 +405,10 @@ func TestClientWithoutActorKeyKeepsWireShapeUnchanged(t *testing.T) {
 	defer server.Close()
 
 	client, err := NewClient(ClientOptions{
-		IngestURL: server.URL,
-		APIKey:    "workspace-api-key-test",
-		App:       AppInfo{ID: "app-test"},
-		Sampler:   alwaysSampler{},
+		CrashURL: server.URL,
+		CrashKey: "workspace-api-key-test",
+		App:      AppInfo{ID: "app-test"},
+		Sampler:  alwaysSampler{},
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -436,8 +436,8 @@ func TestClientRejectsUnusableClientWideActorKeyWithoutFailing(t *testing.T) {
 	// A malformed client-wide identity is inert from construction: the client
 	// still builds and still reports crashes, just without the correlation key.
 	client, err := NewClient(ClientOptions{
-		IngestURL:   "https://ingest.invalid",
-		APIKey:      "workspace-api-key-test",
+		CrashURL:    "https://ingest.invalid",
+		CrashKey:    "workspace-api-key-test",
 		App:         AppInfo{ID: "app-test"},
 		AnonymousID: "user_4242",
 	})

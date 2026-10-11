@@ -17,14 +17,14 @@ func (f transportFunc) RoundTrip(r *http.Request) (*http.Response, error) { retu
 
 func environment(name string) string {
 	return map[string]string{
-		"SHARDPILOT_INGEST_URL":       "https://collector.invalid",
-		"SHARDPILOT_TOKEN":            "synthetic-analytics-token",
-		"SHARDPILOT_WORKSPACE_ID":     "synthetic-workspace",
-		"SHARDPILOT_APP_ID":           "synthetic-app",
-		"SHARDPILOT_ENVIRONMENT_ID":   "test",
-		"SHARDPILOT_ANONYMOUS_ID":     "synthetic-actor",
-		"SHARDPILOT_CRASH_INGEST_URL": "https://crashes.invalid",
-		"SHARDPILOT_API_KEY":          "synthetic-crash-token",
+		"SHARDPILOT_INGEST_URL":      "https://collector.invalid",
+		"SHARDPILOT_PUBLISHABLE_KEY": "synthetic-analytics-token",
+		"SHARDPILOT_WORKSPACE_ID":    "synthetic-workspace",
+		"SHARDPILOT_APP_ID":          "synthetic-app",
+		"SHARDPILOT_ENVIRONMENT_ID":  "test",
+		"SHARDPILOT_ANONYMOUS_ID":    "synthetic-actor",
+		"SHARDPILOT_CRASH_URL":       "https://crashes.invalid",
+		"SHARDPILOT_CRASH_KEY":       "synthetic-crash-token",
 	}[name]
 }
 
@@ -115,7 +115,7 @@ func TestSenderEvidence(t *testing.T) {
 					t.Fatalf("unexpected route: %s", req.URL.Path)
 				}
 				if defect == "echo_key" {
-					result = map[string]string{"error": environment("SHARDPILOT_TOKEN") + environment("SHARDPILOT_API_KEY")}
+					result = map[string]string{"error": environment("SHARDPILOT_PUBLISHABLE_KEY") + environment("SHARDPILOT_CRASH_KEY")}
 				}
 				encoded, err := json.Marshal(result)
 				if err != nil {
@@ -138,7 +138,7 @@ func TestSenderEvidence(t *testing.T) {
 			if calls == 0 {
 				t.Fatal("no SDK request was exercised")
 			}
-			for _, secret := range []string{environment("SHARDPILOT_TOKEN"), environment("SHARDPILOT_API_KEY")} {
+			for _, secret := range []string{environment("SHARDPILOT_PUBLISHABLE_KEY"), environment("SHARDPILOT_CRASH_KEY")} {
 				if strings.Contains(output.String(), secret) {
 					t.Fatal("output contains configured credential")
 				}
@@ -153,7 +153,7 @@ func TestSenderEvidence(t *testing.T) {
 }
 
 func TestConfigurationRefusesBeforeNetwork(t *testing.T) {
-	for _, name := range []string{"SHARDPILOT_TOKEN", "SHARDPILOT_INGEST_URL", "SHARDPILOT_API_KEY", "SHARDPILOT_ANONYMOUS_ID"} {
+	for _, name := range []string{"SHARDPILOT_PUBLISHABLE_KEY", "SHARDPILOT_INGEST_URL", "SHARDPILOT_CRASH_KEY", "SHARDPILOT_ANONYMOUS_ID"} {
 		t.Run(name, func(t *testing.T) {
 			var out bytes.Buffer
 			get := func(key string) string {

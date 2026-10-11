@@ -23,8 +23,8 @@ import (
 // an offline start still gets the previously fetched configuration. It is
 // deliberately separate from the ingest transport routes: configuration is
 // FETCHED (a GET of one resource, ETag-revalidated), never batched, and
-// authenticates with the publishable Config.APIKey only — the ingest
-// Config.Token never authenticates the remote-config endpoint. Every fetch
+// authenticates with the publishable Config.PublishableKey only — the ingest
+// Config.ServiceToken never authenticates the remote-config endpoint. Every fetch
 // is explicit (FetchRemoteConfig); there is no automatic refresh, no
 // Cache-Control interpretation, no experiment assignment, and no client-side
 // rule evaluation. Fetching remains available in every consent state. Only
@@ -188,16 +188,16 @@ type remoteConfigState struct {
 
 func newRemoteConfigState(cfg Config) *remoteConfigState {
 	rc := &remoteConfigState{
-		fetchURL:       buildRemoteConfigURL(cfg.RemoteConfigURL, cfg.WorkspaceID, cfg.EnvironmentID, cfg.AnonymousID),
-		anonymousURL:   buildRemoteConfigURL(cfg.RemoteConfigURL, cfg.WorkspaceID, cfg.EnvironmentID, ""),
-		anonymousScope: buildRemoteConfigScope(cfg.WorkspaceID, cfg.EnvironmentID, "", cfg.RemoteConfigURL),
-		apiKey:         cfg.APIKey,
+		fetchURL:       buildRemoteConfigURL(cfg.AppURL, cfg.WorkspaceID, cfg.EnvironmentID, cfg.AnonymousID),
+		anonymousURL:   buildRemoteConfigURL(cfg.AppURL, cfg.WorkspaceID, cfg.EnvironmentID, ""),
+		anonymousScope: buildRemoteConfigScope(cfg.WorkspaceID, cfg.EnvironmentID, "", cfg.AppURL),
+		apiKey:         cfg.PublishableKey,
 		cachePath:      cfg.RemoteConfigCachePath,
 		clientID:       cfg.AnonymousID,
 		settled:        make(map[string]uint64),
 	}
 	if rc.clientID != "" {
-		rc.scope = buildRemoteConfigScope(cfg.WorkspaceID, cfg.EnvironmentID, rc.clientID, cfg.RemoteConfigURL)
+		rc.scope = buildRemoteConfigScope(cfg.WorkspaceID, cfg.EnvironmentID, rc.clientID, cfg.AppURL)
 	}
 	return rc
 }

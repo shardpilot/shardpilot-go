@@ -28,14 +28,15 @@ func newRemoteConfigClient(t *testing.T, serverURL, cachePath, anonymousID strin
 	t.Helper()
 	client, err := NewClient(Config{
 		IngestURL:             serverURL,
-		Token:                 "test-token",
+		ServiceToken:          "test-token",
 		WorkspaceID:           "workspace-test",
 		AppID:                 "app-test",
 		EnvironmentID:         "develop",
 		Source:                SourceBackend,
 		AnonymousID:           anonymousID,
-		APIKey:                "test-rc-key",
-		RemoteConfigURL:       serverURL,
+		PublishableKey:        "test-rc-key",
+		RemoteConfigEnabled:   true,
+		AppURL:                serverURL,
 		RemoteConfigCachePath: cachePath,
 		BatchSize:             2,
 		BufferSize:            4,
@@ -121,7 +122,7 @@ func TestRemoteConfigRequestShape(t *testing.T) {
 		t.Fatalf("expected path %q, got %q", want, request.escapedPath)
 	}
 	if request.auth != "Bearer test-rc-key" {
-		t.Fatalf("expected the publishable APIKey bearer, got %q", request.auth)
+		t.Fatalf("expected the publishable PublishableKey bearer, got %q", request.auth)
 	}
 	if request.ifNoneMatch != "" {
 		t.Fatalf("expected no If-None-Match without a cache, got %q", request.ifNoneMatch)
@@ -134,7 +135,7 @@ func TestRemoteConfigRequestShape(t *testing.T) {
 func TestRemoteConfigConfigValidation(t *testing.T) {
 	base := Config{
 		IngestURL:     "http://localhost:8080",
-		Token:         "test-token",
+		ServiceToken:  "test-token",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",
@@ -142,9 +143,10 @@ func TestRemoteConfigConfigValidation(t *testing.T) {
 	}
 
 	missingKey := base
-	missingKey.RemoteConfigURL = "https://config.example.test"
+	missingKey.RemoteConfigEnabled = true
+	missingKey.AppURL = "https://config.example.test"
 	if _, err := NewClient(missingKey); !errors.Is(err, ErrInvalidConfig) {
-		t.Fatalf("expected ErrInvalidConfig for RemoteConfigURL without APIKey, got %v", err)
+		t.Fatalf("expected ErrInvalidConfig for AppURL without PublishableKey, got %v", err)
 	}
 
 	for _, badURL := range []string{
@@ -157,16 +159,16 @@ func TestRemoteConfigConfigValidation(t *testing.T) {
 		"http://192.168.1.10",              // private without opt-in
 	} {
 		cfg := base
-		cfg.APIKey = "test-rc-key"
-		cfg.RemoteConfigURL = badURL
+		cfg.PublishableKey = "test-rc-key"
+		cfg.AppURL = badURL
 		if _, err := NewClient(cfg); !errors.Is(err, ErrInvalidConfig) {
 			t.Fatalf("expected remote config URL %q to be rejected, got %v", badURL, err)
 		}
 	}
 
 	private := base
-	private.APIKey = "test-rc-key"
-	private.RemoteConfigURL = "http://192.168.1.10"
+	private.PublishableKey = "test-rc-key"
+	private.AppURL = "http://192.168.1.10"
 	private.AllowInsecurePrivateNetwork = true
 	client, err := NewClient(private)
 	if err != nil {
@@ -174,13 +176,13 @@ func TestRemoteConfigConfigValidation(t *testing.T) {
 	}
 	_ = client.Close(context.Background())
 
-	// APIKey alone (no RemoteConfigURL) is valid — there is no both-set
+	// PublishableKey alone (no AppURL) is valid — there is no both-set
 	// credential conflict in this SDK.
 	keyOnly := base
-	keyOnly.APIKey = "test-rc-key"
+	keyOnly.PublishableKey = "test-rc-key"
 	client, err = NewClient(keyOnly)
 	if err != nil {
-		t.Fatalf("expected APIKey without RemoteConfigURL to be valid, got %v", err)
+		t.Fatalf("expected PublishableKey without AppURL to be valid, got %v", err)
 	}
 	if _, err := client.FetchRemoteConfig(context.Background()); err == nil || !strings.Contains(err.Error(), "remote_config_not_configured") {
 		t.Fatalf("expected remote_config_not_configured, got %v", err)
@@ -1113,17 +1115,18 @@ func TestRemoteConfigInternalTimeoutStaysTransient(t *testing.T) {
 	defer server.Close()
 
 	client, err := NewClient(Config{
-		IngestURL:       server.URL,
-		Token:           "test-token",
-		WorkspaceID:     "workspace-test",
-		AppID:           "app-test",
-		EnvironmentID:   "develop",
-		Source:          SourceBackend,
-		AnonymousID:     "anon-rc-1",
-		APIKey:          "test-rc-key",
-		RemoteConfigURL: server.URL,
-		FlushInterval:   time.Hour,
-		HTTPTimeout:     100 * time.Millisecond,
+		IngestURL:           server.URL,
+		ServiceToken:        "test-token",
+		WorkspaceID:         "workspace-test",
+		AppID:               "app-test",
+		EnvironmentID:       "develop",
+		Source:              SourceBackend,
+		AnonymousID:         "anon-rc-1",
+		PublishableKey:      "test-rc-key",
+		RemoteConfigEnabled: true,
+		AppURL:              server.URL,
+		FlushInterval:       time.Hour,
+		HTTPTimeout:         100 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -1172,14 +1175,15 @@ func TestRemoteConfigStalledBodyPreservesStatus(t *testing.T) {
 	cachePath := filepath.Join(t.TempDir(), "rc-cache.json")
 	client, err := NewClient(Config{
 		IngestURL:             server.URL,
-		Token:                 "test-token",
+		ServiceToken:          "test-token",
 		WorkspaceID:           "workspace-test",
 		AppID:                 "app-test",
 		EnvironmentID:         "develop",
 		Source:                SourceBackend,
 		AnonymousID:           "anon-rc-1",
-		APIKey:                "test-rc-key",
-		RemoteConfigURL:       server.URL,
+		PublishableKey:        "test-rc-key",
+		RemoteConfigEnabled:   true,
+		AppURL:                server.URL,
 		RemoteConfigCachePath: cachePath,
 		FlushInterval:         time.Hour,
 		HTTPTimeout:           100 * time.Millisecond,
@@ -1424,14 +1428,15 @@ func TestRemoteConfigCloseFencesInFlightFetch(t *testing.T) {
 	cachePath := filepath.Join(t.TempDir(), "rc-cache.json")
 	client, err := NewClient(Config{
 		IngestURL:             "http://127.0.0.1:9", // never dialed: the transport is replaced below
-		Token:                 "test-token",
+		ServiceToken:          "test-token",
 		WorkspaceID:           "workspace-test",
 		AppID:                 "app-test",
 		EnvironmentID:         "develop",
 		Source:                SourceBackend,
 		AnonymousID:           "anon-rc-1",
-		APIKey:                "test-rc-key",
-		RemoteConfigURL:       "http://127.0.0.1:9",
+		PublishableKey:        "test-rc-key",
+		RemoteConfigEnabled:   true,
+		AppURL:                "http://127.0.0.1:9",
 		RemoteConfigCachePath: cachePath,
 		BatchSize:             2,
 		BufferSize:            4,
@@ -1699,14 +1704,15 @@ func TestRemoteConfigCacheRoundTripsHTMLDenseBody(t *testing.T) {
 	// the cache round trip, not timeout behavior.
 	first, err := NewClient(Config{
 		IngestURL:             server.URL,
-		Token:                 "test-token",
+		ServiceToken:          "test-token",
 		WorkspaceID:           "workspace-test",
 		AppID:                 "app-test",
 		EnvironmentID:         "develop",
 		Source:                SourceBackend,
 		AnonymousID:           "anon-rc-1",
-		APIKey:                "test-rc-key",
-		RemoteConfigURL:       server.URL,
+		PublishableKey:        "test-rc-key",
+		RemoteConfigEnabled:   true,
+		AppURL:                server.URL,
 		RemoteConfigCachePath: cachePath,
 		BatchSize:             2,
 		BufferSize:            4,
@@ -1794,14 +1800,15 @@ func TestRemoteConfigAttributePassThroughConsentGate(t *testing.T) {
 		t.Helper()
 		client, err := NewClient(Config{
 			IngestURL:                     server.URL,
-			Token:                         "test-token",
+			ServiceToken:                  "test-token",
 			WorkspaceID:                   "workspace-test",
 			AppID:                         "app-test",
 			EnvironmentID:                 "develop",
 			Source:                        SourceBackend,
 			AnonymousID:                   "anon-attr-1",
-			APIKey:                        "test-rc-key",
-			RemoteConfigURL:               server.URL,
+			PublishableKey:                "test-rc-key",
+			RemoteConfigEnabled:           true,
+			AppURL:                        server.URL,
 			RemoteConfigAttributesEnabled: enabled,
 			BatchSize:                     2,
 			BufferSize:                    4,
@@ -1894,16 +1901,17 @@ func TestRemoteConfigAttributePassThroughConsentGate(t *testing.T) {
 // zero bytes of the personal-data-shaped input in SDK state.
 func TestSetRemoteConfigAttributesInertWhileDark(t *testing.T) {
 	client, err := NewClient(Config{
-		IngestURL:       "https://ingest.example.test",
-		Token:           "test-token",
-		WorkspaceID:     "workspace-test",
-		AppID:           "app-test",
-		EnvironmentID:   "develop",
-		Source:          SourceBackend,
-		AnonymousID:     "anon-attr-dark",
-		APIKey:          "test-rc-key",
-		RemoteConfigURL: "https://cfg.example.test",
-		FlushInterval:   time.Hour,
+		IngestURL:           "https://ingest.example.test",
+		ServiceToken:        "test-token",
+		WorkspaceID:         "workspace-test",
+		AppID:               "app-test",
+		EnvironmentID:       "develop",
+		Source:              SourceBackend,
+		AnonymousID:         "anon-attr-dark",
+		PublishableKey:      "test-rc-key",
+		RemoteConfigEnabled: true,
+		AppURL:              "https://cfg.example.test",
+		FlushInterval:       time.Hour,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -1953,14 +1961,15 @@ func TestRemoteConfigAttributeSignatureKeysRevalidation(t *testing.T) {
 	cachePath := filepath.Join(t.TempDir(), "rc-cache.json")
 	client, err := NewClient(Config{
 		IngestURL:                     server.URL,
-		Token:                         "test-token",
+		ServiceToken:                  "test-token",
 		WorkspaceID:                   "workspace-test",
 		AppID:                         "app-test",
 		EnvironmentID:                 "develop",
 		Source:                        SourceBackend,
 		AnonymousID:                   "anon-attr-etag",
-		APIKey:                        "test-rc-key",
-		RemoteConfigURL:               server.URL,
+		PublishableKey:                "test-rc-key",
+		RemoteConfigEnabled:           true,
+		AppURL:                        server.URL,
 		RemoteConfigCachePath:         cachePath,
 		RemoteConfigAttributesEnabled: true,
 		FlushInterval:                 time.Hour,
@@ -2078,14 +2087,15 @@ func TestRemoteConfigAttributeSignatureKeysRevalidation(t *testing.T) {
 		}
 		restarted, err := NewClient(Config{
 			IngestURL:                     server.URL,
-			Token:                         "test-token",
+			ServiceToken:                  "test-token",
 			WorkspaceID:                   "workspace-test",
 			AppID:                         "app-test",
 			EnvironmentID:                 "develop",
 			Source:                        SourceBackend,
 			AnonymousID:                   "anon-attr-etag",
-			APIKey:                        "test-rc-key",
-			RemoteConfigURL:               server.URL,
+			PublishableKey:                "test-rc-key",
+			RemoteConfigEnabled:           true,
+			AppURL:                        server.URL,
 			RemoteConfigCachePath:         path,
 			RemoteConfigAttributesEnabled: true,
 			FlushInterval:                 time.Hour,
@@ -2143,14 +2153,15 @@ func TestRemoteConfigAttributesHoldWhileGrantReceiptPending(t *testing.T) {
 		t.Helper()
 		client, err := NewClient(Config{
 			IngestURL:                     server.URL,
-			Token:                         "test-token",
+			ServiceToken:                  "test-token",
 			WorkspaceID:                   "workspace-test",
 			AppID:                         "app-test",
 			EnvironmentID:                 "develop",
 			Source:                        SourceBackend,
 			AnonymousID:                   anonymousID,
-			APIKey:                        "test-rc-key",
-			RemoteConfigURL:               server.URL,
+			PublishableKey:                "test-rc-key",
+			RemoteConfigEnabled:           true,
+			AppURL:                        server.URL,
 			RemoteConfigAttributesEnabled: true,
 			ConsentFloor:                  &ConsentFloorConfig{},
 			FlushInterval:                 time.Hour,

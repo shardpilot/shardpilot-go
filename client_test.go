@@ -521,7 +521,7 @@ func TestPermanentEncodeErrorDoesNotBlockLaterValidEvents(t *testing.T) {
 
 	cfg := Config{
 		IngestURL:     server.URL,
-		Token:         "test-token",
+		ServiceToken:  "test-token",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",
@@ -695,7 +695,7 @@ func TestPublishWorkerBatchDropsPermanentEncodeFailure(t *testing.T) {
 
 	cfg := Config{
 		IngestURL:     server.URL,
-		Token:         "test-token",
+		ServiceToken:  "test-token",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",

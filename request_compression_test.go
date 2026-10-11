@@ -112,7 +112,7 @@ func newCompressionTestClient(t *testing.T, ingestURL string, mutate func(*Confi
 
 	cfg := Config{
 		IngestURL:     ingestURL,
-		Token:         "test-token",
+		ServiceToken:  "test-token",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",
@@ -306,9 +306,9 @@ func newCompressionTestTransport(t *testing.T, ingestURL string) *httpTransport 
 	t.Helper()
 
 	return newHTTPTransport(Config{
-		IngestURL:   ingestURL,
-		Token:       "test-token",
-		HTTPTimeout: 5 * time.Second,
+		IngestURL:    ingestURL,
+		ServiceToken: "test-token",
+		HTTPTimeout:  5 * time.Second,
 	})
 }
 
@@ -698,7 +698,7 @@ func TestTheUncompressedRetryGetsItsOwnAttemptTimeout(t *testing.T) {
 
 	client, err := NewClient(Config{
 		IngestURL:     server.URL,
-		Token:         "test-token",
+		ServiceToken:  "test-token",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",
@@ -738,9 +738,9 @@ func TestACallerDeadlineStillBoundsBothAttempts(t *testing.T) {
 	defer server.Close()
 
 	transport := newHTTPTransport(Config{
-		IngestURL:   server.URL,
-		Token:       "test-token",
-		HTTPTimeout: time.Minute,
+		IngestURL:    server.URL,
+		ServiceToken: "test-token",
+		HTTPTimeout:  time.Minute,
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)

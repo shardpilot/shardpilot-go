@@ -15,8 +15,8 @@ func main() {
 		This example only demonstrates the client API surface with a synthetic
 		stub event; it does not install a panic handler or capture a real crash.
 	*/
-	ingestURL := os.Getenv("SHARDPILOT_CRASH_INGEST_URL")
-	apiKey := os.Getenv("SHARDPILOT_API_KEY")
+	ingestURL := os.Getenv("SHARDPILOT_CRASH_URL")
+	apiKey := os.Getenv("SHARDPILOT_CRASH_KEY")
 	// The app id is REQUIRED, not decorative: an API key is bound to a single app, and
 	// crash ingest rejects a mismatch with
 	//   403 {"code":"forbidden","message":"crash app.id does not match API key app scope"}.
@@ -24,7 +24,7 @@ func main() {
 	// is read from the environment — the same shape examples/basic uses for its scope.
 	appID := os.Getenv("SHARDPILOT_APP_ID")
 	if ingestURL == "" || apiKey == "" || appID == "" {
-		log.Fatal("SHARDPILOT_CRASH_INGEST_URL, SHARDPILOT_API_KEY and SHARDPILOT_APP_ID are required")
+		log.Fatal("SHARDPILOT_CRASH_URL, SHARDPILOT_CRASH_KEY and SHARDPILOT_APP_ID are required")
 	}
 	appVersion := os.Getenv("SHARDPILOT_APP_VERSION")
 	if appVersion == "" {
@@ -36,8 +36,8 @@ func main() {
 	}
 
 	client, err := crash.NewClient(crash.ClientOptions{
-		IngestURL: ingestURL,
-		APIKey:    apiKey,
+		CrashURL: ingestURL,
+		CrashKey: apiKey,
 	})
 	if err != nil {
 		log.Fatalf("create crash client: %v", err)

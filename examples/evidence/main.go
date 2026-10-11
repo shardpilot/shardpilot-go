@@ -227,7 +227,7 @@ func (w *witness) outcome(kind string) error {
 func run(getenv func(string) string, out io.Writer, transport http.RoundTripper) int {
 	log := &evidenceWriter{Writer: out}
 	out = log
-	names := []string{"SHARDPILOT_INGEST_URL", "SHARDPILOT_TOKEN", "SHARDPILOT_WORKSPACE_ID", "SHARDPILOT_APP_ID", "SHARDPILOT_ENVIRONMENT_ID", "SHARDPILOT_ANONYMOUS_ID", "SHARDPILOT_CRASH_INGEST_URL", "SHARDPILOT_API_KEY"}
+	names := []string{"SHARDPILOT_INGEST_URL", "SHARDPILOT_PUBLISHABLE_KEY", "SHARDPILOT_WORKSPACE_ID", "SHARDPILOT_APP_ID", "SHARDPILOT_ENVIRONMENT_ID", "SHARDPILOT_ANONYMOUS_ID", "SHARDPILOT_CRASH_URL", "SHARDPILOT_CRASH_KEY"}
 	values := make(map[string]string)
 	for _, name := range names {
 		values[name] = strings.TrimSpace(getenv(name))
@@ -236,7 +236,7 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 			return 2
 		}
 	}
-	for _, name := range []string{"SHARDPILOT_INGEST_URL", "SHARDPILOT_CRASH_INGEST_URL"} {
+	for _, name := range []string{"SHARDPILOT_INGEST_URL", "SHARDPILOT_CRASH_URL"} {
 		u, err := url.Parse(values[name])
 		if err != nil || u.Hostname() == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") || (u.Scheme != "https" && u.Scheme != "http") {
 			fmt.Fprintf(out, "configuration: %s must be an HTTP(S) origin without credentials, path, query or fragment; exit2\n", name)
@@ -253,7 +253,7 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 		fmt.Fprintln(out, "configuration: SHARDPILOT_ANONYMOUS_ID must survive the crash SDK actor sanitizer unchanged; exit2")
 		return 2
 	}
-	redact := redact.New(values["SHARDPILOT_TOKEN"], values["SHARDPILOT_API_KEY"])
+	redact := redact.New(values["SHARDPILOT_PUBLISHABLE_KEY"], values["SHARDPILOT_CRASH_KEY"])
 	var random [12]byte
 	if _, err := rand.Read(random[:]); err != nil {
 		fmt.Fprintln(out, "cannot generate synthetic run id; exit2")
@@ -280,7 +280,7 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 	}
 	analytics := func(name, kind string, events []shardpilot.Event, synchronous bool) {
 		caseRun(name, kind, func(hc *http.Client) error {
-			c, err := shardpilot.NewClient(shardpilot.Config{IngestURL: values["SHARDPILOT_INGEST_URL"], Token: values["SHARDPILOT_TOKEN"], WorkspaceID: values["SHARDPILOT_WORKSPACE_ID"], AppID: values["SHARDPILOT_APP_ID"], EnvironmentID: values["SHARDPILOT_ENVIRONMENT_ID"], AnonymousID: values["SHARDPILOT_ANONYMOUS_ID"], Source: shardpilot.SourceClient, BatchSize: len(events), FlushInterval: time.Hour, HTTPTimeout: 15 * time.Second, HTTPClient: hc, DisableRequestCompression: true})
+			c, err := shardpilot.NewClient(shardpilot.Config{IngestURL: values["SHARDPILOT_INGEST_URL"], PublishableKey: values["SHARDPILOT_PUBLISHABLE_KEY"], WorkspaceID: values["SHARDPILOT_WORKSPACE_ID"], AppID: values["SHARDPILOT_APP_ID"], EnvironmentID: values["SHARDPILOT_ENVIRONMENT_ID"], AnonymousID: values["SHARDPILOT_ANONYMOUS_ID"], Source: shardpilot.SourceClient, BatchSize: len(events), FlushInterval: time.Hour, HTTPTimeout: 15 * time.Second, HTTPClient: hc, DisableRequestCompression: true})
 			if err != nil {
 				return err
 			}
@@ -320,7 +320,7 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 	analytics("unauthenticated", "unauthenticated", []shardpilot.Event{event("app.screen_view", "unauth", 1, nil)}, true)
 	for _, kind := range []string{"go-panic", "native-json", "raw-text"} {
 		caseRun(kind, "crash", func(hc *http.Client) error {
-			c, err := crash.NewClient(crash.ClientOptions{IngestURL: values["SHARDPILOT_CRASH_INGEST_URL"], APIKey: values["SHARDPILOT_API_KEY"], App: crash.AppInfo{ID: values["SHARDPILOT_APP_ID"], Version: "synthetic", BuildID: "sdk-evidence"}, Source: "sdk-evidence", AnonymousID: values["SHARDPILOT_ANONYMOUS_ID"], SessionID: runID, HTTPClient: hc, MaxAttempts: 1})
+			c, err := crash.NewClient(crash.ClientOptions{CrashURL: values["SHARDPILOT_CRASH_URL"], CrashKey: values["SHARDPILOT_CRASH_KEY"], App: crash.AppInfo{ID: values["SHARDPILOT_APP_ID"], Version: "synthetic", BuildID: "sdk-evidence"}, CrashComponent: "sdk-evidence", AnonymousID: values["SHARDPILOT_ANONYMOUS_ID"], SessionID: runID, HTTPClient: hc, MaxAttempts: 1})
 			if err != nil {
 				return err
 			}

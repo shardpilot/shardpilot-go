@@ -15,7 +15,7 @@ func main() {
 
 	client, err := shardpilot.NewClient(shardpilot.Config{
 		IngestURL:     os.Getenv("SHARDPILOT_INGEST_URL"),
-		Token:         os.Getenv("SHARDPILOT_TOKEN"),
+		ServiceToken:  os.Getenv("SHARDPILOT_SERVICE_TOKEN"),
 		WorkspaceID:   os.Getenv("SHARDPILOT_WORKSPACE_ID"),
 		AppID:         os.Getenv("SHARDPILOT_APP_ID"),
 		EnvironmentID: os.Getenv("SHARDPILOT_ENVIRONMENT_ID"),

@@ -233,20 +233,21 @@ func parkWorkerWithFullQueue(t *testing.T, client *Client, capture *expWireCaptu
 func newExperimentClient(t *testing.T, serverURL string, mutate func(*Config)) *Client {
 	t.Helper()
 	cfg := Config{
-		IngestURL:          serverURL,
-		Token:              "test-token",
-		WorkspaceID:        "workspace-test",
-		AppID:              "app-test",
-		EnvironmentID:      "develop",
-		Source:             SourceBackend,
-		AnonymousID:        "anon-test",
-		APIKey:             "test-exp-key",
-		RemoteConfigURL:    serverURL,
-		ExperimentsEnabled: true,
-		BatchSize:          8,
-		BufferSize:         16,
-		FlushInterval:      time.Hour,
-		HTTPTimeout:        time.Second,
+		IngestURL:           serverURL,
+		ServiceToken:        "test-token",
+		WorkspaceID:         "workspace-test",
+		AppID:               "app-test",
+		EnvironmentID:       "develop",
+		Source:              SourceBackend,
+		AnonymousID:         "anon-test",
+		PublishableKey:      "test-exp-key",
+		RemoteConfigEnabled: true,
+		AppURL:              serverURL,
+		ExperimentsEnabled:  true,
+		BatchSize:           8,
+		BufferSize:          16,
+		FlushInterval:       time.Hour,
+		HTTPTimeout:         time.Second,
 	}
 	if mutate != nil {
 		mutate(&cfg)
@@ -328,7 +329,7 @@ func TestExperimentsDarkDefault(t *testing.T) {
 func TestExperimentsConfigRequiresRemoteConfigURL(t *testing.T) {
 	_, err := NewClient(Config{
 		IngestURL:          "https://ingest.example",
-		Token:              "test-token",
+		ServiceToken:       "test-token",
 		WorkspaceID:        "ws",
 		AppID:              "app",
 		EnvironmentID:      "dev",
@@ -370,7 +371,7 @@ func TestFetchExperimentAssignmentRequestShape(t *testing.T) {
 		t.Fatalf("expected GET, got %s", request.Method)
 	}
 	if request.Header.Get("Authorization") != "Bearer test-exp-key" {
-		t.Fatalf("expected the publishable APIKey bearer, got %q", request.Header.Get("Authorization"))
+		t.Fatalf("expected the publishable PublishableKey bearer, got %q", request.Header.Get("Authorization"))
 	}
 	if request.Header.Get("If-None-Match") != "" {
 		t.Fatalf("the assignment fetch has no conditional-request contract")

@@ -2,6 +2,23 @@
 
 ## v0.8.0-alpha — release preparation (not published)
 
+### Migration from `v0.7.2-alpha`
+
+| Previous configuration | Current configuration |
+|---|---|
+| `Config.Token` | `ServiceToken` for server/backend ingest; `PublishableKey` for client ingest. Static JWT configuration is refused. |
+| `Config.APIKey` | `PublishableKey` for app requests. |
+| `Config.RemoteConfigURL` | `AppURL`, plus explicit `RemoteConfigEnabled` for configuration fetches. Experiments retain their own switch. |
+| `crash.ClientOptions.APIKey` | `CrashKey` |
+| `crash.ClientOptions.IngestURL` | `CrashURL` |
+| `crash.ClientOptions.Source` | `CrashComponent`; the former alias is removed. |
+| `crash.ClientOptions.RetryBackoff` | `RetryBaseDelay` |
+
+No compatibility aliases are provided. Example environment variables name the
+credential purpose (`SHARDPILOT_SERVICE_TOKEN`, `SHARDPILOT_PUBLISHABLE_KEY`,
+`SHARDPILOT_CRASH_KEY`) and app/crash origins (`SHARDPILOT_APP_URL`,
+`SHARDPILOT_CRASH_URL`). Scope configuration and wire names are unchanged.
+
 - Analytics retries retain events for up to seven days from SDK intake,
   independently of host timestamps. A potentially accepted request without a
   definitive response starts a durable 15-minute retry window; definite

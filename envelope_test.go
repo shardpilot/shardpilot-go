@@ -96,7 +96,7 @@ func TestConfigValidationAndDefaults(t *testing.T) {
 
 	_, err := NewClient(Config{
 		IngestURL:     "http://example.com",
-		Token:         "token",
+		ServiceToken:  "token",
 		WorkspaceID:   "workspace",
 		AppID:         "app",
 		EnvironmentID: "develop",
@@ -108,7 +108,7 @@ func TestConfigValidationAndDefaults(t *testing.T) {
 
 	client, err := NewClient(Config{
 		IngestURL:     "http://localhost:8080/",
-		Token:         "token",
+		ServiceToken:  "token",
 		WorkspaceID:   "workspace",
 		AppID:         "app",
 		EnvironmentID: "develop",
@@ -122,7 +122,7 @@ func TestConfigValidationAndDefaults(t *testing.T) {
 
 	_, err = NewClient(Config{
 		IngestURL:     "http://10.0.0.10:8080",
-		Token:         "token",
+		ServiceToken:  "token",
 		WorkspaceID:   "workspace",
 		AppID:         "app",
 		EnvironmentID: "develop",
@@ -134,7 +134,7 @@ func TestConfigValidationAndDefaults(t *testing.T) {
 
 	privateClient, err := NewClient(Config{
 		IngestURL:                   "http://10.0.0.10:8080",
-		Token:                       "token",
+		ServiceToken:                "token",
 		WorkspaceID:                 "workspace",
 		AppID:                       "app",
 		EnvironmentID:               "develop",
@@ -155,7 +155,7 @@ func TestConfigValidationAndDefaults(t *testing.T) {
 		t.Run("rejects "+name, func(t *testing.T) {
 			_, err := NewClient(Config{
 				IngestURL:     ingestURL,
-				Token:         "token",
+				ServiceToken:  "token",
 				WorkspaceID:   "workspace",
 				AppID:         "app",
 				EnvironmentID: "develop",
@@ -201,7 +201,7 @@ func TestNormalizeConfigFlushIntervalDefaulting(t *testing.T) {
 	base := func() Config {
 		return Config{
 			IngestURL:     "http://localhost:8080",
-			Token:         "test-token",
+			ServiceToken:  "test-token",
 			WorkspaceID:   "workspace-test",
 			AppID:         "app-test",
 			EnvironmentID: "develop",
@@ -232,7 +232,7 @@ func newTestClient(t *testing.T, ingestURL string) *Client {
 	t.Helper()
 	client, err := NewClient(Config{
 		IngestURL:     ingestURL,
-		Token:         "test-token",
+		ServiceToken:  "test-token",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",

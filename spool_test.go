@@ -180,7 +180,7 @@ func newSpoolTestClient(t *testing.T, serverURL, spoolDir string, recorder *spoo
 	t.Helper()
 	cfg := Config{
 		IngestURL:     serverURL,
-		Token:         "test-token",
+		ServiceToken:  "test-token",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",
@@ -368,7 +368,7 @@ func flushUntilSpooled(t *testing.T, client *Client, dir string, want int) {
 func TestSpoolConfigDefaults(t *testing.T) {
 	cfg, err := normalizeConfig(Config{
 		IngestURL:     "http://localhost:8080",
-		Token:         "test-token",
+		ServiceToken:  "test-token",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",
@@ -388,7 +388,7 @@ func TestSpoolConfigDefaults(t *testing.T) {
 	// Without SpoolDir the caps stay unset — no spool exists to bound.
 	cfg, err = normalizeConfig(Config{
 		IngestURL:     "http://localhost:8080",
-		Token:         "test-token",
+		ServiceToken:  "test-token",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",

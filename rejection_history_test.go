@@ -86,7 +86,7 @@ func (l *rejectionLog) Printf(format string, args ...any) {
 func rejectionClient(t *testing.T, configure func(*Config)) (*Client, *rejectionHTTP) {
 	t.Helper()
 	fake := &rejectionHTTP{}
-	cfg := Config{IngestURL: "https://ingest.example.test", Token: "test-token", WorkspaceID: "workspace-test", AppID: "app-test", EnvironmentID: "develop", Source: SourceBackend, BatchSize: 100, BufferSize: 256, FlushInterval: time.Hour, HTTPTimeout: time.Second, DisableRequestCompression: true, HTTPClient: &http.Client{Transport: fake}}
+	cfg := Config{IngestURL: "https://ingest.example.test", ServiceToken: "test-token", WorkspaceID: "workspace-test", AppID: "app-test", EnvironmentID: "develop", Source: SourceBackend, BatchSize: 100, BufferSize: 256, FlushInterval: time.Hour, HTTPTimeout: time.Second, DisableRequestCompression: true, HTTPClient: &http.Client{Transport: fake}}
 	if configure != nil {
 		configure(&cfg)
 	}
@@ -452,10 +452,10 @@ func TestRejectionOtherStatusesStayOut(t *testing.T) {
 func TestRejectionDiagnosticsRedactConfiguredSecrets(t *testing.T) {
 	sink := captureRejectionLog(t)
 	client, fake := rejectionClient(t, func(cfg *Config) {
-		cfg.Token = "synthetic-token-with-\"quote"
-		cfg.APIKey = "synthetic-key-with-\\slash"
+		cfg.ServiceToken = "synthetic-token-with-\"quote"
+		cfg.PublishableKey = "synthetic-key-with-\\slash"
 	})
-	message := client.cfg.Token + " / " + client.cfg.APIKey
+	message := client.cfg.ServiceToken + " / " + client.cfg.PublishableKey
 	fake.setTransform(func(result *batchResult) { result.Events[0].Message = message })
 	if err := client.Track(rejectionContext(t), Event{ID: "2565d870-82ea-5abc-8bbd-1cd37cee4413", Name: "rejected_secret_echo"}); err != nil {
 		t.Fatal(err)

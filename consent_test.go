@@ -62,7 +62,7 @@ func newConsentTestClient(t *testing.T, ingestURL string, userID, anonymousID st
 	t.Helper()
 	client, err := NewClient(Config{
 		IngestURL:     ingestURL,
-		Token:         "test-token",
+		ServiceToken:  "test-token",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",
@@ -257,7 +257,7 @@ func TestSetConsentPublishFailureIsQuietAndKeepsLocalState(t *testing.T) {
 	logs := make(chan string, 8)
 	client, err := NewClient(Config{
 		IngestURL:     server.URL,
-		Token:         "test-token",
+		ServiceToken:  "test-token",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",
@@ -452,7 +452,7 @@ func TestConsentDenialCancelsInFlightPublish(t *testing.T) {
 
 	client, err := NewClient(Config{
 		IngestURL:     server.URL,
-		Token:         "test-token",
+		ServiceToken:  "test-token",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",
@@ -657,7 +657,7 @@ func TestWorkerMidFlightDenialQuickRegrantCountsDroppedNotFailed(t *testing.T) {
 
 	client, err := NewClient(Config{
 		IngestURL:     "http://127.0.0.1:9", // never dialed: the transport is replaced below
-		Token:         "test-token",
+		ServiceToken:  "test-token",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",

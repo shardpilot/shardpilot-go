@@ -202,14 +202,15 @@ func TestRemoteConfigCachePathAloneNeverPersistsConsent(t *testing.T) {
 	dir := t.TempDir()
 	client, err := NewClient(Config{
 		IngestURL:             server.URL,
-		Token:                 "test-token",
+		ServiceToken:          "test-token",
 		WorkspaceID:           "workspace-test",
 		AppID:                 "app-test",
 		EnvironmentID:         "develop",
 		Source:                SourceBackend,
 		AnonymousID:           "anon-rc-1",
-		APIKey:                "test-rc-key",
-		RemoteConfigURL:       server.URL,
+		PublishableKey:        "test-rc-key",
+		RemoteConfigEnabled:   true,
+		AppURL:                server.URL,
 		RemoteConfigCachePath: filepath.Join(dir, "rc-cache.json"),
 		FlushInterval:         time.Hour,
 		HTTPTimeout:           time.Second,

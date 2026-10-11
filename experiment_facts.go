@@ -473,7 +473,7 @@ func (c *Client) postExposureApplication(ctx context.Context, experimentKey stri
 	}
 	resp, err := c.transport.FetchRemoteConfig(ctx, remoteConfigRequest{
 		url:    e.baseURL + route,
-		bearer: c.cfg.APIKey,
+		bearer: c.cfg.PublishableKey,
 		method: "POST",
 		body:   body,
 	})

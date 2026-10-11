@@ -104,7 +104,7 @@ func newBatchResultClient(t *testing.T, ingestURL string, onResult func(BatchRes
 	t.Helper()
 	client, err := NewClient(Config{
 		IngestURL:     ingestURL,
-		Token:         "test-token",
+		ServiceToken:  "test-token",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",
@@ -435,7 +435,7 @@ func TestTransportDecodesPerEventStatuses(t *testing.T) {
 	}))
 	defer server.Close()
 
-	tr := newHTTPTransport(Config{IngestURL: server.URL, Token: "test-token", HTTPTimeout: time.Second})
+	tr := newHTTPTransport(Config{IngestURL: server.URL, ServiceToken: "test-token", HTTPTimeout: time.Second})
 	result, err := tr.Publish(context.Background(), batchRequest{})
 	if err != nil {
 		t.Fatalf("Publish: %v", err)

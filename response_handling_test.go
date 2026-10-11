@@ -170,7 +170,7 @@ func TestDeferralWakeRetriesAtDeadlineNotNextTick(t *testing.T) {
 	// the next flush tick minutes later.
 	client, err := NewClient(Config{
 		IngestURL:     server.URL,
-		Token:         "token-value",
+		ServiceToken:  "token-value",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",
@@ -539,7 +539,7 @@ func TestTrackSuccessClearsWorkerBackoff(t *testing.T) {
 	// nudge can produce a prompt retry of the retained batch.
 	client, err := NewClient(Config{
 		IngestURL:     server.URL,
-		Token:         "token-value",
+		ServiceToken:  "token-value",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",
@@ -584,7 +584,7 @@ func TestTrackSuccessDoesNotFlushHealthyPartialBatches(t *testing.T) {
 	// BatchSize/FlushInterval schedule.
 	client, err := NewClient(Config{
 		IngestURL:     server.URL,
-		Token:         "token-value",
+		ServiceToken:  "token-value",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",
@@ -766,7 +766,7 @@ func TestHintlessFailureBacksOffEndToEnd(t *testing.T) {
 	// is what proves the two clocks are separate.
 	client, err := NewClient(Config{
 		IngestURL:     server.URL,
-		Token:         "token-value",
+		ServiceToken:  "token-value",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",
@@ -819,7 +819,7 @@ func TestRetryAfterZeroRetriesPromptly(t *testing.T) {
 	// produce a prompt second attempt.
 	client, err := NewClient(Config{
 		IngestURL:     server.URL,
-		Token:         "token-value",
+		ServiceToken:  "token-value",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",
@@ -860,7 +860,7 @@ func TestFlushDroppingTheBatchClearsStaleDeferral(t *testing.T) {
 
 	client, err := NewClient(Config{
 		IngestURL:     server.URL,
-		Token:         "token-value",
+		ServiceToken:  "token-value",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",
@@ -968,7 +968,7 @@ func TestWorkerHoldsAutomaticPublishesUntilRetryAfter(t *testing.T) {
 
 	client, err := NewClient(Config{
 		IngestURL:     server.URL,
-		Token:         "token-value",
+		ServiceToken:  "token-value",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",
@@ -1027,7 +1027,7 @@ func TestEventArrivingDuringDeferralKeepsTheDeadlineRetry(t *testing.T) {
 	// event racing the timer), the retry would not happen for 10 minutes.
 	client, err := NewClient(Config{
 		IngestURL:     server.URL,
-		Token:         "token-value",
+		ServiceToken:  "token-value",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",
@@ -1100,7 +1100,7 @@ func TestDeadlineRetryFailureWithoutHintFallsBackToTickCadence(t *testing.T) {
 
 	client, err := NewClient(Config{
 		IngestURL:     server.URL,
-		Token:         "token-value",
+		ServiceToken:  "token-value",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",
@@ -1147,7 +1147,7 @@ func TestConsentDenialClearsStaleDeferral(t *testing.T) {
 
 	client, err := NewClient(Config{
 		IngestURL:     server.URL,
-		Token:         "token-value",
+		ServiceToken:  "token-value",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",
@@ -1191,7 +1191,7 @@ func TestExplicitFlushBypassesRetryAfterDeferral(t *testing.T) {
 
 	client, err := NewClient(Config{
 		IngestURL:     server.URL,
-		Token:         "token-value",
+		ServiceToken:  "token-value",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",
@@ -1282,7 +1282,7 @@ func TestRetryPacingIsIndependentOfTheFlushInterval(t *testing.T) {
 
 	client, err := NewClient(Config{
 		IngestURL:     server.URL,
-		Token:         "token-value",
+		ServiceToken:  "token-value",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",
@@ -1352,7 +1352,7 @@ func TestRetainedBatchRetryDoesNotStarveTheQueue(t *testing.T) {
 	const queueDepth = 20
 	client, err := NewClient(Config{
 		IngestURL:     server.URL,
-		Token:         "token-value",
+		ServiceToken:  "token-value",
 		WorkspaceID:   "workspace-test",
 		AppID:         "app-test",
 		EnvironmentID: "develop",
