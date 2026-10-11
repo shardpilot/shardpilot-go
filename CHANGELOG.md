@@ -2,8 +2,8 @@
 
 ## v0.8.0-alpha — release preparation (not published)
 
-- Caller event IDs must be valid UUIDs and are normalized to lowercase before
-  queueing or delivery. Malformed values return `ErrInvalidEventID` locally,
+- Caller event IDs must be UUID versions 4, 5 or 7 and are normalized to
+  lowercase before queueing or delivery. Malformed values return `ErrInvalidEventID` locally,
   with one drop and a diagnostic. This also applies to typed purchase/economy
   IDs; use stable UUIDs for receipt or ledger retries. Omitted IDs now use
   UUIDv7 through the shared generator.

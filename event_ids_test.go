@@ -36,7 +36,7 @@ func TestHostEventIDAdmission(t *testing.T) {
 		scenes = append(scenes, struct {
 			name, id, want string
 			invalid        bool
-		}{"version_" + string(version), id, id, false})
+		}{"version_" + string(version), id, id, version != '4' && version != '5' && version != '7'})
 	}
 	for _, variant := range []byte{'8', '9', 'a', 'b'} {
 		id := v4[:19] + string(variant) + v4[20:]

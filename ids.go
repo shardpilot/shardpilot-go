@@ -37,6 +37,6 @@ func validEventID(id string) bool {
 			}
 		}
 	}
-	return id[14] >= '1' && id[14] <= '8' &&
+	return (id[14] == '4' || id[14] == '5' || id[14] == '7') &&
 		(id[19] == '8' || id[19] == '9' || id[19] == 'a' || id[19] == 'b')
 }
