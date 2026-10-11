@@ -131,11 +131,11 @@ func rejectionCapacity(t *testing.T, cfg *Config, capacity int) {
 func enqueueRejections(t *testing.T, c *Client, rejected int) {
 	t.Helper()
 	for i := 0; i < rejected; i++ {
-		if err := c.Enqueue(Event{ID: fmt.Sprintf("rejected-id-%d", i), Name: fmt.Sprintf("rejected_%d", i)}); err != nil {
+		if err := c.Enqueue(Event{ID: fixtureEventID(fmt.Sprintf("rejected-id-%d", i)), Name: fmt.Sprintf("rejected_%d", i)}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := c.Enqueue(Event{ID: "accepted-sibling", Name: "accepted"}); err != nil {
+	if err := c.Enqueue(Event{ID: "0a3c8dd7-9bea-5cfb-8d27-831163079cce", Name: "accepted"}); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(time.Second)
@@ -163,7 +163,7 @@ func TestRejectionMixedBatchKeepsNilFlushAndHistory(t *testing.T) {
 		t.Fatalf("parsed 202 Flush must remain nil: %v", err)
 	}
 	entries := rejectionEntries(t, client)
-	want := BatchEventStatus{EventID: "rejected-id-0", Status: EventStatusRejected, Code: "event_too_large", Message: "configured size limit exceeded"}
+	want := BatchEventStatus{EventID: fixtureEventID("rejected-id-0"), Status: EventStatusRejected, Code: "event_too_large", Message: "configured size limit exceeded"}
 	if !reflect.DeepEqual(entries, []BatchEventStatus{want}) {
 		t.Errorf("history = %#v, want %#v", entries, want)
 	}
@@ -192,7 +192,7 @@ func TestRejectionDefaultWarning(t *testing.T) {
 	if strings.Count(output, "shardpilot event rejected") != 1 {
 		t.Errorf("expected one default warning, got %q", output)
 	}
-	for _, field := range []string{"rejected-id-0", "event_too_large", "configured size limit exceeded"} {
+	for _, field := range []string{fixtureEventID("rejected-id-0"), "event_too_large", "configured size limit exceeded"} {
 		if !strings.Contains(output, field) {
 			t.Errorf("default warning omits %q", field)
 		}
@@ -210,11 +210,11 @@ func TestRejectionCapacityAndCopies(t *testing.T) {
 	if len(entries) != 2 {
 		t.Fatalf("history length = %d, want 2", len(entries))
 	}
-	if entries[0].EventID != "rejected-id-2" || entries[1].EventID != "rejected-id-3" {
+	if entries[0].EventID != fixtureEventID("rejected-id-2") || entries[1].EventID != fixtureEventID("rejected-id-3") {
 		t.Errorf("oldest-first entries = %#v", entries)
 	}
 	entries[0].EventID = "host mutation"
-	if rejectionEntries(t, client)[0].EventID != "rejected-id-2" {
+	if rejectionEntries(t, client)[0].EventID != fixtureEventID("rejected-id-2") {
 		t.Error("caller changed retained history")
 	}
 	if client.Snapshot().Rejected != 4 {
@@ -243,7 +243,7 @@ func TestRejectionTerminalSpoolSettlesOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, id := range []string{"rejected-id-0", "accepted-sibling"} {
+	for _, id := range []string{fixtureEventID("rejected-id-0"), "0a3c8dd7-9bea-5cfb-8d27-831163079cce"} {
 		if !bytes.Contains(saved, []byte(id)) {
 			t.Fatalf("persisted fixture lacks %s", id)
 		}
@@ -266,7 +266,7 @@ func TestRejectionTerminalSpoolSettlesOnce(t *testing.T) {
 	if count != 1 || client.Snapshot().Accepted != 1 || client.Snapshot().SpoolResent != 0 {
 		t.Errorf("dead letters=%d accepted=%d resent=%d; live retry settles one rejection and one acceptance", count, client.Snapshot().Accepted, client.Snapshot().SpoolResent)
 	}
-	if count == 1 && (dead[0].Reason != SpoolDropTerminal || !containsEventID(t, dead[0].Envelopes, "rejected-id-0") || len(dead[0].Envelopes) != 1) {
+	if count == 1 && (dead[0].Reason != SpoolDropTerminal || !containsEventID(t, dead[0].Envelopes, fixtureEventID("rejected-id-0")) || len(dead[0].Envelopes) != 1) {
 		t.Fatal("wrong terminal dead-letter event")
 	}
 	if err := client.Close(rejectionContext(t)); err != nil {
@@ -306,7 +306,7 @@ func TestRejectionDefaultCapacityAndLifetime(t *testing.T) {
 		if len(entries) != 64 {
 			t.Fatalf("default history has %d entries, want 64", len(entries))
 		}
-		if entries[0].EventID != "rejected-id-1" || entries[63].EventID != "rejected-id-64" {
+		if entries[0].EventID != fixtureEventID("rejected-id-1") || entries[63].EventID != fixtureEventID("rejected-id-64") {
 			t.Fatal("default ring order is wrong")
 		}
 		if client.Snapshot().Rejected != 65 {
@@ -392,7 +392,7 @@ func TestRejectionObserverOwnsDiagnosticsAndCannotMutateHistory(t *testing.T) {
 		if err := client.Flush(rejectionContext(t)); err != nil {
 			t.Fatal(err)
 		}
-		if seen.Load() != 1 || client.Rejections()[0].EventID != "rejected-id-0" {
+		if seen.Load() != 1 || client.Rejections()[0].EventID != fixtureEventID("rejected-id-0") {
 			t.Fatal("observer changed or missed retained server values")
 		}
 		if custom.text() != "" {
@@ -440,7 +440,7 @@ func TestRejectionOtherStatusesStayOut(t *testing.T) {
 	client, fake := rejectionClient(t, nil)
 	for _, status := range []string{"accepted", "duplicate", "observed", "suppressed_no_consent", "suppressed_ad_revenue_consent", "unknown_future"} {
 		fake.setTransform(func(result *batchResult) { result.Rejected = 0; result.Events[0].Status = status })
-		if err := client.Track(rejectionContext(t), Event{ID: "status-" + status, Name: "rejected_status"}); err != nil {
+		if err := client.Track(rejectionContext(t), Event{ID: fixtureEventID("status-" + status), Name: "rejected_status"}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -457,7 +457,7 @@ func TestRejectionDiagnosticsRedactConfiguredSecrets(t *testing.T) {
 	})
 	message := client.cfg.Token + " / " + client.cfg.APIKey
 	fake.setTransform(func(result *batchResult) { result.Events[0].Message = message })
-	if err := client.Track(rejectionContext(t), Event{ID: "redacted-id", Name: "rejected_secret_echo"}); err != nil {
+	if err := client.Track(rejectionContext(t), Event{ID: "2565d870-82ea-5abc-8bbd-1cd37cee4413", Name: "rejected_secret_echo"}); err != nil {
 		t.Fatal(err)
 	}
 	if client.Rejections()[0].Message != message {
@@ -522,7 +522,7 @@ func TestRejectionConcurrentPublishAndRead(t *testing.T) {
 		go func(worker int) {
 			defer workers.Done()
 			for i := 0; i < 12; i++ {
-				if err := client.Track(context.Background(), Event{ID: fmt.Sprintf("concurrent-%d-%d", worker, i), Name: "rejected_concurrent"}); err != nil {
+				if err := client.Track(context.Background(), Event{ID: fixtureEventID(fmt.Sprintf("concurrent-%d-%d", worker, i)), Name: "rejected_concurrent"}); err != nil {
 					t.Errorf("Track: %v", err)
 				}
 			}
@@ -535,9 +535,15 @@ func TestRejectionConcurrentPublishAndRead(t *testing.T) {
 	if len(entries) != 17 || client.Snapshot().Rejected != 96 || callbacks.Load() != 96 {
 		t.Fatal("concurrent publication lost rejection state")
 	}
+	expected := make(map[string]bool)
+	for worker := 0; worker < 8; worker++ {
+		for i := 0; i < 12; i++ {
+			expected[fixtureEventID(fmt.Sprintf("concurrent-%d-%d", worker, i))] = true
+		}
+	}
 	seen := make(map[string]bool)
 	for _, entry := range entries {
-		if !strings.HasPrefix(entry.EventID, "concurrent-") || seen[entry.EventID] {
+		if !expected[entry.EventID] || seen[entry.EventID] {
 			t.Fatal("concurrent history corrupt or aliased")
 		}
 		seen[entry.EventID] = true
@@ -553,7 +559,7 @@ func TestRejectionDeadLetterOrdering(t *testing.T) {
 					directory := t.TempDir()
 					if path == "resend" {
 						writeConsentRecordFile(t, directory, "granted")
-						writeSpoolRecordFile(t, directory, 0, spoolTestEnvelope(t, "rejected-id-0", time.Now()), spoolTestEnvelope(t, "accepted-sibling", time.Now()))
+						writeSpoolRecordFile(t, directory, 0, spoolTestEnvelope(t, fixtureEventID("rejected-id-0"), time.Now()), spoolTestEnvelope(t, "0a3c8dd7-9bea-5cfb-8d27-831163079cce", time.Now()))
 					}
 					type observation struct {
 						entries             []BatchEventStatus
@@ -575,7 +581,7 @@ func TestRejectionDeadLetterOrdering(t *testing.T) {
 							result.Accepted, result.Rejected = 0, 0
 							for i := range result.Events {
 								entry := &result.Events[i]
-								if entry.EventID == "rejected-id-0" {
+								if entry.EventID == fixtureEventID("rejected-id-0") {
 									entry.Status, entry.Code, entry.Message = "rejected", "event_too_large", "configured size limit exceeded"
 									result.Rejected++
 								} else {
@@ -636,7 +642,7 @@ func TestRejectionDeadLetterOrdering(t *testing.T) {
 					if atHook.reason != SpoolDropTerminal {
 						t.Error("fixture did not reach a terminal settlement")
 					}
-					if len(atHook.entries) != 1 || atHook.entries[0].EventID != "rejected-id-0" {
+					if len(atHook.entries) != 1 || atHook.entries[0].EventID != fixtureEventID("rejected-id-0") {
 						t.Errorf("dead-letter hook saw stale history: %#v", atHook.entries)
 					}
 					if atHook.stats.Rejected != 1 || atHook.stats.Accepted != 1 {

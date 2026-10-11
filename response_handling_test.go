@@ -638,7 +638,7 @@ func TestFlushSwallowedPermanentHTTPResetsStreak(t *testing.T) {
 		queue:     newBoundedQueue(2),
 		transport: transport,
 	}
-	if !client.queue.enqueue(Event{ID: "evt-2", Name: "second"}) {
+	if !client.queue.enqueue(Event{ID: "a2dd3b16-4a48-5886-bcb1-a2c9391711af", Name: "second"}) {
 		t.Fatal("enqueue evt-2")
 	}
 
@@ -650,7 +650,7 @@ func TestFlushSwallowedPermanentHTTPResetsStreak(t *testing.T) {
 	if !errors.As(err, &statusErr) || statusErr.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("expected the later 503 to be returned, got %v", err)
 	}
-	if len(retained) != 1 || retained[0].ID != "evt-2" {
+	if len(retained) != 1 || retained[0].ID != "a2dd3b16-4a48-5886-bcb1-a2c9391711af" {
 		t.Fatalf("expected the second batch retained, got %+v", retained)
 	}
 	if backoffAttempt != 0 {
@@ -710,7 +710,7 @@ func TestFlushMidSuccessResetsBackoffStreak(t *testing.T) {
 		queue:     newBoundedQueue(2),
 		transport: transport,
 	}
-	if !client.queue.enqueue(Event{ID: "evt-2", Name: "second"}) {
+	if !client.queue.enqueue(Event{ID: "a2dd3b16-4a48-5886-bcb1-a2c9391711af", Name: "second"}) {
 		t.Fatal("enqueue evt-2")
 	}
 
@@ -718,7 +718,7 @@ func TestFlushMidSuccessResetsBackoffStreak(t *testing.T) {
 	var consentEpoch uint64
 	backoffAttempt := 5 // a pre-flush failure streak
 	retained, err := client.flushAvailable(context.Background(), batch, &consentEpoch, &backoffAttempt)
-	if err == nil || len(retained) != 1 || retained[0].ID != "evt-2" {
+	if err == nil || len(retained) != 1 || retained[0].ID != "a2dd3b16-4a48-5886-bcb1-a2c9391711af" {
 		t.Fatalf("expected the second batch to fail retryably and be retained, got err=%v retained=%+v", err, retained)
 	}
 	if backoffAttempt != 0 {

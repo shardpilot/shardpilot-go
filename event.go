@@ -3,6 +3,8 @@ package shardpilot
 import "time"
 
 type Event struct {
+	// ID is a caller UUID (versions 1-8, RFC variant), trimmed and sent lowercase.
+	// Empty IDs are generated as UUIDv7 once at intake and retained on retries.
 	ID              string
 	Name            string
 	Timestamp       time.Time

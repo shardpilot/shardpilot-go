@@ -439,7 +439,7 @@ func TestSpoolUnknownConsentRefusesDiskAndDeadLetters(t *testing.T) {
 
 	// Live state stays ConsentUnknown: the pipeline is open, so the publish
 	// is attempted — but disk participation is grant-only.
-	if err := client.Enqueue(Event{ID: "evt-unknown-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "9f659ca6-6805-54f1-8556-48ad8f904084", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -453,7 +453,7 @@ func TestSpoolUnknownConsentRefusesDiskAndDeadLetters(t *testing.T) {
 	if len(letters) == 0 {
 		t.Fatalf("expected the would-have-spooled batch dead-lettered as consent")
 	}
-	if len(letters[0].Envelopes) != 1 || !containsEventID(t, letters[0].Envelopes, "evt-unknown-1") {
+	if len(letters[0].Envelopes) != 1 || !containsEventID(t, letters[0].Envelopes, "9f659ca6-6805-54f1-8556-48ad8f904084") {
 		t.Fatalf("expected the refused envelope in the dead letter, got %+v", letters[0])
 	}
 	state.setOutcome(http.StatusAccepted, "", "")
@@ -494,10 +494,10 @@ func TestSpoolGrantedRetriableFailureSpoolsExactWireBytes(t *testing.T) {
 	client.SetConsent(true)
 
 	state.setOutcome(http.StatusServiceUnavailable, "internal_error", "")
-	if err := client.Enqueue(Event{ID: "evt-wire-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "8dd30552-2bc3-54d0-bf9e-1c1a1033f8a2", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
-	if err := client.Enqueue(Event{ID: "evt-wire-2", Name: "e2"}); err != nil {
+	if err := client.Enqueue(Event{ID: "227f2178-67f5-5483-85e1-d85769ae9826", Name: "e2"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	flushUntilSpooled(t, client, dir, 2)
@@ -571,10 +571,10 @@ func TestSpool202SettlesSpooledEventsByID(t *testing.T) {
 	client.SetConsent(true)
 
 	state.setOutcome(http.StatusInternalServerError, "internal_error", "")
-	if err := client.Enqueue(Event{ID: "evt-settle-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "6b041da1-a741-5bb6-8634-ccdaa64609a1", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
-	if err := client.Enqueue(Event{ID: "evt-settle-2", Name: "e2"}); err != nil {
+	if err := client.Enqueue(Event{ID: "d9c83572-a0ee-5cb4-bb31-e2c5415dd12b", Name: "e2"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	flushUntilSpooled(t, client, dir, 2)
@@ -583,8 +583,8 @@ func TestSpool202SettlesSpooledEventsByID(t *testing.T) {
 	// outcomes (rejected, duplicate, event_too_large): ack-removal settles
 	// ALL of the batch's events out of the spool.
 	state.setAcceptedBody(`{"accepted":0,"rejected":1,"duplicates":1,"events":[` +
-		`{"event_id":"evt-settle-1","status":"rejected","code":"event_too_large"},` +
-		`{"event_id":"evt-settle-2","status":"duplicate","code":"duplicate_event_id"}]}`)
+		`{"event_id":"6b041da1-a741-5bb6-8634-ccdaa64609a1","status":"rejected","code":"event_too_large"},` +
+		`{"event_id":"d9c83572-a0ee-5cb4-bb31-e2c5415dd12b","status":"duplicate","code":"duplicate_event_id"}]}`)
 	if err := client.Flush(context.Background()); err != nil {
 		t.Fatalf("retry flush: %v", err)
 	}
@@ -603,10 +603,10 @@ func TestSpoolResendBeforeFreshAndByteIdenticalAcrossRestart(t *testing.T) {
 	client.SetConsent(true)
 
 	state.setOutcome(http.StatusInternalServerError, "internal_error", "")
-	if err := client.Enqueue(Event{ID: "evt-restart-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "c909bd6c-b387-5222-b7da-4cd6a7175f98", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
-	if err := client.Enqueue(Event{ID: "evt-restart-2", Name: "e2"}); err != nil {
+	if err := client.Enqueue(Event{ID: "b7c754e5-bd9d-53b1-81ab-33af3703a21c", Name: "e2"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	flushUntilSpooled(t, client, dir, 2)
@@ -623,7 +623,7 @@ func TestSpoolResendBeforeFreshAndByteIdenticalAcrossRestart(t *testing.T) {
 	state.setOutcome(http.StatusAccepted, "", "")
 	countBefore := state.batchCount()
 	restarted := newSpoolTestClient(t, server.URL, dir, nil, nil)
-	if err := restarted.Enqueue(Event{ID: "evt-restart-3", Name: "fresh"}); err != nil {
+	if err := restarted.Enqueue(Event{ID: "303176d5-f5d7-5672-b605-7c5f118c22aa", Name: "fresh"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := restarted.Flush(context.Background()); err != nil {
@@ -633,7 +633,7 @@ func TestSpoolResendBeforeFreshAndByteIdenticalAcrossRestart(t *testing.T) {
 	if len(arrivals) != 2 {
 		t.Fatalf("expected the spooled chunk and the fresh batch as two requests, got %v", arrivals)
 	}
-	if arrivals[0][0] != "evt-restart-1" || arrivals[0][1] != "evt-restart-2" || arrivals[1][0] != "evt-restart-3" {
+	if arrivals[0][0] != "c909bd6c-b387-5222-b7da-4cd6a7175f98" || arrivals[0][1] != "b7c754e5-bd9d-53b1-81ab-33af3703a21c" || arrivals[1][0] != "303176d5-f5d7-5672-b605-7c5f118c22aa" {
 		t.Fatalf("expected spooled-before-fresh ordering, got %v", arrivals)
 	}
 	resendWire := wireEventBytes(t, state.allBodies()[countBefore])
@@ -670,7 +670,7 @@ func TestSpoolOldestDropAtCountAndByteCaps(t *testing.T) {
 	// eviction provably reaches into the batch being appended.
 	events := make([]Event, 0, 4)
 	for i := 1; i <= 4; i++ {
-		events = append(events, Event{ID: fmt.Sprintf("evt-cap-%d", i), Name: "e"})
+		events = append(events, Event{ID: fixtureEventID(fmt.Sprintf("evt-cap-%d", i)), Name: "e"})
 	}
 	request, err := client.buildBatch(events)
 	if err != nil {
@@ -682,11 +682,11 @@ func TestSpoolOldestDropAtCountAndByteCaps(t *testing.T) {
 	if len(record.Events) != 3 {
 		t.Fatalf("expected the count cap to keep 3 events, got %d", len(record.Events))
 	}
-	if recordContainsEventID(t, record.Events, "evt-cap-1") {
+	if recordContainsEventID(t, record.Events, fixtureEventID("evt-cap-1")) {
 		t.Fatalf("expected the OLDEST event evicted first")
 	}
 	capacity := recorder.byReason(SpoolDropCapacity)
-	if len(capacity) != 1 || !containsEventID(t, capacity[0].Envelopes, "evt-cap-1") {
+	if len(capacity) != 1 || !containsEventID(t, capacity[0].Envelopes, fixtureEventID("evt-cap-1")) {
 		t.Fatalf("expected the evicted oldest event dead-lettered as capacity, got %+v", capacity)
 	}
 	stats := client.Snapshot()
@@ -704,7 +704,7 @@ func TestSpoolOldestDropAtCountAndByteCaps(t *testing.T) {
 	byteDir := t.TempDir()
 	now := time.Now()
 	envelopes := []json.RawMessage{
-		spoolTestEnvelope(t, "evt-bytes-1", now),
+		spoolTestEnvelope(t, "9e79e5fb-5adc-522f-a04f-10d7be9952bd", now),
 		spoolTestEnvelope(t, "evt-bytes-2", now),
 		spoolTestEnvelope(t, "evt-bytes-3", now),
 	}
@@ -715,10 +715,10 @@ func TestSpoolOldestDropAtCountAndByteCaps(t *testing.T) {
 		cfg.SpoolMaxBytes = len(envelopes[1]) + len(envelopes[2])
 	})
 	record = readSpoolRecordFile(t, byteDir)
-	if len(record.Events) != 2 || recordContainsEventID(t, record.Events, "evt-bytes-1") {
+	if len(record.Events) != 2 || recordContainsEventID(t, record.Events, "9e79e5fb-5adc-522f-a04f-10d7be9952bd") {
 		t.Fatalf("expected the byte cap to evict the oldest at load, got %d events", len(record.Events))
 	}
-	if letters := byteRecorder.byReason(SpoolDropCapacity); len(letters) != 1 || !containsEventID(t, letters[0].Envelopes, "evt-bytes-1") {
+	if letters := byteRecorder.byReason(SpoolDropCapacity); len(letters) != 1 || !containsEventID(t, letters[0].Envelopes, "9e79e5fb-5adc-522f-a04f-10d7be9952bd") {
 		t.Fatalf("expected the byte-cap eviction dead-lettered as capacity, got %+v", letters)
 	}
 	_ = byteClient.Close(context.Background())
@@ -807,7 +807,7 @@ func TestSpoolRetryAfterDeadlinePersisted(t *testing.T) {
 	client.SetConsent(true)
 
 	before := time.Now()
-	if err := client.Enqueue(Event{ID: "evt-ra-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "0ddb2a28-bd15-5295-8889-3fe4f4fa9b1e", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -831,7 +831,7 @@ func TestSpoolRestoredDeferralHonorsRemainingWindow(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now()
 	writeConsentRecordFile(t, dir, "granted")
-	writeSpoolRecordFile(t, dir, now.Add(600*time.Millisecond).UnixMilli(), spoolTestEnvelope(t, "evt-defer-1", now))
+	writeSpoolRecordFile(t, dir, now.Add(600*time.Millisecond).UnixMilli(), spoolTestEnvelope(t, "369db0f9-01cb-5b7b-a035-db0e0b14d909", now))
 
 	client := newSpoolTestClient(t, server.URL, dir, nil, func(cfg *Config) {
 		cfg.FlushInterval = 30 * time.Millisecond
@@ -1011,7 +1011,7 @@ func TestSpoolPurgeFailureOwesWipeFailClosed(t *testing.T) {
 
 	// Spool one batch under grant.
 	state.setOutcome(http.StatusInternalServerError, "internal_error", "")
-	if err := client.Enqueue(Event{ID: "evt-owed-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "35ae8b62-1534-58b7-a229-f1d259742e23", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -1047,7 +1047,7 @@ func TestSpoolPurgeFailureOwesWipeFailClosed(t *testing.T) {
 	if stats := client.Snapshot(); stats.LastError != "spool_purge_failed" {
 		t.Fatalf("expected spool_purge_failed surfaced on the failed re-grant, got %q", stats.LastError)
 	}
-	if err := client.Enqueue(Event{ID: "evt-owed-2", Name: "e2"}); !errors.Is(err, ErrConsentDenied) {
+	if err := client.Enqueue(Event{ID: "9eabaf62-fff0-5133-a680-60dfbf22cfbb", Name: "e2"}); !errors.Is(err, ErrConsentDenied) {
 		t.Fatalf("refused re-grant admitted analytics: %v", err)
 	}
 	if err := client.Flush(context.Background()); err != nil {
@@ -1066,7 +1066,7 @@ func TestSpoolPurgeFailureOwesWipeFailClosed(t *testing.T) {
 	if state2, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || state2 != ConsentGranted {
 		t.Fatalf("expected the granted record written after the wipe, got %v %v", state2, ok)
 	}
-	if err := client.Enqueue(Event{ID: "evt-recovered", Name: "e2"}); err != nil {
+	if err := client.Enqueue(Event{ID: "6a0dc1b2-81a2-539b-888a-13a4c2f273bf", Name: "e2"}); err != nil {
 		t.Fatalf("recovered grant refused intake: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -1153,7 +1153,7 @@ func TestSpoolGrantPersistFailureKeepsSpoolClosed(t *testing.T) {
 	}
 	// ...but a retriable failure is refused disk and dead-lettered.
 	state.setOutcome(http.StatusInternalServerError, "internal_error", "")
-	if err := client.Enqueue(Event{ID: "evt-unpersisted-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "58466796-14aa-584a-a33b-685b4734a202", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -1194,7 +1194,7 @@ func TestSpoolPersistFailureCountsAndMirrorStaysAuthoritative(t *testing.T) {
 
 	injectedErr := errors.New("injected rename failure")
 	breakSpoolWrites(client.spool, injectedErr)
-	if err := client.Enqueue(Event{ID: "evt-persist-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "84d3a502-33c0-5d11-baed-bee8bcdeb4c7", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -1232,14 +1232,14 @@ func TestSpoolPersistFailureCountsAndMirrorStaysAuthoritative(t *testing.T) {
 
 	// The mirror stayed authoritative throughout: a later append persists
 	// alongside the earlier event and counts only itself.
-	if err := client.Enqueue(Event{ID: "evt-persist-2", Name: "e2"}); err != nil {
+	if err := client.Enqueue(Event{ID: "00c2287a-6a70-5ec2-a136-c57a7fb456b4", Name: "e2"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
 		t.Fatalf("expected the retriable failure surfaced")
 	}
 	record := readSpoolRecordFile(t, dir)
-	if len(record.Events) != 2 || !recordContainsEventID(t, record.Events, "evt-persist-1") || !recordContainsEventID(t, record.Events, "evt-persist-2") {
+	if len(record.Events) != 2 || !recordContainsEventID(t, record.Events, "84d3a502-33c0-5d11-baed-bee8bcdeb4c7") || !recordContainsEventID(t, record.Events, "00c2287a-6a70-5ec2-a136-c57a7fb456b4") {
 		t.Fatalf("expected both events persisted, got %s", mustJSON(t, record.Events))
 	}
 	if stats := client.Snapshot(); stats.Spooled != 2 {
@@ -1307,16 +1307,16 @@ func TestSpoolCloseSpoolsUndeliveredRemnant(t *testing.T) {
 
 	// The endpoint dies before anything is delivered.
 	server.Close()
-	if err := client.Enqueue(Event{ID: "evt-remnant-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "7a4bbce6-d01a-5d8d-a047-101f7aa3c2ae", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
-	if err := client.Enqueue(Event{ID: "evt-remnant-2", Name: "e2"}); err != nil {
+	if err := client.Enqueue(Event{ID: "2aaac8ae-0d99-5709-9a93-3d8e2a5d23e4", Name: "e2"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	_ = client.Close(context.Background())
 
 	record := readSpoolRecordFile(t, dir)
-	if len(record.Events) != 2 || !recordContainsEventID(t, record.Events, "evt-remnant-1") || !recordContainsEventID(t, record.Events, "evt-remnant-2") {
+	if len(record.Events) != 2 || !recordContainsEventID(t, record.Events, "7a4bbce6-d01a-5d8d-a047-101f7aa3c2ae") || !recordContainsEventID(t, record.Events, "2aaac8ae-0d99-5709-9a93-3d8e2a5d23e4") {
 		t.Fatalf("expected the undelivered remnant spooled at Close, got %s", mustJSON(t, record.Events))
 	}
 
@@ -1329,7 +1329,7 @@ func TestSpoolCloseSpoolsUndeliveredRemnant(t *testing.T) {
 		t.Fatalf("Flush: %v", err)
 	}
 	arrivals := state2.allArrivals()
-	if len(arrivals) != 1 || len(arrivals[0]) != 2 || arrivals[0][0] != "evt-remnant-1" {
+	if len(arrivals) != 1 || len(arrivals[0]) != 2 || arrivals[0][0] != "7a4bbce6-d01a-5d8d-a047-101f7aa3c2ae" {
 		t.Fatalf("expected the remnant resent after restart, got %v", arrivals)
 	}
 	if got := len(readSpoolRecordFile(t, dir).Events); got != 0 {
@@ -1348,7 +1348,7 @@ func TestSpoolTerminalOnSpooledEventsDeadLetters(t *testing.T) {
 	client.SetConsent(true)
 
 	state.setOutcome(http.StatusInternalServerError, "internal_error", "")
-	if err := client.Enqueue(Event{ID: "evt-poison-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "a165a760-6a20-5148-b5bb-09e16cda65ff", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -1368,7 +1368,7 @@ func TestSpoolTerminalOnSpooledEventsDeadLetters(t *testing.T) {
 		t.Fatalf("expected the terminal outcome to settle the spooled copy, got %d", got)
 	}
 	letters := recorder.byReason(SpoolDropTerminal)
-	if len(letters) != 1 || !containsEventID(t, letters[0].Envelopes, "evt-poison-1") {
+	if len(letters) != 1 || !containsEventID(t, letters[0].Envelopes, "a165a760-6a20-5148-b5bb-09e16cda65ff") {
 		t.Fatalf("expected the settled event dead-lettered as terminal, got %+v", letters)
 	}
 	state.setOutcome(http.StatusAccepted, "", "")
@@ -1385,7 +1385,7 @@ func TestSpoolRetryAfterClearedOnSuccessfulPublish(t *testing.T) {
 
 	// Spool a batch under a live 429 Retry-After window.
 	state.setOutcome(http.StatusTooManyRequests, "rate_limited", "60")
-	if err := client.Enqueue(Event{ID: "evt-clear-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "f60a3bfc-fc75-56e9-ade2-636d670b6b3f", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -1417,7 +1417,7 @@ func TestSpoolRetryAfterClearedOnSuccessfulPublish(t *testing.T) {
 		t.Fatalf("expected no restored deferral after the cleared deadline, got %v", restarted.initialDeferUntil)
 	}
 	countBefore := state.batchCount()
-	if err := restarted.Enqueue(Event{ID: "evt-clear-2", Name: "e2"}); err != nil {
+	if err := restarted.Enqueue(Event{ID: "95a273f8-cb03-533f-a7d6-8faa81ede76d", Name: "e2"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := restarted.Flush(context.Background()); err != nil {
@@ -1529,7 +1529,7 @@ func TestSpoolConsentRecordActorScoped(t *testing.T) {
 	clientA := newSpoolTestClient(t, server.URL, dir, nil, nil)
 	clientA.SetConsent(true)
 	state.setOutcome(http.StatusInternalServerError, "internal_error", "")
-	if err := clientA.Enqueue(Event{ID: "evt-actor-1", Name: "e1"}); err != nil {
+	if err := clientA.Enqueue(Event{ID: "d794f76b-0d04-53ca-9cac-22195a41ac07", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := clientA.Flush(context.Background()); err == nil {
@@ -1554,7 +1554,7 @@ func TestSpoolConsentRecordActorScoped(t *testing.T) {
 		t.Fatalf("expected another actor's spool purged, never loaded")
 	}
 	letters := recorder.byReason(SpoolDropConsent)
-	if len(letters) != 1 || !containsEventID(t, letters[0].Envelopes, "evt-actor-1") {
+	if len(letters) != 1 || !containsEventID(t, letters[0].Envelopes, "d794f76b-0d04-53ca-9cac-22195a41ac07") {
 		t.Fatalf("expected the purged records dead-lettered as consent, got %+v", letters)
 	}
 	if err := clientB.Flush(context.Background()); err != nil {
@@ -1586,7 +1586,7 @@ func TestSpoolEmptyLoadDropsStaleDeadline(t *testing.T) {
 	now := time.Now()
 	writeConsentRecordFile(t, dir, "granted")
 	writeSpoolRecordFile(t, dir, now.Add(time.Hour).UnixMilli(),
-		spoolTestEnvelope(t, "evt-stale-1", now.Add(-8*24*time.Hour)),
+		spoolTestEnvelope(t, "9ff866df-2004-5fee-83b2-e43e4dba517e", now.Add(-8*24*time.Hour)),
 		spoolTestEnvelope(t, "evt-stale-2", now.Add(-9*24*time.Hour)))
 
 	recorder := &spoolDeadLetterRecorder{}
@@ -1604,7 +1604,7 @@ func TestSpoolEmptyLoadDropsStaleDeadline(t *testing.T) {
 		t.Fatalf("expected the discarded events dead-lettered as expired, got %+v", letters)
 	}
 	// Brand-new events publish immediately.
-	if err := client.Enqueue(Event{ID: "evt-fresh-after-stale", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "a7a05914-7be8-5cc2-989a-fa67a3c01158", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err != nil {
@@ -1855,7 +1855,7 @@ func TestSpoolChmodRefusedFailsClosedAndDeadLetters(t *testing.T) {
 		t.Fatalf("expected the refused tighten surfaced as a record persist failure, got %q", got)
 	}
 
-	if err := client.Enqueue(Event{ID: "evt-chmod-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "4352eaa7-0e6b-5455-92b2-227db092cab2", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -1865,7 +1865,7 @@ func TestSpoolChmodRefusedFailsClosedAndDeadLetters(t *testing.T) {
 		t.Fatalf("nothing may be written through a dir whose privacy could not be established")
 	}
 	letters := recorder.byReason(SpoolDropConsent)
-	if len(letters) == 0 || !containsEventID(t, letters[0].Envelopes, "evt-chmod-1") {
+	if len(letters) == 0 || !containsEventID(t, letters[0].Envelopes, "4352eaa7-0e6b-5455-92b2-227db092cab2") {
 		t.Fatalf("expected the refused batch dead-lettered, got %+v", letters)
 	}
 	state.setOutcome(http.StatusAccepted, "", "")
@@ -1911,14 +1911,14 @@ func TestSpoolOversizedRecordDiscardedWithoutFullLoad(t *testing.T) {
 	}
 
 	// The client starts clean and functions normally.
-	if err := client.Enqueue(Event{ID: "evt-after-oversize-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "72a0f6f6-f96b-5415-a6bf-5e5642410d05", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
 	arrivals := state.allArrivals()
-	if len(arrivals) != 1 || len(arrivals[0]) != 1 || arrivals[0][0] != "evt-after-oversize-1" {
+	if len(arrivals) != 1 || len(arrivals[0]) != 1 || arrivals[0][0] != "72a0f6f6-f96b-5415-a6bf-5e5642410d05" {
 		t.Fatalf("expected only the fresh event published (no resends from the discarded record), got %v", arrivals)
 	}
 	_ = client.Close(context.Background())
@@ -1995,7 +1995,7 @@ func TestSpoolRecoveryWakeResendsSpoolOnlyWork(t *testing.T) {
 	// recovery wake must kick the requeued spool chunk NOW — FlushInterval is
 	// an hour, so idling until the next tick would strand it.
 	state.setOutcome(http.StatusAccepted, "", "")
-	if err := client.Track(context.Background(), Event{ID: "evt-wake-live-1", Name: "live"}); err != nil {
+	if err := client.Track(context.Background(), Event{ID: "d0733c1b-6ef9-5d58-9a15-e79db9005822", Name: "live"}); err != nil {
 		t.Fatalf("Track: %v", err)
 	}
 	// Poll the durable artifact alongside the counter: the resent count is
@@ -2092,13 +2092,13 @@ func TestSpoolCanceledFlushPreservesArmedDeadline(t *testing.T) {
 	if record := readSpoolRecordFile(t, dir); len(record.Events) != 0 {
 		t.Fatalf("expected the delivered chunk acked out of the record, got %s", mustJSON(t, record.Events))
 	}
-	if err := client.Enqueue(Event{ID: "evt-cancel-armed-fresh-1", Name: "fresh"}); err != nil {
+	if err := client.Enqueue(Event{ID: "b376d5cb-d1c2-53ad-ac91-cd8a8f7c1a3f", Name: "fresh"}); err != nil {
 		t.Fatalf("enqueue fresh event: %v", err)
 	}
 	waitFor(t, 5*time.Second, "the fresh event published on the flush cadence", func() bool {
 		for _, arrival := range state.allArrivals() {
 			for _, id := range arrival {
-				if id == "evt-cancel-armed-fresh-1" {
+				if id == "b376d5cb-d1c2-53ad-ac91-cd8a8f7c1a3f" {
 					return true
 				}
 			}
@@ -2197,7 +2197,7 @@ func TestSpoolCanceledFlushBatchAppendKeepsPersistedDeadline(t *testing.T) {
 	client := newSpoolTestClient(t, server.URL, dir, nil, nil)
 	client.SetConsent(true)
 
-	if err := client.Enqueue(Event{ID: "evt-append-keep-1", Name: "append_keep"}); err != nil {
+	if err := client.Enqueue(Event{ID: "ffd77187-481c-50b1-a9a7-b332d318b1e0", Name: "append_keep"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -2319,7 +2319,7 @@ func TestSpoolInProcessRetryReusesRetainedBytes(t *testing.T) {
 	// Intake clones Props one level deep: the NESTED map stays shared with
 	// the caller, so mutating it after Enqueue would change a re-marshal.
 	nested := map[string]any{"k": "v1"}
-	if err := client.Enqueue(Event{ID: "evt-bytes-1", Name: "e1", Props: map[string]any{"nested": nested}}); err != nil {
+	if err := client.Enqueue(Event{ID: "9e79e5fb-5adc-522f-a04f-10d7be9952bd", Name: "e1", Props: map[string]any{"nested": nested}}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -2372,18 +2372,18 @@ func TestSpoolRetryReusesRetainedBytesForPaddedID(t *testing.T) {
 	client := newSpoolTestClient(t, server.URL, dir, nil, nil)
 	client.SetConsent(true)
 
-	// The caller pads the id with whitespace; buildEnvelope trims it into
+	// The caller supplies uppercase with whitespace; intake canonicalizes
 	// the wire event_id, so the retained-request comparison must match in
 	// that same canonical form — a raw comparison would rebuild and drift.
 	nested := map[string]any{"k": "v1"}
-	if err := client.Enqueue(Event{ID: "  evt-pad-1  ", Name: "e1", Props: map[string]any{"nested": nested}}); err != nil {
+	if err := client.Enqueue(Event{ID: "  75F30651-78C9-5D12-8DBF-6479E3207D09  ", Name: "e1", Props: map[string]any{"nested": nested}}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
 		t.Fatalf("expected the retriable failure surfaced")
 	}
 	spooled := readSpoolRecordFile(t, dir)
-	if len(spooled.Events) != 1 || !recordContainsEventID(t, spooled.Events, "evt-pad-1") {
+	if len(spooled.Events) != 1 || !recordContainsEventID(t, spooled.Events, "75f30651-78c9-5d12-8dbf-6479e3207d09") {
 		t.Fatalf("expected the failed batch spooled under the trimmed id, got %s", mustJSON(t, spooled.Events))
 	}
 
@@ -2424,7 +2424,7 @@ func TestSpoolCapacityDeadLetterDeferredUntilEvictionDurable(t *testing.T) {
 	client.SetConsent(true)
 
 	// evt-defer-1 spools durably first.
-	if err := client.Enqueue(Event{ID: "evt-defer-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "369db0f9-01cb-5b7b-a035-db0e0b14d909", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -2466,7 +2466,7 @@ func TestSpoolCapacityDeadLetterDeferredUntilEvictionDurable(t *testing.T) {
 	if stats := client.Snapshot(); stats.SpoolEvicted != 0 {
 		t.Fatalf("expected SpoolEvicted deferred with the letter, got %+v", stats)
 	}
-	if record := readSpoolRecordFile(t, dir); !recordContainsEventID(t, record.Events, "evt-defer-1") {
+	if record := readSpoolRecordFile(t, dir); !recordContainsEventID(t, record.Events, "369db0f9-01cb-5b7b-a035-db0e0b14d909") {
 		t.Fatalf("expected the old record still on disk while the rewrite fails, got %s", mustJSON(t, record.Events))
 	}
 
@@ -2481,7 +2481,7 @@ func TestSpoolCapacityDeadLetterDeferredUntilEvictionDurable(t *testing.T) {
 		t.Fatalf("expected the landed record to carry only the survivor, got %s", mustJSON(t, record.Events))
 	}
 	letters := recorder.byReason(SpoolDropCapacity)
-	if len(letters) != 1 || len(letters[0].Envelopes) != 1 || !containsEventID(t, letters[0].Envelopes, "evt-defer-1") {
+	if len(letters) != 1 || len(letters[0].Envelopes) != 1 || !containsEventID(t, letters[0].Envelopes, "369db0f9-01cb-5b7b-a035-db0e0b14d909") {
 		t.Fatalf("expected exactly the evicted event dead-lettered once the eviction landed, got %+v", letters)
 	}
 	if stats := client.Snapshot(); stats.SpoolEvicted != 1 {
@@ -2506,7 +2506,7 @@ func TestSpoolFlushPoisonMemberIsolatedSurvivorsDeliver(t *testing.T) {
 	client.SetConsent(true)
 
 	// evt-rebuild-1 fails retriably: spooled durably, retained by the worker.
-	if err := client.Enqueue(Event{ID: "evt-rebuild-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "ba1027ba-b0f8-5917-a393-4bf0aaeba0de", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -2520,7 +2520,7 @@ func TestSpoolFlushPoisonMemberIsolatedSurvivorsDeliver(t *testing.T) {
 	// batch; wait for the worker to absorb it so the flush retry rebuilds ONE
 	// batch of both events and attributes the build failure to the poison
 	// member alone.
-	if err := client.Enqueue(Event{ID: "evt-rebuild-2", Name: "e2", Props: map[string]any{"bad": func() {}}}); err != nil {
+	if err := client.Enqueue(Event{ID: "dfe535f8-cb70-5ca1-a37d-298a1d18f29a", Name: "e2", Props: map[string]any{"bad": func() {}}}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	deadline := time.Now().Add(3 * time.Second)
@@ -2541,7 +2541,7 @@ func TestSpoolFlushPoisonMemberIsolatedSurvivorsDeliver(t *testing.T) {
 	}
 	arrivals := state.allArrivals()
 	last := arrivals[len(arrivals)-1]
-	if len(last) != 1 || last[0] != "evt-rebuild-1" {
+	if len(last) != 1 || last[0] != "ba1027ba-b0f8-5917-a393-4bf0aaeba0de" {
 		t.Fatalf("expected the surviving batchmate delivered, got %v", last)
 	}
 	// Delivery settled the survivor's spooled copy; the poison member was
@@ -2584,7 +2584,7 @@ func TestSpoolWorkerPoisonMemberIsolatedSurvivorsDeliver(t *testing.T) {
 	})
 	client.SetConsent(true)
 
-	if err := client.Enqueue(Event{ID: "evt-wrebuild-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "d238697e-0a2e-569e-b3bb-3aaa4b6012b5", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -2599,7 +2599,7 @@ func TestSpoolWorkerPoisonMemberIsolatedSurvivorsDeliver(t *testing.T) {
 	// attributed, and the retained batchmate delivers in the same attempt
 	// instead of being condemned with it.
 	state.setOutcome(http.StatusAccepted, "", "")
-	if err := client.Enqueue(Event{ID: "evt-wrebuild-2", Name: "e2", Props: map[string]any{"bad": func() {}}}); err != nil {
+	if err := client.Enqueue(Event{ID: "46447275-4bb0-58c0-95f9-9b484632f84a", Name: "e2", Props: map[string]any{"bad": func() {}}}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	waitFor(t, 3*time.Second, "the worker to deliver the surviving batchmate", func() bool {
@@ -2608,7 +2608,7 @@ func TestSpoolWorkerPoisonMemberIsolatedSurvivorsDeliver(t *testing.T) {
 			return false
 		}
 		last := arrivals[len(arrivals)-1]
-		return len(last) == 1 && last[0] == "evt-wrebuild-1"
+		return len(last) == 1 && last[0] == "d238697e-0a2e-569e-b3bb-3aaa4b6012b5"
 	})
 	waitFor(t, 3*time.Second, "the delivered survivor settled off the record", func() bool {
 		return len(readSpoolRecordFile(t, dir).Events) == 0
@@ -2687,14 +2687,14 @@ func TestSpoolCorruptRecordDiscardedAtLoad(t *testing.T) {
 	}
 
 	// The client starts clean and functions normally.
-	if err := client.Enqueue(Event{ID: "evt-after-corrupt-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "a0131fbb-4f29-54b0-9951-069219ad5506", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
 	arrivals := state.allArrivals()
-	if len(arrivals) != 1 || len(arrivals[0]) != 1 || arrivals[0][0] != "evt-after-corrupt-1" {
+	if len(arrivals) != 1 || len(arrivals[0]) != 1 || arrivals[0][0] != "a0131fbb-4f29-54b0-9951-069219ad5506" {
 		t.Fatalf("expected only the fresh event published, got %v", arrivals)
 	}
 	_ = client.Close(context.Background())
@@ -2738,14 +2738,14 @@ func TestSpoolWrongVersionRecordDiscardedAtLoad(t *testing.T) {
 
 	// The client starts clean: only fresh events publish, never the
 	// incompatible record's.
-	if err := client.Enqueue(Event{ID: "evt-after-wrong-version-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "1f73fa6e-12d0-56a1-bf78-dce0c08feb10", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err != nil {
 		t.Fatalf("Flush: %v", err)
 	}
 	arrivals := state.allArrivals()
-	if len(arrivals) != 1 || len(arrivals[0]) != 1 || arrivals[0][0] != "evt-after-wrong-version-1" {
+	if len(arrivals) != 1 || len(arrivals[0]) != 1 || arrivals[0][0] != "1f73fa6e-12d0-56a1-bf78-dce0c08feb10" {
 		t.Fatalf("expected only the fresh event published (no resends from the discarded record), got %v", arrivals)
 	}
 	_ = client.Close(context.Background())
@@ -2787,7 +2787,7 @@ func TestSetConsentDiskStallDoesNotBlockIntake(t *testing.T) {
 	<-stalled
 
 	enqueued := make(chan error, 1)
-	go func() { enqueued <- client.Enqueue(Event{ID: "evt-during-stall-1", Name: "e1"}) }()
+	go func() { enqueued <- client.Enqueue(Event{ID: "961c5ad7-adde-511e-a723-87c347bea3d3", Name: "e1"}) }()
 	select {
 	case err := <-enqueued:
 		if err != nil {
@@ -2855,7 +2855,7 @@ func TestDenialAppliesToIntakeWhileEarlierDecisionDiskStalls(t *testing.T) {
 	waitFor(t, 3*time.Second, "the denial visible to intake while the grant's write is stalled", func() bool {
 		return client.ConsentState() == ConsentDenied
 	})
-	if err := client.Enqueue(Event{ID: "evt-under-denial-1", Name: "e1"}); !errors.Is(err, ErrConsentDenied) {
+	if err := client.Enqueue(Event{ID: "258a249a-31e2-5de2-a4e7-3a2da5309d0e", Name: "e1"}); !errors.Is(err, ErrConsentDenied) {
 		t.Fatalf("expected intake rejecting under the denial, got %v", err)
 	}
 	select {
@@ -3156,7 +3156,7 @@ func TestSpoolDeadLetterEnvelopesAreCopies(t *testing.T) {
 	})
 	client.SetConsent(true)
 
-	if err := client.Enqueue(Event{ID: "evt-mut-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "277113d8-c814-5b3a-93b6-555c46a1e5f5", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -3166,7 +3166,7 @@ func TestSpoolDeadLetterEnvelopesAreCopies(t *testing.T) {
 	// dead-letter fires with evt-mut-1's envelope — whose spooled bytes came
 	// from the same marshal as the worker's retained request — and the
 	// callback shreds it.
-	if err := client.Enqueue(Event{ID: "evt-mut-2", Name: "e2"}); err != nil {
+	if err := client.Enqueue(Event{ID: "17cf2203-53ea-5aeb-a822-bdee44520910", Name: "e2"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	deadline := time.Now().Add(3 * time.Second)
@@ -3275,7 +3275,7 @@ func TestSpoolHintlessRetryClearsPersistedDeadline(t *testing.T) {
 	client := newSpoolTestClient(t, server.URL, dir, nil, nil)
 	client.SetConsent(true)
 
-	if err := client.Enqueue(Event{ID: "evt-hintless-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "38abb75d-c01b-54e6-9fea-e6a669caac26", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -3354,13 +3354,13 @@ func TestSpoolDuplicateIDBatchCountsSpooledOnce(t *testing.T) {
 	// The caller supplies the same Event.ID twice in one batch (legal — the
 	// server de-duplicates by event_id): the spool stores ONE envelope for
 	// that id and must count one.
-	if err := client.Enqueue(Event{ID: "evt-dupid-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "e6f2a1d9-fdee-5d75-8796-8ea0dccb42d9", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
-	if err := client.Enqueue(Event{ID: "evt-dupid-1", Name: "e1b"}); err != nil {
+	if err := client.Enqueue(Event{ID: "e6f2a1d9-fdee-5d75-8796-8ea0dccb42d9", Name: "e1b"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
-	if err := client.Enqueue(Event{ID: "evt-dupid-2", Name: "e2"}); err != nil {
+	if err := client.Enqueue(Event{ID: "149940dc-567d-5266-86a7-50fe5ec4a063", Name: "e2"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	deadline := time.Now().Add(3 * time.Second)
@@ -3421,7 +3421,7 @@ func TestSpoolLiveRetryAckHonorsPerEventVerdicts(t *testing.T) {
 	client := newSpoolTestClient(t, server.URL, dir, recorder, nil)
 	client.SetConsent(true)
 
-	if err := client.Enqueue(Event{ID: "evt-live-rej-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "f8c2a884-656d-50e0-b6b9-d727b59f7b3c", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -3435,7 +3435,7 @@ func TestSpoolLiveRetryAckHonorsPerEventVerdicts(t *testing.T) {
 	// spooled copy must dead-letter terminal, exactly like a restart-loaded
 	// resend would — never vanish as if delivered.
 	state.setAcceptedBody(`{"accepted":0,"rejected":1,"duplicates":0,"events":[` +
-		`{"event_id":"evt-live-rej-1","status":"rejected","code":"invalid_event"}]}`)
+		`{"event_id":"f8c2a884-656d-50e0-b6b9-d727b59f7b3c","status":"rejected","code":"invalid_event"}]}`)
 	if err := client.Flush(context.Background()); err != nil {
 		t.Fatalf("retry Flush: %v", err)
 	}
@@ -3443,7 +3443,7 @@ func TestSpoolLiveRetryAckHonorsPerEventVerdicts(t *testing.T) {
 		t.Fatalf("expected the verdicted event settled out of the record, got %d", got)
 	}
 	terminal := recorder.byReason(SpoolDropTerminal)
-	if len(terminal) != 1 || len(terminal[0].Envelopes) != 1 || !containsEventID(t, terminal[0].Envelopes, "evt-live-rej-1") {
+	if len(terminal) != 1 || len(terminal[0].Envelopes) != 1 || !containsEventID(t, terminal[0].Envelopes, "f8c2a884-656d-50e0-b6b9-d727b59f7b3c") {
 		t.Fatalf("expected exactly the rejected event dead-lettered terminal, got %+v", terminal)
 	}
 	if stats := client.Snapshot(); stats.SpoolResent != 0 {
@@ -3461,7 +3461,7 @@ func TestSpoolDenialDropClearsRetainedBytes(t *testing.T) {
 	client := newSpoolTestClient(t, server.URL, dir, nil, nil)
 	client.SetConsent(true)
 
-	if err := client.Enqueue(Event{ID: "evt-stale-1", Name: "e1", Props: map[string]any{"v": "old"}}); err != nil {
+	if err := client.Enqueue(Event{ID: "9ff866df-2004-5fee-83b2-e43e4dba517e", Name: "e1", Props: map[string]any{"v": "old"}}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -3476,7 +3476,7 @@ func TestSpoolDenialDropClearsRetainedBytes(t *testing.T) {
 	// A NEW event reusing the same explicit id must publish ITS bytes, not
 	// the denied batch's stale retained encoding.
 	state.setOutcome(http.StatusAccepted, "", "")
-	if err := client.Enqueue(Event{ID: "evt-stale-1", Name: "e1", Props: map[string]any{"v": "new"}}); err != nil {
+	if err := client.Enqueue(Event{ID: "9ff866df-2004-5fee-83b2-e43e4dba517e", Name: "e1", Props: map[string]any{"v": "new"}}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err != nil {
@@ -3590,7 +3590,7 @@ func TestStartupSpoolResendDoesNotWaitForTheFlushTick(t *testing.T) {
 
 	dir := t.TempDir()
 	writeConsentRecordFile(t, dir, "granted")
-	writeSpoolRecordFile(t, dir, 0, spoolTestEnvelope(t, "evt-restart-1", time.Now()))
+	writeSpoolRecordFile(t, dir, 0, spoolTestEnvelope(t, "c909bd6c-b387-5222-b7da-4cd6a7175f98", time.Now()))
 
 	state.setOutcome(http.StatusAccepted, "", "")
 	client := newSpoolTestClient(t, server.URL, dir, nil, func(cfg *Config) {
@@ -3652,7 +3652,7 @@ func TestStartupSpoolResendSurvivesFrequentUnrelatedWakes(t *testing.T) {
 			}
 			// Faster than the one-second recovery wake: every one of these
 			// resets the timer under the defect.
-			_ = client.Enqueue(Event{ID: fmt.Sprintf("evt-busy-%d", i), Name: "noise"})
+			_ = client.Enqueue(Event{ID: fixtureEventID(fmt.Sprintf("evt-busy-%d", i)), Name: "noise"})
 			time.Sleep(100 * time.Millisecond)
 		}
 	}()
@@ -3713,7 +3713,7 @@ func TestStartupSpoolResendSurvivesAWakeThatSpansItsDeadline(t *testing.T) {
 			// 1.4s apart: every one of these wakes arrives AFTER the
 			// one-second recovery deadline has passed, which is exactly the
 			// case that used to roll it forward instead of attempting.
-			_ = client.Enqueue(Event{ID: fmt.Sprintf("evt-spanning-noise-%d", i), Name: "noise"})
+			_ = client.Enqueue(Event{ID: fixtureEventID(fmt.Sprintf("evt-spanning-noise-%d", i)), Name: "noise"})
 			time.Sleep(1400 * time.Millisecond)
 		}
 	}()

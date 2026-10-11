@@ -38,7 +38,7 @@ func TestTrackSendsAppFirstEnvelope(t *testing.T) {
 	defer client.Close(context.Background())
 
 	err := client.Track(context.Background(), Event{
-		ID:              "evt-test-1",
+		ID:              "b21f3a39-793b-5286-94f6-abbeb3e96a5b",
 		Name:            "match_end",
 		Timestamp:       time.Date(2026, 5, 14, 12, 0, 0, 0, time.UTC),
 		AnonymousID:     "anonymous-example",
@@ -262,24 +262,24 @@ func TestBuildBatchIsolatingAttributesPoisonMembers(t *testing.T) {
 		clock: realClock{},
 	}
 	now := time.Now()
-	ok1 := Event{ID: "evt-iso-1", Name: "e1", Timestamp: now}
-	poison := Event{ID: "evt-iso-poison", Name: "e2", Timestamp: now, Props: map[string]any{"bad": func() {}}}
-	ok2 := Event{ID: "evt-iso-3", Name: "e3", Timestamp: now}
+	ok1 := Event{ID: "4a44a49c-bf70-5f37-8b01-29ebb62cd7fc", Name: "e1", Timestamp: now}
+	poison := Event{ID: "a422cc09-21c9-5eeb-9b39-4d38645ca083", Name: "e2", Timestamp: now, Props: map[string]any{"bad": func() {}}}
+	ok2 := Event{ID: "62defa9b-0138-5fe9-bfc8-b49bbd75f6ad", Name: "e3", Timestamp: now}
 
 	// Mixed batch, nothing retained: the poison member is attributed by id
 	// with the EncodeError class, and the request/kept pair carries exactly
 	// its batchmates, aligned.
 	request, kept, poisoned := client.buildBatchIsolating([]Event{ok1, poison, ok2}, batchRequest{})
-	if len(request.Events) != 2 || request.Events[0].EventID != "evt-iso-1" || request.Events[1].EventID != "evt-iso-3" {
+	if len(request.Events) != 2 || request.Events[0].EventID != "4a44a49c-bf70-5f37-8b01-29ebb62cd7fc" || request.Events[1].EventID != "62defa9b-0138-5fe9-bfc8-b49bbd75f6ad" {
 		t.Fatalf("expected the two serializable members built, got %+v", request.Events)
 	}
 	if len(request.rawEvents) != 2 {
 		t.Fatalf("expected raw bytes aligned with the built envelopes, got %d", len(request.rawEvents))
 	}
-	if len(kept) != 2 || kept[0].ID != "evt-iso-1" || kept[1].ID != "evt-iso-3" {
+	if len(kept) != 2 || kept[0].ID != "4a44a49c-bf70-5f37-8b01-29ebb62cd7fc" || kept[1].ID != "62defa9b-0138-5fe9-bfc8-b49bbd75f6ad" {
 		t.Fatalf("expected kept aligned with the request, got %+v", kept)
 	}
-	if len(poisoned) != 1 || poisoned[0].id != "evt-iso-poison" {
+	if len(poisoned) != 1 || poisoned[0].id != "a422cc09-21c9-5eeb-9b39-4d38645ca083" {
 		t.Fatalf("expected the poison member attributed by id, got %+v", poisoned)
 	}
 	var encodeErr *EncodeError

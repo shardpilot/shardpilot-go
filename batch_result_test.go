@@ -131,7 +131,7 @@ func TestOnBatchResultSurfacesPerEventStatuses(t *testing.T) {
 
 	names := []string{"ev_accepted", "ev_observed", "ev_duplicate", "ev_suppressed", "ev_suppressed_ad", "ev_rejected"}
 	for i, name := range names {
-		if err := client.Enqueue(Event{ID: "id-" + name, Name: name}); err != nil {
+		if err := client.Enqueue(Event{ID: fixtureEventID("id-" + name), Name: name}); err != nil {
 			t.Fatalf("enqueue %d (%s): %v", i, name, err)
 		}
 	}
@@ -167,12 +167,12 @@ func TestOnBatchResultSurfacesPerEventStatuses(t *testing.T) {
 		status EventStatus
 		code   string
 	}{
-		"id-ev_accepted":      {EventStatusAccepted, ""},
-		"id-ev_observed":      {EventStatusObserved, "event_not_registered"},
-		"id-ev_duplicate":     {EventStatusDuplicate, "duplicate_event_id"},
-		"id-ev_suppressed":    {EventStatusSuppressedNoConsent, ""},
-		"id-ev_suppressed_ad": {EventStatusSuppressedAdRevenueConsent, ""},
-		"id-ev_rejected":      {EventStatusRejected, "validation_error"},
+		fixtureEventID("id-ev_accepted"):       {EventStatusAccepted, ""},
+		fixtureEventID("id-ev_observed"):       {EventStatusObserved, "event_not_registered"},
+		fixtureEventID("id-ev_duplicate"):      {EventStatusDuplicate, "duplicate_event_id"},
+		"2a190af0-7fd6-52f6-bac0-ae8cb4a22013": {EventStatusSuppressedNoConsent, ""},
+		fixtureEventID("id-ev_suppressed_ad"):  {EventStatusSuppressedAdRevenueConsent, ""},
+		fixtureEventID("id-ev_rejected"):       {EventStatusRejected, "validation_error"},
 	}
 	for id, expect := range want {
 		got, ok := byID[id]
@@ -186,7 +186,7 @@ func TestOnBatchResultSurfacesPerEventStatuses(t *testing.T) {
 			t.Fatalf("%s: expected code %q, got %q", id, expect.code, got.Code)
 		}
 	}
-	if rejected := byID["id-ev_rejected"]; rejected.Message == "" {
+	if rejected := byID[fixtureEventID("id-ev_rejected")]; rejected.Message == "" {
 		t.Fatal("expected rejected event to carry a message")
 	}
 
@@ -218,7 +218,7 @@ func TestOnBatchResultOnSynchronousTrack(t *testing.T) {
 	client := newBatchResultClient(t, server.URL, recorder.record)
 	defer client.Close(context.Background())
 
-	if err := client.Track(context.Background(), Event{ID: "id-ev_suppressed", Name: "ev_suppressed"}); err != nil {
+	if err := client.Track(context.Background(), Event{ID: "2a190af0-7fd6-52f6-bac0-ae8cb4a22013", Name: "ev_suppressed"}); err != nil {
 		t.Fatalf("Track: %v", err)
 	}
 
@@ -272,7 +272,7 @@ func TestUnknownEventStatusCarriedThrough(t *testing.T) {
 	client := newBatchResultClient(t, server.URL, recorder.record)
 	defer client.Close(context.Background())
 
-	if err := client.Track(context.Background(), Event{ID: "id-unknown", Name: "ev_unknown_status"}); err != nil {
+	if err := client.Track(context.Background(), Event{ID: "449fcdcc-db25-57ee-bcbb-831d5de6fd04", Name: "ev_unknown_status"}); err != nil {
 		t.Fatalf("Track: %v", err)
 	}
 

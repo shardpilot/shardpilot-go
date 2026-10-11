@@ -2,6 +2,12 @@
 
 ## v0.8.0-alpha — release preparation (not published)
 
+- Caller event IDs must be valid UUIDs and are normalized to lowercase before
+  queueing or delivery. Malformed values return `ErrInvalidEventID` locally,
+  with one drop and a diagnostic. This also applies to typed purchase/economy
+  IDs; use stable UUIDs for receipt or ledger retries. Omitted IDs now use
+  UUIDv7 through the shared generator.
+
 - Remote config remains available without granted consent through the
   identifier-free workspace/environment route. Only granted requests carry
   the configured anonymous ID; non-granted requests also omit targeting

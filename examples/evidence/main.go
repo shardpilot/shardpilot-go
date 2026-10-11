@@ -275,8 +275,8 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 		}
 		fmt.Fprintf(out, "case=%s sdk_error=%s expectation_error=%s\n", name, redact.Replace(fmt.Sprint(err)), redact.Replace(fmt.Sprint(check)))
 	}
-	event := func(id, name, session string, sequence int64, props map[string]any) shardpilot.Event {
-		return shardpilot.Event{ID: runID + "-" + id, Name: name, SessionID: runID + "-" + session, SessionSequence: sequence, Props: props}
+	event := func(name, session string, sequence int64, props map[string]any) shardpilot.Event {
+		return shardpilot.Event{Name: name, SessionID: runID + "-" + session, SessionSequence: sequence, Props: props}
 	}
 	analytics := func(name, kind string, events []shardpilot.Event, synchronous bool) {
 		caseRun(name, kind, func(hc *http.Client) error {
@@ -309,15 +309,15 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 			return closeErr
 		})
 	}
-	analytics("single", "accepted", []shardpilot.Event{event("single", "app.screen_view", "single", 1, nil)}, true)
+	analytics("single", "accepted", []shardpilot.Event{event("app.screen_view", "single", 1, nil)}, true)
 	analytics("realistic-batch", "accepted", []shardpilot.Event{
-		event("batch-first-a", "app.screen_view", "batch-a", 1, map[string]any{"screen": "menu"}),
-		event("batch-second-a", "app.screen_view", "batch-a", 2, map[string]any{"screen": "summary"}),
-		event("batch-first-b", "app.screen_view", "batch-b", 1, map[string]any{"screen": "menu"}),
-		event("batch-second-b", "app.screen_view", "batch-b", 2, map[string]any{"screen": "summary"}),
+		event("app.screen_view", "batch-a", 1, map[string]any{"screen": "menu"}),
+		event("app.screen_view", "batch-a", 2, map[string]any{"screen": "summary"}),
+		event("app.screen_view", "batch-b", 1, map[string]any{"screen": "menu"}),
+		event("app.screen_view", "batch-b", 2, map[string]any{"screen": "summary"}),
 	}, false)
-	analytics("mixed-size", "mixed", []shardpilot.Event{event("large", "app.screen_view", "large", 1, map[string]any{"synthetic_padding": strings.Repeat("x", 3072)}), event("small", "app.screen_view", "small", 1, nil)}, false)
-	analytics("unauthenticated", "unauthenticated", []shardpilot.Event{event("unauth", "app.screen_view", "unauth", 1, nil)}, true)
+	analytics("mixed-size", "mixed", []shardpilot.Event{event("app.screen_view", "large", 1, map[string]any{"synthetic_padding": strings.Repeat("x", 3072)}), event("app.screen_view", "small", 1, nil)}, false)
+	analytics("unauthenticated", "unauthenticated", []shardpilot.Event{event("app.screen_view", "unauth", 1, nil)}, true)
 	for _, kind := range []string{"go-panic", "native-json", "raw-text"} {
 		caseRun(kind, "crash", func(hc *http.Client) error {
 			c, err := crash.NewClient(crash.ClientOptions{IngestURL: values["SHARDPILOT_CRASH_INGEST_URL"], APIKey: values["SHARDPILOT_API_KEY"], App: crash.AppInfo{ID: values["SHARDPILOT_APP_ID"], Version: "synthetic", BuildID: "sdk-evidence"}, Source: "sdk-evidence", AnonymousID: values["SHARDPILOT_ANONYMOUS_ID"], SessionID: runID, HTTPClient: hc, MaxAttempts: 1})

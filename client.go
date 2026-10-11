@@ -509,7 +509,13 @@ func (c *Client) Track(ctx context.Context, event Event) error {
 		c.lifecycleMu.Unlock()
 		return err
 	}
-	event, err := c.prepareEvent(event)
+	id, err := c.validateHostEventID(event.ID)
+	if err != nil {
+		c.lifecycleMu.Unlock()
+		return err
+	}
+	event.ID = id
+	event, err = c.prepareEvent(event)
 	if err != nil {
 		c.stats.recordFailure(err)
 		c.lifecycleMu.Unlock()
@@ -571,7 +577,12 @@ func (c *Client) Enqueue(event Event) error {
 	if err := c.validateHostEventName(event.Name); err != nil {
 		return err
 	}
-	event, err := c.prepareEvent(event)
+	id, err := c.validateHostEventID(event.ID)
+	if err != nil {
+		return err
+	}
+	event.ID = id
+	event, err = c.prepareEvent(event)
 	if err != nil {
 		return err
 	}

@@ -138,7 +138,7 @@ func TestCloseRemnantDropsPreDenialEvents(t *testing.T) {
 	// re-grant enqueued a fresh event; Close's abandoned flush never let
 	// the worker observe the boundary.
 	client.consentEpoch.Add(1)
-	client.queue.enqueue(Event{ID: "fresh-1", Name: "fresh_post_grant", AnonymousID: "anon-test", intakeConsentEpoch: 1})
+	client.queue.enqueue(Event{ID: "3b8ee119-24be-506a-afd5-d8489feb828f", Name: "fresh_post_grant", AnonymousID: "anon-test", intakeConsentEpoch: 1})
 	held := []Event{{ID: "stale-1", Name: "stale_pre_denial", AnonymousID: "anon-test", intakeConsentEpoch: 0}}
 	droppedBefore := client.Snapshot().Dropped
 	client.spoolCloseRemnant(held)
@@ -207,8 +207,8 @@ func TestWithdrawnFilterKeepsRetainedPrefixWithAppendedTail(t *testing.T) {
 	if skip != "" {
 		t.Fatalf("fact build refused (%s)", skip)
 	}
-	host1 := Event{ID: "host-1", Name: "host_kept", AnonymousID: "anon-test"}
-	host2 := Event{ID: "host-2", Name: "host_late", AnonymousID: "anon-test"}
+	host1 := Event{ID: "6f5ccd22-f901-585b-9072-16b76bdfc765", Name: "host_kept", AnonymousID: "anon-test"}
+	host2 := Event{ID: "b95ed5b2-7484-55a1-b8e7-e9e86f7a39e7", Name: "host_late", AnonymousID: "anon-test"}
 	retained, err := client.buildBatch([]Event{factEvent, host1})
 	if err != nil {
 		t.Fatalf("buildBatch: %v", err)

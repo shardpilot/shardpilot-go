@@ -230,7 +230,7 @@ func TestConsentFloorDefaultOffBehaviorUnchanged(t *testing.T) {
 	})
 
 	// Unknown consent, floor off: intake and publishing are open.
-	if err := client.Enqueue(Event{ID: "evt-off-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "6d5c1d9e-f388-55fe-92b3-260307db4298", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue under unknown consent must stay open with the floor off: %v", err)
 	}
 	if err := client.Flush(context.Background()); err != nil {
@@ -292,7 +292,7 @@ func TestConsentFloorGrantReceiptPrecedesBatch(t *testing.T) {
 	client := newFloorTestClient(t, server.URL, dir, nil)
 
 	client.SetConsent(true)
-	if err := client.Enqueue(Event{ID: "evt-floor-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "4079ca7a-4e7b-5c4d-b534-e43c4073917b", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue after the grant: %v", err)
 	}
 	if err := client.Flush(context.Background()); err != nil {
@@ -347,7 +347,7 @@ func TestConsentFloorParkedGrantGatesEventLegs(t *testing.T) {
 	})
 
 	// Intake stays OPEN under the grant; only the event LEGS hold.
-	if err := client.Enqueue(Event{ID: "evt-gated-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "a19aedd2-656f-516a-ab13-1ae31f927fa6", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue must not be gated: %v", err)
 	}
 	if err := client.Flush(context.Background()); !errors.Is(err, ErrConsentReceiptPending) {
@@ -402,7 +402,7 @@ func TestConsentFloorReceiptRetainedAcrossRestartAndResentVerbatim(t *testing.T)
 	if got := restarted.ConsentState(); got != ConsentGranted {
 		t.Fatalf("expected the persisted grant as the live state, got %v", got)
 	}
-	if err := restarted.Enqueue(Event{ID: "evt-restart-1", Name: "e1"}); err != nil {
+	if err := restarted.Enqueue(Event{ID: "c909bd6c-b387-5222-b7da-4cd6a7175f98", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := restarted.Flush(context.Background()); err != nil {
@@ -568,7 +568,7 @@ func TestConsentFloorForcedMinorRefusesGrant(t *testing.T) {
 	if got := client.ConsentState(); got != ConsentDeniedForcedMinor {
 		t.Fatalf("refused grant changed state: %v", got)
 	}
-	if err := client.Enqueue(Event{ID: "evt-band-1", Name: "e1"}); !errors.Is(err, ErrConsentDenied) {
+	if err := client.Enqueue(Event{ID: "c2478e64-b699-534b-a413-4b0099889a6b", Name: "e1"}); !errors.Is(err, ErrConsentDenied) {
 		t.Fatalf("Enqueue after refusal: %v", err)
 	}
 	if err := client.Close(context.Background()); err != nil {
@@ -1050,7 +1050,7 @@ func TestConsentFloorCloseAfterGatedFlushIsRetryablePending(t *testing.T) {
 	waitFor(t, 3*time.Second, "the failed decision-time dispatch", func() bool {
 		return state.consentCount() >= 1
 	})
-	if err := client.Enqueue(Event{ID: "evt-gatedclose-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "ed288427-3cd8-51df-81be-4d368e748d8f", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	err := client.Close(context.Background())
@@ -1329,7 +1329,7 @@ func TestConsentFloorEmptyBody2xxAcknowledges(t *testing.T) {
 		t.Fatalf("expected the acknowledged receipt pruned")
 	}
 	// The gate released: events flow.
-	if err := client.Enqueue(Event{ID: "evt-204-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "59d68abb-9704-52da-8a79-7c01fc6e38f8", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err != nil {
@@ -1393,7 +1393,7 @@ func TestConsentFloorCloseRunsDrainDespiteEventError(t *testing.T) {
 	// A REAL, non-gate event-plane error at Close: the batch endpoint
 	// answers a terminal 400 for the queued event.
 	state.setBatchOutcome(http.StatusBadRequest)
-	if err := client.Enqueue(Event{ID: "evt-terminal-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "cea1f452-551f-5780-a1fa-58a658769b95", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	err := client.Close(context.Background())
@@ -1739,7 +1739,7 @@ func TestConsentFloorGrantNotObservableBeforeReceiptArmed(t *testing.T) {
 	<-denyDone
 	<-grantDone
 	// Both receipts now exist; the trail drains and events follow.
-	if err := client.Enqueue(Event{ID: "evt-armed-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "f91e8b62-b276-5601-89c7-c60e2981671f", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err != nil {
@@ -1771,7 +1771,7 @@ func TestConsentFloorNonJSON2xxAcknowledges(t *testing.T) {
 	if client.consentOutbox.pending() {
 		t.Fatalf("expected the acknowledged receipt pruned")
 	}
-	if err := client.Enqueue(Event{ID: "evt-raw-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "b48edb7e-6e8b-569d-942d-627c5fcf65e6", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err != nil {
@@ -1849,7 +1849,7 @@ func TestConsentFloorNoResponseFailureKeepsGateArmed(t *testing.T) {
 	// have seen it, so the receipt counts as UNHANDED and the gate keeps
 	// holding the event legs — a batch shipped now could be the server's
 	// first-seen request, overtaking the grant.
-	if err := client.Enqueue(Event{ID: "evt-noresp-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "e2f8136f-58cf-5f51-acb6-cfad47ac7176", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); !errors.Is(err, ErrConsentReceiptPending) {
@@ -1888,7 +1888,7 @@ func TestConsentFloorStaleGrantNeverResendsSpooledEvents(t *testing.T) {
 		return client.Snapshot().ConsentRecorded == 1
 	})
 	state.setBatchOutcome(http.StatusServiceUnavailable)
-	if err := client.Enqueue(Event{ID: "evt-predenial-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "e9bcb934-1f84-5975-a605-6e472e42a57d", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -1960,7 +1960,7 @@ func TestConsentFloorUnconfirmedGrantPurgesSpoolAtInit(t *testing.T) {
 		return client.Snapshot().ConsentRecorded == 1
 	})
 	state.setBatchOutcome(http.StatusServiceUnavailable)
-	if err := client.Enqueue(Event{ID: "evt-unconfirmed-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "8cb05fe8-4096-5088-99d4-deb85e5ffcd8", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -2084,7 +2084,7 @@ func TestConsentFloorGrantReceiptTailRestoresGrantAndHealsRecord(t *testing.T) {
 	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentGranted {
 		t.Fatalf("expected the missing record healed to granted, got (%v, %v)", recorded, ok)
 	}
-	if err := client.Enqueue(Event{ID: "evt-tailgrant-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "817101b3-f0df-5593-b9bf-676e6cb7f848", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err != nil {
@@ -2183,7 +2183,7 @@ func TestConsentFloorRefusesPerEventActorOverride(t *testing.T) {
 		t.Fatalf("expected no override event on the wire, got %d batches", got)
 	}
 	// An override resolving to the SAME effective actor passes through.
-	if err := client.Track(context.Background(), Event{ID: "evt-same-actor-1", Name: "e1", AnonymousID: "anon-spool-1"}); err != nil {
+	if err := client.Track(context.Background(), Event{ID: "23e069aa-cf58-5d29-a13d-b258ce12795f", Name: "e1", AnonymousID: "anon-spool-1"}); err != nil {
 		t.Fatalf("expected the same-actor override accepted, got %v", err)
 	}
 	if err := client.Close(context.Background()); err != nil {
@@ -2199,7 +2199,7 @@ func TestConsentFloorRefusesPerEventActorOverride(t *testing.T) {
 	waitFor(t, 3*time.Second, "the user grant acknowledged", func() bool {
 		return userClient.Snapshot().ConsentRecorded == 1
 	})
-	if err := userClient.Track(context.Background(), Event{ID: "evt-secondary-1", Name: "e1", AnonymousID: "anon-secondary"}); err != nil {
+	if err := userClient.Track(context.Background(), Event{ID: "6112b4dc-dc6d-55ed-9cf3-0ebe9cce6b90", Name: "e1", AnonymousID: "anon-secondary"}); err != nil {
 		t.Fatalf("expected the secondary-identifier override accepted (effective actor unchanged), got %v", err)
 	}
 	if err := userClient.Track(context.Background(), Event{Name: "e1", UserID: "user-2"}); !errors.Is(err, ErrConsentActorMismatch) {
@@ -2214,7 +2214,7 @@ func TestConsentFloorRefusesPerEventActorOverride(t *testing.T) {
 	offClient := newFloorTestClient(t, server.URL, "", func(cfg *Config) {
 		cfg.ConsentFloor = nil
 	})
-	if err := offClient.Track(context.Background(), Event{ID: "evt-off-override-1", Name: "e1", UserID: "someone-else"}); err != nil {
+	if err := offClient.Track(context.Background(), Event{ID: "63744bf3-7e31-5e7d-88b9-414090f666b3", Name: "e1", UserID: "someone-else"}); err != nil {
 		t.Fatalf("expected the floor-off override accepted, got %v", err)
 	}
 	if err := offClient.Close(context.Background()); err != nil {
@@ -2235,7 +2235,7 @@ func TestConsentFloorGatedCloseReportsUnspooledRemnant(t *testing.T) {
 	waitFor(t, 3*time.Second, "the parked grant attempted", func() bool {
 		return client.Snapshot().ConsentFailed >= 1
 	})
-	if err := client.Enqueue(Event{ID: "evt-remnant-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "7a4bbce6-d01a-5d8d-a047-101f7aa3c2ae", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 
@@ -2512,7 +2512,7 @@ func TestConsentFloorDirtyDuplicateRemnantCountsDiscarded(t *testing.T) {
 		return appendPrivateFile(path, payload)
 	}
 	client.spool.mu.Unlock()
-	if err := client.Enqueue(Event{ID: "evt-dupremnant-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "428f8044-a50f-5e3c-9602-6b3dce0cb9bc", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -2597,10 +2597,10 @@ func TestConsentFloorForeignParkedGrantDoesNotGateEvents(t *testing.T) {
 	// Event legs: the dispatch pass SKIPS the foreign receipt (nothing
 	// in-scope to send, nothing handed), and the retained foreign grant
 	// alone must not arm the gate — both batches flow.
-	if err := client.Track(context.Background(), Event{ID: "evt-foreign-gate-1", Name: "e1"}); err != nil {
+	if err := client.Track(context.Background(), Event{ID: "069cf04e-9169-5fe2-89ef-f907916e02b4", Name: "e1"}); err != nil {
 		t.Fatalf("expected the batch to flow despite the retained foreign grant, got %v", err)
 	}
-	if err := client.Track(context.Background(), Event{ID: "evt-foreign-gate-2", Name: "e1"}); err != nil {
+	if err := client.Track(context.Background(), Event{ID: "53b187b0-7595-50c7-8b40-03aeef61c4aa", Name: "e1"}); err != nil {
 		t.Fatalf("expected the batch to flow while the foreign grant stays retained, got %v", err)
 	}
 	if got := state.batchCount(); got != 2 {
@@ -2809,7 +2809,7 @@ func TestConsentFloorRestartReopensSpoolWriteGate(t *testing.T) {
 		t.Fatalf("expected the persisted grant live after restart, got %v", got)
 	}
 	state.setBatchOutcome(http.StatusServiceUnavailable)
-	if err := relaunched.Enqueue(Event{ID: "evt-postrestart-1", Name: "e1"}); err != nil {
+	if err := relaunched.Enqueue(Event{ID: "86eb5fb0-b3d0-51bb-94f2-898d5383de79", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := relaunched.Flush(context.Background()); err == nil {
@@ -2867,7 +2867,7 @@ func TestConsentFloorGrantHeldWhileOwnAppendOwed(t *testing.T) {
 	if recorded, ok := loadConsentRecord(dir, spoolTestActorDigest()); !ok || recorded != ConsentGranted {
 		t.Fatalf("expected the withheld record completed before delivery, got (%v, %v)", recorded, ok)
 	}
-	if err := client.Track(context.Background(), Event{ID: "evt-held-grant-1", Name: "e1"}); err != nil {
+	if err := client.Track(context.Background(), Event{ID: "15b8e75a-1108-5282-9712-2cf3696aa58c", Name: "e1"}); err != nil {
 		t.Fatalf("expected the pipeline open after the release, got %v", err)
 	}
 	if err := client.Close(context.Background()); err != nil {
@@ -2892,7 +2892,7 @@ func TestConsentFloorSecondaryOverrideSpoolsUnderFloor(t *testing.T) {
 		return client.Snapshot().ConsentRecorded == 1
 	})
 	state.setBatchOutcome(http.StatusServiceUnavailable)
-	if err := client.Enqueue(Event{ID: "evt-secondary-spool-1", Name: "e1", AnonymousID: "anon-secondary"}); err != nil {
+	if err := client.Enqueue(Event{ID: "33ccd11c-3eb2-5f17-8489-5e076aca4108", Name: "e1", AnonymousID: "anon-secondary"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -3035,7 +3035,7 @@ func TestConsentFloorLateDiscardFoldsIntoCachedClose(t *testing.T) {
 	waitFor(t, 3*time.Second, "the grant acknowledged", func() bool {
 		return client.Snapshot().ConsentRecorded == 1
 	})
-	if err := client.Enqueue(Event{ID: "evt-latediscard-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "8b575482-ef7f-59dc-abb1-bfd743d119df", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 
@@ -3229,7 +3229,7 @@ func TestConsentFloorProofReceiptPromotesUnprovenGrantRecord(t *testing.T) {
 		t.Fatalf("expected the record healed floor-marked with the receipt's stamp, got %+v %v", info, ok)
 	}
 	// The retained proof still dispatches ahead of any batch.
-	if err := client.Enqueue(Event{ID: "evt-promoted-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "9083fa05-55de-59d5-b6d5-2cdbf38b8cc0", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err != nil {
@@ -3447,7 +3447,7 @@ func TestConsentFloorMintFailureWithholdsAndRetries(t *testing.T) {
 	if got := client.Snapshot().LastConsentError; got != "consent_receipt_mint_failed" {
 		t.Fatalf("expected the mint failure diagnosed, got %q", got)
 	}
-	if err := client.Enqueue(Event{ID: "evt-mint-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "9464d074-81fe-51a5-9531-5a36ebda5c82", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); !errors.Is(err, ErrConsentReceiptPending) {
@@ -3667,10 +3667,10 @@ func TestConsentFloorCloseRemnantCapacityEvictionFoldsDiscarded(t *testing.T) {
 	// close-remnant append — where the cap evicts the older one.
 	transport.setFailing(true)
 	client.SetConsent(true)
-	if err := client.Enqueue(Event{ID: "evt-cap-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "deb56633-ef4f-5679-8121-9322318529b3", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
-	if err := client.Enqueue(Event{ID: "evt-cap-2", Name: "e2"}); err != nil {
+	if err := client.Enqueue(Event{ID: "a7caa617-1b21-5786-a834-d605f6bf2ad6", Name: "e2"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 
@@ -3765,10 +3765,10 @@ func TestConsentFloorPoisonedCloseRemnantFoldsDiscarded(t *testing.T) {
 	})
 	transport.setFailing(true)
 	client.SetConsent(true) // parked with no observed outcome: gates the final flush
-	if err := client.Enqueue(Event{ID: "evt-poison-1", Name: "e1", Props: map[string]any{"bad": func() {}}}); err != nil {
+	if err := client.Enqueue(Event{ID: "a165a760-6a20-5148-b5bb-09e16cda65ff", Name: "e1", Props: map[string]any{"bad": func() {}}}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
-	if err := client.Enqueue(Event{ID: "evt-poison-2", Name: "e2"}); err != nil {
+	if err := client.Enqueue(Event{ID: "4238fbdd-fa37-5dd7-ba4e-98a85ded10d1", Name: "e2"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 
@@ -3807,10 +3807,10 @@ func TestConsentFloorExpiredCloseRemnantFoldsDiscarded(t *testing.T) {
 	})
 	transport.setFailing(true)
 	client.SetConsent(true) // parked with no observed outcome: gates the final flush
-	if err := client.Enqueue(Event{ID: "evt-expired-1", Name: "e1", Timestamp: time.Now().Add(-8 * 24 * time.Hour)}); err != nil {
+	if err := client.Enqueue(Event{ID: "0b65d5c3-d1d6-5cc6-888a-a16d221d0adf", Name: "e1", Timestamp: time.Now().Add(-8 * 24 * time.Hour)}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
-	if err := client.Enqueue(Event{ID: "evt-fresh-1", Name: "e2"}); err != nil {
+	if err := client.Enqueue(Event{ID: "fe9941e3-cdc7-57d3-8d8e-2e08aa441d89", Name: "e2"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 
@@ -4262,7 +4262,7 @@ func TestConsentFloorRetriedCloseWaitsForWorkerStop(t *testing.T) {
 		return appendPrivateFile(path, payload)
 	}
 	state.setBatchOutcome(http.StatusServiceUnavailable)
-	if err := client.Enqueue(Event{ID: "evt-retry-close-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "e24ae947-722a-5c45-9179-a0bcdab79bef", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 
@@ -4292,7 +4292,7 @@ func TestConsentFloorRetriedCloseWaitsForWorkerStop(t *testing.T) {
 		return client.Snapshot().Spooled == 1
 	})
 	data, err := os.ReadFile(filepath.Join(dir, spoolFileName))
-	if err != nil || !strings.Contains(string(data), "evt-retry-close-1") {
+	if err != nil || !strings.Contains(string(data), "e24ae947-722a-5c45-9179-a0bcdab79bef") {
 		t.Fatalf("expected the remnant event durable in spool.json, got (%v, %q)", err, string(data))
 	}
 }
@@ -4314,7 +4314,7 @@ func TestConsentFloorDenialRecordLandsBeforePurge(t *testing.T) {
 		return client.Snapshot().ConsentRecorded == 1
 	})
 	state.setBatchOutcome(http.StatusServiceUnavailable)
-	if err := client.Enqueue(Event{ID: "evt-order-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "a8c6b56e-2105-5049-a734-cdc9886a9720", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -4368,7 +4368,7 @@ func TestConsentFloorDenialRecordLandsBeforePurge(t *testing.T) {
 	waitFor(t, 3*time.Second, "the second grant acknowledged", func() bool {
 		return client2.Snapshot().ConsentRecorded == 1
 	})
-	if err := client2.Enqueue(Event{ID: "evt-order-2", Name: "e2"}); err != nil {
+	if err := client2.Enqueue(Event{ID: "8540f052-3756-5917-94d1-25ade1179425", Name: "e2"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client2.Flush(context.Background()); err == nil {
@@ -4546,7 +4546,7 @@ func TestConsentFloorMintOwedGrantRecordWaits(t *testing.T) {
 	// fails again, and the record retry must keep waiting on the owed mint
 	// — the record may land only AFTER the retried mint appends the
 	// receipt, never before it.
-	if err := client.Enqueue(Event{ID: "evt-mintwait-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "ce4e72ed-cb59-5d58-a56d-639edc7a8370", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); !errors.Is(err, ErrConsentReceiptPending) {
@@ -4605,7 +4605,7 @@ func TestConsentFloorSupersedingGrantSettlesPurgeDebt(t *testing.T) {
 
 	// A retryable batch failure spools the condemned-to-be event durably.
 	state.setBatchOutcome(http.StatusServiceUnavailable)
-	if err := client.Enqueue(Event{ID: "evt-condemned-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "f1d47fe7-473d-5943-9842-161c117933b8", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -4683,7 +4683,7 @@ func TestConsentFloorSupersedingGrantSettlesPurgeDebt(t *testing.T) {
 		recorded, ok := loadConsentRecord(dir, spoolTestActorDigest())
 		return ok && recorded == ConsentGranted
 	})
-	if err := client.Enqueue(Event{ID: "evt-fresh-1", Name: "e2"}); err != nil {
+	if err := client.Enqueue(Event{ID: "fe9941e3-cdc7-57d3-8d8e-2e08aa441d89", Name: "e2"}); err != nil {
 		t.Fatalf("Enqueue after the heal: %v", err)
 	}
 	if err := client.Flush(context.Background()); err != nil {
@@ -4691,14 +4691,14 @@ func TestConsentFloorSupersedingGrantSettlesPurgeDebt(t *testing.T) {
 	}
 	waitFor(t, 3*time.Second, "the fresh event delivered", func() bool {
 		for _, id := range state.batchIDsSince(batchesBefore) {
-			if id == "evt-fresh-1" {
+			if id == "fe9941e3-cdc7-57d3-8d8e-2e08aa441d89" {
 				return true
 			}
 		}
 		return false
 	})
 	for _, id := range state.batchIDsSince(batchesBefore) {
-		if id == "evt-condemned-1" {
+		if id == "f1d47fe7-473d-5943-9842-161c117933b8" {
 			t.Fatalf("the denial-condemned event RESENT under the superseding grant: %v", state.batchIDsSince(batchesBefore))
 		}
 	}
@@ -4706,7 +4706,7 @@ func TestConsentFloorSupersedingGrantSettlesPurgeDebt(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 	for _, id := range state.batchIDsSince(batchesBefore) {
-		if id == "evt-condemned-1" {
+		if id == "f1d47fe7-473d-5943-9842-161c117933b8" {
 			t.Fatalf("the denial-condemned event resent at Close: %v", state.batchIDsSince(batchesBefore))
 		}
 	}
@@ -4806,7 +4806,7 @@ func TestConsentFloorPurgeDebtMarkerFailureRecordRetryRules(t *testing.T) {
 		return client.Snapshot().ConsentRecorded == 1
 	})
 	state.setBatchOutcome(http.StatusServiceUnavailable)
-	if err := client.Enqueue(Event{ID: "evt-ladder-a-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "d74e1568-3744-5289-9b9e-70a1de8773fe", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -4867,7 +4867,7 @@ func TestConsentFloorPurgeDebtMarkerFailureRecordRetryRules(t *testing.T) {
 		t.Fatalf("relaunch Close: %v", err)
 	}
 	for _, id := range state.batchIDsSince(batchesBefore) {
-		if id == "evt-ladder-a-1" {
+		if id == "d74e1568-3744-5289-9b9e-70a1de8773fe" {
 			t.Fatalf("the condemned event resent after the relaunch: %v", state.batchIDsSince(batchesBefore))
 		}
 	}
@@ -4890,7 +4890,7 @@ func TestConsentFloorPurgeDebtMarkerFailureWipesSpoolFile(t *testing.T) {
 	client := newFloorTestClient(t, server.URL, dir, actorless)
 	client.SetConsent(true) // actorless: record persists immediately, receipt-less
 	state.setBatchOutcome(http.StatusServiceUnavailable)
-	if err := client.Enqueue(Event{ID: "evt-ladder-b-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "d81c8e6e-e468-5988-8c63-d731177b5a63", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -4951,7 +4951,7 @@ func TestConsentFloorPurgeDebtMarkerFailureWipesSpoolFile(t *testing.T) {
 		t.Fatalf("relaunch Close: %v", err)
 	}
 	for _, id := range state.batchIDsSince(batchesBefore) {
-		if id == "evt-ladder-b-1" {
+		if id == "d81c8e6e-e468-5988-8c63-d731177b5a63" {
 			t.Fatalf("the condemned event reloaded and resent under the stale grant: %v", state.batchIDsSince(batchesBefore))
 		}
 	}
@@ -4973,7 +4973,7 @@ func TestConsentFloorPurgeDebtNothingDurableSurfacesAndRetries(t *testing.T) {
 		return client.Snapshot().ConsentRecorded == 1
 	})
 	state.setBatchOutcome(http.StatusServiceUnavailable)
-	if err := client.Enqueue(Event{ID: "evt-ladder-c-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "d643d457-76ce-5aab-82a2-03f38002c641", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -5054,7 +5054,7 @@ func TestConsentFloorPurgeDebtNothingDurableSurfacesAndRetries(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 	for _, id := range state.batchIDsSince(batchesBefore) {
-		if id == "evt-ladder-c-1" {
+		if id == "d643d457-76ce-5aab-82a2-03f38002c641" {
 			t.Fatalf("the condemned event resent after the heal: %v", state.batchIDsSince(batchesBefore))
 		}
 	}
@@ -5097,7 +5097,7 @@ func TestConsentFloorFailedSaveEvictionFoldsIntoCloseVerdict(t *testing.T) {
 	}
 	client.spool.mu.Unlock()
 	state.setBatchOutcome(http.StatusServiceUnavailable)
-	if err := client.Enqueue(Event{ID: "evt-cap-lost-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "218bead1-bfab-5027-9177-11fd9ff31bef", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -5106,7 +5106,7 @@ func TestConsentFloorFailedSaveEvictionFoldsIntoCloseVerdict(t *testing.T) {
 
 	// The close remnant appends E2 over the cap: the eviction takes E1 —
 	// never durably saved — and the remnant save fails again.
-	if err := client.Enqueue(Event{ID: "evt-cap-lost-2", Name: "e2"}); err != nil {
+	if err := client.Enqueue(Event{ID: "beefc574-dca0-5771-98cc-8bdfa64a4d27", Name: "e2"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	err := client.Close(context.Background())
@@ -5149,7 +5149,7 @@ func TestConsentFloorPurgeDebtDestructionRequiresDirSync(t *testing.T) {
 		return client.Snapshot().ConsentRecorded == 1
 	})
 	state.setBatchOutcome(http.StatusServiceUnavailable)
-	if err := client.Enqueue(Event{ID: "evt-sync-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "b897c7a7-c519-5f2b-9736-b485c785c37e", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {
@@ -5264,10 +5264,10 @@ func TestConsentFloorDuplicateIDExpiredRemnantStillCounted(t *testing.T) {
 
 	// One batch, same id twice: a stale copy past the spool retry-age cap
 	// and a fresh one.
-	if err := client.Enqueue(Event{ID: "evt-dup-1", Name: "e1", Timestamp: time.Now().Add(-8 * 24 * time.Hour)}); err != nil {
+	if err := client.Enqueue(Event{ID: "53a23f55-9a4a-52d7-b7be-105513ce870f", Name: "e1", Timestamp: time.Now().Add(-8 * 24 * time.Hour)}); err != nil {
 		t.Fatalf("Enqueue stale copy: %v", err)
 	}
-	if err := client.Enqueue(Event{ID: "evt-dup-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "53a23f55-9a4a-52d7-b7be-105513ce870f", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue fresh copy: %v", err)
 	}
 	err := client.Close(context.Background())
@@ -5388,7 +5388,7 @@ func TestConsentFloorMarkerCreateSerializedWithOwedFlag(t *testing.T) {
 		return client.Snapshot().ConsentRecorded == 1
 	})
 	state.setBatchOutcome(http.StatusServiceUnavailable)
-	if err := client.Enqueue(Event{ID: "evt-race-1", Name: "e1"}); err != nil {
+	if err := client.Enqueue(Event{ID: "00e93133-1c65-5593-a818-1bb3b40a0f97", Name: "e1"}); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Flush(context.Background()); err == nil {

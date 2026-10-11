@@ -35,15 +35,15 @@ func TestFlushDrainResettlesConsentEpochMidDrain(t *testing.T) {
 	// drain's one-shot boundary settle — a denial → re-grant whose fresh
 	// post-grant event joins the queue behind it.
 	held := []Event{{ID: "stale-held", Name: "stale_pre_denial", AnonymousID: "anon-test", intakeConsentEpoch: 0}}
-	client.queue.enqueue(Event{ID: "stale-queued", Name: "stale_queued_pre_denial", AnonymousID: "anon-test", intakeConsentEpoch: 0})
+	client.queue.enqueue(Event{ID: "cd693403-6858-5005-bd89-6ba2412d8171", Name: "stale_queued_pre_denial", AnonymousID: "anon-test", intakeConsentEpoch: 0})
 	client.drainReceiveSeam = func(event Event) {
-		if event.ID != "stale-queued" {
+		if event.ID != "cd693403-6858-5005-bd89-6ba2412d8171" {
 			return
 		}
 		// The denial's fast half bumps the epoch; the re-grant's fresh
 		// event carries the moved intake stamp.
 		client.consentEpoch.Add(1)
-		client.queue.enqueue(Event{ID: "survivor", Name: "fresh_post_grant", AnonymousID: "anon-test", intakeConsentEpoch: 1})
+		client.queue.enqueue(Event{ID: "e0c058ac-9b78-59d1-a15d-b4ead8d81dc0", Name: "fresh_post_grant", AnonymousID: "anon-test", intakeConsentEpoch: 1})
 	}
 	seenEpoch := uint64(0)
 	backoff := 0
