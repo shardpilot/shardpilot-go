@@ -10,15 +10,19 @@ type Stats struct {
 	Dropped       uint64
 	Published     uint64
 	FailedBatches uint64
-	Accepted      uint64
-	Rejected      uint64
-	Duplicates    uint64
+	// UnparsedBatchResponses counts settled 2xx batches without a readable outcome.
+	UnparsedBatchResponses uint64
+	// UnparsedConsentResponses counts settled receipts without a readable outcome.
+	UnparsedConsentResponses uint64
+	Accepted                 uint64
+	Rejected                 uint64
+	Duplicates               uint64
 	// ByStatus is the cumulative count of per-event ingest outcomes folded
 	// from the events[] list of every batch response, keyed by status. Every
 	// reported status is counted, including accepted/rejected/duplicate; the
 	// value of the breakdown over the three aggregate counters above is the
 	// finer outcomes they cannot express on their own (such as
-	// EventStatusObserved, EventStatusSuppressedNoConsent, and
+	// EventStatusSuppressedNoConsent and
 	// EventStatusSuppressedAdRevenueConsent). It is forward-compatible with
 	// statuses the server adds later. Each Snapshot returns a fresh copy; it
 	// is nil until a batch response carrying a per-event list is recorded.
@@ -109,13 +113,15 @@ type Stats struct {
 }
 
 type statsCollector struct {
-	enqueued      atomic.Uint64
-	dropped       atomic.Uint64
-	published     atomic.Uint64
-	failedBatches atomic.Uint64
-	accepted      atomic.Uint64
-	rejected      atomic.Uint64
-	duplicates    atomic.Uint64
+	enqueued                 atomic.Uint64
+	dropped                  atomic.Uint64
+	published                atomic.Uint64
+	failedBatches            atomic.Uint64
+	unparsedBatchResponses   atomic.Uint64
+	unparsedConsentResponses atomic.Uint64
+	accepted                 atomic.Uint64
+	rejected                 atomic.Uint64
+	duplicates               atomic.Uint64
 
 	spooled            atomic.Uint64
 	spoolResent        atomic.Uint64
@@ -170,6 +176,8 @@ func (s *statsCollector) snapshot() Stats {
 		Dropped:                    s.dropped.Load(),
 		Published:                  s.published.Load(),
 		FailedBatches:              s.failedBatches.Load(),
+		UnparsedBatchResponses:     s.unparsedBatchResponses.Load(),
+		UnparsedConsentResponses:   s.unparsedConsentResponses.Load(),
 		Accepted:                   s.accepted.Load(),
 		Rejected:                   s.rejected.Load(),
 		Duplicates:                 s.duplicates.Load(),
