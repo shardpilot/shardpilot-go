@@ -26,6 +26,10 @@ var (
 	// Track/Enqueue intake. It also matches ErrInvalidEvent through errors.Is.
 	ErrReservedEventName = fmt.Errorf("%w: reserved_event_name", ErrInvalidEvent)
 
+	// ErrInvalidEventID refuses a caller ID outside the canonical UUID shape.
+	// It also matches ErrInvalidEvent through errors.Is.
+	ErrInvalidEventID = fmt.Errorf("%w: invalid_event_id", ErrInvalidEvent)
+
 	// ErrEventNameRequired refuses an empty or ASCII-whitespace-only name.
 	// It also matches ErrInvalidEvent through errors.Is.
 	ErrEventNameRequired = fmt.Errorf("%w: event_name_required", ErrInvalidEvent)

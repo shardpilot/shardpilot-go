@@ -73,7 +73,7 @@ func BenchmarkStatsCollectorAggregation(b *testing.B) {
 
 func benchmarkEvent() Event {
 	return Event{
-		ID:              "evt-bench",
+		ID:              "1c899644-3afa-5f64-b12d-2c4dc77af277",
 		Name:            "bench_event",
 		Timestamp:       time.Unix(1700000000, 0).UTC(),
 		UserID:          "user-bench",

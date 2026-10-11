@@ -157,13 +157,13 @@ func TestTrackEconomyTxCarriesTheCallerSuppliedEventID(t *testing.T) {
 		t.Fatalf("two calls without EventID produced event_ids %v and %v; want two distinct generated ids", first, second)
 	}
 
-	tx.EventID = "ledger-5c19e2"
+	tx.EventID = "32e803d2-ee32-55d1-bd93-70e5cff29ed1"
 	for i := 0; i < 2; i++ {
 		if err := client.TrackEconomyTx(context.Background(), tx); err != nil {
 			t.Fatalf("TrackEconomyTx with EventID: %v", err)
 		}
-		if got := receiveEnvelope(t, envelopes)["event_id"]; got != "ledger-5c19e2" {
-			t.Fatalf("event_id = %v, want the caller-supplied ledger-5c19e2", got)
+		if got := receiveEnvelope(t, envelopes)["event_id"]; got != "32e803d2-ee32-55d1-bd93-70e5cff29ed1" {
+			t.Fatalf("event_id = %v, want the caller-supplied 32e803d2-ee32-55d1-bd93-70e5cff29ed1", got)
 		}
 	}
 }

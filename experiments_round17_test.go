@@ -85,7 +85,7 @@ func TestSentinelSparesHostLookalikeEvents(t *testing.T) {
 		// Public intake now refuses this name. Seed the legacy queue state
 		// directly: an event admitted by an older release is still not an
 		// SDK-authored fact, and the purge must preserve that distinction.
-		hostLookalike := Event{ID: "host-lookalike", Name: experimentExposureName, Props: map[string]any{"assignment_key": sfk}}
+		hostLookalike := Event{ID: "73946d23-00fd-5987-aae6-6116a5a88f12", Name: experimentExposureName, Props: map[string]any{"assignment_key": sfk}}
 		if err := client.Enqueue(hostLookalike); !errors.Is(err, ErrReservedEventName) {
 			t.Fatalf("public intake must refuse the reserved name: %v", err)
 		}
@@ -102,7 +102,7 @@ func TestSentinelSparesHostLookalikeEvents(t *testing.T) {
 		exposures := capture.exposures()
 		hostDelivered := false
 		for _, envelope := range exposures {
-			if envelope["event_id"] == "host-lookalike" {
+			if envelope["event_id"] == "73946d23-00fd-5987-aae6-6116a5a88f12" {
 				hostDelivered = true
 			}
 		}
@@ -134,7 +134,7 @@ func TestSentinelSparesHostLookalikeEvents(t *testing.T) {
 		if skip != "" {
 			t.Fatalf("fact build refused (%s)", skip)
 		}
-		hostLookalike := Event{ID: "host-spooled-lookalike", Name: experimentExposureName, AnonymousID: "anon-test", Props: map[string]any{"assignment_key": sfk}}
+		hostLookalike := Event{ID: "82006e36-5346-5a4b-ba79-a8f2071d15a0", Name: experimentExposureName, AnonymousID: "anon-test", Props: map[string]any{"assignment_key": sfk}}
 		request, err := client.buildBatch([]Event{sdkFact, hostLookalike})
 		if err != nil {
 			t.Fatalf("buildBatch: %v", err)
@@ -142,7 +142,7 @@ func TestSentinelSparesHostLookalikeEvents(t *testing.T) {
 		client.spoolFailedBatch(request, fmt.Errorf("http 500"), false)
 		client.spool.mu.Lock()
 		_, sdkSpooled := client.spool.ids["sdk-spooled-fact"]
-		_, hostSpooled := client.spool.ids["host-spooled-lookalike"]
+		_, hostSpooled := client.spool.ids["82006e36-5346-5a4b-ba79-a8f2071d15a0"]
 		client.spool.mu.Unlock()
 		if !sdkSpooled || !hostSpooled {
 			t.Fatalf("test shape: both entries must be spooled (sdk=%v host=%v)", sdkSpooled, hostSpooled)
@@ -154,7 +154,7 @@ func TestSentinelSparesHostLookalikeEvents(t *testing.T) {
 		client.purgeWithdrawnExperimentFacts()
 		client.spool.mu.Lock()
 		_, sdkKept := client.spool.ids["sdk-spooled-fact"]
-		_, hostKept := client.spool.ids["host-spooled-lookalike"]
+		_, hostKept := client.spool.ids["82006e36-5346-5a4b-ba79-a8f2071d15a0"]
 		client.spool.mu.Unlock()
 		if hostKept == false {
 			t.Fatalf("the sentinel's spool sweep removed a HOST-authored envelope that merely resembles an experiment fact: the raw-shape match must be paired with the persisted SDK-authorship flag")
@@ -228,7 +228,7 @@ func TestSentinelPurgePreservesQueueOrder(t *testing.T) {
 		}
 		hostIDs := make([]string, 0, hostsPerRound)
 		for h := 0; h < hostsPerRound; h++ {
-			hostIDs = append(hostIDs, fmt.Sprintf("order-%03d-%02d", i, h))
+			hostIDs = append(hostIDs, fixtureEventID(fmt.Sprintf("order-%03d-%02d", i, h)))
 		}
 		if _, err := client.enqueueExperimentFact(staleFact, false); err != nil {
 			t.Fatalf("iteration %d: fact enqueue: %v", i, err)
@@ -275,8 +275,8 @@ func TestSentinelPurgePreservesQueueOrder(t *testing.T) {
 	capture.mu.Unlock()
 	for i := 0; i < iterations; i++ {
 		for h := 1; h < hostsPerRound; h++ {
-			earlier := positions[fmt.Sprintf("order-%03d-%02d", i, h-1)]
-			later := positions[fmt.Sprintf("order-%03d-%02d", i, h)]
+			earlier := positions[fixtureEventID(fmt.Sprintf("order-%03d-%02d", i, h-1))]
+			later := positions[fixtureEventID(fmt.Sprintf("order-%03d-%02d", i, h))]
 			if earlier > later {
 				t.Fatalf("iteration %d: the sentinel purge REORDERED unrelated host events that merely shared the queue (event %02d delivered at %d, event %02d at %d): the drain/re-enqueue filter let the worker receive a later event while an earlier keeper was held out of the channel", i, h-1, earlier, h, later)
 			}

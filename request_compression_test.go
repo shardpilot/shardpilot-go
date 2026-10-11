@@ -142,7 +142,7 @@ func enqueueBatch(t *testing.T, client *Client, count int) {
 
 	for i := range count {
 		err := client.Enqueue(Event{
-			ID:   fmt.Sprintf("evt-compression-%d", i),
+			ID:   fixtureEventID(fmt.Sprintf("evt-compression-%d", i)),
 			Name: "level_complete",
 			Props: map[string]any{
 				"level_id":     fmt.Sprintf("world-3-stage-%d", i%12),
@@ -234,7 +234,7 @@ func TestPublishSendsSmallBodiesUncompressed(t *testing.T) {
 	client := newCompressionTestClient(t, server.URL, nil)
 	defer client.Close(context.Background())
 
-	if err := client.Enqueue(Event{ID: "evt-tiny", Name: "session_start"}); err != nil {
+	if err := client.Enqueue(Event{ID: "dc44487c-8613-5d37-ab9d-e6dd37ccfc62", Name: "session_start"}); err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
 
@@ -715,7 +715,7 @@ func TestTheUncompressedRetryGetsItsOwnAttemptTimeout(t *testing.T) {
 	// caller's context — which is where the shared budget used to be applied.
 	// The props push the single-event body over the compression threshold.
 	if err := client.Track(context.Background(), Event{
-		ID:    "evt-slow-refusal-1",
+		ID:    "c43878a4-e64b-50be-b11d-ae03e72030fd",
 		Name:  "level_complete",
 		Props: map[string]any{"blob": strings.Repeat("compressible-", 200)},
 	}); err != nil {

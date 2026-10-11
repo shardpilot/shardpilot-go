@@ -30,7 +30,7 @@ type Purchase struct {
 	UserID      string
 	AnonymousID string
 
-	// EventID is the event's idempotency key, forwarded to Event.ID; empty
+	// EventID is a UUID idempotency key, forwarded to Event.ID; empty
 	// means a fresh id per call, exactly as for Event.ID. The fact layer
 	// collapses rows that share an event_id and nothing else, so a receipt
 	// or webhook handler that can run twice for one purchase — a

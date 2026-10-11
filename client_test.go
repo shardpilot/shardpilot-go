@@ -33,10 +33,10 @@ func TestFlushPublishesQueuedEvents(t *testing.T) {
 	client := newTestClient(t, server.URL)
 	defer client.Close(context.Background())
 
-	if err := client.Enqueue(Event{ID: "evt-1", Name: "queued_one"}); err != nil {
+	if err := client.Enqueue(Event{ID: "2b86aef7-b63e-5a03-b3dd-b7f78898568b", Name: "queued_one"}); err != nil {
 		t.Fatalf("enqueue first: %v", err)
 	}
-	if err := client.Enqueue(Event{ID: "evt-2", Name: "queued_two"}); err != nil {
+	if err := client.Enqueue(Event{ID: "a2dd3b16-4a48-5886-bcb1-a2c9391711af", Name: "queued_two"}); err != nil {
 		t.Fatalf("enqueue second: %v", err)
 	}
 
@@ -371,7 +371,7 @@ func TestEnqueueSnapshotsMutableEventMaps(t *testing.T) {
 	props := map[string]any{"level": "before", "score": 10}
 	eventContext := map[string]any{"surface": "menu", "online": true}
 	if err := client.Enqueue(Event{
-		ID:      "evt-mutable",
+		ID:      "93584cd8-b570-5fb5-81ff-383feced3e8f",
 		Name:    "mutable_event",
 		Props:   props,
 		Context: eventContext,
@@ -430,10 +430,10 @@ func TestInvalidQueuedBuildErrorDoesNotBlockLaterValidEvents(t *testing.T) {
 		transport: transport,
 	}
 
-	if !client.queue.enqueue(Event{ID: "evt-invalid", Name: " "}) {
+	if !client.queue.enqueue(Event{ID: "9909a262-cc9a-5729-a0b2-7daf2e7a482d", Name: " "}) {
 		t.Fatal("expected invalid internal enqueue to succeed")
 	}
-	if !client.queue.enqueue(Event{ID: "evt-valid", Name: "valid"}) {
+	if !client.queue.enqueue(Event{ID: "73a5f68d-34ee-565e-bfd2-04b04129c6ff", Name: "valid"}) {
 		t.Fatal("expected valid internal enqueue to succeed")
 	}
 
@@ -475,10 +475,10 @@ func TestPermanentHTTPStatusDoesNotBlockLaterValidEvents(t *testing.T) {
 				transport: transport,
 			}
 
-			if !client.queue.enqueue(Event{ID: "evt-permanent", Name: "permanent_status"}) {
+			if !client.queue.enqueue(Event{ID: "4a1db926-2d9e-5e93-9eed-af944028c155", Name: "permanent_status"}) {
 				t.Fatal("expected permanent-status enqueue to succeed")
 			}
-			if !client.queue.enqueue(Event{ID: "evt-valid", Name: "valid_after_permanent_status"}) {
+			if !client.queue.enqueue(Event{ID: "73a5f68d-34ee-565e-bfd2-04b04129c6ff", Name: "valid_after_permanent_status"}) {
 				t.Fatal("expected valid enqueue to succeed")
 			}
 
@@ -542,13 +542,13 @@ func TestPermanentEncodeErrorDoesNotBlockLaterValidEvents(t *testing.T) {
 	}
 
 	if err := client.Enqueue(Event{
-		ID:    "evt-encode-failure",
+		ID:    "a886a4d2-1748-57e1-a6ff-fc03a4b1222e",
 		Name:  "encode_failure",
 		Props: map[string]any{"bad": func() {}},
 	}); err != nil {
 		t.Fatalf("Enqueue invalid JSON event returned error: %v", err)
 	}
-	if err := client.Enqueue(Event{ID: "evt-valid", Name: "valid_after_encode_failure"}); err != nil {
+	if err := client.Enqueue(Event{ID: "73a5f68d-34ee-565e-bfd2-04b04129c6ff", Name: "valid_after_encode_failure"}); err != nil {
 		t.Fatalf("Enqueue valid event returned error: %v", err)
 	}
 
@@ -594,10 +594,10 @@ func TestFlushAvailableRetainsFailedBatchAndRetries(t *testing.T) {
 		transport: transport,
 	}
 
-	if !client.queue.enqueue(Event{ID: "evt-1", Name: "first"}) {
+	if !client.queue.enqueue(Event{ID: "2b86aef7-b63e-5a03-b3dd-b7f78898568b", Name: "first"}) {
 		t.Fatal("expected first enqueue to succeed")
 	}
-	if !client.queue.enqueue(Event{ID: "evt-2", Name: "second"}) {
+	if !client.queue.enqueue(Event{ID: "a2dd3b16-4a48-5886-bcb1-a2c9391711af", Name: "second"}) {
 		t.Fatal("expected second enqueue to succeed")
 	}
 
@@ -610,7 +610,7 @@ func TestFlushAvailableRetainsFailedBatchAndRetries(t *testing.T) {
 	if transport.calls != 1 {
 		t.Fatalf("expected one publish attempt before retaining failed batch, got %d", transport.calls)
 	}
-	if len(batch) != 1 || batch[0].ID != "evt-1" {
+	if len(batch) != 1 || batch[0].ID != "2b86aef7-b63e-5a03-b3dd-b7f78898568b" {
 		t.Fatalf("expected failed batch to be retained, got %+v", batch)
 	}
 	if len(client.queue.ch) != 1 {
@@ -656,7 +656,7 @@ func TestRetryableHTTPStatusRetainsFailedBatch(t *testing.T) {
 				transport: transport,
 			}
 
-			if !client.queue.enqueue(Event{ID: "evt-retryable", Name: "retryable_status"}) {
+			if !client.queue.enqueue(Event{ID: "e233aa9a-3f05-5e63-8f69-0e75fcbb3aed", Name: "retryable_status"}) {
 				t.Fatal("expected retryable-status enqueue to succeed")
 			}
 			var consentEpoch uint64
@@ -666,7 +666,7 @@ func TestRetryableHTTPStatusRetainsFailedBatch(t *testing.T) {
 			if !errors.As(err, &statusErr) || statusErr.StatusCode != statusCode {
 				t.Fatalf("expected HTTPStatusError %d, got %v", statusCode, err)
 			}
-			if len(batch) != 1 || batch[0].ID != "evt-retryable" {
+			if len(batch) != 1 || batch[0].ID != "e233aa9a-3f05-5e63-8f69-0e75fcbb3aed" {
 				t.Fatalf("expected retryable status batch retained, got %+v", batch)
 			}
 
@@ -714,7 +714,7 @@ func TestPublishWorkerBatchDropsPermanentEncodeFailure(t *testing.T) {
 	var deferUntil time.Time
 	backoffAttempt := 0
 	retained := client.publishWorkerBatch([]Event{{
-		ID:      "evt-encode-failure",
+		ID:      "a886a4d2-1748-57e1-a6ff-fc03a4b1222e",
 		Name:    "encode_failure",
 		Context: map[string]any{"bad": func() {}},
 	}}, &consentEpoch, &deferUntil, &backoffAttempt)
@@ -746,12 +746,12 @@ func TestPublishWorkerBatchRetainsFailedBatch(t *testing.T) {
 		transport: transport,
 	}
 
-	batch := []Event{{ID: "evt-1", Name: "first"}}
+	batch := []Event{{ID: "2b86aef7-b63e-5a03-b3dd-b7f78898568b", Name: "first"}}
 	var consentEpoch uint64
 	var deferUntil time.Time
 	backoffAttempt := 0
 	retained := client.publishWorkerBatch(batch, &consentEpoch, &deferUntil, &backoffAttempt)
-	if len(retained) != 1 || retained[0].ID != "evt-1" {
+	if len(retained) != 1 || retained[0].ID != "2b86aef7-b63e-5a03-b3dd-b7f78898568b" {
 		t.Fatalf("expected worker to retain failed batch, got %+v", retained)
 	}
 	if backoffAttempt != 1 {

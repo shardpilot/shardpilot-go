@@ -38,7 +38,7 @@ func TestTransportDoesNotRetryClientErrors(t *testing.T) {
 	defer client.Close(context.Background())
 
 	err = client.Track(context.Background(), Event{
-		ID:   "evt-bad-request",
+		ID:   "2f774f91-5098-5ea4-ba55-0dee7fc7524e",
 		Name: "server_event",
 	})
 	if err == nil {

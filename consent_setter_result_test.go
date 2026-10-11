@@ -204,7 +204,7 @@ func TestConsentSetterPurgeResult(t *testing.T) {
 				checkSetterResult(t, observeSetter(t, client, ConsentDecisionGranted, false), "", "")
 				waitFor(t, 3*time.Second, "setup grant receipt", func() bool { return state.consentCount() == 1 && (!floor || !client.consentOutbox.pending()) })
 				state.setBatchOutcome(http.StatusServiceUnavailable)
-				if err := client.Enqueue(Event{ID: "retained-event", Name: "screen_view"}); err != nil {
+				if err := client.Enqueue(Event{ID: "faf833f3-59a8-5bd4-8d2f-f4f963896a29", Name: "screen_view"}); err != nil {
 					t.Fatal(err)
 				}
 				if err := client.Flush(context.Background()); err == nil || !spoolFileExists(dir) {

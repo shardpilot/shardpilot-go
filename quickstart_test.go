@@ -35,7 +35,7 @@ func TestQuickstartTypedPurchaseMatchesTheRawShape(t *testing.T) {
 
 	// Keep this call in sync with the README quickstart and examples/basic.
 	err := client.TrackPurchase(context.Background(), Purchase{
-		EventID:  "receipt-7f3a2c",
+		EventID:  "2dfb9dbf-b7fa-5dd1-a311-aa0616c0bd9f",
 		UserID:   "user-1042",
 		Product:  "starter_pack",
 		Amount:   9.99,
@@ -51,7 +51,7 @@ func TestQuickstartTypedPurchaseMatchesTheRawShape(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for the typed quickstart event")
 	}
-	if envelope["event_name"] != "purchase" || envelope["source"] != "backend" || envelope["user_id"] != "user-1042" || envelope["event_id"] != "receipt-7f3a2c" {
+	if envelope["event_name"] != "purchase" || envelope["source"] != "backend" || envelope["user_id"] != "user-1042" || envelope["event_id"] != "2dfb9dbf-b7fa-5dd1-a311-aa0616c0bd9f" {
 		t.Fatalf("typed quickstart envelope = %v", envelope)
 	}
 	props := envelope["props"].(map[string]any)

@@ -254,13 +254,13 @@ func TestTrackPurchaseCarriesTheCallerSuppliedEventID(t *testing.T) {
 	}
 
 	// With the key, a redelivery repeats the id the fact layer collapses on.
-	purchase.EventID = "receipt-7f3a2c"
+	purchase.EventID = "2dfb9dbf-b7fa-5dd1-a311-aa0616c0bd9f"
 	for i := 0; i < 2; i++ {
 		if err := client.TrackPurchase(context.Background(), purchase); err != nil {
 			t.Fatalf("TrackPurchase with EventID: %v", err)
 		}
-		if got := receiveEnvelope(t, envelopes)["event_id"]; got != "receipt-7f3a2c" {
-			t.Fatalf("event_id = %v, want the caller-supplied receipt-7f3a2c", got)
+		if got := receiveEnvelope(t, envelopes)["event_id"]; got != "2dfb9dbf-b7fa-5dd1-a311-aa0616c0bd9f" {
+			t.Fatalf("event_id = %v, want the caller-supplied 2dfb9dbf-b7fa-5dd1-a311-aa0616c0bd9f", got)
 		}
 	}
 }

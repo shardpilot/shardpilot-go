@@ -51,6 +51,7 @@ func TestSenderEvidence(t *testing.T) {
 					}
 					var verdicts []map[string]string
 					large, small := 0, 0
+					sequences := make(map[string]int64)
 					for _, raw := range batch.Events {
 						var event struct {
 							ID       string `json:"event_id"`
@@ -65,10 +66,8 @@ func TestSenderEvidence(t *testing.T) {
 						if event.ID == "" || event.Session == "" || event.Source != "client" || event.Name != "app.screen_view" {
 							t.Fatalf("invalid fixture envelope: %s", raw)
 						}
-						wantSequence := int64(1)
-						if strings.Contains(event.ID, "-batch-second-") {
-							wantSequence = 2
-						}
+						sequences[event.Session]++
+						wantSequence := sequences[event.Session]
 						if event.Sequence != wantSequence {
 							t.Errorf("wire session sequence = %d, want %d for %s", event.Sequence, wantSequence, event.Name)
 						}

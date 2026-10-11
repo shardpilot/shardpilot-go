@@ -93,7 +93,7 @@ defer client.Close(context.Background())
 // verb builds it for you and refuses a purchase that is missing a required
 // field, or a client whose Source is not backend.
 err = client.TrackPurchase(context.Background(), shardpilot.Purchase{
-    EventID:  "receipt-7f3a2c", // idempotency key: a retry of the same purchase reuses it
+    EventID:  "2dfb9dbf-b7fa-5dd1-a311-aa0616c0bd9f", // idempotency key: a retry of the same purchase reuses it
     UserID:   "user-1042",
     Product:  "starter_pack",
     Amount:   9.99,
@@ -105,7 +105,7 @@ err = client.TrackPurchase(context.Background(), shardpilot.Purchase{
 // transaction, reported by the backend that keeps the ledger. EventID is
 // the same kind of idempotency key.
 err = client.EnqueueEconomyTx(shardpilot.EconomyTx{
-    EventID:      "ledger-5c19e2",
+    EventID:      "32e803d2-ee32-55d1-bd93-70e5cff29ed1",
     UserID:       "user-1042",
     Direction:    shardpilot.EconomySink,
     CurrencyType: "gems",
@@ -120,7 +120,7 @@ The purchase again in raw form, for events that have no typed verb yet. It is an
 // The canonical schema requires props.amount, props.currency and
 // props.product; ID is the same idempotency key.
 err = client.Track(context.Background(), shardpilot.Event{
-    ID:     "receipt-7f3a2c",
+    ID:     "2dfb9dbf-b7fa-5dd1-a311-aa0616c0bd9f",
     Name:   "purchase",
     UserID: "user-1042",
     Props: map[string]any{
@@ -291,6 +291,8 @@ A malformed value (free-form text, an email, an IP, a JWT, a raw `user_`/`player
 ## Wire contract
 
 App-first event envelope (`POST {IngestURL}/v1/events:batch`, `Authorization: Bearer <token>`). Each envelope carries `event_id`, `schema_version`, `event_name`, `source`, `event_ts`, `workspace_id`, `app_id`, `environment_id`, and optional `user_id`, `anonymous_id`, `session_id`, `session_sequence`, `platform`, `app_version`, `app_build`, `context`, `props`.
+
+Caller `Event.ID` values (including `Purchase.EventID` and `EconomyTx.EventID`) must be UUIDs: 36 hyphenated hexadecimal characters, version 4, 5 or 7 and RFC variant `8`, `9`, `a` or `b`. Leading/trailing whitespace is trimmed and letters are sent in lowercase. Empty IDs receive a UUIDv7 once at intake, retained across retries. Other values are refused locally with `ErrInvalidEventID` (`invalid_event_id`, also matching `ErrInvalidEvent`); one drop and the diagnostic are recorded without queueing or sending a batch. Map receipt or ledger identifiers to stable UUIDs before supplying them; repeat the same UUID for a retry.
 
 Request bodies over 1 KiB are sent
 **gzip-compressed** with `Content-Encoding: gzip` (batch publishes and consent writes alike). The server's body limit (default 8 MiB) applies to the **uncompressed** body, so compression buys throughput and not headroom — `BatchSize` still governs how large a body gets. A deployment that cannot read the coding answers `400` with detail code `unsupported_content_encoding` (or `invalid_content_encoding` if the stream arrived unreadable); the client latches compression off for the process and re-sends the same batch uncompressed, so an SDK upgrade never outruns a server upgrade. `Config.DisableRequestCompression` opts out entirely.
