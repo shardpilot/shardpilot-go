@@ -3807,7 +3807,7 @@ func TestConsentFloorExpiredCloseRemnantFoldsDiscarded(t *testing.T) {
 	})
 	transport.setFailing(true)
 	client.SetConsent(true) // parked with no observed outcome: gates the final flush
-	if err := client.Enqueue(Event{ID: "0b65d5c3-d1d6-5cc6-888a-a16d221d0adf", Name: "e1", Timestamp: time.Now().Add(-8 * 24 * time.Hour)}); err != nil {
+	if err := enqueueAgedRemnant(t, client, Event{ID: "0b65d5c3-d1d6-5cc6-888a-a16d221d0adf", Name: "e1"}, time.Now().Add(-8*24*time.Hour)); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if err := client.Enqueue(Event{ID: "fe9941e3-cdc7-57d3-8d8e-2e08aa441d89", Name: "e2"}); err != nil {
@@ -5264,7 +5264,7 @@ func TestConsentFloorDuplicateIDExpiredRemnantStillCounted(t *testing.T) {
 
 	// One batch, same id twice: a stale copy past the spool retry-age cap
 	// and a fresh one.
-	if err := client.Enqueue(Event{ID: "53a23f55-9a4a-52d7-b7be-105513ce870f", Name: "e1", Timestamp: time.Now().Add(-8 * 24 * time.Hour)}); err != nil {
+	if err := enqueueAgedRemnant(t, client, Event{ID: "53a23f55-9a4a-52d7-b7be-105513ce870f", Name: "e1"}, time.Now().Add(-8*24*time.Hour)); err != nil {
 		t.Fatalf("Enqueue stale copy: %v", err)
 	}
 	if err := client.Enqueue(Event{ID: "53a23f55-9a4a-52d7-b7be-105513ce870f", Name: "e1"}); err != nil {
@@ -7208,4 +7208,23 @@ func TestLegacyTombstoneOutOrdersEveryGrantItCovers(t *testing.T) {
 	if !ok || back.state != ConsentGranted || !back.unwitnessed || back.unwitnessedAt != markAt {
 		t.Fatalf("this build lost the withheld grant or its stamp: %+v ok=%v", back, ok)
 	}
+}
+
+// Seed the age of an admitted member for teardown accounting tests. The
+// host timestamp cannot age a newly enqueued event's local intake clock.
+func enqueueAgedRemnant(t *testing.T, c *Client, event Event, intake time.Time) error {
+	t.Helper()
+	c.lifecycleMu.Lock()
+	defer c.lifecycleMu.Unlock()
+	prepared, err := c.prepareEvent(event)
+	if err != nil {
+		return err
+	}
+	prepared.delivery = newEventDelivery(intake)
+	prepared.intakeConsentEpoch = c.consentEpoch.Load()
+	if !c.queue.enqueue(prepared) {
+		return ErrQueueFull
+	}
+	c.stats.enqueued.Add(1)
+	return nil
 }

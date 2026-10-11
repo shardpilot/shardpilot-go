@@ -167,8 +167,8 @@ func TestSentinelSparesHostLookalikeEvents(t *testing.T) {
 		// lookalike entry (no authorship flag) passes, the stale-stamped SDK
 		// fact is withheld.
 		chunk := []spoolEntry{
-			{id: "chunk-host", ts: time.Now().UTC().Format(time.RFC3339Nano), raw: round5FactRaw("chunk-host")},
-			{id: "chunk-fact", ts: time.Now().UTC().Format(time.RFC3339Nano), raw: round5FactRaw("chunk-fact"), internalFact: true},
+			{id: "chunk-host", delivery: newEventDelivery(time.Now()), raw: round5FactRaw("chunk-host")},
+			{id: "chunk-fact", delivery: newEventDelivery(time.Now()), raw: round5FactRaw("chunk-fact"), internalFact: true},
 		}
 		kept := client.dropWithdrawnSpoolChunkMembers(chunk)
 		keptIDs := make([]string, 0, len(kept))

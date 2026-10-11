@@ -37,8 +37,8 @@ func TestWithdrawnSpoolRemovalSurvivesFailedSave(t *testing.T) {
 	s := newDiskSpool(cfg)
 	now := time.Now()
 	entries := []spoolEntry{
-		{id: "fact-1", ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw("fact-1"), internalFact: true},
-		{id: "host-1", ts: now.UTC().Format(time.RFC3339Nano), raw: round5HostRaw("host-1")},
+		{id: "fact-1", delivery: newEventDelivery(now), raw: round5FactRaw("fact-1"), internalFact: true},
+		{id: "host-1", delivery: newEventDelivery(now), raw: round5HostRaw("host-1")},
 	}
 	refused, added, _, _, persistFailed := s.append(entries, 0, false, now, func() bool { return true })
 	if refused || len(added) != 2 || persistFailed {
@@ -181,7 +181,7 @@ func TestWithdrawnChunkRequeueIsSkipped(t *testing.T) {
 	cfg := Config{SpoolDir: dir, SpoolMaxEvents: 100, SpoolMaxBytes: 1 << 20}
 	s := newDiskSpool(cfg)
 	now := time.Now()
-	entry := spoolEntry{id: "fact-9", ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw("fact-9"), internalFact: true}
+	entry := spoolEntry{id: "fact-9", delivery: newEventDelivery(now), raw: round5FactRaw("fact-9"), internalFact: true}
 	if refused, added, _, _, _ := s.append([]spoolEntry{entry}, 0, false, now, func() bool { return true }); refused || len(added) != 1 {
 		t.Fatalf("test setup: append failed")
 	}

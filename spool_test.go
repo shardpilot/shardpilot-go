@@ -247,7 +247,7 @@ func readSpoolRecordFile(t *testing.T, dir string) spoolRecordWire {
 	}
 	record := spoolRecordWire{Version: spoolRecordVersion, RetryAfterUntilMS: doc.retryAfterUntilMS}
 	for _, entry := range doc.live() {
-		record.Events = append(record.Events, spoolEventWire{Raw: entry.raw, InternalFact: entry.internalFact})
+		record.Events = append(record.Events, entry.wire())
 	}
 	return record
 }
@@ -308,7 +308,7 @@ func writeSpoolRecordFile(t *testing.T, dir string, deadlineMS int64, envelopes 
 	}
 	events := make([]spoolEventWire, 0, len(envelopes))
 	for _, raw := range envelopes {
-		events = append(events, spoolEventWire{Raw: raw})
+		events = append(events, spoolEntryFromEnvelope(t, raw).wire())
 	}
 	record := spoolRecordWire{Version: spoolRecordVersion, Events: events, RetryAfterUntilMS: deadlineMS}
 	payload, err := json.Marshal(record)
@@ -1485,8 +1485,8 @@ func TestSpoolSharedDirMergePreservesSiblingRecords(t *testing.T) {
 	allowed := func() bool { return true }
 	now := time.Now()
 
-	e1 := spoolEntry{id: "evt-shared-1", ts: now.UTC().Format(time.RFC3339Nano), raw: spoolTestEnvelope(t, "evt-shared-1", now)}
-	e2 := spoolEntry{id: "evt-shared-2", ts: now.UTC().Format(time.RFC3339Nano), raw: spoolTestEnvelope(t, "evt-shared-2", now)}
+	e1 := spoolEntry{id: "evt-shared-1", delivery: newEventDelivery(now), raw: spoolTestEnvelope(t, "evt-shared-1", now)}
+	e2 := spoolEntry{id: "evt-shared-2", delivery: newEventDelivery(now), raw: spoolTestEnvelope(t, "evt-shared-2", now)}
 
 	// Interleaved appends from two instances: each save reloads and merges,
 	// so neither writer's records are silently dropped by the other's
@@ -1687,7 +1687,7 @@ func TestSpoolMergeCapEvictionSettlesMirror(t *testing.T) {
 	allowed := func() bool { return true }
 	now := time.Now()
 	entry := func(id string) spoolEntry {
-		return spoolEntry{id: id, ts: now.UTC().Format(time.RFC3339Nano), raw: spoolTestEnvelope(t, id, now)}
+		return spoolEntry{id: id, delivery: newEventDelivery(now), raw: spoolTestEnvelope(t, id, now)}
 	}
 
 	// A persists two, B adds a third (the shared cap is 3), then A appends a
@@ -1754,11 +1754,11 @@ func TestSpoolAppendExpiresPreAgedEnvelopes(t *testing.T) {
 	client := newSpoolTestClient(t, server.URL, dir, recorder, nil)
 	client.SetConsent(true)
 
-	// The event's caller-supplied timestamp is already older than the 7-day
-	// retry cap when the batch fails: the retention bound is enforced at
+	// The local intake clock is already older than the seven-day cap
+	// when the batch fails: the retention bound is enforced at
 	// APPEND — the envelope dead-letters as expired and never lands on disk.
 	request, err := client.buildBatch([]Event{
-		{ID: "evt-preaged-1", Name: "e1", Timestamp: time.Now().Add(-8 * 24 * time.Hour)},
+		{ID: "evt-preaged-1", Name: "e1", Timestamp: time.Now(), delivery: newEventDelivery(time.Now().Add(-8 * 24 * time.Hour))},
 	})
 	if err != nil {
 		t.Fatalf("buildBatch: %v", err)
@@ -1777,10 +1777,10 @@ func TestSpoolAppendExpiresPreAgedEnvelopes(t *testing.T) {
 		t.Fatalf("expected SpoolExpired=1 and Spooled=0, got %+v", stats)
 	}
 
-	// A future-dated envelope beyond the skew tolerance fails the same way,
+	// A future-dated local clock fails the same way,
 	// while a fresh one in the same batch still spools.
 	request, err = client.buildBatch([]Event{
-		{ID: "evt-future-1", Name: "e2", Timestamp: time.Now().Add(2 * time.Hour)},
+		{ID: "evt-future-1", Name: "e2", Timestamp: time.Now(), delivery: newEventDelivery(time.Now().Add(2 * time.Hour))},
 		{ID: "evt-fresh-1", Name: "e3"},
 	})
 	if err != nil {
@@ -1896,6 +1896,7 @@ func TestSpoolOversizedRecordDiscardedWithoutFullLoad(t *testing.T) {
 	recorder := &spoolDeadLetterRecorder{}
 	client := newSpoolTestClient(t, server.URL, dir, recorder, func(cfg *Config) {
 		cfg.SpoolMaxBytes = 4096
+		cfg.SpoolMaxEvents = len(envelopes)
 	})
 	if spoolFileExists(dir) {
 		t.Fatalf("expected the over-limit record discarded at load")
@@ -2447,9 +2448,9 @@ func TestSpoolCapacityDeadLetterDeferredUntilEvictionDurable(t *testing.T) {
 	breakSpoolWrites(client.spool, injectedErr)
 	now := time.Now()
 	_, added, _, evicted, persistFailed := client.spool.append([]spoolEntry{{
-		id:  "evt-defer-2",
-		ts:  now.UTC().Format(time.RFC3339Nano),
-		raw: spoolTestEnvelope(t, "evt-defer-2", now),
+		id:       "evt-defer-2",
+		delivery: newEventDelivery(now),
+		raw:      spoolTestEnvelope(t, "evt-defer-2", now),
 	}}, 0, false, now, func() bool { return true })
 	if len(added) != 1 || !persistFailed {
 		t.Fatalf("expected the over-cap append accepted with a failed rewrite, got added=%d persistFailed=%v", len(added), persistFailed)
@@ -3021,7 +3022,7 @@ func TestSpoolDuplicateAppendRetriesDirtyWrite(t *testing.T) {
 	dir := t.TempDir()
 	s := newDiskSpool(Config{SpoolDir: dir, SpoolMaxEvents: 8, SpoolMaxBytes: 1 << 20})
 	now := time.Now()
-	entry := spoolEntry{id: "evt-dup-1", ts: now.UTC().Format(time.RFC3339Nano), raw: spoolTestEnvelope(t, "evt-dup-1", now)}
+	entry := spoolEntry{id: "evt-dup-1", delivery: newEventDelivery(now), raw: spoolTestEnvelope(t, "evt-dup-1", now)}
 
 	injectedErr := errors.New("injected rename failure")
 	breakSpoolWrites(s, injectedErr)
@@ -3067,9 +3068,9 @@ func TestSpoolCloseRetriesDirtyWrite(t *testing.T) {
 	breakSpoolWrites(client.spool, injectedErr)
 	now := time.Now()
 	_, added, _, _, persistFailed := client.spool.append([]spoolEntry{{
-		id:  "evt-close-1",
-		ts:  now.UTC().Format(time.RFC3339Nano),
-		raw: spoolTestEnvelope(t, "evt-close-1", now),
+		id:       "evt-close-1",
+		delivery: newEventDelivery(now),
+		raw:      spoolTestEnvelope(t, "evt-close-1", now),
 	}}, 0, false, now, func() bool { return true })
 	if len(added) != 1 || !persistFailed {
 		t.Fatalf("expected the append accepted with a failed write, got added=%d persistFailed=%v", len(added), persistFailed)
@@ -3517,7 +3518,7 @@ func TestSpoolOwedWipeStaysClosedUntilMarkerRemoved(t *testing.T) {
 	if spoolFileExists(dir) {
 		t.Fatalf("expected the record itself wiped")
 	}
-	refused, _, _, _, _ := s.append([]spoolEntry{{id: "evt-owed-new-1", ts: time.Now().UTC().Format(time.RFC3339Nano), raw: json.RawMessage(`{}`)}}, 0, false, time.Now(), func() bool { return true })
+	refused, _, _, _, _ := s.append([]spoolEntry{{id: "evt-owed-new-1", delivery: newEventDelivery(time.Now()), raw: json.RawMessage(`{}`)}}, 0, false, time.Now(), func() bool { return true })
 	if !refused {
 		t.Fatalf("an append must stay refused while the stale marker persists")
 	}
@@ -3545,7 +3546,7 @@ func spoolEntryFromEnvelope(t *testing.T, raw json.RawMessage) spoolEntry {
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		t.Fatalf("unmarshal envelope: %v", err)
 	}
-	return spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: raw}
+	return spoolEntry{id: envelope.EventID, delivery: testDeliveryFromTimestamp(envelope.EventTS), raw: raw}
 }
 
 func TestSpoolReadLimitScalesWithEventCap(t *testing.T) {
@@ -3832,4 +3833,15 @@ func TestStartupWakeStandsDownUnderAPersistedDeferral(t *testing.T) {
 	if client.startupResendWakeAt.IsZero() {
 		t.Fatal("expected an absolute startup deadline once the deferral lapsed")
 	}
+}
+
+// Legacy fixture builders used one time for payload and retention. Keep
+// those existing scenarios' ages explicit in local metadata; new retry
+// tests vary payload time and intake independently.
+func testDeliveryFromTimestamp(ts string) *eventDelivery {
+	at, err := time.Parse(time.RFC3339Nano, ts)
+	if err != nil {
+		return deliveryFromRecord(0, 0)
+	}
+	return newEventDelivery(at)
 }
