@@ -27,15 +27,16 @@ type Stats struct {
 	// A rejection does not increment FailedBatches or change the Flush error.
 	LastError string
 
-	// Disk-spool counters (always zero when Config.SpoolDir is unset).
+	// Spool activity counters. SpoolExpired also counts expired live retries
+	// when Config.SpoolDir is unset.
 	// Spooled counts events durably appended to the spool (survivors only —
 	// an append the caps immediately evicted from is not counted);
 	// SpoolResent counts spooled events re-published from a previous
 	// process's record and confirmed delivered by the response's per-event
 	// verdicts (an event the response marked rejected or consent-suppressed
 	// dead-letters instead of counting); SpoolEvicted counts oldest-first cap
-	// evictions; SpoolExpired counts retry-age-cap drops (older than 7 days,
-	// future-dated beyond the skew tolerance, or undatable); and
+	// evictions; SpoolExpired counts local intake-age and ambiguous-delivery
+	// retry-window drops, including unverifiable persisted clocks; and
 	// SpoolPersistFailed counts failed spool record writes (the in-memory
 	// mirror stays authoritative and the write is retried on the flush
 	// cadence). Every SpoolEvicted/SpoolExpired drop is also reported through

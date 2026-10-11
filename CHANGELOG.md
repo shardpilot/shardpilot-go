@@ -2,6 +2,14 @@
 
 ## v0.8.0-alpha — release preparation (not published)
 
+- Analytics retries retain events for up to seven days from SDK intake,
+  independently of host timestamps. A potentially accepted request without a
+  definitive response starts a durable 15-minute retry window; definite
+  offline failures do not. Expiry preserves the original envelope in an
+  `expired` dead letter and increments `SpoolExpired`, including live retries
+  with disk spooling disabled. Older spool records without local clock metadata
+  expire on reload. Deduplication remains best effort.
+
 - Caller event IDs must be UUID versions 4, 5 or 7 and are normalized to
   lowercase before queueing or delivery. Malformed values return `ErrInvalidEventID` locally,
   with one drop and a diagnostic. This also applies to typed purchase/economy
