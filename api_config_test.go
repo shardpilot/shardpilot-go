@@ -2,6 +2,7 @@ package shardpilot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -136,5 +137,50 @@ func TestAPIConfigRoutesCredentialsAndSeparatesEnablement(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestAPIConfigAttributePrerequisite(t *testing.T) {
+	for _, remote := range []bool{false, true} {
+		for _, attributes := range []bool{false, true} {
+			for _, experiments := range []bool{false, true} {
+				t.Run(fmt.Sprintf("remote=%t/attributes=%t/experiments=%t", remote, attributes, experiments), func(t *testing.T) {
+					app := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						if got := r.URL.Query().Get("geo"); r.URL.Path != "/v1/consent" && (got == "CA") != attributes {
+							t.Errorf("attribute query=%q, enabled=%t", got, attributes)
+						}
+						fmt.Fprint(w, `{"version":1,"values":{"example":true}}`)
+					}))
+					defer app.Close()
+					client, err := NewClient(Config{IngestURL: app.URL, ServiceToken: "service-fixture", PublishableKey: "sp_pub_fixture", AppURL: app.URL,
+						WorkspaceID: "w", AppID: "a", EnvironmentID: "e", Source: SourceBackend, AnonymousID: "synthetic-actor",
+						RemoteConfigEnabled: remote, RemoteConfigAttributesEnabled: attributes, ExperimentsEnabled: experiments, FlushInterval: time.Hour})
+					if client != nil {
+						defer client.Close(context.Background())
+					}
+					if attributes && !remote {
+						if !errors.Is(err, ErrInvalidConfig) || client != nil {
+							t.Fatalf("attributes without remote config: client=%t error=%v", client != nil, err)
+						}
+						return
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					if (client.rc != nil) != remote {
+						t.Fatal("remote-config enablement changed")
+					}
+					if remote {
+						if _, err := client.SetConsent(true); err != nil {
+							t.Fatal(err)
+						}
+						client.SetRemoteConfigAttributes(map[string]string{"geo": "CA"})
+						if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+							t.Fatal(err)
+						}
+					}
+				})
+			}
+		}
 	}
 }

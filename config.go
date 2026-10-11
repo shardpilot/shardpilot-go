@@ -161,9 +161,10 @@ type Config struct {
 	// verbatim: geo, app_version, device_type, install_date, user_segment,
 	// custom_attribute_<name> (names ≤64, values ≤512 bytes, ≤64 attributes,
 	// sorted; out-of-vocabulary keys are dropped client-side). Requires
-	// AppURL. Last-known-good caching stays scope-keyed for value
-	// SERVING — a cached body may reflect the previously sent attribute set
-	// until the next successful fetch (documented v1 limit) — but the
+	// RemoteConfigEnabled, AppURL, and PublishableKey. Last-known-good caching
+	// stays scope-keyed for value SERVING — a cached body may reflect the
+	// previously sent attribute set until the next successful fetch (documented
+	// v1 limit) — but the
 	// cached ETag revalidates ONLY a fetch carrying the SAME attribute
 	// signature: a signature change forces a full fetch, so a shared
 	// publication validator can never 304 a differently-targeted request
@@ -390,6 +391,9 @@ func normalizeConfig(cfg Config) (Config, error) {
 			return Config{}, err
 		}
 		cfg.AppURL = normalized
+	}
+	if cfg.RemoteConfigAttributesEnabled && !cfg.RemoteConfigEnabled {
+		return Config{}, fmt.Errorf("%w: RemoteConfigAttributesEnabled requires RemoteConfigEnabled", ErrInvalidConfig)
 	}
 	if cfg.RemoteConfigEnabled || cfg.ExperimentsEnabled || cfg.RemoteConfigAttributesEnabled {
 		if cfg.AppURL == "" || cfg.PublishableKey == "" {
