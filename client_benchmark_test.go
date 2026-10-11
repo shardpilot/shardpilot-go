@@ -14,6 +14,7 @@ var (
 func BenchmarkEnqueueMapPayload(b *testing.B) {
 	client := &Client{
 		queue: newBoundedQueue(1024),
+		clock: benchmarkClock{t: time.Unix(1700000000, 0).UTC()},
 	}
 	event := benchmarkEvent()
 

@@ -29,8 +29,8 @@ func stageSpooledResendState(t *testing.T, serverURL, spoolDir string) {
 	s := newDiskSpool(Config{SpoolDir: spoolDir, SpoolMaxEvents: 100, SpoolMaxBytes: 1 << 20})
 	now := time.Now()
 	entries := []spoolEntry{
-		{id: "staged-fact", ts: now.UTC().Format(time.RFC3339Nano), raw: round5FactRaw("staged-fact"), internalFact: true},
-		{id: "staged-host", ts: now.UTC().Format(time.RFC3339Nano), raw: round5HostRaw("staged-host")},
+		{id: "staged-fact", delivery: newEventDelivery(now), raw: round5FactRaw("staged-fact"), internalFact: true},
+		{id: "staged-host", delivery: newEventDelivery(now), raw: round5HostRaw("staged-host")},
 	}
 	if refused, added, _, _, persistFailed := s.append(entries, 0, false, now, func() bool { return true }); refused || len(added) != 2 || persistFailed {
 		t.Fatalf("staging the spooled entries failed (refused=%v added=%d persistFailed=%v)", refused, len(added), persistFailed)
@@ -285,7 +285,7 @@ func TestRetrySyncDrainsDeferredSpoolLetters(t *testing.T) {
 	// dead-letter — and the cycle then takes its consent early-return on
 	// the very next line: with no other activity, only the cycle itself
 	// can dispatch the letter.
-	entry := spoolEntry{id: "g15-4-owed", ts: time.Now().UTC().Format(time.RFC3339Nano), raw: round5FactRaw("g15-4-owed"), internalFact: true}
+	entry := spoolEntry{id: "g15-4-owed", delivery: newEventDelivery(time.Now()), raw: round5FactRaw("g15-4-owed"), internalFact: true}
 	client.exp.mu.Lock()
 	client.exp.durablePending[scopedIntentKey("g15-4-scope", "exp-owed")] = expOwedSync{
 		asOf: 1, drop: true, scope: "g15-4-scope", experimentKey: "exp-owed",

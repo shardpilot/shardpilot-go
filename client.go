@@ -1611,6 +1611,7 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 				// before the transport/spool handoff (the same window the
 				// dispatch path closes).
 				request, batch = c.dropWithdrawnBuiltBatch(request, batch, backoffAttempt)
+				request, batch = c.expireBuiltBatch(request, batch)
 			}
 			if len(batch) == 0 {
 				// Every member poisoned or withdrawn: nothing is left to
@@ -1762,6 +1763,7 @@ func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, def
 	// just-built request under a post-sentinel stamp — re-verify the BUILT
 	// pair immediately before the transport/spool handoff.
 	request, batch = c.dropWithdrawnBuiltBatch(request, batch, backoffAttempt)
+	request, batch = c.expireBuiltBatch(request, batch)
 	if len(batch) == 0 {
 		// The whole built batch was withdrawn; the retained wire bytes
 		// described it.
@@ -1898,6 +1900,8 @@ func (c *Client) publishRequestResult(ctx context.Context, request batchRequest,
 		return batchResult{}, ErrConsentDenied
 	}
 
+	ctx, cancelRetry := c.analyticsAttemptContext(ctx, request)
+	defer cancelRetry()
 	result, err := c.transport.Publish(ctx, request)
 	if err != nil {
 		if gate != nil && gate.ctx.Err() != nil && errors.Is(err, context.Canceled) {
@@ -1988,6 +1992,7 @@ func cloneEvent(event Event) Event {
 // delivered-but-timed-out batch into permanent duplicates).
 func (c *Client) prepareEvent(event Event) (Event, error) {
 	event = cloneEvent(event)
+	event.delivery = newEventDelivery(c.clock.Now())
 	if normalizeEventName(event.Name) == "" {
 		return Event{}, ErrEventNameRequired
 	}

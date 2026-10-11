@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptrace"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -430,13 +432,41 @@ func (t *httpTransport) postBody(ctx context.Context, endpoint string, payload [
 		httpRequest.Header.Set(schemaRevisionHeader, schemaRevision)
 	}
 
+	// The trace proves pre-connection failures on the standard transport.
+	// Unknown injected transports fail conservatively: absence of tracing
+	// alone is not evidence that no bytes were sent.
+	var connecting, connected atomic.Bool
+	httpRequest = httpRequest.WithContext(httptrace.WithClientTrace(httpRequest.Context(), &httptrace.ClientTrace{
+		GetConn: func(string) { connecting.Store(true) },
+		GotConn: func(httptrace.GotConnInfo) { connected.Store(true) },
+	}))
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	var finish func(bool)
+	if begin, ok := ctx.Value(analyticsAttemptKey{}).(analyticsAttempt); ok {
+		finish, err = begin()
+		if err != nil {
+			return err
+		}
+	}
+	definitelyNotDelivered := false
+	if finish != nil {
+		defer func() { finish(definitelyNotDelivered) }()
+	}
 	response, err := t.client.Do(httpRequest)
 	if err != nil {
+		var dns *net.DNSError
+		var op *net.OpError
+		definitelyNotDelivered = !connected.Load() && (connecting.Load() || errors.As(err, &dns) || (errors.As(err, &op) && op.Op == "dial"))
 		return fmt.Errorf("send shardpilot ingest request: %w", err)
 	}
 	defer response.Body.Close()
 
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		// A client rejection (including backpressure or gzip refusal) is
+		// definitive non-acceptance. A 5xx may follow a committed write.
+		definitelyNotDelivered = response.StatusCode >= 400 && response.StatusCode < 500
 		return newHTTPStatusError(response)
 	}
 

@@ -38,12 +38,11 @@ import (
 // fresh publishes. A persisted retry_after_until_ms re-seeds the Retry-After
 // deferral with the remaining window (24h clamp).
 //
-// Caps: SpoolMaxEvents / SpoolMaxBytes, evicting OLDEST first — an outage
-// outlasting the spool drops oldest events. Retry-age cap: an event whose
-// age is not provable (undatable), older than spoolRetryAgeCap, or
-// future-dated beyond spoolMaxForwardClockSkew is expired — retention must
-// be provable, so unprovable fails closed. Every drop, whatever the class,
-// is reported through Config.OnSpoolDeadLetter.
+// Caps: SpoolMaxEvents / SpoolMaxBytes evict oldest entries first. Local
+// intake time bounds retention to seven days; an ambiguous delivery starts
+// a separate fifteen-minute retry window. Neither clock uses event_ts.
+// Unprovable local ages expire, including records from older SDK versions.
+// Every spool drop is reported through Config.OnSpoolDeadLetter.
 //
 // Consent: disk participation is strictly grant-only. Writes require the
 // live state granted AND the grant record persisted by this process's
@@ -63,8 +62,8 @@ type SpoolDropReason string
 const (
 	// SpoolDropCapacity: the count or byte cap evicted the oldest events.
 	SpoolDropCapacity SpoolDropReason = "capacity"
-	// SpoolDropExpired: the retry-age cap expired the events (older than 7
-	// days, future-dated beyond the skew tolerance, or undatable).
+	// SpoolDropExpired: the local intake age or ambiguous-delivery retry
+	// window expired, or the persisted clock could not be verified.
 	SpoolDropExpired SpoolDropReason = "expired"
 	// SpoolDropTerminal: a permanent ingest outcome settled previously
 	// spooled events — a batch-level permanent failure, or a per-event
@@ -88,16 +87,9 @@ const (
 	spoolFileName      = "spool.json"
 	spoolRecordVersion = 2
 
-	// spoolRetryAgeCap bounds how long an undelivered event may wait in the
-	// spool, mirroring the crash-plane retention contract; age derives from
-	// the envelope's event_ts (stamped once at intake).
+	// spoolRetryAgeCap bounds total retention from local intake, including
+	// definite offline time. Host event_ts overrides cannot extend it.
 	spoolRetryAgeCap = 7 * 24 * time.Hour
-
-	// spoolMaxForwardClockSkew bounds how far in the FUTURE an event_ts may
-	// sit before the record is treated as expired: an untrusted timestamp
-	// must not stretch the retention bound (worst case is the cap plus this
-	// hour), while ordinary clock corrections are absorbed.
-	spoolMaxForwardClockSkew = time.Hour
 
 	// spoolMaxDeferralSeed clamps the deferral re-seeded from a persisted
 	// retry_after_until_ms, matching the ingest plane's Retry-After clamp so
@@ -165,11 +157,14 @@ type spoolRecordWire struct {
 
 // spoolEventWire is one persisted spool entry: the envelope's exact wire
 // bytes (joined verbatim on resend — byte identity is the de-dupe contract)
-// and the internal experiment-fact flag, so a reloaded record can tell this
+// with local intake/retry clocks and the internal experiment-fact flag,
+// so a reloaded record can tell this
 // SDK's own facts from host events that merely resemble them.
 type spoolEventWire struct {
-	Raw          json.RawMessage `json:"raw"`
-	InternalFact bool            `json:"internal_fact,omitempty"`
+	IntakeUnixMS    int64           `json:"intake_unix_ms"`
+	AmbiguousUnixMS int64           `json:"ambiguous_unix_ms,omitempty"`
+	Raw             json.RawMessage `json:"raw"`
+	InternalFact    bool            `json:"internal_fact,omitempty"`
 	// Drop names an id this run evicted. A line carrying it is a RECORDED
 	// DECISION rather than an event: it has no envelope, and the reader
 	// applies it instead of re-deriving that the eviction must have
@@ -234,17 +229,17 @@ const spoolCompactionSlack = 3
 const spoolHeaderAllowance = 4 << 10
 
 // spoolEnvelopeWire is the minimal per-envelope parse a loaded record needs:
-// the de-duplication/ack key and the age source.
+// the de-duplication/ack key and the unchanged payload timestamp.
 type spoolEnvelopeWire struct {
 	EventID string `json:"event_id"`
 	EventTS string `json:"event_ts"`
 }
 
-// spoolEntry is one spooled envelope: its id (ack/de-dup key), its event_ts
-// (age source), and its exact wire bytes.
+// spoolEntry is one envelope: its ID, local delivery clocks and exact bytes.
 type spoolEntry struct {
+	delivery *eventDelivery
+
 	id  string
-	ts  string
 	raw json.RawMessage
 
 	// expFactEpoch is the real-subjects purge generation the entry's batch
@@ -266,20 +261,10 @@ type spoolEntry struct {
 	internalFact bool
 }
 
-// spoolEntryExpired applies the retry-age cap: expired when the event_ts is
-// unparseable or missing (retention must be provable — undatable fails
-// closed), older than the cap, or future-dated beyond the skew tolerance.
-// An entry without an event_id is also unusable (it could never be acked or
-// de-duplicated) and fails the same way.
+// spoolEntryExpired uses local intake and ambiguous-attempt clocks only.
+// Missing metadata (including legacy records) cannot prove safe retry age.
 func spoolEntryExpired(entry spoolEntry, now time.Time) bool {
-	if entry.id == "" {
-		return true
-	}
-	ts, err := time.Parse(time.RFC3339Nano, entry.ts)
-	if err != nil {
-		return true
-	}
-	return ts.Before(now.Add(-spoolRetryAgeCap)) || ts.After(now.Add(spoolMaxForwardClockSkew))
+	return entry.id == "" || entry.delivery.expired(now)
 }
 
 // diskSpool is the spool state machine: an in-memory mirror of spool.json
@@ -531,7 +516,7 @@ func (s *diskSpool) renderDocumentLocked(entries []spoolEntry) ([]byte, error) {
 	buf.Write(header)
 	buf.WriteByte('\n')
 	for _, entry := range entries {
-		line, err := json.Marshal(spoolEventWire{Raw: entry.raw, InternalFact: entry.internalFact})
+		line, err := json.Marshal(entry.wire())
 		if err != nil {
 			return nil, err
 		}
@@ -589,7 +574,7 @@ func (s *diskSpool) appendRecordsLocked(entries []spoolEntry, drops []string) (o
 	}
 	var buf bytes.Buffer
 	for _, entry := range entries {
-		line, marshalErr := json.Marshal(spoolEventWire{Raw: entry.raw, InternalFact: entry.internalFact})
+		line, marshalErr := json.Marshal(entry.wire())
 		if marshalErr != nil {
 			return false, nil
 		}
@@ -1273,7 +1258,7 @@ func (doc spoolDocument) live() []spoolEntry {
 func spoolEntryFromWire(wire spoolEventWire) spoolEntry {
 	var envelope spoolEnvelopeWire
 	_ = json.Unmarshal(wire.Raw, &envelope)
-	return spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: wire.Raw, internalFact: wire.InternalFact}
+	return spoolEntry{id: envelope.EventID, raw: wire.Raw, internalFact: wire.InternalFact, delivery: deliveryFromRecord(wire.IntakeUnixMS, wire.AmbiguousUnixMS)}
 }
 
 // readLimitLocked bounds what the loader will read.
@@ -1291,7 +1276,7 @@ func spoolEntryFromWire(wire spoolEventWire) spoolEntry {
 // SpoolMaxBytes bounds the DELIVERABLE backlog, and the file holding it may
 // reach about 1.5x that.
 func (s *diskSpool) readLimitLocked() int64 {
-	live := int64(s.maxBytes) + 40*int64(s.maxEvents)
+	live := int64(s.maxBytes) + 128*int64(s.maxEvents)
 
 	return live*spoolCompactionSlack/2 + spoolRecordReadOverhead
 }
@@ -1355,7 +1340,7 @@ func (s *diskSpool) load(now time.Time) spoolLoadOutcome {
 	// caps reproduces the writing run's cut; the configured caps, applied by
 	// the existing re-cap below, can then only shrink it further.
 	for _, entry := range doc.live() {
-		record.Events = append(record.Events, spoolEventWire{Raw: entry.raw, InternalFact: entry.internalFact})
+		record.Events = append(record.Events, entry.wire())
 	}
 	// A recovered tear, or a v2 file, owes the reconcile rewrite before
 	// anything may extend the file. load's own rewrite settles it.
@@ -1408,7 +1393,7 @@ func (s *diskSpool) load(now time.Time) spoolLoadOutcome {
 	for _, wire := range record.Events {
 		var envelope spoolEnvelopeWire
 		_ = json.Unmarshal(wire.Raw, &envelope)
-		entry := spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: wire.Raw, internalFact: wire.InternalFact}
+		entry := spoolEntry{id: envelope.EventID, raw: wire.Raw, internalFact: wire.InternalFact, delivery: deliveryFromRecord(wire.IntakeUnixMS, wire.AmbiguousUnixMS)}
 		if _, isWithdrawn := withdrawnIDs[entry.id]; isWithdrawn {
 			// A previous process withdrew this envelope (the real-subjects
 			// sentinel) but exited before the clean rewrite landed: honor
@@ -1502,8 +1487,8 @@ func (s *diskSpool) evictOverCapsLocked() []spoolEntry {
 // spool lock so an append can never race a consent purge into re-creating a
 // condemned record (SetConsent stores the denied state before its purge
 // takes this lock). The retry-age cap is enforced AT APPEND, not just at
-// load: an envelope already expired (or future-dated beyond the skew
-// tolerance) when it fails is returned as expired and never lands on disk —
+// load: an envelope whose local retention or retry clock has expired
+// when it fails is returned as expired and never lands on disk —
 // the documented retention bound holds without waiting for a restart.
 // De-duplicated by event_id; oldest-first eviction may reach into the batch
 // being appended, in which case only the survivors count as durably spooled.
@@ -2055,7 +2040,7 @@ func spoolEntriesFromRequest(request batchRequest) []spoolEntry {
 	}
 	entries := make([]spoolEntry, 0, len(request.Events))
 	for i, envelope := range request.Events {
-		entries = append(entries, spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: request.rawEvents[i], internalFact: envelope.internalIdentityFact})
+		entries = append(entries, spoolEntry{id: envelope.EventID, raw: request.rawEvents[i], internalFact: envelope.internalIdentityFact, delivery: envelope.delivery})
 	}
 	return entries
 }
@@ -2067,7 +2052,7 @@ func spoolChunkRequest(chunk []spoolEntry) batchRequest {
 	for i, entry := range chunk {
 		raws[i] = entry.raw
 	}
-	return batchRequest{rawEvents: raws}
+	return batchRequest{rawEvents: raws, retryEntries: chunk}
 }
 
 func spoolEntryIDs(chunk []spoolEntry) []string {
@@ -2117,12 +2102,19 @@ func (c *Client) notifySpoolDeadLetter(reason SpoolDropReason, entries []spoolEn
 }
 
 // recordSpoolExpired counts and dead-letters retry-age expiries.
-func (c *Client) recordSpoolExpired(expired []spoolEntry) {
-	if len(expired) == 0 {
-		return
+func (c *Client) recordSpoolExpired(expired []spoolEntry) int {
+	report := make([]spoolEntry, 0, len(expired))
+	for _, entry := range expired {
+		if entry.delivery == nil || entry.delivery.expiredReported.CompareAndSwap(false, true) {
+			report = append(report, entry)
+		}
 	}
-	c.stats.spoolExpired.Add(uint64(len(expired)))
-	c.notifySpoolDeadLetter(SpoolDropExpired, expired)
+	if len(report) == 0 {
+		return 0
+	}
+	c.stats.spoolExpired.Add(uint64(len(report)))
+	c.notifySpoolDeadLetter(SpoolDropExpired, report)
+	return len(report)
 }
 
 func (c *Client) recordSpoolPersistFailure() {
@@ -2189,7 +2181,7 @@ func (c *Client) partitionSpoolEligible(request batchRequest) (eligible, refused
 	for i, envelope := range request.Events {
 		// The request's purge-epoch stamp rides each entry: the sentinel's
 		// spool sweep spares entries born at its own epoch.
-		entry := spoolEntry{id: envelope.EventID, ts: envelope.EventTS, raw: request.rawEvents[i], expFactEpoch: request.expPurgeEpoch, internalFact: envelope.internalIdentityFact}
+		entry := spoolEntry{id: envelope.EventID, raw: request.rawEvents[i], expFactEpoch: request.expPurgeEpoch, internalFact: envelope.internalIdentityFact, delivery: envelope.delivery}
 		if c.spoolActorEligible(envelope) {
 			eligible = append(eligible, entry)
 		} else {
@@ -2566,6 +2558,7 @@ func (c *Client) resendSpooledChunks(deferUntil *time.Time, backoffAttempt *int)
 		// reach (see dropWithdrawnSpoolChunkMembers).
 		chunk = c.dropWithdrawnSpoolChunkMembers(chunk)
 		chunk = c.dropKeyWithdrawnSpoolChunkMembers(chunk, pulledAt)
+		chunk = c.expireResendChunk(chunk)
 		if len(chunk) == 0 {
 			continue
 		}
@@ -2661,6 +2654,7 @@ func (c *Client) flushSpooledChunks(ctx context.Context, backoffAttempt *int) er
 		// facts through the explicit flush either.
 		chunk = c.dropWithdrawnSpoolChunkMembers(chunk)
 		chunk = c.dropKeyWithdrawnSpoolChunkMembers(chunk, pulledAt)
+		chunk = c.expireResendChunk(chunk)
 		if len(chunk) == 0 {
 			continue
 		}

@@ -540,7 +540,10 @@ the server de-duplicates by `event_id`. Terminal outcomes never spool, and
 synchronous `Track` failures never spool. Facts:
 
 - **Caps and drops**: 2000 events / 1 MiB by default (oldest evicted first),
-  plus a 7-day retry-age expiry; every event the spool drops undelivered
+  plus a seven-day local intake-age cap and a 15-minute retry window after
+  an ambiguous delivery. Definite offline failures do not start that window;
+  host event timestamps cannot extend either clock. Old records without local
+  clock metadata expire. Deduplication is best effort; every event dropped undelivered
   (capacity, expiry, terminal outcome, consent) fires
   `Config.OnSpoolDeadLetter`. `Stats.Spooled` counts only durably written
   events.

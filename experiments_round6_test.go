@@ -330,8 +330,8 @@ func TestWithdrawnMatchingIsTypedNotSubstring(t *testing.T) {
 // derives) carries no honest time and must not order eviction or aging.
 func TestSpoolAgingUsesEventTSNotID(t *testing.T) {
 	deterministicID := expStubFactID(strings.Repeat("b", 32))
-	old := spoolEntry{id: deterministicID, ts: time.Now().Add(-8 * 24 * time.Hour).UTC().Format(time.RFC3339Nano), raw: []byte(`{}`)}
-	fresh := spoolEntry{id: deterministicID, ts: time.Now().UTC().Format(time.RFC3339Nano), raw: []byte(`{}`)}
+	old := spoolEntry{id: deterministicID, delivery: newEventDelivery(time.Now().Add(-8 * 24 * time.Hour)), raw: []byte(`{}`)}
+	fresh := spoolEntry{id: deterministicID, delivery: newEventDelivery(time.Now()), raw: []byte(`{}`)}
 	if !spoolEntryExpired(old, time.Now()) {
 		t.Fatalf("an old event_ts must expire regardless of the id")
 	}

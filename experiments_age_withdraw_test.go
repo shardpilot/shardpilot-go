@@ -1058,7 +1058,7 @@ func TestAnAgeRefusalCancelsAFrozenCaptureOfTheExperiment(t *testing.T) {
 		raw := `{"event_id":"` + id + `","event_ts":"` + time.Now().UTC().Format(time.RFC3339Nano) +
 			`","event_name":"experiment_exposure","props":{"experiment_key":"` + experimentKey +
 			`","assignment_key":"` + ageGoldenFactKey(t) + `"}}`
-		return spoolEntry{id: id, ts: time.Now().UTC().Format(time.RFC3339Nano), raw: json.RawMessage(raw), internalFact: true}
+		return spoolEntry{id: id, delivery: newEventDelivery(time.Now()), raw: json.RawMessage(raw), internalFact: true}
 	}
 	e := rig.client.exp
 	e.mu.Lock()

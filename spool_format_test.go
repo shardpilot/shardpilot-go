@@ -38,7 +38,7 @@ func formatAppendPadded(t *testing.T, s *diskSpool, id string, now time.Time, pa
 	raw := spoolTestEnvelope(t, id, now)
 	inflated := append([]byte(nil), raw[:len(raw)-1]...)
 	inflated = append(inflated, []byte(fmt.Sprintf(`,"pad":%q}`, strings.Repeat("x", pad)))...)
-	entry := spoolEntry{id: id, ts: now.UTC().Format(time.RFC3339Nano), raw: inflated}
+	entry := spoolEntry{id: id, delivery: newEventDelivery(now), raw: inflated}
 	refused, _, _, _, persistFailed := s.append([]spoolEntry{entry}, 0, false, now, func() bool { return true })
 	if refused || persistFailed {
 		t.Fatalf("append %s: refused=%v persistFailed=%v", id, refused, persistFailed)
@@ -47,7 +47,7 @@ func formatAppendPadded(t *testing.T, s *diskSpool, id string, now time.Time, pa
 
 func formatAppend(t *testing.T, s *diskSpool, id string, now time.Time) {
 	t.Helper()
-	entry := spoolEntry{id: id, ts: now.UTC().Format(time.RFC3339Nano), raw: spoolTestEnvelope(t, id, now)}
+	entry := spoolEntry{id: id, delivery: newEventDelivery(now), raw: spoolTestEnvelope(t, id, now)}
 	refused, _, _, _, persistFailed := s.append([]spoolEntry{entry}, 0, false, now, func() bool { return true })
 	if refused || persistFailed {
 		t.Fatalf("append %s: refused=%v persistFailed=%v", id, refused, persistFailed)
@@ -368,7 +368,7 @@ func TestV2FileStillLoads(t *testing.T) {
 	legacy := spoolRecordWire{Version: spoolRecordVersion}
 	for i := 0; i < 3; i++ {
 		id := fmt.Sprintf("evt-v2-%d", i)
-		legacy.Events = append(legacy.Events, spoolEventWire{Raw: spoolTestEnvelope(t, id, now)})
+		legacy.Events = append(legacy.Events, spoolEntryFromEnvelope(t, spoolTestEnvelope(t, id, now)).wire())
 	}
 	payload, err := json.Marshal(legacy)
 	if err != nil {
@@ -535,7 +535,7 @@ func TestReloadMatchesTheWritersBacklog(t *testing.T) {
 			pad := (round * 37) % 900
 			inflated := append([]byte(nil), raw[:len(raw)-1]...)
 			inflated = append(inflated, []byte(fmt.Sprintf(`,"pad":%q}`, strings.Repeat("x", pad)))...)
-			batch = append(batch, spoolEntry{id: id, ts: now.UTC().Format(time.RFC3339Nano), raw: inflated})
+			batch = append(batch, spoolEntry{id: id, delivery: newEventDelivery(now), raw: inflated})
 		}
 		refused, added, _, _, persistFailed := s.append(batch, 0, false, now, func() bool { return true })
 		if refused || persistFailed {
@@ -564,7 +564,7 @@ func TestReloadMatchesTheWritersBacklog(t *testing.T) {
 		if round%4 == 3 && len(added) > 0 && len(acked) > 0 {
 			id := acked[len(acked)-1]
 			raw := spoolTestEnvelope(t, id, now)
-			re := []spoolEntry{{id: id, ts: now.UTC().Format(time.RFC3339Nano), raw: raw}}
+			re := []spoolEntry{{id: id, delivery: newEventDelivery(now), raw: raw}}
 			if refused, _, _, _, pf := s.append(re, 0, false, now, func() bool { return true }); refused || pf {
 				t.Fatalf("round %d re-append: refused=%v persistFailed=%v", round, refused, pf)
 			}
@@ -598,7 +598,7 @@ func TestAnEvictionIsReportedExactlyOnce(t *testing.T) {
 		formatAppend(t, s, fmt.Sprintf("evt-once-%d", i), now)
 	}
 	// This one evicts evt-once-0 on the fast path.
-	entry := spoolEntry{id: "evt-once-3", ts: now.UTC().Format(time.RFC3339Nano), raw: spoolTestEnvelope(t, "evt-once-3", now)}
+	entry := spoolEntry{id: "evt-once-3", delivery: newEventDelivery(now), raw: spoolTestEnvelope(t, "evt-once-3", now)}
 	_, _, _, evicted, persistFailed := s.append([]spoolEntry{entry}, 0, false, now, func() bool { return true })
 	if persistFailed {
 		t.Fatalf("append failed")
@@ -650,7 +650,7 @@ func TestFailedCompactionKeepsSyncedAppendsCounted(t *testing.T) {
 	raw := spoolTestEnvelope(t, "evt-cf-1", now)
 	inflated := append(append([]byte(nil), raw[:len(raw)-1]...),
 		[]byte(fmt.Sprintf(`,"pad":%q}`, strings.Repeat("x", 4<<10)))...)
-	entry := spoolEntry{id: "evt-cf-1", ts: now.UTC().Format(time.RFC3339Nano), raw: inflated}
+	entry := spoolEntry{id: "evt-cf-1", delivery: newEventDelivery(now), raw: inflated}
 	_, added, _, _, persistFailed := s.append([]spoolEntry{entry}, 0, false, now, func() bool { return true })
 	if len(added) != 1 {
 		t.Fatalf("added = %d, want 1", len(added))
@@ -731,7 +731,7 @@ func TestOneBatchCannotCrossTheReadBound(t *testing.T) {
 		raw := spoolTestEnvelope(t, id, now)
 		inflated := append(append([]byte(nil), raw[:len(raw)-1]...),
 			[]byte(fmt.Sprintf(`,"pad":%q}`, strings.Repeat("x", 100<<10)))...)
-		return spoolEntry{id: id, ts: now.UTC().Format(time.RFC3339Nano), raw: inflated}
+		return spoolEntry{id: id, delivery: newEventDelivery(now), raw: inflated}
 	}
 
 	// ⚠ THE END STATE IS NOT THE INVARIANT — the compaction that runs after the
@@ -811,14 +811,14 @@ func TestAFreshGenerationInABatchIsTheOneWritten(t *testing.T) {
 	s := formatTestSpool(t, dir, 2000, 1<<20)
 
 	stale := spoolEntry{
-		id:  "evt-gen",
-		ts:  now.Add(-30 * 24 * time.Hour).UTC().Format(time.RFC3339Nano),
-		raw: spoolTestEnvelope(t, "evt-gen", now.Add(-30*24*time.Hour)),
+		id:       "evt-gen",
+		delivery: newEventDelivery(now.Add(-30 * 24 * time.Hour)),
+		raw:      spoolTestEnvelope(t, "evt-gen", now.Add(-30*24*time.Hour)),
 	}
 	fresh := spoolEntry{
-		id:  "evt-gen",
-		ts:  now.UTC().Format(time.RFC3339Nano),
-		raw: spoolTestEnvelope(t, "evt-gen", now),
+		id:       "evt-gen",
+		delivery: newEventDelivery(now),
+		raw:      spoolTestEnvelope(t, "evt-gen", now),
 	}
 	if string(stale.raw) == string(fresh.raw) {
 		t.Fatalf("fixture cannot distinguish the generations — both envelopes are identical")
@@ -935,7 +935,7 @@ func TestIDLessV3RecordIsAccountedNotSwallowed(t *testing.T) {
 
 func formatAppendRaw(t *testing.T, s *diskSpool, id string, now time.Time, raw json.RawMessage) {
 	t.Helper()
-	entry := spoolEntry{id: id, ts: now.UTC().Format(time.RFC3339Nano), raw: raw}
+	entry := spoolEntry{id: id, delivery: newEventDelivery(now), raw: raw}
 	refused, _, _, _, persistFailed := s.append([]spoolEntry{entry}, 0, false, time.Now(), func() bool { return true })
 	if refused || persistFailed {
 		t.Fatalf("append %s: refused=%v persistFailed=%v", id, refused, persistFailed)

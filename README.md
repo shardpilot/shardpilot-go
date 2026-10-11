@@ -18,7 +18,7 @@ Real, tested, working code — **early alpha**. The API is pre-v1 and may change
 - Non-2xx responses surface the server's error envelope on the returned error: `HTTPStatusError` carries the HTTP status plus the machine-readable `ErrorCode`, per-field `Details`, and the parsed `RetryAfter` hint — not just a bare status number.
 - Optional explicit analytics consent (`SetConsent` / `ConsentState`) with a separate `POST {IngestURL}/v1/consent` endpoint.
 - Remote config client (`FetchRemoteConfig` + never-fail typed getters): explicit config fetches with ETag revalidation over a durable last-known-good cache. Requests omit the client-ID path segment unless consent is granted; startup cache restoration uses the matching consent scope. See "Remote config" below.
-- Opt-in bounded disk spool (`Config.SpoolDir`): worker batches that fail retriably survive restarts as byte-identical envelope records (server-deduped by `event_id`; the failed batch retains its built wire bytes, so an in-process retry resends the exact encoding the failure spooled even when the caller mutates nested `Props`/`Context` values after handoff — one encoding per `event_id` for wire, disk, and retry) and resend before fresh events, bounded by count/byte caps (oldest dropped) and a 7-day retry-age cap, with a dead-letter callback for every drop. A resent chunk settles by the response's **per-event verdicts**: only confirmed deliveries count as resent, while a per-event `rejected` or consent-suppressed outcome dead-letters with the matching class (a `202` is not delivery confirmation per event). Disk participation is strictly consent-grant-gated; see "Privacy & consent".
+- Opt-in bounded disk spool (`Config.SpoolDir`): worker batches that fail retriably survive restarts as byte-identical envelope records (best-effort server deduplication by `event_id`; the failed batch retains its built wire bytes, so an in-process retry resends the exact encoding the failure spooled even when the caller mutates nested `Props`/`Context` values after handoff — one encoding per `event_id` for wire, disk, and retry) and resend before fresh events, bounded by count/byte caps (oldest dropped) and a seven-day local intake-age cap plus a 15-minute window after ambiguous delivery, with a dead-letter callback for every drop. A resent chunk settles by the response's **per-event verdicts**: only confirmed deliveries count as resent, while a per-event `rejected` or consent-suppressed outcome dead-letters with the matching class (a `202` is not delivery confirmation per event). Disk participation is strictly consent-grant-gated; see "Privacy & consent".
 - Opt-in `LoadOrCreateAnonymousID(path)` helper for a persisted UUIDv7 anonymous identifier.
 - Crash reporting (`pkg/crash`): sends the canonical crash wire schema to `POST {base}/api/v1/crashes/ingest`, with sanitized breadcrumbs, PII scrubbing, and fatal/non-fatal emit APIs.
 
@@ -260,11 +260,30 @@ Two **default-off** capture opt-ins extend automatic capture (both dark by defau
 | `ConsentFloor` | no | Opt-in client-side consent floor (`&ConsentFloorConfig{}`): consent-first gating (`ErrConsentUnknown` until an explicit decision), a durable consent-receipt outbox under `SpoolDir` (32-cap FIFO, retried until acknowledged, decision-order delivery), the grant-receipt dispatch gate, forced-minor denial semantics, and `Close`'s `ErrConsentPending` durability backstop. Nil (default) keeps the documented server-side posture unchanged. See "Privacy & consent". |
 | `SpoolMaxEvents` | no | Spool count cap, default 2000; the oldest events are dropped past it (via `OnSpoolDeadLetter`). |
 | `SpoolMaxBytes` | no | Spool byte cap over serialized envelopes, default 1 MiB (1,048,576), same oldest-first eviction. |
-| `OnSpoolDeadLetter` | no | `func(SpoolDeadLetter)` called with every event the spool drops undelivered (capacity, 7-day retry-age expiry, terminal outcome, consent purge/refusal). A capacity eviction reports only once the rewrite that removed it durably lands — an eviction a failed rewrite left in the on-disk record is not final yet (a restart would reload and resend it), so its callback defers until it is. Panic-recovered like `OnBatchResult`. |
+| `OnSpoolDeadLetter` | no | `func(SpoolDeadLetter)` called with every event the spool drops undelivered (capacity, local intake/retry expiry, terminal outcome, consent purge/refusal). A capacity eviction reports only once the rewrite that removed it durably lands — an eviction a failed rewrite left in the on-disk record is not final yet (a restart would reload and resend it), so its callback defers until it is. Panic-recovered like `OnBatchResult`. |
 | `DisableRequestCompression` | no | Stops gzip-compressing request bodies. Default `false` — the client **compresses**: a batch body is the same envelope keys repeated per event, so it comes down to a few percent of its size (measured: a 100-event batch, 41.7 KB -> 2.4 KB on the wire, **17x**). Bodies under 1 KiB are sent uncompressed — gzip's 18 bytes of framing make a single-event batch bigger, not smaller — as is any body compression fails to shrink. Cost is ~36 us and 2 allocations per batch. **Where that cost lands depends on which API you call**: an `Enqueue`d batch is published by the background worker, so the caller pays nothing; a synchronous `Track` publishes on the CALLER's goroutine, so a single event whose JSON exceeds the 1 KiB threshold — a large props payload — pays the compression there. Most `Track` events are a few hundred bytes and never cross it. If the server cannot read the coding it says so with a distinct detail code and the client falls back to uncompressed **for the rest of the process** after one rejected request, re-sending the same batch, so pointing a new SDK at an older ingest deployment costs one round-trip rather than dropping data. Set this to skip even that. |
 | `SchemaRevision` | no | Opt-in schema-set revision for a writer released with its schema. Empty by default: no `X-ShardPilot-Schema-Revision` header. An explicit value is sent on `events:batch` only. |
 | `RejectionCapacity` | no | Rejection-history entry cap; default 64 for non-positive values, oldest evicted first. See "Batch verdicts". |
 | `OnBatchResult` | no | `func(BatchResult)` called after each successful batch publish with the server's per-event outcomes. Runs on the publish path (may be called concurrently); keep it fast and non-blocking. A panic inside it is recovered. |
+
+Analytics retention uses SDK intake time, independently of `Event.Timestamp`.
+An offline event can remain queued for up to seven days. DNS, connection and
+pre-send TLS failures do not start the retry-deduplication clock. A request
+that may have been accepted without a definitive response (including a lost
+response or server failure) starts a separate **15-minute** retry window.
+Within that window retries preserve the original ID and envelope bytes; once
+it expires the SDK drops the event and reports `SpoolExpired` and an `expired`
+dead letter. A later connection failure or backpressure response cannot reset
+that clock. This is best-effort deduplication, not an exactly-once guarantee.
+
+Local clocks persist beside the unchanged envelope. Records without valid
+clock metadata, including older spool records, expire rather than receiving a
+new retry window. A backward wall-clock change that puts a stored clock in the
+future also expires the entry. Before resending a stored event, the SDK must
+persist its tentative attempt clock; a failed write prevents that attempt and
+increments `SpoolPersistFailed`. Definite non-delivery clears only that new
+clock. If clearing it cannot be persisted, the conservative clock remains on
+disk until the write succeeds. An abrupt exit during an attempt is ambiguous.
 
 The example programs read these from `SHARDPILOT_*` environment variables; the SDK itself reads no environment variables.
 

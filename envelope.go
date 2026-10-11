@@ -9,6 +9,8 @@ import (
 )
 
 type batchRequest struct {
+	retryEntries []spoolEntry
+
 	Events []eventEnvelope `json:"events"`
 
 	// rawEvents, when non-nil, is the exact wire serialization of the batch's
@@ -51,6 +53,8 @@ func (r batchRequest) MarshalJSON() ([]byte, error) {
 }
 
 type eventEnvelope struct {
+	delivery *eventDelivery
+
 	EventID         string         `json:"event_id"`
 	SchemaVersion   int            `json:"schema_version"`
 	EventName       string         `json:"event_name"`
@@ -86,6 +90,9 @@ type eventEnvelope struct {
 }
 
 func (c *Client) buildEnvelope(event Event) (eventEnvelope, error) {
+	if event.delivery == nil {
+		event.delivery = newEventDelivery(c.clock.Now())
+	}
 	name := normalizeEventName(event.Name)
 	if name == "" {
 		return eventEnvelope{}, fmt.Errorf("%w: event name is required", ErrInvalidEvent)
@@ -136,6 +143,7 @@ func (c *Client) buildEnvelope(event Event) (eventEnvelope, error) {
 		eventTS = event.rawEventTS
 	}
 	return eventEnvelope{
+		delivery:        event.delivery,
 		EventID:         id,
 		SchemaVersion:   1,
 		EventName:       name,
@@ -216,6 +224,11 @@ type poisonedEvent struct {
 // slice and must adopt kept in its place. Reused-prefix members carry bytes
 // already marshaled once and can never poison.
 func (c *Client) buildBatchIsolating(events []Event, retained batchRequest) (request batchRequest, kept []Event, poisoned []poisonedEvent) {
+	for i := range events {
+		if events[i].delivery == nil {
+			events[i].delivery = newEventDelivery(c.clock.Now())
+		}
+	}
 	reuse := len(retained.Events)
 	if reuse > len(events) || len(retained.Events) != len(retained.rawEvents) {
 		reuse = 0
