@@ -311,7 +311,9 @@ A malformed value (free-form text, an email, an IP, a JWT, a raw `user_`/`player
 
 ## Wire contract
 
-App-first event envelope (`POST {IngestURL}/v1/events:batch`, `Authorization: Bearer <token>`). Each envelope carries `event_id`, `schema_version`, `event_name`, `source`, `event_ts`, `workspace_id`, `app_id`, `environment_id`, and optional `user_id`, `anonymous_id`, `session_id`, `session_sequence`, `platform`, `app_version`, `app_build`, `context`, `props`.
+App-first event envelope (`POST {IngestURL}/v1/events:batch`, `Authorization: Bearer <token>`). Ordinary event envelopes carry `event_id`, `schema_version`, `event_name`, `source`, `event_ts`, `workspace_id`, `app_id`, `environment_id`, and optional `user_id`, `anonymous_id`, `session_id`, `session_sequence`, `platform`, `app_version`, `app_build`, `context`, `props`.
+
+SDK-owned experiment exposure and outcome facts use schema major 2 and the literal `workspace_key`, `app_key`, and `environment_key` returned by the platform. The SDK forwards the signed fact values and attestation seal without renaming them to `*_id`. Existing spooled bytes remain unchanged; previously queued major-1 experiment facts are not upgraded or re-signed.
 
 Caller `Event.ID` values (including `Purchase.EventID` and `EconomyTx.EventID`) must be UUIDs: 36 hyphenated hexadecimal characters, version 4, 5 or 7 and RFC variant `8`, `9`, `a` or `b`. Leading/trailing whitespace is trimmed and letters are sent in lowercase. Empty IDs receive a UUIDv7 once at intake, retained across retries. Other values are refused locally with `ErrInvalidEventID` (`invalid_event_id`, also matching `ErrInvalidEvent`); one drop and the diagnostic are recorded without queueing or sending a batch. Map receipt or ledger identifiers to stable UUIDs before supplying them; repeat the same UUID for a retry.
 

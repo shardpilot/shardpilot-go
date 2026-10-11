@@ -64,7 +64,7 @@ func TestCaptureRefusesAnonymousOnlyFactUnderUserScopedFloor(t *testing.T) {
 	// A SEALED record: only a sealed application has a capturable form, so
 	// the capture reaches the spool policy this scene is about.
 	fact := `{"event_id":"` + expStubFactID(strings.Repeat("c", 32)) + `","event_name":"experiment_exposure",` +
-		`"event_ts":"2026-09-27T00:00:00Z","workspace_id":"workspace-test","app_id":"app-test","environment_id":"develop",` +
+		`"event_ts":"2026-09-27T00:00:00Z","workspace_key":"workspace-test","app_key":"app-test","environment_key":"develop",` +
 		`"props":{"experiment_key":"exp-cap","experiment_version":1,"assignment_key":"sfk1_` + strings.Repeat("a", 64) + `",` +
 		`"variant_key":"treatment","assignment_unit":"client_id","attestation":"client_attested"}}`
 	owed := []*expOwedExposure{{entry: entry, session: client.exp.sessionMarker,

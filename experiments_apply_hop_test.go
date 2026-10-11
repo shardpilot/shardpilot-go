@@ -32,7 +32,7 @@ type expApplyStub struct {
 	responses []expScriptResponse
 	requests  []expApplyRequest
 	facts     []map[string]any
-	workspace string // the sealed fact's workspace_id; "" means the test client's
+	workspace string // the sealed fact's workspace_key; "" means the test client's
 	// assignmentKey is the sealed fact's assignment_key (the subject fact
 	// key); "" means the stub's fixed one.
 	assignmentKey string
@@ -123,12 +123,12 @@ func (s *expApplyStub) handler(t *testing.T) http.HandlerFunc {
 				eventName = experimentOutcomeName
 			}
 			fact := map[string]any{
-				"event_id":       expStubFactID(applicationID),
-				"event_name":     eventName,
-				"event_ts":       strings.Replace(eventTime, "Z", "+00:00", 1),
-				"workspace_id":   workspace,
-				"app_id":         body["app_key"],
-				"environment_id": body["environment_key"],
+				"event_id":        expStubFactID(applicationID),
+				"event_name":      eventName,
+				"event_ts":        strings.Replace(eventTime, "Z", "+00:00", 1),
+				"workspace_key":   workspace,
+				"app_key":         body["app_key"],
+				"environment_key": body["environment_key"],
 				"props": map[string]any{
 					"experiment_key":     body["experiment_key"],
 					"experiment_version": body["experiment_version"],
@@ -267,8 +267,8 @@ func TestAnApplicationIsSealedByTheApplyHopAndDeliveredVerbatim(t *testing.T) {
 	}
 	delivered, sealed := facts[0], rig.script.apply.sealedFacts()[0]
 	if delivered["event_id"] != sealed["event_id"] || delivered["event_ts"] != sealed["event_ts"] ||
-		delivered["workspace_id"] != sealed["workspace_id"] || delivered["app_id"] != sealed["app_id"] ||
-		delivered["environment_id"] != sealed["environment_id"] {
+		delivered["workspace_key"] != sealed["workspace_key"] || delivered["app_key"] != sealed["app_key"] ||
+		delivered["environment_key"] != sealed["environment_key"] {
 		t.Fatalf("the envelope must carry the sealed members verbatim:\ndelivered %v\nsealed    %v", delivered, sealed)
 	}
 	sealedProps, _ := json.Marshal(sealed["props"])
@@ -277,7 +277,7 @@ func TestAnApplicationIsSealedByTheApplyHopAndDeliveredVerbatim(t *testing.T) {
 	if !reflect.DeepEqual(delivered["props"], wantProps) {
 		t.Fatalf("the props must be the sealed props exactly:\ndelivered %v\nsealed    %v", delivered["props"], wantProps)
 	}
-	if delivered["attestation_seal"] != expStubSeal || delivered["source"] != "client" ||
+	if delivered["schema_version"] != float64(2) || delivered["attestation_seal"] != expStubSeal || delivered["source"] != "client" ||
 		delivered["anonymous_id"] != "anon-test" || delivered["session_id"] == nil || delivered["user_id"] != nil {
 		t.Fatalf("the envelope must carry the seal and the SDK's own client identity and session: %v", delivered)
 	}
