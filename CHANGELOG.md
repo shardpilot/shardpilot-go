@@ -8,7 +8,9 @@
   `Stats.UnparsedConsentResponses`, or `crash.Client.UnparsedResponses()`;
   partially decoded outcomes are discarded. Unknown response members remain
   accepted. These transports refuse redirects without modifying an injected
-  HTTP client, retry 408, 429 and 5xx, and read bounded error envelopes.
+  HTTP client, classify 408, 429 and 5xx as retryable, and read bounded error
+  envelopes. Ordinary consent stays single-shot; automatic receipt retries
+  remain with the opt-in `ConsentFloor` outbox.
 - Crash retries use exponential backoff with jitter when there is no usable
   `Retry-After`. The header is honored only on 429 and 5xx, in either standard
   form, with the same 24-hour cap as analytics. Caller cancellation still
