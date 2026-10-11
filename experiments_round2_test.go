@@ -326,6 +326,13 @@ func TestRetryableSweepRefusalsDoNotCountDropped(t *testing.T) {
 	// Deny: the purge re-arms the exposure; repeated consent-closed sweep
 	// attempts are retryable and must not inflate Dropped.
 	client.SetConsent(false)
+	// SetConsent fences publication immediately; the worker may still be
+	// retiring an already-dequeued event. Drain that work before measuring
+	// whether the following consent-closed sweeps add any drops.
+	if err := client.Flush(context.Background()); err != nil && !errors.Is(err, ErrConsentDenied) {
+		t.Fatalf("drain after denial: %v", err)
+	}
+
 	droppedAfterDeny := client.Snapshot().Dropped
 	for i := 0; i < 5; i++ {
 		client.experimentCycle(context.Background())
