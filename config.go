@@ -37,9 +37,13 @@ type Config struct {
 
 	// UserID and AnonymousID are optional default actor identity values.
 	// When set, they are used as envelope defaults for events that do not
-	// set their own UserID/AnonymousID, and as the consent actor identifier
-	// for SetConsent (UserID preferred, else AnonymousID). AnonymousID can
-	// be sourced from the opt-in LoadOrCreateAnonymousID helper.
+	// set their own UserID/AnonymousID, and to select the consent actor for
+	// SetConsent: a client source uses AnonymousID (kind anon; its UserID is
+	// self-asserted and never a consent key), and a server or backend source
+	// uses UserID (kind user_verified), else AnonymousID (kind anon). A
+	// client source with a UserID and no AnonymousID cannot grant consent.
+	// AnonymousID can be sourced from the opt-in LoadOrCreateAnonymousID
+	// helper.
 	UserID      string
 	AnonymousID string
 
@@ -220,7 +224,7 @@ type Config struct {
 	//     failure keeps holding — and an empty pipeline is never gated.
 	//   - The floor covers the CONFIGURED identity: an event whose per-event
 	//     UserID/AnonymousID override resolves to a DIFFERENT effective
-	//     actor is refused (ErrConsentActorMismatch) — its actor has no
+	//     consent actor (same rule as SetConsent's actor) is refused (ErrConsentActorMismatch) — its actor has no
 	//     local decision and no receipt. Per-actor decisions beyond the
 	//     configured identity belong to the server-side consent path.
 	//   - The floor requires IN-CONTRACT identifiers: a non-empty

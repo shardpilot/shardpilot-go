@@ -35,6 +35,20 @@
 - Reject `RemoteConfigAttributesEnabled` unless `RemoteConfigEnabled` is also
   enabled; attributes cannot operate without the remote-config client.
 
+- Consent receipts carry the actor `kind`, chosen by one consent actor rule.
+  A client source sends `AnonymousID` as `anon`: its `UserID` is
+  self-asserted and never a consent key, so a client configured with both
+  IDs now records consent for the anonymous ID. A server or backend source
+  sends `UserID` as `user_verified`, else `AnonymousID` as `anon`. A client
+  source with a `UserID` and no `AnonymousID` refuses grants with
+  `ErrInvalidConsentIdentity`; its denial applies locally with the
+  `consent_actor_invalid` warning and no receipt. Under `ConsentFloor` the
+  same rule scopes retained receipts, the persisted decision, the event
+  actor check and spool eligibility: on a client source an event that
+  overrides only `UserID` keeps the consent actor, and the SDK's own
+  experiment facts are covered by the anonymous-scoped decision. A stored
+  receipt without a valid kind is malformed.
+
 ### Migration from `v0.7.2-alpha`
 
 | Previous configuration | Current configuration |
