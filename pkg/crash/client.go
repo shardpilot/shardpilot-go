@@ -166,7 +166,11 @@ func (e *HTTPStatusError) Error() string {
 }
 
 func (e *HTTPStatusError) Retryable() bool {
-	return e.StatusCode == http.StatusRequestTimeout || e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
+	return e.disabledKind() || e.StatusCode == http.StatusRequestTimeout || e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
+}
+
+func (e *HTTPStatusError) disabledKind() bool {
+	return (e.StatusCode == http.StatusBadRequest || e.StatusCode == http.StatusNotFound) && e.ErrorCode == "kind_not_enabled"
 }
 
 func NewClient(opts ClientOptions) (*Client, error) {
@@ -439,11 +443,7 @@ func (c *Client) postOnce(ctx context.Context, payload []byte) (Result, error) {
 
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		body, readErr := io.ReadAll(io.LimitReader(response.Body, maxResponseBodyBytes+1))
-		retryAfter, present := time.Duration(0), false
-		if response.StatusCode == 429 || response.StatusCode >= 500 {
-			retryAfter, present = parseRetryAfter(response.Header.Get("Retry-After"))
-		}
-		statusErr := &HTTPStatusError{StatusCode: response.StatusCode, RetryAfter: retryAfter, retryAfterPresent: present}
+		statusErr := &HTTPStatusError{StatusCode: response.StatusCode}
 		var envelope struct {
 			Error struct {
 				Code string `json:"code"`
@@ -451,6 +451,9 @@ func (c *Client) postOnce(ctx context.Context, payload []byte) (Result, error) {
 		}
 		if readErr == nil && len(body) <= maxResponseBodyBytes && json.Unmarshal(body, &envelope) == nil {
 			statusErr.ErrorCode = envelope.Error.Code
+		}
+		if response.StatusCode == 429 || response.StatusCode >= 500 || statusErr.disabledKind() {
+			statusErr.RetryAfter, statusErr.retryAfterPresent = parseRetryAfter(response.Header.Get("Retry-After"))
 		}
 		c.logf("shardpilot crash ingest failed: %v", statusErr)
 		return Result{}, statusErr

@@ -24,9 +24,11 @@
   envelopes. Ordinary consent stays single-shot; automatic receipt retries
   remain with the opt-in `ConsentFloor` outbox.
 - Crash retries use exponential backoff with jitter when there is no usable
-  `Retry-After`. The header is honored only on 429 and 5xx, in either standard
-  form, with the same 24-hour cap as analytics. Caller cancellation still
-  interrupts the wait.
+  `Retry-After`. Exact structured `kind_not_enabled` on crash 400/404 also
+  retries within the existing call budget, preserving the original encoded
+  report, ID and clocks. The header is honored on this exception and on 429/5xx,
+  in either standard form with a 24-hour cap. Caller cancellation still
+  interrupts the wait; exhausting the call budget returns its failure.
 - Remove the retired `EventStatusObserved` constant. Unrecognized per-event
   status strings are retained for diagnostics without resending the event.
 
