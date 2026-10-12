@@ -38,7 +38,8 @@ type Stats struct {
 	// SpoolResent counts spooled events re-published from a previous
 	// process's record and confirmed delivered by the response's per-event
 	// verdicts (an event the response marked rejected or consent-suppressed
-	// dead-letters instead of counting); SpoolEvicted counts oldest-first cap
+	// dead-letters instead of counting). An unreadable 2xx settles the spool
+	// without incrementing SpoolResent. SpoolEvicted counts oldest-first cap
 	// evictions; SpoolExpired counts local intake-age and ambiguous-delivery
 	// retry-window drops, including unverifiable persisted clocks; and
 	// SpoolPersistFailed counts failed spool record writes (the in-memory

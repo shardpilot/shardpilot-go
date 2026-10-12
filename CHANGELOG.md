@@ -6,7 +6,8 @@
   empty, malformed, truncated, or oversized response body. Unparsed successes
   emit a diagnostic and increment `Stats.UnparsedBatchResponses`,
   `Stats.UnparsedConsentResponses`, or `crash.Client.UnparsedResponses()`;
-  partially decoded outcomes are discarded. Unknown response members remain
+  partially decoded outcomes are discarded. Unreadable spool successes settle
+  without incrementing `Stats.SpoolResent`. Unknown response members remain
   accepted. These transports refuse redirects without modifying an injected
   HTTP client, classify 408, 429 and 5xx as retryable, and read bounded error
   envelopes. Ordinary consent stays single-shot; automatic receipt retries

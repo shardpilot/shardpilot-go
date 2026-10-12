@@ -228,3 +228,90 @@ func TestAPIResponseDefaultDiagnostic(t *testing.T) {
 		})
 	}
 }
+
+func TestAPIResponseSpoolSettlementDiagnostics(t *testing.T) {
+	for _, automatic := range []bool{false, true} {
+		t.Run(fmt.Sprintf("automatic=%t", automatic), func(t *testing.T) {
+			for _, tc := range []struct {
+				name, body string
+				malformed  bool
+				resent     uint64
+				drop       SpoolDropReason
+			}{
+				{name: "empty", malformed: true},
+				{name: "invalid", body: "not json", malformed: true},
+				{name: "null", body: "null", malformed: true},
+				{name: "trailing", body: "{} trailing", malformed: true},
+				{name: "truncated", body: `{"accepted":1}`, malformed: true},
+				{name: "oversized", body: `{}` + strings.Repeat(" ", rcMaxBodyBytes+1), malformed: true},
+				{name: "partial", body: `{"accepted":1,"events":"invalid"}`, malformed: true},
+				{name: "accepted", body: `{"events":[{"event_id":"restart-response","status":"accepted"}]}`, resent: 1},
+				{name: "duplicate", body: `{"events":[{"event_id":"restart-response","status":"duplicate"}]}`, resent: 1},
+				{name: "rejected", body: `{"events":[{"event_id":"restart-response","status":"rejected"}]}`, drop: SpoolDropTerminal},
+				{name: "suppressed", body: `{"events":[{"event_id":"restart-response","status":"suppressed_no_consent"}]}`, drop: SpoolDropConsent},
+				{name: "unknown", body: `{"events":[{"event_id":"restart-response","status":"future_status"}]}`, resent: 1},
+				{name: "missing", body: `{}`, resent: 1},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					var requests atomic.Int32
+					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						requests.Add(1)
+						if r.URL.Path != "/v1/events:batch" || len(wireEventBytes(t, ingestRequestBytes(t, r))) != 1 {
+							t.Error("expected the real restart-loaded event batch")
+						}
+						if tc.name == "truncated" {
+							w.Header().Set("Content-Length", "100")
+						}
+						w.WriteHeader(http.StatusAccepted)
+						fmt.Fprint(w, tc.body)
+					}))
+					defer server.Close()
+					dir := t.TempDir()
+					writeConsentRecordFile(t, dir, "granted")
+					deadline := int64(0)
+					if !automatic {
+						// Keep the automatic worker parked so Flush owns this case.
+						deadline = time.Now().Add(time.Hour).UnixMilli()
+					}
+					writeSpoolRecordFile(t, dir, deadline, spoolTestEnvelope(t, "restart-response", time.Now()))
+					recorder := &spoolDeadLetterRecorder{}
+					settled := make(chan struct{}, 2)
+					client := newSpoolTestClient(t, server.URL, dir, recorder, func(cfg *Config) {
+						cfg.OnBatchResult = func(BatchResult) { settled <- struct{}{} }
+					})
+					defer client.Close(context.Background())
+					if !automatic {
+						if err := client.Flush(context.Background()); err != nil {
+							t.Fatal(err)
+						}
+					}
+					select {
+					case <-settled:
+					case <-time.After(10 * time.Second):
+						t.Fatal("restart-loaded spool did not settle")
+					}
+					if err := client.Close(context.Background()); err != nil {
+						t.Fatal(err)
+					}
+					if requests.Load() != 1 || len(readSpoolRecordFile(t, dir).Events) != 0 {
+						t.Fatal("settled chunk must leave the durable spool without replay")
+					}
+					stats := client.Snapshot()
+					if stats.SpoolResent != tc.resent {
+						t.Errorf("SpoolResent=%d, want %d; unreadable success is settlement, not delivery evidence", stats.SpoolResent, tc.resent)
+					}
+					wantUnparsed := uint64(0)
+					if tc.malformed {
+						wantUnparsed = 1
+					}
+					if stats.UnparsedBatchResponses != wantUnparsed {
+						t.Errorf("unparsed=%d, want %d", stats.UnparsedBatchResponses, wantUnparsed)
+					}
+					if tc.drop == "" && recorder.count() != 0 || tc.drop != "" && len(recorder.byReason(tc.drop)) != 1 {
+						t.Errorf("unexpected dead letters: %+v", recorder.letters)
+					}
+				})
+			}
+		})
+	}
+}
