@@ -81,12 +81,12 @@ func TestLaneSkipsKeysDroppedAfterSnapshot(t *testing.T) {
 // the retired scope's owed DROP.
 func TestOwedDropSurvivesSameKeyWriteAfterRotation(t *testing.T) {
 	script := &expScript{}
-	script.push(200, expAssignedBody("1"))                                                             // exp-checkout @ scope A
-	script.push(200, `{"assigned":false,"reason":"kill_switch"}`)                                      // kill: owed drop @ A (broken storage)
-	script.push(400, `{"error":"experiment metadata must use synthetic local-safe identifiers only"}`) // exp-other: rotation
-	script.push(200, strings.Replace(expAssignedBody("1"), expTestScopeKey, "exp-other", 1))           // remint retry
-	script.push(200, expAssignedBody("2"))                                                             // exp-checkout re-fetched @ scope B: owed WRITE @ B
-	script.push(401, `{"error":"invalid runtime token"}`)                                              // ordinary latch: cancels the owed write
+	script.push(200, expAssignedBody("1"))                                                                                                     // exp-checkout @ scope A
+	script.push(200, `{"assigned":false,"reason":"kill_switch"}`)                                                                              // kill: owed drop @ A (broken storage)
+	script.push(400, `{"error":{"code":"subject_id_invalid","message":"experiment metadata must use synthetic local-safe identifiers only"}}`) // exp-other: rotation
+	script.push(200, strings.Replace(expAssignedBody("1"), expTestScopeKey, "exp-other", 1))                                                   // remint retry
+	script.push(200, expAssignedBody("2"))                                                                                                     // exp-checkout re-fetched @ scope B: owed WRITE @ B
+	script.push(401, `{"error":"invalid runtime token"}`)                                                                                      // ordinary latch: cancels the owed write
 	server := httptest.NewServer(script.handler(t))
 	defer server.Close()
 	spoolDir := t.TempDir()
@@ -239,7 +239,7 @@ func TestStaleServeRequiresMatchingAttributes(t *testing.T) {
 func TestCondemnationTombstoneSurvivesRestart(t *testing.T) {
 	script := &expScript{}
 	script.push(200, expAssignedBody("1"))
-	script.push(403, `{"error":"experiment real-subject assignment is disabled"}`)
+	script.push(403, `{"error":{"code":"real_subjects_disabled","message":"experiment real-subject assignment is disabled"}}`)
 	server := httptest.NewServer(script.handler(t))
 	defer server.Close()
 	spoolDir := t.TempDir()
@@ -386,7 +386,7 @@ func TestRevalidationWithoutEntryDoesNotDispatch(t *testing.T) {
 	client := newExperimentClient(t, server.URL, nil)
 	defer client.Close(context.Background())
 
-	_, err := client.fetchExperimentAssignment(context.Background(), expTestScopeKey, nil, true, nil)
+	_, err := client.fetchExperimentAssignment(context.Background(), expTestScopeKey, nil, true, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "revalidation_entry_vanished") {
 		t.Fatalf("a revalidation for an uncached key must abort, got %v", err)
 	}
@@ -419,7 +419,7 @@ func TestLateLaneSettleAfterCloseHousekeepingIsDiscarded(t *testing.T) {
 	// housekeeping runs.
 	fetchDone := make(chan struct{})
 	go func() {
-		_, _ = client.fetchExperimentAssignment(context.Background(), expTestScopeKey, nil, true, nil)
+		_, _ = client.fetchExperimentAssignment(context.Background(), expTestScopeKey, nil, true, nil, nil)
 		close(fetchDone)
 	}()
 	waitFor(t, 5*time.Second, "the lane fetch reaches the server", func() bool { return script.requestCount() == 2 })

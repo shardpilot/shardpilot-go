@@ -266,7 +266,7 @@ func TestSentinelBatchFilterBackoffAndRetainedBytes(t *testing.T) {
 func TestSentinelClearsExposureDedupe(t *testing.T) {
 	script := &expScript{}
 	script.push(200, expAssignedBody("1"))
-	script.push(403, `{"error":"`+expSentinelRealSubjectsDisabled+`"}`)
+	script.push(403, `{"error":{"code":"`+expSentinelRealSubjectsDisabled+`"}}`)
 	script.push(200, expAssignedBody("1"))
 	capture := &expWireCapture{}
 	server := newExperimentServer(t, script, capture)
@@ -396,7 +396,7 @@ func TestUnexpectedStatusSettlesFenceAndKeepsLatch(t *testing.T) {
 	// A 409-class outcome at a fresh sequence: the fence must settle.
 	e.fetchSeq++
 	seq409 := e.fetchSeq
-	e.installLocked(seq409, scope, expTestScopeKey, expOutcome{transient: true, authoritative: true}, epoch, 1000)
+	e.installLocked(seq409, scope, expTestScopeKey, expOutcome{dropEntry: true, authoritative: true, preserveAuth: true}, epoch, 1000)
 	settled := e.settled[fenceKey]
 	latchedAfter := e.authBlocked
 	e.mu.Unlock()
@@ -412,7 +412,7 @@ func TestUnexpectedStatusSettlesFenceAndKeepsLatch(t *testing.T) {
 	e.authBlocked = true
 	epoch = e.authEpoch
 	e.fetchSeq++
-	e.installLocked(e.fetchSeq, scope, expTestScopeKey, expOutcome{transient: true, authoritative: true}, epoch, 2000)
+	e.installLocked(e.fetchSeq, scope, expTestScopeKey, expOutcome{dropEntry: true, authoritative: true, preserveAuth: true}, epoch, 2000)
 	stillLatched := e.authBlocked
 	// And an older AUTHORITATIVE response behind the settled fence is
 	// discarded: the cache stays exactly as the fence left it.

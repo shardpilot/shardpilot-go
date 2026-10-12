@@ -100,10 +100,10 @@ func TestSubjectFactKeyGrammarGuardsTheFactLane(t *testing.T) {
 }
 
 // Finding 11: unknown assignment units are not installable verdicts.
-func TestUnknownAssignmentUnitIsMalformed(t *testing.T) {
+func TestUnknownAssignmentUnitWithdrawsAssignment(t *testing.T) {
 	body := strings.Replace(expAssignedBody("1"), `"assignment_unit":"client_id"`, `"assignment_unit":"device_cluster"`, 1)
-	if _, _, ok := parseExperimentVerdict(expTestResponse(200, body), expTestRequestScope(), 42); ok {
-		t.Fatalf("an unknown assignment_unit must classify malformed")
+	if result, out, ok := parseExperimentVerdict(expTestResponse(200, body), expTestRequestScope(), 42); !ok || result.Assigned || result.Reason != "unknown" || !out.dropEntry {
+		t.Fatalf("an unknown assignment_unit must withdraw: %+v %+v", result, out)
 	}
 	// And a stored record with one is a miss.
 	entries := sanitizeExperimentEntries(map[string]expEntry{
@@ -142,7 +142,7 @@ func TestRemintRetryHonorsCallerContext(t *testing.T) {
 	script := &expScript{}
 	retryGate := make(chan struct{})
 	script.gates = map[int]chan struct{}{1: retryGate} // request 1 = the remint retry
-	script.push(400, `{"error":"experiment metadata must use synthetic local-safe identifiers only"}`)
+	script.push(400, `{"error":{"code":"subject_id_invalid","message":"experiment metadata must use synthetic local-safe identifiers only"}}`)
 	script.push(200, expAssignedBody("1"))
 	server := httptest.NewServer(script.handler(t))
 	defer server.Close()
@@ -408,9 +408,9 @@ func TestExperimentFilesAreTightened(t *testing.T) {
 func TestSpentBudgetGrammar400DropsEntry(t *testing.T) {
 	script := &expScript{}
 	script.push(200, expAssignedBody("1"))
-	script.push(400, `{"error":"experiment metadata must use synthetic local-safe identifiers only"}`)
+	script.push(400, `{"error":{"code":"subject_id_invalid","message":"experiment metadata must use synthetic local-safe identifiers only"}}`)
 	script.push(200, expAssignedBody("2"))
-	script.push(400, `{"error":"experiment metadata must use synthetic local-safe identifiers only"}`)
+	script.push(400, `{"error":{"code":"subject_id_invalid","message":"experiment metadata must use synthetic local-safe identifiers only"}}`)
 	server := httptest.NewServer(script.handler(t))
 	defer server.Close()
 	spoolDir := t.TempDir()
@@ -442,7 +442,7 @@ func TestScopedOwedIntentsAcrossSubjectRotation(t *testing.T) {
 	script := &expScript{}
 	script.push(200, expAssignedBody("1"))
 	script.push(200, `{"assigned":false,"reason":"kill_switch"}`)
-	script.push(400, `{"error":"experiment metadata must use synthetic local-safe identifiers only"}`)
+	script.push(400, `{"error":{"code":"subject_id_invalid","message":"experiment metadata must use synthetic local-safe identifiers only"}}`)
 	script.push(200, strings.Replace(expAssignedBody("2"), expTestScopeKey, "exp-other", 1))
 	server := httptest.NewServer(script.handler(t))
 	defer server.Close()

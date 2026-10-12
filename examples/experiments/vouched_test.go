@@ -396,7 +396,7 @@ func TestSuppliedPunctuationDoesNotAlterStructure(t *testing.T) {
 func benignMemberDocument(name string) string {
 	switch name {
 	case "error":
-		return `{"error":"x"}`
+		return `{"error":{"code":"invalid_request"}}`
 	case "assigned":
 		return `{"assigned":false}`
 	}

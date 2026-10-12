@@ -3514,16 +3514,18 @@ func TestTheTopLevelExemptionsAreExactlyTheWireMembers(t *testing.T) {
 			}
 			return false
 		}
-		// The error body is an anonymous struct inside `experimentBodyErrorText`.
-		if fd, ok := n.(*ast.FuncDecl); ok && fd.Name.Name == "experimentBodyErrorText" {
-			ast.Inspect(fd, func(m ast.Node) bool {
-				if st, ok := m.(*ast.StructType); ok {
-					for k := range tags(st) {
-						errWire[k] = true
-					}
-				}
-				return true
-			})
+
+		return true
+	})
+	errorSource, err := parser.ParseFile(fset, "../../transport.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ast.Inspect(errorSource, func(n ast.Node) bool {
+		if ts, ok := n.(*ast.TypeSpec); ok && ts.Name.Name == "errorResponseWire" {
+			if st, ok := ts.Type.(*ast.StructType); ok {
+				errWire = tags(st)
+			}
 			return false
 		}
 		return true
@@ -4947,22 +4949,15 @@ func TestTruncationExcusesOnlyWhatTruncationExplains(t *testing.T) {
 	}
 }
 
-// The assignment shape is exempt at 200 and nowhere else.
-//
-// ⚠ "NOT AN ERROR" IS NOT "THE ASSIGNMENT SHAPE".
-// `applyExperimentAssignment` parses `expAssignmentWire` for status 200 and for
-// nothing else, so on a `201` the SDK never decodes that shape — and exempting its
-// member names there marked endpoint-chosen text as generated grammar
-// (shardpilot/shardpilot-go#85 review). The registry has now been wrong about its
-// depth, its membership, its shape, and its STATUS.
-func TestAssignmentExemptionsApplyAtTwoHundredOnly(t *testing.T) {
+// A valid assignment body is parsed throughout 2xx; redirects remain terminal.
+func TestAssignmentExemptionsApplyThroughoutTwoHundreds(t *testing.T) {
 	for _, c := range []struct {
 		head    string
 		exempts bool
 	}{
 		{"HTTP/1.1 200 OK", true},
-		{"HTTP/1.1 201 Created", false},
-		{"HTTP/1.1 204 No Content", false},
+		{"HTTP/1.1 201 Created", true},
+		{"HTTP/1.1 204 No Content", true},
 		{"HTTP/1.1 302 Found", false},
 		{"not a status line", false},
 	} {
@@ -5302,7 +5297,7 @@ func TestTrailingDataIsNotExcusedByTruncation(t *testing.T) {
 //
 // ⚠ FIFTH AXIS THIS REGISTRY HAS BEEN WRONG ABOUT: depth, membership, shape,
 // status, and now WHICH statuses. `applyExperimentAssignment` calls
-// `experimentBodyErrorText` only for the subject-grammar sentinel at 400 and the
+// `experimentBodyErrorCode` only for the subject-grammar sentinel at 400 and the
 // real-subjects sentinel at 403; every other status is classified by the status
 // alone (shardpilot/shardpilot-go#85 review).
 func TestErrorExemptionsApplyOnlyWhereTheEnvelopeIsRead(t *testing.T) {
@@ -5318,7 +5313,7 @@ func TestErrorExemptionsApplyOnlyWhereTheEnvelopeIsRead(t *testing.T) {
 	} {
 		suppliedValues = []string{"error"}
 		structuralSurfaces, accountedSurfaces = nil, nil
-		got := stripMarks(scrubSupplied(dropFraming(c.head + "\r\n\r\n" + `{"error":"anything"}`)))
+		got := stripMarks(scrubSupplied(dropFraming(c.head + "\r\n\r\n" + `{"error":{"code":"anything"}}`)))
 		if printed := strings.Contains(got, `"error"`); printed != c.exempts {
 			t.Errorf("%s: the member name printed=%v, want %v: %q", c.head, printed, c.exempts, got)
 		}
@@ -6351,11 +6346,11 @@ func TestExemptionsNeedTheAssignmentSHAPE(t *testing.T) {
 		{"assigned without an assignment unit",
 			`{"assigned":true,"version":1,"assignment_key":"a","variant_key":"v"}`, false},
 		{"assigned with an unknown unit",
-			`{"assigned":true,"version":1,"assignment_key":"a","variant_key":"v","boundary":{"assignment_unit":"made_up"}}`, false},
+			`{"assigned":true,"version":1,"assignment_key":"a","variant_key":"v","boundary":{"assignment_unit":"made_up"}}`, true},
 		{"a complete assigned verdict",
 			`{"assigned":true,"version":1,"assignment_key":"a","variant_key":"v","boundary":{"assignment_unit":"client_id"}}`, true},
 		{"an unassigned reason outside the set",
-			`{"assigned":false,"reason":"because"}`, false},
+			`{"assigned":false,"reason":"because"}`, true},
 		{"an unassigned reason inside it",
 			`{"assigned":false,"reason":"kill_switch"}`, true},
 	} {
@@ -6504,7 +6499,8 @@ func TestTheLastRoundOfExemptionGatesAndSpans(t *testing.T) {
 		name, body string
 		exempt     bool
 	}{
-		{"a typed envelope", `{"error":"nope"}`, true},
+		{"a typed envelope", `{"error":{"code":"nope"}}`, true},
+		{"a retired flat envelope", `{"error":"nope"}`, false},
 		{"a boolean where the string goes", `{"error":false}`, false},
 	} {
 		suppliedValues = []string{"error"}

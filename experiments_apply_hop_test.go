@@ -351,10 +351,10 @@ func TestAnApplyRefusalDropsTheApplication(t *testing.T) {
 	}
 }
 
-func TestAnAuthRefusalKeepsTheApplicationUntilAnAuthorizedFetch(t *testing.T) {
-	for _, status := range []int{401, 403} {
+func TestApplyDisabledKeepsTheApplicationUntilAnAuthorizedFetch(t *testing.T) {
+	for _, status := range []int{403} {
 		rig := newExpHopRig(t, nil)
-		rig.script.apply.push(status, `{"error":"unauthorized"}`)
+		rig.script.apply.push(status, `{"error":{"code":"experiment_apply_disabled"}}`)
 		rig.script.apply.push(200, expApplyEcho)
 		fetchAssignment(t, rig.client, expTestScopeKey)
 		rig.client.ApplyExperimentVariant(expTestScopeKey)
@@ -376,7 +376,7 @@ func TestAnAuthRefusalKeepsTheApplicationUntilAnAuthorizedFetch(t *testing.T) {
 
 func TestTheRealSubjectsSentinelDropsEveryOwedApplication(t *testing.T) {
 	rig := newExpHopRig(t, nil, expAssignedServedBody(expServedTrio), expServedBodyForKey(expSecondKey))
-	rig.script.apply.push(403, `{"error":"`+expSentinelRealSubjectsDisabled+`"}`)
+	rig.script.apply.push(403, `{"error":{"code":"`+expSentinelRealSubjectsDisabled+`"}}`)
 	fetchAssignment(t, rig.client, expTestScopeKey)
 	fetchAssignment(t, rig.client, expSecondKey)
 	rig.client.ApplyExperimentVariant(expTestScopeKey)
@@ -407,7 +407,7 @@ func TestATransientRefusalKeepsTheApplicationAndHonoursRetryAfter(t *testing.T) 
 	if len(rig.capture.exposures()) != 1 || rig.owed() != 0 {
 		t.Fatalf("after the window the application is sealed and delivered: facts=%d owed=%d", len(rig.capture.exposures()), rig.owed())
 	}
-	for _, status := range []int{429, 500, 302} {
+	for _, status := range []int{429, 500, 408} {
 		rig := newExpHopRig(t, nil)
 		rig.script.apply.push(status, ``)
 		fetchAssignment(t, rig.client, expTestScopeKey)
@@ -557,7 +557,7 @@ func TestAPurgeDuringTheHopDeliversTheApplicationOnce(t *testing.T) {
 // by TrackExperimentExposure is the session's own: a denial that drains it
 // before delivery re-arms it, and the re-grant delivers it.
 func TestAFirstTrackedApplicationAfterASentinelSurvivesADenial(t *testing.T) {
-	rig := newExpHopRig(t, nil, expAssignedServedBody(expServedTrio), `{"error":"`+expSentinelRealSubjectsDisabled+`"}`, expAssignedServedBody(expServedTrio))
+	rig := newExpHopRig(t, nil, expAssignedServedBody(expServedTrio), `{"error":{"code":"`+expSentinelRealSubjectsDisabled+`"}}`, expAssignedServedBody(expServedTrio))
 	rig.script.responses[1].status = 403
 	fetchAssignment(t, rig.client, expTestScopeKey)
 	rig.client.ApplyExperimentVariant(expTestScopeKey)
@@ -926,7 +926,7 @@ func TestAnApplySentinelWithdrawsLikeTheAssignmentRoute(t *testing.T) {
 		}
 	})
 	t.Run("the sentinel withdraws the queued fact and the assignments", func(t *testing.T) {
-		rig := setup(t, 403, `{"error":"`+expSentinelRealSubjectsDisabled+`"}`)
+		rig := setup(t, 403, `{"error":{"code":"`+expSentinelRealSubjectsDisabled+`"}}`)
 		flushOrFail(t, rig.client)
 		if got := len(rig.capture.exposures()); got != 0 {
 			t.Fatalf("a fact queued before the sentinel must not be published after it, got %d", got)

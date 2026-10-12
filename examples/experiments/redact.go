@@ -1236,9 +1236,9 @@ var sdkVerdictFields = map[string]bool{"reason": true}
 //
 // ⚠ NARROWER THAN THE TAXONOMY, BECAUSE THE POSITION IS NARROWER. `sdkTaxonomy`
 // is every string this SDK writes as a classification anywhere; the not-assigned
-// branch allows only `{absent, kill_switch, targeting_unmatched, age_ineligible}` and refuses the
-// body outright for anything else. Vouching the whole taxonomy here says the SDK
-// wrote a value it would have rejected.
+// branch preserves only `{absent, kill_switch, targeting_unmatched, age_ineligible}`.
+// Other raw values map to the generated `unknown` verdict. They remain endpoint
+// input here and must not be vouched merely because the SDK accepts the response.
 // `TestTheReasonValuesAreTheSDKsOwn` reads the constants out of the SDK source.
 var sdkReasonValues = map[string]bool{
 	"kill_switch":         true,
@@ -1291,7 +1291,7 @@ type sdkAssignmentWire struct {
 	VariantKey     string          `json:"variant_key"`
 	VariantPayload map[string]any  `json:"variant_payload"`
 	Reason         json.RawMessage `json:"reason"`
-	SubjectFactKey string          `json:"subject_fact_key"`
+	SubjectFactKey json.RawMessage `json:"subject_fact_key"`
 	Boundary       map[string]any  `json:"boundary"`
 	ServedRevision json.RawMessage `json:"served_revision"`
 	ServedKillGate json.RawMessage `json:"served_kill_gate"`

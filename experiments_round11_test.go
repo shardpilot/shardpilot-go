@@ -541,7 +541,7 @@ func TestExplicitArmSurvivesConsentPurge(t *testing.T) {
 func TestExplicitArmSurvivesSentinelSlateReset(t *testing.T) {
 	script := &expScript{}
 	script.push(200, expAssignedBody("1"))
-	script.push(403, `{"error":"`+expSentinelRealSubjectsDisabled+`"}`)
+	script.push(403, `{"error":{"code":"`+expSentinelRealSubjectsDisabled+`"}}`)
 	script.push(200, expAssignedBody("1"))
 	capture := &expWireCapture{}
 	server := newExperimentServer(t, script, capture)

@@ -623,7 +623,7 @@ func TestUnauthorizedLatchesAndHostFetchUnlatches(t *testing.T) {
 func TestRealSubjectsSentinelDropsDurablyAndDiscardsOwed(t *testing.T) {
 	script := &expScript{}
 	script.push(200, expAssignedBody("1"))
-	script.push(403, `{"error":"experiment real-subject assignment is disabled"}`)
+	script.push(403, `{"error":{"code":"real_subjects_disabled","message":"experiment real-subject assignment is disabled"}}`)
 	server := httptest.NewServer(script.handler(t))
 	defer server.Close()
 	spoolDir := t.TempDir()
@@ -700,9 +700,9 @@ func TestPermanent400DropsCachedEntry(t *testing.T) {
 func TestGrammar400RemintsOncePreservingAttributesAndOwedExposures(t *testing.T) {
 	script := &expScript{}
 	script.push(200, expAssignedBody("1"))
-	script.push(400, `{"error":"experiment metadata must use synthetic local-safe identifiers only"}`)
+	script.push(400, `{"error":{"code":"subject_id_invalid","message":"experiment metadata must use synthetic local-safe identifiers only"}}`)
 	script.push(200, expAssignedBody("2"))
-	script.push(400, `{"error":"experiment metadata must use synthetic local-safe identifiers only"}`)
+	script.push(400, `{"error":{"code":"subject_id_invalid","message":"experiment metadata must use synthetic local-safe identifiers only"}}`)
 	capture := &expWireCapture{}
 	server := newExperimentServer(t, script, capture)
 	defer server.Close()
@@ -1057,7 +1057,7 @@ func TestOrdinaryLatchCancelsOwedWritesKeepsOwedDrops(t *testing.T) {
 func TestOwedWholeRecordClearDemotesOnFreshInstall(t *testing.T) {
 	script := &expScript{}
 	script.push(200, expAssignedBody("1"))
-	script.push(403, `{"error":"experiment real-subject assignment is disabled"}`)
+	script.push(403, `{"error":{"code":"real_subjects_disabled","message":"experiment real-subject assignment is disabled"}}`)
 	script.push(200, expAssignedBody("2"))
 	server := httptest.NewServer(script.handler(t))
 	defer server.Close()

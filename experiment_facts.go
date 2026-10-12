@@ -309,15 +309,15 @@ func (c *Client) emitOwedExposure(ctx context.Context, experimentKey string, rec
 
 // sealExperimentApplication sends one application to the apply endpoint and
 // classifies the answer (the SDK half of the design's disposition table):
-//   - 200 with a sealed fact: sealed;
-//   - 401/403: kept, and the hop pauses until an authorized fetch — except the
-//     real-subjects sentinel, which drops every owed application;
+//   - 2xx with a sealed fact: sealed;
+//   - 403 experiment_apply_disabled: kept until an authorized fetch;
+//   - 403 real_subjects_disabled: drops every owed application;
 //   - 409 not_assigned/age_ineligible: the subject's owed applications of
 //     the experiment are withdrawn and its assignment stops serving
 //     (age_ineligible), as for an age refusal from the assignment route;
-//   - any other 4xx but 408/429: dropped (apply_refused), a poison record
+//   - 3xx and any other 4xx but 408/429: dropped (apply_refused), a poison record
 //     never retries;
-//   - 3xx, 408, 429, 5xx, no response, a 200 without a usable fact: kept,
+//   - 408, 429, 5xx, no response, a 2xx without a usable fact: kept,
 //     paced by the plane's shared Retry-After/backoff deadline.
 func (c *Client) sealExperimentApplication(ctx context.Context, experimentKey string, record *expOwedExposure, owed expOwedCopy) (sealed *expSealedFact, dropped string, keep bool) {
 	e := c.exp
@@ -333,20 +333,20 @@ func (c *Client) sealExperimentApplication(ctx context.Context, experimentKey st
 	}
 	nowMS := c.clock.Now().UnixMilli()
 	switch {
-	case resp.status == 200 && !resp.bodyIncomplete:
+	case resp.status >= 200 && resp.status < 300 && !resp.bodyIncomplete:
 		if parsed := parseSealedExposure(resp.body, owed.eventName()); parsed != nil {
 			e.mu.Lock()
 			e.backoffAttempt = 0
 			e.mu.Unlock()
 			return parsed, "", false
 		}
-	case resp.status == 401 || resp.status == 403:
+	case resp.status == 403 && experimentBodyErrorCode(resp.body, resp.bodyIncomplete) == "experiment_apply_disabled":
 		e.mu.Lock()
-		if resp.status != 403 || experimentBodyErrorText(resp.body, resp.bodyIncomplete) != expSentinelRealSubjectsDisabled {
-			e.applyBlocked = true
-			e.mu.Unlock()
-			return nil, "", true
-		}
+		e.applyBlocked = true
+		e.mu.Unlock()
+		return nil, "", true
+	case resp.status == 403 && experimentBodyErrorCode(resp.body, resp.bodyIncomplete) == expSentinelRealSubjectsDisabled:
+		e.mu.Lock()
 		// The assignment route's sentinel, from the apply route: the same
 		// withdrawal — the latch, the cached and durable assignments, the
 		// owed applications (each counted real_subjects_disabled), and the
@@ -393,16 +393,26 @@ func (c *Client) sealExperimentApplication(ctx context.Context, experimentKey st
 			c.logf("shardpilot experiments: the platform refused an %s for experiment %q (HTTP 409, age_ineligible); withdrew the subject's owed applications and facts of the experiment", owed.kind(), experimentKey)
 		}
 		return nil, expDropAgeIneligible, false
-	case resp.status >= 400 && resp.status < 500 && resp.status != 408 && resp.status != 429:
+	case resp.status >= 300 && resp.status < 500 && resp.status != 408 && resp.status != 429:
 		e.mu.Lock()
+		if resp.status == 409 && !record.withdrawn && owed.entry.SubjectKey == e.currentSubjectIDLocked() {
+			switch experimentBodyErrorCode(resp.body, resp.bodyIncomplete) {
+			case "version_mismatch", "variant_mismatch", "unit_not_recordable":
+				if e.refetchAfterApply == nil {
+					e.refetchAfterApply = make(map[string]*expRefetch)
+				}
+				e.refetchAfterApply[experimentKey] = &expRefetch{SubjectKey: owed.entry.SubjectKey, Attributes: append([]expAttribute(nil), owed.entry.Attributes...), afterFetchSeq: e.fetchSeq}
+				e.revalidateAtMS = nowMS
+			}
+		}
 		owed.countDrop(e, expDropApplyRefused)
 		e.mu.Unlock()
 		c.logf("shardpilot experiments: the platform refused an %s for experiment %q (HTTP %d); dropped (apply_refused)", owed.kind(), experimentKey, resp.status)
 		return nil, expDropApplyRefused, false
 	}
 	seconds, present := 0, false
-	if wait, ok := parseRetryAfter(resp.retryAfterRaw); ok && (resp.status == 429 || resp.status >= 500) {
-		seconds, present = int(wait/time.Second), true
+	if resp.status == 429 || resp.status >= 500 {
+		seconds, present = parseRemoteConfigRetryAfter(resp.retryAfterRaw)
 	}
 	e.mu.Lock()
 	e.paceTransientLocked(nowMS, seconds, present)
@@ -488,24 +498,23 @@ func (c *Client) postExposureApplication(ctx context.Context, experimentKey stri
 var errExperimentApplyConsentRefused = errors.New("shardpilot experiments: apply request refused by a consent denial")
 
 // experimentApplyAgeRefusal reports whether an apply route's answer body is
-// the platform's age refusal, {"error":"not_assigned","reason":
-// "age_ineligible"}. A truncated or over-limit body never is (the
-// experimentBodyErrorText bound).
+// the platform's not_assigned code with a reason detail of age_ineligible.
+// A truncated or over-limit body never is (the
+// experimentBodyErrorCode bound).
 func experimentApplyAgeRefusal(body []byte, bodyIncomplete bool) bool {
-	if bodyIncomplete || len(body) > expMaxBodyBytes {
+	wire := responseError(body, bodyIncomplete)
+	if wire.Error.Code != "not_assigned" {
 		return false
 	}
-	var wire struct {
-		Error  string `json:"error"`
-		Reason string `json:"reason"`
+	for _, detail := range wire.Error.Details {
+		if detail.Field == "reason" && detail.Code == experimentReasonAge {
+			return true
+		}
 	}
-	if json.Unmarshal(body, &wire) != nil {
-		return false
-	}
-	return wire.Error == "not_assigned" && wire.Reason == experimentReasonAge
+	return false
 }
 
-// parseSealedExposure reads the apply endpoint's 200 body: {"fact":{...},
+// parseSealedExposure reads the apply endpoint's 2xx body: {"fact":{...},
 // "seal":"..."}, the fact an experiment_exposure with an id, an event time,
 // a scope and props. Anything else is no answer (nil).
 func parseSealedExposure(body []byte, eventName string) *expSealedFact {

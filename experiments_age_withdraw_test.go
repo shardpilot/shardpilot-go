@@ -38,7 +38,7 @@ func ageGoldenFactKey(t *testing.T) string {
 }
 
 // ageApplyRefusal is the apply routes' age refusal.
-const ageApplyRefusal = `{"error":"not_assigned","reason":"age_ineligible"}`
+const ageApplyRefusal = `{"error":{"code":"not_assigned","details":[{"field":"reason","code":"age_ineligible"}]}}`
 
 // ageRefusalBody is the captured under_threshold refusal with its reason
 // replaced; an empty reason removes the member (the traffic-gate shape).
@@ -388,7 +388,7 @@ func TestAnAgeRefusalWithoutAFactKeyLeavesAnotherSubjectsFacts(t *testing.T) {
 		t.Run(staging, func(t *testing.T) {
 			ctx := context.Background()
 			rig := newAgeWithdrawRig(t, t.TempDir(), nil, ageGolden(t, "adult"))
-			rig.script.push(http.StatusBadRequest, `{"error":"experiment metadata must use synthetic local-safe identifiers only"}`)
+			rig.script.push(http.StatusBadRequest, `{"error":{"code":"subject_id_invalid","message":"experiment metadata must use synthetic local-safe identifiers only"}}`)
 			rig.script.push(http.StatusOK, ageRefusalBodyWithoutFactKey(t))
 			fetchAdultAssignment(t, rig.client, ageGoldenExperiment)
 			rig.applyAndMeasure(t, ageGoldenExperiment)
@@ -1600,7 +1600,7 @@ func TestAnAgeRefusalLeavesAnotherSubjectsMintedKeyFacts(t *testing.T) {
 		t.Run(staging, func(t *testing.T) {
 			ctx := context.Background()
 			rig := newAgeWithdrawRig(t, t.TempDir(), nil, adultGoldenWithoutFactKey(t))
-			rig.script.push(http.StatusBadRequest, `{"error":"experiment metadata must use synthetic local-safe identifiers only"}`)
+			rig.script.push(http.StatusBadRequest, `{"error":{"code":"subject_id_invalid","message":"experiment metadata must use synthetic local-safe identifiers only"}}`)
 			rig.script.push(http.StatusOK, ageRefusalBodyWithoutFactKey(t))
 			rig.sealWithKey(minted)
 			fetchAdultAssignment(t, rig.client, ageGoldenExperiment)
@@ -1645,7 +1645,7 @@ func TestAnApplyRouteRefusalOfARetiredSubjectWithdrawsItsMintedKeyFacts(t *testi
 		t.Run("sealed_"+sealed, func(t *testing.T) {
 			ctx := context.Background()
 			rig := newAgeWithdrawRig(t, t.TempDir(), nil, adultGoldenWithoutFactKey(t))
-			rig.script.push(http.StatusBadRequest, `{"error":"experiment metadata must use synthetic local-safe identifiers only"}`)
+			rig.script.push(http.StatusBadRequest, `{"error":{"code":"subject_id_invalid","message":"experiment metadata must use synthetic local-safe identifiers only"}}`)
 			rig.script.push(http.StatusOK, adultGoldenWithoutFactKey(t))
 			rig.sealWithKey(mintedOld)
 			// The outcome's first apply is answered transiently, so the

@@ -18,8 +18,8 @@ func TestExperimentAgeGoldenInCapture(t *testing.T) {
 		if !sdkWouldParseAssignment(string(body)) {
 			t.Errorf("capture rejected SDK server golden %s", name)
 		}
-		if name != "adult" && sdkWouldParseAssignment(strings.Replace(string(body), "age_ineligible", "future_age_reason", 1)) {
-			t.Error("capture accepted an unknown reason")
+		if name != "adult" && !sdkWouldParseAssignment(strings.Replace(string(body), "age_ineligible", "future_age_reason", 1)) {
+			t.Error("capture rejected a valid unknown reason")
 		}
 	}
 	if !isSDKTaxonomy("age_ineligible") || !sdkReasonValues["age_ineligible"] {

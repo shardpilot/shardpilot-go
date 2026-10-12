@@ -676,7 +676,7 @@ func TestTheDeclaringFetchDoesNotServeTheAssignmentItWithdraws(t *testing.T) {
 func TestARevalidationRemintRetryDoesNotResendAdultWhileADeclarationIsPending(t *testing.T) {
 	spool := t.TempDir()
 	rig := newAgeWithdrawRig(t, spool, nil, ageGolden(t, "adult"))
-	rig.script.push(http.StatusBadRequest, `{"error":"experiment metadata must use synthetic local-safe identifiers only"}`)
+	rig.script.push(http.StatusBadRequest, `{"error":{"code":"subject_id_invalid","message":"experiment metadata must use synthetic local-safe identifiers only"}}`)
 	rig.script.push(http.StatusServiceUnavailable, ageTransientBody)
 	rig.script.push(http.StatusOK, ageGolden(t, "adult"))
 	lane := make(chan struct{})

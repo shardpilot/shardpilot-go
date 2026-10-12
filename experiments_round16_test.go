@@ -245,8 +245,8 @@ func TestFactStampRidesEntrySnapshot(t *testing.T) {
 
 func TestRemintAbortsOnRacedDenial(t *testing.T) {
 	script := &expScript{}
-	script.push(200, expAssignedBody("1"))                                                             // seed entry under the OLD subject
-	script.push(400, `{"error":"experiment metadata must use synthetic local-safe identifiers only"}`) // grammar sentinel -> re-mint
+	script.push(200, expAssignedBody("1"))                                                                                                     // seed entry under the OLD subject
+	script.push(400, `{"error":{"code":"subject_id_invalid","message":"experiment metadata must use synthetic local-safe identifiers only"}}`) // grammar sentinel -> re-mint
 	capture := &expWireCapture{}
 	server := newExperimentServer(t, script, capture)
 	defer server.Close()

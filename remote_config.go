@@ -33,7 +33,7 @@ import (
 // belong to that request scope. Denial does not clear the getter snapshot.
 //
 // Fetch semantics (one fetch = one HTTP GET, decided by applyRemoteConfig):
-//   - 200 with a parseable JSON object body — fresh values are served and
+//   - 2xx with a parseable JSON object body — fresh values are served and
 //     the cache record is overwritten (body + response ETag).
 //   - 304 Not Modified — the cached snapshot is served (FromCache=true) and
 //     the record's freshness stamp is renewed: the endpoint confirmed the
@@ -43,22 +43,21 @@ import (
 //     carrying why; with no usable cache the fetch fails.
 //   - 401/403 — fails CLOSED: the cached snapshot is never served for this
 //     outcome (a revoked or wrong key must not keep supplying
-//     configuration), but the cache record and the getter snapshot are left
-//     untouched — a later 200 under a valid credential resumes normally.
+//     configuration), and clears the getter snapshot. The durable cache remains for a
+//     new session or explicit refetch under a valid credential.
 //   - Any other status (404, an unexpected 3xx, 413, other 4xx) is a
 //     PERMANENT failure: the fetch fails rather than serving stale values as
-//     healthy; cache and snapshot stay untouched.
+//     healthy; getters revert to the host defaults.
 //
 // Permanent and fail-closed outcomes are authoritative for THE FETCH THAT
-// RECEIVED THEM — they do not latch: every fetch classifies independently,
+// RECEIVED THEM: getters stop serving the cache. An explicit new fetch
+// classifies independently,
 // so a later transient failure still serves the last-known-good cache. This
 // lets each fetch classify independently.
 //
-// A 429 additionally arms an in-memory cooldown from its Retry-After header
-// (digits-only, floored at 1s, clamped at 24h; absent or malformed reads as
-// the floor). An explicit fetch inside the window does not touch the network:
-// it returns the cache-served transient_429 outcome, indistinguishable from a
-// live 429: the client half of the server's remote-config fetch rate limit.
+// Transient outcomes arm an in-memory retry deadline. Retry-After on 429/5xx
+// is a floor; other transient outcomes use exponential backoff with jitter.
+// A fetch inside that window returns the eligible cache and original reason.
 
 // rcMaxBodyBytes caps how much of a remote-config response body is read: the
 // server contract caps targeted configuration at 1MB (answering 413 above
@@ -131,7 +130,7 @@ type rcCache struct {
 
 // remoteConfigState is the per-client remote-config machinery: the held
 // in-process cache record (which survives a failed durable write), the
-// getter snapshot, the request fence, and the 429 cooldown. All fields are
+// getter snapshot, the request fence, and the retry deadline. All fields are
 // guarded by mu; the HTTP fetch itself runs outside it, so concurrent
 // explicit fetches are legal.
 type remoteConfigState struct {
@@ -160,8 +159,7 @@ type remoteConfigState struct {
 	held *rcCache
 
 	// snapshot backs the typed getters: an independent copy of the last
-	// served values (fresh or cached), last-served-wins. Nothing clears it
-	// except replacement by a later served outcome.
+	// served values (fresh or cached). Authoritative failures clear it.
 	snapshot   map[string]any
 	version    float64
 	hasVersion bool
@@ -180,10 +178,13 @@ type remoteConfigState struct {
 	fetchSeq uint64
 	settled  map[string]uint64
 
-	// cooldownUntil is the in-memory 429 next-fetch-allowed deadline. ONE
-	// deadline shared by anonymous and identified scopes. Monotone: a new 429 can
-	// only extend it, and it is never persisted; it expires only by time.
-	cooldownUntil time.Time
+	// One monotone retry deadline spans anonymous and identified scopes.
+	// The failure streak resets on an authoritative answer; the deadline expires.
+	cooldownUntil  time.Time
+	cooldownReason string
+	backoffAttempt int
+	// A failed durable clear must not revive an absent publication in this process.
+	cleared map[string]*rcCache
 }
 
 func newRemoteConfigState(cfg Config) *remoteConfigState {
@@ -362,8 +363,8 @@ func serveRemoteConfigCache(cache *rcCache, reason string) (RemoteConfigResult, 
 //
 // A transport-level error arrives here as status 0.
 func applyRemoteConfig(cache *rcCache, resp remoteConfigResponse, nowMS int64) (result RemoteConfigResult, newCache *rcCache, authoritative bool, revalidated *rcCache, failure string) {
-	if resp.status == 200 {
-		// A 200 is the only outcome that needs its body: a mid-stream read
+	if resp.status >= 200 && resp.status < 300 {
+		// A 2xx read needs its body: a mid-stream read
 		// failure (bodyIncomplete) makes it unusable — the transient
 		// malformed class — while every non-200 below classifies by STATUS
 		// alone, so a truncated 401 still fails closed and a truncated
@@ -413,7 +414,14 @@ func applyRemoteConfig(cache *rcCache, resp remoteConfigResponse, nowMS int64) (
 	// indefinitely. Fail closed; the cache record is kept untouched but is
 	// never served for this outcome.
 	if resp.status == 401 || resp.status == 403 {
+		if resp.status == 403 && experimentBodyErrorCode(resp.body, resp.bodyIncomplete) == "runtime_disabled" {
+			return RemoteConfigResult{}, nil, true, nil, "runtime_disabled"
+		}
 		return RemoteConfigResult{}, nil, true, nil, "unauthorized"
+	}
+
+	if resp.status == 404 && experimentBodyErrorCode(resp.body, resp.bodyIncomplete) == "remote_config_not_published" {
+		return RemoteConfigResult{}, nil, true, nil, "remote_config_not_published"
 	}
 
 	// The cache fallback is reserved for failures a retry can plausibly fix:
@@ -503,6 +511,9 @@ func (rc *remoteConfigState) durableRecord(scope string) *rcCache {
 // have refreshed), compared by their fetched-at stamps; the in-process
 // record wins ties, being known-good and already backing the getters.
 func (rc *remoteConfigState) loadCacheLocked(scope string) *rcCache {
+	if _, cleared := rc.cleared[scope]; cleared {
+		return nil
+	}
 	var held *rcCache
 	if rc.held != nil && rc.held.Scope == scope {
 		held = rc.held
@@ -546,8 +557,28 @@ func (rc *remoteConfigState) saveDurable(record *rcCache) error {
 // with an empty object, which no scope matches — a restart then starts from
 // the caller's defaults rather than from rolled-back values. Create-only for
 // parents, like saveDurable.
-func (rc *remoteConfigState) tombstoneDurable() {
-	_ = writePrivateFileAtomic(rc.cachePath, []byte("{}"), os.Rename, nil)
+func (rc *remoteConfigState) tombstoneDurable() error {
+	return writePrivateFileAtomic(rc.cachePath, []byte("{}"), os.Rename, nil)
+}
+
+// clearPublicationLocked withdraws this scope's cached publication. Preserve a
+// different scope or a durable record another process advanced during the fetch.
+func (rc *remoteConfigState) clearPublicationLocked(scope string, served *rcCache) bool {
+	durable := rc.durableRecord(scope)
+	if rc.held != nil && rc.held.Scope == scope {
+		rc.held = nil
+	}
+	if rc.cleared == nil {
+		rc.cleared = make(map[string]*rcCache)
+	}
+	if served == nil {
+		served = rc.cleared[scope]
+	}
+	rc.cleared[scope] = served
+	if durable != nil && served != nil && durable.FetchedAtMS <= served.FetchedAtMS {
+		return rc.tombstoneDurable() != nil
+	}
+	return false
 }
 
 // ensurePrivateDir creates dir with the SDK's private mode and TIGHTENS an
@@ -700,6 +731,10 @@ func (rc *remoteConfigState) installLocked(seq uint64, scope string, result Remo
 		rc.settled[scope] = seq
 	}
 	if !ok {
+		if authoritative {
+			rc.snapshot = nil
+			rc.version, rc.hasVersion = 0, false
+		}
 		return false
 	}
 	record := newCache
@@ -709,6 +744,9 @@ func (rc *remoteConfigState) installLocked(seq uint64, scope string, result Remo
 	var durable *rcCache
 	if record != nil {
 		durable = rc.durableRecord(scope)
+	}
+	if served == nil {
+		served = rc.cleared[scope] // compare fresh recovery against the withdrawn record
 	}
 	if record != nil && durable != nil &&
 		durable.Body != record.Body &&
@@ -730,6 +768,7 @@ func (rc *remoteConfigState) installLocked(seq uint64, scope string, result Remo
 	}
 	switch {
 	case record != nil:
+		delete(rc.cleared, scope)
 		record.Scope = scope
 		rc.raiseStampAboveSuperseded(record, served, durable)
 		// The in-process record is updated even when the durable write
@@ -842,8 +881,7 @@ func (c *Client) SetRemoteConfigAttributes(attributes map[string]string) {
 // (FromCache=false), revalidated, or served from the last-known-good cache
 // over a transient failure (FromCache=true with Reason set). A non-nil error
 // means no usable values: the taxonomy code is in the error text
-// ("unauthorized" fails closed without touching the cache or the getter
-// snapshot; "http_<status>" is permanent; "transient_..."/"http_0"/
+// ("unauthorized" closes getters while retaining the cache; "http_<status>" is permanent; "transient_..."/"http_0"/
 // "malformed_response" are transient with no usable cache;
 // "client_id_unavailable" and "remote_config_not_configured" fail before any
 // network use). A fetch ended by the CALLER's context — cancellation or the
@@ -852,8 +890,7 @@ func (c *Client) SetRemoteConfigAttributes(attributes map[string]string) {
 // http_0 only when it fired before a status arrived, while one that merely
 // stalled the response BODY preserves the received status and classifies by
 // it (a stalled 401 fails closed; only a stalled 200 stays transient). A
-// successful result also updates the getter snapshot; a failed one
-// leaves it untouched. Fetching remains available without granted consent,
+// successful result updates the getter snapshot; authoritative failures clear it. Fetching remains available without granted consent,
 // using the identifier-free route and its own cache scope. Concurrent fetches
 // are legal; an older response never overwrites a newer settled outcome in
 // the same request scope. Fetches
@@ -907,10 +944,8 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 				return RemoteConfigResult{}, ctxErr
 			}
 		}
-		// Inside the 429 cooldown an explicit fetch does not touch the
-		// network: the outcome is the cache-served transient_429, by design
-		// indistinguishable from a live 429.
-		result, failure := serveRemoteConfigCache(cache, "transient_429")
+		// Preserve the reason that armed the current retry deadline.
+		result, failure := serveRemoteConfigCache(cache, rc.cooldownReason)
 		rc.installLocked(seq, scope, result, failure == "", nil, false, cache, nil)
 		rc.mu.Unlock()
 		if failure != "" {
@@ -1032,21 +1067,37 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 	}
 
 	rc.mu.Lock()
-	if resp.status == 429 && seq > rc.settled[scope] {
-		// The cooldown is fenced by the same per-scope sequence as installs:
-		// a stale 429 that arrives AFTER a newer fetch already settled an
-		// authoritative outcome (a fresh 200, say) is an outdated
-		// backpressure instruction — arming it would suppress later fetches
-		// for a window the server has already moved past, even though the
-		// stale response's result is otherwise ignored.
-		rc.armCooldownLocked(now, resp)
+	persistFailed := false
+	if seq > rc.settled[scope] {
+		if authoritative {
+			rc.backoffAttempt = 0
+			if failure == "remote_config_not_published" {
+				persistFailed = rc.clearPublicationLocked(scope, cache)
+			}
+		} else {
+			before := rc.cooldownUntil
+			if (resp.status == 429 || resp.status >= 500) && resp.retryAfterPresent {
+				rc.armCooldownLocked(now, resp)
+			} else {
+				rc.backoffAttempt++
+				if deadline := now.Add(c.backoffDelay(rc.backoffAttempt)); deadline.After(rc.cooldownUntil) {
+					rc.cooldownUntil = deadline
+				}
+			}
+			if rc.cooldownUntil.After(before) {
+				rc.cooldownReason = failure
+				if rc.cooldownReason == "" {
+					rc.cooldownReason = result.Reason
+				}
+			}
+		}
 	}
-	persistFailed := rc.installLocked(seq, scope, result, failure == "", newCache, authoritative, cache, revalidated)
+	persistFailed = rc.installLocked(seq, scope, result, failure == "", newCache, authoritative, cache, revalidated) || persistFailed
 	rc.mu.Unlock()
 
 	if persistFailed {
 		c.stats.setLastError("remote_config_cache_persist_failed")
-		c.logf("shardpilot remote config: persisting the cache record failed; the fetched configuration stays the in-memory fallback for this process")
+		c.logf("shardpilot remote config: updating the durable cache failed; this process retains its current in-memory decision")
 	}
 	if failure != "" {
 		return RemoteConfigResult{}, rcFetchError(failure)

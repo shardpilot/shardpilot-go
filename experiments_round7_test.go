@@ -100,7 +100,7 @@ func TestCaptureGateHoldsUntilDurable(t *testing.T) {
 func TestCloseRemnantFiltersWithdrawnFacts(t *testing.T) {
 	script := &expScript{}
 	script.push(200, expAssignedBody("1"))
-	script.push(403, `{"error":"`+expSentinelRealSubjectsDisabled+`"}`)
+	script.push(403, `{"error":{"code":"`+expSentinelRealSubjectsDisabled+`"}}`)
 	capture := &expWireCapture{}
 	server := newExperimentServer(t, script, capture)
 	defer server.Close()
