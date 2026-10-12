@@ -2,10 +2,12 @@ package shardpilot
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/shardpilot/shardpilot-go/internal/uuidv7"
 )
@@ -45,6 +47,9 @@ type ExperimentSubjectConfig struct {
 	AnonymousID string
 	// Consent is the player's consent; see SetConsent.
 	Consent ExperimentSubjectConsent
+
+	// There is no UserID: ingest refuses user_id on experiment facts, so
+	// every experiment fact omits it and a handle's would have no effect.
 }
 
 // ExperimentSubject is the experiment plane for one player, for a process
@@ -78,6 +83,11 @@ type ExperimentSubject struct {
 	// commitMu orders a consent change against a fact's hand-off to the
 	// queue: a fact is handed off under the consent that admitted it.
 	commitMu sync.Mutex
+
+	// denials counts this handle's denials (SetConsent with anything but
+	// Granted). A fact handed to the queue carries the count at hand-off; a
+	// later denial withdraws it at the send point (subjectFactWithdrawn).
+	denials atomic.Uint64
 
 	mu sync.Mutex
 	// consent and consentSeq: consentSeq counts SetConsent calls, so a fetch
@@ -146,9 +156,10 @@ func (c *Client) ExperimentSubject(cfg ExperimentSubjectConfig) (*ExperimentSubj
 
 // SetConsent records the player's consent. Anything but Granted withdraws
 // this handle's cached assignments and owed applications (counted
-// consent_withdrawn) and refuses its fetches and applications until a later
-// Granted. Facts already handed to the analytics queue under Granted are
-// delivered. It returns ErrInvalidExperimentSubject for an unknown value.
+// consent_withdrawn), drops the player's facts not yet sent (counted in
+// Stats.Dropped, like queued events a consent denial purges), and refuses
+// the handle's fetches and applications until a later Granted. It returns
+// ErrInvalidExperimentSubject for an unknown value.
 func (s *ExperimentSubject) SetConsent(consent ExperimentSubjectConsent) error {
 	if !consent.valid() {
 		return fmt.Errorf("%w: unknown Consent value %d", ErrInvalidExperimentSubject, consent)
@@ -161,6 +172,9 @@ func (s *ExperimentSubject) SetConsent(consent ExperimentSubjectConsent) error {
 	s.consentSeq++
 	if consent != ExperimentSubjectConsentGranted {
 		s.withdrawAllLocked(expDropConsentWithdrawn)
+		// The player's facts already in the client's queue, its worker's
+		// batch or a retained retry are dropped at the next send point.
+		s.denials.Add(1)
 	}
 	return nil
 }
@@ -559,7 +573,7 @@ func (s *ExperimentSubject) deliver(ctx context.Context, network, atClose bool, 
 			continue
 		}
 		event.AnonymousID = s.anonymousID
-		event.subjectFact = true
+		event.subject = s
 		event.expKeyWithdrawEpoch = c.expKeyWithdrawEpoch.Load()
 		if !s.commit(head, event, atClose) {
 			return
@@ -579,6 +593,7 @@ func (s *ExperimentSubject) commit(head *expSubjectOwed, event Event, atClose bo
 	if !current {
 		return true // withdrawn meanwhile: the next pass reads the queue again
 	}
+	event.subjectDenials = s.denials.Load()
 	if _, err := s.c.enqueueExperimentFact(event, atClose); err != nil {
 		if errors.Is(err, ErrEventTooLarge) {
 			// Ingest rejects this fact on every attempt: it leaves the
@@ -731,4 +746,86 @@ func (c *Client) closeExperimentSubjects() int {
 	c.expSubjects = nil
 	c.expSubjectsMu.Unlock()
 	return remaining
+}
+
+// subjectFactWithdrawn reports a subject handle's fact whose player has
+// denied consent since it was handed to the queue. The fleet consent rule
+// purges retained analytics on denial; for a handle's facts, which share the
+// client's queue, the purge is this check at every send point.
+func subjectFactWithdrawn(subject *ExperimentSubject, stamp uint64) bool {
+	return subject != nil && stamp < subject.denials.Load()
+}
+
+// dropDeniedSubjectFacts is the worker-batch leg: at every dispatch point it
+// drops the held batch's facts of a player who denied since their hand-off,
+// counted in Stats.Dropped like queued events a consent purge clears, and
+// the same members from the retained wire bytes, so the survivors keep
+// their exact bytes. Each fact carries its own stamp, so every batch is
+// checked: a denial leaves the shared queue untouched, and a batch pulled
+// from it after the denial must still be filtered. Worker goroutine only.
+func (c *Client) dropDeniedSubjectFacts(batch []Event, backoffAttempt *int) []Event {
+	kept := batch[:0]
+	removedIDs := make(map[string]struct{})
+	for _, event := range batch {
+		if subjectFactWithdrawn(event.subject, event.subjectDenials) {
+			removedIDs[strings.TrimSpace(event.ID)] = struct{}{}
+			continue
+		}
+		kept = append(kept, event)
+	}
+	if len(removedIDs) == 0 {
+		return kept
+	}
+	c.stats.dropped.Add(uint64(len(removedIDs)))
+	c.logf("shardpilot experiments: dropped %d queued fact(s) of subject handles whose player denied consent", len(removedIDs))
+	c.retainedRequest = withoutEnvelopeIDs(c.retainedRequest, removedIDs)
+	if len(kept) == 0 {
+		*backoffAttempt = 0
+	}
+	return kept
+}
+
+// dropDeniedSubjectBuiltBatch re-checks a BUILT batch immediately before its
+// transport handoff, for a handle denial that landed between the
+// dispatch-point check and the build. The batch and the request are
+// filtered by position, so they stay aligned; a misaligned pair filters the
+// request by its own members. Worker goroutine only.
+func (c *Client) dropDeniedSubjectBuiltBatch(request batchRequest, batch []Event, backoffAttempt *int) (batchRequest, []Event) {
+	aligned := len(request.Events) == len(batch) && len(request.rawEvents) == len(batch)
+	kept := batch[:0]
+	var envelopes []eventEnvelope
+	var raws []json.RawMessage
+	removed := 0
+	for i, event := range batch {
+		if subjectFactWithdrawn(event.subject, event.subjectDenials) {
+			removed++
+			continue
+		}
+		kept = append(kept, event)
+		if aligned {
+			envelopes = append(envelopes, request.Events[i])
+			raws = append(raws, request.rawEvents[i])
+		}
+	}
+	if removed == 0 {
+		return request, kept
+	}
+	c.stats.dropped.Add(uint64(removed))
+	c.logf("shardpilot experiments: withheld %d built batch member(s) at the transport handoff (their player denied consent on a subject handle)", removed)
+	if aligned {
+		request.Events = envelopes
+		request.rawEvents = raws
+	} else {
+		ids := make(map[string]struct{})
+		for _, envelope := range request.Events {
+			if subjectFactWithdrawn(envelope.subject, envelope.subjectDenials) {
+				ids[envelope.EventID] = struct{}{}
+			}
+		}
+		request = withoutEnvelopeIDs(request, ids)
+	}
+	if len(kept) == 0 {
+		*backoffAttempt = 0
+	}
+	return request, kept
 }

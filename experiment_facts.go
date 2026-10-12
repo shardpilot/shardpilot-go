@@ -105,7 +105,7 @@ func (c *Client) enqueueExperimentFact(event Event, atClose bool) (uint64, error
 	if c.consentFloorEnabled() && c.consentUndecided() {
 		return 0, ErrConsentUnknown
 	}
-	if c.consentFloorEnabled() && event.omitUserID && !event.subjectFact && c.consentFloorUserScoped() {
+	if c.consentFloorEnabled() && event.omitUserID && event.subject == nil && c.consentFloorUserScoped() {
 		// The floor's grant covers the configured consent actor — on a
 		// server or backend source with a UserID, the verified user — but
 		// this SDK fact rides the ANONYMOUS identity alone on the wire
@@ -1113,8 +1113,10 @@ func (c *Client) dropWithdrawnSpoolChunkMembers(chunk []spoolEntry) []spoolEntry
 // field is worker-owned state (the retainedRequest discipline).
 func (c *Client) dropWithdrawnExperimentFacts(batch []Event, backoffAttempt *int) []Event {
 	// An age refusal's per-experiment withdrawal filters at the same
-	// dispatch points (dropKeyWithdrawnExperimentFacts).
+	// dispatch points (dropKeyWithdrawnExperimentFacts), and so does a
+	// player's denial on a subject handle (dropDeniedSubjectFacts).
 	batch = c.dropKeyWithdrawnExperimentFacts(batch, backoffAttempt)
+	batch = c.dropDeniedSubjectFacts(batch, backoffAttempt)
 	epoch := c.expFactPurgeEpoch.Load()
 	if epoch == c.workerSeenExpFactPurge {
 		return batch
@@ -1184,9 +1186,10 @@ func (c *Client) dropWithdrawnExperimentFacts(batch []Event, backoffAttempt *int
 // seen-epoch field is worker-owned state, exactly like
 // dropWithdrawnExperimentFacts).
 func (c *Client) dropWithdrawnBuiltBatch(request batchRequest, batch []Event, backoffAttempt *int) (batchRequest, []Event) {
-	// The same re-check for an age refusal landing in that window
-	// (dropKeyWithdrawnBuiltBatch).
+	// The same re-check for an age refusal, or a player's denial on a
+	// subject handle, landing in that window.
 	request, batch = c.dropKeyWithdrawnBuiltBatch(request, batch, backoffAttempt)
+	request, batch = c.dropDeniedSubjectBuiltBatch(request, batch, backoffAttempt)
 	epoch := c.expFactPurgeEpoch.Load()
 	if epoch == c.workerSeenExpFactPurge {
 		return request, batch

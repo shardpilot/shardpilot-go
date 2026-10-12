@@ -349,3 +349,34 @@ func TestAnOversizeSealedFactLeavesAHandlesQueue(t *testing.T) {
 		t.Fatalf("delivered %v, want the second experiment's exposure", facts[0])
 	}
 }
+
+// TestAPlayersDenialDropsTheirQueuedFacts: a fact already handed to the
+// queue under Granted is not sent after that player denies, even after a
+// quick re-grant; another player's queued fact is sent.
+func TestAPlayersDenialDropsTheirQueuedFacts(t *testing.T) {
+	rig := newExpHopRig(t, nil)
+	a := newSubjectOrFail(t, rig.client, expSubjectA, "player-a")
+	b := newSubjectOrFail(t, rig.client, expSubjectB, "player-b")
+	subjectFetchOrFail(t, a)
+	subjectFetchOrFail(t, b)
+	a.Apply(expTestScopeKey)
+	b.Apply(expTestScopeKey)
+	rig.cycle()
+	if a.owedCount() != 0 || b.owedCount() != 0 {
+		t.Fatal("control: both facts are handed to the queue")
+	}
+	if err := a.SetConsent(ExperimentSubjectConsentDenied); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SetConsent(ExperimentSubjectConsentGranted); err != nil {
+		t.Fatal(err)
+	}
+	flushOrFail(t, rig.client)
+	facts := rig.capture.exposures()
+	if len(facts) != 1 || facts[0]["anonymous_id"] != "player-b" {
+		t.Fatalf("delivered %v, want only player b's fact", facts)
+	}
+	if dropped := rig.client.Snapshot().Dropped; dropped != 1 {
+		t.Fatalf("Dropped = %d, want player a's withdrawn fact", dropped)
+	}
+}

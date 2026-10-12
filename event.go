@@ -35,11 +35,14 @@ type Event struct {
 	// is.
 	sourceOverride Source
 
-	// subjectFact marks an experiment fact of an ExperimentSubject handle:
-	// it carries the handle's player identity, admitted by that player's
-	// consent, not the configured actor's. Unexported: only the handle sets
-	// it.
-	subjectFact bool
+	// subject, when set, marks an experiment fact of an ExperimentSubject
+	// handle: it carries that player's identity, admitted by that player's
+	// consent, not the configured actor's. subjectDenials is the handle's
+	// denial count when the fact was handed to the queue; a later denial
+	// withdraws the fact wherever it waits (subjectFactWithdrawn).
+	// Unexported: only the handle sets them.
+	subject        *ExperimentSubject
+	subjectDenials uint64
 
 	// expFactEpoch is the real-subjects purge generation this experiment
 	// fact was BUILT under (stamped when a sealed fact becomes an event,
