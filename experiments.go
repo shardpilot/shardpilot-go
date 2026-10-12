@@ -96,7 +96,9 @@ import (
 //
 // Subject id (`spcid_`): SDK-minted and SDK-managed — "spcid_" plus the 32
 // lowercase hex chars of a UUIDv7 with the dashes removed. There is NO host
-// override path: no public setter and no config field is read for it. It is
+// override path: no public setter and no config field is read for it (a
+// process serving many players uses ExperimentSubject handles, which carry
+// the player's own subject and never this one). It is
 // persisted in the SpoolDir state directory (in memory only, per process,
 // when SpoolDir is unset — documented ephemeral re-bucketing), minted lazily
 // the first time a fetch needs it, validated against the wire grammar on
@@ -2962,67 +2964,11 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 			pf, landed := e.applySentinelWithdrawalLocked(scope, resolvedAtMS)
 			return false, pf, landed
 		}
-		e.authBlocked = true
-		e.authEpoch++
-		// The latch RETAINS the assignments it stops serving (the durable
-		// record keeps them; a re-init or unlatch re-serves): mirror them
-		// into latchRetained so a consent purge can tell latch-cleared
-		// retained state from true drops — its re-arm pass must keep those
-		// assignments' exposure intents alive (grant-moment re-arms for
-		// RETAINED assignments), not lose them with the emptied entries.
-		for key, entry := range e.entries {
-			e.latchRetained[key] = entry
-		}
-		e.entries = make(map[string]*expEntry)
-		// An ORDINARY 401/403 retains the durable record — and the owed
-		// EXPOSURE snapshots: a treatment that already ran is a fact
-		// about the past, and the latch stops future serving, not the
-		// reporting of what happened (the sweep keeps draining them
-		// while consent admits). An owed cache WRITE whose entry this
-		// latch just cleared from memory must not decay into a delete
-		// at the next retry — absence in memory here is fail-closed
-		// serving, not a drop decision — so owed writes are cancelled
-		// (their source data is gone; the disk keeps its last-known
-		// record). Owed DROPS were authoritative server decisions and
-		// still land.
-		for key, pending := range e.durablePending {
-			if !pending.drop {
-				delete(e.durablePending, key)
-			}
-		}
+		e.latchAuthLocked()
 		return false, false, false
 	}
 	if outcome.authoritative && !outcome.transient && !outcome.preserveAuth {
-		// An authoritative, authorized VERDICT of a post-latch fetch (the
-		// epoch gate above guarantees that) proves the credential works
-		// again: unlatch and let revalidation resume. An unexpected terminal
-		// status does not confirm authorization, so preserveAuth keeps its
-		// per-entry drop from reopening the other cached assignments.
-		if e.authBlocked {
-			// The unlatch RESTORES the retained assignments, not just the
-			// flag: the latch cleared e.entries while deliberately
-			// retaining the assignments (durably, mirrored in
-			// latchRetained), and an unlatch driven by ONE experiment's
-			// fetch must not strand the others — unserved by the getters
-			// and invisible to the revalidation lane (which iterates
-			// entries) until a process restart. The mirror restores with
-			// its ORIGINAL entries — stamps, attributes, and fences
-			// untouched (no disk writes: the record already holds them; no
-			// stamp raises: nothing was superseded) — and this fetch's own
-			// outcome then applies on top: a fresh install replaces its
-			// key, a drop removes it. Owed exposures were never touched by
-			// the latch, so nothing re-arms here — restoring an entry is
-			// not a new application (the grant-moment re-arms belong
-			// to the consent purge alone).
-			for key, entry := range e.latchRetained {
-				if e.entries[key] == nil {
-					e.entries[key] = entry
-				}
-			}
-			e.latchRetained = make(map[string]*expEntry)
-		}
-		e.authBlocked = false
-		e.applyBlocked = false
+		e.liftAuthLatchLocked()
 	}
 	if outcome.transient {
 		return false, false, false
@@ -3068,6 +3014,76 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 		return true, !persisted, false
 	}
 	return false, false, false
+}
+
+// latchAuthLocked sets the plane's credential latch on a 401/403: every
+// cached assignment stops being served, revalidation halts, and a new auth
+// epoch discards the responses still in flight; only a fetch started after
+// this moment may lift it (liftAuthLatchLocked).
+func (e *experimentsState) latchAuthLocked() {
+	e.authBlocked = true
+	e.authEpoch++
+	// The latch RETAINS the assignments it stops serving (the durable
+	// record keeps them; a re-init or unlatch re-serves): mirror them
+	// into latchRetained so a consent purge can tell latch-cleared
+	// retained state from true drops — its re-arm pass must keep those
+	// assignments' exposure intents alive (grant-moment re-arms for
+	// RETAINED assignments), not lose them with the emptied entries.
+	for key, entry := range e.entries {
+		e.latchRetained[key] = entry
+	}
+	e.entries = make(map[string]*expEntry)
+	// An ORDINARY 401/403 retains the durable record — and the owed
+	// EXPOSURE snapshots: a treatment that already ran is a fact
+	// about the past, and the latch stops future serving, not the
+	// reporting of what happened (the sweep keeps draining them
+	// while consent admits). An owed cache WRITE whose entry this
+	// latch just cleared from memory must not decay into a delete
+	// at the next retry — absence in memory here is fail-closed
+	// serving, not a drop decision — so owed writes are cancelled
+	// (their source data is gone; the disk keeps its last-known
+	// record). Owed DROPS were authoritative server decisions and
+	// still land.
+	for key, pending := range e.durablePending {
+		if !pending.drop {
+			delete(e.durablePending, key)
+		}
+	}
+}
+
+// liftAuthLatchLocked is an authoritative, authorized verdict of a fetch
+// started after the latch: the credential works again.
+func (e *experimentsState) liftAuthLatchLocked() {
+	// An authoritative, authorized VERDICT of a post-latch fetch (the
+	// epoch gate above guarantees that) proves the credential works
+	// again: unlatch and let revalidation resume. An unexpected terminal
+	// status does not confirm authorization, so preserveAuth keeps its
+	// per-entry drop from reopening the other cached assignments.
+	if e.authBlocked {
+		// The unlatch RESTORES the retained assignments, not just the
+		// flag: the latch cleared e.entries while deliberately
+		// retaining the assignments (durably, mirrored in
+		// latchRetained), and an unlatch driven by ONE experiment's
+		// fetch must not strand the others — unserved by the getters
+		// and invisible to the revalidation lane (which iterates
+		// entries) until a process restart. The mirror restores with
+		// its ORIGINAL entries — stamps, attributes, and fences
+		// untouched (no disk writes: the record already holds them; no
+		// stamp raises: nothing was superseded) — and this fetch's own
+		// outcome then applies on top: a fresh install replaces its
+		// key, a drop removes it. Owed exposures were never touched by
+		// the latch, so nothing re-arms here — restoring an entry is
+		// not a new application (the grant-moment re-arms belong
+		// to the consent purge alone).
+		for key, entry := range e.latchRetained {
+			if e.entries[key] == nil {
+				e.entries[key] = entry
+			}
+		}
+		e.latchRetained = make(map[string]*expEntry)
+	}
+	e.authBlocked = false
+	e.applyBlocked = false
 }
 
 // ── exposure arming (state side; emission lives in experiment_facts.go) ─────
@@ -4313,6 +4329,9 @@ func (c *Client) experimentCycle(ctx context.Context) {
 		return
 	}
 	c.sweepAllExperimentExposures(ctx)
+	// The subject handles' applications, within their own per-cycle budget.
+	budget := expMaxApplyRequestsPerCycle
+	c.sweepExperimentSubjects(ctx, true, false, &budget)
 }
 
 // revalidateDueExperiments is the cycle's revalidation: when the cadence is

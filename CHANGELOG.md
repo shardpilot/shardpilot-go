@@ -2,6 +2,15 @@
 
 ## v0.8.0-alpha — release preparation (not published)
 
+- One process can serve experiments to many players. `ExperimentSubject`
+  opens a handle for one player's `spcid_` subject and analytics identity;
+  its `Fetch`, `Variant`, `VariantPayload`, `Apply`, `SetConsent` and `Close`
+  keep assignments per handle, in memory, and never fall back to the client's
+  own subject or `Config.AnonymousID`. A handle acts only while that player's
+  consent is granted and the client's consent admits the experiment plane.
+  New `ErrInvalidExperimentSubject`. Outcomes and age-band withdrawal on a
+  handle are not part of this release step.
+
 - Assignment, exposure apply, and outcome apply requests use the public
   `/api/cp/v1/runtime/experiments/` routes on `AppURL`.
 - Configuration and experiment responses use exact stable error codes, ignore
