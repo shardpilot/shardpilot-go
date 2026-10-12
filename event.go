@@ -78,4 +78,9 @@ type Event struct {
 	// string — and attestationSeal as attestation_seal.
 	rawEventTS      string
 	attestationSeal string
+
+	// encoded is the wire encoding built and measured at intake (see
+	// encodeAtIntake). Batches send these exact bytes; nil means the event
+	// is encoded when its batch is built.
+	encoded *intakeEncoding
 }

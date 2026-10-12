@@ -42,10 +42,11 @@ The run uses seven cases, each allowing one HTTP attempt and refusing redirects:
    and 2 for its second; standalone views use sequence 1. These are ordinary
    host events, not reserved session-lifecycle events.
 3. One event with a 3,072-byte padding property (its encoded envelope exceeds
-   2,048 bytes) beside one small event **in the same batch**. The required result
-   is HTTP 202, the large event `rejected` with `event_too_large`, and the small
-   event `accepted`. This checks the 2,048-byte enforce posture; a different limit
-   or log-only posture is a failed expectation, not proof of a server defect.
+   2,048 bytes), then one small event. The SDK must refuse the large event
+   locally with `ErrEventTooLarge` (`event_too_large`) and send nothing for it;
+   the required result for the small event is HTTP 202 with `accepted`. This
+   checks the SDK's per-event size precheck. The ingest's own per-event
+   rejection is covered by the ingest's tests, not by this sender.
 4. A valid SDK event whose Authorization header is removed at the transport
    boundary. Only HTTP 401 or 403 counts as the expected refusal.
 5. A deliberately recovered Go panic through `CapturePanic`.
@@ -89,10 +90,10 @@ verdicts fail the normal admission cases. Crash replies must echo the sent id,
 carry a fingerprint with non-whitespace content and not be suppressed. A successful run still requires
 separate Console/backend readback to establish storage, projection and visible
 product behavior. It does not prove any endpoint that it did not call.
-An oversized normal fixture still requires acceptance; `event_too_large` is a
-passing rejection only in the deliberate mixed-size case.
+No event over 2,048 bytes may reach the wire: an oversize element in any
+request fails the case, whatever the server answers.
 
 `go test ./examples/evidence` uses an in-memory RoundTripper. It opens no listener
 and makes no network request. It exercises accepted controls and false-success
-responses, including oversize acceptance, unauthenticated acceptance, suppression,
+responses, including an oversize element on the wire, unauthenticated acceptance, suppression,
 missing/wrong event ids, crash failure and credential echo.
