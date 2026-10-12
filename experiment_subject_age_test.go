@@ -234,3 +234,25 @@ func TestAHandlesFetchWithAgeBandDeclaresTheBand(t *testing.T) {
 		t.Fatalf("age_band = %q and the caller's attributes %v; want adult sent and the map untouched", got, attributes)
 	}
 }
+
+// TestAHandlesNonAdultDeclarationLandsWhileTheClientRefuses: a declaration
+// made while the client's consent refuses the plane sends nothing, and the
+// earlier age-gated assignment does not serve again after the re-grant.
+func TestAHandlesNonAdultDeclarationLandsWhileTheClientRefuses(t *testing.T) {
+	rig := subjectAgeRig(t, ageGolden(t, "adult"))
+	s := newSubjectOrFail(t, rig.client, expSubjectA, "player-a")
+	if _, err := s.FetchWithAgeBand(context.Background(), ageGoldenExperiment, ExperimentAgeBandAdult, nil); err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	rig.client.SetConsent(false)
+	if _, err := s.FetchWithAgeBand(context.Background(), ageGoldenExperiment, ExperimentAgeBandUnderThreshold, nil); !errors.Is(err, ErrConsentDenied) {
+		t.Fatalf("a declaration under the client's denial: %v, want ErrConsentDenied", err)
+	}
+	if got := rig.script.requestCount(); got != 1 {
+		t.Fatalf("assignment requests = %d, want only the setup fetch", got)
+	}
+	rig.client.SetConsent(true)
+	if variant := s.Variant(ageGoldenExperiment); variant != "" {
+		t.Fatalf("after the re-grant the handle serves %q despite the non-adult declaration", variant)
+	}
+}

@@ -331,18 +331,20 @@ func (s *ExperimentSubject) Fetch(ctx context.Context, experimentKey string, att
 	if experimentKey == "" {
 		return ExperimentAssignmentResult{}, expFetchError("experiment_key_required")
 	}
+	// The declaration is registered before the refusal check, as on the
+	// client: a refused declaration ends unanswered and withdraws.
 	s.mu.Lock()
-	if err := s.refusalLocked(); err != nil {
-		s.mu.Unlock()
-		return ExperimentAssignmentResult{}, err
-	}
 	consentSeq := s.consentSeq
 	s.fetchSeq++
 	seq := s.fetchSeq
 	declaration := s.beginDeclarationLocked(experimentKey, attributes, seq)
+	refusal := s.refusalLocked()
 	s.mu.Unlock()
 	if declaration != nil {
 		defer s.endDeclaration(experimentKey, declaration)
+	}
+	if refusal != nil {
+		return ExperimentAssignmentResult{}, refusal
 	}
 
 	normalized, dropped := normalizeExperimentAssignmentAttributes(attributes)
@@ -397,7 +399,7 @@ func (s *ExperimentSubject) Fetch(ctx context.Context, experimentKey string, att
 	// client's own settle applies, for this handle's state.
 	s.mu.Lock()
 	e.mu.Lock()
-	refusal := s.refusalLocked()
+	refusal = s.refusalLocked()
 	if refusal == nil && (s.consentSeq != consentSeq || c.consentEpoch.Load() != dispatchConsentEpoch) {
 		// A consent change while the request was in flight: the answer
 		// predates it and installs nothing.
