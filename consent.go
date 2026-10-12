@@ -325,6 +325,7 @@ func (c *Client) applyConsentDecision(decision ConsentDecision, notices ...Conse
 			// facts collapse server-side on their deterministic event ids)
 			// instead of under-counting real treatment.
 			c.exp.onAnalyticsPurge()
+			c.purgeExperimentSubjects()
 		}
 	}
 	c.lifecycleMu.Unlock()

@@ -105,7 +105,7 @@ func (c *Client) enqueueExperimentFact(event Event, atClose bool) (uint64, error
 	if c.consentFloorEnabled() && c.consentUndecided() {
 		return 0, ErrConsentUnknown
 	}
-	if c.consentFloorEnabled() && event.omitUserID && c.consentFloorUserScoped() {
+	if c.consentFloorEnabled() && event.omitUserID && event.subject == nil && c.consentFloorUserScoped() {
 		// The floor's grant covers the configured consent actor — on a
 		// server or backend source with a UserID, the verified user — but
 		// this SDK fact rides the ANONYMOUS identity alone on the wire
@@ -114,7 +114,8 @@ func (c *Client) enqueueExperimentFact(event Event, atClose bool) (uint64, error
 		// worse, it would persist under the wrong actor's grant. The same
 		// actor rule Enqueue applies to overridden identities applies
 		// here: refused, retryably (owed snapshots stay armed for a
-		// session whose actor shape may change).
+		// session whose actor shape may change). A subject handle's fact is
+		// not the configured actor's: its player's consent admitted it.
 		return 0, ErrConsentActorMismatch
 	}
 	event, err := c.prepareEvent(event)
@@ -1112,8 +1113,10 @@ func (c *Client) dropWithdrawnSpoolChunkMembers(chunk []spoolEntry) []spoolEntry
 // field is worker-owned state (the retainedRequest discipline).
 func (c *Client) dropWithdrawnExperimentFacts(batch []Event, backoffAttempt *int) []Event {
 	// An age refusal's per-experiment withdrawal filters at the same
-	// dispatch points (dropKeyWithdrawnExperimentFacts).
+	// dispatch points (dropKeyWithdrawnExperimentFacts), and so does a
+	// player's denial on a subject handle (dropDeniedSubjectFacts).
 	batch = c.dropKeyWithdrawnExperimentFacts(batch, backoffAttempt)
+	batch = c.dropDeniedSubjectFacts(batch, backoffAttempt)
 	epoch := c.expFactPurgeEpoch.Load()
 	if epoch == c.workerSeenExpFactPurge {
 		return batch
@@ -1183,9 +1186,10 @@ func (c *Client) dropWithdrawnExperimentFacts(batch []Event, backoffAttempt *int
 // seen-epoch field is worker-owned state, exactly like
 // dropWithdrawnExperimentFacts).
 func (c *Client) dropWithdrawnBuiltBatch(request batchRequest, batch []Event, backoffAttempt *int) (batchRequest, []Event) {
-	// The same re-check for an age refusal landing in that window
-	// (dropKeyWithdrawnBuiltBatch).
+	// The same re-check for an age refusal, or a player's denial on a
+	// subject handle, landing in that window.
 	request, batch = c.dropKeyWithdrawnBuiltBatch(request, batch, backoffAttempt)
+	request, batch = c.dropDeniedSubjectBuiltBatch(request, batch, backoffAttempt)
 	epoch := c.expFactPurgeEpoch.Load()
 	if epoch == c.workerSeenExpFactPurge {
 		return request, batch
@@ -1902,6 +1906,7 @@ func (c *Client) closeExperimentPreFlush() {
 		// Sealed applications only: the one bounded apply attempt comes
 		// after the flush (closeExperimentPostFlush).
 		c.sweepAllExperimentExposuresMode(nil, true, false)
+		c.sweepExperimentSubjects(nil, false, true, nil)
 	}
 	// Any dead-letters a locked capture deferred must not be lost at close.
 	c.drainDeferredSpoolLetters()
@@ -1936,13 +1941,14 @@ func (c *Client) closeExperimentPostFlush(ctx context.Context) {
 		// passes only hand already-sealed facts to the queue as room frees.
 		network := true
 		for {
-			before := c.owedExperimentExposureCount()
+			before := c.owedExperimentExposureCount() + c.owedExperimentSubjectCount()
 			if before == 0 {
 				break
 			}
 			c.sweepAllExperimentExposuresMode(ctx, true, network)
+			c.sweepExperimentSubjects(ctx, network, true, nil)
 			network = false
-			after := c.owedExperimentExposureCount()
+			after := c.owedExperimentExposureCount() + c.owedExperimentSubjectCount()
 			if after < before {
 				// Deliver what the sweep enqueued so the next pass has
 				// room; a failed flush leaves the facts for the worker's
@@ -1981,6 +1987,9 @@ func (c *Client) closeExperimentPostFlush(ctx context.Context) {
 		c.stats.setLastError("experiment_exposures_discarded_at_close")
 		c.logf("shardpilot experiments: %d owed experiment fact(s) discarded at close (counted in Stats.Dropped; %d never sealed, counted unsealed_at_close; %d sealed and not enqueued, counted undelivered_at_close)", remaining, unsealed, remaining-unsealed)
 	}
+	// The subject handles end here, counting what they still owe the same
+	// way.
+	c.closeExperimentSubjects()
 }
 
 func (c *Client) owedExperimentExposureCount() int {

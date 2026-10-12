@@ -150,6 +150,11 @@ type Client struct {
 	expKeyWithdrawEpoch   atomic.Uint64
 	workerSeenKeyWithdraw uint64
 
+	// expSubjects is the open ExperimentSubject handles, guarded by
+	// expSubjectsMu (taken after lifecycleMu, before a handle's own lock).
+	expSubjectsMu sync.Mutex
+	expSubjects   map[*ExperimentSubject]struct{}
+
 	// expFactSeq numbers the experiment facts handed to the analytics queue
 	// (Event.expFactSeq), under lifecycleMu with the send, so the queue holds
 	// them in sequence order. expPipelineLow is the worker's low-water mark:

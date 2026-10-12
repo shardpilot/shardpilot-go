@@ -2,6 +2,14 @@
 
 ## v0.8.0-alpha — release preparation (not published)
 
+- One process can serve experiments to many players. `ExperimentSubject`
+  opens a handle for one player's `spcid_` subject and analytics identity;
+  its `Fetch`, `Variant`, `VariantPayload`, `Apply`, `SetConsent` and `Close`
+  keep assignments per handle, in memory, and never fall back to the client's
+  own subject or `Config.AnonymousID`. A handle acts only while that player's
+  consent is granted and the client's consent admits the experiment plane.
+  New `ErrInvalidExperimentSubject`. Outcomes and age-band withdrawal on a
+  handle are not part of this release step.
 - Every request now carries `X-ShardPilot-SDK: go/<version>` (event batches,
   consent, remote config, the experiment routes and crash ingest). The version
   is a constant in code, which a test holds to the README's latest-tag claim.

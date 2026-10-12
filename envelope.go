@@ -87,6 +87,12 @@ type eventEnvelope struct {
 	// so a built or retained request can be filtered for an age refusal's
 	// withdrawn facts member by member. Unexported and never serialized.
 	expKeyWithdrawEpoch uint64
+
+	// subject and subjectDenials are the event's, carried so a built or
+	// retained request can be filtered for a player's later denial member
+	// by member. Unexported and never serialized.
+	subject        *ExperimentSubject
+	subjectDenials uint64
 }
 
 // Experiment major 2 names the signed scope members with literal keys.
@@ -188,6 +194,8 @@ func (c *Client) buildEnvelope(event Event) (eventEnvelope, error) {
 
 		internalIdentityFact: event.omitUserID,
 		expKeyWithdrawEpoch:  event.expKeyWithdrawEpoch,
+		subject:              event.subject,
+		subjectDenials:       event.subjectDenials,
 	}, nil
 }
 

@@ -2204,6 +2204,12 @@ func (c *Client) partitionSpoolEligible(request batchRequest) (eligible, refused
 // OFF keeps the released strict rule — both envelope identifiers equal to
 // the configured tuple — unchanged.
 func (c *Client) spoolActorEligible(envelope eventEnvelope) bool {
+	if envelope.subject != nil {
+		// A subject handle's fact is admitted by its player's consent, which
+		// lives only in the handle: it is retried in memory, never spooled,
+		// so a later denial by that player reaches every copy.
+		return false
+	}
 	if envelope.internalIdentityFact {
 		if c.consentFloorEnabled() && c.consentFloorUserScoped() {
 			// The mirror of intake's anonymous-actor gate

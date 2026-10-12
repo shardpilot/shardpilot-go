@@ -161,4 +161,10 @@ var (
 	// assignment is served but this session has not applied it: an outcome
 	// follows an application, so call ApplyExperimentVariant first.
 	ErrExperimentNotApplied = errors.New("shardpilot experiment has not been applied in this session")
+
+	// ErrInvalidExperimentSubject is returned by ExperimentSubject for a
+	// SubjectKey outside the spcid_ grammar, an AnonymousID over 512 bytes or
+	// an unknown consent value, and by its Fetch when the platform refuses
+	// the subject. The handle never retries with another subject.
+	ErrInvalidExperimentSubject = errors.New("invalid shardpilot experiment subject")
 )
