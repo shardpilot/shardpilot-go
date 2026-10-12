@@ -274,8 +274,11 @@ while consent is unknown. This server-side SDK does the inverse:
   re-apply it at startup. The opt-in consent floor restores all persisted states.
 - **Consent receipts are fire-and-forget.** A `SetConsent` call also
   transmits the decision to ShardPilot in the background — but only when an
-  actor identity is configured (`Config.UserID`, else `Config.AnonymousID`);
-  with neither set the decision is local-only. Receipts are sent by a single
+  admissible consent actor is configured: a client source uses
+  `Config.AnonymousID` (kind `anon`); a server or backend source uses
+  `Config.UserID` (kind `user_verified`), else `Config.AnonymousID` (kind
+  `anon`). With neither set the decision is local-only; a client source with
+  only `Config.UserID` refuses grants and keeps denials local. Receipts are sent by a single
   per-client sender in call order, buffered at most **16 pending decisions**
   (overflow discards the oldest; the newest decision wins server-side).
   Failures are only logged. `Close` waits (bounded by its context) for
