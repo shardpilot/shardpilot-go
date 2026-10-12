@@ -4,8 +4,7 @@
 
 - Every request now carries `X-ShardPilot-SDK: go/<version>` (event batches,
   consent, remote config, the experiment routes and crash ingest). The version
-  is a constant in code, checked against the release tag by
-  `scripts/check_release_consistency.sh`.
+  is a constant in code, which a test holds to the README's latest-tag claim.
 
 - Assignment, exposure apply, and outcome apply requests use the public
   `/api/cp/v1/runtime/experiments/` routes on `AppURL`.
