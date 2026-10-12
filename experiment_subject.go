@@ -580,6 +580,13 @@ func (s *ExperimentSubject) commit(head *expSubjectOwed, event Event, atClose bo
 		return true // withdrawn meanwhile: the next pass reads the queue again
 	}
 	if _, err := s.c.enqueueExperimentFact(event, atClose); err != nil {
+		if errors.Is(err, ErrEventTooLarge) {
+			// Ingest rejects this fact on every attempt: it leaves the
+			// queue, counted once, and never holds the handle's later facts.
+			s.c.logf("shardpilot experiments: a subject handle's sealed exposure for experiment %q exceeds the 2048-byte ingest limit; dropped (event_too_large)", head.experimentKey)
+			s.retire(head, expDropEventTooLarge)
+			return true
+		}
 		return false
 	}
 	s.mu.Lock()

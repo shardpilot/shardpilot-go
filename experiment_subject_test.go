@@ -309,3 +309,43 @@ func TestExperimentSubjectsRunConcurrently(t *testing.T) {
 		}
 	}
 }
+
+// TestAnOversizeSealedFactLeavesAHandlesQueue: a handle's sealed fact that
+// ingest would reject is dropped once and leaves the handle's queue, so the
+// handle's later facts are delivered.
+func TestAnOversizeSealedFactLeavesAHandlesQueue(t *testing.T) {
+	rig := newExpHopRig(t, nil)
+	s := newSubjectOrFail(t, rig.client, expSubjectA, "player-a")
+	rig.script.apply.mu.Lock()
+	rig.script.apply.padProps = 3 * maxEventSceneBytes
+	rig.script.apply.mu.Unlock()
+	subjectFetchOrFail(t, s)
+	s.Apply(expTestScopeKey)
+	rig.cycle()
+
+	rig.script.apply.mu.Lock()
+	rig.script.apply.padProps = 0
+	rig.script.apply.mu.Unlock()
+	const second = "exp-second"
+	rig.answerNext(expScriptResponse{status: 200, body: expServedBodyForKey(second)})
+	if _, err := s.Fetch(context.Background(), second, nil); err != nil {
+		t.Fatalf("Fetch(%q): %v", second, err)
+	}
+	s.Apply(second)
+	rig.cycle()
+	rig.cycle()
+	flushOrFail(t, rig.client)
+	if owed := s.owedCount(); owed != 0 {
+		t.Fatalf("%d application(s) still owed: the oversize fact holds the handle's queue", owed)
+	}
+	if got := rig.drops(expDropEventTooLarge); got != 1 {
+		t.Fatalf("ExperimentExposureDrops[event_too_large] = %d, want 1", got)
+	}
+	facts := rig.capture.exposures()
+	if len(facts) != 1 {
+		t.Fatalf("delivered %d exposure(s), want the second experiment's one", len(facts))
+	}
+	if props, _ := facts[0]["props"].(map[string]any); props["experiment_key"] != second {
+		t.Fatalf("delivered %v, want the second experiment's exposure", facts[0])
+	}
+}
