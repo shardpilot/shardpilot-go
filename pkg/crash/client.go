@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/shardpilot/shardpilot-go/internal/platform"
+	"github.com/shardpilot/shardpilot-go/internal/sdkversion"
 )
 
 const defaultHTTPTimeout = 30 * time.Second
@@ -433,6 +434,7 @@ func (c *Client) postOnce(ctx context.Context, payload []byte) (Result, error) {
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Authorization", "Bearer "+c.apiKey)
+	request.Header.Set(sdkversion.HeaderName, sdkversion.HeaderValue)
 
 	response, err := c.httpClient.Do(request)
 	if err != nil {

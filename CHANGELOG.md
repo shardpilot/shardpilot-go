@@ -2,6 +2,11 @@
 
 ## v0.8.0-alpha — release preparation (not published)
 
+- Every request now carries `X-ShardPilot-SDK: go/<version>` (event batches,
+  consent, remote config, the experiment routes and crash ingest). The version
+  is a constant in code, checked against the release tag by
+  `scripts/check_release_consistency.sh`.
+
 - Assignment, exposure apply, and outcome apply requests use the public
   `/api/cp/v1/runtime/experiments/` routes on `AppURL`.
 - Configuration and experiment responses use exact stable error codes, ignore

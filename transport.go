@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"github.com/shardpilot/shardpilot-go/internal/sdkversion"
 )
 
 type transport interface {
@@ -276,6 +278,7 @@ func (t *httpTransport) FetchRemoteConfig(ctx context.Context, request remoteCon
 		return remoteConfigResponse{}, fmt.Errorf("create shardpilot remote config request: %w", err)
 	}
 	httpRequest.Header.Set("Authorization", "Bearer "+request.bearer)
+	httpRequest.Header.Set(sdkversion.HeaderName, sdkversion.HeaderValue)
 	if request.body != nil {
 		httpRequest.Header.Set("Content-Type", "application/json")
 	}
@@ -383,6 +386,7 @@ func (t *httpTransport) postBody(ctx context.Context, endpoint string, payload [
 	}
 	httpRequest.Header.Set("Content-Type", "application/json")
 	httpRequest.Header.Set("Authorization", "Bearer "+t.token)
+	httpRequest.Header.Set(sdkversion.HeaderName, sdkversion.HeaderValue)
 	if compressed {
 		httpRequest.Header.Set("Content-Encoding", "gzip")
 	}
