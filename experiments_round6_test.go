@@ -176,7 +176,7 @@ func TestCaptureFailureKeepsCacheUntilPairLands(t *testing.T) {
 func TestFailedRemintPersistCondemnsOldScope(t *testing.T) {
 	script := &expScript{}
 	script.push(200, expAssignedBody("1"))
-	script.push(400, `{"error":"`+expSentinelSubjectGrammar+`"}`)
+	script.push(400, `{"error":{"code":"`+expSentinelSubjectGrammar+`"}}`)
 	script.push(200, expAssignedBody("2"))
 	capture := &expWireCapture{}
 	server := newExperimentServer(t, script, capture)

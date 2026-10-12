@@ -305,7 +305,7 @@ func TestAnOutcomeRefusalIsCountedAsAnOutcomeDrop(t *testing.T) {
 
 func TestTheSentinelWithdrawsAnOwedOutcome(t *testing.T) {
 	rig := newAppliedOutcomeRig(t, nil)
-	rig.script.outcome.push(403, `{"error":"`+expSentinelRealSubjectsDisabled+`"}`)
+	rig.script.outcome.push(403, `{"error":{"code":"`+expSentinelRealSubjectsDisabled+`"}}`)
 	if err := rig.client.TrackExperimentOutcome(expTestScopeKey, "purchase", 1); err != nil {
 		t.Fatalf("TrackExperimentOutcome: %v", err)
 	}
@@ -399,7 +399,7 @@ func TestARepeatApplicationDoesNotMoveTheOutcomesApplication(t *testing.T) {
 // refused anyway.
 func TestASubjectRemintLeavesNoApplicationToFollow(t *testing.T) {
 	rig := newExpHopRig(t, nil, expAssignedBody("1"))
-	rig.script.push(400, `{"error":"experiment metadata must use synthetic local-safe identifiers only"}`)
+	rig.script.push(400, `{"error":{"code":"subject_id_invalid","message":"experiment metadata must use synthetic local-safe identifiers only"}}`)
 	rig.script.push(200, expAssignedBody("2"))
 	fetchAssignment(t, rig.client, expTestScopeKey)
 	rig.client.ApplyExperimentVariant(expTestScopeKey)

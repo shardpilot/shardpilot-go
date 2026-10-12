@@ -220,7 +220,6 @@ func TestParseExperimentVerdictShapes(t *testing.T) {
 		{"assigned missing variant_key", strings.Replace(expAssignedBody("3"), `"variant_key":"treatment"`, `"variant_key":" "`, 1)},
 		{"assigned missing unit", strings.Replace(expAssignedBody("3"), `{"assignment_unit":"client_id"}`, `{}`, 1)},
 		{"assigned array payload", strings.Replace(expAssignedBody("3"), `{"speed":2}`, `[1,2]`, 1)},
-		{"unknown reason", `{"assigned":false,"reason":"experiment_paused"}`},
 		{"echo app mismatch", strings.Replace(expAssignedBody("3"), `"app_key":"app-test"`, `"app_key":"other-app"`, 1)},
 		{"echo env mismatch", strings.Replace(expAssignedBody("3"), `"environment_key":"develop"`, `"environment_key":"prod"`, 1)},
 		{"echo experiment mismatch", strings.Replace(expAssignedBody("3"), `"experiment_key":"`+expTestScopeKey+`"`, `"experiment_key":"exp-other"`, 1)},
@@ -311,7 +310,7 @@ func TestApplyExperimentAssignmentClassification(t *testing.T) {
 	})
 
 	t.Run("403 sentinel drops all; near misses stay generic", func(t *testing.T) {
-		_, outcome, _ := applyExperimentAssignment(cached, expTestResponse(403, `{"error":"experiment real-subject assignment is disabled"}`), scope, 42)
+		_, outcome, _ := applyExperimentAssignment(cached, expTestResponse(403, `{"error":{"code":"real_subjects_disabled","message":"experiment real-subject assignment is disabled"}}`), scope, 42)
 		if !outcome.dropAll || !outcome.authBlocked {
 			t.Fatalf("expected sentinel drop_all, got %+v", outcome)
 		}
@@ -323,7 +322,7 @@ func TestApplyExperimentAssignmentClassification(t *testing.T) {
 			expTestResponse(403, `{"message":"experiment real-subject assignment is disabled"}`),
 			expTestResponse(403, `{"error":"workspace suspended"}`),
 			// A 401 carrying the sentinel body is NOT the sentinel (status-gated).
-			expTestResponse(401, `{"error":"experiment real-subject assignment is disabled"}`),
+			expTestResponse(401, `{"error":{"code":"real_subjects_disabled","message":"experiment real-subject assignment is disabled"}}`),
 		}
 		for i, resp := range nearMisses {
 			_, outcome, failure := applyExperimentAssignment(cached, resp, scope, 42)
@@ -335,7 +334,7 @@ func TestApplyExperimentAssignmentClassification(t *testing.T) {
 			}
 		}
 		// A truncated sentinel body cannot be trusted for equality.
-		truncated := expTestResponse(403, `{"error":"experiment real-subject assignment is disabled"}`)
+		truncated := expTestResponse(403, `{"error":{"code":"real_subjects_disabled","message":"experiment real-subject assignment is disabled"}}`)
 		truncated.bodyIncomplete = true
 		_, outcome, _ = applyExperimentAssignment(cached, truncated, scope, 42)
 		if outcome.dropAll {
@@ -354,7 +353,7 @@ func TestApplyExperimentAssignmentClassification(t *testing.T) {
 	})
 
 	t.Run("400 grammar sentinel remints; other 400 drops", func(t *testing.T) {
-		_, outcome, failure := applyExperimentAssignment(cached, expTestResponse(400, `{"error":"experiment metadata must use synthetic local-safe identifiers only"}`), scope, 42)
+		_, outcome, failure := applyExperimentAssignment(cached, expTestResponse(400, `{"error":{"code":"subject_id_invalid","message":"experiment metadata must use synthetic local-safe identifiers only"}}`), scope, 42)
 		if failure != "bad_request" || !outcome.remint || outcome.dropEntry {
 			t.Fatalf("expected remint outcome, got %+v failure=%q", outcome, failure)
 		}
@@ -362,7 +361,7 @@ func TestApplyExperimentAssignmentClassification(t *testing.T) {
 		if failure != "bad_request" || outcome.remint || !outcome.dropEntry || !outcome.authoritative {
 			t.Fatalf("expected permanent 400 drop, got %+v failure=%q", outcome, failure)
 		}
-		truncated := expTestResponse(400, `{"error":"experiment metadata must use synthetic local-safe identifiers only"}`)
+		truncated := expTestResponse(400, `{"error":{"code":"subject_id_invalid","message":"experiment metadata must use synthetic local-safe identifiers only"}}`)
 		truncated.bodyIncomplete = true
 		_, outcome, _ = applyExperimentAssignment(cached, truncated, scope, 42)
 		if outcome.remint || !outcome.dropEntry {
@@ -415,30 +414,13 @@ func TestApplyExperimentAssignmentClassification(t *testing.T) {
 		}
 	})
 
-	t.Run("out-of-contract statuses are transient serve-stale", func(t *testing.T) {
-		// The fleet-contract status table: every status this contract never
-		// sends lands in the EXPLICIT transient class — a closed transient
-		// result (serve the last-known-good under the attribute-match rule),
-		// cache retained, cadence kept probing, the per-key fence SETTLING
-		// (the server answered: authoritative for ordering), and the auth
-		// latch invariant in both directions. Never a drop: a stray proxy
-		// 409 must not kill a valid cached treatment.
+	t.Run("unexpected redirects and client errors are terminal", func(t *testing.T) {
 		for _, status := range []int{301, 302, 303, 304, 307, 402, 405, 409, 410, 413, 418, 422, 451} {
-			result, outcome, failure := applyExperimentAssignment(cached, expTestResponse(status, ``), scope, 42)
-			if failure != "" || !result.FromCache || result.Code != "http_"+itoa(status) {
-				t.Fatalf("status %d: expected transient serve-stale, got %+v failure=%q", status, result, failure)
-			}
-			if !outcome.transient || !outcome.authoritative {
-				t.Fatalf("status %d: expected the transient class with a settling fence, got %+v", status, outcome)
-			}
-			if outcome.dropEntry || outcome.dropAll || outcome.authBlocked || outcome.newEntry != nil {
-				t.Fatalf("status %d: cache and latch must stay untouched, got %+v", status, outcome)
-			}
-			// With NO cached entry the same status is the closed transient
-			// failure — code intact, still nothing dropped or latched.
-			bare, bareOutcome, bareFailure := applyExperimentAssignment(nil, expTestResponse(status, ``), scope, 42)
-			if bareFailure != "http_"+itoa(status) || bare.Assigned || !bareOutcome.transient {
-				t.Fatalf("status %d without cache: expected closed transient failure, got %+v failure=%q", status, bare, bareFailure)
+			for _, cache := range []*expEntry{cached, nil} {
+				result, outcome, failure := applyExperimentAssignment(cache, expTestResponse(status, ``), scope, 42)
+				if failure != "http_"+itoa(status) || result.FromCache || result.Assigned || outcome.transient || !outcome.authoritative || !outcome.dropEntry || !outcome.preserveAuth || outcome.authBlocked || outcome.dropAll {
+					t.Fatalf("status %d: result=%+v outcome=%+v failure=%q", status, result, outcome, failure)
+				}
 			}
 		}
 	})

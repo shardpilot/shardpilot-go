@@ -173,7 +173,7 @@ func TestExperimentAgeBandAPIRejectsInvalidAndConflictingDeclarations(t *testing
 	}
 }
 
-func TestExperimentAgeUnknownReasonRemainsMalformed(t *testing.T) {
+func TestExperimentAgeUnknownReasonWithdrawsAssignment(t *testing.T) {
 	script := &expScript{}
 	script.push(200, ageGolden(t, "adult"))
 	script.push(200, strings.Replace(ageGolden(t, "undeclared"), `"age_ineligible"`, `"future_age_reason"`, 1))
@@ -184,11 +184,11 @@ func TestExperimentAgeUnknownReasonRemainsMalformed(t *testing.T) {
 	attrs := map[string]string{"age_band": "adult"}
 	for i := 0; i < 2; i++ {
 		result, err := client.FetchExperimentAssignment(context.Background(), ageGoldenExperiment, attrs)
-		if err != nil || !result.Assigned || result.FromCache != (i == 1) {
+		if err != nil || result.Assigned != (i == 0) || result.FromCache {
 			t.Fatalf("fetch %d: result=%+v err=%v", i, result, err)
 		}
-		if i == 1 && result.Code != "malformed_response" {
-			t.Fatalf("unknown reason must remain malformed: %+v", result)
+		if i == 1 && result.Reason != "unknown" {
+			t.Fatalf("unknown reason must withdraw the assignment: %+v", result)
 		}
 	}
 }

@@ -370,7 +370,10 @@ func TestRemoteConfigTransientOutcomesServeCacheThenFail(t *testing.T) {
 		{rcScriptStep{status: 200, body: `[]`}, "malformed_response"},
 		{rcScriptStep{status: 200, body: `{"pad":"` + strings.Repeat("a", rcMaxBodyBytes) + `"}`}, "malformed_response"},
 	}
+	clock := &stubClock{now: time.Now()}
+	client.clock = clock
 	for _, tc := range transients {
+		clock.now = clock.now.Add(2 * time.Minute)
 		script.Store(tc.step)
 		result, err := client.FetchRemoteConfig(context.Background())
 		if err != nil {
@@ -423,13 +426,13 @@ func TestRemoteConfigUnauthorizedFailsClosed(t *testing.T) {
 			t.Fatalf("expected unauthorized for %d, got %v", status, err)
 		}
 		// Fail closed means refuse to serve — not delete: the cache file is
-		// byte-identical and the getter snapshot still serves.
+		// byte-identical for an explicit refetch; getters serve defaults.
 		cacheAfter, _ := os.ReadFile(cachePath)
 		if string(cacheBefore) != string(cacheAfter) {
 			t.Fatalf("%d must not disturb the cache file", status)
 		}
-		if got := client.RemoteConfigString("k", "fallback"); got != "v" {
-			t.Fatalf("%d must leave the getter snapshot intact, got %q", status, got)
+		if got := client.RemoteConfigString("k", "fallback"); got != "fallback" {
+			t.Fatalf("%d must close the getter snapshot, got %q", status, got)
 		}
 	}
 
@@ -466,8 +469,8 @@ func TestRemoteConfigPermanentFailuresNeverServeCache(t *testing.T) {
 		if string(cacheBefore) != string(cacheAfter) {
 			t.Fatalf("%d must not disturb the cache file", status)
 		}
-		if got := client.RemoteConfigString("k", "fallback"); got != "v" {
-			t.Fatalf("%d must leave the getter snapshot intact, got %q", status, got)
+		if got := client.RemoteConfigString("k", "fallback"); got != "fallback" {
+			t.Fatalf("%d must close the getter snapshot, got %q", status, got)
 		}
 	}
 }
@@ -982,7 +985,7 @@ func TestRemoteConfigCooldownMonotonicMax(t *testing.T) {
 	}
 }
 
-func TestRemoteConfigRetryAfterParseDigitsOnly(t *testing.T) {
+func TestRemoteConfigRetryAfterParseStandardForms(t *testing.T) {
 	cases := []struct {
 		header  string
 		seconds int
@@ -995,8 +998,8 @@ func TestRemoteConfigRetryAfterParseDigitsOnly(t *testing.T) {
 		{"-1", 0, false},
 		{"1.5", 0, false},
 		{"soon", 0, false},
-		// HTTP-date is deliberately NOT accepted on this route.
-		{"Wed, 01 Jul 2026 00:00:07 GMT", 0, false},
+		// A past HTTP-date is present and has a zero floor.
+		{"Wed, 01 Jul 2026 00:00:07 GMT", 0, true},
 		{"99999999999999999999", rcCooldownClampSeconds, true},
 		{"999999999", rcCooldownClampSeconds, true},
 	}
@@ -1035,8 +1038,8 @@ func TestRemoteConfigRedirectClassifiedPermanent(t *testing.T) {
 	if string(cacheBefore) != string(cacheAfter) {
 		t.Fatalf("a redirect must not disturb the cache file")
 	}
-	if got := client.RemoteConfigString("k", "fallback"); got != "v" {
-		t.Fatalf("a redirect must leave the getter snapshot intact, got %q", got)
+	if got := client.RemoteConfigString("k", "fallback"); got != "fallback" {
+		t.Fatalf("a redirect must close the getter snapshot, got %q", got)
 	}
 }
 
@@ -1218,8 +1221,8 @@ func TestRemoteConfigStalledBodyPreservesStatus(t *testing.T) {
 	if string(cacheBefore) != string(cacheAfter) {
 		t.Fatalf("an unauthorized outcome must leave the cache file untouched")
 	}
-	if got := client.RemoteConfigString("k", "fallback"); got != "v" {
-		t.Fatalf("an unauthorized outcome must leave the getter snapshot intact, got %q", got)
+	if got := client.RemoteConfigString("k", "fallback"); got != "fallback" {
+		t.Fatalf("an unauthorized outcome must close the getter snapshot, got %q", got)
 	}
 }
 
@@ -1340,8 +1343,8 @@ func TestRemoteConfigTruncatedResponsesClassifyByStatus(t *testing.T) {
 	if string(cacheBefore) != string(cacheAfter) {
 		t.Fatalf("a truncated 401 must not disturb the cache file")
 	}
-	if got := client.RemoteConfigString("k", "fallback"); got != "v" {
-		t.Fatalf("a truncated 401 must leave the getter snapshot intact, got %q", got)
+	if got := client.RemoteConfigString("k", "fallback"); got != "fallback" {
+		t.Fatalf("a truncated 401 must close the getter snapshot, got %q", got)
 	}
 
 	// A truncated 200 is the one outcome that NEEDED its body: transient,

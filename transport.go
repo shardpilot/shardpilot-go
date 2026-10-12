@@ -42,10 +42,9 @@ type remoteConfigRequest struct {
 // status and headers already arrived and are real information, so a
 // truncated response still classifies BY STATUS (a truncated 401 fails
 // closed exactly like a whole one; only a 200 needs its body at all).
-// retryAfterSeconds carries a 429's Retry-After parsed digits-only
-// (HTTP-date is NOT accepted on this route — the server contract sends
-// integer seconds >= 1); retryAfterPresent distinguishes a parsed header
-// from an absent or malformed one.
+// retryAfterSeconds carries a Retry-After floor parsed from delta-seconds
+// or HTTP-date and rounded up; retryAfterPresent distinguishes a parsed
+// header from an absent or malformed one.
 type remoteConfigResponse struct {
 	status            int
 	body              []byte
@@ -319,29 +318,11 @@ func (t *httpTransport) FetchRemoteConfig(ctx context.Context, request remoteCon
 	return result, nil
 }
 
-// parseRemoteConfigRetryAfter reads a remote-config 429's Retry-After header
-// in digits-only delta-seconds form. Unlike the batch route's parseRetryAfter
-// it deliberately does NOT accept the HTTP-date form: the remote-config
-// server contract sends integer seconds >= 1, and the SDK-wide parse rule
-// for this route is digits-only. Anything else — absent, negative, a date, a
-// fraction — reports (0, false), which the cooldown treats as the 1s floor.
-// A digits-only value too large for int64 still means "wait a long time" and
-// saturates at the cooldown clamp instead of being ignored.
+// parseRemoteConfigRetryAfter accepts both Retry-After forms and rounds up
+// to whole seconds so the next request cannot precede an HTTP-date floor.
 func parseRemoteConfigRetryAfter(header string) (int, bool) {
-	header = strings.TrimSpace(header)
-	if header == "" {
-		return 0, false
-	}
-	for i := 0; i < len(header); i++ {
-		if header[i] < '0' || header[i] > '9' {
-			return 0, false
-		}
-	}
-	seconds, err := strconv.ParseInt(header, 10, 64)
-	if err != nil || seconds > rcCooldownClampSeconds {
-		return rcCooldownClampSeconds, true
-	}
-	return int(seconds), true
+	wait, present := parseRetryAfter(header)
+	return int((wait + time.Second - 1) / time.Second), present
 }
 
 // postJSON posts one JSON request to an ingest endpoint. schemaRevision, when

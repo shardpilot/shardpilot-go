@@ -4,6 +4,14 @@
 
 - Assignment, exposure apply, and outcome apply requests use the public
   `/api/cp/v1/runtime/experiments/` routes on `AppURL`.
+- Configuration and experiment responses use exact stable error codes, ignore
+  unknown members, and accept valid read/sealed-apply bodies throughout 2xx.
+  Unknown assignment reasons or units become not assigned with reason `unknown`.
+  Terminal config responses close getters; an unpublished config clears its cache.
+  Config retries use both Retry-After forms or exponential backoff with jitter.
+  Apply conflicts drop the fact and schedule a newer assignment fetch, including
+  when the cached assignment was removed. Code-based decisions require a server
+  that publishes the structured error envelope.
 
 - Batch, consent, and crash writes settle on every HTTP 2xx, including an
   empty, malformed, truncated, or oversized response body. Unparsed successes

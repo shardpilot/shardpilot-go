@@ -21,7 +21,7 @@ func TestOverLimitSentinelBodiesReadGeneric(t *testing.T) {
 	scope := expTestRequestScope()
 	pad := strings.Repeat(" ", expMaxBodyBytes)
 
-	over403 := expTestResponse(403, `{"error":"`+expSentinelRealSubjectsDisabled+`"}`+pad)
+	over403 := expTestResponse(403, `{"error":{"code":"`+expSentinelRealSubjectsDisabled+`"}}`+pad)
 	_, outcome, failure := applyExperimentAssignment(nil, over403, scope, 42)
 	if failure != "unauthorized" || !outcome.authBlocked || !outcome.authoritative {
 		t.Fatalf("an over-limit 403 still fails closed generically, got %+v failure=%q", outcome, failure)
@@ -30,7 +30,7 @@ func TestOverLimitSentinelBodiesReadGeneric(t *testing.T) {
 		t.Fatalf("an over-limit 403 body must never read as the real-subjects sentinel")
 	}
 
-	over400 := expTestResponse(400, `{"error":"`+expSentinelSubjectGrammar+`"}`+pad)
+	over400 := expTestResponse(400, `{"error":{"code":"`+expSentinelSubjectGrammar+`"}}`+pad)
 	_, outcome400, _ := applyExperimentAssignment(nil, over400, scope, 42)
 	if outcome400.remint {
 		t.Fatalf("an over-limit 400 body must never read as the grammar sentinel")
@@ -41,12 +41,12 @@ func TestOverLimitSentinelBodiesReadGeneric(t *testing.T) {
 
 	// In-limit sanity: the exact sentinels still classify.
 	_, sentinel403, _ := applyExperimentAssignment(nil,
-		expTestResponse(403, `{"error":"`+expSentinelRealSubjectsDisabled+`"}`), scope, 42)
+		expTestResponse(403, `{"error":{"code":"`+expSentinelRealSubjectsDisabled+`"}}`), scope, 42)
 	if !sentinel403.dropAll {
 		t.Fatalf("the in-limit real-subjects sentinel must still classify")
 	}
 	_, sentinel400, _ := applyExperimentAssignment(nil,
-		expTestResponse(400, `{"error":"`+expSentinelSubjectGrammar+`"}`), scope, 42)
+		expTestResponse(400, `{"error":{"code":"`+expSentinelSubjectGrammar+`"}}`), scope, 42)
 	if !sentinel400.remint {
 		t.Fatalf("the in-limit grammar sentinel must still classify")
 	}
@@ -90,7 +90,7 @@ func TestZeroRetryAfterHintSkipsDeferralAndBackoff(t *testing.T) {
 func TestLaneRemintRetryStillDispatches(t *testing.T) {
 	script := &expScript{}
 	script.push(200, expAssignedBody("1"))
-	script.push(400, `{"error":"`+expSentinelSubjectGrammar+`"}`)
+	script.push(400, `{"error":{"code":"`+expSentinelSubjectGrammar+`"}}`)
 	script.push(200, expAssignedBody("2"))
 	capture := &expWireCapture{}
 	server := newExperimentServer(t, script, capture)
@@ -184,7 +184,7 @@ func TestOwedSweepAndArmRefreshDoNotRace(t *testing.T) {
 func TestSentinelPurgesQueuedExperimentFacts(t *testing.T) {
 	script := &expScript{}
 	script.push(200, expAssignedBody("1"))
-	script.push(403, `{"error":"`+expSentinelRealSubjectsDisabled+`"}`)
+	script.push(403, `{"error":{"code":"`+expSentinelRealSubjectsDisabled+`"}}`)
 	capture := &expWireCapture{}
 	server := newExperimentServer(t, script, capture)
 	defer server.Close()
@@ -239,7 +239,7 @@ func TestSentinelPurgesQueuedExperimentFacts(t *testing.T) {
 func TestSentinelPurgesWorkerBatchFacts(t *testing.T) {
 	script := &expScript{}
 	script.push(200, expAssignedBody("1"))
-	script.push(403, `{"error":"`+expSentinelRealSubjectsDisabled+`"}`)
+	script.push(403, `{"error":{"code":"`+expSentinelRealSubjectsDisabled+`"}}`)
 	capture := &expWireCapture{}
 	server := newExperimentServer(t, script, capture)
 	defer server.Close()
@@ -289,7 +289,7 @@ func TestSentinelPurgesWorkerBatchFacts(t *testing.T) {
 func TestSentinelRemovesSpooledExperimentFacts(t *testing.T) {
 	script := &expScript{}
 	script.push(200, expAssignedBody("1"))
-	script.push(403, `{"error":"`+expSentinelRealSubjectsDisabled+`"}`)
+	script.push(403, `{"error":{"code":"`+expSentinelRealSubjectsDisabled+`"}}`)
 	capture := &expWireCapture{}
 	server := newExperimentServer(t, script, capture)
 	defer server.Close()

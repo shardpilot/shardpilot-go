@@ -510,6 +510,11 @@ func headerNameEnd(line string) (int, bool) {
 // this may be a list at all -- but a label lost on every transient failure is a
 // cost paid on ordinary captures, not on strange ones.
 var sdkTaxonomy = set(
+	"unknown",
+	"runtime_disabled",
+	"experiments_disabled",
+	"experiment_assignment_disabled",
+	"experiment_apply_disabled",
 	"kill_switch",
 	"targeting_unmatched",
 	"age_ineligible",
@@ -1038,11 +1043,19 @@ var benignTopLevel = func() map[string]bool {
 // carrying literal backslash spellings may fail to decode here though the SDK
 // accepted the captured bytes. That fails CLOSED -- no exemptions -- which is the
 // direction this file refuses in.
-// sdkWouldReadErrorText mirrors `experimentBodyErrorText`: the envelope's `error`
-// member decodes into a STRING or the SDK reads nothing from it.
-func sdkWouldReadErrorText(body string) bool {
+// sdkWouldReadErrorCode mirrors `experimentBodyErrorCode`: the envelope's `error`
+// member carries typed code, message, and details fields.
+func sdkWouldReadErrorCode(body string) bool {
 	var wire struct {
-		Error string `json:"error"`
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+			Details []struct {
+				Field   string `json:"field"`
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"details"`
+		} `json:"error"`
 	}
 	return json.Unmarshal([]byte(body), &wire) == nil
 }
@@ -1055,8 +1068,8 @@ func sdkWouldParseAssignment(body string) bool {
 	// ⚠ AND EVERY SEMANTIC GATE AFTER THE UNMARSHAL, not just the typed decode. The
 	// SDK keeps validating: echoed identity, a version that decodes to a number, and
 	// on the assigned branch a version of at least 1, non-empty assignment and variant
-	// keys, an assignment unit from a closed set, and a subject-fact key matching its
-	// pattern; on the unassigned branch a reason from a closed set. `{"assigned":true}`
+	// keys and a non-empty assignment unit. Client-id assignments also validate
+	// the subject-fact key; unknown units and reasons settle as not assigned. `{"assigned":true}`
 	// alone is type-correct and is NOT a verdict -- exempting its members marked a
 	// supplied `assigned` as generated.
 	//
@@ -1099,28 +1112,27 @@ func sdkWouldParseAssignment(body string) bool {
 		}
 		unit, _ := wire.Boundary["assignment_unit"].(string)
 		switch unit {
-		case "synthetic_subject_key", "client_id":
+		case "":
+			return false
+		case "synthetic_subject_key":
+			return true
+		case "client_id":
 		default:
-			return false
+			return true
 		}
-		if sfk := strings.TrimSpace(wire.SubjectFactKey); sfk != "" &&
-			!regexp.MustCompile(`^sfk1_[0-9a-f]{64}$`).MatchString(sfk) {
-			return false
+		if wire.SubjectFactKey != nil {
+			var sfk *string
+			if json.Unmarshal(wire.SubjectFactKey, &sfk) != nil || sfk == nil || !regexp.MustCompile(`^sfk1_[0-9a-f]{64}$`).MatchString(strings.TrimSpace(*sfk)) {
+				return false
+			}
 		}
 		return true
 	}
-	reason := ""
 	if wire.Reason != nil {
 		var decoded *string
 		if json.Unmarshal(wire.Reason, &decoded) != nil || decoded == nil {
 			return false
 		}
-		reason = *decoded
-	}
-	switch reason {
-	case "", "kill_switch", "targeting_unmatched", "age_ineligible":
-	default:
-		return false
 	}
 	return version == nil || *version >= 1
 }
@@ -1128,7 +1140,7 @@ func sdkWouldParseAssignment(body string) bool {
 // topLevelExemptions picks the registry a body of this status is described by.
 //
 // ⚠ THE SDK'S OWN PRECONDITIONS COME FIRST. Both SDK paths refuse a body before
-// its schema means anything: `parseExperimentVerdict` and `experimentBodyErrorText`
+// its schema means anything: `parseExperimentVerdict` and `experimentBodyErrorCode`
 // each return early when the body is incomplete or longer than `expMaxBodyBytes`.
 // A status-200 body one byte over that limit is therefore never parsed as an
 // assignment -- and exempting its member names marked an endpoint-controlled name
@@ -1162,13 +1174,13 @@ func topLevelExemptions(statusLine string, bodyLen int, shapeOK, envelopeOK bool
 		return none
 	}
 	switch {
-	case n == 200:
+	case n >= 200 && n < 300:
 		if !shapeOK {
 			return none
 		}
 		return assignmentTopLevel
 	// ⚠ AND THE ERROR ENVELOPE IS READ AT 400 AND 403, NOT AT EVERY 4xx.
-	// `applyExperimentAssignment` calls `experimentBodyErrorText` only for those
+	// `applyExperimentAssignment` calls `experimentBodyErrorCode` only for those
 	// two -- the subject-grammar sentinel and the real-subjects sentinel -- and
 	// classifies every other status by the status alone. Exempting `error` at a
 	// 404 marked an endpoint-selected member name as SDK grammar and published a
@@ -1176,8 +1188,8 @@ func topLevelExemptions(statusLine string, bodyLen int, shapeOK, envelopeOK bool
 	// registry has been wrong about: depth, membership, shape, status, and now
 	// WHICH statuses.
 	case n == 400 || n == 403:
-		// ⚠ AND THE ERROR ENVELOPE IS TYPED TOO. `experimentBodyErrorText` unmarshals
-		// `error` into a STRING, so `{"error":false}` is valid JSON that the SDK does
+		// ⚠ AND THE ERROR ENVELOPE IS TYPED TOO. `experimentBodyErrorCode` unmarshals
+		// `error` into a typed object, so `{"error":false}` is valid JSON that the SDK does
 		// not recognise as an envelope -- and exempting its member marked a supplied
 		// `error` as generated. The assignment
 		// branch had already learned this; the error branch was left asking only the
@@ -2205,7 +2217,7 @@ func dropFraming(dump string) string {
 			shapeBody = capturedBodyRaw
 		}
 		exemptions = topLevelExemptions(out[0], exemptBodyLen,
-			sdkWouldParseAssignment(shapeBody), sdkWouldReadErrorText(shapeBody))
+			sdkWouldParseAssignment(shapeBody), sdkWouldReadErrorCode(shapeBody))
 	}
 	if bodyStart < 0 {
 		return strings.Join(out, "\n")

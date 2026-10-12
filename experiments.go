@@ -57,24 +57,23 @@ import (
 // server-side.
 //
 // Outcomes (decided by applyExperimentAssignment, pure):
-//   - 200 assigned — the variant is served and cached (memory + durable).
+//   - 2xx assigned — the variant is served and cached (memory + durable).
 //     Assignment stickiness is entirely the server's deterministic hash; the
 //     cache is a latency/offline device, never an assignment authority, and
 //     this client never re-buckets locally.
-//   - 200 not-assigned — four shapes distinguished only by `reason`: absent
+//   - 2xx not-assigned — four shapes distinguished only by `reason`: absent
 //     (deterministic traffic-gate miss), "targeting_unmatched" (may change
 //     when attributes change), "kill_switch" (operator kill), or
-//     "age_ineligible" (no eligible adult declaration). Any OTHER
-//     reason is not a verdict this SDK can represent and classifies as
-//     malformed. All four shapes drop the cached assignment; a kill in
+//     "age_ineligible" (no eligible adult declaration). Other reasons and
+//     unknown units become not-assigned with reason "unknown".
+//     These shapes drop the cached assignment; a kill in
 //     particular must stop applying at the next safe point and emits no
 //     exposure.
 //   - 401/403 — fail CLOSED: the result never serves a cached assignment,
 //     in-memory serving stops (getters return nothing) and revalidation
 //     halts until re-init or a later successful, authorized fetch. The
 //     durable cache record itself is left untouched (remote-config parity)
-//     EXCEPT for the server's real-subjects kill sentinel ("experiment
-//     real-subject assignment is disabled"), which additionally drops the
+//     EXCEPT for the server's "real_subjects_disabled" code, which additionally drops the
 //     durable record — the platform flipped the real-subjects flag back
 //     off, and the cached assignments plus their subject-fact keys must not
 //     outlive that.
@@ -170,13 +169,10 @@ const (
 	expMaxDeferSeconds    = 86400
 )
 
-// Server error sentinels this client reacts to by exact body text (the error
-// contract distinguishes same-status outcomes only by the body's `error`
-// string). String equality on a fully read body only; an unparseable,
-// truncated, or near-miss body is the generic outcome for its status.
+// Stable response codes are independent of human-readable messages.
 const (
-	expSentinelRealSubjectsDisabled = "experiment real-subject assignment is disabled"
-	expSentinelSubjectGrammar       = "experiment metadata must use synthetic local-safe identifiers only"
+	expSentinelRealSubjectsDisabled = "real_subjects_disabled"
+	expSentinelSubjectGrammar       = "subject_id_invalid"
 )
 
 // The server-evaluated targeting attribute vocabulary: the fixed allowlist
@@ -401,7 +397,7 @@ type ExperimentAssignmentResult struct {
 	// Version is the published experiment version the verdict was computed
 	// against (0 when the server omitted it on a not-assigned shape).
 	Version int64
-	// Reason distinguishes the four not-assigned shapes; empty for the
+	// Reason distinguishes not-assigned shapes, including "unknown"; empty for the
 	// legacy traffic-gate miss and for an assigned verdict.
 	Reason string
 	// Boundary is the server's machine-readable boundary block, served
@@ -504,6 +500,8 @@ type expOutcome struct {
 	refusalFactKey string
 	// authBlocked — 401/403: stop serving, halt revalidation, fail closed.
 	authBlocked bool
+	// preserveAuth leaves an existing credential latch unchanged.
+	preserveAuth bool
 	// remint — the subject-grammar 400 sentinel: the caller may re-mint the
 	// subject id once per process and retry.
 	remint bool
@@ -539,7 +537,7 @@ type expAssignmentWire struct {
 	VariantKey     string          `json:"variant_key"`
 	VariantPayload map[string]any  `json:"variant_payload"`
 	Reason         json.RawMessage `json:"reason"`
-	SubjectFactKey string          `json:"subject_fact_key"`
+	SubjectFactKey json.RawMessage `json:"subject_fact_key"`
 	Boundary       map[string]any  `json:"boundary"`
 	// The served state decodes raw so a wrong type degrades to no pin
 	// instead of failing the whole verdict (see expServedState).
@@ -594,23 +592,22 @@ func serveExperimentEntryOrFail(entry *expEntry, code string) (ExperimentAssignm
 	return ExperimentAssignmentResult{}, code
 }
 
-// experimentBodyErrorText extracts the body `error` string of a non-2xx
-// answer, or "". A truncated OR over-limit body never yields a sentinel —
-// the equality cannot be trusted (an over-limit read is a truncated VIEW
-// even when the prefix happens to unmarshal, e.g. sentinel JSON followed by
-// padding whitespace) — and reads as generic for its status, exactly the
-// bound parseExperimentVerdict applies to 200 bodies.
-func experimentBodyErrorText(body []byte, bodyIncomplete bool) string {
-	if bodyIncomplete || len(body) > expMaxBodyBytes {
-		return ""
+// responseError reads a complete, bounded error envelope. An unknown or
+// malformed envelope leaves classification to the HTTP status.
+func responseError(body []byte, bodyIncomplete bool) errorResponseWire {
+	var wire errorResponseWire
+	if bodyIncomplete || len(body) > expMaxBodyBytes || json.Unmarshal(body, &wire) != nil {
+		return errorResponseWire{}
 	}
-	var wire struct {
-		Error string `json:"error"`
-	}
-	if json.Unmarshal(body, &wire) != nil {
-		return ""
-	}
-	return wire.Error
+	return wire
+}
+
+func experimentBodyErrorCode(body []byte, bodyIncomplete bool) string {
+	return responseError(body, bodyIncomplete).Error.Code
+}
+
+func disabledExperimentCode(code string) bool {
+	return code == "runtime_disabled" || code == "experiments_disabled" || code == "experiment_assignment_disabled" || code == "experiment_apply_disabled"
 }
 
 // applyExperimentAssignment decides one fetch outcome from the transport
@@ -619,14 +616,14 @@ func experimentBodyErrorText(body []byte, bodyIncomplete bool) string {
 // directives, and a failure code; a non-empty failure code means the fetch
 // produced no usable verdict (the result is zero). A transport-level error
 // arrives here as status 0; a stalled body after an authoritative status
-// arrives with the status and bodyIncomplete set, and every non-200
+// arrives with the status and bodyIncomplete set, and every non-2xx
 // classifies by STATUS alone (a truncated 401 still fails closed, a
 // truncated 404 is still permanent; the sentinels are the one
 // body-sensitive refinement and a truncated body is never a sentinel).
 func applyExperimentAssignment(entry *expEntry, resp remoteConfigResponse, scope expRequestScope, nowMS int64) (ExperimentAssignmentResult, expOutcome, string) {
 	status := resp.status
 
-	if status == 200 {
+	if status >= 200 && status < 300 {
 		verdict, outcome, ok := parseExperimentVerdict(resp, scope, nowMS)
 		if !ok {
 			result, failure := serveExperimentEntryOrFail(entry, "malformed_response")
@@ -644,8 +641,11 @@ func applyExperimentAssignment(entry *expEntry, resp remoteConfigResponse, scope
 	// flag off.
 	if status == 401 || status == 403 {
 		outcome := expOutcome{authoritative: true, authBlocked: true}
-		if status == 403 && experimentBodyErrorText(resp.body, resp.bodyIncomplete) == expSentinelRealSubjectsDisabled {
+		if status == 403 && experimentBodyErrorCode(resp.body, resp.bodyIncomplete) == expSentinelRealSubjectsDisabled {
 			outcome.dropAll = true
+		}
+		if code := experimentBodyErrorCode(resp.body, resp.bodyIncomplete); status == 403 && disabledExperimentCode(code) {
+			return ExperimentAssignmentResult{}, outcome, code
 		}
 		return ExperimentAssignmentResult{}, outcome, "unauthorized"
 	}
@@ -669,7 +669,7 @@ func applyExperimentAssignment(entry *expEntry, resp remoteConfigResponse, scope
 	// whose revalidation is permanently rejected must not keep serving
 	// stale forever while the cadence re-sends the same invalid input set.
 	if status == 400 {
-		if experimentBodyErrorText(resp.body, resp.bodyIncomplete) == expSentinelSubjectGrammar {
+		if code := experimentBodyErrorCode(resp.body, resp.bodyIncomplete); code == expSentinelSubjectGrammar || code == "subject_pii_marker" {
 			return ExperimentAssignmentResult{},
 				expOutcome{authoritative: true, remint: true}, "bad_request"
 		}
@@ -693,33 +693,15 @@ func applyExperimentAssignment(entry *expEntry, resp remoteConfigResponse, scope
 	if transientCode != "" {
 		outcome := expOutcome{transient: true}
 		if status == 429 || status >= 500 {
-			// Batch-transport parity (this plane's documented contract):
-			// Retry-After parses as delta-seconds OR an HTTP-date, day
-			// clamped — unlike the remote-config route's deliberately
-			// digits-only parse.
-			if wait, present := parseRetryAfter(resp.retryAfterRaw); present {
-				outcome.retryAfterSeconds = int(wait / time.Second)
-				outcome.retryAfterPresent = true
-			}
+			outcome.retryAfterSeconds, outcome.retryAfterPresent = parseRemoteConfigRetryAfter(resp.retryAfterRaw)
 		}
 		result, failure := serveExperimentEntryOrFail(entry, transientCode)
 		return result, outcome, failureOrEmpty(result, failure)
 	}
 
-	// Anything else (an unexpected redirect, another 4xx — statuses this
-	// contract never sends) is the fleet-contract TRANSIENT class: a closed
-	// transient result to the caller (serve-stale under the attribute-match
-	// rule), the cache RETAINED, and the revalidation cadence kept probing —
-	// a stray proxy 409 must never kill a valid cached treatment; the
-	// platform speaks authoritatively only through 200 verdicts, 400s, the
-	// auth statuses, and the sentinel. Two refinements distinguish the class
-	// from ordinary transients: the SERVER answered, so the per-key sequence
-	// fence SETTLES (authoritative for ordering — an older in-flight
-	// response must not overwrite the newer observation), while the auth
-	// latch never changes in EITHER direction (the install's unlatch is
-	// gated on authoritative NON-transient outcomes).
-	result, failure := serveExperimentEntryOrFail(entry, "http_"+strconv.Itoa(status))
-	return result, expOutcome{transient: true, authoritative: true}, failureOrEmpty(result, failure)
+	// Redirects and other client errors are terminal for this assignment.
+	// Drop the served entry and stop its cadence until an explicit fetch.
+	return ExperimentAssignmentResult{}, expOutcome{authoritative: true, dropEntry: true, preserveAuth: true}, "http_" + strconv.Itoa(status)
 }
 
 func failureOrEmpty(result ExperimentAssignmentResult, failure string) string {
@@ -737,7 +719,7 @@ func failureOrEmpty(result ExperimentAssignmentResult, failure string) string {
 //     1), non-empty assignment_key and variant_key, and a non-empty
 //     boundary.assignment_unit;
 //   - not assigned: a KNOWN reason — absent (traffic gate), kill_switch, or
-//     targeting_unmatched, or age_ineligible. Unknown reasons are malformed.
+//     targeting_unmatched, or age_ineligible. Unknown reasons become unknown.
 func parseExperimentVerdict(resp remoteConfigResponse, scope expRequestScope, nowMS int64) (ExperimentAssignmentResult, expOutcome, bool) {
 	if resp.bodyIncomplete || len(resp.body) > expMaxBodyBytes {
 		return ExperimentAssignmentResult{}, expOutcome{}, false
@@ -784,18 +766,20 @@ func parseExperimentVerdict(resp remoteConfigResponse, scope expRequestScope, no
 		switch assignmentUnit {
 		case experimentAssignmentUnitSynthetic, experimentAssignmentUnitClientID:
 		default:
-			// An unknown assignment unit is not a verdict this SDK can
-			// represent (it would be cached and forwarded verbatim into
-			// analytics facts).
-			return ExperimentAssignmentResult{}, expOutcome{}, false
+			if assignmentUnit == "" {
+				return ExperimentAssignmentResult{}, expOutcome{}, false
+			}
+			boundary := deepCopyJSONMap(wire.Boundary, 0)
+			boundary["assignment_unit"] = "unknown"
+			return ExperimentAssignmentResult{Reason: "unknown", Version: *version, Boundary: boundary}, expOutcome{authoritative: true, dropEntry: true}, true
 		}
-		subjectFactKey := strings.TrimSpace(wire.SubjectFactKey)
-		if subjectFactKey != "" && !expSubjectFactKeyPattern.MatchString(subjectFactKey) {
-			// A present subject-fact key MUST satisfy the sfk1_ grammar: a
-			// malformed echo — the raw spcid_ subject id included — must
-			// never be cached as the value the fact lane would forward
-			// verbatim into analytics assignment_key props.
-			return ExperimentAssignmentResult{}, expOutcome{}, false
+		subjectFactKey := ""
+		if assignmentUnit == experimentAssignmentUnitClientID && wire.SubjectFactKey != nil {
+			var key *string
+			if json.Unmarshal(wire.SubjectFactKey, &key) != nil || key == nil || !expSubjectFactKeyPattern.MatchString(strings.TrimSpace(*key)) {
+				return ExperimentAssignmentResult{}, expOutcome{}, false
+			}
+			subjectFactKey = strings.TrimSpace(*key)
 		}
 		entry := &expEntry{
 			AssignmentKey:  assignmentKey,
@@ -832,9 +816,7 @@ func parseExperimentVerdict(resp remoteConfigResponse, scope expRequestScope, no
 	switch reason {
 	case "", experimentReasonKillSwitch, experimentReasonTargeting, experimentReasonAge:
 	default:
-		// Not a verdict this SDK can represent: the allowlist is {absent,
-		// kill_switch, targeting_unmatched, age_ineligible}.
-		return ExperimentAssignmentResult{}, expOutcome{}, false
+		reason = "unknown"
 	}
 	notAssignedVersion := int64(0)
 	if version != nil {
@@ -863,8 +845,9 @@ func parseExperimentVerdict(resp remoteConfigResponse, scope expRequestScope, no
 	outcome := expOutcome{authoritative: true, dropEntry: true}
 	if reason == experimentReasonAge {
 		outcome.ageRefusal = true
-		if factKey := strings.TrimSpace(wire.SubjectFactKey); expSubjectFactKeyPattern.MatchString(factKey) {
-			outcome.refusalFactKey = factKey
+		var factKey string
+		if json.Unmarshal(wire.SubjectFactKey, &factKey) == nil && expSubjectFactKeyPattern.MatchString(strings.TrimSpace(factKey)) {
+			outcome.refusalFactKey = strings.TrimSpace(factKey)
 		}
 	}
 	return ExperimentAssignmentResult{
@@ -1169,7 +1152,7 @@ type experimentsState struct {
 	authBlocked bool
 	authEpoch   uint64
 
-	// applyBlocked: the apply endpoint answered 401/403. Owed applications
+	// applyBlocked: the apply endpoint answered experiment_apply_disabled. Owed applications
 	// are kept and the lane stops sending them until an authoritative,
 	// authorized fetch (the same point that lifts authBlocked).
 	applyBlocked bool
@@ -1182,9 +1165,11 @@ type experimentsState struct {
 	outcomeDropFn func(reason string, n int)
 
 	// Revalidation cadence state (unix ms; 0 = unarmed).
-	revalidateAtMS int64
-	retryAfterMS   int64
-	backoffAttempt int
+	// Conflicts require a refetch even when the cached entry was removed.
+	refetchAfterApply map[string]*expRefetch
+	revalidateAtMS    int64
+	retryAfterMS      int64
+	backoffAttempt    int
 
 	// reminted is the one-shot grammar re-mint guard (per process).
 	reminted bool
@@ -2627,6 +2612,7 @@ func (e *experimentsState) retryDurableSync() {
 // drop-time capture first. Shared by the current-epoch install and the
 // epoch-stale destructive carve-out (the fleet partition).
 func (e *experimentsState) applyEntryDropLocked(scope, experimentKey string, resolvedAtMS int64) (persistFailed bool) {
+	delete(e.refetchAfterApply, experimentKey)
 	dropped := e.entries[experimentKey]
 	delete(e.entries, experimentKey)
 	// A server-directed withdrawal ends the key's RETAINED status too: a
@@ -2679,6 +2665,7 @@ func (e *experimentsState) applyEntryDropLocked(scope, experimentKey string, res
 // tombstoned, and retried). Shared by the current-epoch install and the
 // epoch-stale destructive carve-out (the fleet partition).
 func (e *experimentsState) applySentinelWithdrawalLocked(scope string, resolvedAtMS int64) (persistFailed, landed bool) {
+	e.refetchAfterApply = nil
 	e.authBlocked = true
 	e.authEpoch++
 	e.entries = make(map[string]*expEntry)
@@ -2785,6 +2772,7 @@ func (e *experimentsState) applySentinelWithdrawalLocked(scope string, resolvedA
 // carve-out; every other not-assigned reason keeps applyEntryDropLocked,
 // whose owed applications survive the drop.
 func (e *experimentsState) applyAgeWithdrawalLocked(scope, subject, experimentKey, refusalFactKey string, resolvedAtMS int64) (persistFailed bool) {
+	delete(e.refetchAfterApply, experimentKey)
 	dropped := e.entries[experimentKey]
 	retained := e.latchRetained[experimentKey]
 	delete(e.entries, experimentKey)
@@ -2958,6 +2946,9 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 	}
 	if outcome.authoritative {
 		e.settled[fenceKey] = seq
+		if ticket := e.refetchAfterApply[experimentKey]; !outcome.transient && ticket != nil && seq > ticket.afterFetchSeq {
+			delete(e.refetchAfterApply, experimentKey)
+		}
 	}
 	if outcome.authBlocked {
 		// Fail closed: stop serving every cached assignment (the getters
@@ -3001,14 +2992,12 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 		}
 		return false, false, false
 	}
-	if outcome.authoritative && !outcome.transient {
+	if outcome.authoritative && !outcome.transient && !outcome.preserveAuth {
 		// An authoritative, authorized VERDICT of a post-latch fetch (the
 		// epoch gate above guarantees that) proves the credential works
-		// again: unlatch and let revalidation resume. The unexpected-status
-		// class (authoritative for FENCE ordering, transient for
-		// everything else) is excluded: the fleet contract pins the latch
-		// invariant in both directions — a stray 409 neither latches nor
-		// unlatches.
+		// again: unlatch and let revalidation resume. An unexpected terminal
+		// status does not confirm authorization, so preserveAuth keeps its
+		// per-entry drop from reopening the other cached assignments.
 		if e.authBlocked {
 			// The unlatch RESTORES the retained assignments, not just the
 			// flag: the latch cleared e.entries while deliberately
@@ -3070,6 +3059,9 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 		e.demoteOwedClearLocked()
 		persisted := e.syncDurableEntryLocked(scope, experimentKey, entry.FetchedAtMS, false)
 		e.armRevalidationLocked(resolvedAtMS)
+		if len(e.refetchAfterApply) != 0 {
+			e.revalidateAtMS = resolvedAtMS
+		}
 		// Installing an assignment is not an application of it and arms no
 		// exposure (ApplyExperimentVariant does). The caller's off-lock sweep
 		// still drains whatever earlier applications are owed.
@@ -3338,6 +3330,14 @@ func (e *experimentsState) fireConsentRaceSeam(stage string) {
 
 // ── revalidation cadence state ──────────────────────────────────────────────
 
+// expRefetch is an immutable conflict ticket. A GET already in flight when
+// the conflict landed cannot discharge the requirement for a newer fetch.
+type expRefetch struct {
+	SubjectKey    string
+	Attributes    []expAttribute
+	afterFetchSeq uint64
+}
+
 // armRevalidationLocked schedules the next revalidation cycle:
 // 300s ± 10% uniform jitter from now. jitter is the caller's [0, 1) source
 // (the client's seeded jitter seam); nil uses the midpoint.
@@ -3477,7 +3477,7 @@ func expFetchError(code string) error {
 // 401/403 halts the automatic revalidation lane and in-memory serving, and
 // a later authorized fetch started after the latch resumes both.
 func (c *Client) FetchExperimentAssignment(ctx context.Context, experimentKey string, attributes map[string]string) (ExperimentAssignmentResult, error) {
-	return c.fetchExperimentAssignment(ctx, experimentKey, attributes, false, nil)
+	return c.fetchExperimentAssignment(ctx, experimentKey, attributes, false, nil, nil)
 }
 
 // ExperimentAgeBand is the game's age declaration, not age verification.
@@ -3663,7 +3663,7 @@ func (entry *expEntry) ageGated() bool {
 	return entry.AssignmentUnit != experimentAssignmentUnitSynthetic
 }
 
-func (c *Client) fetchExperimentAssignment(ctx context.Context, experimentKey string, attributes map[string]string, isRevalidation bool, presetAttributes []expAttribute) (ExperimentAssignmentResult, error) {
+func (c *Client) fetchExperimentAssignment(ctx context.Context, experimentKey string, attributes map[string]string, isRevalidation bool, presetAttributes []expAttribute, conflictRefetch *expRefetch) (ExperimentAssignmentResult, error) {
 	// The same lifecycle fence as Track and FetchRemoteConfig for HOST
 	// fetches: Close either sees this fetch (and waits for it) or completed
 	// its closed store first (and this fetch is rejected). The automatic
@@ -3723,6 +3723,12 @@ func (c *Client) fetchExperimentAssignment(ctx context.Context, experimentKey st
 	if e.tornDown {
 		e.mu.Unlock()
 		return ExperimentAssignmentResult{}, ErrClosed
+	}
+	// The worker captured a conflict request outside this lock. A newer
+	// withdrawal, replacement or subject change cancels that exact request.
+	if conflictRefetch != nil && (e.authBlocked || e.refetchAfterApply[experimentKey] != conflictRefetch || conflictRefetch.SubjectKey != e.currentSubjectIDLocked()) {
+		e.mu.Unlock()
+		return ExperimentAssignmentResult{}, expFetchError("revalidation_entry_vanished")
 	}
 	subject := e.currentSubjectIDLocked()
 	if subject == "" {
@@ -4101,7 +4107,7 @@ func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string
 				if preset == nil {
 					preset = []expAttribute{}
 				}
-				return c.fetchExperimentAssignment(ctx, experimentKey, attributes, isRevalidation, preset)
+				return c.fetchExperimentAssignment(ctx, experimentKey, attributes, isRevalidation, preset, nil)
 			}
 			// The one-shot budget is SPENT and this grammar reject is
 			// CURRENT (it passed the epoch/scope/sequence gates): a
@@ -4317,7 +4323,7 @@ func (c *Client) revalidateDueExperiments(ctx context.Context) {
 	var keys []string
 	e.mu.Lock()
 	switch {
-	case e.authBlocked || len(e.entries) == 0:
+	case e.authBlocked || len(e.entries) == 0 && len(e.refetchAfterApply) == 0:
 	case e.retryAfterMS != 0 && nowMS < e.retryAfterMS:
 	default:
 		if e.retryAfterMS != 0 {
@@ -4330,6 +4336,15 @@ func (c *Client) revalidateDueExperiments(ctx context.Context) {
 			keys = make([]string, 0, len(e.entries))
 			for key := range e.entries {
 				if e.declaring[key] == nil {
+					keys = append(keys, key)
+				}
+			}
+			for key, entry := range e.refetchAfterApply {
+				if entry.SubjectKey != e.currentSubjectIDLocked() {
+					delete(e.refetchAfterApply, key)
+					continue
+				}
+				if e.entries[key] == nil && e.declaring[key] == nil {
 					keys = append(keys, key)
 				}
 			}
@@ -4368,15 +4383,22 @@ func (c *Client) revalidateDueExperiments(ctx context.Context) {
 		// resurrecting state the plane deliberately removed. (The fetch
 		// re-checks under its own lock too — this gate just avoids the
 		// dispatch.)
+		var refetchAttributes []expAttribute
+		var conflictRefetch *expRefetch
+		if entry := e.refetchAfterApply[key]; entry != nil && entry.SubjectKey == e.currentSubjectIDLocked() && e.declaring[key] == nil {
+			// Keep the immutable request ticket until dispatch can recheck it.
+			conflictRefetch = entry
+			refetchAttributes = append(make([]expAttribute, 0, len(entry.Attributes)), entry.Attributes...)
+		}
 		stillCached := e.entries[key] != nil && e.declaring[key] == nil
 		e.mu.Unlock()
 		if blocked || parked {
 			return
 		}
-		if !stillCached {
+		if !stillCached && refetchAttributes == nil {
 			continue
 		}
-		_, _ = c.fetchExperimentAssignment(ctx, key, nil, true, nil)
+		_, _ = c.fetchExperimentAssignment(ctx, key, nil, true, refetchAttributes, conflictRefetch)
 	}
 }
 

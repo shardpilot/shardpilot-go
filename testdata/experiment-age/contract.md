@@ -51,6 +51,6 @@ used. The SHA-256 hashes below distinguish the raw receipts from these files.
   or bypass any other gate. The captured full-traffic fixture assigns `control`.
 - `age_ineligible` is an authoritative not-assigned reason: return it unchanged,
   drop memory and durable assignment caches, and do not retry it as a transient.
-- Unknown future reasons remain malformed; the test's `future_age_reason` is an
-  explicitly derived negative control, not a captured server verdict.
+- Unknown future reasons now install a not-assigned verdict with reason `unknown`;
+  the test's `future_age_reason` is a derived control, not a captured server verdict.
 - Synthetic-subject experiments bypass this age gate; the SDK uses client ids.
