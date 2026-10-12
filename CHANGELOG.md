@@ -10,6 +10,9 @@
   consent is granted and the client's consent admits the experiment plane.
   New `ErrInvalidExperimentSubject`. Outcomes and age-band withdrawal on a
   handle are not part of this release step.
+- Every request now carries `X-ShardPilot-SDK: go/<version>` (event batches,
+  consent, remote config, the experiment routes and crash ingest). The version
+  is a constant in code, which a test holds to the README's latest-tag claim.
 
 - Assignment, exposure apply, and outcome apply requests use the public
   `/api/cp/v1/runtime/experiments/` routes on `AppURL`.

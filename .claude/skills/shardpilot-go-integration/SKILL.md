@@ -624,6 +624,11 @@ Run against your dev/staging deployment credentials, then check each item:
 7. **Shutdown.** Confirm your service calls `Close(ctx)` with a timeout on
    shutdown, and that `Close` returns `nil` (pending events + consent
    receipts flushed within the deadline).
+8. **SDK identity on the wire.** Every request the SDK makes carries
+   `X-ShardPilot-SDK: go/<version>`, the release the SDK was cut from. If
+   you capture traffic or front the SDK with a proxy, confirm the header is
+   present and names the version you pinned; it is a constant in the SDK and
+   never comes from your configuration.
 
 ## Known limitations (source reading 2026-10-02 for `v0.7.2-alpha`)
 
