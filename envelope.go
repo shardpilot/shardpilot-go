@@ -202,13 +202,9 @@ func (c *Client) buildBatch(events []Event) (batchRequest, error) {
 	envelopes := make([]eventEnvelope, 0, len(events))
 	raws := make([]json.RawMessage, 0, len(events))
 	for _, event := range events {
-		envelope, err := c.buildEnvelope(event)
+		envelope, raw, err := c.encodeEvent(event)
 		if err != nil {
 			return batchRequest{}, err
-		}
-		raw, err := json.Marshal(envelope)
-		if err != nil {
-			return batchRequest{}, &EncodeError{Err: err}
 		}
 		envelopes = append(envelopes, envelope)
 		raws = append(raws, raw)
@@ -273,14 +269,7 @@ func (c *Client) buildBatchIsolating(events []Event, retained batchRequest) (req
 	raws = append(raws, retained.rawEvents[:reuse]...)
 	kept = events
 	for i, event := range events[reuse:] {
-		envelope, err := c.buildEnvelope(event)
-		var raw json.RawMessage
-		if err == nil {
-			raw, err = json.Marshal(envelope)
-			if err != nil {
-				err = &EncodeError{Err: err}
-			}
-		}
+		envelope, raw, err := c.encodeEvent(event)
 		if err != nil {
 			if poisoned == nil {
 				// First poison member: everything before it survives; the

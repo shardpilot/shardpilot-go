@@ -121,6 +121,12 @@ func (c *Client) enqueueExperimentFact(event Event, atClose bool) (uint64, error
 	if err != nil {
 		return 0, err
 	}
+	// The same size rule as host events: a fact ingest would reject is never
+	// queued. It is dropped before the queue, so the caller counts it in its
+	// kind's drop map (event_too_large), not in Stats.Dropped.
+	if err := c.encodeAtIntake(&event); err != nil {
+		return 0, err
+	}
 	event.intakeConsentEpoch = intakeEpoch
 	// The pipeline sequence is taken under lifecycleMu with the send, so the
 	// queue holds experiment facts in sequence order: the worker's low-water
@@ -278,6 +284,15 @@ func (c *Client) emitOwedExposure(ctx context.Context, experimentKey string, rec
 	// the raced refusal the intake reports.
 	e.fireConsentRaceSeam("exposure_enqueue")
 	seq, err := c.enqueueExperimentFact(event, atClose)
+	if errors.Is(err, ErrEventTooLarge) {
+		// Ingest rejects this fact on every attempt: it leaves the queue,
+		// counted once, and never holds the experiment's later facts.
+		e.mu.Lock()
+		owed.countDrop(e, expDropEventTooLarge)
+		e.mu.Unlock()
+		c.logf("shardpilot experiments: the sealed %s for experiment %q exceeds the 2048-byte ingest limit; dropped (event_too_large)", owed.kind(), experimentKey)
+		return false, expDropEventTooLarge, true
+	}
 	if err != nil {
 		return false, err.Error(), false
 	}

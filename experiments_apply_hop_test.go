@@ -43,6 +43,8 @@ type expApplyStub struct {
 	// experiment_outcome keyed by outcome_id and occurred_at, carrying the
 	// outcome's key and value.
 	outcome bool
+	// padProps, when positive, seals an extra "pad" prop of that many bytes.
+	padProps int
 }
 
 type expApplyRequest struct {
@@ -142,6 +144,9 @@ func (s *expApplyStub) handler(t *testing.T) http.HandlerFunc {
 				props := fact["props"].(map[string]any)
 				props["outcome_key"] = body["outcome_key"]
 				props["outcome_value"] = body["outcome_value"]
+			}
+			if s.padProps > 0 {
+				fact["props"].(map[string]any)["pad"] = strings.Repeat("p", s.padProps)
 			}
 			s.facts = append(s.facts, fact)
 			encoded, _ := json.Marshal(map[string]any{"fact": fact, "seal": expStubSeal})

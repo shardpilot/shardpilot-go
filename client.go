@@ -525,6 +525,11 @@ func (c *Client) Track(ctx context.Context, event Event) error {
 	c.lifecycleMu.Unlock()
 	defer c.trackWG.Done()
 
+	// The size precheck measures the wire bytes, encoded outside the lock.
+	if err := c.encodeAtIntake(&event); err != nil {
+		return c.refuseOversizeEvent()
+	}
+
 	if c.consentFloorEnabled() {
 		// Track is a consent dispatch point: retained receipts go to the
 		// transport BEFORE the event leg — and while an analytics-grant
@@ -550,6 +555,10 @@ func (c *Client) Track(ctx context.Context, event Event) error {
 }
 
 func (c *Client) Enqueue(event Event) error {
+	// Prepare and encode before taking lifecycleMu, the lock a denial takes:
+	// the size precheck marshals the caller's payload, which can be large.
+	// The result is reported below, after the usual refusals in their order.
+	staged, stageErr := c.stageEvent(event)
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
 
@@ -577,15 +586,16 @@ func (c *Client) Enqueue(event Event) error {
 	if err := c.validateHostEventName(event.Name); err != nil {
 		return err
 	}
-	id, err := c.validateHostEventID(event.ID)
-	if err != nil {
+	if _, err := c.validateHostEventID(event.ID); err != nil {
 		return err
 	}
-	event.ID = id
-	event, err = c.prepareEvent(event)
-	if err != nil {
-		return err
+	if errors.Is(stageErr, ErrEventTooLarge) {
+		return c.refuseOversizeEvent()
 	}
+	if stageErr != nil {
+		return stageErr
+	}
+	event = staged
 	// The intake stamp: the denial generation this admission happened
 	// under. Enqueue holds lifecycleMu — the same lock a denial's fast
 	// half takes to bump the epoch and drain the queue — so the stamp is
@@ -1986,6 +1996,22 @@ func cloneEvent(event Event) Event {
 	event.Props = cloneMap(event.Props)
 	event.Context = cloneMap(event.Context)
 	return event
+}
+
+// stageEvent prepares and encodes an event for Enqueue before intake takes
+// lifecycleMu. An event whose name or id the intake checks refuse is left
+// unprepared: those checks report and count it in their usual order.
+func (c *Client) stageEvent(event Event) (Event, error) {
+	id := strings.ToLower(strings.TrimSpace(event.ID))
+	if normalizeEventName(event.Name) == "" || (id != "" && !validEventID(id)) {
+		return event, nil
+	}
+	event.ID = id
+	event, err := c.prepareEvent(event)
+	if err != nil {
+		return Event{}, err
+	}
+	return event, c.encodeAtIntake(&event)
 }
 
 // prepareEvent validates and normalizes an event at intake. The event id and

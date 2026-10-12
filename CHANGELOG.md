@@ -35,6 +35,19 @@
 - Reject `RemoteConfigAttributesEnabled` unless `RemoteConfigEnabled` is also
   enabled; attributes cannot operate without the remote-config client.
 
+- Events over the ingest per-event cap are refused locally. `Track`,
+  `Enqueue` and the SDK's own experiment facts encode each event once at
+  intake; when that JSON, with surrounding whitespace trimmed, is longer
+  than 2048 bytes they return `ErrEventTooLarge` (`event_too_large`), count
+  one drop and send nothing. An oversize experiment fact leaves the owed
+  queue and is counted under `event_too_large` in
+  `Stats.ExperimentExposureDrops` or `Stats.ExperimentOutcomeDrops`, not in
+  `Stats.Dropped`. An event of exactly 2048 bytes is admitted, and
+  retired experiment facts keep the ingest exemption. The intake bytes are
+  the bytes sent, spooled and retried: a nested `Props` or `Context` value
+  changed after the call no longer reaches the wire. An event that cannot be
+  encoded at intake keeps the existing per-member isolation at publish.
+
 - Consent receipts carry the actor `kind`, chosen by one consent actor rule.
   A client source sends `AnonymousID` as `anon`: its `UserID` is
   self-asserted and never a consent key, so a client configured with both
