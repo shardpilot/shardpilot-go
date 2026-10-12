@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -36,9 +37,12 @@ type Client struct {
 	breadcrumbs  *breadcrumbRing
 	maxAttempts  int
 	retryBackoff time.Duration
+	retryJitter  func() float64
+	retryWait    func(context.Context, time.Duration) error
 	onResult     func(Result)
 
-	warnedPlatform atomic.Bool
+	warnedPlatform    atomic.Bool
+	unparsedResponses atomic.Uint64
 	// selfModule is the running binary's identity, resolved ONCE at NewClient when
 	// DebugIDFillEnabled is on (nil when the flag is off OR the binary is
 	// unreadable), so the panic path does no file I/O.
@@ -142,22 +146,27 @@ type Sampler interface {
 
 type HTTPStatusError struct {
 	StatusCode int
+	// ErrorCode is the stable server code when its bounded envelope parses.
+	ErrorCode string
 	// RetryAfter is the delay the server asked the client to wait before retrying,
 	// parsed from the Retry-After response header. Zero when absent, unparseable, or an
 	// explicit "retry now" (0); use a present value via the retry loop, which distinguishes
 	// the two internally.
 	RetryAfter time.Duration
 	// retryAfterPresent reports whether the server actually sent a Retry-After (even "0").
-	// The retry loop honors a present value over the fixed backoff; an absent one falls back.
+	// The retry loop honors a present value; an absent one uses jittered backoff.
 	retryAfterPresent bool
 }
 
 func (e *HTTPStatusError) Error() string {
+	if e.ErrorCode != "" {
+		return fmt.Sprintf("shardpilot crash ingest returned status %d (%s)", e.StatusCode, e.ErrorCode)
+	}
 	return fmt.Sprintf("shardpilot crash ingest returned status %d", e.StatusCode)
 }
 
 func (e *HTTPStatusError) Retryable() bool {
-	return e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
+	return e.StatusCode == http.StatusRequestTimeout || e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
 }
 
 func NewClient(opts ClientOptions) (*Client, error) {
@@ -174,6 +183,9 @@ func NewClient(opts ClientOptions) (*Client, error) {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: defaultHTTPTimeout}
 	}
+	cloned := *httpClient
+	cloned.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	httpClient = &cloned
 	sampler := opts.Sampler
 	if sampler == nil {
 		sampler = newDefaultSampler()
@@ -357,28 +369,51 @@ func (c *Client) warnUnmappedPlatforms(event Event) {
 }
 
 func (c *Client) post(ctx context.Context, payload []byte) (Result, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var lastErr error
 	for attempt := 1; attempt <= c.maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return Result{}, err
+		}
 		result, err := c.postOnce(ctx, payload)
 		if err == nil {
 			return result, nil
 		}
 		lastErr = err
-		if attempt >= c.maxAttempts || !retryableError(err) {
+		if attempt >= c.maxAttempts || ctx.Err() != nil || !retryableError(err) {
 			return Result{}, err
 		}
-		backoff := c.retryBackoff * time.Duration(attempt)
-		// Honor a server-supplied Retry-After (e.g. a gateway 429) over the fixed backoff,
-		// including an explicit "retry now" (0); fall back to the fixed backoff only when
-		// the server sent no Retry-After.
+		backoff := c.retryDelay(attempt)
+		// A usable server hint is the retry floor, including an explicit zero.
+		// Without a hint, use exponential backoff with full jitter.
 		if retryAfter, ok := retryAfterFromError(err); ok {
 			backoff = retryAfter
 		}
-		if waitErr := sleepContext(ctx, backoff); waitErr != nil {
+		wait := c.retryWait
+		if wait == nil {
+			wait = sleepContext
+		}
+		if waitErr := wait(ctx, backoff); waitErr != nil {
 			return Result{}, waitErr
 		}
 	}
 	return Result{}, lastErr
+}
+
+func (c *Client) retryDelay(attempt int) time.Duration {
+	const ceiling = time.Minute
+	delay := min(c.retryBackoff, ceiling)
+	for i := 1; i < attempt && delay < ceiling; i++ {
+		// Clamp before multiplying, including a host-supplied huge base.
+		delay = min(delay, ceiling/2) * 2
+	}
+	jitter := c.retryJitter
+	if jitter == nil {
+		jitter = rand.Float64
+	}
+	return time.Duration(jitter() * float64(delay))
 }
 
 func (c *Client) postOnce(ctx context.Context, payload []byte) (Result, error) {
@@ -403,21 +438,35 @@ func (c *Client) postOnce(ctx context.Context, payload []byte) (Result, error) {
 	defer response.Body.Close()
 
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		// Drain a bounded amount for connection reuse without buffering the unused
-		// error body into a retained slice.
-		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseBodyBytes))
-		retryAfter, present := parseRetryAfter(response.Header.Get("Retry-After"))
-		statusErr := &HTTPStatusError{
-			StatusCode:        response.StatusCode,
-			RetryAfter:        retryAfter,
-			retryAfterPresent: present,
+		body, readErr := io.ReadAll(io.LimitReader(response.Body, maxResponseBodyBytes+1))
+		retryAfter, present := time.Duration(0), false
+		if response.StatusCode == 429 || response.StatusCode >= 500 {
+			retryAfter, present = parseRetryAfter(response.Header.Get("Retry-After"))
+		}
+		statusErr := &HTTPStatusError{StatusCode: response.StatusCode, RetryAfter: retryAfter, retryAfterPresent: present}
+		var envelope struct {
+			Error struct {
+				Code string `json:"code"`
+			} `json:"error"`
+		}
+		if readErr == nil && len(body) <= maxResponseBodyBytes && json.Unmarshal(body, &envelope) == nil {
+			statusErr.ErrorCode = envelope.Error.Code
 		}
 		c.logf("shardpilot crash ingest failed: %v", statusErr)
 		return Result{}, statusErr
 	}
 
-	body, _ := io.ReadAll(io.LimitReader(response.Body, maxResponseBodyBytes))
-	result := parseResult(body)
+	body, readErr := io.ReadAll(io.LimitReader(response.Body, maxResponseBodyBytes+1))
+	result, parsed := parseResult(body)
+	if readErr != nil || len(body) > maxResponseBodyBytes || !parsed {
+		result = Result{}
+		c.unparsedResponses.Add(1)
+		if c.logger != nil {
+			c.logf("shardpilot crash ingest: HTTP %d settled with an unparseable response body", response.StatusCode)
+		} else {
+			slog.Warn("shardpilot crash ingest: settled with an unparseable response body", "status", response.StatusCode)
+		}
+	}
 	if result.Suppressed {
 		c.logf("shardpilot crash ingest suppressed: actor consent withheld, crash not stored")
 	}
@@ -433,15 +482,27 @@ const (
 	// maxRetryAfter caps a server-supplied Retry-After so a hostile or buggy value cannot
 	// stall a reporting goroutine — which, on the auto-capture path, runs during crash
 	// handling — for an unbounded time.
-	maxRetryAfter = 2 * time.Minute
+	maxRetryAfter = 24 * time.Hour
 	// maxRetryAfterSeconds is maxRetryAfter in whole seconds; the seconds form is clamped
 	// against it BEFORE multiplying so a huge value cannot overflow time.Duration.
 	maxRetryAfterSeconds = int(maxRetryAfter / time.Second)
 )
 
-// parseResult best-effort decodes the crash ingest response. A malformed or empty body
-// yields the zero Result and never turns a 2xx into a failure.
-func parseResult(body []byte) Result {
+// UnparsedResponses counts successful writes whose response body could not be
+// read or parsed. Those writes are settled and are never replayed for this reason.
+func (c *Client) UnparsedResponses() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.unparsedResponses.Load()
+}
+
+// parseResult ignores unknown members and discards partially decoded outcomes.
+func parseResult(body []byte) (Result, bool) {
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return Result{}, false
+	}
 	var payload struct {
 		CrashID     string   `json:"crash_id"`
 		Fingerprint string   `json:"fingerprint"`
@@ -449,20 +510,20 @@ func parseResult(body []byte) Result {
 		Warnings    []string `json:"warnings"`
 	}
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return Result{}
+		return Result{}, false
 	}
 	return Result{
 		CrashID:     payload.CrashID,
 		Fingerprint: payload.Fingerprint,
 		Suppressed:  payload.Suppressed,
 		Warnings:    payload.Warnings,
-	}
+	}, true
 }
 
 // parseRetryAfter parses a Retry-After header (delta-seconds or an HTTP-date). The bool
 // reports whether a valid value was present: an explicit "0" (or an already-elapsed date)
 // returns (0, true) — retry now — distinct from an absent or malformed header (0, false),
-// which leaves the caller on its fixed backoff. The duration is clamped to [0, maxRetryAfter].
+// which leaves the caller on its jittered backoff. The duration is clamped to [0, maxRetryAfter].
 func parseRetryAfter(value string) (time.Duration, bool) {
 	value = strings.TrimSpace(value)
 	if value == "" {
@@ -626,9 +687,8 @@ func retryableError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
-	}
+	// The retry loop checks the caller's context separately. A transport-owned
+	// timeout must remain retryable while that caller is still alive.
 	type retryable interface {
 		Retryable() bool
 	}

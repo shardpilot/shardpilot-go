@@ -1929,6 +1929,10 @@ func (c *Client) publishRequestResult(ctx context.Context, request batchRequest,
 		}
 		return batchResult{}, err
 	}
+	if result.responseMalformed {
+		c.stats.unparsedBatchResponses.Add(1)
+		c.logUnparsedWrite("batch")
+	}
 	c.stats.recordBatch(result, size)
 	c.retainRejections(result)
 	if c.spool != nil {

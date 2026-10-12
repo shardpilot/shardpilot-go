@@ -168,7 +168,7 @@ func TestOnBatchResultSurfacesPerEventStatuses(t *testing.T) {
 		code   string
 	}{
 		fixtureEventID("id-ev_accepted"):       {EventStatusAccepted, ""},
-		fixtureEventID("id-ev_observed"):       {EventStatusObserved, "event_not_registered"},
+		fixtureEventID("id-ev_observed"):       {EventStatus("observed"), "event_not_registered"},
 		fixtureEventID("id-ev_duplicate"):      {EventStatusDuplicate, "duplicate_event_id"},
 		"2a190af0-7fd6-52f6-bac0-ae8cb4a22013": {EventStatusSuppressedNoConsent, ""},
 		fixtureEventID("id-ev_suppressed_ad"):  {EventStatusSuppressedAdRevenueConsent, ""},
@@ -197,7 +197,7 @@ func TestOnBatchResultSurfacesPerEventStatuses(t *testing.T) {
 	}
 	wantByStatus := map[EventStatus]uint64{
 		EventStatusAccepted:                   1,
-		EventStatusObserved:                   1,
+		EventStatus("observed"):               1,
 		EventStatusDuplicate:                  1,
 		EventStatusSuppressedNoConsent:        1,
 		EventStatusSuppressedAdRevenueConsent: 1,
@@ -256,7 +256,7 @@ func TestByStatusFoldsWithoutCallback(t *testing.T) {
 	}
 
 	stats := client.Snapshot()
-	if got := stats.ByStatus[EventStatusObserved]; got != 2 {
+	if got := stats.ByStatus[EventStatus("observed")]; got != 2 {
 		t.Fatalf("expected ByStatus observed 2, got %d", got)
 	}
 	if got := stats.ByStatus[EventStatusAccepted]; got != 1 {

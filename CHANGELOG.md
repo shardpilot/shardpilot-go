@@ -2,6 +2,23 @@
 
 ## v0.8.0-alpha — release preparation (not published)
 
+- Batch, consent, and crash writes settle on every HTTP 2xx, including an
+  empty, malformed, truncated, or oversized response body. Unparsed successes
+  emit a diagnostic and increment `Stats.UnparsedBatchResponses`,
+  `Stats.UnparsedConsentResponses`, or `crash.Client.UnparsedResponses()`;
+  partially decoded outcomes are discarded. Unreadable spool successes settle
+  without incrementing `Stats.SpoolResent`. Unknown response members remain
+  accepted. These transports refuse redirects without modifying an injected
+  HTTP client, classify 408, 429 and 5xx as retryable, and read bounded error
+  envelopes. Ordinary consent stays single-shot; automatic receipt retries
+  remain with the opt-in `ConsentFloor` outbox.
+- Crash retries use exponential backoff with jitter when there is no usable
+  `Retry-After`. The header is honored only on 429 and 5xx, in either standard
+  form, with the same 24-hour cap as analytics. Caller cancellation still
+  interrupts the wait.
+- Remove the retired `EventStatusObserved` constant. Unrecognized per-event
+  status strings are retained for diagnostics without resending the event.
+
 - Reject `RemoteConfigAttributesEnabled` unless `RemoteConfigEnabled` is also
   enabled; attributes cannot operate without the remote-config client.
 

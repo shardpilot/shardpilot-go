@@ -2476,7 +2476,8 @@ func spoolVerdictDropReason(status EventStatus) (SpoolDropReason, bool) {
 // does not mention, or whose status this build cannot classify, settles as
 // delivered — inventing a drop for an unrecognized status would false-alarm
 // the dead-letter contract (mirroring Stats.ByStatus's carry-through
-// posture).
+// posture). An unreadable success still settles every event, but cannot
+// contribute to the delivery counter. Both resend paths use this guard.
 func (c *Client) settleResentChunk(chunk []spoolEntry, result batchResult) {
 	verdicts := make(map[string]EventStatus, len(result.Events))
 	for _, event := range result.Events {
@@ -2488,7 +2489,7 @@ func (c *Client) settleResentChunk(chunk []spoolEntry, result batchResult) {
 			resent++
 		}
 	}
-	if resent > 0 {
+	if resent > 0 && !result.responseMalformed {
 		c.stats.spoolResent.Add(uint64(resent))
 	}
 	removed, persistFailed := c.spool.ack(spoolEntryIDs(chunk))

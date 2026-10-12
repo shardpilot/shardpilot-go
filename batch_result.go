@@ -3,7 +3,7 @@ package shardpilot
 // EventStatus is the per-event ingest outcome the events:batch endpoint
 // reports for a single event in a published batch. The accepted/rejected/
 // duplicate aggregate counts on BatchResult cannot say which event each
-// outcome belongs to, nor do they expose the suppressed/observed outcomes;
+// outcome belongs to, nor do they expose the suppressed outcomes;
 // the per-event statuses do.
 //
 // New statuses may be added by the server over time. Callers that switch on
@@ -14,10 +14,6 @@ type EventStatus string
 const (
 	// EventStatusAccepted means the event was registered and stored.
 	EventStatusAccepted EventStatus = "accepted"
-	// EventStatusObserved means the event was accepted but its event_name is
-	// not registered, so it is observed only and not surfaced as a product
-	// metric (Code is typically "event_not_registered").
-	EventStatusObserved EventStatus = "observed"
 	// EventStatusDuplicate means the event_id was seen before and folded away
 	// as a duplicate (Code is typically "duplicate_event_id").
 	EventStatusDuplicate EventStatus = "duplicate"
@@ -52,7 +48,7 @@ type BatchEventStatus struct {
 // BatchResult is the outcome of a published event batch, surfaced to the
 // OnBatchResult callback. Accepted/Rejected/Duplicates are the server's
 // top-level aggregate counts; Events carries the per-event status list, which
-// identifies rejected, consent-suppressed, observed (not registered), and
+// identifies rejected, consent-suppressed, unknown, and
 // duplicate events. Client.Rejections also retains rejected outcomes without
 // this callback. Events is nil when the response carried no per-event list.
 type BatchResult struct {

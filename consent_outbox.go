@@ -2259,7 +2259,7 @@ func (c *Client) dispatchConsentReceiptsFrom(ctx context.Context, join bool, byW
 		// The transport bounds each HTTP attempt by HTTPTimeout; this used to
 		// bound the whole dispatch, which left a gzip-refusal fallback with
 		// only what the refusal had not already spent.
-		_, err := c.transport.PublishConsent(ctx, consentReceiptWire(receipt))
+		result, err := c.transport.PublishConsent(ctx, consentReceiptWire(receipt))
 		// The dispatch gate releases only on an OBSERVED HTTP outcome: a
 		// success, or a status error — proof the request reached the server
 		// and was answered, so an event batch following in this cycle
@@ -2273,6 +2273,7 @@ func (c *Client) dispatchConsentReceiptsFrom(ctx context.Context, join bool, byW
 			handed[receipt.IdempotencyKey] = struct{}{}
 		}
 		if err == nil {
+			c.recordConsentResponse(result)
 			c.stats.consentRecorded.Add(1)
 			o.mu.Lock()
 			o.deferUntil = time.Time{}

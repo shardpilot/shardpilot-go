@@ -63,6 +63,8 @@ type remoteConfigResponse struct {
 // It is mapped to the public BatchResult before it leaves the SDK; see
 // batch_result.go.
 type batchResult struct {
+	responseMalformed bool
+
 	Accepted   int                    `json:"accepted"`
 	Rejected   int                    `json:"rejected"`
 	Duplicates int                    `json:"duplicates"`
@@ -153,7 +155,7 @@ func (e *HTTPStatusError) Error() string {
 }
 
 func (e *HTTPStatusError) Retryable() bool {
-	return e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
+	return e.StatusCode == http.StatusRequestTimeout || e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500
 }
 
 type EncodeError struct {
@@ -177,12 +179,7 @@ type httpTransport struct {
 	// the consent route. Empty means declare nothing (header omitted).
 	schemaRevision string
 	client         *http.Client
-	// rcClient serves remote-config fetches only. Unlike the ingest client it
-	// does NOT follow redirects: the remote-config contract classifies a 3xx
-	// as a permanent http_3xx failure, and silently following it would
-	// instead surface the redirect target's body (typically HTML) as a
-	// transient malformed_response — the wrong class, and one that serves the
-	// cache for an endpoint that authoritatively is not here.
+	// Both request planes refuse redirects, including injected clients.
 	rcClient *http.Client
 
 	// compressionOptOut is the caller's Config.DisableRequestCompression:
@@ -219,23 +216,11 @@ func newHTTPTransport(cfg Config) *httpTransport {
 	refuseRedirects := func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
-	client := cfg.HTTPClient
-	rcClient := &http.Client{
-		Timeout:       cfg.HTTPTimeout,
-		CheckRedirect: refuseRedirects,
-	}
-	if client == nil {
-		client = &http.Client{
-			Timeout: cfg.HTTPTimeout,
-		}
-	} else {
-		// The remote-config client derives from the injected one — same
-		// Transport, Jar, and Timeout — with only CheckRedirect pinned: the
-		// no-redirect classification is an SDK contract (a 3xx is the
-		// permanent http_3xx outcome), not an integrator knob.
-		derived := *client
+	client := &http.Client{Timeout: cfg.HTTPTimeout, CheckRedirect: refuseRedirects}
+	if cfg.HTTPClient != nil {
+		derived := *cfg.HTTPClient
 		derived.CheckRedirect = refuseRedirects
-		rcClient = &derived
+		client = &derived
 	}
 	return &httpTransport{
 		endpoint:          base + "/v1/events:batch",
@@ -243,7 +228,7 @@ func newHTTPTransport(cfg Config) *httpTransport {
 		token:             ingestBearer(cfg),
 		schemaRevision:    effectiveSchemaRevision(cfg),
 		client:            client,
-		rcClient:          rcClient,
+		rcClient:          client,
 		compressionOptOut: cfg.DisableRequestCompression,
 		attemptTimeout:    cfg.HTTPTimeout,
 		logger:            cfg.Logger,
@@ -259,18 +244,11 @@ func (t *httpTransport) Publish(ctx context.Context, request batchRequest) (batc
 }
 
 func (t *httpTransport) PublishConsent(ctx context.Context, request consentRequest) (consentResult, error) {
-	// The schema-revision header is a batch-endpoint contract; the consent
-	// route must never carry it. The RESPONSE body is not decoded at all:
-	// the consent contract is that ANY 2xx acknowledges the write — the
-	// status is the acknowledgement, the body (empty 200, 204, or even a
-	// non-JSON payload from an intermediary) is irrelevant, and requiring a
-	// decode here would turn an already-accepted receipt into retained
-	// retry work forever. Send-path and no-status errors still surface as
-	// errors — nothing without an observed success status is acknowledged.
-	if err := t.postJSON(ctx, t.consentEndpoint, request, nil, ""); err != nil {
-		return consentResult{}, err
-	}
-	return consentResult{}, nil
+	// Success settles the receipt even if its optional body is unreadable.
+	// Decoding only feeds diagnostics; it cannot turn a 2xx into retry work.
+	var result consentResult
+	err := t.postJSON(ctx, t.consentEndpoint, request, &result, "")
+	return result, err
 }
 
 // FetchRemoteConfig GETs the remote-config resource. It reports transport-
@@ -471,14 +449,23 @@ func (t *httpTransport) postBody(ctx context.Context, endpoint string, payload [
 	}
 
 	if result == nil {
-		// The caller ignores the response body entirely (the consent route:
-		// any 2xx IS the acknowledgement): nothing to decode, and a body of
+		// A caller without a result target only needs the acknowledgement.
+		// There is nothing to decode, and a body of
 		// any shape — empty, non-JSON, truncated — must not turn a received
 		// success status into an error.
 		return nil
 	}
-	if err := json.NewDecoder(response.Body).Decode(result); err != nil {
-		return fmt.Errorf("decode shardpilot ingest response: %w", err)
+	responseBody, readErr := io.ReadAll(io.LimitReader(response.Body, rcMaxBodyBytes+1))
+	trimmed := bytes.TrimSpace(responseBody)
+	if readErr != nil || len(responseBody) > rcMaxBodyBytes || len(trimmed) == 0 || trimmed[0] != '{' || json.Unmarshal(responseBody, result) != nil {
+		// Discard partially decoded fields: the write settled, but its
+		// outcome is unknown and cannot be reported as accepted evidence.
+		switch value := result.(type) {
+		case *batchResult:
+			*value = batchResult{responseMalformed: true}
+		case *consentResult:
+			*value = consentResult{responseMalformed: true}
+		}
 	}
 	return nil
 }
@@ -511,14 +498,17 @@ type errorResponseWire struct {
 // malformed body degrades to the bare status), and the whole-seconds
 // Retry-After header is carried as a duration when present.
 func newHTTPStatusError(response *http.Response) *HTTPStatusError {
-	retryAfter, retryAfterPresent := parseRetryAfter(response.Header.Get("Retry-After"))
+	retryAfter, retryAfterPresent := time.Duration(0), false
+	if response.StatusCode == 429 || response.StatusCode >= 500 {
+		retryAfter, retryAfterPresent = parseRetryAfter(response.Header.Get("Retry-After"))
+	}
 	statusErr := &HTTPStatusError{
 		StatusCode:        response.StatusCode,
 		RetryAfter:        retryAfter,
 		retryAfterPresent: retryAfterPresent,
 	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, maxErrorBodyBytes))
-	if err != nil || len(body) == 0 {
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxErrorBodyBytes+1))
+	if err != nil || len(body) == 0 || len(body) > maxErrorBodyBytes {
 		return statusErr
 	}
 	var wire errorResponseWire

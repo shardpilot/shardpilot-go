@@ -2,6 +2,7 @@ package shardpilot
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -122,8 +123,9 @@ type consentRequest struct {
 }
 
 type consentResult struct {
-	Recorded bool `json:"recorded"`
-	Replayed bool `json:"replayed"`
+	responseMalformed bool
+	Recorded          bool `json:"recorded"`
+	Replayed          bool `json:"replayed"`
 }
 
 // SetConsent records an explicit analytics consent decision.
@@ -665,8 +667,27 @@ func (c *Client) publishConsent(request consentRequest) {
 	// Unbounded here on purpose: the transport bounds each HTTP attempt by
 	// HTTPTimeout, so a gzip-refusal fallback gets its own budget instead of
 	// the refusal's leftovers.
-	if _, err := c.transport.PublishConsent(context.Background(), request); err != nil {
+	result, err := c.transport.PublishConsent(context.Background(), request)
+	if err != nil {
 		c.logf("shardpilot consent publish failed: %v", err)
+	} else {
+		c.recordConsentResponse(result)
+	}
+}
+
+func (c *Client) recordConsentResponse(result consentResult) {
+	if result.responseMalformed {
+		c.stats.unparsedConsentResponses.Add(1)
+		c.logUnparsedWrite("consent receipt")
+	}
+}
+
+func (c *Client) logUnparsedWrite(kind string) {
+	message := "shardpilot: " + kind + " settled with an unreadable response; it will not be resent"
+	if c.cfg.Logger != nil {
+		c.logf("%s", message)
+	} else {
+		slog.Warn(message)
 	}
 }
 
