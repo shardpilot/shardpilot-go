@@ -2255,7 +2255,7 @@ func (r *recorder) last() *exchange {
 // Filtering here rather than trusting a config knob makes it a fact: anything
 // that is not an assignment passes through unrecorded, and is COUNTED, so the
 // claim is checked on every run instead of asserted once in a comment.
-const assignmentRoute = "/api/v1/runtime/experiments/assignment"
+const assignmentRoute = "/api/cp/v1/runtime/experiments/assignment"
 
 // observedConversation reports whether this request belongs to the exchange the
 // harness exists to observe, as opposed to background traffic it must not emit.

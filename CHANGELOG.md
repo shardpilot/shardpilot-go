@@ -2,6 +2,9 @@
 
 ## v0.8.0-alpha — release preparation (not published)
 
+- Assignment, exposure apply, and outcome apply requests use the public
+  `/api/cp/v1/runtime/experiments/` routes on `AppURL`.
+
 - Batch, consent, and crash writes settle on every HTTP 2xx, including an
   empty, malformed, truncated, or oversized response body. Unparsed successes
   emit a diagnostic and increment `Stats.UnparsedBatchResponses`,

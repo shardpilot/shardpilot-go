@@ -1948,7 +1948,7 @@ func TestARecognisedMediaTypeIsGrammar(t *testing.T) {
 // (shardpilot/shardpilot-go#84 review).
 func TestTheQuerySeparatorSurvives(t *testing.T) {
 	suppliedValues = nil
-	got := stripMarks(dropQuery("GET /api/v1/runtime/experiments/assignment?a=1 HTTP/1.1\r"))
+	got := stripMarks(dropQuery("GET /api/cp/v1/runtime/experiments/assignment?a=1 HTTP/1.1\r"))
 	if !strings.Contains(got, "assignment?") {
 		t.Fatalf("the query separator was consumed with the query: %q", got)
 	}
