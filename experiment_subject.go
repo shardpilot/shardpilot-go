@@ -727,7 +727,11 @@ func (s *ExperimentSubject) seal(ctx context.Context, head *expSubjectOwed) (*ex
 		s.mu.Lock()
 		s.countDrops(expDropRealSubjectsDisabled, s.withdrawAllLocked())
 		s.mu.Unlock()
-		c.logf("shardpilot experiments: the platform disabled real-subject assignment (apply endpoint); dropped a subject handle's assignments and owed applications")
+		// The plane fails closed for every subject, as on the fetch route.
+		e.mu.Lock()
+		e.latchAuthLocked()
+		e.mu.Unlock()
+		c.logf("shardpilot experiments: the platform disabled real-subject assignment (apply endpoint); dropped a subject handle's assignments and owed applications and latched the plane")
 		return nil, expSubjectSealSettled, ""
 	case resp.status == 409 && experimentApplyAgeRefusal(resp.body, resp.bodyIncomplete):
 		s.mu.Lock()

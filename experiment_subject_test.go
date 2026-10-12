@@ -531,3 +531,23 @@ func TestARefusedHandleFetchLeavesThePlaneAlone(t *testing.T) {
 		}
 	})
 }
+
+// TestAHandlesApplySentinelLatchesThePlane: the platform's real-subjects
+// sentinel on a handle's apply request stops every handle serving, as on a
+// fetch.
+func TestAHandlesApplySentinelLatchesThePlane(t *testing.T) {
+	rig := newExpHopRig(t, nil)
+	a := newSubjectOrFail(t, rig.client, expSubjectA, "player-a")
+	b := newSubjectOrFail(t, rig.client, expSubjectB, "player-b")
+	subjectFetchOrFail(t, a)
+	subjectFetchOrFail(t, b)
+	a.Apply(expTestScopeKey)
+	rig.script.apply.push(403, `{"error":{"code":"`+expSentinelRealSubjectsDisabled+`"}}`)
+	rig.cycle()
+	if got := rig.drops(expDropRealSubjectsDisabled); got != 1 {
+		t.Fatalf("real_subjects_disabled drops = %d, want a's owed application", got)
+	}
+	if variant := b.Variant(expTestScopeKey); variant != "" {
+		t.Fatalf("after the platform disabled real subjects, another handle still serves %q", variant)
+	}
+}
