@@ -121,6 +121,11 @@ func (c *Client) enqueueExperimentFact(event Event, atClose bool) (uint64, error
 	if err != nil {
 		return 0, err
 	}
+	// The same size rule as host events: a fact ingest would reject is
+	// terminal, never queued.
+	if err := c.encodeAtIntake(&event); err != nil {
+		return 0, c.refuseOversizeEvent()
+	}
 	event.intakeConsentEpoch = intakeEpoch
 	// The pipeline sequence is taken under lifecycleMu with the send, so the
 	// queue holds experiment facts in sequence order: the worker's low-water

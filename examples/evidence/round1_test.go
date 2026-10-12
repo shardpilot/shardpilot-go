@@ -81,21 +81,33 @@ func TestUnlinkableActorRefusedBeforeRequests(t *testing.T) {
 	}
 }
 
-func TestAcceptedSingleCannotPassOversizeRejection(t *testing.T) {
-	event, err := json.Marshal(map[string]string{"event_id": "single", "workspace_id": strings.Repeat("w", 3000)})
-	if err != nil || len(event) <= 2048 {
-		t.Fatal("oversized accepted fixture was not constructed")
-	}
-	body, _ := json.Marshal(map[string]any{"events": []json.RawMessage{event}})
-	for _, status := range []string{"accepted", "rejected"} {
-		t.Run(status, func(t *testing.T) {
+// TestOversizeOnTheWireFailsTheEvidence: the SDK refuses events over 2048
+// bytes at intake, so an oversize element in a request fails the case
+// whatever the server answers. A small event passes only when accepted.
+func TestOversizeOnTheWireFailsTheEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		size   int
+		status string
+		pass   bool
+	}{
+		{"oversize accepted", 3000, "accepted", false},
+		{"oversize rejected", 3000, "rejected", false},
+		{"small accepted", 100, "accepted", true},
+		{"small rejected", 100, "rejected", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			event, err := json.Marshal(map[string]string{"event_id": "single", "workspace_id": strings.Repeat("w", tc.size)})
+			if err != nil || (len(event) > 2048) != (tc.size > 2048) {
+				t.Fatal("fixture was not constructed")
+			}
+			body, _ := json.Marshal(map[string]any{"events": []json.RawMessage{event}})
 			response, _ := json.Marshal(map[string]any{"events": []map[string]string{{
-				"event_id": "single", "status": status, "code": "event_too_large",
+				"event_id": "single", "status": tc.status, "code": "event_too_large",
 			}}})
 			w := witness{name: "single", records: []exchange{{Status: 202, RequestBody: string(body), ResponseBody: string(response)}}}
-			err := w.outcome("accepted")
-			if (err == nil) != (status == "accepted") {
-				t.Fatalf("accepted single with %s verdict: error=%v", status, err)
+			if err := w.outcome("accepted"); (err == nil) != tc.pass {
+				t.Fatalf("%s: error=%v, want pass=%t", tc.name, err, tc.pass)
 			}
 		})
 	}

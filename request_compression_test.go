@@ -713,11 +713,12 @@ func TestTheUncompressedRetryGetsItsOwnAttemptTimeout(t *testing.T) {
 
 	// A synchronous Track publishes on the CALLER's goroutine, under the
 	// caller's context — which is where the shared budget used to be applied.
-	// The props push the single-event body over the compression threshold.
+	// The props push the single-event body over the compression threshold
+	// while the event stays under the 2048-byte per-event cap.
 	if err := client.Track(context.Background(), Event{
 		ID:    "c43878a4-e64b-50be-b11d-ae03e72030fd",
 		Name:  "level_complete",
-		Props: map[string]any{"blob": strings.Repeat("compressible-", 200)},
+		Props: map[string]any{"blob": strings.Repeat("compressible-", 100)},
 	}); err != nil {
 		t.Fatalf("the uncompressed retry must have its own attempt budget: %v", err)
 	}

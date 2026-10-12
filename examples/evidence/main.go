@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -179,18 +180,16 @@ func (w *witness) outcome(kind string) error {
 	if json.Unmarshal([]byte(e.RequestBody), &sent) != nil || json.Unmarshal([]byte(e.ResponseBody), &got) != nil || len(sent.Events) == 0 || len(got.Events) != len(sent.Events) {
 		return fmt.Errorf("missing complete per-event verdicts")
 	}
+	// The mixed case's oversize event is refused by the SDK before sending,
+	// so every case sends its small events only.
 	count := 1
 	if w.name == "realistic-batch" {
 		count = 4
-	}
-	if kind == "mixed" {
-		count = 2
 	}
 	if len(sent.Events) != count {
 		return fmt.Errorf("case sent %d events, expected %d", len(sent.Events), count)
 	}
 	expected := make(map[string]bool)
-	large := 0
 	for _, raw := range sent.Events {
 		var event struct {
 			ID string `json:"event_id"`
@@ -198,26 +197,17 @@ func (w *witness) outcome(kind string) error {
 		if json.Unmarshal(raw, &event) != nil || event.ID == "" {
 			return fmt.Errorf("invalid sent event identity")
 		}
-		oversize := len(raw) > 2048
-		if oversize {
-			large++
+		if len(bytes.TrimSpace(raw)) > 2048 {
+			return fmt.Errorf("an event over 2048 bytes reached the wire")
 		}
-		expected[event.ID] = oversize
-	}
-	if kind == "mixed" && (len(sent.Events) != 2 || large != 1) {
-		return fmt.Errorf("mixed scene must contain one >2048-byte event and one small event")
+		expected[event.ID] = true
 	}
 	for _, event := range got.Events {
-		oversize, exists := expected[event.ID]
-		if !exists {
+		if !expected[event.ID] {
 			return fmt.Errorf("unknown or repeated response event id")
 		}
 		delete(expected, event.ID)
-		if oversize && kind == "mixed" {
-			if event.Status != "rejected" || event.Code != "event_too_large" {
-				return fmt.Errorf("oversize event lacks event_too_large rejection")
-			}
-		} else if event.Status != "accepted" {
+		if event.Status != "accepted" {
 			return fmt.Errorf("event not accepted (status=%s)", event.Status)
 		}
 	}
@@ -278,7 +268,9 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 	event := func(name, session string, sequence int64, props map[string]any) shardpilot.Event {
 		return shardpilot.Event{Name: name, SessionID: runID + "-" + session, SessionSequence: sequence, Props: props}
 	}
-	analytics := func(name, kind string, events []shardpilot.Event, synchronous bool) {
+	// The refused events are offered first and must be refused locally with
+	// event_too_large; only the events argument is sent.
+	analytics := func(name, kind string, events []shardpilot.Event, synchronous bool, refused ...shardpilot.Event) {
 		caseRun(name, kind, func(hc *http.Client) error {
 			c, err := shardpilot.NewClient(shardpilot.Config{IngestURL: values["SHARDPILOT_INGEST_URL"], PublishableKey: values["SHARDPILOT_PUBLISHABLE_KEY"], WorkspaceID: values["SHARDPILOT_WORKSPACE_ID"], AppID: values["SHARDPILOT_APP_ID"], EnvironmentID: values["SHARDPILOT_ENVIRONMENT_ID"], AnonymousID: values["SHARDPILOT_ANONYMOUS_ID"], Source: shardpilot.SourceClient, BatchSize: len(events), FlushInterval: time.Hour, HTTPTimeout: 15 * time.Second, HTTPClient: hc, DisableRequestCompression: true})
 			if err != nil {
@@ -286,6 +278,12 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
+			for _, e := range refused {
+				if refusal := c.Enqueue(e); !errors.Is(refusal, shardpilot.ErrEventTooLarge) {
+					_ = c.Close(ctx)
+					return fmt.Errorf("an oversize event was not refused locally with event_too_large: %v", refusal)
+				}
+			}
 			if synchronous {
 				err = c.Track(ctx, events[0])
 			} else {
@@ -316,7 +314,8 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 		event("app.screen_view", "batch-b", 1, map[string]any{"screen": "menu"}),
 		event("app.screen_view", "batch-b", 2, map[string]any{"screen": "summary"}),
 	}, false)
-	analytics("mixed-size", "mixed", []shardpilot.Event{event("app.screen_view", "large", 1, map[string]any{"synthetic_padding": strings.Repeat("x", 3072)}), event("app.screen_view", "small", 1, nil)}, false)
+	analytics("mixed-size", "mixed", []shardpilot.Event{event("app.screen_view", "small", 1, nil)}, false,
+		event("app.screen_view", "large", 1, map[string]any{"synthetic_padding": strings.Repeat("x", 3072)}))
 	analytics("unauthenticated", "unauthenticated", []shardpilot.Event{event("app.screen_view", "unauth", 1, nil)}, true)
 	for _, kind := range []string{"go-panic", "native-json", "raw-text"} {
 		caseRun(kind, "crash", func(hc *http.Client) error {

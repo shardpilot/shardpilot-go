@@ -29,10 +29,10 @@ func environment(name string) string {
 }
 
 func TestSenderEvidence(t *testing.T) {
-	for _, defect := range []string{"", "accept_oversize", "accept_unauthenticated", "suppress", "missing_verdict", "wrong_id", "crash_failure", "echo_key", "write_failure"} {
+	for _, defect := range []string{"", "accept_unauthenticated", "suppress", "missing_verdict", "wrong_id", "crash_failure", "echo_key", "write_failure"} {
 		t.Run(defect, func(t *testing.T) {
 			var output bytes.Buffer
-			calls, analytics, crashes, mixed := 0, 0, 0, 0
+			calls, analytics, crashes, oversize := 0, 0, 0, 0
 			transport := transportFunc(func(req *http.Request) (*http.Response, error) {
 				calls++
 				body, err := io.ReadAll(req.Body)
@@ -50,7 +50,6 @@ func TestSenderEvidence(t *testing.T) {
 						t.Fatal(err)
 					}
 					var verdicts []map[string]string
-					large, small := 0, 0
 					sequences := make(map[string]int64)
 					for _, raw := range batch.Events {
 						var event struct {
@@ -72,13 +71,10 @@ func TestSenderEvidence(t *testing.T) {
 							t.Errorf("wire session sequence = %d, want %d for %s", event.Sequence, wantSequence, event.Name)
 						}
 						v := map[string]string{"event_id": event.ID, "status": "accepted"}
-						if len(raw) > 2048 {
-							large++
-							if defect != "accept_oversize" {
-								v["status"], v["code"] = "rejected", "event_too_large"
-							}
-						} else {
-							small++
+						if len(bytes.TrimSpace(raw)) > 2048 {
+							// The SDK refuses these at intake; one on the wire is a defect.
+							oversize++
+							v["status"], v["code"] = "rejected", "event_too_large"
 						}
 						if defect == "suppress" {
 							v["status"] = "suppressed_no_consent"
@@ -87,9 +83,6 @@ func TestSenderEvidence(t *testing.T) {
 							v["event_id"] = "not-sent"
 						}
 						verdicts = append(verdicts, v)
-					}
-					if large > 0 && small > 0 {
-						mixed++
 					}
 					if defect == "missing_verdict" {
 						verdicts = nil
@@ -129,8 +122,8 @@ func TestSenderEvidence(t *testing.T) {
 			}
 			code := run(environment, sink, transport)
 			if defect == "" {
-				if code != 0 || analytics != 4 || crashes != 3 || mixed != 1 {
-					t.Fatalf("code=%d analytics=%d crashes=%d mixed=%d\n%s", code, analytics, crashes, mixed, &output)
+				if code != 0 || analytics != 4 || crashes != 3 || oversize != 0 {
+					t.Fatalf("code=%d analytics=%d crashes=%d oversize=%d\n%s", code, analytics, crashes, oversize, &output)
 				}
 			} else if code == 0 {
 				t.Fatalf("false success for %s\n%s", defect, &output)

@@ -26,6 +26,12 @@ var (
 	// Track/Enqueue intake. It also matches ErrInvalidEvent through errors.Is.
 	ErrReservedEventName = fmt.Errorf("%w: reserved_event_name", ErrInvalidEvent)
 
+	// ErrEventTooLarge refuses an event at intake whose wire JSON, with
+	// surrounding whitespace trimmed, is longer than 2048 bytes: the ingest
+	// per-event cap, which rejects the same event as event_too_large. An
+	// event of exactly 2048 bytes is admitted. Nothing is queued or sent.
+	ErrEventTooLarge = errors.New("event_too_large: shardpilot event exceeds the 2048-byte ingest limit")
+
 	// ErrInvalidEventID refuses a caller ID outside the canonical UUID shape.
 	// It also matches ErrInvalidEvent through errors.Is.
 	ErrInvalidEventID = fmt.Errorf("%w: invalid_event_id", ErrInvalidEvent)
