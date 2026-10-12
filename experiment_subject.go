@@ -95,6 +95,8 @@ type ExperimentSubject struct {
 	consent    ExperimentSubjectConsent
 	consentSeq uint64
 	closed     bool
+	// rejected: the platform refused the subject; the handle never sends it again.
+	rejected error
 	// fetchSeq numbers this handle's fetches at dispatch; settled is the
 	// newest authoritative fetch applied per experiment, so an older answer
 	// landing later is discarded (the client's per-key fence).
@@ -189,6 +191,9 @@ func (s *ExperimentSubject) SetConsent(consent ExperimentSubjectConsent) error {
 func (s *ExperimentSubject) refusalLocked() error {
 	if s.closed || s.c.closed.Load() {
 		return ErrClosed
+	}
+	if s.rejected != nil {
+		return s.rejected
 	}
 	switch s.consent {
 	case ExperimentSubjectConsentGranted:
@@ -345,6 +350,11 @@ func (s *ExperimentSubject) Fetch(ctx context.Context, experimentKey string, att
 	}
 	result, outcome, failure := applyExperimentAssignment(serveEntry, resp, scope, nowMS)
 	constructive := refusal == nil && !epochStale && !fencedOut
+	if outcome.remint && s.rejected == nil {
+		// A subject fault is terminal whatever the fences: withdraw everything.
+		s.rejected = fmt.Errorf("%w: the platform refused the subject (%s)", ErrInvalidExperimentSubject, experimentBodyErrorCode(resp.body, resp.bodyIncomplete))
+		e.countDropLocked(expDropApplyRefused, s.withdrawAllLocked())
+	}
 	if !fencedOut {
 		if outcome.authoritative && !epochStale {
 			s.settled[experimentKey] = seq
@@ -356,7 +366,7 @@ func (s *ExperimentSubject) Fetch(ctx context.Context, experimentKey string, att
 			e.countDropLocked(expDropRealSubjectsDisabled, s.withdrawAllLocked())
 		case outcome.ageRefusal:
 			e.countDropLocked(expDropAgeIneligible, s.withdrawExperimentLocked(experimentKey))
-		case outcome.dropEntry, outcome.remint:
+		case outcome.dropEntry:
 			delete(s.entries, experimentKey)
 		case outcome.newEntry != nil && constructive:
 			entry := outcome.newEntry
@@ -367,10 +377,10 @@ func (s *ExperimentSubject) Fetch(ctx context.Context, experimentKey string, att
 	}
 	// The plane's shared state: a refused, stale or fenced-out answer
 	// neither paces nor lifts the latch. A 401/403 latches unless it is
-	// stale, or refused without the sentinel.
+	// stale or refused; the sentinel latches unless it is fenced out.
 	switch {
 	case outcome.authBlocked:
-		if !epochStale && !fencedOut && (refusal == nil || outcome.dropAll) {
+		if !fencedOut && (outcome.dropAll || (!epochStale && refusal == nil)) {
 			e.latchAuthLocked()
 		}
 	case outcome.transient:

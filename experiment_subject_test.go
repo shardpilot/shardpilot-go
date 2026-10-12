@@ -551,3 +551,59 @@ func TestAHandlesApplySentinelLatchesThePlane(t *testing.T) {
 		t.Fatalf("after the platform disabled real subjects, another handle still serves %q", variant)
 	}
 }
+
+// TestAStaleHandleSentinelStillLatchesThePlane: a sentinel landing after the
+// plane was latched and reopened still latches it, as on the client.
+func TestAStaleHandleSentinelStillLatchesThePlane(t *testing.T) {
+	rig := newExpHopRig(t, nil)
+	a := newSubjectOrFail(t, rig.client, expSubjectA, "player-a")
+	b := newSubjectOrFail(t, rig.client, expSubjectB, "player-b")
+	release := make(chan struct{})
+	rig.script.mu.Lock()
+	rig.script.gates = map[int]chan struct{}{0: release}
+	rig.script.mu.Unlock()
+	rig.answerNext(
+		expScriptResponse{status: 403, body: `{"error":{"code":"` + expSentinelRealSubjectsDisabled + `"}}`},
+		expScriptResponse{status: 401, body: `{"error":{"code":"unauthorized"}}`},
+		expScriptResponse{status: 200, body: expControlServedBody()},
+	)
+	stale := fetchInBackground(a)
+	waitForRequests(t, rig, 1)
+	if _, err := b.Fetch(context.Background(), expTestScopeKey, nil); err == nil {
+		t.Fatal("control: the 401 must fail b's fetch")
+	}
+	if _, err := b.Fetch(context.Background(), expTestScopeKey, nil); err != nil {
+		t.Fatalf("control: an authorized fetch lifts the latch: %v", err)
+	}
+	close(release)
+	<-stale
+	if variant := b.Variant(expTestScopeKey); variant != "" {
+		t.Fatalf("after the platform disabled real subjects, another handle still serves %q", variant)
+	}
+}
+
+// TestASubjectRejectionEndsTheHandle: a subject fault withdraws every
+// assignment and owed application; the handle never sends the subject again.
+func TestASubjectRejectionEndsTheHandle(t *testing.T) {
+	rig := newExpHopRig(t, nil)
+	s := newSubjectOrFail(t, rig.client, expSubjectA, "player-a")
+	subjectFetchOrFail(t, s)
+	s.Apply(expTestScopeKey)
+	rig.answerNext(expScriptResponse{status: 400, body: `{"error":{"code":"` + expSentinelSubjectGrammar + `"}}`})
+	if _, err := s.Fetch(context.Background(), "exp-second", nil); !errors.Is(err, ErrInvalidExperimentSubject) {
+		t.Fatalf("Fetch = %v, want ErrInvalidExperimentSubject", err)
+	}
+	if variant := s.Variant(expTestScopeKey); variant != "" {
+		t.Fatalf("the rejected subject's other assignment is still served: %q", variant)
+	}
+	if owed := s.owedCount(); owed != 0 {
+		t.Fatalf("%d application(s) for the rejected subject still owed", owed)
+	}
+	before := rig.script.requestCount()
+	if _, err := s.Fetch(context.Background(), expTestScopeKey, nil); !errors.Is(err, ErrInvalidExperimentSubject) {
+		t.Fatalf("Fetch after the rejection = %v, want ErrInvalidExperimentSubject", err)
+	}
+	if rig.script.requestCount() != before {
+		t.Fatal("the handle sent the rejected subject again")
+	}
+}
