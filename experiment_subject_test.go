@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // One process, many players: an ExperimentSubject handle fetches, serves
@@ -379,4 +380,154 @@ func TestAPlayersDenialDropsTheirQueuedFacts(t *testing.T) {
 	if dropped := rig.client.Snapshot().Dropped; dropped != 1 {
 		t.Fatalf("Dropped = %d, want player a's withdrawn fact", dropped)
 	}
+}
+
+// waitForRequests waits until the assignment route has seen n requests.
+func waitForRequests(t *testing.T, rig *expHopRig, n int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for rig.script.requestCount() < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %d assignment request(s)", n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+type subjectFetchOutcome struct {
+	result ExperimentAssignmentResult
+	err    error
+}
+
+func fetchInBackground(s *ExperimentSubject) chan subjectFetchOutcome {
+	done := make(chan subjectFetchOutcome, 1)
+	go func() {
+		result, err := s.Fetch(context.Background(), expTestScopeKey, nil)
+		done <- subjectFetchOutcome{result, err}
+	}()
+	return done
+}
+
+// TestOneHandlesFetchesOfAnExperimentAreFenced: an older response that
+// lands after a newer one settled is discarded: a killed assignment stays
+// killed, and the older caller is not handed the superseded variant.
+func TestOneHandlesFetchesOfAnExperimentAreFenced(t *testing.T) {
+	rig := newExpHopRig(t, nil)
+	s := newSubjectOrFail(t, rig.client, expSubjectA, "player-a")
+	release := make(chan struct{})
+	rig.script.mu.Lock()
+	rig.script.gates = map[int]chan struct{}{0: release}
+	rig.script.mu.Unlock()
+	rig.answerNext(
+		expScriptResponse{status: 200, body: expAssignedServedBody(expServedTrio)},
+		expScriptResponse{status: 200, body: `{"assigned":false,"reason":"kill_switch","version":3}`},
+	)
+	older := fetchInBackground(s)
+	waitForRequests(t, rig, 1)
+	if newer, err := s.Fetch(context.Background(), expTestScopeKey, nil); err != nil || newer.Assigned || newer.Reason != "kill_switch" {
+		t.Fatalf("the newer fetch = %+v, %v; want the kill", newer, err)
+	}
+	close(release)
+	got := <-older
+	if got.err == nil && got.result.Assigned {
+		t.Fatalf("the older fetch returned the superseded variant: %+v", got.result)
+	}
+	if variant := s.Variant(expTestScopeKey); variant != "" {
+		t.Fatalf("the older response reinstated the killed assignment: %q", variant)
+	}
+}
+
+// TestAHandleFetchThatRacedTheLatchInstallsNothing: a response to a request
+// sent before a 401 latched the plane is discarded, and its caller gets
+// the closed result; a later unlatch does not serve it.
+func TestAHandleFetchThatRacedTheLatchInstallsNothing(t *testing.T) {
+	rig := newExpHopRig(t, nil)
+	a := newSubjectOrFail(t, rig.client, expSubjectA, "player-a")
+	b := newSubjectOrFail(t, rig.client, expSubjectB, "player-b")
+	release := make(chan struct{})
+	rig.script.mu.Lock()
+	rig.script.gates = map[int]chan struct{}{0: release}
+	rig.script.mu.Unlock()
+	rig.answerNext(
+		expScriptResponse{status: 200, body: expAssignedServedBody(expServedTrio)},
+		expScriptResponse{status: 401, body: `{"error":{"code":"unauthorized"}}`},
+		expScriptResponse{status: 200, body: expControlServedBody()},
+	)
+	raced := fetchInBackground(a)
+	waitForRequests(t, rig, 1)
+	if _, err := b.Fetch(context.Background(), expTestScopeKey, nil); err == nil {
+		t.Fatal("control: the 401 must fail b's fetch")
+	}
+	close(release)
+	if got := <-raced; got.err == nil {
+		t.Fatalf("a fetch that raced the latch returned %+v, want the closed result", got.result)
+	}
+	if _, err := b.Fetch(context.Background(), expTestScopeKey, nil); err != nil {
+		t.Fatalf("control: an authorized fetch lifts the latch: %v", err)
+	}
+	if variant := a.Variant(expTestScopeKey); variant != "" {
+		t.Fatalf("the raced response was installed and is served after the unlatch: %q", variant)
+	}
+}
+
+// TestARefusedHandleFetchLeavesThePlaneAlone: an answer that lands after
+// the player's consent changed neither paces the plane nor lifts its latch.
+func TestARefusedHandleFetchLeavesThePlaneAlone(t *testing.T) {
+	t.Run("pacing", func(t *testing.T) {
+		rig := newExpHopRig(t, nil)
+		s := newSubjectOrFail(t, rig.client, expSubjectA, "player-a")
+		release := make(chan struct{})
+		rig.script.mu.Lock()
+		rig.script.gates = map[int]chan struct{}{0: release}
+		rig.script.mu.Unlock()
+		rig.answerNext(expScriptResponse{status: 429, body: `{}`, retryAfter: "3600"})
+		refused := fetchInBackground(s)
+		waitForRequests(t, rig, 1)
+		if err := s.SetConsent(ExperimentSubjectConsentDenied); err != nil {
+			t.Fatal(err)
+		}
+		close(release)
+		if got := <-refused; !errors.Is(got.err, ErrConsentDenied) {
+			t.Fatalf("Fetch = %+v, %v; want ErrConsentDenied", got.result, got.err)
+		}
+		e := rig.client.exp
+		e.mu.Lock()
+		paced := e.retryAfterMS
+		e.mu.Unlock()
+		if paced != 0 {
+			t.Fatal("a refused fetch's Retry-After paced every player's work")
+		}
+	})
+	t.Run("latch", func(t *testing.T) {
+		rig := newExpHopRig(t, nil)
+		a := newSubjectOrFail(t, rig.client, expSubjectA, "player-a")
+		b := newSubjectOrFail(t, rig.client, expSubjectB, "player-b")
+		release := make(chan struct{})
+		rig.script.mu.Lock()
+		rig.script.gates = map[int]chan struct{}{1: release}
+		rig.script.mu.Unlock()
+		rig.answerNext(
+			expScriptResponse{status: 401, body: `{"error":{"code":"unauthorized"}}`},
+			expScriptResponse{status: 200, body: expAssignedServedBody(expServedTrio)},
+		)
+		if _, err := b.Fetch(context.Background(), expTestScopeKey, nil); err == nil {
+			t.Fatal("control: the 401 must fail b's fetch")
+		}
+		refused := fetchInBackground(a)
+		waitForRequests(t, rig, 2)
+		if err := a.SetConsent(ExperimentSubjectConsentDenied); err != nil {
+			t.Fatal(err)
+		}
+		close(release)
+		if got := <-refused; !errors.Is(got.err, ErrConsentDenied) {
+			t.Fatalf("Fetch = %+v, %v; want ErrConsentDenied", got.result, got.err)
+		}
+		e := rig.client.exp
+		e.mu.Lock()
+		latched := e.authBlocked
+		e.mu.Unlock()
+		if !latched {
+			t.Fatal("a refused fetch lifted the plane's credential latch")
+		}
+	})
 }

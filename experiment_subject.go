@@ -95,7 +95,12 @@ type ExperimentSubject struct {
 	consent    ExperimentSubjectConsent
 	consentSeq uint64
 	closed     bool
-	entries    map[string]*expEntry
+	// fetchSeq numbers this handle's fetches at dispatch; settled is the
+	// newest authoritative fetch applied per experiment, so an older answer
+	// landing later is discarded (the client's per-key fence).
+	fetchSeq uint64
+	settled  map[string]uint64
+	entries  map[string]*expEntry
 	// exposed holds the (experiment, version, subject) tuples this handle
 	// has recorded or counted: an application is recorded once per handle.
 	exposed map[string]bool
@@ -137,6 +142,7 @@ func (c *Client) ExperimentSubject(cfg ExperimentSubjectConfig) (*ExperimentSubj
 		anonymousID: cfg.AnonymousID,
 		session:     session,
 		consent:     cfg.Consent,
+		settled:     make(map[string]uint64),
 		entries:     make(map[string]*expEntry),
 		exposed:     make(map[string]bool),
 	}
@@ -171,7 +177,7 @@ func (s *ExperimentSubject) SetConsent(consent ExperimentSubjectConsent) error {
 	s.consent = consent
 	s.consentSeq++
 	if consent != ExperimentSubjectConsentGranted {
-		s.withdrawAllLocked(expDropConsentWithdrawn)
+		s.countDrops(expDropConsentWithdrawn, s.withdrawAllLocked())
 		// The player's facts already in the client's queue, its worker's
 		// batch or a retained retry are dropped at the next send point.
 		s.denials.Add(1)
@@ -194,21 +200,29 @@ func (s *ExperimentSubject) refusalLocked() error {
 	return s.c.experimentConsentRefusal()
 }
 
-// withdrawAllLocked drops every cached assignment and owed application,
-// each application counted for reason.
-func (s *ExperimentSubject) withdrawAllLocked(reason string) {
-	e := s.c.exp
-	e.mu.Lock()
-	e.countDropLocked(reason, len(s.owed))
-	e.mu.Unlock()
+// withdrawAllLocked drops every cached assignment and owed application and
+// returns how many applications it dropped, for the caller to count.
+func (s *ExperimentSubject) withdrawAllLocked() int {
+	dropped := len(s.owed)
 	s.owed = nil
 	s.entries = make(map[string]*expEntry)
 	s.exposed = make(map[string]bool)
+	return dropped
+}
+
+// countDrops reports n applications not recorded for reason, taking the
+// plane's lock (callers must not hold it).
+func (s *ExperimentSubject) countDrops(reason string, n int) {
+	e := s.c.exp
+	e.mu.Lock()
+	e.countDropLocked(reason, n)
+	e.mu.Unlock()
 }
 
 // withdrawExperimentLocked drops one experiment's cached assignment and
-// owed applications, each application counted for reason.
-func (s *ExperimentSubject) withdrawExperimentLocked(experimentKey, reason string) {
+// owed applications and returns how many applications it dropped, for the
+// caller to count.
+func (s *ExperimentSubject) withdrawExperimentLocked(experimentKey string) int {
 	delete(s.entries, experimentKey)
 	kept := s.owed[:0]
 	dropped := 0
@@ -220,10 +234,7 @@ func (s *ExperimentSubject) withdrawExperimentLocked(experimentKey, reason strin
 		kept = append(kept, owed)
 	}
 	s.owed = kept
-	e := s.c.exp
-	e.mu.Lock()
-	e.countDropLocked(reason, dropped)
-	e.mu.Unlock()
+	return dropped
 }
 
 // Fetch asks the platform for this player's assignment of an experiment
@@ -254,6 +265,8 @@ func (s *ExperimentSubject) Fetch(ctx context.Context, experimentKey string, att
 		return ExperimentAssignmentResult{}, err
 	}
 	consentSeq := s.consentSeq
+	s.fetchSeq++
+	seq := s.fetchSeq
 	s.mu.Unlock()
 
 	normalized, dropped := normalizeExperimentAssignmentAttributes(attributes)
@@ -304,8 +317,10 @@ func (s *ExperimentSubject) Fetch(ctx context.Context, experimentKey string, att
 	}
 	nowMS := c.clock.Now().UnixMilli()
 
+	// The commit point, under both locks (handle first): the fences the
+	// client's own settle applies, for this handle's state.
 	s.mu.Lock()
-	result, outcome, failure := applyExperimentAssignment(s.entries[experimentKey], resp, scope, nowMS)
+	e.mu.Lock()
 	refusal := s.refusalLocked()
 	if refusal == nil && (s.consentSeq != consentSeq || c.consentEpoch.Load() != dispatchConsentEpoch) {
 		// A consent change while the request was in flight: the answer
@@ -315,42 +330,85 @@ func (s *ExperimentSubject) Fetch(ctx context.Context, experimentKey string, att
 			refusal = ErrConsentDenied
 		}
 	}
-	// Withdrawals land whatever the consent state; an install only under
-	// the consent that sent the request.
-	switch {
-	case outcome.dropAll:
-		s.withdrawAllLocked(expDropRealSubjectsDisabled)
-	case outcome.ageRefusal:
-		s.withdrawExperimentLocked(experimentKey, expDropAgeIneligible)
-	case outcome.dropEntry, outcome.remint:
-		delete(s.entries, experimentKey)
-	case outcome.newEntry != nil && refusal == nil:
-		entry := outcome.newEntry
-		entry.SubjectKey = s.subjectKey
-		entry.Attributes = normalized
-		s.entries[experimentKey] = entry
+	// A 401/403 latched the plane since dispatch: the answer installs
+	// nothing and moves no plane state; only its destructive half lands.
+	epochStale := authEpoch != e.authEpoch
+	// A newer authoritative answer for this experiment already settled.
+	fencedOut := seq <= s.settled[experimentKey]
+	// A transient serves the cached entry only to a request with the same
+	// attribute set; a stale epoch reads as no entry.
+	var serveEntry *expEntry
+	if !epochStale {
+		if entry := s.entries[experimentKey]; entry != nil && experimentAttributesEqual(entry.Attributes, normalized) {
+			serveEntry = entry
+		}
 	}
-	s.mu.Unlock()
-
-	// The plane's shared state: the credential latch and the pacing.
-	e.mu.Lock()
+	result, outcome, failure := applyExperimentAssignment(serveEntry, resp, scope, nowMS)
+	constructive := refusal == nil && !epochStale && !fencedOut
+	if !fencedOut {
+		if outcome.authoritative && !epochStale {
+			s.settled[experimentKey] = seq
+		}
+		// Withdrawals land whatever the consent or epoch; an install only
+		// under the consent and credential state that sent the request.
+		switch {
+		case outcome.dropAll:
+			e.countDropLocked(expDropRealSubjectsDisabled, s.withdrawAllLocked())
+		case outcome.ageRefusal:
+			e.countDropLocked(expDropAgeIneligible, s.withdrawExperimentLocked(experimentKey))
+		case outcome.dropEntry, outcome.remint:
+			delete(s.entries, experimentKey)
+		case outcome.newEntry != nil && constructive:
+			entry := outcome.newEntry
+			entry.SubjectKey = s.subjectKey
+			entry.Attributes = normalized
+			s.entries[experimentKey] = entry
+		}
+	}
+	// The plane's shared state: a refused, stale or fenced-out answer
+	// neither paces nor lifts the latch. A 401/403 latches unless it is
+	// stale, or refused without the sentinel.
 	switch {
 	case outcome.authBlocked:
-		e.latchAuthLocked()
+		if !epochStale && !fencedOut && (refusal == nil || outcome.dropAll) {
+			e.latchAuthLocked()
+		}
 	case outcome.transient:
-		e.paceTransientLocked(nowMS, outcome.retryAfterSeconds, outcome.retryAfterPresent)
-	case outcome.authoritative && !outcome.preserveAuth && authEpoch == e.authEpoch:
-		e.liftAuthLatchLocked()
+		if constructive {
+			e.paceTransientLocked(nowMS, outcome.retryAfterSeconds, outcome.retryAfterPresent)
+		}
+	case outcome.authoritative && !outcome.preserveAuth:
+		if constructive {
+			e.liftAuthLatchLocked()
+		}
+	}
+	// A fenced-out authoritative answer's caller gets the settled current
+	// state, never the discarded variant.
+	var supersededResult ExperimentAssignmentResult
+	supersededFailure := ""
+	if fencedOut && outcome.authoritative && !epochStale {
+		current := s.entries[experimentKey]
+		if current != nil && (e.authBlocked || !experimentAttributesEqual(current.Attributes, normalized)) {
+			current = nil
+		}
+		supersededResult, supersededFailure = serveExperimentEntryOrFail(current, "superseded")
 	}
 	e.mu.Unlock()
+	s.mu.Unlock()
 
-	if refusal != nil {
+	switch {
+	case refusal != nil:
 		return ExperimentAssignmentResult{}, refusal
-	}
-	if outcome.remint {
+	case epochStale && !outcome.authBlocked:
+		return ExperimentAssignmentResult{}, expFetchError("unauthorized")
+	case fencedOut && outcome.authoritative:
+		if supersededFailure != "" {
+			return ExperimentAssignmentResult{}, expFetchError(supersededFailure)
+		}
+		return supersededResult, nil
+	case outcome.remint:
 		return ExperimentAssignmentResult{}, fmt.Errorf("%w: the platform refused the subject (%s)", ErrInvalidExperimentSubject, experimentBodyErrorCode(resp.body, resp.bodyIncomplete))
-	}
-	if failure != "" {
+	case failure != "":
 		return ExperimentAssignmentResult{}, expFetchError(failure)
 	}
 	return result, nil
@@ -667,13 +725,13 @@ func (s *ExperimentSubject) seal(ctx context.Context, head *expSubjectOwed) (*ex
 		return nil, expSubjectSealKept, ""
 	case resp.status == 403 && code == expSentinelRealSubjectsDisabled:
 		s.mu.Lock()
-		s.withdrawAllLocked(expDropRealSubjectsDisabled)
+		s.countDrops(expDropRealSubjectsDisabled, s.withdrawAllLocked())
 		s.mu.Unlock()
 		c.logf("shardpilot experiments: the platform disabled real-subject assignment (apply endpoint); dropped a subject handle's assignments and owed applications")
 		return nil, expSubjectSealSettled, ""
 	case resp.status == 409 && experimentApplyAgeRefusal(resp.body, resp.bodyIncomplete):
 		s.mu.Lock()
-		s.withdrawExperimentLocked(head.experimentKey, expDropAgeIneligible)
+		s.countDrops(expDropAgeIneligible, s.withdrawExperimentLocked(head.experimentKey))
 		s.mu.Unlock()
 		return nil, expSubjectSealSettled, ""
 	case resp.status >= 300 && resp.status < 500 && resp.status != 408 && resp.status != 429:
