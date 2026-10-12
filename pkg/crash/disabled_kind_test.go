@@ -24,7 +24,7 @@ func TestCrashDisabledKindStatusAndCode(t *testing.T) {
 		}{
 			{"exact", `{"error":{"code":"kind_not_enabled","message":"translated","future":true}}`, true},
 			{"unknown", `{"error":{"code":"unknown_kind"}}`, false},
-			{"case", `{"error":{"code":"KIND_NOT_ENABLED"}}`, false},
+			{"case", `{"error":{"code":"Kind_not_enabled"}}`, false},
 			{"suffix", `{"error":{"code":"kind_not_enabled_extra"}}`, false},
 			{"message-only", `{"error":{"code":"invalid_request","message":"kind_not_enabled"}}`, false},
 			{"wrong-shape", `{"error":"kind_not_enabled"}`, false},
