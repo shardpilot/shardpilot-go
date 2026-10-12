@@ -74,7 +74,7 @@ func TestBuildExperimentAssignmentURLEscapesAndOrders(t *testing.T) {
 			{Name: "custom_attribute_tier", Value: "gold#1"},
 		},
 	)
-	want := "https://cp.example/api/v1/runtime/experiments/assignment?" +
+	want := "https://cp.example/api/cp/v1/runtime/experiments/assignment?" +
 		"app_key=app%201&environment_key=dev%26env&experiment_key=exp%3Dkey" +
 		"&subject_key=spcid_" + strings.Repeat("a", 32) +
 		"&app_version=1.2.3&custom_attribute_tier=gold%231"

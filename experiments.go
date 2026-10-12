@@ -47,7 +47,7 @@ import (
 //
 // Wire contract (assignment fetch):
 //
-//	GET {AppURL}/api/v1/runtime/experiments/assignment
+//	GET {AppURL}/api/cp/v1/runtime/experiments/assignment
 //	  ?app_key=&environment_key=&experiment_key=&subject_key=&<attributes>
 //	Authorization: Bearer <publishable PublishableKey>
 //
@@ -141,15 +141,15 @@ import (
 // server-side block is load-bearing and this SDK deliberately relies on it
 // staying authoritative.
 
-const expAssignmentRoute = "/api/v1/runtime/experiments/assignment"
+const expAssignmentRoute = "/api/cp/v1/runtime/experiments/assignment"
 
 // expExposureApplyRoute is the exposure apply endpoint on the same host,
 // which seals an application for the analytics lane.
-const expExposureApplyRoute = "/api/v1/runtime/experiments/exposures"
+const expExposureApplyRoute = "/api/cp/v1/runtime/experiments/exposures"
 
 // expOutcomeApplyRoute is the outcome apply endpoint on the assignment host:
 // an outcome and the application it follows, sealed like an exposure.
-const expOutcomeApplyRoute = "/api/v1/runtime/experiments/outcomes"
+const expOutcomeApplyRoute = "/api/cp/v1/runtime/experiments/outcomes"
 
 // Revalidation cadence (the SDK's contribution to the kill-switch reach):
 // re-issue the assignment GET for every cached entry, batched per cycle,

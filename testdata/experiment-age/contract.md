@@ -18,7 +18,9 @@ A temporary capture test used that same route fixture, issued four GETs to
 `/api/v1/runtime/experiments/assignment`, and saved each HTTP 200 body directly.
 Each request used `app_key=exposure-app`, `environment_key=develop`,
 `experiment_key=exposure-banner`, and the fixture's synthetic subject.
-It varied only the presence/value of `age_band`.
+It varied only the presence/value of `age_band`. This historical capture used
+the handler fixture directly; current SDK requests use the public route
+`/api/cp/v1/runtime/experiments/assignment`.
 
 ## Public projection
 
