@@ -8,8 +8,10 @@
   keep assignments per handle, in memory, and never fall back to the client's
   own subject or `Config.AnonymousID`. A handle acts only while that player's
   consent is granted and the client's consent admits the experiment plane.
-  New `ErrInvalidExperimentSubject`. Outcomes and age-band withdrawal on a
-  handle are not part of this release step.
+  New `ErrInvalidExperimentSubject`. A handle records outcomes with
+  `TrackOutcome` and declares an age with `FetchWithAgeBand`; a non-adult
+  declaration and an age refusal withdraw what the handle owes for the
+  experiment, its facts not yet sent included, as on the client.
 - Every request now carries `X-ShardPilot-SDK: go/<version>` (event batches,
   consent, remote config, the experiment routes and crash ingest). The version
   is a constant in code, which a test holds to the README's latest-tag claim.
