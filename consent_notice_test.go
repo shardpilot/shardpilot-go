@@ -488,7 +488,7 @@ func TestConsentNoticeStoredValidation(t *testing.T) {
 			"all-null":            `,"notice_version":null,"notice_locale":null,"policy_version":null`,
 		} {
 			t.Run(fmt.Sprintf("grant-%t/%s", grant, name), func(t *testing.T) {
-				raw := fmt.Sprintf(`{"idempotency_key":"synthetic-key","workspace_id":"w","app_id":"a","environment_id":"e","actor_identifier":"synthetic-notice-actor","categories":{"analytics":%t},"decided_at":"2026-06-10T12:00:00Z"%s}`, grant, extra)
+				raw := fmt.Sprintf(`{"idempotency_key":"synthetic-key","workspace_id":"w","app_id":"a","environment_id":"e","actor_identifier":"synthetic-notice-actor","kind":"anon","categories":{"analytics":%t},"decided_at":"2026-06-10T12:00:00Z"%s}`, grant, extra)
 				var entry consentReceipt
 				if err := json.Unmarshal([]byte(raw), &entry); err != nil {
 					t.Fatal(err)
@@ -587,7 +587,7 @@ func TestConsentNoticeStoredPresenceReload(t *testing.T) {
 			t.Run(fmt.Sprintf("grant-%t/%s", grant, name), func(t *testing.T) {
 				malformed := name != "legacy" && name != "valid"
 				dir := t.TempDir()
-				raw := fmt.Sprintf(`{"version":1,"receipts":[{"idempotency_key":"synthetic-key","workspace_id":"workspace-test","app_id":"app-test","environment_id":"develop","actor_identifier":"synthetic-notice-actor","anonymous_id":"synthetic-notice-actor","categories":{"analytics":%t},"decided_at":"2026-06-10T12:00:00Z"%s}]}`, grant, extra)
+				raw := fmt.Sprintf(`{"version":1,"receipts":[{"idempotency_key":"synthetic-key","workspace_id":"workspace-test","app_id":"app-test","environment_id":"develop","actor_identifier":"synthetic-notice-actor","kind":"anon","anonymous_id":"synthetic-notice-actor","categories":{"analytics":%t},"decided_at":"2026-06-10T12:00:00Z"%s}]}`, grant, extra)
 				if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName), []byte(raw), 0o600); err != nil {
 					t.Fatal(err)
 				}
@@ -677,7 +677,7 @@ func TestConsentNoticeStoredEvidenceAndWarningPriority(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			raw := `{"version":1,"receipts":[{"idempotency_key":"synthetic-key","workspace_id":"workspace-test","app_id":"app-test","environment_id":"develop","actor_identifier":"anon-spool-1","anonymous_id":"anon-spool-1","categories":{"analytics":true},"decided_at":"2026-06-10T12:00:00Z","notice_version":null}]}`
+			raw := `{"version":1,"receipts":[{"idempotency_key":"synthetic-key","workspace_id":"workspace-test","app_id":"app-test","environment_id":"develop","actor_identifier":"anon-spool-1","kind":"anon","anonymous_id":"anon-spool-1","categories":{"analytics":true},"decided_at":"2026-06-10T12:00:00Z","notice_version":null}]}`
 			if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName), []byte(raw), 0o600); err != nil {
 				t.Fatal(err)
 			}
@@ -726,7 +726,7 @@ func TestConsentNoticeStoredEvidenceAndWarningPriority(t *testing.T) {
 		if err := c.Close(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		raw := `{"version":1,"receipts":[{"idempotency_key":"synthetic-key","workspace_id":"workspace-test","app_id":"app-test","environment_id":"develop","actor_identifier":"synthetic-notice-actor","anonymous_id":"synthetic-notice-actor","categories":{"analytics":false},"decided_at":"2026-06-10T12:00:00Z","notice_version":""}]}`
+		raw := `{"version":1,"receipts":[{"idempotency_key":"synthetic-key","workspace_id":"workspace-test","app_id":"app-test","environment_id":"develop","actor_identifier":"synthetic-notice-actor","kind":"anon","anonymous_id":"synthetic-notice-actor","categories":{"analytics":false},"decided_at":"2026-06-10T12:00:00Z","notice_version":""}]}`
 		if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName), []byte(raw), 0o600); err != nil {
 			t.Fatal(err)
 		}

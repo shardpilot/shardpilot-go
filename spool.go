@@ -2194,23 +2194,25 @@ func (c *Client) partitionSpoolEligible(request batchRequest) (eligible, refused
 // spoolActorEligible reports whether the persisted grant's actor scope
 // covers this envelope. UNDER THE FLOOR, eligibility mirrors the intake
 // actor gate exactly (consentFloorActorMismatch): the envelope's EFFECTIVE
-// actor — buildEnvelope already resolved per-event overrides over the
-// configured identifiers — must equal the configured actor the decision
-// covers; a secondary-identifier override (say AnonymousID under a
-// configured UserID) does not change the effective actor, so an event the
+// consent actor — the consent actor rule applied to the identifiers
+// buildEnvelope already resolved — must equal the configured actor the
+// decision covers; an override of an identifier the rule does not select
+// (say AnonymousID under a backend's UserID, or UserID on a client source)
+// does not change the effective actor, so an event the
 // floor ADMITTED is never refused disk retention later (accepted-then-
 // dead-lettered would contradict the override semantics). Floor
 // OFF keeps the released strict rule — both envelope identifiers equal to
 // the configured tuple — unchanged.
 func (c *Client) spoolActorEligible(envelope eventEnvelope) bool {
 	if envelope.internalIdentityFact {
-		if c.consentFloorEnabled() && c.cfg.UserID != "" {
+		if c.consentFloorEnabled() && c.consentFloorUserScoped() {
 			// The mirror of intake's anonymous-actor gate
 			// (enqueueExperimentFact → ErrConsentActorMismatch): under an
-			// enabled floor with a UserID configured, the grant covers the
-			// USER actor while the fact ships the anonymous identity alone
-			// — the actor whose id actually rides the wire has no recorded
-			// grant. Intake refuses such facts live; the drop-time capture
+			// enabled floor whose decision covers a verified user, the
+			// grant covers the USER actor while the fact ships the
+			// anonymous identity alone — the actor whose id actually rides
+			// the wire has no recorded grant. Intake refuses such facts
+			// live; the drop-time capture
 			// path reaches this eligibility check WITHOUT passing intake,
 			// and admitting here would give an ungranted actor disk
 			// retention (and a later publish) through the capture
@@ -2229,8 +2231,9 @@ func (c *Client) spoolActorEligible(envelope eventEnvelope) bool {
 		return c.cfg.AnonymousID != "" && envelope.AnonymousID == c.cfg.AnonymousID
 	}
 	if c.consentFloorEnabled() {
-		effective := firstNonEmpty(envelope.UserID, envelope.AnonymousID)
-		return effective == firstNonEmpty(c.cfg.UserID, c.cfg.AnonymousID)
+		effective, _ := selectConsentActor(c.cfg.Source, envelope.UserID, envelope.AnonymousID)
+		configured, _ := c.consentActor()
+		return effective == configured
 	}
 	return envelope.UserID == c.cfg.UserID && envelope.AnonymousID == c.cfg.AnonymousID
 }

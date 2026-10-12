@@ -67,11 +67,13 @@ var (
 	// Denials apply with consent_notice_invalid as a warning and omit the tuple.
 	ErrInvalidConsentNotice = errors.New("consent_notice_invalid: invalid shardpilot consent notice")
 
-	// ErrInvalidConsentIdentity refuses a grant when a configured actor
-	// identifier exceeds the 512-byte receipt bound. Denial still applies
+	// ErrInvalidConsentIdentity refuses a grant when the configured identity
+	// has no admissible consent actor: an identifier exceeds the 512-byte
+	// receipt bound, or a client source has a UserID and no AnonymousID (its
+	// self-asserted UserID is never a consent key). Denial still applies
 	// locally with a consent_actor_invalid warning and no receipt. Neither
 	// mode truncates, rewrites, or substitutes the actor.
-	ErrInvalidConsentIdentity = errors.New("consent_actor_invalid: shardpilot consent identity exceeds the identifier clamp")
+	ErrInvalidConsentIdentity = errors.New("consent_actor_invalid: shardpilot consent identity has no admissible consent actor")
 
 	// ErrConsentActorMismatch is returned by Track/Enqueue under the opt-in
 	// consent floor for an event whose per-event UserID/AnonymousID override

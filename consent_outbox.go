@@ -99,7 +99,9 @@ type consentReceipt struct {
 	AppID           string `json:"app_id"`
 	EnvironmentID   string `json:"environment_id"`
 	ActorIdentifier string `json:"actor_identifier"`
-	Categories      struct {
+	// Kind is the actor's identity kind, fixed when the receipt is minted.
+	Kind       string `json:"kind"`
+	Categories struct {
 		Analytics *bool `json:"analytics"`
 	} `json:"categories"`
 	DecidedAt   string `json:"decided_at"`
@@ -181,8 +183,9 @@ type consentOutboxWire struct {
 // sanitizeConsentReceipt validates one stored entry and copies it down to
 // exactly the known fields. An entry survives only with every required
 // field a non-empty string, the actor identifier within the byte clamp,
-// the analytics category PRESENT (an absent category is a malformed entry,
-// never an implicit denial — see the type comment). A malformed notice rejects
+// the actor kind one this SDK mints (a receipt without a kind is malformed:
+// nothing is inferred), the analytics category PRESENT (an absent category
+// is a malformed entry, never an implicit denial — see the type comment). A malformed notice rejects
 // a grant; a denial survives with the entire optional tuple omitted. Other
 // malformed fields still drop the entry fail-safe without blocking the rest.
 func sanitizeConsentReceipt(entry consentReceipt) (consentReceipt, bool) {
@@ -193,7 +196,7 @@ func sanitizeConsentReceipt(entry consentReceipt) (consentReceipt, bool) {
 	if entry.Categories.Analytics == nil {
 		return consentReceipt{}, false
 	}
-	if !validConsentIdentifier(entry.ActorIdentifier) {
+	if !validConsentIdentifier(entry.ActorIdentifier) || !validConsentKind(entry.Kind) {
 		return consentReceipt{}, false
 	}
 	if entry.AnonymousID != "" && !validConsentIdentifier(entry.AnonymousID) {
@@ -239,6 +242,7 @@ func sanitizeConsentReceipt(entry consentReceipt) (consentReceipt, bool) {
 		AppID:           entry.AppID,
 		EnvironmentID:   entry.EnvironmentID,
 		ActorIdentifier: entry.ActorIdentifier,
+		Kind:            entry.Kind,
 		DecidedAt:       entry.DecidedAt,
 		Reason:          entry.Reason,
 		AnonymousID:     entry.AnonymousID,
@@ -580,7 +584,7 @@ func (o *consentOutbox) readRecordReceiptsWithNotice(invalidNotice func(consentR
 		// sides granted. Validating each stamp on its own cannot see this;
 		// only the relation between them can.
 		scope := sanitized.WorkspaceID + "\x00" + sanitized.AppID + "\x00" +
-			sanitized.EnvironmentID + "\x00" + sanitized.ActorIdentifier
+			sanitized.EnvironmentID + "\x00" + sanitized.ActorIdentifier + "\x00" + sanitized.Kind
 		if prev, ok := lastDecidedAt[scope]; ok && !consentDecisionSupersedes(sanitized.DecidedAt, prev) {
 			rejected = true
 		}
@@ -1701,33 +1705,40 @@ func (c *Client) consentReceiptInScope(receipt consentReceipt) bool {
 	// ActorIdentifier-only match would let the old receipt override and
 	// heal the NEW digest (loading spool data the record scoping rejected).
 	// The mint stamps AnonymousID from the same validated config the digest
-	// hashes, so equality here mirrors the digest's actor scope exactly.
+	// hashes, so equality here mirrors the digest's actor scope exactly. The
+	// kind must match too: the same identifier as another kind of identity is
+	// another actor.
+	actor, _ := c.consentActor()
 	return receipt.WorkspaceID == c.cfg.WorkspaceID &&
 		receipt.AppID == c.cfg.AppID &&
 		receipt.EnvironmentID == c.cfg.EnvironmentID &&
-		receipt.ActorIdentifier == firstNonEmpty(c.cfg.UserID, c.cfg.AnonymousID) &&
+		receipt.ActorIdentifier == actor.identifier &&
+		receipt.Kind == actor.kind &&
 		receipt.AnonymousID == c.cfg.AnonymousID
 }
 
-// consentFloorActorMismatch reports whether an event's EFFECTIVE actor —
-// per-event overrides applied over the configured identifiers exactly as
-// buildEnvelope stamps them — differs from the configured actor the floor's
-// decision covers. The floor holds ONE client-side decision for ONE actor:
-// an event overriding to a different effective actor would transmit an
-// actor with no local decision and no dispatched receipt, so Track/Enqueue
-// refuse it (ErrConsentActorMismatch). Per-actor decisions beyond the
-// configured identity belong to the server-side consent path — the default
-// posture, which per-event overrides were designed for; with the floor off
-// they pass through unchanged.
+// consentFloorActorMismatch reports whether an event's EFFECTIVE consent
+// actor — the consent actor rule (selectConsentActor) applied to per-event
+// overrides over the configured identifiers, exactly as buildEnvelope stamps
+// them — differs from the configured actor the floor's decision covers. On a
+// client source that actor is the anonymous ID, so overriding only the
+// self-asserted UserID keeps it. The floor holds ONE client-side decision
+// for ONE actor: an event overriding to a different effective actor would
+// transmit an actor with no local decision and no dispatched receipt, so
+// Track/Enqueue refuse it (ErrConsentActorMismatch). Per-actor decisions
+// beyond the configured identity belong to the server-side consent path —
+// the default posture, which per-event overrides were designed for; with the
+// floor off they pass through unchanged.
 func (c *Client) consentFloorActorMismatch(event Event) bool {
 	if event.UserID == "" && event.AnonymousID == "" {
 		return false
 	}
-	effective := firstNonEmpty(
+	effective, _ := selectConsentActor(c.cfg.Source,
 		firstNonEmpty(event.UserID, c.cfg.UserID),
 		firstNonEmpty(event.AnonymousID, c.cfg.AnonymousID),
 	)
-	return effective != firstNonEmpty(c.cfg.UserID, c.cfg.AnonymousID)
+	configured, _ := c.consentActor()
+	return effective != configured
 }
 
 // validateConsentFloorIdentity gates a consent decision on IN-CONTRACT
@@ -2042,6 +2053,7 @@ func consentReceiptWire(receipt consentReceipt) consentRequest {
 		AppID:           receipt.AppID,
 		EnvironmentID:   receipt.EnvironmentID,
 		ActorIdentifier: receipt.ActorIdentifier,
+		Kind:            receipt.Kind,
 		Categories:      map[string]bool{"analytics": receipt.analyticsGranted()},
 		DecidedAt:       receipt.DecidedAt,
 		IdempotencyKey:  receipt.IdempotencyKey,
@@ -2404,19 +2416,20 @@ func (c *Client) drainConsentOutboxEvictions() {
 }
 
 // mintConsentReceipt builds a receipt at decision time under the floor. The
-// actor snapshot is the configured actor exactly as events carry it (UserID
-// preferred, else AnonymousID) — validateConsentFloorIdentity already
-// rejected out-of-contract identifiers before the decision applied, so the
-// receipt's actor can never silently diverge from the events' actor. The
-// two no-receipt outcomes are DISTINCT: no configured actor at all means no
-// receipt with a nil error — the sanctioned local-only path, where a
-// receipt is provably never coming — while a failed idempotency-key mint
-// returns the error: the receipt IS owed (the caller registers it for
-// retry; the decision must not persist as if the trail were safe). The
-// anonymous-id retention snapshot never rides the wire.
+// actor snapshot is the configured consent actor and its kind
+// (selectConsentActor) — validateConsentFloorIdentity already rejected
+// out-of-contract identifiers before the decision applied, and a refused
+// client actor never reaches the mint, so the receipt's actor can never
+// silently diverge from the events' actor. The two no-receipt outcomes are
+// DISTINCT: no configured actor at all means no receipt with a nil error —
+// the sanctioned local-only path, where a receipt is provably never coming —
+// while a failed idempotency-key mint returns the error: the receipt IS owed
+// (the caller registers it for retry; the decision must not persist as if
+// the trail were safe). The anonymous-id retention snapshot never rides the
+// wire.
 func (c *Client) mintConsentReceipt(analyticsGranted bool, reason, decidedAt string, notice ConsentNotice) (consentReceipt, bool, error) {
-	actor := firstNonEmpty(c.cfg.UserID, c.cfg.AnonymousID)
-	if actor == "" {
+	actor, _ := c.consentActor()
+	if actor.identifier == "" {
 		return consentReceipt{}, false, nil
 	}
 	idempotencyKey, err := c.consentMintID()
@@ -2429,7 +2442,8 @@ func (c *Client) mintConsentReceipt(analyticsGranted bool, reason, decidedAt str
 		WorkspaceID:     c.cfg.WorkspaceID,
 		AppID:           c.cfg.AppID,
 		EnvironmentID:   c.cfg.EnvironmentID,
-		ActorIdentifier: actor,
+		ActorIdentifier: actor.identifier,
+		Kind:            actor.kind,
 		// The DECISION's stamp, shared with the decision record: the reload
 		// orders receipts against the record by this instant, so both sides
 		// of one decision must carry the same one (see consentDecisionStamp).

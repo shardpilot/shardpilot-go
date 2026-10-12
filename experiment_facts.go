@@ -105,11 +105,11 @@ func (c *Client) enqueueExperimentFact(event Event, atClose bool) (uint64, error
 	if c.consentFloorEnabled() && c.consentUndecided() {
 		return 0, ErrConsentUnknown
 	}
-	if c.consentFloorEnabled() && event.omitUserID && c.cfg.UserID != "" {
-		// The floor's grant covers the configured EFFECTIVE actor — with a
-		// UserID configured, the user actor — but this SDK fact rides the
-		// ANONYMOUS identity alone on the wire (user_id omitted by
-		// contract). The actor whose id actually ships has no recorded
+	if c.consentFloorEnabled() && event.omitUserID && c.consentFloorUserScoped() {
+		// The floor's grant covers the configured consent actor — on a
+		// server or backend source with a UserID, the verified user — but
+		// this SDK fact rides the ANONYMOUS identity alone on the wire
+		// (user_id omitted by contract). The actor whose id actually ships has no recorded
 		// grant, so a strict-consent ingest would suppress the fact — or
 		// worse, it would persist under the wrong actor's grant. The same
 		// actor rule Enqueue applies to overridden identities applies
@@ -725,7 +725,7 @@ func (c *Client) TrackExperimentExposure(experimentKey string) error {
 	if err := c.experimentConsentRefusal(); err != nil {
 		return err
 	}
-	if c.consentFloorEnabled() && c.cfg.UserID != "" {
+	if c.consentFloorEnabled() && c.consentFloorUserScoped() {
 		// The fact would ride the anonymous identity alone, which a
 		// user-scoped floor's grant does not cover — the fact intake's own
 		// actor rule. Reported now, as TrackExperimentOutcome reports it,
@@ -821,7 +821,7 @@ func (c *Client) TrackExperimentOutcome(experimentKey, outcomeKey string, outcom
 	if err := c.experimentConsentRefusal(); err != nil {
 		return err
 	}
-	if c.consentFloorEnabled() && c.cfg.UserID != "" {
+	if c.consentFloorEnabled() && c.consentFloorUserScoped() {
 		// As TrackExperimentExposure: the fact would ride the anonymous
 		// identity alone, which a user-scoped floor's grant does not cover.
 		return ErrConsentActorMismatch

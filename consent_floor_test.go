@@ -644,6 +644,7 @@ func testConsentReceipt(key string, analytics bool) consentReceipt {
 		AppID:           "app-test",
 		EnvironmentID:   "develop",
 		ActorIdentifier: "anon-spool-1",
+		Kind:            consentKindAnon,
 		// The retention metadata a real mint stamps for this config: the
 		// in-scope rule matches BOTH actor components, so a planted receipt
 		// must carry the anonymous id it was "minted" under.
@@ -719,9 +720,9 @@ func TestConsentOutboxSanitizerDropsMalformedAndOversized(t *testing.T) {
 	boundary := strings.Repeat("a", maxConsentIdentifierBytes)
 	oversized := strings.Repeat("b", maxConsentIdentifierBytes+1)
 	record := fmt.Sprintf(`{"version":1,"receipts":[
-		{"idempotency_key":"key-ok","workspace_id":"w","app_id":"a","environment_id":"e","actor_identifier":%q,"categories":{"analytics":true},"decided_at":"2026-07-19T00:00:00Z","stray_field":"dropped"},
-		{"idempotency_key":"","workspace_id":"w","app_id":"a","environment_id":"e","actor_identifier":"x","categories":{"analytics":true},"decided_at":"2026-07-19T00:00:00Z"},
-		{"idempotency_key":"key-oversized","workspace_id":"w","app_id":"a","environment_id":"e","actor_identifier":%q,"categories":{"analytics":false},"decided_at":"2026-07-19T00:00:00Z"},
+		{"idempotency_key":"key-ok","workspace_id":"w","app_id":"a","environment_id":"e","actor_identifier":%q,"kind":"anon","categories":{"analytics":true},"decided_at":"2026-07-19T00:00:00Z","stray_field":"dropped"},
+		{"idempotency_key":"","workspace_id":"w","app_id":"a","environment_id":"e","actor_identifier":"x","kind":"anon","categories":{"analytics":true},"decided_at":"2026-07-19T00:00:00Z"},
+		{"idempotency_key":"key-oversized","workspace_id":"w","app_id":"a","environment_id":"e","actor_identifier":%q,"kind":"anon","categories":{"analytics":false},"decided_at":"2026-07-19T00:00:00Z"},
 		{"idempotency_key":"key-truncated","workspace_id":"w"}
 	]}`, boundary, oversized)
 	if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName), []byte(record), 0o600); err != nil {
@@ -1245,9 +1246,9 @@ func TestConsentFloorDispatchBoundedByCallerDeadline(t *testing.T) {
 func TestConsentOutboxSanitizerRejectsAbsentCategory(t *testing.T) {
 	dir := t.TempDir()
 	record := `{"version":1,"receipts":[
-		{"idempotency_key":"key-no-categories","workspace_id":"w","app_id":"a","environment_id":"e","actor_identifier":"x","decided_at":"2026-07-19T00:00:00Z"},
-		{"idempotency_key":"key-empty-categories","workspace_id":"w","app_id":"a","environment_id":"e","actor_identifier":"x","categories":{},"decided_at":"2026-07-19T00:00:00Z"},
-		{"idempotency_key":"key-explicit-denial","workspace_id":"w","app_id":"a","environment_id":"e","actor_identifier":"x","categories":{"analytics":false},"decided_at":"2026-07-19T00:00:00Z"}
+		{"idempotency_key":"key-no-categories","workspace_id":"w","app_id":"a","environment_id":"e","actor_identifier":"x","kind":"anon","decided_at":"2026-07-19T00:00:00Z"},
+		{"idempotency_key":"key-empty-categories","workspace_id":"w","app_id":"a","environment_id":"e","actor_identifier":"x","kind":"anon","categories":{},"decided_at":"2026-07-19T00:00:00Z"},
+		{"idempotency_key":"key-explicit-denial","workspace_id":"w","app_id":"a","environment_id":"e","actor_identifier":"x","kind":"anon","categories":{"analytics":false},"decided_at":"2026-07-19T00:00:00Z"}
 	]}`
 	if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName), []byte(record), 0o600); err != nil {
 		t.Fatalf("write outbox record: %v", err)
@@ -1286,7 +1287,7 @@ func TestConsentOutboxOverCapLoadKeepsNewest(t *testing.T) {
 	entries := make([]string, 0, maxConsentOutboxEntries+8)
 	for i := 0; i < maxConsentOutboxEntries+8; i++ {
 		entries = append(entries, fmt.Sprintf(
-			`{"idempotency_key":"key-%02d","workspace_id":"w","app_id":"a","environment_id":"e","actor_identifier":"x","categories":{"analytics":false},"decided_at":"2026-07-19T00:00:00Z"}`, i))
+			`{"idempotency_key":"key-%02d","workspace_id":"w","app_id":"a","environment_id":"e","actor_identifier":"x","kind":"anon","categories":{"analytics":false},"decided_at":"2026-07-19T00:00:00Z"}`, i))
 	}
 	record := fmt.Sprintf(`{"version":1,"receipts":[%s]}`, strings.Join(entries, ","))
 	if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName), []byte(record), 0o600); err != nil {
@@ -4422,6 +4423,7 @@ func TestConsentFloorChangedAnonymousIDReceiptOutOfScope(t *testing.T) {
 	dir := t.TempDir()
 	oldReceipt := testConsentReceipt("key-old-anon-1", true)
 	oldReceipt.ActorIdentifier = "user-1"
+	oldReceipt.Kind = consentKindUserVerified
 	oldReceipt.AnonymousID = "anon-A"
 	planted := newConsentOutbox(dir)
 	if planted.append(oldReceipt) {
@@ -4462,6 +4464,7 @@ func TestConsentFloorChangedAnonymousIDReceiptOutOfScope(t *testing.T) {
 	sameDir := t.TempDir()
 	sameReceipt := testConsentReceipt("key-same-anon-1", true)
 	sameReceipt.ActorIdentifier = "user-1"
+	sameReceipt.Kind = consentKindUserVerified
 	sameReceipt.AnonymousID = "anon-B"
 	planted = newConsentOutbox(sameDir)
 	if planted.append(sameReceipt) {
@@ -6197,13 +6200,12 @@ func mustMarshalOversizeOutbox(t *testing.T) []byte {
 	var payload []byte
 	for i := 0; ; i++ {
 		receipts = append(receipts, testConsentReceipt(fmt.Sprintf("key-oversize-%04d", i), false))
-		payload = mustMarshalOutbox(t, receipts...)
-		if len(payload) > consentOutboxReadLimit {
-			t.Fatalf("test shape: overshot the limit at %d bytes; pad in smaller steps", len(payload))
-		}
-		if consentOutboxReadLimit+1-len(payload) < 64 {
+		next := mustMarshalOutbox(t, receipts...)
+		if len(next) > consentOutboxReadLimit {
+			// The last whole receipt that fits; whitespace fills the rest.
 			break
 		}
+		payload = next
 	}
 	payload = append(payload, bytes.Repeat([]byte(" "), consentOutboxReadLimit+1-len(payload))...)
 	if len(payload) != consentOutboxReadLimit+1 {

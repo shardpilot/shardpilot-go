@@ -114,6 +114,7 @@ type consentRequest struct {
 	AppID           string          `json:"app_id"`
 	EnvironmentID   string          `json:"environment_id"`
 	ActorIdentifier string          `json:"actor_identifier"`
+	Kind            string          `json:"kind"`
 	Categories      map[string]bool `json:"categories"`
 	DecidedAt       string          `json:"decided_at"`
 	IdempotencyKey  string          `json:"idempotency_key"`
@@ -149,8 +150,14 @@ type consentResult struct {
 //
 // Remotely it is fire-and-forget for the caller: the decision is handed to
 // a single per-client sender goroutine that posts to
-// POST {ingest}/v1/consent with the batch transport credentials, using
-// Config.UserID (preferred) or Config.AnonymousID as the actor identifier.
+// POST {ingest}/v1/consent with the batch transport credentials. The actor
+// and its kind follow the source: a client source sends Config.AnonymousID as
+// kind anon (its UserID is self-asserted, never a consent key); a server or
+// backend source sends Config.UserID as kind user_verified, else
+// Config.AnonymousID as kind anon. A client source with a UserID and no
+// AnonymousID has no admissible actor: its grant is refused with
+// ErrInvalidConsentIdentity and its denial applies locally with the
+// consent_actor_invalid warning and no receipt.
 // SetConsent never blocks on the network, and decisions are transmitted in
 // call order (a deny-then-grant cannot arrive at the server reversed).
 // Failures are logged quietly through Config.Logger and never affect the
@@ -172,7 +179,7 @@ type consentResult struct {
 // through a consent-write-capable service credential before publishing, and
 // watch Config.OnBatchResult or the Snapshot().ByStatus breakdown for
 // suppressed_no_consent to detect the race. The receipt also covers only
-// the configured actor (Config.UserID, else Config.AnonymousID); events
+// the configured consent actor described above; events
 // that override the actor per event (Event.UserID or Event.AnonymousID)
 // need consent recorded for each such actor through a service path. Grants
 // are recorded server-side only through a consent-write-capable service
@@ -247,7 +254,8 @@ func (c *Client) applyConsentDecision(decision ConsentDecision, notices ...Conse
 		// Optional metadata cannot block a denial. Keep every other warning.
 		result.warn("consent_notice_invalid")
 	}
-	invalidActor := c.validateConsentFloorIdentity() != nil
+	actor, actorRefused := c.consentActor()
+	invalidActor := actorRefused || c.validateConsentFloorIdentity() != nil
 	if invalidActor && decision == ConsentDecisionGranted {
 		c.lifecycleMu.Unlock()
 		return result, ErrInvalidConsentIdentity
@@ -263,8 +271,6 @@ func (c *Client) applyConsentDecision(decision ConsentDecision, notices ...Conse
 	case ConsentDecisionDeniedForcedMinor:
 		state = consentStateDeniedForcedMinor
 	}
-
-	actor := firstNonEmpty(c.cfg.UserID, c.cfg.AnonymousID)
 
 	if c.consent.Load() == consentStateDeniedForcedMinor {
 		if analyticsGranted {
@@ -552,7 +558,7 @@ func (c *Client) applyConsentDecision(decision ConsentDecision, notices ...Conse
 		// a later floor enablement must not promote a fire-and-forget-era
 		// grant (its POST may have failed; no receipt exists) to live state.
 		deadLetters, _ = applyRecord(decision, c.consentDecisionStamp())
-		if actor != "" && !invalidActor {
+		if actor.identifier != "" && !invalidActor {
 			idempotencyKey, err := uuidv7.New()
 			if err != nil {
 				keyErr = err
@@ -567,7 +573,8 @@ func (c *Client) applyConsentDecision(decision ConsentDecision, notices ...Conse
 					WorkspaceID:     c.cfg.WorkspaceID,
 					AppID:           c.cfg.AppID,
 					EnvironmentID:   c.cfg.EnvironmentID,
-					ActorIdentifier: actor,
+					ActorIdentifier: actor.identifier,
+					Kind:            actor.kind,
 					Categories:      map[string]bool{"analytics": analyticsGranted},
 					DecidedAt:       c.clock.Now().UTC().Format(time.RFC3339),
 					IdempotencyKey:  idempotencyKey,
@@ -588,7 +595,7 @@ func (c *Client) applyConsentDecision(decision ConsentDecision, notices ...Conse
 	finish()
 
 	c.emitSpoolDeadLetters(deadLetters)
-	if !c.consentFloorEnabled() && actor == "" {
+	if !c.consentFloorEnabled() && actor.identifier == "" && !invalidActor {
 		c.logf("shardpilot consent: no actor identity configured (Config.UserID or Config.AnonymousID); decision applied locally only")
 	} else if keyErr != nil {
 		c.logf("shardpilot consent: generate idempotency key failed: %v", keyErr)

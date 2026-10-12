@@ -6,7 +6,7 @@ are a serializer fixture, not a live endpoint or deployment observation.
 
 SHA-256:
 
-- `request.json`: `fb88987ab60fd3836d86428e74e7ea3674c6905e56485c9b5c37cc177d47153b`
+- `request.json`: `daf0acb703982cdf1a772b310e37b08b01f9fd40bf6e0f81dba93d3149493066`
 - `response.json`: `8add729673ccd76ee0baee7352dccff01efebc6387439a56c03c523ed34f2e0b`
 
 The SDK scene uses its real setters and POST transport with this response. Only
