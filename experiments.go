@@ -3160,6 +3160,7 @@ const (
 	expDropUnsealedAtClose      = "unsealed_at_close"
 	expDropUndeliveredAtClose   = "undelivered_at_close"
 	expDropConsentWithdrawn     = "consent_withdrawn"
+	expDropEventTooLarge        = "event_too_large"
 	// expDropAgeIneligible: withdrawn by an age_ineligible refusal of the
 	// application's subject (withdrawOwedApplicationsLocked).
 	expDropAgeIneligible = "age_ineligible"

@@ -39,7 +39,10 @@
   `Enqueue` and the SDK's own experiment facts encode each event once at
   intake; when that JSON, with surrounding whitespace trimmed, is longer
   than 2048 bytes they return `ErrEventTooLarge` (`event_too_large`), count
-  one drop and send nothing. An event of exactly 2048 bytes is admitted, and
+  one drop and send nothing. An oversize experiment fact leaves the owed
+  queue and is counted under `event_too_large` in
+  `Stats.ExperimentExposureDrops` or `Stats.ExperimentOutcomeDrops`, not in
+  `Stats.Dropped`. An event of exactly 2048 bytes is admitted, and
   retired experiment facts keep the ingest exemption. The intake bytes are
   the bytes sent, spooled and retried: a nested `Props` or `Context` value
   changed after the call no longer reaches the wire. An event that cannot be

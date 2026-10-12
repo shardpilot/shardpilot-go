@@ -192,3 +192,39 @@ func TestEventSizePrecheckAppliesToExperimentFacts(t *testing.T) {
 		t.Fatalf("an oversize fact was sent (%d elements)", len(got))
 	}
 }
+
+// TestAnOversizeSealedFactLeavesTheOwedQueue: a sealed fact ingest would
+// reject is dropped once and leaves the owed queue, so it neither repeats
+// every cycle nor holds the experiment's later facts.
+func TestAnOversizeSealedFactLeavesTheOwedQueue(t *testing.T) {
+	rig := newExpHopRig(t, nil)
+	rig.script.apply.padProps = 3 * maxEventSceneBytes
+	fetchAssignment(t, rig.client, expTestScopeKey)
+	rig.client.ApplyExperimentVariant(expTestScopeKey)
+	if err := rig.client.TrackExperimentOutcome(expTestScopeKey, "purchase", 1); err != nil {
+		t.Fatalf("TrackExperimentOutcome: %v", err)
+	}
+	for range 3 {
+		rig.cycle()
+	}
+	flushOrFail(t, rig.client)
+	if owed := rig.owed(); owed != 0 {
+		t.Fatalf("%d application(s) still owed: the oversize fact holds the queue", owed)
+	}
+	if got := rig.drops("event_too_large"); got != 1 {
+		t.Fatalf("ExperimentExposureDrops[event_too_large] = %d, want 1", got)
+	}
+	if dropped := rig.client.Snapshot().Dropped; dropped != 0 {
+		t.Fatalf("Dropped = %d: a fact refused before the queue is counted in its kind's drop map only", dropped)
+	}
+	if got := len(rig.capture.exposures()); got != 0 {
+		t.Fatalf("the oversize exposure was sent (%d)", got)
+	}
+	var outcomes int
+	for _, raw := range rig.capture.rawBatches() {
+		outcomes += bytes.Count(raw, []byte(`"event_name":"`+experimentOutcomeName+`"`))
+	}
+	if outcomes != 1 {
+		t.Fatalf("delivered %d outcome(s) behind the oversize exposure, want 1", outcomes)
+	}
+}

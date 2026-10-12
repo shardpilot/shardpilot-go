@@ -103,7 +103,8 @@ type Stats struct {
 	// (sealed, but Close could not hand the fact to the queue);
 	// consent_withdrawn (owed when consent was withdrawn and not re-armed on
 	// the re-grant: an extra application, or one whose assignment is no
-	// longer served). Each Snapshot returns a fresh copy.
+	// longer served); event_too_large (the sealed fact exceeds the 2048-byte
+	// ingest per-event limit). Each Snapshot returns a fresh copy.
 	ExperimentExposureDrops map[string]uint64
 
 	// ExperimentOutcomeDrops counts experiment outcomes the SDK dropped
