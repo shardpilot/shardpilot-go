@@ -282,6 +282,10 @@ func TestExperimentSubjectsRunConcurrently(t *testing.T) {
 			for i := 0; i < 20; i++ {
 				_, _ = s.Fetch(context.Background(), expTestScopeKey, nil)
 				s.Apply(expTestScopeKey)
+				_ = s.TrackOutcome(expTestScopeKey, "score", float64(i))
+				if i%7 == 6 {
+					_, _ = s.FetchWithAgeBand(context.Background(), expTestScopeKey, ExperimentAgeBandUnderThreshold, nil)
+				}
 				if i%5 == 4 {
 					_ = s.SetConsent(ExperimentSubjectConsentDenied)
 					_ = s.SetConsent(ExperimentSubjectConsentGranted)

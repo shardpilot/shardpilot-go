@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/shardpilot/shardpilot-go/internal/uuidv7"
 )
@@ -84,10 +85,15 @@ type ExperimentSubject struct {
 	// queue: a fact is handed off under the consent that admitted it.
 	commitMu sync.Mutex
 
-	// denials counts this handle's denials (SetConsent with anything but
-	// Granted). A fact handed to the queue carries the count at hand-off; a
-	// later denial withdraws it at the send point (subjectFactWithdrawn).
-	denials atomic.Uint64
+	// withdrawSeq numbers this handle's withdrawals of facts already handed
+	// to the queue: a denial (deniedAt) or an age refusal of one experiment
+	// (ageWithdrawnAt). A fact carries the number at hand-off; a later
+	// withdrawal that covers it drops it at the send point
+	// (subjectFactWithdrawn). ageMu is a leaf lock.
+	withdrawSeq    atomic.Uint64
+	deniedAt       atomic.Uint64
+	ageMu          sync.Mutex
+	ageWithdrawnAt map[string]uint64
 
 	mu sync.Mutex
 	// consent and consentSeq: consentSeq counts SetConsent calls, so a fetch
@@ -107,14 +113,50 @@ type ExperimentSubject struct {
 	// has recorded or counted: an application is recorded once per handle.
 	exposed map[string]bool
 	owed    []*expSubjectOwed
+	// lastApplied is the recorded application an outcome follows, per
+	// experiment.
+	lastApplied map[string]expLastApplication
+	// declaring holds a non-adult age declaration whose fetch is in flight,
+	// per experiment: an age-gated assignment of it is neither served nor
+	// recorded until the server's answer to the declaration is applied.
+	declaring map[string]*expSubjectDeclaration
 }
 
-// expSubjectOwed is one owed application of a handle's assignment.
+// expSubjectDeclaration is one handle fetch's non-adult age declaration.
+type expSubjectDeclaration struct {
+	// fenceSeq is the last fetch dispatched before the declaration; seq is
+	// the declaring fetch's own.
+	fenceSeq, seq uint64
+	// decided is set when the server's answer to the declaring fetch was
+	// applied: a verdict, a drop or an install.
+	decided bool
+}
+
+// expSubjectOwed is one owed application of a handle's assignment, or an
+// outcome following one.
 type expSubjectOwed struct {
 	experimentKey string
 	entry         *expEntry
 	app           expApplication
+	outcome       *expOutcomeRecord
 	sealed        *expSealedFact
+}
+
+// copy is the record as the client's apply hop takes it.
+func (owed *expSubjectOwed) copy(session string) expOwedCopy {
+	return expOwedCopy{entry: owed.entry, session: session, app: owed.app, outcome: owed.outcome}
+}
+
+// countSubjectOwedLocked reports dropped owed records for reason, each in
+// its kind's map: Stats.ExperimentExposureDrops or ExperimentOutcomeDrops.
+func countSubjectOwedLocked(e *experimentsState, reason string, records []*expSubjectOwed) {
+	for _, record := range records {
+		if record.outcome != nil {
+			e.countOutcomeDropLocked(reason, 1)
+		} else {
+			e.countDropLocked(reason, 1)
+		}
+	}
 }
 
 // ExperimentSubject returns the experiment plane for one player. It returns
@@ -147,6 +189,10 @@ func (c *Client) ExperimentSubject(cfg ExperimentSubjectConfig) (*ExperimentSubj
 		settled:     make(map[string]uint64),
 		entries:     make(map[string]*expEntry),
 		exposed:     make(map[string]bool),
+		lastApplied: make(map[string]expLastApplication),
+		declaring:   make(map[string]*expSubjectDeclaration),
+
+		ageWithdrawnAt: make(map[string]uint64),
 	}
 	c.lifecycleMu.Lock()
 	defer c.lifecycleMu.Unlock()
@@ -182,7 +228,7 @@ func (s *ExperimentSubject) SetConsent(consent ExperimentSubjectConsent) error {
 		s.countDrops(expDropConsentWithdrawn, s.withdrawAllLocked())
 		// The player's facts already in the client's queue, its worker's
 		// batch or a retained retry are dropped at the next send point.
-		s.denials.Add(1)
+		s.deniedAt.Store(s.withdrawSeq.Add(1))
 	}
 	return nil
 }
@@ -205,40 +251,57 @@ func (s *ExperimentSubject) refusalLocked() error {
 	return s.c.experimentConsentRefusal()
 }
 
-// withdrawAllLocked drops every cached assignment and owed application and
-// returns how many applications it dropped, for the caller to count.
-func (s *ExperimentSubject) withdrawAllLocked() int {
-	dropped := len(s.owed)
+// withdrawAllLocked drops every cached assignment, owed record and
+// application an outcome could follow, and returns the dropped records for
+// the caller to count.
+func (s *ExperimentSubject) withdrawAllLocked() []*expSubjectOwed {
+	dropped := s.owed
 	s.owed = nil
 	s.entries = make(map[string]*expEntry)
 	s.exposed = make(map[string]bool)
+	s.lastApplied = make(map[string]expLastApplication)
 	return dropped
 }
 
-// countDrops reports n applications not recorded for reason, taking the
-// plane's lock (callers must not hold it).
-func (s *ExperimentSubject) countDrops(reason string, n int) {
+// countDrops reports dropped owed records for reason, taking the plane's
+// lock (callers must not hold it).
+func (s *ExperimentSubject) countDrops(reason string, records []*expSubjectOwed) {
 	e := s.c.exp
 	e.mu.Lock()
-	e.countDropLocked(reason, n)
+	countSubjectOwedLocked(e, reason, records)
 	e.mu.Unlock()
 }
 
-// withdrawExperimentLocked drops one experiment's cached assignment and
-// owed applications and returns how many applications it dropped, for the
-// caller to count.
-func (s *ExperimentSubject) withdrawExperimentLocked(experimentKey string) int {
-	delete(s.entries, experimentKey)
-	kept := s.owed[:0]
-	dropped := 0
+// withdrawAgeLocked is an age refusal of one experiment on this handle, the
+// client's package for it: the cached assignment (when dropEntry), the
+// owed exposures and outcomes, the application an outcome would follow, its
+// recorded-once marks, and the facts of the experiment already handed to
+// the queue, which the send point drops. It returns the dropped owed
+// records for the caller to count.
+func (s *ExperimentSubject) withdrawAgeLocked(experimentKey string, dropEntry bool) []*expSubjectOwed {
+	if dropEntry {
+		delete(s.entries, experimentKey)
+	}
+	delete(s.lastApplied, experimentKey)
+	prefix := escapeRemoteConfigSegment(experimentKey) + rcScopeSeparator
+	for tuple := range s.exposed {
+		if strings.HasPrefix(tuple, prefix) {
+			delete(s.exposed, tuple)
+		}
+	}
+	var dropped, kept []*expSubjectOwed
 	for _, owed := range s.owed {
 		if owed.experimentKey == experimentKey {
-			dropped++
+			dropped = append(dropped, owed)
 			continue
 		}
 		kept = append(kept, owed)
 	}
 	s.owed = kept
+	seq := s.withdrawSeq.Add(1)
+	s.ageMu.Lock()
+	s.ageWithdrawnAt[experimentKey] = seq
+	s.ageMu.Unlock()
 	return dropped
 }
 
@@ -247,7 +310,11 @@ func (s *ExperimentSubject) withdrawExperimentLocked(experimentKey string) int {
 // FetchExperimentAssignment's, except that a subject fault the platform
 // reports (the subject-grammar or PII-marker 400) returns an error wrapping
 // ErrInvalidExperimentSubject and is never retried with another subject.
-// Attributes are normalized as there; declare an age with "age_band".
+// Attributes are normalized as there; declare an age with "age_band" (see
+// FetchWithAgeBand). A non-adult declaration takes effect as on the client:
+// an age-gated assignment of the experiment stops serving and recording at
+// once, the server's answer then governs, and a fetch that ends without one
+// withdraws what the handle owes for the experiment.
 func (s *ExperimentSubject) Fetch(ctx context.Context, experimentKey string, attributes map[string]string) (ExperimentAssignmentResult, error) {
 	c := s.c
 	c.lifecycleMu.Lock()
@@ -264,15 +331,21 @@ func (s *ExperimentSubject) Fetch(ctx context.Context, experimentKey string, att
 	if experimentKey == "" {
 		return ExperimentAssignmentResult{}, expFetchError("experiment_key_required")
 	}
+	// The declaration is registered before the refusal check, as on the
+	// client: a refused declaration ends unanswered and withdraws.
 	s.mu.Lock()
-	if err := s.refusalLocked(); err != nil {
-		s.mu.Unlock()
-		return ExperimentAssignmentResult{}, err
-	}
 	consentSeq := s.consentSeq
 	s.fetchSeq++
 	seq := s.fetchSeq
+	declaration := s.beginDeclarationLocked(experimentKey, attributes, seq)
+	refusal := s.refusalLocked()
 	s.mu.Unlock()
+	if declaration != nil {
+		defer s.endDeclaration(experimentKey, declaration)
+	}
+	if refusal != nil {
+		return ExperimentAssignmentResult{}, refusal
+	}
 
 	normalized, dropped := normalizeExperimentAssignmentAttributes(attributes)
 	if dropped > 0 {
@@ -326,7 +399,7 @@ func (s *ExperimentSubject) Fetch(ctx context.Context, experimentKey string, att
 	// client's own settle applies, for this handle's state.
 	s.mu.Lock()
 	e.mu.Lock()
-	refusal := s.refusalLocked()
+	refusal = s.refusalLocked()
 	if refusal == nil && (s.consentSeq != consentSeq || c.consentEpoch.Load() != dispatchConsentEpoch) {
 		// A consent change while the request was in flight: the answer
 		// predates it and installs nothing.
@@ -350,10 +423,11 @@ func (s *ExperimentSubject) Fetch(ctx context.Context, experimentKey string, att
 	}
 	result, outcome, failure := applyExperimentAssignment(serveEntry, resp, scope, nowMS)
 	constructive := refusal == nil && !epochStale && !fencedOut
+	applied, installed := false, false
 	if outcome.remint && s.rejected == nil {
 		// A subject fault is terminal whatever the fences: withdraw everything.
 		s.rejected = fmt.Errorf("%w: the platform refused the subject (%s)", ErrInvalidExperimentSubject, experimentBodyErrorCode(resp.body, resp.bodyIncomplete))
-		e.countDropLocked(expDropApplyRefused, s.withdrawAllLocked())
+		countSubjectOwedLocked(e, expDropApplyRefused, s.withdrawAllLocked())
 	}
 	if !fencedOut {
 		if outcome.authoritative && !epochStale {
@@ -363,17 +437,27 @@ func (s *ExperimentSubject) Fetch(ctx context.Context, experimentKey string, att
 		// under the consent and credential state that sent the request.
 		switch {
 		case outcome.dropAll:
-			e.countDropLocked(expDropRealSubjectsDisabled, s.withdrawAllLocked())
+			countSubjectOwedLocked(e, expDropRealSubjectsDisabled, s.withdrawAllLocked())
+			applied = true
 		case outcome.ageRefusal:
-			e.countDropLocked(expDropAgeIneligible, s.withdrawExperimentLocked(experimentKey))
+			countSubjectOwedLocked(e, expDropAgeIneligible, s.withdrawAgeLocked(experimentKey, true))
+			applied = true
 		case outcome.dropEntry:
 			delete(s.entries, experimentKey)
+			applied = outcome.authoritative && !outcome.transient && !outcome.authBlocked
 		case outcome.newEntry != nil && constructive:
 			entry := outcome.newEntry
 			entry.SubjectKey = s.subjectKey
 			entry.Attributes = normalized
 			s.entries[experimentKey] = entry
+			applied, installed = true, true
 		}
+	}
+	// The server's answer to this fetch's own non-adult declaration was
+	// applied: it governs from here.
+	pending := s.declaring[experimentKey]
+	if pending != nil && pending.seq == seq && applied {
+		pending.decided = true
 	}
 	// The plane's shared state: a refused, stale or fenced-out answer
 	// neither paces nor lifts the latch. A 401/403 latches unless it is
@@ -398,10 +482,25 @@ func (s *ExperimentSubject) Fetch(ctx context.Context, experimentKey string, att
 	supersededFailure := ""
 	if fencedOut && outcome.authoritative && !epochStale {
 		current := s.entries[experimentKey]
-		if current != nil && (e.authBlocked || !experimentAttributesEqual(current.Attributes, normalized)) {
+		if current != nil && (e.authBlocked || !experimentAttributesEqual(current.Attributes, normalized) || (pending != nil && current.ageGated())) {
 			current = nil
 		}
 		supersededResult, supersededFailure = serveExperimentEntryOrFail(current, "superseded")
+	}
+	// A pending non-adult declaration hands no caller an age-gated variant:
+	// not another fetch's, and not the declaring fetch's own cached
+	// fallback, which its end withdraws. Only the declaring fetch's applied
+	// answer is served.
+	suppress, suppressCode := false, "superseded"
+	if pending != nil && !(pending.seq == seq && pending.decided) {
+		source := serveEntry
+		if installed {
+			source = s.entries[experimentKey]
+		}
+		suppress = source == nil || source.ageGated()
+		if pending.seq == seq && result.Code != "" {
+			suppressCode = result.Code
+		}
 	}
 	e.mu.Unlock()
 	s.mu.Unlock()
@@ -420,12 +519,81 @@ func (s *ExperimentSubject) Fetch(ctx context.Context, experimentKey string, att
 		return ExperimentAssignmentResult{}, fmt.Errorf("%w: the platform refused the subject (%s)", ErrInvalidExperimentSubject, experimentBodyErrorCode(resp.body, resp.bodyIncomplete))
 	case failure != "":
 		return ExperimentAssignmentResult{}, expFetchError(failure)
+	case suppress && result.Assigned:
+		return ExperimentAssignmentResult{}, expFetchError(suppressCode)
 	}
 	return result, nil
 }
 
-// servedEntryLocked is the entry this handle serves for an experiment, or
-// nil: none while the handle refuses or the plane's credential latch is set.
+// FetchWithAgeBand is Fetch with an age_band declaration, as
+// FetchExperimentAssignmentWithAgeBand is for the client: only adult can
+// qualify for a client-id assignment. The caller's attributes are copied;
+// an unknown band or a conflicting age_band returns
+// ErrInvalidExperimentAgeBand.
+func (s *ExperimentSubject) FetchWithAgeBand(ctx context.Context, experimentKey string, band ExperimentAgeBand, attributes map[string]string) (ExperimentAssignmentResult, error) {
+	switch band {
+	case ExperimentAgeBandUnknown, ExperimentAgeBandUnderThreshold, ExperimentAgeBandAdult:
+	default:
+		return ExperimentAssignmentResult{}, ErrInvalidExperimentAgeBand
+	}
+	if existing, ok := attributes["age_band"]; ok && existing != string(band) {
+		return ExperimentAssignmentResult{}, ErrInvalidExperimentAgeBand
+	}
+	declared := make(map[string]string, len(attributes)+1)
+	for name, value := range attributes {
+		declared[name] = value
+	}
+	declared["age_band"] = string(band)
+	return s.Fetch(ctx, experimentKey, declared)
+}
+
+// beginDeclarationLocked records a fetch's age declaration for the
+// experiment, as the client does: a non-adult one stops an age-gated
+// assignment serving and recording at once; an adult one replaces a pending
+// non-adult one, and a fetch without one changes nothing. It returns the
+// non-adult declaration, or nil.
+func (s *ExperimentSubject) beginDeclarationLocked(experimentKey string, attributes map[string]string, seq uint64) *expSubjectDeclaration {
+	if !declaresNonAdultAge(attributes) {
+		if declaresAdultAge(attributes) {
+			delete(s.declaring, experimentKey)
+		}
+		return nil
+	}
+	declaration := &expSubjectDeclaration{fenceSeq: seq - 1, seq: seq}
+	s.declaring[experimentKey] = declaration
+	return declaration
+}
+
+// endDeclaration runs when a declaring fetch ends, on every path, as the
+// client's endNonAdultDeclaration. An applied answer simply ends the
+// declaration. Without one, the declaration alone makes the player
+// ineligible for a client-id assignment, so it is the age refusal's
+// package; the key's fence is raised past every fetch dispatched before the
+// declaration, so an earlier adult answer installs nothing when it lands. A
+// synthetic-subject assignment has no age gate and keeps serving. A later
+// declaration replaced this one: nothing happens.
+func (s *ExperimentSubject) endDeclaration(experimentKey string, declaration *expSubjectDeclaration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.declaring[experimentKey] != declaration {
+		return
+	}
+	delete(s.declaring, experimentKey)
+	if declaration.decided {
+		return
+	}
+	if s.settled[experimentKey] < declaration.fenceSeq {
+		s.settled[experimentKey] = declaration.fenceSeq
+	}
+	live := s.entries[experimentKey]
+	s.countDrops(expDropAgeIneligible, s.withdrawAgeLocked(experimentKey, live == nil || live.ageGated()))
+	s.c.logf("shardpilot experiments: a subject handle declared a non-adult age for experiment %q and the fetch ended without the server's answer; withdrew what it owes for the experiment", experimentKey)
+}
+
+// servedEntryLocked is the entry this handle serves and records against for
+// an experiment, or nil: none while the handle refuses or the plane's
+// credential latch is set, and no age-gated one while a non-adult
+// declaration of the experiment is pending.
 func (s *ExperimentSubject) servedEntryLocked(experimentKey string) *expEntry {
 	if s.refusalLocked() != nil {
 		return nil
@@ -437,7 +605,18 @@ func (s *ExperimentSubject) servedEntryLocked(experimentKey string) *expEntry {
 	if blocked {
 		return nil
 	}
-	return s.entries[experimentKey]
+	entry := s.entries[experimentKey]
+	if entry != nil && s.declaring[experimentKey] != nil && entry.ageGated() {
+		return nil
+	}
+	return entry
+}
+
+// recordable reports whether the handle can record an application of the
+// entry: a client_id assignment with serving state, on a handle with an
+// AnonymousID.
+func (s *ExperimentSubject) recordable(entry *expEntry) bool {
+	return entry.AssignmentUnit == experimentAssignmentUnitClientID && entry.Served != nil && s.anonymousID != ""
 }
 
 // Variant returns this player's cached assigned variant for an experiment,
@@ -484,21 +663,86 @@ func (s *ExperimentSubject) Apply(experimentKey string) (string, map[string]any)
 	}
 	s.exposed[tuple] = true
 	e := s.c.exp
-	recordable := entry.AssignmentUnit == experimentAssignmentUnitClientID && entry.Served != nil && s.anonymousID != ""
 	app, err := newExperimentApplication(now)
-	if !recordable || err != nil {
+	if !s.recordable(entry) || err != nil {
 		e.mu.Lock()
 		e.countDropLocked(expDropNotRecordable, 1)
 		e.mu.Unlock()
 		return variant, payload
 	}
 	s.appendOwedLocked(&expSubjectOwed{experimentKey: experimentKey, entry: entry, app: app})
+	s.lastApplied[experimentKey] = expLastApplication{entry: entry, app: app}
 	return variant, payload
 }
 
-// appendOwedLocked queues an application, keeping at most
-// expMaxOwedExposures per experiment: a new one displaces the oldest of its
-// experiment, counted owed_bound_exceeded.
+// TrackOutcome records an outcome of this player's experiment, as
+// TrackExperimentOutcome does for the client: it follows the handle's most
+// recent recorded Apply of the experiment, is sealed through the outcome
+// apply endpoint by the background lane, and its fact carries the handle's
+// AnonymousID. An age refusal withdraws the applications it could follow.
+// The key and value rules and the errors are TrackExperimentOutcome's, and
+// a handle that refuses returns its refusal; an outcome the handle drops
+// before it reaches the analytics queue is counted in
+// Stats.ExperimentOutcomeDrops.
+func (s *ExperimentSubject) TrackOutcome(experimentKey, outcomeKey string, outcomeValue float64) error {
+	experimentKey = strings.TrimSpace(experimentKey)
+	outcomeKey = strings.TrimSpace(outcomeKey)
+	if experimentKey == "" {
+		return fmt.Errorf("%w: experiment key is required", ErrInvalidExperimentFact)
+	}
+	if !validExperimentOutcomeKey(outcomeKey) {
+		return fmt.Errorf("%w: outcome key must be 1-128 of A-Z a-z 0-9 . _ : - and not an IP address", ErrInvalidExperimentFact)
+	}
+	value, ok := experimentOutcomeInteger(outcomeValue)
+	if !ok {
+		return fmt.Errorf("%w: outcome value must be an integer of magnitude at most 2^53", ErrInvalidExperimentFact)
+	}
+	outcomeID, err := newExperimentApplicationID()
+	if err != nil {
+		return ErrExperimentFactUnavailable
+	}
+	now := s.c.clock.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.refusalLocked(); err != nil {
+		return err
+	}
+	applied, ok := s.lastApplied[experimentKey]
+	if ok && s.declaring[experimentKey] != nil && applied.entry.ageGated() {
+		// A pending non-adult declaration records nothing under the
+		// earlier one.
+		return ErrExperimentNoAssignment
+	}
+	if !ok {
+		entry := s.servedEntryLocked(experimentKey)
+		switch {
+		case entry == nil:
+			return ErrExperimentNoAssignment
+		case !s.recordable(entry):
+			e := s.c.exp
+			e.mu.Lock()
+			e.countOutcomeDropLocked(expDropNotRecordable, 1)
+			e.mu.Unlock()
+			return ErrExperimentFactUnavailable
+		default:
+			return ErrExperimentNotApplied
+		}
+	}
+	if appliedAt, err := time.Parse(time.RFC3339Nano, applied.app.appliedAt); err != nil || now.Before(appliedAt) {
+		return fmt.Errorf("%w: the outcome is earlier than the application it follows", ErrInvalidExperimentFact)
+	}
+	s.appendOwedLocked(&expSubjectOwed{experimentKey: experimentKey, entry: applied.entry, app: applied.app, outcome: &expOutcomeRecord{
+		outcomeID:  outcomeID,
+		occurredAt: now.UTC().Format(time.RFC3339Nano),
+		key:        outcomeKey,
+		value:      value,
+	}})
+	return nil
+}
+
+// appendOwedLocked queues an application or an outcome, keeping at most
+// expMaxOwedExposures per experiment: a new record displaces the oldest of
+// its experiment, counted owed_bound_exceeded in that record's kind's map.
 func (s *ExperimentSubject) appendOwedLocked(record *expSubjectOwed) {
 	count := 0
 	for _, owed := range s.owed {
@@ -510,13 +754,10 @@ func (s *ExperimentSubject) appendOwedLocked(record *expSubjectOwed) {
 		for i, owed := range s.owed {
 			if owed.experimentKey == record.experimentKey {
 				s.owed = append(s.owed[:i], s.owed[i+1:]...)
+				s.countDrops(expDropOwedBoundExceeded, []*expSubjectOwed{owed})
 				break
 			}
 		}
-		e := s.c.exp
-		e.mu.Lock()
-		e.countDropLocked(expDropOwedBoundExceeded, 1)
-		e.mu.Unlock()
 	}
 	s.owed = append(s.owed, record)
 }
@@ -553,11 +794,11 @@ func (s *ExperimentSubject) discardOwed() int {
 		e := s.c.exp
 		e.mu.Lock()
 		for _, owed := range s.owed {
+			reason := expDropUndeliveredAtClose
 			if owed.sealed == nil {
-				e.countDropLocked(expDropUnsealedAtClose, 1)
-			} else {
-				e.countDropLocked(expDropUndeliveredAtClose, 1)
+				reason = expDropUnsealedAtClose
 			}
+			countSubjectOwedLocked(e, reason, []*expSubjectOwed{owed})
 		}
 		e.mu.Unlock()
 		s.c.stats.dropped.Add(uint64(remaining))
@@ -589,7 +830,10 @@ func (s *ExperimentSubject) deliver(ctx context.Context, network, atClose bool, 
 			return
 		}
 		s.mu.Lock()
-		if len(s.owed) == 0 || s.consent != ExperimentSubjectConsentGranted {
+		// An unanswered non-adult declaration holds its experiment's owed
+		// records unsent, as on the client: its answer decides whether they
+		// deliver or are withdrawn.
+		if len(s.owed) == 0 || s.consent != ExperimentSubjectConsentGranted || s.declaring[s.owed[0].experimentKey] != nil {
 			s.mu.Unlock()
 			return
 		}
@@ -636,7 +880,7 @@ func (s *ExperimentSubject) deliver(ctx context.Context, network, atClose bool, 
 		}
 		event, scoped := c.sealedExposureEvent(s.session, sealed, c.expFactPurgeEpoch.Load())
 		if !scoped {
-			c.logf("shardpilot experiments: a sealed exposure for experiment %q names another workspace, app or environment than this client's; dropped (foreign_scope)", head.experimentKey)
+			c.logf("shardpilot experiments: a sealed %s for experiment %q names another workspace, app or environment than this client's; dropped (foreign_scope)", head.copy(s.session).kind(), head.experimentKey)
 			s.retire(head, expDropForeignScope)
 			continue
 		}
@@ -656,17 +900,20 @@ func (s *ExperimentSubject) commit(head *expSubjectOwed, event Event, atClose bo
 	s.commitMu.Lock()
 	defer s.commitMu.Unlock()
 	s.mu.Lock()
-	current := s.consent == ExperimentSubjectConsentGranted && len(s.owed) > 0 && s.owed[0] == head
+	// The stamp is read with the head check, under the lock every
+	// withdrawal takes: a withdrawal after it covers the fact at the send
+	// point, one before it removed the head.
+	event.subjectStamp = s.withdrawSeq.Load()
+	current := s.consent == ExperimentSubjectConsentGranted && len(s.owed) > 0 && s.owed[0] == head && s.declaring[head.experimentKey] == nil
 	s.mu.Unlock()
 	if !current {
-		return true // withdrawn meanwhile: the next pass reads the queue again
+		return true // withdrawn or held meanwhile: the next pass reads the queue again
 	}
-	event.subjectDenials = s.denials.Load()
 	if _, err := s.c.enqueueExperimentFact(event, atClose); err != nil {
 		if errors.Is(err, ErrEventTooLarge) {
 			// Ingest rejects this fact on every attempt: it leaves the
 			// queue, counted once, and never holds the handle's later facts.
-			s.c.logf("shardpilot experiments: a subject handle's sealed exposure for experiment %q exceeds the 2048-byte ingest limit; dropped (event_too_large)", head.experimentKey)
+			s.c.logf("shardpilot experiments: a subject handle's sealed %s for experiment %q exceeds the 2048-byte ingest limit; dropped (event_too_large)", head.copy(s.session).kind(), head.experimentKey)
 			s.retire(head, expDropEventTooLarge)
 			return true
 		}
@@ -689,10 +936,7 @@ func (s *ExperimentSubject) retire(head *expSubjectOwed, reason string) {
 		return
 	}
 	s.owed = s.owed[1:]
-	e := s.c.exp
-	e.mu.Lock()
-	e.countDropLocked(reason, 1)
-	e.mu.Unlock()
+	s.countDrops(reason, []*expSubjectOwed{head})
 }
 
 type expSubjectSealStatus int
@@ -704,12 +948,14 @@ const (
 	expSubjectSealSettled                             // a withdrawal already removed and counted it
 )
 
-// seal sends one application to the apply endpoint and classifies the
-// answer as the client's own hop does, for this handle's state.
+// seal sends one application or outcome to its apply endpoint and
+// classifies the answer as the client's own hop does, for this handle's
+// state.
 func (s *ExperimentSubject) seal(ctx context.Context, head *expSubjectOwed) (*expSealedFact, expSubjectSealStatus, string) {
 	c := s.c
 	e := c.exp
-	resp, err := c.postExposureApplication(ctx, head.experimentKey, expOwedCopy{entry: head.entry, session: s.session, app: head.app})
+	owed := head.copy(s.session)
+	resp, err := c.postExposureApplication(ctx, head.experimentKey, owed)
 	if errors.Is(err, errExperimentApplyConsentRefused) {
 		return nil, expSubjectSealKept, ""
 	}
@@ -722,7 +968,7 @@ func (s *ExperimentSubject) seal(ctx context.Context, head *expSubjectOwed) (*ex
 	code := experimentBodyErrorCode(resp.body, resp.bodyIncomplete)
 	switch {
 	case resp.status >= 200 && resp.status < 300 && !resp.bodyIncomplete:
-		if parsed := parseSealedExposure(resp.body, experimentExposureName); parsed != nil {
+		if parsed := parseSealedExposure(resp.body, owed.eventName()); parsed != nil {
 			e.mu.Lock()
 			e.backoffAttempt = 0
 			e.mu.Unlock()
@@ -745,11 +991,11 @@ func (s *ExperimentSubject) seal(ctx context.Context, head *expSubjectOwed) (*ex
 		return nil, expSubjectSealSettled, ""
 	case resp.status == 409 && experimentApplyAgeRefusal(resp.body, resp.bodyIncomplete):
 		s.mu.Lock()
-		s.countDrops(expDropAgeIneligible, s.withdrawExperimentLocked(head.experimentKey))
+		s.countDrops(expDropAgeIneligible, s.withdrawAgeLocked(head.experimentKey, true))
 		s.mu.Unlock()
 		return nil, expSubjectSealSettled, ""
 	case resp.status >= 300 && resp.status < 500 && resp.status != 408 && resp.status != 429:
-		c.logf("shardpilot experiments: the platform refused a subject handle's exposure for experiment %q (HTTP %d); dropped (apply_refused)", head.experimentKey, resp.status)
+		c.logf("shardpilot experiments: the platform refused a subject handle's %s for experiment %q (HTTP %d); dropped (apply_refused)", owed.kind(), head.experimentKey, resp.status)
 		return nil, expSubjectSealDropped, expDropApplyRefused
 	}
 	seconds, present := 0, false
@@ -789,17 +1035,17 @@ func (c *Client) owedExperimentSubjectCount() int {
 }
 
 // purgeExperimentSubjects is the client consent denial's share for the
-// handles: every owed application is withdrawn (counted consent_withdrawn);
-// a later application records again. Callers hold lifecycleMu.
+// handles: every owed application and outcome is withdrawn (counted
+// consent_withdrawn), and with them the applications an outcome would
+// follow, which a handle never re-arms; a later application records again.
+// Callers hold lifecycleMu.
 func (c *Client) purgeExperimentSubjects() {
 	for _, s := range c.openExperimentSubjects() {
 		s.mu.Lock()
-		e := c.exp
-		e.mu.Lock()
-		e.countDropLocked(expDropConsentWithdrawn, len(s.owed))
-		e.mu.Unlock()
+		s.countDrops(expDropConsentWithdrawn, s.owed)
 		s.owed = nil
 		s.exposed = make(map[string]bool)
+		s.lastApplied = make(map[string]expLastApplication)
 		s.mu.Unlock()
 	}
 }
@@ -820,12 +1066,23 @@ func (c *Client) closeExperimentSubjects() int {
 	return remaining
 }
 
-// subjectFactWithdrawn reports a subject handle's fact whose player has
-// denied consent since it was handed to the queue. The fleet consent rule
-// purges retained analytics on denial; for a handle's facts, which share the
-// client's queue, the purge is this check at every send point.
-func subjectFactWithdrawn(subject *ExperimentSubject, stamp uint64) bool {
-	return subject != nil && stamp < subject.denials.Load()
+// subjectFactWithdrawn reports a subject handle's fact withdrawn since it
+// was handed to the queue: its player denied consent, or an age refusal
+// withdrew the experiment it records. The fleet consent rule purges
+// retained analytics on denial, and an age refusal withdraws the subject's
+// facts of the experiment; for a handle's facts, which share the client's
+// queue, the purge is this check at every send point.
+func subjectFactWithdrawn(subject *ExperimentSubject, stamp uint64, props map[string]any) bool {
+	if subject == nil {
+		return false
+	}
+	if stamp < subject.deniedAt.Load() {
+		return true
+	}
+	experimentKey, _ := props["experiment_key"].(string)
+	subject.ageMu.Lock()
+	defer subject.ageMu.Unlock()
+	return stamp < subject.ageWithdrawnAt[experimentKey]
 }
 
 // dropDeniedSubjectFacts is the worker-batch leg: at every dispatch point it
@@ -839,7 +1096,7 @@ func (c *Client) dropDeniedSubjectFacts(batch []Event, backoffAttempt *int) []Ev
 	kept := batch[:0]
 	removedIDs := make(map[string]struct{})
 	for _, event := range batch {
-		if subjectFactWithdrawn(event.subject, event.subjectDenials) {
+		if subjectFactWithdrawn(event.subject, event.subjectStamp, event.Props) {
 			removedIDs[strings.TrimSpace(event.ID)] = struct{}{}
 			continue
 		}
@@ -849,7 +1106,7 @@ func (c *Client) dropDeniedSubjectFacts(batch []Event, backoffAttempt *int) []Ev
 		return kept
 	}
 	c.stats.dropped.Add(uint64(len(removedIDs)))
-	c.logf("shardpilot experiments: dropped %d queued fact(s) of subject handles whose player denied consent", len(removedIDs))
+	c.logf("shardpilot experiments: dropped %d queued fact(s) of subject handles withdrawn by a consent denial or an age refusal", len(removedIDs))
 	c.retainedRequest = withoutEnvelopeIDs(c.retainedRequest, removedIDs)
 	if len(kept) == 0 {
 		*backoffAttempt = 0
@@ -869,7 +1126,7 @@ func (c *Client) dropDeniedSubjectBuiltBatch(request batchRequest, batch []Event
 	var raws []json.RawMessage
 	removed := 0
 	for i, event := range batch {
-		if subjectFactWithdrawn(event.subject, event.subjectDenials) {
+		if subjectFactWithdrawn(event.subject, event.subjectStamp, event.Props) {
 			removed++
 			continue
 		}
@@ -883,14 +1140,14 @@ func (c *Client) dropDeniedSubjectBuiltBatch(request batchRequest, batch []Event
 		return request, kept
 	}
 	c.stats.dropped.Add(uint64(removed))
-	c.logf("shardpilot experiments: withheld %d built batch member(s) at the transport handoff (their player denied consent on a subject handle)", removed)
+	c.logf("shardpilot experiments: withheld %d built batch member(s) at the transport handoff (withdrawn on a subject handle by a consent denial or an age refusal)", removed)
 	if aligned {
 		request.Events = envelopes
 		request.rawEvents = raws
 	} else {
 		ids := make(map[string]struct{})
 		for _, envelope := range request.Events {
-			if subjectFactWithdrawn(envelope.subject, envelope.subjectDenials) {
+			if subjectFactWithdrawn(envelope.subject, envelope.subjectStamp, envelope.Props) {
 				ids[envelope.EventID] = struct{}{}
 			}
 		}
