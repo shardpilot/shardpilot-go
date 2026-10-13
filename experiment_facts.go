@@ -1794,9 +1794,11 @@ func (c *Client) captureOwedExposuresForDrop(experimentKey string, owed []*expOw
 	if len(events) == 0 {
 		return true, nil
 	}
-	request, err := c.buildBatch(events)
-	if err != nil {
-		return true, nil // unbuildable facts have no capturable form
+	// An unbuildable or oversize fact has no capturable form: it is left
+	// out, and its siblings are still captured.
+	request, kept, _ := c.buildBatchIsolating(events, batchRequest{})
+	if len(kept) == 0 {
+		return true, nil
 	}
 	eligible, refusedActors := c.partitionSpoolEligible(request)
 	if len(refusedActors) > 0 {

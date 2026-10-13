@@ -57,7 +57,9 @@ func (c *Client) encodeAtIntake(event *Event) error {
 }
 
 // encodeEvent returns an event's wire envelope and bytes: its intake
-// encoding when it has one, else a fresh build.
+// encoding when it has one, else a fresh build. A fresh build is measured
+// like an intake one: over the cap it fails as ErrEventTooLarge, so a batch
+// drops that member alone.
 func (c *Client) encodeEvent(event Event) (eventEnvelope, json.RawMessage, error) {
 	if event.encoded != nil {
 		envelope := event.encoded.envelope
@@ -71,6 +73,9 @@ func (c *Client) encodeEvent(event Event) (eventEnvelope, json.RawMessage, error
 	raw, err := json.Marshal(envelope)
 	if err != nil {
 		return eventEnvelope{}, nil, &EncodeError{Err: err}
+	}
+	if eventExceedsSizeLimit(raw, envelope.EventName, envelope.SchemaVersion) {
+		return eventEnvelope{}, nil, &EncodeError{Err: ErrEventTooLarge}
 	}
 	return envelope, raw, nil
 }

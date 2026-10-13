@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -226,5 +227,107 @@ func TestAnOversizeSealedFactLeavesTheOwedQueue(t *testing.T) {
 	}
 	if outcomes != 1 {
 		t.Fatalf("delivered %d outcome(s) behind the oversize exposure, want 1", outcomes)
+	}
+}
+
+// TestAnEventLeftUnencodedAtIntakeIsMeasuredAtPublish: an event intake could
+// not encode (a nested value that does not marshal) is measured when its
+// batch builds it. Mutated past the limit after Enqueue, it is dropped and
+// counted, never sent, and its batchmate is.
+func TestAnEventLeftUnencodedAtIntakeIsMeasuredAtPublish(t *testing.T) {
+	client, scene := newSizeSceneClient(t)
+	nested := map[string]any{"value": make(chan int)}
+	unencoded := Event{ID: "0199a0b0-0000-7000-8000-000000000010", Name: "size_scene", Props: map[string]any{"nested": nested}}
+	if err := client.Enqueue(unencoded); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Enqueue(sizedEvent(t, client, "0199a0b0-0000-7000-8000-000000000011", 300)); err != nil {
+		t.Fatalf("Enqueue batchmate: %v", err)
+	}
+	nested["value"] = strings.Repeat("a", 3000)
+	_ = client.Flush(context.Background())
+	got := scene.received()
+	if len(got) != 1 || !bytes.Contains(got[0], []byte("000000000011")) {
+		t.Fatalf("sent %d element(s); want only the batchmate", len(got))
+	}
+	if dropped := client.Snapshot().Dropped; dropped != 1 {
+		t.Fatalf("Dropped = %d, want the oversize event", dropped)
+	}
+}
+
+// flipMarshaler fails its first MarshalJSON and returns 3,000 bytes after:
+// intake leaves the event unencoded, and its publish build measures it.
+type flipMarshaler struct{ calls *atomic.Int32 }
+
+func (m flipMarshaler) MarshalJSON() ([]byte, error) {
+	if m.calls.Add(1) == 1 {
+		return nil, errors.New("not yet")
+	}
+	return json.Marshal(strings.Repeat("a", 3000))
+}
+
+// TestTrackCountsAnEventOversizeAtPublishAsDropped: Track refuses such an
+// event as intake would, counted once in Dropped and never as a failed
+// batch, and sends nothing.
+func TestTrackCountsAnEventOversizeAtPublishAsDropped(t *testing.T) {
+	client, scene := newSizeSceneClient(t)
+	event := Event{ID: "0199a0b0-0000-7000-8000-000000000012", Name: "size_scene", Props: map[string]any{"value": flipMarshaler{calls: new(atomic.Int32)}}}
+	if err := client.Track(context.Background(), event); !errors.Is(err, ErrEventTooLarge) {
+		t.Fatalf("Track = %v, want ErrEventTooLarge", err)
+	}
+	if got := len(scene.received()); got != 0 {
+		t.Fatalf("sent %d element(s), want none", got)
+	}
+	if stats := client.Snapshot(); stats.Dropped != 1 || stats.FailedBatches != 0 {
+		t.Fatalf("Dropped = %d, FailedBatches = %d; want 1 and 0", stats.Dropped, stats.FailedBatches)
+	}
+}
+
+// sentinelMarshaler returns the SDK's own size sentinel from MarshalJSON,
+// so no bytes are ever produced to measure.
+type sentinelMarshaler struct{}
+
+func (sentinelMarshaler) MarshalJSON() ([]byte, error) { return nil, ErrEventTooLarge }
+
+// TestTrackReportsAMarshalerReturningTheSizeSentinelAsAnEncodeFailure: an
+// event that never marshaled was not measured, so Track reports the build
+// failure, not a size drop.
+func TestTrackReportsAMarshalerReturningTheSizeSentinelAsAnEncodeFailure(t *testing.T) {
+	client, scene := newSizeSceneClient(t)
+	event := Event{ID: "0199a0b0-0000-7000-8000-000000000013", Name: "size_scene", Props: map[string]any{"value": sentinelMarshaler{}}}
+	var encodeErr *EncodeError
+	if err := client.Track(context.Background(), event); !errors.As(err, &encodeErr) {
+		t.Fatalf("Track = %v, want an *EncodeError", err)
+	}
+	if got := len(scene.received()); got != 0 {
+		t.Fatalf("sent %d element(s), want none", got)
+	}
+	if stats := client.Snapshot(); stats.Dropped != 0 || stats.FailedBatches != 1 {
+		t.Fatalf("Dropped = %d, FailedBatches = %d; want 0 and 1", stats.Dropped, stats.FailedBatches)
+	}
+}
+
+// TestDropTimeCaptureSpoolsTheSiblingsOfAnOversizeFact: a dropped
+// assignment's capture leaves out a sealed fact over the cap, which has no
+// capturable form, and still spools its siblings before the durable delete.
+func TestDropTimeCaptureSpoolsTheSiblingsOfAnOversizeFact(t *testing.T) {
+	server := newExperimentServer(t, &expScript{}, &expWireCapture{})
+	defer server.Close()
+	client := newExperimentClient(t, server.URL, func(cfg *Config) { cfg.SpoolDir = t.TempDir() })
+	defer client.Close(context.Background())
+	client.SetConsent(true)
+	sealed := func(id, pad string) *expOwedExposure {
+		fact := `{"event_id":"` + expStubFactID(id) + `","event_name":"experiment_exposure","event_ts":"2026-09-27T00:00:00Z",` +
+			`"workspace_key":"workspace-test","app_key":"app-test","environment_key":"develop","props":{"experiment_key":"exp-cap",` +
+			`"experiment_version":1,"variant_key":"treatment` + pad + `","assignment_unit":"client_id","attestation":"client_attested"}}`
+		return &expOwedExposure{entry: &expEntry{VariantKey: "treatment", Version: 1}, session: client.exp.sessionMarker,
+			sealed: &expSealedFact{fact: json.RawMessage(fact), seal: expStubSeal}}
+	}
+	owed := []*expOwedExposure{sealed(strings.Repeat("c", 32), strings.Repeat("x", 3000)), sealed(strings.Repeat("d", 32), "")}
+	if ok, _ := client.captureOwedExposuresForDrop("exp-cap", owed); !ok {
+		t.Fatalf("the capture must be durable")
+	}
+	if got := spooledExperimentFacts(client, "exp-cap"); got != 1 {
+		t.Fatalf("%d fact(s) spooled; want only the sibling of the oversize fact", got)
 	}
 }

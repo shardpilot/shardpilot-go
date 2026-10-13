@@ -1827,6 +1827,13 @@ func (c *Client) publishBatchWithContext(ctx context.Context, events []Event) er
 	}
 	request, err := c.buildBatch(events)
 	if err != nil {
+		// Track's one event measured over the cap at build: refused as at
+		// intake, counted once as dropped, never a failed batch. Only the
+		// size check's own error matches, not a marshaler's that wraps it.
+		var encodeErr *EncodeError
+		if errors.As(err, &encodeErr) && encodeErr.Err == ErrEventTooLarge {
+			return c.refuseOversizeEvent()
+		}
 		c.recordBuildFailure(err)
 		return err
 	}
