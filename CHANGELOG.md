@@ -16,6 +16,9 @@
   handle's delivery pass waits for its turn only as long as its caller's
   context allows, and `Close` passes its context to every handle sweep. What a
   handle still owes is counted at close, as before.
+- An event that could not be encoded at intake is measured against the
+  2048-byte cap when its batch builds it: over the cap, that member alone is
+  dropped and counted in `Stats.Dropped`, and never sent.
 - Every request now carries `X-ShardPilot-SDK: go/<version>` (event batches,
   consent, remote config, the experiment routes and crash ingest). The version
   is a constant in code, which a test holds to the README's latest-tag claim.

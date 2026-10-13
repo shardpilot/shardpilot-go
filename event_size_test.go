@@ -228,3 +228,28 @@ func TestAnOversizeSealedFactLeavesTheOwedQueue(t *testing.T) {
 		t.Fatalf("delivered %d outcome(s) behind the oversize exposure, want 1", outcomes)
 	}
 }
+
+// TestAnEventLeftUnencodedAtIntakeIsMeasuredAtPublish: an event intake could
+// not encode (a nested value that does not marshal) is measured when its
+// batch builds it. Mutated past the limit after Enqueue, it is dropped and
+// counted, never sent, and its batchmate is.
+func TestAnEventLeftUnencodedAtIntakeIsMeasuredAtPublish(t *testing.T) {
+	client, scene := newSizeSceneClient(t)
+	nested := map[string]any{"value": make(chan int)}
+	unencoded := Event{ID: "0199a0b0-0000-7000-8000-000000000010", Name: "size_scene", Props: map[string]any{"nested": nested}}
+	if err := client.Enqueue(unencoded); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if err := client.Enqueue(sizedEvent(t, client, "0199a0b0-0000-7000-8000-000000000011", 300)); err != nil {
+		t.Fatalf("Enqueue batchmate: %v", err)
+	}
+	nested["value"] = strings.Repeat("a", 3000)
+	_ = client.Flush(context.Background())
+	got := scene.received()
+	if len(got) != 1 || !bytes.Contains(got[0], []byte("000000000011")) {
+		t.Fatalf("sent %d element(s); want only the batchmate", len(got))
+	}
+	if dropped := client.Snapshot().Dropped; dropped != 1 {
+		t.Fatalf("Dropped = %d, want the oversize event", dropped)
+	}
+}
