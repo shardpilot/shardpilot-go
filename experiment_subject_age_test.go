@@ -256,3 +256,22 @@ func TestAHandlesNonAdultDeclarationLandsWhileTheClientRefuses(t *testing.T) {
 		t.Fatalf("after the re-grant the handle serves %q despite the non-adult declaration", variant)
 	}
 }
+
+// TestAHandlesOutcomeNeedsAFreshApplyAfterTheClientsDenial: the client's
+// denial withdraws a handle's owed exposure and never re-arms it, so no
+// outcome may follow that application after the re-grant.
+func TestAHandlesOutcomeNeedsAFreshApplyAfterTheClientsDenial(t *testing.T) {
+	rig := newExpHopRig(t, nil)
+	s := newSubjectOrFail(t, rig.client, expSubjectA, "player-a")
+	subjectFetchOrFail(t, s)
+	s.Apply(expTestScopeKey)
+	rig.client.SetConsent(false)
+	rig.client.SetConsent(true)
+	if err := s.TrackOutcome(expTestScopeKey, "purchase", 1); !errors.Is(err, ErrExperimentNotApplied) {
+		t.Fatalf("an outcome after the client's denial: %v, want ErrExperimentNotApplied", err)
+	}
+	rig.cycle()
+	if got := len(rig.outcomeRequests()); got != 0 {
+		t.Fatalf("outcome apply requests = %d, want none", got)
+	}
+}

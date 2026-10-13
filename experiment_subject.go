@@ -1033,14 +1033,16 @@ func (c *Client) owedExperimentSubjectCount() int {
 
 // purgeExperimentSubjects is the client consent denial's share for the
 // handles: every owed application and outcome is withdrawn (counted
-// consent_withdrawn); a later application records again. Callers hold
-// lifecycleMu.
+// consent_withdrawn), and with them the applications an outcome would
+// follow, which a handle never re-arms; a later application records again.
+// Callers hold lifecycleMu.
 func (c *Client) purgeExperimentSubjects() {
 	for _, s := range c.openExperimentSubjects() {
 		s.mu.Lock()
 		s.countDrops(expDropConsentWithdrawn, s.owed)
 		s.owed = nil
 		s.exposed = make(map[string]bool)
+		s.lastApplied = make(map[string]expLastApplication)
 		s.mu.Unlock()
 	}
 }
