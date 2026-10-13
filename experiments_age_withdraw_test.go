@@ -396,6 +396,11 @@ func TestAnAgeRefusalWithoutAFactKeyLeavesAnotherSubjectsFacts(t *testing.T) {
 				rig.capture.setStatus(http.StatusInternalServerError)
 			}
 			rig.client.experimentCycle(ctx)
+			// Both sealed facts are in the worker's batch before the flush:
+			// a flush publishes the batch the worker holds and stops at its
+			// first retriable failure, so a fact still queued would be left
+			// out of the spool.
+			waitFor(t, 5*time.Second, "the worker holds the sealed facts", func() bool { return len(rig.client.queue.ch) == 0 })
 			if staging == "spooled" {
 				if err := rig.client.Flush(ctx); err == nil {
 					t.Fatalf("setup: the flush must fail against the failing ingest")
@@ -403,8 +408,6 @@ func TestAnAgeRefusalWithoutAFactKeyLeavesAnotherSubjectsFacts(t *testing.T) {
 				if spooled := spooledExperimentFacts(rig.client, ageGoldenExperiment); spooled != 2 {
 					t.Fatalf("setup: %d fact(s) spooled by the failed publish, want 2", spooled)
 				}
-			} else {
-				waitFor(t, 5*time.Second, "the worker holds the sealed facts", func() bool { return len(rig.client.queue.ch) == 0 })
 			}
 			subject := func() string {
 				rig.client.exp.mu.Lock()
