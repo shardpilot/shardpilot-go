@@ -830,7 +830,10 @@ func (s *ExperimentSubject) deliver(ctx context.Context, network, atClose bool, 
 			return
 		}
 		s.mu.Lock()
-		if len(s.owed) == 0 || s.consent != ExperimentSubjectConsentGranted {
+		// An unanswered non-adult declaration holds its experiment's owed
+		// records unsent, as on the client: its answer decides whether they
+		// deliver or are withdrawn.
+		if len(s.owed) == 0 || s.consent != ExperimentSubjectConsentGranted || s.declaring[s.owed[0].experimentKey] != nil {
 			s.mu.Unlock()
 			return
 		}
@@ -901,10 +904,10 @@ func (s *ExperimentSubject) commit(head *expSubjectOwed, event Event, atClose bo
 	// withdrawal takes: a withdrawal after it covers the fact at the send
 	// point, one before it removed the head.
 	event.subjectStamp = s.withdrawSeq.Load()
-	current := s.consent == ExperimentSubjectConsentGranted && len(s.owed) > 0 && s.owed[0] == head
+	current := s.consent == ExperimentSubjectConsentGranted && len(s.owed) > 0 && s.owed[0] == head && s.declaring[head.experimentKey] == nil
 	s.mu.Unlock()
 	if !current {
-		return true // withdrawn meanwhile: the next pass reads the queue again
+		return true // withdrawn or held meanwhile: the next pass reads the queue again
 	}
 	if _, err := s.c.enqueueExperimentFact(event, atClose); err != nil {
 		if errors.Is(err, ErrEventTooLarge) {

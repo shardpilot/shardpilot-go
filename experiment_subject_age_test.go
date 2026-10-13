@@ -275,3 +275,62 @@ func TestAHandlesOutcomeNeedsAFreshApplyAfterTheClientsDenial(t *testing.T) {
 		t.Fatalf("outcome apply requests = %d, want none", got)
 	}
 }
+
+// TestAHandlesNonAdultDeclarationHoldsItsOwedFacts: while a non-adult
+// declaration is unanswered, the experiment's owed facts are neither sealed
+// nor handed to the queue, including one whose seal was already in flight;
+// an unanswered declaration then withdraws them, so none is ever sent.
+func TestAHandlesNonAdultDeclarationHoldsItsOwedFacts(t *testing.T) {
+	for _, sealInFlight := range []bool{false, true} {
+		name := "owed"
+		if sealInFlight {
+			name = "seal-in-flight"
+		}
+		t.Run(name, func(t *testing.T) {
+			rig := subjectAgeRig(t, ageGolden(t, "adult"))
+			s := newSubjectOrFail(t, rig.client, expSubjectA, "player-a")
+			if _, err := s.FetchWithAgeBand(context.Background(), ageGoldenExperiment, ExperimentAgeBandAdult, nil); err != nil {
+				t.Fatalf("setup: %v", err)
+			}
+			s.Apply(ageGoldenExperiment)
+			release := make(chan struct{})
+			var once sync.Once
+			unblock := func() { once.Do(func() { close(release) }) }
+			t.Cleanup(unblock)
+			rig.script.mu.Lock()
+			rig.script.gates = map[int]chan struct{}{1: release}
+			rig.script.mu.Unlock()
+			rig.answerNext(expScriptResponse{status: 503, body: `{}`})
+			declared := make(chan error, 1)
+			declare := func() {
+				go func() {
+					_, err := s.FetchWithAgeBand(context.Background(), ageGoldenExperiment, ExperimentAgeBandUnderThreshold, nil)
+					declared <- err
+				}()
+				waitForRequests(t, rig, 2)
+			}
+			if sealInFlight {
+				rig.script.apply.mu.Lock()
+				rig.script.apply.onRequest = declare
+				rig.script.apply.mu.Unlock()
+			} else {
+				declare()
+			}
+			rig.cycle()
+			if !sealInFlight && len(rig.script.apply.requestsSoFar()) != 0 {
+				t.Fatal("an owed exposure was sent for sealing while the non-adult declaration was unanswered")
+			}
+			flushOrFail(t, rig.client)
+			if facts := deliveredExperimentFacts(rig.capture, ageGoldenExperiment); len(facts) != 0 {
+				t.Fatalf("delivered %v while the non-adult declaration was unanswered", facts)
+			}
+			unblock()
+			<-declared
+			rig.cycle()
+			flushOrFail(t, rig.client)
+			if facts := deliveredExperimentFacts(rig.capture, ageGoldenExperiment); len(facts) != 0 {
+				t.Fatalf("delivered %v despite the unanswered non-adult declaration", facts)
+			}
+		})
+	}
+}
