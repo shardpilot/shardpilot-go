@@ -1887,7 +1887,7 @@ func (c *Client) drainDeferredSpoolLetters() {
 // reload truth on disk just because no cycle ran after storage recovered),
 // and owed exposure facts sweep into the queue past the closed gate so the
 // flush delivers them.
-func (c *Client) closeExperimentPreFlush() {
+func (c *Client) closeExperimentPreFlush(ctx context.Context) {
 	e := c.exp
 	if e == nil {
 		return
@@ -1906,7 +1906,7 @@ func (c *Client) closeExperimentPreFlush() {
 		// Sealed applications only: the one bounded apply attempt comes
 		// after the flush (closeExperimentPostFlush).
 		c.sweepAllExperimentExposuresMode(nil, true, false)
-		c.sweepExperimentSubjects(nil, false, true, nil)
+		c.sweepExperimentSubjects(ctx, false, true, nil)
 	}
 	// Any dead-letters a locked capture deferred must not be lost at close.
 	c.drainDeferredSpoolLetters()

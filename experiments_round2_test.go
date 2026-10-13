@@ -425,7 +425,7 @@ func TestLateLaneSettleAfterCloseHousekeepingIsDiscarded(t *testing.T) {
 	waitFor(t, 5*time.Second, "the lane fetch reaches the server", func() bool { return script.requestCount() == 2 })
 	// Housekeeping (teardown + the LAST durable retry) runs, then the
 	// response lands.
-	client.closeExperimentPreFlush()
+	client.closeExperimentPreFlush(context.Background())
 	close(laneGate)
 	<-fetchDone
 	client.exp.mu.Lock()

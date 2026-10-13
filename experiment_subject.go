@@ -79,8 +79,10 @@ type ExperimentSubject struct {
 	// session is this handle's session id, carried by its facts.
 	session string
 
-	// deliverMu lets one delivery pass run at a time (the lane, Close).
-	deliverMu sync.Mutex
+	// deliverSlot lets one delivery pass run at a time (the lane, Close):
+	// a one-slot semaphore, so a pass waiting for it gives up when its
+	// caller's context ends, and the client's Close stays within its own.
+	deliverSlot chan struct{}
 	// commitMu orders a consent change against a fact's hand-off to the
 	// queue: a fact is handed off under the consent that admitted it.
 	commitMu sync.Mutex
@@ -186,6 +188,7 @@ func (c *Client) ExperimentSubject(cfg ExperimentSubjectConfig) (*ExperimentSubj
 		anonymousID: cfg.AnonymousID,
 		session:     session,
 		consent:     cfg.Consent,
+		deliverSlot: make(chan struct{}, 1),
 		settled:     make(map[string]uint64),
 		entries:     make(map[string]*expEntry),
 		exposed:     make(map[string]bool),
@@ -821,8 +824,12 @@ func (s *ExperimentSubject) owedCount() int {
 // allowed (the lane, Close). It stops at the first application it must
 // keep. budget, when set, bounds the apply requests.
 func (s *ExperimentSubject) deliver(ctx context.Context, network, atClose bool, budget *int) {
-	s.deliverMu.Lock()
-	defer s.deliverMu.Unlock()
+	select {
+	case s.deliverSlot <- struct{}{}:
+	case <-contextDone(ctx):
+		return // records stay owed; the close path counts what remains
+	}
+	defer func() { <-s.deliverSlot }()
 	c := s.c
 	e := c.exp
 	for {
