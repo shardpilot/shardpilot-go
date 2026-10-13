@@ -282,3 +282,27 @@ func TestTrackCountsAnEventOversizeAtPublishAsDropped(t *testing.T) {
 		t.Fatalf("Dropped = %d, FailedBatches = %d; want 1 and 0", stats.Dropped, stats.FailedBatches)
 	}
 }
+
+// sentinelMarshaler returns the SDK's own size sentinel from MarshalJSON,
+// so no bytes are ever produced to measure.
+type sentinelMarshaler struct{}
+
+func (sentinelMarshaler) MarshalJSON() ([]byte, error) { return nil, ErrEventTooLarge }
+
+// TestTrackReportsAMarshalerReturningTheSizeSentinelAsAnEncodeFailure: an
+// event that never marshaled was not measured, so Track reports the build
+// failure, not a size drop.
+func TestTrackReportsAMarshalerReturningTheSizeSentinelAsAnEncodeFailure(t *testing.T) {
+	client, scene := newSizeSceneClient(t)
+	event := Event{ID: "0199a0b0-0000-7000-8000-000000000013", Name: "size_scene", Props: map[string]any{"value": sentinelMarshaler{}}}
+	var encodeErr *EncodeError
+	if err := client.Track(context.Background(), event); !errors.As(err, &encodeErr) {
+		t.Fatalf("Track = %v, want an *EncodeError", err)
+	}
+	if got := len(scene.received()); got != 0 {
+		t.Fatalf("sent %d element(s), want none", got)
+	}
+	if stats := client.Snapshot(); stats.Dropped != 0 || stats.FailedBatches != 1 {
+		t.Fatalf("Dropped = %d, FailedBatches = %d; want 0 and 1", stats.Dropped, stats.FailedBatches)
+	}
+}
