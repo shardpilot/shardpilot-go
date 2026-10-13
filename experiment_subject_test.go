@@ -611,3 +611,40 @@ func TestASubjectRejectionEndsTheHandle(t *testing.T) {
 		t.Fatal("the handle sent the rejected subject again")
 	}
 }
+
+// TestClientCloseIsBoundedWhileAHandleDelivers: a handle's apply request in
+// flight does not hold the client's Close past its context; the handle's
+// owed application is counted at close.
+func TestClientCloseIsBoundedWhileAHandleDelivers(t *testing.T) {
+	rig := newExpHopRig(t, func(cfg *Config) { cfg.HTTPTimeout = 5 * time.Second })
+	s := newSubjectOrFail(t, rig.client, expSubjectA, "player-a")
+	subjectFetchOrFail(t, s)
+	s.Apply(expTestScopeKey)
+	release := make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(unblock) // a failure must not leave the server's handler held
+	inFlight := make(chan struct{}, 1)
+	rig.script.apply.mu.Lock()
+	rig.script.apply.onRequest = func() {
+		inFlight <- struct{}{}
+		<-release
+	}
+	rig.script.apply.mu.Unlock()
+	go func() { _ = s.Close(context.Background()) }()
+	select {
+	case <-inFlight:
+	case <-time.After(3 * time.Second):
+		t.Fatal("control: the handle's Close never sent its application")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_ = rig.client.Close(ctx)
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("the client's Close took %v with a 100ms context while a handle delivered", elapsed)
+	}
+	if got := rig.drops(expDropUnsealedAtClose); got != 1 {
+		t.Fatalf("ExperimentExposureDrops[unsealed_at_close] = %d, want the handle's application", got)
+	}
+}

@@ -760,7 +760,7 @@ func (c *Client) finishClose(ctx context.Context) error {
 	if c.expLaneCancel != nil {
 		c.expLaneCancel()
 	}
-	c.closeExperimentPreFlush()
+	c.closeExperimentPreFlush(ctx)
 	err := c.Flush(ctx)
 	// The flush freed queue room: owed exposure facts drain in a
 	// sweep-then-flush LOOP until nothing is owed or a pass makes no

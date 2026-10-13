@@ -12,6 +12,10 @@
   `TrackOutcome` and declares an age with `FetchWithAgeBand`; a non-adult
   declaration and an age refusal withdraw what the handle owes for the
   experiment, its facts not yet sent included, as on the client.
+- `Close` stays within its context while a subject handle is delivering: a
+  handle's delivery pass waits for its turn only as long as its caller's
+  context allows, and `Close` passes its context to every handle sweep. What a
+  handle still owes is counted at close, as before.
 - Every request now carries `X-ShardPilot-SDK: go/<version>` (event batches,
   consent, remote config, the experiment routes and crash ingest). The version
   is a constant in code, which a test holds to the README's latest-tag claim.
