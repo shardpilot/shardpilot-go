@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -251,5 +252,33 @@ func TestAnEventLeftUnencodedAtIntakeIsMeasuredAtPublish(t *testing.T) {
 	}
 	if dropped := client.Snapshot().Dropped; dropped != 1 {
 		t.Fatalf("Dropped = %d, want the oversize event", dropped)
+	}
+}
+
+// flipMarshaler fails its first MarshalJSON and returns 3,000 bytes after:
+// intake leaves the event unencoded, and its publish build measures it.
+type flipMarshaler struct{ calls *atomic.Int32 }
+
+func (m flipMarshaler) MarshalJSON() ([]byte, error) {
+	if m.calls.Add(1) == 1 {
+		return nil, errors.New("not yet")
+	}
+	return json.Marshal(strings.Repeat("a", 3000))
+}
+
+// TestTrackCountsAnEventOversizeAtPublishAsDropped: Track refuses such an
+// event as intake would, counted once in Dropped and never as a failed
+// batch, and sends nothing.
+func TestTrackCountsAnEventOversizeAtPublishAsDropped(t *testing.T) {
+	client, scene := newSizeSceneClient(t)
+	event := Event{ID: "0199a0b0-0000-7000-8000-000000000012", Name: "size_scene", Props: map[string]any{"value": flipMarshaler{calls: new(atomic.Int32)}}}
+	if err := client.Track(context.Background(), event); !errors.Is(err, ErrEventTooLarge) {
+		t.Fatalf("Track = %v, want ErrEventTooLarge", err)
+	}
+	if got := len(scene.received()); got != 0 {
+		t.Fatalf("sent %d element(s), want none", got)
+	}
+	if stats := client.Snapshot(); stats.Dropped != 1 || stats.FailedBatches != 0 {
+		t.Fatalf("Dropped = %d, FailedBatches = %d; want 1 and 0", stats.Dropped, stats.FailedBatches)
 	}
 }

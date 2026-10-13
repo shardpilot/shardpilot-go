@@ -1827,6 +1827,11 @@ func (c *Client) publishBatchWithContext(ctx context.Context, events []Event) er
 	}
 	request, err := c.buildBatch(events)
 	if err != nil {
+		if errors.Is(err, ErrEventTooLarge) {
+			// Track's one event measured over the cap at build: refused
+			// as at intake, counted once as dropped, never a failed batch.
+			return c.refuseOversizeEvent()
+		}
 		c.recordBuildFailure(err)
 		return err
 	}
