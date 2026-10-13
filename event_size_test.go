@@ -306,3 +306,28 @@ func TestTrackReportsAMarshalerReturningTheSizeSentinelAsAnEncodeFailure(t *test
 		t.Fatalf("Dropped = %d, FailedBatches = %d; want 0 and 1", stats.Dropped, stats.FailedBatches)
 	}
 }
+
+// TestDropTimeCaptureSpoolsTheSiblingsOfAnOversizeFact: a dropped
+// assignment's capture leaves out a sealed fact over the cap, which has no
+// capturable form, and still spools its siblings before the durable delete.
+func TestDropTimeCaptureSpoolsTheSiblingsOfAnOversizeFact(t *testing.T) {
+	server := newExperimentServer(t, &expScript{}, &expWireCapture{})
+	defer server.Close()
+	client := newExperimentClient(t, server.URL, func(cfg *Config) { cfg.SpoolDir = t.TempDir() })
+	defer client.Close(context.Background())
+	client.SetConsent(true)
+	sealed := func(id, pad string) *expOwedExposure {
+		fact := `{"event_id":"` + expStubFactID(id) + `","event_name":"experiment_exposure","event_ts":"2026-09-27T00:00:00Z",` +
+			`"workspace_key":"workspace-test","app_key":"app-test","environment_key":"develop","props":{"experiment_key":"exp-cap",` +
+			`"experiment_version":1,"variant_key":"treatment` + pad + `","assignment_unit":"client_id","attestation":"client_attested"}}`
+		return &expOwedExposure{entry: &expEntry{VariantKey: "treatment", Version: 1}, session: client.exp.sessionMarker,
+			sealed: &expSealedFact{fact: json.RawMessage(fact), seal: expStubSeal}}
+	}
+	owed := []*expOwedExposure{sealed(strings.Repeat("c", 32), strings.Repeat("x", 3000)), sealed(strings.Repeat("d", 32), "")}
+	if ok, _ := client.captureOwedExposuresForDrop("exp-cap", owed); !ok {
+		t.Fatalf("the capture must be durable")
+	}
+	if got := spooledExperimentFacts(client, "exp-cap"); got != 1 {
+		t.Fatalf("%d fact(s) spooled; want only the sibling of the oversize fact", got)
+	}
+}
