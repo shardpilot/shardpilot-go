@@ -2,6 +2,7 @@ package shardpilot
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -414,6 +415,26 @@ func TestConsentNoticeForcedMinorAndTerminal(t *testing.T) {
 			got, _ = observeNotice(t, nil, ConsentDecisionGranted, true, [3]string{})
 			checkSetterResult(t, got, "not_initialized", "")
 		})
+	}
+}
+
+// TestConsentNoticeFixtureIsThePlatformsGolden: the fixture is the
+// platform's own consent golden, byte for byte. The platform runs the same
+// request and response bytes through its consent handler in its default kind
+// mode, so a change to either file needs the same change on the platform
+// side, with both hashes.
+func TestConsentNoticeFixtureIsThePlatformsGolden(t *testing.T) {
+	for name, want := range map[string]string{
+		"request.json":  "daf0acb703982cdf1a772b310e37b08b01f9fd40bf6e0f81dba93d3149493066",
+		"response.json": "8add729673ccd76ee0baee7352dccff01efebc6387439a56c03c523ed34f2e0b",
+	} {
+		body, err := os.ReadFile(filepath.Join("testdata", "consent-notice", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := fmt.Sprintf("%x", sha256.Sum256(body)); got != want {
+			t.Fatalf("%s SHA-256 = %s, want the platform golden's %s: change both sides together", name, got, want)
+		}
 	}
 }
 
