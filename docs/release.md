@@ -50,8 +50,9 @@ Never delete or move a published tag — Go module proxies cache tagged
 versions forever. Instead, add a `retract` directive to `go.mod` and release
 a corrected version. For the current release, the precedent is
 `retract [v0.1.0, v0.1.2] // superseded pre-alpha line`, retiring the stale
-`v0.1.x` line. Consumers move to the current announced `v0.8.x` pin. Retain
-that range in later releases rather than recommending another retired version.
+`v0.1.x` line. Consumers move to the current announced pin in the
+[README Installation section](../README.md#installation). Retain that range
+in later releases rather than recommending another retired version.
 The retract directive itself
 only takes effect once it is part of a released version, so ship it with the
 corrective release.
