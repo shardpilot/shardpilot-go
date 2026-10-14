@@ -13,21 +13,21 @@ import (
 	"time"
 )
 
-// ── regressions, part 5 ─────────────────────────────────────────────────────
+// ── Experiment withdrawal and spool safety ─────────────────────────────────────────────────────
 
-func round5FactRaw(id string) json.RawMessage {
+func spooledExperimentFactRaw(id string) json.RawMessage {
 	return json.RawMessage(fmt.Sprintf(
 		`{"event_id":%q,"event_ts":%q,"event_name":"experiment_exposure","props":{"assignment_key":"sfk1_%s"}}`,
 		id, time.Now().UTC().Format(time.RFC3339Nano), strings.Repeat("a", 64)))
 }
 
-func round5HostRaw(id string) json.RawMessage {
+func spooledHostEventRaw(id string) json.RawMessage {
 	return json.RawMessage(fmt.Sprintf(
 		`{"event_id":%q,"event_ts":%q,"event_name":"host_event"}`,
 		id, time.Now().UTC().Format(time.RFC3339Nano)))
 }
 
-// Finding 1: a terminal withdrawal whose record rewrite fails must
+// a terminal withdrawal whose record rewrite fails must
 // still be durable — the withdrawn ids persist in the marker BEFORE the
 // mirror forgets them, and the next process honors the marker at load
 // instead of resending the withdrawn facts.
@@ -37,8 +37,8 @@ func TestWithdrawnSpoolRemovalSurvivesFailedSave(t *testing.T) {
 	s := newDiskSpool(cfg)
 	now := time.Now()
 	entries := []spoolEntry{
-		{id: "fact-1", delivery: newEventDelivery(now), raw: round5FactRaw("fact-1"), internalFact: true},
-		{id: "host-1", delivery: newEventDelivery(now), raw: round5HostRaw("host-1")},
+		{id: "fact-1", delivery: newEventDelivery(now), raw: spooledExperimentFactRaw("fact-1"), internalFact: true},
+		{id: "host-1", delivery: newEventDelivery(now), raw: spooledHostEventRaw("host-1")},
 	}
 	refused, added, _, _, persistFailed := s.append(entries, 0, false, now, func() bool { return true })
 	if refused || len(added) != 2 || persistFailed {
@@ -94,7 +94,7 @@ func TestWithdrawnSpoolRemovalSurvivesFailedSave(t *testing.T) {
 	}
 }
 
-// Finding 2: an outcome serializes with the sentinel's withdrawal.
+// an outcome serializes with the sentinel's withdrawal.
 // The host call no longer enqueues — it arms an owed record under the plane
 // lock, the lock the withdrawal holds — so an outcome armed before the
 // withdrawal is withdrawn with the owed list (counted), and one attempted
@@ -131,7 +131,7 @@ func TestOutcomeFactsSerializeWithSentinelPurge(t *testing.T) {
 	}
 }
 
-// Finding 3: a batch in transport when the sentinel lands can fail
+// a batch in transport when the sentinel lands can fail
 // retriably AFTER the purge — the respool re-filters its withdrawn facts
 // instead of writing them back into the pipeline the purge just cleaned.
 func TestPostPurgeRespoolFiltersWithdrawnFacts(t *testing.T) {
@@ -181,7 +181,7 @@ func TestWithdrawnChunkRequeueIsSkipped(t *testing.T) {
 	cfg := Config{SpoolDir: dir, SpoolMaxEvents: 100, SpoolMaxBytes: 1 << 20}
 	s := newDiskSpool(cfg)
 	now := time.Now()
-	entry := spoolEntry{id: "fact-9", delivery: newEventDelivery(now), raw: round5FactRaw("fact-9"), internalFact: true}
+	entry := spoolEntry{id: "fact-9", delivery: newEventDelivery(now), raw: spooledExperimentFactRaw("fact-9"), internalFact: true}
 	if refused, added, _, _, _ := s.append([]spoolEntry{entry}, 0, false, now, func() bool { return true }); refused || len(added) != 1 {
 		t.Fatalf("test setup: append failed")
 	}
@@ -259,7 +259,7 @@ func TestSentinelBatchFilterBackoffAndRetainedBytes(t *testing.T) {
 	}
 }
 
-// Finding 5: the sentinel resets the exposure dedupe slate — a purged
+// the sentinel resets the exposure dedupe slate — a purged
 // queued-undelivered automatic exposure must not suppress the re-emission
 // when a later authorized fetch reinstalls the assignment in the same
 // session.
@@ -304,7 +304,7 @@ func TestSentinelClearsExposureDedupe(t *testing.T) {
 	}
 }
 
-// Finding 7: `Retry-After: 0` is the latest fence-gated server word on
+// `Retry-After: 0` is the latest fence-gated server word on
 // pacing — it CLEARS a previously armed deferral instead of leaving the
 // lane parked to the stale deadline.
 func TestZeroHintClearsStaleDeferral(t *testing.T) {

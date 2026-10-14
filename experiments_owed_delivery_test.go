@@ -1,6 +1,6 @@
 package shardpilot
 
-// Regressions, part 9:
+// Owed delivery, capture and retry invariants:
 //
 //  1. The drop-time capture path refuses anonymous-only experiment
 //     facts under a user-scoped floor — the mirror of intake's actor gate;
@@ -35,7 +35,7 @@ import (
 	"time"
 )
 
-// ── finding 1: capture refuses anonymous-only facts under user floor ────────
+// ── capture refuses anonymous-only facts under user floor ────────
 
 func TestCaptureRefusesAnonymousOnlyFactUnderUserScopedFloor(t *testing.T) {
 	script := &expScript{}
@@ -82,13 +82,13 @@ func TestCaptureRefusesAnonymousOnlyFactUnderUserScopedFloor(t *testing.T) {
 	}
 }
 
-// ── finding 2: marker spend failure is a failed save ────────────────────────
+// ── marker spend failure is a failed save ────────────────────────
 
 func TestFailedWithdrawalMarkerSpendKeepsSaveDirty(t *testing.T) {
 	dir := t.TempDir()
 	s := newDiskSpool(Config{SpoolDir: dir, SpoolMaxEvents: 100, SpoolMaxBytes: 1 << 20})
 	now := time.Now()
-	entry := spoolEntry{id: "fact-marker", delivery: newEventDelivery(now), raw: round5FactRaw("fact-marker"), internalFact: true}
+	entry := spoolEntry{id: "fact-marker", delivery: newEventDelivery(now), raw: spooledExperimentFactRaw("fact-marker"), internalFact: true}
 	if refused, added, _, _, _ := s.append([]spoolEntry{entry}, 0, false, now, func() bool { return true }); refused || len(added) != 1 {
 		t.Fatalf("test setup: append failed")
 	}
@@ -117,7 +117,7 @@ func TestFailedWithdrawalMarkerSpendKeepsSaveDirty(t *testing.T) {
 	}
 }
 
-// ── finding 3: close remnant settles the consent epoch ──────────────────────
+// ── close remnant settles the consent epoch ──────────────────────
 
 func TestCloseRemnantDropsPreDenialEvents(t *testing.T) {
 	capture := &expWireCapture{}
@@ -158,14 +158,14 @@ func TestCloseRemnantDropsPreDenialEvents(t *testing.T) {
 	}
 }
 
-// ── finding 4: the sweep spares current-epoch entries ───────────────────────
+// ── the sweep spares current-epoch entries ───────────────────────
 
 func TestSentinelSweepSparesEpochStampedCapture(t *testing.T) {
 	dir := t.TempDir()
 	s := newDiskSpool(Config{SpoolDir: dir, SpoolMaxEvents: 100, SpoolMaxBytes: 1 << 20})
 	now := time.Now()
-	stale := spoolEntry{id: "fact-stale", delivery: newEventDelivery(now), raw: round5FactRaw("fact-stale"), expFactEpoch: 1, internalFact: true}
-	fresh := spoolEntry{id: "fact-fresh", delivery: newEventDelivery(now), raw: round5FactRaw("fact-fresh"), expFactEpoch: 2, internalFact: true}
+	stale := spoolEntry{id: "fact-stale", delivery: newEventDelivery(now), raw: spooledExperimentFactRaw("fact-stale"), expFactEpoch: 1, internalFact: true}
+	fresh := spoolEntry{id: "fact-fresh", delivery: newEventDelivery(now), raw: spooledExperimentFactRaw("fact-fresh"), expFactEpoch: 2, internalFact: true}
 	if refused, added, _, _, _ := s.append([]spoolEntry{stale, fresh}, 0, false, now, func() bool { return true }); refused || len(added) != 2 {
 		t.Fatalf("test setup: append failed")
 	}
@@ -185,7 +185,7 @@ func TestSentinelSweepSparesEpochStampedCapture(t *testing.T) {
 	}
 }
 
-// ── finding 5: retained prefix survives the withdrawn filter ────────────────
+// ── retained prefix survives the withdrawn filter ────────────────
 
 func TestWithdrawnFilterKeepsRetainedPrefixWithAppendedTail(t *testing.T) {
 	capture := &expWireCapture{}
@@ -234,7 +234,7 @@ func TestWithdrawnFilterKeepsRetainedPrefixWithAppendedTail(t *testing.T) {
 	}
 }
 
-// ── finding 6: present-zero pulls the cadence down ──────────────────────────
+// ── present-zero pulls the cadence down ──────────────────────────
 
 func TestZeroRetryAfterMidCycleRevalidatesImmediately(t *testing.T) {
 	script := &expScript{}
@@ -264,7 +264,7 @@ func TestZeroRetryAfterMidCycleRevalidatesImmediately(t *testing.T) {
 	}
 }
 
-// ── finding 7: refused sessions mint no subject state (structural pin) ──────
+// ── refused sessions mint no subject state (structural pin) ──────
 
 func TestDeniedFetchMintsNoSubjectState(t *testing.T) {
 	capture := &expWireCapture{}
@@ -289,7 +289,7 @@ func TestDeniedFetchMintsNoSubjectState(t *testing.T) {
 	}
 }
 
-// ── finding 8: reinstall preserves the unlanded capture debt ────────────────
+// ── reinstall preserves the unlanded capture debt ────────────────
 
 func TestReinstallPreservesUnlandedCaptureDebt(t *testing.T) {
 	script := &expScript{}
@@ -393,7 +393,7 @@ func TestReinstallPreservesUnlandedCaptureDebt(t *testing.T) {
 	}
 }
 
-// ── finding 9: withdrawals larger than the settled memory ───────────────────
+// ── withdrawals larger than the settled memory ───────────────────
 
 func TestWithdrawalMergeExcludesBeyondSettledMemory(t *testing.T) {
 	dir := t.TempDir()
@@ -403,7 +403,7 @@ func TestWithdrawalMergeExcludesBeyondSettledMemory(t *testing.T) {
 	entries := make([]spoolEntry, 0, total)
 	for i := 0; i < total; i++ {
 		id := fmt.Sprintf("fact-%05d", i)
-		entries = append(entries, spoolEntry{id: id, delivery: newEventDelivery(now), raw: round5FactRaw(id), internalFact: true})
+		entries = append(entries, spoolEntry{id: id, delivery: newEventDelivery(now), raw: spooledExperimentFactRaw(id), internalFact: true})
 	}
 	if refused, added, _, _, _ := s.append(entries, 0, false, now, func() bool { return true }); refused || len(added) != total {
 		t.Fatalf("test setup: append failed (added %d)", len(added))

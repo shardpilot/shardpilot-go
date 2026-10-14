@@ -1,8 +1,6 @@
 package shardpilot
 
-// Regression pins, part 10. Each test fails on the pre-fix tree
-// for its finding's exact reason (verified mechanically via targeted
-// temporary reverts of the fix, with the test seams retained).
+// Experiment settlement and spooling preserve consent and epoch fences.
 
 import (
 	"context"
@@ -16,7 +14,7 @@ import (
 	"time"
 )
 
-// ── finding 1 (client.go): the bulk drain re-settles the epoch per event ────
+// ── (client.go): the bulk drain re-settles the epoch per event ────
 
 func TestFlushDrainResettlesConsentEpochMidDrain(t *testing.T) {
 	capture := &expWireCapture{}
@@ -65,7 +63,7 @@ func TestFlushDrainResettlesConsentEpochMidDrain(t *testing.T) {
 	}
 }
 
-// ── finding 2 (experiments.go): the mint commit re-checks consent ───────────
+// ── (experiments.go): the mint commit re-checks consent ───────────
 
 func TestRacingDenialAbortsSubjectMintCommit(t *testing.T) {
 	for _, flavor := range []struct {
@@ -130,7 +128,7 @@ func TestRacingDenialAbortsSubjectMintCommit(t *testing.T) {
 	}
 }
 
-// ── finding 5 (experiments.go): not-assigned versions share positivity ──────
+// ── (experiments.go): not-assigned versions share positivity ──────
 
 func TestNonPositiveNotAssignedVersionIsMalformed(t *testing.T) {
 	scope := expTestRequestScope()
@@ -174,7 +172,7 @@ func TestNonPositiveNotAssignedVersionIsMalformed(t *testing.T) {
 	}
 }
 
-// ── finding 6 (experiments.go): the install commit re-checks consent ────────
+// ── (experiments.go): the install commit re-checks consent ────────
 
 func TestRacingDenialDiscardsInstallKeepsRetainedCache(t *testing.T) {
 	script := &expScript{}
@@ -234,7 +232,7 @@ func TestRacingDenialDiscardsInstallKeepsRetainedCache(t *testing.T) {
 	}
 }
 
-// ── finding 6, the partition's other half (fleet contract, as in Defold):
+// ── the partition's other half (fleet contract, as in Defold):
 // destructive verdicts from a request dispatched under grant still apply ────
 
 func TestRacingDenialStillAppliesServerWithdrawal(t *testing.T) {
@@ -331,14 +329,14 @@ func TestStaleEpochServerWithdrawalStillLandsDurably(t *testing.T) {
 	}
 }
 
-// ── finding 3 (spool.go): the marker spend requires the durable unlink ──────
+// ── (spool.go): the marker spend requires the durable unlink ──────
 
 func TestWithdrawnMarkerSpendRequiresDurableUnlink(t *testing.T) {
 	t.Run("spend_sync_failure_holds_the_debt", func(t *testing.T) {
 		dir := t.TempDir()
 		s := newDiskSpool(Config{SpoolDir: dir, SpoolMaxEvents: 100, SpoolMaxBytes: 1 << 20})
 		now := time.Now()
-		entry := spoolEntry{id: "fact-durable-unlink", delivery: newEventDelivery(now), raw: round5FactRaw("fact-durable-unlink"), internalFact: true}
+		entry := spoolEntry{id: "fact-durable-unlink", delivery: newEventDelivery(now), raw: spooledExperimentFactRaw("fact-durable-unlink"), internalFact: true}
 		if refused, added, _, _, _ := s.append([]spoolEntry{entry}, 0, false, now, func() bool { return true }); refused || len(added) != 1 {
 			t.Fatalf("test setup: append failed")
 		}
@@ -385,7 +383,7 @@ func TestWithdrawnMarkerSpendRequiresDurableUnlink(t *testing.T) {
 		dir := t.TempDir()
 		s := newDiskSpool(Config{SpoolDir: dir, SpoolMaxEvents: 100, SpoolMaxBytes: 1 << 20})
 		now := time.Now()
-		entry := spoolEntry{id: "fact-order", delivery: newEventDelivery(now), raw: round5FactRaw("fact-order"), internalFact: true}
+		entry := spoolEntry{id: "fact-order", delivery: newEventDelivery(now), raw: spooledExperimentFactRaw("fact-order"), internalFact: true}
 		if refused, added, _, _, _ := s.append([]spoolEntry{entry}, 0, false, now, func() bool { return true }); refused || len(added) != 1 {
 			t.Fatalf("test setup: append failed")
 		}
@@ -405,7 +403,7 @@ func TestWithdrawnMarkerSpendRequiresDurableUnlink(t *testing.T) {
 	})
 }
 
-// ── finding 4 (spool.go): the marker read bound is capacity-derived ─────────
+// ── (spool.go): the marker read bound is capacity-derived ─────────
 
 func TestWithdrawnMarkerReadBoundScalesWithConfig(t *testing.T) {
 	t.Run("large_configured_marker_honored", func(t *testing.T) {
@@ -414,8 +412,8 @@ func TestWithdrawnMarkerReadBoundScalesWithConfig(t *testing.T) {
 		s := newDiskSpool(cfg)
 		now := time.Now()
 		entries := []spoolEntry{
-			{id: "fact-large-0", delivery: newEventDelivery(now), raw: round5FactRaw("fact-large-0"), internalFact: true},
-			{id: "fact-large-1", delivery: newEventDelivery(now), raw: round5FactRaw("fact-large-1"), internalFact: true},
+			{id: "fact-large-0", delivery: newEventDelivery(now), raw: spooledExperimentFactRaw("fact-large-0"), internalFact: true},
+			{id: "fact-large-1", delivery: newEventDelivery(now), raw: spooledExperimentFactRaw("fact-large-1"), internalFact: true},
 		}
 		if refused, added, _, _, _ := s.append(entries, 0, false, now, func() bool { return true }); refused || len(added) != 2 {
 			t.Fatalf("test setup: append failed")
@@ -465,7 +463,7 @@ func TestWithdrawnMarkerReadBoundScalesWithConfig(t *testing.T) {
 		cfg := Config{SpoolDir: dir, SpoolMaxEvents: 100, SpoolMaxBytes: 1 << 20, ExperimentsEnabled: true}
 		s := newDiskSpool(cfg)
 		now := time.Now()
-		entry := spoolEntry{id: "fact-damaged", delivery: newEventDelivery(now), raw: round5FactRaw("fact-damaged"), internalFact: true}
+		entry := spoolEntry{id: "fact-damaged", delivery: newEventDelivery(now), raw: spooledExperimentFactRaw("fact-damaged"), internalFact: true}
 		if refused, added, _, _, _ := s.append([]spoolEntry{entry}, 0, false, now, func() bool { return true }); refused || len(added) != 1 {
 			t.Fatalf("test setup: append failed")
 		}
@@ -492,14 +490,14 @@ func TestWithdrawnMarkerReadBoundScalesWithConfig(t *testing.T) {
 		if _, err := os.Stat(spoolWithdrawnPath(dir)); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("the settle must durably remove the damaged marker, stat err=%v", err)
 		}
-		fresh := spoolEntry{id: "fact-fresh", delivery: newEventDelivery(now), raw: round5FactRaw("fact-fresh"), internalFact: true}
+		fresh := spoolEntry{id: "fact-fresh", delivery: newEventDelivery(now), raw: spooledExperimentFactRaw("fact-fresh"), internalFact: true}
 		if refused, added, _, _, _ := restarted.append([]spoolEntry{fresh}, 0, false, now, func() bool { return true }); refused || len(added) != 1 {
 			t.Fatalf("the reopened spool must admit fresh facts (refused=%v added=%d)", refused, len(added))
 		}
 	})
 }
 
-// ── finding 7 (spool.go): a failed marker write keeps the full set ──────────
+// ── (spool.go): a failed marker write keeps the full set ──────────
 
 func TestFailedMarkerWriteStillBacksMergeWithFullSet(t *testing.T) {
 	dir := t.TempDir()
@@ -509,7 +507,7 @@ func TestFailedMarkerWriteStillBacksMergeWithFullSet(t *testing.T) {
 	entries := make([]spoolEntry, 0, total)
 	for i := 0; i < total; i++ {
 		id := fmt.Sprintf("fact-%05d", i)
-		entries = append(entries, spoolEntry{id: id, delivery: newEventDelivery(now), raw: round5FactRaw(id), internalFact: true})
+		entries = append(entries, spoolEntry{id: id, delivery: newEventDelivery(now), raw: spooledExperimentFactRaw(id), internalFact: true})
 	}
 	if refused, added, _, _, _ := s.append(entries, 0, false, now, func() bool { return true }); refused || len(added) != total {
 		t.Fatalf("test setup: append failed (added %d)", len(added))

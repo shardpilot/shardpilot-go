@@ -6330,9 +6330,8 @@ func TestConsentUnwitnessedMarkIsHonoredEverywhereAGrantIsTrusted(t *testing.T) 
 	})
 }
 
-// TestUnprovableGrantIsHeldFromTheWireAndRecoverable covers four review
-// findings, which are one question asked four ways: what else still trusts a
-// grant, and what else can strip the mark that says it is unprovable.
+// TestUnprovableGrantIsHeldFromTheWireAndRecoverable keeps an unprovable
+// grant off the wire and preserves its marker until the host can recover.
 func TestUnprovableGrantIsHeldFromTheWireAndRecoverable(t *testing.T) {
 	// (1) Withholding a grant LOCALLY while still POSTing it leaves the
 	// server granted for an actor whose rejected entry may be the very
@@ -6566,9 +6565,8 @@ func TestConsentRecordUnusableClassesAreAllCovered(t *testing.T) {
 	}
 }
 
-// TestBlockedGrantIsDurableWhateverTheRecordSays covers a review that found
-// the same asymmetry for the fifth and sixth time: a grant took effect through
-// a door the previous fix had not widened.
+// TestBlockedGrantIsDurableWhateverTheRecordSays keeps unproven grants
+// durable and off the wire across both outbox and record states.
 func TestBlockedGrantIsDurableWhateverTheRecordSays(t *testing.T) {
 	// (A) The dispatch hold consulted only the OUTBOX read. With the outbox
 	// parsing cleanly — reachable the moment maintenance or a sibling
@@ -6895,12 +6893,10 @@ func TestForeignRecordVetoesGrantsRegardlessOfWallClock(t *testing.T) {
 		t.Fatalf("seed outbox: %v", err)
 	}
 
-	// WITHHELD, deliberately. An earlier revision let this through on the
-	// reasoning that the receipt is strictly newer than the foreign record,
-	// but both stamps come from the device clock and a backward jump makes a
-	// PRE-switch grant compare newer. A wrong answer here ADMITS, so the
-	// comparison is not affordable; the decision is deferred until the host
-	// records another one.
+	// WITHHELD, deliberately. Both receipt and foreign-record stamps come
+	// from the device clock, so a backward jump can make a pre-switch grant
+	// appear newer. Comparing them can admit an unprovable grant; the decision
+	// is deferred until the host records another one.
 	client := newFloorTestClient(t, server.URL, dir, nil)
 	defer func() { _ = client.Close(context.Background()) }()
 	if got := client.ConsentState(); got == ConsentGranted {

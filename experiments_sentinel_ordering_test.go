@@ -1,8 +1,6 @@
 package shardpilot
 
-// Regression pins, part 17. Each test fails on the pre-fix tree
-// for its finding's exact reason (verified mechanically via targeted
-// temporary reverts of the fix, with the test seams retained).
+// Sentinel processing orders withdrawal before capture and delivery.
 
 import (
 	"context"
@@ -167,8 +165,8 @@ func TestSentinelSparesHostLookalikeEvents(t *testing.T) {
 		// lookalike entry (no authorship flag) passes, the stale-stamped SDK
 		// fact is withheld.
 		chunk := []spoolEntry{
-			{id: "chunk-host", delivery: newEventDelivery(time.Now()), raw: round5FactRaw("chunk-host")},
-			{id: "chunk-fact", delivery: newEventDelivery(time.Now()), raw: round5FactRaw("chunk-fact"), internalFact: true},
+			{id: "chunk-host", delivery: newEventDelivery(time.Now()), raw: spooledExperimentFactRaw("chunk-host")},
+			{id: "chunk-fact", delivery: newEventDelivery(time.Now()), raw: spooledExperimentFactRaw("chunk-fact"), internalFact: true},
 		}
 		kept := client.dropWithdrawnSpoolChunkMembers(chunk)
 		keptIDs := make([]string, 0, len(kept))
