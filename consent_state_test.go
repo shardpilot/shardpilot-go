@@ -49,7 +49,7 @@ func TestConsentGetterPublicVocabulary(t *testing.T) {
 				probe := new(getterNoNetwork)
 				cfg := shardpilot.Config{
 					IngestURL: "https://sdk.synthetic.invalid", ServiceToken: "test-token",
-					WorkspaceID: "workspace-test", AppID: "app-test", EnvironmentID: "develop",
+					WorkspaceKey: "workspace-test", AppKey: "app-test", EnvironmentKey: "develop",
 					Source: shardpilot.SourceBackend, HTTPClient: &http.Client{Transport: probe},
 					FlushInterval: time.Hour,
 				}

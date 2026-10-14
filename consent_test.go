@@ -61,18 +61,18 @@ func newConsentTestServer(t *testing.T, eventCount *atomic.Int64, consents chan 
 func newConsentTestClient(t *testing.T, ingestURL string, userID, anonymousID string) *Client {
 	t.Helper()
 	client, err := NewClient(Config{
-		IngestURL:     ingestURL,
-		ServiceToken:  "test-token",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		UserID:        userID,
-		AnonymousID:   anonymousID,
-		BatchSize:     10,
-		BufferSize:    16,
-		FlushInterval: time.Hour,
-		HTTPTimeout:   time.Second,
+		IngestURL:      ingestURL,
+		ServiceToken:   "test-token",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		UserID:         userID,
+		AnonymousID:    anonymousID,
+		BatchSize:      10,
+		BufferSize:     16,
+		FlushInterval:  time.Hour,
+		HTTPTimeout:    time.Second,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -256,16 +256,16 @@ func TestSetConsentPublishFailureIsQuietAndKeepsLocalState(t *testing.T) {
 
 	logs := make(chan string, 8)
 	client, err := NewClient(Config{
-		IngestURL:     server.URL,
-		ServiceToken:  "test-token",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		AnonymousID:   "anon-actor",
-		FlushInterval: time.Hour,
-		HTTPTimeout:   200 * time.Millisecond,
-		Logger:        chanLogger{logs: logs},
+		IngestURL:      server.URL,
+		ServiceToken:   "test-token",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		AnonymousID:    "anon-actor",
+		FlushInterval:  time.Hour,
+		HTTPTimeout:    200 * time.Millisecond,
+		Logger:         chanLogger{logs: logs},
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -451,17 +451,17 @@ func TestConsentDenialCancelsInFlightPublish(t *testing.T) {
 	defer server.Close()
 
 	client, err := NewClient(Config{
-		IngestURL:     server.URL,
-		ServiceToken:  "test-token",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		AnonymousID:   "anon-actor",
-		BatchSize:     batchSize,
-		BufferSize:    8,
-		FlushInterval: time.Hour,
-		HTTPTimeout:   10 * time.Second,
+		IngestURL:      server.URL,
+		ServiceToken:   "test-token",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		AnonymousID:    "anon-actor",
+		BatchSize:      batchSize,
+		BufferSize:     8,
+		FlushInterval:  time.Hour,
+		HTTPTimeout:    10 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -547,12 +547,12 @@ func (t *blockingCancelTransport) PublishConsent(ctx context.Context, request co
 func newBlockingPublishClient(transport *blockingCancelTransport) *Client {
 	client := &Client{
 		cfg: Config{
-			WorkspaceID:   "workspace-test",
-			AppID:         "app-test",
-			EnvironmentID: "develop",
-			Source:        SourceBackend,
-			BatchSize:     1,
-			HTTPTimeout:   10 * time.Second,
+			WorkspaceKey:   "workspace-test",
+			AppKey:         "app-test",
+			EnvironmentKey: "develop",
+			Source:         SourceBackend,
+			BatchSize:      1,
+			HTTPTimeout:    10 * time.Second,
 		},
 		clock:     realClock{},
 		queue:     newBoundedQueue(8),
@@ -656,16 +656,16 @@ func TestWorkerMidFlightDenialQuickRegrantCountsDroppedNotFailed(t *testing.T) {
 	const batchSize = 3
 
 	client, err := NewClient(Config{
-		IngestURL:     "http://127.0.0.1:9", // never dialed: the transport is replaced below
-		ServiceToken:  "test-token",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		BatchSize:     batchSize,
-		BufferSize:    8,
-		FlushInterval: time.Hour,
-		HTTPTimeout:   10 * time.Second,
+		IngestURL:      "http://127.0.0.1:9", // never dialed: the transport is replaced below
+		ServiceToken:   "test-token",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		BatchSize:      batchSize,
+		BufferSize:     8,
+		FlushInterval:  time.Hour,
+		HTTPTimeout:    10 * time.Second,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)

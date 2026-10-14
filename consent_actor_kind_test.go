@@ -71,17 +71,17 @@ func newConsentKindServer(t *testing.T) (*httptest.Server, *consentKindCapture) 
 
 func consentKindConfig(serverURL string, source Source, userID, anonymousID string, floor bool, spoolDir string) Config {
 	cfg := Config{
-		IngestURL:     serverURL,
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        source,
-		UserID:        userID,
-		AnonymousID:   anonymousID,
-		BatchSize:     4,
-		BufferSize:    16,
-		FlushInterval: time.Hour,
-		HTTPTimeout:   time.Second,
+		IngestURL:      serverURL,
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         source,
+		UserID:         userID,
+		AnonymousID:    anonymousID,
+		BatchSize:      4,
+		BufferSize:     16,
+		FlushInterval:  time.Hour,
+		HTTPTimeout:    time.Second,
 	}
 	if source == SourceClient {
 		cfg.PublishableKey = "sp_pub_fixture"
@@ -283,7 +283,7 @@ func TestConsentReceiptKindIsRequiredAtLoad(t *testing.T) {
 // client's floor only when it was minted for the same actor AND kind.
 func TestConsentReceiptScopeIncludesKind(t *testing.T) {
 	client := &Client{cfg: Config{
-		WorkspaceID: "w", AppID: "a", EnvironmentID: "e",
+		WorkspaceKey: "w", AppKey: "a", EnvironmentKey: "e",
 		Source: SourceBackend, UserID: kindSceneUser, AnonymousID: kindSceneAnon,
 	}}
 	for kind, want := range map[string]bool{"user_verified": true, "anon": false} {
@@ -303,7 +303,7 @@ func TestConsentReceiptScopeIncludesKind(t *testing.T) {
 // client source (the anonymous actor) and a backend source (the verified
 // user) are different decisions; server and backend select the same actor.
 func TestConsentRecordDigestFollowsTheSelectedActor(t *testing.T) {
-	cfg := Config{WorkspaceID: "w", AppID: "a", EnvironmentID: "e", UserID: kindSceneUser, AnonymousID: kindSceneAnon}
+	cfg := Config{WorkspaceKey: "w", AppKey: "a", EnvironmentKey: "e", UserID: kindSceneUser, AnonymousID: kindSceneAnon}
 	digest := func(source Source) string {
 		scoped := cfg
 		scoped.Source = source

@@ -10,9 +10,9 @@ Set these environment variables through your normal secret-injection mechanism:
 |---|---|
 | `SHARDPILOT_INGEST_URL` | Analytics ingest origin, with no path/query/fragment. |
 | `SHARDPILOT_PUBLISHABLE_KEY` | In-memory analytics ingest credential for the test scope. |
-| `SHARDPILOT_WORKSPACE_ID` | Canonical workspace key for that credential. |
-| `SHARDPILOT_APP_ID` | Canonical app key; also the app scoped by the crash key. |
-| `SHARDPILOT_ENVIRONMENT_ID` | Canonical environment key for that credential. |
+| `SHARDPILOT_WORKSPACE_KEY` | Canonical workspace key for that credential. |
+| `SHARDPILOT_APP_KEY` | Canonical app key; also the app scoped by the crash key. |
+| `SHARDPILOT_ENVIRONMENT_KEY` | Canonical environment key for that credential. |
 | `SHARDPILOT_ANONYMOUS_ID` | A dedicated synthetic actor identifier accepted unchanged by the crash SDK sanitizer. |
 | `SHARDPILOT_CRASH_URL` | Crash ingest origin, with no path/query/fragment. |
 | `SHARDPILOT_CRASH_KEY` | In-memory API key with `crash:write` for the test app. |

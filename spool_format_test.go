@@ -25,8 +25,8 @@ func formatTestSpool(t *testing.T, dir string, maxEvents int, maxBytes int) *dis
 		SpoolDir:       dir,
 		SpoolMaxEvents: maxEvents,
 		SpoolMaxBytes:  maxBytes,
-		WorkspaceID:    "workspace-test",
-		EnvironmentID:  "develop",
+		WorkspaceKey:   "workspace-test",
+		EnvironmentKey: "develop",
 		AnonymousID:    "anon-format",
 	})
 }

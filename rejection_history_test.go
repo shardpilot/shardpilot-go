@@ -86,7 +86,7 @@ func (l *rejectionLog) Printf(format string, args ...any) {
 func rejectionClient(t *testing.T, configure func(*Config)) (*Client, *rejectionHTTP) {
 	t.Helper()
 	fake := &rejectionHTTP{}
-	cfg := Config{IngestURL: "https://ingest.example.test", ServiceToken: "test-token", WorkspaceID: "workspace-test", AppID: "app-test", EnvironmentID: "develop", Source: SourceBackend, BatchSize: 100, BufferSize: 256, FlushInterval: time.Hour, HTTPTimeout: time.Second, DisableRequestCompression: true, HTTPClient: &http.Client{Transport: fake}}
+	cfg := Config{IngestURL: "https://ingest.example.test", ServiceToken: "test-token", WorkspaceKey: "workspace-test", AppKey: "app-test", EnvironmentKey: "develop", Source: SourceBackend, BatchSize: 100, BufferSize: 256, FlushInterval: time.Hour, HTTPTimeout: time.Second, DisableRequestCompression: true, HTTPClient: &http.Client{Transport: fake}}
 	if configure != nil {
 		configure(&cfg)
 	}

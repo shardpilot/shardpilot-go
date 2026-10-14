@@ -45,7 +45,7 @@ func ageGolden(t *testing.T, name string) string {
 func ageClient(t *testing.T, url, spool string) *Client {
 	t.Helper()
 	return newExperimentClient(t, url, func(cfg *Config) {
-		cfg.AppID = "exposure-app"
+		cfg.AppKey = "exposure-app"
 		cfg.SpoolDir = spool
 	})
 }

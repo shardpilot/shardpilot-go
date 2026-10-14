@@ -19,9 +19,9 @@ func environment(name string) string {
 	return map[string]string{
 		"SHARDPILOT_INGEST_URL":      "https://collector.invalid",
 		"SHARDPILOT_PUBLISHABLE_KEY": "synthetic-analytics-token",
-		"SHARDPILOT_WORKSPACE_ID":    "synthetic-workspace",
-		"SHARDPILOT_APP_ID":          "synthetic-app",
-		"SHARDPILOT_ENVIRONMENT_ID":  "test",
+		"SHARDPILOT_WORKSPACE_KEY":   "synthetic-workspace",
+		"SHARDPILOT_APP_KEY":         "synthetic-app",
+		"SHARDPILOT_ENVIRONMENT_KEY": "test",
 		"SHARDPILOT_ANONYMOUS_ID":    "synthetic-actor",
 		"SHARDPILOT_CRASH_URL":       "https://crashes.invalid",
 		"SHARDPILOT_CRASH_KEY":       "synthetic-crash-token",

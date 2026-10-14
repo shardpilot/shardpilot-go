@@ -50,16 +50,16 @@ func newSchemaRevisionTestServer(t *testing.T, headers chan capturedRevisionHead
 func newSchemaRevisionTestClient(t *testing.T, ingestURL string, mutate func(*Config)) *Client {
 	t.Helper()
 	cfg := Config{
-		IngestURL:     ingestURL,
-		ServiceToken:  "test-token",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		BatchSize:     10,
-		BufferSize:    16,
-		FlushInterval: time.Hour,
-		HTTPTimeout:   time.Second,
+		IngestURL:      ingestURL,
+		ServiceToken:   "test-token",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		BatchSize:      10,
+		BufferSize:     16,
+		FlushInterval:  time.Hour,
+		HTTPTimeout:    time.Second,
 	}
 	if mutate != nil {
 		mutate(&cfg)

@@ -62,9 +62,9 @@ func TestConsentRecordRoundTrip(t *testing.T) {
 	// this one: a reused state dir never lets one actor's decision authorize
 	// another's disk participation.
 	otherDigest := consentActorDigest(Config{
-		WorkspaceID:   "workspace-test",
-		EnvironmentID: "develop",
-		AnonymousID:   "anon-other",
+		WorkspaceKey:   "workspace-test",
+		EnvironmentKey: "develop",
+		AnonymousID:    "anon-other",
 	})
 	if _, ok := loadConsentRecord(dir, otherDigest); ok {
 		t.Fatalf("expected no decision for a different actor digest")
@@ -87,7 +87,7 @@ func TestConsentRecordRoundTrip(t *testing.T) {
 }
 
 func TestConsentActorDigestInjective(t *testing.T) {
-	base := Config{WorkspaceID: "ws", AppID: "app", EnvironmentID: "env", UserID: "u", AnonymousID: "a"}
+	base := Config{WorkspaceKey: "ws", AppKey: "app", EnvironmentKey: "env", UserID: "u", AnonymousID: "a"}
 	digest := consentActorDigest(base)
 	if len(digest) != 64 {
 		t.Fatalf("expected a sha256 hex digest, got %q", digest)
@@ -95,13 +95,13 @@ func TestConsentActorDigestInjective(t *testing.T) {
 	// Every tuple field participates, and shifting bytes across field
 	// boundaries changes the digest (length-prefixed hashing).
 	variants := []Config{
-		{WorkspaceID: "wsX", AppID: "app", EnvironmentID: "env", UserID: "u", AnonymousID: "a"},
-		{WorkspaceID: "ws", AppID: "appX", EnvironmentID: "env", UserID: "u", AnonymousID: "a"},
-		{WorkspaceID: "ws", AppID: "app", EnvironmentID: "envX", UserID: "u", AnonymousID: "a"},
-		{WorkspaceID: "ws", AppID: "app", EnvironmentID: "env", UserID: "uX", AnonymousID: "a"},
-		{WorkspaceID: "ws", AppID: "app", EnvironmentID: "env", UserID: "u", AnonymousID: "aX"},
-		{WorkspaceID: "wse", AppID: "app", EnvironmentID: "nv", UserID: "u", AnonymousID: "a"},
-		{WorkspaceID: "wsa", AppID: "pp", EnvironmentID: "env", UserID: "u", AnonymousID: "a"},
+		{WorkspaceKey: "wsX", AppKey: "app", EnvironmentKey: "env", UserID: "u", AnonymousID: "a"},
+		{WorkspaceKey: "ws", AppKey: "appX", EnvironmentKey: "env", UserID: "u", AnonymousID: "a"},
+		{WorkspaceKey: "ws", AppKey: "app", EnvironmentKey: "envX", UserID: "u", AnonymousID: "a"},
+		{WorkspaceKey: "ws", AppKey: "app", EnvironmentKey: "env", UserID: "uX", AnonymousID: "a"},
+		{WorkspaceKey: "ws", AppKey: "app", EnvironmentKey: "env", UserID: "u", AnonymousID: "aX"},
+		{WorkspaceKey: "wse", AppKey: "app", EnvironmentKey: "nv", UserID: "u", AnonymousID: "a"},
+		{WorkspaceKey: "wsa", AppKey: "pp", EnvironmentKey: "env", UserID: "u", AnonymousID: "a"},
 	}
 	for _, variant := range variants {
 		if consentActorDigest(variant) == digest {
@@ -203,9 +203,9 @@ func TestRemoteConfigCachePathAloneNeverPersistsConsent(t *testing.T) {
 	client, err := NewClient(Config{
 		IngestURL:             server.URL,
 		ServiceToken:          "test-token",
-		WorkspaceID:           "workspace-test",
-		AppID:                 "app-test",
-		EnvironmentID:         "develop",
+		WorkspaceKey:          "workspace-test",
+		AppKey:                "app-test",
+		EnvironmentKey:        "develop",
 		Source:                SourceBackend,
 		AnonymousID:           "anon-rc-1",
 		PublishableKey:        "test-rc-key",

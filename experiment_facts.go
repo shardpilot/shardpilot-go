@@ -573,7 +573,7 @@ func (c *Client) sealedExposureEvent(sessionID string, sealed *expSealedFact, fa
 	if json.Unmarshal(sealed.fact, &fact) != nil {
 		return Event{}, false
 	}
-	if fact.WorkspaceKey != c.cfg.WorkspaceID || fact.AppKey != c.cfg.AppID || fact.EnvironmentKey != c.cfg.EnvironmentID {
+	if fact.WorkspaceKey != c.cfg.WorkspaceKey || fact.AppKey != c.cfg.AppKey || fact.EnvironmentKey != c.cfg.EnvironmentKey {
 		return Event{}, false
 	}
 	// The props travel as decoded values: analytics re-canonicalizes the

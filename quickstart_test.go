@@ -122,7 +122,7 @@ func TestQuickstartPurchaseEventIsBackendLegal(t *testing.T) {
 	if envelope["schema_version"] != float64(1) {
 		t.Fatalf("expected schema_version 1, got %v", envelope["schema_version"])
 	}
-	for _, required := range []string{"event_id", "event_ts", "workspace_id", "app_id", "environment_id"} {
+	for _, required := range []string{"event_id", "event_ts", "workspace_key", "app_key", "environment_key"} {
 		value, _ := envelope[required].(string)
 		if value == "" {
 			t.Fatalf("expected required envelope field %s to be non-empty", required)
@@ -153,12 +153,12 @@ func TestQuickstartPurchaseEventIsBackendLegal(t *testing.T) {
 func TestConfigIdentityDefaultsApplyToEnvelope(t *testing.T) {
 	client := &Client{
 		cfg: Config{
-			WorkspaceID:   "workspace-test",
-			AppID:         "app-test",
-			EnvironmentID: "develop",
-			Source:        SourceBackend,
-			UserID:        "config-user",
-			AnonymousID:   "config-anon",
+			WorkspaceKey:   "workspace-test",
+			AppKey:         "app-test",
+			EnvironmentKey: "develop",
+			Source:         SourceBackend,
+			UserID:         "config-user",
+			AnonymousID:    "config-anon",
 		},
 		clock: realClock{},
 	}

@@ -418,12 +418,12 @@ func TestInvalidQueuedBuildErrorDoesNotBlockLaterValidEvents(t *testing.T) {
 	transport := &sequenceTransport{}
 	client := &Client{
 		cfg: Config{
-			WorkspaceID:   "workspace-test",
-			AppID:         "app-test",
-			EnvironmentID: "develop",
-			Source:        SourceBackend,
-			BatchSize:     1,
-			HTTPTimeout:   time.Second,
+			WorkspaceKey:   "workspace-test",
+			AppKey:         "app-test",
+			EnvironmentKey: "develop",
+			Source:         SourceBackend,
+			BatchSize:      1,
+			HTTPTimeout:    time.Second,
 		},
 		clock:     realClock{},
 		queue:     newBoundedQueue(2),
@@ -463,12 +463,12 @@ func TestPermanentHTTPStatusDoesNotBlockLaterValidEvents(t *testing.T) {
 			transport := &sequenceTransport{firstErr: &HTTPStatusError{StatusCode: statusCode}}
 			client := &Client{
 				cfg: Config{
-					WorkspaceID:   "workspace-test",
-					AppID:         "app-test",
-					EnvironmentID: "develop",
-					Source:        SourceBackend,
-					BatchSize:     1,
-					HTTPTimeout:   time.Second,
+					WorkspaceKey:   "workspace-test",
+					AppKey:         "app-test",
+					EnvironmentKey: "develop",
+					Source:         SourceBackend,
+					BatchSize:      1,
+					HTTPTimeout:    time.Second,
 				},
 				clock:     realClock{},
 				queue:     newBoundedQueue(2),
@@ -520,19 +520,19 @@ func TestPermanentEncodeErrorDoesNotBlockLaterValidEvents(t *testing.T) {
 	defer server.Close()
 
 	cfg := Config{
-		IngestURL:     server.URL,
-		ServiceToken:  "test-token",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		AppVersion:    "0.1.0",
-		AppBuild:      "100",
-		Platform:      "linux",
-		BatchSize:     1,
-		BufferSize:    4,
-		FlushInterval: time.Hour,
-		HTTPTimeout:   time.Second,
+		IngestURL:      server.URL,
+		ServiceToken:   "test-token",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		AppVersion:     "0.1.0",
+		AppBuild:       "100",
+		Platform:       "linux",
+		BatchSize:      1,
+		BufferSize:     4,
+		FlushInterval:  time.Hour,
+		HTTPTimeout:    time.Second,
 	}
 	client := &Client{
 		cfg:       cfg,
@@ -582,12 +582,12 @@ func TestFlushAvailableRetainsFailedBatchAndRetries(t *testing.T) {
 	transport := &sequenceTransport{firstErr: firstErr}
 	client := &Client{
 		cfg: Config{
-			WorkspaceID:   "workspace-test",
-			AppID:         "app-test",
-			EnvironmentID: "develop",
-			Source:        SourceBackend,
-			BatchSize:     1,
-			HTTPTimeout:   time.Second,
+			WorkspaceKey:   "workspace-test",
+			AppKey:         "app-test",
+			EnvironmentKey: "develop",
+			Source:         SourceBackend,
+			BatchSize:      1,
+			HTTPTimeout:    time.Second,
 		},
 		clock:     realClock{},
 		queue:     newBoundedQueue(2),
@@ -644,12 +644,12 @@ func TestRetryableHTTPStatusRetainsFailedBatch(t *testing.T) {
 			transport := &sequenceTransport{firstErr: &HTTPStatusError{StatusCode: statusCode}}
 			client := &Client{
 				cfg: Config{
-					WorkspaceID:   "workspace-test",
-					AppID:         "app-test",
-					EnvironmentID: "develop",
-					Source:        SourceBackend,
-					BatchSize:     1,
-					HTTPTimeout:   time.Second,
+					WorkspaceKey:   "workspace-test",
+					AppKey:         "app-test",
+					EnvironmentKey: "develop",
+					Source:         SourceBackend,
+					BatchSize:      1,
+					HTTPTimeout:    time.Second,
 				},
 				clock:     realClock{},
 				queue:     newBoundedQueue(1),
@@ -694,14 +694,14 @@ func TestPublishWorkerBatchDropsPermanentEncodeFailure(t *testing.T) {
 	defer server.Close()
 
 	cfg := Config{
-		IngestURL:     server.URL,
-		ServiceToken:  "test-token",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		BatchSize:     2,
-		HTTPTimeout:   time.Second,
+		IngestURL:      server.URL,
+		ServiceToken:   "test-token",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		BatchSize:      2,
+		HTTPTimeout:    time.Second,
 	}
 	client := &Client{
 		cfg:       cfg,
@@ -734,12 +734,12 @@ func TestPublishWorkerBatchRetainsFailedBatch(t *testing.T) {
 	transport := &sequenceTransport{firstErr: firstErr}
 	client := &Client{
 		cfg: Config{
-			WorkspaceID:   "workspace-test",
-			AppID:         "app-test",
-			EnvironmentID: "develop",
-			Source:        SourceBackend,
-			BatchSize:     2,
-			HTTPTimeout:   time.Second,
+			WorkspaceKey:   "workspace-test",
+			AppKey:         "app-test",
+			EnvironmentKey: "develop",
+			Source:         SourceBackend,
+			BatchSize:      2,
+			HTTPTimeout:    time.Second,
 		},
 		clock:     realClock{},
 		queue:     newBoundedQueue(2),

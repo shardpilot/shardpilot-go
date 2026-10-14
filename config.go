@@ -26,14 +26,16 @@ type Config struct {
 	IngestURL string
 	// ServiceToken is required for server/backend ingest and forbidden for a
 	// client source. It cannot be a publishable key or a static JWT.
-	ServiceToken  string
-	WorkspaceID   string
-	AppID         string
-	EnvironmentID string
-	Source        Source
-	AppVersion    string
-	AppBuild      string
-	Platform      string
+	ServiceToken string
+	// WorkspaceKey, AppKey and EnvironmentKey are literal scope keys. Values
+	// are trimmed; the SDK does not resolve them from database record IDs.
+	WorkspaceKey   string
+	AppKey         string
+	EnvironmentKey string
+	Source         Source
+	AppVersion     string
+	AppBuild       string
+	Platform       string
 
 	// UserID and AnonymousID are optional default actor identity values.
 	// When set, they are used as envelope defaults for events that do not
@@ -342,9 +344,9 @@ const (
 func normalizeConfig(cfg Config) (Config, error) {
 	cfg.IngestURL = strings.TrimSpace(cfg.IngestURL)
 	cfg.ServiceToken = strings.TrimSpace(cfg.ServiceToken)
-	cfg.WorkspaceID = strings.TrimSpace(cfg.WorkspaceID)
-	cfg.AppID = strings.TrimSpace(cfg.AppID)
-	cfg.EnvironmentID = strings.TrimSpace(cfg.EnvironmentID)
+	cfg.WorkspaceKey = strings.TrimSpace(cfg.WorkspaceKey)
+	cfg.AppKey = strings.TrimSpace(cfg.AppKey)
+	cfg.EnvironmentKey = strings.TrimSpace(cfg.EnvironmentKey)
 	cfg.UserID = strings.TrimSpace(cfg.UserID)
 	cfg.AnonymousID = strings.TrimSpace(cfg.AnonymousID)
 	// A blank revision keeps declaration disabled.
@@ -370,14 +372,14 @@ func normalizeConfig(cfg Config) (Config, error) {
 			return Config{}, fmt.Errorf("%w: server/backend source requires a service token, not a publishable key or static JWT", ErrInvalidConfig)
 		}
 	}
-	if cfg.WorkspaceID == "" {
-		return Config{}, fmt.Errorf("%w: workspace ID is required", ErrInvalidConfig)
+	if cfg.WorkspaceKey == "" {
+		return Config{}, fmt.Errorf("%w: workspace key is required", ErrInvalidConfig)
 	}
-	if cfg.AppID == "" {
-		return Config{}, fmt.Errorf("%w: app ID is required", ErrInvalidConfig)
+	if cfg.AppKey == "" {
+		return Config{}, fmt.Errorf("%w: app key is required", ErrInvalidConfig)
 	}
-	if cfg.EnvironmentID == "" {
-		return Config{}, fmt.Errorf("%w: environment ID is required", ErrInvalidConfig)
+	if cfg.EnvironmentKey == "" {
+		return Config{}, fmt.Errorf("%w: environment key is required", ErrInvalidConfig)
 	}
 	if !validSource(cfg.Source) {
 		return Config{}, fmt.Errorf("%w: source must be client, server, or backend", ErrInvalidConfig)

@@ -457,8 +457,8 @@ func TestConsentNoticeGolden(t *testing.T) {
 			defer server.Close()
 			wire.setConsentRawBody(string(response))
 			c := newFloorTestClient(t, server.URL, "", func(cfg *Config) {
-				cfg.WorkspaceID = want["workspace_id"].(string)
-				cfg.AppID = want["app_id"].(string)
+				cfg.WorkspaceKey = want["workspace_id"].(string)
+				cfg.AppKey = want["app_id"].(string)
 				cfg.AnonymousID = want["actor_identifier"].(string)
 				if !floor {
 					cfg.ConsentFloor = nil
@@ -616,7 +616,7 @@ func TestConsentNoticeStoredPresenceReload(t *testing.T) {
 				if grant {
 					decision = ConsentDecisionGranted
 				}
-				cfg := Config{WorkspaceID: "workspace-test", AppID: "app-test", EnvironmentID: "develop", AnonymousID: "synthetic-notice-actor"}
+				cfg := Config{WorkspaceKey: "workspace-test", AppKey: "app-test", EnvironmentKey: "develop", AnonymousID: "synthetic-notice-actor"}
 				if err := saveConsentRecord(dir, decision, consentActorDigest(cfg), "2026-06-10T12:00:00Z", true, os.Rename, os.Chmod); err != nil {
 					t.Fatal(err)
 				}
@@ -692,7 +692,7 @@ func TestConsentNoticeStoredEvidenceAndWarningPriority(t *testing.T) {
 	for _, mode := range []string{"missing-record", "mark-write-failed", "healthy-mark"} {
 		t.Run(mode, func(t *testing.T) {
 			dir := t.TempDir()
-			cfg := Config{WorkspaceID: "workspace-test", AppID: "app-test", EnvironmentID: "develop", AnonymousID: "anon-spool-1", SpoolDir: dir, ConsentFloor: &ConsentFloorConfig{}}
+			cfg := Config{WorkspaceKey: "workspace-test", AppKey: "app-test", EnvironmentKey: "develop", AnonymousID: "anon-spool-1", SpoolDir: dir, ConsentFloor: &ConsentFloorConfig{}}
 			if mode != "missing-record" {
 				if err := saveConsentRecord(dir, ConsentDecisionGranted, consentActorDigest(cfg), "2026-06-10T12:00:00Z", true, os.Rename, os.Chmod); err != nil {
 					t.Fatal(err)

@@ -571,9 +571,9 @@ func (c *Client) applyConsentDecision(decision ConsentDecision, notices ...Conse
 				// consentSends).
 				request := consentRequest{
 					ConsentNotice:   notice,
-					WorkspaceID:     c.cfg.WorkspaceID,
-					AppID:           c.cfg.AppID,
-					EnvironmentID:   c.cfg.EnvironmentID,
+					WorkspaceID:     c.cfg.WorkspaceKey,
+					AppID:           c.cfg.AppKey,
+					EnvironmentID:   c.cfg.EnvironmentKey,
 					ActorIdentifier: actor.identifier,
 					Kind:            actor.kind,
 					Categories:      map[string]bool{"analytics": analyticsGranted},

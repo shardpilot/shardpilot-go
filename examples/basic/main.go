@@ -14,15 +14,15 @@ func main() {
 	defer cancel()
 
 	client, err := shardpilot.NewClient(shardpilot.Config{
-		IngestURL:     os.Getenv("SHARDPILOT_INGEST_URL"),
-		ServiceToken:  os.Getenv("SHARDPILOT_SERVICE_TOKEN"),
-		WorkspaceID:   os.Getenv("SHARDPILOT_WORKSPACE_ID"),
-		AppID:         os.Getenv("SHARDPILOT_APP_ID"),
-		EnvironmentID: os.Getenv("SHARDPILOT_ENVIRONMENT_ID"),
-		Source:        shardpilot.SourceBackend,
-		AppVersion:    "0.1.0",
-		AppBuild:      "100",
-		Platform:      "linux",
+		IngestURL:      os.Getenv("SHARDPILOT_INGEST_URL"),
+		ServiceToken:   os.Getenv("SHARDPILOT_SERVICE_TOKEN"),
+		WorkspaceKey:   os.Getenv("SHARDPILOT_WORKSPACE_KEY"),
+		AppKey:         os.Getenv("SHARDPILOT_APP_KEY"),
+		EnvironmentKey: os.Getenv("SHARDPILOT_ENVIRONMENT_KEY"),
+		Source:         shardpilot.SourceBackend,
+		AppVersion:     "0.1.0",
+		AppBuild:       "100",
+		Platform:       "linux",
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "configure shardpilot: %v\n", err)
