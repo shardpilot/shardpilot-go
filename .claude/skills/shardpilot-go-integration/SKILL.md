@@ -5,7 +5,7 @@ description: Use when integrating the ShardPilot Go SDK (shardpilot-go) into a G
 
 # Integrating the ShardPilot Go SDK
 
-The install command uses the pinned release tag `v0.8.0-alpha`; this is a release-preparation target, not a published release. Wait for the announced release before installing it. The Known limitations section below records the source review for this release preparation.
+The install command uses the pinned release tag `v0.8.0` for this source. Install after its release announcement; tagging/publication follow the merged release PR. The Known limitations section below records the source review for this release.
 The release retains compression, the 15-second flush default, independent retry pacing, goroutine-label sanitization and rejection history. Opt-in experiment integrations must follow the [migration from v0.6.4-alpha](../../../CHANGELOG.md#migration-from-v064-alpha): apply the variant before recording outcomes, allow asynchronous platform sealing, and declare the game's age band. Read the [experiment contract](../../../README.md#experiments-dark-opt-in) before enabling it; the default remains off.
 
 **SCOPE: the DEFAULT configuration.** `v0.6.0-alpha` added three opt-ins that
@@ -55,7 +55,7 @@ other calls, no automatic actions.
 ## Install
 
 ```bash
-go get github.com/shardpilot/shardpilot-go@v0.8.0-alpha
+go get github.com/shardpilot/shardpilot-go@v0.8.0
 ```
 
 - Requires **Go 1.25+** at the pinned tag.
@@ -205,7 +205,7 @@ Two things follow that matter when you integrate:
 
 ## Consent model — READ THIS FIRST, IT IS INVERTED
 
-In release preparation, either consent setter accepts one optional
+In this release, either consent setter accepts one optional
 `shardpilot.ConsentNotice{NoticeVersion, NoticeLocale, PolicyVersion}`. Omit it
 when unknown; all three fields are required when supplied. Version ids are
 1–64 ASCII bytes of `[A-Za-z0-9._+/-]`; locale uses RFC 5646 syntax within 2–35

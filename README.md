@@ -27,10 +27,10 @@ Real, tested, working code — **early alpha**. The API is pre-v1 and may change
 Prepared install command (use after the announced release):
 
 ```bash
-go get github.com/shardpilot/shardpilot-go@v0.8.0-alpha
+go get github.com/shardpilot/shardpilot-go@v0.8.0
 ```
 
-For this release preparation, `v0.8.0-alpha` is the latest tag target. It is not published yet; wait for the announced release before using the install pin.
+`v0.8.0` is the latest tag target for this source. Install after its release announcement; the release PR prepares the source, and tagging/publication is a separate step.
 
 **Consent getter migration:** replace `client.Consent()` with `client.ConsentState()`. The named string result retains `unknown`, `granted`, `denied` and `denied_forced_minor`; a zero-value client reports `unknown`. The old getter has no compatibility alias.
 
@@ -138,7 +138,7 @@ Pick events whose canonical schema allows your configured `Source`. Session/scre
 
 ## Quick start (crash reporting)
 
-**Unreleased on main:** emitted crash bodies carry `fatal: true` for `EmitFatal`
+**Release behavior:** emitted crash bodies carry `fatal: true` for `EmitFatal`
 and `fatal: false` for `Emit`; non-fatal reports admitted by the built-in sampler
 also carry `non_fatal_sample_one_in` (1 by default). Custom sampler rates remain
 unknown and are omitted. The SDK stamps these fields rather than reading them
@@ -314,7 +314,7 @@ A malformed value (free-form text, an email, an IP, a JWT, a raw `user_`/`player
 
 App-first event envelope (`POST {IngestURL}/v1/events:batch`, `Authorization: Bearer <token>`). Ordinary event envelopes carry `event_id`, `schema_version`, `event_name`, `source`, `event_ts`, `workspace_key`, `app_key`, `environment_key`, and optional `user_id`, `anonymous_id`, `session_id`, `session_sequence`, `platform`, `app_version`, `app_build`, `context`, `props`.
 
-Every request the SDK makes (event batches, consent, remote config, the experiment assignment and apply routes, and crash ingest) carries `X-ShardPilot-SDK: go/<version>`, for example `go/0.8.0-alpha`. The version is the release the SDK was cut from, held as a constant in code; it never comes from configuration.
+Every request the SDK makes (event batches, consent, remote config, the experiment assignment and apply routes, and crash ingest) carries `X-ShardPilot-SDK: go/<version>`, for example `go/0.8.0`. The version is the release the SDK was cut from, held as a constant in code; it never comes from configuration.
 
 SDK-owned experiment exposure and outcome facts use schema major 2 and the literal `workspace_key`, `app_key`, and `environment_key` returned by the platform. The SDK forwards the signed fact values and attestation seal without renaming them to `*_id`. Existing spooled bytes remain unchanged; previously queued major-1 experiment facts are not upgraded or re-signed.
 

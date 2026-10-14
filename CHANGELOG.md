@@ -1,6 +1,8 @@
 # Changelog
 
-## v0.8.0-alpha — release preparation (not published)
+## Unreleased
+
+## v0.8.0 — 2026-10-14 — scope keys and explicit consent outcomes
 
 - Analytics configuration uses `WorkspaceKey`, `AppKey` and `EnvironmentKey`
   for literal scope keys. Ordinary event envelopes send `workspace_key`,
@@ -247,8 +249,8 @@ credential purpose (`SHARDPILOT_SERVICE_TOKEN`, `SHARDPILOT_PUBLISHABLE_KEY`,
 | Direct `Track`/`Enqueue` of reserved names | Remove those calls; use the experiment API for experiment facts. There is no new session/ad-revenue producer in this release. |
 | Unicode whitespace trimmed from event names | Only ASCII whitespace is trimmed; choose the intended ordinary event name explicitly. |
 
-No aliases are provided for the removed symbols. This version is prepared in
-source; its release tag is not published yet.
+No aliases are provided for the removed symbols. Tagging and publication
+follow the merged release PR.
 
 ## v0.7.2-alpha — 2026-10-02
 
