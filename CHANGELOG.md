@@ -2,11 +2,14 @@
 
 ## Unreleased
 
+## v0.9.0 — 2026-10-15 — per-event schema version
+
 - Adds optional `Event.SchemaVersion *int` to `Track` and `Enqueue`: nil
   retains version 1; explicit values must be 1..65535. Invalid values return
   `ErrSchemaVersionInvalid` (`schema_version_invalid`). Intake snapshots the
   selected value for wire-size checks, retries and newly written spool records.
   Adds the exact `event_schema_version` capability; SDK-owned facts keep their versions.
+- Updates release pins and the SDK identity header to `go/0.9.0`.
 
 ## v0.8.1 — 2026-10-14 — retire the superseded pre-alpha line
 
