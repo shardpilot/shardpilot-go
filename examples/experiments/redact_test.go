@@ -59,9 +59,8 @@ func TestQueryLengthCountsCharactersNotBytes(t *testing.T) {
 }
 
 func TestEveryPlaceholderCountsCharacters(t *testing.T) {
-	// One measure, one place: this asserts the PROPERTY across every surface
-	// that produces a placeholder, so a new one measuring bytes fails here
-	// rather than in a review round two days later.
+	// One measure, one place: assert character counts across every surface
+	// that produces a placeholder, including new surfaces added to the recorder.
 	suppliedValues = []string{"éé"}
 	t.Cleanup(func() { suppliedValues = nil })
 	for name, got := range map[string]string{
@@ -135,7 +134,7 @@ func TestLocationQueryValuesAreRedacted(t *testing.T) {
 	// registered both as request names and asserted they were printed -- which is
 	// the provenance confusion the sibling thread names: the registry answers for
 	// the OUTGOING request, and a redirect target is someone else's URL
-	// (shardpilot/shardpilot-go#85 review). Both names are lengthened now, and what
+	// . Both names are lengthened now, and what
 	// this scene is really about -- the VALUES not being published -- is unchanged.
 	t.Cleanup(func() { requestNames = map[string]bool{} })
 	got := stripMarks(dropFraming("HTTP/1.1 302 Found\r\nLocation: /cb?state=abc123&token=zzz\r\n\r\n"))
@@ -260,7 +259,7 @@ func TestServerMintedSubjectFactKeyIsRedacted(t *testing.T) {
 	// followed by a value with enough entropy, and this file has now reddened the
 	// whole repository twice over exactly that. Length is kept so the
 	// length-preserving placeholder still has something to preserve; entropy is
-	// not (shardpilot/shardpilot-go#73 review).
+	// not .
 	body := "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n" +
 		`{"assigned":true,"subject_fact_key":"sfk1_abababababababab"}`
 	got := stripMarks(dropFraming(body))
@@ -269,12 +268,6 @@ func TestServerMintedSubjectFactKeyIsRedacted(t *testing.T) {
 	}
 }
 
-// A Location carrying BOTH a query and a fragment is where the composition
-// order is load-bearing on its own. Composed the other way round, redactQuery
-// cuts at the first `?`, swallows the whole `#fragment` into the last parameter
-// VALUE and reports one length for the two of them -- the fragment vanishes as a
-// structure and the number printed describes neither part. The `?`-opaque rule
-// cannot see this: there is no `?` inside the fragment to make it opaque.
 func TestQueryAndFragmentAreMeasuredSeparately(t *testing.T) {
 	suppliedValues = nil
 	t.Cleanup(func() { suppliedValues = nil })
@@ -295,8 +288,6 @@ func TestQueryAndFragmentAreMeasuredSeparately(t *testing.T) {
 		t.Errorf("the fragment was published: %q", got)
 	}
 }
-
-// ---- round on 45eb421: eight findings ----
 
 func TestMintedKeyIsRedactedAcrossALineBreak(t *testing.T) {
 	suppliedValues = nil
@@ -485,7 +476,7 @@ func TestTheTargetPipelineContinuesAfterTheAuthorityIsReplaced(t *testing.T) {
 // the registered media type already had this ruling, and the directive lists did
 // not: `Cache-Control: no-store` came back as `<redacted, 8 chars>`, which is not
 // a cache-directive token, with an EMPTY refusal ledger
-// (shardpilot/shardpilot-go#85 review).
+// .
 func TestARegistryTokenSurvivesACollision(t *testing.T) {
 	t.Cleanup(func() { suppliedValues, structuralSurfaces = nil, nil })
 
@@ -515,7 +506,7 @@ func TestARegistryTokenSurvivesACollision(t *testing.T) {
 // SHAPE, and a shape says nothing about who chose the value. With a supplied
 // `123456` the fallback answered `Max-Age=redacted-6-chars`, which is not an
 // integer, and recorded nothing -- so the guard approved a cookie no parser
-// accepts (shardpilot/shardpilot-go#85 review).
+// accepts .
 func TestAShapeAdmittedCookieAttributeIsRefusedOnCollision(t *testing.T) {
 	t.Cleanup(func() { suppliedValues, structuralSurfaces = nil, nil })
 
@@ -543,7 +534,7 @@ func TestAShapeAdmittedCookieAttributeIsRefusedOnCollision(t *testing.T) {
 // membership test cannot ask that, so an endpoint returning the app key in
 // `experiment_key` passed it — a body the SDK rejects — and `reason` was vouched
 // as this SDK's taxonomy, publishing a supplied identifier with an empty ledger
-// (shardpilot/shardpilot-go#85 review).
+// .
 func TestAnEchoIsComparedWithItsOwnRequestValue(t *testing.T) {
 	t.Cleanup(func() {
 		suppliedValues = nil
@@ -569,7 +560,7 @@ func TestAnEchoIsComparedWithItsOwnRequestValue(t *testing.T) {
 // TestAnOverLimitBodyIsNotThisSDKsVerdict: `parseExperimentVerdict` refuses a body
 // over `expMaxBodyBytes` BEFORE decoding, so a well-formed verdict past the ceiling
 // is not this SDK's classification at all — while the decode here succeeded and
-// vouched `reason` (shardpilot/shardpilot-go#85 review).
+// vouched `reason` .
 func TestAnOverLimitBodyIsNotThisSDKsVerdict(t *testing.T) {
 	t.Cleanup(func() { suppliedValues = nil })
 	suppliedValues = []string{"kill_switch"}
@@ -586,11 +577,6 @@ func TestAnOverLimitBodyIsNotThisSDKsVerdict(t *testing.T) {
 	}
 }
 
-// TestVouchingCarriesEverySDKPrecondition: the SDK refuses a response before
-// decoding for THREE reasons — the status, the size, and incompleteness — and a
-// vouch claims it would have parsed. Each of the three was missing from one of the
-// two vouching decisions at some point in this round
-// (shardpilot/shardpilot-go#85 review).
 func TestVouchingCarriesEverySDKPrecondition(t *testing.T) {
 	t.Cleanup(func() { suppliedValues, structuralSurfaces = nil, nil; capturedIncomplete = false })
 	verdict := "{\"assigned\":false,\"reason\":\"kill_switch\"}"
@@ -622,7 +608,7 @@ func TestVouchingCarriesEverySDKPrecondition(t *testing.T) {
 
 // TestAllowIsNotFolded: HTTP method names are case-sensitive, so `get` is not the
 // registered `GET`. Folding it made an endpoint-selected token read as the
-// registry's own spelling (shardpilot/shardpilot-go#85 review).
+// registry's own spelling .
 func TestAllowIsNotFolded(t *testing.T) {
 	t.Cleanup(func() { suppliedValues, structuralSurfaces = nil, nil })
 	suppliedValues, structuralSurfaces = []string{"get"}, nil
@@ -640,7 +626,7 @@ func TestAllowIsNotFolded(t *testing.T) {
 // NON-canonical spelling, and `MAX-AGE=123456` is non-canonical — so a colliding
 // number reached the token substitution and came back as `MAX-AGE=redacted-6-chars`,
 // which is not an integer, with the ledger recording an accounted rewrite rather
-// than a refusal (shardpilot/shardpilot-go#85 review).
+// than a refusal .
 func TestANumericArgumentIsAShapeWhateverTheCasing(t *testing.T) {
 	t.Cleanup(func() { suppliedValues, structuralSurfaces = nil, nil })
 	suppliedValues, structuralSurfaces = []string{"123456"}, nil
