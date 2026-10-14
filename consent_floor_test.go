@@ -309,7 +309,7 @@ func TestConsentFloorGrantReceiptPrecedesBatch(t *testing.T) {
 	if !consentBoolCategory(t, body) {
 		t.Fatalf("expected an analytics grant receipt, got %v", body)
 	}
-	for _, field := range []string{"idempotency_key", "decided_at", "actor_identifier", "workspace_id", "app_id", "environment_id"} {
+	for _, field := range []string{"idempotency_key", "decided_at", "actor_identifier", "workspace_key", "app_key", "environment_key"} {
 		if value, ok := body[field].(string); !ok || value == "" {
 			t.Fatalf("expected receipt field %q present, got %v", field, body)
 		}
@@ -3011,7 +3011,7 @@ func TestConsentFloorForeignReceiptNeverDispatched(t *testing.T) {
 	if got := state.consentCount(); got != 1 {
 		t.Fatalf("expected only the in-scope receipt on the wire, got %d posts", got)
 	}
-	if got := state.consentAt(0)["workspace_id"]; got != "workspace-test" {
+	if got := state.consentAt(0)["workspace_key"]; got != "workspace-test" {
 		t.Fatalf("expected the posted receipt to carry this client's scope, got %v", got)
 	}
 	if !client.consentOutbox.pending() {

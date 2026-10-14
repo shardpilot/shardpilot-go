@@ -97,7 +97,7 @@ func TestOversizeOnTheWireFailsTheEvidence(t *testing.T) {
 		{"small rejected", 100, "rejected", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			event, err := json.Marshal(map[string]string{"event_id": "single", "workspace_id": strings.Repeat("w", tc.size)})
+			event, err := json.Marshal(map[string]string{"event_id": "single", "workspace_key": strings.Repeat("w", tc.size)})
 			if err != nil || (len(event) > 2048) != (tc.size > 2048) {
 				t.Fatal("fixture was not constructed")
 			}
