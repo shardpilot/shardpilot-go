@@ -174,9 +174,9 @@ func TestSetConsentPostsConsentDecisionShape(t *testing.T) {
 		t.Fatalf("unexpected consent content type %q", granted.contentType)
 	}
 	for field, want := range map[string]string{
-		"workspace_id":   "workspace-test",
-		"app_id":         "app-test",
-		"environment_id": "develop",
+		"workspace_key":   "workspace-test",
+		"app_key":         "app-test",
+		"environment_key": "develop",
 		// user_id is preferred over anonymous_id.
 		"actor_identifier": "user-actor",
 	} {

@@ -110,9 +110,9 @@ func newConsentGateState() *consentGateState {
 
 type consentRequest struct {
 	ConsentNotice
-	WorkspaceID     string          `json:"workspace_id"`
-	AppID           string          `json:"app_id"`
-	EnvironmentID   string          `json:"environment_id"`
+	WorkspaceID     string          `json:"workspace_key"`
+	AppID           string          `json:"app_key"`
+	EnvironmentID   string          `json:"environment_key"`
 	ActorIdentifier string          `json:"actor_identifier"`
 	Kind            string          `json:"kind"`
 	Categories      map[string]bool `json:"categories"`

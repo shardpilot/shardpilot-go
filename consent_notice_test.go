@@ -425,7 +425,7 @@ func TestConsentNoticeForcedMinorAndTerminal(t *testing.T) {
 // side, with both hashes.
 func TestConsentNoticeFixtureIsThePlatformsGolden(t *testing.T) {
 	for name, want := range map[string]string{
-		"request.json":  "daf0acb703982cdf1a772b310e37b08b01f9fd40bf6e0f81dba93d3149493066",
+		"request.json":  "87f337aa10ad76ffcc60424e8f3a996b9b5548df57e62a4decbd13a1e886f233",
 		"response.json": "8add729673ccd76ee0baee7352dccff01efebc6387439a56c03c523ed34f2e0b",
 	} {
 		body, err := os.ReadFile(filepath.Join("testdata", "consent-notice", name))
@@ -456,9 +456,14 @@ func TestConsentNoticeGolden(t *testing.T) {
 			wire, server := newFloorTestServer(t)
 			defer server.Close()
 			wire.setConsentRawBody(string(response))
-			c := newFloorTestClient(t, server.URL, "", func(cfg *Config) {
-				cfg.WorkspaceKey = want["workspace_id"].(string)
-				cfg.AppKey = want["app_id"].(string)
+			spoolDir := ""
+			if floor {
+				spoolDir = t.TempDir()
+			}
+			c := newFloorTestClient(t, server.URL, spoolDir, func(cfg *Config) {
+				cfg.WorkspaceKey = want["workspace_key"].(string)
+				cfg.AppKey = want["app_key"].(string)
+				cfg.EnvironmentKey = want["environment_key"].(string)
 				cfg.AnonymousID = want["actor_identifier"].(string)
 				if !floor {
 					cfg.ConsentFloor = nil
