@@ -1,8 +1,6 @@
 package shardpilot
 
-// Regression pins, part 16. Each test fails on the pre-fix tree
-// for its finding's exact reason (verified mechanically via targeted
-// temporary reverts of the fix, with the test seams retained).
+// Withdrawal markers and capture preserve grant provenance.
 
 import (
 	"context"
@@ -112,7 +110,7 @@ func TestSentinelCancelsFrozenCaptureDebts(t *testing.T) {
 
 	// A prior kill drop left a FROZEN captureFirst debt (its spool append
 	// failed at drop time; the payload carries pre-sentinel facts).
-	frozen := spoolEntry{id: "g16-2-frozen", delivery: newEventDelivery(time.Now()), raw: round5FactRaw("g16-2-frozen"), internalFact: true}
+	frozen := spoolEntry{id: "g16-2-frozen", delivery: newEventDelivery(time.Now()), raw: spooledExperimentFactRaw("g16-2-frozen"), internalFact: true}
 	client.exp.mu.Lock()
 	client.exp.durablePending[scopedIntentKey("g16-2-scope", "exp-frozen")] = expOwedSync{
 		asOf: 1, drop: true, scope: "g16-2-scope", experimentKey: "exp-frozen",

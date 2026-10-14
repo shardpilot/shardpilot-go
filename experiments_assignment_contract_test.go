@@ -13,9 +13,10 @@ import (
 	"time"
 )
 
-// Regressions, part 1, plus the pins shared with the Defold SDK.
+// Assignment verdict and fact-privacy invariants, including the pins
+// shared with the Defold SDK.
 
-// Finding 1: the fact lane's privacy boundary — a non-sfk1_ subject
+// the fact lane's privacy boundary — a non-sfk1_ subject
 // fact key (a raw spcid_ echo included) must never ride assignment_key.
 func TestSubjectFactKeyGrammarGuardsTheFactLane(t *testing.T) {
 	rawSubject := "spcid_" + strings.Repeat("a", 32)
@@ -99,7 +100,7 @@ func TestSubjectFactKeyGrammarGuardsTheFactLane(t *testing.T) {
 	}
 }
 
-// Finding 11: unknown assignment units are not installable verdicts.
+// unknown assignment units are not installable verdicts.
 func TestUnknownAssignmentUnitWithdrawsAssignment(t *testing.T) {
 	body := strings.Replace(expAssignedBody("1"), `"assignment_unit":"client_id"`, `"assignment_unit":"device_cluster"`, 1)
 	if result, out, ok := parseExperimentVerdict(expTestResponse(200, body), expTestRequestScope(), 42); !ok || result.Assigned || result.Reason != "unknown" || !out.dropEntry {
@@ -137,7 +138,7 @@ func TestNullReasonAndEchoesAreMalformed(t *testing.T) {
 	}
 }
 
-// Finding 2: the grammar-remint retry is bounded by the CALLER's context.
+// the grammar-remint retry is bounded by the CALLER's context.
 func TestRemintRetryHonorsCallerContext(t *testing.T) {
 	script := &expScript{}
 	retryGate := make(chan struct{})
@@ -165,7 +166,7 @@ func TestRemintRetryHonorsCallerContext(t *testing.T) {
 	}
 }
 
-// Finding 3: a hung automatic revalidation fetch must not block Close.
+// a hung automatic revalidation fetch must not block Close.
 func TestHungRevalidationFetchDoesNotBlockClose(t *testing.T) {
 	script := &expScript{}
 	script.push(200, expAssignedBody("1"))
@@ -214,7 +215,7 @@ func TestHungRevalidationFetchDoesNotBlockClose(t *testing.T) {
 	close(hang)
 }
 
-// Finding 4: an auth latch set mid-batch stops the automatic batch — and a
+// an auth latch set mid-batch stops the automatic batch — and a
 // later scripted 200 never reaches the wire to clear it from the lane.
 func TestLatchStopsRevalidationBatch(t *testing.T) {
 	script := &expScript{}
@@ -247,7 +248,7 @@ func TestLatchStopsRevalidationBatch(t *testing.T) {
 	}
 }
 
-// Finding 5: restored attributes re-validate against the live
+// restored attributes re-validate against the live
 // vocabulary before riding a revalidation fetch.
 func TestRestoredAttributesAreRenormalized(t *testing.T) {
 	script := &expScript{}
@@ -304,7 +305,7 @@ func TestRestoredAttributesAreRenormalized(t *testing.T) {
 	}
 }
 
-// Finding 6: the persisted subject id is read through a hard cap.
+// the persisted subject id is read through a hard cap.
 func TestOversizedSubjectFileIsAMiss(t *testing.T) {
 	script := &expScript{}
 	server := httptest.NewServer(script.handler(t))
@@ -323,7 +324,7 @@ func TestOversizedSubjectFileIsAMiss(t *testing.T) {
 	}
 }
 
-// Finding 7: internal facts count in Stats.Enqueued.
+// internal facts count in Stats.Enqueued.
 func TestExperimentFactsCountInStats(t *testing.T) {
 	script := &expScript{}
 	script.push(200, expAssignedBody("1"))
@@ -343,7 +344,7 @@ func TestExperimentFactsCountInStats(t *testing.T) {
 	}
 }
 
-// Finding 8: a fenced-out stale 429's Retry-After never parks the cadence.
+// a fenced-out stale 429's Retry-After never parks the cadence.
 func TestStaleRetryAfterDoesNotParkCadence(t *testing.T) {
 	script := &expScript{}
 	slowGate := make(chan struct{})
@@ -373,7 +374,7 @@ func TestStaleRetryAfterDoesNotParkCadence(t *testing.T) {
 	}
 }
 
-// Finding 9: experiment state files are written with the private-tightening
+// experiment state files are written with the private-tightening
 // chmod hook.
 func TestExperimentFilesAreTightened(t *testing.T) {
 	script := &expScript{}

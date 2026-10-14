@@ -1,8 +1,6 @@
 package shardpilot
 
-// Regression pins, part 12. Each test fails on the pre-fix tree
-// for its finding's exact reason (verified mechanically via targeted
-// temporary reverts of the fix, with the test seams retained).
+// Owed experiments preserve withdrawal records and delivery boundaries.
 
 import (
 	"context"
@@ -167,7 +165,7 @@ func TestPurgeSpendsStaleWithdrawalMarker(t *testing.T) {
 		// A later granted session spools a FRESH fact that legitimately
 		// reuses the id (deterministic event ids recur by design).
 		now := time.Now()
-		fresh := spoolEntry{id: "fact-recur", delivery: newEventDelivery(now), raw: round5FactRaw("fact-recur"), internalFact: true}
+		fresh := spoolEntry{id: "fact-recur", delivery: newEventDelivery(now), raw: spooledExperimentFactRaw("fact-recur"), internalFact: true}
 		if refused, added, _, _, persistFailed := s.append([]spoolEntry{fresh}, 0, false, now, func() bool { return true }); refused || len(added) != 1 || persistFailed {
 			t.Fatalf("the reopened spool must admit and persist the fresh fact (refused=%v added=%d persistFailed=%v)", refused, len(added), persistFailed)
 		}
