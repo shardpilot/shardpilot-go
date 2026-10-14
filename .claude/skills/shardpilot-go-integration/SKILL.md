@@ -456,7 +456,7 @@ import "github.com/shardpilot/shardpilot-go/pkg/crash"
 crashClient, err := crash.NewClient(crash.ClientOptions{
     CrashURL:  os.Getenv("SHARDPILOT_CRASH_URL"), // base URL, no path
     CrashKey:  os.Getenv("SHARDPILOT_CRASH_KEY"),
-    App:       crash.AppInfo{ID: "<YOUR-APP-ID>", Version: "1.0.0"}, // required for auto-capture
+    App:       crash.AppInfo{Key: "<YOUR-APP-KEY>", Version: "1.0.0"}, // required for auto-capture
     CrashComponent: "<COMPONENT-SLUG>", // e.g. which service in a multi-repo product
     OnResult:  func(r crash.Result) { /* see verification */ },
 })
@@ -620,7 +620,7 @@ Run against your dev/staging deployment credentials, then check each item:
    did not store it (actor consent withheld server-side).
 6. **Panic capture.** In a throwaway binary, `defer crashClient.Recover(ctx)`
    around a deliberate panic; confirm the process still crashes (re-panic)
-   and the report shows up with your `App.ID`/`Source` and Go frames.
+   and the report shows up with your `App.Key`/`Source` and Go frames.
 7. **Shutdown.** Confirm your service calls `Close(ctx)` with a timeout on
    shutdown, and that `Close` returns `nil` (pending events + consent
    receipts flushed within the deadline).

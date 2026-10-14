@@ -45,7 +45,7 @@ func newCaptureClient(t *testing.T, url, source string) *crash.Client {
 	client, err := crash.NewClient(crash.ClientOptions{
 		CrashURL:       url,
 		CrashKey:       "workspace-api-key-test",
-		App:            crash.AppInfo{ID: "fortress-fury"},
+		App:            crash.AppInfo{Key: "fortress-fury"},
 		CrashComponent: source,
 		Logger:         testLogger{t},
 	})
@@ -92,8 +92,8 @@ func TestRecoverCapturesPanicOriginAndRepanics(t *testing.T) {
 	if received.Source != "main-server" {
 		t.Fatalf("source = %q, want main-server (stamped from ClientOptions)", received.Source)
 	}
-	if received.App.ID != "fortress-fury" {
-		t.Fatalf("app.id = %q, want fortress-fury (stamped from ClientOptions)", received.App.ID)
+	if received.App.Key != "fortress-fury" {
+		t.Fatalf("app.key = %q, want fortress-fury (stamped from ClientOptions)", received.App.Key)
 	}
 	if len(received.Modules) != 0 {
 		t.Fatalf("a pre-symbolicated Go crash carries 0 native modules, got %d", len(received.Modules))

@@ -38,7 +38,7 @@ func TestCrashComponentWireGolden(t *testing.T) {
 			}
 			event := Event{
 				CrashID: "018bcfe5-5680-7cc8-a7b8-7f6b0a5969de", OccurredAt: time.Date(2026, 10, 9, 0, 0, 0, 0, time.UTC),
-				App: AppInfo{ID: "synthetic-app"}, Source: tc.eventSource, Platform: "linux", OS: OSInfo{Name: "linux"},
+				App: AppInfo{Key: "synthetic-app"}, Source: tc.eventSource, Platform: "linux", OS: OSInfo{Name: "linux"},
 				Exception: ExceptionInfo{Type: "SyntheticCrash"}, RawText: "synthetic crash",
 			}
 			if tc.fatal {

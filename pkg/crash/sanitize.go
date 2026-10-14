@@ -35,7 +35,7 @@ func SanitizeEvent(event Event) (Event, error) {
 func sanitizeEvent(event Event, trustedFrameFunctions bool) (Event, error) {
 	event = cloneEvent(event)
 	event.CrashID = strings.TrimSpace(event.CrashID)
-	event.App.ID = sanitizeString(event.App.ID)
+	event.App.Key = sanitizeString(event.App.Key)
 	event.App.Version = sanitizeString(event.App.Version)
 	event.App.BuildID = sanitizeString(event.App.BuildID)
 	// Source is an operator-set component slug on the wire; scrub it like the

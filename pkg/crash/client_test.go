@@ -310,7 +310,7 @@ func validEventForBenchmark() Event {
 	return Event{
 		CrashID:    "018bcfe5-5680-7cc8-a7b8-7f6b0a5969de",
 		OccurredAt: time.Unix(1700000002, 0).UTC(),
-		App:        AppInfo{ID: "app_bench", Version: "0.2.0-alpha-bench", BuildID: "build-bench"},
+		App:        AppInfo{Key: "app_bench", Version: "0.2.0-alpha-bench", BuildID: "build-bench"},
 		Platform:   "linux",
 		OS:         OSInfo{Name: "linux", Version: "bench"},
 		Device:     map[string]string{"class": DeviceClassDesktop, "arch": "x86_64"},
@@ -355,7 +355,7 @@ func TestClientActorKeyDefaultsAndPerEventOverride(t *testing.T) {
 	client, err := NewClient(ClientOptions{
 		CrashURL:    server.URL,
 		CrashKey:    "workspace-api-key-test",
-		App:         AppInfo{ID: "app-test"},
+		App:         AppInfo{Key: "app-test"},
 		Sampler:     alwaysSampler{},
 		AnonymousID: clientAnon,
 		SessionID:   "session-abc",
@@ -407,7 +407,7 @@ func TestClientWithoutActorKeyKeepsWireShapeUnchanged(t *testing.T) {
 	client, err := NewClient(ClientOptions{
 		CrashURL: server.URL,
 		CrashKey: "workspace-api-key-test",
-		App:      AppInfo{ID: "app-test"},
+		App:      AppInfo{Key: "app-test"},
 		Sampler:  alwaysSampler{},
 	})
 	if err != nil {
@@ -438,7 +438,7 @@ func TestClientRejectsUnusableClientWideActorKeyWithoutFailing(t *testing.T) {
 	client, err := NewClient(ClientOptions{
 		CrashURL:    "https://ingest.invalid",
 		CrashKey:    "workspace-api-key-test",
-		App:         AppInfo{ID: "app-test"},
+		App:         AppInfo{Key: "app-test"},
 		AnonymousID: "user_4242",
 	})
 	if err != nil {

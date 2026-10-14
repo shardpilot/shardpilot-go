@@ -55,10 +55,10 @@ type Client struct {
 type ClientOptions struct {
 	CrashURL string
 	CrashKey string
-	// App identifies the project this client reports for. Its fields default onto every
+	// App identifies the canonical app this client reports for. Its fields default onto every
 	// event that leaves them empty (per-event values win). REQUIRED for auto-capture
 	// (Recover/CapturePanic), which builds events with no App of their own; the producer
-	// rejects an empty app.id and one that mismatches the API key's app scope. App.ID
+	// rejects an empty app.key and one that mismatches the API key's app scope. App.Key
 	// must equal the API key's app.
 	App AppInfo
 	// CrashComponent is the optional component slug stamped on events that do not
@@ -218,7 +218,7 @@ func NewClient(opts ClientOptions) (*Client, error) {
 		ingestURL: ingestURL,
 		apiKey:    apiKey,
 		app: AppInfo{
-			ID:      strings.TrimSpace(opts.App.ID),
+			Key:     strings.TrimSpace(opts.App.Key),
 			Version: strings.TrimSpace(opts.App.Version),
 			BuildID: strings.TrimSpace(opts.App.BuildID),
 		},
@@ -304,8 +304,8 @@ func (c *Client) prepareEvent(event Event, trustedFrameFunctions bool) (Event, e
 	event = cloneEvent(event)
 	event.CrashID = strings.TrimSpace(event.CrashID)
 	// Default app identity and source from client config; a per-event value always wins.
-	if strings.TrimSpace(event.App.ID) == "" {
-		event.App.ID = c.app.ID
+	if strings.TrimSpace(event.App.Key) == "" {
+		event.App.Key = c.app.Key
 	}
 	if strings.TrimSpace(event.App.Version) == "" {
 		event.App.Version = c.app.Version

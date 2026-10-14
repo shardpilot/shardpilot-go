@@ -102,7 +102,7 @@ func TestReadSelfModuleOnTestBinary(t *testing.T) {
 	event := Event{
 		CrashID:    mustNewCrashID(t),
 		OccurredAt: time.Now().UTC(),
-		App:        AppInfo{ID: "fortress-fury"},
+		App:        AppInfo{Key: "fortress-fury"},
 		Platform:   "linux",
 		Exception:  ExceptionInfo{Type: "panic"},
 		Modules:    []Module{module},

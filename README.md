@@ -166,7 +166,7 @@ defer cancel()
 
 err = client.EmitFatal(ctx, crash.Event{
     OccurredAt: time.Now().UTC(),
-    App:        crash.AppInfo{ID: "app_example", Version: "0.2.0-alpha", BuildID: "synthetic-build"},
+    App:        crash.AppInfo{Key: "app_example", Version: "0.2.0-alpha", BuildID: "synthetic-build"},
     Platform:   "linux",
     OS:         crash.OSInfo{Name: "linux", Version: "synthetic"},
     Device:     map[string]string{"class": crash.DeviceClassDesktop, "arch": "x86_64"},
@@ -210,7 +210,7 @@ For Go services you can capture panics automatically instead of building `Event`
 client, err := crash.NewClient(crash.ClientOptions{
     CrashURL:  os.Getenv("SHARDPILOT_CRASH_URL"),
     CrashKey:  os.Getenv("SHARDPILOT_CRASH_KEY"),
-    App:       crash.AppInfo{ID: "fortress-fury", Version: "1.4.0"},
+    App:       crash.AppInfo{Key: "fortress-fury", Version: "1.4.0"},
     CrashComponent: "main-server", // which component this crash came from
 })
 
@@ -290,7 +290,7 @@ disk until the write succeeds. An abrupt exit during an attempt is ambiguous.
 
 The example programs read these from `SHARDPILOT_*` environment variables; the SDK itself reads no environment variables.
 
-Crash client (`crash.ClientOptions`): `CrashURL` (crash ingest base URL), `CrashKey` (needs `crash:write`), plus optional `App` (`AppInfo{ID,Version,BuildID}` — defaulted onto every event; **required for automatic panic capture**, and `App.ID` must equal the API key's app scope), `CrashComponent` (component slug), `AnonymousID`/`SessionID` (optional actor keys — see "Actor identity on crash reports"), `DebugIDFillEnabled` (default `false` — dark; self-module debug-id fill, see "Automatic panic capture"), `AllGoroutineCaptureEnabled` (default `false` — dark; all-goroutine threads at panic time, same section), `HTTPClient`, `Logger`, `Sampler`, `MaxAttempts` (default 2), `RetryBaseDelay` (default 50ms). Default HTTP timeout is 30s.
+Crash client (`crash.ClientOptions`): `CrashURL` (crash ingest base URL), `CrashKey` (needs `crash:write`), plus optional `App` (`AppInfo{Key,Version,BuildID}` — defaulted onto every event; **required for automatic panic capture**, and `App.Key` must equal the API key's app scope), `CrashComponent` (component slug), `AnonymousID`/`SessionID` (optional actor keys — see "Actor identity on crash reports"), `DebugIDFillEnabled` (default `false` — dark; self-module debug-id fill, see "Automatic panic capture"), `AllGoroutineCaptureEnabled` (default `false` — dark; all-goroutine threads at panic time, same section), `HTTPClient`, `Logger`, `Sampler`, `MaxAttempts` (default 2), `RetryBaseDelay` (default 50ms). Default HTTP timeout is 30s.
 
 ### Actor identity on crash reports
 
@@ -335,7 +335,7 @@ Consent decisions ride their own endpoint (`POST {IngestURL}/v1/consent`), never
 
 Remote configuration is fetched from `GET {AppURL}/config/v1/{workspace_id}/{environment_id}`, appending `/{client_id}` only while consent is granted (`Authorization: Bearer <PublishableKey>`, each path segment percent-escaped, `If-None-Match` revalidation when a cached ETag exists; no body, and never the schema-revision header — that is a batch-route contract). By default the request carries **no query parameters**; under the dark `RemoteConfigAttributesEnabled` opt-in — and only while consent is granted — the targeting attributes set via `SetRemoteConfigAttributes` ride as percent-escaped query parameters in the experiment attribute vocabulary (allowlist + `custom_attribute_<name>`, ≤512-byte values, 64-attribute cap, sorted; out-of-vocabulary keys dropped client-side, never sent).
 
-Crash reports go to `POST {base}/api/v1/crashes/ingest` (`Authorization: Bearer <api-key-with-crash:write>`) with a stable `crash_id`, `occurred_at`, app/platform/os, device & context maps, exception metadata, binary modules with `debug_id`/`load_address`, per-thread raw instruction addresses, optional pre-symbolicated frames, optional `raw_text`, and breadcrumbs. The crash structs are a **hand-maintained mirror** of the ShardPilot crash ingest API's OpenAPI schema.
+Crash reports go to `POST {base}/api/v1/crashes/ingest` (`Authorization: Bearer <api-key-with-crash:write>`) with a stable `crash_id`, `occurred_at`, app.key/platform/os, device & context maps, exception metadata, binary modules with `debug_id`/`load_address`, per-thread raw instruction addresses, optional pre-symbolicated frames, optional `raw_text`, and breadcrumbs. The crash structs are a **hand-maintained mirror** of the ShardPilot crash ingest API's OpenAPI schema.
 
 The ingest response is surfaced through the optional `ClientOptions.OnResult func(Result)` callback (fired on both manual `Emit`/`EmitFatal` and the auto-capture path, on the calling goroutine): `Result` carries the server-assigned `CrashID`/`Fingerprint`, a `Suppressed` flag (the crash was accepted but **not stored** because the actor withheld consent — the HTTP status is still `2xx`), and any `Warnings`. Suppression and warnings are also logged. When a `429`/`5xx`, or a `400`/`404` with exact error code `kind_not_enabled`, carries a usable `Retry-After` header (delta-seconds or HTTP-date), the retry loop waits that long, capped at 24 hours. Otherwise it uses full jitter over an exponentially growing window starting at `RetryBaseDelay`, capped at one minute; the default base is 50ms. Caller cancellation interrupts a wait.
 

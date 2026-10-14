@@ -15,6 +15,12 @@
 | `Config.AppID` | `Config.AppKey` |
 | `Config.EnvironmentID` | `Config.EnvironmentKey` |
 
+- Crash events and client defaults use `AppInfo.Key` and emit `app.key`.
+  Replace `AppInfo.ID` with `AppInfo.Key` and the crash example host variable
+  `SHARDPILOT_APP_ID` with `SHARDPILOT_APP_KEY`. There is no old-name alias
+  or dual wire spelling. Crash, session, module, debug and build identifiers
+  retain their existing contracts; credential scope remains authoritative.
+
 - One process can serve experiments to many players. `ExperimentSubject`
   opens a handle for one player's `spcid_` subject and analytics identity;
   its `Fetch`, `Variant`, `VariantPayload`, `Apply`, `SetConsent` and `Close`

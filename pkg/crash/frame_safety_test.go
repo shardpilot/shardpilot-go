@@ -11,7 +11,7 @@ func fatalSafetyEvent(frames []Frame, threadID string) Event {
 		CrashID:    "01890000-0000-7000-8000-000000000000",
 		OccurredAt: time.Now().UTC(),
 		Platform:   "linux",
-		App:        AppInfo{ID: "fortress-fury"},
+		App:        AppInfo{Key: "fortress-fury"},
 		Exception:  ExceptionInfo{Type: "panic"},
 		Threads:    []Thread{{ID: threadID, Crashed: true, Frames: frames}},
 	}

@@ -319,7 +319,7 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 	analytics("unauthenticated", "unauthenticated", []shardpilot.Event{event("app.screen_view", "unauth", 1, nil)}, true)
 	for _, kind := range []string{"go-panic", "native-json", "raw-text"} {
 		caseRun(kind, "crash", func(hc *http.Client) error {
-			c, err := crash.NewClient(crash.ClientOptions{CrashURL: values["SHARDPILOT_CRASH_URL"], CrashKey: values["SHARDPILOT_CRASH_KEY"], App: crash.AppInfo{ID: values["SHARDPILOT_APP_KEY"], Version: "synthetic", BuildID: "sdk-evidence"}, CrashComponent: "sdk-evidence", AnonymousID: values["SHARDPILOT_ANONYMOUS_ID"], SessionID: runID, HTTPClient: hc, MaxAttempts: 1})
+			c, err := crash.NewClient(crash.ClientOptions{CrashURL: values["SHARDPILOT_CRASH_URL"], CrashKey: values["SHARDPILOT_CRASH_KEY"], App: crash.AppInfo{Key: values["SHARDPILOT_APP_KEY"], Version: "synthetic", BuildID: "sdk-evidence"}, CrashComponent: "sdk-evidence", AnonymousID: values["SHARDPILOT_ANONYMOUS_ID"], SessionID: runID, HTTPClient: hc, MaxAttempts: 1})
 			if err != nil {
 				return err
 			}
