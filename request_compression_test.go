@@ -457,12 +457,12 @@ func TestOrdinaryValidationFailureDoesNotDisableCompression(t *testing.T) {
 // consent decision is a few hundred bytes and stays uncompressed; the same
 // helper compresses it once it is worth compressing.
 func TestConsentWritesAreCompressedWhenLargeEnough(t *testing.T) {
-	small := []byte(`{"workspace_id":"workspace-test","categories":{"analytics":true}}`)
+	small := []byte(`{"workspace_key":"workspace-test","categories":{"analytics":true}}`)
 	if _, ok := compressRequestBody(small); ok {
 		t.Fatalf("a %d-byte consent decision must not be compressed", len(small))
 	}
 
-	large := []byte(`{"workspace_id":"workspace-test","reason":"` + strings.Repeat("consent-", 400) + `"}`)
+	large := []byte(`{"workspace_key":"workspace-test","reason":"` + strings.Repeat("consent-", 400) + `"}`)
 	encoded, ok := compressRequestBody(large)
 	if !ok {
 		t.Fatalf("a %d-byte body must be compressed", len(large))
