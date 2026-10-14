@@ -519,6 +519,10 @@ func (c *Client) Track(ctx context.Context, event Event) error {
 		c.lifecycleMu.Unlock()
 		return err
 	}
+	if err := c.validateHostSchemaVersion(event.SchemaVersion); err != nil {
+		c.lifecycleMu.Unlock()
+		return err
+	}
 	event.ID = id
 	event, err = c.prepareEvent(event)
 	if err != nil {
@@ -592,6 +596,9 @@ func (c *Client) Enqueue(event Event) error {
 		return err
 	}
 	if _, err := c.validateHostEventID(event.ID); err != nil {
+		return err
+	}
+	if err := c.validateHostSchemaVersion(staged.SchemaVersion); err != nil {
 		return err
 	}
 	if errors.Is(stageErr, ErrEventTooLarge) {
@@ -2007,15 +2014,19 @@ func contextCause(ctx context.Context) error {
 func cloneEvent(event Event) Event {
 	event.Props = cloneMap(event.Props)
 	event.Context = cloneMap(event.Context)
+	if event.SchemaVersion != nil {
+		version := *event.SchemaVersion
+		event.SchemaVersion = &version
+	}
 	return event
 }
 
 // stageEvent prepares and encodes an event for Enqueue before intake takes
-// lifecycleMu. An event whose name or id the intake checks refuse is left
+// lifecycleMu. An event whose name, id or version the intake checks refuse is left
 // unprepared: those checks report and count it in their usual order.
 func (c *Client) stageEvent(event Event) (Event, error) {
 	id := strings.ToLower(strings.TrimSpace(event.ID))
-	if normalizeEventName(event.Name) == "" || (id != "" && !validEventID(id)) {
+	if normalizeEventName(event.Name) == "" || (id != "" && !validEventID(id)) || !validEventSchemaVersion(event.SchemaVersion) {
 		return event, nil
 	}
 	event.ID = id

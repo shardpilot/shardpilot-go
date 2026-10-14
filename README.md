@@ -66,6 +66,31 @@ This release adds no typed session or ad-revenue producer; migrate any direct
 calls using reserved names before upgrading, without renaming them to bypass
 the restriction. Local name admission does not establish server acceptance.
 
+### Per-event schema version (unreleased)
+
+This source adds `Event.SchemaVersion *int`; the published `v0.8.1` API predates
+this option. Leave it nil to emit integer 1, or select an integer from 1 through
+65535 on an ordinary event:
+
+```go
+version := 2
+err := client.Enqueue(shardpilot.Event{
+    Name: "app.screen_view", SchemaVersion: &version,
+})
+```
+
+`Track` accepts the same field. Intake snapshots the pointed value, and actual
+wire-size checks, retries and newly written spool records retain that selection.
+Explicit zero, negative or over-65535 values return `ErrSchemaVersionInvalid`,
+which matches `ErrInvalidEvent` through `errors.Is`, count one drop and set
+`Stats.LastError` to `schema_version_invalid`. Existing lifecycle, consent,
+name and ID refusals take precedence. SDK-owned producers keep their versions;
+the option does not admit reserved names or change sealed experiment facts.
+`Supports("event_schema_version")` reports this support before initialization.
+The option is independent of `Config.SchemaRevision` and its declaration header.
+The server determines whether the selected contract exists and is active;
+rejection never selects another version automatically.
+
 For a bounded analytics-and-crash evidence run, set the environment variables in
 [`examples/evidence`](examples/evidence/README.md), then run
 `go build -trimpath -o /tmp/shardpilot-go-evidence ./examples/evidence` followed by

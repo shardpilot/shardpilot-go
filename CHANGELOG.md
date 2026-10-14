@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Adds optional `Event.SchemaVersion *int` to `Track` and `Enqueue`: nil
+  retains version 1; explicit values must be 1..65535. Invalid values return
+  `ErrSchemaVersionInvalid` (`schema_version_invalid`). Intake snapshots the
+  selected value for wire-size checks, retries and newly written spool records.
+  Adds the exact `event_schema_version` capability; SDK-owned facts keep their versions.
+
 ## v0.8.1 — 2026-10-14 — retire the superseded pre-alpha line
 
 - Retracts `v0.1.0` through `v0.1.2`, the superseded pre-alpha line, without

@@ -7,8 +7,11 @@ type Event struct {
 
 	// ID is a caller UUID (versions 4, 5 or 7, RFC variant), trimmed and sent lowercase.
 	// Empty IDs are generated as UUIDv7 once at intake and retained on retries.
-	ID              string
-	Name            string
+	ID   string
+	Name string
+	// SchemaVersion selects an event contract in 1..65535. Nil emits version 1.
+	// Intake snapshots the value; explicit zero is invalid.
+	SchemaVersion   *int
 	Timestamp       time.Time
 	UserID          string
 	AnonymousID     string
