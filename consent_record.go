@@ -26,17 +26,15 @@ import (
 // open-by-default posture. RemoteConfigCachePath alone never enables consent
 // persistence.
 
-// consentAnalyticsUnwitnessed is the decision value written for a WITHHELD
-// grant. No released build recognises it, so every decoder — including this
-// one's predecessors — refuses to treat the record as authorization.
-// consentAnalyticsUnwitnessed is the decision value written for a WITHHELD
-// grant: the legacy-understood DENIED, so an older build honours it as a
-// denial. An earlier revision used an unknown value on the reasoning that an
-// old decoder would reject the record — it does, and rejecting lands it in
-// the MORE permissive branch, because a build that sees no usable record lets
-// its trail-tail override apply a retained grant unconditionally. Rejecting
-// the record is not the same as refusing the authorization, and only the
-// second one was ever the goal.
+// consentAnalyticsUnwitnessed represents a withheld grant with the
+// legacy denial value. A reader that understands "denied" can retain
+// that denial instead of rejecting an unknown decision value.
+// WithheldAnalytics carries the withheld decision for the current
+// reader, which marks a recognized withheld record unwitnessed.
+//
+// Rejecting a record is not the same as refusing authorization: a
+// reader's fallback to a retained trail can otherwise recover a grant.
+// The sentinel therefore uses the recognized denial value.
 const consentAnalyticsUnwitnessed = "denied"
 
 const (
@@ -322,18 +320,15 @@ func loadConsentRecordRead(dir, actorDigest string) (consentRecordInfo, bool, co
 		// else to compare against. Discarding it makes every foreign record
 		// an unbounded veto.
 		none.decidedAt = record.DecidedAt
-		// A well-formed record for a DIFFERENT actor records nothing about
-		// THIS scope — but it is not the same as no file at all, and an
-		// earlier revision of this code collapsed the two and said so in a
-		// comment that was wrong. consentRecordPath takes only the
-		// directory: it is ONE file per SpoolDir, stamped with a digest
-		// rather than keyed by one, and saveConsentRecord overwrites it
-		// whole. So a sibling scope's decision — a login that sets a
-		// UserID, a tenant switch, a second AppKey — erases this scope's
-		// unwitnessed mark, and the same sibling's merging outbox save
-		// sanitizes the unreadable trail into a clean record. Both pieces
-		// of evidence vanish and the grant a previous start refused is
-		// promoted AND healed to disk. FOREIGN keeps the two apart.
+		// A well-formed record for another actor is distinct from absence.
+		// consentRecordPath selects one file per SpoolDir; its digest stamps
+		// the contents rather than selecting a separate file for each scope.
+		// saveConsentRecord replaces that file, so a sibling scope's decision
+		// can replace this scope's unwitnessed mark. Outbox maintenance can
+		// also replace the unreadable trail with a parsed view.
+		//
+		// Return the foreign verdict so floor initialization can veto retained
+		// grant recovery instead of treating that record as absent.
 		return none, false, consentRecordReadForeign
 	}
 	info := consentRecordInfo{decidedAt: record.DecidedAt, floor: record.Floor, unwitnessed: record.Unwitnessed, unwitnessedAt: record.UnwitnessedAt}
