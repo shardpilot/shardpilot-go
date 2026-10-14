@@ -27,10 +27,10 @@ Real, tested, working code — **early alpha**. The API is pre-v1 and may change
 Prepared install command (use after the announced release):
 
 ```bash
-go get github.com/shardpilot/shardpilot-go@v0.8.0
+go get github.com/shardpilot/shardpilot-go@v0.8.1
 ```
 
-`v0.8.0` is the latest tag target for this source. Install after its release announcement; the release PR prepares the source, and tagging/publication is a separate step.
+`v0.8.1` is the latest tag target for this source. Install after its release announcement; the release PR prepares the source, and tagging/publication is a separate step.
 
 **Consent getter migration:** replace `client.Consent()` with `client.ConsentState()`. The named string result retains `unknown`, `granted`, `denied` and `denied_forced_minor`; a zero-value client reports `unknown`. The old getter has no compatibility alias.
 
@@ -42,7 +42,7 @@ If upgrading from `v0.6.3-alpha`, also follow the [consent-policy migration](CHA
 
 This release includes the changes summarized in [CHANGELOG.md](CHANGELOG.md), including the previously unrecorded `v0.6.2-alpha` release. `v0.6.0-alpha` shipped the optional pseudonymous actor key on crash reports — `Event.AnonymousID`, the ONLY field the service keys the actor on, with `Event.SessionID` alongside it as session linkage that is never used as the actor key (both `omitempty`, so a client that does not opt in keeps a byte-identical wire shape) — the dark opt-in experiment-assignment consumer with consent-gated exposure/outcome producers, the dark opt-in remote-config targeting-attribute pass-through, the crash capture opt-ins (self-module debug-id fill and all-goroutine threads), and the opt-in client-side consent floor (`Config.ConsentFloor`), on top of the v0.5.0-alpha remote config client, disk spool, schema-revision declaration and full-jitter retry backoff documented in this README. **Do not pin an earlier tag.** Do not pin `v0.5.0-alpha` or `v0.6.0-alpha`; use `v0.6.1-alpha` or later (`v0.6.1-alpha` has no Go source difference from `v0.6.0-alpha`). Tags at `v0.4.0-alpha` and below predate most of what this README documents. If you need a release without the features listed above, wait for a later one rather than reaching back.
 
-For analytics only, `v0.1.2` is available. **`v0.1.0` is retracted** in the module's `go.mod`; use `v0.1.2` or `v0.2.0-alpha`. Not "or later" — that phrasing pointed at `v0.5.0-alpha` and `v0.6.0-alpha`, the two tags this change exists to stop distributing, and contradicted the prohibition four lines above. The pin at the top of this file is the current release. `v0.1.2` requires **Go 1.24+** — it is the Go 1.24 modernization release and its `go` directive is immutable. The **1.25** baseline stated above applies from `v0.6.2-alpha`, not retroactively to older tags.
+**`v0.1.0` through `v0.1.2` are retracted** in this release's `go.mod` as the superseded pre-alpha line; do not use them as an installation fallback. Use the release pin above after its announcement. Historical tags keep their original Go directives; the Go 1.25 baseline is not applied retroactively to them.
 
 ## Quick start (analytics)
 
@@ -314,7 +314,7 @@ A malformed value (free-form text, an email, an IP, a JWT, a raw `user_`/`player
 
 App-first event envelope (`POST {IngestURL}/v1/events:batch`, `Authorization: Bearer <token>`). Ordinary event envelopes carry `event_id`, `schema_version`, `event_name`, `source`, `event_ts`, `workspace_key`, `app_key`, `environment_key`, and optional `user_id`, `anonymous_id`, `session_id`, `session_sequence`, `platform`, `app_version`, `app_build`, `context`, `props`.
 
-Every request the SDK makes (event batches, consent, remote config, the experiment assignment and apply routes, and crash ingest) carries `X-ShardPilot-SDK: go/<version>`, for example `go/0.8.0`. The version is the release the SDK was cut from, held as a constant in code; it never comes from configuration.
+Every request the SDK makes (event batches, consent, remote config, the experiment assignment and apply routes, and crash ingest) carries `X-ShardPilot-SDK: go/<version>`, for example `go/0.8.1`. The version is the release the SDK was cut from, held as a constant in code; it never comes from configuration.
 
 SDK-owned experiment exposure and outcome facts use schema major 2 and the literal `workspace_key`, `app_key`, and `environment_key` returned by the platform. The SDK forwards the signed fact values and attestation seal without renaming them to `*_id`. Existing spooled bytes remain unchanged; previously queued major-1 experiment facts are not upgraded or re-signed.
 

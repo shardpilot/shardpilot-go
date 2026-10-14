@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## v0.8.1 — 2026-10-14 — retire the superseded pre-alpha line
+
+- Retracts `v0.1.0` through `v0.1.2`, the superseded pre-alpha line, without
+  changing the public API or its behavior.
+- Updates release pins and the SDK identity header to `go/0.8.1`.
+
 ## v0.8.0 — 2026-10-14 — scope keys and explicit consent outcomes
 
 - Analytics configuration uses `WorkspaceKey`, `AppKey` and `EnvironmentKey`

@@ -48,8 +48,10 @@ reversible. Cutting one is the only irreversible step in this procedure.
 
 Never delete or move a published tag — Go module proxies cache tagged
 versions forever. Instead, add a `retract` directive to `go.mod` and release
-a corrected version. Precedent: `v0.1.0` is retracted
-(`retract v0.1.0 // documentation re-cut; superseded by v0.1.1`) and
-consumers were pointed at `v0.1.1`/`v0.1.2`. The retract directive itself
+a corrected version. For the current release, the precedent is
+`retract [v0.1.0, v0.1.2] // superseded pre-alpha line`, retiring the stale
+`v0.1.x` line. Consumers move to the current announced `v0.8.x` pin. Retain
+that range in later releases rather than recommending another retired version.
+The retract directive itself
 only takes effect once it is part of a released version, so ship it with the
 corrective release.
