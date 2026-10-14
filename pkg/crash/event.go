@@ -104,7 +104,7 @@ func sanitizeActorIdentifier(value string) string {
 }
 
 type AppInfo struct {
-	ID      string `json:"id"`
+	Key     string `json:"key"`
 	Version string `json:"version,omitempty"`
 	BuildID string `json:"build_id,omitempty"`
 }
@@ -179,8 +179,8 @@ func validateEvent(event Event) error {
 	if event.OccurredAt.Location() != time.UTC {
 		return fmt.Errorf("%w: occurred_at must be UTC", ErrInvalidEvent)
 	}
-	if strings.TrimSpace(event.App.ID) == "" {
-		return fmt.Errorf("%w: app.id is required", ErrInvalidEvent)
+	if strings.TrimSpace(event.App.Key) == "" {
+		return fmt.Errorf("%w: app.key is required", ErrInvalidEvent)
 	}
 	if strings.TrimSpace(event.Platform) == "" {
 		return fmt.Errorf("%w: platform is required", ErrInvalidEvent)

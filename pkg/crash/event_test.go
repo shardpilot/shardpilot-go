@@ -87,7 +87,7 @@ func validEvent(t *testing.T) Event {
 	return Event{
 		CrashID:    id,
 		OccurredAt: time.Unix(1700000002, 0).UTC(),
-		App:        AppInfo{ID: "app_test_001", Version: "0.2.0-alpha-test", BuildID: "build-test"},
+		App:        AppInfo{Key: "app_test_001", Version: "0.2.0-alpha-test", BuildID: "build-test"},
 		Platform:   "linux",
 		OS:         OSInfo{Name: "linux", Version: "test"},
 		Device:     map[string]string{"class": DeviceClassDesktop, "arch": "x86_64"},

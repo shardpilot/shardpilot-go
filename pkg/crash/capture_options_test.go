@@ -84,7 +84,7 @@ func TestRecoverDebugIDFillAttachesSelfModule(t *testing.T) {
 	client, err := crash.NewClient(crash.ClientOptions{
 		CrashURL:           server.URL,
 		CrashKey:           "workspace-api-key-test",
-		App:                crash.AppInfo{ID: "fortress-fury"},
+		App:                crash.AppInfo{Key: "fortress-fury"},
 		CrashComponent:     "main-server",
 		Logger:             testLogger{t},
 		DebugIDFillEnabled: true,
@@ -131,7 +131,7 @@ func TestRecoverAllGoroutineCaptureAddsParkedGoroutines(t *testing.T) {
 	client, err := crash.NewClient(crash.ClientOptions{
 		CrashURL:                   server.URL,
 		CrashKey:                   "workspace-api-key-test",
-		App:                        crash.AppInfo{ID: "fortress-fury"},
+		App:                        crash.AppInfo{Key: "fortress-fury"},
 		CrashComponent:             "main-server",
 		Logger:                     testLogger{t},
 		AllGoroutineCaptureEnabled: true,
@@ -187,7 +187,7 @@ func TestRecoverAllGoroutineCaptureRespectsEventCaps(t *testing.T) {
 	client, err := crash.NewClient(crash.ClientOptions{
 		CrashURL:                   server.URL,
 		CrashKey:                   "workspace-api-key-test",
-		App:                        crash.AppInfo{ID: "fortress-fury"},
+		App:                        crash.AppInfo{Key: "fortress-fury"},
 		Logger:                     testLogger{t},
 		AllGoroutineCaptureEnabled: true,
 	})

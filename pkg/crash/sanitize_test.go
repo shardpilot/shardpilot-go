@@ -140,7 +140,7 @@ func TestSanitizeEventCapsBreadcrumbs(t *testing.T) {
 func assertEventHasNoDisallowedStrings(t *testing.T, event Event) {
 	t.Helper()
 	values := []string{
-		event.App.ID,
+		event.App.Key,
 		event.App.Version,
 		event.App.BuildID,
 		event.Platform,
