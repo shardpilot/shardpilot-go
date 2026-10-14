@@ -159,7 +159,7 @@ func fetchAndApply(t *testing.T, c *Client, key string) ExperimentAssignmentResu
 	return result
 }
 
-// Regressions from the review of #125.
+// Variant application validates the requested assignment and its outcome.
 
 // F1: a denial landing between ApplyExperimentVariant's consent check and
 // its lock must not see the variant served or an exposure armed — the same

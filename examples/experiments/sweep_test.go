@@ -9,14 +9,6 @@ import (
 // The sweep. For every structural surface these rules RECOGNISE, what happens to
 // a form they do NOT recognise?
 //
-// ⚠ IT IS A FIXTURE, NOT A REPORT, AND THAT IS THE WHOLE POINT. Written as a
-// survey that logs its findings, it was a placebo: it told me seven of ten forms
-// were published and let the suite pass. The rule it enforces — a header value
-// is printed as received only if it passes the criterion in redact.go — is prose
-// everywhere else, and prose composes silently. A field added next month that
-// the criterion does not cover fails HERE, in the run that adds it, instead of
-// in a review round some weeks later.
-//
 // Each case carries SRVGEN, standing for a value the ENDPOINT generated. It is
 // absent from suppliedValues by construction, so the publication guard cannot
 // see it: if it reaches the artifact, nothing downstream will catch it.
@@ -145,7 +137,7 @@ func TestStructureSurvivesWhereItIsVouchedFor(t *testing.T) {
 		t.Cleanup(func() { requestNames = map[string]bool{} })
 		// ⚠ ON OUR OWN REQUEST LINE. The registry answers for what the harness
 		// SENT; a redirect target is the endpoint's URL and its names are its own
-		// (shardpilot/shardpilot-go#85 review).
+		// .
 		got := stripMarks(redactQuery("GET /cb?custom_attribute_%C3%A9=v HTTP/1.1"))
 		if !strings.Contains(got, "custom_attribute_%C3%A9=") {
 			t.Fatalf("a harness-owned name was classified as endpoint-chosen: %q", got)
@@ -162,8 +154,7 @@ func TestTheCriterionStillAdmitsWhatItShould(t *testing.T) {
 		{"a relative path containing ://", "HTTP/1.1 302 Found\r\nLocation: /cb/http://e/x\r\n\r\n", "/"},
 		{"an interior at-sign in a path", "HTTP/1.1 302 Found\r\nLocation: /a//foo@bar/b\r\n\r\n", "/"},
 		{"a GMT HTTP-date", "HTTP/1.1 200 OK\r\nDate: Mon, 02 Jan 2006 15:04:05 GMT\r\n\r\n", "15:04:05 GMT"},
-		// One entry from each transcribed registry, so a truncated list fails
-		// here rather than in a review round.
+		// One entry from each transcribed registry keeps truncated lists observable.
 		{"a registered media type", "HTTP/1.1 200 OK\r\nContent-Type: application/cbor\r\n\r\n", "application/cbor"},
 		{"a registered response field", "HTTP/1.1 200 OK\r\nContent-Digest: sha-256=:x:\r\n\r\n", "Content-Digest"},
 		{"a registered cache directive", "HTTP/1.1 200 OK\r\nCache-Control: stale-if-error=60\r\n\r\n", "stale-if-error=60"},
@@ -233,7 +224,6 @@ func TestClausesTheSweepCannotExpress(t *testing.T) {
 	})
 }
 
-// Structure that must survive, for the clauses added this round.
 func TestStructureSurvivesTheNewerClauses(t *testing.T) {
 	for _, c := range []struct{ name, dump, keep string }{
 		{"a registered CORS field name", "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\n\r\n", "Access-Control-Allow-Origin"},
@@ -337,8 +327,6 @@ func TestListsAndBorrowedPredicates(t *testing.T) {
 	})
 }
 
-// ---- round on 5046f38 ----
-
 func TestRefusalDiagnosticsCarryNoEndpointText(t *testing.T) {
 	structuralSurfaces = nil
 	suppliedValues = nil
@@ -403,8 +391,6 @@ func TestTheRequestAuthorityStaysInsideTheGuard(t *testing.T) {
 	}
 }
 
-// ---- round on 9625b3d ----
-
 func TestBracketedAuthoritiesAreIPLiterals(t *testing.T) {
 	for _, c := range []struct {
 		target  string
@@ -460,10 +446,9 @@ func TestCookieValuesAreMeasuredBeforeOurEscape(t *testing.T) {
 }
 
 func TestTheRegistriesNameTheirSource(t *testing.T) {
-	// ⚠ NOT A STYLE CHECK. Three of these lists bled one entry per review round
-	// because they answered the length of the author's memory. A named source is
-	// what lets the NEXT person complete one in a single operation, so the
-	// provenance is pinned the way any other load-bearing fact is.
+	// Each list names its source so the complete current population can be
+	// derived in one operation. The assertions bind that population to its
+	// registry instead of relying on a hand-written subset.
 	for _, want := range []string{
 		"iana.org/assignments/media-types",
 		"iana.org/assignments/http-fields",

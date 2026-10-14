@@ -308,8 +308,7 @@ func TestRemintAbortsOnRacedDenial(t *testing.T) {
 
 // ── Dark-client withdrawal-marker adjudication ──────────────────────────────
 
-// TestDarkClientHonorsReadableWithdrawalMarker pins the adjudicated fleet
-// posture (unchanged by these fixes): a READABLE withdrawal marker is a durable
+// TestDarkClientHonorsReadableWithdrawalMarker pins the withdrawal rule: a READABLE withdrawal marker is a durable
 // purge debt and is honored — and spent — even while experiments are dark;
 // only the named ids are filtered, and the ordinary spool loads and serves.
 func TestDarkClientHonorsReadableWithdrawalMarker(t *testing.T) {

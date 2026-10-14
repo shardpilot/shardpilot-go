@@ -34,9 +34,9 @@ import (
 	"unicode"
 )
 
-// Each test below stands for one review finding on this program. They are here
-// because the findings were all of one kind -- the record claiming something the
-// bytes do not support -- and that kind is invisible to a run that succeeds.
+// Each case compares the record's claims with the bytes it observed.
+// A successful execution alone does not establish that correspondence.
+// The assertions keep those observations explicit.
 
 func TestDropFramingStopsAtTheHeaderBlock(t *testing.T) {
 	dump := "HTTP/1.1 200 OK\r\n" +
@@ -241,11 +241,7 @@ func TestGuardHasNoFixedDecodingDepth(t *testing.T) {
 	for i := 0; i < 40; i++ {
 		v = strings.ReplaceAll(v, "%", "%25")
 	}
-	// ⚠ ASSERT THE REASON, NOT MERELY AN ERROR. The first version of this test
-	// checked only `err != nil`, and the mutant that restores the 16-round cap
-	// SURVIVED it: that version also errors, but with "did not settle" rather
-	// than by finding the value. Two different verdicts, one indistinguishable
-	// assertion.
+
 	err := assertNoLeak(asCaptured(v))
 	if err == nil {
 		t.Fatal("a deeply nested encoding walked through the guard")
@@ -531,8 +527,6 @@ func TestTrailersAreSnapshotAtEOFNotFromTheHead(t *testing.T) {
 	}
 }
 
-// ---- round on c0fbd19: five findings, one property each ----
-
 func TestNameBoundariesDoNotReachOrdinaryBodyText(t *testing.T) {
 	suppliedValues = []string{"bar"}
 	t.Cleanup(func() { suppliedValues = nil })
@@ -602,8 +596,6 @@ func TestReportDoesNotClaimTheBodyIsAsReceived(t *testing.T) {
 	}
 }
 
-// ---- round on 0dc23aa: six findings ----
-
 func TestEscapingSeparatesABackslashNextToAMarker(t *testing.T) {
 	adjacent := escapeMarks(`\` + capturedMark) // a backslash then a REAL marker byte
 	literal := escapeMarks(`\` + `\x00`)        // a backslash then the wire spelling
@@ -630,13 +622,7 @@ func TestGuardDecodesBareHexadecimal(t *testing.T) {
 func TestDecodeBudgetChargesEveryStage(t *testing.T) {
 	suppliedValues = []string{"abcdefgh"}
 	t.Cleanup(func() { suppliedValues = nil })
-	// ~1 MiB of filler plus an escape nested deeply enough that the rounds
-	// needed, times the FIVE decoders each round runs, exceeds the budget --
-	// while one charge per round would stay well inside it.
-	// ⚠ NESTED, NOT REPEATED. `%25%25%25…` all peels in ONE pass, because
-	// undoPercent decodes each escape independently; the nesting that costs a
-	// round each is in the encoding of the percent SIGN -- `%2525` -> `%25` -> `%`.
-	// And the payload decodes to something harmless, so only the budget can fire.
+
 	nested := "%" + strings.Repeat("25", 20) + "41"
 	body := nested + strings.Repeat("f", 1<<20)
 	err := assertNoLeak(asCaptured(body))
@@ -656,8 +642,6 @@ func TestStatusLineIsNotRewrittenByTheValueScrub(t *testing.T) {
 		t.Fatalf("the BODY occurrence was left unredacted: %q", got)
 	}
 }
-
-// ---- round on 51eeaaf: three findings ----
 
 func TestReportDoesNotClaimTheStatusLineIsReceived(t *testing.T) {
 	if strings.Contains(respSection, "status line is as received") {
@@ -700,8 +684,6 @@ func TestABodyLineShapedLikeAHeaderIsNotAFieldName(t *testing.T) {
 		t.Fatal("a genuine field name stopped being checked under the name rule")
 	}
 }
-
-// ---- round on 6b28540 ----
 
 func TestFieldNamesAreDecodedBeforeTheNameBoundaryApplies(t *testing.T) {
 	suppliedValues = []string{"bar"}
@@ -793,8 +775,6 @@ type rtFunc func(*http.Request) (*http.Response, error)
 
 func (f rtFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
-// ---- round on 7854bd8 ----
-
 func TestATransportErrorDoesNotDeadlockTheRecorder(t *testing.T) {
 	r := &recorder{inner: rtFunc(func(*http.Request) (*http.Response, error) {
 		return nil, errors.New("dial: no route")
@@ -853,8 +833,6 @@ type closerFunc func() error
 func (f closerFunc) Close() error             { return f() }
 func (f closerFunc) Read([]byte) (int, error) { return 0, io.EOF }
 
-// ---- round on 706ab2c ----
-
 func TestMimeNormalisationStaysInsideTheEncodedRun(t *testing.T) {
 	suppliedValues = []string{"abcdefghijklmnopqrstuvwxyz012345678901234567890123456789"}
 	t.Cleanup(func() { suppliedValues = nil })
@@ -900,8 +878,6 @@ func TestGeneratedCaptureNotesAreMarked(t *testing.T) {
 		t.Fatalf("the generated note was destroyed: %q", got)
 	}
 }
-
-// ---- round on 0cdc4ee / 03cba8b ----
 
 func TestDecodedFieldNamesAreFoldedBeforeApproval(t *testing.T) {
 	suppliedValues = []string{"secret"}
@@ -984,8 +960,6 @@ func TestTheWithheldQueryMarkerIsOneToken(t *testing.T) {
 	}
 }
 
-// ---- round on 3d334a3 ----
-
 func TestNormalisedCandidateReachesAFixedPoint(t *testing.T) {
 	suppliedValues = []string{"abcdefgh"}
 	t.Cleanup(func() { suppliedValues = nil })
@@ -1049,7 +1023,7 @@ func TestABodyReadErrorIsReadByTheGuard(t *testing.T) {
 	// artifact either. What this scene is for is the other half: the guard must go
 	// on decoding the endpoint text that is NOT quoted, which is the fallback for
 	// any diagnostic shape the redaction does not cover
-	// (shardpilot/shardpilot-go#85 review).
+	// .
 	tee := &teeBody{err: errors.New("malformed trailer X-Bad " + enc)}
 	ex := exchange{head: []byte("x"), captured: tee}
 	// ⚠ THE PROPERTY GOT STRONGER, SO THE ASSERTION DID. This used to say the guard
@@ -1087,8 +1061,6 @@ func TestTheSerialiserUserAgentIsGenerated(t *testing.T) {
 		t.Fatalf("the serialiser's own User-Agent was read as a leak: %v", err)
 	}
 }
-
-// ---- round on 4b472c8 ----
 
 func TestGrammarLiteralsAreFoundByParsing(t *testing.T) {
 	suppliedValues = []string{"false"}
@@ -1139,8 +1111,6 @@ func TestTheSerialiserConnectionHeaderIsGenerated(t *testing.T) {
 	}
 }
 
-// ---- round on d9a8bb1 ----
-
 func TestOnlySynthesisedConnectionIsGenerated(t *testing.T) {
 	suppliedValues = []string{"bar"}
 	t.Cleanup(func() { suppliedValues = nil; receivedConnection = false })
@@ -1150,7 +1120,7 @@ func TestOnlySynthesisedConnectionIsGenerated(t *testing.T) {
 	// guard-errors MECHANISM with the property, because it redacts the value
 	// structurally and nothing reaches the guard. Both corrections are real and
 	// they are about different halves of the same sentence
-	// (shardpilot/shardpilot-go#84, #85 review).
+	// .
 	receivedConnection = true
 	got1 := stripMarks(scrubSupplied(dropFraming(
 		"HTTP/1.1 200 OK\r\nConnection: YmFy\r\n\r\n")))
@@ -1185,7 +1155,7 @@ func TestRefusalLabelsCarryNoEndpointText(t *testing.T) {
 	// ⚠ THE ACCOUNTING LEDGER, NOT THE REFUSAL ONE. The guard half refused such a
 	// capture, so detection and refusal were the same list. This half redacts and
 	// PUBLISHES it, so asserting on the refusal ledger would demand the program
-	// refuse every fact response (shardpilot/shardpilot-go#85, stack seam).
+	// refuse every fact response .
 	if len(accountedSurfaces) == 0 {
 		t.Fatal("a folded minted name stopped being detected")
 	}
@@ -1242,7 +1212,7 @@ func TestAnOrdinaryFactResponseStaysPublishable(t *testing.T) {
 // an ordinary response; nothing asserted it FILLS for a shape the rules cannot
 // describe, so `refusalLedger` could have returned nil unconditionally with the
 // whole suite green — a negative-only assertion is satisfied by a gate that never
-// fires (shardpilot/shardpilot-go#85, promise sweep).
+// fires .
 func TestASurfaceTheRulesCannotDescribeRefuses(t *testing.T) {
 	structuralSurfaces = nil
 	accountedSurfaces = nil
@@ -1251,7 +1221,7 @@ func TestASurfaceTheRulesCannotDescribeRefuses(t *testing.T) {
 	// ⚠ THE EXAMPLE MOVED, THE SCENE DID NOT. This used `Set-Cookie: ` — an
 	// OWS-only value — which is a shape the rules CAN describe: there are no value
 	// bytes to conceal, so it is now published as it arrived and refusing it cost a
-	// safe capture exit 4 (shardpilot/shardpilot-go#85 review). The scene's job is
+	// safe capture exit 4 . The scene's job is
 	// unchanged and still needed: it is the positive control proving `refusalLedger`
 	// can FILL, without which it could return nil unconditionally and the whole
 	// suite stay green. So it is pointed at a surface that is still undescribable —
@@ -1267,7 +1237,7 @@ func TestASurfaceTheRulesCannotDescribeRefuses(t *testing.T) {
 // decoding to invalid UTF-8 that CONTAINS a supplied value. `undoHex` drops such
 // a decode because substituting binary destroys the text around it, and nothing
 // retained the bytes -- so the guard approved a value a standard hex decoder
-// reconstructs in one step (shardpilot/shardpilot-go#84 review).
+// reconstructs in one step .
 func TestABinaryHexDecodeIsRetained(t *testing.T) {
 	suppliedValues = []string{"abcdefgh"}
 	t.Cleanup(func() { suppliedValues = nil })
@@ -1280,7 +1250,7 @@ func TestABinaryHexDecodeIsRetained(t *testing.T) {
 // binary candidate is an INPUT to the decoder chain, not an answer from it.
 // `/yU2MWJjZGVmZ2g=` is base64 of `0xff%61bcdefgh`; the binary decode was kept
 // as-is and never percent-decoded, and the ordinary chain cannot reach it
-// because it never un-wraps the base64 (shardpilot/shardpilot-go#84 review).
+// because it never un-wraps the base64 .
 func TestABinaryCandidateIsDecodedAgain(t *testing.T) {
 	suppliedValues = []string{"abcdefgh"}
 	t.Cleanup(func() { suppliedValues = nil })
@@ -1293,7 +1263,7 @@ func TestABinaryCandidateIsDecodedAgain(t *testing.T) {
 // that ends mid-value. `topLevelMembers` returns nothing for it, and "no top-level
 // names" was read as "no minted field here" — so the identifier was published and
 // the leak guard could not help, because a server-minted value is not supplied
-// (shardpilot/shardpilot-go#84 review).
+// .
 func TestAMalformedBodyWithAMintedFieldRefuses(t *testing.T) {
 	structuralSurfaces = nil
 	suppliedValues = nil
@@ -1304,8 +1274,7 @@ func TestAMalformedBodyWithAMintedFieldRefuses(t *testing.T) {
 	// The guard half could only REFUSE a malformed body carrying a minted field,
 	// so its scene asserted refusal. This half redacts the value, which is the
 	// stronger outcome: the identifier never reaches the artifact. What it owes is
-	// the record, and that is what is asserted (shardpilot/shardpilot-go#84 review,
-	// ported across the stack seam).
+	// the record, and that is what is asserted .
 	got := stripMarks(dropFraming("HTTP/1.1 200 OK\r\n\r\n" +
 		`{"assigned":true,"subject_fact_key":"sfk1_xxxxxxxxxxxx"`))
 	if strings.Contains(got, "sfk1_xxxxxxxxxxxx") {
@@ -1319,7 +1288,7 @@ func TestAMalformedBodyWithAMintedFieldRefuses(t *testing.T) {
 // TestAShortValueInsideANonASCIIWordSurvives is the reviewer's own example: the
 // short-value rule exists to avoid corrupting unrelated words, and a byte-based
 // boundary check made every non-ASCII byte a separator — so `é` was rewritten
-// inside the unrelated endpoint word `αéβ` (shardpilot/shardpilot-go#84 review).
+// inside the unrelated endpoint word `αéβ` .
 func TestAShortValueInsideANonASCIIWordSurvives(t *testing.T) {
 	suppliedValues = []string{"é"}
 	t.Cleanup(func() { suppliedValues = nil })
@@ -1342,7 +1311,7 @@ func TestAShortValueInsideANonASCIIWordSurvives(t *testing.T) {
 // TestASanitizerCreatedMarkIsNotEscaped: `dropQuery` inserts a GENERATED
 // `query-withheld` token, and the outer escape read those freshly generated bytes
 // as endpoint bytes — so the report claimed a transport error contained a mark
-// pair nothing produced (shardpilot/shardpilot-go#84 review).
+// pair nothing produced .
 func TestASanitizerCreatedMarkIsNotEscaped(t *testing.T) {
 	suppliedValues = nil
 	got := stripMarks(sanitizeCaptured(&url.Error{
@@ -1375,8 +1344,6 @@ func TestASanitizerCreatedMarkIsNotEscaped(t *testing.T) {
 	}
 }
 
-// ---- round on b7d4c7a ----
-
 // TestIPvFutureNeedsItsWholeGrammar asks `isIPvFuture` directly, NOT through
 // `parsesAsURI`.
 //
@@ -1390,7 +1357,7 @@ func TestASanitizerCreatedMarkIsNotEscaped(t *testing.T) {
 // rest of this file stopped borrowing predicates: a future net/url that starts
 // accepting IPvFuture must not silently widen what this program publishes. So the
 // scene exercises the predicate, which is the thing that would then be
-// load-bearing (shardpilot/shardpilot-go#85 review).
+// load-bearing .
 func TestIPvFutureNeedsItsWholeGrammar(t *testing.T) {
 	for _, bad := range []string{"vSERVER-SECRET", "v", "v.abc", "vg7.abc", "v7.", "v7abc"} {
 		if isIPvFuture(bad) {
@@ -1444,7 +1411,7 @@ func TestAVouchedCookieNameIsMarked(t *testing.T) {
 	// showed that vouching a cookie name because it appears in `requestNames`
 	// publishes a supplied identifier: a name we sent in a QUERY is not a name we
 	// authored in a `Set-Cookie` the ENDPOINT wrote
-	// (shardpilot/shardpilot-go#85 review). Cookie names are always lengthened now.
+	// . Cookie names are always lengthened now.
 	// What this scene still holds is the reason it was written: the name must not
 	// reach the generic scrub, which would rewrite it into PROSE and produce
 	// something no cookie parser accepts. The placeholder is token-safe and
@@ -1540,13 +1507,11 @@ func TestDepthIsWalkedForwardNotRescanned(t *testing.T) {
 	}
 }
 
-// ---- round on 9721c2d ----
-
 // TestATrailingJSONValueIsNotGrammar is the reviewer's own example. `json.Decoder`
 // reads a SEQUENCE of top-level values, so `{"x":1} false` walked as valid JSON
 // and the trailing literal was marked as grammar — and a marked span is skipped by
 // both the scrub and the guard, while `json.Unmarshal` rejects that body as a
-// verdict outright (shardpilot/shardpilot-go#84 review).
+// verdict outright .
 func TestATrailingJSONValueIsNotGrammar(t *testing.T) {
 	suppliedValues = []string{"false"}
 	t.Cleanup(func() { suppliedValues = nil })
@@ -1566,7 +1531,7 @@ func TestATrailingJSONValueIsNotGrammar(t *testing.T) {
 // field name percent-encoding the separator before a base64 component. The
 // one-time split saw no hyphen, and when the percent stage produced `X-YmFy` the
 // name went on being one url-base64 token, so `bar` was never reconstructed
-// (shardpilot/shardpilot-go#84 review).
+// .
 func TestASeparatorArrivingMidChainIsSplit(t *testing.T) {
 	suppliedValues = []string{"bar"}
 	t.Cleanup(func() { suppliedValues = nil })
@@ -1575,12 +1540,6 @@ func TestASeparatorArrivingMidChainIsSplit(t *testing.T) {
 	}
 }
 
-// ---- round on 73ae245 ----
-
-// TestLeadingTextIsNotJSON is the third side of one rule. Earlier rounds found
-// this function accepting a body that merely CONTAINS a value and a body followed
-// by more values; this one is a body PRECEDED by text (shardpilot/shardpilot-go#84
-// review). The rule is one value with only JSON whitespace around it.
 func TestLeadingTextIsNotJSON(t *testing.T) {
 	suppliedValues = []string{"false"}
 	t.Cleanup(func() { suppliedValues = nil })
@@ -1605,7 +1564,7 @@ func TestLeadingTextIsNotJSON(t *testing.T) {
 // TestABlankLineInsideABase64RunIsWhitespace: a standard base64 decoder ignores
 // every CR and LF, so `YWJjZ\r\n\r\nGVmZ2g=` reconstructs the identifier in one
 // step, while ending the run at the empty line left neither fragment decoding to
-// anything (shardpilot/shardpilot-go#84 review).
+// anything .
 func TestABlankLineInsideABase64RunIsWhitespace(t *testing.T) {
 	suppliedValues = []string{"abcdefgh"}
 	t.Cleanup(func() { suppliedValues = nil })
@@ -1617,7 +1576,7 @@ func TestABlankLineInsideABase64RunIsWhitespace(t *testing.T) {
 // TestValidNonObjectJSONIsNotUnclassifiable: `[{"subject_fact_key":…}]` is
 // syntactically valid JSON whose structure PROVES the member is nested. Reading
 // `topLevelMembers(body) == nil` as "cannot be classified" refused it
-// (shardpilot/shardpilot-go#84 review).
+// .
 func TestValidNonObjectJSONIsNotUnclassifiable(t *testing.T) {
 	structuralSurfaces = nil
 	suppliedValues = nil
@@ -1639,7 +1598,7 @@ func TestValidNonObjectJSONIsNotUnclassifiable(t *testing.T) {
 // TestAnAcceptedIdentityCodingIsGrammar: the branch accepts `identity` as the
 // no-op coding, then left the token as captured text — so a legal experiment key
 // of `identity` turned it into a declaration of an unknown coding
-// (shardpilot/shardpilot-go#84 review).
+// .
 func TestAnAcceptedIdentityCodingIsGrammar(t *testing.T) {
 	suppliedValues = []string{"identity"}
 	receivedConnection = true
@@ -1650,12 +1609,10 @@ func TestAnAcceptedIdentityCodingIsGrammar(t *testing.T) {
 	}
 }
 
-// ---- round on c72e65d ----
-
 // TestAnOpaqueURIPayloadIsRedacted: `https:SERVER_SECRET` is a valid absolute URI
 // whose remainder has no slash, so the segment-based path redaction left it
 // untouched and the endpoint's text reached the artifact verbatim
-// (shardpilot/shardpilot-go#85 review).
+// .
 func TestAnOpaqueURIPayloadIsRedacted(t *testing.T) {
 	suppliedValues = nil
 	got := stripMarks(redactTarget("Location: https:SERVER_SECRET"))
@@ -1675,14 +1632,14 @@ func TestAnOpaqueURIPayloadIsRedacted(t *testing.T) {
 // TestACodingAnnouncedInATrailerRefuses: for a chunked HTTP/1 response declaring
 // `Trailer: Content-Encoding`, Go leaves the initial field empty and the coding
 // arrives late, with the raw compressed bytes in the body. The header path refuses
-// that; this one accepted it (shardpilot/shardpilot-go#85 review).
+// that; this one accepted it .
 func TestACodingAnnouncedInATrailerRefuses(t *testing.T) {
 	structuralSurfaces = nil
 	suppliedValues = nil
 	t.Cleanup(func() { structuralSurfaces = nil })
 	// ⚠ WITH A BODY. The refusal is about what an undecodable body could HIDE, so a
 	// trailer coding on a zero-length response has no subject -- the header path
-	// already asks that and this scene had not (shardpilot/shardpilot-go#85 review).
+	// already asks that and this scene had not .
 	tee := &teeBody{trailer: map[string][]string{"Content-Encoding": {"gzip"}}}
 	tee.buf.WriteString("x")
 	e := &exchange{captured: tee}
@@ -1703,7 +1660,7 @@ func TestACodingAnnouncedInATrailerRefuses(t *testing.T) {
 
 // TestACookieAttributeIsMeasuredAsReceived: `responseText` expands a marker-like
 // spelling before the attribute is measured, so a four-character value was
-// reported as seven (shardpilot/shardpilot-go#85 review).
+// reported as seven .
 func TestACookieAttributeIsMeasuredAsReceived(t *testing.T) {
 	suppliedValues = nil
 	got := stripMarks(redactSetCookie("Set-Cookie: sid=x; Path=" + escapeMarks(capturedMark)))
@@ -1715,13 +1672,11 @@ func TestACookieAttributeIsMeasuredAsReceived(t *testing.T) {
 	}
 }
 
-// ---- round on ac5f3a0 ----
-
 // TestTheAuthorityIsNotAParameterName: registering the URL authority in
 // `requestNames` made `nameIsOurs` vouch for it wherever a NAME is expected, so
 // with host and experiment key both `control` the identifier was marked
 // harness-generated and both the scrub and the guard skipped it
-// (shardpilot/shardpilot-go#85 review).
+// .
 func TestTheAuthorityIsNotAParameterName(t *testing.T) {
 	suppliedValues = []string{"control"}
 	requestNames = map[string]bool{}
@@ -1732,7 +1687,7 @@ func TestTheAuthorityIsNotAParameterName(t *testing.T) {
 	}
 	// ⚠ AND A NAME THE HARNESS REALLY SENT IS STILL VOUCHED FOR **IN ITS OWN
 	// REQUEST**. The registry answers for what we sent, so it does not reach a
-	// `Location` (shardpilot/shardpilot-go#85 review).
+	// `Location` .
 	requestNames = map[string]bool{"control": true}
 	got = stripMarks(scrubSupplied(redactQuery("GET /cb?control=x HTTP/1.1")))
 	if !strings.Contains(got, "control=") {
@@ -1742,7 +1697,7 @@ func TestTheAuthorityIsNotAParameterName(t *testing.T) {
 
 // TestAnIPv6ZoneIsNotExempt: the host exemption rests on "publicly resolvable and
 // constrained by its grammar", and a zone identifier is an arbitrary local string
-// (shardpilot/shardpilot-go#85 review).
+// .
 func TestAnIPv6ZoneIsNotExempt(t *testing.T) {
 	// ⚠ THE PROPERTY IS ABOUT THE OUTPUT, NOT THE PREDICATE. My first version
 	// asserted `parsesAsURI` refuses it — and `SERVER_SECRET` satisfies RFC 6874
@@ -1767,12 +1722,10 @@ func TestAnIPv6ZoneIsNotExempt(t *testing.T) {
 	}
 }
 
-// ---- round on f258c43 ----
-
 // TestConnectionProvenanceIsPerExchange: the SDK retries, and every attempt is
 // rendered. A single global held the LAST attempt's answer, so a first response
 // that really sent the field had it marked serialiser-generated when the final
-// response carried none (shardpilot/shardpilot-go#84 review).
+// response carried none .
 func TestConnectionProvenanceIsPerExchange(t *testing.T) {
 	suppliedValues = []string{"bar"}
 	t.Cleanup(func() { suppliedValues = nil; receivedConnection = false })
@@ -1793,7 +1746,7 @@ func TestConnectionProvenanceIsPerExchange(t *testing.T) {
 	// redacts it structurally, so nothing reaches the guard and a nil error is the
 	// stricter answer. What both halves must satisfy is that the first attempt's
 	// received value is not treated as serialiser syntax — which shows as the
-	// value surviving into the text (shardpilot/shardpilot-go#84, #85 review).
+	// value surviving into the text .
 	got := stripMarks(responseText(first))
 	if strings.Contains(got, "YmFy") {
 		t.Fatalf("a received Connection value was published as serialiser syntax: %q", got)
@@ -1824,7 +1777,7 @@ func (f *fakeTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 // first value and map membership does not — and the mutant restoring `Get` at the
 // call site SURVIVED it, because the scene never reached that call site. This
 // file already records the same defect about `responseText`: a test of the
-// composition is not a test of the call site (shardpilot/shardpilot-go#84 review).
+// composition is not a test of the call site .
 func TestConnectionPresenceIsNotItsFirstValue(t *testing.T) {
 	h := http.Header{}
 	h.Add("Connection", "")
@@ -1855,12 +1808,10 @@ func TestConnectionPresenceIsNotItsFirstValue(t *testing.T) {
 	}
 }
 
-// ---- round on 819d04c ----
-
 // TestVouchingIsTopLevelOnly: a key inside `variant_payload` is endpoint-controlled
 // payload, not SDK wire syntax, so vouching at every depth let a supplied
 // identifier of `assigned` ride out inside the nested object — skipped by the
-// scrub AND the guard (shardpilot/shardpilot-go#85 review).
+// scrub AND the guard .
 func TestVouchingIsTopLevelOnly(t *testing.T) {
 	suppliedValues = []string{"assigned"}
 	structuralSurfaces = nil
@@ -1880,7 +1831,7 @@ func TestVouchingIsTopLevelOnly(t *testing.T) {
 // TestValidNonObjectJSONIsNotWithheld is the second site of one conflation: a
 // complete `[{"subject_fact_key":1}]` was labelled unparsable, its nested member
 // treated as possibly top-level, and the body withheld with exit 4 — while its
-// depth is fully determined (shardpilot/shardpilot-go#85 review).
+// depth is fully determined .
 func TestValidNonObjectJSONIsNotWithheld(t *testing.T) {
 	structuralSurfaces = nil
 	suppliedValues = nil
@@ -1902,7 +1853,7 @@ func TestValidNonObjectJSONIsNotWithheld(t *testing.T) {
 
 // TestAZoneIsMeasuredDecoded: `eth%30` is `eth0`, four characters, and measuring
 // the wire spelling put two lengths for one value in one capture
-// (shardpilot/shardpilot-go#85 review).
+// .
 func TestAZoneIsMeasuredDecoded(t *testing.T) {
 	suppliedValues = nil
 	got := stripMarks(redactTarget("Location: https://[fe80::1%25eth%30]/cb"))
@@ -1915,7 +1866,7 @@ func TestAZoneIsMeasuredDecoded(t *testing.T) {
 // ordinary `Content-Type: application/json` came back as
 // `application/<redacted, 4 chars>` — the recorded response no longer declaring
 // its own media type, approved because the placeholder is generated
-// (shardpilot/shardpilot-go#84 review).
+// .
 func TestARecognisedMediaTypeIsGrammar(t *testing.T) {
 	suppliedValues = []string{"json"}
 	receivedConnection = true
@@ -1940,12 +1891,10 @@ func TestARecognisedMediaTypeIsGrammar(t *testing.T) {
 	}
 }
 
-// ---- round on b86853d ----
-
 // TestTheQuerySeparatorSurvives: concatenating the marker onto the path published
 // `/api/…/assignmentquery-withheld` — a route the SDK never requested, on every
 // successful report, since every assignment request carries a query
-// (shardpilot/shardpilot-go#84 review).
+// .
 func TestTheQuerySeparatorSurvives(t *testing.T) {
 	suppliedValues = nil
 	got := stripMarks(dropQuery("GET /api/cp/v1/runtime/experiments/assignment?a=1 HTTP/1.1\r"))
@@ -1965,7 +1914,7 @@ func TestTheQuerySeparatorSurvives(t *testing.T) {
 // TestBinaryCandidatesSeeTheNameForms: a field name whose component decodes to
 // invalid UTF-8 — `X-_2Jhcg`, where `_2Jhcg` is url-base64 for `0xffbar` — was
 // examined as one unsplit token and no candidate ever held the value
-// (shardpilot/shardpilot-go#84 review).
+// .
 func TestBinaryCandidatesSeeTheNameForms(t *testing.T) {
 	suppliedValues = []string{"bar"}
 	t.Cleanup(func() { suppliedValues = nil })
@@ -1977,7 +1926,7 @@ func TestBinaryCandidatesSeeTheNameForms(t *testing.T) {
 // TestAQueryNameIsComparedExactly: `%20experiment_key%20` decodes to
 // ` experiment_key `, which the HTTP-whitespace trim turned into the harness-owned
 // name — so the entire endpoint spelling was marked generated and both the scrub
-// and the guard skipped it (shardpilot/shardpilot-go#85 review).
+// and the guard skipped it .
 func TestAQueryNameIsComparedExactly(t *testing.T) {
 	suppliedValues = []string{"experiment_key"}
 	requestNames = map[string]bool{"experiment_key": true}
@@ -1990,7 +1939,7 @@ func TestAQueryNameIsComparedExactly(t *testing.T) {
 	// repair scrubs the SDK's wire contract. The registry records the names the
 	// harness SENT, so it answers for the request line and not for a `Location` the
 	// endpoint chose -- this half used to be asserted on the endpoint's URL, which
-	// is the defect the sibling thread names (shardpilot/shardpilot-go#85 review).
+	// is the defect the sibling thread names .
 	got = stripMarks(scrubSupplied(redactQuery("GET /cb?experiment_key=x HTTP/1.1")))
 	if !strings.Contains(got, "experiment_key") {
 		t.Fatalf("a name the harness sent was scrubbed from its own request: %q", got)
@@ -2002,13 +1951,11 @@ func TestAQueryNameIsComparedExactly(t *testing.T) {
 	}
 }
 
-// ---- round on a2457d6 ----
-
 // TestATrailerIsNotAMessageStart: `trailerReport` wraps each trailer in its own
 // captured span, so a trailer named `X-YmFy` carrying the legal value `HTTP/1.1`
 // was handed to `dataOf` as though it were a request line — the value dropped, the
 // header name never collected, and `YmFy` decoded as one token
-// (shardpilot/shardpilot-go#84 review).
+// .
 func TestATrailerIsNotAMessageStart(t *testing.T) {
 	suppliedValues = []string{"bar"}
 	t.Cleanup(func() { suppliedValues = nil })
@@ -2030,7 +1977,7 @@ func TestATrailerIsNotAMessageStart(t *testing.T) {
 // TestTheConfiguredHostIsOurs: with `SHARDPILOT_APP_URL` of
 // `https://app.shardpilot.com` and a legal experiment key of `app`, the guard found
 // `app` inside the host this program itself configured and refused every otherwise
-// valid capture (shardpilot/shardpilot-go#84 review).
+// valid capture .
 func TestTheConfiguredHostIsOurs(t *testing.T) {
 	suppliedValues = []string{"app"}
 	configuredHost = "app.shardpilot.com"
@@ -2054,7 +2001,7 @@ func TestTheConfiguredHostIsOurs(t *testing.T) {
 	// an internationalised name as PUNYCODE, so the pre-serialisation spelling never
 	// matched and this program's own authority was rewritten into
 	// `xn--9ca.<redacted, 7 chars>` -- an authority no parser accepts, approved
-	// because the placeholder is generated (shardpilot/shardpilot-go#84 review).
+	// because the placeholder is generated .
 	suppliedValues = []string{"example"}
 	configuredHost, configuredHostWire = "é.example", "xn--9ca.example"
 	got = stripMarks(scrubSupplied(string(redact(
@@ -2077,7 +2024,7 @@ func TestTheConfiguredHostIsOurs(t *testing.T) {
 // TestATransportErrorGoesThroughTheStructuralQuestion: Go rejects a malformed
 // response before returning one and puts the complete bad header into the error, so
 // a server-set cookie reached the report through the error diagnostic where only
-// the supplied-value scrub ran (shardpilot/shardpilot-go#84 review).
+// the supplied-value scrub ran .
 func TestATransportErrorGoesThroughTheStructuralQuestion(t *testing.T) {
 	structuralSurfaces, accountedSurfaces = nil, nil
 	suppliedValues = nil
@@ -2112,12 +2059,10 @@ func TestATransportErrorGoesThroughTheStructuralQuestion(t *testing.T) {
 	}
 }
 
-// ---- round on 0d5d3c4 ----
-
 // TestALocationLineKeepsItsColon: `splitField` returns the colon in NEITHER piece,
 // so the finishing pass dropped it from every Location line it touched —
 // `Location /cb`, which is not an HTTP header at all
-// (shardpilot/shardpilot-go#85 review). My scenes called `redactTarget` directly
+// . My scenes called `redactTarget` directly
 // and never went through the header path, so nothing saw it.
 func TestALocationLineKeepsItsColon(t *testing.T) {
 	suppliedValues = nil
@@ -2131,7 +2076,7 @@ func TestALocationLineKeepsItsColon(t *testing.T) {
 
 // TestAuthorityBodyIsNotSyntax: `[v1.=]` is a valid IPvFuture authority whose `=`
 // is DATA, and the finishing pass marked it — so a supplied `=` rode out past both
-// the scrub and the guard (shardpilot/shardpilot-go#85 review). "Everything left is
+// the scrub and the guard . "Everything left is
 // structure by construction" was my argument for that pass, and it is false of the
 // one component whose body has its own grammar.
 func TestAuthorityBodyIsNotSyntax(t *testing.T) {
@@ -2160,7 +2105,7 @@ func TestAuthorityBodyIsNotSyntax(t *testing.T) {
 // TestALocationTrailerGetsTheFinishingPasses: a `Location` arriving as a trailer
 // was rendered `<redacted, 5 chars>://…` for a supplied `https`, because the
 // trailer path never applied the passes the response-header path does
-// (shardpilot/shardpilot-go#85 review).
+// .
 func TestALocationTrailerGetsTheFinishingPasses(t *testing.T) {
 	suppliedValues = []string{"https"}
 	t.Cleanup(func() { suppliedValues = nil })
@@ -2176,7 +2121,7 @@ func TestALocationTrailerGetsTheFinishingPasses(t *testing.T) {
 // TestTheRequestQuerySeparatorIsSyntax: the request dump is NOT passed through
 // `scrubSupplied` afterwards, so an unmarked `&` was reported by the guard as a
 // surviving supplied value and every such run exited 4
-// (shardpilot/shardpilot-go#85 review). The sweep probes the response Location and
+// . The sweep probes the response Location and
 // could not see this: one function, two callers, and only one of them post-scrubs.
 func TestTheRequestQuerySeparatorIsSyntax(t *testing.T) {
 	suppliedValues = []string{"&"}
@@ -2190,12 +2135,10 @@ func TestTheRequestQuerySeparatorIsSyntax(t *testing.T) {
 	}
 }
 
-// ---- round on 967f7c1 ----
-
 // TestAnEmbeddedBase64SuffixIsTried: the token scan is MAXIMAL, so
 // `prefix/YWJjZGVmZ2g=` is one token that does not decode, and the final path
 // component — which a standard decoder reconstructs directly — was never tried
-// (shardpilot/shardpilot-go#84 review).
+// .
 func TestAnEmbeddedBase64SuffixIsTried(t *testing.T) {
 	suppliedValues = []string{"abcdefgh"}
 	t.Cleanup(func() { suppliedValues = nil })
@@ -2207,7 +2150,7 @@ func TestAnEmbeddedBase64SuffixIsTried(t *testing.T) {
 // TestAMintedFieldInATransportErrorRefuses: an endpoint can make its malformed
 // first line a JSON object carrying the subject key, and Go puts that whole line in
 // the error — where no supplied value can match it and no body scan runs
-// (shardpilot/shardpilot-go#84 review).
+// .
 func TestAMintedFieldInATransportErrorRefuses(t *testing.T) {
 	structuralSurfaces = nil
 	suppliedValues = nil
@@ -2222,7 +2165,7 @@ func TestAMintedFieldInATransportErrorRefuses(t *testing.T) {
 // TestAnAuthChallengeRefusesOnTheSuccessPathToo: the transport-error path
 // classifies these as unpublishable, and that check ran only when PARSING FAILED —
 // so an ordinary 401 published the endpoint-minted challenge
-// (shardpilot/shardpilot-go#84 review).
+// .
 func TestAnAuthChallengeRefusesOnTheSuccessPathToo(t *testing.T) {
 	structuralSurfaces = nil
 	suppliedValues = nil
@@ -2240,13 +2183,11 @@ func TestAnAuthChallengeRefusesOnTheSuccessPathToo(t *testing.T) {
 	}
 }
 
-// ---- round on f639447 ----
-
 // TestTheSDKTaxonomyIsVouchedFor: with a legal experiment key of `not_found` and a
 // 404, the SDK deliberately produces `Code == "not_found"` and the generic scrub
 // rewrote the verdict to `<redacted, 9 chars>` — the capture losing the
 // first-class classification the report exists to record
-// (shardpilot/shardpilot-go#84 review).
+// .
 func TestTheSDKTaxonomyIsVouchedFor(t *testing.T) {
 	for _, v := range []string{"not_found", "targeting_unmatched", "kill_switch", "superseded"} {
 		suppliedValues = []string{v}
@@ -2267,13 +2208,12 @@ func TestTheSDKTaxonomyIsVouchedFor(t *testing.T) {
 // TestAnEscapedMintedNameInATransportErrorRefuses: a malformed first line may
 // spell the member as `subject_fact_key`; splitting on non-identifier bytes
 // cuts that into `subject_` and `u0066act_key`, neither of which is the name
-// (shardpilot/shardpilot-go#84 review).
+// .
 func TestAnEscapedMintedNameInATransportErrorRefuses(t *testing.T) {
 	structuralSurfaces = nil
 	suppliedValues = nil
 	t.Cleanup(func() { structuralSurfaces = nil })
-	// ⚠ THE ESCAPED SPELLING, which is the whole point: the plain one was already
-	// caught by the previous round's fix, so a scene using it measures nothing new.
+
 	_ = sanitizeCaptured(errors.New(
 		`malformed HTTP response "{\"subject_\u0066act_key\":\"sfk1_xxxxxxxxxxxx\"}"`))
 	if len(structuralSurfaces) == 0 {
@@ -2281,12 +2221,10 @@ func TestAnEscapedMintedNameInATransportErrorRefuses(t *testing.T) {
 	}
 }
 
-// ---- round on d2cd70d ----
-
 // TestACookieNameIsComparedExactly is the SECOND site of one conflation: I fixed
 // the query-name lookup and left this one, so `Set-Cookie: experiment_key =x` had
 // the trailing space trimmed for the provenance match and the whole endpoint
-// spelling was marked generated (shardpilot/shardpilot-go#85 review).
+// spelling was marked generated .
 func TestACookieNameIsComparedExactly(t *testing.T) {
 	suppliedValues = []string{"experiment_key"}
 	requestNames = map[string]bool{"experiment_key": true}
@@ -2307,7 +2245,7 @@ func TestACookieNameIsComparedExactly(t *testing.T) {
 
 // TestAnOpaqueTargetHasItsSchemeVouched: with no `://` the fallback took the FIRST
 // colon in the line — the header name's — so `Location: https:abc` never had its
-// scheme vouched (shardpilot/shardpilot-go#85 review).
+// scheme vouched .
 func TestAnOpaqueTargetHasItsSchemeVouched(t *testing.T) {
 	suppliedValues = []string{"https"}
 	receivedConnection = true
@@ -2322,7 +2260,7 @@ func TestAnOpaqueTargetHasItsSchemeVouched(t *testing.T) {
 // TestVouchingParsesAMarkFreeView: the minted replacement inserts provenance bytes
 // INSIDE a JSON string, so an ordinary body carrying a minted value stopped parsing
 // and returned no names — and a supplied `assigned` took the recognised SDK field
-// with it (shardpilot/shardpilot-go#85 review).
+// with it .
 func TestVouchingParsesAMarkFreeView(t *testing.T) {
 	suppliedValues = []string{"assigned"}
 	structuralSurfaces = nil
@@ -2335,11 +2273,9 @@ func TestVouchingParsesAMarkFreeView(t *testing.T) {
 	}
 }
 
-// ---- round on a212a1c ----
-
 // TestVouchingRequiresTheRecognisedSpelling: the predicates normalise case, so
 // `Content-Type: application/JSON` is admitted — and marking the RAW span vouched
-// for a spelling the registry never saw (shardpilot/shardpilot-go#85 review).
+// for a spelling the registry never saw .
 func TestVouchingRequiresTheRecognisedSpelling(t *testing.T) {
 	suppliedValues = []string{"JSON"}
 	receivedConnection = true
@@ -2360,7 +2296,7 @@ func TestVouchingRequiresTheRecognisedSpelling(t *testing.T) {
 
 // TestAnEscapedMemberNameIsNotVouched: recognition here is SEMANTIC —
 // `{"assigned":false}` decodes to a name this program knows — and marking the raw
-// span vouched for the endpoint's escape (shardpilot/shardpilot-go#85 review).
+// span vouched for the endpoint's escape .
 func TestAnEscapedMemberNameIsNotVouched(t *testing.T) {
 	suppliedValues = []string{"bound"}
 	t.Cleanup(func() { suppliedValues = nil })
@@ -2385,7 +2321,7 @@ func TestAnEscapedMemberNameIsNotVouched(t *testing.T) {
 // TestAnEmptyPortOnABracketedAuthorityIsAccepted: `https://[::1]:/cb` leaves the
 // trailing colon in `host`, so the bracket test refused an authority Go accepts —
 // while the registered-name form with an empty port is admitted
-// (shardpilot/shardpilot-go#85 review).
+// .
 func TestAnEmptyPortOnABracketedAuthorityIsAccepted(t *testing.T) {
 	if !parsesAsURI("https://[::1]:/cb") {
 		t.Fatal("a bracketed authority with an empty port was refused")
@@ -2509,12 +2445,7 @@ func TestTheVerdictVersionGoesThroughTheScrub(t *testing.T) {
 	if got := verdictVersion(123); strings.Contains(got, "123") {
 		t.Fatalf("a supplied identifier was reintroduced by the verdict line: %q", got)
 	}
-	// ⚠ AND THE CALL SITE, WHICH IS OTHERWISE UNREACHABLE. The verdict block is
-	// printed inside `main()`, so no fixture can run it -- and a test that calls
-	// `verdictVersion` alone passes while the report goes on printing `%d`
-	// directly, which is exactly what the mutant showed. The same gap covers the
-	// three sibling verdict lines; this binds the one this round is about, and the
-	// rest is named rather than implied.
+
 	src, err := os.ReadFile("main.go")
 	if err != nil {
 		t.Fatalf("the scene cannot read its own subject: %v", err)
@@ -2740,7 +2671,7 @@ func TestAnUnaccountedValueInAParsedBodyIsRedacted(t *testing.T) {
 	structuralSurfaces, accountedSurfaces = nil, nil
 	// ⚠ A VALUE THE SDK ACCEPTS **AT `reason`**, which is narrower than the taxonomy:
 	// the not-assigned branch takes only `{absent, kill_switch,
-	// targeting_unmatched}` (shardpilot/shardpilot-go#85 review). This scene used
+	// targeting_unmatched}` . This scene used
 	// `not_found`, which the SDK writes as a Code and refuses at this member.
 	if v := stripMarks(dropFraming("HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false,\"reason\":\"targeting_unmatched\"}")); !strings.Contains(v, "targeting_unmatched") {
 		t.Fatalf("the SDK's own taxonomy was lengthened: %q", v)
@@ -2766,7 +2697,7 @@ func TestTheMemberAfterAContainerValueIsStillAKey(t *testing.T) {
 	got := stripMarks(scrubSupplied(dropFraming(
 		// ⚠ THE BODY CARRIES `assigned`, because a body without it is not a verdict at
 		// all and takes no schema exemptions -- this scene is about KEY DETECTION after a
-		// container value, not about eligibility (shardpilot/shardpilot-go#84 review).
+		// container value, not about eligibility .
 		"HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false,\"variant_payload\":{},\"version\":1}")))
 	if !strings.Contains(got, `"version"`) {
 		t.Fatalf("a fixed schema member after a container value was rewritten: %q", got)
@@ -3007,7 +2938,7 @@ func TestJSONNumbersAreGrammar(t *testing.T) {
 	// ⚠ THE SUPPLIED VALUE IS NOT THE NUMBER IN THE BODY. The first version supplied
 	// `1` against `{"version":1}` -- which is the COLLISION a later finding names as
 	// a leak, so this scene was asserting the wrong half of the rule
-	// (shardpilot/shardpilot-go#85 review). What this one holds is that an ordinary
+	// . What this one holds is that an ordinary
 	// number is grammar and survives a scrub aimed at something else; the collision
 	// is TestACollidingJSONNumberIsRefused.
 	suppliedValues = []string{"zzz"}
@@ -3032,7 +2963,7 @@ func TestOnlyOurOwnQueryEscapingIsVouched(t *testing.T) {
 	// ⚠ ON OUR OWN REQUEST LINE. The registry answers for what the harness SENT, so
 	// the "printed in our spelling" half belongs to the request dump; asserting it on
 	// a `Location` was the provenance confusion the sibling thread names
-	// (shardpilot/shardpilot-go#85 review).
+	// .
 	got := stripMarks(scrubSupplied(redactQuery("GET /cb?experiment%5Fkey=x HTTP/1.1")))
 	if !strings.Contains(got, "experiment_key") {
 		t.Fatalf("a name this program owns was lost instead of being printed in our spelling: %q", got)
@@ -3060,7 +2991,7 @@ func TestTruncationSuppressesTheRefusalWithoutDiscardingTheReport(t *testing.T) 
 	// ⚠ THE CONDITION MOVED FROM "the last attempt" TO "attributed to a truncated
 	// attempt", because the ledger is global and the old form let a later truncated
 	// retry excuse a COMPLETE earlier attempt's refusal
-	// (shardpilot/shardpilot-go#85 review). What is checkable is that the refusal
+	// . What is checkable is that the refusal
 	// reads the ATTRIBUTED set rather than the whole ledger.
 	guarded := strings.Index(text, "if len(unexcused) > 0 {")
 	if guarded < 0 {
@@ -3270,7 +3201,7 @@ func TestTruncationExcusesOnlyItsOwnBodyRefusals(t *testing.T) {
 
 	// ⚠ AND ONLY WHERE TRUNCATION EXPLAINS IT. The rows carry `jsonTruncated`
 	// because being incomplete is not by itself a reason a body failed to parse
-	// (shardpilot/shardpilot-go#85 review).
+	// .
 	//
 	// A truncated attempt's OWN body refusal is excused.
 	structuralAt = map[string][]int{bodyShape: {0}}
@@ -3363,7 +3294,7 @@ func TestTheLedgerRecordsTheAttemptThatRaisedAReason(t *testing.T) {
 // `null`, `true`, `false`, a number or a string returned unexamined -- neither
 // marked as grammar nor noted as a collision -- and the scrub downstream replaced
 // the whole document with a bare `<redacted, N chars>`, which is not JSON, while
-// the refusal ledger stayed EMPTY (shardpilot/shardpilot-go#85 review).
+// the refusal ledger stayed EMPTY .
 //
 // The property asserted is the one that was broken, not the fix: whatever comes
 // out is either a JSON document or a refusal. Published-and-invalid is the state
@@ -3401,7 +3332,7 @@ func TestEveryJSONRootFormIsEitherGrammarOrRefused(t *testing.T) {
 // the decoder returns; the traversal vouched every recognised `code` or `reason`
 // value, which published a supplied `kill_switch` as though this program had
 // written it while the SDK actually classified `not_found`
-// (shardpilot/shardpilot-go#85 review). The scene decodes each body and asks the
+// . The scene decodes each body and asks the
 // decoder which occurrence counts, so it cannot drift from the rule it pins.
 //
 // Rows are the product of the two verdict fields with both orderings, because the
@@ -3415,7 +3346,7 @@ func TestOnlyTheEffectiveVerdictOccurrenceIsVouched(t *testing.T) {
 			// ⚠ A COMPLETE NOT-ASSIGNED SHAPE. The SDK rejects a body with no `assigned`
 			// member before it reads `reason` at all, so a duplicate-member scene built
 			// without it exercises a body whose `reason` is never the SDK's
-			// (shardpilot/shardpilot-go#85 review).
+			// .
 			body := `{"assigned":false,"` + field + `":"` + order[0] + `","` + field + `":"` + order[1] + `"}`
 			// The oracle decodes only the member under test; `assigned` is a bool and
 			// a `map[string]string` cannot hold it.
@@ -3447,13 +3378,6 @@ func TestOnlyTheEffectiveVerdictOccurrenceIsVouched(t *testing.T) {
 
 // An undecodable coding is about BYTES, not about content worth reading.
 //
-// ⚠ THE POPULATION IS "A BODY", AND `TrimSpace` NAMED ONLY THE NON-BLANK HALF OF
-// IT. A response with an unsupported coding and a body of ` \t` was published:
-// the trimmed body looked empty, the structural refusal was skipped, and a
-// decoder for that coding may reconstruct a supplied value from exactly those
-// bytes (shardpilot/shardpilot-go#84 review). The round before wrote the trim to
-// spare a 204 its diagnostic; a 204 has no bytes, so length answers both.
-//
 // Rows are the product of the whitespace bytes HTTP can leave in a body with the
 // empty and non-empty cases, so the rule is read as "any bytes at all" rather
 // than as the two spellings that happened to be shown.
@@ -3481,7 +3405,7 @@ func TestAWhitespaceOnlyEncodedBodyIsStillABody(t *testing.T) {
 // `errorBody := {"error","code"}` by hand as "a different wire shape" -- and
 // `code` is a member of no top-level shape at all, so the derivation was right and
 // missed exactly the name that had been lifted out of it
-// (shardpilot/shardpilot-go#85 review). A list beside a derived check is where the
+// . A list beside a derived check is where the
 // assumption the check just closed goes to live. Both shapes are read from the
 // source now.
 func TestTheTopLevelExemptionsAreExactlyTheWireMembers(t *testing.T) {
@@ -3563,7 +3487,7 @@ func TestTheTopLevelExemptionsAreExactlyTheWireMembers(t *testing.T) {
 // and `"transient_" + Itoa(status)` are unbounded families, and the registry held
 // four static entries -- so every `http_503` or `transient_408` verdict lost its
 // classification to a placeholder on an ORDINARY capture
-// (shardpilot/shardpilot-go#84 review).
+// .
 //
 // The population is parsed out of the doc comment where the SDK states the
 // taxonomy, so a code added there turns this red. A template token is exercised
@@ -3647,11 +3571,7 @@ func TestGeneratedTaxonomyIsVouchedInRenderedText(t *testing.T) {
 // mark in the boundary class, so a supplied short value adjacent to a decomposed
 // grapheme was replaced while the mark stayed behind -- evidence altered into
 // something the endpoint never sent, and approved, because the placeholder is
-// generated (shardpilot/shardpilot-go#84 review).
-//
-// The rows are the product of the three mark categories with both sides of the
-// value, generated from `unicode.Mn/Mc/Me` rather than from the one code point
-// the review named.
+// generated .
 func TestACombiningMarkDoesNotDetachFromItsLetter(t *testing.T) {
 	marks := []rune{'́', 'ٔ', 'ः', '⃝'} // Mn, Mn, Mc, Me
 	for _, m := range marks {
@@ -3678,7 +3598,7 @@ func TestACombiningMarkDoesNotDetachFromItsLetter(t *testing.T) {
 // PLACEMENT SHOWN. The whole-line producer normalised spaces and tabs and the
 // shared-line producer did not, so a run carrying whitespace produced no
 // candidate and `assertNoLeak` approved a spelling a standard decoder turns
-// straight back into the identifier (shardpilot/shardpilot-go#84 review).
+// straight back into the identifier .
 // Measured before fixing: three of the four placements broke it.
 //
 // The rows are the product of the whitespace bytes with the placements and with
@@ -3716,8 +3636,7 @@ func TestWrappedBase64SurvivesWhitespaceWhereverItSits(t *testing.T) {
 // makes a field NAME syntactically invalid -- so `headerNameEnd` failed, the
 // name-specific decoded boundary check never ran, and with `bar` and `qux`
 // supplied the capture `X-redacted-3-chars-%71ux` was approved, from which the
-// supported percent decoder reconstructs `qux` (shardpilot/shardpilot-go#84
-// review).
+// supported percent decoder reconstructs `qux` .
 //
 // The rows are the product of where the encoded value sits in the name with which
 // of its bytes are encoded, because the defect is about the name PARSING at all
@@ -3754,7 +3673,7 @@ func TestAGeneratedSpanLeavesTheFieldNameParsable(t *testing.T) {
 // nested, which this root-only rule never reaches -- and the SDK synthesizes its
 // own `Code` from the HTTP outcome. Vouching it marked endpoint-controlled text as
 // this SDK's classification and published a supplied identifier from
-// `{"assigned":false,"code":"kill_switch"}` (shardpilot/shardpilot-go#85 review).
+// `{"assigned":false,"code":"kill_switch"}` .
 // Four fixtures asserted `code` WAS a verdict position and pinned the wrong half
 // of the rule until the contract was read.
 //
@@ -3824,7 +3743,7 @@ func TestVerdictPositionsAreWireMembers(t *testing.T) {
 // brackets. In a URI scheme or a cookie attribute name those are not admissible
 // bytes, so the "structure-preserving" capture was malformed and the guard
 // approved it, because a placeholder is generated
-// (shardpilot/shardpilot-go#85 review). The valueless-cookie-flag branch already
+// . The valueless-cookie-flag branch already
 // answered this; the answer was applied where it was shown.
 //
 // The rows are the product of the structural positions with the three cases a
@@ -3878,7 +3797,7 @@ func TestDecliningToVouchStillKeepsTheGrammar(t *testing.T) {
 // someone else's prose -- and `x509: certificate is valid for
 // server-secret-token.internal, not configured.example` carries the names with no
 // quotes, so the quoted-extent rule left them standing with an empty ledger
-// (shardpilot/shardpilot-go#85 review). Working from the value, the names are not
+// . Working from the value, the names are not
 // redacted: they are never taken.
 //
 // The rows are the product of the SAN spellings with the two things a name can be
@@ -3895,7 +3814,7 @@ func TestCertificateNamesAreNeverTaken(t *testing.T) {
 	// `&x509.HostnameError{…}`; `crypto/x509` returns the error BY VALUE, so every
 	// row here exercised a shape the verifier never produces and the branch that
 	// handles the real one was unreachable and unmeasured -- deleting it broke no
-	// scene (shardpilot/shardpilot-go#85 review). A fixture that constructs the
+	// scene . A fixture that constructs the
 	// subject itself can construct one that does not occur.
 	for _, names := range sans {
 		for _, byValue := range []bool{false, true} {
@@ -3973,19 +3892,8 @@ func TestTheMeasuredTransportFailuresAreDescribable(t *testing.T) {
 // while `DumpResponse` reconstructs the line -- so this recorded "not received"
 // for a line the endpoint DID send, `dropFraming` marked the whole line as
 // serializer-generated, and a supplied `close` was published because the guard
-// skips generated spans (shardpilot/shardpilot-go#84 review).
-//
-// Fourth round on one line, and the rows are the product of the two ways the
-// signal can arrive -- in the map, or consumed into `resp.Close` -- with the case
-// where it did not arrive at all.
+// skips generated spans .
 func TestAConsumedCloseSignalIsStillReceived(t *testing.T) {
-	// ⚠ AND `resp.Close` HAS TWO CAUSES. Go sets it when the transport CONSUMED
-	// `Connection: close`, and also when an HTTP/1.1 response is close-delimited --
-	// no length, no chunked framing, body ends at EOF. `DumpResponse` synthesises
-	// the line either way, so the two are separable only by the FRAMING
-	// (shardpilot/shardpilot-go#84 review). The round before read both as received
-	// and this table had no framing column at all.
-	//
 	// The rows are the product of the header's presence with `resp.Close` and with
 	// the three framings a response can have.
 	// ⚠ AND THE PROTOCOL IS A THIRD AXIS, because BELOW HTTP/1.1 closure is the
@@ -3994,7 +3902,7 @@ func TestAConsumedCloseSignalIsStillReceived(t *testing.T) {
 	// `http.ReadResponse`, which gives `Close=true` there and false for the same
 	// response as 1.1. So framing separated the two provenances only above 1.0, and
 	// the row that proves it was missing rather than wrong
-	// (shardpilot/shardpilot-go#84 review). The expectation carries `ambiguous` too:
+	// . The expectation carries `ambiguous` too:
 	// a scene that reads only `recvConn` cannot tell "the endpoint did not send it"
 	// from "we cannot tell", and those are the two answers this branch chooses
 	// between.
@@ -4058,8 +3966,7 @@ func TestAConsumedCloseSignalIsStillReceived(t *testing.T) {
 // `shardpilot experiment assignment fetch failed: <code>` and wrong for
 // everything else: with an experiment key of `unauthorized`, `malformed HTTP
 // response "unauthorized"` had the word marked as generated, the guard ignored
-// it, and `stripMarks` published it verbatim (shardpilot/shardpilot-go#84
-// review). Recognition is not authorship, and here the position is what carries
+// it, and `stripMarks` published it verbatim . Recognition is not authorship, and here the position is what carries
 // the authorship.
 //
 // The rows are the product of the taxonomy words with the two contexts.
@@ -4085,7 +3992,7 @@ func TestTaxonomyIsVouchedOnlyWhereTheSDKWroteIt(t *testing.T) {
 			// DID, this branch publishes it and the branch stacked above withholds
 			// the whole diagnostic, because there the text is never taken from the
 			// error at all; so the positive half is "published, or refused", which
-			// is exactly what each branch does (shardpilot/shardpilot-go#84 review).
+			// is exactly what each branch does .
 			if !c.sdkWrote && printed {
 				t.Errorf("%s / %s: a taxonomy word this SDK did not write was published: %q",
 					code, c.name, got)
@@ -4134,7 +4041,7 @@ func TestTheSDKErrorPrefixesAreTheOnesTheSDKWrites(t *testing.T) {
 // `joinBase64Runs`, which joins only lines that are ENTIRELY base64 -- so
 // `USF6\r\nJDdwQA== end!` was assembled by neither and the guard approved text a
 // decoder turns straight back into the identifier
-// (shardpilot/shardpilot-go#84 review).
+// .
 //
 // And the padding: with horizontal whitespace dropped, `JDdwQA== end!` became
 // `JDdwQA==end!`, and a scan that treats `=` as one more admissible byte ran PAST
@@ -4161,7 +4068,7 @@ func TestAWrappedRunMayBeginOnAWholeLine(t *testing.T) {
 // `Reason` and `REASON` to the same field, so
 // `{"reason":"kill_switch","Reason":"anything"}` is classified `anything` -- while
 // the ordinal counted the two occurrences separately, left the first vouched, and
-// published the supplied identifier (shardpilot/shardpilot-go#85 review). The
+// published the supplied identifier . The
 // ordinal answers "which occurrence does the decoder keep", so it has to group
 // members exactly as the decoder groups them.
 //
@@ -4241,7 +4148,7 @@ func TestExemptionsFollowTheResponseShape(t *testing.T) {
 // embedded newline passes the nonempty and config-normalisation checks and makes
 // an invalid `Authorization` value; the serialiser's error was discarded, `req`
 // stayed empty, and the report rendered an empty canonical block under a heading
-// saying the request was formed (shardpilot/shardpilot-go#84 review). The
+// saying the request was formed . The
 // artifact exists to carry that evidence, so its absence is the one thing it must
 // not be silent about.
 func TestASectionDoesNotClaimARequestItDoesNotHave(t *testing.T) {
@@ -4270,7 +4177,7 @@ func TestASectionDoesNotClaimARequestItDoesNotHave(t *testing.T) {
 // decompressed before `RoundTrip` returns and the coding headers are removed, so
 // `teeBody` wraps the DECODED payload -- while the section's prose called it "the
 // received bytes" and the header block is missing a `Content-Encoding` the
-// endpoint did send (shardpilot/shardpilot-go#84 review). A capture that
+// endpoint did send . A capture that
 // misdescribes its own provenance is worse than one that captures less.
 func TestADecodedBodyIsNotDescribedAsReceived(t *testing.T) {
 	for _, uncompressed := range []bool{true, false} {
@@ -4361,7 +4268,7 @@ func TestTheRecorderCarriesSerialiserAndCodingFacts(t *testing.T) {
 // ⚠ GO DELIVERS 1xx ONLY THROUGH `httptrace`. A bare `RoundTrip` returns the final
 // response alone, so a `103 Early Hints` — its status and its headers — vanished
 // from a report that went on to present a complete captured pair
-// (shardpilot/shardpilot-go#84 review). This harness records rather than
+// . This harness records rather than
 // summarises, and an omission it does not mention is the one kind it cannot make.
 //
 // The fake transport fires the trace the way the real one does, so the scene
@@ -4434,7 +4341,7 @@ func (t *traceFiringTransport) RoundTrip(req *http.Request) (*http.Response, err
 // unexpected character` — so the host exemption cannot be reached with one and no
 // end-to-end input publishes such a body. The redaction is insurance against
 // `net/url` accepting the grammar RFC 3986 defines, so the only honest scene calls
-// the pass directly (shardpilot/shardpilot-go#85 review, premise measured).
+// the pass directly .
 //
 // The rows are the product of the shapes the grammar admits: a hex version of one
 // and several digits, and a body carrying unreserved, sub-delim and colon bytes.
@@ -4469,12 +4376,7 @@ func TestTheIPvFutureBodyIsRedacted(t *testing.T) {
 // true, and `tokenPlaceholder("")` rendered `redacted-0-chars=redacted-6-chars` --
 // an invalid cookie presented as a syntactically valid one this recorder invented,
 // hiding the very response defect the artifact exists to preserve
-// (shardpilot/shardpilot-go#85 review).
-//
-// Narrowed to EMPTY rather than to "not a cookie token", which the review asked
-// for: a name of one NUL byte is not a token either, and this file deliberately
-// MEASURES that one — the wider predicate turned
-// `TestEveryComponentIsMeasuredAsReceived` red.
+// .
 func TestAnEmptyCookieNameIsWithheld(t *testing.T) {
 	for _, c := range []struct {
 		line     string
@@ -4507,7 +4409,9 @@ func TestAnEmptyCookieNameIsWithheld(t *testing.T) {
 // ⚠ THE HEADER PATH ASKS `hasBody` AND THE TRAILER PATH DID NOT. A zero-length
 // response announcing `Content-Encoding: br` in its trailer had an otherwise
 // publishable capture withheld with exit 4 over bytes that do not exist
-// (shardpilot/shardpilot-go#85 review) — the fifth time a rule written on the
+//
+//	— the fifth time a rule written on the
+//
 // header path had to be carried to the trailer path.
 func TestATrailerCodingOnAnEmptyBodyDoesNotRefuse(t *testing.T) {
 	for _, c := range []struct {
@@ -4532,7 +4436,7 @@ func TestATrailerCodingOnAnEmptyBodyDoesNotRefuse(t *testing.T) {
 //
 // ⚠ `strings.Index` FOUND THE WRAPPER ANYWHERE. An endpoint that puts the wrapper
 // text INSIDE its own diagnostic got its own bytes vouched as this SDK's
-// classification (shardpilot/shardpilot-go#84 review). `fmt.Errorf("shardpilot …
+// classification . `fmt.Errorf("shardpilot …
 // failed: %s", code)` puts the wrapper at the START of the message and nowhere
 // else, so that is the only position that establishes provenance — finding a
 // prefix is not being written by the thing that writes it, one level up from the
@@ -4574,19 +4478,6 @@ func TestOnlyAnSDKAuthoredErrorVouchesItsClassification(t *testing.T) {
 }
 
 // Every producer over every view, and a seed re-enters the producing half too.
-//
-// ⚠ TWO OF SIX PRODUCER/VIEW PAIRS WERE MISSING, AND THE CHAIN RERAN ONLY ITS
-// DESTRUCTIVE HALF. `binaryCandidates` and `base64SuffixCandidates` were given the
-// NORMALISED form and the hex, short-base64 and wrapped producers were not, so a
-// one-character value emitted as wrapped unpadded base64 — `a` as `Y\r\nQ` — was
-// approved: the fragments are each too short to decode and nothing scanned the
-// joined form. And a binary candidate carrying another wrapped run could not be
-// reached at all, because the rounds rerun the six decoders and no producer
-// (shardpilot/shardpilot-go#84 review).
-//
-// The rows are the review's two cases plus the shapes around them, and the fix is
-// stated as a product rather than as pairs listed by hand — which is how two of
-// six went missing.
 func TestTheCandidateChainReachesWrappedAndReWrappedValues(t *testing.T) {
 	// ⚠ A LIMIT, NAMED WHERE A READER SEES IT. A wrapped run whose continuation is
 	// ADJACENT to base64-shaped prose cannot be delimited: in `prefix: Y\r\nQ end`
@@ -4611,15 +4502,6 @@ func TestTheCandidateChainReachesWrappedAndReWrappedValues(t *testing.T) {
 }
 
 // An interim response is a response.
-//
-// ⚠ THE REQUEST REDACTOR ASKS A QUESTION ABOUT THE REQUEST. `redact` consults
-// `serialiserWritten` — whether net/http wrote a field for the OUTGOING request —
-// so every endpoint field of an interim response was marked generated, the guard
-// skipped the span, and `stripMarks` published it verbatim
-// (shardpilot/shardpilot-go#84 review). My own capture from the previous round
-// introduced this: handing a response to the request's redactor is the same
-// category error as reading a trailer with the header path's rules, which this
-// file has now made five times.
 //
 // The rows are the shapes an interim response carries: an endpoint-only field, a
 // field the request also has, and a server-minted surface.
@@ -4668,7 +4550,7 @@ func TestAnInterimResponseGoesThroughTheResponsePipeline(t *testing.T) {
 // ⚠ `continue` MADE THE SECTION'S OWN SENTENCE FALSE. The NOT CAPTURED block says
 // the transport's outcome is reported below, and then skipped the informational
 // blocks, the response, and the recorded transport error
-// (shardpilot/shardpilot-go#84 review). The missing evidence is the request;
+// . The missing evidence is the request;
 // everything else was recorded and is still owed.
 func TestASerialiserRefusalStillRendersTheResponse(t *testing.T) {
 	structuralSurfaces = nil
@@ -4689,19 +4571,6 @@ func TestASerialiserRefusalStillRendersTheResponse(t *testing.T) {
 }
 
 // A budget that does not count the work it bounds is a number in a message.
-//
-// ⚠ THE CANDIDATE PRODUCERS SCANNED `cur`, `norm` AND THE NAME STREAM ONCE PER
-// DECODER STAGE AND PER ROUND, AND NONE OF IT WAS CHARGED. The `len(cur)` charge
-// after the block accounted for one pass and `takeDecodeWork` covered only the
-// suffix tails, so post-processing could examine far more than the advertised
-// ceiling (shardpilot/shardpilot-go#84 review).
-//
-// I could not find an input that flips the budget's VERDICT: on every shape I
-// built, the other charges dominate and the refusal arrives either way. So this
-// asserts the accounting itself, which is the thing that was wrong — the same
-// seam `decodeWork` already provides for the suffix probes. The lower bound is
-// arithmetic rather than a guess: one round charges `joinBase64Runs` once over
-// `cur` and `binaryCandidates` twice, so at least three passes.
 func TestTheProducingScansAreCharged(t *testing.T) {
 	suppliedValues = []string{"nothingmatches"}
 	t.Cleanup(func() { suppliedValues = nil; decodeWork = 0; producerWork = 0 })
@@ -4719,14 +4588,6 @@ func TestTheProducingScansAreCharged(t *testing.T) {
 
 // A position is the SDK's only where the SDK reads it.
 //
-// ⚠ AND READING IT IS CONDITIONAL ON THE REST OF THE DOCUMENT. The assigned branch
-// RETURNS before `reason` is read, so in a valid assigned response the member is
-// endpoint-chosen text the SDK never looks at — and vouching it published a
-// supplied identifier out of an ordinary success (shardpilot/shardpilot-go#85
-// review). The rounds before moved this question from the TOKEN to the POSITION
-// and then to the EFFECTIVE position; this is the third axis, and it is about the
-// document rather than about the member.
-//
 // The allowlist narrows with it: the not-assigned branch takes `{absent,
 // kill_switch, targeting_unmatched}` and refuses the body for anything else, so
 // the wider taxonomy would vouch a value the SDK itself rejects.
@@ -4739,7 +4600,7 @@ func TestReasonIsVouchedOnlyWhereTheSDKReadsIt(t *testing.T) {
 		{`{"assigned":false,"reason":"kill_switch"}`, true},
 		// ⚠ NO `assigned` MEMBER: the SDK rejects the body at `wire.Assigned == nil`
 		// before it reads `reason` at all, so the value is never its classification
-		// (shardpilot/shardpilot-go#85 review). This row asserted the opposite while
+		// . This row asserted the opposite while
 		// the condition was only "is assigned true".
 		{`{"reason":"kill_switch"}`, false},
 		{`{"assigned":false,"reason":"targeting_unmatched"}`, true},
@@ -4750,7 +4611,7 @@ func TestReasonIsVouchedOnlyWhereTheSDKReadsIt(t *testing.T) {
 		// the request's own value, which this pass can only check as "is it a value
 		// this harness supplied" -- so an echo carrying something else stops the
 		// vouch, because the SDK would reject that body and the value would not be
-		// its classification (shardpilot/shardpilot-go#85 review).
+		// its classification .
 		{`{"assigned":false,"reason":"kill_switch","app_key":"ak"}`, false},
 		{`{"assigned":false,"reason":"kill_switch","experiment_key":"ek"}`, false},
 
@@ -4808,11 +4669,6 @@ func TestTheReasonValuesAreTheSDKsOwn(t *testing.T) {
 
 // Marking the vouched names is one pass, not one rebuild per name.
 //
-// ⚠ THE SECOND HALF OF A FIX APPLIED TO THE HALF IT WAS SHOWN. Two rounds ago the
-// VALUE-span assembly was rewritten from a right-to-left splice into a builder;
-// the NAME-span pass standing beside it kept the splice, and a valid object may
-// hold many vouched names (shardpilot/shardpilot-go#85 review).
-//
 // Measured on this machine at 30,000 duplicate canonical members in a ~510 KB
 // body — inside the accepted ~1 MB response limit, and after the network deadline
 // has stopped bounding anything: 2.694s splicing, 137ms with the builder.
@@ -4821,7 +4677,7 @@ func TestTheReasonValuesAreTheSDKsOwn(t *testing.T) {
 // with room rather than a guess" — and it was still a measurement of THIS machine.
 // On a slower or shared runner the same correct code failed 4 of 5 runs at
 // 524–582 ms, which makes `go test ./examples/experiments/...` report a defect that
-// is not in the tree (shardpilot/shardpilot-go#85 review). A threshold whose
+// is not in the tree . A threshold whose
 // verdict depends on who runs it is not a scene, however carefully it was derived.
 //
 // The property is ONE PASS, and the defect was a rebuild per span: quadratic in
@@ -4856,7 +4712,7 @@ func TestVouchedNamesAreMarkedInOnePass(t *testing.T) {
 // ⚠ `strings.Replace` EDITED THE FIRST OCCURRENCE, WHICH IS NOT THE AUTHORITY.
 // With a supplied `http`, `http://http/cb` had its SCHEME replaced, and the
 // remaining passes emitted `redacted-19-chars//redacted-4-chars/...` — a malformed
-// target with no structural refusal recorded (shardpilot/shardpilot-go#85 review).
+// target with no structural refusal recorded .
 //
 // The rows are the product of the components a supplied value can collide with by
 // spelling — the scheme, the host, a path segment — and the assertion is on the
@@ -4898,7 +4754,7 @@ func TestTheAuthorityIsReplacedAtItsOffset(t *testing.T) {
 // ⚠ A `text/plain` PAYLOAD THAT WAS ALSO CUT SHORT IS AN UNSUPPORTED SHAPE EITHER
 // WAY. The excuse fired on truncation alone, so a partial body carrying
 // endpoint-chosen text was printed with its refusal removed — and the guard cannot
-// see a value this harness never supplied (shardpilot/shardpilot-go#85 review).
+// see a value this harness never supplied .
 //
 // The classification is asked of the DECODER by sentinel: `Decode` returns
 // `io.ErrUnexpectedEOF` for a JSON prefix and a syntax error for something that is
@@ -4915,7 +4771,7 @@ func TestTruncationExcusesOnlyWhatTruncationExplains(t *testing.T) {
 		// ⚠ AND A CUT *INSIDE* A VALUE IS NOT EXCUSED, however good a JSON prefix it
 		// is. Neither body redactor can traverse a malformed document, so the extent
 		// the cut opened is published unmeasured and the supplied-value scrub cannot
-		// see it -- the token is the endpoint's (shardpilot/shardpilot-go#85 review).
+		// see it -- the token is the endpoint's .
 		// The row for `"abc` used to say true; a truncated bare string is exactly this
 		// case at the root.
 		{`"abc`, false},
@@ -4974,13 +4830,6 @@ func TestAssignmentExemptionsApplyThroughoutTwoHundreds(t *testing.T) {
 
 // Every producer re-enters, not the two I happened to name.
 //
-// ⚠ THE ROUND BEFORE FIXED AN ENUMERATION BY WRITING ANOTHER ONE. Seeds were made
-// to re-enter the PRODUCING half of the chain, and only the wrapped and
-// short-Base64 producers were enqueued — so a seed carrying a form another
-// producer handles stayed unreachable: `/zYx` decodes to `0xff61`, which `undoHex`
-// deliberately ignores as a two-byte token and only `hexCandidates` splits
-// (shardpilot/shardpilot-go#84 review).
-//
 // The rows are one input per producer that was missing, so the assertion is about
 // the SET of producers rather than about the case shown.
 func TestEveryProducerReEntersForASeed(t *testing.T) {
@@ -5010,7 +4859,7 @@ func TestEveryProducerReEntersForASeed(t *testing.T) {
 // built here from `http.StatusText`, so a custom reason phrase the endpoint sent
 // is replaced by the registered one — and on HTTP/2 no textual status line was
 // received at all, while the section presented the synthesized bytes as a status
-// the endpoint sent (shardpilot/shardpilot-go#84 review). The final-response
+// the endpoint sent . The final-response
 // section has carried that label since #73; this one was added without it.
 func TestTheInterimSectionIsLabelledCanonical(t *testing.T) {
 	var report strings.Builder
@@ -5037,7 +4886,7 @@ func TestTheInterimSectionIsLabelledCanonical(t *testing.T) {
 // supplied `JSON`, `Content-Type: application/JSON` became
 // `application/<redacted, 4 chars>` — which `mime.ParseMediaType` rejects even
 // though what arrived was a valid media type, with an empty ledger
-// (shardpilot/shardpilot-go#85 review).
+// .
 //
 // The assertion is on the GRAMMAR of what came out, over the product of the
 // spellings with a colliding and a non-colliding supplied value.
@@ -5071,14 +4920,6 @@ func TestAnAdmittedValueKeepsItsGrammarWhenItCollides(t *testing.T) {
 }
 
 // An interim block's Connection provenance is its own.
-//
-// ⚠ THE FINAL RESPONSE'S ANSWER SAYS NOTHING ABOUT AN INTERIM ONE.
-// `Got1xxResponse` hands over the headers IT delivered, so whether an interim
-// carried a `Connection` field is a fact about that block — and inheriting the
-// final response's `recvConn=false` marked a received interim line as
-// serialiser-generated, which the guard skips and `stripMarks` publishes
-// (shardpilot/shardpilot-go#84 review). Per exchange was the fix two rounds ago;
-// per interim BLOCK is the same sentence one surface along.
 func TestInterimConnectionProvenanceIsPerBlock(t *testing.T) {
 	suppliedValues = []string{"secret"}
 	t.Cleanup(func() { suppliedValues = nil; structuralSurfaces = nil })
@@ -5131,12 +4972,6 @@ func TestInterimConnectionProvenanceIsPerBlock(t *testing.T) {
 }
 
 // The interim capture is bounded, and says so when it drops.
-//
-// ⚠ INSTALLING `Got1xxResponse` REMOVES THE ONLY BOUND THERE WAS. `net/http`
-// resets its response-header allowance after every interim response it delivers,
-// leaving the callback responsible for limiting them — so the capture I added in a
-// previous round could grow for the whole deadline
-// (shardpilot/shardpilot-go#84 review).
 func TestTheInterimCaptureIsBounded(t *testing.T) {
 	structuralSurfaces = nil
 	t.Cleanup(func() { structuralSurfaces = nil; suppliedValues = nil })
@@ -5181,7 +5016,7 @@ func TestTheInterimCaptureIsBounded(t *testing.T) {
 // SPELLING. `Age: 123456` is admitted because it IS an integer, so with `123456`
 // supplied there is nothing to substitute that stays one — the prose scrub emitted
 // `Age: <redacted, 6 chars>` with an empty ledger, and a token placeholder would be
-// no better (shardpilot/shardpilot-go#85 review). The line is withheld and the
+// no better . The line is withheld and the
 // refusal recorded.
 //
 // A REGISTRY value is different in kind: it has a canonical spelling this program
@@ -5215,12 +5050,6 @@ func TestAnOpenGrammarCollisionIsRefusedRatherThanMangled(t *testing.T) {
 }
 
 // A name we sent in a query proves nothing about a name in someone else's fragment.
-//
-// ⚠ SECOND TIME THIS REGISTRY HAS BEEN READ AS SAYING MORE THAN IT DOES. The round
-// before took it out of the COOKIE path for the same reason, and the fragment stood
-// one caller away: with an experiment key of `experiment_key`, an endpoint's
-// `Location: /cb#experiment_key=x` had that member name marked harness-authored, so
-// the scrub and the guard both skipped it (shardpilot/shardpilot-go#85 review).
 func TestFragmentNamesAreNotInferredFromTheRequestQuery(t *testing.T) {
 	restore := requestNames
 	t.Cleanup(func() { requestNames = restore; suppliedValues = nil })
@@ -5242,7 +5071,7 @@ func TestFragmentNamesAreNotInferredFromTheRequestQuery(t *testing.T) {
 // a present one must decode to a number and be at least 1, and an explicit null is
 // PRESENT and rejected — so `{"assigned":false,"version":null,"reason":"kill_switch"}`
 // is a body the SDK refuses, and `reason` there is not its classification
-// (shardpilot/shardpilot-go#85 review).
+// .
 func TestTheNotAssignedShapeIncludesVersion(t *testing.T) {
 	for _, c := range []struct {
 		body    string
@@ -5273,7 +5102,9 @@ func TestTheNotAssignedShapeIncludesVersion(t *testing.T) {
 // ⚠ TRAILING DATA VIOLATES THE SINGLE-DOCUMENT SHAPE WHETHER OR NOT ANYTHING WAS
 // TRUNCATED. `{}` in `{}server-secret-token` decodes cleanly and leaves endpoint
 // text behind, so the excuse removed a refusal the trailing bytes had earned
-// (shardpilot/shardpilot-go#85 review) — the same sentence `markBareJSONLiterals`
+//
+//	— the same sentence `markBareJSONLiterals`
+//
 // already applies to a value STREAM, one pass along.
 func TestTrailingDataIsNotExcusedByTruncation(t *testing.T) {
 	for _, c := range []struct {
@@ -5299,7 +5130,7 @@ func TestTrailingDataIsNotExcusedByTruncation(t *testing.T) {
 // status, and now WHICH statuses. `applyExperimentAssignment` calls
 // `experimentBodyErrorCode` only for the subject-grammar sentinel at 400 and the
 // real-subjects sentinel at 403; every other status is classified by the status
-// alone (shardpilot/shardpilot-go#85 review).
+// alone .
 func TestErrorExemptionsApplyOnlyWhereTheEnvelopeIsRead(t *testing.T) {
 	for _, c := range []struct {
 		head    string
@@ -5322,16 +5153,6 @@ func TestErrorExemptionsApplyOnlyWhereTheEnvelopeIsRead(t *testing.T) {
 	}
 }
 
-// TestUnicodeSpaceIsNotJSONWhitespaceAtTheRoot is the THIRD site of the question
-// the other two fixes in this round answer, and the only one no reviewer pointed
-// at: `markBareJSONLiterals` still asks it with `strings.TrimSpace`, which eats
-// Unicode's whole space class. MEASURED, NOT ASSUMED, AND THE MEASUREMENT SAID NO:
-// deleting that early refusal republishes the STREAM case (`{"x":1} false` -- and
-// TestATrailingJSONValueIsNotGrammar kills that mutant) while U+00A0 stays
-// redacted, because the refusal for it is `encoding/json`'s own and not this
-// program's. So the production spelling is left alone -- there is no defect here
-// to fix -- and this scene exists to keep it that way: it fails the day a tolerant
-// pre-filter becomes the answer at the root (shardpilot/shardpilot-go#85 review).
 func TestUnicodeSpaceIsNotJSONWhitespaceAtTheRoot(t *testing.T) {
 	suppliedValues = []string{"false"}
 	t.Cleanup(func() { suppliedValues = nil })
@@ -5353,7 +5174,7 @@ func TestUnicodeSpaceIsNotJSONWhitespaceAtTheRoot(t *testing.T) {
 // believes the body is one JSON document. With `TrimSpace` there, `{"x":1}`
 // followed by U+00A0 was believed -- so endpoint text in a shape this build does
 // not cover was carried into the artifact with an EMPTY refusal ledger, while
-// `encoding/json` rejects that body (shardpilot/shardpilot-go#85 review).
+// `encoding/json` rejects that body .
 //
 // ⚠ THE OBSERVABLE IS THE LEDGER, NOT THE STRING. This function refuses without
 // rewriting -- both paths return the body unchanged -- so a scene that compares
@@ -5383,7 +5204,7 @@ func TestAUnicodeSpaceDoesNotMakeABodyParse(t *testing.T) {
 // "reason":"kill_switch"}` is rejected outright; the reduced mirror carrying only
 // the members this pass reads decoded it happily and vouched `reason`, and a
 // supplied `kill_switch` was skipped by both the scrub and the guard and published
-// with an empty ledger (shardpilot/shardpilot-go#85 review).
+// with an empty ledger .
 func TestAVouchNeedsTheWholeWireShape(t *testing.T) {
 	suppliedValues = []string{"kill_switch"}
 	t.Cleanup(func() { suppliedValues = nil })
@@ -5401,12 +5222,6 @@ func TestAVouchNeedsTheWholeWireShape(t *testing.T) {
 	}
 }
 
-// TestTheMirroredWireShapeMatchesTheSDKs is the drift guard the mirror needs. A
-// copy of someone else's grammar has as many edges as that grammar has versions,
-// and five rounds have narrowed this predicate one member at a time. Both structs
-// are read out of the source: the day the SDK gains a member, or retypes one, this
-// fails instead of the vouch quietly answering a weaker question
-// (shardpilot/shardpilot-go#85 review).
 func TestTheMirroredWireShapeMatchesTheSDKs(t *testing.T) {
 	fset := token.NewFileSet()
 	members := func(path, name string) map[string]string {
@@ -5466,13 +5281,6 @@ func TestTheMirroredWireShapeMatchesTheSDKs(t *testing.T) {
 }
 
 // When provenance cannot be established, the capture refuses.
-//
-// ⚠ THE AMBIGUOUS STATE COVERS BOTH ANSWERS. Without explicit framing, `resp.Close`
-// means either a CONSUMED `Connection: close` or close-delimited framing, and
-// `net/http` leaves the same evidence for each — so calling it received lets the
-// scrub rewrite a line net/http invented, and calling it generated lets the guard
-// skip a line the endpoint sent (shardpilot/shardpilot-go#84 review). Two rounds
-// each picked one default; the third fact is that neither is knowable here.
 func TestAnUndecidableConnectionProvenanceRefuses(t *testing.T) {
 	for _, c := range []struct {
 		name    string
@@ -5516,7 +5324,7 @@ func TestAnUndecidableConnectionProvenanceRefuses(t *testing.T) {
 // ⚠ THE PRODUCERS CAN OVERSHOOT THE CAP BEFORE THE WORKLIST EXISTS. A 900 KB body
 // of `61 ` repeated yields roughly 300,000 hex seeds and about 234 MB of
 // allocations, and the loop checked the cap only after processing every initial
-// entry (shardpilot/shardpilot-go#84 review) — the same sentence this file had just
+// entry  — the same sentence this file had just
 // applied to the decode budget, one collection along.
 func TestTheSeedCapIsAppliedWhileCollecting(t *testing.T) {
 	suppliedValues = []string{"nothingmatches"}
@@ -5525,17 +5333,6 @@ func TestTheSeedCapIsAppliedWhileCollecting(t *testing.T) {
 	// ⚠ MEASURED IN ALLOCATIONS, WHICH IS WHAT THE FINDING IS ABOUT. Wall time does
 	// not separate the two — the per-seed work is charged either way; what the cap
 	// changes is how much is BUILT first.
-	//
-	// ⚠ AND THE BOUND OUTLIVED ITS SUBJECT, FOR THE SECOND TIME IN THIS FILE. It was
-	// derived from the WORKLIST cap — 56 MiB against 234 MiB — and this scene
-	// carries the name of the property, not of that collection. The PRODUCERS were
-	// never capped, and they allocate 103 MiB on this very input: under the bound, so
-	// this test passed for four rounds while the thing it is named for was false
-	// (shardpilot/shardpilot-go#85 review). ⚠ The comment here also said the bound
-	// was 120 while the code said 160, so the two disagreed as well. A threshold is a
-	// fact about the
-	// measurement it came from, and this one had been left pointing at a different
-	// one.
 	//
 	// Re-derived on the same input, 900 KB of `61 ` repeated: 15 MiB with the
 	// producers capped, 103 MiB without. The bound is 32 MiB — between them, and
@@ -5551,7 +5348,7 @@ func TestTheSeedCapIsAppliedWhileCollecting(t *testing.T) {
 	// ⚠ AND THE MARGIN IS FOR THE TOOLCHAIN, WHICH IS ALSO MEASURED. The same code
 	// allocated 117 MiB here and 124 in CI on Go 1.25 -- so this scene was green
 	// locally and red there, on a bound with 3 MiB of headroom
-	// (shardpilot/shardpilot-go#84 CI). A bound one toolchain passes is not a
+	// . A bound one toolchain passes is not a
 	// statement about the toolchains this repository builds on; the spread is about
 	// 6%, and what this scene must now separate is 15 from 103.
 	if got > 32 {
@@ -5566,7 +5363,7 @@ func TestTheSeedCapIsAppliedWhileCollecting(t *testing.T) {
 // and a full copy of the line was kept for each, all of it BEFORE `assertNoLeak`
 // resets and enforces its budget — so a malformed status line of tens of kilobytes
 // could spend the process after the network deadline has already ended
-// (shardpilot/shardpilot-go#84 review).
+// .
 func TestTheTransportErrorDecodeIsBounded(t *testing.T) {
 	structuralSurfaces = nil
 	t.Cleanup(func() { structuralSurfaces = nil; suppliedValues = nil })
@@ -5579,12 +5376,6 @@ func TestTheTransportErrorDecodeIsBounded(t *testing.T) {
 	// small line, and the cost is the retained forms. When this was written the
 	// measurement was 516 MiB charged and bounded against 3394 MiB retaining every
 	// form, and the bound was set at 1024, between them.
-	//
-	// ⚠ AND THE SUBJECT MOVED UNDER IT. Re-measured here: this now allocates 0 MiB,
-	// so a 1024 MiB bound is three orders of magnitude above its own subject and
-	// could not detect the regression it exists for. Found by asking the same
-	// question of every allocation bound in this file after the seed cap's had
-	// outlived its subject — no review named this one.
 	//
 	// Re-derived only on the side that was re-measured: the bounded number is 0–1
 	// MiB now, so 64 sits far above it and still two orders below the 3394 the
@@ -5619,7 +5410,7 @@ func allocatedBytes(f func()) uint64 {
 // a slower runner. It was replaced with an absolute allocation ceiling, which
 // measures the TEST BUILD: under `-race` the one-pass implementation allocates 232
 // MiB against a 64 MiB ceiling and the suite fails on correct code
-// (shardpilot/shardpilot-go#85 review). Two substitutions, one sentence -- the
+// . Two substitutions, one sentence -- the
 // number moved for a reason that is not the tree.
 //
 // The property these scenes exist for IS a ratio: linear against quadratic. Any
@@ -5657,7 +5448,7 @@ func allocatedMiB(f func()) uint64 {
 // TestALegalEmptyFieldIsNotRefused: the refusal is about what a value could
 // hide, so a field with no value bytes has nothing for it to be about. A legal
 // empty `Location:` was refused on the strength of its NAME and the capture cost
-// an operator the record and exit 4 (shardpilot/shardpilot-go#84 review) — the
+// an operator the record and exit 4  — the
 // same shape as the unsupported-coding check, which already asks whether there is
 // a body to decode.
 func TestALegalEmptyFieldIsNotRefused(t *testing.T) {
@@ -5701,7 +5492,7 @@ func TestALegalEmptyFieldIsNotRefused(t *testing.T) {
 // handed to `isMintedName` (which answers about minted identifiers, not field
 // names) and nothing was recorded, so the diagnostic was published and the
 // supported percent decoder reconstructs the cookie from it
-// (shardpilot/shardpilot-go#84 review).
+// .
 func TestAnEncodedFieldNameIsRefusedOnEveryForm(t *testing.T) {
 	t.Cleanup(func() { structuralSurfaces = nil })
 	for _, spelling := range []string{
@@ -5729,7 +5520,7 @@ func TestAnEncodedFieldNameIsRefusedOnEveryForm(t *testing.T) {
 // run folded with a lone CR reconstructs the value — while splitting only on LF
 // left the CR inside one line, `allBase64` rejected the run, and the ordinary
 // token decoder saw two fragments that reconstruct nothing
-// (shardpilot/shardpilot-go#84 review).
+// .
 func TestALoneCRFoldsBase64LikeLF(t *testing.T) {
 	// ⚠ THE BUDGET IS SHARED AND THIS SCENE IS NOT FIRST. Assembly stops charging
 	// against `decodeWork`, so a scene that does not reset it passes alone and fails
@@ -5754,7 +5545,7 @@ func TestALoneCRFoldsBase64LikeLF(t *testing.T) {
 // valid-UTF-8 decode and the binary producer's floor is four bytes, so `/2E` —
 // which raw-decodes to 0xff 0x61 — fell between the two producers and a
 // one-character supplied value was approved, even though the configured decoder
-// reconstructs it directly (shardpilot/shardpilot-go#84 review).
+// reconstructs it directly .
 func TestAShortBinaryBase64DecodeIsRetained(t *testing.T) {
 	var found bool
 	for _, c := range shortBase64Candidates("/2E") {
@@ -5785,7 +5576,7 @@ func TestAShortBinaryBase64DecodeIsRetained(t *testing.T) {
 // the assignment set, so `201 Created` with `{"assigned":"x"}` marked an
 // endpoint-controlled name as generated and a supplied `assigned` was published;
 // and an over-limit body took it too, though `parseExperimentVerdict` refuses
-// before decoding (shardpilot/shardpilot-go#84 and #85 reviews).
+// before decoding .
 func TestExemptionsFollowTheSDKsOwnGates(t *testing.T) {
 	t.Cleanup(func() { suppliedValues = nil })
 	for _, c := range []struct {
@@ -5818,7 +5609,7 @@ func TestExemptionsFollowTheSDKsOwnGates(t *testing.T) {
 	}
 	// ⚠ AND THE LAST ACCEPTED SIZE IS STILL EXEMPT. The separator line is framing,
 	// not payload, and measuring it made the two largest legal bodies lose their
-	// exemptions (shardpilot/shardpilot-go#84 review).
+	// exemptions .
 	suppliedValues = []string{"assigned"}
 	head := `{"assigned":false}`
 	exact := head + strings.Repeat(" ", sdkMaxBodyBytes-len(head))
@@ -5905,7 +5696,7 @@ func TestTheMirroredBodyLimitMatchesTheSDKs(t *testing.T) {
 // neither empty nor a JSON document, and `jsonParses` rejects both; `TrimSpace`
 // made each look empty, so the structural refusal was skipped and endpoint bytes
 // were published outside the four documented capture forms with an empty ledger
-// (shardpilot/shardpilot-go#85 review).
+// .
 func TestAWhitespaceOnlyBodyIsNotEmpty(t *testing.T) {
 	t.Cleanup(func() { structuralSurfaces = nil })
 	for _, c := range []struct {
@@ -5932,7 +5723,7 @@ func TestAWhitespaceOnlyBodyIsNotEmpty(t *testing.T) {
 // guard will reconstruct, or it answers about a smaller world than the guard
 // searches — and the difference is exactly what an endpoint spells its payload in.
 // The transport diagnostic ran two decoders while the guard runs six, and the
-// malformed-body member scan ran none (shardpilot/shardpilot-go#84 review).
+// malformed-body member scan ran none .
 func TestAScanProducesEverySpellingTheGuardReconstructs(t *testing.T) {
 	t.Cleanup(func() { structuralSurfaces = nil })
 	for _, c := range []struct{ name, text string }{
@@ -5942,7 +5733,7 @@ func TestAScanProducesEverySpellingTheGuardReconstructs(t *testing.T) {
 		// ⚠ AND TWO HOPS, because an endpoint chooses how many stages to use. The first
 		// version of the producer applied each decoder ONCE, so a value behind two
 		// already-supported stages reached only its middle spelling and neither scan
-		// recorded anything (shardpilot/shardpilot-go#84 review).
+		// recorded anything .
 		{"base64 of base64", `malformed HTTP response "VTJWMExVTnZiMnRwWlRvZ2MyVnpjMmx2YmoxelpXTnlaWFE9"`},
 		{"double percent", `malformed HTTP response "%2553et-Cookie: session=secret"`},
 	} {
@@ -5987,7 +5778,7 @@ func TestAScanProducesEverySpellingTheGuardReconstructs(t *testing.T) {
 		// decode is not valid UTF-8 exactly as it found it, so this spelling was in no
 		// form the walk produced while `assertNoLeak` builds that very candidate
 		// downstream and checks it only against SUPPLIED values
-		// (shardpilot/shardpilot-go#84 review).
+		// .
 		`/yJzdWJqZWN0X2ZhY3Rfa2V5Ijoic2ZrX3NlY3JldCI=`,
 	} {
 		structuralSurfaces = nil
@@ -6009,7 +5800,7 @@ func TestAScanProducesEverySpellingTheGuardReconstructs(t *testing.T) {
 // made `dataOf` treat the reason phrase as endpoint data, so a legal supplied
 // value equal to a standard phrase — experiment key `Hints` against a
 // `103 Early Hints` — refused an otherwise safe capture
-// (shardpilot/shardpilot-go#84 review).
+// .
 func TestASynthesisedInterimStatusLineIsOurs(t *testing.T) {
 	suppliedValues = []string{"Hints"}
 	t.Cleanup(func() { suppliedValues = nil })
@@ -6047,7 +5838,7 @@ func TestASynthesisedInterimStatusLineIsOurs(t *testing.T) {
 // same token unmeasured one position along. `decodeBase64` keeps only a valid-UTF-8
 // decode and `binaryCandidates` starts at four bytes, so `/2E` — 0xff 0x61 — was
 // retained when it stood alone and lost when it followed a separator
-// (shardpilot/shardpilot-go#84 review).
+// .
 func TestAShortBinarySuffixIsRetained(t *testing.T) {
 	suppliedValues = []string{"a"}
 	t.Cleanup(func() { suppliedValues = nil; decodeWork = 0 })
@@ -6067,7 +5858,7 @@ func TestAShortBinarySuffixIsRetained(t *testing.T) {
 // a later producer would have found. With `dada` supplied, `/zY0NjE2NDYx` decodes
 // to a binary seed the hex producer reconstructs from — and `undoBase64` rewrites
 // that run before the producers ever see it, so the value was approved
-// (shardpilot/shardpilot-go#84 review).
+// .
 func TestAProducerRunsBeforeAStageDestroysTheForm(t *testing.T) {
 	suppliedValues = []string{"dada"}
 	t.Cleanup(func() { suppliedValues = nil; decodeWork = 0 })
@@ -6077,10 +5868,6 @@ func TestAProducerRunsBeforeAStageDestroysTheForm(t *testing.T) {
 	}
 }
 
-// TestTheSeedCapBoundsTheAppend: one seed can carry thousands of short encoded
-// tokens, so a single round appended tens of thousands of entries and the loop
-// processed every one before the check at the top refused — a limit tested after
-// the overshoot is a report, not a limit (shardpilot/shardpilot-go#84 review).
 func TestTheSeedCapBoundsTheAppend(t *testing.T) {
 	suppliedValues = []string{"nothingmatches"}
 	t.Cleanup(func() { suppliedValues = nil; decodeWork = 0 })
@@ -6107,7 +5894,7 @@ func TestTheSeedCapBoundsTheAppend(t *testing.T) {
 // response as two separate `identity` lines, which this loop already accepts — so
 // the classification depended only on how an intermediary chose to combine the
 // fields, and the combined spelling withheld a readable capture with exit 4
-// (shardpilot/shardpilot-go#84 review).
+// .
 func TestAContentCodingIsAList(t *testing.T) {
 	t.Cleanup(func() { structuralSurfaces = nil })
 	for _, c := range []struct {
@@ -6134,7 +5921,7 @@ func TestAContentCodingIsAList(t *testing.T) {
 // is no longer unconditional: applying an assignment ARMS an `experiment_exposure`
 // that `Close` flushes through this same transport, so on the served path at least
 // one off-route request is the SDK working — and a line that calls that unexpected
-// teaches an operator to ignore it (shardpilot/shardpilot-go#84 review).
+// teaches an operator to ignore it .
 //
 // ⚠ A SOURCE-READING SCENE IS WEAKER THAN A RUN, and this one says so. It cannot
 // see what the report prints; it can only see that the claim is conditioned on the
@@ -6157,7 +5944,7 @@ func TestTheOffRouteClaimIsVerdictDependent(t *testing.T) {
 	// always expected" with "the served path expects one" -- and the exposure never
 	// reaches the transport at all, because this harness sets no `AnonymousID`. Two
 	// false claims in a row, in opposite directions, both written without measuring
-	// the path (shardpilot/shardpilot-go#84 review). What the line must carry now is
+	// the path . What the line must carry now is
 	// the REASON, so an operator can check it rather than trust it.
 	if strings.Contains(text, "if result.Assigned {\n\t\toffRouteExpected") {
 		t.Errorf("the expected count is still conditioned on the verdict")
@@ -6176,7 +5963,7 @@ func TestTheOffRouteClaimIsVerdictDependent(t *testing.T) {
 // registry has to carry, each of which arrived as its own finding: the body length
 // must be the one the SDK READ (not the one this program's `escapeMarks` produced),
 // and an incomplete read disqualifies a body whatever its length
-// (shardpilot/shardpilot-go#84 review).
+// .
 func TestTheSecondRoundOfSchemaGates(t *testing.T) {
 	t.Cleanup(func() {
 		suppliedValues = nil
@@ -6214,7 +6001,7 @@ func TestTheSecondRoundOfSchemaGates(t *testing.T) {
 // TestASynthesisedCacheControlIsAmbiguous: `http.ReadResponse` ADDS
 // `Cache-Control: no-cache` when the response carries `Pragma: no-cache` and no
 // cache directive of its own — measured — so with both present the field's
-// provenance cannot be established (shardpilot/shardpilot-go#84 review).
+// provenance cannot be established .
 func TestASynthesisedCacheControlIsAmbiguous(t *testing.T) {
 	t.Cleanup(func() { structuralSurfaces = nil })
 	structuralSurfaces = nil
@@ -6242,7 +6029,7 @@ func TestASynthesisedCacheControlIsAmbiguous(t *testing.T) {
 // line that is entirely base64, because `joinBase64Runs` is supposed to have joined
 // it — and that normalisation ran on the outer text only. So a member wrapped across
 // whole base64 lines was in no form either walk produced, though three ordinary
-// decodes that ignore CR/LF reconstruct it (shardpilot/shardpilot-go#84 review).
+// decodes that ignore CR/LF reconstruct it .
 // A producer that assumes another pass ran first is only correct where that pass runs.
 func TestAWholeLineFoldIsInEveryWalk(t *testing.T) {
 	t.Cleanup(func() { structuralSurfaces = nil; suppliedValues = nil; decodeWork = 0 })
@@ -6262,7 +6049,7 @@ func TestAWholeLineFoldIsInEveryWalk(t *testing.T) {
 // expensive call is a report, not a limit. Measured: a 108 KB run costs about 240
 // MiB across this walk — six decoders and a tokenising scan per form, sixty-four
 // forms — and charging each producer's pass count afterwards changed that by 2 MiB
-// (shardpilot/shardpilot-go#84 review). The bound is on what is WALKED, and an
+// . The bound is on what is WALKED, and an
 // unfinished form list is a refusal rather than a silent clean scan.
 func TestTheStructuralWalkIsBoundedByWhatItWalks(t *testing.T) {
 	t.Cleanup(func() { structuralSurfaces = nil; decodeWork = 0 })
@@ -6293,7 +6080,7 @@ func TestTheStructuralWalkIsBoundedByWhatItWalks(t *testing.T) {
 
 // ⚠ AND A BODY THAT MENTIONS THOSE FIELDS IS NOT A HEADER BLOCK. My own repair
 // scanned the whole dump, so an error page quoting `Pragma: no-cache` refused an
-// otherwise fine capture (shardpilot/shardpilot-go#84 review).
+// otherwise fine capture .
 func TestTheCacheProvenanceCheckStopsAtTheHeaderBlock(t *testing.T) {
 	t.Cleanup(func() { structuralSurfaces = nil })
 	structuralSurfaces = nil
@@ -6316,7 +6103,7 @@ func TestTheCacheProvenanceCheckStopsAtTheHeaderBlock(t *testing.T) {
 // LOOK at a body; the typed decode says whether it finds a verdict. A complete,
 // under-limit 200 may be valid JSON that is not an assignment — `{"assigned":"x"}`
 // is rejected as `malformed_response` — and exempting its member names marked a
-// supplied identifier as generated (shardpilot/shardpilot-go#84 review).
+// supplied identifier as generated .
 func TestExemptionsNeedTheAssignmentSHAPE(t *testing.T) {
 	t.Cleanup(func() { suppliedValues = nil })
 	for _, c := range []struct {
@@ -6332,7 +6119,7 @@ func TestExemptionsNeedTheAssignmentSHAPE(t *testing.T) {
 		// validating: on the assigned branch a version of at least 1, non-empty
 		// assignment and variant keys, and an assignment unit from a closed set; on the
 		// unassigned branch a reason from a closed set
-		// (shardpilot/shardpilot-go#84 review).
+		// .
 		{"assigned with nothing else", `{"assigned":true}`, false},
 		// Each gate gets a row that isolates IT: a table where one row trips several
 		// gates cannot tell which one is load-bearing, and the mutant for the version
@@ -6364,7 +6151,7 @@ func TestExemptionsNeedTheAssignmentSHAPE(t *testing.T) {
 
 // TestTheInterimLineKeepsItsMarks: escaping AFTER the marks turns the provenance
 // bytes into literal `\x01` text — the line stops being recognised as generated, or
-// as a status line at all (shardpilot/shardpilot-go#84 review).
+// as a status line at all .
 func TestTheInterimLineKeepsItsMarks(t *testing.T) {
 	suppliedValues = []string{"Hints"}
 	t.Cleanup(func() { suppliedValues = nil })
@@ -6398,7 +6185,7 @@ func TestTheInterimLineKeepsItsMarks(t *testing.T) {
 // TestTheCacheProvenanceMirrorsTheParsersCondition: `fixPragmaCacheControl`
 // synthesises the directive only when the FIRST parsed `Pragma` value is exactly
 // `no-cache`, lowercase. My substring test refused genuine pairs
-// (shardpilot/shardpilot-go#84 review).
+// .
 func TestTheCacheProvenanceMirrorsTheParsersCondition(t *testing.T) {
 	t.Cleanup(func() { structuralSurfaces = nil })
 	for _, c := range []struct {
@@ -6428,7 +6215,7 @@ func TestTheCacheProvenanceMirrorsTheParsersCondition(t *testing.T) {
 // TestTheAmbiguityNeedsTheAbsenceOfOtherDirectives: Go synthesises the cache
 // directive only when the `Cache-Control` map key is ENTIRELY absent, so any other
 // `Cache-Control` field in the block proves the parser wrote none of them
-// (shardpilot/shardpilot-go#84 review).
+// .
 func TestTheAmbiguityNeedsTheAbsenceOfOtherDirectives(t *testing.T) {
 	t.Cleanup(func() { structuralSurfaces = nil })
 	for _, c := range []struct {
@@ -6455,7 +6242,7 @@ func TestTheAmbiguityNeedsTheAbsenceOfOtherDirectives(t *testing.T) {
 // TestTheInterimSectionSaysWhatItCannotShow: `net/http` deletes `Connection` from
 // an interim's headers before the callback, so the reconstruction omits a field the
 // endpoint sent — the section's own prose has to say so rather than present the
-// block as the interim's headers (shardpilot/shardpilot-go#84 review).
+// block as the interim's headers .
 func TestTheInterimSectionSaysWhatItCannotShow(t *testing.T) {
 	src, err := os.ReadFile("main.go")
 	if err != nil {
@@ -6468,8 +6255,6 @@ func TestTheInterimSectionSaysWhatItCannotShow(t *testing.T) {
 	}
 }
 
-// TestTheLastRoundOfExemptionGatesAndSpans covers the four narrow findings of this
-// round together, each with the negative half (shardpilot/shardpilot-go#84 review).
 func TestTheLastRoundOfExemptionGatesAndSpans(t *testing.T) {
 	t.Cleanup(func() {
 		suppliedValues = nil
@@ -6532,7 +6317,7 @@ func TestTheLastRoundOfExemptionGatesAndSpans(t *testing.T) {
 // backslashes and the equality failed -- the exemptions were disabled and the scrub
 // rewrote the schema member, producing altered JSON the marks make the guard
 // approve. I had named that as a limit that "fails closed"; it does not
-// (shardpilot/shardpilot-go#84 review).
+// .
 func TestTheShapeIsCheckedOnCapturedBytes(t *testing.T) {
 	t.Cleanup(func() {
 		suppliedValues, capturedBodyRaw = nil, ""
@@ -6562,7 +6347,7 @@ func TestTheShapeIsCheckedOnCapturedBytes(t *testing.T) {
 // TestAnEmptyMintedMemberIsNotConcealment: an explicitly empty
 // `"subject_fact_key":""` is accepted by the SDK and conceals nothing -- the same
 // defect as the empty `Location:` header one surface along
-// (shardpilot/shardpilot-go#84 review).
+// .
 func TestAnEmptyMintedMemberIsNotConcealment(t *testing.T) {
 	t.Cleanup(func() { structuralSurfaces = nil })
 	for _, c := range []struct {
@@ -6584,7 +6369,7 @@ func TestAnEmptyMintedMemberIsNotConcealment(t *testing.T) {
 // TestTheFinalSectionSaysWhatItCannotShow: a `Connection` option naming another
 // header makes net/http remove BOTH, so the reconstruction omits a field the
 // endpoint sent and the section's prose has to say so
-// (shardpilot/shardpilot-go#84 review).
+// .
 func TestTheFinalSectionSaysWhatItCannotShow(t *testing.T) {
 	src, err := os.ReadFile("main.go")
 	if err != nil {
@@ -6601,12 +6386,7 @@ func TestTheFinalSectionSaysWhatItCannotShow(t *testing.T) {
 // `%53et-Cookie:` passed a raw lookup while the publication guard's own percent
 // decoder rebuilds `Set-Cookie:` from it -- and `assertNoLeak` checks only SUPPLIED
 // values, so the endpoint-minted credential was published
-// (shardpilot/shardpilot-go#84 review).
-//
-// ⚠ THIS IS THE THIRD SITE OF ONE DEFECT, and the population was greped this time:
-// the transport diagnostic and the unparsable body were fixed in earlier rounds, the
-// response header path is the one reported, and the TRAILER block had it too and was
-// not reported. Both remaining sites are covered here.
+// .
 func TestAFieldNameIsScannedInEverySpelling(t *testing.T) {
 	t.Cleanup(func() { structuralSurfaces = nil })
 	for _, c := range []struct {
@@ -6638,13 +6418,6 @@ func TestAFieldNameIsScannedInEverySpelling(t *testing.T) {
 	}
 }
 
-// TestTheWalkIsBoundedByCostNotLength: the suffix producers enumerate one candidate
-// per SEPARATOR POSITION and decode each, so the work is about (separators x length)
-// and not length. Measured: 8192 bytes of `/` cost 251 MiB while sitting exactly
-// under an 8 KiB byte bound I had chosen one round earlier without measuring the
-// worst case AT it (shardpilot/shardpilot-go#84 review) -- the same mistake as a
-// threshold that outlived the subject it was computed from.
-//
 // The preflight is one linear pass over the form and allocates nothing.
 func TestTheWalkIsBoundedByCostNotLength(t *testing.T) {
 	worst := strings.Repeat("/", 8192)
@@ -6667,9 +6440,6 @@ func TestTheWalkIsBoundedByCostNotLength(t *testing.T) {
 	}
 }
 
-// TestTheFourthRoundOfNamesAndSpans covers this round's four findings, three of
-// which are consequences of repairs from the two rounds before it
-// (shardpilot/shardpilot-go#84 review).
 func TestTheFourthRoundOfNamesAndSpans(t *testing.T) {
 	t.Cleanup(func() { suppliedValues, structuralSurfaces = nil, nil })
 
@@ -6712,7 +6482,7 @@ func TestTheFourthRoundOfNamesAndSpans(t *testing.T) {
 // `Content-Encoding: gzip` is accepted by Go and leaves the body encoded, and the
 // head-only check never sees it -- a gzip-compressed supplied value passed
 // `assertNoLeak`, which has no gzip decoder, while this report carried the coding
-// needed to rebuild it (shardpilot/shardpilot-go#84 review).
+// needed to rebuild it .
 func TestATrailerCodingIsStillACoding(t *testing.T) {
 	t.Cleanup(func() { structuralSurfaces = nil })
 	for _, c := range []struct {
@@ -6742,14 +6512,6 @@ func TestATrailerCodingIsStillACoding(t *testing.T) {
 // TestTheSDKGateIsMeasuredOnTheCapturedBytes: the SDK refuses a body over
 // `expMaxBodyBytes` BEFORE decoding it, so a reason phrase in an oversized body is
 // the endpoint's word and not this program's grammar.
-//
-// ⚠ THE PASS THAT ASKS RUNS AFTER THE PASS THAT SHORTENS. `redactMintedBody`
-// replaces a minted string with a placeholder, so a 1 MiB+1 response whose bulk is
-// a minted `assignment_key` reached the gate under the limit, the gate read as
-// satisfied, and a supplied `kill_switch` was vouched -- through both the scrub and
-// the guard, with an empty refusal ledger (shardpilot/shardpilot-go#85 review).
-// `capturedBodyBytes` and `capturedBodyRaw` are what the SDK read; the exemption
-// registry was moved onto them a round earlier and this site was not.
 func TestTheSDKGateIsMeasuredOnTheCapturedBytes(t *testing.T) {
 	t.Cleanup(func() {
 		suppliedValues, structuralSurfaces = nil, nil
@@ -6779,7 +6541,7 @@ func TestTheSDKGateIsMeasuredOnTheCapturedBytes(t *testing.T) {
 // costs the capture the attribute's meaning.
 //
 // ⚠ AND THE PREDICATE WAS WRONG IN BOTH DIRECTIONS. `isDigits` refused `-1`, which
-// the parser accepts (shardpilot/shardpilot-go#85 review), and admitted `007`,
+// the parser accepts , and admitted `007`,
 // which the parser leaves in `Unparsed` and does NOT read as a Max-Age -- so this
 // program vouched endpoint-chosen bytes as grammar the specification fixes. The
 // second half was not in the finding and is the same defect. Both sites that asked
@@ -6808,7 +6570,7 @@ func TestASignedMaxAgeKeepsItsGrammar(t *testing.T) {
 //
 // ⚠ `url.Parse` IS PERMISSIVE ABOUT REGISTERED NAMES. It accepts `se_cret`, `a;b`,
 // `host$tok` and `..`, all of which rode into the capture VERBATIM with nothing
-// recorded (shardpilot/shardpilot-go#85 review). RFC 3986 `reg-name` is not the
+// recorded . RFC 3986 `reg-name` is not the
 // test either -- it admits the sub-delims `!$&'()*+,;=`, so it would accept exactly
 // the spellings that carried the text through. What the exemption is about is LDH.
 func TestANonBracketedAuthorityIsMeasuredAgainstTheHostGrammar(t *testing.T) {
@@ -6822,20 +6584,12 @@ func TestANonBracketedAuthorityIsMeasuredAgainstTheHostGrammar(t *testing.T) {
 		{"ok.example", true}, {"ok.example.", true}, {"a.b.c:8443", true},
 		{"xn--9ca.example", true}, {"127.0.0.1", true}, {"[2001:db8::1]", true},
 		{"localhost", true}, {"user:pass@ok.example", true},
-		// ⚠ THE PORT IS ONE QUESTION FOR BOTH FORMS. Asked twice, the bracketed
-		// branch skipped port validation entirely because the authority held a `]`,
-		// so `[::1]:99999999` kept an unusable port while the identical
-		// `example.com:99999999` was replaced; and an EMPTY port, which RFC 3986
-		// allows as `port = *DIGIT` and `parsesAsURI` already accepts, was refused
-		// and cost the capture its host (shardpilot/shardpilot-go#85 review). Two
-		// findings on ADJACENT lines of one function in one round is the signal that
-		// the repair was finer than the defect.
+
 		{"example.com:", true}, {"[::1]:443", true}, {"[::1]", true},
 		{"[::1]:99999999", false},
 		// ⚠ AND THE SIZES, which are the same property as the character set and were
 		// left unstated: a 64-octet label and a 319-octet name were both called
-		// publicly resolvable and published verbatim (shardpilot/shardpilot-go#85
-		// review). DNS fixes a label at 1..63 octets and a name at 253.
+		// publicly resolvable and published verbatim . DNS fixes a label at 1..63 octets and a name at 253.
 		{strings.Repeat("a", 63) + ".example", true},
 		{strings.Repeat("a", 64) + ".example", false},
 		{strings.TrimSuffix(strings.Repeat(strings.Repeat("b", 63)+".", 5), "."), false},
@@ -6862,7 +6616,7 @@ func TestANonBracketedAuthorityIsMeasuredAgainstTheHostGrammar(t *testing.T) {
 // its extension has no name. The placeholder path rendered it
 // `redacted-0-chars=redacted-6-chars` -- INVENTING a syntactically valid attribute
 // where the endpoint sent a malformed one, and recording nothing, so the capture
-// concealed the response defect (shardpilot/shardpilot-go#85 review). The PRIMARY
+// concealed the response defect . The PRIMARY
 // cookie name asks exactly this question a hundred lines up and withholds.
 func TestAnEmptyCookieAttributeNameIsRefused(t *testing.T) {
 	t.Cleanup(func() { structuralSurfaces = nil })
@@ -6886,7 +6640,7 @@ func TestAnEmptyCookieAttributeNameIsRefused(t *testing.T) {
 // permission -- so `Allow: GET=123456`, `Content-Encoding: gzip=123456` and
 // `Vary: accept=123456` all passed and the whole value was vouched, publishing
 // endpoint-selected numeric text that both the scrub and the guard then skip if it
-// is a supplied identifier (shardpilot/shardpilot-go#85 review). Those three
+// is a supplied identifier . Those three
 // grammars have no arguments at all.
 func TestADirectiveArgumentBelongsToItsField(t *testing.T) {
 	for _, c := range []struct {
@@ -6900,7 +6654,7 @@ func TestADirectiveArgumentBelongsToItsField(t *testing.T) {
 		// arguments described the kind of the example that had arrived; the next one
 		// was `Allow: GET=POST`, admitted by the branch that accepted any registered
 		// token as an argument, so a supplied `POST` was published with an empty
-		// refusal ledger (shardpilot/shardpilot-go#85 review). A third condition
+		// refusal ledger . A third condition
 		// would have described the third example. The rule is the DIRECTIVE's.
 		{"Allow: GET=POST", false},
 		{"Cache-Control: no-cache=POST", false},
@@ -6922,7 +6676,7 @@ func TestADirectiveArgumentBelongsToItsField(t *testing.T) {
 // `Content-Encoding: IDENTITY` -- which this path accepts as readable -- was
 // rewritten to `Content-Encoding: redacted-8-chars` while the captured body stayed
 // plain, so the published field declared a coding no consumer can apply and the
-// capture contradicted itself (shardpilot/shardpilot-go#85 review). The canonical
+// capture contradicted itself . The canonical
 // spelling is THIS program's text and means what the arrived spelling meant.
 func TestANonCanonicalCodingKeepsItsMeaning(t *testing.T) {
 	t.Cleanup(func() { suppliedValues, structuralSurfaces = nil, nil })
@@ -6944,8 +6698,6 @@ func TestANonCanonicalCodingKeepsItsMeaning(t *testing.T) {
 		t.Errorf("the supplied canonical spelling was published: %q", stripMarks(scrubSupplied(raw)))
 	}
 }
-
-// ---- round on 50d9a50 ----
 
 // TestARedirectFollowUpIsForwardedNotAbsorbed covers the main finding here. The
 // recorder classified by PATH, so the follow-up `http.Client` sends after a 302
@@ -7044,14 +6796,6 @@ func TestAnUnknownErrorTypeIsStillRefused(t *testing.T) {
 	}
 }
 
-// TestARegisteredMediaTypeCollisionStaysPublishable is the finding this round's
-// structural change answers. `registryOnlyValue` walked the DIRECTIVE registries
-// only, so `Content-Type` -- a registry field in the other three classifiers --
-// could not satisfy it: an ordinary `application/json` against a supplied `json`
-// fell past the vouch, took a structural refusal, and exited 4, while
-// `markMediaType` vouched the same bytes one pass later and the stale refusal was
-// never withdrawn.
-//
 // The scene fails on the old code with a non-empty refusal ledger.
 func TestARegisteredMediaTypeCollisionStaysPublishable(t *testing.T) {
 	t.Cleanup(func() { suppliedValues, structuralSurfaces, accountedSurfaces = nil, nil, nil })
@@ -7080,13 +6824,6 @@ func TestAShapeCollisionStillRefuses(t *testing.T) {
 	}
 }
 
-// TestEveryRegistryFieldCanAnswerBothRegistryQuestions is the property the four
-// hand-written classifiers could not hold. A field admitted BECAUSE A REGISTRY
-// NAMES IT must also be able to say which of its values are registry words end to
-// end -- that pair is what makes a collision answerable. `content-type` satisfied
-// the first and not the second for four rounds, and no scene could see it because
-// the two answers lived in different functions.
-//
 // This is the invariant, not an instance: a field added later cannot land in
 // three of the four answers, because there is now one row and this reads it.
 func TestEveryRegistryFieldCanAnswerBothRegistryQuestions(t *testing.T) {
@@ -7162,8 +6899,6 @@ func TestAnOrdinaryJSONValueIsStillMeasuredWhole(t *testing.T) {
 	}
 }
 
-// ---- round on adbb037 ----
-
 // TestARedirectLegPublishesNoEndpointTarget covers a second main finding, and it is a
 // consequence of the previous one. Forwarding redirect follow-ups was right; what
 // it broke is an assumption the REQUEST redactor had been able to make while they
@@ -7222,15 +6957,6 @@ func TestARedirectLegPublishesNoEndpointTarget(t *testing.T) {
 	}
 }
 
-// TestACrossHostRedirectPublishesNoEndpointAuthority covers a third main finding, and it is
-// the case I ARGUED OUT of the previous round's population. I wrote that a redirect
-// leg's `Host` is not a leak because the response side exempts a host as
-// structurally constrained -- reasoning about the exemption's RULE and not its
-// PREMISE. The premise is "publicly resolvable and constrained by its grammar", and
-// `redactTarget` enforces it: measured, the response side prints
-// `http://redacted-13-chars/redacted-2-chars` for `http://server_secret/cb` while
-// the request leg published `Host: server_secret` with an EMPTY ledger.
-//
 // The dial fails -- that host does not resolve -- but `DumpRequestOut` runs inside
 // `RoundTrip`, so the leg is recorded and published either way.
 func TestACrossHostRedirectPublishesNoEndpointAuthority(t *testing.T) {
@@ -7309,14 +7035,6 @@ func TestAHarnessOriginatedRequestIsUnchanged(t *testing.T) {
 	}
 }
 
-// TestAMalformedCodingIsNotReadAsTheNoOpOne is the round's coding finding.
-// `strings.TrimSpace` removes Unicode whitespace — U+00A0 among it — which
-// net/http preserves in a field value. So `Content-Encoding: identity\u00a0` was
-// trimmed to the well-known token, the undecodable-coding refusal was skipped, and
-// the non-token byte was published while the body was called readable. `ows` —
-// space and tab, what HTTP calls optional whitespace — already existed in this
-// file with a comment naming this exact defect.
-//
 // ⚠ WHAT THIS SCENE DOES AND DOES NOT COVER, because the change is wider than it.
 // The same `TrimSpace` stood at seven other endpoint-facing trims (the field name,
 // the media type, the cache directive, the minted-field lookup), and all of them
@@ -7433,11 +7151,6 @@ func TestAnOpaqueTargetKeepsTheReceivedFieldLayout(t *testing.T) {
 	}
 }
 
-// TestANonCanonicalCollisionKeepsItsGrammar is this round's finding and the
-// sibling no review named. Declining to VOUCH a non-canonical spelling was right;
-// leaving it to a scrub that does not know the field's grammar was not, and the
-// two are the same sentence one step apart.
-//
 // Both tokens fold, so the canonical spelling means what arrived and is this
 // program's own text — the answer the admitted header value already gives.
 func TestANonCanonicalCollisionKeepsItsGrammar(t *testing.T) {
@@ -7466,15 +7179,6 @@ func TestANonCanonicalCollisionKeepsItsGrammar(t *testing.T) {
 	}
 }
 
-// TestEveryFoldedTokenKeepsItsGrammar is the containing unit this shape finally
-// got. Four rounds running, one sentence: declining to vouch a spelling is not
-// declining to keep its grammar. It was repaired at the redirect scheme, the cookie
-// attribute name, the admitted header value and the media type — each where it was
-// shown — and each round brought another member. The rule is one function now, and
-// this table is the population rather than the last example.
-//
-// The last two rows were not named by any review. They were found by asking which
-// other tokens in this file fold, once the flag was shown.
 func TestEveryFoldedTokenKeepsItsGrammar(t *testing.T) {
 	t.Cleanup(func() { suppliedValues, structuralSurfaces, accountedSurfaces = nil, nil, nil })
 	for _, c := range []struct{ name, supplied, raw, want, reject string }{
@@ -7506,9 +7210,9 @@ func TestEveryFoldedTokenKeepsItsGrammar(t *testing.T) {
 		})
 	}
 
-	// And the edge, on the site the review named: when the canonical spelling is
-	// itself supplied there is nothing semantics-preserving left, and the capture
-	// must be refused rather than published with an empty ledger.
+	// When the canonical spelling is itself supplied, no semantics-preserving
+	// replacement remains. The capture must be refused instead of publishing
+	// an empty ledger.
 	suppliedValues, structuralSurfaces, accountedSurfaces =
 		[]string{"CONTENT-TYPE", "Content-Type"}, nil, nil
 	dropFraming(escapeMarks("HTTP/1.1 200 OK\r\nCONTENT-TYPE: application/json\r\n\r\n{}"))
@@ -7586,8 +7290,6 @@ func TestACanonicalSpellingIsStillPublished(t *testing.T) {
 		t.Errorf("an ordinary SameSite stopped being published as itself: %q", ck)
 	}
 }
-
-// ---- round on d1f00c1 ----
 
 // TestEveryCookieAttributeHasExactlyOneRule is the invariant six hand-written
 // lists could not hold. `Priority` was in the NAME list and in

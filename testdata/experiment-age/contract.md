@@ -1,18 +1,15 @@
 # Experiment age assignment contract
 
-Captured on 2026-09-28 from the real in-memory HTTP assignment handler at
-server revision `2b7012d1f761ef37e1034c0ee83a45ecfc0b3154`, using synthetic data.
+Captured on 2026-09-28 from the real in-memory HTTP assignment handler,
+using synthetic data.
 No database, container or deployed service was involved. These files are
 responses from that handler, not SDK-authored response examples.
 
-Source anchors:
+Captured behaviours:
 
-- `experiment_age_eligibility_routes_test.go:36`,
-  `TestExperimentAgeRefusalRoutes`: omitted, `unknown`, and `under_threshold`.
-- `experiment_fact_apply_routes_test.go:168`, `newExposureRouteFixture`, and
-  `experiment_fact_apply_routes_test.go:219`, its adult assignment fetch.
-- `experiments.go:284`, `experimentSubjectEligible`: the exact admission rule.
-- `local_runtime_routes.go:1429`: the handler's JSON serialization.
+- Omitted, `unknown` and `under_threshold` age bands refuse assignment.
+- An adult subject can receive an assignment.
+- The responses use the handler's actual JSON serialization.
 
 A temporary capture test used that same route fixture, issued four GETs to
 `/api/v1/runtime/experiments/assignment`, and saved each HTTP 200 body directly.

@@ -10,14 +10,6 @@ import (
 
 // TestEveryVouchedTokenSurvivesTheScrub is the sweep this class earned.
 //
-// ⚠ SIX ROUNDS HAVE NOW PRODUCED ONE DEFECT: this program admits a token because
-// it RECOGNISES it — a registered field name, a standard cookie attribute, a
-// no-op content coding, a benign JSON member, a registered reason phrase — and
-// then returns it as CAPTURED text, so the supplied-value scrub rewrites it into
-// a placeholder and publishes a response no parser accepts, which the guard
-// approves because a placeholder is generated. Each round I fixed the site I was
-// shown; the list of sites is the thing that kept being incomplete.
-//
 // So the population is not a list here. It is drawn from the program's own
 // registries, which means a token admitted by a rule added later is covered by
 // this scene the day it is added, without anyone remembering to extend it.
@@ -33,7 +25,7 @@ func TestEveryVouchedTokenSurvivesTheScrub(t *testing.T) {
 		// survives inside a field name's own marked span whatever this program
 		// does with the delimiter, so a probe that supplies `:` and looks for `:`
 		// cannot fail. The delimiter is only observable in its context -- `Age:`
-		// (shardpilot/shardpilot-go#85 review).
+		// .
 		tok  string
 		want string
 	}
@@ -45,7 +37,7 @@ func TestEveryVouchedTokenSurvivesTheScrub(t *testing.T) {
 	// iteration order -- a population of one, chosen freshly each run. It went
 	// unnoticed until the order handed it `proxy-authenticate`, a registered name
 	// this program also WITHHOLDS, and the row failed on a run that differed from
-	// the last only by chance (shardpilot/shardpilot-go#84/#85, stack seam).
+	// the last only by chance .
 	//
 	// A withheld field keeps its NAME -- that is the vouching this row is about --
 	// but rendered in THIS program's spelling rather than the arrived one, so the
@@ -57,7 +49,7 @@ func TestEveryVouchedTokenSurvivesTheScrub(t *testing.T) {
 	// standard attribute BARE -- including `Path`, `Max-Age` and `SameSite`, which
 	// carry values by specification -- and so asserted that a truncated attribute
 	// is vouched, which is the very shape a later finding named as a bypass
-	// (shardpilot/shardpilot-go#85 review). A sweep row is an assertion about what
+	// . A sweep row is an assertion about what
 	// SHOULD hold; this one held the defect in place.
 	for _, a := range []string{"Secure", "HttpOnly"} {
 		if _, ok := canonicalCookieFlag(a); !ok {
@@ -77,7 +69,7 @@ func TestEveryVouchedTokenSurvivesTheScrub(t *testing.T) {
 	// ⚠ EACH NAME IN ITS OWN SHAPE. The registry is split by response shape now, so
 	// probing every name against a 200 asserts that `error` is grammar in an
 	// assignment -- which is the defect the split closed
-	// (shardpilot/shardpilot-go#84 review). The population is the PRODUCT of the
+	// . The population is the PRODUCT of the
 	// registries with the status each describes.
 	for shape, head := range map[string]string{
 		"HTTP/1.1 200 OK":          "assignment",
@@ -97,13 +89,6 @@ func TestEveryVouchedTokenSurvivesTheScrub(t *testing.T) {
 	}
 	probes = append(probes, pv("HTTP/1 reason phrase", "HTTP/1.1 200 OK\r\n\r\n", "OK"))
 
-	// ⚠ AND THE PREDICATES THAT ADMIT VALUES, not only the registries of NAMES.
-	// The first version of this sweep drew from name registries alone, so four more
-	// sites of the same rule reached the review: a header value `verbatimHeaders`
-	// admits, a cookie attribute value `cookieAttrVerbatim` admits, an approved URI
-	// scheme, and the field names the structural paths dispatch on. The population
-	// is "everything this program admits BECAUSE it recognises it", and half of that
-	// is values (shardpilot/shardpilot-go#85 review).
 	probes = append(probes,
 		pv("admitted header value", "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n", "application/json"),
 		// ⚠ NOT `Content-Length`: `dropFraming` REMOVES that field and puts a capture
@@ -114,7 +99,7 @@ func TestEveryVouchedTokenSurvivesTheScrub(t *testing.T) {
 		// of its own. This row supplied `12` and asserted `Age: 12` survives -- which
 		// is exactly the collision a later finding named as a leak: integer syntax
 		// constrains the alphabet and says nothing about who chose the number
-		// (shardpilot/shardpilot-go#85 review). A row that pins "a supplied numeric
+		// . A row that pins "a supplied numeric
 		// value is vouched" pins the defect. See
 		// TestAnAdmittedNumericValueIsNotVouchedWhenSupplied, which asserts both
 		// halves: unsupplied it is published, supplied it is not.
@@ -122,8 +107,7 @@ func TestEveryVouchedTokenSurvivesTheScrub(t *testing.T) {
 		// ⚠ THE `Max-Age` ROW IS GONE for the reason the `Age` row went: it supplied
 		// `10` and asserted `Max-Age=10` survives, which is the collision a later
 		// finding names as a leak. `Max-Age` is admitted by SHAPE -- an integer -- and
-		// shape says nothing about who chose the value (shardpilot/shardpilot-go#85
-		// review). The `SameSite` rows stay: that vocabulary is ENUMERATED, so its
+		// shape says nothing about who chose the value . The `SameSite` rows stay: that vocabulary is ENUMERATED, so its
 		// tokens are the grammar's whoever else also chose them.
 		pv("approved URI scheme", "HTTP/1.1 200 OK\r\nLocation: https://e.example/cb\r\n\r\n", "https"),
 		pv("structural field name", "HTTP/1.1 200 OK\r\nLocation: /cb\r\n\r\n", "Location"),
@@ -136,7 +120,7 @@ func TestEveryVouchedTokenSurvivesTheScrub(t *testing.T) {
 	// then handed them to the generic scrub, which replaced them with prose
 	// placeholders the guard approves, publishing JSON that no longer parses, a
 	// cookie whose attribute is no longer separated, and a Location that is no
-	// longer parent-relative (shardpilot/shardpilot-go#85 review).
+	// longer parent-relative .
 	//
 	// Same rule as every row above, arriving on characters instead of tokens: what
 	// this program emits as STRUCTURE must be marked as structure.
@@ -150,7 +134,7 @@ func TestEveryVouchedTokenSurvivesTheScrub(t *testing.T) {
 		pv("URI separators", "HTTP/1.1 200 OK\r\nLocation: /a/b?x=1&y=2\r\n\r\n", "&"),
 		// ⚠ THE COLONS, WHICH THE FIRST VERSION OF THIS ROW SET DID NOT NAME. A
 		// syntax set's population is the grammar's punctuation, and I had listed the
-		// characters I happened to think of (shardpilot/shardpilot-go#85 review).
+		// characters I happened to think of .
 		pv("JSON structure", "HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false,\"code\":1}", ","),
 		pv("JSON structure", "HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false}", ":"),
 		pv("JSON structure", "HTTP/1.1 200 OK\r\n\r\n{\"assigned\":false}", "\""),
@@ -195,7 +179,7 @@ func TestEveryVouchedTokenSurvivesTheScrub(t *testing.T) {
 			// a token the scrub deliberately skips can still be reported by
 			// `assertNoLeak` as a survivor, and then NOTHING is publishable — which
 			// is how a registered reason phrase made an ordinary 200 uncapturable
-			// (shardpilot/shardpilot-go#85 review). The scrub and the guard have to
+			// . The scrub and the guard have to
 			// hold the same exemption, or the exemption is a disagreement.
 			if err := assertNoLeak(asCaptured(red)); err != nil {
 				t.Fatalf("the guard reported a vouched-for token as a survivor: %v", err)
@@ -206,15 +190,6 @@ func TestEveryVouchedTokenSurvivesTheScrub(t *testing.T) {
 
 // TestNoAdmissionVouchesANonCanonicalSpelling is the sweep the CASE half of this
 // class earned.
-//
-// ⚠ THREE ROUNDS, FIVE SITES, ONE QUESTION. Every admission predicate in this
-// program folds case, because the protocols do. Every vouching site then marked
-// the spelling that ARRIVED — so a supplied identifier differing from an admitted
-// token only in case (`LAX`, `HTTPS`, `ASSIGNED`) was marked as this program's own
-// syntax and skipped by BOTH the scrub and the guard. The round before repaired
-// two sites by comparing raw against DECODED, which catches an escape and says
-// nothing about case: the question was never about escapes
-// (shardpilot/shardpilot-go#85 review).
 //
 // The population is drawn from the registries themselves, so a name added to any
 // of them is measured here without anyone remembering to come back.
@@ -254,11 +229,7 @@ func TestNoAdmissionVouchesANonCanonicalSpelling(t *testing.T) {
 		u := strings.ToUpper(sc)
 		addAt("URI scheme", "HTTP/1.1 302 Found\r\nLocation: "+u+"://e.example/cb\r\n\r\n", u, u+"://")
 	}
-	// ⚠ AND THE REGISTRIES THIS SWEEP DID NOT DRAW FROM. Three more vouching sites
-	// reached review with the same defect -- a registered FIELD NAME, a cookie
-	// ATTRIBUTE NAME, and a query parameter name -- because the population here was
-	// the registries I had already thought to include
-	// (shardpilot/shardpilot-go#85 review). Every predicate that folds belongs in it.
+
 	for _, n := range slices.Sorted(maps.Keys(registeredFieldNames)) {
 		u := strings.ToUpper(n)
 		if u == n {
@@ -299,15 +270,6 @@ func TestNoAdmissionVouchesANonCanonicalSpelling(t *testing.T) {
 // TestSuppliedPunctuationDoesNotAlterStructure is the sweep the PUNCTUATION half
 // of this class earned, and it is a PRODUCT rather than a list.
 //
-// ⚠ NINE SITES OVER FOUR ROUNDS, EACH FOUND BY A REVIEWER AND EACH FIXED ALONE.
-// The rule has been stated since the first: what this program emits as STRUCTURE
-// must be marked as structure, or the supplied-value scrub rewrites it into prose
-// the guard approves. Every previous sweep drew its rows from a list of probes I
-// wrote, so it could only ever find the sites I had thought of -- the `@` a
-// userinfo redaction reconstructs, the colon on `Set-Cookie`'s own early return,
-// the comma joining an announced trailer list were all missed the same way
-// (shardpilot/shardpilot-go#85 review).
-//
 // The population here is a PRODUCT: the grammar's punctuation, crossed with the
 // structural paths this program renders. The invariant needs no per-row
 // expectation and cannot be written too narrowly -- supplying a character must
@@ -325,18 +287,11 @@ func TestSuppliedPunctuationDoesNotAlterStructure(t *testing.T) {
 	// ⚠ AND TOKENS THAT SPAN A BOUNDARY, not only single characters. A supplied
 	// identifier need not BE the punctuation: `@e` straddles the userinfo
 	// separator this program RECONSTRUCTS, and a row of single characters cannot
-	// express that (shardpilot/shardpilot-go#85 review). The scrub matches on
+	// express that . The scrub matches on
 	// spellings, so the population is spellings that cross a mark boundary.
 	marks := []string{"{", "}", "[", "]", "\"", ",", ":", ";", "=", "&", "?", "#", "/", "@", ".", "..", "-", "//",
 		"@e", "://", "=x", "; ", ", ", "/a", "1&", "x=", ":s"}
 
-	// ⚠ AND THE RENDERERS THAT ARE NOT `dropFraming`. The first version of this
-	// product drove one function, and I said so in the review reply as a boundary
-	// -- which is honest and still leaves the boundary there: the tenth site of
-	// this same rule was the late trailer renderer, found by a reviewer, in a path
-	// this sweep could not reach (shardpilot/shardpilot-go#85 review). A product
-	// whose second axis is "the paths this program renders" has to enumerate the
-	// RENDERERS, not one of them.
 	renderers := []struct {
 		what string
 		run  func(line string) string
@@ -389,7 +344,7 @@ func TestSuppliedPunctuationDoesNotAlterStructure(t *testing.T) {
 // name is this program's grammar only where the SDK reads the shape; `{"x":1}` is
 // a document the SDK REJECTS, so in it this program vouches nothing -- and
 // asserting that the name survives the scrub asserted a promise it does not make
-// (shardpilot/shardpilot-go#84 review, which added the gate). The values are per
+// . The values are per
 // member because `1` is the wrong type for every field that is not a raw message,
 // and a member with no value here falls back to `1` so the sweep fails loudly
 // rather than quietly probing a document the SDK will not read.
