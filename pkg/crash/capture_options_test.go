@@ -1,4 +1,4 @@
-// External-package tests for the phase-D capture opt-ins (debug-id fill and
+// External-package tests for the capture opt-ins (debug-id fill and
 // all-goroutine capture): the panic origins must live outside pkg/crash, like
 // real application code, for the frame assertions to be meaningful.
 package crash_test
@@ -43,11 +43,11 @@ func capturePanicWith(t *testing.T, client *crash.Client) {
 	}()
 }
 
-// TestRecoverPhaseDDarkDefaultsKeepWireShape pins the SHIPS-DARK posture of both
-// Phase-D opt-ins: with neither enabled, an auto-captured event still marshals zero
+// TestRecoverCaptureOptionsDisabledKeepWireShape pins the SHIPS-DARK posture of both
+// Capture opt-ins: with neither enabled, an auto-captured event still marshals zero
 // modules (no debug_id anywhere) and exactly the one precise crashed thread —
-// byte-shape-identical to the pre-Phase-D SDK.
-func TestRecoverPhaseDDarkDefaultsKeepWireShape(t *testing.T) {
+// byte-shape-identical to the SDK with capture options disabled.
+func TestRecoverCaptureOptionsDisabledKeepWireShape(t *testing.T) {
 	var raw []byte
 	server := rawCaptureServer(t, &raw)
 	defer server.Close()
@@ -117,9 +117,9 @@ func TestRecoverDebugIDFillAttachesSelfModule(t *testing.T) {
 	}
 }
 
-// parkedForPhaseDTest is the distinctive park point the all-goroutine capture
+// parkedForCaptureOptionsTest is the distinctive park point the all-goroutine capture
 // assertions look for.
-func parkedForPhaseDTest(release <-chan struct{}, started *sync.WaitGroup) {
+func parkedForCaptureOptionsTest(release <-chan struct{}, started *sync.WaitGroup) {
 	started.Done()
 	<-release
 }
@@ -144,7 +144,7 @@ func TestRecoverAllGoroutineCaptureAddsParkedGoroutines(t *testing.T) {
 	var started sync.WaitGroup
 	for i := 0; i < 3; i++ {
 		started.Add(1)
-		go parkedForPhaseDTest(release, &started)
+		go parkedForCaptureOptionsTest(release, &started)
 	}
 	started.Wait()
 	defer close(release)
@@ -166,13 +166,13 @@ func TestRecoverAllGoroutineCaptureAddsParkedGoroutines(t *testing.T) {
 			t.Fatalf("extra thread id %q lacks the goroutine- prefix", thread.ID)
 		}
 		for _, frame := range thread.Frames {
-			if strings.Contains(frame.Function, "parkedForPhaseDTest") {
+			if strings.Contains(frame.Function, "parkedForCaptureOptionsTest") {
 				foundParked = true
 			}
 		}
 	}
 	if !foundParked {
-		t.Fatalf("no captured thread parks in parkedForPhaseDTest; threads: %+v", received.Threads)
+		t.Fatalf("no captured thread parks in parkedForCaptureOptionsTest; threads: %+v", received.Threads)
 	}
 }
 
@@ -199,7 +199,7 @@ func TestRecoverAllGoroutineCaptureRespectsEventCaps(t *testing.T) {
 	var started sync.WaitGroup
 	for i := 0; i < 100; i++ {
 		started.Add(1)
-		go parkedForPhaseDTest(release, &started)
+		go parkedForCaptureOptionsTest(release, &started)
 	}
 	started.Wait()
 	defer close(release)
