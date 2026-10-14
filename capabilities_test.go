@@ -8,7 +8,7 @@ import (
 )
 
 func TestSupportsBeforeInitialization(t *testing.T) {
-	keys := []string{"consent_receipt_outbox", "consent_state_denied_forced_minor", "schema_revision_declaration", "experiments_assignment", "experiments_age_band"}
+	keys := []string{"consent_receipt_outbox", "consent_state_denied_forced_minor", "schema_revision_declaration", "experiments_assignment", "experiments_age_band", "event_schema_version"}
 	for _, key := range keys {
 		t.Run(key, func(t *testing.T) {
 			if !shardpilot.Supports(key) {

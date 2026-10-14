@@ -5,7 +5,7 @@ package shardpilot
 func Supports(key string) bool {
 	switch key {
 	case "consent_receipt_outbox", "consent_state_denied_forced_minor",
-		"schema_revision_declaration", "experiments_assignment", "experiments_age_band":
+		"schema_revision_declaration", "experiments_assignment", "experiments_age_band", "event_schema_version":
 		return true
 	default:
 		return false

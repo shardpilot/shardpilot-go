@@ -164,6 +164,9 @@ func (c *Client) buildEnvelope(event Event) (eventEnvelope, error) {
 		eventTS = event.rawEventTS
 	}
 	schemaVersion := 1
+	if event.SchemaVersion != nil {
+		schemaVersion = *event.SchemaVersion
+	}
 	if event.omitUserID && (name == experimentExposureName || name == experimentOutcomeName) {
 		schemaVersion = 2
 	}

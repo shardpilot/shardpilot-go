@@ -9,8 +9,11 @@ var (
 	ErrClosed        = errors.New("shardpilot client is closed")
 	ErrInvalidConfig = errors.New("invalid shardpilot config")
 	ErrInvalidEvent  = errors.New("invalid shardpilot event")
-	ErrQueueFull     = errors.New("shardpilot queue is full")
-	ErrConsentDenied = errors.New("shardpilot analytics consent is denied")
+	// ErrSchemaVersionInvalid refuses a present schema version outside 1..65535.
+	// It also matches ErrInvalidEvent through errors.Is.
+	ErrSchemaVersionInvalid = fmt.Errorf("%w: schema_version_invalid", ErrInvalidEvent)
+	ErrQueueFull            = errors.New("shardpilot queue is full")
+	ErrConsentDenied        = errors.New("shardpilot analytics consent is denied")
 
 	// ErrNotInitialized refuses setters on a nil or zero-value client.
 	ErrNotInitialized = errors.New("not_initialized: shardpilot client is not initialized")
