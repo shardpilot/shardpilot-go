@@ -217,7 +217,7 @@ func (w *witness) outcome(kind string) error {
 func run(getenv func(string) string, out io.Writer, transport http.RoundTripper) int {
 	log := &evidenceWriter{Writer: out}
 	out = log
-	names := []string{"SHARDPILOT_INGEST_URL", "SHARDPILOT_PUBLISHABLE_KEY", "SHARDPILOT_WORKSPACE_ID", "SHARDPILOT_APP_ID", "SHARDPILOT_ENVIRONMENT_ID", "SHARDPILOT_ANONYMOUS_ID", "SHARDPILOT_CRASH_URL", "SHARDPILOT_CRASH_KEY"}
+	names := []string{"SHARDPILOT_INGEST_URL", "SHARDPILOT_PUBLISHABLE_KEY", "SHARDPILOT_WORKSPACE_KEY", "SHARDPILOT_APP_KEY", "SHARDPILOT_ENVIRONMENT_KEY", "SHARDPILOT_ANONYMOUS_ID", "SHARDPILOT_CRASH_URL", "SHARDPILOT_CRASH_KEY"}
 	values := make(map[string]string)
 	for _, name := range names {
 		values[name] = strings.TrimSpace(getenv(name))
@@ -272,7 +272,7 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 	// event_too_large; only the events argument is sent.
 	analytics := func(name, kind string, events []shardpilot.Event, synchronous bool, refused ...shardpilot.Event) {
 		caseRun(name, kind, func(hc *http.Client) error {
-			c, err := shardpilot.NewClient(shardpilot.Config{IngestURL: values["SHARDPILOT_INGEST_URL"], PublishableKey: values["SHARDPILOT_PUBLISHABLE_KEY"], WorkspaceID: values["SHARDPILOT_WORKSPACE_ID"], AppID: values["SHARDPILOT_APP_ID"], EnvironmentID: values["SHARDPILOT_ENVIRONMENT_ID"], AnonymousID: values["SHARDPILOT_ANONYMOUS_ID"], Source: shardpilot.SourceClient, BatchSize: len(events), FlushInterval: time.Hour, HTTPTimeout: 15 * time.Second, HTTPClient: hc, DisableRequestCompression: true})
+			c, err := shardpilot.NewClient(shardpilot.Config{IngestURL: values["SHARDPILOT_INGEST_URL"], PublishableKey: values["SHARDPILOT_PUBLISHABLE_KEY"], WorkspaceKey: values["SHARDPILOT_WORKSPACE_KEY"], AppKey: values["SHARDPILOT_APP_KEY"], EnvironmentKey: values["SHARDPILOT_ENVIRONMENT_KEY"], AnonymousID: values["SHARDPILOT_ANONYMOUS_ID"], Source: shardpilot.SourceClient, BatchSize: len(events), FlushInterval: time.Hour, HTTPTimeout: 15 * time.Second, HTTPClient: hc, DisableRequestCompression: true})
 			if err != nil {
 				return err
 			}
@@ -319,7 +319,7 @@ func run(getenv func(string) string, out io.Writer, transport http.RoundTripper)
 	analytics("unauthenticated", "unauthenticated", []shardpilot.Event{event("app.screen_view", "unauth", 1, nil)}, true)
 	for _, kind := range []string{"go-panic", "native-json", "raw-text"} {
 		caseRun(kind, "crash", func(hc *http.Client) error {
-			c, err := crash.NewClient(crash.ClientOptions{CrashURL: values["SHARDPILOT_CRASH_URL"], CrashKey: values["SHARDPILOT_CRASH_KEY"], App: crash.AppInfo{ID: values["SHARDPILOT_APP_ID"], Version: "synthetic", BuildID: "sdk-evidence"}, CrashComponent: "sdk-evidence", AnonymousID: values["SHARDPILOT_ANONYMOUS_ID"], SessionID: runID, HTTPClient: hc, MaxAttempts: 1})
+			c, err := crash.NewClient(crash.ClientOptions{CrashURL: values["SHARDPILOT_CRASH_URL"], CrashKey: values["SHARDPILOT_CRASH_KEY"], App: crash.AppInfo{ID: values["SHARDPILOT_APP_KEY"], Version: "synthetic", BuildID: "sdk-evidence"}, CrashComponent: "sdk-evidence", AnonymousID: values["SHARDPILOT_ANONYMOUS_ID"], SessionID: runID, HTTPClient: hc, MaxAttempts: 1})
 			if err != nil {
 				return err
 			}

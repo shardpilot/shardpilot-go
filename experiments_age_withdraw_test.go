@@ -89,7 +89,7 @@ func newAgeWithdrawRig(t *testing.T, spool string, mutate func(*Config), bodies 
 func (r *ageWithdrawRig) launch(t *testing.T, mutate func(*Config)) *Client {
 	t.Helper()
 	client := newExperimentClient(t, r.server.URL, func(cfg *Config) {
-		cfg.AppID = "exposure-app"
+		cfg.AppKey = "exposure-app"
 		cfg.SpoolDir = r.spool
 		if mutate != nil {
 			mutate(cfg)

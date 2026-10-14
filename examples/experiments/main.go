@@ -100,7 +100,7 @@
 //	SHARDPILOT_INGEST_URL=https://ingest.example.invalid \
 //	SHARDPILOT_APP_URL=https://app.shardpilot.com \
 //	SHARDPILOT_PUBLISHABLE_KEY=sp_ingest_... \
-//	SP_WORKSPACE_ID=... SP_APP_ID=... SP_ENVIRONMENT_ID=... \
+//	SHARDPILOT_WORKSPACE_KEY=... SHARDPILOT_APP_KEY=... SHARDPILOT_ENVIRONMENT_KEY=... \
 //	SP_EXPERIMENT_KEY=... \
 //	go run ./examples/experiments
 //
@@ -5392,8 +5392,8 @@ func isWordByte(c byte) bool {
 
 func main() {
 	required := []string{
-		"SHARDPILOT_INGEST_URL", "SHARDPILOT_APP_URL", "SHARDPILOT_PUBLISHABLE_KEY", "SP_WORKSPACE_ID",
-		"SP_APP_ID", "SP_ENVIRONMENT_ID", "SP_EXPERIMENT_KEY",
+		"SHARDPILOT_INGEST_URL", "SHARDPILOT_APP_URL", "SHARDPILOT_PUBLISHABLE_KEY", "SHARDPILOT_WORKSPACE_KEY",
+		"SHARDPILOT_APP_KEY", "SHARDPILOT_ENVIRONMENT_KEY", "SP_EXPERIMENT_KEY",
 	}
 	var missing []string
 	for _, name := range required {
@@ -5411,14 +5411,14 @@ func main() {
 	}
 
 	suppliedValues = []string{
-		env("SHARDPILOT_PUBLISHABLE_KEY"), env("SP_WORKSPACE_ID"), env("SP_APP_ID"),
-		env("SP_ENVIRONMENT_ID"), env("SP_EXPERIMENT_KEY"),
+		env("SHARDPILOT_PUBLISHABLE_KEY"), env("SHARDPILOT_WORKSPACE_KEY"), env("SHARDPILOT_APP_KEY"),
+		env("SHARDPILOT_ENVIRONMENT_KEY"), env("SP_EXPERIMENT_KEY"),
 	}
 	// ...and BY NAME as well, because one question needs the mapping the flat list
 	// throws away: whether an echoed member carries the value THIS request put in
 	// that slot. See the echo check in redactUnaccountedJSONValues.
-	requestedAppKey = env("SP_APP_ID")
-	requestedEnvKey = env("SP_ENVIRONMENT_ID")
+	requestedAppKey = env("SHARDPILOT_APP_KEY")
+	requestedEnvKey = env("SHARDPILOT_ENVIRONMENT_KEY")
 	requestedExpKey = env("SP_EXPERIMENT_KEY")
 
 	// The authority this program was pointed at, recorded before anything is sent:
@@ -5440,9 +5440,9 @@ func main() {
 		// Ingest remains a separately configured origin even though this example
 		// fetches assignments without publishing events.
 		IngestURL:           env("SHARDPILOT_INGEST_URL"),
-		WorkspaceID:         env("SP_WORKSPACE_ID"),
-		AppID:               env("SP_APP_ID"),
-		EnvironmentID:       env("SP_ENVIRONMENT_ID"),
+		WorkspaceKey:        env("SHARDPILOT_WORKSPACE_KEY"),
+		AppKey:              env("SHARDPILOT_APP_KEY"),
+		EnvironmentKey:      env("SHARDPILOT_ENVIRONMENT_KEY"),
 		Source:              shardpilot.SourceClient,
 		PublishableKey:      env("SHARDPILOT_PUBLISHABLE_KEY"),
 		RemoteConfigEnabled: true,

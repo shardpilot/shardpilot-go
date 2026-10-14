@@ -44,8 +44,8 @@ func TestExperimentV2ServerGoldenEnvelope(t *testing.T) {
 				t.Fatal(err)
 			}
 			client := &Client{clock: realClock{}, cfg: Config{
-				WorkspaceID: fact["workspace_key"].(string), AppID: fact["app_key"].(string),
-				EnvironmentID: fact["environment_key"].(string), AnonymousID: "anon-test", Source: SourceBackend,
+				WorkspaceKey: fact["workspace_key"].(string), AppKey: fact["app_key"].(string),
+				EnvironmentKey: fact["environment_key"].(string), AnonymousID: "anon-test", Source: SourceBackend,
 			}}
 			sealed := &expSealedFact{fact: raw, seal: expStubSeal}
 			event, ok := client.sealedExposureEvent("session-test", sealed, 0)
@@ -79,8 +79,13 @@ func TestExperimentV2ServerGoldenEnvelope(t *testing.T) {
 			if err := json.Unmarshal(batch.rawEvents[1], &ordinary); err != nil {
 				t.Fatal(err)
 			}
-			if ordinary["schema_version"] != float64(1) || ordinary["workspace_id"] != client.cfg.WorkspaceID || ordinary["workspace_key"] != nil {
-				t.Fatal("ordinary events must retain their original major and scope fields")
+			if ordinary["schema_version"] != float64(1) {
+				t.Fatal("ordinary events must retain their original major")
+			}
+			for axis, value := range map[string]string{"workspace": client.cfg.WorkspaceKey, "app": client.cfg.AppKey, "environment": client.cfg.EnvironmentKey} {
+				if ordinary[axis+"_key"] != value || ordinary[axis+"_id"] != nil {
+					t.Fatalf("ordinary %s scope must use its literal key", axis)
+				}
 			}
 			for _, axis := range []string{"workspace_key", "app_key", "environment_key"} {
 				original := fact[axis]

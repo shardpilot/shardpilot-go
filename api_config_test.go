@@ -61,7 +61,7 @@ func TestAPIConfigCredentialAndEnableRules(t *testing.T) {
 		{"experiments without remote", SourceBackend, "service-fixture", "sp_pub_fixture", "https://app.example", false, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := Config{IngestURL: "https://ingest.example", WorkspaceID: "w", AppID: "a", EnvironmentID: "e", Source: tc.source}
+			cfg := Config{IngestURL: "https://ingest.example", WorkspaceKey: "w", AppKey: "a", EnvironmentKey: "e", Source: tc.source}
 			setConfigSceneFields(&cfg, map[string]any{"ServiceToken": tc.service, "PublishableKey": tc.publishable, "AppURL": tc.app, "RemoteConfigEnabled": tc.remote, "ExperimentsEnabled": tc.experiments})
 			_, err := normalizeConfig(cfg)
 			if (err == nil) != tc.valid {
@@ -108,7 +108,7 @@ func TestAPIConfigRoutesCredentialsAndSeparatesEnablement(t *testing.T) {
 				fmt.Fprint(w, `{"version":1,"values":{"example":true}}`)
 			}))
 			defer app.Close()
-			cfg := Config{IngestURL: ingest.URL, WorkspaceID: "w", AppID: "a", EnvironmentID: "e", Source: source, AnonymousID: "synthetic-actor", FlushInterval: time.Hour}
+			cfg := Config{IngestURL: ingest.URL, WorkspaceKey: "w", AppKey: "a", EnvironmentKey: "e", Source: source, AnonymousID: "synthetic-actor", FlushInterval: time.Hour}
 			service := "service-fixture"
 			if source == SourceClient {
 				service = ""
@@ -153,7 +153,7 @@ func TestAPIConfigAttributePrerequisite(t *testing.T) {
 					}))
 					defer app.Close()
 					client, err := NewClient(Config{IngestURL: app.URL, ServiceToken: "service-fixture", PublishableKey: "sp_pub_fixture", AppURL: app.URL,
-						WorkspaceID: "w", AppID: "a", EnvironmentID: "e", Source: SourceBackend, AnonymousID: "synthetic-actor",
+						WorkspaceKey: "w", AppKey: "a", EnvironmentKey: "e", Source: SourceBackend, AnonymousID: "synthetic-actor",
 						RemoteConfigEnabled: remote, RemoteConfigAttributesEnabled: attributes, ExperimentsEnabled: experiments, FlushInterval: time.Hour})
 					if client != nil {
 						defer client.Close(context.Background())

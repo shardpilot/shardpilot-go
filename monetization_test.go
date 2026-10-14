@@ -44,19 +44,19 @@ func newPurchaseCaptureServer(t *testing.T) (*httptest.Server, chan map[string]a
 func newSourceTestClient(t *testing.T, ingestURL string, source Source) *Client {
 	t.Helper()
 	cfg := Config{
-		IngestURL:     ingestURL,
-		ServiceToken:  "test-token",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        source,
-		AppVersion:    "0.1.0",
-		AppBuild:      "100",
-		Platform:      "linux",
-		BatchSize:     2,
-		BufferSize:    4,
-		FlushInterval: time.Hour,
-		HTTPTimeout:   time.Second,
+		IngestURL:      ingestURL,
+		ServiceToken:   "test-token",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         source,
+		AppVersion:     "0.1.0",
+		AppBuild:       "100",
+		Platform:       "linux",
+		BatchSize:      2,
+		BufferSize:     4,
+		FlushInterval:  time.Hour,
+		HTTPTimeout:    time.Second,
 	}
 	if source == SourceClient {
 		cfg.PublishableKey = cfg.ServiceToken

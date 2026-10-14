@@ -111,19 +111,19 @@ func newCompressionTestClient(t *testing.T, ingestURL string, mutate func(*Confi
 	t.Helper()
 
 	cfg := Config{
-		IngestURL:     ingestURL,
-		ServiceToken:  "test-token",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		AppVersion:    "0.1.0",
-		AppBuild:      "100",
-		Platform:      "linux",
-		BatchSize:     200,
-		BufferSize:    400,
-		FlushInterval: time.Hour,
-		HTTPTimeout:   5 * time.Second,
+		IngestURL:      ingestURL,
+		ServiceToken:   "test-token",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		AppVersion:     "0.1.0",
+		AppBuild:       "100",
+		Platform:       "linux",
+		BatchSize:      200,
+		BufferSize:     400,
+		FlushInterval:  time.Hour,
+		HTTPTimeout:    5 * time.Second,
 	}
 	if mutate != nil {
 		mutate(&cfg)
@@ -697,14 +697,14 @@ func TestTheUncompressedRetryGetsItsOwnAttemptTimeout(t *testing.T) {
 	defer server.Close()
 
 	client, err := NewClient(Config{
-		IngestURL:     server.URL,
-		ServiceToken:  "test-token",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		FlushInterval: time.Hour,
-		HTTPTimeout:   attemptTimeout,
+		IngestURL:      server.URL,
+		ServiceToken:   "test-token",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		FlushInterval:  time.Hour,
+		HTTPTimeout:    attemptTimeout,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)

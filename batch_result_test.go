@@ -103,17 +103,17 @@ func (r *batchResultRecorder) all() []BatchResult {
 func newBatchResultClient(t *testing.T, ingestURL string, onResult func(BatchResult)) *Client {
 	t.Helper()
 	client, err := NewClient(Config{
-		IngestURL:     ingestURL,
-		ServiceToken:  "test-token",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		BatchSize:     10,
-		BufferSize:    32,
-		FlushInterval: time.Hour,
-		HTTPTimeout:   time.Second,
-		OnBatchResult: onResult,
+		IngestURL:      ingestURL,
+		ServiceToken:   "test-token",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		BatchSize:      10,
+		BufferSize:     32,
+		FlushInterval:  time.Hour,
+		HTTPTimeout:    time.Second,
+		OnBatchResult:  onResult,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)

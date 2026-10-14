@@ -169,19 +169,19 @@ func (s *floorTestServer) batchIDsSince(from int) []string {
 func newFloorTestClient(t *testing.T, serverURL, spoolDir string, mutate func(*Config)) *Client {
 	t.Helper()
 	cfg := Config{
-		IngestURL:     serverURL,
-		ServiceToken:  "test-token",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		AnonymousID:   "anon-spool-1",
-		SpoolDir:      spoolDir,
-		ConsentFloor:  &ConsentFloorConfig{},
-		BatchSize:     4,
-		BufferSize:    16,
-		FlushInterval: time.Hour,
-		HTTPTimeout:   time.Second,
+		IngestURL:      serverURL,
+		ServiceToken:   "test-token",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		AnonymousID:    "anon-spool-1",
+		SpoolDir:       spoolDir,
+		ConsentFloor:   &ConsentFloorConfig{},
+		BatchSize:      4,
+		BufferSize:     16,
+		FlushInterval:  time.Hour,
+		HTTPTimeout:    time.Second,
 	}
 	if mutate != nil {
 		mutate(&cfg)
@@ -1106,12 +1106,12 @@ func TestConsentFloorRefusedTightenStartsFailClosed(t *testing.T) {
 	}
 
 	cfg := Config{
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		AnonymousID:   "anon-spool-1",
-		SpoolDir:      dir,
-		ConsentFloor:  &ConsentFloorConfig{},
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		AnonymousID:    "anon-spool-1",
+		SpoolDir:       dir,
+		ConsentFloor:   &ConsentFloorConfig{},
 	}
 	client := &Client{cfg: cfg, clock: realClock{}}
 	client.initConsentFloor(os.Rename, func(string, os.FileMode) error {
@@ -1793,11 +1793,11 @@ func TestConsentFloorReloadRefusesOutOfContractIdentity(t *testing.T) {
 	dir := t.TempDir()
 	oversized := strings.Repeat("u", maxConsentIdentifierBytes+1)
 	cfgTuple := Config{
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		UserID:        oversized,
-		AnonymousID:   "anon-spool-1",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		UserID:         oversized,
+		AnonymousID:    "anon-spool-1",
 	}
 	// A persisted grant for the out-of-contract tuple (legacy, seeded, or
 	// written by a floor-off build, which has no identity gate).
@@ -1979,11 +1979,11 @@ func TestConsentFloorUnconfirmedGrantPurgesSpoolAtInit(t *testing.T) {
 	// dark.
 	oversized := strings.Repeat("u", maxConsentIdentifierBytes+1)
 	invalidTuple := Config{
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		UserID:        oversized,
-		AnonymousID:   "anon-spool-1",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		UserID:         oversized,
+		AnonymousID:    "anon-spool-1",
 	}
 	payload := []byte(fmt.Sprintf(`{"consent_analytics":"granted","actor_digest":%q}`, consentActorDigest(invalidTuple)))
 	if err := os.WriteFile(consentRecordPath(dir), payload, 0o600); err != nil {
@@ -2544,10 +2544,10 @@ func TestConsentFloorRecordScopedToApp(t *testing.T) {
 	// This app's floor must not adopt it as live state.
 	dir := t.TempDir()
 	otherApp := Config{
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-other",
-		EnvironmentID: "develop",
-		AnonymousID:   "anon-spool-1",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-other",
+		EnvironmentKey: "develop",
+		AnonymousID:    "anon-spool-1",
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
@@ -2757,12 +2757,12 @@ func TestConsentFloorFailedHealRegistersOwedDenial(t *testing.T) {
 	}
 
 	cfg := Config{
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		AnonymousID:   "anon-spool-1",
-		SpoolDir:      dir,
-		ConsentFloor:  &ConsentFloorConfig{},
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		AnonymousID:    "anon-spool-1",
+		SpoolDir:       dir,
+		ConsentFloor:   &ConsentFloorConfig{},
 	}
 	client := &Client{cfg: cfg, clock: realClock{}}
 	client.initConsentFloor(func(oldpath, newpath string) error {
@@ -4164,9 +4164,9 @@ func TestConsentFloorFailedHealPreservesResolvedGrantSpool(t *testing.T) {
 	writeSpoolRecordFile(t, dir, 0, spoolTestEnvelope(t, "evt-preserve-1", time.Now()))
 
 	cfg := Config{
-		WorkspaceID:    "workspace-test",
-		AppID:          "app-test",
-		EnvironmentID:  "develop",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
 		AnonymousID:    "anon-spool-1",
 		SpoolDir:       dir,
 		SpoolMaxEvents: 100,
@@ -4440,11 +4440,11 @@ func TestConsentFloorChangedAnonymousIDReceiptOutOfScope(t *testing.T) {
 		t.Fatalf("expected the undecided refusal, got %v", err)
 	}
 	newDigest := consentActorDigest(Config{
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		UserID:        "user-1",
-		AnonymousID:   "anon-B",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		UserID:         "user-1",
+		AnonymousID:    "anon-B",
 	})
 	if _, ok := loadConsentRecordInfo(dir, newDigest); ok {
 		t.Fatalf("expected NO healed record for the new digest")
@@ -5303,11 +5303,11 @@ func TestConsentFloorSettleUnlinkOrderMarkerOutlivesRecord(t *testing.T) {
 		t.Fatalf("seed marker: %v", err)
 	}
 	s := newDiskSpool(Config{
-		SpoolDir:      dir,
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		AnonymousID:   "anon-spool-1",
+		SpoolDir:       dir,
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		AnonymousID:    "anon-spool-1",
 	})
 	if !s.owedWipe() {
 		t.Fatalf("test setup: expected the marker to derive an owed wipe")
@@ -6295,7 +6295,7 @@ func TestConsentUnwitnessedMarkIsHonoredEverywhereAGrantIsTrusted(t *testing.T) 
 		}
 
 		cfg := Config{
-			WorkspaceID: "workspace-test", AppID: "app-test", EnvironmentID: "develop",
+			WorkspaceKey: "workspace-test", AppKey: "app-test", EnvironmentKey: "develop",
 			AnonymousID: "anon-spool-1", SpoolDir: dir, ConsentFloor: &ConsentFloorConfig{},
 		}
 		client := &Client{cfg: cfg, clock: realClock{}}
@@ -6395,7 +6395,7 @@ func TestUnprovableGrantIsHeldFromTheWireAndRecoverable(t *testing.T) {
 			t.Fatalf("seed outbox: %v", err)
 		}
 		cfg := Config{
-			WorkspaceID: "workspace-test", AppID: "app-test", EnvironmentID: "develop",
+			WorkspaceKey: "workspace-test", AppKey: "app-test", EnvironmentKey: "develop",
 			AnonymousID: "anon-spool-1", SpoolDir: dir, ConsentFloor: &ConsentFloorConfig{},
 			IngestURL: server.URL, PublishableKey: "wk_test",
 		}

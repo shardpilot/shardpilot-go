@@ -580,9 +580,9 @@ func TestPurgeDiscardsDeadOwedAndReArmsLiveOnly(t *testing.T) {
 // to a strictly-fresher stored sibling entry.
 func TestFoldedDropYieldsToFresherStoredSibling(t *testing.T) {
 	e := newExperimentsState(Config{
-		WorkspaceID:         "ws",
-		AppID:               "app",
-		EnvironmentID:       "dev",
+		WorkspaceKey:        "ws",
+		AppKey:              "app",
+		EnvironmentKey:      "dev",
 		PublishableKey:      "k",
 		RemoteConfigEnabled: true,
 		AppURL:              "https://cp.example",

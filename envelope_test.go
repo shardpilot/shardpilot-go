@@ -61,9 +61,9 @@ func TestTrackSendsAppFirstEnvelope(t *testing.T) {
 	}
 
 	for _, field := range []string{
-		`"workspace_id":"workspace-test"`,
-		`"app_id":"app-test"`,
-		`"environment_id":"develop"`,
+		`"workspace_key":"workspace-test"`,
+		`"app_key":"app-test"`,
+		`"environment_key":"develop"`,
 		`"event_ts":"2026-05-14T12:00:00Z"`,
 		`"session_sequence":1`,
 		`"app_version":"0.1.0"`,
@@ -95,25 +95,25 @@ func TestConfigValidationAndDefaults(t *testing.T) {
 	}
 
 	_, err := NewClient(Config{
-		IngestURL:     "http://example.com",
-		ServiceToken:  "token",
-		WorkspaceID:   "workspace",
-		AppID:         "app",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
+		IngestURL:      "http://example.com",
+		ServiceToken:   "token",
+		WorkspaceKey:   "workspace",
+		AppKey:         "app",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
 	})
 	if err == nil {
 		t.Fatal("expected non-local http URL to be rejected")
 	}
 
 	client, err := NewClient(Config{
-		IngestURL:     "http://localhost:8080/",
-		ServiceToken:  "token",
-		WorkspaceID:   "workspace",
-		AppID:         "app",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		BatchSize:     500,
+		IngestURL:      "http://localhost:8080/",
+		ServiceToken:   "token",
+		WorkspaceKey:   "workspace",
+		AppKey:         "app",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		BatchSize:      500,
 	})
 	if err != nil {
 		t.Fatalf("expected localhost URL to be allowed: %v", err)
@@ -121,12 +121,12 @@ func TestConfigValidationAndDefaults(t *testing.T) {
 	defer client.Close(context.Background())
 
 	_, err = NewClient(Config{
-		IngestURL:     "http://10.0.0.10:8080",
-		ServiceToken:  "token",
-		WorkspaceID:   "workspace",
-		AppID:         "app",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
+		IngestURL:      "http://10.0.0.10:8080",
+		ServiceToken:   "token",
+		WorkspaceKey:   "workspace",
+		AppKey:         "app",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
 	})
 	if err == nil {
 		t.Fatal("expected private network http URL to require explicit opt-in")
@@ -135,9 +135,9 @@ func TestConfigValidationAndDefaults(t *testing.T) {
 	privateClient, err := NewClient(Config{
 		IngestURL:                   "http://10.0.0.10:8080",
 		ServiceToken:                "token",
-		WorkspaceID:                 "workspace",
-		AppID:                       "app",
-		EnvironmentID:               "develop",
+		WorkspaceKey:                "workspace",
+		AppKey:                      "app",
+		EnvironmentKey:              "develop",
 		Source:                      SourceBackend,
 		AllowInsecurePrivateNetwork: true,
 	})
@@ -154,12 +154,12 @@ func TestConfigValidationAndDefaults(t *testing.T) {
 	} {
 		t.Run("rejects "+name, func(t *testing.T) {
 			_, err := NewClient(Config{
-				IngestURL:     ingestURL,
-				ServiceToken:  "token",
-				WorkspaceID:   "workspace",
-				AppID:         "app",
-				EnvironmentID: "develop",
-				Source:        SourceBackend,
+				IngestURL:      ingestURL,
+				ServiceToken:   "token",
+				WorkspaceKey:   "workspace",
+				AppKey:         "app",
+				EnvironmentKey: "develop",
+				Source:         SourceBackend,
 			})
 			if err == nil {
 				t.Fatalf("expected ingest URL %q to be rejected", ingestURL)
@@ -200,12 +200,12 @@ func TestNormalizeConfigFlushIntervalDefaulting(t *testing.T) {
 
 	base := func() Config {
 		return Config{
-			IngestURL:     "http://localhost:8080",
-			ServiceToken:  "test-token",
-			WorkspaceID:   "workspace-test",
-			AppID:         "app-test",
-			EnvironmentID: "develop",
-			Source:        SourceBackend,
+			IngestURL:      "http://localhost:8080",
+			ServiceToken:   "test-token",
+			WorkspaceKey:   "workspace-test",
+			AppKey:         "app-test",
+			EnvironmentKey: "develop",
+			Source:         SourceBackend,
 		}
 	}
 
@@ -231,19 +231,19 @@ func TestNormalizeConfigFlushIntervalDefaulting(t *testing.T) {
 func newTestClient(t *testing.T, ingestURL string) *Client {
 	t.Helper()
 	client, err := NewClient(Config{
-		IngestURL:     ingestURL,
-		ServiceToken:  "test-token",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		AppVersion:    "0.1.0",
-		AppBuild:      "100",
-		Platform:      "linux",
-		BatchSize:     2,
-		BufferSize:    4,
-		FlushInterval: time.Hour,
-		HTTPTimeout:   time.Second,
+		IngestURL:      ingestURL,
+		ServiceToken:   "test-token",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		AppVersion:     "0.1.0",
+		AppBuild:       "100",
+		Platform:       "linux",
+		BatchSize:      2,
+		BufferSize:     4,
+		FlushInterval:  time.Hour,
+		HTTPTimeout:    time.Second,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -254,10 +254,10 @@ func newTestClient(t *testing.T, ingestURL string) *Client {
 func TestBuildBatchIsolatingAttributesPoisonMembers(t *testing.T) {
 	client := &Client{
 		cfg: Config{
-			WorkspaceID:   "workspace-test",
-			AppID:         "app-test",
-			EnvironmentID: "develop",
-			Source:        SourceBackend,
+			WorkspaceKey:   "workspace-test",
+			AppKey:         "app-test",
+			EnvironmentKey: "develop",
+			Source:         SourceBackend,
 		},
 		clock: realClock{},
 	}

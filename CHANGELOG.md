@@ -2,6 +2,19 @@
 
 ## v0.8.0-alpha — release preparation (not published)
 
+- Analytics configuration uses `WorkspaceKey`, `AppKey` and `EnvironmentKey`
+  for literal scope keys. Ordinary event envelopes send `workspace_key`,
+  `app_key` and `environment_key` at their existing schema major. Existing
+  queued bytes and signed experiment facts retain their exact encodings.
+  The example environment variables are `SHARDPILOT_WORKSPACE_KEY`,
+  `SHARDPILOT_APP_KEY` and `SHARDPILOT_ENVIRONMENT_KEY`.
+
+| Previous analytics setting | Current setting |
+| --- | --- |
+| `Config.WorkspaceID` | `Config.WorkspaceKey` |
+| `Config.AppID` | `Config.AppKey` |
+| `Config.EnvironmentID` | `Config.EnvironmentKey` |
+
 - One process can serve experiments to many players. `ExperimentSubject`
   opens a handle for one player's `spcid_` subject and analytics identity;
   its `Fetch`, `Variant`, `VariantPayload`, `Apply`, `SetConsent` and `Close`

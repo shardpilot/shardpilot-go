@@ -176,19 +176,19 @@ type consentRecordInfo struct {
 // UserID/AnonymousID actor identity, and the kind of the actor the consent
 // rule selects from them. The kind keeps a decision scoped to its actor: the
 // same IDs under a client source (the anonymous actor) and a server or
-// backend source (the verified user) are different decisions. AppID is part
+// backend source (the verified user) are different decisions. AppKey is part
 // of the tuple because the record can become LIVE floor state at reload: a
 // SpoolDir reused across apps in one workspace/environment must not let
 // another app's record rule this app's floor (its receipt was delivered for
 // the other app's scope). A record written by an earlier build (digest
-// without AppID) reads as "no usable decision" — fail-closed: the floor
+// without AppKey) reads as "no usable decision" — fail-closed: the floor
 // starts undecided and the spool purges once, exactly like any digest
 // mismatch. Fields are length-prefixed before hashing, so distinct tuples
 // can never collide by concatenation.
 func consentActorDigest(cfg Config) string {
 	h := sha256.New()
 	actor, _ := selectConsentActor(cfg.Source, cfg.UserID, cfg.AnonymousID)
-	for _, field := range []string{cfg.WorkspaceID, cfg.AppID, cfg.EnvironmentID, cfg.UserID, cfg.AnonymousID, actor.kind} {
+	for _, field := range []string{cfg.WorkspaceKey, cfg.AppKey, cfg.EnvironmentKey, cfg.UserID, cfg.AnonymousID, actor.kind} {
 		fmt.Fprintf(h, "%d:%s\n", len(field), field)
 	}
 	return hex.EncodeToString(h.Sum(nil))
@@ -329,7 +329,7 @@ func loadConsentRecordRead(dir, actorDigest string) (consentRecordInfo, bool, co
 		// directory: it is ONE file per SpoolDir, stamped with a digest
 		// rather than keyed by one, and saveConsentRecord overwrites it
 		// whole. So a sibling scope's decision — a login that sets a
-		// UserID, a tenant switch, a second AppID — erases this scope's
+		// UserID, a tenant switch, a second AppKey — erases this scope's
 		// unwitnessed mark, and the same sibling's merging outbox save
 		// sanitizes the unreadable trail into a clean record. Both pieces
 		// of evidence vanish and the grant a previous start refused is

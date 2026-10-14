@@ -24,13 +24,13 @@ func TestTransportDoesNotRetryClientErrors(t *testing.T) {
 	defer server.Close()
 
 	client, err := NewClient(Config{
-		IngestURL:     server.URL,
-		ServiceToken:  "secret-token-value",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		Logger:        testLogger{out: &logs},
+		IngestURL:      server.URL,
+		ServiceToken:   "secret-token-value",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		Logger:         testLogger{out: &logs},
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -121,9 +121,9 @@ func TestInjectedHTTPClientCarriesAllRequests(t *testing.T) {
 	client, err := NewClient(Config{
 		IngestURL:           server.URL,
 		ServiceToken:        "test-token",
-		WorkspaceID:         "workspace-test",
-		AppID:               "app-test",
-		EnvironmentID:       "develop",
+		WorkspaceKey:        "workspace-test",
+		AppKey:              "app-test",
+		EnvironmentKey:      "develop",
 		Source:              SourceBackend,
 		AnonymousID:         "anon-inject-1",
 		PublishableKey:      "test-rc-key",
@@ -190,9 +190,9 @@ func TestInjectedHTTPClientRemoteConfigStillRefusesRedirects(t *testing.T) {
 	client, err := NewClient(Config{
 		IngestURL:           server.URL,
 		ServiceToken:        "test-token",
-		WorkspaceID:         "workspace-test",
-		AppID:               "app-test",
-		EnvironmentID:       "develop",
+		WorkspaceKey:        "workspace-test",
+		AppKey:              "app-test",
+		EnvironmentKey:      "develop",
 		Source:              SourceBackend,
 		AnonymousID:         "anon-inject-2",
 		PublishableKey:      "test-rc-key",
@@ -231,16 +231,16 @@ func TestInjectedClientAttemptsBoundedByHTTPTimeout(t *testing.T) {
 	// must still bound the attempt at HTTPTimeout — the internal clients'
 	// Timeout used to be the only cap, and injection must not lose it.
 	client, err := NewClient(Config{
-		IngestURL:     server.URL,
-		ServiceToken:  "test-token",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		AnonymousID:   "anon-inject-3",
-		HTTPClient:    &http.Client{},
-		FlushInterval: time.Hour,
-		HTTPTimeout:   200 * time.Millisecond,
+		IngestURL:      server.URL,
+		ServiceToken:   "test-token",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		AnonymousID:    "anon-inject-3",
+		HTTPClient:     &http.Client{},
+		FlushInterval:  time.Hour,
+		HTTPTimeout:    200 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)

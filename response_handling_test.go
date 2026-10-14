@@ -169,14 +169,14 @@ func TestDeferralWakeRetriesAtDeadlineNotNextTick(t *testing.T) {
 	// must fire at the backpressure deadline (the dedicated wake), not at
 	// the next flush tick minutes later.
 	client, err := NewClient(Config{
-		IngestURL:     server.URL,
-		ServiceToken:  "token-value",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		BatchSize:     1,
-		FlushInterval: 10 * time.Minute,
+		IngestURL:      server.URL,
+		ServiceToken:   "token-value",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		BatchSize:      1,
+		FlushInterval:  10 * time.Minute,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -538,14 +538,14 @@ func TestTrackSuccessClearsWorkerBackoff(t *testing.T) {
 	// The flush interval is deliberately enormous: only the success-signal
 	// nudge can produce a prompt retry of the retained batch.
 	client, err := NewClient(Config{
-		IngestURL:     server.URL,
-		ServiceToken:  "token-value",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		BatchSize:     1,
-		FlushInterval: 10 * time.Minute,
+		IngestURL:      server.URL,
+		ServiceToken:   "token-value",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		BatchSize:      1,
+		FlushInterval:  10 * time.Minute,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -583,14 +583,14 @@ func TestTrackSuccessDoesNotFlushHealthyPartialBatches(t *testing.T) {
 	// success must NOT flush the partial async batch ahead of its
 	// BatchSize/FlushInterval schedule.
 	client, err := NewClient(Config{
-		IngestURL:     server.URL,
-		ServiceToken:  "token-value",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		BatchSize:     10,
-		FlushInterval: 10 * time.Minute,
+		IngestURL:      server.URL,
+		ServiceToken:   "token-value",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		BatchSize:      10,
+		FlushInterval:  10 * time.Minute,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -627,12 +627,12 @@ func TestFlushSwallowedPermanentHTTPResetsStreak(t *testing.T) {
 	transport := &scriptedTransport{errs: []error{&HTTPStatusError{StatusCode: 400}, &HTTPStatusError{StatusCode: 503}}}
 	client := &Client{
 		cfg: Config{
-			WorkspaceID:   "workspace-test",
-			AppID:         "app-test",
-			EnvironmentID: "develop",
-			Source:        SourceBackend,
-			BatchSize:     1,
-			HTTPTimeout:   time.Second,
+			WorkspaceKey:   "workspace-test",
+			AppKey:         "app-test",
+			EnvironmentKey: "develop",
+			Source:         SourceBackend,
+			BatchSize:      1,
+			HTTPTimeout:    time.Second,
 		},
 		clock:     realClock{},
 		queue:     newBoundedQueue(2),
@@ -699,12 +699,12 @@ func TestFlushMidSuccessResetsBackoffStreak(t *testing.T) {
 	transport := &scriptedTransport{errs: []error{nil, &HTTPStatusError{StatusCode: 503}}}
 	client := &Client{
 		cfg: Config{
-			WorkspaceID:   "workspace-test",
-			AppID:         "app-test",
-			EnvironmentID: "develop",
-			Source:        SourceBackend,
-			BatchSize:     1,
-			HTTPTimeout:   time.Second,
+			WorkspaceKey:   "workspace-test",
+			AppKey:         "app-test",
+			EnvironmentKey: "develop",
+			Source:         SourceBackend,
+			BatchSize:      1,
+			HTTPTimeout:    time.Second,
 		},
 		clock:     realClock{},
 		queue:     newBoundedQueue(2),
@@ -765,14 +765,14 @@ func TestHintlessFailureBacksOffEndToEnd(t *testing.T) {
 	// ticker, every retry would land at ~50ms. Both retries holding at ~1s
 	// is what proves the two clocks are separate.
 	client, err := NewClient(Config{
-		IngestURL:     server.URL,
-		ServiceToken:  "token-value",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		BatchSize:     1,
-		FlushInterval: 50 * time.Millisecond,
+		IngestURL:      server.URL,
+		ServiceToken:   "token-value",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		BatchSize:      1,
+		FlushInterval:  50 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -818,14 +818,14 @@ func TestRetryAfterZeroRetriesPromptly(t *testing.T) {
 	// With a 10-minute flush interval, only an honored retry-now hint can
 	// produce a prompt second attempt.
 	client, err := NewClient(Config{
-		IngestURL:     server.URL,
-		ServiceToken:  "token-value",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		BatchSize:     1,
-		FlushInterval: 10 * time.Minute,
+		IngestURL:      server.URL,
+		ServiceToken:   "token-value",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		BatchSize:      1,
+		FlushInterval:  10 * time.Minute,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -859,14 +859,14 @@ func TestFlushDroppingTheBatchClearsStaleDeferral(t *testing.T) {
 	defer server.Close()
 
 	client, err := NewClient(Config{
-		IngestURL:     server.URL,
-		ServiceToken:  "token-value",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		BatchSize:     1,
-		FlushInterval: 300 * time.Millisecond,
+		IngestURL:      server.URL,
+		ServiceToken:   "token-value",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		BatchSize:      1,
+		FlushInterval:  300 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -898,12 +898,12 @@ func TestRetriesReuseEventIDAndTimestamp(t *testing.T) {
 	transport := &sequenceTransport{firstErr: &HTTPStatusError{StatusCode: http.StatusInternalServerError}}
 	client := &Client{
 		cfg: Config{
-			WorkspaceID:   "workspace-test",
-			AppID:         "app-test",
-			EnvironmentID: "develop",
-			Source:        SourceBackend,
-			BatchSize:     1,
-			HTTPTimeout:   time.Second,
+			WorkspaceKey:   "workspace-test",
+			AppKey:         "app-test",
+			EnvironmentKey: "develop",
+			Source:         SourceBackend,
+			BatchSize:      1,
+			HTTPTimeout:    time.Second,
 		},
 		clock:     realClock{},
 		queue:     newBoundedQueue(2),
@@ -967,13 +967,13 @@ func TestWorkerHoldsAutomaticPublishesUntilRetryAfter(t *testing.T) {
 	defer server.Close()
 
 	client, err := NewClient(Config{
-		IngestURL:     server.URL,
-		ServiceToken:  "token-value",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		FlushInterval: 20 * time.Millisecond,
+		IngestURL:      server.URL,
+		ServiceToken:   "token-value",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		FlushInterval:  20 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -1026,14 +1026,14 @@ func TestEventArrivingDuringDeferralKeepsTheDeadlineRetry(t *testing.T) {
 	// A long flush interval: if the deadline wake were lost (e.g. to a queue
 	// event racing the timer), the retry would not happen for 10 minutes.
 	client, err := NewClient(Config{
-		IngestURL:     server.URL,
-		ServiceToken:  "token-value",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		BatchSize:     2,
-		FlushInterval: 10 * time.Minute,
+		IngestURL:      server.URL,
+		ServiceToken:   "token-value",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		BatchSize:      2,
+		FlushInterval:  10 * time.Minute,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -1099,14 +1099,14 @@ func TestDeadlineRetryFailureWithoutHintFallsBackToTickCadence(t *testing.T) {
 	defer server.Close()
 
 	client, err := NewClient(Config{
-		IngestURL:     server.URL,
-		ServiceToken:  "token-value",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		BatchSize:     1,
-		FlushInterval: 300 * time.Millisecond,
+		IngestURL:      server.URL,
+		ServiceToken:   "token-value",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		BatchSize:      1,
+		FlushInterval:  300 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -1146,14 +1146,14 @@ func TestConsentDenialClearsStaleDeferral(t *testing.T) {
 	defer server.Close()
 
 	client, err := NewClient(Config{
-		IngestURL:     server.URL,
-		ServiceToken:  "token-value",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		BatchSize:     1,
-		FlushInterval: 200 * time.Millisecond,
+		IngestURL:      server.URL,
+		ServiceToken:   "token-value",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		BatchSize:      1,
+		FlushInterval:  200 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -1190,13 +1190,13 @@ func TestExplicitFlushBypassesRetryAfterDeferral(t *testing.T) {
 	defer server.Close()
 
 	client, err := NewClient(Config{
-		IngestURL:     server.URL,
-		ServiceToken:  "token-value",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		FlushInterval: 20 * time.Millisecond,
+		IngestURL:      server.URL,
+		ServiceToken:   "token-value",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		FlushInterval:  20 * time.Millisecond,
 	})
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -1281,13 +1281,13 @@ func TestRetryPacingIsIndependentOfTheFlushInterval(t *testing.T) {
 	defer server.Close()
 
 	client, err := NewClient(Config{
-		IngestURL:     server.URL,
-		ServiceToken:  "token-value",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		BatchSize:     1,
+		IngestURL:      server.URL,
+		ServiceToken:   "token-value",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		BatchSize:      1,
 		// FlushInterval DELIBERATELY unset: this exercises the shipped
 		// default, which is the whole subject of the test.
 	})
@@ -1351,14 +1351,14 @@ func TestRetainedBatchRetryDoesNotStarveTheQueue(t *testing.T) {
 
 	const queueDepth = 20
 	client, err := NewClient(Config{
-		IngestURL:     server.URL,
-		ServiceToken:  "token-value",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		BatchSize:     1,
-		BufferSize:    queueDepth,
+		IngestURL:      server.URL,
+		ServiceToken:   "token-value",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		BatchSize:      1,
+		BufferSize:     queueDepth,
 		// FlushInterval DELIBERATELY unset: the shipped default is the subject.
 	})
 	if err != nil {

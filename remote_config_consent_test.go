@@ -20,7 +20,7 @@ func newConsentConfigClient(t *testing.T, serverURL, cachePath string, configure
 	cfg := Config{
 		IngestURL: serverURL, AppURL: serverURL, RemoteConfigEnabled: true,
 		ServiceToken: "test-token", PublishableKey: "test-rc-key",
-		WorkspaceID: "workspace-test", AppID: "app-test", EnvironmentID: "develop",
+		WorkspaceKey: "workspace-test", AppKey: "app-test", EnvironmentKey: "develop",
 		Source: SourceBackend, AnonymousID: "config-anonymous", UserID: "config-host-user",
 		RemoteConfigCachePath: cachePath, RemoteConfigAttributesEnabled: true,
 		FlushInterval: time.Hour, HTTPTimeout: 5 * time.Second,

@@ -1709,9 +1709,9 @@ func (c *Client) consentReceiptInScope(receipt consentReceipt) bool {
 	// kind must match too: the same identifier as another kind of identity is
 	// another actor.
 	actor, _ := c.consentActor()
-	return receipt.WorkspaceID == c.cfg.WorkspaceID &&
-		receipt.AppID == c.cfg.AppID &&
-		receipt.EnvironmentID == c.cfg.EnvironmentID &&
+	return receipt.WorkspaceID == c.cfg.WorkspaceKey &&
+		receipt.AppID == c.cfg.AppKey &&
+		receipt.EnvironmentID == c.cfg.EnvironmentKey &&
 		receipt.ActorIdentifier == actor.identifier &&
 		receipt.Kind == actor.kind &&
 		receipt.AnonymousID == c.cfg.AnonymousID
@@ -2439,9 +2439,9 @@ func (c *Client) mintConsentReceipt(analyticsGranted bool, reason, decidedAt str
 	receipt := consentReceipt{
 		ConsentNotice:   notice,
 		IdempotencyKey:  idempotencyKey,
-		WorkspaceID:     c.cfg.WorkspaceID,
-		AppID:           c.cfg.AppID,
-		EnvironmentID:   c.cfg.EnvironmentID,
+		WorkspaceID:     c.cfg.WorkspaceKey,
+		AppID:           c.cfg.AppKey,
+		EnvironmentID:   c.cfg.EnvironmentKey,
 		ActorIdentifier: actor.identifier,
 		Kind:            actor.kind,
 		// The DECISION's stamp, shared with the decision record: the reload

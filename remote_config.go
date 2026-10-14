@@ -189,16 +189,16 @@ type remoteConfigState struct {
 
 func newRemoteConfigState(cfg Config) *remoteConfigState {
 	rc := &remoteConfigState{
-		fetchURL:       buildRemoteConfigURL(cfg.AppURL, cfg.WorkspaceID, cfg.EnvironmentID, cfg.AnonymousID),
-		anonymousURL:   buildRemoteConfigURL(cfg.AppURL, cfg.WorkspaceID, cfg.EnvironmentID, ""),
-		anonymousScope: buildRemoteConfigScope(cfg.WorkspaceID, cfg.EnvironmentID, "", cfg.AppURL),
+		fetchURL:       buildRemoteConfigURL(cfg.AppURL, cfg.WorkspaceKey, cfg.EnvironmentKey, cfg.AnonymousID),
+		anonymousURL:   buildRemoteConfigURL(cfg.AppURL, cfg.WorkspaceKey, cfg.EnvironmentKey, ""),
+		anonymousScope: buildRemoteConfigScope(cfg.WorkspaceKey, cfg.EnvironmentKey, "", cfg.AppURL),
 		apiKey:         cfg.PublishableKey,
 		cachePath:      cfg.RemoteConfigCachePath,
 		clientID:       cfg.AnonymousID,
 		settled:        make(map[string]uint64),
 	}
 	if rc.clientID != "" {
-		rc.scope = buildRemoteConfigScope(cfg.WorkspaceID, cfg.EnvironmentID, rc.clientID, cfg.AppURL)
+		rc.scope = buildRemoteConfigScope(cfg.WorkspaceKey, cfg.EnvironmentKey, rc.clientID, cfg.AppURL)
 	}
 	return rc
 }

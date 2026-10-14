@@ -179,18 +179,18 @@ func (s *spoolTestServer) consentAt(i int) capturedConsent {
 func newSpoolTestClient(t *testing.T, serverURL, spoolDir string, recorder *spoolDeadLetterRecorder, mutate func(*Config)) *Client {
 	t.Helper()
 	cfg := Config{
-		IngestURL:     serverURL,
-		ServiceToken:  "test-token",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		AnonymousID:   "anon-spool-1",
-		SpoolDir:      spoolDir,
-		BatchSize:     4,
-		BufferSize:    16,
-		FlushInterval: time.Hour,
-		HTTPTimeout:   time.Second,
+		IngestURL:      serverURL,
+		ServiceToken:   "test-token",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		AnonymousID:    "anon-spool-1",
+		SpoolDir:       spoolDir,
+		BatchSize:      4,
+		BufferSize:     16,
+		FlushInterval:  time.Hour,
+		HTTPTimeout:    time.Second,
 	}
 	if recorder != nil {
 		cfg.OnSpoolDeadLetter = recorder.record
@@ -261,10 +261,10 @@ func spoolFileExists(dir string) bool {
 // configures, so pre-seeded consent records read as THAT client's decision.
 func spoolTestActorDigest() string {
 	return consentActorDigest(Config{
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		AnonymousID:   "anon-spool-1",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		AnonymousID:    "anon-spool-1",
 	})
 }
 
@@ -367,13 +367,13 @@ func flushUntilSpooled(t *testing.T, client *Client, dir string, want int) {
 
 func TestSpoolConfigDefaults(t *testing.T) {
 	cfg, err := normalizeConfig(Config{
-		IngestURL:     "http://localhost:8080",
-		ServiceToken:  "test-token",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
-		SpoolDir:      t.TempDir(),
+		IngestURL:      "http://localhost:8080",
+		ServiceToken:   "test-token",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		SpoolDir:       t.TempDir(),
 	})
 	if err != nil {
 		t.Fatalf("normalizeConfig: %v", err)
@@ -387,12 +387,12 @@ func TestSpoolConfigDefaults(t *testing.T) {
 
 	// Without SpoolDir the caps stay unset — no spool exists to bound.
 	cfg, err = normalizeConfig(Config{
-		IngestURL:     "http://localhost:8080",
-		ServiceToken:  "test-token",
-		WorkspaceID:   "workspace-test",
-		AppID:         "app-test",
-		EnvironmentID: "develop",
-		Source:        SourceBackend,
+		IngestURL:      "http://localhost:8080",
+		ServiceToken:   "test-token",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
 	})
 	if err != nil {
 		t.Fatalf("normalizeConfig: %v", err)
@@ -1474,8 +1474,8 @@ func TestSpoolSharedDirMergePreservesSiblingRecords(t *testing.T) {
 		SpoolDir:       dir,
 		SpoolMaxEvents: 100,
 		SpoolMaxBytes:  1 << 20,
-		WorkspaceID:    "workspace-test",
-		EnvironmentID:  "develop",
+		WorkspaceKey:   "workspace-test",
+		EnvironmentKey: "develop",
 		AnonymousID:    "anon-spool-1",
 	}
 	spoolA := newDiskSpool(cfg)
@@ -1678,8 +1678,8 @@ func TestSpoolMergeCapEvictionSettlesMirror(t *testing.T) {
 		SpoolDir:       dir,
 		SpoolMaxEvents: 3,
 		SpoolMaxBytes:  1 << 20,
-		WorkspaceID:    "workspace-test",
-		EnvironmentID:  "develop",
+		WorkspaceKey:   "workspace-test",
+		EnvironmentKey: "develop",
 		AnonymousID:    "anon-spool-1",
 	}
 	spoolA := newDiskSpool(cfg)
@@ -2626,9 +2626,9 @@ func TestSpoolWorkerPoisonMemberIsolatedSurvivorsDeliver(t *testing.T) {
 func TestSpoolCloseRemnantPoisonMemberIsolated(t *testing.T) {
 	dir := t.TempDir()
 	cfg := Config{
-		WorkspaceID:    "workspace-test",
-		AppID:          "app-test",
-		EnvironmentID:  "develop",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
 		Source:         SourceBackend,
 		AnonymousID:    "anon-spool-1",
 		SpoolDir:       dir,
@@ -3104,9 +3104,9 @@ func TestSpoolLoadRefusedWhenDirCannotBePrivate(t *testing.T) {
 	writeSpoolRecordFile(t, dir, 0, spoolTestEnvelope(t, "evt-dirref-1", now))
 
 	cfg := Config{
-		WorkspaceID:    "workspace-test",
-		AppID:          "app-test",
-		EnvironmentID:  "develop",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
 		AnonymousID:    "anon-spool-1",
 		SpoolDir:       dir,
 		SpoolMaxEvents: 8,

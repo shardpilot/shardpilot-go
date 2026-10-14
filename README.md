@@ -77,9 +77,9 @@ A runnable backend example lives in [`examples/basic`](examples/basic). The mini
 client, err := shardpilot.NewClient(shardpilot.Config{
     IngestURL:     os.Getenv("SHARDPILOT_INGEST_URL"),
     ServiceToken:  os.Getenv("SHARDPILOT_SERVICE_TOKEN"),
-    WorkspaceID:   os.Getenv("SHARDPILOT_WORKSPACE_ID"),
-    AppID:         os.Getenv("SHARDPILOT_APP_ID"),
-    EnvironmentID: os.Getenv("SHARDPILOT_ENVIRONMENT_ID"),
+    WorkspaceKey:   os.Getenv("SHARDPILOT_WORKSPACE_KEY"),
+    AppKey:         os.Getenv("SHARDPILOT_APP_KEY"),
+    EnvironmentKey: os.Getenv("SHARDPILOT_ENVIRONMENT_KEY"),
     Source:        shardpilot.SourceBackend,
     AppVersion:    "0.1.0",
 })
@@ -240,7 +240,7 @@ Two **default-off** capture opt-ins extend automatic capture (both dark by defau
 | `IngestURL` | yes | Absolute base URL, no path/query/fragment. HTTPS required outside localhost/loopback (or private nets with `AllowInsecurePrivateNetwork`). |
 | `ServiceToken` | server/backend only | Service credential for ingest. Required for `SourceServer` and `SourceBackend`; forbidden for `SourceClient`. Publishable keys and static JWTs are refused here. |
 | `RemoteConfigEnabled` | no | Explicit opt-in, default false. Requires `AppURL` and `PublishableKey`. The address alone enables nothing. |
-| `WorkspaceID` / `AppID` / `EnvironmentID` | yes | App-first identity (`workspace → app → environment`). |
+| `WorkspaceKey` / `AppKey` / `EnvironmentKey` | yes | App-first identity (`workspace → app → environment`). |
 | `Source` | yes | `SourceClient`, `SourceServer`, or `SourceBackend`. |
 | `AppVersion` / `AppBuild` | no | Default envelope metadata. |
 | `Platform` | no | Analytics platform: `windows`, `macos`, `linux`, `android`, `ios`, `tvos`, `web`, `ps4`, `ps5`, `xbox`, `switch`, or `other`. Values are trimmed and lowercased; supported aliases such as `darwin` map to their canonical value. Empty or unmapped input becomes `other`. `Event.Platform` overrides this default when nonempty. |
@@ -312,7 +312,7 @@ A malformed value (free-form text, an email, an IP, a JWT, a raw `user_`/`player
 
 ## Wire contract
 
-App-first event envelope (`POST {IngestURL}/v1/events:batch`, `Authorization: Bearer <token>`). Ordinary event envelopes carry `event_id`, `schema_version`, `event_name`, `source`, `event_ts`, `workspace_id`, `app_id`, `environment_id`, and optional `user_id`, `anonymous_id`, `session_id`, `session_sequence`, `platform`, `app_version`, `app_build`, `context`, `props`.
+App-first event envelope (`POST {IngestURL}/v1/events:batch`, `Authorization: Bearer <token>`). Ordinary event envelopes carry `event_id`, `schema_version`, `event_name`, `source`, `event_ts`, `workspace_key`, `app_key`, `environment_key`, and optional `user_id`, `anonymous_id`, `session_id`, `session_sequence`, `platform`, `app_version`, `app_build`, `context`, `props`.
 
 Every request the SDK makes (event batches, consent, remote config, the experiment assignment and apply routes, and crash ingest) carries `X-ShardPilot-SDK: go/<version>`, for example `go/0.8.0-alpha`. The version is the release the SDK was cut from, held as a constant in code; it never comes from configuration.
 

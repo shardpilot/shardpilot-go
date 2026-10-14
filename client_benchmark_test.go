@@ -33,10 +33,10 @@ func BenchmarkEnqueueMapPayload(b *testing.B) {
 func BenchmarkBuildBatchMapPayloads(b *testing.B) {
 	client := &Client{
 		cfg: Config{
-			WorkspaceID:   "workspace-bench",
-			AppID:         "app-bench",
-			EnvironmentID: "develop",
-			Source:        SourceBackend,
+			WorkspaceKey:   "workspace-bench",
+			AppKey:         "app-bench",
+			EnvironmentKey: "develop",
+			Source:         SourceBackend,
 		},
 		clock: benchmarkClock{t: time.Unix(1700000000, 0).UTC()},
 	}

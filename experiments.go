@@ -1500,9 +1500,9 @@ func newExperimentsState(cfg Config) *experimentsState {
 		chmod = os.Chmod
 	}
 	return &experimentsState{
-		workspaceID:     cfg.WorkspaceID,
-		appKey:          cfg.AppID,
-		envKey:          cfg.EnvironmentID,
+		workspaceID:     cfg.WorkspaceKey,
+		appKey:          cfg.AppKey,
+		envKey:          cfg.EnvironmentKey,
 		baseURL:         strings.TrimRight(cfg.AppURL, "/"),
 		keyPrint:        experimentAPIKeyFingerprint(cfg.PublishableKey),
 		spoolDir:        cfg.SpoolDir,

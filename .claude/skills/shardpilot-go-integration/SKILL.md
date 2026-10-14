@@ -139,9 +139,9 @@ import "github.com/shardpilot/shardpilot-go"
 client, err := shardpilot.NewClient(shardpilot.Config{
     IngestURL:     os.Getenv("SHARDPILOT_INGEST_URL"), // base URL, no path
     ServiceToken:  os.Getenv("SHARDPILOT_SERVICE_TOKEN"),
-    WorkspaceID:   os.Getenv("SHARDPILOT_WORKSPACE_ID"),
-    AppID:         os.Getenv("SHARDPILOT_APP_ID"),
-    EnvironmentID: os.Getenv("SHARDPILOT_ENVIRONMENT_ID"),
+    WorkspaceKey:   os.Getenv("SHARDPILOT_WORKSPACE_KEY"),
+    AppKey:         os.Getenv("SHARDPILOT_APP_KEY"),
+    EnvironmentKey: os.Getenv("SHARDPILOT_ENVIRONMENT_KEY"),
     Source:        shardpilot.SourceBackend, // or SourceServer
     AppVersion:    "1.0.0",
 })
@@ -158,7 +158,7 @@ defer func() {
 }()
 ```
 
-Required: `IngestURL`, the source-appropriate credential, `WorkspaceID`, `AppID`, `EnvironmentID`, and a
+Required: `IngestURL`, the source-appropriate credential, `WorkspaceKey`, `AppKey`, `EnvironmentKey`, and a
 valid `Source` (`SourceClient` / `SourceServer` / `SourceBackend`).
 `NewClient` rejects an `IngestURL` with a path, query, fragment, or userinfo,
 and non-HTTPS URLs outside localhost/loopback (plain HTTP to a private

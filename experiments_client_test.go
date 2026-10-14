@@ -235,9 +235,9 @@ func newExperimentClient(t *testing.T, serverURL string, mutate func(*Config)) *
 	cfg := Config{
 		IngestURL:           serverURL,
 		ServiceToken:        "test-token",
-		WorkspaceID:         "workspace-test",
-		AppID:               "app-test",
-		EnvironmentID:       "develop",
+		WorkspaceKey:        "workspace-test",
+		AppKey:              "app-test",
+		EnvironmentKey:      "develop",
 		Source:              SourceBackend,
 		AnonymousID:         "anon-test",
 		PublishableKey:      "test-exp-key",
@@ -330,9 +330,9 @@ func TestExperimentsConfigRequiresRemoteConfigURL(t *testing.T) {
 	_, err := NewClient(Config{
 		IngestURL:          "https://ingest.example",
 		ServiceToken:       "test-token",
-		WorkspaceID:        "ws",
-		AppID:              "app",
-		EnvironmentID:      "dev",
+		WorkspaceKey:       "ws",
+		AppKey:             "app",
+		EnvironmentKey:     "dev",
 		Source:             SourceBackend,
 		ExperimentsEnabled: true,
 	})

@@ -51,9 +51,9 @@ func newSizeSceneClient(t *testing.T) (*Client, *sizeSceneServer) {
 	client, err := NewClient(Config{
 		IngestURL:                 server.URL,
 		ServiceToken:              "service-fixture",
-		WorkspaceID:               "workspace-test",
-		AppID:                     "app-test",
-		EnvironmentID:             "develop",
+		WorkspaceKey:              "workspace-test",
+		AppKey:                    "app-test",
+		EnvironmentKey:            "develop",
 		Source:                    SourceBackend,
 		AnonymousID:               "synthetic-anon",
 		BatchSize:                 10,
@@ -241,7 +241,7 @@ func TestAnEventLeftUnencodedAtIntakeIsMeasuredAtPublish(t *testing.T) {
 	if err := client.Enqueue(unencoded); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
-	if err := client.Enqueue(sizedEvent(t, client, "0199a0b0-0000-7000-8000-000000000011", 300)); err != nil {
+	if err := client.Enqueue(sizedEvent(t, client, "0199a0b0-0000-7000-8000-000000000011", 400)); err != nil {
 		t.Fatalf("Enqueue batchmate: %v", err)
 	}
 	nested["value"] = strings.Repeat("a", 3000)

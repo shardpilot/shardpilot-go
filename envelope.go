@@ -95,14 +95,10 @@ type eventEnvelope struct {
 	subjectStamp uint64
 }
 
-// Experiment major 2 names the signed scope members with literal keys.
-// Keep the internal scope fields for queue bookkeeping; only this wire shape
-// changes. The explicit omitted fields shadow the ordinary envelope's names.
+// Wire envelopes name their scope members with literal keys. The internal
+// fields keep their names for bookkeeping; omitted fields shadow their tags.
 func (e eventEnvelope) MarshalJSON() ([]byte, error) {
 	type plain eventEnvelope
-	if e.SchemaVersion != 2 || (e.EventName != experimentExposureName && e.EventName != experimentOutcomeName) {
-		return json.Marshal(plain(e))
-	}
 	return json.Marshal(struct {
 		plain
 		WorkspaceID    *string `json:"workspace_id,omitempty"`
@@ -178,9 +174,9 @@ func (c *Client) buildEnvelope(event Event) (eventEnvelope, error) {
 		EventName:       name,
 		Source:          source,
 		EventTS:         eventTS,
-		WorkspaceID:     c.cfg.WorkspaceID,
-		AppID:           c.cfg.AppID,
-		EnvironmentID:   c.cfg.EnvironmentID,
+		WorkspaceID:     c.cfg.WorkspaceKey,
+		AppID:           c.cfg.AppKey,
+		EnvironmentID:   c.cfg.EnvironmentKey,
 		UserID:          userID,
 		AnonymousID:     anonymousID,
 		SessionID:       event.SessionID,
