@@ -1024,8 +1024,8 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 	// URL, validator and response scope together from current consent.
 	// The attribute receipt gate is independent and remains grant-only.
 	attributesAllowed := attributedURL != "" && !c.grantReceiptGateArmed(nil)
-	now := c.clock.Now()
 	rc.mu.Lock()
+	now := c.clock.Now()
 	requestURL := rc.anonymousURL
 	scope, cache := rc.anonymousScope, anonymousCache
 	usedSignature := ""

@@ -228,3 +228,49 @@ func TestRemoteConfigPolicyRejectedInstallStaysClosed(t *testing.T) {
 		t.Fatal("the newer durable record must recover through a winning 304")
 	}
 }
+
+type rcPolicyClockFunc func() time.Time
+
+func (f rcPolicyClockFunc) Now() time.Time { return f() }
+
+func TestRemoteConfigPolicyWindowExpiresDuringLockContention(t *testing.T) {
+	client, clock, transport := rcPolicyClient()
+	client.rc.retryWindows = map[string]rcRetryWindow{client.rc.anonymousScope: {
+		until: clock.Now().Add(time.Second), reason: "transient_503",
+	}}
+	var sampled atomic.Bool
+	client.clock = rcPolicyClockFunc(func() time.Time {
+		if sampled.CompareAndSwap(false, true) {
+			if client.rc.mu.TryLock() {
+				client.rc.mu.Unlock()
+				// An outside-lock sample ages while another holder keeps the
+				// mutex. Barriers make that elapsed time deterministic.
+				held, advance, finished := make(chan struct{}), make(chan struct{}), make(chan struct{})
+				go func() {
+					client.rc.mu.Lock()
+					close(held)
+					<-advance
+					clock.advance(2 * time.Second)
+					client.rc.mu.Unlock()
+					close(finished)
+				}()
+				<-held
+				before := clock.Now()
+				close(advance)
+				<-finished
+				return before
+			}
+			clock.advance(2 * time.Second)
+		}
+		return clock.Now()
+	})
+	calls := 0
+	transport.fetch = func(context.Context, remoteConfigRequest) (remoteConfigResponse, error) {
+		calls++
+		return remoteConfigResponse{status: 200, body: []byte(`{"value":"fresh"}`)}, nil
+	}
+	result, err := client.FetchRemoteConfig(context.Background())
+	if err != nil || calls != 1 || result.FromCache || result.Values["value"] != "fresh" {
+		t.Fatalf("expired retry window suppressed dispatch: calls=%d result=%+v error=%v", calls, result, err)
+	}
+}
