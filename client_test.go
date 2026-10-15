@@ -849,14 +849,22 @@ func TestCIComparisonBaseTreatsContextAsData(t *testing.T) {
 		}
 		script.WriteString(line + "\n")
 	}
-	type scene struct{ name, branch, base, before, want string }
+	eventSHA := strings.Repeat("c", 40)
+	fetchedSHA := strings.Repeat("d", 40)
+	parentSHA := strings.Repeat("e", 40)
+	type scene struct{ name, branch, base, before, parent, wantFetch, wantSelected string }
 	cases := []scene{}
 	for i, branch := range []string{"main", "x$(printf${IFS}SCENE_EXECUTED)", "x`printf${IFS}SCENE_EXECUTED`", `a"b`, "a'b", "y;z", "p(q)"} {
-		cases = append(cases, scene{fmt.Sprint("new-ref-", i), branch, "", strings.Repeat("0", 40), branch})
+		cases = append(cases, scene{name: fmt.Sprint("new-root-ref-", i), branch: branch,
+			before: strings.Repeat("0", 40), wantFetch: branch, wantSelected: fetchedSHA})
 	}
 	cases = append(cases,
-		scene{"pull-request", "main", strings.Repeat("a", 40), strings.Repeat("0", 40), strings.Repeat("a", 40)},
-		scene{"existing-push", "main", "", strings.Repeat("b", 40), strings.Repeat("b", 40)})
+		scene{name: "pull-request", branch: "main", base: strings.Repeat("a", 40),
+			before: strings.Repeat("0", 40), wantFetch: strings.Repeat("a", 40), wantSelected: strings.Repeat("a", 40)},
+		scene{name: "existing-push", branch: "main", before: strings.Repeat("b", 40),
+			wantFetch: strings.Repeat("b", 40), wantSelected: strings.Repeat("b", 40)},
+		scene{name: "new-ref-parent", branch: "main", before: strings.Repeat("0", 40),
+			parent: parentSHA, wantSelected: parentSHA})
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if out, err := exec.Command(git, "check-ref-format", "--branch", tc.branch).CombinedOutput(); err != nil {
@@ -867,14 +875,40 @@ func TestCIComparisonBaseTreatsContextAsData(t *testing.T) {
 			render := strings.NewReplacer(
 				"${{ github.event.pull_request.base.sha }}", tc.base,
 				"${{ github.event.before }}", tc.before,
-				"${{ github.event.repository.default_branch }}", tc.branch)
+				"${{ github.event.repository.default_branch }}", tc.branch,
+				"${{ github.sha }}", eventSHA)
 			dir := t.TempDir()
 			argsFile, envFile := filepath.Join(dir, "args"), filepath.Join(dir, "env")
-			if err := os.WriteFile(filepath.Join(dir, "git"), []byte("#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$WORKFLOW_ARGS\"\n"), 0700); err != nil {
+			// Record every call rather than overwriting fetch arguments with the
+			// selector's later object reads. Real ancestry is covered separately.
+			gitDouble := `#!/bin/sh
+printf '%s\0' "$@" >> "$WORKFLOW_ARGS"
+printf '\0' >> "$WORKFLOW_ARGS"
+case "$1" in
+  fetch) exit 0 ;;
+  rev-parse)
+    case "$3" in
+      'FETCH_HEAD^{commit}') printf '%s\n' "$WORKFLOW_SELECTED" ;;
+      *) printf '%s\n' "$WORKFLOW_EVENT" ;;
+    esac ;;
+  cat-file)
+    case "$2" in
+      commit)
+        printf 'tree %s\n' "$WORKFLOW_EVENT"
+        if [ -n "$WORKFLOW_PARENT" ]; then printf 'parent %s\n' "$WORKFLOW_PARENT"; fi ;;
+      -e) exit 0 ;;
+      *) exit 23 ;;
+    esac ;;
+  *) exit 23 ;;
+esac
+`
+			if err := os.WriteFile(filepath.Join(dir, "git"), []byte(gitDouble), 0700); err != nil {
 				t.Fatal(err)
 			}
 			cmd := exec.Command(bash, "-e", "-c", render.Replace(script.String()))
-			cmd.Env = []string{"PATH=" + dir + ":/usr/bin:/bin", "GITHUB_ENV=" + envFile, "WORKFLOW_ARGS=" + argsFile}
+			cmd.Env = []string{"PATH=" + dir + ":/usr/bin:/bin", "GITHUB_ENV=" + envFile, "WORKFLOW_ARGS=" + argsFile,
+				"WORKFLOW_EVENT=" + eventSHA, "WORKFLOW_PARENT=" + tc.parent, "WORKFLOW_SELECTED=" + tc.wantSelected}
+
 			for _, line := range strings.Split(header, "\n") {
 				if strings.TrimSpace(line) == "" || strings.TrimSpace(line) == "env:" {
 					continue
@@ -885,20 +919,35 @@ func TestCIComparisonBaseTreatsContextAsData(t *testing.T) {
 				}
 				cmd.Env = append(cmd.Env, name+"="+render.Replace(strings.TrimSpace(value)))
 			}
-			if out, err := cmd.CombinedOutput(); err != nil {
+			out, err := cmd.CombinedOutput()
+			if err != nil {
 				t.Fatalf("workflow script failed for valid branch %q: %v: %s", tc.branch, err, out)
+			}
+			if strings.Contains(string(out), "SCENE_EXECUTED") {
+				t.Fatalf("context became shell code: %s", out)
 			}
 			args, err := os.ReadFile(argsFile)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if want := "fetch\n--depth=1\norigin\n" + tc.want + "\n"; string(args) != want {
-				t.Fatalf("context became shell code: git args %q, want %q", args, want)
+			var fetches []string
+			for _, call := range strings.Split(strings.TrimSuffix(string(args), "\x00\x00"), "\x00\x00") {
+				if strings.HasPrefix(call, "fetch\x00") {
+					fetches = append(fetches, strings.ReplaceAll(call, "\x00", "\n")+"\n")
+				}
+			}
+			if tc.wantFetch == "" {
+				if len(fetches) != 0 {
+					t.Fatalf("a present event parent required no fetch, got %q", fetches)
+				}
+			} else if want := "fetch\n--depth=1\norigin\n" + tc.wantFetch + "\n"; len(fetches) != 1 || fetches[0] != want {
+				t.Fatalf("context changed fetch arguments: got %q, want one call %q", fetches, want)
 			}
 			output, err := os.ReadFile(envFile)
-			if err != nil || string(output) != "SP_LANE_B_BASE=FETCH_HEAD\n" {
-				t.Fatalf("comparison ref was not exported: %q, %v", output, err)
+			if err != nil || string(output) != "SP_LANE_B_BASE="+tc.wantSelected+"\n" {
+				t.Fatalf("immutable comparison ref was not exported: %q, %v", output, err)
 			}
+
 		})
 	}
 }
