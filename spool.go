@@ -27,7 +27,9 @@ import (
 // 5xx, network/transport error), de-duplicated by event_id, and the
 // undelivered remnant at Close (queue + retained batch). Track's synchronous
 // path never spools — the caller owns that error. Terminal outcomes are
-// never spooled, and a terminal outcome on previously spooled events removes
+// never spooled. SDK-owned experiment applications also retain a private
+// local record until their sealed envelope replaces it atomically. A terminal
+// outcome on previously spooled events removes
 // them (ack-removal, so a poison batch cannot re-fail every launch); a 2xx
 // settles all of a batch's events the same way (per-event verdicts inside
 // the 202 are terminal server outcomes).
@@ -77,7 +79,9 @@ const (
 )
 
 // SpoolDeadLetter is one dead-letter notification: the drop reason and the
-// exact spooled wire bytes of each dropped envelope.
+// exact spooled wire bytes of each dropped envelope. An entry for SDK-local
+// experiment application state is nil; its subject and attributes are never
+// exposed as an analytics envelope or integrator callback payload.
 type SpoolDeadLetter struct {
 	Reason    SpoolDropReason
 	Envelopes []json.RawMessage
@@ -161,10 +165,13 @@ type spoolRecordWire struct {
 // so a reloaded record can tell this
 // SDK's own facts from host events that merely resemble them.
 type spoolEventWire struct {
-	IntakeUnixMS    int64           `json:"intake_unix_ms"`
-	AmbiguousUnixMS int64           `json:"ambiguous_unix_ms,omitempty"`
-	Raw             json.RawMessage `json:"raw"`
-	InternalFact    bool            `json:"internal_fact,omitempty"`
+	IntakeUnixMS     int64           `json:"intake_unix_ms"`
+	AmbiguousUnixMS  int64           `json:"ambiguous_unix_ms,omitempty"`
+	Raw              json.RawMessage `json:"raw"`
+	Application      json.RawMessage `json:"application,omitempty"`
+	ApplicationID    string          `json:"application_id,omitempty"`
+	ApplicationExtra bool            `json:"application_extra,omitempty"`
+	InternalFact     bool            `json:"internal_fact,omitempty"`
 	// Drop names an id this run evicted. A line carrying it is a RECORDED
 	// DECISION rather than an event: it has no envelope, and the reader
 	// applies it instead of re-deriving that the eviction must have
@@ -258,7 +265,10 @@ type spoolEntry struct {
 	// spool predicates require it, so a host-authored envelope that merely
 	// resembles a fact — the reserved-looking name + sfk1_-shaped
 	// assignment_key — is never withdrawn, class-condemned, or withheld.
-	internalFact bool
+	internalFact     bool
+	application      bool
+	applicationID    string
+	applicationExtra bool
 }
 
 // spoolEntryExpired uses local intake and ambiguous-attempt clocks only.
@@ -1185,7 +1195,7 @@ func parseSpoolDocument(data []byte) spoolDocument {
 			ordered = append(ordered, spoolRecord{drop: wire.Drop})
 			continue
 		}
-		if len(wire.Raw) == 0 {
+		if len(wire.Raw) == 0 && len(wire.Application) == 0 {
 			continue
 		}
 		// ⚠ AN ID-LESS RECORD IS KEPT, NOT DROPPED HERE. A syntactically valid
@@ -1256,9 +1266,17 @@ func (doc spoolDocument) live() []spoolEntry {
 }
 
 func spoolEntryFromWire(wire spoolEventWire) spoolEntry {
+	if len(wire.Application) != 0 {
+		entry := spoolEntry{raw: wire.Application, internalFact: wire.InternalFact, application: true, delivery: deliveryFromRecord(wire.IntakeUnixMS, wire.AmbiguousUnixMS)}
+		emptyRaw := len(wire.Raw) == 0 || bytes.Equal(bytes.TrimSpace(wire.Raw), []byte("null"))
+		if app := parseStoredApplication(wire.Application); app != nil && emptyRaw && wire.InternalFact {
+			entry.id = app.id()
+		}
+		return entry
+	}
 	var envelope spoolEnvelopeWire
 	_ = json.Unmarshal(wire.Raw, &envelope)
-	return spoolEntry{id: envelope.EventID, raw: wire.Raw, internalFact: wire.InternalFact, delivery: deliveryFromRecord(wire.IntakeUnixMS, wire.AmbiguousUnixMS)}
+	return spoolEntry{id: envelope.EventID, raw: wire.Raw, internalFact: wire.InternalFact, delivery: deliveryFromRecord(wire.IntakeUnixMS, wire.AmbiguousUnixMS), applicationID: wire.ApplicationID, applicationExtra: wire.ApplicationExtra}
 }
 
 // readLimitLocked bounds what the loader will read.
@@ -1390,10 +1408,13 @@ func (s *diskSpool) load(now time.Time) spoolLoadOutcome {
 		// withdrawnOwedIDs).
 		s.withdrawnOwedIDs = withdrawnIDs
 	}
+	replacedApplications := sealedApplicationReplacements(record.Events)
 	for _, wire := range record.Events {
-		var envelope spoolEnvelopeWire
-		_ = json.Unmarshal(wire.Raw, &envelope)
-		entry := spoolEntry{id: envelope.EventID, raw: wire.Raw, internalFact: wire.InternalFact, delivery: deliveryFromRecord(wire.IntakeUnixMS, wire.AmbiguousUnixMS)}
+		entry := spoolEntryFromWire(wire)
+		if entry.application && replacedApplications[entry.id] {
+			s.recordSettledLocked(entry.id)
+			continue
+		}
 		if _, isWithdrawn := withdrawnIDs[entry.id]; isWithdrawn {
 			// A previous process withdrew this envelope (the real-subjects
 			// sentinel) but exited before the clean rewrite landed: honor
@@ -1441,7 +1462,12 @@ func (s *diskSpool) load(now time.Time) spoolLoadOutcome {
 	// clamp — would defer fresh work for a record that no longer exists. The
 	// stale deadline is dropped along with the empty record (retryAfterUntilMS
 	// stays zero, and the rewrite below persists that).
-	if len(s.entries) > 0 && record.RetryAfterUntilMS > now.UnixMilli() {
+	for _, entry := range s.entries {
+		if !entry.application {
+			s.resend = append(s.resend, entry)
+		}
+	}
+	if len(s.resend) > 0 && record.RetryAfterUntilMS > now.UnixMilli() {
 		remaining := time.Duration(record.RetryAfterUntilMS-now.UnixMilli()) * time.Millisecond
 		if remaining > spoolMaxDeferralSeed {
 			remaining = spoolMaxDeferralSeed
@@ -1455,7 +1481,6 @@ func (s *diskSpool) load(now time.Time) spoolLoadOutcome {
 		// longer than one clamp window from this load.
 		s.retryAfterUntilMS = outcome.deferUntil.UnixMilli()
 	}
-	s.resend = append([]spoolEntry(nil), s.entries...)
 	outcome.persistFailed = s.saveLocked() != nil
 	if outcome.persistFailed && len(outcome.evicted) > 0 {
 		// Same deferral as append: the rewrite that would have removed the
@@ -2040,7 +2065,7 @@ func spoolEntriesFromRequest(request batchRequest) []spoolEntry {
 	}
 	entries := make([]spoolEntry, 0, len(request.Events))
 	for i, envelope := range request.Events {
-		entries = append(entries, spoolEntry{id: envelope.EventID, raw: request.rawEvents[i], internalFact: envelope.internalIdentityFact, delivery: envelope.delivery})
+		entries = append(entries, spoolEntry{id: envelope.EventID, raw: request.rawEvents[i], internalFact: envelope.internalIdentityFact, delivery: envelope.delivery, applicationID: envelope.expApplicationID, applicationExtra: envelope.expApplicationExtra})
 	}
 	return entries
 }
@@ -2066,6 +2091,9 @@ func spoolEntryIDs(chunk []spoolEntry) []string {
 func spoolDeadLetterFrom(reason SpoolDropReason, entries []spoolEntry) SpoolDeadLetter {
 	envelopes := make([]json.RawMessage, len(entries))
 	for i, entry := range entries {
+		if entry.application {
+			continue // local state, never an analytics envelope or callback payload
+		}
 		// The callback payload is the integrator's to keep or mutate: it must
 		// never alias the live bytes backing the retained request or the
 		// spool mirror, or a callback that redacts/annotates an envelope
@@ -2181,7 +2209,7 @@ func (c *Client) partitionSpoolEligible(request batchRequest) (eligible, refused
 	for i, envelope := range request.Events {
 		// The request's purge-epoch stamp rides each entry: the sentinel's
 		// spool sweep spares entries born at its own epoch.
-		entry := spoolEntry{id: envelope.EventID, raw: request.rawEvents[i], expFactEpoch: request.expPurgeEpoch, internalFact: envelope.internalIdentityFact, delivery: envelope.delivery}
+		entry := spoolEntry{id: envelope.EventID, raw: request.rawEvents[i], expFactEpoch: request.expPurgeEpoch, internalFact: envelope.internalIdentityFact, delivery: envelope.delivery, applicationID: envelope.expApplicationID, applicationExtra: envelope.expApplicationExtra}
 		if c.spoolActorEligible(envelope) {
 			eligible = append(eligible, entry)
 		} else {
@@ -2803,6 +2831,7 @@ func (c *Client) spoolCloseRemnant(batch []Event) (gateRefused int, mirrored []s
 	boundaryDropped := 0
 	for _, event := range remnant {
 		if event.intakeConsentEpoch < currentConsentEpoch {
+			c.countPointEventConsentDrop(event)
 			boundaryDropped++
 			continue
 		}
@@ -2996,6 +3025,11 @@ func (c *Client) applySpoolConsent(decision ConsentDecision, decidedAt string) (
 		// decision" — fail toward purging — on builds that predate it).
 		s.mu.Lock()
 		s.grantPersisted = false
+		for _, entry := range s.entries {
+			if entry.internalFact && !entry.application {
+				c.countPointApplicationConsentDrop(entry.applicationID, entry.applicationExtra, entry.delivery)
+			}
+		}
 		s.mu.Unlock()
 		// The denied RECORD lands BEFORE the purge destroys anything: with a
 		// durable prior grant on disk, purging first would open a crash

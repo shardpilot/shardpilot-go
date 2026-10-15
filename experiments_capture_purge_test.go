@@ -2,7 +2,6 @@ package shardpilot
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -37,36 +36,26 @@ func TestCaptureGateHoldsUntilDurable(t *testing.T) {
 	}()
 	client.SetConsent(true)
 	parkWorkerWithFullQueue(t, client, capture)
+	failApplicationHandoffStorage(client)
 	fetchAndApply(t, client, expTestScopeKey) // owed exposure (queue full)
+	if client.Snapshot().SpoolPersistFailed == 0 {
+		t.Fatal("the actual sealed handoff must reach its storage failure")
+	}
 
-	// The spool's record rewrite fails: the capture cannot land.
-	client.spool.mu.Lock()
-	client.spool.renameFn = func(oldpath, newpath string) error {
-		if strings.HasSuffix(newpath, spoolFileName) {
-			return errors.New("disk full")
-		}
-		return os.Rename(oldpath, newpath)
-	}
-	client.spool.appendFn = func(path string, payload []byte) error {
-		if strings.HasSuffix(path, spoolFileName) {
-			return errors.New("disk full")
-		}
-		return appendPrivateFile(path, payload)
-	}
-	client.spool.mu.Unlock()
+	// The handoff's disk fault also refuses the drop-time capture.
 	if result, err := client.FetchExperimentAssignment(context.Background(), expTestScopeKey, nil); err != nil || result.Code != "not_found" {
 		t.Fatalf("the kill fetch must land not_found, got %+v err=%v", result, err)
 	}
 
-	// The live sweep drains the owed snapshot into the QUEUE (the ingest
-	// recovers and the flush frees room) — volatile residency only.
+	// Analytics recovers and frees the queue, but the failed durable
+	// handoff still holds the owed snapshot until storage also recovers.
 	capture.setStatus(http.StatusAccepted)
 	if err := client.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
 	client.sweepExperimentExposures(expTestScopeKey)
-	if owed := client.owedExperimentExposureCount(); owed != 0 {
-		t.Fatalf("test setup: the sweep must empty the owed snapshots, got %d", owed)
+	if owed := client.owedExperimentExposureCount(); owed != 1 {
+		t.Fatalf("the failed durable handoff must keep its snapshot owed, got %d", owed)
 	}
 
 	// The retry with the spool still broken must NOT release the gate: the
@@ -76,10 +65,8 @@ func TestCaptureGateHoldsUntilDurable(t *testing.T) {
 		t.Fatalf("the record must keep the entry until the FROZEN capture is durable")
 	}
 
-	// Storage heals: the frozen payload lands (or settles as already
-	// DELIVERED — the live copy was published and acked above, and a
-	// delivered fact outranks a durable-pending one; the spool settles the
-	// same-id entry by design) and the record converges.
+	// Storage heals: the frozen payload lands, and only then can the
+	// retained assignment record converge.
 	client.spool.mu.Lock()
 	client.spool.renameFn = os.Rename
 	client.spool.appendFn = appendPrivateFile

@@ -314,7 +314,7 @@ func (c *Client) applyConsentDecision(decision ConsentDecision, notices ...Conse
 		if gate := c.consentGate.Swap(newConsentGateState()); gate != nil {
 			gate.cancel()
 		}
-		if dropped := c.queue.drainAll(); dropped > 0 {
+		if dropped := c.queue.drainAllVisit(c.countPointEventConsentDrop); dropped > 0 {
 			c.stats.dropped.Add(uint64(dropped))
 		}
 		if c.exp != nil {

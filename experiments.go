@@ -1316,7 +1316,11 @@ type experimentsState struct {
 	// UNDER e.mu by the age refusal, before its durable record delete. Same
 	// locking contract as sentinelSpoolPurgeFn. nil only in bare test
 	// states.
-	ageWithdrawFactsFn func(experimentKey string, factKeys []string)
+	ageWithdrawFactsFn     func(experimentKey string, factKeys []string)
+	persistApplicationFn   func(experimentKey string, record *expOwedExposure) bool
+	retireApplicationFn    func(experimentKey string, record *expOwedExposure)
+	withdrawApplicationsFn func(experimentKey, subject string)
+	applyCursor            string
 
 	// chmodFn is the chmod used when preload establishes the state
 	// directory's privacy (nil never occurs in a constructed state:
@@ -1336,8 +1340,12 @@ func (e *experimentsState) syncDirLocked(dir string) error {
 }
 
 type expOwedExposure struct {
-	entry   *expEntry
-	session string
+	intentDelivery  *eventDelivery
+	intentEvent     *Event
+	handoffComplete bool
+	intentDurable   bool
+	entry           *expEntry
+	session         string
 	// app is the application this record owes: its exposure_id and
 	// applied_at, fixed when the host applied the variant and re-sent
 	// unchanged on every retry and re-arm.
@@ -1402,6 +1410,21 @@ func newExperimentApplicationID() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(id[:]), nil
+}
+
+func (c *Client) mintExperimentApplicationID() (string, error) {
+	if c.cfg.experimentIDMinterForTests != nil {
+		return c.cfg.experimentIDMinterForTests()
+	}
+	return newExperimentApplicationID()
+}
+
+func (c *Client) newExperimentApplication(now time.Time) (expApplication, error) {
+	id, err := c.mintExperimentApplicationID()
+	if err != nil {
+		return expApplication{}, err
+	}
+	return expApplication{exposureID: id, appliedAt: now.UTC().Format(time.RFC3339Nano)}, nil
 }
 
 // expSealedFact is a fact the apply endpoint sealed: its bytes as answered
@@ -2843,6 +2866,9 @@ func (e *experimentsState) applyAgeRefusedApplicationLocked(experimentKey string
 // subject's facts of the experiment (an earlier subject's, kept across a
 // re-mint) cannot be told apart there.
 func (e *experimentsState) withdrawOwedApplicationsLocked(scope, subject, experimentKey string, factKeys []string) {
+	if e.withdrawApplicationsFn != nil {
+		e.withdrawApplicationsFn(experimentKey, subject)
+	}
 	known := make(map[string]bool)
 	addFactKey := func(factKey string) {
 		if factKey != "" {
@@ -3170,11 +3196,17 @@ func (e *experimentsState) armOutcomeLocked(experimentKey string, applied expLas
 func (e *experimentsState) appendOwedLocked(experimentKey string, record *expOwedExposure) {
 	list := append(e.pendingExposure[experimentKey], record)
 	if len(list) > expMaxOwedExposures {
+		if e.retireApplicationFn != nil {
+			e.retireApplicationFn(experimentKey, list[0])
+		}
 		e.countOwedDropLocked(expDropOwedBoundExceeded, list[0])
 		list = list[1:]
 		e.owedExposureOverflow++
 	}
 	e.pendingExposure[experimentKey] = list
+	if e.persistApplicationFn != nil {
+		e.persistApplicationFn(experimentKey, record)
+	}
 }
 
 // The reasons an application is not recorded, as counted in
@@ -3278,6 +3310,9 @@ func (e *experimentsState) onAnalyticsPurge() {
 	owedTuples := make(map[string]bool)
 	for key, list := range e.pendingExposure {
 		for _, owed := range list {
+			if owed.extra && owed.intentDelivery != nil && !owed.intentDelivery.pointConsentReported.CompareAndSwap(false, true) {
+				continue // the queue, worker or durable copy already counted it
+			}
 			if owed.outcome != nil {
 				// An outcome is a point event of the withdrawn period: it
 				// is discarded, never re-armed.
@@ -4575,7 +4610,7 @@ func (c *Client) ApplyExperimentVariant(experimentKey string) (string, map[strin
 	// Once per session needs no check here: the arm skips a tuple already
 	// delivered or owed this session. Only an application that arms becomes
 	// the one an outcome follows.
-	if app, err := newExperimentApplication(now); err == nil {
+	if app, err := c.newExperimentApplication(now); err == nil {
 		if e.armExposureLocked(experimentKey, entry, app, false) {
 			e.lastApplied[experimentKey] = expLastApplication{entry: entry, app: app}
 		}

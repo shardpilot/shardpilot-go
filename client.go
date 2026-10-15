@@ -445,6 +445,9 @@ func NewClient(cfg Config) (*Client, error) {
 		// the ±10% window instead of herding at exactly 300s.
 		client.exp.jitterFn = client.jitterValue
 		client.exp.captureOwedDropFn = client.captureOwedExposuresForDrop
+		client.exp.persistApplicationFn = client.persistExperimentApplication
+		client.exp.retireApplicationFn = client.retireExperimentApplication
+		client.exp.withdrawApplicationsFn = client.withdrawExperimentApplications
 		client.exp.dropFn = client.stats.recordExperimentExposureDrop
 		client.exp.outcomeDropFn = client.stats.recordExperimentOutcomeDrop
 		client.exp.captureRetryFn = client.appendCaptureEntries
@@ -468,6 +471,7 @@ func NewClient(cfg Config) (*Client, error) {
 		}
 		// The spool is loaded (initSpool ran above), so the restored fact-key
 		// history can be pruned to the keys the restored facts still carry.
+		client.restoreExperimentApplications()
 		client.pruneExperimentFactKeys()
 		client.expLaneDone = make(chan struct{})
 		client.expLaneCtx, client.expLaneCancel = context.WithCancel(context.Background())
@@ -1435,6 +1439,9 @@ func (c *Client) dropBatchOnConsentEpoch(batch []Event, seenEpoch *uint64, backo
 	}
 	*seenEpoch = epoch
 	if len(batch) > 0 {
+		for _, event := range batch {
+			c.countPointEventConsentDrop(event)
+		}
 		c.stats.dropped.Add(uint64(len(batch)))
 		batch = batch[:0]
 		*backoffAttempt = 0
@@ -1464,6 +1471,7 @@ func (c *Client) admitReceivedEvent(batch []Event, event Event, seenEpoch *uint6
 	}
 	batch = c.dropBatchOnConsentEpoch(batch, seenEpoch, backoffAttempt)
 	if event.intakeConsentEpoch < *seenEpoch {
+		c.countPointEventConsentDrop(event)
 		c.stats.dropped.Add(1)
 		return batch
 	}
@@ -1918,6 +1926,11 @@ func (c *Client) publishRequest(ctx context.Context, request batchRequest, size 
 // consent flip would purge (and dead-letter) entries the 202 already
 // settled.
 func (c *Client) publishRequestResult(ctx context.Context, request batchRequest, size int) (batchResult, error) {
+	for _, entry := range request.retryEntries {
+		if entry.application {
+			return batchResult{}, errLocalExperimentApplication
+		}
+	}
 	if c.ageHeldRequest(request) {
 		return batchResult{}, errExperimentAgePending
 	}
@@ -1940,6 +1953,7 @@ func (c *Client) publishRequestResult(ctx context.Context, request batchRequest,
 		defer stop()
 	}
 	if c.consentDenied() {
+		c.countPointRequestConsentDrop(request)
 		// Not a transport failure: callers count the batch as Dropped,
 		// matching their own pre-publish denial paths.
 		return batchResult{}, ErrConsentDenied
@@ -1953,6 +1967,7 @@ func (c *Client) publishRequestResult(ctx context.Context, request batchRequest,
 			return batchResult{}, err
 		}
 		if gate != nil && gate.ctx.Err() != nil && errors.Is(err, context.Canceled) {
+			c.countPointRequestConsentDrop(request)
 			// THIS publish's gate was cancelled, so a consent denial aborted
 			// the request mid-flight. Map the cancellation to ErrConsentDenied
 			// regardless of the CURRENT consent state: a quick re-grant can

@@ -124,23 +124,13 @@ func TestCaptureFailureKeepsCacheUntilPairLands(t *testing.T) {
 	}()
 	client.SetConsent(true)
 	parkWorkerWithFullQueue(t, client, capture)
+	failApplicationHandoffStorage(client)
 	fetchAndApply(t, client, expTestScopeKey) // owed exposure (queue full)
+	if client.Snapshot().SpoolPersistFailed == 0 {
+		t.Fatal("the actual sealed handoff must reach its storage failure")
+	}
 
 	// The SPOOL's record rewrite starts failing: the capture cannot land.
-	client.spool.mu.Lock()
-	client.spool.renameFn = func(oldpath, newpath string) error {
-		if strings.HasSuffix(newpath, spoolFileName) {
-			return errors.New("disk full")
-		}
-		return os.Rename(oldpath, newpath)
-	}
-	client.spool.appendFn = func(path string, payload []byte) error {
-		if strings.HasSuffix(path, spoolFileName) {
-			return errors.New("disk full")
-		}
-		return appendPrivateFile(path, payload)
-	}
-	client.spool.mu.Unlock()
 
 	result, err := client.FetchExperimentAssignment(context.Background(), expTestScopeKey, nil)
 	if err != nil || result.Assigned || result.Code != "not_found" {
@@ -158,6 +148,7 @@ func TestCaptureFailureKeepsCacheUntilPairLands(t *testing.T) {
 	// Storage heals: the retry lands the capture, then converges the record.
 	client.spool.mu.Lock()
 	client.spool.renameFn = os.Rename
+	client.spool.appendFn = appendPrivateFile
 	client.spool.mu.Unlock()
 	client.exp.retryDurableSync()
 

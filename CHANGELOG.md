@@ -4,6 +4,15 @@
 
 ### Changed
 
+- The opt-in disk spool now retains the client's unsealed experiment exposure
+  and outcome applications with their original IDs and clocks. Atomic sealing,
+  drop-time capture recovery, current-launch age/consent gates and withdrawal
+  cleanup keep a restart from losing or replaying both forms. Memory-only
+  clients and per-player handles retain their existing durability boundary.
+- Incomplete sealed-fact scope stays retryable; apply budgets rotate across
+  pending experiments. Withdrawn apply answers cannot change newer plane state,
+  queued point-application consent drops count once, and outcome-ID mint
+  failures increment their per-kind diagnostic counter.
 - Restored client-id experiment assignments and sealed facts wait for a fresh
   host age/consent decision on every launch. Offline restored serving no longer
   substitutes for that decision, including after an interrupted fetch or failed
