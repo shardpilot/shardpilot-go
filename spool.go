@@ -2126,17 +2126,28 @@ func (c *Client) notifySpoolDeadLetter(reason SpoolDropReason, entries []spoolEn
 	if len(entries) == 0 {
 		return
 	}
+	if c.exp != nil && (reason == SpoolDropCapacity || reason == SpoolDropExpired) {
+		c.exp.mu.Lock()
+		c.settleApplicationRetentionLocked(reason, entries)
+		c.exp.mu.Unlock()
+	}
 	c.emitSpoolDeadLetters([]SpoolDeadLetter{spoolDeadLetterFrom(reason, entries)})
 }
 
-// recordSpoolExpired counts and dead-letters retry-age expiries.
-func (c *Client) recordSpoolExpired(expired []spoolEntry) int {
+// unreportedSpoolExpired spends the shared receipt before reporting expiry.
+func unreportedSpoolExpired(expired []spoolEntry) []spoolEntry {
 	report := make([]spoolEntry, 0, len(expired))
 	for _, entry := range expired {
 		if entry.delivery == nil || entry.delivery.expiredReported.CompareAndSwap(false, true) {
 			report = append(report, entry)
 		}
 	}
+	return report
+}
+
+// recordSpoolExpired counts and dead-letters retry-age expiries.
+func (c *Client) recordSpoolExpired(expired []spoolEntry) int {
+	report := unreportedSpoolExpired(expired)
 	if len(report) == 0 {
 		return 0
 	}

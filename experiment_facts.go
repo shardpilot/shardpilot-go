@@ -220,8 +220,9 @@ func (c *Client) emitOwedExposure(ctx context.Context, experimentKey string, rec
 		return false, "age_pending", false
 	}
 	if e.persistApplicationFn != nil && !e.persistApplicationFn(experimentKey, record) {
+		terminal := record.withdrawn
 		e.mu.Unlock()
-		return false, "application_unsaved", false
+		return false, "application_unsaved", terminal
 	}
 	// The fact's per-experiment withdrawal stamp, read with the record
 	// still owed under e.mu: a refusal landing after this point withdraws
@@ -1907,13 +1908,15 @@ func (c *Client) appendCaptureEntries(eligible []spoolEntry) bool {
 		c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropConsent, eligible))
 		return true
 	}
-	if len(expired) > 0 {
-		c.stats.spoolExpired.Add(uint64(len(expired)))
-		c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropExpired, expired))
+	c.settleApplicationRetentionLocked(SpoolDropExpired, expired)
+	if report := unreportedSpoolExpired(expired); len(report) > 0 {
+		c.stats.spoolExpired.Add(uint64(len(report)))
+		c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropExpired, report))
 	}
 	if len(added) > 0 && !persistFailed {
 		c.stats.spooled.Add(uint64(len(added)))
 	}
+	c.settleApplicationRetentionLocked(SpoolDropCapacity, evicted)
 	if len(evicted) > 0 {
 		c.stats.spoolEvicted.Add(uint64(len(evicted)))
 		c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropCapacity, evicted))

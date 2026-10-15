@@ -111,6 +111,9 @@ func (c *Client) persistExperimentApplication(key string, record *expOwedExposur
 	if record.intentDelivery == nil {
 		record.intentDelivery = newEventDelivery(c.clock.Now())
 	}
+	if record.withdrawn {
+		return false
+	}
 	if record.handoffComplete {
 		return true
 	}
@@ -133,16 +136,36 @@ func (c *Client) persistExperimentApplication(key string, record *expOwedExposur
 	}
 	entry := spoolEntry{id: a.id(), raw: raw, internalFact: true, application: true, delivery: record.intentDelivery}
 	s := c.spool
-	refused, added, expired, evicted, failed := s.append([]spoolEntry{entry}, 0, false, c.clock.Now(), func() bool {
+	if spoolEntryExpired(entry, c.clock.Now()) {
+		c.settleApplicationRetentionLocked(SpoolDropExpired, []spoolEntry{entry})
+		if report := unreportedSpoolExpired([]spoolEntry{entry}); len(report) > 0 {
+			c.stats.spoolExpired.Add(uint64(len(report)))
+			c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropExpired, report))
+		}
+		return false
+	}
+	refused, added, expired, evicted, failed := s.appendExcept([]spoolEntry{entry}, 0, false, c.clock.Now(), func() bool {
 		return c.consent.Load() == consentStateGranted && s.grantPersisted
+	}, func() map[string]struct{} {
+		// An earlier admission cannot be re-created after another writer
+		// evicts it. The exclusion and append share the spool lock; a
+		// pending disk failure may retry its save, never the application.
+		_, present := s.ids[entry.id]
+		if record.intentAdmitted && !present {
+			return map[string]struct{}{entry.id: {}}
+		}
+		record.intentAdmitted = true
+		return nil
 	})
 	if len(added) > 0 && !failed {
 		c.stats.spooled.Add(uint64(len(added)))
 	}
-	if len(expired) > 0 {
-		c.stats.spoolExpired.Add(uint64(len(expired)))
-		c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropExpired, expired))
+	c.settleApplicationRetentionLocked(SpoolDropExpired, expired)
+	if report := unreportedSpoolExpired(expired); len(report) > 0 {
+		c.stats.spoolExpired.Add(uint64(len(report)))
+		c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropExpired, report))
 	}
+	c.settleApplicationRetentionLocked(SpoolDropCapacity, evicted)
 	if len(evicted) > 0 {
 		c.stats.spoolEvicted.Add(uint64(len(evicted)))
 		c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropCapacity, evicted))
@@ -153,7 +176,11 @@ func (c *Client) persistExperimentApplication(key string, record *expOwedExposur
 	s.mu.Lock()
 	_, present := s.ids[entry.id]
 	retained := present && !s.dirty && !s.owed && !spoolEntryExpired(entry, c.clock.Now())
+	settledAbsence := !refused && !failed && record.intentAdmitted && !present && !s.dirty && !s.owed
 	s.mu.Unlock()
+	if settledAbsence && !record.withdrawn {
+		c.settleApplicationRetentionLocked(SpoolDropCapacity, []spoolEntry{entry})
+	}
 	if !refused && !failed && retained {
 		record.intentDurable = true
 	}
@@ -202,6 +229,10 @@ func (c *Client) withdrawExperimentApplications(key, subject string) {
 }
 
 func (c *Client) removeStoredApplications(matches func(*expStoredApplication) bool) {
+	c.removeStoredApplicationsReporting(matches, true)
+}
+
+func (c *Client) removeStoredApplicationsReporting(matches func(*expStoredApplication) bool, terminalLetter bool) {
 	removed, failed := c.spool.removeMatching(func(raw json.RawMessage) bool {
 		a := parseStoredApplication(raw)
 		return a != nil && matches(a)
@@ -209,7 +240,9 @@ func (c *Client) removeStoredApplications(matches func(*expStoredApplication) bo
 	if failed {
 		c.stats.spoolPersistFailed.Add(1) // under a plane lock: never invoke host logging
 	}
-	c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropTerminal, removed))
+	if terminalLetter {
+		c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropTerminal, removed))
+	}
 }
 
 func (c *Client) applicationDurableAtClose(record *expOwedExposure) bool {
@@ -253,7 +286,7 @@ func (c *Client) restoreExperimentApplications() {
 		if duplicate {
 			continue
 		}
-		owed := &expOwedExposure{entry: &a.Entry, session: a.Session, app: expApplication{a.ExposureID, a.AppliedAt}, extra: a.Extra, intentDelivery: entry.delivery, intentDurable: true}
+		owed := &expOwedExposure{entry: &a.Entry, session: a.Session, app: expApplication{a.ExposureID, a.AppliedAt}, extra: a.Extra, intentDelivery: entry.delivery, intentDurable: true, intentAdmitted: true}
 		if outcome := a.Outcome; outcome != nil {
 			owed.outcome = &expOutcomeRecord{outcome.ID, outcome.OccurredAt, outcome.Key, outcome.Value}
 		}
@@ -268,6 +301,11 @@ func (s *diskSpool) replaceApplication(id string, fact spoolEntry) (bool, error)
 	defer s.mu.Unlock()
 	if s.owed || !s.grantPersisted {
 		return false, nil
+	}
+	if _, present := s.ids[id]; !present {
+		if _, converted := s.ids[fact.id]; !converted {
+			return false, nil // a retention drop cannot become a new sealed admission
+		}
 	}
 	oldEntries, oldResend := append([]spoolEntry(nil), s.entries...), append([]spoolEntry(nil), s.resend...)
 	oldIDs, oldSettled := maps.Clone(s.ids), maps.Clone(s.settledIDs)
@@ -352,6 +390,7 @@ func (c *Client) durablyHandoffApplication(key string, record *expOwedExposure, 
 		c.stats.spoolPersistFailed.Add(1) // under a plane lock: never invoke host logging
 	}
 	if drops := c.spool.takeCapacityDrops(); len(drops) > 0 {
+		c.settleApplicationRetentionLocked(SpoolDropCapacity, drops)
 		c.stats.spoolEvicted.Add(uint64(len(drops)))
 		c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropCapacity, drops))
 	}
@@ -370,6 +409,49 @@ func (c *Client) countPointRequestConsentDrop(request batchRequest) {
 	for _, entry := range entries {
 		if entry.internalFact && !entry.application {
 			c.countPointApplicationConsentDrop(entry.applicationID, entry.applicationExtra, entry.delivery)
+		}
+	}
+}
+
+// Under e.mu, settle the same local application in both retention owners.
+// Ordinary spool writes call this before dispatching their off-lock callback;
+// experiment writes call it directly and defer the callback. No host code runs.
+func (c *Client) settleApplicationRetentionLocked(reason SpoolDropReason, entries []spoolEntry) {
+	if c.exp == nil || (reason != SpoolDropCapacity && reason != SpoolDropExpired) {
+		return
+	}
+	ids := make(map[string]bool)
+	for _, entry := range entries {
+		if entry.application {
+			ids[entry.id] = true
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+	drop := expDropSpoolCapacity
+	if reason == SpoolDropExpired {
+		drop = expDropRetryAgeExpired
+		// append rejects an expired duplicate without removing its older
+		// stored form. Withdraw that source too, without a second letter.
+		c.removeStoredApplicationsReporting(func(a *expStoredApplication) bool { return ids[a.id()] }, false)
+	}
+	for key, list := range c.exp.pendingExposure {
+		kept := list[:0]
+		for _, record := range list {
+			if !record.handoffComplete && ids[applicationID(record)] {
+				if !record.withdrawn {
+					record.withdrawn = true
+					c.exp.countOwedDropLocked(drop, record)
+				}
+				continue
+			}
+			kept = append(kept, record)
+		}
+		if len(kept) == 0 {
+			delete(c.exp.pendingExposure, key)
+		} else {
+			c.exp.pendingExposure[key] = kept
 		}
 	}
 }

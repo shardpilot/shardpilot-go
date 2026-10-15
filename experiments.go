@@ -1344,6 +1344,7 @@ type expOwedExposure struct {
 	intentEvent     *Event
 	handoffComplete bool
 	intentDurable   bool
+	intentAdmitted  bool
 	entry           *expEntry
 	session         string
 	// app is the application this record owes: its exposure_id and
@@ -3221,6 +3222,8 @@ const (
 	expDropUndeliveredAtClose   = "undelivered_at_close"
 	expDropConsentWithdrawn     = "consent_withdrawn"
 	expDropEventTooLarge        = "event_too_large"
+	expDropSpoolCapacity        = "spool_capacity"
+	expDropRetryAgeExpired      = "retry_age_expired"
 	// expDropAgeIneligible: withdrawn by an age_ineligible refusal of the
 	// application's subject (withdrawOwedApplicationsLocked).
 	expDropAgeIneligible = "age_ineligible"
