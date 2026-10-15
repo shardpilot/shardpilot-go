@@ -44,7 +44,7 @@ jobs:
   # workflow.
   secret-scan:
     name: gitleaks
-    runs-on: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/self-hosted-runners') && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     timeout-minutes: 10
 
     steps:
@@ -79,7 +79,7 @@ jobs:
       - name: Scan git history and verify its corpus
         run: python3 scripts/check_secret_scan.py --container .
   go:
-    runs-on: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/self-hosted-runners') && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
       # ⚠ THE MATRIX AXIS IS PART OF THE GROUP. Without it every leg of the
       # matrix shares one group, and `cancel-in-progress` has the legs cancel
       # each other as they start — leaving one runtime tested and the others
@@ -140,7 +140,7 @@ jobs:
   # Formatting is not a compatibility constraint: it has no bearing on what the
   # 1.25 baseline can compile, which is what the matrix is actually for.
   format:
-    runs-on: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/self-hosted-runners') && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     concurrency:
       # ⚠ A LITERAL JOB NAME, NOT `github.job`. That context is not populated
       # when the group is evaluated, so every job sharing an event and a ref
@@ -196,7 +196,7 @@ jobs:
   # version bump can silently switch off is the failure this script exists to
   # refuse; it should not be reintroduced by the way the script is invoked.
   benchmarks:
-    runs-on: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/self-hosted-runners') && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     timeout-minutes: 10
 
     steps:
@@ -283,7 +283,7 @@ jobs:
   # look at the change under review. A gate reporting green while checking nothing
   # is the defect this job exists to prevent, so the gate is compared, not moved.
   gate-integrity:
-    runs-on: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/self-hosted-runners') && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     concurrency:
       group: ${{ github.workflow }}-${{ github.event_name }}-gate-integrity-${{ github.ref }}
       cancel-in-progress: true
@@ -432,7 +432,7 @@ jobs:
           exit 1
 
   release-consistency:
-    runs-on: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/self-hosted-runners') && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     concurrency:
       # ⚠ A LITERAL JOB NAME, NOT `github.job`. That context is not populated
       # when the group is evaluated, so every job sharing an event and a ref
@@ -498,7 +498,7 @@ jobs:
   # Individual controls retain their own timeouts.
   # Current size: this harness is at 63 controls.
   surface-ratchet-controls:
-    runs-on: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/self-hosted-runners') && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     timeout-minutes: 26
 
     steps:
@@ -515,7 +515,7 @@ jobs:
         run: ./scripts/test_surface_ratchet.sh
 
   public-surface:
-    runs-on: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/codex/self-hosted-runners') && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
+    runs-on: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
 
     steps:
