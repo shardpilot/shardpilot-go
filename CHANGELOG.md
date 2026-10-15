@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.10.0 — 2026-10-15 — scoped config retries and terminal closure
+
 - Remote-config retry policy changes from `v0.9.0`: only a positive server
   `Retry-After` on `429`/`5xx` creates a retry window, independently per
   identified or identifier-free request scope. Removes client-wide local
@@ -11,6 +13,7 @@
   304-revalidated), or a new client/session. A success in another consent
   scope does not reopen the closed scope. Retains `408` classification,
   HTTP-date parsing, the 24-hour hint cap and caller cancellation.
+- Updates release pins and the SDK identity header to `go/0.10.0`.
 
 ## v0.9.0 — 2026-10-15 — per-event schema version
 

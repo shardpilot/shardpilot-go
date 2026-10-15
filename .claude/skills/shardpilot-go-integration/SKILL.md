@@ -5,7 +5,7 @@ description: Use when integrating the ShardPilot Go SDK (shardpilot-go) into a G
 
 # Integrating the ShardPilot Go SDK
 
-The install command uses the pinned release tag `v0.9.0` for this source. Install after its release announcement; tagging/publication follow the merged release PR. The Known limitations section below records the source review for this release.
+The install command uses the pinned release tag `v0.10.0` for this source. Install after its release announcement; tagging/publication follow the merged release PR. The Known limitations section below records the source review for this release.
 The release retains compression, the 15-second flush default, independent retry pacing, goroutine-label sanitization and rejection history. Opt-in experiment integrations must follow the [migration from v0.6.4-alpha](../../../CHANGELOG.md#migration-from-v064-alpha): apply the variant before recording outcomes, allow asynchronous platform sealing, and declare the game's age band. Read the [experiment contract](../../../README.md#experiments-dark-opt-in) before enabling it; the default remains off.
 
 **SCOPE: the DEFAULT configuration.** `v0.6.0-alpha` added three opt-ins that
@@ -55,7 +55,7 @@ other calls, no automatic actions.
 ## Install
 
 ```bash
-go get github.com/shardpilot/shardpilot-go@v0.9.0
+go get github.com/shardpilot/shardpilot-go@v0.10.0
 ```
 
 - Requires **Go 1.25+** at the pinned tag.
@@ -424,9 +424,7 @@ speed := client.RemoteConfigNumber("scroll_speed", 1.0)
   configuration), though the cached record survives for later fetches under
   a valid credential. Any other status (`404`, `3xx`, other `4xx`) is a
   permanent error; redirects are not followed on this route.
-- **Pinned `v0.9.0` retry policy:** a `429`/`5xx` hint creates an in-memory
-  cooldown (one-second floor, 24-hour cap), with local jitter otherwise.
-  **Unreleased on `main`:** only a positive `429`/`5xx` server hint creates
+- **Retry policy (`v0.10.0`):** only a positive `429`/`5xx` server hint creates
   a window, separately per consent scope, without local backoff or a floor.
   Both delta-seconds and HTTP-date retain the 24-hour cap. A terminal scope
   remains closed across explicit transient refetches and fenced responses
