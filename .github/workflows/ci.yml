@@ -483,14 +483,14 @@ jobs:
   # equally citable, argues in the wrong direction. A snapshot, not a definition:
   # both factors move, one with the runner and one with this file.
   #
-  # Hosted 57-control jobs on d2b2720 took 872s (push) and 940s (pull request).
-  # Scale the slower job for the six added controls, with a 50% margin for
-  # runner variation: ceil(max(872, 940) * 63 / 57 * 1.5 / 60) = 26 minutes.
+  # Current-head 63-control jobs took 842s (push) and 974s (pull request).
+  # Scale the slower measurement to 70 controls, allow 30s for the separate
+  # selector scenes and a 50% margin: ceil((974 * 70 / 63 + 30) * 1.5 / 60) = 28.
   # Individual controls retain their own timeouts.
-  # Current size: this harness is at 63 controls.
+  # Current size: this harness is at 70 controls.
   surface-ratchet-controls:
     runs-on: ubuntu-latest
-    timeout-minutes: 26
+    timeout-minutes: 28
 
     steps:
       - name: Checkout
@@ -504,6 +504,8 @@ jobs:
       # comparison target is synthesized from HEAD.
       - name: Every surface-check refusal still fires
         run: ./scripts/test_surface_ratchet.sh
+      - name: Comparison-base controls
+        run: python3 scripts/test_public_surface_base.py
 
   public-surface:
     runs-on: ubuntu-latest
@@ -531,47 +533,16 @@ jobs:
       #
       # push to an existing ref: github.event.before is the pre-push tip.
       #
-      # push CREATING a ref: COMPARE AGAINST THE DEFAULT BRANCH.
-      #
-      #   I removed this arm once, arguing "a branch is not a publication" and
-      #   that a new ref reaches main only through the other two arms. THE
-      #   HEADER OF THIS FILE SAYS OTHERWISE, three lines from where I was
-      #   editing: "This repository is PUBLIC: a branch pushed here is readable
-      #   the moment it lands, whether or not a pull request ever opens", and
-      #   tags are "the artifact people install, and one release here was cut
-      #   off-main". Publication is not reaching main. It is being readable.
-      #
-      #   `before` is all zeros here, and the pushed commit's own parent is not a
-      #   baseline either -- on a branch publishing several commits it is itself
-      #   newly published. So the comparison is against the DEFAULT BRANCH: a ref
-      #   that certainly exists, certainly is published, and answers the question
-      #   this arm actually asks -- does this ref expose more internal material
-      #   than what is already public?
-      #
-      #   A branch cut from an older main can fail here after main pays debt. That
-      #   is a false alarm with an obvious remedy (rebase, or regenerate), and it
-      #   is the cheaper error: the alternative was publishing unreviewed material
-      #   with a green tick.
+      # A newly created ref compares with the immutable event commit's first
+      # parent. The default branch is used only for a genuine root commit.
       - name: Fetch the comparison base for the lane B ratchet
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PUSH_BEFORE: ${{ github.event.before }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT_SHA: ${{ github.sha }}
         run: |
-          set -euo pipefail
-          base_sha="$BASE_SHA"
-          before="$PUSH_BEFORE"
-          zero='0000000000000000000000000000000000000000'
-          if [ -n "$base_sha" ]; then
-            git fetch --depth=1 origin "$base_sha"
-            echo "SP_LANE_B_BASE=FETCH_HEAD" >> "$GITHUB_ENV"
-          elif [ -n "$before" ] && [ "$before" != "$zero" ]; then
-            git fetch --depth=1 origin "$before"
-            echo "SP_LANE_B_BASE=FETCH_HEAD" >> "$GITHUB_ENV"
-          else
-            git fetch --depth=1 origin "$DEFAULT_BRANCH"
-            echo "SP_LANE_B_BASE=FETCH_HEAD" >> "$GITHUB_ENV"
-          fi
+          ./scripts/select_public_surface_base.sh
 
       - name: Public surface check
         run: ./scripts/check_public_surface.sh
