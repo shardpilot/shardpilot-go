@@ -87,6 +87,8 @@ func parseStoredApplication(raw json.RawMessage) *expStoredApplication {
 	validated := sanitizeExperimentEntries(map[string]expEntry{a.ExperimentKey: a.Entry})
 	if entry, ok := validated[a.ExperimentKey]; !ok || entry.Served == nil {
 		return nil
+	} else {
+		a.Entry = entry
 	}
 	if outcome := a.Outcome; outcome != nil {
 		occurred, err := time.Parse(time.RFC3339Nano, outcome.OccurredAt)
@@ -119,6 +121,10 @@ func (c *Client) persistExperimentApplication(key string, record *expOwedExposur
 	}
 	if !c.durableExperimentApplicationsAllowed() {
 		return !record.intentDurable // a restored durable intent still needs a writable grant
+	}
+	if !c.exp.ensureSubjectPersistedLocked() {
+		c.stats.spoolPersistFailed.Add(1) // a durable application needs its canonical identity
+		return false
 	}
 	a := expStoredApplication{
 		Scope: c.exp.scopeForLocked(record.entry.SubjectKey), ExperimentKey: key,

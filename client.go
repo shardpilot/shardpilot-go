@@ -1423,6 +1423,22 @@ func (c *Client) jitterValue() float64 {
 	return rand.Float64()
 }
 
+// discardConsentEvents is the accounting boundary for actual consent
+// discards, including exits reached after blocking receipt, spool or publish
+// work. The delivery receipt prevents another owner from counting a point twice.
+func (c *Client) discardConsentEvents(batch []Event, drainQueue bool) {
+	for _, event := range batch {
+		c.countPointEventConsentDrop(event)
+	}
+	dropped := len(batch)
+	if drainQueue {
+		dropped += c.queue.drainAllVisit(c.countPointEventConsentDrop)
+	}
+	if dropped > 0 {
+		c.stats.dropped.Add(uint64(dropped))
+	}
+}
+
 // dropBatchOnConsentEpoch discards the worker-held batch when a consent
 // denial happened since the worker last looked. Events cleared here count
 // as Dropped; events drained from the shared queue are counted by
@@ -1439,10 +1455,7 @@ func (c *Client) dropBatchOnConsentEpoch(batch []Event, seenEpoch *uint64, backo
 	}
 	*seenEpoch = epoch
 	if len(batch) > 0 {
-		for _, event := range batch {
-			c.countPointEventConsentDrop(event)
-		}
-		c.stats.dropped.Add(uint64(len(batch)))
+		c.discardConsentEvents(batch, false)
 		batch = batch[:0]
 		*backoffAttempt = 0
 		// The retained wire bytes described the discarded batch.
@@ -1573,10 +1586,7 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 			return batch, contextCause(ctx)
 		}
 		if c.consentDenied() {
-			dropped := len(batch) + c.queue.drainAll()
-			if dropped > 0 {
-				c.stats.dropped.Add(uint64(dropped))
-			}
+			c.discardConsentEvents(batch, true)
 			// A denial-drained flush discards the pipeline the streak was
 			// tracking along with it — including the retained wire bytes,
 			// which described the discarded batch: kept, they could resend a
@@ -1599,10 +1609,7 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 		// swallowed into firstErr and the flush keeps draining.
 		if err := c.flushSpooledChunks(ctx, backoffAttempt); err != nil {
 			if errors.Is(err, ErrConsentDenied) {
-				dropped := len(batch) + c.queue.drainAll()
-				if dropped > 0 {
-					c.stats.dropped.Add(uint64(dropped))
-				}
+				c.discardConsentEvents(batch, true)
 				*backoffAttempt = 0
 				// The retained wire bytes described the discarded batch.
 				c.retainedRequest = batchRequest{}
@@ -1661,8 +1668,7 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 					// and the publish: drop and drain exactly like the
 					// denied path above, keeping Flush's nil result. The
 					// streak goes with the discarded batch.
-					dropped := len(batch) + c.queue.drainAll()
-					c.stats.dropped.Add(uint64(dropped))
+					c.discardConsentEvents(batch, true)
 					*backoffAttempt = 0
 					c.retainedRequest = batchRequest{}
 					return batch[:0], firstErr
@@ -1763,7 +1769,7 @@ func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, def
 		return batch
 	}
 	if c.consentDenied() {
-		c.stats.dropped.Add(uint64(len(batch)))
+		c.discardConsentEvents(batch, false)
 		// Denial-discard: the streak belonged to the dropped batch.
 		*backoffAttempt = 0
 		c.retainedRequest = batchRequest{}

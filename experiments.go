@@ -1193,8 +1193,10 @@ type experimentsState struct {
 
 	// subjectID is the lazily loaded/minted subject id ("" = none yet);
 	// subjectChecked marks that the persisted value was read once.
-	subjectID      string
-	subjectChecked bool
+	subjectID          string
+	subjectChecked     bool
+	subjectPersisted   bool
+	subjectInitialMint bool
 
 	// memorySubjectID / memoryRecord are the SpoolDir-less fallbacks: the
 	// subject id and the record last only for the process lifetime,
@@ -1683,6 +1685,7 @@ func (e *experimentsState) currentSubjectIDLocked() string {
 		}
 		if validExperimentSubjectID(raw) {
 			e.subjectID = raw
+			e.subjectPersisted = e.subjectFilePath() != ""
 		}
 	}
 	return e.subjectID
@@ -1722,6 +1725,8 @@ func (e *experimentsState) adoptMintedSubjectIDLocked() (subject string, persist
 		return "", false, false
 	}
 	initialMint := e.subjectID == ""
+	e.subjectInitialMint = initialMint
+	defer func() { e.subjectPersisted = persisted }()
 	e.entries = make(map[string]*expEntry)
 	// The rotation retires the scope: the old subject's retained set is
 	// dead weight (scope-missed on disk) and never re-arms under the new
@@ -1771,6 +1776,35 @@ func (e *experimentsState) adoptMintedSubjectIDLocked() (subject string, persist
 	return minted, persisted, ownFile
 }
 
+// ensureSubjectPersistedLocked repairs a failed canonical write without
+// minting another identity. Preserve initial create-only publication and never
+// overwrite a valid different winner while applications still name this subject.
+func (e *experimentsState) ensureSubjectPersistedLocked() bool {
+	if e.subjectPersisted {
+		return true
+	}
+	path, subject := e.subjectFilePath(), e.currentSubjectIDLocked()
+	if path == "" || !validExperimentSubjectID(subject) {
+		return false
+	}
+	if err := e.writeSubjectFileLocked(path, subject, e.subjectInitialMint); err != nil {
+		if !e.subjectInitialMint || !errors.Is(err, os.ErrExist) {
+			return false
+		}
+		stored := e.readSubjectFileLocked()
+		if validExperimentSubjectID(stored) && stored != subject {
+			return false
+		}
+		// The same id may be visible after a failed parent sync. Repeat
+		// the atomic write so a visible file is not mistaken for durability.
+		if e.writeSubjectFileLocked(path, subject, false) != nil {
+			return false
+		}
+	}
+	e.subjectPersisted = true
+	return true
+}
+
 // writeSubjectFileLocked publishes the subject file — create-only (link
 // semantics, EEXIST when another process already published) for the initial
 // mint, replace (rename) otherwise. The chmod hook tightens a pre-existing
@@ -1807,6 +1841,8 @@ func (e *experimentsState) writeSubjectFileLocked(path, minted string, initialMi
 func (e *experimentsState) unadoptFreshMintLocked(ownFile bool) bool {
 	e.subjectID = ""
 	e.memorySubjectID = ""
+	e.subjectPersisted = false
+	e.subjectInitialMint = false
 	removeFailed := false
 	if ownFile {
 		if path := e.subjectFilePath(); path != "" {
@@ -4121,6 +4157,7 @@ func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string
 				// snapshots); durablePending is mutated in place and needs
 				// a copy.
 				priorSubject := e.subjectID
+				priorSubjectPersisted, priorSubjectInitialMint := e.subjectPersisted, e.subjectInitialMint
 				priorMemorySubject := e.memorySubjectID
 				priorEntries := e.entries
 				priorLatchRetained := e.latchRetained
@@ -4149,6 +4186,10 @@ func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string
 				if refusal := c.experimentConsentRefusal(); refusal != nil {
 					removeFailed := e.unadoptFreshMintLocked(ownFile)
 					e.subjectID = priorSubject
+					// A responsible rotation may have replaced then unlinked
+					// the prior file; its old in-memory witness is no longer proof.
+					e.subjectPersisted = priorSubjectPersisted && !ownFile
+					e.subjectInitialMint = priorSubjectInitialMint
 					e.memorySubjectID = priorMemorySubject
 					e.entries = priorEntries
 					e.latchRetained = priorLatchRetained

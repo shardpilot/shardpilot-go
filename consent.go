@@ -314,9 +314,7 @@ func (c *Client) applyConsentDecision(decision ConsentDecision, notices ...Conse
 		if gate := c.consentGate.Swap(newConsentGateState()); gate != nil {
 			gate.cancel()
 		}
-		if dropped := c.queue.drainAllVisit(c.countPointEventConsentDrop); dropped > 0 {
-			c.stats.dropped.Add(uint64(dropped))
-		}
+		c.discardConsentEvents(nil, true)
 		if c.exp != nil {
 			// The drain above discarded any queued-but-unpublished
 			// experiment exposure facts: re-arm this session's emissions so

@@ -11,6 +11,9 @@
   clients and per-player handles retain their existing durability boundary.
   Capacity eviction and retry-age expiry settle a local application's stored and
   owed forms once, with per-kind diagnostics; later sweeps cannot re-admit it.
+  Canonical-subject save failures hold durable admission until the same subject
+  is saved. Cold restoration retains the sanitized entry, and point-application
+  consent diagnostics include worker discards after blocking dispatch.
 - Incomplete sealed-fact scope stays retryable; apply budgets rotate across
   pending experiments. Withdrawn apply answers cannot change newer plane state,
   queued point-application consent drops count once, and outcome-ID mint

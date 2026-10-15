@@ -453,7 +453,8 @@ if !result.Assigned && result.Reason == "age_ineligible" {
   cannot replay both forms. Handoff and restart preserve the original local intake and
   ambiguous-delivery clocks. Storage failures leave work owed and increment
   `SpoolPersistFailed`; the lane holds the apply or analytics handoff until durability is
-  confirmed. The variant-serving result is unchanged.
+  confirmed. Saving the canonical subject is part of that boundary: a failed save
+  retries the same subject before an application can be treated as durable. The variant-serving result is unchanged.
 
   The same count, byte, age and private-file limits apply. Capacity, expiry, terminal and
   consent drops use the existing spool diagnostics. Capacity eviction and expiry are
