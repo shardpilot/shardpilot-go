@@ -1,5 +1,7 @@
 package shardpilot
 
+import "sync/atomic"
+
 // boundedQueue is an in-memory, bounded event buffer. It is memory-only by
 // default: events still buffered when the process exits are lost — unless
 // the opt-in bounded disk spool (Config.SpoolDir; see spool.go) is
@@ -8,6 +10,9 @@ package shardpilot
 // delivered before they age out.
 type boundedQueue struct {
 	ch chan Event
+	// Highest experiment sequence discarded without passing the worker.
+	// Competing destructive drains may observe their removals out of order.
+	drainedFactSeq atomic.Uint64
 }
 
 func newBoundedQueue(size int) *boundedQueue {
@@ -27,7 +32,12 @@ func (q *boundedQueue) drainAll() int {
 	count := 0
 	for {
 		select {
-		case <-q.ch:
+		case event := <-q.ch:
+			for seen := q.drainedFactSeq.Load(); event.expFactSeq > seen; seen = q.drainedFactSeq.Load() {
+				if q.drainedFactSeq.CompareAndSwap(seen, event.expFactSeq) {
+					break
+				}
+			}
 			count++
 		default:
 			return count
