@@ -1,26 +1,13 @@
 # gitleaks configuration for shardpilot-go.
 #
-# ⚠ NO `paths` CLAUSE ANYWHERE IN THIS FILE, AND THAT IS THE WHOLE DESIGN.
-# Measured against gitleaks v8.30.1 by planting a realistic AWS key into an
-# allowlisted file:
+# Credential-shaped examples are allowed by their exact anchored value, not
+# by their containing file. Keep other rules scanning the same files. A path
+# condition is not a blanket exemption for every rule: its scope depends on
+# the allowlist condition and targetRules. The separate synthetic UUID pattern
+# below describes identifiers, which authenticate nothing.
 #
-#   allowlist with `paths` + `regexes`, condition = "AND"   -> planted key MISSED
-#   allowlist with `regexes` only                            -> planted key CAUGHT
-#
-# `condition = "AND"` does not narrow it: a `paths` entry excuses the whole
-# file regardless, so every allowlisted path becomes a place a real secret can
-# be committed unseen. Since the files needing exceptions here are TEST files —
-# exactly where a careless credential is most likely to be pasted — that is the
-# worst possible blind spot.
-#
-# So exceptions name the LITERAL and nothing else. Wider in one direction (the
-# literal is excused wherever it appears) and far narrower in the one that
-# matters (no file stops being scanned).
-#
-# ⚠ AND THE PROBE MATTERS. The first attempt planted `AKIAIOSFODNN7EXAMPLE`,
-# AWS's canonical documentation key, which gitleaks allowlists by default — it
-# reported MISSED under every configuration and would have condemned the
-# correct one. Mutation-test with a key that is not already excused upstream.
+# Test a credential-shaped fixture against defaults first: a fixture already
+# excused upstream cannot establish that this configuration detects it.
 [extend]
 useDefault = true
 
@@ -35,6 +22,6 @@ pseudonymous actor key, not a credential — it authenticates nothing — and bo
 are visibly synthetic (the second ends in twelve f's).
 """
 regexes = [
-  '''header\.eyJzdWIiOiJ0ZXN0In0\.signature''',
+  '''^header\.eyJzdWIiOiJ0ZXN0In0\.signature$''',
   '''0198f2c1-4b3a-7c2d-8e9f-[0-9a-f]{12}''',
 ]
