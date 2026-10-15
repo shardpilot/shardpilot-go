@@ -483,16 +483,14 @@ jobs:
   # equally citable, argues in the wrong direction. A snapshot, not a definition:
   # both factors move, one with the runner and one with this file.
   #
-  # What the bound means in the unit that actually grows: at the slow end of the
-  # bands recorded here (14.9s), fifteen minutes is reached at about SIXTY
-  # controls. Plan against sixty: this harness is at 35 controls.
-  # Sharing public-surface's five-minute budget would have put it past half of that
-  # on day one, and the failure mode of outgrowing a timeout is a cancelled job
-  # that reads like an outage rather than like a check that got too expensive.
-  # Separate clock, stated size.
+  # Hosted 57-control jobs on d2b2720 took 872s (push) and 940s (pull request).
+  # Scale the slower job for the six added controls, with a 50% margin for
+  # runner variation: ceil(max(872, 940) * 63 / 57 * 1.5 / 60) = 26 minutes.
+  # Individual controls retain their own timeouts.
+  # Current size: this harness is at 63 controls.
   surface-ratchet-controls:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 26
 
     steps:
       - name: Checkout

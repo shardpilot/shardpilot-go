@@ -66,6 +66,28 @@ Workflow trust and exception-review policy remain tracked separately in
 [#97](https://github.com/shardpilot/shardpilot-go/issues/97) and
 [#102](https://github.com/shardpilot/shardpilot-go/issues/102).
 
+## Publication shape controls
+
+`scripts/check_public_surface.sh` reads staged files. Flag-shaped identifiers
+with inline markers inside their prefix or required suffix are refused from
+their raw spelling in filenames, staged symlink targets and file contents:
+deleting markers can also delete their required underscores. The link check
+reads its Git blob without following the target.
+The existing raw and marker-free matching streams remain in place. Undecorated
+identifiers remain subject to the usual publication rules.
+
+Occurrence counting retains the original line-and-match bucket. Matched control
+bytes cannot truncate that identity. Distinct matches are summed, while repeated
+identical matches use the largest multiplicity reported by a matching family.
+
+Run `scripts/test_surface_ratchet.sh` from a clean committed checkout. It clones
+that commit and exercises staged repository fixtures, including every inline
+marker in each required flag suffix, prefix decoration, ordinary wrappers, a
+failed spelling readers for each surface, distinct control-byte matches and
+repeated matches. Plain flag filenames and symlink targets remain detectable.
+The baseline-writing scenes require GNU `mktemp` and GNU `mv` with `-T` support;
+the Linux CI job provides them.
+
 ## Bad versions
 
 Never delete or move a published tag — Go module proxies cache tagged
