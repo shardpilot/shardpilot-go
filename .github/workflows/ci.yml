@@ -483,16 +483,14 @@ jobs:
   # equally citable, argues in the wrong direction. A snapshot, not a definition:
   # both factors move, one with the runner and one with this file.
   #
-  # What the bound means in the unit that actually grows: at the slow end of the
-  # bands recorded here (14.9s), fifteen minutes is reached at about SIXTY
-  # controls. Plan against sixty: this harness is at 35 controls.
-  # Sharing public-surface's five-minute budget would have put it past half of that
-  # on day one, and the failure mode of outgrowing a timeout is a cancelled job
-  # that reads like an outage rather than like a check that got too expensive.
-  # Separate clock, stated size.
+  # A local unprivileged Linux run executed all 57 controls in 1282.535s.
+  # That run's only failure was the count comment, corrected here. Allocate
+  # ceil(1282.535 * 1.5 / 60) = 33 minutes for the battery and runner
+  # variation. Replace this local estimate with hosted measurements if shorter.
+  # Current size: this harness is at 57 controls.
   surface-ratchet-controls:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 33
 
     steps:
       - name: Checkout

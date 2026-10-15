@@ -1083,6 +1083,71 @@ expect_nostage "an index-only symlink refuses" 2 "is a symlink in the index"
 git update-index --add --cacheinfo "100644,$(git hash-object -w "$BASELINE"),$BASELINE"
 restore
 
+# Raw spelling checks cover every marker and each required flag suffix. Build
+# the synthetic identifier in pieces so these controls publish no flag literal.
+harness_flag_prefix='EXAMPLE_'"SYNTHETIC_"'FLAG_'
+for harness_flag_suffix in ENABLED DISABLED MODE; do
+  case "$harness_flag_suffix" in
+    ENABLED) harness_flag_left=ENA; harness_flag_right=BLED ;;
+    DISABLED) harness_flag_left=DISA; harness_flag_right=BLED ;;
+    MODE) harness_flag_left=MO; harness_flag_right=DE ;;
+  esac
+  for harness_flag_marker in '*' '_' '`' '~' '\'; do
+    printf '\n// %s%s%s%s\n' "$harness_flag_prefix" "$harness_flag_left" \
+      "$harness_flag_marker" "$harness_flag_right" >> config.go
+    expect "a $harness_flag_marker inside $harness_flag_suffix refuses" \
+      2 "contains a decorated flag spelling"
+    restore
+  done
+done
+printf '\n// EXAM**PLE_%sMODE\n' "${harness_flag_prefix#EXAMPLE_}" >> config.go
+expect "a marker inside the flag prefix refuses" 2 "contains a decorated flag spelling"
+restore
+printf '\n// %s**MODE\n' "$harness_flag_prefix" >> config.go
+expect "a marker before the flag suffix refuses" 2 "contains a decorated flag spelling"
+restore
+printf '\n// %sMODE then %sM_*O`D~E\n' "$harness_flag_prefix" "$harness_flag_prefix" >> config.go
+expect "a later decorated flag on the same line refuses" 2 "contains a decorated flag spelling"
+restore
+printf '\n// **SHARDPILOT_INGEST_URL** and _EXAMPLE_MODE_ and `LATENCY`.\n' >> config.go
+expect "ordinary wrappers and shorter names remain readable" 0 "LANE B RATCHET — held at"
+restore
+
+# A failed spelling reader must not be treated as an empty set of spellings.
+# Target the subject blob, so the instrument cannot fail a setup self-test.
+printf '\n// exampleFlagReaderProbe\n' >> config.go
+STUB="$(mktemp -d)"
+REAL_AWK="$(command -v awk)"
+REAL_GREP="$(command -v grep)"
+{
+  echo '#!/bin/sh'
+  echo 'reader=no; last=';
+  echo 'for arg do'
+  echo '  case "$arg" in *'"'"'candidate = ENVIRON["FLAG_CANDIDATE"]'"'"'*) reader=yes ;; esac'
+  echo '  last=$arg'
+  echo 'done'
+  printf 'if [ "$reader" = yes ] && %q -qF exampleFlagReaderProbe "$last"; then exit 2; fi\n' "$REAL_GREP"
+  printf 'exec %q "$@"\n' "$REAL_AWK"
+} > "$STUB/awk"
+chmod +x "$STUB/awk"
+expect_env "a failed flag spelling reader refuses" \
+  "PATH=$STUB:$PATH" 2 "could not check flag spellings"
+rm -f "$STUB/awk"
+rmdir "$STUB"
+STUB=""
+restore
+
+# Byte 0x1c belongs to matched text too; two distinct matches must keep two
+# buckets. Repeats of one match still take a maximum across matching families.
+printf '// x isn\034At tested y isn\034Bt covered z\npackage example\n' > "$NEW_FILE"
+printf '\n2 %s\n' "$NEW_FILE" >> "$BASELINE"
+expect "distinct control-byte matches retain separate buckets" 0 "LANE B RATCHET — held at"
+restore
+printf '// x isn\034At tested y isn\034At tested z\npackage example\n' > "$NEW_FILE"
+printf '\n2 %s\n' "$NEW_FILE" >> "$BASELINE"
+expect "identical control-byte matches retain multiplicity" 0 "LANE B RATCHET — held at"
+restore
+
 # ⚠ FIFTEEN CONTROLS USED TO STAND HERE, and they are gone because their
 # SUBJECT is gone -- not because coverage was traded away. Every one drove a
 # refusal that existed to defend LANE_B_BASELINE as an override: an out-of-tree
@@ -1267,7 +1332,7 @@ rm -rf "$lane_b_symreal"
 # read it -- and then the control below read it and got an empty string, because
 # a variable defined after its reader is not a variable. Still exactly one
 # literal in the file; only its position moved.
-EXPECTED_CHECKS=35
+EXPECTED_CHECKS=57
 
 # ⚠ THE WORKFLOW'S STATED SIZE IS GATED, BECAUSE CORRECTING IT BY HAND HAS NOW
 # FAILED THREE TIMES. That comment carries a planning threshold -- how many
