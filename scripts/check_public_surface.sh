@@ -524,6 +524,23 @@ decorated_flag_hits() {
     }' "$1"
 }
 
+check_decorated_spelling() {
+  local input_file="$1" label="$2" spelling_hits
+  if ! spelling_hits="$(decorated_flag_hits "$input_file")"; then
+    # refusal:structural
+    echo "REFUSING: could not check flag spellings in $label." >&2
+    exit 2
+  fi
+  if [ -n "$spelling_hits" ]; then
+    # refusal:hazard
+    echo "REFUSING: $label contains a decorated flag spelling." >&2
+    echo "  Write flag identifiers without inline markers inside them." >&2
+    echo "  Marker deletion can erase their required underscores as well." >&2
+    exit 2
+  fi
+  return 0
+}
+
 # ⚠ EVERY ASSIGNMENT IN THE BLOCK MUST BE ENUMERATED. The audits downstream
 # read the DECODED values, and they reach them through the name list — so an
 # assignment added to the block and forgotten in the list is decoded by nothing
@@ -1054,6 +1071,7 @@ scan_tree() {
     # of a record id was scanned raw and passed, while the identical string in
     # the body was reported — one criterion, two answers, depending on where
     # the bytes sat.
+    check_decorated_spelling - "path '$f'" <<< "$f"
     f_stripped="$(printf '%s' "$f" | tr -d '*_`~\\')"
     if printf '%s\n' "$f" | grep -qE -- "$PATTERNS" \
        || printf '%s\n' "$f_stripped" | grep -qE -- "$PATTERNS" \
@@ -1124,6 +1142,7 @@ scan_tree() {
     fi
     scan_files=$((scan_files + 1))
     if [ "$mode" = 120000 ]; then
+      check_decorated_spelling "$blob" "symlink target of '$f'"
       link="$(cat "$blob")"
       # ⚠ AND THE MARKER-FREE FORM, like a path and like a body. This branch
       # returns before the content pass, so it was the one place the criterion
@@ -1550,20 +1569,7 @@ scan_tree() {
       echo "  what a source viewer shows." >&2
       exit 2
     fi
-    flag_hits="$(decorated_flag_hits "$scan_src")"
-    flag_status=$?
-    if [ "$flag_status" -ne 0 ]; then
-      # refusal:structural
-      echo "REFUSING: could not check flag spellings in '$f'." >&2
-      exit 2
-    fi
-    if [ -n "$flag_hits" ]; then
-      # refusal:hazard
-      echo "REFUSING: '$f' contains a decorated flag spelling." >&2
-      echo "  Write flag identifiers without inline markers inside them." >&2
-      echo "  Marker deletion can erase their required underscores as well." >&2
-      exit 2
-    fi
+    check_decorated_spelling "$scan_src" "file '$f'"
     # Raw and marker-free readings complement each other. Neither covers a
     # marker splitting a required suffix when deletion also erases the shape's
     # literal separators; the raw spelling refusal above handles that case.

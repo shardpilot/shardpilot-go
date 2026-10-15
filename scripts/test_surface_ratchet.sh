@@ -1137,6 +1137,70 @@ rmdir "$STUB"
 STUB=""
 restore
 
+# Paths and symlink targets are published bytes too. The target is deliberately
+# absent: the gate must read the staged link blob without following the link.
+harness_saved_new_file="$NEW_FILE"
+NEW_FILE="${harness_flag_prefix}MODE.txt"
+printf 'ordinary content\n' > "$NEW_FILE"
+expect "an undecorated flag filename is reported" 1 ":path:"
+restore
+NEW_FILE="${harness_flag_prefix}MO_DE.txt"
+printf 'ordinary content\n' > "$NEW_FILE"
+expect "a decorated flag filename refuses" 2 "path '$NEW_FILE' contains a decorated flag spelling"
+restore
+NEW_FILE="$harness_saved_new_file"
+ln -s "${harness_flag_prefix}MODE.txt" "$NEW_FILE"
+expect "an undecorated flag symlink target is reported" 1 ":link:"
+restore
+ln -s "${harness_flag_prefix}MO_DE.txt" "$NEW_FILE"
+expect "a decorated flag symlink target refuses" 2 "symlink target of '$NEW_FILE' contains a decorated flag spelling"
+restore
+
+# Inject reader failures at each new surface, independently of content reads.
+# A pathname uses stdin; a link uses its staged blob. Keep the link sentinel
+# split here so the stub cannot fail while reading this harness's own content.
+for harness_reader_surface in path link; do
+  if [ "$harness_reader_surface" = path ]; then
+    NEW_FILE=examplePathReaderProbe.md
+    printf 'ordinary content\n' > "$NEW_FILE"
+    harness_reader_marker=examplePathReaderProbe
+    harness_reader_label="path '$NEW_FILE'"
+  else
+    NEW_FILE="$harness_saved_new_file"
+    harness_reader_marker='exampleLink'"ReaderProbe"
+    ln -s "$harness_reader_marker" "$NEW_FILE"
+    harness_reader_label="symlink target of '$NEW_FILE'"
+  fi
+  STUB="$(mktemp -d)"
+  {
+    echo '#!/bin/sh'
+    echo 'reader=no; last='
+    echo 'for arg do'
+    echo '  case "$arg" in *'"'"'candidate = ENVIRON["FLAG_CANDIDATE"]'"'"'*) reader=yes ;; esac'
+    echo '  last=$arg'
+    echo 'done'
+    if [ "$harness_reader_surface" = path ]; then
+      printf 'if [ "$reader" = yes ] && [ "$last" = - ]; then\n'
+      echo '  input=$(cat)'
+      printf '  case "$input" in *%s*) exit 2 ;; esac\n' "$harness_reader_marker"
+      printf '  printf "%%s\\n" "$input" | %q "$@"\n' "$REAL_AWK"
+      echo '  exit $?'
+      echo 'fi'
+    else
+      printf 'if [ "$reader" = yes ] && [ "$last" != - ] && %q -qF %q "$last"; then exit 2; fi\n' "$REAL_GREP" "$harness_reader_marker"
+    fi
+    printf 'exec %q "$@"\n' "$REAL_AWK"
+  } > "$STUB/awk"
+  chmod +x "$STUB/awk"
+  expect_env "a failed $harness_reader_surface spelling reader refuses" \
+    "PATH=$STUB:$PATH" 2 "could not check flag spellings in $harness_reader_label"
+  rm -f "$STUB/awk"
+  rmdir "$STUB"
+  STUB=""
+  restore
+done
+NEW_FILE="$harness_saved_new_file"
+
 # Byte 0x1c belongs to matched text too; two distinct matches must keep two
 # buckets. Repeats of one match still take a maximum across matching families.
 printf '// x isn\034At tested y isn\034Bt covered z\npackage example\n' > "$NEW_FILE"
@@ -1332,7 +1396,7 @@ rm -rf "$lane_b_symreal"
 # read it -- and then the control below read it and got an empty string, because
 # a variable defined after its reader is not a variable. Still exactly one
 # literal in the file; only its position moved.
-EXPECTED_CHECKS=57
+EXPECTED_CHECKS=63
 
 # ⚠ THE WORKFLOW'S STATED SIZE IS GATED, BECAUSE CORRECTING IT BY HAND HAS NOW
 # FAILED THREE TIMES. That comment carries a planning threshold -- how many

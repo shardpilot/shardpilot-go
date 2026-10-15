@@ -484,13 +484,13 @@ jobs:
   # both factors move, one with the runner and one with this file.
   #
   # Hosted 57-control jobs on d2b2720 took 872s (push) and 940s (pull request).
-  # Use the slower job and a 50% margin for runner variation. Allocate
-  # ceil(max(872, 940) * 1.5 / 60) = 24 minutes for the complete battery.
+  # Scale the slower job for the six added controls, with a 50% margin for
+  # runner variation: ceil(max(872, 940) * 63 / 57 * 1.5 / 60) = 26 minutes.
   # Individual controls retain their own timeouts.
-  # Current size: this harness is at 57 controls.
+  # Current size: this harness is at 63 controls.
   surface-ratchet-controls:
     runs-on: ubuntu-latest
-    timeout-minutes: 24
+    timeout-minutes: 26
 
     steps:
       - name: Checkout
