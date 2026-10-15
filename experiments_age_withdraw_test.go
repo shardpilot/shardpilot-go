@@ -521,6 +521,12 @@ func TestAnAgeRefusalLeavesNoDurableCopyToReplay(t *testing.T) {
 				cancel()
 				rig.capture.setStatus(http.StatusAccepted)
 				relaunched := rig.launch(t, stage.config)
+				if reason == "kill_switch" {
+					answer, err := relaunched.FetchExperimentAssignmentWithAgeBand(context.Background(), ageGoldenExperiment, ExperimentAgeBandUnderThreshold, nil)
+					if err != nil || answer.Reason != "kill_switch" {
+						t.Fatalf("fresh host decision: %+v %v", answer, err)
+					}
+				}
 				flushOrFail(t, relaunched)
 				delivered := deliveredExperimentFacts(rig.capture, ageGoldenExperiment)
 				if reason == "age_ineligible" && len(delivered) != 0 {
@@ -555,9 +561,13 @@ func TestAnAgeRefusalWithholdsAPulledSpoolChunk(t *testing.T) {
 	// the refusal lands while the resend chunk is pulled but not yet sent.
 	rig.capture.setStatus(http.StatusAccepted)
 	relaunched := rig.launch(t, nil)
-	if variant := relaunched.ExperimentVariant(ageGoldenExperiment); variant != "control" {
-		t.Fatalf("setup: the relaunch must restore the declared assignment, got %q", variant)
+	if variant := relaunched.ExperimentVariant(ageGoldenExperiment); variant != "" {
+		t.Fatalf("restored state served before a current decision: %q", variant)
 	}
+	rig.script.mu.Lock()
+	rig.script.responses = append([]expScriptResponse{{status: http.StatusOK, body: ageGolden(t, "adult")}}, rig.script.responses...)
+	rig.script.mu.Unlock()
+	fetchAdultAssignment(t, relaunched, ageGoldenExperiment)
 	var refused atomic.Bool
 	var refusalErr error
 	relaunched.spoolResendHandoffSeam = func(chunk []spoolEntry) {
@@ -1384,7 +1394,16 @@ func TestAKeyWhoseEntryNeverLandedIsRetiredByTheDrop(t *testing.T) {
 	rig.client.exp.failDurableWritesForTests = true
 	rig.client.exp.mu.Unlock()
 	fetchAdultAssignment(t, rig.client, ageGoldenExperiment)
-	rig.sealAndSpool(t, 2)
+	rig.applyAndMeasure(t, ageGoldenExperiment)
+	rig.capture.setStatus(http.StatusInternalServerError)
+	rig.client.experimentCycle(context.Background())
+	_ = rig.client.Flush(context.Background())
+	if got := spooledExperimentFacts(rig.client, ageGoldenExperiment); got != 0 {
+		t.Fatalf("unsaved key facts were spooled: %d", got)
+	}
+	if got := rig.client.owedExperimentExposureCount(); got != 2 {
+		t.Fatalf("unsaved key must retain both applications: %d", got)
+	}
 	if durableRecordHolds(t, spool, ageGoldenExperiment) {
 		t.Fatalf("setup: the entry's write must not land")
 	}
@@ -1398,6 +1417,11 @@ func TestAKeyWhoseEntryNeverLandedIsRetiredByTheDrop(t *testing.T) {
 		t.Errorf("the drop took the key out of the entries, yet the persisted history lacks it: %v", disk)
 	}
 
+	rig.client.experimentCycle(context.Background())
+	_ = rig.client.Flush(context.Background())
+	if got := spooledExperimentFacts(rig.client, ageGoldenExperiment); got != 2 {
+		t.Fatalf("durable history must admit the two facts: %d", got)
+	}
 	rig.relaunch(t, http.StatusServiceUnavailable)
 	rig.refuse(t, "age_ineligible")
 	left := spooledExperimentFacts(rig.client, ageGoldenExperiment)
@@ -1425,8 +1449,14 @@ func TestARestoredKeyIsRetiredWhenTheRecordReadsEmpty(t *testing.T) {
 	fetchAdultAssignment(t, rig.client, ageGoldenExperiment)
 	rig.sealAndSpool(t, 2)
 	rig.relaunch(t, http.StatusServiceUnavailable)
-	if variant := rig.client.ExperimentVariant(ageGoldenExperiment); variant != "control" {
-		t.Fatalf("setup: the relaunch must restore version 1's entry, got %q", variant)
+	rig.client.exp.mu.Lock()
+	restored := rig.client.exp.entries[ageGoldenExperiment]
+	rig.client.exp.mu.Unlock()
+	if restored == nil || restored.Version != 1 {
+		t.Fatalf("version 1 must load as quarantined state: %+v", restored)
+	}
+	if rig.client.ExperimentVariant(ageGoldenExperiment) != "" {
+		t.Fatal("restored state must not serve before a new decision")
 	}
 	if err := os.WriteFile(filepath.Join(spool, expCacheFileName), []byte("{"), 0o600); err != nil {
 		t.Fatalf("setup: %v", err)
@@ -1486,12 +1516,14 @@ func TestARecordWithoutAFactKeyHistoryLoads(t *testing.T) {
 	rig.client = rig.launch(t, nil)
 	rig.client.SetConsent(true)
 
-	if variant := rig.client.ExperimentVariant(ageGoldenExperiment); variant != "control" || script.requestCount() != 0 {
-		t.Fatalf("the record must restore its assignment without a fetch: served %q after %d fetch(es)", variant, script.requestCount())
+	if variant := rig.client.ExperimentVariant(ageGoldenExperiment); variant != "" || script.requestCount() != 0 {
+		t.Fatalf("the optional history must not bypass startup quarantine: served %q after %d fetch(es)", variant, script.requestCount())
 	}
 	if held := factKeyHistoryInMemory(rig.client, ageGoldenExperiment); len(held) != 0 {
 		t.Errorf("a record without the section must load an empty history, got %v", held)
 	}
+	script.push(http.StatusOK, ageGolden(t, "adult"))
+	fetchAdultAssignment(t, rig.client, ageGoldenExperiment)
 	rig.client.ApplyExperimentVariant(ageGoldenExperiment)
 	rig.client.experimentCycle(context.Background())
 	flushOrFail(t, rig.client)

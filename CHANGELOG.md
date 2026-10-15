@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Changed
+
+- Restored client-id experiment assignments and sealed facts wait for a fresh
+  host age/consent decision on every launch. Offline restored serving no longer
+  substitutes for that decision, including after an interrupted fetch or failed
+  state write. Pending non-adult fetches quarantine their facts; ordinary
+  analytics and synthetic assignments remain available.
+- Host age declarations reserve fetch order at the call boundary. Plane-wide
+  authorization refusals bypass per-experiment response fences, and a fact key
+  must reach durable state before its fact enters the analytics pipeline.
+
 ## v0.10.0 — 2026-10-15 — scoped config retries and terminal closure
 
 - Remote-config retry policy changes from `v0.9.0`: only a positive server

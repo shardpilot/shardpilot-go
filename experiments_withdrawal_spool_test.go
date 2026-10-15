@@ -359,6 +359,9 @@ func TestDroppedEntryOwedExposureSurvivesProcessDeath(t *testing.T) {
 	capture.setStatus(http.StatusAccepted)
 	client2 := newExperimentClient(t, server.URL, func(cfg *Config) { cfg.SpoolDir = spoolDir })
 	defer client2.Close(context.Background())
+	if _, err := client2.FetchExperimentAssignmentWithAgeBand(context.Background(), expTestScopeKey, ExperimentAgeBandAdult, nil); err != nil {
+		t.Fatal(err)
+	}
 	if err := client2.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}

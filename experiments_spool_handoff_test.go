@@ -404,8 +404,14 @@ func TestPreloadEstablishesSpoolDirPrivacy(t *testing.T) {
 		if perm := info.Mode().Perm(); perm != 0o700 {
 			t.Fatalf("the preload read persisted experiment state without establishing the directory's privacy first (dir still %o)", perm)
 		}
-		if variant := client.ExperimentVariant("exp-loose"); variant != "treatment" {
-			t.Fatalf("with privacy established (tightened to 0700), the preload must serve the persisted assignment, got %q", variant)
+		client.exp.mu.Lock()
+		loaded := client.exp.entries["exp-loose"]
+		client.exp.mu.Unlock()
+		if loaded == nil {
+			t.Fatal("private directory must permit loading the persisted entry")
+		}
+		if variant := client.ExperimentVariant("exp-loose"); variant != "" {
+			t.Fatalf("loading a private record must not confirm current age: %q", variant)
 		}
 	})
 }

@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/shardpilot/shardpilot-go/internal/uuidv7"
@@ -1140,6 +1141,10 @@ type experimentsState struct {
 	// declaration withdraws the experiment (endNonAdultDeclaration). A later
 	// host declaration replaces it.
 	declaring map[string]*expNonAdultDeclaration
+	// ageConfirmed is process-local. Restored client-id assignments and
+	// facts require a new host decision, regardless of the last disk write.
+	ageConfirmed  map[string]bool
+	sentinelEpoch atomic.Uint64
 
 	// authBlocked is the fail-closed latch: set by 401/403, cleared by
 	// re-init or a later authoritative, authorized outcome of a fetch
@@ -1519,10 +1524,9 @@ func newExperimentsState(cfg Config) *experimentsState {
 	}
 }
 
-// preload serves the persisted last-known-good assignments immediately
-// after a restart when a stored subject id exists and the record matches
-// this exact scope; their exposures re-arm for this instance and are
-// emitted by the first admitted sweep. No subject id is minted here.
+// preload retains cached assignments when a stored subject id exists and
+// the record matches this exact scope. Client-id serving waits for this
+// process's host decision. No subject id or exposure is minted here.
 // Returns whether the state directory's privacy could not be established —
 // the preload then refused to read anything (the caller diagnoses it).
 func (e *experimentsState) preload() (privacyRefused bool) {
@@ -1580,7 +1584,7 @@ func (e *experimentsState) preload() (privacyRefused bool) {
 	// from here on; the client prunes the history once the spool is loaded
 	// (pruneExperimentFactKeys), never before.
 	e.factKeys = newFactKeyMirror(record)
-	// A restored assignment serves and records nothing: an exposure is the
+	// A restored assignment records nothing: an exposure is the
 	// host's application of the variant (ApplyExperimentVariant), and this
 	// session has applied nothing yet.
 	for key, stored := range record.Entries {
@@ -2151,7 +2155,7 @@ func (e *experimentsState) recordFactKeyLocked(experimentKey string, entry *expE
 		history[experimentKey] = insertFactKey(history[experimentKey], factKey)
 		return true
 	}
-	if mirror.entryKeys[experimentKey] == factKey {
+	if mirror.entryKeys[experimentKey] == factKey && mirror.durable {
 		return true
 	}
 	if !mirror.addHistoryKey(experimentKey, factKey) && mirror.durable {
@@ -2667,6 +2671,8 @@ func (e *experimentsState) applyEntryDropLocked(scope, experimentKey string, res
 // tombstoned, and retried). Shared by the current-epoch install and the
 // epoch-stale destructive carve-out (the fleet partition).
 func (e *experimentsState) applySentinelWithdrawalLocked(scope string, resolvedAtMS int64) (persistFailed, landed bool) {
+	e.sentinelEpoch.Add(1)
+	e.ageConfirmed = nil
 	e.refetchAfterApply = nil
 	e.authBlocked = true
 	e.authEpoch++
@@ -2919,7 +2925,7 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 		return false, false, false
 	}
 	fenceKey := scope + rcScopeSeparator + experimentKey
-	if seq <= e.settled[fenceKey] {
+	if seq <= e.settled[fenceKey] && !outcome.authBlocked {
 		return false, false, false
 	}
 	if authEpoch != e.authEpoch {
@@ -2929,9 +2935,9 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 		// DESTRUCTIVE half still lands. The latch retains the durable
 		// record, so discarding a server-directed withdrawal here would let
 		// a later unlatch or re-init serve an assignment the server already
-		// killed or withdrew. The scope and sequence gates above still
-		// apply: another subject's verdict, or one a newer settled outcome
-		// superseded, stays discarded whole.
+		// killed or withdrew. Scope always applies. The sequence fence
+		// applies to per-key results, while a shared refusal can still
+		// close the plane.
 		if outcome.authoritative && !outcome.transient {
 			if outcome.dropAll {
 				pf, landed := e.applySentinelWithdrawalLocked(scope, resolvedAtMS)
@@ -2947,7 +2953,9 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 		return false, false, false
 	}
 	if outcome.authoritative {
-		e.settled[fenceKey] = seq
+		if e.settled[fenceKey] < seq {
+			e.settled[fenceKey] = seq
+		}
 		if ticket := e.refetchAfterApply[experimentKey]; !outcome.transient && ticket != nil && seq > ticket.afterFetchSeq {
 			delete(e.refetchAfterApply, experimentKey)
 		}
@@ -2957,7 +2965,7 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 		// return nothing), halt revalidation, and open a new auth epoch so
 		// every response still in flight is discarded — only a fetch
 		// started AFTER this moment may unlatch. The durable record is
-		// retained (a re-init may serve it and re-probe) unless the
+		// retained (a later host decision may serve it again) unless the
 		// real-subjects sentinel says the platform withdrew the
 		// assignments outright.
 		if outcome.dropAll {
@@ -2991,6 +2999,10 @@ func (e *experimentsState) installLocked(seq uint64, scope, experimentKey string
 	}
 	if outcome.newEntry != nil {
 		entry := outcome.newEntry
+		if e.ageConfirmed == nil {
+			e.ageConfirmed = make(map[string]bool)
+		}
+		e.ageConfirmed[experimentKey] = true
 		entry.SubjectKey = subject
 		entry.Attributes = outcome.attributes
 		e.entries[experimentKey] = entry
@@ -3571,7 +3583,7 @@ type expNonAdultDeclaration struct {
 	// fenceSeq is the last fetch sequence dispatched before the
 	// declaration: every fetch at or below it left with an earlier one.
 	fenceSeq uint64
-	// seq is the declaring fetch's own sequence, once dispatched.
+	// seq is the declaring fetch's own ordinal, reserved with the declaration.
 	seq uint64
 	// decided is set when the server's answer to the declaring fetch was
 	// applied to the assignment state: a verdict (age_ineligible or any
@@ -3586,21 +3598,30 @@ type expNonAdultDeclaration struct {
 // while its fetch is in flight; an adult one replaces a pending non-adult
 // declaration (the later declaration decides afresh). A fetch that declares
 // no age changes nothing. Returns the non-adult declaration, or nil.
-func (c *Client) beginHostDeclaration(experimentKey string, attributes map[string]string) *expNonAdultDeclaration {
+func (c *Client) beginHostDeclaration(experimentKey string, attributes map[string]string) (*expNonAdultDeclaration, uint64, uint64) {
 	nonAdult := declaresNonAdultAge(attributes)
-	if !nonAdult && !declaresAdultAge(attributes) {
-		return nil
-	}
 	e := c.exp
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.fetchSeq++
+	seq := e.fetchSeq
+	if !nonAdult && !declaresAdultAge(attributes) {
+		return nil, seq, e.authEpoch
+	}
 	if !nonAdult {
 		delete(e.declaring, experimentKey)
-		return nil
+		if subject := e.currentSubjectIDLocked(); subject != "" {
+			key := e.scopeForLocked(subject) + rcScopeSeparator + experimentKey
+			if e.settled[key] < seq-1 {
+				e.settled[key] = seq - 1
+			}
+		}
+		return nil, seq, e.authEpoch
 	}
-	declaration := &expNonAdultDeclaration{fenceSeq: e.fetchSeq}
+	declaration := &expNonAdultDeclaration{fenceSeq: seq - 1, seq: seq}
 	e.declaring[experimentKey] = declaration
-	return declaration
+	delete(e.ageConfirmed, experimentKey)
+	return declaration, seq, e.authEpoch
 }
 
 // endNonAdultDeclaration runs when the declaring fetch ends, on every path.
@@ -3667,7 +3688,7 @@ func (c *Client) endNonAdultDeclaration(experimentKey string, declaration *expNo
 // synthetic-subject assignment, which has no age gate.
 func (e *experimentsState) servedEntryLocked(experimentKey string) *expEntry {
 	entry := e.entries[experimentKey]
-	if entry != nil && e.declaring[experimentKey] != nil && entry.ageGated() {
+	if entry != nil && entry.ageGated() && (e.declaring[experimentKey] != nil || !e.ageConfirmed[experimentKey]) {
 		return nil
 	}
 	return entry
@@ -3719,12 +3740,16 @@ func (c *Client) fetchExperimentAssignment(ctx context.Context, experimentKey st
 		return ExperimentAssignmentResult{}, expFetchError("experiment_key_required")
 	}
 	var declaration *expNonAdultDeclaration
-	if !isRevalidation && presetAttributes == nil {
+	var seq uint64
+	var callAuthEpoch uint64
+	hostCall := !isRevalidation && presetAttributes == nil
+	if hostCall {
 		// Before any consent gate: a non-adult declaration made while the
 		// plane refuses still withdraws when its fetch ends, or a later
 		// re-grant would serve the assignment the host has declared the
 		// subject ineligible for.
-		declaration = c.beginHostDeclaration(experimentKey, attributes)
+		declaration, seq, callAuthEpoch = c.beginHostDeclaration(experimentKey, attributes)
+		e.fireConsentRaceSeam("host_declared")
 		if declaration != nil {
 			defer c.endNonAdultDeclaration(experimentKey, declaration)
 		}
@@ -3793,7 +3818,7 @@ func (c *Client) fetchExperimentAssignment(ctx context.Context, experimentKey st
 			c.logf("shardpilot experiments: persisting the minted subject id failed; the id rules this process only (a restart re-buckets)")
 		}
 	}
-	if isRevalidation && ((presetAttributes == nil && e.entries[experimentKey] == nil) || e.declaring[experimentKey] != nil) {
+	if isRevalidation && ((presetAttributes == nil && e.entries[experimentKey] == nil) || e.declaring[experimentKey] != nil || (e.entries[experimentKey] != nil && e.entries[experimentKey].ageGated() && !e.ageConfirmed[experimentKey])) {
 		// The pre-dispatch existence check and this section run under
 		// separate lock acquisitions: the entry can vanish in the gap (a
 		// concurrent host fetch's drop, a re-mint clearing the cache).
@@ -3811,8 +3836,10 @@ func (c *Client) fetchExperimentAssignment(ctx context.Context, experimentKey st
 		e.mu.Unlock()
 		return ExperimentAssignmentResult{}, expFetchError("revalidation_entry_vanished")
 	}
-	e.fetchSeq++
-	seq := e.fetchSeq
+	if seq == 0 {
+		e.fetchSeq++
+		seq = e.fetchSeq
+	}
 	if declaration != nil && e.declaring[experimentKey] == declaration {
 		declaration.seq = seq
 	} else if presetAttributes != nil && !isRevalidation && declaresNonAdultAge(attributes) {
@@ -3829,6 +3856,9 @@ func (c *Client) fetchExperimentAssignment(ctx context.Context, experimentKey st
 	// gate at install time.
 	scope := e.scopeForLocked(subject)
 	authEpoch := e.authEpoch
+	if hostCall {
+		authEpoch = callAuthEpoch
+	}
 	var normalizedAttributes []expAttribute
 	dropped := 0
 	switch {
@@ -4006,6 +4036,9 @@ func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string
 	// cohort's variant. (Revalidation re-sends the entry's own set, so the
 	// lane always matches.)
 	serveEntry := entryNow
+	if serveEntry != nil && serveEntry.ageGated() && !e.ageConfirmed[experimentKey] {
+		serveEntry = nil
+	}
 	if serveEntry != nil && !experimentAttributesEqual(serveEntry.Attributes, normalizedAttributes) {
 		serveEntry = nil
 	}
@@ -4167,6 +4200,12 @@ func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string
 	if !skipInstall {
 		sweepOwedNow, persistFailed, dropAllLanded = e.installLocked(seq, scope, experimentKey, outcome, authEpoch, nowMS)
 	}
+	if !skipInstall && !fencedOut && installScopeCurrent && authEpoch == e.authEpoch && consentRefusal == nil && outcome.authoritative && !outcome.transient && !outcome.authBlocked {
+		if e.ageConfirmed == nil {
+			e.ageConfirmed = make(map[string]bool)
+		}
+		e.ageConfirmed[experimentKey] = true
+	}
 	if declaration := e.declaring[experimentKey]; declaration != nil && declaration.seq == seq {
 		// The server's answer to a non-adult declaration was applied: a
 		// verdict or a drop the install landed (the auth-epoch carve-out's
@@ -4200,7 +4239,7 @@ func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string
 	// from the current fenced entry and pass through untouched.
 	var supersededResult ExperimentAssignmentResult
 	supersededFailure := ""
-	if !epochStale && !scopeStale && fencedOut && outcome.authoritative {
+	if !epochStale && !scopeStale && fencedOut && outcome.authoritative && !outcome.authBlocked {
 		supersededServe := e.servedEntryLocked(experimentKey)
 		if supersededServe != nil && !experimentAttributesEqual(supersededServe.Attributes, normalizedAttributes) {
 			supersededServe = nil
@@ -4260,7 +4299,7 @@ func (c *Client) settleExperimentFetch(ctx context.Context, experimentKey string
 		return ExperimentAssignmentResult{}, expFetchError("unauthorized")
 	case scopeStale:
 		return ExperimentAssignmentResult{}, expFetchError("stale_subject")
-	case fencedOut && outcome.authoritative:
+	case fencedOut && outcome.authoritative && !outcome.authBlocked:
 		if supersededFailure != "" {
 			return ExperimentAssignmentResult{}, expFetchError(supersededFailure)
 		}

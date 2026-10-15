@@ -58,9 +58,16 @@ func TestSubjectFactKeyGrammarGuardsTheFactLane(t *testing.T) {
 
 	client2 := newExperimentClient(t, server.URL, func(cfg *Config) { cfg.SpoolDir = spoolDir })
 	defer client2.Close(context.Background())
-	if v := client2.ExperimentVariant(expTestScopeKey); v != "treatment" {
-		t.Fatalf("the assignment still serves degraded, got %q", v)
+	if v := client2.ExperimentVariant(expTestScopeKey); v != "" {
+		t.Fatalf("restored corrupt state must not serve before a fresh decision: %q", v)
 	}
+	client2.exp.mu.Lock()
+	restored := client2.exp.entries[expTestScopeKey]
+	client2.exp.mu.Unlock()
+	if restored == nil || restored.SubjectFactKey != "" {
+		t.Fatal("the raw-subject key must be removed at load")
+	}
+	fetchAdultAssignment(t, client2, expTestScopeKey)
 	client2.experimentCycle(context.Background()) // sweeps the restored owed exposure
 	if err := client2.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
@@ -292,8 +299,28 @@ func TestRestoredAttributesAreRenormalized(t *testing.T) {
 	client2.exp.revalidateAtMS = 1
 	client2.exp.mu.Unlock()
 	client2.experimentCycle(context.Background())
-	waitFor(t, 5*time.Second, "the revalidation fetch", func() bool { return script.requestCount() >= 2 })
-	query := script.request(1).URL.Query()
+	if script.requestCount() != 1 {
+		t.Fatal("stored attributes must not automatically confirm age")
+	}
+	client2.exp.mu.Lock()
+	restored := append([]expAttribute(nil), client2.exp.entries[expTestScopeKey].Attributes...)
+	client2.exp.mu.Unlock()
+	attrs := make(map[string]string)
+	for _, a := range restored {
+		attrs[a.Name] = a.Value
+	}
+	if attrs["geo"] != "DE" || attrs["not_in_vocabulary"] != "" || attrs["app_version"] != "" {
+		t.Fatalf("restored attributes were not sanitized: %v", attrs)
+	}
+	if _, err := client2.FetchExperimentAssignmentWithAgeBand(context.Background(), expTestScopeKey, ExperimentAgeBandAdult, map[string]string{"geo": "DE"}); err != nil {
+		t.Fatal(err)
+	}
+	client2.exp.mu.Lock()
+	client2.exp.revalidateAtMS = 1
+	client2.exp.mu.Unlock()
+	client2.experimentCycle(context.Background())
+	waitFor(t, 5*time.Second, "the revalidation fetch", func() bool { return script.requestCount() >= 3 })
+	query := script.request(2).URL.Query()
 	if query.Get("geo") != "DE" {
 		t.Fatalf("the valid restored attribute must ride, got %v", query)
 	}
