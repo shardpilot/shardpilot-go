@@ -393,16 +393,12 @@ func TestV2FileStillLoads(t *testing.T) {
 // file could legitimately exceed what the loader would read. A restart in that
 // window classifies this spool's OWN file as oversized and removes it.
 func TestFileNeverOutgrowsTheReadBound(t *testing.T) {
-	// ⚠ THE SPOOL HAS TO BE BYTE-CAP DOMINANT, and two earlier versions of this
-	// test were not — they passed against the unfixed code and proved nothing.
-	//
-	// The loader's old bound was max_bytes + 64 KiB + 40 x max_events. For the
-	// file to exceed it, 1.5x the live content must be larger than that, which
-	// needs the BYTE cap to be the one that binds: with small caps the fixed
-	// 64 KiB dominates, and with the default 219-byte test envelope the EVENT
-	// cap binds at 438 KB of live content, half the byte cap. Padding the
-	// envelopes to ~600 bytes puts the byte cap in charge, which is the
-	// configuration the finding describes.
+	// Use a byte-cap-dominant setup so repeated appends challenge the
+	// loader's read bound. Small caps can let the fixed header allowance
+	// mask overgrowth; small envelopes can make the event cap bind before
+	// the byte cap. Padding these envelopes makes the byte cap bind first.
+	// After each append, compare the actual file size with the loader's
+	// actual readLimitLocked value.
 	dir := t.TempDir()
 	const maxEvents = 2000
 	s := formatTestSpool(t, dir, maxEvents, 1<<20)
@@ -483,20 +479,13 @@ func TestLoosenedPermissionsFallBackToTheRewrite(t *testing.T) {
 	}
 }
 
-// TestReloadMatchesTheWritersBacklog is the invariant every replay defect broke,
-// asserted directly instead of one worked example at a time.
+// TestReloadMatchesTheWritersBacklog compares the real writer's mirror
+// with a file reload after every operation, including order.
 //
-// ⚠ FOUR SEPARATE DEFECTS SHARED ONE STATEMENT: what a restart loads is not
-// what the writing run held. Each was found by a reviewer constructing the
-// history that exposed it — dedup-before-trim, a re-appended id, a batch member
-// evicted on arrival, and the position a settled id left behind — and each was
-// fixed without the next one becoming any less likely, because the reader was
-// re-deriving decisions the writer never wrote down.
-//
-// So this drives the REAL writer through appends, batches, re-appends and acks
-// against caps tight enough that most appends evict, and after every operation
-// asserts the file reloads to exactly the mirror's backlog, in order. It is
-// deliberately not a table of cases: the cases were never the problem.
+// Tight caps and repeated IDs exercise deduplication, re-append,
+// eviction of a batch member, and the positions left by settled IDs.
+// Appends, batches and acknowledgments must leave a file that reloads
+// to exactly the writer's current backlog.
 func TestReloadMatchesTheWritersBacklog(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now()

@@ -1261,13 +1261,13 @@ func deliveredByKey(capture *expWireCapture) map[any]int {
 	return byKey
 }
 
-// shardpilot/shardpilot-go#138 R5: facts built under version 1's key are
-// spooled; a republish installs version 2 under another key, and facts are
-// built under it; the age refusal echoes version 2's key. The history names
-// version 1's key, so the facts of both keys are withdrawn and none is
-// delivered — in the same process, and after a relaunch that restores the
-// spool. One cycle later the withdrawn keys have no live fact left and leave
-// the history.
+// shardpilot/shardpilot-go#138: facts built under version 1's key are
+// spooled; a republish installs version 2 under another key, and facts
+// are built under it. The age refusal echoes version 2's key. History
+// retains version 1's key, so this test checks withdrawal under both
+// keys in the same process and after a relaunch restores the spool.
+// After an explicit experimentCycle call, both the in-memory and
+// persisted histories must be empty.
 func TestAnAgeRefusalWithdrawsFactsUnderARetiredKey(t *testing.T) {
 	for _, relaunch := range []bool{false, true} {
 		name := "same_process"

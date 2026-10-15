@@ -707,13 +707,11 @@ func (o *consentOutbox) saveLocked(carriesFreshDecision bool) error {
 	}
 	diskReceipts, diskRead := o.readRecordReceipts()
 	if carriesFreshDecision && diskRead == consentOutboxReadUnusable {
-		// A fresh decision supersedes the unknown trail — but only for ITS
-		// OWN scope. An earlier revision dropped the whole disk view here,
-		// and the merge below restores only this process's own keys, so a
-		// valid pending denial belonging to ANOTHER scope sharing the
-		// SpoolDir was erased by a decision that supersedes nothing about
-		// it. This client never dispatches foreign receipts, so that denial
-		// would be lost permanently and its server left granted.
+		// A fresh decision supersedes an unusable trail only for its own scope.
+		// Keep the other scopes' receipts from disk before merging this
+		// process's keys. This client does not dispatch foreign receipts, so a
+		// pending denial for another scope sharing SpoolDir must remain for
+		// that scope to dispatch.
 		kept := make([]consentReceipt, 0, len(diskReceipts))
 		for _, entry := range diskReceipts {
 			if !ownScope(entry) {
@@ -1436,31 +1434,21 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 				return true
 			}
 			if recordRead == consentRecordReadForeign {
-				// A foreign record vetoes a grant UNCONDITIONALLY, and the
-				// timestamp exception an earlier revision put here is
-				// withdrawn.
+				// During floor initialization, a foreign record blocks recovery of a
+				// retained grant regardless of its device-clock stamp. A receipt that
+				// compares newer need not postdate the scope switch: a client with the
+				// floor disabled can write consent.json from its current clock without
+				// seeding it from the retained trail, and the device clock can move
+				// backward. A pre-switch grant can therefore appear newer.
 				//
-				// That exception let a receipt "strictly newer than the
-				// foreign record" through, on the reasoning that it must
-				// postdate the scope switch. The ordering is not sound
-				// across a switch: both stamps come from the DEVICE clock,
-				// a backward jump is ordinary, and the intervening client —
-				// which may have the floor disabled — writes consent.json
-				// with its current clock without seeding from the retained
-				// trail. A pre-switch grant can therefore compare newer and
-				// heal over the tombstone.
+				// This receipt carries no causal or generation ordering across that
+				// switch. The foreign-record path makes no timestamp exception; the
+				// mark path below has its separate timestamp comparison. A wrong
+				// comparison here could admit the grant, rather than keep it withheld.
 				//
-				// The mark can afford a wall-clock comparison because a
-				// wrong answer there STICKS (the safe direction). Here a
-				// wrong answer ADMITS, so the same imprecision is not
-				// affordable. Nothing in this SDK's receipt carries causal
-				// or generation information, and adding it would change what
-				// is POSTed — out of proportion to the liveness it buys.
-				//
-				// The cost is named rather than hidden: a fresh grant whose
-				// receipt landed durably and whose record write was lost to
-				// a crash stays withheld until the host records a decision
-				// again. That is a decision deferred, not lost.
+				// The liveness cost remains explicit: a fresh grant whose receipt was
+				// saved but whose record write was lost can stay withheld until the
+				// host records a decision again.
 				return true
 			}
 			// The MARK is an ordering question, not a veto. A receipt
@@ -1547,15 +1535,15 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 			record.unwitnessed
 		c.consentOutbox.setGrantsUnprovable(grantsUnprovable)
 
-		// PERSIST IT WHATEVER THE RECORD SAYS. An earlier revision wrote the
-		// mark only when the CURRENT record was itself a grant, which left
-		// the blocked-tail case durable-less: with an older DENIAL on file
-		// (or none at all) and a trail holding an older deny, a newer grant
-		// and a malformed latest deny, the grant tail is blocked on this
-		// start — but the surviving deny then dispatches, its prune rewrites
-		// the outbox clean with only the grant, and the NEXT start lets that
-		// grant supersede the older denial and heals it as live consent. A
-		// denial lifted by housekeeping.
+		// Retain the evidence of unprovable grants regardless of the current
+		// record's decision. Where a record can carry the mark, preserve its
+		// decision and add the mark; without a usable record or after a failed
+		// mark write, preserve the opaque outbox evidence.
+		//
+		// An older denial can otherwise dispatch and be pruned, leaving a
+		// retained grant in a clean outbox. A later startup could then use
+		// that grant to supersede the older denial. Housekeeping must not
+		// turn a blocked grant into live consent.
 		markFailed := false
 		if grantsUnprovable {
 			switch {

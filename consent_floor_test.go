@@ -3593,11 +3593,10 @@ func TestConsentFloorFlushJoinsInFlightDispatchPass(t *testing.T) {
 	state, server := newFloorTestServer(t)
 	defer server.Close()
 
-	// A caller-driven drain must never silently skip when a concurrent pass
-	// holds the serial-dispatch claim: pre-fix, a Flush losing the claim on
-	// the denied path returned SUCCESS with the denial receipt undrained.
-	// The test holds the claim itself — a deterministic in-flight pass — so
-	// the decision's worker wake cannot deliver either.
+	// A caller-driven drain joins the serial-dispatch claim within its
+	// caller's deadline. On the denied path, losing that claim must not
+	// report success over an undrained denial receipt. This test holds the
+	// claim so neither Flush nor the decision's worker wake can deliver.
 	dir := t.TempDir()
 	client := newFloorTestClient(t, server.URL, dir, nil)
 	if !client.consentOutbox.claimDispatch(false) {
@@ -3645,12 +3644,10 @@ func TestConsentFloorCloseRemnantCapacityEvictionFoldsDiscarded(t *testing.T) {
 	state, server := newFloorTestServer(t)
 	defer server.Close()
 
-	// A close remnant larger than the spool cap evicts at the STOP-path
-	// append. That eviction lands durably gone at exit — there is no later
-	// resend, unlike a mid-session eviction — so it must fold into the
-	// Close verdict like every other close-remnant loss. Pre-fix: the fold
-	// counted only gate refusals and still-unpersisted mirror entries, the
-	// evicted event was silently lost, and Close read nil.
+	// A close remnant larger than the spool cap evicts during the stop-path
+	// append. That eviction has no later resend on this Close path, so it
+	// must fold into the Close verdict alongside gate refusals and
+	// still-unpersisted mirror entries.
 	dir := t.TempDir()
 	transport := &eofOnConsentTransport{}
 	client := newFloorTestClient(t, server.URL, dir, func(cfg *Config) {
@@ -3964,9 +3961,9 @@ func TestConsentFloorLegacyRecordSupersededByStampedProof(t *testing.T) {
 		}
 	}
 
-	// Legacy GRANT + durable denial proof: pre-fix the compare blocked the
-	// override and provenance stranded the floor UNDECIDED — losing the
-	// denial. The proof must heal denied.
+	// A stamped durable denial proof supersedes the legacy grant and heals
+	// the record denied. The recovered record retains the proof's decision
+	// stamp and floor provenance.
 	deniedDir := t.TempDir()
 	writeLegacyRecord(t, deniedDir, "granted")
 	planted := newConsentOutbox(deniedDir)
@@ -4880,12 +4877,11 @@ func TestConsentFloorPurgeDebtMarkerFailureWipesSpoolFile(t *testing.T) {
 	state, server := newFloorTestServer(t)
 	defer server.Close()
 
-	// Escalation ladder, second rung — pinned on the ACTORLESS local-only
-	// path, where no deny receipt will ever exist to override a stale
-	// granted record at reload (the finding's sharpest exposure): with the
-	// denied record unwritable AND the marker uncreatable, the branch
-	// removes the condemned spool file ITSELF — durable by destruction —
-	// so a crash cannot reload the condemned events under the old grant.
+	// The actorless local-only path has no denial receipt to override a
+	// stale granted record on reload. With the denied record unwritable
+	// and the marker uncreatable, this test checks that the purge-debt
+	// fallback removes the spool file before a relaunch can reload its
+	// condemned events.
 	actorless := func(cfg *Config) {
 		cfg.AnonymousID = ""
 	}
@@ -4937,10 +4933,9 @@ func TestConsentFloorPurgeDebtMarkerFailureWipesSpoolFile(t *testing.T) {
 		t.Fatalf("test shape: expected the stale granted record still on disk, got (%v, %v)", recorded, ok)
 	}
 
-	// CRASH (no Close): the relaunch promotes the stale grant — no receipt
-	// exists to override it — but nothing condemned can reload: the spool
-	// file is gone. Pre-fix the file survives with no marker, and the
-	// condemned event resends under the old grant.
+	// Relaunch without Close promotes the retained grant in this actorless
+	// fixture. The condemned spool file is gone, so the following Flush
+	// and Close must not resend its event under that grant.
 	state.setBatchOutcome(0)
 	batchesBefore := state.batchCount()
 	relaunched := newFloorTestClient(t, server.URL, dir, actorless)
@@ -5067,13 +5062,10 @@ func TestConsentFloorFailedSaveEvictionFoldsIntoCloseVerdict(t *testing.T) {
 	state, server := newFloorTestServer(t)
 	defer server.Close()
 
-	// A close-remnant member evicted by the caps BEFORE a FAILED save has
-	// no durable copy anywhere — it was only ever accepted into the mirror
-	// under failed writes — so its eviction is a SETTLED loss, not a
-	// deferrable one: it must be returned, counted (SpoolEvicted, Dropped)
-	// and folded into the Close verdict. Pre-fix the failed-save path
-	// deferred ALL evictions, and a disk-full Close lost the member with
-	// no ErrEventsDiscarded accounting for it.
+	// A close-remnant member accepted only into the mirror under failed
+	// writes has no durable copy when a cap evicts it before a failed save.
+	// That eviction is a settled loss: Close must report ErrEventsDiscarded
+	// and count SpoolEvicted and Dropped despite the failed save.
 	dir := t.TempDir()
 	client := newFloorTestClient(t, server.URL, dir, func(cfg *Config) {
 		cfg.SpoolMaxEvents = 1
@@ -5116,15 +5108,12 @@ func TestConsentFloorFailedSaveEvictionFoldsIntoCloseVerdict(t *testing.T) {
 	if !errors.Is(err, ErrEventsDiscarded) {
 		t.Fatalf("expected the close verdict to report the discarded remnant, got %v", err)
 	}
-	// Close appends the retained batch twice (the failing final flush, then
-	// the stop-path remnant), and the cap churns on each: stage one evicts
-	// E1 (never saved — settled loss, counted), stage two re-admits E1 and
-	// evicts E2 (accepted under the stage-one failed save — settled loss,
-	// counted), leaving E1 mirrored-but-unpersisted for the remnant fold.
-	// Every member is lost exactly once in the verdict: E2 through its
-	// settled eviction, E1 through unpersistedOf. Pre-fix both evictions
-	// deferred (SpoolEvicted 0) and only the mirrored member counted
-	// (Dropped 1) — E2 vanished with no accounting at all.
+	// Close appends the retained batch during the failing final flush and
+	// again on the stop path. The first append evicts E1; the second
+	// re-admits E1 and evicts E2, which was accepted under the first failed
+	// save. Both cap evictions count in SpoolEvicted. Dropped counts the
+	// two teardown losses once each: E2 through its settled eviction and
+	// E1 through the retained unpersisted mirror.
 	snap := client.Snapshot()
 	if got := snap.SpoolEvicted; got != 2 {
 		t.Fatalf("expected the never-persisted evictions COUNTED despite the failed saves, got SpoolEvicted=%d", got)
@@ -5277,9 +5266,9 @@ func TestConsentFloorDuplicateIDExpiredRemnantStillCounted(t *testing.T) {
 	if !errors.Is(err, ErrEventsDiscarded) {
 		t.Fatalf("expected the close verdict to report the discarded remnant, got %v", err)
 	}
-	// BOTH copies are teardown losses: the expired one through the
-	// retry-age refusal, the fresh one through the unpersisted-mirror
-	// fold. Pre-fix the id-filter hid the fresh copy (Dropped=1).
+	// Both copies count as teardown losses: the expired copy through the
+	// retry-age refusal and the fresh copy through the unpersisted-mirror
+	// fold. Their shared ID must not hide the fresh copy from that count.
 	if got := client.Snapshot().Dropped; got != 2 {
 		t.Fatalf("expected both the expired copy and the retained fresh duplicate counted, got Dropped=%d", got)
 	}
