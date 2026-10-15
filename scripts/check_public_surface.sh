@@ -74,11 +74,10 @@
 # close this; a reviewer can.
 #
 # ⚠ SOURCE AND RENDERED PAGE ARE DIFFERENT SURFACES, and the published one is
-# the page. THIS GATE DOES NOT MODEL THE RENDERER. It compares against a form
-# that DOMINATES any output the renderer could produce — a copy with every
-# inline marker character removed — so whatever a renderer would join, that
-# copy joins too. There is no false miss along this axis by construction rather
-# than by testing, and nothing to add when the next construct appears.
+# the page. THIS GATE DOES NOT MODEL THE RENDERER. It reads both raw bytes and
+# a copy with inline markers removed. Deletion can also remove a character a
+# pattern requires: the flag shape requires underscores. Decorated flags are
+# therefore refused from their raw spelling before either matching stream runs.
 #
 # That line is the whole design and it replaced a normalisation pipeline that
 # tried to predict the rendered string. The pipeline was correct five times
@@ -492,6 +491,55 @@ for gate_var in $GATE_DATA_NAMES; do
   eval "$gate_var=\"\${$gate_var//\[\]/}\""
 done
 unset gate_var
+
+# Of the shape alternatives, only flags require a literal from the marker set:
+# underscores. The branch-reference shape's backtick is optional. Enumerate raw
+# flag spellings with markers between letters, then accept only the original
+# undecorated shape. This is a refusal, not another normalized matching stream.
+flag_gap='[*_`~\\]*'
+flag_suffixes=''; flag_separator=''
+for flag_word in ENABLED DISABLED MODE; do
+  flag_arm=''
+  while [ -n "$flag_word" ]; do
+    flag_arm="${flag_arm}${flag_gap}${flag_word:0:1}"
+    flag_word="${flag_word:1}"
+  done
+  flag_suffixes="${flag_suffixes}${flag_separator}${flag_arm}"
+  flag_separator='|'
+done
+FLAG_CANDIDATE='[A-Z][A-Z0-9_*`~\\]*_[A-Z0-9_*`~\\]*_('"$flag_suffixes"')'
+unset flag_gap flag_suffixes flag_separator flag_word flag_arm
+
+decorated_flag_hits() {
+  FLAG_CANDIDATE="$FLAG_CANDIDATE" awk '
+    BEGIN { candidate = ENVIRON["FLAG_CANDIDATE"] }
+    {
+      rest = $0
+      while (match(rest, candidate)) {
+        spelling = substr(rest, RSTART, RLENGTH)
+        if (spelling !~ /^[A-Z][A-Z0-9]*(_[A-Z0-9]+)+_(ENABLED|DISABLED|MODE)$/)
+          print NR ":" spelling
+        rest = substr(rest, RSTART + RLENGTH)
+      }
+    }' "$1"
+}
+
+check_decorated_spelling() {
+  local input_file="$1" label="$2" spelling_hits
+  if ! spelling_hits="$(decorated_flag_hits "$input_file")"; then
+    # refusal:structural
+    echo "REFUSING: could not check flag spellings in $label." >&2
+    exit 2
+  fi
+  if [ -n "$spelling_hits" ]; then
+    # refusal:hazard
+    echo "REFUSING: $label contains a decorated flag spelling." >&2
+    echo "  Write flag identifiers without inline markers inside them." >&2
+    echo "  Marker deletion can erase their required underscores as well." >&2
+    exit 2
+  fi
+  return 0
+}
 
 # ⚠ EVERY ASSIGNMENT IN THE BLOCK MUST BE ENUMERATED. The audits downstream
 # read the DECODED values, and they reach them through the name list — so an
@@ -1023,6 +1071,7 @@ scan_tree() {
     # of a record id was scanned raw and passed, while the identical string in
     # the body was reported — one criterion, two answers, depending on where
     # the bytes sat.
+    check_decorated_spelling - "path '$f'" <<< "$f"
     f_stripped="$(printf '%s' "$f" | tr -d '*_`~\\')"
     if printf '%s\n' "$f" | grep -qE -- "$PATTERNS" \
        || printf '%s\n' "$f_stripped" | grep -qE -- "$PATTERNS" \
@@ -1093,6 +1142,7 @@ scan_tree() {
     fi
     scan_files=$((scan_files + 1))
     if [ "$mode" = 120000 ]; then
+      check_decorated_spelling "$blob" "symlink target of '$f'"
       link="$(cat "$blob")"
       # ⚠ AND THE MARKER-FREE FORM, like a path and like a body. This branch
       # returns before the content pass, so it was the one place the criterion
@@ -1519,12 +1569,10 @@ scan_tree() {
       echo "  what a source viewer shows." >&2
       exit 2
     fi
-    # ⚠ THIS GATE DOES NOT MODEL THE RENDERER. It compares against a form that
-    # DOMINATES any output the renderer could produce: a copy with every inline
-    # marker character removed. Whatever a renderer joins, the marker-free copy
-    # joins too, so there is no false miss along this axis BY CONSTRUCTION
-    # rather than by testing — and no rule to add when the next construct
-    # appears.
+    check_decorated_spelling "$scan_src" "file '$f'"
+    # Raw and marker-free readings complement each other. Neither covers a
+    # marker splitting a required suffix when deletion also erases the shape's
+    # literal separators; the raw spelling refusal above handles that case.
     #
     # What stood here before was a normalisation pipeline that tried to predict
     # the rendered string: emphasis pairing, run lengths, whitespace flanking,
@@ -1827,12 +1875,18 @@ scan_tree() {
               # would only re-introduce a disagreement -- and would strip the
               # underscores that normal form deliberately keeps, collapsing two
               # distinct identifiers on one line into one key.
-              if (m != "") seen[pass SUBSEP n ":" m]++
+              if (m != "") {
+                k = pass SUBSEP n ":" m
+                seen[k]++
+                keyof[k] = n ":" m
+              }
             }
             END {
               for (k in seen) {
-                split(k, a, SUBSEP)
-                if (seen[k] > best[a[2]]) best[a[2]] = seen[k]
+                # Matched text may itself contain SUBSEP. Keep its original
+                # bucket rather than splitting a joined key to recover it.
+                bucket = keyof[k]
+                if (seen[k] > best[bucket]) best[bucket] = seen[k]
               }
               total = 0
               for (k in best) total += best[k]

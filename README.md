@@ -581,6 +581,16 @@ Add `--container` to use the pinned scanner image through Docker, as CI does.
 The controls exercise count/reader failures, changing refs, merge and empty commits,
 and the synthetic literal exception in both directions. See [release checks](docs/release.md#secret-scan-corpus).
 
+The staged publication check also refuses decorated flag identifiers whose
+required separators can disappear in marker removal. It reads those spellings
+directly in filenames, staged symlink targets and file contents, before the
+existing raw and marker-free checks. Symlink targets are never followed.
+Occurrence buckets
+preserve every matched byte, including control bytes, and repeated matches
+retain their multiplicity. Run `scripts/test_surface_ratchet.sh` from a clean
+committed checkout to exercise the repository fixtures; see the
+[publication controls](https://github.com/shardpilot/shardpilot-go/blob/main/docs/release.md#publication-shape-controls).
+
 ## Conventions & boundaries
 
 - **Zero third-party dependencies** — stdlib only. Keep it that way.
