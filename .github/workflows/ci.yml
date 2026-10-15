@@ -483,14 +483,14 @@ jobs:
   # equally citable, argues in the wrong direction. A snapshot, not a definition:
   # both factors move, one with the runner and one with this file.
   #
-  # A local unprivileged Linux run executed all 57 controls in 1282.535s.
-  # That run's only failure was the count comment, corrected here. Allocate
-  # ceil(1282.535 * 1.5 / 60) = 33 minutes for the battery and runner
-  # variation. Replace this local estimate with hosted measurements if shorter.
+  # Hosted 57-control jobs on d2b2720 took 872s (push) and 940s (pull request).
+  # Use the slower job and a 50% margin for runner variation. Allocate
+  # ceil(max(872, 940) * 1.5 / 60) = 24 minutes for the complete battery.
+  # Individual controls retain their own timeouts.
   # Current size: this harness is at 57 controls.
   surface-ratchet-controls:
     runs-on: ubuntu-latest
-    timeout-minutes: 33
+    timeout-minutes: 24
 
     steps:
       - name: Checkout
