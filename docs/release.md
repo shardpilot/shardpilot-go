@@ -44,6 +44,28 @@ not be cut without it.**
 The reason the requirement exists is in the next section: a tag is not
 reversible. Cutting one is the only irreversible step in this procedure.
 
+## Secret-scan corpus
+
+The history scan prints the total reachable commit count and ref count beside its
+expected material count and the scanner's observed count. It also binds HEAD, refs
+and material commit identities with a before/after snapshot. A missing, ambiguous,
+zero or mismatched reading refuses the check. A scanner error or a corpus change
+also refuses it. Shallow history is refused before measuring the expected corpus.
+
+History uses `--full-history --all --diff-merges=first-parent --diff-filter=d`.
+This includes merge-resolution additions and file type changes. Git's NUL-delimited
+numstat provides text-change counts while filenames and rename pairs stay opaque.
+A modified file that only loses lines still contributes a text patch. Commits
+without text patches, such as empty and metadata-only changes, are counted
+separately. The expected patch corpus is measured before invoking gitleaks.
+
+`python3 scripts/test_secret_scan.py` exercises the checker and confirms that the
+exact synthetic sanitiser literal retains its exception while a larger containing
+value is detected. The CI variant adds `--container`; both use gitleaks 8.30.1.
+Workflow trust and exception-review policy remain tracked separately in
+[#97](https://github.com/shardpilot/shardpilot-go/issues/97) and
+[#102](https://github.com/shardpilot/shardpilot-go/issues/102).
+
 ## Bad versions
 
 Never delete or move a published tag — Go module proxies cache tagged
