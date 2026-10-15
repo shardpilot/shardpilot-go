@@ -562,6 +562,25 @@ goroot="$(GOTOOLCHAIN=go1.27.0 go env GOROOT)" || goroot=""
 "$goroot"/bin/gofmt -w .   # to fix
 ```
 
+### Secret-scan coverage checks
+
+CI runs the working-tree scan and verifies the history scan against an independently
+measured Git corpus. Complete Git history is required. The history checker reports reachable commits, refs, the
+expected count of commits with text patches, excluded commits and corpus digests.
+It includes first-parent merge diffs and requires the scanner's count to match the
+material corpus while refs and HEAD remain stable.
+
+Run the controls with Python 3.11+ and gitleaks 8.30.1:
+
+```bash
+python3 scripts/test_secret_scan.py
+python3 scripts/check_secret_scan.py .
+```
+
+Add `--container` to use the pinned scanner image through Docker, as CI does.
+The controls exercise count/reader failures, changing refs, merge and empty commits,
+and the synthetic literal exception in both directions. See [release checks](docs/release.md#secret-scan-corpus).
+
 ## Conventions & boundaries
 
 - **Zero third-party dependencies** — stdlib only. Keep it that way.

@@ -32,10 +32,9 @@ jobs:
   # tree and the full history across all refs, so a secret can neither live at
   # HEAD nor hide in an earlier commit. Exact-pinned image.
   #
-  # There IS a .gitleaks.toml here, and it carries no `paths` clause on purpose:
-  # measured against v8.30.1, an allowlist with `paths` excuses the whole FILE
-  # even with condition = "AND", and the files needing exceptions are test files
-  # — the likeliest place for a pasted credential. Exceptions name the literal.
+  # Credential-shaped examples use an exact anchored literal exception. No
+  # file is exempted: the rule and condition determine an allowlist's scope.
+  # The scene harness checks both an exact value and a larger containing value.
   #
   # ⚠ THIS REPOSITORY IS PUBLIC, which inverts the usual urgency. Everywhere
   # else a missing secret scan is a gap to close before a visibility flip; here
@@ -74,14 +73,11 @@ jobs:
         with:
           args: dir --verbose --redact /github/workspace
 
-      - name: Scan git history for secrets
-        uses: docker://ghcr.io/gitleaks/gitleaks:v8.30.1
-        env:
-          GIT_CONFIG_COUNT: 1
-          GIT_CONFIG_KEY_0: safe.directory
-          GIT_CONFIG_VALUE_0: /github/workspace
-        with:
-          args: git --verbose --redact --log-opts=--all /github/workspace
+      - name: History coverage and literal-exception scenes
+        run: python3 scripts/test_secret_scan.py --container
+
+      - name: Scan git history and verify its corpus
+        run: python3 scripts/check_secret_scan.py --container .
   go:
     runs-on: ubuntu-latest
       # ⚠ THE MATRIX AXIS IS PART OF THE GROUP. Without it every leg of the
