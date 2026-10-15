@@ -424,9 +424,16 @@ speed := client.RemoteConfigNumber("scroll_speed", 1.0)
   configuration), though the cached record survives for later fetches under
   a valid credential. Any other status (`404`, `3xx`, other `4xx`) is a
   permanent error; redirects are not followed on this route.
-- **A `429`'s `Retry-After` arms an in-memory cooldown** (floor 1s, clamp
-  24h): an explicit fetch inside the window serves the cache without
-  touching the network.
+- **Pinned `v0.9.0` retry policy:** a `429`/`5xx` hint creates an in-memory
+  cooldown (one-second floor, 24-hour cap), with local jitter otherwise.
+  **Unreleased on `main`:** only a positive `429`/`5xx` server hint creates
+  a window, separately per consent scope, without local backoff or a floor.
+  Both delta-seconds and HTTP-date retain the 24-hour cap. A terminal scope
+  remains closed across explicit transient refetches and fenced responses
+  until an installed valid fresh/304 response or a new client/session.
+  A success in the other scope does not reopen it, and a departed-scope
+  response cannot install or arm a window. `408` stays transient;
+  caller cancellation still returns its context error without state changes.
 - **Available in every consent state**: granted consent uses
   `/config/v1/{workspace}/{environment}/{client_id}`. Unknown, denied, and
   forced-minor denied use `/config/v1/{workspace}/{environment}`, without

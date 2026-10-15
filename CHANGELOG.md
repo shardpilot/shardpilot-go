@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Remote-config retry policy changes from `v0.9.0`: only a positive server
+  `Retry-After` on `429`/`5xx` creates a retry window, independently per
+  identified or identifier-free request scope. Removes client-wide local
+  backoff and the one-second floor for missing/non-positive hints.
+  Terminal responses keep their scope closed across explicit transient
+  refetches and fenced successes until an installed valid response (fresh or
+  304-revalidated), or a new client/session. A success in another consent
+  scope does not reopen the closed scope. Retains `408` classification,
+  HTTP-date parsing, the 24-hour hint cap and caller cancellation.
+
 ## v0.9.0 — 2026-10-15 — per-event schema version
 
 - Adds optional `Event.SchemaVersion *int` to `Track` and `Enqueue`: nil

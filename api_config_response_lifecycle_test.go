@@ -10,19 +10,15 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
-	"time"
 )
 
-func TestAPIResponseConfigBackoff(t *testing.T) {
+func TestAPIResponseConfigWithoutHintDispatchesImmediately(t *testing.T) {
 	for _, status := range []int{0, 204, 408, 429, 503} {
 		t.Run(fmt.Sprint(status), func(t *testing.T) {
 			var calls atomic.Int32
-			var healthy atomic.Bool
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				calls.Add(1)
-				if healthy.Load() {
-					fmt.Fprint(w, `{"values":{"healthy":true}}`)
-				} else if status == 0 {
+				if status == 0 {
 					conn, _, err := w.(http.Hijacker).Hijack()
 					if err == nil {
 						_ = conn.Close()
@@ -34,35 +30,11 @@ func TestAPIResponseConfigBackoff(t *testing.T) {
 			defer server.Close()
 			client := newRemoteConfigClient(t, server.URL, "", "synthetic")
 			defer client.Close(context.Background())
-			clock := &stubClock{now: time.Now()}
-			client.clock = clock
-			client.jitter = func() float64 { return 0.5 }
-			for attempt, delay := range []time.Duration{time.Second, time.Second, 1500 * time.Millisecond, 2500 * time.Millisecond} {
+			for attempt := int32(1); attempt <= 3; attempt++ {
 				_, _ = client.FetchRemoteConfig(context.Background())
-				client.rc.mu.Lock()
-				until := client.rc.cooldownUntil
-				client.rc.mu.Unlock()
-				if got := until.Sub(clock.now); got != delay {
-					t.Errorf("attempt %d: backoff=%v want %v", attempt+1, got, delay)
+				if calls.Load() != attempt {
+					t.Errorf("attempt %d added a local retry delay: %d calls", attempt, calls.Load())
 				}
-				before := calls.Load()
-				_, _ = client.FetchRemoteConfig(context.Background())
-				if calls.Load() != before {
-					t.Error("another request dispatched inside backoff")
-				}
-				clock.now = clock.now.Add(2 * time.Minute)
-			}
-			healthy.Store(true)
-			if result, err := client.FetchRemoteConfig(context.Background()); err != nil || result.FromCache {
-				t.Fatalf("recovery: %+v %v", result, err)
-			}
-			healthy.Store(false)
-			_, _ = client.FetchRemoteConfig(context.Background())
-			client.rc.mu.Lock()
-			delay := client.rc.cooldownUntil.Sub(clock.now)
-			client.rc.mu.Unlock()
-			if delay != time.Second {
-				t.Errorf("recovery did not reset the streak: %v", delay)
 			}
 		})
 	}
@@ -111,8 +83,8 @@ func TestAPIResponseConfigPublicationWithdrawal(t *testing.T) {
 			}
 			status.Store(503)
 			result, err := client.FetchRemoteConfig(context.Background())
-			if (err != nil) != tc.clears || result.FromCache == tc.clears {
-				t.Errorf("explicit refetch: %+v err=%v; cleared=%v", result, err, tc.clears)
+			if err == nil || result.Values != nil || client.RemoteConfigBool("example", false) {
+				t.Errorf("explicit transient refetch must stay closed: %+v err=%v", result, err)
 			}
 		})
 	}

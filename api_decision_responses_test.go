@@ -203,7 +203,7 @@ func TestAPIResponseConfigRetryAfter(t *testing.T) {
 				defer client.Close(context.Background())
 				_, _ = client.FetchRemoteConfig(context.Background())
 				client.rc.mu.Lock()
-				until := client.rc.cooldownUntil
+				until := client.rc.retryWindows[client.rc.anonymousScope].until
 				client.rc.mu.Unlock()
 				if time.Until(until) < 110*time.Second {
 					t.Errorf("Retry-After floor missing: %v", until)
