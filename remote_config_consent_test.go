@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -179,7 +180,7 @@ func TestRemoteConfigConsentCacheRestartAndRegrant(t *testing.T) {
 	}
 }
 
-func TestRemoteConfigConsentResponseKeepsDispatchScope(t *testing.T) {
+func TestRemoteConfigConsentResponseCannotSettleDepartedScope(t *testing.T) {
 	seen := make(chan string, 1)
 	resume := make(chan struct{})
 	release := sync.OnceFunc(func() { close(resume) })
@@ -210,12 +211,18 @@ func TestRemoteConfigConsentResponseKeepsDispatchScope(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if got := client.RemoteConfigString("kind", "missing"); got != "anonymous-late" {
-		t.Errorf("late anonymous response did not install: %q", got)
+	if got := client.RemoteConfigString("kind", "missing"); got != "missing" {
+		t.Errorf("late anonymous response changed current-scope getters: %q", got)
+	}
+	if _, err := os.Stat(cachePath); !os.IsNotExist(err) {
+		t.Errorf("departed-scope response wrote a cache record: %v", err)
+	}
+	if _, err := client.FetchRemoteConfig(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 	record := readRemoteConfigCacheFile(t, cachePath)
-	if want := buildRemoteConfigScope("workspace-test", "develop", "", server.URL); record.Scope != want {
-		t.Errorf("response cache lost dispatch scope: %q, want %q", record.Scope, want)
+	if record.Scope != client.rc.scope {
+		t.Errorf("winning identified response cache scope: %q", record.Scope)
 	}
 }
 

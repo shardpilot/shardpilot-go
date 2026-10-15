@@ -906,37 +906,18 @@ func TestRemoteConfigCooldownWithoutCacheFails(t *testing.T) {
 	}
 }
 
-func TestRemoteConfigCooldownFloorAndExpiry(t *testing.T) {
-	for _, header := range []string{"", "0", "soon", "-5", "1.5"} {
+func TestRemoteConfigNoCooldownWithoutPositiveHint(t *testing.T) {
+	for _, header := range []string{"", "0", "soon", "-5", "1.5", "Wed, 21 Oct 2015 07:28:00 GMT"} {
 		var requests atomic.Int64
 		var script atomic.Value
-		headers := map[string]string{}
-		if header != "" {
-			headers["Retry-After"] = header
-		}
-		script.Store(rcScriptStep{status: 429, headers: headers})
+		script.Store(rcScriptStep{status: 429, headers: map[string]string{"Retry-After": header}})
 		server := newRCScriptServer(t, &requests, &script)
-
 		client := newRemoteConfigClient(t, server.URL, "", "anon-rc-1")
-		clock := &stubClock{now: time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)}
-		client.clock = clock
-
 		_, _ = client.FetchRemoteConfig(context.Background())
-		sent := requests.Load()
-
-		// An absent or malformed header floors at 1s: still in-window at
-		// +0.5s, expired at +1s.
-		clock.now = clock.now.Add(500 * time.Millisecond)
 		_, _ = client.FetchRemoteConfig(context.Background())
-		if requests.Load() != sent {
-			t.Fatalf("header %q: expected the +0.5s fetch inside the 1s floor window", header)
+		if requests.Load() != 2 {
+			t.Errorf("header %q must not add a local delay", header)
 		}
-		clock.now = clock.now.Add(500 * time.Millisecond)
-		_, _ = client.FetchRemoteConfig(context.Background())
-		if requests.Load() != sent+1 {
-			t.Fatalf("header %q: expected the +1s fetch to go out", header)
-		}
-
 		_ = client.Close(context.Background())
 		server.Close()
 	}
@@ -972,16 +953,16 @@ func TestRemoteConfigCooldownClamp(t *testing.T) {
 func TestRemoteConfigCooldownMonotonicMax(t *testing.T) {
 	rc := &remoteConfigState{}
 	now := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
-	rc.armCooldownLocked(now, remoteConfigResponse{retryAfterSeconds: 100, retryAfterPresent: true})
+	rc.armCooldownLocked("scope", "transient_429", now, remoteConfigResponse{status: 429, retryAfterSeconds: 100, retryAfterPresent: true})
 	// A later, shorter Retry-After from a straggling concurrent response
 	// must never LOWER the armed deadline.
-	rc.armCooldownLocked(now, remoteConfigResponse{retryAfterSeconds: 5, retryAfterPresent: true})
-	if want := now.Add(100 * time.Second); !rc.cooldownUntil.Equal(want) {
-		t.Fatalf("expected the deadline kept at %v, got %v", want, rc.cooldownUntil)
+	rc.armCooldownLocked("scope", "transient_429", now, remoteConfigResponse{status: 429, retryAfterSeconds: 5, retryAfterPresent: true})
+	if want := now.Add(100 * time.Second); !rc.retryWindows["scope"].until.Equal(want) {
+		t.Fatalf("expected the deadline kept at %v, got %v", want, rc.retryWindows["scope"].until)
 	}
-	rc.armCooldownLocked(now, remoteConfigResponse{retryAfterSeconds: 200, retryAfterPresent: true})
-	if want := now.Add(200 * time.Second); !rc.cooldownUntil.Equal(want) {
-		t.Fatalf("expected the deadline extended to %v, got %v", want, rc.cooldownUntil)
+	rc.armCooldownLocked("scope", "transient_429", now, remoteConfigResponse{status: 429, retryAfterSeconds: 200, retryAfterPresent: true})
+	if want := now.Add(200 * time.Second); !rc.retryWindows["scope"].until.Equal(want) {
+		t.Fatalf("expected the deadline extended to %v, got %v", want, rc.retryWindows["scope"].until)
 	}
 }
 
@@ -1347,12 +1328,17 @@ func TestRemoteConfigTruncatedResponsesClassifyByStatus(t *testing.T) {
 		t.Fatalf("a truncated 401 must close the getter snapshot, got %q", got)
 	}
 
-	// A truncated 200 is the one outcome that NEEDED its body: transient,
-	// cache-served.
+	// A malformed 200 cannot reopen this terminal scope. A new session
+	// can still use the retained record and classify that body as transient.
 	status.Store(200)
-	result, err := client.FetchRemoteConfig(context.Background())
+	if result, err := client.FetchRemoteConfig(context.Background()); err == nil || result.Values != nil {
+		t.Fatalf("truncated 200 reopened the terminal scope: %+v %v", result, err)
+	}
+	restarted := newRemoteConfigClient(t, server.URL, cachePath, "anon-rc-1")
+	defer restarted.Close(context.Background())
+	result, err := restarted.FetchRemoteConfig(context.Background())
 	if err != nil {
-		t.Fatalf("expected the truncated 200 served from cache, got %v", err)
+		t.Fatalf("expected the new session to serve cache over truncated 200, got %v", err)
 	}
 	if !result.FromCache || result.Reason != "malformed_response" || result.Values["k"] != "v" {
 		t.Fatalf("expected the cache-served malformed_response outcome, got %+v", result)

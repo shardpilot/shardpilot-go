@@ -44,20 +44,19 @@ import (
 //   - 401/403 — fails CLOSED: the cached snapshot is never served for this
 //     outcome (a revoked or wrong key must not keep supplying
 //     configuration), and clears the getter snapshot. The durable cache remains for a
-//     new session or explicit refetch under a valid credential.
+//     new session or a winning valid response under a valid credential.
 //   - Any other status (404, an unexpected 3xx, 413, other 4xx) is a
 //     PERMANENT failure: the fetch fails rather than serving stale values as
 //     healthy; getters revert to the host defaults.
 //
-// Permanent and fail-closed outcomes are authoritative for THE FETCH THAT
-// RECEIVED THEM: getters stop serving the cache. An explicit new fetch
-// classifies independently,
-// so a later transient failure still serves the last-known-good cache. This
-// lets each fetch classify independently.
+// Permanent and fail-closed outcomes close their scope for this client.
+// Explicit refetches still dispatch, but cached or fenced results cannot
+// reopen it: only an installed valid response (fresh or 304-revalidated) can.
+// A new client/session may preload the retained durable record.
 //
-// Transient outcomes arm an in-memory retry deadline. Retry-After on 429/5xx
-// is a floor; other transient outcomes use exponential backoff with jitter.
-// A fetch inside that window returns the eligible cache and original reason.
+// Only positive Retry-After hints on 429/5xx arm a retry window, per scope,
+// capped at 24 hours. Other transient outcomes add no local delay. A fetch
+// inside its scope's window returns eligible cache and the original reason.
 
 // rcMaxBodyBytes caps how much of a remote-config response body is read: the
 // server contract caps targeted configuration at 1MB (answering 413 above
@@ -178,13 +177,16 @@ type remoteConfigState struct {
 	fetchSeq uint64
 	settled  map[string]uint64
 
-	// One monotone retry deadline spans anonymous and identified scopes.
-	// The failure streak resets on an authoritative answer; the deadline expires.
-	cooldownUntil  time.Time
-	cooldownReason string
-	backoffAttempt int
+	// Both maps are bounded by the client's two request scopes.
+	retryWindows map[string]rcRetryWindow
+	closedScopes map[string]string
 	// A failed durable clear must not revive an absent publication in this process.
 	cleared map[string]*rcCache
+}
+
+type rcRetryWindow struct {
+	until  time.Time
+	reason string
 }
 
 func newRemoteConfigState(cfg Config) *remoteConfigState {
@@ -768,6 +770,7 @@ func (rc *remoteConfigState) installLocked(seq uint64, scope string, result Remo
 	}
 	switch {
 	case record != nil:
+		delete(rc.closedScopes, scope)
 		delete(rc.cleared, scope)
 		record.Scope = scope
 		rc.raiseStampAboveSuperseded(record, served, durable)
@@ -808,22 +811,65 @@ func (rc *remoteConfigState) installLocked(seq uint64, scope string, result Remo
 	return persistFailed
 }
 
-// armCooldownLocked extends the 429 cooldown from a Retry-After value:
-// digits-only seconds, floored at 1s (an absent or malformed header reads as
-// the floor — the server contract always sends >= 1), clamped at 24h, and
-// monotone (a shorter later value never lowers an armed deadline).
-func (rc *remoteConfigState) armCooldownLocked(now time.Time, resp remoteConfigResponse) {
+// armCooldownLocked extends only this scope's positive server-hint window.
+// A shorter later hint never lowers the deadline; no local floor is added.
+func (rc *remoteConfigState) armCooldownLocked(scope, reason string, now time.Time, resp remoteConfigResponse) {
 	seconds := resp.retryAfterSeconds
-	if !resp.retryAfterPresent || seconds < 1 {
-		seconds = 1
+	if !resp.retryAfterPresent || seconds <= 0 || (resp.status != 429 && resp.status < 500) {
+		return
 	}
 	if seconds > rcCooldownClampSeconds {
 		seconds = rcCooldownClampSeconds
 	}
 	deadline := now.Add(time.Duration(seconds) * time.Second)
-	if deadline.After(rc.cooldownUntil) {
-		rc.cooldownUntil = deadline
+	if deadline.After(rc.retryWindows[scope].until) {
+		if rc.retryWindows == nil {
+			rc.retryWindows = make(map[string]rcRetryWindow)
+		}
+		rc.retryWindows[scope] = rcRetryWindow{until: deadline, reason: reason}
 	}
+}
+
+func (c *Client) currentRemoteConfigScope() string {
+	if c.ConsentState() == ConsentGranted {
+		return c.rc.scope
+	}
+	return c.rc.anonymousScope
+}
+
+// settleRemoteConfigLocked uses one current-scope/sequence gate for retry
+// windows, closure and installation. Even the caller's returned values must
+// respect closure when a valid but fenced response could not reopen it.
+func (c *Client) settleRemoteConfigLocked(seq uint64, scope string, result RemoteConfigResult, newCache *rcCache, authoritative bool, served, revalidated *rcCache, failure string, resp remoteConfigResponse, now time.Time) (RemoteConfigResult, string, bool) {
+	rc := c.rc
+	persistFailed := false
+	if scope == c.currentRemoteConfigScope() && seq > rc.settled[scope] {
+		if authoritative && failure != "" {
+			if rc.closedScopes == nil {
+				rc.closedScopes = make(map[string]string)
+			}
+			rc.closedScopes[scope] = failure
+			if failure == "remote_config_not_published" {
+				persistFailed = rc.clearPublicationLocked(scope, served)
+			}
+		}
+		reason := failure
+		if reason == "" {
+			reason = result.Reason
+		}
+		rc.armCooldownLocked(scope, reason, now, resp)
+		// A transient cache fallback never installs into a closed scope.
+		if rc.closedScopes[scope] == "" || authoritative {
+			persistFailed = rc.installLocked(seq, scope, result, failure == "", newCache, authoritative, served, revalidated) || persistFailed
+		}
+	}
+	if reason := rc.closedScopes[scope]; reason != "" {
+		result = RemoteConfigResult{}
+		if failure == "" {
+			failure = reason
+		}
+	}
+	return result, failure, persistFailed
 }
 
 // rcFetchError is a fetch outcome with no usable values; the taxonomy code
@@ -928,31 +974,6 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 	seq := rc.fetchSeq
 	identifiedCache := rc.loadCacheLocked(rc.scope)
 	anonymousCache := rc.loadCacheLocked(rc.anonymousScope)
-	scope, cache := rc.anonymousScope, anonymousCache
-	if c.ConsentState() == ConsentGranted {
-		scope, cache = rc.scope, identifiedCache
-	}
-	if c.clock.Now().Before(rc.cooldownUntil) {
-		// The cooldown fast path honors the caller's context FIRST, exactly
-		// like a dispatched fetch would through the transport: a caller that
-		// already canceled (or whose deadline already passed) gets its
-		// context error — never a cache "success" it cannot distinguish from
-		// a healthy outcome — and nothing installs or adopts.
-		if ctx != nil {
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				rc.mu.Unlock()
-				return RemoteConfigResult{}, ctxErr
-			}
-		}
-		// Preserve the reason that armed the current retry deadline.
-		result, failure := serveRemoteConfigCache(cache, rc.cooldownReason)
-		rc.installLocked(seq, scope, result, failure == "", nil, false, cache, nil)
-		rc.mu.Unlock()
-		if failure != "" {
-			return RemoteConfigResult{}, rcFetchError(failure)
-		}
-		return result, nil
-	}
 	etag := ""
 	cacheSignature := ""
 	if identifiedCache != nil {
@@ -1003,8 +1024,10 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 	// URL, validator and response scope together from current consent.
 	// The attribute receipt gate is independent and remains grant-only.
 	attributesAllowed := attributedURL != "" && !c.grantReceiptGateArmed(nil)
+	rc.mu.Lock()
+	now := c.clock.Now()
 	requestURL := rc.anonymousURL
-	scope, cache = rc.anonymousScope, anonymousCache
+	scope, cache := rc.anonymousScope, anonymousCache
 	usedSignature := ""
 	etag = ""
 	if anonymousCache != nil && anonymousCache.AttributeSignature == "" {
@@ -1016,6 +1039,20 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 			requestURL, usedSignature, etag = attributedURL, attributedSignature, attributedEtag
 		}
 	}
+	if window := rc.retryWindows[scope]; now.Before(window.until) {
+		if callerCtx != nil && callerCtx.Err() != nil {
+			rc.mu.Unlock()
+			return RemoteConfigResult{}, callerCtx.Err()
+		}
+		result, failure := serveRemoteConfigCache(cache, window.reason)
+		result, failure, _ = c.settleRemoteConfigLocked(seq, scope, result, nil, false, cache, nil, failure, remoteConfigResponse{}, now)
+		rc.mu.Unlock()
+		if failure != "" {
+			return RemoteConfigResult{}, rcFetchError(failure)
+		}
+		return result, nil
+	}
+	rc.mu.Unlock()
 	resp, err := c.transport.FetchRemoteConfig(ctx, remoteConfigRequest{
 		url:         requestURL,
 		bearer:      apiKey,
@@ -1049,7 +1086,7 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 		// would keep serving a snapshot for a revoked key).
 	}
 
-	now := c.clock.Now()
+	now = c.clock.Now()
 	result, newCache, authoritative, revalidated, failure := applyRemoteConfig(cache, resp, now.UnixMilli())
 	if newCache != nil {
 		// A fresh 200 record carries the signature of the fetch that
@@ -1067,32 +1104,7 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 	}
 
 	rc.mu.Lock()
-	persistFailed := false
-	if seq > rc.settled[scope] {
-		if authoritative {
-			rc.backoffAttempt = 0
-			if failure == "remote_config_not_published" {
-				persistFailed = rc.clearPublicationLocked(scope, cache)
-			}
-		} else {
-			before := rc.cooldownUntil
-			if (resp.status == 429 || resp.status >= 500) && resp.retryAfterPresent {
-				rc.armCooldownLocked(now, resp)
-			} else {
-				rc.backoffAttempt++
-				if deadline := now.Add(c.backoffDelay(rc.backoffAttempt)); deadline.After(rc.cooldownUntil) {
-					rc.cooldownUntil = deadline
-				}
-			}
-			if rc.cooldownUntil.After(before) {
-				rc.cooldownReason = failure
-				if rc.cooldownReason == "" {
-					rc.cooldownReason = result.Reason
-				}
-			}
-		}
-	}
-	persistFailed = rc.installLocked(seq, scope, result, failure == "", newCache, authoritative, cache, revalidated) || persistFailed
+	result, failure, persistFailed := c.settleRemoteConfigLocked(seq, scope, result, newCache, authoritative, cache, revalidated, failure, resp, now)
 	rc.mu.Unlock()
 
 	if persistFailed {
@@ -1152,7 +1164,7 @@ func (c *Client) remoteConfigLookup(key string) (any, bool) {
 	}
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
-	if rc.snapshot == nil {
+	if rc.snapshot == nil || rc.closedScopes[c.currentRemoteConfigScope()] != "" {
 		return nil, false
 	}
 	value, ok := rc.snapshot[key]
@@ -1219,6 +1231,9 @@ func (c *Client) RemoteConfigValues() map[string]any {
 	}
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
+	if rc.closedScopes[c.currentRemoteConfigScope()] != "" {
+		return nil
+	}
 	return copyRemoteConfigMap(rc.snapshot)
 }
 
@@ -1233,5 +1248,8 @@ func (c *Client) RemoteConfigVersion() (float64, bool) {
 	}
 	rc.mu.Lock()
 	defer rc.mu.Unlock()
+	if rc.closedScopes[c.currentRemoteConfigScope()] != "" {
+		return 0, false
+	}
 	return rc.version, rc.hasVersion
 }
