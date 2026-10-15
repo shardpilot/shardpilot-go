@@ -436,9 +436,9 @@ func NewClient(cfg Config) (*Client, error) {
 	if normalized.ExperimentsEnabled {
 		// The experiment-assignment consumer (dark unless opted in — while
 		// off there is no subject-id mint, no fetch, no lane goroutine, no
-		// fact emission, and no new persistence keys). The preload serves
-		// persisted last-known-good assignments immediately and re-arms
-		// their exposure facts for this instance.
+		// fact emission, and no new persistence keys). Preload retains
+		// private cached state; client-id assignments and facts wait for
+		// this process's fresh host decision.
 		client.exp = newExperimentsState(normalized)
 		// The cadence jitter rides the client's seeded jitter seam — the
 		// FIRST revalidation arm included, so fresh installs spread across
@@ -832,7 +832,7 @@ func (c *Client) finishClose(ctx context.Context) error {
 	// transient bookkeeping about the same receipts the drain just settled,
 	// not an event-plane outcome worth freezing.
 	consentErr := c.finalizeConsentOutbox(ctx)
-	if errors.Is(err, ErrConsentReceiptPending) {
+	if errors.Is(err, ErrConsentReceiptPending) || errors.Is(err, errExperimentAgePending) {
 		err = consentErr
 	} else {
 		err = errors.Join(err, consentErr)
@@ -1284,13 +1284,12 @@ func (c *Client) applyRetryPacing(err error, deferUntil *time.Time, backoffAttem
 		*backoffAttempt = 0
 		return
 	}
-	if errors.Is(err, ErrConsentReceiptPending) {
-		// Consent gating is not an event-publish outcome: the batch leg was
+	if errors.Is(err, ErrConsentReceiptPending) || errors.Is(err, errExperimentAgePending) {
+		// Privacy gating is not an event-publish outcome: the batch leg was
 		// HELD, never attempted, so nothing was learned about the ingest
-		// endpoint. Event pacing stays untouched — the consent plane has
-		// its own deferral, and feeding the gate into the event backoff
-		// would keep queued events waiting behind an unrelated deferral
-		// after the receipt delivers.
+		// endpoint. Event pacing stays untouched: receipts have their own
+		// deferral and age waits for the host decision. Feeding either into
+		// event backoff would hold unrelated events after the gate opens.
 		return
 	}
 	var statusErr *HTTPStatusError
@@ -1535,10 +1534,18 @@ func (c *Client) drainQueueAdmitted(batch []Event, seenEpoch *uint64, backoffAtt
 	return batch
 }
 
-func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentEpoch *uint64, backoffAttempt *int) ([]Event, error) {
+func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentEpoch *uint64, backoffAttempt *int) (remaining []Event, failure error) {
+	var held []Event
+	defer func() {
+		remaining = c.rejoinAgeHeld(remaining, held)
+		if len(held) > 0 && failure == nil {
+			failure = errExperimentAgePending
+		}
+	}()
 	var firstErr error
 	for {
 		batch = c.dropBatchOnConsentEpoch(batch, seenConsentEpoch, backoffAttempt)
+		batch = c.separateAgeHeld(batch, &held)
 		// Consent-floor receipts dispatch first (a dispatch point of the
 		// flush) — BEFORE the denied early-return below, because receipt
 		// delivery is permitted (required) while consent is denied: a
@@ -1593,7 +1600,7 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 				c.retainedRequest = batchRequest{}
 				return batch[:0], firstErr
 			}
-			if !isPermanentPublishError(err) {
+			if !isPermanentPublishError(err) && !errors.Is(err, errExperimentAgePending) {
 				return batch, err
 			}
 			if firstErr == nil {
@@ -1694,6 +1701,9 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 				c.retainedRequest = batchRequest{}
 			}
 		}
+		if len(held) >= c.cfg.BatchSize+c.cfg.BufferSize {
+			return batch, errExperimentAgePending
+		}
 		batch = c.drainQueueAdmitted(batch, seenConsentEpoch, backoffAttempt)
 		if len(c.queue.ch) == 0 {
 			if len(batch) == 0 {
@@ -1704,7 +1714,9 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 	}
 }
 
-func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, deferUntil *time.Time, backoffAttempt *int) []Event {
+func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, deferUntil *time.Time, backoffAttempt *int) (remaining []Event) {
+	var held []Event
+	defer func() { remaining = c.rejoinAgeHeld(remaining, held) }()
 	// The startup-recovery deadline belongs to the pass that ATTEMPTS the
 	// resend, which is this one. Clearing it here — rather than rolling it in
 	// nextPacingWake when it happens to be expired — is what keeps unrelated
@@ -1754,6 +1766,7 @@ func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, def
 	// sentinel lands, and the batch filtered at the loop top must not
 	// carry a since-withdrawn fact onto the wire.
 	batch = c.dropWithdrawnExperimentFacts(batch, backoffAttempt)
+	batch = c.separateAgeHeld(batch, &held)
 	if len(batch) == 0 {
 		return batch
 	}
@@ -1905,6 +1918,9 @@ func (c *Client) publishRequest(ctx context.Context, request batchRequest, size 
 // consent flip would purge (and dead-letter) entries the 202 already
 // settled.
 func (c *Client) publishRequestResult(ctx context.Context, request batchRequest, size int) (batchResult, error) {
+	if c.ageHeldRequest(request) {
+		return batchResult{}, errExperimentAgePending
+	}
 	// The SDK attempt timeout is applied inside the transport, per HTTP
 	// attempt, NOT here: one publish can make two attempts (a gzip refusal is
 	// answered by re-sending uncompressed), and bounding the pair together
@@ -1933,6 +1949,9 @@ func (c *Client) publishRequestResult(ctx context.Context, request batchRequest,
 	defer cancelRetry()
 	result, err := c.transport.Publish(ctx, request)
 	if err != nil {
+		if errors.Is(err, errExperimentAgePending) {
+			return batchResult{}, err
+		}
 		if gate != nil && gate.ctx.Err() != nil && errors.Is(err, context.Canceled) {
 			// THIS publish's gate was cancelled, so a consent denial aborted
 			// the request mid-flight. Map the cancellation to ErrConsentDenied

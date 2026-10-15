@@ -135,13 +135,18 @@ func TestExperimentAgeBandAPI(t *testing.T) {
 			defer restarted.Close(context.Background())
 			clock := &expFakeClock{now: time.Now()}
 			restarted.clock = clock
-			if restarted.ExperimentVariant(ageGoldenExperiment) != "control" {
-				t.Fatal("positive control: durable adult assignment did not load")
+			if restarted.ExperimentVariant(ageGoldenExperiment) != "" {
+				t.Fatal("the stored adult declaration is not a current decision")
 			}
-			restarted.experimentCycle(context.Background()) // Arm the restored cadence.
+			restarted.experimentCycle(context.Background())
+			if script.requestCount() != 1 {
+				t.Fatal("startup must not revalidate the stored declaration")
+			}
+			fetchAdultAssignment(t, restarted, ageGoldenExperiment)
+			restarted.experimentCycle(context.Background())
 			clock.advance(10 * time.Minute)
 			restarted.experimentCycle(context.Background())
-			if script.requestCount() != 2 || script.request(1).URL.Query().Get("age_band") != "adult" {
+			if script.requestCount() != 3 || script.request(2).URL.Query().Get("age_band") != "adult" {
 				t.Fatal("durable revalidation lost the declared adult band")
 			}
 		})

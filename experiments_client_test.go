@@ -772,7 +772,7 @@ func TestGrammar400RemintsOncePreservingAttributesAndOwedExposures(t *testing.T)
 
 // ── fences ──────────────────────────────────────────────────────────────────
 
-func TestStaleAuthoritativeResponseServesSettledState(t *testing.T) {
+func TestStaleAuthorizationRefusalStillClosesThePlane(t *testing.T) {
 	script := &expScript{}
 	slowGate := make(chan struct{})
 	script.gates = map[int]chan struct{}{0: slowGate}
@@ -799,26 +799,19 @@ func TestStaleAuthoritativeResponseServesSettledState(t *testing.T) {
 	if !fast.Assigned || fast.Version != 2 {
 		t.Fatalf("the fast fetch must settle the fresh verdict, got %+v", fast)
 	}
-	// Release the stale 401 only now: it lost the per-key fence to the
-	// newer settled success — it must NOT latch the plane, NOT touch the
-	// cache, and its caller must receive the SETTLED state, never the
-	// discarded refusal.
 	close(slowGate)
 	outcome := <-slow
-	if outcome.err != nil {
-		t.Fatalf("the fenced-out refusal must serve the settled state, got %v", outcome.err)
+	if outcome.err == nil || !strings.Contains(outcome.err.Error(), "unauthorized") {
+		t.Fatalf("the plane refusal must reach its caller: %+v %v", outcome.result, outcome.err)
 	}
-	if !outcome.result.FromCache || outcome.result.Code != "superseded" || outcome.result.VariantKey != "treatment" {
-		t.Fatalf("expected the superseded serve of the settled state, got %+v", outcome.result)
+	if outcome.result.Assigned || client.ExperimentVariant(expTestScopeKey) != "" {
+		t.Fatal("a plane-wide refusal must close serving despite the key fence")
 	}
 	client.exp.mu.Lock()
 	latched := client.exp.authBlocked
 	client.exp.mu.Unlock()
-	if latched {
-		t.Fatalf("a stale refusal fenced out by a newer settled success must not latch the plane")
-	}
-	if v := client.ExperimentVariant(expTestScopeKey); v != "treatment" {
-		t.Fatalf("the settled assignment keeps serving, got %q", v)
+	if !latched {
+		t.Fatal("the stale authorization refusal must latch the plane")
 	}
 }
 
@@ -1376,15 +1369,17 @@ func TestRestoreFromDiskServesAndRecordsOnlyWhenApplied(t *testing.T) {
 
 	client2 := newExperimentClient(t, server.URL, func(cfg *Config) { cfg.SpoolDir = spoolDir })
 	defer client2.Close(context.Background())
-	// The restored assignment serves without a fetch...
-	if v := client2.ExperimentVariant(expTestScopeKey); v != "treatment" {
-		t.Fatalf("expected the restored variant, got %q", v)
+	if v := client2.ExperimentVariant(expTestScopeKey); v != "" {
+		t.Fatalf("restored assignment served before the current decision: %q", v)
 	}
 	if script.requestCount() != 1 {
 		t.Fatalf("the restore must not fetch")
 	}
-	// ...and records nothing: a fresh instance is a fresh session that has
-	// applied nothing yet.
+	fetchAdultAssignment(t, client2, expTestScopeKey)
+	if v := client2.ExperimentVariant(expTestScopeKey); v != "treatment" {
+		t.Fatalf("fresh decision did not serve: %q", v)
+	}
+	// A current decision alone is not an application and records nothing.
 	client2.experimentCycle(context.Background())
 	if err := client2.Flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)

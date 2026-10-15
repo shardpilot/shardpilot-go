@@ -121,7 +121,8 @@ type ExperimentSubject struct {
 	// declaring holds a non-adult age declaration whose fetch is in flight,
 	// per experiment: an age-gated assignment of it is neither served nor
 	// recorded until the server's answer to the declaration is applied.
-	declaring map[string]*expSubjectDeclaration
+	declaring     map[string]*expSubjectDeclaration
+	sentinelEpoch uint64
 }
 
 // expSubjectDeclaration is one handle fetch's non-adult age declaration.
@@ -238,6 +239,7 @@ func (s *ExperimentSubject) SetConsent(consent ExperimentSubjectConsent) error {
 
 // refusalLocked is why this handle may not fetch or serve now, or nil.
 func (s *ExperimentSubject) refusalLocked() error {
+	s.syncSentinelLocked()
 	if s.closed || s.c.closed.Load() {
 		return ErrClosed
 	}
@@ -252,6 +254,25 @@ func (s *ExperimentSubject) refusalLocked() error {
 		return ErrConsentUnknown
 	}
 	return s.c.experimentConsentRefusal()
+}
+
+// A shared withdrawal invalidates every handle, including one not called
+// until after another handle has re-enabled the plane. The generation is
+// read without the plane lock; counters take only their own leaf lock.
+func (s *ExperimentSubject) syncSentinelLocked() {
+	epoch := s.c.exp.sentinelEpoch.Load()
+	if s.sentinelEpoch == epoch {
+		return
+	}
+	for _, record := range s.withdrawAllLocked() {
+		if record.outcome != nil {
+			s.c.stats.recordExperimentOutcomeDrop(expDropRealSubjectsDisabled, 1)
+		} else {
+			s.c.stats.recordExperimentExposureDrop(expDropRealSubjectsDisabled, 1)
+		}
+	}
+	s.declaring = make(map[string]*expSubjectDeclaration)
+	s.sentinelEpoch = epoch
 }
 
 // withdrawAllLocked drops every cached assignment, owed record and
@@ -337,12 +358,17 @@ func (s *ExperimentSubject) Fetch(ctx context.Context, experimentKey string, att
 	// The declaration is registered before the refusal check, as on the
 	// client: a refused declaration ends unanswered and withdraws.
 	s.mu.Lock()
+	s.syncSentinelLocked()
+	c.exp.mu.Lock()
+	authEpoch := c.exp.authEpoch
+	c.exp.mu.Unlock()
 	consentSeq := s.consentSeq
 	s.fetchSeq++
 	seq := s.fetchSeq
 	declaration := s.beginDeclarationLocked(experimentKey, attributes, seq)
 	refusal := s.refusalLocked()
 	s.mu.Unlock()
+	c.exp.fireConsentRaceSeam("subject_declared")
 	if declaration != nil {
 		defer s.endDeclaration(experimentKey, declaration)
 	}
@@ -356,7 +382,6 @@ func (s *ExperimentSubject) Fetch(ctx context.Context, experimentKey string, att
 	}
 	e := c.exp
 	e.mu.Lock()
-	authEpoch := e.authEpoch
 	scope := expRequestScope{appKey: e.appKey, envKey: e.envKey, experimentKey: experimentKey}
 	fetchURL := buildExperimentAssignmentURL(e.baseURL, e.appKey, e.envKey, experimentKey, s.subjectKey, normalized)
 	e.mu.Unlock()
@@ -432,8 +457,8 @@ func (s *ExperimentSubject) Fetch(ctx context.Context, experimentKey string, att
 		s.rejected = fmt.Errorf("%w: the platform refused the subject (%s)", ErrInvalidExperimentSubject, experimentBodyErrorCode(resp.body, resp.bodyIncomplete))
 		countSubjectOwedLocked(e, expDropApplyRefused, s.withdrawAllLocked())
 	}
-	if !fencedOut {
-		if outcome.authoritative && !epochStale {
+	if !fencedOut || outcome.dropAll {
+		if outcome.authoritative && !epochStale && s.settled[experimentKey] < seq {
 			s.settled[experimentKey] = seq
 		}
 		// Withdrawals land whatever the consent or epoch; an install only
@@ -462,12 +487,14 @@ func (s *ExperimentSubject) Fetch(ctx context.Context, experimentKey string, att
 	if pending != nil && pending.seq == seq && applied {
 		pending.decided = true
 	}
-	// The plane's shared state: a refused, stale or fenced-out answer
-	// neither paces nor lifts the latch. A 401/403 latches unless it is
-	// stale or refused; the sentinel latches unless it is fenced out.
+	// Only a current per-key answer paces or lifts the latch. Shared
+	// authorization refusals bypass the key fence; a disabled response
+	// withdraws the entire plane.
 	switch {
 	case outcome.authBlocked:
-		if !fencedOut && (outcome.dropAll || (!epochStale && refusal == nil)) {
+		if outcome.dropAll {
+			_, _ = e.applySentinelWithdrawalLocked(e.scopeForLocked(e.currentSubjectIDLocked()), nowMS)
+		} else if !epochStale && refusal == nil {
 			e.latchAuthLocked()
 		}
 	case outcome.transient:
@@ -483,7 +510,7 @@ func (s *ExperimentSubject) Fetch(ctx context.Context, experimentKey string, att
 	// state, never the discarded variant.
 	var supersededResult ExperimentAssignmentResult
 	supersededFailure := ""
-	if fencedOut && outcome.authoritative && !epochStale {
+	if fencedOut && outcome.authoritative && !epochStale && !outcome.authBlocked {
 		current := s.entries[experimentKey]
 		if current != nil && (e.authBlocked || !experimentAttributesEqual(current.Attributes, normalized) || (pending != nil && current.ageGated())) {
 			current = nil
@@ -513,7 +540,7 @@ func (s *ExperimentSubject) Fetch(ctx context.Context, experimentKey string, att
 		return ExperimentAssignmentResult{}, refusal
 	case epochStale && !outcome.authBlocked:
 		return ExperimentAssignmentResult{}, expFetchError("unauthorized")
-	case fencedOut && outcome.authoritative:
+	case fencedOut && outcome.authoritative && !outcome.authBlocked:
 		if supersededFailure != "" {
 			return ExperimentAssignmentResult{}, expFetchError(supersededFailure)
 		}
@@ -559,6 +586,9 @@ func (s *ExperimentSubject) beginDeclarationLocked(experimentKey string, attribu
 	if !declaresNonAdultAge(attributes) {
 		if declaresAdultAge(attributes) {
 			delete(s.declaring, experimentKey)
+			if s.settled[experimentKey] < seq-1 {
+				s.settled[experimentKey] = seq - 1
+			}
 		}
 		return nil
 	}
@@ -792,6 +822,7 @@ func (s *ExperimentSubject) Close(ctx context.Context) error {
 func (s *ExperimentSubject) discardOwed() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.syncSentinelLocked()
 	remaining := len(s.owed)
 	if remaining > 0 {
 		e := s.c.exp
@@ -816,6 +847,7 @@ func (s *ExperimentSubject) discardOwed() int {
 func (s *ExperimentSubject) owedCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.syncSentinelLocked()
 	return len(s.owed)
 }
 
@@ -837,6 +869,7 @@ func (s *ExperimentSubject) deliver(ctx context.Context, network, atClose bool, 
 			return
 		}
 		s.mu.Lock()
+		s.syncSentinelLocked()
 		// An unanswered non-adult declaration holds its experiment's owed
 		// records unsent, as on the client: its answer decides whether they
 		// deliver or are withdrawn.
@@ -907,6 +940,7 @@ func (s *ExperimentSubject) commit(head *expSubjectOwed, event Event, atClose bo
 	s.commitMu.Lock()
 	defer s.commitMu.Unlock()
 	s.mu.Lock()
+	s.syncSentinelLocked()
 	// The stamp is read with the head check, under the lock every
 	// withdrawal takes: a withdrawal after it covers the fact at the send
 	// point, one before it removed the head.
@@ -939,6 +973,7 @@ func (s *ExperimentSubject) commit(head *expSubjectOwed, event Event, atClose bo
 func (s *ExperimentSubject) retire(head *expSubjectOwed, reason string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.syncSentinelLocked()
 	if len(s.owed) == 0 || s.owed[0] != head {
 		return
 	}
@@ -992,7 +1027,7 @@ func (s *ExperimentSubject) seal(ctx context.Context, head *expSubjectOwed) (*ex
 		s.mu.Unlock()
 		// The plane fails closed for every subject, as on the fetch route.
 		e.mu.Lock()
-		e.latchAuthLocked()
+		_, _ = e.applySentinelWithdrawalLocked(e.scopeForLocked(e.currentSubjectIDLocked()), c.clock.Now().UnixMilli())
 		e.mu.Unlock()
 		c.logf("shardpilot experiments: the platform disabled real-subject assignment (apply endpoint); dropped a subject handle's assignments and owed applications and latched the plane")
 		return nil, expSubjectSealSettled, ""

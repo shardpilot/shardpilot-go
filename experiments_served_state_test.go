@@ -115,13 +115,17 @@ func TestAFetchedServedStateSurvivesARestart(t *testing.T) {
 	}
 	second := newExperimentClient(t, server.URL, func(cfg *Config) { cfg.SpoolDir = dir })
 	defer second.Close(context.Background())
-	if second.ExperimentVariant(expTestScopeKey) != "treatment" {
-		t.Fatal("control: the restarted client must serve the cached assignment")
+	if second.ExperimentVariant(expTestScopeKey) != "" {
+		t.Fatal("a restored served-state pin cannot confirm current eligibility")
 	}
 	second.exp.mu.Lock()
 	restored := second.exp.entries[expTestScopeKey]
 	second.exp.mu.Unlock()
 	if restored == nil || restored.Served == nil || *restored.Served != want {
 		t.Fatalf("the restored entry must carry the same served state, got %+v", restored)
+	}
+	fetchAdultAssignment(t, second, expTestScopeKey)
+	if second.ExperimentVariant(expTestScopeKey) != "treatment" {
+		t.Fatal("the new decision must release serving")
 	}
 }

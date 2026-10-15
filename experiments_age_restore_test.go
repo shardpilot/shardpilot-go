@@ -75,8 +75,8 @@ func TestARestoredClientIDEntryWithoutAnAgeDeclarationIsNotServed(t *testing.T) 
 	if v := client2.ExperimentVariant(undeclared); v != "" {
 		t.Fatalf("an undeclared client-id assignment must not be served after a restart, got %q", v)
 	}
-	if v := client2.ExperimentVariant(declared); v != "treatment" {
-		t.Fatalf("control: an assignment declared adult must restore, got %q", v)
+	if v := client2.ExperimentVariant(declared); v != "" {
+		t.Fatalf("a stored adult declaration also requires a current decision, got %q", v)
 	}
 	if v := client2.ExperimentVariant(synthetic); v != "treatment" {
 		t.Fatalf("control: a synthetic-subject assignment has no age gate and must restore, got %q", v)

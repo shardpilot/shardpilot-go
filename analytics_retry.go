@@ -139,6 +139,9 @@ func (c *Client) analyticsAttemptContext(ctx context.Context, request batchReque
 	}
 	ctx, cancel := context.WithTimeout(ctx, remaining)
 	begin := analyticsAttempt(func() (func(bool), error) {
+		if c.ageHeldRequest(request) {
+			return nil, errExperimentAgePending
+		}
 		now := c.clock.Now()
 		for _, entry := range entries {
 			if spoolEntryExpired(entry, now) {

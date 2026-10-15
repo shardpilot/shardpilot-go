@@ -2308,7 +2308,7 @@ func (c *Client) spoolFailedBatch(request batchRequest, cause error, abandoned b
 	// flush is no failure OUTCOME either — nothing was learned from the
 	// endpoint — so the abandonment rule extends to persisted pacing state
 	// and the window survives untouched.
-	clearStale := cause != nil && deadlineMS <= 0 && !abandoned
+	clearStale := cause != nil && deadlineMS <= 0 && !abandoned && !errors.Is(cause, errExperimentAgePending)
 	if c.respoolAppendSeam != nil {
 		c.respoolAppendSeam(eligible)
 	}
@@ -2541,6 +2541,12 @@ func (c *Client) resendSpooledChunks(deferUntil *time.Time, backoffAttempt *int)
 	if s == nil {
 		return true
 	}
+	var held []spoolEntry
+	defer func() {
+		if len(held) > 0 {
+			s.requeueResend(held)
+		}
+	}()
 	// Set before the first pull (see Client.expChunkHeld).
 	if c.exp != nil {
 		c.expChunkHeld.Store(true)
@@ -2569,6 +2575,7 @@ func (c *Client) resendSpooledChunks(deferUntil *time.Time, backoffAttempt *int)
 		chunk = c.dropWithdrawnSpoolChunkMembers(chunk)
 		chunk = c.dropKeyWithdrawnSpoolChunkMembers(chunk, pulledAt)
 		chunk = c.expireResendChunk(chunk)
+		chunk = c.separateAgeHeldSpool(chunk, &held)
 		if len(chunk) == 0 {
 			continue
 		}
@@ -2612,6 +2619,10 @@ func (c *Client) resendSpooledChunks(deferUntil *time.Time, backoffAttempt *int)
 // server stopped asserting a window, so a restart must not park behind the
 // stale one.
 func (c *Client) spoolStoreResendDeadline(err error) {
+	// A local age hold learned nothing about the ingest retry window.
+	if errors.Is(err, errExperimentAgePending) {
+		return
+	}
 	deadlineMS := c.spoolDeadlineFromError(err)
 	if deadlineMS <= 0 {
 		if c.spool.clearRetryDeadline() {
@@ -2632,11 +2643,20 @@ func (c *Client) spoolStoreResendDeadline(err error) {
 // first-error semantics. backoffAttempt mirrors the batch loop's streak
 // bookkeeping: a success ends the streak, a permanent HTTP response resets
 // it.
-func (c *Client) flushSpooledChunks(ctx context.Context, backoffAttempt *int) error {
+func (c *Client) flushSpooledChunks(ctx context.Context, backoffAttempt *int) (failure error) {
 	s := c.spool
 	if s == nil {
 		return nil
 	}
+	var held []spoolEntry
+	defer func() {
+		if len(held) > 0 {
+			s.requeueResend(held)
+		}
+		if len(held) > 0 && failure == nil {
+			failure = errExperimentAgePending
+		}
+	}()
 	// Set before the first pull (see Client.expChunkHeld).
 	if c.exp != nil {
 		c.expChunkHeld.Store(true)
@@ -2665,6 +2685,7 @@ func (c *Client) flushSpooledChunks(ctx context.Context, backoffAttempt *int) er
 		chunk = c.dropWithdrawnSpoolChunkMembers(chunk)
 		chunk = c.dropKeyWithdrawnSpoolChunkMembers(chunk, pulledAt)
 		chunk = c.expireResendChunk(chunk)
+		chunk = c.separateAgeHeldSpool(chunk, &held)
 		if len(chunk) == 0 {
 			continue
 		}
