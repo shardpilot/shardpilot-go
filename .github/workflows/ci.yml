@@ -163,6 +163,9 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version: '1.27.x'
+          # gofmt reads only tracked source files; restoring module/build caches
+          # can exhaust this short job before formatting starts.
+          cache: false
 
       - name: gofmt check
         run: |
