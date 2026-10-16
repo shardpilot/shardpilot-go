@@ -2,6 +2,7 @@ package shardpilot
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -20,15 +21,23 @@ func TestPointConsentDropsAfterBlockingDispatch(t *testing.T) {
 			capture := &expWireCapture{}
 			var armed, crossed atomic.Bool
 			entered, gate := make(chan struct{}), make(chan struct{})
+			canceled := make(chan error, 1)
 			var releaseOnce sync.Once
 			release := func() { releaseOnce.Do(func() { close(gate) }) }
 			defer release()
 			block := func(r *http.Request) {
 				if armed.Load() && crossed.CompareAndSwap(false, true) {
+					if mode == "worker_publish" {
+						// The server observes disconnects after consuming the body.
+						_, _ = io.Copy(io.Discard, r.Body)
+					}
 					close(entered)
 					select {
 					case <-gate:
 					case <-r.Context().Done():
+					}
+					if mode == "worker_publish" {
+						canceled <- r.Context().Err()
 					}
 				}
 			}
@@ -47,7 +56,7 @@ func TestPointConsentDropsAfterBlockingDispatch(t *testing.T) {
 					block(r)
 				}
 				if mode == "worker_publish" && armed.Load() && crossed.Load() {
-					return // the canceled request was transmitted; this fixture does not acknowledge its facts
+					return // only return after observing cancellation; a live return would acknowledge with HTTP 200
 				}
 				capture.handler(t)(w, r)
 			})
@@ -136,6 +145,16 @@ func TestPointConsentDropsAfterBlockingDispatch(t *testing.T) {
 			if _, err := client.SetConsent(false); err != nil {
 				t.Fatal(err)
 			}
+			if mode == "worker_publish" {
+				select {
+				case err := <-canceled:
+					if err != context.Canceled {
+						t.Fatalf("publish handler returned before cancellation: %v", err)
+					}
+				case <-time.After(3 * time.Second): // below HTTPTimeout; a timeout cannot stand in for denial
+					t.Fatal("consent denial did not cancel the actual worker publish")
+				}
+			}
 			release()
 			if mode != "worker_receipt" && mode != "worker_publish" {
 				select {
@@ -155,6 +174,9 @@ func TestPointConsentDropsAfterBlockingDispatch(t *testing.T) {
 			}
 			if len(deliveredExperimentFacts(capture, ageGoldenExperiment)) != 1 {
 				t.Error("a denied point fact reached analytics beside the settled automatic control")
+			}
+			if mode == "worker_publish" && (stats.Published != 1 || stats.UnparsedBatchResponses != 0) {
+				t.Errorf("the blocked publish was acknowledged: published=%d unparsed=%d", stats.Published, stats.UnparsedBatchResponses)
 			}
 		})
 	}
