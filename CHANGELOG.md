@@ -4,6 +4,10 @@
 
 ### Changed
 
+- Terminal experiment withdrawals now clear a restored ingest retry deadline
+  when no worker-held batch or restored resend work remains. Fresh host events
+  can publish automatically without inheriting the withdrawn Retry-After;
+  pending retry work retains its pacing.
 - Consent-denial queue drains now report discarded experiment sequences to
   the worker's liveness bookkeeping. Retired fact keys can be pruned after the
   held batch settles without waiting for another experiment fact; an earlier
