@@ -447,6 +447,8 @@ if !result.Assigned && result.Reason == "age_ineligible" {
   and outcomes retain their unsealed application members, IDs and times in the bounded
   spool under a matching writable consent grant. A restart preserves the original IDs and
   waits for the current launch's host age/consent decision before applying them again.
+  Applications retained across a canonical-subject remint restore under their recorded
+  subject and complete tenant/configuration scope, rather than the new subject.
 
   Sealing replaces the local application with its sealed envelope in one atomic spool
   rewrite. Recovery also recognizes a sealed drop-time capture, so an interrupted handoff
@@ -461,7 +463,8 @@ if !result.Assigned && result.Reason == "age_ineligible" {
   terminal for the local application and its owed record, including eviction by
   another spool write. Each reports once; subsequent sweeps cannot re-admit it or
   evict newer work. These losses also increment the application's per-kind
-  `spool_capacity` or `retry_age_expired` counter. A dead-letter's entry for local
+  `spool_capacity` or `retry_age_expired` counter. This includes losses discovered
+  while loading after a stopped process; generic diagnostics and callbacks still run once. A dead-letter's entry for local
   application state is `nil`: neither the analytics wire nor a callback receives its
   subject or targeting attributes. `Close` keeps confirmed durable work replayable instead
   of counting it as `unsealed_at_close` or `undelivered_at_close`.

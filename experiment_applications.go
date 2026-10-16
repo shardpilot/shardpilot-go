@@ -267,6 +267,34 @@ func (c *Client) applicationDurableAtClose(record *expOwedExposure) bool {
 	return present && !c.spool.owed && !record.intentDelivery.expired(c.clock.Now())
 }
 
+// Construction already counted generic load losses before experiments existed.
+// Attribute their local application kinds once, without repeating letters or
+// settling owed records: dropped applications were never restored into those.
+func (c *Client) recordLoadedApplicationRetention(outcome spoolLoadOutcome) {
+	e := c.exp
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, drop := range []struct {
+		reason  string
+		entries []spoolEntry
+	}{{expDropRetryAgeExpired, outcome.expired}, {expDropSpoolCapacity, outcome.evicted}} {
+		for _, entry := range drop.entries {
+			if !entry.application {
+				continue
+			}
+			a := parseStoredApplication(entry.raw)
+			if a == nil || a.Scope != e.scopeForLocked(a.Entry.SubjectKey) {
+				continue
+			}
+			if a.Outcome != nil {
+				e.countOutcomeDropLocked(drop.reason, 1)
+			} else {
+				e.countDropLocked(drop.reason, 1)
+			}
+		}
+	}
+}
+
 func (c *Client) restoreExperimentApplications() {
 	if c.exp == nil || c.spool == nil {
 		return
@@ -282,7 +310,7 @@ func (c *Client) restoreExperimentApplications() {
 			continue
 		}
 		a := parseStoredApplication(entry.raw)
-		if a == nil || a.Scope != e.scopeForLocked(e.currentSubjectIDLocked()) {
+		if a == nil || a.Scope != e.scopeForLocked(a.Entry.SubjectKey) {
 			continue
 		}
 		duplicate := false

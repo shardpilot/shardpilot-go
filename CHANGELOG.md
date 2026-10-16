@@ -14,6 +14,8 @@
   Canonical-subject save failures hold durable admission until the same subject
   is saved. Cold restoration retains the sanitized entry, and point-application
   consent diagnostics include worker discards after blocking dispatch.
+  Retained applications restore under their recorded subject after a remint, and
+  load-time retention losses increment exposure/outcome diagnostics once.
 - Incomplete sealed-fact scope stays retryable; apply budgets rotate across
   pending experiments. Withdrawn apply answers cannot change newer plane state,
   queued point-application consent drops count once, and outcome-ID mint

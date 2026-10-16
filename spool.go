@@ -2884,14 +2884,15 @@ func (c *Client) spoolCloseRemnant(batch []Event) (gateRefused int, mirrored []s
 // initSpool runs the construction-time spool lifecycle: settle an owed wipe
 // from a previous run, then load under a persisted grant or purge under any
 // other persisted state. Returns the dead-letters to emit once construction
-// finishes (the callback must not run mid-construction).
-func (c *Client) initSpool() []SpoolDeadLetter {
+// finishes (the callback must not run mid-construction), plus load losses for
+// per-kind attribution after experiments are wired.
+func (c *Client) initSpool() ([]SpoolDeadLetter, spoolLoadOutcome) {
 	s := c.spool
 	s.settleOwedWipe()
 	if s.owedWipe() {
 		c.stats.setLastError("spool_purge_failed")
 		c.logf("shardpilot spool: a spool wipe is still owed from a previous run; disk spool disabled until it succeeds")
-		return nil
+		return nil, spoolLoadOutcome{}
 	}
 	// The RESOLVED floor truth governs the spool decision, never
 	// consent.json alone: a grant-tail reload whose record HEAL failed
@@ -2920,7 +2921,7 @@ func (c *Client) initSpool() []SpoolDeadLetter {
 			c.spoolLeftUnloaded = true
 			c.stats.setLastError("spool_dir_private_failed")
 			c.logf("shardpilot spool: the spool directory could not be made private (0700); the persisted record is not loaded and the disk spool is disabled: %v", err)
-			return nil
+			return nil, spoolLoadOutcome{}
 		}
 		// GRANT-ONLY under the RESOLVED floor: with the consent floor opted
 		// in, initConsentFloor already resolved the live truth before this
@@ -2972,6 +2973,7 @@ func (c *Client) initSpool() []SpoolDeadLetter {
 			// folded into the deferred init letters (the callback must not
 			// run mid-construction).
 			if drops := s.takeCapacityDrops(); len(drops) > 0 {
+				outcome.evicted = append(outcome.evicted, drops...)
 				c.stats.spoolEvicted.Add(uint64(len(drops)))
 				letters = append(letters, spoolDeadLetterFrom(SpoolDropCapacity, drops))
 			}
@@ -2979,7 +2981,7 @@ func (c *Client) initSpool() []SpoolDeadLetter {
 				c.recordSpoolPersistFailure()
 			}
 			c.initialDeferUntil = outcome.deferUntil
-			return letters
+			return letters, outcome
 		}
 	}
 	// No persisted grant (absent, denied, or unreadable record) — or, under
@@ -2994,9 +2996,9 @@ func (c *Client) initSpool() []SpoolDeadLetter {
 		c.logf("shardpilot spool: purging the spool record at init failed; a wipe is owed and the disk spool is disabled until it succeeds: %v", err)
 	}
 	if len(dropped) == 0 {
-		return nil
+		return nil, spoolLoadOutcome{}
 	}
-	return []SpoolDeadLetter{spoolDeadLetterFrom(SpoolDropConsent, dropped)}
+	return []SpoolDeadLetter{spoolDeadLetterFrom(SpoolDropConsent, dropped)}, spoolLoadOutcome{}
 }
 
 // applySpoolConsent applies a SetConsent decision to the disk side: persist

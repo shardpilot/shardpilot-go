@@ -4185,7 +4185,7 @@ func TestConsentFloorFailedHealPreservesResolvedGrantSpool(t *testing.T) {
 	}
 
 	client.spool = newDiskSpool(cfg)
-	letters := client.initSpool()
+	letters, _ := client.initSpool()
 	if len(letters) != 0 {
 		t.Fatalf("expected NO dead-letters for a spool the resolved grant covers, got %v", letters)
 	}

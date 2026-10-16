@@ -422,12 +422,13 @@ func NewClient(cfg Config) (*Client, error) {
 	// and the resend queue the worker consumes. Dead-letters it produced are
 	// emitted only after the client is fully wired.
 	var initDeadLetters []SpoolDeadLetter
+	var initRetention spoolLoadOutcome
 	if normalized.SpoolDir != "" {
 		client.spool = newDiskSpool(normalized)
 		client.spool.countForeign = func(n int) {
 			client.stats.spoolForeignMerged.Add(uint64(n))
 		}
-		initDeadLetters = client.initSpool()
+		initDeadLetters, initRetention = client.initSpool()
 	}
 	if normalized.RemoteConfigEnabled {
 		client.rc = newRemoteConfigState(normalized)
@@ -469,6 +470,7 @@ func NewClient(cfg Config) (*Client, error) {
 			client.stats.setLastError("experiment_dir_private_failed")
 			client.logf("shardpilot experiments: the state directory could not be made private (0700); persisted experiment state is not loaded and nothing serves from it")
 		}
+		client.recordLoadedApplicationRetention(initRetention)
 		// The spool is loaded (initSpool ran above), so the restored fact-key
 		// history can be pruned to the keys the restored facts still carry.
 		client.restoreExperimentApplications()
