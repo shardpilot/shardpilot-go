@@ -427,7 +427,10 @@ func TestAgeQuarantinePreservesTransportPacing(t *testing.T) {
 	}
 	deadline := rig.client.clock.Now().Add(time.Minute)
 	deferUntil, attempt := deadline, 3
-	rig.client.applyRetryPacing(err, &deferUntil, &attempt)
+	// Probe the real Flush error without mutating the live worker's pacing
+	// bookkeeping from this goroutine. The durable checks below stay live.
+	pacing := &Client{clock: rig.client.clock}
+	pacing.applyRetryPacing(err, &deferUntil, &attempt)
 	if !deferUntil.Equal(deadline) || attempt != 3 {
 		t.Error("age quarantine changed the ingest retry schedule")
 	}
