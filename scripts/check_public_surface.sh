@@ -2838,29 +2838,27 @@ if [ "${1:-}" = "--write-baseline" ]; then
       exit 2
     fi
     lane_b_leaf="$(basename "$LANE_B_BASELINE")"
-    # ⚠ THE WRITE-ASIDE IS A PATH TOO, AND NOTHING ABOVE CHECKS IT. Every guard
-    # so far inspects the BASELINE leaf -- symlink, regular file, link count. The
-    # temporary had a predictable name and was opened with an ordinary redirect,
-    # so a symlink planted at that name is followed: the redirect truncates
-    # whatever it points at, and the rename then installs the symlink as the
-    # baseline while the gate prints WROTE. Measured, by what stands at the path:
+    # mkdir atomically refuses every existing entry, including a FIFO. Keep
+    # both temporaries inside this directory on the baseline's filesystem.
+    lane_b_private=".lane_b_write.$$.${RANDOM}${RANDOM}"
+    lane_b_owned=no
+    lane_b_tmp="$lane_b_private/baseline"
+    lane_b_tprobe="$lane_b_private/rename"
+    trap 'lane_b_cleanup_rc=$?; set +e
+      if [ "$lane_b_owned" = yes ]; then
+        rm -f -- "$lane_b_tmp" "$lane_b_tprobe" "$lane_b_tprobe.dst"
+        rmdir -- "$lane_b_private"
+      fi
+      exit "$lane_b_cleanup_rc"' EXIT
+    if ! mkdir -m 700 -- "$lane_b_private"; then
+      # refusal:structural
+      echo "REFUSING: could not create the private baseline directory." >&2
+      exit 2
+    fi
+    lane_b_owned=yes
     #
-    #   plain  > t   with t -> outside.txt     the outside file was TRUNCATED
-    #   set -C > t   nothing at the path       rc 0
-    #   set -C > t   regular / symlink-to-file / symlink-to-dir / dangling
-    #                                          rc 1, outside file intact
-    #
-    # `set -C` makes bash open with O_CREAT|O_EXCL, and O_EXCL refuses a symlink,
-    # even a dangling one -- so the open IS the check, with no window between
-    # them. The random suffix is not the guarantee, only a way to stop a blind
-    # pre-creation from turning every write into a refusal.
-    lane_b_tmp="$lane_b_leaf.tmp.$$.${RANDOM}${RANDOM}"
-    #
-    # Opened ONCE, in this shell, and its status read. A probe in a subshell
-    # would create the file and then make the real open fail on its own probe --
-    # and a failed `exec` redirect does not abort the shell when its status is
-    # taken (measured: the check below is reached, rc 0), so this needs no
-    # errexit gymnastics.
+    # Open once on fd 9, checking allocation separately from serialization.
+    # Reading exec's status preserves the distinct open-failure refusal.
     #
     # ⚠ AND NO `2>/dev/null` ON THIS LINE. `exec` applies its redirections to the
     # SHELL, not to a command, so `exec 9>tmp 2>/dev/null` opens the write-aside
@@ -2871,25 +2869,13 @@ if [ "${1:-}" = "--write-baseline" ]; then
     # judge() separates "wrong exit" from "right exit, wrong reason" -- the exit
     # was 2, exactly as expected, and only the reason showed the damage.
     lane_b_aside=yes
-    set -C
     exec 9>"$lane_b_tmp" || lane_b_aside=no
-    set +C
     if [ "$lane_b_aside" = no ]; then
       # refusal:structural
-      # ⚠ ITS OWN MESSAGE, BECAUSE SHARING ONE HID A COVERAGE GAP. This said
-      # "serialisation failed" so that the existing control -- whose lever makes
-      # the directory unwritable, and therefore fails HERE -- would keep matching.
-      # That convenience made one control look like it covered two handlers: the
-      # partial-write handler below could be deleted with every control green.
-      # A shared message is a shared alibi.
+      # Allocation inside the new directory can still fail (for example,
+      # ENOSPC or a descriptor limit). The permission control reaches mkdir,
+      # so it does not cover this distinct open failure.
       echo "REFUSING: could not create the write-aside for the baseline." >&2
-      if [ -e "$lane_b_tmp" ] || [ -L "$lane_b_tmp" ]; then
-        echo "  Something already stands at the write-aside path. An exclusive" >&2
-        echo "  create refuses it rather than writing through whatever it" >&2
-        echo "  points at, so nothing outside this directory was touched." >&2
-      else
-        echo "  The directory would not accept a new file." >&2
-      fi
       exit 2
     fi
   {
@@ -2927,8 +2913,8 @@ if [ "${1:-}" = "--write-baseline" ]; then
     # naming where the failure is silent and the consequence is a wrong number.
     # ⚠ NOT DRIVEN, AND THE LEVER SEARCH IS RECORDED RATHER THAN OMITTED. This
     # fires when the open SUCCEEDED and the writes then failed -- ENOSPC, a
-    # quota, a full pipe. Every lever available to an unprivileged control fails
-    # the OPEN instead: measured, this gate writes temporaries of up to 299158
+    # quota, a full pipe. Permission controls now stop at directory allocation.
+    # In the earlier open-failure measurement, temporaries reached 299158
     # bytes during a run while the baseline is 1195, so no `ulimit -f` threshold
     # lets the scan through and stops this write. A filesystem genuinely full at
     # this instant needs privileges CI does not have. Named, not implied.
@@ -2957,7 +2943,6 @@ if [ "${1:-}" = "--write-baseline" ]; then
     # extension: a real rename in the held directory, not a scrape of --help.
     # Where it is missing the gate refuses instead of falling back to semantics
     # it has just measured to be unsafe.
-    lane_b_tprobe=".lane_b_rename_probe.$$.${RANDOM}${RANDOM}"
     lane_b_have_T=no
     if : > "$lane_b_tprobe" 2>/dev/null; then
       if mv -fT "$lane_b_tprobe" "$lane_b_tprobe.dst" 2>/dev/null; then
@@ -3107,15 +3092,23 @@ if [ -n "${PUBLIC_SURFACE_BASE_REF:-}" ]; then
       exit 2
     fi
   fi
-  # ⚠ THE TARGET'S FORMAT, ASKED BEFORE ITS ROWS ARE READ. I had this check and
-  # lost it while restructuring the probe: a format-1 target parsed by the
-  # format-2 reader binds every path to the count field, so every current path
-  # looks absent and an untouched PR fails. A skew is not a finding about the
-  # code; it is announced and skipped, which is the same treatment a target that
-  # predates the file gets.
+  # A pure format change can skip an incomparable target. Source changes
+  # must be split out: otherwise raising the format also disables the ratchet
+  # for the same staged source that raised its baseline.
   if [ -n "$base_copy" ]; then
     base_version="$(printf '%s' "$base_copy" | { grep -m1 '^# format-version:' || [ $? -eq 1 ]; } | tr -dc '0-9')"
     if [ "${base_version:-1}" != "$LANE_B_FORMAT" ]; then
+      if ! lane_b_skew_src="$(git diff --cached --name-only "$PUBLIC_SURFACE_BASE_REF" -- '*.go')"; then
+        # refusal:structural
+        echo "REFUSING: could not compare staged Go sources across the baseline format change." >&2
+        exit 2
+      fi
+      if [ -n "$lane_b_skew_src" ]; then
+        # refusal:structural
+        echo "REFUSING: split Go source changes from the baseline format change:" >&2
+        printf '  %s\n' "$lane_b_skew_src" >&2
+        exit 2
+      fi
       echo "  (baseline-vs-target check skipped: target baseline is format ${base_version:-1}, this script reads $LANE_B_FORMAT)"
       base_copy=""
     fi

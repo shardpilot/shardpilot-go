@@ -619,6 +619,28 @@ restore
 old_commit="$(synth_target '/^# format-version:/d')"
 expect_ref "an older-format target is skipped, not misparsed" "$old_commit" 0 "target baseline is format 1"
 
+# Stage the new source before writing its raised baseline: both reads use the
+# index. A pure migration above still skips; source plus migration must split.
+printf 'package shardpilot\n\n// See %s.\n' "$marker" > "$NEW_FILE"
+git add -- "$NEW_FILE"
+must_write_baseline "format skew cannot hide a raised source baseline"
+expect_ref "format skew cannot hide a raised source baseline" "$old_commit" 2 "split Go source changes"
+restore
+STUB="$(mktemp -d)"
+{
+  echo '#!/bin/sh'
+  echo 'if [ "$1" = diff ] && [ "${2:-}" = --cached ] && [ "${3:-}" = --name-only ]; then exit 23; fi'
+  printf 'exec %q "$@"\n' "$(command -v git)"
+} > "$STUB/git"
+chmod +x "$STUB/git"
+checks=$((checks + 1))
+lane_b_skew_rc=0
+lane_b_skew_out="$(env "PATH=$STUB:$PATH" "PUBLIC_SURFACE_BASE_REF=$old_commit" "$GATE" 2>&1)" || lane_b_skew_rc=$?
+judge "an unreadable format-skew source diff refuses" "$lane_b_skew_rc" 2 "could not compare staged Go sources" "$lane_b_skew_out"
+rm -f "$STUB/git"
+rmdir "$STUB"
+STUB=""
+
 # ⚠ A COUNT THAT MUST BE REACHED, same rule the gate applies to itself: a run
 # that asserts nothing prints the same closing line as a run that asserts
 # everything. Raise this when you add a control; it refuses when one goes.
@@ -733,7 +755,7 @@ lane_b_swapstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
   echo '#!/bin/sh'
   printf 'REAL_MV=%q\n' "$(command -v mv)"
   echo 'case " $* " in'
-  echo '  *public-surface-lane-b-baseline.txt.tmp.*)'
+  echo '  *.lane_b_write.*/baseline*)'
   printf '    "$REAL_MV" %q %q 2>/dev/null &&\n' "$PWD/scripts" "$PWD/scripts.real"
   printf '      ln -s %q %q 2>/dev/null &&\n' "$lane_b_outside/scripts" "$PWD/scripts"
   printf '      : > %q\n' "$lane_b_outside/.hook-fired"
@@ -891,7 +913,7 @@ done
 lane_b_mvstub="$(mktemp -d "$lane_b_scratch/XXXXXX")"
 {
   echo '#!/bin/sh'
-  echo 'case " $* " in *public-surface-lane-b-baseline.txt.tmp.*) exit 1 ;; esac'
+  echo 'case " $* " in *.lane_b_write.*/baseline*) exit 1 ;; esac'
   printf 'exec %q "$@"\n' "$(command -v mv)"
 } > "$lane_b_mvstub/mv"
 chmod +x "$lane_b_mvstub/mv"
@@ -1025,14 +1047,82 @@ else
   lane_b_out="$("$GATE" --write-baseline 2>&1)" || lane_b_rc=$?
   chmod 755 scripts 2>/dev/null || true
   chattr -i scripts 2>/dev/null || true
-  # The needle names the OPEN failure, which is what this lever actually causes.
-  # It used to name the string both handlers shared, which read as covering the
-  # partial-write handler too; that one has no lever and is named as a limit in
-  # the gate rather than implied to be covered here.
-  judge "a failed write-aside create refuses" "${lane_b_rc:-0}" 2 "could not create the write-aside" "$lane_b_out"
+  # The permission lever now fails the private-directory allocation. It does
+  # not exercise an open or partial-write failure inside an allocated directory.
+  judge "a failed private-directory create refuses" "${lane_b_rc:-0}" 2 "could not create the private baseline directory" "$lane_b_out"
 fi
 chmod 755 scripts 2>/dev/null || true
 chattr -i scripts 2>/dev/null || true
+
+# Each entry belongs to this clone. Stabilize names only in the child shell
+# and bound the FIFO case, whose regression is a blocked open rather than a code.
+for lane_b_collision in fifo dir symlink probe-link probe-destination; do
+  lane_b_case="$(mktemp -d "$lane_b_scratch/XXXXXX")"
+  printf 'PRESERVE FIXTURE BYTES\n' > "$lane_b_case/precious"
+  cp "$lane_b_case/precious" "$lane_b_case/outside"
+  cat > "$lane_b_case/startup" <<'WRITER_STARTUP'
+if [ -z "${SP_WRITER_STARTED:-}" ]; then
+  export SP_WRITER_STARTED=yes
+  unset RANDOM
+  RANDOM=1234
+  collision_path="scripts/.lane_b_write.$$.12341234"
+  case "$SP_WRITER_CASE" in
+    fifo) mkfifo "$collision_path" ;;
+    dir) mkdir "$collision_path" ;;
+    symlink) ln -s "$SP_WRITER_SENTINEL" "$collision_path" ;;
+    probe-link)
+      collision_path="scripts/.lane_b_rename_probe.$$.12341234"
+      ln -s "$SP_WRITER_SENTINEL" "$collision_path" ;;
+    probe-destination)
+      collision_path="scripts/.lane_b_rename_probe.$$.12341234.dst"
+      cp "$SP_WRITER_SENTINEL" "$collision_path" ;;
+  esac
+  printf '%s\n' "$collision_path" > "$SP_WRITER_MARKER"
+fi
+WRITER_STARTUP
+  checks=$((checks + 1))
+  lane_b_collision_rc=0
+  lane_b_collision_out="$(env "BASH_ENV=$lane_b_case/startup" \
+    "SP_WRITER_CASE=$lane_b_collision" "SP_WRITER_SENTINEL=$lane_b_case/outside" \
+    "SP_WRITER_MARKER=$lane_b_case/marker" \
+    timeout --kill-after=2s 90s "$GATE" --write-baseline 2>&1)" || lane_b_collision_rc=$?
+  lane_b_collision_label="writer collision preserves fixture entries ($lane_b_collision)"
+  if [ ! -s "$lane_b_case/marker" ]; then
+    echo "FAIL [$lane_b_collision_label]: the collision was not established." >&2
+    failures=$((failures + 1))
+  else
+    lane_b_collision_path="$(cat "$lane_b_case/marker")"
+    case "$lane_b_collision" in
+      fifo|dir|symlink)
+        judge "$lane_b_collision_label" "$lane_b_collision_rc" 2 "could not create the private baseline directory" "$lane_b_collision_out"
+        if ! cmp -s "$SAVED" "$BASELINE"; then
+          echo "FAIL [$lane_b_collision_label]: the refused write changed the baseline." >&2
+          failures=$((failures + 1))
+        fi ;;
+      *) judge "$lane_b_collision_label" "$lane_b_collision_rc" 0 "WROTE" "$lane_b_collision_out" ;;
+    esac
+    if ! cmp -s "$lane_b_case/precious" "$lane_b_case/outside"; then
+      echo "FAIL [$lane_b_collision_label]: the outside fixture changed." >&2
+      failures=$((failures + 1))
+    fi
+    if [ "$lane_b_collision" = probe-destination ] && ! cmp -s "$lane_b_case/precious" "$lane_b_collision_path"; then
+      echo "FAIL [$lane_b_collision_label]: the existing probe destination changed." >&2
+      failures=$((failures + 1))
+    fi
+    case "$lane_b_collision_path" in
+      scripts/.lane_b_write.*|scripts/.lane_b_rename_probe.*)
+        if [ -d "$lane_b_collision_path" ] && [ ! -L "$lane_b_collision_path" ]; then
+          rmdir -- "$lane_b_collision_path"
+        else
+          rm -f -- "$lane_b_collision_path"
+        fi ;;
+      *) echo "REFUSING: unexpected writer fixture path." >&2; exit 2 ;;
+    esac
+  fi
+  rm -f "$lane_b_case/startup" "$lane_b_case/precious" "$lane_b_case/outside" "$lane_b_case/marker"
+  rmdir "$lane_b_case"
+  restore
+done
 
 # ⚠ THE VARIABLE IS REFUSED, NOT IGNORED. Removing an input silently is a worse
 # interface than refusing it, and this control is also what turns "nothing sets
@@ -1396,7 +1486,7 @@ rm -rf "$lane_b_symreal"
 # read it -- and then the control below read it and got an empty string, because
 # a variable defined after its reader is not a variable. Still exactly one
 # literal in the file; only its position moved.
-EXPECTED_CHECKS=63
+EXPECTED_CHECKS=70
 
 # ⚠ THE WORKFLOW'S STATED SIZE IS GATED, BECAUSE CORRECTING IT BY HAND HAS NOW
 # FAILED THREE TIMES. That comment carries a planning threshold -- how many
