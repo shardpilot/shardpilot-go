@@ -492,7 +492,7 @@ func TestAnAgeRefusalLeavesNoDurableCopyToReplay(t *testing.T) {
 				}
 				return 1
 			},
-			captured: 1,
+			captured: 0, // the sealed handoff already persisted this fact
 		},
 	}
 	for _, stage := range stagings {
@@ -926,6 +926,7 @@ func TestAnApplyRouteAgeRefusalDeadLettersOutsideTheSweep(t *testing.T) {
 	ctx := context.Background()
 	var client atomic.Pointer[Client]
 	var deadLettered atomic.Int64
+	var localApplications atomic.Int64
 	var once sync.Once
 	reentered := make(chan error, 1)
 	rig := newAgeWithdrawRig(t, t.TempDir(), func(cfg *Config) {
@@ -933,7 +934,13 @@ func TestAnApplyRouteAgeRefusalDeadLettersOutsideTheSweep(t *testing.T) {
 			if letter.Reason != SpoolDropTerminal {
 				return
 			}
-			deadLettered.Add(int64(len(letter.Envelopes)))
+			for _, envelope := range letter.Envelopes {
+				if len(envelope) == 0 {
+					localApplications.Add(1)
+				} else {
+					deadLettered.Add(1)
+				}
+			}
 			once.Do(func() {
 				// The integrator fetches the experiment again: an adult
 				// assignment installs, and the install sweeps.
@@ -984,6 +991,9 @@ func TestAnApplyRouteAgeRefusalDeadLettersOutsideTheSweep(t *testing.T) {
 	}
 	if letters := deadLettered.Load(); letters != 2 {
 		t.Errorf("the refusal must dead-letter the 2 withdrawn spooled facts, got %d", letters)
+	}
+	if localApplications.Load() != 1 {
+		t.Error("the refused unsealed application must also be retired without exposing its payload")
 	}
 }
 

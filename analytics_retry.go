@@ -19,9 +19,10 @@ const analyticsDedupWindow = 15 * time.Minute
 // shared pointer keeps the clock across retained-batch rebuilds and spool
 // copies without changing the event's ID, timestamp or serialized bytes.
 type eventDelivery struct {
-	intakeMS        int64
-	ambiguousMS     atomic.Int64
-	expiredReported atomic.Bool
+	intakeMS             int64
+	ambiguousMS          atomic.Int64
+	expiredReported      atomic.Bool
+	pointConsentReported atomic.Bool
 }
 
 func newEventDelivery(now time.Time) *eventDelivery {
@@ -47,7 +48,10 @@ func (d *eventDelivery) expired(now time.Time) bool {
 }
 
 func (entry spoolEntry) wire() spoolEventWire {
-	wire := spoolEventWire{Raw: entry.raw, InternalFact: entry.internalFact}
+	wire := spoolEventWire{Raw: entry.raw, InternalFact: entry.internalFact, ApplicationID: entry.applicationID, ApplicationExtra: entry.applicationExtra}
+	if entry.application {
+		wire.Raw, wire.Application = nil, entry.raw
+	}
 	if entry.delivery != nil {
 		wire.IntakeUnixMS = entry.delivery.intakeMS
 		wire.AmbiguousUnixMS = entry.delivery.ambiguousMS.Load()

@@ -29,6 +29,10 @@ func (q *boundedQueue) enqueue(event Event) bool {
 }
 
 func (q *boundedQueue) drainAll() int {
+	return q.drainAllVisit(nil)
+}
+
+func (q *boundedQueue) drainAllVisit(visit func(Event)) int {
 	count := 0
 	for {
 		select {
@@ -37,6 +41,9 @@ func (q *boundedQueue) drainAll() int {
 				if q.drainedFactSeq.CompareAndSwap(seen, event.expFactSeq) {
 					break
 				}
+			}
+			if visit != nil {
+				visit(event)
 			}
 			count++
 		default:

@@ -3,7 +3,9 @@ package shardpilot
 import "time"
 
 type Event struct {
-	delivery *eventDelivery
+	delivery            *eventDelivery
+	expApplicationID    string
+	expApplicationExtra bool
 
 	// ID is a caller UUID (versions 4, 5 or 7, RFC variant), trimmed and sent lowercase.
 	// Empty IDs are generated as UUIDv7 once at intake and retained on retries.

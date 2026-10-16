@@ -162,9 +162,10 @@ type Client struct {
 	// worker's batches (delivered, dropped, or spooled and no longer held).
 	// The worker publishes it (publishExpPipelineLow) from
 	// workerLastFactSeq, the highest sequence it has received, the queue's
-	// highest discarded sequence, and the lowest one its batch still holds; a stale mark only keeps a key live
-	// longer. expChunkHeld is set while the worker holds pulled spool resend
-	// chunks: their members are out of the mirror's reach for a moment, so
+	// highest discarded sequence, and the lowest one its batch still holds;
+	// a stale mark only keeps a key live longer. expChunkHeld is set while
+	// the worker holds pulled spool resend chunks: their members are out
+	// of the mirror's reach for a moment, so
 	// the prune waits.
 	expFactSeq        atomic.Uint64
 	expPipelineLow    atomic.Uint64
@@ -422,12 +423,13 @@ func NewClient(cfg Config) (*Client, error) {
 	// and the resend queue the worker consumes. Dead-letters it produced are
 	// emitted only after the client is fully wired.
 	var initDeadLetters []SpoolDeadLetter
+	var initRetention spoolLoadOutcome
 	if normalized.SpoolDir != "" {
 		client.spool = newDiskSpool(normalized)
 		client.spool.countForeign = func(n int) {
 			client.stats.spoolForeignMerged.Add(uint64(n))
 		}
-		initDeadLetters = client.initSpool()
+		initDeadLetters, initRetention = client.initSpool()
 	}
 	if normalized.RemoteConfigEnabled {
 		client.rc = newRemoteConfigState(normalized)
@@ -445,6 +447,9 @@ func NewClient(cfg Config) (*Client, error) {
 		// the ±10% window instead of herding at exactly 300s.
 		client.exp.jitterFn = client.jitterValue
 		client.exp.captureOwedDropFn = client.captureOwedExposuresForDrop
+		client.exp.persistApplicationFn = client.persistExperimentApplication
+		client.exp.retireApplicationFn = client.retireExperimentApplication
+		client.exp.withdrawApplicationsFn = client.withdrawExperimentApplications
 		client.exp.dropFn = client.stats.recordExperimentExposureDrop
 		client.exp.outcomeDropFn = client.stats.recordExperimentOutcomeDrop
 		client.exp.captureRetryFn = client.appendCaptureEntries
@@ -466,8 +471,10 @@ func NewClient(cfg Config) (*Client, error) {
 			client.stats.setLastError("experiment_dir_private_failed")
 			client.logf("shardpilot experiments: the state directory could not be made private (0700); persisted experiment state is not loaded and nothing serves from it")
 		}
+		client.recordLoadedApplicationRetention(initRetention)
 		// The spool is loaded (initSpool ran above), so the restored fact-key
 		// history can be pruned to the keys the restored facts still carry.
+		client.restoreExperimentApplications()
 		client.pruneExperimentFactKeys()
 		client.expLaneDone = make(chan struct{})
 		client.expLaneCtx, client.expLaneCancel = context.WithCancel(context.Background())
@@ -1419,6 +1426,22 @@ func (c *Client) jitterValue() float64 {
 	return rand.Float64()
 }
 
+// discardConsentEvents is the accounting boundary for actual consent
+// discards, including exits reached after blocking receipt, spool or publish
+// work. The delivery receipt prevents another owner from counting a point twice.
+func (c *Client) discardConsentEvents(batch []Event, drainQueue bool) {
+	for _, event := range batch {
+		c.countPointEventConsentDrop(event)
+	}
+	dropped := len(batch)
+	if drainQueue {
+		dropped += c.queue.drainAllVisit(c.countPointEventConsentDrop)
+	}
+	if dropped > 0 {
+		c.stats.dropped.Add(uint64(dropped))
+	}
+}
+
 // dropBatchOnConsentEpoch discards the worker-held batch when a consent
 // denial happened since the worker last looked. Events cleared here count
 // as Dropped; events drained from the shared queue are counted by
@@ -1435,7 +1458,7 @@ func (c *Client) dropBatchOnConsentEpoch(batch []Event, seenEpoch *uint64, backo
 	}
 	*seenEpoch = epoch
 	if len(batch) > 0 {
-		c.stats.dropped.Add(uint64(len(batch)))
+		c.discardConsentEvents(batch, false)
 		batch = batch[:0]
 		*backoffAttempt = 0
 		// The retained wire bytes described the discarded batch.
@@ -1464,6 +1487,7 @@ func (c *Client) admitReceivedEvent(batch []Event, event Event, seenEpoch *uint6
 	}
 	batch = c.dropBatchOnConsentEpoch(batch, seenEpoch, backoffAttempt)
 	if event.intakeConsentEpoch < *seenEpoch {
+		c.countPointEventConsentDrop(event)
 		c.stats.dropped.Add(1)
 		return batch
 	}
@@ -1565,10 +1589,7 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 			return batch, contextCause(ctx)
 		}
 		if c.consentDenied() {
-			dropped := len(batch) + c.queue.drainAll()
-			if dropped > 0 {
-				c.stats.dropped.Add(uint64(dropped))
-			}
+			c.discardConsentEvents(batch, true)
 			// A denial-drained flush discards the pipeline the streak was
 			// tracking along with it — including the retained wire bytes,
 			// which described the discarded batch: kept, they could resend a
@@ -1591,10 +1612,7 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 		// swallowed into firstErr and the flush keeps draining.
 		if err := c.flushSpooledChunks(ctx, backoffAttempt); err != nil {
 			if errors.Is(err, ErrConsentDenied) {
-				dropped := len(batch) + c.queue.drainAll()
-				if dropped > 0 {
-					c.stats.dropped.Add(uint64(dropped))
-				}
+				c.discardConsentEvents(batch, true)
 				*backoffAttempt = 0
 				// The retained wire bytes described the discarded batch.
 				c.retainedRequest = batchRequest{}
@@ -1653,8 +1671,7 @@ func (c *Client) flushAvailable(ctx context.Context, batch []Event, seenConsentE
 					// and the publish: drop and drain exactly like the
 					// denied path above, keeping Flush's nil result. The
 					// streak goes with the discarded batch.
-					dropped := len(batch) + c.queue.drainAll()
-					c.stats.dropped.Add(uint64(dropped))
+					c.discardConsentEvents(batch, true)
 					*backoffAttempt = 0
 					c.retainedRequest = batchRequest{}
 					return batch[:0], firstErr
@@ -1755,7 +1772,7 @@ func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, def
 		return batch
 	}
 	if c.consentDenied() {
-		c.stats.dropped.Add(uint64(len(batch)))
+		c.discardConsentEvents(batch, false)
 		// Denial-discard: the streak belonged to the dropped batch.
 		*backoffAttempt = 0
 		c.retainedRequest = batchRequest{}
@@ -1918,6 +1935,11 @@ func (c *Client) publishRequest(ctx context.Context, request batchRequest, size 
 // consent flip would purge (and dead-letter) entries the 202 already
 // settled.
 func (c *Client) publishRequestResult(ctx context.Context, request batchRequest, size int) (batchResult, error) {
+	for _, entry := range request.retryEntries {
+		if entry.application {
+			return batchResult{}, errLocalExperimentApplication
+		}
+	}
 	if c.ageHeldRequest(request) {
 		return batchResult{}, errExperimentAgePending
 	}
@@ -1940,6 +1962,7 @@ func (c *Client) publishRequestResult(ctx context.Context, request batchRequest,
 		defer stop()
 	}
 	if c.consentDenied() {
+		c.countPointRequestConsentDrop(request)
 		// Not a transport failure: callers count the batch as Dropped,
 		// matching their own pre-publish denial paths.
 		return batchResult{}, ErrConsentDenied
@@ -1953,6 +1976,7 @@ func (c *Client) publishRequestResult(ctx context.Context, request batchRequest,
 			return batchResult{}, err
 		}
 		if gate != nil && gate.ctx.Err() != nil && errors.Is(err, context.Canceled) {
+			c.countPointRequestConsentDrop(request)
 			// THIS publish's gate was cancelled, so a consent denial aborted
 			// the request mid-flight. Map the cancellation to ErrConsentDenied
 			// regardless of the CURRENT consent state: a quick re-grant can
