@@ -4,6 +4,10 @@
 
 ### Changed
 
+- Consent-denial queue drains now report discarded experiment sequences to
+  the worker's liveness bookkeeping. Retired fact keys can be pruned after the
+  held batch settles without waiting for another experiment fact; an earlier
+  worker-held fact still keeps its key live.
 - The opt-in disk spool now retains the client's unsealed experiment exposure
   and outcome applications with their original IDs and clocks. Atomic sealing,
   drop-time capture recovery, current-launch age/consent gates and withdrawal

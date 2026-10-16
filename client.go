@@ -161,10 +161,11 @@ type Client struct {
 	// every experiment fact with a lower sequence has left the queue and the
 	// worker's batches (delivered, dropped, or spooled and no longer held).
 	// The worker publishes it (publishExpPipelineLow) from
-	// workerLastFactSeq, the highest sequence it has received, and the
-	// lowest one its batch still holds; a stale mark only keeps a key live
-	// longer. expChunkHeld is set while the worker holds pulled spool resend
-	// chunks: their members are out of the mirror's reach for a moment, so
+	// workerLastFactSeq, the highest sequence it has received, the queue's
+	// highest discarded sequence, and the lowest one its batch still holds;
+	// a stale mark only keeps a key live longer. expChunkHeld is set while
+	// the worker holds pulled spool resend chunks: their members are out
+	// of the mirror's reach for a moment, so
 	// the prune waits.
 	expFactSeq        atomic.Uint64
 	expPipelineLow    atomic.Uint64
@@ -1515,15 +1516,15 @@ func (c *Client) admitReceivedEvent(batch []Event, event Event, seenEpoch *uint6
 
 // publishExpPipelineLow publishes the worker's low-water mark
 // (Client.expPipelineLow): the lowest pipeline sequence of an experiment
-// fact the worker's batch holds, else one past the highest it has received.
-// The queue holds facts in sequence order and the worker takes them in that
-// order, so every fact with a lower sequence has left both. Worker
+// fact the worker's batch holds, else one past the highest it has received
+// or the queue discarded directly. The held-batch minimum still protects an
+// earlier member while a concurrent drain retires later queued facts. Worker
 // goroutine only; a no-op without the experiments consumer.
 func (c *Client) publishExpPipelineLow(batch []Event) {
 	if c.exp == nil {
 		return
 	}
-	low := c.workerLastFactSeq + 1
+	low := max(c.workerLastFactSeq, c.queue.drainedFactSeq.Load()) + 1
 	for i := range batch {
 		if seq := batch[i].expFactSeq; seq != 0 && seq < low {
 			low = seq
