@@ -100,11 +100,17 @@ sources match it. Split source changes from the format change; a failed source
 comparison refuses separately. The pure format-only control remains valid.
 
 CI uses `scripts/select_public_surface_base.sh` for PR bases, existing-push bases
-and newly created refs. A new ref uses the immutable event commit's first parent,
-fetching missing shallow ancestry by that SHA. Only a commit that declares no
-parent uses the default branch. Failed object reads and fetches refuse. Run
-`python3 scripts/test_public_surface_base.py` for the ten local Git scenarios;
-they use `file://` clones so shallow-history tests actually lack the parent.
+and newly created refs. A new ref snapshots other published heads and tags,
+excludes its own ref, and fetches those immutable object ids with complete history.
+It selects the unique newest published ancestor reachable from the event. Missing
+or incomparable ancestry, unreadable inventories and failed fetches refuse;
+an unrelated default branch is never substituted.
+Run `python3 scripts/test_public_surface_base.py` for twenty-one local Git scenarios.
+The four whole-gate scenes cover first publications with single and multiple
+commits, clean multi-commit documentation, and an ordinary existing-ref push.
+Their bare remote proves the new commits were absent before the publication;
+`file://` clones make shallow-history tests genuinely shallow. The whole-gate
+scenes use the same GNU tools as the baseline-writing harness.
 
 ## Bad versions
 

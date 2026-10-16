@@ -593,9 +593,11 @@ committed checkout to exercise the repository fixtures; see the
 
 Baseline writes allocate a private directory on the baseline filesystem before
 creating temporary files. A baseline format change must be separate from Go
-source changes. CI compares a new ref with its event commit's first parent;
-`python3 scripts/test_public_surface_base.py` exercises that selection with local
-Git fixtures, including shallow history and a ref that moves after the event.
+source changes. CI compares a new ref with the newest published ancestor of its
+immutable event, excluding the new ref from the other published heads and tags.
+Missing or incomparable published ancestry refuses the comparison.
+`python3 scripts/test_public_surface_base.py` runs local Git fixtures and four
+whole-gate scenes, including a first publication containing several commits.
 
 ## Conventions & boundaries
 

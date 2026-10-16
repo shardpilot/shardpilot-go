@@ -850,21 +850,27 @@ func TestCIComparisonBaseTreatsContextAsData(t *testing.T) {
 		script.WriteString(line + "\n")
 	}
 	eventSHA := strings.Repeat("c", 40)
-	fetchedSHA := strings.Repeat("d", 40)
-	parentSHA := strings.Repeat("e", 40)
-	type scene struct{ name, branch, base, before, parent, wantFetch, wantSelected string }
+	publishedSHA := strings.Repeat("e", 40)
+	type scene struct {
+		name, branch, base, before, shallow, wantSelected string
+		wantFetch                                         []string
+	}
 	cases := []scene{}
 	for i, branch := range []string{"main", "x$(printf${IFS}SCENE_EXECUTED)", "x`printf${IFS}SCENE_EXECUTED`", `a"b`, "a'b", "y;z", "p(q)"} {
-		cases = append(cases, scene{name: fmt.Sprint("new-root-ref-", i), branch: branch,
-			before: strings.Repeat("0", 40), wantFetch: branch, wantSelected: fetchedSHA})
+		cases = append(cases, scene{name: fmt.Sprint("new-ref-", i), branch: branch,
+			before: strings.Repeat("0", 40), shallow: "true", wantSelected: publishedSHA,
+			wantFetch: []string{"fetch", "--no-tags", "--unshallow", "origin", eventSHA, publishedSHA}})
 	}
 	cases = append(cases,
 		scene{name: "pull-request", branch: "main", base: strings.Repeat("a", 40),
-			before: strings.Repeat("0", 40), wantFetch: strings.Repeat("a", 40), wantSelected: strings.Repeat("a", 40)},
+			before: strings.Repeat("0", 40), wantSelected: strings.Repeat("a", 40),
+			wantFetch: []string{"fetch", "--depth=1", "origin", strings.Repeat("a", 40)}},
 		scene{name: "existing-push", branch: "main", before: strings.Repeat("b", 40),
-			wantFetch: strings.Repeat("b", 40), wantSelected: strings.Repeat("b", 40)},
-		scene{name: "new-ref-parent", branch: "main", before: strings.Repeat("0", 40),
-			parent: parentSHA, wantSelected: parentSHA})
+			wantSelected: strings.Repeat("b", 40),
+			wantFetch:    []string{"fetch", "--depth=1", "origin", strings.Repeat("b", 40)}},
+		scene{name: "new-ref-complete-history", branch: "main", before: strings.Repeat("0", 40),
+			shallow: "false", wantSelected: publishedSHA,
+			wantFetch: []string{"fetch", "--no-tags", "origin", eventSHA, publishedSHA}})
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if out, err := exec.Command(git, "check-ref-format", "--branch", tc.branch).CombinedOutput(); err != nil {
@@ -875,7 +881,7 @@ func TestCIComparisonBaseTreatsContextAsData(t *testing.T) {
 			render := strings.NewReplacer(
 				"${{ github.event.pull_request.base.sha }}", tc.base,
 				"${{ github.event.before }}", tc.before,
-				"${{ github.event.repository.default_branch }}", tc.branch,
+				"${{ github.ref }}", "refs/heads/"+tc.branch,
 				"${{ github.sha }}", eventSHA)
 			dir := t.TempDir()
 			argsFile, envFile := filepath.Join(dir, "args"), filepath.Join(dir, "env")
@@ -885,20 +891,25 @@ func TestCIComparisonBaseTreatsContextAsData(t *testing.T) {
 printf '%s\0' "$@" >> "$WORKFLOW_ARGS"
 printf '\0' >> "$WORKFLOW_ARGS"
 case "$1" in
-  fetch) exit 0 ;;
+  fetch) : > "$WORKFLOW_FETCHED" ;;
+  check-ref-format) exit 0 ;;
+  ls-remote)
+    printf '%s\trefs/heads/published\n%s\t%s\n' "$WORKFLOW_PUBLISHED" "$WORKFLOW_EVENT" "$WORKFLOW_REF" ;;
   rev-parse)
-    case "$3" in
-      'FETCH_HEAD^{commit}') printf '%s\n' "$WORKFLOW_SELECTED" ;;
-      *) printf '%s\n' "$WORKFLOW_EVENT" ;;
-    esac ;;
+    if [ "$2" = --is-shallow-repository ]; then
+      if [ -f "$WORKFLOW_FETCHED" ]; then printf 'false\n'; else printf '%s\n' "$WORKFLOW_SHALLOW"; fi
+    elif [ "$3" = 'FETCH_HEAD^{commit}' ]; then printf '%s\n' "$WORKFLOW_SELECTED"
+    elif [ "$3" = "$WORKFLOW_EVENT^{commit}" ]; then printf '%s\n' "$WORKFLOW_EVENT"
+    else printf '%s\n' "$WORKFLOW_PUBLISHED"; fi ;;
   cat-file)
     case "$2" in
       commit)
         printf 'tree %s\n' "$WORKFLOW_EVENT"
-        if [ -n "$WORKFLOW_PARENT" ]; then printf 'parent %s\n' "$WORKFLOW_PARENT"; fi ;;
+        printf 'parent %s\n' "$WORKFLOW_PUBLISHED" ;;
       -e) exit 0 ;;
       *) exit 23 ;;
     esac ;;
+  merge-base) printf '%s\n' "$WORKFLOW_PUBLISHED" ;;
   *) exit 23 ;;
 esac
 `
@@ -907,7 +918,8 @@ esac
 			}
 			cmd := exec.Command(bash, "-e", "-c", render.Replace(script.String()))
 			cmd.Env = []string{"PATH=" + dir + ":/usr/bin:/bin", "GITHUB_ENV=" + envFile, "WORKFLOW_ARGS=" + argsFile,
-				"WORKFLOW_EVENT=" + eventSHA, "WORKFLOW_PARENT=" + tc.parent, "WORKFLOW_SELECTED=" + tc.wantSelected}
+				"WORKFLOW_EVENT=" + eventSHA, "WORKFLOW_PUBLISHED=" + publishedSHA, "WORKFLOW_SELECTED=" + tc.wantSelected,
+				"WORKFLOW_REF=refs/heads/" + tc.branch, "WORKFLOW_SHALLOW=" + tc.shallow, "WORKFLOW_FETCHED=" + filepath.Join(dir, "fetched")}
 
 			for _, line := range strings.Split(header, "\n") {
 				if strings.TrimSpace(line) == "" || strings.TrimSpace(line) == "env:" {
@@ -930,18 +942,23 @@ esac
 			if err != nil {
 				t.Fatal(err)
 			}
-			var fetches []string
+			var fetches, refChecks []string
 			for _, call := range strings.Split(strings.TrimSuffix(string(args), "\x00\x00"), "\x00\x00") {
 				if strings.HasPrefix(call, "fetch\x00") {
 					fetches = append(fetches, strings.ReplaceAll(call, "\x00", "\n")+"\n")
+				} else if strings.HasPrefix(call, "check-ref-format\x00") {
+					refChecks = append(refChecks, strings.ReplaceAll(call, "\x00", "\n")+"\n")
 				}
 			}
-			if tc.wantFetch == "" {
-				if len(fetches) != 0 {
-					t.Fatalf("a present event parent required no fetch, got %q", fetches)
-				}
-			} else if want := "fetch\n--depth=1\norigin\n" + tc.wantFetch + "\n"; len(fetches) != 1 || fetches[0] != want {
+			if want := strings.Join(tc.wantFetch, "\n") + "\n"; len(fetches) != 1 || fetches[0] != want {
 				t.Fatalf("context changed fetch arguments: got %q, want one call %q", fetches, want)
+			}
+			if tc.base == "" && tc.before == strings.Repeat("0", 40) {
+				if want := "check-ref-format\nrefs/heads/" + tc.branch + "\n"; len(refChecks) != 1 || refChecks[0] != want {
+					t.Fatalf("context changed ref arguments: got %q, want one call %q", refChecks, want)
+				}
+			} else if len(refChecks) != 0 {
+				t.Fatalf("an existing base unexpectedly checked a ref: %q", refChecks)
 			}
 			output, err := os.ReadFile(envFile)
 			if err != nil || string(output) != "SP_LANE_B_BASE="+tc.wantSelected+"\n" {
