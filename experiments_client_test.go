@@ -125,10 +125,11 @@ func (c *expFakeClock) advance(d time.Duration) {
 // BatchSize=1 the worker parks holding a retained batch — the staging seam
 // the owed-exposure tests use to make ErrQueueFull deterministic.
 type expWireCapture struct {
-	mu        sync.Mutex
-	status    int
-	hits      int
-	envelopes []map[string]any
+	mu         sync.Mutex
+	status     int
+	retryAfter string
+	hits       int
+	envelopes  []map[string]any
 	// raw keeps each accepted batch's request body as sent.
 	raw [][]byte
 }
@@ -145,6 +146,7 @@ func (w *expWireCapture) handler(t *testing.T) http.HandlerFunc {
 		w.mu.Lock()
 		w.hits++
 		status := w.status
+		retryAfter := w.retryAfter
 		if status == 0 {
 			status = http.StatusAccepted
 		}
@@ -155,6 +157,9 @@ func (w *expWireCapture) handler(t *testing.T) http.HandlerFunc {
 		count := len(batch.Events)
 		w.mu.Unlock()
 		rw.Header().Set("Content-Type", "application/json")
+		if retryAfter != "" {
+			rw.Header().Set("Retry-After", retryAfter)
+		}
 		rw.WriteHeader(status)
 		if status == http.StatusAccepted {
 			_, _ = rw.Write([]byte(fmt.Sprintf(`{"accepted":%d,"rejected":0,"duplicates":0}`, count)))

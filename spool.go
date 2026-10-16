@@ -280,11 +280,15 @@ func spoolEntryExpired(entry spoolEntry, now time.Time) bool {
 // diskSpool is the spool state machine: an in-memory mirror of spool.json
 // (authoritative — a failed rewrite keeps the mirror and retries), the
 // startup resend queue, and the owed-wipe fail-closed flag. All fields are
-// guarded by mu. It performs no callbacks and touches no client state:
+// guarded by mu except the atomic withdrawalEpoch. It performs no callbacks
+// and touches no client state:
 // methods return the dropped/added entries for the Client layer to count and
 // dead-letter outside the lock.
 type diskSpool struct {
 	mu sync.Mutex
+	// withdrawalEpoch lets the worker reconcile its pacing after a terminal
+	// withdrawal. The mirror changes even when its disk rewrite fails.
+	withdrawalEpoch atomic.Uint64
 
 	dir       string
 	maxEvents int
@@ -1823,6 +1827,7 @@ func (s *diskSpool) removeMatchingAfter(first func(), matches func(raw json.RawM
 		}
 	}
 	s.resend = keptResend
+	s.withdrawalEpoch.Add(1)
 	persistFailed = s.saveLocked() != nil
 	return removed, persistFailed
 }

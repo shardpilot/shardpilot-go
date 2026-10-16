@@ -889,6 +889,24 @@ func (c *Client) run() {
 	// hint-less fallback schedule (backoffDelay) grows per failure; a
 	// successful publish resets it.
 	backoffAttempt := 0
+	var seenSpoolWithdrawal uint64
+	reconcileSpoolWithdrawal := func() {
+		if c.spool == nil {
+			return
+		}
+		epoch := c.spool.withdrawalEpoch.Load()
+		if epoch == seenSpoolWithdrawal {
+			return
+		}
+		seenSpoolWithdrawal = epoch
+		// A terminal withdrawal can empty restored resend work while the
+		// worker is idle. Retain pacing only while some retry work owns it;
+		// otherwise fresh events must not inherit the withdrawn deadline.
+		if len(batch) == 0 && !c.spoolHasResendWork() {
+			deferUntil = time.Time{}
+			backoffAttempt = 0
+		}
+	}
 	// deferTimer wakes the worker AT the backpressure deadline, so the held
 	// batch retries when the server said it may — not at the next flush tick,
 	// which can be much later when FlushInterval exceeds the Retry-After. It
@@ -900,6 +918,7 @@ func (c *Client) run() {
 		}
 	}()
 	for {
+		reconcileSpoolWithdrawal()
 		c.publishExpPipelineLow(batch)
 		hadBatch := len(batch) > 0
 		batch = c.dropBatchOnConsentEpoch(batch, &seenConsentEpoch, &backoffAttempt)
@@ -991,6 +1010,9 @@ func (c *Client) run() {
 		}
 		select {
 		case event := <-queueEvents:
+			// Withdrawal may have completed while select was waiting. Check
+			// before admitting a fresh event, which would look like held work.
+			reconcileSpoolWithdrawal()
 			batch = c.admitReceivedEvent(batch, event, &seenConsentEpoch, &backoffAttempt)
 			if len(batch) >= c.cfg.BatchSize && !c.publishDeferred(deferUntil) {
 				batch = c.publishWorkerBatch(batch, &seenConsentEpoch, &deferUntil, &backoffAttempt)
