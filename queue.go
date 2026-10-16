@@ -24,10 +24,17 @@ func (q *boundedQueue) enqueue(event Event) bool {
 }
 
 func (q *boundedQueue) drainAll() int {
+	return q.drainAllVisit(nil)
+}
+
+func (q *boundedQueue) drainAllVisit(visit func(Event)) int {
 	count := 0
 	for {
 		select {
-		case <-q.ch:
+		case event := <-q.ch:
+			if visit != nil {
+				visit(event)
+			}
 			count++
 		default:
 			return count

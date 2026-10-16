@@ -696,7 +696,7 @@ func (s *ExperimentSubject) Apply(experimentKey string) (string, map[string]any)
 	}
 	s.exposed[tuple] = true
 	e := s.c.exp
-	app, err := newExperimentApplication(now)
+	app, err := s.c.newExperimentApplication(now)
 	if !s.recordable(entry) || err != nil {
 		e.mu.Lock()
 		e.countDropLocked(expDropNotRecordable, 1)
@@ -730,8 +730,11 @@ func (s *ExperimentSubject) TrackOutcome(experimentKey, outcomeKey string, outco
 	if !ok {
 		return fmt.Errorf("%w: outcome value must be an integer of magnitude at most 2^53", ErrInvalidExperimentFact)
 	}
-	outcomeID, err := newExperimentApplicationID()
+	outcomeID, err := s.c.mintExperimentApplicationID()
 	if err != nil {
+		s.c.exp.mu.Lock()
+		s.c.exp.countOutcomeDropLocked(expDropNotRecordable, 1)
+		s.c.exp.mu.Unlock()
 		return ErrExperimentFactUnavailable
 	}
 	now := s.c.clock.Now()
@@ -998,6 +1001,7 @@ func (s *ExperimentSubject) seal(ctx context.Context, head *expSubjectOwed) (*ex
 	e := c.exp
 	owed := head.copy(s.session)
 	resp, err := c.postExposureApplication(ctx, head.experimentKey, owed)
+	e.fireConsentRaceSeam("subject_apply_answer")
 	if errors.Is(err, errExperimentApplyConsentRefused) {
 		return nil, expSubjectSealKept, ""
 	}
@@ -1007,46 +1011,54 @@ func (s *ExperimentSubject) seal(ctx context.Context, head *expSubjectOwed) (*ex
 		}
 		resp = remoteConfigResponse{}
 	}
+	// Handle withdrawal precedes the shared plane lock everywhere. Holding
+	// both makes membership and all shared response effects one decision.
+	s.mu.Lock()
+	e.mu.Lock()
+	var logAfterUnlock func()
+	defer func() {
+		e.mu.Unlock()
+		s.mu.Unlock()
+		if logAfterUnlock != nil {
+			logAfterUnlock()
+		}
+	}()
+	s.syncSentinelLocked()
+	if s.consent != ExperimentSubjectConsentGranted || c.experimentConsentRefusal() != nil || len(s.owed) == 0 || s.owed[0] != head {
+		return nil, expSubjectSealSettled, ""
+	}
 	code := experimentBodyErrorCode(resp.body, resp.bodyIncomplete)
 	switch {
 	case resp.status >= 200 && resp.status < 300 && !resp.bodyIncomplete:
 		if parsed := parseSealedExposure(resp.body, owed.eventName()); parsed != nil {
-			e.mu.Lock()
 			e.backoffAttempt = 0
-			e.mu.Unlock()
 			return parsed, expSubjectSealOK, ""
 		}
 	case resp.status == 403 && code == "experiment_apply_disabled":
-		e.mu.Lock()
 		e.applyBlocked = true
-		e.mu.Unlock()
 		return nil, expSubjectSealKept, ""
 	case resp.status == 403 && code == expSentinelRealSubjectsDisabled:
-		s.mu.Lock()
-		s.countDrops(expDropRealSubjectsDisabled, s.withdrawAllLocked())
-		s.mu.Unlock()
+		countSubjectOwedLocked(e, expDropRealSubjectsDisabled, s.withdrawAllLocked())
 		// The plane fails closed for every subject, as on the fetch route.
-		e.mu.Lock()
 		_, _ = e.applySentinelWithdrawalLocked(e.scopeForLocked(e.currentSubjectIDLocked()), c.clock.Now().UnixMilli())
-		e.mu.Unlock()
-		c.logf("shardpilot experiments: the platform disabled real-subject assignment (apply endpoint); dropped a subject handle's assignments and owed applications and latched the plane")
+		logAfterUnlock = func() {
+			c.logf("shardpilot experiments: the platform disabled real-subject assignment (apply endpoint); dropped a subject handle's assignments and owed applications and latched the plane")
+		}
 		return nil, expSubjectSealSettled, ""
 	case resp.status == 409 && experimentApplyAgeRefusal(resp.body, resp.bodyIncomplete):
-		s.mu.Lock()
-		s.countDrops(expDropAgeIneligible, s.withdrawAgeLocked(head.experimentKey, true))
-		s.mu.Unlock()
+		countSubjectOwedLocked(e, expDropAgeIneligible, s.withdrawAgeLocked(head.experimentKey, true))
 		return nil, expSubjectSealSettled, ""
 	case resp.status >= 300 && resp.status < 500 && resp.status != 408 && resp.status != 429:
-		c.logf("shardpilot experiments: the platform refused a subject handle's %s for experiment %q (HTTP %d); dropped (apply_refused)", owed.kind(), head.experimentKey, resp.status)
+		logAfterUnlock = func() {
+			c.logf("shardpilot experiments: the platform refused a subject handle's %s for experiment %q (HTTP %d); dropped (apply_refused)", owed.kind(), head.experimentKey, resp.status)
+		}
 		return nil, expSubjectSealDropped, expDropApplyRefused
 	}
 	seconds, present := 0, false
 	if resp.status == 429 || resp.status >= 500 {
 		seconds, present = parseRemoteConfigRetryAfter(resp.retryAfterRaw)
 	}
-	e.mu.Lock()
 	e.paceTransientLocked(c.clock.Now().UnixMilli(), seconds, present)
-	e.mu.Unlock()
 	return nil, expSubjectSealKept, ""
 }
 

@@ -316,23 +316,14 @@ func TestReinstallPreservesUnlandedCaptureDebt(t *testing.T) {
 	}()
 	client.SetConsent(true)
 	parkWorkerWithFullQueue(t, client, capture)
+	failApplicationHandoffStorage(client)
 	fetchAndApply(t, client, expTestScopeKey) // owed exposure (queue full)
+	if client.Snapshot().SpoolPersistFailed == 0 {
+		t.Fatal("the actual sealed handoff must reach its storage failure")
+	}
 
 	// The spool cannot persist: the kill's capture freezes in the pair.
-	client.spool.mu.Lock()
-	client.spool.renameFn = func(oldpath, newpath string) error {
-		if strings.HasSuffix(newpath, spoolFileName) {
-			return errors.New("disk full")
-		}
-		return os.Rename(oldpath, newpath)
-	}
-	client.spool.appendFn = func(path string, payload []byte) error {
-		if strings.HasSuffix(path, spoolFileName) {
-			return errors.New("disk full")
-		}
-		return appendPrivateFile(path, payload)
-	}
-	client.spool.mu.Unlock()
+
 	if result, err := client.FetchExperimentAssignment(context.Background(), expTestScopeKey, nil); err != nil || result.Code != "not_found" {
 		t.Fatalf("the kill fetch must land not_found, got %+v err=%v", result, err)
 	}
@@ -375,6 +366,7 @@ func TestReinstallPreservesUnlandedCaptureDebt(t *testing.T) {
 	// record survives the pair's outranked delete half.
 	client.spool.mu.Lock()
 	client.spool.renameFn = os.Rename
+	client.spool.appendFn = appendPrivateFile
 	client.spool.mu.Unlock()
 	client.exp.retryDurableSync()
 	record, err := os.ReadFile(filepath.Join(spoolDir, expCacheFileName))

@@ -242,7 +242,7 @@ type Config struct {
 	//     receipt, no persisted record): record decisions before Close.
 	ConsentFloor *ConsentFloorConfig
 
-	// SpoolMaxEvents caps how many undelivered events the disk spool retains;
+	// SpoolMaxEvents caps retained envelopes and local experiment applications;
 	// past it the OLDEST events are dropped (through OnSpoolDeadLetter).
 	// Zero defaults to 2000 when SpoolDir is set.
 	SpoolMaxEvents int
@@ -300,6 +300,9 @@ type Config struct {
 	// refused-tighten fail-closed path deterministically — a real chmod on
 	// a test-owned directory always succeeds. nil in production (os.Chmod).
 	experimentDirChmodForTests func(name string, mode os.FileMode) error
+	// nil in production; isolates a failed application-ID mint without
+	// replacing the process-wide cryptographic random source.
+	experimentIDMinterForTests func() (string, error)
 }
 
 // ConsentFloorConfig configures the opt-in client-side consent floor. The

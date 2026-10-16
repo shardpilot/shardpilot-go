@@ -118,9 +118,13 @@ func (c *Client) enqueueExperimentFact(event Event, atClose bool) (uint64, error
 		// not the configured actor's: its player's consent admitted it.
 		return 0, ErrConsentActorMismatch
 	}
+	delivery := event.delivery
 	event, err := c.prepareEvent(event)
 	if err != nil {
 		return 0, err
+	}
+	if delivery != nil {
+		event.delivery = delivery
 	}
 	// The same size rule as host events: a fact ingest would reject is never
 	// queued. It is dropped before the queue, so the caller counts it in its
@@ -211,6 +215,15 @@ func (c *Client) emitOwedExposure(ctx context.Context, experimentKey string, rec
 		e.mu.Unlock()
 		return false, expDropAgeIneligible, true
 	}
+	if owed.entry.ageGated() && !e.ageConfirmed[experimentKey] {
+		e.mu.Unlock()
+		return false, "age_pending", false
+	}
+	if e.persistApplicationFn != nil && !e.persistApplicationFn(experimentKey, record) {
+		terminal := record.withdrawn
+		e.mu.Unlock()
+		return false, "application_unsaved", terminal
+	}
 	// The fact's per-experiment withdrawal stamp, read with the record
 	// still owed under e.mu: a refusal landing after this point withdraws
 	// the fact wherever it is in the pipeline.
@@ -231,7 +244,7 @@ func (c *Client) emitOwedExposure(ctx context.Context, experimentKey string, rec
 	if sealed == nil {
 		var dropped string
 		var keep bool
-		sealed, dropped, keep = c.sealExperimentApplication(ctx, experimentKey, record, owed)
+		sealed, dropped, keep = c.sealExperimentApplication(ctx, experimentKey, record, owed, purgeEpoch)
 		switch {
 		case dropped != "":
 			return false, dropped, true
@@ -280,11 +293,16 @@ func (c *Client) emitOwedExposure(ctx context.Context, experimentKey string, rec
 		return false, expDropForeignScope, true
 	}
 	event.expKeyWithdrawEpoch = keyEpoch
-	// Seam: the window between this emission's own consent check (above)
-	// and the fact intake's gate re-check — a consent flip landing here is
-	// the raced refusal the intake reports.
-	e.fireConsentRaceSeam("exposure_enqueue")
-	seq, err := c.enqueueExperimentFact(event, atClose)
+	var seq uint64
+	var err error
+	event, err = c.durablyHandoffApplication(experimentKey, record, event)
+	if err == nil {
+		// Consent may change between the confirmed disk handoff and intake.
+		e.fireConsentRaceSeam("exposure_enqueue")
+		event.expApplicationID, event.expApplicationExtra = applicationID(record), record.extra
+		event.delivery = record.intentDelivery
+		seq, err = c.enqueueExperimentFact(event, atClose)
+	}
 	if errors.Is(err, ErrEventTooLarge) {
 		// Ingest rejects this fact on every attempt: it leaves the queue,
 		// counted once, and never holds the experiment's later facts.
@@ -335,9 +353,10 @@ func (c *Client) emitOwedExposure(ctx context.Context, experimentKey string, rec
 //     never retries;
 //   - 408, 429, 5xx, no response, a 2xx without a usable fact: kept,
 //     paced by the plane's shared Retry-After/backoff deadline.
-func (c *Client) sealExperimentApplication(ctx context.Context, experimentKey string, record *expOwedExposure, owed expOwedCopy) (sealed *expSealedFact, dropped string, keep bool) {
+func (c *Client) sealExperimentApplication(ctx context.Context, experimentKey string, record *expOwedExposure, owed expOwedCopy, purgeEpoch uint64) (sealed *expSealedFact, dropped string, keep bool) {
 	e := c.exp
 	resp, err := c.postExposureApplication(ctx, experimentKey, owed)
+	e.fireConsentRaceSeam("apply_answer")
 	if errors.Is(err, errExperimentApplyConsentRefused) {
 		return nil, "", true // a denial refused or aborted it: kept, unpaced; the denial's purge settles it
 	}
@@ -347,22 +366,35 @@ func (c *Client) sealExperimentApplication(ctx context.Context, experimentKey st
 		}
 		resp = remoteConfigResponse{}
 	}
+	// The response and every disposition share the withdrawal lock. Checking
+	// only the successful fact after classifying would leave counters, latches,
+	// refetch tickets and shared pacing vulnerable to an obsolete answer.
+	e.mu.Lock()
+	var logAfterUnlock func()
+	defer func() {
+		e.mu.Unlock()
+		if logAfterUnlock != nil {
+			logAfterUnlock()
+		}
+	}()
+	current := false
+	for _, pending := range e.pendingExposure[experimentKey] {
+		current = current || pending == record
+	}
+	if e.purgeEpoch != purgeEpoch || record.withdrawn || !current || c.experimentConsentRefusal() != nil {
+		return nil, "", true
+	}
 	nowMS := c.clock.Now().UnixMilli()
 	switch {
 	case resp.status >= 200 && resp.status < 300 && !resp.bodyIncomplete:
 		if parsed := parseSealedExposure(resp.body, owed.eventName()); parsed != nil {
-			e.mu.Lock()
 			e.backoffAttempt = 0
-			e.mu.Unlock()
 			return parsed, "", false
 		}
 	case resp.status == 403 && experimentBodyErrorCode(resp.body, resp.bodyIncomplete) == "experiment_apply_disabled":
-		e.mu.Lock()
 		e.applyBlocked = true
-		e.mu.Unlock()
 		return nil, "", true
 	case resp.status == 403 && experimentBodyErrorCode(resp.body, resp.bodyIncomplete) == expSentinelRealSubjectsDisabled:
-		e.mu.Lock()
 		// The assignment route's sentinel, from the apply route: the same
 		// withdrawal — the latch, the cached and durable assignments, the
 		// owed applications (each counted real_subjects_disabled), and the
@@ -381,11 +413,12 @@ func (c *Client) sealExperimentApplication(ctx context.Context, experimentKey st
 			}
 			e.pendingExposure = make(map[string][]*expOwedExposure)
 		}
-		e.mu.Unlock()
 		if persistFailed {
 			c.stats.setLastError("experiment_cache_persist_failed")
 		}
-		c.logf("shardpilot experiments: the platform disabled real-subject assignment (apply endpoint); dropped the cached assignments, the owed applications and their subject fact keys")
+		logAfterUnlock = func() {
+			c.logf("shardpilot experiments: the platform disabled real-subject assignment (apply endpoint); dropped the cached assignments, the owed applications and their subject fact keys")
+		}
 		return nil, expDropRealSubjectsDisabled, false
 	case resp.status == 409 && experimentApplyAgeRefusal(resp.body, resp.bodyIncomplete):
 		// The platform refused the application's pinned declaration. The
@@ -393,24 +426,23 @@ func (c *Client) sealExperimentApplication(ctx context.Context, experimentKey st
 		// owed applications and their facts are withdrawn, and a served
 		// assignment of that subject is dropped durably. An application an
 		// earlier refusal already withdrew withdraws nothing more.
-		e.mu.Lock()
 		withdraw := !record.withdrawn
 		persistFailed := false
 		if withdraw {
 			persistFailed = e.applyAgeRefusedApplicationLocked(experimentKey, owed.entry, nowMS)
 		}
-		e.mu.Unlock()
 		// (Its spool sweep's dead-letters stay deferred: this runs under
 		// emitMu, and the sweep dispatches them once it is released.)
 		if persistFailed {
 			c.stats.setLastError("experiment_cache_persist_failed")
 		}
 		if withdraw {
-			c.logf("shardpilot experiments: the platform refused an %s for experiment %q (HTTP 409, age_ineligible); withdrew the subject's owed applications and facts of the experiment", owed.kind(), experimentKey)
+			logAfterUnlock = func() {
+				c.logf("shardpilot experiments: the platform refused an %s for experiment %q (HTTP 409, age_ineligible); withdrew the subject's owed applications and facts of the experiment", owed.kind(), experimentKey)
+			}
 		}
 		return nil, expDropAgeIneligible, false
 	case resp.status >= 300 && resp.status < 500 && resp.status != 408 && resp.status != 429:
-		e.mu.Lock()
 		if resp.status == 409 && !record.withdrawn && owed.entry.SubjectKey == e.currentSubjectIDLocked() {
 			switch experimentBodyErrorCode(resp.body, resp.bodyIncomplete) {
 			case "version_mismatch", "variant_mismatch", "unit_not_recordable":
@@ -422,17 +454,16 @@ func (c *Client) sealExperimentApplication(ctx context.Context, experimentKey st
 			}
 		}
 		owed.countDrop(e, expDropApplyRefused)
-		e.mu.Unlock()
-		c.logf("shardpilot experiments: the platform refused an %s for experiment %q (HTTP %d); dropped (apply_refused)", owed.kind(), experimentKey, resp.status)
+		logAfterUnlock = func() {
+			c.logf("shardpilot experiments: the platform refused an %s for experiment %q (HTTP %d); dropped (apply_refused)", owed.kind(), experimentKey, resp.status)
+		}
 		return nil, expDropApplyRefused, false
 	}
 	seconds, present := 0, false
 	if resp.status == 429 || resp.status >= 500 {
 		seconds, present = parseRemoteConfigRetryAfter(resp.retryAfterRaw)
 	}
-	e.mu.Lock()
 	e.paceTransientLocked(nowMS, seconds, present)
-	e.mu.Unlock()
 	return nil, "", true
 }
 
@@ -542,13 +573,17 @@ func parseSealedExposure(body []byte, eventName string) *expSealedFact {
 		return nil
 	}
 	var fact struct {
-		EventID   string          `json:"event_id"`
-		EventName string          `json:"event_name"`
-		EventTS   string          `json:"event_ts"`
-		Props     json.RawMessage `json:"props"`
+		EventID        string          `json:"event_id"`
+		EventName      string          `json:"event_name"`
+		EventTS        string          `json:"event_ts"`
+		WorkspaceKey   string          `json:"workspace_key"`
+		AppKey         string          `json:"app_key"`
+		EnvironmentKey string          `json:"environment_key"`
+		Props          json.RawMessage `json:"props"`
 	}
 	if json.Unmarshal(answer.Fact, &fact) != nil || fact.EventID == "" || fact.EventName != eventName ||
-		fact.EventTS == "" || len(fact.Props) == 0 || fact.Props[0] != '{' {
+		fact.EventTS == "" || len(fact.Props) == 0 || fact.Props[0] != '{' ||
+		strings.TrimSpace(fact.WorkspaceKey) == "" || strings.TrimSpace(fact.AppKey) == "" || strings.TrimSpace(fact.EnvironmentKey) == "" {
 		return nil
 	}
 	return &expSealedFact{fact: answer.Fact, seal: answer.Seal}
@@ -676,6 +711,9 @@ func (c *Client) sweepExperimentExposuresBudget(ctx context.Context, experimentK
 		// racing this sweep may have appended, never removed or reordered.
 		list = e.pendingExposure[experimentKey]
 		if len(list) > 0 && list[0] == head {
+			if terminal && e.retireApplicationFn != nil {
+				e.retireApplicationFn(experimentKey, head)
+			}
 			e.pendingExposure[experimentKey] = list[1:]
 		}
 		e.mu.Unlock()
@@ -706,10 +744,27 @@ func (c *Client) sweepAllExperimentExposuresBudget(ctx context.Context, atClose,
 	for key := range e.pendingExposure {
 		keys = append(keys, key)
 	}
+	cursor := e.applyCursor
 	e.mu.Unlock()
 	sort.Strings(keys)
+	if len(keys) > 0 && budget != nil {
+		start := sort.Search(len(keys), func(i int) bool { return keys[i] > cursor })
+		if start == len(keys) {
+			start = 0
+		}
+		keys = append(append([]string(nil), keys[start:]...), keys[:start]...)
+	}
 	for _, key := range keys {
+		before := 0
+		if budget != nil {
+			before = *budget
+		}
 		c.sweepExperimentExposuresBudget(ctx, key, atClose, network, budget)
+		if budget != nil && *budget < before {
+			e.mu.Lock()
+			e.applyCursor = key
+			e.mu.Unlock()
+		}
 	}
 }
 
@@ -765,7 +820,7 @@ func (c *Client) TrackExperimentExposure(experimentKey string) error {
 		e.countDropLocked(expDropNotRecordable, 1)
 		return ErrExperimentFactUnavailable
 	}
-	app, err := newExperimentApplication(now)
+	app, err := c.newExperimentApplication(now)
 	if err != nil {
 		e.countDropLocked(expDropNotRecordable, 1)
 		return ErrExperimentFactUnavailable
@@ -842,8 +897,11 @@ func (c *Client) TrackExperimentOutcome(experimentKey, outcomeKey string, outcom
 		// identity alone, which a user-scoped floor's grant does not cover.
 		return ErrConsentActorMismatch
 	}
-	outcomeID, err := newExperimentApplicationID()
+	outcomeID, err := c.mintExperimentApplicationID()
 	if err != nil {
+		e.mu.Lock()
+		e.countOutcomeDropLocked(expDropNotRecordable, 1)
+		e.mu.Unlock()
 		return ErrExperimentFactUnavailable
 	}
 	now := c.clock.Now()
@@ -949,6 +1007,9 @@ func (c *Client) isWithdrawnExperimentFactEvent(event Event) bool {
 // envelope at spool time and stored in the record) — the shape alone must
 // never condemn a host-authored envelope that resembles a fact.
 func withdrawnExperimentFactRaw(raw json.RawMessage) bool {
+	if parseStoredApplication(raw) != nil {
+		return true
+	}
 	var wire struct {
 		EventName string `json:"event_name"`
 		Props     struct {
@@ -1761,7 +1822,8 @@ func (c *Client) liveExperimentFactKeysLocked(experiments map[string]bool) (map[
 // process death before the next sweep). The next launch replays the spooled
 // envelope; a fact the live session ALSO delivers settles its spooled copy
 // by event id, and a double delivery collapses server-side on the
-// deterministic id. Queue-full-without-drop stays memory-only by design.
+// deterministic id. The normal queue handoff already retains its sealed
+// copy; an interrupted handoff instead keeps the local application record.
 //
 // Lock discipline: runs under e.mu, so it takes NO client lock (the fact
 // and envelope builders are lock-free; the spool's mutex is a leaf) and
@@ -1778,10 +1840,9 @@ func (c *Client) captureOwedExposuresForDrop(experimentKey string, owed []*expOw
 	factEpoch := c.expFactPurgeEpoch.Load()
 	events := make([]Event, 0, len(owed))
 	for _, snapshot := range owed {
-		// Only a SEALED application has a capturable form: an unsealed one
-		// cannot be sealed offline. It stays owed in memory and the lane
-		// still seals it — the endpoint judges it as of the state it was
-		// served from, so the drop does not invalidate it.
+		// Only a sealed application has an analytics capture. Unsealed
+		// applications retain their local spool form and remain owed;
+		// the lane still seals the state the host actually applied.
 		if snapshot.sealed == nil {
 			continue
 		}
@@ -1789,6 +1850,14 @@ func (c *Client) captureOwedExposuresForDrop(experimentKey string, owed []*expOw
 		if !scoped {
 			continue // no deliverable fact exists for this record
 		}
+		if snapshot.intentEvent != nil {
+			event = *snapshot.intentEvent
+		}
+		// A frozen capture is another route through the same handoff. Its
+		// local link suppresses an older unsealed copy after restart, and
+		// its clock must not restart the retention or deduplication window.
+		event.expApplicationID, event.expApplicationExtra = applicationID(snapshot), snapshot.extra
+		event.delivery = snapshot.intentDelivery
 		events = append(events, event)
 	}
 	if len(events) == 0 {
@@ -1839,13 +1908,15 @@ func (c *Client) appendCaptureEntries(eligible []spoolEntry) bool {
 		c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropConsent, eligible))
 		return true
 	}
-	if len(expired) > 0 {
-		c.stats.spoolExpired.Add(uint64(len(expired)))
-		c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropExpired, expired))
+	c.settleApplicationRetentionLocked(SpoolDropExpired, expired)
+	if report := unreportedSpoolExpired(expired); len(report) > 0 {
+		c.stats.spoolExpired.Add(uint64(len(report)))
+		c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropExpired, report))
 	}
 	if len(added) > 0 && !persistFailed {
 		c.stats.spooled.Add(uint64(len(added)))
 	}
+	c.settleApplicationRetentionLocked(SpoolDropCapacity, evicted)
 	if len(evicted) > 0 {
 		c.stats.spoolEvicted.Add(uint64(len(evicted)))
 		c.deferSpoolLetter(spoolDeadLetterFrom(SpoolDropCapacity, evicted))
@@ -1965,16 +2036,17 @@ func (c *Client) closeExperimentPostFlush(ctx context.Context) {
 			}
 		}
 	}
-	// Applications STILL owed at teardown are lost with the process: COUNT
-	// them as dropped with a distinct diagnostic — never a silent loss. Each
-	// is counted by why as well: unsealed_at_close if it was never sealed,
-	// undelivered_at_close if its sealed fact could not be handed to the
-	// queue.
+	// A confirmed durable application remains replayable after teardown.
+	// Count only records without that proof: unsealed_at_close before
+	// sealing, otherwise undelivered_at_close.
 	e.mu.Lock()
 	remaining, unsealed := 0, 0
 	for _, list := range e.pendingExposure {
-		remaining += len(list)
 		for _, owed := range list {
+			if c.applicationDurableAtClose(owed) {
+				continue
+			}
+			remaining++
 			if owed.sealed == nil {
 				unsealed++
 				e.countOwedDropLocked(expDropUnsealedAtClose, owed)

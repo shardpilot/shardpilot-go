@@ -53,7 +53,9 @@ func (r batchRequest) MarshalJSON() ([]byte, error) {
 }
 
 type eventEnvelope struct {
-	delivery *eventDelivery
+	delivery            *eventDelivery
+	expApplicationID    string
+	expApplicationExtra bool
 
 	EventID         string         `json:"event_id"`
 	SchemaVersion   int            `json:"schema_version"`
@@ -192,6 +194,8 @@ func (c *Client) buildEnvelope(event Event) (eventEnvelope, error) {
 		AttestationSeal: event.attestationSeal,
 
 		internalIdentityFact: event.omitUserID,
+		expApplicationID:     event.expApplicationID,
+		expApplicationExtra:  event.expApplicationExtra,
 		expKeyWithdrawEpoch:  event.expKeyWithdrawEpoch,
 		subject:              event.subject,
 		subjectStamp:         event.subjectStamp,

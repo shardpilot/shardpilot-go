@@ -3120,7 +3120,7 @@ func TestSpoolLoadRefusedWhenDirCannotBePrivate(t *testing.T) {
 	client.spool.chmodFn = func(string, os.FileMode) error {
 		return errors.New("chmod refused")
 	}
-	if letters := client.initSpool(); len(letters) != 0 {
+	if letters, _ := client.initSpool(); len(letters) != 0 {
 		t.Fatalf("a refused dir tighten must not produce init dead-letters, got %+v", letters)
 	}
 	if client.spool.hasResendWork() {
