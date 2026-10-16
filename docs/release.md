@@ -88,6 +88,30 @@ repeated matches. Plain flag filenames and symlink targets remain detectable.
 The baseline-writing scenes require GNU `mktemp` and GNU `mv` with `-T` support;
 the Linux CI job provides them.
 
+The baseline writer uses one atomically created mode-700 directory in the held
+baseline directory for its write-aside and rename probe. Existing entries,
+including FIFOs, refuse directory allocation; test-owned sentinel files remain
+unchanged. Cleanup removes only the known temporary files and their directory.
+The open and partial-write refusals inside an allocated directory remain named
+limits: the permission control exercises directory allocation, not those failures.
+
+A target with an incomparable baseline format is skipped only when staged Go
+sources match it. Split source changes from the format change; a failed source
+comparison refuses separately. The pure format-only control remains valid.
+
+CI uses `scripts/select_public_surface_base.sh` for PR bases, existing-push bases
+and newly created refs. A new ref snapshots other published heads and tags,
+excludes its own ref, and fetches those immutable object ids with complete history.
+It selects the unique newest published ancestor reachable from the event. Missing
+or incomparable ancestry, unreadable inventories and failed fetches refuse;
+an unrelated default branch is never substituted.
+Run `python3 scripts/test_public_surface_base.py` for twenty-one local Git scenarios.
+The four whole-gate scenes cover first publications with single and multiple
+commits, clean multi-commit documentation, and an ordinary existing-ref push.
+Their bare remote proves the new commits were absent before the publication;
+`file://` clones make shallow-history tests genuinely shallow. The whole-gate
+scenes use the same GNU tools as the baseline-writing harness.
+
 ## Bad versions
 
 Never delete or move a published tag — Go module proxies cache tagged

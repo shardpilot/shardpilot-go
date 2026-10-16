@@ -621,6 +621,14 @@ retain their multiplicity. Run `scripts/test_surface_ratchet.sh` from a clean
 committed checkout to exercise the repository fixtures; see the
 [publication controls](https://github.com/shardpilot/shardpilot-go/blob/main/docs/release.md#publication-shape-controls).
 
+Baseline writes allocate a private directory on the baseline filesystem before
+creating temporary files. A baseline format change must be separate from Go
+source changes. CI compares a new ref with the newest published ancestor of its
+immutable event, excluding the new ref from the other published heads and tags.
+Missing or incomparable published ancestry refuses the comparison.
+`python3 scripts/test_public_surface_base.py` runs local Git fixtures and four
+whole-gate scenes, including a first publication containing several commits.
+
 ## Conventions & boundaries
 
 - **Zero third-party dependencies** — stdlib only. Keep it that way.
