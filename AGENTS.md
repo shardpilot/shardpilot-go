@@ -21,5 +21,7 @@ Document behavior and verification changes in `README.md` and `CHANGELOG.md`.
 For publication receipt CI changes, run both receipt-scene commands documented
 in `README.md`. Prove the append fault fired and distinguish its permission
 bypass model from execution as root. Retain the gate-integrity check.
+Place gate inputs under `scripts/`. Run `python3 scripts/test_gate_integrity.py`
+for integrity changes and preserve the event-specific comparison base.
 Keep repository content and pull request discussions suitable for public SDK
 consumers.

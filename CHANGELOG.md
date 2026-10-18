@@ -4,6 +4,8 @@
 
 ### Tests
 
+- Gate integrity compares the complete `scripts/` subtree directly. CI controls
+  cover quoted filenames and the directory boundary without a text-derived roster.
 - CI runs the publication receipt scenes and the explicit permission bypass
   model on non-root hosted Ubuntu, checking append failure before refusal.
 - Blocked-request fixtures release handlers before client and server cleanup
