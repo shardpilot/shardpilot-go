@@ -1,7 +1,9 @@
 package shardpilot
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -22,11 +24,18 @@ func TestPointConsentDropsAfterBlockingDispatch(t *testing.T) {
 			var armed, crossed atomic.Bool
 			entered, gate := make(chan struct{}), make(chan struct{})
 			canceled := make(chan error, 1)
+			blockedWire := make(chan []byte, 1)
 			var releaseOnce sync.Once
 			release := func() { releaseOnce.Do(func() { close(gate) }) }
 			defer release()
 			block := func(r *http.Request) {
 				if armed.Load() && crossed.CompareAndSwap(false, true) {
+					if mode == "flush_spool" {
+						wire := ingestRequestBytes(t, r)
+						blockedWire <- wire
+						r.Body = io.NopCloser(bytes.NewReader(wire))
+						r.Header.Del("Content-Encoding")
+					}
 					if mode == "worker_publish" {
 						// The server observes disconnects after consuming the body.
 						_, _ = io.Copy(io.Discard, r.Body)
@@ -97,6 +106,7 @@ func TestPointConsentDropsAfterBlockingDispatch(t *testing.T) {
 			if client.owedExperimentExposureCount() != 0 {
 				t.Fatal("both actual point facts must have left the owed owner")
 			}
+			ordinaryID := ""
 			if mode == "flush_spool" {
 				// Evict the durable copies with an actual failed ordinary
 				// publish. The worker then owns the point facts' only copies.
@@ -104,6 +114,7 @@ func TestPointConsentDropsAfterBlockingDispatch(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				ordinaryID = ordinary.ID
 				request, err := client.buildBatch([]Event{ordinary})
 				if err != nil {
 					t.Fatal(err)
@@ -119,6 +130,12 @@ func TestPointConsentDropsAfterBlockingDispatch(t *testing.T) {
 				client.spoolFailedBatch(request, publishErr, false)
 				if client.Snapshot().SpoolEvicted != 2 || !applicationTestHasSpoolID(client, ordinary.ID) || spooledExperimentFacts(client, ageGoldenExperiment) != 0 {
 					t.Fatal("capacity must actually retire both durable point copies and keep the ordinary retry")
+				}
+				// Only restored entries enter the resend queue. Reload the
+				// actual trimmed record; the live worker still owns the two
+				// point facts whose disk copies were evicted above.
+				if loaded := client.spool.load(client.clock.Now()); loaded.persistFailed || !client.spoolHasResendWork() {
+					t.Fatal("the persisted ordinary event must become actual resend work")
 				}
 				capture.setStatus(http.StatusAccepted)
 			} else if mode != "worker_publish" {
@@ -141,6 +158,20 @@ func TestPointConsentDropsAfterBlockingDispatch(t *testing.T) {
 			case <-entered:
 			case <-time.After(5 * time.Second):
 				t.Fatal("the actual dispatch leg did not reach its blocking endpoint")
+			}
+			if mode == "flush_spool" {
+				var blocked struct {
+					Events []struct {
+						ID   string `json:"event_id"`
+						Name string `json:"event_name"`
+					} `json:"events"`
+				}
+				if err := json.Unmarshal(<-blockedWire, &blocked); err != nil {
+					t.Fatal(err)
+				}
+				if len(blocked.Events) != 1 || blocked.Events[0].ID != ordinaryID || blocked.Events[0].Name != "ordinary.dispatch.block" {
+					t.Fatalf("the blocked resend must contain only the persisted ordinary event, got %+v", blocked.Events)
+				}
 			}
 			if _, err := client.SetConsent(false); err != nil {
 				t.Fatal(err)

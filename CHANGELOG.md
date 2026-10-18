@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Tests
+
+- The consent-dispatch spool fixture now reloads its persisted ordinary retry
+  and verifies the blocked request's event ID before denying consent. This
+  establishes the intended resend ordering while retaining delivery and drop
+  accounting assertions.
+
 ### Changed
 
 - Terminal experiment withdrawals now clear a restored ingest retry deadline
