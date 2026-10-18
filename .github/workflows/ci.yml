@@ -322,7 +322,7 @@ jobs:
             exit 0
           fi
 
-          echo "REFUSING: this change alters gate inputs under scripts/ (base: $what)." >&2
+          echo "REFUSING: this change alters the gate that judges it (base: $what)." >&2
           echo >&2
           echo '  A change may not supply its own judge. CI is the authoritative' >&2
           echo '  place to hold that: a pre-push hook asserting it is advisory,' >&2

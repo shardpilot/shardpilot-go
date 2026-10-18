@@ -48,4 +48,5 @@ with tempfile.TemporaryDirectory(prefix='gate-integrity-') as directory:
                      DEFAULT_BRANCH='main', PUSH_BEFORE=''), timeout=30,
         )
         assert run.returncode == expected, (scene, run.returncode, run.stdout, run.stderr)
+        if expected: assert 'alters the gate that judges it' in run.stderr, run.stderr
         print('PASS', scene, 'exit', run.returncode, flush=True)
