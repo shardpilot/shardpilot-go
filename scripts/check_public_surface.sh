@@ -238,6 +238,9 @@ cd "$(dirname "$0")/.."
 # space-delimited list with an unquoted expansion would split one path into
 # several and remove neither.
 GATE_TMPFILES=()
+GATE_TMPDIRS=()
+GATE_TMPDIR_IDS=()
+GATE_SCRATCH_BASE=
 # ⚠ IT SETS A VARIABLE RATHER THAN PRINTING ONE. Called as `$(gate_tmp)` the
 # function would run in a subshell, so every path it recorded would be
 # discarded with that subshell and this trap would remove an empty list — a
@@ -263,6 +266,59 @@ gate_tmp() {
   }
   GATE_TMPFILES+=("$GATE_TMP")
 }
+gate_scratch_refuse() {
+  # refusal:structural
+  echo "REFUSING: unsafe or unavailable scratch directory." >&2
+  exit 2
+}
+gate_scratch_identity() {
+  python3 - "$1" "${2:-directory}" <<'PYIDENTITY'
+import os, pathlib, stat, sys
+path = pathlib.Path(sys.argv[1])
+s = path.lstat()
+if not stat.S_ISDIR(s.st_mode) or (sys.argv[2] != 'base' and s.st_uid != os.geteuid()): sys.exit(1)
+if sys.argv[2] == 'base':
+    # A private ancestor shields descendants; ancestors above it must still be safe.
+    unsafe = False
+    for parent in [path, *path.parents]:
+        p = parent.lstat()
+        if p.st_uid not in [0, os.geteuid()]: sys.exit(1)
+        if p.st_uid == os.geteuid() and not p.st_mode & 0o077: unsafe = False
+        if p.st_mode & 0o022 and not p.st_mode & stat.S_ISVTX: unsafe = True
+    if unsafe: sys.exit(1)
+print(s.st_dev, s.st_ino, s.st_uid)
+PYIDENTITY
+}
+gate_tmpdir() {
+  [ -n "$GATE_SCRATCH_BASE" ] || GATE_SCRATCH_BASE="$(cd "${TMPDIR:-/tmp}" && pwd -P)" || gate_scratch_refuse
+  gate_scratch_identity "$GATE_SCRATCH_BASE" base >/dev/null || gate_scratch_refuse
+  GATE_TMPDIR="$(mktemp -d "$GATE_SCRATCH_BASE/public-surface-$$.XXXXXXXX")" || gate_scratch_refuse
+  [[ -n "$GATE_TMPDIR" && "${GATE_TMPDIR%/*}" == "$GATE_SCRATCH_BASE" &&
+     "${GATE_TMPDIR##*/}" == "public-surface-$$."* && -d "$GATE_TMPDIR" && ! -L "$GATE_TMPDIR" ]] || gate_scratch_refuse
+  GATE_TMPDIR_ID="$(gate_scratch_identity "$GATE_TMPDIR")" || gate_scratch_refuse
+  GATE_TMPDIRS+=("$GATE_TMPDIR")
+  GATE_TMPDIR_IDS+=("$GATE_TMPDIR_ID")
+}
+gate_cleanup_dirs() {
+  set -euo pipefail
+  [ "${GATE_TMPDIRS[0]+set}" = set ] || return 0
+  local gate_base="${GATE_SCRATCH_BASE:-}" gate_dir gate_name gate_real gate_index=0
+  [[ -n "$gate_base" && "$gate_base" = "$(cd "${TMPDIR:-/tmp}" && pwd -P)" ]] || gate_scratch_refuse
+  [[ -d "$gate_base" && ! -L "$gate_base" ]] || gate_scratch_refuse
+  gate_scratch_identity "$gate_base" base >/dev/null || gate_scratch_refuse
+  for gate_dir in ${GATE_TMPDIRS[@]+"${GATE_TMPDIRS[@]}"}; do
+    gate_name=${gate_dir#"$gate_base"/}
+    [[ -n "$gate_name" && "$gate_name" != */* && "$gate_name" != . && "$gate_name" != .. &&
+       "$gate_name" == "public-surface-$$."* ]] || gate_scratch_refuse
+    [[ -d "$gate_dir" && ! -L "$gate_dir" ]] || gate_scratch_refuse
+    gate_real="$(cd "$gate_dir" && pwd -P)" || gate_scratch_refuse
+    [[ "$gate_real" == "$gate_base/"* && "$gate_real" != "$gate_base" ]] || gate_scratch_refuse
+    gate_real="$(gate_scratch_identity "$gate_dir")" || gate_scratch_refuse
+    [[ "$gate_real" == "${GATE_TMPDIR_IDS[$gate_index]}" ]] || gate_scratch_refuse
+    gate_index=$((gate_index + 1))
+  done
+  rm -rf -- ${GATE_TMPDIRS[@]+"${GATE_TMPDIRS[@]}"} || gate_scratch_refuse
+}
 # ⚠ AND A RUN THAT DID NOT REACH ITS OWN END EXITS NON-ZERO, whatever the
 # shell says. Measured on bash 3.2: after a `set -u` failure the EXIT trap is
 # entered with `$?` ALREADY ZERO — the status of the last command that
@@ -282,12 +338,15 @@ gate_finished=no
 # `${a[@]+"${a[@]}"}` rather than `"${a[@]}"`: on that shell an EMPTY array is
 # itself an unbound variable, so the cleanup would fail before it could restore
 # anything.
-trap 'gate_rc=$?; rm -f ${GATE_TMPFILES[@]+"${GATE_TMPFILES[@]}"};
+trap 'gate_rc=$?; gate_command=${BASH_COMMAND:-unknown}; rm -f ${GATE_TMPFILES[@]+"${GATE_TMPFILES[@]}"};
+      gate_cleanup_dirs;
       if [ "$gate_finished" != yes ] && [ "$gate_rc" = 0 ]; then
         echo "REFUSING: this gate stopped before its own last line and the shell" >&2
         echo "  reported success. Nothing here has been established; read the" >&2
         echo "  error above this line, not the absence of findings." >&2
         gate_rc=3
+      elif [ "$gate_finished" != yes ] && [ "$gate_command" != "exit 2" ]; then
+        printf "REFUSING: command stopped (status %s): %s\n" "$gate_rc" "$gate_command" >&2
       fi
       if [ "${public_gate_ready:-no}" = yes ]; then
         public_gate_finish "$gate_rc" || gate_rc=2
@@ -2397,8 +2456,7 @@ EOF
     fixseen="$fixseen$fixval"$'\n'
   done
 
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' RETURN
+  gate_tmpdir; tmp="$GATE_TMPDIR"
   (
     cd "$tmp"
     git init -q .
@@ -2416,7 +2474,6 @@ EOF
   )
   scan_tree "$tmp"
   scanned_a="$scan_lane_a"
-  rm -rf "$tmp"; trap - RETURN
 
   local fixture_fail=0 fixture_checks=0
   fixture_checks=$((fixture_checks + 1))
@@ -2460,7 +2517,7 @@ EOF
   # The NUL fixture gets its own tree: a refusal ends the run it happens in,
   # so it cannot sit beside the fixtures whose results are read afterwards. The
   # scan runs in a subshell precisely so its exit status can be read.
-  nul_tmp="$(mktemp -d)"
+  gate_tmpdir; nul_tmp="$GATE_TMPDIR"
   (
     cd "$nul_tmp"
     git init -q .
@@ -2480,7 +2537,6 @@ EOF
   fixture_checks=$((fixture_checks + 1))
   [ "$nul_status" -eq 2 ] || {
     echo "SELFTEST: a NUL-bearing tracked file was not refused" >&2; fixture_fail=1; }
-  rm -rf "$nul_tmp"
   # ⚠ THE FIXTURE THAT MADE THIS RULE EXIST. Before the refusal above, this
   # exact tree PASSED while the same identifier written plainly was refused,
   # measured on a clone of a public repository. It gets its own tree for the
@@ -2504,7 +2560,7 @@ EOF
     entity_rest="${entity_case#*|}"
     entity_body="${entity_rest%|*}"
     entity_label="${entity_case##*|}"
-    entity_tmp="$(mktemp -d)"
+    gate_tmpdir; entity_tmp="$GATE_TMPDIR"
     (
       cd "$entity_tmp"
       git init -q .
@@ -2519,7 +2575,6 @@ EOF
     [ "$entity_selftest_status" -eq 2 ] || {
       echo "SELFTEST: $entity_label was not refused (status $entity_selftest_status)" >&2
       fixture_fail=1; }
-    rm -rf "$entity_tmp"
   done
 
   fixture_checks=$((fixture_checks + 1))
@@ -2552,7 +2607,7 @@ EOF
   # `ADR-[]000**00**` reads as `ADR-[]000` raw and `ADR-[]00000` marker-free,
   # and no reading of that line is defensible. Under the counting policies this
   # unit tried before, the same file tallied 3, then 2, and both were guesses.
-  splitid_tmp="$(mktemp -d)"
+  gate_tmpdir; splitid_tmp="$GATE_TMPDIR"
   (
     cd "$splitid_tmp"
     git init -q .
@@ -2567,7 +2622,6 @@ EOF
   [ "$splitid_status" -eq 2 ] || {
     echo "SELFTEST: the ambiguous spelling was not refused (status $splitid_status)" >&2
     fixture_fail=1; }
-  rm -rf "$splitid_tmp"
   # ⚠ A COUNT THAT MUST BE REACHED. Every assertion above is invisible when it
   # is deleted, and a run that asserts nothing prints the same closing line as
   # a run that asserted everything.
@@ -2592,6 +2646,7 @@ EOF
     echo "REFUSING: the scan failed its own fixture." >&2
     exit 2
   fi
+  gate_cleanup_dirs; GATE_TMPDIRS=(); GATE_TMPDIR_IDS=()
   echo "self-test: OK — $tested known-internal string(s) matched, $innocent innocent string(s) passed, $fixture_checks scan assertion(s)"
   public_gate_observe self-test
 }

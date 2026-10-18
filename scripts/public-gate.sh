@@ -4,7 +4,7 @@
 # The baseline-write scene requires GNU mv, as does the existing write command.
 if [ "${1:-}" = --test ]; then
   python3 - "$0" "${@:2}" <<'PY'
-import json, os, pathlib, subprocess, sys, tempfile
+import json, os, pathlib, re, subprocess, sys, tempfile
 source = pathlib.Path(sys.argv[1]).resolve().parent.parent
 compact = '--compact' in sys.argv[2:]
 permission_bypass = '--permission-bypass' in sys.argv[2:]
@@ -56,7 +56,9 @@ with tempfile.TemporaryDirectory(prefix='public-gate-scenes-') as directory:
     subject = 'scan_tree "$PWD"'
     if original.count(subject) != 1: raise RuntimeError('actual scan invocation moved')
     total = 0
-    for name in ['clean-zero-comparison', 'completed-finding', 'stopped-after-finding', 'dropped-tree-read', 'killed-reader', 'short-tree-walk', 'stale-startup', 'helper-mismatch', 'channel-write-failure', 'baseline-write', 'stdout-closes-after-json', 'channel-closes-after-json']:
+    scenes = ['clean-zero-comparison', 'completed-finding', 'stopped-after-finding', 'dropped-tree-read', 'killed-reader', 'short-tree-walk', 'stale-startup', 'helper-mismatch', 'channel-write-failure', 'baseline-write', 'stdout-closes-after-json', 'channel-closes-after-json']
+    scenes += ['silent-tr', 'silent-tr-2', 'scratch-ownership', 'scratch-replacement', 'empty-scratch', 'unsafe-parent', 'private-parent'] + ['scratch-interrupt-' + str(i) for i in range(4)]
+    for name in scenes:
         if selected and name not in selected: continue
         gate.write_text(original)
         helper.write_text(original_helper)
@@ -71,6 +73,47 @@ with tempfile.TemporaryDirectory(prefix='public-gate-scenes-') as directory:
             point = '    scan_files=$((scan_files + 1))'
             assert original.count(point) == 1
             gate.write_text(original.replace(point, point + '\n    if [ "${2:-}" = receipt ]; then echo "synthetic short tree"; break; fi', 1))
+        if name == 'empty-scratch':
+            helper.write_text(original_helper + r'''
+mktemp() {
+  if [ "${1:-}" = -d ]; then : > "$public_gate_scene_fault_marker"; return 0; fi
+  command mktemp "$@"
+}
+cd() { [ "${1-unset}" != "" ] || : > "$public_gate_scene_fault_marker.empty-cd"; builtin cd "$@"; }
+''')
+        if name.startswith('silent-tr'):
+            markers = next(s for s in re.findall(r"tr -d ('[^']+')", original) if s.startswith("'*_"))
+            helper.write_text(original_helper + r'''
+tr() {
+  if [ "$#" -eq 2 ] && [ "$1" = -d ] && [ "$2" = @MARKERS@ ]; then
+    cat >/dev/null; : > "$public_gate_scene_fault_marker"; return "$public_gate_scene_tool_status"
+  fi
+  command tr "$@"
+}
+'''.replace('@MARKERS@', markers))
+        if name.startswith('scratch-'):
+            helper.write_text(original_helper + r'''
+git() {
+  if [ "${1:-}" = init ]; then
+    [ -d "$PWD" ] || exit 4
+    printf '%s\n' "$PWD" >> "$public_gate_scene_dirs"
+    if [ "${BASH_LINENO[0]}" = "$public_gate_scene_stop_line" ]; then
+      printf '%s\n' "$PWD" > "$public_gate_scene_fault_marker"
+      if [ "${public_gate_scene_guard:-no}" != no ]; then
+        local probe_dir="$PWD"
+        cd ..
+        if [ "$public_gate_scene_guard" = replacement ]; then
+          mv "$probe_dir" "$public_gate_scene_outside/original"; mkdir "$probe_dir"; echo keep > "$probe_dir/keep"
+        else
+          rmdir "$probe_dir"; ln -s "$public_gate_scene_outside" "$probe_dir"
+        fi
+      fi
+      trap - EXIT; kill -TERM "$$"; exit 143
+    fi
+  fi
+  command git "$@"
+}
+''')
         if name in ['stdout-closes-after-json', 'channel-closes-after-json']:
             # The actual successful stdout JSON is the synchronization point.
             # A pipe identifies stdout; the channel append redirects to a file.
@@ -112,11 +155,52 @@ printf() {
             changed.write_text(changed.read_text() + '\n')
         if name == 'channel-write-failure': channel.mkdir()
         env = dict(os.environ, NIGHTLY_COMPLETION_FILE=str(channel))
+        fault_scene = name.startswith('silent-tr') or name.startswith('scratch-') or name in ['empty-scratch', 'unsafe-parent', 'private-parent']
+        if fault_scene:
+            scratch = root / (name + '.scratch space'); scratch.mkdir()
+            if name in ['unsafe-parent', 'private-parent']:
+                scratch.chmod(0o777); root.chmod(0o755 if name == 'unsafe-parent' else 0o700)
+                assert scratch.stat().st_mode & 0o1777 == 0o777
+                assert root.stat().st_mode & 0o777 == (0o755 if name == 'unsafe-parent' else 0o700)
+                pathlib.Path(str(channel) + '.fault-fired').touch()
+            env.update(TMPDIR=str(scratch), public_gate_scene_fault_marker=str(channel) + '.fault-fired', public_gate_scene_dirs=str(channel) + '.dirs')
+            env['public_gate_scene_tool_status'] = '2' if name == 'silent-tr-2' else '3'
+            if name.startswith('scratch-'):
+                sites = [i for i, s in enumerate(original.splitlines(), 1) if s.strip() == 'git init -q .']
+                assert len(sites) == 4, sites
+                env['public_gate_scene_stop_line'] = str(sites[-1 if name in ['scratch-ownership', 'scratch-replacement'] else int(name.rsplit('-', 1)[1])])
+                if name in ['scratch-ownership', 'scratch-replacement']:
+                    outside = root / (name + '.outside-canary'); outside.mkdir(); (outside / 'keep').write_text('keep')
+                    env.update(public_gate_scene_guard='replacement' if name == 'scratch-replacement' else 'yes', public_gate_scene_outside=str(outside))
         env.pop('PUBLIC_SURFACE_BASE_REF', None)
         if name != 'clean-zero-comparison': env['PUBLIC_SURFACE_BASE_REF'] = 'HEAD'
         args = ['bash', str(gate)] + (['--write-baseline'] if name == 'baseline-write' else [])
+        if name == 'empty-scratch': before_tree = subprocess.check_output(['git', 'write-tree'], cwd=repo)
         run = subprocess.run(args, cwd=repo, env=env, capture_output=True, text=True, timeout=600)
+        root.chmod(0o700)
         r = receipt(channel)
+        if fault_scene:
+            fault_marker = pathlib.Path(env['public_gate_scene_fault_marker'])
+            assert fault_marker.is_file(), ('fault did not fire', name, run.stderr)
+            if name == 'unsafe-parent': assert 'REFUSING: unsafe or unavailable scratch directory.' in run.stderr, run.stderr
+            if name.startswith('silent-tr'): assert 'REFUSING:' in run.stderr and 'tr ' in run.stderr, ('silent tr failure was not named', run.stderr)
+            if name == 'empty-scratch':
+                assert not pathlib.Path(str(fault_marker) + '.empty-cd').exists(), 'empty scratch path reached cd'
+                assert subprocess.check_output(['git', 'write-tree'], cwd=repo) == before_tree, 'empty scratch output allowed repository writes'
+            if name in ['scratch-ownership', 'scratch-replacement']:
+                substituted = pathlib.Path(fault_marker.read_text().strip())
+                if name == 'scratch-replacement':
+                    assert (substituted / 'keep').is_file(), 'replacement directory was removed'
+                    assert (substituted / 'keep').read_text() == 'keep\n'
+                    prior, current = (outside / 'original').stat(), substituted.stat()
+                    assert (prior.st_dev, prior.st_ino) != (current.st_dev, current.st_ino)
+                else: assert substituted.is_symlink()
+                assert 'REFUSING: unsafe or unavailable scratch directory.' in run.stderr, run.stderr
+                assert (outside / 'keep').read_text() == 'keep'
+                owned = [pathlib.Path(s) for s in pathlib.Path(env['public_gate_scene_dirs']).read_text().splitlines()]
+                assert len(owned) > 1 and all(p.exists() or p.is_symlink() for p in owned)
+            else:
+                assert not list(scratch.iterdir()), ('scratch directories survived', name, list(scratch.iterdir()))
         if name in ['stdout-closes-after-json', 'channel-closes-after-json']:
             fault_marker = pathlib.Path(str(channel) + '.fault-fired')
             assert fault_marker.is_file(), ('finalization fault did not fire', name, run.stderr)
@@ -125,7 +209,7 @@ printf() {
                 assert append_status != 0, ('channel append fault did not fire', name, run.returncode)
                 print('Observed channel append failure:', append_status, flush=True)
             assert run.returncode == 2, (name, run.returncode, run.stderr)
-        if name in ['clean-zero-comparison', 'completed-finding', 'baseline-write']:
+        if name in ['clean-zero-comparison', 'completed-finding', 'baseline-write', 'private-parent']:
             assert complete(r), (name, run.returncode, r, run.stdout[-1000:], run.stderr[-1000:])
             assert run.returncode == (1 if name == 'completed-finding' else 0), (name, run.returncode)
             assert r['findings'] == (1 if name == 'completed-finding' else 0), (name, r)
