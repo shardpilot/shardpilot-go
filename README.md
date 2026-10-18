@@ -645,6 +645,12 @@ Missing or incomparable published ancestry refuses the comparison.
 `python3 scripts/test_public_surface_base.py` runs local Git fixtures and four
 whole-gate scenes, including a first publication containing several commits.
 
+CI runs `bash scripts/public-gate.sh --test --compact` on hosted Ubuntu as a
+non-root user with Bash, Python 3 and GNU coreutils. It also runs
+`bash scripts/public-gate.sh --test --compact --permission-bypass channel-closes-after-json`.
+That second command models ignored permission changes; it is not UID-0 execution.
+The channel scene verifies the failed append before checking the refusal exit.
+
 ## Conventions & boundaries
 
 - **Zero third-party dependencies** — stdlib only. Keep it that way.

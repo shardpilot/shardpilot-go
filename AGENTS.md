@@ -18,5 +18,8 @@ Blocked-request fixture changes must run the failure-path subprocess control.
 Release handlers before blocking cleanup and retain the existing timing bounds.
 
 Document behavior and verification changes in `README.md` and `CHANGELOG.md`.
+For publication receipt CI changes, run both receipt-scene commands documented
+in `README.md`. Prove the append fault fired and distinguish its permission
+bypass model from execution as root. Retain the gate-integrity check.
 Keep repository content and pull request discussions suitable for public SDK
 consumers.

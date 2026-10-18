@@ -4,6 +4,8 @@
 
 ### Tests
 
+- CI runs the publication receipt scenes and the explicit permission bypass
+  model on non-root hosted Ubuntu, checking append failure before refusal.
 - Blocked-request fixtures release handlers before client and server cleanup
   on every exit. Subprocess controls exercise deliberate failed assertions
   while preserving the existing timing assertions.
