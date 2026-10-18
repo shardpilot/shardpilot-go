@@ -113,6 +113,7 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version: ${{ matrix.go-version }}
+          cache: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main') }}
 
       - name: Test
         # Preserve permission-denied scenes even when the runner service uses root.
@@ -207,6 +208,7 @@ jobs:
         uses: actions/setup-go@v7
         with:
           go-version: '1.27.x'
+          cache: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main') }}
 
       - name: Benchmarks
         run: scripts/run_benchmarks.sh bench/latest.txt
