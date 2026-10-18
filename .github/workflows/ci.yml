@@ -518,6 +518,25 @@ jobs:
       - name: Comparison-base controls
         run: python3 scripts/test_public_surface_base.py
 
+  publication-receipt-controls:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Non-root receipt prerequisites
+        run: |
+          test "$(id -u)" -ne 0
+          bash --version
+          python3 --version
+          mv --version
+      - name: Publication receipt scenes
+        run: bash scripts/public-gate.sh --test --compact
+      - name: Permission bypass model (non-root)
+        run: bash scripts/public-gate.sh --test --compact --permission-bypass channel-closes-after-json
+
   public-surface:
     runs-on: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     timeout-minutes: 5

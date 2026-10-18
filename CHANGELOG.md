@@ -4,6 +4,8 @@
 
 ### Tests
 
+- CI runs the publication receipt scenes and the explicit permission bypass
+  model on non-root hosted Ubuntu, checking append failure before refusal.
 - The consent-dispatch spool fixture now reloads its persisted ordinary retry
   and verifies the blocked request's event ID before denying consent. This
   establishes the intended resend ordering while retaining delivery and drop
