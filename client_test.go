@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -173,12 +174,13 @@ func TestCloseRacingWithTrackRejectsPostCloseEvent(t *testing.T) {
 }
 
 func TestEnqueueIsNotBlockedBySlowTrackPublish(t *testing.T) {
-	requestStarted := make(chan struct{})
+	requestStarted := make(chan string, 1)
 	releaseRequest := make(chan struct{})
+	release := sync.OnceFunc(func() { close(releaseRequest) })
 	var started atomic.Bool
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if started.CompareAndSwap(false, true) {
-			close(requestStarted)
+			requestStarted <- blockedFixtureEventName(t, r)
 			<-releaseRequest
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -189,12 +191,13 @@ func TestEnqueueIsNotBlockedBySlowTrackPublish(t *testing.T) {
 
 	client := newTestClient(t, server.URL)
 	defer client.Close(context.Background())
+	defer release()
 
 	trackDone := make(chan error, 1)
 	go func() {
 		trackDone <- client.Track(context.Background(), Event{Name: "slow_track"})
 	}()
-	<-requestStarted
+	requireBlockedFixtureRequest(t, requestStarted, "slow_track")
 
 	enqueueDone := make(chan error, 1)
 	go func() {
@@ -210,17 +213,19 @@ func TestEnqueueIsNotBlockedBySlowTrackPublish(t *testing.T) {
 		t.Fatal("Enqueue blocked behind slow Track network publish")
 	}
 
-	close(releaseRequest)
+	failBlockedFixtureAssertion(t)
+	release()
 	if err := <-trackDone; err != nil {
 		t.Fatalf("Track returned error: %v", err)
 	}
 }
 
 func TestCloseWaitsForInFlightTrack(t *testing.T) {
-	requestStarted := make(chan struct{})
+	requestStarted := make(chan string, 1)
 	releaseRequest := make(chan struct{})
+	release := sync.OnceFunc(func() { close(releaseRequest) })
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		close(requestStarted)
+		requestStarted <- blockedFixtureEventName(t, r)
 		<-releaseRequest
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
@@ -229,12 +234,14 @@ func TestCloseWaitsForInFlightTrack(t *testing.T) {
 	defer server.Close()
 
 	client := newTestClient(t, server.URL)
+	defer client.Close(context.Background())
+	defer release()
 
 	trackDone := make(chan error, 1)
 	go func() {
 		trackDone <- client.Track(context.Background(), Event{Name: "in_flight_track"})
 	}()
-	<-requestStarted
+	requireBlockedFixtureRequest(t, requestStarted, "in_flight_track")
 
 	closeDone := make(chan error, 1)
 	go func() {
@@ -248,7 +255,8 @@ func TestCloseWaitsForInFlightTrack(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 
-	close(releaseRequest)
+	failBlockedFixtureAssertion(t)
+	release()
 
 	if err := <-trackDone; err != nil {
 		t.Fatalf("Track returned error: %v", err)
@@ -259,10 +267,11 @@ func TestCloseWaitsForInFlightTrack(t *testing.T) {
 }
 
 func TestCloseWithCanceledContextReturnsWhileTrackInFlight(t *testing.T) {
-	requestStarted := make(chan struct{})
+	requestStarted := make(chan string, 1)
 	releaseRequest := make(chan struct{})
+	release := sync.OnceFunc(func() { close(releaseRequest) })
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		close(requestStarted)
+		requestStarted <- blockedFixtureEventName(t, r)
 		<-releaseRequest
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
@@ -271,12 +280,14 @@ func TestCloseWithCanceledContextReturnsWhileTrackInFlight(t *testing.T) {
 	defer server.Close()
 
 	client := newTestClient(t, server.URL)
+	defer client.Close(context.Background())
+	defer release()
 
 	trackDone := make(chan error, 1)
 	go func() {
 		trackDone <- client.Track(context.Background(), Event{Name: "in_flight_track"})
 	}()
-	<-requestStarted
+	requireBlockedFixtureRequest(t, requestStarted, "in_flight_track")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
@@ -292,7 +303,8 @@ func TestCloseWithCanceledContextReturnsWhileTrackInFlight(t *testing.T) {
 		t.Fatalf("expected Enqueue after Close start to return ErrClosed, got %v", err)
 	}
 
-	close(releaseRequest)
+	failBlockedFixtureAssertion(t)
+	release()
 	if err := <-trackDone; err != nil {
 		t.Fatalf("Track returned error: %v", err)
 	}

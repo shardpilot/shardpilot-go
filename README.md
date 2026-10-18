@@ -604,6 +604,10 @@ The spool case verifies that the blocked request carries the persisted ordinary
 retry before changing consent, then checks the worker-held experiment facts'
 delivery and drop accounting.
 
+`TestBlockedRequestFixtureCleanupAfterFailedAssertion` runs the three blocked
+request fixtures in bounded child processes, forces a failed assertion, and
+requires an ordinary test failure followed by completed cleanup.
+
 ### Secret-scan coverage checks
 
 CI runs the working-tree scan and verifies the history scan against an independently

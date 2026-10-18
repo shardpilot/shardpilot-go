@@ -14,6 +14,9 @@ Persisting a fresh failed batch does not schedule it for startup resend;
 restore the persisted record when a test needs that ordering. Keep the
 consent-dispatch delivery and drop-count assertions intact.
 
+Blocked-request fixture changes must run the failure-path subprocess control.
+Release handlers before blocking cleanup and retain the existing timing bounds.
+
 Document behavior and verification changes in `README.md` and `CHANGELOG.md`.
 For publication receipt CI changes, run both receipt-scene commands documented
 in `README.md`. Prove the append fault fired and distinguish its permission
