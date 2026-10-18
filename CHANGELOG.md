@@ -4,6 +4,9 @@
 
 ### Tests
 
+- Publication checks name unexpected command failures and clean owned scratch
+  directories on interruption. Receipt controls cover both paths and symlink refusal.
+- Release-consistency guidance now names the separately checked in-code version.
 - Gate integrity compares the complete `scripts/` subtree directly. CI controls
   cover quoted filenames and the directory boundary without a text-derived roster.
 - CI runs the publication receipt scenes and the explicit permission bypass

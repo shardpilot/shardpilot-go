@@ -3,11 +3,10 @@
 # topmost released (non-Unreleased) section of CHANGELOG.md, and the
 # integration skill's pinned install command must match the README.
 #
-# The Go SDK has no in-code version constant — Go modules version via git
-# tags — so the consistency surface is README ↔ CHANGELOG ↔ the
-# customer-facing integration skill (.claude/skills/shardpilot-go-integration/
-# SKILL.md). This runs on every CI build and must not require git tags to be
-# present (CI checkouts are shallow and tagless).
+# This script checks README ↔ CHANGELOG ↔ the customer-facing integration
+# skill. TestVersionIsTheReleaseTag separately checks internal/sdkversion.Version
+# against the README. These documentation checks run on every CI build without
+# requiring git tags (CI checkouts are shallow and tagless).
 #
 # Usage:
 #   scripts/check_release_consistency.sh             # README ↔ CHANGELOG ↔ SKILL.md

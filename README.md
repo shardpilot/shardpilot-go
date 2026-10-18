@@ -650,6 +650,9 @@ non-root user with Bash, Python 3 and GNU coreutils. It also runs
 `bash scripts/public-gate.sh --test --compact --permission-bypass channel-closes-after-json`.
 That second command models ignored permission changes; it is not UID-0 execution.
 The channel scene verifies the failed append before checking the refusal exit.
+The suite also names silent command failures, interrupts each scratch-directory
+allocation caller, and checks that cleanup refuses a substituted symlink while
+preserving an outside canary. Fault controls use temporary paths with spaces.
 
 Gate inputs belong under `scripts/`. CI compares that complete subtree with the
 event's base, including quoted filenames, helpers and manifests.
