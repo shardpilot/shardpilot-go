@@ -10,9 +10,10 @@ tools = {name: shutil.which(name) for name in ['python3', 'mv', 'timeout', 'dirn
 assert all(tools.values()), tools
 faults = {'mv-noop': 'exit 0',
           'mv-follows-directory': 'shift; exec ' + shlex.quote(tools['mv']) + ' -f "$@"',
-          'timeout-noop': 'exit 0', 'timeout-fake-expiry': 'exit 124',
+          'timeout-noop': 'exit 0', 'timeout-fake-expiry': 'exit 137',
           'timeout-masks-status': shlex.quote(tools['timeout']) + ' "$@"; exit 0',
-          'timeout-ignores-limit': 'shift; shift; exec "$@"'}
+          'timeout-term-only': 'shift; exec ' + shlex.quote(tools['timeout']) + ' "$@"',
+          'timeout-ignores-limit': 'shift; shift; shift; exec "$@"'}
 for case in ['missing-mv', 'missing-timeout', 'missing-python3', *faults, 'capable']:
     with tempfile.TemporaryDirectory(prefix='publication-host-controls-') as directory:
         folder = pathlib.Path(directory); marker = folder / 'started'; bindir = folder / 'bin'; bindir.mkdir()
@@ -36,6 +37,6 @@ for case in ['missing-mv', 'missing-timeout', 'missing-python3', *faults, 'capab
                 assert not marker.exists(), (case, label, 'dependent Git work started')
                 assert (run.returncode == 2 and run.stderr.count('PREREQUISITE:') == 1
                         and len(run.stderr.splitlines()) == 1 and not run.stdout), (case, label, run.returncode, run.stderr)
-                if case == 'timeout-ignores-limit': assert 'timeout did not bound execution' in run.stderr, run.stderr
+                if case in ['timeout-ignores-limit', 'timeout-term-only']: assert 'timeout did not bound execution' in run.stderr, run.stderr
                 assert 'FAIL [' not in run.stderr and 'surface ratchet:' not in run.stderr, run.stderr
             print('PASS', case, label, flush=True)
