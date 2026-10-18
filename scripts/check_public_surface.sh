@@ -239,6 +239,7 @@ cd "$(dirname "$0")/.."
 # several and remove neither.
 GATE_TMPFILES=()
 GATE_TMPDIRS=()
+GATE_TMPDIR_IDS=()
 GATE_SCRATCH_BASE=
 # ⚠ IT SETS A VARIABLE RATHER THAN PRINTING ONE. Called as `$(gate_tmp)` the
 # function would run in a subshell, so every path it recorded would be
@@ -270,19 +271,41 @@ gate_scratch_refuse() {
   echo "REFUSING: unsafe or unavailable scratch directory." >&2
   exit 2
 }
+gate_scratch_identity() {
+  python3 - "$1" "${2:-directory}" <<'PYIDENTITY'
+import os, pathlib, stat, sys
+path = pathlib.Path(sys.argv[1])
+s = path.lstat()
+if not stat.S_ISDIR(s.st_mode) or (sys.argv[2] != 'base' and s.st_uid != os.geteuid()): sys.exit(1)
+if sys.argv[2] == 'base':
+    # A private ancestor shields descendants; ancestors above it must still be safe.
+    unsafe = False
+    for parent in [path, *path.parents]:
+        p = parent.lstat()
+        if p.st_uid not in [0, os.geteuid()]: sys.exit(1)
+        if p.st_uid == os.geteuid() and not p.st_mode & 0o077: unsafe = False
+        if p.st_mode & 0o022 and not p.st_mode & stat.S_ISVTX: unsafe = True
+    if unsafe: sys.exit(1)
+print(s.st_dev, s.st_ino, s.st_uid)
+PYIDENTITY
+}
 gate_tmpdir() {
   [ -n "$GATE_SCRATCH_BASE" ] || GATE_SCRATCH_BASE="$(cd "${TMPDIR:-/tmp}" && pwd -P)" || gate_scratch_refuse
+  gate_scratch_identity "$GATE_SCRATCH_BASE" base >/dev/null || gate_scratch_refuse
   GATE_TMPDIR="$(mktemp -d "$GATE_SCRATCH_BASE/public-surface-$$.XXXXXXXX")" || gate_scratch_refuse
   [[ -n "$GATE_TMPDIR" && "${GATE_TMPDIR%/*}" == "$GATE_SCRATCH_BASE" &&
      "${GATE_TMPDIR##*/}" == "public-surface-$$."* && -d "$GATE_TMPDIR" && ! -L "$GATE_TMPDIR" ]] || gate_scratch_refuse
+  GATE_TMPDIR_ID="$(gate_scratch_identity "$GATE_TMPDIR")" || gate_scratch_refuse
   GATE_TMPDIRS+=("$GATE_TMPDIR")
+  GATE_TMPDIR_IDS+=("$GATE_TMPDIR_ID")
 }
 gate_cleanup_dirs() {
   set -euo pipefail
   [ "${GATE_TMPDIRS[0]+set}" = set ] || return 0
-  local gate_base="${GATE_SCRATCH_BASE:-}" gate_dir gate_name gate_real
+  local gate_base="${GATE_SCRATCH_BASE:-}" gate_dir gate_name gate_real gate_index=0
   [[ -n "$gate_base" && "$gate_base" = "$(cd "${TMPDIR:-/tmp}" && pwd -P)" ]] || gate_scratch_refuse
   [[ -d "$gate_base" && ! -L "$gate_base" ]] || gate_scratch_refuse
+  gate_scratch_identity "$gate_base" base >/dev/null || gate_scratch_refuse
   for gate_dir in ${GATE_TMPDIRS[@]+"${GATE_TMPDIRS[@]}"}; do
     gate_name=${gate_dir#"$gate_base"/}
     [[ -n "$gate_name" && "$gate_name" != */* && "$gate_name" != . && "$gate_name" != .. &&
@@ -290,6 +313,9 @@ gate_cleanup_dirs() {
     [[ -d "$gate_dir" && ! -L "$gate_dir" ]] || gate_scratch_refuse
     gate_real="$(cd "$gate_dir" && pwd -P)" || gate_scratch_refuse
     [[ "$gate_real" == "$gate_base/"* && "$gate_real" != "$gate_base" ]] || gate_scratch_refuse
+    gate_real="$(gate_scratch_identity "$gate_dir")" || gate_scratch_refuse
+    [[ "$gate_real" == "${GATE_TMPDIR_IDS[$gate_index]}" ]] || gate_scratch_refuse
+    gate_index=$((gate_index + 1))
   done
   rm -rf -- ${GATE_TMPDIRS[@]+"${GATE_TMPDIRS[@]}"} || gate_scratch_refuse
 }
@@ -2620,7 +2646,7 @@ EOF
     echo "REFUSING: the scan failed its own fixture." >&2
     exit 2
   fi
-  gate_cleanup_dirs; GATE_TMPDIRS=()
+  gate_cleanup_dirs; GATE_TMPDIRS=(); GATE_TMPDIR_IDS=()
   echo "self-test: OK — $tested known-internal string(s) matched, $innocent innocent string(s) passed, $fixture_checks scan assertion(s)"
   public_gate_observe self-test
 }

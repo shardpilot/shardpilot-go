@@ -23,7 +23,7 @@ in `README.md`. Prove the append fault fired and distinguish its permission
 bypass model from execution as root. Retain the gate-integrity check.
 Place gate inputs under `scripts/`. Run `python3 scripts/test_gate_integrity.py`
 for integrity changes and preserve the event-specific comparison base.
-Keep scratch directories registered for cleanup and validate ownership before
-recursive removal. Receipt controls must prove their tool and interrupt faults fired.
+Keep scratch identities registered; verify their owner and identity before
+recursive removal, and refuse temporary parents that permit replacement. Receipt controls must prove their tool and interrupt faults fired.
 Keep repository content and pull request discussions suitable for public SDK
 consumers.
