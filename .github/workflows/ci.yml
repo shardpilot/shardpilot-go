@@ -439,6 +439,8 @@ jobs:
           bash --version
           python3 --version
           mv --version
+      - name: Publication host prerequisite controls
+        run: python3 scripts/test_publication_host.py
       - name: Publication receipt scenes
         run: bash scripts/public-gate.sh --test --compact
       - name: Permission bypass model (non-root)

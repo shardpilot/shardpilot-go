@@ -87,6 +87,9 @@ failed spelling readers for each surface, distinct control-byte matches and
 repeated matches. Plain flag filenames and symlink targets remain detectable.
 The baseline-writing scenes require GNU `mktemp` and GNU `mv` with `-T` support;
 the Linux CI job provides them.
+Both publication suites preflight Python 3, GNU `mv -fT` and `timeout --kill-after`.
+Other hosts must provide compatible commands on PATH; an unsuitable host stops
+with one prerequisite message before dependent setup. Existing gate probes remain.
 
 The baseline writer uses one atomically created mode-700 directory in the held
 baseline directory for its write-aside and rename probe. Existing entries,

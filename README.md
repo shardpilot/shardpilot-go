@@ -655,6 +655,10 @@ allocation caller, and checks symlink and directory replacement refusals with
 canaries. Cleanup uses Python 3 to verify owner, device and inode, and refuses
 parents exposed to replacement by other users. Controls cover private ancestors
 and temporary paths with spaces.
+Local suites require Bash, Python 3 and GNU coreutils (`mv -fT` and `timeout
+--kill-after`) on PATH. Both entrypoints preflight the host and stop once with
+`PREREQUISITE:` when it is unsuitable. Run `python3 scripts/test_publication_host.py`
+for missing-tool, incompatible-tool and capable-host controls.
 
 Gate inputs belong under `scripts/`. CI compares that complete subtree with the
 event's base, including quoted filenames, helpers and manifests.
