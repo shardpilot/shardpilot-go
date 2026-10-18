@@ -23,6 +23,8 @@ func TestRestoredDeadlineAfterWithdrawal(t *testing.T) {
 		{"deadline_sentinel", true, "sentinel", "", true},
 		{"batch_full_age_refusal", true, "age", "", true},
 		{"batch_full_sentinel", true, "sentinel", "", true},
+		{"queued_age_refusal", true, "age", "fresh", true},
+		{"queued_sentinel", true, "sentinel", "fresh", true},
 		{"retained_deadline_control", true, "none", "", false},
 		{"no_deadline_age_control", false, "age", "", true},
 		{"no_deadline_sentinel_control", false, "sentinel", "", true},
@@ -101,6 +103,15 @@ func TestRestoredDeadlineAfterWithdrawal(t *testing.T) {
 			waitFor(t, 5*time.Second, "the restored worker starts", func() bool {
 				return restarted.expPipelineLow.Load() > 0
 			})
+			if tc.retained == "fresh" {
+				if err := restarted.Enqueue(Event{Name: "host.before"}); err != nil {
+					t.Fatal(err)
+				}
+				waitFor(t, 5*time.Second, "fresh event received before withdrawal", func() bool { return len(restarted.queue.ch) == 0 })
+				if len(rig.capture.byName("host.before")) != 0 {
+					t.Fatal("the fresh event must wait behind the restored deadline before withdrawal")
+				}
+			}
 			if tc.retained == "worker" {
 				fetchAdultAssignment(t, restarted, ageGoldenExperiment)
 				if err := restarted.Enqueue(Event{Name: "held.before"}); err != nil {
@@ -158,6 +169,9 @@ func TestRestoredDeadlineAfterWithdrawal(t *testing.T) {
 			}
 			time.Sleep(1500 * time.Millisecond)
 			automatic := len(rig.capture.byName("host.after")) > 0
+			if tc.retained == "fresh" && len(rig.capture.byName("host.before")) == 0 {
+				t.Error("the never-attempted batch must publish automatically after withdrawal")
+			}
 			flushCtx, flushCancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer flushCancel()
 			flushErr := restarted.Flush(flushCtx)

@@ -67,6 +67,11 @@ type Client struct {
 	// recovery).
 	workerSeenSuccesses uint64
 
+	// workerPacingFromRestore distinguishes the startup spool deadline from
+	// pacing armed by this worker's own publish outcomes. A never-attempted
+	// batch does not own the startup deadline. Worker goroutine only.
+	workerPacingFromRestore bool
+
 	// pacingWake nudges a parked worker when publishSuccesses moves, so a
 	// recovery proven by a synchronous Track retries the held batch NOW
 	// instead of at the next flush tick (which can be minutes away).
@@ -885,6 +890,7 @@ func (c *Client) run() {
 	// It starts from the deadline the spool re-seeded from a persisted
 	// retry_after_until_ms, when one was live (zero otherwise).
 	deferUntil := c.initialDeferUntil
+	c.workerPacingFromRestore = !deferUntil.IsZero()
 	// backoffAttempt counts consecutive retryable publish failures so the
 	// hint-less fallback schedule (backoffDelay) grows per failure; a
 	// successful publish resets it.
@@ -902,9 +908,10 @@ func (c *Client) run() {
 		// A terminal withdrawal can empty restored resend work while the
 		// worker is idle. Retain pacing only while some retry work owns it;
 		// otherwise fresh events must not inherit the withdrawn deadline.
-		if len(batch) == 0 && !c.spoolHasResendWork() {
+		if (len(batch) == 0 || c.workerPacingFromRestore) && !c.spoolHasResendWork() {
 			deferUntil = time.Time{}
 			backoffAttempt = 0
+			c.workerPacingFromRestore = false
 		}
 	}
 	// deferTimer wakes the worker AT the backpressure deadline, so the held
@@ -1311,6 +1318,7 @@ func (c *Client) applyRetryPacing(err error, deferUntil *time.Time, backoffAttem
 	if err == nil {
 		*deferUntil = time.Time{}
 		*backoffAttempt = 0
+		c.workerPacingFromRestore = false
 		return
 	}
 	if errors.Is(err, ErrConsentReceiptPending) || errors.Is(err, errExperimentAgePending) {
@@ -1331,6 +1339,7 @@ func (c *Client) applyRetryPacing(err error, deferUntil *time.Time, backoffAttem
 			retryAfter = minRetryNowSpacing
 		}
 		*deferUntil = c.clock.Now().Add(retryAfter)
+		c.workerPacingFromRestore = false
 		return
 	}
 	if errors.Is(err, ErrConsentDenied) {
@@ -1348,6 +1357,7 @@ func (c *Client) applyRetryPacing(err error, deferUntil *time.Time, backoffAttem
 		return
 	}
 	*backoffAttempt++
+	c.workerPacingFromRestore = false
 	if delay := c.backoffDelay(*backoffAttempt); delay > 0 {
 		*deferUntil = c.clock.Now().Add(delay)
 	} else {
@@ -1769,6 +1779,7 @@ func (c *Client) publishWorkerBatch(batch []Event, seenConsentEpoch *uint64, def
 	// its own Retry-After hint, or the backoff schedule) instead of
 	// re-firing immediately off the stale, already-elapsed deadline.
 	*deferUntil = time.Time{}
+	c.workerPacingFromRestore = false
 	batch = c.dropBatchOnConsentEpoch(batch, seenConsentEpoch, backoffAttempt)
 	// Consent-floor receipts dispatch FIRST — before every event leg, spool
 	// resends included: receipts deliver under denied/unknown too, and the
