@@ -3,6 +3,8 @@
 # The normal gate sources the receipt functions in this file.
 # The baseline-write scene requires GNU mv, as does the existing write command.
 if [ "${1:-}" = --test ]; then
+  command -v python3 >/dev/null || { echo 'PREREQUISITE: publication controls require Python 3.' >&2; exit 2; }
+  python3 "$(dirname "$0")/check_publication_host.py" || exit $?
   python3 - "$0" "${@:2}" <<'PY'
 import json, os, pathlib, re, subprocess, sys, tempfile
 source = pathlib.Path(sys.argv[1]).resolve().parent.parent

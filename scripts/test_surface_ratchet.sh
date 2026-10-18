@@ -66,6 +66,8 @@ if [ -f "$lane_b_marker" ] && [ "$(cat "$lane_b_marker" 2>/dev/null)" = "$lane_b
 fi
 
 if [ "$lane_b_am_clone" = no ]; then
+  command -v python3 >/dev/null || { echo 'PREREQUISITE: publication controls require Python 3.' >&2; exit 2; }
+  python3 scripts/check_publication_host.py || exit $?
   if [ -n "$(git status --porcelain)" ]; then
     echo "REFUSING: working tree is dirty." >&2
     echo "  This harness clones HEAD and runs there, so uncommitted work would" >&2

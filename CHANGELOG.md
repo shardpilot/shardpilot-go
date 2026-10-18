@@ -4,6 +4,8 @@
 
 ### Tests
 
+- Publication suites preflight GNU rename and timeout behavior before dependent
+  setup, reporting a single host-prerequisite message when tools are unsuitable.
 - Publication checks name unexpected command failures and clean owned scratch
   directories on interruption. Receipt controls cover command failures, identity
   and symlink refusals, and temporary-parent safety.
