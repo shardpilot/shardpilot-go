@@ -233,57 +233,9 @@ jobs:
           path: bench/latest.txt
           retention-days: 30
 
-  # ── THE CHANGE MAY NOT SUPPLY THE GATE THAT JUDGES IT ────────────────────────
-  #
-  # Every gate below runs as `./scripts/<name>.sh` out of the checkout being
-  # judged, so a change could ship a modified gate in the same commit and be
-  # judged by it. CI is the authoritative place for that to fail: a pre-push hook
-  # asserting the same thing is advisory, because `--no-verify` removes it
-  # (shardpilot/shardpilot-go#97).
-  #
-  # WHAT IS JUDGED: every tracked path under scripts/ -- the gate scripts, the Go
-  # helpers they `go run`, the benchmark manifest and the lane B baseline are all
-  # inputs to a decision -- plus every shell script this workflow invokes by path
-  # (a slash and `.sh`), wherever it lives. Both are read at the change's BASE as
-  # well as at its head. The first version read the roster from the change's own
-  # copy of this file, which is the change supplying its judge's roster: a gate
-  # moved out of scripts/, weakened, with its invocation edited to match, left
-  # the roster and passed. Measured, not reasoned, before this was rewritten.
-  #
-  # AGAINST WHAT: the change's own base, chosen by event -- the pull request's
-  # base commit, the pre-push tip, or for a brand-new ref the merge base with the
-  # default branch. The first version took that merge base for every event, and
-  # review found it wrong twice. A push to the default branch has merge base
-  # HEAD, so the change was diffed against itself and passed -- and measured
-  # 2026-09-01, 113 of the 184 commits on main carry no pull-request number, 26
-  # of those touched scripts/: that is the path gate changes took here. And a
-  # pull request into a non-default branch reached back to main, so the target
-  # branch's own gate change was charged to every pull request into it.
-  #
-  # ⚠ THIS JOB DOES NOT CLOSE THE WHOLE CLASS, AND THAT IS SAID HERE RATHER THAN
-  # FURTHER DOWN. GitHub runs the CHANGE'S copy of this file on both triggers --
-  # the branch's on `push`, the merge commit's on `pull_request` -- so a change
-  # can delete this job, or keep its name and hollow it out. A required status
-  # check closes the deletion (a missing check blocks the merge) and not the
-  # hollowing; only a job run from a workflow the change cannot edit closes both
-  # -- `pull_request_target` in its own workflow file, or a ruleset requiring a
-  # workflow pinned to the default branch. Every one of those is a repository
-  # setting rather than anything a file can assert. A reader who implements
-  # this and stops has closed the script routes and left the workflow route
-  # silent, which is the mistake #97 documents.
-  #
-  # ⚠ A GATE CHANGE IS RED HERE BY DESIGN. Measured 2026-09-01: 35 of the 184
-  # commits then on main touched a gate script, and each would have failed this
-  # job -- each was a change to a judge, and the refusal asks a human to read it
-  # as one. With this job a required check, such a change merges only through
-  # the bypass list; that is the review, not a way around it.
-  #
-  # ⚠ VERIFY, NOT SUBSTITUTE, AND THE REASON WAS MEASURED. Running the gate from a
-  # trusted checkout looks stronger and is worse: `check_public_surface.sh` does
-  # `cd "$(dirname "$0")/.."`, so a copy invoked from a trusted directory scans
-  # THAT directory -- it would audit the default branch, report clean, and never
-  # look at the change under review. A gate reporting green while checking nothing
-  # is the defect this job exists to prevent, so the gate is compared, not moved.
+  # Gate inputs live under scripts/, including helpers and manifests.
+  # Compare them against the event's own base. Deliberate gate changes need
+  # explicit review and the landing route described in shardpilot/shardpilot-go#97.
   gate-integrity:
     runs-on: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && fromJSON('["self-hosted","Linux","X64"]') || 'ubuntu-latest' }}
     concurrency:
@@ -299,23 +251,18 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Script subtree comparison controls
+        run: python3 scripts/test_gate_integrity.py
+
       - name: A change may not alter the gate that judges it
-        # Plain variables rather than `${{ }}` inside the script, so the block can
-        # be extracted from this file and driven through every event shape by a
-        # fixture that sets these four names. That is how the rows in the pull
-        # request were produced.
+        # Plain variables keep the Bash block directly executable by fixtures.
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PUSH_BEFORE: ${{ github.event.before }}
         run: |
-          # `-e` is spelled out because the runner adds it anyway (`bash -e {0}`).
-          # The first version said `set -uo pipefail`, its controls were run under
-          # plain bash, and in CI the branch refusing an empty roster was
-          # unreachable: the failing pipeline exited 1 with no message.
           set -euo pipefail
-          wf=.github/workflows/ci.yml
           zero=0000000000000000000000000000000000000000
 
           # ⚠ THE CHANGE'S OWN BASE, BY EVENT. `git merge-base HEAD <default tip>`
@@ -369,53 +316,13 @@ jobs:
             fi
           fi
 
-          # The roster is DERIVED from this workflow, not listed: every shell
-          # script it invokes by path -- a slash and `.sh`, in any directory --
-          # read from the base's copy as well as the head's, so the change cannot
-          # edit a gate out of it. The grep is guarded: under -e a miss would
-          # otherwise end the script before the refusal below could name it.
-          # ⚠ Outside the roster, stated: a gate that is not a `.sh` path (a
-          # `go run` target, an inline step) and does not live under scripts/.
-          derive() { { grep -oE '(\./)?[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)+\.sh' || :; } | sed 's|^\./||' | sort -u; }
-          if ! git cat-file -e "$base:$wf" 2>/dev/null; then
-            echo "REFUSING: $wf does not exist at the base $base, so the roster" >&2
-            echo "  this job judges against could not be read." >&2
-            exit 2
-          fi
-          from_base="$(git show "$base:$wf" | derive)"
-          from_head=""
-          if [ -f "$wf" ]; then from_head="$(derive < "$wf")"; fi
-          if [ -z "$from_base" ] || [ -z "$from_head" ]; then
-            echo "REFUSING: no gate script invocation was found in $wf" >&2
-            echo "  (base: ${from_base:-none}; head: ${from_head:-none}), so this" >&2
-            echo "  check would compare nothing and report success. The pattern" >&2
-            echo "  here has stopped matching how the workflow runs its gates." >&2
-            exit 2
-          fi
-          tree_base="$(git ls-tree -r --name-only "$base" -- scripts/)"
-          tree_head="$(git ls-files -- scripts/)"
-          judges="$(printf '%s\n%s\n%s\n%s\n' "$from_base" "$from_head" "$tree_base" "$tree_head" | sed '/^$/d' | sort -u)"
-
-          changed=""
-          n=0
-          while IFS= read -r g; do
-            [ -n "$g" ] || continue
-            n=$((n + 1))
-            if ! git diff --quiet "$base" -- "$g"; then
-              changed="$changed    $g"$'\n'
-            fi
-          done <<EOF
-          $judges
-          EOF
-
-          if [ -z "$changed" ]; then
-            printf 'this change does not alter any of the %d gate file(s) that judge it (base: %s).\n' "$n" "$what"
+          # Only scripts/ defines protected gate inputs. Compare its paths directly.
+          if git diff --quiet "$base" -- scripts/; then
+            printf 'this change does not alter scripts/ (base: %s).\n' "$what"
             exit 0
           fi
 
           echo "REFUSING: this change alters the gate that judges it (base: $what)." >&2
-          echo >&2
-          printf '%s' "$changed" >&2
           echo >&2
           echo '  A change may not supply its own judge. CI is the authoritative' >&2
           echo '  place to hold that: a pre-push hook asserting it is advisory,' >&2

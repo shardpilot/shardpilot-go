@@ -651,6 +651,11 @@ non-root user with Bash, Python 3 and GNU coreutils. It also runs
 That second command models ignored permission changes; it is not UID-0 execution.
 The channel scene verifies the failed append before checking the refusal exit.
 
+Gate inputs belong under `scripts/`. CI compares that complete subtree with the
+event's base, including quoted filenames, helpers and manifests.
+Run `python3 scripts/test_gate_integrity.py` for unchanged, ordinary-name,
+quoted-name and outside-directory controls. Deliberate gate changes require review.
+
 ## Conventions & boundaries
 
 - **Zero third-party dependencies** — stdlib only. Keep it that way.
