@@ -120,6 +120,11 @@ type Client struct {
 	closed        atomic.Bool
 	consent       atomic.Int32
 
+	// closeExpired marks a cached verdict whose event-plane part is only the
+	// closing context's expiry while background work drained: a later Close
+	// waits again instead of returning it.
+	closeExpired bool
+
 	// consentEpoch is the denial generation counter: SetConsent(false)
 	// increments it so the worker discards events it has already pulled
 	// into its local batch. The worker tracks the last epoch it observed
@@ -718,8 +723,13 @@ func (c *Client) finishClose(ctx context.Context) error {
 		select {
 		case <-done:
 			c.closeMu.Lock()
-			err := c.closeErr
+			err, expired := c.closeErr, c.closeExpired
 			c.closeMu.Unlock()
+			if expired {
+				// That deadline was the other caller's: wait for the
+				// teardown within this caller's own context instead.
+				return c.finishClose(ctx)
+			}
 			// Re-fold LATE discards (idempotent): the close that cached this
 			// verdict may have abandoned the worker on its own context
 			// expiry, and the stop path can count discarded remnant events
@@ -730,13 +740,17 @@ func (c *Client) finishClose(ctx context.Context) error {
 		}
 	}
 	if c.closeComplete {
-		if !errors.Is(c.closeErr, ErrConsentPending) {
+		if !errors.Is(c.closeErr, ErrConsentPending) && !c.closeExpired {
 			err := c.closeErr
 			c.closeMu.Unlock()
 			// Same late-discard re-fold as the waiter path above: a cached
 			// verdict must never hide a loss counted after it was stored.
 			return c.closeDiscardVerdict(err)
 		}
+		// A previous Close whose context expired while background work drained
+		// is retried the same way: its verdict was the caller's deadline, not
+		// the teardown's outcome.
+		//
 		// The previous Close left consent receipts pending (undeliverable
 		// AND not durably on disk): completion was declined so the process
 		// would not silently lose them, and Close stays RETRYABLE — this
@@ -750,18 +764,28 @@ func (c *Client) finishClose(ctx context.Context) error {
 		c.closeDone = done
 		c.closeMu.Unlock()
 		err := c.finalizeConsentOutbox(ctx)
-		// The worker may still be running after an earlier Close timed out.
-		// Wait for workerDone within this caller's context so the stop path can
-		// persist or account for its remnant. Fold a timeout into the result;
-		// cached returns also fold any later discard count.
-		select {
-		case <-c.workerDone:
-		case <-contextDone(ctx):
-			err = errors.Join(err, contextCause(ctx))
+		// The worker, the experiments lane and the consent sender may still be
+		// running after an earlier Close timed out. Wait for them within this
+		// caller's context so the stop path can persist or account for its
+		// remnant. Fold a timeout into the result; cached returns also fold
+		// any later discard count.
+		expired := false
+		for _, laneDone := range []chan struct{}{c.workerDone, c.expLaneDone, c.consentSenderDone} {
+			if laneDone == nil {
+				continue
+			}
+			select {
+			case <-laneDone:
+				continue
+			case <-contextDone(ctx):
+				err, expired = errors.Join(err, contextCause(ctx)), true
+			}
+			break
 		}
 		err = c.closeDiscardVerdict(err)
 		c.closeMu.Lock()
 		c.closeErr = err
+		c.closeExpired = expired
 		c.closeInFlight = false
 		close(done)
 		c.closeMu.Unlock()
@@ -781,6 +805,7 @@ func (c *Client) finishClose(ctx context.Context) error {
 	}
 	c.closeExperimentPreFlush(ctx)
 	err := c.Flush(ctx)
+	expired := false
 	// The flush freed queue room: owed exposure facts drain in a
 	// sweep-then-flush LOOP until nothing is owed or a pass makes no
 	// progress (see closeExperimentPostFlush) — a bounded queue can admit
@@ -797,7 +822,7 @@ func (c *Client) finishClose(ctx context.Context) error {
 	case <-c.workerDone:
 	case <-contextDone(ctx):
 		if err == nil {
-			err = contextCause(ctx)
+			err, expired = contextCause(ctx), true
 		}
 	}
 	// The experiments background lane exits on the same stop signal; wait
@@ -810,7 +835,7 @@ func (c *Client) finishClose(ctx context.Context) error {
 		case <-c.expLaneDone:
 		case <-contextDone(ctx):
 			if err == nil {
-				err = contextCause(ctx)
+				err, expired = contextCause(ctx), true
 			}
 		}
 	}
@@ -824,7 +849,7 @@ func (c *Client) finishClose(ctx context.Context) error {
 	case <-c.consentSenderDone:
 	case <-contextDone(ctx):
 		if err == nil {
-			err = contextCause(ctx)
+			err, expired = contextCause(ctx), true
 		}
 	}
 	// Consent-floor drain (no-op with the floor off): ALWAYS runs, whatever
@@ -859,6 +884,7 @@ func (c *Client) finishClose(ctx context.Context) error {
 
 	c.closeMu.Lock()
 	c.closeErr = err
+	c.closeExpired = expired
 	c.closeComplete = true
 	c.closeInFlight = false
 	close(done)
