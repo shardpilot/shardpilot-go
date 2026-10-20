@@ -3,7 +3,6 @@ package shardpilot
 import (
 	"bytes"
 	"encoding/json"
-	"strings"
 )
 
 // maxEventBytes is the ingest per-event cap. An event whose serialized JSON,
@@ -11,21 +10,10 @@ import (
 // event_too_large; an event of exactly this many bytes is admitted.
 const maxEventBytes = 2048
 
-// eventExceedsSizeLimit applies the ingest size rule to one wire element:
-// the trimmed byte length is over the cap, unless the element is a retired
-// experiment fact, which ingest leaves to its schema-version refusal.
-func eventExceedsSizeLimit(raw []byte, eventName string, schemaVersion int) bool {
-	return len(bytes.TrimSpace(raw)) > maxEventBytes && !retiredExperimentFact(eventName, schemaVersion)
-}
-
-// retiredExperimentFact reports an experiment exposure or outcome at schema
-// version 1, the retired experiment major.
-func retiredExperimentFact(eventName string, schemaVersion int) bool {
-	switch strings.TrimSpace(eventName) {
-	case experimentExposureName, experimentOutcomeName:
-		return schemaVersion == 1
-	}
-	return false
+// eventExceedsSizeLimit applies the ingest size rule to one wire element: its
+// byte length, with surrounding whitespace trimmed, is over the cap.
+func eventExceedsSizeLimit(raw []byte) bool {
+	return len(bytes.TrimSpace(raw)) > maxEventBytes
 }
 
 // intakeEncoding is an event's envelope and wire bytes, built once at intake.
@@ -49,7 +37,7 @@ func (c *Client) encodeAtIntake(event *Event) error {
 	if err != nil {
 		return nil
 	}
-	if eventExceedsSizeLimit(raw, envelope.EventName, envelope.SchemaVersion) {
+	if eventExceedsSizeLimit(raw) {
 		return ErrEventTooLarge
 	}
 	event.encoded = &intakeEncoding{envelope: envelope, raw: raw}
@@ -74,7 +62,7 @@ func (c *Client) encodeEvent(event Event) (eventEnvelope, json.RawMessage, error
 	if err != nil {
 		return eventEnvelope{}, nil, &EncodeError{Err: err}
 	}
-	if eventExceedsSizeLimit(raw, envelope.EventName, envelope.SchemaVersion) {
+	if eventExceedsSizeLimit(raw) {
 		return eventEnvelope{}, nil, &EncodeError{Err: ErrEventTooLarge}
 	}
 	return envelope, raw, nil

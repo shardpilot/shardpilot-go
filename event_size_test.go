@@ -174,7 +174,7 @@ func TestEventSizePrecheckRefusesOnlyTheOversizeEvent(t *testing.T) {
 }
 
 // TestEventSizePrecheckAppliesToExperimentFacts: the SDK's own facts follow
-// the same rule; ingest exempts only the retired experiment major.
+// the same rule.
 func TestEventSizePrecheckAppliesToExperimentFacts(t *testing.T) {
 	client, scene := newSizeSceneClient(t)
 	fact := Event{
