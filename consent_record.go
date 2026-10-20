@@ -158,8 +158,7 @@ type consentRecordWire struct {
 
 // consentRecordInfo is a loaded record's full shape for the floor reload:
 // the decision state plus the ordering stamp and floor provenance
-// (decidedAt empty and floor false for a legacy record that predates the
-// fields).
+// (decidedAt is empty when the record carries no stamp).
 type consentRecordInfo struct {
 	state         ConsentState
 	decidedAt     string
@@ -376,13 +375,12 @@ func loadConsentRecordRead(dir, actorDigest string) (consentRecordInfo, bool, co
 		//     absent, a stale retained grant receipt would apply
 		//     unconditionally and reopen the floor against a durable denial
 		//     (fail-closed = keep the denial). The cleared stamp keeps the
-		//     record un-overridable by comparison — floor-marked stampless
-		//     is never superseded, unlike the legacy stampless shape — and
-		//     the next decision or trail heal rewrites it whole.
-		// Legacy records (no floor mark) keep loading with their empty
-		// stamp: the provenance rule vets their grants, their denials are
-		// honored, and a validly-stamped in-scope proof supersedes them in
-		// both directions (they predate the stamping build).
+		//     record un-overridable by comparison, and the next decision or
+		//     trail heal rewrites it whole.
+		// A record without the floor mark keeps loading with the stamp it
+		// carries: the provenance rule vets an unstamped grant and an
+		// unstamped denial is honored; without an orderable stamp no
+		// receipt supersedes it by comparison.
 		if _, err := time.Parse(time.RFC3339Nano, record.DecidedAt); err != nil {
 			if info.state == ConsentGranted {
 				// `none` already carries the mark (captured above), so a

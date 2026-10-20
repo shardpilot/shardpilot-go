@@ -64,6 +64,10 @@
   that earlier pre-release builds wrote. The SDK writes only the line format (a
   header, then one record per line); a file in any other layout is discarded at
   load and the spool starts clean, as with any record this build does not write.
+- A persisted consent record without a decision stamp no longer yields to any
+  stamped receipt at reload. Every build writes the stamp, so such a record is
+  damaged rather than old: like a record whose stamp cannot be ordered, it is
+  kept as recorded until the next decision.
 
 ## v0.10.0 — 2026-10-15 — scoped config retries and terminal closure
 
