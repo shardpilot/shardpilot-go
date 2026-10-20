@@ -92,7 +92,7 @@ func rewriteRestartApplications(t *testing.T, dir string, mutate func(*spoolEven
 	if !doc.ok {
 		t.Fatal("the actual SDK spool must parse before the offline change")
 	}
-	record := spoolRecordWire{Version: spoolRecordVersion}
+	var record spoolRecordWire
 	for _, entry := range doc.live() {
 		wire := entry.wire()
 		application := parseStoredApplication(wire.Application)
@@ -106,13 +106,7 @@ func rewriteRestartApplications(t *testing.T, dir string, mutate func(*spoolEven
 		}
 		record.Events = append(record.Events, wire)
 	}
-	data, err = json.Marshal(record)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, data, 0600); err != nil {
-		t.Fatal(err)
-	}
+	writeSpoolDocument(t, path, spoolRecordVersionLines, record)
 }
 
 func TestRestoredApplicationRejectsEveryForeignScopeComponent(t *testing.T) {

@@ -58,6 +58,13 @@
   authorization refusals bypass per-experiment response fences, and a fact key
   must reach durable state before its fact enters the analytics pipeline.
 
+### Removed
+
+- The opt-in disk spool no longer reads the single-object `spool.json` layout
+  that earlier pre-release builds wrote. The SDK writes only the line format (a
+  header, then one record per line); a file in any other layout is discarded at
+  load and the spool starts clean, as with any record this build does not write.
+
 ## v0.10.0 — 2026-10-15 — scoped config retries and terminal closure
 
 - Remote-config retry policy changes from `v0.9.0`: only a positive server

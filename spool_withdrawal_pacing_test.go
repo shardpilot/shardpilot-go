@@ -2,10 +2,8 @@ package shardpilot
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -76,13 +74,7 @@ func TestRestoredDeadlineAfterWithdrawal(t *testing.T) {
 			if tc.deadline {
 				record.RetryAfterUntilMS = time.Now().Add(10 * time.Minute).UnixMilli()
 			}
-			payload, err := json.Marshal(record)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := os.WriteFile(filepath.Join(spool, spoolFileName), payload, 0600); err != nil {
-				t.Fatal(err)
-			}
+			writeSpoolDocument(t, filepath.Join(spool, spoolFileName), spoolRecordVersionLines, record)
 			rig.capture.setStatus(http.StatusAccepted)
 			restarted := rig.launch(t, func(cfg *Config) {
 				cfg.FlushInterval = 30 * time.Millisecond

@@ -245,7 +245,7 @@ func readSpoolRecordFile(t *testing.T, dir string) spoolRecordWire {
 	if !doc.ok {
 		t.Fatalf("parse spool record: not a recognised spool document (%d bytes)", len(data))
 	}
-	record := spoolRecordWire{Version: spoolRecordVersion, RetryAfterUntilMS: doc.retryAfterUntilMS}
+	record := spoolRecordWire{RetryAfterUntilMS: doc.retryAfterUntilMS}
 	for _, entry := range doc.live() {
 		record.Events = append(record.Events, entry.wire())
 	}
@@ -310,12 +310,27 @@ func writeSpoolRecordFile(t *testing.T, dir string, deadlineMS int64, envelopes 
 	for _, raw := range envelopes {
 		events = append(events, spoolEntryFromEnvelope(t, raw).wire())
 	}
-	record := spoolRecordWire{Version: spoolRecordVersion, Events: events, RetryAfterUntilMS: deadlineMS}
-	payload, err := json.Marshal(record)
+	writeSpoolDocument(t, filepath.Join(dir, spoolFileName), spoolRecordVersionLines,
+		spoolRecordWire{Events: events, RetryAfterUntilMS: deadlineMS})
+}
+
+// writeSpoolDocument writes record in the line format load reads: a header
+// naming version, then one entry per line.
+func writeSpoolDocument(t *testing.T, path string, version int, record spoolRecordWire) {
+	t.Helper()
+	payload, err := json.Marshal(spoolHeaderWire{Version: version, RetryAfterUntilMS: record.RetryAfterUntilMS})
 	if err != nil {
-		t.Fatalf("marshal spool record: %v", err)
+		t.Fatalf("marshal spool header: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, spoolFileName), payload, 0o600); err != nil {
+	payload = append(payload, '\n')
+	for _, event := range record.Events {
+		line, err := json.Marshal(event)
+		if err != nil {
+			t.Fatalf("marshal spool line: %v", err)
+		}
+		payload = append(append(payload, line...), '\n')
+	}
+	if err := os.WriteFile(path, payload, 0o600); err != nil {
 		t.Fatalf("write spool record: %v", err)
 	}
 }
@@ -503,9 +518,6 @@ func TestSpoolGrantedRetriableFailureSpoolsExactWireBytes(t *testing.T) {
 	flushUntilSpooled(t, client, dir, 2)
 
 	record := readSpoolRecordFile(t, dir)
-	if record.Version != spoolRecordVersion {
-		t.Fatalf("expected record version %d, got %d", spoolRecordVersion, record.Version)
-	}
 	// Every spooled envelope is the EXACT bytes some failed publish attempt
 	// put on the wire.
 	sent := make(map[string]bool)
@@ -2712,18 +2724,10 @@ func TestSpoolWrongVersionRecordDiscardedAtLoad(t *testing.T) {
 	// event bytes and its persisted deadline belong to an incompatible
 	// layout and must not be trusted — not resent, not seeding the deferral.
 	// Discarded as a clean start exactly like an unparseable record.
-	record := spoolRecordWire{
-		Version:           spoolRecordVersion + 1,
+	writeSpoolDocument(t, filepath.Join(dir, spoolFileName), spoolRecordVersionLines+1, spoolRecordWire{
 		Events:            []spoolEventWire{{Raw: spoolTestEnvelope(t, "evt-wrong-version-1", time.Now())}},
 		RetryAfterUntilMS: time.Now().Add(time.Hour).UnixMilli(),
-	}
-	payload, err := json.Marshal(record)
-	if err != nil {
-		t.Fatalf("marshal wrong-version record: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, spoolFileName), payload, 0o600); err != nil {
-		t.Fatalf("write wrong-version record: %v", err)
-	}
+	})
 
 	recorder := &spoolDeadLetterRecorder{}
 	client := newSpoolTestClient(t, server.URL, dir, recorder, nil)
