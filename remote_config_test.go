@@ -483,10 +483,11 @@ func TestRemoteConfigMalformedValuesMemberNeverFallsBack(t *testing.T) {
 	client := newRemoteConfigClient(t, server.URL, "", "anon-rc-1")
 	defer client.Close(context.Background())
 
-	// A wrapper whose values member is not an object must be malformed —
-	// never served as an unwrapped payload (that would expose wrapper fields
-	// as configuration).
+	// A body whose values member is absent or not an object must be
+	// malformed — never served as the configuration map (that would expose
+	// wrapper fields as configuration).
 	for _, body := range []string{
+		`{"version":7,"speed":1.5}`,
 		`{"version":1,"values":null}`,
 		`{"version":1,"values":[]}`,
 		`{"version":1,"values":"nope"}`,
@@ -496,34 +497,6 @@ func TestRemoteConfigMalformedValuesMemberNeverFallsBack(t *testing.T) {
 		if _, err := client.FetchRemoteConfig(context.Background()); err == nil || !strings.Contains(err.Error(), "malformed_response") {
 			t.Fatalf("expected malformed_response for %s, got %v", body, err)
 		}
-	}
-}
-
-func TestRemoteConfigUnwrappedPayload(t *testing.T) {
-	var script atomic.Value
-	script.Store(rcScriptStep{status: 200, body: `{"version":7,"speed":1.5}`})
-	server := newRCScriptServer(t, nil, &script)
-	defer server.Close()
-
-	client := newRemoteConfigClient(t, server.URL, "", "anon-rc-1")
-	defer client.Close(context.Background())
-
-	result, err := client.FetchRemoteConfig(context.Background())
-	if err != nil {
-		t.Fatalf("FetchRemoteConfig: %v", err)
-	}
-	if result.HasVersion {
-		t.Fatalf("an unwrapped payload carries no wrapper version, got %+v", result)
-	}
-	// In an unwrapped payload a "version" KEY is configuration.
-	if result.Values["version"] != float64(7) || result.Values["speed"] != 1.5 {
-		t.Fatalf("unexpected unwrapped values %+v", result.Values)
-	}
-	if got := client.RemoteConfigNumber("version", 0); got != 7 {
-		t.Fatalf("expected the unwrapped version key served as configuration, got %v", got)
-	}
-	if _, has := client.RemoteConfigVersion(); has {
-		t.Fatalf("RemoteConfigVersion must report absent for an unwrapped payload")
 	}
 }
 

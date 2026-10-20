@@ -58,6 +58,14 @@
   authorization refusals bypass per-experiment response fences, and a fact key
   must reach durable state before its fact enters the analytics pipeline.
 
+### Removed
+
+- Remote config no longer serves a response body without a `values` member as
+  the configuration map. The config endpoint always answers with the
+  `{"version", "values"}` wrapper, so such a body is now `malformed_response`,
+  like a `values` member that is not an object. Cached records, which hold the
+  served body verbatim, follow the same rule.
+
 ## v0.10.0 — 2026-10-15 — scoped config retries and terminal closure
 
 - Remote-config retry policy changes from `v0.9.0`: only a positive server
