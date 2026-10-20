@@ -3,7 +3,6 @@ package shardpilot
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -49,17 +48,11 @@ func TestSpoolRestartRetryWindow(t *testing.T) {
 			if tc.ambiguousAge > 0 {
 				ambiguous = now.Add(-tc.ambiguousAge).UnixMilli()
 			}
-			data, err := json.Marshal(map[string]any{"version": 2, "events": []any{
-				map[string]any{"raw": subject, "intake_unix_ms": now.Add(-tc.intakeAge).UnixMilli(), "ambiguous_unix_ms": ambiguous},
-				map[string]any{"raw": fresh, "intake_unix_ms": now.Add(-time.Minute).UnixMilli()},
-			}})
-			if err != nil {
-				t.Fatal(err)
-			}
 			writeConsentRecordFile(t, dir, "granted")
-			if err := os.WriteFile(filepath.Join(dir, spoolFileName), data, 0600); err != nil {
-				t.Fatal(err)
-			}
+			writeSpoolDocument(t, filepath.Join(dir, spoolFileName), spoolRecordVersionLines, spoolRecordWire{Events: []spoolEventWire{
+				{Raw: subject, IntakeUnixMS: now.Add(-tc.intakeAge).UnixMilli(), AmbiguousUnixMS: ambiguous},
+				{Raw: fresh, IntakeUnixMS: now.Add(-time.Minute).UnixMilli()},
+			}})
 			recorder := &spoolDeadLetterRecorder{}
 			client := newSpoolTestClient(t, server.URL, dir, recorder, nil)
 			defer client.Close(context.Background())
@@ -445,17 +438,11 @@ func TestRetryWindowMissingMetadataExpires(t *testing.T) {
 	now := time.Now()
 	dir := t.TempDir()
 	raw := spoolTestEnvelope(t, "unverifiable", now)
-	legacy := spoolRecordWire{Version: 2, Events: []spoolEventWire{{Raw: raw}}}
-	data, err := json.Marshal(legacy)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, spoolFileName), data, 0600); err != nil {
-		t.Fatal(err)
-	}
+	writeSpoolDocument(t, filepath.Join(dir, spoolFileName), spoolRecordVersionLines,
+		spoolRecordWire{Events: []spoolEventWire{{Raw: raw}}})
 	s := newDiskSpool(Config{SpoolDir: dir, SpoolMaxEvents: 10, SpoolMaxBytes: 1 << 20})
 	outcome := s.load(now)
 	if len(outcome.expired) != 1 || s.hasResendWork() {
-		t.Fatal("legacy record acquired a fresh retry clock")
+		t.Fatal("a record without intake metadata acquired a fresh retry clock")
 	}
 }

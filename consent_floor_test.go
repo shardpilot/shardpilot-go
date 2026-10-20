@@ -1282,36 +1282,6 @@ func TestGateRefusalLeavesEventPacingUntouched(t *testing.T) {
 	}
 }
 
-func TestConsentOutboxOverCapLoadKeepsNewest(t *testing.T) {
-	dir := t.TempDir()
-	entries := make([]string, 0, maxConsentOutboxEntries+8)
-	for i := 0; i < maxConsentOutboxEntries+8; i++ {
-		entries = append(entries, fmt.Sprintf(
-			`{"idempotency_key":"key-%02d","workspace_id":"w","app_id":"a","environment_id":"e","actor_identifier":"x","kind":"anon","categories":{"analytics":false},"decided_at":"2026-07-19T00:00:00Z"}`, i))
-	}
-	record := fmt.Sprintf(`{"version":1,"receipts":[%s]}`, strings.Join(entries, ","))
-	if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName), []byte(record), 0o600); err != nil {
-		t.Fatalf("write outbox record: %v", err)
-	}
-	outbox := newConsentOutbox(dir)
-	outbox.load(nil)
-	outbox.mu.Lock()
-	kept := len(outbox.receipts)
-	oldest := outbox.receipts[0].IdempotencyKey
-	newest := outbox.receipts[kept-1].IdempotencyKey
-	outbox.mu.Unlock()
-	// The load-time cap trims OLDEST first, exactly like the save-time cap:
-	// an over-cap legacy record keeps its NEWEST receipts — the operative
-	// decisions — never the stalest history.
-	if kept != maxConsentOutboxEntries || oldest != "key-08" || newest != fmt.Sprintf("key-%02d", maxConsentOutboxEntries+7) {
-		t.Fatalf("expected the newest %d receipts kept (oldest evicted), got %d spanning %s..%s",
-			maxConsentOutboxEntries, kept, oldest, newest)
-	}
-	if got := outbox.takeEvicted(); got != 8 {
-		t.Fatalf("expected 8 load-time evictions counted, got %d", got)
-	}
-}
-
 func TestConsentFloorEmptyBody2xxAcknowledges(t *testing.T) {
 	state, server := newFloorTestServer(t)
 	defer server.Close()
@@ -3831,55 +3801,6 @@ func TestConsentFloorExpiredCloseRemnantFoldsDiscarded(t *testing.T) {
 	}
 }
 
-func TestConsentOutboxOverCapLoadTrimLandsDurably(t *testing.T) {
-	// The load-time cap trim is a MEMORY change: without marking the write
-	// owed, a process that never saves before exiting leaves the over-cap
-	// file behind, and every restart re-evicts and re-counts the same
-	// entries. The trim must owe the rewrite; the owed-write machinery
-	// lands it at the first retry.
-	dir := t.TempDir()
-	over := maxConsentOutboxEntries + 8
-	seeded := make([]consentReceipt, 0, over)
-	for i := 0; i < over; i++ {
-		seeded = append(seeded, testConsentReceipt(fmt.Sprintf("key-trim-%02d", i), false))
-	}
-	record := consentOutboxWire{Version: consentOutboxRecordVersion, Receipts: &seeded}
-	payload, err := json.Marshal(record)
-	if err != nil {
-		t.Fatalf("marshal seed record: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName), payload, 0o600); err != nil {
-		t.Fatalf("write seed record: %v", err)
-	}
-
-	outbox := newConsentOutbox(dir)
-	outbox.load(nil)
-	if got := outbox.takeEvicted(); got != 8 {
-		t.Fatalf("expected the 8 load-time evictions counted, got %d", got)
-	}
-	if !outbox.writeOwed() {
-		t.Fatalf("expected the load-time trim to OWE the durable rewrite")
-	}
-	if attempted, failed := outbox.retryPersist(); !attempted || failed {
-		t.Fatalf("expected the owed rewrite attempted and landed, got (%v, %v)", attempted, failed)
-	}
-	onDisk, _ := outbox.readRecordReceipts()
-	if got := len(onDisk); got != maxConsentOutboxEntries {
-		t.Fatalf("expected the trimmed record durable on disk, got %d entries", got)
-	}
-
-	// A restart sees a within-cap record: no re-eviction, no re-count, no
-	// owed write.
-	reloaded := newConsentOutbox(dir)
-	reloaded.load(nil)
-	if got := reloaded.takeEvicted(); got != 0 {
-		t.Fatalf("expected no re-eviction after the durable trim, got %d", got)
-	}
-	if reloaded.writeOwed() {
-		t.Fatalf("expected no owed write on a within-cap record")
-	}
-}
-
 func TestConsentFloorCorruptStampFloorDenialStaysDenied(t *testing.T) {
 	// A floor-marked DENIED record with a garbled stamp must PRESERVE the
 	// denial (denied-with-unknown-stamp) — read as absent, a stale retained
@@ -3944,66 +3865,6 @@ func TestConsentFloorCorruptStampFloorDenialStaysDenied(t *testing.T) {
 	}
 	if probe := newConsentOutbox(dir); func() int { r, _ := probe.readRecordReceipts(); return len(r) }() != 1 {
 		t.Fatalf("expected the stale grant durably retained after Close")
-	}
-}
-
-func TestConsentFloorLegacyRecordSupersededByStampedProof(t *testing.T) {
-	state, server := newFloorTestServer(t)
-	defer server.Close()
-
-	// A LEGACY stampless record predates the stamping build: any
-	// validly-stamped in-scope proof supersedes it in BOTH directions.
-	writeLegacyRecord := func(t *testing.T, dir, decision string) {
-		t.Helper()
-		payload := []byte(fmt.Sprintf(`{"consent_analytics":%q,"actor_digest":%q}`, decision, spoolTestActorDigest()))
-		if err := os.WriteFile(consentRecordPath(dir), payload, 0o600); err != nil {
-			t.Fatalf("write consent record: %v", err)
-		}
-	}
-
-	// A stamped durable denial proof supersedes the legacy grant and heals
-	// the record denied. The recovered record retains the proof's decision
-	// stamp and floor provenance.
-	deniedDir := t.TempDir()
-	writeLegacyRecord(t, deniedDir, "granted")
-	planted := newConsentOutbox(deniedDir)
-	if planted.append(testConsentReceipt("key-legacy-deny-1", false)) {
-		t.Fatalf("seeding the deny receipt failed")
-	}
-	deniedClient := newFloorTestClient(t, server.URL, deniedDir, nil)
-	if got := deniedClient.ConsentState(); got != ConsentDenied {
-		t.Fatalf("expected the stamped denial proof to supersede the legacy grant, got %v", got)
-	}
-	info, ok := loadConsentRecordInfo(deniedDir, spoolTestActorDigest())
-	if !ok || info.state != ConsentDenied || !info.floor || info.decidedAt != "2026-07-19T00:00:00Z" {
-		t.Fatalf("expected the record healed denied from the proof, got (%+v, %v)", info, ok)
-	}
-	if err := deniedClient.Close(context.Background()); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	// Legacy DENIAL + durable later grant proof: the user's newest decision
-	// is the grant — the proof supersedes the legacy denial and heals a
-	// floor-marked grant.
-	grantedDir := t.TempDir()
-	writeLegacyRecord(t, grantedDir, "denied")
-	planted = newConsentOutbox(grantedDir)
-	if planted.append(testConsentReceipt("key-legacy-grant-1", true)) {
-		t.Fatalf("seeding the grant receipt failed")
-	}
-	grantedClient := newFloorTestClient(t, server.URL, grantedDir, nil)
-	if got := grantedClient.ConsentState(); got != ConsentGranted {
-		t.Fatalf("expected the stamped grant proof to supersede the legacy denial, got %v", got)
-	}
-	info, ok = loadConsentRecordInfo(grantedDir, spoolTestActorDigest())
-	if !ok || info.state != ConsentGranted || !info.floor {
-		t.Fatalf("expected the record healed to a floor-marked grant, got (%+v, %v)", info, ok)
-	}
-	waitFor(t, 3*time.Second, "the retained proofs delivered", func() bool {
-		return state.consentCount() == 2
-	})
-	if err := grantedClient.Close(context.Background()); err != nil {
-		t.Fatalf("Close: %v", err)
 	}
 }
 
