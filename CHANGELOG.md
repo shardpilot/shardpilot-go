@@ -73,6 +73,11 @@
   only a different writer could leave a larger one; such a record now loads
   as written and the next save applies the cap, counting its evictions in
   `Stats.ConsentOutboxEvicted` then.
+- The local 2048-byte event size check no longer exempts experiment exposure
+  and outcome facts at schema version 1. The SDK emits its experiment facts
+  only at schema version 2 and refuses those names from the host, so no event
+  it builds can take the exemption; the check is now the trimmed byte length
+  alone.
 - Remote config no longer serves a response body without a `values` member as
   the configuration map. The config endpoint always answers with the
   `{"version", "values"}` wrapper, so such a body is now `malformed_response`,
