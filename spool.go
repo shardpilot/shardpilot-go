@@ -88,8 +88,7 @@ type SpoolDeadLetter struct {
 }
 
 const (
-	spoolFileName      = "spool.json"
-	spoolRecordVersion = 2
+	spoolFileName = "spool.json"
 
 	// spoolRetryAgeCap bounds total retention from local intake, including
 	// definite offline time. Host event_ts overrides cannot extend it.
@@ -144,19 +143,16 @@ const (
 // load time too, not just for what this process writes.
 var errSpoolRecordOversized = errors.New("spool record exceeds the bounded read limit")
 
-// spoolRecordWire is the spool.json payload. Events hold the exact
-// wire-serialized envelope bytes; retry_after_until_ms carries a live server
-// Retry-After deadline captured when a batch was spooled under one.
-// Version 2 wraps each event in spoolEventWire — the exact envelope bytes
-// plus SDK-side metadata that must survive a restart but can never ride the
-// wire envelope itself (the ingest contract is a strict allowlist): the
-// SDK-authorship marker the sentinel's spool predicates require. Version 1
-// records (bare raw arrays) fail the version gate at load and start clean —
-// the pre-release breaking-format posture.
+// spoolRecordWire is a loaded spool's live entries and its persisted server
+// Retry-After deadline, as load works on them. It is not a file format:
+// spool.json is the line format below, one spoolEventWire per line. Each
+// entry is the exact wire-serialized envelope bytes plus SDK-side metadata
+// that must survive a restart but can never ride the wire envelope itself
+// (the ingest contract is a strict allowlist): the SDK-authorship marker the
+// sentinel's spool predicates require.
 type spoolRecordWire struct {
-	Version           int              `json:"version"`
-	Events            []spoolEventWire `json:"events"`
-	RetryAfterUntilMS int64            `json:"retry_after_until_ms,omitempty"`
+	Events            []spoolEventWire
+	RetryAfterUntilMS int64
 }
 
 // spoolEventWire is one persisted spool entry: the envelope's exact wire
@@ -272,7 +268,7 @@ type spoolEntry struct {
 }
 
 // spoolEntryExpired uses local intake and ambiguous-attempt clocks only.
-// Missing metadata (including legacy records) cannot prove safe retry age.
+// Missing metadata cannot prove safe retry age.
 func spoolEntryExpired(entry spoolEntry, now time.Time) bool {
 	return entry.id == "" || entry.delivery.expired(now)
 }
@@ -789,9 +785,9 @@ func (s *diskSpool) saveLocked() error {
 	s.dirty = err != nil
 	// A landed rewrite is the ONLY thing that makes the file appendable: it is
 	// the moment the bytes on disk are known to be a v3 document matching the
-	// committed state. A failed one clears the flag, which is also how a
-	// legacy file, an absent file, and a recovered tear all take the rewrite
-	// path without any of them needing a separate check.
+	// committed state. A failed one clears the flag, which is also how an
+	// absent file and a recovered tear take the rewrite path without either
+	// needing a separate check.
 	s.fileAppendable = err == nil
 	s.tornTailOwed = s.tornTailOwed && err != nil
 	if err == nil {
@@ -1096,9 +1092,9 @@ func (s *diskSpool) readRecordBytesLocked() ([]byte, error) {
 	// The framing allowance scales with the EVENT cap as well: past ~64k
 	// retained envelopes the per-event framing alone outgrows the fixed
 	// overhead, and a self-written cap-full record must never read back as
-	// oversized. Forty bytes per allowed event covers the version-2
+	// oversized. Forty bytes per allowed event covers the per-line
 	// spoolEventWire wrapper ({"raw":...} plus the optional internal-fact
-	// flag, worst case 29 bytes) and the array separator with room to
+	// flag, worst case 29 bytes) and the line terminator with room to
 	// spare.
 	limit := s.readLimitLocked()
 	data, err := io.ReadAll(io.LimitReader(file, limit+1))
@@ -1111,7 +1107,7 @@ func (s *diskSpool) readRecordBytesLocked() ([]byte, error) {
 	return data, nil
 }
 
-// spoolDocument is one parsed spool file, whatever version wrote it.
+// spoolDocument is one parsed spool file.
 // spoolRecord is one line of the append log: either an appended entry, or a
 // recorded eviction naming the id it removed.
 type spoolRecord struct {
@@ -1126,12 +1122,12 @@ type spoolDocument struct {
 	// still on disk and the file MUST be rewritten before anything extends
 	// it — see reconcile below.
 	tornTail bool
-	// legacy is set for a v2 document, which is rewritten as v3 on first save.
-	legacy bool
-	ok     bool
+	ok       bool
 }
 
-// parseSpoolDocument reads either format.
+// parseSpoolDocument reads the line format. Any other content, including a
+// document whose header names another version, is not a spool this SDK wrote:
+// ok stays false and load starts clean.
 //
 // ⚠ THE TORN TAIL IS NOT MERELY DROPPED, IT IS OWED A REWRITE. Discarding the
 // unterminated final line keeps the RECORDS intact, but its bytes are still at
@@ -1143,21 +1139,6 @@ type spoolDocument struct {
 func parseSpoolDocument(data []byte) spoolDocument {
 	var doc spoolDocument
 	if len(data) == 0 {
-		return doc
-	}
-
-	// v2: a single JSON object. Recognised by its version field rather than
-	// by shape, so a v3 header — also a JSON object on line one — cannot be
-	// mistaken for one.
-	var legacy spoolRecordWire
-	if json.Unmarshal(data, &legacy) == nil && legacy.Version == spoolRecordVersion {
-		doc.ok = true
-		doc.legacy = true
-		doc.retryAfterUntilMS = legacy.RetryAfterUntilMS
-		doc.records = make([]spoolRecord, 0, len(legacy.Events))
-		for _, wire := range legacy.Events {
-			doc.records = append(doc.records, spoolRecord{entry: spoolEntryFromWire(wire)})
-		}
 		return doc
 	}
 
@@ -1354,7 +1335,7 @@ func (s *diskSpool) load(now time.Time) spoolLoadOutcome {
 		_ = s.removeRecordFile()
 		return outcome
 	}
-	record := spoolRecordWire{Version: spoolRecordVersion, RetryAfterUntilMS: doc.retryAfterUntilMS}
+	record := spoolRecordWire{RetryAfterUntilMS: doc.retryAfterUntilMS}
 	// ⚠ THE FILE'S OWN CAPS BIND FIRST. Trimming under the configured caps
 	// alone would let a build that RAISED SpoolMaxEvents resurrect records the
 	// writing run had already evicted — they fit again, so they load and
@@ -1364,8 +1345,8 @@ func (s *diskSpool) load(now time.Time) spoolLoadOutcome {
 	for _, entry := range doc.live() {
 		record.Events = append(record.Events, entry.wire())
 	}
-	// A recovered tear, or a v2 file, owes the reconcile rewrite before
-	// anything may extend the file. load's own rewrite settles it.
+	// A recovered tear owes the reconcile rewrite before anything may extend
+	// the file. load's own rewrite settles it.
 	s.tornTailOwed = doc.tornTail
 	s.fileAppendable = false
 	withdrawn, markerDamaged := readWithdrawnMarker(s.dir, s.withdrawnMarkerReadLimit())

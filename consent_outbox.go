@@ -598,7 +598,7 @@ func (o *consentOutbox) readRecordReceiptsWithNotice(invalidNotice func(consentR
 }
 
 // load reads the durable record into the mirror at construction: sanitized,
-// capped, oldest first. Entries matching own (nil: every entry) are adopted
+// oldest first. Entries matching own (nil: every entry) are adopted
 // as THIS process's — its trail from a previous run, which its merging
 // saves keep writing back even when a disk re-read transiently fails —
 // while the rest stay foreign: refreshed from the fresh disk view on every
@@ -617,38 +617,19 @@ func (o *consentOutbox) load(own func(consentReceipt) bool) {
 	})
 	o.lastRead = readState
 	o.mu.Lock()
-	evicted := 0
-	for len(loaded) > maxConsentOutboxEntries {
-		// The cap trims OLDEST first at load exactly as it does on save: an
-		// over-cap legacy record keeps its NEWEST receipts — the newest
-		// decisions are the operative ones, and dropping them instead would
-		// resend only stale history. The trim is settled so the next merging
-		// save does not re-adopt (and re-count) the same entries from the
-		// still-over-cap file.
-		o.recordSettledLocked(loaded[0].IdempotencyKey)
-		loaded = loaded[1:]
-		evicted++
-	}
 	for _, entry := range loaded {
 		if own == nil || own(entry) {
 			o.ownKeys[entry.IdempotencyKey] = struct{}{}
 		}
 	}
 	o.receipts = loaded
-	o.evictedSinceSave += evicted
-	if evicted > 0 || needsNoticeRewrite {
-		// Notice sanitation is also only in memory. Retry its rewrite through
-		// the existing evidence hold: rejected grants never erase the last
-		// witness before an unwitnessed decision record is durable.
-		// The trim only happened in MEMORY: left there, a process that never
-		// saves before exiting leaves the over-cap file behind, and every
-		// restart re-evicts and re-counts the same entries. Marking the
-		// write OWED is enough — the owed-write machinery (retryPersist at
-		// every dispatch point, the construction wake below, Close's retry)
-		// lands the trimmed record durably, and the failed-write posture is
-		// preserved: nothing more is evicted if the rewrite fails, the
-		// mirror stays authoritative, and the settled trim keys keep the
-		// merge from re-adopting the evicted entries meanwhile.
+	if needsNoticeRewrite {
+		// Notice sanitation is only in memory. Retry its rewrite through the
+		// existing evidence hold: rejected grants never erase the last
+		// witness before an unwitnessed decision record is durable. Marking
+		// the write OWED is enough — the owed-write machinery (retryPersist
+		// at every dispatch point, the construction wake below, Close's
+		// retry) lands the sanitized record durably.
 		o.dirty = true
 	}
 	o.mu.Unlock()
@@ -1401,11 +1382,9 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 		// long ago, left on disk by a failed prune rewrite), and re-reading
 		// that must never flip the state back over a record persisted for a
 		// NEWER decision (deny record durable, deny receipt append failed,
-		// crash) — while a LEGACY stampless record is provably older than
-		// any validly-stamped proof and yields in both directions, and a
-		// floor-marked stampless record (the preserved corrupt denial)
-		// never yields by comparison. With no record at all the proof
-		// restores its decision unconditionally.
+		// crash) — while a record without an orderable stamp (such as the
+		// preserved corrupt denial) never yields by comparison. With no
+		// record at all the proof restores its decision unconditionally.
 		// A GRANT surviving an UNUSABLE trail may not drive the override or
 		// the heal. The sanitizer can return a valid newer grant while a
 		// malformed entry beside it is exactly the denial that would
@@ -2536,31 +2515,14 @@ func consentReceiptNewerThanRecord(receiptDecidedAt, recordDecidedAt string) boo
 }
 
 // consentReceiptSupersedesRecord decides whether an in-scope proof receipt
-// may override (and heal) the persisted record at reload. Three record
-// shapes, three rules:
-//   - STAMPED record: the proof must be STRICTLY newer
-//     (consentReceiptNewerThanRecord) — a stale acked-but-unpruned receipt
-//     never flips back a newer decision.
-//   - LEGACY stampless record (no floor mark): it predates the stamping
-//     build, so it is OLDER than any validly-stamped receipt BY DEFINITION —
-//     the proof supersedes it in BOTH directions (a grant proof heals a
-//     floor-marked grant over a legacy denial; a denial proof heals denied
-//     over a legacy grant that provenance would otherwise strand as
-//     undecided, losing the denial). With no validly-stamped in-scope proof
-//     retained, today's posture holds: provenance vets legacy grants,
-//     legacy denials are honored.
-//   - FLOOR-MARKED stampless record (the corrupt-stamped DENIAL shape
-//     loadConsentRecordInfo preserves): never superseded by comparison —
-//     the record is not provably old, and failing toward the denial is the
-//     fail-closed direction.
+// may override (and heal) the persisted record at reload: the proof must be
+// STRICTLY newer than the record's stamp (consentReceiptNewerThanRecord), so
+// a stale acked-but-unpruned receipt never flips back a newer decision. A
+// record without an orderable stamp — such as the corrupt-stamped DENIAL
+// loadConsentRecordInfo preserves with its stamp cleared — is never
+// superseded by comparison: it is not provably old, and failing toward the
+// recorded decision is the fail-closed direction.
 func consentReceiptSupersedesRecord(receiptDecidedAt string, record consentRecordInfo) bool {
-	if record.decidedAt == "" {
-		if record.floor {
-			return false
-		}
-		_, err := time.Parse(time.RFC3339Nano, receiptDecidedAt)
-		return err == nil
-	}
 	return consentReceiptNewerThanRecord(receiptDecidedAt, record.decidedAt)
 }
 
