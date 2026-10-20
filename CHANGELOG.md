@@ -58,6 +58,14 @@
   authorization refusals bypass per-experiment response fences, and a fact key
   must reach durable state before its fact enters the analytics pipeline.
 
+### Removed
+
+- The consent-receipt outbox no longer trims a `consent-outbox.json` holding
+  more than 32 receipts when it loads. Every save caps the record at 32, so
+  only a different writer could leave a larger one; such a record now loads
+  as written and the next save applies the cap, counting its evictions in
+  `Stats.ConsentOutboxEvicted` then.
+
 ## v0.10.0 — 2026-10-15 — scoped config retries and terminal closure
 
 - Remote-config retry policy changes from `v0.9.0`: only a positive server
