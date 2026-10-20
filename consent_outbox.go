@@ -598,7 +598,7 @@ func (o *consentOutbox) readRecordReceiptsWithNotice(invalidNotice func(consentR
 }
 
 // load reads the durable record into the mirror at construction: sanitized,
-// capped, oldest first. Entries matching own (nil: every entry) are adopted
+// oldest first. Entries matching own (nil: every entry) are adopted
 // as THIS process's — its trail from a previous run, which its merging
 // saves keep writing back even when a disk re-read transiently fails —
 // while the rest stay foreign: refreshed from the fresh disk view on every
@@ -617,38 +617,19 @@ func (o *consentOutbox) load(own func(consentReceipt) bool) {
 	})
 	o.lastRead = readState
 	o.mu.Lock()
-	evicted := 0
-	for len(loaded) > maxConsentOutboxEntries {
-		// The cap trims OLDEST first at load exactly as it does on save: an
-		// over-cap legacy record keeps its NEWEST receipts — the newest
-		// decisions are the operative ones, and dropping them instead would
-		// resend only stale history. The trim is settled so the next merging
-		// save does not re-adopt (and re-count) the same entries from the
-		// still-over-cap file.
-		o.recordSettledLocked(loaded[0].IdempotencyKey)
-		loaded = loaded[1:]
-		evicted++
-	}
 	for _, entry := range loaded {
 		if own == nil || own(entry) {
 			o.ownKeys[entry.IdempotencyKey] = struct{}{}
 		}
 	}
 	o.receipts = loaded
-	o.evictedSinceSave += evicted
-	if evicted > 0 || needsNoticeRewrite {
-		// Notice sanitation is also only in memory. Retry its rewrite through
-		// the existing evidence hold: rejected grants never erase the last
-		// witness before an unwitnessed decision record is durable.
-		// The trim only happened in MEMORY: left there, a process that never
-		// saves before exiting leaves the over-cap file behind, and every
-		// restart re-evicts and re-counts the same entries. Marking the
-		// write OWED is enough — the owed-write machinery (retryPersist at
-		// every dispatch point, the construction wake below, Close's retry)
-		// lands the trimmed record durably, and the failed-write posture is
-		// preserved: nothing more is evicted if the rewrite fails, the
-		// mirror stays authoritative, and the settled trim keys keep the
-		// merge from re-adopting the evicted entries meanwhile.
+	if needsNoticeRewrite {
+		// Notice sanitation is only in memory. Retry its rewrite through the
+		// existing evidence hold: rejected grants never erase the last
+		// witness before an unwitnessed decision record is durable. Marking
+		// the write OWED is enough — the owed-write machinery (retryPersist
+		// at every dispatch point, the construction wake below, Close's
+		// retry) lands the sanitized record durably.
 		o.dirty = true
 	}
 	o.mu.Unlock()

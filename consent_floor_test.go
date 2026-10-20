@@ -1282,36 +1282,6 @@ func TestGateRefusalLeavesEventPacingUntouched(t *testing.T) {
 	}
 }
 
-func TestConsentOutboxOverCapLoadKeepsNewest(t *testing.T) {
-	dir := t.TempDir()
-	entries := make([]string, 0, maxConsentOutboxEntries+8)
-	for i := 0; i < maxConsentOutboxEntries+8; i++ {
-		entries = append(entries, fmt.Sprintf(
-			`{"idempotency_key":"key-%02d","workspace_id":"w","app_id":"a","environment_id":"e","actor_identifier":"x","kind":"anon","categories":{"analytics":false},"decided_at":"2026-07-19T00:00:00Z"}`, i))
-	}
-	record := fmt.Sprintf(`{"version":1,"receipts":[%s]}`, strings.Join(entries, ","))
-	if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName), []byte(record), 0o600); err != nil {
-		t.Fatalf("write outbox record: %v", err)
-	}
-	outbox := newConsentOutbox(dir)
-	outbox.load(nil)
-	outbox.mu.Lock()
-	kept := len(outbox.receipts)
-	oldest := outbox.receipts[0].IdempotencyKey
-	newest := outbox.receipts[kept-1].IdempotencyKey
-	outbox.mu.Unlock()
-	// The load-time cap trims OLDEST first, exactly like the save-time cap:
-	// an over-cap legacy record keeps its NEWEST receipts — the operative
-	// decisions — never the stalest history.
-	if kept != maxConsentOutboxEntries || oldest != "key-08" || newest != fmt.Sprintf("key-%02d", maxConsentOutboxEntries+7) {
-		t.Fatalf("expected the newest %d receipts kept (oldest evicted), got %d spanning %s..%s",
-			maxConsentOutboxEntries, kept, oldest, newest)
-	}
-	if got := outbox.takeEvicted(); got != 8 {
-		t.Fatalf("expected 8 load-time evictions counted, got %d", got)
-	}
-}
-
 func TestConsentFloorEmptyBody2xxAcknowledges(t *testing.T) {
 	state, server := newFloorTestServer(t)
 	defer server.Close()
@@ -3828,55 +3798,6 @@ func TestConsentFloorExpiredCloseRemnantFoldsDiscarded(t *testing.T) {
 	}
 	if got := state.batchCount(); got != 0 {
 		t.Fatalf("expected the gated close to publish nothing, got %d batches", got)
-	}
-}
-
-func TestConsentOutboxOverCapLoadTrimLandsDurably(t *testing.T) {
-	// The load-time cap trim is a MEMORY change: without marking the write
-	// owed, a process that never saves before exiting leaves the over-cap
-	// file behind, and every restart re-evicts and re-counts the same
-	// entries. The trim must owe the rewrite; the owed-write machinery
-	// lands it at the first retry.
-	dir := t.TempDir()
-	over := maxConsentOutboxEntries + 8
-	seeded := make([]consentReceipt, 0, over)
-	for i := 0; i < over; i++ {
-		seeded = append(seeded, testConsentReceipt(fmt.Sprintf("key-trim-%02d", i), false))
-	}
-	record := consentOutboxWire{Version: consentOutboxRecordVersion, Receipts: &seeded}
-	payload, err := json.Marshal(record)
-	if err != nil {
-		t.Fatalf("marshal seed record: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, consentOutboxFileName), payload, 0o600); err != nil {
-		t.Fatalf("write seed record: %v", err)
-	}
-
-	outbox := newConsentOutbox(dir)
-	outbox.load(nil)
-	if got := outbox.takeEvicted(); got != 8 {
-		t.Fatalf("expected the 8 load-time evictions counted, got %d", got)
-	}
-	if !outbox.writeOwed() {
-		t.Fatalf("expected the load-time trim to OWE the durable rewrite")
-	}
-	if attempted, failed := outbox.retryPersist(); !attempted || failed {
-		t.Fatalf("expected the owed rewrite attempted and landed, got (%v, %v)", attempted, failed)
-	}
-	onDisk, _ := outbox.readRecordReceipts()
-	if got := len(onDisk); got != maxConsentOutboxEntries {
-		t.Fatalf("expected the trimmed record durable on disk, got %d entries", got)
-	}
-
-	// A restart sees a within-cap record: no re-eviction, no re-count, no
-	// owed write.
-	reloaded := newConsentOutbox(dir)
-	reloaded.load(nil)
-	if got := reloaded.takeEvicted(); got != 0 {
-		t.Fatalf("expected no re-eviction after the durable trim, got %d", got)
-	}
-	if reloaded.writeOwed() {
-		t.Fatalf("expected no owed write on a within-cap record")
 	}
 }
 
