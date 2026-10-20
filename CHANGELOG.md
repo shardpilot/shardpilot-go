@@ -24,6 +24,11 @@
 
 ### Changed
 
+- A `Close` whose context expired after its final flush succeeded, while
+  the event worker, the experiments lane or the consent sender was still
+  finishing, no longer returns that deadline from every later `Close`. A later
+  call waits again within its own context and reports the teardown's outcome.
+  A deadline that cut the final flush stays the verdict.
 - Terminal experiment withdrawals now clear a restored ingest retry deadline
   when no restored resend work remains and the worker holds only fresh events
   or no batch. Events queued before withdrawal can publish automatically

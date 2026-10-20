@@ -363,6 +363,72 @@ func TestRepeatedCloseReturnsFirstFlushFailure(t *testing.T) {
 	}
 }
 
+func TestRepeatedCloseAfterDeadlineReportsSettledTeardown(t *testing.T) {
+	consentStarted := make(chan struct{}, 1)
+	releaseConsent := make(chan struct{})
+	release := sync.OnceFunc(func() { close(releaseConsent) })
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/consent" {
+			consentStarted <- struct{}{}
+			<-releaseConsent
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"accepted":1,"rejected":0,"duplicates":0}`))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(Config{
+		IngestURL:      server.URL,
+		ServiceToken:   "test-token",
+		WorkspaceKey:   "workspace-test",
+		AppKey:         "app-test",
+		EnvironmentKey: "develop",
+		Source:         SourceBackend,
+		AnonymousID:    "anon-actor",
+		FlushInterval:  time.Hour,
+		HTTPTimeout:    5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer client.Close(context.Background())
+	defer release()
+	if _, err := client.SetConsent(true); err != nil {
+		t.Fatalf("SetConsent: %v", err)
+	}
+	select {
+	case <-consentStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("consent send never reached the server")
+	}
+
+	// The first Close gives up while the consent sender is still sending.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := client.Close(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first Close = %v, want context.DeadlineExceeded", err)
+	}
+
+	// A retry before the send lands waits again and still reports the deadline.
+	retry, cancelRetry := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelRetry()
+	if err := client.Close(retry); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Close while the send is in flight = %v, want context.DeadlineExceeded", err)
+	}
+
+	// The send lands; the teardown finished cleanly.
+	release()
+	select {
+	case <-client.consentSenderDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("consent sender did not finish")
+	}
+	if err := client.Close(context.Background()); err != nil {
+		t.Fatalf("Close after the background work finished = %v, want nil", err)
+	}
+}
+
 func TestEnqueueSnapshotsMutableEventMaps(t *testing.T) {
 	requests := make(chan batchRequest, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
