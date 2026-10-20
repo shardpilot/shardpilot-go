@@ -58,6 +58,14 @@
   authorization refusals bypass per-experiment response fences, and a fact key
   must reach durable state before its fact enters the analytics pipeline.
 
+### Removed
+
+- The local 2048-byte event size check no longer exempts experiment exposure
+  and outcome facts at schema version 1. The SDK emits its experiment facts
+  only at schema version 2 and refuses those names from the host, so no event
+  it builds can take the exemption; the check is now the trimmed byte length
+  alone.
+
 ## v0.10.0 — 2026-10-15 — scoped config retries and terminal closure
 
 - Remote-config retry policy changes from `v0.9.0`: only a positive server
