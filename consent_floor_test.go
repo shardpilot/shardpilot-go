@@ -3868,66 +3868,6 @@ func TestConsentFloorCorruptStampFloorDenialStaysDenied(t *testing.T) {
 	}
 }
 
-func TestConsentFloorLegacyRecordSupersededByStampedProof(t *testing.T) {
-	state, server := newFloorTestServer(t)
-	defer server.Close()
-
-	// A LEGACY stampless record predates the stamping build: any
-	// validly-stamped in-scope proof supersedes it in BOTH directions.
-	writeLegacyRecord := func(t *testing.T, dir, decision string) {
-		t.Helper()
-		payload := []byte(fmt.Sprintf(`{"consent_analytics":%q,"actor_digest":%q}`, decision, spoolTestActorDigest()))
-		if err := os.WriteFile(consentRecordPath(dir), payload, 0o600); err != nil {
-			t.Fatalf("write consent record: %v", err)
-		}
-	}
-
-	// A stamped durable denial proof supersedes the legacy grant and heals
-	// the record denied. The recovered record retains the proof's decision
-	// stamp and floor provenance.
-	deniedDir := t.TempDir()
-	writeLegacyRecord(t, deniedDir, "granted")
-	planted := newConsentOutbox(deniedDir)
-	if planted.append(testConsentReceipt("key-legacy-deny-1", false)) {
-		t.Fatalf("seeding the deny receipt failed")
-	}
-	deniedClient := newFloorTestClient(t, server.URL, deniedDir, nil)
-	if got := deniedClient.ConsentState(); got != ConsentDenied {
-		t.Fatalf("expected the stamped denial proof to supersede the legacy grant, got %v", got)
-	}
-	info, ok := loadConsentRecordInfo(deniedDir, spoolTestActorDigest())
-	if !ok || info.state != ConsentDenied || !info.floor || info.decidedAt != "2026-07-19T00:00:00Z" {
-		t.Fatalf("expected the record healed denied from the proof, got (%+v, %v)", info, ok)
-	}
-	if err := deniedClient.Close(context.Background()); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	// Legacy DENIAL + durable later grant proof: the user's newest decision
-	// is the grant — the proof supersedes the legacy denial and heals a
-	// floor-marked grant.
-	grantedDir := t.TempDir()
-	writeLegacyRecord(t, grantedDir, "denied")
-	planted = newConsentOutbox(grantedDir)
-	if planted.append(testConsentReceipt("key-legacy-grant-1", true)) {
-		t.Fatalf("seeding the grant receipt failed")
-	}
-	grantedClient := newFloorTestClient(t, server.URL, grantedDir, nil)
-	if got := grantedClient.ConsentState(); got != ConsentGranted {
-		t.Fatalf("expected the stamped grant proof to supersede the legacy denial, got %v", got)
-	}
-	info, ok = loadConsentRecordInfo(grantedDir, spoolTestActorDigest())
-	if !ok || info.state != ConsentGranted || !info.floor {
-		t.Fatalf("expected the record healed to a floor-marked grant, got (%+v, %v)", info, ok)
-	}
-	waitFor(t, 3*time.Second, "the retained proofs delivered", func() bool {
-		return state.consentCount() == 2
-	})
-	if err := grantedClient.Close(context.Background()); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-}
-
 func TestConsentOutboxDuplicateKeysKeepFirstAtLoad(t *testing.T) {
 	// Duplicate idempotency keys never come from this SDK; a corrupt or
 	// hand-edited record can carry them with DIFFERENT decision bodies. The

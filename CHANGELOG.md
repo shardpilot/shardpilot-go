@@ -60,6 +60,14 @@
 
 ### Removed
 
+- The opt-in disk spool no longer reads the single-object `spool.json` layout
+  that earlier pre-release builds wrote. The SDK writes only the line format (a
+  header, then one record per line); a file in any other layout is discarded at
+  load and the spool starts clean, as with any record this build does not write.
+- A persisted consent record without a decision stamp no longer yields to any
+  stamped receipt at reload. Every build writes the stamp, so such a record is
+  damaged rather than old: like a record whose stamp cannot be ordered, it is
+  kept as recorded until the next decision.
 - The consent-receipt outbox no longer trims a `consent-outbox.json` holding
   more than 32 receipts when it loads. Every save caps the record at 32, so
   only a different writer could leave a larger one; such a record now loads
