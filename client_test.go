@@ -363,7 +363,10 @@ func TestRepeatedCloseReturnsFirstFlushFailure(t *testing.T) {
 	}
 }
 
-func TestRepeatedCloseAfterDeadlineReportsSettledTeardown(t *testing.T) {
+// blockedConsentClient returns a client whose consent send is in flight and
+// blocked in the handler until release is called. Cleanup releases it first.
+func blockedConsentClient(t *testing.T) (*Client, func()) {
+	t.Helper()
 	consentStarted := make(chan struct{}, 1)
 	releaseConsent := make(chan struct{})
 	release := sync.OnceFunc(func() { close(releaseConsent) })
@@ -376,7 +379,7 @@ func TestRepeatedCloseAfterDeadlineReportsSettledTeardown(t *testing.T) {
 		w.WriteHeader(http.StatusAccepted)
 		_, _ = w.Write([]byte(`{"accepted":1,"rejected":0,"duplicates":0}`))
 	}))
-	defer server.Close()
+	t.Cleanup(server.Close)
 
 	client, err := NewClient(Config{
 		IngestURL:      server.URL,
@@ -392,8 +395,8 @@ func TestRepeatedCloseAfterDeadlineReportsSettledTeardown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
-	defer client.Close(context.Background())
-	defer release()
+	t.Cleanup(func() { client.Close(context.Background()) })
+	t.Cleanup(release)
 	if _, err := client.SetConsent(true); err != nil {
 		t.Fatalf("SetConsent: %v", err)
 	}
@@ -402,6 +405,11 @@ func TestRepeatedCloseAfterDeadlineReportsSettledTeardown(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("consent send never reached the server")
 	}
+	return client, release
+}
+
+func TestRepeatedCloseAfterDeadlineReportsSettledTeardown(t *testing.T) {
+	client, release := blockedConsentClient(t)
 
 	// The first Close gives up while the consent sender is still sending.
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -426,6 +434,40 @@ func TestRepeatedCloseAfterDeadlineReportsSettledTeardown(t *testing.T) {
 	}
 	if err := client.Close(context.Background()); err != nil {
 		t.Fatalf("Close after the background work finished = %v, want nil", err)
+	}
+}
+
+func TestCloseJoiningAnExpiredCloseReportsSettledTeardown(t *testing.T) {
+	client, release := blockedConsentClient(t)
+
+	first, cancelFirst := context.WithCancel(context.Background())
+	defer cancelFirst()
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- client.Close(first) }()
+	waitFor(t, time.Second, "the first Close to be in flight", func() bool {
+		client.closeMu.Lock()
+		defer client.closeMu.Unlock()
+		return client.closeInFlight
+	})
+
+	// A second caller with no deadline joins the in-flight Close, whose own
+	// context then ends while the consent send is still blocked.
+	joinedDone := make(chan error, 1)
+	go func() { joinedDone <- client.Close(context.Background()) }()
+	time.Sleep(50 * time.Millisecond)
+	cancelFirst()
+	if err := <-firstDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("first Close = %v, want context.Canceled", err)
+	}
+
+	release()
+	select {
+	case err := <-joinedDone:
+		if err != nil {
+			t.Fatalf("joined Close = %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("joined Close did not return")
 	}
 }
 

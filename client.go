@@ -723,8 +723,13 @@ func (c *Client) finishClose(ctx context.Context) error {
 		select {
 		case <-done:
 			c.closeMu.Lock()
-			err := c.closeErr
+			err, expired := c.closeErr, c.closeExpired
 			c.closeMu.Unlock()
+			if expired {
+				// That deadline was the other caller's: wait for the
+				// teardown within this caller's own context instead.
+				return c.finishClose(ctx)
+			}
 			// Re-fold LATE discards (idempotent): the close that cached this
 			// verdict may have abandoned the worker on its own context
 			// expiry, and the stop path can count discarded remnant events
