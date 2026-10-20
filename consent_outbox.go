@@ -1401,11 +1401,9 @@ func (c *Client) initConsentFloor(rename func(oldpath, newpath string) error, ch
 		// long ago, left on disk by a failed prune rewrite), and re-reading
 		// that must never flip the state back over a record persisted for a
 		// NEWER decision (deny record durable, deny receipt append failed,
-		// crash) — while a LEGACY stampless record is provably older than
-		// any validly-stamped proof and yields in both directions, and a
-		// floor-marked stampless record (the preserved corrupt denial)
-		// never yields by comparison. With no record at all the proof
-		// restores its decision unconditionally.
+		// crash) — while a record without an orderable stamp (such as the
+		// preserved corrupt denial) never yields by comparison. With no
+		// record at all the proof restores its decision unconditionally.
 		// A GRANT surviving an UNUSABLE trail may not drive the override or
 		// the heal. The sanitizer can return a valid newer grant while a
 		// malformed entry beside it is exactly the denial that would
@@ -2536,31 +2534,14 @@ func consentReceiptNewerThanRecord(receiptDecidedAt, recordDecidedAt string) boo
 }
 
 // consentReceiptSupersedesRecord decides whether an in-scope proof receipt
-// may override (and heal) the persisted record at reload. Three record
-// shapes, three rules:
-//   - STAMPED record: the proof must be STRICTLY newer
-//     (consentReceiptNewerThanRecord) — a stale acked-but-unpruned receipt
-//     never flips back a newer decision.
-//   - LEGACY stampless record (no floor mark): it predates the stamping
-//     build, so it is OLDER than any validly-stamped receipt BY DEFINITION —
-//     the proof supersedes it in BOTH directions (a grant proof heals a
-//     floor-marked grant over a legacy denial; a denial proof heals denied
-//     over a legacy grant that provenance would otherwise strand as
-//     undecided, losing the denial). With no validly-stamped in-scope proof
-//     retained, today's posture holds: provenance vets legacy grants,
-//     legacy denials are honored.
-//   - FLOOR-MARKED stampless record (the corrupt-stamped DENIAL shape
-//     loadConsentRecordInfo preserves): never superseded by comparison —
-//     the record is not provably old, and failing toward the denial is the
-//     fail-closed direction.
+// may override (and heal) the persisted record at reload: the proof must be
+// STRICTLY newer than the record's stamp (consentReceiptNewerThanRecord), so
+// a stale acked-but-unpruned receipt never flips back a newer decision. A
+// record without an orderable stamp — such as the corrupt-stamped DENIAL
+// loadConsentRecordInfo preserves with its stamp cleared — is never
+// superseded by comparison: it is not provably old, and failing toward the
+// recorded decision is the fail-closed direction.
 func consentReceiptSupersedesRecord(receiptDecidedAt string, record consentRecordInfo) bool {
-	if record.decidedAt == "" {
-		if record.floor {
-			return false
-		}
-		_, err := time.Parse(time.RFC3339Nano, receiptDecidedAt)
-		return err == nil
-	}
 	return consentReceiptNewerThanRecord(receiptDecidedAt, record.decidedAt)
 }
 

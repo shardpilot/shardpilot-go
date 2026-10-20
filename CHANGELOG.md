@@ -58,6 +58,13 @@
   authorization refusals bypass per-experiment response fences, and a fact key
   must reach durable state before its fact enters the analytics pipeline.
 
+### Removed
+
+- A persisted consent record without a decision stamp no longer yields to any
+  stamped receipt at reload. Every build writes the stamp, so such a record is
+  damaged rather than old: like a record whose stamp cannot be ordered, it is
+  kept as recorded until the next decision.
+
 ## v0.10.0 — 2026-10-15 — scoped config retries and terminal closure
 
 - Remote-config retry policy changes from `v0.9.0`: only a positive server
