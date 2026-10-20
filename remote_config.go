@@ -90,8 +90,7 @@ type RemoteConfigResult struct {
 	// mutate it freely; the getter snapshot is an independent copy.
 	Values map[string]any
 	// Version is the published configuration version from the response
-	// wrapper; meaningful only when HasVersion. An unwrapped payload carries
-	// none (a "version" KEY in an unwrapped payload is configuration).
+	// wrapper; meaningful only when HasVersion.
 	Version    float64
 	HasVersion bool
 }
@@ -296,14 +295,11 @@ func buildRemoteConfigScope(workspaceID, environmentID, clientID, baseURL string
 }
 
 // parseRemoteConfigBody parses a configuration body end-to-end: the body
-// must be a JSON object. A top-level `values` member that is a JSON object
-// is the configuration map, with the wrapper's numeric `version` as
-// metadata; a `values` member of any other shape (null, array, scalar) is
-// MALFORMED — falling back to serving the wrapper would expose wrapper
-// fields as configuration. An object WITHOUT a `values` member is served as
-// the map itself (unwrapped compatibility; its "version" key, if any, is
-// then configuration, and no wrapper version exists). Returns ok=false for
-// anything unusable.
+// must be a JSON object whose `values` member is a JSON object — the
+// configuration map — with the wrapper's numeric `version` as metadata. A
+// body without a `values` member, or with one of any other shape (null,
+// array, scalar), is MALFORMED: serving the wrapper itself would expose
+// wrapper fields as configuration. Returns ok=false for anything unusable.
 func parseRemoteConfigBody(body string) (values map[string]any, version float64, hasVersion bool, ok bool) {
 	var decoded map[string]any
 	if err := json.Unmarshal([]byte(body), &decoded); err != nil || decoded == nil {
@@ -313,19 +309,13 @@ func parseRemoteConfigBody(body string) (values map[string]any, version float64,
 		// for a body that carried none.
 		return nil, 0, false, false
 	}
-	if raw, present := decoded["values"]; present {
-		obj, isObject := raw.(map[string]any)
-		if !isObject {
-			return nil, 0, false, false
-		}
-		// The published version is wrapper metadata, so it is read only
-		// here: in an unwrapped payload a config key named "version" is
-		// configuration, not a revision marker. A non-numeric wrapper
-		// version is simply absent.
-		version, hasVersion = decoded["version"].(float64)
-		return obj, version, hasVersion, true
+	obj, isObject := decoded["values"].(map[string]any)
+	if !isObject {
+		return nil, 0, false, false
 	}
-	return decoded, 0, false, true
+	// A non-numeric wrapper version is simply absent.
+	version, hasVersion = decoded["version"].(float64)
+	return obj, version, hasVersion, true
 }
 
 // serveRemoteConfigCache serves the cached snapshot for a transient failure,
@@ -1238,9 +1228,8 @@ func (c *Client) RemoteConfigValues() map[string]any {
 }
 
 // RemoteConfigVersion returns the published configuration version from the
-// last served payload, and false when unknown (no configuration yet, or an
-// unwrapped payload — the version is wrapper metadata, so an unwrapped
-// payload never carries one).
+// last served payload, and false when unknown (no configuration yet, or a
+// payload without a numeric version).
 func (c *Client) RemoteConfigVersion() (float64, bool) {
 	rc := c.rc
 	if rc == nil {

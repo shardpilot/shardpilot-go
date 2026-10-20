@@ -22,7 +22,7 @@ func rcPolicyClient() (*Client, *expFakeClock, *rcPolicyTransport) {
 	clock := &expFakeClock{now: time.Date(2026, 10, 15, 0, 0, 0, 0, time.UTC)}
 	transport := &rcPolicyTransport{}
 	client := &Client{cfg: cfg, rc: newRemoteConfigState(cfg), clock: clock, transport: transport}
-	client.rc.held = &rcCache{Scope: client.rc.anonymousScope, ETag: "cached", Body: `{"value":"cached"}`}
+	client.rc.held = &rcCache{Scope: client.rc.anonymousScope, ETag: "cached", Body: `{"values":{"value":"cached"}}`}
 	client.rc.snapshot = map[string]any{"value": "cached"}
 	return client, clock, transport
 }
@@ -61,7 +61,7 @@ func TestRemoteConfigPolicyWindowsFollowScope(t *testing.T) {
 				if calls == 1 {
 					return remoteConfigResponse{status: 429, retryAfterPresent: true, retryAfterSeconds: 10}, nil
 				}
-				return remoteConfigResponse{status: 200, body: []byte(`{"value":"fresh"}`)}, nil
+				return remoteConfigResponse{status: 200, body: []byte(`{"values":{"value":"fresh"}}`)}, nil
 			}
 			_, _ = client.FetchRemoteConfig(context.Background())
 			client.consent.Store(consentStateGranted - start)
@@ -127,11 +127,11 @@ func TestRemoteConfigPolicyStaleSuccessCannotReopen(t *testing.T) {
 				case 1:
 					close(started)
 					<-release
-					return remoteConfigResponse{status: status, body: []byte(`{"value":"stale"}`)}, nil
+					return remoteConfigResponse{status: status, body: []byte(`{"values":{"value":"stale"}}`)}, nil
 				case 2:
 					return remoteConfigResponse{status: 403}, nil
 				default:
-					return remoteConfigResponse{status: 200, body: []byte(`{"value":"fresh"}`)}, nil
+					return remoteConfigResponse{status: 200, body: []byte(`{"values":{"value":"fresh"}}`)}, nil
 				}
 			}
 			done := make(chan error, 1)
@@ -178,9 +178,9 @@ func TestRemoteConfigPolicyLateForeignScopeCannotSettle(t *testing.T) {
 				if calls.Add(1) == 1 {
 					close(started)
 					<-release
-					return remoteConfigResponse{status: status, body: []byte(`{"value":"old-scope"}`), retryAfterPresent: true, retryAfterSeconds: 10}, nil
+					return remoteConfigResponse{status: status, body: []byte(`{"values":{"value":"old-scope"}}`), retryAfterPresent: true, retryAfterSeconds: 10}, nil
 				}
-				return remoteConfigResponse{status: 200, body: []byte(`{"value":"current-scope"}`)}, nil
+				return remoteConfigResponse{status: 200, body: []byte(`{"values":{"value":"current-scope"}}`)}, nil
 			}
 			done := make(chan struct{})
 			go func() { _, _ = client.FetchRemoteConfig(context.Background()); close(done) }()
@@ -209,11 +209,11 @@ func TestRemoteConfigPolicyRejectedInstallStaysClosed(t *testing.T) {
 	}
 	_, _ = client.FetchRemoteConfig(context.Background())
 	transport.fetch = func(context.Context, remoteConfigRequest) (remoteConfigResponse, error) {
-		newer := &rcCache{Scope: client.rc.anonymousScope, ETag: "newer", Body: `{"value":"durable"}`, FetchedAtMS: 20}
+		newer := &rcCache{Scope: client.rc.anonymousScope, ETag: "newer", Body: `{"values":{"value":"durable"}}`, FetchedAtMS: 20}
 		if err := client.rc.saveDurable(newer); err != nil {
 			t.Fatal(err)
 		}
-		return remoteConfigResponse{status: 200, body: []byte(`{"value":"overtaken"}`)}, nil
+		return remoteConfigResponse{status: 200, body: []byte(`{"values":{"value":"overtaken"}}`)}, nil
 	}
 	if result, err := client.FetchRemoteConfig(context.Background()); err == nil || result.Values != nil || client.RemoteConfigValues() != nil {
 		t.Fatal("a durable-fenced install must not reopen the scope or return values")
@@ -267,7 +267,7 @@ func TestRemoteConfigPolicyWindowExpiresDuringLockContention(t *testing.T) {
 	calls := 0
 	transport.fetch = func(context.Context, remoteConfigRequest) (remoteConfigResponse, error) {
 		calls++
-		return remoteConfigResponse{status: 200, body: []byte(`{"value":"fresh"}`)}, nil
+		return remoteConfigResponse{status: 200, body: []byte(`{"values":{"value":"fresh"}}`)}, nil
 	}
 	result, err := client.FetchRemoteConfig(context.Background())
 	if err != nil || calls != 1 || result.FromCache || result.Values["value"] != "fresh" {
