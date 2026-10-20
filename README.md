@@ -305,9 +305,9 @@ dead letter. A later connection failure or backpressure response cannot reset
 that clock. This is best-effort deduplication, not an exactly-once guarantee.
 
 Local clocks persist beside the unchanged envelope. Records without valid
-clock metadata, including older spool records, expire rather than receiving a
-new retry window. A backward wall-clock change that puts a stored clock in the
-future also expires the entry. Before resending a stored event, the SDK must
+clock metadata expire rather than receiving a new retry window. A backward
+wall-clock change that puts a stored clock in the future also expires the
+entry. Before resending a stored event, the SDK must
 persist its tentative attempt clock; a failed write prevents that attempt and
 increments `SpoolPersistFailed`. Definite non-delivery clears only that new
 clock. If clearing it cannot be persisted, the conservative clock remains on

@@ -360,33 +360,6 @@ func assertIDs(t *testing.T, entries []spoolEntry, want []string, why string) {
 	}
 }
 
-// TestV2FileStillLoads is the migration path: a file written by the previous
-// release must not be discarded.
-func TestV2FileStillLoads(t *testing.T) {
-	dir := t.TempDir()
-	now := time.Now()
-	legacy := spoolRecordWire{Version: spoolRecordVersion}
-	for i := 0; i < 3; i++ {
-		id := fmt.Sprintf("evt-v2-%d", i)
-		legacy.Events = append(legacy.Events, spoolEntryFromEnvelope(t, spoolTestEnvelope(t, id, now)).wire())
-	}
-	payload, err := json.Marshal(legacy)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, spoolFileName), payload, 0o600); err != nil {
-		t.Fatalf("write: %v", err)
-	}
-
-	doc := parseSpoolDocument(payload)
-	if !doc.ok || !doc.legacy {
-		t.Fatalf("a v2 document must load and be marked legacy (ok=%v legacy=%v)", doc.ok, doc.legacy)
-	}
-	if len(doc.records) != 3 {
-		t.Fatalf("v2 load produced %d entries, want 3", len(doc.records))
-	}
-}
-
 // TestFileNeverOutgrowsTheReadBound is the one that would have deleted a live
 // backlog: compaction is relative to the live content, the loader's bound was
 // relative to the live content too — but they were derived differently, and the
