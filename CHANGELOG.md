@@ -24,6 +24,7 @@
 
 ### Changed
 
+- Resolve the README formatter from CI's Go 1.27.x family, preserving the Go 1.25 consumer floor.
 - A `Close` whose context expired after its final flush succeeded, while
   the event worker, the experiments lane or the consent sender was still
   finishing, no longer returns that deadline from every later `Close`. A later

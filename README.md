@@ -590,10 +590,12 @@ go vet ./...
 # ignores GOTOOLCHAIN entirely and hands back its own GOROOT, so the ask succeeds
 # and the pin does nothing). The version comes from `go env GOVERSION`, not from
 # $GOROOT/VERSION — that file is optional, so reading it would reject a correctly
-# repackaged 1.27.0.
-goroot="$(GOTOOLCHAIN=go1.27.0 go env GOROOT)" || goroot=""
-[ -n "$goroot" ] || { echo "cannot resolve go1.27.0 GOROOT" >&2; exit 1; }
-[ "$(GOTOOLCHAIN=go1.27.0 go env GOVERSION)" = go1.27.0 ] || { echo "resolved the wrong toolchain" >&2; exit 1; }
+# repackaged toolchain.
+format_version="$(GOTOOLCHAIN=local go list -m -f '{{.Version}}' go@1.27)" || exit 1
+[[ "$format_version" =~ ^1\.27\.[0-9]+$ ]] || { echo "cannot resolve CI formatter release" >&2; exit 1; }
+goroot="$(GOTOOLCHAIN="go$format_version" go env GOROOT)" || goroot=""
+[ -n "$goroot" ] || { echo "cannot resolve go$format_version GOROOT" >&2; exit 1; }
+[ "$(GOTOOLCHAIN="go$format_version" go env GOVERSION)" = "go$format_version" ] || { echo "resolved the wrong toolchain" >&2; exit 1; }
 "$goroot"/bin/gofmt -l .   # must print nothing
 "$goroot"/bin/gofmt -w .   # to fix
 ```
