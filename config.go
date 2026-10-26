@@ -25,7 +25,9 @@ type Logger interface {
 type Config struct {
 	IngestURL string
 	// ServiceToken is required for server/backend ingest and forbidden for a
-	// client source. It cannot be a publishable key or a static JWT.
+	// client source. It cannot be an sp_pub_ key or a static JWT. Server-tier
+	// ingest tokens share the sp_ingest_ prefix with client ingest keys, so
+	// the ingest server, not this check, decides which tier a token holds.
 	ServiceToken string
 	// WorkspaceKey, AppKey and EnvironmentKey are literal scope keys. Values
 	// are trimmed; the SDK does not resolve them from database record IDs.
@@ -371,7 +373,7 @@ func normalizeConfig(cfg Config) (Config, error) {
 			return Config{}, fmt.Errorf("%w: client source requires PublishableKey and no ServiceToken", ErrInvalidConfig)
 		}
 	case SourceServer, SourceBackend:
-		if cfg.ServiceToken == "" || strings.HasPrefix(cfg.ServiceToken, "sp_ingest_") || strings.HasPrefix(cfg.ServiceToken, "sp_pub_") || strings.Count(cfg.ServiceToken, ".") == 2 {
+		if cfg.ServiceToken == "" || strings.HasPrefix(cfg.ServiceToken, "sp_pub_") || strings.Count(cfg.ServiceToken, ".") == 2 {
 			return Config{}, fmt.Errorf("%w: server/backend source requires a service token, not a publishable key or static JWT", ErrInvalidConfig)
 		}
 	}

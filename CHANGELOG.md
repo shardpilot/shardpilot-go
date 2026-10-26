@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## v0.11.0 — 2026-10-26 — server-tier ingest tokens
+
+### Fixed
+
+- A `SourceServer` or `SourceBackend` client now accepts a server-tier ingest
+  token that starts with `sp_ingest_`. Server-tier and client ingest tokens
+  share that prefix, so v0.10.0 refused every server-tier token at
+  configuration with "server/backend source requires a service token". The
+  SDK still refuses `sp_pub_` keys and static JWTs as `ServiceToken`; the
+  ingest server enforces which tier a token holds.
+
 ### Tests
 
 - Publication suites preflight GNU rename and timeout behavior before dependent

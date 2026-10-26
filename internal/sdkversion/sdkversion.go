@@ -7,7 +7,7 @@ package sdkversion
 // bumps it together with the README, CHANGELOG and integration-skill claims;
 // TestVersionIsTheReleaseTag fails when it disagrees with the README's
 // latest-tag claim.
-const Version = "0.10.0"
+const Version = "0.11.0"
 
 // HeaderName is the SDK identity request header.
 const HeaderName = "X-ShardPilot-SDK"
