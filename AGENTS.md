@@ -30,3 +30,5 @@ Keep repository content and pull request discussions suitable for public SDK
 consumers.
 Keep the publication host preflight before dependent setup and retain the gate's
 behavioral probes. Run `python3 scripts/test_publication_host.py` for preflight changes.
+
+Keep Remote Config identity out of URLs; cover consent-gated headers and ETag scope separation through the public fetch API.

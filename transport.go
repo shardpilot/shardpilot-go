@@ -30,6 +30,7 @@ type remoteConfigRequest struct {
 	url         string
 	bearer      string
 	ifNoneMatch string
+	anonymousID string
 	// method and body: empty method is the GET every remote-config and
 	// assignment fetch uses; the experiment exposure apply hop POSTs a JSON
 	// body to the same host through the same no-redirect client.
@@ -284,6 +285,9 @@ func (t *httpTransport) FetchRemoteConfig(ctx context.Context, request remoteCon
 	}
 	if request.ifNoneMatch != "" {
 		httpRequest.Header.Set("If-None-Match", request.ifNoneMatch)
+	}
+	if request.anonymousID != "" {
+		httpRequest.Header.Set("X-ShardPilot-Anonymous-Id", request.anonymousID)
 	}
 
 	response, err := t.rcClient.Do(httpRequest)

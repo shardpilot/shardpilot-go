@@ -5,7 +5,7 @@ description: Use when integrating the ShardPilot Go SDK (shardpilot-go) into a G
 
 # Integrating the ShardPilot Go SDK
 
-The install command uses the pinned release tag `v0.11.0` for this source. Install after its release announcement; tagging/publication follow the merged release PR. The Known limitations section below records the source review for this release.
+The install command uses the pinned release tag `v0.11.1` for this source. Install after its release announcement; tagging/publication follow the merged release PR. The Known limitations section below records the source review for this release.
 The release retains compression, the 15-second flush default, independent retry pacing, goroutine-label sanitization and rejection history. Opt-in experiment integrations must follow the [migration from v0.6.4-alpha](../../../CHANGELOG.md#migration-from-v064-alpha): apply the variant before recording outcomes, allow asynchronous platform sealing, and declare the game's age band. Read the [experiment contract](../../../README.md#experiments-dark-opt-in) before enabling it; the default remains off.
 
 **SCOPE: the DEFAULT configuration.** `v0.6.0-alpha` added three opt-ins that
@@ -55,7 +55,7 @@ other calls, no automatic actions.
 ## Install
 
 ```bash
-go get github.com/shardpilot/shardpilot-go@v0.11.0
+go get github.com/shardpilot/shardpilot-go@v0.11.1
 ```
 
 - Requires **Go 1.25+** at the pinned tag.
@@ -434,10 +434,12 @@ speed := client.RemoteConfigNumber("scroll_speed", 1.0)
   A success in the other scope does not reopen it, and a departed-scope
   response cannot install or arm a window. `408` stays transient;
   caller cancellation still returns its context error without state changes.
-- **Available in every consent state**: granted consent uses
-  `/config/v1/{workspace}/{environment}/{client_id}`. Unknown, denied, and
-  forced-minor denied use `/config/v1/{workspace}/{environment}`, without
-  client ID, host user ID, or targeting attributes. Publishable-key
+- **Available in every consent state**: all requests use
+  `/config/v1/{workspace_key}/{environment_key}`. Granted consent carries
+  a safe anonymous ID in `X-ShardPilot-Anonymous-Id`; it never enters the URL.
+  After configuration trimming, control bytes or DEL select the identifier-free
+  cache scope; valid UTF-8 is preserved. Unknown, denied and forced-minor denied omit
+  the identity header, host user ID and targeting attributes. Publishable-key
   authorization remains present. Denial leaves the getter snapshot available
   until a later successful fetch replaces it. `RemoteConfigCachePath` works
   without `SpoolDir` and never enables consent persistence.
@@ -682,7 +684,7 @@ them:
   preserves it: ordinary denial is a no-op and ordinary grant is refused.
 - **Ordinary remote config is explicit-fetch-only** — no background refresh,
   and every fetch requires configured `Config.AnonymousID`, sent as
-  `client_id` only while granted. The SDK
+  `X-ShardPilot-Anonymous-Id` only while granted. The SDK
   consumes the returned values rather than evaluating delivery rules.
   Since `v0.6.0-alpha`, `Config.ExperimentsEnabled` and
   `Config.RemoteConfigAttributesEnabled` are available and default `false`.
