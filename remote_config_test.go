@@ -84,6 +84,7 @@ func TestRemoteConfigRequestShape(t *testing.T) {
 		auth        string
 		ifNoneMatch string
 		revision    string
+		anonymousID string
 	}
 	seen := make(chan seenRequest, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -97,14 +98,14 @@ func TestRemoteConfigRequestShape(t *testing.T) {
 			auth:        r.Header.Get("Authorization"),
 			ifNoneMatch: r.Header.Get("If-None-Match"),
 			revision:    r.Header.Get("X-ShardPilot-Schema-Revision"),
+			anonymousID: r.Header.Get("X-ShardPilot-Anonymous-Id"),
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"version":1,"values":{"k":"v"}}`))
 	}))
 	defer server.Close()
 
-	// The identifier carries a space, a slash, and a percent sign: each must
-	// arrive as exactly one escaped path segment byte sequence.
+	// Identity is a header value, never an extra path segment or URL escape.
 	client := newRemoteConfigClient(t, server.URL, "", "anon id/1%x")
 	defer client.Close(context.Background())
 	if _, err := client.SetConsent(true); err != nil {
@@ -118,8 +119,11 @@ func TestRemoteConfigRequestShape(t *testing.T) {
 	if request.method != http.MethodGet {
 		t.Fatalf("expected GET, got %s", request.method)
 	}
-	if want := "/config/v1/workspace-test/develop/anon%20id%2F1%25x"; request.escapedPath != want {
+	if want := "/config/v1/workspace-test/develop"; request.escapedPath != want {
 		t.Fatalf("expected path %q, got %q", want, request.escapedPath)
+	}
+	if request.anonymousID != "anon id/1%x" {
+		t.Fatalf("anonymous-ID header = %q, want the original identity", request.anonymousID)
 	}
 	if request.auth != "Bearer test-rc-key" {
 		t.Fatalf("expected the publishable PublishableKey bearer, got %q", request.auth)
@@ -1795,9 +1799,6 @@ func TestRemoteConfigAttributePassThroughConsentGate(t *testing.T) {
 		}
 		probe := <-seen
 		want := "/config/v1/workspace-test/develop"
-		if client.ConsentState() == ConsentGranted {
-			want += "/anon-attr-1"
-		}
 		if probe.path != want {
 			t.Fatalf("path mismatch: got %q want %q", probe.path, want)
 		}

@@ -70,8 +70,13 @@ func TestRemoteConfigConsentRequestIdentity(t *testing.T) {
 			}
 			request := <-seen
 			want := server.URL + consentConfigPath
+			identity := ""
 			if state == ConsentGranted {
-				want += "/config-anonymous?geo=US"
+				want += "?geo=US"
+				identity = "config-anonymous"
+			}
+			if got := request.headers.Get("X-ShardPilot-Anonymous-Id"); got != identity {
+				t.Errorf("anonymous-ID header = %q, want %q", got, identity)
 			}
 			if request.url != want {
 				t.Errorf("complete request URL = %q, want %q", request.url, want)
@@ -110,7 +115,7 @@ func TestRemoteConfigConsentCacheRestartAndRegrant(t *testing.T) {
 		}
 		seen <- capturedRequest{r.URL.Path, r.Header.Get("If-None-Match")}
 		etag, body := `"anonymous"`, `{"values":{"kind":"anonymous"}}`
-		if strings.HasSuffix(r.URL.Path, "/config-anonymous") {
+		if r.Header.Get("X-ShardPilot-Anonymous-Id") == "config-anonymous" {
 			etag, body = `"identified"`, `{"values":{"kind":"identified"}}`
 		}
 		w.Header().Set("ETag", etag)
@@ -166,7 +171,7 @@ func TestRemoteConfigConsentCacheRestartAndRegrant(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, request = fetch(restarted)
-	if request.path != consentConfigPath+"/config-anonymous" || request.etag != "" || result.FromCache {
+	if request.path != consentConfigPath || request.etag != "" || result.FromCache {
 		t.Errorf("regrant reused anonymous scope: %+v %+v", request, result)
 	}
 	if err := restarted.Close(context.Background()); err != nil {
@@ -177,6 +182,50 @@ func TestRemoteConfigConsentCacheRestartAndRegrant(t *testing.T) {
 	defer unknown.Close(context.Background())
 	if unknown.RemoteConfigValues() != nil {
 		t.Error("unknown startup loaded identified cache")
+	}
+}
+
+func TestRemoteConfigUnsafeHeaderIdentityUsesAnonymousScope(t *testing.T) {
+	for _, test := range []struct{ name, identity string }{
+		{"control", "anon\x00id"}, {"unicode", "anon-\u2603"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			type capturedRequest struct{ path, identity, etag string }
+			seen := make(chan capturedRequest, 2)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !strings.HasPrefix(r.URL.Path, "/config/v1/") {
+					w.WriteHeader(http.StatusAccepted)
+					return
+				}
+				seen <- capturedRequest{r.URL.Path, r.Header.Get("X-ShardPilot-Anonymous-Id"), r.Header.Get("If-None-Match")}
+				w.Header().Set("ETag", `"anonymous"`)
+				if r.Header.Get("If-None-Match") != "" {
+					w.WriteHeader(http.StatusNotModified)
+					return
+				}
+				_, _ = w.Write([]byte(`{"values":{"available":true}}`))
+			}))
+			defer server.Close()
+			client := newConsentConfigClient(t, server.URL, "", func(cfg *Config) { cfg.AnonymousID = test.identity })
+			defer client.Close(context.Background())
+			if _, err := client.SetConsent(true); err != nil {
+				t.Fatal(err)
+			}
+			for fetch := 0; fetch < 2; fetch++ {
+				result, err := client.FetchRemoteConfig(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				request := <-seen
+				etag := ""
+				if fetch == 1 {
+					etag = `"anonymous"`
+				}
+				if request.path != consentConfigPath || request.identity != "" || request.etag != etag || result.FromCache != (fetch == 1) {
+					t.Fatalf("anonymous scope/revalidation: request=%+v result=%+v", request, result)
+				}
+			}
+		})
 	}
 }
 
