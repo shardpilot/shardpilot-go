@@ -109,7 +109,9 @@ type Config struct {
 	AppURL string
 
 	// RemoteConfigEnabled enables configuration fetches. Requests include the
-	// configured AnonymousID and targeting attributes only under granted consent.
+	// configured AnonymousID in X-ShardPilot-Anonymous-Id and targeting attributes
+	// only under granted consent. An ID unsuitable for an HTTP header selects
+	// identifier-free fetching and its cache scope.
 	RemoteConfigEnabled bool
 
 	// RemoteConfigCachePath, when set, is the file the remote-config client

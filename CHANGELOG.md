@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## v0.11.1 — 2026-11-03 — remote config identity header
+
+### Fixed
+
+- Remote Config always uses the two-key workspace/environment URL. Granted
+  consent sends anonymous identity in `X-ShardPilot-Anonymous-Id`, preserving
+  valid UTF-8 without URL encoding. Other consent states omit identity and
+  targeting attributes. IDs unsuitable for an HTTP header use identifier-free
+  fetching and its cache scope, retaining ETag/304 revalidation.
+
 ## v0.11.0 — 2026-10-26 — server-tier ingest tokens
 
 ### Fixed

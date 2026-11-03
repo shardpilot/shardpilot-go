@@ -186,8 +186,9 @@ func TestRemoteConfigConsentCacheRestartAndRegrant(t *testing.T) {
 }
 
 func TestRemoteConfigUnsafeHeaderIdentityUsesAnonymousScope(t *testing.T) {
-	for _, test := range []struct{ name, identity string }{
-		{"control", "anon\x00id"}, {"unicode", "anon-\u2603"},
+	for _, test := range []struct{ name, identity, header string }{
+		{"control", "anon\x00id", ""}, {"tab", "anon\tid", ""},
+		{"unicode", "anon-\u2603", "anon-\u2603"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			type capturedRequest struct{ path, identity, etag string }
@@ -221,7 +222,7 @@ func TestRemoteConfigUnsafeHeaderIdentityUsesAnonymousScope(t *testing.T) {
 				if fetch == 1 {
 					etag = `"anonymous"`
 				}
-				if request.path != consentConfigPath || request.identity != "" || request.etag != etag || result.FromCache != (fetch == 1) {
+				if request.path != consentConfigPath || request.identity != test.header || request.etag != etag || result.FromCache != (fetch == 1) {
 					t.Fatalf("anonymous scope/revalidation: request=%+v result=%+v", request, result)
 				}
 			}

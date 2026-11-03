@@ -135,10 +135,10 @@ type remoteConfigState struct {
 	mu sync.Mutex
 
 	fetchURL       string
-	anonymousURL   string
 	apiKey         string
 	cachePath      string
 	clientID       string
+	headerIdentity string
 	scope          string
 	anonymousScope string
 
@@ -190,15 +190,16 @@ type rcRetryWindow struct {
 
 func newRemoteConfigState(cfg Config) *remoteConfigState {
 	rc := &remoteConfigState{
-		fetchURL:       buildRemoteConfigURL(cfg.AppURL, cfg.WorkspaceKey, cfg.EnvironmentKey, cfg.AnonymousID),
-		anonymousURL:   buildRemoteConfigURL(cfg.AppURL, cfg.WorkspaceKey, cfg.EnvironmentKey, ""),
+		fetchURL:       buildRemoteConfigURL(cfg.AppURL, cfg.WorkspaceKey, cfg.EnvironmentKey),
 		anonymousScope: buildRemoteConfigScope(cfg.WorkspaceKey, cfg.EnvironmentKey, "", cfg.AppURL),
 		apiKey:         cfg.PublishableKey,
 		cachePath:      cfg.RemoteConfigCachePath,
 		clientID:       cfg.AnonymousID,
+		headerIdentity: remoteConfigHeaderIdentity(cfg.AnonymousID),
 		settled:        make(map[string]uint64),
 	}
-	if rc.clientID != "" {
+	rc.scope = rc.anonymousScope
+	if rc.headerIdentity != "" {
 		rc.scope = buildRemoteConfigScope(cfg.WorkspaceKey, cfg.EnvironmentKey, rc.clientID, cfg.AppURL)
 	}
 	return rc
@@ -249,14 +250,23 @@ func escapeRemoteConfigSegment(value string) string {
 	return b.String()
 }
 
-func buildRemoteConfigURL(baseURL, workspaceID, environmentID, clientID string) string {
-	url := strings.TrimRight(baseURL, "/") + "/config/v1/" +
+func buildRemoteConfigURL(baseURL, workspaceID, environmentID string) string {
+	return strings.TrimRight(baseURL, "/") + "/config/v1/" +
 		escapeRemoteConfigSegment(workspaceID) + "/" +
 		escapeRemoteConfigSegment(environmentID)
-	if clientID != "" {
-		url += "/" + escapeRemoteConfigSegment(clientID)
+}
+
+// Preserve identity bytes through HTTP field parsing, including UTF-8.
+func remoteConfigHeaderIdentity(value string) string {
+	if value == "" || value[0] == ' ' || value[len(value)-1] == ' ' {
+		return ""
 	}
-	return url
+	for i := 0; i < len(value); i++ {
+		if value[i] < 0x20 || value[i] == 0x7f {
+			return ""
+		}
+	}
+	return value
 }
 
 // appendRemoteConfigAttributes appends the targeting attributes as
@@ -1016,15 +1026,17 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 	attributesAllowed := attributedURL != "" && !c.grantReceiptGateArmed(nil)
 	rc.mu.Lock()
 	now := c.clock.Now()
-	requestURL := rc.anonymousURL
+	requestURL := fetchURL
+	identity := ""
 	scope, cache := rc.anonymousScope, anonymousCache
 	usedSignature := ""
 	etag = ""
 	if anonymousCache != nil && anonymousCache.AttributeSignature == "" {
 		etag = anonymousCache.ETag
 	}
-	if c.ConsentState() == ConsentGranted {
+	if c.ConsentState() == ConsentGranted && rc.headerIdentity != "" {
 		requestURL, scope, cache, etag = fetchURL, rc.scope, identifiedCache, baselineEtag
+		identity = rc.headerIdentity
 		if attributesAllowed {
 			requestURL, usedSignature, etag = attributedURL, attributedSignature, attributedEtag
 		}
@@ -1047,6 +1059,7 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 		url:         requestURL,
 		bearer:      apiKey,
 		ifNoneMatch: etag,
+		anonymousID: identity,
 	})
 	if err != nil {
 		if callerCtx != nil {
