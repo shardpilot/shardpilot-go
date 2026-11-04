@@ -75,3 +75,41 @@ testdata/experiment-age/unknown.json:generic-api-key:1
 /github/workspace/testdata/experiment-age/undeclared.json:generic-api-key:1
 /github/workspace/testdata/experiment-age/under_threshold.json:generic-api-key:1
 /github/workspace/testdata/experiment-age/unknown.json:generic-api-key:1
+
+# Public wire corpus: synthetic workspace keys, not access credentials.
+# Exact file/rule/line pins; TestConformanceIntegrity binds all fixture bytes.
+testdata/conformance/v1/bodies/batch-accepted.request:generic-api-key:1
+testdata/conformance/v1/bodies/batch-duplicate.request:generic-api-key:1
+testdata/conformance/v1/bodies/batch-retired-scope-member.request:generic-api-key:1
+testdata/conformance/v1/bodies/batch-size-rejected-mixed.request:generic-api-key:1
+testdata/conformance/v1/bodies/batch-suppressed-no-consent.request:generic-api-key:1
+testdata/conformance/v1/bodies/consent-denial-publishable.request:generic-api-key:1
+testdata/conformance/v1/bodies/consent-grant-notice.request:generic-api-key:1
+testdata/conformance/v1/bodies/consent-grant-publishable-refused.request:generic-api-key:1
+testdata/conformance/v1/bodies/consent-replayed.request:generic-api-key:1
+testdata/conformance/v1/bodies/consent-retired-scope-member.request:generic-api-key:1
+testdata/conformance/v1/bodies/identity-batch-anonymous.request:generic-api-key:1
+testdata/conformance/v1/bodies/identity-batch-user-and-anonymous.request:generic-api-key:1
+testdata/conformance/v1/bodies/identity-consent-kind-forgery.request:generic-api-key:1
+testdata/conformance/v1/bodies/identity-consent-subject-match.request:generic-api-key:1
+testdata/conformance/v1/bodies/identity-consent-subject-mismatch.request:generic-api-key:1
+/github/workspace/testdata/conformance/v1/bodies/batch-accepted.request:generic-api-key:1
+/github/workspace/testdata/conformance/v1/bodies/batch-duplicate.request:generic-api-key:1
+/github/workspace/testdata/conformance/v1/bodies/batch-retired-scope-member.request:generic-api-key:1
+/github/workspace/testdata/conformance/v1/bodies/batch-size-rejected-mixed.request:generic-api-key:1
+/github/workspace/testdata/conformance/v1/bodies/batch-suppressed-no-consent.request:generic-api-key:1
+/github/workspace/testdata/conformance/v1/bodies/consent-denial-publishable.request:generic-api-key:1
+/github/workspace/testdata/conformance/v1/bodies/consent-grant-notice.request:generic-api-key:1
+/github/workspace/testdata/conformance/v1/bodies/consent-grant-publishable-refused.request:generic-api-key:1
+/github/workspace/testdata/conformance/v1/bodies/consent-replayed.request:generic-api-key:1
+/github/workspace/testdata/conformance/v1/bodies/consent-retired-scope-member.request:generic-api-key:1
+/github/workspace/testdata/conformance/v1/bodies/identity-batch-anonymous.request:generic-api-key:1
+/github/workspace/testdata/conformance/v1/bodies/identity-batch-user-and-anonymous.request:generic-api-key:1
+/github/workspace/testdata/conformance/v1/bodies/identity-consent-kind-forgery.request:generic-api-key:1
+/github/workspace/testdata/conformance/v1/bodies/identity-consent-subject-match.request:generic-api-key:1
+/github/workspace/testdata/conformance/v1/bodies/identity-consent-subject-mismatch.request:generic-api-key:1
+
+# Public test scope key on the exact configuration line; it authenticates nothing.
+conformance_test.go:generic-api-key:422
+/github/workspace/conformance_test.go:generic-api-key:422
+ea38ea27f37422eeb5ed7b26fe3c4a833603ed0e:conformance_test.go:generic-api-key:409

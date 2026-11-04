@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- Publication refusal controls share a derived fixture so added SDK artifacts
+  do not multiply their runtime; the complete-tree publication check is retained.
+
 ## v0.11.1 — 2026-11-03 — remote config identity header
 
 ### Fixed

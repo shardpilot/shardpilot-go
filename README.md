@@ -639,6 +639,12 @@ retain their multiplicity. Run `scripts/test_surface_ratchet.sh` from a clean
 committed checkout to exercise the repository fixtures; see the
 [publication controls](https://github.com/shardpilot/shardpilot-go/blob/main/docs/release.md#publication-shape-controls).
 
+The refusal harness derives one shared fixture from `scripts/`, `config.go` and
+its CI workflow inside its disposable clone. Its baseline is regenerated there;
+the final receipt names the source commit and fixture tree. Unrelated SDK files
+do not enlarge every control. The separate publication job still scans every
+tracked path in the actual change, including vendored artifacts.
+
 Baseline writes allocate a private directory on the baseline filesystem before
 creating temporary files. A baseline format change must be separate from Go
 source changes. CI compares a new ref with the newest published ancestor of its
