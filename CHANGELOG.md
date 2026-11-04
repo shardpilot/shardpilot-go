@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Remote Config conformance compares complete outcomes and exact failure codes.
 - Crash conformance expectations independently retain all public result fields.
 - Conformance validates the exact source commit and metadata pins independently,
   and requires an explicit request disposition for every case ID.

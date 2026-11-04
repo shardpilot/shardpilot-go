@@ -110,6 +110,6 @@ testdata/conformance/v1/bodies/identity-consent-subject-mismatch.request:generic
 /github/workspace/testdata/conformance/v1/bodies/identity-consent-subject-mismatch.request:generic-api-key:1
 
 # Public test scope key on the exact configuration line; it authenticates nothing.
-conformance_test.go:generic-api-key:429
-/github/workspace/conformance_test.go:generic-api-key:429
+conformance_test.go:generic-api-key:434
+/github/workspace/conformance_test.go:generic-api-key:434
 ea38ea27f37422eeb5ed7b26fe3c4a833603ed0e:conformance_test.go:generic-api-key:409

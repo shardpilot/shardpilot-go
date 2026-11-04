@@ -25,6 +25,8 @@ credential kind and raw body. It applies to the eleven publishable-key Remote
 Config cases. The credential-free 401 request is UNSUPPORTED: Go requires a
 publishable key; its captured refusal is still handled. Arbitrary other HTTP
 headers, credential values and receiver-side storage are outside this claim.
+Remote Config response checks compare the complete result, including empty success
+reasons and failure values, and require the exact independently expected error.
 
 The other 21 requests are UNSUPPORTED, with response handling still asserted:
 

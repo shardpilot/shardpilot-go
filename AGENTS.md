@@ -40,3 +40,4 @@ Run `go test -v -count=1 -run '^TestConformance' .` for conformance changes.
 Use synchronous batch dispatch and test-owned response schemas; keep async grouping out of the claim.
 Pin every decoded source field independently and require exact case-ID disposition coverage.
 Crash expectations enumerate every public result field independently of its SDK type.
+Compare complete Remote Config results and exact failure messages in corpus reports.

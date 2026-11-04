@@ -315,16 +315,21 @@ func conformanceRemoteConfig(t *testing.T, c *Client, w *conformanceHTTP) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		conformanceEqual(t, "config values", result.Values, map[string]any{"feature.matchmaking.enabled": true})
-		conformanceEqual(t, "config version", result.Version, float64(1))
-		conformanceEqual(t, "has version", result.HasVersion, true)
-		conformanceEqual(t, "cache revalidation", result.FromCache, s == 304)
+		want := RemoteConfigResult{
+			FromCache:  s == 304,
+			Reason:     "",
+			Values:     map[string]any{"feature.matchmaking.enabled": true},
+			Version:    1,
+			HasVersion: true,
+		}
+		conformanceEqual(t, "config result", result, want)
 		conformanceEqual(t, "config getter", c.RemoteConfigBool("feature.matchmaking.enabled", false), true)
 	} else {
 		reason := map[int]string{401: "unauthorized", 400: "http_400", 404: "remote_config_not_published", 429: "transient_429", 503: "transient_503"}[s]
-		if err == nil || !strings.Contains(err.Error(), reason) {
+		if err == nil || err.Error() != "shardpilot remote config fetch failed: "+reason {
 			t.Fatalf("expected %s, got %v", reason, err)
 		}
+		conformanceEqual(t, "refused config result", result, RemoteConfigResult{})
 		conformanceEqual(t, "refused config getter", c.RemoteConfigBool("feature.matchmaking.enabled", false), false)
 		if raw := w.c.Response.Headers["Retry-After"]; raw != "" {
 			n, e := strconv.Atoi(raw)
