@@ -79,7 +79,7 @@ func (r batchResult) toPublic() BatchResult {
 func (e batchEventStatusWire) toPublic() BatchEventStatus {
 	return BatchEventStatus{
 		EventID: e.EventID,
-		Status:  EventStatusAccepted,
+		Status:  EventStatus(e.Status),
 		Code:    e.Code,
 		Message: e.Message,
 	}

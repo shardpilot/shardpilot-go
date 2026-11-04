@@ -250,7 +250,7 @@ func (t *httpTransport) PublishConsent(ctx context.Context, request consentReque
 	// Decoding only feeds diagnostics; it cannot turn a 2xx into retry work.
 	var result consentResult
 	err := t.postJSON(ctx, t.consentEndpoint, request, &result, "")
-	return consentResult{Recorded: result.Recorded}, err
+	return result, err
 }
 
 // FetchRemoteConfig GETs the remote-config resource. It reports transport-
