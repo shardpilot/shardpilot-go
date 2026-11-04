@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixed
+
+- Conformance replay uses synchronous batch dispatch and independent response
+  expectations instead of timing assumptions or shared SDK decoder types.
+
 ### Added
 
 - Public wire-conformance corpus, byte-integrity controls and explicit per-case

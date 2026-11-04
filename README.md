@@ -16,6 +16,8 @@ The [wire conformance suite](docs/wire-conformance.md) vendors 45 public cases.
 Run `go test -v -count=1 -run '^TestConformance' .` to see each request and response
 disposition, including unsupported capabilities. CI prints the report on both
 supported Go toolchains; the suite adds no dependencies or network services.
+Batch cases use the SDK's synchronous dispatcher; this report does not claim
+atomic grouping by the asynchronous queue.
 
 - Builds and sends app-first event envelopes to `POST {IngestURL}/v1/events:batch` with bearer-token auth.
 - Synchronous `Track`, bounded async `Enqueue`, `Flush`, and `Close`; in-memory delivery stats via `Snapshot` (including a per-status breakdown in `Stats.ByStatus`), a bounded rejection history via `Rejections()`, and an optional `OnBatchResult` callback that surfaces the server's per-event outcomes (which events were rejected, suppressed, observed, or folded as duplicates).

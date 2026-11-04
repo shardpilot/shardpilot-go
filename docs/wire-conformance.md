@@ -10,6 +10,10 @@ Every one of the 45 case IDs produces a named request and response disposition.
 An in-memory HTTP transport delivers captured status, approved headers and raw
 response bytes to a fresh SDK client for each of 33 required cases. This proves
 SDK response handling, not a live receiver or acceptance of a substituted request.
+Batch cases invoke the SDK's synchronous batch builder/dispatcher once. Public
+asynchronous queue grouping is outside this suite: `Enqueue` followed by `Flush`
+may publish an already-held partial batch before the remaining queued events.
+Response expectations use a test-owned schema, independent of SDK decoders.
 
 Request PASS covers the method, complete target, all seven approved headers,
 credential kind and raw body. It applies to the eleven publishable-key Remote

@@ -19,6 +19,20 @@ import (
 	"github.com/shardpilot/shardpilot-go/pkg/crash"
 )
 
+// Decode fixture expectations independently of SDK response wire types.
+type conformanceReply struct {
+	Accepted, Rejected, Duplicates int
+	Events                         []struct {
+		EventID               string `json:"event_id"`
+		Status, Code, Message string
+	}
+	Recorded, Replayed bool
+	Error              struct {
+		Code, Message string
+		Details       []struct{ Field, Code, Message string }
+	}
+}
+
 type conformanceHTTP struct {
 	t      *testing.T
 	c      conformanceCase
@@ -99,7 +113,7 @@ func conformanceError(t *testing.T, err error, c conformanceCase, raw []byte) {
 	if !errors.As(err, &got) {
 		t.Fatalf("expected typed status %d, got %v", c.Response.Status, err)
 	}
-	var want errorResponseWire
+	var want conformanceReply
 	if e := json.Unmarshal(raw, &want); e != nil {
 		t.Fatal(e)
 	}
@@ -158,6 +172,7 @@ func conformanceBatch(t *testing.T, c *Client, w *conformanceHTTP, captured, rep
 	var got BatchResult
 	calls := 0
 	c.cfg.OnBatchResult = func(r BatchResult) { got = r; calls++ }
+	events := make([]Event, 0, len(request.Events))
 	for _, e := range request.Events {
 		// The public API reserves app.* names; replay responses with a valid probe.
 		e["event_name"] = "conformance_probe"
@@ -170,14 +185,12 @@ func conformanceBatch(t *testing.T, c *Client, w *conformanceHTTP, captured, rep
 			event.SessionSequence = int64(n)
 		}
 		event.Props, _ = e["props"].(map[string]any)
-		if err := c.Enqueue(event); err != nil {
-			t.Fatal(err)
-		}
+		events = append(events, event)
 	}
-	err := c.Flush(context.Background())
+	err := c.publishBatchWithContext(context.Background(), events)
 	conformanceError(t, err, w.c, reply)
 	if w.c.Response.Status < 300 {
-		var expected batchResult
+		var expected conformanceReply
 		if err := json.Unmarshal(reply, &expected); err != nil {
 			t.Fatal(err)
 		}
@@ -239,11 +252,11 @@ func conformanceConsent(t *testing.T, c *Client, w *conformanceHTTP, captured, r
 	case got := <-p.done:
 		conformanceError(t, got.err, w.c, reply)
 		if got.err == nil {
-			var want consentResult
+			var want conformanceReply
 			if err := json.Unmarshal(reply, &want); err != nil {
 				t.Fatal(err)
 			}
-			conformanceEqual(t, "parsed consent receipt", got.result, want)
+			conformanceEqual(t, "parsed consent receipt", got.result, consentResult{Recorded: want.Recorded, Replayed: want.Replayed})
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("consent not delivered and settled")
