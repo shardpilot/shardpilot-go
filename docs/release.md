@@ -46,6 +46,9 @@ reversible. Cutting one is the only irreversible step in this procedure.
 
 ## Secret-scan corpus
 
+Public corpus fingerprints retain exact file, rule and line bindings across
+fetched history. Corpus consumers verify the pinned fixture bytes.
+
 The history scan prints the total reachable commit count and ref count beside its
 expected material count and the scanner's observed count. It also binds HEAD, refs
 and material commit identities with a before/after snapshot. A missing, ambiguous,
