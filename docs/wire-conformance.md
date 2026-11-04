@@ -36,7 +36,8 @@ The other 21 requests are UNSUPPORTED, with response handling still asserted:
   represented. Actual receipt fields and decoded outcomes are checked.
 - Five crash cases: intake requires UUIDv7 IDs and module load addresses. Valid
   probes retain the captured anonymous identity; retired and claimed-user fields
-  are omitted. The SDK's decoded result or typed refusal is checked.
+  are omitted. Independent expectations check every public result field: crash
+  ID, fingerprint, suppression and warnings, or the SDK's typed refusal.
 
 Six resolver cases are parser-only: the complete parsed plan is compared with
 the captured body, and refusals retain `resolver_refused`. No resolver HTTP API

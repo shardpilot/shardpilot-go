@@ -33,6 +33,13 @@ type conformanceReply struct {
 	}
 }
 
+type conformanceCrashReply struct {
+	CrashID     string `json:"crash_id"`
+	Fingerprint string
+	Suppressed  bool
+	Warnings    []string
+}
+
 type conformanceHTTP struct {
 	t      *testing.T
 	c      conformanceCase
@@ -365,11 +372,11 @@ func conformanceCrash(t *testing.T, w *conformanceHTTP, captured, reply []byte, 
 		if err != nil {
 			t.Fatal(err)
 		}
-		var want crash.Result
-		if err := json.Unmarshal(reply, &want); err != nil {
+		var expected conformanceCrashReply
+		if err := json.Unmarshal(reply, &expected); err != nil {
 			t.Fatal(err)
 		}
-		want.CrashID = conformanceMap(t, reply)["crash_id"].(string)
+		want := crash.Result{CrashID: expected.CrashID, Fingerprint: expected.Fingerprint, Suppressed: expected.Suppressed, Warnings: expected.Warnings}
 		conformanceEqual(t, "crash callback", calls, 1)
 		conformanceEqual(t, "crash result", got, want)
 	}

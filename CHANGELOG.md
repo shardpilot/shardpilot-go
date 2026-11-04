@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Crash conformance expectations independently retain all public result fields.
 - Conformance validates the exact source commit and metadata pins independently,
   and requires an explicit request disposition for every case ID.
 - Conformance replay uses synchronous batch dispatch and independent response

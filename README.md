@@ -20,6 +20,8 @@ Batch cases use the SDK's synchronous dispatcher; this report does not claim
 atomic grouping by the asynchronous queue.
 The source commit and all metadata hashes are independently pinned; all 45
 request dispositions are enumerated by case ID and checked for exact coverage.
+Crash callback expectations independently decode crash ID, fingerprint,
+suppression and warnings before comparing the complete public result.
 
 - Builds and sends app-first event envelopes to `POST {IngestURL}/v1/events:batch` with bearer-token auth.
 - Synchronous `Track`, bounded async `Enqueue`, `Flush`, and `Close`; in-memory delivery stats via `Snapshot` (including a per-status breakdown in `Stats.ByStatus`), a bounded rejection history via `Rejections()`, and an optional `OnBatchResult` callback that surfaces the server's per-event outcomes (which events were rejected, suppressed, observed, or folded as duplicates).
