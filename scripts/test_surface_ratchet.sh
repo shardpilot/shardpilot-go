@@ -213,8 +213,7 @@ fi
 # ⚠ THE WITNESS IS MEASURED HERE, IN THE TREE UNDER TEST. It used to be the
 # string the parent passed in, which made the closing line a repeater rather
 # than an instrument: whoever set the variable chose what the run claimed to
-# have tested. This reads the commit out of the checkout the controls are about
-# to run against.
+# have tested. Read the source commit before deriving the controls' fixture.
 lane_b_tested="$(git rev-parse HEAD)"
 
 # ⚠ A REGISTRY AND A TRAP BEFORE THE FIRST ALLOCATION, because sweeping for
@@ -254,6 +253,20 @@ unset BASH_ENV ENV
 # reason that has nothing to do with the control under test. expect_ref supplies
 # it explicitly, per call, and is the only thing that may.
 unset PUBLIC_SURFACE_BASE_REF
+
+# Each refusal shares the inputs it exercises, rather than rescanning every
+# SDK source and vendored body. The separate publication job still judges the
+# complete staged tree. This projection runs only inside the owned clone.
+git rm -q -r --ignore-unmatch -- . ':(exclude)scripts/**' \
+  ':(exclude)config.go' ':(exclude).github/workflows/ci.yml'
+"$GATE" --write-baseline >/dev/null
+git add "$BASELINE"
+if ! git diff --cached --quiet; then
+  git -c commit.gpgsign=false -c user.name="surface-ratchet-test" \
+    -c user.email="surface-ratchet-test@invalid" \
+    commit -q -m "Prepare isolated publication-control fixture"
+fi
+
 # ⚠ EVERY TARGET IS SYNTHESIZED FROM HEAD, and none is fetched. CI clones at
 # depth 1, so `origin/main~1` does not exist there and a harness leaning on it
 # would silently skip its own controls on the one machine that matters. Building
@@ -305,6 +318,7 @@ if ! grep -q '^[0-9]' "$BASELINE"; then
 fi
 
 WITH_BASE="$(git rev-parse HEAD)"
+lane_b_fixture_tree="$(git rev-parse 'HEAD^{tree}')"
 WITHOUT_BASE="$(synth_target "")"
 
 checks=0; failures=0
@@ -1543,4 +1557,4 @@ if [ "$failures" -ne 0 ]; then
   echo "surface ratchet: $failures of $checks control(s) FAILED" >&2
   exit 1
 fi
-echo "surface ratchet: $checks control(s), 0 failure(s) — against ${lane_b_tested}"
+echo "surface ratchet: $checks control(s), 0 failure(s) — against ${lane_b_tested} (fixture tree ${lane_b_fixture_tree})"

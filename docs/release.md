@@ -46,6 +46,9 @@ reversible. Cutting one is the only irreversible step in this procedure.
 
 ## Secret-scan corpus
 
+Public corpus fingerprints retain exact file, rule and line bindings across
+fetched history. Corpus consumers verify the pinned fixture bytes.
+
 The history scan prints the total reachable commit count and ref count beside its
 expected material count and the scanner's observed count. It also binds HEAD, refs
 and material commit identities with a before/after snapshot. A missing, ambiguous,
@@ -81,7 +84,10 @@ bytes cannot truncate that identity. Distinct matches are summed, while repeated
 identical matches use the largest multiplicity reported by a matching family.
 
 Run `scripts/test_surface_ratchet.sh` from a clean committed checkout. It clones
-that commit and exercises staged repository fixtures, including every inline
+that commit, keeps the guard scripts, workflow and `config.go`, regenerates the
+fixture baseline, and exercises all existing refusal controls. The final receipt
+names both the original source commit and the prepared fixture tree. The separate
+publication job continues scanning the complete staged change. Controls include every inline
 marker in each required flag suffix, prefix decoration, ordinary wrappers, a
 failed spelling readers for each surface, distinct control-byte matches and
 repeated matches. Plain flag filenames and symlink targets remain detectable.
