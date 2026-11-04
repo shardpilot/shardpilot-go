@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Added
+
+- Public wire-conformance corpus, byte-integrity controls and explicit per-case
+  request/response reports on both supported Go toolchains.
+
 ## v0.11.1 — 2026-11-03 — remote config identity header
 
 ### Fixed

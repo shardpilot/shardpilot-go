@@ -32,3 +32,6 @@ Keep the publication host preflight before dependent setup and retain the gate's
 behavioral probes. Run `python3 scripts/test_publication_host.py` for preflight changes.
 
 Keep Remote Config identity out of URLs; cover consent-gated headers and ETag scope separation through the public fetch API.
+
+Keep the complete pinned wire corpus and explicit per-case dispositions intact.
+Run `go test -v -count=1 -run '^TestConformance' .` for conformance changes.
