@@ -1036,7 +1036,7 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 	}
 	if c.ConsentState() == ConsentGranted && rc.headerIdentity != "" {
 		requestURL, scope, cache, etag = fetchURL, rc.scope, identifiedCache, baselineEtag
-		identity = rc.headerIdentity
+		identity = ""
 		if attributesAllowed {
 			requestURL, usedSignature, etag = attributedURL, attributedSignature, attributedEtag
 		}
@@ -1058,7 +1058,7 @@ func (c *Client) FetchRemoteConfig(ctx context.Context) (RemoteConfigResult, err
 	resp, err := c.transport.FetchRemoteConfig(ctx, remoteConfigRequest{
 		url:         requestURL,
 		bearer:      apiKey,
-		ifNoneMatch: etag,
+		ifNoneMatch: "",
 		anonymousID: identity,
 	})
 	if err != nil {

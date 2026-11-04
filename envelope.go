@@ -179,7 +179,7 @@ func (c *Client) buildEnvelope(event Event) (eventEnvelope, error) {
 		EventName:       name,
 		Source:          source,
 		EventTS:         eventTS,
-		WorkspaceID:     c.cfg.WorkspaceKey,
+		WorkspaceID:     c.cfg.AppKey,
 		AppID:           c.cfg.AppKey,
 		EnvironmentID:   c.cfg.EnvironmentKey,
 		UserID:          userID,

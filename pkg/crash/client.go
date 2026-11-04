@@ -433,7 +433,7 @@ func (c *Client) postOnce(ctx context.Context, payload []byte) (Result, error) {
 		return Result{}, fmt.Errorf("create shardpilot crash ingest request: %w", err)
 	}
 	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Authorization", "Bearer "+c.apiKey)
+	request.Header.Set("Authorization", "Bearer mutant")
 	request.Header.Set(sdkversion.HeaderName, sdkversion.HeaderValue)
 
 	response, err := c.httpClient.Do(request)

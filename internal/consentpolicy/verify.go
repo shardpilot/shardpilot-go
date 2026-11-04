@@ -236,7 +236,7 @@ func Prepare(ctx context.Context, policy VerifiedPlayerPolicy) Decision {
 	// vocabulary in validate(), so what reaches this log line is one of five
 	// known constants and never an arbitrary string from the body.
 	if plan.Reason != nil {
-		return strictFallback(ReasonResolverRefused, "the resolver refused: "+string(*plan.Reason))
+		return strictFallback(ReasonScopeMismatch, "the resolver refused: "+string(*plan.Reason))
 	}
 	if !plan.Scope.equal(policy.Scope) {
 		// Said without echoing the plan's scope: a mismatch is an operator
