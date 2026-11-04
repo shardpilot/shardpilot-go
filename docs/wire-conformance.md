@@ -5,8 +5,13 @@
 The unchanged 79-file `conformance/v1` tree lives in `testdata/conformance/v1`;
 `source.json` binds its metadata and corpus hashes. Corpus SHA-256:
 `bd63843c26a31f1c0ef7750352f983a3c8fe0321d1ce192e331fdb373fbe7340`.
+The validator independently pins the decoded source commit and all three metadata
+hashes; rehashing altered metadata cannot authorize it. JSON formatting may vary.
 
 Every one of the 45 case IDs produces a named request and response disposition.
+The request disposition table enumerates exactly those IDs, including all N/A
+cases. Missing, extra, replaced or empty entries fail before replay; operation and
+credential kind cannot confer PASS on an unreviewed case.
 An in-memory HTTP transport delivers captured status, approved headers and raw
 response bytes to a fresh SDK client for each of 33 required cases. This proves
 SDK response handling, not a live receiver or acceptance of a substituted request.

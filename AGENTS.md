@@ -38,3 +38,4 @@ Keep Remote Config identity out of URLs; cover consent-gated headers and ETag sc
 Keep the complete pinned wire corpus and explicit per-case dispositions intact.
 Run `go test -v -count=1 -run '^TestConformance' .` for conformance changes.
 Use synchronous batch dispatch and test-owned response schemas; keep async grouping out of the claim.
+Pin every decoded source field independently and require exact case-ID disposition coverage.

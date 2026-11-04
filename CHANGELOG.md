@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Conformance validates the exact source commit and metadata pins independently,
+  and requires an explicit request disposition for every case ID.
 - Conformance replay uses synchronous batch dispatch and independent response
   expectations instead of timing assumptions or shared SDK decoder types.
 - Publication refusal controls share a derived fixture so added SDK artifacts

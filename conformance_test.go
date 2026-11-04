@@ -152,7 +152,7 @@ func conformanceRequest(t *testing.T, w *conformanceHTTP, credential string) boo
 		}
 		conformanceEqual(t, "approved header "+name, values(name), want)
 	}
-	exact := c.Operation == "fetchRemoteConfigSDKConfigByKeys" && c.Request.Credential == "publishable_key"
+	exact := conformanceRequestDispositions()[c.ID] == "PASS"
 	if exact {
 		conformanceEqual(t, "raw body", string(body), string(w.files["v1/"+c.Request.File]))
 	}
@@ -466,7 +466,7 @@ func TestConformance(t *testing.T) {
 			if conformanceRequest(t, w, credential) {
 				t.Log("request PASS; response PASS; delivery 1 (seed excluded)")
 			} else {
-				reason := map[string]string{"batchIngestEvents": "SDK reserves app.* names and stamps ingest time; valid probe replays malformed/retired requests", "recordConsent": "SDK stamps receipt time/key and derives actor kind; client JWT unsupported", "ingestCrash": "SDK requires UUIDv7 and module load_address; typed body omits retired/claimed-user members", "fetchRemoteConfigSDKConfigByKeys": "credential-free fetch unsupported: SDK requires a publishable key"}[c.Operation]
+				reason := conformanceRequestDispositions()[c.ID]
 				t.Logf("request UNSUPPORTED: %s; response PASS; delivery 1", reason)
 			}
 		})
@@ -480,4 +480,32 @@ func mustConformanceJSON(t *testing.T, v any) []byte {
 		t.Fatal(err)
 	}
 	return raw
+}
+
+func TestConformanceUnreviewedRequest(t *testing.T) {
+	files := conformanceFiles(t)
+	m, err := conformanceCorpus(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range m.Cases {
+		if c.ID != "rc.two-key-200" {
+			continue
+		}
+		c.ID = "rc.unreviewed-200"
+		r, err := http.NewRequest(c.Request.Method, "https://conformance.example.invalid"+c.Request.Path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for key, value := range c.Request.Headers {
+			r.Header.Set(key, value)
+		}
+		r.Header.Set("Authorization", "Bearer fixture")
+		w := &conformanceHTTP{c: c, files: files, seen: []*http.Request{r}, bodies: [][]byte{nil}}
+		if conformanceRequest(t, w, "fixture") {
+			t.Fatal("unreviewed request inherited PASS")
+		}
+		return
+	}
+	t.Fatal("positive Remote Config control missing")
 }
