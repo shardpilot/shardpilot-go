@@ -12,6 +12,18 @@ Real, tested, working code — **early alpha**. The API is pre-v1 and may change
 
 ## What it does
 
+The [wire conformance suite](docs/wire-conformance.md) vendors 45 public cases.
+Run `go test -v -count=1 -run '^TestConformance' .` to see each request and response
+disposition, including unsupported capabilities. CI prints the report on both
+supported Go toolchains; the suite adds no dependencies or network services.
+Batch cases use the SDK's synchronous dispatcher; this report does not claim
+atomic grouping by the asynchronous queue.
+The source commit and all metadata hashes are independently pinned; all 45
+request dispositions are enumerated by case ID and checked for exact coverage.
+Crash callback expectations independently decode crash ID, fingerprint,
+suppression and warnings before comparing the complete public result.
+Remote Config reports compare the complete result and exact failure taxonomy.
+
 - Builds and sends app-first event envelopes to `POST {IngestURL}/v1/events:batch` with bearer-token auth.
 - Synchronous `Track`, bounded async `Enqueue`, `Flush`, and `Close`; in-memory delivery stats via `Snapshot` (including a per-status breakdown in `Stats.ByStatus`), a bounded rejection history via `Rejections()`, and an optional `OnBatchResult` callback that surfaces the server's per-event outcomes (which events were rejected, suppressed, observed, or folded as duplicates).
 - Bounded batching (default 25 events, capped at 100) with retry of retryable HTTP responses; a `429`'s `Retry-After` hint defers the next automatic publish attempt, and retryable failures without a hint (server unreachable, `5xx` without the header) fall back to client-side exponential backoff with full jitter on their OWN clock, independent of `FlushInterval` — every failure, the first included, waits a random duration in [1s, ceiling], the ceiling doubling from the third consecutive failure up to 60s, reset on success (explicit `Flush`/`Close` still try immediately). Memory-only queue (no durable on-disk queue). Event ids and timestamps are stamped once at intake, so a re-sent batch is de-duplicated by the service instead of double-counted.

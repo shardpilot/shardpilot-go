@@ -124,6 +124,14 @@ jobs:
             go test ./...
           fi
 
+      - name: Wire conformance case report
+        run: |
+          if [ "$(id -u)" -eq 0 ]; then
+            sudo -H -u shardpilot env "PATH=$PATH" "GOTOOLCHAIN=${GOTOOLCHAIN:-local}" go test -v -count=1 -run '^TestConformance' .
+          else
+            go test -v -count=1 -run '^TestConformance' .
+          fi
+
       - name: Vet
         run: go vet ./...
 

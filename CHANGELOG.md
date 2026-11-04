@@ -4,8 +4,19 @@
 
 ### Fixed
 
+- Remote Config conformance compares complete outcomes and exact failure codes.
+- Crash conformance expectations independently retain all public result fields.
+- Conformance validates the exact source commit and metadata pins independently,
+  and requires an explicit request disposition for every case ID.
+- Conformance replay uses synchronous batch dispatch and independent response
+  expectations instead of timing assumptions or shared SDK decoder types.
 - Publication refusal controls share a derived fixture so added SDK artifacts
   do not multiply their runtime; the complete-tree publication check is retained.
+
+### Added
+
+- Public wire-conformance corpus, byte-integrity controls and explicit per-case
+  request/response reports on both supported Go toolchains.
 
 ## v0.11.1 — 2026-11-03 — remote config identity header
 

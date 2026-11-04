@@ -34,3 +34,10 @@ Keep refusal controls independent of unrelated SDK files; retain their shared
 derived fixture and the separate complete-tree publication check.
 
 Keep Remote Config identity out of URLs; cover consent-gated headers and ETag scope separation through the public fetch API.
+
+Keep the complete pinned wire corpus and explicit per-case dispositions intact.
+Run `go test -v -count=1 -run '^TestConformance' .` for conformance changes.
+Use synchronous batch dispatch and test-owned response schemas; keep async grouping out of the claim.
+Pin every decoded source field independently and require exact case-ID disposition coverage.
+Crash expectations enumerate every public result field independently of its SDK type.
+Compare complete Remote Config results and exact failure messages in corpus reports.
