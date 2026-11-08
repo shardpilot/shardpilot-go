@@ -14,14 +14,14 @@ config_path = re.compile(
     rb'|include\.path|commit\.template)(?:\s*[^a-z0-9\s_./-]){0,12}\s*'
     rb'(/dev/null|os\.devnull)([^a-z0-9_./-]|$)', re.IGNORECASE,
 )
-comment_line = re.compile(rb'^[\t \r\f\x0b]*(?:#|//|/\*|\*)[^\n]*', re.MULTILINE)
 
 
-def direct_config_paths(repo, env=None):
+def direct_config_paths(repo, env=None, excluded_paths=()):
     candidates = subprocess.run(
         ['git', 'grep', '-IilzE', '-e', '/dev/null|os[.]devnull', '--',
          '*.go', '*.py', '*.sh', '*.js', '*.mjs', '*.cjs', '*.ts', '*.yml', '*.yaml',
-         '*.json', '*.toml', 'Makefile'],
+         '*.json', '*.toml', 'Makefile',
+         *(f':(exclude,top,literal){path}' for path in excluded_paths)],
         cwd=repo, env=env, stdout=subprocess.PIPE,
     )
     if candidates.returncode == 1:
@@ -30,8 +30,7 @@ def direct_config_paths(repo, env=None):
     matches = []
     for name in candidates.stdout.rstrip(b'\0').split(b'\0'):
         path = Path(os.fsdecode(name))
-        source = comment_line.sub(b'X', (repo / path).read_bytes())
-        if config_path.search(source):
+        if config_path.search((repo / path).read_bytes()):
             matches.append(path)
     return matches
 
@@ -52,19 +51,18 @@ with tempfile.TemporaryDirectory(prefix='gate-integrity-') as directory:
     env = {'PATH': os.defpath, 'LC_ALL': 'C', 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': str(config)}
     guard_repo = Path(directory) / 'git-config-guard'
     subprocess.run(['git', 'init', '-q', str(guard_repo)], env=env, check=True)
-    fixture = guard_repo / 'paths with spaces.py'
+    fixture = guard_repo / 'paths with spaces.mjs'
     key = b'GIT_CONFIG_GLOBAL'
-    single = b'env = {"' + key + b'": os.devnull}\n'
-    wrapped = b'env = {"' + key + b'":\n    os.devnull}\n'
+    single = b'const env = {"' + key + b'": os.devNull};\n'
+    wrapped = b'const env = {"' + key + b'":\n    os.devNull};\n'
     fixture.write_bytes(single)
     subprocess.run(['git', 'add', '--', fixture.name], cwd=guard_repo, env=env, check=True)
-    for source in (single, wrapped):
+    for source in (single, wrapped, b'/* Git fixture */ ' + single, b'// ' + single):
         fixture.write_bytes(source)
         assert direct_config_paths(guard_repo, env) == [Path(fixture.name)]
-    fixture.write_bytes(b'# ' + single + b'# ' + wrapped.replace(b'\n    ', b'\n#     '))
     (guard_repo / 'untracked.py').write_bytes(single)
-    assert not direct_config_paths(guard_repo, env)
-    print('PASS direct Git config paths, wrapped assignments and comment control', flush=True)
+    assert not direct_config_paths(guard_repo, env, excluded_paths=(fixture.name,))
+    print('PASS direct, wrapped and commented Git config paths, and exact path exclusion', flush=True)
 
     for scene, changed, expected in [
         ('unchanged', None, 0),
