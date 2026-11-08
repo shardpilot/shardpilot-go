@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Tests
+
+- Use virtual time for the canceled spool flush regression. A held request
+  exercises both release and expiry under the same HTTP attempt deadline.
+
 ## v0.11.2 — 2026-11-08 — wire conformance
 
 ### Tests

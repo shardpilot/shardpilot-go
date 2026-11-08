@@ -17,6 +17,8 @@ consent-dispatch delivery and drop-count assertions intact.
 
 Blocked-request fixture changes must run the failure-path subprocess control.
 Release handlers before blocking cleanup and retain the existing timing bounds.
+Keep the canceled spool flush fixture on virtual time and the shared HTTP
+handler. Preserve the held-request release and attempt-deadline controls.
 
 Document behavior and verification changes in `README.md` and `CHANGELOG.md`.
 For publication receipt CI changes, run both receipt-scene commands documented
