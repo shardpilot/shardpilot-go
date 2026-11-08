@@ -13,6 +13,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 )
 
@@ -64,8 +65,14 @@ type spoolTestServer struct {
 
 func newSpoolTestServer(t *testing.T) (*spoolTestServer, *httptest.Server) {
 	t.Helper()
+	state, handler := newSpoolTestHandler(t)
+	return state, httptest.NewServer(handler)
+}
+
+func newSpoolTestHandler(t *testing.T) (*spoolTestServer, http.Handler) {
+	t.Helper()
 	state := &spoolTestServer{t: t, status: http.StatusAccepted}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1/events:batch":
 			body := ingestRequestBytes(t, r)
@@ -121,8 +128,8 @@ func newSpoolTestServer(t *testing.T) (*spoolTestServer, *httptest.Server) {
 			t.Errorf("unexpected request path %q", r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
 		}
-	}))
-	return state, server
+	})
+	return state, handler
 }
 
 func (s *spoolTestServer) setOutcome(status int, errorCode, retryAfter string) {
@@ -2037,29 +2044,63 @@ func TestSpoolRecoveryWakeResendsSpoolOnlyWork(t *testing.T) {
 // clear must not run for an abandoned flush — or the chunk would retry at
 // the next tick inside the server's window.
 func TestSpoolCanceledFlushPreservesArmedDeadline(t *testing.T) {
-	state, server := newSpoolTestServer(t)
-	defer server.Close()
+	t.Run("release_before_deadline", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) { testSpoolCanceledFlush(t, false) })
+	})
+	t.Run("hold_until_deadline", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) { testSpoolCanceledFlush(t, true) })
+	})
+}
+
+func testSpoolCanceledFlush(t *testing.T, holdUntilDeadline bool) {
+	t.Helper()
+	state, handler := newSpoolTestHandler(t)
 	// Any leaked retry keeps failing retriably; the discriminator is whether
 	// a request arrives at all while the deadline is armed.
 	state.setOutcome(http.StatusInternalServerError, "internal_error", "3600")
 
 	dir := t.TempDir()
 	now := time.Now()
+	const spooledID = "evt-cancel-armed-1"
+	spooled := spoolTestEnvelope(t, spooledID, now)
 	writeConsentRecordFile(t, dir, "granted")
-	writeSpoolRecordFile(t, dir, now.Add(time.Hour).UnixMilli(), spoolTestEnvelope(t, "evt-cancel-armed-1", now))
+	writeSpoolRecordFile(t, dir, now.Add(time.Hour).UnixMilli(), spooled)
 
 	// The short cadence makes a leaked deadline clear observable: the next
 	// tick would retry the requeued chunk immediately.
-	client := newSpoolTestClient(t, server.URL, dir, nil, func(cfg *Config) {
-		cfg.FlushInterval = 40 * time.Millisecond
+	const cadence = 40 * time.Millisecond
+	holdNext := make(chan struct{}, 1)
+	held := make(chan *http.Request, 1)
+	release := make(chan struct{})
+	releaseHeld := sync.OnceFunc(func() { close(release) })
+	client := newSpoolTestClient(t, "https://ingest.example.test", dir, nil, func(cfg *Config) {
+		cfg.FlushInterval = cadence
+		cfg.HTTPClient = &http.Client{Timeout: cfg.HTTPTimeout, Transport: apiDecisionForwarder(func(r *http.Request) (*http.Response, error) {
+			defer r.Body.Close()
+			select {
+			case <-holdNext:
+				held <- r
+				select {
+				case <-release:
+				case <-r.Context().Done():
+					return nil, r.Context().Err()
+				}
+			default:
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, r)
+			return response.Result(), nil
+		})}
 	})
 	defer client.Close(context.Background())
+	defer releaseHeld()
 
 	if client.initialDeferUntil.IsZero() {
 		t.Fatalf("expected the persisted deadline to seed the deferral")
 	}
 	// Baseline: inside the restored window automatic resends hold off.
 	time.Sleep(150 * time.Millisecond)
+	synctest.Wait()
 	if got := state.batchCount(); got != 0 {
 		t.Fatalf("expected no resend inside the armed window before the flush, got %d requests", got)
 	}
@@ -2088,6 +2129,7 @@ func TestSpoolCanceledFlushPreservesArmedDeadline(t *testing.T) {
 	// Zero pacing side-effects: the deadline stays armed, so the requeued
 	// chunk must NOT retry at the following ticks.
 	time.Sleep(400 * time.Millisecond)
+	synctest.Wait()
 	if got := state.batchCount(); got != 0 {
 		t.Fatalf("expected the armed deadline to keep gating the requeued chunk after the canceled flush, got %d requests", got)
 	}
@@ -2096,7 +2138,50 @@ func TestSpoolCanceledFlushPreservesArmedDeadline(t *testing.T) {
 	// bypasses the deferral, delivers the chunk, and the successful outcome
 	// clears pacing so a fresh event publishes on the normal cadence.
 	state.setOutcome(http.StatusAccepted, "", "")
-	if err := client.Flush(context.Background()); err != nil {
+	holdNext <- struct{}{}
+	started := time.Now()
+	go func() { reply <- client.Flush(context.Background()) }()
+	synctest.Wait()
+	select {
+	case request := <-held:
+		deadline, ok := request.Context().Deadline()
+		if request.Method != http.MethodPost || request.URL.Path != "/v1/events:batch" || !ok || deadline.Sub(started) != time.Second {
+			t.Fatal("expected the held batch request to have the original one-second deadline")
+		}
+	default:
+		t.Fatal("live flush never reached the held request")
+	}
+	const serverDelay = 750 * time.Millisecond
+	time.Sleep(serverDelay)
+	synctest.Wait()
+	select {
+	case err := <-reply:
+		t.Fatalf("held request completed before release or deadline: %v", err)
+	default:
+	}
+	if got := state.batchCount(); got != 0 {
+		t.Fatalf("held request reached the handler before release, got %d requests", got)
+	}
+	if holdUntilDeadline {
+		time.Sleep(time.Second - serverDelay)
+		synctest.Wait()
+		select {
+		case err := <-reply:
+			if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "send shardpilot ingest request: Post ") {
+				t.Fatalf("expected the wrapped ingest deadline error, got %v", err)
+			}
+		default:
+			t.Fatal("held request did not return at the attempt deadline")
+		}
+		record := readSpoolRecordFile(t, dir)
+		if state.batchCount() != 0 || len(record.Events) != 1 || string(record.Events[0].Raw) != string(spooled) {
+			t.Fatal("timed-out request did not retain the undelivered chunk")
+		}
+		t.Log("held request returned the wrapped deadline error and retained the original chunk")
+		return
+	}
+	releaseHeld()
+	if err := <-reply; err != nil {
 		t.Fatalf("live-context flush: %v", err)
 	}
 	if got := state.batchCount(); got != 1 {
@@ -2105,19 +2190,18 @@ func TestSpoolCanceledFlushPreservesArmedDeadline(t *testing.T) {
 	if record := readSpoolRecordFile(t, dir); len(record.Events) != 0 {
 		t.Fatalf("expected the delivered chunk acked out of the record, got %s", mustJSON(t, record.Events))
 	}
-	if err := client.Enqueue(Event{ID: "b376d5cb-d1c2-53ad-ac91-cd8a8f7c1a3f", Name: "fresh"}); err != nil {
+	const freshID = "b376d5cb-d1c2-53ad-ac91-cd8a8f7c1a3f"
+	if err := client.Enqueue(Event{ID: freshID, Name: "fresh"}); err != nil {
 		t.Fatalf("enqueue fresh event: %v", err)
 	}
-	waitFor(t, 5*time.Second, "the fresh event published on the flush cadence", func() bool {
-		for _, arrival := range state.allArrivals() {
-			for _, id := range arrival {
-				if id == "b376d5cb-d1c2-53ad-ac91-cd8a8f7c1a3f" {
-					return true
-				}
-			}
-		}
-		return false
-	})
+	synctest.Wait()
+	time.Sleep(cadence)
+	synctest.Wait()
+	arrivals := state.allArrivals()
+	if len(arrivals) != 2 || len(arrivals[0]) != 1 || arrivals[0][0] != spooledID || len(arrivals[1]) != 1 || arrivals[1][0] != freshID {
+		t.Fatalf("expected the requeued chunk then the fresh cadence publish, got %v", arrivals)
+	}
+	t.Log("released request delivered the chunk and cleared pacing for the next cadence")
 }
 
 // The abandonment rule extends to PERSISTED pacing state: a canceled flush

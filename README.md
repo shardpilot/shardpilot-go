@@ -621,6 +621,10 @@ The spool case verifies that the blocked request carries the persisted ordinary
 retry before changing consent, then checks the worker-held experiment facts'
 delivery and drop accounting.
 
+The canceled spool flush regression runs the worker and the shared HTTP fixture
+on virtual time. It verifies both release before the existing HTTP deadline and
+expiry while the request is held.
+
 `TestBlockedRequestFixtureCleanupAfterFailedAssertion` runs the three blocked
 request fixtures in bounded child processes, forces a failed assertion, and
 requires an ordinary test failure followed by completed cleanup.
@@ -697,7 +701,7 @@ quoted-name and outside-directory controls. Deliberate gate changes require revi
 - **No domain logic in core.** No product-specific event names or game/vertical fields in the universal envelope.
 - **The SDK only sends telemetry.** It performs no provider, model, GitHub, billing, or account-management write calls, and triggers no automatic actions.
 - **Fail-safe HTTP.** HTTPS required outside localhost/loopback (private-network HTTP only via explicit opt-in). No durable local queue unless the opt-in disk spool is configured (`SpoolDir`); no retry storms; the worker retains at most one failed in-memory batch.
-- The `go` directive is held deliberately below the current toolchain for consumer compatibility — **1.25** today — even though CI also exercises the current toolchain. It moves only when the SDK needs something the older baseline cannot express: 1.25 was taken for `testing/synctest`, which is available to tests written against it from here on. It did **not** retire the existing suite's real-time waits, and no test currently imports it — the retry and flush-pacing tests still run on the real clock. See the `v0.6.3-alpha` entry in [`CHANGELOG.md`](CHANGELOG.md) for the measurement behind that.
+- The `go` directive retains the **1.25** consumer baseline while CI also exercises the current toolchain. The canceled spool flush test uses the standard library's `testing/synctest` package to control worker ticks and the HTTP deadline. See the `v0.6.3-alpha` entry in [`CHANGELOG.md`](CHANGELOG.md) for the baseline measurement.
 
 ## Roadmap
 
