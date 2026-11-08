@@ -22,7 +22,9 @@ class ComparisonBaseScenes(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.remote = self.root / "origin"
         self.remote.mkdir()
-        self.env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull,
+        config = self.root / "gitconfig"
+        config.touch(exist_ok=False)
+        self.env = dict(os.environ, GIT_CONFIG_GLOBAL=str(config),
                         GIT_CONFIG_NOSYSTEM="1")
         for key in ("BASH_ENV", "ENV", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"):
             self.env.pop(key, None)
@@ -196,7 +198,9 @@ class WholeGatePublicationScenes(unittest.TestCase):
         self.publisher.mkdir()
         self.origin = self.root / "origin.git"
         self.worker = self.root / "worker"
-        self.env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+        config = self.root / "gitconfig"
+        config.touch(exist_ok=False)
+        self.env = dict(os.environ, GIT_CONFIG_GLOBAL=str(config), GIT_CONFIG_NOSYSTEM="1")
         for key in ("BASH_ENV", "ENV", "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE",
                     "PUBLIC_SURFACE_BASE_REF", "LANE_B_BASELINE"):
             self.env.pop(key, None)

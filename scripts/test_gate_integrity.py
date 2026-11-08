@@ -13,9 +13,10 @@ job = workflow.split('\n  gate-integrity:\n', 1)[1].split('\n  release-consisten
 assert job.count('        run: |\n') == 1
 command = textwrap.dedent(job.split('        run: |\n', 1)[1])
 workflow += '\n  outside-fixture:\n    runs-on: ubuntu-latest\n    steps:\n      - run: ./outside.sh\n'
-env = {'PATH': os.defpath, 'LC_ALL': 'C', 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull}
-
 with tempfile.TemporaryDirectory(prefix='gate-integrity-') as directory:
+    config = Path(directory) / 'gitconfig'
+    config.touch(exist_ok=False)
+    env = {'PATH': os.defpath, 'LC_ALL': 'C', 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': str(config)}
     for scene, changed, expected in [
         ('unchanged', None, 0),
         ('ordinary-script', 'scripts/ordinary.sh', 1),

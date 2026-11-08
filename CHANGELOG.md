@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Git fixtures use private temporary configuration files with scoped cleanup.
+
 - Typed ingest-error conformance independently verifies header-derived retry delays
   while retaining status, envelope and complete field-detail assertions.
 - Remote Config conformance compares complete outcomes and exact failure codes.

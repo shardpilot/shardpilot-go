@@ -25,7 +25,9 @@ for case in ['missing-mv', 'missing-timeout', 'missing-python3', *faults, 'capab
         git = bindir / 'git'
         git.write_text('#!/bin/sh\ncase "$1" in status) exit 0;; ls-files|write-tree) : > "$PUBLICATION_CONTROL_STARTED"; exit 99;; esac\nexec ' + shlex.quote(tools['git']) + ' "$@"\n')
         git.chmod(0o755)
-        env = {'PATH': str(bindir), 'LANG': 'C', 'GIT_CONFIG_GLOBAL': os.devnull,
+        config = folder / 'gitconfig'
+        config.touch(exist_ok=False)
+        env = {'PATH': str(bindir), 'LANG': 'C', 'GIT_CONFIG_GLOBAL': str(config),
                'GIT_CONFIG_NOSYSTEM': '1', 'PUBLICATION_CONTROL_STARTED': str(marker)}
         for label, args in entries.items():
             if sys.argv[1:] and label not in sys.argv[1:]: continue
