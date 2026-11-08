@@ -4,6 +4,8 @@
 
 ### Fixed
 
+- Typed ingest-error conformance independently verifies header-derived retry delays
+  while retaining status, envelope and complete field-detail assertions.
 - Remote Config conformance compares complete outcomes and exact failure codes.
 - Crash conformance expectations independently retain all public result fields.
 - Conformance validates the exact source commit and metadata pins independently,

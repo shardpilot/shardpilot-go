@@ -19,6 +19,13 @@ Batch cases invoke the SDK's synchronous batch builder/dispatcher once. Public
 asynchronous queue grouping is outside this suite: `Enqueue` followed by `Flush`
 may publish an already-held partial batch before the remaining queued events.
 Response expectations use a test-owned schema, independent of SDK decoders.
+Typed ingest refusals compare status, envelope code/message, every field detail
+and the retry duration derived independently from captured response headers.
+The pinned 400/403 refusals expect zero delay. Separately labelled controls reuse
+one captured refusal body with absent, explicit-zero, positive delta-seconds on
+429 and 503, invalid, and ignored-on-400 headers. These response variants retain
+the single synchronous delivery and envelope assertions; corpus bytes and case
+dispositions stay pinned.
 
 Request PASS covers the method, complete target, all seven approved headers,
 credential kind and raw body. It applies to the eleven publishable-key Remote

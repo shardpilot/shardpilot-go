@@ -127,6 +127,14 @@ func conformanceError(t *testing.T, err error, c conformanceCase, raw []byte) {
 	conformanceEqual(t, "status", got.StatusCode, c.Response.Status)
 	conformanceEqual(t, "error code", got.ErrorCode, want.Error.Code)
 	conformanceEqual(t, "error message", got.ErrorMessage, want.Error.Message)
+	var retryAfter time.Duration
+	if c.Response.Status == http.StatusTooManyRequests || c.Response.Status >= 500 {
+		seconds, err := strconv.ParseUint(strings.TrimSpace(c.Response.Headers["Retry-After"]), 10, 64)
+		if err == nil {
+			retryAfter = time.Duration(min(seconds, 24*60*60)) * time.Second
+		}
+	}
+	conformanceEqual(t, "retry after", got.RetryAfter, retryAfter)
 	conformanceEqual(t, "detail count", len(got.Details), len(want.Error.Details))
 	for i, d := range want.Error.Details {
 		conformanceEqual(t, "error detail", got.Details[i], ErrorDetail{d.Field, d.Code, d.Message})
@@ -517,6 +525,7 @@ func TestConformanceIngestErrorRetryAfter(t *testing.T) {
 		{"absent", http.StatusServiceUnavailable, ""},
 		{"explicit-zero", http.StatusServiceUnavailable, "0"},
 		{"positive", http.StatusTooManyRequests, "7"},
+		{"positive-server-error", http.StatusServiceUnavailable, "7"},
 		{"invalid", http.StatusServiceUnavailable, "invalid"},
 		{"ignored", http.StatusBadRequest, "7"},
 	} {
