@@ -48,6 +48,7 @@ reversible. Cutting one is the only irreversible step in this procedure.
 
 Public corpus fingerprints retain exact file, rule and line bindings across
 fetched history. Corpus consumers verify the pinned fixture bytes.
+Retain a separate exact fingerprint when a squash commit contains the same synthetic span.
 
 The history scan prints the total reachable commit count and ref count beside its
 expected material count and the scanner's observed count. It also binds HEAD, refs

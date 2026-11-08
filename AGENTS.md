@@ -28,6 +28,7 @@ Keep scratch identities registered; verify their owner and identity before
 recursive removal, and refuse temporary parents that permit replacement. Receipt controls must prove their tool and interrupt faults fired.
 Keep repository content and pull request discussions suitable for public SDK
 consumers.
+Verify synthetic fixture matches by hash before retaining exact squash-commit fingerprints.
 Keep the publication host preflight before dependent setup and retain the gate's
 behavioral probes. Run `python3 scripts/test_publication_host.py` for preflight changes.
 Keep refusal controls independent of unrelated SDK files; retain their shared
