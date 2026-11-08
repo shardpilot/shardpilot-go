@@ -21,21 +21,21 @@ if CONTAINER:
 class SecretScanScenes(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="secret-scan-scenes-")
+        self.addCleanup(self.temp.cleanup)
         self.root = pathlib.Path(self.temp.name).resolve()
         self.repo = self.root / "repo"
         self.repo.mkdir()
+        config = self.root / "gitconfig"
+        config.touch(exist_ok=False)
         self.env = os.environ.copy()
         self.env.update({
-            "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": str(config), "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_AUTHOR_NAME": "Synthetic", "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
             "GIT_COMMITTER_NAME": "Synthetic", "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
         })
         self.git("init", "-q", "-b", "main")
         (self.repo / "content.txt").write_text("public fixture\n")
         self.commit("Synthetic root")
-
-    def tearDown(self):
-        self.temp.cleanup()
 
     def git(self, *args):
         return subprocess.check_output(

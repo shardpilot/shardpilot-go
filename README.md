@@ -682,6 +682,9 @@ Local suites require Bash, Python 3 and GNU-compatible `mv -fT` and `timeout` co
 Both entrypoints verify `--kill-after` escalation, stopping once with `PREREQUISITE:` if unsuitable.
 Run `python3 scripts/test_publication_host.py` for missing-tool, incompatible-tool and capable-host controls.
 
+Git fixtures use private temporary configuration files. The gate integrity
+suite also checks direct assignments in tracked source, including wrapped and commented text.
+
 Gate inputs belong under `scripts/`. CI compares that complete subtree with the
 event's base, including quoted filenames, helpers and manifests.
 Run `python3 scripts/test_gate_integrity.py` for unchanged, ordinary-name,
