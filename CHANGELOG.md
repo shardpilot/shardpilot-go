@@ -2,9 +2,12 @@
 
 ## Unreleased
 
-### Fixed
+## v0.11.2 — 2026-11-08 — wire conformance
 
-- Align consent-policy fixture notices with the published disclaimer.
+### Tests
+
+- Align consent-policy fixture notices with the published text after removal of
+  the legacy prefix.
 - Retain the exact synthetic conformance-fixture fingerprint after squash merging.
 - Typed ingest-error conformance independently verifies header-derived retry delays
   while retaining status, envelope and complete field-detail assertions.
