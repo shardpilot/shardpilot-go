@@ -16,6 +16,7 @@ The [wire conformance suite](docs/wire-conformance.md) vendors 45 public cases.
 Run `go test -v -count=1 -run '^TestConformance' .` to see each request and response
 disposition, including unsupported capabilities. CI prints the report on both
 supported Go toolchains; the suite adds no dependencies or network services.
+Consent-policy fixtures preserve the informational disclaimer from the resolver response.
 Batch cases use the SDK's synchronous dispatcher; this report does not claim
 atomic grouping by the asynchronous queue.
 The source commit and all metadata hashes are independently pinned; all 45

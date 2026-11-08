@@ -39,6 +39,6 @@
   "basis": {
     "character": "informational_reference",
     "table_provenance": "ai_draft",
-    "notice": "AI draft — owner-confirmed; counsel confirmation pending (Stage B): The consent-policy resolver provides informational reference output based on AI-collected jurisdiction data, not legal advice; ShardPilot makes no representation as to the accuracy of those jurisdiction readings and accepts no liability for reliance on them, subject to applicable mandatory-law limits; the customer remains responsible for its consent design and its own compliance decision, acting as controller or under its controller's instructions where it acts as processor."
+    "notice": "The consent-policy resolver provides informational reference output based on AI-collected jurisdiction data, not legal advice; ShardPilot makes no representation as to the accuracy of those jurisdiction readings and accepts no liability for reliance on them, subject to applicable mandatory-law limits; the customer remains responsible for its consent design and its own compliance decision, acting as controller or under its controller's instructions where it acts as processor."
   }
 }

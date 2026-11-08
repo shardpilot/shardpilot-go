@@ -1,10 +1,10 @@
 # Wire conformance
 
 `go test -v -count=1 -run '^TestConformance' .` verifies the complete public
-`shardpilot/developers` corpus at `d5d4164efe19dcf30485a0723135f385b7d1e245`.
+`shardpilot/developers` corpus at `91d5dcacd260e060b1b5fbe43ae252d814664ac4`.
 The unchanged 79-file `conformance/v1` tree lives in `testdata/conformance/v1`;
 `source.json` binds its metadata and corpus hashes. Corpus SHA-256:
-`bd63843c26a31f1c0ef7750352f983a3c8fe0321d1ce192e331fdb373fbe7340`.
+`cd3affb4c1732e18f83e069e7ad3ee7de6b21790e79b9e8e7fda92dd24fa483d`.
 The validator independently pins the decoded source commit and all three metadata
 hashes; rehashing altered metadata cannot authorize it. JSON formatting may vary.
 
