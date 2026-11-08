@@ -127,6 +127,14 @@ func conformanceError(t *testing.T, err error, c conformanceCase, raw []byte) {
 	conformanceEqual(t, "status", got.StatusCode, c.Response.Status)
 	conformanceEqual(t, "error code", got.ErrorCode, want.Error.Code)
 	conformanceEqual(t, "error message", got.ErrorMessage, want.Error.Message)
+	var retryAfter time.Duration
+	if c.Response.Status == http.StatusTooManyRequests || c.Response.Status >= 500 {
+		seconds, err := strconv.ParseUint(strings.TrimSpace(c.Response.Headers["Retry-After"]), 10, 64)
+		if err == nil {
+			retryAfter = time.Duration(min(seconds, 24*60*60)) * time.Second
+		}
+	}
+	conformanceEqual(t, "retry after", got.RetryAfter, retryAfter)
 	conformanceEqual(t, "detail count", len(got.Details), len(want.Error.Details))
 	for i, d := range want.Error.Details {
 		conformanceEqual(t, "error detail", got.Details[i], ErrorDetail{d.Field, d.Code, d.Message})
@@ -492,6 +500,61 @@ func mustConformanceJSON(t *testing.T, v any) []byte {
 		t.Fatal(err)
 	}
 	return raw
+}
+
+func TestConformanceIngestErrorRetryAfter(t *testing.T) {
+	files := conformanceFiles(t)
+	manifest, err := conformanceCorpus(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var captured conformanceCase
+	for _, c := range manifest.Cases {
+		if c.ID == "batch-retired-scope-member" {
+			captured = c
+		}
+	}
+	if captured.ID == "" {
+		t.Fatal("missing captured ingest refusal")
+	}
+	for _, control := range []struct {
+		name   string
+		status int
+		header string
+	}{
+		{"absent", http.StatusServiceUnavailable, ""},
+		{"explicit-zero", http.StatusServiceUnavailable, "0"},
+		{"positive", http.StatusTooManyRequests, "7"},
+		{"positive-server-error", http.StatusServiceUnavailable, "7"},
+		{"invalid", http.StatusServiceUnavailable, "invalid"},
+		{"ignored", http.StatusBadRequest, "7"},
+	} {
+		t.Run(control.name, func(t *testing.T) {
+			c := captured
+			c.Response.Status = control.status
+			c.Response.Headers = map[string]string{"Content-Type": captured.Response.Headers["Content-Type"]}
+			if control.header != "" {
+				c.Response.Headers["Retry-After"] = control.header
+			}
+			w := &conformanceHTTP{t: t, c: c, files: files}
+			client, err := NewClient(Config{
+				IngestURL: "https://conformance.example.invalid", ServiceToken: "sp_ingest_test",
+				Source: SourceBackend, WorkspaceKey: "synthetic-ws-01", AppKey: "synthetic-app-001", EnvironmentKey: "develop",
+				BatchSize: 1000, FlushInterval: time.Hour, DisableRequestCompression: true,
+				HTTPClient: &http.Client{Transport: w},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := client.Close(context.Background()); err != nil {
+					t.Errorf("close: %v", err)
+				}
+			})
+			conformanceBatch(t, client, w, files["v1/"+c.Request.File], files["v1/"+c.Response.File])
+			t.Log("derived header control; response PASS; delivery 1")
+		})
+	}
 }
 
 func TestConformanceUnreviewedRequest(t *testing.T) {
