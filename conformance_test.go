@@ -494,6 +494,60 @@ func mustConformanceJSON(t *testing.T, v any) []byte {
 	return raw
 }
 
+func TestConformanceIngestErrorRetryAfter(t *testing.T) {
+	files := conformanceFiles(t)
+	manifest, err := conformanceCorpus(files)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var captured conformanceCase
+	for _, c := range manifest.Cases {
+		if c.ID == "batch-retired-scope-member" {
+			captured = c
+		}
+	}
+	if captured.ID == "" {
+		t.Fatal("missing captured ingest refusal")
+	}
+	for _, control := range []struct {
+		name   string
+		status int
+		header string
+	}{
+		{"absent", http.StatusServiceUnavailable, ""},
+		{"explicit-zero", http.StatusServiceUnavailable, "0"},
+		{"positive", http.StatusTooManyRequests, "7"},
+		{"invalid", http.StatusServiceUnavailable, "invalid"},
+		{"ignored", http.StatusBadRequest, "7"},
+	} {
+		t.Run(control.name, func(t *testing.T) {
+			c := captured
+			c.Response.Status = control.status
+			c.Response.Headers = map[string]string{"Content-Type": captured.Response.Headers["Content-Type"]}
+			if control.header != "" {
+				c.Response.Headers["Retry-After"] = control.header
+			}
+			w := &conformanceHTTP{t: t, c: c, files: files}
+			client, err := NewClient(Config{
+				IngestURL: "https://conformance.example.invalid", ServiceToken: "sp_ingest_test",
+				Source: SourceBackend, WorkspaceKey: "synthetic-ws-01", AppKey: "synthetic-app-001", EnvironmentKey: "develop",
+				BatchSize: 1000, FlushInterval: time.Hour, DisableRequestCompression: true,
+				HTTPClient: &http.Client{Transport: w},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := client.Close(context.Background()); err != nil {
+					t.Errorf("close: %v", err)
+				}
+			})
+			conformanceBatch(t, client, w, files["v1/"+c.Request.File], files["v1/"+c.Response.File])
+			t.Log("derived header control; response PASS; delivery 1")
+		})
+	}
+}
+
 func TestConformanceUnreviewedRequest(t *testing.T) {
 	files := conformanceFiles(t)
 	m, err := conformanceCorpus(files)
