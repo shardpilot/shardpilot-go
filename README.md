@@ -631,6 +631,7 @@ measured Git corpus. Complete Git history is required. The history checker repor
 expected count of commits with text patches, excluded commits and corpus digests.
 It includes first-parent merge diffs and requires the scanner's count to match the
 material corpus while refs and HEAD remain stable.
+Synthetic fixture exceptions retain exact commit fingerprints after a squash merge.
 
 Run the controls with Python 3.11+ and gitleaks 8.30.1:
 
