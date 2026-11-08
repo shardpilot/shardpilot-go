@@ -4,6 +4,7 @@
 
 ### Fixed
 
+- Align consent-policy fixture notices with the published disclaimer.
 - Retain the exact synthetic conformance-fixture fingerprint after squash merging.
 - Typed ingest-error conformance independently verifies header-derived retry delays
   while retaining status, envelope and complete field-detail assertions.

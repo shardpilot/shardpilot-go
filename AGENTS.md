@@ -46,3 +46,4 @@ Crash expectations enumerate every public result field independently of its SDK 
 Compare complete Remote Config results and exact failure messages in corpus reports.
 Derive ingest-error retry expectations independently from captured response headers.
 Keep the captured corpus unchanged and label derived header controls separately.
+Keep consent-policy fixture notices aligned with the published disclaimer.
