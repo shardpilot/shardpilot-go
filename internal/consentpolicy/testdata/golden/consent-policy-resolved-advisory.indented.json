@@ -49,8 +49,8 @@
     "row_basis": "ai_draft",
     "advisory_basis": "`medium` · contested · UK: \"Opt-in required unless a PECR exception fits\"; condition, verbatim: \"The statistical-purpose exception permits notice plus simple free objection where the sole purpose is statistics about use to improve the provider's own service; a third party may assist that purpose, not reuse the data. Ads/mixed purposes fall outside it. UK GDPR basis remains separate.\" · class `STRICT_OPT_IN` default, `child=UNDER_18_REVIEW`, `transfer=REVIEW` · a retained individual event catalogue is not assumed to qualify as sole-purpose statistics",
     "matrix": {
-      "docs_commit": "f6b6f0f617d4e15442608fc77be8a5bb40f40e26",
-      "file_sha256": "370b04f374d0c506b92a003d4c801f450d5e5c45aed369f14a1c9382e3d592cc",
+      "docs_commit": "1111111111111111111111111111111111111111",
+      "file_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
       "date": "2026-10-07"
     },
     "resolved_by": "server_country"

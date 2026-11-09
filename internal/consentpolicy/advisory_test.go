@@ -69,8 +69,8 @@ func TestTheAdvisoryGoldenCarriesWhatTheResolverSent(t *testing.T) {
 		if !strings.HasPrefix(a.AdvisoryBasis, "`medium` · contested") {
 			t.Fatalf("%s: the basis was not carried verbatim: %q", name, a.AdvisoryBasis)
 		}
-		if a.Matrix.DocsCommit != "f6b6f0f617d4e15442608fc77be8a5bb40f40e26" ||
-			a.Matrix.FileSHA256 != "370b04f374d0c506b92a003d4c801f450d5e5c45aed369f14a1c9382e3d592cc" ||
+		if a.Matrix.DocsCommit != strings.Repeat("1", 40) ||
+			a.Matrix.FileSHA256 != strings.Repeat("2", 64) ||
 			a.Matrix.Date != "2026-10-07" {
 			t.Fatalf("%s: matrix=%+v", name, a.Matrix)
 		}
@@ -285,9 +285,9 @@ func TestTheAdvisoryVocabularyIsClosed(t *testing.T) {
 		{"a country's row under OTHER", func(a map[string]any) {
 			a["jurisdiction"], a["estimate"] = "OTHER", nil
 		}},
-		{"docs_commit in upper case", setMatrix("docs_commit", strings.ToUpper("f6b6f0f617d4e15442608fc77be8a5bb40f40e26"))},
-		{"docs_commit one character short", setMatrix("docs_commit", "f6b6f0f617d4e15442608fc77be8a5bb40f40e2")},
-		{"file_sha256 one character short", setMatrix("file_sha256", "370b04f374d0c506b92a003d4c801f450d5e5c45aed369f14a1c9382e3d592c")},
+		{"docs_commit in upper case", setMatrix("docs_commit", strings.Repeat("A", 40))},
+		{"docs_commit one character short", setMatrix("docs_commit", strings.Repeat("a", 39))},
+		{"file_sha256 one character short", setMatrix("file_sha256", strings.Repeat("b", 63))},
 		{"date without leading zeros", setMatrix("date", "2026-10-7")},
 		{"date that does not exist", setMatrix("date", "2026-02-30")},
 		{"date as a timestamp", setMatrix("date", "2026-10-07T00:00:00Z")},
