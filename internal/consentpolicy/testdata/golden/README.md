@@ -1,7 +1,9 @@
 # Golden bodies — the resolver's actual bytes
 
 These fixtures start from recorded resolver responses. The `basis.notice`
-value follows the published disclaimer and the remaining capture bytes are retained.
+value follows the published disclaimer. The advisory capture uses synthetic
+matrix identifiers in both representations: forty `1` characters for the revision
+and sixty-four `2` characters for the digest.
 
 | file | what it is |
 |---|---|
@@ -18,20 +20,8 @@ These recordings use request contract version 3 and scope members
 `workspace_key`, `app_key` and `environment_key`. The decoder accepts only
 these names, including on refusals; retired or mixed scope names are rejected.
 
-
-Recorded from the resolver service's own golden test, from the stored bodies
-`internal/httpserver/testdata/consent_policy_resolved_strict.json` (blob
-`ba2795a09d6a591e2904b4d23f9aa81bef5b8ce3`) and
-`internal/httpserver/testdata/consent_policy_refusal_invalid_scope.json` (blob
-`ec6eb6c293b1d28f1b250c4a23058570755d04a6`). Those two are the stored review
-forms that supplied the `.indented.json` fixtures here.
-
-The advisory pair was recorded the same way, from the stored body
-`internal/httpserver/testdata/consent_policy_resolved_strict_with_advisory.json`
-(blob `915ea00fc4cb461f0e9b96299a3e6a91c0167c51`). It answers the same request with
-`advisory: true` added, for a workspace admitted to the advisory, from a
-connection the resolver located in GB. Its plan is the resolved plan above,
-unchanged; the advisory sits beside it and does not alter it.
+For the advisory capture, admit the workspace, use a GB connection and set `advisory: true`
+on the valid request. For the refusal, set `workspace_key` to `not a valid key`.
 
 The resolved body answers the request `{workspace_key: ws_1, app_key: app_1,
 environment_key: env_1, app_version: 1.2.3, store: steam, store_region: null,
@@ -105,7 +95,22 @@ from these bytes rather than from a hand-written list.
 
 ## Re-recording
 
-If the contract moves, re-record from the resolver's stored bodies rather than
-editing these by hand, and update the blob ids above in the same change. A file
-edited here to make a test pass is the fixture-agrees-with-the-code defect
-coming back.
+Capture each case using the inputs and clock above. For the advisory request, use the synthetic
+matrix IDs above and date `2026-10-07`. Copy the raw body (no added newline) and the recorded
+indented form independently. Go’s `json.Indent` (empty prefix, two spaces) plus one final LF reproduces the review layout.
+
+From this directory, verify an existing capture with the following SHA-256 checks:
+
+```sh
+shasum -a 256 -c <<'SHA256'
+ea329d5dd06f2ca5819af6a32679d7db8df4cc2d6a55e1fa484feed35748b570  consent-policy-resolved.indented.json
+32ab657e1e05ed36a00d97b8d051ff88607d4786c7f5383266eed57422582182  consent-policy-resolved.json
+2c427500daf93a5841ad4f5b3272dce89b5f36315d36a0acb260d3ecc972245a  consent-policy-refusal.indented.json
+808be00525b0968e3c05505313fa1438a68a7646faabd468538b8c5ede3cd298  consent-policy-refusal.json
+e054da6ed36ea965e85c77427626f482e3ec7b114cf14c9eb9a91681ed74ebcf  consent-policy-resolved-advisory.indented.json
+74c47858182bc41bdd279a1382bd6c63a80e82183b19312fd58e3b64dd28a6ec  consent-policy-resolved-advisory.json
+SHA256
+```
+
+For a new contract, compare both files byte for byte with the new recording. Hash the recording,
+update the checks above, and run them and `TestTheReviewFormsCompactToTheWireBytes`.
