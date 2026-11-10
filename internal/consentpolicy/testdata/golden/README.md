@@ -20,9 +20,8 @@ These recordings use request contract version 3 and scope members
 `workspace_key`, `app_key` and `environment_key`. The decoder accepts only
 these names, including on refusals; retired or mixed scope names are rejected.
 
-
-The review forms are recorded responses. The advisory pair adds `advisory: true`
-to the valid request and contains a GB estimate beside the unchanged strict plan.
+For the advisory capture, admit the workspace, use a GB connection and set `advisory: true`
+on the valid request. For the refusal, set `workspace_key` to `not a valid key`.
 
 The resolved body answers the request `{workspace_key: ws_1, app_key: app_1,
 environment_key: env_1, app_version: 1.2.3, store: steam, store_region: null,
@@ -96,7 +95,22 @@ from these bytes rather than from a hand-written list.
 
 ## Re-recording
 
-If the contract moves, re-record from the resolver's stored bodies rather than
-editing these by hand, and update the blob ids above in the same change. A file
-edited here to make a test pass is the fixture-agrees-with-the-code defect
-coming back.
+Capture each case using the inputs and clock above. For the advisory request, use the synthetic
+matrix IDs above and date `2026-10-07`. Copy the raw body (no added newline) and the recorded
+indented form independently. Go’s `json.Indent` (empty prefix, two spaces) plus one final LF reproduces the review layout.
+
+From this directory, verify an existing capture with the following SHA-256 checks:
+
+```sh
+shasum -a 256 -c <<'SHA256'
+ea329d5dd06f2ca5819af6a32679d7db8df4cc2d6a55e1fa484feed35748b570  consent-policy-resolved.indented.json
+32ab657e1e05ed36a00d97b8d051ff88607d4786c7f5383266eed57422582182  consent-policy-resolved.json
+2c427500daf93a5841ad4f5b3272dce89b5f36315d36a0acb260d3ecc972245a  consent-policy-refusal.indented.json
+808be00525b0968e3c05505313fa1438a68a7646faabd468538b8c5ede3cd298  consent-policy-refusal.json
+e054da6ed36ea965e85c77427626f482e3ec7b114cf14c9eb9a91681ed74ebcf  consent-policy-resolved-advisory.indented.json
+74c47858182bc41bdd279a1382bd6c63a80e82183b19312fd58e3b64dd28a6ec  consent-policy-resolved-advisory.json
+SHA256
+```
+
+For a new contract, compare both files byte for byte with the new recording. Hash the recording,
+update the checks above, and run them and `TestTheReviewFormsCompactToTheWireBytes`.
