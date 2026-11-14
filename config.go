@@ -270,10 +270,10 @@ type Config struct {
 	// OnBatchResult, when set, is called after each successful batch publish
 	// (HTTP 202) with the ingest outcome: the accepted/rejected/duplicate
 	// aggregate plus the per-event status list the endpoint reports. It is the
-	// complete way to learn which individual events the server rejected, folded
-	// as duplicates, observed (event_name not registered), or suppressed for
-	// withheld consent — for suppressed events the 202 is not delivery
-	// confirmation. The same per-event statuses are also folded into the
+	// complete way to learn which individual events the server rejected (an
+	// event_name that is not registered is rejected with code
+	// schema_not_found), folded as duplicates, or suppressed for withheld
+	// consent — for suppressed events the 202 is not delivery confirmation. The same per-event statuses are also folded into the
 	// Snapshot().ByStatus aggregate.
 	// Rejected outcomes are also retained by Client.Rejections without a hook.
 	//
