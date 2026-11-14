@@ -4,7 +4,7 @@
 
 ### Documentation
 
-- Correct the integration guide on unregistered event names. The retired
+- Correct the README and the integration guide on unregistered event names. The retired
   `observed` status is no longer described as a current outcome: an
   unregistered name is refused with `schema_not_found`, per event or as a
   whole-batch `400`, and the guide no longer names the removed
