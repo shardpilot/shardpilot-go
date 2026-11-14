@@ -356,8 +356,9 @@ Facts that keep integrations correct:
 - **Event names are schema-checked per source.** Pick canonical events whose
   schema allows your configured `Source`; e.g. `purchase` / `economy_tx` are
   backend-source events, while session/screen events are client-source-only.
-  An unregistered `event_name` is accepted as status `observed` (stored for
-  observation, not surfaced as a product metric).
+  An unregistered `event_name` is refused with code `schema_not_found` and is
+  not stored: as that event's `rejected` status when another event of the
+  batch is registered, or as an HTTP `400` for the whole batch when none is.
 - **`SessionID` is required for non-`backend` sources.** This SDK does not
   manage sessions; with `SourceClient`/`SourceServer` you must set
   `Event.SessionID` (and a monotonic `Event.SessionSequence`) yourself, or
@@ -602,9 +603,12 @@ Run against your dev/staging deployment credentials, then check each item:
 
 2. **Analytics round trip.** `Track` one test event valid for your `Source`
    and confirm: the returned error is `nil`, and `OnBatchResult` reports the
-   event with `Status` `shardpilot.EventStatusAccepted` (`"accepted"`) — or
-   `shardpilot.EventStatusObserved` (`"observed"`) if you used an
-   unregistered test name; both prove auth + connectivity + envelope shape.
+   event with `Status` `shardpilot.EventStatusAccepted` (`"accepted"`). Use a
+   registered event name: an unregistered one is not stored. Sent alone it
+   fails the whole batch with an HTTP `400`, so `Track` returns an error;
+   beside a registered event it comes back as
+   `shardpilot.EventStatusRejected` with `Code` `schema_not_found`. The
+   `observed` status is retired and the SDK has no constant for it.
    Cross-check `client.Snapshot()`: `Published` incremented and
    `Snapshot().ByStatus` counting your event's status.
 3. **Consent suppression check.** If `OnBatchResult` shows
