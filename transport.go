@@ -384,13 +384,10 @@ func (t *httpTransport) postBody(ctx context.Context, endpoint string, payload [
 		}
 	}
 
-	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	httpRequest, err := t.newIngestRequest(ctx, endpoint, "application/json", body)
 	if err != nil {
-		return fmt.Errorf("create shardpilot ingest request: %w", err)
+		return err
 	}
-	httpRequest.Header.Set("Content-Type", "application/json")
-	httpRequest.Header.Set("Authorization", "Bearer "+t.token)
-	httpRequest.Header.Set(sdkversion.HeaderName, sdkversion.HeaderValue)
 	if compressed {
 		httpRequest.Header.Set("Content-Encoding", "gzip")
 	}
@@ -459,6 +456,17 @@ func (t *httpTransport) postBody(ctx context.Context, endpoint string, payload [
 	return nil
 }
 
+func (t *httpTransport) newIngestRequest(ctx context.Context, endpoint, mediaType string, body []byte) (*http.Request, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create shardpilot ingest request: %w", err)
+	}
+	request.Header.Set("Content-Type", mediaType)
+	request.Header.Set("Authorization", "Bearer "+t.token)
+	request.Header.Set(sdkversion.HeaderName, sdkversion.HeaderValue)
+	return request, nil
+}
+
 // maxErrorBodyBytes bounds how much of a non-2xx response body is read while
 // looking for the error envelope; a real envelope is tiny.
 const maxErrorBodyBytes = 64 << 10
@@ -487,6 +495,11 @@ type errorResponseWire struct {
 // malformed body degrades to the bare status), and the whole-seconds
 // Retry-After header is carried as a duration when present.
 func newHTTPStatusError(response *http.Response) *HTTPStatusError {
+	statusErr, _ := readHTTPStatusError(response)
+	return statusErr
+}
+
+func readHTTPStatusError(response *http.Response) (*HTTPStatusError, []byte) {
 	retryAfter, retryAfterPresent := time.Duration(0), false
 	if response.StatusCode == 429 || response.StatusCode >= 500 {
 		retryAfter, retryAfterPresent = parseRetryAfter(response.Header.Get("Retry-After"))
@@ -498,11 +511,11 @@ func newHTTPStatusError(response *http.Response) *HTTPStatusError {
 	}
 	body, err := io.ReadAll(io.LimitReader(response.Body, maxErrorBodyBytes+1))
 	if err != nil || len(body) == 0 || len(body) > maxErrorBodyBytes {
-		return statusErr
+		return statusErr, nil
 	}
 	var wire errorResponseWire
 	if json.Unmarshal(body, &wire) != nil || wire.Error.Code == "" {
-		return statusErr
+		return statusErr, nil
 	}
 	statusErr.ErrorCode = wire.Error.Code
 	statusErr.ErrorMessage = wire.Error.Message
@@ -512,7 +525,7 @@ func newHTTPStatusError(response *http.Response) *HTTPStatusError {
 			statusErr.Details = append(statusErr.Details, ErrorDetail(detail))
 		}
 	}
-	return statusErr
+	return statusErr, body
 }
 
 // parseRetryAfter reads a Retry-After header in either standard form —

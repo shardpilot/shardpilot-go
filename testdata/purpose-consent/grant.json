@@ -1,0 +1,1 @@
+{"purpose":"profile_features","actor_kind":"anon","actor_identifier":"example-actor","decision":"granted","idempotency_key":"grant-request-1","policy_version":"policy-1","evidence_ref":"example-evidence","expected":{"authorization_id":"","decision_seq":0,"graph_version":0}}

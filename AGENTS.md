@@ -49,3 +49,4 @@ Compare complete Remote Config results and exact failure messages in corpus repo
 Derive ingest-error retry expectations independently from captured response headers.
 Keep the captured corpus unchanged and label derived header controls separately.
 Keep consent-policy fixture notices aligned with the published disclaimer.
+Keep named-purpose consent retries byte-identical and preserve the pending withdrawal receipt on retry exhaustion.

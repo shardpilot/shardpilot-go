@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Added
+
+- Trusted backends can record named-purpose decisions with stable retries and explicit withdrawal cleanup status.
+
 ### Documentation
 
 - Correct the README, the integration guide and the `Config.OnBatchResult`

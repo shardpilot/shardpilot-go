@@ -535,6 +535,21 @@ variant, payload := player.Apply("welcome-layout")
 - Crash reports strip PII and raw identifier material; there is no API surface for screenshots, network payloads, or attachments.
 - Do not commit tokens or real customer/player data. Tokens and full event payloads are never logged by default.
 
+### Named-purpose consent
+
+Call `GrantPurposeConsent` or `WithdrawPurposeConsent` from a trusted `SourceServer` or `SourceBackend` client with an environment-scoped service ingest credential. Pass the enabled purpose and the actor's `anon` or `user_verified` identity.
+
+A grant takes the policy version, an opaque evidence reference and an expected witness. Use a zero witness initially, then copy `PurposeConsentWitness` from the prior receipt verbatim. A conflict requires a new decision by the caller.
+
+```go
+request := shardpilot.PurposeConsentRequest{Purpose: "profile_features", ActorKind: "anon", ActorIdentifier: actorID, IdempotencyKey: withdrawalID}
+receipt, err := client.WithdrawPurposeConsent(ctx, request)
+```
+
+Persist the request and its unique operation key before sending. The methods wait for acknowledgement and retry the same bytes up to three attempts within 30 seconds or the caller's shorter deadline.
+
+If `receipt.PurgeStatus` is `pending`, the withdrawal was recorded and cleanup remains due. Resume with the same request and key after an ambiguous response or restart. `completed` confirms cleanup.
+
 ## Minting client ingest JWTs (backend-only, Mode B)
 
 > **Backend-only — this helper holds the per-tenant signing secret.** It belongs in a trusted server-side game backend and must **never** be compiled into a shipped client binary. Client SDKs (Unity, Unreal, Defold) consume a minted token through a `token_provider` callback and never see the secret. This Go SDK is a backend/service-tier SDK, so its dual-mode role is the inverse: it **mints** the short-lived per-user JWTs that client SDKs then fetch over your own authenticated channel.

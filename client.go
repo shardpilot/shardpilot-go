@@ -100,7 +100,7 @@ type Client struct {
 	consentTicketNext    uint64
 	consentTicketServing uint64
 
-	// consentDecisionsWG counts SetConsent calls admitted BEFORE Close
+	// consentDecisionsWG counts consent calls admitted BEFORE Close
 	// stored the closed flag (both happen under lifecycleMu, so the set is
 	// exact). Close waits for them — bounded by its context — before
 	// stopping and draining the consent sender: a pre-Close decision's
