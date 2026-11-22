@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.12.0 — 2026-11-22 — named-purpose consent
+
 ### Added
 
 - Trusted backends can record named-purpose decisions with stable retries and explicit withdrawal cleanup status.
